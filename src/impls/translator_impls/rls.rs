@@ -3220,6 +3220,46 @@ mod tests {
     }
 
     #[test]
+    fn transform_expr_transforms_function_parameters_like_args() {
+        let schema = schema_from_sql(
+            "CREATE TABLE reports(id INTEGER PRIMARY KEY, tenant TEXT, amount INTEGER, weight INTEGER);",
+        );
+        let table = schema
+            .table_by_target(TargetName::new("reports", false), IdentifierCase::AsWritten)
+            .expect("table lookup should succeed")
+            .expect("table should exist");
+        let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
+        let lowercased_columns = resolved_sets(table, &schema);
+        let facts = ResolvedSchemaFacts { lowercased_columns: &lowercased_columns };
+
+        let call = Expr::Function(Function {
+            name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("quantile"))]),
+            uses_odbc_syntax: false,
+            parameters: FunctionArguments::List(FunctionArgumentList {
+                duplicate_treatment: None,
+                args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(
+                    Ident::new("weight"),
+                )))],
+                clauses: vec![],
+            }),
+            args: FunctionArguments::List(FunctionArgumentList {
+                duplicate_treatment: None,
+                args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(
+                    Ident::new("amount"),
+                )))],
+                clauses: vec![],
+            }),
+            filter: None,
+            null_treatment: None,
+            over: None,
+            within_group: vec![],
+        });
+
+        let transformed = transform_expr(&call, &options, table, &schema, Some("NEW"), None, facts);
+        assert_eq!(transformed.to_string(), "quantile(NEW.weight)(NEW.amount)");
+    }
+
+    #[test]
     fn transform_query_and_subquery_helpers_cover_projection_and_join_paths() {
         let schema = schema_from_sql(
             r#"
