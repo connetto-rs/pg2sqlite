@@ -3937,6 +3937,11 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                         .to_string(),
                 ));
             }
+            Expr::In { target: InTarget::Table { .. }, .. } => {
+                return Err(crate::errors::Error::forward_refusal(
+                    "IN table and IN table_function(...) are SQLite-only syntax. Use IN (SELECT ...) with explicit output columns.",
+                ));
+            }
             Expr::In { target: InTarget::Unnest(_), .. } => {
                 return Err(crate::errors::Error::forward_refusal(
                     "IN UNNEST (array unnesting) is not supported in SQLite. \

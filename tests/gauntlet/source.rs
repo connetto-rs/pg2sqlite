@@ -105,7 +105,7 @@ fn corpus_verdict_classification() {
                 (false, true) => translator_refuses += 1,
                 (true, false) => {
                     let pg_err = pg_result.unwrap_err();
-                    forbidden.push((group.to_string(), (*row).to_string(), pg_err));
+                    forbidden.push(((*group).to_string(), (*row).to_string(), pg_err));
                 }
             }
         }

@@ -104,7 +104,7 @@ fn test_all_crash_cases() {
 
         if let Err(panic) = result {
             let panic_msg = if let Some(s) = panic.downcast_ref::<&str>() {
-                s.to_string()
+                (*s).to_string()
             } else if let Some(s) = panic.downcast_ref::<String>() {
                 s.clone()
             } else {

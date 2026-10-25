@@ -263,8 +263,7 @@ impl PlPgSqlTranslator {
                 expr,
                 Expr::Subquery(_)
                     | Expr::Exists { .. }
-                    | Expr::In { target: InTarget::Subquery(_), .. }
-                    | Expr::In { target: InTarget::Unnest(_), .. }
+                    | Expr::In { target: InTarget::Subquery(_) | InTarget::Unnest(_), .. }
             ) {
                 ControlFlow::Break(())
             } else {
