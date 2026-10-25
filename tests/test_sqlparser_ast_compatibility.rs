@@ -29,7 +29,7 @@ fn foreign_data_wrapper_is_reported_as_a_lossy_drop() {
         .unwrap()
         .translate_with_report(&Pg2SqliteOptions::default())
         .unwrap();
-    assert!(report.script.into_vec().is_empty());
+    assert_eq!(report.script.into_vec(), Vec::<Statement>::new());
     assert!(matches!(
         report.warnings.as_slice(),
         [TranslationWarning::LossyDrop { construct, .. }] if construct == "CREATE FOREIGN DATA WRAPPER"
