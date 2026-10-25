@@ -491,6 +491,11 @@ impl ReverseTranslator for Expr {
             Expr::In { expr: operand, target: InTarget::List(list), negated, global } => {
                 reverse_in_list(operand, list, *negated, *global, schema, options)
             }
+            Expr::In { target: InTarget::Table { .. }, .. } => {
+                Err(Error::reverse_refusal(
+                    "IN table and IN table_function(...) have no PostgreSQL spelling. Use IN (SELECT ...) with explicit output columns.",
+                ))
+            }
 
             Expr::Between { expr: operand, negated, low, high } => {
                 reverse_between(operand, *negated, low, high, schema, options)

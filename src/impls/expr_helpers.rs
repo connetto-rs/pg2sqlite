@@ -271,6 +271,19 @@ pub(crate) fn try_map_expr_children<E>(
                         InTarget::Subquery(Box::new(f_query(subquery)?))
                     }
                     InTarget::Unnest(array_expr) => InTarget::Unnest(Box::new(f(array_expr)?)),
+                    InTarget::Table { name, args } => {
+                        InTarget::Table {
+                            name: name.clone(),
+                            args: args
+                                .as_ref()
+                                .map(|args| {
+                                    args.iter()
+                                        .map(|arg| try_map_function_arg(arg, f))
+                                        .collect::<Result<_, _>>()
+                                })
+                                .transpose()?,
+                        }
+                    }
                 };
                 Ok(Expr::In { expr: inner, target, negated: *negated, global: *global })
             })?
@@ -786,7 +799,7 @@ pub(crate) fn for_each_child_expr(expr: &Expr, f: &mut impl FnMut(&Expr)) {
             }
         }
 
-        // list and unnest children, subquery targets stay untouched
+        // Subquery targets stay untouched.
         Expr::In { expr: inner, target, .. } => {
             f(inner);
             match target {
@@ -797,6 +810,13 @@ pub(crate) fn for_each_child_expr(expr: &Expr, f: &mut impl FnMut(&Expr)) {
                 }
                 InTarget::Subquery(_) => {}
                 InTarget::Unnest(array_expr) => f(array_expr),
+                InTarget::Table { name: _, args } => {
+                    if let Some(args) = args {
+                        for arg in args {
+                            for_each_function_arg_expr(arg, f);
+                        }
+                    }
+                }
             }
         }
         Expr::Tuple(items) => {
@@ -945,15 +965,7 @@ fn for_each_function_child_expr(function: &sqlparser::ast::Function, f: &mut imp
     for arguments in [parameters, args] {
         if let sqlparser::ast::FunctionArguments::List(list) = arguments {
             for arg in &list.args {
-                if let sqlparser::ast::FunctionArg::ExprNamed { name, .. } = arg {
-                    f(name);
-                }
-                let (sqlparser::ast::FunctionArg::Named { arg, .. }
-                | sqlparser::ast::FunctionArg::ExprNamed { arg, .. }
-                | sqlparser::ast::FunctionArg::Unnamed(arg)) = arg;
-                if let sqlparser::ast::FunctionArgExpr::Expr(expr) = arg {
-                    f(expr);
-                }
+                for_each_function_arg_expr(arg, f);
             }
             for clause in &list.clauses {
                 for_each_function_argument_clause_expr(clause, f);
@@ -984,6 +996,19 @@ fn for_each_function_child_expr(function: &sqlparser::ast::Function, f: &mut imp
                 }
             }
         }
+    }
+}
+
+/// Visits argument values and expression-valued argument names.
+fn for_each_function_arg_expr(arg: &sqlparser::ast::FunctionArg, f: &mut impl FnMut(&Expr)) {
+    if let sqlparser::ast::FunctionArg::ExprNamed { name, .. } = arg {
+        f(name);
+    }
+    let (sqlparser::ast::FunctionArg::Named { arg, .. }
+    | sqlparser::ast::FunctionArg::ExprNamed { arg, .. }
+    | sqlparser::ast::FunctionArg::Unnamed(arg)) = arg;
+    if let sqlparser::ast::FunctionArgExpr::Expr(expr) = arg {
+        f(expr);
     }
 }
 
@@ -1139,6 +1164,60 @@ mod tests {
             }
         });
         assert_eq!(expr.to_string(), "(A, B)");
+    }
+
+    #[test]
+    fn table_membership_walkers_transform_every_argument_expression() {
+        use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArgOperator, ObjectName};
+
+        let expr = Expr::In {
+            expr: Box::new(ident_expr("lhs")),
+            target: InTarget::Table {
+                name: ObjectName::from(Ident::new("lookup")),
+                args: Some(vec![
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(ident_expr("positional"))),
+                    FunctionArg::Named {
+                        name: Ident::new("label"),
+                        arg: FunctionArgExpr::Expr(ident_expr("named")),
+                        operator: FunctionArgOperator::RightArrow,
+                    },
+                    FunctionArg::ExprNamed {
+                        name: ident_expr("key"),
+                        arg: FunctionArgExpr::Expr(ident_expr("value")),
+                        operator: FunctionArgOperator::RightArrow,
+                    },
+                    FunctionArg::Unnamed(FunctionArgExpr::Wildcard),
+                ]),
+            },
+            negated: true,
+            global: false,
+        };
+        let mut children = Vec::new();
+        for_each_child_expr(&expr, &mut |child| children.push(child.to_string()));
+        assert_eq!(children, ["lhs", "positional", "named", "key", "value"]);
+
+        let rewritten = try_map_expr_children::<()>(
+            &expr,
+            &mut |child| Ok(Expr::Nested(Box::new(child.clone()))),
+            &mut |_| panic!("table membership has no query child"),
+        )
+        .unwrap();
+        assert_eq!(
+            rewritten.to_string(),
+            "(lhs) NOT IN lookup((positional), label => (named), (key) => (value), *)"
+        );
+        let failure = try_map_expr_children(
+            &expr,
+            &mut |child| {
+                if *child == ident_expr("value") {
+                    Err("argument refused")
+                } else {
+                    Ok(child.clone())
+                }
+            },
+            &mut |query| Ok(query.clone()),
+        );
+        assert_eq!(failure, Err("argument refused"));
     }
 
     /// Parse a single SQL expression using the PostgreSQL dialect.
@@ -1530,6 +1609,24 @@ mod tests {
         corpus.push(("map_literal".to_string(), map_literal_expr()));
         corpus.push(("lambda".to_string(), lambda_expr()));
         corpus.push(("member_of".to_string(), member_of_expr()));
+        for sql in ["SELECT a IN t", "SELECT a NOT IN f(b, c)"] {
+            let sqlparser::ast::Statement::Query(query) =
+                sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::SQLiteDialect {}, sql)
+                    .unwrap()
+                    .remove(0)
+            else {
+                panic!("expected query");
+            };
+            let sqlparser::ast::SetExpr::Select(select) = *query.body else {
+                panic!("expected select");
+            };
+            let sqlparser::ast::SelectItem::UnnamedExpr(expr) =
+                select.projection.into_iter().next().unwrap()
+            else {
+                panic!("expected expression");
+            };
+            corpus.push((sql.to_string(), expr));
+        }
 
         for (label, expr) in corpus {
             let mut read_only = Vec::new();

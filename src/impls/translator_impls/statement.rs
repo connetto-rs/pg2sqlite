@@ -1971,6 +1971,9 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
                 drop_with_warning("ALTER FUNCTION", REASON_ACCESS_CONTROL, emit)
             }
             Self::CreateServer(_) => drop_with_warning("CREATE SERVER", REASON_FOREIGN_DATA, emit),
+            Self::CreateForeignDataWrapper(_) => {
+                drop_with_warning("CREATE FOREIGN DATA WRAPPER", REASON_FOREIGN_DATA, emit)
+            }
             Self::CreateForeignTable(_) => {
                 drop_with_warning("CREATE FOREIGN TABLE", REASON_FOREIGN_DATA, emit)
             }
@@ -2130,6 +2133,18 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
             | Self::CreateSchema { .. }
             | Self::AlterSchema(_) => Vec::new(),
             // Outcome 2, hard error, grouped by reason.
+            Self::CreateRule(_) => {
+                return Err(reject_unsupported_statement(
+                    self,
+                    "SQLite has no query rewrite rules. Rewrite the rule as explicit statements or triggers.",
+                ));
+            }
+            Self::AlterTrigger(_) => {
+                return Err(reject_unsupported_statement(
+                    self,
+                    "SQLite cannot alter a trigger. Drop and recreate the trigger with its intended definition.",
+                ));
+            }
             data_movement_patterns!() => {
                 return Err(reject_unsupported_statement(
                     self,

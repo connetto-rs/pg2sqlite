@@ -123,6 +123,7 @@ impl<S> InitializationPlan<S> {
     }
 
     /// Complete initialization in source order.
+    #[must_use]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &S> + FusedIterator {
         self.selected(FreshFiles::Both)
     }

@@ -1238,6 +1238,7 @@ impl Pg2Sqlite {
     /// [`crate::errors::Error::UnsupportedReverseStatement`] for non-DML
     /// statements, or [`crate::errors::Error::RlsTableDetected`] for RLS
     /// backing table references.
+    /// Refuses SQLite's `IN table` and `IN table_function(...)` shorthand.
     ///
     /// # Example
     ///
