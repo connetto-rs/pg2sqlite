@@ -70,6 +70,15 @@ fn a_long_set_operation_chain_translates() {
 }
 
 #[test]
+fn a_long_set_operation_chain_as_insert_source_translates() {
+    let pg = format!(
+        "{ROWS} INSERT INTO t (a) {}; SELECT count(*) FROM t;",
+        chain("SELECT a FROM t", " UNION ALL ", ARMS)
+    );
+    assert_eq!(answer(pg), Some((1 + ARMS).to_string()));
+}
+
+#[test]
 fn a_long_arithmetic_chain_reverses() {
     let sqlite = format!("SELECT {} FROM t", chain("a", " + ", OPERANDS));
     let postgres = on_a_default_thread(move || {
