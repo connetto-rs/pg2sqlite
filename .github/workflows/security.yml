@@ -19,7 +19,7 @@ concurrency:
 jobs:
   audit:
     name: Security Audit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # The repository default for GITHUB_TOKEN is read-only, and rustsec/audit-check
     # publishes its findings as a check run, so the job has to ask for that scope
     # explicitly or the step dies with "Resource not accessible by integration".
