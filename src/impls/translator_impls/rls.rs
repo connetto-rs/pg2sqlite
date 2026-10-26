@@ -1257,25 +1257,28 @@ fn transform_expr_generic(
         }
 
         Expr::Function(func) => {
+            let transform_list = |list: &FunctionArgumentList| {
+                FunctionArgumentList {
+                    duplicate_treatment: list.duplicate_treatment,
+                    args: list
+                        .args
+                        .iter()
+                        .map(|arg| transform_function_arg_with_rls(arg, &recurse))
+                        .collect(),
+                    clauses: list
+                        .clauses
+                        .iter()
+                        .map(|clause| {
+                            transform_function_argument_clause_rls(
+                                clause, options, table, schema, strategy,
+                            )
+                        })
+                        .collect(),
+                }
+            };
             let transformed_args = match &func.args {
                 FunctionArguments::List(arg_list) => {
-                    FunctionArguments::List(FunctionArgumentList {
-                        duplicate_treatment: arg_list.duplicate_treatment,
-                        args: arg_list
-                            .args
-                            .iter()
-                            .map(|arg| transform_function_arg_with_rls(arg, &recurse))
-                            .collect(),
-                        clauses: arg_list
-                            .clauses
-                            .iter()
-                            .map(|clause| {
-                                transform_function_argument_clause_rls(
-                                    clause, options, table, schema, strategy,
-                                )
-                            })
-                            .collect(),
-                    })
+                    FunctionArguments::List(transform_list(arg_list))
                 }
                 FunctionArguments::Subquery(query) => {
                     FunctionArguments::Subquery(Box::new(transform_query(
@@ -1345,23 +1348,7 @@ fn transform_expr_generic(
 
             let transformed_parameters = match &func.parameters {
                 FunctionArguments::List(param_list) => {
-                    FunctionArguments::List(FunctionArgumentList {
-                        duplicate_treatment: param_list.duplicate_treatment,
-                        args: param_list
-                            .args
-                            .iter()
-                            .map(|arg| transform_function_arg_with_rls(arg, &recurse))
-                            .collect(),
-                        clauses: param_list
-                            .clauses
-                            .iter()
-                            .map(|clause| {
-                                transform_function_argument_clause_rls(
-                                    clause, options, table, schema, strategy,
-                                )
-                            })
-                            .collect(),
-                    })
+                    FunctionArguments::List(transform_list(param_list))
                 }
                 other => other.clone(),
             };
@@ -3230,6 +3217,46 @@ mod tests {
             facts,
         );
         assert_eq!(prefixed_identifier.to_string(), "NEW.owner_id");
+    }
+
+    #[test]
+    fn transform_expr_transforms_function_parameters_like_args() {
+        let schema = schema_from_sql(
+            "CREATE TABLE reports(id INTEGER PRIMARY KEY, tenant TEXT, amount INTEGER, weight INTEGER);",
+        );
+        let table = schema
+            .table_by_target(TargetName::new("reports", false), IdentifierCase::AsWritten)
+            .expect("table lookup should succeed")
+            .expect("table should exist");
+        let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
+        let lowercased_columns = resolved_sets(table, &schema);
+        let facts = ResolvedSchemaFacts { lowercased_columns: &lowercased_columns };
+
+        let call = Expr::Function(Function {
+            name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("quantile"))]),
+            uses_odbc_syntax: false,
+            parameters: FunctionArguments::List(FunctionArgumentList {
+                duplicate_treatment: None,
+                args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(
+                    Ident::new("weight"),
+                )))],
+                clauses: vec![],
+            }),
+            args: FunctionArguments::List(FunctionArgumentList {
+                duplicate_treatment: None,
+                args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(
+                    Ident::new("amount"),
+                )))],
+                clauses: vec![],
+            }),
+            filter: None,
+            null_treatment: None,
+            over: None,
+            within_group: vec![],
+        });
+
+        let transformed = transform_expr(&call, &options, table, &schema, Some("NEW"), None, facts);
+        assert_eq!(transformed.to_string(), "quantile(NEW.weight)(NEW.amount)");
     }
 
     #[test]

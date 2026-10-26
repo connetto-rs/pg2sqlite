@@ -4,25 +4,11 @@
 //! C2: SetExpr::SetOperation in `transform_query`
 //! C3: Missing Expr arms in `transform_outer_table_refs`
 
-use diesel::{Connection, RunQueryDsl, SqliteConnection};
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+use diesel::RunQueryDsl;
 
-fn translate(sql: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let options = Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit");
-    let stmts = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-    Ok(stmts.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"))
-}
+mod helpers;
 
-fn apply_all(sql: &str) -> Result<SqliteConnection, Box<dyn std::error::Error>> {
-    let options = Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit");
-    let stmts = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-    let mut conn = SqliteConnection::establish(":memory:")?;
-    for stmt in &stmts {
-        diesel::sql_query(stmt.to_string()).execute(&mut conn)?;
-    }
-    Ok(conn)
-}
-
+use helpers::{apply_rls_sql as apply_all, translate_rls_sql as translate};
 #[test]
 fn rls_policy_case_when_transforms_column_refs() -> Result<(), Box<dyn std::error::Error>> {
     let sql = r#"
@@ -164,5 +150,52 @@ fn rls_outer_table_ref_in_function_arg() -> Result<(), Box<dyn std::error::Error
     assert!(output.contains("lower("), "lower() function should be preserved, got:\n{output}");
     let _conn = apply_all(sql)?;
 
+    Ok(())
+}
+
+#[test]
+fn rls_policy_function_argument_order_by_checks_correlated_columns()
+-> Result<(), Box<dyn std::error::Error>> {
+    use diesel::{ExpressionMethods, QueryDsl};
+
+    diesel::table! {
+        reports (id) {
+            id -> Integer,
+            tenant -> Text,
+        }
+    }
+
+    let sql = r#"
+        CREATE TABLE ordering_keys (rank_key INTEGER, label TEXT);
+        INSERT INTO ordering_keys VALUES (1, 'a'), (2, 'b');
+        CREATE TABLE reports (
+            id INTEGER PRIMARY KEY,
+            tenant TEXT NOT NULL
+        );
+        ALTER TABLE reports ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY psel ON reports FOR SELECT USING (true);
+        CREATE POLICY pins ON reports FOR INSERT WITH CHECK (
+            (SELECT string_agg(label, ',' ORDER BY
+                CASE WHEN tenant = 'forward' THEN rank_key ELSE -rank_key END
+            ) FROM ordering_keys) = 'a,b'
+        );
+    "#;
+
+    let mut conn = apply_all(sql)?;
+    diesel::insert_into(reports::table)
+        .values((reports::id.eq(1), reports::tenant.eq("forward")))
+        .execute(&mut conn)?;
+    let denied = diesel::insert_into(reports::table)
+        .values((reports::id.eq(2), reports::tenant.eq("backward")))
+        .execute(&mut conn)
+        .expect_err("reversed aggregate order must deny the insert");
+    assert!(denied.to_string().contains("row-level security policy"), "{denied}");
+    diesel::insert_into(reports::table)
+        .values((reports::id.eq(3), reports::tenant.eq("forward")))
+        .execute(&mut conn)?;
+    assert_eq!(
+        reports::table.select(reports::id).order(reports::id).load::<i32>(&mut conn)?,
+        vec![1, 3]
+    );
     Ok(())
 }
