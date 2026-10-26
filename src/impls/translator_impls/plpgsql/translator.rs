@@ -534,6 +534,7 @@ impl PlPgSqlTranslator {
     ///   or an error for a multi-event trigger.
     /// - `TG_TABLE_NAME` becomes the table name literal.
     /// - Any other `TG_*` name produces an error naming the variable.
+    #[cfg_attr(feature = "std", recursive::recursive)]
     fn fold_trigger_specials(expr: &mut Expr, context: &PlPgSqlContext) -> Result<(), Error> {
         use crate::impls::expr_helpers::mutate_expr_children;
 
@@ -899,6 +900,7 @@ impl PlPgSqlTranslator {
         vec![Statement::Delete(new_delete)]
     }
 
+    #[cfg_attr(feature = "std", recursive::recursive)]
     fn inject_with_into_in_subqueries(
         expr: &mut Expr,
         with: &sqlparser::ast::With,
@@ -959,6 +961,7 @@ impl PlPgSqlTranslator {
         Self::set_expr_references_ctes(&query.body, &normalized)
     }
 
+    #[cfg_attr(feature = "std", recursive::recursive)]
     fn set_expr_references_ctes(body: &SetExpr, cte_names: &[String]) -> bool {
         match body {
             SetExpr::Select(select) => Self::select_references_ctes(select, cte_names),
@@ -1110,6 +1113,7 @@ impl PlPgSqlTranslator {
         new_delete
     }
 
+    #[cfg_attr(feature = "std", recursive::recursive)]
     fn transform_set_expr(
         set_expr: &mut SetExpr,
         context: &mut PlPgSqlContext,
@@ -1199,6 +1203,7 @@ impl PlPgSqlTranslator {
     }
 
     #[allow(clippy::too_many_lines)]
+    #[cfg_attr(feature = "std", recursive::recursive)]
     fn transform_expr(
         expr: &mut Expr,
         context: &mut PlPgSqlContext,
