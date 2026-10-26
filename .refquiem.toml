@@ -1,0 +1,4 @@
+# English for running text, and the PostgreSQL and SQLite function names the
+# translator maps between, so a mention of `unhex` never reads as a removed Rust item.
+[vocabularies]
+builtins = ["english", "postgres@18", "sqlite@3.54"]
