@@ -5,7 +5,8 @@
 
 mod helpers;
 
-use helpers::translate_sql;
+use diesel::{prelude::*, result::DatabaseErrorKind};
+use helpers::{apply_translated_ddl, translate_sql};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use rusqlite::Connection as SqliteConn;
 
@@ -130,26 +131,67 @@ fn the_translatable_constraints_still_translate() {
         .unwrap_or_else(|e| panic!("translated DDL must execute: {e}"));
 }
 
-/// `NULLS NOT DISTINCT` makes two NULL rows collide, which SQLite cannot do:
-/// its unique indexes always treat NULLs as distinct. Verified on both, where
-/// PostgreSQL 16 answers `duplicate key value violates unique constraint` for
-/// the second NULL and SQLite accepts it. Dropping the clause would therefore
-/// change which rows the database accepts, so it is refused rather than
-/// cleared. The clause used to reach the output and fail with `near "NULLS":
-/// syntax error`.
+mod keyed {
+    diesel::table! {
+        t (id) {
+            id -> Integer,
+            a -> Nullable<Integer>,
+            s -> Nullable<Text>,
+        }
+    }
+}
+
+/// Inserts one row into `t` of the translated schema.
+fn insert_keyed(
+    connection: &mut SqliteConnection,
+    id: i32,
+    a: Option<i32>,
+    s: Option<&str>,
+) -> QueryResult<usize> {
+    diesel::insert_into(keyed::t::table)
+        .values((keyed::t::id.eq(id), keyed::t::a.eq(a), keyed::t::s.eq(s)))
+        .execute(connection)
+}
+
+fn is_unique_violation(result: &QueryResult<usize>) -> bool {
+    matches!(
+        result,
+        Err(diesel::result::Error::DatabaseError(DatabaseErrorKind::UniqueViolation, _))
+    )
+}
+
+/// A repeated NULL key is an ordinary unique violation, as clients expect.
 #[test]
-fn unique_nulls_not_distinct_is_rejected() {
-    let error =
-        reject("CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT, UNIQUE NULLS NOT DISTINCT (s));");
-    assert!(
-        error.to_uppercase().contains("NULLS NOT DISTINCT"),
-        "expected the error to name the clause, got {error}"
+fn unique_nulls_not_distinct_refuses_a_repeated_null() {
+    let mut connection = apply_translated_ddl(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, s TEXT, UNIQUE NULLS NOT DISTINCT (a, s));",
+        &default_options(),
     );
+    insert_keyed(&mut connection, 1, Some(1), None).expect("the first NULL key is accepted");
+    insert_keyed(&mut connection, 2, Some(2), None).expect("a different key is accepted");
+    let repeated = insert_keyed(&mut connection, 3, Some(1), None);
+    assert!(is_unique_violation(&repeated), "a repeated NULL key must collide: {repeated:?}");
+}
+
+/// The column's collation decides which values collide, beside a NULL too.
+#[test]
+fn unique_nulls_not_distinct_keeps_the_column_collation() {
+    let mut connection = apply_translated_ddl(
+        r#"CREATE TABLE t (
+            id INTEGER PRIMARY KEY,
+            a INTEGER,
+            s TEXT COLLATE "NOCASE",
+            UNIQUE NULLS NOT DISTINCT (a, s)
+        );"#,
+        &default_options(),
+    );
+    insert_keyed(&mut connection, 1, None, Some("x")).expect("the first key is accepted");
+    let folded = insert_keyed(&mut connection, 2, None, Some("X"));
+    assert!(is_unique_violation(&folded), "NOCASE makes x and X the same key: {folded:?}");
 }
 
 /// `NULLS DISTINCT` is PostgreSQL's default and is exactly what SQLite does, so
-/// the clause is dropped rather than refused. Guards the rejection above from
-/// swallowing the harmless spelling.
+/// the clause is dropped rather than refused.
 #[test]
 fn unique_nulls_distinct_is_translated() {
     let sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT, UNIQUE NULLS DISTINCT (s));";

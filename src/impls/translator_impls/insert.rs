@@ -423,7 +423,11 @@ fn declared_constraint_name(constraint: &sqlparser::ast::UniqueConstraint) -> Op
 /// PostgreSQL 16 by reading `pg_constraint`: `<table>_pkey` for a primary key,
 /// and `<table>_<column>_key` for a unique constraint with every column joined
 /// by an underscore.
-fn postgres_constraint_name(table: &str, columns: &[String], is_primary_key: bool) -> String {
+pub(crate) fn postgres_constraint_name(
+    table: &str,
+    columns: &[String],
+    is_primary_key: bool,
+) -> String {
     if is_primary_key {
         return format!("{table}_pkey");
     }

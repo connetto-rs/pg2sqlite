@@ -325,22 +325,138 @@ fn gin_tsvector_translates_to_fts5() {
     );
 }
 
-/// The index path had the mirror image of the table-constraint defect: it
-/// cleared `nulls_distinct` unconditionally, so `NULLS NOT DISTINCT` was
-/// dropped silently rather than emitted. That is worse than the syntax error,
-/// because the emitted index accepts rows PostgreSQL rejects. Verified on both:
-/// PostgreSQL 16 refuses a second NULL, SQLite accepts it.
-#[test]
-fn unique_index_nulls_not_distinct_is_rejected() {
-    let error = translate_result(
-        "CREATE TABLE t (id INT PRIMARY KEY, s TEXT);
-         CREATE UNIQUE INDEX i ON t (s) NULLS NOT DISTINCT;",
+mod keyed {
+    diesel::table! {
+        t (id) {
+            id -> Integer,
+            s -> Nullable<Text>,
+            live -> Integer,
+        }
+    }
+
+    diesel::table! {
+        notes (id) {
+            id -> Integer,
+            title -> Nullable<Text>,
+        }
+    }
+
+    diesel::table! {
+        tags (id) {
+            id -> Integer,
+            label -> Nullable<Text>,
+        }
+    }
+}
+
+const KEYED_TABLE: &str = "CREATE TABLE t (id INT PRIMARY KEY, s TEXT, live INT NOT NULL);";
+
+/// Inserts one row into `t` of the translated schema.
+fn insert_keyed(
+    connection: &mut diesel::SqliteConnection,
+    id: i32,
+    s: Option<&str>,
+    live: i32,
+) -> diesel::QueryResult<usize> {
+    use diesel::prelude::*;
+    diesel::insert_into(keyed::t::table)
+        .values((keyed::t::id.eq(id), keyed::t::s.eq(s), keyed::t::live.eq(live)))
+        .execute(connection)
+}
+
+fn is_unique_violation(result: &diesel::QueryResult<usize>) -> bool {
+    matches!(
+        result,
+        Err(diesel::result::Error::DatabaseError(
+            diesel::result::DatabaseErrorKind::UniqueViolation,
+            _
+        ))
     )
-    .expect_err("NULLS NOT DISTINCT changes which rows collide and must be reported");
-    assert!(
-        error.to_uppercase().contains("NULLS NOT DISTINCT"),
-        "expected the error to name the clause, got {error}"
+}
+
+/// A repeated NULL key is a unique violation, among predicate rows only.
+#[test]
+fn unique_index_nulls_not_distinct_refuses_a_repeated_null() {
+    let mut connection = helpers::apply_translated_ddl(
+        &format!("{KEYED_TABLE} CREATE UNIQUE INDEX i ON t (s) NULLS NOT DISTINCT WHERE live = 1;"),
+        &Pg2SqliteOptions::default(),
     );
+    insert_keyed(&mut connection, 1, None, 1).expect("the first NULL key is accepted");
+    insert_keyed(&mut connection, 2, None, 0).expect("a NULL outside the predicate is accepted");
+    let repeated = insert_keyed(&mut connection, 3, None, 1);
+    assert!(is_unique_violation(&repeated), "a repeated NULL key must collide: {repeated:?}");
+}
+
+/// Dropping the index lifts its rule, in the same batch and in a migration.
+#[test]
+fn dropping_a_nulls_not_distinct_index_lifts_its_rule() {
+    let create = format!("{KEYED_TABLE} CREATE UNIQUE INDEX i ON t (s) NULLS NOT DISTINCT;");
+    let options = Pg2SqliteOptions::default();
+
+    let mut same_batch =
+        helpers::apply_translated_ddl(&format!("{create} DROP INDEX i;"), &options);
+    insert_keyed(&mut same_batch, 1, None, 1).expect("the first NULL key is accepted");
+    insert_keyed(&mut same_batch, 2, None, 1).expect("the index no longer collides NULLs");
+
+    let mut migrated = helpers::apply_translated_ddl(&create, &options);
+    let schema = Pg2Sqlite::default().sql(&create).unwrap().build_schema().unwrap();
+    let migration = Pg2Sqlite::default()
+        .sql("DROP INDEX i;")
+        .unwrap()
+        .translate_with_schema(&schema, &options)
+        .expect("translate the migration")
+        .into_vec();
+    for statement in &migration {
+        // Translated DDL, which the query DSL cannot express.
+        diesel::RunQueryDsl::execute(diesel::sql_query(statement.to_string()), &mut migrated)
+            .unwrap_or_else(|error| panic!("{error}\n{statement}"));
+    }
+    insert_keyed(&mut migrated, 1, None, 1).expect("the first NULL key is accepted");
+    insert_keyed(&mut migrated, 2, None, 1).expect("the index no longer collides NULLs");
+}
+
+/// An unnamed index leaves its companion no name for `DROP INDEX` to follow.
+#[test]
+fn unnamed_unique_index_nulls_not_distinct_is_refused() {
+    let error = translate_result(&format!(
+        "{KEYED_TABLE} CREATE UNIQUE INDEX ON t (s) NULLS NOT DISTINCT;"
+    ))
+    .expect_err("an unnamed NULLS NOT DISTINCT index must be refused");
+    assert!(error.contains("NULLS NOT DISTINCT"), "expected the error to name the clause: {error}");
+}
+
+/// On a secured table the rule holds for writes through the view.
+#[test]
+fn nulls_not_distinct_on_a_secured_table_holds_on_its_backing_table() {
+    use diesel::prelude::*;
+
+    let mut connection = helpers::apply_translated_ddl(
+        "CREATE TABLE notes (id INT PRIMARY KEY, title TEXT, UNIQUE NULLS NOT DISTINCT (title));
+         ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY anyone ON notes USING (true) WITH CHECK (true);
+         CREATE TABLE tags (id INT PRIMARY KEY, label TEXT);
+         ALTER TABLE tags ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY anyone ON tags USING (true) WITH CHECK (true);
+         CREATE UNIQUE INDEX tags_label ON tags (label) NULLS NOT DISTINCT;",
+        &Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit"),
+    );
+    let mut note = |id: i32| {
+        diesel::insert_into(keyed::notes::table)
+            .values((keyed::notes::id.eq(id), keyed::notes::title.eq(None::<&str>)))
+            .execute(&mut connection)
+    };
+    note(1).expect("the first NULL title is accepted");
+    let repeated = note(2);
+    assert!(is_unique_violation(&repeated), "a repeated NULL title must collide: {repeated:?}");
+
+    let mut tag = |id: i32| {
+        diesel::insert_into(keyed::tags::table)
+            .values((keyed::tags::id.eq(id), keyed::tags::label.eq(None::<&str>)))
+            .execute(&mut connection)
+    };
+    tag(1).expect("the first NULL label is accepted");
+    let repeated = tag(2);
+    assert!(is_unique_violation(&repeated), "a repeated NULL label must collide: {repeated:?}");
 }
 
 /// The default spelling matches SQLite, so the index still translates.

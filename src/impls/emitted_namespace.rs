@@ -353,6 +353,7 @@ fn generated_artifact_label(statement: &Statement) -> &'static str {
         Statement::CreateView(_) => "a generated RLS view",
         Statement::CreateTrigger(_) => "a generated trigger",
         Statement::CreateTable(_) => "a generated backing table",
+        Statement::CreateIndex(_) => "a generated NULLS NOT DISTINCT index",
         _ => "a generated statement",
     }
 }

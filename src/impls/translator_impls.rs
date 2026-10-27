@@ -31,6 +31,7 @@ mod helpers;
 pub(crate) use helpers::Forward;
 mod index_column;
 pub(crate) mod insert;
+mod nulls_not_distinct;
 mod order_by_expr;
 pub mod plpgsql;
 pub mod postgis;
