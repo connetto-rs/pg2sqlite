@@ -190,6 +190,41 @@ fn unique_nulls_not_distinct_keeps_the_column_collation() {
     assert!(is_unique_violation(&folded), "NOCASE makes x and X the same key: {folded:?}");
 }
 
+/// A named constraint with a `NOT NULL` key still collides on its nullable key.
+#[test]
+fn named_unique_nulls_not_distinct_with_a_not_null_key_refuses_a_repeated_null() {
+    let mut connection = apply_translated_ddl(
+        "CREATE TABLE t (
+            id INTEGER PRIMARY KEY,
+            a INTEGER NOT NULL,
+            s TEXT DEFAULT 'x',
+            CONSTRAINT pair UNIQUE NULLS NOT DISTINCT (a, s)
+        );",
+        &default_options(),
+    );
+    insert_keyed(&mut connection, 1, Some(1), None).expect("the first NULL key is accepted");
+    insert_keyed(&mut connection, 2, Some(2), None).expect("a different key is accepted");
+    let repeated = insert_keyed(&mut connection, 3, Some(1), None);
+    assert!(is_unique_violation(&repeated), "a repeated NULL key must collide: {repeated:?}");
+}
+
+/// A key that can never be NULL still refuses a repeated value.
+#[test]
+fn unique_nulls_not_distinct_over_not_null_keys_refuses_a_repeated_value() {
+    let mut connection = apply_translated_ddl(
+        "CREATE TABLE t (
+            id INTEGER PRIMARY KEY,
+            a INTEGER NOT NULL,
+            s TEXT,
+            UNIQUE NULLS NOT DISTINCT (a)
+        );",
+        &default_options(),
+    );
+    insert_keyed(&mut connection, 1, Some(1), None).expect("the first key is accepted");
+    let repeated = insert_keyed(&mut connection, 2, Some(1), None);
+    assert!(is_unique_violation(&repeated), "a repeated key must collide: {repeated:?}");
+}
+
 /// `NULLS DISTINCT` is PostgreSQL's default and is exactly what SQLite does, so
 /// the clause is dropped rather than refused.
 #[test]

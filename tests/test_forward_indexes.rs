@@ -347,6 +347,14 @@ mod keyed {
             label -> Nullable<Text>,
         }
     }
+
+    diesel::table! {
+        pairs (id) {
+            id -> Integer,
+            a -> Nullable<Integer>,
+            s -> Nullable<Text>,
+        }
+    }
 }
 
 const KEYED_TABLE: &str = "CREATE TABLE t (id INT PRIMARY KEY, s TEXT, live INT NOT NULL);";
@@ -385,6 +393,31 @@ fn unique_index_nulls_not_distinct_refuses_a_repeated_null() {
     insert_keyed(&mut connection, 2, None, 0).expect("a NULL outside the predicate is accepted");
     let repeated = insert_keyed(&mut connection, 3, None, 1);
     assert!(is_unique_violation(&repeated), "a repeated NULL key must collide: {repeated:?}");
+}
+
+/// A `COLLATE` written on an index key decides which values collide, beside a
+/// NULL too.
+#[test]
+fn unique_index_nulls_not_distinct_keeps_an_explicit_collation() {
+    use diesel::prelude::*;
+
+    let mut connection = helpers::apply_translated_ddl(
+        r#"CREATE TABLE pairs (id INT PRIMARY KEY, a INT, s TEXT);
+           CREATE UNIQUE INDEX pairs_a_s ON pairs (a, s COLLATE "NOCASE") NULLS NOT DISTINCT;"#,
+        &Pg2SqliteOptions::default(),
+    );
+    let mut pair = |id: i32, s: &str| {
+        diesel::insert_into(keyed::pairs::table)
+            .values((
+                keyed::pairs::id.eq(id),
+                keyed::pairs::a.eq(None::<i32>),
+                keyed::pairs::s.eq(s),
+            ))
+            .execute(&mut connection)
+    };
+    pair(1, "x").expect("the first key is accepted");
+    let folded = pair(2, "X");
+    assert!(is_unique_violation(&folded), "NOCASE makes x and X the same key: {folded:?}");
 }
 
 /// Dropping the index lifts its rule, in the same batch and in a migration.
