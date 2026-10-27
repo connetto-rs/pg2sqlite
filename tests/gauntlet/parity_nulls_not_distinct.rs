@@ -199,7 +199,7 @@ fn scenario() -> Vec<(Step, Outcome)> {
         // An update onto an existing key is refused, one onto its own is not.
         (Step::SetPair { id: 5, a: Some(1), b: None }, Refused),
         (Step::SetPair { id: 1, a: Some(1), b: None }, Accepted),
-        // The upsert treats the NULL collision as a conflict, as PostgreSQL does.
+        // The upsert skips the NULL collision, as PostgreSQL does.
         (Step::InsertPairOrNothing { id: 8, a: Some(1), b: None }, Accepted),
         // The foreign key still finds a unique key on the referenced columns.
         (Step::InsertChild { id: 1, a: Some(1), b: Some(0) }, Accepted),
