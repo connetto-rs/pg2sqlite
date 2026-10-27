@@ -28,7 +28,7 @@ use crate::{
         ast_builder,
         function_helpers::{simple_function_expr, string_literal},
         object_name::{
-            append_suffix, fts_table_name, last_ident_value_or_display,
+            append_suffix, fts_table_name, last_ident, last_ident_value_or_display,
             normalize_schema_qualified_object_name_for_sqlite, postgres_catalog_function_name,
             quoted_ident, resolve_translation_table, sqlite_unqualified_object_name,
             sync_trigger_name, translation_table_has_rls,
@@ -36,10 +36,10 @@ use crate::{
         query_builder::{
             from_relation, make_query, make_simple_select, plain_table_factor, single_expr_query,
         },
-        shared_helpers::{
-            ColumnReferences, extract_columns_from_expr, nulls_not_distinct_not_supported_error,
+        shared_helpers::{ColumnReferences, extract_columns_from_expr},
+        translator_impls::{
+            nulls_not_distinct::companion_index, postgis, rls::resolve_trigger_table_name,
         },
-        translator_impls::{postgis, rls::resolve_trigger_table_name},
     },
 };
 
@@ -562,16 +562,14 @@ impl crate::traits::translator::TranslatorWithContext for CreateIndex {
     ) -> Result<Self::SQLiteEntry, crate::errors::Error> {
         // An index expression and a partial index predicate name the indexed
         // table's own columns, with no query around them.
-        let index_scope =
-            crate::impls::object_name::resolve_translation_table(schema, &self.table_name)?.map(
-                |table| {
-                    sql_traits::structs::ColumnScope::for_table(
-                        table,
-                        schema,
-                        sql_traits::structs::IdentifierCase::AsWritten,
-                    )
-                },
-            );
+        let indexed_source = resolve_translation_table(schema, &self.table_name)?;
+        let index_scope = indexed_source.map(|table| {
+            sql_traits::structs::ColumnScope::for_table(
+                table,
+                schema,
+                sql_traits::structs::IdentifierCase::AsWritten,
+            )
+        });
         let scoped = index_scope.as_ref().map(|scope| options.with_scope(scope));
         let options = scoped.as_ref().unwrap_or(options);
         let sqlite_table_name =
@@ -612,34 +610,55 @@ impl crate::traits::translator::TranslatorWithContext for CreateIndex {
             };
         }
 
-        if self.nulls_distinct == Some(false) {
-            return Err(nulls_not_distinct_not_supported_error());
-        }
-
         report_dropped_index_clauses(self, emit);
-        let indexed_table = if translation_table_has_rls(schema, &self.table_name)? {
+        let backing_table = if translation_table_has_rls(schema, &self.table_name)? {
             append_suffix(&sqlite_table_name, options.get_rls_table_suffix())
         } else {
             sqlite_table_name
         };
+        let indexed_table = sqlite_unqualified_object_name(&backing_table);
         let definition_options = options.without_subqueries();
         let options = &definition_options;
+        let columns = self
+            .columns
+            .iter()
+            .map(|col| col.translate_with_warnings(schema, options, emit))
+            .collect::<Result<Vec<_>, _>>()?;
+        let predicate = self
+            .predicate
+            .as_ref()
+            .map(|predicate| predicate.translate_with_warnings(schema, options, emit))
+            .transpose()?;
+
+        let companion = if self.unique && self.nulls_distinct == Some(false) {
+            let Some(name) = self.name.as_ref().and_then(last_ident) else {
+                return Err(Error::forward_refusal(format!(
+                    "{self} cannot be translated without a name. SQLite enforces NULLS NOT \
+                     DISTINCT through a companion index named after this one, which DROP INDEX \
+                     removes along with it. Name the index."
+                )));
+            };
+            companion_index(
+                &name.value,
+                &indexed_table,
+                &columns,
+                indexed_source,
+                schema,
+                predicate.clone(),
+                self.if_not_exists,
+            )?
+        } else {
+            None
+        };
 
         // Regular index - translate normally, explicitly dropping PG-only
         // fields (using, concurrently, include, nulls_distinct, with,
         // index_options, alter_options) that are not valid in SQLite.
-        // `nulls_distinct` is only safe to drop for the DISTINCT
-        // spelling, refused above otherwise, because it decides which
-        // rows collide.
-        Ok(vec![Statement::CreateIndex(CreateIndex {
+        let mut statements = vec![Statement::CreateIndex(CreateIndex {
             name: self.name.clone(),
-            table_name: sqlite_unqualified_object_name(&indexed_table),
+            table_name: indexed_table,
             using: None,
-            columns: self
-                .columns
-                .iter()
-                .map(|col| col.translate_with_warnings(schema, options, emit))
-                .collect::<Result<_, _>>()?,
+            columns,
             unique: self.unique,
             concurrently: false,
             r#async: false,
@@ -647,14 +666,12 @@ impl crate::traits::translator::TranslatorWithContext for CreateIndex {
             include: vec![],
             nulls_distinct: None,
             with: vec![],
-            predicate: self
-                .predicate
-                .as_ref()
-                .map(|predicate| predicate.translate_with_warnings(schema, options, emit))
-                .transpose()?,
+            predicate,
             index_options: vec![],
             alter_options: vec![],
-        })])
+        })];
+        statements.extend(companion);
+        Ok(statements)
     }
 }
 

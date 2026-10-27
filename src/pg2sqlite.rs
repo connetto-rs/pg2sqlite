@@ -256,6 +256,8 @@ struct PreparedEpoch {
     /// Snapshots taken before each column change inside the epoch, which bind
     /// the references written before that change.
     bindings: Vec<(usize, ParserDB)>,
+    /// Snapshots taken before each `DROP INDEX`, which still hold its indexes.
+    before_index_drops: Vec<(usize, ParserDB)>,
 }
 
 impl PreparedEpoch {
@@ -265,6 +267,14 @@ impl PreparedEpoch {
             .iter()
             .find(|(change, _)| *change > index)
             .map_or(&self.schema, |(_, schema)| schema)
+    }
+
+    /// The schema statement `index` was written against.
+    fn written(&self, index: usize) -> &ParserDB {
+        self.before_index_drops
+            .iter()
+            .find(|(drop, _)| *drop == index)
+            .map_or_else(|| self.binding(index), |(_, schema)| schema)
     }
 }
 
@@ -658,15 +668,25 @@ impl Pg2Sqlite {
             let end = boundary.map_or(statements.len(), |index| index + 1);
             let schema_end = boundary.unwrap_or(end);
             let mut bindings = Vec::new();
+            let mut before_index_drops = Vec::new();
             for (index, statement) in statements[start..schema_end].iter().enumerate() {
                 if Self::changes_columns(statement) {
                     bindings.push((start + index, input.snapshot()));
+                }
+                if matches!(statement, Statement::Drop { object_type: ObjectType::Index, .. }) {
+                    before_index_drops.push((start + index, input.snapshot()));
                 }
                 if !Self::schema_statement_is_ignored(statement) {
                     input = input.apply_statement(statement.clone())?;
                 }
             }
-            epochs.push(PreparedEpoch { start, end, schema: input.snapshot(), bindings });
+            epochs.push(PreparedEpoch {
+                start,
+                end,
+                schema: input.snapshot(),
+                bindings,
+                before_index_drops,
+            });
             if let Some(index) = boundary {
                 match input.apply_statement(statements[index].clone()) {
                     Ok(next) => input = next,
@@ -735,7 +755,7 @@ impl Pg2Sqlite {
                     crate::impls::transaction_blocks::Disposition::Translate => {
                         translated.push(statement.translate_with_warnings(
                             &epoch.schema,
-                            &context.with_written_schema(epoch.binding(epoch.start + offset)),
+                            &context.with_written_schema(epoch.written(epoch.start + offset)),
                             &mut emit,
                         )?);
                     }
@@ -793,7 +813,7 @@ impl Pg2Sqlite {
         let units: Vec<crate::history::Unit<'_>> = epochs
             .iter()
             .flat_map(|epoch| {
-                (epoch.start..epoch.end).map(move |index| (index, epoch.binding(index)))
+                (epoch.start..epoch.end).map(move |index| (index, epoch.written(index)))
             })
             .map(|(index, binding)| {
                 crate::history::Unit {

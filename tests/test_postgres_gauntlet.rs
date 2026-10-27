@@ -39,6 +39,9 @@ mod parity_ddl;
 #[path = "gauntlet/parity_dml.rs"]
 mod parity_dml;
 
+#[path = "gauntlet/parity_nulls_not_distinct.rs"]
+mod parity_nulls_not_distinct;
+
 #[path = "gauntlet/parity_values.rs"]
 mod parity_values;
 

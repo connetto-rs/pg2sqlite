@@ -66,6 +66,7 @@ use crate::{
         translator_impls::{
             column::translate_column_def,
             condition_injection::inject_condition_into_dml_statement,
+            nulls_not_distinct::{companion_drops, table_companions},
             rls::{
                 generate_readonly_rls_statements_with_context,
                 generate_rls_statements_with_context, rename_table_for_rls,
@@ -514,16 +515,16 @@ fn build_create_table_statements(
     rls_statements: Option<Vec<Statement>>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Vec<Statement>, Error> {
-    let mut statements = if let Some(rls_statements) = rls_statements {
-        let translated_table = create_table.translate_with_warnings(schema, options, emit)?;
-        let inner_table = rename_table_for_rls(&translated_table, options, schema);
-        let mut statements = vec![Statement::CreateTable(inner_table)];
-        statements.extend(rls_statements);
-        statements
-    } else {
-        vec![Statement::CreateTable(create_table.translate_with_warnings(schema, options, emit)?)]
+    let translated_table = create_table.translate_with_warnings(schema, options, emit)?;
+    let emitted_table = match rls_statements {
+        Some(_) => rename_table_for_rls(&translated_table, options, schema),
+        None => translated_table,
     };
+    let companions = table_companions(create_table, &emitted_table.name, schema, options, emit)?;
 
+    let mut statements = vec![Statement::CreateTable(emitted_table)];
+    statements.extend(rls_statements.into_iter().flatten());
+    statements.extend(companions);
     append_vec0_statements_if_needed(&mut statements, create_table, schema, options, emit)?;
     Ok(statements)
 }
@@ -1872,7 +1873,7 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
                                 normalize_schema_qualified_object_name_for_sqlite(schema, name)
                             })
                             .collect::<Result<Vec<_>, _>>()?;
-                        vec![Statement::Drop {
+                        let mut statements = vec![Statement::Drop {
                             object_type: *object_type,
                             if_exists: *if_exists,
                             names: normalized_names,
@@ -1881,7 +1882,13 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
                             purge: false,
                             temporary: false,
                             table: None,
-                        }]
+                        }];
+                        if *object_type == ObjectType::Index {
+                            // `schema` has already dropped the index.
+                            let written = options.written_schema().unwrap_or(schema);
+                            statements.extend(companion_drops(names, written));
+                        }
+                        statements
                     }
                     // A schema, role, or type never reached the output, so
                     // dropping the statement removes nothing that exists. The

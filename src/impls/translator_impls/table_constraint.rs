@@ -21,9 +21,7 @@ use sqlparser::ast::{
 use crate::{
     impls::{
         object_name::{append_suffix, translation_table_has_rls},
-        shared_helpers::{
-            match_partial_not_supported_error, nulls_not_distinct_not_supported_error,
-        },
+        shared_helpers::match_partial_not_supported_error,
         translator_impls::constraint_characteristic::deferrability_outside_a_foreign_key,
     },
     traits::translator::TranslatorWithContext,
@@ -85,10 +83,6 @@ impl crate::traits::translator::TranslatorWithContext for TableConstraint {
                 Ok(vec![Self::PrimaryKey(updated_pk)])
             }
             Self::Unique(unique_constraint) => {
-                if matches!(unique_constraint.nulls_distinct, NullsDistinctOption::NotDistinct) {
-                    return Err(nulls_not_distinct_not_supported_error());
-                }
-
                 let mut updated_unique = unique_constraint.clone();
                 updated_unique.columns =
                     translate_index_columns(&unique_constraint.columns, schema, options, emit)?;
@@ -96,9 +90,7 @@ impl crate::traits::translator::TranslatorWithContext for TableConstraint {
                     return Err(deferrability_outside_a_foreign_key("UNIQUE", characteristics));
                 }
                 updated_unique.include = drop_include("UNIQUE", &unique_constraint.include, emit);
-                // `NULLS DISTINCT` is the default and is what SQLite does, so
-                // the clause is dropped rather than emitted: SQLite rejects it
-                // with `near "NULLS": syntax error`.
+                // `NOT DISTINCT` becomes a companion index instead.
                 updated_unique.nulls_distinct = NullsDistinctOption::None;
                 Ok(vec![Self::Unique(updated_unique)])
             }

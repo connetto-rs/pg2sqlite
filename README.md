@@ -64,6 +64,7 @@ Divergences that survive translation because the difference lives in the engines
 - **Transactions.** A failing statement aborts the whole transaction in PostgreSQL and leaves it open in SQLite, so applying a translated batch correctly means rolling back yourself once anything fails inside an open transaction.
 - **Compound `SELECT`.** PostgreSQL resolves one type per output column and SQLite decides per value, so `SELECT 1 UNION SELECT '1'` is one row on the server and two in the replica. Cast the branches when the type matters.
 - **Generated keys.** `SERIAL` and `IDENTITY` become `INTEGER PRIMARY KEY AUTOINCREMENT`. A supplied insert value moves the counter where a sequence ignores one, a rolled-back insert consumes no key, both reported as warnings, and inserts or updates that assign a `GENERATED ALWAYS` column are refused outright.
+- **`NULLS NOT DISTINCT`.** A unique key declared with it keeps its plain unique index and gains a companion unique index, named after it with `_nnd` appended, over `(key IS NULL, ifnull(key, 0))` for each key that can be NULL. A repeated NULL key is therefore an ordinary unique violation, and `ON CONFLICT DO NOTHING` skips it. `ON CONFLICT (key) DO UPDATE` aborts on a repeated NULL key where PostgreSQL updates the existing row, because SQLite matches that target to the plain index.
 - **RLS emulation.** An unqualified `UPDATE` or `DELETE` and `RETURNING` through the view can diverge from the server only when a row is readable under a wider predicate than it is writable.
 
 ## License
