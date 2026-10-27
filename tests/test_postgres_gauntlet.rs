@@ -50,3 +50,6 @@ mod parity_numeric;
 
 #[path = "gauntlet/parity_query.rs"]
 mod parity_query;
+
+#[path = "gauntlet/parity_index_names.rs"]
+mod parity_index_names;

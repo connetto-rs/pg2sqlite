@@ -448,14 +448,32 @@ fn dropping_a_nulls_not_distinct_index_lifts_its_rule() {
     insert_keyed(&mut migrated, 2, None, 1).expect("the index no longer collides NULLs");
 }
 
-/// An unnamed index leaves its companion no name for `DROP INDEX` to follow.
+/// An unnamed index enforces the rule, and `DROP INDEX` under the name
+/// PostgreSQL gives it lifts the rule with its companion.
 #[test]
-fn unnamed_unique_index_nulls_not_distinct_is_refused() {
-    let error = translate_result(&format!(
-        "{KEYED_TABLE} CREATE UNIQUE INDEX ON t (s) NULLS NOT DISTINCT;"
-    ))
-    .expect_err("an unnamed NULLS NOT DISTINCT index must be refused");
-    assert!(error.contains("NULLS NOT DISTINCT"), "expected the error to name the clause: {error}");
+fn unnamed_unique_index_nulls_not_distinct_follows_its_postgresql_name() {
+    let create = format!("{KEYED_TABLE} CREATE UNIQUE INDEX ON t (s) NULLS NOT DISTINCT;");
+    let options = Pg2SqliteOptions::default();
+
+    let mut created = helpers::apply_translated_ddl(&create, &options);
+    insert_keyed(&mut created, 1, None, 1).expect("the first NULL key is accepted");
+    let repeated = insert_keyed(&mut created, 2, None, 1);
+    assert!(is_unique_violation(&repeated), "a repeated NULL key must collide: {repeated:?}");
+
+    let mut dropped =
+        helpers::apply_translated_ddl(&format!("{create} DROP INDEX t_s_idx;"), &options);
+    insert_keyed(&mut dropped, 1, None, 1).expect("the first NULL key is accepted");
+    insert_keyed(&mut dropped, 2, None, 1).expect("the index no longer collides NULLs");
+}
+
+/// An index whose PostgreSQL name cannot be predicted is refused rather than
+/// emitted without one.
+#[test]
+fn unnamed_index_without_a_predictable_name_is_refused() {
+    let error =
+        translate_result(&format!("{KEYED_TABLE} CREATE INDEX ON t (((s || 'x')::nvarchar));"))
+            .expect_err("an index SQLite would reject must be refused");
+    assert!(error.contains("Name the index"), "expected the error to ask for a name: {error}");
 }
 
 /// On a secured table the rule holds for writes through the view.

@@ -28,7 +28,7 @@ use crate::{
         ast_builder,
         function_helpers::{simple_function_expr, string_literal},
         object_name::{
-            append_suffix, fts_table_name, last_ident, last_ident_value_or_display,
+            append_suffix, fts_table_name, last_ident_value_or_display,
             normalize_schema_qualified_object_name_for_sqlite, postgres_catalog_function_name,
             quoted_ident, resolve_translation_table, sqlite_unqualified_object_name,
             sync_trigger_name, translation_table_has_rls,
@@ -610,6 +610,13 @@ impl crate::traits::translator::TranslatorWithContext for CreateIndex {
             };
         }
 
+        // `Pg2Sqlite` names every index whose PostgreSQL name it can predict.
+        let Some(name) = &self.name else {
+            return Err(Error::forward_refusal(format!(
+                "{self} cannot be translated without a name, because the name PostgreSQL gives \
+                 this index cannot be predicted. Name the index."
+            )));
+        };
         report_dropped_index_clauses(self, emit);
         let backing_table = if translation_table_has_rls(schema, &self.table_name)? {
             append_suffix(&sqlite_table_name, options.get_rls_table_suffix())
@@ -631,15 +638,8 @@ impl crate::traits::translator::TranslatorWithContext for CreateIndex {
             .transpose()?;
 
         let companion = if self.unique && self.nulls_distinct == Some(false) {
-            let Some(name) = self.name.as_ref().and_then(last_ident) else {
-                return Err(Error::forward_refusal(format!(
-                    "{self} cannot be translated without a name. SQLite enforces NULLS NOT \
-                     DISTINCT through a companion index named after this one, which DROP INDEX \
-                     removes along with it. Name the index."
-                )));
-            };
             companion_index(
-                &name.value,
+                &last_ident_value_or_display(name),
                 &indexed_table,
                 &columns,
                 indexed_source,
@@ -655,7 +655,7 @@ impl crate::traits::translator::TranslatorWithContext for CreateIndex {
         // fields (using, concurrently, include, nulls_distinct, with,
         // index_options, alter_options) that are not valid in SQLite.
         let mut statements = vec![Statement::CreateIndex(CreateIndex {
-            name: self.name.clone(),
+            name: Some(name.clone()),
             table_name: indexed_table,
             using: None,
             columns,

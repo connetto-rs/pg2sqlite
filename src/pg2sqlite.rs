@@ -1,5 +1,6 @@
 //! Submodule defining the main translator struct.
 
+use alloc::borrow::Cow;
 #[cfg(not(feature = "std"))]
 #[allow(unused_imports)]
 use alloc::{
@@ -278,7 +279,9 @@ impl PreparedEpoch {
     }
 }
 
-struct PreparedSchema {
+struct PreparedSchema<'a> {
+    /// The statements as written, with each unnamed index given its name.
+    sources: Cow<'a, [Statement]>,
     schema: Result<ParserDB, crate::errors::Error>,
     options: Pg2SqliteOptions,
     epochs: Vec<PreparedEpoch>,
@@ -288,7 +291,7 @@ struct PreparedSchema {
     dispositions: Vec<crate::impls::transaction_blocks::Disposition>,
 }
 
-impl PreparedSchema {
+impl PreparedSchema<'_> {
     /// The translation context for this batch, borrowing `options`.
     fn context<'a>(&self, options: &'a Pg2SqliteOptions) -> TranslationContext<'a> {
         if self.complete {
@@ -299,7 +302,8 @@ impl PreparedSchema {
     }
 }
 
-struct PreparedStatements {
+struct PreparedStatements<'a> {
+    sources: Cow<'a, [Statement]>,
     schema: ParserDB,
     options: Pg2SqliteOptions,
     statements: Vec<Vec<Statement>>,
@@ -638,7 +642,7 @@ impl Pg2Sqlite {
         &self,
         options: &Pg2SqliteOptions,
         initial_schema: Option<&ParserDB>,
-    ) -> Result<PreparedSchema, crate::errors::Error> {
+    ) -> Result<PreparedSchema<'_>, crate::errors::Error> {
         use sql_traits::traits::DatabaseLike;
 
         let statements = &self.pg_statements;
@@ -656,6 +660,7 @@ impl Pg2Sqlite {
         let mut input = initial_schema
             .map_or_else(Self::translation_ingestor, |schema| schema.clone().into_ingestor());
         let mut epochs = Vec::new();
+        let mut named = Vec::new();
         let mut start = 0;
         let schema = loop {
             if start >= statements.len() {
@@ -677,7 +682,18 @@ impl Pg2Sqlite {
                     before_index_drops.push((start + index, input.snapshot()));
                 }
                 if !Self::schema_statement_is_ignored(statement) {
-                    input = input.apply_statement(statement.clone())?;
+                    let mut applied = statement.clone();
+                    // PostgreSQL names an unnamed index against the catalog as
+                    // it stands.
+                    if let Statement::CreateIndex(create_index) = &mut applied
+                        && create_index.name.is_none()
+                        && let Some(name) = input.create_index_name(create_index)?
+                    {
+                        let name = ObjectName(vec![ObjectNamePart::Identifier(name)]);
+                        create_index.name = Some(name.clone());
+                        named.push((start + index, name));
+                    }
+                    input = input.apply_statement(applied)?;
                 }
             }
             epochs.push(PreparedEpoch {
@@ -696,7 +712,19 @@ impl Pg2Sqlite {
             start = end;
         };
 
+        let sources = if named.is_empty() {
+            Cow::Borrowed(statements.as_slice())
+        } else {
+            let mut sources = statements.clone();
+            for (index, name) in named {
+                if let Statement::CreateIndex(create_index) = &mut sources[index] {
+                    create_index.name = Some(name);
+                }
+            }
+            Cow::Owned(sources)
+        };
         Ok(PreparedSchema {
+            sources,
             schema,
             options,
             epochs,
@@ -707,15 +735,15 @@ impl Pg2Sqlite {
         })
     }
 
-    fn translate_prepared(
-        &self,
-        prepared: PreparedSchema,
+    fn translate_prepared<'a>(
+        prepared: PreparedSchema<'a>,
         context: &mut TranslationContext<'_>,
         mut should_translate: impl FnMut(&Statement) -> bool,
-    ) -> Result<PreparedStatements, crate::errors::Error> {
+    ) -> Result<PreparedStatements<'a>, crate::errors::Error> {
         use sql_traits::traits::DatabaseLike;
 
         let PreparedSchema {
+            sources,
             schema,
             options,
             epochs,
@@ -724,7 +752,7 @@ impl Pg2Sqlite {
             dispositions,
             initial_schema,
         } = prepared;
-        let statements = &self.pg_statements;
+        let statements = &*sources;
         populate_prewalk_catalogs(statements, context);
 
         let mut warnings = Vec::new();
@@ -778,6 +806,7 @@ impl Pg2Sqlite {
         )?;
 
         Ok(PreparedStatements {
+            sources,
             schema,
             options,
             statements: translated,
@@ -796,6 +825,7 @@ impl Pg2Sqlite {
         let prepared = self.prepare_schema(options, initial_schema)?;
         let mut context = prepared.context(options);
         let PreparedStatements {
+            sources,
             schema,
             options: _,
             mut statements,
@@ -803,13 +833,9 @@ impl Pg2Sqlite {
             mut warnings,
             epochs,
             dispositions,
-        } = self.translate_prepared(prepared, &mut context, |_| true)?;
-        let mut placed = crate::history::placement::place(
-            &self.pg_statements,
-            &mut statements,
-            &schema,
-            options,
-        )?;
+        } = Self::translate_prepared(prepared, &mut context, |_| true)?;
+        let mut placed =
+            crate::history::placement::place(&sources, &mut statements, &schema, options)?;
         let units: Vec<crate::history::Unit<'_>> = epochs
             .iter()
             .flat_map(|epoch| {
@@ -817,7 +843,7 @@ impl Pg2Sqlite {
             })
             .map(|(index, binding)| {
                 crate::history::Unit {
-                    source: &self.pg_statements[index],
+                    source: &sources[index],
                     binding,
                     emitted: &statements[index],
                     disposition: &dispositions[index],
@@ -1093,19 +1119,15 @@ impl Pg2Sqlite {
 
         let prepared = self.prepare_schema(options, None)?;
         let mut context = prepared.context(options);
-        let PreparedStatements { schema, options, mut statements, .. } = self.translate_prepared(
-            prepared,
-            &mut context,
-            Self::manifest_statement_needs_translation,
-        )?;
+        let PreparedStatements { sources, schema, options, mut statements, .. } =
+            Self::translate_prepared(
+                prepared,
+                &mut context,
+                Self::manifest_statement_needs_translation,
+            )?;
         let schema = &schema;
         let options = &options;
-        let placed = crate::history::placement::place(
-            &self.pg_statements,
-            &mut statements,
-            schema,
-            options,
-        )?;
+        let placed = crate::history::placement::place(&sources, &mut statements, schema, options)?;
 
         let role = options.get_session_user_role().and_then(|name| schema.role(name));
 
