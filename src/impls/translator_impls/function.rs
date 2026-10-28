@@ -212,8 +212,8 @@ pub(crate) const FORWARD_RENAMES: &[(&str, &str)] = &[
     ("strpos", "INSTR"),
     // chr is NOT a rename: PostgreSQL refuses code point 0 where SQLite's
     // char makes a one-byte NUL string. See `FunctionTranslation::Chr`.
-    // The JSON constructors are NOT renames: each argument is converted by its type first.
-    // See `json_value`.
+    // The JSON constructors are NOT renames: each argument is converted by its
+    // type first. See `json_value`.
     ("btrim", "trim"),
     // jsonb_array_length is NOT a rename: SQLite answers 0 for a non-array
     // where PostgreSQL raises. See `FunctionTranslation::JsonArrayLength`.
