@@ -1949,7 +1949,9 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
             Self::CreateUser(_) => drop_with_warning("CREATE USER", REASON_ACCESS_CONTROL, emit),
             Self::AlterRole { .. } => drop_with_warning("ALTER ROLE", REASON_ACCESS_CONTROL, emit),
             Self::AlterUser(_) => drop_with_warning("ALTER USER", REASON_ACCESS_CONTROL, emit),
-            Self::Grant(_) => drop_with_warning("GRANT", REASON_ACCESS_CONTROL, emit),
+            Self::Grant(_) | Self::GrantRole(_) => {
+                drop_with_warning("GRANT", REASON_ACCESS_CONTROL, emit)
+            }
             Self::Revoke(_) => drop_with_warning("REVOKE", REASON_ACCESS_CONTROL, emit),
             Self::Deny { .. } => drop_with_warning("DENY", REASON_ACCESS_CONTROL, emit),
             Self::CreateType { .. } => {

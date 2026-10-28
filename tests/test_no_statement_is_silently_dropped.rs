@@ -76,6 +76,10 @@ const TABLE_AND_ROLE: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT); C
 const TABLE_ROLE_AND_GRANT: &str =
     "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT); CREATE ROLE r; GRANT SELECT ON t TO r;";
 
+/// A membership `GRANT` names a role on each side, so both have to exist.
+const TWO_ROLES: &str =
+    "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT); CREATE ROLE r; CREATE ROLE u;";
+
 const fn emitted(sql: &'static str) -> Case {
     Case { setup: TABLE, sql, outcome: Outcome::Emitted }
 }
@@ -167,6 +171,7 @@ const CASES: &[Case] = &[
         sql: "REVOKE SELECT ON t FROM r",
         outcome: Outcome::Warned,
     },
+    Case { setup: TWO_ROLES, sql: "GRANT r TO u", outcome: Outcome::Warned },
     warned("DENY SELECT ON t TO r"),
     warned("DROP ROLE r"),
     warned("DROP USER r"),
