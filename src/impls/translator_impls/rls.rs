@@ -28,6 +28,7 @@ use sql_traits::{
     errors::LookupError,
     structs::{IdentifierCase, ParserDB, TargetName},
     traits::{ColumnLike, DatabaseLike, PolicyLike, TableLike, TriggerLike},
+    utils::identifier_resolution::{is_public_pseudo_role, normalize_identifier},
 };
 use sqlparser::{
     ast::{
@@ -781,15 +782,12 @@ fn build_row_identity_clause(columns: &[String], pk_columns: &[String]) -> Expr 
         .expect("a table has at least one identity column")
 }
 
-/// Returns the policies that apply to the given commands, filtered by the
-/// session user role when a non-PUBLIC `TO` clause is present.
+/// Returns the policies for `commands` that apply to the session user role.
 ///
-/// A policy applies when its `TO` list is empty (PUBLIC), contains the literal
-/// `PUBLIC` role, or contains the configured session user role (exact name
-/// match; no membership graph is consulted). When a policy has a non-PUBLIC
-/// role restriction and no session user role is configured with
-/// `with_session_user_role`, translation is refused so the caller does not
-/// silently apply a policy to the wrong audience.
+/// A session role the schema never declares has no recorded memberships, so
+/// it gets only the `PUBLIC` policies and those whose `TO` clause names it. A
+/// policy naming a role is refused without `with_session_user_role`, so it
+/// never reaches the wrong audience.
 fn filter_policies<'a>(
     table: &'a CreateTable,
     schema: &'a ParserDB,
@@ -797,41 +795,43 @@ fn filter_policies<'a>(
     options: &Pg2SqliteOptions,
 ) -> Result<Vec<&'a CreatePolicy>, Error> {
     let session_role = options.get_session_user_role();
+    let declared_role = session_role.and_then(|name| schema.role(name));
     let mut policies = Vec::new();
     for policy in table.policies(schema)? {
         let command = policy.command();
         if !commands.contains(&command) && command != CreatePolicyCommand::All {
             continue;
         }
-        // Determine whether this policy applies given its TO clause.
-        let mut applies = false;
-        let mut has_non_public_role = false;
-        let roles: Vec<_> = policy.roles(schema).collect();
-        if roles.is_empty() {
-            // No TO clause means PUBLIC.
-            applies = true;
-        } else {
-            for owner in &roles {
-                if let Owner::Ident(ident) = owner {
-                    if ident.value.eq_ignore_ascii_case("PUBLIC") {
-                        applies = true;
-                    } else {
-                        has_non_public_role = true;
-                        if session_role.is_some_and(|role| ident.value == role) {
-                            applies = true;
-                        }
-                    }
+        let mut named_roles = policy.roles(schema).filter_map(|owner| {
+            match owner {
+                Owner::Ident(ident)
+                    if !is_public_pseudo_role(&ident.value, ident.quote_style.is_some()) =>
+                {
+                    Some(ident)
                 }
+                _ => None,
             }
-        }
-        if has_non_public_role && session_role.is_none() {
-            return Err(Error::forward_refusal(format!(
-                "policy '{}' on table '{}' is scoped to a specific role. \
-                 Call with_session_user_role to specify which role this translation targets.",
-                policy.name(),
-                table.table_name(),
-            )));
-        }
+        });
+        let applies = match (declared_role, session_role) {
+            (Some(role), _) => policy.applies_to_role(role, schema),
+            (None, Some(name)) => {
+                policy.applies_to_public()
+                    || named_roles.any(|ident| {
+                        normalize_identifier(&ident.value, ident.quote_style.is_some()) == name
+                    })
+            }
+            (None, None) => {
+                if named_roles.next().is_some() {
+                    return Err(Error::forward_refusal(format!(
+                        "policy '{}' on table '{}' is scoped to a specific role. \
+                         Call with_session_user_role to specify which role this translation targets.",
+                        policy.name(),
+                        table.table_name(),
+                    )));
+                }
+                policy.applies_to_public()
+            }
+        };
         if applies {
             policies.push(policy);
         }
