@@ -1024,6 +1024,24 @@ fn interval_counts_keep_their_own_signs() {
 }
 
 #[test]
+fn a_positive_interval_count_after_a_negative_one_is_printed_with_a_plus() {
+    // What PostgreSQL 18 prints for each literal under the default
+    // IntervalStyle.
+    for (literal, printed) in [
+        ("-1 day 2 hours", "-1 days +02:00:00"),
+        ("-1 day +2 hours", "-1 days +02:00:00"),
+        ("-1 mon 2 days", "-1 mons +2 days"),
+        ("-1 day -2 hours", "-1 days -02:00:00"),
+        ("1 year -1 day", "1 year -1 days"),
+        ("1 day 02:00:00", "1 day 02:00:00"),
+        ("-1 year 1 day 2 hours", "-1 years +1 day 02:00:00"),
+        ("1 mon -1 day 2 hours", "1 mon -1 days +02:00:00"),
+    ] {
+        assert_eq!(interval_text(literal), vec![Some(printed.to_string())], "{literal}");
+    }
+}
+
+#[test]
 fn an_interval_second_keeps_its_microseconds() {
     assert_eq!(interval_text("1.000001 seconds"), vec![Some("00:00:01.000001".to_string())]);
     assert_eq!(interval_text("1 microsecond"), vec![Some("00:00:00.000001".to_string())]);
