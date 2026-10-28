@@ -78,8 +78,16 @@ fn opts_without_role() -> Pg2SqliteOptions {
 }
 
 fn apply(opts: &Pg2SqliteOptions) -> SqliteConnection {
-    let stmts =
-        Pg2Sqlite::default().sql(PG).expect("parse").translate(opts).expect("translate").into_vec();
+    apply_schema(PG, opts)
+}
+
+fn apply_schema(sql: &str, opts: &Pg2SqliteOptions) -> SqliteConnection {
+    let stmts = Pg2Sqlite::default()
+        .sql(sql)
+        .expect("parse")
+        .translate(opts)
+        .expect("translate")
+        .into_vec();
     let mut conn = SqliteConnection::establish(":memory:").expect("open db");
     app_user_utils::register_impl(&mut conn, || "alice".to_string()).expect("register app_user");
     for s in &stmts {
@@ -121,6 +129,33 @@ fn role_scoped_policy_excluded_when_session_role_mismatch() {
         count, 1,
         "alice must see only her own rows when admin policy is excluded by role, got {count}"
     );
+}
+
+/// A policy scoped to a role applies to the members that inherit its
+/// privileges.
+#[test]
+fn role_scoped_policy_applies_to_inheriting_member() {
+    let sql = format!(
+        "CREATE ROLE admin; CREATE ROLE app_user; GRANT admin TO app_user; {PG} \
+         GRANT SELECT, INSERT ON docs TO admin;"
+    );
+    let mut conn = apply_schema(&sql, &opts_with_role());
+    seed(&mut conn);
+
+    let count: i64 = docs::table.count().get_result(&mut conn).expect("count");
+    assert_eq!(count, 2, "admin_read must apply to app_user through its membership in admin");
+}
+
+/// An undeclared session role matches a `TO` entry under PostgreSQL's case
+/// folding.
+#[test]
+fn undeclared_session_role_matches_folded_policy_role() {
+    let sql = PG.replace("TO admin", "TO App_User");
+    let mut conn = apply_schema(&sql, &opts_with_role());
+    seed(&mut conn);
+
+    let count: i64 = docs::table.count().get_result(&mut conn).expect("count");
+    assert_eq!(count, 2, "TO App_User names app_user, so admin_read must apply");
 }
 
 /// Without with_session_user_role, a batch containing a non-PUBLIC TO clause
