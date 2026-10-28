@@ -124,3 +124,24 @@ fn to_json_over_an_unresolvable_column_is_refused() {
     );
     assert!(error.contains("ghost"), "the refusal must name the column: {error}");
 }
+
+/// A vector is stored as packed floats, which has no text form in SQL, so the
+/// statement is refused rather than failing on SQLite's BLOB refusal.
+#[test]
+fn a_json_constructor_over_a_vector_is_refused() {
+    let error = translate_err(
+        "CREATE TABLE e (id INT PRIMARY KEY, v vector(3));
+         SELECT json_build_array(v) FROM e;",
+    );
+    assert!(error.contains("vector"), "the refusal must name the type: {error}");
+}
+
+/// PostgreSQL refuses a document as an object key.
+#[test]
+fn a_json_document_as_an_object_key_is_refused() {
+    let error = translate_err(
+        "CREATE TABLE t (id INT PRIMARY KEY, doc JSONB);
+         SELECT json_build_object(doc, 1) FROM t;",
+    );
+    assert!(error.contains("key"), "the refusal must say the key is the problem: {error}");
+}

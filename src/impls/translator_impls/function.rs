@@ -21,6 +21,7 @@ use sqlparser::ast::{
 use super::{
     array::{self, ArrayFunction},
     helpers::{Forward, translate_window_type},
+    json_value::{json_argument, json_key, json_value},
     postgis,
 };
 use crate::{
@@ -40,8 +41,7 @@ use crate::{
         session_variable,
         shared_helpers::{
             GENERATE_SERIES_UNSUPPORTED_MESSAGE, declared_in_scope, declared_type_matches,
-            function_argument_exprs, referenced_column_name, rescale_minor_units, scale_of,
-            translate_function_arguments,
+            function_argument_exprs, rescale_minor_units, scale_of, translate_function_arguments,
         },
         temporal_arithmetic::{
             epoch_of_temporal_difference, subsecond_timestamp_from_epoch, trim_trailing_zeros,
@@ -175,9 +175,9 @@ enum FunctionTranslation {
     /// `chr`, whose code point 0 PostgreSQL refuses while SQLite's `char`
     /// answers a one-byte NUL string that `length` then reads as empty.
     Chr,
-    /// `json_build_object`, whose keys PostgreSQL coerces to text where
-    /// SQLite's `json_object` answers `labels must be TEXT` when the query
-    /// runs.
+    /// `json_build_array`, whose arguments are converted by type.
+    JsonBuildArray,
+    /// `json_build_object`, whose keys and values are converted by type.
     JsonBuildObject,
     /// `json_array_length`, which PostgreSQL raises over a non-array where
     /// SQLite answers 0.
@@ -212,10 +212,8 @@ pub(crate) const FORWARD_RENAMES: &[(&str, &str)] = &[
     ("strpos", "INSTR"),
     // chr is NOT a rename: PostgreSQL refuses code point 0 where SQLite's
     // char makes a one-byte NUL string. See `FunctionTranslation::Chr`.
-    ("json_build_array", "json_array"),
-    // json_build_object is NOT a rename: PostgreSQL coerces a key to text
-    // where SQLite answers `json_object() labels must be TEXT`. See
-    // `FunctionTranslation::JsonBuildObject`.
+    // The JSON constructors are NOT renames: each argument is converted by its type first.
+    // See `json_value`.
     ("btrim", "trim"),
     // jsonb_array_length is NOT a rename: SQLite answers 0 for a non-array
     // where PostgreSQL raises. See `FunctionTranslation::JsonArrayLength`.
@@ -713,8 +711,7 @@ fn translate_catalog_function(
             .to_string(),
     ),
     "to_char" => FunctionTranslation::ToChar,
-    // json_build_array(v, ...) -> json_array(v, ...) (handle remaining jsonb_build_*)
-    "jsonb_build_array" => FunctionTranslation::Rename("json_array".to_string()),
+    "json_build_array" | "jsonb_build_array" => FunctionTranslation::JsonBuildArray,
     "chr" => FunctionTranslation::Chr,
     "json_build_object" | "jsonb_build_object" => FunctionTranslation::JsonBuildObject,
     "json_array_length" | "jsonb_array_length" => FunctionTranslation::JsonArrayLength,
@@ -1237,16 +1234,10 @@ fn declares_function_by_option(name: &str, options: &Pg2SqliteOptions) -> bool {
 
 /// True when `expr` already carries JSON, so `to_json` has nothing to convert.
 ///
-/// Recognised syntactically, which covers what this translator itself emits and
-/// what a migration writes inline: an array literal, which becomes JSON text
-/// under the JSON array representation, and a call to a function that returns
-/// JSON.
-///
-/// It cannot see through a bare column reference, so an array or `json` COLUMN
-/// takes the `json_quote` path and is quoted into a string, which is wrong and
-/// needs the column's declared type to fix. Tracked as R89.
+/// Recognised syntactically, so a column's document is found by `json_value`
+/// from its type.
 #[cfg_attr(feature = "std", recursive::recursive)]
-fn is_already_json(expr: &Expr) -> bool {
+pub(crate) fn is_already_json(expr: &Expr) -> bool {
     const JSON_VALUED: [&str; 10] = [
         "json",
         "jsonb",
@@ -1311,13 +1302,14 @@ fn postgres_json_type_name(sqlite_type: Expr) -> Expr {
     }
 }
 
-/// Swaps the first positional argument of an already translated argument list,
-/// leaving `ORDER BY`, `DISTINCT`, and the rest of the clauses in place.
-fn replace_first_argument(args: &mut FunctionArguments, replacement: Expr) {
+/// Swaps the positional argument at `index` of an already translated argument
+/// list, leaving `ORDER BY`, `DISTINCT`, and the rest of the clauses in place.
+fn replace_argument(args: &mut FunctionArguments, index: usize, replacement: Expr) {
     if let FunctionArguments::List(list) = args
-        && let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(first))) = list.args.first_mut()
+        && let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))) =
+            list.args.get_mut(index)
     {
-        *first = replacement;
+        *argument = replacement;
     }
 }
 
@@ -2255,11 +2247,18 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                     translate_window_type(func.over.as_ref(), schema, options, emit)?,
                 ))
             }
+            FunctionTranslation::JsonBuildArray => {
+                let arguments = function_argument_exprs(&func.args)
+                    .into_iter()
+                    .map(|argument| json_value(argument, "json_build_array", schema, options, emit))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(simple_function_expr(
+                    "json_array",
+                    arguments,
+                    translate_window_type(func.over.as_ref(), schema, options, emit)?,
+                ))
+            }
             FunctionTranslation::JsonBuildObject => {
-                // PostgreSQL answers {"1" : 2} for json_build_object(1, 2),
-                // coercing the key, where SQLite answers `json_object()
-                // labels must be TEXT` at run time. Every key position is
-                // cast; the values are left alone.
                 let exprs = function_argument_exprs(&func.args);
                 if !exprs.len().is_multiple_of(2) {
                     return Err(crate::errors::Error::forward_refusal(
@@ -2269,18 +2268,9 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                     ));
                 }
                 let mut arguments = Vec::with_capacity(exprs.len());
-                for (index, argument) in exprs.iter().enumerate() {
-                    let translated = argument.translate_with_warnings(schema, options, emit)?;
-                    arguments.push(if index.is_multiple_of(2) {
-                        Expr::Cast {
-                            expr: Box::new(translated),
-                            data_type: DataType::Text,
-                            format: None,
-                            kind: CastKind::Cast,
-                        }
-                    } else {
-                        translated
-                    });
+                for [key, value] in exprs.as_chunks::<2>().0 {
+                    arguments.push(json_key(key, "json_build_object", schema, options, emit)?);
+                    arguments.push(json_value(value, "json_build_object", schema, options, emit)?);
                 }
                 Ok(simple_function_expr(
                     "json_object",
@@ -2335,68 +2325,7 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                          type, as {argument}::text."
                     )));
                 }
-
-                // A boolean converts to the JSON words, which PostgreSQL
-                // writes as `true` and `false` where the translated integer
-                // gave 1 and 0.
-                if crate::impls::translator_impls::expr::is_boolean_expression(
-                    argument, schema, options,
-                )? {
-                    let rendered = crate::impls::translator_impls::expr::render_boolean_as_text(
-                        argument, schema, options, emit,
-                    )?;
-                    return Ok(simple_function_expr("json", vec![rendered], None));
-                }
-
-                let translated = argument.translate_with_warnings(schema, options, emit)?;
-
-                // An argument that is already JSON needs reading, not
-                // converting: quoting it would turn the document into a
-                // string. For a bare column the declared type is the only
-                // thing separating a document from its own text, so a column
-                // the schema cannot settle is refused rather than guessed,
-                // since either guess is wrong for the other's type.
-                if is_already_json(argument) {
-                    return Ok(simple_function_expr("json", vec![translated], None));
-                }
-                if referenced_column_name(argument).is_some() {
-                    match declared_in_scope(
-                        argument,
-                        schema,
-                        options,
-                        |column| Some(is_json_document_type(&column.data_type, options)),
-                        |expression, schema, options| {
-                            Ok(Some(carries_json(expression, schema, options)?))
-                        },
-                    )? {
-                        Some(true) => {
-                            return Ok(simple_function_expr("json", vec![translated], None));
-                        }
-                        Some(false) => {}
-                        None => {
-                            return Err(crate::errors::Error::forward_refusal(format!(
-                                "to_json({argument}) names a column the translation schema cannot \
-                                                 resolve to one declared type, and a json, jsonb, or array column \
-                                                 must be read as a document where any other is quoted into a \
-                                                 string. Include the column's table in the translation batch, or \
-                                                 qualify the reference so the type is unambiguous."
-                            )));
-                        }
-                    }
-                }
-
-                // `json_quote` renders SQL NULL as the JSON text `null` where
-                // PostgreSQL yields SQL NULL, and it produces that bare `null`
-                // for no other input, so NULLIF restores it while evaluating
-                // the argument once.
-                Ok(simple_function_expr(
-                    "NULLIF",
-                    vec![
-                        simple_function_expr("json_quote", vec![translated], None),
-                        string_literal("null"),
-                    ],
-                    None,
-                ))
+                Ok(json_argument(argument, "to_json", schema, options, emit)?.into_to_json())
             }
             FunctionTranslation::Extremum { greatest } => {
                 let exprs = function_argument_exprs(&func.args);
@@ -2585,20 +2514,10 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                         "json_agg takes exactly one argument".to_string(),
                     ));
                 };
-                let element = argument.translate_with_warnings(schema, options, emit)?;
-                // A JSON column is TEXT here, so json_group_array would quote
-                // the document into a string. Reading it back with json() is
-                // only safe for a column declared JSON: json('hello') is
-                // `malformed JSON`.
-                let element = if carries_json(argument, schema, options)? {
-                    simple_function_expr("json", vec![element], None)
-                } else {
-                    element
-                };
-
+                let element = json_value(argument, "json_agg", schema, options, emit)?;
                 let mut args =
                     translate_function_arguments::<Forward>(&func.args, schema, options, emit)?;
-                replace_first_argument(&mut args, element);
+                replace_argument(&mut args, 0, element);
                 let aggregate = Expr::Function(Function {
                     name: ObjectName::from(vec![Ident::new("json_group_array")]),
                     parameters: translate_function_arguments::<Forward>(
@@ -2619,10 +2538,19 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                 Ok(crate::impls::idioms::nullif_empty_json_array(aggregate))
             }
             FunctionTranslation::JsonObjectAgg => {
-                // Translate the arguments (key and value) and build
-                // json_group_object.
-                let args =
+                let exprs = function_argument_exprs(&func.args);
+                let [key, value] = exprs.as_slice() else {
+                    return Err(crate::errors::Error::forward_refusal(
+                        "json_object_agg takes exactly two arguments, a key and a value"
+                            .to_string(),
+                    ));
+                };
+                let key = json_key(key, "json_object_agg", schema, options, emit)?;
+                let value = json_value(value, "json_object_agg", schema, options, emit)?;
+                let mut args =
                     translate_function_arguments::<Forward>(&func.args, schema, options, emit)?;
+                replace_argument(&mut args, 0, key);
+                replace_argument(&mut args, 1, value);
                 let aggregate = Expr::Function(Function {
                     name: ObjectName::from(vec![Ident::new("json_group_object")]),
                     parameters: translate_function_arguments::<Forward>(

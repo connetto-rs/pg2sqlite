@@ -25,15 +25,18 @@
 use diesel::{Connection, RunQueryDsl, SqliteConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
-/// Helper: translate a PG `SELECT ... FROM t` statement, then execute it
-/// against an in-memory SQLite database (pre-populated with a minimal
-/// `t (a, b, c)` table) and assert it both translates and runs.
+/// Helper: translate a PG `SELECT ... FROM t` statement after a minimal
+/// `t (a, b, c)` table and one row, then execute it against an in-memory
+/// SQLite database and assert it both translates and runs.
 ///
 /// Returns the translated SQL text on success so the assertion can also
 /// inspect the rewrite shape.
 fn assert_translates_and_runs(pg_sql: &str) -> String {
     let stmts = Pg2Sqlite::default()
-        .sql(pg_sql)
+        .sql(&format!(
+            "CREATE TABLE t (a TEXT, b TEXT, c TEXT); \
+             INSERT INTO t (a, b, c) VALUES ('x', 'y', 'z'); {pg_sql}"
+        ))
         .and_then(|t| {
             t.translate(&Pg2SqliteOptions::default()).map(pg2sqlite::script::Script::into_vec)
         })
@@ -42,12 +45,6 @@ fn assert_translates_and_runs(pg_sql: &str) -> String {
     let translated_sql = stmts.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("; ");
 
     let mut conn = SqliteConnection::establish(":memory:").expect("open in-memory SQLite");
-    diesel::sql_query("CREATE TABLE t (a TEXT, b TEXT, c TEXT)")
-        .execute(&mut conn)
-        .expect("seed schema");
-    diesel::sql_query("INSERT INTO t (a, b, c) VALUES ('x', 'y', 'z')")
-        .execute(&mut conn)
-        .expect("seed row");
 
     for stmt in &stmts {
         diesel::sql_query(stmt.to_string()).execute(&mut conn).unwrap_or_else(|e| {
