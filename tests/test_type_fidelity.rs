@@ -420,6 +420,66 @@ fn numeric_scaled_array_column_is_refused() {
     );
 }
 
+// ── Arrays of a type stored as BLOB ──────────────────────────────────────────
+
+fn blob_uuid_array_opts() -> Pg2SqliteOptions {
+    array_opts().with_uuid_representation(UuidRepresentation::Blob)
+}
+
+#[test]
+fn array_columns_of_blob_stored_types_are_refused() {
+    // Every element lands as a BLOB (unhex(...), vec_f32(...)), and SQLite's
+    // json_array refuses one, so each write of a non-empty array would fail
+    // at run time.
+    for (ddl, opts, element) in [
+        ("CREATE TABLE b (id INT PRIMARY KEY, blobs BYTEA[]);", array_opts(), "BYTEA"),
+        ("CREATE TABLE u (id INT PRIMARY KEY, ids UUID[]);", blob_uuid_array_opts(), "UUID"),
+        ("CREATE TABLE v (id INT PRIMARY KEY, e vector(3)[]);", array_opts(), "vector(3)"),
+    ] {
+        expect_refusal(
+            ddl,
+            &opts,
+            &format!("a JSON array cannot hold the BLOB {element} is stored as"),
+        );
+    }
+}
+
+#[test]
+fn arrays_built_from_blob_stored_elements_are_refused() {
+    let schema = "CREATE TABLE t (id INT PRIMARY KEY, b BYTEA, u UUID, tags TEXT[]);";
+    for (query, element) in [
+        ("SELECT ARRAY[b] FROM t;", "BYTEA"),
+        ("SELECT ARRAY['\\x0102'::bytea] FROM t;", "BYTEA"),
+        ("SELECT ARRAY[(u)] FROM t;", "UUID"),
+        ("SELECT array_agg(u) FROM t;", "UUID"),
+        ("SELECT array_append(tags, b) FROM t;", "BYTEA"),
+        ("SELECT array_prepend(b, tags) FROM t;", "BYTEA"),
+        ("SELECT tags || b FROM t;", "BYTEA"),
+        ("SELECT array_replace(tags, NULL, b) FROM t;", "BYTEA"),
+        ("SELECT CAST(NULL AS UUID[]) FROM t;", "UUID"),
+    ] {
+        expect_refusal(
+            &format!("{schema} {query}"),
+            &blob_uuid_array_opts(),
+            &format!("a JSON array cannot hold the BLOB {element} is stored as"),
+        );
+    }
+}
+
+#[test]
+fn uuid_array_column_round_trips_when_uuids_are_text() {
+    let opts = array_opts().with_uuid_representation(UuidRepresentation::Text);
+    assert_eq!(
+        query_rows(
+            "CREATE TABLE u (id INT PRIMARY KEY, ids UUID[]);
+             INSERT INTO u VALUES (1, ARRAY['00010203-0405-0607-0809-0a0b0c0d0e0f'::uuid]);
+             SELECT ids FROM u;",
+            &opts,
+        ),
+        vec![Some(r#"["00010203-0405-0607-0809-0a0b0c0d0e0f"]"#.to_string())]
+    );
+}
+
 // ── Finding 6: string literal cast to array type stores wrong format
 // ──────────
 

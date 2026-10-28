@@ -1952,7 +1952,9 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
             Self::Grant(_) | Self::GrantRole(_) => {
                 drop_with_warning("GRANT", REASON_ACCESS_CONTROL, emit)
             }
-            Self::Revoke(_) => drop_with_warning("REVOKE", REASON_ACCESS_CONTROL, emit),
+            Self::Revoke(_) | Self::RevokeRole(_) => {
+                drop_with_warning("REVOKE", REASON_ACCESS_CONTROL, emit)
+            }
             Self::Deny { .. } => drop_with_warning("DENY", REASON_ACCESS_CONTROL, emit),
             Self::CreateType { .. } => {
                 drop_with_warning("CREATE TYPE", REASON_TYPE_DEFINITION, emit)

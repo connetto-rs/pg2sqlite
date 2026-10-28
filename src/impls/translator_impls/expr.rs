@@ -66,8 +66,9 @@ use crate::{
         translator_impls::{
             array::{
                 Quantifier, array_concat, array_overlap, is_json_array_representation,
-                json_array_call, representation_required, translate_array_literal,
-                translate_array_subscript, translate_quantified_over_array,
+                json_array_call, refuse_blob_element, representation_required,
+                translate_array_literal, translate_array_subscript,
+                translate_quantified_over_array,
             },
             data_type::{MAX_NUMERIC_PRECISION, exact_numeric_info, numeric_precision_and_scale},
             function::cube_root_closed_form,
@@ -2818,12 +2819,11 @@ fn translate_binary_op(
         // array expands to exactly that element, so both spellings reuse the
         // array shape rather than needing their own.
         let mut as_array = |side: &Expr| -> Result<Expr, crate::errors::Error> {
-            let translated = side.translate_with_warnings(schema, options, emit)?;
-            Ok(if is_array_expression(side, schema, options)? {
-                translated
-            } else {
-                json_array_call(vec![translated])
-            })
+            if is_array_expression(side, schema, options)? {
+                return side.translate_with_warnings(schema, options, emit);
+            }
+            refuse_blob_element(side, schema, options)?;
+            Ok(json_array_call(vec![side.translate_with_warnings(schema, options, emit)?]))
         };
         let concatenated = array_concat(as_array(left)?, as_array(right)?);
 

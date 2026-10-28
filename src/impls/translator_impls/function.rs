@@ -2647,6 +2647,11 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                 // wrapping since array_agg accumulates regular
                 // scalar values, not JSON documents. The filter
                 // is kept natively (3.46 floor).
+                array::refuse_blob_element(
+                    extract_exactly(&func.args, 1, "array_agg")?[0],
+                    schema,
+                    options,
+                )?;
                 let translated_args_list =
                     translate_function_arguments::<Forward>(&func.args, schema, options, emit)?;
                 let translated_params = translate_function_arguments::<Forward>(
