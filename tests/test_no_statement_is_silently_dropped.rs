@@ -80,6 +80,11 @@ const TABLE_ROLE_AND_GRANT: &str =
 const TWO_ROLES: &str =
     "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT); CREATE ROLE r; CREATE ROLE u;";
 
+/// A membership `REVOKE` removes a membership `GRANT`, so that has to exist
+/// too.
+const TWO_ROLES_AND_MEMBERSHIP: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT); \
+                                        CREATE ROLE r; CREATE ROLE u; GRANT r TO u;";
+
 const fn emitted(sql: &'static str) -> Case {
     Case { setup: TABLE, sql, outcome: Outcome::Emitted }
 }
@@ -172,6 +177,7 @@ const CASES: &[Case] = &[
         outcome: Outcome::Warned,
     },
     Case { setup: TWO_ROLES, sql: "GRANT r TO u", outcome: Outcome::Warned },
+    Case { setup: TWO_ROLES_AND_MEMBERSHIP, sql: "REVOKE r FROM u", outcome: Outcome::Warned },
     warned("DENY SELECT ON t TO r"),
     warned("DROP ROLE r"),
     warned("DROP USER r"),

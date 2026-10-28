@@ -160,6 +160,21 @@ fn revoke_emits_lossy_drop_warning() {
 }
 
 #[test]
+fn revoke_of_role_membership_emits_lossy_drop_warning() {
+    let report = Pg2Sqlite::default()
+        .sql("CREATE ROLE a; CREATE ROLE b; GRANT a TO b; REVOKE a FROM b;")
+        .expect("parse")
+        .translate_with_report(&Pg2SqliteOptions::default())
+        .expect("translate");
+    assert_eq!(report.script.iter().count(), 0, "expected no SQLite statement");
+    assert_eq!(report.warnings.len(), 4);
+    assert_lossy_drop(&report.warnings[0], "CREATE ROLE");
+    assert_lossy_drop(&report.warnings[1], "CREATE ROLE");
+    assert_lossy_drop(&report.warnings[2], "GRANT");
+    assert_lossy_drop(&report.warnings[3], "REVOKE");
+}
+
+#[test]
 fn alter_role_emits_lossy_drop_warning() {
     let warns = warnings_for("CREATE ROLE alice;\nALTER ROLE alice WITH SUPERUSER;");
     assert_eq!(warns.len(), 2);
