@@ -263,7 +263,7 @@ impl crate::traits::translator::TranslatorWithContext for DataType {
 
     fn translate_with_warnings(
         &self,
-        _schema: &sql_traits::structs::ParserDB,
+        schema: &sql_traits::structs::ParserDB,
         options: &crate::options::TranslationContext<'_>,
         _emit: &mut dyn FnMut(crate::warnings::TranslationWarning),
     ) -> Result<Self::SQLiteEntry, crate::errors::Error> {
@@ -361,11 +361,15 @@ DataType::Array(elem) => {
              a separate table."
         )));
     }
-    if super::array::is_json_array_representation(options) {
-        Ok(DataType::Text)
-    } else {
-        Err(super::array::representation_required(&format!("The array type {self}")))
+    if !super::array::is_json_array_representation(options) {
+        return Err(super::array::representation_required(&format!("The array type {self}")));
     }
+    if let Some(inner) = inner
+        && super::array::stored_as_blob(inner, schema, options)
+    {
+        return Err(super::array::blob_element_refusal(inner));
+    }
+    Ok(DataType::Text)
 }
 DataType::Uuid => {
     match options.get_uuid_representation() {

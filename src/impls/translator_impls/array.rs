@@ -24,6 +24,9 @@
 //!   for a NULL operand, or for an array containing NULL in the `ALL` case.
 //!   Both exclude the row from a `WHERE` clause, which is the only place the
 //!   difference is observable.
+//! * An element stored as a BLOB is refused, because SQLite's JSON functions
+//!   take no BLOB argument. Only a declared or cast type is read, so a function
+//!   returning a BLOB still fails in SQLite.
 
 #[cfg(not(feature = "std"))]
 #[allow(unused_imports)]
@@ -109,6 +112,67 @@ pub(crate) fn no_json_message(construct: &str, hint: &str) -> String {
 #[must_use]
 pub(crate) fn no_json_equivalent(construct: &str, hint: &str) -> Error {
     Error::forward_refusal(no_json_message(construct, hint))
+}
+
+/// True when a value of `data_type` lands as a BLOB on the replica.
+#[must_use]
+pub(crate) fn stored_as_blob(
+    data_type: &DataType,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> bool {
+    matches!(data_type.translate_with_warnings(schema, options, &mut |_| {}), Ok(DataType::Blob(_)))
+}
+
+/// The refusal an array of `element` earns when `element` lands as a BLOB.
+///
+/// The replica builds every array with `json_array` or `json_group_array`, and
+/// both answer `JSON cannot hold BLOB values` at run time for a BLOB argument.
+#[must_use]
+pub(crate) fn blob_element_refusal(element: &DataType) -> Error {
+    let uuid_hint = if super::uuid::is_uuid_data_type(element) {
+        ", or store UUIDs as text with UuidRepresentation::Text"
+    } else {
+        ""
+    };
+    Error::forward_refusal(format!(
+        "{element}[] cannot be translated: the replica stores every array as JSON, and a JSON \
+         array cannot hold the BLOB {element} is stored as. Keep the elements in rows of their \
+         own, or convert each one to text first{uuid_hint}."
+    ))
+}
+
+/// Refuses `element` as an array element when its declared or cast type lands
+/// as a BLOB.
+///
+/// # Errors
+///
+/// Returns [`blob_element_refusal`] for a BLOB-stored element, and propagates
+/// the unresolved reference the scope answers for a column no relation in it
+/// declares.
+#[cfg_attr(feature = "std", recursive::recursive)]
+pub(crate) fn refuse_blob_element(
+    element: &Expr,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<(), Error> {
+    let declared;
+    let element_type = match element {
+        Expr::Nested(inner) => return refuse_blob_element(inner, schema, options),
+        Expr::Cast { data_type, .. } => data_type,
+        Expr::TypedString(typed) => &typed.data_type,
+        _ => {
+            declared = crate::impls::reverse_translator_impls::storage_shape::declared_data_type(
+                element, schema, options,
+            )?;
+            let Some(declared) = &declared else { return Ok(()) };
+            declared
+        }
+    };
+    if stored_as_blob(element_type, schema, options) {
+        return Err(blob_element_refusal(element_type));
+    }
+    Ok(())
 }
 
 /// `json_each(<array>)` as a `FROM` item.
@@ -339,7 +403,10 @@ pub(crate) fn translate_array_literal(
     }
     let translated = elements
         .iter()
-        .map(|e| e.translate_with_warnings(schema, options, emit))
+        .map(|e| {
+            refuse_blob_element(e, schema, options)?;
+            e.translate_with_warnings(schema, options, emit)
+        })
         .collect::<Result<Vec<_>, Error>>()?;
     Ok(json_array_call(translated))
 }
@@ -510,6 +577,7 @@ pub(crate) fn translate_array_function(
         if !is_replayable(raw[0], options) {
             return Err(reject_duplicated_operand(kind.name(), raw[0]));
         }
+        refuse_blob_element(raw[2], schema, options)?;
         let [array, from, to] = translated_args(args, kind, schema, options, emit)?;
         return Ok(array_replace(array, from, to));
     }
@@ -527,6 +595,7 @@ pub(crate) fn translate_array_function(
         return Ok(array_cat_expr(a, b));
     }
     if kind == ArrayFunction::Prepend {
+        refuse_blob_element(extract_exactly(args, 2, kind.name())?[0], schema, options)?;
         let [element, array] = translated_args(args, kind, schema, options, emit)?;
         // `json_each(NULL)` yields no rows, so NULL arrays collapse naturally.
         return Ok(array_concat(json_array_call(vec![element]), array));
@@ -542,6 +611,9 @@ pub(crate) fn translate_array_function(
         && !is_replayable(operand, options)
     {
         return Err(reject_duplicated_operand(kind.name(), operand));
+    }
+    if kind == ArrayFunction::Append {
+        refuse_blob_element(raw[1], schema, options)?;
     }
     let [array, second] = translated_args(args, kind, schema, options, emit)?;
     match kind {
