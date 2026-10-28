@@ -60,12 +60,13 @@ const TABLE_IN_TRANSACTION: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, a TE
 const SAVEPOINT_IN_TRANSACTION: &str =
     "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT); BEGIN; SAVEPOINT sp;";
 
-/// Same, plus a schema, a role, a function, and a policy, for the cases that
-/// alter or drop one of those.
+/// Same, plus a schema, a role, a function, a policy, and an extension, for the
+/// cases that alter or drop one of those.
 const SCHEMA: &str = "CREATE SCHEMA s;";
 const ROLE: &str = "CREATE ROLE r;";
 const FUNCTION: &str = "CREATE FUNCTION f() RETURNS INT AS $$ SELECT 1 $$ LANGUAGE sql;";
 const POLICY: &str = "CREATE POLICY p ON t FOR SELECT USING (true);";
+const EXTENSION: &str = "CREATE EXTENSION pgcrypto;";
 
 /// `GRANT` and `REVOKE` are resolved against the schema, so the role has to
 /// exist before they can be classified.
@@ -191,7 +192,10 @@ const CASES: &[Case] = &[
     // Rejected at build: ownership of a function nothing declared.
     rejected("ALTER FUNCTION nope() OWNER TO r"),
     warned("CREATE EXTENSION IF NOT EXISTS pgcrypto"),
-    warned("DROP EXTENSION pgcrypto"),
+    // A drop of an extension nothing declared refuses at build, as PostgreSQL
+    // does, so the warn-drop needs the extension declared first.
+    Case { setup: EXTENSION, sql: "DROP EXTENSION pgcrypto", outcome: Outcome::Warned },
+    rejected("DROP EXTENSION pgcrypto"),
     warned("CREATE SEQUENCE seq START WITH 1"),
     warned("DROP SEQUENCE seq"),
     // Warned and dropped: foreign data and credentials.

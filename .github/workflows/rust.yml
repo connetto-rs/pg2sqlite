@@ -222,8 +222,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-msrv-
 
-      - name: Check MSRV build
-        run: cargo test --all-targets
+      # The MSRV covers what a dependent compiles, which never includes the
+      # dev-dependencies, so tests and benches build on the other toolchains.
+      - name: Check the library at the MSRV
+        run: |
+          cargo check --lib
+          cargo check --lib --no-default-features
+          cargo check --lib --features sqlitegis
+          cargo check --lib --features arbitrary
 
   coverage:
     name: Code Coverage
