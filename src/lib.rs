@@ -13,6 +13,7 @@ pub mod pg2sqlite;
 pub mod script;
 pub mod traits;
 pub mod warnings;
+pub mod write_guard;
 
 /// Prelude module for the library.
 pub mod prelude {
@@ -32,5 +33,6 @@ pub mod prelude {
             UuidRepresentation, UuidVersion,
         },
         warnings::{TranslationReport, TranslationWarning, WarningSink},
+        write_guard::is_policy_refusal,
     };
 }

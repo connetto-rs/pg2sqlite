@@ -545,7 +545,7 @@ fn append_readonly_deny_triggers(
 
     let marker = options.get_readonly_deny_trigger_suffix();
     let name = |value: &str| ObjectName(vec![ObjectNamePart::Identifier(quoted_ident(value))]);
-    let message = format!("permission denied: {table_ident} is read-only for this role");
+    let message = crate::write_guard::read_only(&table_ident);
     let condition = write_guard_condition_expr(None, options);
 
     let mut triggers = Vec::with_capacity(READONLY_DENY_TRIGGER_VERBS.len());

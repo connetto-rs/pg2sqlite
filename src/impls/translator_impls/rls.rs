@@ -62,6 +62,7 @@ use crate::{
     },
     options::Pg2SqliteOptions,
     traits::{SessionVariablePattern, translator::TranslatorWithContext},
+    write_guard::{RLS_VIOLATION, WriteCommand, no_policy, read_only},
 };
 
 /// A column of a guarded table, as the write triggers have to see it.
@@ -303,8 +304,6 @@ fn refuse_computed_write_statements(
         })
         .collect()
 }
-
-const RLS_VIOLATION_ERROR: &str = "new row violates row-level security policy";
 
 /// True when `expr` is the boolean literal `true`, possibly wrapped in
 /// redundant parentheses. Such a predicate constrains nothing.
@@ -2067,7 +2066,7 @@ fn generate_insert_trigger_sql(
     let guard = if insert_policies.is_empty() {
         Some(ast_builder::raise_statement(
             "ABORT",
-            Some(&format!("permission denied: no INSERT policy on {table_name}")),
+            Some(&no_policy(WriteCommand::Insert, table_name)),
             write_guard_condition_expr(None, options),
         ))
     } else {
@@ -2075,7 +2074,7 @@ fn generate_insert_trigger_sql(
             PolicyPredicate::DenyAll => {
                 Some(ast_builder::raise_statement(
                     "ABORT",
-                    Some(RLS_VIOLATION_ERROR),
+                    Some(RLS_VIOLATION),
                     write_guard_condition_expr(None, options),
                 ))
             }
@@ -2084,7 +2083,7 @@ fn generate_insert_trigger_sql(
                 let violation = Expr::IsNotTrue(Box::new(Expr::Nested(predicate)));
                 Some(ast_builder::raise_statement(
                     "ABORT",
-                    Some(RLS_VIOLATION_ERROR),
+                    Some(RLS_VIOLATION),
                     write_guard_condition_expr(Some(violation), options),
                 ))
             }
@@ -2181,22 +2180,19 @@ fn generate_insert_check_trigger_sql(
     let ctx = RlsTriggerContext::new(table, options);
     let policies = filter_policies(table, schema, &[CreatePolicyCommand::Insert], options)?;
     let (condition, message) = if policies.is_empty() {
-        (
-            write_guard_condition_expr(None, options),
-            format!("permission denied: no INSERT policy on {}", ctx.table_name),
-        )
+        (write_guard_condition_expr(None, options), no_policy(WriteCommand::Insert, ctx.table_name))
     } else {
         let (_, _, check) =
             build_write_guard(&policies, GuardKind::Insert, table, schema, options, emit)?;
         match check {
             PolicyPredicate::DenyAll => {
-                (write_guard_condition_expr(None, options), RLS_VIOLATION_ERROR.to_string())
+                (write_guard_condition_expr(None, options), RLS_VIOLATION.to_string())
             }
             PolicyPredicate::AllowAll => return Ok(None),
             PolicyPredicate::Expr(predicate) => {
                 (
                     write_guard_condition_expr(Some(policy_violation(*predicate)), options),
-                    RLS_VIOLATION_ERROR.to_string(),
+                    RLS_VIOLATION.to_string(),
                 )
             }
         }
@@ -2339,7 +2335,7 @@ fn generate_update_check_trigger_sql(
         &ctx.inner_table_name,
         sqlparser::ast::TriggerEvent::Update(Vec::new()),
         write_guard_condition_expr(violation, options),
-        RLS_VIOLATION_ERROR,
+        RLS_VIOLATION,
     )))
 }
 
@@ -2376,7 +2372,7 @@ fn generate_delete_check_trigger_sql(
         &ctx.inner_table_name,
         sqlparser::ast::TriggerEvent::Delete,
         write_guard_condition_expr(violation, options),
-        RLS_VIOLATION_ERROR,
+        RLS_VIOLATION,
     )))
 }
 
@@ -2461,7 +2457,7 @@ fn generate_update_trigger_sql(
         if options.is_strict_rls_write_deny() {
             let mut body = vec![ast_builder::raise_statement(
                 "ABORT",
-                Some(&format!("permission denied: no UPDATE policy on {table_name}")),
+                Some(&no_policy(WriteCommand::Update, table_name)),
                 write_guard_condition_expr(None, options),
             )];
             body.extend(forwarded);
@@ -2479,7 +2475,7 @@ fn generate_update_trigger_sql(
             PolicyPredicate::DenyAll => {
                 Some(ast_builder::raise_statement(
                     "ABORT",
-                    Some(RLS_VIOLATION_ERROR),
+                    Some(RLS_VIOLATION),
                     write_guard_condition_expr(None, options),
                 ))
             }
@@ -2497,7 +2493,7 @@ fn generate_update_trigger_sql(
                 };
                 Some(ast_builder::raise_statement(
                     "ABORT",
-                    Some(RLS_VIOLATION_ERROR),
+                    Some(RLS_VIOLATION),
                     write_guard_condition_expr(Some(violation), options),
                 ))
             }
@@ -2562,7 +2558,7 @@ fn generate_delete_trigger_sql(
             vec![
                 ast_builder::raise_statement(
                     "ABORT",
-                    Some(&format!("permission denied: no DELETE policy on {table_name}")),
+                    Some(&no_policy(WriteCommand::Delete, table_name)),
                     write_guard_condition_expr(None, options),
                 ),
                 forward,
@@ -2598,7 +2594,7 @@ fn generate_readonly_backing_guard_sql(
     }
     let ctx = RlsTriggerContext::new(table, options);
     let condition = write_guard_condition_expr(None, options);
-    let message = format!("permission denied: {} is read-only for this role", ctx.table_name);
+    let message = read_only(ctx.table_name);
     [
         ("insert", sqlparser::ast::TriggerEvent::Insert),
         ("update", sqlparser::ast::TriggerEvent::Update(Vec::new())),
