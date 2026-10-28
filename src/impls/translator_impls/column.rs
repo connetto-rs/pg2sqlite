@@ -24,7 +24,7 @@ use crate::{
         object_name::last_ident_value_or_display,
         shared_helpers::{
             declares_identity, minor_unit_scale, quoted_decimal_as_number, scale_decimal_literal,
-            typed_text_literal,
+            typed_text_literal, untyped_array_refusal,
         },
         translator_impls::{
             data_type::{
@@ -268,6 +268,20 @@ pub(crate) fn translate_column_def(
             data_type: translated_type,
             options: translated_options,
         });
+    }
+
+    // PostgreSQL assigns a DEFAULT and a generation expression to the column
+    // when the table is created, and refuses an untyped ARRAY[...] there just
+    // as it does in a write.
+    for option in &column.options {
+        let (ColumnOption::Default(expr)
+        | ColumnOption::Generated { generation_expr: Some(expr), .. }) = &option.option
+        else {
+            continue;
+        };
+        if let Some(refusal) = untyped_array_refusal(&column.name.value, &column.data_type, expr) {
+            return Err(refusal);
+        }
     }
 
     // D1 makes a scaled NUMERIC column an INTEGER of minor units, and the

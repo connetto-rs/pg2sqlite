@@ -341,15 +341,8 @@ DataType::Bit(_) | DataType::BitVarying(_) | DataType::VarBit(_) => {
 // NUMERIC(p,s)[] cannot use minor-unit storage: array elements have no
 // per-element scale context, so a scalar column and its array twin would
 // hold different representations and comparisons would silently fail.
-DataType::Array(elem) => {
-    let inner = match elem {
-        ArrayElemTypeDef::SquareBracket(t, _)
-        | ArrayElemTypeDef::AngleBracket(t)
-        | ArrayElemTypeDef::Qualified(t, _)
-        | ArrayElemTypeDef::Parenthesis(t)
-        | ArrayElemTypeDef::ParenthesisNotNull(t) => Some(t.as_ref()),
-        ArrayElemTypeDef::None => None,
-    };
+DataType::Array(_) => {
+    let inner = array_element_type(self);
     if let Some(inner) = inner
         && let Some(info) = exact_numeric_info(inner)
         && let Ok((_, scale)) = numeric_precision_and_scale(info)
@@ -389,6 +382,42 @@ unsupported => {
 }
 }
     }
+}
+
+/// The element type an array type declares, or `None` for a bare `ARRAY` and
+/// for every type that is not an array.
+pub(crate) fn array_element_type(data_type: &DataType) -> Option<&DataType> {
+    let DataType::Array(element) = data_type else { return None };
+    match element {
+        ArrayElemTypeDef::SquareBracket(t, _)
+        | ArrayElemTypeDef::AngleBracket(t)
+        | ArrayElemTypeDef::Qualified(t, _)
+        | ArrayElemTypeDef::Parenthesis(t)
+        | ArrayElemTypeDef::ParenthesisNotNull(t) => Some(t),
+        ArrayElemTypeDef::None => None,
+    }
+}
+
+/// True for the character types, the ones a `text` value is assigned to.
+pub(crate) fn is_string_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Character(_)
+            | DataType::Char(_)
+            | DataType::CharacterVarying(_)
+            | DataType::CharVarying(_)
+            | DataType::Varchar(_)
+            | DataType::Nvarchar(_)
+            | DataType::CharacterLargeObject(_)
+            | DataType::CharLargeObject(_)
+            | DataType::Clob(_)
+            | DataType::Text
+            | DataType::TinyText
+            | DataType::MediumText
+            | DataType::LongText
+            | DataType::String(_)
+            | DataType::FixedString(_)
+    )
 }
 
 /// True when `data_type` is one of PostgreSQL's serial pseudo-types.
