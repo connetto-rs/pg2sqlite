@@ -660,7 +660,7 @@ impl Pg2Sqlite {
         let mut input = initial_schema
             .map_or_else(Self::translation_ingestor, |schema| schema.clone().into_ingestor());
         let mut epochs = Vec::new();
-        let mut named = Vec::new();
+        let mut sources = Cow::Borrowed(statements.as_slice());
         let mut start = 0;
         let schema = loop {
             if start >= statements.len() {
@@ -689,9 +689,9 @@ impl Pg2Sqlite {
                         && create_index.name.is_none()
                         && let Some(name) = input.create_index_name(create_index)?
                     {
-                        let name = ObjectName(vec![ObjectNamePart::Identifier(name)]);
-                        create_index.name = Some(name.clone());
-                        named.push((start + index, name));
+                        create_index.name =
+                            Some(ObjectName(vec![ObjectNamePart::Identifier(name)]));
+                        sources.to_mut()[start + index] = applied.clone();
                     }
                     input = input.apply_statement(applied)?;
                 }
@@ -712,17 +712,6 @@ impl Pg2Sqlite {
             start = end;
         };
 
-        let sources = if named.is_empty() {
-            Cow::Borrowed(statements.as_slice())
-        } else {
-            let mut sources = statements.clone();
-            for (index, name) in named {
-                if let Statement::CreateIndex(create_index) = &mut sources[index] {
-                    create_index.name = Some(name);
-                }
-            }
-            Cow::Owned(sources)
-        };
         Ok(PreparedSchema {
             sources,
             schema,
