@@ -2490,6 +2490,68 @@ fn shifted_datetime(target: Expr, modifiers: &[String]) -> Expr {
     trim_trailing_zeros(simple_function_expr("datetime", args, None))
 }
 
+/// The time of day `target` answers after `modifiers`, wrapped at midnight,
+/// with a `timetz` operand's offset kept in place. The zoned form reads
+/// `target` three times, so the caller refuses a non-replayable operand.
+fn shifted_time_of_day(target: Expr, modifiers: &[String], zoned: bool) -> Expr {
+    if !zoned {
+        return shifted_clock(target, modifiers);
+    }
+    // The offset is the trailing ±HH:MM, which the answer keeps as written.
+    let local = simple_function_expr(
+        "substr",
+        vec![
+            target.clone(),
+            integer_literal(1),
+            Expr::BinaryOp {
+                left: Box::new(simple_function_expr("length", vec![target.clone()], None)),
+                op: BinaryOperator::Minus,
+                right: Box::new(integer_literal(6)),
+            },
+        ],
+        None,
+    );
+    let clock = shifted_clock(local, modifiers);
+    let offset = simple_function_expr("substr", vec![target, integer_literal(-6)], None);
+    Expr::BinaryOp {
+        left: Box::new(clock),
+        op: BinaryOperator::StringConcat,
+        right: Box::new(offset),
+    }
+}
+
+/// The time part of a shifted time, trailing fractional zeros trimmed. SQLite
+/// reads a bare time as 2000-01-01, so the part after the date wraps at
+/// midnight.
+fn shifted_clock(local: Expr, modifiers: &[String]) -> Expr {
+    let mut args = vec![local];
+    args.extend(modifiers.iter().map(|modifier| string_literal(modifier)));
+    args.push(string_literal("subsec"));
+    let shifted = simple_function_expr("datetime", args, None);
+    // The date part is eleven characters, so the time of day starts at twelve.
+    trim_trailing_zeros(simple_function_expr("substr", vec![shifted, integer_literal(12)], None))
+}
+
+/// The shifted form of `left` for the temporal kind it resolves to, refusing
+/// a zoned operand the emitted form would read three times.
+fn shifted_interval_target(
+    left: &Expr,
+    modifiers: &[String],
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Expr, crate::errors::Error> {
+    let kind = temporal_kind_of(left, schema, options);
+    if matches!(kind, Some(TemporalKind::Time { zoned: true })) && !is_replayable(left, options) {
+        return Err(reject_duplicated_operand("a TIMETZ operand shifted by an interval", left));
+    }
+    let target = left.translate_with_warnings(schema, options, emit)?;
+    match kind {
+        Some(TemporalKind::Time { zoned }) => Ok(shifted_time_of_day(target, modifiers, zoned)),
+        _ => Ok(shifted_datetime(target, modifiers)),
+    }
+}
+
 /// Translate a binary operation expression.
 #[allow(clippy::too_many_lines)]
 fn translate_binary_op(
@@ -3207,8 +3269,9 @@ fn translate_binary_op(
                 Some(n) => {
                     match interval_date_modifiers_scaled(interval, negating, n)? {
                         Some(modifiers) => {
-                            let target = left.translate_with_warnings(schema, options, emit)?;
-                            return Ok(shifted_datetime(target, &modifiers));
+                            return shifted_interval_target(
+                                left, &modifiers, schema, options, emit,
+                            );
                         }
                         None => {
                             return Err(crate::errors::Error::forward_refusal(format!(
@@ -3231,8 +3294,7 @@ fn translate_binary_op(
         if let Some(interval) = extract_interval_expr(right) {
             match interval_date_modifiers(interval, negating)? {
                 Some(modifiers) => {
-                    let target = left.translate_with_warnings(schema, options, emit)?;
-                    return Ok(shifted_datetime(target, &modifiers));
+                    return shifted_interval_target(left, &modifiers, schema, options, emit);
                 }
                 None => {
                     // The notation was not decoded (HH:MM:SS, ISO P-form,

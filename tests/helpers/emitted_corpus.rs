@@ -19,6 +19,8 @@ CREATE TABLE t (
     b BOOLEAN,
     ts TIMESTAMP,
     d DATE,
+    tm TIME,
+    tmt TIMETZ,
     payload JSONB,
     tags TEXT[],
     blob BYTEA
@@ -562,6 +564,14 @@ pub const CORPUS_GROUPS: &[(&str, &[&str])] = &[
                 "SELECT ts + interval '1500 ms' FROM t;",
                 "SELECT ts + interval '90 minutes' FROM t;",
                 "SELECT d + interval '1' month FROM t;",
+                "SELECT tm + interval '1 hour' FROM t;",
+                "SELECT tm - interval '30 minutes' FROM t;",
+                "SELECT tm + interval '1 day 1 hour' FROM t;",
+                "SELECT interval '1 hour' + tm FROM t;",
+                "SELECT tm + 2 * interval '1 hour' FROM t;",
+                "SELECT tmt + interval '1 hour' FROM t;",
+                "SELECT tmt - interval '1 hour 30 minutes' FROM t;",
+                "SELECT interval '1 hour' + tmt FROM t;",
                     ],
     ),
     (
