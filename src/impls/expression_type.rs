@@ -19,7 +19,8 @@ use crate::{
     errors::Error,
     impls::{
         function_helpers::positional_arity, object_name::last_ident,
-        reverse_translator_impls::storage_shape::declared_data_type, translator_impls::postgis,
+        reverse_translator_impls::storage_shape::declared_data_type,
+        shared_helpers::function_arg_expr, translator_impls::postgis,
     },
 };
 
@@ -121,14 +122,8 @@ fn call_type_name(
             list.args
                 .iter()
                 .map(|argument| {
-                    match argument {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))
-                        | FunctionArg::Named { arg: FunctionArgExpr::Expr(argument), .. }
-                        | FunctionArg::ExprNamed { arg: FunctionArgExpr::Expr(argument), .. } => {
-                            type_name(argument, schema, options)
-                        }
-                        _ => Ok(None),
-                    }
+                    function_arg_expr(argument)
+                        .map_or(Ok(None), |argument| type_name(argument, schema, options))
                 })
                 .collect::<Result<Vec<_>, Error>>()?
         }

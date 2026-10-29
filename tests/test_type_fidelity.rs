@@ -504,6 +504,32 @@ fn arrays_of_calls_returning_text_still_translate() {
 }
 
 #[test]
+fn a_literal_argument_picks_the_overload_whose_result_decides_the_refusal() {
+    let schema = "CREATE TABLE t (id INT PRIMARY KEY);
+         CREATE FUNCTION g(x INT) RETURNS BYTEA LANGUAGE sql AS $$ SELECT '\\x01'::bytea $$;
+         CREATE FUNCTION g(x BIGINT) RETURNS TEXT LANGUAGE sql AS $$ SELECT 'a' $$;
+         CREATE FUNCTION g(x NUMERIC) RETURNS TEXT LANGUAGE sql AS $$ SELECT 'a' $$;
+         CREATE FUNCTION g(x BOOLEAN) RETURNS BYTEA LANGUAGE sql AS $$ SELECT '\\x01'::bytea $$;";
+    let opts = array_opts().with_user_defined_functions(["g"]);
+    for refused in ["g(1)", "g(true)"] {
+        expect_refusal(
+            &format!("{schema} SELECT ARRAY[{refused}] FROM t;"),
+            &opts,
+            "a JSON array cannot hold the BLOB BYTEA is stored as",
+        );
+    }
+    // A bound parameter has no type, so the overloads disagree and nothing is
+    // refused.
+    for accepted in ["g(3000000000)", "g(1.5)", "g(1e3)", "g(99999999999999999999)", "g($1)"] {
+        Pg2Sqlite::default()
+            .sql(&format!("{schema} SELECT ARRAY[{accepted}] FROM t;"))
+            .expect("parse")
+            .translate(&opts)
+            .unwrap_or_else(|e| panic!("ARRAY[{accepted}] returns text, got: {e}"));
+    }
+}
+
+#[test]
 fn arrays_of_sqlitegis_geometry_results_are_refused() {
     expect_refusal(
         "CREATE TABLE t (id INT PRIMARY KEY); SELECT ARRAY[ST_Point(1, 2)] FROM t;",

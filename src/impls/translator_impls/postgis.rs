@@ -725,22 +725,22 @@ mod tests {
         let mismatched = SQLITE_DETERMINISTIC_FUNCTIONS
             .iter()
             .chain(SQLITE_DIRECT_ONLY_FUNCTIONS)
-            .filter(|spec| {
+            .filter_map(|spec| {
                 let result = sqlitegis_result_type(spec.name, spec.n_arg)
                     .expect("the coverage tests above pin every entry");
                 let stored = crate::impls::expression_type::parse_type_name(result)
                     .expect("a catalog result type should parse")
                     .translate(&schema, &Pg2SqliteOptions::default())
                     .expect("a catalog result type should translate");
-                !matches!(
+                let agrees = matches!(
                     (spec.return_class, stored),
                     (SqliteReturnClass::Blob, DataType::Blob(_))
                         | (SqliteReturnClass::Text, DataType::Text)
                         | (SqliteReturnClass::Numeric, DataType::Integer(_) | DataType::Real)
                         | (SqliteReturnClass::Bool, DataType::Integer(_))
-                )
+                );
+                (!agrees).then_some((spec.name, spec.n_arg))
             })
-            .map(|spec| format!("{}/{}", spec.name, spec.n_arg))
             .collect::<Vec<_>>();
         assert!(mismatched.is_empty(), "result types disagree with SQLiteGIS: {mismatched:?}");
     }
