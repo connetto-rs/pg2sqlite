@@ -507,6 +507,9 @@ fn with_output_scope<R>(
 }
 
 /// Inspects known outputs while preserving unknown wildcard widths.
+///
+/// A query the statement records no scope for answers `false`, as an opaque
+/// output does.
 pub(crate) fn query_output_matches(
     query: &Query,
     schema: &ParserDB,
@@ -519,10 +522,7 @@ pub(crate) fn query_output_matches(
     ) -> Result<bool, Error>,
 ) -> Result<bool, Error> {
     with_output_scope(query, schema, options, |scope| {
-        let scope = scope.ok_or_else(|| {
-            Error::forward_refusal("The scalar query has no recorded output scope.".to_owned())
-        })?;
-        for output in scope.outputs() {
+        for output in scope.iter().flat_map(ColumnQueryScope::outputs) {
             if let QueryOutput::Column { definition, .. } = output
                 && definition_matches(&definition, schema, options, &read_column, &read_expression)?
             {

@@ -509,9 +509,11 @@ fn a_literal_argument_picks_the_overload_whose_result_decides_the_refusal() {
          CREATE FUNCTION g(x INT) RETURNS BYTEA LANGUAGE sql AS $$ SELECT '\\x01'::bytea $$;
          CREATE FUNCTION g(x BIGINT) RETURNS TEXT LANGUAGE sql AS $$ SELECT 'a' $$;
          CREATE FUNCTION g(x NUMERIC) RETURNS TEXT LANGUAGE sql AS $$ SELECT 'a' $$;
-         CREATE FUNCTION g(x BOOLEAN) RETURNS BYTEA LANGUAGE sql AS $$ SELECT '\\x01'::bytea $$;";
-    let opts = array_opts().with_user_defined_functions(["g"]);
-    for refused in ["g(1)", "g(true)"] {
+         CREATE FUNCTION g(x BOOLEAN) RETURNS BYTEA LANGUAGE sql AS $$ SELECT '\\x01'::bytea $$;
+         CREATE FUNCTION h(x INT[]) RETURNS BYTEA LANGUAGE sql AS $$ SELECT '\\x01'::bytea $$;
+         CREATE FUNCTION h(x TEXT[]) RETURNS TEXT LANGUAGE sql AS $$ SELECT 'a' $$;";
+    let opts = array_opts().with_user_defined_functions(["g", "h"]);
+    for refused in ["g(1)", "g(true)", "h(ARRAY[id])"] {
         expect_refusal(
             &format!("{schema} SELECT ARRAY[{refused}] FROM t;"),
             &opts,
@@ -520,7 +522,14 @@ fn a_literal_argument_picks_the_overload_whose_result_decides_the_refusal() {
     }
     // A bound parameter has no type, so the overloads disagree and nothing is
     // refused.
-    for accepted in ["g(3000000000)", "g(1.5)", "g(1e3)", "g(99999999999999999999)", "g($1)"] {
+    for accepted in [
+        "g(3000000000)",
+        "g(1.5)",
+        "g(1e3)",
+        "g(99999999999999999999)",
+        "g($1)",
+        "h(ARRAY['a'::text])",
+    ] {
         Pg2Sqlite::default()
             .sql(&format!("{schema} SELECT ARRAY[{accepted}] FROM t;"))
             .expect("parse")
@@ -614,12 +623,32 @@ fn bytea_operators_postgresql_cannot_resolve_are_refused() {
         ("SELECT b || id FROM t;", "|| over BYTEA and INT has no PostgreSQL operator"),
         ("SELECT b + NULL FROM t;", "+ over BYTEA and an untyped value has no PostgreSQL operator"),
         ("SELECT b || g() FROM t;", "|| beside a BYTEA value needs the type of g()"),
+        ("SELECT g() || b FROM t;", "|| beside a BYTEA value needs the type of g()"),
+        // An untyped literal beside bytea is read as bytea, and only the hex
+        // format is unambiguous.
+        ("SELECT b || 'abc' FROM t;", "bytea literal 'abc' is not in the PostgreSQL hex format"),
+        ("SELECT 'abc' || b FROM t;", "bytea literal 'abc' is not in the PostgreSQL hex format"),
     ] {
         expect_refusal(
             &format!("{schema} {query}"),
             &default_opts().with_user_defined_functions(["g"]),
             needle,
         );
+    }
+}
+
+#[test]
+fn an_untranslatable_operand_of_a_bytea_or_vector_lowering_is_reported() {
+    let schema = "CREATE TABLE t (id INT PRIMARY KEY, s TEXT, b BYTEA, v vector(3));";
+    for query in [
+        "SELECT encode(md5(s)::bytea, 'hex') FROM t;",
+        "SELECT b || md5(s)::bytea FROM t;",
+        "SELECT md5(s)::bytea || b FROM t;",
+        "SELECT b || md5(s) FROM t;",
+        "SELECT v <-> md5(s)::vector(3) FROM t;",
+        "SELECT md5(s)::vector(3) <-> v FROM t;",
+    ] {
+        expect_refusal(&format!("{schema} {query}"), &default_opts(), "md5");
     }
 }
 
