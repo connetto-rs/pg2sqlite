@@ -963,8 +963,8 @@ fn translate_distinct_comparison(
     } else {
         let tl = left.translate_with_warnings(schema, options, emit)?;
         let tr = right.translate_with_warnings(schema, options, emit)?;
-        let tl = convert_beside_column_expr(right, tl, schema, options)?;
-        let tr = convert_beside_column_expr(left, tr, schema, options)?;
+        let tl = convert_beside_column_expr(right, tl, left, schema, options)?;
+        let tr = convert_beside_column_expr(left, tr, right, schema, options)?;
         (tl, tr)
     };
     Ok(if is_not_distinct { null_safe_eq(l, r) } else { null_safe_neq(l, r) })
@@ -2174,6 +2174,7 @@ fn scalar_times_interval(expr: &Expr) -> Option<(&Expr, &Interval)> {
 fn convert_beside_column_expr(
     column_expr: &Expr,
     value: Expr,
+    source_value: &Expr,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
 ) -> Result<Expr, crate::errors::Error> {
@@ -2195,12 +2196,27 @@ fn convert_beside_column_expr(
         // narrowing the instant.
         Some(dt)
             if crate::impls::temporal_literals::temporal_literal_kind(&dt).is_some_and(
-                |kind| kind != crate::impls::temporal_literals::TemporalLiteralKind::TIMESTAMPTZ,
+                |kind| {
+                    !matches!(
+                        kind,
+                        crate::impls::temporal_literals::TemporalLiteralKind::Timestamp {
+                            zoned: true,
+                            ..
+                        },
+                    )
+                },
             ) && crate::impls::datetime_helpers::is_canonical_timestamptz_call(&value) =>
         {
             Ok(value)
         }
-        Some(dt) => convert_value_for_column_type(&dt, value, options),
+        Some(dt) => {
+            crate::impls::shared_helpers::temporal_precision_replay_refusal(
+                source_value,
+                &dt,
+                options,
+            )?;
+            convert_value_for_column_type(&dt, value, options)
+        }
         None => Ok(value),
     }
 }
@@ -2649,13 +2665,13 @@ fn translate_binary_op(
             let tr = right.translate_with_warnings(schema, options, emit)?;
             return Ok(Expr::BinaryOp {
                 left: Box::new(if right_is_col {
-                    convert_beside_column_expr(right, tl, schema, options)?
+                    convert_beside_column_expr(right, tl, left, schema, options)?
                 } else {
                     tl
                 }),
                 op: op.clone(),
                 right: Box::new(if left_is_col {
-                    convert_beside_column_expr(left, tr, schema, options)?
+                    convert_beside_column_expr(left, tr, right, schema, options)?
                 } else {
                     tr
                 }),
@@ -3400,7 +3416,9 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                                 .map(|item| {
                                     let v = scale_or_translate(item, scale, schema, options, emit)?;
                                     if scale.is_none() {
-                                        convert_beside_column_expr(operand, v, schema, options)
+                                        convert_beside_column_expr(
+                                            operand, v, item, schema, options,
+                                        )
                                     } else {
                                         Ok(v)
                                     }
@@ -3419,8 +3437,8 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                     let high_v = scale_or_translate(high, scale, schema, options, emit)?;
                     let (low_v, high_v) = if scale.is_none() {
                         (
-                            convert_beside_column_expr(operand, low_v, schema, options)?,
-                            convert_beside_column_expr(operand, high_v, schema, options)?,
+                            convert_beside_column_expr(operand, low_v, low, schema, options)?,
+                            convert_beside_column_expr(operand, high_v, high, schema, options)?,
                         )
                     } else {
                         (low_v, high_v)
@@ -3598,6 +3616,9 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                     if let Some(kind) =
                         crate::impls::temporal_literals::temporal_literal_kind(data_type)
                     {
+                        crate::impls::shared_helpers::temporal_precision_replay_refusal(
+                            expr, data_type, options,
+                        )?;
                         let source =
                             crate::impls::timezone::timestamp_awareness(expr, schema, options)
                                 .ok()

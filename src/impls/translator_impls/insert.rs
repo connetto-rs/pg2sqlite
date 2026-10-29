@@ -763,7 +763,8 @@ fn cast_temporal_insert_values(
     let context = scoped.as_ref().unwrap_or(options);
     for_each_insert_position(source.body.as_mut(), &column_names, &mut |index, expr| {
         let Some(column) = column_names.get(index) else { return Ok(expr) };
-        Ok(rewrites.temporal_column_cast(column, &expr, schema, context).unwrap_or(expr))
+        let cast = rewrites.temporal_column_cast(column, &expr, schema, context)?;
+        Ok(cast.unwrap_or(expr))
     })
 }
 
