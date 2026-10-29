@@ -391,6 +391,41 @@ fn json_array_length_call(array: Expr) -> Expr {
     simple_function_expr("json_array_length", vec![array], None)
 }
 
+/// `ARRAY[a, b]::T[]` as `ARRAY[a::T, b::T]`, which is how PostgreSQL applies
+/// the cast, or `None` when `expr` is no constructor or `data_type` names no
+/// element type.
+///
+/// PostgreSQL ignores an array type's declared dimensions, so a nested
+/// constructor takes the whole array type even where `data_type` declares one
+/// dimension.
+#[must_use]
+pub(crate) fn distribute_array_cast(expr: &Expr, data_type: &DataType) -> Option<Expr> {
+    let element_type = super::data_type::array_element_type(data_type)?;
+    let mut peeled = expr;
+    while let Expr::Nested(inner) = peeled {
+        peeled = inner;
+    }
+    let Expr::Array(array) = peeled else { return None };
+    let cast = |element: &Expr| {
+        let target =
+            if matches!(element, Expr::Array(_)) && !matches!(element_type, DataType::Array(_)) {
+                data_type
+            } else {
+                element_type
+            };
+        Expr::Cast {
+            kind: CastKind::Cast,
+            expr: Box::new(element.clone()),
+            data_type: target.clone(),
+            format: None,
+        }
+    };
+    Some(Expr::Array(sqlparser::ast::Array {
+        elem: array.elem.iter().map(cast).collect(),
+        named: array.named,
+    }))
+}
+
 /// Translate an `ARRAY[...]` (or bare `[...]`) literal.
 pub(crate) fn translate_array_literal(
     elements: &[Expr],

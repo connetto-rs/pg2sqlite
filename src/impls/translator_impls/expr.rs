@@ -3447,6 +3447,14 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                     {
                         return Ok(paired);
                     }
+                    if format.is_none()
+                        && let Some(distributed) =
+                            crate::impls::translator_impls::array::distribute_array_cast(
+                                expr, data_type,
+                            )
+                    {
+                        return distributed.translate_with_warnings(schema, options, emit);
+                    }
                     if crate::impls::translator_impls::vector::is_vector_data_type(data_type) {
                         return translate_vector_cast(expr, data_type, schema, options, emit);
                     }
