@@ -487,26 +487,23 @@ fn evaluate_definition<T: PartialEq>(
     }
 }
 
-/// Runs `inspect` over the recorded output scope of `query`, building it from
-/// the enclosing statement when none is recorded.
+/// Runs `inspect` over the output scope of `query`, recorded or built from the
+/// enclosing statement, or over [`None`] when the statement records none.
 fn with_output_scope<R>(
     query: &Query,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
-    inspect: impl FnOnce(ColumnQueryScope<'_, '_, '_, ParserDB>) -> Result<R, Error>,
+    inspect: impl FnOnce(Option<ColumnQueryScope<'_, '_, '_, ParserDB>>) -> Result<R, Error>,
 ) -> Result<R, Error> {
     if let Some(scope) = options.query_scope(query) {
-        return inspect(scope);
+        return inspect(Some(scope));
     }
     let graph = ColumnScope::from_query(
         options.original_query().unwrap_or(query),
         schema,
         sql_traits::structs::IdentifierCase::AsWritten,
     )?;
-    let scope = graph.scope_for_query(query).ok_or_else(|| {
-        Error::forward_refusal("The scalar query has no recorded output scope.".to_owned())
-    })?;
-    inspect(scope)
+    inspect(graph.scope_for_query(query))
 }
 
 /// Inspects known outputs while preserving unknown wildcard widths.
@@ -522,6 +519,9 @@ pub(crate) fn query_output_matches(
     ) -> Result<bool, Error>,
 ) -> Result<bool, Error> {
     with_output_scope(query, schema, options, |scope| {
+        let scope = scope.ok_or_else(|| {
+            Error::forward_refusal("The scalar query has no recorded output scope.".to_owned())
+        })?;
         for output in scope.outputs() {
             if let QueryOutput::Column { definition, .. } = output
                 && definition_matches(&definition, schema, options, &read_column, &read_expression)?
@@ -534,7 +534,8 @@ pub(crate) fn query_output_matches(
 }
 
 /// Reads the first output column of `query`, the value a scalar subquery
-/// answers, or [`None`] when that output has no inspectable definition.
+/// answers, or [`None`] when the statement records no scope for it or that
+/// output has no inspectable definition.
 pub(crate) fn first_query_output<T: PartialEq>(
     query: &Query,
     schema: &ParserDB,
@@ -547,7 +548,9 @@ pub(crate) fn first_query_output<T: PartialEq>(
     ) -> Result<Option<T>, Error>,
 ) -> Result<Option<T>, Error> {
     with_output_scope(query, schema, options, |scope| {
-        let Some(QueryOutput::Column { definition, .. }) = scope.outputs().next() else {
+        let Some(QueryOutput::Column { definition, .. }) =
+            scope.and_then(|scope| scope.outputs().next())
+        else {
             return Ok(None);
         };
         Ok(
