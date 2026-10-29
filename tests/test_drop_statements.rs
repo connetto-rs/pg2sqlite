@@ -531,6 +531,18 @@ fn drop_database_is_rejected() {
     );
 }
 
+/// A cascading `DROP FOREIGN TABLE` also deletes the views over the table,
+/// which reach the output.
+#[test]
+fn drop_foreign_table_cascade_is_rejected() {
+    let error = translate_statement("DROP FOREIGN TABLE remote_users CASCADE;")
+        .expect_err("a cascading DROP FOREIGN TABLE must be reported");
+    assert!(
+        error.to_string().contains("DROP FOREIGN TABLE remote_users CASCADE"),
+        "expected the error to name the statement, got {error}"
+    );
+}
+
 #[test]
 fn test_drop_sequence_ignored() -> Result<(), Box<dyn std::error::Error>> {
     let translated = translate_statement("DROP SEQUENCE my_sequence;")?;
