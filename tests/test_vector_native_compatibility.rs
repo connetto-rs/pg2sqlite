@@ -560,3 +560,36 @@ fn vector_operators_sqlite_vec_lacks_are_refused() {
         assert_refusal(source, None);
     }
 }
+
+#[derive(Debug, PartialEq, diesel::QueryableByName)]
+struct NullableDistance {
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    id: i32,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+    distance: Option<f64>,
+}
+
+#[test]
+fn a_distance_to_a_null_vector_is_null() {
+    // sqlite-vec refuses a NULL argument, where pgvector's distance operators
+    // are strict and answer NULL.
+    helpers::register_sqlite_vec_once();
+    for (operator, expected) in
+        [("<->", 5.0), ("<=>", 1.0 - 25.0 / (14.0_f64.sqrt() * 61.0_f64.sqrt()))]
+    {
+        let statements = Pg2Sqlite::default()
+            .sql(&format!(
+                "CREATE TABLE pairs(id INT PRIMARY KEY, v vector(3), w vector(3));
+                 INSERT INTO pairs VALUES (1, '[1,2,3]', '[4,6,3]'), (2, NULL, '[4,6,3]');
+                 SELECT id, v {operator} w AS distance FROM pairs ORDER BY id;"
+            ))
+            .unwrap()
+            .translate(&Pg2SqliteOptions::default())
+            .unwrap();
+        let mut connection = diesel::sqlite::SqliteConnection::establish(":memory:").unwrap();
+        let rows = run_emitted::<NullableDistance>(&statements, &mut connection);
+        assert_eq!(rows.len(), 2, "{operator}");
+        assert!((rows[0].distance.unwrap() - expected).abs() < 1e-6, "{operator}: {rows:?}");
+        assert_eq!(rows[1], NullableDistance { id: 2, distance: None }, "{operator}");
+    }
+}

@@ -598,6 +598,16 @@ fn bytea_concatenated_with_text_answers_the_hex_text() {
 }
 
 #[test]
+fn encode_of_a_null_bytea_is_null() {
+    // SQLite's hex(NULL) is the empty string, where PostgreSQL's encode is
+    // strict.
+    assert_eq!(
+        bytea_rows("SELECT encode(b, 'hex') FROM t ORDER BY id;"),
+        vec![Some("0102".to_owned()), None]
+    );
+}
+
+#[test]
 fn bytea_operators_postgresql_cannot_resolve_are_refused() {
     let schema = "CREATE TABLE t (id INT PRIMARY KEY, b BYTEA);";
     for (query, needle) in [

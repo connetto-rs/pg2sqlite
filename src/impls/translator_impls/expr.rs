@@ -1394,10 +1394,16 @@ fn translate_vector_distance_op(
     {
         return Err(crate::impls::translator_impls::vector::halfvec_refusal());
     }
-    let translated_left = left.translate_with_warnings(schema, options, emit)?;
-    let translated_right = right.translate_with_warnings(schema, options, emit)?;
-
-    Ok(simple_function_expr(function_name, vec![translated_left, translated_right], None))
+    let translated = [
+        left.translate_with_warnings(schema, options, emit)?,
+        right.translate_with_warnings(schema, options, emit)?,
+    ];
+    crate::impls::translator_impls::blob_operator::strict_vector_call(
+        function_name,
+        [left, right],
+        translated,
+        options,
+    )
 }
 
 /// The elements of a quantifier operand that compares element-wise: an
