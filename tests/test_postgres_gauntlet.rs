@@ -53,3 +53,6 @@ mod parity_query;
 
 #[path = "gauntlet/parity_index_names.rs"]
 mod parity_index_names;
+
+#[path = "gauntlet/parity_json_values.rs"]
+mod parity_json_values;

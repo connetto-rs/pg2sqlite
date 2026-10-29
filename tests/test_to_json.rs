@@ -124,3 +124,68 @@ fn to_json_over_an_unresolvable_column_is_refused() {
     );
     assert!(error.contains("ghost"), "the refusal must name the column: {error}");
 }
+
+/// A vector is stored as packed floats, which has no text form in SQL, so the
+/// statement is refused rather than failing on SQLite's BLOB refusal.
+#[test]
+fn a_json_constructor_over_a_vector_is_refused() {
+    let error = translate_err(
+        "CREATE TABLE e (id INT PRIMARY KEY, v vector(3));
+         SELECT json_build_array(v) FROM e;",
+    );
+    assert!(error.contains("vector"), "the refusal must name the type: {error}");
+}
+
+/// PostgreSQL refuses a document as an object key.
+#[test]
+fn a_json_document_as_an_object_key_is_refused() {
+    let error = translate_err(
+        "CREATE TABLE t (id INT PRIMARY KEY, doc JSONB);
+         SELECT json_build_object(doc, 1) FROM t;",
+    );
+    assert!(error.contains("key"), "the refusal must say the key is the problem: {error}");
+}
+
+/// A column a union answers as a document on one side and as text on the
+/// other has no one conversion, so it is refused rather than guessed.
+#[test]
+fn a_column_a_union_types_two_ways_is_refused() {
+    let error = translate_err(
+        "CREATE TABLE t (id INT PRIMARY KEY, doc JSONB, s TEXT);
+         SELECT json_build_array(x) FROM (SELECT doc AS x FROM t UNION ALL SELECT s FROM t) q;",
+    );
+    assert!(error.contains("one declared type"), "the refusal must name the ambiguity: {error}");
+}
+
+/// Rendering a bytea reads it twice, and a scalar subquery may answer
+/// differently each time, so it is refused rather than read twice.
+#[test]
+fn a_bytea_read_by_a_scalar_subquery_is_refused() {
+    let error = translate_err(
+        "CREATE TABLE t (id INT PRIMARY KEY, b BYTEA);
+         SELECT json_build_array((SELECT b FROM t LIMIT 1)) FROM t;",
+    );
+    assert!(error.contains("json_build_array"), "the refusal must name the call: {error}");
+}
+
+/// PostgreSQL refuses a scalar subquery with two columns, and the conversion
+/// has no one type to read from it either.
+#[test]
+fn a_scalar_subquery_with_two_columns_is_refused() {
+    let error = translate_err(
+        "CREATE TABLE t (id INT PRIMARY KEY, s TEXT);
+         SELECT json_build_array((SELECT s, id FROM t LIMIT 1)) FROM t;",
+    );
+    assert!(error.contains("exactly one column"), "the refusal must name the shape: {error}");
+}
+
+/// A subquery over `VALUES` declares no type, so the conversion is refused
+/// rather than guessed, as it is for a column of such a relation.
+#[test]
+fn a_scalar_subquery_with_no_declared_type_is_refused() {
+    let error = translate_err(
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         SELECT json_build_array((SELECT column1 FROM (VALUES (1)) v)) FROM t;",
+    );
+    assert!(error.contains("inspectable definition"), "the refusal must name the cause: {error}");
+}

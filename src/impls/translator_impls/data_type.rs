@@ -433,6 +433,15 @@ pub(crate) fn is_serial_type(data_type: &DataType) -> bool {
     })
 }
 
+/// True when a type that reaches the parser as a custom name is stored as a
+/// BLOB.
+pub(crate) fn translates_to_blob(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Custom(name, ..) if matches!(translate_custom_type(name), Ok(DataType::Blob(_)))
+    )
+}
+
 /// Maps PostgreSQL and extension types that reach the parser as a custom name.
 fn translate_custom_type(
     name: &sqlparser::ast::ObjectName,

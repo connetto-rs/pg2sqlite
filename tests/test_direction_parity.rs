@@ -122,11 +122,11 @@ fn localtime_forward_emission_round_trips() {
 // passes for a different (correct) reason. A second test exercises the reverse
 // recognizer directly against the contracted NULLIF shape.
 
-/// Forward-translate `json_object_agg(k, v)` and reverse the emission.
+/// Forward-translate `json_object_agg(s, n)` and reverse the emission.
 /// The result must restore `json_object_agg` with no `NULLIF` wrapper.
 #[test]
 fn json_object_agg_forward_emission_round_trips_without_nullif() {
-    let sqlite_sql = forward("SELECT json_object_agg(k, v) FROM t")
+    let sqlite_sql = forward("SELECT json_object_agg(s, n) FROM t")
         .expect("forward json_object_agg must succeed");
     let pg_sql = reverse(&sqlite_sql)
         .expect("the crate's own json_object_agg emission must reverse successfully");

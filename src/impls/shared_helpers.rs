@@ -522,6 +522,47 @@ pub(crate) fn query_output_matches(
     Ok(false)
 }
 
+/// The declaration of a scalar query's one output column, read from the query
+/// on its own.
+///
+/// # Errors
+///
+/// Refuses a query that does not answer exactly one column, which PostgreSQL
+/// refuses as a scalar subquery too, and an output with no inspectable
+/// definition.
+pub(crate) fn scalar_query_declared<T: PartialEq>(
+    query: &Query,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    read_column: impl Fn(&sqlparser::ast::ColumnDef) -> Option<T>,
+    read_expression: impl Fn(
+        &Expr,
+        &ParserDB,
+        &crate::options::TranslationContext<'_>,
+    ) -> Result<Option<T>, Error>,
+) -> Result<Option<T>, Error> {
+    let graph =
+        ColumnScope::from_query(query, schema, sql_traits::structs::IdentifierCase::AsWritten)?;
+    let mut outputs = graph.scope_for_query(query).into_iter().flat_map(|root| root.outputs());
+    let (Some(QueryOutput::Column { definition, .. }), None) = (outputs.next(), outputs.next())
+    else {
+        return Err(Error::forward_refusal(format!(
+            "({query}) has to answer exactly one column to be read as a value, which PostgreSQL \
+             requires of a scalar subquery with `subquery must return only one column`."
+        )));
+    };
+    match evaluate_definition(&definition, schema, options, &read_column, &read_expression)? {
+        DefinitionValue::Known(value) => Ok(value),
+        DefinitionValue::Opaque => {
+            Err(Error::UnresolvedColumnReference {
+                reference: format!("({query})"),
+                reason: "the relation exposes the column without an inspectable definition"
+                    .to_owned(),
+            })
+        }
+    }
+}
+
 #[cfg_attr(feature = "std", recursive::recursive)]
 fn definition_matches(
     definition: &ColumnDefinition<'_, '_, '_, ParserDB>,
