@@ -1891,17 +1891,22 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
                         }
                         statements
                     }
-                    // A schema, role, or type never reached the output, so
-                    // dropping the statement removes nothing that exists. The
-                    // exceptions are the two that would destroy tables: a
-                    // cascading DROP SCHEMA removes every table in the schema,
-                    // and DROP DATABASE removes the lot.
+                    // These never reached the output, so a drop removes nothing
+                    // unless it cascades into tables or views that did.
                     ObjectType::Schema if *cascade => {
                         return Err(reject_unsupported_statement(
                             self,
                             "A cascading DROP SCHEMA deletes every table in the schema, and the \
                  translated tables carry no schema, so which tables it means cannot be \
                  determined. Drop the tables by name instead.",
+                        ));
+                    }
+                    ObjectType::ForeignTable if *cascade => {
+                        return Err(reject_unsupported_statement(
+                            self,
+                            "A cascading DROP FOREIGN TABLE also deletes the views that read the \
+                 table, and those views reach the output although the table does not. Drop \
+                 the views by name instead.",
                         ));
                     }
                     ObjectType::Database | ObjectType::MaterializedView => {
