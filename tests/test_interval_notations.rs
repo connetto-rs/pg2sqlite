@@ -5,10 +5,8 @@
 //!   TIMESTAMP '2024-01-01 00:00:00' + INTERVAL '1 day' * 3   -> 2024-01-04
 //!   INTERVAL '1 day' + TIMESTAMP '2024-01-01 00:00:00'        -> 2024-01-04
 //!
-//! Refusal contracts:
-//!   ts + INTERVAL '01:30:00'   must name the verbose form (INTERVAL '1 hour 30
-//! minutes')   ts + $1 * INTERVAL '1 day' must say the scalar cannot be folded
-//! at translation time
+//! Refusal contract: `ts + $1 * INTERVAL '1 day'` must say the scalar cannot be
+//! folded at translation time.
 
 mod helpers;
 
@@ -99,21 +97,14 @@ fn interval_times_scalar_on_right_folds_to_modifier() {
 
 // --- R2-18c: message contracts -----------------------------------------------
 
-/// `INTERVAL '01:30:00'` (HH:MM:SS notation) is not decodable. The refusal must
-/// name the supported verbose form so the caller can fix the SQL rather than
-/// guessing. The old message falsely claimed INTERVAL is entirely unsupported.
+/// `INTERVAL '01:30:00'` adds an hour and a half, as on postgres:18.
 #[test]
-fn hh_mm_ss_interval_refusal_names_verbose_spelling() {
-    let err = tr_err("SELECT TIMESTAMP '2024-01-01 00:00:00' + INTERVAL '01:30:00' AS r");
-    assert!(
-        err.to_lowercase().contains("hour") || err.contains("verbose") || err.contains("1 hour"),
-        "refusal must name the verbose spelling (e.g. '1 hour 30 minutes'), got: {err}"
-    );
-    // Must not claim INTERVAL is entirely unsupported in SQLite.
-    assert!(
-        !err.contains("not supported in SQLite"),
-        "must not claim INTERVAL is wholly unsupported; got: {err}"
-    );
+fn hh_mm_ss_interval_is_added() {
+    let sql = tr("SELECT TIMESTAMP '2024-01-01 00:00:00' + INTERVAL '01:30:00' AS r");
+    let mut conn = establish_connection();
+    // sql_query: running dynamically generated translated SQL.
+    let rows = sql_query(&sql).load::<ScalarText>(&mut conn).expect("clock interval must run");
+    assert_eq!(rows[0].r, "2024-01-01 01:30:00", "{sql}");
 }
 
 /// `ts + $1 * INTERVAL '1 day'` cannot be folded at translation time because

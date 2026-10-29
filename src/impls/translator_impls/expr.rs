@@ -3505,7 +3505,7 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                     {
                         return Err(refusal);
                     }
-                    if matches!(data_type, DataType::Interval { .. })
+                    if let DataType::Interval { fields, precision } = data_type
                         && matches!(
                             expr.as_ref(),
                             Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(_), .. })
@@ -3513,6 +3513,8 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                     {
                         return crate::impls::shared_helpers::normalize_interval_literal_expr(
                             expr.as_ref().clone(),
+                            fields.as_ref(),
+                            *precision,
                         );
                     }
                     // A temporal literal is validated and normalised where it

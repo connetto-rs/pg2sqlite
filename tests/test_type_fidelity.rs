@@ -1136,11 +1136,12 @@ fn the_end_of_day_hour_rolls_the_month_and_the_year_over() {
     );
 }
 
-/// Refuses an interval literal, returning the message.
-fn interval_refusal(literal: &str) -> String {
+/// Refuses a literal written into a column of interval type `column`,
+/// returning the message.
+fn interval_refusal(column: &str, literal: &str) -> String {
     Pg2Sqlite::default()
         .sql(&format!(
-            "CREATE TABLE t (iv interval);
+            "CREATE TABLE t (iv {column});
              INSERT INTO t (iv) VALUES ('{literal}');"
         ))
         .expect("parse")
@@ -1150,33 +1151,100 @@ fn interval_refusal(literal: &str) -> String {
 }
 
 #[test]
-fn an_interval_unit_postgresql_does_not_have_is_refused() {
-    let message = interval_refusal("2 fortnights");
-    assert!(message.contains("not an interval unit"), "{message}");
+fn an_interval_postgresql_refuses_is_refused_with_its_message() {
+    const SYNTAX: &str = "invalid input syntax for type interval";
+    const FIELD: &str = "interval field value out of range";
+    // What PostgreSQL 18 answers for each literal.
+    for (literal, message) in [
+        ("2 fortnights", SYNTAX),
+        ("2 3 days", SYNTAX),
+        ("days", SYNTAX),
+        ("1:2:3:4", SYNTAX),
+        ("P1X", SYNTAX),
+        ("P1H", SYNTAX),
+        ("P1Y2", SYNTAX),
+        ("1.2.3 days", SYNTAX),
+        ("1 day 1 day", SYNTAX),
+        ("1 hour 01:00", SYNTAX),
+        ("0.5 seconds 1 millisecond", SYNTAX),
+        ("ago", SYNTAX),
+        ("@", SYNTAX),
+        ("P1D ago", SYNTAX),
+        ("p1d", SYNTAX),
+        ("1:60", FIELD),
+        ("1-12", FIELD),
+        ("2147483648 days", FIELD),
+        ("178956971 years", "interval out of range"),
+    ] {
+        let refusal = interval_refusal("interval", literal);
+        assert!(refusal.contains(message), "{literal}: {refusal}");
+    }
 }
 
 #[test]
-fn an_interval_count_without_a_unit_is_refused() {
-    let dangling = interval_refusal("2 3 days");
-    assert!(dangling.contains("names no unit"), "{dangling}");
-    let unitless = interval_refusal("days");
-    assert!(unitless.contains("has no count"), "{unitless}");
+fn an_infinite_interval_is_refused() {
+    for literal in ["infinity", "-infinity"] {
+        let refusal = interval_refusal("interval", literal);
+        assert!(refusal.contains("infinite"), "{literal}: {refusal}");
+    }
 }
 
 #[test]
-fn an_interval_clock_of_the_wrong_shape_is_refused() {
-    let message = interval_refusal("1:2:3:4");
-    assert!(message.contains("three parts at most"), "{message}");
+fn a_fractional_microsecond_rounds_as_postgresql_rounds_it() {
+    for (literal, printed) in [
+        ("1.999999999 millisecond", "00:00:00.002"),
+        ("0.333333333 hours", "00:19:59.999999"),
+        ("0.0000015 seconds", "00:00:00.000001"),
+        ("0.0000025 seconds", "00:00:00.000002"),
+        ("1:2:3.9999995", "01:02:04"),
+    ] {
+        assert_eq!(interval_text(literal), vec![Some(printed.to_string())], "{literal}");
+    }
 }
 
 #[test]
-fn an_iso_interval_of_the_wrong_shape_is_refused() {
-    let designator = interval_refusal("P1X");
-    assert!(designator.contains("designator"), "{designator}");
-    let hour_before_t = interval_refusal("P1H");
-    assert!(hour_before_t.contains("designator"), "{hour_before_t}");
-    let no_designator = interval_refusal("P1Y2");
-    assert!(no_designator.contains("unit designator"), "{no_designator}");
+fn a_two_part_clock_with_a_fraction_is_minutes_and_seconds() {
+    assert_eq!(interval_text("1:2.5"), vec![Some("00:01:02.5".to_string())]);
+}
+
+#[test]
+fn the_sql_standard_and_iso_alternative_forms_are_read() {
+    for (literal, printed) in [
+        ("1-2 3 4:05:06", "1 year 2 mons 3 days 04:05:06"),
+        ("-1-2 -3 -4:05:06", "-1 years -2 mons -3 days -04:05:06"),
+        ("P0001-02-03T04:05:06", "1 year 2 mons 3 days 04:05:06"),
+        ("P00010203T040506", "1 year 2 mons 3 days 04:05:06"),
+        ("1 day,2 hours", "1 day 02:00:00"),
+    ] {
+        assert_eq!(interval_text(literal), vec![Some(printed.to_string())], "{literal}");
+    }
+}
+
+#[test]
+fn an_interval_column_keeps_only_the_fields_its_type_names() {
+    for (column, literal, printed) in [
+        ("interval hour to minute", "1 day 2:03:04.5", "1 day 02:03:00"),
+        ("interval second(2)", "1.987654321 seconds", "00:00:01.99"),
+        ("interval(0)", "-1.5 seconds", "-00:00:02"),
+        ("interval minute to second", "1:2", "00:01:02"),
+        ("interval year", "1 year 13 months 40 days", "2 years"),
+    ] {
+        let rows = query_rows(
+            &format!(
+                "CREATE TABLE t (iv {column});
+                 INSERT INTO t (iv) VALUES ('{literal}');
+                 SELECT iv FROM t;"
+            ),
+            &default_opts(),
+        );
+        assert_eq!(rows, vec![Some(printed.to_string())], "{column} '{literal}'");
+    }
+}
+
+#[test]
+fn an_interval_type_with_a_precision_postgresql_lacks_is_refused() {
+    let refusal = interval_refusal("interval year(2)", "1 year");
+    assert!(refusal.contains("interval YEAR(2)"), "{refusal}");
 }
 
 #[test]
@@ -1239,12 +1307,6 @@ fn a_bare_count_before_a_clock_counts_days() {
 #[test]
 fn a_negative_year_month_interval_signs_both_counts() {
     assert_eq!(interval_text("-1-2"), vec![Some("-1 years -2 mons".to_string())]);
-}
-
-#[test]
-fn an_interval_count_that_is_not_a_number_is_refused() {
-    let message = interval_refusal("1.2.3 days");
-    assert!(message.contains("not a number"), "{message}");
 }
 
 #[test]
