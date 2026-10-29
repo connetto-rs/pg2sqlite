@@ -899,14 +899,16 @@ struct ScalarText {
 const STORED_DDL: &str = "CREATE TABLE stored (\
      id INT PRIMARY KEY, u UUID, raw BYTEA, xs INT[], doc JSONB);";
 
-/// Two rows, the second one empty where emptiness is what diverges: SQLite
-/// answers 0 for the length of an empty array and PostgreSQL's `array_length`
-/// answers NULL.
+/// Three rows, the second one empty where emptiness is what diverges, and the
+/// third NULL where NULL is: SQLite answers 0 for the length of an empty array
+/// where PostgreSQL's `array_length` answers NULL, and SQLite's `hex(NULL)` is
+/// the empty string where PostgreSQL's `encode` answers NULL.
 const STORED_ROWS: &str = "\
      INSERT INTO stored (id, u, raw, xs, doc) VALUES \
      (1, '550e8400-e29b-41d4-a716-446655440000'::uuid, '\\x00ff'::bytea, ARRAY[1,2], '[1,2,3]'::jsonb); \
      INSERT INTO stored (id, u, raw, xs, doc) VALUES \
-     (2, '660e8400-e29b-41d4-a716-446655440000'::uuid, '\\x'::bytea, ARRAY[]::int[], '[]'::jsonb);";
+     (2, '660e8400-e29b-41d4-a716-446655440000'::uuid, '\\x'::bytea, ARRAY[]::int[], '[]'::jsonb); \
+     INSERT INTO stored (id) VALUES (3);";
 
 /// SQLite expressions over `stored`, each one a storage wrapper whose
 /// PostgreSQL form depends on the column's declared type rather than on the
