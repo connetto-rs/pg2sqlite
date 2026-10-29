@@ -13,6 +13,7 @@ use alloc::{
 };
 
 pub(crate) mod array;
+pub(crate) mod blob_operator;
 pub(crate) mod column;
 pub(crate) mod column_option;
 mod condition_injection;

@@ -29,7 +29,7 @@ use crate::{
 
 /// PostgreSQL's name for the type of an untyped literal such as `NULL` or
 /// `'abc'`, which the call it is passed to decides.
-const UNKNOWN: &str = "unknown";
+pub(crate) const UNKNOWN: &str = "unknown";
 
 /// The PostgreSQL type name of `expr`, or [`None`] when nothing the statement
 /// writes decides it.
@@ -50,6 +50,14 @@ pub(crate) fn type_name<'e>(
         Expr::TypedString(typed) => Some(normalize_sqlparser_type(&typed.data_type)),
         Expr::Value(value) => literal_type_name(&value.value).map(Cow::Borrowed),
         Expr::Function(call) => call_type_name(call, schema, options)?.map(Cow::Owned),
+        Expr::BinaryOp { left, op, right } => {
+            crate::impls::translator_impls::blob_operator::resolve(
+                left, op, right, schema, options,
+            )?
+            .map(|resolved| {
+                Cow::Owned(normalize_sqlparser_type(resolved.result_type()).into_owned())
+            })
+        }
         Expr::Array(array) => {
             common_type(&array.elem, schema, options)?
                 .map(|element| Cow::Owned(format!("{element}[]")))

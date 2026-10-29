@@ -473,3 +473,90 @@ fn float32_bound_parameters_store_native_vectors() {
         .unwrap();
     assert_eq!(distances(&mut connection), [ScalarDistance { id: 3, distance: 0.0 }]);
 }
+
+#[derive(Debug, PartialEq, diesel::QueryableByName)]
+struct VectorResult {
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    id: i32,
+    #[diesel(sql_type = diesel::sql_types::Nullable<Binary>)]
+    result: Option<Vec<u8>>,
+}
+
+/// The float32 bytes sqlite-vec stores `values` as.
+fn float32_bytes(values: &[f32]) -> Vec<u8> {
+    values.iter().flat_map(|value| value.to_le_bytes()).collect()
+}
+
+/// Stores `expression` into a `vector(dimensions)` column over a row holding
+/// `[1,2,3]` and `[4,6,3]` and a row whose first vector is NULL, then reads it.
+fn vector_results(expression: &str, dimensions: u32) -> Vec<VectorResult> {
+    helpers::register_sqlite_vec_once();
+    let statements = Pg2Sqlite::default()
+        .sql(&format!(
+            "CREATE TABLE pairs(id INT PRIMARY KEY, v vector(3), w vector(3), r vector({dimensions}));
+             INSERT INTO pairs(id, v, w) VALUES (1, '[1,2,3]', '[4,6,3]'), (2, NULL, '[4,6,3]');
+             UPDATE pairs SET r = {expression};
+             SELECT id, r AS result FROM pairs ORDER BY id;"
+        ))
+        .unwrap()
+        .translate(&Pg2SqliteOptions::default())
+        .unwrap();
+    let mut connection = diesel::sqlite::SqliteConnection::establish(":memory:").unwrap();
+    run_emitted::<VectorResult>(&statements, &mut connection)
+}
+
+#[test]
+fn vector_addition_and_subtraction_are_element_wise() {
+    // Emitted as SQLite arithmetic, a BLOB reads as 0, so both answered 0.
+    assert_eq!(
+        vector_results("v + w", 3),
+        [
+            VectorResult { id: 1, result: Some(float32_bytes(&[5.0, 8.0, 6.0])) },
+            VectorResult { id: 2, result: None },
+        ]
+    );
+    assert_eq!(
+        vector_results("v - w", 3),
+        [
+            VectorResult { id: 1, result: Some(float32_bytes(&[-3.0, -4.0, 0.0])) },
+            VectorResult { id: 2, result: None },
+        ]
+    );
+    assert_eq!(
+        vector_results("v + '[1,1,1]'", 3),
+        [
+            VectorResult { id: 1, result: Some(float32_bytes(&[2.0, 3.0, 4.0])) },
+            VectorResult { id: 2, result: None },
+        ]
+    );
+}
+
+#[test]
+fn vector_concatenation_stores_the_appended_elements() {
+    // SQLite's || answers TEXT, which the STRICT BLOB column refuses.
+    assert_eq!(
+        vector_results("v || w", 6),
+        [
+            VectorResult { id: 1, result: Some(float32_bytes(&[1.0, 2.0, 3.0, 4.0, 6.0, 3.0])) },
+            VectorResult { id: 2, result: None },
+        ]
+    );
+    assert_eq!(
+        vector_results("v || '[7,8,9]'", 6),
+        [
+            VectorResult { id: 1, result: Some(float32_bytes(&[1.0, 2.0, 3.0, 7.0, 8.0, 9.0])) },
+            VectorResult { id: 2, result: None },
+        ]
+    );
+}
+
+#[test]
+fn vector_operators_sqlite_vec_lacks_are_refused() {
+    for source in [
+        "CREATE TABLE pairs(id INT PRIMARY KEY, v vector(3), w vector(3)); SELECT v * w FROM pairs;",
+        "CREATE TABLE pairs(id INT PRIMARY KEY, v vector(3)); SELECT v + id FROM pairs;",
+        "SELECT '[1,2,3]'::halfvec(3) + '[1,2,3]'::halfvec(3);",
+    ] {
+        assert_refusal(source, None);
+    }
+}
