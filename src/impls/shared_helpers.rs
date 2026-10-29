@@ -522,11 +522,14 @@ pub(crate) fn query_output_matches(
     Ok(false)
 }
 
-/// The declaration of a scalar query's one output column, or `None` when it has
-/// another number of columns or one this cannot inspect.
+/// The declaration of a scalar query's one output column, read from the query
+/// on its own.
 ///
-/// A query the translation recorded no scope for is read on its own, so a
-/// reference it correlates to the outer query answers `None`.
+/// # Errors
+///
+/// Refuses a query that does not answer exactly one column, which PostgreSQL
+/// refuses as a scalar subquery too, and an output with no inspectable
+/// definition.
 pub(crate) fn scalar_query_declared<T: PartialEq>(
     query: &Query,
     schema: &ParserDB,
@@ -537,24 +540,26 @@ pub(crate) fn scalar_query_declared<T: PartialEq>(
         &ParserDB,
         &crate::options::TranslationContext<'_>,
     ) -> Result<Option<T>, Error>,
-) -> Option<T> {
-    let graph;
-    let scope = if let Some(scope) = options.query_scope(query) {
-        scope
-    } else {
-        graph =
-            ColumnScope::from_query(query, schema, sql_traits::structs::IdentifierCase::AsWritten)
-                .ok()?;
-        graph.scope_for_query(query)?
-    };
-    let mut outputs = scope.outputs();
+) -> Result<Option<T>, Error> {
+    let graph =
+        ColumnScope::from_query(query, schema, sql_traits::structs::IdentifierCase::AsWritten)?;
+    let mut outputs = graph.scope_for_query(query).into_iter().flat_map(|root| root.outputs());
     let (Some(QueryOutput::Column { definition, .. }), None) = (outputs.next(), outputs.next())
     else {
-        return None;
+        return Err(Error::forward_refusal(format!(
+            "({query}) has to answer exactly one column to be read as a value, which PostgreSQL \
+             requires of a scalar subquery with `subquery must return only one column`."
+        )));
     };
-    match evaluate_definition(&definition, schema, options, &read_column, &read_expression) {
-        Ok(DefinitionValue::Known(value)) => value,
-        Ok(DefinitionValue::Opaque) | Err(_) => None,
+    match evaluate_definition(&definition, schema, options, &read_column, &read_expression)? {
+        DefinitionValue::Known(value) => Ok(value),
+        DefinitionValue::Opaque => {
+            Err(Error::UnresolvedColumnReference {
+                reference: format!("({query})"),
+                reason: "the relation exposes the column without an inspectable definition"
+                    .to_owned(),
+            })
+        }
     }
 }
 

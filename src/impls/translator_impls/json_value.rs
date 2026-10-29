@@ -102,7 +102,7 @@ pub(crate) fn json_argument(
 ) -> Result<JsonArgument, Error> {
     let Some(conversion) = conversion_of(argument, schema, options)? else {
         return Err(Error::forward_refusal(format!(
-            "{label}({argument}) names a column the translation schema cannot resolve to one \
+            "{label}({argument}) reads a value the translation schema cannot settle to one \
              declared type, and PostgreSQL converts a value into JSON by its type. Include the \
              column's table in the translation batch, or qualify the reference so the type is \
              unambiguous."
@@ -222,8 +222,8 @@ enum Stored {
     TimeWithTimeZone,
 }
 
-/// The conversion `expr` needs, or `None` for a column the scope answers more
-/// than one type for.
+/// The conversion `expr` needs, or `None` for a column or subquery the scope
+/// answers more than one type for.
 #[cfg_attr(feature = "std", recursive::recursive)]
 fn conversion_of(
     expr: &Expr,
@@ -245,14 +245,13 @@ fn conversion_of(
     Ok(Some(match expr {
         Expr::Nested(inner) => return conversion_of(inner, schema, options),
         Expr::Subquery(query) => {
-            scalar_query_declared(
+            return scalar_query_declared(
                 query,
                 schema,
                 options,
                 |column| Some(conversion_of_type(&column.data_type, options)),
                 conversion_of,
-            )
-            .unwrap_or(Conversion::Stored(Stored::Native))
+            );
         }
         _ if is_already_json(expr) => Conversion::Stored(Stored::Document),
         _ if is_boolean_expression(expr, schema, options)? => Conversion::Boolean,

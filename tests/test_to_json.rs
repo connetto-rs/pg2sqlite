@@ -167,3 +167,25 @@ fn a_bytea_read_by_a_scalar_subquery_is_refused() {
     );
     assert!(error.contains("json_build_array"), "the refusal must name the call: {error}");
 }
+
+/// PostgreSQL refuses a scalar subquery with two columns, and the conversion
+/// has no one type to read from it either.
+#[test]
+fn a_scalar_subquery_with_two_columns_is_refused() {
+    let error = translate_err(
+        "CREATE TABLE t (id INT PRIMARY KEY, s TEXT);
+         SELECT json_build_array((SELECT s, id FROM t LIMIT 1)) FROM t;",
+    );
+    assert!(error.contains("exactly one column"), "the refusal must name the shape: {error}");
+}
+
+/// A subquery over `VALUES` declares no type, so the conversion is refused
+/// rather than guessed, as it is for a column of such a relation.
+#[test]
+fn a_scalar_subquery_with_no_declared_type_is_refused() {
+    let error = translate_err(
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         SELECT json_build_array((SELECT column1 FROM (VALUES (1)) v)) FROM t;",
+    );
+    assert!(error.contains("inspectable definition"), "the refusal must name the cause: {error}");
+}
