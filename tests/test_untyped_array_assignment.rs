@@ -14,8 +14,8 @@ use pg2sqlite::prelude::{
 };
 
 const TABLE: &str = "CREATE TABLE z (id INT PRIMARY KEY, ats TIMESTAMPTZ[], d DATE[], \
-                     ids UUID[], iv INTERVAL[], n INT[], tags TEXT[], names VARCHAR(8)[], \
-                     codes CHAR(2)[]);";
+                     dd DATE[][], ids UUID[], iv INTERVAL[], n INT[], tags TEXT[], \
+                     names VARCHAR(8)[], codes CHAR(2)[], countries COUNTRYCODE[]);";
 
 fn options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
@@ -67,10 +67,22 @@ fn null_elements_are_untyped_too() {
 }
 
 #[test]
+fn nested_and_parenthesised_literals_are_untyped_too() {
+    refusal(&format!("{TABLE} INSERT INTO z (id, dd) VALUES (1, ARRAY[ARRAY['2024-01-01']]);"));
+    refusal(&format!("{TABLE} INSERT INTO z (id, d) VALUES (1, ARRAY[('2024-01-01')]);"));
+}
+
+#[test]
 fn a_character_array_takes_it() {
     for column in ["tags", "names", "codes"] {
         accepted(&format!("{TABLE} INSERT INTO z (id, {column}) VALUES (1, ARRAY['ab', NULL]);"));
     }
+}
+
+/// A custom element type may be a domain over `text`, which takes `text[]`.
+#[test]
+fn a_custom_element_type_is_left_alone() {
+    accepted(&format!("{TABLE} INSERT INTO z (id, countries) VALUES (1, ARRAY['IT']);"));
 }
 
 #[test]
@@ -92,8 +104,14 @@ fn an_insert_from_a_select_is_refused() {
 
 #[test]
 fn an_update_is_refused() {
-    refusal(&format!("{TABLE} UPDATE z SET d = ARRAY['2024-01-01'] WHERE id = 1;"));
-    refusal(&format!("{TABLE} UPDATE z SET (id, d) = (2, ARRAY['2024-01-01']) WHERE id = 1;"));
+    for assignment in [
+        "d = ARRAY['2024-01-01']",
+        "(id, d) = (2, ARRAY['2024-01-01'])",
+        "(id, d) = (SELECT 2, ARRAY['2024-01-01'])",
+    ] {
+        let message = refusal(&format!("{TABLE} UPDATE z SET {assignment} WHERE id = 1;"));
+        assert!(message.contains("text[]"), "{assignment}: {message}");
+    }
 }
 
 #[test]

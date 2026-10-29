@@ -1230,7 +1230,8 @@ impl ColumnRewrites {
     }
 
     /// [`Self::reject_untyped_array`] for every column an assignment writes,
-    /// with the tuple spelling zipped name by name.
+    /// with the tuple spelling zipped name by name against a row or a
+    /// sub-select's projection.
     pub(crate) fn reject_untyped_array_assignment(
         &self,
         target: &AssignmentTarget,
@@ -1240,12 +1241,25 @@ impl ColumnRewrites {
             last_ident(name)
                 .map_or(Ok(()), |column| self.reject_untyped_array(&column.value, value))
         };
-        match (target, value) {
-            (AssignmentTarget::ColumnName(name), _) => reject(name, value),
-            (AssignmentTarget::Tuple(names), Expr::Tuple(items)) => {
+        let names = match target {
+            AssignmentTarget::ColumnName(name) => return reject(name, value),
+            AssignmentTarget::Tuple(names) => names,
+        };
+        match value {
+            Expr::Tuple(items) => {
                 names.iter().zip(items).try_for_each(|(name, item)| reject(name, item))
             }
-            (AssignmentTarget::Tuple(_), _) => Ok(()),
+            Expr::Subquery(query) => {
+                let SetExpr::Select(select) = query.body.as_ref() else { return Ok(()) };
+                names.iter().zip(&select.projection).try_for_each(|(name, item)| {
+                    match item {
+                        SelectItem::UnnamedExpr(item)
+                        | SelectItem::ExprWithAlias { expr: item, .. } => reject(name, item),
+                        _ => Ok(()),
+                    }
+                })
+            }
+            _ => Ok(()),
         }
     }
 
