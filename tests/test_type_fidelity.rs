@@ -633,6 +633,44 @@ fn an_array_of_concatenated_bytea_is_refused() {
 }
 
 #[test]
+fn an_array_of_a_subquery_with_no_readable_type_still_translates() {
+    // A PL/pgSQL variable is read through a subquery the statement's scope
+    // does not record, and a function relation's columns are opaque. Neither
+    // says the element is a BLOB, so the array translates.
+    run(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY);
+         CREATE TABLE log (id INTEGER PRIMARY KEY, tags INT[]);
+         CREATE TABLE src (id INTEGER PRIMARY KEY, v INTEGER);
+         CREATE FUNCTION f() RETURNS TRIGGER AS $$
+         DECLARE v_n INTEGER := 3;
+         BEGIN INSERT INTO log (tags) SELECT array_agg(v_n) FROM src; RETURN NEW; END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER tr AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION f();
+         INSERT INTO src VALUES (1, 1);
+         INSERT INTO t VALUES (1);",
+        &array_opts(),
+    );
+    run(
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         SELECT ARRAY[(SELECT name FROM pragma_table_info('t') LIMIT 1)] FROM t;",
+        &array_opts().with_user_defined_functions(["pragma_table_info"]),
+    );
+}
+
+#[test]
+fn an_unresolved_column_in_an_array_element_is_reported() {
+    let error = Pg2Sqlite::default()
+        .sql("CREATE TABLE t (id INT PRIMARY KEY); SELECT ARRAY[CASE WHEN id > 0 THEN missing END] FROM t;")
+        .expect("parse")
+        .translate(&array_opts())
+        .expect_err("missing is no column of t");
+    assert!(
+        matches!(error, pg2sqlite::errors::Error::UnresolvedColumnReference { .. }),
+        "{error:?}"
+    );
+}
+
+#[test]
 fn arrays_of_sqlitegis_geometry_results_are_refused() {
     expect_refusal(
         "CREATE TABLE t (id INT PRIMARY KEY); SELECT ARRAY[ST_Point(1, 2)] FROM t;",
