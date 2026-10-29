@@ -17,6 +17,7 @@ pub(crate) mod datetime_helpers;
 pub(crate) mod direction_wrappers;
 pub(crate) mod emitted_namespace;
 pub(crate) mod expr_helpers;
+pub(crate) mod expression_type;
 pub(crate) mod function_helpers;
 pub(crate) mod idioms;
 pub(crate) mod interval;

@@ -25,8 +25,9 @@
 //!   Both exclude the row from a `WHERE` clause, which is the only place the
 //!   difference is observable.
 //! * An element stored as a BLOB is refused, because SQLite's JSON functions
-//!   take no BLOB argument. Only a declared or cast type is read, so a function
-//!   returning a BLOB still fails in SQLite.
+//!   take no BLOB argument. The element's type is read from a column, a cast, a
+//!   literal or a call's result, so an operator or `CASE` producing a BLOB
+//!   still fails in SQLite.
 
 #[cfg(not(feature = "std"))]
 #[allow(unused_imports)]
@@ -142,35 +143,24 @@ pub(crate) fn blob_element_refusal(element: &DataType) -> Error {
     ))
 }
 
-/// Refuses `element` as an array element when its declared or cast type lands
-/// as a BLOB.
+/// Refuses `element` as an array element when its type lands as a BLOB.
 ///
 /// # Errors
 ///
 /// Returns [`blob_element_refusal`] for a BLOB-stored element, and propagates
-/// the unresolved reference the scope answers for a column no relation in it
-/// declares.
-#[cfg_attr(feature = "std", recursive::recursive)]
+/// what [`crate::impls::expression_type::type_name`] fails with.
 pub(crate) fn refuse_blob_element(
     element: &Expr,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
 ) -> Result<(), Error> {
-    let declared;
-    let element_type = match element {
-        Expr::Nested(inner) => return refuse_blob_element(inner, schema, options),
-        Expr::Cast { data_type, .. } => data_type,
-        Expr::TypedString(typed) => &typed.data_type,
-        _ => {
-            declared = crate::impls::reverse_translator_impls::storage_shape::declared_data_type(
-                element, schema, options,
-            )?;
-            let Some(declared) = &declared else { return Ok(()) };
-            declared
-        }
+    let Some(element_type) = crate::impls::expression_type::type_name(element, schema, options)?
+        .and_then(|name| crate::impls::expression_type::parse_type_name(&name))
+    else {
+        return Ok(());
     };
-    if stored_as_blob(element_type, schema, options) {
-        return Err(blob_element_refusal(element_type));
+    if stored_as_blob(&element_type, schema, options) {
+        return Err(blob_element_refusal(&element_type));
     }
     Ok(())
 }

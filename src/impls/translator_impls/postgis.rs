@@ -10,7 +10,8 @@
 //! The list MUST stay in sync with SQLiteGIS's
 //! `sqlitegis::core::function_catalog::SQLITE_DETERMINISTIC_FUNCTIONS` and
 //! `SQLITE_DIRECT_ONLY_FUNCTIONS`. The feature-gated unit tests assert that
-//! every SQLiteGIS catalog entry has a matching `(name, arity)` here.
+//! every SQLiteGIS catalog entry has a matching `(name, arity)` here, and that
+//! its result type lands in the storage class SQLiteGIS returns.
 
 #[cfg(not(feature = "std"))]
 #[allow(unused_imports)]
@@ -23,151 +24,163 @@ use alloc::{
     vec::Vec,
 };
 
-/// `(lowercase-name, arity)` pairs implemented by SQLiteGIS v0.1.0.
+/// `(lowercase-name, arity, PostgreSQL result type)` triples implemented by
+/// SQLiteGIS.
 ///
 /// Multiple entries with the same name encode overloaded arities (for
 /// example `st_point` takes either 2 or 3 args).
-pub(crate) const POSTGIS_FUNCTION_CATALOG: &[(&str, i32)] = &[
+pub(crate) const POSTGIS_FUNCTION_CATALOG: &[(&str, i32, &str)] = &[
     // -- I/O --
-    ("st_geomfromtext", 1),
-    ("st_geomfromtext", 2),
-    ("st_geomfromwkb", 1),
-    ("st_geomfromwkb", 2),
-    ("st_geomfromewkb", 1),
-    ("st_geomfromgeojson", 1),
-    ("st_astext", 1),
-    ("st_asewkt", 1),
-    ("st_asbinary", 1),
-    ("st_asewkb", 1),
-    ("st_asgeojson", 1),
+    ("st_geomfromtext", 1, "geometry"),
+    ("st_geomfromtext", 2, "geometry"),
+    ("st_geomfromwkb", 1, "geometry"),
+    ("st_geomfromwkb", 2, "geometry"),
+    ("st_geomfromewkb", 1, "geometry"),
+    ("st_geomfromgeojson", 1, "geometry"),
+    ("st_astext", 1, "text"),
+    ("st_asewkt", 1, "text"),
+    ("st_asbinary", 1, "bytea"),
+    ("st_asewkb", 1, "bytea"),
+    ("st_asgeojson", 1, "text"),
     // -- Constructors --
-    ("st_point", 2),
-    ("st_point", 3),
-    ("st_makepoint", 2),
-    ("st_makeline", 2),
-    ("st_makepolygon", 1),
-    ("st_makeenvelope", 4),
-    ("st_makeenvelope", 5),
-    ("st_collect", 2),
-    ("st_tileenvelope", 3),
+    ("st_point", 2, "geometry"),
+    ("st_point", 3, "geometry"),
+    ("st_makepoint", 2, "geometry"),
+    ("st_makeline", 2, "geometry"),
+    ("st_makepolygon", 1, "geometry"),
+    ("st_makeenvelope", 4, "geometry"),
+    ("st_makeenvelope", 5, "geometry"),
+    ("st_collect", 2, "geometry"),
+    ("st_tileenvelope", 3, "geometry"),
     // -- SRID / type / dimensions --
-    ("st_srid", 1),
-    ("st_setsrid", 2),
-    ("st_geometrytype", 1),
-    ("geometrytype", 1),
-    ("st_ndims", 1),
-    ("st_coorddim", 1),
-    ("st_zmflag", 1),
-    ("st_isempty", 1),
-    ("st_memsize", 1),
+    ("st_srid", 1, "integer"),
+    ("st_setsrid", 2, "geometry"),
+    ("st_geometrytype", 1, "text"),
+    ("geometrytype", 1, "text"),
+    ("st_ndims", 1, "smallint"),
+    ("st_coorddim", 1, "smallint"),
+    ("st_zmflag", 1, "smallint"),
+    ("st_isempty", 1, "boolean"),
+    ("st_memsize", 1, "integer"),
     // -- Coordinate accessors --
-    ("st_x", 1),
-    ("st_y", 1),
-    ("st_z", 1),
+    ("st_x", 1, "double precision"),
+    ("st_y", 1, "double precision"),
+    ("st_z", 1, "double precision"),
     // -- Cardinality --
-    ("st_numpoints", 1),
-    ("st_npoints", 1),
-    ("st_numgeometries", 1),
-    ("st_numinteriorrings", 1),
-    ("st_numinteriorring", 1),
-    ("st_numrings", 1),
+    ("st_numpoints", 1, "integer"),
+    ("st_npoints", 1, "integer"),
+    ("st_numgeometries", 1, "integer"),
+    ("st_numinteriorrings", 1, "integer"),
+    ("st_numinteriorring", 1, "integer"),
+    ("st_numrings", 1, "integer"),
     // -- Element extraction --
-    ("st_pointn", 2),
-    ("st_startpoint", 1),
-    ("st_endpoint", 1),
-    ("st_exteriorring", 1),
-    ("st_interiorringn", 2),
-    ("st_geometryn", 2),
+    ("st_pointn", 2, "geometry"),
+    ("st_startpoint", 1, "geometry"),
+    ("st_endpoint", 1, "geometry"),
+    ("st_exteriorring", 1, "geometry"),
+    ("st_interiorringn", 2, "geometry"),
+    ("st_geometryn", 2, "geometry"),
     // -- Metadata --
-    ("st_dimension", 1),
-    ("st_envelope", 1),
-    ("st_isvalid", 1),
-    ("st_isvalidreason", 1),
+    ("st_dimension", 1, "integer"),
+    ("st_envelope", 1, "geometry"),
+    ("st_isvalid", 1, "boolean"),
+    ("st_isvalidreason", 1, "text"),
     // -- Measurement --
-    ("st_area", 1),
-    ("st_length", 1),
-    ("st_length2d", 1),
-    ("st_perimeter", 1),
-    ("st_perimeter2d", 1),
-    ("st_distance", 2),
-    ("st_centroid", 1),
-    ("st_pointonsurface", 1),
-    ("st_hausdorffdistance", 2),
+    ("st_area", 1, "double precision"),
+    ("st_length", 1, "double precision"),
+    ("st_length2d", 1, "double precision"),
+    ("st_perimeter", 1, "double precision"),
+    ("st_perimeter2d", 1, "double precision"),
+    ("st_distance", 2, "double precision"),
+    ("st_centroid", 1, "geometry"),
+    ("st_pointonsurface", 1, "geometry"),
+    ("st_hausdorffdistance", 2, "double precision"),
     // -- Bounds --
-    ("st_xmin", 1),
-    ("st_xmax", 1),
-    ("st_ymin", 1),
-    ("st_ymax", 1),
+    ("st_xmin", 1, "double precision"),
+    ("st_xmax", 1, "double precision"),
+    ("st_ymin", 1, "double precision"),
+    ("st_ymax", 1, "double precision"),
     // -- Linear referencing (planar) --
-    ("st_segmentize", 2),
-    ("st_lineinterpolatepoint", 2),
-    ("st_lineinterpolatepoints", 2),
-    ("st_linesubstring", 3),
+    ("st_segmentize", 2, "geometry"),
+    ("st_lineinterpolatepoint", 2, "geometry"),
+    ("st_lineinterpolatepoints", 2, "geometry"),
+    ("st_linesubstring", 3, "geometry"),
     // -- Geodetic (SRID 4326) --
-    ("st_distancesphere", 2),
-    ("st_distancespheroid", 2),
-    ("st_lengthsphere", 1),
-    ("st_lengthspheroid", 1),
-    ("st_length2dspheroid", 1),
-    ("st_areasphere", 1),
-    ("st_areaspheroid", 1),
-    ("st_perimetersphere", 1),
-    ("st_perimeterspheroid", 1),
-    ("st_segmentizesphere", 2),
-    ("st_segmentizespheroid", 2),
-    ("st_lineinterpolatepointsphere", 2),
-    ("st_lineinterpolatepointspheroid", 2),
-    ("st_lineinterpolatepointssphere", 2),
-    ("st_lineinterpolatepointsspheroid", 2),
-    ("st_linesubstringsphere", 3),
-    ("st_linesubstringspheroid", 3),
-    ("st_azimuth", 2),
-    ("st_project", 3),
-    ("st_closestpoint", 2),
+    ("st_distancesphere", 2, "double precision"),
+    ("st_distancespheroid", 2, "double precision"),
+    ("st_lengthsphere", 1, "double precision"),
+    ("st_lengthspheroid", 1, "double precision"),
+    ("st_length2dspheroid", 1, "double precision"),
+    ("st_areasphere", 1, "double precision"),
+    ("st_areaspheroid", 1, "double precision"),
+    ("st_perimetersphere", 1, "double precision"),
+    ("st_perimeterspheroid", 1, "double precision"),
+    ("st_segmentizesphere", 2, "geometry"),
+    ("st_segmentizespheroid", 2, "geometry"),
+    ("st_lineinterpolatepointsphere", 2, "geometry"),
+    ("st_lineinterpolatepointspheroid", 2, "geometry"),
+    ("st_lineinterpolatepointssphere", 2, "geometry"),
+    ("st_lineinterpolatepointsspheroid", 2, "geometry"),
+    ("st_linesubstringsphere", 3, "geometry"),
+    ("st_linesubstringspheroid", 3, "geometry"),
+    ("st_azimuth", 2, "double precision"),
+    ("st_project", 3, "geometry"),
+    ("st_closestpoint", 2, "geometry"),
     // -- Set operations --
-    ("st_union", 2),
-    ("st_intersection", 2),
-    ("st_difference", 2),
-    ("st_symdifference", 2),
-    ("st_buffer", 2),
+    ("st_union", 2, "geometry"),
+    ("st_intersection", 2, "geometry"),
+    ("st_difference", 2, "geometry"),
+    ("st_symdifference", 2, "geometry"),
+    ("st_buffer", 2, "geometry"),
     // -- Predicates --
-    ("st_intersects", 2),
-    ("st_contains", 2),
-    ("st_within", 2),
-    ("st_disjoint", 2),
-    ("st_dwithin", 3),
-    ("st_dwithinsphere", 3),
-    ("st_dwithinspheroid", 3),
-    ("st_covers", 2),
-    ("st_coveredby", 2),
-    ("st_equals", 2),
-    ("st_touches", 2),
-    ("st_crosses", 2),
-    ("st_overlaps", 2),
-    ("st_relate", 2),
-    ("st_relate", 3),
-    ("st_relatematch", 2),
+    ("st_intersects", 2, "boolean"),
+    ("st_contains", 2, "boolean"),
+    ("st_within", 2, "boolean"),
+    ("st_disjoint", 2, "boolean"),
+    ("st_dwithin", 3, "boolean"),
+    ("st_dwithinsphere", 3, "boolean"),
+    ("st_dwithinspheroid", 3, "boolean"),
+    ("st_covers", 2, "boolean"),
+    ("st_coveredby", 2, "boolean"),
+    ("st_equals", 2, "boolean"),
+    ("st_touches", 2, "boolean"),
+    ("st_crosses", 2, "boolean"),
+    ("st_overlaps", 2, "boolean"),
+    ("st_relate", 2, "text"),
+    ("st_relate", 3, "boolean"),
+    ("st_relatematch", 2, "boolean"),
     // -- Direct-only DDL helpers (SQLite-side) --
-    ("createspatialindex", 2),
-    ("createspatialindex", 3),
-    ("dropspatialindex", 2),
-    ("dropspatialindex", 3),
+    ("createspatialindex", 2, "integer"),
+    ("createspatialindex", 3, "integer"),
+    ("dropspatialindex", 2, "integer"),
+    ("dropspatialindex", 3, "integer"),
 ];
 
 /// Returns `true` when `(name, arity)` is implemented by SQLiteGIS. `name`
 /// is matched case-insensitively against the lowercase catalog entries.
 #[must_use]
 pub(crate) fn is_sqlitegis_function(name: &str, arity: i32) -> bool {
-    let lower = name.to_ascii_lowercase();
-    POSTGIS_FUNCTION_CATALOG.iter().any(|&(n, a)| n == lower && a == arity)
+    sqlitegis_result_type(name, arity).is_some()
+}
+
+/// The PostgreSQL type the `(name, arity)` SQLiteGIS implements returns.
+/// `name` is matched case-insensitively.
+#[must_use]
+pub(crate) fn sqlitegis_result_type(name: &str, arity: i32) -> Option<&'static str> {
+    POSTGIS_FUNCTION_CATALOG
+        .iter()
+        .find(|&&(n, a, _)| n.eq_ignore_ascii_case(name) && a == arity)
+        .map(|&(_, _, result)| result)
 }
 
 /// Returns the set of arities SQLiteGIS implements for `name`, lowercased
 /// case-insensitively. Empty when the function is unknown.
 #[must_use]
 pub(crate) fn sqlitegis_function_arities(name: &str) -> Vec<i32> {
-    let lower = name.to_ascii_lowercase();
-    POSTGIS_FUNCTION_CATALOG.iter().filter_map(|&(n, a)| (n == lower).then_some(a)).collect()
+    POSTGIS_FUNCTION_CATALOG
+        .iter()
+        .filter_map(|&(n, a, _)| n.eq_ignore_ascii_case(name).then_some(a))
+        .collect()
 }
 
 /// Returns `true` if `name` is shaped like a PostGIS scalar, used to flag
@@ -694,5 +707,41 @@ mod tests {
             missing.len(),
             missing.join(", ")
         );
+    }
+
+    #[cfg(feature = "sqlitegis")]
+    #[test]
+    fn every_catalog_result_type_lands_in_the_storage_class_sqlitegis_returns() {
+        use sqlitegis::core::function_catalog::{
+            SQLITE_DETERMINISTIC_FUNCTIONS, SQLITE_DIRECT_ONLY_FUNCTIONS, SqliteReturnClass,
+        };
+        use sqlparser::ast::DataType;
+
+        use super::sqlitegis_result_type;
+        use crate::prelude::{Pg2SqliteOptions, Translator};
+
+        let schema = sql_traits::structs::ParserDB::from_statements(Vec::new(), "test".into())
+            .expect("schema should build");
+        let mismatched = SQLITE_DETERMINISTIC_FUNCTIONS
+            .iter()
+            .chain(SQLITE_DIRECT_ONLY_FUNCTIONS)
+            .filter_map(|spec| {
+                let result = sqlitegis_result_type(spec.name, spec.n_arg)
+                    .expect("the coverage tests above pin every entry");
+                let stored = crate::impls::expression_type::parse_type_name(result)
+                    .expect("a catalog result type should parse")
+                    .translate(&schema, &Pg2SqliteOptions::default())
+                    .expect("a catalog result type should translate");
+                let agrees = matches!(
+                    (spec.return_class, stored),
+                    (SqliteReturnClass::Blob, DataType::Blob(_))
+                        | (SqliteReturnClass::Text, DataType::Text)
+                        | (SqliteReturnClass::Numeric, DataType::Integer(_) | DataType::Real)
+                        | (SqliteReturnClass::Bool, DataType::Integer(_))
+                );
+                (!agrees).then_some((spec.name, spec.n_arg))
+            })
+            .collect::<Vec<_>>();
+        assert!(mismatched.is_empty(), "result types disagree with SQLiteGIS: {mismatched:?}");
     }
 }
