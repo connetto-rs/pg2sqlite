@@ -1422,8 +1422,8 @@ pub(crate) fn convert_value_for_column_type(
     if let Some(kind) = crate::impls::temporal_literals::temporal_literal_kind(data_type) {
         return convert_temporal_value(kind, expr, None);
     }
-    if matches!(data_type, DataType::Interval { .. }) {
-        return normalize_interval_literal_expr(expr);
+    if let DataType::Interval { fields, precision } = data_type {
+        return normalize_interval_literal_expr(expr, fields.as_ref(), *precision);
     }
     if matches!(data_type, DataType::JSON | DataType::JSONB) {
         return check_json_document_literal(data_type, expr);
@@ -1597,13 +1597,17 @@ pub(crate) fn check_json_document_literal(data_type: &DataType, expr: Expr) -> R
     }
 }
 
-/// Rewrites a string literal in an interval column position to the text
-/// PostgreSQL prints for it, or refuses what PostgreSQL refuses.
-pub(crate) fn normalize_interval_literal_expr(expr: Expr) -> Result<Expr, Error> {
+/// Rewrites a string literal in an interval column or cast position to the
+/// text PostgreSQL stores for that type, or refuses what PostgreSQL refuses.
+pub(crate) fn normalize_interval_literal_expr(
+    expr: Expr,
+    fields: Option<&sqlparser::ast::IntervalFields>,
+    precision: Option<u64>,
+) -> Result<Expr, Error> {
     let Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(text), span }) = &expr else {
         return Ok(expr);
     };
-    let normalized = crate::impls::interval::normalize_interval_literal(text)?;
+    let normalized = crate::impls::interval::normalize_interval_literal(text, fields, precision)?;
     Ok(Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(normalized), span: *span }))
 }
 

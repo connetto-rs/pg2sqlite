@@ -195,15 +195,41 @@ fn a_fractional_day_spills_into_the_time() {
 #[test]
 fn the_leading_field_spelling_clamps_too() {
     assert_eq!(shift("timestamp '2026-01-31' + interval '1' month"), "2026-02-28 00:00:00");
-    assert_eq!(shift("timestamp '2026-01-31' + interval '1' week"), "2026-02-07 00:00:00");
 }
 
-/// `INTERVAL '1-2' YEAR TO MONTH` is a range spelling this does not decode,
-/// and it used to emit `'+1-2 year'`, which answers NULL.
+/// PostgreSQL has no `WEEK` qualifier and reads `interval '1' week` as one
+/// second under the column alias `week`, so a week would be the wrong answer.
 #[test]
-fn the_range_spelling_is_refused() {
-    let error = refusal("timestamp '2026-01-31' + interval '1-2' year to month");
-    assert!(error.contains("INTERVAL"), "the refusal must name the construct: {error}");
+fn a_week_qualifier_is_refused() {
+    let error = refusal("timestamp '2026-01-31' + interval '1' week");
+    assert!(error.contains("qualifier"), "the refusal must name the qualifier: {error}");
+}
+
+#[test]
+fn the_range_spelling_is_read() {
+    assert_eq!(
+        shift("timestamp '2026-01-31' + interval '1-2' year to month"),
+        "2027-03-31 00:00:00"
+    );
+}
+
+/// The qualifier drops the fields right of its last one, and a two-part clock
+/// under `MINUTE TO SECOND` is minutes and seconds.
+#[test]
+fn a_field_qualifier_truncates_like_postgresql() {
+    assert_eq!(
+        shift("timestamp '2026-01-31' + interval '1 day 2 hours' day"),
+        "2026-02-01 00:00:00"
+    );
+    assert_eq!(
+        shift("timestamp '2026-01-31' + interval '1:30' minute to second"),
+        "2026-01-31 00:01:30"
+    );
+}
+
+#[test]
+fn a_scaled_interval_is_multiplied_count_by_count() {
+    assert_eq!(shift("timestamp '2026-01-31' - 3 * interval '1.5 days'"), "2026-01-26 12:00:00");
 }
 
 /// Two spellings of the same duration collapse onto one modifier, and it is
