@@ -413,6 +413,7 @@ fn drop_label(object_type: ObjectType) -> &'static str {
         ObjectType::Stage => "DROP STAGE",
         ObjectType::Stream => "DROP STREAM",
         ObjectType::Warehouse => "DROP WAREHOUSE",
+        ObjectType::ForeignTable => "DROP FOREIGN TABLE",
         ObjectType::Table
         | ObjectType::View
         | ObjectType::Index
@@ -1918,7 +1919,8 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
                     | ObjectType::Collation
                     | ObjectType::Stage
                     | ObjectType::Stream
-                    | ObjectType::Warehouse => {
+                    | ObjectType::Warehouse
+                    | ObjectType::ForeignTable => {
                         drop_with_warning(
                             drop_label(*object_type),
                             REASON_DROP_OF_ABSENT_OBJECT,

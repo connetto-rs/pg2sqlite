@@ -14,7 +14,7 @@ use alloc::{
 use core::ops::ControlFlow;
 
 use sql_traits::{
-    structs::{ColumnDefinition, ColumnScope, ParserDB, QueryOutput},
+    structs::{ColumnDefinition, ColumnQueryScope, ColumnScope, ParserDB, QueryOutput},
     traits::{ColumnLike, DatabaseLike, TableLike},
 };
 use sqlparser::ast::{
@@ -487,6 +487,28 @@ fn evaluate_definition<T: PartialEq>(
     }
 }
 
+/// Runs `inspect` over the recorded output scope of `query`, building it from
+/// the enclosing statement when none is recorded.
+fn with_output_scope<R>(
+    query: &Query,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    inspect: impl FnOnce(ColumnQueryScope<'_, '_, '_, ParserDB>) -> Result<R, Error>,
+) -> Result<R, Error> {
+    if let Some(scope) = options.query_scope(query) {
+        return inspect(scope);
+    }
+    let graph = ColumnScope::from_query(
+        options.original_query().unwrap_or(query),
+        schema,
+        sql_traits::structs::IdentifierCase::AsWritten,
+    )?;
+    let scope = graph.scope_for_query(query).ok_or_else(|| {
+        Error::forward_refusal("The scalar query has no recorded output scope.".to_owned())
+    })?;
+    inspect(scope)
+}
+
 /// Inspects known outputs while preserving unknown wildcard widths.
 pub(crate) fn query_output_matches(
     query: &Query,
@@ -499,27 +521,43 @@ pub(crate) fn query_output_matches(
         &crate::options::TranslationContext<'_>,
     ) -> Result<bool, Error>,
 ) -> Result<bool, Error> {
-    let graph;
-    let scope = if let Some(scope) = options.query_scope(query) {
-        scope
-    } else {
-        graph = ColumnScope::from_query(
-            options.original_query().unwrap_or(query),
-            schema,
-            sql_traits::structs::IdentifierCase::AsWritten,
-        )?;
-        graph.scope_for_query(query).ok_or_else(|| {
-            Error::forward_refusal("The scalar query has no recorded output scope.".to_owned())
-        })?
-    };
-    for output in scope.outputs() {
-        if let QueryOutput::Column { definition, .. } = output
-            && definition_matches(&definition, schema, options, &read_column, &read_expression)?
-        {
-            return Ok(true);
+    with_output_scope(query, schema, options, |scope| {
+        for output in scope.outputs() {
+            if let QueryOutput::Column { definition, .. } = output
+                && definition_matches(&definition, schema, options, &read_column, &read_expression)?
+            {
+                return Ok(true);
+            }
         }
-    }
-    Ok(false)
+        Ok(false)
+    })
+}
+
+/// Reads the first output column of `query`, the value a scalar subquery
+/// answers, or [`None`] when that output has no inspectable definition.
+pub(crate) fn first_query_output<T: PartialEq>(
+    query: &Query,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    read_column: impl Fn(&sqlparser::ast::ColumnDef) -> Option<T>,
+    read_expression: impl Fn(
+        &Expr,
+        &ParserDB,
+        &crate::options::TranslationContext<'_>,
+    ) -> Result<Option<T>, Error>,
+) -> Result<Option<T>, Error> {
+    with_output_scope(query, schema, options, |scope| {
+        let Some(QueryOutput::Column { definition, .. }) = scope.outputs().next() else {
+            return Ok(None);
+        };
+        Ok(
+            match evaluate_definition(&definition, schema, options, &read_column, &read_expression)?
+            {
+                DefinitionValue::Known(value) => value,
+                DefinitionValue::Opaque => None,
+            },
+        )
+    })
 }
 
 #[cfg_attr(feature = "std", recursive::recursive)]

@@ -530,6 +530,31 @@ fn a_literal_argument_picks_the_overload_whose_result_decides_the_refusal() {
 }
 
 #[test]
+fn arrays_of_case_and_subquery_results_stored_as_blob_are_refused() {
+    let schema = "CREATE TABLE t (id INT PRIMARY KEY, b BYTEA, u UUID);";
+    for (query, element) in [
+        ("SELECT ARRAY[CASE WHEN id > 0 THEN b ELSE NULL END] FROM t;", "BYTEA"),
+        ("SELECT ARRAY[CASE id WHEN 1 THEN u END] FROM t;", "UUID"),
+        ("SELECT array_agg(CASE WHEN id > 0 THEN b END) FROM t;", "BYTEA"),
+        ("SELECT ARRAY[(SELECT b FROM t LIMIT 1)] FROM t;", "BYTEA"),
+        ("SELECT ARRAY[d.x] FROM (SELECT decode('0102', 'hex') AS x FROM t) d;", "BYTEA"),
+    ] {
+        expect_refusal(
+            &format!("{schema} {query}"),
+            &blob_uuid_array_opts(),
+            &format!("a JSON array cannot hold the BLOB {element} is stored as"),
+        );
+    }
+    run(
+        &format!(
+            "{schema} SELECT ARRAY[CASE WHEN id > 0 THEN encode(b, 'hex') END], \
+             ARRAY[(SELECT id FROM t LIMIT 1)] FROM t;"
+        ),
+        &blob_uuid_array_opts(),
+    );
+}
+
+#[test]
 fn arrays_of_sqlitegis_geometry_results_are_refused() {
     expect_refusal(
         "CREATE TABLE t (id INT PRIMARY KEY); SELECT ARRAY[ST_Point(1, 2)] FROM t;",

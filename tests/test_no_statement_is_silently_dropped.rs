@@ -85,6 +85,11 @@ const TWO_ROLES: &str =
 const TWO_ROLES_AND_MEMBERSHIP: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT); \
                                         CREATE ROLE r; CREATE ROLE u; GRANT r TO u;";
 
+/// `DROP FOREIGN TABLE` removes a foreign table, so one has to exist.
+const FOREIGN_TABLE: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT); \
+                             CREATE SERVER srv FOREIGN DATA WRAPPER postgres_fdw; \
+                             CREATE FOREIGN TABLE ft (id INT) SERVER srv;";
+
 const fn emitted(sql: &'static str) -> Case {
     Case { setup: TABLE, sql, outcome: Outcome::Emitted }
 }
@@ -212,6 +217,7 @@ const CASES: &[Case] = &[
     // Warned and dropped: foreign data and credentials.
     warned("CREATE SERVER srv FOREIGN DATA WRAPPER postgres_fdw"),
     warned("CREATE FOREIGN TABLE ft (id INT) SERVER srv"),
+    Case { setup: FOREIGN_TABLE, sql: "DROP FOREIGN TABLE ft", outcome: Outcome::Warned },
     warned("CREATE CONNECTOR c TYPE 'mysql'"),
     warned("ALTER CONNECTOR c SET URL 'u'"),
     warned("DROP CONNECTOR c"),
