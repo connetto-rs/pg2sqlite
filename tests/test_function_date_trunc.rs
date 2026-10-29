@@ -260,3 +260,61 @@ fn microseconds_refusal_does_not_misrepresent_postgresql() {
         "refusal must not claim microseconds is not PostgreSQL: {err}"
     );
 }
+
+/// PostgreSQL 18.6 prints a millisecond truncation without trailing zeros.
+#[test]
+fn millisecond_granularity_answers_postgres_fraction_text() {
+    for (stamp, expected) in [
+        ("2024-01-02 03:04:05", "2024-01-02 03:04:05"),
+        ("2024-01-02 03:04:05.5", "2024-01-02 03:04:05.5"),
+        ("2024-01-02 03:04:05.123", "2024-01-02 03:04:05.123"),
+    ] {
+        let rows = run_translated_with(
+            &format!(
+                "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP);
+                 INSERT INTO t VALUES (1, '{stamp}');
+                 SELECT date_trunc('millisecond', ts) FROM t;"
+            ),
+            &Pg2SqliteOptions::default(),
+        );
+        assert_eq!(rows, vec![Some(expected.to_string())], "date_trunc('millisecond', '{stamp}')");
+    }
+}
+
+/// The plural unit trims the same padding.
+#[test]
+fn milliseconds_granularity_trims_the_padded_fraction() {
+    let rows = run_translated_with(
+        "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP);
+         INSERT INTO t VALUES (1, '2024-01-02 03:04:05.5');
+         SELECT date_trunc('milliseconds', ts) FROM t;",
+        &Pg2SqliteOptions::default(),
+    );
+    assert_eq!(rows, vec![Some("2024-01-02 03:04:05.5".to_string())]);
+}
+
+/// A millisecond truncation equals a stored literal of the same instant.
+#[test]
+fn a_millisecond_truncated_value_compares_against_a_stored_literal() {
+    let rows = run_translated_with(
+        "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP);
+         INSERT INTO t VALUES (1, '2024-01-02 03:04:05.5');
+         SELECT count(*) FROM t WHERE date_trunc('millisecond', ts) = '2024-01-02 03:04:05.5';",
+        &Pg2SqliteOptions::default(),
+    );
+    assert_eq!(rows, vec![Some("1".to_string())]);
+}
+
+/// A millisecond truncation written to a `timestamptz` keeps the canonical
+/// text.
+#[test]
+fn a_millisecond_truncation_written_to_timestamptz_keeps_the_canonical_form() {
+    let rows = run_translated_with(
+        "CREATE TABLE t (id INT PRIMARY KEY, at timestamptz);
+         INSERT INTO t (id, at) VALUES (1, '2024-01-02 03:04:05.5+00');
+         UPDATE t SET at = date_trunc('millisecond', at) WHERE id = 1;
+         SELECT at FROM t;",
+        &Pg2SqliteOptions::default(),
+    );
+    assert_eq!(rows, vec![Some("2024-01-02 03:04:05.500000+00:00".to_string())]);
+}

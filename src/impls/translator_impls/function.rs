@@ -1936,8 +1936,13 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                         )));
                     }
                 };
-
-                Ok(build_strftime_call(format_str, translated_ts))
+                let call = build_strftime_call(format_str, translated_ts);
+                // SQLite's %f always prints three digits where PostgreSQL drops
+                // trailing zeros.
+                if matches!(field_str.as_str(), "millisecond" | "milliseconds") {
+                    return Ok(trim_trailing_zeros(call));
+                }
+                Ok(call)
             }
             FunctionTranslation::DatePart => {
                 // date_part('field', expr) -> CAST(strftime(format, expr) AS
