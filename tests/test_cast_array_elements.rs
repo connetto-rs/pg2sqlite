@@ -88,16 +88,24 @@ fn a_cast_array_matches_its_element_casts() {
     }
 }
 
+/// PostgreSQL ignores declared dimensions, so `date[]` and `date[][]` cast a
+/// nested constructor alike.
 #[test]
 fn a_nested_constructor_casts_its_inner_elements() {
-    assert_eq!(
-        stored(
-            "INSERT INTO z (id, dd) VALUES (1, ARRAY[ARRAY['2024-1-1'], ARRAY['2024-1-2']]::date[][]);",
-            "dd"
-        )
-        .as_deref(),
-        Some(r#"[["2024-01-01"],["2024-01-02"]]"#)
-    );
+    for array_type in ["date[][]", "date[]"] {
+        assert_eq!(
+            stored(
+                &format!(
+                    "INSERT INTO z (id, dd) VALUES \
+                     (1, ARRAY[ARRAY['2024-1-1'], ARRAY['2024-1-2']]::{array_type});"
+                ),
+                "dd"
+            )
+            .as_deref(),
+            Some(r#"[["2024-01-01"],["2024-01-02"]]"#),
+            "{array_type}"
+        );
+    }
 }
 
 #[test]
