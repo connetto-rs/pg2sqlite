@@ -15,10 +15,11 @@ use sqlparser::ast::{BinaryOperator, CastKind, DataType, Expr};
 use crate::{
     errors::Error,
     impls::{
-        bind_once::bind_once,
+        bind_once::{bind_once, is_atomic},
         expr_helpers::case_when,
         expression_type::{UNKNOWN, parse_type_name, type_name},
         function_helpers::{simple_function_expr, single_quoted_literal, string_literal},
+        replay::is_replayable,
         shared_helpers::{convert_bytea_hex_literal, is_bound_parameter},
         translator_impls::vector::{halfvec_refusal, is_halfvec_data_type, is_vector_data_type},
     },
@@ -257,22 +258,11 @@ pub(crate) fn translate(
             } else {
                 (right, right_sql, left_sql)
             };
-            // `hex(NULL)` is the empty string, so the guard keeps NULL.
-            let rendered = bind_once("||", [bytea_source], [bytea_sql], options, |[bytea]| {
-                case_when(
-                    Expr::IsNotNull(Box::new(bytea.clone())),
-                    Expr::BinaryOp {
-                        left: Box::new(string_literal("\\x")),
-                        op: BinaryOperator::StringConcat,
-                        right: Box::new(simple_function_expr(
-                            "lower",
-                            vec![simple_function_expr("hex", vec![bytea.clone()], None)],
-                            None,
-                        )),
-                    },
-                    None,
-                )
-            })?;
+            let rendered = Expr::BinaryOp {
+                left: Box::new(string_literal("\\x")),
+                op: BinaryOperator::StringConcat,
+                right: Box::new(lower_hex("||", bytea_source, bytea_sql, options)?),
+            };
             let (left_sql, right_sql) =
                 if bytea_on_left { (rendered, text_sql) } else { (text_sql, rendered) };
             Ok(Expr::BinaryOp {
@@ -281,20 +271,112 @@ pub(crate) fn translate(
                 right: Box::new(right_sql),
             })
         }
-        // sqlite-vec refuses a NULL argument, where pgvector's operators are
-        // strict and answer NULL.
         Lowering::VectorArithmetic(function) => {
-            bind_once(function, [left, right], [left_sql, right_sql], options, |[l, r]| {
-                case_when(
-                    Expr::BinaryOp {
-                        left: Box::new(Expr::IsNotNull(Box::new(l.clone()))),
-                        op: BinaryOperator::And,
-                        right: Box::new(Expr::IsNotNull(Box::new(r.clone()))),
-                    },
-                    simple_function_expr(function, vec![l.clone(), r.clone()], None),
-                    None,
-                )
-            })
+            strict_vector_call(function, [left, right], [left_sql, right_sql], options)
         }
+    }
+}
+
+/// `lower(hex(x))`, NULL when `x` is, as PostgreSQL's strict `encode` answers.
+///
+/// SQLite's `hex(NULL)` is the empty string.
+///
+/// # Errors
+///
+/// Refuses an operand the guard cannot bind once.
+pub(crate) fn lower_hex(
+    construct: &str,
+    source: &Expr,
+    translated: Expr,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<Expr, Error> {
+    strict(construct, [source], [translated], options, |[value]| {
+        simple_function_expr(
+            "lower",
+            vec![simple_function_expr("hex", vec![value.clone()], None)],
+            None,
+        )
+    })
+}
+
+/// The sqlite-vec `function` over two vectors, NULL when either is.
+///
+/// sqlite-vec refuses a NULL argument, where pgvector's operators are strict
+/// and answer NULL.
+///
+/// # Errors
+///
+/// Refuses an operand the guard cannot bind once.
+pub(crate) fn strict_vector_call(
+    function: &str,
+    sources: [&Expr; 2],
+    translated: [Expr; 2],
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<Expr, Error> {
+    strict(function, sources, translated, options, |[left, right]| {
+        simple_function_expr(function, vec![left.clone(), right.clone()], None)
+    })
+}
+
+/// `body` over the operands, NULL when any of them is, as a strict
+/// PostgreSQL function answers.
+///
+/// Only an operand that can be NULL is checked, and it is bound once only when
+/// it is more than a column or a literal. An operand that may answer
+/// differently when read again, a subquery or a volatile call, is read once
+/// inside `body` and left unchecked, so a NULL there reaches SQLite as before.
+fn strict<const N: usize>(
+    construct: &str,
+    sources: [&Expr; N],
+    translated: [Expr; N],
+    options: &crate::options::TranslationContext<'_>,
+    body: impl Fn(&[Expr; N]) -> Expr,
+) -> Result<Expr, Error> {
+    let guarded = |operands: &[Expr; N], checked: [bool; N]| {
+        let condition = operands
+            .iter()
+            .zip(checked)
+            .filter(|(_, checked)| *checked)
+            .map(|(operand, _)| Expr::IsNotNull(Box::new(operand.clone())))
+            .reduce(|left, right| {
+                Expr::BinaryOp {
+                    left: Box::new(left),
+                    op: BinaryOperator::And,
+                    right: Box::new(right),
+                }
+            });
+        match condition {
+            Some(condition) => case_when(condition, body(operands), None),
+            None => body(operands),
+        }
+    };
+    let nullable: [bool; N] = core::array::from_fn(|index| !is_never_null(&translated[index]));
+    let binds = (0..N).any(|index| nullable[index] && !is_atomic(&translated[index]));
+    if !binds {
+        return Ok(guarded(&translated, nullable));
+    }
+    if sources.iter().all(|source| is_replayable(source, options)) {
+        return bind_once(construct, sources, translated, options, |operands| {
+            guarded(operands, nullable)
+        });
+    }
+    let checked = core::array::from_fn(|index| nullable[index] && is_atomic(&translated[index]));
+    Ok(guarded(&translated, checked))
+}
+
+/// True for a non-NULL literal, and for `vec_f32` over one, which answers a
+/// vector or fails and never answers NULL.
+fn is_never_null(expr: &Expr) -> bool {
+    match expr {
+        Expr::Value(value) => !matches!(value.value, sqlparser::ast::Value::Null),
+        Expr::Function(call)
+            if crate::impls::object_name::last_ident(&call.name)
+                .is_some_and(|name| name.value.eq_ignore_ascii_case("vec_f32")) =>
+        {
+            crate::impls::shared_helpers::function_argument_exprs(&call.args)
+                .first()
+                .is_some_and(|argument| single_quoted_literal(argument).is_some())
+        }
+        _ => false,
     }
 }

@@ -4,4 +4,4 @@ expression: translated_sql
 ---
 PRAGMA case_sensitive_like = 1
 CREATE TABLE items (id INTEGER PRIMARY KEY CHECK (id BETWEEN -2147483648 AND 2147483647) NOT NULL, embedding BLOB) STRICT
-SELECT * FROM items WHERE vec_distance_cosine(embedding, vec_f32('[1,2,3]')) < 0.5 ORDER BY vec_distance_L2(embedding, vec_f32('[1,2,3]')) NULLS LAST LIMIT 5
+SELECT * FROM items WHERE CASE WHEN embedding IS NOT NULL THEN vec_distance_cosine(embedding, vec_f32('[1,2,3]')) END < 0.5 ORDER BY CASE WHEN embedding IS NOT NULL THEN vec_distance_L2(embedding, vec_f32('[1,2,3]')) END NULLS LAST LIMIT 5

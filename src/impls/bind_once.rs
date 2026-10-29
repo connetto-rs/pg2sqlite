@@ -58,7 +58,9 @@ pub(crate) fn bind_once<const N: usize>(
     Ok(form(&translated))
 }
 
-fn is_atomic(expr: &Expr) -> bool {
+/// True for an operand that is a column or a literal, which reads the same
+/// every time and costs nothing to repeat.
+pub(crate) fn is_atomic(expr: &Expr) -> bool {
     matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_))
 }
 
