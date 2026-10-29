@@ -709,6 +709,97 @@ fn a_fractional_second_is_kept() {
 }
 
 #[test]
+fn a_fractional_second_is_stored_as_postgresql_prints_it() {
+    // PostgreSQL 18.6 rounds the fraction to microseconds with rint, ties to
+    // even, drops its trailing zeros, and carries a rounded-up fraction into
+    // the second, the minute and the day.
+    for (column, literal, printed) in [
+        ("timestamp", "2024-01-02 03:04:05.500", "2024-01-02 03:04:05.5"),
+        ("timestamp", "2024-01-02 03:04:06.1234567", "2024-01-02 03:04:06.123457"),
+        ("timestamp", "2024-01-02 03:04:05.000", "2024-01-02 03:04:05"),
+        ("timestamp", "2024-01-02 03:04:59.9999995", "2024-01-02 03:05:00"),
+        ("timestamp", "2024-12-31 23:59:59.9999999", "2025-01-01 00:00:00"),
+        ("timestamp", "2024-01-02 24:00:00.0", "2024-01-03 00:00:00"),
+        ("time", "03:04:05.500", "03:04:05.5"),
+        ("time", "03:04:05.0000015", "03:04:05.000002"),
+        ("time", "03:04:05.0000005", "03:04:05"),
+        ("time", "23:59:59.9999999", "24:00:00"),
+        ("time", "24:00:00.0000001", "24:00:00"),
+        ("time with time zone", "03:04:05.500+02", "03:04:05.5+02:00"),
+        ("time with time zone", "03:04:06.000+02", "03:04:06+02:00"),
+        ("time with time zone", "23:59:59.9999999+02", "24:00:00+02:00"),
+    ] {
+        let rows = query_rows(
+            &format!(
+                "CREATE TABLE t (v {column});
+                 INSERT INTO t (v) VALUES ('{literal}');
+                 SELECT v FROM t;"
+            ),
+            &default_opts(),
+        );
+        assert_eq!(rows, vec![Some(printed.to_string())], "{column} '{literal}'");
+    }
+}
+
+#[test]
+fn a_fraction_that_rounds_past_the_end_of_the_day_is_refused() {
+    // PostgreSQL answers date/time field value out of range.
+    let message = temporal_refusal("time", "24:00:00.9999999");
+    assert!(message.contains("out of range"), "{message}");
+}
+
+#[test]
+fn spellings_of_one_fraction_compare_equal() {
+    for (column, stored, comparand) in [
+        ("timestamp", "2024-01-02 03:04:05.500", "'2024-01-02 03:04:05.5'"),
+        ("timestamp", "2024-01-02 03:04:05.5", "'2024-01-02 03:04:05.500'"),
+        ("timestamp", "2024-01-02 03:04:05.500", "TIMESTAMP '2024-01-02 03:04:05.5'"),
+        ("time", "03:04:05.500", "'03:04:05.5'"),
+        ("time with time zone", "03:04:06.000+02", "'03:04:06+02'"),
+    ] {
+        let rows = query_rows(
+            &format!(
+                "CREATE TABLE t (v {column});
+                 INSERT INTO t (v) VALUES ('{stored}');
+                 SELECT count(*) FROM t WHERE v = {comparand};"
+            ),
+            &default_opts(),
+        );
+        assert_eq!(rows, vec![Some("1".to_string())], "{column} '{stored}' = {comparand}");
+    }
+}
+
+#[test]
+fn spellings_of_one_fraction_collide_in_a_unique_column() {
+    // PostgreSQL answers duplicate key value violates unique constraint.
+    for (column, first, second) in [
+        ("timestamp", "2024-01-02 03:04:05.500", "2024-01-02 03:04:05.5"),
+        ("time", "03:04:05.500", "03:04:05.5"),
+        ("time with time zone", "03:04:06.000+02", "03:04:06+02"),
+    ] {
+        let stmts = Pg2Sqlite::default()
+            .sql(&format!(
+                "CREATE TABLE t (v {column} UNIQUE);
+                 INSERT INTO t (v) VALUES ('{first}');
+                 INSERT INTO t (v) VALUES ('{second}');"
+            ))
+            .expect("parse")
+            .translate_to_sql(&default_opts())
+            .expect("translate")
+            .into_vec();
+        let (last, setup) = stmts.split_last().expect("statements");
+        let conn = Connection::open_in_memory().unwrap();
+        for s in setup {
+            conn.execute_batch(&format!("{s};")).unwrap_or_else(|e| panic!("{e}\n{s}"));
+        }
+        let err = conn
+            .execute_batch(&format!("{last};"))
+            .expect_err(&format!("{column} '{second}' duplicates '{first}'"));
+        assert!(err.to_string().contains("UNIQUE"), "{err}");
+    }
+}
+
+#[test]
 fn a_style_dependent_date_is_refused() {
     // '1/2/2024' is 2 January under the default DateStyle and 1 February
     // under DMY, which is server state the translator cannot read.
