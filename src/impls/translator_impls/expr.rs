@@ -825,12 +825,6 @@ fn promote_date_to_midnight(date_expr: Expr) -> Expr {
     simple_function_expr("strftime", vec![string_literal("%Y-%m-%d 00:00:00"), date_expr], None)
 }
 
-/// True when `s` has second=60 (a leap second PostgreSQL normalises, SQLite
-/// cannot represent).
-fn has_leap_second(s: &str) -> bool {
-    s.split('.').next().unwrap_or(s).ends_with(":60")
-}
-
 /// Convert a PostgreSQL text-array path literal `{a,b}` to a SQLite JSON path
 /// `$."a"."b"`.
 ///
@@ -3584,21 +3578,6 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                     if let Some(info) = exact_numeric_info(data_type) {
                         return translate_numeric_cast(expr, info, schema, options, emit);
                     }
-                    // Leap second (second=60): PostgreSQL normalises to
-                    // 24:00:00, SQLite cannot represent it.
-                    if matches!(data_type, DataType::Time(..))
-                        && let Expr::Value(ValueWithSpan {
-                            value: Value::SingleQuotedString(s),
-                            ..
-                        }) = expr.as_ref()
-                        && has_leap_second(s)
-                    {
-                        return Err(crate::errors::Error::forward_refusal(format!(
-                            "TIME literal '{s}' has second=60, which PostgreSQL normalises to \
-                             24:00:00 but SQLite cannot represent. Normalise to '00:00:00' \
-                             before inserting, or store the boundary as midnight '00:00:00'."
-                        )));
-                    }
                     // CAST(date AS TIMESTAMP): add midnight so stored text
                     // matches TIMESTAMP format for comparisons.
                     if matches!(
@@ -3852,30 +3831,15 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
             }
             Expr::TypedString(typed_string) => {
                 rebuild(|| -> Result<Expr, crate::errors::Error> {
-                    if matches!(typed_string.data_type, DataType::Time(..))
-                        && let Value::SingleQuotedString(s) = &typed_string.value.value
-                        && has_leap_second(s)
-                    {
-                        return Err(crate::errors::Error::forward_refusal(format!(
-                            "TIME literal '{s}' has second=60, which PostgreSQL normalises to \
-                             24:00:00 but SQLite cannot represent. Normalise to '00:00:00' \
-                             before inserting, or store the boundary as midnight '00:00:00'."
-                        )));
-                    }
-                    if matches!(
-                        typed_string.data_type,
-                        DataType::Timestamp(_, TimezoneInfo::Tz | TimezoneInfo::WithTimeZone)
-                    ) && let Value::SingleQuotedString(s) = &typed_string.value.value
-                    {
-                        let canonical =
-                            crate::impls::temporal_literals::normalize_temporal_literal(
-                                crate::impls::temporal_literals::TemporalLiteralKind::TIMESTAMPTZ,
-                                s,
-                            )?;
-                        return Ok(Expr::Value(ValueWithSpan {
-                            value: Value::SingleQuotedString(canonical),
-                            span: typed_string.value.span,
-                        }));
+                    // A literal of a named temporal type is the type's own
+                    // value, so it takes the column-write normalisation.
+                    if let Some(kind) = crate::impls::temporal_literals::temporal_literal_kind(
+                        &typed_string.data_type,
+                    ) {
+                        return crate::impls::shared_helpers::normalize_temporal_literal_expr(
+                            kind,
+                            Expr::Value(typed_string.value.clone()),
+                        );
                     }
                     Ok(Expr::Cast {
                         expr: Box::new(Expr::Value(typed_string.value.clone())),
