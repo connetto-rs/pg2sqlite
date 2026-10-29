@@ -145,3 +145,25 @@ fn a_json_document_as_an_object_key_is_refused() {
     );
     assert!(error.contains("key"), "the refusal must say the key is the problem: {error}");
 }
+
+/// A column a union answers as a document on one side and as text on the
+/// other has no one conversion, so it is refused rather than guessed.
+#[test]
+fn a_column_a_union_types_two_ways_is_refused() {
+    let error = translate_err(
+        "CREATE TABLE t (id INT PRIMARY KEY, doc JSONB, s TEXT);
+         SELECT json_build_array(x) FROM (SELECT doc AS x FROM t UNION ALL SELECT s FROM t) q;",
+    );
+    assert!(error.contains("one declared type"), "the refusal must name the ambiguity: {error}");
+}
+
+/// Rendering a bytea reads it twice, and a scalar subquery may answer
+/// differently each time, so it is refused rather than read twice.
+#[test]
+fn a_bytea_read_by_a_scalar_subquery_is_refused() {
+    let error = translate_err(
+        "CREATE TABLE t (id INT PRIMARY KEY, b BYTEA);
+         SELECT json_build_array((SELECT b FROM t LIMIT 1)) FROM t;",
+    );
+    assert!(error.contains("json_build_array"), "the refusal must name the call: {error}");
+}

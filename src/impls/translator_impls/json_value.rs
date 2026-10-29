@@ -19,13 +19,13 @@ use sqlparser::ast::{BinaryOperator, CastKind, DataType, Expr, TimezoneInfo};
 use crate::{
     errors::Error,
     impls::{
+        bind_once::bind_once,
         expr_helpers::case_when,
         function_helpers::{number_literal, simple_function_expr, string_literal},
         object_name::last_ident,
-        replay::{is_replayable, reject_duplicated_operand},
         shared_helpers::{
             declared_in_scope, minor_unit_scale, numeric_scale, referenced_column_name,
-            render_minor_units_as_text, scope_declines_column,
+            render_minor_units_as_text, scalar_query_declared, scope_declines_column,
         },
         temporal_arithmetic::{TemporalKind, temporal_kind, trim_trailing_zeros},
         translator_impls::{
@@ -108,16 +108,11 @@ pub(crate) fn json_argument(
              unambiguous."
         )));
     };
-    let replayable = |value: Expr| {
-        if is_replayable(&value, options) {
-            Ok(value)
-        } else {
-            Err(reject_duplicated_operand(label, &value))
-        }
-    };
-    Ok(match conversion {
+    let stored = match conversion {
         Conversion::Boolean => {
-            JsonArgument::Literal(render_boolean_as_text(argument, schema, options, emit)?)
+            return Ok(JsonArgument::Literal(render_boolean_as_text(
+                argument, schema, options, emit,
+            )?));
         }
         Conversion::Unrenderable(data_type) => {
             return Err(Error::forward_refusal(format!(
@@ -126,38 +121,24 @@ pub(crate) fn json_argument(
                  form in SQL, and SQLite's JSON functions refuse a BLOB."
             )));
         }
-        Conversion::Native => {
-            JsonArgument::Native(argument.translate_with_warnings(schema, options, emit)?)
+        Conversion::Stored(stored) => stored,
+    };
+    let value = argument.translate_with_warnings(schema, options, emit)?;
+    let rendered = |value: Expr, render: &dyn Fn(&Expr) -> Expr| {
+        bind_once(label, [argument], [value], options, |[value]| render(value))
+    };
+    Ok(match stored {
+        Stored::Native => JsonArgument::Native(value),
+        Stored::Document => JsonArgument::Document(value),
+        Stored::MinorUnits(scale) => {
+            JsonArgument::Literal(rendered(value, &|value| {
+                render_minor_units_as_text(value, scale)
+            })?)
         }
-        Conversion::Document => {
-            JsonArgument::Document(argument.translate_with_warnings(schema, options, emit)?)
-        }
-        Conversion::MinorUnits(scale) => {
-            JsonArgument::Literal(render_minor_units_as_text(
-                &replayable(argument.translate_with_warnings(schema, options, emit)?)?,
-                scale,
-            ))
-        }
-        Conversion::Bytea => {
-            JsonArgument::Text(bytea_text(&replayable(
-                argument.translate_with_warnings(schema, options, emit)?,
-            )?))
-        }
-        Conversion::UuidBlob => {
-            JsonArgument::Text(uuid_text(&replayable(
-                argument.translate_with_warnings(schema, options, emit)?,
-            )?))
-        }
-        Conversion::Timestamp => {
-            JsonArgument::Text(iso_timestamp(&replayable(
-                argument.translate_with_warnings(schema, options, emit)?,
-            )?))
-        }
-        Conversion::TimeWithTimeZone => {
-            JsonArgument::Text(time_with_time_zone_text(&replayable(
-                argument.translate_with_warnings(schema, options, emit)?,
-            )?))
-        }
+        Stored::Bytea => JsonArgument::Text(rendered(value, &bytea_text)?),
+        Stored::UuidBlob => JsonArgument::Text(rendered(value, &uuid_text)?),
+        Stored::Timestamp => JsonArgument::Text(rendered(value, &iso_timestamp)?),
+        Stored::TimeWithTimeZone => JsonArgument::Text(rendered(value, &time_with_time_zone_text)?),
     })
 }
 
@@ -211,15 +192,24 @@ pub(crate) fn json_key(
     })
 }
 
-/// How a stored value becomes PostgreSQL's JSON value.
+/// How an argument becomes PostgreSQL's JSON value.
 #[derive(Clone, PartialEq, Eq)]
 enum Conversion {
-    /// Stored as a value SQLite encodes as PostgreSQL does.
+    /// 1 or 0, which PostgreSQL writes as `true` or `false`.
+    Boolean,
+    /// A BLOB with no text form here, named by its type.
+    Unrenderable(String),
+    /// A form rendered from the stored value.
+    Stored(Stored),
+}
+
+/// The stored form of a value the conversion reads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stored {
+    /// A value SQLite encodes as PostgreSQL does.
     Native,
     /// `json`, `jsonb`, or an array under the JSON representation.
     Document,
-    /// 1 or 0, which PostgreSQL writes as `true` or `false`.
-    Boolean,
     /// A NUMERIC held as minor units at this scale.
     MinorUnits(u32),
     /// Raw bytes, which PostgreSQL writes as their hex text output.
@@ -230,8 +220,6 @@ enum Conversion {
     Timestamp,
     /// `HH:MM:SS±HH:MM`, whose offset PostgreSQL writes as `±HH` on the hour.
     TimeWithTimeZone,
-    /// A BLOB with no text form here, named by its type.
-    Unrenderable(String),
 }
 
 /// The conversion `expr` needs, or `None` for a column the scope answers more
@@ -244,7 +232,7 @@ fn conversion_of(
 ) -> Result<Option<Conversion>, Error> {
     if let Some(column_name) = referenced_column_name(expr) {
         if scope_declines_column(expr, column_name, options) {
-            return Ok(Some(Conversion::Native));
+            return Ok(Some(Conversion::Stored(Stored::Native)));
         }
         return declared_in_scope(
             expr,
@@ -256,7 +244,17 @@ fn conversion_of(
     }
     Ok(Some(match expr {
         Expr::Nested(inner) => return conversion_of(inner, schema, options),
-        _ if is_already_json(expr) => Conversion::Document,
+        Expr::Subquery(query) => {
+            scalar_query_declared(
+                query,
+                schema,
+                options,
+                |column| Some(conversion_of_type(&column.data_type, options)),
+                conversion_of,
+            )
+            .unwrap_or(Conversion::Stored(Stored::Native))
+        }
+        _ if is_already_json(expr) => Conversion::Stored(Stored::Document),
         _ if is_boolean_expression(expr, schema, options)? => Conversion::Boolean,
         Expr::Cast { data_type, .. } => conversion_of_type(data_type, options),
         Expr::TypedString(typed) => conversion_of_type(&typed.data_type, options),
@@ -264,15 +262,15 @@ fn conversion_of(
             if last_ident(&function.name)
                 .is_some_and(|name| name.value.eq_ignore_ascii_case("decode")) =>
         {
-            Conversion::Bytea
+            Conversion::Stored(Stored::Bytea)
         }
         _ => {
             if let Some(scale) = numeric_scale(expr, schema, options)?.filter(|scale| *scale > 0) {
-                Conversion::MinorUnits(scale)
+                Conversion::Stored(Stored::MinorUnits(scale))
             } else if temporal_kind(expr, schema, options)? == Some(TemporalKind::Timestamp) {
-                Conversion::Timestamp
+                Conversion::Stored(Stored::Timestamp)
             } else {
-                Conversion::Native
+                Conversion::Stored(Stored::Native)
             }
         }
     }))
@@ -280,21 +278,29 @@ fn conversion_of(
 
 fn conversion_of_type(data_type: &DataType, options: &Pg2SqliteOptions) -> Conversion {
     match data_type {
-        DataType::JSON | DataType::JSONB => Conversion::Document,
-        DataType::Array(_) if is_json_array_representation(options) => Conversion::Document,
+        DataType::JSON | DataType::JSONB => Conversion::Stored(Stored::Document),
+        DataType::Array(_) if is_json_array_representation(options) => {
+            Conversion::Stored(Stored::Document)
+        }
         DataType::Boolean | DataType::Bool => Conversion::Boolean,
         DataType::Bytea | DataType::Blob(_) | DataType::Binary(_) | DataType::Varbinary(_) => {
-            Conversion::Bytea
+            Conversion::Stored(Stored::Bytea)
         }
-        DataType::Uuid if is_blob_uuid_representation(options) => Conversion::UuidBlob,
-        DataType::Timestamp(_, _) | DataType::Datetime(_) => Conversion::Timestamp,
+        DataType::Uuid if is_blob_uuid_representation(options) => {
+            Conversion::Stored(Stored::UuidBlob)
+        }
+        DataType::Timestamp(_, _) | DataType::Datetime(_) => Conversion::Stored(Stored::Timestamp),
         DataType::Time(_, TimezoneInfo::Tz | TimezoneInfo::WithTimeZone) => {
-            Conversion::TimeWithTimeZone
+            Conversion::Stored(Stored::TimeWithTimeZone)
         }
         DataType::Custom(..) if translates_to_blob(data_type) => {
             Conversion::Unrenderable(data_type.to_string())
         }
-        _ => minor_unit_scale(data_type).map_or(Conversion::Native, Conversion::MinorUnits),
+        _ => {
+            Conversion::Stored(
+                minor_unit_scale(data_type).map_or(Stored::Native, Stored::MinorUnits),
+            )
+        }
     }
 }
 

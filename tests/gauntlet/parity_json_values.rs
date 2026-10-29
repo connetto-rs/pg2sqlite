@@ -58,6 +58,13 @@ const KEYED: &str = "b, 1, u, 2, f, 3, n, 4, ts, 5, tz, 6, tt, 7, d, 8, s, 9, i,
 
 const COLUMNS: [&str; 12] = ["b", "u", "f", "n", "j", "ts", "tz", "tt", "d", "s", "i", "tags"];
 
+/// Values whose type comes from how they are written rather than from a
+/// column, such as a call, casts, typed literals and arithmetic over columns.
+const WRITTEN: &str = "decode('0102', 'hex'), '\\x0a'::bytea, \
+                       '00010203-0405-0607-0809-0a0b0c0d0e0f'::uuid, true, \
+                       TIMESTAMP '2024-01-02 03:04:05', '2024-01-02 03:04:05.25+00'::timestamptz, \
+                       '03:04:05+02'::timetz, n * 2, ts + INTERVAL '1 day', (j)";
+
 fn options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
@@ -190,6 +197,10 @@ fn json_constructors_convert_every_argument_as_postgresql_does() {
     for column in ["b", "u", "f", "n", "ts", "tz", "tt", "d"] {
         probes.push((format!("json_object_agg({column}, id ORDER BY id)"), Rows::NonNull));
     }
+    for id in 1..=3 {
+        probes.push((format!("json_build_array({WRITTEN})"), Rows::One(id)));
+    }
+    probes.push(("json_agg(n * 2 ORDER BY id)".to_owned(), Rows::All));
 
     let mismatches: Vec<String> = probes
         .iter()

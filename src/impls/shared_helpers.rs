@@ -522,6 +522,42 @@ pub(crate) fn query_output_matches(
     Ok(false)
 }
 
+/// The declaration of a scalar query's one output column, or `None` when it has
+/// another number of columns or one this cannot inspect.
+///
+/// A query the translation recorded no scope for is read on its own, so a
+/// reference it correlates to the outer query answers `None`.
+pub(crate) fn scalar_query_declared<T: PartialEq>(
+    query: &Query,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    read_column: impl Fn(&sqlparser::ast::ColumnDef) -> Option<T>,
+    read_expression: impl Fn(
+        &Expr,
+        &ParserDB,
+        &crate::options::TranslationContext<'_>,
+    ) -> Result<Option<T>, Error>,
+) -> Option<T> {
+    let graph;
+    let scope = if let Some(scope) = options.query_scope(query) {
+        scope
+    } else {
+        graph =
+            ColumnScope::from_query(query, schema, sql_traits::structs::IdentifierCase::AsWritten)
+                .ok()?;
+        graph.scope_for_query(query)?
+    };
+    let mut outputs = scope.outputs();
+    let (Some(QueryOutput::Column { definition, .. }), None) = (outputs.next(), outputs.next())
+    else {
+        return None;
+    };
+    match evaluate_definition(&definition, schema, options, &read_column, &read_expression) {
+        Ok(DefinitionValue::Known(value)) => value,
+        Ok(DefinitionValue::Opaque) | Err(_) => None,
+    }
+}
+
 #[cfg_attr(feature = "std", recursive::recursive)]
 fn definition_matches(
     definition: &ColumnDefinition<'_, '_, '_, ParserDB>,
