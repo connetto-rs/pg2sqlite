@@ -81,7 +81,8 @@ pub(crate) fn normalize_temporal_literal(
         TemporalLiteralKind::Time { zoned } => {
             let (body, zone) = split_time_zone(kind, trimmed, zoned)?;
             let zone = zone.map_or_else(String::new, |zone| zone.render());
-            Ok(format!("{}{zone}", parse_time(kind, body, trimmed)?.render()))
+            let clock = parse_time(kind, body, trimmed)?;
+            Ok(format!("{}{zone}", time_of_day_text(clock.micros_of_day())))
         }
         TemporalLiteralKind::Timestamp { zoned } => {
             let (body, zone) = split_time_zone(kind, trimmed, zoned)?;
@@ -95,34 +96,49 @@ pub(crate) fn normalize_temporal_literal(
                 // No offset reads as UTC, the zone the replica's own clock
                 // answers in.
                 let offset = zone.map_or(0, |zone| zone.seconds());
-                return canonical_instant((year, month, day), &clock, offset, trimmed);
+                return canonical_instant((year, month, day), clock, offset, trimmed);
             }
-            // PostgreSQL reads 24:00:00 on a timestamp as the next day's
-            // midnight.
-            if clock.hour == 24 {
-                let (year, month, day) = next_day(year, month, day);
-                return Ok(format!("{year:04}-{month:02}-{day:02} {}", Clock::MIDNIGHT.render()));
-            }
-            Ok(format!("{year:04}-{month:02}-{day:02} {}", clock.render()))
+            // PostgreSQL reads 24:00:00 on a timestamp, and a fraction that
+            // rounds up into it, as the next day's midnight.
+            let ((year, month, day), micros) = match clock.micros_of_day() {
+                MICROS_PER_DAY => (next_day(year, month, day), 0),
+                micros => ((year, month, day), micros),
+            };
+            Ok(format!("{year:04}-{month:02}-{day:02} {}", time_of_day_text(micros)))
         }
     }
+}
+
+const MICROS_PER_SECOND: i64 = 1_000_000;
+const MICROS_PER_DAY: i64 = 86_400 * MICROS_PER_SECOND;
+
+/// `HH:MM:SS` of a time of day given in microseconds, with the fraction
+/// PostgreSQL prints: no trailing zeros, and no point when nothing is left.
+fn time_of_day_text(micros: i64) -> String {
+    let second_of_day = micros / MICROS_PER_SECOND;
+    let mut text = format!(
+        "{:02}:{:02}:{:02}",
+        second_of_day / 3600,
+        second_of_day / 60 % 60,
+        second_of_day % 60
+    );
+    let fraction = micros % MICROS_PER_SECOND;
+    if fraction != 0 {
+        text.push('.');
+        text.push_str(format!("{fraction:06}").trim_end_matches('0'));
+    }
+    text
 }
 
 /// The canonical `YYYY-MM-DD HH:MM:SS.ffffff+00:00` text of an instant.
 fn canonical_instant(
     (year, month, day): (u32, u32, u32),
-    clock: &Clock<'_>,
+    clock: Clock,
     offset_seconds: i64,
     text: &str,
 ) -> Result<String, Error> {
-    const MICROS_PER_SECOND: i64 = 1_000_000;
-    const MICROS_PER_DAY: i64 = 86_400 * MICROS_PER_SECOND;
-    let seconds =
-        i64::from(clock.hour) * 3600 + i64::from(clock.minute) * 60 + i64::from(clock.second)
-            - offset_seconds;
-    let micros = days_from_civil(year, month, day) * MICROS_PER_DAY
-        + seconds * MICROS_PER_SECOND
-        + clock.fraction.map_or(0, rounded_microseconds);
+    let micros = days_from_civil(year, month, day) * MICROS_PER_DAY + clock.micros_of_day()
+        - offset_seconds * MICROS_PER_SECOND;
     let (year, month, day) = civil_from_days(micros.div_euclid(MICROS_PER_DAY));
     if !(1..=9999).contains(&year) {
         return Err(Error::forward_refusal(format!(
@@ -388,49 +404,47 @@ fn parse_date(kind: TemporalLiteralKind, date: &str, text: &str) -> Result<(u32,
     Ok((year, month, day))
 }
 
-/// A validated time of day, with the fraction of a second as written.
-struct Clock<'a> {
+/// A validated time of day, with the fraction of a second rounded to
+/// microseconds as PostgreSQL rounds it, so `microsecond` may be a whole
+/// second that carries into the next one.
+#[derive(Clone, Copy)]
+struct Clock {
     hour: u32,
     minute: u32,
     second: u32,
-    fraction: Option<&'a str>,
+    microsecond: i64,
 }
 
-impl Clock<'_> {
-    const MIDNIGHT: Clock<'static> = Clock { hour: 0, minute: 0, second: 0, fraction: None };
+impl Clock {
+    const MIDNIGHT: Self = Self { hour: 0, minute: 0, second: 0, microsecond: 0 };
 
-    /// The text PostgreSQL prints, which keeps the fraction's digits as given.
-    fn render(&self) -> String {
-        let Self { hour, minute, second, fraction } = self;
-        match fraction {
-            Some(fraction) => format!("{hour:02}:{minute:02}:{second:02}.{fraction}"),
-            None => format!("{hour:02}:{minute:02}:{second:02}"),
-        }
+    /// Microseconds since midnight, a whole day for `24:00:00` and for a
+    /// fraction that rounds up into it.
+    fn micros_of_day(self) -> i64 {
+        let Self { hour, minute, second, microsecond } = self;
+        (i64::from(hour) * 3600 + i64::from(minute) * 60 + i64::from(second)) * MICROS_PER_SECOND
+            + microsecond
     }
 }
 
 /// Parses `HH:MM[:SS[.frac]]` with unpadded components allowed.
-fn parse_time<'a>(
-    kind: TemporalLiteralKind,
-    time: &'a str,
-    text: &str,
-) -> Result<Clock<'a>, Error> {
+fn parse_time(kind: TemporalLiteralKind, time: &str, text: &str) -> Result<Clock, Error> {
     let mut parts = time.split(':');
     let hour: u32 = parse_component(kind, parts.next().unwrap_or_default(), text)?;
     let minute: u32 = parse_component(kind, parts.next().ok_or_else(|| shape(kind, text))?, text)?;
-    let (second, fraction) = match parts.next() {
+    let (second, microsecond) = match parts.next() {
         Some(second) => {
             match second.split_once('.') {
                 Some((whole, fraction)) => {
                     if fraction.is_empty() || !fraction.chars().all(|c| c.is_ascii_digit()) {
                         return Err(shape(kind, text));
                     }
-                    (parse_component(kind, whole, text)?, Some(fraction))
+                    (parse_component(kind, whole, text)?, rounded_microseconds(fraction))
                 }
-                None => (parse_component(kind, second, text)?, None),
+                None => (parse_component(kind, second, text)?, 0),
             }
         }
-        None => (0, None),
+        None => (0, 0),
     };
     if parts.next().is_some() {
         return Err(shape(kind, text));
@@ -447,10 +461,10 @@ fn parse_time<'a>(
         }
         return Err(out_of_range(text));
     }
-    if hour > 24 || (hour == 24 && (minute > 0 || second > 0 || fraction.is_some())) {
+    if hour > 24 || (hour == 24 && (minute > 0 || second > 0 || microsecond > 0)) {
         return Err(out_of_range(text));
     }
-    Ok(Clock { hour, minute, second, fraction })
+    Ok(Clock { hour, minute, second, microsecond })
 }
 
 /// One numeric component of a temporal literal.
