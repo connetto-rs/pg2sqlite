@@ -46,6 +46,7 @@ fn an_untyped_array_into_a_timestamptz_array_is_refused() {
     ));
     assert!(message.contains("text[]"), "{message}");
     assert!(message.contains("ARRAY['...'::TIMESTAMPTZ]"), "{message}");
+    assert!(message.contains("ARRAY[...]::TIMESTAMPTZ[]"), "{message}");
 }
 
 #[test]

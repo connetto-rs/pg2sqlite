@@ -1831,7 +1831,8 @@ pub(crate) fn untyped_array_refusal(
     Some(Error::forward_refusal(format!(
         "column {column} is {data_type}, and PostgreSQL reads an ARRAY[...] of untyped literals as \
          text[], which it does not assign to {data_type}, so it refuses the value. Type the \
-         elements, as in ARRAY['...'::{element}]."
+         elements, as in ARRAY['...'::{element}], or cast the array, as in \
+         ARRAY[...]::{data_type}."
     )))
 }
 
