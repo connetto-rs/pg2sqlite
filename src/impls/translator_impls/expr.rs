@@ -2490,6 +2490,13 @@ fn translate_binary_op(
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Expr, crate::errors::Error> {
+    if let Some(resolved) =
+        crate::impls::translator_impls::blob_operator::resolve(left, op, right, schema, options)?
+    {
+        return crate::impls::translator_impls::blob_operator::translate(
+            &resolved, left, right, schema, options, emit,
+        );
+    }
     if numeric_rules_may_apply(op, left, right) {
         let scales = (scale_of(left, schema, options), scale_of(right, schema, options));
 

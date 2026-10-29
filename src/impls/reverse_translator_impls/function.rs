@@ -568,6 +568,9 @@ pub fn reverse_function(
         "vec_distance_hamming" => {
             FunctionReversal::ToOperator(BinaryOperator::Custom("<~>".to_string()))
         }
+        // vec_add(a, b) -> a + b and vec_sub(a, b) -> a - b
+        "vec_add" => FunctionReversal::ToOperator(BinaryOperator::Plus),
+        "vec_sub" => FunctionReversal::ToOperator(BinaryOperator::Minus),
         // vec_f32(expr) -> expr::vector
         "vec_f32" => FunctionReversal::ToVectorCast,
         // vec_f16(expr) -> expr::halfvec

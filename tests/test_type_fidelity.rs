@@ -554,6 +554,74 @@ fn arrays_of_case_and_subquery_results_stored_as_blob_are_refused() {
     );
 }
 
+// ── bytea concatenation ──────────────────────────────────────────────────────
+
+/// A table with one row holding `\x0102` and one holding NULL, then `query`.
+fn bytea_rows(query: &str) -> Vec<Option<String>> {
+    query_rows(
+        &format!(
+            "CREATE TABLE t (id INT PRIMARY KEY, b BYTEA);
+             INSERT INTO t VALUES (1, '\\x0102'), (2, NULL);
+             {query}"
+        ),
+        &default_opts(),
+    )
+}
+
+#[test]
+fn bytea_concatenation_answers_bytes() {
+    // SQLite's || answers TEXT for two blobs, so the bytes came back as a
+    // string where PostgreSQL answers bytea.
+    assert_eq!(
+        bytea_rows("SELECT b || b FROM t ORDER BY id;"),
+        vec![Some("[1, 2, 1, 2]".to_owned()), None]
+    );
+    assert_eq!(
+        bytea_rows("SELECT b || '\\x03' FROM t ORDER BY id;"),
+        vec![Some("[1, 2, 3]".to_owned()), None]
+    );
+    assert_eq!(bytea_rows("SELECT b || NULL FROM t ORDER BY id;"), vec![None, None]);
+}
+
+#[test]
+fn bytea_concatenated_with_text_answers_the_hex_text() {
+    // PostgreSQL reads `bytea || text` as text concatenation over the bytea's
+    // output form.
+    assert_eq!(
+        bytea_rows("SELECT b || 'ab'::text FROM t ORDER BY id;"),
+        vec![Some("\\x0102ab".to_owned()), None]
+    );
+    assert_eq!(
+        bytea_rows("SELECT 'ab'::text || b FROM t ORDER BY id;"),
+        vec![Some("ab\\x0102".to_owned()), None]
+    );
+}
+
+#[test]
+fn bytea_operators_postgresql_cannot_resolve_are_refused() {
+    let schema = "CREATE TABLE t (id INT PRIMARY KEY, b BYTEA);";
+    for (query, needle) in [
+        ("SELECT b || id FROM t;", "|| over BYTEA and INT has no PostgreSQL operator"),
+        ("SELECT b + NULL FROM t;", "+ over BYTEA and an untyped value has no PostgreSQL operator"),
+        ("SELECT b || g() FROM t;", "|| beside a BYTEA value needs the type of g()"),
+    ] {
+        expect_refusal(
+            &format!("{schema} {query}"),
+            &default_opts().with_user_defined_functions(["g"]),
+            needle,
+        );
+    }
+}
+
+#[test]
+fn an_array_of_concatenated_bytea_is_refused() {
+    expect_refusal(
+        "CREATE TABLE t (id INT PRIMARY KEY, b BYTEA); SELECT ARRAY[b || b] FROM t;",
+        &array_opts(),
+        "a JSON array cannot hold the BLOB BYTEA is stored as",
+    );
+}
+
 #[test]
 fn arrays_of_sqlitegis_geometry_results_are_refused() {
     expect_refusal(
