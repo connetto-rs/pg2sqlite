@@ -425,24 +425,28 @@ impl LiteralFields {
     ///
     /// Each count carries its own sign, so `1 mon -1 day` prints as written,
     /// and a count is plural whenever it is not exactly one, which is why
-    /// PostgreSQL answers `-1 days`. The time of day is printed only when it
-    /// is non-zero, except for an interval that is zero throughout, which
-    /// prints as a zero clock.
+    /// PostgreSQL answers `-1 days`. A positive count or clock right after a
+    /// negative count is marked with `+`, so `-1 day 2 hours` prints as
+    /// `-1 days +02:00:00`. The time of day is printed only when it is
+    /// non-zero, except for an interval that is zero throughout, which prints
+    /// as a zero clock.
     fn to_postgres_text(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
-        let years = self.months / 12;
-        let months = self.months % 12;
-        if years != 0 {
-            parts.push(format!("{years} {}", if years == 1 { "year" } else { "years" }));
-        }
-        if months != 0 {
-            parts.push(format!("{months} {}", if months == 1 { "mon" } else { "mons" }));
-        }
-        if self.days != 0 {
-            parts.push(format!("{} {}", self.days, if self.days == 1 { "day" } else { "days" }));
+        let mut after_negative = false;
+        for (count, unit) in
+            [(self.months / 12, "year"), (self.months % 12, "mon"), (self.days, "day")]
+        {
+            if count == 0 {
+                continue;
+            }
+            let plus = if after_negative && count > 0 { "+" } else { "" };
+            let plural = if count == 1 { "" } else { "s" };
+            parts.push(format!("{plus}{count} {unit}{plural}"));
+            after_negative = count < 0;
         }
         if self.micros != 0 || parts.is_empty() {
-            parts.push(clock_text(self.micros));
+            let plus = if after_negative && self.micros > 0 { "+" } else { "" };
+            parts.push(format!("{plus}{}", clock_text(self.micros)));
         }
         parts.join(" ")
     }
