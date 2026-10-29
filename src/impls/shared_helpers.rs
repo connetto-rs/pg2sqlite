@@ -1218,6 +1218,51 @@ impl ColumnRewrites {
         }
     }
 
+    /// Refuses `value` written into `column` where PostgreSQL refuses it,
+    /// which is decided on the value as written, before translation.
+    pub(crate) fn reject_untyped_array(&self, column: &str, value: &Expr) -> Result<(), Error> {
+        let Some((name, data_type)) =
+            self.literal_checked_cols.iter().find(|(name, _)| name.eq_ignore_ascii_case(column))
+        else {
+            return Ok(());
+        };
+        untyped_array_refusal(name, data_type, value).map_or(Ok(()), Err)
+    }
+
+    /// [`Self::reject_untyped_array`] for every column an assignment writes,
+    /// with the tuple spelling zipped name by name against a row or a
+    /// sub-select's projection.
+    pub(crate) fn reject_untyped_array_assignment(
+        &self,
+        target: &AssignmentTarget,
+        value: &Expr,
+    ) -> Result<(), Error> {
+        let reject = |name: &ObjectName, value: &Expr| {
+            last_ident(name)
+                .map_or(Ok(()), |column| self.reject_untyped_array(&column.value, value))
+        };
+        let names = match target {
+            AssignmentTarget::ColumnName(name) => return reject(name, value),
+            AssignmentTarget::Tuple(names) => names,
+        };
+        match value {
+            Expr::Tuple(items) => {
+                names.iter().zip(items).try_for_each(|(name, item)| reject(name, item))
+            }
+            Expr::Subquery(query) => {
+                let SetExpr::Select(select) = query.body.as_ref() else { return Ok(()) };
+                names.iter().zip(&select.projection).try_for_each(|(name, item)| {
+                    match item {
+                        SelectItem::UnnamedExpr(item)
+                        | SelectItem::ExprWithAlias { expr: item, .. } => reject(name, item),
+                        _ => Ok(()),
+                    }
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// The value an assignment translates, with PostgreSQL's cast into a
     /// temporal target column written out where [`temporal_assignment_cast`]
     /// finds one, and `None` when the value translates as written.
@@ -1759,6 +1804,69 @@ pub(crate) fn array_text_literal_refusal(data_type: &DataType) -> Error {
     ))
 }
 
+/// The refusal an `ARRAY[...]` of untyped literals earns where PostgreSQL
+/// assigns it to `column` of type `data_type`, or `None` when it is accepted.
+///
+/// PostgreSQL resolves string literals and `NULL` to `text`, so the
+/// constructor is `text[]`, which is assigned only to an array of a character
+/// type. `ARRAY['2024-01-01']` into a `date[]` column answers `expression is of
+/// type text[]`. A custom element type may be a domain over `text`, which takes
+/// it, so it is left alone.
+pub(crate) fn untyped_array_refusal(
+    column: &str,
+    data_type: &DataType,
+    value: &Expr,
+) -> Option<Error> {
+    use crate::impls::translator_impls::data_type::{array_element_type, is_string_type};
+    let mut element = array_element_type(data_type)?;
+    while let Some(inner) = array_element_type(element) {
+        element = inner;
+    }
+    if is_string_type(element)
+        || matches!(element, DataType::Custom(..))
+        || !is_untyped_array(value)
+    {
+        return None;
+    }
+    Some(Error::forward_refusal(format!(
+        "column {column} is {data_type}, and PostgreSQL reads an ARRAY[...] of untyped literals as \
+         text[], which it does not assign to {data_type}, so it refuses the value. Type the \
+         elements, as in ARRAY['...'::{element}]."
+    )))
+}
+
+/// True for a non-empty `ARRAY[...]` holding only string literals, `NULL`,
+/// and arrays of the same, which PostgreSQL types as `text[]`.
+#[cfg_attr(feature = "std", recursive::recursive)]
+fn is_untyped_array(expr: &Expr) -> bool {
+    let mut peeled = expr;
+    while let Expr::Nested(inner) = peeled {
+        peeled = inner;
+    }
+    let Expr::Array(array) = peeled else { return false };
+    !array.elem.is_empty()
+        && array.elem.iter().all(|element| {
+            let mut element = element;
+            while let Expr::Nested(inner) = element {
+                element = inner;
+            }
+            match element {
+                Expr::Value(ValueWithSpan { value, .. }) => {
+                    matches!(
+                        value,
+                        Value::Null
+                            | Value::SingleQuotedString(_)
+                            | Value::EscapedStringLiteral(_)
+                            | Value::UnicodeStringLiteral(_)
+                            | Value::DollarQuotedString(_)
+                    )
+                }
+                Expr::Array(_) => is_untyped_array(element),
+                _ => false,
+            }
+        })
+}
+
 /// Rewrites a bit-string literal into the digit text a bit column stores.
 ///
 /// A bit column becomes `TEXT` holding the digits, so PostgreSQL's own
@@ -1911,6 +2019,25 @@ fn is_decimal_number_literal(expr: &Expr) -> bool {
     }
 }
 
+/// Translates one `SET` assignment of an `UPDATE` or a `DO UPDATE` into the
+/// columns `rewrites` describes, `source` being the value as written.
+fn translate_column_assignment<D: TranslationDirection>(
+    target: &AssignmentTarget,
+    source: &Expr,
+    schema: &ParserDB,
+    options: &D::Options<'_>,
+    rewrites: &ColumnRewrites,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Assignment, Error> {
+    rewrites.reject_untyped_array_assignment(target, source)?;
+    let cast = rewrites.assignment_cast(target, source, schema, D::forward_context(options));
+    let value = D::translate_expr(cast.as_ref().unwrap_or(source), schema, options, emit)?;
+    Ok(Assignment {
+        target: target.clone(),
+        value: rewrites.finish_assignment(target, value, D::config(options))?,
+    })
+}
+
 /// Translates the DO UPDATE assignments and WHERE inside an ON CONFLICT
 /// clause, and the predicate of its conflict target.
 ///
@@ -1929,14 +2056,7 @@ pub(crate) fn translate_on_conflict_do_update<D: TranslationDirection>(
         .assignments
         .iter()
         .map(|a| {
-            let cast =
-                rewrites.assignment_cast(&a.target, &a.value, schema, D::forward_context(options));
-            let value =
-                D::translate_expr(cast.as_ref().unwrap_or(&a.value), schema, options, emit)?;
-            Ok(Assignment {
-                target: a.target.clone(),
-                value: rewrites.finish_assignment(&a.target, value, D::config(options))?,
-            })
+            translate_column_assignment::<D>(&a.target, &a.value, schema, options, rewrites, emit)
         })
         .collect::<Result<Vec<_>, Error>>()?;
     let selection = do_update
@@ -3290,13 +3410,7 @@ pub(crate) fn translate_update<D: TranslationDirection>(
                 return Err(default_outside_an_insert_error());
             }
             let source = substituted.as_ref().unwrap_or(&a.value);
-            let cast =
-                rewrites.assignment_cast(&a.target, source, schema, D::forward_context(options));
-            let value = D::translate_expr(cast.as_ref().unwrap_or(source), schema, options, emit)?;
-            Ok(Assignment {
-                target: a.target.clone(),
-                value: rewrites.finish_assignment(&a.target, value, D::config(options))?,
-            })
+            translate_column_assignment::<D>(&a.target, source, schema, options, &rewrites, emit)
         })
         .collect::<Result<Vec<_>, Error>>()?;
 

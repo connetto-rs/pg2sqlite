@@ -17,9 +17,9 @@ use sql_traits::{
     traits::{ColumnLike, TableLike},
 };
 use sqlparser::ast::{
-    BinaryOperator, CreateIndex, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArguments, Ident, IndexType, ObjectName, ObjectNamePart, SetExpr, Statement,
-    TriggerEvent, TriggerPeriod, Value, VisitMut, VisitorMut,
+    BinaryOperator, CreateIndex, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
+    Ident, IndexType, ObjectName, ObjectNamePart, SetExpr, Statement, TriggerEvent, TriggerPeriod,
+    Value, VisitMut, VisitorMut,
 };
 
 use crate::{
@@ -38,7 +38,8 @@ use crate::{
         },
         shared_helpers::{ColumnReferences, extract_columns_from_expr},
         translator_impls::{
-            nulls_not_distinct::companion_index, postgis, rls::resolve_trigger_table_name,
+            data_type::is_string_type, nulls_not_distinct::companion_index, postgis,
+            rls::resolve_trigger_table_name,
         },
     },
 };
@@ -79,27 +80,6 @@ fn tsvector_document(function: &Function) -> Option<&Expr> {
     }
 }
 
-fn is_text_cast(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Character(_)
-            | DataType::Char(_)
-            | DataType::CharacterVarying(_)
-            | DataType::CharVarying(_)
-            | DataType::Varchar(_)
-            | DataType::Nvarchar(_)
-            | DataType::CharacterLargeObject(_)
-            | DataType::CharLargeObject(_)
-            | DataType::Clob(_)
-            | DataType::Text
-            | DataType::TinyText
-            | DataType::MediumText
-            | DataType::LongText
-            | DataType::String(_)
-            | DataType::FixedString(_)
-    )
-}
-
 fn lower_argument(function: &Function) -> Option<&Expr> {
     let is_lower =
         postgres_catalog_function_name(&function.name).is_some_and(|name| name == "lower");
@@ -127,7 +107,7 @@ fn is_reproducible_fts_document(expr: &Expr) -> bool {
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => true,
         Expr::Nested(inner) => is_reproducible_fts_document(inner),
         Expr::Cast { expr, data_type, .. } => {
-            is_text_cast(data_type) && is_reproducible_fts_document(expr)
+            is_string_type(data_type) && is_reproducible_fts_document(expr)
         }
         Expr::BinaryOp { left, op: BinaryOperator::StringConcat, right } => {
             is_reproducible_fts_document(left) && is_reproducible_fts_document(right)

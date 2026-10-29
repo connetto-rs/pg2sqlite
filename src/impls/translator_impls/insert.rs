@@ -144,7 +144,7 @@ impl crate::traits::translator::TranslatorWithContext for Insert {
         reject_explicit_identity_values(self, schema)?;
         let mut prepared = self.clone();
         substitute_default_values(&mut prepared, schema, options, emit)?;
-        cast_temporal_insert_values(&mut prepared, schema, options)?;
+        assign_insert_values(&mut prepared, schema, options)?;
 
         let source = prepared
             .source
@@ -733,12 +733,14 @@ fn unknown_default_column(table: &str, column_name: &str) -> crate::errors::Erro
     ))
 }
 
-/// Writes out PostgreSQL's assignment cast wherever a source value's zone
-/// differs from its temporal target column's.
+/// Applies PostgreSQL's assignment rules to every source value before
+/// translation. An untyped `ARRAY[...]` PostgreSQL refuses is refused, and the
+/// assignment cast is written out wherever a value's zone differs from its
+/// temporal target column's.
 ///
 /// A projection names the columns of its own `FROM`, so its zone is read in
 /// that scope, which borrows a copy of the source because the walk rewrites it.
-fn cast_temporal_insert_values(
+fn assign_insert_values(
     insert: &mut Insert,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
@@ -763,6 +765,7 @@ fn cast_temporal_insert_values(
     let context = scoped.as_ref().unwrap_or(options);
     for_each_insert_position(source.body.as_mut(), &column_names, &mut |index, expr| {
         let Some(column) = column_names.get(index) else { return Ok(expr) };
+        rewrites.reject_untyped_array(column, &expr)?;
         Ok(rewrites.temporal_column_cast(column, &expr, schema, context).unwrap_or(expr))
     })
 }
