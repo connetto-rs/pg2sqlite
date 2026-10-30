@@ -534,7 +534,7 @@ fn overlap_with_a_null_operand_is_false_rather_than_null() {
 /// would be a process abort rather than a test failure anywhere else.
 #[test]
 fn an_array_column_answers_its_declared_type() {
-    use sql_traits::traits::{ColumnLike, DatabaseLike, TableLike};
+    use sql_traits::traits::{ColumnLike, DataTypeLike, DatabaseLike, TableLike};
 
     for (ddl, want) in [
         ("CREATE TABLE t (c TEXT[]);", "TEXT[]"),
@@ -545,7 +545,7 @@ fn an_array_column_answers_its_declared_type() {
         let schema = Pg2Sqlite::default().sql(ddl).expect("parses").build_schema().expect("builds");
         let table = schema.tables().next().expect("one table");
         let column = table.columns(&schema).expect("columns").next().expect("one column");
-        assert_eq!(column.data_type(&schema), want, "for {ddl}");
+        assert_eq!(column.data_type(&schema).name(&schema), want, "for {ddl}");
     }
 }
 

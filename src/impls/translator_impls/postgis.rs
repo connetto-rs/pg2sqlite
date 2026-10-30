@@ -197,7 +197,7 @@ pub(crate) fn is_postgis_shaped_name(name: &str) -> bool {
 
 use sql_traits::{
     structs::ParserDB,
-    traits::{ColumnLike, TableLike},
+    traits::{ColumnLike, DataTypeLike, TableLike},
 };
 use sqlparser::ast::{CreateIndex, Expr, InTarget};
 
@@ -238,7 +238,9 @@ pub(crate) fn classify_gist_spatial_columns(
             .column(&column_name, schema, COLUMN_LOOKUP_CASE)?
             .map(|col| col.data_type(schema))
         {
-            Some(dt) if is_spatial_data_type(&dt) => spatial_columns.push(column_name),
+            Some(dt) if is_spatial_data_type(&dt.name(schema)) => {
+                spatial_columns.push(column_name);
+            }
             _ => non_spatial_columns.push(column_name),
         }
     }
