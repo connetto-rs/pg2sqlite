@@ -41,10 +41,7 @@ use crate::{
             translate_order_by_expr,
         },
         sqlite_functions::classify,
-        timezone::{
-            TimestampAwareness, flipped_shifting_offset, normalize_timezone_modifier_for_postgres,
-            timestamp_awareness,
-        },
+        timezone::{at_time_zone_for_modifier, normalize_timezone_modifier_for_postgres},
         translator_impls::{expr::sqlite_json_path_to_pg_text_path, postgis},
     },
     traits::SessionVariableMapping,
@@ -269,56 +266,6 @@ fn strftime_rejection(subject: &str) -> String {
          single field (%Y %m %d %H %M %S %f %s %V %G %u %w %j) becomes EXTRACT, and a format \
          built from %Y %G %V %u %m %d %H %I %M %S with separators becomes to_char."
     )
-}
-
-/// The PostgreSQL zone for a SQLite `datetime` timezone modifier.
-///
-/// The forward direction flips an aware operand's offset, because a bare
-/// timestamp and a timestamptz shift opposite ways, so this has to flip it
-/// back. Over `2023-01-15 12:00:00` PostgreSQL answers 17:30 for the naive
-/// operand and 06:30 for the aware one, both measured on 16, and handing the
-/// stored sign straight back turns the second into the first.
-///
-/// An operand not known to be a timestamp is refused, for either of two
-/// reasons, and the message says which. A shifting offset cannot pick its sign
-/// without the type. Every other spelling can, but PostgreSQL applies `AT TIME
-/// ZONE` only to a timestamp, so emitting one over a text column answered
-/// `function pg_catalog.timezone(unknown, text) does not exist`.
-///
-/// The forward direction deliberately does NOT require the type for the second
-/// reason, and the asymmetry is the two type systems rather than an oversight:
-/// SQLite is dynamically typed, so `datetime(txt, '+05:30')` over a text column
-/// answers 17:30 rather than complaining. Both measured.
-fn at_time_zone_for_modifier(
-    modifier: String,
-    timestamp: &Expr,
-    schema: &ParserDB,
-    options: &crate::options::TranslationContext<'_>,
-) -> Result<String, Error> {
-    let flipped = flipped_shifting_offset(&modifier);
-
-    let Some(awareness) = timestamp_awareness(timestamp, schema, options)? else {
-        return Err(Error::reverse_refusal(if flipped.is_some() {
-            format!(
-                "a datetime offset modifier of '{modifier}' shifts a bare timestamp and a \
-                 timestamptz in opposite directions, and `{timestamp}` is not known to be \
-                 either, so either sign would be wrong half the time. Cast the operand, as \
-                 `{timestamp}::timestamptz`, to say which it is."
-            )
-        } else {
-            format!(
-                "PostgreSQL applies AT TIME ZONE only to a timestamp, and `{timestamp}` is not \
-                 known to be a timestamp here, so reversing the datetime modifier '{modifier}' \
-                 onto it would emit SQL PostgreSQL refuses. Cast the operand, as \
-                 `{timestamp}::timestamp`, to say what it holds."
-            )
-        }));
-    };
-
-    match (flipped, awareness) {
-        (Some(flipped), TimestampAwareness::Aware) => Ok(flipped),
-        _ => Ok(modifier),
-    }
 }
 
 /// True when a multi-argument `min` or `max` cannot become `LEAST` or

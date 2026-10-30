@@ -475,6 +475,21 @@ fn time_interval_ignores_days_and_months() {
     );
 }
 
+/// A timetz column cast to timetz keeps its own offset, as PostgreSQL 18.6
+/// prints `03:04:05.5+02`.
+#[test]
+fn timetz_column_cast_to_timetz_keeps_the_offset() {
+    let rows = run_translated_with(
+        &format!(
+            "{TIMETZ_DDL}\n\
+             INSERT INTO t VALUES (1, '03:04:05.5+02');\n\
+             SELECT CAST(v AS TIMETZ) FROM t;"
+        ),
+        &Pg2SqliteOptions::default(),
+    );
+    assert_eq!(rows, vec![Some("03:04:05.5+02:00".to_string())]);
+}
+
 /// A timetz column keeps its offset and wraps its local time.
 #[test]
 fn timetz_column_plus_interval_keeps_the_offset() {

@@ -48,23 +48,19 @@ struct Divergence {
 /// or using an alternative expression to get consistent text).
 const KNOWN_DIVERGENCES: &[Divergence] = &[
     // SQLite's datetime() drops the sub-second component of its first argument.
-    // This affects two comparisons:
+    // This affects the interval arithmetic comparison:
     //
     //   ts + INTERVAL '1 day' for row 4 (ts = '2024-03-05 14:07:09.250'):
     //     PG gives '2024-03-06 14:07:09.25', SQLite gives '2024-03-06
     // 14:07:09'.
     //
-    //   tstz AT TIME ZONE '+05:30' for row 4 (tstz = '2024-03-05
-    // 14:07:09.250'):     PG gives '2024-03-05 08:37:09.25', SQLite gives
-    // '2024-03-05 08:37:09'.
-    //
-    // Both comparisons are limited to rows 1-3 (whole-second timestamps) so
-    // no runtime failure is triggered. Row 4 is excluded with a comment.
+    // The comparison is limited to rows 1-3 (whole-second timestamps) so no
+    // runtime failure is triggered. Row 4 is excluded with a comment.
     Divergence {
         label: "datetime_drops_subseconds",
         reason: "datetime() in SQLite drops the sub-second component of its \
                  first argument, PostgreSQL preserves it through interval \
-                 arithmetic and AT TIME ZONE",
+                 arithmetic",
     },
     // TIMESTAMP AT TIME ZONE returns TIMESTAMPTZ in PostgreSQL. In a UTC
     // session, CAST of TIMESTAMPTZ to TEXT appends a +00 zone suffix. The
@@ -398,13 +394,11 @@ fn datetime_expressions_agree() {
     // timestamp is already UTC and converting to a local zone subtracts the
     // offset.
     //
-    // Tested on rows 1-3 (whole-second tstz values). Row 4 has a known
-    // divergence (KNOWN_DIVERGENCES["datetime_drops_subseconds"]): SQLite
-    // datetime() drops sub-second precision, so tstz = '2024-03-05
-    // 14:07:09.250' would produce '2024-03-05 08:37:09.25' in PostgreSQL
-    // but '2024-03-05 08:37:09' in SQLite.
+    // The sub-second fraction of the stored instant is read back from its text
+    // rather than dropped by datetime(), so row 4's '.250' survives as '.25'
+    // on both engines.
 
-    cmp("tstz_at_time_zone", "tstz AT TIME ZONE '+05:30'", WHOLE_SECOND);
+    cmp("tstz_at_time_zone", "tstz AT TIME ZONE '+05:30'", ALL);
 
     // ── AT TIME ZONE over naive TIMESTAMP ────────────────────────────────────
     //

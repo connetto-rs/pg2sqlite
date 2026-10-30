@@ -13,12 +13,12 @@ use alloc::{
 
 use sqlparser::ast::{
     BinaryOperator, CastKind, DataType, DateTimeField, Expr, FunctionArg, FunctionArgExpr,
-    FunctionArguments,
+    FunctionArguments, Value, ValueWithSpan,
 };
 
 use super::{
     expr_helpers::{case_when, concat},
-    function_helpers::{integer_literal, simple_function_expr, string_literal},
+    function_helpers::{integer_literal, number_literal, simple_function_expr, string_literal},
 };
 use crate::errors::Error;
 
@@ -382,31 +382,229 @@ pub(crate) fn take_canonical_timestamptz_operand(expr: &mut Expr) -> Option<Expr
     if is_canonical_timestamptz_call(expr) { take_last_argument(expr) } else { None }
 }
 
-/// `value` as canonical `timestamptz` text.
+/// The fraction of a second of a timestamp text, read from character 20.
 ///
-/// A one-argument `datetime(x)`, which is what `AT TIME ZONE 'UTC'` becomes,
-/// only drops the offset and the fraction, so its canonical text is `x`'s.
+/// A fraction never exceeds the six digits PostgreSQL keeps. A `+00:00`
+/// marker sitting in the read is stripped first, so text stored without a
+/// fraction still reads as a whole second.
 #[must_use]
-pub(crate) fn canonical_timestamptz_value(mut value: Expr) -> Expr {
+fn fraction_of(value_expr: Expr) -> Expr {
+    simple_function_expr(
+        "replace",
+        vec![
+            simple_function_expr(
+                "substr",
+                vec![value_expr, number_literal("20"), number_literal("7")],
+                None,
+            ),
+            string_literal("+00:00"),
+            string_literal(""),
+        ],
+        None,
+    )
+}
+
+/// The fraction of a second of a timestamp text, with trailing zeros and a
+/// bare point dropped.
+#[must_use]
+fn trimmed_fraction_of(value_expr: Expr) -> Expr {
+    super::temporal_arithmetic::trim_trailing_zeros(fraction_of(value_expr))
+}
+
+/// `datetime(substr(value, 1, 19) [, modifier])`, which fills a date with
+/// its midnight.
+#[must_use]
+fn whole_seconds_of(value_expr: Expr, modifier: Option<&str>) -> Expr {
+    let mut arguments = vec![simple_function_expr(
+        "substr",
+        vec![value_expr, number_literal("1"), number_literal("19")],
+        None,
+    )];
+    if let Some(modifier) = modifier {
+        arguments.push(string_literal(modifier));
+    }
+    simple_function_expr("datetime", arguments, None)
+}
+
+/// `datetime(substr(value, 1, 19) [, modifier])` with the value's fraction
+/// appended, the local timestamp text of an aware operand's value.
+///
+/// The fraction comes out of the text, where a date function's `subsec`
+/// reading caps it at three digits, so a canonical operand's six are kept.
+#[must_use]
+pub(crate) fn local_timestamp_text(value: Expr, modifier: Option<&str>) -> Expr {
+    let whole = whole_seconds_of(value.clone(), modifier);
+    binary(whole, BinaryOperator::StringConcat, trimmed_fraction_of(value))
+}
+
+/// The local time of day of an aware operand's value.
+#[must_use]
+pub(crate) fn local_time_of(value: Expr) -> Expr {
+    let local = local_timestamp_text(value, None);
+    simple_function_expr("substr", vec![local, number_literal("12")], None)
+}
+
+/// The local `time with time zone` text of an aware operand's value.
+#[must_use]
+pub(crate) fn local_timetz_of(value: Expr) -> Expr {
+    binary(local_time_of(value), BinaryOperator::StringConcat, string_literal("+00:00"))
+}
+
+/// The canonical `timestamptz` text of the instant a naive value marks.
+///
+/// The fraction is zero-padded to six digits from the text, which a date
+/// function would cap at three.
+#[must_use]
+pub(crate) fn canonical_timestamptz_text(value: Expr, modifier: Option<&str>) -> Expr {
+    let whole = whole_seconds_of(value.clone(), modifier);
+    let digits = simple_function_expr(
+        "replace",
+        vec![fraction_of(value), string_literal("."), string_literal("")],
+        None,
+    );
+    let padded = simple_function_expr(
+        "substr",
+        vec![
+            binary(digits, BinaryOperator::StringConcat, string_literal("000000")),
+            number_literal("1"),
+            number_literal("6"),
+        ],
+        None,
+    );
+    let with_point = binary(whole, BinaryOperator::StringConcat, string_literal("."));
+    let with_fraction = binary(with_point, BinaryOperator::StringConcat, padded);
+    binary(with_fraction, BinaryOperator::StringConcat, string_literal("+00:00"))
+}
+
+/// The operand and PostgreSQL zone of a translated `AT TIME ZONE`, or `None`
+/// when `expr` is not one of the shapes the translation emits.
+pub(crate) fn at_time_zone_of(expr: &Expr) -> Option<(&Expr, String)> {
+    use crate::impls::timezone::{flipped_shifting_offset, is_fixed_utc_offset};
+
+    let (left, right) = concat_operands(expr)?;
+    if let Some((operand, shift)) = local_datetime_argument(left)
+        && trimmed_fraction_operand(right) == Some(operand)
+    {
+        // An aware operand's offset was negated on the way out.
+        let zone = match shift {
+            None => Some("UTC".to_string()),
+            Some("localtime") => Some("localtime".to_string()),
+            Some(shift) => flipped_shifting_offset(shift),
+        };
+        return zone.map(|zone| (operand, zone));
+    }
+    if super::function_helpers::single_quoted_literal(right) == Some("+00:00")
+        && let Some((with_point, padded)) = concat_operands(left)
+        && let Some((whole, point)) = concat_operands(with_point)
+        && super::function_helpers::single_quoted_literal(point) == Some(".")
+        && let Some((operand, shift)) = local_datetime_argument(whole)
+        && padded_fraction_operand(padded) == Some(operand)
+    {
+        // SQLite's `utc` reads a bare timestamp as the machine's local time.
+        let zone = match shift {
+            None => Some("UTC".to_string()),
+            Some("utc") => Some("localtime".to_string()),
+            Some(shift) => is_fixed_utc_offset(shift).then(|| shift.to_string()),
+        };
+        return zone.map(|zone| (operand, zone));
+    }
+    None
+}
+
+/// The two operands of a `left || right`.
+fn concat_operands(expr: &Expr) -> Option<(&Expr, &Expr)> {
+    let Expr::BinaryOp { op: BinaryOperator::StringConcat, left, right } = expr else {
+        return None;
+    };
+    Some((&**left, &**right))
+}
+
+/// The operand and modifier of `datetime(substr(value, 1, 19) [, 'modifier'])`.
+fn local_datetime_argument(expr: &Expr) -> Option<(&Expr, Option<&str>)> {
+    let Expr::Function(function) = expr else { return None };
+    if !super::function_helpers::is_function_named(function, "datetime") {
+        return None;
+    }
+    match super::shared_helpers::function_argument_exprs(&function.args).as_slice() {
+        [whole] => Some((substr_bounded_argument(whole, "1", "19")?, None)),
+        [whole, shift] => {
+            Some((
+                substr_bounded_argument(whole, "1", "19")?,
+                Some(super::function_helpers::single_quoted_literal(shift)?),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// The operand of the trimmed fraction a [`local_timestamp_text`] reads.
+fn trimmed_fraction_operand(expr: &Expr) -> Option<&Expr> {
+    let without_point = super::temporal_arithmetic::rtrim_argument(expr, ".")?;
+    let without_zeros = super::temporal_arithmetic::rtrim_argument(without_point, "0")?;
+    let (fraction, from, to) = replace_arguments(without_zeros)?;
+    (from == "+00:00" && to.is_empty()).then_some(())?;
+    substr_bounded_argument(fraction, "20", "7")
+}
+
+/// The operand of the padded fraction a [`canonical_timestamptz_text`] reads.
+fn padded_fraction_operand(expr: &Expr) -> Option<&Expr> {
+    let padded = substr_bounded_argument(expr, "1", "6")?;
+    let Expr::BinaryOp { op: BinaryOperator::StringConcat, left: digits, right: zeros } = padded
+    else {
+        return None;
+    };
+    if super::function_helpers::single_quoted_literal(zeros) != Some("000000") {
+        return None;
+    }
+    let (fraction, from, to) = replace_arguments(digits)?;
+    (from == "." && to.is_empty()).then_some(())?;
+    let (raw, from, to) = replace_arguments(fraction)?;
+    (from == "+00:00" && to.is_empty()).then_some(())?;
+    substr_bounded_argument(raw, "20", "7")
+}
+
+/// The value argument of a `SUBSTRING` whose `from` and `for` bounds are the
+/// given numeric literals.
+fn substr_bounded_argument<'a>(expr: &'a Expr, from: &str, to: &str) -> Option<&'a Expr> {
+    let number_is = |bound: &Expr, literal: &str| {
+        matches!(
+            bound,
+            Expr::Value(ValueWithSpan { value: Value::Number(text, _), .. }) if text == literal
+        )
+    };
+    let Expr::Substring { expr: target, substring_from, substring_for, .. } = expr else {
+        return None;
+    };
+    let from_bound = substring_from.as_deref()?;
+    let for_bound = substring_for.as_deref()?;
+    (number_is(from_bound, from) && number_is(for_bound, to)).then_some(target)
+}
+
+/// The arguments of `replace(value, <from>, <to>)`.
+fn replace_arguments(expr: &Expr) -> Option<(&Expr, &str, &str)> {
+    let Expr::Function(function) = expr else { return None };
+    if !super::function_helpers::is_function_named(function, "replace") {
+        return None;
+    }
+    match super::shared_helpers::function_argument_exprs(&function.args).as_slice() {
+        [value, from, to] => {
+            Some((
+                *value,
+                super::function_helpers::single_quoted_literal(from)?,
+                super::function_helpers::single_quoted_literal(to)?,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// `value` as canonical `timestamptz` text.
+#[must_use]
+pub(crate) fn canonical_timestamptz_value(value: Expr) -> Expr {
     if is_canonical_timestamptz_call(&value) {
         return value;
     }
-    if is_utc_datetime_call(&value)
-        && let Some(operand) = take_last_argument(&mut value)
-    {
-        return if is_canonical_timestamptz_call(&operand) {
-            operand
-        } else {
-            canonical_timestamptz_call(operand)
-        };
-    }
     if is_offset_less_timestamp_call(&value) { canonical_timestamptz_call(value) } else { value }
-}
-
-fn is_utc_datetime_call(expr: &Expr) -> bool {
-    let Expr::Function(function) = peel_nested(expr) else { return false };
-    super::function_helpers::is_function_named(function, "datetime")
-        && super::shared_helpers::function_argument_exprs(&function.args).len() == 1
 }
 
 /// Moves the last argument out of a call, which the caller then discards.

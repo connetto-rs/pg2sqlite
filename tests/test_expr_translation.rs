@@ -901,7 +901,9 @@ struct ShiftedTimeRow {
 /// `ts` is declared TIMESTAMP rather than TEXT because the two `AT TIME ZONE`
 /// directions are chosen by the operand's declared type, and a bare TEXT column
 /// says nothing. The expected values are the naive direction: PostgreSQL reads
-/// the string `'+02:00'` as a POSIX zone, so a naive operand gains the offset.
+/// the string `'+02:00'` as a POSIX zone, so a naive operand gains the offset,
+/// and the result is a timestamptz, which the replica holds in its canonical
+/// form.
 #[test]
 fn test_at_time_zone_fixed_offset_semantic() -> Result<(), Box<dyn std::error::Error>> {
     let sql = "
@@ -950,9 +952,9 @@ fn test_at_time_zone_fixed_offset_semantic() -> Result<(), Box<dyn std::error::E
     let rows: Vec<ShiftedTimeRow> = diesel::sql_query(select_stmt).load(&mut connection)?;
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].id, 1);
-    assert_eq!(rows[0].shifted, "2024-03-15 12:00:00");
+    assert_eq!(rows[0].shifted, "2024-03-15 12:00:00.000000+00:00");
     assert_eq!(rows[1].id, 2);
-    assert_eq!(rows[1].shifted, "2024-03-16 01:30:00");
+    assert_eq!(rows[1].shifted, "2024-03-16 01:30:00.000000+00:00");
 
     Ok(())
 }

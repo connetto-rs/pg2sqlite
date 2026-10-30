@@ -29,7 +29,10 @@ use sqlparser::{
 
 use crate::{
     impls::{
-        datetime_helpers::{DatePartKey, build_date_part_expr, datetime_field_key},
+        datetime_helpers::{
+            DatePartKey, build_date_part_expr, canonical_timestamptz_text, datetime_field_key,
+            is_offset_less_timestamp_call, local_timestamp_text,
+        },
         expr_helpers::{
             case_when, for_each_child_expr, not_predicate, null_safe_eq, null_safe_neq, rebuild,
         },
@@ -1253,7 +1256,8 @@ fn translate_numeric_cast(
     )))
 }
 
-/// Translate PostgreSQL `expr AT TIME ZONE '...'` to a SQLite `datetime` call.
+/// Translate PostgreSQL `expr AT TIME ZONE '...'` to the SQLite text that
+/// keeps the fraction PostgreSQL prints.
 ///
 /// The two PostgreSQL operations share this syntax and shift opposite ways: a
 /// naive timestamp moves toward UTC, an aware one away from it. Over
@@ -1262,6 +1266,10 @@ fn translate_numeric_cast(
 /// The naive side ADDS because PostgreSQL reads a bare `'+05:30'` string as a
 /// POSIX zone, whose sign is the opposite of the ISO one. `AT TIME ZONE
 /// INTERVAL '05:30'` goes the other way and is not accepted here.
+///
+/// An aware operand's result is local timestamp text and a naive operand's
+/// is canonical `timestamptz` text, and the fraction is read from the operand's
+/// text, where a date function's `subsec` reading would cap it at three digits.
 fn translate_at_time_zone(
     timestamp: &Expr,
     time_zone: &Expr,
@@ -1269,8 +1277,6 @@ fn translate_at_time_zone(
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Expr, crate::errors::Error> {
-    let translated_timestamp = timestamp.translate_with_warnings(schema, options, emit)?;
-
     let modifier = single_quoted_literal(time_zone)
 .and_then(normalize_at_time_zone_modifier)
 .ok_or_else(|| {
@@ -1278,22 +1284,31 @@ crate::errors::Error::forward_refusal("AT TIME ZONE supports only literal UTC/lo
     .to_string())
 })?;
 
-    // UTC shifts nothing in PostgreSQL whichever side the operand is on, so its
-    // type need not be resolved. SQLite's own `utc` modifier is NOT that: it
-    // reads the value as local time, so emitting it made the answer depend on
-    // the offset of whatever machine ran the query.
+    // UTC shifts nothing in PostgreSQL, so the operand's type alone picks the
+    // result's text form, and an unresolvable operand keeps the plain reading.
+    // SQLite's `utc` modifier reads a value as local time and is not that
+    // shift.
     if modifier == "utc" || modifier == "+00:00" || modifier == "-00:00" {
-        return Ok(simple_function_expr("datetime", vec![translated_timestamp], None));
+        let awareness = timestamp_awareness(timestamp, schema, options).ok().flatten();
+        if matches!(awareness, Some(TimestampAwareness::Naive | TimestampAwareness::Aware)) {
+            require_replayable(timestamp, options)?;
+        }
+        let translated = timestamp.translate_with_warnings(schema, options, emit)?;
+        return Ok(match awareness {
+            Some(TimestampAwareness::Naive) => canonical_timestamptz_text(translated, None),
+            Some(TimestampAwareness::Aware) => local_timestamp_text(translated, None),
+            None if is_offset_less_timestamp_call(&translated) => {
+                local_timestamp_text(translated, None)
+            }
+            None => simple_function_expr("datetime", vec![translated], None),
+        });
     }
 
-    let Some(negated) = flipped_shifting_offset(&modifier) else {
-        // `localtime`, where both databases mean the machine's own zone and
-        // neither agrees on which machine.
-        return Ok(simple_function_expr(
-            "datetime",
-            vec![translated_timestamp, string_literal(&modifier)],
-            None,
-        ));
+    // `localtime` is the machine's zone in both databases, and SQLite's `utc`
+    // reads a value as that zone's local time.
+    let (naive_shift, aware_shift) = match flipped_shifting_offset(&modifier) {
+        Some(negated) => (modifier, negated),
+        None => ("utc".to_string(), modifier),
     };
 
     let awareness = timestamp_awareness(timestamp, schema, options)?.ok_or_else(|| {
@@ -1303,12 +1318,28 @@ crate::errors::Error::forward_refusal("AT TIME ZONE supports only literal UTC/lo
              time. Cast the operand, as `{timestamp}::timestamptz`, to say which it is."
         ))
     })?;
+    require_replayable(timestamp, options)?;
+    let translated = timestamp.translate_with_warnings(schema, options, emit)?;
+    Ok(match awareness {
+        // A bare timestamp is read as local to the zone, so the result is the
+        // zone's instant in canonical `timestamptz` text.
+        TimestampAwareness::Naive => canonical_timestamptz_text(translated, Some(&naive_shift)),
+        // A timestamptz is already an instant, so the result is the zone's
+        // wall clock as local timestamp text.
+        TimestampAwareness::Aware => local_timestamp_text(translated, Some(&aware_shift)),
+    })
+}
 
-    let applied = match awareness {
-        TimestampAwareness::Naive => modifier,
-        TimestampAwareness::Aware => negated,
-    };
-    Ok(simple_function_expr("datetime", vec![translated_timestamp, string_literal(&applied)], None))
+/// Refuses an `AT TIME ZONE` whose operand the slicing form would read twice.
+fn require_replayable(
+    operand: &Expr,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<(), crate::errors::Error> {
+    if crate::impls::replay::is_replayable(operand, options) {
+        Ok(())
+    } else {
+        Err(crate::impls::replay::reject_duplicated_operand("AT TIME ZONE", operand))
+    }
 }
 
 /// The pgvector type sqlite-vec cannot store that `expr` evaluates to, read
@@ -3670,7 +3701,10 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                                 .ok()
                                 .flatten();
                         let converted = crate::impls::shared_helpers::convert_temporal_value(
-                            kind, translated, source,
+                            kind,
+                            translated,
+                            source,
+                            Some(options),
                         )?;
                         if matches!(converted, Expr::Function(_)) {
                             return Ok(converted);

@@ -313,7 +313,7 @@ pub(crate) fn translate_column_def(
                 &column.data_type,
                 options,
             )?;
-            temporal_default(&column.data_type, translated, source)
+            temporal_default(&column.data_type, translated, source, options)
         })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
@@ -347,6 +347,7 @@ fn temporal_default(
     data_type: &DataType,
     option: Option<ColumnOptionDef>,
     source: Option<crate::impls::timezone::TimestampAwareness>,
+    options: &crate::options::TranslationContext<'_>,
 ) -> Result<Option<ColumnOptionDef>, Error> {
     let Some(kind) = crate::impls::temporal_literals::temporal_literal_kind(data_type) else {
         return Ok(option);
@@ -357,7 +358,8 @@ fn temporal_default(
     while let Expr::Nested(inner) = value {
         value = *inner;
     }
-    let value = crate::impls::shared_helpers::convert_temporal_value(kind, value, source)?;
+    let value =
+        crate::impls::shared_helpers::convert_temporal_value(kind, value, source, Some(options))?;
     Ok(Some(ColumnOptionDef {
         name,
         option: ColumnOption::Default(

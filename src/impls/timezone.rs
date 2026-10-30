@@ -16,9 +16,9 @@ use alloc::{
 };
 
 use sql_traits::structs::ParserDB;
-use sqlparser::ast::{DataType, Expr, TimezoneInfo};
+use sqlparser::ast::{DataType, Expr, TimezoneInfo, Value, ValueWithSpan};
 
-use crate::impls::shared_helpers::declared_type_matches;
+use crate::{errors::Error, impls::shared_helpers::declared_in_scope, prelude::ReverseTranslator};
 
 /// Returns `true` when `value` is a fixed UTC offset in `+HH:MM` / `-HH:MM`
 /// format.
@@ -130,8 +130,8 @@ pub(crate) fn timestamp_awareness(
                 None => None,
             }
         }
-        // PostgreSQL's now() and its aliases return timestamptz, and
-        // localtimestamp returns a bare timestamp.
+        // PostgreSQL's now() and its aliases and to_timestamp return
+        // timestamptz, and localtimestamp returns a bare timestamp.
         Expr::Function(function) => {
             match crate::impls::object_name::last_ident(&function.name) {
                 Some(ident) => {
@@ -140,7 +140,8 @@ pub(crate) fn timestamp_awareness(
                         | "current_timestamp"
                         | "transaction_timestamp"
                         | "statement_timestamp"
-                        | "clock_timestamp" => Some(TimestampAwareness::Aware),
+                        | "clock_timestamp"
+                        | "to_timestamp" => Some(TimestampAwareness::Aware),
                         "localtimestamp" => Some(TimestampAwareness::Naive),
                         _ => None,
                     }
@@ -149,18 +150,13 @@ pub(crate) fn timestamp_awareness(
             }
         }
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
-            let declared_contains = |needle: &'static str| {
-                declared_type_matches(expr, schema, options, |declared| {
-                    declared.to_ascii_lowercase().contains(needle)
-                })
-            };
-            if declared_contains("with time zone")? || declared_contains("timestamptz")? {
-                Some(TimestampAwareness::Aware)
-            } else if declared_contains("timestamp")? || declared_contains("date")? {
-                Some(TimestampAwareness::Naive)
-            } else {
-                None
-            }
+            declared_in_scope(
+                expr,
+                schema,
+                options,
+                |column| from_data_type(&column.data_type),
+                timestamp_awareness,
+            )?
         }
         _ => None,
     })
@@ -181,4 +177,61 @@ pub(crate) fn flipped_shifting_offset(modifier: &str) -> Option<String> {
     }
     let flipped = if modifier.starts_with('-') { '+' } else { '-' };
     Some(format!("{flipped}{}", &modifier[1..]))
+}
+
+/// The PostgreSQL zone for a SQLite `datetime` timezone modifier.
+///
+/// The forward direction flips an aware operand's offset, because a bare
+/// timestamp and a timestamptz shift opposite ways, so this has to flip it
+/// back. An operand not known to be a timestamp is refused, and the message
+/// names the reason.
+pub(crate) fn at_time_zone_for_modifier(
+    modifier: String,
+    timestamp: &Expr,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<String, Error> {
+    let flipped = flipped_shifting_offset(&modifier);
+
+    let Some(awareness) = timestamp_awareness(timestamp, schema, options)? else {
+        return Err(Error::reverse_refusal(if flipped.is_some() {
+            format!(
+                "a datetime offset modifier of '{modifier}' shifts a bare timestamp and a \
+                 timestamptz in opposite directions, and `{timestamp}` is not known to be \
+                 either, so either sign would be wrong half the time. Cast the operand, as \
+                 `{timestamp}::timestamptz`, to say which it is."
+            )
+        } else {
+            format!(
+                "PostgreSQL applies AT TIME ZONE only to a timestamp, and `{timestamp}` is not \
+                 known to be a timestamp here, so reversing the datetime modifier '{modifier}' \
+                 onto it would emit SQL PostgreSQL refuses. Cast the operand, as \
+                 `{timestamp}::timestamp`, to say what it holds."
+            )
+        }));
+    };
+
+    match (flipped, awareness) {
+        (Some(flipped), TimestampAwareness::Aware) => Ok(flipped),
+        _ => Ok(modifier),
+    }
+}
+
+/// Rebuilds the `AT TIME ZONE` a shape in [`super::datetime_helpers`] was
+/// lowered to, or `None` when `expr` is not one of those shapes.
+pub(crate) fn restore_at_time_zone(
+    expr: &Expr,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Option<Result<Expr, Error>> {
+    let (operand, zone) = super::datetime_helpers::at_time_zone_of(expr)?;
+    Some(operand.reverse_translate(schema, options).map(|operand| {
+        Expr::AtTimeZone {
+            timestamp: Box::new(operand),
+            time_zone: Box::new(Expr::Value(ValueWithSpan {
+                value: Value::SingleQuotedString(zone),
+                span: sqlparser::tokenizer::Span::empty(),
+            })),
+        }
+    }))
 }

@@ -488,7 +488,7 @@ fn trimmed_subsecond_datetime_argument(expr: &Expr) -> Option<&Expr> {
 }
 
 /// The first argument of `rtrim(x, <cut>)`.
-fn rtrim_argument<'a>(expr: &'a Expr, cut: &str) -> Option<&'a Expr> {
+pub(crate) fn rtrim_argument<'a>(expr: &'a Expr, cut: &str) -> Option<&'a Expr> {
     let Expr::Function(function) = expr else { return None };
     if !is_function_named(function, "rtrim") {
         return None;

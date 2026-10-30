@@ -43,6 +43,7 @@ use crate::{
             translate_expr_recursive,
         },
         temporal_arithmetic::reverse_temporal_arithmetic,
+        timezone::restore_at_time_zone,
         translator_impls::expr::sqlite_json_path_to_pg_text_path,
     },
     prelude::ReverseTranslator,
@@ -651,6 +652,9 @@ fn restore_lowered_idiom(
     }
     if let Some(membership) = delimited_membership_operands(expr) {
         return Some(reverse_delimited_membership(membership, schema, options));
+    }
+    if let Some(at_zone) = restore_at_time_zone(expr, schema, options) {
+        return Some(at_zone);
     }
     reverse_temporal_arithmetic(expr, schema, options)
 }
