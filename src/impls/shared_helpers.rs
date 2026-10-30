@@ -44,7 +44,7 @@ use crate::{
                 uuid_columns_of_table,
             },
             vector::{
-                halfvec_refusal, maybe_wrap_text_vector_literal, stored_vector,
+                UnstoredVector, maybe_wrap_text_vector_literal, stored_vector,
                 vector_columns_of_table,
             },
         },
@@ -506,30 +506,32 @@ fn with_output_scope<R>(
     inspect(graph.scope_for_query(query))
 }
 
-/// Inspects known outputs while preserving unknown wildcard widths.
+/// The first answer `read_column` or `read_expression` gives for a known
+/// output of `query`, preserving unknown wildcard widths.
 ///
-/// A query the statement records no scope for answers `false`, as an opaque
+/// A query the statement records no scope for answers [`None`], as an opaque
 /// output does.
-pub(crate) fn query_output_matches(
+pub(crate) fn query_output_find<T>(
     query: &Query,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
-    read_column: impl Fn(&sqlparser::ast::ColumnDef) -> bool,
+    read_column: impl Fn(&sqlparser::ast::ColumnDef) -> Option<T>,
     read_expression: impl Fn(
         &Expr,
         &ParserDB,
         &crate::options::TranslationContext<'_>,
-    ) -> Result<bool, Error>,
-) -> Result<bool, Error> {
+    ) -> Result<Option<T>, Error>,
+) -> Result<Option<T>, Error> {
     with_output_scope(query, schema, options, |scope| {
         for output in scope.iter().flat_map(ColumnQueryScope::outputs) {
             if let QueryOutput::Column { definition, .. } = output
-                && definition_matches(&definition, schema, options, &read_column, &read_expression)?
+                && let Some(found) =
+                    definition_find(&definition, schema, options, &read_column, &read_expression)?
             {
-                return Ok(true);
+                return Ok(Some(found));
             }
         }
-        Ok(false)
+        Ok(None)
     })
 }
 
@@ -605,41 +607,46 @@ pub(crate) fn scalar_query_declared<T: PartialEq>(
 }
 
 #[cfg_attr(feature = "std", recursive::recursive)]
-fn definition_matches(
+fn definition_find<T>(
     definition: &ColumnDefinition<'_, '_, '_, ParserDB>,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
-    read_column: &impl Fn(&sqlparser::ast::ColumnDef) -> bool,
+    read_column: &impl Fn(&sqlparser::ast::ColumnDef) -> Option<T>,
     read_expression: &impl Fn(
         &Expr,
         &ParserDB,
         &crate::options::TranslationContext<'_>,
-    ) -> Result<bool, Error>,
-) -> Result<bool, Error> {
+    ) -> Result<Option<T>, Error>,
+) -> Result<Option<T>, Error> {
     match definition {
         ColumnDefinition::Base { column, .. } => Ok(read_column(column.attribute())),
         ColumnDefinition::Expression { expression, scope } => {
             read_expression(expression, schema, &options.with_definition_scope(*scope))
         }
         ColumnDefinition::SetOperation { left, right, .. } => {
-            Ok(definition_matches(
+            match definition_find(
                 &left.definition(),
                 schema,
                 options,
                 read_column,
                 read_expression,
-            )? || definition_matches(
-                &right.definition(),
-                schema,
-                options,
-                read_column,
-                read_expression,
-            )?)
+            )? {
+                Some(found) => Ok(Some(found)),
+                None => {
+                    definition_find(
+                        &right.definition(),
+                        schema,
+                        options,
+                        read_column,
+                        read_expression,
+                    )
+                }
+            }
         }
         ColumnDefinition::RecursiveUnion { anchor, .. } => {
-            definition_matches(&anchor.definition(), schema, options, read_column, read_expression)
+            definition_find(&anchor.definition(), schema, options, read_column, read_expression)
         }
-        ColumnDefinition::Opaque => Ok(false),
+        ColumnDefinition::Opaque => Ok(None),
     }
 }
 
@@ -1114,7 +1121,7 @@ pub(crate) fn numeric_minor_unit_scales_of_table(
 /// columns.
 #[derive(Default)]
 pub(crate) struct ColumnRewrites {
-    vector_cols: Vec<(String, bool)>,
+    vector_cols: Vec<(String, sql_traits::traits::VectorKind)>,
     uuid_cols: Vec<String>,
     pub(crate) numeric_scales: Vec<(String, u32)>,
     /// Array columns under the JSON representation; a bound parameter here is
@@ -1214,14 +1221,14 @@ impl ColumnRewrites {
                     .to_string(),
             ));
         }
-        let mut value = if let Some(is_halfvec) = self
+        let mut value = if let Some(kind) = self
             .vector_cols
             .iter()
             .find(|(col, _)| col.eq_ignore_ascii_case(column))
-            .map(|(_, is_halfvec)| *is_halfvec)
+            .map(|(_, kind)| *kind)
         {
-            if is_halfvec {
-                return Err(halfvec_refusal());
+            if let Some(unstored) = UnstoredVector::of(kind) {
+                return Err(unstored.refusal());
             }
             if is_param {
                 crate::impls::function_helpers::simple_function_expr("vec_f32", vec![value], None)

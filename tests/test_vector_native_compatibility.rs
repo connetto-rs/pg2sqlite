@@ -1,4 +1,4 @@
-//! Native vector lowering refuses unsupported half-precision values.
+//! Native vector lowering refuses the pgvector values sqlite-vec cannot store.
 
 mod helpers;
 
@@ -242,6 +242,73 @@ fn half_precision_manifest_does_not_claim_native_storage() {
     assert_eq!(refusal.direction(), TranslationDirection::PostgreSqlToSqlite);
     assert_eq!(refusal.category(), RefusalCategory::UnrepresentableSemantics);
     assert!(refusal.detail().contains(HALFVEC_REFUSAL), "{}", refusal.detail());
+}
+
+/// The detail every refusal of sparse vector storage carries.
+const SPARSEVEC_REFUSAL: &str = "sparsevec storage is not supported by sqlite-vec";
+
+#[test]
+fn sparse_vector_declarations_and_casts_are_typed_refusals() {
+    for source in [
+        "CREATE TABLE items(id INT PRIMARY KEY, s sparsevec(3));",
+        "CREATE TABLE items(id INT PRIMARY KEY, s sparsevec);",
+        "CREATE TABLE items(id INT PRIMARY KEY, v vector(3), s public.sparsevec(3));",
+        "CREATE TABLE items(id INT PRIMARY KEY); ALTER TABLE items ADD s sparsevec(3);",
+        "SELECT '{1:1}/3'::sparsevec(3);",
+        "SELECT CAST(NULL AS sparsevec(3));",
+        "SELECT $1::sparsevec;",
+    ] {
+        assert_refusal(&format!("CREATE EXTENSION vector; {source}"), None, SPARSEVEC_REFUSAL);
+    }
+}
+
+#[test]
+fn supplied_sparse_vector_columns_refuse_reads_and_writes() {
+    let schema = ParserDB::from_statements(
+        Parser::parse_sql(
+            &PostgreSqlDialect {},
+            "CREATE EXTENSION vector;
+             CREATE TABLE items(id INT PRIMARY KEY, s sparsevec(3), v vector(3));",
+        )
+        .unwrap(),
+        "sparse-vector".to_owned(),
+    )
+    .unwrap();
+    for source in [
+        "INSERT INTO items(id,s) VALUES(1,'{1:1}/3');",
+        "INSERT INTO items(id,s) VALUES(1,$1);",
+        "INSERT INTO items VALUES(1,$1,NULL);",
+        "UPDATE items SET s='{1:1}/3';",
+        "UPDATE items SET s=$1;",
+        "SELECT s FROM items;",
+        "SELECT s <-> v FROM items;",
+    ] {
+        assert_refusal(source, Some(&schema), SPARSEVEC_REFUSAL);
+    }
+}
+
+#[test]
+fn sparse_vector_manifest_does_not_claim_native_storage() {
+    let translator = Pg2Sqlite::default()
+        .sql("CREATE EXTENSION vector; CREATE TABLE items(id INT PRIMARY KEY, s sparsevec(3));")
+        .unwrap();
+    let Error::TranslationRefusal(refusal) = translator
+        .translation_manifest(&Pg2SqliteOptions::default())
+        .expect_err("unsupported sparse storage")
+    else {
+        panic!("unexpected manifest refusal");
+    };
+    assert!(refusal.detail().contains(SPARSEVEC_REFUSAL), "{}", refusal.detail());
+}
+
+/// Without the extension, `sparsevec` is the schema's own type.
+#[test]
+fn a_sparsevec_without_pgvector_is_an_unknown_type() {
+    assert_refusal(
+        "CREATE TABLE items(id INT PRIMARY KEY, s sparsevec(3));",
+        None,
+        "sparsevec has no SQLite equivalent. If this is an enum or domain",
+    );
 }
 
 #[test]
@@ -583,6 +650,7 @@ fn vector_operators_sqlite_vec_lacks_are_refused() {
             "has no PostgreSQL operator",
         ),
         ("SELECT '[1,2,3]'::halfvec(3) + '[1,2,3]'::halfvec(3);", HALFVEC_REFUSAL),
+        ("SELECT '{1:1}/3'::sparsevec(3) + '{1:1}/3'::sparsevec(3);", SPARSEVEC_REFUSAL),
     ] {
         assert_refusal(&format!("CREATE EXTENSION vector; {source}"), None, reason);
     }

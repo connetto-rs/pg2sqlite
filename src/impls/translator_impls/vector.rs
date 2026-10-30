@@ -68,54 +68,67 @@ pub struct VectorColumnInfo {
     pub column_name: String,
     /// The number of dimensions (e.g., 384 for vector(384)).
     pub dimensions: Option<u32>,
-    /// Whether this is a half-precision (16-bit float) vector column.
-    /// `true` for `halfvec`, `false` for `vector`.
-    pub is_halfvec: bool,
+    /// Which pgvector type the column holds.
+    pub kind: VectorKind,
 }
 
-/// True when `data_type` is pgvector's `vector` or `halfvec`, which needs the
-/// schema to run `CREATE EXTENSION vector` and the name to resolve to the
-/// extension's schema.
+/// True when `data_type` is one of pgvector's types, which needs the schema to
+/// run `CREATE EXTENSION vector` and the name to resolve to the extension's
+/// schema.
 pub(crate) fn is_vector_data_type(data_type: &DataType, schema: &ParserDB) -> bool {
-    data_type.vector(schema).and_then(|vector| half_precision(vector.kind())).is_some()
+    data_type.vector(schema).is_some()
 }
 
-/// Whether a vector column of `kind` holds `halfvec` values, or `None` for
-/// `sparsevec`, which is not translated as a vector column.
-const fn half_precision(kind: VectorKind) -> Option<bool> {
-    match kind {
-        VectorKind::Vector => Some(false),
-        VectorKind::HalfVec => Some(true),
-        VectorKind::SparseVec => None,
+/// A pgvector type sqlite-vec has no storage for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnstoredVector {
+    /// `halfvec`, whose half-precision elements sqlite-vec cannot hold.
+    HalfVec,
+    /// `sparsevec`, whose positioned nonzero elements sqlite-vec cannot hold.
+    SparseVec,
+}
+
+impl UnstoredVector {
+    /// The unstored type `kind` names, or `None` for `vector`, which
+    /// sqlite-vec stores as packed float32.
+    pub(crate) const fn of(kind: VectorKind) -> Option<Self> {
+        match kind {
+            VectorKind::Vector => None,
+            VectorKind::HalfVec => Some(Self::HalfVec),
+            VectorKind::SparseVec => Some(Self::SparseVec),
+        }
+    }
+
+    /// The unstored type `data_type` declares.
+    pub(crate) fn declared(data_type: &DataType, schema: &ParserDB) -> Option<Self> {
+        Self::of(data_type.vector(schema)?.kind())
+    }
+
+    /// The typed refusal for a value of this type.
+    #[must_use]
+    pub(crate) fn refusal(self) -> Error {
+        Error::forward_refusal(match self {
+            Self::HalfVec => "half-precision halfvec storage is not supported by sqlite-vec",
+            Self::SparseVec => "sparse sparsevec storage is not supported by sqlite-vec",
+        })
     }
 }
 
-/// True when `data_type` is pgvector's `halfvec` (16-bit float) type.
-pub(crate) fn is_halfvec_data_type(data_type: &DataType, schema: &ParserDB) -> bool {
-    data_type.vector(schema).is_some_and(|vector| vector.kind() == VectorKind::HalfVec)
-}
-
 /// The pgvector type `data_type` declares when it is stored as packed float32
-/// in a `BLOB`, or `None` when `data_type` is not pgvector's `vector`.
+/// in a `BLOB`, or `None` when `data_type` is not one of pgvector's types.
 ///
 /// # Errors
 ///
-/// Refuses `halfvec`, which sqlite-vec cannot store.
+/// Refuses `halfvec` and `sparsevec`, which sqlite-vec cannot store.
 pub(crate) fn stored_vector(
     data_type: &DataType,
     schema: &ParserDB,
 ) -> Result<Option<VectorType>, Error> {
-    match data_type.vector(schema) {
-        Some(vector) if vector.kind() == VectorKind::Vector => Ok(Some(vector)),
-        Some(vector) if vector.kind() == VectorKind::HalfVec => Err(halfvec_refusal()),
-        _ => Ok(None),
+    let Some(vector) = data_type.vector(schema) else { return Ok(None) };
+    match UnstoredVector::of(vector.kind()) {
+        Some(unstored) => Err(unstored.refusal()),
+        None => Ok(Some(vector)),
     }
-}
-
-/// The typed refusal for unsupported native half-precision storage.
-#[must_use]
-pub(crate) fn halfvec_refusal() -> Error {
-    Error::forward_refusal("half-precision halfvec storage is not supported by sqlite-vec")
 }
 
 /// Check if a CREATE TABLE has any vector columns.
@@ -138,7 +151,7 @@ pub fn extract_vector_columns(
             Some(VectorColumnInfo {
                 column_name: col.name.value.clone(),
                 dimensions: vector.dimensions(),
-                is_halfvec: half_precision(vector.kind())?,
+                kind: vector.kind(),
             })
         })
         .collect()
@@ -285,8 +298,8 @@ pub fn generate_vec0_statements(
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Vec<Statement>, Error> {
     let vector_cols = extract_vector_columns(create_table, schema);
-    if vector_cols.iter().any(|column| column.is_halfvec) {
-        return Err(halfvec_refusal());
+    if let Some(unstored) = vector_cols.iter().find_map(|column| UnstoredVector::of(column.kind)) {
+        return Err(unstored.refusal());
     }
     if vector_cols.is_empty() {
         return Ok(Vec::new());
@@ -364,18 +377,18 @@ pub(crate) fn maybe_wrap_text_vector_literal(mut expr: Expr) -> Expr {
     }
 }
 
-/// Collect `(column_name, is_halfvec)` pairs for every pgvector column on
-/// the resolved schema table, preserving column ordinal order. Returns an
-/// empty `Vec` when the table has no vector columns.
+/// Collect `(column_name, kind)` pairs for every pgvector column on the
+/// resolved schema table, preserving column ordinal order. Returns an empty
+/// `Vec` when the table has no vector columns.
 pub(crate) fn vector_columns_of_table(
     table: &<ParserDB as sql_traits::traits::DatabaseLike>::Table,
     schema: &ParserDB,
-) -> Result<Vec<(String, bool)>, LookupError> {
+) -> Result<Vec<(String, VectorKind)>, LookupError> {
     Ok(table
         .columns(schema)?
         .filter_map(|col| {
             let vector = col.attribute().data_type.vector(schema)?;
-            Some((col.column_name().to_string(), half_precision(vector.kind())?))
+            Some((col.column_name().to_string(), vector.kind()))
         })
         .collect())
 }
