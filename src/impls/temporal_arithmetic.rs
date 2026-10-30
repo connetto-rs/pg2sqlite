@@ -17,7 +17,8 @@ use alloc::{boxed::Box, format, string::ToString, vec};
 
 use sql_traits::structs::ParserDB;
 use sqlparser::ast::{
-    BinaryOperator, CastKind, DataType, DateTimeField, Expr, ExtractSyntax, Value, ValueWithSpan,
+    BinaryOperator, CastKind, DataType, DateTimeField, Expr, ExtractSyntax, TimezoneInfo, Value,
+    ValueWithSpan,
 };
 
 use super::{
@@ -35,7 +36,10 @@ pub(crate) enum TemporalKind {
     /// `timestamp` and `timestamptz` alike: nothing here separates them.
     Timestamp,
     /// `time` and `timetz`.
-    Time,
+    Time {
+        /// Whether a UTC offset follows the time of day.
+        zoned: bool,
+    },
 }
 
 /// Resolve the temporal type of `expr` from its own spelling or from the
@@ -95,7 +99,11 @@ fn kind_of_data_type(data_type: &DataType) -> Option<TemporalKind> {
     match data_type {
         DataType::Date => Some(TemporalKind::Date),
         DataType::Timestamp(_, _) | DataType::Datetime(_) => Some(TemporalKind::Timestamp),
-        DataType::Time(_, _) => Some(TemporalKind::Time),
+        DataType::Time(_, info) => {
+            Some(TemporalKind::Time {
+                zoned: matches!(info, TimezoneInfo::Tz | TimezoneInfo::WithTimeZone),
+            })
+        }
         _ => None,
     }
 }
@@ -110,7 +118,7 @@ fn kind_of_nullary(name: &str) -> Option<TemporalKind> {
         | "transaction_timestamp"
         | "statement_timestamp"
         | "clock_timestamp" => Some(TemporalKind::Timestamp),
-        "current_time" | "localtime" => Some(TemporalKind::Time),
+        "current_time" | "localtime" => Some(TemporalKind::Time { zoned: false }),
         _ => None,
     }
 }
@@ -150,8 +158,8 @@ fn binary_result_kind(
         (None, Some(TemporalKind::Date)) if matches!(op, BinaryOperator::Plus) && left_integral => {
             Some(TemporalKind::Date)
         }
-        (Some(TemporalKind::Date), Some(TemporalKind::Time))
-        | (Some(TemporalKind::Time), Some(TemporalKind::Date))
+        (Some(TemporalKind::Date), Some(TemporalKind::Time { .. }))
+        | (Some(TemporalKind::Time { .. }), Some(TemporalKind::Date))
             if matches!(op, BinaryOperator::Plus) =>
         {
             Some(TemporalKind::Timestamp)

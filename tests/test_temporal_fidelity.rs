@@ -377,3 +377,249 @@ fn cast_string_with_bare_offset_to_timestamp_with_time_zone_normalises() {
     let epoch: f64 = result.parse().expect("epoch must be numeric");
     assert!((epoch - 1_705_303_845.0).abs() < 2.0, "epoch should be ~1705303845, got {epoch}");
 }
+
+// ── time and timetz shifted by an interval ─────────────────────────────────
+//
+// PostgreSQL 18.6 wraps the time of day modulo 24 hours, ignores day and month
+// counts, and keeps a timetz offset.
+
+const TIME_DDL: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, v TIME);";
+const TIMETZ_DDL: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, v TIMETZ);";
+
+/// A time column shifted by an interval answers the time of day PostgreSQL
+/// answers.
+#[test]
+fn time_column_plus_interval_answers_a_time_of_day() {
+    let rows = run_translated_with(
+        &format!(
+            "{TIME_DDL}\n\
+             INSERT INTO t VALUES (1, '03:04:05.5'), (2, '03:04:05'), (3, '03:04:05.123456');\n\
+             SELECT v + interval '1 hour' FROM t ORDER BY id;"
+        ),
+        &Pg2SqliteOptions::default(),
+    );
+    // PostgreSQL: 04:04:05.5, 04:04:05, 04:04:05.123456 (last at three
+    // decimals, the documented millisecond limit of SQLite's date functions).
+    assert_eq!(
+        rows,
+        vec![
+            Some("04:04:05.5".to_string()),
+            Some("04:04:05".to_string()),
+            Some("04:04:05.123".to_string()),
+        ],
+    );
+}
+
+/// Subtracting an interval from a time column wraps back across midnight.
+#[test]
+fn time_column_minus_interval_wraps_back_a_day() {
+    let rows = run_translated_with(
+        &format!(
+            "{TIME_DDL}\n\
+             INSERT INTO t VALUES (1, '03:04:05.5'), (2, '03:04:05'), (3, '03:04:05.123456');\n\
+             SELECT v - interval '0.5 seconds' FROM t ORDER BY id;"
+        ),
+        &Pg2SqliteOptions::default(),
+    );
+    // PostgreSQL: 03:04:05, 03:04:04.5, 03:04:04.623456 (last at three
+    // decimals, the documented millisecond limit).
+    assert_eq!(
+        rows,
+        vec![
+            Some("03:04:05".to_string()),
+            Some("03:04:04.5".to_string()),
+            Some("03:04:04.623".to_string()),
+        ],
+    );
+}
+
+/// The shift wraps at the day boundary in both directions.
+#[test]
+fn time_plus_interval_wraps_past_midnight() {
+    let opts = Pg2SqliteOptions::default();
+    // PostgreSQL: 00:00:00, 23:30:00, 23:59:59.5, 00:00:00.
+    assert_eq!(
+        run_translated_with("SELECT time '23:00' + interval '1 hour';", &opts),
+        vec![Some("00:00:00".to_string())],
+    );
+    assert_eq!(
+        run_translated_with("SELECT time '00:30' - interval '1 hour';", &opts),
+        vec![Some("23:30:00".to_string())],
+    );
+    assert_eq!(
+        run_translated_with("SELECT time '00:00:00.5' - interval '1 second';", &opts),
+        vec![Some("23:59:59.5".to_string())],
+    );
+    assert_eq!(
+        run_translated_with("SELECT time '23:59:59.5' + interval '0.5 seconds';", &opts),
+        vec![Some("00:00:00".to_string())],
+    );
+}
+
+/// The interval's day and month counts do not move a time of day.
+#[test]
+fn time_interval_ignores_days_and_months() {
+    let opts = Pg2SqliteOptions::default();
+    // PostgreSQL: 00:00:00, 00:00:00, 03:00:00.
+    assert_eq!(
+        run_translated_with("SELECT time '23:00' + interval '1 day 1 hour';", &opts),
+        vec![Some("00:00:00".to_string())],
+    );
+    assert_eq!(
+        run_translated_with("SELECT time '23:00' + interval '1 month 1 hour';", &opts),
+        vec![Some("00:00:00".to_string())],
+    );
+    assert_eq!(
+        run_translated_with("SELECT time '03:00:00' + interval '1.5 months';", &opts),
+        vec![Some("03:00:00".to_string())],
+    );
+}
+
+/// A timetz column keeps its offset and wraps its local time.
+#[test]
+fn timetz_column_plus_interval_keeps_the_offset() {
+    let rows = run_translated_with(
+        &format!(
+            "{TIMETZ_DDL}\n\
+             INSERT INTO t VALUES (1, '03:04:05.5+02'), (2, '10:00:00-05'), (3, '10:00:00+02:30');\n\
+             SELECT v + interval '1 hour' FROM t ORDER BY id;"
+        ),
+        &Pg2SqliteOptions::default(),
+    );
+    // PostgreSQL: 04:04:05.5+02, 11:00:00-05, 11:00:00+02:30. The replica
+    // keeps the offset minutes PostgreSQL omits when they are zero.
+    assert_eq!(
+        rows,
+        vec![
+            Some("04:04:05.5+02:00".to_string()),
+            Some("11:00:00-05:00".to_string()),
+            Some("11:00:00+02:30".to_string()),
+        ],
+    );
+}
+
+/// Subtracting an interval from a timetz wraps the local time and keeps the
+/// offset.
+#[test]
+fn timetz_column_minus_interval_keeps_the_offset() {
+    let rows = run_translated_with(
+        &format!(
+            "{TIMETZ_DDL}\n\
+             INSERT INTO t VALUES (1, '03:04:05.5+02');\n\
+             SELECT v - interval '5 hours' FROM t;"
+        ),
+        &Pg2SqliteOptions::default(),
+    );
+    // PostgreSQL: 22:04:05.5+02.
+    assert_eq!(rows, vec![Some("22:04:05.5+02:00".to_string())]);
+}
+
+/// An interval on the left of + commutes to the time operand.
+#[test]
+fn commuted_interval_over_time_and_timetz() {
+    let opts = Pg2SqliteOptions::default();
+    // PostgreSQL: 04:04:05 and 04:04:05.5+02.
+    assert_eq!(
+        run_translated_with("SELECT interval '1 hour' + time '03:04:05';", &opts),
+        vec![Some("04:04:05".to_string())],
+    );
+    assert_eq!(
+        run_translated_with("SELECT interval '1 hour' + timetz '03:04:05.5+02';", &opts),
+        vec![Some("04:04:05.5+02:00".to_string())],
+    );
+}
+
+/// A scaled interval on the right shifts a time as if folded into it.
+#[test]
+fn scaled_interval_over_time() {
+    let opts = Pg2SqliteOptions::default();
+    // PostgreSQL: 05:04:05 for both orderings of the scalar.
+    assert_eq!(
+        run_translated_with("SELECT time '03:04:05' + 2 * interval '1 hour';", &opts),
+        vec![Some("05:04:05".to_string())],
+    );
+    assert_eq!(
+        run_translated_with("SELECT time '03:04:05' + interval '1 hour' * 2;", &opts),
+        vec![Some("05:04:05".to_string())],
+    );
+}
+
+/// A cast time operand takes the same shift.
+#[test]
+fn cast_time_plus_interval() {
+    // PostgreSQL: 04:04:05.5.
+    let rows = run_translated_with(
+        "SELECT CAST('03:04:05.5' AS time) + interval '1 hour';",
+        &Pg2SqliteOptions::default(),
+    );
+    assert_eq!(rows, vec![Some("04:04:05.5".to_string())]);
+}
+
+/// A fractional interval moves the sub-second part of the time.
+#[test]
+fn time_fractional_interval() {
+    let opts = Pg2SqliteOptions::default();
+    // PostgreSQL: 03:04:05.25 and 03:04:05.75.
+    assert_eq!(
+        run_translated_with("SELECT time '03:04:05' + interval '250 milliseconds';", &opts),
+        vec![Some("03:04:05.25".to_string())],
+    );
+    assert_eq!(
+        run_translated_with("SELECT time '03:04:05.25' + interval '0.5 seconds';", &opts),
+        vec![Some("03:04:05.75".to_string())],
+    );
+}
+
+/// The shifted value compares as text against the literal PostgreSQL would
+/// store.
+#[test]
+fn shifted_time_compares_equal_to_a_time_literal() {
+    let opts = Pg2SqliteOptions::default();
+    // PostgreSQL: true for the equal literal, false for the other one.
+    let rows = run_translated_with(
+        &format!(
+            "{TIME_DDL}\n\
+             INSERT INTO t VALUES (1, '03:04:05.5');\n\
+             SELECT v + interval '1 hour' = time '04:04:05.5' FROM t;"
+        ),
+        &opts,
+    );
+    assert_eq!(rows, vec![Some("1".to_string())]);
+    let rows = run_translated_with(
+        &format!(
+            "{TIME_DDL}\n\
+             INSERT INTO t VALUES (1, '03:04:05.5');\n\
+             SELECT v + interval '1 hour' = time '04:04:06.5' FROM t;"
+        ),
+        &opts,
+    );
+    assert_eq!(rows, vec![Some("0".to_string())]);
+}
+
+/// INSERT and UPDATE store the shifted time of day.
+#[test]
+fn time_column_write_positions_take_the_shifted_value() {
+    // PostgreSQL: ('03:04:05.5'::time + interval '1 hour' + interval '1 hour')
+    // = 05:04:05.5.
+    let rows = run_translated_with(
+        &format!(
+            "{TIME_DDL}\n\
+             INSERT INTO t (id, v) VALUES (1, time '03:04:05.5' + interval '1 hour');\n\
+             UPDATE t SET v = v + interval '1 hour' WHERE id = 1;\n\
+             SELECT v FROM t;"
+        ),
+        &Pg2SqliteOptions::default(),
+    );
+    assert_eq!(rows, vec![Some("05:04:05.5".to_string())]);
+}
+
+/// `localtime` shifted by a whole day wraps back to itself, true in PostgreSQL
+/// 18.6.
+#[test]
+fn localtime_shifted_by_a_day_wraps_to_itself() {
+    let rows = run_translated_with(
+        "SELECT localtime + interval '24 hours' = localtime;",
+        &Pg2SqliteOptions::default(),
+    );
+    assert_eq!(rows, vec![Some("1".to_string())]);
+}

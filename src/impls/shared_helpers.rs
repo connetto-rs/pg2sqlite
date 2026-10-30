@@ -1354,9 +1354,11 @@ impl ColumnRewrites {
         value: &Expr,
         schema: &ParserDB,
         context: Option<&crate::options::TranslationContext<'_>>,
-    ) -> Option<Expr> {
-        let AssignmentTarget::ColumnName(name) = target else { return None };
-        self.temporal_column_cast(&last_ident(name)?.value, value, schema, context?)
+    ) -> Result<Option<Expr>, Error> {
+        let AssignmentTarget::ColumnName(name) = target else { return Ok(None) };
+        let Some(column) = last_ident(name) else { return Ok(None) };
+        let Some(context) = context else { return Ok(None) };
+        self.temporal_column_cast(&column.value, value, schema, context)
     }
 
     /// [`temporal_assignment_cast`] into `column`, when it is a temporal
@@ -1367,11 +1369,40 @@ impl ColumnRewrites {
         value: &Expr,
         schema: &ParserDB,
         context: &crate::options::TranslationContext<'_>,
-    ) -> Option<Expr> {
-        let (_, data_type) =
-            self.literal_checked_cols.iter().find(|(name, _)| name.eq_ignore_ascii_case(column))?;
-        temporal_assignment_cast(value, data_type, schema, context)
+    ) -> Result<Option<Expr>, Error> {
+        let Some((_, data_type)) =
+            self.literal_checked_cols.iter().find(|(name, _)| name.eq_ignore_ascii_case(column))
+        else {
+            return Ok(None);
+        };
+        temporal_precision_replay_refusal(value, data_type, context)?;
+        Ok(temporal_assignment_cast(value, data_type, schema, context))
     }
+}
+
+/// Refuses the precision rounding of a non-literal temporal value when
+/// re-reading the value would not answer the same way.
+pub(crate) fn temporal_precision_replay_refusal(
+    value: &Expr,
+    data_type: &DataType,
+    context: &crate::options::TranslationContext<'_>,
+) -> Result<(), Error> {
+    let Some(kind) = crate::impls::temporal_literals::temporal_literal_kind(data_type) else {
+        return Ok(());
+    };
+    if kind.rounding_precision().is_none() {
+        return Ok(());
+    }
+    if crate::impls::function_helpers::single_quoted_literal(value).is_some() {
+        return Ok(());
+    }
+    if !crate::impls::replay::is_replayable(value, context) {
+        return Err(crate::impls::replay::reject_duplicated_operand(
+            "rounding a temporal value to its declared precision",
+            value,
+        ));
+    }
+    Ok(())
 }
 
 /// `value` cast to the temporal `data_type` it is written into, when the
@@ -1391,7 +1422,7 @@ pub(crate) fn temporal_assignment_cast(
     // A value whose zone cannot be read keeps the column's own conversion.
     let awareness =
         crate::impls::timezone::timestamp_awareness(value, schema, context).ok().flatten()?;
-    let zoned = kind == TemporalLiteralKind::TIMESTAMPTZ;
+    let zoned = matches!(kind, TemporalLiteralKind::Timestamp { zoned: true, .. });
     (zoned == (awareness == TimestampAwareness::Naive)).then(|| {
         Expr::Cast {
             kind: CastKind::Cast,
@@ -1735,30 +1766,68 @@ pub(crate) fn convert_temporal_value(
     if crate::impls::function_helpers::single_quoted_literal(&expr).is_some() {
         return normalize_temporal_literal_expr(kind, expr);
     }
-    if kind == TemporalLiteralKind::TIMESTAMPTZ {
+    let precision = kind.rounding_precision();
+    let zoned = matches!(kind, TemporalLiteralKind::Timestamp { zoned: true, .. });
+    if zoned {
         let value = canonical_timestamptz_value(expr);
-        return Ok(
-            if source == Some(TimestampAwareness::Naive) && !is_canonical_timestamptz_call(&value) {
-                canonical_timestamptz_call(value)
-            } else {
-                value
-            },
-        );
+        let value = if source == Some(TimestampAwareness::Naive)
+            && !is_canonical_timestamptz_call(&value)
+        {
+            canonical_timestamptz_call(value)
+        } else {
+            value
+        };
+        return Ok(match precision {
+            Some(precision) => crate::impls::datetime_helpers::round_timestamptz(value, precision),
+            None => value,
+        });
     }
     let instant = match take_canonical_timestamptz_operand(&mut expr) {
         Some(operand) => operand,
         None if source == Some(TimestampAwareness::Aware) => expr,
-        None => return Ok(expr),
+        None => {
+            // The value already holds the column's text and only the
+            // precision rounds it.
+            return Ok(match (kind, precision) {
+                (TemporalLiteralKind::Time { zoned: true, .. }, Some(precision)) => {
+                    crate::impls::datetime_helpers::round_timetz(&expr, precision, expr.clone())
+                }
+                (TemporalLiteralKind::Time { zoned: false, .. }, Some(precision)) => {
+                    crate::impls::datetime_helpers::round_time(&expr, precision, expr.clone())
+                }
+                (TemporalLiteralKind::Timestamp { .. }, Some(precision)) => {
+                    crate::impls::datetime_helpers::round_naive_timestamp(
+                        &expr,
+                        precision,
+                        expr.clone(),
+                    )
+                }
+                _ => expr,
+            });
+        }
     };
-    Ok(match kind {
-        TemporalLiteralKind::Time { zoned: true } => {
+    Ok(match (kind, precision) {
+        (TemporalLiteralKind::Time { zoned: true, .. }, Some(precision)) => {
+            crate::impls::datetime_helpers::round_time_of_instant(instant, precision, true)
+        }
+        (TemporalLiteralKind::Time { zoned: false, .. }, Some(precision)) => {
+            crate::impls::datetime_helpers::round_time_of_instant(instant, precision, false)
+        }
+        (TemporalLiteralKind::Timestamp { .. }, Some(precision)) => {
+            crate::impls::datetime_helpers::round_naive_timestamp(
+                &instant,
+                precision,
+                simple_function_expr("datetime", vec![instant.clone()], None),
+            )
+        }
+        (TemporalLiteralKind::Time { zoned: true, .. }, None) => {
             crate::impls::datetime_helpers::build_strftime_call("%H:%M:%S+00:00", instant)
         }
-        TemporalLiteralKind::Time { zoned: false } => {
+        (TemporalLiteralKind::Time { zoned: false, .. }, None) => {
             simple_function_expr("time", vec![instant], None)
         }
-        TemporalLiteralKind::Date => simple_function_expr("date", vec![instant], None),
-        TemporalLiteralKind::Timestamp { .. } => {
+        (TemporalLiteralKind::Date, _) => simple_function_expr("date", vec![instant], None),
+        (TemporalLiteralKind::Timestamp { .. }, None) => {
             simple_function_expr("datetime", vec![instant], None)
         }
     })
@@ -2117,7 +2186,7 @@ fn translate_column_assignment<D: TranslationDirection>(
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Assignment, Error> {
     rewrites.reject_untyped_array_assignment(target, source)?;
-    let cast = rewrites.assignment_cast(target, source, schema, D::forward_context(options));
+    let cast = rewrites.assignment_cast(target, source, schema, D::forward_context(options))?;
     let value = D::translate_expr(cast.as_ref().unwrap_or(source), schema, options, emit)?;
     Ok(Assignment {
         target: target.clone(),
