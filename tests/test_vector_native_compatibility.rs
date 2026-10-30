@@ -67,7 +67,9 @@ fn half_schema() -> ParserDB {
     .unwrap()
 }
 
-fn assert_refusal(source: &str, schema: Option<&ParserDB>) {
+/// Asserts that `source` is refused as unrepresentable, with `reason` in the
+/// refusal's detail.
+fn assert_refusal(source: &str, schema: Option<&ParserDB>, reason: &str) {
     let translator = Pg2Sqlite::default().sql(source).unwrap();
     let options = Pg2SqliteOptions::default();
     let result = match schema {
@@ -80,7 +82,11 @@ fn assert_refusal(source: &str, schema: Option<&ParserDB>) {
     };
     assert_eq!(refusal.direction(), TranslationDirection::PostgreSqlToSqlite);
     assert_eq!(refusal.category(), RefusalCategory::UnrepresentableSemantics);
+    assert!(refusal.detail().contains(reason), "{source}: {}", refusal.detail());
 }
+
+/// The detail every refusal of half-precision storage carries.
+const HALFVEC_REFUSAL: &str = "halfvec storage is not supported by sqlite-vec";
 
 #[test]
 fn half_precision_declarations_are_typed_refusals() {
@@ -91,10 +97,17 @@ fn half_precision_declarations_are_typed_refusals() {
         "CREATE TABLE items(id INT PRIMARY KEY, h \"halfvec\"(3));",
         "CREATE TABLE items(id INT PRIMARY KEY, v vector(3), h public.halfvec(3));",
         "CREATE TABLE items(id INT PRIMARY KEY); ALTER TABLE items ADD h halfvec(3);",
-        "CREATE TABLE items(id INT PRIMARY KEY, h vector(3)); ALTER TABLE items ALTER COLUMN h TYPE halfvec(3);",
     ] {
-        assert_refusal(source, None);
+        assert_refusal(&format!("CREATE EXTENSION vector; {source}"), None, HALFVEC_REFUSAL);
     }
+    // SQLite cannot change a column's type in place, which is refused before
+    // the new type is read.
+    assert_refusal(
+        "CREATE EXTENSION vector; CREATE TABLE items(id INT PRIMARY KEY, h vector(3));
+         ALTER TABLE items ALTER COLUMN h TYPE halfvec(3);",
+        None,
+        "ALTER COLUMN h TYPE halfvec(3) has no SQLite equivalent",
+    );
 }
 
 #[test]
@@ -106,7 +119,7 @@ fn half_precision_casts_are_typed_refusals() {
         "SELECT $1::halfvec(3);",
         "CREATE TABLE items(id INT PRIMARY KEY, v vector(3)); SELECT v::halfvec FROM items;",
     ] {
-        assert_refusal(source, None);
+        assert_refusal(&format!("CREATE EXTENSION vector; {source}"), None, HALFVEC_REFUSAL);
     }
 }
 
@@ -127,7 +140,7 @@ fn supplied_half_precision_columns_refuse_every_write_form() {
         "UPDATE items SET h=(SELECT '[0.1,0.2,0.3]');",
         "INSERT INTO items(id) VALUES(1) ON CONFLICT(id) DO UPDATE SET h=$1;",
     ] {
-        assert_refusal(source, Some(&schema));
+        assert_refusal(source, Some(&schema), HALFVEC_REFUSAL);
     }
 }
 
@@ -156,7 +169,7 @@ fn half_precision_native_operations_refuse_scoped_and_nested_values() {
         "WITH bound AS (SELECT * FROM halves) SELECT (SELECT * FROM bound LIMIT 1) <-> '[1,2,3]'::vector(3);",
         "WITH bound AS (SELECT * FROM halves) SELECT (SELECT * FROM bound LIMIT 1) <-> i.v FROM (items i CROSS JOIN items j);",
     ] {
-        assert_refusal(source, Some(&schema));
+        assert_refusal(source, Some(&schema), HALFVEC_REFUSAL);
     }
 }
 
@@ -183,7 +196,8 @@ fn a_trigger_variable_named_like_a_half_precision_column_is_the_variable() {
     let schema = ParserDB::from_statements(
         Parser::parse_sql(
             &PostgreSqlDialect {},
-            "CREATE TABLE items(id INT PRIMARY KEY, h halfvec(3));
+            "CREATE EXTENSION vector;
+             CREATE TABLE items(id INT PRIMARY KEY, h halfvec(3));
              CREATE TABLE audit(n INT);
              CREATE FUNCTION record() RETURNS trigger AS $$
              DECLARE h INT := 2;
@@ -216,8 +230,9 @@ fn a_trigger_variable_named_like_a_half_precision_column_is_the_variable() {
 
 #[test]
 fn half_precision_manifest_does_not_claim_native_storage() {
-    let translator =
-        Pg2Sqlite::default().sql("CREATE TABLE items(id INT PRIMARY KEY, h halfvec(3));").unwrap();
+    let translator = Pg2Sqlite::default()
+        .sql("CREATE EXTENSION vector; CREATE TABLE items(id INT PRIMARY KEY, h halfvec(3));")
+        .unwrap();
     let Error::TranslationRefusal(refusal) = translator
         .translation_manifest(&Pg2SqliteOptions::default())
         .expect_err("unsupported half-precision storage")
@@ -226,11 +241,12 @@ fn half_precision_manifest_does_not_claim_native_storage() {
     };
     assert_eq!(refusal.direction(), TranslationDirection::PostgreSqlToSqlite);
     assert_eq!(refusal.category(), RefusalCategory::UnrepresentableSemantics);
+    assert!(refusal.detail().contains(HALFVEC_REFUSAL), "{}", refusal.detail());
 }
 
 #[test]
 fn half_precision_codec_is_not_an_implicit_native_capability() {
-    assert_refusal("SELECT vec_f16('[0.1,0.2,0.3]');", None);
+    assert_refusal("SELECT vec_f16('[0.1,0.2,0.3]');", None, "vec_f16");
 }
 
 #[test]
@@ -428,7 +444,8 @@ fn float32_bound_parameters_store_native_vectors() {
     let schema = ParserDB::from_statements(
         Parser::parse_sql(
             &PostgreSqlDialect {},
-            "CREATE TABLE scalar_items(id INT PRIMARY KEY,v vector(3));
+            "CREATE EXTENSION vector;
+             CREATE TABLE scalar_items(id INT PRIMARY KEY,v vector(3));
              CREATE TABLE scalar_vectors(v vector(3));",
         )
         .unwrap(),
