@@ -509,9 +509,11 @@ fn a_literal_argument_picks_the_overload_whose_result_decides_the_refusal() {
          CREATE FUNCTION g(x INT) RETURNS BYTEA LANGUAGE sql AS $$ SELECT '\\x01'::bytea $$;
          CREATE FUNCTION g(x BIGINT) RETURNS TEXT LANGUAGE sql AS $$ SELECT 'a' $$;
          CREATE FUNCTION g(x NUMERIC) RETURNS TEXT LANGUAGE sql AS $$ SELECT 'a' $$;
-         CREATE FUNCTION g(x BOOLEAN) RETURNS BYTEA LANGUAGE sql AS $$ SELECT '\\x01'::bytea $$;";
-    let opts = array_opts().with_user_defined_functions(["g"]);
-    for refused in ["g(1)", "g(true)"] {
+         CREATE FUNCTION g(x BOOLEAN) RETURNS BYTEA LANGUAGE sql AS $$ SELECT '\\x01'::bytea $$;
+         CREATE FUNCTION h(x INT[]) RETURNS BYTEA LANGUAGE sql AS $$ SELECT '\\x01'::bytea $$;
+         CREATE FUNCTION h(x TEXT[]) RETURNS TEXT LANGUAGE sql AS $$ SELECT 'a' $$;";
+    let opts = array_opts().with_user_defined_functions(["g", "h"]);
+    for refused in ["g(1)", "g(true)", "h(ARRAY[id])"] {
         expect_refusal(
             &format!("{schema} SELECT ARRAY[{refused}] FROM t;"),
             &opts,
@@ -520,13 +522,181 @@ fn a_literal_argument_picks_the_overload_whose_result_decides_the_refusal() {
     }
     // A bound parameter has no type, so the overloads disagree and nothing is
     // refused.
-    for accepted in ["g(3000000000)", "g(1.5)", "g(1e3)", "g(99999999999999999999)", "g($1)"] {
+    for accepted in [
+        "g(3000000000)",
+        "g(1.5)",
+        "g(1e3)",
+        "g(99999999999999999999)",
+        "g($1)",
+        "h(ARRAY['a'::text])",
+    ] {
         Pg2Sqlite::default()
             .sql(&format!("{schema} SELECT ARRAY[{accepted}] FROM t;"))
             .expect("parse")
             .translate(&opts)
             .unwrap_or_else(|e| panic!("ARRAY[{accepted}] returns text, got: {e}"));
     }
+}
+
+#[test]
+fn arrays_of_case_and_subquery_results_stored_as_blob_are_refused() {
+    let schema = "CREATE TABLE t (id INT PRIMARY KEY, b BYTEA, u UUID);";
+    for (query, element) in [
+        ("SELECT ARRAY[CASE WHEN id > 0 THEN b ELSE NULL END] FROM t;", "BYTEA"),
+        ("SELECT ARRAY[CASE id WHEN 1 THEN u END] FROM t;", "UUID"),
+        ("SELECT array_agg(CASE WHEN id > 0 THEN b END) FROM t;", "BYTEA"),
+        ("SELECT ARRAY[(SELECT b FROM t LIMIT 1)] FROM t;", "BYTEA"),
+        ("SELECT ARRAY[d.x] FROM (SELECT decode('0102', 'hex') AS x FROM t) d;", "BYTEA"),
+    ] {
+        expect_refusal(
+            &format!("{schema} {query}"),
+            &blob_uuid_array_opts(),
+            &format!("a JSON array cannot hold the BLOB {element} is stored as"),
+        );
+    }
+    run(
+        &format!(
+            "{schema} SELECT ARRAY[CASE WHEN id > 0 THEN encode(b, 'hex') END], \
+             ARRAY[(SELECT id FROM t LIMIT 1)] FROM t;"
+        ),
+        &blob_uuid_array_opts(),
+    );
+}
+
+// ── bytea concatenation ──────────────────────────────────────────────────────
+
+/// A table with one row holding `\x0102` and one holding NULL, then `query`.
+fn bytea_rows(query: &str) -> Vec<Option<String>> {
+    query_rows(
+        &format!(
+            "CREATE TABLE t (id INT PRIMARY KEY, b BYTEA);
+             INSERT INTO t VALUES (1, '\\x0102'), (2, NULL);
+             {query}"
+        ),
+        &default_opts(),
+    )
+}
+
+#[test]
+fn bytea_concatenation_answers_bytes() {
+    // SQLite's || answers TEXT for two blobs, so the bytes came back as a
+    // string where PostgreSQL answers bytea.
+    assert_eq!(
+        bytea_rows("SELECT b || b FROM t ORDER BY id;"),
+        vec![Some("[1, 2, 1, 2]".to_owned()), None]
+    );
+    assert_eq!(
+        bytea_rows("SELECT b || '\\x03' FROM t ORDER BY id;"),
+        vec![Some("[1, 2, 3]".to_owned()), None]
+    );
+    assert_eq!(bytea_rows("SELECT b || NULL FROM t ORDER BY id;"), vec![None, None]);
+}
+
+#[test]
+fn bytea_concatenated_with_text_answers_the_hex_text() {
+    // PostgreSQL reads `bytea || text` as text concatenation over the bytea's
+    // output form.
+    assert_eq!(
+        bytea_rows("SELECT b || 'ab'::text FROM t ORDER BY id;"),
+        vec![Some("\\x0102ab".to_owned()), None]
+    );
+    assert_eq!(
+        bytea_rows("SELECT 'ab'::text || b FROM t ORDER BY id;"),
+        vec![Some("ab\\x0102".to_owned()), None]
+    );
+}
+
+#[test]
+fn encode_of_a_null_bytea_is_null() {
+    // SQLite's hex(NULL) is the empty string, where PostgreSQL's encode is
+    // strict.
+    assert_eq!(
+        bytea_rows("SELECT encode(b, 'hex') FROM t ORDER BY id;"),
+        vec![Some("0102".to_owned()), None]
+    );
+}
+
+#[test]
+fn bytea_operators_postgresql_cannot_resolve_are_refused() {
+    let schema = "CREATE TABLE t (id INT PRIMARY KEY, b BYTEA);";
+    for (query, needle) in [
+        ("SELECT b || id FROM t;", "|| over BYTEA and INT has no PostgreSQL operator"),
+        ("SELECT b + NULL FROM t;", "+ over BYTEA and an untyped value has no PostgreSQL operator"),
+        ("SELECT b || g() FROM t;", "|| beside a BYTEA value needs the type of g()"),
+        ("SELECT g() || b FROM t;", "|| beside a BYTEA value needs the type of g()"),
+        // An untyped literal beside bytea is read as bytea, and only the hex
+        // format is unambiguous.
+        ("SELECT b || 'abc' FROM t;", "bytea literal 'abc' is not in the PostgreSQL hex format"),
+        ("SELECT 'abc' || b FROM t;", "bytea literal 'abc' is not in the PostgreSQL hex format"),
+    ] {
+        expect_refusal(
+            &format!("{schema} {query}"),
+            &default_opts().with_user_defined_functions(["g"]),
+            needle,
+        );
+    }
+}
+
+#[test]
+fn an_untranslatable_operand_of_a_bytea_or_vector_lowering_is_reported() {
+    let schema = "CREATE TABLE t (id INT PRIMARY KEY, s TEXT, b BYTEA, v vector(3));";
+    for query in [
+        "SELECT encode(md5(s)::bytea, 'hex') FROM t;",
+        "SELECT b || md5(s)::bytea FROM t;",
+        "SELECT md5(s)::bytea || b FROM t;",
+        "SELECT b || md5(s) FROM t;",
+        "SELECT v <-> md5(s)::vector(3) FROM t;",
+        "SELECT md5(s)::vector(3) <-> v FROM t;",
+    ] {
+        expect_refusal(&format!("{schema} {query}"), &default_opts(), "md5");
+    }
+}
+
+#[test]
+fn an_array_of_concatenated_bytea_is_refused() {
+    expect_refusal(
+        "CREATE TABLE t (id INT PRIMARY KEY, b BYTEA); SELECT ARRAY[b || b] FROM t;",
+        &array_opts(),
+        "a JSON array cannot hold the BLOB BYTEA is stored as",
+    );
+}
+
+#[test]
+fn an_array_of_a_subquery_with_no_readable_type_still_translates() {
+    // A PL/pgSQL variable is read through a subquery the statement's scope
+    // does not record, and a function relation's columns are opaque. Neither
+    // says the element is a BLOB, so the array translates.
+    run(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY);
+         CREATE TABLE log (id INTEGER PRIMARY KEY, tags INT[]);
+         CREATE TABLE src (id INTEGER PRIMARY KEY, v INTEGER);
+         CREATE FUNCTION f() RETURNS TRIGGER AS $$
+         DECLARE v_n INTEGER := 3;
+         BEGIN INSERT INTO log (tags) SELECT array_agg(v_n) FROM src; RETURN NEW; END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER tr AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION f();
+         INSERT INTO src VALUES (1, 1);
+         INSERT INTO t VALUES (1);",
+        &array_opts(),
+    );
+    run(
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         SELECT ARRAY[(SELECT name FROM pragma_table_info('t') LIMIT 1)] FROM t;",
+        &array_opts().with_user_defined_functions(["pragma_table_info"]),
+    );
+}
+
+#[test]
+fn an_unresolved_column_in_an_array_element_is_reported() {
+    let error = Pg2Sqlite::default()
+        .sql("CREATE TABLE t (id INT PRIMARY KEY); SELECT ARRAY[CASE WHEN id > 0 THEN missing END] FROM t;")
+        .expect("parse")
+        .translate(&array_opts())
+        .expect_err("missing is no column of t");
+    assert!(
+        matches!(error, pg2sqlite::errors::Error::UnresolvedColumnReference { .. }),
+        "{error:?}"
+    );
 }
 
 #[test]

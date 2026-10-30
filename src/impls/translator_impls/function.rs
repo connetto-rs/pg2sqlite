@@ -2650,12 +2650,12 @@ impl crate::traits::translator::TranslatorWithContext for Function {
             }
             FunctionTranslation::ToLowerHex => {
                 let exprs = extract_exactly(&func.args, 2, "encode")?;
-                let hex = simple_function_expr(
-                    "hex",
-                    vec![exprs[0].translate_with_warnings(schema, options, emit)?],
-                    None,
-                );
-                Ok(simple_function_expr("lower", vec![hex], None))
+                crate::impls::translator_impls::blob_operator::lower_hex(
+                    "encode",
+                    exprs[0],
+                    exprs[0].translate_with_warnings(schema, options, emit)?,
+                    options,
+                )
             }
             FunctionTranslation::ToUnhex => {
                 let exprs = extract_exactly(&func.args, 2, "decode")?;

@@ -10,7 +10,9 @@ use sql_traits::{
     utils::{common_type_name, normalize_sqlparser_type},
 };
 use sqlparser::{
-    ast::{DataType, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Value},
+    ast::{
+        ColumnDef, DataType, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Value,
+    },
     dialect::PostgreSqlDialect,
     parser::Parser,
 };
@@ -18,15 +20,16 @@ use sqlparser::{
 use crate::{
     errors::Error,
     impls::{
-        function_helpers::positional_arity, object_name::last_ident,
-        reverse_translator_impls::storage_shape::declared_data_type,
-        shared_helpers::function_arg_expr, translator_impls::postgis,
+        function_helpers::positional_arity,
+        object_name::last_ident,
+        shared_helpers::{declared_in_scope, first_query_output, function_arg_expr},
+        translator_impls::postgis,
     },
 };
 
 /// PostgreSQL's name for the type of an untyped literal such as `NULL` or
 /// `'abc'`, which the call it is passed to decides.
-const UNKNOWN: &str = "unknown";
+pub(crate) const UNKNOWN: &str = "unknown";
 
 /// The PostgreSQL type name of `expr`, or [`None`] when nothing the statement
 /// writes decides it.
@@ -47,20 +50,74 @@ pub(crate) fn type_name<'e>(
         Expr::TypedString(typed) => Some(normalize_sqlparser_type(&typed.data_type)),
         Expr::Value(value) => literal_type_name(&value.value).map(Cow::Borrowed),
         Expr::Function(call) => call_type_name(call, schema, options)?.map(Cow::Owned),
+        Expr::BinaryOp { left, op, right } => {
+            crate::impls::translator_impls::blob_operator::resolve(
+                left, op, right, schema, options,
+            )?
+            .map(|resolved| {
+                Cow::Owned(normalize_sqlparser_type(resolved.result_type()).into_owned())
+            })
+        }
         Expr::Array(array) => {
-            let elements = array
-                .elem
-                .iter()
-                .map(|element| type_name(element, schema, options))
-                .collect::<Result<Vec<_>, Error>>()?;
-            let elements: Vec<Option<&str>> = elements.iter().map(Option::as_deref).collect();
-            common_type_name(&elements).map(|element| Cow::Owned(format!("{element}[]")))
+            common_type(&array.elem, schema, options)?
+                .map(|element| Cow::Owned(format!("{element}[]")))
+        }
+        // A missing ELSE is NULL, which takes the type of the other branches.
+        Expr::Case { conditions, else_result, .. } => {
+            let results: Vec<&Expr> =
+                conditions.iter().map(|when| &when.result).chain(else_result.as_deref()).collect();
+            common_type(results, schema, options)?.map(Cow::Owned)
+        }
+        Expr::Subquery(query) => {
+            first_query_output(
+                query,
+                schema,
+                options,
+                |column| Some(declared_type_name(column)),
+                owned_type_name,
+            )?
+            .map(Cow::Owned)
         }
         _ => {
-            declared_data_type(expr, schema, options)?
-                .map(|declared| Cow::Owned(normalize_sqlparser_type(&declared).into_owned()))
+            declared_in_scope(
+                expr,
+                schema,
+                options,
+                |column| Some(declared_type_name(column)),
+                owned_type_name,
+            )?
+            .map(Cow::Owned)
         }
     })
+}
+
+/// The type name of a column's declaration.
+fn declared_type_name(column: &ColumnDef) -> String {
+    normalize_sqlparser_type(&column.data_type).into_owned()
+}
+
+/// [`type_name`] for an expression a relation in scope defines a column by.
+fn owned_type_name(
+    expr: &Expr,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<Option<String>, Error> {
+    Ok(type_name(expr, schema, options)?.map(Cow::into_owned))
+}
+
+/// The type PostgreSQL's `select_common_type` settles on for `values`, as
+/// `ARRAY[...]` and `CASE` resolve their results.
+fn common_type<'v>(
+    values: impl IntoIterator<Item = &'v Expr>,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<Option<String>, Error> {
+    let types = values
+        .into_iter()
+        .map(|value| type_name(value, schema, options))
+        .collect::<Result<Vec<_>, Error>>()?;
+    let types: Vec<Option<&str>> = types.iter().map(Option::as_deref).collect();
+    Ok(common_type_name(&types).map(Cow::into_owned))
 }
 
 /// The [`DataType`] a type name answered by [`type_name`] spells.

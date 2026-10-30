@@ -568,6 +568,9 @@ pub fn reverse_function(
         "vec_distance_hamming" => {
             FunctionReversal::ToOperator(BinaryOperator::Custom("<~>".to_string()))
         }
+        // vec_add(a, b) -> a + b and vec_sub(a, b) -> a - b
+        "vec_add" => FunctionReversal::ToOperator(BinaryOperator::Plus),
+        "vec_sub" => FunctionReversal::ToOperator(BinaryOperator::Minus),
         // vec_f32(expr) -> expr::vector
         "vec_f32" => FunctionReversal::ToVectorCast,
         // vec_f16(expr) -> expr::halfvec
@@ -1012,6 +1015,12 @@ fn build_reverse_function(
     }))
 }
 
+/// `coalesce(hexed, '')`, since SQLite's `hex(NULL)` is the empty string where
+/// PostgreSQL's `encode` answers NULL.
+fn sqlite_hex_of_null(hexed: Expr) -> Expr {
+    simple_function_expr("coalesce", vec![hexed, string_literal("")], None)
+}
+
 /// `floor(extract(epoch from now()))::bigint`, which is what SQLite's
 /// `unixepoch()` answers.
 ///
@@ -1451,11 +1460,7 @@ pub fn reverse_translate_function(
             // refuse.
             let exprs = function_argument_exprs(&func.args);
             let arg = exprs.first().copied();
-            // An array column is not JSON at all on the server, where
-            // `json_array_length(integer[])` does not exist. Its length is
-            // `array_length(xs, 1)`, which answers NULL for an empty array
-            // where SQLite answers 0, so the zero is restored: measured, the
-            // replica answers 2 and 0 over `{1,2}` and `{}`.
+            // `json_array_length(integer[])` does not exist on the server.
             let declared = match arg {
                 Some(argument) => declared_data_type(argument, schema, options)?,
                 None => None,
@@ -1467,13 +1472,9 @@ pub fn reverse_translate_function(
                 let inner = crate::prelude::ReverseTranslator::reverse_translate(
                     argument, schema, options,
                 )?;
-                let length =
-                    simple_function_expr("array_length", vec![inner, integer_literal(1)], None);
-                return Ok(simple_function_expr(
-                    "coalesce",
-                    vec![length, integer_literal(0)],
-                    None,
-                ));
+                // 0 for an empty array and NULL for a NULL one, as SQLite
+                // answers.
+                return Ok(simple_function_expr("cardinality", vec![inner], None));
             }
             let is_jsonb = match arg {
                 Some(argument) => {
@@ -1553,7 +1554,7 @@ pub fn reverse_translate_function(
                     vec![text, string_literal("-"), string_literal("")],
                     None,
                 );
-                return Ok(simple_function_expr("upper", vec![undashed], None));
+                return Ok(sqlite_hex_of_null(simple_function_expr("upper", vec![undashed], None)));
             }
             // Every other declared type, including a uuid held as text, is
             // hexed by SQLite as the bytes of its text, which the server
@@ -1579,7 +1580,7 @@ pub fn reverse_translate_function(
             };
             let encoded =
                 simple_function_expr("encode", vec![bytea_cast, string_literal("hex")], None);
-            Ok(simple_function_expr("upper", vec![encoded], None))
+            Ok(sqlite_hex_of_null(simple_function_expr("upper", vec![encoded], None)))
         }
         FunctionReversal::ToDecodeHex => {
             // unhex(x) -> decode(x, 'hex')

@@ -26,8 +26,8 @@
 //!   difference is observable.
 //! * An element stored as a BLOB is refused, because SQLite's JSON functions
 //!   take no BLOB argument. The element's type is read from a column, a cast, a
-//!   literal or a call's result, so an operator or `CASE` producing a BLOB
-//!   still fails in SQLite.
+//!   literal, a call, a `CASE` or a scalar subquery, so a call to a function
+//!   the schema does not declare still fails in SQLite.
 
 #[cfg(not(feature = "std"))]
 #[allow(unused_imports)]

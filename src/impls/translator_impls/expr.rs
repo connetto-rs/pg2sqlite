@@ -1394,10 +1394,16 @@ fn translate_vector_distance_op(
     {
         return Err(crate::impls::translator_impls::vector::halfvec_refusal());
     }
-    let translated_left = left.translate_with_warnings(schema, options, emit)?;
-    let translated_right = right.translate_with_warnings(schema, options, emit)?;
-
-    Ok(simple_function_expr(function_name, vec![translated_left, translated_right], None))
+    let translated = [
+        left.translate_with_warnings(schema, options, emit)?,
+        right.translate_with_warnings(schema, options, emit)?,
+    ];
+    crate::impls::translator_impls::blob_operator::strict_vector_call(
+        function_name,
+        [left, right],
+        translated,
+        options,
+    )
 }
 
 /// The elements of a quantifier operand that compares element-wise: an
@@ -2490,6 +2496,13 @@ fn translate_binary_op(
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Expr, crate::errors::Error> {
+    if let Some(resolved) =
+        crate::impls::translator_impls::blob_operator::resolve(left, op, right, schema, options)?
+    {
+        return crate::impls::translator_impls::blob_operator::translate(
+            &resolved, left, right, schema, options, emit,
+        );
+    }
     if numeric_rules_may_apply(op, left, right) {
         let scales = (scale_of(left, schema, options), scale_of(right, schema, options));
 

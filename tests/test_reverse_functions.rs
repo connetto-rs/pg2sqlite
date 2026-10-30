@@ -83,6 +83,12 @@ fn reverse_vec_distance_cosine() {
 }
 
 #[test]
+fn reverse_vec_add_and_vec_sub_to_operators() {
+    let pg = reverse(VECTORS, "SELECT vec_add(vec, vec), vec_sub(vec, vec) FROM embeddings;");
+    assert_eq!(pg, "SELECT vec + vec, vec - vec FROM embeddings");
+}
+
+#[test]
 fn reverse_vec_f32_to_cast() {
     let pg = reverse(VECTORS, "SELECT vec_f32('[1,2,3]') FROM embeddings;");
     assert!(pg.contains("::vector"), "Expected ::vector cast: {pg}");

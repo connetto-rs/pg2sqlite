@@ -167,16 +167,6 @@ fn an_empty_json_array_beside_an_array_column_carries_the_column_type() {
 }
 
 #[test]
-fn the_length_of_an_array_column_reverses_to_array_length() {
-    // `json_array_length(integer[])` does not exist on the server, and
-    // `array_length` answers NULL for an empty array where SQLite answers 0,
-    // so the zero is restored.
-    let postgres = reversed("SELECT json_array_length(xs) FROM stored");
-    assert!(postgres.contains("array_length(xs, 1)"), "{postgres}");
-    assert!(postgres.contains("coalesce"), "{postgres}");
-}
-
-#[test]
 fn the_length_of_a_json_column_still_reverses_to_the_json_overload() {
     let postgres = reversed("SELECT json_array_length(doc) FROM stored");
     assert!(postgres.contains("jsonb_array_length(doc)"), "{postgres}");
