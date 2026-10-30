@@ -1841,14 +1841,10 @@ pub(crate) fn convert_temporal_value(
             round_column_text(kind, local_timestamp_text(instant, None))
         }
         (TemporalLiteralKind::Time { zoned, .. }, Some(precision)) => {
-            crate::impls::datetime_helpers::round_time_of_instant(instant, precision, zoned)
+            crate::impls::datetime_helpers::round_time_of_instant(&instant, precision, zoned)
         }
         (TemporalLiteralKind::Timestamp { .. }, Some(precision)) => {
-            crate::impls::datetime_helpers::round_naive_timestamp(
-                &instant,
-                precision,
-                simple_function_expr("datetime", vec![instant.clone()], None),
-            )
+            crate::impls::datetime_helpers::round_instant(&instant, precision)
         }
         (TemporalLiteralKind::Time { zoned: true, .. }, None) => {
             build_strftime_call("%H:%M:%S+00:00", instant)

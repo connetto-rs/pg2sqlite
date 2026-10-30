@@ -1172,46 +1172,47 @@ pub(crate) fn round_timetz(value: &Expr, precision: u32, fallback: Expr) -> Expr
     case_when(timetz_guard(value), timetz_rounded(value, precision), Some(fallback))
 }
 
-/// The time of day of an `instant`, rounded to the typmod precision when the
-/// instant is canonical `timestamptz` text carrying a fraction, a
-/// `time with time zone` keeping its own offset with only the fraction
-/// rounded, and anything else in the column's existing form of the instant.
+/// The UTC time of day of an `instant`, any SQLite time value, rounded to the
+/// typmod precision as a time, so a fraction rounding up at midnight reaches
+/// `24:00:00`.
 #[must_use]
-pub(crate) fn round_time_of_instant(instant: Expr, precision: u32, zoned: bool) -> Expr {
-    let guard = binary(
-        binary(
-            simple_function_expr("length", vec![instant.clone()], None),
-            BinaryOperator::Eq,
-            integer_literal(32),
-        ),
-        BinaryOperator::And,
-        binary(
-            simple_function_expr(
-                "substr",
-                vec![instant.clone(), integer_literal(20), integer_literal(1)],
-                None,
-            ),
-            BinaryOperator::Eq,
-            string_literal("."),
-        ),
+pub(crate) fn round_time_of_instant(instant: &Expr, precision: u32, zoned: bool) -> Expr {
+    let time = simple_function_expr(
+        "substr",
+        vec![instant_text(instant), integer_literal(12), integer_literal(15)],
+        None,
     );
-    let rounded = round_naive_timestamp(
-        &instant,
-        precision,
-        simple_function_expr("datetime", vec![instant.clone()], None),
+    let rounded = round_time(&time, precision, time.clone());
+    if zoned { concat(rounded, string_literal("+00:00")) } else { rounded }
+}
+
+/// The naive timestamp text of an `instant`, any SQLite time value, rounded to
+/// the typmod precision.
+#[must_use]
+pub(crate) fn round_instant(instant: &Expr, precision: u32) -> Expr {
+    let text = instant_text(instant);
+    round_naive_timestamp(&text, precision, text.clone())
+}
+
+/// `instant` itself when it is timestamp text with a fraction, whose digits
+/// round exactly, and the milliseconds SQLite's date functions read otherwise.
+fn instant_text(instant: &Expr) -> Expr {
+    let fraction_point = binary(
+        simple_function_expr(
+            "substr",
+            vec![instant.clone(), integer_literal(20), integer_literal(1)],
+            None,
+        ),
+        BinaryOperator::Eq,
+        string_literal("."),
     );
-    let time_part = simple_function_expr("substr", vec![rounded, integer_literal(12)], None);
-    let then = if zoned { concat(time_part, string_literal("+00:00")) } else { time_part };
-    let fallback = if zoned {
-        // A canonical instant is extracted above, a `time with time zone`
-        // keeps its offset, and the rest is normalized to UTC.
-        case_when(
-            timetz_guard(&instant),
-            timetz_rounded(&instant, precision),
-            Some(build_strftime_call("%H:%M:%S+00:00", instant.clone())),
-        )
-    } else {
-        simple_function_expr("time", vec![instant], None)
-    };
-    case_when(guard, then, Some(fallback))
+    case_when(
+        fraction_point,
+        instant.clone(),
+        Some(simple_function_expr(
+            "datetime",
+            vec![instant.clone(), string_literal("subsec")],
+            None,
+        )),
+    )
 }
