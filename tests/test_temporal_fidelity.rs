@@ -797,20 +797,20 @@ fn temporal_kind_casts_postgres_refuses_are_refused() {
     }
 }
 
-/// A concatenation of unknown kind passes its timestamp text through the cast,
-/// as PostgreSQL 18.6 prints it.
+/// A concatenation of unknown kind is read as a timestamp, as PostgreSQL 18.6
+/// prints it.
 #[test]
-fn concatenated_text_passes_through_a_timestamp_cast() {
+fn concatenated_text_is_read_by_a_timestamp_cast() {
     assert_eq!(
-        kind_cast_rows("('2024-03-05' || ' 03:04:05.5')::timestamp"),
+        kind_cast_rows("('2024-03-05' || ' 03:04:05.500')::timestamp"),
         text_rows(&["2024-03-05 03:04:05.5"; 3])
     );
 }
 
-/// An argument-free function the crate cannot name keeps its own text through
-/// the cast, as PostgreSQL 18.6 prints it for a text function.
+/// An argument-free function the crate cannot name is read as a timestamp, as
+/// PostgreSQL 18.6 prints it for a text function.
 #[test]
-fn unknown_argument_free_function_passes_through_a_timestamp_cast() {
+fn unknown_argument_free_function_is_read_by_a_timestamp_cast() {
     let options = Pg2SqliteOptions::default().with_user_defined_functions(["probe_stamp"]);
     let probe = Pg2Sqlite::default()
         .sql("SELECT probe_stamp()::timestamp;")
@@ -827,11 +827,81 @@ fn unknown_argument_free_function_passes_through_a_timestamp_cast() {
             0,
             rusqlite::functions::FunctionFlags::SQLITE_UTF8
                 | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
-            |_| Ok("2024-03-05 03:04:05.5"),
+            |_| Ok("2024-03-05 03:04:05.500"),
         )
         .expect("register the probe function");
     let value: String = connection.query_row(&probe, [], |row| row.get(0)).expect("the probe runs");
     assert_eq!(value, "2024-03-05 03:04:05.5");
+}
+
+/// A text column is read into each temporal type the way PostgreSQL 18.6 prints
+/// it, to the milliseconds SQLite's date functions hold.
+#[test]
+fn text_column_is_read_by_a_temporal_cast() {
+    for (query, expected) in [
+        ("x::date", ["2024-01-02", "2024-12-31", "2025-02-28"]),
+        ("x::time", ["03:04:05.5", "23:59:59", "00:00:00.123"]),
+        (
+            "x::timestamp",
+            ["2024-01-02 03:04:05.5", "2024-12-31 23:59:59", "2025-02-28 00:00:00.123"],
+        ),
+        (
+            "x::timestamptz",
+            [
+                "2024-01-02 03:04:05.500000+00:00",
+                "2024-12-31 23:59:59.000000+00:00",
+                "2025-02-28 00:00:00.123000+00:00",
+            ],
+        ),
+        ("x::date = d", ["1", "1", "1"]),
+        ("x::time(0)", ["03:04:06", "23:59:59", "00:00:00"]),
+        ("x::timestamp(0)", ["2024-01-02 03:04:06", "2024-12-31 23:59:59", "2025-02-28 00:00:00"]),
+        (
+            "x::timestamptz(1)",
+            [
+                "2024-01-02 03:04:05.500000+00:00",
+                "2024-12-31 23:59:59.000000+00:00",
+                "2025-02-28 00:00:00.100000+00:00",
+            ],
+        ),
+    ] {
+        assert_eq!(kind_cast_rows(query), text_rows(&expected), "{query}");
+    }
+}
+
+/// A text cast is reported, since SQLite's date functions answer NULL for a
+/// spelling PostgreSQL parses or refuses.
+#[test]
+fn text_cast_reports_the_date_function_reading() {
+    use pg2sqlite::warnings::TranslationWarning;
+    let report = Pg2Sqlite::default()
+        .sql(&format!("{KIND_CAST_DDL}\nSELECT x::date FROM k;"))
+        .expect("parse")
+        .translate_with_report(&Pg2SqliteOptions::default())
+        .expect("translate");
+    assert!(
+        report.warnings.iter().any(|warning| {
+            matches!(
+                warning,
+                TranslationWarning::LossyDowngrade { construct, reason, .. }
+                    if construct == "CAST" && reason.contains("NULL")
+            )
+        }),
+        "{:?}",
+        report.warnings
+    );
+}
+
+/// PostgreSQL 18.6 answers `cannot cast type integer to date`.
+#[test]
+fn integer_cast_to_a_temporal_type_is_refused() {
+    let error = Pg2Sqlite::default()
+        .sql(&format!("{KIND_CAST_DDL}\nSELECT id::date FROM k;"))
+        .expect("parse")
+        .translate(&Pg2SqliteOptions::default())
+        .expect_err("an integer has no date")
+        .to_string();
+    assert!(error.contains("cannot cast type` for an integer cast to date"), "{error}");
 }
 
 /// A rewritten cast compares as text with the stored form of the value.
