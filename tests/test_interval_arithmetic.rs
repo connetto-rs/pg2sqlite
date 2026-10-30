@@ -197,11 +197,18 @@ fn the_leading_field_spelling_clamps_too() {
     assert_eq!(shift("timestamp '2026-01-31' + interval '1' month"), "2026-02-28 00:00:00");
 }
 
-/// PostgreSQL has no `WEEK` qualifier and reads `interval '1' week` as one
-/// second under the column alias `week`, so a week would be the wrong answer.
+/// PostgreSQL 18.6 has no `WEEK` qualifier and reads `interval '1' week` as
+/// one second under the column alias `week`.
 #[test]
-fn a_week_qualifier_is_refused() {
-    let error = refusal("timestamp '2026-01-31' + interval '1' week");
+fn a_word_after_an_interval_is_an_alias() {
+    assert_eq!(shift("timestamp '2026-01-31' + interval '1' week"), "2026-01-31 00:00:01");
+}
+
+/// PostgreSQL 18.6 answers a syntax error for a qualifier range that runs
+/// backwards.
+#[test]
+fn a_backwards_qualifier_is_refused() {
+    let error = refusal("timestamp '2026-01-31' + interval '1' day to month");
     assert!(error.contains("qualifier"), "the refusal must name the qualifier: {error}");
 }
 
