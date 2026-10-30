@@ -308,6 +308,11 @@ pub(crate) fn translate_column_def(
             .translate_with_warnings(schema, options, emit)?;
             let source =
                 crate::impls::timezone::timestamp_awareness(expr, schema, options).ok().flatten();
+            crate::impls::shared_helpers::temporal_precision_replay_refusal(
+                expr,
+                &column.data_type,
+                options,
+            )?;
             temporal_default(&column.data_type, translated, source)
         })
         .collect::<Result<Vec<_>, _>>()?

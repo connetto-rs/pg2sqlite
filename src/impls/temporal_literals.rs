@@ -35,17 +35,28 @@ pub(crate) enum TemporalLiteralKind {
     Time {
         /// Whether a UTC offset may follow the time.
         zoned: bool,
+        /// The typmod precision, when it rounds.
+        precision: Option<u32>,
     },
     /// `timestamp` and `timestamp with time zone`.
     Timestamp {
         /// Whether a UTC offset may follow the time.
         zoned: bool,
+        /// The typmod precision, when it rounds.
+        precision: Option<u32>,
     },
 }
 
 impl TemporalLiteralKind {
-    /// `timestamp with time zone`, whose replica text is canonical.
-    pub(crate) const TIMESTAMPTZ: Self = Self::Timestamp { zoned: true };
+    /// The typmod precision to round a written value to, when it rounds at
+    /// all.
+    #[must_use]
+    pub(crate) fn rounding_precision(self) -> Option<u32> {
+        match self {
+            Self::Date => None,
+            Self::Time { precision, .. } | Self::Timestamp { precision, .. } => precision,
+        }
+    }
 }
 
 /// The kind of temporal literal `data_type` takes, or `None` for every other
@@ -53,10 +64,22 @@ impl TemporalLiteralKind {
 #[must_use]
 pub(crate) fn temporal_literal_kind(data_type: &DataType) -> Option<TemporalLiteralKind> {
     let zoned = |info: &TimezoneInfo| matches!(info, TimezoneInfo::Tz | TimezoneInfo::WithTimeZone);
+    // PostgreSQL clamps a precision above six to six, which keeps every
+    // digit, so only zero to five is carried.
+    let typmod = |declared: &Option<u64>| {
+        declared
+            .map(|declared| declared.min(6))
+            .filter(|precision| *precision < 6)
+            .and_then(|precision| precision.try_into().ok())
+    };
     match data_type {
         DataType::Date => Some(TemporalLiteralKind::Date),
-        DataType::Time(_, info) => Some(TemporalLiteralKind::Time { zoned: zoned(info) }),
-        DataType::Timestamp(_, info) => Some(TemporalLiteralKind::Timestamp { zoned: zoned(info) }),
+        DataType::Time(declared, info) => {
+            Some(TemporalLiteralKind::Time { zoned: zoned(info), precision: typmod(declared) })
+        }
+        DataType::Timestamp(declared, info) => {
+            Some(TemporalLiteralKind::Timestamp { zoned: zoned(info), precision: typmod(declared) })
+        }
         _ => None,
     }
 }
@@ -78,13 +101,14 @@ pub(crate) fn normalize_temporal_literal(
             let (year, month, day) = parse_date(kind, trimmed, trimmed)?;
             Ok(format!("{year:04}-{month:02}-{day:02}"))
         }
-        TemporalLiteralKind::Time { zoned } => {
+        TemporalLiteralKind::Time { zoned, precision } => {
             let (body, zone) = split_time_zone(kind, trimmed, zoned)?;
             let zone = zone.map_or_else(String::new, |zone| zone.render());
             let clock = parse_time(kind, body, trimmed)?;
-            Ok(format!("{}{zone}", time_of_day_text(clock.micros_of_day())))
+            let micros = round_typmod_micros(clock.micros_of_day(), precision);
+            Ok(format!("{}{zone}", time_of_day_text(micros)))
         }
-        TemporalLiteralKind::Timestamp { zoned } => {
+        TemporalLiteralKind::Timestamp { zoned, precision } => {
             let (body, zone) = split_time_zone(kind, trimmed, zoned)?;
             let (date, time) = split_timestamp(body);
             let (year, month, day) = parse_date(kind, date, trimmed)?;
@@ -92,15 +116,19 @@ pub(crate) fn normalize_temporal_literal(
                 Some(time) => parse_time(kind, time, trimmed)?,
                 None => Clock::MIDNIGHT,
             };
+            let micros_of_day = clock.micros_of_day();
             if zoned {
                 // No offset reads as UTC, the zone the replica's own clock
                 // answers in.
                 let offset = zone.map_or(0, |zone| zone.seconds());
-                return canonical_instant((year, month, day), clock, offset, trimmed);
+                let micros = days_from_civil(year, month, day) * MICROS_PER_DAY + micros_of_day
+                    - offset * MICROS_PER_SECOND;
+                return canonical_instant(round_typmod_micros(micros, precision), trimmed);
             }
             // PostgreSQL reads 24:00:00 on a timestamp, and a fraction that
             // rounds up into it, as the next day's midnight.
-            let ((year, month, day), micros) = match clock.micros_of_day() {
+            let micros = round_typmod_micros(micros_of_day, precision);
+            let ((year, month, day), micros) = match micros {
                 MICROS_PER_DAY => (next_day(year, month, day), 0),
                 micros => ((year, month, day), micros),
             };
@@ -131,14 +159,7 @@ fn time_of_day_text(micros: i64) -> String {
 }
 
 /// The canonical `YYYY-MM-DD HH:MM:SS.ffffff+00:00` text of an instant.
-fn canonical_instant(
-    (year, month, day): (u32, u32, u32),
-    clock: Clock,
-    offset_seconds: i64,
-    text: &str,
-) -> Result<String, Error> {
-    let micros = days_from_civil(year, month, day) * MICROS_PER_DAY + clock.micros_of_day()
-        - offset_seconds * MICROS_PER_SECOND;
+fn canonical_instant(micros: i64, text: &str) -> Result<String, Error> {
     let (year, month, day) = civil_from_days(micros.div_euclid(MICROS_PER_DAY));
     if !(1..=9999).contains(&year) {
         return Err(Error::forward_refusal(format!(
@@ -175,6 +196,19 @@ fn rounded_microseconds(fraction: &str) -> i64 {
     }
 }
 
+/// The value of `micros` rounded to the typmod precision, half away from
+/// zero the way PostgreSQL's typmod adjustment rounds it.
+fn round_typmod_micros(micros: i64, precision: Option<u32>) -> i64 {
+    let Some(precision) = precision else { return micros };
+    let divisor = 10_i64.pow(6 - precision);
+    let half = divisor / 2;
+    if micros >= 0 {
+        (micros + half) / divisor * divisor
+    } else {
+        (micros - half) / divisor * divisor
+    }
+}
+
 /// Days since 1970-01-01 of a proleptic Gregorian date.
 fn days_from_civil(year: u32, month: u32, day: u32) -> i64 {
     let year = i64::from(year) - i64::from(month <= 2);
@@ -207,10 +241,10 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 fn type_name(kind: TemporalLiteralKind) -> &'static str {
     match kind {
         TemporalLiteralKind::Date => "date",
-        TemporalLiteralKind::Time { zoned: false } => "time",
-        TemporalLiteralKind::Time { zoned: true } => "time with time zone",
-        TemporalLiteralKind::Timestamp { zoned: false } => "timestamp",
-        TemporalLiteralKind::Timestamp { zoned: true } => "timestamp with time zone",
+        TemporalLiteralKind::Time { zoned: false, .. } => "time",
+        TemporalLiteralKind::Time { zoned: true, .. } => "time with time zone",
+        TemporalLiteralKind::Timestamp { zoned: false, .. } => "timestamp",
+        TemporalLiteralKind::Timestamp { zoned: true, .. } => "timestamp with time zone",
     }
 }
 
@@ -218,10 +252,10 @@ fn type_name(kind: TemporalLiteralKind) -> &'static str {
 fn expected_shape(kind: TemporalLiteralKind) -> &'static str {
     match kind {
         TemporalLiteralKind::Date => "YYYY-MM-DD",
-        TemporalLiteralKind::Time { zoned: false } => "HH:MM:SS",
-        TemporalLiteralKind::Time { zoned: true } => "HH:MM:SS+HH:MM",
-        TemporalLiteralKind::Timestamp { zoned: false } => "YYYY-MM-DD HH:MM:SS",
-        TemporalLiteralKind::Timestamp { zoned: true } => "YYYY-MM-DD HH:MM:SS+HH:MM",
+        TemporalLiteralKind::Time { zoned: false, .. } => "HH:MM:SS",
+        TemporalLiteralKind::Time { zoned: true, .. } => "HH:MM:SS+HH:MM",
+        TemporalLiteralKind::Timestamp { zoned: false, .. } => "YYYY-MM-DD HH:MM:SS",
+        TemporalLiteralKind::Timestamp { zoned: true, .. } => "YYYY-MM-DD HH:MM:SS+HH:MM",
     }
 }
 

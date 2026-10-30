@@ -81,9 +81,14 @@ fn the_paired_epoch_difference_is_still_intercepted_whole() {
             "SELECT extract(epoch from (timestamp '2024-03-05 14:07:09.5' \
              - timestamp '2024-03-05 14:07:09'));"
         ),
-        "SELECT (unixepoch(CAST('2024-03-05 14:07:09.5' AS TEXT), 'subsec') \
-         - unixepoch(CAST('2024-03-05 14:07:09' AS TEXT), 'subsec'))"
+        "SELECT (unixepoch('2024-03-05 14:07:09.5', 'subsec') \
+         - unixepoch('2024-03-05 14:07:09', 'subsec'))"
     );
+    let answer: f64 = evaluate(
+        "SELECT extract(epoch from (timestamp '2024-03-05 14:07:09.5' \
+                 - timestamp '2024-03-05 14:07:09'));",
+    );
+    assert!((answer - 0.5).abs() < 1e-6, "got {answer}");
 }
 
 // ---------- to_timestamp ----------

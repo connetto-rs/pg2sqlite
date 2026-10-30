@@ -825,12 +825,6 @@ fn promote_date_to_midnight(date_expr: Expr) -> Expr {
     simple_function_expr("strftime", vec![string_literal("%Y-%m-%d 00:00:00"), date_expr], None)
 }
 
-/// True when `s` has second=60 (a leap second PostgreSQL normalises, SQLite
-/// cannot represent).
-fn has_leap_second(s: &str) -> bool {
-    s.split('.').next().unwrap_or(s).ends_with(":60")
-}
-
 /// Convert a PostgreSQL text-array path literal `{a,b}` to a SQLite JSON path
 /// `$."a"."b"`.
 ///
@@ -963,8 +957,8 @@ fn translate_distinct_comparison(
     } else {
         let tl = left.translate_with_warnings(schema, options, emit)?;
         let tr = right.translate_with_warnings(schema, options, emit)?;
-        let tl = convert_beside_column_expr(right, tl, schema, options)?;
-        let tr = convert_beside_column_expr(left, tr, schema, options)?;
+        let tl = convert_beside_column_expr(right, tl, left, schema, options)?;
+        let tr = convert_beside_column_expr(left, tr, right, schema, options)?;
         (tl, tr)
     };
     Ok(if is_not_distinct { null_safe_eq(l, r) } else { null_safe_neq(l, r) })
@@ -2180,6 +2174,7 @@ fn scalar_times_interval(expr: &Expr) -> Option<(&Expr, &Interval)> {
 fn convert_beside_column_expr(
     column_expr: &Expr,
     value: Expr,
+    source_value: &Expr,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
 ) -> Result<Expr, crate::errors::Error> {
@@ -2201,12 +2196,27 @@ fn convert_beside_column_expr(
         // narrowing the instant.
         Some(dt)
             if crate::impls::temporal_literals::temporal_literal_kind(&dt).is_some_and(
-                |kind| kind != crate::impls::temporal_literals::TemporalLiteralKind::TIMESTAMPTZ,
+                |kind| {
+                    !matches!(
+                        kind,
+                        crate::impls::temporal_literals::TemporalLiteralKind::Timestamp {
+                            zoned: true,
+                            ..
+                        },
+                    )
+                },
             ) && crate::impls::datetime_helpers::is_canonical_timestamptz_call(&value) =>
         {
             Ok(value)
         }
-        Some(dt) => convert_value_for_column_type(&dt, value, options),
+        Some(dt) => {
+            crate::impls::shared_helpers::temporal_precision_replay_refusal(
+                source_value,
+                &dt,
+                options,
+            )?;
+            convert_value_for_column_type(&dt, value, options)
+        }
         None => Ok(value),
     }
 }
@@ -2486,6 +2496,68 @@ fn shifted_datetime(target: Expr, modifiers: &[String]) -> Expr {
     trim_trailing_zeros(simple_function_expr("datetime", args, None))
 }
 
+/// The time of day `target` answers after `modifiers`, wrapped at midnight,
+/// with a `timetz` operand's offset kept in place. The zoned form reads
+/// `target` three times, so the caller refuses a non-replayable operand.
+fn shifted_time_of_day(target: Expr, modifiers: &[String], zoned: bool) -> Expr {
+    if !zoned {
+        return shifted_clock(target, modifiers);
+    }
+    // The offset is the trailing ±HH:MM, which the answer keeps as written.
+    let local = simple_function_expr(
+        "substr",
+        vec![
+            target.clone(),
+            integer_literal(1),
+            Expr::BinaryOp {
+                left: Box::new(simple_function_expr("length", vec![target.clone()], None)),
+                op: BinaryOperator::Minus,
+                right: Box::new(integer_literal(6)),
+            },
+        ],
+        None,
+    );
+    let clock = shifted_clock(local, modifiers);
+    let offset = simple_function_expr("substr", vec![target, integer_literal(-6)], None);
+    Expr::BinaryOp {
+        left: Box::new(clock),
+        op: BinaryOperator::StringConcat,
+        right: Box::new(offset),
+    }
+}
+
+/// The time part of a shifted time, trailing fractional zeros trimmed. SQLite
+/// reads a bare time as 2000-01-01, so the part after the date wraps at
+/// midnight.
+fn shifted_clock(local: Expr, modifiers: &[String]) -> Expr {
+    let mut args = vec![local];
+    args.extend(modifiers.iter().map(|modifier| string_literal(modifier)));
+    args.push(string_literal("subsec"));
+    let shifted = simple_function_expr("datetime", args, None);
+    // The date part is eleven characters, so the time of day starts at twelve.
+    trim_trailing_zeros(simple_function_expr("substr", vec![shifted, integer_literal(12)], None))
+}
+
+/// The shifted form of `left` for the temporal kind it resolves to, refusing
+/// a zoned operand the emitted form would read three times.
+fn shifted_interval_target(
+    left: &Expr,
+    modifiers: &[String],
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Expr, crate::errors::Error> {
+    let kind = temporal_kind_of(left, schema, options);
+    if matches!(kind, Some(TemporalKind::Time { zoned: true })) && !is_replayable(left, options) {
+        return Err(reject_duplicated_operand("a TIMETZ operand shifted by an interval", left));
+    }
+    let target = left.translate_with_warnings(schema, options, emit)?;
+    match kind {
+        Some(TemporalKind::Time { zoned }) => Ok(shifted_time_of_day(target, modifiers, zoned)),
+        _ => Ok(shifted_datetime(target, modifiers)),
+    }
+}
+
 /// Translate a binary operation expression.
 #[allow(clippy::too_many_lines)]
 fn translate_binary_op(
@@ -2662,13 +2734,13 @@ fn translate_binary_op(
             let tr = right.translate_with_warnings(schema, options, emit)?;
             return Ok(Expr::BinaryOp {
                 left: Box::new(if right_is_col {
-                    convert_beside_column_expr(right, tl, schema, options)?
+                    convert_beside_column_expr(right, tl, left, schema, options)?
                 } else {
                     tl
                 }),
                 op: op.clone(),
                 right: Box::new(if left_is_col {
-                    convert_beside_column_expr(left, tr, schema, options)?
+                    convert_beside_column_expr(left, tr, right, schema, options)?
                 } else {
                     tr
                 }),
@@ -3210,8 +3282,9 @@ fn translate_binary_op(
                 Some(n) => {
                     match interval_date_modifiers_scaled(interval, negating, n)? {
                         Some(modifiers) => {
-                            let target = left.translate_with_warnings(schema, options, emit)?;
-                            return Ok(shifted_datetime(target, &modifiers));
+                            return shifted_interval_target(
+                                left, &modifiers, schema, options, emit,
+                            );
                         }
                         None => {
                             return Err(crate::errors::Error::forward_refusal(format!(
@@ -3234,8 +3307,7 @@ fn translate_binary_op(
         if let Some(interval) = extract_interval_expr(right) {
             match interval_date_modifiers(interval, negating)? {
                 Some(modifiers) => {
-                    let target = left.translate_with_warnings(schema, options, emit)?;
-                    return Ok(shifted_datetime(target, &modifiers));
+                    return shifted_interval_target(left, &modifiers, schema, options, emit);
                 }
                 None => {
                     // The notation was not decoded (HH:MM:SS, ISO P-form,
@@ -3413,7 +3485,9 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                                 .map(|item| {
                                     let v = scale_or_translate(item, scale, schema, options, emit)?;
                                     if scale.is_none() {
-                                        convert_beside_column_expr(operand, v, schema, options)
+                                        convert_beside_column_expr(
+                                            operand, v, item, schema, options,
+                                        )
                                     } else {
                                         Ok(v)
                                     }
@@ -3432,8 +3506,8 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                     let high_v = scale_or_translate(high, scale, schema, options, emit)?;
                     let (low_v, high_v) = if scale.is_none() {
                         (
-                            convert_beside_column_expr(operand, low_v, schema, options)?,
-                            convert_beside_column_expr(operand, high_v, schema, options)?,
+                            convert_beside_column_expr(operand, low_v, low, schema, options)?,
+                            convert_beside_column_expr(operand, high_v, high, schema, options)?,
                         )
                     } else {
                         (low_v, high_v)
@@ -3589,21 +3663,6 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                     if let Some(info) = exact_numeric_info(data_type) {
                         return translate_numeric_cast(expr, info, schema, options, emit);
                     }
-                    // Leap second (second=60): PostgreSQL normalises to
-                    // 24:00:00, SQLite cannot represent it.
-                    if matches!(data_type, DataType::Time(..))
-                        && let Expr::Value(ValueWithSpan {
-                            value: Value::SingleQuotedString(s),
-                            ..
-                        }) = expr.as_ref()
-                        && has_leap_second(s)
-                    {
-                        return Err(crate::errors::Error::forward_refusal(format!(
-                            "TIME literal '{s}' has second=60, which PostgreSQL normalises to \
-                             24:00:00 but SQLite cannot represent. Normalise to '00:00:00' \
-                             before inserting, or store the boundary as midnight '00:00:00'."
-                        )));
-                    }
                     // CAST(date AS TIMESTAMP): add midnight so stored text
                     // matches TIMESTAMP format for comparisons.
                     if matches!(
@@ -3621,6 +3680,9 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                     if let Some(kind) =
                         crate::impls::temporal_literals::temporal_literal_kind(data_type)
                     {
+                        crate::impls::shared_helpers::temporal_precision_replay_refusal(
+                            expr, data_type, options,
+                        )?;
                         let source =
                             crate::impls::timezone::timestamp_awareness(expr, schema, options)
                                 .ok()
@@ -3854,30 +3916,15 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
             }
             Expr::TypedString(typed_string) => {
                 rebuild(|| -> Result<Expr, crate::errors::Error> {
-                    if matches!(typed_string.data_type, DataType::Time(..))
-                        && let Value::SingleQuotedString(s) = &typed_string.value.value
-                        && has_leap_second(s)
-                    {
-                        return Err(crate::errors::Error::forward_refusal(format!(
-                            "TIME literal '{s}' has second=60, which PostgreSQL normalises to \
-                             24:00:00 but SQLite cannot represent. Normalise to '00:00:00' \
-                             before inserting, or store the boundary as midnight '00:00:00'."
-                        )));
-                    }
-                    if matches!(
-                        typed_string.data_type,
-                        DataType::Timestamp(_, TimezoneInfo::Tz | TimezoneInfo::WithTimeZone)
-                    ) && let Value::SingleQuotedString(s) = &typed_string.value.value
-                    {
-                        let canonical =
-                            crate::impls::temporal_literals::normalize_temporal_literal(
-                                crate::impls::temporal_literals::TemporalLiteralKind::TIMESTAMPTZ,
-                                s,
-                            )?;
-                        return Ok(Expr::Value(ValueWithSpan {
-                            value: Value::SingleQuotedString(canonical),
-                            span: typed_string.value.span,
-                        }));
+                    // A literal of a named temporal type is the type's own
+                    // value, so it takes the column-write normalisation.
+                    if let Some(kind) = crate::impls::temporal_literals::temporal_literal_kind(
+                        &typed_string.data_type,
+                    ) {
+                        return crate::impls::shared_helpers::normalize_temporal_literal_expr(
+                            kind,
+                            Expr::Value(typed_string.value.clone()),
+                        );
                     }
                     Ok(Expr::Cast {
                         expr: Box::new(Expr::Value(typed_string.value.clone())),

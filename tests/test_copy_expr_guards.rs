@@ -1,4 +1,4 @@
-//! Refusal guards for expression lowerings that copy an operand (C7–C12).
+//! Refusal guards for expression lowerings that copy an operand (C7–C13).
 //!
 //! Several lowerings write one operand into multiple output positions, so a
 //! volatile operand is evaluated more often than PostgreSQL evaluates it and
@@ -289,4 +289,31 @@ fn cube_root_op_stable_operand_translates_without_error() {
         .unwrap()
         .translate_to_sql(&Pg2SqliteOptions::default().with_math_functions_available())
         .expect("stable operand should translate");
+}
+
+// ── C13: TIMETZ ± interval over a volatile timetz operand ──────────────────
+
+/// The zoned shift reads a volatile operand three times, so it is refused.
+#[test]
+fn timetz_interval_volatile_operand_is_refused() {
+    let err = Pg2Sqlite::default()
+        .sql(
+            "CREATE TABLE t (id INT PRIMARY KEY); \
+             SELECT c()::TIMETZ + interval '1 hour' FROM t;",
+        )
+        .unwrap()
+        .translate_to_sql(&Pg2SqliteOptions::default())
+        .expect_err("volatile TIMETZ operand should be refused");
+    let msg = err.to_string();
+    assert!(msg.contains("TIMETZ"), "error names construct: {msg}");
+}
+
+/// A stable operand takes the zoned shift and keeps its offset.
+#[test]
+fn timetz_interval_stable_operand_executes_correctly() {
+    let rows = run_translated_with(
+        "SELECT CAST('03:04:05.5+02' AS TIMETZ) + interval '1 hour';",
+        &Pg2SqliteOptions::default(),
+    );
+    assert_eq!(rows, vec![Some("04:04:05.5+02:00".to_string())]);
 }

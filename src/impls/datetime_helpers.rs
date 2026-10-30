@@ -16,7 +16,10 @@ use sqlparser::ast::{
     FunctionArguments,
 };
 
-use super::function_helpers::{integer_literal, simple_function_expr, string_literal};
+use super::{
+    expr_helpers::{case_when, concat},
+    function_helpers::{integer_literal, simple_function_expr, string_literal},
+};
 use crate::errors::Error;
 
 /// Canonical date/time part keys used for shared mappings.
@@ -568,4 +571,443 @@ pub(crate) fn build_date_trunc_year_span_call(value_expr: Expr, span: i64, offse
         )],
         None,
     )
+}
+
+/// `CAST(expr AS INTEGER)`.
+fn integer_cast(expr: Expr) -> Expr {
+    Expr::Cast {
+        kind: CastKind::Cast,
+        expr: Box::new(expr),
+        data_type: DataType::Integer(None),
+        format: None,
+    }
+}
+
+/// `strftime('%s', value) * 1000000` plus the fractional digits of `value`.
+fn fractional_second_total(value: Expr) -> Expr {
+    let seconds = strftime_number("%s", value.clone());
+    let digits = simple_function_expr(
+        "substr",
+        vec![
+            Expr::Nested(Box::new(concat(
+                simple_function_expr(
+                    "substr",
+                    vec![value, integer_literal(21), integer_literal(6)],
+                    None,
+                ),
+                string_literal("000000"),
+            ))),
+            integer_literal(1),
+            integer_literal(6),
+        ],
+        None,
+    );
+    binary(
+        binary(seconds, BinaryOperator::Multiply, integer_literal(1_000_000)),
+        BinaryOperator::Plus,
+        integer_cast(digits),
+    )
+}
+
+/// `total` microseconds rounded half away from zero to a multiple of `divisor`.
+fn round_micros(total: Expr, divisor: i64) -> Expr {
+    let half = divisor / 2;
+    let shifted = |total: Expr, op: BinaryOperator| {
+        binary(
+            binary(
+                Expr::Nested(Box::new(binary(total, op, integer_literal(half)))),
+                BinaryOperator::Divide,
+                integer_literal(divisor),
+            ),
+            BinaryOperator::Multiply,
+            integer_literal(divisor),
+        )
+    };
+    Expr::Nested(Box::new(case_when(
+        binary(total.clone(), BinaryOperator::GtEq, integer_literal(0)),
+        shifted(total.clone(), BinaryOperator::Plus),
+        Some(shifted(total, BinaryOperator::Minus)),
+    )))
+}
+
+/// The fraction of `micros` printed the way PostgreSQL prints it, empty for a
+/// whole second.
+fn fraction_text(micros: Expr) -> Expr {
+    case_when(
+        binary(micros.clone(), BinaryOperator::Eq, integer_literal(0)),
+        string_literal(""),
+        Some(concat(
+            string_literal("."),
+            simple_function_expr(
+                "rtrim",
+                vec![
+                    simple_function_expr("printf", vec![string_literal("%06d"), micros], None),
+                    string_literal("0"),
+                ],
+                None,
+            ),
+        )),
+    )
+}
+
+/// The hours, minutes and seconds of `seconds_of_day` as `HH:MM:SS`.
+fn time_of_day_call(seconds_of_day: Expr) -> Expr {
+    simple_function_expr(
+        "printf",
+        vec![
+            string_literal("%02d:%02d:%02d"),
+            binary(
+                Expr::Nested(Box::new(seconds_of_day.clone())),
+                BinaryOperator::Divide,
+                integer_literal(3600),
+            ),
+            binary(
+                Expr::Nested(Box::new(binary(
+                    Expr::Nested(Box::new(seconds_of_day.clone())),
+                    BinaryOperator::Divide,
+                    integer_literal(60),
+                ))),
+                BinaryOperator::Modulo,
+                integer_literal(60),
+            ),
+            binary(
+                Expr::Nested(Box::new(seconds_of_day)),
+                BinaryOperator::Modulo,
+                integer_literal(60),
+            ),
+        ],
+        None,
+    )
+}
+
+/// `value` rounded to the typmod precision when it is the text of a naive
+/// timestamp or a canonical `timestamptz` carrying a fraction, unchanged
+/// otherwise, `fallback` answering the otherwise case.
+#[must_use]
+pub(crate) fn round_naive_timestamp(value: &Expr, precision: u32, fallback: Expr) -> Expr {
+    let divisor = 10_i64.pow(6 - precision.min(5));
+    let total = fractional_second_total(value.clone());
+    let rounded = round_micros(total, divisor);
+    let fraction = binary(rounded.clone(), BinaryOperator::Modulo, integer_literal(1_000_000));
+    let seconds = binary(
+        Expr::Nested(Box::new(binary(rounded, BinaryOperator::Minus, fraction.clone()))),
+        BinaryOperator::Divide,
+        integer_literal(1_000_000),
+    );
+    let whole = simple_function_expr(
+        "strftime",
+        vec![string_literal("%Y-%m-%d %H:%M:%S"), seconds, string_literal("unixepoch")],
+        None,
+    );
+    let guard = binary(
+        simple_function_expr(
+            "substr",
+            vec![value.clone(), integer_literal(20), integer_literal(1)],
+            None,
+        ),
+        BinaryOperator::Eq,
+        string_literal("."),
+    );
+    case_when(guard, concat(whole, fraction_text(fraction)), Some(fallback))
+}
+
+/// `value` rounded to the typmod precision when it is canonical
+/// `timestamptz` text carrying a fraction, unchanged otherwise, keeping the
+/// six fractional digits and the `+00:00` offset.
+#[must_use]
+pub(crate) fn round_timestamptz(value: Expr, precision: u32) -> Expr {
+    let divisor = 10_i64.pow(6 - precision.min(5));
+    let seconds = strftime_number("%s", value.clone());
+    let fraction = integer_cast(simple_function_expr(
+        "substr",
+        vec![value.clone(), integer_literal(21), integer_literal(6)],
+        None,
+    ));
+    let total = binary(
+        binary(seconds, BinaryOperator::Multiply, integer_literal(1_000_000)),
+        BinaryOperator::Plus,
+        fraction,
+    );
+    let rounded = round_micros(total, divisor);
+    let fraction = binary(
+        binary(
+            Expr::Nested(Box::new(binary(
+                rounded.clone(),
+                BinaryOperator::Modulo,
+                integer_literal(1_000_000),
+            ))),
+            BinaryOperator::Plus,
+            integer_literal(1_000_000),
+        ),
+        BinaryOperator::Modulo,
+        integer_literal(1_000_000),
+    );
+    let seconds = binary(
+        Expr::Nested(Box::new(binary(rounded, BinaryOperator::Minus, fraction.clone()))),
+        BinaryOperator::Divide,
+        integer_literal(1_000_000),
+    );
+    let whole = simple_function_expr(
+        "strftime",
+        vec![string_literal("%Y-%m-%d %H:%M:%S"), seconds, string_literal("unixepoch")],
+        None,
+    );
+    let length = simple_function_expr("length", vec![value.clone()], None);
+    let offset = simple_function_expr(
+        "substr",
+        vec![
+            value.clone(),
+            binary(
+                Expr::Nested(Box::new(length.clone())),
+                BinaryOperator::Minus,
+                integer_literal(5),
+            ),
+            integer_literal(6),
+        ],
+        None,
+    );
+    let guard = binary(
+        binary(length, BinaryOperator::Eq, integer_literal(32)),
+        BinaryOperator::And,
+        binary(
+            simple_function_expr(
+                "substr",
+                vec![value.clone(), integer_literal(20), integer_literal(1)],
+                None,
+            ),
+            BinaryOperator::Eq,
+            string_literal("."),
+        ),
+    );
+    case_when(
+        guard,
+        concat(
+            concat(whole, string_literal(".")),
+            concat(
+                simple_function_expr("printf", vec![string_literal("%06d"), fraction], None),
+                offset,
+            ),
+        ),
+        Some(value),
+    )
+}
+
+/// The seconds of the day that the `HH:MM:SS` text of `value` names, as an
+/// integer.
+fn clock_seconds_of_day(value: &Expr) -> Expr {
+    let hours = integer_cast(simple_function_expr(
+        "substr",
+        vec![value.clone(), integer_literal(1), integer_literal(2)],
+        None,
+    ));
+    let minutes = integer_cast(simple_function_expr(
+        "substr",
+        vec![value.clone(), integer_literal(4), integer_literal(2)],
+        None,
+    ));
+    let seconds = integer_cast(simple_function_expr(
+        "substr",
+        vec![value.clone(), integer_literal(7), integer_literal(2)],
+        None,
+    ));
+    binary(
+        binary(
+            binary(hours, BinaryOperator::Multiply, integer_literal(3600)),
+            BinaryOperator::Plus,
+            binary(minutes, BinaryOperator::Multiply, integer_literal(60)),
+        ),
+        BinaryOperator::Plus,
+        seconds,
+    )
+}
+
+/// The fraction of `value` read from `start` for `len` digits, padded to six
+/// digits.
+fn padded_fraction_digits(value: &Expr, start: Expr, len: Expr) -> Expr {
+    simple_function_expr(
+        "substr",
+        vec![
+            Expr::Nested(Box::new(concat(
+                simple_function_expr("substr", vec![value.clone(), start, len], None),
+                string_literal("000000"),
+            ))),
+            integer_literal(1),
+            integer_literal(6),
+        ],
+        None,
+    )
+}
+
+/// The sign of the trailing offset in the text of `value`.
+fn offset_sign(value: &Expr) -> Expr {
+    simple_function_expr(
+        "substr",
+        vec![
+            value.clone(),
+            binary(
+                Expr::Nested(Box::new(simple_function_expr("length", vec![value.clone()], None))),
+                BinaryOperator::Minus,
+                integer_literal(5),
+            ),
+            integer_literal(1),
+        ],
+        None,
+    )
+}
+
+/// `value` rounded to the typmod precision when it is the text of a `time`
+/// carrying a fraction, unchanged otherwise, `fallback` answering the
+/// otherwise case.
+#[must_use]
+pub(crate) fn round_time(value: &Expr, precision: u32, fallback: Expr) -> Expr {
+    let divisor = 10_i64.pow(6 - precision.min(5));
+    let day_seconds = clock_seconds_of_day(value);
+    let digits = padded_fraction_digits(value, integer_literal(10), integer_literal(6));
+    let rounded = round_micros(integer_cast(digits), divisor);
+    let carry = binary(rounded.clone(), BinaryOperator::Divide, integer_literal(1_000_000));
+    let fraction = binary(rounded, BinaryOperator::Modulo, integer_literal(1_000_000));
+    let seconds_of_day = binary(Expr::Nested(Box::new(day_seconds)), BinaryOperator::Plus, carry);
+    let length = simple_function_expr("length", vec![value.clone()], None);
+    let tenth = simple_function_expr(
+        "substr",
+        vec![value.clone(), integer_literal(10), integer_literal(1)],
+        None,
+    );
+    let guard = binary(
+        binary(
+            binary(
+                binary(length.clone(), BinaryOperator::GtEq, integer_literal(9)),
+                BinaryOperator::And,
+                binary(length, BinaryOperator::LtEq, integer_literal(15)),
+            ),
+            BinaryOperator::And,
+            binary(
+                binary(
+                    simple_function_expr(
+                        "substr",
+                        vec![value.clone(), integer_literal(3), integer_literal(1)],
+                        None,
+                    ),
+                    BinaryOperator::Eq,
+                    string_literal(":"),
+                ),
+                BinaryOperator::And,
+                binary(
+                    simple_function_expr(
+                        "substr",
+                        vec![value.clone(), integer_literal(6), integer_literal(1)],
+                        None,
+                    ),
+                    BinaryOperator::Eq,
+                    string_literal(":"),
+                ),
+            ),
+        ),
+        BinaryOperator::And,
+        binary(
+            binary(tenth.clone(), BinaryOperator::NotEq, string_literal("+")),
+            BinaryOperator::And,
+            binary(tenth, BinaryOperator::NotEq, string_literal("-")),
+        ),
+    );
+    case_when(
+        guard,
+        concat(time_of_day_call(seconds_of_day), fraction_text(fraction)),
+        Some(fallback),
+    )
+}
+
+/// True when `value` is the text of a `time with time zone` carrying a
+/// fraction, the sign sitting at the start of its trailing offset.
+fn timetz_guard(value: &Expr) -> Expr {
+    let length = simple_function_expr("length", vec![value.clone()], None);
+    let sign = offset_sign(value);
+    binary(
+        binary(length, BinaryOperator::Gt, integer_literal(14)),
+        BinaryOperator::And,
+        Expr::Nested(Box::new(binary(
+            binary(sign.clone(), BinaryOperator::Eq, string_literal("+")),
+            BinaryOperator::Or,
+            binary(sign, BinaryOperator::Eq, string_literal("-")),
+        ))),
+    )
+}
+
+/// `value` rounded to the typmod precision, the offset kept as written, so a
+/// fraction that rounds up into the next second or day carries.
+fn timetz_rounded(value: &Expr, precision: u32) -> Expr {
+    let divisor = 10_i64.pow(6 - precision.min(5));
+    let day_seconds = clock_seconds_of_day(value);
+    let length = simple_function_expr("length", vec![value.clone()], None);
+    let digits = padded_fraction_digits(
+        value,
+        integer_literal(10),
+        binary(Expr::Nested(Box::new(length.clone())), BinaryOperator::Minus, integer_literal(15)),
+    );
+    let rounded = round_micros(integer_cast(digits), divisor);
+    let carry = binary(rounded.clone(), BinaryOperator::Divide, integer_literal(1_000_000));
+    let fraction = binary(rounded, BinaryOperator::Modulo, integer_literal(1_000_000));
+    let seconds_of_day = binary(Expr::Nested(Box::new(day_seconds)), BinaryOperator::Plus, carry);
+    let offset = simple_function_expr(
+        "substr",
+        vec![
+            value.clone(),
+            binary(Expr::Nested(Box::new(length)), BinaryOperator::Minus, integer_literal(5)),
+            integer_literal(6),
+        ],
+        None,
+    );
+    concat(concat(time_of_day_call(seconds_of_day), fraction_text(fraction)), offset)
+}
+
+/// `value` rounded to the typmod precision when it is the text of a
+/// `time with time zone` carrying a fraction, unchanged otherwise,
+/// `fallback` answering the otherwise case, and the offset kept as written.
+#[must_use]
+pub(crate) fn round_timetz(value: &Expr, precision: u32, fallback: Expr) -> Expr {
+    case_when(timetz_guard(value), timetz_rounded(value, precision), Some(fallback))
+}
+
+/// The time of day of an `instant`, rounded to the typmod precision when the
+/// instant is canonical `timestamptz` text carrying a fraction, a
+/// `time with time zone` keeping its own offset with only the fraction
+/// rounded, and anything else in the column's existing form of the instant.
+#[must_use]
+pub(crate) fn round_time_of_instant(instant: Expr, precision: u32, zoned: bool) -> Expr {
+    let guard = binary(
+        binary(
+            simple_function_expr("length", vec![instant.clone()], None),
+            BinaryOperator::Eq,
+            integer_literal(32),
+        ),
+        BinaryOperator::And,
+        binary(
+            simple_function_expr(
+                "substr",
+                vec![instant.clone(), integer_literal(20), integer_literal(1)],
+                None,
+            ),
+            BinaryOperator::Eq,
+            string_literal("."),
+        ),
+    );
+    let rounded = round_naive_timestamp(
+        &instant,
+        precision,
+        simple_function_expr("datetime", vec![instant.clone()], None),
+    );
+    let time_part = simple_function_expr("substr", vec![rounded, integer_literal(12)], None);
+    let then = if zoned { concat(time_part, string_literal("+00:00")) } else { time_part };
+    let fallback = if zoned {
+        // A canonical instant is extracted above, a `time with time zone`
+        // keeps its offset, and the rest is normalized to UTC.
+        case_when(
+            timetz_guard(&instant),
+            timetz_rounded(&instant, precision),
+            Some(build_strftime_call("%H:%M:%S+00:00", instant.clone())),
+        )
+    } else {
+        simple_function_expr("time", vec![instant], None)
+    };
+    case_when(guard, then, Some(fallback))
 }

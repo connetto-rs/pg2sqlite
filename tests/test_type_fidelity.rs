@@ -1306,6 +1306,129 @@ fn the_end_of_day_hour_rolls_the_month_and_the_year_over() {
     );
 }
 
+// ── Typed temporal literals TYPE 'value' ───────────────────────────────────
+//
+// Each answers the text a column of that type holds, measured against
+// PostgreSQL 18.6 under SET TIME ZONE 'UTC'. A time with time zone offset is
+// rendered +HH:MM, the form SQLite's date functions read.
+
+#[test]
+fn a_typed_temporal_literal_prints_like_a_column_value() {
+    for (typed, printed) in [
+        ("date '2024-3-5'", "2024-03-05"),
+        ("time '03:04:05.500'", "03:04:05.5"),
+        ("time '03:04'", "03:04:00"),
+        ("time with time zone '3:4+2'", "03:04:00+02:00"),
+        ("time with time zone '03:04:05.500+02'", "03:04:05.5+02:00"),
+        ("time with time zone '03:04:05Z'", "03:04:05+00:00"),
+        ("timestamp '2024-1-2 3:4'", "2024-01-02 03:04:00"),
+        ("timestamp '2024-01-02T03:04:05'", "2024-01-02 03:04:05"),
+        ("timestamp '2024-01-02'", "2024-01-02 00:00:00"),
+        ("timestamp with time zone '2024-01-02T03:04:05+02'", "2024-01-02 01:04:05.000000+00:00"),
+    ] {
+        let rows = query_rows(&format!("SELECT {typed};"), &default_opts());
+        assert_eq!(rows, vec![Some(printed.to_string())], "{typed}");
+    }
+}
+
+#[test]
+fn a_typed_literal_fraction_rounds_and_carries_like_a_column_write() {
+    for (typed, printed) in [
+        ("time '03:04:05.9999999'", "03:04:06"),
+        ("timestamp '2024-12-31 23:59:59.9999999'", "2025-01-01 00:00:00"),
+        ("timestamp '2024-01-02 24:00:00'", "2024-01-03 00:00:00"),
+    ] {
+        let rows = query_rows(&format!("SELECT {typed};"), &default_opts());
+        assert_eq!(rows, vec![Some(printed.to_string())], "{typed}");
+    }
+}
+
+#[test]
+fn typed_literals_are_stored_and_updated_like_column_writes() {
+    let rows = query_rows(
+        "CREATE TABLE t (id int primary key, ts timestamp, d date, tm time with time zone);
+         INSERT INTO t VALUES (1, TIMESTAMP '2024-01-02 03:04:05.500', DATE '2024-3-5', TIMETZ '3:4+2');
+         UPDATE t SET ts = TIMESTAMP '2024-1-2 3:4' WHERE id = 1;
+         SELECT ts || ' ' || d || ' ' || tm FROM t;",
+        &default_opts(),
+    );
+    assert_eq!(rows, vec![Some("2024-01-02 03:04:00 2024-03-05 03:04:00+02:00".to_string())]);
+}
+
+#[test]
+fn a_typed_literal_default_prints_like_a_column_value() {
+    let rows = query_rows(
+        "CREATE TABLE t (id int primary key, d date DEFAULT DATE '2024-3-5');
+         INSERT INTO t (id) VALUES (1);
+         SELECT d FROM t;",
+        &default_opts(),
+    );
+    assert_eq!(rows, vec![Some("2024-03-05".to_string())]);
+}
+
+#[test]
+fn a_typed_literal_in_a_comparison_matches_the_stored_spelling() {
+    let rows = query_rows(
+        "CREATE TABLE t (id int primary key, ts timestamp, d date);
+         INSERT INTO t VALUES (1, '2024-01-02 03:04:05.5', '2024-03-05');
+         SELECT count(*) FROM t
+         WHERE ts = TIMESTAMP '2024-01-02 03:04:05.500'
+           AND d = DATE '2024-3-5';",
+        &default_opts(),
+    );
+    assert_eq!(rows, vec![Some("1".to_string())]);
+}
+
+#[test]
+fn typed_literal_spellings_collide_in_a_unique_column() {
+    // PostgreSQL answers duplicate key value violates unique constraint.
+    for (column, first, second) in [
+        ("timestamp", "'2024-01-02 03:04:05.5'", "TIMESTAMP '2024-01-02 03:04:05.500'"),
+        ("date", "'2024-3-5'", "DATE '2024-03-5'"),
+        ("time with time zone", "'03:04:06+02'", "TIMETZ '03:04:06.000+02'"),
+    ] {
+        let stmts = Pg2Sqlite::default()
+            .sql(&format!(
+                "CREATE TABLE t (v {column} UNIQUE);
+                 INSERT INTO t (v) VALUES ({first});
+                 INSERT INTO t (v) VALUES ({second});"
+            ))
+            .expect("parse")
+            .translate_to_sql(&default_opts())
+            .expect("translate")
+            .into_vec();
+        let (last, setup) = stmts.split_last().expect("statements");
+        let conn = Connection::open_in_memory().unwrap();
+        for s in setup {
+            conn.execute_batch(&format!("{s};")).unwrap_or_else(|e| panic!("{e}\n{s}"));
+        }
+        let err = conn
+            .execute_batch(&format!("{last};"))
+            .expect_err(&format!("{column} {second} duplicates {first}"));
+        assert!(err.to_string().contains("UNIQUE"), "{err}");
+    }
+}
+
+#[test]
+fn an_invalid_typed_temporal_literal_is_refused() {
+    for typed in [
+        "date '2024-13-01'",
+        "time '25:00:00'",
+        "timestamp '2024-02-30 00:00:00'",
+        "time with time zone '03:04:05+99'",
+        "timestamptz '2024-13-01 00:00:00'",
+    ] {
+        expect_refusal(&format!("SELECT {typed};"), &default_opts(), "out of range");
+    }
+}
+
+#[test]
+fn a_non_temporal_typed_string_keeps_its_cast() {
+    // TEXT has no temporal kind, so the cast path is the one it takes.
+    let rows = query_rows("SELECT TEXT 'hello';", &default_opts());
+    assert_eq!(rows, vec![Some("hello".to_string())]);
+}
+
 /// Refuses a literal written into a column of interval type `column`,
 /// returning the message.
 fn interval_refusal(column: &str, literal: &str) -> String {
