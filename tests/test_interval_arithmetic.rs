@@ -217,6 +217,40 @@ fn a_range_postgresql_lacks_is_refused() {
     assert!(error.contains("qualifier PostgreSQL does not accept"), "{error}");
 }
 
+/// SQLite's date functions answer NULL outside the years 1 to 9999, where
+/// PostgreSQL answers a value, so arithmetic whose operands are all literals
+/// and whose result leaves that range is refused rather than emitted.
+#[test]
+fn literal_arithmetic_leaving_the_four_digit_years_is_refused() {
+    for expression in [
+        "timestamp '9999-12-31' + interval '1 day'",
+        "timestamp '9000-01-01' + interval '2000 years'",
+        "timestamp '9999-12-31 23:59:59.5' + interval '0.5 seconds'",
+        "timestamp '9999-06-01' + 2 * interval '6 months'",
+        "timestamp '0001-01-01' - interval '1 day'",
+        "date '9999-12-31' + 1",
+        "date '0001-01-01' - 1",
+    ] {
+        let error = refusal(expression);
+        assert!(error.contains("years 1 to 9999"), "{expression}: {error}");
+    }
+}
+
+#[test]
+fn literal_arithmetic_inside_the_four_digit_years_is_kept() {
+    assert_eq!(shift("timestamp '9999-12-30' + interval '1 day'"), "9999-12-31 00:00:00");
+    assert_eq!(shift("timestamp '0001-01-02' - interval '1 day'"), "0001-01-01 00:00:00");
+    assert_eq!(shift("date '9999-12-30' + 1"), "9999-12-31");
+}
+
+/// Each step is emitted on its own, so a literal step that leaves the range is
+/// refused even when a later step would bring PostgreSQL's answer back inside.
+#[test]
+fn a_literal_step_leaving_the_range_is_refused_before_a_later_step() {
+    let error = refusal("timestamp '9999-06-01' + interval '12 months' - interval '1 year'");
+    assert!(error.contains("years 1 to 9999"), "{error}");
+}
+
 #[test]
 fn the_range_spelling_is_read() {
     assert_eq!(

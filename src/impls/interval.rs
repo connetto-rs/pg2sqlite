@@ -27,32 +27,66 @@ const MICROS_PER_HOUR: i64 = 3_600_000_000;
 const MICROS_PER_MINUTE: i64 = 60_000_000;
 const MICROS_PER_SECOND: i64 = 1_000_000;
 
-/// The SQLite date modifiers for `interval`, negated for subtraction.
+/// An interval operand of `timestamp ± interval`, scaled and negated.
+pub(crate) struct IntervalShift(Interval);
+
+impl IntervalShift {
+    /// The SQLite date modifiers, in PostgreSQL's order of operations.
+    pub(crate) fn modifiers(&self) -> Vec<String> {
+        let interval = &self.0;
+        let mut modifiers = Vec::new();
+        if interval.months != 0 {
+            modifiers.push(signed(i64::from(interval.months), "months"));
+            // The days below land on the clamped date, so the clamp sits here.
+            modifiers.push("floor".into());
+        }
+        if interval.days != 0 {
+            modifiers.push(signed(i64::from(interval.days), "days"));
+        }
+        if interval.micros != 0 {
+            modifiers.push(time_modifier(interval.micros));
+        }
+        modifiers
+    }
+
+    /// The year a date or timestamp literal in the replica's stored text
+    /// lands in after this shift.
+    pub(crate) fn year_after(&self, literal: &str) -> Option<i64> {
+        crate::impls::temporal_literals::year_after_shift(
+            literal,
+            i64::from(self.0.months),
+            i64::from(self.0.days),
+            self.0.micros,
+        )
+    }
+}
+
+/// The shift `interval` applies, negated for subtraction.
 ///
 /// `Ok(None)` means the interval's value is not a string literal, so the
 /// caller falls through to the standalone-INTERVAL refusal.
-pub(crate) fn interval_date_modifiers(
+pub(crate) fn interval_shift(
     interval: &sqlparser::ast::Interval,
     negate: bool,
-) -> Result<Option<Vec<String>>, Error> {
-    date_modifiers(interval, negate, None)
+) -> Result<Option<IntervalShift>, Error> {
+    shift(interval, negate, None)
 }
 
-/// The SQLite date modifiers for `factor * interval`, negated for
-/// subtraction, multiplied the way PostgreSQL's `interval_mul` multiplies.
-pub(crate) fn interval_date_modifiers_scaled(
+/// The shift `factor * interval` applies, negated for subtraction,
+/// multiplied the way PostgreSQL's `interval_mul` multiplies.
+pub(crate) fn interval_shift_scaled(
     interval: &sqlparser::ast::Interval,
     negate: bool,
     factor: i64,
-) -> Result<Option<Vec<String>>, Error> {
-    date_modifiers(interval, negate, Some(factor))
+) -> Result<Option<IntervalShift>, Error> {
+    shift(interval, negate, Some(factor))
 }
 
-fn date_modifiers(
+fn shift(
     interval: &sqlparser::ast::Interval,
     negate: bool,
     factor: Option<i64>,
-) -> Result<Option<Vec<String>>, Error> {
+) -> Result<Option<IntervalShift>, Error> {
     let Some(text) = single_quoted_literal(interval.value.as_ref()) else { return Ok(None) };
     let mut value = finite_interval(text, qualifier_typmod(interval)?)?;
     if let Some(factor) = factor {
@@ -61,24 +95,7 @@ fn date_modifiers(
     if negate {
         value = value.negated().map_err(|refusal| refused(text, refusal))?;
     }
-    Ok(Some(modifiers(&value)))
-}
-
-/// The modifiers, in PostgreSQL's order of operations.
-fn modifiers(interval: &Interval) -> Vec<String> {
-    let mut modifiers = Vec::new();
-    if interval.months != 0 {
-        modifiers.push(signed(i64::from(interval.months), "months"));
-        // The days below land on the clamped date, so the clamp sits here.
-        modifiers.push("floor".into());
-    }
-    if interval.days != 0 {
-        modifiers.push(signed(i64::from(interval.days), "days"));
-    }
-    if interval.micros != 0 {
-        modifiers.push(time_modifier(interval.micros));
-    }
-    modifiers
+    Ok(Some(IntervalShift(value)))
 }
 
 /// `+3 days`, `-1 months`.
