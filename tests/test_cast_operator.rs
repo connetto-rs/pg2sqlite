@@ -85,7 +85,7 @@ fn cast_output_runs_in_sqlite() {
 fn vector_cast_still_lowers_to_vec_f32() {
     // Regression: the pgvector special-case returns before the generic cast
     // arm, so forcing CastKind::Cast must not disturb it.
-    let out = tr("SELECT '[1,2,3]'::vector FROM t");
+    let out = tr("CREATE EXTENSION vector; SELECT '[1,2,3]'::vector FROM t");
     assert!(out.contains("vec_f32"), "{out}");
     assert!(!out.contains("::"), "{out}");
     sqlite_syntax_check(&out);

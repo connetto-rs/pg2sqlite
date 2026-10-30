@@ -374,7 +374,7 @@ DataType::Uuid => {
         }
     }
 }
-DataType::Custom(name, ..) => translate_custom_type(name),
+DataType::Custom(name, ..) => translate_custom_type(self, name, schema),
 unsupported => {
     Err(crate::errors::Error::forward_refusal(format!(
         "The data type {unsupported:?} is not supported"
@@ -435,24 +435,35 @@ pub(crate) fn is_serial_type(data_type: &DataType) -> bool {
 
 /// True when a type that reaches the parser as a custom name is stored as a
 /// BLOB.
-pub(crate) fn translates_to_blob(data_type: &DataType) -> bool {
+pub(crate) fn translates_to_blob(
+    data_type: &DataType,
+    schema: &sql_traits::structs::ParserDB,
+) -> bool {
     matches!(
         data_type,
-        DataType::Custom(name, ..) if matches!(translate_custom_type(name), Ok(DataType::Blob(_)))
+        DataType::Custom(name, ..)
+            if matches!(translate_custom_type(data_type, name, schema), Ok(DataType::Blob(_)))
     )
 }
 
 /// Maps PostgreSQL and extension types that reach the parser as a custom name.
+///
+/// `vector` and `halfvec` are pgvector's only where the schema installs the
+/// extension, and are otherwise the schema's own types like any other name.
 fn translate_custom_type(
+    data_type: &DataType,
     name: &sqlparser::ast::ObjectName,
+    schema: &sql_traits::structs::ParserDB,
 ) -> Result<DataType, crate::errors::Error> {
+    if super::vector::stored_vector(data_type, schema)?.is_some() {
+        return Ok(DataType::Blob(None));
+    }
     let custom_type_name = crate::impls::object_name::last_catalog_name(name);
 
     match custom_type_name.as_deref() {
         Some("serial" | "smallserial" | "bigserial" | "largeserial") => Ok(DataType::Integer(None)),
         Some("countrycode") => Ok(DataType::Text),
-        Some("halfvec") => Err(super::vector::halfvec_refusal()),
-        Some("geometry" | "geography" | "cas" | "molecularformula" | "mediatype" | "vector") => {
+        Some("geometry" | "geography" | "cas" | "molecularformula" | "mediatype") => {
             Ok(DataType::Blob(None))
         }
         _ => {

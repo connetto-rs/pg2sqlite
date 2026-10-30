@@ -279,7 +279,8 @@ fn vec0_collision_names_vec0_artifact_not_rls() {
     // collides in SQLite's flat object namespace.
     let error = Pg2Sqlite::default()
         .sql(
-            "CREATE TABLE items (id INT PRIMARY KEY, embedding vector(3));
+            "CREATE EXTENSION vector;
+             CREATE TABLE items (id INT PRIMARY KEY, embedding vector(3));
              CREATE TABLE items_embedding_vec (id INT PRIMARY KEY);",
         )
         .expect("parse")
@@ -303,7 +304,8 @@ fn vec0_trigger_collision_names_generated_trigger_not_rls() {
     // generates. A user trigger with the same name on another table collides.
     let error = Pg2Sqlite::default()
         .sql(
-            "CREATE TABLE items (id INT PRIMARY KEY, embedding vector(3));
+            "CREATE EXTENSION vector;
+             CREATE TABLE items (id INT PRIMARY KEY, embedding vector(3));
              CREATE TABLE other (id INT PRIMARY KEY);
              CREATE FUNCTION f() RETURNS TRIGGER AS $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql;
              CREATE TRIGGER items_embedding_vec_ai BEFORE INSERT ON other

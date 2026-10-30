@@ -184,7 +184,8 @@ fn at_at_without_tsvector_produces_error() {
 
 #[test]
 fn vector_l2_distance_translates() {
-    let sql = "CREATE TABLE t (id INT PRIMARY KEY, embedding vector(3));
+    let sql = "CREATE EXTENSION vector;
+               CREATE TABLE t (id INT PRIMARY KEY, embedding vector(3));
                SELECT * FROM t ORDER BY embedding <-> '[1,2,3]';";
     let output = helpers::translate_sql(sql, &Pg2SqliteOptions::default()).unwrap();
     assert!(
@@ -196,7 +197,8 @@ fn vector_l2_distance_translates() {
 
 #[test]
 fn vector_cosine_distance_translates() {
-    let sql = "CREATE TABLE t (id INT PRIMARY KEY, embedding vector(3));
+    let sql = "CREATE EXTENSION vector;
+               CREATE TABLE t (id INT PRIMARY KEY, embedding vector(3));
                SELECT * FROM t ORDER BY embedding <=> '[1,2,3]';";
     let output = helpers::translate_sql(sql, &Pg2SqliteOptions::default()).unwrap();
     assert!(
@@ -208,7 +210,8 @@ fn vector_cosine_distance_translates() {
 
 #[test]
 fn vector_negative_inner_product_produces_error() {
-    let sql = "CREATE TABLE t (id INT PRIMARY KEY, embedding vector(3));
+    let sql = "CREATE EXTENSION vector;
+               CREATE TABLE t (id INT PRIMARY KEY, embedding vector(3));
                SELECT * FROM t ORDER BY embedding <#> '[1,2,3]';";
     let result = helpers::translate_sql(sql, &Pg2SqliteOptions::default());
     assert!(result.is_err());
@@ -218,7 +221,8 @@ fn vector_negative_inner_product_produces_error() {
 
 #[test]
 fn vector_manhattan_produces_error() {
-    let sql = "CREATE TABLE t (id INT PRIMARY KEY, embedding vector(3));
+    let sql = "CREATE EXTENSION vector;
+               CREATE TABLE t (id INT PRIMARY KEY, embedding vector(3));
                SELECT * FROM t ORDER BY embedding <+> '[1,2,3]';";
     let result = helpers::translate_sql(sql, &Pg2SqliteOptions::default());
     assert!(result.is_err());
@@ -228,7 +232,8 @@ fn vector_manhattan_produces_error() {
 
 #[test]
 fn vector_jaccard_produces_error() {
-    let sql = "CREATE TABLE t (id INT PRIMARY KEY, embedding vector(3));
+    let sql = "CREATE EXTENSION vector;
+               CREATE TABLE t (id INT PRIMARY KEY, embedding vector(3));
                SELECT * FROM t ORDER BY embedding <%> '[1,2,3]';";
     let result = helpers::translate_sql(sql, &Pg2SqliteOptions::default());
     assert!(result.is_err());

@@ -76,6 +76,7 @@ fn test_translated_vector_table_works() -> Result<()> {
     helpers::register_sqlite_vec_once();
 
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL,
@@ -111,6 +112,7 @@ fn test_vec0_knn_query_correctness() -> Result<()> {
     helpers::register_sqlite_vec_once();
 
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL,
@@ -171,6 +173,7 @@ fn test_vec0_indexed_knn_large_dataset() -> Result<()> {
     const K: usize = 10;
 
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (
             id INTEGER PRIMARY KEY,
             embedding vector(128)
@@ -282,6 +285,7 @@ fn test_vec0_faster_than_naive_at_scale() -> Result<()> {
     const NUM_QUERIES: usize = 10;
 
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (
             id INTEGER PRIMARY KEY,
             embedding vector(64)
@@ -368,6 +372,7 @@ fn test_update_trigger_syncs_to_vec0() -> Result<()> {
     helpers::register_sqlite_vec_once();
 
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (
             id INTEGER PRIMARY KEY,
             embedding vector(4)
@@ -407,6 +412,7 @@ fn an_update_to_null_removes_the_row_from_the_index() -> Result<()> {
     helpers::register_sqlite_vec_once();
 
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (
             id INTEGER PRIMARY KEY,
             embedding vector(4)
@@ -439,6 +445,7 @@ fn a_null_row_updated_to_a_vector_joins_the_index() -> Result<()> {
     helpers::register_sqlite_vec_once();
 
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (
             id INTEGER PRIMARY KEY,
             embedding vector(4)
@@ -473,6 +480,7 @@ fn a_pk_update_moves_the_indexed_row() -> Result<()> {
     helpers::register_sqlite_vec_once();
 
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (
             id INTEGER PRIMARY KEY,
             embedding vector(4)
@@ -497,6 +505,7 @@ fn test_delete_trigger_removes_from_vec0() -> Result<()> {
     helpers::register_sqlite_vec_once();
 
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (
             id INTEGER PRIMARY KEY,
             embedding vector(4)

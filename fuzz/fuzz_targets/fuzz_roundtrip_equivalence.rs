@@ -30,6 +30,8 @@ use libfuzzer_sys::fuzz_target;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
 const SCHEMA_SQL: &str = r#"
+    CREATE EXTENSION vector;
+
     CREATE TABLE users (
         id INTEGER PRIMARY KEY,
         name TEXT NOT NULL,

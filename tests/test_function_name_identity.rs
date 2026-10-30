@@ -135,7 +135,7 @@ fn a_bare_builtin_is_untouched_by_the_new_rule() {
 #[test]
 fn a_quoted_type_name_quoting_leaves_alone_still_maps() {
     let emitted = translate(
-        r#"CREATE TABLE t (id INT PRIMARY KEY, v "vector"(3));"#,
+        r#"CREATE EXTENSION vector; CREATE TABLE t (id INT PRIMARY KEY, v "vector"(3));"#,
         &Pg2SqliteOptions::default(),
     )
     .expect(r#""vector" names the pgvector type"#);

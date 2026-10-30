@@ -44,8 +44,8 @@ use crate::{
                 uuid_columns_of_table,
             },
             vector::{
-                halfvec_refusal, is_halfvec_data_type, is_vector_data_type,
-                maybe_wrap_text_vector_literal, vector_columns_of_table,
+                halfvec_refusal, maybe_wrap_text_vector_literal, stored_vector,
+                vector_columns_of_table,
             },
         },
     },
@@ -1202,6 +1202,7 @@ impl ColumnRewrites {
         &self,
         column: &str,
         value: Expr,
+        schema: &ParserDB,
         options: &Pg2SqliteOptions,
     ) -> Result<Expr, Error> {
         let is_param = is_bound_parameter(&value);
@@ -1253,7 +1254,7 @@ impl ColumnRewrites {
             if let Some((_, data_type)) =
                 self.literal_checked_cols.iter().find(|(name, _)| name.eq_ignore_ascii_case(column))
             {
-                value = convert_value_for_column_type(data_type, value, options)?;
+                value = convert_value_for_column_type(data_type, value, schema, options)?;
             }
         }
         Ok(value)
@@ -1268,6 +1269,7 @@ impl ColumnRewrites {
         &self,
         target: &AssignmentTarget,
         value: Expr,
+        schema: &ParserDB,
         options: &Pg2SqliteOptions,
     ) -> Result<Expr, Error> {
         if self.is_empty() {
@@ -1276,7 +1278,7 @@ impl ColumnRewrites {
         match target {
             AssignmentTarget::ColumnName(name) => {
                 match last_ident(name) {
-                    Some(column) => self.finish_value(&column.value, value, options),
+                    Some(column) => self.finish_value(&column.value, value, schema, options),
                     None => Ok(value),
                 }
             }
@@ -1290,7 +1292,7 @@ impl ColumnRewrites {
                     .zip(items)
                     .map(|(name, item)| {
                         match last_ident(name) {
-                            Some(column) => self.finish_value(&column.value, item, options),
+                            Some(column) => self.finish_value(&column.value, item, schema, options),
                             None => Ok(item),
                         }
                     })
@@ -1467,6 +1469,7 @@ pub(crate) fn scale_parameter(expr: Expr, scale: u32) -> Expr {
 pub(crate) fn convert_value_for_column_type(
     data_type: &DataType,
     expr: Expr,
+    schema: &ParserDB,
     options: &Pg2SqliteOptions,
 ) -> Result<Expr, Error> {
     let expr = typed_text_literal(data_type, &expr)?.unwrap_or(expr);
@@ -1497,10 +1500,7 @@ pub(crate) fn convert_value_for_column_type(
             None => return Ok(expr),
         }
     }
-    if is_vector_data_type(data_type) {
-        if is_halfvec_data_type(data_type) {
-            return Err(halfvec_refusal());
-        }
+    if stored_vector(data_type, schema)?.is_some() {
         if is_bound_parameter(&expr) {
             return Ok(crate::impls::function_helpers::simple_function_expr(
                 "vec_f32",
@@ -1846,6 +1846,7 @@ pub(crate) fn convert_temporal_value(
 /// read, which is the same refusal its translation gives.
 pub(crate) fn column_storage(
     data_type: &DataType,
+    schema: &ParserDB,
     options: &Pg2SqliteOptions,
 ) -> Result<crate::manifest::ColumnStorage, Error> {
     use crate::manifest::{ColumnStorage, VectorElement};
@@ -1864,12 +1865,9 @@ pub(crate) fn column_storage(
             None => ColumnStorage::Direct,
         });
     }
-    if is_vector_data_type(data_type) {
-        if is_halfvec_data_type(data_type) {
-            return Err(halfvec_refusal());
-        }
+    if let Some(vector) = stored_vector(data_type, schema)? {
         return Ok(ColumnStorage::Vector {
-            dimensions: crate::impls::translator_impls::vector::extract_dimensions(data_type),
+            dimensions: vector.dimensions(),
             element: VectorElement::Float32,
         });
     }
@@ -2190,7 +2188,7 @@ fn translate_column_assignment<D: TranslationDirection>(
     let value = D::translate_expr(cast.as_ref().unwrap_or(source), schema, options, emit)?;
     Ok(Assignment {
         target: target.clone(),
-        value: rewrites.finish_assignment(target, value, D::config(options))?,
+        value: rewrites.finish_assignment(target, value, schema, D::config(options))?,
     })
 }
 
@@ -5320,6 +5318,7 @@ mod tests {
         assert_eq!(
             super::column_storage(
                 &sqlparser::ast::DataType::Uuid,
+                &empty_schema(),
                 &crate::options::Pg2SqliteOptions::default(),
             )
             .expect("no numeric scale to read"),

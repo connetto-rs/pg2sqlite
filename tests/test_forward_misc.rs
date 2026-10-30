@@ -826,6 +826,7 @@ fn delete_using_with_rls_table_join() {
 #[test]
 fn vector_type_cast() {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (
             id INT PRIMARY KEY,
             embedding VECTOR(384)
@@ -840,6 +841,7 @@ fn vector_type_cast() {
 #[test]
 fn hamming_distance_operator() {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (
             id INT PRIMARY KEY,
             bits VECTOR(384)

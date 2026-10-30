@@ -793,7 +793,9 @@ fn apply_column_type_conversions(
         if let Some((_, data_type)) =
             col_types.iter().find(|(name, _)| name.eq_ignore_ascii_case(col_name))
         {
-            crate::impls::shared_helpers::convert_value_for_column_type(data_type, expr, options)
+            crate::impls::shared_helpers::convert_value_for_column_type(
+                data_type, expr, schema, options,
+            )
         } else {
             Ok(expr)
         }

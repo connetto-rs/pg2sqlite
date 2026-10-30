@@ -57,7 +57,8 @@ fn half_schema() -> ParserDB {
     ParserDB::from_statements(
         Parser::parse_sql(
             &PostgreSqlDialect {},
-            "CREATE TABLE items(id INT PRIMARY KEY, h halfvec(3), v vector(3));
+            "CREATE EXTENSION vector;
+             CREATE TABLE items(id INT PRIMARY KEY, h halfvec(3), v vector(3));
              CREATE TABLE halves(h halfvec(3));",
         )
         .unwrap(),
@@ -261,7 +262,8 @@ fn float32_distance_executes_with_an_opaque_function_relation() {
     let options = Pg2SqliteOptions::default().with_user_defined_functions(["pragma_table_info"]);
     let statements = Pg2Sqlite::default()
         .sql(
-            "CREATE TABLE t(id INT PRIMARY KEY, v vector(3));
+            "CREATE EXTENSION vector;
+             CREATE TABLE t(id INT PRIMARY KEY, v vector(3));
              CREATE TABLE u(id INT PRIMARY KEY, v2 vector(3));
              INSERT INTO t VALUES(1,'[1,2,3]');
              INSERT INTO u VALUES(1,'[4,6,3]');
@@ -327,7 +329,8 @@ fn float32_scalar_outputs_preserve_binding_and_cardinality() {
     let schema = ParserDB::from_statements(
         Parser::parse_sql(
             &PostgreSqlDialect {},
-            "CREATE TABLE scalar_items(id INT PRIMARY KEY,v vector(3));
+            "CREATE EXTENSION vector;
+             CREATE TABLE scalar_items(id INT PRIMARY KEY,v vector(3));
              CREATE TABLE scalar_vectors(v vector(3));
              CREATE TABLE halves(h halfvec(3));",
         )

@@ -130,7 +130,8 @@ fn to_json_over_an_unresolvable_column_is_refused() {
 #[test]
 fn a_json_constructor_over_a_vector_is_refused() {
     let error = translate_err(
-        "CREATE TABLE e (id INT PRIMARY KEY, v vector(3));
+        "CREATE EXTENSION vector;
+         CREATE TABLE e (id INT PRIMARY KEY, v vector(3));
          SELECT json_build_array(v) FROM e;",
     );
     assert!(error.contains("vector"), "the refusal must name the type: {error}");

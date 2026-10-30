@@ -238,7 +238,7 @@ fn conversion_of(
             expr,
             schema,
             options,
-            |column| Some(conversion_of_type(&column.data_type, options)),
+            |column| Some(conversion_of_type(&column.data_type, schema, options)),
             conversion_of,
         );
     }
@@ -249,14 +249,14 @@ fn conversion_of(
                 query,
                 schema,
                 options,
-                |column| Some(conversion_of_type(&column.data_type, options)),
+                |column| Some(conversion_of_type(&column.data_type, schema, options)),
                 conversion_of,
             );
         }
         _ if is_already_json(expr) => Conversion::Stored(Stored::Document),
         _ if is_boolean_expression(expr, schema, options)? => Conversion::Boolean,
-        Expr::Cast { data_type, .. } => conversion_of_type(data_type, options),
-        Expr::TypedString(typed) => conversion_of_type(&typed.data_type, options),
+        Expr::Cast { data_type, .. } => conversion_of_type(data_type, schema, options),
+        Expr::TypedString(typed) => conversion_of_type(&typed.data_type, schema, options),
         Expr::Function(function)
             if last_ident(&function.name)
                 .is_some_and(|name| name.value.eq_ignore_ascii_case("decode")) =>
@@ -275,7 +275,11 @@ fn conversion_of(
     }))
 }
 
-fn conversion_of_type(data_type: &DataType, options: &Pg2SqliteOptions) -> Conversion {
+fn conversion_of_type(
+    data_type: &DataType,
+    schema: &ParserDB,
+    options: &Pg2SqliteOptions,
+) -> Conversion {
     match data_type {
         DataType::JSON | DataType::JSONB => Conversion::Stored(Stored::Document),
         DataType::Array(_) if is_json_array_representation(options) => {
@@ -292,7 +296,7 @@ fn conversion_of_type(data_type: &DataType, options: &Pg2SqliteOptions) -> Conve
         DataType::Time(_, TimezoneInfo::Tz | TimezoneInfo::WithTimeZone) => {
             Conversion::Stored(Stored::TimeWithTimeZone)
         }
-        DataType::Custom(..) if translates_to_blob(data_type) => {
+        DataType::Custom(..) if translates_to_blob(data_type, schema) => {
             Conversion::Unrenderable(data_type.to_string())
         }
         _ => {

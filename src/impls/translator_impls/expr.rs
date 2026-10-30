@@ -1318,21 +1318,6 @@ crate::errors::Error::forward_refusal("AT TIME ZONE supports only literal UTC/lo
     Ok(simple_function_expr("datetime", vec![translated_timestamp, string_literal(&applied)], None))
 }
 
-/// Lowers a supported vector cast to its native codec.
-fn translate_vector_cast(
-    expr: &Expr,
-    data_type: &DataType,
-    schema: &ParserDB,
-    options: &crate::options::TranslationContext<'_>,
-    emit: crate::warnings::WarningSink<'_>,
-) -> Result<Expr, crate::errors::Error> {
-    if crate::impls::translator_impls::vector::is_halfvec_data_type(data_type) {
-        return Err(crate::impls::translator_impls::vector::halfvec_refusal());
-    }
-    let translated_expr = expr.translate_with_warnings(schema, options, emit)?;
-    Ok(simple_function_expr("vec_f32", vec![translated_expr], None))
-}
-
 fn halfvec_operand(
     expr: &Expr,
     schema: &ParserDB,
@@ -1344,7 +1329,10 @@ fn halfvec_operand(
             schema,
             options,
             |column| {
-                crate::impls::translator_impls::vector::is_halfvec_data_type(&column.data_type)
+                crate::impls::translator_impls::vector::is_halfvec_data_type(
+                    &column.data_type,
+                    schema,
+                )
             },
             |expr, schema, options| {
                 halfvec_operand(expr, schema, options).map(|value| value.is_some())
@@ -1357,7 +1345,7 @@ fn halfvec_operand(
         schema,
         options,
         |column| {
-            crate::impls::translator_impls::vector::is_halfvec_data_type(&column.data_type)
+            crate::impls::translator_impls::vector::is_halfvec_data_type(&column.data_type, schema)
                 .then_some(())
         },
         halfvec_operand,
@@ -2215,7 +2203,7 @@ fn convert_beside_column_expr(
                 &dt,
                 options,
             )?;
-            convert_value_for_column_type(&dt, value, options)
+            convert_value_for_column_type(&dt, value, schema, options)
         }
         None => Ok(value),
     }
@@ -2711,7 +2699,7 @@ fn translate_binary_op(
                     options,
                     |column| {
                         let dt = &column.data_type;
-                        if is_vector_data_type(dt)
+                        if is_vector_data_type(dt, schema)
                             || matches!(dt, DataType::Array(_))
                             || (crate::impls::shared_helpers::literal_checks_apply(dt)
                                 && matches!(sibling, Expr::Value(_)))
@@ -3409,6 +3397,7 @@ fn unwrap_pg_catalog_operator(parts: &[String]) -> Option<BinaryOperator> {
 
 fn reject_halfvec_reference(
     expr: &Expr,
+    schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
 ) -> Result<(), crate::errors::Error> {
     let pseudo;
@@ -3434,6 +3423,7 @@ fn reject_halfvec_reference(
         if let ColumnDefinition::Base { column, .. } = definition
             && crate::impls::translator_impls::vector::is_halfvec_data_type(
                 &column.attribute().data_type,
+                schema,
             )
         {
             return Err(crate::impls::translator_impls::vector::halfvec_refusal());
@@ -3454,7 +3444,7 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
         options: &crate::options::TranslationContext<'_>,
         emit: &mut dyn FnMut(crate::warnings::TranslationWarning),
     ) -> Result<Self::SQLiteEntry, crate::errors::Error> {
-        reject_halfvec_reference(self, options)?;
+        reject_halfvec_reference(self, schema, options)?;
         Ok(match self {
             // PostgreSQL's other spellings of a string literal have no SQLite
             // form: `$$hello$$` reads there as a parameter named `$hello$`,
@@ -3542,8 +3532,11 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                     {
                         return distributed.translate_with_warnings(schema, options, emit);
                     }
-                    if crate::impls::translator_impls::vector::is_vector_data_type(data_type) {
-                        return translate_vector_cast(expr, data_type, schema, options, emit);
+                    if crate::impls::translator_impls::vector::stored_vector(data_type, schema)?
+                        .is_some()
+                    {
+                        let translated = expr.translate_with_warnings(schema, options, emit)?;
+                        return Ok(simple_function_expr("vec_f32", vec![translated], None));
                     }
                     // PG `'...'::uuid` under Blob representation: lower to the
                     // same text-to-blob expression used for INSERT/UPDATE

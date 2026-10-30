@@ -1152,6 +1152,7 @@ impl Pg2Sqlite {
                         name: column.column_name().to_string(),
                         storage: crate::impls::shared_helpers::column_storage(
                             &column.attribute().data_type,
+                            schema,
                             options,
                         )?,
                     })

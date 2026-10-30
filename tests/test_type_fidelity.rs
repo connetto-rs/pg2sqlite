@@ -434,7 +434,11 @@ fn array_columns_of_blob_stored_types_are_refused() {
     for (ddl, opts, element) in [
         ("CREATE TABLE b (id INT PRIMARY KEY, blobs BYTEA[]);", array_opts(), "BYTEA"),
         ("CREATE TABLE u (id INT PRIMARY KEY, ids UUID[]);", blob_uuid_array_opts(), "UUID"),
-        ("CREATE TABLE v (id INT PRIMARY KEY, e vector(3)[]);", array_opts(), "vector(3)"),
+        (
+            "CREATE EXTENSION vector; CREATE TABLE v (id INT PRIMARY KEY, e vector(3)[]);",
+            array_opts(),
+            "vector(3)",
+        ),
     ] {
         expect_refusal(
             ddl,

@@ -12,7 +12,7 @@ The contract is strict. Every returned statement is valid SQLite, an unimplement
 
 `CREATE TEMPORARY TABLE` binds definition expressions to its declared columns and preserves the temporary modifier. `WITH` preserves PostgreSQL's lexical bindings, including physical and outer references beside same-named non-recursive CTEs, and each CTE keeps its PostgreSQL column names when a stored column it reads is later renamed.
 
-The rewrites go beyond types. Row-Level Security becomes a renamed backing table, a view enforcing the `USING` clause, and `INSTEAD OF` triggers. A GIN `to_tsvector` index becomes an FTS5 virtual table with sync triggers. pgvector maps to [sqlite-vec](https://github.com/asg017/sqlite-vec) and PostGIS to the [SQLiteGIS](https://github.com/connetto-rs/sqlitegis) extension. PL/pgSQL trigger bodies become SQLite trigger syntax, and SQLite DML translates back to PostgreSQL to sync replicas upstream. The crate is `no_std + alloc` and compiles for `wasm32-unknown-unknown`.
+The rewrites go beyond types. Row-Level Security becomes a renamed backing table, a view enforcing the `USING` clause, and `INSTEAD OF` triggers. A GIN `to_tsvector` index becomes an FTS5 virtual table with sync triggers. pgvector, in a schema that runs `CREATE EXTENSION vector`, maps to [sqlite-vec](https://github.com/asg017/sqlite-vec) and PostGIS to the [SQLiteGIS](https://github.com/connetto-rs/sqlitegis) extension. PL/pgSQL trigger bodies become SQLite trigger syntax, and SQLite DML translates back to PostgreSQL to sync replicas upstream. The crate is `no_std + alloc` and compiles for `wasm32-unknown-unknown`.
 
 ## Quick start
 

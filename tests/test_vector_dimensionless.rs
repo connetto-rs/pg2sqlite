@@ -21,7 +21,9 @@ fn warnings_for(sql: &str) -> Vec<TranslationWarning> {
 /// A `vector` column without a dimension count must warn.
 #[test]
 fn dimensionless_vector_column_emits_lossy_drop_warning() {
-    let warnings = warnings_for("CREATE TABLE docs (id INT PRIMARY KEY, embedding vector);");
+    let warnings = warnings_for(
+        "CREATE EXTENSION vector; CREATE TABLE docs (id INT PRIMARY KEY, embedding vector);",
+    );
     let has_warning = warnings.iter().any(|w| {
         matches!(
             w,
@@ -41,7 +43,9 @@ fn dimensionless_vector_column_emits_lossy_drop_warning() {
 /// supported.
 #[test]
 fn dimensioned_vector_column_does_not_warn() {
-    let warnings = warnings_for("CREATE TABLE docs (id INT PRIMARY KEY, embedding vector(384));");
+    let warnings = warnings_for(
+        "CREATE EXTENSION vector; CREATE TABLE docs (id INT PRIMARY KEY, embedding vector(384));",
+    );
     // Only a vec0 table is emitted. No LossyDrop warning about a missing
     // dimension.
     let has_dimension_warning = warnings.iter().any(|w| {
@@ -62,7 +66,7 @@ fn dimensioned_vector_column_does_not_warn() {
 #[test]
 fn dimensionless_vector_column_translation_still_executes() {
     let report = Pg2Sqlite::default()
-        .sql("CREATE TABLE docs (id INT PRIMARY KEY, embedding vector);")
+        .sql("CREATE EXTENSION vector; CREATE TABLE docs (id INT PRIMARY KEY, embedding vector);")
         .expect("parse")
         .translate_with_report(&Pg2SqliteOptions::default())
         .expect("translate");

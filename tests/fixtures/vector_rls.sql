@@ -2,6 +2,8 @@
 -- This tests that vec0 sync triggers correctly reference the backing table (embeddings_rls)
 -- instead of the view (embeddings).
 
+CREATE EXTENSION vector;
+
 CREATE TABLE embeddings (
     id SERIAL PRIMARY KEY,
     content TEXT NOT NULL,

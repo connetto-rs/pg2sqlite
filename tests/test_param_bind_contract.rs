@@ -328,7 +328,8 @@ fn vector_param_insert_is_wrapped_in_translation() {
     let opts = Pg2SqliteOptions::default();
     let stmts = Pg2Sqlite::default()
         .sql(
-            "CREATE TABLE t (id INT PRIMARY KEY, embedding vector(3));
+            "CREATE EXTENSION vector;
+             CREATE TABLE t (id INT PRIMARY KEY, embedding vector(3));
              INSERT INTO t (id, embedding) VALUES (1, $1);",
         )
         .expect("parse")
