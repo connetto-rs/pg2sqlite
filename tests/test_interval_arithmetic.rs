@@ -197,12 +197,24 @@ fn the_leading_field_spelling_clamps_too() {
     assert_eq!(shift("timestamp '2026-01-31' + interval '1' month"), "2026-02-28 00:00:00");
 }
 
-/// PostgreSQL has no `WEEK` qualifier and reads `interval '1' week` as one
-/// second under the column alias `week`, so a week would be the wrong answer.
+/// PostgreSQL has no `WEEK`, `DAYS` or `DECADE` qualifier: the word is a
+/// column alias and the bare count is seconds.
 #[test]
-fn a_week_qualifier_is_refused() {
-    let error = refusal("timestamp '2026-01-31' + interval '1' week");
-    assert!(error.contains("qualifier"), "the refusal must name the qualifier: {error}");
+fn a_word_postgresql_has_no_qualifier_for_is_an_alias() {
+    for (expression, instant) in [
+        ("timestamp '2026-01-31' + interval '1' week", "2026-01-31 00:00:01"),
+        ("timestamp '2026-01-31' + interval '2' days", "2026-01-31 00:00:02"),
+        ("timestamp '2026-01-31' + interval '3' decade", "2026-01-31 00:00:03"),
+    ] {
+        assert_eq!(shift(expression), instant, "{expression}");
+    }
+}
+
+/// PostgreSQL answers a syntax error for a range its grammar lacks.
+#[test]
+fn a_range_postgresql_lacks_is_refused() {
+    let error = refusal("timestamp '2026-01-31' + interval '1' year to day");
+    assert!(error.contains("qualifier PostgreSQL does not accept"), "{error}");
 }
 
 #[test]
