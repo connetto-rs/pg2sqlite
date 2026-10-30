@@ -1740,6 +1740,31 @@ pub(crate) fn normalize_temporal_literal_expr(
     Ok(Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(normalized), span: *span }))
 }
 
+/// `text`, already in the form a column of `kind` holds, rounded to the
+/// kind's declared precision.
+pub(crate) fn round_column_text(
+    kind: crate::impls::temporal_literals::TemporalLiteralKind,
+    text: Expr,
+) -> Expr {
+    use crate::impls::{
+        datetime_helpers::{round_naive_timestamp, round_time, round_timestamptz, round_timetz},
+        temporal_literals::TemporalLiteralKind::{Time, Timestamp},
+    };
+    match kind {
+        Time { zoned: true, precision: Some(precision) } => {
+            round_timetz(&text, precision, text.clone())
+        }
+        Time { zoned: false, precision: Some(precision) } => {
+            round_time(&text, precision, text.clone())
+        }
+        Timestamp { zoned: true, precision: Some(precision) } => round_timestamptz(text, precision),
+        Timestamp { zoned: false, precision: Some(precision) } => {
+            round_naive_timestamp(&text, precision, text.clone())
+        }
+        _ => text,
+    }
+}
+
 /// Brings a value written into, or compared with, a temporal column to the
 /// text that column holds.
 ///
@@ -1777,34 +1802,14 @@ pub(crate) fn convert_temporal_value(
         } else {
             value
         };
-        return Ok(match precision {
-            Some(precision) => crate::impls::datetime_helpers::round_timestamptz(value, precision),
-            None => value,
-        });
+        return Ok(round_column_text(kind, value));
     }
     let instant = match take_canonical_timestamptz_operand(&mut expr) {
         Some(operand) => operand,
         None if source == Some(TimestampAwareness::Aware) => expr,
-        None => {
-            // The value already holds the column's text and only the
-            // precision rounds it.
-            return Ok(match (kind, precision) {
-                (TemporalLiteralKind::Time { zoned: true, .. }, Some(precision)) => {
-                    crate::impls::datetime_helpers::round_timetz(&expr, precision, expr.clone())
-                }
-                (TemporalLiteralKind::Time { zoned: false, .. }, Some(precision)) => {
-                    crate::impls::datetime_helpers::round_time(&expr, precision, expr.clone())
-                }
-                (TemporalLiteralKind::Timestamp { .. }, Some(precision)) => {
-                    crate::impls::datetime_helpers::round_naive_timestamp(
-                        &expr,
-                        precision,
-                        expr.clone(),
-                    )
-                }
-                _ => expr,
-            });
-        }
+        // The value already holds the column's text and only the precision
+        // rounds it.
+        None => return Ok(round_column_text(kind, expr)),
     };
     Ok(match (kind, precision) {
         (TemporalLiteralKind::Time { zoned: true, .. }, Some(precision)) => {

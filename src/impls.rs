@@ -35,6 +35,7 @@ pub(crate) mod sqlite_functions;
 pub(crate) mod sqlite_keywords;
 pub(crate) mod stack_headroom;
 pub(crate) mod temporal_arithmetic;
+pub(crate) mod temporal_casts;
 pub(crate) mod temporal_literals;
 pub(crate) mod timezone;
 pub(crate) mod transaction_blocks;

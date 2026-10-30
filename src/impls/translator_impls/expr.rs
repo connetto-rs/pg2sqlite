@@ -21,8 +21,8 @@ use sqlparser::{
         AccessExpr, Array, BinaryOperator, CaseWhen, CastKind, DataType, DateTimeField,
         ExactNumberInfo, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
         InTarget, Interval, JsonKeyUniqueness, JsonPredicateType, ObjectName, ObjectNamePart,
-        Query, SelectItem, SetExpr, Subscript, TableAlias, TableFactor, TimezoneInfo,
-        UnaryOperator, Value, ValueWithSpan, helpers::attached_token::AttachedToken,
+        Query, SelectItem, SetExpr, Subscript, TableAlias, TableFactor, UnaryOperator, Value,
+        ValueWithSpan, helpers::attached_token::AttachedToken,
     },
     tokenizer::Span,
 };
@@ -817,12 +817,6 @@ fn boolean_literal(value: bool) -> Expr {
         value: Value::Boolean(value),
         span: sqlparser::tokenizer::Span::empty(),
     })
-}
-
-/// Promotes a DATE to midnight text so text comparison with a TIMESTAMP column
-/// works.
-fn promote_date_to_midnight(date_expr: Expr) -> Expr {
-    simple_function_expr("strftime", vec![string_literal("%Y-%m-%d 00:00:00"), date_expr], None)
 }
 
 /// Convert a PostgreSQL text-array path literal `{a,b}` to a SQLite JSON path
@@ -3343,13 +3337,13 @@ fn translate_binary_op(
             let tr = right.translate_with_warnings(schema, options, emit)?;
             return Ok(Expr::BinaryOp {
                 left: Box::new(if matches!(lk, Some(TemporalKind::Date)) {
-                    promote_date_to_midnight(tl)
+                    crate::impls::datetime_helpers::promote_date_to_midnight(tl)
                 } else {
                     tl
                 }),
                 op: op.clone(),
                 right: Box::new(if matches!(rk, Some(TemporalKind::Date)) {
-                    promote_date_to_midnight(tr)
+                    crate::impls::datetime_helpers::promote_date_to_midnight(tr)
                 } else {
                     tr
                 }),
@@ -3663,18 +3657,6 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                     if let Some(info) = exact_numeric_info(data_type) {
                         return translate_numeric_cast(expr, info, schema, options, emit);
                     }
-                    // CAST(date AS TIMESTAMP): add midnight so stored text
-                    // matches TIMESTAMP format for comparisons.
-                    if matches!(
-                        data_type,
-                        DataType::Timestamp(_, TimezoneInfo::None | TimezoneInfo::WithoutTimeZone)
-                    ) && matches!(
-                        temporal_kind_of(expr, schema, options),
-                        Some(TemporalKind::Date)
-                    ) {
-                        let translated = expr.translate_with_warnings(schema, options, emit)?;
-                        return Ok(promote_date_to_midnight(translated));
-                    }
                     // A cast to a temporal type answers the text a column of
                     // that type holds.
                     if let Some(kind) =
@@ -3683,14 +3665,29 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                         crate::impls::shared_helpers::temporal_precision_replay_refusal(
                             expr, data_type, options,
                         )?;
+                        let translated = expr.translate_with_warnings(schema, options, emit)?;
+                        // A kind change rewrites the text into the target
+                        // kind's form, or refuses the pair.
+                        if let Some(source) =
+                            crate::impls::temporal_casts::cast_source_kind(expr, schema, options)
+                                .ok()
+                                .flatten()
+                            && let Some(rewritten) =
+                                crate::impls::temporal_casts::translate_temporal_kind_cast(
+                                    kind,
+                                    source,
+                                    &translated,
+                                    options,
+                                )?
+                        {
+                            return Ok(rewritten);
+                        }
                         let source =
                             crate::impls::timezone::timestamp_awareness(expr, schema, options)
                                 .ok()
                                 .flatten();
                         let converted = crate::impls::shared_helpers::convert_temporal_value(
-                            kind,
-                            expr.translate_with_warnings(schema, options, emit)?,
-                            source,
+                            kind, translated, source,
                         )?;
                         if matches!(converted, Expr::Function(_)) {
                             return Ok(converted);
