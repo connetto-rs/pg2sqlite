@@ -513,7 +513,8 @@ fn vector_results(expression: &str, dimensions: u32) -> Vec<VectorResult> {
     helpers::register_sqlite_vec_once();
     let statements = Pg2Sqlite::default()
         .sql(&format!(
-            "CREATE TABLE pairs(id INT PRIMARY KEY, v vector(3), w vector(3), r vector({dimensions}));
+            "CREATE EXTENSION vector;
+             CREATE TABLE pairs(id INT PRIMARY KEY, v vector(3), w vector(3), r vector({dimensions}));
              INSERT INTO pairs(id, v, w) VALUES (1, '[1,2,3]', '[4,6,3]'), (2, NULL, '[4,6,3]');
              UPDATE pairs SET r = {expression};
              SELECT id, r AS result FROM pairs ORDER BY id;"
@@ -572,12 +573,18 @@ fn vector_concatenation_stores_the_appended_elements() {
 
 #[test]
 fn vector_operators_sqlite_vec_lacks_are_refused() {
-    for source in [
-        "CREATE TABLE pairs(id INT PRIMARY KEY, v vector(3), w vector(3)); SELECT v * w FROM pairs;",
-        "CREATE TABLE pairs(id INT PRIMARY KEY, v vector(3)); SELECT v + id FROM pairs;",
-        "SELECT '[1,2,3]'::halfvec(3) + '[1,2,3]'::halfvec(3);",
+    for (source, reason) in [
+        (
+            "CREATE TABLE pairs(id INT PRIMARY KEY, v vector(3), w vector(3)); SELECT v * w FROM pairs;",
+            "sqlite-vec has no function that does",
+        ),
+        (
+            "CREATE TABLE pairs(id INT PRIMARY KEY, v vector(3)); SELECT v + id FROM pairs;",
+            "has no PostgreSQL operator",
+        ),
+        ("SELECT '[1,2,3]'::halfvec(3) + '[1,2,3]'::halfvec(3);", HALFVEC_REFUSAL),
     ] {
-        assert_refusal(source, None);
+        assert_refusal(&format!("CREATE EXTENSION vector; {source}"), None, reason);
     }
 }
 
@@ -599,7 +606,8 @@ fn a_distance_to_a_null_vector_is_null() {
     {
         let statements = Pg2Sqlite::default()
             .sql(&format!(
-                "CREATE TABLE pairs(id INT PRIMARY KEY, v vector(3), w vector(3));
+                "CREATE EXTENSION vector;
+                 CREATE TABLE pairs(id INT PRIMARY KEY, v vector(3), w vector(3));
                  INSERT INTO pairs VALUES (1, '[1,2,3]', '[4,6,3]'), (2, NULL, '[4,6,3]');
                  SELECT id, v {operator} w AS distance FROM pairs ORDER BY id;"
             ))

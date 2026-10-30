@@ -643,7 +643,8 @@ fn bytea_operators_postgresql_cannot_resolve_are_refused() {
 
 #[test]
 fn an_untranslatable_operand_of_a_bytea_or_vector_lowering_is_reported() {
-    let schema = "CREATE TABLE t (id INT PRIMARY KEY, s TEXT, b BYTEA, v vector(3));";
+    let schema = "CREATE EXTENSION vector; \
+                  CREATE TABLE t (id INT PRIMARY KEY, s TEXT, b BYTEA, v vector(3));";
     for query in [
         "SELECT encode(md5(s)::bytea, 'hex') FROM t;",
         "SELECT b || md5(s)::bytea FROM t;",
