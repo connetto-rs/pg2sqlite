@@ -358,6 +358,12 @@ pub(crate) fn canonical_timestamptz_call(value_expr: Expr) -> Expr {
     build_strftime_call(TIMESTAMPTZ_FORMAT, value_expr)
 }
 
+/// The midnight text of a date, the form a TIMESTAMP value of that day holds.
+#[must_use]
+pub(crate) fn promote_date_to_midnight(date_expr: Expr) -> Expr {
+    simple_function_expr("strftime", vec![string_literal("%Y-%m-%d 00:00:00"), date_expr], None)
+}
+
 /// Whether `expr` is a [`canonical_timestamptz_call`].
 #[must_use]
 pub(crate) fn is_canonical_timestamptz_call(expr: &Expr) -> bool {

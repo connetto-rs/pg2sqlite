@@ -623,3 +623,399 @@ fn localtime_shifted_by_a_day_wraps_to_itself() {
     );
     assert_eq!(rows, vec![Some("1".to_string())]);
 }
+
+// ── Casts between temporal kinds over non-literal values ──────────────────
+//
+// A temporal column holds its own text, so a kind change rewrites that text
+// into the target kind's form, or refuses what PostgreSQL 18.6 refuses
+// under a UTC session. Each row carries a fraction, a whole second and a
+// six-digit fraction.
+
+const KIND_CAST_DDL: &str = "CREATE TABLE k (
+    id INTEGER PRIMARY KEY,
+    d DATE NOT NULL,
+    tm TIME NOT NULL,
+    tt TIMETZ NOT NULL,
+    ts TIMESTAMP NOT NULL,
+    tzs TIMESTAMPTZ NOT NULL,
+    x TEXT NOT NULL
+);
+INSERT INTO k (id, d, tm, tt, ts, tzs, x) VALUES
+    (1, '2024-01-02', '03:04:05.5', '03:04:05.5+02', '2024-01-02 03:04:05.5', '2024-01-02 03:04:05.5+02', '2024-01-02 03:04:05.5'),
+    (2, '2024-12-31', '03:04:05', '03:04:05-05', '2024-12-31 23:59:59', '2024-12-31 23:59:59+00', '2024-12-31 23:59:59'),
+    (3, '2025-02-28', '03:04:05.123456', '03:04:05.123456+00', '2025-02-28 00:00:00.123456', '2025-02-28 00:00:00.123456-03', '2025-02-28 00:00:00.123456');";
+
+fn kind_cast_rows(query: &str) -> Vec<Option<String>> {
+    run_translated_with(
+        &format!("{KIND_CAST_DDL}\nSELECT {query} FROM k ORDER BY id;"),
+        &Pg2SqliteOptions::default(),
+    )
+}
+
+fn text_rows(values: &[&str]) -> Vec<Option<String>> {
+    values.iter().map(|value| Some(value.to_string())).collect()
+}
+
+/// `ts::time` answers the time of day PostgreSQL prints, fraction included.
+#[test]
+fn cast_timestamp_column_to_time_answers_the_time_of_day() {
+    assert_eq!(
+        kind_cast_rows("ts::time"),
+        text_rows(&["03:04:05.5", "23:59:59", "00:00:00.123456"])
+    );
+}
+
+/// `ts::date` answers the calendar day of the timestamp.
+#[test]
+fn cast_timestamp_column_to_date_answers_the_date_part() {
+    assert_eq!(kind_cast_rows("ts::date"), text_rows(&["2024-01-02", "2024-12-31", "2025-02-28"]));
+}
+
+/// `tzs::date` answers the UTC date of the stored instant.
+#[test]
+fn cast_timestamptz_column_to_date_answers_the_utc_date() {
+    assert_eq!(kind_cast_rows("tzs::date"), text_rows(&["2024-01-02", "2024-12-31", "2025-02-28"]));
+}
+
+/// `tt::time` keeps the wall-clock time and drops the stored offset.
+#[test]
+fn cast_timetz_column_to_time_drops_the_offset() {
+    assert_eq!(
+        kind_cast_rows("tt::time"),
+        text_rows(&["03:04:05.5", "03:04:05", "03:04:05.123456"])
+    );
+}
+
+/// `tm::timetz` reads the zoneless time in the session zone, which is UTC.
+#[test]
+fn cast_time_column_to_timetz_uses_the_session_offset() {
+    assert_eq!(
+        kind_cast_rows("tm::timetz"),
+        text_rows(&["03:04:05.5+00:00", "03:04:05+00:00", "03:04:05.123456+00:00"])
+    );
+}
+
+/// `d::timestamptz` stands the day on its UTC midnight.
+#[test]
+fn cast_date_column_to_timestamptz_answers_utc_midnight() {
+    assert_eq!(
+        kind_cast_rows("d::timestamptz"),
+        text_rows(&[
+            "2024-01-02 00:00:00.000000+00:00",
+            "2024-12-31 00:00:00.000000+00:00",
+            "2025-02-28 00:00:00.000000+00:00"
+        ])
+    );
+}
+
+/// `ts::timestamptz` reads the zoneless text in the UTC session and
+/// canonicalises it.
+#[test]
+fn cast_timestamp_column_to_timestamptz_answers_the_canonical_instant() {
+    assert_eq!(
+        kind_cast_rows("ts::timestamptz"),
+        text_rows(&[
+            "2024-01-02 03:04:05.500000+00:00",
+            "2024-12-31 23:59:59.000000+00:00",
+            "2025-02-28 00:00:00.123456+00:00"
+        ])
+    );
+}
+
+/// A cast to the value's own kind keeps the stored text.
+#[test]
+fn identity_temporal_casts_keep_the_stored_text() {
+    for (query, stored) in [
+        ("d::date", &["2024-01-02", "2024-12-31", "2025-02-28"]),
+        ("tm::time", &["03:04:05.5", "03:04:05", "03:04:05.123456"]),
+        ("tt::timetz", &["03:04:05.5+02:00", "03:04:05-05:00", "03:04:05.123456+00:00"]),
+        (
+            "ts::timestamp",
+            &["2024-01-02 03:04:05.5", "2024-12-31 23:59:59", "2025-02-28 00:00:00.123456"],
+        ),
+        (
+            "tzs::timestamptz",
+            &[
+                "2024-01-02 01:04:05.500000+00:00",
+                "2024-12-31 23:59:59.000000+00:00",
+                "2025-02-28 03:00:00.123456+00:00",
+            ],
+        ),
+    ] {
+        assert_eq!(kind_cast_rows(query), text_rows(stored), "{query}");
+    }
+}
+
+/// `d::timestamp` stands the day on its midnight.
+#[test]
+fn cast_date_column_to_timestamp_answers_midnight() {
+    assert_eq!(
+        kind_cast_rows("d::timestamp"),
+        text_rows(&["2024-01-02 00:00:00", "2024-12-31 00:00:00", "2025-02-28 00:00:00"])
+    );
+}
+
+/// The pairs PostgreSQL answers `cannot cast type ... to ...` for are refused
+/// at translation.
+#[test]
+fn temporal_kind_casts_postgres_refuses_are_refused() {
+    for (cast, source, target) in [
+        ("d::time", "date", "time without time zone"),
+        ("d::timetz", "date", "time with time zone"),
+        ("tm::date", "time without time zone", "date"),
+        ("tm::timestamp", "time without time zone", "timestamp without time zone"),
+        ("tm::timestamptz", "time without time zone", "timestamp with time zone"),
+        ("tt::date", "time with time zone", "date"),
+        ("tt::timestamp", "time with time zone", "timestamp without time zone"),
+        ("tt::timestamptz", "time with time zone", "timestamp with time zone"),
+        ("ts::timetz", "timestamp without time zone", "time with time zone"),
+    ] {
+        let ddl = "CREATE TABLE k (d DATE, tm TIME, tt TIMETZ, ts TIMESTAMP, tzs TIMESTAMPTZ);";
+        let error = Pg2Sqlite::default()
+            .sql(&format!("{ddl}\nSELECT {cast} FROM k;"))
+            .expect("parse")
+            .translate_to_sql(&Pg2SqliteOptions::default())
+            .expect_err("expected a translation refusal")
+            .to_string();
+        let expected = format!("cannot cast type {source} to {target}");
+        assert!(error.contains(&expected), "{cast}: {error}");
+    }
+}
+
+/// A concatenation of unknown kind passes its timestamp text through the cast,
+/// as PostgreSQL 18.6 prints it.
+#[test]
+fn concatenated_text_passes_through_a_timestamp_cast() {
+    assert_eq!(
+        kind_cast_rows("('2024-03-05' || ' 03:04:05.5')::timestamp"),
+        text_rows(&["2024-03-05 03:04:05.5"; 3])
+    );
+}
+
+/// An argument-free function the crate cannot name keeps its own text through
+/// the cast, as PostgreSQL 18.6 prints it for a text function.
+#[test]
+fn unknown_argument_free_function_passes_through_a_timestamp_cast() {
+    let options = Pg2SqliteOptions::default().with_user_defined_functions(["probe_stamp"]);
+    let probe = Pg2Sqlite::default()
+        .sql("SELECT probe_stamp()::timestamp;")
+        .expect("parse")
+        .translate_to_sql(&options)
+        .expect("translate")
+        .into_vec()
+        .pop()
+        .expect("a probe statement");
+    let connection = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+    connection
+        .create_scalar_function(
+            "probe_stamp",
+            0,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |_| Ok("2024-03-05 03:04:05.5"),
+        )
+        .expect("register the probe function");
+    let value: String = connection.query_row(&probe, [], |row| row.get(0)).expect("the probe runs");
+    assert_eq!(value, "2024-03-05 03:04:05.5");
+}
+
+/// A rewritten cast compares as text with the stored form of the value.
+#[test]
+fn cast_between_kinds_compares_with_the_stored_text() {
+    for (predicate, count) in [
+        ("tt::time = tm", "3"),
+        ("ts::time = '03:04:05.5'", "1"),
+        ("ts::date = d", "3"),
+        ("tzs::date = d", "3"),
+    ] {
+        assert_eq!(
+            run_translated_with(
+                &format!("{KIND_CAST_DDL}\nSELECT count(*) FROM k WHERE {predicate};"),
+                &Pg2SqliteOptions::default(),
+            ),
+            vec![Some(count.to_string())],
+            "{predicate}"
+        );
+    }
+}
+
+/// A cast over a rewritten cast reads the rewritten text, in either order.
+#[test]
+fn cast_chains_compose_across_kinds() {
+    assert_eq!(
+        kind_cast_rows("ts::timestamptz::date"),
+        text_rows(&["2024-01-02", "2024-12-31", "2025-02-28"])
+    );
+    assert_eq!(
+        kind_cast_rows("(ts::date)::timestamp"),
+        text_rows(&["2024-01-02 00:00:00", "2024-12-31 00:00:00", "2025-02-28 00:00:00"])
+    );
+}
+
+/// A kind change rounds to the target's declared precision, as PostgreSQL 18.6
+/// prints it.
+#[test]
+fn kind_cast_rounds_to_the_target_precision() {
+    for (query, expected) in [
+        ("ts::time(0)", ["03:04:06", "23:59:59", "00:00:00"]),
+        ("tt::time(0)", ["03:04:06", "03:04:05", "03:04:05"]),
+        (
+            "ts::timestamptz(1)",
+            [
+                "2024-01-02 03:04:05.500000+00:00",
+                "2024-12-31 23:59:59.000000+00:00",
+                "2025-02-28 00:00:00.100000+00:00",
+            ],
+        ),
+        ("d::timestamp(0)", ["2024-01-02 00:00:00", "2024-12-31 00:00:00", "2025-02-28 00:00:00"]),
+    ] {
+        assert_eq!(kind_cast_rows(query), text_rows(&expected), "{query}");
+    }
+}
+
+/// A parenthesized operand keeps the kind the operand's own spelling carries.
+#[test]
+fn parenthesized_operand_keeps_the_kind_cast() {
+    assert_eq!(
+        kind_cast_rows("((ts))::time"),
+        text_rows(&["03:04:05.5", "23:59:59", "00:00:00.123456"])
+    );
+}
+
+/// A typed string literal is read at the kind its type declares.
+#[test]
+fn typed_string_literal_keeps_the_kind_cast() {
+    assert_eq!(
+        kind_cast_rows("(DATE '2024-03-04')::timestamp"),
+        text_rows(&["2024-03-04 00:00:00"; 3])
+    );
+}
+
+/// `ts AT TIME ZONE 'UTC'` stands the bare text on its UTC instant, so the
+/// date cast reads that instant's UTC day.
+#[test]
+fn at_time_zone_utc_over_a_bare_timestamp_reads_the_utc_day() {
+    assert_eq!(
+        kind_cast_rows("(ts AT TIME ZONE 'UTC')::date"),
+        text_rows(&["2024-01-02", "2024-12-31", "2025-02-28"])
+    );
+}
+
+/// `d AT TIME ZONE 'UTC'` inverts the day to its UTC midnight, so the date
+/// cast reads the same day back.
+#[test]
+fn at_time_zone_utc_over_a_date_reads_the_same_day() {
+    assert_eq!(
+        kind_cast_rows("(d AT TIME ZONE 'UTC')::date"),
+        text_rows(&["2024-01-02", "2024-12-31", "2025-02-28"])
+    );
+}
+
+/// `tm AT TIME ZONE` answers a timetz, which a date cast cannot read, so the
+/// refusal PostgreSQL gives for a timetz to date cast stands.
+#[test]
+fn at_time_zone_utc_over_a_time_is_refused_by_the_date_cast() {
+    let ddl = "CREATE TABLE k (tm TIME);";
+    let error = Pg2Sqlite::default()
+        .sql(&format!("{ddl}\nSELECT (tm AT TIME ZONE 'UTC')::date FROM k;"))
+        .expect("parse")
+        .translate_to_sql(&Pg2SqliteOptions::default())
+        .expect_err("expected a translation refusal")
+        .to_string();
+    assert!(error.contains("cannot cast type time with time zone to date"), "{error}");
+}
+
+/// `CURRENT_DATE` cast to `timestamp` and back answers `CURRENT_DATE`, true in
+/// PostgreSQL 18.6.
+#[test]
+fn current_date_survives_a_timestamp_round_trip() {
+    assert_eq!(
+        kind_cast_rows("(CURRENT_DATE::timestamp)::date = CURRENT_DATE"),
+        text_rows(&["1"; 3])
+    );
+}
+
+/// A function call with arguments has no resolvable kind, so the cast keeps
+/// the generic lowering, which reads the spelled-out day.
+#[test]
+fn argument_carrying_function_cast_keeps_the_generic_lowering() {
+    assert_eq!(kind_cast_rows("make_date(2024, 5, 6)::date"), text_rows(&["2024-05-06"; 3]));
+}
+
+/// An interval on either side of a date widens the day to its midnight
+/// timestamp, which the identity cast keeps as written.
+#[test]
+fn interval_plus_date_cast_reads_the_widened_midnight() {
+    let expected = ["2024-01-03 00:00:00", "2025-01-01 00:00:00", "2025-03-01 00:00:00"];
+    assert_eq!(kind_cast_rows("(INTERVAL '1 day' + d)::timestamp"), text_rows(&expected));
+    assert_eq!(kind_cast_rows("(d + INTERVAL '1 day')::timestamp"), text_rows(&expected));
+}
+
+/// A timestamp plus an interval keeps the timestamp kind, so the identity
+/// cast reads the shifted text as written. The assertion selects the rows
+/// whose shifted fraction SQLite keeps, since the shift truncates the
+/// six-digit fraction row to milliseconds.
+#[test]
+fn interval_plus_timestamp_cast_keeps_the_timestamp_kind() {
+    let result = run_translated_with(
+        &format!(
+            "{KIND_CAST_DDL}\nSELECT (ts + INTERVAL '1 hour')::timestamp FROM k WHERE id <= 2 ORDER BY id;"
+        ),
+        &Pg2SqliteOptions::default(),
+    );
+    assert_eq!(result, text_rows(&["2024-01-02 04:04:05.5", "2025-01-01 00:59:59"]));
+}
+
+/// A date shifted by whole days keeps the date kind, so the identity cast
+/// reads the shifted day as written.
+#[test]
+fn date_plus_integer_cast_keeps_the_date_kind() {
+    assert_eq!(
+        kind_cast_rows("(d + 1)::date"),
+        text_rows(&["2024-01-03", "2025-01-01", "2025-03-01"])
+    );
+    assert_eq!(
+        kind_cast_rows("(d - 1)::date"),
+        text_rows(&["2024-01-01", "2024-12-30", "2025-02-27"])
+    );
+}
+
+/// An integer on the left of a date keeps the date kind, so the identity
+/// cast reads the shifted day as written.
+#[test]
+fn integer_plus_date_cast_keeps_the_date_kind() {
+    assert_eq!(
+        kind_cast_rows("(1 + d)::date"),
+        text_rows(&["2024-01-03", "2025-01-01", "2025-03-01"])
+    );
+}
+
+/// A subquery operand may answer differently on each evaluation, and a
+/// TIMETZ to TIME cast would name it twice, so the cast refuses the operand
+/// PostgreSQL would evaluate once.
+#[test]
+fn timetz_to_time_cast_over_a_subquery_is_refused() {
+    let ddl = "CREATE TABLE k (tt TIMETZ);";
+    let error = Pg2Sqlite::default()
+        .sql(&format!("{ddl}\nSELECT ((SELECT tt FROM k LIMIT 1)::timetz)::time;"))
+        .expect("parse")
+        .translate_to_sql(&Pg2SqliteOptions::default())
+        .expect_err("expected a translation refusal")
+        .to_string();
+    assert!(error.contains("a TIMETZ to TIME cast has no SQLite form"), "{error}");
+}
+
+/// A subquery operand may answer differently on each evaluation, and a
+/// TIMESTAMP to TIMESTAMPTZ cast would name it twice, so the cast refuses the
+/// operand PostgreSQL would evaluate once.
+#[test]
+fn timestamp_to_timestamptz_cast_over_a_subquery_is_refused() {
+    let ddl = "CREATE TABLE k (ts TIMESTAMP);";
+    let error = Pg2Sqlite::default()
+        .sql(&format!("{ddl}\nSELECT ((SELECT ts FROM k LIMIT 1)::timestamp)::timestamptz;"))
+        .expect("parse")
+        .translate_to_sql(&Pg2SqliteOptions::default())
+        .expect_err("expected a translation refusal")
+        .to_string();
+    assert!(error.contains("a TIMESTAMP to TIMESTAMPTZ cast has no SQLite form"), "{error}");
+}
