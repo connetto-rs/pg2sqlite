@@ -406,6 +406,7 @@ fn drop_label(object_type: ObjectType) -> &'static str {
     match object_type {
         ObjectType::Schema => "DROP SCHEMA",
         ObjectType::Role => "DROP ROLE",
+        ObjectType::Group => "DROP GROUP",
         ObjectType::User => "DROP USER",
         ObjectType::Sequence => "DROP SEQUENCE",
         ObjectType::Type => "DROP TYPE",
@@ -1918,6 +1919,7 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
                     }
                     ObjectType::Schema
                     | ObjectType::Role
+                    | ObjectType::Group
                     | ObjectType::User
                     | ObjectType::Sequence
                     | ObjectType::Type

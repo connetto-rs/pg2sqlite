@@ -180,6 +180,7 @@ const CASES: &[Case] = &[
     Case { setup: TWO_ROLES_AND_MEMBERSHIP, sql: "REVOKE r FROM u", outcome: Outcome::Warned },
     warned("DENY SELECT ON t TO r"),
     warned("DROP ROLE r"),
+    warned("DROP GROUP r"),
     warned("DROP USER r"),
     // Warned and dropped: type-like definitions.
     warned("CREATE TYPE mood AS ENUM ('sad', 'ok')"),
