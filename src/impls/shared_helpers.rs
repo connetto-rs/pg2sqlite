@@ -44,8 +44,8 @@ use crate::{
                 uuid_columns_of_table,
             },
             vector::{
-                halfvec_refusal, is_halfvec_data_type, is_vector_data_type,
-                maybe_wrap_text_vector_literal, vector_columns_of_table,
+                UnstoredVector, maybe_wrap_text_vector_literal, stored_vector,
+                vector_columns_of_table,
             },
         },
     },
@@ -506,30 +506,32 @@ fn with_output_scope<R>(
     inspect(graph.scope_for_query(query))
 }
 
-/// Inspects known outputs while preserving unknown wildcard widths.
+/// The first answer `read_column` or `read_expression` gives for a known
+/// output of `query`, preserving unknown wildcard widths.
 ///
-/// A query the statement records no scope for answers `false`, as an opaque
+/// A query the statement records no scope for answers [`None`], as an opaque
 /// output does.
-pub(crate) fn query_output_matches(
+pub(crate) fn query_output_find<T>(
     query: &Query,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
-    read_column: impl Fn(&sqlparser::ast::ColumnDef) -> bool,
+    read_column: impl Fn(&sqlparser::ast::ColumnDef) -> Option<T>,
     read_expression: impl Fn(
         &Expr,
         &ParserDB,
         &crate::options::TranslationContext<'_>,
-    ) -> Result<bool, Error>,
-) -> Result<bool, Error> {
+    ) -> Result<Option<T>, Error>,
+) -> Result<Option<T>, Error> {
     with_output_scope(query, schema, options, |scope| {
         for output in scope.iter().flat_map(ColumnQueryScope::outputs) {
             if let QueryOutput::Column { definition, .. } = output
-                && definition_matches(&definition, schema, options, &read_column, &read_expression)?
+                && let Some(found) =
+                    definition_find(&definition, schema, options, &read_column, &read_expression)?
             {
-                return Ok(true);
+                return Ok(Some(found));
             }
         }
-        Ok(false)
+        Ok(None)
     })
 }
 
@@ -605,41 +607,46 @@ pub(crate) fn scalar_query_declared<T: PartialEq>(
 }
 
 #[cfg_attr(feature = "std", recursive::recursive)]
-fn definition_matches(
+fn definition_find<T>(
     definition: &ColumnDefinition<'_, '_, '_, ParserDB>,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
-    read_column: &impl Fn(&sqlparser::ast::ColumnDef) -> bool,
+    read_column: &impl Fn(&sqlparser::ast::ColumnDef) -> Option<T>,
     read_expression: &impl Fn(
         &Expr,
         &ParserDB,
         &crate::options::TranslationContext<'_>,
-    ) -> Result<bool, Error>,
-) -> Result<bool, Error> {
+    ) -> Result<Option<T>, Error>,
+) -> Result<Option<T>, Error> {
     match definition {
         ColumnDefinition::Base { column, .. } => Ok(read_column(column.attribute())),
         ColumnDefinition::Expression { expression, scope } => {
             read_expression(expression, schema, &options.with_definition_scope(*scope))
         }
         ColumnDefinition::SetOperation { left, right, .. } => {
-            Ok(definition_matches(
+            match definition_find(
                 &left.definition(),
                 schema,
                 options,
                 read_column,
                 read_expression,
-            )? || definition_matches(
-                &right.definition(),
-                schema,
-                options,
-                read_column,
-                read_expression,
-            )?)
+            )? {
+                Some(found) => Ok(Some(found)),
+                None => {
+                    definition_find(
+                        &right.definition(),
+                        schema,
+                        options,
+                        read_column,
+                        read_expression,
+                    )
+                }
+            }
         }
         ColumnDefinition::RecursiveUnion { anchor, .. } => {
-            definition_matches(&anchor.definition(), schema, options, read_column, read_expression)
+            definition_find(&anchor.definition(), schema, options, read_column, read_expression)
         }
-        ColumnDefinition::Opaque => Ok(false),
+        ColumnDefinition::Opaque => Ok(None),
     }
 }
 
@@ -1114,7 +1121,7 @@ pub(crate) fn numeric_minor_unit_scales_of_table(
 /// columns.
 #[derive(Default)]
 pub(crate) struct ColumnRewrites {
-    vector_cols: Vec<(String, bool)>,
+    vector_cols: Vec<(String, sql_traits::traits::VectorKind)>,
     uuid_cols: Vec<String>,
     pub(crate) numeric_scales: Vec<(String, u32)>,
     /// Array columns under the JSON representation; a bound parameter here is
@@ -1202,6 +1209,7 @@ impl ColumnRewrites {
         &self,
         column: &str,
         value: Expr,
+        schema: &ParserDB,
         options: &Pg2SqliteOptions,
     ) -> Result<Expr, Error> {
         let is_param = is_bound_parameter(&value);
@@ -1213,14 +1221,14 @@ impl ColumnRewrites {
                     .to_string(),
             ));
         }
-        let mut value = if let Some(is_halfvec) = self
+        let mut value = if let Some(kind) = self
             .vector_cols
             .iter()
             .find(|(col, _)| col.eq_ignore_ascii_case(column))
-            .map(|(_, is_halfvec)| *is_halfvec)
+            .map(|(_, kind)| *kind)
         {
-            if is_halfvec {
-                return Err(halfvec_refusal());
+            if let Some(unstored) = UnstoredVector::of(kind) {
+                return Err(unstored.refusal());
             }
             if is_param {
                 crate::impls::function_helpers::simple_function_expr("vec_f32", vec![value], None)
@@ -1253,7 +1261,7 @@ impl ColumnRewrites {
             if let Some((_, data_type)) =
                 self.literal_checked_cols.iter().find(|(name, _)| name.eq_ignore_ascii_case(column))
             {
-                value = convert_value_for_column_type(data_type, value, options)?;
+                value = convert_value_for_column_type(data_type, value, schema, options)?;
             }
         }
         Ok(value)
@@ -1268,6 +1276,7 @@ impl ColumnRewrites {
         &self,
         target: &AssignmentTarget,
         value: Expr,
+        schema: &ParserDB,
         options: &Pg2SqliteOptions,
     ) -> Result<Expr, Error> {
         if self.is_empty() {
@@ -1276,7 +1285,7 @@ impl ColumnRewrites {
         match target {
             AssignmentTarget::ColumnName(name) => {
                 match last_ident(name) {
-                    Some(column) => self.finish_value(&column.value, value, options),
+                    Some(column) => self.finish_value(&column.value, value, schema, options),
                     None => Ok(value),
                 }
             }
@@ -1290,7 +1299,7 @@ impl ColumnRewrites {
                     .zip(items)
                     .map(|(name, item)| {
                         match last_ident(name) {
-                            Some(column) => self.finish_value(&column.value, item, options),
+                            Some(column) => self.finish_value(&column.value, item, schema, options),
                             None => Ok(item),
                         }
                     })
@@ -1467,6 +1476,7 @@ pub(crate) fn scale_parameter(expr: Expr, scale: u32) -> Expr {
 pub(crate) fn convert_value_for_column_type(
     data_type: &DataType,
     expr: Expr,
+    schema: &ParserDB,
     options: &Pg2SqliteOptions,
 ) -> Result<Expr, Error> {
     let expr = typed_text_literal(data_type, &expr)?.unwrap_or(expr);
@@ -1497,10 +1507,7 @@ pub(crate) fn convert_value_for_column_type(
             None => return Ok(expr),
         }
     }
-    if is_vector_data_type(data_type) {
-        if is_halfvec_data_type(data_type) {
-            return Err(halfvec_refusal());
-        }
+    if stored_vector(data_type, schema)?.is_some() {
         if is_bound_parameter(&expr) {
             return Ok(crate::impls::function_helpers::simple_function_expr(
                 "vec_f32",
@@ -1851,6 +1858,7 @@ pub(crate) fn convert_temporal_value(
 /// read, which is the same refusal its translation gives.
 pub(crate) fn column_storage(
     data_type: &DataType,
+    schema: &ParserDB,
     options: &Pg2SqliteOptions,
 ) -> Result<crate::manifest::ColumnStorage, Error> {
     use crate::manifest::{ColumnStorage, VectorElement};
@@ -1869,12 +1877,9 @@ pub(crate) fn column_storage(
             None => ColumnStorage::Direct,
         });
     }
-    if is_vector_data_type(data_type) {
-        if is_halfvec_data_type(data_type) {
-            return Err(halfvec_refusal());
-        }
+    if let Some(vector) = stored_vector(data_type, schema)? {
         return Ok(ColumnStorage::Vector {
-            dimensions: crate::impls::translator_impls::vector::extract_dimensions(data_type),
+            dimensions: vector.dimensions(),
             element: VectorElement::Float32,
         });
     }
@@ -2195,7 +2200,7 @@ fn translate_column_assignment<D: TranslationDirection>(
     let value = D::translate_expr(cast.as_ref().unwrap_or(source), schema, options, emit)?;
     Ok(Assignment {
         target: target.clone(),
-        value: rewrites.finish_assignment(target, value, D::config(options))?,
+        value: rewrites.finish_assignment(target, value, schema, D::config(options))?,
     })
 }
 
@@ -5325,6 +5330,7 @@ mod tests {
         assert_eq!(
             super::column_storage(
                 &sqlparser::ast::DataType::Uuid,
+                &empty_schema(),
                 &crate::options::Pg2SqliteOptions::default(),
             )
             .expect("no numeric scale to read"),

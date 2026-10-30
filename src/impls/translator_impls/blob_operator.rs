@@ -21,7 +21,7 @@ use crate::{
         function_helpers::{simple_function_expr, single_quoted_literal, string_literal},
         replay::is_replayable,
         shared_helpers::{convert_bytea_hex_literal, is_bound_parameter},
-        translator_impls::vector::{halfvec_refusal, is_halfvec_data_type, is_vector_data_type},
+        translator_impls::vector::{UnstoredVector, is_vector_data_type},
     },
     traits::translator::TranslatorWithContext,
 };
@@ -88,10 +88,10 @@ fn operand(
     }
 }
 
-fn family(data_type: &DataType) -> Option<Family> {
+fn family(data_type: &DataType, schema: &ParserDB) -> Option<Family> {
     if matches!(data_type, DataType::Bytea) {
         Some(Family::Bytea)
-    } else if is_vector_data_type(data_type) {
+    } else if is_vector_data_type(data_type, schema) {
         Some(Family::Vector)
     } else {
         None
@@ -118,8 +118,8 @@ fn is_text(data_type: &DataType) -> bool {
 /// # Errors
 ///
 /// Refuses an operator PostgreSQL does not define over the operand types, one
-/// sqlite-vec has no function for, a `halfvec` operand, and an operand whose
-/// type the statement does not decide beside a BLOB-stored one.
+/// sqlite-vec has no function for, a `halfvec` or `sparsevec` operand, and an
+/// operand whose type the statement does not decide beside a BLOB-stored one.
 pub(crate) fn resolve(
     left: &Expr,
     op: &BinaryOperator,
@@ -148,13 +148,15 @@ pub(crate) fn resolve(
     if sides.iter().flatten().any(|data_type| matches!(data_type, DataType::Array(_))) {
         return Ok(None);
     }
-    if sides.iter().flatten().any(is_halfvec_data_type) {
-        return Err(halfvec_refusal());
+    if let Some(unstored) =
+        sides.iter().flatten().find_map(|data_type| UnstoredVector::declared(data_type, schema))
+    {
+        return Err(unstored.refusal());
     }
     let Some((blob_on_left, blob_type, blob_family)) =
         sides.iter().enumerate().find_map(|(index, side)| {
             let data_type = side.as_ref()?;
-            family(data_type).map(|found| (index == 0, data_type.clone(), found))
+            family(data_type, schema).map(|found| (index == 0, data_type.clone(), found))
         })
     else {
         return Ok(None);
@@ -162,7 +164,7 @@ pub(crate) fn resolve(
     let other = if blob_on_left { &right_type } else { &left_type };
     let other_family = match other {
         Operand::Untyped => Some(blob_family),
-        Operand::Typed(data_type) => family(data_type),
+        Operand::Typed(data_type) => family(data_type, schema),
         Operand::Unresolved => {
             let unresolved = if blob_on_left { right } else { left };
             return Err(Error::forward_refusal(format!(

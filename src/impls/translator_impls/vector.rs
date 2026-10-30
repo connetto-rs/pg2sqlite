@@ -37,7 +37,7 @@ use alloc::{
 use sql_traits::{
     errors::LookupError,
     structs::ParserDB,
-    traits::{ColumnLike, TableLike},
+    traits::{ColumnLike, DataTypeLike, TableLike, VectorKind, VectorType},
 };
 use sqlparser::ast::{
     BinaryOperator, CreateTable, DataType, Expr, Ident, ObjectName, ObjectNamePart, SelectItem,
@@ -68,73 +68,91 @@ pub struct VectorColumnInfo {
     pub column_name: String,
     /// The number of dimensions (e.g., 384 for vector(384)).
     pub dimensions: Option<u32>,
-    /// Whether this is a half-precision (16-bit float) vector column.
-    /// `true` for `halfvec`, `false` for `vector`.
-    pub is_halfvec: bool,
 }
 
-/// Check if a data type is a pgvector type (vector or halfvec).
-pub(crate) fn is_vector_data_type(data_type: &DataType) -> bool {
-    if let DataType::Custom(name, _) = data_type
-        && let Some(type_name) = crate::impls::object_name::last_catalog_name(name)
-    {
-        return type_name == "vector" || type_name == "halfvec";
+/// True when `data_type` is one of pgvector's types, which needs the schema to
+/// run `CREATE EXTENSION vector` and the name to resolve to the extension's
+/// schema.
+pub(crate) fn is_vector_data_type(data_type: &DataType, schema: &ParserDB) -> bool {
+    data_type.vector(schema).is_some()
+}
+
+/// A pgvector type sqlite-vec has no storage for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnstoredVector {
+    /// `halfvec`, whose half-precision elements sqlite-vec cannot hold.
+    HalfVec,
+    /// `sparsevec`, whose positioned nonzero elements sqlite-vec cannot hold.
+    SparseVec,
+}
+
+impl UnstoredVector {
+    /// The unstored type `kind` names, or `None` for `vector`, which
+    /// sqlite-vec stores as packed float32.
+    pub(crate) const fn of(kind: VectorKind) -> Option<Self> {
+        match kind {
+            VectorKind::Vector => None,
+            VectorKind::HalfVec => Some(Self::HalfVec),
+            VectorKind::SparseVec => Some(Self::SparseVec),
+        }
     }
-    false
-}
 
-/// Check if a data type is the halfvec (16-bit float) type.
-pub(crate) fn is_halfvec_data_type(data_type: &DataType) -> bool {
-    if let DataType::Custom(name, _) = data_type
-        && let Some(type_name) = last_ident(name)
-    {
-        return if type_name.quote_style.is_some() {
-            type_name.value == "halfvec"
-        } else {
-            type_name.value.eq_ignore_ascii_case("halfvec")
-        };
+    /// The unstored type `data_type` declares.
+    pub(crate) fn declared(data_type: &DataType, schema: &ParserDB) -> Option<Self> {
+        Self::of(data_type.vector(schema)?.kind())
     }
-    false
-}
 
-/// The typed refusal for unsupported native half-precision storage.
-#[must_use]
-pub(crate) fn halfvec_refusal() -> Error {
-    Error::forward_refusal("half-precision halfvec storage is not supported by sqlite-vec")
-}
-
-/// Extract dimension count from a vector type like vector(384).
-pub(crate) fn extract_dimensions(data_type: &DataType) -> Option<u32> {
-    // The modifier list carries the type arguments, so `vector(384)` arrives
-    // as the single numeric modifier 384.
-    if let DataType::Custom(_, modifiers) = data_type
-        && let Some(sqlparser::ast::TypeModifier::Number(digits, false)) = modifiers.first()
-        && let Ok(dim) = digits.parse::<u32>()
-    {
-        return Some(dim);
+    /// The typed refusal for a value of this type.
+    #[must_use]
+    pub(crate) fn refusal(self) -> Error {
+        Error::forward_refusal(match self {
+            Self::HalfVec => "half-precision halfvec storage is not supported by sqlite-vec",
+            Self::SparseVec => "sparse sparsevec storage is not supported by sqlite-vec",
+        })
     }
-    None
+}
+
+/// The pgvector type `data_type` declares when it is stored as packed float32
+/// in a `BLOB`, or `None` when `data_type` is not one of pgvector's types.
+///
+/// # Errors
+///
+/// Refuses `halfvec` and `sparsevec`, which sqlite-vec cannot store.
+pub(crate) fn stored_vector(
+    data_type: &DataType,
+    schema: &ParserDB,
+) -> Result<Option<VectorType>, Error> {
+    let Some(vector) = data_type.vector(schema) else { return Ok(None) };
+    match UnstoredVector::of(vector.kind()) {
+        Some(unstored) => Err(unstored.refusal()),
+        None => Ok(Some(vector)),
+    }
 }
 
 /// Check if a CREATE TABLE has any vector columns.
 #[must_use]
-pub fn has_vector_columns(create_table: &CreateTable) -> bool {
-    create_table.columns.iter().any(|col| is_vector_data_type(&col.data_type))
+pub fn has_vector_columns(create_table: &CreateTable, schema: &ParserDB) -> bool {
+    create_table.columns.iter().any(|col| is_vector_data_type(&col.data_type, schema))
 }
 
-/// Extract all vector column information from a CREATE TABLE.
+/// Extract every `vector` column of a CREATE TABLE, the float32 columns
+/// sqlite-vec indexes.
 #[must_use]
-pub fn extract_vector_columns(create_table: &CreateTable) -> Vec<VectorColumnInfo> {
+pub fn extract_vector_columns(
+    create_table: &CreateTable,
+    schema: &ParserDB,
+) -> Vec<VectorColumnInfo> {
     create_table
         .columns
         .iter()
-        .filter(|col| is_vector_data_type(&col.data_type))
-        .map(|col| {
-            VectorColumnInfo {
-                column_name: col.name.value.clone(),
-                dimensions: extract_dimensions(&col.data_type),
-                is_halfvec: is_halfvec_data_type(&col.data_type),
-            }
+        .filter_map(|col| {
+            let vector = col.data_type.vector(schema)?;
+            (vector.kind() == VectorKind::Vector).then(|| {
+                VectorColumnInfo {
+                    column_name: col.name.value.clone(),
+                    dimensions: vector.dimensions(),
+                }
+            })
         })
         .collect()
 }
@@ -279,10 +297,7 @@ pub fn generate_vec0_statements(
     options: &Pg2SqliteOptions,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Vec<Statement>, Error> {
-    let vector_cols = extract_vector_columns(create_table);
-    if vector_cols.iter().any(|column| column.is_halfvec) {
-        return Err(halfvec_refusal());
-    }
+    let vector_cols = extract_vector_columns(create_table, schema);
     if vector_cols.is_empty() {
         return Ok(Vec::new());
     }
@@ -359,22 +374,18 @@ pub(crate) fn maybe_wrap_text_vector_literal(mut expr: Expr) -> Expr {
     }
 }
 
-/// Collect `(column_name, is_halfvec)` pairs for every pgvector column on
-/// the resolved schema table, preserving column ordinal order. Returns an
-/// empty `Vec` when the table has no vector columns.
+/// Collect `(column_name, kind)` pairs for every pgvector column on the
+/// resolved schema table, preserving column ordinal order. Returns an empty
+/// `Vec` when the table has no vector columns.
 pub(crate) fn vector_columns_of_table(
     table: &<ParserDB as sql_traits::traits::DatabaseLike>::Table,
     schema: &ParserDB,
-) -> Result<Vec<(String, bool)>, LookupError> {
+) -> Result<Vec<(String, VectorKind)>, LookupError> {
     Ok(table
         .columns(schema)?
         .filter_map(|col| {
-            let dt = &col.attribute().data_type;
-            if is_vector_data_type(dt) {
-                Some((col.column_name().to_string(), is_halfvec_data_type(dt)))
-            } else {
-                None
-            }
+            let vector = col.attribute().data_type.vector(schema)?;
+            Some((col.column_name().to_string(), vector.kind()))
         })
         .collect())
 }
@@ -396,16 +407,20 @@ mod tests {
     }
 
     fn parse_create_table(sql: &str) -> sqlparser::ast::CreateTable {
-        let stmt = parse_statements(sql).remove(0);
-        let Statement::CreateTable(create_table) = stmt else {
-            panic!("expected create table");
-        };
-        create_table
+        parse_statements(sql)
+            .into_iter()
+            .find_map(|statement| {
+                match statement {
+                    Statement::CreateTable(create_table) => Some(create_table),
+                    _ => None,
+                }
+            })
+            .expect("expected create table")
     }
 
     #[test]
     fn find_pk_column_falls_back_to_schema_metadata() {
-        let schema_sql = "CREATE TABLE docs(id INTEGER PRIMARY KEY, embedding vector(3));";
+        let schema_sql = "CREATE EXTENSION vector; CREATE TABLE docs(id INTEGER PRIMARY KEY, embedding vector(3));";
         let schema = ParserDB::from_statements(parse_statements(schema_sql), "test".to_string())
             .expect("schema should build");
 
@@ -439,8 +454,11 @@ mod tests {
         let create_table = parse_create_table(
             "CREATE TABLE missing(id INTEGER PRIMARY KEY, embedding vector(3));",
         );
-        let schema =
-            ParserDB::from_statements(Vec::new(), "test".to_string()).expect("schema should build");
+        let schema = ParserDB::from_statements(
+            parse_statements("CREATE EXTENSION vector;"),
+            "test".to_string(),
+        )
+        .expect("schema should build");
         let options = Pg2SqliteOptions::default();
 
         let err = generate_vec0_statements(&create_table, &schema, &options, &mut |_| {})
@@ -450,7 +468,7 @@ mod tests {
 
     #[test]
     fn generate_vec0_statements_supports_quoted_identifiers() {
-        let sql = r#"CREATE TABLE "Vector Docs" ("doc id" INTEGER PRIMARY KEY, "embedding vec" vector(3));"#;
+        let sql = r#"CREATE EXTENSION vector; CREATE TABLE "Vector Docs" ("doc id" INTEGER PRIMARY KEY, "embedding vec" vector(3));"#;
         let schema = ParserDB::from_statements(parse_statements(sql), "test".to_string())
             .expect("schema should build");
         let create_table = parse_create_table(sql);
@@ -466,7 +484,7 @@ mod tests {
 
     #[test]
     fn generate_vec0_update_trigger_tracks_primary_key_changes() {
-        let sql = "CREATE TABLE docs(id INTEGER PRIMARY KEY, embedding vector(3));";
+        let sql = "CREATE EXTENSION vector; CREATE TABLE docs(id INTEGER PRIMARY KEY, embedding vector(3));";
         let schema = ParserDB::from_statements(parse_statements(sql), "test".to_string())
             .expect("schema should build");
         let create_table = parse_create_table(sql);

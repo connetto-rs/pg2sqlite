@@ -154,7 +154,8 @@ fn the_published_uuid_storage_decodes_a_value_written_through_the_emitted_sql() 
 
 #[test]
 fn the_published_vector_storage_decodes_a_value_written_through_the_emitted_sql() {
-    let pg = "CREATE TABLE t (id int primary key, e vector(3));
+    let pg = "CREATE EXTENSION vector;
+              CREATE TABLE t (id int primary key, e vector(3));
               INSERT INTO t (id, e) VALUES (1, '[0.5, -1.5, 2.25]');";
     let options = Pg2SqliteOptions::default();
     let statements =
@@ -179,4 +180,29 @@ fn the_published_vector_storage_decodes_a_value_written_through_the_emitted_sql(
     let decoded: Vec<f32> =
         stored.as_chunks::<4>().0.iter().map(|chunk| f32::from_le_bytes(*chunk)).collect();
     assert_eq!(decoded, vec![0.5, -1.5, 2.25]);
+}
+
+/// A type named `vector` is pgvector's only where the schema installs the
+/// extension. Elsewhere it is the schema's own type, which has no SQLite
+/// storage.
+#[test]
+fn a_vector_column_needs_the_schema_to_install_pgvector() {
+    let table = "CREATE TABLE t (id INT PRIMARY KEY, v vector(3));";
+    let options = Pg2SqliteOptions::default();
+
+    let installed = format!("CREATE EXTENSION vector; {table}");
+    assert_eq!(
+        storage_of(&installed, &options).into_iter().find(|(name, _)| name == "v"),
+        Some((
+            "v".to_owned(),
+            ColumnStorage::Vector { dimensions: Some(3), element: VectorElement::Float32 }
+        ))
+    );
+
+    let error = Pg2Sqlite::default()
+        .sql(table)
+        .expect("parse")
+        .translation_manifest(&options)
+        .expect_err("a type named vector without the extension has no SQLite storage");
+    assert!(error.to_string().contains("vector has no SQLite equivalent"), "got: {error}");
 }

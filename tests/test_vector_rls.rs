@@ -168,6 +168,7 @@ fn test_vec0_sync_works_with_rls() -> Result<(), Box<dyn std::error::Error>> {
 fn test_role_filtered_vector_translation_keeps_vec0_artifacts()
 -> Result<(), Box<dyn std::error::Error>> {
     let sql = r#"
+        CREATE EXTENSION vector;
         CREATE ROLE readonly_user;
 
         CREATE TABLE embeddings (

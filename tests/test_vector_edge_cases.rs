@@ -15,6 +15,7 @@ use translate_helpers::translate_default as translate;
 #[test]
 fn vector_with_table_level_pk() {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (
             embedding VECTOR(384),
             id INTEGER,
@@ -41,6 +42,7 @@ fn vector_with_table_level_pk() {
 #[test]
 fn vector_with_column_level_pk() {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (
             id INTEGER PRIMARY KEY,
             embedding VECTOR(384)
@@ -64,6 +66,7 @@ fn vector_with_column_level_pk() {
 #[test]
 fn multiple_vector_columns() {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (
             id INTEGER PRIMARY KEY,
             title_embedding VECTOR(384),
@@ -89,6 +92,7 @@ fn multiple_vector_columns() {
 #[test]
 fn vector_without_dimensions() {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (
             id INTEGER PRIMARY KEY,
             embedding VECTOR
@@ -113,6 +117,7 @@ fn vector_without_dimensions() {
 #[test]
 fn vector_without_pk_produces_error() {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (
             name TEXT NOT NULL,
             embedding VECTOR(384)
@@ -131,6 +136,7 @@ fn vector_without_pk_produces_error() {
 #[test]
 fn vector_with_composite_pk() {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (
             id1 INTEGER,
             id2 INTEGER,

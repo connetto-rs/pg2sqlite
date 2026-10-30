@@ -122,7 +122,8 @@ fn media_type_to_blob() {
 
 #[test]
 fn vector_to_blob() {
-    let sql = "CREATE TABLE t (id INT PRIMARY KEY, embedding vector(384));";
+    let sql =
+        "CREATE EXTENSION vector; CREATE TABLE t (id INT PRIMARY KEY, embedding vector(384));";
     let output = translate(sql, &Pg2SqliteOptions::default()).unwrap();
     assert!(output.contains("BLOB"), "vector should map to BLOB, got: {output}");
     parse_sqlite(&output);
@@ -130,7 +131,7 @@ fn vector_to_blob() {
 
 #[test]
 fn schema_qualified_vector_to_blob() {
-    let sql = "CREATE TABLE t (id INT PRIMARY KEY, embedding public.vector(384));";
+    let sql = "CREATE EXTENSION vector; CREATE TABLE t (id INT PRIMARY KEY, embedding public.vector(384));";
     let output = translate(sql, &Pg2SqliteOptions::default()).unwrap();
     assert!(output.contains("BLOB"), "public.vector should map to BLOB, got: {output}");
     parse_sqlite(&output);

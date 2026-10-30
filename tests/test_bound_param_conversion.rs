@@ -313,7 +313,7 @@ mod helpers;
 fn vector_param_comparison_finds_row() {
     helpers::register_sqlite_vec_once();
     let opt = Pg2SqliteOptions::default();
-    let schema = "CREATE TABLE vecs (id INT PRIMARY KEY, emb vector(3));";
+    let schema = "CREATE EXTENSION vector; CREATE TABLE vecs (id INT PRIMARY KEY, emb vector(3));";
     let seed = "INSERT INTO vecs VALUES (1, '[1.0,2.0,3.0]');";
 
     let conn = vec_setup(&opt, schema, seed);
@@ -442,7 +442,7 @@ fn unscaled_col_is_distinct_from_numeric_col() {
 fn vector_param_update_wraps_with_vec_f32() {
     helpers::register_sqlite_vec_once();
     let opt = Pg2SqliteOptions::default();
-    let schema = "CREATE TABLE vecs (id INT PRIMARY KEY, emb vector(3));";
+    let schema = "CREATE EXTENSION vector; CREATE TABLE vecs (id INT PRIMARY KEY, emb vector(3));";
     let seed = "INSERT INTO vecs VALUES (1, '[1.0,2.0,3.0]');";
 
     let conn = vec_setup(&opt, schema, seed);

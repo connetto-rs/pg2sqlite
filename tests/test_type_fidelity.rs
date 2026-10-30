@@ -434,7 +434,11 @@ fn array_columns_of_blob_stored_types_are_refused() {
     for (ddl, opts, element) in [
         ("CREATE TABLE b (id INT PRIMARY KEY, blobs BYTEA[]);", array_opts(), "BYTEA"),
         ("CREATE TABLE u (id INT PRIMARY KEY, ids UUID[]);", blob_uuid_array_opts(), "UUID"),
-        ("CREATE TABLE v (id INT PRIMARY KEY, e vector(3)[]);", array_opts(), "vector(3)"),
+        (
+            "CREATE EXTENSION vector; CREATE TABLE v (id INT PRIMARY KEY, e vector(3)[]);",
+            array_opts(),
+            "vector(3)",
+        ),
     ] {
         expect_refusal(
             ddl,
@@ -639,7 +643,8 @@ fn bytea_operators_postgresql_cannot_resolve_are_refused() {
 
 #[test]
 fn an_untranslatable_operand_of_a_bytea_or_vector_lowering_is_reported() {
-    let schema = "CREATE TABLE t (id INT PRIMARY KEY, s TEXT, b BYTEA, v vector(3));";
+    let schema = "CREATE EXTENSION vector; \
+                  CREATE TABLE t (id INT PRIMARY KEY, s TEXT, b BYTEA, v vector(3));";
     for query in [
         "SELECT encode(md5(s)::bytea, 'hex') FROM t;",
         "SELECT b || md5(s)::bytea FROM t;",

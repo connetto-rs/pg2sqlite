@@ -20,6 +20,7 @@ use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 #[test]
 fn test_vector_type_to_blob() -> Result<(), Box<dyn std::error::Error>> {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (
             id INTEGER PRIMARY KEY,
             embedding vector(384)
@@ -122,6 +123,7 @@ fn test_cosine_distance_operator() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn test_vector_cast_to_vec_f32() -> Result<(), Box<dyn std::error::Error>> {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (
             id INTEGER PRIMARY KEY,
             embedding BLOB
@@ -161,7 +163,7 @@ fn test_vector_cast_to_vec_f32() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn qualified_vector_cast_lowers_to_vec_f32() -> Result<(), Box<dyn std::error::Error>> {
     let translated = Pg2Sqlite::default()
-        .sql("SELECT '[1,2]'::public.vector AS v;")?
+        .sql("CREATE EXTENSION vector;\nSELECT '[1,2]'::public.vector AS v;")?
         .translate(&Pg2SqliteOptions::default())?
         .into_vec();
     let select_stmt = translated
@@ -188,6 +190,7 @@ fn qualified_vector_cast_lowers_to_vec_f32() -> Result<(), Box<dyn std::error::E
 #[test]
 fn test_vector_column_generates_vec0() -> Result<(), Box<dyn std::error::Error>> {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (
             id INTEGER PRIMARY KEY,
             name TEXT,
@@ -234,6 +237,7 @@ fn test_vector_column_generates_vec0() -> Result<(), Box<dyn std::error::Error>>
 #[test]
 fn test_schema_qualified_vector_column_generates_vec0() -> Result<(), Box<dyn std::error::Error>> {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (
             id INTEGER PRIMARY KEY,
             name TEXT,
@@ -267,6 +271,7 @@ fn test_schema_qualified_vector_column_generates_vec0() -> Result<(), Box<dyn st
 #[test]
 fn test_multiple_vector_columns() -> Result<(), Box<dyn std::error::Error>> {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (
             id INTEGER PRIMARY KEY,
             title_embedding vector(384),
@@ -335,6 +340,7 @@ fn test_no_vector_columns_no_vec0() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn test_distance_with_cast() -> Result<(), Box<dyn std::error::Error>> {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (
             id INTEGER PRIMARY KEY,
             embedding BLOB
@@ -371,6 +377,7 @@ fn test_distance_with_cast() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn test_order_by_distance() -> Result<(), Box<dyn std::error::Error>> {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (
             id INTEGER PRIMARY KEY,
             embedding BLOB
@@ -406,6 +413,7 @@ fn test_order_by_distance() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn test_vector_translation_snapshot() -> Result<(), Box<dyn std::error::Error>> {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL,
@@ -425,6 +433,7 @@ fn test_vector_translation_snapshot() -> Result<(), Box<dyn std::error::Error>> 
 #[test]
 fn test_vector_query_snapshot() -> Result<(), Box<dyn std::error::Error>> {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (
             id INTEGER PRIMARY KEY,
             embedding BLOB

@@ -51,9 +51,8 @@ use crate::{
             declared_in_scope, declared_numeric_precision, declared_type_matches,
             extract_column_references_from_function, function_argument_exprs,
             inspect_declared_in_scope, is_bound_parameter, is_integral_expression, numeric_scale,
-            query_output_matches, referenced_column_name, rescale_minor_units,
-            scale_decimal_literal, scale_of, scale_parameter, scope_declines_column,
-            translate_expr_recursive,
+            query_output_find, referenced_column_name, rescale_minor_units, scale_decimal_literal,
+            scale_of, scale_parameter, scope_declines_column, translate_expr_recursive,
         },
         temporal_arithmetic::{
             TemporalKind, epoch_of_temporal_difference, temporal_kind_of,
@@ -73,7 +72,7 @@ use crate::{
             data_type::{MAX_NUMERIC_PRECISION, exact_numeric_info, numeric_precision_and_scale},
             function::cube_root_closed_form,
             helpers::Forward,
-            vector::is_vector_data_type,
+            vector::{UnstoredVector, is_vector_data_type},
         },
     },
     traits::{SessionVariableMapping, translator::TranslatorWithContext},
@@ -1312,49 +1311,28 @@ crate::errors::Error::forward_refusal("AT TIME ZONE supports only literal UTC/lo
     Ok(simple_function_expr("datetime", vec![translated_timestamp, string_literal(&applied)], None))
 }
 
-/// Lowers a supported vector cast to its native codec.
-fn translate_vector_cast(
-    expr: &Expr,
-    data_type: &DataType,
-    schema: &ParserDB,
-    options: &crate::options::TranslationContext<'_>,
-    emit: crate::warnings::WarningSink<'_>,
-) -> Result<Expr, crate::errors::Error> {
-    if crate::impls::translator_impls::vector::is_halfvec_data_type(data_type) {
-        return Err(crate::impls::translator_impls::vector::halfvec_refusal());
-    }
-    let translated_expr = expr.translate_with_warnings(schema, options, emit)?;
-    Ok(simple_function_expr("vec_f32", vec![translated_expr], None))
-}
-
-fn halfvec_operand(
+/// The pgvector type sqlite-vec cannot store that `expr` evaluates to, read
+/// through columns, scalar subqueries and nested expressions.
+fn unstored_vector_operand(
     expr: &Expr,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
-) -> Result<Option<()>, crate::errors::Error> {
+) -> Result<Option<UnstoredVector>, crate::errors::Error> {
     if let Expr::Subquery(query) = expr {
-        return query_output_matches(
+        return query_output_find(
             query,
             schema,
             options,
-            |column| {
-                crate::impls::translator_impls::vector::is_halfvec_data_type(&column.data_type)
-            },
-            |expr, schema, options| {
-                halfvec_operand(expr, schema, options).map(|value| value.is_some())
-            },
-        )
-        .map(|matched| matched.then_some(()));
+            |column| UnstoredVector::declared(&column.data_type, schema),
+            unstored_vector_operand,
+        );
     }
     let declared = inspect_declared_in_scope(
         expr,
         schema,
         options,
-        |column| {
-            crate::impls::translator_impls::vector::is_halfvec_data_type(&column.data_type)
-                .then_some(())
-        },
-        halfvec_operand,
+        |column| UnstoredVector::declared(&column.data_type, schema),
+        unstored_vector_operand,
     )?;
     if declared.is_some() {
         return Ok(declared);
@@ -1362,13 +1340,14 @@ fn halfvec_operand(
     let mut result = Ok(None);
     for_each_child_expr(expr, &mut |child| {
         if matches!(result, Ok(None)) {
-            result = halfvec_operand(child, schema, options);
+            result = unstored_vector_operand(child, schema, options);
         }
     });
     result
 }
 
-/// Lowers a native vector distance without reinterpreting half-precision bytes.
+/// Lowers a native vector distance, refusing an operand sqlite-vec cannot
+/// store rather than reinterpreting its bytes.
 fn translate_vector_distance_op(
     left: &Expr,
     right: &Expr,
@@ -1377,10 +1356,12 @@ fn translate_vector_distance_op(
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Expr, crate::errors::Error> {
-    if halfvec_operand(left, schema, options)?.is_some()
-        || halfvec_operand(right, schema, options)?.is_some()
-    {
-        return Err(crate::impls::translator_impls::vector::halfvec_refusal());
+    let unstored = match unstored_vector_operand(left, schema, options)? {
+        Some(unstored) => Some(unstored),
+        None => unstored_vector_operand(right, schema, options)?,
+    };
+    if let Some(unstored) = unstored {
+        return Err(unstored.refusal());
     }
     let translated = [
         left.translate_with_warnings(schema, options, emit)?,
@@ -2209,7 +2190,7 @@ fn convert_beside_column_expr(
                 &dt,
                 options,
             )?;
-            convert_value_for_column_type(&dt, value, options)
+            convert_value_for_column_type(&dt, value, schema, options)
         }
         None => Ok(value),
     }
@@ -2705,7 +2686,7 @@ fn translate_binary_op(
                     options,
                     |column| {
                         let dt = &column.data_type;
-                        if is_vector_data_type(dt)
+                        if is_vector_data_type(dt, schema)
                             || matches!(dt, DataType::Array(_))
                             || (crate::impls::shared_helpers::literal_checks_apply(dt)
                                 && matches!(sibling, Expr::Value(_)))
@@ -3401,8 +3382,9 @@ fn unwrap_pg_catalog_operator(parts: &[String]) -> Option<BinaryOperator> {
     })
 }
 
-fn reject_halfvec_reference(
+fn reject_unstored_vector_reference(
     expr: &Expr,
+    schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
 ) -> Result<(), crate::errors::Error> {
     let pseudo;
@@ -3426,11 +3408,9 @@ fn reject_halfvec_reference(
     for definition in options.column_definitions(expr, pseudo_reference) {
         let Some(definition) = definition? else { continue };
         if let ColumnDefinition::Base { column, .. } = definition
-            && crate::impls::translator_impls::vector::is_halfvec_data_type(
-                &column.attribute().data_type,
-            )
+            && let Some(unstored) = UnstoredVector::declared(&column.attribute().data_type, schema)
         {
-            return Err(crate::impls::translator_impls::vector::halfvec_refusal());
+            return Err(unstored.refusal());
         }
         break;
     }
@@ -3448,7 +3428,7 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
         options: &crate::options::TranslationContext<'_>,
         emit: &mut dyn FnMut(crate::warnings::TranslationWarning),
     ) -> Result<Self::SQLiteEntry, crate::errors::Error> {
-        reject_halfvec_reference(self, options)?;
+        reject_unstored_vector_reference(self, schema, options)?;
         Ok(match self {
             // PostgreSQL's other spellings of a string literal have no SQLite
             // form: `$$hello$$` reads there as a parameter named `$hello$`,
@@ -3536,8 +3516,11 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                     {
                         return distributed.translate_with_warnings(schema, options, emit);
                     }
-                    if crate::impls::translator_impls::vector::is_vector_data_type(data_type) {
-                        return translate_vector_cast(expr, data_type, schema, options, emit);
+                    if crate::impls::translator_impls::vector::stored_vector(data_type, schema)?
+                        .is_some()
+                    {
+                        let translated = expr.translate_with_warnings(schema, options, emit)?;
+                        return Ok(simple_function_expr("vec_f32", vec![translated], None));
                     }
                     // PG `'...'::uuid` under Blob representation: lower to the
                     // same text-to-blob expression used for INSERT/UPDATE

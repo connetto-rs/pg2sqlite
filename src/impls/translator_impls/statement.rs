@@ -428,10 +428,10 @@ fn translate_create_table(
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Vec<Statement>, Error> {
-    if create_table.columns.iter().any(|column| {
-        crate::impls::translator_impls::vector::is_halfvec_data_type(&column.data_type)
+    if let Some(unstored) = create_table.columns.iter().find_map(|column| {
+        crate::impls::translator_impls::vector::UnstoredVector::declared(&column.data_type, schema)
     }) {
-        return Err(crate::impls::translator_impls::vector::halfvec_refusal());
+        return Err(unstored.refusal());
     }
     if let Some(role_filtered) =
         translate_create_table_for_role(create_table, schema, options, emit)?
@@ -599,7 +599,7 @@ fn append_vec0_statements_if_needed(
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<(), Error> {
-    if has_vector_columns(create_table) {
+    if has_vector_columns(create_table, schema) {
         statements.extend(generate_vec0_statements(create_table, schema, options, emit)?);
     }
     Ok(())

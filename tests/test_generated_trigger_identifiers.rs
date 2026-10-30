@@ -40,6 +40,7 @@ fn fts5_generated_trigger_sql_handles_quoted_identifiers() {
 #[test]
 fn vec0_generated_trigger_sql_handles_quoted_identifiers() {
     let sql = r#"
+        CREATE EXTENSION vector;
         CREATE TABLE "embeddings-bad" (
             id INTEGER PRIMARY KEY,
             embedding vector(3)

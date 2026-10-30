@@ -16,6 +16,8 @@ use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
 
 const SCHEMA_SQL: &str = r#"
+    CREATE EXTENSION vector;
+
     CREATE TABLE users (
         id INTEGER PRIMARY KEY,
         name TEXT NOT NULL,

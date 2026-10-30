@@ -22,6 +22,7 @@ fn find_update(out: &str) -> String {
 #[test]
 fn insert_into_vector_column_wraps_text_literal_with_vec_f32() {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (id INTEGER PRIMARY KEY, embedding vector(3));
         INSERT INTO items (id, embedding) VALUES (1, '[0.1, 0.2, 0.3]');
     ";
@@ -37,6 +38,7 @@ fn insert_into_vector_column_wraps_text_literal_with_vec_f32() {
 #[test]
 fn insert_positional_without_column_list_wraps_vector_position() {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (id INTEGER PRIMARY KEY, embedding vector(3));
         INSERT INTO items VALUES (1, '[0.1, 0.2, 0.3]');
     ";
@@ -52,6 +54,7 @@ fn insert_positional_without_column_list_wraps_vector_position() {
 #[test]
 fn insert_multi_row_values_wraps_each_vector_literal() {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (id INTEGER PRIMARY KEY, embedding vector(3));
         INSERT INTO items (id, embedding) VALUES
             (1, '[0.1, 0.2, 0.3]'),
@@ -69,6 +72,7 @@ fn insert_multi_row_values_wraps_each_vector_literal() {
 #[test]
 fn insert_null_at_vector_position_left_alone() {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (id INTEGER PRIMARY KEY, embedding vector(3));
         INSERT INTO items (id, embedding) VALUES (1, NULL);
     ";
@@ -87,6 +91,7 @@ fn insert_null_at_vector_position_left_alone() {
 #[test]
 fn insert_default_at_vector_position_becomes_an_unwrapped_null() {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (id INTEGER PRIMARY KEY, embedding vector(3));
         INSERT INTO items (id, embedding) VALUES (1, DEFAULT);
     ";
@@ -104,6 +109,7 @@ fn insert_default_at_vector_position_becomes_an_unwrapped_null() {
 #[test]
 fn insert_already_wrapped_vector_literal_not_double_wrapped() {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (id INTEGER PRIMARY KEY, embedding vector(3));
         INSERT INTO items (id, embedding) VALUES (1, vec_f32('[0.1, 0.2, 0.3]'));
     ";
@@ -117,6 +123,7 @@ fn insert_already_wrapped_vector_literal_not_double_wrapped() {
 #[test]
 fn insert_explicit_vector_cast_not_double_wrapped() {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (id INTEGER PRIMARY KEY, embedding vector(3));
         INSERT INTO items (id, embedding) VALUES (1, '[0.1, 0.2, 0.3]'::vector);
     ";
@@ -149,6 +156,7 @@ fn insert_non_vector_text_column_not_wrapped() {
 #[test]
 fn insert_from_select_not_modified() {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (id INTEGER PRIMARY KEY, embedding vector(3));
         CREATE TABLE other (id INTEGER PRIMARY KEY, embedding vector(3));
         INSERT INTO items (id, embedding) SELECT id, embedding FROM other;
@@ -162,6 +170,7 @@ fn insert_from_select_not_modified() {
 #[test]
 fn update_set_vector_column_wraps_text_literal() {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (id INTEGER PRIMARY KEY, embedding vector(3));
         UPDATE items SET embedding = '[0.1, 0.2, 0.3]' WHERE id = 1;
     ";
@@ -177,6 +186,7 @@ fn update_set_vector_column_wraps_text_literal() {
 #[test]
 fn update_set_non_vector_column_not_wrapped() {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT, embedding vector(3));
         UPDATE items SET label = '[not-a-vector]' WHERE id = 1;
     ";
@@ -189,6 +199,7 @@ fn update_set_non_vector_column_not_wrapped() {
 #[test]
 fn update_already_wrapped_vector_literal_not_double_wrapped() {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (id INTEGER PRIMARY KEY, embedding vector(3));
         UPDATE items SET embedding = vec_f32('[0.1, 0.2, 0.3]') WHERE id = 1;
     ";
@@ -206,6 +217,7 @@ fn update_already_wrapped_vector_literal_not_double_wrapped() {
 #[test]
 fn do_update_on_vector_column_wraps_text_literal_with_vec_f32() {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (id INTEGER PRIMARY KEY, embedding vector(2));
         INSERT INTO items VALUES (1, '[3,4]') ON CONFLICT (id) DO UPDATE SET embedding = '[5,6]';
     ";
@@ -224,6 +236,7 @@ fn do_update_on_vector_column_wraps_text_literal_with_vec_f32() {
 #[test]
 fn tuple_update_on_vector_column_wraps_text_literal_with_vec_f32() {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (id INTEGER PRIMARY KEY, n INTEGER, embedding vector(2));
         UPDATE items SET (n, embedding) = (7, '[5,6]') WHERE id = 1;
     ";
@@ -261,6 +274,7 @@ fn apply_vector_sql(pg: &str) {
 #[test]
 fn insert_select_text_literal_wraps_vec_f32() {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (id INTEGER PRIMARY KEY, embedding vector(3));
         INSERT INTO items (id, embedding) SELECT 1, '[0.1, 0.2, 0.3]';
     ";
@@ -278,6 +292,7 @@ fn insert_select_text_literal_wraps_vec_f32() {
 #[test]
 fn insert_select_union_all_wraps_both_arms() {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (id INTEGER PRIMARY KEY, embedding vector(3));
         INSERT INTO items (id, embedding)
             SELECT 1, '[0.1, 0.2, 0.3]'
@@ -298,6 +313,7 @@ fn insert_select_union_all_wraps_both_arms() {
 #[test]
 fn update_subquery_assignment_wraps_vec_f32() {
     let sql = "
+        CREATE EXTENSION vector;
         CREATE TABLE items (id INTEGER PRIMARY KEY, embedding vector(3));
         UPDATE items SET embedding = (SELECT '[0.1, 0.2, 0.3]') WHERE id = 1;
     ";
