@@ -612,3 +612,14 @@ fn time_column_write_positions_take_the_shifted_value() {
     );
     assert_eq!(rows, vec![Some("05:04:05.5".to_string())]);
 }
+
+/// `localtime` shifted by a whole day wraps back to itself, true in PostgreSQL
+/// 18.6.
+#[test]
+fn localtime_shifted_by_a_day_wraps_to_itself() {
+    let rows = run_translated_with(
+        "SELECT localtime + interval '24 hours' = localtime;",
+        &Pg2SqliteOptions::default(),
+    );
+    assert_eq!(rows, vec![Some("1".to_string())]);
+}
