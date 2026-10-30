@@ -68,8 +68,6 @@ pub struct VectorColumnInfo {
     pub column_name: String,
     /// The number of dimensions (e.g., 384 for vector(384)).
     pub dimensions: Option<u32>,
-    /// Which pgvector type the column holds.
-    pub kind: VectorKind,
 }
 
 /// True when `data_type` is one of pgvector's types, which needs the schema to
@@ -137,7 +135,8 @@ pub fn has_vector_columns(create_table: &CreateTable, schema: &ParserDB) -> bool
     create_table.columns.iter().any(|col| is_vector_data_type(&col.data_type, schema))
 }
 
-/// Extract all vector column information from a CREATE TABLE.
+/// Extract every `vector` column of a CREATE TABLE, the float32 columns
+/// sqlite-vec indexes.
 #[must_use]
 pub fn extract_vector_columns(
     create_table: &CreateTable,
@@ -148,10 +147,11 @@ pub fn extract_vector_columns(
         .iter()
         .filter_map(|col| {
             let vector = col.data_type.vector(schema)?;
-            Some(VectorColumnInfo {
-                column_name: col.name.value.clone(),
-                dimensions: vector.dimensions(),
-                kind: vector.kind(),
+            (vector.kind() == VectorKind::Vector).then(|| {
+                VectorColumnInfo {
+                    column_name: col.name.value.clone(),
+                    dimensions: vector.dimensions(),
+                }
             })
         })
         .collect()
@@ -298,9 +298,6 @@ pub fn generate_vec0_statements(
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Vec<Statement>, Error> {
     let vector_cols = extract_vector_columns(create_table, schema);
-    if let Some(unstored) = vector_cols.iter().find_map(|column| UnstoredVector::of(column.kind)) {
-        return Err(unstored.refusal());
-    }
     if vector_cols.is_empty() {
         return Ok(Vec::new());
     }
