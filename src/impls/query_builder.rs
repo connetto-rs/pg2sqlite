@@ -103,6 +103,7 @@ pub(crate) fn plain_table_factor(name: ObjectName) -> TableFactor {
         json_path: None,
         sample: None,
         index_directives: Vec::new(),
+        inheritance: None,
     }
 }
 
@@ -132,6 +133,7 @@ pub(crate) fn table_function_factor(
         json_path: None,
         sample: None,
         index_directives: Vec::new(),
+        inheritance: None,
     }
 }
 

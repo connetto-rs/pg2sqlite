@@ -1010,6 +1010,7 @@ fn translate_truncate(
                     json_path: None,
                     sample: None,
                     index_directives: vec![],
+                    inheritance: None,
                     with_ordinality: false,
                 },
                 joins: vec![],

@@ -4399,6 +4399,9 @@ pub(crate) fn translate_table_factor<D: TranslationDirection>(
             json_path,
             sample,
             index_directives,
+            // No descendant exists, since INHERITS and PARTITION OF are
+            // refused, so ONLY and `*` both name just this table.
+            inheritance: _,
         } => {
             // generate_series with args parses as TableFactor::Table (not
             // Function).
@@ -4480,6 +4483,7 @@ pub(crate) fn translate_table_factor<D: TranslationDirection>(
                     .map(|sample| translate_table_sample_kind::<D>(sample, schema, options, emit))
                     .transpose()?,
                 index_directives: index_directives.clone(),
+                inheritance: None,
             }
         }
         TableFactor::Derived { subquery, lateral, alias, sample } => {
@@ -4836,6 +4840,7 @@ fn renamed_relation_factor<D: TranslationDirection>(
         json_path: None,
         sample: None,
         index_directives: Vec::new(),
+        inheritance: None,
     };
 
     Ok(TableFactor::Derived {
