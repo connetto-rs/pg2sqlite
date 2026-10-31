@@ -1821,6 +1821,13 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
             }
             Self::Rollback { chain, savepoint } => translate_rollback(*chain, savepoint.as_ref()),
             Self::Vacuum(vacuum) => translate_vacuum(vacuum, emit),
+            Self::RefreshMaterializedView(_) => {
+                return Err(reject_unsupported_statement(
+                    self,
+                    "SQLite has no materialized view, and the matching CREATE is refused, so \
+                     nothing of the kind can exist in the output to refresh.",
+                ));
+            }
             // DROP TABLE/VIEW/INDEX - translate to SQLite (strip
             // CASCADE/RESTRICT)
             Self::Drop { object_type, if_exists, names, cascade, .. } => {
@@ -2119,6 +2126,13 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
                 return Err(reject_unsupported_statement(
                     self,
                     "SQLite has no query rewrite rules. Rewrite the rule as explicit statements or triggers.",
+                ));
+            }
+            Self::DropRule(_) => {
+                return Err(reject_unsupported_statement(
+                    self,
+                    "SQLite has no query rewrite rules, and the matching CREATE RULE is refused, \
+                     so nothing of the kind can exist in the output to drop.",
                 ));
             }
             Self::AlterTrigger(_) => {

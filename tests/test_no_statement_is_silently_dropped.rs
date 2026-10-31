@@ -339,6 +339,8 @@ const CASES: &[Case] = &[
     rejected("DROP DATABASE d"),
     rejected("DROP SCHEMA s CASCADE"),
     rejected("DROP MATERIALIZED VIEW mv"),
+    rejected("REFRESH MATERIALIZED VIEW mv"),
+    rejected("DROP RULE r ON t"),
 ];
 
 fn report(sql: &str) -> Result<TranslationReport, pg2sqlite::errors::Error> {
