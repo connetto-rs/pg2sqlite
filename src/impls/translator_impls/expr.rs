@@ -58,7 +58,7 @@ use crate::{
             scale_of, scale_parameter, scope_declines_column, translate_expr_recursive,
         },
         temporal_arithmetic::{
-            TemporalKind, epoch_of_temporal_difference, temporal_kind_of,
+            TemporalKind, epoch_of_temporal_difference, from_year_one, temporal_kind_of,
             translate_temporal_binary_op, trim_trailing_zeros,
         },
         timezone::{
@@ -2573,7 +2573,7 @@ fn shifted_interval_target(
             year,
         ));
     }
-    Ok(shifted_datetime(target, &modifiers))
+    Ok(from_year_one(shifted_datetime(target, &modifiers)))
 }
 
 /// Translate a binary operation expression.

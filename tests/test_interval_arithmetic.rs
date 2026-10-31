@@ -251,6 +251,42 @@ fn a_literal_step_leaving_the_range_is_refused_before_a_later_step() {
     assert!(error.contains("years 1 to 9999"), "{error}");
 }
 
+/// Below the year 1 SQLite answers its own astronomical year (`0000` for
+/// 1 BC, `-0699` for 700 BC), which never matches PostgreSQL's `… BC` text and
+/// sorts backwards, so a column shifted before the year 1 answers NULL, as
+/// one shifted past 9999 does.
+#[test]
+fn column_arithmetic_landing_before_the_year_one_answers_null() {
+    for probe in [
+        "SELECT ts - interval '1 year' FROM t",
+        "SELECT ts - interval '700 years' FROM t",
+        "SELECT ts - 3 * interval '1 year' FROM t",
+        "SELECT d - 365 FROM t",
+        "SELECT d - 1000 FROM t",
+    ] {
+        let rows = run_translated_with(
+            &format!(
+                "CREATE TABLE t (ts timestamp, d date);
+                 INSERT INTO t (ts, d) VALUES ('0001-06-01', '0001-06-01');
+                 {probe};"
+            ),
+            &Pg2SqliteOptions::default(),
+        );
+        assert_eq!(rows, vec![None], "{probe}");
+    }
+}
+
+#[test]
+fn column_arithmetic_inside_the_year_one_is_kept() {
+    let rows = run_translated_with(
+        "CREATE TABLE t (ts timestamp, d date);
+         INSERT INTO t (ts, d) VALUES ('0002-06-01 10:00:00', '0002-06-01');
+         SELECT ts - interval '1 year' FROM t UNION ALL SELECT d - 516 FROM t;",
+        &Pg2SqliteOptions::default(),
+    );
+    assert_eq!(rows, vec![Some("0001-06-01 10:00:00".to_string()), Some("0001-01-01".to_string())]);
+}
+
 #[test]
 fn the_range_spelling_is_read() {
     assert_eq!(
