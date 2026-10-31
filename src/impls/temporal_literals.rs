@@ -343,6 +343,9 @@ fn reject_non_iso_input(kind: TemporalLiteralKind, text: &str) -> Result<(), Err
         "allballs",
     ];
     let lowered = text.to_ascii_lowercase();
+    if lowered.ends_with(" bc") {
+        return Err(outside_four_digit_years(text));
+    }
     if KEYWORDS.contains(&lowered.as_str()) {
         return Err(unreadable(
             kind,

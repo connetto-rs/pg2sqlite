@@ -1652,6 +1652,21 @@ fn year_zero_is_refused_as_postgresql_refuses_it() {
     assert!(message.contains("date/time field value out of range"), "{message}");
 }
 
+/// PostgreSQL stores BC dates, which the replica's text cannot hold.
+#[test]
+fn a_bc_literal_is_refused_as_the_replica_limit() {
+    for (kind, literal) in [
+        ("date", "0677-01-31 BC"),
+        ("date", "0001-01-01 bc"),
+        ("timestamp", "0001-01-01 BC"),
+        ("timestamp with time zone", "0001-01-01 10:00 BC"),
+    ] {
+        let message = temporal_refusal(kind, literal);
+        assert!(message.contains("years 1 to 9999"), "{kind} '{literal}': {message}");
+        assert!(!message.contains("month name"), "{kind} '{literal}': {message}");
+    }
+}
+
 #[test]
 fn a_bound_parameter_in_a_checked_column_passes_through() {
     // The caller binds the value PostgreSQL takes, so there is no literal to

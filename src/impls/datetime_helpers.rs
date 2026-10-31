@@ -630,6 +630,9 @@ fn take_last_argument(expr: &mut Expr) -> Option<Expr> {
 #[must_use]
 #[cfg_attr(feature = "std", recursive::recursive)]
 pub(crate) fn is_offset_less_timestamp_call(expr: &Expr) -> bool {
+    if let Some(guarded) = super::temporal_arithmetic::year_one_guarded(peel_nested(expr)) {
+        return is_offset_less_timestamp_call(guarded);
+    }
     let Expr::Function(function) = peel_nested(expr) else { return false };
     let named = |name| super::function_helpers::is_function_named(function, name);
     if named("datetime") || named("date") {
