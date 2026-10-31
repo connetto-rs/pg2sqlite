@@ -324,6 +324,17 @@ const CASES: &[Case] = &[
     // Emitted: a view redefinition, which is CREATE OR REPLACE VIEW spelled
     // differently and takes the same drop-then-create path.
     emitted("ALTER VIEW v AS SELECT 1"),
+    // Rejected: every other ALTER VIEW form renames the view or a column, or
+    // changes a property a SQLite view does not have.
+    rejected("ALTER VIEW v ALTER COLUMN n SET DEFAULT 1"),
+    rejected("ALTER VIEW v ALTER COLUMN n DROP DEFAULT"),
+    rejected("ALTER VIEW v OWNER TO r"),
+    rejected("ALTER VIEW v RENAME COLUMN n TO m"),
+    rejected("ALTER VIEW v RENAME TO w"),
+    rejected("ALTER VIEW v SET SCHEMA s"),
+    rejected("ALTER VIEW v SET (security_barrier = true)"),
+    rejected("ALTER VIEW v RESET (security_barrier)"),
+    rejected("ALTER VIEW IF EXISTS v RENAME TO w"),
     // Rejected: database-level statements.
     rejected("CREATE DATABASE d"),
     rejected("DROP DATABASE d"),

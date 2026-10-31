@@ -43,13 +43,14 @@ use sql_traits::{
     traits::{DatabaseLike, TableLike},
 };
 use sqlparser::ast::{
-    AlterTable, AlterTableOperation, AlterTableType, BeginTransactionKind, BinaryOperator,
-    CascadeOption, ColumnDef, ColumnOption, CreateFunction, CreateTableOptions, CreateView, Delete,
-    DescribeAlias, DiscardObject, DropBehavior, ExceptionWhen, Expr, FromTable, Ident, Merge,
-    ObjectName, ObjectNamePart, ObjectType, Query, RenameTable, RenameTableNameKind, Set,
-    SqlOption, Statement, TableFactor, TableWithJoins, TransactionAccessMode, TransactionMode,
-    TransactionModifier, TriggerEvent, TriggerPeriod, Truncate, TruncateIdentityOption,
-    UnaryOperator, VacuumStatement, ViewColumnDef, helpers::attached_token::AttachedToken,
+    AlterTable, AlterTableOperation, AlterTableType, AlterView, AlterViewOperation,
+    BeginTransactionKind, BinaryOperator, CascadeOption, ColumnDef, ColumnOption, CreateFunction,
+    CreateTableOptions, CreateView, Delete, DescribeAlias, DiscardObject, DropBehavior,
+    ExceptionWhen, Expr, FromTable, Ident, Merge, ObjectName, ObjectNamePart, ObjectType, Query,
+    RenameTable, RenameTableNameKind, Set, SqlOption, Statement, TableFactor, TableWithJoins,
+    TransactionAccessMode, TransactionMode, TransactionModifier, TriggerEvent, TriggerPeriod,
+    Truncate, TruncateIdentityOption, UnaryOperator, VacuumStatement, ViewColumnDef,
+    helpers::attached_token::AttachedToken,
 };
 
 use crate::{
@@ -1748,17 +1749,27 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
                 translate_view_definition(create_view, schema, options, emit)?
             }
             // `ALTER VIEW v AS ...` redefines a view, which is what
-            // `CREATE OR REPLACE VIEW` does, so it takes the same path. Every
-            // other `ALTER VIEW` spelling PostgreSQL has, `OWNER TO`,
-            // `SET SCHEMA`, and `RENAME TO`, fails in the parser before
-            // reaching here, so there is no other shape to classify.
-            Self::AlterView { name, columns, query, with_options } => {
+            // `CREATE OR REPLACE VIEW` does, so it takes the same path.
+            Self::AlterView(AlterView {
+                name,
+                if_exists: false,
+                operation: AlterViewOperation::As { columns, query, with_options },
+            }) => {
                 translate_view_definition(
                     &alter_view_as_create_view(name, columns, query, with_options),
                     schema,
                     options,
                     emit,
                 )?
+            }
+            Self::AlterView(_) => {
+                return Err(reject_unsupported_statement(
+                    self,
+                    "A SQLite view has no owner, schema, column default or options to change, \
+                     and SQLite renames a view or its columns only by dropping and recreating \
+                     it, which needs its current definition. Write the DROP VIEW and the CREATE \
+                     VIEW out instead.",
+                ));
             }
             Self::Update(update) => {
                 vec![Statement::Update(update.translate_with_warnings(schema, options, emit)?)]
