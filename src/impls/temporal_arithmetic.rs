@@ -322,7 +322,7 @@ fn shift_date(
             ));
         }
     }
-    Ok(simple_function_expr(
+    Ok(from_year_one(simple_function_expr(
         "date",
         vec![Expr::BinaryOp {
             left: Box::new(simple_function_expr("julianday", vec![date], None)),
@@ -330,7 +330,44 @@ fn shift_date(
             right: Box::new(days),
         }],
         None,
-    ))
+    )))
+}
+
+/// The year text a date or timestamp from year 1 on starts at or above.
+const YEAR_ONE: &str = "0001";
+
+/// `nullif(max(x, '0001'), '0001')`: `x`, or NULL when SQLite's answer lies
+/// before the year 1.
+///
+/// SQLite numbers years astronomically there, `0000` for 1 BC and `-0699` for
+/// 700 BC, which never equals PostgreSQL's `… BC` text and sorts backwards.
+/// Every such answer sorts below `'0001'` as text, while a date of the year 1
+/// itself is longer than `'0001'` and above it. Unlike a `CASE`, this reads
+/// `x` once.
+pub(crate) fn from_year_one(rendered: Expr) -> Expr {
+    let floored = simple_function_expr("max", vec![rendered, string_literal(YEAR_ONE)], None);
+    simple_function_expr("nullif", vec![floored, string_literal(YEAR_ONE)], None)
+}
+
+/// The guarded value of `nullif(max(x, '0001'), '0001')`.
+pub(crate) fn year_one_guarded(expr: &Expr) -> Option<&Expr> {
+    let Expr::Function(nullif) = expr else { return None };
+    if !is_function_named(nullif, "nullif") {
+        return None;
+    }
+    let outer = function_argument_exprs(&nullif.args);
+    let [Expr::Function(max), floor] = outer.as_slice() else { return None };
+    if !is_function_named(max, "max") || !is_year_one_literal(floor) {
+        return None;
+    }
+    match function_argument_exprs(&max.args).as_slice() {
+        [value, floor] if is_year_one_literal(floor) => Some(value),
+        _ => None,
+    }
+}
+
+fn is_year_one_literal(expr: &Expr) -> bool {
+    single_quoted_literal(expr) == Some(YEAR_ONE)
 }
 
 /// The seconds in a difference PostgreSQL answers as an interval, which is what
@@ -415,14 +452,15 @@ pub(crate) fn trim_trailing_zeros(rendered: Expr) -> Expr {
 
 /// Restore the PostgreSQL spelling of whatever this module emitted.
 ///
-/// `None` when `expr` is not one of the three shapes, so anything else keeps
+/// `None` when `expr` is not one of the four shapes, so anything else keeps
 /// the ordinary reverse translation. Reversing here rather than in the reverse
 /// translator keeps each emission and its inverse in one file: a change to one
 /// that forgets the other is visible on the screen.
 ///
 /// The four, in the order they appear below: a day count between two dates, a
-/// date moved by whole days, the seconds in a difference PostgreSQL answers as
-/// an interval, and an instant built from an epoch.
+/// date moved by whole days under its year-1 guard, the seconds in a
+/// difference PostgreSQL answers as an interval, and an instant built from an
+/// epoch.
 pub(crate) fn reverse_temporal_arithmetic(
     expr: &Expr,
     schema: &ParserDB,
@@ -438,7 +476,7 @@ pub(crate) fn reverse_temporal_arithmetic(
         return Some(reversed_binary_op(from, &BinaryOperator::Minus, subtracted, schema, options));
     }
 
-    if let Expr::Function(function) = expr
+    if let Some(Expr::Function(function)) = year_one_guarded(expr)
         && is_function_named(function, "date")
         && let [
             Expr::BinaryOp { left, op: op @ (BinaryOperator::Plus | BinaryOperator::Minus), right },
