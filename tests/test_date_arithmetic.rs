@@ -269,6 +269,23 @@ fn a_shifted_date_reverses_to_date_arithmetic() {
     assert_eq!(round_trip("d1 - n"), "SELECT d1 - n FROM dt");
 }
 
+/// The year-1 guard is recognised only with `'0001'` in both places, so a
+/// look-alike written straight in SQLite takes the ordinary reverse
+/// translation, which refuses SQLite's NULL-propagating `max(a, b)`, rather
+/// than reversing to `d1 + 7`.
+#[test]
+fn a_look_alike_of_the_year_one_guard_is_not_reversed_as_one() {
+    let translator = Pg2Sqlite::default().sql(DDL).expect("parses");
+    let schema = translator.build_schema().expect("schema builds");
+    let reversed = translator.reverse_sql(
+        "SELECT nullif(max(date(julianday(d1) + 7), '0002'), '0001') FROM dt;",
+        &schema,
+        &Pg2SqliteOptions::default(),
+    );
+    let error = reversed.expect_err("max(a, b) has no NULL-preserving PostgreSQL form");
+    assert!(error.to_string().contains("max(a, b"), "{error}");
+}
+
 /// `unixepoch(x, 'subsec')` has no PostgreSQL name either, and the pair of
 /// them is one EXTRACT.
 #[test]
