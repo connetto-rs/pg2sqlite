@@ -1540,7 +1540,7 @@ pub(crate) fn convert_value_for_column_type(
         return convert_bit_literal(expr);
     }
     if let Some(kind) = crate::impls::temporal_literals::temporal_literal_kind(data_type) {
-        return convert_temporal_value(kind, expr, None);
+        return convert_temporal_value(kind, expr, None, None);
     }
     if let DataType::Interval { fields, precision } = data_type {
         return normalize_interval_literal_expr(expr, fields.as_ref(), *precision);
@@ -1785,22 +1785,23 @@ pub(crate) fn convert_temporal_value(
     kind: crate::impls::temporal_literals::TemporalLiteralKind,
     mut expr: Expr,
     source: Option<crate::impls::timezone::TimestampAwareness>,
+    options: Option<&crate::options::TranslationContext<'_>>,
 ) -> Result<Expr, Error> {
     use crate::impls::{
         datetime_helpers::{
-            canonical_timestamptz_call, canonical_timestamptz_value, is_canonical_timestamptz_call,
+            build_strftime_call, canonical_timestamptz_call, canonical_timestamptz_value,
+            is_canonical_timestamptz_call, local_time_of, local_timestamp_text, local_timetz_of,
             take_canonical_timestamptz_operand,
         },
         function_helpers::simple_function_expr,
+        replay::{is_replayable, reject_duplicated_operand},
         temporal_literals::TemporalLiteralKind,
         timezone::TimestampAwareness,
     };
     if crate::impls::function_helpers::single_quoted_literal(&expr).is_some() {
         return normalize_temporal_literal_expr(kind, expr);
     }
-    let precision = kind.rounding_precision();
-    let zoned = matches!(kind, TemporalLiteralKind::Timestamp { zoned: true, .. });
-    if zoned {
+    if matches!(kind, TemporalLiteralKind::Timestamp { zoned: true, .. }) {
         let value = canonical_timestamptz_value(expr);
         let value = if source == Some(TimestampAwareness::Naive)
             && !is_canonical_timestamptz_call(&value)
@@ -1811,34 +1812,46 @@ pub(crate) fn convert_temporal_value(
         };
         return Ok(round_column_text(kind, value));
     }
-    let instant = match take_canonical_timestamptz_operand(&mut expr) {
-        Some(operand) => operand,
-        None if source == Some(TimestampAwareness::Aware) => expr,
+    // The operand of a canonical call is any SQLite time value, not text the
+    // slicing builders read. A value named on its own is a column's or a
+    // canonical call's own text, which they can read.
+    let (instant, is_text) = match take_canonical_timestamptz_operand(&mut expr) {
+        Some(operand) => (operand, false),
+        None if source == Some(TimestampAwareness::Aware) => (expr, true),
         // The value already holds the column's text and only the precision
         // rounds it.
         None => return Ok(round_column_text(kind, expr)),
     };
+    if is_text
+        && let Some(options) = options
+        && !is_replayable(&instant, options)
+    {
+        return Err(reject_duplicated_operand("a temporal write", &instant));
+    }
+    let precision = kind.rounding_precision();
     Ok(match (kind, precision) {
-        (TemporalLiteralKind::Time { zoned: true, .. }, Some(precision)) => {
-            crate::impls::datetime_helpers::round_time_of_instant(instant, precision, true)
+        (TemporalLiteralKind::Date, _) => simple_function_expr("date", vec![instant], None),
+        (TemporalLiteralKind::Time { zoned: true, .. }, _) if is_text => {
+            round_column_text(kind, local_timetz_of(instant))
         }
-        (TemporalLiteralKind::Time { zoned: false, .. }, Some(precision)) => {
-            crate::impls::datetime_helpers::round_time_of_instant(instant, precision, false)
+        (TemporalLiteralKind::Time { zoned: false, .. }, _) if is_text => {
+            round_column_text(kind, local_time_of(instant))
+        }
+        (TemporalLiteralKind::Timestamp { .. }, _) if is_text => {
+            round_column_text(kind, local_timestamp_text(instant, None))
+        }
+        (TemporalLiteralKind::Time { zoned, .. }, Some(precision)) => {
+            crate::impls::datetime_helpers::round_time_of_instant(&instant, precision, zoned)
         }
         (TemporalLiteralKind::Timestamp { .. }, Some(precision)) => {
-            crate::impls::datetime_helpers::round_naive_timestamp(
-                &instant,
-                precision,
-                simple_function_expr("datetime", vec![instant.clone()], None),
-            )
+            crate::impls::datetime_helpers::round_instant(&instant, precision)
         }
         (TemporalLiteralKind::Time { zoned: true, .. }, None) => {
-            crate::impls::datetime_helpers::build_strftime_call("%H:%M:%S+00:00", instant)
+            build_strftime_call("%H:%M:%S+00:00", instant)
         }
         (TemporalLiteralKind::Time { zoned: false, .. }, None) => {
             simple_function_expr("time", vec![instant], None)
         }
-        (TemporalLiteralKind::Date, _) => simple_function_expr("date", vec![instant], None),
         (TemporalLiteralKind::Timestamp { .. }, None) => {
             simple_function_expr("datetime", vec![instant], None)
         }

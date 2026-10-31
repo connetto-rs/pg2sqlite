@@ -361,6 +361,32 @@ fn a_cast_over_time_and_timetz_columns_rounds_at_run_time() {
     assert_eq!(rows, vec!["03:04:05.5+02:00", "24:00:00+02:00"]);
 }
 
+/// An instant read into a precision type rounds as that type, as PostgreSQL
+/// 18.6 prints it, so a time of day can round up to `24:00:00`.
+#[test]
+fn an_instant_rounds_as_the_target_type() {
+    const INSERT: &str = "INSERT INTO t (ts) VALUES ('2024-01-02 03:04:05.5'),
+        ('2024-01-02 03:04:05.25'), ('2024-12-31 23:59:59.6');";
+    for (target, expected) in [
+        ("TIME(0)", ["03:04:06", "03:04:05", "24:00:00"]),
+        ("TIMETZ(1)", ["03:04:05.5+00:00", "03:04:05.3+00:00", "23:59:59.6+00:00"]),
+        ("TIMESTAMP(0)", ["2024-01-02 03:04:06", "2024-01-02 03:04:05", "2025-01-01 00:00:00"]),
+    ] {
+        let rows = run(&format!(
+            "{DDL}\n{INSERT}\nSELECT CAST(CAST(ts AS TIMESTAMPTZ) AS {target}) FROM t ORDER BY rowid;"
+        ));
+        assert_eq!(rows, expected, "{target}");
+    }
+}
+
+/// The clock is rounded from the milliseconds SQLite holds, the way a time
+/// column of that precision rounds it.
+#[test]
+fn the_clock_rounds_like_a_time_column() {
+    let rows = run("SELECT CAST(now() AS TIME(0)) = CAST(CAST(now() AS TIME(3)) AS TIME(0));");
+    assert_eq!(rows, vec!["1"]);
+}
+
 /// Raising the precision rounds nothing, so the stored text stands.
 #[test]
 fn a_cast_to_a_higher_precision_is_a_no_op() {
