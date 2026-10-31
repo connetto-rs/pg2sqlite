@@ -2128,6 +2128,13 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
                     "SQLite has no query rewrite rules. Rewrite the rule as explicit statements or triggers.",
                 ));
             }
+            Self::DropRule(_) => {
+                return Err(reject_unsupported_statement(
+                    self,
+                    "SQLite has no query rewrite rules, and the matching CREATE RULE is refused, \
+                     so nothing of the kind can exist in the output to drop.",
+                ));
+            }
             Self::AlterTrigger(_) => {
                 return Err(reject_unsupported_statement(
                     self,
