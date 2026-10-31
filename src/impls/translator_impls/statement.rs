@@ -1999,6 +1999,9 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
             Self::CreateForeignTable(_) => {
                 drop_with_warning("CREATE FOREIGN TABLE", REASON_FOREIGN_DATA, emit)
             }
+            Self::CreateUserMapping(_) => {
+                drop_with_warning("CREATE USER MAPPING", REASON_FOREIGN_DATA, emit)
+            }
             Self::CreateConnector(_) => {
                 drop_with_warning("CREATE CONNECTOR", REASON_FOREIGN_DATA, emit)
             }
