@@ -155,7 +155,9 @@ fn create_view_translation_rejects_additional_unsupported_variants() {
     );
 
     let mut with_options = base.clone();
-    with_options.options = CreateTableOptions::With(vec![SqlOption::Ident(Ident::new("dummy"))]);
+    with_options.options = CreateTableOptions::With(vec![SqlOption::Ident(ObjectName(vec![
+        ObjectNamePart::Identifier(Ident::new("dummy")),
+    ]))]);
     assert!(
         unsupported_message(with_options.translate(&schema, &options).unwrap_err())
             .contains("VIEW options")

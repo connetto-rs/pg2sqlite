@@ -15,7 +15,8 @@ use core::ops::ControlFlow;
 
 use sql_traits::structs::ParserDB;
 use sqlparser::ast::{
-    CreateTableOptions, CreateView, Expr, ObjectName, Query, SqlOption, Value, visit_relations_mut,
+    CreateTableOptions, CreateView, Expr, ObjectName, ObjectNamePart, Query, SqlOption, Value,
+    visit_relations_mut,
 };
 
 use crate::{
@@ -109,7 +110,8 @@ fn reads_as_the_invoker(options: &CreateTableOptions) -> bool {
     matches!(
         pairs.as_slice(),
         [SqlOption::KeyValue { key, value }]
-            if key.value.eq_ignore_ascii_case("security_invoker")
+            if matches!(key.0.as_slice(), [ObjectNamePart::Identifier(name)]
+                if name.value.eq_ignore_ascii_case("security_invoker"))
                 && matches!(value, Expr::Value(literal) if literal.value == Value::Boolean(true))
     )
 }
