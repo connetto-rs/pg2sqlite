@@ -41,7 +41,7 @@ use crate::{
             single_quoted_literal, string_literal,
         },
         idioms::{delimited_membership, single_character, wrap_with_lower},
-        interval::{interval_date_modifiers, interval_date_modifiers_scaled},
+        interval::{IntervalShift, interval_shift, interval_shift_scaled},
         object_name::{
             fts_table_name, last_ident_value_or_display, postgres_catalog_function_name,
         },
@@ -2545,10 +2545,12 @@ fn shifted_clock(local: Expr, modifiers: &[String]) -> Expr {
 }
 
 /// The shifted form of `left` for the temporal kind it resolves to, refusing
-/// a zoned operand the emitted form would read three times.
+/// a zoned operand the emitted form would read three times, and a literal
+/// date or timestamp whose shifted year SQLite's date functions cannot hold.
 fn shifted_interval_target(
     left: &Expr,
-    modifiers: &[String],
+    (op, right): (&BinaryOperator, &Expr),
+    shift: &IntervalShift,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
@@ -2558,10 +2560,20 @@ fn shifted_interval_target(
         return Err(reject_duplicated_operand("a TIMETZ operand shifted by an interval", left));
     }
     let target = left.translate_with_warnings(schema, options, emit)?;
-    match kind {
-        Some(TemporalKind::Time { zoned }) => Ok(shifted_time_of_day(target, modifiers, zoned)),
-        _ => Ok(shifted_datetime(target, modifiers)),
+    let modifiers = shift.modifiers();
+    if let Some(TemporalKind::Time { zoned }) = kind {
+        return Ok(shifted_time_of_day(target, &modifiers, zoned));
     }
+    if let Some(literal) = single_quoted_literal(&target)
+        && let Some(year) = shift.year_after(literal)
+        && !(1..=9999).contains(&year)
+    {
+        return Err(crate::impls::temporal_literals::arithmetic_outside_four_digit_years(
+            &format!("{left} {op} {right}"),
+            year,
+        ));
+    }
+    Ok(shifted_datetime(target, &modifiers))
 }
 
 /// Translate a binary operation expression.
@@ -3286,10 +3298,15 @@ fn translate_binary_op(
         if let Some((scalar, interval)) = scalar_times_interval(right) {
             match integer_literal_value(scalar) {
                 Some(n) => {
-                    match interval_date_modifiers_scaled(interval, negating, n)? {
-                        Some(modifiers) => {
+                    match interval_shift_scaled(interval, negating, n)? {
+                        Some(shift) => {
                             return shifted_interval_target(
-                                left, &modifiers, schema, options, emit,
+                                left,
+                                (op, right),
+                                &shift,
+                                schema,
+                                options,
+                                emit,
                             );
                         }
                         None => {
@@ -3311,9 +3328,16 @@ fn translate_binary_op(
 
         // Case 3: bare INTERVAL on the right.
         if let Some(interval) = extract_interval_expr(right) {
-            match interval_date_modifiers(interval, negating)? {
-                Some(modifiers) => {
-                    return shifted_interval_target(left, &modifiers, schema, options, emit);
+            match interval_shift(interval, negating)? {
+                Some(shift) => {
+                    return shifted_interval_target(
+                        left,
+                        (op, right),
+                        &shift,
+                        schema,
+                        options,
+                        emit,
+                    );
                 }
                 None => {
                     // The notation was not decoded (HH:MM:SS, ISO P-form,

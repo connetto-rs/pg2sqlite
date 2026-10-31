@@ -1627,6 +1627,31 @@ fn a_year_too_large_to_hold_is_refused() {
     assert!(message.contains("99999999999999-01-01"), "{message}");
 }
 
+/// PostgreSQL stores years past 9999, which the replica's four-digit text
+/// cannot hold, so the refusal must name the replica rather than claim
+/// PostgreSQL refuses the value.
+#[test]
+fn a_year_past_9999_is_refused_as_the_replica_limit() {
+    for (kind, literal) in [
+        ("date", "12345-06-07"),
+        ("timestamp", "10000-01-01"),
+        ("timestamp with time zone", "10000-01-01 00:00:00+00"),
+        ("timestamp", "9999-12-31 24:00:00"),
+        ("timestamp", "9999-12-31 23:59:59.9999995"),
+    ] {
+        let message = temporal_refusal(kind, literal);
+        assert!(message.contains("years 1 to 9999"), "{kind} '{literal}': {message}");
+        assert!(!message.contains("PostgreSQL refuses"), "{kind} '{literal}': {message}");
+    }
+}
+
+/// PostgreSQL refuses year zero itself.
+#[test]
+fn year_zero_is_refused_as_postgresql_refuses_it() {
+    let message = temporal_refusal("date", "0000-01-01");
+    assert!(message.contains("date/time field value out of range"), "{message}");
+}
+
 #[test]
 fn a_bound_parameter_in_a_checked_column_passes_through() {
     // The caller binds the value PostgreSQL takes, so there is no literal to

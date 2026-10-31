@@ -23,8 +23,12 @@ use sqlparser::ast::{
 
 use super::{
     datetime_helpers::build_subsecond_unixepoch_call,
-    function_helpers::{is_function_named, simple_function_expr, string_literal},
+    function_helpers::{
+        integer_literal_value, is_function_named, simple_function_expr, single_quoted_literal,
+        string_literal,
+    },
     shared_helpers::{declared_in_scope, function_argument_exprs, is_integral_expression},
+    temporal_literals,
 };
 use crate::{errors::Error, prelude::ReverseTranslator, traits::translator::TranslatorWithContext};
 
@@ -234,18 +238,20 @@ fn rewrite(
             ))
         }
         (Some(TemporalKind::Date), None) if right_integral => {
-            Ok(shift_date(
+            shift_date(
                 left.translate_with_warnings(schema, options, emit)?,
                 op,
                 right.translate_with_warnings(schema, options, emit)?,
-            ))
+                (left, op, right),
+            )
         }
         (None, Some(TemporalKind::Date)) if !subtracting && left_integral => {
-            Ok(shift_date(
+            shift_date(
                 right.translate_with_warnings(schema, options, emit)?,
                 &BinaryOperator::Plus,
                 left.translate_with_warnings(schema, options, emit)?,
-            ))
+                (left, op, right),
+            )
         }
         (Some(_), Some(_)) if subtracting => {
             Err(Error::forward_refusal(format!(
@@ -289,14 +295,34 @@ fn day_difference(left: Expr, right: Expr) -> Expr {
     }
 }
 
-/// `date +/- n`, as a Julian day moved by whole days.
+/// `date +/- n`, as a Julian day moved by whole days, refusing a literal date
+/// and count whose answer leaves the years SQLite's date functions hold.
 ///
 /// The obvious `date(a, printf('%+d days', n))` is silently wrong for a NULL
 /// count: printf writes `+0 days` and the date comes back unchanged where
 /// PostgreSQL answers NULL. Julian days propagate NULL from either side and
 /// need no sign juggling for the subtracting case.
-fn shift_date(date: Expr, op: &BinaryOperator, days: Expr) -> Expr {
-    simple_function_expr(
+fn shift_date(
+    date: Expr,
+    op: &BinaryOperator,
+    days: Expr,
+    (written_left, written_op, written_right): (&Expr, &BinaryOperator, &Expr),
+) -> Result<Expr, Error> {
+    if let (Some(literal), Some(count)) =
+        (single_quoted_literal(&date), integer_literal_value(&days))
+    {
+        let count = if *op == BinaryOperator::Minus { count.checked_neg() } else { Some(count) };
+        if let Some(year) =
+            count.and_then(|count| temporal_literals::year_after_shift(literal, 0, count, 0))
+            && !(1..=9999).contains(&year)
+        {
+            return Err(temporal_literals::arithmetic_outside_four_digit_years(
+                &format!("{written_left} {written_op} {written_right}"),
+                year,
+            ));
+        }
+    }
+    Ok(simple_function_expr(
         "date",
         vec![Expr::BinaryOp {
             left: Box::new(simple_function_expr("julianday", vec![date], None)),
@@ -304,7 +330,7 @@ fn shift_date(date: Expr, op: &BinaryOperator, days: Expr) -> Expr {
             right: Box::new(days),
         }],
         None,
-    )
+    ))
 }
 
 /// The seconds in a difference PostgreSQL answers as an interval, which is what

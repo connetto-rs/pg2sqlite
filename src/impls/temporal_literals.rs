@@ -121,7 +121,8 @@ pub(crate) fn normalize_temporal_literal(
                 // No offset reads as UTC, the zone the replica's own clock
                 // answers in.
                 let offset = zone.map_or(0, |zone| zone.seconds());
-                let micros = days_from_civil(year, month, day) * MICROS_PER_DAY + micros_of_day
+                let micros = days_from_civil(i64::from(year), month, day) * MICROS_PER_DAY
+                    + micros_of_day
                     - offset * MICROS_PER_SECOND;
                 return canonical_instant(round_typmod_micros(micros, precision), trimmed);
             }
@@ -132,6 +133,9 @@ pub(crate) fn normalize_temporal_literal(
                 MICROS_PER_DAY => (next_day(year, month, day), 0),
                 micros => ((year, month, day), micros),
             };
+            if year > 9999 {
+                return Err(outside_four_digit_years(trimmed));
+            }
             Ok(format!("{year:04}-{month:02}-{day:02} {}", time_of_day_text(micros)))
         }
     }
@@ -210,8 +214,8 @@ fn round_typmod_micros(micros: i64, precision: Option<u32>) -> i64 {
 }
 
 /// Days since 1970-01-01 of a proleptic Gregorian date.
-fn days_from_civil(year: u32, month: u32, day: u32) -> i64 {
-    let year = i64::from(year) - i64::from(month <= 2);
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = year - i64::from(month <= 2);
     let era = year.div_euclid(400);
     let year_of_era = year - era * 400;
     let month_from_march = (i64::from(month) + 9) % 12;
@@ -276,6 +280,48 @@ fn out_of_range(text: &str) -> Error {
         "date/time field value out of range: \"{text}\". PostgreSQL refuses this value, so the \
          replica must not hold it."
     ))
+}
+
+/// The refusal for a year PostgreSQL may hold but the replica's four-digit
+/// text cannot.
+fn outside_four_digit_years(text: &str) -> Error {
+    Error::forward_refusal(format!(
+        "\"{text}\" falls outside the years 1 to 9999. The replica holds dates and timestamps \
+         as text with a four-digit year, which is all SQLite's date functions read."
+    ))
+}
+
+/// The refusal for date or timestamp arithmetic over literals whose answer
+/// leaves the years the replica holds.
+pub(crate) fn arithmetic_outside_four_digit_years(expression: &str, year: i64) -> Error {
+    Error::forward_refusal(format!(
+        "`{expression}` lands in the year {year}, outside the years 1 to 9999 the replica holds \
+         dates and timestamps in, and SQLite's date functions cannot answer it."
+    ))
+}
+
+/// The year a date or timestamp literal, in the text the replica stores,
+/// lands in after PostgreSQL's `timestamp + interval`: the months with the
+/// day clamped to the month's end, then the days, then the microseconds.
+/// `None` when the literal is not in that text or the counts overflow.
+pub(crate) fn year_after_shift(literal: &str, months: i64, days: i64, micros: i64) -> Option<i64> {
+    const KIND: TemporalLiteralKind =
+        TemporalLiteralKind::Timestamp { zoned: false, precision: None };
+    let (date, time) = split_timestamp(literal.strip_suffix("+00:00").unwrap_or(literal));
+    let (year, month, day) = parse_date(KIND, date, literal).ok()?;
+    let micros_of_day = match time {
+        Some(time) => parse_time(KIND, time, literal).ok()?.micros_of_day(),
+        None => 0,
+    };
+    let month_index = (i64::from(year) * 12 + i64::from(month) - 1).checked_add(months)?;
+    let (year, month) = (month_index.div_euclid(12), month_index.rem_euclid(12) + 1);
+    let month = u32::try_from(month).ok()?;
+    let day = day.min(days_in_month(year, month));
+    let micros = micros_of_day.checked_add(micros)?;
+    let day_number = days_from_civil(year, month, day)
+        .checked_add(days)?
+        .checked_add(micros.div_euclid(MICROS_PER_DAY))?;
+    Some(civil_from_days(day_number).0)
 }
 
 /// Refuses the PostgreSQL input forms whose meaning is not in the text.
@@ -429,10 +475,13 @@ fn parse_date(kind: TemporalLiteralKind, date: &str, text: &str) -> Result<(u32,
     if parts.next().is_some() {
         return Err(shape(kind, text));
     }
-    if !(1..=9999).contains(&year) {
+    if year == 0 || !(1..=12).contains(&month) || day < 1 {
         return Err(out_of_range(text));
     }
-    if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
+    if year > 9999 {
+        return Err(outside_four_digit_years(text));
+    }
+    if day > days_in_month(i64::from(year), month) {
         return Err(out_of_range(text));
     }
     Ok((year, month, day))
@@ -519,12 +568,10 @@ fn shape(kind: TemporalLiteralKind, text: &str) -> Error {
 /// `month` is validated before it reaches here, and an out-of-range one is
 /// clamped rather than given an arm of its own, so no branch exists that a
 /// test could not reach.
-fn days_in_month(year: u32, month: u32) -> u32 {
+fn days_in_month(year: i64, month: u32) -> u32 {
     const LENGTHS: [u32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    if month == 2
-        && year.is_multiple_of(4)
-        && (!year.is_multiple_of(100) || year.is_multiple_of(400))
-    {
+    let leap = year.rem_euclid(4) == 0 && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0);
+    if month == 2 && leap {
         return 29;
     }
     LENGTHS[(month.clamp(1, 12) - 1) as usize]
@@ -532,7 +579,7 @@ fn days_in_month(year: u32, month: u32) -> u32 {
 
 /// The day after `year-month-day`, Gregorian.
 fn next_day(year: u32, month: u32, day: u32) -> (u32, u32, u32) {
-    if day < days_in_month(year, month) {
+    if day < days_in_month(i64::from(year), month) {
         return (year, month, day + 1);
     }
     if month < 12 {
