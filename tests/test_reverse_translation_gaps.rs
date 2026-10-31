@@ -9,7 +9,7 @@
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use sqlparser::{
     ast::Statement,
-    dialect::{PostgreSqlDialect, SQLiteDialect},
+    dialect::{PostgreSqlDialect, SQLiteDialect, SnowflakeDialect},
     parser::Parser,
 };
 
@@ -278,19 +278,25 @@ fn insert_by_name_is_refused_in_reverse() {
     assert!(message.contains("BY NAME"), "the refusal should name BY NAME: {message}");
 }
 
-// M6: `SQLiteDialect` lenient-parses Snowflake's `obj:key.key2` dot-path
-// syntax, which real SQLite's parser rejects; the reverse direction passed
-// it through unchanged as supposed PostgreSQL, which has no such grammar.
+// M6: Snowflake's `obj:key.key2` dot path has neither PostgreSQL nor SQLite
+// grammar.
 
-/// Found by `fuzz_reverse_translation`.
+/// SQLite text with the path no longer parses, and a statement carrying it,
+/// as one parsed under another dialect does, is refused.
 #[test]
 fn colon_dot_json_path_is_refused_in_reverse() {
-    let sqlite_sql = "SELECT val FROM t WHERE val:NA.foo = 1";
-    Parser::parse_sql(&SQLiteDialect {}, sqlite_sql)
-        .expect("sqlparser's SQLiteDialect lenient-parses the colon-dot path");
+    let sql = "SELECT val FROM t WHERE val:NA.foo = 1";
+    assert!(reverse_result(SCHEMA, sql).is_err(), "SQLite's parser rejects the colon-dot path");
 
-    let message = reverse_result(SCHEMA, sqlite_sql)
-        .expect_err("the colon-dot path has no PostgreSQL grammar and no SQLite grammar either")
+    let statement = Parser::parse_sql(&SnowflakeDialect {}, sql)
+        .expect("Snowflake parses the colon-dot path")
+        .pop()
+        .expect("one statement");
+    let translator = Pg2Sqlite::default().sql(SCHEMA).unwrap();
+    let schema = translator.build_schema().unwrap();
+    let message = translator
+        .reverse_translate(&statement, &schema, &Pg2SqliteOptions::default())
+        .expect_err("the colon-dot path has no PostgreSQL grammar")
         .to_string();
     assert!(message.contains("Snowflake"), "the refusal should explain the dialect: {message}");
 }
