@@ -278,19 +278,16 @@ fn insert_by_name_is_refused_in_reverse() {
     assert!(message.contains("BY NAME"), "the refusal should name BY NAME: {message}");
 }
 
-// M6: `SQLiteDialect` lenient-parses Snowflake's `obj:key.key2` dot-path
-// syntax, which real SQLite's parser rejects; the reverse direction passed
-// it through unchanged as supposed PostgreSQL, which has no such grammar.
+// M6: Snowflake's `obj:key.key2` dot-path syntax is no SQLite grammar, so the
+// reverse direction must not pass it through as supposed PostgreSQL.
 
-/// Found by `fuzz_reverse_translation`.
+/// Found by `fuzz_reverse_translation`. sqlparser's `SQLiteDialect` rejects
+/// the path since apache/datafusion-sqlparser-rs#2613, as SQLite does.
 #[test]
 fn colon_dot_json_path_is_refused_in_reverse() {
     let sqlite_sql = "SELECT val FROM t WHERE val:NA.foo = 1";
     Parser::parse_sql(&SQLiteDialect {}, sqlite_sql)
-        .expect("sqlparser's SQLiteDialect lenient-parses the colon-dot path");
-
-    let message = reverse_result(SCHEMA, sqlite_sql)
-        .expect_err("the colon-dot path has no PostgreSQL grammar and no SQLite grammar either")
-        .to_string();
-    assert!(message.contains("Snowflake"), "the refusal should explain the dialect: {message}");
+        .expect_err("SQLiteDialect rejects the colon-dot path, as SQLite does");
+    reverse_result(SCHEMA, sqlite_sql)
+        .expect_err("the colon-dot path has no PostgreSQL grammar and no SQLite grammar either");
 }
