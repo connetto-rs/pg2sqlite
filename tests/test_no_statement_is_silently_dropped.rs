@@ -214,6 +214,7 @@ const CASES: &[Case] = &[
     warned("CREATE SERVER srv FOREIGN DATA WRAPPER postgres_fdw"),
     warned("CREATE FOREIGN TABLE ft (id INT) SERVER srv"),
     warned("DROP FOREIGN TABLE ft"),
+    warned("CREATE USER MAPPING FOR PUBLIC SERVER srv OPTIONS (user 'u', password 'p')"),
     warned("COMMENT ON FOREIGN TABLE ft IS 'note'"),
     warned("CREATE CONNECTOR c TYPE 'mysql'"),
     warned("ALTER CONNECTOR c SET URL 'u'"),
