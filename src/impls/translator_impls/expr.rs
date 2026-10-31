@@ -3700,34 +3700,53 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                     if let Some(kind) =
                         crate::impls::temporal_literals::temporal_literal_kind(data_type)
                     {
+                        use crate::impls::temporal_casts as casts;
                         crate::impls::shared_helpers::temporal_precision_replay_refusal(
                             expr, data_type, options,
                         )?;
-                        let translated = expr.translate_with_warnings(schema, options, emit)?;
-                        // A kind change rewrites the text into the target
-                        // kind's form, or refuses the pair.
-                        if let Some(source) =
-                            crate::impls::temporal_casts::cast_source_kind(expr, schema, options)
-                                .ok()
-                                .flatten()
-                            && let Some(rewritten) =
-                                crate::impls::temporal_casts::translate_temporal_kind_cast(
-                                    kind,
-                                    source,
-                                    &translated,
-                                    options,
-                                )?
-                        {
-                            return Ok(rewritten);
-                        }
-                        let source =
+                        let source_kind =
+                            casts::cast_source_kind(expr, schema, options).ok().flatten();
+                        let awareness =
                             crate::impls::timezone::timestamp_awareness(expr, schema, options)
                                 .ok()
                                 .flatten();
+                        if source_kind.is_none()
+                            && awareness.is_none()
+                            && crate::impls::shared_helpers::is_integral_expression(
+                                expr, schema, options,
+                            )?
+                        {
+                            return Err(casts::integer_cast_refusal(kind));
+                        }
+                        let translated = expr.translate_with_warnings(schema, options, emit)?;
+                        // A kind change rewrites the text into the target
+                        // kind's form, or refuses the pair.
+                        if let Some(source) = source_kind
+                            && let Some(rewritten) = casts::translate_temporal_kind_cast(
+                                kind,
+                                source,
+                                &translated,
+                                options,
+                            )?
+                        {
+                            return Ok(rewritten);
+                        }
+                        // Text of unknown kind is read by SQLite's date
+                        // functions.
+                        if source_kind.is_none()
+                            && awareness.is_none()
+                            && let Some(read) = casts::temporal_text_reader(kind)
+                        {
+                            casts::warn_text_read_by_date_functions(expr, data_type, emit);
+                            return Ok(crate::impls::shared_helpers::round_column_text(
+                                kind,
+                                read(translated),
+                            ));
+                        }
                         let converted = crate::impls::shared_helpers::convert_temporal_value(
                             kind,
                             translated,
-                            source,
+                            awareness,
                             Some(options),
                         )?;
                         if matches!(converted, Expr::Function(_)) {
