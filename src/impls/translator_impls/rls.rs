@@ -3319,6 +3319,7 @@ mod tests {
             json_path: None,
             sample: None,
             index_directives: vec![],
+            inheritance: None,
         };
         transform_table_factor_for_subquery(&mut already_suffixed, &context, &mut rename_pairs);
         assert_eq!(rename_pairs, vec![("docs_rls".to_string(), "docs_rls".to_string())]);
@@ -3403,6 +3404,7 @@ mod tests {
             json_path: None,
             sample: None,
             index_directives: vec![],
+            inheritance: None,
         };
         transform_table_factor_for_subquery(&mut three_part, &context, &mut rename_pairs);
 

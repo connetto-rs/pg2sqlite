@@ -90,6 +90,7 @@ fn update_with_joined_target_table_is_rejected() {
             json_path: None,
             sample: None,
             index_directives: vec![],
+            inheritance: None,
             with_ordinality: false,
         },
         global: false,

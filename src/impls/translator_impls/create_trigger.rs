@@ -133,6 +133,7 @@ fn generate_maintenance_trigger_body(
                 json_path: None,
                 sample: None,
                 index_directives: vec![],
+                inheritance: None,
                 with_ordinality: false,
             },
             joins: vec![],
