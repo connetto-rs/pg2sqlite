@@ -1717,6 +1717,17 @@ pub(crate) fn check_json_document_literal(data_type: &DataType, expr: Expr) -> R
     }
 }
 
+/// The refusal for MySQL's `ALTER VIEW ... AS`, which PostgreSQL rejects.
+///
+/// Raised before the translation schema is built, since the schema refuses
+/// the statement too, and this message is the one that names the fix.
+pub(crate) fn alter_view_as_refusal(statement: &Statement) -> Error {
+    Error::forward_refusal(format!(
+        "{statement} is MySQL syntax, which PostgreSQL rejects with `syntax error at or near \
+         \"AS\"`. Redefine the view with CREATE OR REPLACE VIEW instead."
+    ))
+}
+
 /// Rewrites a string literal in an interval column or cast position to the
 /// text PostgreSQL stores for that type, or refuses what PostgreSQL refuses.
 pub(crate) fn normalize_interval_literal_expr(

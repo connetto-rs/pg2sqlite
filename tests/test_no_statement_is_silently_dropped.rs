@@ -321,11 +321,10 @@ const CASES: &[Case] = &[
     rejected("ALTER TABLE t RENAME TO public.t2"),
     // Rejected: renames SQLite cannot apply in place.
     rejected("ALTER INDEX i RENAME TO j"),
-    // Emitted: a view redefinition, which is CREATE OR REPLACE VIEW spelled
-    // differently and takes the same drop-then-create path.
-    emitted("ALTER VIEW v AS SELECT 1"),
-    // Rejected: every other ALTER VIEW form renames the view or a column, or
-    // changes a property a SQLite view does not have.
+    // Rejected: ALTER VIEW ... AS is MySQL, which PostgreSQL rejects, and every
+    // other ALTER VIEW form renames the view or a column, or changes a property
+    // a SQLite view does not have.
+    rejected("ALTER VIEW v AS SELECT 1"),
     rejected("ALTER VIEW v ALTER COLUMN n SET DEFAULT 1"),
     rejected("ALTER VIEW v ALTER COLUMN n DROP DEFAULT"),
     rejected("ALTER VIEW v OWNER TO r"),

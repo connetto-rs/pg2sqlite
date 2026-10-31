@@ -648,6 +648,17 @@ impl Pg2Sqlite {
         let statements = &self.pg_statements;
         crate::impls::translator_impls::rls::ensure_usable_rls_table_suffix(options)?;
         Self::reject_rename_of_secured_table(statements)?;
+        if let Some(alter_view_as) = statements.iter().find(|statement| {
+            matches!(
+                statement,
+                Statement::AlterView(sqlparser::ast::AlterView {
+                    operation: sqlparser::ast::AlterViewOperation::As { .. },
+                    ..
+                })
+            )
+        }) {
+            return Err(crate::impls::shared_helpers::alter_view_as_refusal(alter_view_as));
+        }
         let dispositions = crate::impls::transaction_blocks::analyse(statements)?;
 
         let options = options.clone();
