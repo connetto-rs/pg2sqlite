@@ -185,6 +185,17 @@ fn create_view_translation_rejects_additional_unsupported_variants() {
     );
 }
 
+/// The translator refuses MySQL's `ALTER VIEW ... AS` on its own as well, for
+/// a caller that translates a statement without the pipeline's early refusal.
+#[test]
+fn alter_view_as_statement_is_refused_by_the_translator() {
+    let statement = parse_statement("ALTER VIEW v AS SELECT 1");
+    let message = unsupported_message(
+        statement.translate(&empty_schema(), &Pg2SqliteOptions::default()).unwrap_err(),
+    );
+    assert!(message.contains("CREATE OR REPLACE VIEW"), "{message}");
+}
+
 #[test]
 fn create_index_translation_covers_gin_error_branches() {
     let schema = schema_from_sql(

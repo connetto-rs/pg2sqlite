@@ -45,12 +45,11 @@ use sql_traits::{
 use sqlparser::ast::{
     AlterTable, AlterTableOperation, AlterTableType, AlterView, AlterViewOperation,
     BeginTransactionKind, BinaryOperator, CascadeOption, ColumnDef, ColumnOption, CreateFunction,
-    CreateTableOptions, CreateView, Delete, DescribeAlias, DiscardObject, DropBehavior,
-    ExceptionWhen, Expr, FromTable, Ident, Merge, ObjectName, ObjectNamePart, ObjectType, Query,
-    RenameTable, RenameTableNameKind, Set, SqlOption, Statement, TableFactor, TableWithJoins,
-    TransactionAccessMode, TransactionMode, TransactionModifier, TriggerEvent, TriggerPeriod,
-    Truncate, TruncateIdentityOption, UnaryOperator, VacuumStatement, ViewColumnDef,
-    helpers::attached_token::AttachedToken,
+    CreateView, Delete, DescribeAlias, DiscardObject, DropBehavior, ExceptionWhen, Expr, FromTable,
+    Ident, Merge, ObjectName, ObjectNamePart, ObjectType, RenameTable, RenameTableNameKind, Set,
+    Statement, TableFactor, TableWithJoins, TransactionAccessMode, TransactionMode,
+    TransactionModifier, TriggerEvent, TriggerPeriod, Truncate, TruncateIdentityOption,
+    UnaryOperator, VacuumStatement, helpers::attached_token::AttachedToken,
 };
 
 use crate::{
@@ -277,9 +276,6 @@ fn reject_unsupported_statement(statement: &Statement, reason: &str) -> Error {
 
 /// Emits a view definition, preceded by `DROP VIEW IF EXISTS` when it replaces
 /// one, since SQLite has no `CREATE OR REPLACE VIEW`.
-///
-/// Shared with the `ALTER VIEW ... AS` arm, which is the same redefinition
-/// under another spelling.
 fn translate_view_definition(
     create_view: &CreateView,
     schema: &ParserDB,
@@ -301,45 +297,6 @@ fn translate_view_definition(
     }
     statements.push(create_view.translate_with_warnings(schema, options, emit)?.into());
     Ok(statements)
-}
-
-/// Reads `ALTER VIEW ... AS` as the replacement it is.
-///
-/// `with_options` travels rather than being dropped, so the `CREATE VIEW`
-/// translator refuses an option it cannot express instead of this arm quietly
-/// losing it.
-fn alter_view_as_create_view(
-    name: &ObjectName,
-    columns: &[Ident],
-    query: &Query,
-    with_options: &[SqlOption],
-) -> CreateView {
-    CreateView {
-        or_alter: false,
-        or_replace: true,
-        materialized: false,
-        secure: false,
-        copy_grants: false,
-        name: name.clone(),
-        name_before_not_exists: false,
-        columns: columns
-            .iter()
-            .map(|name| ViewColumnDef { name: name.clone(), data_type: None, options: None })
-            .collect(),
-        query: Box::new(query.clone()),
-        options: if with_options.is_empty() {
-            CreateTableOptions::None
-        } else {
-            CreateTableOptions::With(with_options.to_vec())
-        },
-        cluster_by: Vec::new(),
-        comment: None,
-        if_not_exists: false,
-        temporary: false,
-        to: None,
-        params: None,
-        with_no_schema_binding: false,
-    }
 }
 
 /// Reason shared by the publish and subscribe statements.
@@ -1748,19 +1705,8 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
             Self::CreateView(create_view) => {
                 translate_view_definition(create_view, schema, options, emit)?
             }
-            // `ALTER VIEW v AS ...` redefines a view, which is what
-            // `CREATE OR REPLACE VIEW` does, so it takes the same path.
-            Self::AlterView(AlterView {
-                name,
-                if_exists: false,
-                operation: AlterViewOperation::As { columns, query, with_options },
-            }) => {
-                translate_view_definition(
-                    &alter_view_as_create_view(name, columns, query, with_options),
-                    schema,
-                    options,
-                    emit,
-                )?
+            Self::AlterView(AlterView { operation: AlterViewOperation::As { .. }, .. }) => {
+                return Err(crate::impls::shared_helpers::alter_view_as_refusal(self));
             }
             Self::AlterView(_) => {
                 return Err(reject_unsupported_statement(
