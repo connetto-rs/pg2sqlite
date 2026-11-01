@@ -340,10 +340,10 @@ enum PolicyPredicate {
 /// Permissive policies OR together to grant access. Restrictive policies AND on
 /// top to remove it. Two consequences the caller must honour:
 ///
-/// * A set with no permissive policy denies every row, because nothing granted
-///   access. That covers both an empty set and a restrictive-only set.
-/// * A permissive policy carrying no predicate grants every row, so it
-///   contributes TRUE rather than nothing. Same for a restrictive one.
+/// * A set with no permissive predicate denies every row, because nothing
+///   granted access. That covers an empty set, a restrictive-only set, and a
+///   permissive policy lacking the clause, which adds nothing.
+/// * A restrictive policy lacking the clause constrains nothing.
 ///
 /// `substitutions` says what a `NEW.<column>` reference stands for where the
 /// value reaching the trigger is not the value the row will carry: a default
@@ -386,9 +386,6 @@ fn combine_policy_predicates(
 
     for policy in policies {
         let is_restrictive = policy.policy_type() == CreatePolicyType::Restrictive;
-        if !is_restrictive {
-            has_permissive = true;
-        }
         let expr = match clause {
             PolicyClause::Using => policy.using_expression(schema),
             // PostgreSQL: "If no WITH CHECK expression is defined, then the
@@ -404,6 +401,9 @@ fn combine_policy_predicates(
             }
         };
         let Some(expr) = expr else { continue };
+        if !is_restrictive {
+            has_permissive = true;
+        }
         let mut transformed =
             transform_expr(expr, options, table, schema, prefix, table_rename, facts);
         // Folded before translation so a substituted default travels the same
