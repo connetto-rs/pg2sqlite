@@ -18,8 +18,8 @@ use sql_traits::{
 };
 use sqlparser::ast::{
     BinaryOperator, CreateIndex, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
-    Ident, IndexType, ObjectName, ObjectNamePart, SetExpr, Statement, TriggerEvent, TriggerPeriod,
-    Value, VisitMut, VisitorMut,
+    Ident, IndexColumn, IndexType, ObjectName, ObjectNamePart, SetExpr, Statement, TriggerEvent,
+    TriggerPeriod, Value, VisitMut, VisitorMut,
 };
 
 use crate::{
@@ -470,6 +470,24 @@ fn try_spatial_index_routing(
         .collect();
     Ok(Some(statements))
 }
+
+/// One CREATE INDEX column, settled on the comparison key when it is an
+/// interval, since the key's byte order is PostgreSQL's interval order.
+fn translate_index_column(
+    column: &IndexColumn,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<IndexColumn, crate::errors::Error> {
+    use crate::traits::translator::TranslatorWithContext;
+    let mut translated = column.translate_with_warnings(schema, options, emit)?;
+    if crate::impls::expression_type::is_interval_typed(&column.column.expr, schema, options) {
+        translated.column.expr =
+            crate::impls::interval::keys::key_expr(&translated.column.expr, options)?;
+    }
+    Ok(translated)
+}
+
 /// Reports the PostgreSQL-only clauses the regular index path drops.
 ///
 /// Each one is result-neutral, so the index still enforces what it enforced,
@@ -609,7 +627,7 @@ impl crate::traits::translator::TranslatorWithContext for CreateIndex {
         let columns = self
             .columns
             .iter()
-            .map(|col| col.translate_with_warnings(schema, options, emit))
+            .map(|column| translate_index_column(column, schema, options, emit))
             .collect::<Result<Vec<_>, _>>()?;
         let predicate = self
             .predicate

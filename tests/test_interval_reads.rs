@@ -819,6 +819,62 @@ fn a_primary_key_on_an_interval_column_runs_on_the_key() {
     assert_eq!(rows, vec![Some("1".into())]);
 }
 
+/// The table keeps its declared key on the stored text beside the key index,
+/// since a SQLite session records changes only to a table with a declared
+/// primary key and applies a changeset only onto one. Equal texts are equal
+/// intervals, so the text key rejects nothing PostgreSQL accepts.
+#[test]
+fn a_table_keyed_by_an_interval_keeps_its_declared_key() {
+    for ddl in [
+        "CREATE TABLE shifts (span interval PRIMARY KEY, crew text);",
+        "CREATE TABLE shifts (span interval, crew text, PRIMARY KEY (span));",
+    ] {
+        let connection = run_script(&format!(
+            "{ddl}
+             INSERT INTO shifts VALUES ('1 day', 'a');"
+        ));
+        let pk: i64 = connection
+            .query_row(
+                "SELECT pk FROM pragma_table_info('shifts') WHERE name = 'span'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the span column");
+        assert_eq!(pk, 1, "{ddl}");
+        assert!(
+            connection.execute_batch("INSERT INTO shifts VALUES ('24:00:00', 'b');").is_err(),
+            "{ddl}: the key index must still reject an equal interval"
+        );
+    }
+    let connection = run_script("CREATE TABLE crews (id int, span interval UNIQUE);");
+    let unique: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM pragma_index_list('crews') WHERE origin = 'u'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the index list");
+    assert_eq!(unique, 1);
+}
+
+/// Runs every statement translated from `pg` on a fresh in-memory SQLite and
+/// hands the connection back for raw probes of the replica.
+fn run_script(pg: &str) -> rusqlite::Connection {
+    let statements = Pg2Sqlite::default()
+        .sql(pg)
+        .expect("parse")
+        .translate_to_sql(&Pg2SqliteOptions::default())
+        .expect("translate")
+        .into_vec();
+    let connection = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+    for statement in &statements {
+        connection
+            .execute_batch(&format!("{statement};"))
+            .unwrap_or_else(|error| panic!("{error}\n{statement}"));
+    }
+    connection
+}
+
 #[test]
 fn a_check_over_an_interval_column_runs_on_the_key() {
     let rows = run_with_failures(

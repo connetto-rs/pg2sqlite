@@ -51,15 +51,10 @@ impl crate::traits::translator::TranslatorWithContext for OrderByExpr {
             });
         }
 
-        let translated = self.expr.translate_with_warnings(schema, options, emit)?;
-        let expr = if crate::impls::expression_type::is_interval_typed(&self.expr, schema, options)
-        {
-            // The index must settle on the key, whose byte order is
-            // PostgreSQL's interval order.
-            crate::impls::interval::keys::key_expr(&translated, options)?
-        } else {
-            translated
-        };
-        Ok(OrderByExpr { expr, options: index_options, with_fill: None })
+        Ok(OrderByExpr {
+            expr: self.expr.translate_with_warnings(schema, options, emit)?,
+            options: index_options,
+            with_fill: None,
+        })
     }
 }

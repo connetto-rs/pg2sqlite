@@ -3,7 +3,6 @@
 
 #[cfg(not(feature = "std"))]
 use alloc::{
-    boxed::Box,
     format,
     string::{String, ToString},
     vec,
@@ -13,8 +12,8 @@ use core::ops::ControlFlow;
 
 use sql_traits::{structs::ParserDB, traits::TableLike};
 use sqlparser::ast::{
-    BinaryOperator, ColumnOption, ColumnOptionDef, CreateTable, Expr, ForeignKeyConstraint, Ident,
-    InTarget, IndexColumn, ObjectName, ObjectNamePart, OrderByExpr, OrderByOptions, Statement,
+    BinaryOperator, ColumnOption, CreateTable, Expr, ForeignKeyConstraint, Ident, InTarget,
+    IndexColumn, ObjectName, ObjectNamePart, OrderByExpr, OrderByOptions, Statement,
     TableConstraint, Visit, Visitor,
 };
 
@@ -87,68 +86,52 @@ pub(crate) struct CompanionIndex {
     columns: Vec<IndexColumn>,
 }
 
-/// What the DDL prepare pass hands the caller: the table to translate and
-/// the companion indexes the table earns.
-pub(crate) enum Prepared<'a> {
-    Ordinary(&'a CreateTable),
-    Interval { table: Box<CreateTable>, companions: Vec<CompanionIndex> },
-}
-
-impl Prepared<'_> {
-    /// The table the caller translates.
-    pub(crate) fn source(&self) -> &CreateTable {
-        match self {
-            Self::Ordinary(create_table) => create_table,
-            Self::Interval { table, .. } => table,
-        }
-    }
-
-    /// The companion unique indexes, in declaration order, over the emitted
-    /// `table_name`.
-    pub(crate) fn companion_statements(&self, table_name: &ObjectName) -> Vec<Statement> {
-        let Self::Interval { companions, .. } = self else {
-            return Vec::new();
-        };
-        companions
-            .iter()
-            .map(|companion| {
-                Statement::CreateIndex(sqlparser::ast::CreateIndex {
-                    name: Some(ObjectName(vec![ObjectNamePart::Identifier(quoted_ident(
-                        &companion.name,
-                    ))])),
-                    table_name: table_name.clone(),
-                    using: None,
-                    columns: companion.columns.clone(),
-                    unique: true,
-                    concurrently: false,
-                    r#async: false,
-                    if_not_exists: true,
-                    include: Vec::new(),
-                    nulls_distinct: None,
-                    with: Vec::new(),
-                    predicate: None,
-                    index_options: Vec::new(),
-                    alter_options: Vec::new(),
-                })
+/// The companion unique indexes, in declaration order, over the emitted
+/// `table_name`.
+pub(crate) fn companion_statements(
+    companions: &[CompanionIndex],
+    table_name: &ObjectName,
+) -> Vec<Statement> {
+    companions
+        .iter()
+        .map(|companion| {
+            Statement::CreateIndex(sqlparser::ast::CreateIndex {
+                name: Some(ObjectName(vec![ObjectNamePart::Identifier(quoted_ident(
+                    &companion.name,
+                ))])),
+                table_name: table_name.clone(),
+                using: None,
+                columns: companion.columns.clone(),
+                unique: true,
+                concurrently: false,
+                r#async: false,
+                if_not_exists: true,
+                include: Vec::new(),
+                nulls_distinct: None,
+                with: Vec::new(),
+                predicate: None,
+                index_options: Vec::new(),
+                alter_options: Vec::new(),
             })
-            .collect()
-    }
+        })
+        .collect()
 }
 
-/// Refuses the table's foreign keys over interval columns, strips the
-/// uniqueness the stored text cannot settle, and keys the checks and
-/// generated expressions the stored text cannot answer.
+/// Refuses the table's foreign keys over interval columns, checks its
+/// constraint expressions name intervals only where the key settles them,
+/// and answers the companion index each UNIQUE or PRIMARY KEY over an
+/// interval column earns.
 ///
 /// # Errors
 ///
 /// Propagates the refusal a foreign key over an interval column answers, the
 /// refusal a key template fails to parse, and the refusal a constraint
 /// expression naming an interval outside a keyed position answers.
-pub(crate) fn prepare<'a>(
-    create_table: &'a CreateTable,
+pub(crate) fn companions(
+    create_table: &CreateTable,
     schema: &ParserDB,
     options: &TranslationContext<'_>,
-) -> Result<Prepared<'a>, Error> {
+) -> Result<Vec<CompanionIndex>, Error> {
     let interval_columns: Vec<String> = create_table
         .columns
         .iter()
@@ -157,15 +140,14 @@ pub(crate) fn prepare<'a>(
         .collect();
     reject_foreign_keys_over_intervals(create_table, schema, &interval_columns)?;
     if interval_columns.is_empty() {
-        return Ok(Prepared::Ordinary(create_table));
+        return Ok(Vec::new());
     }
     let refs = IntervalRefs::of(interval_columns, create_table);
-    let mut table = create_table.clone();
     let mut companions = Vec::new();
-    strip_column_keys(&mut table, &refs, &mut companions, options)?;
-    strip_table_keys(&mut table, &refs, &mut companions, options)?;
-    validate_constraint_expressions(&table, &refs)?;
-    Ok(Prepared::Interval { table: Box::new(table), companions })
+    add_column_key_companions(create_table, &refs, &mut companions, options)?;
+    add_table_key_companions(create_table, &refs, &mut companions, options)?;
+    validate_constraint_expressions(create_table, &refs)?;
+    Ok(companions)
 }
 
 /// Refuses a foreign key whose local or referenced side is an interval
@@ -229,102 +211,80 @@ fn column_named(interval_columns: &[String], value: &str) -> bool {
     interval_columns.iter().any(|column| column.to_ascii_lowercase() == lowered)
 }
 
-/// Strips the UNIQUE and PRIMARY KEY options off the interval columns,
-/// keeping the NOT NULL a primary key implies, and names the companion
-/// index each stripped constraint earns.
-fn strip_column_keys(
-    table: &mut CreateTable,
+/// Names the companion index each UNIQUE or PRIMARY KEY option on an
+/// interval column earns, keeping the option itself on the stored text.
+///
+/// The declared key stays because a SQLite session records changes only to a
+/// table with a declared primary key and applies a changeset only onto one.
+/// Equal texts are equal intervals, so it rejects nothing PostgreSQL accepts,
+/// and the companion over the comparison key settles PostgreSQL's equality.
+fn add_column_key_companions(
+    table: &CreateTable,
     refs: &IntervalRefs,
     companions: &mut Vec<CompanionIndex>,
     options: &TranslationContext<'_>,
 ) -> Result<(), Error> {
-    for column in &mut table.columns {
+    for column in &table.columns {
         if !is_interval_data_type(&column.data_type) {
             continue;
         }
-        let taken = core::mem::take(&mut column.options);
-        let mut kept = Vec::with_capacity(taken.len());
-        let mut primary_key = false;
-        for option in taken {
-            match option.option {
+        for option in &column.options {
+            let (declared, primary_key) = match &option.option {
                 ColumnOption::Unique(unique) => {
-                    companions.push(declared_companion(
-                        declared_name(unique.name.as_ref(), unique.index_name.as_ref()),
-                        &refs.table,
-                        core::slice::from_ref(&column.name.value),
-                        false,
-                        [keyed_index_column(&Expr::Identifier(column.name.clone()), options)?],
-                    ));
+                    (declared_name(unique.name.as_ref(), unique.index_name.as_ref()), false)
                 }
                 ColumnOption::PrimaryKey(primary) => {
-                    companions.push(declared_companion(
-                        declared_name(primary.name.as_ref(), primary.index_name.as_ref()),
-                        &refs.table,
-                        core::slice::from_ref(&column.name.value),
-                        true,
-                        [keyed_index_column(&Expr::Identifier(column.name.clone()), options)?],
-                    ));
-                    primary_key = true;
+                    (declared_name(primary.name.as_ref(), primary.index_name.as_ref()), true)
                 }
-                other => kept.push(ColumnOptionDef { name: option.name, option: other }),
-            }
-        }
-        column.options = kept;
-        if primary_key
-            && !column.options.iter().any(|option| matches!(option.option, ColumnOption::NotNull))
-        {
-            column.options.push(ColumnOptionDef { name: None, option: ColumnOption::NotNull });
+                _ => continue,
+            };
+            companions.push(declared_companion(
+                declared,
+                &refs.table,
+                core::slice::from_ref(&column.name.value),
+                primary_key,
+                [keyed_index_column(&Expr::Identifier(column.name.clone()), options)?],
+            ));
         }
     }
     Ok(())
 }
 
-/// Strips the table UNIQUE and PRIMARY KEY constraints carrying an interval
-/// column and names the companion index each one earns, keeping NOT NULL on
-/// every column a primary key named.
-fn strip_table_keys(
-    table: &mut CreateTable,
+/// Names the companion index each table UNIQUE or PRIMARY KEY carrying an
+/// interval column earns, keeping the constraint itself on the stored text
+/// for the reason [`add_column_key_companions`] gives.
+fn add_table_key_companions(
+    table: &CreateTable,
     refs: &IntervalRefs,
     companions: &mut Vec<CompanionIndex>,
     options: &TranslationContext<'_>,
 ) -> Result<(), Error> {
-    let mut primary_key_columns = Vec::new();
-    let constraints = core::mem::take(&mut table.constraints);
-    let mut kept = Vec::with_capacity(constraints.len());
-    for constraint in constraints {
-        match constraint {
+    for constraint in &table.constraints {
+        let (declared, columns, primary_key) = match constraint {
             TableConstraint::Unique(unique) if has_interval_column(&unique.columns, refs) => {
-                companions.push(companion_for_columns(
+                (
                     declared_name(unique.name.as_ref(), unique.index_name.as_ref()),
-                    &refs.table,
                     &unique.columns,
                     false,
-                    refs,
-                    options,
-                )?);
+                )
             }
             TableConstraint::PrimaryKey(primary) if has_interval_column(&primary.columns, refs) => {
-                companions.push(companion_for_columns(
+                (
                     declared_name(primary.name.as_ref(), primary.index_name.as_ref()),
-                    &refs.table,
                     &primary.columns,
                     true,
-                    refs,
-                    options,
-                )?);
-                primary_key_columns.extend(primary.columns.iter().filter_map(|column| {
-                    match &column.column.expr {
-                        Expr::Identifier(ident) => Some(ident.value.clone()),
-                        _ => None,
-                    }
-                }));
+                )
             }
-            other => kept.push(other),
-        }
-    }
-    table.constraints = kept;
-    for column in primary_key_columns {
-        ensure_not_null(table, &column);
+            _ => continue,
+        };
+        companions.push(companion_for_columns(
+            declared,
+            &refs.table,
+            columns,
+            primary_key,
+            refs,
+            options,
+        )?);
     }
     Ok(())
 }
@@ -334,7 +294,7 @@ fn has_interval_column(columns: &[IndexColumn], refs: &IntervalRefs) -> bool {
     columns.iter().any(|column| refs.is_ref(&column.column.expr))
 }
 
-/// The companion of a stripped UNIQUE or PRIMARY KEY over `columns`, keyed
+/// The companion of a UNIQUE or PRIMARY KEY over `columns`, keyed
 /// where a column is an interval.
 fn companion_for_columns(
     declared: Option<String>,
@@ -377,7 +337,8 @@ fn companion_for_columns(
     Ok(CompanionIndex { name, columns })
 }
 
-/// The companion of a stripped constraint, named after the constraint.
+/// The companion of a UNIQUE or PRIMARY KEY option, named after the
+/// constraint.
 fn declared_companion(
     declared: Option<String>,
     table: &str,
@@ -406,18 +367,6 @@ fn keyed_index_column(
         column: OrderByExpr { expr, options: OrderByOptions::default(), with_fill: None },
         operator_class: None,
     })
-}
-
-/// Keeps a column of a stripped primary key NOT NULL.
-fn ensure_not_null(table: &mut CreateTable, column_name: &str) {
-    let lowered = column_name.to_ascii_lowercase();
-    for column in &mut table.columns {
-        if column.name.value.to_ascii_lowercase() == lowered
-            && !column.options.iter().any(|option| matches!(option.option, ColumnOption::NotNull))
-        {
-            column.options.push(ColumnOptionDef { name: None, option: ColumnOption::NotNull });
-        }
-    }
 }
 
 /// The table's CHECK constraints, the CHECK options of its columns and its
