@@ -49,6 +49,7 @@ pub(crate) fn type_name<'e>(
         Expr::Cast { data_type, .. } => Some(normalize_sqlparser_type(data_type)),
         Expr::TypedString(typed) => Some(normalize_sqlparser_type(&typed.data_type)),
         Expr::Value(value) => literal_type_name(&value.value).map(Cow::Borrowed),
+        Expr::Interval(_) => Some(Cow::Borrowed("interval")),
         Expr::Function(call) => call_type_name(call, schema, options)?.map(Cow::Owned),
         Expr::BinaryOp { left, op, right } => {
             crate::impls::translator_impls::blob_operator::resolve(
@@ -89,6 +90,35 @@ pub(crate) fn type_name<'e>(
             .map(Cow::Owned)
         }
     })
+}
+
+/// Whether `expr` settles on the `interval` type: an `INTERVAL '…'`
+/// literal, an interval column of any typmod, a cast to `interval`, or a
+/// `coalesce`, `greatest`, `least`, `nullif`, `min`, `max` or `CASE` that
+/// settles on an interval result. `false` when nothing the statement writes
+/// settles the type, a column it cannot resolve included, so a position that
+/// only decides on the answer keeps its ordinary translation.
+pub(crate) fn is_interval_typed(
+    expr: &Expr,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> bool {
+    match expr {
+        Expr::Nested(inner) => is_interval_typed(inner, schema, options),
+        Expr::Interval(_) => true,
+        _ => {
+            type_name(expr, schema, options)
+                .ok()
+                .flatten()
+                .is_some_and(|name| is_interval_type_name(&name.to_ascii_lowercase()))
+        }
+    }
+}
+
+/// Whether a type name is `interval`, with or without a field-list and
+/// precision qualifier.
+fn is_interval_type_name(lower: &str) -> bool {
+    lower.split([' ', '(']).next().is_some_and(|first| first == "interval")
 }
 
 /// The type name of a column's declaration.
@@ -191,6 +221,15 @@ fn call_type_name(
     {
         return Ok(Some(result.into_owned()));
     }
+    // greatest and least settle on the common type of their arguments, as
+    // PostgreSQL's `select_common_type` does, which the catalog answer above
+    // leaves open.
+    if last_ident(&call.name).is_some_and(|name| {
+        name.value.to_ascii_lowercase().as_str() == "greatest"
+            || name.value.to_ascii_lowercase().as_str() == "least"
+    }) {
+        return Ok(common_type_name(&argument_types).map(Cow::into_owned));
+    }
     if !options.is_sqlitegis_enabled() {
         return Ok(None);
     }
@@ -198,4 +237,74 @@ fn call_type_name(
         .zip(last_ident(&call.name))
         .and_then(|(arity, name)| postgis::sqlitegis_result_type(&name.value, arity))
         .map(String::from))
+}
+
+#[cfg(test)]
+mod interval_typing {
+    use sql_traits::prelude::ParserDB;
+    use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
+
+    /// Whether `SELECT {expr_sql} FROM t` types the projection as an interval.
+    fn interval_typed(expr_sql: &str) -> bool {
+        let schema = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE t (id int, iv interval, iv2 interval);",
+        )
+        .unwrap();
+        let options = crate::options::TranslationContext::from_owned(
+            crate::prelude::Pg2SqliteOptions::default(),
+        );
+        let query =
+            Parser::parse_sql(&PostgreSqlDialect {}, &format!("SELECT {expr_sql} FROM t")).unwrap();
+        let sqlparser::ast::Statement::Query(query) = &query[0] else { panic!("expected query") };
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select")
+        };
+        let scope = sql_traits::structs::ColumnScope::from_query(
+            query,
+            &schema,
+            sql_traits::structs::IdentifierCase::AsWritten,
+        )
+        .unwrap();
+        let scoped = options.with_scope(&scope);
+        let sqlparser::ast::SelectItem::UnnamedExpr(expr) = select.projection.first().unwrap()
+        else {
+            panic!("expected unnamed projection")
+        };
+        crate::impls::expression_type::is_interval_typed(expr, &schema, &scoped)
+    }
+
+    #[test]
+    fn interval_spellings_are_interval_typed() {
+        for expr in [
+            "iv",
+            "CAST(iv AS interval)",
+            "iv::interval",
+            "coalesce(iv, iv2)",
+            "greatest(iv, iv2)",
+            "least(iv, iv2)",
+            "nullif(iv, iv2)",
+            "min(iv)",
+            "max(iv)",
+            "CASE WHEN id = 1 THEN iv ELSE iv2 END",
+            "t.iv",
+            "interval '1 day'",
+            "interval hour to minute '2:30'",
+        ] {
+            assert!(interval_typed(expr), "{expr} should be interval-typed");
+        }
+    }
+
+    #[test]
+    fn non_interval_spellings_are_not_interval_typed() {
+        for expr in [
+            "id",
+            "'1 day'",
+            "NULL",
+            "coalesce(id, 1)",
+            "greatest(id, 1)",
+            "CASE WHEN id = 1 THEN id ELSE 2 END",
+        ] {
+            assert!(!interval_typed(expr), "{expr} should not be interval-typed");
+        }
+    }
 }

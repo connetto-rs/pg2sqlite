@@ -24,8 +24,7 @@ use sqlparser::ast::{
 };
 
 use super::helpers::{
-    Forward, translate_order_by_clause, translate_pipe_operators, translate_query_settings,
-    translate_with_clause,
+    Forward, translate_pipe_operators, translate_query_settings, translate_with_clause,
 };
 use crate::{
     impls::{
@@ -94,7 +93,13 @@ impl crate::traits::translator::TranslatorWithContext for Query {
                 None => super::cte::pin_output_names(with, source, scope),
             }
         }
-        let order_by = translate_order_by(query.order_by.as_ref(), schema, options, emit)?;
+        let order_by = translate_order_by(
+            query.order_by.as_ref(),
+            query.body.as_ref(),
+            schema,
+            options,
+            emit,
+        )?;
         let (limit_clause, fetch) = forward_translate_limit_and_fetch(
             query.limit_clause.as_ref(),
             query.fetch.as_ref(),
@@ -166,11 +171,18 @@ impl crate::traits::translator::TranslatorWithContext for Query {
 
 fn translate_order_by(
     order_by: Option<&OrderBy>,
+    body: &SetExpr,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Option<OrderBy>, crate::errors::Error> {
-    translate_order_by_clause(order_by, schema, options, emit)
+    let projection = match body {
+        SetExpr::Select(select) => Some(select.projection.as_slice()),
+        _ => None,
+    };
+    crate::impls::shared_helpers::translate_order_by_clause::<Forward>(
+        order_by, projection, schema, options, emit,
+    )
 }
 
 /// Build a `Query` envelope with the translated top-level clauses and the given
@@ -1031,6 +1043,36 @@ fn is_aggregate_expression(expr: &Expr) -> bool {
     }
 }
 
+/// True when `expr` contains a call that settles which rows fall together,
+/// an aggregate without an `OVER` clause or any call with one.
+#[cfg_attr(feature = "std", recursive::recursive)]
+pub(crate) fn is_aggregate_or_window_expression(expr: &Expr) -> bool {
+    match expr {
+        Expr::Function(func) => func.over.is_some() || is_aggregate_call(func),
+        Expr::BinaryOp { left, right, .. } => {
+            is_aggregate_or_window_expression(left) || is_aggregate_or_window_expression(right)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Nested(expr)
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::IsTrue(expr)
+        | Expr::IsNotTrue(expr)
+        | Expr::IsFalse(expr)
+        | Expr::IsNotFalse(expr) => is_aggregate_or_window_expression(expr),
+        Expr::Case { conditions, else_result, .. } => {
+            conditions.iter().any(|case_when| {
+                is_aggregate_or_window_expression(&case_when.condition)
+                    || is_aggregate_or_window_expression(&case_when.result)
+            }) || else_result
+                .as_ref()
+                .is_some_and(|result| is_aggregate_or_window_expression(result))
+        }
+        _ => false,
+    }
+}
+
 fn contains_expr(targets: &[Expr], expr: &Expr) -> bool {
     targets.iter().any(|target| target == expr)
 }
@@ -1317,6 +1359,7 @@ fn translate_group_by(
 ) -> Result<sqlparser::ast::GroupByExpr, crate::errors::Error> {
     crate::impls::shared_helpers::translate_group_by_expr::<Forward>(
         group_by,
+        None,
         schema,
         options,
         &mut |_| {},
@@ -1554,7 +1597,15 @@ mod tests {
             }),
             interpolate: None,
         });
-        let _ = translate_order_by(order_by_all.as_ref(), &schema, &options, &mut |_| {}).unwrap();
+        let body = parse_query("SELECT a FROM t").body;
+        let _ = translate_order_by(
+            order_by_all.as_ref(),
+            body.as_ref(),
+            &schema,
+            &options,
+            &mut |_| {},
+        )
+        .unwrap();
 
         let offset_comma_limit = Some(sqlparser::ast::LimitClause::OffsetCommaLimit {
             offset: parse_expr("5"),

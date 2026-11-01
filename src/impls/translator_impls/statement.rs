@@ -475,16 +475,22 @@ fn build_create_table_statements(
     rls_statements: Option<Vec<Statement>>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Vec<Statement>, Error> {
-    let translated_table = create_table.translate_with_warnings(schema, options, emit)?;
+    // Uniqueness over interval columns moves to a companion index on the
+    // comparison key, and the references the stored text cannot settle are
+    // refused, before the ordinary translation runs.
+    let prepared = crate::impls::interval::ddl::prepare(create_table, schema, options)?;
+    let translated_table = prepared.source().translate_with_warnings(schema, options, emit)?;
     let emitted_table = match rls_statements {
         Some(_) => rename_table_for_rls(&translated_table, options, schema),
         None => translated_table,
     };
     let companions = table_companions(create_table, &emitted_table.name, schema, options, emit)?;
+    let interval_companions = prepared.companion_statements(&emitted_table.name);
 
     let mut statements = vec![Statement::CreateTable(emitted_table)];
     statements.extend(rls_statements.into_iter().flatten());
     statements.extend(companions);
+    statements.extend(interval_companions);
     append_vec0_statements_if_needed(&mut statements, create_table, schema, options, emit)?;
     Ok(statements)
 }
