@@ -10,10 +10,10 @@
 //! exposed the whole backing table. The write path already denied correctly,
 //! which made the read path an inconsistency rather than a design choice.
 //!
-//! A policy that omits `USING` is a different case and must NOT deny.
-//! PostgreSQL treats a missing `USING` as permissive-true, so such a policy
-//! grants every row. `policy_without_using_clause_grants_every_row` pins that
-//! distinction so the deny-all fix cannot be over-applied.
+//! A policy that omits `USING` denies too. PostgreSQL 18.6 shows a non-owner no
+//! row through `CREATE POLICY p ON t FOR SELECT`, since such a policy adds
+//! nothing to the permissive side. `policy_without_using_clause_grants_no_row`
+//! pins it.
 //!
 //! Denying every row also removes the point of the runtime validation monitor
 //! for such a table: its check asks whether a backing row is visible through
@@ -178,10 +178,10 @@ fn rls_with_select_policy_filters_normally() -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-/// A policy that omits `USING` is permissive-true in PostgreSQL, so it grants
-/// every row. The deny-all fix must not treat a missing predicate as a denial.
+/// A policy that omits `USING` grants nothing, so with no other permissive
+/// policy no row is visible, as on PostgreSQL 18.6.
 #[test]
-fn policy_without_using_clause_grants_every_row() -> Result<(), Box<dyn std::error::Error>> {
+fn policy_without_using_clause_grants_no_row() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = setup(
         "
         CREATE TABLE docs (id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL);
@@ -190,11 +190,7 @@ fn policy_without_using_clause_grants_every_row() -> Result<(), Box<dyn std::err
     ",
     )?;
 
-    assert_eq!(
-        view_count(&mut conn)?,
-        2,
-        "a SELECT policy with no USING clause is permissive-true, so every row is visible"
-    );
+    assert_eq!(view_count(&mut conn)?, 0, "a SELECT policy with no USING clause grants no row");
 
     Ok(())
 }

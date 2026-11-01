@@ -303,15 +303,10 @@ fn explicit_insert_with_check_is_enforced() -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-/// A `FOR INSERT` policy carrying neither `WITH CHECK` nor `USING` has no
-/// predicate to apply, so it grants the insert.
-///
-/// PostgreSQL forbids `USING` on an INSERT-only policy, so the documented
-/// fallback chain has nothing to fall back to and the policy imposes no
-/// restriction. Characterization test: it pins that a missing predicate reads
-/// as permissive-true rather than as a denial.
+/// A `FOR INSERT` policy carrying neither `WITH CHECK` nor `USING` adds nothing
+/// for a new row to satisfy, so it admits no insert, as on PostgreSQL 18.6.
 #[test]
-fn insert_policy_without_any_predicate_grants_the_insert() -> Result<(), Box<dyn std::error::Error>>
+fn insert_policy_without_any_predicate_admits_no_insert() -> Result<(), Box<dyn std::error::Error>>
 {
     let mut conn = setup(
         "
@@ -320,11 +315,12 @@ fn insert_policy_without_any_predicate_grants_the_insert() -> Result<(), Box<dyn
     ",
     )?;
 
-    diesel::insert_into(docs::table)
+    let inserted = diesel::insert_into(docs::table)
         .values(ViewRow { id: 2, is_public: 0, body: "anything".to_owned() })
-        .execute(&mut conn)?;
+        .execute(&mut conn);
 
-    assert_eq!(docs_rls::table.count().get_result::<i64>(&mut conn)?, 2);
+    assert!(inserted.is_err(), "the INSERT must be rejected; got {inserted:?}");
+    assert_eq!(docs_rls::table.count().get_result::<i64>(&mut conn)?, 1);
 
     Ok(())
 }
