@@ -1017,40 +1017,25 @@ pub(crate) fn is_aggregate_call(func: &Function) -> bool {
     aggregate_function_name(func).is_some_and(|name| AGGREGATE_NAMES.contains(&name.as_str()))
 }
 
-#[cfg_attr(feature = "std", recursive::recursive)]
+/// True when `expr` contains an aggregate call without an `OVER` clause.
 fn is_aggregate_expression(expr: &Expr) -> bool {
-    match expr {
-        Expr::Function(func) => func.over.is_none() && is_aggregate_call(func),
-        Expr::BinaryOp { left, right, .. } => {
-            is_aggregate_expression(left) || is_aggregate_expression(right)
-        }
-        Expr::UnaryOp { expr, .. }
-        | Expr::Nested(expr)
-        | Expr::Cast { expr, .. }
-        | Expr::IsNull(expr)
-        | Expr::IsNotNull(expr)
-        | Expr::IsTrue(expr)
-        | Expr::IsNotTrue(expr)
-        | Expr::IsFalse(expr)
-        | Expr::IsNotFalse(expr) => is_aggregate_expression(expr),
-        Expr::Case { conditions, else_result, .. } => {
-            conditions.iter().any(|case_when| {
-                is_aggregate_expression(&case_when.condition)
-                    || is_aggregate_expression(&case_when.result)
-            }) || else_result.as_ref().is_some_and(|result| is_aggregate_expression(result))
-        }
-        _ => false,
-    }
+    contains_call(expr, &|func| func.over.is_none() && is_aggregate_call(func))
 }
 
 /// True when `expr` contains a call that settles which rows fall together,
 /// an aggregate without an `OVER` clause or any call with one.
-#[cfg_attr(feature = "std", recursive::recursive)]
 pub(crate) fn is_aggregate_or_window_expression(expr: &Expr) -> bool {
+    contains_call(expr, &|func| func.over.is_some() || is_aggregate_call(func))
+}
+
+/// True when `expr`, through operators, casts, `IS` tests and `CASE` arms,
+/// contains a call `matches` accepts.
+#[cfg_attr(feature = "std", recursive::recursive)]
+fn contains_call(expr: &Expr, matches: &dyn Fn(&Function) -> bool) -> bool {
     match expr {
-        Expr::Function(func) => func.over.is_some() || is_aggregate_call(func),
+        Expr::Function(func) => matches(func),
         Expr::BinaryOp { left, right, .. } => {
-            is_aggregate_or_window_expression(left) || is_aggregate_or_window_expression(right)
+            contains_call(left, matches) || contains_call(right, matches)
         }
         Expr::UnaryOp { expr, .. }
         | Expr::Nested(expr)
@@ -1060,14 +1045,12 @@ pub(crate) fn is_aggregate_or_window_expression(expr: &Expr) -> bool {
         | Expr::IsTrue(expr)
         | Expr::IsNotTrue(expr)
         | Expr::IsFalse(expr)
-        | Expr::IsNotFalse(expr) => is_aggregate_or_window_expression(expr),
+        | Expr::IsNotFalse(expr) => contains_call(expr, matches),
         Expr::Case { conditions, else_result, .. } => {
             conditions.iter().any(|case_when| {
-                is_aggregate_or_window_expression(&case_when.condition)
-                    || is_aggregate_or_window_expression(&case_when.result)
-            }) || else_result
-                .as_ref()
-                .is_some_and(|result| is_aggregate_or_window_expression(result))
+                contains_call(&case_when.condition, matches)
+                    || contains_call(&case_when.result, matches)
+            }) || else_result.as_ref().is_some_and(|result| contains_call(result, matches))
         }
         _ => false,
     }
