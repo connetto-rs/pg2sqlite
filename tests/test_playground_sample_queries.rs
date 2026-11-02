@@ -31,6 +31,7 @@
 
 #![allow(clippy::too_many_lines)]
 
+#[expect(dead_code, reason = "this binary uses part of the shared helpers")]
 mod helpers;
 
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};

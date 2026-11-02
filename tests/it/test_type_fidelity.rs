@@ -1,0 +1,1822 @@
+//! Type-fidelity tests from the TypeFidelity scout hunt.
+//!
+//! Each test corresponds to a numbered finding and asserts either the
+//! refusal message for constructs the target cannot represent, or the
+//! round-trip value for constructs that must translate faithfully.
+//!
+//! Every assertion executes the emitted SQL through rusqlite against the
+//! emitted DDL; grepping the output string is not accepted as proof.
+
+use pg2sqlite::{
+    prelude::{Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation},
+    warnings::TranslationWarning,
+};
+use run_translated_helper::run_translated_with;
+use rusqlite::Connection;
+
+use crate::helpers::run_translated as run_translated_helper;
+
+fn default_opts() -> Pg2SqliteOptions {
+    Pg2SqliteOptions::default()
+}
+
+fn array_opts() -> Pg2SqliteOptions {
+    use pg2sqlite::traits::ArrayRepresentation;
+    Pg2SqliteOptions::default().with_array_representation(ArrayRepresentation::Json)
+}
+
+fn text_uuid_opts() -> Pg2SqliteOptions {
+    Pg2SqliteOptions::default().with_uuid_representation(UuidRepresentation::Text)
+}
+
+/// Translate and execute every emitted statement in a fresh SQLite database.
+fn run(pg: &str, opts: &Pg2SqliteOptions) {
+    let stmts = Pg2Sqlite::default()
+        .sql(pg)
+        .expect("parse")
+        .translate_to_sql(opts)
+        .expect("translate")
+        .into_vec();
+    let conn = Connection::open_in_memory().unwrap();
+    for s in &stmts {
+        conn.execute_batch(&format!("{s};"))
+            .unwrap_or_else(|e| panic!("emitted statement failed in SQLite: {e}\n{s}"));
+    }
+}
+
+/// Translate and execute, then return the first column of the last query as
+/// a `Vec<Option<String>>`.
+fn query_rows(pg: &str, opts: &Pg2SqliteOptions) -> Vec<Option<String>> {
+    run_translated_with(pg, opts)
+}
+
+/// Expect translation to fail with a message containing `needle`.
+fn expect_refusal(pg: &str, opts: &Pg2SqliteOptions, needle: &str) {
+    let err = Pg2Sqlite::default()
+        .sql(pg)
+        .expect("parse")
+        .translate(opts)
+        .expect_err("expected a refusal");
+    assert!(
+        err.to_string().contains(needle),
+        "refusal message must contain {needle:?}, got: {err}"
+    );
+}
+
+/// Translate and return the warnings.
+fn warnings(pg: &str, opts: &Pg2SqliteOptions) -> Vec<TranslationWarning> {
+    Pg2Sqlite::default()
+        .sql(pg)
+        .expect("parse")
+        .translate_with_report(opts)
+        .expect("translate")
+        .warnings
+}
+
+// ── Finding 1: NaN / Infinity silently become 0.0 ────────────────────────────
+
+#[test]
+fn nan_cast_to_double_is_refused() {
+    expect_refusal(
+        "CREATE TABLE t (col double precision);
+         INSERT INTO t VALUES ('NaN'::double precision);",
+        &default_opts(),
+        "NaN",
+    );
+}
+
+#[test]
+fn infinity_cast_to_double_is_refused() {
+    expect_refusal(
+        "CREATE TABLE t (col double precision);
+         INSERT INTO t VALUES ('Infinity'::double precision);",
+        &default_opts(),
+        "Infinity",
+    );
+}
+
+#[test]
+fn negative_infinity_cast_to_real_is_refused() {
+    expect_refusal(
+        "CREATE TABLE t (col real);
+         INSERT INTO t VALUES ('-Infinity'::real);",
+        &default_opts(),
+        "Infinity",
+    );
+}
+
+#[test]
+fn finite_float_is_accepted() {
+    // -0.0 is finite; no crash.
+    run(
+        "CREATE TABLE t (col double precision);
+         INSERT INTO t VALUES (-0.0);",
+        &default_opts(),
+    );
+}
+
+#[test]
+fn nan_written_into_a_double_column_is_refused() {
+    // No cast: the column's own type is what makes 'NaN' a float here, and
+    // the emitted INSERT used to die at apply with "cannot store TEXT value
+    // in REAL column".
+    expect_refusal(
+        "CREATE TABLE t (col double precision);
+         INSERT INTO t (col) VALUES ('NaN');",
+        &default_opts(),
+        "NaN",
+    );
+}
+
+#[test]
+fn infinity_compared_against_a_double_column_is_refused() {
+    // `col = 'Infinity'` compares a REAL against TEXT in SQLite, which is
+    // never equal, where PostgreSQL matches every infinite row.
+    expect_refusal(
+        "CREATE TABLE t (col double precision);
+         SELECT * FROM t WHERE col = 'Infinity';",
+        &default_opts(),
+        "Infinity",
+    );
+}
+
+#[test]
+fn a_finite_string_literal_in_a_double_column_still_translates() {
+    let rows = query_rows(
+        "CREATE TABLE t (col double precision);
+         INSERT INTO t (col) VALUES ('1.5');
+         SELECT col FROM t;",
+        &default_opts(),
+    );
+    assert_eq!(rows, vec![Some("1.5".to_string())]);
+}
+
+// ── Finding 2: BIT / BIT VARYING → TEXT with length CHECK ───────────────────
+
+#[test]
+fn bit_n_maps_to_text_not_integer() {
+    let stmts = Pg2Sqlite::default()
+        .sql("CREATE TABLE t (col bit(4));")
+        .expect("parse")
+        .translate_to_sql(&default_opts())
+        .expect("translate")
+        .into_vec();
+    let sql = stmts.join("\n");
+    assert!(sql.contains("TEXT"), "bit(n) must map to TEXT, got: {sql}");
+    assert!(!sql.to_uppercase().contains("INTEGER"), "bit(n) must not map to INTEGER, got: {sql}");
+}
+
+#[test]
+fn bit_values_remain_distinct() {
+    // '010' and '10' are distinct bit strings with different lengths; they
+    // must compare unequal in the replica, as they do in PostgreSQL.
+    let rows = query_rows(
+        "CREATE TABLE t (col bit varying(10));
+         INSERT INTO t VALUES ('010'), ('10');
+         SELECT col FROM t ORDER BY col DESC;",
+        &default_opts(),
+    );
+    assert_eq!(rows.len(), 2, "expected 2 rows, got {rows:?}");
+    assert_ne!(rows[0], rows[1], "'010' and '10' must be stored distinct, got {rows:?}");
+}
+
+#[test]
+fn overlong_bit_value_is_rejected() {
+    // '10101' is 5 bits; bit(4) must not accept it.
+    let conn = Connection::open_in_memory().unwrap();
+    let stmts = Pg2Sqlite::default()
+        .sql("CREATE TABLE t (col bit(4));")
+        .expect("parse")
+        .translate_to_sql(&default_opts())
+        .expect("translate")
+        .into_vec();
+    for s in &stmts {
+        conn.execute_batch(&format!("{s};")).unwrap_or_else(|e| panic!("DDL failed: {e}\n{s}"));
+    }
+    let err = conn
+        .execute_batch("INSERT INTO t VALUES ('10101');")
+        .expect_err("5-bit value into bit(4) must fail the CHECK");
+    assert!(
+        err.to_string().contains("CHECK"),
+        "rejection must come from the CHECK constraint, got: {err}"
+    );
+}
+
+#[test]
+fn bit_varying_n_accepts_at_boundary_and_rejects_past_it() {
+    let conn = Connection::open_in_memory().unwrap();
+    let stmts = Pg2Sqlite::default()
+        .sql("CREATE TABLE t (col bit varying(3));")
+        .expect("parse")
+        .translate_to_sql(&default_opts())
+        .expect("translate")
+        .into_vec();
+    for s in &stmts {
+        conn.execute_batch(&format!("{s};")).unwrap_or_else(|e| panic!("{e}\n{s}"));
+    }
+    conn.execute_batch("INSERT INTO t VALUES ('101');").expect("3-bit value into bit varying(3)");
+    let err = conn
+        .execute_batch("INSERT INTO t VALUES ('1010');")
+        .expect_err("4-bit value into bit varying(3) must fail");
+    assert!(err.to_string().contains("CHECK"), "rejection must come from CHECK, got: {err}");
+}
+
+#[test]
+fn a_bit_string_literal_is_translated_to_its_digits() {
+    // B'010' is PostgreSQL's own spelling of a bit string; emitted verbatim
+    // it is a syntax error in SQLite.
+    let rows = query_rows(
+        "CREATE TABLE t (col bit varying(8));
+         INSERT INTO t (col) VALUES (B'010');
+         SELECT col FROM t;",
+        &default_opts(),
+    );
+    assert_eq!(rows, vec![Some("010".to_string())]);
+}
+
+#[test]
+fn a_hex_bit_literal_is_expanded_to_bits() {
+    // PostgreSQL answers '00011010' for X'1A'::text, four bits per digit.
+    let rows = query_rows(
+        "CREATE TABLE t (col bit(8));
+         INSERT INTO t (col) VALUES (X'1A');
+         SELECT col FROM t;",
+        &default_opts(),
+    );
+    assert_eq!(rows, vec![Some("00011010".to_string())]);
+}
+
+#[test]
+fn a_non_binary_digit_in_a_bit_column_is_refused() {
+    // PostgreSQL answers `"2" is not a valid binary digit`; the replica
+    // stored '012' because the CHECK counted length only.
+    expect_refusal(
+        "CREATE TABLE t (col bit(3));
+         INSERT INTO t (col) VALUES ('012');",
+        &default_opts(),
+        "binary digit",
+    );
+}
+
+#[test]
+fn a_non_binary_value_written_later_fails_the_check() {
+    // A write the translator never sees must fail in the replica too.
+    let conn = Connection::open_in_memory().unwrap();
+    let stmts = Pg2Sqlite::default()
+        .sql("CREATE TABLE t (col bit(3));")
+        .expect("parse")
+        .translate_to_sql(&default_opts())
+        .expect("translate")
+        .into_vec();
+    for s in &stmts {
+        conn.execute_batch(&format!("{s};")).unwrap_or_else(|e| panic!("DDL failed: {e}\n{s}"));
+    }
+    conn.execute_batch("INSERT INTO t VALUES ('010');").expect("three binary digits");
+    let err = conn
+        .execute_batch("INSERT INTO t VALUES ('012');")
+        .expect_err("a non-binary digit must fail the CHECK");
+    assert!(err.to_string().contains("CHECK"), "rejection must come from CHECK, got: {err}");
+}
+
+// ── Finding 3: bytea hex literals fail at apply time ─────────────────────────
+
+#[test]
+fn bytea_hex_literal_executes() {
+    // '\x414243' is the hex representation of 'ABC'; must reach a BLOB column.
+    run(
+        "CREATE TABLE t (col bytea);
+         INSERT INTO t VALUES ('\\x414243');",
+        &default_opts(),
+    );
+}
+
+#[test]
+fn bytea_empty_hex_literal_executes() {
+    run(
+        "CREATE TABLE t (col bytea);
+         INSERT INTO t VALUES ('\\x');",
+        &default_opts(),
+    );
+}
+
+#[test]
+fn bytea_two_byte_hex_literal_executes() {
+    run(
+        "CREATE TABLE t (col bytea);
+         INSERT INTO t VALUES ('\\xfffe');",
+        &default_opts(),
+    );
+}
+
+#[test]
+fn bytea_odd_nibble_hex_literal_is_refused() {
+    // '\xfff' has 3 hex digits — odd number of nibbles — PostgreSQL refuses.
+    expect_refusal(
+        "CREATE TABLE t (col bytea);
+         INSERT INTO t VALUES ('\\xfff');",
+        &default_opts(),
+        "nibble",
+    );
+}
+
+#[test]
+fn bytea_hex_value_is_accessible_after_insert() {
+    // The stored bytes must be retrievable; lower(hex(col)) reads them back.
+    let rows = query_rows(
+        "CREATE TABLE t (col bytea);
+         INSERT INTO t VALUES ('\\x414243');
+         SELECT lower(hex(col)) FROM t;",
+        &default_opts(),
+    );
+    assert_eq!(rows, vec![Some("414243".to_string())]);
+}
+
+// ── Finding 4: smallint / integer missing range CHECK ────────────────────────
+
+#[test]
+fn smallint_boundary_is_accepted() {
+    // 32767 is within range; must not fail the CHECK.
+    run(
+        "CREATE TABLE t (col smallint);
+         INSERT INTO t VALUES (32767);",
+        &default_opts(),
+    );
+}
+
+#[test]
+fn smallint_above_upper_bound_is_rejected() {
+    let conn = Connection::open_in_memory().unwrap();
+    let stmts = Pg2Sqlite::default()
+        .sql("CREATE TABLE t (col smallint);")
+        .expect("parse")
+        .translate_to_sql(&default_opts())
+        .expect("translate")
+        .into_vec();
+    for s in &stmts {
+        conn.execute_batch(&format!("{s};")).unwrap_or_else(|e| panic!("{e}\n{s}"));
+    }
+    let err = conn
+        .execute_batch("INSERT INTO t VALUES (32768);")
+        .expect_err("32768 must fail the smallint range CHECK");
+    assert!(err.to_string().contains("CHECK"), "got: {err}");
+}
+
+#[test]
+fn smallint_below_lower_bound_is_rejected() {
+    let conn = Connection::open_in_memory().unwrap();
+    let stmts = Pg2Sqlite::default()
+        .sql("CREATE TABLE t (col smallint);")
+        .expect("parse")
+        .translate_to_sql(&default_opts())
+        .expect("translate")
+        .into_vec();
+    for s in &stmts {
+        conn.execute_batch(&format!("{s};")).unwrap_or_else(|e| panic!("{e}\n{s}"));
+    }
+    let err = conn
+        .execute_batch("INSERT INTO t VALUES (-32769);")
+        .expect_err("-32769 must fail the smallint range CHECK");
+    assert!(err.to_string().contains("CHECK"), "got: {err}");
+}
+
+#[test]
+fn integer_boundary_is_accepted() {
+    run(
+        "CREATE TABLE t (col integer);
+         INSERT INTO t VALUES (2147483647);",
+        &default_opts(),
+    );
+}
+
+#[test]
+fn integer_above_upper_bound_is_rejected() {
+    let conn = Connection::open_in_memory().unwrap();
+    let stmts = Pg2Sqlite::default()
+        .sql("CREATE TABLE t (col integer);")
+        .expect("parse")
+        .translate_to_sql(&default_opts())
+        .expect("translate")
+        .into_vec();
+    for s in &stmts {
+        conn.execute_batch(&format!("{s};")).unwrap_or_else(|e| panic!("{e}\n{s}"));
+    }
+    let err = conn
+        .execute_batch("INSERT INTO t VALUES (2147483648);")
+        .expect_err("2147483648 must fail the integer range CHECK");
+    assert!(err.to_string().contains("CHECK"), "got: {err}");
+}
+
+// ── Finding 5: NUMERIC(p,s)[] array elements stored unscaled ─────────────────
+
+#[test]
+fn numeric_scaled_array_column_is_refused() {
+    // A numeric(10,2)[] column would store elements in decimal while the
+    // scalar column stores minor units, making comparisons between them fail.
+    expect_refusal(
+        "CREATE TABLE t (a numeric(10,2), b numeric(10,2)[]);",
+        &array_opts(),
+        "NUMERIC",
+    );
+}
+
+// ── Arrays of a type stored as BLOB ──────────────────────────────────────────
+
+fn blob_uuid_array_opts() -> Pg2SqliteOptions {
+    array_opts().with_uuid_representation(UuidRepresentation::Blob)
+}
+
+#[test]
+fn array_columns_of_blob_stored_types_are_refused() {
+    // Every element lands as a BLOB (unhex(...), vec_f32(...)), and SQLite's
+    // json_array refuses one, so each write of a non-empty array would fail
+    // at run time.
+    for (ddl, opts, element) in [
+        ("CREATE TABLE b (id INT PRIMARY KEY, blobs BYTEA[]);", array_opts(), "BYTEA"),
+        ("CREATE TABLE u (id INT PRIMARY KEY, ids UUID[]);", blob_uuid_array_opts(), "UUID"),
+        (
+            "CREATE EXTENSION vector; CREATE TABLE v (id INT PRIMARY KEY, e vector(3)[]);",
+            array_opts(),
+            "vector(3)",
+        ),
+    ] {
+        expect_refusal(
+            ddl,
+            &opts,
+            &format!("a JSON array cannot hold the BLOB {element} is stored as"),
+        );
+    }
+}
+
+#[test]
+fn arrays_built_from_blob_stored_elements_are_refused() {
+    let schema = "CREATE TABLE t (id INT PRIMARY KEY, b BYTEA, u UUID, tags TEXT[]);";
+    for (query, element) in [
+        ("SELECT ARRAY[b] FROM t;", "BYTEA"),
+        ("SELECT ARRAY['\\x0102'::bytea] FROM t;", "BYTEA"),
+        ("SELECT ARRAY[(u)] FROM t;", "UUID"),
+        ("SELECT array_agg(u) FROM t;", "UUID"),
+        ("SELECT array_append(tags, b) FROM t;", "BYTEA"),
+        ("SELECT array_prepend(b, tags) FROM t;", "BYTEA"),
+        ("SELECT tags || b FROM t;", "BYTEA"),
+        ("SELECT array_replace(tags, NULL, b) FROM t;", "BYTEA"),
+        ("SELECT CAST(NULL AS UUID[]) FROM t;", "UUID"),
+    ] {
+        expect_refusal(
+            &format!("{schema} {query}"),
+            &blob_uuid_array_opts(),
+            &format!("a JSON array cannot hold the BLOB {element} is stored as"),
+        );
+    }
+}
+
+#[test]
+fn arrays_of_calls_returning_a_blob_stored_type_are_refused() {
+    let schema = "CREATE EXTENSION \"uuid-ossp\";
+         CREATE TABLE t (id INT PRIMARY KEY, b BYTEA, tags TEXT[]);
+         CREATE FUNCTION f() RETURNS BYTEA LANGUAGE sql AS $$ SELECT '\\x01'::bytea $$;";
+    for (query, element) in [
+        ("SELECT ARRAY[decode('0102', 'hex')] FROM t;", "BYTEA"),
+        ("SELECT array_agg(gen_random_uuid()) FROM t;", "UUID"),
+        ("SELECT ARRAY[uuid_generate_v4()] FROM t;", "UUID"),
+        ("SELECT array_agg(coalesce(b, NULL)) FROM t;", "BYTEA"),
+        ("SELECT array_append(tags, nullif(b, b)) FROM t;", "BYTEA"),
+        ("SELECT ARRAY[f()] FROM t;", "BYTEA"),
+    ] {
+        expect_refusal(
+            &format!("{schema} {query}"),
+            &blob_uuid_array_opts(),
+            &format!("a JSON array cannot hold the BLOB {element} is stored as"),
+        );
+    }
+}
+
+#[test]
+fn arrays_of_calls_returning_text_still_translate() {
+    run(
+        "CREATE TABLE t (id INT PRIMARY KEY, b BYTEA);
+         SELECT ARRAY[encode(b, 'hex')] FROM t;",
+        &array_opts(),
+    );
+    // Text UUIDs come from a host-registered generator, absent here, so the
+    // statement is translated without being run.
+    Pg2Sqlite::default()
+        .sql("CREATE TABLE t (id INT PRIMARY KEY); SELECT array_agg(gen_random_uuid()) FROM t;")
+        .expect("parse")
+        .translate(&array_opts().with_uuid_representation(UuidRepresentation::Text))
+        .expect("text UUIDs fit in a JSON array");
+}
+
+#[test]
+fn a_literal_argument_picks_the_overload_whose_result_decides_the_refusal() {
+    let schema = "CREATE TABLE t (id INT PRIMARY KEY);
+         CREATE FUNCTION g(x INT) RETURNS BYTEA LANGUAGE sql AS $$ SELECT '\\x01'::bytea $$;
+         CREATE FUNCTION g(x BIGINT) RETURNS TEXT LANGUAGE sql AS $$ SELECT 'a' $$;
+         CREATE FUNCTION g(x NUMERIC) RETURNS TEXT LANGUAGE sql AS $$ SELECT 'a' $$;
+         CREATE FUNCTION g(x BOOLEAN) RETURNS BYTEA LANGUAGE sql AS $$ SELECT '\\x01'::bytea $$;
+         CREATE FUNCTION h(x INT[]) RETURNS BYTEA LANGUAGE sql AS $$ SELECT '\\x01'::bytea $$;
+         CREATE FUNCTION h(x TEXT[]) RETURNS TEXT LANGUAGE sql AS $$ SELECT 'a' $$;";
+    let opts = array_opts().with_user_defined_functions(["g", "h"]);
+    for refused in ["g(1)", "g(true)", "h(ARRAY[id])"] {
+        expect_refusal(
+            &format!("{schema} SELECT ARRAY[{refused}] FROM t;"),
+            &opts,
+            "a JSON array cannot hold the BLOB BYTEA is stored as",
+        );
+    }
+    // A bound parameter has no type, so the overloads disagree and nothing is
+    // refused.
+    for accepted in [
+        "g(3000000000)",
+        "g(1.5)",
+        "g(1e3)",
+        "g(99999999999999999999)",
+        "g($1)",
+        "h(ARRAY['a'::text])",
+    ] {
+        Pg2Sqlite::default()
+            .sql(&format!("{schema} SELECT ARRAY[{accepted}] FROM t;"))
+            .expect("parse")
+            .translate(&opts)
+            .unwrap_or_else(|e| panic!("ARRAY[{accepted}] returns text, got: {e}"));
+    }
+}
+
+#[test]
+fn arrays_of_case_and_subquery_results_stored_as_blob_are_refused() {
+    let schema = "CREATE TABLE t (id INT PRIMARY KEY, b BYTEA, u UUID);";
+    for (query, element) in [
+        ("SELECT ARRAY[CASE WHEN id > 0 THEN b ELSE NULL END] FROM t;", "BYTEA"),
+        ("SELECT ARRAY[CASE id WHEN 1 THEN u END] FROM t;", "UUID"),
+        ("SELECT array_agg(CASE WHEN id > 0 THEN b END) FROM t;", "BYTEA"),
+        ("SELECT ARRAY[(SELECT b FROM t LIMIT 1)] FROM t;", "BYTEA"),
+        ("SELECT ARRAY[d.x] FROM (SELECT decode('0102', 'hex') AS x FROM t) d;", "BYTEA"),
+    ] {
+        expect_refusal(
+            &format!("{schema} {query}"),
+            &blob_uuid_array_opts(),
+            &format!("a JSON array cannot hold the BLOB {element} is stored as"),
+        );
+    }
+    run(
+        &format!(
+            "{schema} SELECT ARRAY[CASE WHEN id > 0 THEN encode(b, 'hex') END], \
+             ARRAY[(SELECT id FROM t LIMIT 1)] FROM t;"
+        ),
+        &blob_uuid_array_opts(),
+    );
+}
+
+// ── bytea concatenation ──────────────────────────────────────────────────────
+
+/// A table with one row holding `\x0102` and one holding NULL, then `query`.
+fn bytea_rows(query: &str) -> Vec<Option<String>> {
+    query_rows(
+        &format!(
+            "CREATE TABLE t (id INT PRIMARY KEY, b BYTEA);
+             INSERT INTO t VALUES (1, '\\x0102'), (2, NULL);
+             {query}"
+        ),
+        &default_opts(),
+    )
+}
+
+#[test]
+fn bytea_concatenation_answers_bytes() {
+    // SQLite's || answers TEXT for two blobs, so the bytes came back as a
+    // string where PostgreSQL answers bytea.
+    assert_eq!(
+        bytea_rows("SELECT b || b FROM t ORDER BY id;"),
+        vec![Some("[1, 2, 1, 2]".to_owned()), None]
+    );
+    assert_eq!(
+        bytea_rows("SELECT b || '\\x03' FROM t ORDER BY id;"),
+        vec![Some("[1, 2, 3]".to_owned()), None]
+    );
+    assert_eq!(bytea_rows("SELECT b || NULL FROM t ORDER BY id;"), vec![None, None]);
+}
+
+#[test]
+fn bytea_concatenated_with_text_answers_the_hex_text() {
+    // PostgreSQL reads `bytea || text` as text concatenation over the bytea's
+    // output form.
+    assert_eq!(
+        bytea_rows("SELECT b || 'ab'::text FROM t ORDER BY id;"),
+        vec![Some("\\x0102ab".to_owned()), None]
+    );
+    assert_eq!(
+        bytea_rows("SELECT 'ab'::text || b FROM t ORDER BY id;"),
+        vec![Some("ab\\x0102".to_owned()), None]
+    );
+}
+
+#[test]
+fn encode_of_a_null_bytea_is_null() {
+    // SQLite's hex(NULL) is the empty string, where PostgreSQL's encode is
+    // strict.
+    assert_eq!(
+        bytea_rows("SELECT encode(b, 'hex') FROM t ORDER BY id;"),
+        vec![Some("0102".to_owned()), None]
+    );
+}
+
+#[test]
+fn bytea_operators_postgresql_cannot_resolve_are_refused() {
+    let schema = "CREATE TABLE t (id INT PRIMARY KEY, b BYTEA);";
+    for (query, needle) in [
+        ("SELECT b || id FROM t;", "|| over BYTEA and INT has no PostgreSQL operator"),
+        ("SELECT b + NULL FROM t;", "+ over BYTEA and an untyped value has no PostgreSQL operator"),
+        ("SELECT b || g() FROM t;", "|| beside a BYTEA value needs the type of g()"),
+        ("SELECT g() || b FROM t;", "|| beside a BYTEA value needs the type of g()"),
+        // An untyped literal beside bytea is read as bytea, and only the hex
+        // format is unambiguous.
+        ("SELECT b || 'abc' FROM t;", "bytea literal 'abc' is not in the PostgreSQL hex format"),
+        ("SELECT 'abc' || b FROM t;", "bytea literal 'abc' is not in the PostgreSQL hex format"),
+    ] {
+        expect_refusal(
+            &format!("{schema} {query}"),
+            &default_opts().with_user_defined_functions(["g"]),
+            needle,
+        );
+    }
+}
+
+#[test]
+fn an_untranslatable_operand_of_a_bytea_or_vector_lowering_is_reported() {
+    let schema = "CREATE EXTENSION vector; \
+                  CREATE TABLE t (id INT PRIMARY KEY, s TEXT, b BYTEA, v vector(3));";
+    for query in [
+        "SELECT encode(md5(s)::bytea, 'hex') FROM t;",
+        "SELECT b || md5(s)::bytea FROM t;",
+        "SELECT md5(s)::bytea || b FROM t;",
+        "SELECT b || md5(s) FROM t;",
+        "SELECT v <-> md5(s)::vector(3) FROM t;",
+        "SELECT md5(s)::vector(3) <-> v FROM t;",
+    ] {
+        expect_refusal(&format!("{schema} {query}"), &default_opts(), "md5");
+    }
+}
+
+#[test]
+fn an_array_of_concatenated_bytea_is_refused() {
+    expect_refusal(
+        "CREATE TABLE t (id INT PRIMARY KEY, b BYTEA); SELECT ARRAY[b || b] FROM t;",
+        &array_opts(),
+        "a JSON array cannot hold the BLOB BYTEA is stored as",
+    );
+}
+
+#[test]
+fn an_array_of_a_subquery_with_no_readable_type_still_translates() {
+    // A PL/pgSQL variable is read through a subquery the statement's scope
+    // does not record, and a function relation's columns are opaque. Neither
+    // says the element is a BLOB, so the array translates.
+    run(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY);
+         CREATE TABLE log (id INTEGER PRIMARY KEY, tags INT[]);
+         CREATE TABLE src (id INTEGER PRIMARY KEY, v INTEGER);
+         CREATE FUNCTION f() RETURNS TRIGGER AS $$
+         DECLARE v_n INTEGER := 3;
+         BEGIN INSERT INTO log (tags) SELECT array_agg(v_n) FROM src; RETURN NEW; END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER tr AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION f();
+         INSERT INTO src VALUES (1, 1);
+         INSERT INTO t VALUES (1);",
+        &array_opts(),
+    );
+    run(
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         SELECT ARRAY[(SELECT name FROM pragma_table_info('t') LIMIT 1)] FROM t;",
+        &array_opts().with_user_defined_functions(["pragma_table_info"]),
+    );
+}
+
+#[test]
+fn an_unresolved_column_in_an_array_element_is_reported() {
+    let error = Pg2Sqlite::default()
+        .sql("CREATE TABLE t (id INT PRIMARY KEY); SELECT ARRAY[CASE WHEN id > 0 THEN missing END] FROM t;")
+        .expect("parse")
+        .translate(&array_opts())
+        .expect_err("missing is no column of t");
+    assert!(
+        matches!(error, pg2sqlite::errors::Error::UnresolvedColumnReference { .. }),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn arrays_of_sqlitegis_geometry_results_are_refused() {
+    expect_refusal(
+        "CREATE TABLE t (id INT PRIMARY KEY); SELECT ARRAY[ST_Point(1, 2)] FROM t;",
+        &array_opts().with_sqlitegis_enabled(),
+        "a JSON array cannot hold the BLOB geometry is stored as",
+    );
+}
+
+#[test]
+fn uuid_array_column_round_trips_when_uuids_are_text() {
+    let opts = array_opts().with_uuid_representation(UuidRepresentation::Text);
+    assert_eq!(
+        query_rows(
+            "CREATE TABLE u (id INT PRIMARY KEY, ids UUID[]);
+             INSERT INTO u VALUES (1, ARRAY['00010203-0405-0607-0809-0a0b0c0d0e0f'::uuid]);
+             SELECT ids FROM u;",
+            &opts,
+        ),
+        vec![Some(r#"["00010203-0405-0607-0809-0a0b0c0d0e0f"]"#.to_string())]
+    );
+}
+
+// ── Finding 6: string literal cast to array type stores wrong format
+// ──────────
+
+#[test]
+fn string_cast_to_integer_array_is_refused() {
+    // '{{1,2},{3,4}}'::integer[][] stores PG array text in the JSON column;
+    // every later json_extract then fails with "malformed JSON".
+    expect_refusal(
+        "CREATE TABLE t (col integer[][]);
+         SELECT '{{1,2},{3,4}}'::integer[][];",
+        &array_opts(),
+        "ARRAY",
+    );
+}
+
+#[test]
+fn a_string_literal_written_into_an_array_column_is_refused() {
+    // No cast: the column's type is what makes '{1,2}' an array here, and
+    // the replica stored PostgreSQL array text in a column holding JSON, so
+    // every later array operation failed with "malformed JSON".
+    expect_refusal(
+        "CREATE TABLE t (col integer[]);
+         INSERT INTO t (col) VALUES ('{1,2}');",
+        &array_opts(),
+        "ARRAY",
+    );
+}
+
+#[test]
+fn an_array_constructor_still_translates() {
+    let rows = query_rows(
+        "CREATE TABLE t (col integer[]);
+         INSERT INTO t (col) VALUES (ARRAY[1,2]);
+         SELECT col FROM t;",
+        &array_opts(),
+    );
+    assert_eq!(rows, vec![Some("[1,2]".to_string())]);
+}
+
+// ── Finding 7: UUID Text representation neither validates nor canonicalises
+// ───
+
+#[test]
+fn uuid_text_invalid_literal_is_refused() {
+    expect_refusal(
+        "CREATE TABLE t (id uuid);
+         INSERT INTO t VALUES ('not-a-uuid'::uuid);",
+        &text_uuid_opts(),
+        "invalid input syntax for type uuid",
+    );
+}
+
+#[test]
+fn uuid_text_braced_upper_is_canonicalised() {
+    // PostgreSQL normalises '{550E8400-E29B-41D4-A716-446655440000}' to
+    // '550e8400-e29b-41d4-a716-446655440000'.  The Text replica must store
+    // the same canonical form so equality holds.
+    let rows = query_rows(
+        "CREATE TABLE t (id uuid);
+         INSERT INTO t VALUES ('{550E8400-E29B-41D4-A716-446655440000}'::uuid);
+         SELECT id FROM t;",
+        &text_uuid_opts(),
+    );
+    assert_eq!(
+        rows,
+        vec![Some("550e8400-e29b-41d4-a716-446655440000".to_string())],
+        "braced/upper UUID must be stored in canonical form, got {rows:?}"
+    );
+}
+
+#[test]
+fn uuid_text_bare_literal_in_insert_is_canonicalised() {
+    let rows = query_rows(
+        "CREATE TABLE t (id uuid);
+         INSERT INTO t VALUES ('550E8400-E29B-41D4-A716-446655440000');
+         SELECT id FROM t;",
+        &text_uuid_opts(),
+    );
+    assert_eq!(rows, vec![Some("550e8400-e29b-41d4-a716-446655440000".to_string())],);
+}
+
+#[test]
+fn uuid_text_bare_invalid_in_insert_is_refused() {
+    expect_refusal(
+        "CREATE TABLE t (id uuid);
+         INSERT INTO t VALUES ('not-a-uuid');",
+        &text_uuid_opts(),
+        "invalid input syntax for type uuid",
+    );
+}
+
+// ── Finding 8: temporal literals unvalidated and un-normalised ───────────────
+
+#[test]
+fn a_month_out_of_range_is_refused() {
+    // PostgreSQL: date/time field value out of range: "2024-13-01".
+    expect_refusal(
+        "CREATE TABLE t (d date);
+         INSERT INTO t (d) VALUES ('2024-13-01');",
+        &default_opts(),
+        "2024-13-01",
+    );
+}
+
+#[test]
+fn a_day_past_the_end_of_the_month_is_refused() {
+    expect_refusal(
+        "CREATE TABLE t (d date);
+         INSERT INTO t (d) VALUES ('2024-02-30');",
+        &default_opts(),
+        "2024-02-30",
+    );
+}
+
+#[test]
+fn february_29_is_refused_outside_a_leap_year_and_kept_inside_one() {
+    expect_refusal(
+        "CREATE TABLE t (d date);
+         INSERT INTO t (d) VALUES ('2023-02-29');",
+        &default_opts(),
+        "2023-02-29",
+    );
+    let rows = query_rows(
+        "CREATE TABLE t (d date);
+         INSERT INTO t (d) VALUES ('2024-02-29');
+         SELECT d FROM t;",
+        &default_opts(),
+    );
+    assert_eq!(rows, vec![Some("2024-02-29".to_string())]);
+}
+
+#[test]
+fn a_single_digit_month_and_day_are_padded() {
+    // PostgreSQL answers 2024-03-05, and SQLite's own date functions answer
+    // NULL for '2024-3-5', so the padding is what makes the stored value
+    // usable at all.
+    let rows = query_rows(
+        "CREATE TABLE t (d date);
+         INSERT INTO t (d) VALUES ('2024-3-5');
+         SELECT strftime('%Y/%m', d) FROM t;",
+        &default_opts(),
+    );
+    assert_eq!(rows, vec![Some("2024/03".to_string())]);
+}
+
+#[test]
+fn a_time_literal_is_filled_out_to_seconds() {
+    // PostgreSQL answers 02:30:00 for '2:30'::time.
+    let rows = query_rows(
+        "CREATE TABLE t (tm time);
+         INSERT INTO t (tm) VALUES ('2:30');
+         SELECT tm FROM t;",
+        &default_opts(),
+    );
+    assert_eq!(rows, vec![Some("02:30:00".to_string())]);
+}
+
+#[test]
+fn an_hour_past_the_end_of_the_day_is_refused() {
+    expect_refusal(
+        "CREATE TABLE t (tm time);
+         INSERT INTO t (tm) VALUES ('25:00:00');",
+        &default_opts(),
+        "25:00:00",
+    );
+}
+
+#[test]
+fn the_end_of_day_hour_rolls_a_timestamp_over() {
+    // PostgreSQL answers 2024-03-06 00:00:00 for a timestamp written at
+    // 24:00:00, while a time column keeps the hour.
+    let rows = query_rows(
+        "CREATE TABLE t (ts timestamp);
+         INSERT INTO t (ts) VALUES ('2024-03-05 24:00:00');
+         SELECT ts FROM t;",
+        &default_opts(),
+    );
+    assert_eq!(rows, vec![Some("2024-03-06 00:00:00".to_string())]);
+}
+
+#[test]
+fn the_end_of_day_hour_is_accepted() {
+    // PostgreSQL takes 24:00:00 as a time and answers it back.
+    let rows = query_rows(
+        "CREATE TABLE t (tm time);
+         INSERT INTO t (tm) VALUES ('24:00:00');
+         SELECT tm FROM t;",
+        &default_opts(),
+    );
+    assert_eq!(rows, vec![Some("24:00:00".to_string())]);
+}
+
+#[test]
+fn a_sloppy_timestamp_is_normalised() {
+    // PostgreSQL answers 2024-01-02 03:04:00.
+    let rows = query_rows(
+        "CREATE TABLE t (ts timestamp);
+         INSERT INTO t (ts) VALUES ('2024-1-2 3:4');
+         SELECT ts FROM t;",
+        &default_opts(),
+    );
+    assert_eq!(rows, vec![Some("2024-01-02 03:04:00".to_string())]);
+}
+
+#[test]
+fn an_iso_t_separator_becomes_a_space() {
+    // PostgreSQL prints a space, and the replica's text has to match so a
+    // row written through either database compares equal.
+    let rows = query_rows(
+        "CREATE TABLE t (ts timestamp);
+         INSERT INTO t (ts) VALUES ('2024-03-05T14:07:09');
+         SELECT ts FROM t;",
+        &default_opts(),
+    );
+    assert_eq!(rows, vec![Some("2024-03-05 14:07:09".to_string())]);
+}
+
+#[test]
+fn a_fractional_second_is_kept() {
+    let rows = query_rows(
+        "CREATE TABLE t (ts timestamp);
+         INSERT INTO t (ts) VALUES ('2024-03-05 14:07:09.123');
+         SELECT ts FROM t;",
+        &default_opts(),
+    );
+    assert_eq!(rows, vec![Some("2024-03-05 14:07:09.123".to_string())]);
+}
+
+#[test]
+fn a_fractional_second_is_stored_as_postgresql_prints_it() {
+    // PostgreSQL 18.6 rounds the fraction to microseconds with rint, ties to
+    // even, drops its trailing zeros, and carries a rounded-up fraction into
+    // the second, the minute and the day.
+    for (column, literal, printed) in [
+        ("timestamp", "2024-01-02 03:04:05.500", "2024-01-02 03:04:05.5"),
+        ("timestamp", "2024-01-02 03:04:06.1234567", "2024-01-02 03:04:06.123457"),
+        ("timestamp", "2024-01-02 03:04:05.000", "2024-01-02 03:04:05"),
+        ("timestamp", "2024-01-02 03:04:59.9999995", "2024-01-02 03:05:00"),
+        ("timestamp", "2024-12-31 23:59:59.9999999", "2025-01-01 00:00:00"),
+        ("timestamp", "2024-01-02 24:00:00.0", "2024-01-03 00:00:00"),
+        ("time", "03:04:05.500", "03:04:05.5"),
+        ("time", "03:04:05.0000015", "03:04:05.000002"),
+        ("time", "03:04:05.0000005", "03:04:05"),
+        ("time", "23:59:59.9999999", "24:00:00"),
+        ("time", "24:00:00.0000001", "24:00:00"),
+        ("time with time zone", "03:04:05.500+02", "03:04:05.5+02:00"),
+        ("time with time zone", "03:04:06.000+02", "03:04:06+02:00"),
+        ("time with time zone", "23:59:59.9999999+02", "24:00:00+02:00"),
+    ] {
+        let rows = query_rows(
+            &format!(
+                "CREATE TABLE t (v {column});
+                 INSERT INTO t (v) VALUES ('{literal}');
+                 SELECT v FROM t;"
+            ),
+            &default_opts(),
+        );
+        assert_eq!(rows, vec![Some(printed.to_string())], "{column} '{literal}'");
+    }
+}
+
+#[test]
+fn a_fraction_that_rounds_past_the_end_of_the_day_is_refused() {
+    // PostgreSQL answers date/time field value out of range.
+    let message = temporal_refusal("time", "24:00:00.9999999");
+    assert!(message.contains("out of range"), "{message}");
+}
+
+#[test]
+fn spellings_of_one_fraction_compare_equal() {
+    for (column, stored, comparand) in [
+        ("timestamp", "2024-01-02 03:04:05.500", "'2024-01-02 03:04:05.5'"),
+        ("timestamp", "2024-01-02 03:04:05.5", "'2024-01-02 03:04:05.500'"),
+        ("timestamp", "2024-01-02 03:04:05.500", "TIMESTAMP '2024-01-02 03:04:05.5'"),
+        ("time", "03:04:05.500", "'03:04:05.5'"),
+        ("time with time zone", "03:04:06.000+02", "'03:04:06+02'"),
+    ] {
+        let rows = query_rows(
+            &format!(
+                "CREATE TABLE t (v {column});
+                 INSERT INTO t (v) VALUES ('{stored}');
+                 SELECT count(*) FROM t WHERE v = {comparand};"
+            ),
+            &default_opts(),
+        );
+        assert_eq!(rows, vec![Some("1".to_string())], "{column} '{stored}' = {comparand}");
+    }
+}
+
+#[test]
+fn spellings_of_one_fraction_collide_in_a_unique_column() {
+    // PostgreSQL answers duplicate key value violates unique constraint.
+    for (column, first, second) in [
+        ("timestamp", "2024-01-02 03:04:05.500", "2024-01-02 03:04:05.5"),
+        ("time", "03:04:05.500", "03:04:05.5"),
+        ("time with time zone", "03:04:06.000+02", "03:04:06+02"),
+    ] {
+        let stmts = Pg2Sqlite::default()
+            .sql(&format!(
+                "CREATE TABLE t (v {column} UNIQUE);
+                 INSERT INTO t (v) VALUES ('{first}');
+                 INSERT INTO t (v) VALUES ('{second}');"
+            ))
+            .expect("parse")
+            .translate_to_sql(&default_opts())
+            .expect("translate")
+            .into_vec();
+        let (last, setup) = stmts.split_last().expect("statements");
+        let conn = Connection::open_in_memory().unwrap();
+        for s in setup {
+            conn.execute_batch(&format!("{s};")).unwrap_or_else(|e| panic!("{e}\n{s}"));
+        }
+        let err = conn
+            .execute_batch(&format!("{last};"))
+            .expect_err(&format!("{column} '{second}' duplicates '{first}'"));
+        assert!(err.to_string().contains("UNIQUE"), "{err}");
+    }
+}
+
+#[test]
+fn a_style_dependent_date_is_refused() {
+    // '1/2/2024' is 2 January under the default DateStyle and 1 February
+    // under DMY, which is server state the translator cannot read.
+    expect_refusal(
+        "CREATE TABLE t (d date);
+         INSERT INTO t (d) VALUES ('1/2/2024');",
+        &default_opts(),
+        "1/2/2024",
+    );
+}
+
+#[test]
+fn a_relative_date_keyword_is_refused() {
+    // 'today' is resolved when PostgreSQL reads it, so storing the word
+    // itself would freeze a value that was meant to be a date.
+    expect_refusal(
+        "CREATE TABLE t (d date);
+         INSERT INTO t (d) VALUES ('today');",
+        &default_opts(),
+        "today",
+    );
+}
+
+#[test]
+fn a_comparison_literal_is_normalised_too() {
+    // The stored value is padded, so an unpadded literal in a comparison
+    // would match nothing.
+    let rows = query_rows(
+        "CREATE TABLE t (d date);
+         INSERT INTO t (d) VALUES ('2024-03-05');
+         SELECT d FROM t WHERE d = '2024-3-5';",
+        &default_opts(),
+    );
+    assert_eq!(rows, vec![Some("2024-03-05".to_string())]);
+}
+
+#[test]
+fn a_timestamptz_offset_is_moved_to_utc() {
+    let rows = query_rows(
+        "CREATE TABLE t (ts timestamptz);
+         INSERT INTO t (ts) VALUES ('2024-01-02 03:04:05+02');
+         SELECT ts FROM t;",
+        &default_opts(),
+    );
+    assert_eq!(rows, vec![Some("2024-01-02 01:04:05.000000+00:00".to_string())]);
+}
+
+#[test]
+fn a_cast_to_date_validates_its_literal() {
+    expect_refusal("SELECT '2024-13-01'::date;", &default_opts(), "2024-13-01");
+}
+
+#[test]
+fn a_cast_to_date_normalises_its_literal() {
+    let rows = query_rows("SELECT '2024-3-5'::date;", &default_opts());
+    assert_eq!(rows, vec![Some("2024-03-05".to_string())]);
+}
+
+#[test]
+fn an_update_assignment_normalises_its_literal() {
+    let rows = query_rows(
+        "CREATE TABLE t (id int primary key, d date);
+         INSERT INTO t (id, d) VALUES (1, '2024-01-01');
+         UPDATE t SET d = '2024-3-5' WHERE id = 1;
+         SELECT d FROM t;",
+        &default_opts(),
+    );
+    assert_eq!(rows, vec![Some("2024-03-05".to_string())]);
+}
+
+#[test]
+fn an_update_assignment_validates_its_literal() {
+    expect_refusal(
+        "CREATE TABLE t (id int primary key, d date);
+         UPDATE t SET d = '2024-13-01' WHERE id = 1;",
+        &default_opts(),
+        "2024-13-01",
+    );
+}
+
+/// Every expected value here is what PostgreSQL 17 prints for the literal,
+/// measured in Docker under the default `IntervalStyle`.
+fn interval_text(literal: &str) -> Vec<Option<String>> {
+    query_rows(
+        &format!(
+            "CREATE TABLE t (iv interval);
+             INSERT INTO t (iv) VALUES ('{literal}');
+             SELECT iv FROM t;"
+        ),
+        &default_opts(),
+    )
+}
+
+#[test]
+fn an_iso_interval_is_printed_as_a_clock() {
+    assert_eq!(interval_text("PT15M"), vec![Some("00:15:00".to_string())]);
+}
+
+#[test]
+fn interval_minutes_carry_into_hours() {
+    assert_eq!(interval_text("90 minutes"), vec![Some("01:30:00".to_string())]);
+}
+
+#[test]
+fn interval_days_stay_apart_from_the_time_of_day() {
+    assert_eq!(interval_text("1 day 2:03:04"), vec![Some("1 day 02:03:04".to_string())]);
+    // Hours beyond a day are not folded into one, as PostgreSQL does not.
+    assert_eq!(interval_text("26 hours"), vec![Some("26:00:00".to_string())]);
+    // A written clock reading never becomes a day count either.
+    assert_eq!(interval_text("100:00:00"), vec![Some("100:00:00".to_string())]);
+    assert_eq!(interval_text("24:00:00"), vec![Some("24:00:00".to_string())]);
+}
+
+#[test]
+fn a_fraction_of_a_month_becomes_days() {
+    assert_eq!(interval_text("1.5 months"), vec![Some("1 mon 15 days".to_string())]);
+    assert_eq!(interval_text("1.05 months"), vec![Some("1 mon 1 day 12:00:00".to_string())]);
+}
+
+#[test]
+fn interval_months_carry_into_years() {
+    assert_eq!(interval_text("12 months"), vec![Some("1 year".to_string())]);
+    assert_eq!(interval_text("1-2"), vec![Some("1 year 2 mons".to_string())]);
+}
+
+#[test]
+fn an_interval_written_backwards_is_negated() {
+    assert_eq!(interval_text("2 days ago"), vec![Some("-2 days".to_string())]);
+}
+
+#[test]
+fn a_zero_interval_is_printed_as_a_zero_clock() {
+    assert_eq!(interval_text("0"), vec![Some("00:00:00".to_string())]);
+}
+
+#[test]
+fn a_bare_interval_number_counts_seconds() {
+    assert_eq!(interval_text("5"), vec![Some("00:00:05".to_string())]);
+}
+
+#[test]
+fn an_unreadable_interval_is_refused() {
+    expect_refusal(
+        "CREATE TABLE t (iv interval);
+         INSERT INTO t (iv) VALUES ('every other tuesday');",
+        &default_opts(),
+        "every other tuesday",
+    );
+}
+
+#[test]
+fn an_interval_comparison_literal_is_normalised_too() {
+    let rows = query_rows(
+        "CREATE TABLE t (iv interval);
+         INSERT INTO t (iv) VALUES ('90 minutes');
+         SELECT iv FROM t WHERE iv = 'PT1H30M';",
+        &default_opts(),
+    );
+    assert_eq!(rows, vec![Some("01:30:00".to_string())]);
+}
+
+#[test]
+fn a_cast_to_interval_is_normalised() {
+    let rows = query_rows("SELECT 'PT15M'::interval;", &default_opts());
+    assert_eq!(rows, vec![Some("00:15:00".to_string())]);
+}
+
+/// Refuses a literal written into a temporal column of `kind`, returning the
+/// message.
+fn temporal_refusal(kind: &str, literal: &str) -> String {
+    Pg2Sqlite::default()
+        .sql(&format!(
+            "CREATE TABLE t (v {kind});
+             INSERT INTO t (v) VALUES ('{literal}');"
+        ))
+        .expect("parse")
+        .translate(&default_opts())
+        .expect_err("expected a refusal")
+        .to_string()
+}
+
+#[test]
+fn an_offset_in_a_column_without_a_zone_is_refused() {
+    // Stored as text, the offset would be kept where PostgreSQL drops it,
+    // so the two databases would disagree about the instant.
+    let message = temporal_refusal("timestamp", "2024-01-02 03:04:05+02");
+    assert!(message.contains("no time zone"), "{message}");
+}
+
+#[test]
+fn a_zoned_time_column_takes_an_offset() {
+    let rows = query_rows(
+        "CREATE TABLE t (v time with time zone);
+         INSERT INTO t (v) VALUES ('2:30+02');
+         SELECT v FROM t;",
+        &default_opts(),
+    );
+    assert_eq!(rows, vec![Some("02:30:00+02:00".to_string())]);
+}
+
+#[test]
+fn a_utc_marker_becomes_a_zero_offset() {
+    let rows = query_rows(
+        "CREATE TABLE t (v timestamptz);
+         INSERT INTO t (v) VALUES ('2024-01-02T03:04:05Z');
+         SELECT v FROM t;",
+        &default_opts(),
+    );
+    assert_eq!(rows, vec![Some("2024-01-02 03:04:05.000000+00:00".to_string())]);
+}
+
+#[test]
+fn an_impossible_offset_is_refused() {
+    // PostgreSQL's offsets run to ±15:59; anything past that is not a zone.
+    let message = temporal_refusal("timestamptz", "2024-01-02 03:04:05+20");
+    assert!(message.contains("out of range"), "{message}");
+    let too_many = temporal_refusal("timestamptz", "2024-01-02 03:04:05+02:00:00");
+    assert!(too_many.contains("too many parts"), "{too_many}");
+}
+
+#[test]
+fn the_other_locale_dependent_forms_are_refused() {
+    for literal in ["Jan 2 2024", "2 January 2024"] {
+        let message = temporal_refusal("date", literal);
+        assert!(message.contains("locale"), "{literal}: {message}");
+    }
+    let clock = temporal_refusal("time", "12:00:00 PM");
+    assert!(clock.contains("12-hour"), "{clock}");
+    let keyword = temporal_refusal("timestamp", "infinity");
+    assert!(keyword.contains("keyword"), "{keyword}");
+}
+
+#[test]
+fn a_date_of_the_wrong_shape_is_refused() {
+    for literal in ["2024-03", "2024-03-05-06", "2024-ab-05", "0000-01-01"] {
+        let message = temporal_refusal("date", literal);
+        assert!(message.contains(literal), "{literal}: {message}");
+    }
+}
+
+#[test]
+fn a_time_of_the_wrong_shape_is_refused() {
+    for literal in ["12", "12:00:00:00", "12:60:00", "12:00:00."] {
+        let message = temporal_refusal("time", literal);
+        assert!(message.contains(literal), "{literal}: {message}");
+    }
+    let leap = temporal_refusal("time", "23:59:60");
+    assert!(leap.contains("second=60"), "{leap}");
+}
+
+#[test]
+fn the_end_of_day_hour_rolls_the_month_and_the_year_over() {
+    let rows = query_rows(
+        "CREATE TABLE t (id int primary key, ts timestamp);
+         INSERT INTO t (id, ts) VALUES (1, '2024-02-29 24:00:00'), (2, '2024-12-31 24:00:00');
+         SELECT ts FROM t ORDER BY id;",
+        &default_opts(),
+    );
+    assert_eq!(
+        rows,
+        vec![Some("2024-03-01 00:00:00".to_string()), Some("2025-01-01 00:00:00".to_string())]
+    );
+}
+
+// ── Typed temporal literals TYPE 'value' ───────────────────────────────────
+//
+// Each answers the text a column of that type holds, measured against
+// PostgreSQL 18.6 under SET TIME ZONE 'UTC'. A time with time zone offset is
+// rendered +HH:MM, the form SQLite's date functions read.
+
+#[test]
+fn a_typed_temporal_literal_prints_like_a_column_value() {
+    for (typed, printed) in [
+        ("date '2024-3-5'", "2024-03-05"),
+        ("time '03:04:05.500'", "03:04:05.5"),
+        ("time '03:04'", "03:04:00"),
+        ("time with time zone '3:4+2'", "03:04:00+02:00"),
+        ("time with time zone '03:04:05.500+02'", "03:04:05.5+02:00"),
+        ("time with time zone '03:04:05Z'", "03:04:05+00:00"),
+        ("timestamp '2024-1-2 3:4'", "2024-01-02 03:04:00"),
+        ("timestamp '2024-01-02T03:04:05'", "2024-01-02 03:04:05"),
+        ("timestamp '2024-01-02'", "2024-01-02 00:00:00"),
+        ("timestamp with time zone '2024-01-02T03:04:05+02'", "2024-01-02 01:04:05.000000+00:00"),
+    ] {
+        let rows = query_rows(&format!("SELECT {typed};"), &default_opts());
+        assert_eq!(rows, vec![Some(printed.to_string())], "{typed}");
+    }
+}
+
+#[test]
+fn a_typed_literal_fraction_rounds_and_carries_like_a_column_write() {
+    for (typed, printed) in [
+        ("time '03:04:05.9999999'", "03:04:06"),
+        ("timestamp '2024-12-31 23:59:59.9999999'", "2025-01-01 00:00:00"),
+        ("timestamp '2024-01-02 24:00:00'", "2024-01-03 00:00:00"),
+    ] {
+        let rows = query_rows(&format!("SELECT {typed};"), &default_opts());
+        assert_eq!(rows, vec![Some(printed.to_string())], "{typed}");
+    }
+}
+
+#[test]
+fn typed_literals_are_stored_and_updated_like_column_writes() {
+    let rows = query_rows(
+        "CREATE TABLE t (id int primary key, ts timestamp, d date, tm time with time zone);
+         INSERT INTO t VALUES (1, TIMESTAMP '2024-01-02 03:04:05.500', DATE '2024-3-5', TIMETZ '3:4+2');
+         UPDATE t SET ts = TIMESTAMP '2024-1-2 3:4' WHERE id = 1;
+         SELECT ts || ' ' || d || ' ' || tm FROM t;",
+        &default_opts(),
+    );
+    assert_eq!(rows, vec![Some("2024-01-02 03:04:00 2024-03-05 03:04:00+02:00".to_string())]);
+}
+
+#[test]
+fn a_typed_literal_default_prints_like_a_column_value() {
+    let rows = query_rows(
+        "CREATE TABLE t (id int primary key, d date DEFAULT DATE '2024-3-5');
+         INSERT INTO t (id) VALUES (1);
+         SELECT d FROM t;",
+        &default_opts(),
+    );
+    assert_eq!(rows, vec![Some("2024-03-05".to_string())]);
+}
+
+#[test]
+fn a_typed_literal_in_a_comparison_matches_the_stored_spelling() {
+    let rows = query_rows(
+        "CREATE TABLE t (id int primary key, ts timestamp, d date);
+         INSERT INTO t VALUES (1, '2024-01-02 03:04:05.5', '2024-03-05');
+         SELECT count(*) FROM t
+         WHERE ts = TIMESTAMP '2024-01-02 03:04:05.500'
+           AND d = DATE '2024-3-5';",
+        &default_opts(),
+    );
+    assert_eq!(rows, vec![Some("1".to_string())]);
+}
+
+#[test]
+fn typed_literal_spellings_collide_in_a_unique_column() {
+    // PostgreSQL answers duplicate key value violates unique constraint.
+    for (column, first, second) in [
+        ("timestamp", "'2024-01-02 03:04:05.5'", "TIMESTAMP '2024-01-02 03:04:05.500'"),
+        ("date", "'2024-3-5'", "DATE '2024-03-5'"),
+        ("time with time zone", "'03:04:06+02'", "TIMETZ '03:04:06.000+02'"),
+    ] {
+        let stmts = Pg2Sqlite::default()
+            .sql(&format!(
+                "CREATE TABLE t (v {column} UNIQUE);
+                 INSERT INTO t (v) VALUES ({first});
+                 INSERT INTO t (v) VALUES ({second});"
+            ))
+            .expect("parse")
+            .translate_to_sql(&default_opts())
+            .expect("translate")
+            .into_vec();
+        let (last, setup) = stmts.split_last().expect("statements");
+        let conn = Connection::open_in_memory().unwrap();
+        for s in setup {
+            conn.execute_batch(&format!("{s};")).unwrap_or_else(|e| panic!("{e}\n{s}"));
+        }
+        let err = conn
+            .execute_batch(&format!("{last};"))
+            .expect_err(&format!("{column} {second} duplicates {first}"));
+        assert!(err.to_string().contains("UNIQUE"), "{err}");
+    }
+}
+
+#[test]
+fn an_invalid_typed_temporal_literal_is_refused() {
+    for typed in [
+        "date '2024-13-01'",
+        "time '25:00:00'",
+        "timestamp '2024-02-30 00:00:00'",
+        "time with time zone '03:04:05+99'",
+        "timestamptz '2024-13-01 00:00:00'",
+    ] {
+        expect_refusal(&format!("SELECT {typed};"), &default_opts(), "out of range");
+    }
+}
+
+#[test]
+fn a_non_temporal_typed_string_keeps_its_cast() {
+    // TEXT has no temporal kind, so the cast path is the one it takes.
+    let rows = query_rows("SELECT TEXT 'hello';", &default_opts());
+    assert_eq!(rows, vec![Some("hello".to_string())]);
+}
+
+/// Refuses a literal written into a column of interval type `column`,
+/// returning the message.
+fn interval_refusal(column: &str, literal: &str) -> String {
+    Pg2Sqlite::default()
+        .sql(&format!(
+            "CREATE TABLE t (iv {column});
+             INSERT INTO t (iv) VALUES ('{literal}');"
+        ))
+        .expect("parse")
+        .translate(&default_opts())
+        .expect_err("expected a refusal")
+        .to_string()
+}
+
+#[test]
+fn an_interval_postgresql_refuses_is_refused_with_its_message() {
+    const SYNTAX: &str = "invalid input syntax for type interval";
+    const FIELD: &str = "interval field value out of range";
+    // What PostgreSQL 18 answers for each literal.
+    for (literal, message) in [
+        ("2 fortnights", SYNTAX),
+        ("2 3 days", SYNTAX),
+        ("days", SYNTAX),
+        ("1:2:3:4", SYNTAX),
+        ("P1X", SYNTAX),
+        ("P1H", SYNTAX),
+        ("P1Y2", SYNTAX),
+        ("1.2.3 days", SYNTAX),
+        ("1 day 1 day", SYNTAX),
+        ("1 hour 01:00", SYNTAX),
+        ("0.5 seconds 1 millisecond", SYNTAX),
+        ("ago", SYNTAX),
+        ("@", SYNTAX),
+        ("P1D ago", SYNTAX),
+        ("p1d", SYNTAX),
+        ("1:60", FIELD),
+        ("1-12", FIELD),
+        ("2147483648 days", FIELD),
+        ("178956971 years", "interval out of range"),
+    ] {
+        let refusal = interval_refusal("interval", literal);
+        assert!(refusal.contains(message), "{literal}: {refusal}");
+    }
+}
+
+#[test]
+fn an_infinite_interval_is_refused() {
+    for literal in ["infinity", "-infinity"] {
+        let refusal = interval_refusal("interval", literal);
+        assert!(refusal.contains("infinite"), "{literal}: {refusal}");
+    }
+}
+
+#[test]
+fn a_fractional_microsecond_rounds_as_postgresql_rounds_it() {
+    for (literal, printed) in [
+        ("1.999999999 millisecond", "00:00:00.002"),
+        ("0.333333333 hours", "00:19:59.999999"),
+        ("0.0000015 seconds", "00:00:00.000001"),
+        ("0.0000025 seconds", "00:00:00.000002"),
+        ("1:2:3.9999995", "01:02:04"),
+    ] {
+        assert_eq!(interval_text(literal), vec![Some(printed.to_string())], "{literal}");
+    }
+}
+
+#[test]
+fn a_two_part_clock_with_a_fraction_is_minutes_and_seconds() {
+    assert_eq!(interval_text("1:2.5"), vec![Some("00:01:02.5".to_string())]);
+}
+
+#[test]
+fn the_sql_standard_and_iso_alternative_forms_are_read() {
+    for (literal, printed) in [
+        ("1-2 3 4:05:06", "1 year 2 mons 3 days 04:05:06"),
+        ("-1-2 -3 -4:05:06", "-1 years -2 mons -3 days -04:05:06"),
+        ("P0001-02-03T04:05:06", "1 year 2 mons 3 days 04:05:06"),
+        ("P00010203T040506", "1 year 2 mons 3 days 04:05:06"),
+        ("1 day,2 hours", "1 day 02:00:00"),
+    ] {
+        assert_eq!(interval_text(literal), vec![Some(printed.to_string())], "{literal}");
+    }
+}
+
+#[test]
+fn an_interval_column_keeps_only_the_fields_its_type_names() {
+    for (column, literal, printed) in [
+        ("interval hour to minute", "1 day 2:03:04.5", "1 day 02:03:00"),
+        ("interval second(2)", "1.987654321 seconds", "00:00:01.99"),
+        ("interval(0)", "-1.5 seconds", "-00:00:02"),
+        ("interval minute to second", "1:2", "00:01:02"),
+        ("interval year", "1 year 13 months 40 days", "2 years"),
+    ] {
+        let rows = query_rows(
+            &format!(
+                "CREATE TABLE t (iv {column});
+                 INSERT INTO t (iv) VALUES ('{literal}');
+                 SELECT iv FROM t;"
+            ),
+            &default_opts(),
+        );
+        assert_eq!(rows, vec![Some(printed.to_string())], "{column} '{literal}'");
+    }
+}
+
+#[test]
+fn an_interval_type_with_a_precision_postgresql_lacks_is_refused() {
+    let refusal = interval_refusal("interval year(2)", "1 year");
+    assert!(refusal.contains("interval YEAR(2)"), "{refusal}");
+}
+
+#[test]
+fn interval_counts_keep_their_own_signs() {
+    assert_eq!(interval_text("1 mon -1 day"), vec![Some("1 mon -1 days".to_string())]);
+    assert_eq!(interval_text("1 day -02:00:00"), vec![Some("1 day -02:00:00".to_string())]);
+    assert_eq!(interval_text("PT-1H"), vec![Some("-01:00:00".to_string())]);
+}
+
+#[test]
+fn a_positive_interval_count_after_a_negative_one_is_printed_with_a_plus() {
+    // What PostgreSQL 18 prints for each literal under the default
+    // IntervalStyle.
+    for (literal, printed) in [
+        ("-1 day 2 hours", "-1 days +02:00:00"),
+        ("-1 day +2 hours", "-1 days +02:00:00"),
+        ("-1 mon 2 days", "-1 mons +2 days"),
+        ("-1 day -2 hours", "-1 days -02:00:00"),
+        ("1 year -1 day", "1 year -1 days"),
+        ("1 day 02:00:00", "1 day 02:00:00"),
+        ("-1 year 1 day 2 hours", "-1 years +1 day 02:00:00"),
+        ("1 mon -1 day 2 hours", "1 mon -1 days +02:00:00"),
+    ] {
+        assert_eq!(interval_text(literal), vec![Some(printed.to_string())], "{literal}");
+    }
+}
+
+#[test]
+fn an_interval_second_keeps_its_microseconds() {
+    assert_eq!(interval_text("1.000001 seconds"), vec![Some("00:00:01.000001".to_string())]);
+    assert_eq!(interval_text("1 microsecond"), vec![Some("00:00:00.000001".to_string())]);
+}
+
+#[test]
+fn an_interval_written_as_one_token_is_read() {
+    assert_eq!(interval_text("1day"), vec![Some("1 day".to_string())]);
+    assert_eq!(interval_text("@ 1 day"), vec![Some("1 day".to_string())]);
+}
+
+#[test]
+fn interval_weeks_become_days() {
+    assert_eq!(interval_text("3 weeks"), vec![Some("21 days".to_string())]);
+    assert_eq!(interval_text("P1W"), vec![Some("7 days".to_string())]);
+}
+
+#[test]
+fn an_iso_interval_reads_every_designator() {
+    assert_eq!(
+        interval_text("P1Y2M3DT4H5M6S"),
+        vec![Some("1 year 2 mons 3 days 04:05:06".to_string())]
+    );
+}
+
+#[test]
+fn a_bare_count_before_a_clock_counts_days() {
+    // PostgreSQL reads '1 12:00' as one day and twelve hours.
+    assert_eq!(interval_text("1 12:00"), vec![Some("1 day 12:00:00".to_string())]);
+}
+
+#[test]
+fn a_negative_year_month_interval_signs_both_counts() {
+    assert_eq!(interval_text("-1-2"), vec![Some("-1 years -2 mons".to_string())]);
+}
+
+#[test]
+fn a_zoned_time_column_refuses_what_it_cannot_read() {
+    let message = temporal_refusal("time with time zone", "2:30+20");
+    assert!(message.contains("out of range"), "{message}");
+    let shape = temporal_refusal("time with time zone", "half past two+02");
+    assert!(shape.contains("half past two"), "{shape}");
+}
+
+#[test]
+fn a_month_name_in_a_timestamp_is_refused() {
+    let message = temporal_refusal("timestamp", "Jan 2 2024 10:00");
+    assert!(message.contains("locale"), "{message}");
+}
+
+#[test]
+fn a_year_too_large_to_hold_is_refused() {
+    let message = temporal_refusal("date", "99999999999999-01-01");
+    assert!(message.contains("99999999999999-01-01"), "{message}");
+}
+
+/// PostgreSQL stores years past 9999, which the replica's four-digit text
+/// cannot hold, so the refusal must name the replica rather than claim
+/// PostgreSQL refuses the value.
+#[test]
+fn a_year_past_9999_is_refused_as_the_replica_limit() {
+    for (kind, literal) in [
+        ("date", "12345-06-07"),
+        ("timestamp", "10000-01-01"),
+        ("timestamp with time zone", "10000-01-01 00:00:00+00"),
+        ("timestamp", "9999-12-31 24:00:00"),
+        ("timestamp", "9999-12-31 23:59:59.9999995"),
+    ] {
+        let message = temporal_refusal(kind, literal);
+        assert!(message.contains("years 1 to 9999"), "{kind} '{literal}': {message}");
+        assert!(!message.contains("PostgreSQL refuses"), "{kind} '{literal}': {message}");
+    }
+}
+
+/// PostgreSQL refuses year zero itself.
+#[test]
+fn year_zero_is_refused_as_postgresql_refuses_it() {
+    let message = temporal_refusal("date", "0000-01-01");
+    assert!(message.contains("date/time field value out of range"), "{message}");
+}
+
+/// PostgreSQL stores BC dates, which the replica's text cannot hold.
+#[test]
+fn a_bc_literal_is_refused_as_the_replica_limit() {
+    for (kind, literal) in [
+        ("date", "0677-01-31 BC"),
+        ("date", "0001-01-01 bc"),
+        ("timestamp", "0001-01-01 BC"),
+        ("timestamp with time zone", "0001-01-01 10:00 BC"),
+    ] {
+        let message = temporal_refusal(kind, literal);
+        assert!(message.contains("years 1 to 9999"), "{kind} '{literal}': {message}");
+        assert!(!message.contains("month name"), "{kind} '{literal}': {message}");
+    }
+}
+
+#[test]
+fn a_bound_parameter_in_a_checked_column_passes_through() {
+    // The caller binds the value PostgreSQL takes, so there is no literal to
+    // read and nothing to refuse.
+    let statements = Pg2Sqlite::default()
+        .sql(
+            "CREATE TABLE t (d date, iv interval, v double precision);
+             INSERT INTO t (d, iv, v) VALUES ($1, $2, $3);",
+        )
+        .expect("parse")
+        .translate_to_sql(&default_opts())
+        .expect("translate")
+        .into_vec();
+    let insert = statements.last().expect("two statements");
+    assert!(insert.contains("VALUES (?1, ?2, ?3)"), "{insert}");
+}
+
+// ── Finding 9: catch-all refusal message misnames built-ins and enum types ───
+
+#[test]
+fn money_type_refusal_does_not_say_unknown() {
+    let err = Pg2Sqlite::default()
+        .sql("CREATE TABLE t (col money);")
+        .expect("parse")
+        .translate(&default_opts())
+        .expect_err("money has no SQLite form");
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("Unknown PostgreSQL custom type"),
+        "money is a known built-in, message must not say 'unknown custom type', got: {msg}"
+    );
+    assert!(
+        msg.contains("money") || msg.contains("built-in"),
+        "message must name the type or say 'built-in', got: {msg}"
+    );
+}
+
+#[test]
+fn inet_type_refusal_does_not_say_unknown() {
+    let err = Pg2Sqlite::default()
+        .sql("CREATE TABLE t (col inet);")
+        .expect("parse")
+        .translate(&default_opts())
+        .expect_err("inet has no SQLite form");
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("Unknown PostgreSQL custom type"),
+        "inet is a known built-in, got: {msg}"
+    );
+}
+
+#[test]
+fn enum_type_refusal_does_not_say_unknown() {
+    // mood is declared in the same batch, so calling it "unknown" is false.
+    let err = Pg2Sqlite::default()
+        .sql(
+            "CREATE TYPE mood AS ENUM ('happy', 'sad');
+              CREATE TABLE t (col mood);",
+        )
+        .expect("parse")
+        .translate(&default_opts())
+        .expect_err("enum has no SQLite form");
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("Unknown PostgreSQL custom type"),
+        "enum is not an unknown type, got: {msg}"
+    );
+}
+
+// ── Missing warnings: jsonb normalisation, tsvector lexeme parsing
+// ────────────
+
+#[test]
+fn jsonb_column_warns_about_key_order_loss() {
+    let ws = warnings("CREATE TABLE t (col jsonb);", &default_opts());
+    let has_jsonb_warn = ws.iter().any(|w| {
+        matches!(
+            w,
+            TranslationWarning::LossyDowngrade { construct, .. }
+            if construct.to_ascii_lowercase().contains("jsonb")
+        )
+    });
+    assert!(has_jsonb_warn, "jsonb column must emit a LossyDowngrade warning, got: {ws:?}");
+}
+
+#[test]
+fn tsvector_column_warns_about_lexeme_loss() {
+    let ws = warnings("CREATE TABLE t (col tsvector);", &default_opts());
+    let has_ts_warn = ws.iter().any(|w| {
+        matches!(
+            w,
+            TranslationWarning::LossyDowngrade { construct, .. }
+            if construct.to_ascii_lowercase().contains("tsvector")
+        )
+    });
+    assert!(has_ts_warn, "tsvector column must emit a LossyDowngrade warning, got: {ws:?}");
+}
+
+// ── INSERT ... SELECT into bytea column (for_each_insert_position Select
+// branch) ──
+
+#[test]
+fn bytea_insert_select_executes() {
+    // INSERT ... SELECT must convert \x literals at bytea-column positions just
+    // as VALUES does; exercises the SetExpr::Select branch in
+    // for_each_insert_position.
+    run(
+        "CREATE TABLE t (b bytea);
+         INSERT INTO t (b) SELECT '\\x414243';",
+        &default_opts(),
+    );
+}
+
+// ── Bytea literal without \\x prefix (maybe_convert_bytea_hex_literal line
+// 992) ──
+
+#[test]
+fn bytea_literal_without_hex_prefix_is_refused() {
+    // A raw string with no \\x prefix cannot be decoded as hex bytea.
+    expect_refusal(
+        "CREATE TABLE t (col bytea);
+         INSERT INTO t VALUES ('ABC');",
+        &default_opts(),
+        "hex format",
+    );
+}
+
+// ── Bytea literal with non-hex characters (line 1003-1007) ───────────────────
+
+#[test]
+fn bytea_non_hex_chars_after_prefix_are_refused() {
+    // \\xGG has a valid \\x prefix but G is not a hex digit.
+    expect_refusal(
+        "CREATE TABLE t (col bytea);
+         INSERT INTO t VALUES ('\\xGG');",
+        &default_opts(),
+        "non-hex",
+    );
+}
+
+// ── Multi-row VALUES where only a later row carries the literal ──────────────
+
+#[test]
+fn bytea_multi_row_values_later_row_is_converted() {
+    // The second row carries the hex literal; the first row has NULL.
+    // All rows must be processed, not just the first.
+    let rows = query_rows(
+        "CREATE TABLE t (id INTEGER, b bytea);
+         INSERT INTO t VALUES (1, NULL), (2, '\\x414243');
+         SELECT lower(hex(b)) FROM t WHERE id = 2;",
+        &default_opts(),
+    );
+    assert_eq!(rows, vec![Some("414243".to_string())]);
+}

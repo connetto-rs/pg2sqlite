@@ -10,12 +10,12 @@
 //! - a container an earlier run abandoned (a `SIGKILL` runs no exit code) is
 //!   swept at the next start, while one a concurrent run is using is not.
 
+#[expect(dead_code, reason = "this binary uses part of the shared helpers")]
 mod helpers;
 
-#[path = "helpers/postgres.rs"]
-mod postgres_harness;
-
 use std::process::Command;
+
+use helpers::postgres as postgres_harness;
 
 /// Runs in a child process: touches the server, prints its container ID,
 /// exits normally. Ignored so the parent test is the only one that runs it.

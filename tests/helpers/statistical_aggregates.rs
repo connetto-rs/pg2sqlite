@@ -1,14 +1,5 @@
 //! Registers the nine PostgreSQL statistical aggregates on a `rusqlite`
 //! connection, which SQLite does not provide.
-//!
-//! Include in a test binary with:
-//!
-//! ```rust,ignore
-//! #[path = "helpers/statistical_aggregates.rs"]
-//! mod statistical_aggregates;
-//! use statistical_aggregates::{STATISTICAL_AGGREGATES, register_statistical_aggregates};
-//! ```
-//!
 //! The translator refuses these names unless the caller declares them, so a
 //! test that wants a number out of one has to supply the implementation. The
 //! same list is what `with_user_defined_functions` is handed, which keeps the
@@ -78,17 +69,13 @@ pub fn register_statistical_aggregates(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// The declared list is what the registration table registers, in order.
-/// A name added to one and not the other would translate but not run, or run
-/// but not translate.
-#[test]
-fn the_declared_list_is_what_gets_registered() {
-    let registered: Vec<&str> = UNIVARIATE
+/// The names `register_statistical_aggregates` registers, in order.
+pub fn registered_names() -> Vec<&'static str> {
+    UNIVARIATE
         .iter()
         .map(|(name, _)| *name)
         .chain(BIVARIATE.iter().map(|(name, _)| *name))
-        .collect();
-    assert_eq!(registered, STATISTICAL_AGGREGATES);
+        .collect()
 }
 
 /// Mean and sum of squared deviations, or `None` when there is nothing to

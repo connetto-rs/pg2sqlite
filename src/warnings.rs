@@ -14,7 +14,7 @@
 //! pipeline realises elsewhere is neither: it emits nothing and warns nothing,
 //! and it belongs to the closed list documented in
 //! `impls::translator_impls::statement`, which also carries the per-statement
-//! classification. `tests/test_no_statement_is_silently_dropped.rs` enforces
+//! classification. `tests/it/test_no_statement_is_silently_dropped.rs` enforces
 //! the whole policy.
 //!
 //! Do not add a fourth mechanism. There are three outcomes, plus that closed
