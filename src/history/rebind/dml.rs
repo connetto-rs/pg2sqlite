@@ -115,19 +115,9 @@ impl Planner<'_> {
         else {
             return Ok(());
         };
-        let current = self
-            .epoch
-            .column_identity(column)
-            .and_then(|id| self.final_schema.column_by_identity(id))
-            .ok_or_else(|| {
-                ConnectionError::UnavailableColumn {
-                    relation: table.table_name().to_owned(),
-                    column: column.column_name().to_owned(),
-                    statement: self.position.index(),
-                }
-            })?;
-        if current.column_name() != column.column_name() {
-            self.edits.rename(ident.span, current.column_name().to_owned());
+        let current = self.current_column_name(table, column)?;
+        if current != column.column_name() {
+            self.edits.rename(ident.span, current);
         }
         Ok(())
     }

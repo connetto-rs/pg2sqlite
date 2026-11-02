@@ -6,7 +6,7 @@ use alloc::{borrow::ToOwned, string::String, vec, vec::Vec};
 use sql_traits::{
     errors::LookupError,
     structs::{ColumnBinding, ColumnDefinition, ColumnScope, IdentifierCase, ParserDB},
-    traits::{ColumnLike, DatabaseLike, TableLike},
+    traits::{ColumnLike, TableLike},
 };
 use sqlparser::{
     ast::{Expr, Ident, InTarget, ObjectName, Query, Select, SelectItem, SetExpr, TableFactor},
@@ -329,24 +329,14 @@ impl Planner<'_> {
             return Ok(None);
         }
         let Some(written) = parts.last() else { return Ok(None) };
-        let current = self
-            .epoch
-            .column_identity(column)
-            .and_then(|id| self.final_schema.column_by_identity(id))
-            .ok_or_else(|| {
-                ConnectionError::UnavailableColumn {
-                    relation: table.table_name().to_owned(),
-                    column: column.column_name().to_owned(),
-                    statement: self.position.index(),
-                }
-            })?;
+        let current = self.current_column_name(table, column)?;
         if parts.len() == 1 && !through_view {
             self.edits.qualify(written.span, quoted(&replay_name, Span::empty()));
         }
-        if current.column_name() == column.column_name() {
+        if current == column.column_name() {
             return Ok(None);
         }
-        self.edits.rename(written.span, current.column_name().to_owned());
+        self.edits.rename(written.span, current);
         Ok(Some(column.column_name().to_owned()))
     }
 

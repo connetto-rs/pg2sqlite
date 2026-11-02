@@ -153,21 +153,36 @@ impl Planner<'_> {
             let current = if table.is_temporary() || self.replays_home(table.table_name()) {
                 column.column_name().to_owned()
             } else {
-                self.epoch
-                    .column_identity(column)
-                    .and_then(|id| self.final_schema.column_by_identity(id))
-                    .map(|current| current.column_name().to_owned())
-                    .ok_or_else(|| {
-                        ConnectionError::UnavailableColumn {
-                            relation: table.table_name().to_owned(),
-                            column: column.column_name().to_owned(),
-                            statement: self.position.index(),
-                        }
-                    })?
+                self.current_column_name(table, column)?
             };
             names.push((column.column_name().to_owned(), current));
         }
         Ok(Some(names))
+    }
+
+    /// The name the final schema gives `column` of the stored `table`, found
+    /// by identity so a rename is followed.
+    ///
+    /// # Errors
+    ///
+    /// [`ConnectionError::UnavailableColumn`] when a later statement retired
+    /// the column, so a replay has no field to read it from.
+    pub(super) fn current_column_name(
+        &self,
+        table: &<ParserDB as DatabaseLike>::Table,
+        column: &<ParserDB as DatabaseLike>::Column,
+    ) -> Result<String, ConnectionError> {
+        self.epoch
+            .column_identity(column)
+            .and_then(|id| self.final_schema.column_by_identity(id))
+            .map(|current| current.column_name().to_owned())
+            .ok_or_else(|| {
+                ConnectionError::UnavailableColumn {
+                    relation: table.table_name().to_owned(),
+                    column: column.column_name().to_owned(),
+                    statement: self.position.index(),
+                }
+            })
     }
 
     /// The innermost listed relation a qualifier names.
