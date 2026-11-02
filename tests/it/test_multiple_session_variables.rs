@@ -28,7 +28,11 @@ fn make_options() -> Pg2SqliteOptions {
 /// `current_setting('app.user_id')` and `current_user`.
 #[test]
 fn test_multiple_session_vars_snapshot() {
-    let sql = include_str!("../fixtures/rls_multi_session_vars.sql");
+    let sql = concat!(
+        "CREATE ROLE authenticated;\n",
+        include_str!("../fixtures/rls_multi_session_vars.sql"),
+        "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
+    );
     let options = make_options();
 
     let translated = Pg2Sqlite::default().sql(sql).unwrap().translate(&options).unwrap().into_vec();
@@ -41,7 +45,11 @@ fn test_multiple_session_vars_snapshot() {
 /// configured SQLite function names in the generated SQL.
 #[test]
 fn test_both_session_variable_patterns_are_mapped() {
-    let sql = include_str!("../fixtures/rls_multi_session_vars.sql");
+    let sql = concat!(
+        "CREATE ROLE authenticated;\n",
+        include_str!("../fixtures/rls_multi_session_vars.sql"),
+        "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
+    );
     let options = make_options();
 
     let translated = Pg2Sqlite::default().sql(sql).unwrap().translate(&options).unwrap().into_vec();

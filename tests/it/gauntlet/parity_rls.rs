@@ -114,6 +114,14 @@ fn seed_tenant_membership<'r, C>(
 
 const RLS_BASIC: &str = include_str!("../../fixtures/rls_basic.sql");
 
+/// Translation-side copy: declares the `authenticated` role and its DML grants,
+/// which the PostgreSQL harness creates out of band.
+const RLS_BASIC_FOR_TRANSLATION: &str = concat!(
+    "CREATE ROLE authenticated;\n",
+    include_str!("../../fixtures/rls_basic.sql"),
+    "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
+);
+
 mod basic_schema {
     diesel::table! {
         use diesel::sql_types::*;
@@ -143,6 +151,7 @@ enum BasicStep {
     Session(Uuid),
     InsertDoc { id: Uuid, owner: Uuid, title: &'static str },
     DeleteDoc(Uuid),
+    RetitleDoc { id: Uuid, title: &'static str },
     VisibleTitles,
     StoredCount,
 }
@@ -182,6 +191,13 @@ macro_rules! impl_basic_step {
                     BasicStep::DeleteDoc(id) => {
                         Outcome::of(
                             &diesel::delete(documents::table.filter(documents::id.eq(*id)))
+                                .execute(&mut self.connection),
+                        )
+                    }
+                    BasicStep::RetitleDoc { id, title } => {
+                        Outcome::of(
+                            &diesel::update(documents::table.filter(documents::id.eq(*id)))
+                                .set(documents::title.eq(*title))
                                 .execute(&mut self.connection),
                         )
                     }
@@ -309,7 +325,7 @@ fn rls_basic_engines_agree() {
     };
     let (mut sq, basic_triggers) = {
         let translated = Pg2Sqlite::default()
-            .sql(RLS_BASIC)
+            .sql(RLS_BASIC_FOR_TRANSLATION)
             .expect("parse rls_basic")
             .translate(&basic_options())
             .expect("translate rls_basic")
@@ -338,10 +354,91 @@ fn rls_basic_engines_agree() {
 }
 
 // ════════════════════════════════════════════════════════════════════════
+// Update into invisibility: an UPDATE whose WHERE reads a column checks the
+// updated row against the SELECT policies, so a row cannot be moved out of
+// them even where the UPDATE policy admits it.
+// ════════════════════════════════════════════════════════════════════════
+
+const HIDDEN_TITLES: &str = "
+CREATE TABLE documents (
+    id UUID PRIMARY KEY,
+    owner_id UUID NOT NULL,
+    title TEXT NOT NULL,
+    content TEXT
+);
+ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+CREATE POLICY documents_select_policy ON documents
+    FOR SELECT
+    USING (title <> 'hidden');
+CREATE POLICY documents_update_policy ON documents
+    FOR UPDATE
+    USING (owner_id = current_setting('app.user_id')::uuid);
+";
+
+#[test]
+fn an_update_into_invisibility_is_refused_on_both_engines() {
+    let mut pg = {
+        let mut conn = postgres_harness::fresh_database();
+        postgres_harness::apply(&mut conn, HIDDEN_TITLES).expect("apply the schema to pg");
+        postgres_harness::apply(&mut conn, "GRANT SELECT, UPDATE ON documents TO app")
+            .expect("grant to app");
+        BasicPgRunner { connection: conn, acting: ua(), current_role: String::new() }
+    };
+    let (mut sq, triggers) = {
+        let translated = Pg2Sqlite::default()
+            .sql(&format!(
+                "CREATE ROLE authenticated; {HIDDEN_TITLES} \
+                 GRANT SELECT, UPDATE ON documents TO authenticated;"
+            ))
+            .expect("parse the schema")
+            .translate(&basic_options())
+            .expect("translate the schema")
+            .into_vec();
+        let mut conn = establish_connection();
+        let triggers = apply_base_ddl(&mut conn, &translated);
+        (BasicSqliteRunner { connection: conn, acting: ua() }, triggers)
+    };
+
+    set_session_user_id(&ua());
+    let d1 = Uuid::from([0xd1; 16]);
+    let d2 = Uuid::from([0xd2; 16]);
+    pg.seed(d1, ua(), "alice doc");
+    sq.seed(d1, ua(), "alice doc");
+    pg.seed(d2, ub(), "bob doc");
+    sq.seed(d2, ub(), "bob doc");
+    arm_triggers(&mut sq.connection, &triggers);
+
+    for step in [
+        BasicStep::Session(ua()),
+        BasicStep::RetitleDoc { id: d1, title: "renamed" }, // Accepted
+        BasicStep::RetitleDoc { id: d1, title: "hidden" },  // Refused
+        BasicStep::RetitleDoc { id: d2, title: "hidden" },  // Accepted (0 rows)
+        BasicStep::VisibleTitles,                           // ["bob doc", "renamed"]
+    ] {
+        let expected = pg.step(&step);
+        let actual = sq.step(&step);
+        assert_eq!(actual, expected, "update into invisibility disagrees on {step:?}");
+    }
+    assert_eq!(
+        pg.step(&BasicStep::RetitleDoc { id: d1, title: "hidden" }),
+        Outcome::Refused,
+        "PostgreSQL refuses the row leaving the SELECT policies"
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════
 // rls_multiple_policies: three OR'd SELECT policies, owner-only writes.
 // ════════════════════════════════════════════════════════════════════════
 
 const RLS_MULTIPLE_POLICIES: &str = include_str!("../../fixtures/rls_multiple_policies.sql");
+
+/// Translation-side copy: declares the `authenticated` role and its DML grants,
+/// which the PostgreSQL harness creates out of band.
+const RLS_MULTIPLE_POLICIES_FOR_TRANSLATION: &str = concat!(
+    "CREATE ROLE authenticated;\n",
+    include_str!("../../fixtures/rls_multiple_policies.sql"),
+    "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
+);
 
 mod multi_schema {
     diesel::table! {
@@ -600,7 +697,7 @@ fn rls_multiple_policies_engines_agree() {
     };
     let (mut sq, multi_triggers) = {
         let translated = Pg2Sqlite::default()
-            .sql(RLS_MULTIPLE_POLICIES)
+            .sql(RLS_MULTIPLE_POLICIES_FOR_TRANSLATION)
             .expect("parse rls_multiple_policies")
             .translate(&multi_options())
             .expect("translate rls_multiple_policies")
@@ -636,6 +733,14 @@ fn rls_multiple_policies_engines_agree() {
 // ══════════════════════════════════════════════════════════════════════════════
 
 const RLS_TENANT_ISOLATION: &str = include_str!("../../fixtures/rls_tenant_isolation.sql");
+
+/// Translation-side copy: declares the `authenticated` role and its DML grants,
+/// which the PostgreSQL harness creates out of band.
+const RLS_TENANT_ISOLATION_FOR_TRANSLATION: &str = concat!(
+    "CREATE ROLE authenticated;\n",
+    include_str!("../../fixtures/rls_tenant_isolation.sql"),
+    "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
+);
 
 mod tenant_schema {
     diesel::table! {
@@ -878,7 +983,7 @@ fn rls_tenant_isolation_engines_agree() {
     };
     let (mut sq, tenant_triggers) = {
         let translated = Pg2Sqlite::default()
-            .sql(RLS_TENANT_ISOLATION)
+            .sql(RLS_TENANT_ISOLATION_FOR_TRANSLATION)
             .expect("parse rls_tenant_isolation")
             .translate(&tenant_options())
             .expect("translate rls_tenant_isolation")
@@ -919,6 +1024,14 @@ fn rls_tenant_isolation_engines_agree() {
 // ═══════════════════════════════════════════════════════════════════════
 
 const RLS_PUBLIC_ACCESS: &str = include_str!("../../fixtures/rls_public_access.sql");
+
+/// Translation-side copy: declares the `authenticated` role and its DML grants,
+/// which the PostgreSQL harness creates out of band.
+const RLS_PUBLIC_ACCESS_FOR_TRANSLATION: &str = concat!(
+    "CREATE ROLE authenticated;\n",
+    include_str!("../../fixtures/rls_public_access.sql"),
+    "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
+);
 
 mod public_schema {
     diesel::table! {
@@ -1213,7 +1326,7 @@ fn rls_public_access_engines_agree() {
     };
     let mut sq = {
         let translated = Pg2Sqlite::default()
-            .sql(RLS_PUBLIC_ACCESS)
+            .sql(RLS_PUBLIC_ACCESS_FOR_TRANSLATION)
             .expect("parse rls_public_access")
             .translate(&public_options())
             .expect("translate rls_public_access")
@@ -1250,6 +1363,14 @@ fn rls_public_access_engines_agree() {
 // ════════════════════════════════════════════════════════════════════════
 
 const RLS_CURRENT_USER: &str = include_str!("../../fixtures/rls_current_user.sql");
+
+/// Translation-side copy: declares the `authenticated` role and its DML grants,
+/// which the PostgreSQL harness creates out of band.
+const RLS_CURRENT_USER_FOR_TRANSLATION: &str = concat!(
+    "CREATE ROLE authenticated;\n",
+    include_str!("../../fixtures/rls_current_user.sql"),
+    "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
+);
 
 mod current_user_schema {
     diesel::table! {
@@ -1450,7 +1571,7 @@ fn rls_current_user_engines_agree() {
     };
     let mut sq = {
         let translated = Pg2Sqlite::default()
-            .sql(RLS_CURRENT_USER)
+            .sql(RLS_CURRENT_USER_FOR_TRANSLATION)
             .expect("parse rls_current_user")
             .translate(&current_user_options())
             .expect("translate rls_current_user")

@@ -161,6 +161,12 @@ const CASES: &[Case] = &[
     ),
     consumed(TABLE, SCHEMA),
     consumed(SCHEMA, "ALTER SCHEMA s RENAME TO s2"),
+    consumed(TABLE_AND_ROLE, "ALTER TABLE t OWNER TO r"),
+    consumed(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT); CREATE VIEW v AS SELECT id FROM t; \
+         CREATE ROLE r;",
+        "ALTER VIEW v OWNER TO r",
+    ),
     // Warned and dropped: publish and subscribe.
     warned("LISTEN ch"),
     warned("UNLISTEN ch"),
@@ -330,12 +336,11 @@ const CASES: &[Case] = &[
     // Rejected: renames SQLite cannot apply in place.
     rejected("ALTER INDEX i RENAME TO j"),
     // Rejected: ALTER VIEW ... AS is MySQL, which PostgreSQL rejects, and every
-    // other ALTER VIEW form renames the view or a column, or changes a property
-    // a SQLite view does not have.
+    // other ALTER VIEW form but OWNER TO renames the view or a column, or
+    // changes a property a SQLite view does not have.
     rejected("ALTER VIEW v AS SELECT 1"),
     rejected("ALTER VIEW v ALTER COLUMN n SET DEFAULT 1"),
     rejected("ALTER VIEW v ALTER COLUMN n DROP DEFAULT"),
-    rejected("ALTER VIEW v OWNER TO r"),
     rejected("ALTER VIEW v RENAME COLUMN n TO m"),
     rejected("ALTER VIEW v RENAME TO w"),
     rejected("ALTER VIEW v SET SCHEMA s"),
@@ -421,6 +426,10 @@ fn only_the_documented_statements_are_silent() {
             // create, so the qualifier is stripped instead.
             "CREATE SCHEMA s;",
             "ALTER SCHEMA s RENAME TO s2",
+            // Read by row-level security, which exempts a table's owner and
+            // reads a plain view's tables as the view's owner.
+            "ALTER TABLE t OWNER TO r",
+            "ALTER VIEW v OWNER TO r",
         ]
     );
 }

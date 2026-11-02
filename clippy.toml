@@ -1,0 +1,7 @@
+disallowed-methods = [
+    { path = "sql_traits::traits::PolicyLike::command", reason = "which policies gate a statement is answered by TableLike::row_security" },
+    { path = "sql_traits::traits::PolicyLike::policy_type", reason = "how policies combine is answered by TableLike::row_security" },
+    { path = "sql_traits::traits::PolicyLike::roles", reason = "whom a policy reaches is answered by TableLike::row_security" },
+    { path = "sql_traits::traits::PolicyLike::applies_to_public", reason = "whom a policy reaches is answered by TableLike::row_security" },
+    { path = "sql_traits::traits::PolicyLike::applies_to_role", reason = "whom a policy reaches is answered by TableLike::row_security" },
+]

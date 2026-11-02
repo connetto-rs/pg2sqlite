@@ -75,6 +75,7 @@ fn execute_rls_ddl_with_opts(pg_sql: &str, options: &Pg2SqliteOptions) {
 #[test]
 fn exists_in_policy_using() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE orgs (id INT PRIMARY KEY, name TEXT);
         CREATE TABLE documents (
             id INT PRIMARY KEY,
@@ -95,6 +96,7 @@ fn exists_in_policy_using() {
         CREATE POLICY docs_delete ON documents
             FOR DELETE TO authenticated
             USING (EXISTS (SELECT 1 FROM orgs WHERE orgs.id = documents.org_id));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(output.contains("EXISTS"), "Expected EXISTS in view: {output}");
@@ -104,6 +106,7 @@ fn exists_in_policy_using() {
 #[test]
 fn in_subquery_in_policy() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE departments (id INT PRIMARY KEY, name TEXT);
         CREATE TABLE employees (
             id INT PRIMARY KEY,
@@ -124,6 +127,7 @@ fn in_subquery_in_policy() {
         CREATE POLICY emp_delete ON employees
             FOR DELETE TO authenticated
             USING (department_id IN (SELECT id FROM departments));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(output.contains("IN (SELECT"), "Expected IN subquery: {output}");
@@ -133,6 +137,7 @@ fn in_subquery_in_policy() {
 #[test]
 fn update_with_check_resolves_against_new_row() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE items (
             id INT PRIMARY KEY,
             owner_id INT NOT NULL
@@ -151,6 +156,7 @@ fn update_with_check_resolves_against_new_row() {
         CREATE POLICY items_delete ON items
             FOR DELETE TO authenticated
             USING (owner_id = CAST(current_setting('app.user_id') AS INT));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     // WITH CHECK constrains the NEW row, so its column refs resolve against
@@ -169,6 +175,7 @@ fn update_with_check_resolves_against_new_row() {
 #[test]
 fn compound_identifier_renamed_in_trigger() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE docs (
             id INT PRIMARY KEY,
             owner_id INT NOT NULL
@@ -187,6 +194,7 @@ fn compound_identifier_renamed_in_trigger() {
         CREATE POLICY docs_delete ON docs
             FOR DELETE TO authenticated
             USING (docs.owner_id = CAST(current_setting('app.user_id') AS INT));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     // In trigger context, docs.owner_id should become NEW.owner_id or
@@ -201,6 +209,7 @@ fn compound_identifier_renamed_in_trigger() {
 #[test]
 fn current_setting_in_binary_op() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE tenants (
             id INT PRIMARY KEY,
             tenant_id INT NOT NULL
@@ -219,6 +228,7 @@ fn current_setting_in_binary_op() {
         CREATE POLICY tenant_delete ON tenants
             FOR DELETE TO authenticated
             USING (current_setting('app.user_id')::int = tenant_id);
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(
@@ -231,6 +241,7 @@ fn current_setting_in_binary_op() {
 #[test]
 fn current_user_in_nested_expr() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE resources (
             id INT PRIMARY KEY,
             owner TEXT NOT NULL
@@ -249,6 +260,7 @@ fn current_user_in_nested_expr() {
         CREATE POLICY res_delete ON resources
             FOR DELETE TO authenticated
             USING ((current_user = owner));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let options = Pg2SqliteOptions::default()
         .with_session_user_role("authenticated".to_string())
@@ -369,6 +381,7 @@ fn readonly_rls_table_no_write_triggers() {
 #[test]
 fn monitoring_triggers_in_monitor_mode() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE monitored (
             id INT PRIMARY KEY,
             owner_id INT NOT NULL
@@ -387,6 +400,7 @@ fn monitoring_triggers_in_monitor_mode() {
         CREATE POLICY mon_delete ON monitored
             FOR DELETE TO authenticated
             USING (owner_id = CAST(current_setting('app.user_id') AS INT));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     // Should have monitoring triggers
@@ -400,6 +414,7 @@ fn monitoring_triggers_in_monitor_mode() {
 #[test]
 fn monitoring_triggers_in_strict_mode() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE strict_table (
             id INT PRIMARY KEY,
             owner_id INT NOT NULL
@@ -418,6 +433,7 @@ fn monitoring_triggers_in_strict_mode() {
         CREATE POLICY strict_delete ON strict_table
             FOR DELETE TO authenticated
             USING (owner_id = CAST(current_setting('app.user_id') AS INT));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let options = make_options().with_strict_rls_validation();
     let output = translate_with_options(sql, &options);
@@ -431,6 +447,7 @@ fn monitoring_triggers_in_strict_mode() {
 #[test]
 fn validation_view_generated() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE validated (
             id INT PRIMARY KEY,
             owner_id INT NOT NULL
@@ -449,6 +466,7 @@ fn validation_view_generated() {
         CREATE POLICY val_delete ON validated
             FOR DELETE TO authenticated
             USING (owner_id = CAST(current_setting('app.user_id') AS INT));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(output.contains("_violations"), "Expected validation view with _violations: {output}");
@@ -458,6 +476,7 @@ fn validation_view_generated() {
 #[test]
 fn audit_table_generated() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE audited (
             id INT PRIMARY KEY,
             owner_id INT NOT NULL
@@ -476,6 +495,7 @@ fn audit_table_generated() {
         CREATE POLICY aud_delete ON audited
             FOR DELETE TO authenticated
             USING (owner_id = CAST(current_setting('app.user_id') AS INT));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(
@@ -488,6 +508,7 @@ fn audit_table_generated() {
 #[test]
 fn is_null_in_policy() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE nullable_docs (
             id INT PRIMARY KEY,
             deleted_at TEXT,
@@ -507,6 +528,7 @@ fn is_null_in_policy() {
         CREATE POLICY null_delete ON nullable_docs
             FOR DELETE TO authenticated
             USING (deleted_at IS NULL AND owner_id = CAST(current_setting('app.user_id') AS INT));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(output.contains("IS NULL"), "Expected IS NULL in transformed policy: {output}");
@@ -516,6 +538,7 @@ fn is_null_in_policy() {
 #[test]
 fn in_list_in_policy() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE role_items (
             id INT PRIMARY KEY,
             role TEXT NOT NULL,
@@ -535,6 +558,7 @@ fn in_list_in_policy() {
         CREATE POLICY role_delete ON role_items
             FOR DELETE TO authenticated
             USING (role IN ('admin', 'owner') AND owner_id = CAST(current_setting('app.user_id') AS INT));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(output.contains("IN ("), "Expected IN list in transformed policy: {output}");
@@ -544,6 +568,7 @@ fn in_list_in_policy() {
 #[test]
 fn between_in_policy() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE age_restricted (
             id INT PRIMARY KEY,
             age INT NOT NULL,
@@ -563,6 +588,7 @@ fn between_in_policy() {
         CREATE POLICY age_delete ON age_restricted
             FOR DELETE TO authenticated
             USING (age BETWEEN 18 AND 65 AND owner_id = CAST(current_setting('app.user_id') AS INT));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(output.contains("BETWEEN"), "Expected BETWEEN in transformed policy: {output}");
@@ -601,6 +627,7 @@ fn missing_audit_table_name_error() {
 #[test]
 fn is_not_null_in_policy() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE verified (
             id INT PRIMARY KEY,
             verified_at TEXT,
@@ -620,6 +647,7 @@ fn is_not_null_in_policy() {
         CREATE POLICY ver_delete ON verified
             FOR DELETE TO authenticated
             USING (verified_at IS NOT NULL AND owner_id = CAST(current_setting('app.user_id') AS INT));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(output.contains("IS NOT NULL"), "Expected IS NOT NULL in transformed policy: {output}");
@@ -629,6 +657,7 @@ fn is_not_null_in_policy() {
 #[test]
 fn unary_not_in_policy() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE flagged (
             id INT PRIMARY KEY,
             is_deleted INT NOT NULL DEFAULT 0,
@@ -648,6 +677,7 @@ fn unary_not_in_policy() {
         CREATE POLICY flag_delete ON flagged
             FOR DELETE TO authenticated
             USING (NOT is_deleted AND owner_id = CAST(current_setting('app.user_id') AS INT));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(output.contains("NOT"), "Expected NOT in transformed policy: {output}");
@@ -657,6 +687,7 @@ fn unary_not_in_policy() {
 #[test]
 fn nested_parens_in_policy() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE nested_items (
             id INT PRIMARY KEY,
             category TEXT NOT NULL,
@@ -677,6 +708,7 @@ fn nested_parens_in_policy() {
         CREATE POLICY nested_delete ON nested_items
             FOR DELETE TO authenticated
             USING ((category = 'A' OR status = 'active') AND owner_id = CAST(current_setting('app.user_id') AS INT));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(
@@ -689,6 +721,7 @@ fn nested_parens_in_policy() {
 #[test]
 fn update_check_with_not_operator() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE check_not (
             id INT PRIMARY KEY,
             is_archived INT NOT NULL DEFAULT 0,
@@ -708,6 +741,7 @@ fn update_check_with_not_operator() {
         CREATE POLICY cn_delete ON check_not
             FOR DELETE TO authenticated
             USING (owner_id = CAST(current_setting('app.user_id') AS INT));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(output.contains("NOT NEW.is_archived"), "NOT must apply to NEW: {output}");
@@ -722,6 +756,7 @@ fn update_check_with_not_operator() {
 #[test]
 fn update_check_with_nested_expr() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE check_nested (
             id INT PRIMARY KEY,
             category TEXT NOT NULL,
@@ -742,6 +777,7 @@ fn update_check_with_nested_expr() {
         CREATE POLICY cne_delete ON check_nested
             FOR DELETE TO authenticated
             USING (owner_id = CAST(current_setting('app.user_id') AS INT));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(output.contains("NEW.category"), "nested OR arm must reference NEW: {output}");
@@ -757,6 +793,7 @@ fn update_check_with_nested_expr() {
 #[test]
 fn update_check_with_is_null() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE check_null (
             id INT PRIMARY KEY,
             deleted_at TEXT,
@@ -776,6 +813,7 @@ fn update_check_with_is_null() {
         CREATE POLICY cnl_delete ON check_null
             FOR DELETE TO authenticated
             USING (owner_id = CAST(current_setting('app.user_id') AS INT));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(output.contains("IS NULL"), "Expected IS NULL in update check: {output}");
@@ -785,6 +823,7 @@ fn update_check_with_is_null() {
 #[test]
 fn update_check_with_is_not_null() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE check_not_null (
             id INT PRIMARY KEY,
             verified_at TEXT,
@@ -804,6 +843,7 @@ fn update_check_with_is_not_null() {
         CREATE POLICY cnn_delete ON check_not_null
             FOR DELETE TO authenticated
             USING (owner_id = CAST(current_setting('app.user_id') AS INT));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(output.contains("IS NOT NULL"), "Expected IS NOT NULL in update check: {output}");
@@ -813,6 +853,7 @@ fn update_check_with_is_not_null() {
 #[test]
 fn update_check_with_in_list() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE check_in_list (
             id INT PRIMARY KEY,
             role TEXT NOT NULL,
@@ -832,6 +873,7 @@ fn update_check_with_in_list() {
         CREATE POLICY cil_delete ON check_in_list
             FOR DELETE TO authenticated
             USING (owner_id = CAST(current_setting('app.user_id') AS INT));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(output.contains("IN ("), "Expected IN list in update check: {output}");
@@ -841,6 +883,7 @@ fn update_check_with_in_list() {
 #[test]
 fn update_check_with_exists_subquery() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE check_exists (
             id INT PRIMARY KEY,
             group_id INT NOT NULL,
@@ -864,6 +907,7 @@ fn update_check_with_exists_subquery() {
         CREATE POLICY ce_delete ON check_exists
             FOR DELETE TO authenticated
             USING (owner_id = CAST(current_setting('app.user_id') AS INT));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(output.contains("EXISTS"), "Expected EXISTS in update check: {output}");
@@ -873,6 +917,7 @@ fn update_check_with_exists_subquery() {
 #[test]
 fn update_check_with_in_subquery() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE check_in_sub (
             id INT PRIMARY KEY,
             dept_id INT NOT NULL,
@@ -896,6 +941,7 @@ fn update_check_with_in_subquery() {
         CREATE POLICY cis_delete ON check_in_sub
             FOR DELETE TO authenticated
             USING (owner_id = CAST(current_setting('app.user_id') AS INT));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(output.contains("IN (SELECT"), "Expected IN subquery in update check: {output}");
@@ -905,6 +951,7 @@ fn update_check_with_in_subquery() {
 #[test]
 fn update_check_with_compound_identifier() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE check_compound (
             id INT PRIMARY KEY,
             owner_id INT NOT NULL
@@ -923,6 +970,7 @@ fn update_check_with_compound_identifier() {
         CREATE POLICY cc_delete ON check_compound
             FOR DELETE TO authenticated
             USING (check_compound.owner_id = CAST(current_setting('app.user_id') AS INT));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     // The policy qualifies the column as `check_compound.owner_id`. In the WITH
@@ -939,6 +987,7 @@ fn update_check_with_compound_identifier() {
 #[test]
 fn outer_table_ref_is_null_in_subquery() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE docs_outer (
             id INT PRIMARY KEY,
             deleted_at TEXT,
@@ -978,6 +1027,7 @@ fn outer_table_ref_is_null_in_subquery() {
                 AND docs_outer.deleted_at IS NULL
                 AND org_access.user_id = CAST(current_setting('app.user_id') AS INT)
             ));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(output.contains("IS NULL"), "Expected IS NULL in subquery: {output}");
@@ -987,6 +1037,7 @@ fn outer_table_ref_is_null_in_subquery() {
 #[test]
 fn outer_table_ref_in_list_in_subquery() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE tagged_docs (
             id INT PRIMARY KEY,
             tag TEXT NOT NULL,
@@ -1026,6 +1077,7 @@ fn outer_table_ref_in_list_in_subquery() {
                 AND tagged_docs.tag IN ('public', 'shared')
                 AND org_access2.user_id = CAST(current_setting('app.user_id') AS INT)
             ));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(output.contains("IN ("), "Expected IN list in subquery: {output}");
@@ -1035,6 +1087,7 @@ fn outer_table_ref_in_list_in_subquery() {
 #[test]
 fn outer_table_ref_nested_in_subquery() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE nested_docs (
             id INT PRIMARY KEY,
             status TEXT NOT NULL,
@@ -1075,6 +1128,7 @@ fn outer_table_ref_nested_in_subquery() {
                 AND (nested_docs.status = 'active' OR nested_docs.priority > 5)
                 AND org_members.user_id = CAST(current_setting('app.user_id') AS INT)
             ));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(
@@ -1087,6 +1141,7 @@ fn outer_table_ref_nested_in_subquery() {
 #[test]
 fn for_all_policy() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE simple_rls (
             id INT PRIMARY KEY,
             owner_id INT NOT NULL
@@ -1096,6 +1151,7 @@ fn for_all_policy() {
             FOR ALL TO authenticated
             USING (owner_id = CAST(current_setting('app.user_id') AS INT))
             WITH CHECK (owner_id = CAST(current_setting('app.user_id') AS INT));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(
@@ -1108,6 +1164,7 @@ fn for_all_policy() {
 #[test]
 fn update_check_with_between() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE check_between (
             id INT PRIMARY KEY,
             priority INT NOT NULL,
@@ -1127,6 +1184,7 @@ fn update_check_with_between() {
         CREATE POLICY cb_delete ON check_between
             FOR DELETE TO authenticated
             USING (owner_id = CAST(current_setting('app.user_id') AS INT));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(output.contains("BETWEEN"), "Expected BETWEEN in update check: {output}");
@@ -1136,6 +1194,7 @@ fn update_check_with_between() {
 #[test]
 fn update_check_with_subquery() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE check_subq (
             id INT PRIMARY KEY,
             max_allowed INT NOT NULL,
@@ -1159,6 +1218,7 @@ fn update_check_with_subquery() {
         CREATE POLICY cs_delete ON check_subq
             FOR DELETE TO authenticated
             USING (owner_id = CAST(current_setting('app.user_id') AS INT));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(output.contains("NEW.max_allowed"), "WITH CHECK must reference NEW: {output}");
@@ -1174,6 +1234,7 @@ fn update_check_with_subquery() {
 #[test]
 fn policy_with_cast_on_session_var() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE cast_docs (
             id INT PRIMARY KEY,
             tenant_id TEXT NOT NULL
@@ -1192,6 +1253,7 @@ fn policy_with_cast_on_session_var() {
         CREATE POLICY cd_delete ON cast_docs
             FOR DELETE TO authenticated
             USING (tenant_id = current_setting('app.user_id')::text);
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(
@@ -1229,6 +1291,7 @@ fn readonly_rls_with_monitoring_triggers() {
 #[test]
 fn subquery_in_policy() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE access_controlled (
             id INT PRIMARY KEY,
             group_id INT NOT NULL
@@ -1251,6 +1314,7 @@ fn subquery_in_policy() {
         CREATE POLICY ac_delete ON access_controlled
             FOR DELETE TO authenticated
             USING (group_id = (SELECT id FROM access_groups WHERE user_id = CAST(current_setting('app.user_id') AS INT) LIMIT 1));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(
@@ -1263,6 +1327,7 @@ fn subquery_in_policy() {
 #[test]
 fn outer_table_ref_is_not_null_in_subquery() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE active_docs (
             id INT PRIMARY KEY,
             published_at TEXT,
@@ -1302,6 +1367,7 @@ fn outer_table_ref_is_not_null_in_subquery() {
                 AND active_docs.published_at IS NOT NULL
                 AND org_access3.user_id = CAST(current_setting('app.user_id') AS INT)
             ));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(output.contains("IS NOT NULL"), "Expected IS NOT NULL in subquery: {output}");
@@ -1311,6 +1377,7 @@ fn outer_table_ref_is_not_null_in_subquery() {
 #[test]
 fn outer_table_ref_between_in_subquery() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE scored_items (
             id INT PRIMARY KEY,
             score INT NOT NULL,
@@ -1352,6 +1419,7 @@ fn outer_table_ref_between_in_subquery() {
                 AND scored_items.score BETWEEN scored_items.min_score AND scored_items.max_score
                 AND org_scores.user_id = CAST(current_setting('app.user_id') AS INT)
             ));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(output.contains("BETWEEN"), "Expected BETWEEN in subquery: {output}");
@@ -1361,6 +1429,7 @@ fn outer_table_ref_between_in_subquery() {
 #[test]
 fn outer_table_ref_unary_not_in_subquery() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE flagged_docs (
             id INT PRIMARY KEY,
             is_hidden INT NOT NULL DEFAULT 0,
@@ -1400,6 +1469,7 @@ fn outer_table_ref_unary_not_in_subquery() {
                 AND NOT flagged_docs.is_hidden
                 AND org_access4.user_id = CAST(current_setting('app.user_id') AS INT)
             ));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(output.contains("NOT"), "Expected NOT in subquery: {output}");
@@ -1469,6 +1539,7 @@ fn missing_schema_qualified_current_setting_mapping_error() {
 #[test]
 fn in_subquery_with_outer_table_ref_in_using() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE projects (
             id INT PRIMARY KEY,
             team_id INT NOT NULL
@@ -1492,6 +1563,7 @@ fn in_subquery_with_outer_table_ref_in_using() {
         CREATE POLICY proj_delete ON projects
             FOR DELETE TO authenticated
             USING (team_id IN (SELECT team_id FROM team_members WHERE user_id = CAST(current_setting('app.user_id') AS INT)));
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let output = translate(sql);
     assert!(output.contains("IN (SELECT"), "Expected IN subquery: {output}");

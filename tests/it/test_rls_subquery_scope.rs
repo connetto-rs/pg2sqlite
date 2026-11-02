@@ -398,8 +398,8 @@ fn mutual_unaliased_read_policies_refused_at_translation() {
     let err = result.expect_err("mutual-reference cycle must be refused at translation");
     let msg = err.to_string();
     assert!(
-        msg.contains("on a") && msg.contains("on b"),
-        "error message must name both tables; got: {msg}"
+        msg.contains(r#"infinite recursion detected in policy for relation "a""#),
+        "the refusal names the relation PostgreSQL names; got: {msg}"
     );
 }
 
@@ -428,8 +428,8 @@ fn a_mutual_cycle_through_a_function_argument_is_refused_at_translation() {
         .expect_err("a cycle through a function argument must be refused at translation");
     let msg = err.to_string();
     assert!(
-        msg.contains("on a") && msg.contains("on b"),
-        "error message must name both tables; got: {msg}"
+        msg.contains(r#"infinite recursion detected in policy for relation "a""#),
+        "the refusal names the relation PostgreSQL names; got: {msg}"
     );
 }
 

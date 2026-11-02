@@ -139,6 +139,7 @@ fn check_constraint_translated() {
 #[test]
 fn fk_to_rls_table_gets_renamed() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE users (
             id UUID PRIMARY KEY,
             name TEXT NOT NULL
@@ -157,6 +158,7 @@ fn fk_to_rls_table_gets_renamed() {
             id UUID PRIMARY KEY,
             user_id UUID REFERENCES users(id)
         );
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)

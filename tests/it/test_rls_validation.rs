@@ -12,6 +12,7 @@ use crate::helpers;
 
 /// PostgreSQL schema with basic RLS setup for testing.
 const RLS_SCHEMA: &str = r#"
+CREATE ROLE authenticated;
 CREATE TABLE documents (
     id UUID PRIMARY KEY,
     owner_id UUID NOT NULL,
@@ -41,6 +42,7 @@ CREATE POLICY documents_delete_policy ON documents
     FOR DELETE
     TO authenticated
     USING (owner_id = current_setting('app.user_id')::uuid);
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
 "#;
 
 /// Test 1: RLS requires audit table name to be configured.
@@ -171,6 +173,7 @@ fn test_monitor_mode_logs_violations() -> Result<(), Box<dyn std::error::Error>>
     // PostgreSQL semantics.
     let audit_table_name = "rls_violations";
     const MONITOR_SCHEMA: &str = r#"
+CREATE ROLE authenticated;
 CREATE TABLE documents (
     id UUID PRIMARY KEY,
     owner_id UUID NOT NULL,
@@ -186,6 +189,7 @@ CREATE POLICY documents_insert_policy ON documents
     FOR INSERT
     TO authenticated
     WITH CHECK (true);
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
 "#;
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
@@ -317,6 +321,7 @@ fn test_validation_views_exist() -> Result<(), Box<dyn std::error::Error>> {
     // and then inserts bob's doc through the view (not visible to alice).
     // The violations view must show only bob's doc.
     const VALIDATION_SCHEMA: &str = r#"
+CREATE ROLE authenticated;
 CREATE TABLE documents (
     id UUID PRIMARY KEY,
     owner_id UUID NOT NULL,
@@ -332,6 +337,7 @@ CREATE POLICY documents_insert_policy ON documents
     FOR INSERT
     TO authenticated
     WITH CHECK (true);
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
 "#;
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
