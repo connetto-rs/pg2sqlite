@@ -220,6 +220,7 @@ const CASES: &[Case] = &[
     // Warned and dropped: foreign data and credentials.
     warned("CREATE SERVER srv FOREIGN DATA WRAPPER postgres_fdw"),
     warned("CREATE FOREIGN TABLE ft (id INT) SERVER srv"),
+    warned("ALTER FOREIGN TABLE IF EXISTS ft OPTIONS (ADD schema_name 'remote')"),
     warned("DROP FOREIGN TABLE ft"),
     warned("CREATE USER MAPPING FOR PUBLIC SERVER srv OPTIONS (user 'u', password 'p')"),
     warned("COMMENT ON FOREIGN TABLE ft IS 'note'"),

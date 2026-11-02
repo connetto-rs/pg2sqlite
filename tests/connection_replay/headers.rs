@@ -304,11 +304,12 @@ fn set_operation_view_keeps_the_left_arm_shape() {
 }
 
 #[test]
-fn connect_refuses_a_view_over_a_retired_column() {
+fn connect_refuses_a_seed_over_a_retired_column() {
     let script = script(
         "CREATE TABLE a(key INT PRIMARY KEY, id INT NOT NULL);
          INSERT INTO a VALUES(0, 1);
-         CREATE TEMP VIEW v AS SELECT id FROM a;
+         CREATE TEMP TABLE scratch(key INT PRIMARY KEY, x INT NOT NULL);
+         INSERT INTO scratch SELECT key, id FROM a;
          ALTER TABLE a DROP COLUMN id;
          ALTER TABLE a ADD COLUMN id INT NOT NULL DEFAULT 99;",
     );
@@ -318,7 +319,7 @@ fn connect_refuses_a_view_over_a_retired_column() {
         Error::Connection(ConnectionError::UnavailableColumn {
             relation,
             column,
-            statement: 2,
+            statement: 3,
         }) if relation == "a" && column == "id"
     ));
 }

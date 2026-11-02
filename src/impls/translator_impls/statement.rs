@@ -670,13 +670,14 @@ fn translate_alter_table(
 /// everything this crate translates is a syntax error in SQLite. What decides
 /// each answer is whether the clause carries meaning that would be lost.
 ///
-/// `ON CLUSTER` is ClickHouse and the three `table_type` spellings are
-/// Snowflake. PostgreSQL rejects all of them outright, so a file carrying one
-/// is not the input this crate accepts, which is the reason worth reporting.
-/// Only `ICEBERG` currently reaches this: `DYNAMIC` and `EXTERNAL` are refused
-/// by the parser under the PostgreSQL dialect, as is Hive's `SET LOCATION`, and
-/// all three are named anyway so a parser change cannot reopen the hole
-/// quietly.
+/// `ON CLUSTER` is ClickHouse and the `ICEBERG`, `DYNAMIC` and `EXTERNAL`
+/// `table_type` spellings are Snowflake. PostgreSQL rejects all of them
+/// outright, so a file carrying one is not the input this crate accepts, which
+/// is the reason worth reporting. Only `ICEBERG` currently reaches this:
+/// `DYNAMIC` and `EXTERNAL` are refused by the parser under the PostgreSQL
+/// dialect, as is Hive's `SET LOCATION`, and all three are named anyway so a
+/// parser change cannot reopen the hole quietly. `FOREIGN` is PostgreSQL's own
+/// and never arrives here, because the statement is dropped as foreign data.
 ///
 /// The existence check runs for every operation, guarded or not. A rename is
 /// the one operation that needs nothing from the schema, so it was the one
@@ -694,11 +695,12 @@ fn reject_untranslatable_alter_table_clauses(
     let foreign = if alter_table.on_cluster.is_some() {
         Some("ON CLUSTER, which is ClickHouse")
     } else if let Some(table_type) = alter_table.table_type.as_ref() {
-        Some(match table_type {
-            AlterTableType::Iceberg => "ICEBERG, which is Snowflake",
-            AlterTableType::Dynamic => "DYNAMIC, which is Snowflake",
-            AlterTableType::External => "EXTERNAL, which is Snowflake",
-        })
+        match table_type {
+            AlterTableType::Iceberg => Some("ICEBERG, which is Snowflake"),
+            AlterTableType::Dynamic => Some("DYNAMIC, which is Snowflake"),
+            AlterTableType::External => Some("EXTERNAL, which is Snowflake"),
+            AlterTableType::Foreign => None,
+        }
     } else if alter_table.location.is_some() {
         Some("SET LOCATION, which is Hive")
     } else {
@@ -2085,6 +2087,9 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
             Self::Lock { .. } => drop_with_warning("LOCK", REASON_HINT, emit),
             Self::LockTables { .. } => drop_with_warning("LOCK TABLES", REASON_HINT, emit),
             Self::UnlockTables => drop_with_warning("UNLOCK TABLES", REASON_HINT, emit),
+            Statement::AlterTable(AlterTable {
+                table_type: Some(AlterTableType::Foreign), ..
+            }) => drop_with_warning("ALTER FOREIGN TABLE", REASON_FOREIGN_DATA, emit),
             Statement::AlterTable(alter_table) => {
                 translate_alter_table(alter_table, schema, options, emit)?
             }
