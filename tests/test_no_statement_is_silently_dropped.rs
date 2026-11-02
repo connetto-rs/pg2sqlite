@@ -186,7 +186,14 @@ const CASES: &[Case] = &[
     warned("CREATE TYPE mood AS ENUM ('sad', 'ok')"),
     warned("ALTER TYPE mood RENAME TO feeling"),
     warned("CREATE DOMAIN positive AS INTEGER CHECK (VALUE > 0)"),
-    warned("DROP DOMAIN positive"),
+    // sql-traits records domains, so a drop of one nothing declared refuses at
+    // build, as PostgreSQL does, and the warn-drop needs the domain declared.
+    Case {
+        setup: "CREATE DOMAIN positive AS INTEGER CHECK (VALUE > 0);",
+        sql: "DROP DOMAIN positive",
+        outcome: Outcome::Warned,
+    },
+    rejected("DROP DOMAIN nope"),
     warned("DROP TYPE mood"),
     warned("CREATE COLLATION c (provider = 'icu', locale = 'und')"),
     warned("ALTER COLLATION c REFRESH VERSION"),
