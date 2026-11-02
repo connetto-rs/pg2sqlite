@@ -191,6 +191,24 @@ fn undeclared_session_role_is_refused() {
     );
 }
 
+/// A schema owner the schema never declares refuses translation, since it
+/// would own every table and view whose owner is never named.
+#[test]
+fn undeclared_schema_owner_is_refused() {
+    let error = Pg2Sqlite::default()
+        .sql(&format!(
+            "CREATE ROLE admin; CREATE ROLE app_user; {PG} GRANT SELECT ON docs TO app_user;"
+        ))
+        .expect("parse")
+        .translate(&opts_with_role().with_schema_owner_role("migrator"))
+        .map(pg2sqlite::script::Script::into_vec)
+        .expect_err("migrator is never declared");
+    assert!(
+        error.to_string().contains("the schema owner role 'migrator' is not declared"),
+        "the refusal names the undeclared role: {error}"
+    );
+}
+
 /// Without with_session_user_role, a batch containing a non-PUBLIC TO clause
 /// refuses translation naming the option so the caller knows what to set.
 #[test]

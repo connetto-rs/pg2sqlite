@@ -257,6 +257,22 @@ fn a_view_owned_by_the_schema_owner_reads_the_backing_table() {
     assert!(emitted.contains("CREATE VIEW oo_all AS SELECT id, owner_id FROM oo_rls"), "{emitted}");
 }
 
+/// A schema-qualified view finds the owner its `ALTER VIEW` names, so a view
+/// in another schema owned by the table's owner reads the backing table.
+#[test]
+fn a_qualified_view_reads_as_the_owner_its_alter_view_names() {
+    let emitted = translate(&format!(
+        "CREATE ROLE migrator;
+         CREATE SCHEMA app;
+         {TABLE}
+         ALTER TABLE oo OWNER TO migrator;
+         CREATE VIEW app.oo_all AS SELECT id, owner_id FROM oo;
+         ALTER VIEW app.oo_all OWNER TO migrator;"
+    ))
+    .join("\n");
+    assert!(emitted.contains("AS SELECT id, owner_id FROM oo_rls"), "{emitted}");
+}
+
 /// A view owned by a role the table's policies bind would show that role's
 /// rows, which no SQLite view can, so it is refused.
 #[test]
