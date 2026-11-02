@@ -2165,7 +2165,7 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
             //
             // The policy statements drive the row level security view and
             // trigger set built from the final schema state (`rls.rs`,
-            // `filter_policies`). The schema statements make a qualified name
+            // `row_security`). The schema statements make a qualified name
             // resolvable (`object_name.rs`, `schema_resolves`) and SQLite has
             // no schema for the name to keep, so the qualifier is stripped
             // instead.

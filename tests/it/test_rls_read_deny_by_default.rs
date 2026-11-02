@@ -196,12 +196,8 @@ fn policy_without_using_clause_grants_no_row() -> Result<(), Box<dyn std::error:
 }
 
 /// A `FOR ALL` policy applies to SELECT, so such a table filters normally and
-/// must NOT reach the deny-all path.
-///
-/// Guards a latent regression whose severity this change raised: if
-/// `filter_policies` ever stopped treating `CreatePolicyCommand::All` as
-/// applying to SELECT, the old failure mode was an unfiltered view (rows still
-/// visible) and the new one is denying everything.
+/// must NOT reach the deny-all path, which an unapplied `FOR ALL` policy would
+/// otherwise send it down.
 #[test]
 fn rls_with_only_a_for_all_policy_filters_normally() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = setup(
