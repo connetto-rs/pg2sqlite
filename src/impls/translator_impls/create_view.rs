@@ -15,9 +15,7 @@ use core::ops::ControlFlow;
 
 use sql_traits::{
     errors::{LookupError, RowSecurityError},
-    structs::{
-        ActingRole, IdentifierCase, ParserDB, Requester, RowSecurity, RowStatement, TargetName,
-    },
+    structs::{IdentifierCase, ParserDB, RowSecurity, RowStatement, TargetName},
     traits::{DatabaseLike, RoleLike, TableLike, ViewLike},
 };
 use sqlparser::ast::{
@@ -143,7 +141,7 @@ fn retarget_rls_reads(
             Ok(None) => return ControlFlow::Continue(()),
             Err(error) => return ControlFlow::Break(error),
         };
-        match owner_bypasses(view, table, schema, options) {
+        match owner_bypasses(view, table, schema) {
             Ok(true) => {
                 *name = append_suffix(name, options.get_rls_table_suffix());
                 ControlFlow::Continue(())
@@ -163,24 +161,22 @@ fn retarget_rls_reads(
 ///
 /// # Errors
 ///
-/// Refuses an owner neither the schema nor the options name, and an owner the
-/// table's policies bind.
+/// Refuses an owner the schema never names, and an owner the table's policies
+/// bind.
 fn owner_bypasses(
     view: &CreateView,
     table: &CreateTable,
     schema: &ParserDB,
-    options: &crate::options::TranslationContext<'_>,
 ) -> Result<bool, Error> {
     if !table.has_row_level_security(schema)? {
         return Ok(false);
     }
-    let schema_owner = options.get_schema_owner_role().and_then(|name| schema.role(name));
-    let named = declared_view(schema, view)?
+    let owner = declared_view(schema, view)?
         .map(|stored| stored.owner(schema))
         .transpose()?
         .flatten()
         .and_then(|name| schema.role(name));
-    let Some(owner) = named.or(schema_owner) else {
+    let Some(owner) = owner else {
         return Err(Error::forward_refusal(format!(
             "view '{}' reads table '{}', which has row-level security, as the view's owner, and \
              the schema never names that owner. Name it with ALTER VIEW {} OWNER TO, call \
@@ -191,8 +187,7 @@ fn owner_bypasses(
             view.name
         )));
     };
-    let requester = Requester::new(ActingRole::Declared(owner), schema_owner);
-    match table.row_security(RowStatement::Select, requester, schema) {
+    match table.row_security(RowStatement::Select, owner, schema) {
         Ok(RowSecurity::Exempt(_)) => Ok(true),
         Ok(RowSecurity::Gated(_) | RowSecurity::InfiniteRecursion { .. }) => {
             Err(Error::forward_refusal(format!(

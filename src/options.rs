@@ -84,8 +84,7 @@ pub struct Pg2SqliteOptions {
     readonly_deny_trigger_suffix: String,
     /// The role name to use when filtering policies.
     session_user_role: Option<String>,
-    /// The role that ran the schema, owning every table and view whose owner
-    /// the schema never names.
+    /// The role the schema's statements run as, owning what they create.
     schema_owner_role: Option<String>,
     /// Mappings from PostgreSQL session variable patterns to SQLite functions.
     session_variables: Vec<SessionVariableMapping>,
@@ -779,10 +778,12 @@ impl Pg2SqliteOptions {
     }
 
     #[must_use]
-    /// Names the role that ran the schema, as the role running `CREATE TABLE`
-    /// or `CREATE VIEW` owns what it creates. Row-level security exempts that
-    /// role from the policies of a table whose owner the schema never names,
-    /// and reads a plain view whose owner the schema never names as that role.
+    /// Names the role the schema's statements run as, as a migration runs as
+    /// one role no statement names. That role owns every table and view
+    /// created before a `SET ROLE` moves away from it, so row-level security
+    /// exempts it from those tables' policies and reads a plain view as it,
+    /// and an `ALTER DEFAULT PRIVILEGES` without `FOR ROLE` gives its defaults
+    /// to what it creates afterwards.
     pub fn with_schema_owner_role(mut self, role: impl Into<String>) -> Self {
         self.schema_owner_role = Some(role.into());
         self

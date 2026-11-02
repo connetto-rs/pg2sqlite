@@ -19,7 +19,7 @@ autotests = false
 [dependencies]
 sqlparser = { version = "0.63", default-features = false, features = ["visitor"] }
 sqlparser-plpgsql = { git = "https://github.com/connetto-rs/sqlparser-plpgsql", branch = "main", features = ["body-parse"] }
-sql-traits = { git = "https://github.com/connetto-rs/sql-traits", branch = "main", default-features = false }
+sql-traits = { git = "https://github.com/connetto-rs/sql-traits", branch = "parse-time-owner", default-features = false }
 git2 = { version = "0.21", optional = true }
 tempfile = { version = "3.27", optional = true }
 thiserror = { version = "2.0", default-features = false }

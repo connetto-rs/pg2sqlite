@@ -27,8 +27,8 @@ use core::ops::ControlFlow;
 use sql_traits::{
     errors::{LookupError, RowSecurityError},
     structs::{
-        ActingRole, GatedCommand, IdentifierCase, ParserDB, Requester, RowGate, RowSecurity,
-        RowStatement, RowVersion, TargetName,
+        ActingRole, GatedCommand, IdentifierCase, ParserDB, RowGate, RowSecurity, RowStatement,
+        RowVersion, TargetName,
     },
     traits::{ColumnLike, DatabaseLike, PolicyLike, TableLike, TriggerLike},
 };
@@ -779,11 +779,14 @@ impl<'s> Rows<'s> {
 }
 
 /// Who this translation runs as: the declared session role, or a caller
-/// holding none, against a schema run by the declared schema owner, if named.
-fn requester<'s>(
+/// holding none.
+///
+/// The schema owner role owns what the schema creates, and has to be declared
+/// too.
+fn acting_role<'s>(
     schema: &'s ParserDB,
     options: &Pg2SqliteOptions,
-) -> Result<Requester<'s, <ParserDB as DatabaseLike>::Role>, Error> {
+) -> Result<ActingRole<'s, <ParserDB as DatabaseLike>::Role>, Error> {
     let declared = |name: &str, what: &str| {
         schema.role(name).ok_or_else(|| {
             Error::forward_refusal(format!(
@@ -792,26 +795,24 @@ fn requester<'s>(
             ))
         })
     };
-    let role = match options.get_session_user_role() {
+    if let Some(name) = options.get_schema_owner_role() {
+        declared(name, "schema owner role")?;
+    }
+    Ok(match options.get_session_user_role() {
         Some(name) => ActingRole::Declared(declared(name, "session role")?),
         None => ActingRole::Public,
-    };
-    let schema_owner = options
-        .get_schema_owner_role()
-        .map(|name| declared(name, "schema owner role"))
-        .transpose()?;
-    Ok(Requester::new(role, schema_owner))
+    })
 }
 
 /// What row-level security applies to `statement` on `table`, as `sql-traits`
-/// answers it for the requester.
+/// answers it for the acting role.
 fn row_security<'s>(
     table: &'s CreateTable,
     schema: &'s ParserDB,
     statement: RowStatement,
     options: &Pg2SqliteOptions,
 ) -> Result<Rows<'s>, Error> {
-    let answer = table.row_security(statement, requester(schema, options)?, schema);
+    let answer = table.row_security(statement, acting_role(schema, options)?, schema);
     let refusal = |reason: String| Err(Error::forward_refusal(reason));
     match answer {
         Ok(RowSecurity::Exempt(_)) => Ok(Rows::Exempt),
