@@ -557,10 +557,8 @@ pub(crate) fn query_output_carries<T>(
 ) -> Result<bool, Error> {
     let graph =
         ColumnScope::from_query(query, schema, sql_traits::structs::IdentifierCase::AsWritten)?;
-    let Some(scope) = graph.scope_for_query(query) else {
-        return Ok(false);
-    };
-    for output in scope.outputs() {
+    let outputs = graph.scope_for_query(query).map(|scope| scope.outputs()).into_iter().flatten();
+    for output in outputs {
         if let QueryOutput::Column { definition, .. } = output
             && definition_find(&definition, schema, options, &read_column, &read_expression)?
                 .is_some()
@@ -3353,6 +3351,25 @@ pub(crate) fn translate_group_by_expr<D: TranslationDirection>(
     })
 }
 
+/// The `PARTITION BY` expression of a window: the position key over an
+/// interval operand, or the plain translation.
+///
+/// # Errors
+///
+/// Propagates the key's refusal or the plain translation's.
+fn window_partition_expr<D: TranslationDirection>(
+    e: &Expr,
+    schema: &ParserDB,
+    options: &D::Options<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Expr, Error> {
+    let Some(ctx) = D::forward_context(options) else {
+        return D::translate_expr(e, schema, options, emit);
+    };
+    crate::impls::interval::keys::position_key(e, None, false, schema, ctx, emit)?
+        .map_or_else(|| D::translate_expr(e, schema, options, emit), Ok)
+}
+
 pub(crate) fn translate_window_spec<D: TranslationDirection>(
     spec: &WindowSpec,
     schema: &ParserDB,
@@ -3364,20 +3381,7 @@ pub(crate) fn translate_window_spec<D: TranslationDirection>(
         partition_by: spec
             .partition_by
             .iter()
-            .map(|e| {
-                let key = D::forward_context(options)
-                    .map(|ctx| {
-                        crate::impls::interval::keys::position_key(
-                            e, None, false, schema, ctx, emit,
-                        )
-                    })
-                    .transpose()?
-                    .flatten();
-                Ok::<Expr, Error>(match key {
-                    Some(key) => key,
-                    None => D::translate_expr(e, schema, options, emit)?,
-                })
-            })
+            .map(|e| window_partition_expr::<D>(e, schema, options, emit))
             .collect::<Result<Vec<_>, _>>()?,
         order_by: spec
             .order_by
@@ -4188,10 +4192,10 @@ fn values_relation_carries_interval(
     let TableFactor::Derived { subquery, alias, .. } = relation else {
         return false;
     };
-    let SetExpr::Values(values) = subquery.body.as_ref() else {
-        return false;
-    };
-    let Some(first) = values.rows.first() else {
+    let Some((values, first)) = (match subquery.body.as_ref() {
+        SetExpr::Values(values) => values.rows.first().map(|first| (values, first)),
+        _ => None,
+    }) else {
         return false;
     };
     let names: Vec<String> = (0..first.len())
@@ -4222,10 +4226,7 @@ fn values_relation_carries_interval(
         }
     };
     select.projection.iter().any(|item| {
-        let (SelectItem::UnnamedExpr(expr)
-        | SelectItem::ExprWithAlias { expr, .. }
-        | SelectItem::ExprWithAliases { expr, .. }) = item
-        else {
+        let (SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. }) = item else {
             return false;
         };
         let position = match strip_nesting(expr) {
@@ -4257,14 +4258,15 @@ fn values_relation_carries_interval(
 /// # Errors
 ///
 /// Propagates the refusal a scope that cannot be built answers.
-fn set_branch_output_carries_interval(
+pub(crate) fn set_branch_output_carries_interval(
     branch: &SetExpr,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
 ) -> Result<bool, Error> {
     match branch {
-        SetExpr::SetOperation { left, .. } => {
-            set_branch_output_carries_interval(left, schema, options)
+        SetExpr::SetOperation { left, right, .. } => {
+            Ok(set_branch_output_carries_interval(left, schema, options)?
+                || set_branch_output_carries_interval(right, schema, options)?)
         }
         SetExpr::Query(query) => {
             set_branch_output_carries_interval(query.body.as_ref(), schema, options)
@@ -5211,8 +5213,8 @@ mod tests {
         ast::{
             Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgOperator,
             FunctionArgumentList, FunctionArguments, Ident, JoinConstraint, JoinOperator,
-            ObjectName, ObjectNamePart, Query, SelectItem, SetExpr, Statement, TableFactor,
-            ValueWithSpan,
+            ObjectName, ObjectNamePart, PivotValueSource, Query, SelectItem, SetExpr, Statement,
+            TableFactor, ValueWithSpan,
         },
         dialect::PostgreSqlDialect,
         parser::Parser,
@@ -5220,11 +5222,12 @@ mod tests {
 
     use super::{
         ColumnReferences, TranslationDirection, extract_columns_from_expr,
-        extract_columns_from_function, translate_join, translate_join_constraint,
-        translate_join_operator, translate_returning, translate_select_item,
-        translate_table_factor, translate_table_with_joins,
+        extract_columns_from_function, query_output_carries, translate_join,
+        translate_join_constraint, translate_join_operator, translate_pipe_operator,
+        translate_pivot_value_source, translate_returning, translate_select_item,
+        translate_table_factor, translate_table_with_joins, values_relation_carries_interval,
     };
-    use crate::{errors::Error, prelude::Pg2SqliteOptions};
+    use crate::{errors::Error, impls::translator_impls::Forward, prelude::Pg2SqliteOptions};
 
     struct IdentityDirection;
 
@@ -5364,6 +5367,14 @@ mod tests {
             Statement::Query(query) => *query,
             other => panic!("expected query statement, got: {other:?}"),
         }
+    }
+
+    /// The schema every position-key test resolves `iv` against.
+    fn interval_schema() -> ParserDB {
+        let stmts =
+            Parser::parse_sql(&PostgreSqlDialect {}, "CREATE TABLE t (id int, iv interval)")
+                .unwrap();
+        ParserDB::from_statements(stmts, "test".to_string()).unwrap()
     }
 
     #[test]
@@ -5646,5 +5657,142 @@ mod tests {
             .expect("no numeric scale to read"),
             crate::manifest::ColumnStorage::Direct
         );
+    }
+
+    /// The forward shape an `ORDER BY` over an interval operand settles on:
+    /// the position key for the expression and the ASC nulls-last default.
+    fn expected_order_by_over_interval(
+        order_by_expr: &sqlparser::ast::OrderByExpr,
+        schema: &ParserDB,
+        options: &crate::options::TranslationContext<'_>,
+    ) -> sqlparser::ast::OrderByExpr {
+        use crate::impls::interval::keys::position_key;
+
+        let expr = position_key(&order_by_expr.expr, None, false, schema, options, &mut |_| {})
+            .expect("the position key settles")
+            .expect("an interval operand reads a key");
+        sqlparser::ast::OrderByExpr {
+            expr,
+            options: sqlparser::ast::OrderByOptions { sort: None, nulls_first: Some(false) },
+            with_fill: None,
+        }
+    }
+
+    #[test]
+    fn a_pipe_order_by_over_an_interval_reads_the_position_key() {
+        let schema = interval_schema();
+        let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
+        let order_by_expr = sqlparser::ast::OrderByExpr {
+            expr: parse_expr("iv"),
+            options: sqlparser::ast::OrderByOptions::default(),
+            with_fill: None,
+        };
+        let pipe = sqlparser::ast::PipeOperator::OrderBy { exprs: vec![order_by_expr.clone()] };
+        let expected = expected_order_by_over_interval(&order_by_expr, &schema, &options);
+        let translated = translate_pipe_operator::<Forward>(&pipe, &schema, &options, &mut |_| {})
+            .expect("a pipe ORDER BY over an interval keeps the position key");
+        assert_eq!(translated, sqlparser::ast::PipeOperator::OrderBy { exprs: vec![expected] });
+    }
+
+    #[test]
+    fn a_match_recognize_order_by_over_an_interval_reads_the_position_key() {
+        let schema = interval_schema();
+        let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
+        let order_by_expr = sqlparser::ast::OrderByExpr {
+            expr: parse_expr("iv"),
+            options: sqlparser::ast::OrderByOptions::default(),
+            with_fill: None,
+        };
+        let inner_table = Box::new(TableFactor::Table {
+            name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("t"))]),
+            alias: None,
+            args: None,
+            with_hints: vec![],
+            version: None,
+            with_ordinality: false,
+            partitions: vec![],
+            json_path: None,
+            sample: None,
+            index_directives: vec![],
+            inheritance: None,
+        });
+        let table = TableFactor::MatchRecognize {
+            table: inner_table.clone(),
+            partition_by: vec![],
+            order_by: vec![order_by_expr.clone()],
+            measures: vec![],
+            rows_per_match: None,
+            after_match_skip: None,
+            pattern: sqlparser::ast::MatchRecognizePattern::Concat(vec![]),
+            symbols: vec![],
+            alias: None,
+        };
+        let expected = expected_order_by_over_interval(&order_by_expr, &schema, &options);
+        let translated = translate_table_factor::<Forward>(&table, &schema, &options, &mut |_| {})
+            .expect("a MATCH_RECOGNIZE order by over an interval keeps the position key");
+        assert_eq!(
+            translated,
+            TableFactor::MatchRecognize {
+                table: inner_table.clone(),
+                partition_by: vec![],
+                order_by: vec![expected],
+                measures: vec![],
+                rows_per_match: None,
+                after_match_skip: None,
+                pattern: sqlparser::ast::MatchRecognizePattern::Concat(vec![]),
+                symbols: vec![],
+                alias: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_values_column_named_as_a_variable_keeps_its_variable_translation() {
+        let schema = interval_schema();
+        let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
+        let query = parse_query("SELECT x FROM (VALUES ('1 day'::interval)) v (x)");
+        let select = query.body.as_ref().as_select().expect("the select body");
+        assert!(values_relation_carries_interval(select, &schema, &options));
+        let variables = vec![String::from("x")];
+        let scoped = options.with_variables(&variables);
+        assert!(!values_relation_carries_interval(select, &schema, &scoped));
+    }
+
+    #[test]
+    fn a_pivot_any_value_source_translates_its_order_by() {
+        let s = empty_schema();
+        let o = Pg2SqliteOptions::default();
+        let ob = sqlparser::ast::OrderByExpr {
+            expr: parse_expr("a"),
+            options: sqlparser::ast::OrderByOptions::default(),
+            with_fill: None,
+        };
+        let expected = ob.clone();
+        let source = PivotValueSource::Any(vec![ob]);
+        let got = translate_pivot_value_source::<IdentityDirection>(&source, &s, &o, &mut |_| {})
+            .expect("a pivot ANY value source translates its order by");
+        assert_eq!(got, PivotValueSource::Any(vec![expected]));
+    }
+
+    #[test]
+    fn a_query_output_defined_by_an_interval_column_or_expression_carries() {
+        let schema = interval_schema();
+        let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
+        for sql in ["SELECT iv FROM t", "SELECT s FROM (SELECT '1 day'::interval AS s FROM t) y"] {
+            let carries = query_output_carries(
+                &parse_query(sql),
+                &schema,
+                &options,
+                |column| {
+                    crate::impls::interval::is_interval_data_type(&column.data_type).then_some(())
+                },
+                |expr, schema, options| {
+                    Ok(crate::impls::expression_type::is_interval_typed(expr, schema, options)
+                        .then_some(()))
+                },
+            )
+            .expect("the output's scope settles");
+            assert!(carries, "{sql}: the output answers the interval read");
+        }
     }
 }

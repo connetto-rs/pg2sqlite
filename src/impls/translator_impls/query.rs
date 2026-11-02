@@ -1570,38 +1570,31 @@ mod tests {
 
     #[test]
     fn low_level_translation_helpers_cover_remaining_variants() {
-        let schema = empty_schema();
-        let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
+        let s = empty_schema();
+        let o = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
 
-        let order_by_all = Some(sqlparser::ast::OrderBy {
+        let ob = Some(sqlparser::ast::OrderBy {
             kind: sqlparser::ast::OrderByKind::All(sqlparser::ast::OrderByOptions {
                 sort: Some(sqlparser::ast::OrderBySort::Asc),
                 nulls_first: Some(false),
             }),
             interpolate: None,
         });
-        let body = parse_query("SELECT a FROM t").body;
-        let _ = translate_order_by(
-            order_by_all.as_ref(),
-            body.as_ref(),
-            &schema,
-            &options,
-            &mut |_| {},
-        )
-        .unwrap();
+        let b = parse_query("SELECT a FROM t").body;
+        let _ = translate_order_by(ob.as_ref(), b.as_ref(), &s, &o, &mut |_| {}).unwrap();
 
         let offset_comma_limit = Some(sqlparser::ast::LimitClause::OffsetCommaLimit {
             offset: parse_expr("5"),
             limit: parse_expr("10"),
         });
-        let _ = translate_limit_clause(offset_comma_limit.as_ref(), &schema, &options).unwrap();
+        let _ = translate_limit_clause(offset_comma_limit.as_ref(), &s, &o).unwrap();
 
         let distinct_on = Some(Distinct::On(vec![parse_expr("a")]));
-        let err = translate_distinct(distinct_on.as_ref(), &schema, &options).unwrap_err();
+        let err = translate_distinct(distinct_on.as_ref(), &s, &o).unwrap_err();
         assert!(err.to_string().contains("DISTINCT ON"), "unexpected error: {err}");
 
         let group_by_all = GroupByExpr::All(vec![]);
-        let translated = super::translate_group_by(&group_by_all, &schema, &options).unwrap();
+        let translated = super::translate_group_by(&group_by_all, &s, &o).unwrap();
         assert!(matches!(translated, GroupByExpr::All(_)));
     }
 
@@ -1756,6 +1749,7 @@ mod tests {
         assert!(is_aggregate_expression(&parse_expr("bool_or(active)")));
         assert!(is_aggregate_expression(&parse_expr("every(active)")));
         assert!(is_aggregate_expression(&parse_expr("CASE WHEN 1=1 THEN avg(v) ELSE 0 END")));
+        assert!(is_aggregate_expression(&parse_expr("CASE WHEN max(v) > 1 THEN 2 ELSE 3 END")));
         assert!(is_aggregate_expression(&parse_expr("NOT max(v)")));
         assert!(is_aggregate_expression(&parse_expr("(max(v))")));
         assert!(is_aggregate_expression(&parse_expr("max(v)::INT")));

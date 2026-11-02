@@ -353,7 +353,7 @@ fn rewrite_conflict_interval_columns(
         return Ok(Some(sqlparser::ast::ConflictTarget::Columns { columns, predicate }));
     };
     let without = options.without_subqueries();
-    let columns = columns
+    let result: Result<Vec<sqlparser::ast::Ident>, crate::errors::Error> = columns
         .iter()
         .map(|column| {
             let is_interval =
@@ -373,7 +373,8 @@ fn rewrite_conflict_interval_columns(
                 span: column.span,
             })
         })
-        .collect::<Result<Vec<_>, crate::errors::Error>>()?;
+        .collect();
+    let columns = result?;
     Ok(Some(sqlparser::ast::ConflictTarget::Columns { columns, predicate }))
 }
 

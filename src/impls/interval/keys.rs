@@ -28,7 +28,7 @@ use sqlparser::{
     ast::{
         BinaryOperator, Distinct, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
         FunctionArgumentList, FunctionArguments, GroupByExpr, Ident, ObjectName, ObjectNamePart,
-        Select, SelectItem, SetExpr, Value, ValueWithSpan, VisitMut, VisitorMut,
+        Select, SelectItem, SetExpr, TableFactor, Value, ValueWithSpan, VisitMut, VisitorMut,
     },
     dialect::SQLiteDialect,
     parser::Parser,
@@ -49,7 +49,7 @@ use crate::{
         replay::{is_replayable, reject_duplicated_operand},
         shared_helpers::{
             function_argument_exprs, inspect_declared_in_scope, query_output_carries,
-            scope_declines_column,
+            scope_declines_column, set_branch_output_carries_interval,
         },
     },
     options::TranslationContext,
@@ -152,15 +152,6 @@ fn interval_side(
         }
         Expr::Cast { expr, data_type, .. } if is_interval_data_type(data_type) => {
             interval_side_cast(expr, data_type)
-        }
-        Expr::TypedString(typed) if is_interval_data_type(&typed.data_type) => {
-            let Some(text) = string_literal_text(&typed.value) else {
-                return Err(cast_spelling_refusal());
-            };
-            Ok(IntervalSide::TypedLiteral {
-                text,
-                typmod: interval_data_type_typmod(&typed.data_type)?,
-            })
         }
         _ => {
             Ok(if is_interval_typed(side, schema, options) {
@@ -266,8 +257,7 @@ impl VisitorMut for ReplacePlaceholder {
     fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
         if matches!(
             expr,
-            Expr::Identifier(ident)
-                if ident.quote_style.is_none() && ident.value == PLACEHOLDER
+            Expr::Identifier(ident) if ident.value == PLACEHOLDER
         ) {
             *expr = self.operand.clone();
         }
@@ -524,9 +514,6 @@ fn ordinal_projection_item<'a>(item: &Expr, projection: &'a [SelectItem]) -> Opt
 fn projection_item_name(item: &SelectItem) -> Option<Cow<'_, str>> {
     match item {
         SelectItem::ExprWithAlias { alias, .. } => Some(folded_name(alias)),
-        SelectItem::ExprWithAliases { aliases, .. } => {
-            aliases.first().map(|alias| folded_name(alias))
-        }
         SelectItem::UnnamedExpr(expr) => {
             match expr {
                 Expr::Identifier(ident) => Some(folded_name(ident)),
@@ -555,27 +542,60 @@ pub(crate) fn distinct_select(
     let Some(Distinct::Distinct) = translated.distinct.as_ref() else {
         return Ok(None);
     };
-    if let Some(wildcard) = translated.projection.iter().find(|item| wildcard_item(item)) {
-        let query = crate::impls::query_builder::make_query(
-            None,
-            SetExpr::Select(Box::new(source.clone())),
-        );
-        let interval_output = query_output_carries(
-            &query,
-            schema,
-            options,
-            |column| is_interval_data_type(&column.data_type).then_some(()),
-            |expr, schema, options| Ok(is_interval_typed(expr, schema, options).then_some(())),
-        )?;
-        if interval_output {
-            return Err(Error::forward_refusal(format!(
-                "SELECT DISTINCT {wildcard} over a relation with an interval column cannot be \
-                 translated: the distinct would run on the stored text, and the key that \
-                 settles interval equality is a scalar subquery SQLite does not allow in a \
-                 wildcard projection. Name the interval columns."
-            )));
+    let mut translated_exprs = Vec::with_capacity(translated.projection.len());
+    for translated_item in &translated.projection {
+        match translated_item {
+            SelectItem::UnnamedExpr(expr)
+            | SelectItem::ExprWithAlias { expr, .. }
+            | SelectItem::ExprWithAliases { expr, .. } => translated_exprs.push(expr),
+            wildcard @ (SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)) => {
+                let query = crate::impls::query_builder::make_query(
+                    None,
+                    SetExpr::Select(Box::new(source.clone())),
+                );
+                let mut interval_output = query_output_carries(
+                    &query,
+                    schema,
+                    options,
+                    |column| is_interval_data_type(&column.data_type).then_some(()),
+                    |expr, schema, o| Ok(is_interval_typed(expr, schema, o).then_some(())),
+                )?;
+                // A derived relation's outputs do not always expand under a
+                // wildcard, VALUES and set operations among them, so the
+                // check settles each derived body itself.
+                if !interval_output {
+                    let derived = source
+                        .from
+                        .iter()
+                        .flat_map(|entry| {
+                            core::iter::once(&entry.relation)
+                                .chain(entry.joins.iter().map(|join| &join.relation))
+                        })
+                        .filter_map(|relation| {
+                            match relation {
+                                TableFactor::Derived { subquery, .. } => Some(subquery),
+                                _ => None,
+                            }
+                        });
+                    for subquery in derived {
+                        if set_branch_output_carries_interval(&subquery.body, schema, options)? {
+                            interval_output = true;
+                            break;
+                        }
+                    }
+                }
+                if interval_output {
+                    return Err(Error::forward_refusal(format!(
+                        "SELECT DISTINCT {wildcard} over a relation with an interval column \
+                         cannot be translated: the distinct would run on the stored text, \
+                         and the key that settles interval equality is a scalar subquery \
+                         SQLite does not allow in a wildcard projection. Name the interval \
+                         columns."
+                    )));
+                }
+                return Ok(None);
+            }
         }
-        return Ok(None);
     }
     let interval_items: Vec<bool> = source
         .projection
@@ -608,10 +628,7 @@ pub(crate) fn distinct_select(
             ));
         }
         let mut group_by = Vec::with_capacity(translated.projection.len());
-        for (position, translated_item) in translated.projection.iter().enumerate() {
-            let Some(translated_expr) = projection_item_expr(translated_item) else {
-                unreachable!("wildcard items are refused above");
-            };
+        for (position, translated_expr) in translated_exprs.iter().copied().enumerate() {
             if interval_items[position] {
                 group_by.push(key_expr(translated_expr, options)?);
             } else {
@@ -626,18 +643,11 @@ pub(crate) fn distinct_select(
     Ok(None)
 }
 
-/// Whether the projection item is a wildcard, bare or qualified.
-fn wildcard_item(item: &SelectItem) -> bool {
-    matches!(item, SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _))
-}
-
 /// The expression a projection item carries, `None` for a wildcard.
 fn projection_item_expr(item: &SelectItem) -> Option<&Expr> {
     match item {
-        SelectItem::UnnamedExpr(expr)
-        | SelectItem::ExprWithAlias { expr, .. }
-        | SelectItem::ExprWithAliases { expr, .. } => Some(expr),
-        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => None,
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => Some(expr),
+        _ => None,
     }
 }
 
@@ -816,9 +826,7 @@ fn count(
              values, so this is not a statement the server runs."
         )));
     }
-    let Some(arg) = args.first() else {
-        return Ok(None);
-    };
+    let arg = args[0];
     let translated = arg.translate_with_warnings(schema, options, emit)?;
     let key = key_expr(&translated, options)?;
     Ok(Some(Expr::Function(Function {
@@ -954,5 +962,114 @@ fn with_rank(keyed_text: Expr, rank: &str) -> Expr {
         }),
         op: BinaryOperator::StringConcat,
         right: Box::new(text),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::ops::ControlFlow;
+
+    use sql_traits::prelude::ParserDB;
+    use sqlparser::{
+        ast::{Expr, Ident, SelectItem, Visit, Visitor},
+        dialect::{PostgreSqlDialect, SQLiteDialect},
+        parser::Parser,
+    };
+
+    use super::{keys_templates, select_list_item, substitute};
+
+    fn parse_expr(sql: &str) -> Expr {
+        Parser::new(&PostgreSqlDialect {}).try_with_sql(sql).unwrap().parse_expr().unwrap()
+    }
+
+    #[test]
+    fn a_malformed_key_template_answers_the_parse_refusal() {
+        let error = substitute(&parse_expr("iv"), "(").unwrap_err();
+        assert!(
+            error.to_string().contains("fails to parse as an expression"),
+            "refusal {error} should name the parse failure"
+        );
+    }
+
+    /// The value of the first quoted identifier of `expr`, in visit order.
+    fn first_quoted_identifier(expr: &Expr) -> Option<String> {
+        struct Finder(Option<String>);
+
+        impl Visitor for Finder {
+            type Break = ();
+
+            fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+                if let Expr::Identifier(ident) = expr
+                    && ident.quote_style.is_some()
+                {
+                    self.0 = Some(ident.value.clone());
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
+            }
+        }
+
+        let mut finder = Finder(None);
+        let _ = expr.visit(&mut finder);
+        finder.0
+    }
+
+    #[test]
+    fn the_key_templates_parse_and_substitute_their_placeholder() {
+        assert_eq!(first_quoted_identifier(&parse_expr("\"x\"")), Some(String::from("x")));
+        for template in [
+            keys_templates::BOUND_KEY,
+            keys_templates::INLINE_KEY,
+            keys_templates::BOUND_KEYED_TEXT,
+        ] {
+            let parsed = Parser::new(&SQLiteDialect {})
+                .try_with_sql(template)
+                .unwrap()
+                .parse_expr()
+                .unwrap();
+            assert!(
+                first_quoted_identifier(&parsed).is_none(),
+                "the template {template} carries only unquoted identifiers"
+            );
+            let substituted = substitute(&parse_expr("iv"), template).unwrap();
+            assert!(
+                !substituted.to_string().contains("pg2sqlite_interval_operand"),
+                "the substitution replaces every placeholder: {substituted}"
+            );
+        }
+    }
+
+    #[test]
+    fn select_list_item_skips_the_group_by_column_check_for_a_variable() {
+        let schema =
+            ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE t (x int, iv interval)").unwrap();
+        let options = crate::options::TranslationContext::from_owned(
+            crate::prelude::Pg2SqliteOptions::default(),
+        );
+        let query = Parser::new(&PostgreSqlDialect {})
+            .try_with_sql("SELECT x, iv FROM t")
+            .unwrap()
+            .parse_query()
+            .unwrap();
+        let scope = sql_traits::structs::ColumnScope::from_query(
+            &query,
+            &schema,
+            sql_traits::structs::IdentifierCase::AsWritten,
+        )
+        .unwrap();
+        let scoped = options.with_scope(&scope);
+        let projection = vec![
+            SelectItem::UnnamedExpr(Expr::Identifier(Ident::new("x"))),
+            SelectItem::UnnamedExpr(Expr::Identifier(Ident::new("iv"))),
+        ];
+        let item = Expr::Identifier(Ident::new("x"));
+        let plain = select_list_item(&item, &projection, true, &schema, &scoped)
+            .expect("a group by name settles");
+        assert!(plain.is_none(), "a declared column keeps its ordinary translation under GROUP BY");
+        let variables = vec![String::from("x")];
+        let scoped = scoped.with_variables(&variables);
+        let keyed = select_list_item(&item, &projection, true, &schema, &scoped)
+            .expect("a group by name settles");
+        assert!(keyed.is_some(), "a variable name skips the column check and reads its output");
     }
 }

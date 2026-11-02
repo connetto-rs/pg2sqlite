@@ -354,3 +354,24 @@ fn clock_text(micros: i64) -> String {
     }
     format!("{clock}.{}", format!("{fraction:06}").trim_end_matches('0'))
 }
+
+#[cfg(test)]
+mod data_type_readers {
+    use sqlparser::ast::{ArrayElemTypeDef, DataType};
+
+    use super::{interval_data_type_typmod, is_interval_array_data_type};
+
+    /// An element-less array type and a non-array type are not interval
+    /// arrays.
+    #[test]
+    fn types_without_an_interval_element_are_not_interval_arrays() {
+        assert!(!is_interval_array_data_type(&DataType::Array(ArrayElemTypeDef::None)));
+        assert!(!is_interval_array_data_type(&DataType::Text));
+    }
+
+    /// A non-interval type carries no typmod.
+    #[test]
+    fn a_non_interval_type_carries_no_typmod() {
+        assert_eq!(interval_data_type_typmod(&DataType::Text).unwrap(), None);
+    }
+}

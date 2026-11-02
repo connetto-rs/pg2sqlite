@@ -676,6 +676,67 @@ fn a_distinct_alongside_a_group_by_over_an_interval_item_is_refused() {
 }
 
 #[test]
+fn a_distinct_wildcard_over_a_set_operation_derived_relation_is_refused() {
+    refused(
+        "SELECT DISTINCT * FROM ((SELECT iv::interval FROM t) UNION ALL (SELECT iv2::interval FROM t)) x",
+        "wildcard projection",
+    );
+}
+
+#[test]
+fn a_distinct_wildcard_over_a_subquery_derived_interval_output_is_refused() {
+    refused("SELECT DISTINCT * FROM (SELECT iv::interval AS s FROM t) y", "wildcard projection");
+}
+
+#[test]
+fn a_distinct_wildcard_over_a_subquery_derived_plain_column_translates() {
+    assert_eq!(ids("SELECT DISTINCT * FROM (SELECT id FROM t) z"), vec!["1", "2", "3"]);
+}
+
+#[test]
+fn a_distinct_wildcard_over_an_unparenthesized_set_operation_derived_relation_is_refused() {
+    refused(
+        "SELECT DISTINCT * FROM (SELECT iv::interval FROM t UNION ALL SELECT iv2::interval FROM t) x",
+        "wildcard projection",
+    );
+}
+
+#[test]
+fn a_distinct_wildcard_over_a_relation_without_interval_columns_translates() {
+    assert_eq!(ids("SELECT DISTINCT * FROM s ORDER BY id"), vec!["1", "2"]);
+}
+
+#[test]
+fn a_distinct_wildcard_over_a_parenthesized_set_operation_derived_relation_is_refused() {
+    refused(
+        "SELECT DISTINCT * FROM (((SELECT iv::interval FROM t) UNION ALL (SELECT iv2::interval FROM t))) x",
+        "wildcard projection",
+    );
+}
+
+#[test]
+fn a_distinct_wildcard_over_a_set_operation_derived_plain_column_translates() {
+    assert_eq!(
+        ids("SELECT DISTINCT * FROM ((SELECT id FROM t) UNION ALL (SELECT id FROM t)) x"),
+        vec!["1", "2", "3"],
+    );
+}
+
+/// PostgreSQL settles a VALUES column as interval when any row does and
+/// dedupes on the value, so `'1 day'` and `'24:00:00'` give one row.
+#[test]
+fn a_distinct_wildcard_over_an_interval_values_relation_is_refused() {
+    refused(
+        "SELECT DISTINCT * FROM (VALUES ('1 day'::interval), ('24:00:00'::interval)) v",
+        "wildcard projection",
+    );
+    refused(
+        "SELECT DISTINCT * FROM t CROSS JOIN (VALUES ('1 day'::interval), ('24:00:00'::interval)) v",
+        "wildcard projection",
+    );
+}
+
+#[test]
 fn a_bound_parameter_is_keyed_like_a_column() {
     let conn = bind_setup(SCHEMA);
     let query = bind_query(&format!("{SCHEMA}\nSELECT id FROM t WHERE iv = $1;"));
@@ -1271,4 +1332,554 @@ fn a_union_over_bare_literal_values_branches_keeps_translating() {
         ),
         "2"
     );
+}
+
+/// Translates `pg` and executes every emitted statement, returning the error
+/// the last statement to fail answers, or `None` when every statement runs.
+fn execution_error(pg: &str) -> Option<String> {
+    let statements = Pg2Sqlite::default()
+        .sql(&format!("{SCHEMA}\n{pg}"))
+        .expect("parse")
+        .translate_to_sql(&Pg2SqliteOptions::default())
+        .expect("translate")
+        .into_vec();
+    let connection = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+    let mut error = None;
+    for statement in &statements {
+        if let Err(e) = connection.execute(&format!("{statement};"), []) {
+            error = Some(e.to_string());
+        }
+    }
+    error
+}
+
+#[test]
+fn a_dollar_quoted_literal_compares_the_value() {
+    assert_eq!(ids("SELECT id FROM t WHERE iv = $$1 day$$ ORDER BY id"), vec!["1"]);
+}
+
+#[test]
+fn a_parenthesized_literal_compares_the_value() {
+    assert_eq!(ids("SELECT id FROM t WHERE iv = ('1 day') ORDER BY id"), vec!["1"]);
+}
+
+#[test]
+fn an_interval_literal_spelling_compares_the_value() {
+    assert_eq!(ids("SELECT id FROM t WHERE iv = interval '1 day' ORDER BY id"), vec!["1"]);
+}
+
+#[test]
+fn an_interval_over_a_non_literal_operand_is_refused() {
+    refused("SELECT id FROM t WHERE iv = INTERVAL 1 DAY", "non-literal operand");
+    refused("SELECT id FROM t WHERE iv = INTERVAL id DAY", "non-literal operand");
+}
+
+#[test]
+fn is_distinct_from_a_refused_literal_keeps_the_literal_refusal() {
+    refused("SELECT id FROM t WHERE iv IS DISTINCT FROM ('banana')", "invalid input syntax");
+}
+
+#[test]
+fn is_distinct_from_an_integer_spells_the_operator() {
+    refused(
+        "SELECT id FROM t WHERE iv IS DISTINCT FROM 1",
+        "operator does not exist: interval = integer",
+    );
+}
+
+#[test]
+fn is_distinct_from_with_an_integer_left_spells_the_operator_in_source_order() {
+    refused(
+        "SELECT id FROM t WHERE 1 IS DISTINCT FROM iv",
+        "operator does not exist: integer = interval",
+    );
+}
+
+#[test]
+fn any_beside_an_interval_over_a_text_cast_is_refused() {
+    refused("SELECT id FROM t WHERE iv = ANY('1 day'::text)", "= ANY and <> ALL over an interval");
+}
+
+#[test]
+fn any_beside_an_interval_over_a_text_array_cast_is_refused() {
+    refused(
+        "SELECT id FROM t WHERE iv = ANY(ARRAY['1 day', '2 days']::text[])",
+        "= ANY and <> ALL over an interval",
+    );
+}
+
+#[test]
+fn an_order_by_over_a_cast_interval_const_keeps_the_row_order() {
+    assert_eq!(ids("SELECT id FROM t ORDER BY '1 day'::interval, id"), vec!["1", "2", "3"]);
+}
+
+#[test]
+fn a_partition_by_a_bare_literal_settles_on_the_key() {
+    assert_eq!(
+        first("SELECT count(*) FROM (SELECT row_number() OVER (PARTITION BY '1 day') rn FROM t) q"),
+        "3"
+    );
+}
+
+#[test]
+fn a_partition_by_an_interval_column_settles_on_the_key() {
+    assert_eq!(
+        first(
+            "SELECT count(*) FROM \
+             (SELECT row_number() OVER (PARTITION BY iv ORDER BY id) rn FROM t) q"
+        ),
+        "3"
+    );
+}
+
+#[test]
+fn a_union_over_a_cross_join_of_values_relations_translates() {
+    assert_eq!(
+        first(
+            "SELECT v.column1 FROM (VALUES (1)) v JOIN (VALUES ('1 day'::interval)) w ON true \
+             UNION SELECT 1"
+        ),
+        "1"
+    );
+}
+
+#[test]
+fn a_union_over_a_values_column_named_by_its_quoted_name_is_refused() {
+    refused(
+        "SELECT \"column1\" FROM (VALUES ('1 day'::interval)) v UNION SELECT '2 days'::interval",
+        "over an interval column",
+    );
+}
+
+#[test]
+fn a_union_over_a_values_column_named_by_relation_is_refused() {
+    refused(
+        "SELECT v.column1 FROM (VALUES ('1 day'::interval)) v UNION SELECT '2 days'::interval",
+        "over an interval column",
+    );
+}
+
+#[test]
+fn a_union_over_a_wildcard_values_projection_translates() {
+    assert_eq!(ids("SELECT * FROM (VALUES (1)) v UNION SELECT 2"), vec!["1", "2"]);
+}
+
+#[test]
+fn a_union_over_a_values_projection_of_a_function_translates() {
+    assert_eq!(
+        ids("SELECT length('x') FROM (VALUES ('1 day'::interval)) v UNION SELECT id FROM t \
+             ORDER BY 1"),
+        vec!["1", "2", "3"]
+    );
+}
+
+#[test]
+fn a_union_over_a_values_relation_named_by_a_subquery_branch_translates() {
+    assert_eq!(first("SELECT x FROM (SELECT 1 AS x) a UNION SELECT 1"), "1");
+}
+
+#[test]
+fn a_union_whose_right_branch_carries_an_interval_is_refused() {
+    refused("SELECT id FROM t UNION SELECT iv FROM n", "over an interval column");
+}
+
+#[test]
+fn a_union_over_a_table_branch_keeps_the_table_refusal() {
+    refused("SELECT id FROM t UNION TABLE one", "TABLE and MERGE");
+}
+
+#[test]
+fn a_distinct_with_an_interval_and_an_ordinary_item_groups_by_the_key() {
+    assert_eq!(
+        ids("SELECT id FROM (SELECT DISTINCT iv, id FROM t) q ORDER BY id"),
+        vec!["1", "2", "3"]
+    );
+}
+
+#[test]
+fn a_distinct_wildcard_over_a_relation_with_an_interval_column_is_refused() {
+    refused("SELECT DISTINCT * FROM t", "wildcard projection");
+}
+
+#[test]
+fn a_distinct_with_an_interval_item_and_group_by_all_is_refused() {
+    refused("SELECT DISTINCT iv FROM t GROUP BY ALL", "GROUP BY clause");
+}
+
+#[test]
+fn greatest_beside_an_ordinary_type_is_refused_like_postgresql() {
+    refused("SELECT greatest(iv, id) FROM t", "cannot be matched");
+}
+
+#[test]
+fn greatest_beside_a_subquery_argument_is_refused() {
+    refused(
+        "SELECT greatest(iv, (SELECT iv FROM n LIMIT 1)) FROM t",
+        "has no SQLite form that reads",
+    );
+}
+
+#[test]
+fn count_distinct_over_an_interval_with_a_filter_is_refused() {
+    refused("SELECT count(DISTINCT iv) FILTER (WHERE id > 0) FROM t", "FILTER or WITHIN GROUP");
+}
+
+#[test]
+fn count_distinct_over_a_pair_is_refused_like_postgresql() {
+    refused("SELECT count(DISTINCT iv, id) FROM t", "does not exist");
+}
+
+#[test]
+fn min_over_no_arguments_answers_the_sqlite_error() {
+    assert!(
+        execution_error("SELECT min() FROM t").is_some(),
+        "SQLite has no zero-argument min, as PostgreSQL has no min()"
+    );
+}
+
+#[test]
+fn min_over_an_interval_with_an_over_clause_is_refused() {
+    refused("SELECT id FROM t WHERE iv < min(iv) OVER ()", "OVER clause");
+}
+
+#[test]
+fn greatest_over_an_interval_with_an_over_clause_is_refused() {
+    refused("SELECT id FROM t WHERE iv < greatest(iv, iv2) OVER ()", "OVER clause");
+}
+
+#[test]
+fn greatest_in_a_generated_column_is_refused() {
+    refused(
+        "CREATE TABLE gen_r (g text GENERATED ALWAYS AS \
+         (greatest(interval '1 day', interval '2 days')) STORED)",
+        "scalar subquery",
+    );
+}
+
+#[test]
+fn a_nested_check_beside_an_interval_column_keeps_its_key() {
+    assert!(
+        execution_error(
+            "CREATE TABLE ck_n (id int, iv interval, CHECK ((iv) < interval '10 days'));\
+             INSERT INTO ck_n VALUES (1, '20 days');"
+        )
+        .is_some(),
+        "the keyed check refuses the interval it settles"
+    );
+}
+
+#[test]
+fn a_check_qualified_by_the_own_table_name_keeps_its_key() {
+    assert!(
+        execution_error(
+            "CREATE TABLE ck_q (id int, iv interval, CHECK (ck_q.iv < interval '10 days'));\
+             INSERT INTO ck_q VALUES (1, '20 days');"
+        )
+        .is_some(),
+        "the keyed check refuses the interval it settles"
+    );
+}
+
+#[test]
+fn a_check_qualified_by_a_quoted_table_name_keeps_its_key() {
+    assert!(
+        execution_error(
+            "CREATE TABLE \"ck_t\" (id int, iv interval, CHECK (\"ck_t\".iv < interval '10 days'));\
+             INSERT INTO \"ck_t\" VALUES (1, '20 days');"
+        )
+        .is_some(),
+        "the keyed check refuses the interval it settles"
+    );
+}
+
+#[test]
+fn a_check_beside_a_quoted_interval_column_keeps_its_key() {
+    assert!(
+        execution_error(
+            "CREATE TABLE ck_c (\"IV\" interval, CHECK (\"IV\" < interval '1 day'));\
+             INSERT INTO ck_c VALUES ('2 days');"
+        )
+        .is_some(),
+        "the keyed check refuses the interval it settles"
+    );
+}
+
+#[test]
+fn a_check_qualified_by_schema_and_table_keeps_its_key() {
+    assert!(
+        execution_error(
+            "CREATE TABLE ck3 (id int, iv interval, CHECK (public.ck3.iv > '1 day'));\
+             INSERT INTO ck3 VALUES (1, '24:00:00');"
+        )
+        .is_some(),
+        "the keyed check refuses the interval it settles"
+    );
+}
+
+#[test]
+fn a_check_qualified_by_the_own_table_name_on_a_plain_column_translates() {
+    let script = "CREATE TABLE ck5 (id int, iv interval, CHECK (ck5.id > 1)); INSERT INTO ck5 VALUES (2, '24:00:00'); SELECT id FROM ck5 ORDER BY id";
+    assert_eq!(ids(script), vec!["2"]);
+}
+
+#[test]
+fn a_check_qualified_by_schema_and_table_on_a_plain_column_translates() {
+    let script = "CREATE TABLE ck6 (id int, iv interval, CHECK (public.ck6.id > 1)); INSERT INTO ck6 VALUES (2, '24:00:00'); SELECT id FROM ck6 ORDER BY id";
+    assert_eq!(ids(script), vec!["2"]);
+}
+
+#[test]
+fn a_check_running_interval_arithmetic_qualified_by_schema_and_table_is_refused() {
+    refused(
+        "CREATE TABLE q9 (iv interval, CHECK (public.q9.iv + interval '1 day' < interval '10 days'))",
+        "names an interval column outside a comparison",
+    );
+}
+
+#[test]
+fn an_in_list_check_beside_an_interval_column_keeps_its_key() {
+    assert!(
+        execution_error(
+            "CREATE TABLE ck_i (id int, iv interval, CHECK (iv IN ('1 day', '2 days')));\
+             INSERT INTO ck_i VALUES (1, '10 days');"
+        )
+        .is_some(),
+        "the keyed check refuses the interval it settles"
+    );
+}
+
+#[test]
+fn a_between_check_beside_an_interval_column_keeps_its_key() {
+    assert!(
+        execution_error(
+            "CREATE TABLE ck_b (id int, iv interval, CHECK (iv BETWEEN '1 day' AND '10 days'));\
+             INSERT INTO ck_b VALUES (1, '20 days');"
+        )
+        .is_some(),
+        "the keyed check refuses the interval it settles"
+    );
+}
+
+#[test]
+fn an_is_not_null_check_beside_an_interval_column_keeps_its_key() {
+    let script = format!(
+        "{SCHEMA}\nCREATE TABLE ck_u (id int, iv interval, CHECK (iv IS NOT NULL));\
+         INSERT INTO ck_u VALUES (1, '1 day');"
+    );
+    Pg2Sqlite::default()
+        .sql(&script)
+        .expect("parse")
+        .translate_to_sql(&Pg2SqliteOptions::default())
+        .expect("translate");
+}
+
+#[test]
+fn a_function_call_check_beside_an_interval_column_is_refused() {
+    refused(
+        "CREATE TABLE ck_f (id int, iv interval, CHECK (length(iv) > 0))",
+        "outside a comparison",
+    );
+}
+
+#[test]
+fn a_unique_over_an_interval_column_keeps_its_companion() {
+    assert!(
+        execution_error(
+            "CREATE TABLE uk_r (id int, iv interval, UNIQUE (iv, id));\
+             INSERT INTO uk_r VALUES (1, '1 day');\
+             INSERT INTO uk_r VALUES (1, '24:00:00');"
+        )
+        .is_some(),
+        "the companion index over the key refuses the equivalent spelling"
+    );
+}
+
+#[test]
+fn a_unique_beside_an_interval_arithmetic_column_is_refused() {
+    refused(
+        "CREATE TABLE uk_e (iv interval, iv2 interval, UNIQUE (iv, iv2 + '1 day'))",
+        "cannot be translated",
+    );
+}
+
+#[test]
+fn a_check_with_a_subquery_beside_an_interval_column_is_refused() {
+    refused(
+        "CREATE TABLE ck_s (iv interval, CHECK (iv = (SELECT max(iv) FROM n)))",
+        "comparison key",
+    );
+}
+
+#[test]
+fn a_check_with_a_scalar_subquery_beside_an_interval_column_is_refused() {
+    refused(
+        "CREATE TABLE ck_s2 (iv interval, CHECK (iv < (SELECT iv FROM n LIMIT 1)))",
+        "has no SQLite form that reads",
+    );
+}
+
+#[test]
+fn a_generated_column_with_an_aggregate_over_an_interval_is_refused() {
+    refused(
+        "CREATE TABLE ck_g (iv interval, g text GENERATED ALWAYS AS (min(iv)) STORED)",
+        "comparison key",
+    );
+}
+
+#[test]
+fn an_insert_conflict_over_a_missing_table_answers_the_sqlite_error() {
+    assert!(
+        execution_error("INSERT INTO missing_r (id) VALUES (1) ON CONFLICT (id) DO NOTHING")
+            .is_some(),
+        "the translated statement runs against a table SQLite does not have"
+    );
+}
+
+#[test]
+fn an_interval_compared_to_a_column_of_a_relation_outside_the_scope_is_refused() {
+    refused("SELECT id FROM t WHERE iv = out_of_scope.iv", "does not exist");
+}
+
+#[test]
+fn a_values_union_without_an_alias_over_an_interval_is_refused() {
+    refused(
+        "SELECT v.column1 FROM (VALUES ('1 day'::interval)) UNION SELECT '2 days'::interval",
+        "UNION over an interval column",
+    );
+}
+
+#[test]
+fn a_values_union_naming_a_mismatched_alias_over_an_interval_is_refused() {
+    refused(
+        "SELECT w.column1 FROM (VALUES ('1 day'::interval)) v UNION SELECT '2 days'::interval",
+        "UNION over an interval column",
+    );
+}
+
+#[test]
+fn a_values_union_with_a_three_part_reference_over_an_interval_is_refused() {
+    refused(
+        "SELECT a.b.c FROM (VALUES ('1 day'::interval)) v UNION SELECT '2 days'::interval",
+        "UNION over an interval column",
+    );
+}
+
+#[test]
+fn a_union_chain_mixed_with_an_interval_column_is_refused() {
+    refused("SELECT 1 UNION SELECT 2 UNION SELECT iv FROM t", "UNION over an interval column");
+}
+
+#[test]
+fn a_distinct_wildcard_over_a_derived_interval_column_is_refused() {
+    refused(
+        "SELECT DISTINCT * FROM (SELECT '1 day'::interval AS iv) x",
+        "SELECT DISTINCT * over a relation with an interval column",
+    );
+}
+
+#[test]
+fn a_check_running_interval_arithmetic_is_refused() {
+    refused(
+        "CREATE TABLE q1 (iv interval, CHECK (iv + '1 day' < interval '10 days'))",
+        "names an interval column outside a comparison",
+    );
+}
+
+#[test]
+fn a_check_on_a_plain_column_beside_an_interval_column_translates() {
+    let script = "CREATE TABLE q2 (id int, iv interval, CHECK (id IN (1, 2))); INSERT INTO q2 VALUES (1, '1 day'), (2, '2 days'); SELECT id FROM q2 ORDER BY id";
+    assert_eq!(ids(script), vec!["1", "2"]);
+}
+
+#[test]
+fn a_check_naming_a_three_part_column_reference_is_refused() {
+    refused(
+        "CREATE TABLE q3 (iv interval, CHECK (s.t.iv < interval '1 day'))",
+        "names something other than that table",
+    );
+}
+
+#[test]
+fn a_foreign_key_naming_a_missing_referenced_column_is_refused() {
+    refused(
+        "CREATE TABLE q5 (id int, iv interval, f int, FOREIGN KEY (f) REFERENCES t (nope))",
+        "not found in table",
+    );
+}
+
+#[test]
+fn a_unique_on_a_plain_column_beside_an_interval_column_translates() {
+    let script = "CREATE TABLE u11 (id int, iv interval, UNIQUE (id)); INSERT INTO u11 VALUES (1, '1 day'), (2, '2 days'); SELECT id FROM u11 ORDER BY id";
+    assert_eq!(ids(script), vec!["1", "2"]);
+}
+
+#[test]
+fn a_primary_key_on_a_plain_column_beside_an_interval_column_translates() {
+    let script = "CREATE TABLE u22 (id int, iv interval, PRIMARY KEY (id)); INSERT INTO u22 VALUES (1, '1 day'), (2, '2 days'); SELECT id FROM u22 ORDER BY id";
+    assert_eq!(ids(script), vec!["1", "2"]);
+}
+
+#[test]
+fn an_order_by_over_equal_named_interval_outputs_keeps_the_rows() {
+    let script = "SELECT count(*) FROM (SELECT greatest(iv, iv2) AS g, greatest(iv, iv2) AS g FROM t ORDER BY g)";
+    assert_eq!(ids(script), vec!["3"]);
+}
+
+#[test]
+fn a_distinct_over_a_function_beside_an_interval_column_keeps_its_rows() {
+    assert_eq!(
+        ids("SELECT DISTINCT length(s.s), t.iv FROM s JOIN t ON s.id = t.id ORDER BY 1"),
+        vec!["4", "5"],
+    );
+}
+
+#[test]
+fn a_count_distinct_over_an_interval_with_within_group_is_refused() {
+    refused(
+        "SELECT count(DISTINCT iv) WITHIN GROUP (ORDER BY id) FROM t",
+        "FILTER or WITHIN GROUP",
+    );
+}
+
+#[test]
+fn a_count_distinct_over_an_interval_with_null_treatment_is_refused() {
+    refused("SELECT count(DISTINCT iv) IGNORE NULLS FROM t", "FILTER or WITHIN GROUP");
+}
+
+#[test]
+fn an_equality_beside_a_text_cast_is_refused() {
+    refused("SELECT id FROM t WHERE iv = id::text", "operator does not exist");
+}
+
+#[test]
+fn a_distinct_wildcard_over_a_derived_interval_expression_is_refused() {
+    refused(
+        "SELECT DISTINCT * FROM (SELECT greatest(iv, iv2) AS s FROM t) x",
+        "SELECT DISTINCT * over a relation with an interval column",
+    );
+}
+
+#[test]
+fn a_union_chain_with_the_interval_column_first_is_refused() {
+    refused("SELECT iv FROM t UNION SELECT 1 UNION SELECT 2", "UNION over an interval column");
+}
+
+#[test]
+fn a_foreign_key_referencing_an_interval_column_is_refused() {
+    refused(
+        "CREATE TABLE u7 (id int, iv interval UNIQUE);
+         CREATE TABLE q6 (f int, FOREIGN KEY (f) REFERENCES u7 (iv))",
+        "a foreign key over interval columns",
+    );
+}
+
+#[test]
+fn an_ordinal_order_by_over_a_wildcard_select_keeps_its_rows() {
+    assert_eq!(ids("SELECT * FROM t ORDER BY 1"), vec!["1", "2", "3"]);
+}
+
+#[test]
+fn a_foreign_key_referencing_a_plain_column_of_a_table_with_an_interval_translates() {
+    let script = "CREATE TABLE u8 (id int PRIMARY KEY, iv interval); CREATE TABLE q7 (f int, FOREIGN KEY (f) REFERENCES u8 (id)); INSERT INTO u8 VALUES (1, '1 day'); INSERT INTO q7 VALUES (1); SELECT f FROM q7 ORDER BY f";
+    assert_eq!(ids(script), vec!["1"]);
 }

@@ -28,22 +28,26 @@ use crate::{
 };
 
 /// The table's interval columns as a check, an index or a conflict names
-/// them, and the table a compound reference qualifies them with.
+/// them, and the table's name, which companion indexes are named after.
 struct IntervalRefs {
     columns: Vec<String>,
     table: String,
 }
 
 impl IntervalRefs {
-    /// The interval columns a table declares and the table a compound
-    /// reference qualifies them with.
+    /// The interval columns a table declares and the table's own name.
     fn of(columns: Vec<String>, table: &CreateTable) -> Self {
         let table = last_ident(&table.name)
             .map_or_else(|| table.name.to_string(), |ident| ident.value.clone());
         Self { columns, table }
     }
 
-    /// Whether `expr` names one of the interval columns.
+    /// Whether `expr` names one of the interval columns, bare or qualified,
+    /// in the spellings a constraint expression may carry.
+    ///
+    /// A qualified name's last part is the column. Its qualifiers need no
+    /// check here, since sql-traits refuses a constraint expression whose
+    /// reference names a relation other than the table being created.
     fn is_ref(&self, expr: &Expr) -> bool {
         let expr = match expr {
             Expr::Nested(inner) => inner.as_ref(),
@@ -51,12 +55,21 @@ impl IntervalRefs {
         };
         match expr {
             Expr::Identifier(ident) => self.column_named(&ident.value, ident.quote_style.is_some()),
-            Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-                self.table_named(&parts[0])
-                    && self.column_named(&parts[1].value, parts[1].quote_style.is_some())
+            Expr::CompoundIdentifier(parts) => {
+                parts.last().is_some_and(|column| {
+                    self.column_named(&column.value, column.quote_style.is_some())
+                })
             }
             _ => false,
         }
+    }
+
+    /// Whether `expr` is a bare identifier naming one of the interval
+    /// columns, the only spelling a UNIQUE or PRIMARY KEY column list may
+    /// carry.
+    fn is_bare_ref(&self, expr: &Expr) -> bool {
+        matches!(expr, Expr::Identifier(ident)
+            if self.column_named(&ident.value, ident.quote_style.is_some()))
     }
 
     /// Whether `value` names one of the interval columns, case rules
@@ -66,15 +79,6 @@ impl IntervalRefs {
             self.columns.iter().any(|column| column == value)
         } else {
             self.columns.iter().any(|column| column.eq_ignore_ascii_case(value))
-        }
-    }
-
-    /// Whether `ident` qualifies with the table the columns sit in.
-    fn table_named(&self, ident: &Ident) -> bool {
-        if ident.quote_style.is_some() {
-            ident.value == self.table
-        } else {
-            ident.value.eq_ignore_ascii_case(&self.table)
         }
     }
 }
@@ -184,8 +188,10 @@ fn reject_foreign_key(
     }
     if let Ok(Some(foreign)) = resolve_translation_table(schema, &fk.foreign_table) {
         for referenced in &fk.referred_columns {
-            if let Some(column) = foreign.column(&referenced.value, schema, COLUMN_LOOKUP_CASE)?
-                && is_interval_data_type(&column.attribute().data_type)
+            // sql-traits refuses a reference to a missing column before this
+            // runs, so only the referenced column's type is in question.
+            let referenced = foreign.column(&referenced.value, schema, COLUMN_LOOKUP_CASE)?;
+            if referenced.is_some_and(|column| is_interval_data_type(&column.attribute().data_type))
             {
                 return Err(foreign_key_refusal());
             }
@@ -291,11 +297,13 @@ fn add_table_key_companions(
 
 /// Whether the constraint's columns name an interval column.
 fn has_interval_column(columns: &[IndexColumn], refs: &IntervalRefs) -> bool {
-    columns.iter().any(|column| refs.is_ref(&column.column.expr))
+    columns.iter().any(|column| refs.is_bare_ref(&column.column.expr))
 }
 
 /// The companion of a UNIQUE or PRIMARY KEY over `columns`, keyed
-/// where a column is an interval.
+/// where a column is an interval. A column list may name its columns only
+/// bare, so a qualified entry, which PostgreSQL refuses, keeps its ordinary
+/// translation.
 fn companion_for_columns(
     declared: Option<String>,
     table: &str,
@@ -309,30 +317,24 @@ fn companion_for_columns(
         .filter_map(|column| {
             match &column.column.expr {
                 Expr::Identifier(ident) => Some(ident.value.clone()),
-                Expr::CompoundIdentifier(parts) if parts.len() == 2 => Some(parts[1].value.clone()),
                 _ => None,
             }
         })
         .collect();
-    let columns = columns
-        .iter()
-        .map(|column| {
-            let operand = &column.column.expr;
-            let expr = if refs.is_ref(operand) {
-                keys::key_expr(operand, &options.without_subqueries())?
-            } else {
-                operand.clone()
-            };
-            Ok(IndexColumn {
-                column: OrderByExpr {
-                    expr,
-                    options: column.column.options.clone(),
-                    with_fill: None,
-                },
-                operator_class: None,
-            })
-        })
-        .collect::<Result<Vec<_>, Error>>()?;
+    let declared_columns = columns;
+    let mut columns: Vec<IndexColumn> = Vec::with_capacity(declared_columns.len());
+    for column in declared_columns {
+        let operand = &column.column.expr;
+        let expr = if refs.is_bare_ref(operand) {
+            keys::key_expr(operand, &options.without_subqueries())?
+        } else {
+            operand.clone()
+        };
+        columns.push(IndexColumn {
+            column: OrderByExpr { expr, options: column.column.options.clone(), with_fill: None },
+            operator_class: None,
+        });
+    }
     let name = declared.unwrap_or_else(|| postgres_constraint_name(table, &names, primary_key));
     Ok(CompanionIndex { name, columns })
 }

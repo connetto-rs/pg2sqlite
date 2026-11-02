@@ -244,7 +244,8 @@ mod interval_typing {
     use sql_traits::prelude::ParserDB;
     use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
 
-    /// Whether `SELECT {expr_sql} FROM t` types the projection as an interval.
+    /// Whether `expr_sql`, typed in the scope of `SELECT iv FROM t`, is an
+    /// interval.
     fn interval_typed(expr_sql: &str) -> bool {
         let schema = ParserDB::parse::<PostgreSqlDialect>(
             "CREATE TABLE t (id int, iv interval, iv2 interval);",
@@ -253,24 +254,24 @@ mod interval_typing {
         let options = crate::options::TranslationContext::from_owned(
             crate::prelude::Pg2SqliteOptions::default(),
         );
-        let query =
-            Parser::parse_sql(&PostgreSqlDialect {}, &format!("SELECT {expr_sql} FROM t")).unwrap();
-        let sqlparser::ast::Statement::Query(query) = &query[0] else { panic!("expected query") };
-        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
-            panic!("expected select")
-        };
+        let query = Parser::new(&PostgreSqlDialect {})
+            .try_with_sql("SELECT iv FROM t")
+            .unwrap()
+            .parse_query()
+            .unwrap();
         let scope = sql_traits::structs::ColumnScope::from_query(
-            query,
+            &query,
             &schema,
             sql_traits::structs::IdentifierCase::AsWritten,
         )
         .unwrap();
         let scoped = options.with_scope(&scope);
-        let sqlparser::ast::SelectItem::UnnamedExpr(expr) = select.projection.first().unwrap()
-        else {
-            panic!("expected unnamed projection")
-        };
-        crate::impls::expression_type::is_interval_typed(expr, &schema, &scoped)
+        let expr = Parser::new(&PostgreSqlDialect {})
+            .try_with_sql(expr_sql)
+            .unwrap()
+            .parse_expr()
+            .unwrap();
+        crate::impls::expression_type::is_interval_typed(&expr, &schema, &scoped)
     }
 
     #[test]

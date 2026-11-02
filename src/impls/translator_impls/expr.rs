@@ -3550,9 +3550,9 @@ fn translate_binary_op(
         _ => {}
     }
 
-    if let Some(resolved) = interval_binary(left, op, right, schema, options, emit)? {
-        return Ok(resolved);
-    }
+    // Only the arithmetic refusal reaches this far; a comparison with an
+    // interval side answers through the call above.
+    interval_binary(left, op, right, schema, options, emit)?;
 
     // PG INTERVAL arithmetic: `target + INTERVAL 'N unit'` becomes
     // `datetime(target, '+M months', 'floor', '+D days', '+S seconds')`, and
@@ -4946,8 +4946,9 @@ mod tests {
     };
 
     use super::{
-        extract_query_from_tsquery, is_sqlite_fixed_offset, normalize_at_time_zone_modifier,
-        translate_any_all_to_in, translate_extract, translate_trim,
+        extract_query_from_tsquery, is_sqlite_fixed_offset, is_string_literal_spelling,
+        normalize_at_time_zone_modifier, translate_any_all_to_in, translate_extract,
+        translate_trim,
     };
     use crate::prelude::{Pg2SqliteOptions, Translator};
 
@@ -4961,6 +4962,13 @@ mod tests {
             .expect("sql should parse")
             .parse_expr()
             .expect("expression should parse")
+    }
+
+    #[test]
+    fn a_cast_or_call_is_not_a_string_literal_spelling() {
+        assert!(is_string_literal_spelling(&parse_expr("'1 day'")));
+        assert!(!is_string_literal_spelling(&parse_expr("id::text")));
+        assert!(!is_string_literal_spelling(&parse_expr("now()")));
     }
 
     #[test]
