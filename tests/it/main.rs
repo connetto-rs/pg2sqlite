@@ -105,6 +105,7 @@ mod test_identity_sequences;
 mod test_ilike_lower;
 mod test_index_clause_warnings;
 mod test_interval_arithmetic;
+mod test_interval_arithmetic_exact;
 mod test_interval_errors;
 mod test_interval_input;
 mod test_interval_notations;

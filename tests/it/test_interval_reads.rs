@@ -8,9 +8,9 @@
 //! fails here.
 
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use run_translated_helper::run_translated_with;
+use run_translated_helper::{first_column_text, run_translated_with};
 
-use crate::helpers::run_translated as run_translated_helper;
+use crate::helpers::{run_translated as run_translated_helper, translate::assert_refused};
 
 const SCHEMA: &str = "
 CREATE TABLE t (id int, iv interval, iv2 interval, ts timestamptz);
@@ -58,12 +58,7 @@ fn ids(query: &str) -> Vec<String> {
 /// Asserts that translating `pg` is refused, and that the refusal names
 /// `needle`.
 fn refused(pg: &str, needle: &str) {
-    let script = Pg2Sqlite::default()
-        .sql(&format!("{SCHEMA}\n{pg}"))
-        .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default());
-    let error = script.expect_err("should be refused at translation time");
-    assert!(error.to_string().contains(needle), "refusal {error} should name {needle}");
+    assert_refused(&format!("{SCHEMA}\n{pg}"), needle);
 }
 
 #[test]
@@ -367,25 +362,65 @@ fn a_timestamp_shift_by_a_literal_interval_keeps_working() {
 }
 
 #[test]
-fn interval_arithmetic_is_refused() {
-    refused("SELECT iv + iv2 FROM t;", "cannot be translated: the answer is an interval");
-    refused("SELECT iv * 2 FROM t;", "cannot be translated: the answer is an interval");
-    refused("SELECT 2 * iv FROM t;", "cannot be translated: the answer is an interval");
-    refused("SELECT iv / 2 FROM t;", "cannot be translated: the answer is an interval");
-    refused(
-        "SELECT iv + interval '1 day' FROM t;",
-        "cannot be translated: the answer is an interval",
+fn interval_addition_and_subtraction_answer_postgresqls_text() {
+    let got = run_translated_with(
+        &format!("{SCHEMA}\nSELECT (iv + iv2)::text FROM t ORDER BY id;"),
+        &Pg2SqliteOptions::default(),
+    );
+    assert_eq!(
+        got,
+        vec![
+            Some("1 day 24:00:00".to_string()),
+            Some("1 mon 30 days".to_string()),
+            Some("12 days".to_string()),
+        ]
+    );
+    let got = run_translated_with(
+        &format!("{SCHEMA}\nSELECT (iv + interval '1 day')::text FROM t ORDER BY id;"),
+        &Pg2SqliteOptions::default(),
+    );
+    assert_eq!(
+        got,
+        vec![
+            Some("2 days".to_string()),
+            Some("1 mon 1 day".to_string()),
+            Some("11 days".to_string()),
+        ]
     );
 }
 
 #[test]
-fn a_negated_interval_is_refused() {
-    refused("SELECT -iv FROM n;", "negating");
+fn interval_multiplication_and_division_are_refused() {
+    refused("SELECT iv * 2 FROM t;", "cannot be translated: the answer is an interval");
+    refused("SELECT 2 * iv FROM t;", "cannot be translated: the answer is an interval");
+    refused("SELECT iv / 2 FROM t;", "cannot be translated: the answer is an interval");
+}
+
+#[test]
+fn a_negated_interval_answers_postgresqls_text() {
+    let got = run_translated_with(
+        &format!("{SCHEMA}\nSELECT (-iv)::text FROM n ORDER BY id;"),
+        &Pg2SqliteOptions::default(),
+    );
+    assert_eq!(
+        got,
+        vec![
+            Some("1 day".to_string()),
+            Some("00:00:00".to_string()),
+            Some("-1 days".to_string()),
+            None,
+            Some("1 day -02:00:00".to_string()),
+        ]
+    );
 }
 
 #[test]
 fn interval_aggregates_and_field_reads_are_refused() {
-    refused("SELECT sum(iv) FROM t;", "sum over an interval cannot be translated");
+    let got = run_translated_with(
+        &format!("{SCHEMA}\nSELECT sum(iv)::text FROM t;"),
+        &Pg2SqliteOptions::default(),
+    );
+    assert_eq!(got, vec![Some("1 mon 11 days".to_string())]);
     refused("SELECT avg(iv) FROM t;", "avg over an interval cannot be translated");
     refused("SELECT extract(day FROM iv) FROM t;", "extract over an interval");
     refused("SELECT date_part('day', iv) FROM t;", "date_part over an interval");
@@ -790,19 +825,7 @@ fn run_with_failures(pg: &str, failing: &[&str]) -> Vec<Option<String>> {
     let mut prepared = connection
         .prepare(statements.last().expect("the script ends in a probe"))
         .unwrap_or_else(|error| panic!("probe failed: {error}"));
-    prepared
-        .query_map([], |row| {
-            Ok(match row.get_ref(0)? {
-                rusqlite::types::ValueRef::Null => None,
-                rusqlite::types::ValueRef::Integer(i) => Some(i.to_string()),
-                rusqlite::types::ValueRef::Real(f) => Some(f.to_string()),
-                rusqlite::types::ValueRef::Text(t) => Some(String::from_utf8_lossy(t).into_owned()),
-                rusqlite::types::ValueRef::Blob(b) => Some(format!("{b:?}")),
-            })
-        })
-        .unwrap()
-        .map(|cell| cell.unwrap())
-        .collect()
+    prepared.query_map([], first_column_text).unwrap().map(|cell| cell.unwrap()).collect()
 }
 
 #[test]
@@ -1697,7 +1720,7 @@ fn a_unique_over_an_interval_column_keeps_its_companion() {
 fn a_unique_beside_an_interval_arithmetic_column_is_refused() {
     refused(
         "CREATE TABLE uk_e (iv interval, iv2 interval, UNIQUE (iv, iv2 + '1 day'))",
-        "cannot be translated",
+        "scalar subquery",
     );
 }
 

@@ -11,6 +11,8 @@
 
 pub(crate) mod ddl;
 mod decode;
+pub(crate) mod fields;
+mod fields_templates;
 pub(crate) mod keys;
 mod keys_templates;
 

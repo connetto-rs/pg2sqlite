@@ -2,6 +2,22 @@
 
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
+/// Asserts that translating `pg` with default options is refused, and that
+/// the refusal names `needle`.
+///
+/// # Panics
+///
+/// Panics when parsing fails, when the translation succeeds, or when the
+/// refusal does not name `needle`.
+pub fn assert_refused(pg: &str, needle: &str) {
+    let error = Pg2Sqlite::default()
+        .sql(pg)
+        .expect("parse")
+        .translate_to_sql(&Pg2SqliteOptions::default())
+        .expect_err("should be refused at translation time");
+    assert!(error.to_string().contains(needle), "refusal {error} should name {needle}");
+}
+
 /// Translates `pg` SQL with default options and joins all emitted statements
 /// with newlines. Panics when parsing or translation fails.
 ///

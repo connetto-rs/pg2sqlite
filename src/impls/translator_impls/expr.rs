@@ -2845,8 +2845,16 @@ fn interval_binary(
         extract_interval_expr(right).is_some() || scalar_times_interval(right).is_some();
     if (right_shift && !left_typed) || (left_shift && !right_typed) {
         // A shift literal beside a non-interval target keeps its existing
-        // translation.
-        return Ok(None);
+        // translation, unless PostgreSQL's unknown-literal rule resolves the
+        // target as an interval itself.
+        let other = if right_shift { left } else { right };
+        if !crate::impls::interval::fields::is_interval_literal(other, schema, options)? {
+            return Ok(None);
+        }
+    }
+    if matches!(op, BinaryOperator::Plus | BinaryOperator::Minus) {
+        return crate::impls::interval::fields::binary(op, left, right, schema, options, emit)
+            .map(Some);
     }
     Err(crate::errors::Error::forward_refusal(format!(
         "{} {op} {} cannot be translated: the answer is an interval, and SQLite has no interval \
@@ -3552,7 +3560,9 @@ fn translate_binary_op(
 
     // Only the arithmetic refusal reaches this far; a comparison with an
     // interval side answers through the call above.
-    interval_binary(left, op, right, schema, options, emit)?;
+    if let Some(resolved) = interval_binary(left, op, right, schema, options, emit)? {
+        return Ok(resolved);
+    }
 
     // PG INTERVAL arithmetic: `target + INTERVAL 'N unit'` becomes
     // `datetime(target, '+M months', 'floor', '+D days', '+S seconds')`, and
@@ -4483,12 +4493,7 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                                 .to_string(),
                         ));
                     }
-                    return Err(crate::errors::Error::forward_refusal(
-                        "negating an interval cannot be translated: the answer is an interval, \
-                         and SQLite has no interval type to hold one. Negate it in the \
-                         application."
-                            .to_string(),
-                    ));
+                    return crate::impls::interval::fields::negated(expr, schema, options, emit);
                 }
                 rebuild(|| {
                     Ok(match op {
