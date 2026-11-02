@@ -175,6 +175,24 @@ fn revoke_of_role_membership_emits_lossy_drop_warning() {
 }
 
 #[test]
+fn alter_default_privileges_emits_lossy_drop_warning() {
+    let report = Pg2Sqlite::default()
+        .sql(
+            "CREATE ROLE app;\n\
+             ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO app;\n\
+             ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;",
+        )
+        .expect("parse")
+        .translate_with_report(&Pg2SqliteOptions::default())
+        .expect("translate");
+    assert_eq!(report.script.iter().count(), 0, "expected no SQLite statement");
+    assert_eq!(report.warnings.len(), 3);
+    assert_lossy_drop(&report.warnings[0], "CREATE ROLE");
+    assert_lossy_drop(&report.warnings[1], "ALTER DEFAULT PRIVILEGES");
+    assert_lossy_drop(&report.warnings[2], "ALTER DEFAULT PRIVILEGES");
+}
+
+#[test]
 fn alter_role_emits_lossy_drop_warning() {
     let warns = warnings_for("CREATE ROLE alice;\nALTER ROLE alice WITH SUPERUSER;");
     assert_eq!(warns.len(), 2);
