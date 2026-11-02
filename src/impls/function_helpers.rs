@@ -80,6 +80,23 @@ pub(crate) fn scalar_subquery_projection(expr: &Expr) -> Option<&Expr> {
     }
 }
 
+/// The subquery of PostgreSQL's array constructor `ARRAY(<subquery>)`.
+///
+/// sqlparser reads the constructor as a call named `array` whose argument is
+/// the subquery itself, a shape no ordinary call takes, since PostgreSQL wants
+/// `f((SELECT ...))` for a subquery argument.
+#[must_use]
+pub(crate) fn array_constructor_subquery(expr: &Expr) -> Option<&sqlparser::ast::Query> {
+    match expr {
+        Expr::Function(function @ Function { args: FunctionArguments::Subquery(query), .. })
+            if is_function_named(function, "array") =>
+        {
+            Some(query)
+        }
+        _ => None,
+    }
+}
+
 /// Create a numeric literal expression from a string representation.
 #[must_use]
 pub(crate) fn number_literal(n: &str) -> Expr {

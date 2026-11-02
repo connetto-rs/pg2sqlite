@@ -8,6 +8,7 @@ mod helpers;
 mod test_aggregate_ordered_set;
 mod test_aggregate_window_fixes;
 mod test_alter_table_columns;
+mod test_any_array_subquery;
 mod test_array_concat;
 mod test_array_containment;
 mod test_array_to_string_empty;

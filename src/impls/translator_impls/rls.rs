@@ -580,7 +580,8 @@ fn scrub_policy_stable_exprs(
             match expr {
                 Expr::Subquery(_)
                 | Expr::Exists { .. }
-                | Expr::In { target: InTarget::Subquery(_), .. } => {
+                | Expr::In { target: InTarget::Subquery(_), .. }
+                | Expr::Function(Function { args: FunctionArguments::Subquery(_), .. }) => {
                     *expr = Expr::Value(ValueWithSpan::from(Value::Boolean(true)));
                 }
                 Expr::Function(func)
@@ -870,17 +871,22 @@ fn collect_patterns_from_function(func: &Function, patterns: &mut Vec<SessionVar
         push_pattern_unique(patterns, pattern);
     }
 
-    if let FunctionArguments::List(arg_list) = &func.args {
-        for arg in &arg_list.args {
-            match arg {
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
-                | FunctionArg::Named { arg: FunctionArgExpr::Expr(expr), .. }
-                | FunctionArg::ExprNamed { arg: FunctionArgExpr::Expr(expr), .. } => {
-                    collect_session_variable_patterns(expr, patterns);
+    match &func.args {
+        FunctionArguments::List(arg_list) => {
+            for arg in &arg_list.args {
+                match arg {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))
+                    | FunctionArg::Named { arg: FunctionArgExpr::Expr(expr), .. }
+                    | FunctionArg::ExprNamed { arg: FunctionArgExpr::Expr(expr), .. } => {
+                        collect_session_variable_patterns(expr, patterns);
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
+        // `ARRAY(<subquery>)`, the one call sqlparser gives a bare subquery.
+        FunctionArguments::Subquery(query) => collect_patterns_from_query(query, patterns),
+        FunctionArguments::None => {}
     }
 
     if let Some(filter) = &func.filter {
@@ -1876,7 +1882,9 @@ fn rls_read_predicate(
 #[cfg_attr(feature = "std", recursive::recursive)]
 fn collect_subquery_tables(expr: &Expr, out: &mut Vec<String>) {
     match expr {
-        Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => {
+        Expr::Exists { subquery, .. }
+        | Expr::Subquery(subquery)
+        | Expr::Function(Function { args: FunctionArguments::Subquery(subquery), .. }) => {
             collect_query_tables(subquery, out);
         }
         Expr::In { target: InTarget::Subquery(subquery), expr: inner, .. } => {
