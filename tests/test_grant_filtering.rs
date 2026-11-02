@@ -69,8 +69,10 @@ mod helpers;
 use diesel::prelude::*;
 use helpers::{establish_connection, set_session_user_id};
 use pg2sqlite::{
+    errors::{Error, RefusalCategory},
     prelude::{Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation},
     traits::SessionVariableMapping,
+    warnings::TranslationWarning,
 };
 use rosetta_uuid::Uuid;
 
@@ -491,4 +493,51 @@ fn test_writable_insert_fails_wrong_user() -> Result<(), Box<dyn std::error::Err
     );
 
     Ok(())
+}
+
+/// PostgreSQL gives a table created after `ALTER DEFAULT PRIVILEGES ... ON
+/// TABLES` the privileges it names, so `app_user` can read `t` here. The grant
+/// model behind role filtering does not apply default privileges and would
+/// leave `t` out, so a role-scoped translation refuses the statement.
+#[test]
+fn role_scoped_translation_refuses_default_table_privileges() {
+    let error = Pg2Sqlite::default()
+        .sql(
+            "CREATE ROLE app_user;\n\
+             ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO app_user;\n\
+             CREATE TABLE t (id INTEGER PRIMARY KEY);",
+        )
+        .expect("parse")
+        .translate(&Pg2SqliteOptions::default().with_session_user_role("app_user"))
+        .expect_err("refused");
+    let Error::TranslationRefusal(refusal) = error else {
+        panic!("expected a structured translation refusal, got {error:?}");
+    };
+    assert_eq!(refusal.category(), RefusalCategory::UnrepresentableSemantics);
+    assert!(refusal.detail().contains("ALTER DEFAULT PRIVILEGES"), "{}", refusal.detail());
+}
+
+/// Default privileges on sequences decide nothing role filtering reads, so
+/// a role-scoped translation drops them and keeps the granted table.
+#[test]
+fn role_scoped_translation_drops_default_privileges_on_other_objects() {
+    let report = Pg2Sqlite::default()
+        .sql(
+            "CREATE ROLE app_user;\n\
+             ALTER DEFAULT PRIVILEGES GRANT USAGE ON SEQUENCES TO app_user;\n\
+             CREATE TABLE t (id INTEGER PRIMARY KEY);\n\
+             GRANT SELECT ON t TO app_user;",
+        )
+        .expect("parse")
+        .translate_with_report(&Pg2SqliteOptions::default().with_session_user_role("app_user"))
+        .expect("translate");
+    assert!(
+        report.script.iter().any(|statement| statement.to_string().starts_with("CREATE TABLE t")),
+        "{:?}",
+        report.script.iter().map(ToString::to_string).collect::<Vec<_>>()
+    );
+    assert!(report.warnings.iter().any(|warning| matches!(
+        warning,
+        TranslationWarning::LossyDrop { construct, .. } if construct == "ALTER DEFAULT PRIVILEGES"
+    )));
 }
