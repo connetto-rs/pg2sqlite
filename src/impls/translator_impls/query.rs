@@ -24,8 +24,7 @@ use sqlparser::ast::{
 };
 
 use super::helpers::{
-    Forward, translate_order_by_clause, translate_pipe_operators, translate_query_settings,
-    translate_with_clause,
+    Forward, translate_pipe_operators, translate_query_settings, translate_with_clause,
 };
 use crate::{
     impls::{
@@ -94,7 +93,13 @@ impl crate::traits::translator::TranslatorWithContext for Query {
                 None => super::cte::pin_output_names(with, source, scope),
             }
         }
-        let order_by = translate_order_by(query.order_by.as_ref(), schema, options, emit)?;
+        let order_by = translate_order_by(
+            query.order_by.as_ref(),
+            query.body.as_ref(),
+            schema,
+            options,
+            emit,
+        )?;
         let (limit_clause, fetch) = forward_translate_limit_and_fetch(
             query.limit_clause.as_ref(),
             query.fetch.as_ref(),
@@ -166,11 +171,18 @@ impl crate::traits::translator::TranslatorWithContext for Query {
 
 fn translate_order_by(
     order_by: Option<&OrderBy>,
+    body: &SetExpr,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Option<OrderBy>, crate::errors::Error> {
-    translate_order_by_clause(order_by, schema, options, emit)
+    let projection = match body {
+        SetExpr::Select(select) => Some(select.projection.as_slice()),
+        _ => None,
+    };
+    crate::impls::shared_helpers::translate_order_by_clause::<Forward>(
+        order_by, projection, schema, options, emit,
+    )
 }
 
 /// Build a `Query` envelope with the translated top-level clauses and the given
@@ -1005,12 +1017,25 @@ pub(crate) fn is_aggregate_call(func: &Function) -> bool {
     aggregate_function_name(func).is_some_and(|name| AGGREGATE_NAMES.contains(&name.as_str()))
 }
 
-#[cfg_attr(feature = "std", recursive::recursive)]
+/// True when `expr` contains an aggregate call without an `OVER` clause.
 fn is_aggregate_expression(expr: &Expr) -> bool {
+    contains_call(expr, &|func| func.over.is_none() && is_aggregate_call(func))
+}
+
+/// True when `expr` contains a call that settles which rows fall together,
+/// an aggregate without an `OVER` clause or any call with one.
+pub(crate) fn is_aggregate_or_window_expression(expr: &Expr) -> bool {
+    contains_call(expr, &|func| func.over.is_some() || is_aggregate_call(func))
+}
+
+/// True when `expr`, through operators, casts, `IS` tests and `CASE` arms,
+/// contains a call `matches` accepts.
+#[cfg_attr(feature = "std", recursive::recursive)]
+fn contains_call(expr: &Expr, matches: &dyn Fn(&Function) -> bool) -> bool {
     match expr {
-        Expr::Function(func) => func.over.is_none() && is_aggregate_call(func),
+        Expr::Function(func) => matches(func),
         Expr::BinaryOp { left, right, .. } => {
-            is_aggregate_expression(left) || is_aggregate_expression(right)
+            contains_call(left, matches) || contains_call(right, matches)
         }
         Expr::UnaryOp { expr, .. }
         | Expr::Nested(expr)
@@ -1020,12 +1045,12 @@ fn is_aggregate_expression(expr: &Expr) -> bool {
         | Expr::IsTrue(expr)
         | Expr::IsNotTrue(expr)
         | Expr::IsFalse(expr)
-        | Expr::IsNotFalse(expr) => is_aggregate_expression(expr),
+        | Expr::IsNotFalse(expr) => contains_call(expr, matches),
         Expr::Case { conditions, else_result, .. } => {
             conditions.iter().any(|case_when| {
-                is_aggregate_expression(&case_when.condition)
-                    || is_aggregate_expression(&case_when.result)
-            }) || else_result.as_ref().is_some_and(|result| is_aggregate_expression(result))
+                contains_call(&case_when.condition, matches)
+                    || contains_call(&case_when.result, matches)
+            }) || else_result.as_ref().is_some_and(|result| contains_call(result, matches))
         }
         _ => false,
     }
@@ -1317,6 +1342,7 @@ fn translate_group_by(
 ) -> Result<sqlparser::ast::GroupByExpr, crate::errors::Error> {
     crate::impls::shared_helpers::translate_group_by_expr::<Forward>(
         group_by,
+        None,
         schema,
         options,
         &mut |_| {},
@@ -1544,30 +1570,31 @@ mod tests {
 
     #[test]
     fn low_level_translation_helpers_cover_remaining_variants() {
-        let schema = empty_schema();
-        let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
+        let s = empty_schema();
+        let o = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
 
-        let order_by_all = Some(sqlparser::ast::OrderBy {
+        let ob = Some(sqlparser::ast::OrderBy {
             kind: sqlparser::ast::OrderByKind::All(sqlparser::ast::OrderByOptions {
                 sort: Some(sqlparser::ast::OrderBySort::Asc),
                 nulls_first: Some(false),
             }),
             interpolate: None,
         });
-        let _ = translate_order_by(order_by_all.as_ref(), &schema, &options, &mut |_| {}).unwrap();
+        let b = parse_query("SELECT a FROM t").body;
+        let _ = translate_order_by(ob.as_ref(), b.as_ref(), &s, &o, &mut |_| {}).unwrap();
 
         let offset_comma_limit = Some(sqlparser::ast::LimitClause::OffsetCommaLimit {
             offset: parse_expr("5"),
             limit: parse_expr("10"),
         });
-        let _ = translate_limit_clause(offset_comma_limit.as_ref(), &schema, &options).unwrap();
+        let _ = translate_limit_clause(offset_comma_limit.as_ref(), &s, &o).unwrap();
 
         let distinct_on = Some(Distinct::On(vec![parse_expr("a")]));
-        let err = translate_distinct(distinct_on.as_ref(), &schema, &options).unwrap_err();
+        let err = translate_distinct(distinct_on.as_ref(), &s, &o).unwrap_err();
         assert!(err.to_string().contains("DISTINCT ON"), "unexpected error: {err}");
 
         let group_by_all = GroupByExpr::All(vec![]);
-        let translated = super::translate_group_by(&group_by_all, &schema, &options).unwrap();
+        let translated = super::translate_group_by(&group_by_all, &s, &o).unwrap();
         assert!(matches!(translated, GroupByExpr::All(_)));
     }
 
@@ -1722,6 +1749,7 @@ mod tests {
         assert!(is_aggregate_expression(&parse_expr("bool_or(active)")));
         assert!(is_aggregate_expression(&parse_expr("every(active)")));
         assert!(is_aggregate_expression(&parse_expr("CASE WHEN 1=1 THEN avg(v) ELSE 0 END")));
+        assert!(is_aggregate_expression(&parse_expr("CASE WHEN max(v) > 1 THEN 2 ELSE 3 END")));
         assert!(is_aggregate_expression(&parse_expr("NOT max(v)")));
         assert!(is_aggregate_expression(&parse_expr("(max(v))")));
         assert!(is_aggregate_expression(&parse_expr("max(v)::INT")));

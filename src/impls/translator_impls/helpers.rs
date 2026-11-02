@@ -13,9 +13,7 @@ use alloc::{
 };
 
 use sql_traits::structs::ParserDB;
-use sqlparser::ast::{
-    Expr, OrderBy, PipeOperator, Query, Setting, TableWithJoins, WindowType, With,
-};
+use sqlparser::ast::{Expr, PipeOperator, Query, Setting, TableWithJoins, WindowType, With};
 
 use crate::{
     errors::Error,
@@ -131,6 +129,5 @@ define_direction_wrappers! {
     fn translate_query_settings(settings: Option<&Vec<Setting>>) -> Option<Vec<Setting>> = translate_query_settings;
     fn translate_pipe_operators(pipe_operators: &[PipeOperator]) -> Vec<PipeOperator> = translate_pipe_operators;
     fn translate_with_clause(with: Option<&With>) -> Option<With> = translate_with_clause;
-    fn translate_order_by_clause(order_by: Option<&OrderBy>) -> Option<OrderBy> = translate_order_by_clause;
     fn translate_window_type(over: Option<&WindowType>) -> Option<WindowType> = translate_window_type;
 }

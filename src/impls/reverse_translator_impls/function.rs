@@ -957,7 +957,7 @@ fn build_reverse_function(
         within_group: func
             .within_group
             .iter()
-            .map(|e| translate_order_by_expr::<Reverse>(e, schema, options, &mut |_| {}))
+            .map(|e| translate_order_by_expr::<Reverse>(e, None, schema, options, &mut |_| {}))
             .collect::<Result<Vec<_>, _>>()?,
     }))
 }

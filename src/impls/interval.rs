@@ -9,7 +9,10 @@
 //! seconds'`, where `floor` is SQLite's month-end clamp (3.46.0, the declared
 //! floor).
 
+pub(crate) mod ddl;
 mod decode;
+pub(crate) mod keys;
+mod keys_templates;
 
 #[cfg(not(feature = "std"))]
 use alloc::{
@@ -18,8 +21,9 @@ use alloc::{
     vec::Vec,
 };
 
-use decode::{Decoded, Interval, Refusal, Typmod, TypmodFields, interval_in};
-use sqlparser::ast::{DateTimeField, IntervalFields};
+pub(crate) use decode::Typmod;
+use decode::{Decoded, Interval, Refusal, TypmodFields, interval_in};
+use sqlparser::ast::{DataType, DateTimeField, IntervalFields};
 
 use crate::{errors::Error, impls::function_helpers::single_quoted_literal};
 
@@ -148,6 +152,71 @@ fn finite_interval(text: &str, typmod: Option<Typmod>) -> Result<Interval, Error
              for an infinite interval."
             )))
         }
+    }
+}
+
+/// The fixed-width comparison key of `interval`, whose byte order is
+/// PostgreSQL's `interval_cmp_value` order over `(months, days, micros)`.
+///
+/// The span is one 12-digit day count and one 11-digit within-day microsecond
+/// count. Day counts carry a `1e11` offset, so a finite key is always
+/// positive and `-infinity`, twenty-three `0`s, sorts below every one while
+/// `infinity`, twenty-three `9`s, sorts above every one.
+fn comparison_key(interval: &Interval) -> String {
+    const MICROS_PER_DAY: i64 = 86_400_000_000;
+    // i32 to i64 widens with sign preserved, so no digit is lost.
+    let months_days = i64::from(interval.months) * 30 + i64::from(interval.days);
+    let micros = interval.micros;
+    format!(
+        "{:012}{:011}",
+        months_days + micros.div_euclid(MICROS_PER_DAY) + 100_000_000_000,
+        micros.rem_euclid(MICROS_PER_DAY),
+    )
+}
+
+/// The comparison key of the finite interval PostgreSQL reads `text` as, or
+/// the refusal it answers.
+pub(crate) fn literal_comparison_key(text: &str, typmod: Option<Typmod>) -> Result<String, Error> {
+    Ok(comparison_key(&finite_interval(text, typmod)?))
+}
+
+/// The text PostgreSQL stores for the finite interval it reads `text` as, or
+/// the refusal it answers.
+pub(crate) fn literal_text(text: &str, typmod: Option<Typmod>) -> Result<String, Error> {
+    Ok(postgres_text(&finite_interval(text, typmod)?))
+}
+
+/// Whether a data type declares an interval value, typmod or no.
+pub(crate) fn is_interval_data_type(data_type: &DataType) -> bool {
+    matches!(data_type, DataType::Interval { .. })
+}
+
+/// Whether a data type declares an array of interval values, any element
+/// spelling.
+pub(crate) fn is_interval_array_data_type(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Array(element) => {
+            match element {
+                sqlparser::ast::ArrayElemTypeDef::None => false,
+                sqlparser::ast::ArrayElemTypeDef::AngleBracket(element)
+                | sqlparser::ast::ArrayElemTypeDef::SquareBracket(element, _)
+                | sqlparser::ast::ArrayElemTypeDef::Parenthesis(element)
+                | sqlparser::ast::ArrayElemTypeDef::ParenthesisNotNull(element)
+                | sqlparser::ast::ArrayElemTypeDef::Qualified(element, _) => {
+                    is_interval_data_type(element)
+                }
+            }
+        }
+        _ => false,
+    }
+}
+
+/// The typmod an `interval` data type declaration keeps, or `None` for any
+/// other type.
+pub(crate) fn interval_data_type_typmod(data_type: &DataType) -> Result<Option<Typmod>, Error> {
+    match data_type {
+        DataType::Interval { fields, precision } => data_type_typmod(fields.as_ref(), *precision),
+        _ => Ok(None),
     }
 }
 
@@ -284,4 +353,25 @@ fn clock_text(micros: i64) -> String {
         return clock;
     }
     format!("{clock}.{}", format!("{fraction:06}").trim_end_matches('0'))
+}
+
+#[cfg(test)]
+mod data_type_readers {
+    use sqlparser::ast::{ArrayElemTypeDef, DataType};
+
+    use super::{interval_data_type_typmod, is_interval_array_data_type};
+
+    /// An element-less array type and a non-array type are not interval
+    /// arrays.
+    #[test]
+    fn types_without_an_interval_element_are_not_interval_arrays() {
+        assert!(!is_interval_array_data_type(&DataType::Array(ArrayElemTypeDef::None)));
+        assert!(!is_interval_array_data_type(&DataType::Text));
+    }
+
+    /// A non-interval type carries no typmod.
+    #[test]
+    fn a_non_interval_type_carries_no_typmod() {
+        assert_eq!(interval_data_type_typmod(&DataType::Text).unwrap(), None);
+    }
 }
