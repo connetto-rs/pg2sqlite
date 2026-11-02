@@ -97,3 +97,12 @@ fn a_separated_aggregate_round_trips_unchanged() {
     let restored = reverse(&sqlite);
     assert!(restored.contains("string_agg(name, '|')"), "{restored}");
 }
+
+/// The `WITHIN GROUP` order clause survives the reverse of a separated
+/// `group_concat`, which PostgreSQL answers with `string_agg`.
+#[test]
+fn a_within_group_order_clause_survives_the_reverse() {
+    let sql = reverse("SELECT group_concat(name, ',') WITHIN GROUP (ORDER BY id) FROM tags");
+    assert!(sql.contains("WITHIN GROUP"), "{sql}");
+    assert!(sql.contains("string_agg(name, ',')"), "{sql}");
+}

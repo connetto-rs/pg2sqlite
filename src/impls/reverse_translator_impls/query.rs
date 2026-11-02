@@ -334,6 +334,7 @@ mod tests {
 
         let group_by = crate::impls::shared_helpers::translate_group_by_expr::<Reverse>(
             &select.group_by,
+            Some(&select.projection),
             &schema,
             &options,
             &mut |_| {},

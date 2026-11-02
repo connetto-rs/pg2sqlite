@@ -23,13 +23,13 @@ use sqlparser::ast::{
     FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList, FunctionArguments, GeneratedAs,
     GroupByExpr, HavingBound, Ident, InTarget, Join, JoinConstraint, JoinOperator, LimitClause,
     ListAggOnOverflow, Measure, NamedWindowDefinition, NamedWindowExpr, ObjectName, ObjectNamePart,
-    OrderBy, OrderByExpr, OrderByKind, PipeOperator, PivotValueSource, Query, SelectItem, SetExpr,
-    SetOperator, SetQuantifier, Setting, Statement, SymbolDefinition, TableAlias, TableFactor,
-    TableFunctionArgs, TableSample, TableSampleBucket, TableSampleKind, TableSampleQuantity,
-    TableVersion, TableWithJoins, UnaryOperator, UpdateTableFromKind, Value, ValueWithSpan, Values,
-    Visit, Visitor, WindowFrame, WindowFrameBound, WindowFrameUnits, WindowSpec, WindowType, With,
-    WithFill, XmlNamespaceDefinition, XmlPassingArgument, XmlPassingClause, XmlTableColumn,
-    XmlTableColumnOption, visit_expressions,
+    OrderBy, OrderByExpr, OrderByKind, PipeOperator, PivotValueSource, Query, Select, SelectItem,
+    SetExpr, SetOperator, SetQuantifier, Setting, Statement, SymbolDefinition, TableAlias,
+    TableFactor, TableFunctionArgs, TableSample, TableSampleBucket, TableSampleKind,
+    TableSampleQuantity, TableVersion, TableWithJoins, UnaryOperator, UpdateTableFromKind, Value,
+    ValueWithSpan, Values, Visit, Visitor, WindowFrame, WindowFrameBound, WindowFrameUnits,
+    WindowSpec, WindowType, With, WithFill, XmlNamespaceDefinition, XmlPassingArgument,
+    XmlPassingClause, XmlTableColumn, XmlTableColumnOption, visit_expressions,
 };
 
 use crate::{
@@ -533,6 +533,40 @@ pub(crate) fn query_output_find<T>(
         }
         Ok(None)
     })
+}
+
+/// Whether any known output of `query` answers `Some` through `read_column`
+/// or `read_expression`, reading the scope `query` itself declares. Unlike
+/// [`query_output_find`], the scope is built from `query` rather than the
+/// enclosing statement, so a `query` the statement does not contain answers.
+///
+/// # Errors
+///
+/// Propagates the refusal a scope that cannot be built answers, and the error
+/// `read_expression` answers.
+pub(crate) fn query_output_carries<T>(
+    query: &Query,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    read_column: impl Fn(&sqlparser::ast::ColumnDef) -> Option<T>,
+    read_expression: impl Fn(
+        &Expr,
+        &ParserDB,
+        &crate::options::TranslationContext<'_>,
+    ) -> Result<Option<T>, Error>,
+) -> Result<bool, Error> {
+    let graph =
+        ColumnScope::from_query(query, schema, sql_traits::structs::IdentifierCase::AsWritten)?;
+    let outputs = graph.scope_for_query(query).map(|scope| scope.outputs()).into_iter().flatten();
+    for output in outputs {
+        if let QueryOutput::Column { definition, .. } = output
+            && definition_find(&definition, schema, options, &read_column, &read_expression)?
+                .is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Reads the first output column of `query`, the value a scalar subquery
@@ -2265,8 +2299,11 @@ pub(crate) fn translate_on_conflict_do_update<D: TranslationDirection>(
     }))
 }
 
-/// Translates the `WHERE` predicate of a column conflict target, which picks a
-/// partial unique index as the arbiter in both dialects.
+/// Translates the `WHERE` predicate of a column conflict target, which picks
+/// a partial unique index as the arbiter in both dialects. The predicate
+/// translates without subqueries, since SQLite compares it structurally
+/// against the partial index's own predicate, which carries the inline key
+/// the DDL emits.
 pub(crate) fn translate_conflict_predicate<D: TranslationDirection>(
     conflict_target: &mut Option<sqlparser::ast::ConflictTarget>,
     schema: &ParserDB,
@@ -2276,7 +2313,18 @@ pub(crate) fn translate_conflict_predicate<D: TranslationDirection>(
     if let Some(sqlparser::ast::ConflictTarget::Columns { predicate: Some(predicate), .. }) =
         conflict_target
     {
-        *predicate = D::translate_expr(predicate, schema, options, emit)?;
+        if D::IS_FORWARD {
+            let ctx = required_forward_context::<D>(options);
+            let without = ctx.without_subqueries();
+            *predicate = <sqlparser::ast::Expr as crate::traits::translator::TranslatorWithContext>::translate_with_warnings(
+                predicate,
+                schema,
+                &without,
+                emit,
+            )?;
+        } else {
+            *predicate = D::translate_expr(predicate, schema, options, emit)?;
+        }
     }
     Ok(())
 }
@@ -2541,7 +2589,7 @@ pub(crate) fn translate_delete_core<D: TranslationDirection>(
     let order_by = delete
         .order_by
         .iter()
-        .map(|expr| translate_order_by_expr::<D>(expr, schema, options, emit))
+        .map(|expr| translate_order_by_expr::<D>(expr, None, schema, options, emit))
         .collect::<Result<Vec<_>, _>>()?;
     let limit = delete
         .limit
@@ -2818,6 +2866,7 @@ fn translate_with_fill<D: TranslationDirection>(
 
 pub(crate) fn translate_order_by_expr<D: TranslationDirection>(
     order_by_expr: &OrderByExpr,
+    projection: Option<&[sqlparser::ast::SelectItem]>,
     schema: &ParserDB,
     options: &D::Options<'_>,
     emit: crate::warnings::WarningSink<'_>,
@@ -2836,8 +2885,24 @@ pub(crate) fn translate_order_by_expr<D: TranslationDirection>(
         order_by_expr.options.clone()
     };
 
+    let key = D::forward_context(options)
+        .map(|ctx| {
+            crate::impls::interval::keys::position_key(
+                &order_by_expr.expr,
+                projection,
+                false,
+                schema,
+                ctx,
+                emit,
+            )
+        })
+        .transpose()?
+        .flatten();
     Ok(OrderByExpr {
-        expr: D::translate_expr(&order_by_expr.expr, schema, options, emit)?,
+        expr: match key {
+            Some(key) => key,
+            None => D::translate_expr(&order_by_expr.expr, schema, options, emit)?,
+        },
         options: options_out,
         with_fill: order_by_expr
             .with_fill
@@ -2879,7 +2944,7 @@ fn translate_pivot_value_source<D: TranslationDirection>(
                 order_by
                     .iter()
                     .map(|order_by_expr| {
-                        translate_order_by_expr::<D>(order_by_expr, schema, options, emit)
+                        translate_order_by_expr::<D>(order_by_expr, None, schema, options, emit)
                     })
                     .collect::<Result<Vec<_>, _>>()?,
             )
@@ -2943,7 +3008,7 @@ fn translate_pipe_operator<D: TranslationDirection>(
             PipeOperator::OrderBy {
                 exprs: exprs
                     .iter()
-                    .map(|expr| translate_order_by_expr::<D>(expr, schema, options, emit))
+                    .map(|expr| translate_order_by_expr::<D>(expr, None, schema, options, emit))
                     .collect::<Result<Vec<_>, _>>()?,
             }
         }
@@ -3128,6 +3193,7 @@ pub(crate) fn translate_with_clause<D: TranslationDirection>(
 
 pub(crate) fn translate_order_by_clause<D: TranslationDirection>(
     order_by: Option<&OrderBy>,
+    projection: Option<&[sqlparser::ast::SelectItem]>,
     schema: &ParserDB,
     options: &D::Options<'_>,
     emit: crate::warnings::WarningSink<'_>,
@@ -3139,7 +3205,11 @@ pub(crate) fn translate_order_by_clause<D: TranslationDirection>(
                     OrderByKind::Expressions(
                         exprs
                             .iter()
-                            .map(|expr| translate_order_by_expr::<D>(expr, schema, options, emit))
+                            .map(|expr| {
+                                translate_order_by_expr::<D>(
+                                    expr, projection, schema, options, emit,
+                                )
+                            })
                             .collect::<Result<Vec<_>, _>>()?,
                     )
                 }
@@ -3249,6 +3319,7 @@ pub(crate) fn translate_fetch_clause<D: TranslationDirection>(
 
 pub(crate) fn translate_group_by_expr<D: TranslationDirection>(
     group_by: &GroupByExpr,
+    projection: Option<&[sqlparser::ast::SelectItem]>,
     schema: &ParserDB,
     options: &D::Options<'_>,
     emit: crate::warnings::WarningSink<'_>,
@@ -3258,13 +3329,45 @@ pub(crate) fn translate_group_by_expr<D: TranslationDirection>(
             GroupByExpr::Expressions(
                 exprs
                     .iter()
-                    .map(|e| D::translate_expr(e, schema, options, emit))
+                    .map(|e| {
+                        let key = D::forward_context(options)
+                            .map(|ctx| {
+                                crate::impls::interval::keys::position_key(
+                                    e, projection, true, schema, ctx, emit,
+                                )
+                            })
+                            .transpose()?
+                            .flatten();
+                        Ok::<Expr, Error>(match key {
+                            Some(key) => key,
+                            None => D::translate_expr(e, schema, options, emit)?,
+                        })
+                    })
                     .collect::<Result<Vec<_>, _>>()?,
                 modifiers.clone(),
             )
         }
         GroupByExpr::All(all) => GroupByExpr::All(all.clone()),
     })
+}
+
+/// The `PARTITION BY` expression of a window: the position key over an
+/// interval operand, or the plain translation.
+///
+/// # Errors
+///
+/// Propagates the key's refusal or the plain translation's.
+fn window_partition_expr<D: TranslationDirection>(
+    e: &Expr,
+    schema: &ParserDB,
+    options: &D::Options<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Expr, Error> {
+    let Some(ctx) = D::forward_context(options) else {
+        return D::translate_expr(e, schema, options, emit);
+    };
+    crate::impls::interval::keys::position_key(e, None, false, schema, ctx, emit)?
+        .map_or_else(|| D::translate_expr(e, schema, options, emit), Ok)
 }
 
 pub(crate) fn translate_window_spec<D: TranslationDirection>(
@@ -3278,12 +3381,12 @@ pub(crate) fn translate_window_spec<D: TranslationDirection>(
         partition_by: spec
             .partition_by
             .iter()
-            .map(|e| D::translate_expr(e, schema, options, emit))
+            .map(|e| window_partition_expr::<D>(e, schema, options, emit))
             .collect::<Result<Vec<_>, _>>()?,
         order_by: spec
             .order_by
             .iter()
-            .map(|e| translate_order_by_expr::<D>(e, schema, options, emit))
+            .map(|e| translate_order_by_expr::<D>(e, None, schema, options, emit))
             .collect::<Result<Vec<_>, _>>()?,
         window_frame: spec
             .window_frame
@@ -3414,7 +3517,7 @@ fn translate_function_argument_clause<D: TranslationDirection>(
             FunctionArgumentClause::OrderBy(
                 order_by_exprs
                     .iter()
-                    .map(|e| translate_order_by_expr::<D>(e, schema, options, emit))
+                    .map(|e| translate_order_by_expr::<D>(e, None, schema, options, emit))
                     .collect::<Result<Vec<_>, _>>()?,
             )
         }
@@ -3870,7 +3973,13 @@ fn translate_select_with_from<D: TranslationDirection>(
         lateral_views: Vec::new(),
         prewhere,
         selection,
-        group_by: translate_group_by_expr::<D>(&select.group_by, schema, options, emit)?,
+        group_by: translate_group_by_expr::<D>(
+            &select.group_by,
+            Some(&select.projection),
+            schema,
+            options,
+            emit,
+        )?,
         cluster_by: Vec::new(),
         distribute_by: Vec::new(),
         sort_by: Vec::new(),
@@ -3886,6 +3995,16 @@ fn translate_select_with_from<D: TranslationDirection>(
         select_modifiers: select.select_modifiers.clone(),
     };
 
+    if D::IS_FORWARD
+        && let Some(rewritten) = crate::impls::interval::keys::distinct_select(
+            select,
+            &translated,
+            schema,
+            required_forward_context::<D>(options),
+        )?
+    {
+        return Ok(rewritten);
+    }
     // Hooked here so DISTINCT ON and GROUPING SETS rewrites that call this
     // helper directly also receive spatial rewriting.
     if D::IS_FORWARD
@@ -3984,6 +4103,11 @@ pub(crate) fn translate_set_expr_shared<D: TranslationDirection>(
                              Use {op} without the ALL quantifier for the deduplicating form."
                 )));
             }
+            if D::IS_FORWARD
+                && !matches!(set_quantifier, SetQuantifier::All | SetQuantifier::AllByName)
+            {
+                refuse_set_operation_over_interval::<D>(*op, left, right, schema, options)?;
+            }
             let mut translated_left = translate_set_expr_shared::<D>(left, schema, options, emit)?;
             let mut translated_right =
                 translate_set_expr_shared::<D>(right, schema, options, emit)?;
@@ -4022,6 +4146,160 @@ pub(crate) fn translate_set_expr_shared<D: TranslationDirection>(
     })
 }
 
+/// The refusal a deduplicating set operation over an interval column
+/// answers: the deduplication would run on the stored text, where equivalent
+/// spellings of one interval are not one row.
+///
+/// # Errors
+///
+/// Propagates the refusal a scope that cannot be built answers.
+fn refuse_set_operation_over_interval<D: TranslationDirection>(
+    op: SetOperator,
+    left: &SetExpr,
+    right: &SetExpr,
+    schema: &ParserDB,
+    options: &D::Options<'_>,
+) -> Result<(), Error> {
+    let options = required_forward_context::<D>(options);
+    for branch in [left, right] {
+        if set_branch_output_carries_interval(branch, schema, options)? {
+            return Err(Error::forward_refusal(format!(
+                "{op} over an interval column cannot be translated: the deduplication would run \
+                 on the stored text, where equivalent spellings of one interval are not one row, \
+                 and the key that settles interval equality is a scalar subquery SQLite does not \
+                 allow in a set operation. Run the set operation in the application."
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Whether a select projects a column of its single `VALUES` relation that
+/// any row settles to the `interval` type. PostgreSQL settles the column on
+/// the type of any row, and the scope leaves a `VALUES` column opaque, so
+/// `query_output_carries` cannot read the type off the relation.
+fn values_relation_carries_interval(
+    select: &Select,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> bool {
+    let [TableWithJoins { relation, joins }] = select.from.as_slice() else {
+        return false;
+    };
+    if !joins.is_empty() {
+        return false;
+    }
+    let TableFactor::Derived { subquery, alias, .. } = relation else {
+        return false;
+    };
+    let Some((values, first)) = (match subquery.body.as_ref() {
+        SetExpr::Values(values) => values.rows.first().map(|first| (values, first)),
+        _ => None,
+    }) else {
+        return false;
+    };
+    let names: Vec<String> = (0..first.len())
+        .map(|position| {
+            alias
+                .as_ref()
+                .and_then(|alias| alias.columns.get(position))
+                .map_or_else(|| format!("column{}", position + 1), |name| name.name.value.clone())
+        })
+        .collect();
+    let settled: Vec<bool> = names
+        .iter()
+        .enumerate()
+        .map(|(position, _)| {
+            values.rows.iter().any(|row| {
+                row.content.get(position).is_some_and(|expr| {
+                    crate::impls::expression_type::is_interval_typed(expr, schema, options)
+                })
+            })
+        })
+        .collect();
+    let relation_name = alias.as_ref().map(|alias| &alias.name.value);
+    let matches = |written: &Ident, stored: &str| {
+        if written.quote_style.is_none() {
+            stored.eq_ignore_ascii_case(&written.value)
+        } else {
+            stored == written.value
+        }
+    };
+    select.projection.iter().any(|item| {
+        let (SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. }) = item else {
+            return false;
+        };
+        let position = match strip_nesting(expr) {
+            Expr::Identifier(ident) => {
+                if options.is_variable(&ident.value) {
+                    return false;
+                }
+                names.iter().position(|name| matches(ident, name))
+            }
+            Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+                let Some(relation_name) = relation_name else {
+                    return false;
+                };
+                if !matches(&parts[0], relation_name) {
+                    return false;
+                }
+                names.iter().position(|name| matches(&parts[1], name))
+            }
+            _ => None,
+        };
+        position.is_some_and(|position| settled[position])
+    })
+}
+
+/// Whether a set-operation branch's output carries an interval column,
+/// following a parenthesized query or a nested set operation down to the
+/// branch that names its outputs.
+///
+/// # Errors
+///
+/// Propagates the refusal a scope that cannot be built answers.
+pub(crate) fn set_branch_output_carries_interval(
+    branch: &SetExpr,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<bool, Error> {
+    match branch {
+        SetExpr::SetOperation { left, right, .. } => {
+            Ok(set_branch_output_carries_interval(left, schema, options)?
+                || set_branch_output_carries_interval(right, schema, options)?)
+        }
+        SetExpr::Query(query) => {
+            set_branch_output_carries_interval(query.body.as_ref(), schema, options)
+        }
+        SetExpr::Select(select) => {
+            let query = crate::impls::query_builder::make_query(
+                None,
+                SetExpr::Select(Box::new(select.as_ref().clone())),
+            );
+            Ok(query_output_carries(
+                &query,
+                schema,
+                options,
+                |column| {
+                    crate::impls::interval::is_interval_data_type(&column.data_type).then_some(())
+                },
+                |expr, schema, options| {
+                    Ok(crate::impls::expression_type::is_interval_typed(expr, schema, options)
+                        .then_some(()))
+                },
+            )? || values_relation_carries_interval(select.as_ref(), schema, options))
+        }
+        SetExpr::Values(values) => {
+            Ok(values.rows.iter().any(|row| {
+                row.content.iter().any(|expr| {
+                    crate::impls::expression_type::is_interval_typed(expr, schema, options)
+                })
+            }))
+        }
+        _ => Ok(false),
+    }
+}
+
 /// Shared `Query` translation. Forward strips row locks and `for_clause`.
 /// Callers may apply DISTINCT ON and GROUPING SETS rewrites first.
 pub(crate) fn translate_query_shared<D: TranslationDirection>(
@@ -4030,7 +4308,12 @@ pub(crate) fn translate_query_shared<D: TranslationDirection>(
     options: &D::Options<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Query, Error> {
-    let order_by = translate_order_by_clause::<D>(query.order_by.as_ref(), schema, options, emit)?;
+    let projection = match query.body.as_ref() {
+        sqlparser::ast::SetExpr::Select(select) => Some(select.projection.as_slice()),
+        _ => None,
+    };
+    let order_by =
+        translate_order_by_clause::<D>(query.order_by.as_ref(), projection, schema, options, emit)?;
     let settings = translate_query_settings::<D>(query.settings.as_ref(), schema, options, emit)?;
     let pipe_operators =
         translate_pipe_operators::<D>(&query.pipe_operators, schema, options, emit)?;
@@ -4709,7 +4992,7 @@ pub(crate) fn translate_table_factor<D: TranslationDirection>(
                 order_by: order_by
                     .iter()
                     .map(|order_by_expr| {
-                        translate_order_by_expr::<D>(order_by_expr, schema, options, emit)
+                        translate_order_by_expr::<D>(order_by_expr, None, schema, options, emit)
                     })
                     .collect::<Result<Vec<_>, _>>()?,
                 measures: measures
@@ -4930,8 +5213,8 @@ mod tests {
         ast::{
             Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgOperator,
             FunctionArgumentList, FunctionArguments, Ident, JoinConstraint, JoinOperator,
-            ObjectName, ObjectNamePart, Query, SelectItem, SetExpr, Statement, TableFactor,
-            ValueWithSpan,
+            ObjectName, ObjectNamePart, PivotValueSource, Query, SelectItem, SetExpr, Statement,
+            TableFactor, ValueWithSpan,
         },
         dialect::PostgreSqlDialect,
         parser::Parser,
@@ -4939,11 +5222,12 @@ mod tests {
 
     use super::{
         ColumnReferences, TranslationDirection, extract_columns_from_expr,
-        extract_columns_from_function, translate_join, translate_join_constraint,
-        translate_join_operator, translate_returning, translate_select_item,
-        translate_table_factor, translate_table_with_joins,
+        extract_columns_from_function, query_output_carries, translate_join,
+        translate_join_constraint, translate_join_operator, translate_pipe_operator,
+        translate_pivot_value_source, translate_returning, translate_select_item,
+        translate_table_factor, translate_table_with_joins, values_relation_carries_interval,
     };
-    use crate::{errors::Error, prelude::Pg2SqliteOptions};
+    use crate::{errors::Error, impls::translator_impls::Forward, prelude::Pg2SqliteOptions};
 
     struct IdentityDirection;
 
@@ -5083,6 +5367,14 @@ mod tests {
             Statement::Query(query) => *query,
             other => panic!("expected query statement, got: {other:?}"),
         }
+    }
+
+    /// The schema every position-key test resolves `iv` against.
+    fn interval_schema() -> ParserDB {
+        let stmts =
+            Parser::parse_sql(&PostgreSqlDialect {}, "CREATE TABLE t (id int, iv interval)")
+                .unwrap();
+        ParserDB::from_statements(stmts, "test".to_string()).unwrap()
     }
 
     #[test]
@@ -5365,5 +5657,142 @@ mod tests {
             .expect("no numeric scale to read"),
             crate::manifest::ColumnStorage::Direct
         );
+    }
+
+    /// The forward shape an `ORDER BY` over an interval operand settles on:
+    /// the position key for the expression and the ASC nulls-last default.
+    fn expected_order_by_over_interval(
+        order_by_expr: &sqlparser::ast::OrderByExpr,
+        schema: &ParserDB,
+        options: &crate::options::TranslationContext<'_>,
+    ) -> sqlparser::ast::OrderByExpr {
+        use crate::impls::interval::keys::position_key;
+
+        let expr = position_key(&order_by_expr.expr, None, false, schema, options, &mut |_| {})
+            .expect("the position key settles")
+            .expect("an interval operand reads a key");
+        sqlparser::ast::OrderByExpr {
+            expr,
+            options: sqlparser::ast::OrderByOptions { sort: None, nulls_first: Some(false) },
+            with_fill: None,
+        }
+    }
+
+    #[test]
+    fn a_pipe_order_by_over_an_interval_reads_the_position_key() {
+        let schema = interval_schema();
+        let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
+        let order_by_expr = sqlparser::ast::OrderByExpr {
+            expr: parse_expr("iv"),
+            options: sqlparser::ast::OrderByOptions::default(),
+            with_fill: None,
+        };
+        let pipe = sqlparser::ast::PipeOperator::OrderBy { exprs: vec![order_by_expr.clone()] };
+        let expected = expected_order_by_over_interval(&order_by_expr, &schema, &options);
+        let translated = translate_pipe_operator::<Forward>(&pipe, &schema, &options, &mut |_| {})
+            .expect("a pipe ORDER BY over an interval keeps the position key");
+        assert_eq!(translated, sqlparser::ast::PipeOperator::OrderBy { exprs: vec![expected] });
+    }
+
+    #[test]
+    fn a_match_recognize_order_by_over_an_interval_reads_the_position_key() {
+        let schema = interval_schema();
+        let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
+        let order_by_expr = sqlparser::ast::OrderByExpr {
+            expr: parse_expr("iv"),
+            options: sqlparser::ast::OrderByOptions::default(),
+            with_fill: None,
+        };
+        let inner_table = Box::new(TableFactor::Table {
+            name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("t"))]),
+            alias: None,
+            args: None,
+            with_hints: vec![],
+            version: None,
+            with_ordinality: false,
+            partitions: vec![],
+            json_path: None,
+            sample: None,
+            index_directives: vec![],
+            inheritance: None,
+        });
+        let table = TableFactor::MatchRecognize {
+            table: inner_table.clone(),
+            partition_by: vec![],
+            order_by: vec![order_by_expr.clone()],
+            measures: vec![],
+            rows_per_match: None,
+            after_match_skip: None,
+            pattern: sqlparser::ast::MatchRecognizePattern::Concat(vec![]),
+            symbols: vec![],
+            alias: None,
+        };
+        let expected = expected_order_by_over_interval(&order_by_expr, &schema, &options);
+        let translated = translate_table_factor::<Forward>(&table, &schema, &options, &mut |_| {})
+            .expect("a MATCH_RECOGNIZE order by over an interval keeps the position key");
+        assert_eq!(
+            translated,
+            TableFactor::MatchRecognize {
+                table: inner_table.clone(),
+                partition_by: vec![],
+                order_by: vec![expected],
+                measures: vec![],
+                rows_per_match: None,
+                after_match_skip: None,
+                pattern: sqlparser::ast::MatchRecognizePattern::Concat(vec![]),
+                symbols: vec![],
+                alias: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_values_column_named_as_a_variable_keeps_its_variable_translation() {
+        let schema = interval_schema();
+        let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
+        let query = parse_query("SELECT x FROM (VALUES ('1 day'::interval)) v (x)");
+        let select = query.body.as_ref().as_select().expect("the select body");
+        assert!(values_relation_carries_interval(select, &schema, &options));
+        let variables = vec![String::from("x")];
+        let scoped = options.with_variables(&variables);
+        assert!(!values_relation_carries_interval(select, &schema, &scoped));
+    }
+
+    #[test]
+    fn a_pivot_any_value_source_translates_its_order_by() {
+        let s = empty_schema();
+        let o = Pg2SqliteOptions::default();
+        let ob = sqlparser::ast::OrderByExpr {
+            expr: parse_expr("a"),
+            options: sqlparser::ast::OrderByOptions::default(),
+            with_fill: None,
+        };
+        let expected = ob.clone();
+        let source = PivotValueSource::Any(vec![ob]);
+        let got = translate_pivot_value_source::<IdentityDirection>(&source, &s, &o, &mut |_| {})
+            .expect("a pivot ANY value source translates its order by");
+        assert_eq!(got, PivotValueSource::Any(vec![expected]));
+    }
+
+    #[test]
+    fn a_query_output_defined_by_an_interval_column_or_expression_carries() {
+        let schema = interval_schema();
+        let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
+        for sql in ["SELECT iv FROM t", "SELECT s FROM (SELECT '1 day'::interval AS s FROM t) y"] {
+            let carries = query_output_carries(
+                &parse_query(sql),
+                &schema,
+                &options,
+                |column| {
+                    crate::impls::interval::is_interval_data_type(&column.data_type).then_some(())
+                },
+                |expr, schema, options| {
+                    Ok(crate::impls::expression_type::is_interval_typed(expr, schema, options)
+                        .then_some(()))
+                },
+            )
+            .expect("the output's scope settles");
+            assert!(carries, "{sql}: the output answers the interval read");
+        }
     }
 }

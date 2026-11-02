@@ -261,6 +261,14 @@ fn translate_extract(
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Expr, crate::errors::Error> {
+    if crate::impls::expression_type::is_interval_typed(expr, schema, options) {
+        return Err(crate::errors::Error::forward_refusal(
+            "extract over an interval cannot be translated: reading a field out of an interval \
+             is a value read the replica does not translate. Read the stored text in the \
+             application."
+                .to_string(),
+        ));
+    }
     let key = datetime_field_key(field).ok_or_else(|| {
         crate::errors::Error::forward_refusal(format!(
             "EXTRACT({field}) is not supported in SQLite. Supported fields: \
@@ -907,8 +915,34 @@ fn extract_string_array_keys(expr: &Expr) -> Option<Vec<&str>> {
     elem.iter().map(single_quoted_literal).collect()
 }
 
+/// Whether `expr` is a string literal the statement does not type, in any of
+/// the spellings a side beside an interval may carry, through parentheses.
+fn is_string_literal_spelling(expr: &Expr) -> bool {
+    match expr {
+        Expr::Value(ValueWithSpan { value, .. }) => {
+            matches!(
+                value,
+                Value::SingleQuotedString(_)
+                    | Value::NationalStringLiteral(_)
+                    | Value::EscapedStringLiteral(_)
+                    | Value::UnicodeStringLiteral(_)
+                    | Value::DollarQuotedString(_)
+            )
+        }
+        Expr::Nested(inner) => is_string_literal_spelling(inner),
+        _ => false,
+    }
+}
+
 /// Scales NUMERIC literals/parameters and converts UUID/vector values before
-/// forwarding `IS [NOT] DISTINCT FROM` to SQLite.
+/// forwarding `IS [NOT] DISTINCT FROM` to SQLite. Beside an interval the
+/// comparison runs on the keys, with the same operand rules as the
+/// comparison operators.
+///
+/// # Errors
+///
+/// Propagates the refusal a side its `interval =` operator has no form for
+/// answers.
 fn translate_distinct_comparison(
     left: &Expr,
     right: &Expr,
@@ -917,6 +951,46 @@ fn translate_distinct_comparison(
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Expr, crate::errors::Error> {
+    use crate::impls::{expression_type::is_interval_typed, interval::keys};
+    if is_interval_typed(left, schema, options) || is_interval_typed(right, schema, options) {
+        let left_key = keys::operand_key(
+            left,
+            "=",
+            right,
+            keys::BareLiterals::AsInterval,
+            schema,
+            options,
+            emit,
+        );
+        let right_key = keys::operand_key(
+            right,
+            "=",
+            left,
+            keys::BareLiterals::AsInterval,
+            schema,
+            options,
+            emit,
+        );
+        return match (left_key, right_key) {
+            (Ok(left_key), Ok(right_key)) => {
+                Ok(if is_not_distinct {
+                    null_safe_eq(left_key, right_key)
+                } else {
+                    null_safe_neq(left_key, right_key)
+                })
+            }
+            // The left side's refusal spells its own types in source order.
+            (Err(left_error), _) => Err(left_error),
+            (Ok(_), Err(right_error)) if is_string_literal_spelling(right) => Err(right_error),
+            (Ok(_), _) => {
+                Err(crate::errors::Error::forward_refusal(format!(
+                    "operator does not exist: {} = {}.",
+                    keys::message_type_name_of(left, schema, options),
+                    keys::message_type_name_of(right, schema, options),
+                )))
+            }
+        };
+    }
     let scales = (scale_of(left, schema, options), scale_of(right, schema, options));
     if let Some((left_aligned, right_aligned)) =
         align_minor_units(left, right, scales, schema, options, emit)?
@@ -1418,6 +1492,33 @@ fn quantifier_elements(right: &Expr) -> Option<&[Expr]> {
     }
 }
 
+/// The right side of an interval quantifier comparison with a cast to an
+/// interval array peeled, and whether that cast types the elements.
+fn interval_array_cast(right: &Expr) -> (&Expr, bool) {
+    let Expr::Cast { expr, data_type, .. } = right else {
+        return (right, false);
+    };
+    if crate::impls::interval::is_interval_array_data_type(data_type) {
+        return (expr.as_ref(), true);
+    }
+    (right, false)
+}
+
+/// The elements an interval quantifier comparison reads on its right side,
+/// with the cast to an interval array that types them peeled, and how a
+/// string literal the statement does not type is read among them.
+fn interval_quantifier_elements(
+    right: &Expr,
+) -> Option<(&[Expr], crate::impls::interval::keys::BareLiterals)> {
+    let (inner, cast) = interval_array_cast(right);
+    let bare_literals = if cast {
+        crate::impls::interval::keys::BareLiterals::AsInterval
+    } else {
+        crate::impls::interval::keys::BareLiterals::AsText
+    };
+    quantifier_elements(inner).map(|elements| (elements, bare_literals))
+}
+
 /// The argument list of a plain `string_to_array(...)` call.
 ///
 /// A call carrying a window, a filter, a modifier or an argument clause is
@@ -1762,6 +1863,99 @@ fn mapped_setting<'o>(
     let Expr::Function(function) = session_variable::setting_operand(expr) else { return None };
     let pattern = session_variable::pattern_of_function(function)?;
     options.find_session_variable(&pattern)
+}
+
+/// `= ANY` or `<> ALL` with an interval left side: the array literal's
+/// elements are keyed, a cast to an interval array is peeled and its
+/// elements typed by it, and PostgreSQL's refusal is answered for the
+/// elements the operator has no form for.
+///
+/// # Errors
+///
+/// Propagates the refusal an element its `interval {op}` operator has no form
+/// for answers, and the refusal the right side is not an array literal.
+fn interval_any_all(
+    left: &Expr,
+    right: &Expr,
+    negated: bool,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Expr, crate::errors::Error> {
+    use crate::impls::interval::keys;
+    let operator = if negated { "<>" } else { "=" };
+    let Some((elements, bare_literals)) = interval_quantifier_elements(right) else {
+        return Err(crate::errors::Error::forward_refusal(
+            "= ANY and <> ALL over an interval with a subquery or an array column cannot be \
+             translated: the comparison runs on the comparison key, and the right side's \
+             values keep the stored text. Compare the columns against each other, or list the \
+             values in an IN list."
+                .to_string(),
+        ));
+    };
+    let operand_key =
+        keys::operand_key(left, operator, left, bare_literals, schema, options, emit)?;
+    let key = |element: &Expr| {
+        keys::operand_key(element, operator, left, bare_literals, schema, options, emit)
+    };
+    let keys = elements.iter().map(key).collect::<Result<Vec<_>, crate::errors::Error>>()?;
+    Ok(Expr::In {
+        expr: Box::new(operand_key),
+        target: InTarget::List(keys),
+        negated,
+        global: false,
+    })
+}
+
+/// The ordered quantified comparison over an interval left side, `<op> ANY`
+/// or `<op> ALL` in the forms the key does not own (`<> ANY`, `= ALL`, and
+/// `< <= > >=`). The left side's key is compared to every element's key of
+/// the array literal, and PostgreSQL's refusal is answered for a subquery or
+/// an array column on the right.
+///
+/// # Errors
+///
+/// Propagates the refusal an element its `interval {op}` operator has no form
+/// for answers, and the refusal the right side is not an array literal.
+fn interval_ordered_any_all(
+    left: &Expr,
+    op: &BinaryOperator,
+    right: &Expr,
+    quantifier: Quantifier,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Expr, crate::errors::Error> {
+    use crate::impls::interval::keys;
+    let operator =
+        comparison_operator_display(op).expect("the caller settles the operator to a comparison");
+    let Some((elements, bare_literals)) = interval_quantifier_elements(right) else {
+        return Err(crate::errors::Error::forward_refusal(format!(
+            "{operator} ANY and {operator} ALL over an interval with a subquery or an array \
+             column cannot be translated: the comparison runs on the comparison key, and the \
+             right side's values keep the stored text. Compare the columns against each other, \
+             or list the values in an array."
+        )));
+    };
+    let (fold_op, empty_value) = match quantifier {
+        Quantifier::Any => (BinaryOperator::Or, false),
+        Quantifier::All => (BinaryOperator::And, true),
+    };
+    let operand_key =
+        keys::operand_key(left, operator, left, bare_literals, schema, options, emit)?;
+    let predicates = elements
+        .iter()
+        .map(|element| {
+            let element_key =
+                keys::operand_key(element, operator, left, bare_literals, schema, options, emit)?;
+            Ok(Expr::BinaryOp {
+                left: Box::new(operand_key.clone()),
+                op: op.clone(),
+                right: Box::new(element_key),
+            })
+        })
+        .collect::<Result<Vec<_>, crate::errors::Error>>()?;
+    Ok(fold_predicates(predicates, &fold_op, empty_value))
 }
 
 /// Translate the equality forms `x = ANY(...)` and `x <> ALL(...)` into
@@ -2576,6 +2770,92 @@ fn shifted_interval_target(
     Ok(from_year_one(shifted_datetime(target, &modifiers)))
 }
 
+/// The display spelling of a comparison operator, in PostgreSQL's spelling.
+const fn comparison_operator_display(op: &BinaryOperator) -> Option<&'static str> {
+    match op {
+        BinaryOperator::Eq => Some("="),
+        BinaryOperator::NotEq => Some("<>"),
+        BinaryOperator::Lt => Some("<"),
+        BinaryOperator::LtEq => Some("<="),
+        BinaryOperator::Gt => Some(">"),
+        BinaryOperator::GtEq => Some(">="),
+        _ => None,
+    }
+}
+
+/// The interval read over `left` and `right`: a comparison keyed, or the
+/// refusal an interval arithmetic answers, or `None` when the read keeps its
+/// ordinary translation.
+///
+/// # Errors
+///
+/// Propagates the refusal a side its `interval {op}` operator has no form for
+/// answers, and the refusal the literal the statement types fails to decode.
+fn interval_binary(
+    left: &Expr,
+    op: &BinaryOperator,
+    right: &Expr,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Option<Expr>, crate::errors::Error> {
+    use crate::impls::{expression_type::is_interval_typed, interval::keys};
+    let (left_typed, right_typed) =
+        (is_interval_typed(left, schema, options), is_interval_typed(right, schema, options));
+    if !left_typed && !right_typed {
+        return Ok(None);
+    }
+    if let Some(operator) = comparison_operator_display(op) {
+        let left_key = keys::operand_key(
+            left,
+            operator,
+            right,
+            keys::BareLiterals::AsInterval,
+            schema,
+            options,
+            emit,
+        )?;
+        let right_key = keys::operand_key(
+            right,
+            operator,
+            left,
+            keys::BareLiterals::AsInterval,
+            schema,
+            options,
+            emit,
+        )?;
+        return Ok(Some(Expr::BinaryOp {
+            left: Box::new(left_key),
+            op: op.clone(),
+            right: Box::new(right_key),
+        }));
+    }
+    if !matches!(
+        op,
+        BinaryOperator::Plus
+            | BinaryOperator::Minus
+            | BinaryOperator::Multiply
+            | BinaryOperator::Divide
+    ) {
+        // Concatenation and the remaining operators run on the stored text.
+        return Ok(None);
+    }
+    let left_shift = extract_interval_expr(left).is_some() || scalar_times_interval(left).is_some();
+    let right_shift =
+        extract_interval_expr(right).is_some() || scalar_times_interval(right).is_some();
+    if (right_shift && !left_typed) || (left_shift && !right_typed) {
+        // A shift literal beside a non-interval target keeps its existing
+        // translation.
+        return Ok(None);
+    }
+    Err(crate::errors::Error::forward_refusal(format!(
+        "{} {op} {} cannot be translated: the answer is an interval, and SQLite has no interval \
+         type to hold one. Apply the interval to a date or a timestamp in the application.",
+        keys::message_type_name_of(left, schema, options),
+        keys::message_type_name_of(right, schema, options)
+    )))
+}
+
 /// Translate a binary operation expression.
 #[allow(clippy::too_many_lines)]
 fn translate_binary_op(
@@ -2716,6 +2996,11 @@ fn translate_binary_op(
             | BinaryOperator::Gt
             | BinaryOperator::GtEq
     ) {
+        // Interval sides take the comparison key before the literal-check
+        // path, which would compare the canonical texts.
+        if let Some(resolved) = interval_binary(left, op, right, schema, options, emit)? {
+            return Ok(resolved);
+        }
         // A column whose literals only need checking, a float or a bit
         // column, enters this branch only when the other side is a literal:
         // two columns compared with each other have nothing to check, and
@@ -3265,6 +3550,10 @@ fn translate_binary_op(
         _ => {}
     }
 
+    // Only the arithmetic refusal reaches this far; a comparison with an
+    // interval side answers through the call above.
+    interval_binary(left, op, right, schema, options, emit)?;
+
     // PG INTERVAL arithmetic: `target + INTERVAL 'N unit'` becomes
     // `datetime(target, '+M months', 'floor', '+D days', '+S seconds')`, and
     // `-` negates every count.
@@ -3496,15 +3785,44 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                 Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(text), span: *span })
             }
             Expr::Function(func) => {
-                let translated = func.translate_with_warnings(schema, options, emit)?;
-                match scale_of(self, schema, options) {
-                    Some(scale) if scale > 0 => {
-                        scale_call_arguments(translated, scale, schema, options)?
+                if let Some(keyed) =
+                    crate::impls::interval::keys::function(func, schema, options, emit)?
+                {
+                    keyed
+                } else {
+                    let translated = func.translate_with_warnings(schema, options, emit)?;
+                    match scale_of(self, schema, options) {
+                        Some(scale) if scale > 0 => {
+                            scale_call_arguments(translated, scale, schema, options)?
+                        }
+                        _ => translated,
                     }
-                    _ => translated,
                 }
             }
             Expr::In { expr: operand, target: InTarget::List(list), negated, global } => {
+                if crate::impls::expression_type::is_interval_typed(operand, schema, options) {
+                    use crate::impls::interval::keys;
+                    let mut key = |side: &Expr| {
+                        keys::operand_key(
+                            side,
+                            "=",
+                            operand,
+                            keys::BareLiterals::AsInterval,
+                            schema,
+                            options,
+                            emit,
+                        )
+                    };
+                    let operand_key = key(operand)?;
+                    let keys =
+                        list.iter().map(key).collect::<Result<Vec<_>, crate::errors::Error>>()?;
+                    return Ok(Expr::In {
+                        expr: Box::new(operand_key),
+                        target: InTarget::List(keys),
+                        negated: *negated,
+                        global: *global,
+                    });
+                }
                 rebuild(|| {
                     let scale = scale_of(operand, schema, options).filter(|scale| *scale > 0);
                     Ok::<Expr, crate::errors::Error>(Expr::In {
@@ -3529,6 +3847,29 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                 })?
             }
             Expr::Between { expr: operand, negated, low, high } => {
+                if crate::impls::expression_type::is_interval_typed(operand, schema, options) {
+                    use crate::impls::interval::keys;
+                    let mut key = |side: &Expr, operator: &str| {
+                        keys::operand_key(
+                            side,
+                            operator,
+                            operand,
+                            keys::BareLiterals::AsInterval,
+                            schema,
+                            options,
+                            emit,
+                        )
+                    };
+                    let operand_key = key(operand, ">=")?;
+                    let low_key = key(low, ">=")?;
+                    let high_key = key(high, "<=")?;
+                    return Ok(Expr::Between {
+                        expr: Box::new(operand_key),
+                        negated: *negated,
+                        low: Box::new(low_key),
+                        high: Box::new(high_key),
+                    });
+                }
                 rebuild(|| {
                     let scale = scale_of(operand, schema, options).filter(|scale| *scale > 0);
                     let low_v = scale_or_translate(low, scale, schema, options, emit)?;
@@ -3998,8 +4339,24 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                     .to_string()));
             }
             Expr::AnyOp { left, compare_op, right, .. } => {
+                let left_interval =
+                    crate::impls::expression_type::is_interval_typed(left, schema, options);
+                if matches!(compare_op, BinaryOperator::Eq) && left_interval {
+                    return interval_any_all(left, right, false, schema, options, emit);
+                }
                 if matches!(compare_op, BinaryOperator::Eq) {
                     return translate_any_all_to_in(left, right, false, schema, options, emit);
+                }
+                if left_interval && comparison_operator_display(compare_op).is_some() {
+                    return interval_ordered_any_all(
+                        left,
+                        compare_op,
+                        right,
+                        Quantifier::Any,
+                        schema,
+                        options,
+                        emit,
+                    );
                 }
                 translate_quantified_operation(
                     left,
@@ -4012,8 +4369,24 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                 )?
             }
             Expr::AllOp { left, compare_op, right } => {
+                let left_interval =
+                    crate::impls::expression_type::is_interval_typed(left, schema, options);
+                if matches!(compare_op, BinaryOperator::NotEq) && left_interval {
+                    return interval_any_all(left, right, true, schema, options, emit);
+                }
                 if matches!(compare_op, BinaryOperator::NotEq) {
                     return translate_any_all_to_in(left, right, true, schema, options, emit);
+                }
+                if left_interval && comparison_operator_display(compare_op).is_some() {
+                    return interval_ordered_any_all(
+                        left,
+                        compare_op,
+                        right,
+                        Quantifier::All,
+                        schema,
+                        options,
+                        emit,
+                    );
                 }
                 translate_quantified_operation(
                     left,
@@ -4045,6 +4418,18 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                          Restructure as separate GROUP BY queries and UNION ALL the results."
                         .to_string(),
                 ));
+            }
+            Expr::In { expr: operand, target: InTarget::Subquery(_), .. } => {
+                if crate::impls::expression_type::is_interval_typed(operand, schema, options) {
+                    return Err(crate::errors::Error::forward_refusal(
+                        "IN (subquery) over an interval cannot be translated: the comparison \
+                         runs on the comparison key, and the subquery's result column keeps the \
+                         stored text. Compare the columns against each other, or list the values \
+                         in an IN list."
+                            .to_string(),
+                    ));
+                }
+                translate_expr_recursive::<Forward>(self, schema, options, emit)?
             }
             Expr::In { target: InTarget::Table { .. }, .. } => {
                 return Err(crate::errors::Error::forward_refusal(
@@ -4087,6 +4472,24 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
             // Not, Minus, Plus and BitwiseNot fall through and keep the
             // operator.
             Expr::UnaryOp { op, expr } => {
+                if (matches!(op, UnaryOperator::Minus | UnaryOperator::PGAbs))
+                    && crate::impls::expression_type::is_interval_typed(expr, schema, options)
+                {
+                    if *op == UnaryOperator::PGAbs {
+                        return Err(crate::errors::Error::forward_refusal(
+                            "function abs(interval) does not exist. SQLite's abs has no interval \
+                             form, and the replica refuses rather than run it on the stored \
+                             text."
+                                .to_string(),
+                        ));
+                    }
+                    return Err(crate::errors::Error::forward_refusal(
+                        "negating an interval cannot be translated: the answer is an interval, \
+                         and SQLite has no interval type to hold one. Negate it in the \
+                         application."
+                            .to_string(),
+                    ));
+                }
                 rebuild(|| {
                     Ok(match op {
                         UnaryOperator::PGSquareRoot => {
@@ -4543,8 +4946,9 @@ mod tests {
     };
 
     use super::{
-        extract_query_from_tsquery, is_sqlite_fixed_offset, normalize_at_time_zone_modifier,
-        translate_any_all_to_in, translate_extract, translate_trim,
+        extract_query_from_tsquery, is_sqlite_fixed_offset, is_string_literal_spelling,
+        normalize_at_time_zone_modifier, translate_any_all_to_in, translate_extract,
+        translate_trim,
     };
     use crate::prelude::{Pg2SqliteOptions, Translator};
 
@@ -4558,6 +4962,13 @@ mod tests {
             .expect("sql should parse")
             .parse_expr()
             .expect("expression should parse")
+    }
+
+    #[test]
+    fn a_cast_or_call_is_not_a_string_literal_spelling() {
+        assert!(is_string_literal_spelling(&parse_expr("'1 day'")));
+        assert!(!is_string_literal_spelling(&parse_expr("id::text")));
+        assert!(!is_string_literal_spelling(&parse_expr("now()")));
     }
 
     #[test]

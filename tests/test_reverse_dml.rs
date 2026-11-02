@@ -172,6 +172,19 @@ fn reverse_insert_on_conflict_do_update_with_where() {
 }
 
 #[test]
+fn reverse_insert_on_conflict_target_predicate_keeps_its_predicate() {
+    // The WHERE after the conflict target columns names a partial index as
+    // the arbiter and travels with the target.
+    let pg = reverse(
+        SCHEMA,
+        "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30) ON CONFLICT (id) WHERE age > 18 DO UPDATE SET name = excluded.name;",
+    );
+    assert!(pg.contains("ON CONFLICT"), "Expected ON CONFLICT: {pg}");
+    assert!(pg.contains("WHERE"), "Expected the target's WHERE: {pg}");
+    assert!(pg.contains("DO UPDATE SET"), "Expected DO UPDATE SET: {pg}");
+}
+
+#[test]
 fn reverse_delete_with_derived_subquery() {
     let pg = reverse(
         TWO_TABLES,

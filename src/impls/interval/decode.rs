@@ -326,7 +326,7 @@ pub(super) enum Decoded {
 /// An interval typmod: the fields a column or literal keeps and its
 /// fractional-second precision, `INTERVAL_RANGE` and `INTERVAL_PRECISION`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Typmod {
+pub(crate) struct Typmod {
     range: u16,
     precision: Option<u8>,
 }

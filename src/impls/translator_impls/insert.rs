@@ -226,6 +226,8 @@ fn translate_on_insert(
         target,
         schema,
     )?;
+    let conflict_target =
+        rewrite_conflict_interval_columns(conflict_target, target, schema, options)?;
     match &on_conflict.action {
         sqlparser::ast::OnConflictAction::DoNothing => {
             // Unlike `INSERT OR IGNORE`, this keeps CHECK and NOT NULL errors.
@@ -332,6 +334,48 @@ fn resolve_conflict_target(
     }
 
     Err(unresolvable_constraint(&wanted, &table_name.to_string()))
+}
+
+/// The conflict target's interval columns rewritten to the comparison key,
+/// since the companion unique index the DDL moves the constraint onto is the
+/// arbiter SQLite matches.
+fn rewrite_conflict_interval_columns(
+    conflict_target: Option<sqlparser::ast::ConflictTarget>,
+    target: &ResolvedInsertTarget<'_>,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<Option<sqlparser::ast::ConflictTarget>, crate::errors::Error> {
+    let Some(sqlparser::ast::ConflictTarget::Columns { columns, predicate }) = conflict_target
+    else {
+        return Ok(conflict_target);
+    };
+    let Some(table) = target.optional() else {
+        return Ok(Some(sqlparser::ast::ConflictTarget::Columns { columns, predicate }));
+    };
+    let without = options.without_subqueries();
+    let result: Result<Vec<sqlparser::ast::Ident>, crate::errors::Error> = columns
+        .iter()
+        .map(|column| {
+            let is_interval =
+                table.column(&column.value, schema, COLUMN_LOOKUP_CASE)?.is_some_and(|found| {
+                    crate::impls::interval::is_interval_data_type(&found.attribute().data_type)
+                });
+            if !is_interval {
+                return Ok(column.clone());
+            }
+            let key = crate::impls::interval::keys::key_expr(
+                &sqlparser::ast::Expr::Identifier(column.clone()),
+                &without,
+            )?;
+            Ok(sqlparser::ast::Ident {
+                value: key.to_string(),
+                quote_style: None,
+                span: column.span,
+            })
+        })
+        .collect();
+    let columns = result?;
+    Ok(Some(sqlparser::ast::ConflictTarget::Columns { columns, predicate }))
 }
 
 /// Replaces a conflict target predicate with the predicate of the partial
