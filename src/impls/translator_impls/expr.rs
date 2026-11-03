@@ -41,7 +41,7 @@ use crate::{
             single_quoted_literal, string_literal,
         },
         idioms::{delimited_membership, single_character, wrap_with_lower},
-        interval::{IntervalShift, interval_shift, interval_shift_scaled},
+        interval::{ClockShift, IntervalShift, interval_shift, interval_shift_scaled},
         object_name::{
             fts_table_name, last_ident_value_or_display, postgres_catalog_function_name,
         },
@@ -2696,12 +2696,13 @@ fn shifted_datetime(target: Expr, modifiers: &[Expr]) -> Expr {
     trim_trailing_zeros(simple_function_expr("datetime", args, None))
 }
 
-/// The time of day `target` answers after `modifiers`, wrapped at midnight,
-/// with a `timetz` operand's offset kept in place. The zoned form reads
-/// `target` three times, so the caller refuses a non-replayable operand.
-fn shifted_time_of_day(target: Expr, modifiers: &[Expr], zoned: bool) -> Expr {
+/// The time of day `target` answers after `clock`, wrapped at midnight, with
+/// a `timetz` operand's offset kept in place. The zoned form, and a shift
+/// whose sum can leave 64 bits, read `target` more than once, so the caller
+/// refuses a non-replayable operand.
+pub(crate) fn shifted_time_of_day(target: Expr, clock: &ClockShift, zoned: bool) -> Expr {
     if !zoned {
-        return shifted_clock(target, modifiers);
+        return shifted_clock(target, clock);
     }
     // The offset is the trailing ±HH:MM, which the answer keeps as written.
     let local = simple_function_expr(
@@ -2717,19 +2718,59 @@ fn shifted_time_of_day(target: Expr, modifiers: &[Expr], zoned: bool) -> Expr {
         ],
         None,
     );
-    let clock = shifted_clock(local, modifiers);
+    let moved = shifted_clock(local, clock);
     let offset = simple_function_expr("substr", vec![target, integer_literal(-6)], None);
     Expr::BinaryOp {
-        left: Box::new(clock),
+        left: Box::new(moved),
         op: BinaryOperator::StringConcat,
         right: Box::new(offset),
     }
 }
 
-/// The time part of a shifted time, trailing fractional zeros trimmed. SQLite
-/// reads a bare time as 2000-01-01, so the part after the date wraps at
-/// midnight.
-fn shifted_clock(local: Expr, modifiers: &[Expr]) -> Expr {
+/// The time of day `local` answers after `clock`, taking the wrapped
+/// modifiers for a time of day past the clock's 64-bit threshold.
+fn shifted_clock(local: Expr, clock: &ClockShift) -> Expr {
+    let Some((threshold, wrapped)) = &clock.wrap else {
+        return clock_after(local, &clock.modifiers);
+    };
+    let past = Expr::BinaryOp {
+        left: Box::new(micros_of_day(&local)),
+        op: BinaryOperator::Gt,
+        right: Box::new(Expr::Nested(Box::new(threshold.clone()))),
+    };
+    case_when(past, clock_after(local.clone(), wrapped), Some(clock_after(local, &clock.modifiers)))
+}
+
+/// The microsecond of the day a stored `HH:MM:SS[.ffffff]` time of day
+/// names, from SQLite's numeric reading of each part.
+fn micros_of_day(local: &Expr) -> Expr {
+    let part = |start: i64, length: Option<i64>| {
+        let mut args = vec![local.clone(), integer_literal(start)];
+        args.extend(length.map(integer_literal));
+        simple_function_expr("substr", args, None)
+    };
+    let times = |left: Expr, factor: i64| {
+        Expr::BinaryOp {
+            left: Box::new(left),
+            op: BinaryOperator::Multiply,
+            right: Box::new(integer_literal(factor)),
+        }
+    };
+    let plus = |left: Expr, right: Expr| {
+        Expr::BinaryOp { left: Box::new(left), op: BinaryOperator::Plus, right: Box::new(right) }
+    };
+    // The seconds carry up to six decimals, which `round` makes whole.
+    let seconds = simple_function_expr("round", vec![times(part(7, None), 1_000_000)], None);
+    Expr::Nested(Box::new(plus(
+        plus(times(part(1, Some(2)), 3_600_000_000), times(part(4, Some(2)), 60_000_000)),
+        seconds,
+    )))
+}
+
+/// The time part of `local` shifted by `modifiers`, trailing fractional zeros
+/// trimmed. SQLite reads a bare time as 2000-01-01, so the part after the
+/// date wraps at midnight.
+fn clock_after(local: Expr, modifiers: &[Expr]) -> Expr {
     let mut args = vec![local];
     args.extend(modifiers.iter().cloned());
     args.push(string_literal("subsec"));
@@ -2738,23 +2779,16 @@ fn shifted_clock(local: Expr, modifiers: &[Expr]) -> Expr {
     trim_trailing_zeros(simple_function_expr("substr", vec![shifted, integer_literal(12)], None))
 }
 
-/// The shifted form of the translated `target` of temporal `kind` under the
-/// date `modifiers`: a time of day wrapped at midnight, or a date or
-/// timestamp under the year-1 guard.
-pub(crate) fn shifted_by_modifiers(
-    target: Expr,
-    kind: Option<TemporalKind>,
-    modifiers: &[Expr],
-) -> Expr {
-    if let Some(TemporalKind::Time { zoned }) = kind {
-        return shifted_time_of_day(target, modifiers, zoned);
-    }
+/// The shifted form of a translated date or timestamp `target` under the
+/// date `modifiers`, under the year-1 guard.
+pub(crate) fn shifted_by_modifiers(target: Expr, modifiers: &[Expr]) -> Expr {
     from_year_one(shifted_datetime(target, modifiers))
 }
 
 /// The shifted form of `left` for the temporal kind it resolves to, refusing
-/// a zoned operand the emitted form would read three times, and a literal
-/// date or timestamp whose shifted year SQLite's date functions cannot hold.
+/// an operand the emitted form would read more than once and cannot replay,
+/// and a literal date or timestamp whose shifted year SQLite's date functions
+/// cannot hold.
 pub(crate) fn shifted_interval_target(
     left: &Expr,
     (op, right): (&BinaryOperator, &Expr),
@@ -2764,18 +2798,29 @@ pub(crate) fn shifted_interval_target(
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Expr, crate::errors::Error> {
     let kind = temporal_kind_of(left, schema, options);
-    if matches!(kind, Some(TemporalKind::Time { zoned: true })) && !is_replayable(left, options) {
-        return Err(reject_duplicated_operand("a TIMETZ operand shifted by an interval", left));
+    if let Some(TemporalKind::Time { zoned }) = kind {
+        let clock = shift.clock_shift();
+        if !is_replayable(left, options) {
+            if zoned {
+                return Err(reject_duplicated_operand(
+                    "a TIMETZ operand shifted by an interval",
+                    left,
+                ));
+            }
+            if clock.wrap.is_some() {
+                return Err(reject_duplicated_operand(
+                    "a TIME operand shifted by an interval whose sum with it can pass 64 bits",
+                    left,
+                ));
+            }
+        }
+        let target = left.translate_with_warnings(schema, options, emit)?;
+        return Ok(shifted_time_of_day(target, &clock, zoned));
     }
     let target = left.translate_with_warnings(schema, options, emit)?;
-    let is_time = matches!(kind, Some(TemporalKind::Time { .. }));
     let modifiers: Vec<Expr> =
-        if is_time { shift.time_of_day_modifiers() } else { shift.modifiers() }
-            .iter()
-            .map(|modifier| string_literal(modifier))
-            .collect();
-    if !is_time
-        && let Some(literal) = single_quoted_literal(&target)
+        shift.modifiers()?.iter().map(|modifier| string_literal(modifier)).collect();
+    if let Some(literal) = single_quoted_literal(&target)
         && let Some(year) = shift.year_after(literal)
         && !(1..=9999).contains(&year)
     {
@@ -2784,7 +2829,7 @@ pub(crate) fn shifted_interval_target(
             year,
         ));
     }
-    Ok(shifted_by_modifiers(target, kind, &modifiers))
+    Ok(shifted_by_modifiers(target, &modifiers))
 }
 
 /// The display spelling of a comparison operator, in PostgreSQL's spelling.

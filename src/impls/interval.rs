@@ -26,21 +26,54 @@ use alloc::{
 
 pub(crate) use decode::Typmod;
 use decode::{Decoded, Interval, Refusal, TypmodFields, interval_in};
-use sqlparser::ast::{DataType, DateTimeField, IntervalFields};
+use sqlparser::ast::{DataType, DateTimeField, Expr, IntervalFields};
 
-use crate::{errors::Error, impls::function_helpers::single_quoted_literal};
+use crate::{
+    errors::Error,
+    impls::function_helpers::{integer_literal, single_quoted_literal, string_literal},
+};
 
 const MICROS_PER_HOUR: i64 = 3_600_000_000;
 const MICROS_PER_MINUTE: i64 = 60_000_000;
 const MICROS_PER_SECOND: i64 = 1_000_000;
+const MICROS_PER_DAY: i64 = 86_400_000_000;
 
-/// An interval operand of `timestamp ± interval`, scaled and negated.
-pub(crate) struct IntervalShift(Interval);
+/// 2^64 microseconds less its whole days: what a 64-bit wrap takes off a
+/// time of day.
+const WRAP_IN_A_DAY: i64 = 28_909_551_616;
+
+/// An interval operand of `date`, `time` or `timestamp ± interval`, scaled,
+/// and whether it is subtracted.
+pub(crate) struct IntervalShift {
+    interval: Interval,
+    subtract: bool,
+}
+
+/// The modifiers that move a time of day as `time_pl_interval` and
+/// `time_mi_interval` move it: the interval's time field added in 64 bits,
+/// which wrap past the bound, and the whole days taken off.
+pub(crate) struct ClockShift {
+    /// The modifiers for a time of day whose sum stays in 64 bits.
+    pub(crate) modifiers: Vec<Expr>,
+    /// The microsecond of the day past which the sum leaves 64 bits, and the
+    /// modifiers for a time of day past it.
+    pub(crate) wrap: Option<(Expr, Vec<Expr>)>,
+}
 
 impl IntervalShift {
+    /// The interval `timestamp_pl_interval` adds: negated for subtraction,
+    /// which PostgreSQL refuses when a field has no negation.
+    fn signed(&self) -> Result<Interval, Error> {
+        if self.subtract {
+            self.interval.negated().map_err(|_| interval_out_of_range())
+        } else {
+            Ok(self.interval)
+        }
+    }
+
     /// The SQLite date modifiers, in PostgreSQL's order of operations.
-    pub(crate) fn modifiers(&self) -> Vec<String> {
-        let interval = &self.0;
+    pub(crate) fn modifiers(&self) -> Result<Vec<String>, Error> {
+        let interval = self.signed()?;
         let mut modifiers = Vec::new();
         if interval.months != 0 {
             modifiers.push(signed(i64::from(interval.months), "months"));
@@ -53,30 +86,52 @@ impl IntervalShift {
         if interval.micros != 0 {
             modifiers.push(time_modifier(interval.micros));
         }
-        modifiers
+        Ok(modifiers)
     }
 
-    /// The SQLite date modifier `time_pl_interval` applies to a time of day:
-    /// the time field alone, wrapped at 24 hours, since PostgreSQL ignores
-    /// the months and days of an interval added to a `time` or `timetz`.
-    pub(crate) fn time_of_day_modifiers(&self) -> Vec<String> {
-        let wrapped = self.0.micros % (24 * MICROS_PER_HOUR);
-        if wrapped == 0 { Vec::new() } else { vec![time_modifier(wrapped)] }
+    /// The shift `time_pl_interval` or `time_mi_interval` applies to a time
+    /// of day, from the time field alone, since PostgreSQL ignores the months
+    /// and days of an interval added to or subtracted from a `time` or
+    /// `timetz`.
+    pub(crate) fn clock_shift(&self) -> ClockShift {
+        let clock = i128::from(self.interval.micros);
+        let signed = if self.subtract { -clock } else { clock };
+        let in_a_day = i64::try_from(signed % i128::from(MICROS_PER_DAY))
+            .expect("a remainder of a day fits 64 bits");
+        let modifiers = |micros: i64| {
+            if micros == 0 { Vec::new() } else { vec![string_literal(&time_modifier(micros))] }
+        };
+        // A time of day past the threshold leaves 64 bits, and none is past
+        // 24:00:00.
+        let threshold = i128::from(i64::MAX) - signed;
+        match i64::try_from(threshold) {
+            Ok(threshold) if (0..MICROS_PER_DAY).contains(&threshold) => {
+                ClockShift {
+                    modifiers: modifiers(in_a_day),
+                    wrap: Some((integer_literal(threshold), modifiers(in_a_day - WRAP_IN_A_DAY))),
+                }
+            }
+            _ if threshold < 0 => {
+                ClockShift { modifiers: modifiers(in_a_day - WRAP_IN_A_DAY), wrap: None }
+            }
+            _ => ClockShift { modifiers: modifiers(in_a_day), wrap: None },
+        }
     }
 
     /// The year a date or timestamp literal in the replica's stored text
-    /// lands in after this shift.
+    /// lands in after this shift, `None` where PostgreSQL refuses the shift.
     pub(crate) fn year_after(&self, literal: &str) -> Option<i64> {
+        let interval = self.signed().ok()?;
         crate::impls::temporal_literals::year_after_shift(
             literal,
-            i64::from(self.0.months),
-            i64::from(self.0.days),
-            self.0.micros,
+            i64::from(interval.months),
+            i64::from(interval.days),
+            interval.micros,
         )
     }
 }
 
-/// The shift `interval` applies, negated for subtraction.
+/// The shift `interval` applies, added or subtracted.
 ///
 /// `Ok(None)` means the interval's value is not a string literal, so the
 /// caller falls through to the standalone-INTERVAL refusal.
@@ -87,8 +142,8 @@ pub(crate) fn interval_shift(
     shift(interval, negate, None)
 }
 
-/// The shift `factor * interval` applies, negated for subtraction,
-/// multiplied the way PostgreSQL's `interval_mul` multiplies.
+/// The shift `factor * interval` applies, added or subtracted, multiplied
+/// the way PostgreSQL's `interval_mul` multiplies.
 pub(crate) fn interval_shift_scaled(
     interval: &sqlparser::ast::Interval,
     negate: bool,
@@ -109,10 +164,7 @@ fn shift(
             .scaled(decode::int_to_f64(factor), false)
             .map_err(|refusal| refused(text, refusal))?;
     }
-    if negate {
-        value = value.negated().map_err(|refusal| refused(text, refusal))?;
-    }
-    Ok(Some(IntervalShift(value)))
+    Ok(Some(IntervalShift { interval: value, subtract: negate }))
 }
 
 /// `+3 days`, `-1 months`.
@@ -176,7 +228,6 @@ fn finite_interval(text: &str, typmod: Option<Typmod>) -> Result<Interval, Error
 /// positive and `-infinity`, twenty-three `0`s, sorts below every one while
 /// `infinity`, twenty-three `9`s, sorts above every one.
 fn comparison_key(interval: &Interval) -> String {
-    const MICROS_PER_DAY: i64 = 86_400_000_000;
     // i32 to i64 widens with sign preserved, so no digit is lost.
     let months_days = i64::from(interval.months) * 30 + i64::from(interval.days);
     let micros = interval.micros;
@@ -238,11 +289,19 @@ fn refused(text: &str, refusal: Refusal) -> Error {
     let message = match refusal {
         Refusal::BadFormat => format!("invalid input syntax for type interval: \"{text}\""),
         Refusal::FieldOverflow => format!("interval field value out of range: \"{text}\""),
-        Refusal::OutOfRange => "interval out of range".to_string(),
+        Refusal::OutOfRange => return interval_out_of_range(),
     };
     Error::forward_refusal(format!(
         "{message}. PostgreSQL refuses this interval, so the translation does too."
     ))
+}
+
+/// The refusal for an interval past PostgreSQL's field limits.
+fn interval_out_of_range() -> Error {
+    Error::forward_refusal(
+        "interval out of range. PostgreSQL refuses this interval, so the translation does too."
+            .to_string(),
+    )
 }
 
 /// The typmod of an `interval` column or cast type.
