@@ -9548,6 +9548,105 @@ fn a_time_shifted_by_a_literal_ignores_the_months_and_days() {
     }
 }
 
+/// An interval clock 12:00:00.000191 short of the 64-bit bound in
+/// microseconds: `time_pl_interval` adds it to the time of day in 64 bits,
+/// which wraps for a time of day past 12:00:00.000191 before the day is
+/// taken off.
+const NEAR_BOUND_CLOCK: &str = "2562047776:00:54.775616";
+
+/// What [`NEAR_BOUND_CLOCK`] moves a time of day by when the sum stays in
+/// 64 bits: the clock less its whole days.
+const NEAR_BOUND_CLOCK_IN_A_DAY: &str = "16:00:54.775616";
+
+#[test]
+fn a_time_shift_past_the_64_bit_bound_wraps_as_postgresql_does() {
+    let clock = NEAR_BOUND_CLOCK;
+    let wrapped = [
+        ("time", "12:00:00.001", "+", clock.to_string(), "19:59:05.225"),
+        ("time", "23:59:59.999", "+", clock.to_string(), "07:59:05.223"),
+        ("time", "12:00:00.001", "-", format!("-{clock}"), "19:59:05.225"),
+        (
+            "time",
+            "12:00:00.001",
+            "-",
+            format!("-178956970 years -8 mons -2147483648 days -{clock}"),
+            "19:59:05.225",
+        ),
+        ("timetz", "12:00:00.001-05:30", "+", clock.to_string(), "19:59:05.225-05:30"),
+        ("timetz", "12:00:00.001+05:30", "-", format!("-{clock}"), "19:59:05.225+05:30"),
+    ];
+    for (kind, target, op, interval, answer) in &wrapped {
+        let literal = format!("SELECT ({kind} '{target}' {op} interval '{interval}')::text;");
+        assert_eq!(run(&literal), some(&[answer]), "{literal}");
+        let column = format!(
+            "CREATE TABLE w (tg {kind}, iv interval);\nINSERT INTO w VALUES ('{target}', '{interval}');\nSELECT (tg {op} iv)::text FROM w;"
+        );
+        assert_eq!(run(&column), some(&[answer]), "{column}");
+    }
+    // A time of day at or below the bound's distance stays in 64 bits and
+    // moves as the clock's remainder in a day moves it.
+    for (kind, target) in [("time", "12:00:00"), ("time", "00:00:00"), ("timetz", "12:00:00-05:30")]
+    {
+        let expected = run(&format!(
+            "SELECT ({kind} '{target}' + interval '{NEAR_BOUND_CLOCK_IN_A_DAY}')::text;"
+        ));
+        for (op, interval) in [("+", clock.to_string()), ("-", format!("-{clock}"))] {
+            let literal = format!("SELECT ({kind} '{target}' {op} interval '{interval}')::text;");
+            assert_eq!(run(&literal), expected, "{literal}");
+            let column = format!(
+                "CREATE TABLE w (tg {kind}, iv interval);\nINSERT INTO w VALUES ('{target}', '{interval}');\nSELECT (tg {op} iv)::text FROM w;"
+            );
+            assert_eq!(run(&column), expected, "{column}");
+        }
+    }
+}
+
+#[test]
+fn a_time_shift_that_wraps_for_every_time_of_day_matches_postgresql() {
+    // Twice this clock is -2^63 microseconds, so subtracting it leaves 64
+    // bits for every time of day, and PostgreSQL answers the time of day
+    // moved by 19:59:05.224192.
+    for target in ["12:00:00.001", "00:00:00"] {
+        let scaled = run(&format!(
+            "SELECT (time '{target}' - 2 * interval '-1281023894:00:27.387904')::text;"
+        ));
+        let reduced = run(&format!("SELECT (time '{target}' + interval '19:59:05.224192')::text;"));
+        assert_eq!(scaled, reduced, "{target}");
+    }
+}
+
+#[test]
+fn a_volatile_time_shifted_past_the_64_bit_bound_is_refused() {
+    // The wrapping form reads the time of day for the bound and for each
+    // answer, and `clock_timestamp()` answers anew on each read.
+    let volatile = "CAST(clock_timestamp() AS time)";
+    let wrapping = format!("SELECT ({volatile} + interval '{NEAR_BOUND_CLOCK}')::text FROM t;");
+    refused(&wrapping, "64 bits");
+    refused(&wrapping, "clock_timestamp");
+    let within = format!("{SCHEMA}\nSELECT ({volatile} + interval '1 hour')::text FROM t;");
+    assert!(
+        Pg2Sqlite::default()
+            .sql(&within)
+            .expect("parse")
+            .translate_to_sql(&Pg2SqliteOptions::default())
+            .is_ok(),
+        "a shift that stays in 64 bits reads the time of day once"
+    );
+}
+
+#[test]
+fn a_time_minus_an_interval_reads_only_its_clock() {
+    // `time_mi_interval` subtracts the time field, so months and days with
+    // no negation in 32 bits take no part.
+    for (expression, answer) in [
+        ("time '00:00:00' - interval '-2147483648 days'", "00:00:00"),
+        ("time '10:00:00' - interval '-178956970 years -8 mons 01:00:00'", "09:00:00"),
+        ("timetz '10:00:00-05:30' - interval '-2147483648 days 01:00:00'", "09:00:00-05:30"),
+    ] {
+        assert_eq!(run(&format!("SELECT ({expression})::text;")), some(&[answer]), "{expression}");
+    }
+}
+
 #[test]
 fn a_signed_factor_matches_postgresql() {
     let schema = "CREATE TABLE fz (id int, iv interval, k int);\nINSERT INTO fz VALUES (1, '1 day 02:00:00', 3), (2, '1 mon', -2);";

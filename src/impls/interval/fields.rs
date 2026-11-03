@@ -27,9 +27,9 @@ use sqlparser::{
 };
 
 use super::{
-    IntervalShift,
+    ClockShift, IntervalShift, WRAP_IN_A_DAY,
     decode::{Decoded, Interval, Typmod, interval_in},
-    fields_templates,
+    fields_templates, interval_out_of_range,
     keys::{self, IntervalSide},
     postgres_text, refused,
 };
@@ -41,7 +41,9 @@ use crate::{
         replay::{is_replayable, reject_duplicated_operand},
         shared_helpers::{declared_type_matches, numeric_scale},
         temporal_arithmetic::{TemporalKind, temporal_kind_of},
-        translator_impls::expr::{shifted_by_modifiers, shifted_interval_target},
+        translator_impls::expr::{
+            shifted_by_modifiers, shifted_interval_target, shifted_time_of_day,
+        },
     },
     options::TranslationContext,
     traits::translator::TranslatorWithContext,
@@ -248,14 +250,6 @@ fn no_subquery_refusal() -> Error {
     )
 }
 
-/// The refusal an arithmetic answer over PostgreSQL's field limits answers.
-fn interval_out_of_range() -> Error {
-    Error::forward_refusal(
-        "interval out of range. PostgreSQL refuses this interval, so the translation does too."
-            .to_string(),
-    )
-}
-
 /// The NULL literal an arithmetic over a NULL side answers.
 fn null_literal() -> Expr {
     Expr::Value(ValueWithSpan::from(Value::Null))
@@ -339,9 +333,7 @@ fn shifted_target(
     };
     let operand = match row {
         FieldRow::Literal(value) => {
-            let value =
-                if negate { value.negated().map_err(|_| interval_out_of_range())? } else { value };
-            let shift = IntervalShift(value);
+            let shift = IntervalShift { interval: value, subtract: negate };
             return shifted_interval_target(target, (op, interval), &shift, schema, options, emit)
                 .map(Some);
         }
@@ -365,26 +357,42 @@ fn shifted_target(
     let printf = |format: &str, value: Expr| {
         simple_function_expr("printf", vec![string_literal(format), signed(value)], None)
     };
-    let fraction = || {
-        binary(
+    let target_ref = Expr::CompoundIdentifier(vec![Ident::new("tv"), Ident::new("tg")]);
+    let body = if let TemporalKind::Time { zoned } = kind {
+        // `time_pl_interval` adds the time field alone in 64 bits, which wrap
+        // past the bound, takes the whole days off, and ignores the months
+        // and days. `signed` negates a subtracted clock's modifiers.
+        let clock_modifiers = |micros: Expr| {
+            let fraction = binary(
+                binary(micros.clone(), BinaryOperator::Modulo, integer_literal(1_000_000)),
+                BinaryOperator::Divide,
+                number_literal("1000000.0"),
+            );
+            vec![
+                printf(
+                    "%+d seconds",
+                    binary(micros, BinaryOperator::Divide, integer_literal(1_000_000)),
+                ),
+                printf("%+.6f seconds", fraction),
+            ]
+        };
+        let in_a_day = binary(field("u"), BinaryOperator::Modulo, integer_literal(86_400_000_000));
+        let toward_wrap = if negate { BinaryOperator::Plus } else { BinaryOperator::Minus };
+        let wrapped = binary(in_a_day.clone(), toward_wrap.clone(), integer_literal(WRAP_IN_A_DAY));
+        // `i64::MAX ∓ u` past 64 bits turns to a REAL above every time of day.
+        let threshold = binary(integer_literal(i64::MAX), toward_wrap, field("u"));
+        let clock = ClockShift {
+            modifiers: clock_modifiers(in_a_day),
+            wrap: Some((threshold, clock_modifiers(wrapped))),
+        };
+        shifted_time_of_day(target_ref, &clock, zoned)
+    } else {
+        let fraction = binary(
             binary(field("u"), BinaryOperator::Modulo, integer_literal(1_000_000)),
             BinaryOperator::Divide,
             number_literal("1000000.0"),
-        )
-    };
-    let modifiers = if matches!(kind, TemporalKind::Time { .. }) {
-        // `time_pl_interval` applies the time field alone, wrapped at 24
-        // hours, and ignores the months and days.
-        let wrapped = binary(field("u"), BinaryOperator::Modulo, integer_literal(86_400_000_000));
-        vec![
-            printf(
-                "%+d seconds",
-                binary(wrapped, BinaryOperator::Divide, integer_literal(1_000_000)),
-            ),
-            printf("%+.6f seconds", fraction()),
-        ]
-    } else {
-        vec![
+        );
+        let modifiers = vec![
             printf("%+d months", field("m")),
             string_literal("floor"),
             printf("%+d days", field("d")),
@@ -392,11 +400,10 @@ fn shifted_target(
                 "%+d seconds",
                 binary(field("u"), BinaryOperator::Divide, integer_literal(1_000_000)),
             ),
-            printf("%+.6f seconds", fraction()),
-        ]
+            printf("%+.6f seconds", fraction),
+        ];
+        shifted_by_modifiers(target_ref, &modifiers)
     };
-    let target_ref = Expr::CompoundIdentifier(vec![Ident::new("tv"), Ident::new("tg")]);
-    let body = shifted_by_modifiers(target_ref, Some(kind), &modifiers);
     // `printf` reads a NULL field as zero, so a NULL interval answers NULL
     // before the modifiers see it.
     let template = format!(
