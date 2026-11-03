@@ -58,3 +58,75 @@ pub(super) const RENDER: &str = "CASE
         ELSE '' END)
  END
 END";
+
+/// The factor placeholder a multiplication or division substitutes.
+pub(super) const FACTOR: &str = "pg2sqlite_interval_factor";
+
+/// PostgreSQL's `rint` on a `double`, ties to even: adding and taking away
+/// `2^52` leaves no fraction bits on the magnitude, and a magnitude at or
+/// above `2^52` is already integral.
+fn rint(x: &str) -> String {
+    format!(
+        "(CASE WHEN ABS({x}) >= 4503599627370496.0 THEN {x} \
+         WHEN {x} < 0.0 THEN -((-({x}) + 4503599627370496.0) - 4503599627370496.0) \
+         ELSE ({x} + 4503599627370496.0) - 4503599627370496.0 END)"
+    )
+}
+
+/// PostgreSQL's `TSROUND`, `rint(x * 1e6) / 1e6`.
+fn tsround(x: &str) -> String {
+    format!("({} / 1000000.0)", rint(&format!("{x} * 1000000.0")))
+}
+
+/// The canonical text of `interval_mul`, or `interval_div` when `divide`,
+/// over a `source` row of an interval's `m`, `d` and `u` fields and the `f`
+/// factor as a `REAL`.
+///
+/// Each derived table is one statement of PostgreSQL's function in its
+/// order, so every intermediate double is the one PostgreSQL computes: the
+/// month and day products truncated into their fields, the month fraction
+/// cascaded to days and the day fraction to seconds under `TSROUND`, a whole
+/// day of seconds carried into the days, and the time rounded with `rint`.
+/// `NULL` wherever PostgreSQL raises `interval out of range` or `division by
+/// zero`, and for fields already past the 32-bit or 64-bit range, which a
+/// summed `avg` operand reaches where PostgreSQL's accumulation raises.
+///
+/// Every derived table carries `LIMIT -1 OFFSET 0`, which keeps SQLite from
+/// flattening it into the next: a layer names its inputs more than once, so
+/// flattening substitutes each input expression at every use, and the
+/// expression grows exponentially with the depth.
+pub(super) fn scaled(source: &str, divide: bool) -> String {
+    let op = if divide { "/" } else { "*" };
+    let zero_factor = if divide { "WHEN f = 0.0 THEN NULL " } else { "" };
+    let render =
+        RENDER.replace(FIELD_U, "CAST(t AS INTEGER)").replace(FIELD_D, "d2").replace(FIELD_M, "mo");
+    let layers = [
+        format!("m, d, u, f, m {op} f AS mp, d {op} f AS dp"),
+        "*, CAST(mp AS INTEGER) AS mo, CAST(dp AS INTEGER) AS d0, \
+         (mp - CAST(mp AS INTEGER)) * 30.0 AS mraw"
+            .to_string(),
+        format!("*, {} AS mrd", tsround("mraw")),
+        "*, (dp - d0 + mrd - CAST(mrd AS INTEGER)) * 86400.0 AS sraw".to_string(),
+        format!("*, {} AS s0", tsround("sraw")),
+        "*, CASE WHEN ABS(s0) >= 86400.0 THEN CAST(s0 / 86400.0 AS INTEGER) ELSE 0 END AS carry"
+            .to_string(),
+        "*, d0 + carry AS d1, s0 - carry * 86400.0 AS sr".to_string(),
+        format!("*, d1 + CAST(mrd AS INTEGER) AS d2, u {op} f + sr * 1000000.0 AS traw"),
+        format!("*, {} AS t", rint("traw")),
+    ];
+    let rows = layers.iter().fold(source.to_string(), |from, columns| {
+        format!("(SELECT {columns} FROM {from} LIMIT -1 OFFSET 0)")
+    });
+    format!(
+        "(SELECT CASE \
+         WHEN typeof(u) <> 'integer' OR m < -2147483648 OR m > 2147483647 \
+         OR d < -2147483648 OR d > 2147483647 THEN NULL \
+         {zero_factor}\
+         WHEN NOT (mp >= -2147483648.0 AND mp < 2147483648.0) THEN NULL \
+         WHEN NOT (dp >= -2147483648.0 AND dp < 2147483648.0) THEN NULL \
+         WHEN d1 < -2147483648 OR d1 > 2147483647 THEN NULL \
+         WHEN d2 < -2147483648 OR d2 > 2147483647 THEN NULL \
+         WHEN NOT (t >= -9223372036854775808.0 AND t < 9223372036854775808.0) THEN NULL \
+         ELSE {render} END FROM {rows})"
+    )
+}

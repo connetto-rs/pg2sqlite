@@ -96,7 +96,9 @@ fn shift(
     let Some(text) = single_quoted_literal(interval.value.as_ref()) else { return Ok(None) };
     let mut value = finite_interval(text, qualifier_typmod(interval)?)?;
     if let Some(factor) = factor {
-        value = value.multiplied(factor).map_err(|refusal| refused(text, refusal))?;
+        value = value
+            .scaled(decode::int_to_f64(factor), false)
+            .map_err(|refusal| refused(text, refusal))?;
     }
     if negate {
         value = value.negated().map_err(|refusal| refused(text, refusal))?;

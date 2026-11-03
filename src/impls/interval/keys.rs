@@ -36,7 +36,9 @@ use sqlparser::{
 };
 
 use super::{
-    Typmod, interval_data_type_typmod, is_interval_data_type,
+    Typmod,
+    fields::Aggregate,
+    interval_data_type_typmod, is_interval_data_type,
     keys_templates::{self, PLACEHOLDER},
     literal_comparison_key, literal_text, qualifier_typmod,
 };
@@ -733,19 +735,8 @@ pub(crate) fn function(
     match name.as_str() {
         "count" => count(func, list, &args, schema, options, emit),
         "min" | "max" => extremum(name.as_str(), func, &args, schema, options, emit),
-        "sum" => sum_aggregate(func, list, &args, schema, options, emit),
-        "avg" => {
-            if any_interval_typed(&args, schema, options) {
-                Err(Error::forward_refusal(
-                    "avg over an interval cannot be translated: the answer is an \
-                     interval, and SQLite has no interval type to hold one. Aggregate in the \
-                     application."
-                        .to_string(),
-                ))
-            } else {
-                Ok(None)
-            }
-        }
+        "sum" => interval_aggregate(Aggregate::Sum, func, list, &args, schema, options, emit),
+        "avg" => interval_aggregate(Aggregate::Avg, func, list, &args, schema, options, emit),
         "date_part" => {
             if args.get(1).is_some_and(|arg| is_interval_typed(arg, schema, options)) {
                 Err(Error::forward_refusal(
@@ -848,14 +839,16 @@ fn count(
     })))
 }
 
-/// The interval translation of a `sum` call: the fields summed the way
-/// PostgreSQL's `do_interval_accum` adds row by row, rendered in the text
+/// The interval translation of a `sum` or `avg` call: the fields summed the
+/// way PostgreSQL's `do_interval_accum` adds row by row, an average divided
+/// by the row count the way `interval_avg` divides, rendered in the text
 /// PostgreSQL prints.
 ///
 /// # Errors
 ///
 /// Propagates the refusal the call answers.
-fn sum_aggregate(
+fn interval_aggregate(
+    kind: Aggregate,
     func: &Function,
     list: &FunctionArgumentList,
     args: &[&Expr],
@@ -866,20 +859,23 @@ fn sum_aggregate(
     if !any_interval_typed(args, schema, options) {
         return Ok(None);
     }
+    let name = match kind {
+        Aggregate::Sum => "sum",
+        Aggregate::Avg => "avg",
+    };
     if list.args.iter().any(|arg| !matches!(arg, FunctionArg::Unnamed(_))) {
         let types = call_argument_types(list, schema, options);
         return Err(Error::forward_refusal(format!(
-            "function sum({types}) does not exist. PostgreSQL has no sum over named \
+            "function {name}({types}) does not exist. PostgreSQL has no {name} over named \
              arguments, so this is not a statement the server runs."
         )));
     }
     if list.duplicate_treatment.is_some() {
-        return Err(Error::forward_refusal(
-            "sum(DISTINCT) over an interval cannot be translated: the fields are summed over \
+        return Err(Error::forward_refusal(format!(
+            "{name}(DISTINCT) over an interval cannot be translated: the fields are summed over \
              every row, and PostgreSQL decides the distinct rows on the value, not the text. \
              Aggregate in the application."
-                .to_string(),
-        ));
+        )));
     }
     if args.len() > 1 {
         let types = args
@@ -888,28 +884,25 @@ fn sum_aggregate(
             .collect::<Vec<_>>()
             .join(", ");
         return Err(Error::forward_refusal(format!(
-            "function sum({types}) does not exist. PostgreSQL has no sum over a pair of \
+            "function {name}({types}) does not exist. PostgreSQL has no {name} over a pair of \
              values, so this is not a statement the server runs."
         )));
     }
     if func.over.is_some() {
-        return Err(Error::forward_refusal(
-            "sum over an interval with an OVER clause cannot be translated: the fields are \
+        return Err(Error::forward_refusal(format!(
+            "{name} over an interval with an OVER clause cannot be translated: the fields are \
              summed in a scalar subquery, and SQLite does not allow one inside a window \
              function."
-                .to_string(),
-        ));
+        )));
     }
     if func.filter.is_some() || !func.within_group.is_empty() || func.null_treatment.is_some() {
-        return Err(Error::forward_refusal(
-            "sum over an interval with a FILTER or WITHIN GROUP clause cannot be translated: \
+        return Err(Error::forward_refusal(format!(
+            "{name} over an interval with a FILTER or WITHIN GROUP clause cannot be translated: \
              the fields are summed in a scalar subquery, and the clause does not carry \
              through it. Aggregate in the application."
-                .to_string(),
-        ));
+        )));
     }
-    let arg = args[0];
-    Ok(Some(super::fields::sum(arg, schema, options, emit)?))
+    Ok(Some(super::fields::aggregate(kind, args[0], schema, options, emit)?))
 }
 
 /// PostgreSQL's spelling of a call's arguments, a named one as `name => type`.

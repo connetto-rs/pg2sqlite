@@ -390,10 +390,18 @@ fn interval_addition_and_subtraction_answer_postgresqls_text() {
 }
 
 #[test]
-fn interval_multiplication_and_division_are_refused() {
-    refused("SELECT iv * 2 FROM t;", "cannot be translated: the answer is an interval");
-    refused("SELECT 2 * iv FROM t;", "cannot be translated: the answer is an interval");
-    refused("SELECT iv / 2 FROM t;", "cannot be translated: the answer is an interval");
+fn interval_multiplication_and_division_answer_postgresqls_text() {
+    let run = |query: &str| {
+        run_translated_with(&format!("{SCHEMA}\n{query}"), &Pg2SqliteOptions::default())
+    };
+    let doubled =
+        vec![Some("2 days".to_string()), Some("2 mons".to_string()), Some("20 days".to_string())];
+    assert_eq!(run("SELECT (iv * 2)::text FROM t ORDER BY id;"), doubled);
+    assert_eq!(run("SELECT (2 * iv)::text FROM t ORDER BY id;"), doubled);
+    assert_eq!(
+        run("SELECT (iv / 2)::text FROM t ORDER BY id;"),
+        vec![Some("12:00:00".to_string()), Some("15 days".to_string()), Some("5 days".to_string())]
+    );
 }
 
 #[test]
@@ -415,13 +423,12 @@ fn a_negated_interval_answers_postgresqls_text() {
 }
 
 #[test]
-fn interval_aggregates_and_field_reads_are_refused() {
-    let got = run_translated_with(
-        &format!("{SCHEMA}\nSELECT sum(iv)::text FROM t;"),
-        &Pg2SqliteOptions::default(),
-    );
-    assert_eq!(got, vec![Some("1 mon 11 days".to_string())]);
-    refused("SELECT avg(iv) FROM t;", "avg over an interval cannot be translated");
+fn interval_aggregates_answer_and_field_reads_are_refused() {
+    let run = |query: &str| {
+        run_translated_with(&format!("{SCHEMA}\n{query}"), &Pg2SqliteOptions::default())
+    };
+    assert_eq!(run("SELECT sum(iv)::text FROM t;"), vec![Some("1 mon 11 days".to_string())]);
+    assert_eq!(run("SELECT avg(iv)::text FROM t;"), vec![Some("13 days 16:00:00".to_string())]);
     refused("SELECT extract(day FROM iv) FROM t;", "extract over an interval");
     refused("SELECT date_part('day', iv) FROM t;", "date_part over an interval");
     refused("SELECT to_char(iv, 'DD') FROM t;", "to_char over an interval");

@@ -2840,6 +2840,12 @@ fn interval_binary(
         // Concatenation and the remaining operators run on the stored text.
         return Ok(None);
     }
+    if matches!(op, BinaryOperator::Multiply | BinaryOperator::Divide) {
+        return crate::impls::interval::fields::scaled_binary(
+            op, left, right, schema, options, emit,
+        )
+        .map(Some);
+    }
     let left_shift = extract_interval_expr(left).is_some() || scalar_times_interval(left).is_some();
     let right_shift =
         extract_interval_expr(right).is_some() || scalar_times_interval(right).is_some();
@@ -2852,16 +2858,7 @@ fn interval_binary(
             return Ok(None);
         }
     }
-    if matches!(op, BinaryOperator::Plus | BinaryOperator::Minus) {
-        return crate::impls::interval::fields::binary(op, left, right, schema, options, emit)
-            .map(Some);
-    }
-    Err(crate::errors::Error::forward_refusal(format!(
-        "{} {op} {} cannot be translated: the answer is an interval, and SQLite has no interval \
-         type to hold one. Apply the interval to a date or a timestamp in the application.",
-        keys::message_type_name_of(left, schema, options),
-        keys::message_type_name_of(right, schema, options)
-    )))
+    crate::impls::interval::fields::binary(op, left, right, schema, options, emit).map(Some)
 }
 
 /// Translate a binary operation expression.
@@ -2880,6 +2877,18 @@ fn translate_binary_op(
         return crate::impls::translator_impls::blob_operator::translate(
             &resolved, left, right, schema, options, emit,
         );
+    }
+    // Interval arithmetic answers before the NUMERIC rules, which would read
+    // a scaled factor beside an interval as minor units of a NUMERIC result.
+    if matches!(
+        op,
+        BinaryOperator::Plus
+            | BinaryOperator::Minus
+            | BinaryOperator::Multiply
+            | BinaryOperator::Divide
+    ) && let Some(resolved) = interval_binary(left, op, right, schema, options, emit)?
+    {
+        return Ok(resolved);
     }
     if numeric_rules_may_apply(op, left, right) {
         let scales = (scale_of(left, schema, options), scale_of(right, schema, options));
@@ -3556,12 +3565,6 @@ fn translate_binary_op(
             return translate_binary_op(left, &plain, right, schema, options, emit);
         }
         _ => {}
-    }
-
-    // Only the arithmetic refusal reaches this far; a comparison with an
-    // interval side answers through the call above.
-    if let Some(resolved) = interval_binary(left, op, right, schema, options, emit)? {
-        return Ok(resolved);
     }
 
     // PG INTERVAL arithmetic: `target + INTERVAL 'N unit'` becomes

@@ -1,5 +1,6 @@
 //! The exact interval arithmetic answers, checked against PostgreSQL 18.6:
-//! negation, addition and subtraction of intervals, and their sum.
+//! negation, addition and subtraction of intervals, multiplication and
+//! division by a factor, and their sum and average.
 //!
 //! The differential pairs are canonical interval texts PostgreSQL stores, and
 //! its measured answers to negating the first and adding or subtracting the
@@ -6787,6 +6788,1315 @@ const SUM_ROWS: &[&str] = &[
 /// PostgreSQL's answer for the total of the corpus.
 const SUM_TOTAL: &str = "3720 years 5 mons -262 days +00:00:54.541936";
 
+/// The intervals the multiplication and division corpus scales, as
+/// PostgreSQL prints them.
+const SCALED_INTERVALS: &[&str] = &[
+    "1 day",
+    "-1 days",
+    "1 mon",
+    "1 year 2 mons 3 days 04:05:06.789",
+    "1 mon -1 days +01:00:00",
+    "-1 years -9 mons",
+    "00:00:00.000001",
+    "2147483647 days",
+    "-2147483648 days",
+    "178956970 years 7 mons",
+    "-178956970 years -8 mons",
+    "2562047788:00:54.775807",
+    "-2562047788:00:54.775807",
+    "23:59:59.999999",
+    "1 mon 15 days",
+    "3 mons",
+    "7 days 12:00:00",
+    "-1 mons +29 days -23:59:59",
+    "00:00:00",
+    "10 years",
+    "1 mon 1 day 00:00:00.000001",
+    "5 days 00:00:00.5",
+    "-3 mons -7 days -00:00:00.000001",
+    "1 mon 30 days -23:59:59.999999",
+    "2 mons 1 day",
+    "100 years 100 days 100:00:00",
+];
+
+/// The factors the corpus scales by, as the statement writes them.
+const FACTORS: &[&str] = &[
+    "0",
+    "1",
+    "2",
+    "-3",
+    "7",
+    "1000000",
+    "2147483647",
+    "-2147483648",
+    "1.5",
+    "0.1",
+    "-2.5",
+    "0.33333333333333333333",
+    "0.5",
+    "1.000001",
+    "3.14159",
+    "1e-7",
+    "1e9",
+    "0.0001",
+    "86400.5",
+    "-0.75",
+    "2.5e-10",
+    "12",
+    "30",
+    "-1",
+];
+
+/// PostgreSQL's answers to `iv * f`, `f * iv` and `iv / f` for every interval
+/// of [`SCALED_INTERVALS`] and, within it, every factor of [`FACTORS`], `None`
+/// where PostgreSQL raises `interval out of range` or `division by zero`.
+const SCALED: &[[Option<&str>; 3]] = &[
+    [Some("00:00:00"), Some("00:00:00"), None],
+    [Some("1 day"), Some("1 day"), Some("1 day")],
+    [Some("2 days"), Some("2 days"), Some("12:00:00")],
+    [Some("-3 days"), Some("-3 days"), Some("-08:00:00")],
+    [Some("7 days"), Some("7 days"), Some("03:25:42.857143")],
+    [Some("1000000 days"), Some("1000000 days"), Some("00:00:00.0864")],
+    [Some("2147483647 days"), Some("2147483647 days"), Some("00:00:00.00004")],
+    [Some("-2147483648 days"), Some("-2147483648 days"), Some("-00:00:00.00004")],
+    [Some("1 day 12:00:00"), Some("1 day 12:00:00"), Some("16:00:00")],
+    [Some("02:24:00"), Some("02:24:00"), Some("10 days")],
+    [Some("-2 days -12:00:00"), Some("-2 days -12:00:00"), Some("-09:36:00")],
+    [Some("08:00:00"), Some("08:00:00"), Some("3 days")],
+    [Some("12:00:00"), Some("12:00:00"), Some("2 days")],
+    [Some("1 day 00:00:00.0864"), Some("1 day 00:00:00.0864"), Some("23:59:59.9136")],
+    [Some("3 days 03:23:53.376"), Some("3 days 03:23:53.376"), Some("07:38:21.997396")],
+    [Some("00:00:00.00864"), Some("00:00:00.00864"), Some("10000000 days")],
+    [Some("1000000000 days"), Some("1000000000 days"), Some("00:00:00.000086")],
+    [Some("00:00:08.64"), Some("00:00:08.64"), Some("10000 days")],
+    [Some("86400 days 12:00:00"), Some("86400 days 12:00:00"), Some("00:00:00.999994")],
+    [Some("-18:00:00"), Some("-18:00:00"), Some("-1 days -08:00:00")],
+    [Some("00:00:00.000022"), Some("00:00:00.000022"), None],
+    [Some("12 days"), Some("12 days"), Some("02:00:00")],
+    [Some("30 days"), Some("30 days"), Some("00:48:00")],
+    [Some("-1 days"), Some("-1 days"), Some("-1 days")],
+    [Some("00:00:00"), Some("00:00:00"), None],
+    [Some("-1 days"), Some("-1 days"), Some("-1 days")],
+    [Some("-2 days"), Some("-2 days"), Some("-12:00:00")],
+    [Some("3 days"), Some("3 days"), Some("08:00:00")],
+    [Some("-7 days"), Some("-7 days"), Some("-03:25:42.857143")],
+    [Some("-1000000 days"), Some("-1000000 days"), Some("-00:00:00.0864")],
+    [Some("-2147483647 days"), Some("-2147483647 days"), Some("-00:00:00.00004")],
+    [None, None, Some("00:00:00.00004")],
+    [Some("-1 days -12:00:00"), Some("-1 days -12:00:00"), Some("-16:00:00")],
+    [Some("-02:24:00"), Some("-02:24:00"), Some("-10 days")],
+    [Some("2 days 12:00:00"), Some("2 days 12:00:00"), Some("09:36:00")],
+    [Some("-08:00:00"), Some("-08:00:00"), Some("-3 days")],
+    [Some("-12:00:00"), Some("-12:00:00"), Some("-2 days")],
+    [Some("-1 days -00:00:00.0864"), Some("-1 days -00:00:00.0864"), Some("-23:59:59.9136")],
+    [Some("-3 days -03:23:53.376"), Some("-3 days -03:23:53.376"), Some("-07:38:21.997396")],
+    [Some("-00:00:00.00864"), Some("-00:00:00.00864"), Some("-10000000 days")],
+    [Some("-1000000000 days"), Some("-1000000000 days"), Some("-00:00:00.000086")],
+    [Some("-00:00:08.64"), Some("-00:00:08.64"), Some("-10000 days")],
+    [Some("-86400 days -12:00:00"), Some("-86400 days -12:00:00"), Some("-00:00:00.999994")],
+    [Some("18:00:00"), Some("18:00:00"), Some("1 day 08:00:00")],
+    [Some("-00:00:00.000022"), Some("-00:00:00.000022"), None],
+    [Some("-12 days"), Some("-12 days"), Some("-02:00:00")],
+    [Some("-30 days"), Some("-30 days"), Some("-00:48:00")],
+    [Some("1 day"), Some("1 day"), Some("1 day")],
+    [Some("00:00:00"), Some("00:00:00"), None],
+    [Some("1 mon"), Some("1 mon"), Some("1 mon")],
+    [Some("2 mons"), Some("2 mons"), Some("15 days")],
+    [Some("-3 mons"), Some("-3 mons"), Some("-10 days")],
+    [Some("7 mons"), Some("7 mons"), Some("4 days 06:51:25.6896")],
+    [Some("83333 years 4 mons"), Some("83333 years 4 mons"), Some("00:00:02.592")],
+    [Some("178956970 years 7 mons"), Some("178956970 years 7 mons"), Some("00:00:00")],
+    [Some("-178956970 years -8 mons"), Some("-178956970 years -8 mons"), Some("00:00:00")],
+    [Some("1 mon 15 days"), Some("1 mon 15 days"), Some("20 days")],
+    [Some("3 days"), Some("3 days"), Some("10 mons")],
+    [Some("-2 mons -15 days"), Some("-2 mons -15 days"), Some("-12 days")],
+    [Some("10 days"), Some("10 days"), Some("3 mons")],
+    [Some("15 days"), Some("15 days"), Some("2 mons")],
+    [Some("1 mon 00:00:02.592"), Some("1 mon 00:00:02.592"), Some("29 days 23:59:57.408")],
+    [
+        Some("3 mons 4 days 05:56:41.28"),
+        Some("3 mons 4 days 05:56:41.28"),
+        Some("9 days 13:10:59.952"),
+    ],
+    [Some("00:00:00.2592"), Some("00:00:00.2592"), Some("833333 years 4 mons")],
+    [Some("83333333 years 4 mons"), Some("83333333 years 4 mons"), Some("00:00:00")],
+    [Some("00:04:19.2"), Some("00:04:19.2"), Some("833 years 4 mons")],
+    [Some("7200 years 15 days"), Some("7200 years 15 days"), Some("00:00:29.9808")],
+    [Some("-22 days -12:00:00"), Some("-22 days -12:00:00"), Some("-1 mons -10 days")],
+    [Some("00:00:00"), Some("00:00:00"), None],
+    [Some("1 year"), Some("1 year"), Some("2 days 12:00:00")],
+    [Some("2 years 6 mons"), Some("2 years 6 mons"), Some("1 day")],
+    [Some("-1 mons"), Some("-1 mons"), Some("-1 mons")],
+    [Some("00:00:00"), Some("00:00:00"), None],
+    [
+        Some("1 year 2 mons 3 days 04:05:06.789"),
+        Some("1 year 2 mons 3 days 04:05:06.789"),
+        Some("1 year 2 mons 3 days 04:05:06.789"),
+    ],
+    [
+        Some("2 years 4 mons 6 days 08:10:13.578"),
+        Some("2 years 4 mons 6 days 08:10:13.578"),
+        Some("7 mons 1 day 14:02:33.3945"),
+    ],
+    [
+        Some("-3 years -6 mons -9 days -12:15:20.367"),
+        Some("-3 years -6 mons -9 days -12:15:20.367"),
+        Some("-4 mons -21 days -01:21:42.263"),
+    ],
+    [
+        Some("8 years 2 mons 21 days 28:35:47.523"),
+        Some("8 years 2 mons 21 days 28:35:47.523"),
+        Some("2 mons 10:52:09.541286"),
+    ],
+    [
+        Some("1166666 years 8 mons 3000000 days 4085219:10:00"),
+        Some("1166666 years 8 mons 3000000 days 4085219:10:00"),
+        Some("00:00:36.561907"),
+    ],
+    [None, None, Some("00:00:00.000128")],
+    [None, None, Some("-00:00:00.000128")],
+    [
+        Some("1 year 9 mons 4 days 18:07:40.1835"),
+        Some("1 year 9 mons 4 days 18:07:40.1835"),
+        Some("9 mons 12 days 02:43:24.526"),
+    ],
+    [
+        Some("1 mon 12 days 07:36:30.6789"),
+        Some("1 mon 12 days 07:36:30.6789"),
+        Some("11 years 8 mons 30 days 40:51:07.89"),
+    ],
+    [
+        Some("-2 years -11 mons -7 days -22:12:46.9725"),
+        Some("-2 years -11 mons -7 days -22:12:46.9725"),
+        Some("-5 mons -19 days -06:26:02.7156"),
+    ],
+    [
+        Some("4 mons 21 days 01:21:42.263"),
+        Some("4 mons 21 days 01:21:42.263"),
+        Some("3 years 6 mons 9 days 12:15:20.367"),
+    ],
+    [
+        Some("7 mons 1 day 14:02:33.3945"),
+        Some("7 mons 1 day 14:02:33.3945"),
+        Some("2 years 4 mons 6 days 08:10:13.578"),
+    ],
+    [
+        Some("1 year 2 mons 3 days 04:05:43.350907"),
+        Some("1 year 2 mons 3 days 04:05:43.350907"),
+        Some("1 year 1 mon 32 days 28:04:30.227093"),
+    ],
+    [
+        Some("3 years 7 mons 38 days 34:15:20.749255"),
+        Some("3 years 7 mons 38 days 34:15:20.749255"),
+        Some("4 mons 14 days 16:47:06.208476"),
+    ],
+    [
+        Some("00:00:03.656191"),
+        Some("00:00:03.656191"),
+        Some("11666666 years 8 mons 30000000 days 40852191:40:00"),
+    ],
+    [None, None, Some("00:00:00.000274")],
+    [
+        Some("01:00:56.190679"),
+        Some("01:00:56.190679"),
+        Some("11666 years 8 mons 30000 days 40852:11:30"),
+    ],
+    [
+        Some("100800 years 7 mons 259201 days 352976:58:42.9945"),
+        Some("100800 years 7 mons 259201 days 352976:58:42.9945"),
+        Some("00:07:03.160599"),
+    ],
+    [
+        Some("-10 mons -17 days -09:03:50.09175"),
+        Some("-10 mons -17 days -09:03:50.09175"),
+        Some("-1 years -6 mons -24 days -05:26:49.052"),
+    ],
+    [Some("00:00:00.000069"), Some("00:00:00.000069"), None],
+    [
+        Some("14 years 36 days 49:01:21.468"),
+        Some("14 years 36 days 49:01:21.468"),
+        Some("1 mon 5 days 06:20:25.56575"),
+    ],
+    [
+        Some("35 years 90 days 122:33:23.67"),
+        Some("35 years 90 days 122:33:23.67"),
+        Some("14 days 02:32:10.2263"),
+    ],
+    [
+        Some("-1 years -2 mons -3 days -04:05:06.789"),
+        Some("-1 years -2 mons -3 days -04:05:06.789"),
+        Some("-1 years -2 mons -3 days -04:05:06.789"),
+    ],
+    [Some("00:00:00"), Some("00:00:00"), None],
+    [
+        Some("1 mon -1 days +01:00:00"),
+        Some("1 mon -1 days +01:00:00"),
+        Some("1 mon -1 days +01:00:00"),
+    ],
+    [Some("2 mons -2 days +02:00:00"), Some("2 mons -2 days +02:00:00"), Some("15 days -11:30:00")],
+    [
+        Some("-3 mons +3 days -03:00:00"),
+        Some("-3 mons +3 days -03:00:00"),
+        Some("-10 days +07:40:00"),
+    ],
+    [
+        Some("7 mons -7 days +07:00:00"),
+        Some("7 mons -7 days +07:00:00"),
+        Some("4 days 03:34:17.118171"),
+    ],
+    [
+        Some("83333 years 4 mons -1000000 days +1000000:00:00"),
+        Some("83333 years 4 mons -1000000 days +1000000:00:00"),
+        Some("00:00:02.5092"),
+    ],
+    [
+        Some("178956970 years 7 mons -2147483647 days +2147483647:00:00"),
+        Some("178956970 years 7 mons -2147483647 days +2147483647:00:00"),
+        Some("-00:00:00.000038"),
+    ],
+    [None, None, Some("00:00:00.000038")],
+    [Some("1 mon 14 days -10:30:00"), Some("1 mon 14 days -10:30:00"), Some("20 days -15:20:00")],
+    [Some("3 days -02:18:00"), Some("3 days -02:18:00"), Some("10 mons -10 days +10:00:00")],
+    [
+        Some("-2 mons -13 days +09:30:00"),
+        Some("-2 mons -13 days +09:30:00"),
+        Some("-12 days +09:12:00"),
+    ],
+    [Some("10 days -07:40:00"), Some("10 days -07:40:00"), Some("3 mons -3 days +03:00:00")],
+    [Some("15 days -11:30:00"), Some("15 days -11:30:00"), Some("2 mons -2 days +02:00:00")],
+    [
+        Some("1 mon -1 days +01:00:02.5092"),
+        Some("1 mon -1 days +01:00:02.5092"),
+        Some("29 days 00:59:57.4908"),
+    ],
+    [
+        Some("3 mons 1 day 05:41:17.628"),
+        Some("3 mons 1 day 05:41:17.628"),
+        Some("9 days 05:51:43.871162"),
+    ],
+    [
+        Some("00:00:00.25092"),
+        Some("00:00:00.25092"),
+        Some("833333 years 4 mons -10000000 days +10000000:00:00"),
+    ],
+    [
+        Some("83333333 years 4 mons -1000000000 days +1000000000:00:00"),
+        Some("83333333 years 4 mons -1000000000 days +1000000000:00:00"),
+        Some("-00:00:00.000082"),
+    ],
+    [Some("00:04:10.92"), Some("00:04:10.92"), Some("833 years 4 mons -10000 days +10000:00:00")],
+    [
+        Some("7200 years -86385 days +86388:30:00"),
+        Some("7200 years -86385 days +86388:30:00"),
+        Some("00:00:29.022472"),
+    ],
+    [Some("-22 days +05:15:00"), Some("-22 days +05:15:00"), Some("-1 mons -9 days +06:40:00")],
+    [Some("-00:00:00.000021"), Some("-00:00:00.000021"), None],
+    [Some("1 year -12 days +12:00:00"), Some("1 year -12 days +12:00:00"), Some("2 days 10:05:00")],
+    [
+        Some("2 years 6 mons -30 days +30:00:00"),
+        Some("2 years 6 mons -30 days +30:00:00"),
+        Some("1 day -00:46:00"),
+    ],
+    [
+        Some("-1 mons +1 day -01:00:00"),
+        Some("-1 mons +1 day -01:00:00"),
+        Some("-1 mons +1 day -01:00:00"),
+    ],
+    [Some("00:00:00"), Some("00:00:00"), None],
+    [Some("-1 years -9 mons"), Some("-1 years -9 mons"), Some("-1 years -9 mons")],
+    [Some("-3 years -6 mons"), Some("-3 years -6 mons"), Some("-10 mons -15 days")],
+    [Some("5 years 3 mons"), Some("5 years 3 mons"), Some("7 mons")],
+    [Some("-12 years -3 mons"), Some("-12 years -3 mons"), Some("-3 mons")],
+    [Some("-1750000 years"), Some("-1750000 years"), Some("-00:00:54.432")],
+    [None, None, Some("00:00:00")],
+    [None, None, Some("00:00:00")],
+    [
+        Some("-2 years -7 mons -15 days"),
+        Some("-2 years -7 mons -15 days"),
+        Some("-1 years -2 mons"),
+    ],
+    [Some("-2 mons -3 days"), Some("-2 mons -3 days"), Some("-17 years -6 mons")],
+    [Some("4 years 4 mons 15 days"), Some("4 years 4 mons 15 days"), Some("8 mons 12 days")],
+    [Some("-7 mons"), Some("-7 mons"), Some("-5 years -3 mons")],
+    [Some("-10 mons -15 days"), Some("-10 mons -15 days"), Some("-3 years -6 mons")],
+    [
+        Some("-1 years -9 mons -00:00:54.432"),
+        Some("-1 years -9 mons -00:00:54.432"),
+        Some("-1 years -8 mons -29 days -23:59:05.568"),
+    ],
+    [
+        Some("-5 years -5 mons -29 days -04:50:26.88"),
+        Some("-5 years -5 mons -29 days -04:50:26.88"),
+        Some("-6 mons -20 days -12:50:58.3872"),
+    ],
+    [Some("-00:00:05.4432"), Some("-00:00:05.4432"), Some("-17500000 years")],
+    [None, None, Some("-00:00:00.0864")],
+    [Some("-01:30:43.2"), Some("-01:30:43.2"), Some("-17500 years")],
+    [
+        Some("-151200 years -10 mons -15 days"),
+        Some("-151200 years -10 mons -15 days"),
+        Some("-00:10:30.0288"),
+    ],
+    [
+        Some("1 year 3 mons 22 days 12:00:00"),
+        Some("1 year 3 mons 22 days 12:00:00"),
+        Some("2 years 4 mons"),
+    ],
+    [Some("00:00:00"), Some("00:00:00"), None],
+    [Some("-21 years"), Some("-21 years"), Some("-1 mons -22 days -12:00:00")],
+    [Some("-52 years -6 mons"), Some("-52 years -6 mons"), Some("-21 days")],
+    [Some("1 year 9 mons"), Some("1 year 9 mons"), Some("1 year 9 mons")],
+    [Some("00:00:00"), Some("00:00:00"), None],
+    [Some("00:00:00.000001"), Some("00:00:00.000001"), Some("00:00:00.000001")],
+    [Some("00:00:00.000002"), Some("00:00:00.000002"), Some("00:00:00")],
+    [Some("-00:00:00.000003"), Some("-00:00:00.000003"), Some("00:00:00")],
+    [Some("00:00:00.000007"), Some("00:00:00.000007"), Some("00:00:00")],
+    [Some("00:00:01"), Some("00:00:01"), Some("00:00:00")],
+    [Some("00:35:47.483647"), Some("00:35:47.483647"), Some("00:00:00")],
+    [Some("-00:35:47.483648"), Some("-00:35:47.483648"), Some("00:00:00")],
+    [Some("00:00:00.000002"), Some("00:00:00.000002"), Some("00:00:00.000001")],
+    [Some("00:00:00"), Some("00:00:00"), Some("00:00:00.00001")],
+    [Some("-00:00:00.000002"), Some("-00:00:00.000002"), Some("00:00:00")],
+    [Some("00:00:00"), Some("00:00:00"), Some("00:00:00.000003")],
+    [Some("00:00:00"), Some("00:00:00"), Some("00:00:00.000002")],
+    [Some("00:00:00.000001"), Some("00:00:00.000001"), Some("00:00:00.000001")],
+    [Some("00:00:00.000003"), Some("00:00:00.000003"), Some("00:00:00")],
+    [Some("00:00:00"), Some("00:00:00"), Some("00:00:10")],
+    [Some("00:16:40"), Some("00:16:40"), Some("00:00:00")],
+    [Some("00:00:00"), Some("00:00:00"), Some("00:00:00.01")],
+    [Some("00:00:00.0864"), Some("00:00:00.0864"), Some("00:00:00")],
+    [Some("-00:00:00.000001"), Some("-00:00:00.000001"), Some("-00:00:00.000001")],
+    [Some("00:00:00"), Some("00:00:00"), Some("01:06:40")],
+    [Some("00:00:00.000012"), Some("00:00:00.000012"), Some("00:00:00")],
+    [Some("00:00:00.00003"), Some("00:00:00.00003"), Some("00:00:00")],
+    [Some("-00:00:00.000001"), Some("-00:00:00.000001"), Some("-00:00:00.000001")],
+    [Some("00:00:00"), Some("00:00:00"), None],
+    [Some("2147483647 days"), Some("2147483647 days"), Some("2147483647 days")],
+    [None, None, Some("1073741823 days 12:00:00")],
+    [None, None, Some("-715827882 days -08:00:00.003433")],
+    [None, None, Some("306783378 days 03:25:42.856407")],
+    [None, None, Some("2147 days 11:36:27.1008")],
+    [None, None, Some("1 day")],
+    [None, None, Some("-23:59:59.99996")],
+    [None, None, Some("1431655764 days 16:00:00.006866")],
+    [Some("214748364 days 16:48:00.001545"), Some("214748364 days 16:48:00.001545"), None],
+    [None, None, Some("-858993458 days -19:11:59.99588")],
+    [Some("715827882 days 07:59:59.993134"), Some("715827882 days 07:59:59.993134"), None],
+    [Some("1073741823 days 12:00:00"), Some("1073741823 days 12:00:00"), None],
+    [None, None, Some("2147481499 days 12:26:38.448944")],
+    [None, None, Some("683565852 days 15:23:45.331879")],
+    [Some("214 days 17:57:38.71008"), Some("214 days 17:57:38.71008"), None],
+    [None, None, Some("2 days 03:32:22.587101")],
+    [Some("214748 days 08:45:10.08"), Some("214748 days 08:45:10.08"), None],
+    [None, None, Some("24854 days 23:46:59.504517")],
+    [Some("-1610612735 days -06:00:00"), Some("-1610612735 days -06:00:00"), None],
+    [Some("12:53:05.646775"), Some("12:53:05.646775"), None],
+    [None, None, Some("178956970 days 14:00:00.000858")],
+    [None, None, Some("71582788 days 05:36:00.000086")],
+    [Some("-2147483647 days"), Some("-2147483647 days"), Some("-2147483647 days")],
+    [Some("00:00:00"), Some("00:00:00"), None],
+    [Some("-2147483648 days"), Some("-2147483648 days"), Some("-2147483648 days")],
+    [None, None, Some("-1073741824 days")],
+    [None, None, Some("715827882 days 15:59:59.996567")],
+    [None, None, Some("-306783378 days -06:51:25.712814")],
+    [None, None, Some("-2147 days -11:36:27.1872")],
+    [None, None, Some("-1 days -00:00:00.00004")],
+    [None, None, Some("1 day")],
+    [None, None, Some("-1431655765 days -07:59:59.993134")],
+    [Some("-214748364 days -19:12:00.00103"), Some("-214748364 days -19:12:00.00103"), None],
+    [None, None, Some("858993459 days 04:48:00.00412")],
+    [Some("-715827882 days -15:59:59.996567"), Some("-715827882 days -15:59:59.996567"), None],
+    [Some("-1073741824 days"), Some("-1073741824 days"), None],
+    [None, None, Some("-2147481500 days -12:26:38.366547")],
+    [None, None, Some("-683565852 days -23:02:07.32811")],
+    [Some("-214 days -17:57:38.71872"), Some("-214 days -17:57:38.71872"), None],
+    [None, None, Some("-2 days -03:32:22.587187")],
+    [Some("-214748 days -08:45:18.720001"), Some("-214748 days -08:45:18.720001"), None],
+    [None, None, Some("-24854 days -23:47:00.504511")],
+    [Some("1610612736 days"), Some("1610612736 days"), None],
+    [Some("-12:53:05.646797"), Some("-12:53:05.646797"), None],
+    [None, None, Some("-178956970 days -15:59:59.999142")],
+    [None, None, Some("-71582788 days -06:23:59.999914")],
+    [None, None, None],
+    [Some("00:00:00"), Some("00:00:00"), None],
+    [
+        Some("178956970 years 7 mons"),
+        Some("178956970 years 7 mons"),
+        Some("178956970 years 7 mons"),
+    ],
+    [None, None, Some("89478485 years 3 mons 15 days")],
+    [None, None, Some("-59652323 years -6 mons -10 days -00:00:00.0864")],
+    [None, None, Some("25565281 years 6 mons 4 days 06:51:25.6896")],
+    [None, None, Some("178 years 11 mons 14 days 12:13:33.024")],
+    [None, None, Some("1 mon")],
+    [None, None, Some("-30 days")],
+    [None, None, Some("119304647 years 20 days 00:00:00.1728")],
+    [
+        Some("17895697 years 21 days 00:00:00.0864"),
+        Some("17895697 years 21 days 00:00:00.0864"),
+        None,
+    ],
+    [None, None, Some("-71582788 years -2 mons -23 days -23:59:59.9136")],
+    [
+        Some("59652323 years 6 mons 9 days 23:59:59.8272"),
+        Some("59652323 years 6 mons 9 days 23:59:59.8272"),
+        None,
+    ],
+    [Some("89478485 years 3 mons 15 days"), Some("89478485 years 3 mons 15 days"), None],
+    [None, None, Some("178956791 years 7 mons 15 days 13:19:13.4688")],
+    [None, None, Some("56963821 years 19 days 05:52:39.9648")],
+    [
+        Some("17 years 10 mons 22 days 10:49:21.3024"),
+        Some("17 years 10 mons 22 days 10:49:21.3024"),
+        None,
+    ],
+    [None, None, Some("2 mons 4 days 10:11:17.5776")],
+    [
+        Some("17895 years 8 mons 10 days 22:35:02.4"),
+        Some("17895 years 8 mons 10 days 22:35:02.4"),
+        None,
+    ],
+    [None, None, Some("2071 years 2 mons 29 days 17:29:45.168")],
+    [
+        Some("-134217727 years -11 mons -7 days -12:00:00"),
+        Some("-134217727 years -11 mons -7 days -12:00:00"),
+        None,
+    ],
+    [Some("16 days 02:32:49.3728"), Some("16 days 02:32:49.3728"), None],
+    [None, None, Some("14913080 years 10 mons 17 days 12:00:00")],
+    [None, None, Some("5965232 years 4 mons 7 days")],
+    [
+        Some("-178956970 years -7 mons"),
+        Some("-178956970 years -7 mons"),
+        Some("-178956970 years -7 mons"),
+    ],
+    [Some("00:00:00"), Some("00:00:00"), None],
+    [
+        Some("-178956970 years -8 mons"),
+        Some("-178956970 years -8 mons"),
+        Some("-178956970 years -8 mons"),
+    ],
+    [None, None, Some("-89478485 years -4 mons")],
+    [None, None, Some("59652323 years 6 mons 19 days 23:59:59.9136")],
+    [None, None, Some("-25565281 years -6 mons -8 days -13:42:51.3792")],
+    [None, None, Some("-178 years -11 mons -14 days -12:13:35.616")],
+    [None, None, Some("-1 mons")],
+    [None, None, Some("1 mon")],
+    [None, None, Some("-119304647 years -1 mons -9 days -23:59:59.8272")],
+    [Some("-17895697 years -24 days"), Some("-17895697 years -24 days"), None],
+    [None, None, Some("71582788 years 3 mons 6 days 00:00:00.0864")],
+    [
+        Some("-59652323 years -6 mons -19 days -23:59:59.9136"),
+        Some("-59652323 years -6 mons -19 days -23:59:59.9136"),
+        None,
+    ],
+    [Some("-89478485 years -4 mons"), Some("-89478485 years -4 mons"), None],
+    [None, None, Some("-178956791 years -8 mons -15 days -13:19:10.9632")],
+    [None, None, Some("-56963821 years -28 days -19:03:39.8304")],
+    [
+        Some("-17 years -10 mons -22 days -10:49:21.5616"),
+        Some("-17 years -10 mons -22 days -10:49:21.5616"),
+        None,
+    ],
+    [None, None, Some("-2 mons -4 days -10:11:17.5776")],
+    [
+        Some("-17895 years -8 mons -10 days -22:39:21.6"),
+        Some("-17895 years -8 mons -10 days -22:39:21.6"),
+        None,
+    ],
+    [None, None, Some("-2071 years -2 mons -29 days -17:30:15.1488")],
+    [Some("134217728 years"), Some("134217728 years"), None],
+    [Some("-16 days -02:32:49.3728"), Some("-16 days -02:32:49.3728"), None],
+    [None, None, Some("-14913080 years -10 mons -20 days")],
+    [None, None, Some("-5965232 years -4 mons -8 days")],
+    [None, None, None],
+    [Some("00:00:00"), Some("00:00:00"), None],
+    [None, None, None],
+    [None, None, Some("1281023894:00:27.387904")],
+    [None, None, Some("-854015929:20:18.258432")],
+    [None, None, Some("366006826:51:33.539328")],
+    [None, None, Some("2562:02:52.036855")],
+    [None, None, Some("01:11:34.967298")],
+    [None, None, Some("-01:11:34.967296")],
+    [None, None, Some("1708031858:40:36.516864")],
+    [Some("256204778:48:05.477632"), Some("256204778:48:05.477632"), None],
+    [None, None, Some("-1024819115:12:21.910528")],
+    [Some("854015929:20:18.258432"), Some("854015929:20:18.258432"), None],
+    [Some("1281023894:00:27.387904"), Some("1281023894:00:27.387904"), None],
+    [None, None, Some("2562045225:58:11.96288")],
+    [None, None, Some("815525828:38:44.716032")],
+    [Some("256:12:17.203685"), Some("256:12:17.203685"), None],
+    [None, None, Some("02:33:43.372037")],
+    [Some("256204:46:43.685478"), Some("256204:46:43.685478"), None],
+    [None, None, Some("29653:09:33.393149")],
+    [Some("-1921535841:00:41.081856"), Some("-1921535841:00:41.081856"), None],
+    [Some("00:38:25.843009"), Some("00:38:25.843009"), None],
+    [None, None, Some("213503982:20:04.564608")],
+    [None, None, Some("85401592:56:01.825856")],
+    [
+        Some("-2562047788:00:54.775808"),
+        Some("-2562047788:00:54.775808"),
+        Some("-2562047788:00:54.775808"),
+    ],
+    [Some("00:00:00"), Some("00:00:00"), None],
+    [
+        Some("-2562047788:00:54.775808"),
+        Some("-2562047788:00:54.775808"),
+        Some("-2562047788:00:54.775808"),
+    ],
+    [None, None, Some("-1281023894:00:27.387904")],
+    [None, None, Some("854015929:20:18.258432")],
+    [None, None, Some("-366006826:51:33.539328")],
+    [None, None, Some("-2562:02:52.036855")],
+    [None, None, Some("-01:11:34.967298")],
+    [None, None, Some("01:11:34.967296")],
+    [None, None, Some("-1708031858:40:36.516864")],
+    [Some("-256204778:48:05.477632"), Some("-256204778:48:05.477632"), None],
+    [None, None, Some("1024819115:12:21.910528")],
+    [Some("-854015929:20:18.258432"), Some("-854015929:20:18.258432"), None],
+    [Some("-1281023894:00:27.387904"), Some("-1281023894:00:27.387904"), None],
+    [None, None, Some("-2562045225:58:11.96288")],
+    [None, None, Some("-815525828:38:44.716032")],
+    [Some("-256:12:17.203685"), Some("-256:12:17.203685"), None],
+    [None, None, Some("-02:33:43.372037")],
+    [Some("-256204:46:43.685478"), Some("-256204:46:43.685478"), None],
+    [None, None, Some("-29653:09:33.393149")],
+    [Some("1921535841:00:41.081856"), Some("1921535841:00:41.081856"), None],
+    [Some("-00:38:25.843009"), Some("-00:38:25.843009"), None],
+    [None, None, Some("-213503982:20:04.564608")],
+    [None, None, Some("-85401592:56:01.825856")],
+    [None, None, None],
+    [Some("00:00:00"), Some("00:00:00"), None],
+    [Some("23:59:59.999999"), Some("23:59:59.999999"), Some("23:59:59.999999")],
+    [Some("47:59:59.999998"), Some("47:59:59.999998"), Some("12:00:00")],
+    [Some("-71:59:59.999997"), Some("-71:59:59.999997"), Some("-08:00:00")],
+    [Some("167:59:59.999993"), Some("167:59:59.999993"), Some("03:25:42.857143")],
+    [Some("23999999:59:59"), Some("23999999:59:59"), Some("00:00:00.0864")],
+    [None, None, Some("00:00:00.00004")],
+    [None, None, Some("-00:00:00.00004")],
+    [Some("35:59:59.999998"), Some("35:59:59.999998"), Some("15:59:59.999999")],
+    [Some("02:24:00"), Some("02:24:00"), Some("239:59:59.99999")],
+    [Some("-59:59:59.999998"), Some("-59:59:59.999998"), Some("-09:36:00")],
+    [Some("08:00:00"), Some("08:00:00"), Some("71:59:59.999997")],
+    [Some("12:00:00"), Some("12:00:00"), Some("47:59:59.999998")],
+    [Some("24:00:00.086399"), Some("24:00:00.086399"), Some("23:59:59.913599")],
+    [Some("75:23:53.375997"), Some("75:23:53.375997"), Some("07:38:21.997396")],
+    [Some("00:00:00.00864"), Some("00:00:00.00864"), Some("239999999:59:50")],
+    [None, None, Some("00:00:00.000086")],
+    [Some("00:00:08.64"), Some("00:00:08.64"), Some("239999:59:59.99")],
+    [Some("2073611:59:59.9136"), Some("2073611:59:59.9136"), Some("00:00:00.999994")],
+    [Some("-17:59:59.999999"), Some("-17:59:59.999999"), Some("-31:59:59.999999")],
+    [Some("00:00:00.000022"), Some("00:00:00.000022"), None],
+    [Some("287:59:59.999988"), Some("287:59:59.999988"), Some("02:00:00")],
+    [Some("719:59:59.99997"), Some("719:59:59.99997"), Some("00:48:00")],
+    [Some("-23:59:59.999999"), Some("-23:59:59.999999"), Some("-23:59:59.999999")],
+    [Some("00:00:00"), Some("00:00:00"), None],
+    [Some("1 mon 15 days"), Some("1 mon 15 days"), Some("1 mon 15 days")],
+    [Some("2 mons 30 days"), Some("2 mons 30 days"), Some("22 days 12:00:00")],
+    [Some("-3 mons -45 days"), Some("-3 mons -45 days"), Some("-15 days")],
+    [Some("7 mons 105 days"), Some("7 mons 105 days"), Some("6 days 10:17:08.546743")],
+    [
+        Some("83333 years 4 mons 15000000 days"),
+        Some("83333 years 4 mons 15000000 days"),
+        Some("00:00:03.888"),
+    ],
+    [None, None, Some("00:00:00.000603")],
+    [None, None, Some("-00:00:00.000603")],
+    [Some("1 mon 37 days 12:00:00"), Some("1 mon 37 days 12:00:00"), Some("30 days")],
+    [Some("4 days 12:00:00"), Some("4 days 12:00:00"), Some("10 mons 150 days")],
+    [Some("-2 mons -52 days -12:00:00"), Some("-2 mons -52 days -12:00:00"), Some("-18 days")],
+    [Some("15 days"), Some("15 days"), Some("3 mons 45 days")],
+    [Some("22 days 12:00:00"), Some("22 days 12:00:00"), Some("2 mons 30 days")],
+    [
+        Some("1 mon 15 days 00:00:03.888"),
+        Some("1 mon 15 days 00:00:03.888"),
+        Some("44 days 23:59:56.112001"),
+    ],
+    [
+        Some("3 mons 51 days 08:55:01.92"),
+        Some("3 mons 51 days 08:55:01.92"),
+        Some("14 days 07:46:29.912943"),
+    ],
+    [Some("00:00:00.3888"), Some("00:00:00.3888"), Some("833333 years 4 mons 150000000 days")],
+    [None, None, Some("00:00:00.001296")],
+    [Some("00:06:28.8"), Some("00:06:28.8"), Some("833 years 4 mons 150000 days")],
+    [
+        Some("7200 years 1296022 days 12:00:00"),
+        Some("7200 years 1296022 days 12:00:00"),
+        Some("00:00:44.980713"),
+    ],
+    [Some("-33 days -18:00:00"), Some("-33 days -18:00:00"), Some("-1 mons -30 days")],
+    [Some("00:00:00.000324"), Some("00:00:00.000324"), None],
+    [Some("1 year 180 days"), Some("1 year 180 days"), Some("3 days 18:00:00")],
+    [Some("2 years 6 mons 450 days"), Some("2 years 6 mons 450 days"), Some("1 day 12:00:00")],
+    [Some("-1 mons -15 days"), Some("-1 mons -15 days"), Some("-1 mons -15 days")],
+    [Some("00:00:00"), Some("00:00:00"), None],
+    [Some("3 mons"), Some("3 mons"), Some("3 mons")],
+    [Some("6 mons"), Some("6 mons"), Some("1 mon 15 days")],
+    [Some("-9 mons"), Some("-9 mons"), Some("-1 mons")],
+    [Some("1 year 9 mons"), Some("1 year 9 mons"), Some("12 days 20:34:17.1552")],
+    [Some("250000 years"), Some("250000 years"), Some("00:00:07.776")],
+    [None, None, Some("00:00:00")],
+    [None, None, Some("00:00:00")],
+    [Some("4 mons 15 days"), Some("4 mons 15 days"), Some("2 mons")],
+    [Some("9 days"), Some("9 days"), Some("2 years 6 mons")],
+    [Some("-7 mons -15 days"), Some("-7 mons -15 days"), Some("-1 mons -6 days")],
+    [Some("1 mon"), Some("1 mon"), Some("9 mons")],
+    [Some("1 mon 15 days"), Some("1 mon 15 days"), Some("6 mons")],
+    [Some("3 mons 00:00:07.776"), Some("3 mons 00:00:07.776"), Some("2 mons 29 days 23:59:52.224")],
+    [
+        Some("9 mons 12 days 17:50:03.84"),
+        Some("9 mons 12 days 17:50:03.84"),
+        Some("28 days 15:32:59.7696"),
+    ],
+    [Some("00:00:00.7776"), Some("00:00:00.7776"), Some("2500000 years")],
+    [None, None, Some("00:00:00")],
+    [Some("00:12:57.6"), Some("00:12:57.6"), Some("2500 years")],
+    [Some("21600 years 1 mon 15 days"), Some("21600 years 1 mon 15 days"), Some("00:01:30.0288")],
+    [Some("-2 mons -7 days -12:00:00"), Some("-2 mons -7 days -12:00:00"), Some("-4 mons")],
+    [Some("00:00:00"), Some("00:00:00"), None],
+    [Some("3 years"), Some("3 years"), Some("7 days 12:00:00")],
+    [Some("7 years 6 mons"), Some("7 years 6 mons"), Some("3 days")],
+    [Some("-3 mons"), Some("-3 mons"), Some("-3 mons")],
+    [Some("00:00:00"), Some("00:00:00"), None],
+    [Some("7 days 12:00:00"), Some("7 days 12:00:00"), Some("7 days 12:00:00")],
+    [Some("14 days 24:00:00"), Some("14 days 24:00:00"), Some("3 days 18:00:00")],
+    [Some("-21 days -36:00:00"), Some("-21 days -36:00:00"), Some("-2 days -12:00:00")],
+    [Some("49 days 84:00:00"), Some("49 days 84:00:00"), Some("1 day 01:42:51.428571")],
+    [
+        Some("7000000 days 12000000:00:00"),
+        Some("7000000 days 12000000:00:00"),
+        Some("00:00:00.648"),
+    ],
+    [None, None, Some("00:00:00.000302")],
+    [None, None, Some("-00:00:00.000302")],
+    [Some("10 days 30:00:00"), Some("10 days 30:00:00"), Some("4 days 24:00:00")],
+    [Some("18:00:00"), Some("18:00:00"), Some("70 days 120:00:00")],
+    [Some("-17 days -42:00:00"), Some("-17 days -42:00:00"), Some("-2 days -24:00:00")],
+    [Some("2 days 12:00:00"), Some("2 days 12:00:00"), Some("21 days 36:00:00")],
+    [Some("3 days 18:00:00"), Some("3 days 18:00:00"), Some("14 days 24:00:00")],
+    [Some("7 days 12:00:00.648"), Some("7 days 12:00:00.648"), Some("6 days 35:59:59.352001")],
+    [Some("21 days 61:29:10.32"), Some("21 days 61:29:10.32"), Some("2 days 09:17:44.980472")],
+    [Some("00:00:00.0648"), Some("00:00:00.0648"), Some("70000000 days 120000000:00:00")],
+    [None, None, Some("00:00:00.000648")],
+    [Some("00:01:04.8"), Some("00:01:04.8"), Some("70000 days 120000:00:00")],
+    [Some("604803 days 1036818:00:00"), Some("604803 days 1036818:00:00"), Some("00:00:07.499956")],
+    [Some("-5 days -15:00:00"), Some("-5 days -15:00:00"), Some("-9 days -24:00:00")],
+    [Some("00:00:00.000162"), Some("00:00:00.000162"), None],
+    [Some("84 days 144:00:00"), Some("84 days 144:00:00"), Some("15:00:00")],
+    [Some("210 days 360:00:00"), Some("210 days 360:00:00"), Some("06:00:00")],
+    [Some("-7 days -12:00:00"), Some("-7 days -12:00:00"), Some("-7 days -12:00:00")],
+    [Some("00:00:00"), Some("00:00:00"), None],
+    [
+        Some("-1 mons +29 days -23:59:59"),
+        Some("-1 mons +29 days -23:59:59"),
+        Some("-1 mons +29 days -23:59:59"),
+    ],
+    [
+        Some("-2 mons +58 days -47:59:58"),
+        Some("-2 mons +58 days -47:59:58"),
+        Some("-1 days +00:00:00.5"),
+    ],
+    [
+        Some("3 mons -87 days +71:59:57"),
+        Some("3 mons -87 days +71:59:57"),
+        Some("1 day -08:00:00.333333"),
+    ],
+    [
+        Some("-7 mons +203 days -167:59:53"),
+        Some("-7 mons +203 days -167:59:53"),
+        Some("-06:51:25.546743"),
+    ],
+    [
+        Some("-83333 years -4 mons +29000000 days -23999722:13:20"),
+        Some("-83333 years -4 mons +29000000 days -23999722:13:20"),
+        Some("-00:00:00.172799"),
+    ],
+    [None, None, Some("00:00:00.001127")],
+    [None, None, Some("-00:00:00.001127")],
+    [
+        Some("-1 mons +28 days -23:59:58.5"),
+        Some("-1 mons +28 days -23:59:58.5"),
+        Some("-1 days -07:59:59.333333"),
+    ],
+    [
+        Some("-1 days +19:12:00.1"),
+        Some("-1 days +19:12:00.1"),
+        Some("-10 mons +290 days -239:59:50"),
+    ],
+    [
+        Some("2 mons -57 days +47:59:57.5"),
+        Some("2 mons -57 days +47:59:57.5"),
+        Some("1 day -04:48:00.4"),
+    ],
+    [
+        Some("-1 days +08:00:00.333333"),
+        Some("-1 days +08:00:00.333333"),
+        Some("-3 mons +87 days -71:59:57"),
+    ],
+    [Some("-1 days +00:00:00.5"), Some("-1 days +00:00:00.5"), Some("-2 mons +58 days -47:59:58")],
+    [
+        Some("-1 mons +29 days -23:59:59.172799"),
+        Some("-1 mons +29 days -23:59:59.172799"),
+        Some("-1 days -23:59:58.827198"),
+    ],
+    [
+        Some("-3 mons +87 days -78:47:43.61041"),
+        Some("-3 mons +87 days -78:47:43.61041"),
+        Some("-15:16:43.706596"),
+    ],
+    [
+        Some("-00:00:00.01728"),
+        Some("-00:00:00.01728"),
+        Some("-833333 years -4 mons +290000000 days -239997222:13:20"),
+    ],
+    [None, None, Some("00:00:00.00242")],
+    [
+        Some("-00:00:17.2799"),
+        Some("-00:00:17.2799"),
+        Some("-833 years -4 mons +290000 days -239997:13:20"),
+    ],
+    [
+        Some("-7200 years +2505599 days -2073575:59:59.5"),
+        Some("-7200 years +2505599 days -2073575:59:59.5"),
+        Some("-00:00:01.980951"),
+    ],
+    [Some("1 day 11:59:59.25"), Some("1 day 11:59:59.25"), Some("1 mon -28 days +15:59:58.666667")],
+    [Some("00:00:00.000604"), Some("00:00:00.000604"), None],
+    [
+        Some("-1 years +348 days -287:59:48"),
+        Some("-1 years +348 days -287:59:48"),
+        Some("-03:59:59.916667"),
+    ],
+    [
+        Some("-2 years -6 mons +870 days -719:59:30"),
+        Some("-2 years -6 mons +870 days -719:59:30"),
+        Some("-1 days +22:24:00.033333"),
+    ],
+    [
+        Some("1 mon -29 days +23:59:59"),
+        Some("1 mon -29 days +23:59:59"),
+        Some("1 mon -29 days +23:59:59"),
+    ],
+    [Some("00:00:00"), Some("00:00:00"), None],
+    [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+    [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+    [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+    [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+    [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+    [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+    [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+    [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+    [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+    [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+    [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+    [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+    [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+    [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+    [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+    [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+    [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+    [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+    [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+    [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+    [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+    [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+    [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+    [Some("00:00:00"), Some("00:00:00"), None],
+    [Some("10 years"), Some("10 years"), Some("10 years")],
+    [Some("20 years"), Some("20 years"), Some("5 years")],
+    [Some("-30 years"), Some("-30 years"), Some("-3 years -4 mons")],
+    [Some("70 years"), Some("70 years"), Some("1 year 5 mons 4 days 06:51:25.6896")],
+    [Some("10000000 years"), Some("10000000 years"), Some("00:05:11.04")],
+    [None, None, Some("00:00:00.1728")],
+    [None, None, Some("-00:00:00.1728")],
+    [Some("15 years"), Some("15 years"), Some("6 years 8 mons")],
+    [Some("1 year"), Some("1 year"), Some("100 years")],
+    [Some("-25 years"), Some("-25 years"), Some("-4 years")],
+    [Some("3 years 4 mons"), Some("3 years 4 mons"), Some("30 years")],
+    [Some("5 years"), Some("5 years"), Some("20 years")],
+    [
+        Some("10 years 00:05:11.04"),
+        Some("10 years 00:05:11.04"),
+        Some("9 years 11 mons 29 days 23:54:48.96"),
+    ],
+    [
+        Some("31 years 4 mons 29 days 17:22:33.6"),
+        Some("31 years 4 mons 29 days 17:22:33.6"),
+        Some("3 years 2 mons 5 days 21:59:50.6112"),
+    ],
+    [Some("00:00:31.104"), Some("00:00:31.104"), Some("100000000 years")],
+    [None, None, Some("00:00:00.3456")],
+    [Some("08:38:24"), Some("08:38:24"), Some("100000 years")],
+    [Some("864005 years"), Some("864005 years"), Some("00:59:59.9424")],
+    [Some("-7 years -6 mons"), Some("-7 years -6 mons"), Some("-13 years -4 mons")],
+    [Some("00:00:00.0864"), Some("00:00:00.0864"), None],
+    [Some("120 years"), Some("120 years"), Some("10 mons")],
+    [Some("300 years"), Some("300 years"), Some("4 mons")],
+    [Some("-10 years"), Some("-10 years"), Some("-10 years")],
+    [Some("00:00:00"), Some("00:00:00"), None],
+    [
+        Some("1 mon 1 day 00:00:00.000001"),
+        Some("1 mon 1 day 00:00:00.000001"),
+        Some("1 mon 1 day 00:00:00.000001"),
+    ],
+    [
+        Some("2 mons 2 days 00:00:00.000002"),
+        Some("2 mons 2 days 00:00:00.000002"),
+        Some("15 days 12:00:00"),
+    ],
+    [
+        Some("-3 mons -3 days -00:00:00.000003"),
+        Some("-3 mons -3 days -00:00:00.000003"),
+        Some("-10 days -08:00:00"),
+    ],
+    [
+        Some("7 mons 7 days 00:00:00.000007"),
+        Some("7 mons 7 days 00:00:00.000007"),
+        Some("4 days 10:17:08.546743"),
+    ],
+    [
+        Some("83333 years 4 mons 1000000 days 00:00:01"),
+        Some("83333 years 4 mons 1000000 days 00:00:01"),
+        Some("00:00:02.6784"),
+    ],
+    [
+        Some("178956970 years 7 mons 2147483647 days 00:35:47.483647"),
+        Some("178956970 years 7 mons 2147483647 days 00:35:47.483647"),
+        Some("00:00:00.00004"),
+    ],
+    [
+        Some("-178956970 years -8 mons -2147483648 days -00:35:47.483648"),
+        Some("-178956970 years -8 mons -2147483648 days -00:35:47.483648"),
+        Some("-00:00:00.00004"),
+    ],
+    [
+        Some("1 mon 16 days 12:00:00.000002"),
+        Some("1 mon 16 days 12:00:00.000002"),
+        Some("20 days 16:00:00.000001"),
+    ],
+    [Some("3 days 02:24:00"), Some("3 days 02:24:00"), Some("10 mons 10 days 00:00:00.00001")],
+    [
+        Some("-2 mons -17 days -12:00:00.000002"),
+        Some("-2 mons -17 days -12:00:00.000002"),
+        Some("-12 days -09:36:00"),
+    ],
+    [Some("10 days 08:00:00"), Some("10 days 08:00:00"), Some("3 mons 3 days 00:00:00.000003")],
+    [Some("15 days 12:00:00"), Some("15 days 12:00:00"), Some("2 mons 2 days 00:00:00.000002")],
+    [
+        Some("1 mon 1 day 00:00:02.678401"),
+        Some("1 mon 1 day 00:00:02.678401"),
+        Some("30 days 23:59:57.321601"),
+    ],
+    [
+        Some("3 mons 7 days 09:20:34.656003"),
+        Some("3 mons 7 days 09:20:34.656003"),
+        Some("9 days 20:49:21.949396"),
+    ],
+    [
+        Some("00:00:00.26784"),
+        Some("00:00:00.26784"),
+        Some("833333 years 4 mons 10000000 days 00:00:10"),
+    ],
+    [
+        Some("83333333 years 4 mons 1000000000 days 00:16:40"),
+        Some("83333333 years 4 mons 1000000000 days 00:16:40"),
+        Some("00:00:00.000086"),
+    ],
+    [Some("00:04:27.84"), Some("00:04:27.84"), Some("833 years 4 mons 10000 days 00:00:00.01")],
+    [
+        Some("7200 years 86415 days 12:00:00.0864"),
+        Some("7200 years 86415 days 12:00:00.0864"),
+        Some("00:00:30.980794"),
+    ],
+    [
+        Some("-23 days -06:00:00.000001"),
+        Some("-23 days -06:00:00.000001"),
+        Some("-1 mons -11 days -08:00:00.000001"),
+    ],
+    [Some("00:00:00.000022"), Some("00:00:00.000022"), None],
+    [
+        Some("1 year 12 days 00:00:00.000012"),
+        Some("1 year 12 days 00:00:00.000012"),
+        Some("2 days 14:00:00"),
+    ],
+    [
+        Some("2 years 6 mons 30 days 00:00:00.00003"),
+        Some("2 years 6 mons 30 days 00:00:00.00003"),
+        Some("1 day 00:48:00"),
+    ],
+    [
+        Some("-1 mons -1 days -00:00:00.000001"),
+        Some("-1 mons -1 days -00:00:00.000001"),
+        Some("-1 mons -1 days -00:00:00.000001"),
+    ],
+    [Some("00:00:00"), Some("00:00:00"), None],
+    [Some("5 days 00:00:00.5"), Some("5 days 00:00:00.5"), Some("5 days 00:00:00.5")],
+    [Some("10 days 00:00:01"), Some("10 days 00:00:01"), Some("2 days 12:00:00.25")],
+    [Some("-15 days -00:00:01.5"), Some("-15 days -00:00:01.5"), Some("-1 days -16:00:00.166667")],
+    [Some("35 days 00:00:03.5"), Some("35 days 00:00:03.5"), Some("17:08:34.357143")],
+    [Some("5000000 days 138:53:20"), Some("5000000 days 138:53:20"), Some("00:00:00.432")],
+    [None, None, Some("00:00:00.000201")],
+    [None, None, Some("-00:00:00.000201")],
+    [Some("7 days 12:00:00.75"), Some("7 days 12:00:00.75"), Some("3 days 08:00:00.333333")],
+    [Some("12:00:00.05"), Some("12:00:00.05"), Some("50 days 00:00:05")],
+    [Some("-12 days -12:00:01.25"), Some("-12 days -12:00:01.25"), Some("-2 days -00:00:00.2")],
+    [Some("1 day 16:00:00.166667"), Some("1 day 16:00:00.166667"), Some("15 days 00:00:01.5")],
+    [Some("2 days 12:00:00.25"), Some("2 days 12:00:00.25"), Some("10 days 00:00:01")],
+    [Some("5 days 00:00:00.932"), Some("5 days 00:00:00.932"), Some("4 days 24:00:00.068")],
+    [
+        Some("15 days 16:59:28.450795"),
+        Some("15 days 16:59:28.450795"),
+        Some("1 day 14:11:50.146136"),
+    ],
+    [Some("00:00:00.0432"), Some("00:00:00.0432"), Some("50000000 days 1388:53:20")],
+    [None, None, Some("00:00:00.000432")],
+    [Some("00:00:43.20005"), Some("00:00:43.20005"), Some("50000 days 01:23:20")],
+    [Some("432002 days 24:00:00.25"), Some("432002 days 24:00:00.25"), Some("00:00:04.999977")],
+    [
+        Some("-3 days -18:00:00.375"),
+        Some("-3 days -18:00:00.375"),
+        Some("-6 days -16:00:00.666667"),
+    ],
+    [Some("00:00:00.000108"), Some("00:00:00.000108"), None],
+    [Some("60 days 00:00:06"), Some("60 days 00:00:06"), Some("10:00:00.041667")],
+    [Some("150 days 00:00:15"), Some("150 days 00:00:15"), Some("04:00:00.016667")],
+    [Some("-5 days -00:00:00.5"), Some("-5 days -00:00:00.5"), Some("-5 days -00:00:00.5")],
+    [Some("00:00:00"), Some("00:00:00"), None],
+    [
+        Some("-3 mons -7 days -00:00:00.000001"),
+        Some("-3 mons -7 days -00:00:00.000001"),
+        Some("-3 mons -7 days -00:00:00.000001"),
+    ],
+    [
+        Some("-6 mons -14 days -00:00:00.000002"),
+        Some("-6 mons -14 days -00:00:00.000002"),
+        Some("-1 mons -18 days -12:00:00"),
+    ],
+    [
+        Some("9 mons 21 days 00:00:00.000003"),
+        Some("9 mons 21 days 00:00:00.000003"),
+        Some("1 mon 2 days 08:00:00"),
+    ],
+    [
+        Some("-1 years -9 mons -49 days -00:00:00.000007"),
+        Some("-1 years -9 mons -49 days -00:00:00.000007"),
+        Some("-13 days -20:34:17.1552"),
+    ],
+    [
+        Some("-250000 years -7000000 days -00:00:01"),
+        Some("-250000 years -7000000 days -00:00:01"),
+        Some("-00:00:08.3808"),
+    ],
+    [None, None, Some("-00:00:00.000282")],
+    [None, None, Some("00:00:00.000282")],
+    [
+        Some("-4 mons -25 days -12:00:00.000002"),
+        Some("-4 mons -25 days -12:00:00.000002"),
+        Some("-2 mons -4 days -16:00:00.000001"),
+    ],
+    [
+        Some("-9 days -16:48:00"),
+        Some("-9 days -16:48:00"),
+        Some("-2 years -6 mons -70 days -00:00:00.00001"),
+    ],
+    [
+        Some("7 mons 32 days 12:00:00.000002"),
+        Some("7 mons 32 days 12:00:00.000002"),
+        Some("1 mon 8 days 19:12:00"),
+    ],
+    [
+        Some("-1 mons -2 days -08:00:00"),
+        Some("-1 mons -2 days -08:00:00"),
+        Some("-9 mons -21 days -00:00:00.000003"),
+    ],
+    [
+        Some("-1 mons -18 days -12:00:00"),
+        Some("-1 mons -18 days -12:00:00"),
+        Some("-6 mons -14 days -00:00:00.000002"),
+    ],
+    [
+        Some("-3 mons -7 days -00:00:08.380801"),
+        Some("-3 mons -7 days -00:00:08.380801"),
+        Some("-2 mons -36 days -23:59:51.619202"),
+    ],
+    [
+        Some("-9 mons -34 days -17:37:17.472003"),
+        Some("-9 mons -34 days -17:37:17.472003"),
+        Some("-30 days -21:01:33.751374"),
+    ],
+    [
+        Some("-00:00:00.83808"),
+        Some("-00:00:00.83808"),
+        Some("-2500000 years -70000000 days -00:00:10"),
+    ],
+    [None, None, Some("-00:00:00.000605")],
+    [Some("-00:13:58.08"), Some("-00:13:58.08"), Some("-2500 years -70000 days -00:00:00.01")],
+    [
+        Some("-21600 years -1 mons -604818 days -12:00:00.0864"),
+        Some("-21600 years -1 mons -604818 days -12:00:00.0864"),
+        Some("-00:01:37.028759"),
+    ],
+    [
+        Some("2 mons 12 days 18:00:00.000001"),
+        Some("2 mons 12 days 18:00:00.000001"),
+        Some("4 mons 9 days 08:00:00.000001"),
+    ],
+    [Some("-00:00:00.000151"), Some("-00:00:00.000151"), None],
+    [
+        Some("-3 years -84 days -00:00:00.000012"),
+        Some("-3 years -84 days -00:00:00.000012"),
+        Some("-8 days -02:00:00"),
+    ],
+    [
+        Some("-7 years -6 mons -210 days -00:00:00.00003"),
+        Some("-7 years -6 mons -210 days -00:00:00.00003"),
+        Some("-3 days -05:36:00"),
+    ],
+    [
+        Some("3 mons 7 days 00:00:00.000001"),
+        Some("3 mons 7 days 00:00:00.000001"),
+        Some("3 mons 7 days 00:00:00.000001"),
+    ],
+    [Some("00:00:00"), Some("00:00:00"), None],
+    [
+        Some("1 mon 30 days -23:59:59.999999"),
+        Some("1 mon 30 days -23:59:59.999999"),
+        Some("1 mon 30 days -23:59:59.999999"),
+    ],
+    [
+        Some("2 mons 60 days -47:59:59.999998"),
+        Some("2 mons 60 days -47:59:59.999998"),
+        Some("30 days -12:00:00"),
+    ],
+    [
+        Some("-3 mons -90 days +71:59:59.999997"),
+        Some("-3 mons -90 days +71:59:59.999997"),
+        Some("-20 days +08:00:00"),
+    ],
+    [
+        Some("7 mons 210 days -167:59:59.999993"),
+        Some("7 mons 210 days -167:59:59.999993"),
+        Some("8 days 10:17:08.546743"),
+    ],
+    [
+        Some("83333 years 4 mons 30000000 days -23999999:59:59"),
+        Some("83333 years 4 mons 30000000 days -23999999:59:59"),
+        Some("00:00:05.0976"),
+    ],
+    [None, None, Some("00:00:00.001167")],
+    [None, None, Some("-00:00:00.001167")],
+    [
+        Some("1 mon 60 days -35:59:59.999998"),
+        Some("1 mon 60 days -35:59:59.999998"),
+        Some("40 days -15:59:59.999999"),
+    ],
+    [Some("6 days -02:24:00"), Some("6 days -02:24:00"), Some("10 mons 300 days -239:59:59.99999")],
+    [
+        Some("-2 mons -90 days +59:59:59.999998"),
+        Some("-2 mons -90 days +59:59:59.999998"),
+        Some("-24 days +09:36:00"),
+    ],
+    [Some("20 days -08:00:00"), Some("20 days -08:00:00"), Some("3 mons 90 days -71:59:59.999997")],
+    [Some("30 days -12:00:00"), Some("30 days -12:00:00"), Some("2 mons 60 days -47:59:59.999998")],
+    [
+        Some("1 mon 30 days -23:59:54.902399"),
+        Some("1 mon 30 days -23:59:54.902399"),
+        Some("59 days -00:00:05.097596"),
+    ],
+    [
+        Some("3 mons 98 days -63:30:30.815997"),
+        Some("3 mons 98 days -63:30:30.815997"),
+        Some("19 days -05:16:22.123509"),
+    ],
+    [
+        Some("00:00:00.50976"),
+        Some("00:00:00.50976"),
+        Some("833333 years 4 mons 300000000 days -239999999:59:50"),
+    ],
+    [None, None, Some("00:00:00.002506")],
+    [
+        Some("00:08:29.76"),
+        Some("00:08:29.76"),
+        Some("833 years 4 mons 300000 days -239999:59:59.99"),
+    ],
+    [
+        Some("7200 years 2592030 days -2073611:59:59.9136"),
+        Some("7200 years 2592030 days -2073611:59:59.9136"),
+        Some("00:00:58.980632"),
+    ],
+    [
+        Some("-45 days +17:59:59.999999"),
+        Some("-45 days +17:59:59.999999"),
+        Some("-1 mons -50 days +31:59:59.999999"),
+    ],
+    [Some("00:00:00.000626"), Some("00:00:00.000626"), None],
+    [
+        Some("1 year 360 days -287:59:59.999988"),
+        Some("1 year 360 days -287:59:59.999988"),
+        Some("5 days -02:00:00"),
+    ],
+    [
+        Some("2 years 6 mons 900 days -719:59:59.99997"),
+        Some("2 years 6 mons 900 days -719:59:59.99997"),
+        Some("2 days -00:48:00"),
+    ],
+    [
+        Some("-1 mons -30 days +23:59:59.999999"),
+        Some("-1 mons -30 days +23:59:59.999999"),
+        Some("-1 mons -30 days +23:59:59.999999"),
+    ],
+    [Some("00:00:00"), Some("00:00:00"), None],
+    [Some("2 mons 1 day"), Some("2 mons 1 day"), Some("2 mons 1 day")],
+    [Some("4 mons 2 days"), Some("4 mons 2 days"), Some("1 mon 12:00:00")],
+    [Some("-6 mons -3 days"), Some("-6 mons -3 days"), Some("-20 days -08:00:00")],
+    [Some("1 year 2 mons 7 days"), Some("1 year 2 mons 7 days"), Some("8 days 17:08:34.322743")],
+    [
+        Some("166666 years 8 mons 1000000 days"),
+        Some("166666 years 8 mons 1000000 days"),
+        Some("00:00:05.2704"),
+    ],
+    [None, None, Some("00:00:00.00004")],
+    [None, None, Some("-00:00:00.00004")],
+    [Some("3 mons 1 day 12:00:00"), Some("3 mons 1 day 12:00:00"), Some("1 mon 10 days 16:00:00")],
+    [Some("6 days 02:24:00"), Some("6 days 02:24:00"), Some("1 year 8 mons 10 days")],
+    [
+        Some("-5 mons -2 days -12:00:00"),
+        Some("-5 mons -2 days -12:00:00"),
+        Some("-24 days -09:36:00"),
+    ],
+    [Some("20 days 08:00:00"), Some("20 days 08:00:00"), Some("6 mons 3 days")],
+    [Some("1 mon 12:00:00"), Some("1 mon 12:00:00"), Some("4 mons 2 days")],
+    [
+        Some("2 mons 1 day 00:00:05.2704"),
+        Some("2 mons 1 day 00:00:05.2704"),
+        Some("1 mon 30 days 23:59:54.7296"),
+    ],
+    [
+        Some("6 mons 11 days 15:17:15.936"),
+        Some("6 mons 11 days 15:17:15.936"),
+        Some("19 days 10:00:21.814996"),
+    ],
+    [Some("00:00:00.52704"), Some("00:00:00.52704"), Some("1666666 years 8 mons 10000000 days")],
+    [
+        Some("166666666 years 8 mons 1000000000 days"),
+        Some("166666666 years 8 mons 1000000000 days"),
+        Some("00:00:00.000086"),
+    ],
+    [Some("00:08:47.04"), Some("00:08:47.04"), Some("1666 years 8 mons 10000 days")],
+    [
+        Some("14400 years 1 mon 86400 days 12:00:00"),
+        Some("14400 years 1 mon 86400 days 12:00:00"),
+        Some("00:01:00.961594"),
+    ],
+    [
+        Some("-1 mons -15 days -18:00:00"),
+        Some("-1 mons -15 days -18:00:00"),
+        Some("-2 mons -21 days -08:00:00"),
+    ],
+    [Some("00:00:00.000022"), Some("00:00:00.000022"), None],
+    [Some("2 years 12 days"), Some("2 years 12 days"), Some("5 days 02:00:00")],
+    [Some("5 years 30 days"), Some("5 years 30 days"), Some("2 days 00:48:00")],
+    [Some("-2 mons -1 days"), Some("-2 mons -1 days"), Some("-2 mons -1 days")],
+    [Some("00:00:00"), Some("00:00:00"), None],
+    [
+        Some("100 years 100 days 100:00:00"),
+        Some("100 years 100 days 100:00:00"),
+        Some("100 years 100 days 100:00:00"),
+    ],
+    [
+        Some("200 years 200 days 200:00:00"),
+        Some("200 years 200 days 200:00:00"),
+        Some("50 years 50 days 50:00:00"),
+    ],
+    [
+        Some("-300 years -300 days -300:00:00"),
+        Some("-300 years -300 days -300:00:00"),
+        Some("-33 years -4 mons -33 days -41:20:00"),
+    ],
+    [
+        Some("700 years 700 days 700:00:00"),
+        Some("700 years 700 days 700:00:00"),
+        Some("14 years 3 mons 27 days 17:42:51.440915"),
+    ],
+    [
+        Some("100000000 years 100000000 days 100000000:00:00"),
+        Some("100000000 years 100000000 days 100000000:00:00"),
+        Some("00:51:59.4"),
+    ],
+    [None, None, Some("00:00:01.472991")],
+    [None, None, Some("-00:00:01.472991")],
+    [
+        Some("150 years 150 days 150:00:00"),
+        Some("150 years 150 days 150:00:00"),
+        Some("66 years 8 mons 66 days 82:40:00"),
+    ],
+    [
+        Some("10 years 10 days 10:00:00"),
+        Some("10 years 10 days 10:00:00"),
+        Some("1000 years 1000 days 1000:00:00"),
+    ],
+    [
+        Some("-250 years -250 days -250:00:00"),
+        Some("-250 years -250 days -250:00:00"),
+        Some("-40 years -40 days -40:00:00"),
+    ],
+    [
+        Some("33 years 4 mons 33 days 41:20:00"),
+        Some("33 years 4 mons 33 days 41:20:00"),
+        Some("300 years 300 days 300:00:00"),
+    ],
+    [
+        Some("50 years 50 days 50:00:00"),
+        Some("50 years 50 days 50:00:00"),
+        Some("200 years 200 days 200:00:00"),
+    ],
+    [
+        Some("100 years 100 days 100:51:59.4"),
+        Some("100 years 100 days 100:51:59.4"),
+        Some("99 years 11 mons 129 days 123:08:00.600009"),
+    ],
+    [
+        Some("314 years 1 mon 341 days 323:44:06"),
+        Some("314 years 1 mon 341 days 323:44:06"),
+        Some("31 years 9 mons 60 days 55:44:57.68024"),
+    ],
+    [Some("00:05:11.94"), Some("00:05:11.94"), None],
+    [None, None, Some("00:00:03.1194")],
+    [
+        Some("3 days 14:39:00"),
+        Some("3 days 14:39:00"),
+        Some("1000000 years 1000000 days 1000000:00:00"),
+    ],
+    [
+        Some("8640050 years 8640050 days 8640050:00:00"),
+        Some("8640050 years 8640050 days 8640050:00:00"),
+        Some("10:01:43.935664"),
+    ],
+    [
+        Some("-75 years -75 days -75:00:00"),
+        Some("-75 years -75 days -75:00:00"),
+        Some("-133 years -4 mons -133 days -141:20:00"),
+    ],
+    [Some("00:00:00.77985"), Some("00:00:00.77985"), None],
+    [
+        Some("1200 years 1200 days 1200:00:00"),
+        Some("1200 years 1200 days 1200:00:00"),
+        Some("8 years 4 mons 8 days 16:20:00"),
+    ],
+    [
+        Some("3000 years 3000 days 3000:00:00"),
+        Some("3000 years 3000 days 3000:00:00"),
+        Some("3 years 4 mons 3 days 11:20:00"),
+    ],
+    [
+        Some("-100 years -100 days -100:00:00"),
+        Some("-100 years -100 days -100:00:00"),
+        Some("-100 years -100 days -100:00:00"),
+    ],
+];
+
 const SCHEMA: &str = "
 CREATE TABLE t (id int, iv interval, iv2 interval, ts timestamptz);
 INSERT INTO t VALUES
@@ -7100,16 +8410,320 @@ fn a_literal_postgresql_refuses_to_read_is_refused() {
     );
 }
 
+/// The answers as `Some` texts, for comparing with a run.
+fn some(values: &[&str]) -> Vec<Option<String>> {
+    values.iter().map(|value| Some((*value).to_string())).collect()
+}
+
 #[test]
-fn multiplication_division_and_avg_stay_refused() {
-    for pg in [
-        "SELECT iv * 2 FROM t;",
-        "SELECT 2 * iv FROM t;",
-        "SELECT iv / 2 FROM t;",
-        "SELECT avg(iv) FROM t;",
-    ] {
-        refused(pg, "cannot be translated: the answer is an interval");
+fn multiplication_division_and_avg_match_postgresql() {
+    assert_eq!(
+        run("SELECT (iv * 2)::text FROM t ORDER BY id;"),
+        some(&["2 days", "2 mons", "20 days"])
+    );
+    assert_eq!(
+        run("SELECT (2 * iv)::text FROM t ORDER BY id;"),
+        some(&["2 days", "2 mons", "20 days"])
+    );
+    assert_eq!(
+        run("SELECT (iv / 2)::text FROM t ORDER BY id;"),
+        some(&["12:00:00", "15 days", "5 days"])
+    );
+    assert_eq!(run("SELECT avg(iv)::text FROM t;"), some(&["13 days 16:00:00"]));
+}
+
+/// The scaled corpus intervals as one table.
+fn scaled_schema() -> String {
+    let tuples: Vec<String> = SCALED_INTERVALS
+        .iter()
+        .enumerate()
+        .map(|(index, text)| format!("({}, '{text}')", index + 1))
+        .collect();
+    format!("CREATE TABLE sc (id int, iv interval);\nINSERT INTO sc VALUES {};", tuples.join(", "))
+}
+
+/// PostgreSQL's answer for the interval at `interval` and the factor at
+/// `factor` under `op`: 0 for `iv * f`, 1 for `f * iv`, 2 for `iv / f`.
+fn scaled_answer(interval: usize, factor: usize, op: usize) -> Option<String> {
+    SCALED[interval * FACTORS.len() + factor][op].map(ToString::to_string)
+}
+
+/// The statements of the three operations for `interval` and `factor`.
+fn scaled_expressions(interval: &str, factor: &str) -> [String; 3] {
+    [
+        format!("{interval} * {factor}"),
+        format!("{factor} * {interval}"),
+        format!("{interval} / {factor}"),
+    ]
+}
+
+#[test]
+fn scaling_an_interval_column_by_a_literal_matches_postgresql() {
+    let schema = scaled_schema();
+    for (factor_index, factor) in FACTORS.iter().enumerate() {
+        for (op, expression) in scaled_expressions("iv", factor).iter().enumerate() {
+            let got = run_translated_with(
+                &format!("{schema}\nSELECT ({expression})::text FROM sc ORDER BY id;"),
+                &Pg2SqliteOptions::default(),
+            );
+            let want: Vec<Option<String>> = (0..SCALED_INTERVALS.len())
+                .map(|interval| scaled_answer(interval, factor_index, op))
+                .collect();
+            assert_eq!(got, want, "{expression} should match PostgreSQL");
+        }
     }
+}
+
+#[test]
+fn scaling_an_interval_literal_by_a_literal_matches_postgresql() {
+    for (interval_index, interval) in SCALED_INTERVALS.iter().enumerate() {
+        for (factor_index, factor) in FACTORS.iter().enumerate() {
+            let literal = format!("interval '{interval}'");
+            for (op, expression) in scaled_expressions(&literal, factor).iter().enumerate() {
+                let pg = format!("SELECT ({expression})::text;");
+                if let Some(answer) = scaled_answer(interval_index, factor_index, op) {
+                    assert_eq!(
+                        run_translated_with(&pg, &Pg2SqliteOptions::default()),
+                        vec![Some(answer)],
+                        "{expression} should match PostgreSQL"
+                    );
+                } else {
+                    let error = Pg2Sqlite::default()
+                        .sql(&pg)
+                        .expect("parse")
+                        .translate_to_sql(&Pg2SqliteOptions::default())
+                        .expect_err("PostgreSQL raises, so the translation refuses");
+                    let needle = if op == 2 && *factor == "0" {
+                        "division by zero"
+                    } else {
+                        "interval out of range"
+                    };
+                    assert!(
+                        error.to_string().contains(needle),
+                        "{expression}: refusal {error} should name {needle}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Scales every corpus interval by every factor `column` holds, the factors
+/// at `factors` of [`FACTORS`] in that order, declared as `column_type`.
+fn assert_column_factor_matches(column_type: &str, factors: &[usize]) {
+    let tuples: Vec<String> = factors
+        .iter()
+        .enumerate()
+        .map(|(position, factor)| format!("({}, {})", position + 1, FACTORS[*factor]))
+        .collect();
+    let schema = format!(
+        "{}\nCREATE TABLE fa (id int, n {column_type});\nINSERT INTO fa VALUES {};",
+        scaled_schema(),
+        tuples.join(", ")
+    );
+    for (op, expression) in scaled_expressions("sc.iv", "fa.n").iter().enumerate() {
+        let got = run_translated_with(
+            &format!("{schema}\nSELECT ({expression})::text FROM sc, fa ORDER BY sc.id, fa.id;"),
+            &Pg2SqliteOptions::default(),
+        );
+        let want: Vec<Option<String>> = (0..SCALED_INTERVALS.len())
+            .flat_map(|interval| {
+                factors.iter().map(move |factor| scaled_answer(interval, *factor, op))
+            })
+            .collect();
+        assert_eq!(got, want, "{expression} over a {column_type} factor should match PostgreSQL");
+    }
+}
+
+#[test]
+fn scaling_an_interval_column_by_an_integer_column_matches_postgresql() {
+    let integers: Vec<usize> = FACTORS
+        .iter()
+        .enumerate()
+        .filter(|(_, factor)| factor.parse::<i64>().is_ok())
+        .map(|(index, _)| index)
+        .collect();
+    assert_column_factor_matches("bigint", &integers);
+}
+
+#[test]
+fn scaling_an_interval_column_by_a_numeric_column_matches_postgresql() {
+    let fitting: Vec<usize> = FACTORS
+        .iter()
+        .enumerate()
+        .filter(|(_, factor)| {
+            !factor.contains('e') && factor.split('.').nth(1).is_none_or(|digits| digits.len() <= 6)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    assert_column_factor_matches("numeric(18,6)", &fitting);
+}
+
+#[test]
+fn scaling_by_a_bound_parameter_matches_postgresql() {
+    let factor =
+        FACTORS.iter().position(|factor| *factor == "1.5").expect("1.5 is a corpus factor");
+    let got = run_translated_bound_with(
+        &format!("{}\nSELECT (iv * $1)::text FROM sc ORDER BY id;", scaled_schema()),
+        &Pg2SqliteOptions::default(),
+        &["1.5"],
+    );
+    let want: Vec<Option<String>> =
+        (0..SCALED_INTERVALS.len()).map(|interval| scaled_answer(interval, factor, 0)).collect();
+    assert_eq!(got, want);
+}
+
+#[test]
+fn a_factor_column_named_like_a_field_reads_its_own_value() {
+    let schema = "CREATE TABLE cap (id int, iv interval, d int, m int, u int);\nINSERT INTO cap VALUES (1, '1 day 01:00:00', 3, 5, 7);";
+    assert_eq!(
+        run(&format!("{schema}\nSELECT (iv * d)::text FROM cap;")),
+        some(&["3 days 03:00:00"])
+    );
+    assert_eq!(
+        run(&format!("{schema}\nSELECT (iv * m)::text FROM cap;")),
+        some(&["5 days 05:00:00"])
+    );
+    assert_eq!(
+        run(&format!("{schema}\nSELECT (iv / u)::text FROM cap;")),
+        some(&["03:34:17.142857"])
+    );
+}
+
+#[test]
+fn scaling_by_null_answers_null() {
+    assert_eq!(run("SELECT (iv * NULL)::text FROM t ORDER BY id;"), vec![None, None, None]);
+    assert_eq!(run("SELECT (iv / NULL)::text FROM t ORDER BY id;"), vec![None, None, None]);
+    assert_eq!(run("SELECT (iv * 2)::text FROM n WHERE id = 2;"), vec![None]);
+}
+
+#[test]
+fn scaled_intervals_compose_with_the_other_reads() {
+    assert_eq!(
+        run("SELECT (iv * 2 + iv)::text FROM t ORDER BY id;"),
+        some(&["3 days", "3 mons", "30 days"])
+    );
+    assert_eq!(
+        run("SELECT (-(iv / 3))::text FROM t ORDER BY id;"),
+        some(&["-08:00:00", "-10 days", "-3 days -08:00:00"])
+    );
+    assert_eq!(run("SELECT sum(iv * 2)::text FROM t;"), some(&["2 mons 22 days"]));
+    assert_eq!(run("SELECT id::text FROM t ORDER BY iv * 2;"), some(&["1", "3", "2"]));
+    assert_eq!(
+        run("SELECT (iv * 1.5 < interval '3 days')::text FROM t ORDER BY id;"),
+        some(&["true", "false", "false"])
+    );
+    assert_eq!(
+        run("SELECT (iv / 3 * 3)::text FROM t ORDER BY id;"),
+        some(&["24:00:00", "30 days", "9 days 24:00:00"])
+    );
+}
+
+#[test]
+fn averaging_matches_postgresql() {
+    let groups = "CREATE TABLE g (k int, iv interval);\nINSERT INTO g VALUES (1, '1 day'), (1, '2 days'), (1, NULL), (2, '1 mon'), (2, '-1 days +00:00:00.000001'), (3, NULL);";
+    assert_eq!(
+        run(&format!("{groups}\nSELECT avg(iv)::text FROM g GROUP BY k ORDER BY k;")),
+        vec![Some("1 day 12:00:00".to_string()), Some("15 days -12:00:00".to_string()), None]
+    );
+    assert_eq!(run("SELECT avg(iv)::text FROM t WHERE id > 3;"), vec![None]);
+    for (rows, answer) in [
+        ("('1 mon'), ('1 day'), ('00:00:01')", "10 days 08:00:00.333333"),
+        (
+            "('1 year'), ('1 mon'), ('1 day'), ('1 hour'), ('1 minute'), ('1 second'), ('00:00:00.000001')",
+            "1 mon 25 days 20:43:00.167543",
+        ),
+        (
+            "('178956970 years 7 mons'), ('-1 mon'), ('1 mon')",
+            "59652323 years 6 mons 10 days 00:00:00.0864",
+        ),
+    ] {
+        let values = rows.replace("('", "(1, '");
+        assert_eq!(
+            run(&format!(
+                "CREATE TABLE a (id int, iv interval);\nINSERT INTO a VALUES {values};\nSELECT avg(iv)::text FROM a;"
+            )),
+            some(&[answer]),
+            "avg over {rows}"
+        );
+    }
+}
+
+#[test]
+fn an_average_whose_total_leaves_range_answers_null() {
+    // PostgreSQL raises `interval out of range` while accumulating; the
+    // replica answers NULL, as the README's Quiet answers say.
+    assert_eq!(
+        run(
+            "CREATE TABLE a (id int, iv interval);\nINSERT INTO a VALUES (1, '178956970 years 7 mons'), (2, '1 mon');\nSELECT avg(iv)::text FROM a;"
+        ),
+        vec![None]
+    );
+}
+
+#[test]
+fn scaling_refuses_what_postgresql_refuses() {
+    refused(
+        "SELECT (interval '1 day' * interval '1 day')::text;",
+        "operator does not exist: interval * interval",
+    );
+    refused("SELECT (2 / iv)::text FROM t;", "operator does not exist: integer / interval");
+    refused("SELECT (iv / iv2)::text FROM t;", "operator does not exist: interval / interval");
+    refused(
+        "CREATE TABLE x (iv interval, s text);\nSELECT (iv * s)::text FROM x;",
+        "operator does not exist: interval * text",
+    );
+    refused(
+        "SELECT (interval '1 day' * 1e400)::text;",
+        "is out of range for type double precision",
+    );
+    refused("SELECT (interval '1 day' / 0)::text;", "division by zero");
+    refused("SELECT (interval '1 day' / 0.0)::text;", "division by zero");
+    refused("SELECT (interval '2147483647 days' * 2)::text;", "interval out of range");
+}
+
+#[test]
+fn a_factor_without_an_exact_reading_is_refused() {
+    refused(
+        "CREATE TABLE x (iv interval, dp double precision);\nSELECT (iv * dp)::text FROM x;",
+        "cannot be translated exactly",
+    );
+    refused("SELECT (iv * (id + 1))::text FROM t;", "cannot be translated exactly");
+}
+
+#[test]
+fn a_zero_factor_column_answers_null_for_division() {
+    // PostgreSQL raises `division by zero`; the replica answers NULL.
+    assert_eq!(
+        run(
+            "CREATE TABLE z (n int);\nINSERT INTO z VALUES (0);\nSELECT (t.iv / z.n)::text FROM t, z ORDER BY t.id;"
+        ),
+        vec![None, None, None]
+    );
+}
+
+#[test]
+fn averaging_refuses_the_clauses_it_cannot_carry() {
+    refused("SELECT avg(DISTINCT iv)::text FROM t;", "avg(DISTINCT) over an interval");
+    refused("SELECT (avg(iv) OVER ())::text FROM t;", "avg over an interval with an OVER clause");
+    refused(
+        "SELECT (avg(iv) FILTER (WHERE id > 1))::text FROM t;",
+        "avg over an interval with a FILTER",
+    );
+    refused("SELECT avg(iv, iv2)::text FROM t;", "function avg(interval, interval) does not exist");
+    refused(
+        "SELECT avg(CASE WHEN random() > 0.5 THEN iv ELSE iv2 END)::text FROM t;",
+        "an interval average has no SQLite form",
+    );
+}
+
+#[test]
+fn scaling_in_a_generated_column_or_index_is_refused() {
+    refused("CREATE INDEX ON t (iv * 2);", "scalar subquery");
+    refused(
+        "CREATE TABLE gen_m (iv interval, g interval GENERATED ALWAYS AS (iv * 2) STORED);",
+        "is not legal in that position",
+    );
 }
 
 #[test]
@@ -7296,10 +8910,10 @@ fn negating_past_the_microsecond_bound_answers_null() {
 }
 
 #[test]
-fn an_unresolvable_side_beside_an_interval_keeps_the_legacy_refusal() {
-    refused(
-        "SELECT ((iv * 2) + iv2)::text FROM t;",
-        "cannot be translated: the answer is an interval",
+fn a_product_beside_an_interval_column_matches_postgresql() {
+    assert_eq!(
+        run("SELECT ((iv * 2) + iv2)::text FROM t ORDER BY id;"),
+        some(&["2 days 24:00:00", "2 mons 30 days", "22 days"])
     );
 }
 

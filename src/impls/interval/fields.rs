@@ -20,7 +20,7 @@ use core::ops::ControlFlow;
 
 use sql_traits::structs::ParserDB;
 use sqlparser::{
-    ast::{BinaryOperator, Expr, Value, ValueWithSpan, VisitMut, VisitorMut},
+    ast::{BinaryOperator, Expr, UnaryOperator, Value, ValueWithSpan, VisitMut, VisitorMut},
     dialect::SQLiteDialect,
     parser::Parser,
 };
@@ -34,9 +34,10 @@ use super::{
 use crate::{
     errors::Error,
     impls::{
-        expression_type::type_name,
+        expression_type::{is_interval_typed, type_name},
         function_helpers::string_literal,
         replay::{is_replayable, reject_duplicated_operand},
+        shared_helpers::{declared_type_matches, numeric_scale},
     },
     options::TranslationContext,
     traits::translator::TranslatorWithContext,
@@ -403,15 +404,220 @@ pub(crate) fn binary(
     }
 }
 
-/// The rendered text of a `sum` over the `arg` operand's fields, summed the
-/// way PostgreSQL's `do_interval_accum` adds row by row: field-wise totals,
-/// `NULL` where a total leaves the range PostgreSQL's fields hold.
+/// The `float8` factor of an interval multiplication or division.
+enum Factor {
+    /// A literal, read the way `float8in` reads its text.
+    Literal(f64),
+    /// A run-time factor: the SQL reading it as a `REAL`, over the
+    /// [`fields_templates::FACTOR`] placeholder its operand substitutes.
+    Runtime { sql: String, operand: Box<Expr> },
+}
+
+/// The factor `side` supplies beside the `interval` operand of `operator`,
+/// `None` for a `NULL` factor, or the refusal it answers.
+///
+/// A number literal is decided at translation time. An integer column and a
+/// bound parameter are read as a `REAL`, which converts an integer the way
+/// PostgreSQL converts it to `float8`. A `numeric(p,s)` column holds minor
+/// units, so its value is the stored integer over `10^s`, one correctly
+/// rounded division as PostgreSQL's conversion is.
+fn factor(
+    side: &Expr,
+    interval: &Expr,
+    operator: &str,
+    factor_is_left: bool,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+    emit: WarningSink<'_>,
+) -> Result<Option<Factor>, Error> {
+    let inner = match side {
+        Expr::Nested(inner) => inner.as_ref(),
+        _ => side,
+    };
+    let number = match inner {
+        Expr::Value(ValueWithSpan { value: Value::Null, .. }) => return Ok(None),
+        Expr::Value(ValueWithSpan { value: Value::Number(text, _), .. }) => Some((text, false)),
+        Expr::UnaryOp { op: op @ (UnaryOperator::Minus | UnaryOperator::Plus), expr } => {
+            match expr.as_ref() {
+                Expr::Value(ValueWithSpan { value: Value::Number(text, _), .. }) => {
+                    Some((text, matches!(op, UnaryOperator::Minus)))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    if let Some((text, negative)) = number {
+        let value: f64 = text.parse().map_err(|_| unreadable_factor(text))?;
+        if !value.is_finite() {
+            return Err(Error::forward_refusal(format!(
+                "\"{text}\" is out of range for type double precision. PostgreSQL cannot read \
+                 it as the factor of an interval, so the translation refuses it too."
+            )));
+        }
+        return Ok(Some(Factor::Literal(if negative { -value } else { value })));
+    }
+    let is_placeholder =
+        matches!(inner, Expr::Value(ValueWithSpan { value: Value::Placeholder(_), .. }));
+    let is_column = matches!(inner, Expr::Identifier(_) | Expr::CompoundIdentifier(_));
+    let sql = if is_placeholder {
+        Some(format!("CAST({} AS REAL)", fields_templates::FACTOR))
+    } else if is_column {
+        if let Some(scale) = numeric_scale(inner, schema, options)? {
+            10_u64
+                .checked_pow(scale)
+                .map(|divisor| format!("(CAST({} AS REAL) / {divisor})", fields_templates::FACTOR))
+        } else if declared_type_matches(inner, schema, options, |declared| {
+            let lowered = declared.to_ascii_lowercase();
+            ["int", "smallint", "bigint"].iter().any(|integral| lowered.starts_with(integral))
+        })? {
+            Some(format!("CAST({} AS REAL)", fields_templates::FACTOR))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let Some(sql) = sql else {
+        let (left, right) = if factor_is_left { (side, interval) } else { (interval, side) };
+        return Err(unsupported_factor(left, operator, right, schema, options));
+    };
+    let translated = side.translate_with_warnings(schema, options, emit)?;
+    Ok(Some(Factor::Runtime { sql, operand: Box::new(translated) }))
+}
+
+/// The refusal a number literal no `double` reads answers.
+fn unreadable_factor(text: &str) -> Error {
+    Error::forward_refusal(format!(
+        "invalid input syntax for type double precision: \"{text}\". PostgreSQL cannot read it \
+         as the factor of an interval, so the translation refuses it too."
+    ))
+}
+
+/// The refusal a factor without an exact translation answers: PostgreSQL's
+/// own error for a type it has no operator for, otherwise a refusal naming
+/// the factors the translation reads exactly.
+fn unsupported_factor(
+    left: &Expr,
+    operator: &str,
+    right: &Expr,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Error {
+    let factor = if is_interval_typed(left, schema, options) { right } else { left };
+    let numeric = type_name(factor, schema, options).ok().flatten().is_none_or(|name| {
+        let lowered = name.to_ascii_lowercase();
+        ["int", "smallint", "bigint", "numeric", "decimal", "real", "double", "float"]
+            .iter()
+            .any(|family| lowered.starts_with(family))
+    });
+    if !numeric {
+        return keys::operator_does_not_exist(left, operator, right, schema, options);
+    }
+    Error::forward_refusal(format!(
+        "{} {operator} {} cannot be translated exactly: the factor is read as PostgreSQL's \
+         double precision only from a number literal, a bound parameter, or an integer or \
+         numeric(p,s) column. Compute the factor into such a column first.",
+        keys::message_type_name_of(left, schema, options),
+        keys::message_type_name_of(right, schema, options)
+    ))
+}
+
+/// The refusal a literal division by zero answers.
+fn division_by_zero() -> Error {
+    Error::forward_refusal(
+        "division by zero. PostgreSQL refuses this division, so the translation does too."
+            .to_string(),
+    )
+}
+
+/// The rendered text of an interval multiplied, `interval_mul`, or divided,
+/// `interval_div`, by a `float8` factor, or the refusal it answers.
+///
+/// # Errors
+///
+/// Answers PostgreSQL's `operator does not exist` for two intervals and for
+/// a factor divided by an interval, and propagates the refusal a side the
+/// arithmetic has no form for answers, the refusal a literal answers, and
+/// the refusal a position without subqueries answers.
+pub(crate) fn scaled_binary(
+    op: &BinaryOperator,
+    left: &Expr,
+    right: &Expr,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+    emit: WarningSink<'_>,
+) -> Result<Expr, Error> {
+    let divide = matches!(op, BinaryOperator::Divide);
+    let operator = if divide { "/" } else { "*" };
+    let left_interval = is_interval_typed(left, schema, options);
+    let right_interval = is_interval_typed(right, schema, options);
+    if right_interval && (left_interval || divide) {
+        return Err(keys::operator_does_not_exist(left, operator, right, schema, options));
+    }
+    let (interval, multiplier, interval_is_left) =
+        if left_interval { (left, right, true) } else { (right, left, false) };
+    let row = field_row(interval, operator, multiplier, interval_is_left, schema, options, emit)?;
+    let factor = factor(multiplier, interval, operator, !interval_is_left, schema, options, emit)?;
+    let (Some(row), Some(factor)) = (row, factor) else {
+        return Ok(null_literal());
+    };
+    if let (FieldRow::Literal(value), Factor::Literal(by)) = (&row, &factor) {
+        if divide && *by == 0.0 {
+            return Err(division_by_zero());
+        }
+        let scaled = value.scaled(*by, divide).map_err(|_| interval_out_of_range())?;
+        return Ok(string_literal(&postgres_text(&scaled)));
+    }
+    if !options.allows_subqueries() {
+        return Err(no_subquery_refusal());
+    }
+    let mut operands: Vec<(&str, &Expr)> = Vec::new();
+    let fields = match &row {
+        FieldRow::Literal(value) => literal_row(value),
+        FieldRow::Text(operand) => {
+            operands.push((fields_templates::PLACEHOLDER, operand.as_ref()));
+            field_sub(fields_templates::PLACEHOLDER)
+        }
+    };
+    let factor_sql = match &factor {
+        Factor::Literal(by) => format!("({by:?})"),
+        Factor::Runtime { sql, operand } => {
+            operands.push((fields_templates::FACTOR, operand.as_ref()));
+            sql.clone()
+        }
+    };
+    // The factor is read in a select of its own, so its column references
+    // resolve in the statement rather than against the field row's `m`, `d`
+    // and `u`.
+    let source = format!(
+        "(SELECT fr.m AS m, fr.d AS d, fr.u AS u, fv.f AS f \
+         FROM (SELECT {factor_sql} AS f) AS fv, {fields} AS fr)"
+    );
+    substitute(&operands, &fields_templates::scaled(&source, divide))
+}
+
+/// The interval aggregates the fields translate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Aggregate {
+    /// `sum`, `do_interval_accum` and `interval_sum`.
+    Sum,
+    /// `avg`, `interval_avg`: the sum divided by the count of non-NULL rows.
+    Avg,
+}
+
+/// The rendered text of a `sum` or `avg` over the `arg` operand's fields.
+/// The fields are summed the way PostgreSQL's `do_interval_accum` adds row
+/// by row, `NULL` where a total leaves the range PostgreSQL's fields hold,
+/// and an average divides the totals by the count the way `interval_div`
+/// does.
 ///
 /// # Errors
 ///
 /// Answers the refusal a position without subqueries answers, and the
 /// refusal a non-replayable operand answers.
-pub(crate) fn sum(
+pub(crate) fn aggregate(
+    kind: Aggregate,
     arg: &Expr,
     schema: &ParserDB,
     options: &TranslationContext<'_>,
@@ -422,7 +628,11 @@ pub(crate) fn sum(
     }
     let translated = arg.translate_with_warnings(schema, options, emit)?;
     if !is_replayable(&translated, options) {
-        return Err(reject_duplicated_operand("an interval sum", arg));
+        let construct = match kind {
+            Aggregate::Sum => "an interval sum",
+            Aggregate::Avg => "an interval average",
+        };
+        return Err(reject_duplicated_operand(construct, arg));
     }
     let parse = field_sub(fields_templates::PLACEHOLDER);
     let total_months = format!("SUM((SELECT m FROM {parse}))");
@@ -431,7 +641,19 @@ pub(crate) fn sum(
         "SUM((SELECT (u - u % {MICROS_SPLIT}) / {MICROS_SPLIT} FROM {parse})) * {MICROS_SPLIT} \
          + SUM((SELECT u % {MICROS_SPLIT} FROM {parse}))"
     );
-    let template = render_over(&total_months, &total_days, &total_micros);
+    let template = match kind {
+        Aggregate::Sum => render_over(&total_months, &total_days, &total_micros),
+        Aggregate::Avg => {
+            fields_templates::scaled(
+                &format!(
+                    "(SELECT {total_months} AS m, {total_days} AS d, {total_micros} AS u, \
+                 CAST(COUNT({}) AS REAL) AS f)",
+                    fields_templates::PLACEHOLDER
+                ),
+                true,
+            )
+        }
+    };
     substitute(&[(fields_templates::PLACEHOLDER, &translated)], &template)
 }
 
