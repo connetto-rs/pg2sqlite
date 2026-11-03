@@ -174,6 +174,30 @@ fn session_role_matches_folded_policy_role() {
     assert_eq!(count, 2, "TO App_User names app_user, so admin_read must apply");
 }
 
+/// A `TO` entry that cannot be settled for the session role refuses the
+/// translation naming it: a role the schema never declares, and
+/// `CURRENT_USER`, which names whoever ran `CREATE POLICY`.
+#[test]
+fn a_policy_role_that_cannot_be_settled_is_refused() {
+    for (to, named) in [("ghost", "ghost"), ("CURRENT_USER", "CURRENT_USER")] {
+        let sql = format!(
+            "CREATE ROLE app_user; {} GRANT SELECT ON docs TO app_user;",
+            PG.replace("TO admin", &format!("TO {to}"))
+        );
+        let error = Pg2Sqlite::default()
+            .sql(&sql)
+            .expect("parse")
+            .translate(&opts_with_role())
+            .map(pg2sqlite::script::Script::into_vec)
+            .expect_err("the TO list cannot be settled for app_user");
+        let message = error.to_string();
+        assert!(
+            message.contains("admin_read") && message.contains(named),
+            "TO {to}: the refusal names the policy and the role: {message}"
+        );
+    }
+}
+
 /// A session role the schema never declares refuses translation, as
 /// PostgreSQL refuses `SET ROLE` to a role that does not exist.
 #[test]

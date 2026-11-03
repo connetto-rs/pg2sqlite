@@ -292,6 +292,28 @@ fn a_view_whose_owner_the_policies_bind_is_refused() {
     assert!(error.to_string().contains("as its owner 'reader'"), "{error}");
 }
 
+/// The view's owner meets the table's policies like any role, so a `TO` entry
+/// that cannot be settled for it refuses the view, here `CURRENT_USER`, which
+/// names whoever ran `CREATE POLICY`. The session role owns the table, so only
+/// the view reaches the policy.
+#[test]
+fn a_view_owner_meeting_an_unsettled_policy_role_is_refused() {
+    let error = Pg2Sqlite::default()
+        .sql(&format!(
+            "CREATE ROLE app_user;
+             CREATE ROLE reader;
+             {TABLE}
+             ALTER TABLE oo OWNER TO app_user;
+             CREATE POLICY p ON oo FOR SELECT TO CURRENT_USER USING (owner_id > 0);
+             CREATE VIEW oo_all AS SELECT id, owner_id FROM oo;
+             ALTER VIEW oo_all OWNER TO reader;"
+        ))
+        .expect("parse")
+        .translate_to_sql(&options().with_session_user_role("app_user"))
+        .expect_err("CURRENT_USER cannot be settled for reader");
+    assert!(error.to_string().contains("CURRENT_USER"), "{error}");
+}
+
 /// A view declared `security_invoker` keeps the caller's rights, so it reads
 /// the policy view. It used to be refused outright as an unsupported option.
 #[test]

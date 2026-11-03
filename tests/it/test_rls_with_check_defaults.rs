@@ -243,6 +243,23 @@ fn an_update_moving_a_row_out_of_the_select_policies_is_refused()
     Ok(())
 }
 
+/// With an UPDATE policy and no SELECT policy, an UPDATE whose `WHERE` reads a
+/// column sees no row, so it changes nothing and raises nothing. Measured on
+/// PostgreSQL 18.6 as `UPDATE 0`.
+#[test]
+fn an_update_without_a_select_policy_reaches_no_row() -> Result<(), Box<dyn std::error::Error>> {
+    let mut conn = setup("CREATE POLICY upd ON docs FOR UPDATE USING (true);")?;
+
+    let updated = diesel::update(docs::table.filter(docs::id.eq(1)))
+        .set(docs::body.eq("edited"))
+        .execute(&mut conn)?;
+
+    assert_eq!(updated, 0, "no SELECT policy admits the row the WHERE reads");
+    assert_eq!(stored(&mut conn)?.body, "original");
+
+    Ok(())
+}
+
 /// `FOR ALL USING (p)` with no `WITH CHECK` must also constrain an INSERT: the
 /// USING expression doubles as the check on the new row. This is the INSERT
 /// half of the same rule the UPDATE tests above cover.

@@ -436,6 +436,30 @@ fn backing_delete_enforces_policy_unless_exempt() {
         .expect("exempt backing delete");
 }
 
+/// A DELETE policy admitting every row leaves nothing for the backing guard to
+/// refuse, so a backing delete lands without the exemption.
+#[test]
+fn backing_delete_every_row_admits_needs_no_exemption() {
+    let schema_sql =
+        POLICY_SCHEMA.replace("FOR DELETE USING (owner = 'alice')", "FOR DELETE USING (true)");
+    let (mut connection, exempt) = apply_with_exemption(&schema_sql, &options());
+    exempt.store(true, Ordering::Relaxed);
+    diesel::insert_into(schema::shared_items_rls::table)
+        .values((
+            schema::shared_items_rls::id.eq(1),
+            schema::shared_items_rls::owner.eq("bob"),
+            schema::shared_items_rls::body.eq("first"),
+        ))
+        .execute(&mut connection)
+        .expect("seed backing row");
+
+    exempt.store(false, Ordering::Relaxed);
+    let deleted = diesel::delete(schema::shared_items_rls::table.find(1))
+        .execute(&mut connection)
+        .expect("a delete every row may take needs no exemption");
+    assert_eq!(deleted, 1);
+}
+
 #[test]
 fn read_only_non_rls_guards_honour_exemption() {
     let role_options = Pg2SqliteOptions::default()
