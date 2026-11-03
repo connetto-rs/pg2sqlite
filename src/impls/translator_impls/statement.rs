@@ -692,15 +692,16 @@ fn reject_untranslatable_alter_table_clauses(
     alter_table: &AlterTable,
     schema: &ParserDB,
 ) -> Result<(), Error> {
+    let snowflake = match alter_table.table_type {
+        Some(AlterTableType::Iceberg) => Some("ICEBERG, which is Snowflake"),
+        Some(AlterTableType::Dynamic) => Some("DYNAMIC, which is Snowflake"),
+        Some(AlterTableType::External) => Some("EXTERNAL, which is Snowflake"),
+        Some(AlterTableType::Foreign) | None => None,
+    };
     let foreign = if alter_table.on_cluster.is_some() {
         Some("ON CLUSTER, which is ClickHouse")
-    } else if let Some(table_type) = alter_table.table_type.as_ref() {
-        match table_type {
-            AlterTableType::Iceberg => Some("ICEBERG, which is Snowflake"),
-            AlterTableType::Dynamic => Some("DYNAMIC, which is Snowflake"),
-            AlterTableType::External => Some("EXTERNAL, which is Snowflake"),
-            AlterTableType::Foreign => None,
-        }
+    } else if snowflake.is_some() {
+        snowflake
     } else if alter_table.location.is_some() {
         Some("SET LOCATION, which is Hive")
     } else {
