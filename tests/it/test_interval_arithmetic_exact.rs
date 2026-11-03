@@ -1,6 +1,7 @@
 //! The exact interval arithmetic answers, checked against PostgreSQL 18.6:
 //! negation, addition and subtraction of intervals, multiplication and
-//! division by a factor, and their sum and average.
+//! division by a factor, their sum and average, and a date, time or
+//! timestamp shifted by an interval.
 //!
 //! The differential pairs are canonical interval texts PostgreSQL stores, and
 //! its measured answers to negating the first and adding or subtracting the
@@ -8097,6 +8098,634 @@ const SCALED: &[[Option<&str>; 3]] = &[
     ],
 ];
 
+/// The intervals the shift corpus applies, as the statement writes them.
+const SHIFT_INTERVALS: &[&str] = &[
+    "1 day",
+    "1 mon",
+    "-1 mons",
+    "1 year 2 mons 3 days 04:05:06.789",
+    "1 mon -1 days +01:00:00",
+    "-2 years +3 mons -00:00:00.5",
+    "00:00:00",
+    "23:59:59.999",
+    "36:00:00",
+    "-1 days -12:00:00",
+    "12 mons 30 days",
+    "10000 years",
+    "-2025 years",
+    "2 mons 1 day 00:00:01",
+    "100:00:00.001",
+];
+
+/// A shift corpus row: a target type, its targets as the statement writes
+/// them, and PostgreSQL's answers to `target + iv`, `target - iv` and
+/// `iv + target` for each target and, within it, each interval of
+/// [`SHIFT_INTERVALS`], `None` where PostgreSQL raises.
+type ShiftRow<'a> = (&'a str, &'a [&'a str], &'a [[Option<&'a str>; 3]]);
+
+/// The shift corpus.
+const SHIFTS: &[ShiftRow<'static>] = &[
+    (
+        "date",
+        &["2026-01-31", "2024-02-29", "0001-03-01", "9999-12-01"],
+        &[
+            [Some("2026-02-01 00:00:00"), Some("2026-01-30 00:00:00"), Some("2026-02-01 00:00:00")],
+            [Some("2026-02-28 00:00:00"), Some("2025-12-31 00:00:00"), Some("2026-02-28 00:00:00")],
+            [Some("2025-12-31 00:00:00"), Some("2026-02-28 00:00:00"), Some("2025-12-31 00:00:00")],
+            [
+                Some("2027-04-03 04:05:06.789"),
+                Some("2024-11-26 19:54:53.211"),
+                Some("2027-04-03 04:05:06.789"),
+            ],
+            [Some("2026-02-27 01:00:00"), Some("2025-12-31 23:00:00"), Some("2026-02-27 01:00:00")],
+            [
+                Some("2024-04-29 23:59:59.5"),
+                Some("2027-10-31 00:00:00.5"),
+                Some("2024-04-29 23:59:59.5"),
+            ],
+            [Some("2026-01-31 00:00:00"), Some("2026-01-31 00:00:00"), Some("2026-01-31 00:00:00")],
+            [
+                Some("2026-01-31 23:59:59.999"),
+                Some("2026-01-30 00:00:00.001"),
+                Some("2026-01-31 23:59:59.999"),
+            ],
+            [Some("2026-02-01 12:00:00"), Some("2026-01-29 12:00:00"), Some("2026-02-01 12:00:00")],
+            [Some("2026-01-29 12:00:00"), Some("2026-02-01 12:00:00"), Some("2026-01-29 12:00:00")],
+            [Some("2027-03-02 00:00:00"), Some("2025-01-01 00:00:00"), Some("2027-03-02 00:00:00")],
+            [Some("12026-01-31 00:00:00"), None, Some("12026-01-31 00:00:00")],
+            [Some("0001-01-31 00:00:00"), Some("4051-01-31 00:00:00"), Some("0001-01-31 00:00:00")],
+            [Some("2026-04-01 00:00:01"), Some("2025-11-28 23:59:59"), Some("2026-04-01 00:00:01")],
+            [
+                Some("2026-02-04 04:00:00.001"),
+                Some("2026-01-26 19:59:59.999"),
+                Some("2026-02-04 04:00:00.001"),
+            ],
+            [Some("2024-03-01 00:00:00"), Some("2024-02-28 00:00:00"), Some("2024-03-01 00:00:00")],
+            [Some("2024-03-29 00:00:00"), Some("2024-01-29 00:00:00"), Some("2024-03-29 00:00:00")],
+            [Some("2024-01-29 00:00:00"), Some("2024-03-29 00:00:00"), Some("2024-01-29 00:00:00")],
+            [
+                Some("2025-05-02 04:05:06.789"),
+                Some("2022-12-25 19:54:53.211"),
+                Some("2025-05-02 04:05:06.789"),
+            ],
+            [Some("2024-03-28 01:00:00"), Some("2024-01-29 23:00:00"), Some("2024-03-28 01:00:00")],
+            [
+                Some("2022-05-28 23:59:59.5"),
+                Some("2025-11-29 00:00:00.5"),
+                Some("2022-05-28 23:59:59.5"),
+            ],
+            [Some("2024-02-29 00:00:00"), Some("2024-02-29 00:00:00"), Some("2024-02-29 00:00:00")],
+            [
+                Some("2024-02-29 23:59:59.999"),
+                Some("2024-02-28 00:00:00.001"),
+                Some("2024-02-29 23:59:59.999"),
+            ],
+            [Some("2024-03-01 12:00:00"), Some("2024-02-27 12:00:00"), Some("2024-03-01 12:00:00")],
+            [Some("2024-02-27 12:00:00"), Some("2024-03-01 12:00:00"), Some("2024-02-27 12:00:00")],
+            [Some("2025-03-30 00:00:00"), Some("2023-01-29 00:00:00"), Some("2025-03-30 00:00:00")],
+            [Some("12024-02-29 00:00:00"), None, Some("12024-02-29 00:00:00")],
+            [
+                Some("0002-02-28 00:00:00 BC"),
+                Some("4049-02-28 00:00:00"),
+                Some("0002-02-28 00:00:00 BC"),
+            ],
+            [Some("2024-04-30 00:00:01"), Some("2023-12-27 23:59:59"), Some("2024-04-30 00:00:01")],
+            [
+                Some("2024-03-04 04:00:00.001"),
+                Some("2024-02-24 19:59:59.999"),
+                Some("2024-03-04 04:00:00.001"),
+            ],
+            [Some("0001-03-02 00:00:00"), Some("0001-02-28 00:00:00"), Some("0001-03-02 00:00:00")],
+            [Some("0001-04-01 00:00:00"), Some("0001-02-01 00:00:00"), Some("0001-04-01 00:00:00")],
+            [Some("0001-02-01 00:00:00"), Some("0001-04-01 00:00:00"), Some("0001-02-01 00:00:00")],
+            [
+                Some("0002-05-04 04:05:06.789"),
+                Some("0002-12-28 19:54:53.211 BC"),
+                Some("0002-05-04 04:05:06.789"),
+            ],
+            [Some("0001-03-31 01:00:00"), Some("0001-02-01 23:00:00"), Some("0001-03-31 01:00:00")],
+            [
+                Some("0002-05-31 23:59:59.5 BC"),
+                Some("0002-12-01 00:00:00.5"),
+                Some("0002-05-31 23:59:59.5 BC"),
+            ],
+            [Some("0001-03-01 00:00:00"), Some("0001-03-01 00:00:00"), Some("0001-03-01 00:00:00")],
+            [
+                Some("0001-03-01 23:59:59.999"),
+                Some("0001-02-28 00:00:00.001"),
+                Some("0001-03-01 23:59:59.999"),
+            ],
+            [Some("0001-03-02 12:00:00"), Some("0001-02-27 12:00:00"), Some("0001-03-02 12:00:00")],
+            [Some("0001-02-27 12:00:00"), Some("0001-03-02 12:00:00"), Some("0001-02-27 12:00:00")],
+            [
+                Some("0002-03-31 00:00:00"),
+                Some("0001-01-31 00:00:00 BC"),
+                Some("0002-03-31 00:00:00"),
+            ],
+            [Some("10001-03-01 00:00:00"), None, Some("10001-03-01 00:00:00")],
+            [
+                Some("2025-03-01 00:00:00 BC"),
+                Some("2026-03-01 00:00:00"),
+                Some("2025-03-01 00:00:00 BC"),
+            ],
+            [
+                Some("0001-05-02 00:00:01"),
+                Some("0001-12-30 23:59:59 BC"),
+                Some("0001-05-02 00:00:01"),
+            ],
+            [
+                Some("0001-03-05 04:00:00.001"),
+                Some("0001-02-24 19:59:59.999"),
+                Some("0001-03-05 04:00:00.001"),
+            ],
+            [Some("9999-12-02 00:00:00"), Some("9999-11-30 00:00:00"), Some("9999-12-02 00:00:00")],
+            [
+                Some("10000-01-01 00:00:00"),
+                Some("9999-11-01 00:00:00"),
+                Some("10000-01-01 00:00:00"),
+            ],
+            [
+                Some("9999-11-01 00:00:00"),
+                Some("10000-01-01 00:00:00"),
+                Some("9999-11-01 00:00:00"),
+            ],
+            [
+                Some("10001-02-04 04:05:06.789"),
+                Some("9998-09-27 19:54:53.211"),
+                Some("10001-02-04 04:05:06.789"),
+            ],
+            [Some("9999-12-31 01:00:00"), Some("9999-11-01 23:00:00"), Some("9999-12-31 01:00:00")],
+            [
+                Some("9998-02-28 23:59:59.5"),
+                Some("10001-09-01 00:00:00.5"),
+                Some("9998-02-28 23:59:59.5"),
+            ],
+            [Some("9999-12-01 00:00:00"), Some("9999-12-01 00:00:00"), Some("9999-12-01 00:00:00")],
+            [
+                Some("9999-12-01 23:59:59.999"),
+                Some("9999-11-30 00:00:00.001"),
+                Some("9999-12-01 23:59:59.999"),
+            ],
+            [Some("9999-12-02 12:00:00"), Some("9999-11-29 12:00:00"), Some("9999-12-02 12:00:00")],
+            [Some("9999-11-29 12:00:00"), Some("9999-12-02 12:00:00"), Some("9999-11-29 12:00:00")],
+            [
+                Some("10000-12-31 00:00:00"),
+                Some("9998-11-01 00:00:00"),
+                Some("10000-12-31 00:00:00"),
+            ],
+            [
+                Some("19999-12-01 00:00:00"),
+                Some("0002-12-01 00:00:00 BC"),
+                Some("19999-12-01 00:00:00"),
+            ],
+            [
+                Some("7974-12-01 00:00:00"),
+                Some("12024-12-01 00:00:00"),
+                Some("7974-12-01 00:00:00"),
+            ],
+            [
+                Some("10000-02-02 00:00:01"),
+                Some("9999-09-29 23:59:59"),
+                Some("10000-02-02 00:00:01"),
+            ],
+            [
+                Some("9999-12-05 04:00:00.001"),
+                Some("9999-11-26 19:59:59.999"),
+                Some("9999-12-05 04:00:00.001"),
+            ],
+        ],
+    ),
+    (
+        "timestamp",
+        &["2026-01-31 10:20:30.5", "2024-02-29 23:59:59.999", "2000-01-01 00:00:00"],
+        &[
+            [
+                Some("2026-02-01 10:20:30.5"),
+                Some("2026-01-30 10:20:30.5"),
+                Some("2026-02-01 10:20:30.5"),
+            ],
+            [
+                Some("2026-02-28 10:20:30.5"),
+                Some("2025-12-31 10:20:30.5"),
+                Some("2026-02-28 10:20:30.5"),
+            ],
+            [
+                Some("2025-12-31 10:20:30.5"),
+                Some("2026-02-28 10:20:30.5"),
+                Some("2025-12-31 10:20:30.5"),
+            ],
+            [
+                Some("2027-04-03 14:25:37.289"),
+                Some("2024-11-27 06:15:23.711"),
+                Some("2027-04-03 14:25:37.289"),
+            ],
+            [
+                Some("2026-02-27 11:20:30.5"),
+                Some("2026-01-01 09:20:30.5"),
+                Some("2026-02-27 11:20:30.5"),
+            ],
+            [Some("2024-04-30 10:20:30"), Some("2027-10-31 10:20:31"), Some("2024-04-30 10:20:30")],
+            [
+                Some("2026-01-31 10:20:30.5"),
+                Some("2026-01-31 10:20:30.5"),
+                Some("2026-01-31 10:20:30.5"),
+            ],
+            [
+                Some("2026-02-01 10:20:30.499"),
+                Some("2026-01-30 10:20:30.501"),
+                Some("2026-02-01 10:20:30.499"),
+            ],
+            [
+                Some("2026-02-01 22:20:30.5"),
+                Some("2026-01-29 22:20:30.5"),
+                Some("2026-02-01 22:20:30.5"),
+            ],
+            [
+                Some("2026-01-29 22:20:30.5"),
+                Some("2026-02-01 22:20:30.5"),
+                Some("2026-01-29 22:20:30.5"),
+            ],
+            [
+                Some("2027-03-02 10:20:30.5"),
+                Some("2025-01-01 10:20:30.5"),
+                Some("2027-03-02 10:20:30.5"),
+            ],
+            [Some("12026-01-31 10:20:30.5"), None, Some("12026-01-31 10:20:30.5")],
+            [
+                Some("0001-01-31 10:20:30.5"),
+                Some("4051-01-31 10:20:30.5"),
+                Some("0001-01-31 10:20:30.5"),
+            ],
+            [
+                Some("2026-04-01 10:20:31.5"),
+                Some("2025-11-29 10:20:29.5"),
+                Some("2026-04-01 10:20:31.5"),
+            ],
+            [
+                Some("2026-02-04 14:20:30.501"),
+                Some("2026-01-27 06:20:30.499"),
+                Some("2026-02-04 14:20:30.501"),
+            ],
+            [
+                Some("2024-03-01 23:59:59.999"),
+                Some("2024-02-28 23:59:59.999"),
+                Some("2024-03-01 23:59:59.999"),
+            ],
+            [
+                Some("2024-03-29 23:59:59.999"),
+                Some("2024-01-29 23:59:59.999"),
+                Some("2024-03-29 23:59:59.999"),
+            ],
+            [
+                Some("2024-01-29 23:59:59.999"),
+                Some("2024-03-29 23:59:59.999"),
+                Some("2024-01-29 23:59:59.999"),
+            ],
+            [
+                Some("2025-05-03 04:05:06.788"),
+                Some("2022-12-26 19:54:53.21"),
+                Some("2025-05-03 04:05:06.788"),
+            ],
+            [
+                Some("2024-03-29 00:59:59.999"),
+                Some("2024-01-30 22:59:59.999"),
+                Some("2024-03-29 00:59:59.999"),
+            ],
+            [
+                Some("2022-05-29 23:59:59.499"),
+                Some("2025-11-30 00:00:00.499"),
+                Some("2022-05-29 23:59:59.499"),
+            ],
+            [
+                Some("2024-02-29 23:59:59.999"),
+                Some("2024-02-29 23:59:59.999"),
+                Some("2024-02-29 23:59:59.999"),
+            ],
+            [
+                Some("2024-03-01 23:59:59.998"),
+                Some("2024-02-29 00:00:00"),
+                Some("2024-03-01 23:59:59.998"),
+            ],
+            [
+                Some("2024-03-02 11:59:59.999"),
+                Some("2024-02-28 11:59:59.999"),
+                Some("2024-03-02 11:59:59.999"),
+            ],
+            [
+                Some("2024-02-28 11:59:59.999"),
+                Some("2024-03-02 11:59:59.999"),
+                Some("2024-02-28 11:59:59.999"),
+            ],
+            [
+                Some("2025-03-30 23:59:59.999"),
+                Some("2023-01-29 23:59:59.999"),
+                Some("2025-03-30 23:59:59.999"),
+            ],
+            [Some("12024-02-29 23:59:59.999"), None, Some("12024-02-29 23:59:59.999")],
+            [
+                Some("0002-02-28 23:59:59.999 BC"),
+                Some("4049-02-28 23:59:59.999"),
+                Some("0002-02-28 23:59:59.999 BC"),
+            ],
+            [
+                Some("2024-05-01 00:00:00.999"),
+                Some("2023-12-28 23:59:58.999"),
+                Some("2024-05-01 00:00:00.999"),
+            ],
+            [
+                Some("2024-03-05 04:00:00"),
+                Some("2024-02-25 19:59:59.998"),
+                Some("2024-03-05 04:00:00"),
+            ],
+            [Some("2000-01-02 00:00:00"), Some("1999-12-31 00:00:00"), Some("2000-01-02 00:00:00")],
+            [Some("2000-02-01 00:00:00"), Some("1999-12-01 00:00:00"), Some("2000-02-01 00:00:00")],
+            [Some("1999-12-01 00:00:00"), Some("2000-02-01 00:00:00"), Some("1999-12-01 00:00:00")],
+            [
+                Some("2001-03-04 04:05:06.789"),
+                Some("1998-10-28 19:54:53.211"),
+                Some("2001-03-04 04:05:06.789"),
+            ],
+            [Some("2000-01-31 01:00:00"), Some("1999-12-01 23:00:00"), Some("2000-01-31 01:00:00")],
+            [
+                Some("1998-03-31 23:59:59.5"),
+                Some("2001-10-01 00:00:00.5"),
+                Some("1998-03-31 23:59:59.5"),
+            ],
+            [Some("2000-01-01 00:00:00"), Some("2000-01-01 00:00:00"), Some("2000-01-01 00:00:00")],
+            [
+                Some("2000-01-01 23:59:59.999"),
+                Some("1999-12-31 00:00:00.001"),
+                Some("2000-01-01 23:59:59.999"),
+            ],
+            [Some("2000-01-02 12:00:00"), Some("1999-12-30 12:00:00"), Some("2000-01-02 12:00:00")],
+            [Some("1999-12-30 12:00:00"), Some("2000-01-02 12:00:00"), Some("1999-12-30 12:00:00")],
+            [Some("2001-01-31 00:00:00"), Some("1998-12-02 00:00:00"), Some("2001-01-31 00:00:00")],
+            [Some("12000-01-01 00:00:00"), None, Some("12000-01-01 00:00:00")],
+            [
+                Some("0026-01-01 00:00:00 BC"),
+                Some("4025-01-01 00:00:00"),
+                Some("0026-01-01 00:00:00 BC"),
+            ],
+            [Some("2000-03-02 00:00:01"), Some("1999-10-30 23:59:59"), Some("2000-03-02 00:00:01")],
+            [
+                Some("2000-01-05 04:00:00.001"),
+                Some("1999-12-27 19:59:59.999"),
+                Some("2000-01-05 04:00:00.001"),
+            ],
+        ],
+    ),
+    (
+        "timestamptz",
+        &["2026-01-31 10:20:30.5+00", "2024-02-29 23:00:00+00"],
+        &[
+            [
+                Some("2026-02-01 10:20:30.5+00"),
+                Some("2026-01-30 10:20:30.5+00"),
+                Some("2026-02-01 10:20:30.5+00"),
+            ],
+            [
+                Some("2026-02-28 10:20:30.5+00"),
+                Some("2025-12-31 10:20:30.5+00"),
+                Some("2026-02-28 10:20:30.5+00"),
+            ],
+            [
+                Some("2025-12-31 10:20:30.5+00"),
+                Some("2026-02-28 10:20:30.5+00"),
+                Some("2025-12-31 10:20:30.5+00"),
+            ],
+            [
+                Some("2027-04-03 14:25:37.289+00"),
+                Some("2024-11-27 06:15:23.711+00"),
+                Some("2027-04-03 14:25:37.289+00"),
+            ],
+            [
+                Some("2026-02-27 11:20:30.5+00"),
+                Some("2026-01-01 09:20:30.5+00"),
+                Some("2026-02-27 11:20:30.5+00"),
+            ],
+            [
+                Some("2024-04-30 10:20:30+00"),
+                Some("2027-10-31 10:20:31+00"),
+                Some("2024-04-30 10:20:30+00"),
+            ],
+            [
+                Some("2026-01-31 10:20:30.5+00"),
+                Some("2026-01-31 10:20:30.5+00"),
+                Some("2026-01-31 10:20:30.5+00"),
+            ],
+            [
+                Some("2026-02-01 10:20:30.499+00"),
+                Some("2026-01-30 10:20:30.501+00"),
+                Some("2026-02-01 10:20:30.499+00"),
+            ],
+            [
+                Some("2026-02-01 22:20:30.5+00"),
+                Some("2026-01-29 22:20:30.5+00"),
+                Some("2026-02-01 22:20:30.5+00"),
+            ],
+            [
+                Some("2026-01-29 22:20:30.5+00"),
+                Some("2026-02-01 22:20:30.5+00"),
+                Some("2026-01-29 22:20:30.5+00"),
+            ],
+            [
+                Some("2027-03-02 10:20:30.5+00"),
+                Some("2025-01-01 10:20:30.5+00"),
+                Some("2027-03-02 10:20:30.5+00"),
+            ],
+            [Some("12026-01-31 10:20:30.5+00"), None, Some("12026-01-31 10:20:30.5+00")],
+            [
+                Some("0001-01-31 10:20:30.5+00"),
+                Some("4051-01-31 10:20:30.5+00"),
+                Some("0001-01-31 10:20:30.5+00"),
+            ],
+            [
+                Some("2026-04-01 10:20:31.5+00"),
+                Some("2025-11-29 10:20:29.5+00"),
+                Some("2026-04-01 10:20:31.5+00"),
+            ],
+            [
+                Some("2026-02-04 14:20:30.501+00"),
+                Some("2026-01-27 06:20:30.499+00"),
+                Some("2026-02-04 14:20:30.501+00"),
+            ],
+            [
+                Some("2024-03-01 23:00:00+00"),
+                Some("2024-02-28 23:00:00+00"),
+                Some("2024-03-01 23:00:00+00"),
+            ],
+            [
+                Some("2024-03-29 23:00:00+00"),
+                Some("2024-01-29 23:00:00+00"),
+                Some("2024-03-29 23:00:00+00"),
+            ],
+            [
+                Some("2024-01-29 23:00:00+00"),
+                Some("2024-03-29 23:00:00+00"),
+                Some("2024-01-29 23:00:00+00"),
+            ],
+            [
+                Some("2025-05-03 03:05:06.789+00"),
+                Some("2022-12-26 18:54:53.211+00"),
+                Some("2025-05-03 03:05:06.789+00"),
+            ],
+            [
+                Some("2024-03-29 00:00:00+00"),
+                Some("2024-01-30 22:00:00+00"),
+                Some("2024-03-29 00:00:00+00"),
+            ],
+            [
+                Some("2022-05-29 22:59:59.5+00"),
+                Some("2025-11-29 23:00:00.5+00"),
+                Some("2022-05-29 22:59:59.5+00"),
+            ],
+            [
+                Some("2024-02-29 23:00:00+00"),
+                Some("2024-02-29 23:00:00+00"),
+                Some("2024-02-29 23:00:00+00"),
+            ],
+            [
+                Some("2024-03-01 22:59:59.999+00"),
+                Some("2024-02-28 23:00:00.001+00"),
+                Some("2024-03-01 22:59:59.999+00"),
+            ],
+            [
+                Some("2024-03-02 11:00:00+00"),
+                Some("2024-02-28 11:00:00+00"),
+                Some("2024-03-02 11:00:00+00"),
+            ],
+            [
+                Some("2024-02-28 11:00:00+00"),
+                Some("2024-03-02 11:00:00+00"),
+                Some("2024-02-28 11:00:00+00"),
+            ],
+            [
+                Some("2025-03-30 23:00:00+00"),
+                Some("2023-01-29 23:00:00+00"),
+                Some("2025-03-30 23:00:00+00"),
+            ],
+            [Some("12024-02-29 23:00:00+00"), None, Some("12024-02-29 23:00:00+00")],
+            [
+                Some("0002-02-28 23:00:00+00 BC"),
+                Some("4049-02-28 23:00:00+00"),
+                Some("0002-02-28 23:00:00+00 BC"),
+            ],
+            [
+                Some("2024-04-30 23:00:01+00"),
+                Some("2023-12-28 22:59:59+00"),
+                Some("2024-04-30 23:00:01+00"),
+            ],
+            [
+                Some("2024-03-05 03:00:00.001+00"),
+                Some("2024-02-25 18:59:59.999+00"),
+                Some("2024-03-05 03:00:00.001+00"),
+            ],
+        ],
+    ),
+    (
+        "time",
+        &["10:20:30.5", "23:59:59.999", "00:00:00"],
+        &[
+            [Some("10:20:30.5"), Some("10:20:30.5"), Some("10:20:30.5")],
+            [Some("10:20:30.5"), Some("10:20:30.5"), Some("10:20:30.5")],
+            [Some("10:20:30.5"), Some("10:20:30.5"), Some("10:20:30.5")],
+            [Some("14:25:37.289"), Some("06:15:23.711"), Some("14:25:37.289")],
+            [Some("11:20:30.5"), Some("09:20:30.5"), Some("11:20:30.5")],
+            [Some("10:20:30"), Some("10:20:31"), Some("10:20:30")],
+            [Some("10:20:30.5"), Some("10:20:30.5"), Some("10:20:30.5")],
+            [Some("10:20:30.499"), Some("10:20:30.501"), Some("10:20:30.499")],
+            [Some("22:20:30.5"), Some("22:20:30.5"), Some("22:20:30.5")],
+            [Some("22:20:30.5"), Some("22:20:30.5"), Some("22:20:30.5")],
+            [Some("10:20:30.5"), Some("10:20:30.5"), Some("10:20:30.5")],
+            [Some("10:20:30.5"), Some("10:20:30.5"), Some("10:20:30.5")],
+            [Some("10:20:30.5"), Some("10:20:30.5"), Some("10:20:30.5")],
+            [Some("10:20:31.5"), Some("10:20:29.5"), Some("10:20:31.5")],
+            [Some("14:20:30.501"), Some("06:20:30.499"), Some("14:20:30.501")],
+            [Some("23:59:59.999"), Some("23:59:59.999"), Some("23:59:59.999")],
+            [Some("23:59:59.999"), Some("23:59:59.999"), Some("23:59:59.999")],
+            [Some("23:59:59.999"), Some("23:59:59.999"), Some("23:59:59.999")],
+            [Some("04:05:06.788"), Some("19:54:53.21"), Some("04:05:06.788")],
+            [Some("00:59:59.999"), Some("22:59:59.999"), Some("00:59:59.999")],
+            [Some("23:59:59.499"), Some("00:00:00.499"), Some("23:59:59.499")],
+            [Some("23:59:59.999"), Some("23:59:59.999"), Some("23:59:59.999")],
+            [Some("23:59:59.998"), Some("00:00:00"), Some("23:59:59.998")],
+            [Some("11:59:59.999"), Some("11:59:59.999"), Some("11:59:59.999")],
+            [Some("11:59:59.999"), Some("11:59:59.999"), Some("11:59:59.999")],
+            [Some("23:59:59.999"), Some("23:59:59.999"), Some("23:59:59.999")],
+            [Some("23:59:59.999"), Some("23:59:59.999"), Some("23:59:59.999")],
+            [Some("23:59:59.999"), Some("23:59:59.999"), Some("23:59:59.999")],
+            [Some("00:00:00.999"), Some("23:59:58.999"), Some("00:00:00.999")],
+            [Some("04:00:00"), Some("19:59:59.998"), Some("04:00:00")],
+            [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+            [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+            [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+            [Some("04:05:06.789"), Some("19:54:53.211"), Some("04:05:06.789")],
+            [Some("01:00:00"), Some("23:00:00"), Some("01:00:00")],
+            [Some("23:59:59.5"), Some("00:00:00.5"), Some("23:59:59.5")],
+            [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+            [Some("23:59:59.999"), Some("00:00:00.001"), Some("23:59:59.999")],
+            [Some("12:00:00"), Some("12:00:00"), Some("12:00:00")],
+            [Some("12:00:00"), Some("12:00:00"), Some("12:00:00")],
+            [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+            [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+            [Some("00:00:00"), Some("00:00:00"), Some("00:00:00")],
+            [Some("00:00:01"), Some("23:59:59"), Some("00:00:01")],
+            [Some("04:00:00.001"), Some("19:59:59.999"), Some("04:00:00.001")],
+        ],
+    ),
+    (
+        "timetz",
+        &["10:20:30.5+00", "23:00:00+05:30", "00:00:00-03"],
+        &[
+            [Some("10:20:30.5+00"), Some("10:20:30.5+00"), Some("10:20:30.5+00")],
+            [Some("10:20:30.5+00"), Some("10:20:30.5+00"), Some("10:20:30.5+00")],
+            [Some("10:20:30.5+00"), Some("10:20:30.5+00"), Some("10:20:30.5+00")],
+            [Some("14:25:37.289+00"), Some("06:15:23.711+00"), Some("14:25:37.289+00")],
+            [Some("11:20:30.5+00"), Some("09:20:30.5+00"), Some("11:20:30.5+00")],
+            [Some("10:20:30+00"), Some("10:20:31+00"), Some("10:20:30+00")],
+            [Some("10:20:30.5+00"), Some("10:20:30.5+00"), Some("10:20:30.5+00")],
+            [Some("10:20:30.499+00"), Some("10:20:30.501+00"), Some("10:20:30.499+00")],
+            [Some("22:20:30.5+00"), Some("22:20:30.5+00"), Some("22:20:30.5+00")],
+            [Some("22:20:30.5+00"), Some("22:20:30.5+00"), Some("22:20:30.5+00")],
+            [Some("10:20:30.5+00"), Some("10:20:30.5+00"), Some("10:20:30.5+00")],
+            [Some("10:20:30.5+00"), Some("10:20:30.5+00"), Some("10:20:30.5+00")],
+            [Some("10:20:30.5+00"), Some("10:20:30.5+00"), Some("10:20:30.5+00")],
+            [Some("10:20:31.5+00"), Some("10:20:29.5+00"), Some("10:20:31.5+00")],
+            [Some("14:20:30.501+00"), Some("06:20:30.499+00"), Some("14:20:30.501+00")],
+            [Some("23:00:00+05:30"), Some("23:00:00+05:30"), Some("23:00:00+05:30")],
+            [Some("23:00:00+05:30"), Some("23:00:00+05:30"), Some("23:00:00+05:30")],
+            [Some("23:00:00+05:30"), Some("23:00:00+05:30"), Some("23:00:00+05:30")],
+            [Some("03:05:06.789+05:30"), Some("18:54:53.211+05:30"), Some("03:05:06.789+05:30")],
+            [Some("00:00:00+05:30"), Some("22:00:00+05:30"), Some("00:00:00+05:30")],
+            [Some("22:59:59.5+05:30"), Some("23:00:00.5+05:30"), Some("22:59:59.5+05:30")],
+            [Some("23:00:00+05:30"), Some("23:00:00+05:30"), Some("23:00:00+05:30")],
+            [Some("22:59:59.999+05:30"), Some("23:00:00.001+05:30"), Some("22:59:59.999+05:30")],
+            [Some("11:00:00+05:30"), Some("11:00:00+05:30"), Some("11:00:00+05:30")],
+            [Some("11:00:00+05:30"), Some("11:00:00+05:30"), Some("11:00:00+05:30")],
+            [Some("23:00:00+05:30"), Some("23:00:00+05:30"), Some("23:00:00+05:30")],
+            [Some("23:00:00+05:30"), Some("23:00:00+05:30"), Some("23:00:00+05:30")],
+            [Some("23:00:00+05:30"), Some("23:00:00+05:30"), Some("23:00:00+05:30")],
+            [Some("23:00:01+05:30"), Some("22:59:59+05:30"), Some("23:00:01+05:30")],
+            [Some("03:00:00.001+05:30"), Some("18:59:59.999+05:30"), Some("03:00:00.001+05:30")],
+            [Some("00:00:00-03"), Some("00:00:00-03"), Some("00:00:00-03")],
+            [Some("00:00:00-03"), Some("00:00:00-03"), Some("00:00:00-03")],
+            [Some("00:00:00-03"), Some("00:00:00-03"), Some("00:00:00-03")],
+            [Some("04:05:06.789-03"), Some("19:54:53.211-03"), Some("04:05:06.789-03")],
+            [Some("01:00:00-03"), Some("23:00:00-03"), Some("01:00:00-03")],
+            [Some("23:59:59.5-03"), Some("00:00:00.5-03"), Some("23:59:59.5-03")],
+            [Some("00:00:00-03"), Some("00:00:00-03"), Some("00:00:00-03")],
+            [Some("23:59:59.999-03"), Some("00:00:00.001-03"), Some("23:59:59.999-03")],
+            [Some("12:00:00-03"), Some("12:00:00-03"), Some("12:00:00-03")],
+            [Some("12:00:00-03"), Some("12:00:00-03"), Some("12:00:00-03")],
+            [Some("00:00:00-03"), Some("00:00:00-03"), Some("00:00:00-03")],
+            [Some("00:00:00-03"), Some("00:00:00-03"), Some("00:00:00-03")],
+            [Some("00:00:00-03"), Some("00:00:00-03"), Some("00:00:00-03")],
+            [Some("00:00:01-03"), Some("23:59:59-03"), Some("00:00:01-03")],
+            [Some("04:00:00.001-03"), Some("19:59:59.999-03"), Some("04:00:00.001-03")],
+        ],
+    ),
+];
+
 const SCHEMA: &str = "
 CREATE TABLE t (id int, iv interval, iv2 interval, ts timestamptz);
 INSERT INTO t VALUES
@@ -8732,29 +9361,177 @@ fn an_interval_beside_a_number_is_refused_with_postgresqls_message() {
     refused("SELECT (iv - 5)::text FROM t;", "operator does not exist: interval - integer");
 }
 
+/// Whether a date or timestamp answer PostgreSQL prints falls in the years 1
+/// to 9999 the replica holds.
+fn in_replica_years(answer: &str) -> bool {
+    answer.as_bytes().get(4) == Some(&b'-')
+        && answer[..4].bytes().all(|byte| byte.is_ascii_digit())
+        && !answer.starts_with("0000")
+        && !answer.ends_with(" BC")
+}
+
+/// The shift corpus rows of `kind` as one table of targets and intervals,
+/// in target-major order.
+fn shift_schema(kind: &str, targets: &[&str]) -> String {
+    let tuples: Vec<String> = targets
+        .iter()
+        .flat_map(|target| SHIFT_INTERVALS.iter().map(move |interval| (target, interval)))
+        .enumerate()
+        .map(|(index, (target, interval))| format!("({}, '{target}', '{interval}')", index + 1))
+        .collect();
+    format!(
+        "CREATE TABLE sh (id int, tg {kind}, iv interval);\nINSERT INTO sh VALUES {};",
+        tuples.join(", ")
+    )
+}
+
+/// The three shift statements over `target` and `interval`.
+fn shift_expressions(target: &str, interval: &str) -> [String; 3] {
+    [
+        format!("{target} + {interval}"),
+        format!("{target} - {interval}"),
+        format!("{interval} + {target}"),
+    ]
+}
+
+/// The corpus shift whose month step passes the year 9999 before its
+/// negative day step brings it back: PostgreSQL answers inside the years,
+/// and SQLite's date functions answer `NULL` at the month step, as for a
+/// literal interval.
+const PAST_9999_MIDWAY: (&str, &str) = ("9999-12-01", "1 mon -1 days +01:00:00");
+
 #[test]
-fn a_shift_beside_an_interval_column_stays_refused() {
-    refused("SELECT (ts + iv)::text FROM t;", "cannot be translated");
-    refused("SELECT (ts - iv)::text FROM t;", "cannot be translated");
+fn shifting_by_an_interval_column_matches_postgresql() {
+    for (kind, targets, answers) in
+        SHIFTS.iter().filter(|(kind, _, _)| matches!(*kind, "date" | "timestamp" | "time"))
+    {
+        let schema = shift_schema(kind, targets);
+        for (op, expression) in shift_expressions("tg", "iv").iter().enumerate() {
+            let got = run_translated_with(
+                &format!("{schema}\nSELECT ({expression})::text FROM sh ORDER BY id;"),
+                &Pg2SqliteOptions::default(),
+            );
+            let want: Vec<Option<String>> = answers
+                .iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    let target = targets[index / SHIFT_INTERVALS.len()];
+                    let interval = SHIFT_INTERVALS[index % SHIFT_INTERVALS.len()];
+                    if (target, interval) == PAST_9999_MIDWAY && op != 1 {
+                        return None;
+                    }
+                    row[op]
+                        .filter(|answer| *kind == "time" || in_replica_years(answer))
+                        .map(ToString::to_string)
+                })
+                .collect();
+            assert_eq!(got, want, "{expression} over {kind} should match PostgreSQL");
+        }
+    }
 }
 
 #[test]
-fn a_column_interval_shifts_no_time_type_in_the_replica() {
-    // PostgreSQL shifts every one of these types by the column interval; the
-    // replica shifts a date or timestamp only by a literal interval and
-    // refuses the column form for every shift type.
-    let schema = "CREATE TABLE sh (id int, iv interval, d date, tm time, tmtz timetz, tmwz time with time zone, ts timestamp, tstz timestamptz, tswz timestamp with time zone);\nINSERT INTO sh VALUES (1, '1 day', '2026-01-01', '00:00:00', '00:00:00+00', '00:00:00+00', '2026-01-01 00:00:00', '2026-01-01 00:00:00+00', '2026-01-01 00:00:00+00');";
-    for column in ["d", "tm", "tmtz", "tmwz", "ts", "tstz", "tswz"] {
-        let script = Pg2Sqlite::default()
-            .sql(&format!("{schema}\nSELECT ({column} + iv)::text FROM sh;"))
-            .expect("parse")
-            .translate_to_sql(&Pg2SqliteOptions::default());
-        let error = script.expect_err("the column shift should be refused at translation time");
-        assert!(
-            error.to_string().contains("cannot be translated: the answer is an interval"),
-            "refusal {error} should name the interval answer beside {column}"
-        );
+fn a_shift_passing_the_year_9999_midway_answers_null() {
+    let (target, interval) = PAST_9999_MIDWAY;
+    let index = SHIFT_INTERVALS.iter().position(|text| *text == interval).expect("corpus interval");
+    let (_, targets, answers) =
+        SHIFTS.iter().find(|(kind, _, _)| *kind == "date").expect("date corpus");
+    let row = targets.iter().position(|text| *text == target).expect("corpus target");
+    assert_eq!(answers[row * SHIFT_INTERVALS.len() + index][0], Some("9999-12-31 01:00:00"));
+    for pg in [
+        format!(
+            "CREATE TABLE p (d date, iv interval);\nINSERT INTO p VALUES ('{target}', '{interval}');\nSELECT (d + iv)::text FROM p;"
+        ),
+        format!(
+            "CREATE TABLE p (d date);\nINSERT INTO p VALUES ('{target}');\nSELECT (d + INTERVAL '{interval}')::text FROM p;"
+        ),
+    ] {
+        assert_eq!(run_translated_with(&pg, &Pg2SqliteOptions::default()), vec![None], "{pg}");
     }
+}
+
+#[test]
+fn shifting_by_an_interval_column_answers_what_the_literal_shift_answers() {
+    for (kind, targets, _) in SHIFTS {
+        let schema = shift_schema(kind, targets);
+        for (op, expression) in shift_expressions("tg", "iv").iter().enumerate() {
+            let got = run_translated_with(
+                &format!("{schema}\nSELECT ({expression})::text FROM sh ORDER BY id;"),
+                &Pg2SqliteOptions::default(),
+            );
+            for (row, value) in got.iter().enumerate() {
+                let interval = SHIFT_INTERVALS[row % SHIFT_INTERVALS.len()];
+                let literal = &shift_expressions("tg", &format!("INTERVAL '{interval}'"))[op];
+                let script = Pg2Sqlite::default()
+                    .sql(&format!(
+                        "{schema}\nSELECT ({literal})::text FROM sh WHERE id = {};",
+                        row + 1
+                    ))
+                    .expect("parse")
+                    .translate_to_sql(&Pg2SqliteOptions::default());
+                let Ok(script) = script else {
+                    // The literal path refuses what it can decide is out of
+                    // range; the column form answers NULL there.
+                    assert_eq!(*value, None, "{literal} over {kind} row {}", row + 1);
+                    continue;
+                };
+                drop(script);
+                let literal_answer = run_translated_with(
+                    &format!("{schema}\nSELECT ({literal})::text FROM sh WHERE id = {};", row + 1),
+                    &Pg2SqliteOptions::default(),
+                );
+                assert_eq!(
+                    vec![value.clone()],
+                    literal_answer,
+                    "{expression} and {literal} over {kind} row {}",
+                    row + 1
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_shift_beside_an_interval_column_matches_postgresql() {
+    let schema = "CREATE TABLE sh2 (id int, iv interval, d date, tm time, ts timestamp);\nINSERT INTO sh2 VALUES (1, '1 day', '2026-01-01', '00:00:00', '2026-01-01 00:00:00'), (2, '1 mon -1 days +01:00:00', '2026-01-31', '23:30:00', '2026-01-31 23:30:00');";
+    for (pg, answers) in [
+        (
+            "SELECT (d + iv)::text FROM sh2 ORDER BY id;",
+            ["2026-01-02 00:00:00", "2026-02-27 01:00:00"],
+        ),
+        ("SELECT (tm + iv)::text FROM sh2 ORDER BY id;", ["00:00:00", "00:30:00"]),
+        (
+            "SELECT (ts - iv)::text FROM sh2 ORDER BY id;",
+            ["2025-12-31 00:00:00", "2026-01-01 22:30:00"],
+        ),
+        (
+            "SELECT (iv + ts)::text FROM sh2 ORDER BY id;",
+            ["2026-01-02 00:00:00", "2026-02-28 00:30:00"],
+        ),
+    ] {
+        assert_eq!(run(&format!("{schema}\n{pg}")), some(&answers), "{pg}");
+    }
+}
+
+#[test]
+fn a_time_shifted_by_a_literal_ignores_the_months_and_days() {
+    // `time_pl_interval` adds the time field alone, wrapped at 24 hours.
+    for (expression, answer) in [
+        ("time '10:20:30.5' + interval '10000 years'", "10:20:30.5"),
+        ("time '10:20:30.5' + interval '-2025 years 1 hour'", "11:20:30.5"),
+        ("time '23:00:00' + interval '1 mon 2 days 36:00:00'", "11:00:00"),
+        ("time '01:00:00' - interval '50:00:00'", "23:00:00"),
+    ] {
+        assert_eq!(run(&format!("SELECT ({expression})::text;")), some(&[answer]), "{expression}");
+    }
+}
+
+#[test]
+fn shifting_by_a_null_interval_answers_null() {
+    assert_eq!(
+        run("SELECT (t.ts + n.iv)::text FROM n, t WHERE n.id = 2 AND t.id = 1;"),
+        vec![None]
+    );
 }
 
 #[test]

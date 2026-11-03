@@ -14,18 +14,20 @@ use alloc::{
     boxed::Box,
     format,
     string::{String, ToString},
+    vec,
     vec::Vec,
 };
 use core::ops::ControlFlow;
 
 use sql_traits::structs::ParserDB;
 use sqlparser::{
-    ast::{BinaryOperator, Expr, UnaryOperator, Value, ValueWithSpan, VisitMut, VisitorMut},
+    ast::{BinaryOperator, Expr, Ident, UnaryOperator, Value, ValueWithSpan, VisitMut, VisitorMut},
     dialect::SQLiteDialect,
     parser::Parser,
 };
 
 use super::{
+    IntervalShift,
     decode::{Decoded, Interval, Typmod, interval_in},
     fields_templates,
     keys::{self, IntervalSide},
@@ -38,6 +40,8 @@ use crate::{
         function_helpers::string_literal,
         replay::{is_replayable, reject_duplicated_operand},
         shared_helpers::{declared_type_matches, numeric_scale},
+        temporal_arithmetic::{TemporalKind, temporal_kind_of},
+        translator_impls::expr::{shifted_by_modifiers, shifted_interval_target},
     },
     options::TranslationContext,
     traits::translator::TranslatorWithContext,
@@ -305,8 +309,100 @@ pub(crate) fn negated(
     }
 }
 
+/// The target placeholder a shift template substitutes.
+const SHIFT_TARGET: &str = "pg2sqlite_shift_target";
+
+/// The body placeholder a shift template substitutes.
+const SHIFT_BODY: &str = "pg2sqlite_shift_body";
+
+/// `target ± interval` and `interval + target` for a date, time or
+/// timestamp `target`, `timestamp_pl_interval` and its siblings, or `None`
+/// when neither side is such a pair.
+///
+/// A literal interval takes the literal shift's modifiers. An interval read
+/// at run time builds the same modifiers, `'±M months'`, `'floor'`,
+/// `'±D days'` and the seconds, from its fields, in a subquery that reads the
+/// target once and the interval once.
+fn shifted_target(
+    op: &BinaryOperator,
+    left: &Expr,
+    right: &Expr,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+    emit: WarningSink<'_>,
+) -> Result<Option<Expr>, Error> {
+    let negate = matches!(op, BinaryOperator::Minus);
+    let (target, kind, interval) =
+        match (temporal_kind_of(left, schema, options), temporal_kind_of(right, schema, options)) {
+            (Some(kind), None) if is_interval_typed(right, schema, options) => (left, kind, right),
+            (None, Some(kind)) if !negate && is_interval_typed(left, schema, options) => {
+                (right, kind, left)
+            }
+            _ => return Ok(None),
+        };
+    let operator = if negate { "-" } else { "+" };
+    let interval_is_left = core::ptr::eq(interval, left);
+    let Some(row) = field_row(interval, operator, target, interval_is_left, schema, options, emit)?
+    else {
+        return Ok(Some(null_literal()));
+    };
+    let operand = match row {
+        FieldRow::Literal(value) => {
+            let value =
+                if negate { value.negated().map_err(|_| interval_out_of_range())? } else { value };
+            let shift = IntervalShift(value);
+            return shifted_interval_target(target, (op, interval), &shift, schema, options, emit)
+                .map(Some);
+        }
+        FieldRow::Text(operand) => operand,
+    };
+    if !options.allows_subqueries() {
+        return Err(no_subquery_refusal());
+    }
+    let translated_target = target.translate_with_warnings(schema, options, emit)?;
+    let sign = if negate { "-" } else { "" };
+    let modifiers = if matches!(kind, TemporalKind::Time { .. }) {
+        // `time_pl_interval` applies the time field alone, wrapped at 24
+        // hours, and ignores the months and days.
+        vec![
+            format!("printf('%+d seconds', {sign}((fr.u % 86400000000) / 1000000))"),
+            format!("printf('%+.6f seconds', {sign}((fr.u % 1000000) / 1000000.0))"),
+        ]
+    } else {
+        vec![
+            format!("printf('%+d months', {sign}fr.m)"),
+            "'floor'".to_string(),
+            format!("printf('%+d days', {sign}fr.d)"),
+            format!("printf('%+d seconds', {sign}(fr.u / 1000000))"),
+            format!("printf('%+.6f seconds', {sign}((fr.u % 1000000) / 1000000.0))"),
+        ]
+    }
+    .iter()
+    .map(|sql| substitute(&[], sql))
+    .collect::<Result<Vec<Expr>, Error>>()?;
+    let target_ref = Expr::CompoundIdentifier(vec![Ident::new("tv"), Ident::new("tg")]);
+    let body = shifted_by_modifiers(target_ref, Some(kind), &modifiers);
+    // `printf` reads a NULL field as zero, so a NULL interval answers NULL
+    // before the modifiers see it.
+    let template = format!(
+        "(SELECT CASE WHEN fr.m IS NULL OR fr.d IS NULL OR fr.u IS NULL THEN NULL \
+         ELSE {SHIFT_BODY} END FROM (SELECT {SHIFT_TARGET} AS tg) AS tv, {} AS fr)",
+        field_sub(fields_templates::PLACEHOLDER)
+    );
+    substitute(
+        &[
+            (fields_templates::PLACEHOLDER, operand.as_ref()),
+            (SHIFT_TARGET, &translated_target),
+            (SHIFT_BODY, &body),
+        ],
+        &template,
+    )
+    .map(Some)
+}
+
 /// The rendered text of `left` added to or subtracted from `right`,
-/// `finite_interval_pl` and `finite_interval_mi`, or the refusal it answers.
+/// `finite_interval_pl` and `finite_interval_mi`, a date, time or timestamp
+/// shifted by an interval, or the refusal it answers.
 ///
 /// # Errors
 ///
@@ -321,6 +417,9 @@ pub(crate) fn binary(
     options: &TranslationContext<'_>,
     emit: WarningSink<'_>,
 ) -> Result<Expr, Error> {
+    if let Some(shifted) = shifted_target(op, left, right, schema, options, emit)? {
+        return Ok(shifted);
+    }
     let operator = if matches!(op, BinaryOperator::Plus) { "+" } else { "-" };
     let left_row = field_row(left, operator, right, true, schema, options, emit)?;
     let right_row = field_row(right, operator, left, false, schema, options, emit)?;

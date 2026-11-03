@@ -20,6 +20,7 @@ mod keys_templates;
 use alloc::{
     format,
     string::{String, ToString},
+    vec,
     vec::Vec,
 };
 
@@ -53,6 +54,14 @@ impl IntervalShift {
             modifiers.push(time_modifier(interval.micros));
         }
         modifiers
+    }
+
+    /// The SQLite date modifier `time_pl_interval` applies to a time of day:
+    /// the time field alone, wrapped at 24 hours, since PostgreSQL ignores
+    /// the months and days of an interval added to a `time` or `timetz`.
+    pub(crate) fn time_of_day_modifiers(&self) -> Vec<String> {
+        let wrapped = self.0.micros % (24 * MICROS_PER_HOUR);
+        if wrapped == 0 { Vec::new() } else { vec![time_modifier(wrapped)] }
     }
 
     /// The year a date or timestamp literal in the replica's stored text

@@ -7,6 +7,12 @@
 //! `NULL` when a field is missing, has left the 32-bit or 64-bit range
 //! PostgreSQL's `interval` fields hold, or lands on either infinity bound.
 
+#[cfg(not(feature = "std"))]
+use alloc::{
+    format,
+    string::{String, ToString},
+};
+
 /// The operand placeholder the single-operand templates substitute.
 pub(super) const PLACEHOLDER: &str = crate::impls::interval::keys_templates::PLACEHOLDER;
 
