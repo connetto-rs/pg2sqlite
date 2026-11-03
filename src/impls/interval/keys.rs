@@ -196,10 +196,26 @@ fn cast_spelling_refusal() -> Error {
     )
 }
 
-/// The PostgreSQL type name a refusal message spells.
+/// The PostgreSQL type name a refusal message spells, as `format_type`
+/// spells it in PostgreSQL's operator errors: the alias resolved, and a
+/// length or precision dropped from the types it renames.
 pub(crate) fn message_type_name(normalized: &str) -> String {
     let lower = normalized.to_ascii_lowercase();
-    if lower == "int" { "integer".to_string() } else { lower }
+    let base = lower.split('(').next().unwrap_or(&lower).trim_end();
+    match base {
+        "int" | "int4" => "integer",
+        "int2" => "smallint",
+        "int8" => "bigint",
+        "float4" => "real",
+        "float8" => "double precision",
+        "decimal" => "numeric",
+        "varchar" => "character varying",
+        "timestamp" => "timestamp without time zone",
+        "timestamptz" => "timestamp with time zone",
+        "timetz" => "time with time zone",
+        _ => return lower,
+    }
+    .to_string()
 }
 
 /// The PostgreSQL type name of `expr` spelled for a refusal message, or

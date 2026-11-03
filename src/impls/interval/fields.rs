@@ -37,7 +37,7 @@ use crate::{
     errors::Error,
     impls::{
         expression_type::{is_interval_typed, type_name},
-        function_helpers::string_literal,
+        function_helpers::{integer_literal, number_literal, simple_function_expr, string_literal},
         replay::{is_replayable, reject_duplicated_operand},
         shared_helpers::{declared_type_matches, numeric_scale},
         temporal_arithmetic::{TemporalKind, temporal_kind_of},
@@ -108,8 +108,10 @@ fn field_row(
 }
 
 /// The refusal PostgreSQL answers for a side whose type an interval
-/// arithmetic has no form for, or that shifts a date or timestamp the
-/// statement does not decide as a literal.
+/// arithmetic has no operator for, or the refusal a side the statement
+/// cannot type answers. A date, time or timestamp beside an interval is
+/// shifted before a side reaches here, except the `time` an interval
+/// subtracts, which PostgreSQL casts to an interval.
 fn refusal_for_other_side(
     side: &Expr,
     operator: &str,
@@ -120,13 +122,16 @@ fn refusal_for_other_side(
 ) -> Error {
     let (left, right) = if is_left { (side, other) } else { (other, side) };
     let Some(type_name) = type_name(side, schema, options).ok().flatten() else {
-        return legacy_refusal(left, operator, right, schema, options);
+        return untyped_side_refusal(left, operator, right, schema, options);
     };
-    let lower = type_name.to_ascii_lowercase();
-    if !is_shift_type_name(&lower) {
-        return keys::operator_does_not_exist(left, operator, right, schema, options);
+    if type_name.eq_ignore_ascii_case("time") {
+        return Error::forward_refusal(format!(
+            "interval {operator} time without time zone cannot be translated: PostgreSQL casts \
+             the time to an interval and answers an interval, and the translation reads only \
+             a stored or literal interval. Compute it in the application."
+        ));
     }
-    legacy_refusal(left, operator, right, schema, options)
+    keys::operator_does_not_exist(left, operator, right, schema, options)
 }
 
 /// Whether `expr` settles on an interval literal at translation time, the
@@ -147,9 +152,9 @@ pub(crate) fn is_interval_literal(
     ))
 }
 
-/// The refusal a side the statement cannot type answers: the answer may be
-/// an interval or a shifted date or timestamp, and SQLite has neither.
-fn legacy_refusal(
+/// The refusal a side the statement cannot type answers: PostgreSQL decides
+/// the operator from that type, and the translation cannot.
+fn untyped_side_refusal(
     side: &Expr,
     operator: &str,
     other: &Expr,
@@ -157,26 +162,12 @@ fn legacy_refusal(
     options: &TranslationContext<'_>,
 ) -> Error {
     Error::forward_refusal(format!(
-        "{} {operator} {} cannot be translated: the answer is an interval, and SQLite has no \
-         interval type to hold one. Apply the interval to a date or a timestamp in the \
-         application.",
+        "{} {operator} {} cannot be translated: PostgreSQL picks the operator from the type of \
+         each side, and the statement does not settle the type of one of them. Cast that side \
+         to the type you mean.",
         keys::message_type_name_of(side, schema, options),
         keys::message_type_name_of(other, schema, options)
     ))
-}
-
-/// Whether a type name is a date or time an interval shifts.
-fn is_shift_type_name(lower: &str) -> bool {
-    matches!(
-        lower,
-        "date"
-            | "time"
-            | "timetz"
-            | "time with time zone"
-            | "timestamp"
-            | "timestamptz"
-            | "timestamp with time zone"
-    )
 }
 
 /// The field subselect of the `placeholder` operand, the field parse wrapped
@@ -332,12 +323,12 @@ fn shifted_target(
     emit: WarningSink<'_>,
 ) -> Result<Option<Expr>, Error> {
     let negate = matches!(op, BinaryOperator::Minus);
+    // The caller has an interval on one side, which has no temporal kind, so
+    // a temporal side settles which side is the interval.
     let (target, kind, interval) =
         match (temporal_kind_of(left, schema, options), temporal_kind_of(right, schema, options)) {
-            (Some(kind), None) if is_interval_typed(right, schema, options) => (left, kind, right),
-            (None, Some(kind)) if !negate && is_interval_typed(left, schema, options) => {
-                (right, kind, left)
-            }
+            (Some(kind), None) => (left, kind, right),
+            (None, Some(kind)) if !negate => (right, kind, left),
             _ => return Ok(None),
         };
     let operator = if negate { "-" } else { "+" };
@@ -360,26 +351,50 @@ fn shifted_target(
         return Err(no_subquery_refusal());
     }
     let translated_target = target.translate_with_warnings(schema, options, emit)?;
-    let sign = if negate { "-" } else { "" };
+    let field = |name: &str| Expr::CompoundIdentifier(vec![Ident::new("fr"), Ident::new(name)]);
+    let signed = |expr: Expr| {
+        if negate {
+            Expr::UnaryOp { op: UnaryOperator::Minus, expr: Box::new(Expr::Nested(Box::new(expr))) }
+        } else {
+            expr
+        }
+    };
+    let binary = |left: Expr, op: BinaryOperator, right: Expr| {
+        Expr::Nested(Box::new(Expr::BinaryOp { left: Box::new(left), op, right: Box::new(right) }))
+    };
+    let printf = |format: &str, value: Expr| {
+        simple_function_expr("printf", vec![string_literal(format), signed(value)], None)
+    };
+    let fraction = || {
+        binary(
+            binary(field("u"), BinaryOperator::Modulo, integer_literal(1_000_000)),
+            BinaryOperator::Divide,
+            number_literal("1000000.0"),
+        )
+    };
     let modifiers = if matches!(kind, TemporalKind::Time { .. }) {
         // `time_pl_interval` applies the time field alone, wrapped at 24
         // hours, and ignores the months and days.
+        let wrapped = binary(field("u"), BinaryOperator::Modulo, integer_literal(86_400_000_000));
         vec![
-            format!("printf('%+d seconds', {sign}((fr.u % 86400000000) / 1000000))"),
-            format!("printf('%+.6f seconds', {sign}((fr.u % 1000000) / 1000000.0))"),
+            printf(
+                "%+d seconds",
+                binary(wrapped, BinaryOperator::Divide, integer_literal(1_000_000)),
+            ),
+            printf("%+.6f seconds", fraction()),
         ]
     } else {
         vec![
-            format!("printf('%+d months', {sign}fr.m)"),
-            "'floor'".to_string(),
-            format!("printf('%+d days', {sign}fr.d)"),
-            format!("printf('%+d seconds', {sign}(fr.u / 1000000))"),
-            format!("printf('%+.6f seconds', {sign}((fr.u % 1000000) / 1000000.0))"),
+            printf("%+d months", field("m")),
+            string_literal("floor"),
+            printf("%+d days", field("d")),
+            printf(
+                "%+d seconds",
+                binary(field("u"), BinaryOperator::Divide, integer_literal(1_000_000)),
+            ),
+            printf("%+.6f seconds", fraction()),
         ]
-    }
-    .iter()
-    .map(|sql| substitute(&[], sql))
-    .collect::<Result<Vec<Expr>, Error>>()?;
+    };
     let target_ref = Expr::CompoundIdentifier(vec![Ident::new("tv"), Ident::new("tg")]);
     let body = shifted_by_modifiers(target_ref, Some(kind), &modifiers);
     // `printf` reads a NULL field as zero, so a NULL interval answers NULL
@@ -512,14 +527,26 @@ enum Factor {
     Runtime { sql: String, operand: Box<Expr> },
 }
 
+impl Factor {
+    /// The factor with its sign flipped, for a unary minus over it.
+    fn negated(self) -> Self {
+        match self {
+            Self::Literal(value) => Self::Literal(-value),
+            Self::Runtime { sql, operand } => Self::Runtime { sql: format!("(-{sql})"), operand },
+        }
+    }
+}
+
 /// The factor `side` supplies beside the `interval` operand of `operator`,
 /// `None` for a `NULL` factor, or the refusal it answers.
 ///
-/// A number literal is decided at translation time. An integer column and a
-/// bound parameter are read as a `REAL`, which converts an integer the way
-/// PostgreSQL converts it to `float8`. A `numeric(p,s)` column holds minor
-/// units, so its value is the stored integer over `10^s`, one correctly
-/// rounded division as PostgreSQL's conversion is.
+/// A number literal is decided at translation time, its digit-group
+/// underscores dropped as PostgreSQL drops them. A unary sign applies to
+/// the factor it precedes. An integer column and a bound parameter are read
+/// as a `REAL`, which converts an integer the way PostgreSQL converts it to
+/// `float8`. A `numeric(p,s)` column holds minor units, so its value is the
+/// stored integer over `10^s`, one correctly rounded division as
+/// PostgreSQL's conversion is.
 fn factor(
     side: &Expr,
     interval: &Expr,
@@ -533,28 +560,35 @@ fn factor(
         Expr::Nested(inner) => inner.as_ref(),
         _ => side,
     };
-    let number = match inner {
+    match inner {
         Expr::Value(ValueWithSpan { value: Value::Null, .. }) => return Ok(None),
-        Expr::Value(ValueWithSpan { value: Value::Number(text, _), .. }) => Some((text, false)),
+        Expr::Cast { expr, .. }
+            if matches!(expr.as_ref(), Expr::Value(ValueWithSpan { value: Value::Null, .. }))
+                && is_numeric_type(inner, schema, options) =>
+        {
+            return Ok(None);
+        }
+        Expr::Value(ValueWithSpan { value: Value::Number(text, _), .. }) => {
+            let value = text
+                .replace('_', "")
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| {
+                    Error::forward_refusal(format!(
+                        "\"{text}\" is out of range for type double precision. PostgreSQL \
+                         cannot read it as the factor of an interval, so the translation \
+                         refuses it too."
+                    ))
+                })?;
+            return Ok(Some(Factor::Literal(value)));
+        }
         Expr::UnaryOp { op: op @ (UnaryOperator::Minus | UnaryOperator::Plus), expr } => {
-            match expr.as_ref() {
-                Expr::Value(ValueWithSpan { value: Value::Number(text, _), .. }) => {
-                    Some((text, matches!(op, UnaryOperator::Minus)))
-                }
-                _ => None,
-            }
+            let negative = matches!(op, UnaryOperator::Minus);
+            let signed = factor(expr, interval, operator, factor_is_left, schema, options, emit)?;
+            return Ok(signed.map(|factor| if negative { factor.negated() } else { factor }));
         }
-        _ => None,
-    };
-    if let Some((text, negative)) = number {
-        let value: f64 = text.parse().map_err(|_| unreadable_factor(text))?;
-        if !value.is_finite() {
-            return Err(Error::forward_refusal(format!(
-                "\"{text}\" is out of range for type double precision. PostgreSQL cannot read \
-                 it as the factor of an interval, so the translation refuses it too."
-            )));
-        }
-        return Ok(Some(Factor::Literal(if negative { -value } else { value })));
+        _ => {}
     }
     let is_placeholder =
         matches!(inner, Expr::Value(ValueWithSpan { value: Value::Placeholder(_), .. }));
@@ -585,14 +619,6 @@ fn factor(
     Ok(Some(Factor::Runtime { sql, operand: Box::new(translated) }))
 }
 
-/// The refusal a number literal no `double` reads answers.
-fn unreadable_factor(text: &str) -> Error {
-    Error::forward_refusal(format!(
-        "invalid input syntax for type double precision: \"{text}\". PostgreSQL cannot read it \
-         as the factor of an interval, so the translation refuses it too."
-    ))
-}
-
 /// The refusal a factor without an exact translation answers: PostgreSQL's
 /// own error for a type it has no operator for, otherwise a refusal naming
 /// the factors the translation reads exactly.
@@ -604,12 +630,8 @@ fn unsupported_factor(
     options: &TranslationContext<'_>,
 ) -> Error {
     let factor = if is_interval_typed(left, schema, options) { right } else { left };
-    let numeric = type_name(factor, schema, options).ok().flatten().is_none_or(|name| {
-        let lowered = name.to_ascii_lowercase();
-        ["int", "smallint", "bigint", "numeric", "decimal", "real", "double", "float"]
-            .iter()
-            .any(|family| lowered.starts_with(family))
-    });
+    let numeric = type_name(factor, schema, options).ok().flatten().is_none()
+        || is_numeric_type(factor, schema, options);
     if !numeric {
         return keys::operator_does_not_exist(left, operator, right, schema, options);
     }
@@ -620,6 +642,17 @@ fn unsupported_factor(
         keys::message_type_name_of(left, schema, options),
         keys::message_type_name_of(right, schema, options)
     ))
+}
+
+/// Whether `expr` settles on a number type, one PostgreSQL converts to the
+/// `float8` factor of an interval.
+fn is_numeric_type(expr: &Expr, schema: &ParserDB, options: &TranslationContext<'_>) -> bool {
+    type_name(expr, schema, options).ok().flatten().is_some_and(|name| {
+        let lowered = name.to_ascii_lowercase();
+        ["int", "smallint", "bigint", "numeric", "decimal", "real", "double", "float"]
+            .iter()
+            .any(|family| lowered.starts_with(family))
+    })
 }
 
 /// The refusal a literal division by zero answers.

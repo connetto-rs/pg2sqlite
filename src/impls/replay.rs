@@ -169,3 +169,46 @@ fn body_reads_no_relation(body: &SetExpr) -> bool {
         _ => false,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
+
+    use super::is_replayable;
+    use crate::{options::TranslationContext, prelude::Pg2SqliteOptions};
+
+    /// Whether the expression `sql` replays.
+    fn replays(sql: &str) -> bool {
+        let expr =
+            Parser::new(&PostgreSqlDialect {}).try_with_sql(sql).unwrap().parse_expr().unwrap();
+        is_replayable(&expr, &TranslationContext::from_owned(Pg2SqliteOptions::default()))
+    }
+
+    #[test]
+    fn a_subquery_replays_only_when_it_reads_no_relation() {
+        for sql in [
+            "(SELECT 1)",
+            "(SELECT x FROM (SELECT 1 AS x))",
+            "(SELECT x FROM (SELECT 1 AS x) AS a, (SELECT 2 AS y) AS b)",
+            "(SELECT column1 FROM (VALUES (1)))",
+            "((SELECT 1))",
+            "(SELECT 1 UNION SELECT 2)",
+            "(SELECT x FROM ((SELECT 1 AS x) UNION (SELECT 2)) AS a)",
+        ] {
+            assert!(replays(sql), "{sql} reads no relation");
+        }
+        for sql in [
+            "(SELECT x FROM t)",
+            "(SELECT x FROM (SELECT x FROM t))",
+            "(SELECT a.x FROM (SELECT 1 AS x) AS a JOIN (SELECT 1 AS x) AS b ON 1)",
+            "(WITH w AS (SELECT 1 AS x) SELECT x FROM w)",
+            "(SELECT 1 UNION SELECT x FROM t)",
+            "(SELECT random())",
+            "EXISTS (SELECT 1)",
+            "1 IN (SELECT 1)",
+            "(SELECT x FROM (TABLE t) AS a)",
+        ] {
+            assert!(!replays(sql), "{sql} may answer a different value");
+        }
+    }
+}

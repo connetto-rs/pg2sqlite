@@ -9318,6 +9318,28 @@ fn a_factor_without_an_exact_reading_is_refused() {
         "cannot be translated exactly",
     );
     refused("SELECT (iv * (id + 1))::text FROM t;", "cannot be translated exactly");
+    refused("SELECT ((id + 1) * iv)::text FROM t;", "cannot be translated exactly");
+    refused(
+        "SELECT (interval '1 day' * CAST(NULL AS text))::text;",
+        "operator does not exist: interval * text",
+    );
+}
+
+#[test]
+fn a_type_postgresql_has_no_operator_for_is_named_as_postgresql_names_it() {
+    let schema = "CREATE TABLE ty (iv interval, a int2, b int8, c float4, d float8, e decimal(10,2), f varchar(10), g timestamp, h timetz);";
+    for (expression, message) in [
+        ("iv + a", "operator does not exist: interval + smallint"),
+        ("iv + b", "operator does not exist: interval + bigint"),
+        ("iv + c", "operator does not exist: interval + real"),
+        ("iv + d", "operator does not exist: interval + double precision"),
+        ("iv + e", "operator does not exist: interval + numeric"),
+        ("iv + f", "operator does not exist: interval + character varying"),
+        ("iv - g", "operator does not exist: interval - timestamp without time zone"),
+        ("iv - h", "operator does not exist: interval - time with time zone"),
+    ] {
+        refused(&format!("{schema}\nSELECT ({expression})::text FROM ty;"), message);
+    }
 }
 
 #[test]
@@ -9524,6 +9546,88 @@ fn a_time_shifted_by_a_literal_ignores_the_months_and_days() {
     ] {
         assert_eq!(run(&format!("SELECT ({expression})::text;")), some(&[answer]), "{expression}");
     }
+}
+
+#[test]
+fn a_signed_factor_matches_postgresql() {
+    let schema = "CREATE TABLE fz (id int, iv interval, k int);\nINSERT INTO fz VALUES (1, '1 day 02:00:00', 3), (2, '1 mon', -2);";
+    for (expression, answers) in [
+        ("iv * -k", ["-3 days -06:00:00", "2 mons"]),
+        ("iv * +k", ["3 days 06:00:00", "-2 mons"]),
+        ("iv / -(k)", ["-08:40:00", "15 days"]),
+        ("interval '1 day 02:00:00' * k", ["3 days 06:00:00", "-2 days -04:00:00"]),
+    ] {
+        assert_eq!(
+            run(&format!("{schema}\nSELECT ({expression})::text FROM fz ORDER BY id;")),
+            some(&answers),
+            "{expression}"
+        );
+    }
+    assert_eq!(run("SELECT (interval '1 day' * -CAST(NULL AS int))::text;"), vec![None]);
+    assert_eq!(run("SELECT (interval '1 mon' * -1.5)::text;"), some(&["-1 mons -15 days"]));
+}
+
+#[test]
+fn a_digit_grouped_factor_matches_postgresql() {
+    assert_eq!(run("SELECT (interval '1 day' * 1_000)::text;"), some(&["1000 days"]));
+}
+
+#[test]
+fn shifting_by_a_cast_interval_literal_matches_postgresql() {
+    let schema = "CREATE TABLE sh3 (id int, d date, ts timestamp);\nINSERT INTO sh3 VALUES (1, '2026-01-31', '2026-01-31 10:00:00');";
+    assert_eq!(
+        run(&format!("{schema}\nSELECT (d + CAST('1 mon' AS interval))::text FROM sh3;")),
+        some(&["2026-02-28 00:00:00"])
+    );
+    assert_eq!(
+        run(&format!("{schema}\nSELECT (ts - CAST('1 day 01:00:00' AS interval))::text FROM sh3;")),
+        some(&["2026-01-30 09:00:00"])
+    );
+    assert_eq!(
+        run(&format!("{schema}\nSELECT (d + CAST(NULL AS interval))::text FROM sh3;")),
+        vec![None]
+    );
+    refused(
+        "SELECT (ts - CAST('-178956970 years -8 mons' AS interval))::text FROM t;",
+        "interval out of range",
+    );
+}
+
+#[test]
+fn an_interval_minus_a_timestamp_is_refused_with_postgresqls_message() {
+    refused(
+        "SELECT (iv - ts)::text FROM t;",
+        "operator does not exist: interval - timestamp with time zone",
+    );
+    // PostgreSQL casts the time to an interval and answers an interval.
+    refused(
+        "CREATE TABLE tm (iv interval, t time);\nSELECT (iv - t)::text FROM tm;",
+        "PostgreSQL casts the time to an interval",
+    );
+}
+
+#[test]
+fn a_side_the_statement_cannot_type_is_refused() {
+    // PostgreSQL decides the operator from NULLIF's argument types; the
+    // statement settles neither, and the translation refuses.
+    refused("SELECT (iv + NULLIF(NULL, NULL))::text FROM t;", "does not settle the type");
+    refused(
+        "SELECT (iv + CASE WHEN id > 1 THEN NULL END)::text FROM t;",
+        "operator does not exist: interval + text",
+    );
+}
+
+#[test]
+fn a_shift_by_an_interval_column_in_an_index_is_refused() {
+    refused("CREATE INDEX ON t (ts + iv);", "scalar subquery");
+}
+
+#[test]
+fn an_aggregate_over_an_operand_with_an_exists_is_refused() {
+    refused(
+        "SELECT sum(CASE WHEN EXISTS (SELECT 1 FROM t) THEN iv END)::text FROM t;",
+        "an interval sum has no SQLite form",
+    );
 }
 
 #[test]
