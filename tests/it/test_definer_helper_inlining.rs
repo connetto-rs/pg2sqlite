@@ -187,13 +187,15 @@ CREATE POLICY project_grants_delete ON project_grants FOR DELETE USING (
 
 ";
 
-/// Two grant tables, one guarded and one not, helpers over them in `public`,
-/// and a guarded table its policies compare against the helpers' sets.
+/// Two grant tables, one guarded and one not, a table naming its document
+/// without a foreign key, helpers over them in `public`, and a guarded table
+/// its policies compare against the helpers' sets.
 const DOCS: &str = "
 CREATE ROLE helper_owner NOLOGIN BYPASSRLS;
 CREATE TABLE docs (id TEXT PRIMARY KEY);
 CREATE TABLE doc_grants (doc_id TEXT NOT NULL REFERENCES docs (id), principal_id TEXT NOT NULL, role TEXT NOT NULL);
 CREATE TABLE doc_members (doc_id TEXT NOT NULL REFERENCES docs (id), principal_id TEXT NOT NULL, \"group\" TEXT NOT NULL);
+CREATE TABLE doc_notes (id TEXT PRIMARY KEY, doc TEXT NOT NULL);
 CREATE FUNCTION docs_with(min_role TEXT) RETURNS SETOF TEXT
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
   SELECT doc_id FROM doc_grants
@@ -212,13 +214,19 @@ CREATE FUNCTION docs_in_group(wanted TEXT) RETURNS SETOF TEXT
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
   SELECT doc_id FROM doc_members WHERE principal_id = current_setting('app.user_id') AND \"group\" = wanted
 $$;
+CREATE FUNCTION notes_with(min_role TEXT) RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+  SELECT id FROM doc_notes WHERE doc IN (SELECT docs_with(min_role))
+$$;
 ALTER FUNCTION docs_with(TEXT) OWNER TO helper_owner;
 ALTER FUNCTION docs_administered(TEXT) OWNER TO helper_owner;
 ALTER FUNCTION docs_as_invoker(TEXT) OWNER TO helper_owner;
 ALTER FUNCTION docs_in_group(TEXT) OWNER TO helper_owner;
-GRANT SELECT ON doc_grants, doc_members TO helper_owner;
+ALTER FUNCTION notes_with(TEXT) OWNER TO helper_owner;
+GRANT SELECT ON doc_grants, doc_members, doc_notes TO helper_owner;
 ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE doc_grants ENABLE ROW LEVEL SECURITY;
+ALTER TABLE doc_notes ENABLE ROW LEVEL SECURITY;
 ";
 
 /// What `docs_with('write')` returns, as the replica reads it.
@@ -352,6 +360,26 @@ fn a_helper_reading_an_unguarded_table_reads_it_directly() {
         statement(&script, "docs"),
         "CREATE VIEW docs AS SELECT id FROM docs_rls WHERE (id IN (SELECT doc_id FROM doc_members \
          WHERE principal_id = app_user() AND \"group\" IN ('staff')))"
+    );
+}
+
+/// A parent arm over a column without a foreign key, its parent named by the
+/// table the called helper's set covers, lowers as one with a foreign key.
+#[test]
+fn a_parent_arm_without_a_foreign_key_reads_the_called_helpers_set() {
+    let script = translated(
+        &format!(
+            "{DOCS}CREATE POLICY notes_read ON doc_notes FOR SELECT \
+             USING (id IN (SELECT notes_with('write')));"
+        ),
+        &options(),
+    );
+    assert_eq!(
+        statement(&script, "doc_notes"),
+        format!(
+            "CREATE VIEW doc_notes AS SELECT id, doc FROM doc_notes_rls WHERE (id IN (\
+             SELECT id FROM doc_notes_rls WHERE doc IN ({WRITERS})))"
+        )
     );
 }
 

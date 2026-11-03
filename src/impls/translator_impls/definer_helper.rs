@@ -206,7 +206,7 @@ fn lowered_arm(arm: &HelperArm<'_, ParserDB>) -> Query {
                 column(parent.key()),
                 from_relation(plain_table_factor(parent.table().name.clone())),
                 Some(Expr::In {
-                    expr: Box::new(column(parent.foreign_key_column())),
+                    expr: Box::new(column(parent.column())),
                     target: InTarget::Subquery(Box::new(lowered_set(parent.set()))),
                     negated: false,
                     global: false,
