@@ -4,23 +4,27 @@
 //! rewrites that text into the target kind's form, or answers the refusal
 //! PostgreSQL 18.6 gives for the pair, measured under a UTC session. The
 //! rewrites slice the stored text rather than route it through SQLite's date
-//! functions, which would drop fraction digits past milliseconds.
+//! functions, which would drop fraction digits past milliseconds. A value of
+//! unknown kind has no stored form to slice, so the date functions read it.
 
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, format, vec};
+use alloc::{boxed::Box, format, string::ToString, vec};
 
 use sql_traits::structs::ParserDB;
-use sqlparser::ast::{BinaryOperator, Expr, Function, FunctionArguments};
+use sqlparser::ast::{BinaryOperator, DataType, Expr, Function, FunctionArguments};
 
 use crate::{
     errors::Error,
     impls::{
+        datetime_helpers::canonical_timestamptz_call,
         function_helpers::{integer_literal, simple_function_expr, string_literal},
         object_name::last_ident,
         replay::{is_replayable, reject_duplicated_operand},
         shared_helpers::{declared_in_scope, is_integral_expression},
+        temporal_arithmetic::trim_trailing_zeros,
         temporal_literals::{TemporalLiteralKind, temporal_literal_kind},
     },
+    warnings::{TranslationWarning, WarningSink},
 };
 
 /// The temporal kind a non-literal cast operand carries, from its own spelling
@@ -281,19 +285,76 @@ fn kind_cast_refusal(
     target: TemporalLiteralKind,
     reason: &str,
 ) -> Error {
-    let name = |kind: TemporalLiteralKind| {
-        match kind {
-            TemporalLiteralKind::Date => "date",
-            TemporalLiteralKind::Time { zoned: false, .. } => "time without time zone",
-            TemporalLiteralKind::Time { zoned: true, .. } => "time with time zone",
-            TemporalLiteralKind::Timestamp { zoned: false, .. } => "timestamp without time zone",
-            TemporalLiteralKind::Timestamp { zoned: true, .. } => "timestamp with time zone",
-        }
-    };
     Error::forward_refusal(format!(
         "PostgreSQL answers `cannot cast type {} to {}` for this cast, since {reason}, and the \
          replica refuses it the same way.",
-        name(source),
-        name(target)
+        type_name(source),
+        type_name(target)
     ))
+}
+
+/// The name PostgreSQL gives `kind` in a cast refusal.
+fn type_name(kind: TemporalLiteralKind) -> &'static str {
+    match kind {
+        TemporalLiteralKind::Date => "date",
+        TemporalLiteralKind::Time { zoned: false, .. } => "time without time zone",
+        TemporalLiteralKind::Time { zoned: true, .. } => "time with time zone",
+        TemporalLiteralKind::Timestamp { zoned: false, .. } => "timestamp without time zone",
+        TemporalLiteralKind::Timestamp { zoned: true, .. } => "timestamp with time zone",
+    }
+}
+
+/// The refusal PostgreSQL answers for an integer cast to a temporal type.
+pub(crate) fn integer_cast_refusal(target: TemporalLiteralKind) -> Error {
+    Error::forward_refusal(format!(
+        "PostgreSQL answers `cannot cast type` for an integer cast to {}, and the replica \
+         refuses it the same way.",
+        type_name(target)
+    ))
+}
+
+/// How SQLite's date functions read a value of unknown kind into `target`, or
+/// `None` for a `timetz`, whose offset they would move to UTC.
+pub(crate) fn temporal_text_reader(target: TemporalLiteralKind) -> Option<fn(Expr) -> Expr> {
+    match target {
+        TemporalLiteralKind::Date => {
+            Some(|operand| simple_function_expr("date", vec![operand], None))
+        }
+        TemporalLiteralKind::Time { zoned: false, .. } => {
+            Some(|operand| read_subsec("time", operand))
+        }
+        TemporalLiteralKind::Timestamp { zoned: false, .. } => {
+            Some(|operand| read_subsec("datetime", operand))
+        }
+        TemporalLiteralKind::Timestamp { zoned: true, .. } => Some(canonical_timestamptz_call),
+        TemporalLiteralKind::Time { zoned: true, .. } => None,
+    }
+}
+
+/// `function(operand, 'subsec')` with its trailing fractional zeros trimmed.
+fn read_subsec(function: &str, operand: Expr) -> Expr {
+    trim_trailing_zeros(simple_function_expr(
+        function,
+        vec![operand, string_literal("subsec")],
+        None,
+    ))
+}
+
+/// Reports that `operand` is read by SQLite's date functions on its way to
+/// `data_type`.
+pub(crate) fn warn_text_read_by_date_functions(
+    operand: &Expr,
+    data_type: &DataType,
+    emit: WarningSink<'_>,
+) {
+    emit(TranslationWarning::LossyDowngrade {
+        construct: "CAST".to_string(),
+        from: "PostgreSQL date and time input".to_string(),
+        to: "SQLite's date functions".to_string(),
+        location: format!("CAST({operand} AS {data_type})"),
+        reason: "the value is text known only at run time, and SQLite's date functions read \
+                 ISO 8601 text to milliseconds, answering NULL for any other spelling where \
+                 PostgreSQL parses it or raises an error."
+            .to_string(),
+    });
 }
