@@ -37,8 +37,8 @@ use crate::{
             case_when, for_each_child_expr, not_predicate, null_safe_eq, null_safe_neq, rebuild,
         },
         function_helpers::{
-            integer_literal, integer_literal_value, number_literal, simple_function_expr,
-            single_quoted_literal, string_literal,
+            array_constructor_subquery, integer_literal, integer_literal_value, number_literal,
+            simple_function_expr, single_quoted_literal, string_literal,
         },
         idioms::{delimited_membership, single_character, wrap_with_lower},
         interval::{ClockShift, IntervalShift, interval_shift, interval_shift_scaled},
@@ -301,10 +301,12 @@ fn is_array_expression(
         Expr::Array(_) => Ok(true),
         Expr::Nested(inner) => is_array_expression(inner, schema, options),
         _ => {
-            declared_type_matches(expr, schema, options, |data_type| {
-                let lowered = data_type.to_ascii_lowercase();
-                lowered.ends_with("[]") || lowered.starts_with("array")
-            })
+            declared_type_matches(
+                expr,
+                schema,
+                options,
+                crate::impls::expression_type::is_array_type_name,
+            )
         }
     }
 }
@@ -1962,7 +1964,8 @@ fn interval_ordered_any_all(
 /// `IN` / `NOT IN`.
 ///
 /// Supported operands:
-/// - subquery: `x = ANY(SELECT ...)` -> `x IN (SELECT ...)`
+/// - subquery: `x = ANY(SELECT ...)` -> `x IN (SELECT ...)`, and `x =
+///   ANY(ARRAY(SELECT ...))` alike, see [`membership_subquery`]
 /// - array literal: `x = ANY(ARRAY[...])` -> `x IN (...)`
 /// - tuple: `x = ANY((...))` -> `x IN (...)`
 /// - delimited text: `x = ANY(string_to_array(a, ','))` -> `instr(...)`
@@ -1981,11 +1984,13 @@ fn translate_any_all_to_in(
     {
         return Ok(membership);
     }
-    if let Expr::Subquery(q) = right {
+    if let Some(query) = membership_subquery(right, schema, options)? {
         let translated_left = left.translate_with_warnings(schema, options, emit)?;
         return Ok(Expr::In {
             expr: Box::new(translated_left),
-            target: InTarget::Subquery(Box::new(q.translate_with_warnings(schema, options, emit)?)),
+            target: InTarget::Subquery(Box::new(
+                query.translate_with_warnings(schema, options, emit)?,
+            )),
             negated,
             global: false,
         });
@@ -2022,6 +2027,49 @@ fn translate_any_all_to_in(
         quantifier,
         options,
     )
+}
+
+/// The subquery whose rows `x = ANY(...)` and `x <> ALL(...)` compare `x`
+/// against, either the operand itself or the one `ARRAY(<subquery>)` collects.
+///
+/// Collecting the rows into an array changes nothing about which of them equal
+/// `x` while each row is a scalar. Rows that are arrays stack into a
+/// multi-dimensional array, whose scalar elements `= ANY` compares instead, so
+/// the collected form translates only once the column is known not to be an
+/// array. An unresolved column type is refused for the same reason, since
+/// answering false where PostgreSQL answers true would go unnoticed.
+fn membership_subquery<'e>(
+    right: &'e Expr,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<Option<&'e Query>, crate::errors::Error> {
+    if let Expr::Subquery(query) = right {
+        return Ok(Some(query));
+    }
+    let Some(query) = array_constructor_subquery(right) else { return Ok(None) };
+    let output = crate::impls::expression_type::query_output_type_name(query, schema, options)?;
+    const UNNEST: &str = "unnest it in the subquery's FROM clause, \
+                          `x = ANY (SELECT e FROM t, unnest(t.col) AS e)`";
+    let (column, fix) = match output.as_deref() {
+        Some(name) if !crate::impls::expression_type::is_array_type_name(name) => {
+            return Ok(Some(query));
+        }
+        Some(name) => {
+            (format!("is the array type {name}"), format!("To compare elements, {UNNEST}."))
+        }
+        None => {
+            (
+                "has a type this translation cannot resolve".to_owned(),
+                format!("Cast the projected column to its type, or when it is an array, {UNNEST}."),
+            )
+        }
+    };
+    Err(crate::errors::Error::forward_refusal(format!(
+        "= ANY / <> ALL over ARRAY(subquery) translates as IN / NOT IN only when the subquery \
+         answers a non-array column, since PostgreSQL stacks array rows into one \
+         multi-dimensional array and compares against its elements, and this subquery's \
+         column {column}. {fix}"
+    )))
 }
 
 fn fold_predicates(predicates: Vec<Expr>, op: &BinaryOperator, empty_value: bool) -> Expr {

@@ -70,16 +70,7 @@ pub(crate) fn type_name<'e>(
                 conditions.iter().map(|when| &when.result).chain(else_result.as_deref()).collect();
             common_type(results, schema, options)?.map(Cow::Owned)
         }
-        Expr::Subquery(query) => {
-            first_query_output(
-                query,
-                schema,
-                options,
-                |column| Some(declared_type_name(column)),
-                owned_type_name,
-            )?
-            .map(Cow::Owned)
-        }
+        Expr::Subquery(query) => query_output_type_name(query, schema, options)?.map(Cow::Owned),
         _ => {
             declared_in_scope(
                 expr,
@@ -91,6 +82,32 @@ pub(crate) fn type_name<'e>(
             .map(Cow::Owned)
         }
     })
+}
+
+/// The PostgreSQL type name of the one column `query` answers, or [`None`]
+/// when nothing the statement writes decides it.
+///
+/// # Errors
+///
+/// As [`type_name`].
+pub(crate) fn query_output_type_name(
+    query: &sqlparser::ast::Query,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<Option<String>, Error> {
+    first_query_output(
+        query,
+        schema,
+        options,
+        |column| Some(declared_type_name(column)),
+        owned_type_name,
+    )
+}
+
+/// Whether a type name, as [`type_name`] spells it, names an array type.
+pub(crate) fn is_array_type_name(name: &str) -> bool {
+    let lowered = name.to_ascii_lowercase();
+    lowered.ends_with("[]") || lowered.starts_with("array")
 }
 
 /// Whether `expr` settles on the `interval` type: an `INTERVAL '…'`

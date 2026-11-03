@@ -16,6 +16,9 @@ mod parity_rls;
 #[path = "gauntlet/parity_grants.rs"]
 mod parity_grants;
 
+#[path = "gauntlet/parity_any_array_subquery.rs"]
+mod parity_any_array_subquery;
+
 #[path = "gauntlet/parity_plpgsql.rs"]
 mod parity_plpgsql;
 
