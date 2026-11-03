@@ -1,0 +1,331 @@
+//! F3: `timestamp + interval` must land where PostgreSQL lands.
+//!
+//! PostgreSQL holds an interval as three independent counts, months, days and
+//! microseconds, and applies them in that order, clamping an overflowed
+//! day-of-month to the end of the target month. SQLite has a date modifier per
+//! unit, applies them left to right, rolls an overflowed day forward instead
+//! of clamping, and knows only six unit words.
+//!
+//! Every expected value below was read off PostgreSQL 17 before the fix, and
+//! every case runs the crate's own emitted SQL, because what this guards is a
+//! date, not a keyword.
+
+use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+use run_translated_helper::run_translated_with;
+
+use crate::helpers::run_translated as run_translated_helper;
+
+/// The instant `expression` evaluates to, through the emitted SQLite.
+fn shift(expression: &str) -> String {
+    let script = format!("SELECT {expression};");
+    run_translated_with(&script, &Pg2SqliteOptions::default())
+        .remove(0)
+        .unwrap_or_else(|| panic!("{expression} evaluated to NULL"))
+}
+
+fn refusal(expression: &str) -> String {
+    Pg2Sqlite::default()
+        .sql(&format!("SELECT {expression};"))
+        .unwrap()
+        .translate_to_sql(&Pg2SqliteOptions::default())
+        .expect_err("this shape has no SQLite form")
+        .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// The month-end clamp
+// ---------------------------------------------------------------------------
+
+/// The item's own trigger. SQLite rolls 31 February forward to 3 March,
+/// PostgreSQL clamps it to the last day of February.
+#[test]
+fn adding_a_month_clamps_to_the_month_end() {
+    assert_eq!(shift("timestamp '2026-01-31' + interval '1 month'"), "2026-02-28 00:00:00");
+}
+
+/// The clamp is not specific to addition.
+#[test]
+fn subtracting_a_month_clamps_to_the_month_end() {
+    assert_eq!(shift("timestamp '2026-03-31' - interval '1 month'"), "2026-02-28 00:00:00");
+}
+
+/// A leap day one year on has nowhere to land either.
+#[test]
+fn adding_a_year_clamps_a_leap_day() {
+    assert_eq!(shift("timestamp '2024-02-29' + interval '1 year'"), "2025-02-28 00:00:00");
+}
+
+/// A day that exists in the target month is left where it is, which is what
+/// makes the clamp safe to apply unconditionally.
+#[test]
+fn a_day_that_exists_is_untouched() {
+    assert_eq!(shift("timestamp '2026-01-15' + interval '1 month'"), "2026-02-15 00:00:00");
+    assert_eq!(shift("timestamp '2026-01-31' + interval '2 months'"), "2026-03-31 00:00:00");
+}
+
+/// An interval with no month component cannot overflow a month, so it must not
+/// pick up a clamp that would change nothing but would still have to be right.
+#[test]
+fn days_alone_roll_over_the_month() {
+    assert_eq!(shift("timestamp '2026-01-31' + interval '30 days'"), "2026-03-02 00:00:00");
+}
+
+// ---------------------------------------------------------------------------
+// The three counts, and the order they are applied in
+// ---------------------------------------------------------------------------
+
+/// PostgreSQL adds thirteen months and clamps once. Clamping a year and then
+/// a month lands a day earlier, on 2025-03-28, which is what a per-unit
+/// modifier chain produces however the clamp is placed.
+#[test]
+fn a_year_and_a_month_clamp_once_together() {
+    assert_eq!(shift("timestamp '2024-02-29' + interval '1 year 1 month'"), "2025-03-29 00:00:00");
+}
+
+/// The months go on before the days no matter which order they were written
+/// in, so both spellings give the same instant.
+#[test]
+fn months_are_applied_before_days() {
+    assert_eq!(shift("timestamp '2026-01-30' + interval '1 day 1 month'"), "2026-03-01 00:00:00");
+    assert_eq!(shift("timestamp '2026-01-30' + interval '1 month 1 day'"), "2026-03-01 00:00:00");
+}
+
+/// Clamp first, then add the day: 28 February plus one day, not 3 March plus
+/// one day.
+#[test]
+fn the_clamp_lands_before_the_days_are_added() {
+    assert_eq!(shift("timestamp '2026-01-31' + interval '1 month 1 day'"), "2026-03-01 00:00:00");
+}
+
+/// A field can carry its own sign, and the negative day still follows the
+/// clamped month.
+#[test]
+fn a_field_keeps_its_own_sign() {
+    assert_eq!(shift("timestamp '2026-01-31' + interval '1 month -1 day'"), "2026-02-27 00:00:00");
+}
+
+/// Subtraction negates every field, so the day becomes an addition.
+#[test]
+fn subtraction_negates_every_field() {
+    assert_eq!(shift("timestamp '2026-03-31' - interval '1 month -1 day'"), "2026-03-01 00:00:00");
+}
+
+/// All three counts at once.
+#[test]
+fn months_days_and_time_together() {
+    assert_eq!(
+        shift("timestamp '2026-01-31 08:00:00' + interval '1 year 2 mons 3 days 4 hours'"),
+        "2027-04-03 12:00:00"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Unit names SQLite does not know
+// ---------------------------------------------------------------------------
+
+/// SQLite's date modifier has no week, so `'+1 week'` made `datetime()`
+/// return NULL with no error at all.
+#[test]
+fn a_week_is_seven_days() {
+    assert_eq!(shift("timestamp '2026-01-31' + interval '1 week'"), "2026-02-07 00:00:00");
+}
+
+/// Every abbreviation PostgreSQL accepts and SQLite does not.
+#[test]
+fn abbreviated_units_are_translated() {
+    assert_eq!(shift("timestamp '2026-01-31' + interval '1 mon'"), "2026-02-28 00:00:00");
+    assert_eq!(shift("timestamp '2026-01-31' + interval '1 yr'"), "2027-01-31 00:00:00");
+    assert_eq!(shift("timestamp '2026-01-31' + interval '1 hr'"), "2026-01-31 01:00:00");
+    assert_eq!(shift("timestamp '2026-01-31' + interval '1 min'"), "2026-01-31 00:01:00");
+    assert_eq!(shift("timestamp '2026-01-31' + interval '1 sec'"), "2026-01-31 00:00:01");
+}
+
+/// The units above a year are all a count of months.
+#[test]
+fn the_long_units_are_months() {
+    assert_eq!(shift("timestamp '2026-01-31' + interval '1 decade'"), "2036-01-31 00:00:00");
+    assert_eq!(shift("timestamp '2026-01-31' + interval '1 century'"), "2126-01-31 00:00:00");
+    assert_eq!(shift("timestamp '2026-01-31' + interval '1 millennium'"), "3026-01-31 00:00:00");
+}
+
+/// A unit neither engine knows is refused by name rather than emitted into a
+/// `datetime()` call that answers NULL.
+#[test]
+fn an_unknown_unit_is_refused() {
+    let error = refusal("timestamp '2026-01-31' + interval '1 fortnight'");
+    assert!(error.contains("fortnight"), "the refusal must name the unit: {error}");
+}
+
+// ---------------------------------------------------------------------------
+// Fractional counts
+// ---------------------------------------------------------------------------
+
+/// A fraction of a unit above a month is rounded to whole months: one and a
+/// half years is eighteen months, with no stray days.
+#[test]
+fn a_fractional_year_becomes_whole_months() {
+    assert_eq!(shift("timestamp '2026-01-31' + interval '1.5 years'"), "2027-07-31 00:00:00");
+}
+
+/// A fraction of a month spills into days at thirty days to the month, so
+/// one and seven tenths months is one month and twenty one days.
+#[test]
+fn a_fractional_month_spills_into_days() {
+    assert_eq!(shift("timestamp '2026-01-31' + interval '1.7 months'"), "2026-03-21 00:00:00");
+}
+
+/// A fraction of a day spills into the time of day.
+#[test]
+fn a_fractional_day_spills_into_the_time() {
+    assert_eq!(
+        shift("timestamp '2026-01-31 12:00:00' + interval '1.5 days'"),
+        "2026-02-02 00:00:00"
+    );
+    assert_eq!(shift("timestamp '2026-01-31' + interval '1.5 weeks'"), "2026-02-10 12:00:00");
+}
+
+// ---------------------------------------------------------------------------
+// Other spellings of the same thing
+// ---------------------------------------------------------------------------
+
+/// `INTERVAL '1' MONTH` puts the unit in its own clause, and reaches the same
+/// arithmetic.
+#[test]
+fn the_leading_field_spelling_clamps_too() {
+    assert_eq!(shift("timestamp '2026-01-31' + interval '1' month"), "2026-02-28 00:00:00");
+}
+
+/// PostgreSQL has no `WEEK`, `DAYS` or `DECADE` qualifier: the word is a
+/// column alias and the bare count is seconds.
+#[test]
+fn a_word_postgresql_has_no_qualifier_for_is_an_alias() {
+    for (expression, instant) in [
+        ("timestamp '2026-01-31' + interval '1' week", "2026-01-31 00:00:01"),
+        ("timestamp '2026-01-31' + interval '2' days", "2026-01-31 00:00:02"),
+        ("timestamp '2026-01-31' + interval '3' decade", "2026-01-31 00:00:03"),
+    ] {
+        assert_eq!(shift(expression), instant, "{expression}");
+    }
+}
+
+/// PostgreSQL answers a syntax error for a range its grammar lacks.
+#[test]
+fn a_range_postgresql_lacks_is_refused() {
+    let error = refusal("timestamp '2026-01-31' + interval '1' year to day");
+    assert!(error.contains("qualifier PostgreSQL does not accept"), "{error}");
+}
+
+/// SQLite's date functions answer NULL outside the years 1 to 9999, where
+/// PostgreSQL answers a value, so arithmetic whose operands are all literals
+/// and whose result leaves that range is refused rather than emitted.
+#[test]
+fn literal_arithmetic_leaving_the_four_digit_years_is_refused() {
+    for expression in [
+        "timestamp '9999-12-31' + interval '1 day'",
+        "timestamp '9000-01-01' + interval '2000 years'",
+        "timestamp '9999-12-31 23:59:59.5' + interval '0.5 seconds'",
+        "timestamp '9999-06-01' + 2 * interval '6 months'",
+        "timestamp '0001-01-01' - interval '1 day'",
+        "date '9999-12-31' + 1",
+        "date '0001-01-01' - 1",
+    ] {
+        let error = refusal(expression);
+        assert!(error.contains("years 1 to 9999"), "{expression}: {error}");
+    }
+}
+
+#[test]
+fn literal_arithmetic_inside_the_four_digit_years_is_kept() {
+    assert_eq!(shift("timestamp '9999-12-30' + interval '1 day'"), "9999-12-31 00:00:00");
+    assert_eq!(shift("timestamp '0001-01-02' - interval '1 day'"), "0001-01-01 00:00:00");
+    assert_eq!(shift("date '9999-12-30' + 1"), "9999-12-31");
+}
+
+/// Each step is emitted on its own, so a literal step that leaves the range is
+/// refused even when a later step would bring PostgreSQL's answer back inside.
+#[test]
+fn a_literal_step_leaving_the_range_is_refused_before_a_later_step() {
+    let error = refusal("timestamp '9999-06-01' + interval '12 months' - interval '1 year'");
+    assert!(error.contains("years 1 to 9999"), "{error}");
+}
+
+/// Below the year 1 SQLite answers its own astronomical year (`0000` for
+/// 1 BC, `-0699` for 700 BC), which never matches PostgreSQL's `… BC` text and
+/// sorts backwards, so a column shifted before the year 1 answers NULL, as
+/// one shifted past 9999 does.
+#[test]
+fn column_arithmetic_landing_before_the_year_one_answers_null() {
+    for probe in [
+        "SELECT ts - interval '1 year' FROM t",
+        "SELECT ts - interval '700 years' FROM t",
+        "SELECT ts - 3 * interval '1 year' FROM t",
+        "SELECT d - 365 FROM t",
+        "SELECT d - 1000 FROM t",
+    ] {
+        let rows = run_translated_with(
+            &format!(
+                "CREATE TABLE t (ts timestamp, d date);
+                 INSERT INTO t (ts, d) VALUES ('0001-06-01', '0001-06-01');
+                 {probe};"
+            ),
+            &Pg2SqliteOptions::default(),
+        );
+        assert_eq!(rows, vec![None], "{probe}");
+    }
+}
+
+#[test]
+fn column_arithmetic_inside_the_year_one_is_kept() {
+    let rows = run_translated_with(
+        "CREATE TABLE t (ts timestamp, d date);
+         INSERT INTO t (ts, d) VALUES ('0002-06-01 10:00:00', '0002-06-01');
+         SELECT ts - interval '1 year' FROM t UNION ALL SELECT d - 516 FROM t;",
+        &Pg2SqliteOptions::default(),
+    );
+    assert_eq!(rows, vec![Some("0001-06-01 10:00:00".to_string()), Some("0001-01-01".to_string())]);
+}
+
+#[test]
+fn the_range_spelling_is_read() {
+    assert_eq!(
+        shift("timestamp '2026-01-31' + interval '1-2' year to month"),
+        "2027-03-31 00:00:00"
+    );
+}
+
+/// The qualifier drops the fields right of its last one, and a two-part clock
+/// under `MINUTE TO SECOND` is minutes and seconds.
+#[test]
+fn a_field_qualifier_truncates_like_postgresql() {
+    assert_eq!(
+        shift("timestamp '2026-01-31' + interval '1 day 2 hours' day"),
+        "2026-02-01 00:00:00"
+    );
+    assert_eq!(
+        shift("timestamp '2026-01-31' + interval '1:30' minute to second"),
+        "2026-01-31 00:01:30"
+    );
+}
+
+#[test]
+fn a_scaled_interval_is_multiplied_count_by_count() {
+    assert_eq!(shift("timestamp '2026-01-31' - 3 * interval '1.5 days'"), "2026-01-26 12:00:00");
+}
+
+/// Two spellings of the same duration collapse onto one modifier, and it is
+/// the largest unit that divides the total exactly.
+#[test]
+fn the_time_of_day_is_emitted_in_one_unit() {
+    assert_eq!(
+        shift("timestamp '2026-01-31' + interval '1 hour 30 minutes'"),
+        "2026-01-31 01:30:00"
+    );
+    let emitted = Pg2Sqlite::default()
+        .sql("SELECT timestamp '2026-01-31' + interval '1 hour 30 minutes';")
+        .unwrap()
+        .translate_to_sql(&Pg2SqliteOptions::default())
+        .unwrap()
+        .into_vec()
+        .join("\n");
+    assert!(emitted.contains("'+90 minutes'"), "one exact modifier, got: {emitted}");
+}

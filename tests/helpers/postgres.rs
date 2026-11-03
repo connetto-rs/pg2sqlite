@@ -1,23 +1,9 @@
 //! A real PostgreSQL to check the suite's inputs against.
-//!
-//! Include in a test binary with:
-//!
-//! ```rust,ignore
-//! #[path = "helpers/postgres.rs"]
-//! mod postgres_harness;
-//! ```
-//!
-//! Using `#[path]` rather than a sub-module of `helpers/mod.rs` keeps the
-//! container machinery compiled into the binaries that ask for it, the same
-//! reason `run_translated.rs` is included that way.
-//!
 //! The translator's guarantee is that SQLite accepts its output, which says
 //! nothing about the input being valid PostgreSQL. A fixture PostgreSQL refuses
 //! can therefore sit in the tree and stay green, which is what the permissions
 //! fixture did for as long as it existed. These helpers make the other engine
 //! available so that a test can say what PostgreSQL does rather than assume it.
-
-#![allow(dead_code)]
 
 use std::{
     process::Command,
@@ -28,7 +14,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use diesel::{connection::SimpleConnection, prelude::*, sql_types::BigInt};
+use diesel::{connection::SimpleConnection, prelude::*};
 use parking_lot::Mutex;
 use testcontainers::{Container, ImageExt, runners::SyncRunner};
 use testcontainers_modules::postgres::Postgres;
@@ -187,6 +173,7 @@ impl Server {
 }
 
 /// The ID of this binary's container, for a test that checks its lifecycle.
+#[allow(dead_code, reason = "used by the test_postgres_harness_lifecycle test binary alone")]
 pub fn container_id() -> &'static str {
     &SERVER.id
 }
@@ -266,26 +253,6 @@ pub fn read_every_table(connection: &mut PgConnection, role: &str) -> Result<(),
          RESET ROLE;"
     );
     connection.batch_execute(&probe).map_err(|error| error.to_string())
-}
-
-/// Counts rows without a policy in the way, for asking what the storage holds
-/// rather than what a user may see.
-///
-/// # Panics
-///
-/// Panics when the count will not run.
-pub fn stored_count(connection: &mut PgConnection, table: &str) -> i64 {
-    diesel::sql_query("RESET ROLE").execute(connection).expect("reset role");
-    diesel::sql_query(format!("SELECT count(*) AS count FROM {table}"))
-        .get_result::<CountRow>(connection)
-        .expect("count the table")
-        .count
-}
-
-#[derive(QueryableByName)]
-pub struct CountRow {
-    #[diesel(sql_type = BigInt)]
-    pub count: i64,
 }
 
 /// What a step did, for a comparison between the engines.

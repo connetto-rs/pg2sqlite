@@ -14,9 +14,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Roughly two hundred test binaries, each carrying full debug info, fill a
-  # runner's disk before the suite finishes. Line tables keep the file and
-  # line in a backtrace and drop the rest.
+  # Line tables keep the file and line in a backtrace and drop the rest of
+  # the debug info, which the test builds do not need.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
   CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
@@ -31,9 +30,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      # One test binary per file in tests/, each about a hundred megabytes,
-      # and there are over two hundred of them. The preinstalled toolchains
-      # a Rust job never touches are what makes room for them.
+      # The preinstalled toolchains a Rust job never touches make room for
+      # the debug and release builds of the test binaries.
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
@@ -63,7 +61,7 @@ jobs:
         run: cargo test --all-targets
 
       - name: Run git loader test
-        run: cargo test --release --features git --test test_translator
+        run: "cargo test --release --features git --test it test_translator::"
 
       - name: Run doc tests
         run: cargo test --doc

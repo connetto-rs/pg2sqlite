@@ -4,7 +4,7 @@
 #
 # The declared floor lives in one place, FLOOR below, and must match the version
 # the README and the D3 decision state. The check is differential: every
-# snapshot under tests/snapshots, plus every translated row of the validity
+# snapshot under tests/*/snapshots, plus every translated row of the validity
 # sweep corpus (emitted by examples/floor_corpus.rs), is executed against both
 # the floor build and a recent build, and only a failure that appears on the
 # floor alone is reported. That cancels out failures caused by extensions this
@@ -48,7 +48,7 @@ import sys
 
 repository, destination = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
 scripts = []
-for snapshot in sorted((repository / "tests" / "snapshots").glob("*.snap")):
+for snapshot in sorted((repository / "tests").glob("*/snapshots/*.snap")):
     parts = snapshot.read_text().split("---\n", 2)
     body = parts[2] if len(parts) >= 3 else ""
     statements = [line.rstrip() for line in body.splitlines() if line.strip()]

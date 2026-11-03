@@ -1,6 +1,6 @@
-# Read by every `cargo mutants` run. Scope runs with `-f <file>` and an explicit
-# `-- --test <binary>` list: the crate generates ~4200 mutants, and
-# tests/test_postgres_gauntlet.rs needs a Docker PostgreSQL per run.
+# Read by every `cargo mutants` run. Scope runs with `-f <file>` and a
+# `-- --test it <module>::` filter: the crate generates ~4200 mutants, and
+# tests/it/test_postgres_gauntlet.rs needs a Docker PostgreSQL per run.
 profile = "mutants"
 
 # Without this the scratch copy includes examples/web-playground/target,

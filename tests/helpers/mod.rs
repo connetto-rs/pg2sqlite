@@ -1,8 +1,13 @@
 //! Shared test helpers for pg2sqlite integration tests.
 
-#![allow(dead_code)]
+pub mod emitted_corpus;
+pub mod postgres;
+pub mod run_translated;
+pub mod statistical_aggregates;
+pub mod translate;
 
 #[cfg(feature = "sqlitegis")]
+#[allow(dead_code, reason = "used by the sqlitegis test binary alone")]
 pub mod sqlitegis;
 
 use std::{cell::RefCell, sync::Once};
@@ -195,7 +200,6 @@ thread_local! {
 }
 
 /// Sets the current session user ID for RLS filtering.
-#[allow(dead_code)]
 pub fn set_session_user_id(user_id: &Uuid) {
     SESSION_USER_ID.with(|u| {
         *u.borrow_mut() = Some(*user_id);
@@ -204,7 +208,6 @@ pub fn set_session_user_id(user_id: &Uuid) {
 
 /// Sets the current session username for RLS filtering (for current_user
 /// mapping).
-#[allow(dead_code)]
 pub fn set_session_username(username: &str) {
     SESSION_USERNAME.with(|u| {
         *u.borrow_mut() = Some(username.to_string());
@@ -212,7 +215,6 @@ pub fn set_session_username(username: &str) {
 }
 
 /// Sets the current session department for RLS filtering.
-#[allow(dead_code)]
 pub fn set_session_department(department: Option<&str>) {
     SESSION_DEPARTMENT.with(|d| {
         *d.borrow_mut() = department.map(ToString::to_string);
@@ -271,7 +273,6 @@ pub fn establish_connection() -> SqliteConnection {
     connection
 }
 
-#[allow(dead_code)]
 /// Common query result type for counting rows.
 #[derive(QueryableByName, Debug)]
 pub struct Count {
@@ -279,40 +280,7 @@ pub struct Count {
     pub count: i64,
 }
 
-/// Inserts a user into the backing table (simulating sync from server).
-///
-/// **Testing only** - This directly inserts into the backing table, bypassing
-/// RLS. Real applications should insert into the `users` view, which enforces
-/// RLS policies.
-#[allow(dead_code)]
-pub fn insert_user(conn: &mut SqliteConnection, user: &User) -> QueryResult<usize> {
-    diesel::insert_into(users_rls::table).values(user).execute(conn)
-}
-
-/// Inserts a post into the backing table (simulating sync from server).
-///
-/// **Testing only** - This directly inserts into the backing table, bypassing
-/// RLS. Real applications should insert into the `posts` view, which enforces
-/// RLS policies.
-#[allow(dead_code)]
-pub fn insert_post_rls(conn: &mut SqliteConnection, post: &Post) -> QueryResult<usize> {
-    diesel::insert_into(posts_rls::table).values(post).execute(conn)
-}
-
-/// Counts rows in the users view.
-#[allow(dead_code)]
-pub fn count_users(conn: &mut SqliteConnection) -> QueryResult<i64> {
-    users::table.count().get_result(conn)
-}
-
-/// Counts rows in the posts view.
-#[allow(dead_code)]
-pub fn count_posts(conn: &mut SqliteConnection) -> QueryResult<i64> {
-    posts::table.count().get_result(conn)
-}
-
 /// Translates PostgreSQL SQL text into SQLite AST statements.
-#[allow(dead_code)]
 pub fn translate_statements(
     sql: &str,
     options: &Pg2SqliteOptions,
@@ -326,14 +294,12 @@ pub fn translate_statements(
 }
 
 /// Translates PostgreSQL SQL text and returns rendered SQLite SQL.
-#[allow(dead_code)]
 pub fn translate_sql(sql: &str, options: &Pg2SqliteOptions) -> Result<String, String> {
     translate_statements(sql, options)
         .map(|stmts| stmts.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"))
 }
 
 /// Translates PostgreSQL SQL text and returns output statement count.
-#[allow(dead_code)]
 pub fn translate_count(sql: &str, options: &Pg2SqliteOptions) -> Result<usize, String> {
     translate_statements(sql, options).map(|stmts| stmts.len())
 }
@@ -341,7 +307,6 @@ pub fn translate_count(sql: &str, options: &Pg2SqliteOptions) -> Result<usize, S
 /// Reverse-translates SQLite SQL text back to PostgreSQL SQL.
 ///
 /// Uses a minimal schema with table `t` for reverse translation context.
-#[allow(dead_code)]
 pub fn reverse_translate_sql(sql: &str) -> Result<String, String> {
     let ddl = "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, val TEXT, key TEXT, value TEXT);";
     let translator = Pg2Sqlite::default().sql(ddl).map_err(|e| e.to_string())?;
@@ -406,6 +371,7 @@ pub fn prepared_user_select(pg: &str, options: &Pg2SqliteOptions) -> String {
 }
 
 /// Registers sqlite-vec once per process, so every later connection has it.
+#[allow(dead_code, reason = "used by the sqlite_vec and playground test binaries alone")]
 pub fn register_sqlite_vec_once() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
@@ -428,11 +394,13 @@ pub fn register_sqlite_vec_once() {
 }
 
 /// Encodes an `f32` as little-endian IEEE 754 binary16.
+#[allow(dead_code, reason = "used by the sqlite_vec test binary alone")]
 pub fn f32_to_f16_le(value: f32) -> [u8; 2] {
     half::f16::from_f32(value).to_le_bytes()
 }
 
 /// Opens an in-memory connection with the native vector extension.
+#[allow(dead_code, reason = "used by the sqlite_vec test binary alone")]
 pub fn vec_connection() -> rusqlite::Connection {
     register_sqlite_vec_once();
     rusqlite::Connection::open_in_memory().expect("in-memory SQLite")
@@ -460,6 +428,7 @@ pub fn translate_default_joined(pg: &str) -> Result<String, String> {
 /// Translates `pg` with default options and returns the emitted statements
 /// joined with newlines, or the translation error message when translation
 /// is refused.
+#[allow(dead_code, reason = "used by the sqlite_vec test binary alone")]
 pub fn translate_default_or_err(pg: &str) -> String {
     match Pg2Sqlite::default().sql(pg).unwrap().translate(&Pg2SqliteOptions::default()) {
         Err(e) => e.to_string(),

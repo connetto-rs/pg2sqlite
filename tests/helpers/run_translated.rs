@@ -1,17 +1,4 @@
 //! Runs a translated PostgreSQL script against a real in-memory SQLite.
-//!
-//! Include in a test binary with:
-//!
-//! ```rust,ignore
-//! #[path = "helpers/run_translated.rs"]
-//! mod run_translated_helper;
-//! use run_translated_helper::run_translated_with;
-//! ```
-//!
-//! Using `#[path]` rather than a sub-module of `helpers/mod.rs` keeps this
-//! compiled only in the binaries that include it, so it needs no `dead_code`
-//! allowance in the ones that do not.
-//!
 //! Executing the translator's own output, rather than a hand-written
 //! equivalent, is what makes an assertion proof: a drift between the shape the
 //! translator emits and the shape SQLite accepts fails here.

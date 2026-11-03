@@ -1,7 +1,7 @@
 // The validity-sweep corpus, shared between the sweep test and the floor
 // emitter.
 //
-// `tests/test_emitted_sql_is_valid_sqlite.rs` executes every row against the
+// `tests/it/test_emitted_sql_is_valid_sqlite.rs` executes every row against the
 // bundled SQLite (the crate's central guarantee), and
 // `examples/floor_corpus.rs` emits every row's translation for
 // `scripts/check_sqlite_floor.sh`, so a corpus row is automatically a floor
@@ -37,7 +37,6 @@ CREATE TABLE dv (id SERIAL PRIMARY KEY, note TEXT DEFAULT 'unset');
 /// exactly these, and `the_sweep_declares_every_registered_aggregate` holds
 /// the two lists together.
 #[must_use]
-#[allow(dead_code, reason = "consumed by the binaries that sweep, not by every includer")]
 pub fn sweep_options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
@@ -65,7 +64,6 @@ pub fn sweep_options() -> Pg2SqliteOptions {
 /// holding a LIKE gets the case-sensitivity pragma prepended, and counting
 /// then drops the pragma and re-creates a fixture table instead.
 #[must_use]
-#[allow(dead_code, reason = "consumed by the binaries that sweep, not by every includer")]
 pub fn row_statements(setup: &[String], all: &[String]) -> Vec<String> {
     all.iter().filter(|statement| !setup.contains(statement)).cloned().collect()
 }

@@ -3,8 +3,6 @@
 //!
 //! Only compiled when the `sqlitegis` cargo feature is enabled.
 
-#![allow(dead_code)]
-
 use std::sync::Once;
 
 use diesel::{Connection, sqlite::SqliteConnection};

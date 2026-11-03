@@ -11,6 +11,10 @@ documentation = "https://docs.rs/pg2sqlite"
 readme = "README.md"
 keywords = ["postgresql", "sqlite", "sql", "translation", "migration"]
 categories = ["database", "parser-implementations"]
+# The integration tests are modules of one test binary, `it`, so the crate is
+# linked once for all of them. The `[[test]]` entries below say why each other
+# test target needs its own process.
+autotests = false
 
 [dependencies]
 sqlparser = { version = "0.63", default-features = false, features = ["visitor"] }
@@ -108,6 +112,38 @@ sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch 
 # `SqliteConnection::set_triggers_enabled` and its db-config siblings are on
 # diesel main and absent from 2.3.12, and the RLS trigger tests need them.
 diesel = { git = "https://github.com/diesel-rs/diesel", branch = "main" }
+
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
+
+# Separate because the PostgreSQL harness sweeps abandoned containers when it
+# starts, and in a process shared with the other PostgreSQL-backed tests that
+# sweep races the sweep test's setup, removing the container it created as
+# abandoned before it can inspect it.
+[[test]]
+name = "test_postgres_harness_lifecycle"
+path = "tests/test_postgres_harness_lifecycle.rs"
+
+# Separate because sqlite-vec is registered with `sqlite3_auto_extension`,
+# which loads it into every later connection in the process.
+[[test]]
+name = "sqlite_vec"
+path = "tests/sqlite_vec/main.rs"
+
+# Separate because SQLiteGIS is registered with `sqlite3_auto_extension`,
+# which loads it into every later connection in the process.
+[[test]]
+name = "sqlitegis"
+path = "tests/sqlitegis/main.rs"
+required-features = ["sqlitegis"]
+
+# Separate because it registers both sqlite-vec and, with the `sqlitegis`
+# feature, SQLiteGIS with `sqlite3_auto_extension`, so it shares a process
+# with neither group above.
+[[test]]
+name = "test_playground_sample_queries"
+path = "tests/test_playground_sample_queries.rs"
 
 [[bench]]
 name = "translation"
