@@ -9602,6 +9602,39 @@ fn a_time_shift_past_the_64_bit_bound_wraps_as_postgresql_does() {
 }
 
 #[test]
+fn a_time_shift_that_wraps_for_every_time_of_day_matches_postgresql() {
+    // Twice this clock is -2^63 microseconds, so subtracting it leaves 64
+    // bits for every time of day, and PostgreSQL answers the time of day
+    // moved by 19:59:05.224192.
+    for target in ["12:00:00.001", "00:00:00"] {
+        let scaled = run(&format!(
+            "SELECT (time '{target}' - 2 * interval '-1281023894:00:27.387904')::text;"
+        ));
+        let reduced = run(&format!("SELECT (time '{target}' + interval '19:59:05.224192')::text;"));
+        assert_eq!(scaled, reduced, "{target}");
+    }
+}
+
+#[test]
+fn a_volatile_time_shifted_past_the_64_bit_bound_is_refused() {
+    // The wrapping form reads the time of day for the bound and for each
+    // answer, and `clock_timestamp()` answers anew on each read.
+    let volatile = "CAST(clock_timestamp() AS time)";
+    let wrapping = format!("SELECT ({volatile} + interval '{NEAR_BOUND_CLOCK}')::text FROM t;");
+    refused(&wrapping, "64 bits");
+    refused(&wrapping, "clock_timestamp");
+    let within = format!("{SCHEMA}\nSELECT ({volatile} + interval '1 hour')::text FROM t;");
+    assert!(
+        Pg2Sqlite::default()
+            .sql(&within)
+            .expect("parse")
+            .translate_to_sql(&Pg2SqliteOptions::default())
+            .is_ok(),
+        "a shift that stays in 64 bits reads the time of day once"
+    );
+}
+
+#[test]
 fn a_time_minus_an_interval_reads_only_its_clock() {
     // `time_mi_interval` subtracts the time field, so months and days with
     // no negation in 32 bits take no part.
