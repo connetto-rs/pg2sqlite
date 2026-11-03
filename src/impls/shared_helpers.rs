@@ -1002,6 +1002,10 @@ fn numeric_precision_and_scale_of(
             })
         }
         Expr::BinaryOp { left, op: BinaryOperator::Multiply, right } => {
+            if crate::impls::expression_type::is_interval_typed(expr, schema, options) {
+                // A factor times an interval is an interval, not a NUMERIC.
+                return Ok(None);
+            }
             // `*` of two NUMERIC values lands at the sum of their scales.
             let lps = numeric_precision_and_scale_of(left, schema, options).ok().flatten();
             let rps = numeric_precision_and_scale_of(right, schema, options).ok().flatten();

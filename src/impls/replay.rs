@@ -10,7 +10,7 @@
 use alloc::{format, string::String, vec::Vec};
 use core::ops::ControlFlow;
 
-use sqlparser::ast::{Expr, Function, InTarget, Visit, Visitor};
+use sqlparser::ast::{Expr, Function, InTarget, Query, SetExpr, TableFactor, Visit, Visitor};
 
 use crate::{
     errors::Error,
@@ -54,8 +54,9 @@ const VOLATILE: &[&str] = &[
 /// Columns, literals and the operators over them replay; a call replays only
 /// when this crate can name the function and knows it is not volatile, since
 /// a function it cannot name may be anything the caller defined. A subquery
-/// never replays: it may read rows another copy of the same statement has
-/// already changed.
+/// that reads a relation never replays: it may read rows another copy of the
+/// same statement has already changed. One that reads none, a select over
+/// derived tables or no source at all, replays when what it evaluates does.
 pub(crate) fn is_replayable(expr: &Expr, options: &TranslationContext<'_>) -> bool {
     let mut check = ReplayCheck { options, replayable: true };
     let _: ControlFlow<()> = expr.visit(&mut check);
@@ -129,9 +130,8 @@ impl Visitor for ReplayCheck<'_, '_> {
     fn post_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
         let replays = match expr {
             Expr::Function(function) => self.call_replays(function),
-            Expr::Subquery(_)
-            | Expr::Exists { .. }
-            | Expr::In { target: InTarget::Subquery(_), .. } => false,
+            Expr::Subquery(query) => reads_no_relation(query),
+            Expr::Exists { .. } | Expr::In { target: InTarget::Subquery(_), .. } => false,
             _ => true,
         };
         if replays {
@@ -139,6 +139,76 @@ impl Visitor for ReplayCheck<'_, '_> {
         } else {
             self.replayable = false;
             ControlFlow::Break(())
+        }
+    }
+}
+
+/// Whether `query` reads no relation: it has no `WITH`, and every source of
+/// every select is a derived table that reads none, or there is no source.
+fn reads_no_relation(query: &Query) -> bool {
+    query.with.is_none() && body_reads_no_relation(&query.body)
+}
+
+/// [`reads_no_relation`] for a query body.
+fn body_reads_no_relation(body: &SetExpr) -> bool {
+    match body {
+        SetExpr::Select(select) => {
+            select.from.iter().all(|source| {
+                source.joins.is_empty()
+                    && matches!(
+                        &source.relation,
+                        TableFactor::Derived { subquery, .. } if reads_no_relation(subquery)
+                    )
+            })
+        }
+        SetExpr::Query(query) => reads_no_relation(query),
+        SetExpr::Values(_) => true,
+        SetExpr::SetOperation { left, right, .. } => {
+            body_reads_no_relation(left) && body_reads_no_relation(right)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
+
+    use super::is_replayable;
+    use crate::{options::TranslationContext, prelude::Pg2SqliteOptions};
+
+    /// Whether the expression `sql` replays.
+    fn replays(sql: &str) -> bool {
+        let expr =
+            Parser::new(&PostgreSqlDialect {}).try_with_sql(sql).unwrap().parse_expr().unwrap();
+        is_replayable(&expr, &TranslationContext::from_owned(Pg2SqliteOptions::default()))
+    }
+
+    #[test]
+    fn a_subquery_replays_only_when_it_reads_no_relation() {
+        for sql in [
+            "(SELECT 1)",
+            "(SELECT x FROM (SELECT 1 AS x))",
+            "(SELECT x FROM (SELECT 1 AS x) AS a, (SELECT 2 AS y) AS b)",
+            "(SELECT column1 FROM (VALUES (1)))",
+            "((SELECT 1))",
+            "(SELECT 1 UNION SELECT 2)",
+            "(SELECT x FROM ((SELECT 1 AS x) UNION (SELECT 2)) AS a)",
+        ] {
+            assert!(replays(sql), "{sql} reads no relation");
+        }
+        for sql in [
+            "(SELECT x FROM t)",
+            "(SELECT x FROM (SELECT x FROM t))",
+            "(SELECT a.x FROM (SELECT 1 AS x) AS a JOIN (SELECT 1 AS x) AS b ON 1)",
+            "(WITH w AS (SELECT 1 AS x) SELECT x FROM w)",
+            "(SELECT 1 UNION SELECT x FROM t)",
+            "(SELECT random())",
+            "EXISTS (SELECT 1)",
+            "1 IN (SELECT 1)",
+            "(SELECT x FROM (TABLE t) AS a)",
+        ] {
+            assert!(!replays(sql), "{sql} may answer a different value");
         }
     }
 }

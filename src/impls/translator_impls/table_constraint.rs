@@ -71,8 +71,13 @@ impl crate::traits::translator::TranslatorWithContext for TableConstraint {
             }
             Self::PrimaryKey(pk_constraint) => {
                 let mut updated_pk = pk_constraint.clone();
-                updated_pk.columns =
-                    translate_index_columns(&pk_constraint.columns, schema, options, emit)?;
+                let definition_options = options.without_subqueries();
+                updated_pk.columns = translate_index_columns(
+                    &pk_constraint.columns,
+                    schema,
+                    &definition_options,
+                    emit,
+                )?;
                 if let Some(characteristics) = pk_constraint.characteristics {
                     return Err(deferrability_outside_a_foreign_key(
                         "PRIMARY KEY",
@@ -84,8 +89,13 @@ impl crate::traits::translator::TranslatorWithContext for TableConstraint {
             }
             Self::Unique(unique_constraint) => {
                 let mut updated_unique = unique_constraint.clone();
-                updated_unique.columns =
-                    translate_index_columns(&unique_constraint.columns, schema, options, emit)?;
+                let definition_options = options.without_subqueries();
+                updated_unique.columns = translate_index_columns(
+                    &unique_constraint.columns,
+                    schema,
+                    &definition_options,
+                    emit,
+                )?;
                 if let Some(characteristics) = unique_constraint.characteristics {
                     return Err(deferrability_outside_a_foreign_key("UNIQUE", characteristics));
                 }

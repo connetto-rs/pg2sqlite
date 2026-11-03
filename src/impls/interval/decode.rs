@@ -288,30 +288,49 @@ impl Interval {
         Ok(negated)
     }
 
-    /// `interval_mul` for a finite interval and an integer factor, which
-    /// PostgreSQL converts to `float8` before multiplying.
-    pub(super) fn multiplied(self, factor: i64) -> Result<Self, Refusal> {
-        let factor = int_to_f64(factor);
-        let month_product = f64::from(self.months) * factor;
-        let day_product = f64::from(self.days) * factor;
-        if !fits_in_i32(month_product) || !fits_in_i32(day_product) {
+    /// `interval_mul` for a finite interval, or `interval_div` when `divide`,
+    /// by a finite `factor`, PostgreSQL's `float8` operand.
+    ///
+    /// The whole parts of the month and day products land in their fields,
+    /// and the fractions cascade down through 30 days a month and 86400
+    /// seconds a day, rounded with `TSROUND` and `rint` in PostgreSQL's order
+    /// so every intermediate double is the one PostgreSQL computes. A
+    /// division by zero answers `OutOfRange` here, so a caller reports
+    /// PostgreSQL's `division by zero` before calling.
+    pub(super) fn scaled(self, factor: f64, divide: bool) -> Result<Self, Refusal> {
+        let apply = |value: f64| if divide { value / factor } else { value * factor };
+        let month_product = apply(f64::from(self.months));
+        if !fits_in_i32(month_product) {
             return Err(Refusal::OutOfRange);
         }
-        // An integral product leaves no fractional month or day for
-        // `interval_mul` to cascade into the time.
-        let time = round_ties_even(int_to_f64(self.micros) * factor);
+        let months = truncate_to_i32(month_product);
+        let day_product = apply(f64::from(self.days));
+        if !fits_in_i32(day_product) {
+            return Err(Refusal::OutOfRange);
+        }
+        let mut days = truncate_to_i32(day_product);
+        let month_remainder_days = tsround((month_product - f64::from(months)) * 30.0);
+        let whole_remainder_days = truncate_to_i32(month_remainder_days);
+        let mut sec_remainder = tsround(
+            (day_product - f64::from(days) + month_remainder_days
+                - f64::from(whole_remainder_days))
+                * 86_400.0,
+        );
+        if sec_remainder.abs() >= 86_400.0 {
+            let carried = truncate_to_i32(sec_remainder / 86_400.0);
+            days = days.checked_add(carried).ok_or(Refusal::OutOfRange)?;
+            sec_remainder -= f64::from(carried) * 86_400.0;
+        }
+        days = days.checked_add(whole_remainder_days).ok_or(Refusal::OutOfRange)?;
+        let time = round_ties_even(apply(int_to_f64(self.micros)) + sec_remainder * 1_000_000.0);
         if !fits_in_i64(time) {
             return Err(Refusal::OutOfRange);
         }
-        let product = Self {
-            months: truncate_to_i32(month_product),
-            days: truncate_to_i32(day_product),
-            micros: truncate_to_i64(time),
-        };
-        if product.is_infinite() {
+        let scaled = Self { months, days, micros: truncate_to_i64(time) };
+        if scaled.is_infinite() {
             return Err(Refusal::OutOfRange);
         }
-        Ok(product)
+        Ok(scaled)
     }
 }
 
@@ -1431,6 +1450,11 @@ fn round_ties_even(value: f64) -> f64 {
     if value.is_sign_negative() { -rounded } else { rounded }
 }
 
+/// `TSROUND`, the microsecond rounding of a seconds or days remainder.
+fn tsround(value: f64) -> f64 {
+    round_ties_even(value * 1_000_000.0) / 1_000_000.0
+}
+
 /// `FLOAT8_FITS_IN_INT32`.
 fn fits_in_i32(value: f64) -> bool {
     !value.is_nan() && value >= f64::from(i32::MIN) && value < -f64::from(i32::MIN)
@@ -1463,6 +1487,6 @@ fn truncate_to_i64(value: f64) -> i64 {
     clippy::cast_precision_loss,
     reason = "reproduces C's rounding int64-to-double conversion"
 )]
-fn int_to_f64(value: i64) -> f64 {
+pub(super) fn int_to_f64(value: i64) -> f64 {
     value as f64
 }

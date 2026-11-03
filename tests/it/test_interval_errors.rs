@@ -94,34 +94,48 @@ fn test_interval_in_arithmetic() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-/// Two intervals added answer an interval in PostgreSQL, and SQLite has no
-/// interval type to answer with. The commutation that moves an interval from
-/// the left of `+` to the right used to swap the two sides forever here, and
-/// the translator aborted on a stack overflow.
-#[test]
-fn adding_two_intervals_is_refused() {
-    let error = Pg2Sqlite::default()
-        .sql("SELECT INTERVAL '1 day' + INTERVAL '2 hours';")
+/// Translates `sql` and returns the first value of its single emitted
+/// statement, as text.
+fn translated_value(sql: &str) -> String {
+    let statements = Pg2Sqlite::default()
+        .sql(sql)
         .expect("parse")
-        .translate(&Pg2SqliteOptions::default())
-        .expect_err("two intervals added have no SQLite form");
-    assert!(error.to_string().to_lowercase().contains("interval"), "{error}");
+        .translate_to_sql(&Pg2SqliteOptions::default())
+        .expect("translation")
+        .into_vec();
+    let probe = statements.last().expect("a select").clone();
+    let connection = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+    connection
+        .query_row(&probe, [], |row| row.get::<_, String>(0))
+        .unwrap_or_else(|error| panic!("probe failed: {error}\n{probe}"))
 }
 
-/// The same for subtraction, which reached the refusal already, and for the
-/// parenthesised spelling of both.
+/// Two intervals added answer PostgreSQL's literal: the fields summed and
+/// rendered in its default text.
 #[test]
-fn interval_arithmetic_between_intervals_is_refused() {
-    for sql in [
-        "SELECT INTERVAL '1 day' - INTERVAL '2 hours';",
-        "SELECT (INTERVAL '1 day') + (INTERVAL '2 hours');",
-        "SELECT INTERVAL '1 day' + INTERVAL '2 hours' + INTERVAL '3 minutes';",
-    ] {
-        let error = Pg2Sqlite::default()
-            .sql(sql)
-            .expect("parse")
-            .translate(&Pg2SqliteOptions::default())
-            .unwrap_err();
-        assert!(error.to_string().to_lowercase().contains("interval"), "{sql}: {error}");
-    }
+fn adding_two_intervals_answers_postgresqls_literal() {
+    assert_eq!(
+        translated_value("SELECT (INTERVAL '1 day' + INTERVAL '2 hours')::text;"),
+        "1 day 02:00:00"
+    );
+}
+
+/// The same for subtraction, the parenthesised spelling, and the chained
+/// addition PostgreSQL groups left to right.
+#[test]
+fn interval_arithmetic_between_intervals_answers_postgresqls_literals() {
+    assert_eq!(
+        translated_value("SELECT (INTERVAL '1 day' - INTERVAL '2 hours')::text;"),
+        "1 day -02:00:00"
+    );
+    assert_eq!(
+        translated_value("SELECT ((INTERVAL '1 day') + (INTERVAL '2 hours'))::text;"),
+        "1 day 02:00:00"
+    );
+    assert_eq!(
+        translated_value(
+            "SELECT (INTERVAL '1 day' + INTERVAL '2 hours' + INTERVAL '3 minutes')::text;"
+        ),
+        "1 day 02:03:00"
+    );
 }

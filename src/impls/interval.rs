@@ -11,6 +11,8 @@
 
 pub(crate) mod ddl;
 mod decode;
+pub(crate) mod fields;
+mod fields_templates;
 pub(crate) mod keys;
 mod keys_templates;
 
@@ -18,6 +20,7 @@ mod keys_templates;
 use alloc::{
     format,
     string::{String, ToString},
+    vec,
     vec::Vec,
 };
 
@@ -51,6 +54,14 @@ impl IntervalShift {
             modifiers.push(time_modifier(interval.micros));
         }
         modifiers
+    }
+
+    /// The SQLite date modifier `time_pl_interval` applies to a time of day:
+    /// the time field alone, wrapped at 24 hours, since PostgreSQL ignores
+    /// the months and days of an interval added to a `time` or `timetz`.
+    pub(crate) fn time_of_day_modifiers(&self) -> Vec<String> {
+        let wrapped = self.0.micros % (24 * MICROS_PER_HOUR);
+        if wrapped == 0 { Vec::new() } else { vec![time_modifier(wrapped)] }
     }
 
     /// The year a date or timestamp literal in the replica's stored text
@@ -94,7 +105,9 @@ fn shift(
     let Some(text) = single_quoted_literal(interval.value.as_ref()) else { return Ok(None) };
     let mut value = finite_interval(text, qualifier_typmod(interval)?)?;
     if let Some(factor) = factor {
-        value = value.multiplied(factor).map_err(|refusal| refused(text, refusal))?;
+        value = value
+            .scaled(decode::int_to_f64(factor), false)
+            .map_err(|refusal| refused(text, refusal))?;
     }
     if negate {
         value = value.negated().map_err(|refusal| refused(text, refusal))?;

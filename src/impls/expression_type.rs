@@ -11,7 +11,8 @@ use sql_traits::{
 };
 use sqlparser::{
     ast::{
-        ColumnDef, DataType, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Value,
+        BinaryOperator, ColumnDef, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
+        FunctionArguments, UnaryOperator, Value,
     },
     dialect::PostgreSqlDialect,
     parser::Parser,
@@ -95,9 +96,11 @@ pub(crate) fn type_name<'e>(
 /// Whether `expr` settles on the `interval` type: an `INTERVAL '…'`
 /// literal, an interval column of any typmod, a cast to `interval`, or a
 /// `coalesce`, `greatest`, `least`, `nullif`, `min`, `max` or `CASE` that
-/// settles on an interval result. `false` when nothing the statement writes
-/// settles the type, a column it cannot resolve included, so a position that
-/// only decides on the answer keeps its ordinary translation.
+/// settles on an interval result, a negation or a `+`/`-` that settles on an
+/// interval on both sides, a `*` with an interval on exactly one side, and a
+/// `/` with an interval on the left only. `false` when nothing the statement
+/// writes settles the type, a column it cannot resolve included, so a
+/// position that only decides on the answer keeps its ordinary translation.
 pub(crate) fn is_interval_typed(
     expr: &Expr,
     schema: &ParserDB,
@@ -106,6 +109,18 @@ pub(crate) fn is_interval_typed(
     match expr {
         Expr::Nested(inner) => is_interval_typed(inner, schema, options),
         Expr::Interval(_) => true,
+        Expr::UnaryOp { op: UnaryOperator::Minus, expr: inner } => {
+            is_interval_typed(inner, schema, options)
+        }
+        Expr::BinaryOp { op: BinaryOperator::Plus | BinaryOperator::Minus, left, right } => {
+            is_interval_typed(left, schema, options) && is_interval_typed(right, schema, options)
+        }
+        Expr::BinaryOp { op: BinaryOperator::Multiply, left, right } => {
+            is_interval_typed(left, schema, options) != is_interval_typed(right, schema, options)
+        }
+        Expr::BinaryOp { op: BinaryOperator::Divide, left, right } => {
+            is_interval_typed(left, schema, options) && !is_interval_typed(right, schema, options)
+        }
         _ => {
             type_name(expr, schema, options)
                 .ok()

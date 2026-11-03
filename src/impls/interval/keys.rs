@@ -36,7 +36,9 @@ use sqlparser::{
 };
 
 use super::{
-    Typmod, interval_data_type_typmod, is_interval_data_type,
+    Typmod,
+    fields::Aggregate,
+    interval_data_type_typmod, is_interval_data_type,
     keys_templates::{self, PLACEHOLDER},
     literal_comparison_key, literal_text, qualifier_typmod,
 };
@@ -48,8 +50,8 @@ use crate::{
         object_name::last_ident,
         replay::{is_replayable, reject_duplicated_operand},
         shared_helpers::{
-            function_argument_exprs, inspect_declared_in_scope, query_output_carries,
-            scope_declines_column, set_branch_output_carries_interval,
+            function_arg_expr, function_argument_exprs, inspect_declared_in_scope,
+            query_output_carries, scope_declines_column, set_branch_output_carries_interval,
         },
     },
     options::TranslationContext,
@@ -79,7 +81,7 @@ fn value_of(expr: &Expr) -> Option<&Value> {
 }
 
 /// What a side beside an interval read answers.
-enum IntervalSide {
+pub(super) enum IntervalSide {
     /// A string literal the statement does not type. Beside an `IN` or a
     /// `BETWEEN` PostgreSQL types it as a plain interval; inside an array
     /// literal it resolves as text.
@@ -115,7 +117,7 @@ pub(crate) enum BareLiterals {
 ///
 /// Propagates the refusal an `INTERVAL` over a non-literal operand answers,
 /// and the refusal a cast to `interval` over a non-literal answers.
-fn interval_side(
+pub(super) fn interval_side(
     side: &Expr,
     schema: &ParserDB,
     options: &TranslationContext<'_>,
@@ -194,10 +196,26 @@ fn cast_spelling_refusal() -> Error {
     )
 }
 
-/// The PostgreSQL type name a refusal message spells.
+/// The PostgreSQL type name a refusal message spells, as `format_type`
+/// spells it in PostgreSQL's operator errors: the alias resolved, and a
+/// length or precision dropped from the types it renames.
 pub(crate) fn message_type_name(normalized: &str) -> String {
     let lower = normalized.to_ascii_lowercase();
-    if lower == "int" { "integer".to_string() } else { lower }
+    let base = lower.split('(').next().unwrap_or(&lower).trim_end();
+    match base {
+        "int" | "int4" => "integer",
+        "int2" => "smallint",
+        "int8" => "bigint",
+        "float4" => "real",
+        "float8" => "double precision",
+        "decimal" => "numeric",
+        "varchar" => "character varying",
+        "timestamp" => "timestamp without time zone",
+        "timestamptz" => "timestamp with time zone",
+        "timetz" => "time with time zone",
+        _ => return lower,
+    }
+    .to_string()
 }
 
 /// The PostgreSQL type name of `expr` spelled for a refusal message, or
@@ -215,7 +233,7 @@ pub(crate) fn message_type_name_of(
 
 /// The refusal PostgreSQL answers for a side its `interval {op}` operator has
 /// no form for.
-fn operator_does_not_exist(
+pub(super) fn operator_does_not_exist(
     side: &Expr,
     operator: &str,
     other: &Expr,
@@ -726,21 +744,15 @@ pub(crate) fn function(
 ) -> Result<Option<Expr>, Error> {
     let name =
         last_ident(&func.name).map(|ident| ident.value.to_ascii_lowercase()).unwrap_or_default();
+    let FunctionArguments::List(list) = &func.args else {
+        return Ok(None);
+    };
     let args = function_argument_exprs(&func.args);
     match name.as_str() {
-        "count" => count(func, &args, schema, options, emit),
+        "count" => count(func, list, &args, schema, options, emit),
         "min" | "max" => extremum(name.as_str(), func, &args, schema, options, emit),
-        "sum" | "avg" => {
-            if any_interval_typed(&args, schema, options) {
-                Err(Error::forward_refusal(format!(
-                    "{name} over an interval cannot be translated: the answer is an \
-                     interval, and SQLite has no interval type to hold one. Aggregate in the \
-                     application."
-                )))
-            } else {
-                Ok(None)
-            }
-        }
+        "sum" => interval_aggregate(Aggregate::Sum, func, list, &args, schema, options, emit),
+        "avg" => interval_aggregate(Aggregate::Avg, func, list, &args, schema, options, emit),
         "date_part" => {
             if args.get(1).is_some_and(|arg| is_interval_typed(arg, schema, options)) {
                 Err(Error::forward_refusal(
@@ -789,14 +801,12 @@ fn any_interval_typed(args: &[&Expr], schema: &ParserDB, options: &TranslationCo
 /// The interval translation of a `count` call.
 fn count(
     func: &Function,
+    list: &FunctionArgumentList,
     args: &[&Expr],
     schema: &ParserDB,
     options: &TranslationContext<'_>,
     emit: WarningSink<'_>,
 ) -> Result<Option<Expr>, Error> {
-    let FunctionArguments::List(list) = &func.args else {
-        return Ok(None);
-    };
     if func.over.is_some() {
         // A window count agrees on text and value: it counts non-NULL rows.
         return Ok(None);
@@ -843,6 +853,95 @@ fn count(
         within_group: Vec::new(),
         over: None,
     })))
+}
+
+/// The interval translation of a `sum` or `avg` call: the fields summed the
+/// way PostgreSQL's `do_interval_accum` adds row by row, an average divided
+/// by the row count the way `interval_avg` divides, rendered in the text
+/// PostgreSQL prints.
+///
+/// # Errors
+///
+/// Propagates the refusal the call answers.
+fn interval_aggregate(
+    kind: Aggregate,
+    func: &Function,
+    list: &FunctionArgumentList,
+    args: &[&Expr],
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+    emit: WarningSink<'_>,
+) -> Result<Option<Expr>, Error> {
+    if !any_interval_typed(args, schema, options) {
+        return Ok(None);
+    }
+    let name = match kind {
+        Aggregate::Sum => "sum",
+        Aggregate::Avg => "avg",
+    };
+    if list.args.iter().any(|arg| !matches!(arg, FunctionArg::Unnamed(_))) {
+        let types = call_argument_types(list, schema, options);
+        return Err(Error::forward_refusal(format!(
+            "function {name}({types}) does not exist. PostgreSQL has no {name} over named \
+             arguments, so this is not a statement the server runs."
+        )));
+    }
+    if list.duplicate_treatment.is_some() {
+        return Err(Error::forward_refusal(format!(
+            "{name}(DISTINCT) over an interval cannot be translated: the fields are summed over \
+             every row, and PostgreSQL decides the distinct rows on the value, not the text. \
+             Aggregate in the application."
+        )));
+    }
+    if args.len() > 1 {
+        let types = args
+            .iter()
+            .map(|arg| message_type_name_of(arg, schema, options))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(Error::forward_refusal(format!(
+            "function {name}({types}) does not exist. PostgreSQL has no {name} over a pair of \
+             values, so this is not a statement the server runs."
+        )));
+    }
+    if func.over.is_some() {
+        return Err(Error::forward_refusal(format!(
+            "{name} over an interval with an OVER clause cannot be translated: the fields are \
+             summed in a scalar subquery, and SQLite does not allow one inside a window \
+             function."
+        )));
+    }
+    if func.filter.is_some() || !func.within_group.is_empty() || func.null_treatment.is_some() {
+        return Err(Error::forward_refusal(format!(
+            "{name} over an interval with a FILTER or WITHIN GROUP clause cannot be translated: \
+             the fields are summed in a scalar subquery, and the clause does not carry \
+             through it. Aggregate in the application."
+        )));
+    }
+    Ok(Some(super::fields::aggregate(kind, args[0], schema, options, emit)?))
+}
+
+/// PostgreSQL's spelling of a call's arguments, a named one as `name => type`.
+fn call_argument_types(
+    list: &FunctionArgumentList,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> String {
+    list.args
+        .iter()
+        .map(|arg| {
+            let Some(value) = function_arg_expr(arg) else {
+                return "unknown".to_string();
+            };
+            let type_name = message_type_name_of(value, schema, options);
+            // The PostgreSQL dialect settles a named argument on `ExprNamed`.
+            match arg {
+                FunctionArg::ExprNamed { name, .. } => format!("{name} => {type_name}"),
+                _ => type_name,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The interval translation of a `min` or `max` call.

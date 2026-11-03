@@ -2689,9 +2689,9 @@ fn warn_ascii_only_ilike_folding(
 
 /// `datetime(target, modifier..., 'subsec')` with its trailing fractional zeros
 /// trimmed.
-fn shifted_datetime(target: Expr, modifiers: &[String]) -> Expr {
+fn shifted_datetime(target: Expr, modifiers: &[Expr]) -> Expr {
     let mut args = vec![target];
-    args.extend(modifiers.iter().map(|modifier| string_literal(modifier)));
+    args.extend(modifiers.iter().cloned());
     args.push(string_literal("subsec"));
     trim_trailing_zeros(simple_function_expr("datetime", args, None))
 }
@@ -2699,7 +2699,7 @@ fn shifted_datetime(target: Expr, modifiers: &[String]) -> Expr {
 /// The time of day `target` answers after `modifiers`, wrapped at midnight,
 /// with a `timetz` operand's offset kept in place. The zoned form reads
 /// `target` three times, so the caller refuses a non-replayable operand.
-fn shifted_time_of_day(target: Expr, modifiers: &[String], zoned: bool) -> Expr {
+fn shifted_time_of_day(target: Expr, modifiers: &[Expr], zoned: bool) -> Expr {
     if !zoned {
         return shifted_clock(target, modifiers);
     }
@@ -2729,19 +2729,33 @@ fn shifted_time_of_day(target: Expr, modifiers: &[String], zoned: bool) -> Expr 
 /// The time part of a shifted time, trailing fractional zeros trimmed. SQLite
 /// reads a bare time as 2000-01-01, so the part after the date wraps at
 /// midnight.
-fn shifted_clock(local: Expr, modifiers: &[String]) -> Expr {
+fn shifted_clock(local: Expr, modifiers: &[Expr]) -> Expr {
     let mut args = vec![local];
-    args.extend(modifiers.iter().map(|modifier| string_literal(modifier)));
+    args.extend(modifiers.iter().cloned());
     args.push(string_literal("subsec"));
     let shifted = simple_function_expr("datetime", args, None);
     // The date part is eleven characters, so the time of day starts at twelve.
     trim_trailing_zeros(simple_function_expr("substr", vec![shifted, integer_literal(12)], None))
 }
 
+/// The shifted form of the translated `target` of temporal `kind` under the
+/// date `modifiers`: a time of day wrapped at midnight, or a date or
+/// timestamp under the year-1 guard.
+pub(crate) fn shifted_by_modifiers(
+    target: Expr,
+    kind: Option<TemporalKind>,
+    modifiers: &[Expr],
+) -> Expr {
+    if let Some(TemporalKind::Time { zoned }) = kind {
+        return shifted_time_of_day(target, modifiers, zoned);
+    }
+    from_year_one(shifted_datetime(target, modifiers))
+}
+
 /// The shifted form of `left` for the temporal kind it resolves to, refusing
 /// a zoned operand the emitted form would read three times, and a literal
 /// date or timestamp whose shifted year SQLite's date functions cannot hold.
-fn shifted_interval_target(
+pub(crate) fn shifted_interval_target(
     left: &Expr,
     (op, right): (&BinaryOperator, &Expr),
     shift: &IntervalShift,
@@ -2754,11 +2768,14 @@ fn shifted_interval_target(
         return Err(reject_duplicated_operand("a TIMETZ operand shifted by an interval", left));
     }
     let target = left.translate_with_warnings(schema, options, emit)?;
-    let modifiers = shift.modifiers();
-    if let Some(TemporalKind::Time { zoned }) = kind {
-        return Ok(shifted_time_of_day(target, &modifiers, zoned));
-    }
-    if let Some(literal) = single_quoted_literal(&target)
+    let is_time = matches!(kind, Some(TemporalKind::Time { .. }));
+    let modifiers: Vec<Expr> =
+        if is_time { shift.time_of_day_modifiers() } else { shift.modifiers() }
+            .iter()
+            .map(|modifier| string_literal(modifier))
+            .collect();
+    if !is_time
+        && let Some(literal) = single_quoted_literal(&target)
         && let Some(year) = shift.year_after(literal)
         && !(1..=9999).contains(&year)
     {
@@ -2767,7 +2784,7 @@ fn shifted_interval_target(
             year,
         ));
     }
-    Ok(from_year_one(shifted_datetime(target, &modifiers)))
+    Ok(shifted_by_modifiers(target, kind, &modifiers))
 }
 
 /// The display spelling of a comparison operator, in PostgreSQL's spelling.
@@ -2840,20 +2857,25 @@ fn interval_binary(
         // Concatenation and the remaining operators run on the stored text.
         return Ok(None);
     }
+    if matches!(op, BinaryOperator::Multiply | BinaryOperator::Divide) {
+        return crate::impls::interval::fields::scaled_binary(
+            op, left, right, schema, options, emit,
+        )
+        .map(Some);
+    }
     let left_shift = extract_interval_expr(left).is_some() || scalar_times_interval(left).is_some();
     let right_shift =
         extract_interval_expr(right).is_some() || scalar_times_interval(right).is_some();
     if (right_shift && !left_typed) || (left_shift && !right_typed) {
         // A shift literal beside a non-interval target keeps its existing
-        // translation.
-        return Ok(None);
+        // translation, unless PostgreSQL's unknown-literal rule resolves the
+        // target as an interval itself.
+        let other = if right_shift { left } else { right };
+        if !crate::impls::interval::fields::is_interval_literal(other, schema, options)? {
+            return Ok(None);
+        }
     }
-    Err(crate::errors::Error::forward_refusal(format!(
-        "{} {op} {} cannot be translated: the answer is an interval, and SQLite has no interval \
-         type to hold one. Apply the interval to a date or a timestamp in the application.",
-        keys::message_type_name_of(left, schema, options),
-        keys::message_type_name_of(right, schema, options)
-    )))
+    crate::impls::interval::fields::binary(op, left, right, schema, options, emit).map(Some)
 }
 
 /// Translate a binary operation expression.
@@ -2872,6 +2894,18 @@ fn translate_binary_op(
         return crate::impls::translator_impls::blob_operator::translate(
             &resolved, left, right, schema, options, emit,
         );
+    }
+    // Interval arithmetic answers before the NUMERIC rules, which would read
+    // a scaled factor beside an interval as minor units of a NUMERIC result.
+    if matches!(
+        op,
+        BinaryOperator::Plus
+            | BinaryOperator::Minus
+            | BinaryOperator::Multiply
+            | BinaryOperator::Divide
+    ) && let Some(resolved) = interval_binary(left, op, right, schema, options, emit)?
+    {
+        return Ok(resolved);
     }
     if numeric_rules_may_apply(op, left, right) {
         let scales = (scale_of(left, schema, options), scale_of(right, schema, options));
@@ -3549,10 +3583,6 @@ fn translate_binary_op(
         }
         _ => {}
     }
-
-    // Only the arithmetic refusal reaches this far; a comparison with an
-    // interval side answers through the call above.
-    interval_binary(left, op, right, schema, options, emit)?;
 
     // PG INTERVAL arithmetic: `target + INTERVAL 'N unit'` becomes
     // `datetime(target, '+M months', 'floor', '+D days', '+S seconds')`, and
@@ -4483,12 +4513,7 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                                 .to_string(),
                         ));
                     }
-                    return Err(crate::errors::Error::forward_refusal(
-                        "negating an interval cannot be translated: the answer is an interval, \
-                         and SQLite has no interval type to hold one. Negate it in the \
-                         application."
-                            .to_string(),
-                    ));
+                    return crate::impls::interval::fields::negated(expr, schema, options, emit);
                 }
                 rebuild(|| {
                     Ok(match op {
