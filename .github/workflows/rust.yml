@@ -218,8 +218,15 @@ jobs:
         run: |
           cargo check --lib
           cargo check --lib --no-default-features
+          cargo check --lib --no-default-features --features std
           cargo check --lib --features sqlitegis
           cargo check --lib --features arbitrary
+
+      - name: Check std leaves out libgit2
+        shell: bash
+        run: |
+          cargo tree --no-default-features --features std -e normal --prefix none --format '{p}' > std-deps.txt
+          ! grep -E '^(git2|libgit2-sys) ' std-deps.txt
 
   coverage:
     name: Code Coverage

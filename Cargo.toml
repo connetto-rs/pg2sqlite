@@ -42,6 +42,7 @@ rusqlite = { version = "0.40", features = ["bundled", "functions", "window"] }
 sqlite-vec = "0.1.9"
 zerocopy = "0.8.48"
 rand = "0.10.1"
+tempfile = "3.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 testcontainers = { version = "0.27", features = ["blocking"] }
 parking_lot = "0.13.0"
@@ -61,24 +62,19 @@ version = "0.38"
 optional = true
 
 [features]
-# Default feature: pulls in everything that depends on the host environment
-# (filesystem-backed loaders, git-backed loaders, std-bound error variants,
-# and the stack growth in sqlparser's parser and this crate's translator). Drop this with
-# `--no-default-features` to build for `wasm32-unknown-unknown` or other
-# no_std targets. The `[patch.crates-io]` block below tracks apache main,
-# which makes `sqlparser/visitor` no_std-compatible.
-default = ["std"]
+# Drop the defaults with `--no-default-features` to build for `wasm32-unknown-unknown` or other no_std targets.
+# The sqlparser patch below is what lets `sqlparser/visitor` build without std.
+default = ["std", "git"]
+# Filesystem loaders, std error variants, and stack growth in the parser and translator.
 std = [
     "sqlparser/std",
     "sqlparser/recursive-protection",
     "sql-traits/std",
     "dep:recursive",
     "thiserror/std",
-    "git",
 ]
-# Cloning a schema from a repository. Only reachable with `std`, which is why
-# `std` turns it on rather than the other way round.
-git = ["dep:git2", "dep:tempfile"]
+# `Pg2Sqlite::from_git`, kept out of `std` so dependents that never clone a schema skip libgit2.
+git = ["std", "dep:git2", "dep:tempfile"]
 # SQLiteGIS Diesel + native-SQLite spatial integration is native-only,
 # so it implies `std`.
 sqlitegis = [
