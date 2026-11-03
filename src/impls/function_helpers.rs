@@ -67,6 +67,13 @@ pub(crate) fn is_function_named(function: &sqlparser::ast::Function, name: &str)
 #[must_use]
 pub(crate) fn scalar_subquery_projection(expr: &Expr) -> Option<&Expr> {
     let Expr::Subquery(query) = expr else { return None };
+    query_projection(query)
+}
+
+/// The one expression `SELECT <expr>` projects, when the query reads nothing
+/// and answers exactly that.
+#[must_use]
+pub(crate) fn query_projection(query: &sqlparser::ast::Query) -> Option<&Expr> {
     if query.with.is_some() || query.order_by.is_some() || query.limit_clause.is_some() {
         return None;
     }

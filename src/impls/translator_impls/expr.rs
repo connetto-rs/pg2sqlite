@@ -73,6 +73,7 @@ use crate::{
                 translate_quantified_over_array,
             },
             data_type::{MAX_NUMERIC_PRECISION, exact_numeric_info, numeric_precision_and_scale},
+            definer_helper::helper_membership,
             function::cube_root_closed_form,
             helpers::Forward,
             vector::{UnstoredVector, is_vector_data_type},
@@ -1984,13 +1985,17 @@ fn translate_any_all_to_in(
     {
         return Ok(membership);
     }
-    if let Some(query) = membership_subquery(right, schema, options)? {
+    if let Some(membership) = membership_subquery(right, schema, options, emit)? {
         let translated_left = left.translate_with_warnings(schema, options, emit)?;
+        let query = match membership {
+            Membership::Helper(set) => set,
+            Membership::Subquery(query) => {
+                Box::new(query.translate_with_warnings(schema, options, emit)?)
+            }
+        };
         return Ok(Expr::In {
             expr: Box::new(translated_left),
-            target: InTarget::Subquery(Box::new(
-                query.translate_with_warnings(schema, options, emit)?,
-            )),
+            target: InTarget::Subquery(query),
             negated,
             global: false,
         });
@@ -2029,6 +2034,15 @@ fn translate_any_all_to_in(
     )
 }
 
+/// The rows `x = ANY(...)` and `x <> ALL(...)` compare `x` against.
+enum Membership<'e> {
+    /// The set a definer helper returns, already translated, see
+    /// [`helper_membership`].
+    Helper(Box<Query>),
+    /// A subquery still to be translated.
+    Subquery(&'e Query),
+}
+
 /// The subquery whose rows `x = ANY(...)` and `x <> ALL(...)` compare `x`
 /// against, either the operand itself or the one `ARRAY(<subquery>)` collects.
 ///
@@ -2037,22 +2051,35 @@ fn translate_any_all_to_in(
 /// multi-dimensional array, whose scalar elements `= ANY` compares instead, so
 /// the collected form translates only once the column is known not to be an
 /// array. An unresolved column type is refused for the same reason, since
-/// answering false where PostgreSQL answers true would go unnoticed.
+/// answering false where PostgreSQL answers true would go unnoticed. A definer
+/// helper returns `SETOF` a scalar, so its set is never an array.
 fn membership_subquery<'e>(
     right: &'e Expr,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
-) -> Result<Option<&'e Query>, crate::errors::Error> {
-    if let Expr::Subquery(query) = right {
-        return Ok(Some(query));
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Option<Membership<'e>>, crate::errors::Error> {
+    let (query, collected) = match right {
+        Expr::Subquery(query) => (query.as_ref(), false),
+        _ => {
+            match array_constructor_subquery(right) {
+                Some(query) => (query, true),
+                None => return Ok(None),
+            }
+        }
+    };
+    if let Some(set) = helper_membership(query, schema, options, emit)? {
+        return Ok(Some(Membership::Helper(Box::new(set))));
     }
-    let Some(query) = array_constructor_subquery(right) else { return Ok(None) };
+    if !collected {
+        return Ok(Some(Membership::Subquery(query)));
+    }
     let output = crate::impls::expression_type::query_output_type_name(query, schema, options)?;
     const UNNEST: &str = "unnest it in the subquery's FROM clause, \
                           `x = ANY (SELECT e FROM t, unnest(t.col) AS e)`";
     let (column, fix) = match output.as_deref() {
         Some(name) if !crate::impls::expression_type::is_array_type_name(name) => {
-            return Ok(Some(query));
+            return Ok(Some(Membership::Subquery(query)));
         }
         Some(name) => {
             (format!("is the array type {name}"), format!("To compare elements, {UNNEST}."))
@@ -4561,7 +4588,7 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                         .to_string(),
                 ));
             }
-            Expr::In { expr: operand, target: InTarget::Subquery(_), .. } => {
+            Expr::In { expr: operand, target: InTarget::Subquery(subquery), negated, global } => {
                 if crate::impls::expression_type::is_interval_typed(operand, schema, options) {
                     return Err(crate::errors::Error::forward_refusal(
                         "IN (subquery) over an interval cannot be translated: the comparison \
@@ -4571,7 +4598,17 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                             .to_string(),
                     ));
                 }
-                translate_expr_recursive::<Forward>(self, schema, options, emit)?
+                match helper_membership(subquery, schema, options, emit)? {
+                    Some(set) => {
+                        Expr::In {
+                            expr: Box::new(operand.translate_with_warnings(schema, options, emit)?),
+                            target: InTarget::Subquery(Box::new(set)),
+                            negated: *negated,
+                            global: *global,
+                        }
+                    }
+                    None => translate_expr_recursive::<Forward>(self, schema, options, emit)?,
+                }
             }
             Expr::In { target: InTarget::Table { .. }, .. } => {
                 return Err(crate::errors::Error::forward_refusal(

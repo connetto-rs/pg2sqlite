@@ -25,6 +25,7 @@ mod create_trigger;
 mod create_view;
 mod cte;
 pub(crate) mod data_type;
+mod definer_helper;
 pub(crate) mod delete;
 pub(crate) mod expr;
 pub(crate) mod function;
