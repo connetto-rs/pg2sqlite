@@ -11,12 +11,12 @@
 
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, format, string::ToString, vec, vec::Vec};
-use core::ops::ControlFlow;
+use core::{convert::Infallible, ops::ControlFlow};
 
 use sql_traits::{
     errors::HelperSetError,
     structs::{HelperArm, HelperSet, IdentifierCase, ParserDB},
-    traits::{ColumnLike, DatabaseLike, FunctionLike},
+    traits::{ColumnLike, DatabaseLike, FunctionLike, TableLike},
 };
 use sqlparser::ast::{
     BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
@@ -29,7 +29,6 @@ use crate::{
     impls::{
         function_helpers::{query_projection, simple_function_expr, string_literal},
         query_builder::{from_relation, make_query, plain_table_factor, single_expr_query},
-        translator_impls::rls::table_has_rls,
     },
     options::TranslationContext,
     traits::{TranslatorWithContext, schema::function_lookup_target},
@@ -62,9 +61,15 @@ pub(crate) fn helper_membership(
         return Ok(None);
     }
     let Some(target) = function_lookup_target(&call.name) else { return Ok(None) };
-    let Some(helper) = schema.resolve_target_function(target, IdentifierCase::AsWritten)? else {
-        return Ok(None);
-    };
+    // A builtin resolves too, registered in `pg_catalog`, and is no helper.
+    let declared =
+        schema.resolve_target_function(target, IdentifierCase::AsWritten)?.filter(|function| {
+            !function
+                .target_name()
+                .schema()
+                .is_some_and(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
+        });
+    let Some(helper) = declared else { return Ok(None) };
     let name = &call.name;
     let Some(deployment) = options.get_deployment() else {
         return Err(Error::forward_refusal(format!(
@@ -80,11 +85,11 @@ pub(crate) fn helper_membership(
                 "{name}() cannot be translated as the set it returns: {error}"
             ))
         })?;
+    let mut guarded = Vec::new();
+    guarded_tables(&set, schema, &mut guarded)?;
     let mut lowered = lowered_set(&set).translate_with_warnings(schema, options, emit)?;
-    let mut backing = BackingTables { schema, options };
-    if let ControlFlow::Break(error) = lowered.visit(&mut backing) {
-        return Err(error);
-    }
+    let ControlFlow::Continue(()) = lowered
+        .visit(&mut BackingTables { guarded: &guarded, suffix: options.get_rls_table_suffix() });
     Ok(Some(lowered))
 }
 
@@ -96,24 +101,43 @@ fn arguments(call: &Function) -> Result<Vec<Value>, HelperSetError> {
             argument: argument.to_string(),
         }
     };
-    match &call.args {
-        FunctionArguments::None => Ok(Vec::new()),
-        FunctionArguments::Subquery(query) => Err(unsupported(query)),
-        FunctionArguments::List(list) if !list.clauses.is_empty() => Err(unsupported(list)),
-        FunctionArguments::List(list) => {
-            list.args
-                .iter()
-                .map(|argument| {
-                    match argument {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(value))) => {
-                            Ok(value.value.clone())
-                        }
-                        other => Err(unsupported(other)),
-                    }
-                })
-                .collect()
+    let FunctionArguments::List(list) = &call.args else { return Err(unsupported(&call.args)) };
+    if !list.clauses.is_empty() {
+        return Err(unsupported(list));
+    }
+    list.args
+        .iter()
+        .map(|argument| {
+            match argument {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(value))) => {
+                    Ok(value.value.clone())
+                }
+                other => Err(unsupported(other)),
+            }
+        })
+        .collect()
+}
+
+/// The names of the tables with row-level security the arms of `set` read,
+/// its parent arms' sets included.
+fn guarded_tables<'db>(
+    set: &HelperSet<'db, ParserDB>,
+    schema: &ParserDB,
+    guarded: &mut Vec<&'db str>,
+) -> Result<(), Error> {
+    for arm in set.arms() {
+        let table = match arm {
+            HelperArm::Grant(grant) => grant.table(),
+            HelperArm::Parent(parent) => {
+                guarded_tables(parent.set(), schema, guarded)?;
+                parent.table()
+            }
+        };
+        if table.has_row_level_security(schema)? {
+            guarded.push(table.table_name());
         }
     }
+    Ok(())
 }
 
 /// The set as a PostgreSQL query over the tables the helper reads, written
@@ -143,14 +167,15 @@ fn lowered_set(set: &HelperSet<'_, ParserDB>) -> Query {
 fn lowered_arm(arm: &HelperArm<'_, ParserDB>) -> Query {
     match arm {
         HelperArm::Grant(grant) => {
-            let mut caller_arguments = vec![string_literal(grant.setting().name())];
-            if !grant.raises_when_unset() {
-                caller_arguments.push(Expr::Value(Value::Boolean(true).into()));
-            }
+            let caller = simple_function_expr(
+                "current_setting",
+                vec![string_literal(grant.setting().name())],
+                None,
+            );
             let mut condition = Expr::BinaryOp {
                 left: Box::new(column(grant.caller_column())),
                 op: BinaryOperator::Eq,
-                right: Box::new(simple_function_expr("current_setting", caller_arguments, None)),
+                right: Box::new(caller),
             };
             if let Some(restriction) = grant.restriction() {
                 condition = Expr::BinaryOp {
@@ -204,25 +229,22 @@ fn column(column: &<ParserDB as DatabaseLike>::Column) -> Expr {
 
 /// Points every relation of a lowered set at its table's backing table.
 ///
-/// Every relation in the query is one an arm reads, so each is renamed when
-/// its table has row-level security, the view carrying its name filtering
+/// Every relation in the query is one an arm reads, so each naming a table
+/// with row-level security is renamed, the view carrying its name filtering
 /// rows the helper's owner reads past.
 struct BackingTables<'a> {
-    schema: &'a ParserDB,
-    options: &'a TranslationContext<'a>,
+    guarded: &'a [&'a str],
+    suffix: &'a str,
 }
 
 impl VisitorMut for BackingTables<'_> {
-    type Break = Error;
+    type Break = Infallible;
 
     fn post_visit_relation(&mut self, relation: &mut ObjectName) -> ControlFlow<Self::Break> {
-        let Some(ObjectNamePart::Identifier(last)) = relation.0.last_mut() else {
-            return ControlFlow::Continue(());
-        };
-        match table_has_rls(&last.value, self.schema) {
-            Ok(true) => last.value.push_str(self.options.get_rls_table_suffix()),
-            Ok(false) => {}
-            Err(error) => return ControlFlow::Break(error.into()),
+        if let Some(ObjectNamePart::Identifier(last)) = relation.0.last_mut()
+            && self.guarded.contains(&last.value.as_str())
+        {
+            last.value.push_str(self.suffix);
         }
         ControlFlow::Continue(())
     }

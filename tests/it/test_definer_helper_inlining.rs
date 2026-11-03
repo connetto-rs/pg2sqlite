@@ -187,12 +187,13 @@ CREATE POLICY project_grants_delete ON project_grants FOR DELETE USING (
 
 ";
 
-/// One grant table, a helper over it in `public`, and a guarded table its
-/// policies compare against the helper's set.
+/// Two grant tables, one guarded and one not, helpers over them in `public`,
+/// and a guarded table its policies compare against the helpers' sets.
 const DOCS: &str = "
 CREATE ROLE helper_owner NOLOGIN BYPASSRLS;
 CREATE TABLE docs (id TEXT PRIMARY KEY);
 CREATE TABLE doc_grants (doc_id TEXT NOT NULL REFERENCES docs (id), principal_id TEXT NOT NULL, role TEXT NOT NULL);
+CREATE TABLE doc_members (doc_id TEXT NOT NULL REFERENCES docs (id), principal_id TEXT NOT NULL, \"group\" TEXT NOT NULL);
 CREATE FUNCTION docs_with(min_role TEXT) RETURNS SETOF TEXT
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
   SELECT doc_id FROM doc_grants
@@ -207,10 +208,15 @@ CREATE FUNCTION docs_as_invoker(min_role TEXT) RETURNS SETOF TEXT
 LANGUAGE sql STABLE SET search_path = public AS $$
   SELECT doc_id FROM doc_grants WHERE principal_id = current_setting('app.user_id', true)
 $$;
+CREATE FUNCTION docs_in_group(wanted TEXT) RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+  SELECT doc_id FROM doc_members WHERE principal_id = current_setting('app.user_id') AND \"group\" = wanted
+$$;
 ALTER FUNCTION docs_with(TEXT) OWNER TO helper_owner;
 ALTER FUNCTION docs_administered(TEXT) OWNER TO helper_owner;
 ALTER FUNCTION docs_as_invoker(TEXT) OWNER TO helper_owner;
-GRANT SELECT ON doc_grants TO helper_owner;
+ALTER FUNCTION docs_in_group(TEXT) OWNER TO helper_owner;
+GRANT SELECT ON doc_grants, doc_members TO helper_owner;
 ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE doc_grants ENABLE ROW LEVEL SECURITY;
 ";
@@ -330,9 +336,33 @@ fn a_helper_that_helper_set_refuses_is_refused_with_its_error() {
             && error.contains("is not SECURITY DEFINER"),
         "{error}"
     );
-    let error = refusal(&read_policy("id IN (SELECT docs_with(min_role => 'write'))"), &options())
-        .to_string();
-    assert!(error.contains("not a comparable literal"), "{error}");
+    for call in ["docs_with(min_role => 'write')", "docs_with('write' ORDER BY 1)"] {
+        let error =
+            refusal(&read_policy(&format!("id IN (SELECT {call})")), &options()).to_string();
+        assert!(error.contains("not a comparable literal"), "{call}: {error}");
+    }
+}
+
+/// A helper reading a table without row-level security reads the table
+/// itself, and a column named like a keyword keeps its quotes.
+#[test]
+fn a_helper_reading_an_unguarded_table_reads_it_directly() {
+    let script = translated(&read_policy("id IN (SELECT docs_in_group('staff'))"), &options());
+    assert_eq!(
+        statement(&script, "docs"),
+        "CREATE VIEW docs AS SELECT id FROM docs_rls WHERE (id IN (SELECT doc_id FROM doc_members \
+         WHERE principal_id = app_user() AND \"group\" IN ('staff')))"
+    );
+}
+
+/// A call to a function the schema does not declare is no helper call.
+#[test]
+fn a_call_the_schema_does_not_declare_keeps_its_translation() {
+    let script = translated(&read_policy("id IN (SELECT lower('W'))"), &options());
+    assert_eq!(
+        statement(&script, "docs"),
+        "CREATE VIEW docs AS SELECT id FROM docs_rls WHERE (id IN (SELECT lower('W')))"
+    );
 }
 
 #[test]
