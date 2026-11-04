@@ -6,7 +6,7 @@
 //!
 //! Measured on SQLite 3.51.1: `group_concat(s, ',' ORDER BY id)` gives the same
 //! `a,b,c,a`, since ordering inside an aggregate arrived in 3.44.0 and the
-//! declared floor is 3.46.0. But `group_concat(DISTINCT s, ',')` is
+//! declared floor is 3.47.0. But `group_concat(DISTINCT s, ',')` is
 //! `DISTINCT aggregates must have exactly one argument` in every version, so
 //! the separator has to go, and the one it uses when it does is a comma.
 
@@ -29,7 +29,7 @@ fn evaluate(expression: &str) -> Option<String> {
 }
 
 /// Ordering inside the aggregate is the whole point of this spelling, and it
-/// is what the 3.46.0 floor buys.
+/// is what the 3.47.0 floor buys.
 #[test]
 fn an_ordered_aggregate_keeps_its_order() {
     assert_eq!(evaluate("string_agg(s, ',' ORDER BY id)"), Some("a,b,c,a".to_string()));

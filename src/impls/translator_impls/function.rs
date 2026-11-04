@@ -1730,7 +1730,7 @@ impl crate::traits::translator::TranslatorWithContext for Function {
         }
 
         // SQLite 3.25 added native FILTER (WHERE ...) for aggregates; our floor
-        // is 3.46, so CASE lowering is never needed. Translate the filter
+        // is 3.47, so CASE lowering is never needed. Translate the filter
         // expression now so every arm can keep it natively.
         let translated_filter = self
             .filter
@@ -2579,7 +2579,7 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                 // Same NULLIF wrapper as JsonAgg, but without the json()
                 // wrapping since array_agg accumulates regular
                 // scalar values, not JSON documents. The filter
-                // is kept natively (3.46 floor).
+                // is kept natively (3.47 floor).
                 array::refuse_blob_element(
                     extract_exactly(&func.args, 1, "array_agg")?[0],
                     schema,

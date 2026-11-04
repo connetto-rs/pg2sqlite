@@ -6,8 +6,8 @@
 //! day-of-month the target month lacks. SQLite applies one modifier per unit
 //! left to right and rolls an overflowed day forward, so the counts are
 //! emitted in PostgreSQL's order as `'+M months', 'floor', '+D days', '+S
-//! seconds'`, where `floor` is SQLite's month-end clamp (3.46.0, the declared
-//! floor).
+//! seconds'`, where `floor` is SQLite's month-end clamp (3.46.0, below the
+//! declared 3.47.0 floor).
 
 pub(crate) mod ddl;
 mod decode;

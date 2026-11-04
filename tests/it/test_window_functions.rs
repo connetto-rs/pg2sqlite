@@ -3,7 +3,7 @@
 //! Window functions in PostgreSQL (ROW_NUMBER, RANK, LAG, LEAD, etc.) are
 //! supported in SQLite 3.25+ with identical syntax, so most translations
 //! are pass-through. FILTER (WHERE ...) is also pass-through: SQLite 3.25
-//! added native aggregate FILTER support and 3.46 is the floor.
+//! added native aggregate FILTER support and 3.47 is the floor.
 //! IGNORE NULLS / RESPECT NULLS null treatment is refused because neither
 //! engine accepts it.
 
@@ -426,7 +426,7 @@ fn test_range_between_frame() {
 #[test]
 fn test_filter_clause_to_case() {
     // Stale-pin update: transform_filter_to_case was removed (R2-7). SQLite
-    // 3.25 added native FILTER (WHERE ...) support; 3.46 is our floor so the
+    // 3.25 added native FILTER (WHERE ...) support; 3.47 is our floor so the
     // translator passes the clause through unchanged.
     let sql = "
         CREATE TABLE data (
@@ -517,7 +517,7 @@ fn test_filter_clause_aggregate_to_case() {
     assert_eq!(click_count, 2, "FILTER must count only click events: {click_count}");
 }
 
-/// Semantic test: FILTER clause passes through natively (SQLite 3.46 floor).
+/// Semantic test: FILTER clause passes through natively (SQLite 3.47 floor).
 #[test]
 fn test_filter_clause_semantic() -> Result<(), Box<dyn std::error::Error>> {
     let sql = "

@@ -2,7 +2,7 @@
 //! dropped.
 //!
 //! SQLite has supported `ADD COLUMN` since 3.1.1 and `DROP COLUMN` since
-//! 3.35.0, both below the declared 3.46.0 floor. The translator used to discard
+//! 3.35.0, both below the declared 3.47.0 floor. The translator used to discard
 //! every `ALTER TABLE` operation except the two RENAME forms, so a migration
 //! adding a column produced no output at all: no error, no warning, and a
 //! SQLite schema silently missing the column. For a crate whose entry point is

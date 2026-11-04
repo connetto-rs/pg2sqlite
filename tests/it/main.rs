@@ -180,6 +180,7 @@ mod test_query_clause_gaps;
 mod test_query_shape;
 mod test_quote_literal;
 mod test_quoted_column_lookup;
+mod test_raise_format_arguments;
 mod test_readonly_nonrls_deny_triggers;
 mod test_recursive_view;
 mod test_rename_table;

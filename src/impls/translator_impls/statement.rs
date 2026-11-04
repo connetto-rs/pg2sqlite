@@ -731,7 +731,7 @@ fn reject_untranslatable_alter_table_clauses(
 /// Translates a single `ALTER TABLE` operation.
 ///
 /// SQLite supports `RENAME TO`, `RENAME COLUMN`, `ADD COLUMN` (since 3.1.1),
-/// and `DROP COLUMN` (since 3.35.0), all at or below the declared 3.46.0 floor.
+/// and `DROP COLUMN` (since 3.35.0), all below the declared 3.47.0 floor.
 ///
 /// `Ok(None)` means the operation is consumed elsewhere in the pipeline and
 /// correctly contributes no `ALTER TABLE` of its own. Anything with no SQLite

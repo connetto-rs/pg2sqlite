@@ -15,7 +15,7 @@
 # Usage: scripts/check_sqlite_floor.sh
 set -euo pipefail
 
-FLOOR=3460000        # 3.46.0
+FLOOR=3470000        # 3.47.0
 RECENT=3500200       # 3.50.2
 FLOOR_URL="https://sqlite.org/2024/sqlite-amalgamation-${FLOOR}.zip"
 RECENT_URL="https://sqlite.org/2025/sqlite-amalgamation-${RECENT}.zip"

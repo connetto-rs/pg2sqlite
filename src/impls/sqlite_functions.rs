@@ -23,7 +23,7 @@
 /// Core scalar, aggregate, window, date, and JSON functions, sorted.
 ///
 /// JSON is here unconditionally because SQLite builds it in by default from
-/// 3.38.0, below the 3.46.0 floor.
+/// 3.38.0, below the 3.47.0 floor.
 const SQLITE_BUILTINS: &[&str] = &[
     "abs",
     "changes",
