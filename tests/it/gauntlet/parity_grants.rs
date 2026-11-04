@@ -351,6 +351,8 @@ impl SqliteRunner {
     }
 }
 
+/// `postgres` runs the fixtures on the PostgreSQL side, so it owns every table
+/// and view, and the fixture's `_unfiltered` views read past the policies.
 fn options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
@@ -360,10 +362,13 @@ fn options() -> Pg2SqliteOptions {
             "app.user_id",
             "current_app_user",
         ))
+        .with_schema_owner_role("postgres")
 }
 
 fn sqlite_runner() -> SqliteRunner {
     let translated = Pg2Sqlite::default()
+        .sql("CREATE ROLE postgres;")
+        .expect("parse the schema owner")
         .sql(GROUPS)
         .expect("parse the groups fixture")
         .sql(GRANTS)

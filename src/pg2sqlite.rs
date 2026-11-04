@@ -375,17 +375,22 @@ impl Pg2Sqlite {
         Ok(())
     }
 
-    /// Starts incremental schema ingestion with external grants allowed.
-    fn translation_ingestor() -> ParserDBIngestor {
-        ParseOptions::default()
-            .with_access_resolution(AccessResolution::OpenWorld)
-            .ingestor::<GenericDialect>("translation_db".to_owned())
+    /// Starts incremental schema ingestion with external grants allowed, run
+    /// as `session_role` when one is named, which then owns what the input
+    /// creates.
+    fn translation_ingestor(session_role: Option<&str>) -> ParserDBIngestor {
+        let options = ParseOptions::default().with_access_resolution(AccessResolution::OpenWorld);
+        let options = match session_role {
+            Some(role) => options.with_session_role(role),
+            None => options,
+        };
+        options.ingestor::<GenericDialect>("translation_db".to_owned())
     }
 
     fn build_translation_schema(
         statements: Vec<Statement>,
     ) -> Result<ParserDB, crate::errors::Error> {
-        let mut input = Self::translation_ingestor();
+        let mut input = Self::translation_ingestor(None);
         for statement in statements {
             input = input.apply_statement(statement)?;
         }
@@ -668,8 +673,10 @@ impl Pg2Sqlite {
         };
         let complete = initial_schema.is_some();
         let initial_namespace = initial_schema.cloned();
-        let mut input = initial_schema
-            .map_or_else(Self::translation_ingestor, |schema| schema.clone().into_ingestor());
+        let mut input = initial_schema.map_or_else(
+            || Self::translation_ingestor(options.get_schema_owner_role()),
+            |schema| schema.clone().into_ingestor(),
+        );
         let mut epochs = Vec::new();
         let mut sources = Cow::Borrowed(statements.as_slice());
         let mut start = 0;

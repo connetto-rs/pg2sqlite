@@ -84,6 +84,8 @@ pub struct Pg2SqliteOptions {
     readonly_deny_trigger_suffix: String,
     /// The role name to use when filtering policies.
     session_user_role: Option<String>,
+    /// The role the schema's statements run as, owning what they create.
+    schema_owner_role: Option<String>,
     /// Mappings from PostgreSQL session variable patterns to SQLite functions.
     session_variables: Vec<SessionVariableMapping>,
     /// The name of the audit table for RLS validation monitoring.
@@ -124,6 +126,7 @@ impl<'a> arbitrary::Arbitrary<'a> for Pg2SqliteOptions {
             rls_table_suffix: String::arbitrary(u)?,
             readonly_deny_trigger_suffix: String::arbitrary(u)?,
             session_user_role: Option::<String>::arbitrary(u)?,
+            schema_owner_role: Option::<String>::arbitrary(u)?,
             session_variables: Vec::<SessionVariableMapping>::arbitrary(u)?,
             rls_audit_table_name: Option::<String>::arbitrary(u)?,
             write_exemption_function: Option::<String>::arbitrary(u)?,
@@ -150,6 +153,7 @@ impl Default for Pg2SqliteOptions {
             rls_table_suffix: "_rls".to_string(),
             readonly_deny_trigger_suffix: "__readonly".to_string(),
             session_user_role: None,
+            schema_owner_role: None,
             session_variables: Vec::new(),
             rls_audit_table_name: None,
             write_exemption_function: None,
@@ -771,6 +775,24 @@ impl Pg2SqliteOptions {
     /// Returns the role used to filter grants and policies.
     pub fn get_session_user_role(&self) -> Option<&str> {
         self.session_user_role.as_deref()
+    }
+
+    #[must_use]
+    /// Names the role the schema's statements run as, as a migration runs as
+    /// one role no statement names. That role owns every table and view
+    /// created before a `SET ROLE` moves away from it, so row-level security
+    /// exempts it from those tables' policies and reads a plain view as it,
+    /// and an `ALTER DEFAULT PRIVILEGES` without `FOR ROLE` gives its defaults
+    /// to what it creates afterwards.
+    pub fn with_schema_owner_role(mut self, role: impl Into<String>) -> Self {
+        self.schema_owner_role = Some(role.into());
+        self
+    }
+
+    #[must_use]
+    /// Returns the role that ran the schema, if one is named.
+    pub fn get_schema_owner_role(&self) -> Option<&str> {
+        self.schema_owner_role.as_deref()
     }
 
     #[must_use]

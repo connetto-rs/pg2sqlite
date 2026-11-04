@@ -51,7 +51,11 @@ struct Document {
 
 #[test]
 fn test_rls_select_policy_filters_rows() -> Result<(), Box<dyn std::error::Error>> {
-    let sql = include_str!("../fixtures/rls_basic.sql");
+    let sql = concat!(
+        "CREATE ROLE authenticated;\n",
+        include_str!("../fixtures/rls_basic.sql"),
+        "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
+    );
 
     // Configure translation with RLS options
     let options = Pg2SqliteOptions::default()
@@ -136,7 +140,11 @@ fn test_rls_select_policy_filters_rows() -> Result<(), Box<dyn std::error::Error
 
 #[test]
 fn test_rls_insert_policy_enforces_owner() -> Result<(), Box<dyn std::error::Error>> {
-    let sql = include_str!("../fixtures/rls_basic.sql");
+    let sql = concat!(
+        "CREATE ROLE authenticated;\n",
+        include_str!("../fixtures/rls_basic.sql"),
+        "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
+    );
 
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
@@ -193,7 +201,11 @@ fn test_rls_insert_policy_enforces_owner() -> Result<(), Box<dyn std::error::Err
 
 #[test]
 fn test_rls_update_policy_restricts_updates() -> Result<(), Box<dyn std::error::Error>> {
-    let sql = include_str!("../fixtures/rls_basic.sql");
+    let sql = concat!(
+        "CREATE ROLE authenticated;\n",
+        include_str!("../fixtures/rls_basic.sql"),
+        "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
+    );
 
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
@@ -281,7 +293,11 @@ fn test_rls_update_policy_restricts_updates() -> Result<(), Box<dyn std::error::
 
 #[test]
 fn test_rls_delete_policy_restricts_deletes() -> Result<(), Box<dyn std::error::Error>> {
-    let sql = include_str!("../fixtures/rls_basic.sql");
+    let sql = concat!(
+        "CREATE ROLE authenticated;\n",
+        include_str!("../fixtures/rls_basic.sql"),
+        "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
+    );
 
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
@@ -372,7 +388,11 @@ fn test_rls_delete_policy_restricts_deletes() -> Result<(), Box<dyn std::error::
 #[test]
 #[allow(clippy::too_many_lines)]
 fn test_rls_all_policy_works_like_individual_policies() -> Result<(), Box<dyn std::error::Error>> {
-    let sql = include_str!("../fixtures/rls_all_policy.sql");
+    let sql = concat!(
+        "CREATE ROLE authenticated;\n",
+        include_str!("../fixtures/rls_all_policy.sql"),
+        "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
+    );
 
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)

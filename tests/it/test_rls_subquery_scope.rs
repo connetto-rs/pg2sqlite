@@ -398,8 +398,8 @@ fn mutual_unaliased_read_policies_refused_at_translation() {
     let err = result.expect_err("mutual-reference cycle must be refused at translation");
     let msg = err.to_string();
     assert!(
-        msg.contains("on a") && msg.contains("on b"),
-        "error message must name both tables; got: {msg}"
+        msg.contains(r#"infinite recursion detected in policy for relation "a""#),
+        "the refusal names the relation PostgreSQL names; got: {msg}"
     );
 }
 
@@ -428,8 +428,35 @@ fn a_mutual_cycle_through_a_function_argument_is_refused_at_translation() {
         .expect_err("a cycle through a function argument must be refused at translation");
     let msg = err.to_string();
     assert!(
-        msg.contains("on a") && msg.contains("on b"),
-        "error message must name both tables; got: {msg}"
+        msg.contains(r#"infinite recursion detected in policy for relation "a""#),
+        "the refusal names the relation PostgreSQL names; got: {msg}"
+    );
+}
+
+/// The same cycle with each half inside `= ANY (ARRAY(subquery))`, which
+/// PostgreSQL 18.6 also answers with `infinite recursion detected in policy
+/// for relation "a"`.
+#[test]
+fn a_mutual_cycle_through_array_subqueries_is_refused_at_translation() {
+    const SQL: &str = r#"
+        CREATE TABLE a (id INTEGER PRIMARY KEY);
+        ALTER TABLE a ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY a_p ON a FOR SELECT USING (id = ANY (ARRAY(SELECT id FROM b)));
+
+        CREATE TABLE b (id INTEGER PRIMARY KEY);
+        ALTER TABLE b ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY b_p ON b FOR SELECT USING (id = ANY (ARRAY(SELECT id FROM a)));
+    "#;
+
+    let err = Pg2Sqlite::default()
+        .sql(SQL)
+        .expect("parse")
+        .translate(&base_opts())
+        .expect_err("a cycle through ARRAY subqueries must be refused at translation");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(r#"infinite recursion detected in policy for relation "a""#),
+        "the refusal names the relation PostgreSQL names; got: {msg}"
     );
 }
 

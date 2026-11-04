@@ -70,7 +70,11 @@ struct Project {
 
 fn translate_and_setup()
 -> Result<(diesel::SqliteConnection, Pg2SqliteOptions), Box<dyn std::error::Error>> {
-    let sql = include_str!("../fixtures/rls_tenant_isolation.sql");
+    let sql = concat!(
+        "CREATE ROLE authenticated;\n",
+        include_str!("../fixtures/rls_tenant_isolation.sql"),
+        "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
+    );
 
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
@@ -96,7 +100,11 @@ fn translate_and_setup()
 
 #[test]
 fn test_tenant_isolation_translation_snapshot() -> Result<(), Box<dyn std::error::Error>> {
-    let sql = include_str!("../fixtures/rls_tenant_isolation.sql");
+    let sql = concat!(
+        "CREATE ROLE authenticated;\n",
+        include_str!("../fixtures/rls_tenant_isolation.sql"),
+        "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
+    );
 
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)

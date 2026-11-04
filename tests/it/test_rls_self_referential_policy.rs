@@ -116,6 +116,18 @@ fn a_self_reference_inside_a_derived_table_is_refused() {
     assert!(error.contains("infinite recursion"), "{error}");
 }
 
+/// A reference inside `= ANY (ARRAY(subquery))`, which PostgreSQL 18.6
+/// answers with `infinite recursion detected in policy for relation "oo"`.
+#[test]
+fn a_self_reference_inside_an_array_subquery_is_refused() {
+    let error = refusal(&format!(
+        "{TABLE}
+         CREATE POLICY p ON oo FOR SELECT USING (
+             id = ANY (ARRAY(SELECT id FROM oo WHERE kind = 1)));"
+    ));
+    assert!(error.contains("infinite recursion"), "{error}");
+}
+
 /// A policy with no `FOR` clause covers every command including the read, and
 /// PostgreSQL was measured to recurse on it, so it is refused too.
 #[test]
@@ -181,13 +193,17 @@ fn referencing_the_guarded_columns_is_not_a_self_reference() {
 // F31: a view over an RLS table reads the backing table
 // ---------------------------------------------------------------------------
 
-/// The legitimate way to write the refused policy, and the reason F31 had to
-/// land first: the view bypasses the policy, so the policy may consult it.
+/// The legitimate way to write the refused policy: the view reads as its
+/// owner, who owns the table and so bypasses the policy, so the policy may
+/// consult it.
 #[test]
 fn a_policy_may_consult_a_view_over_its_own_table() {
     let pg = format!(
-        "{TABLE}
+        "CREATE ROLE migrator;
+         {TABLE}
+         ALTER TABLE oo OWNER TO migrator;
          CREATE VIEW oo_all AS SELECT id, owner_id FROM oo;
+         ALTER VIEW oo_all OWNER TO migrator;
          CREATE POLICY p ON oo FOR SELECT USING (
              EXISTS (SELECT 1 FROM oo_all a WHERE a.id = oo.id AND a.owner_id > 0));"
     );
@@ -198,6 +214,116 @@ fn a_policy_may_consult_a_view_over_its_own_table() {
         emitted.contains("CREATE VIEW oo_all AS SELECT id, owner_id FROM oo_rls"),
         "the view must read the backing table, not the policy view: {emitted}"
     );
+}
+
+/// A view owned by a role the table's policies bind reads through them, so
+/// the policy consulting it loops back into itself, as PostgreSQL answers
+/// `infinite recursion detected in policy for relation "oo"`.
+#[test]
+fn a_policy_consulting_a_view_its_owner_cannot_bypass_is_refused() {
+    let error = Pg2Sqlite::default()
+        .sql(&format!(
+            "CREATE ROLE migrator;
+             CREATE ROLE reader;
+             {TABLE}
+             ALTER TABLE oo OWNER TO migrator;
+             CREATE VIEW oo_all AS SELECT id, owner_id FROM oo;
+             ALTER VIEW oo_all OWNER TO reader;
+             CREATE POLICY p ON oo FOR SELECT USING (
+                 EXISTS (SELECT 1 FROM oo_all a WHERE a.id = oo.id AND a.owner_id > 0));"
+        ))
+        .expect("parse")
+        .translate_to_sql(&options())
+        .expect_err("the view reads oo through p again");
+    assert!(
+        error.to_string().contains(r#"infinite recursion detected in policy for relation "oo""#),
+        "{error}"
+    );
+}
+
+/// A plain view reads as its owner, so a view over a table with row-level
+/// security whose owner nothing names cannot be translated.
+#[test]
+fn a_view_whose_owner_nothing_names_is_refused() {
+    let error = Pg2Sqlite::default()
+        .sql(&format!("{TABLE} CREATE VIEW oo_all AS SELECT id, owner_id FROM oo;"))
+        .expect("parse")
+        .translate_to_sql(&options())
+        .expect_err("the view's owner is unknown");
+    assert!(error.to_string().contains("with_schema_owner_role"), "{error}");
+}
+
+/// The schema owner owns every table and view whose owner the schema never
+/// names, so its views read past the policies.
+#[test]
+fn a_view_owned_by_the_schema_owner_reads_the_backing_table() {
+    let emitted = Pg2Sqlite::default()
+        .sql(&format!(
+            "CREATE ROLE migrator; {TABLE} CREATE VIEW oo_all AS SELECT id, owner_id FROM oo;"
+        ))
+        .expect("parse")
+        .translate_to_sql(&options().with_schema_owner_role("migrator"))
+        .expect("the schema owner owns oo")
+        .into_vec()
+        .join("\n");
+    assert!(emitted.contains("CREATE VIEW oo_all AS SELECT id, owner_id FROM oo_rls"), "{emitted}");
+}
+
+/// A schema-qualified view finds the owner its `ALTER VIEW` names, so a view
+/// in another schema owned by the table's owner reads the backing table.
+#[test]
+fn a_qualified_view_reads_as_the_owner_its_alter_view_names() {
+    let emitted = translate(&format!(
+        "CREATE ROLE migrator;
+         CREATE SCHEMA app;
+         {TABLE}
+         ALTER TABLE oo OWNER TO migrator;
+         CREATE VIEW app.oo_all AS SELECT id, owner_id FROM oo;
+         ALTER VIEW app.oo_all OWNER TO migrator;"
+    ))
+    .join("\n");
+    assert!(emitted.contains("AS SELECT id, owner_id FROM oo_rls"), "{emitted}");
+}
+
+/// A view owned by a role the table's policies bind would show that role's
+/// rows, which no SQLite view can, so it is refused.
+#[test]
+fn a_view_whose_owner_the_policies_bind_is_refused() {
+    let error = Pg2Sqlite::default()
+        .sql(&format!(
+            "CREATE ROLE migrator;
+             CREATE ROLE reader;
+             {TABLE}
+             CREATE POLICY p ON oo FOR SELECT USING (owner_id > 0);
+             CREATE VIEW oo_all AS SELECT id, owner_id FROM oo;
+             ALTER VIEW oo_all OWNER TO reader;"
+        ))
+        .expect("parse")
+        .translate_to_sql(&options().with_schema_owner_role("migrator"))
+        .expect_err("reader does not own oo");
+    assert!(error.to_string().contains("as its owner 'reader'"), "{error}");
+}
+
+/// The view's owner meets the table's policies like any role, so a `TO` entry
+/// that cannot be settled for it refuses the view, here `CURRENT_USER`, which
+/// names whoever ran `CREATE POLICY`. The session role owns the table, so only
+/// the view reaches the policy.
+#[test]
+fn a_view_owner_meeting_an_unsettled_policy_role_is_refused() {
+    let error = Pg2Sqlite::default()
+        .sql(&format!(
+            "CREATE ROLE app_user;
+             CREATE ROLE reader;
+             {TABLE}
+             ALTER TABLE oo OWNER TO app_user;
+             CREATE POLICY p ON oo FOR SELECT TO CURRENT_USER USING (owner_id > 0);
+             CREATE VIEW oo_all AS SELECT id, owner_id FROM oo;
+             ALTER VIEW oo_all OWNER TO reader;"
+        ))
+        .expect("parse")
+        .translate_to_sql(&options().with_session_user_role("app_user"))
+        .expect_err("CURRENT_USER cannot be settled for reader");
+    assert!(error.to_string().contains("CURRENT_USER"), "{error}");
 }
 
 /// A view declared `security_invoker` keeps the caller's rights, so it reads

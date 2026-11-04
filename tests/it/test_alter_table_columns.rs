@@ -418,11 +418,13 @@ fn alter_on_a_protected_table_lands_on_the_backing_table() -> Result<(), Box<dyn
         ));
     let translated = Pg2Sqlite::default()
         .sql(
-            "CREATE TABLE docs (id INT PRIMARY KEY, owner TEXT, gone TEXT);
+            "CREATE ROLE authenticated;
+             CREATE TABLE docs (id INT PRIMARY KEY, owner TEXT, gone TEXT);
              ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
              CREATE POLICY p ON docs TO authenticated USING (true) WITH CHECK (true);
              ALTER TABLE docs ADD COLUMN extra TEXT;
-             ALTER TABLE docs DROP COLUMN gone;",
+             ALTER TABLE docs DROP COLUMN gone;
+             GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
         )?
         .translate(&options)?
         .into_vec();

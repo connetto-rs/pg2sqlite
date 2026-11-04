@@ -26,7 +26,11 @@ fn make_options_with_suffix(suffix: &str) -> Pg2SqliteOptions {
 /// original table name.
 #[test]
 fn test_custom_suffix_renames_backing_table() {
-    let sql = include_str!("../fixtures/rls_basic.sql");
+    let sql = concat!(
+        "CREATE ROLE authenticated;\n",
+        include_str!("../fixtures/rls_basic.sql"),
+        "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
+    );
     let options = make_options_with_suffix("_secure");
 
     let translated = Pg2Sqlite::default().sql(sql).unwrap().translate(&options).unwrap().into_vec();
@@ -57,7 +61,11 @@ fn test_custom_suffix_renames_backing_table() {
 /// future regression is immediately visible.
 #[test]
 fn test_custom_suffix_snapshot() {
-    let sql = include_str!("../fixtures/rls_basic.sql");
+    let sql = concat!(
+        "CREATE ROLE authenticated;\n",
+        include_str!("../fixtures/rls_basic.sql"),
+        "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
+    );
     let options = make_options_with_suffix("_secure");
 
     let translated = Pg2Sqlite::default().sql(sql).unwrap().translate(&options).unwrap().into_vec();
@@ -70,7 +78,11 @@ fn test_custom_suffix_snapshot() {
 /// custom suffix, not the default `_rls`.
 #[test]
 fn test_custom_suffix_in_foreign_keys() {
-    let sql = include_str!("../fixtures/rls_fk_simple.sql");
+    let sql = concat!(
+        "CREATE ROLE authenticated;\n",
+        include_str!("../fixtures/rls_fk_simple.sql"),
+        "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
+    );
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")

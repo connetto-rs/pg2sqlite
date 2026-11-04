@@ -574,6 +574,7 @@ fn generated_column_stored() {
 fn table_fk_to_rls_table() {
     use pg2sqlite::prelude::SessionVariableMapping;
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE users (
             id INT PRIMARY KEY,
             owner_id INT NOT NULL
@@ -593,6 +594,7 @@ fn table_fk_to_rls_table() {
             user_id INT,
             FOREIGN KEY (user_id) REFERENCES users(id)
         );
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let options = Pg2SqliteOptions::default()
         .with_session_user_role("authenticated".to_string())
@@ -620,6 +622,7 @@ fn table_fk_to_rls_table() {
 fn column_fk_to_rls_table() {
     use pg2sqlite::prelude::SessionVariableMapping;
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE users (
             id INT PRIMARY KEY,
             owner_id INT NOT NULL
@@ -638,6 +641,7 @@ fn column_fk_to_rls_table() {
             id INT PRIMARY KEY,
             user_id INT REFERENCES users(id)
         );
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let options = Pg2SqliteOptions::default()
         .with_session_user_role("authenticated".to_string())
@@ -736,6 +740,7 @@ fn materialized_view_error() {
 fn delete_using_with_rls_table_join() {
     use pg2sqlite::prelude::SessionVariableMapping;
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE orders (
             id INT PRIMARY KEY,
             user_id INT,
@@ -756,6 +761,7 @@ fn delete_using_with_rls_table_join() {
         CREATE POLICY del ON users FOR DELETE TO authenticated
             USING (owner_id = CAST(current_setting('app.user_id') AS INT));
         DELETE FROM orders USING users WHERE orders.user_id = users.id AND users.owner_id = 1;
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let options = Pg2SqliteOptions::default()
         .with_session_user_role("authenticated".to_string())
@@ -918,6 +924,7 @@ fn or_replace_trigger() {
 fn before_trigger_on_rls_table() {
     use pg2sqlite::prelude::SessionVariableMapping;
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE items (id INT PRIMARY KEY, name TEXT, owner_id INT NOT NULL);
         ALTER TABLE items ENABLE ROW LEVEL SECURITY;
         CREATE POLICY sel ON items FOR SELECT TO authenticated
@@ -940,6 +947,7 @@ fn before_trigger_on_rls_table() {
             BEFORE UPDATE ON items
             FOR EACH ROW
             EXECUTE FUNCTION update_name();
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let options = Pg2SqliteOptions::default()
         .with_session_user_role("authenticated".to_string())

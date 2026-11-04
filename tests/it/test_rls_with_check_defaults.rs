@@ -174,12 +174,13 @@ fn update_staying_inside_the_predicate_succeeds() -> Result<(), Box<dyn std::err
 }
 
 /// An explicit `WITH CHECK` replaces `USING` for the new row rather than being
-/// combined with it, so a check laxer than the USING clause is honoured.
+/// combined with it, so a check laxer than the USING clause is honoured. The
+/// `SELECT` policy admits every row, so reading the updated row back passes.
 #[test]
 fn explicit_with_check_replaces_using_for_the_new_row() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = setup(
         "
-        CREATE POLICY sel ON docs FOR SELECT USING (is_public = 1);
+        CREATE POLICY sel ON docs FOR SELECT USING (true);
         CREATE POLICY upd ON docs FOR UPDATE USING (is_public = 1) WITH CHECK (true);
     ",
     )?;
@@ -218,11 +219,13 @@ fn explicit_with_check_stricter_than_using_is_enforced() -> Result<(), Box<dyn s
     Ok(())
 }
 
-/// A `FOR SELECT` policy carries no write semantics, so its `USING` must not
-/// leak into the UPDATE trigger's check on the new row. Only the UPDATE
-/// policy's predicate governs the write.
+/// An UPDATE whose `WHERE` reads a column checks the updated row against the
+/// `SELECT` policies too, so moving the row out of them raises even though the
+/// UPDATE policy admits it. Measured on PostgreSQL 18.6 as
+/// `new row violates row-level security policy`.
 #[test]
-fn select_policy_using_does_not_constrain_updates() -> Result<(), Box<dyn std::error::Error>> {
+fn an_update_moving_a_row_out_of_the_select_policies_is_refused()
+-> Result<(), Box<dyn std::error::Error>> {
     let mut conn = setup(
         "
         CREATE POLICY sel ON docs FOR SELECT USING (body <> 'hidden');
@@ -230,13 +233,29 @@ fn select_policy_using_does_not_constrain_updates() -> Result<(), Box<dyn std::e
     ",
     )?;
 
-    // Sets body to 'hidden', which the SELECT policy would exclude, but the
-    // UPDATE policy's own predicate is satisfied so the write is allowed.
-    diesel::update(docs::table.filter(docs::id.eq(1)))
+    let rejected = diesel::update(docs::table.filter(docs::id.eq(1)))
         .set(docs::body.eq("hidden"))
+        .execute(&mut conn);
+
+    assert!(rejected.is_err(), "the updated row has to stay visible to the SELECT policies");
+    assert_ne!(stored(&mut conn)?.body, "hidden", "the refused update stored nothing");
+
+    Ok(())
+}
+
+/// With an UPDATE policy and no SELECT policy, an UPDATE whose `WHERE` reads a
+/// column sees no row, so it changes nothing and raises nothing. Measured on
+/// PostgreSQL 18.6 as `UPDATE 0`.
+#[test]
+fn an_update_without_a_select_policy_reaches_no_row() -> Result<(), Box<dyn std::error::Error>> {
+    let mut conn = setup("CREATE POLICY upd ON docs FOR UPDATE USING (true);")?;
+
+    let updated = diesel::update(docs::table.filter(docs::id.eq(1)))
+        .set(docs::body.eq("edited"))
         .execute(&mut conn)?;
 
-    assert_eq!(stored(&mut conn)?.body, "hidden");
+    assert_eq!(updated, 0, "no SELECT policy admits the row the WHERE reads");
+    assert_eq!(stored(&mut conn)?.body, "original");
 
     Ok(())
 }

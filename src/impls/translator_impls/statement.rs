@@ -820,12 +820,13 @@ fn translate_alter_table_operation(
             }))
         }
         // Row level security is realised as the view and trigger set built from
-        // the schema, which already records these, so they carry no ALTER
-        // TABLE.
+        // the schema, which already records these and the owner it exempts, so
+        // they carry no ALTER TABLE.
         AlterTableOperation::EnableRowLevelSecurity
         | AlterTableOperation::DisableRowLevelSecurity
         | AlterTableOperation::ForceRowLevelSecurity
-        | AlterTableOperation::NoForceRowLevelSecurity => Ok(None),
+        | AlterTableOperation::NoForceRowLevelSecurity
+        | AlterTableOperation::OwnerTo { .. } => Ok(None),
         other => {
             Err(Error::forward_refusal(format!(
                 "ALTER TABLE {} {other} has no SQLite equivalent. SQLite can only rename a table \
@@ -1749,10 +1750,15 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
             Self::AlterView(AlterView { operation: AlterViewOperation::As { .. }, .. }) => {
                 return Err(crate::impls::shared_helpers::alter_view_as_refusal(self));
             }
+            // Row-level security reads a view's owner from the schema, and the
+            // SQLite view has none to change.
+            Self::AlterView(AlterView { operation: AlterViewOperation::OwnerTo(_), .. }) => {
+                Vec::new()
+            }
             Self::AlterView(_) => {
                 return Err(reject_unsupported_statement(
                     self,
-                    "A SQLite view has no owner, schema, column default or options to change, \
+                    "A SQLite view has no schema, column default or options to change, \
                      and SQLite renames a view or its columns only by dropping and recreating \
                      it, which needs its current definition. Write the DROP VIEW and the CREATE \
                      VIEW out instead.",
@@ -2159,7 +2165,7 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
             //
             // The policy statements drive the row level security view and
             // trigger set built from the final schema state (`rls.rs`,
-            // `filter_policies`). The schema statements make a qualified name
+            // `row_security`). The schema statements make a qualified name
             // resolvable (`object_name.rs`, `schema_resolves`) and SQLite has
             // no schema for the name to keep, so the qualifier is stripped
             // instead.

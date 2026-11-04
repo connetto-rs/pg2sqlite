@@ -13,16 +13,20 @@ use alloc::{
 };
 use core::ops::ControlFlow;
 
-use sql_traits::structs::ParserDB;
+use sql_traits::{
+    errors::{LookupError, RowSecurityError},
+    structs::{IdentifierCase, ParserDB, RowSecurity, RowStatement, TargetName},
+    traits::{DatabaseLike, RoleLike, TableLike, ViewLike},
+};
 use sqlparser::ast::{
-    CreateTableOptions, CreateView, Expr, ObjectName, ObjectNamePart, Query, SqlOption, Value,
-    visit_relations_mut,
+    CreateTable, CreateTableOptions, CreateView, Expr, Ident, ObjectName, ObjectNamePart, Query,
+    SqlOption, Value, visit_relations_mut,
 };
 
 use crate::{
     errors::Error,
     impls::object_name::{
-        append_suffix, normalize_schema_qualified_object_name_for_sqlite, translation_table_has_rls,
+        append_suffix, normalize_schema_qualified_object_name_for_sqlite, resolve_translation_table,
     },
 };
 
@@ -78,7 +82,7 @@ impl crate::traits::translator::TranslatorWithContext for CreateView {
 
         let mut query = self.query.translate_with_warnings(schema, options, emit)?;
         if !security_invoker {
-            retarget_rls_reads(&mut query, schema, options)?;
+            retarget_rls_reads(&mut query, self, schema, options)?;
         }
 
         Ok(CreateView {
@@ -117,20 +121,27 @@ fn reads_as_the_invoker(options: &CreateTableOptions) -> bool {
 }
 
 /// Points the view body at the backing table of every row level security table
-/// it reads, which is what makes it bypass the policy the way PostgreSQL does.
+/// it reads, which is how the view's owner reads a table whose policies exempt
+/// it.
 ///
 /// The same retarget a foreign key referencing such a table already gets, so a
-/// declared view and a declared reference now agree about which relation holds
-/// the rows. Without it the body kept reading the policy view, which both
-/// filtered rows PostgreSQL would have shown and made a policy that consults
-/// the view through another view circularly defined.
+/// declared view and a declared reference agree about which relation holds
+/// the rows. A plain view reads as its owner, named by `OWNER TO` or else the
+/// schema owner. An owner the policies bind is refused, since the view would
+/// show that owner's rows rather than the table's or the caller's.
 fn retarget_rls_reads(
     query: &mut Query,
+    view: &CreateView,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
 ) -> Result<(), Error> {
     let outcome = visit_relations_mut(query, |name: &mut ObjectName| {
-        match translation_table_has_rls(schema, name) {
+        let table = match resolve_translation_table(schema, name) {
+            Ok(Some(table)) => table,
+            Ok(None) => return ControlFlow::Continue(()),
+            Err(error) => return ControlFlow::Break(error),
+        };
+        match owner_bypasses(view, table, schema) {
             Ok(true) => {
                 *name = append_suffix(name, options.get_rls_table_suffix());
                 ControlFlow::Continue(())
@@ -143,4 +154,71 @@ fn retarget_rls_reads(
         ControlFlow::Continue(()) => Ok(()),
         ControlFlow::Break(error) => Err(error),
     }
+}
+
+/// Whether `view`'s owner reads `table` past row-level security, `false`
+/// meaning the table has none.
+///
+/// # Errors
+///
+/// Refuses an owner the schema never names, and an owner the table's policies
+/// bind.
+fn owner_bypasses(
+    view: &CreateView,
+    table: &CreateTable,
+    schema: &ParserDB,
+) -> Result<bool, Error> {
+    if !table.has_row_level_security(schema)? {
+        return Ok(false);
+    }
+    let owner = declared_view(schema, view)?
+        .map(|stored| stored.owner(schema))
+        .transpose()?
+        .flatten()
+        .and_then(|name| schema.role(name));
+    let Some(owner) = owner else {
+        return Err(Error::forward_refusal(format!(
+            "view '{}' reads table '{}', which has row-level security, as the view's owner, and \
+             the schema never names that owner. Name it with ALTER VIEW {} OWNER TO, call \
+             with_schema_owner_role with the role that runs the schema, or declare the view \
+             WITH (security_invoker = true).",
+            view.name,
+            table.table_name(),
+            view.name
+        )));
+    };
+    match table.row_security(RowStatement::Select, owner, schema) {
+        Ok(RowSecurity::Exempt(_)) => Ok(true),
+        Ok(RowSecurity::Gated(_) | RowSecurity::InfiniteRecursion { .. }) => {
+            Err(Error::forward_refusal(format!(
+                "view '{}' reads table '{}' as its owner '{}', whom the table's row-level \
+                 security policies bind, so PostgreSQL shows the owner's rows through it. The \
+                 translation has no view reading as another role. Make the owner the table's \
+                 owner, or declare the view WITH (security_invoker = true).",
+                view.name,
+                table.table_name(),
+                owner.name()
+            )))
+        }
+        Err(RowSecurityError::Lookup(error)) => Err(error.into()),
+        Err(error) => Err(Error::forward_refusal(error.to_string())),
+    }
+}
+
+/// The stored view `view` declares.
+fn declared_view<'a>(
+    schema: &'a ParserDB,
+    view: &CreateView,
+) -> Result<Option<&'a <ParserDB as DatabaseLike>::View>, LookupError> {
+    let idents: Vec<&Ident> = view.name.0.iter().filter_map(ObjectNamePart::as_ident).collect();
+    let Some((last, qualifier)) = idents.split_last() else { return Ok(None) };
+    let target = TargetName::new(&last.value, last.quote_style.is_some());
+    let target = match qualifier.last() {
+        Some(schema_name) => {
+            target.with_schema(&schema_name.value, schema_name.quote_style.is_some())
+        }
+        None if view.temporary => target.with_schema("pg_temp", false),
+        None => target,
+    };
+    schema.view_by_target(target, IdentifierCase::AsWritten)
 }

@@ -35,7 +35,11 @@ struct Profile {
 }
 
 fn translate_and_setup() -> Result<diesel::SqliteConnection, Box<dyn std::error::Error>> {
-    let sql = include_str!("../fixtures/rls_current_user.sql");
+    let sql = concat!(
+        "CREATE ROLE authenticated;\n",
+        include_str!("../fixtures/rls_current_user.sql"),
+        "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
+    );
 
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
@@ -59,7 +63,11 @@ fn translate_and_setup() -> Result<diesel::SqliteConnection, Box<dyn std::error:
 /// Snapshot test for current_user RLS translation.
 #[test]
 fn test_current_user_translation_snapshot() -> Result<(), Box<dyn std::error::Error>> {
-    let sql = include_str!("../fixtures/rls_current_user.sql");
+    let sql = concat!(
+        "CREATE ROLE authenticated;\n",
+        include_str!("../fixtures/rls_current_user.sql"),
+        "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
+    );
 
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)

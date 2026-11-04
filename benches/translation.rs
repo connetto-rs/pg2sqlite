@@ -136,15 +136,22 @@ fn bench_rls_translation(c: &mut Criterion) {
             "app.tenant_id",
             "current_tenant",
         ))
-        .with_rls_audit_table_name("rls_violations");
+        .with_rls_audit_table_name("rls_violations")
+        .with_schema_owner_role("migrator");
 
     let mut group = c.benchmark_group("rls_translation");
 
+    // The session role acts with its grants, and the schema owner owns the
+    // `_unfiltered` views rls_grants.sql reads from its policies.
+    let roles = "CREATE ROLE authenticated; CREATE ROLE migrator;";
+    let grants =
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;";
+    let basic = format!("{roles}\n{RLS_BASIC_SQL}\n{grants}");
     // rls_grants.sql references tables groups.sql creates, so the two are
     // benched as one reference-closed document.
-    let groups_plus_grants = format!("{GROUPS_SQL}\n{RLS_GRANTS_SQL}");
+    let groups_plus_grants = format!("{roles}\n{GROUPS_SQL}\n{RLS_GRANTS_SQL}\n{grants}");
     let fixtures: &[(&str, &str)] =
-        &[("rls_basic_1.2KB", RLS_BASIC_SQL), ("groups_plus_rls_grants_25KB", &groups_plus_grants)];
+        &[("rls_basic_1.2KB", &basic), ("groups_plus_rls_grants_25KB", &groups_plus_grants)];
 
     for (name, sql) in fixtures {
         group.throughput(Throughput::Bytes(sql.len() as u64));

@@ -25,21 +25,23 @@ use alloc::{
 use core::ops::ControlFlow;
 
 use sql_traits::{
-    errors::LookupError,
-    structs::{IdentifierCase, ParserDB, TargetName},
+    errors::{LookupError, RowSecurityError},
+    structs::{
+        ActingRole, GatedCommand, IdentifierCase, ParserDB, RowGate, RowSecurity, RowStatement,
+        RowVersion, TargetName,
+    },
     traits::{ColumnLike, DatabaseLike, PolicyLike, TableLike, TriggerLike},
-    utils::identifier_resolution::{is_public_pseudo_role, normalize_identifier},
 };
 use sqlparser::{
     ast::{
         Assignment, AssignmentTarget, BinaryOperator, ColumnDef, ColumnOption, ColumnOptionDef,
-        CreatePolicy, CreatePolicyCommand, CreatePolicyType, CreateTable, CreateTrigger, DataType,
-        Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList,
-        FunctionArguments, FunctionDesc, HavingBound, Ident, InTarget, JoinConstraint,
-        JoinOperator, ListAggOnOverflow, ObjectName, ObjectNamePart, Owner, SelectItem, SetExpr,
-        Statement, TableAlias, TableFactor, TriggerEvent, TriggerExecBody, TriggerExecBodyType,
-        TriggerObject, TriggerObjectKind, TriggerPeriod, UnaryOperator, Value, ValueWithSpan,
-        Visit, VisitMut, Visitor, VisitorMut, WindowType,
+        CreatePolicy, CreateTable, CreateTrigger, DataType, Expr, Function, FunctionArg,
+        FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList, FunctionArguments,
+        FunctionDesc, HavingBound, Ident, InTarget, JoinConstraint, JoinOperator,
+        ListAggOnOverflow, ObjectName, ObjectNamePart, SelectItem, SetExpr, Statement, TableAlias,
+        TableFactor, TriggerEvent, TriggerExecBody, TriggerExecBodyType, TriggerObject,
+        TriggerObjectKind, TriggerPeriod, UnaryOperator, Value, ValueWithSpan, Visit, VisitMut,
+        Visitor, VisitorMut, WindowType,
     },
     tokenizer::{Token, Word},
 };
@@ -317,14 +319,9 @@ fn is_true_literal(expr: &Expr) -> bool {
     }
 }
 
-/// Which clause of a policy supplies the predicate.
-#[derive(Clone, Copy)]
-enum PolicyClause {
-    /// `USING`, which selects the existing rows a command may touch.
-    Using,
-    /// `WITH CHECK`, which constrains the row a command writes.
-    Check,
-}
+/// The policies one row version passes, as `sql-traits` settles them for the
+/// acting role.
+type PolicyGate<'s> = RowGate<'s, CreatePolicy>;
 
 /// How a policy set constrains rows once permissive and restrictive policies
 /// are combined.
@@ -334,30 +331,23 @@ enum PolicyPredicate {
     Expr(Box<Expr>),
 }
 
-/// Combines a policy set the way PostgreSQL does:
-/// `(PERMISSIVE_1 OR PERMISSIVE_2 OR ...) AND RESTRICTIVE_1 AND RESTRICTIVE_2`.
-///
-/// Permissive policies OR together to grant access. Restrictive policies AND on
-/// top to remove it. Two consequences the caller must honour:
-///
-/// * A set with no permissive predicate denies every row, because nothing
-///   granted access. That covers an empty set, a restrictive-only set, and a
-///   permissive policy lacking the clause, which adds nothing.
-/// * A restrictive policy lacking the clause constrains nothing.
+/// Combines a gate the way PostgreSQL does:
+/// `(PERMISSIVE_1 OR PERMISSIVE_2 OR ...) AND RESTRICTIVE_1 AND RESTRICTIVE_2`,
+/// so a gate with no permissive term denies every row.
 ///
 /// `substitutions` says what a `NEW.<column>` reference stands for where the
 /// value reaching the trigger is not the value the row will carry: a default
 /// for a column the caller left out, and the computation for a generated one.
 /// Empty for a predicate resolved against `OLD` or against the table itself.
 fn combine_policy_predicates(
-    policies: &[&CreatePolicy],
-    clause: PolicyClause,
+    gate: Option<&PolicyGate<'_>>,
     bindings: PolicyBindings<'_>,
     options: &crate::options::TranslationContext<'_>,
     table: &CreateTable,
     schema: &ParserDB,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<PolicyPredicate, Error> {
+    let Some(gate) = gate else { return Ok(PolicyPredicate::AllowAll) };
     let PolicyBindings { prefix, substitutions } = bindings;
     // The backing table's name is what a policy naming its own table has to
     // resolve to, and it follows from the table and the options, so it is read
@@ -374,36 +364,16 @@ fn combine_policy_predicates(
 
     let mut permissive = Vec::new();
     let mut restrictive = Vec::new();
-    let mut has_permissive = false;
-    // A literally-true permissive predicate makes the permissive OR true
-    // regardless of other permissive conditions. Track it separately so the
-    // conjunct-building step knows to skip the permissive side entirely when
-    // any one permissive policy grants all rows. Without this tracking, a
-    // FOR SELECT USING (true) alongside a FOR ALL USING (owner = 'alice')
-    // drops the true predicate but keeps the (owner = 'alice') conjunct,
-    // producing a view narrower than PostgreSQL's (which ORs them to true).
+    let has_permissive = !gate.permissive().is_empty();
+    // One literally-true permissive term makes the whole permissive OR true.
     let mut permissive_always_true = false;
 
-    for policy in policies {
-        let is_restrictive = policy.policy_type() == CreatePolicyType::Restrictive;
-        let expr = match clause {
-            PolicyClause::Using => policy.using_expression(schema),
-            // PostgreSQL: "If no WITH CHECK expression is defined, then the
-            // USING expression will be used both to determine which rows are
-            // visible and which new rows will be allowed to be added." So an
-            // UPDATE that moves a row out of the USING predicate is rejected.
-            //
-            // The policy set reaching this arm is filtered to INSERT, UPDATE,
-            // and ALL commands, so a SELECT or DELETE policy's USING can never
-            // leak into a write guard.
-            PolicyClause::Check => {
-                policy.check_expression(schema).or_else(|| policy.using_expression(schema))
-            }
-        };
-        let Some(expr) = expr else { continue };
-        if !is_restrictive {
-            has_permissive = true;
-        }
+    let terms = gate
+        .permissive()
+        .iter()
+        .map(|term| (false, term.expression()))
+        .chain(gate.restrictive().iter().map(|term| (true, term.expression())));
+    for (is_restrictive, expr) in terms {
         let mut transformed =
             transform_expr(expr, options, table, schema, prefix, table_rename, facts);
         // Folded before translation so a substituted default travels the same
@@ -549,21 +519,6 @@ fn expr_contains_identifier(expr: &Expr, name: &str) -> bool {
     finder.found
 }
 
-/// True when the expression the INSERT guard uses (WITH CHECK or its USING
-/// fallback) names `column_name`.
-fn any_insert_policy_reads_column(
-    policies: &[&CreatePolicy],
-    schema: &ParserDB,
-    column_name: &str,
-) -> bool {
-    policies.iter().any(|policy| {
-        policy
-            .check_expression(schema)
-            .or_else(|| policy.using_expression(schema))
-            .is_some_and(|expr| expr_contains_identifier(expr, column_name))
-    })
-}
-
 /// Returns `expr` with session-variable calls, subqueries, and caller-declared
 /// functions replaced by replayable placeholders, so `is_replayable` focuses
 /// on scalar volatile calls rather than flagging these stable constructs.
@@ -607,28 +562,54 @@ fn scrub_policy_stable_exprs(
     copy
 }
 
-/// Builds the write-guard predicate context for one DML event.
-///
-/// Returns `(columns, using, check)` where `using` is `None` for INSERT
-/// because PostgreSQL's RLS model has no USING clause on that command.
+/// The predicates guarding one DML event, each `None` where the event has no
+/// such gate.
+struct WriteGuard {
+    columns: Vec<TriggerColumn>,
+    /// `USING` on the existing row, for UPDATE.
+    using: Option<PolicyPredicate>,
+    /// `WITH CHECK` on the written row.
+    check: PolicyPredicate,
+    /// The `SELECT` policies on the updated row, which an UPDATE naming its
+    /// row reads back.
+    read_back: Option<PolicyPredicate>,
+}
+
+/// Builds the write-guard predicates for one DML event from `rows`, the
+/// answer for the statement the event stands for.
 fn build_write_guard(
-    policies: &[&CreatePolicy],
+    rows: &Rows<'_>,
     kind: GuardKind,
     table: &CreateTable,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
-) -> Result<(Vec<TriggerColumn>, Option<PolicyPredicate>, PolicyPredicate), Error> {
+) -> Result<WriteGuard, Error> {
     let columns = trigger_columns(table, schema, options)?;
     let subs = guard_substitutions(&columns, kind, options, table, schema)?;
     let table_name = table.table_name();
-    // D1: volatile column default, INSERT only — appears in both the guard
-    // substitution and the forwarding INSERT VALUES, two independent draws.
+    let (using_gate, check_gate, read_back_gate) = match kind {
+        GuardKind::Insert => (None, rows.gate(GatedCommand::Insert, RowVersion::Inserted), None),
+        GuardKind::Update => {
+            (
+                rows.gate(GatedCommand::Update, RowVersion::Existing),
+                rows.gate(GatedCommand::Update, RowVersion::Updated),
+                rows.gate(GatedCommand::Select, RowVersion::Updated),
+            )
+        }
+    };
+    // A volatile column default reaches both the guard and the forwarding
+    // INSERT, two independent draws.
     if kind == GuardKind::Insert {
         for column in &columns {
             let Some(guard_default) = &column.guard_default else { continue };
+            let read = check_gate
+                .into_iter()
+                .flat_map(|gate| gate.permissive().iter().chain(gate.restrictive()));
             if !is_replayable(guard_default, options)
-                && any_insert_policy_reads_column(policies, schema, &column.name)
+                && read
+                    .into_iter()
+                    .any(|term| expr_contains_identifier(term.expression(), &column.name))
             {
                 return Err(reject_duplicated_operand(
                     &format!(
@@ -640,65 +621,50 @@ fn build_write_guard(
             }
         }
     }
-    // D2: volatile policy predicate — appears in trigger guard and forwarding
-    // WHERE or backing check trigger WHEN, two independent draws.
-    for policy in policies {
-        if kind == GuardKind::Update
-            && let Some(using) = policy.using_expression(schema)
-            && !is_replayable(&scrub_policy_stable_exprs(using, options), options)
-        {
-            return Err(reject_duplicated_operand(
-                &format!(
-                    "policy \"{}\" USING predicate on table \"{}\"",
-                    policy.name(),
-                    table_name
-                ),
-                using,
-            ));
-        }
-        let check_expr =
-            policy.check_expression(schema).or_else(|| policy.using_expression(schema));
-        if let Some(check) = check_expr
-            && !is_replayable(&scrub_policy_stable_exprs(check, options), options)
-        {
-            let clause = if policy.check_expression(schema).is_some() {
-                "WITH CHECK"
-            } else {
-                "USING (as WITH CHECK)"
+    // A volatile policy predicate reaches both the trigger guard and the
+    // forwarding WHERE or backing check, two independent draws.
+    for gate in [using_gate, check_gate, read_back_gate].into_iter().flatten() {
+        for term in gate.permissive().iter().chain(gate.restrictive()) {
+            if is_replayable(&scrub_policy_stable_exprs(term.expression(), options), options) {
+                continue;
+            }
+            let clause = match (term.clause(), gate.row()) {
+                (sql_traits::structs::PolicyClause::WithCheck, _) => "WITH CHECK",
+                (_, RowVersion::Existing) => "USING",
+                (_, _) if gate.command() == GatedCommand::Select => "USING (on the new row)",
+                (_, _) => "USING (as WITH CHECK)",
             };
             return Err(reject_duplicated_operand(
                 &format!(
                     "policy \"{}\" {clause} predicate on table \"{}\"",
-                    policy.name(),
+                    term.policy().name(),
                     table_name
                 ),
-                check,
+                term.expression(),
             ));
         }
     }
-    let using = if kind == GuardKind::Update {
-        Some(combine_policy_predicates(
-            policies,
-            PolicyClause::Using,
-            PolicyBindings { prefix: Some("OLD"), substitutions: &[] },
+    let mut combine = |gate: Option<&PolicyGate<'_>>, prefix, substitutions| {
+        combine_policy_predicates(
+            gate,
+            PolicyBindings { prefix: Some(prefix), substitutions },
             options,
             table,
             schema,
             emit,
-        )?)
-    } else {
-        None
+        )
     };
-    let check = combine_policy_predicates(
-        policies,
-        PolicyClause::Check,
-        PolicyBindings { prefix: Some("NEW"), substitutions: &subs },
-        options,
-        table,
-        schema,
-        emit,
-    )?;
-    Ok((columns, using, check))
+    // An exempt role has no gate, which combines to every row.
+    let using = match kind {
+        GuardKind::Update => Some(combine(using_gate, "OLD", &[])?),
+        GuardKind::Insert => None,
+    };
+    let check = combine(check_gate, "NEW", &subs)?;
+    let read_back = match read_back_gate {
+        Some(gate) => Some(combine(Some(gate), "NEW", &subs)?),
+        None => None,
+    };
+    Ok(WriteGuard { columns, using, check, read_back })
 }
 
 /// Returns true if the table has RLS enabled.
@@ -783,61 +749,101 @@ fn build_row_identity_clause(columns: &[String], pk_columns: &[String]) -> Expr 
         .expect("a table has at least one identity column")
 }
 
-/// Returns the policies for `commands` that apply to the session user role.
-///
-/// A session role the schema never declares has no recorded memberships, so
-/// it gets only the `PUBLIC` policies and those whose `TO` clause names it. A
-/// policy naming a role is refused without `with_session_user_role`, so it
-/// never reaches the wrong audience.
-fn filter_policies<'a>(
-    table: &'a CreateTable,
-    schema: &'a ParserDB,
-    commands: &[CreatePolicyCommand],
-    options: &Pg2SqliteOptions,
-) -> Result<Vec<&'a CreatePolicy>, Error> {
-    let session_role = options.get_session_user_role();
-    let declared_role = session_role.and_then(|name| schema.role(name));
-    let mut policies = Vec::new();
-    for policy in table.policies(schema)? {
-        let command = policy.command();
-        if !commands.contains(&command) && command != CreatePolicyCommand::All {
-            continue;
-        }
-        let mut named_roles = policy.roles(schema).filter_map(|owner| {
-            match owner {
-                Owner::Ident(ident)
-                    if !is_public_pseudo_role(&ident.value, ident.quote_style.is_some()) =>
-                {
-                    Some(ident)
-                }
-                _ => None,
+/// What row-level security applies to one statement shape, for the acting
+/// role.
+enum Rows<'s> {
+    /// The role is exempt, so every row passes.
+    Exempt,
+    /// The gates a row passes.
+    Gated(Vec<PolicyGate<'s>>),
+}
+
+impl<'s> Rows<'s> {
+    /// The gate `command`'s policies put on `row`, or `None` where the role is
+    /// exempt or the statement puts no such gate.
+    fn gate(&self, command: GatedCommand, row: RowVersion) -> Option<&PolicyGate<'s>> {
+        match self {
+            Self::Exempt => None,
+            Self::Gated(gates) => {
+                gates.iter().find(|gate| gate.command() == command && gate.row() == row)
             }
-        });
-        let applies = match (declared_role, session_role) {
-            (Some(role), _) => policy.applies_to_role(role, schema),
-            (None, Some(name)) => {
-                policy.applies_to_public()
-                    || named_roles.any(|ident| {
-                        normalize_identifier(&ident.value, ident.quote_style.is_some()) == name
-                    })
-            }
-            (None, None) => {
-                if named_roles.next().is_some() {
-                    return Err(Error::forward_refusal(format!(
-                        "policy '{}' on table '{}' is scoped to a specific role. \
-                         Call with_session_user_role to specify which role this translation targets.",
-                        policy.name(),
-                        table.table_name(),
-                    )));
-                }
-                policy.applies_to_public()
-            }
-        };
-        if applies {
-            policies.push(policy);
         }
     }
-    Ok(policies)
+
+    /// Whether no policy at all gates `command`'s `row`, which PostgreSQL
+    /// reports as the command having no policy.
+    fn has_no_policy(&self, command: GatedCommand, row: RowVersion) -> bool {
+        self.gate(command, row)
+            .is_some_and(|gate| gate.permissive().is_empty() && gate.restrictive().is_empty())
+    }
+}
+
+/// Who this translation runs as: the declared session role, or a caller
+/// holding none.
+///
+/// The schema owner role owns what the schema creates, and has to be declared
+/// too.
+fn acting_role<'s>(
+    schema: &'s ParserDB,
+    options: &Pg2SqliteOptions,
+) -> Result<ActingRole<'s, <ParserDB as DatabaseLike>::Role>, Error> {
+    let declared = |name: &str, what: &str| {
+        schema.role(name).ok_or_else(|| {
+            Error::forward_refusal(format!(
+                "the {what} '{name}' is not declared in the schema. Declare it with CREATE ROLE, \
+                 as PostgreSQL requires before a role can act or own."
+            ))
+        })
+    };
+    if let Some(name) = options.get_schema_owner_role() {
+        declared(name, "schema owner role")?;
+    }
+    Ok(match options.get_session_user_role() {
+        Some(name) => ActingRole::Declared(declared(name, "session role")?),
+        None => ActingRole::Public,
+    })
+}
+
+/// What row-level security applies to `statement` on `table`, as `sql-traits`
+/// answers it for the acting role.
+fn row_security<'s>(
+    table: &'s CreateTable,
+    schema: &'s ParserDB,
+    statement: RowStatement,
+    options: &Pg2SqliteOptions,
+) -> Result<Rows<'s>, Error> {
+    let answer = table.row_security(statement, acting_role(schema, options)?, schema);
+    let refusal = |reason: String| Err(Error::forward_refusal(reason));
+    match answer {
+        Ok(RowSecurity::Exempt(_)) => Ok(Rows::Exempt),
+        Ok(RowSecurity::Gated(gates)) => Ok(Rows::Gated(gates)),
+        Ok(RowSecurity::InfiniteRecursion { relation }) => {
+            refusal(format!(
+                "the policies on '{}' expand back into '{relation}' while its own policies are \
+                 still being expanded, so PostgreSQL answers `infinite recursion detected in \
+                 policy for relation \"{relation}\"`. Rewrite one of the policies to read a \
+                 table its expansion does not reach.",
+                table.table_name()
+            ))
+        }
+        Err(RowSecurityError::RoleRequired { policy }) => {
+            refusal(format!(
+                "policy '{policy}' on table '{}' is scoped to a specific role. Call \
+                 with_session_user_role to specify which role this translation targets.",
+                table.table_name()
+            ))
+        }
+        Err(RowSecurityError::UnsettledViewOwner { view }) => {
+            refusal(format!(
+                "the policies on '{}' read view '{view}', which reads its tables as its owner, \
+                 and the schema never names that owner. Name it with ALTER VIEW {view} OWNER \
+                 TO, or call with_schema_owner_role with the role that runs the schema.",
+                table.table_name()
+            ))
+        }
+        Err(RowSecurityError::Lookup(error)) => Err(error.into()),
+        Err(error) => refusal(error.to_string()),
+    }
 }
 
 struct RlsTriggerContext<'a> {
@@ -1862,158 +1868,15 @@ fn rls_read_predicate(
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<PolicyPredicate, Error> {
-    let select_policies = filter_policies(table, schema, &[CreatePolicyCommand::Select], options)?;
-    reject_self_referential_read_policy(&select_policies, table, schema, options)?;
-
+    let rows = row_security(table, schema, RowStatement::Select, options)?;
     combine_policy_predicates(
-        &select_policies,
-        PolicyClause::Using,
+        rows.gate(GatedCommand::Select, RowVersion::Existing),
         PolicyBindings { prefix: None, substitutions: &[] },
         options,
         table,
         schema,
         emit,
     )
-}
-
-/// Collects the unqualified name of every table that appears in a direct
-/// subquery FROM clause within `expr`, aliased or not. Both spellings are read
-/// through the table's view, so both can close a cycle.
-#[cfg_attr(feature = "std", recursive::recursive)]
-fn collect_subquery_tables(expr: &Expr, out: &mut Vec<String>) {
-    match expr {
-        Expr::Exists { subquery, .. }
-        | Expr::Subquery(subquery)
-        | Expr::Function(Function { args: FunctionArguments::Subquery(subquery), .. }) => {
-            collect_query_tables(subquery, out);
-        }
-        Expr::In { target: InTarget::Subquery(subquery), expr: inner, .. } => {
-            collect_subquery_tables(inner, out);
-            collect_query_tables(subquery, out);
-        }
-        other => {
-            for_each_child_expr(other, &mut |child| collect_subquery_tables(child, out));
-        }
-    }
-}
-
-fn collect_query_tables(query: &sqlparser::ast::Query, out: &mut Vec<String>) {
-    if let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() {
-        for twj in &select.from {
-            collect_factor_tables(&twj.relation, out);
-            for join in &twj.joins {
-                collect_factor_tables(&join.relation, out);
-            }
-        }
-        if let Some(sel) = &select.selection {
-            collect_subquery_tables(sel, out);
-        }
-    }
-}
-
-fn collect_factor_tables(factor: &TableFactor, out: &mut Vec<String>) {
-    if let TableFactor::Table { name, .. } = factor
-        && let Some(last) = last_ident(name)
-    {
-        let name_lc = last.value.to_lowercase();
-        if !out.iter().any(|r| r == &name_lc) {
-            out.push(name_lc);
-        }
-    }
-}
-
-/// Refuses a read-path policy whose predicate reads the table it guards, or
-/// where two tables' read policies read each other.
-///
-/// PostgreSQL cannot evaluate a self-referential policy. Reading the table
-/// applies the policy and the policy reads the table, so it answers `infinite
-/// recursion detected in policy for relation`, measured on PostgreSQL 17 as a
-/// non-superuser for the plain, CTE and set-operation spellings alike. The
-/// translated form is a view selecting from the backing table, so the same
-/// predicate makes SQLite answer `view <table> is circularly defined` wherever
-/// the inner reference is not renamed, and where it is renamed the view works
-/// and filters, which accepts and evaluates input the source database refuses.
-///
-/// The same problem arises when table A's read policy reads table B and table
-/// B's read policy reads table A. A policy reads another guarded table through
-/// that table's view, so both views come to reference each other, which SQLite
-/// rejects as a circular view definition the first time either one is queried.
-///
-/// Only the read path is refused, which is where PostgreSQL draws the line
-/// too. A `WITH CHECK` predicate, and the `USING` predicate of an
-/// `INSERT`-only, `UPDATE`-only or `DELETE`-only policy, all read the table
-/// under its SELECT policy rather than their own, so nothing recurses and
-/// PostgreSQL runs them. Those were measured and are left alone.
-fn reject_self_referential_read_policy(
-    policies: &[&CreatePolicy],
-    table: &CreateTable,
-    schema: &ParserDB,
-    options: &crate::options::TranslationContext<'_>,
-) -> Result<(), Error> {
-    let guarded = table.table_name();
-    for policy in policies {
-        let Some(predicate) = policy.using.as_ref() else { continue };
-        let reads_itself = sqlparser::ast::visit_relations(predicate, |relation| {
-            if crate::impls::object_name::last_ident(relation)
-                .is_some_and(|ident| ident.value.eq_ignore_ascii_case(guarded))
-            {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
-        })
-        .is_break();
-
-        if reads_itself {
-            return Err(Error::forward_refusal(format!(
-                "The read policy {} on {guarded} reads {guarded} in its own USING predicate, \
-             which PostgreSQL cannot evaluate: reading the table applies the policy and the \
-             policy reads the table, so PostgreSQL answers `infinite recursion detected in \
-             policy for relation \"{guarded}\"`. Rewrite the predicate over another table, or \
-             restrict the policy to INSERT, UPDATE or DELETE, where PostgreSQL does evaluate \
-             a self reference.",
-                policy.name
-            )));
-        }
-
-        // Every table a policy reads is read through its own view, so any
-        // reference here can close a cycle, aliased or not.
-        let mut refs: Vec<String> = Vec::new();
-        collect_subquery_tables(predicate, &mut refs);
-
-        for other_name in &refs {
-            if other_name.eq_ignore_ascii_case(guarded) {
-                continue;
-            }
-            // Check whether the other table has its own read policy reading
-            // back to the guarded table. If so, each view ends up defined in
-            // terms of the other, which SQLite rejects at query time.
-            let Some(other_table) =
-                schema.rls_tables()?.find(|t| t.table_name().eq_ignore_ascii_case(other_name))
-            else {
-                continue;
-            };
-            let other_select =
-                filter_policies(other_table, schema, &[CreatePolicyCommand::Select], options)?;
-            for other_policy in &other_select {
-                let Some(other_pred) = other_policy.using.as_ref() else { continue };
-                let mut back_refs: Vec<String> = Vec::new();
-                collect_subquery_tables(other_pred, &mut back_refs);
-                if back_refs.iter().any(|r| r.eq_ignore_ascii_case(guarded)) {
-                    return Err(Error::forward_refusal(format!(
-                        "The read policy {} on {guarded} and the read policy {} on {other_name} \
-                     read each other, so each view would be defined in terms of the other and \
-                     SQLite would refuse both at query time. PostgreSQL answers `infinite \
-                     recursion detected in policy for relation` for the same pair. Restructure \
-                     one of the policies to read a table that is not guarded, or restrict it \
-                     to INSERT, UPDATE or DELETE.",
-                        policy.name, other_policy.name
-                    )));
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 fn generated_object_name(name: &str) -> ObjectName {
@@ -2060,9 +1923,9 @@ fn generate_insert_trigger_sql(
 ) -> Result<Statement, Error> {
     let ctx = RlsTriggerContext::new(table, options);
     let table_name = ctx.table_name;
-    let insert_policies = filter_policies(table, schema, &[CreatePolicyCommand::Insert], options)?;
-    let (columns, _, check) =
-        build_write_guard(&insert_policies, GuardKind::Insert, table, schema, options, emit)?;
+    let rows = row_security(table, schema, RowStatement::Insert { returning: false }, options)?;
+    let WriteGuard { columns, check, .. } =
+        build_write_guard(&rows, GuardKind::Insert, table, schema, options, emit)?;
     let written: Vec<&TriggerColumn> =
         columns.iter().filter(|column| !column.is_generated()).collect();
     let target_columns = written.iter().map(|column| generated_object_name(&column.name)).collect();
@@ -2071,7 +1934,7 @@ fn generate_insert_trigger_sql(
         .map(|column| column.forwarded_value().translate_with_warnings(schema, options, emit))
         .collect::<Result<Vec<_>, Error>>()?;
 
-    let guard = if insert_policies.is_empty() {
+    let guard = if rows.has_no_policy(GatedCommand::Insert, RowVersion::Inserted) {
         Some(ast_builder::raise_statement(
             "ABORT",
             Some(&no_policy(WriteCommand::Insert, table_name)),
@@ -2161,6 +2024,83 @@ fn policy_violation(predicate: Expr) -> Expr {
     Expr::IsNotTrue(Box::new(Expr::Nested(Box::new(predicate))))
 }
 
+/// What a row fails when it has to pass every one of a set of predicates.
+enum Violation {
+    /// A predicate admits no row.
+    Every,
+    /// The rows failing any predicate, `None` when each admits every row.
+    Rows(Option<Box<Expr>>),
+}
+
+/// A predicate appearing twice, as a `FOR ALL USING (p)` policy's check and
+/// read-back do, is tested once.
+fn violation(predicates: impl IntoIterator<Item = PolicyPredicate>) -> Violation {
+    let mut failing = Vec::new();
+    for predicate in predicates {
+        match predicate {
+            PolicyPredicate::DenyAll => return Violation::Every,
+            PolicyPredicate::AllowAll => {}
+            PolicyPredicate::Expr(predicate) => {
+                let violation = policy_violation(*predicate);
+                if !failing.contains(&violation) {
+                    failing.push(violation);
+                }
+            }
+        }
+    }
+    Violation::Rows(
+        failing
+            .into_iter()
+            .reduce(|left, right| {
+                Expr::BinaryOp {
+                    left: Box::new(left),
+                    op: BinaryOperator::Or,
+                    right: Box::new(right),
+                }
+            })
+            .map(Box::new),
+    )
+}
+
+/// The `INSTEAD OF UPDATE` statement refusing an updated row that fails
+/// `WITH CHECK` or, read back, the `SELECT` policies, raised only for a row
+/// `using` lets the caller update.
+fn new_row_guard(
+    check: PolicyPredicate,
+    read_back: Option<PolicyPredicate>,
+    using: Option<Expr>,
+    options: &Pg2SqliteOptions,
+) -> Option<Statement> {
+    let violation = match violation([Some(check), read_back].into_iter().flatten()) {
+        Violation::Every => None,
+        Violation::Rows(None) => return None,
+        Violation::Rows(Some(violation)) => {
+            Some(match using {
+                Some(using) => {
+                    // A disjunction stays one operand of the conjunct.
+                    let violation =
+                        if matches!(*violation, Expr::BinaryOp { op: BinaryOperator::Or, .. }) {
+                            Expr::Nested(violation)
+                        } else {
+                            *violation
+                        };
+                    Expr::BinaryOp {
+                        left: Box::new(Expr::Nested(Box::new(using))),
+                        op: BinaryOperator::And,
+                        right: Box::new(violation),
+                    }
+                }
+                None => *violation,
+            })
+        }
+    };
+    Some(ast_builder::raise_statement(
+        "ABORT",
+        Some(RLS_VIOLATION),
+        write_guard_condition_expr(violation, options),
+    ))
+}
+
 fn backing_abort_trigger(
     name: &str,
     table_name: &str,
@@ -2186,12 +2126,12 @@ fn generate_insert_check_trigger_sql(
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Option<Statement>, Error> {
     let ctx = RlsTriggerContext::new(table, options);
-    let policies = filter_policies(table, schema, &[CreatePolicyCommand::Insert], options)?;
-    let (condition, message) = if policies.is_empty() {
+    let rows = row_security(table, schema, RowStatement::Insert { returning: false }, options)?;
+    let (condition, message) = if rows.has_no_policy(GatedCommand::Insert, RowVersion::Inserted) {
         (write_guard_condition_expr(None, options), no_policy(WriteCommand::Insert, ctx.table_name))
     } else {
-        let (_, _, check) =
-            build_write_guard(&policies, GuardKind::Insert, table, schema, options, emit)?;
+        let WriteGuard { check, .. } =
+            build_write_guard(&rows, GuardKind::Insert, table, schema, options, emit)?;
         match check {
             PolicyPredicate::DenyAll => {
                 (write_guard_condition_expr(None, options), RLS_VIOLATION.to_string())
@@ -2313,29 +2253,20 @@ fn generate_update_check_trigger_sql(
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Option<Statement>, Error> {
     let ctx = RlsTriggerContext::new(table, options);
-    let policies = filter_policies(table, schema, &[CreatePolicyCommand::Update], options)?;
-    let violation = if policies.is_empty() {
-        // No UPDATE policies: deny all caller UPDATEs. A maintenance exemption
-        // narrows the guard so the crate's own AFTER INSERT trigger UPDATEs
-        // still succeed; see `build_maintenance_insert_exemption`.
+    let rows = row_security(table, schema, RowStatement::Update { reads: true }, options)?;
+    let violation = if rows.has_no_policy(GatedCommand::Update, RowVersion::Existing)
+        && rows.has_no_policy(GatedCommand::Update, RowVersion::Updated)
+    {
+        // The crate's own AFTER INSERT trigger UPDATEs still pass a table with
+        // no UPDATE policy, through `build_maintenance_insert_exemption`.
         build_maintenance_insert_exemption(table, schema, options)
     } else {
-        let (_, using, check) =
-            build_write_guard(&policies, GuardKind::Update, table, schema, options, emit)?;
-        match (using.expect("update guard always has a USING predicate"), check) {
-            (PolicyPredicate::DenyAll, _) | (_, PolicyPredicate::DenyAll) => None,
-            (PolicyPredicate::AllowAll, PolicyPredicate::AllowAll) => return Ok(None),
-            (PolicyPredicate::AllowAll, PolicyPredicate::Expr(check))
-            | (PolicyPredicate::Expr(check), PolicyPredicate::AllowAll) => {
-                Some(policy_violation(*check))
-            }
-            (PolicyPredicate::Expr(using), PolicyPredicate::Expr(check)) => {
-                Some(Expr::BinaryOp {
-                    left: Box::new(policy_violation(*using)),
-                    op: BinaryOperator::Or,
-                    right: Box::new(policy_violation(*check)),
-                })
-            }
+        let WriteGuard { using, check, read_back, .. } =
+            build_write_guard(&rows, GuardKind::Update, table, schema, options, emit)?;
+        match violation([using, Some(check), read_back].into_iter().flatten()) {
+            Violation::Every => None,
+            Violation::Rows(None) => return Ok(None),
+            Violation::Rows(Some(violation)) => Some(*violation),
         }
     };
     Ok(Some(backing_abort_trigger(
@@ -2357,23 +2288,18 @@ fn generate_delete_check_trigger_sql(
         return Ok(None);
     }
     let ctx = RlsTriggerContext::new(table, options);
-    let policies = filter_policies(table, schema, &[CreatePolicyCommand::Delete], options)?;
-    let violation = if policies.is_empty() {
-        None
-    } else {
-        match combine_policy_predicates(
-            &policies,
-            PolicyClause::Using,
-            PolicyBindings { prefix: Some("OLD"), substitutions: &[] },
-            options,
-            table,
-            schema,
-            emit,
-        )? {
-            PolicyPredicate::DenyAll => None,
-            PolicyPredicate::AllowAll => return Ok(None),
-            PolicyPredicate::Expr(predicate) => Some(policy_violation(*predicate)),
-        }
+    let rows = row_security(table, schema, RowStatement::Delete { reads: true }, options)?;
+    let violation = match combine_policy_predicates(
+        rows.gate(GatedCommand::Delete, RowVersion::Existing),
+        PolicyBindings { prefix: Some("OLD"), substitutions: &[] },
+        options,
+        table,
+        schema,
+        emit,
+    )? {
+        PolicyPredicate::DenyAll => None,
+        PolicyPredicate::AllowAll => return Ok(None),
+        PolicyPredicate::Expr(predicate) => Some(policy_violation(*predicate)),
     };
     Ok(Some(backing_abort_trigger(
         &format!("{}_delete_check", ctx.inner_table_name),
@@ -2423,11 +2349,11 @@ fn generate_update_trigger_sql(
 ) -> Result<Statement, Error> {
     let ctx = RlsTriggerContext::new(table, options);
     let table_name = ctx.table_name;
-    let policies = filter_policies(table, schema, &[CreatePolicyCommand::Update], options)?;
+    let rows = row_security(table, schema, RowStatement::Update { reads: true }, options)?;
     let columns = collect_column_names(table, schema)?;
     let primary_key = collect_pk_column_names(table, schema)?;
-    let (assigned, using, check) =
-        build_write_guard(&policies, GuardKind::Update, table, schema, options, emit)?;
+    let WriteGuard { columns: assigned, using, check, read_back } =
+        build_write_guard(&rows, GuardKind::Update, table, schema, options, emit)?;
     let assignments = assigned
         .iter()
         .filter(|column| !column.is_generated())
@@ -2443,7 +2369,8 @@ fn generate_update_trigger_sql(
         PolicyPredicate::Expr(predicate) => Some(predicate.as_ref().clone()),
         PolicyPredicate::AllowAll | PolicyPredicate::DenyAll => None,
     };
-    let using_denies = policies.is_empty() || matches!(using, PolicyPredicate::DenyAll);
+    let using_denies = rows.has_no_policy(GatedCommand::Update, RowVersion::Existing)
+        || matches!(using, PolicyPredicate::DenyAll);
     let authorization = if using_denies {
         write_exemption_expr(options)
             .map(|call| Expr::IsTrue(Box::new(Expr::Nested(Box::new(call)))))
@@ -2479,34 +2406,11 @@ fn generate_update_trigger_sql(
             body
         }
     } else {
-        let guard = match check {
-            PolicyPredicate::DenyAll => {
-                Some(ast_builder::raise_statement(
-                    "ABORT",
-                    Some(RLS_VIOLATION),
-                    write_guard_condition_expr(None, options),
-                ))
-            }
-            PolicyPredicate::AllowAll => None,
-            PolicyPredicate::Expr(check) => {
-                let violation = match using_predicate {
-                    Some(using) => {
-                        Expr::BinaryOp {
-                            left: Box::new(Expr::Nested(Box::new(using))),
-                            op: BinaryOperator::And,
-                            right: Box::new(policy_violation(*check)),
-                        }
-                    }
-                    None => policy_violation(*check),
-                };
-                Some(ast_builder::raise_statement(
-                    "ABORT",
-                    Some(RLS_VIOLATION),
-                    write_guard_condition_expr(Some(violation), options),
-                ))
-            }
-        };
-        let mut body = guard.into_iter().collect::<Vec<_>>();
+        // The updated row has to pass `WITH CHECK` and, since the trigger names
+        // its row, the `SELECT` policies it is read back through.
+        let mut body = new_row_guard(check, read_back, using_predicate, options)
+            .into_iter()
+            .collect::<Vec<_>>();
         body.extend(forwarded);
         body
     };
@@ -2530,19 +2434,19 @@ fn generate_delete_trigger_sql(
 ) -> Result<Statement, Error> {
     let ctx = RlsTriggerContext::new(table, options);
     let table_name = ctx.table_name;
-    let policies = filter_policies(table, schema, &[CreatePolicyCommand::Delete], options)?;
+    let rows = row_security(table, schema, RowStatement::Delete { reads: true }, options)?;
     let columns = collect_column_names(table, schema)?;
     let primary_key = collect_pk_column_names(table, schema)?;
     let using = combine_policy_predicates(
-        &policies,
-        PolicyClause::Using,
+        rows.gate(GatedCommand::Delete, RowVersion::Existing),
         PolicyBindings { prefix: Some("OLD"), substitutions: &[] },
         options,
         table,
         schema,
         emit,
     )?;
-    let using_denies = policies.is_empty() || matches!(using, PolicyPredicate::DenyAll);
+    let using_denies = rows.has_no_policy(GatedCommand::Delete, RowVersion::Existing)
+        || matches!(using, PolicyPredicate::DenyAll);
     let authorization = if using_denies {
         write_exemption_expr(options)
             .map(|call| Expr::IsTrue(Box::new(Expr::Nested(Box::new(call)))))
@@ -3028,12 +2932,12 @@ mod tests {
     };
 
     use super::{
-        ResolvedSchemaFacts, SubqueryTransformContext, filter_policies,
-        generate_delete_trigger_sql, generate_insert_trigger_sql, generate_readonly_rls_statements,
-        generate_rls_audit_table, generate_rls_statements, generate_rls_validation_statements,
-        generate_update_trigger_sql, rename_table_for_rls, transform_expr,
-        transform_join_operator_for_subquery, transform_query, transform_table_factor_for_subquery,
-        validate_session_variables, validate_table_policies,
+        ResolvedSchemaFacts, SubqueryTransformContext, generate_delete_trigger_sql,
+        generate_insert_trigger_sql, generate_readonly_rls_statements, generate_rls_audit_table,
+        generate_rls_statements, generate_rls_validation_statements, generate_update_trigger_sql,
+        rename_table_for_rls, transform_expr, transform_join_operator_for_subquery,
+        transform_query, transform_table_factor_for_subquery, validate_session_variables,
+        validate_table_policies,
     };
     use crate::{
         impls::{function_helpers::single_quoted_literal, session_variable},
@@ -3604,14 +3508,6 @@ mod tests {
         );
         let lowercased_columns = resolved_sets(table, &schema);
         let facts = ResolvedSchemaFacts { lowercased_columns: &lowercased_columns };
-
-        let select_policies = filter_policies(
-            table,
-            &schema,
-            &[sqlparser::ast::CreatePolicyCommand::Select],
-            &options,
-        )?;
-        assert_eq!(select_policies.len(), 1);
 
         let transformed_query = transform_query(
             &parse_query(

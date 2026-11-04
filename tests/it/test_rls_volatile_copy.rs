@@ -141,6 +141,36 @@ fn volatile_update_using_predicate_is_refused() {
     assert!(err.contains("docs_p"), "refusal must name the policy: {err}");
 }
 
+/// The refusal names the clause holding the volatile predicate, so the author
+/// knows which one to rewrite: an explicit `WITH CHECK`, a `USING` standing in
+/// for a missing `WITH CHECK`, and a `SELECT` policy's `USING` checked against
+/// the updated row.
+#[test]
+fn the_refusal_names_the_clause_holding_the_volatile_predicate() {
+    const TABLE: &str = "
+        CREATE TABLE docs (id INTEGER PRIMARY KEY, owner TEXT NOT NULL);
+        ALTER TABLE docs ENABLE ROW LEVEL SECURITY;";
+    for (policies, clause) in [
+        (
+            "CREATE POLICY docs_p ON docs FOR INSERT WITH CHECK (random() > 0);",
+            "\"docs_p\" WITH CHECK predicate",
+        ),
+        (
+            "CREATE POLICY docs_p ON docs FOR INSERT WITH CHECK (true);
+             CREATE POLICY docs_all ON docs FOR ALL USING (random() > 0);",
+            "\"docs_all\" USING (as WITH CHECK) predicate",
+        ),
+        (
+            "CREATE POLICY docs_p ON docs FOR UPDATE USING (true);
+             CREATE POLICY docs_sel ON docs FOR SELECT USING (random() > 0);",
+            "\"docs_sel\" USING (on the new row) predicate",
+        ),
+    ] {
+        let err = refusal(&format!("{TABLE} {policies}"));
+        assert!(err.contains(clause), "{policies} must be refused naming {clause}: {err}");
+    }
+}
+
 /// A deterministic USING predicate translates and a write through the view
 /// lands the row.
 #[test]

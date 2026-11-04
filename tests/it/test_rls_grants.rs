@@ -338,6 +338,8 @@ impl HasOwnerId for Group {
     }
 }
 
+/// The fixture's `_unfiltered` views read past the policies as their owner,
+/// the role that runs the schema.
 fn translation_options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
@@ -347,6 +349,7 @@ fn translation_options() -> Pg2SqliteOptions {
             "current_app_user",
         ))
         .with_rls_audit_table_name("rls_audit".to_string())
+        .with_schema_owner_role("migrator")
 }
 
 fn setup_database(connection: &mut SqliteConnection) -> Result<(), Box<dyn std::error::Error>> {
@@ -355,6 +358,7 @@ fn setup_database(connection: &mut SqliteConnection) -> Result<(), Box<dyn std::
     // groups.sql and rls_grants.sql form one reference-closed document: the
     // grants fixture's FKs resolve against tables groups.sql creates.
     let translated = Pg2Sqlite::default()
+        .sql("CREATE ROLE migrator;")?
         .sql(include_str!("../fixtures/groups.sql"))?
         .sql(include_str!("../fixtures/rls_grants.sql"))?
         .translate(&options)?
@@ -712,7 +716,7 @@ fn test_rls_grants_translation_snapshot() -> Result<(), Box<dyn std::error::Erro
     // Translate both files together
     let groups_sql = include_str!("../fixtures/groups.sql");
     let grants_sql = include_str!("../fixtures/rls_grants.sql");
-    let combined_sql = format!("{groups_sql}\n{grants_sql}");
+    let combined_sql = format!("CREATE ROLE migrator;\n{groups_sql}\n{grants_sql}");
 
     let options = translation_options();
 

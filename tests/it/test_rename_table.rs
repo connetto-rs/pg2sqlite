@@ -163,9 +163,11 @@ fn a_qualified_rename_target_is_rejected() {
 #[test]
 fn row_level_security_without_a_rename_builds_its_object_set() {
     let stmts = rls_translation(
-        "CREATE TABLE t2 (id INT PRIMARY KEY, owner TEXT);
+        "CREATE ROLE app_user;
+         CREATE TABLE t2 (id INT PRIMARY KEY, owner TEXT);
          ALTER TABLE t2 ENABLE ROW LEVEL SECURITY;
-         CREATE POLICY p ON t2 USING (owner = current_setting('app.user'));",
+         CREATE POLICY p ON t2 USING (owner = current_setting('app.user'));
+         GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_user;",
     );
     let emitted = stmts.join("\n");
     assert!(
