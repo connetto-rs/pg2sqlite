@@ -303,6 +303,35 @@ fn set_operation_view_keeps_the_left_arm_shape() {
     assert_eq!(rows, ["ax".to_owned(), "bn".to_owned()]);
 }
 
+/// PostgreSQL refuses to drop a column a view reads ("cannot drop column id
+/// of table a because other objects depend on it"), so the script is refused
+/// at translation and no replay ever meets a view over a retired column.
+#[test]
+fn a_view_over_a_column_the_script_drops_is_refused() {
+    let error = Pg2Sqlite::default()
+        .sql(
+            "CREATE TABLE a(key INT PRIMARY KEY, id INT NOT NULL);
+             INSERT INTO a VALUES(0, 1);
+             CREATE TEMP VIEW v AS SELECT id FROM a;
+             ALTER TABLE a DROP COLUMN id;
+             ALTER TABLE a ADD COLUMN id INT NOT NULL DEFAULT 99;",
+        )
+        .expect("parse")
+        .translate_to_sql(&Pg2SqliteOptions::default())
+        .expect_err("PostgreSQL refuses the drop");
+    let Error::SchemaError(schema_error) = error else {
+        panic!("expected the schema refusal, got {error:?}");
+    };
+    assert!(
+        matches!(
+            &*schema_error,
+            sql_traits::errors::Error::ColumnReferenced { table_name, column_name }
+                if table_name == "a" && column_name == "id"
+        ),
+        "{schema_error:?}"
+    );
+}
+
 #[test]
 fn connect_refuses_a_seed_over_a_retired_column() {
     let script = script(
