@@ -20,6 +20,8 @@ autotests = false
 sqlparser = { version = "0.64", default-features = false, features = ["visitor"] }
 sqlparser-plpgsql = { git = "https://github.com/connetto-rs/sqlparser-plpgsql", branch = "main", features = ["body-parse"] }
 sql-traits = { git = "https://github.com/connetto-rs/sql-traits", branch = "main", default-features = false }
+# Reads, prints and computes PostgreSQL intervals the way PostgreSQL 18 does.
+sql-values = { version = "0.3", default-features = false }
 git2 = { version = "0.21", optional = true }
 tempfile = { version = "3.27", optional = true }
 thiserror = { version = "2.0", default-features = false }

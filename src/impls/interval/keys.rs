@@ -24,6 +24,7 @@ use alloc::{
 use core::ops::ControlFlow;
 
 use sql_traits::{errors::LookupError, structs::ParserDB};
+use sql_values::IntervalTypmod;
 use sqlparser::{
     ast::{
         BinaryOperator, Distinct, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
@@ -36,7 +37,6 @@ use sqlparser::{
 };
 
 use super::{
-    Typmod,
     fields::Aggregate,
     interval_data_type_typmod, is_interval_data_type,
     keys_templates::{self, PLACEHOLDER},
@@ -88,7 +88,7 @@ pub(super) enum IntervalSide {
     BareLiteral(String),
     /// A literal the statement types as an interval, a cast or an
     /// `INTERVAL '…'` qualifier setting the typmod it keeps.
-    TypedLiteral { text: String, typmod: Option<Typmod> },
+    TypedLiteral { text: String, typmod: IntervalTypmod },
     /// The side holds the canonical text the key reads, a column or a bound
     /// parameter: key it at run time.
     Keyed(Box<Expr>),
@@ -181,7 +181,8 @@ fn interval_side_cast(
             let Some(text) = value_of(expr).and_then(string_literal_text) else {
                 return Err(cast_spelling_refusal());
             };
-            Ok(IntervalSide::TypedLiteral { text, typmod: interval_data_type_typmod(data_type)? })
+            let typmod = interval_data_type_typmod(data_type)?.unwrap_or_default();
+            Ok(IntervalSide::TypedLiteral { text, typmod })
         }
     }
 }
@@ -323,14 +324,14 @@ pub(crate) fn keyed_text_expr(
 
 /// The comparison key of the interval literal `text` under `typmod`, as a
 /// string literal, or the refusal PostgreSQL answers.
-pub(crate) fn literal_key(text: &str, typmod: Option<Typmod>) -> Result<Expr, Error> {
+pub(crate) fn literal_key(text: &str, typmod: IntervalTypmod) -> Result<Expr, Error> {
     Ok(string_literal(&literal_comparison_key(text, typmod)?))
 }
 
 /// The keyed text of the interval literal `text` under `typmod`: the
 /// comparison key with the canonical text kept behind it, as `min` and
 /// `max` pick the text off.
-pub(crate) fn literal_keyed_text(text: &str, typmod: Option<Typmod>) -> Result<Expr, Error> {
+pub(crate) fn literal_keyed_text(text: &str, typmod: IntervalTypmod) -> Result<Expr, Error> {
     Ok(Expr::BinaryOp {
         left: Box::new(literal_key(text, typmod)?),
         op: BinaryOperator::StringConcat,
@@ -363,7 +364,7 @@ pub(crate) fn operand_key(
         }
         IntervalSide::BareLiteral(text) => {
             match bare_literals {
-                BareLiterals::AsInterval => literal_key(&text, None),
+                BareLiterals::AsInterval => literal_key(&text, IntervalTypmod::default()),
                 BareLiterals::AsText => {
                     Err(Error::forward_refusal(format!(
                         "operator does not exist: interval {operator} text. An array literal beside an \
@@ -404,7 +405,9 @@ pub(crate) fn position_key(
     emit: WarningSink<'_>,
 ) -> Result<Option<Expr>, Error> {
     let resolved = match interval_side(side, schema, options)? {
-        IntervalSide::BareLiteral(text) => return Ok(Some(literal_key(&text, None)?)),
+        IntervalSide::BareLiteral(text) => {
+            return Ok(Some(literal_key(&text, IntervalTypmod::default())?));
+        }
         IntervalSide::TypedLiteral { text, typmod } => {
             return Ok(Some(literal_key(&text, typmod)?));
         }
@@ -708,7 +711,7 @@ fn extremum_argument_key(
     emit: WarningSink<'_>,
 ) -> Result<Expr, Error> {
     match interval_side(arg, schema, options)? {
-        IntervalSide::BareLiteral(text) => literal_keyed_text(&text, None),
+        IntervalSide::BareLiteral(text) => literal_keyed_text(&text, IntervalTypmod::default()),
         IntervalSide::TypedLiteral { text, typmod } => literal_keyed_text(&text, typmod),
         IntervalSide::Null => {
             Ok(Expr::Value(ValueWithSpan { value: Value::Null, span: Span::empty() }))
