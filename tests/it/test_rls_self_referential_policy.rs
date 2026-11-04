@@ -116,6 +116,18 @@ fn a_self_reference_inside_a_derived_table_is_refused() {
     assert!(error.contains("infinite recursion"), "{error}");
 }
 
+/// A reference inside `= ANY (ARRAY(subquery))`, which PostgreSQL 18.6
+/// answers with `infinite recursion detected in policy for relation "oo"`.
+#[test]
+fn a_self_reference_inside_an_array_subquery_is_refused() {
+    let error = refusal(&format!(
+        "{TABLE}
+         CREATE POLICY p ON oo FOR SELECT USING (
+             id = ANY (ARRAY(SELECT id FROM oo WHERE kind = 1)));"
+    ));
+    assert!(error.contains("infinite recursion"), "{error}");
+}
+
 /// A policy with no `FOR` clause covers every command including the read, and
 /// PostgreSQL was measured to recurse on it, so it is refused too.
 #[test]
