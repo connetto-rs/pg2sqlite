@@ -1064,7 +1064,7 @@ pub(crate) fn case_when(condition: Expr, then_expr: Expr, else_expr: Option<Expr
 
 /// `<left> IS NOT DISTINCT FROM <right>`, null-safe equality.
 ///
-/// SQLite has taken this spelling since 3.39 and the floor is 3.46, so the bare
+/// SQLite has taken this spelling since 3.39 and the floor is 3.47, so the bare
 /// `IS` this used to render through `BinaryOperator::Custom` buys nothing and
 /// costs the round trip: `a IS b` is valid SQLite that `sqlparser` refuses,
 /// taking only `IS [NOT] NULL|TRUE|FALSE|DISTINCT FROM` after `IS`, so the

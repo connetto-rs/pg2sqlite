@@ -120,7 +120,7 @@ fn concat_ws_separator_plus_multiple_values() {
 
 #[test]
 fn filter_clause_on_count_star() {
-    // SQLite 3.25 added native FILTER support; 3.46 is our floor, so the
+    // SQLite 3.25 added native FILTER support; 3.47 is our floor, so the
     // translator keeps the FILTER clause rather than lowering to CASE WHEN.
     let sql = "CREATE TABLE t (id INT PRIMARY KEY, x INT);
                SELECT COUNT(*) FILTER (WHERE x > 5) FROM t;";

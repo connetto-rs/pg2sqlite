@@ -3,7 +3,7 @@
 //! PostgreSQL numbers weeks by ISO 8601, Monday based, with week 1 holding the
 //! first Thursday. SQLite's `%W` is Sunday based and disagrees at every year
 //! boundary. Its `%V` is the ISO one, available since 3.30.0 and well under the
-//! 3.46.0 floor.
+//! 3.47.0 floor.
 //!
 //! Measured on PostgreSQL 16 and SQLite 3.51.1:
 //!

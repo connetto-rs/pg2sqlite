@@ -16,7 +16,7 @@ diesel::table! {
 }
 
 /// The comparison is handed straight to SQLite, which has taken both spellings
-/// since 3.39 and is pinned at 3.46 here. It used to be lowered to `NOT (a IS
+/// since 3.39 and is pinned at 3.47 here. It used to be lowered to `NOT (a IS
 /// b)`, valid SQLite that the crate's own parser cannot read back.
 #[test]
 fn test_is_distinct_from_translation_form() {

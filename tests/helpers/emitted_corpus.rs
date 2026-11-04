@@ -712,6 +712,18 @@ pub const CORPUS_GROUPS: &[(&str, &[&str])] = &[
                  END; $$;
                  CREATE TRIGGER pt4 AFTER INSERT ON ev4 FOR EACH ROW EXECUTE FUNCTION pf4();
                  INSERT INTO ev4 VALUES (2, 10);",
+                // A RAISE format's arguments land in the message as an
+                // expression, which SQLite's RAISE takes from 3.47.0.
+                "CREATE TABLE ev5 (id INT PRIMARY KEY, val INT);
+                 CREATE FUNCTION pf5() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN
+                   IF NEW.val < 0 THEN
+                     RAISE EXCEPTION 'val % of row % is negative', NEW.val, NEW.id;
+                   END IF;
+                   RETURN NEW;
+                 END; $$;
+                 CREATE TRIGGER pt5 BEFORE INSERT ON ev5 FOR EACH ROW EXECUTE FUNCTION pf5();
+                 INSERT INTO ev5 VALUES (1, 3);",
                     ],
     ),
     (
