@@ -484,6 +484,10 @@ impl From<sqlparser_plpgsql::Error> for Error {
                  '<string literal>' translates to SQLite"
                 ))
             }
+            // PostgreSQL refuses this RAISE when the function is created.
+            error @ Extracted::RaiseParameterCount { .. } => {
+                Self::unsupported_source_syntax(error.to_string())
+            }
             Extracted::Tokenization { name, body, source } => {
                 Self::unsupported_source_syntax(format!(
                     "Failed to tokenize trigger function '{name}' body: {source}. Body: {body}"

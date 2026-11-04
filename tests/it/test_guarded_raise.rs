@@ -9,7 +9,10 @@
 //! The RLS triggers already emit the right idiom, `SELECT RAISE(ABORT, ...)
 //! WHERE NOT (...)`, so the guard has a place to go.
 
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+use pg2sqlite::{
+    errors::{Error, RefusalCategory, TranslationDirection},
+    prelude::{Pg2Sqlite, Pg2SqliteOptions},
+};
 use rusqlite::Connection;
 
 const SCHEMA: &str = "CREATE TABLE t (id INT PRIMARY KEY, val INT);
@@ -62,4 +65,27 @@ fn a_row_the_guard_rejects_aborts() {
     let remaining: i64 =
         connection.query_row("SELECT count(*) FROM t", [], |row| row.get(0)).expect("count");
     assert_eq!(remaining, 0, "the rejected row must not be stored");
+}
+
+/// PostgreSQL refuses a RAISE whose `%` placeholders and arguments differ in
+/// number when the function is created, so the source is not valid PL/pgSQL.
+#[test]
+fn a_raise_with_more_placeholders_than_arguments_is_refused() {
+    let schema =
+        SCHEMA.replace("'val must not be negative'", "'val % must not be below %', NEW.val");
+    let error = Pg2Sqlite::default()
+        .sql(&schema)
+        .expect("parse")
+        .translate(&Pg2SqliteOptions::default())
+        .expect_err("PostgreSQL refuses too few RAISE parameters");
+    let Error::TranslationRefusal(refusal) = error else {
+        panic!("expected a translation refusal, got: {error:?}");
+    };
+    assert_eq!(refusal.direction(), TranslationDirection::PostgreSqlToSqlite);
+    assert_eq!(refusal.category(), RefusalCategory::UnsupportedSourceSyntax);
+    assert!(
+        refusal.detail().contains("'val % must not be below %'"),
+        "the refusal must name the format: {}",
+        refusal.detail()
+    );
 }
