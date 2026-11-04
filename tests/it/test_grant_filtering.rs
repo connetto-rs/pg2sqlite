@@ -67,7 +67,6 @@ use std::cell::Cell;
 use diesel::prelude::*;
 use helpers::{establish_connection, set_session_user_id};
 use pg2sqlite::{
-    errors::{Error, RefusalCategory},
     prelude::{Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation},
     traits::SessionVariableMapping,
     warnings::TranslationWarning,
@@ -496,25 +495,30 @@ fn test_writable_insert_fails_wrong_user() -> Result<(), Box<dyn std::error::Err
 }
 
 /// PostgreSQL gives a table created after `ALTER DEFAULT PRIVILEGES ... ON
-/// TABLES` the privileges it names, so `app_user` can read `t` here. The grant
-/// model behind role filtering does not apply default privileges and would
-/// leave `t` out, so a role-scoped translation refuses the statement.
+/// TABLES` the privileges it names, so `app_user` reads `t` and still not
+/// `before`, created earlier.
 #[test]
-fn role_scoped_translation_refuses_default_table_privileges() {
-    let error = Pg2Sqlite::default()
+fn default_table_privileges_reach_only_tables_created_afterwards() {
+    let report = Pg2Sqlite::default()
         .sql(
             "CREATE ROLE app_user;\n\
+             CREATE TABLE before (id INTEGER PRIMARY KEY);\n\
              ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO app_user;\n\
              CREATE TABLE t (id INTEGER PRIMARY KEY);",
         )
         .expect("parse")
-        .translate(&Pg2SqliteOptions::default().with_session_user_role("app_user"))
-        .expect_err("refused");
-    let Error::TranslationRefusal(refusal) = error else {
-        panic!("expected a structured translation refusal, got {error:?}");
-    };
-    assert_eq!(refusal.category(), RefusalCategory::UnrepresentableSemantics);
-    assert!(refusal.detail().contains("ALTER DEFAULT PRIVILEGES"), "{}", refusal.detail());
+        .translate_with_report(&Pg2SqliteOptions::default().with_session_user_role("app_user"))
+        .expect("translate");
+    let emitted: Vec<String> = report.script.iter().map(ToString::to_string).collect();
+    assert!(emitted.iter().any(|statement| statement.starts_with("CREATE TABLE t")), "{emitted:?}");
+    assert!(
+        !emitted.iter().any(|statement| statement.starts_with("CREATE TABLE before")),
+        "{emitted:?}"
+    );
+    assert!(report.warnings.iter().any(|warning| matches!(
+        warning,
+        TranslationWarning::LossyDrop { construct, .. } if construct == "ALTER DEFAULT PRIVILEGES"
+    )));
 }
 
 /// Default privileges on sequences decide nothing role filtering reads, so

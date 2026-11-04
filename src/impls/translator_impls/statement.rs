@@ -43,14 +43,13 @@ use sql_traits::{
     traits::{DatabaseLike, TableLike},
 };
 use sqlparser::ast::{
-    AlterDefaultPrivileges, AlterDefaultPrivilegesOperation, AlterTable, AlterTableOperation,
-    AlterTableType, AlterView, AlterViewOperation, BeginTransactionKind, BinaryOperator,
-    CascadeOption, ColumnDef, ColumnOption, CreateFunction, CreateView,
-    DefaultPrivilegesObjectType, Delete, DescribeAlias, DiscardObject, DropBehavior, ExceptionWhen,
-    Expr, FromTable, Ident, Merge, ObjectName, ObjectNamePart, ObjectType, RenameTable,
-    RenameTableNameKind, Set, Statement, TableFactor, TableWithJoins, TransactionAccessMode,
-    TransactionMode, TransactionModifier, TriggerEvent, TriggerPeriod, Truncate,
-    TruncateIdentityOption, UnaryOperator, VacuumStatement, helpers::attached_token::AttachedToken,
+    AlterTable, AlterTableOperation, AlterTableType, AlterView, AlterViewOperation,
+    BeginTransactionKind, BinaryOperator, CascadeOption, ColumnDef, ColumnOption, CreateFunction,
+    CreateView, Delete, DescribeAlias, DiscardObject, DropBehavior, ExceptionWhen, Expr, FromTable,
+    Ident, Merge, ObjectName, ObjectNamePart, ObjectType, RenameTable, RenameTableNameKind, Set,
+    Statement, TableFactor, TableWithJoins, TransactionAccessMode, TransactionMode,
+    TransactionModifier, TriggerEvent, TriggerPeriod, Truncate, TruncateIdentityOption,
+    UnaryOperator, VacuumStatement, helpers::attached_token::AttachedToken,
 };
 
 use crate::{
@@ -1673,33 +1672,6 @@ fn translate_discard(
     }
 }
 
-/// `ALTER DEFAULT PRIVILEGES` decides the privileges of objects created
-/// afterwards. Only a role-scoped translation reads privileges, and only those
-/// on tables, which the grant model behind it does not derive from default
-/// privileges. A table the statement grants a role would be left out of that
-/// role's translation, so the statement is refused there and dropped elsewhere.
-fn translate_alter_default_privileges(
-    statement: &Statement,
-    alter: &AlterDefaultPrivileges,
-    schema: &ParserDB,
-    options: &crate::options::TranslationContext<'_>,
-    emit: crate::warnings::WarningSink<'_>,
-) -> Result<Vec<Statement>, Error> {
-    let (AlterDefaultPrivilegesOperation::Grant { object_type, .. }
-    | AlterDefaultPrivilegesOperation::Revoke { object_type, .. }) = &alter.operation;
-    if matches!(object_type, DefaultPrivilegesObjectType::Tables)
-        && resolve_session_role(schema, options).is_some()
-    {
-        return Err(reject_unsupported_statement(
-            statement,
-            "Role filtering decides which tables the session role reads from explicit grants, \
-             and the privileges this statement gives tables created afterwards are not among \
-             them. Grant the privileges on each table instead.",
-        ));
-    }
-    Ok(drop_with_warning("ALTER DEFAULT PRIVILEGES", REASON_ACCESS_CONTROL, emit))
-}
-
 impl crate::traits::translator::TranslatorWithContext for Statement {
     type SQLiteEntry = Vec<Statement>;
 
@@ -1976,8 +1948,10 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
             Self::Revoke(_) | Self::RevokeRole(_) => {
                 drop_with_warning("REVOKE", REASON_ACCESS_CONTROL, emit)
             }
-            Self::AlterDefaultPrivileges(alter) => {
-                translate_alter_default_privileges(self, alter, schema, options, emit)?
+            // The schema applies its defaults to the objects created
+            // afterwards, which role filtering reads as it reads a GRANT's.
+            Self::AlterDefaultPrivileges(_) => {
+                drop_with_warning("ALTER DEFAULT PRIVILEGES", REASON_ACCESS_CONTROL, emit)
             }
             Self::Deny { .. } => drop_with_warning("DENY", REASON_ACCESS_CONTROL, emit),
             Self::CreateType { .. } => {
