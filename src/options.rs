@@ -13,7 +13,7 @@ use alloc::{
 };
 
 use sql_traits::structs::{
-    ColumnDefinition, ColumnDefinitionScope, ColumnQueryScope, ColumnScope, ParserDB,
+    ColumnDefinition, ColumnDefinitionScope, ColumnQueryScope, ColumnScope, Deployment, ParserDB,
 };
 
 use crate::traits::{
@@ -88,6 +88,9 @@ pub struct Pg2SqliteOptions {
     schema_owner_role: Option<String>,
     /// Mappings from PostgreSQL session variable patterns to SQLite functions.
     session_variables: Vec<SessionVariableMapping>,
+    /// The roles and session settings the deployment's requests run with,
+    /// which say which setting holds the caller a definer helper reads.
+    deployment: Option<Deployment>,
     /// The name of the audit table for RLS validation monitoring.
     rls_audit_table_name: Option<String>,
     /// The caller-registered function that exempts generated write guards.
@@ -128,6 +131,7 @@ impl<'a> arbitrary::Arbitrary<'a> for Pg2SqliteOptions {
             session_user_role: Option::<String>::arbitrary(u)?,
             schema_owner_role: Option::<String>::arbitrary(u)?,
             session_variables: Vec::<SessionVariableMapping>::arbitrary(u)?,
+            deployment: None,
             rls_audit_table_name: Option::<String>::arbitrary(u)?,
             write_exemption_function: Option::<String>::arbitrary(u)?,
             strict_rls_validation: bool::arbitrary(u)?,
@@ -155,6 +159,7 @@ impl Default for Pg2SqliteOptions {
             session_user_role: None,
             schema_owner_role: None,
             session_variables: Vec::new(),
+            deployment: None,
             rls_audit_table_name: None,
             write_exemption_function: None,
             strict_rls_validation: false,
@@ -830,6 +835,24 @@ impl Pg2SqliteOptions {
                 variable_name,
                 func_name,
             ))
+    }
+
+    #[must_use]
+    /// Sets the deployment whose requests the policies serve.
+    ///
+    /// A policy calling a `SECURITY DEFINER` helper translates as the set the
+    /// helper returns for the caller this deployment declares, read through the
+    /// mapping of the caller's setting. Without a deployment such a call is
+    /// refused.
+    pub fn with_deployment(mut self, deployment: Deployment) -> Self {
+        self.deployment = Some(deployment);
+        self
+    }
+
+    #[must_use]
+    /// Returns the deployment the policies serve.
+    pub fn get_deployment(&self) -> Option<&Deployment> {
+        self.deployment.as_ref()
     }
 
     #[must_use]
