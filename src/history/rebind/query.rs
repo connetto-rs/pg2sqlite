@@ -294,7 +294,8 @@ impl Planner<'_> {
         resolve: &dyn Fn(&Expr) -> Resolved<'s, 'q, 'd>,
         expr: &Expr,
     ) -> Result<Option<String>, ConnectionError> {
-        let Ok(Some((ColumnDefinition::Base { table, column }, binding))) = resolve(expr) else {
+        let Ok(Some((ColumnDefinition::Base { table, column, .. }, binding))) = resolve(expr)
+        else {
             return Ok(None);
         };
         let parts: Vec<&Ident> = match expr {
