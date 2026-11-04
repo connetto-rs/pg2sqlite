@@ -80,7 +80,7 @@ impl<S> InitializationPlan<S> {
     /// Assembles the plan from the main-file `prelude`, every unit's files and
     /// emitted form, and the forms of both fresh-file selections.
     pub(crate) fn new(
-        prelude: Option<S>,
+        prelude: Vec<S>,
         units: impl IntoIterator<Item = (Files, Vec<S>)>,
         main: Forms<S>,
         attached: Forms<S>,
@@ -88,13 +88,11 @@ impl<S> InitializationPlan<S> {
         let (main_unavailable, main) = split(main);
         let (attached_unavailable, attached) = split(attached);
         let (mut main, mut attached) = (main.into_iter(), attached.into_iter());
-        let prelude = prelude.map(|statement| {
-            Step {
-                files: Files::MAIN,
-                base: alloc::vec![statement],
-                main_rebound: None,
-                attached_rebound: None,
-            }
+        let prelude = (!prelude.is_empty()).then_some(Step {
+            files: Files::MAIN,
+            base: prelude,
+            main_rebound: None,
+            attached_rebound: None,
         });
         let steps = prelude
             .into_iter()

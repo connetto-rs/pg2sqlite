@@ -33,7 +33,7 @@ use crate::{
         object_name::last_ident_value_or_display,
         translator_impls::{
             create_index::{FtsTranslation, analyze_fts_index},
-            postgis,
+            definer, postgis,
             rls::generate_rls_audit_table,
         },
     },
@@ -307,7 +307,8 @@ struct PreparedStatements<'a> {
     schema: ParserDB,
     options: Pg2SqliteOptions,
     statements: Vec<Vec<Statement>>,
-    audit_table: Option<Statement>,
+    /// Tables the translation adds before the source's statements.
+    prelude: Vec<Statement>,
     warnings: Vec<crate::warnings::TranslationWarning>,
     epochs: Vec<PreparedEpoch>,
     dispositions: Vec<crate::impls::transaction_blocks::Disposition>,
@@ -802,13 +803,19 @@ impl Pg2Sqlite {
         let audit_table = (!had_rls_tables && schema.has_rls_tables()?)
             .then(|| options.get_rls_audit_table_name())
             .flatten()
-            .map(generate_rls_audit_table);
+            .map(|name| ("the row-security audit table", generate_rls_audit_table(name)));
+        let definer_stack = translated
+            .iter()
+            .flatten()
+            .any(definer::uses_stack)
+            .then(|| ("the definer owner stack", definer::stack_table()));
+        let prelude: Vec<_> = audit_table.into_iter().chain(definer_stack).collect();
 
         reject_name_collisions(
             initial_schema.as_ref(),
-            audit_table
+            prelude
                 .iter()
-                .map(|statement| (Source::Generated("the row-security audit table"), statement))
+                .map(|(label, statement)| (Source::Generated(label), statement))
                 .chain(sourced(statements, &translated)),
         )?;
 
@@ -817,7 +824,7 @@ impl Pg2Sqlite {
             schema,
             options,
             statements: translated,
-            audit_table,
+            prelude: prelude.into_iter().map(|(_, statement)| statement).collect(),
             warnings,
             epochs,
             dispositions,
@@ -836,7 +843,7 @@ impl Pg2Sqlite {
             schema,
             options: _,
             mut statements,
-            audit_table,
+            prelude,
             mut warnings,
             epochs,
             dispositions,
@@ -861,7 +868,7 @@ impl Pg2Sqlite {
         let (main, attached) = crate::history::fresh_forms(&units, &mut placed, &schema, &context);
         drop(units);
         let files = crate::initialization::InitializationPlan::new(
-            audit_table,
+            prelude,
             placed.unit_files.into_iter().zip(statements),
             main,
             attached,

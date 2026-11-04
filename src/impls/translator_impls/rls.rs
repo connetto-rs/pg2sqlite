@@ -2100,13 +2100,27 @@ fn new_row_guard(
     ))
 }
 
+/// A `BEFORE` trigger on a backing table raising `message` where `condition`
+/// holds, unless a definer body whose owner is among `definer_owners` is
+/// running.
 fn backing_abort_trigger(
     name: &str,
     table_name: &str,
     event: sqlparser::ast::TriggerEvent,
     condition: Option<Expr>,
+    definer_owners: &[&str],
     message: &str,
 ) -> Statement {
+    let condition = match (condition, super::definer::outside_owners(definer_owners)) {
+        (Some(condition), Some(outside)) => {
+            Some(Expr::BinaryOp {
+                left: Box::new(Expr::Nested(Box::new(condition))),
+                op: BinaryOperator::And,
+                right: Box::new(outside),
+            })
+        }
+        (condition, outside) => condition.or(outside),
+    };
     ast_builder::trigger(
         generated_object_name(name),
         generated_object_name(table_name),
@@ -2149,6 +2163,7 @@ fn generate_insert_check_trigger_sql(
         &ctx.inner_table_name,
         sqlparser::ast::TriggerEvent::Insert,
         condition,
+        &super::definer::exempt_owners(table, schema),
         &message,
     )))
 }
@@ -2274,6 +2289,7 @@ fn generate_update_check_trigger_sql(
         &ctx.inner_table_name,
         sqlparser::ast::TriggerEvent::Update(Vec::new()),
         write_guard_condition_expr(violation, options),
+        &super::definer::exempt_owners(table, schema),
         RLS_VIOLATION,
     )))
 }
@@ -2306,6 +2322,7 @@ fn generate_delete_check_trigger_sql(
         &ctx.inner_table_name,
         sqlparser::ast::TriggerEvent::Delete,
         write_guard_condition_expr(violation, options),
+        &super::definer::exempt_owners(table, schema),
         RLS_VIOLATION,
     )))
 }
@@ -2519,6 +2536,9 @@ fn generate_readonly_backing_guard_sql(
             &ctx.inner_table_name,
             event,
             condition.clone(),
+            // The owner's privileges are not modelled, so a table the session
+            // role only reads stays closed to definer bodies too.
+            &[],
             &message,
         )
     })
@@ -2816,7 +2836,8 @@ fn generate_validation_view_statement(
     )
 }
 
-fn audit_column(name: &str, data_type: DataType, not_null: bool) -> ColumnDef {
+/// A column of a table the translation adds.
+pub(crate) fn generated_table_column(name: &str, data_type: DataType, not_null: bool) -> ColumnDef {
     let options = if not_null {
         vec![ColumnOptionDef { name: None, option: ColumnOption::NotNull }]
     } else {
@@ -2892,14 +2913,14 @@ pub fn generate_rls_audit_table(audit_table_name: &str) -> Statement {
         generated_object_name(audit_table_name),
         vec![
             audit_id_column(),
-            audit_column("table_name", DataType::Text, true),
-            audit_column("violation_type", DataType::Text, true),
-            audit_column("row_identifier", DataType::Text, true),
-            audit_column("policy_name", DataType::Text, false),
-            audit_column("detected_at", DataType::Text, true),
-            audit_column("severity", DataType::Text, true),
-            audit_column("details", DataType::Text, false),
-            audit_column("reported_at", DataType::Text, false),
+            generated_table_column("table_name", DataType::Text, true),
+            generated_table_column("violation_type", DataType::Text, true),
+            generated_table_column("row_identifier", DataType::Text, true),
+            generated_table_column("policy_name", DataType::Text, false),
+            generated_table_column("detected_at", DataType::Text, true),
+            generated_table_column("severity", DataType::Text, true),
+            generated_table_column("details", DataType::Text, false),
+            generated_table_column("reported_at", DataType::Text, false),
         ],
         true,
         true,

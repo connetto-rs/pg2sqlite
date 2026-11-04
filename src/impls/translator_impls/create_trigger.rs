@@ -307,17 +307,35 @@ fn generate_standard_trigger_body(
                 sqlparser::ast::ObjectNamePart::Function(_) => None,
             }
         });
-        let mut translated = super::plpgsql::PlPgSqlTranslator::translate_with_context(
+        let translated = super::plpgsql::PlPgSqlTranslator::translate_with_context(
             &body, context, schema, options, emit,
         )?;
-        for statement in &mut translated {
-            route_trigger_statement_writes(statement, schema, options)?;
-        }
-        body.statements = translated;
+        body.statements =
+            run_as_definer_or_route_writes(function_name, translated, schema, options)?;
         Ok(Some(body))
     } else {
         Ok(None)
     }
+}
+
+/// A `SECURITY DEFINER` body reads and writes as its owner, and any other
+/// body has its writes routed to backing storage under a configured write
+/// exemption.
+fn run_as_definer_or_route_writes(
+    function_name: &ObjectName,
+    mut translated: Vec<Statement>,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<Vec<Statement>, crate::errors::Error> {
+    if let Some(function) = crate::traits::schema::written_function(schema, function_name)?
+        && let Some(owner) = super::definer::definer_owner(function, schema)?
+    {
+        return super::definer::run_as_owner(function, owner, translated, schema, options);
+    }
+    for statement in &mut translated {
+        route_trigger_statement_writes(statement, schema, options)?;
+    }
+    Ok(translated)
 }
 
 /// Replaces `NEW` with `OLD` in compound identifiers so the WHEN clause can
