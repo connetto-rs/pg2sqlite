@@ -40,7 +40,7 @@ jobs:
           cache-targets: false
 
       - name: Install dioxus-cli
-        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2
         with:
           # A floating dx can diverge from the dioxus library and break the
           # build, so the CLI is pinned to a version tested against it. No
@@ -49,7 +49,7 @@ jobs:
           tool: dioxus-cli@0.7.9
 
       - name: Install wasm-bindgen-cli
-        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2
         with:
           tool: wasm-bindgen-cli
 
