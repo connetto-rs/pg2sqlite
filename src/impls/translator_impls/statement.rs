@@ -172,14 +172,16 @@ macro_rules! cursor_patterns {
     };
 }
 
-/// Stored procedures and macros. Their bodies are statements that would be
-/// lost, and `CALL` performs the work.
+/// Stored procedures, macros and `DO` blocks. Their bodies are statements
+/// that would be lost, and `CALL` or `DO` performs the work. A `DO` block is
+/// refused by `sql-traits` while the schema is built, before it gets here.
 macro_rules! procedural_patterns {
     () => {
         Statement::Call(_)
             | Statement::CreateProcedure { .. }
             | Statement::DropProcedure { .. }
             | Statement::CreateMacro { .. }
+            | Statement::Do(_)
     };
 }
 
@@ -2196,13 +2198,6 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
                     self,
                     "SQLite has no stored procedures, so the body would be lost and a call to it \
          would perform nothing. Inline the statements at each call site.",
-                ));
-            }
-            Statement::Do(_) => {
-                return Err(reject_unsupported_statement(
-                    self,
-                    "A DO block runs its procedural body at once, and SQLite has no procedural \
-         language, so the work it does would be lost. Run its statements as plain SQL instead.",
                 ));
             }
             session_state_patterns!() => {
