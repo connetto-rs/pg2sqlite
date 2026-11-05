@@ -22,7 +22,12 @@ wildcards = "allow"
 
 [advisories]
 # Check for known security vulnerabilities.
-ignore = []
+ignore = [
+    # astral-tokio-tar is unmaintained and only the dev-dependency testcontainers
+    # pulls it, whose newest release still requires it. Drop this entry once a
+    # testcontainers release does not.
+    { id = "RUSTSEC-2026-0440", reason = "dev-only through testcontainers, no release without it" },
+]
 
 [sources]
 # Allow git sources since the project uses git dependencies for sqlparser and sql-traits.
