@@ -20,6 +20,7 @@ use alloc::{
 use core::ops::ControlFlow;
 
 use sql_traits::structs::ParserDB;
+use sql_values::{IntervalTypmod, PgInterval};
 use sqlparser::{
     ast::{BinaryOperator, Expr, Ident, UnaryOperator, Value, ValueWithSpan, VisitMut, VisitorMut},
     dialect::SQLiteDialect,
@@ -27,11 +28,8 @@ use sqlparser::{
 };
 
 use super::{
-    ClockShift, IntervalShift, WRAP_IN_A_DAY,
-    decode::{Decoded, Interval, Typmod, interval_in},
-    fields_templates, interval_out_of_range,
+    ClockShift, IntervalShift, WRAP_IN_A_DAY, computed, fields_templates, finite_interval,
     keys::{self, IntervalSide},
-    postgres_text, refused,
 };
 use crate::{
     errors::Error,
@@ -59,29 +57,9 @@ const MICROS_SPLIT: i64 = 2_147_483_648;
 /// One operand of an arithmetic that is not NULL.
 enum FieldRow {
     /// A decoded finite interval: its fields as literals.
-    Literal(Interval),
+    Literal(PgInterval),
     /// The operand's text the field parse reads at run time.
     Text(Box<Expr>),
-}
-
-/// The refusal PostgreSQL answers for an infinite literal an arithmetic
-/// applies.
-fn infinite_refusal(text: &str) -> Error {
-    Error::forward_refusal(format!(
-        "interval '{text}' is infinite in PostgreSQL, and the replica has no representation \
-         for an infinite interval."
-    ))
-}
-
-/// The decoded side of a string literal the statement types as an interval,
-/// or the refusal PostgreSQL answers for it.
-fn literal_side(text: &str, typmod: Option<Typmod>) -> Result<FieldRow, Error> {
-    // `interval_in` folds the NOEND and NOBEGIN fields into its infinity
-    // answers, so a `Finite` side is finite by construction.
-    match interval_in(text, typmod).map_err(|refusal| refused(text, refusal))? {
-        Decoded::Finite(interval) => Ok(FieldRow::Literal(interval)),
-        Decoded::Infinity | Decoded::NegativeInfinity => Err(infinite_refusal(text)),
-    }
 }
 
 /// The non-NULL field side of `side`, or the refusal it answers beside
@@ -97,8 +75,12 @@ fn field_row(
 ) -> Result<Option<FieldRow>, Error> {
     match keys::interval_side(side, schema, options)? {
         IntervalSide::Null => Ok(None),
-        IntervalSide::BareLiteral(text) => Ok(Some(literal_side(&text, None)?)),
-        IntervalSide::TypedLiteral { text, typmod } => Ok(Some(literal_side(&text, typmod)?)),
+        IntervalSide::BareLiteral(text) => {
+            Ok(Some(FieldRow::Literal(finite_interval(&text, IntervalTypmod::default())?)))
+        }
+        IntervalSide::TypedLiteral { text, typmod } => {
+            Ok(Some(FieldRow::Literal(finite_interval(&text, typmod)?)))
+        }
         IntervalSide::Keyed(expr) => {
             let translated = expr.translate_with_warnings(schema, options, emit)?;
             Ok(Some(FieldRow::Text(Box::new(translated))))
@@ -185,8 +167,11 @@ fn field_sub(placeholder: &str) -> String {
 }
 
 /// The const row of a decoded literal's fields, in place of a field parse.
-fn literal_row(interval: &Interval) -> String {
-    format!("(SELECT {} AS m, {} AS d, {} AS u)", interval.months, interval.days, interval.micros)
+fn literal_row(interval: &PgInterval) -> String {
+    format!(
+        "(SELECT {} AS m, {} AS d, {} AS u)",
+        interval.months, interval.days, interval.microseconds
+    )
 }
 
 /// Replaces every operand placeholder in the parsed `template` with an owned
@@ -274,8 +259,7 @@ pub(crate) fn negated(
     };
     match row {
         FieldRow::Literal(interval) => {
-            let negated = interval.negated().map_err(|_| interval_out_of_range())?;
-            Ok(string_literal(&postgres_text(&negated)))
+            Ok(string_literal(&interval.checked_neg().map_err(computed)?.to_string()))
         }
         FieldRow::Text(translated) => {
             if !options.allows_subqueries() {
@@ -448,36 +432,11 @@ pub(crate) fn binary(
     match (left_row, right_row) {
         (None, _) | (_, None) => Ok(null_literal()),
         (Some(FieldRow::Literal(left)), Some(FieldRow::Literal(right))) => {
-            let months = match op {
-                BinaryOperator::Plus => i64::from(left.months) + i64::from(right.months),
-                _ => i64::from(left.months) - i64::from(right.months),
+            let result = match op {
+                BinaryOperator::Plus => left.checked_add(right),
+                _ => left.checked_sub(right),
             };
-            let days = match op {
-                BinaryOperator::Plus => i64::from(left.days) + i64::from(right.days),
-                _ => i64::from(left.days) - i64::from(right.days),
-            };
-            let Some(micros) = (match op {
-                BinaryOperator::Plus => left.micros.checked_add(right.micros),
-                _ => left.micros.checked_sub(right.micros),
-            }) else {
-                return Err(interval_out_of_range());
-            };
-            if months < i64::from(i32::MIN)
-                || months > i64::from(i32::MAX)
-                || days < i64::from(i32::MIN)
-                || days > i64::from(i32::MAX)
-            {
-                return Err(interval_out_of_range());
-            }
-            let result = Interval {
-                months: i32::try_from(months).expect("the range check above settles the 32 bits"),
-                days: i32::try_from(days).expect("the range check above settles the 32 bits"),
-                micros,
-            };
-            if result.is_infinite() {
-                return Err(interval_out_of_range());
-            }
-            Ok(string_literal(&postgres_text(&result)))
+            Ok(string_literal(&result.map_err(computed)?.to_string()))
         }
         (Some(left), Some(right)) => {
             if !options.allows_subqueries() {
@@ -662,14 +621,6 @@ fn is_numeric_type(expr: &Expr, schema: &ParserDB, options: &TranslationContext<
     })
 }
 
-/// The refusal a literal division by zero answers.
-fn division_by_zero() -> Error {
-    Error::forward_refusal(
-        "division by zero. PostgreSQL refuses this division, so the translation does too."
-            .to_string(),
-    )
-}
-
 /// The rendered text of an interval multiplied, `interval_mul`, or divided,
 /// `interval_div`, by a `float8` factor, or the refusal it answers.
 ///
@@ -702,11 +653,8 @@ pub(crate) fn scaled_binary(
         return Ok(null_literal());
     };
     if let (FieldRow::Literal(value), Factor::Literal(by)) = (&row, &factor) {
-        if divide && *by == 0.0 {
-            return Err(division_by_zero());
-        }
-        let scaled = value.scaled(*by, divide).map_err(|_| interval_out_of_range())?;
-        return Ok(string_literal(&postgres_text(&scaled)));
+        let scaled = if divide { value.checked_div(*by) } else { value.checked_mul(*by) };
+        return Ok(string_literal(&scaled.map_err(computed)?.to_string()));
     }
     if !options.allows_subqueries() {
         return Err(no_subquery_refusal());
