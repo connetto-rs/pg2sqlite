@@ -513,14 +513,17 @@ fn a_trigger_function_is_silent_while_a_lone_one_warns() {
     );
 }
 
+/// A `DO` block is refused while the schema is built, since its effects on
+/// the catalog depend on a database the model does not have.
 #[test]
-fn a_do_block_is_refused_as_procedural_code_that_would_not_run() {
-    crate::helpers::translate::assert_refused(
+fn a_do_block_is_refused_while_the_schema_is_built() {
+    for sql in [
         "DO $$ BEGIN INSERT INTO t VALUES (1, 'a'); END $$;",
-        "DO block",
-    );
-    crate::helpers::translate::assert_refused(
         "DO LANGUAGE plpgsql $$ BEGIN PERFORM 1; END $$;",
-        "DO block",
-    );
+    ] {
+        crate::helpers::translate::assert_refused(
+            sql,
+            "runs code whose effects on the schema this model cannot represent",
+        );
+    }
 }
