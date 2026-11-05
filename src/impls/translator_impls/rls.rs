@@ -570,8 +570,7 @@ struct WriteGuard {
     using: Option<PolicyPredicate>,
     /// `WITH CHECK` on the written row.
     check: PolicyPredicate,
-    /// The `SELECT` policies on the updated row, which an UPDATE naming its
-    /// row reads back.
+    /// The `SELECT` policies an UPDATE reading a column holds its new row to.
     read_back: Option<PolicyPredicate>,
 }
 
@@ -2253,6 +2252,7 @@ fn generate_update_check_trigger_sql(
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Option<Statement>, Error> {
     let ctx = RlsTriggerContext::new(table, options);
+    // Triggers cannot tell a blind write from one reading a column.
     let rows = row_security(table, schema, RowStatement::Update { reads: true }, options)?;
     let violation = if rows.has_no_policy(GatedCommand::Update, RowVersion::Existing)
         && rows.has_no_policy(GatedCommand::Update, RowVersion::Updated)
@@ -2349,6 +2349,7 @@ fn generate_update_trigger_sql(
 ) -> Result<Statement, Error> {
     let ctx = RlsTriggerContext::new(table, options);
     let table_name = ctx.table_name;
+    // Triggers cannot tell a blind write from one reading a column.
     let rows = row_security(table, schema, RowStatement::Update { reads: true }, options)?;
     let columns = collect_column_names(table, schema)?;
     let primary_key = collect_pk_column_names(table, schema)?;
@@ -2406,8 +2407,7 @@ fn generate_update_trigger_sql(
             body
         }
     } else {
-        // The updated row has to pass `WITH CHECK` and, since the trigger names
-        // its row, the `SELECT` policies it is read back through.
+        // The updated row has to pass `WITH CHECK` and the `SELECT` policies.
         let mut body = new_row_guard(check, read_back, using_predicate, options)
             .into_iter()
             .collect::<Vec<_>>();
