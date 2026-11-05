@@ -38,7 +38,7 @@ diesel = { version = "2.3.9", features = ["postgres", "sqlite"] }
 half = "2.7"
 insta = "1.47.2"
 rosetta-uuid = { version = "0.2.0", features = ["diesel", "postgres", "sqlite"] }
-rusqlite = { version = "0.40", features = ["bundled", "functions", "window"] }
+rusqlite = { version = "0.41", features = ["bundled", "functions", "window"] }
 sqlite-vec = "0.1.9"
 zerocopy = "0.8.48"
 rand = "0.10.1"
@@ -52,13 +52,13 @@ parking_lot = "0.13.0"
 # `optional = true` on regular dependencies. Still test-only: nothing
 # in `src/` references it unless `feature = "sqlitegis"` is set.
 [dependencies.sqlitegis]
-version = "0.3.0"
+version = "0.3.2"
 default-features = false
 features = ["sqlite", "diesel-sqlite"]
 optional = true
 
 [dependencies.libsqlite3-sys]
-version = "0.38"
+version = "0.39"
 optional = true
 
 [features]

@@ -30,7 +30,7 @@ sqlparser = "0.64"
 # fuzzer build is self-contained and doesn't depend on the host's
 # libsqlite3 version, which could otherwise mask or shift dialect
 # behaviour between developers.
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 
 [profile.release]
 debug = 1
