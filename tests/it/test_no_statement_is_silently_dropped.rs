@@ -304,6 +304,7 @@ const CASES: &[Case] = &[
     rejected("CALL p()"),
     rejected("CREATE PROCEDURE p() AS BEGIN SELECT 1; END"),
     rejected("DROP PROCEDURE p"),
+    rejected("DO $$ BEGIN PERFORM 1; END $$"),
     // Rejected: session state.
     rejected("SET search_path TO s"),
     rejected("SET TIME ZONE 'UTC'"),
@@ -509,5 +510,17 @@ fn a_trigger_function_is_silent_while_a_lone_one_warns() {
         with_trigger.script.iter().any(|statement| statement.to_string().contains("'stamped'")),
         "the function body must appear inside the emitted trigger: {:?}",
         with_trigger.script.iter().map(ToString::to_string).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_do_block_is_refused_as_procedural_code_that_would_not_run() {
+    crate::helpers::translate::assert_refused(
+        "DO $$ BEGIN INSERT INTO t VALUES (1, 'a'); END $$;",
+        "DO block",
+    );
+    crate::helpers::translate::assert_refused(
+        "DO LANGUAGE plpgsql $$ BEGIN PERFORM 1; END $$;",
+        "DO block",
     );
 }

@@ -2198,6 +2198,13 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
          would perform nothing. Inline the statements at each call site.",
                 ));
             }
+            Statement::Do(_) => {
+                return Err(reject_unsupported_statement(
+                    self,
+                    "A DO block runs its procedural body at once, and SQLite has no procedural \
+         language, so the work it does would be lost. Run its statements as plain SQL instead.",
+                ));
+            }
             session_state_patterns!() => {
                 return Err(reject_unsupported_statement(
                     self,

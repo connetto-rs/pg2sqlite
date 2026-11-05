@@ -17,7 +17,7 @@ categories = ["database", "parser-implementations"]
 autotests = false
 
 [dependencies]
-sqlparser = { version = "0.63", default-features = false, features = ["visitor"] }
+sqlparser = { version = "0.64", default-features = false, features = ["visitor"] }
 sqlparser-plpgsql = { git = "https://github.com/connetto-rs/sqlparser-plpgsql", branch = "main", features = ["body-parse"] }
 sql-traits = { git = "https://github.com/connetto-rs/sql-traits", branch = "main", default-features = false }
 git2 = { version = "0.21", optional = true }
@@ -58,7 +58,7 @@ features = ["sqlite", "diesel-sqlite"]
 optional = true
 
 [dependencies.libsqlite3-sys]
-version = "0.39"
+version = "0.38"
 optional = true
 
 [features]
