@@ -14,8 +14,8 @@ use crate::helpers::postgres as postgres_harness;
 
 /// The roles, created once per cluster on PostgreSQL and declared in the
 /// translated source.
-const BYPASSING_OWNER: &str = "CREATE ROLE authz_owner NOLOGIN BYPASSRLS;";
-const BOUND_OWNER: &str = "CREATE ROLE authz_bound_owner NOLOGIN;";
+const BYPASSING_OWNER: &str = "CREATE ROLE trigger_owner NOLOGIN BYPASSRLS;";
+const BOUND_OWNER: &str = "CREATE ROLE trigger_bound_owner NOLOGIN;";
 
 const TABLES: &str = "
 CREATE SCHEMA authz;
@@ -63,6 +63,38 @@ CREATE TRIGGER organization_grants_keep_last_admin_on_delete BEFORE DELETE ON or
   FOR EACH ROW EXECUTE FUNCTION authz.keep_last_admin_on_delete();
 ";
 
+/// A founding log the owner appends to, numbering entries through a view,
+/// with neither carrying row-level security.
+const LOGGING: &str = "
+CREATE TABLE organization_log (organization_id TEXT NOT NULL, founder TEXT NOT NULL, entry BIGINT NOT NULL);
+CREATE VIEW organization_log_size AS SELECT count(*) AS entries FROM organization_log;
+CREATE FUNCTION authz.log_organization() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+BEGIN
+  INSERT INTO public.organization_log
+    VALUES (NEW.id, NEW.created_by, (SELECT entries FROM public.organization_log_size) + 1);
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER organizations_log AFTER INSERT ON organizations
+  FOR EACH ROW EXECUTE FUNCTION authz.log_organization();
+";
+
+/// A cap of two organizations, counted over rows the caller cannot see.
+const CAPPED: &str = "
+CREATE FUNCTION authz.cap_organizations() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+BEGIN
+  IF (SELECT count(*) FROM public.organizations) >= 2 THEN
+    RETURN NULL;
+  END IF;
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER organizations_cap BEFORE INSERT ON organizations
+  FOR EACH ROW EXECUTE FUNCTION authz.cap_organizations();
+";
+
 const POLICIES: &str = "
 ALTER TABLE organizations ENABLE ROW LEVEL SECURITY;
 CREATE POLICY organizations_read ON organizations FOR SELECT
@@ -102,6 +134,13 @@ mod schema {
             organization_id -> Text,
             principal_id -> Text,
             role -> Text,
+        }
+    }
+    diesel::table! {
+        organization_log (organization_id) {
+            organization_id -> Text,
+            founder -> Text,
+            entry -> BigInt,
         }
     }
 }
@@ -161,7 +200,7 @@ impl Scenario {
              EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$;"
         );
         let privileges = format!(
-            "GRANT SELECT, INSERT, UPDATE, DELETE ON organizations, organization_grants TO app, {};",
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app, {};",
             self.owner
         );
         [role.as_str(), TABLES, self.triggers, &self.ownership(), POLICIES, &privileges].concat()
@@ -170,23 +209,37 @@ impl Scenario {
 
 const FOUNDED_BY_BYPASSING_OWNER: Scenario = Scenario {
     role: BYPASSING_OWNER,
-    owner: "authz_owner",
+    owner: "trigger_owner",
     triggers: FOUNDING,
     function: "authz.found_organization()",
 };
 
 const FOUNDED_BY_BOUND_OWNER: Scenario = Scenario {
     role: BOUND_OWNER,
-    owner: "authz_bound_owner",
+    owner: "trigger_bound_owner",
     triggers: FOUNDING,
     function: "authz.found_organization()",
 };
 
 const GUARDED_BY_BYPASSING_OWNER: Scenario = Scenario {
     role: BYPASSING_OWNER,
-    owner: "authz_owner",
+    owner: "trigger_owner",
     triggers: LAST_ADMIN,
     function: "authz.keep_last_admin_on_delete()",
+};
+
+const LOGGED_BY_BOUND_OWNER: Scenario = Scenario {
+    role: BOUND_OWNER,
+    owner: "trigger_bound_owner",
+    triggers: LOGGING,
+    function: "authz.log_organization()",
+};
+
+const CAPPED_BY_BYPASSING_OWNER: Scenario = Scenario {
+    role: BYPASSING_OWNER,
+    owner: "trigger_owner",
+    triggers: CAPPED,
+    function: "authz.cap_organizations()",
 };
 
 /// `scenario` on PostgreSQL, seeded as the superuser, then acting as `app`
@@ -360,7 +413,7 @@ fn an_owner_the_policies_bind_founds_nothing() {
         .expect_err("SQLite cannot apply the owner's policies")
         .to_string();
     assert!(
-        message.contains("authz_bound_owner") && message.contains("organization_grants"),
+        message.contains("trigger_bound_owner") && message.contains("organization_grants"),
         "{message}"
     );
 }
@@ -398,4 +451,131 @@ fn the_last_admin_guard_keeps_the_last_admin() {
     assert_eq!((pg, sqlite), (Outcome::Refused, Outcome::Refused));
     assert_eq!(pg_rows, [grant("nina", "admin"), grant("nora", "read")]);
     assert_eq!(sqlite_rows, pg_rows);
+}
+
+#[test]
+fn a_definer_whose_owner_the_schema_never_declares_is_refused() {
+    let source = [TABLES, FOUNDING, POLICIES].concat();
+    let message = translate(&source).expect_err("the owner is unknown").to_string();
+    assert!(
+        message.contains("authz.found_organization") && message.contains("never declares"),
+        "{message}"
+    );
+}
+
+#[test]
+fn a_trigger_naming_its_function_in_another_database_is_refused() {
+    let source = [
+        TABLES,
+        "CREATE FUNCTION authz.noop() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+         CREATE TRIGGER organizations_noop BEFORE INSERT ON organizations
+           FOR EACH ROW EXECUTE FUNCTION elsewhere.authz.noop();",
+    ]
+    .concat();
+    let pg = apply(&mut fresh_database(), &source).expect_err("PostgreSQL refuses it");
+    assert!(pg.contains("cross-database references are not implemented"), "{pg}");
+    let message = translate(&source).expect_err("pg2sqlite refuses it").to_string();
+    assert!(message.contains("elsewhere.authz.noop"), "{message}");
+}
+
+/// A body that touches only tables without row-level security runs as
+/// written, even for an owner the policies bind.
+#[test]
+fn a_bound_owner_logs_through_tables_without_row_level_security() {
+    let scenario = LOGGED_BY_BOUND_OWNER;
+    let mut pg = postgres(&scenario, &[]);
+    let mut sqlite = replica(&translate(&scenario.source()).expect("translate"), &[]);
+
+    assert_eq!(found_org3(&mut pg), Outcome::Accepted);
+    assert_eq!(found_org3(&mut sqlite), Outcome::Accepted);
+
+    let logged = vec![("org3".to_owned(), "nina".to_owned(), 1)];
+    // Reset so the read runs as the superuser that created the log.
+    diesel::sql_query("RESET ROLE").execute(&mut pg).expect("reset role");
+    assert_eq!(log_held(&mut pg), logged);
+    assert_eq!(log_held(&mut sqlite), logged);
+}
+
+fn log_held<C>(connection: &mut C) -> Vec<(String, String, i64)>
+where
+    C: Connection,
+    diesel::dsl::Order<
+        diesel::dsl::Select<
+            schema::organization_log::table,
+            (
+                schema::organization_log::organization_id,
+                schema::organization_log::founder,
+                schema::organization_log::entry,
+            ),
+        >,
+        schema::organization_log::entry,
+    >: diesel::query_dsl::LoadQuery<'static, C, (String, String, i64)>,
+{
+    use schema::organization_log::dsl::*;
+    organization_log
+        .select((organization_id, founder, entry))
+        .order(entry)
+        .load(connection)
+        .expect("read the log")
+}
+
+/// Nora's `org1`, hidden from Nina, and Nina's `org2`, stored past the
+/// policies on both engines.
+fn seed_two_organizations(pg: &mut PgConnection, sqlite: &mut SqliteConnection) {
+    let seeded = [
+        (schema::organizations::id.eq("org1"), schema::organizations::created_by.eq("nora")),
+        (schema::organizations::id.eq("org2"), schema::organizations::created_by.eq("nina")),
+    ];
+    diesel::sql_query("RESET ROLE").execute(pg).expect("reset role");
+    diesel::insert_into(schema::organizations::table)
+        .values(&seeded[..])
+        .execute(pg)
+        .expect("seed PostgreSQL");
+    diesel::sql_query("SET ROLE app").execute(pg).expect("act as app");
+
+    definer_write_exempt_utils::register_nondeterministic_impl(sqlite, || true)
+        .expect("exempt the seed");
+    diesel::insert_into(schema::organizations_rls::table)
+        .values([
+            (
+                schema::organizations_rls::id.eq("org1"),
+                schema::organizations_rls::created_by.eq("nora"),
+            ),
+            (
+                schema::organizations_rls::id.eq("org2"),
+                schema::organizations_rls::created_by.eq("nina"),
+            ),
+        ])
+        .execute(sqlite)
+        .expect("seed SQLite");
+    definer_write_exempt_utils::register_nondeterministic_impl(sqlite, || false)
+        .expect("end the exemption");
+}
+
+/// Nora's organization fills the cap although Nina cannot see it, so Nina's
+/// insert is skipped.
+#[test]
+fn the_cap_counts_organizations_the_caller_cannot_see() {
+    let scenario = CAPPED_BY_BYPASSING_OWNER;
+    let mut pg = postgres(&scenario, &[]);
+    let mut sqlite = replica(&translate(&scenario.source()).expect("translate"), &[]);
+    seed_two_organizations(&mut pg, &mut sqlite);
+
+    assert_eq!(found_org3(&mut pg), Outcome::Accepted);
+    assert_eq!(found_org3(&mut sqlite), Outcome::Accepted);
+
+    let held = vec!["org1".to_owned(), "org2".to_owned()];
+    diesel::sql_query("RESET ROLE").execute(&mut pg).expect("reset role");
+    let pg_held: Vec<String> = schema::organizations::table
+        .select(schema::organizations::id)
+        .order(schema::organizations::id)
+        .load(&mut pg)
+        .expect("read PostgreSQL");
+    let sqlite_held: Vec<String> = schema::organizations_rls::table
+        .select(schema::organizations_rls::id)
+        .order(schema::organizations_rls::id)
+        .load(&mut sqlite)
+        .expect("read SQLite");
+    assert_eq!(pg_held, held);
+    assert_eq!(sqlite_held, held);
 }
