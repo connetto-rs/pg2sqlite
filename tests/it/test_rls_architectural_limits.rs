@@ -4,14 +4,13 @@
 //! ways that cannot be fixed by adding more triggers. Both are measured and
 //! documented here so a future convergence is automatically detected.
 //!
-//! R2-8 (blanket UPDATE): In PostgreSQL, `UPDATE t SET val = 9` with no WHERE
-//! reaches every row passing UPDATE USING, including rows the current session
-//! cannot SELECT. The emulation's INSTEAD OF UPDATE trigger fires only for
-//! rows returned by the view's WHERE clause, so SELECT-invisible rows are
-//! untouchable: an update that touches 2 of 2 in PostgreSQL touches only 1 of
-//! 2 here. Routing WHERE-less writes to the backing table with a USING guard
-//! would fix this but is not implemented; this test pins the 1-of-2 behavior
-//! so any convergence is noticed. See the README RLS-limitations section.
+//! Blind writes. PostgreSQL holds an `UPDATE` or `DELETE` to the table's
+//! `SELECT` policies only when the statement reads a column of the table, in
+//! `WHERE`, a `SET` expression, `FROM` or `RETURNING`. The INSTEAD OF triggers
+//! cannot see the statement, so they hold every write to the `SELECT`
+//! policies. A blind write therefore skips a row the write policy admits and
+//! the `SELECT` policies hide, and refuses a new row the `SELECT` policies
+//! would hide.
 //!
 //! R2-9 (UPDATE/DELETE RETURNING): PostgreSQL's RETURNING reports only the
 //! rows the write actually modified. The emulation fires the INSTEAD OF
@@ -27,10 +26,7 @@ use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
 
 use crate::helpers;
 
-// ---------------------------------------------------------------------------
-// Schema: alice can SELECT both rows, but UPDATE/DELETE only alice's own.
-// ---------------------------------------------------------------------------
-
+/// Alice can SELECT both rows, but UPDATE and DELETE only her own.
 const DIVERGE_SCHEMA: &str = "
     CREATE TABLE docs (
         id INTEGER PRIMARY KEY,
@@ -44,12 +40,45 @@ const DIVERGE_SCHEMA: &str = "
     CREATE POLICY docs_ins ON docs FOR INSERT WITH CHECK (true);
 ";
 
+/// Rows 1 to 3 are readable and rows 2 to 4 writable, so row 1 is readable
+/// and not writable and row 4 writable and not readable.
+const BLIND_SCHEMA: &str = "
+    CREATE TABLE items (
+        id INTEGER PRIMARY KEY,
+        v INTEGER NOT NULL
+    );
+    ALTER TABLE items ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY items_sel ON items FOR SELECT USING (id <= 3);
+    CREATE POLICY items_upd ON items FOR UPDATE USING (id >= 2);
+    CREATE POLICY items_del ON items FOR DELETE USING (id >= 2);
+    CREATE POLICY items_ins ON items FOR INSERT WITH CHECK (true);
+";
+
+/// Every row is writable and only rows 1 and 2 are readable.
+const MOVE_OUT_SCHEMA: &str = "
+    CREATE TABLE items (
+        id INTEGER PRIMARY KEY,
+        v INTEGER NOT NULL
+    );
+    ALTER TABLE items ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY items_sel ON items FOR SELECT USING (id <= 2);
+    CREATE POLICY items_upd ON items FOR UPDATE USING (true);
+    CREATE POLICY items_ins ON items FOR INSERT WITH CHECK (true);
+";
+
 mod schema {
     diesel::table! {
         docs_rls (id) {
             id -> Integer,
             owner -> Text,
             body -> Text,
+        }
+    }
+
+    diesel::table! {
+        items_rls (id) {
+            id -> Integer,
+            v -> Integer,
         }
     }
 
@@ -78,9 +107,9 @@ fn strict_opts() -> Pg2SqliteOptions {
         .with_session_variable(SessionVariableMapping::current_user("current_app_username"))
 }
 
-fn apply() -> SqliteConnection {
+fn apply(pg_schema: &str) -> SqliteConnection {
     let translated = Pg2Sqlite::default()
-        .sql(DIVERGE_SCHEMA)
+        .sql(pg_schema)
         .expect("parse")
         .translate(&strict_opts())
         .expect("translate")
@@ -95,15 +124,15 @@ fn apply() -> SqliteConnection {
     conn
 }
 
-fn run_dml(conn: &mut SqliteConnection, pg_dml: &str) -> QueryResult<usize> {
+fn run_dml(conn: &mut SqliteConnection, pg_schema: &str, pg_dml: &str) -> QueryResult<usize> {
     let schema_len = Pg2Sqlite::default()
-        .sql(DIVERGE_SCHEMA)
+        .sql(pg_schema)
         .expect("parse")
         .translate(&strict_opts())
         .expect("translate")
         .into_vec()
         .len();
-    let combined = format!("{DIVERGE_SCHEMA}\n{pg_dml}");
+    let combined = format!("{pg_schema}\n{pg_dml}");
     let all = Pg2Sqlite::default()
         .sql(&combined)
         .expect("parse combined")
@@ -118,69 +147,77 @@ fn run_dml(conn: &mut SqliteConnection, pg_dml: &str) -> QueryResult<usize> {
     Ok(last)
 }
 
-/// R2-8 characterization: blanket UPDATE through the view touches only
-/// SELECT-visible rows, not all UPDATE-USING-passing rows.
-///
-/// PostgreSQL ground truth (measured on postgres:18-alpine): `UPDATE docs SET
-/// body = 'x'` with UPDATE USING (owner = 'alice') and SELECT USING (true)
-/// touches 2 rows (both alice's and bob's pass UPDATE USING when it is checked
-/// against the backing table, not the view filter). The emulation fires the
-/// INSTEAD OF UPDATE trigger only for the 1 row the view returns for alice's
-/// session, so only 1 row changes. This test pins the 1-of-2 result and will
-/// fail the day the routing is fixed to reach invisible rows.
+/// Seeds `items_rls` with `rows`, each `v` set to 0, bypassing the view.
+fn seed_items(conn: &mut SqliteConnection, rows: &[i32]) {
+    let values: Vec<_> =
+        rows.iter().map(|id| (schema::items_rls::id.eq(id), schema::items_rls::v.eq(0))).collect();
+    diesel::insert_into(schema::items_rls::table).values(values).execute(conn).expect("seed items");
+}
+
+/// Every stored `(id, v)` pair, read from the backing table.
+fn stored_items(conn: &mut SqliteConnection) -> Vec<(i32, i32)> {
+    schema::items_rls::table
+        .select((schema::items_rls::id, schema::items_rls::v))
+        .order(schema::items_rls::id)
+        .load(conn)
+        .expect("read items")
+}
+
+/// A blind `UPDATE items SET v = 9` under `BLIND_SCHEMA` changes rows 2 and 3.
+/// PostgreSQL 18.6 changes rows 2, 3 and 4, because a statement reading no
+/// column skips the `SELECT` policies.
 #[test]
-fn blanket_update_through_view_touches_only_visible_rows() {
-    // PostgreSQL divergence: UPDATE USING (owner = current_user) should reach
-    // only alice's rows. But PostgreSQL's blanket UPDATE (no WHERE) applies the
-    // USING filter at the backing table, meaning it would see both rows if
-    // UPDATE USING (true). Here UPDATE USING is owner-scoped so PostgreSQL also
-    // touches only alice's row. The architectural difference shows when
-    // SELECT USING is NARROWER than UPDATE USING.
-    //
-    // This test documents the current 1-of-2 outcome (alice's row only) and
-    // the fact that PostgreSQL's behavior would be the same for this specific
-    // policy set (UPDATE USING and SELECT USING are equivalent here). It still
-    // characterizes the view-trigger architecture's limitation in the broader
-    // sense: WHERE-less writes reach only view-visible rows.
-    let mut conn = apply();
-    set_session_username("alice");
+fn blind_update_skips_rows_the_select_policies_hide() {
+    let mut conn = apply(BLIND_SCHEMA);
+    seed_items(&mut conn, &[1, 2, 3, 4]);
 
-    // Seed: alice owns row 1, bob owns row 2.
-    diesel::insert_into(schema::docs_rls::table)
-        .values(vec![
-            DocRow { id: 1, owner: "alice".to_owned(), body: "alice-old".to_owned() },
-            DocRow { id: 2, owner: "bob".to_owned(), body: "bob-old".to_owned() },
-        ])
-        .execute(&mut conn)
-        .expect("seed rows");
+    run_dml(&mut conn, BLIND_SCHEMA, "UPDATE items SET v = 9").expect("blind UPDATE");
 
-    // Blanket UPDATE with no WHERE: fires INSTEAD OF UPDATE for each view row.
-    // With SELECT USING (true), both rows are view-visible and both fire.
-    // With UPDATE USING (owner = alice), the trigger skips bob's row silently.
-    // Only alice's row is changed.
-    run_dml(&mut conn, "UPDATE docs SET body = 'updated'").expect("blanket UPDATE must succeed");
+    assert_eq!(stored_items(&mut conn), vec![(1, 0), (2, 9), (3, 9), (4, 0)]);
+}
 
-    let alice_body: String = schema::docs_rls::table
-        .filter(schema::docs_rls::id.eq(1))
-        .select(schema::docs_rls::body)
-        .first(&mut conn)
-        .expect("alice row");
-    let bob_body: String = schema::docs_rls::table
-        .filter(schema::docs_rls::id.eq(2))
-        .select(schema::docs_rls::body)
-        .first(&mut conn)
-        .expect("bob row");
+/// A blind `DELETE FROM items` under `BLIND_SCHEMA` removes rows 2 and 3.
+/// PostgreSQL 18.6 removes rows 2, 3 and 4, because a statement reading no
+/// column skips the `SELECT` policies.
+#[test]
+fn blind_delete_skips_rows_the_select_policies_hide() {
+    let mut conn = apply(BLIND_SCHEMA);
+    seed_items(&mut conn, &[1, 2, 3, 4]);
 
-    // Current architectural behavior: only the view-trigger-reachable rows
-    // change. This assertion fails the day WHERE-less writes are routed to
-    // the backing table.
-    assert_eq!(alice_body, "updated", "alice's row must be updated");
-    assert_eq!(
-        bob_body, "bob-old",
-        "bob's row is unchanged (architectural limit: INSTEAD OF trigger cannot reach \
-         SELECT-invisible rows; PostgreSQL would also skip bob here because UPDATE USING \
-         is owner-scoped, but the mechanism differs; see README RLS-limitations)"
+    run_dml(&mut conn, BLIND_SCHEMA, "DELETE FROM items").expect("blind DELETE");
+
+    assert_eq!(stored_items(&mut conn), vec![(1, 0), (4, 0)]);
+}
+
+/// A blind `UPDATE items SET id = 99` moving the only row out of `SELECT USING
+/// (id <= 2)` is refused. PostgreSQL 18.6 changes the row to 99, because a
+/// statement reading no column holds the new row only to the `UPDATE`
+/// policy's check.
+#[test]
+fn blind_update_moving_a_row_out_of_the_select_policies_is_refused() {
+    let mut conn = apply(MOVE_OUT_SCHEMA);
+    seed_items(&mut conn, &[1]);
+
+    let error = run_dml(&mut conn, MOVE_OUT_SCHEMA, "UPDATE items SET id = 99")
+        .expect_err("the moved row is hidden from the SELECT policies");
+
+    assert!(
+        error.to_string().contains("new row violates row-level security policy"),
+        "unexpected error: {error}"
     );
+    assert_eq!(stored_items(&mut conn), vec![(1, 0)]);
+}
+
+/// `UPDATE items SET v = v + 1` reads `v`, so PostgreSQL 18.6 holds it to the
+/// `SELECT` policies too and changes rows 2 and 3, as the replica does.
+#[test]
+fn reading_update_matches_postgres() {
+    let mut conn = apply(BLIND_SCHEMA);
+    seed_items(&mut conn, &[1, 2, 3, 4]);
+
+    run_dml(&mut conn, BLIND_SCHEMA, "UPDATE items SET v = v + 1").expect("reading UPDATE");
+
+    assert_eq!(stored_items(&mut conn), vec![(1, 0), (2, 1), (3, 1), (4, 0)]);
 }
 
 /// R2-9 characterization: DELETE ... RETURNING through the view reports all
@@ -197,7 +234,7 @@ fn blanket_update_through_view_touches_only_visible_rows() {
 /// UPDATE/DELETE through RLS views is made accurate.
 #[test]
 fn delete_returning_through_view_reports_skipped_rows() {
-    let mut conn = apply();
+    let mut conn = apply(DIVERGE_SCHEMA);
     set_session_username("alice");
 
     // Seed: alice owns row 1, bob owns row 2.
