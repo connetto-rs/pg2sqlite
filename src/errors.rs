@@ -164,8 +164,8 @@ pub enum Error {
     /// what it reads.
     #[error(
         "{reading} reads what the deployment declares, and no deployment is configured. Pass \
-         the deployment with `with_deployment(...)`, declaring the login role and the acting \
-         roles."
+         the deployment with `with_deployment(...)`, declaring the login role, the acting roles \
+         and every session setting the statements read."
     )]
     DeploymentRequired {
         /// What the statement reads, as it is written.
@@ -201,91 +201,90 @@ pub enum Error {
         /// The role the schema lacks.
         role: String,
     },
-    /// Error when a session variable pattern is encountered but no mapping is
-    /// configured.
+    /// Error when a statement reads a session setting the deployment does not
+    /// declare.
     #[error(
-        "No session variable mapping configured for pattern '{pattern}'. \
-         Configure a mapping using `with_session_variable()` in the translation options."
+        "{pattern} reads a setting the deployment does not declare. Declare it in the \
+         deployment with its type, or read a declared setting."
+    )]
+    SessionSettingNotDeclared {
+        /// The PostgreSQL pattern that was encountered.
+        pattern: String,
+    },
+    /// Error when a session variable mapping pairs a setting the deployment
+    /// does not declare.
+    #[error(
+        "The session variable mapping pairs '{setting}' with {sqlite_function}(), and the \
+         deployment declares no such setting. Declare it in the deployment, or drop the mapping."
+    )]
+    MappedSettingNotDeclared {
+        /// The setting the mapping names.
+        setting: String,
+        /// The SQLite function the mapping names.
+        sqlite_function: String,
+    },
+    /// Error when a statement reads a declared session setting no mapping
+    /// pairs with a SQLite function.
+    #[error(
+        "No session variable mapping configured for pattern '{pattern}'. Pair the setting with \
+         the SQLite function the replica answers it with, using `with_session_variable()`."
     )]
     SessionVariableMappingNotFound {
         /// The PostgreSQL pattern that was encountered.
         pattern: String,
     },
-    /// Error when the type recorded on a session variable mapping cannot be
-    /// read as a type.
+    /// Error when a statement casts a session setting, or a field of one, to a
+    /// type other than the one the deployment declares.
     #[error(
-        "The session variable mapping for '{pattern}' records the PostgreSQL type \
-         '{pg_type}', which does not parse as one. Record it as PostgreSQL spells it, such as \
-         `uuid` or `numeric(10,2)`."
-    )]
-    SessionVariableTypeUnreadable {
-        /// The PostgreSQL pattern the mapping matches.
-        pattern: String,
-        /// The type spelling the mapping carries.
-        pg_type: String,
-        /// The parser's own error, when the spelling failed to parse at all. A
-        /// spelling that parses and then leaves input behind, such as `uuid
-        /// oops`, has no underlying error, so it is `None`.
-        #[source]
-        source: Option<SqlParseError>,
-    },
-    /// Error when a statement casts a session variable to a type other than the
-    /// one its mapping records.
-    #[error(
-        "The session variable mapping for '{pattern}' records the PostgreSQL type \
-         '{recorded}', and this statement casts the setting to '{written}'. The cast is dropped \
-         going to SQLite and written again from the recorded type coming back, so the two have \
-         to agree: correct whichever is stale."
+        "The deployment declares {pattern} as '{declared}', and this statement casts it to \
+         '{written}'. The two have to agree: correct whichever is stale."
     )]
     SessionVariableTypeDisagrees {
-        /// The PostgreSQL pattern the mapping matches.
+        /// The setting, or the field of one, the statement reads.
         pattern: String,
-        /// The type the mapping records.
-        recorded: String,
+        /// The type the deployment declares.
+        declared: String,
         /// The type the statement casts to.
         written: String,
     },
-    /// Error when a statement reads a session variable that holds a set as one
+    /// Error when a statement reads a session setting that holds a set as one
     /// value.
     #[error(
-        "The session variable mapping for '{pattern}' declares a set joined by '{delimiter}', \
-         which is read through `x = ANY(string_to_array(current_setting(...), '{delimiter}'))`, \
-         and this statement reads it as one value. Compare against the set, or drop the \
-         `holding_set` declaration if the setting holds one value."
+        "The deployment declares {pattern} as a set {packing}, which is read only through a \
+         membership test, and this statement reads it as one value. Compare against the set, or \
+         declare the setting as one value."
     )]
     SessionVariableReadAsScalar {
-        /// The PostgreSQL pattern the mapping matches.
+        /// The PostgreSQL pattern that was encountered.
         pattern: String,
-        /// The delimiter the mapping records.
-        delimiter: char,
+        /// How the deployment packs the set.
+        packing: String,
     },
-    /// Error when a membership test reads a session variable that holds one
+    /// Error when a membership test reads a session setting that holds one
     /// value as a set.
     #[error(
-        "The session variable mapping for '{pattern}' declares one value, and this statement \
-         splits the setting on '{written}' and tests membership of the elements. Declare the set \
-         with `holding_set('{written}')`, or compare against the value."
+        "The deployment declares {pattern} as one value, and this statement reads it as a set \
+         {written}. Declare the setting as a set packed that way, or compare against the value."
     )]
     SessionVariableReadAsSet {
-        /// The PostgreSQL pattern the mapping matches.
+        /// The PostgreSQL pattern that was encountered.
         pattern: String,
-        /// The delimiter the statement splits on.
-        written: char,
+        /// How the statement unpacks the setting.
+        written: String,
     },
-    /// Error when a membership test splits a session variable on a delimiter
-    /// other than the one its mapping records.
+    /// Error when a membership test unpacks a session setting other than the
+    /// way the deployment packs it.
     #[error(
-        "The session variable mapping for '{pattern}' declares a set joined by '{recorded}', and \
-         this statement splits the setting on '{written}'. The two have to agree: correct \
-         whichever is stale."
+        "The deployment declares {pattern} as a set {declared}, and this statement reads it as a \
+         set {written}. The two have to agree: correct whichever is stale."
     )]
-    SessionVariableDelimiterDisagrees {
-        /// The PostgreSQL pattern the mapping matches.
+    SessionVariablePackingDisagrees {
+        /// The PostgreSQL pattern that was encountered.
         pattern: String,
-        /// The delimiter the mapping records.
-        recorded: char,
-        /// The delimiter the statement splits on.
-        written: char,
+        /// How the deployment packs the set.
+        declared: String,
+        /// How the statement unpacks it.
+        written: String,
     },
     /// Error when attempting to access an RLS backing table directly.
     #[error(

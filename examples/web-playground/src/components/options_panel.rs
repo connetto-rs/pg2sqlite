@@ -4,9 +4,9 @@
 
 use dioxus::prelude::*;
 use dioxus_free_icons::{Icon, icons::fa_solid_icons::FaSliders};
-use pg2sqlite::prelude::{ArrayRepresentation, SessionVariableMapping, UuidRepresentation};
+use pg2sqlite::prelude::{ArrayRepresentation, UuidRepresentation};
 
-use crate::state::AppState;
+use crate::state::{AppState, SessionVarEntry};
 
 #[component]
 pub fn OptionsPanel() -> Element {
@@ -195,31 +195,33 @@ fn RlsAuditRow() -> Element {
     }
 }
 
-/// Lists the current session-variable mappings and lets the user add
-/// or remove `current_setting('<pattern>') -> <sqlite_fn>()` pairs.
+/// Lists the current session-variable entries and lets the user add
+/// or remove `current_setting('<name>')::<type> -> <sqlite_fn>()` pairs.
 #[component]
 fn SessionVarsRow() -> Element {
     let state: AppState = use_context();
-    let mappings: Vec<SessionVariableMapping> = state.options.read().session_variables.clone();
-    let mut new_pattern = use_signal(String::new);
+    let entries: Vec<SessionVarEntry> = state.options.read().session_variables.clone();
+    let mut new_setting = use_signal(String::new);
+    let mut new_type = use_signal(String::new);
     let mut new_function = use_signal(String::new);
 
     rsx! {
         div { class: "options-row",
             span { class: "options-label", "Session variables" }
             div { class: "options-control session-vars",
-                if mappings.is_empty() {
+                if entries.is_empty() {
                     span { class: "options-muted", "None configured." }
                 }
-                for (idx, mapping) in mappings.iter().enumerate() {
+                for (idx, entry) in entries.iter().enumerate() {
                     div { class: "session-var-row",
-                        code { "current_setting('{mapping.pg_pattern.to_string()}')" }
+                        code { "current_setting('{entry.setting}')" }
+                        code { " :: {entry.pg_type}" }
                         span { " → " }
-                        code { "{mapping.sqlite_function}()" }
+                        code { "{entry.function}()" }
                         button {
                             r#type: "button",
                             class: "session-var-remove",
-                            title: "Remove this mapping",
+                            title: "Remove this entry",
                             onclick: move |_| {
                                 let mut options = state.options;
                                 let mut opts = options.read().clone();
@@ -234,8 +236,14 @@ fn SessionVarsRow() -> Element {
                     input {
                         r#type: "text",
                         placeholder: "app.user_id",
-                        value: new_pattern(),
-                        oninput: move |evt| new_pattern.set(evt.value()),
+                        value: new_setting(),
+                        oninput: move |evt| new_setting.set(evt.value()),
+                    }
+                    input {
+                        r#type: "text",
+                        placeholder: "text",
+                        value: new_type(),
+                        oninput: move |evt| new_type.set(evt.value()),
                     }
                     input {
                         r#type: "text",
@@ -245,23 +253,28 @@ fn SessionVarsRow() -> Element {
                     }
                     button {
                         r#type: "button",
-                        disabled: new_pattern().is_empty() || new_function().is_empty(),
+                        disabled: new_setting().is_empty() || new_function().is_empty(),
                         onclick: move |_| {
-                            let pattern = new_pattern();
+                            let setting = new_setting();
+                            let pg_type = new_type();
                             let function = new_function();
-                            if pattern.is_empty() || function.is_empty() {
+                            if setting.is_empty() || function.is_empty() {
                                 return;
                             }
                             let mut options = state.options;
                             let mut opts = options.read().clone();
-                            opts.session_variables.push(
-                                SessionVariableMapping::current_setting(
-                                    pattern.clone(),
-                                    function.clone(),
-                                ),
-                            );
+                            opts.session_variables.push(SessionVarEntry {
+                                setting,
+                                pg_type: if pg_type.is_empty() {
+                                    "text".to_string()
+                                } else {
+                                    pg_type
+                                },
+                                function,
+                            });
                             options.set(opts);
-                            new_pattern.set(String::new());
+                            new_setting.set(String::new());
+                            new_type.set(String::new());
                             new_function.set(String::new());
                         },
                         "Add"

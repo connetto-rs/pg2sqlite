@@ -9,7 +9,10 @@
 use diesel::prelude::*;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
 
-use crate::helpers;
+use crate::{
+    helpers,
+    helpers::deployment::{caller, deployment},
+};
 // Tests (a) and (c): members + t, where members.team is absent from t.
 diesel::table! {
     /// Lookup table used in the correlated-subquery policy tests.
@@ -151,9 +154,10 @@ fn base_opts() -> Pg2SqliteOptions {
 }
 
 fn opts_with_username() -> Pg2SqliteOptions {
-    Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit").with_session_variable(
-        SessionVariableMapping::current_setting("app.username", "current_app_username"),
-    )
+    Pg2SqliteOptions::default()
+        .with_rls_audit_table_name("rls_audit")
+        .with_deployment(deployment([], [caller("app.username", "text")]))
+        .with_session_variable(SessionVariableMapping::new("app.username", "current_app_username"))
 }
 
 /// Translates `pg_sql` and applies every emitted statement to a fresh

@@ -574,7 +574,7 @@ fn generated_column_stored() {
 fn table_fk_to_rls_table() {
     use pg2sqlite::prelude::SessionVariableMapping;
 
-    use crate::helpers::deployment::deployment;
+    use crate::helpers::deployment::{caller, deployment};
     let sql = r#"
         CREATE ROLE authenticated;
         CREATE TABLE users (
@@ -599,13 +599,10 @@ fn table_fk_to_rls_table() {
         GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let options = Pg2SqliteOptions::default()
-        .with_deployment(deployment(["authenticated"], []))
+        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "integer")]))
         .with_acting_role("authenticated")
         .with_rls_audit_table_name("rls_audit".to_string())
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ));
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"));
     let output = Pg2Sqlite::default()
         .sql(sql)
         .unwrap()
@@ -625,7 +622,7 @@ fn table_fk_to_rls_table() {
 fn column_fk_to_rls_table() {
     use pg2sqlite::prelude::SessionVariableMapping;
 
-    use crate::helpers::deployment::deployment;
+    use crate::helpers::deployment::{caller, deployment};
     let sql = r#"
         CREATE ROLE authenticated;
         CREATE TABLE users (
@@ -649,13 +646,10 @@ fn column_fk_to_rls_table() {
         GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let options = Pg2SqliteOptions::default()
-        .with_deployment(deployment(["authenticated"], []))
+        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "integer")]))
         .with_acting_role("authenticated")
         .with_rls_audit_table_name("rls_audit".to_string())
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ));
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"));
     let output = Pg2Sqlite::default()
         .sql(sql)
         .unwrap()
@@ -746,7 +740,7 @@ fn materialized_view_error() {
 fn delete_using_with_rls_table_join() {
     use pg2sqlite::prelude::SessionVariableMapping;
 
-    use crate::helpers::deployment::deployment;
+    use crate::helpers::deployment::{caller, deployment};
     let sql = r#"
         CREATE ROLE authenticated;
         CREATE TABLE orders (
@@ -772,13 +766,10 @@ fn delete_using_with_rls_table_join() {
         GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let options = Pg2SqliteOptions::default()
-        .with_deployment(deployment(["authenticated"], []))
+        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "integer")]))
         .with_acting_role("authenticated")
         .with_rls_audit_table_name("rls_audit".to_string())
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ));
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"));
     let stmts =
         Pg2Sqlite::default().sql(sql).unwrap().translate_to_sql(&options).unwrap().into_vec();
     let delete_stmt =
@@ -933,7 +924,7 @@ fn or_replace_trigger() {
 fn before_trigger_on_rls_table() {
     use pg2sqlite::prelude::SessionVariableMapping;
 
-    use crate::helpers::deployment::deployment;
+    use crate::helpers::deployment::{caller, deployment};
     let sql = r#"
         CREATE ROLE authenticated;
         CREATE TABLE items (id INT PRIMARY KEY, name TEXT, owner_id INT NOT NULL);
@@ -961,13 +952,10 @@ fn before_trigger_on_rls_table() {
         GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let options = Pg2SqliteOptions::default()
-        .with_deployment(deployment(["authenticated"], []))
+        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "integer")]))
         .with_acting_role("authenticated")
         .with_rls_audit_table_name("rls_audit".to_string())
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ));
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"));
     let output = Pg2Sqlite::default()
         .sql(sql)
         .unwrap()

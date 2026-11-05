@@ -156,8 +156,8 @@ enum FunctionTranslation {
     /// `cbrt(x)` translated to `pow(x, (1.0 / 3.0))` when math functions are
     /// available.
     ToCbrt,
-    /// A reading of the session, a role the deployment answers or a setting
-    /// its mapping answers.
+    /// A reading of the session, a role or a setting, answered from the
+    /// deployment.
     SessionRead(session_variable::SessionRead),
     /// `array_agg`, which answers NULL over no rows where `json_group_array`
     /// answers `'[]'`. Wrapped in `NULLIF(json_group_array(...), '[]')`.
@@ -571,16 +571,10 @@ fn translate_catalog_function(
     args: &FunctionArguments,
     options: &crate::options::TranslationContext<'_>,
 ) -> FunctionTranslation {
-    // The roles and settings a statement reads, wherever they are named. A
-    // declared name is evidence the destination registered this very function,
-    // which is a different claim from a mapping and is left to stand.
+    // The roles and settings a statement reads, wherever they are named. The
+    // deployment says what each holds, and it applies to a query exactly as
+    // it applies to a policy predicate.
     if let Some(read) = session_variable::session_read_of(original_name, args) {
-        if let session_variable::SessionRead::Setting(name) = &read
-            && options.find_session_variable(&session_variable::setting_pattern(name)).is_none()
-            && options.declares_user_defined_function(original_name)
-        {
-            return FunctionTranslation::PassThrough;
-        }
         return FunctionTranslation::SessionRead(read);
     }
 

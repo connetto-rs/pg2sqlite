@@ -16,7 +16,10 @@ use pg2sqlite::{
 };
 use rosetta_uuid::Uuid;
 
-use crate::helpers;
+use crate::{
+    helpers,
+    helpers::deployment::{caller, deployment},
+};
 
 diesel::define_sql_function! {
     /// Reports whether generated write guards are exempt.
@@ -30,10 +33,8 @@ fn translation_options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ))
+        .with_deployment(deployment([], [caller("app.user_id", "uuid")]))
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
         .with_rls_audit_table_name("rls_audit".to_string())
 }
 
@@ -89,11 +90,10 @@ fn test_fk_constraint_enforcement() -> Result<(), Box<dyn std::error::Error>> {
 
     // Insert a valid user. With the deny-by-default + backing-table guard
     // trigger fix, direct backing-table inserts now hit the WITH CHECK
-    // trigger too. Set the session user so `id = current_app_user()` passes.
+    // trigger too.
     let user_id = Uuid::new_v4();
     let user_id_bytes = user_id.as_bytes();
     let user_id_hex = user_id_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>();
-    set_session_user_id(&user_id);
     sql_query(format!(
         "INSERT INTO users_rls (id, username, email) VALUES (x'{}', 'testuser', 'test@example.com')",
         user_id_hex

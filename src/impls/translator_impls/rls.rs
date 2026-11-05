@@ -3449,15 +3449,20 @@ mod tests {
         .expect_err("missing current_user mapping should error");
         assert!(err.to_string().contains("current_user"));
 
-        let deployment =
-            sql_traits::structs::Deployment::new("app", ["alice"], []).expect("a valid deployment");
+        let deployment = sql_traits::structs::Deployment::new(
+            "app",
+            ["alice"],
+            [sql_traits::structs::SessionSetting::value(
+                "app.user_id",
+                sql_traits::structs::SettingValue::Caller(sqlparser::ast::DataType::Int(None)),
+            )
+            .expect("a custom setting name")],
+        )
+        .expect("a valid deployment");
         let mapped = Pg2SqliteOptions::default()
             .with_deployment(deployment)
             .with_acting_role("alice")
-            .with_session_variable(SessionVariableMapping::current_setting(
-                "app.user_id",
-                "sqlite_user_id",
-            ));
+            .with_session_variable(SessionVariableMapping::new("app.user_id", "sqlite_user_id"));
         validate_session_variables(
             &parse_expr("owner_id = current_setting('app.user_id')::INT"),
             &mapped,

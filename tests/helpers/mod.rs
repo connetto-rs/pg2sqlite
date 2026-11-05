@@ -232,7 +232,7 @@ fn current_app_username_impl() -> String {
 
 /// Implementation of the current_app_department function for SQLite.
 /// Returns the current department as text, or empty string if not set (mimics
-/// PostgreSQL's current_setting with missing_ok=true).
+/// PostgreSQL's `current_setting(name, true)`).
 fn current_app_department_impl() -> String {
     SESSION_DEPARTMENT.with(|d| (*d.borrow()).clone().unwrap_or_default())
 }

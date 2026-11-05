@@ -7,7 +7,10 @@ use std::cell::RefCell;
 use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
 
-use crate::helpers::postgres as postgres_harness;
+use crate::helpers::{
+    deployment::{caller, deployment},
+    postgres as postgres_harness,
+};
 
 const SCHEMA: &str = "
 CREATE TABLE projects (id TEXT PRIMARY KEY, owner TEXT NOT NULL, linked_id TEXT);
@@ -121,7 +124,8 @@ fn postgres(policy: &str) -> PgConnection {
 fn sqlite(policy: &str) -> SqliteConnection {
     let options = Pg2SqliteOptions::default()
         .with_rls_audit_table_name("rls_audit")
-        .with_session_variable(SessionVariableMapping::current_setting("app.owner", "app_owner"));
+        .with_deployment(deployment([], [caller("app.owner", "text")]))
+        .with_session_variable(SessionVariableMapping::new("app.owner", "app_owner"));
     let translated = Pg2Sqlite::default()
         .sql(&format!("{SCHEMA}{policy}"))
         .expect("parse")

@@ -1582,7 +1582,7 @@ pub fn reverse_translate_function(
             })
         }
         FunctionReversal::ToSessionVariable(mapping) => {
-            session_variable::reverse_expression(&mapping)
+            session_variable::reverse_expression(&mapping, options)
         }
         FunctionReversal::ToCast(data_type) => {
             let name = session_variable::function_name_lower(&func.name);

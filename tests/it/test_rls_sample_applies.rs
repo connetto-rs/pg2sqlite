@@ -9,6 +9,8 @@
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 use rusqlite::{Connection, params};
 
+use crate::helpers::deployment::{caller, deployment};
+
 const RLS_SAMPLE: &str = "\
 CREATE TABLE documents (
     id INTEGER PRIMARY KEY,
@@ -37,10 +39,8 @@ fn translate_rls_sample() -> String {
         .with_sqlitegis_enabled()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_rls_audit_table_name("rls_violations")
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ));
+        .with_deployment(deployment([], [caller("app.user_id", "integer")]))
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"));
     let stmts = Pg2Sqlite::default()
         .sql(RLS_SAMPLE)
         .expect("parse")

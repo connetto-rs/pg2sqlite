@@ -24,7 +24,10 @@ use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
 use postgres_harness::{apply, fresh_database};
 use sql_traits::structs::ParserDB;
 
-use crate::helpers::postgres as postgres_harness;
+use crate::helpers::{
+    deployment::{caller, deployment},
+    postgres as postgres_harness,
+};
 
 /// Union of all table shapes referenced by the harvested cases. Applied once to
 /// a fresh database and reused for every case.
@@ -795,18 +798,18 @@ fn a_reversed_session_variable_runs_in_postgres() {
     let mut connection = fresh_database();
     apply(&mut connection, SCHEMA_DDL).expect("schema applied to fresh database");
 
-    let untyped = Pg2SqliteOptions::default().with_session_variable(
-        SessionVariableMapping::current_setting("app.user_id", "app_user_id"),
-    );
-    let typed = Pg2SqliteOptions::default().with_session_variable(
-        SessionVariableMapping::current_setting("app.user_id", "app_user_id").with_pg_type("uuid"),
-    );
+    let untyped = Pg2SqliteOptions::default()
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "app_user_id"))
+        .with_deployment(deployment([], [caller("app.user_id", "text")]));
+    let typed = Pg2SqliteOptions::default()
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "app_user_id"))
+        .with_deployment(deployment([], [caller("app.user_id", "uuid")]));
 
     let cases: [(&str, &Pg2SqliteOptions, &str); 3] = [
         // The setting answers text, so a text column compares without a cast.
         ("SELECT id FROM callers WHERE owner = app_user_id()", &untyped, "text column"),
         // A uuid column does not: `uuid = text` is an error, which is why the
-        // mapping records the type and the cast is written back.
+        // deployment declares the type and the cast is written back.
         ("SELECT id FROM callers WHERE owner_uuid = app_user_id()", &typed, "uuid column"),
         // Inside a subquery, which is the shape a membership filter takes.
         (

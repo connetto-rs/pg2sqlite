@@ -9,7 +9,10 @@
 
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 
-use crate::helpers::{apply_statements, deployment::deployment};
+use crate::helpers::{
+    apply_statements,
+    deployment::{caller, deployment},
+};
 
 fn make_options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
@@ -17,11 +20,8 @@ fn make_options() -> Pg2SqliteOptions {
         .with_uuid_v7_function_name("uuidv7")
         .with_rls_audit_table_name("rls_audit".to_string())
         // UUID-based identity mapping
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ))
-        .with_deployment(deployment(["authenticated"], []))
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
+        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
         .with_acting_role("authenticated")
 }
 
@@ -77,7 +77,7 @@ fn test_both_session_readings_are_applied() {
     apply_statements(&translated.iter().map(ToString::to_string).collect::<Vec<_>>());
 }
 
-/// When a policy reads a `current_setting` that no mapping pairs with,
+/// When the deployment declares a setting no mapping pairs with a function,
 /// translation should fail with a clear error about the missing mapping.
 #[test]
 fn test_missing_session_variable_for_current_setting_fails() {
@@ -87,13 +87,13 @@ fn test_missing_session_variable_for_current_setting_fails() {
         "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
     );
 
-    // Name the acting role, but pair no mapping with
-    // current_setting('app.user_id')
+    // Declare the setting and name the acting role, but pair no mapping
+    // with current_setting('app.user_id')
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
         .with_rls_audit_table_name("rls_audit".to_string())
-        .with_deployment(deployment(["authenticated"], []))
+        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
         .with_acting_role("authenticated");
 
     let result = Pg2Sqlite::default()

@@ -15,7 +15,10 @@ use rosetta_uuid::Uuid;
 
 use crate::{
     helpers,
-    helpers::{deployment::deployment, postgres as postgres_harness},
+    helpers::{
+        deployment::{caller, deployment, scalar},
+        postgres as postgres_harness,
+    },
 };
 
 // User UUIDs shared across all scenarios.
@@ -285,11 +288,8 @@ fn basic_options() -> Pg2SqliteOptions {
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
         .with_rls_audit_table_name("rls_audit")
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ))
-        .with_deployment(deployment(["authenticated"], []))
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
+        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
         .with_acting_role("authenticated")
 }
 
@@ -638,15 +638,15 @@ fn multi_options() -> Pg2SqliteOptions {
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
         .with_rls_audit_table_name("rls_audit")
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ))
-        .with_session_variable(SessionVariableMapping::current_setting(
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
+        .with_session_variable(SessionVariableMapping::new(
             "app.user_department",
             "current_app_department",
         ))
-        .with_deployment(deployment(["authenticated"], []))
+        .with_deployment(deployment(
+            ["authenticated"],
+            [caller("app.user_id", "uuid"), scalar("app.user_department", "text")],
+        ))
         .with_acting_role("authenticated")
 }
 
@@ -936,11 +936,8 @@ fn tenant_options() -> Pg2SqliteOptions {
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
         .with_rls_audit_table_name("rls_audit")
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ))
-        .with_deployment(deployment(["authenticated"], []))
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
+        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
         .with_acting_role("authenticated")
 }
 
@@ -1272,11 +1269,8 @@ fn public_options() -> Pg2SqliteOptions {
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
         .with_rls_audit_table_name("rls_audit")
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ))
-        .with_deployment(deployment(["authenticated"], []))
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
+        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
         .with_acting_role("authenticated")
 }
 

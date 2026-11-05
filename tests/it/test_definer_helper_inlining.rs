@@ -244,7 +244,7 @@ fn deployment() -> Deployment {
 pub(crate) fn options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_rls_audit_table_name("rls_audit")
-        .with_session_variable(SessionVariableMapping::current_setting("app.user_id", "app_user"))
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "app_user"))
         .with_deployment(deployment())
 }
 
@@ -328,9 +328,7 @@ fn a_helper_keeping_no_row_for_its_arguments_is_the_empty_set() {
 
 #[test]
 fn a_helper_call_without_a_deployment_is_refused() {
-    let options = Pg2SqliteOptions::default()
-        .with_rls_audit_table_name("rls_audit")
-        .with_session_variable(SessionVariableMapping::current_setting("app.user_id", "app_user"));
+    let options = Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit");
     let error = refusal(&read_policy("id IN (SELECT docs_with('write'))"), &options).to_string();
     assert!(error.contains("docs_with()") && error.contains("with_deployment"), "{error}");
 }

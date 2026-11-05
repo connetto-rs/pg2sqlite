@@ -3,21 +3,26 @@
 //! A session variable mapping pairs a PostgreSQL setting with the function the
 //! replica registers. Until now that pairing was read only while translating a
 //! row-security policy, so a query naming the caller was refused as an unknown
-//! function. These tests cover the query path: the pairing applies, an
-//! unmapped pattern refuses in the mapping's own words, and a cast that
-//! disagrees with the type the pairing records refuses rather than being
-//! dropped in silence.
+//! function. These tests cover the query path: the pairing applies, a reading
+//! the deployment does not declare or no mapping pairs refuses in the
+//! deployment's or the mapping's own words, and a cast that disagrees with
+//! the type the deployment declares refuses rather than being dropped in
+//! silence.
 //!
 //! Each behavioural case executes the translator's own emitted SQL against a
 //! SQLite connection with the paired function registered, and discriminates by
 //! switching the session between two rows.
 
 use diesel::{prelude::*, sql_query};
-use helpers::{deployment::deployment, establish_connection, set_session_username};
+use helpers::{
+    deployment::{caller, deployment, pg_type},
+    establish_connection, set_session_username,
+};
 use pg2sqlite::{
     errors::Error,
     prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping},
 };
+use sql_traits::structs::{SessionSetting, SettingValue};
 
 use crate::helpers;
 
@@ -52,7 +57,8 @@ struct OwnerRow {
 
 fn setting_paired() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
-        .with_session_variable(SessionVariableMapping::current_setting(SETTING, PAIRED_FUNCTION))
+        .with_session_variable(SessionVariableMapping::new(SETTING, PAIRED_FUNCTION))
+        .with_deployment(deployment([], [caller(SETTING, "text")]))
 }
 
 fn translate(pg: &str, options: &Pg2SqliteOptions) -> Result<Vec<String>, Error> {
@@ -140,17 +146,17 @@ fn a_query_naming_current_user_answers_the_acting_role() {
 }
 
 #[test]
-fn a_cast_over_the_setting_drops_the_cast_when_the_pairing_agrees() {
-    let options = Pg2SqliteOptions::default().with_session_variable(
-        SessionVariableMapping::current_setting(SETTING, PAIRED_FUNCTION).with_pg_type("text"),
-    );
+fn a_cast_over_the_setting_drops_the_cast_when_the_declaration_agrees() {
+    let options = Pg2SqliteOptions::default()
+        .with_session_variable(SessionVariableMapping::new(SETTING, PAIRED_FUNCTION))
+        .with_deployment(deployment([], [caller(SETTING, "text")]));
     let emitted = translate(
         &format!(
             "{PG_SCHEMA} SELECT id FROM docs WHERE owner = current_setting('{SETTING}')::text;"
         ),
         &options,
     )
-    .expect("the written cast agrees with the recorded type");
+    .expect("the written cast agrees with the declared type");
 
     let query = emitted.last().expect("the query is emitted");
     assert!(
@@ -161,23 +167,10 @@ fn a_cast_over_the_setting_drops_the_cast_when_the_pairing_agrees() {
 }
 
 #[test]
-fn a_cast_over_the_setting_needs_no_recorded_type() {
-    let emitted = translate(
-        &format!(
-            "{PG_SCHEMA} SELECT id FROM docs WHERE owner = current_setting('{SETTING}')::text;"
-        ),
-        &setting_paired(),
-    )
-    .expect("a pairing that records no type has nothing to disagree with");
-
-    assert_eq!(ids_visible_to(&emitted, "bob"), vec![2]);
-}
-
-#[test]
 fn one_type_spelled_two_ways_agrees() {
-    let options = Pg2SqliteOptions::default().with_session_variable(
-        SessionVariableMapping::current_setting(SETTING, PAIRED_FUNCTION).with_pg_type("integer"),
-    );
+    let options = Pg2SqliteOptions::default()
+        .with_session_variable(SessionVariableMapping::new(SETTING, PAIRED_FUNCTION))
+        .with_deployment(deployment([], [caller(SETTING, "integer")]));
 
     translate(
         &format!("{PG_SCHEMA} SELECT id FROM docs WHERE id = current_setting('{SETTING}')::int;"),
@@ -187,10 +180,10 @@ fn one_type_spelled_two_ways_agrees() {
 }
 
 #[test]
-fn a_cast_that_disagrees_with_the_pairing_refuses() {
-    let options = Pg2SqliteOptions::default().with_session_variable(
-        SessionVariableMapping::current_setting(SETTING, PAIRED_FUNCTION).with_pg_type("uuid"),
-    );
+fn a_cast_that_disagrees_with_the_declaration_refuses() {
+    let options = Pg2SqliteOptions::default()
+        .with_session_variable(SessionVariableMapping::new(SETTING, PAIRED_FUNCTION))
+        .with_deployment(deployment([], [caller(SETTING, "uuid")]));
 
     let error = translate(
         &format!(
@@ -198,22 +191,24 @@ fn a_cast_that_disagrees_with_the_pairing_refuses() {
         ),
         &options,
     )
-    .expect_err("the recorded type and the written cast disagree");
+    .expect_err("the declared type and the written cast disagree");
 
     assert!(
-        matches!(&error, Error::SessionVariableTypeDisagrees { pattern, recorded, written }
-            if pattern.contains(SETTING) && recorded == "uuid" && written == "TEXT"),
+        matches!(&error, Error::SessionVariableTypeDisagrees { pattern, declared, written }
+            if pattern.contains(SETTING) && declared == "UUID" && written == "TEXT"),
         "the refusal names both types, got: {error}"
     );
 }
 
 #[test]
 fn a_query_naming_an_unpaired_setting_refuses() {
+    let options =
+        Pg2SqliteOptions::default().with_deployment(deployment([], [caller(SETTING, "text")]));
     let error = translate(
         &format!("{PG_SCHEMA} SELECT id FROM docs WHERE owner = current_setting('{SETTING}');"),
-        &Pg2SqliteOptions::default(),
+        &options,
     )
-    .expect_err("nothing says what the setting becomes");
+    .expect_err("nothing pairs the setting with a function");
 
     assert!(
         matches!(&error, Error::SessionVariableMappingNotFound { pattern }
@@ -237,22 +232,6 @@ fn a_query_naming_current_user_without_an_acting_role_refuses() {
 }
 
 #[test]
-fn a_declared_current_setting_passes_through_unpaired() {
-    let options = Pg2SqliteOptions::default().with_user_defined_functions(["current_setting"]);
-    let emitted = translate(
-        &format!("{PG_SCHEMA} SELECT id FROM docs WHERE owner = current_setting('{SETTING}');"),
-        &options,
-    )
-    .expect("a declared name is evidence the destination has it");
-
-    let query = emitted.last().expect("the query is emitted");
-    assert!(
-        query.contains("current_setting"),
-        "a caller who registered the name keeps it, got: {query}"
-    );
-}
-
-#[test]
 fn a_setting_named_by_an_expression_refuses() {
     let error = translate(
         &format!("{PG_SCHEMA} SELECT id FROM docs WHERE owner = current_setting(owner);"),
@@ -266,18 +245,22 @@ fn a_setting_named_by_an_expression_refuses() {
     );
 }
 
-/// M8: a strict mapping reverses to `current_setting(name)` with no second
-/// argument. The tolerant form (the default) adds `true` as the second arg.
+/// An always-set declaration reverses to `current_setting(name)` with no
+/// second argument. A declaration a request may leave unset adds `true`.
 #[test]
-fn a_strict_mapping_reverses_to_one_argument_current_setting() {
+fn an_always_set_setting_reverses_to_one_argument_current_setting() {
     const STRICT_SETTING: &str = "app.strict_user";
     const STRICT_FN: &str = "strict_user_fn";
 
     let translator = Pg2Sqlite::default().sql(PG_SCHEMA).expect("parse");
     let schema = translator.build_schema().expect("schema");
-    let options = Pg2SqliteOptions::default().with_session_variable(
-        SessionVariableMapping::current_setting_strict(STRICT_SETTING, STRICT_FN),
-    );
+    let options = Pg2SqliteOptions::default()
+        .with_session_variable(SessionVariableMapping::new(STRICT_SETTING, STRICT_FN))
+        .with_deployment(deployment(
+            [],
+            [SessionSetting::value(STRICT_SETTING, SettingValue::Caller(pg_type("text")))
+                .expect("a custom setting name")],
+        ));
 
     let sqlite_sql = format!("SELECT {STRICT_FN}() FROM docs;");
     let reversed = translator
@@ -290,10 +273,10 @@ fn a_strict_mapping_reverses_to_one_argument_current_setting() {
 
     assert!(
         reversed.contains(&format!("current_setting('{STRICT_SETTING}')")),
-        "strict mapping must restore one-argument current_setting: {reversed}"
+        "an always-set declaration must restore one-argument current_setting: {reversed}"
     );
     assert!(
         !reversed.contains("true"),
-        "strict mapping must not include missing_ok argument: {reversed}"
+        "an always-set declaration reverses without the second argument: {reversed}"
     );
 }

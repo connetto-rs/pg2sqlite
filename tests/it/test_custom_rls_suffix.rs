@@ -9,20 +9,17 @@
 use diesel::{connection::SimpleConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 
-use crate::helpers::deployment::deployment;
+use crate::helpers::deployment::{caller, deployment};
 
 fn make_options_with_suffix(suffix: &str) -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
         .with_rls_table_suffix(suffix)
-        .with_deployment(deployment(["authenticated"], []))
+        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
         .with_acting_role("authenticated")
         .with_rls_audit_table_name("rls_audit".to_string())
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ))
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
 }
 
 /// The backing table must carry the custom suffix; the view retains the
@@ -90,11 +87,7 @@ fn test_custom_suffix_in_foreign_keys() {
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
         .with_rls_table_suffix("_secure")
-        .with_rls_audit_table_name("rls_audit".to_string())
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ));
+        .with_rls_audit_table_name("rls_audit".to_string());
 
     let translated = Pg2Sqlite::default().sql(sql).unwrap().translate(&options).unwrap().into_vec();
     let sql_output = translated.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");

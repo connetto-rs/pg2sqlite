@@ -79,7 +79,7 @@ use crate::{
             vector::{UnstoredVector, is_vector_data_type},
         },
     },
-    traits::{SessionVariableMapping, translator::TranslatorWithContext},
+    traits::translator::TranslatorWithContext,
 };
 
 /// Extract the search query string from a to_tsquery expression.
@@ -1792,9 +1792,9 @@ fn declared_collation(
 /// `x = ANY(string_to_array(a, d))`, and its `<> ALL` negation, as the
 /// [`delimited_membership`] search.
 ///
-/// A text operand that is a mapped setting has to be declared a set joined
-/// by `d`, and is written as the paired call directly, since the ordinary
-/// function path refuses reading a set as one value.
+/// A text operand that is a session setting has to be declared a set of text
+/// joined by `d`, and is read by
+/// [`delimited_set_membership`](session_variable::delimited_set_membership).
 ///
 /// `Ok(None)` when the operand is not a `string_to_array` call, which leaves
 /// the call refused everywhere no membership test consumes it: the array
@@ -1820,7 +1820,29 @@ fn translate_delimited_membership(
     else {
         return Ok(None);
     };
-    let delimiter = membership_delimiter(delimiter)?;
+    let setting = match session_variable::setting_operand(text) {
+        Expr::Function(function) => {
+            match session_variable::session_read_of_function(function) {
+                Some(session_variable::SessionRead::Setting(name)) => Some(name),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    let split = match setting {
+        Some(name) => {
+            let written = single_quoted_literal(delimiter).ok_or_else(|| {
+                crate::errors::Error::forward_refusal(
+                    "A membership test over a session setting's string_to_array() splits on the \
+                     delimiter the deployment declares, so it has to be written as a string \
+                     literal."
+                        .to_string(),
+                )
+            })?;
+            Split::Setting { name, written }
+        }
+        None => Split::Text(membership_delimiter(delimiter)?),
+    };
     match effective_collation(left, text, schema, options)? {
         ComparisonCollation::Byte => {}
         // The message about a name SQLite has no counterpart for belongs to
@@ -1847,29 +1869,30 @@ fn translate_delimited_membership(
     }
 
     let translated_left = left.translate_with_warnings(schema, options, emit)?;
-    let translated_text = match mapped_setting(text, options) {
-        Some(mapping) => {
-            session_variable::set_reading(mapping, delimiter)?;
-            session_variable::paired_call(mapping)
+    match split {
+        Split::Setting { name, written } => {
+            session_variable::delimited_set_membership(
+                translated_left,
+                &name,
+                written,
+                negated,
+                options,
+            )
+            .map(Some)
         }
-        None => text.translate_with_warnings(schema, options, emit)?,
-    };
-    Ok(Some(delimited_membership(translated_left, translated_text, delimiter, negated)))
+        Split::Text(delimiter) => {
+            let translated_text = text.translate_with_warnings(schema, options, emit)?;
+            Ok(Some(delimited_membership(translated_left, translated_text, delimiter, negated)))
+        }
+    }
 }
 
-/// The mapping of a session variable pattern `expr` names, under parentheses
-/// or a plain cast to `text`, when it names one a mapping pairs.
-fn mapped_setting<'o>(
-    expr: &Expr,
-    options: &'o crate::options::TranslationContext<'_>,
-) -> Option<&'o SessionVariableMapping> {
-    let Expr::Function(function) = session_variable::setting_operand(expr) else { return None };
-    let Some(session_variable::SessionRead::Setting(name)) =
-        session_variable::session_read_of_function(function)
-    else {
-        return None;
-    };
-    options.find_session_variable(&session_variable::setting_pattern(&name))
+/// What a membership test over `string_to_array` splits.
+enum Split<'e> {
+    /// A session setting, split on the delimiter written.
+    Setting { name: String, written: &'e str },
+    /// Any other text, split on one character.
+    Text(char),
 }
 
 /// `= ANY` or `<> ALL` with an interval left side: the array literal's

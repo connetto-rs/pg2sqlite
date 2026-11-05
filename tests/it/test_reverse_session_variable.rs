@@ -5,8 +5,8 @@
 //! same thing. Going out, the setting becomes the function and the cast over it
 //! is dropped, because SQLite is dynamically typed. Coming back, the function
 //! has to become the setting again, and the cast has to be written from the
-//! type the mapping records: PostgreSQL's `current_setting` answers text, and
-//! `uuid = text` is an error there rather than a comparison.
+//! type the deployment declares: PostgreSQL's `current_setting` answers text,
+//! and `uuid = text` is an error there rather than a comparison.
 //!
 //! Every emitted statement is re-parsed with the PostgreSQL dialect, which is
 //! the least this direction owes. The real server checks the same shapes in
@@ -16,8 +16,10 @@ use pg2sqlite::{
     errors::Error,
     prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping},
 };
-use sql_traits::structs::ParserDB;
-use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
+use sql_traits::structs::{ParserDB, SessionSetting, SetPacking, SettingValue};
+use sqlparser::{ast::DataType, dialect::PostgreSqlDialect, parser::Parser};
+
+use crate::helpers::deployment::{caller, delimited, deployment, scalar};
 
 const DDL: &str = "CREATE TABLE projects(id INTEGER PRIMARY KEY, name TEXT);
 CREATE TABLE project_members(project_id INTEGER REFERENCES projects(id), user_id TEXT, PRIMARY KEY(project_id, user_id));
@@ -48,7 +50,8 @@ fn reverse(sqlite: &str, options: &Pg2SqliteOptions) -> Result<String, Error> {
 
 fn setting_paired() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
-        .with_session_variable(SessionVariableMapping::current_setting(SETTING, PAIRED_FUNCTION))
+        .with_session_variable(SessionVariableMapping::new(SETTING, PAIRED_FUNCTION))
+        .with_deployment(deployment([], [caller(SETTING, "text")]))
 }
 
 #[test]
@@ -68,13 +71,13 @@ fn the_paired_function_becomes_the_setting() {
 }
 
 #[test]
-fn a_recorded_type_becomes_a_cast() {
-    let options = Pg2SqliteOptions::default().with_session_variable(
-        SessionVariableMapping::current_setting(SETTING, PAIRED_FUNCTION).with_pg_type("uuid"),
-    );
+fn a_declared_type_becomes_a_cast() {
+    let options = Pg2SqliteOptions::default()
+        .with_session_variable(SessionVariableMapping::new(SETTING, PAIRED_FUNCTION))
+        .with_deployment(deployment([], [caller(SETTING, "uuid")]));
 
     let postgres = reverse("SELECT * FROM docs WHERE title = app_user_id()", &options)
-        .expect("the mapping records what the setting holds");
+        .expect("the deployment declares what the setting holds");
 
     assert!(
         postgres.contains("current_setting('app.user_id', true)::UUID"),
@@ -83,11 +86,10 @@ fn a_recorded_type_becomes_a_cast() {
 }
 
 #[test]
-fn a_parameterised_recorded_type_keeps_its_parameters() {
-    let options = Pg2SqliteOptions::default().with_session_variable(
-        SessionVariableMapping::current_setting("app.rate", "app_rate")
-            .with_pg_type("numeric(10,2)"),
-    );
+fn a_parameterised_declared_type_keeps_its_parameters() {
+    let options = Pg2SqliteOptions::default()
+        .with_session_variable(SessionVariableMapping::new("app.rate", "app_rate"))
+        .with_deployment(deployment([], [scalar("app.rate", "numeric(10,2)")]));
 
     let postgres = reverse("SELECT * FROM docs WHERE id = app_rate()", &options)
         .expect("a parameterised type is a type");
@@ -136,9 +138,9 @@ const SET_SETTING: &str = "app.subjects";
 const SET_FUNCTION: &str = "current_app_subjects";
 
 fn set_paired() -> Pg2SqliteOptions {
-    Pg2SqliteOptions::default().with_session_variable(
-        SessionVariableMapping::current_setting(SET_SETTING, SET_FUNCTION).holding_set(','),
-    )
+    Pg2SqliteOptions::default()
+        .with_session_variable(SessionVariableMapping::new(SET_SETTING, SET_FUNCTION))
+        .with_deployment(deployment([], [delimited(SET_SETTING, ",")]))
 }
 
 /// The predicate the forward direction emits for `user_id =
@@ -171,16 +173,26 @@ fn the_membership_shape_over_a_set_valued_setting_becomes_any_over_the_split() {
     );
 }
 
-/// A strict mapping keeps its one-argument spelling inside the split, since
-/// `current_setting(name, true)` there would make the test tolerate an unset
-/// setting the scalar reading raises on.
+/// An always-set declaration keeps its one-argument spelling inside the split,
+/// since `current_setting(name, true)` there would make the test tolerate an
+/// unset setting the scalar reading raises on.
 #[test]
-fn a_strict_set_valued_setting_keeps_the_strict_spelling_inside_the_split() {
-    let options = Pg2SqliteOptions::default().with_session_variable(
-        SessionVariableMapping::current_setting_strict(SET_SETTING, SET_FUNCTION).holding_set(','),
-    );
+fn an_always_set_set_valued_setting_keeps_the_one_argument_spelling_inside_the_split() {
+    let options = Pg2SqliteOptions::default()
+        .with_session_variable(SessionVariableMapping::new(SET_SETTING, SET_FUNCTION))
+        .with_deployment(deployment(
+            [],
+            [SessionSetting::value(
+                SET_SETTING,
+                SettingValue::Set {
+                    element: DataType::Text,
+                    packing: SetPacking::Delimited(",".to_owned()),
+                },
+            )
+            .expect("a custom setting name")],
+        ));
     let postgres = reverse(&format!("SELECT * FROM project_members WHERE {MEMBERSHIP}"), &options)
-        .expect("the strict mapping declares the set");
+        .expect("the deployment declares the set");
 
     assert_eq!(
         postgres,
@@ -207,9 +219,9 @@ fn parentheses_or_a_text_cast_over_the_paired_function_keep_the_membership_readi
 /// would otherwise read the name as volatile.
 #[test]
 fn a_pairing_outranks_the_volatile_name_inventory() {
-    let options = Pg2SqliteOptions::default().with_session_variable(
-        SessionVariableMapping::current_setting(SET_SETTING, "random").holding_set(','),
-    );
+    let options = Pg2SqliteOptions::default()
+        .with_session_variable(SessionVariableMapping::new(SET_SETTING, "random"))
+        .with_deployment(deployment([], [delimited(SET_SETTING, ",")]));
     let membership = MEMBERSHIP.replace("current_app_subjects()", "random()");
     let postgres = reverse(&format!("SELECT * FROM project_members WHERE {membership}"), &options)
         .expect("the paired name answers the setting, whatever it is called");
@@ -239,40 +251,43 @@ fn a_set_valued_setting_read_as_one_value_refuses() {
     .expect_err("one user_id against the whole joined text matches nobody the server admits");
 
     assert!(
-        matches!(&error, Error::SessionVariableReadAsScalar { pattern, delimiter: ',' }
-            if pattern == "current_setting('app.subjects')"),
-        "the refusal names the setting and its delimiter, got: {error}"
+        matches!(&error, Error::SessionVariableReadAsScalar { pattern, packing }
+            if pattern == "current_setting('app.subjects')" && *packing == "joined by ','"),
+        "the refusal names the setting and its packing, got: {error}"
     );
 }
 
 #[test]
 fn a_scalar_setting_read_as_a_set_refuses() {
     let options = Pg2SqliteOptions::default()
-        .with_session_variable(SessionVariableMapping::current_setting(SET_SETTING, SET_FUNCTION));
+        .with_session_variable(SessionVariableMapping::new(SET_SETTING, SET_FUNCTION))
+        .with_deployment(deployment([], [scalar(SET_SETTING, "text")]));
 
     let error = reverse(&format!("SELECT * FROM project_members WHERE {MEMBERSHIP}"), &options)
-        .expect_err("a mapping that declares no set holds one value");
+        .expect_err("the deployment declares one value, which holds no set");
 
     assert!(
         matches!(&error, Error::SessionVariableReadAsSet { pattern, written }
-            if pattern == "current_setting('app.subjects')" && *written == ','),
+            if pattern == "current_setting('app.subjects')" && *written == "joined by ','"),
         "the refusal names the setting and the delimiter the statement split on, got: {error}"
     );
 }
 
 #[test]
 fn a_delimiter_other_than_the_declared_one_refuses() {
-    let options = Pg2SqliteOptions::default().with_session_variable(
-        SessionVariableMapping::current_setting(SET_SETTING, SET_FUNCTION).holding_set(';'),
-    );
+    let options = Pg2SqliteOptions::default()
+        .with_session_variable(SessionVariableMapping::new(SET_SETTING, SET_FUNCTION))
+        .with_deployment(deployment([], [delimited(SET_SETTING, ";")]));
 
     let error = reverse(&format!("SELECT * FROM project_members WHERE {MEMBERSHIP}"), &options)
-        .expect_err("splitting on a comma reads a set the mapping does not declare");
+        .expect_err("splitting on a comma reads a set the deployment does not declare");
 
     assert!(
-        matches!(&error, Error::SessionVariableDelimiterDisagrees { pattern, recorded: ';', written }
-            if pattern == "current_setting('app.subjects')" && *written == ','),
-        "the refusal names both delimiters, got: {error}"
+        matches!(&error, Error::SessionVariablePackingDisagrees { pattern, declared, written }
+            if pattern == "current_setting('app.subjects')"
+                && *declared == "joined by ';'"
+                && *written == "joined by ','"),
+        "the refusal names both packings, got: {error}"
     );
 }
 

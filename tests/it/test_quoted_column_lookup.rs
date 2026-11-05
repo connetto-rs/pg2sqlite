@@ -21,7 +21,10 @@ use helpers::translate_pg as translate;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 use rusqlite::Connection;
 
-use crate::helpers;
+use crate::{
+    helpers,
+    helpers::deployment::{caller, deployment},
+};
 
 /// Applies every emitted statement, which proves SQLite takes the output.
 fn apply(connection: &Connection, statements: &[String]) {
@@ -115,11 +118,9 @@ INSERT INTO documents (owner_id) VALUES (42) RETURNING {returning};"
 fn monitor_options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
+        .with_deployment(deployment([], [caller("app.user_id", "integer")]))
         .with_rls_audit_table_name("rls_violations")
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ))
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
 }
 
 #[test]

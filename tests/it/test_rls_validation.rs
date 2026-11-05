@@ -8,7 +8,10 @@ use helpers::establish_connection;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 use rosetta_uuid::Uuid;
 
-use crate::{helpers, helpers::deployment::deployment};
+use crate::{
+    helpers,
+    helpers::deployment::{caller, deployment},
+};
 
 /// PostgreSQL schema with basic RLS setup for testing.
 const RLS_SCHEMA: &str = r#"
@@ -52,12 +55,9 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authentic
 fn test_rls_requires_audit_table_name() {
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
-        .with_deployment(deployment(["authenticated"], []))
+        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
         .with_acting_role("authenticated")
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ));
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"));
     // Note: NO .with_rls_audit_table_name() called
 
     let result = Pg2Sqlite::default()
@@ -80,12 +80,9 @@ fn test_audit_table_uses_configured_name() -> Result<(), Box<dyn std::error::Err
     let custom_audit_name = "my_custom_violations";
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
-        .with_deployment(deployment(["authenticated"], []))
+        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
         .with_acting_role("authenticated")
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ))
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
         .with_rls_audit_table_name(custom_audit_name.to_string());
 
     let translated = Pg2Sqlite::default().sql(RLS_SCHEMA)?.translate(&options)?.into_vec();
@@ -115,12 +112,9 @@ fn test_triggers_use_configured_audit_table() -> Result<(), Box<dyn std::error::
     let custom_audit_name = "custom_audit";
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
-        .with_deployment(deployment(["authenticated"], []))
+        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
         .with_acting_role("authenticated")
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ))
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
         .with_rls_audit_table_name(custom_audit_name.to_string());
 
     let translated = Pg2Sqlite::default().sql(RLS_SCHEMA)?.translate(&options)?.into_vec();
@@ -196,12 +190,9 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authentic
 "#;
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
-        .with_deployment(deployment(["authenticated"], []))
+        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
         .with_acting_role("authenticated")
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ))
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
         .with_rls_audit_table_name(audit_table_name.to_string());
 
     let translated = Pg2Sqlite::default().sql(MONITOR_SCHEMA)?.translate(&options)?.into_vec();
@@ -257,12 +248,9 @@ fn test_strict_mode_blocks_violations() -> Result<(), Box<dyn std::error::Error>
     let audit_table_name = "rls_violations_strict";
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
-        .with_deployment(deployment(["authenticated"], []))
+        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
         .with_acting_role("authenticated")
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ))
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
         .with_rls_audit_table_name(audit_table_name.to_string())
         .with_strict_rls_validation(); // Enable strict mode
 
@@ -346,12 +334,9 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authentic
 "#;
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
-        .with_deployment(deployment(["authenticated"], []))
+        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
         .with_acting_role("authenticated")
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ))
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
         .with_rls_audit_table_name("rls_audit".to_string());
 
     let translated = Pg2Sqlite::default().sql(VALIDATION_SCHEMA)?.translate(&options)?.into_vec();
@@ -407,12 +392,9 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authentic
 fn test_monitor_mode_snapshot() -> Result<(), Box<dyn std::error::Error>> {
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
-        .with_deployment(deployment(["authenticated"], []))
+        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
         .with_acting_role("authenticated")
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ))
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
         .with_rls_audit_table_name("rls_violations".to_string());
 
     let translated = Pg2Sqlite::default().sql(RLS_SCHEMA)?.translate(&options)?.into_vec();
@@ -427,12 +409,9 @@ fn test_monitor_mode_snapshot() -> Result<(), Box<dyn std::error::Error>> {
 fn test_strict_mode_snapshot() -> Result<(), Box<dyn std::error::Error>> {
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
-        .with_deployment(deployment(["authenticated"], []))
+        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
         .with_acting_role("authenticated")
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ))
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
         .with_rls_audit_table_name("rls_violations".to_string())
         .with_strict_rls_validation();
 
