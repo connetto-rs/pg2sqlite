@@ -45,8 +45,8 @@ use sql_traits::structs::ParserDB;
 use sqlparser::ast::{
     BinaryOperator, CastKind, DataType, Expr, FunctionArg, FunctionArgExpr, FunctionArgumentClause,
     FunctionArguments, Ident, InTarget, ObjectName, OrderByExpr, OrderByOptions, SelectItem,
-    SetExpr, SetOperator, SetQuantifier, TableAlias, TableFactor, Value, ValueWithSpan,
-    visit_expressions,
+    SetExpr, SetOperator, SetQuantifier, TableAlias, TableFactor, TableWithJoins, Value,
+    ValueWithSpan, visit_expressions,
 };
 
 use crate::{
@@ -1057,7 +1057,133 @@ fn canonical_key_order() -> sqlparser::ast::OrderBy {
 /// table. Keeping the predicate beside the mapping table means a name added
 /// there is refused in scalar position on the same edit.
 pub(crate) fn is_json_set_returning(lowered: &str) -> bool {
-    JSON_SET_RETURNING.iter().any(|&(candidate, _, _)| candidate == lowered)
+    json_set_shape(lowered).is_some()
+}
+
+/// The shape and requote of the set-returning JSON function `name`, read
+/// without regard to ASCII case, or `None` when it is not one.
+fn json_set_shape(name: &str) -> Option<(JsonSetShape, bool)> {
+    JSON_SET_RETURNING
+        .iter()
+        .find(|(candidate, _, _)| candidate.eq_ignore_ascii_case(name))
+        .map(|&(_, shape, requote)| (shape, requote))
+}
+
+/// The names of a set-returning JSON function's columns, the second only for
+/// the two-column shape.
+///
+/// PostgreSQL names a column after what the function declares. The `value`
+/// functions declare `OUT value` and `json_each` declares `key` and `value`, so
+/// an alias leaves those names alone. The keys functions declare no output
+/// name, and PostgreSQL then names the column after the relation, the alias
+/// when there is one, measured on 18.6. A column list renames every column.
+fn column_names<'n>(
+    shape: JsonSetShape,
+    relation: &'n str,
+    declared: &[&'n str],
+) -> (&'n str, Option<&'n str>) {
+    let named = |index: usize, default: &'n str| declared.get(index).copied().unwrap_or(default);
+    match shape {
+        JsonSetShape::Value => (named(0, VALUE_COLUMN), None),
+        JsonSetShape::Key => (named(0, relation), None),
+        JsonSetShape::KeyValue => (named(0, KEY_COLUMN), Some(named(1, VALUE_COLUMN))),
+    }
+}
+
+/// What a bare reference to the relation of a set-returning JSON function
+/// reads.
+///
+/// PostgreSQL resolves a name that no column in scope answers as the whole row
+/// of the relation it names. The row of a one-column function is that column's
+/// value, so `SELECT e FROM jsonb_array_elements_text(x) AS e` reads the
+/// element. The row of `json_each` is a record, `(a,1)`, which SQLite has no
+/// value for.
+pub(crate) struct WholeRow<'w> {
+    relation: &'w Ident,
+    function: &'w ObjectName,
+    columns: (&'w str, Option<&'w str>),
+}
+
+impl<'w> WholeRow<'w> {
+    /// The whole rows the set-returning JSON functions in `from` expose.
+    pub(crate) fn of_relations(from: &'w [TableWithJoins]) -> Vec<Self> {
+        let mut rows = Vec::new();
+        for entry in from {
+            Self::collect(entry, &mut rows);
+        }
+        rows
+    }
+
+    #[cfg_attr(feature = "std", recursive::recursive)]
+    fn collect(entry: &'w TableWithJoins, rows: &mut Vec<Self>) {
+        let factors =
+            core::iter::once(&entry.relation).chain(entry.joins.iter().map(|join| &join.relation));
+        for factor in factors {
+            match factor {
+                TableFactor::NestedJoin { table_with_joins, .. } => {
+                    Self::collect(table_with_joins, rows);
+                }
+                TableFactor::Function { name, alias, .. }
+                | TableFactor::Table { name, alias, args: Some(_), .. } => {
+                    let Some(function_name) = crate::impls::object_name::last_ident(name) else {
+                        continue;
+                    };
+                    let Some((shape, _)) = json_set_shape(&function_name.value) else { continue };
+                    let relation = alias.as_ref().map_or(function_name, |alias| &alias.name);
+                    let declared: Vec<&str> = alias
+                        .iter()
+                        .flat_map(|alias| &alias.columns)
+                        .map(|column| column.name.value.as_str())
+                        .collect();
+                    let columns = column_names(shape, &relation.value, &declared);
+                    rows.push(Self { relation, function: name, columns });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Whether the bare name `name` names this relation, under PostgreSQL's
+    /// folding of an unquoted identifier.
+    pub(crate) fn is_named(&self, name: &Ident) -> bool {
+        sql_traits::structs::IdentifierCase::AsWritten.identifiers_match(
+            &self.relation.value,
+            self.relation.quote_style.is_some(),
+            &name.value,
+            name.quote_style.is_some(),
+        )
+    }
+
+    /// The qualified column a one-column row reads, `None` for a record.
+    ///
+    /// The relation is spelled unquoted, as the derived table that replaces
+    /// the function is aliased.
+    pub(crate) fn column_reference(&self) -> Option<Expr> {
+        let (column, None) = self.columns else { return None };
+        Some(Expr::CompoundIdentifier(vec![
+            Ident::new(self.relation.value.as_str()),
+            Ident::new(column),
+        ]))
+    }
+
+    /// The column the row reads, or the refusal of a record.
+    ///
+    /// # Errors
+    ///
+    /// Refuses the row of a two-column function, naming the relation and the
+    /// columns to read instead.
+    pub(crate) fn read(&self) -> Result<Expr, Error> {
+        self.column_reference().ok_or_else(|| {
+            let (key, value) = (self.columns.0, self.columns.1.unwrap_or_default());
+            let relation = self.relation;
+            Error::forward_refusal(format!(
+                "`{relation}` reads the whole row of {function}(), a record of two columns, and \
+                 SQLite has no record value. Read `{relation}.{key}` and `{relation}.{value}` \
+                 instead.",
+                function = self.function,
+            ))
+        })
+    }
 }
 
 /// Translate `FROM <set returning function>(<json>)` into a derived table over
@@ -1085,9 +1211,7 @@ pub(crate) fn translate_set_returning_factor(
         .map(|ident| ident.value.to_ascii_lowercase())
         .unwrap_or_default();
 
-    let Some(&(_, shape, requote)) =
-        JSON_SET_RETURNING.iter().find(|(candidate, _, _)| *candidate == lowered)
-    else {
+    let Some((shape, requote)) = json_set_shape(&lowered) else {
         if options.declares_user_defined_function(&lowered) {
             return Ok(TableFactor::Function {
                 lateral: false,
@@ -1132,7 +1256,6 @@ pub(crate) fn translate_set_returning_factor(
         .map(|a| a.columns.iter().map(|c| c.name.value.as_str()).collect())
         .unwrap_or_default();
 
-    let mut projection = Vec::with_capacity(2);
     let text_column = |name| {
         Expr::Cast {
             kind: CastKind::Cast,
@@ -1141,28 +1264,23 @@ pub(crate) fn translate_set_returning_factor(
             format: None,
         }
     };
-    let value_column = if requote {
-        simple_function_expr("json_quote", vec![json_each_column(VALUE_COLUMN)], None)
-    } else {
-        text_column(VALUE_COLUMN)
+    let value_column = || {
+        if requote {
+            simple_function_expr("json_quote", vec![json_each_column(VALUE_COLUMN)], None)
+        } else {
+            text_column(VALUE_COLUMN)
+        }
     };
 
-    match shape {
-        // PostgreSQL names this column after the function itself.
-        JsonSetShape::Key => {
-            projection.push(aliased(
-                text_column(KEY_COLUMN),
-                declared.first().copied().unwrap_or(&lowered),
-            ));
-        }
-        JsonSetShape::KeyValue => {
-            projection
-                .push(aliased(text_column(KEY_COLUMN), declared.first().copied().unwrap_or("key")));
-            projection.push(aliased(value_column, declared.get(1).copied().unwrap_or("value")));
-        }
-        JsonSetShape::Value => {
-            projection.push(aliased(value_column, declared.first().copied().unwrap_or("value")));
-        }
+    let (first, second) = column_names(shape, table_name, &declared);
+    let first_column = match shape {
+        JsonSetShape::Value => value_column(),
+        JsonSetShape::Key | JsonSetShape::KeyValue => text_column(KEY_COLUMN),
+    };
+    let mut projection = Vec::with_capacity(2);
+    projection.push(aliased(first_column, first));
+    if let Some(second) = second {
+        projection.push(aliased(value_column(), second));
     }
 
     let translated_document = expanded_document(name, shape, document, schema, options, emit)?;

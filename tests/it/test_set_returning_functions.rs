@@ -24,6 +24,7 @@
 //! `'[{"a":1}]'` both databases answer `{"a":1}` rather than a doubly quoted
 //! string, because SQLite tracks the JSON subtype through `json_each`.
 
+use diesel::{Connection, SqliteConnection, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use run_translated_helper::run_translated_with;
 
@@ -44,6 +45,27 @@ fn refuse(query: &str) -> String {
         .translate(&Pg2SqliteOptions::default())
         .expect_err("this function has no SQLite table-valued form")
         .to_string()
+}
+
+/// Translates `query` over the fixture, applies it to SQLite, and returns the
+/// error SQLite answers.
+fn sqlite_refusal(query: &str) -> String {
+    let statements = Pg2Sqlite::default()
+        .sql(&format!("{FIXTURE} {query};"))
+        .expect("parse")
+        .translate_to_sql(&Pg2SqliteOptions::default())
+        .expect("translate")
+        .into_vec();
+    let mut connection = SqliteConnection::establish(":memory:").expect("in-memory SQLite");
+    // The translated script is generated text, which no typed query expresses.
+    connection
+        .batch_execute(&statements.join(";\n"))
+        .expect_err("SQLite should refuse the emitted reference")
+        .to_string()
+}
+
+fn texts(values: &[&str]) -> Vec<Option<String>> {
+    values.iter().map(|value| Some((*value).to_string())).collect()
 }
 
 /// The defect: a function with no SQLite form used to be emitted verbatim, and
@@ -162,9 +184,10 @@ fn a_correlated_argument_is_refused_with_advice() {
 
 /// The derived table exists to name the output columns, so the alias forms
 /// carry the real logic and each one has to keep resolving. PostgreSQL's
-/// default names are `value`, `key` and `value`, and the function's own name
-/// for `json_object_keys`, all measured on 16. SQLite accepts no column list on
-/// a table alias, so an explicit list has to become the projection's aliases.
+/// default names are `value`, `key` and `value`, measured on 16, and for
+/// `json_object_keys` the alias, or the function's own name when there is
+/// none, measured on 18.6. SQLite accepts no column list on a table alias, so
+/// an explicit list has to become the projection's aliases.
 #[test]
 fn the_alias_forms_keep_their_column_names() {
     // A column list renames the element column.
@@ -187,6 +210,141 @@ fn the_alias_forms_keep_their_column_names() {
         rows("SELECT jae.value FROM json_array_elements('[1]') jae"),
         vec![Some("1".to_string())]
     );
+}
+
+/// PostgreSQL resolves a name that no column answers as the row of the
+/// relation it names, and the row of a one-column function is its value. So a
+/// bare alias reads the element, measured on PostgreSQL 18.6 for every query
+/// here. The membership test answers `t` there and `1` in SQLite.
+#[test]
+fn a_bare_alias_reads_the_value_of_a_one_column_function() {
+    for (query, expected) in [
+        ("SELECT e FROM jsonb_array_elements_text('[\"a\",\"b\"]'::jsonb) AS e", &["a", "b"][..]),
+        ("SELECT e FROM json_array_elements_text('[\"a\",\"b\"]'::json) AS e", &["a", "b"]),
+        ("SELECT e FROM jsonb_array_elements('[1,2]'::jsonb) AS e", &["1", "2"]),
+        ("SELECT e FROM json_array_elements('[1,\"x\"]') AS e", &["1", "\"x\""]),
+        ("SELECT e FROM json_object_keys('{\"a\":1}'::json) AS e", &["a"]),
+        ("SELECT e FROM jsonb_object_keys('{\"b\":1,\"a\":2}'::jsonb) AS e", &["a", "b"]),
+        (
+            "SELECT 'a' IN (SELECT e FROM jsonb_array_elements_text('[\"a\",\"b\"]'::jsonb) AS e)",
+            &["1"],
+        ),
+        ("SELECT E FROM jsonb_array_elements_text('[\"a\"]'::jsonb) AS e", &["a"]),
+        (
+            "SELECT jsonb_array_elements_text FROM jsonb_array_elements_text('[\"a\"]'::jsonb)",
+            &["a"],
+        ),
+        ("SELECT r FROM jsonb_array_elements_text('[\"a\",\"b\"]'::jsonb) AS r(e)", &["a", "b"]),
+        ("SELECT e FROM jsonb_array_elements_text('[\"a\",\"b\"]'::jsonb) AS r(e)", &["a", "b"]),
+    ] {
+        assert_eq!(rows(query), texts(expected), "{query}");
+    }
+}
+
+/// The whole-row reference reads the value in every clause, and the output
+/// column keeps the alias's name, so an enclosing query still finds it.
+/// Measured on PostgreSQL 18.6.
+#[test]
+fn a_bare_alias_reads_the_value_in_every_clause() {
+    for (query, expected) in [
+        (
+            "SELECT count(*) FROM jsonb_array_elements_text('[\"a\",\"b\"]'::jsonb) AS e \
+             WHERE e = 'b'",
+            &["1"][..],
+        ),
+        ("SELECT upper(e) FROM json_array_elements_text('[\"a\"]') AS e", &["A"]),
+        (
+            "SELECT e FROM jsonb_array_elements_text('[\"a\",\"b\"]'::jsonb) AS e ORDER BY e DESC",
+            &["b", "a"],
+        ),
+        (
+            "SELECT count(*) FROM jsonb_array_elements_text('[\"a\",\"b\"]'::jsonb) AS e \
+             GROUP BY e ORDER BY e",
+            &["1", "1"],
+        ),
+        (
+            "SELECT e FROM jsonb_array_elements_text('[\"a\",\"b\"]'::jsonb) AS e \
+             UNION SELECT 'c' ORDER BY 1",
+            &["a", "b", "c"],
+        ),
+        (
+            "SELECT x.e FROM (SELECT e FROM jsonb_array_elements_text('[\"a\"]'::jsonb) AS e) AS x",
+            &["a"],
+        ),
+        (
+            "SELECT (SELECT count(*) FROM t WHERE e = 'a') \
+             FROM jsonb_array_elements_text('[\"a\"]'::jsonb) AS e",
+            &["1"],
+        ),
+    ] {
+        assert_eq!(rows(query), texts(expected), "{query}");
+    }
+}
+
+/// A column of that name wins over the whole row, at the same level and at an
+/// enclosing one, as in PostgreSQL 18.6.
+#[test]
+fn a_column_named_like_the_alias_wins_over_the_whole_row() {
+    for (query, expected) in [
+        (
+            "SELECT e FROM (SELECT 'z' AS e) AS x, jsonb_array_elements_text('[\"a\"]'::jsonb) AS e",
+            &["z"][..],
+        ),
+        (
+            "SELECT (SELECT e FROM jsonb_array_elements_text('[\"a\"]'::jsonb) AS e) \
+             FROM (SELECT 'z' AS e) AS o",
+            &["z"],
+        ),
+    ] {
+        assert_eq!(rows(query), texts(expected), "{query}");
+    }
+}
+
+/// A one-column function keeps PostgreSQL's naming under an alias. The
+/// `value` functions declare their output, so the column stays `value`. The
+/// keys functions declare none, so the column takes the alias's name. Measured
+/// on PostgreSQL 18.6.
+#[test]
+fn an_alias_names_only_an_undeclared_column() {
+    for (query, expected) in [
+        ("SELECT e.value FROM jsonb_array_elements_text('[\"a\"]'::jsonb) AS e", &["a"][..]),
+        ("SELECT value FROM jsonb_array_elements_text('[\"a\"]'::jsonb) AS e", &["a"]),
+        ("SELECT e.value FROM json_array_elements('[1]') AS e", &["1"]),
+        ("SELECT e.e FROM json_object_keys('{\"a\":1}') AS e", &["a"]),
+        ("SELECT json_object_keys.json_object_keys FROM json_object_keys('{\"a\":1}')", &["a"]),
+    ] {
+        assert_eq!(rows(query), texts(expected), "{query}");
+    }
+}
+
+/// The references PostgreSQL 18.6 answers with `column ... does not exist`
+/// fail in SQLite too rather than starting to resolve.
+#[test]
+fn a_column_the_function_does_not_have_stays_missing() {
+    for (query, column) in [
+        ("SELECT e.e FROM jsonb_array_elements_text('[\"a\"]'::jsonb) AS e", "e.e"),
+        ("SELECT e.e FROM json_array_elements('[1]') AS e", "e.e"),
+        ("SELECT e.value FROM json_object_keys('{\"a\":1}') AS e", "e.value"),
+        ("SELECT e.json_object_keys FROM json_object_keys('{\"a\":1}') AS e", "e.json_object_keys"),
+    ] {
+        let error = sqlite_refusal(query);
+        assert!(error.contains(&format!("no such column: {column}")), "{query}: {error}");
+    }
+}
+
+/// The row of a two-column function is a record, `(a,1)` on PostgreSQL 18.6,
+/// and SQLite has no record value, so a bare alias is refused naming it.
+#[test]
+fn a_bare_alias_of_a_two_column_function_is_refused_naming_it() {
+    for query in [
+        "SELECT e FROM jsonb_each('{\"a\":1}') AS e",
+        "SELECT e FROM json_each_text('{\"a\":1}') AS e",
+        "SELECT e.key FROM jsonb_each('{\"a\":1}') AS e WHERE e IS NOT NULL",
+    ] {
+        let error = refuse(query);
+        assert!(error.contains("`e`"), "{query}: the refusal must name the alias, got: {error}");
+        assert!(error.contains("e.key"), "{query}: the advice must name the columns, got: {error}");
+    }
 }
 
 /// A call whose arity is not PostgreSQL's is refused, and the message reports
