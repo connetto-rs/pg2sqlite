@@ -50,19 +50,30 @@ pub trait Schema: DatabaseLike<Table = CreateTable, Function = CreateFunction> {
         &self,
         name: &ObjectName,
     ) -> Result<Option<(BeginEndStatements, PlPgSqlContext)>, Error> {
-        let Some(target) = function_lookup_target(name) else {
-            return Ok(None);
-        };
-        let Some(function) = self.resolve_target_function(target, IdentifierCase::AsWritten)?
+        let Some(function_body) =
+            written_function(self, name)?.and_then(|function| function.body())
         else {
-            return Ok(None);
-        };
-        let Some(function_body) = function.body() else {
             return Ok(None);
         };
 
         Ok(Some(parse_body(&name.to_string(), function_body)?))
     }
+}
+
+/// Returns the function a written reference names, if it exists.
+///
+/// # Errors
+///
+/// Returns [`Error::LookupError`] if the name carries several declarations,
+/// which a lookup by name cannot choose between.
+pub(crate) fn written_function<'s, S: Schema>(
+    schema: &'s S,
+    name: &ObjectName,
+) -> Result<Option<&'s CreateFunction>, Error> {
+    let Some(target) = function_lookup_target(name) else {
+        return Ok(None);
+    };
+    Ok(schema.resolve_target_function(target, IdentifierCase::AsWritten)?)
 }
 
 /// Reads a written function reference as the name to resolve, keeping each
