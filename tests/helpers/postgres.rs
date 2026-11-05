@@ -39,7 +39,7 @@ CREATE FUNCTION current_app_username() RETURNS text LANGUAGE sql STABLE
 
 /// Roles the policies name, created once for the cluster rather than per
 /// database, which is where they live.
-const ROLES: [&str; 4] = ["app", "app_user", "authenticated", "anon"];
+const ROLES: [&str; 6] = ["app", "app_user", "authenticated", "anon", "alice", "bob"];
 
 /// A session setting has to exist before a one-argument `current_setting` reads
 /// it, and a policy that reads one errors otherwise. A deployment sets this per

@@ -208,7 +208,7 @@ mod tests {
             CREATE TABLE editable (id INTEGER PRIMARY KEY);
             GRANT ALL ON editable TO app_user;
         "#;
-        let options = Pg2SqliteOptions::default().with_session_user_role("app_user");
+        let options = crate::options::acting_as("app_user");
         let manifest = manifest(sql, &options);
 
         let readonly = manifest.iter().find(|e| e.logical == "reference_data").unwrap();
@@ -228,7 +228,7 @@ mod tests {
             CREATE TABLE visible (id INTEGER PRIMARY KEY);
             GRANT SELECT ON visible TO app_user;
         "#;
-        let options = Pg2SqliteOptions::default().with_session_user_role("app_user");
+        let options = crate::options::acting_as("app_user");
         let manifest = manifest(sql, &options);
 
         assert_eq!(

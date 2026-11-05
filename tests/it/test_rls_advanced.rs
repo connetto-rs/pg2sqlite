@@ -10,10 +10,12 @@
 
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
 
-use crate::helpers;
+use crate::{helpers, helpers::deployment::deployment};
+
 fn make_options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
-        .with_session_user_role("authenticated".to_string())
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated".to_string())
         .with_rls_audit_table_name("rls_audit".to_string())
         .with_session_variable(SessionVariableMapping::current_setting(
             "app.user_id",
@@ -263,29 +265,32 @@ fn current_user_in_nested_expr() {
         GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
     let options = Pg2SqliteOptions::default()
-        .with_session_user_role("authenticated".to_string())
-        .with_rls_audit_table_name("rls_audit".to_string())
-        .with_session_variable(SessionVariableMapping::current_user("current_app_username"));
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated".to_string())
+        .with_rls_audit_table_name("rls_audit".to_string());
     let output = translate_with_options(sql, &options);
-    assert!(output.contains("current_app_username()"), "Expected current_app_username(): {output}");
+    assert!(output.contains("'authenticated'"), "Expected the acting role literal: {output}");
     execute_rls_ddl_with_opts(sql, &options);
 }
 
 #[test]
 fn missing_session_variable_mapping_error() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE secrets (
             id INT PRIMARY KEY,
             org_id TEXT NOT NULL
         );
         ALTER TABLE secrets ENABLE ROW LEVEL SECURITY;
+        GRANT SELECT ON secrets TO authenticated;
         CREATE POLICY secrets_select ON secrets
             FOR SELECT TO authenticated
             USING (org_id = current_setting('app.org_id')::text);
     "#;
     // Options that don't include mapping for 'app.org_id'
     let options = Pg2SqliteOptions::default()
-        .with_session_user_role("authenticated".to_string())
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated".to_string())
         .with_rls_audit_table_name("rls_audit".to_string());
 
     let result = Pg2Sqlite::default()
@@ -304,12 +309,14 @@ fn missing_session_variable_mapping_error() {
 #[test]
 fn missing_one_of_multiple_current_setting_mappings_errors() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE scoped_secrets (
             id INT PRIMARY KEY,
             user_id TEXT NOT NULL,
             org_id TEXT NOT NULL
         );
         ALTER TABLE scoped_secrets ENABLE ROW LEVEL SECURITY;
+        GRANT SELECT ON scoped_secrets TO authenticated;
         CREATE POLICY scoped_secrets_select ON scoped_secrets
             FOR SELECT TO authenticated
             USING (
@@ -319,7 +326,8 @@ fn missing_one_of_multiple_current_setting_mappings_errors() {
     "#;
     // Only app.user_id is mapped; app.org_id is missing and should error.
     let options = Pg2SqliteOptions::default()
-        .with_session_user_role("authenticated".to_string())
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated".to_string())
         .with_rls_audit_table_name("rls_audit".to_string())
         .with_session_variable(SessionVariableMapping::current_setting(
             "app.user_id",
@@ -598,17 +606,20 @@ fn between_in_policy() {
 #[test]
 fn missing_audit_table_name_error() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE no_audit (
             id INT PRIMARY KEY,
             owner_id INT NOT NULL
         );
         ALTER TABLE no_audit ENABLE ROW LEVEL SECURITY;
+        GRANT SELECT ON no_audit TO authenticated;
         CREATE POLICY no_aud_select ON no_audit
             FOR SELECT TO authenticated
             USING (owner_id = CAST(current_setting('app.user_id') AS INT));
     "#;
     let options = Pg2SqliteOptions::default()
-        .with_session_user_role("authenticated".to_string())
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated".to_string())
         .with_session_variable(SessionVariableMapping::current_setting(
             "app.user_id",
             "current_app_user",
@@ -1477,7 +1488,7 @@ fn outer_table_ref_unary_not_in_subquery() {
 }
 
 #[test]
-fn missing_current_user_mapping_error() {
+fn current_user_without_acting_role_error() {
     let sql = r#"
         CREATE TABLE user_docs (
             id INT PRIMARY KEY,
@@ -1488,9 +1499,9 @@ fn missing_current_user_mapping_error() {
             FOR SELECT TO authenticated
             USING (owner = current_user);
     "#;
-    // Options without current_user mapping
+    // Options that name the deployment but no acting role
     let options = Pg2SqliteOptions::default()
-        .with_session_user_role("authenticated".to_string())
+        .with_deployment(deployment(["authenticated"], []))
         .with_rls_audit_table_name("rls_audit".to_string());
 
     let result = Pg2Sqlite::default()
@@ -1498,29 +1509,29 @@ fn missing_current_user_mapping_error() {
         .unwrap()
         .translate(&options)
         .map(pg2sqlite::script::Script::into_vec);
-    assert!(result.is_err(), "Expected error for missing current_user mapping");
+    assert!(result.is_err(), "Expected error for missing acting role");
     let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("session variable mapping"),
-        "Expected session variable mapping error: {err}"
-    );
+    assert!(err.contains("acting role"), "Expected acting role error: {err}");
 }
 
 #[test]
 fn missing_schema_qualified_current_setting_mapping_error() {
     let sql = r#"
+        CREATE ROLE authenticated;
         CREATE TABLE scoped_docs (
             id INT PRIMARY KEY,
             owner_id INT NOT NULL
         );
         ALTER TABLE scoped_docs ENABLE ROW LEVEL SECURITY;
+        GRANT SELECT ON scoped_docs TO authenticated;
         CREATE POLICY sd_select ON scoped_docs
             FOR SELECT TO authenticated
             USING (owner_id = CAST(pg_catalog.current_setting('app.user_id') AS INT));
     "#;
     // Options intentionally omit current_setting mapping.
     let options = Pg2SqliteOptions::default()
-        .with_session_user_role("authenticated".to_string())
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated".to_string())
         .with_rls_audit_table_name("rls_audit".to_string());
 
     let result = Pg2Sqlite::default()

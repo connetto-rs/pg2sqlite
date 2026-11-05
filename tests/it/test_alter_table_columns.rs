@@ -409,8 +409,11 @@ fn alter_on_a_protected_table_lands_on_the_backing_table() -> Result<(), Box<dyn
 {
     use pg2sqlite::prelude::SessionVariableMapping;
 
+    use crate::helpers::deployment::deployment;
+
     let options = Pg2SqliteOptions::default()
-        .with_session_user_role("authenticated".to_string())
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated")
         .with_rls_audit_table_name("rls_audit".to_string())
         .with_session_variable(SessionVariableMapping::current_setting(
             "app.user_id",

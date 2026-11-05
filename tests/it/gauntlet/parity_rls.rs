@@ -8,14 +8,15 @@
 //! outcomes.
 
 use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
-use helpers::{
-    establish_connection, set_session_department, set_session_user_id, set_session_username,
-};
+use helpers::{establish_connection, set_session_department, set_session_user_id};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 use postgres_harness::Outcome;
 use rosetta_uuid::Uuid;
 
-use crate::{helpers, helpers::postgres as postgres_harness};
+use crate::{
+    helpers,
+    helpers::{deployment::deployment, postgres as postgres_harness},
+};
 
 // User UUIDs shared across all scenarios.
 fn ua() -> Uuid {
@@ -283,12 +284,13 @@ fn basic_options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
-        .with_session_user_role("authenticated")
         .with_rls_audit_table_name("rls_audit")
         .with_session_variable(SessionVariableMapping::current_setting(
             "app.user_id",
             "current_app_user",
         ))
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated")
 }
 
 fn basic_scenario() -> Vec<BasicStep> {
@@ -635,7 +637,6 @@ fn multi_options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
-        .with_session_user_role("authenticated")
         .with_rls_audit_table_name("rls_audit")
         .with_session_variable(SessionVariableMapping::current_setting(
             "app.user_id",
@@ -645,6 +646,8 @@ fn multi_options() -> Pg2SqliteOptions {
             "app.user_department",
             "current_app_department",
         ))
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated")
 }
 
 fn multi_scenario() -> Vec<MultiStep> {
@@ -932,12 +935,13 @@ fn tenant_options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
-        .with_session_user_role("authenticated")
         .with_rls_audit_table_name("rls_audit")
         .with_session_variable(SessionVariableMapping::current_setting(
             "app.user_id",
             "current_app_user",
         ))
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated")
 }
 
 fn tenant_scenario(t1: Uuid, t2: Uuid, p1: Uuid) -> Vec<TenantStep> {
@@ -1267,12 +1271,13 @@ fn public_options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
-        .with_session_user_role("authenticated")
         .with_rls_audit_table_name("rls_audit")
         .with_session_variable(SessionVariableMapping::current_setting(
             "app.user_id",
             "current_app_user",
         ))
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated")
 }
 
 fn public_access_scenario() -> Vec<PublicStep> {
@@ -1364,12 +1369,13 @@ fn rls_public_access_engines_agree() {
 
 const RLS_CURRENT_USER: &str = include_str!("../../fixtures/rls_current_user.sql");
 
-/// Translation-side copy: declares the `authenticated` role and its DML grants,
-/// which the PostgreSQL harness creates out of band.
+/// Translation-side copy: declares the roles the scenario acts as and their
+/// DML grants, which the PostgreSQL harness creates out of band.
 const RLS_CURRENT_USER_FOR_TRANSLATION: &str = concat!(
-    "CREATE ROLE authenticated;\n",
+    "CREATE ROLE app;\n",
+    "CREATE ROLE anon;\n",
     include_str!("../../fixtures/rls_current_user.sql"),
-    "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
+    "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app, anon;",
 );
 
 mod current_user_schema {
@@ -1398,32 +1404,27 @@ mod current_user_schema {
 
 #[derive(Debug)]
 enum CurrentUserStep {
-    /// PG: SET ROLE <name>. SQLite: set_session_username(<name>).
-    RoleSession(&'static str),
-    InsertProfile {
-        id: Uuid,
-        username: &'static str,
-        email: &'static str,
-        is_public: bool,
-    },
+    InsertProfile { id: Uuid, username: &'static str, email: &'static str, is_public: bool },
     VisibleUsernames,
     StoredCount,
 }
 
-macro_rules! current_user_runner {
-    ($name:ident, $conn:ty) => {
-        struct $name {
-            connection: $conn,
-            current_role: String,
-        }
-        impl $name {
+/// One engine's side of the scenario, bound to one acting role, since the
+/// replica answers `current_user` as the role it translated with.
+struct CurrentUserPgRunner {
+    connection: PgConnection,
+    acting: String,
+}
+struct CurrentUserSqliteRunner {
+    connection: SqliteConnection,
+}
+
+macro_rules! current_user_step {
+    ($t:ty) => {
+        impl $t {
             fn step(&mut self, step: &CurrentUserStep) -> Outcome {
                 use current_user_schema::profiles;
                 match step {
-                    CurrentUserStep::RoleSession(name) => {
-                        self.set_role(name);
-                        Outcome::Accepted
-                    }
                     CurrentUserStep::InsertProfile { id, username, email, is_public } => {
                         Outcome::of(
                             &diesel::insert_into(profiles::table)
@@ -1451,35 +1452,26 @@ macro_rules! current_user_runner {
     };
 }
 
-current_user_runner!(CurrentUserPgRunner, PgConnection);
-current_user_runner!(CurrentUserSqliteRunner, SqliteConnection);
+current_user_step!(CurrentUserPgRunner);
+current_user_step!(CurrentUserSqliteRunner);
 
 impl CurrentUserPgRunner {
-    fn set_role(&mut self, name: &str) {
-        self.current_role = name.to_string();
-        // Vendor-specific role command; current_user returns this name.
-        diesel::sql_query(format!("SET ROLE {name}"))
-            .execute(&mut self.connection)
-            .expect("set role");
-    }
-
     fn stored_count(&mut self) -> i64 {
         use current_user_schema::profiles;
-        let role = self.current_role.clone();
+        // Vendor-specific role reset to count past RLS.
         diesel::sql_query("RESET ROLE").execute(&mut self.connection).expect("reset role");
         let count =
             profiles::table.count().get_result(&mut self.connection).expect("count profiles");
-        if !role.is_empty() {
-            diesel::sql_query(format!("SET ROLE {role}"))
-                .execute(&mut self.connection)
-                .expect("restore role");
-        }
+        // Vendor-specific role restoration.
+        diesel::sql_query(format!("SET ROLE {}", self.acting))
+            .execute(&mut self.connection)
+            .expect("restore role");
         count
     }
 
     fn seed(&mut self, id: Uuid, username: &str, email: &str, is_public: bool) {
         use current_user_schema::profiles;
-        // Running as superuser before any RoleSession step; no RLS applies.
+        // Running as superuser before the role switch; no RLS applies.
         diesel::insert_into(profiles::table)
             .values((
                 profiles::id.eq(id),
@@ -1493,11 +1485,6 @@ impl CurrentUserPgRunner {
 }
 
 impl CurrentUserSqliteRunner {
-    fn set_role(&mut self, name: &str) {
-        self.current_role = name.to_string();
-        set_session_username(name);
-    }
-
     fn stored_count(&mut self) -> i64 {
         use current_user_schema::profiles_rls;
         profiles_rls::table.count().get_result(&mut self.connection).expect("count profiles_rls")
@@ -1517,84 +1504,106 @@ impl CurrentUserSqliteRunner {
     }
 }
 
-fn current_user_options() -> Pg2SqliteOptions {
+/// Each acting role gets its own replica translated for it, since
+/// `current_user` is the acting role's name, fixed at translation.
+fn current_user_options(acting: &str) -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
-        .with_session_user_role("authenticated")
         .with_rls_audit_table_name("rls_audit")
-        .with_session_variable(SessionVariableMapping::current_user("current_app_username"))
+        .with_deployment(deployment(["app", "anon"], []))
+        .with_acting_role(acting)
 }
 
-fn current_user_scenario() -> Vec<CurrentUserStep> {
-    let prof2 = Uuid::from([0x22; 16]);
-    let prof3 = Uuid::from([0x23; 16]);
-    vec![
-        CurrentUserStep::RoleSession("app"),
-        // app has no profile yet; anon profile is public so app sees it.
-        CurrentUserStep::VisibleUsernames, // ["anon"]
-        CurrentUserStep::InsertProfile {
-            id: prof2,
-            username: "app",
-            email: "app@test.com",
-            is_public: false,
-        }, // Accepted (username = current_user)
-        CurrentUserStep::InsertProfile {
-            id: prof3,
-            username: "anon",
-            email: "fake@test.com",
-            is_public: false,
-        }, // Refused (username != current_user)
-        CurrentUserStep::StoredCount,      // 2
-        CurrentUserStep::VisibleUsernames, // ["anon", "app"]
-        CurrentUserStep::RoleSession("anon"),
-        // anon sees own profile (public) but not app's private profile.
-        CurrentUserStep::VisibleUsernames, // ["anon"]
-    ]
-}
-
-#[test]
-fn rls_current_user_engines_agree() {
-    let prof1 = Uuid::from([0x21; 16]);
-
+/// Runs `steps` as `acting` on both engines. Each engine gets a database of
+/// its own seeded with `seeds`, the superuser on PostgreSQL and the backing
+/// table with the triggers still un-armed on SQLite, so both start from the
+/// same bypassed load, and then act under `SET ROLE <acting>` on PostgreSQL
+/// and in the replica translated for it on SQLite.
+fn assert_role_reads_agree(
+    acting: &str,
+    seeds: &[(Uuid, &str, &str, bool)],
+    steps: &[CurrentUserStep],
+) {
     let mut pg = {
         let mut conn = postgres_harness::fresh_database();
         postgres_harness::apply(&mut conn, RLS_CURRENT_USER).expect("apply rls_current_user to pg");
-        // Both app and anon roles need DML grants since the scenario switches
-        // between them.
+        // Both app and anon roles need DML grants since each scenario reads
+        // and writes as one of them.
         postgres_harness::apply(
             &mut conn,
             "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app, anon",
         )
         .expect("grant DML to app and anon");
-        CurrentUserPgRunner { connection: conn, current_role: String::new() }
+        let mut runner = CurrentUserPgRunner { connection: conn, acting: acting.to_string() };
+        for (id, username, email, is_public) in seeds {
+            runner.seed(*id, username, email, *is_public);
+        }
+        // Vendor-specific role command; current_user answers the acting role.
+        diesel::sql_query(format!("SET ROLE {acting}"))
+            .execute(&mut runner.connection)
+            .expect("set role");
+        runner
     };
     let mut sq = {
         let translated = Pg2Sqlite::default()
             .sql(RLS_CURRENT_USER_FOR_TRANSLATION)
             .expect("parse rls_current_user")
-            .translate(&current_user_options())
+            .translate(&current_user_options(acting))
             .expect("translate rls_current_user")
             .into_vec();
         let mut conn = establish_connection();
-        for stmt in &translated {
-            diesel::sql_query(stmt.to_string())
-                .execute(&mut conn)
-                .unwrap_or_else(|e| panic!("DDL failed: {e}\n{stmt}"));
+        let triggers = apply_base_ddl(&mut conn, &translated);
+        let mut runner = CurrentUserSqliteRunner { connection: conn };
+        for (id, username, email, is_public) in seeds {
+            runner.seed(*id, username, email, *is_public);
         }
-        CurrentUserSqliteRunner { connection: conn, current_role: String::new() }
+        arm_triggers(&mut runner.connection, &triggers);
+        runner
     };
 
-    // Set a session username so the profiles_rls audit trigger can query the
-    // view.
-    set_session_username("anon");
-    // Seed the anon profile (public) before any role is set on either engine.
-    pg.seed(prof1, "anon", "anon@test.com", true);
-    sq.seed(prof1, "anon", "anon@test.com", true);
-
-    for step in current_user_scenario() {
-        let expected = pg.step(&step);
-        let actual = sq.step(&step);
-        assert_eq!(actual, expected, "rls_current_user disagrees on {step:?}");
+    for step in steps {
+        let expected = pg.step(step);
+        let actual = sq.step(step);
+        assert_eq!(actual, expected, "rls_current_user disagrees as {acting} on {step:?}");
     }
+}
+
+#[test]
+fn rls_current_user_engines_agree() {
+    let prof1 = Uuid::from([0x21; 16]);
+    let prof2 = Uuid::from([0x22; 16]);
+    let prof3 = Uuid::from([0x23; 16]);
+
+    // app has no profile yet; the scenario inserts one, so only the public
+    // anon profile is seeded for it.
+    assert_role_reads_agree(
+        "app",
+        &[(prof1, "anon", "anon@test.com", true)],
+        &[
+            // The anon profile is public, so app sees it.
+            CurrentUserStep::VisibleUsernames, // ["anon"]
+            CurrentUserStep::InsertProfile {
+                id: prof2,
+                username: "app",
+                email: "app@test.com",
+                is_public: false,
+            }, // Accepted (username = current_user)
+            CurrentUserStep::InsertProfile {
+                id: prof3,
+                username: "anon",
+                email: "fake@test.com",
+                is_public: false,
+            }, // Refused (username != current_user)
+            CurrentUserStep::StoredCount,      // 2
+            CurrentUserStep::VisibleUsernames, // ["anon", "app"]
+        ],
+    );
+    // anon sees its own public profile but not app's private profile, which
+    // the seeding bypass left in the storage.
+    assert_role_reads_agree(
+        "anon",
+        &[(prof1, "anon", "anon@test.com", true), (prof2, "app", "app@test.com", false)],
+        &[CurrentUserStep::VisibleUsernames], // ["anon"]
+    );
 }

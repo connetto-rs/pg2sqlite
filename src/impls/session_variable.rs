@@ -1,32 +1,32 @@
-//! What a session variable mapping means, for everything that reads one.
+//! What a statement reads of the session, for everything that reads it.
 //!
-//! A mapping pairs a PostgreSQL setting with the function the replica registers
-//! under. Going out, the pattern becomes the paired call and any cast over it
-//! is dropped, because SQLite is dynamically typed and the replica's function
-//! answers the value directly. Coming back, the paired call becomes the pattern
-//! again and the cast is written from the type the mapping records.
+//! The role keywords become the names the deployment and `with_acting_role`
+//! give. A setting becomes the call a mapping pairs it with: going out the
+//! pattern becomes the paired call and any cast over it is dropped, and coming
+//! back the paired call becomes the pattern again, cast to the type the mapping
+//! records.
 //!
 //! The mapping also states what the setting holds, and a reading that
 //! disagrees with it is refused in either direction: a set is read only
 //! through a membership test, a scalar never is.
-//!
-//! Single source of truth for both directions, and for the row-security
-//! transformer, which used to carry its own copy of the substitution.
 
 #[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
 use alloc::{
-    borrow::ToOwned,
     boxed::Box,
     format,
     string::{String, ToString},
     vec,
     vec::Vec,
 };
+use core::fmt;
 
+use sql_traits::{
+    structs::{Deployment, ParserDB},
+    traits::DatabaseLike,
+};
 use sqlparser::ast::{
     CastKind, DataType, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
-    FunctionArguments, Ident, ObjectName, ObjectNamePart, TimezoneInfo, Value, ValueWithSpan,
+    FunctionArguments, ObjectName, TimezoneInfo, Value, ValueWithSpan,
 };
 
 use crate::{
@@ -65,25 +65,183 @@ fn setting_name(args: &FunctionArguments) -> Option<String> {
     })
 }
 
-/// The pattern a call matches, when it matches one a mapping can pair.
+/// What a statement reads of the session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SessionRead {
+    /// `current_setting(name[, missing_ok])`.
+    Setting(String),
+    /// `current_user`, `current_role` or `user`, as written.
+    ActingRole(&'static str),
+    /// `session_user`.
+    LoginRole,
+}
+
+/// What a call named `name` reads of the session.
 ///
-/// A `current_setting` whose name is computed rather than written yields
-/// `None`: no mapping can be found for a setting only known at run time.
+/// A role keyword takes no argument list, since PostgreSQL refuses
+/// `current_user()`, so a call with one is some other function.
 #[must_use]
-pub(crate) fn pattern_of(name: &str, args: &FunctionArguments) -> Option<SessionVariablePattern> {
+pub(crate) fn session_read_of(name: &str, args: &FunctionArguments) -> Option<SessionRead> {
+    let keyword = matches!(args, FunctionArguments::None);
     match name {
-        "current_user" => Some(SessionVariablePattern::CurrentUser),
-        "current_setting" => {
-            setting_name(args).map(|name| SessionVariablePattern::CurrentSetting { name })
+        "current_user" if keyword => Some(SessionRead::ActingRole("current_user")),
+        "user" if keyword => Some(SessionRead::ActingRole("user")),
+        "session_user" if keyword => Some(SessionRead::LoginRole),
+        "current_setting" => setting_name(args).map(SessionRead::Setting),
+        _ => None,
+    }
+}
+
+/// What a function node reads of the session.
+#[must_use]
+pub(crate) fn session_read_of_function(func: &Function) -> Option<SessionRead> {
+    session_read_of(&function_name_lower(&func.name), &func.args)
+}
+
+/// What `expr` reads of the session.
+///
+/// sqlparser reads `current_role` as an identifier, and PostgreSQL reserves
+/// the word, so only a quoted one names a column.
+#[must_use]
+pub(crate) fn session_read(expr: &Expr) -> Option<SessionRead> {
+    match expr {
+        Expr::Function(func) => session_read_of_function(func),
+        Expr::Identifier(ident)
+            if ident.quote_style.is_none() && ident.value.eq_ignore_ascii_case("current_role") =>
+        {
+            Some(SessionRead::ActingRole("current_role"))
         }
         _ => None,
     }
 }
 
-/// The pattern a function node matches.
+/// The mapping pattern of the setting `name`.
 #[must_use]
-pub(crate) fn pattern_of_function(func: &Function) -> Option<SessionVariablePattern> {
-    pattern_of(&function_name_lower(&func.name), &func.args)
+pub(crate) fn setting_pattern(name: &str) -> SessionVariablePattern {
+    SessionVariablePattern::CurrentSetting { name: name.to_string() }
+}
+
+/// The deployment a reading of `reading` needs.
+fn deployment<'o>(
+    options: &'o Pg2SqliteOptions,
+    reading: &dyn fmt::Display,
+) -> Result<&'o Deployment, Error> {
+    options
+        .get_deployment()
+        .ok_or_else(|| Error::DeploymentRequired { reading: reading.to_string() })
+}
+
+/// The acting role and the deployment declaring it among its acting roles.
+fn acting_role_in_deployment(
+    options: &Pg2SqliteOptions,
+) -> Result<Option<(&str, &Deployment)>, Error> {
+    let Some(role) = options.get_acting_role() else { return Ok(None) };
+    let deployment = deployment(options, &format_args!("with_acting_role('{role}')"))?;
+    if deployment.acting_roles().any(|declared| declared == role) {
+        Ok(Some((role, deployment)))
+    } else {
+        Err(Error::ActingRoleNotDeclared {
+            role: role.to_string(),
+            declared: deployment.acting_roles().collect::<Vec<_>>().join(", "),
+        })
+    }
+}
+
+/// Refuses a deployment naming a role `schema` does not declare, the login
+/// role first.
+fn resolve_roles(deployment: &Deployment, schema: &ParserDB) -> Result<(), Error> {
+    match core::iter::once(deployment.login_role())
+        .chain(deployment.acting_roles())
+        .find(|role| schema.role(role).is_none())
+    {
+        Some(role) => Err(Error::DeploymentRoleNotDeclared { role: role.to_string() }),
+        None => Ok(()),
+    }
+}
+
+/// The acting role this translation runs as, declared in `schema`.
+pub(crate) fn acting_role<'s>(
+    schema: &'s ParserDB,
+    options: &Pg2SqliteOptions,
+) -> Result<Option<&'s <ParserDB as DatabaseLike>::Role>, Error> {
+    let Some((role, deployment)) = acting_role_in_deployment(options)? else { return Ok(None) };
+    resolve_roles(deployment, schema)?;
+    Ok(schema.role(role))
+}
+
+/// Refuses a reading of the session whose declarations are missing, short of
+/// the schema check, `context` saying where the statement reads it.
+pub(crate) fn check_read(
+    read: &SessionRead,
+    options: &Pg2SqliteOptions,
+    context: &str,
+) -> Result<(), Error> {
+    match read {
+        SessionRead::Setting(name) => {
+            let pattern = setting_pattern(name);
+            options.find_session_variable(&pattern).map(drop).ok_or_else(|| {
+                Error::SessionVariableMappingNotFound { pattern: format!("{pattern}{context}") }
+            })
+        }
+        SessionRead::ActingRole(spelling) => {
+            acting_role_in_deployment(options)?.map(drop).ok_or_else(|| {
+                Error::ActingRoleRequired { reading: format!("{spelling}{context}") }
+            })
+        }
+        SessionRead::LoginRole => {
+            deployment(options, &format_args!("session_user{context}")).map(drop)
+        }
+    }
+}
+
+/// `name` as the text PostgreSQL answers for a role, once `schema` is checked
+/// to declare the deployment's roles.
+fn role_literal(name: &str, deployment: &Deployment, schema: &ParserDB) -> Result<Expr, Error> {
+    resolve_roles(deployment, schema)?;
+    Ok(string_literal(name))
+}
+
+/// What reading the session as one value becomes.
+pub(crate) fn translate_session_read(
+    read: &SessionRead,
+    schema: &ParserDB,
+    options: &Pg2SqliteOptions,
+) -> Result<Expr, Error> {
+    match read {
+        SessionRead::ActingRole(spelling) => {
+            let (role, deployment) = acting_role_in_deployment(options)?
+                .ok_or_else(|| Error::ActingRoleRequired { reading: (*spelling).to_string() })?;
+            role_literal(role, deployment, schema)
+        }
+        SessionRead::LoginRole => {
+            let deployment = deployment(options, &"session_user")?;
+            role_literal(deployment.login_role(), deployment, schema)
+        }
+        SessionRead::Setting(name) => {
+            let pattern = setting_pattern(name);
+            let mapping =
+                options.find_session_variable(&pattern).ok_or_else(|| unpaired(&pattern))?;
+            scalar_reading(mapping)?;
+            Ok(paired_call(mapping))
+        }
+    }
+}
+
+/// What `expr` becomes when it reads a role, or `None` when it reads none.
+///
+/// A setting is left to the function path, which also passes through a
+/// `current_setting` the caller declared as its own function.
+pub(crate) fn translate_expr_read(
+    expr: &Expr,
+    schema: &ParserDB,
+    options: &Pg2SqliteOptions,
+) -> Result<Option<Expr>, Error> {
+    match session_read(expr) {
+        Some(read @ (SessionRead::ActingRole(_) | SessionRead::LoginRole)) => {
+            translate_session_read(&read, schema, options).map(Some)
+        }
+        Some(SessionRead::Setting(_)) | None => Ok(None),
+    }
 }
 
 /// The call the replica makes instead of the pattern.
@@ -99,30 +257,16 @@ pub(crate) fn unpaired(pattern: &SessionVariablePattern) -> Error {
 }
 
 /// The mapping whose paired function is `name`, when one is installed.
-///
-/// A single function can be reached from both patterns, which
-/// [`Pg2SqliteOptions::with_session_user`] always arranges, and coming back
-/// only one of them can be written. The setting wins: it names a value the
-/// application binds per connection, where `current_user` names whatever role
-/// the connection opened as, so the setting is the reading that carries the
-/// caller. The same rule orders the two UUID arms in the reverse function
-/// translator.
 #[must_use]
 pub(crate) fn mapping_for_function<'a>(
     name: &str,
     options: &'a Pg2SqliteOptions,
 ) -> Option<&'a SessionVariableMapping> {
-    let paired =
-        |mapping: &&SessionVariableMapping| mapping.sqlite_function.eq_ignore_ascii_case(name);
-    let settings_first = |mapping: &&SessionVariableMapping| {
-        matches!(mapping.pg_pattern, SessionVariablePattern::CurrentSetting { .. })
-    };
-    let mappings = options.get_session_variables();
-    mappings
+    options
+        .get_session_variables()
         .iter()
         .rev()
-        .find(|mapping| paired(mapping) && settings_first(mapping))
-        .or_else(|| mappings.iter().rev().find(paired))
+        .find(|mapping| mapping.sqlite_function.eq_ignore_ascii_case(name))
 }
 
 /// Refuses reading a set-valued setting as one value.
@@ -173,41 +317,24 @@ pub(crate) fn set_reading(mapping: &SessionVariableMapping, written: char) -> Re
 /// For a tolerant mapping (`missing_ok = true`, the default) this is
 /// `current_setting(name, true)`, which answers NULL when the setting is unset.
 /// For a strict mapping (`missing_ok = false`) it is `current_setting(name)`
-/// with no second argument, which raises when the setting is unset. The role
-/// keyword is written without an argument list, since PostgreSQL refuses
-/// `current_user()` as a syntax error.
+/// with no second argument, which raises when the setting is unset.
 #[must_use]
 pub(crate) fn reverse_pattern(mapping: &SessionVariableMapping) -> Expr {
-    match &mapping.pg_pattern {
-        SessionVariablePattern::CurrentSetting { name } => {
-            if mapping.missing_ok {
-                simple_function_expr(
-                    "current_setting",
-                    vec![
-                        string_literal(name),
-                        Expr::Value(ValueWithSpan {
-                            value: Value::Boolean(true),
-                            span: sqlparser::tokenizer::Span::empty(),
-                        }),
-                    ],
-                    None,
-                )
-            } else {
-                simple_function_expr("current_setting", vec![string_literal(name)], None)
-            }
-        }
-        SessionVariablePattern::CurrentUser => {
-            Expr::Function(Function {
-                name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("current_user"))]),
-                uses_odbc_syntax: false,
-                parameters: FunctionArguments::None,
-                args: FunctionArguments::None,
-                filter: None,
-                null_treatment: None,
-                over: None,
-                within_group: vec![],
-            })
-        }
+    let SessionVariablePattern::CurrentSetting { name } = &mapping.pg_pattern;
+    if mapping.missing_ok {
+        simple_function_expr(
+            "current_setting",
+            vec![
+                string_literal(name),
+                Expr::Value(ValueWithSpan {
+                    value: Value::Boolean(true),
+                    span: sqlparser::tokenizer::Span::empty(),
+                }),
+            ],
+            None,
+        )
+    } else {
+        simple_function_expr("current_setting", vec![string_literal(name)], None)
     }
 }
 
@@ -244,8 +371,8 @@ pub(crate) fn reverse_expression(mapping: &SessionVariableMapping) -> Result<Exp
 #[must_use]
 pub(crate) fn paired_arity_refusal(mapping: &SessionVariableMapping) -> String {
     format!(
-        "{}() pairs with {}, which takes no argument, so a call to it with arguments is not the \
-         caller's identity and has no PostgreSQL equivalent.",
+        "{}() pairs with {}, which takes no argument, so a call to it with arguments has no \
+         PostgreSQL equivalent.",
         mapping.sqlite_function, mapping.pg_pattern
     )
 }
@@ -278,9 +405,10 @@ pub(crate) fn translate_cast(
     let Expr::Function(func) = inner else {
         return Ok(None);
     };
-    let Some(pattern) = pattern_of_function(func) else {
+    let Some(SessionRead::Setting(name)) = session_read_of_function(func) else {
         return Ok(None);
     };
+    let pattern = setting_pattern(&name);
     let Some(mapping) = options.find_session_variable(&pattern) else {
         return Ok(None);
     };
@@ -441,6 +569,6 @@ mod tests {
             )))],
             clauses: vec![],
         });
-        assert!(pattern_of("current_setting", &args).is_none());
+        assert!(session_read_of("current_setting", &args).is_none());
     }
 }

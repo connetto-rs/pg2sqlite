@@ -82,14 +82,13 @@ pub struct Pg2SqliteOptions {
     /// The reserved marker used to name deny triggers for read-only non-RLS
     /// tables (`<table><marker>_insert` and so on).
     readonly_deny_trigger_suffix: String,
-    /// The role name to use when filtering policies.
-    session_user_role: Option<String>,
+    /// The deployment acting role this translation runs as.
+    acting_role: Option<String>,
     /// The role the schema's statements run as, owning what they create.
     schema_owner_role: Option<String>,
     /// Mappings from PostgreSQL session variable patterns to SQLite functions.
     session_variables: Vec<SessionVariableMapping>,
-    /// The roles and session settings the deployment's requests run with,
-    /// which say which setting holds the caller a definer helper reads.
+    /// The roles and session settings the deployment's requests run with.
     deployment: Option<Deployment>,
     /// The name of the audit table for RLS validation monitoring.
     rls_audit_table_name: Option<String>,
@@ -128,7 +127,7 @@ impl<'a> arbitrary::Arbitrary<'a> for Pg2SqliteOptions {
             array_representation: Option::<ArrayRepresentation>::arbitrary(u)?,
             rls_table_suffix: String::arbitrary(u)?,
             readonly_deny_trigger_suffix: String::arbitrary(u)?,
-            session_user_role: Option::<String>::arbitrary(u)?,
+            acting_role: Option::<String>::arbitrary(u)?,
             schema_owner_role: Option::<String>::arbitrary(u)?,
             session_variables: Vec::<SessionVariableMapping>::arbitrary(u)?,
             deployment: None,
@@ -156,7 +155,7 @@ impl Default for Pg2SqliteOptions {
             array_representation: None,
             rls_table_suffix: "_rls".to_string(),
             readonly_deny_trigger_suffix: "__readonly".to_string(),
-            session_user_role: None,
+            acting_role: None,
             schema_owner_role: None,
             session_variables: Vec::new(),
             deployment: None,
@@ -770,16 +769,22 @@ impl Pg2SqliteOptions {
     }
 
     #[must_use]
-    /// Filters grants and policies for the named session role.
-    pub fn with_session_user_role(mut self, role: impl Into<String>) -> Self {
-        self.session_user_role = Some(role.into());
+    /// Names the deployment acting role this translation runs as, which
+    /// filters grants and policies and which `current_user`, `current_role`
+    /// and `user` answer.
+    ///
+    /// The role has to be one of the acting roles of the deployment passed
+    /// with [`with_deployment`](Self::with_deployment), declared in the
+    /// schema.
+    pub fn with_acting_role(mut self, role: impl Into<String>) -> Self {
+        self.acting_role = Some(role.into());
         self
     }
 
     #[must_use]
-    /// Returns the role used to filter grants and policies.
-    pub fn get_session_user_role(&self) -> Option<&str> {
-        self.session_user_role.as_deref()
+    /// Returns the acting role this translation runs as.
+    pub fn get_acting_role(&self) -> Option<&str> {
+        self.acting_role.as_deref()
     }
 
     #[must_use]
@@ -823,34 +828,20 @@ impl Pg2SqliteOptions {
     }
 
     #[must_use]
-    /// Maps current user and one current setting to the same SQLite function.
-    pub fn with_session_user(
-        self,
-        variable_name: impl Into<String>,
-        sqlite_function: impl Into<String>,
-    ) -> Self {
-        let func_name = sqlite_function.into();
-        self.with_session_variable(SessionVariableMapping::current_user(func_name.clone()))
-            .with_session_variable(SessionVariableMapping::current_setting(
-                variable_name,
-                func_name,
-            ))
-    }
-
-    #[must_use]
-    /// Sets the deployment whose requests the policies serve.
+    /// Sets the deployment whose requests the translation serves.
     ///
-    /// A policy calling a `SECURITY DEFINER` helper translates as the set the
-    /// helper returns for the caller this deployment declares, read through the
-    /// mapping of the caller's setting. Without a deployment such a call is
-    /// refused.
+    /// The deployment declares the login role `session_user` answers and the
+    /// acting roles [`with_acting_role`](Self::with_acting_role) chooses
+    /// from, and a policy calling a `SECURITY DEFINER` helper translates as
+    /// the set the helper returns for the caller it declares. A statement
+    /// reading a role, or calling such a helper, is refused without one.
     pub fn with_deployment(mut self, deployment: Deployment) -> Self {
         self.deployment = Some(deployment);
         self
     }
 
     #[must_use]
-    /// Returns the deployment the policies serve.
+    /// Returns the deployment the translation serves.
     pub fn get_deployment(&self) -> Option<&Deployment> {
         self.deployment.as_ref()
     }
@@ -1002,5 +993,36 @@ impl Pg2SqliteOptions {
     /// Returns the tables placed in an attached database, if any.
     pub fn get_attached_tables(&self) -> Option<&AttachedTables> {
         self.attached_tables.as_ref()
+    }
+}
+
+/// Options acting as `role`, a deployment that logs in and acts as it alone.
+#[cfg(all(test, feature = "std"))]
+pub(crate) fn acting_as(role: &str) -> Pg2SqliteOptions {
+    let deployment = Deployment::new(role, [role], []).expect("one acting role");
+    Pg2SqliteOptions::default().with_deployment(deployment).with_acting_role(role)
+}
+
+#[cfg(all(test, feature = "arbitrary"))]
+mod tests {
+    use arbitrary::{Arbitrary, Unstructured};
+
+    use super::Pg2SqliteOptions;
+
+    /// Fuzzed options never carry a deployment, so a fuzzed acting role is
+    /// refused rather than trusted.
+    #[test]
+    fn a_fuzzed_acting_role_meets_the_deployment_refusal() {
+        let options = (0..=u8::MAX)
+            .filter_map(|seed| {
+                Pg2SqliteOptions::arbitrary(&mut Unstructured::new(&[seed; 512])).ok()
+            })
+            .find(|options| options.get_acting_role().is_some())
+            .expect("a seed naming an acting role");
+        let schema = sql_traits::structs::ParserDB::from_statements(Vec::new(), "fuzz".to_string())
+            .expect("an empty schema");
+        let error = crate::impls::session_variable::acting_role(&schema, &options)
+            .expect_err("no deployment declares the role");
+        assert!(matches!(error, crate::errors::Error::DeploymentRequired { .. }), "{error}");
     }
 }

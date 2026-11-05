@@ -8,7 +8,7 @@ use helpers::establish_connection;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 use rosetta_uuid::Uuid;
 
-use crate::helpers;
+use crate::{helpers, helpers::deployment::deployment};
 
 /// PostgreSQL schema with basic RLS setup for testing.
 const RLS_SCHEMA: &str = r#"
@@ -52,7 +52,8 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authentic
 fn test_rls_requires_audit_table_name() {
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
-        .with_session_user_role("authenticated".to_string())
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated")
         .with_session_variable(SessionVariableMapping::current_setting(
             "app.user_id",
             "current_app_user",
@@ -79,7 +80,8 @@ fn test_audit_table_uses_configured_name() -> Result<(), Box<dyn std::error::Err
     let custom_audit_name = "my_custom_violations";
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
-        .with_session_user_role("authenticated".to_string())
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated")
         .with_session_variable(SessionVariableMapping::current_setting(
             "app.user_id",
             "current_app_user",
@@ -113,7 +115,8 @@ fn test_triggers_use_configured_audit_table() -> Result<(), Box<dyn std::error::
     let custom_audit_name = "custom_audit";
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
-        .with_session_user_role("authenticated".to_string())
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated")
         .with_session_variable(SessionVariableMapping::current_setting(
             "app.user_id",
             "current_app_user",
@@ -193,7 +196,8 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authentic
 "#;
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
-        .with_session_user_role("authenticated".to_string())
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated")
         .with_session_variable(SessionVariableMapping::current_setting(
             "app.user_id",
             "current_app_user",
@@ -253,7 +257,8 @@ fn test_strict_mode_blocks_violations() -> Result<(), Box<dyn std::error::Error>
     let audit_table_name = "rls_violations_strict";
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
-        .with_session_user_role("authenticated".to_string())
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated")
         .with_session_variable(SessionVariableMapping::current_setting(
             "app.user_id",
             "current_app_user",
@@ -341,7 +346,8 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authentic
 "#;
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
-        .with_session_user_role("authenticated".to_string())
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated")
         .with_session_variable(SessionVariableMapping::current_setting(
             "app.user_id",
             "current_app_user",
@@ -401,7 +407,8 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authentic
 fn test_monitor_mode_snapshot() -> Result<(), Box<dyn std::error::Error>> {
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
-        .with_session_user_role("authenticated".to_string())
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated")
         .with_session_variable(SessionVariableMapping::current_setting(
             "app.user_id",
             "current_app_user",
@@ -420,7 +427,8 @@ fn test_monitor_mode_snapshot() -> Result<(), Box<dyn std::error::Error>> {
 fn test_strict_mode_snapshot() -> Result<(), Box<dyn std::error::Error>> {
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
-        .with_session_user_role("authenticated".to_string())
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated")
         .with_session_variable(SessionVariableMapping::current_setting(
             "app.user_id",
             "current_app_user",

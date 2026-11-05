@@ -8,7 +8,7 @@ use helpers::{establish_connection, set_session_user_id};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 use rosetta_uuid::Uuid;
 
-use crate::helpers;
+use crate::{helpers, helpers::deployment::deployment};
 
 mod schema {
     diesel::table! {
@@ -43,7 +43,8 @@ fn translate_and_setup() -> Result<diesel::SqliteConnection, Box<dyn std::error:
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
-        .with_session_user_role("authenticated".to_string())
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated")
         .with_rls_audit_table_name("rls_audit".to_string())
         .with_session_variable(SessionVariableMapping::current_setting(
             "app.user_id",
@@ -74,7 +75,8 @@ fn test_self_referential_translation_snapshot() -> Result<(), Box<dyn std::error
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
-        .with_session_user_role("authenticated".to_string())
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated")
         .with_rls_audit_table_name("rls_audit".to_string())
         .with_session_variable(SessionVariableMapping::current_setting(
             "app.user_id",

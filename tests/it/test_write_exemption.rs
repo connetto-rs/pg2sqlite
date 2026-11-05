@@ -11,6 +11,8 @@ use diesel::{
 };
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
+use crate::helpers::deployment::deployment;
+
 const WRITE_EXEMPTION_FUNCTION: &str = "write_is_exempt";
 
 const POLICY_SCHEMA: &str = "
@@ -463,7 +465,8 @@ fn backing_delete_every_row_admits_needs_no_exemption() {
 #[test]
 fn read_only_non_rls_guards_honour_exemption() {
     let role_options = Pg2SqliteOptions::default()
-        .with_session_user_role("app_user")
+        .with_deployment(deployment(["app_user"], []))
+        .with_acting_role("app_user")
         .with_write_exemption_function(WRITE_EXEMPTION_FUNCTION);
     let (mut connection, exempt) = apply_with_exemption(READ_ONLY_SCHEMA, &role_options);
 
@@ -506,7 +509,8 @@ fn read_only_non_rls_guards_honour_exemption() {
 #[test]
 fn read_only_rls_backing_guards_honour_exemption() {
     let role_options = Pg2SqliteOptions::default()
-        .with_session_user_role("app_user")
+        .with_deployment(deployment(["app_user"], []))
+        .with_acting_role("app_user")
         .with_rls_audit_table_name("rls_audit")
         .with_write_exemption_function(WRITE_EXEMPTION_FUNCTION);
     let (mut connection, exempt) = apply_with_exemption(READ_ONLY_RLS_SCHEMA, &role_options);

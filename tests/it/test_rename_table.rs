@@ -19,11 +19,13 @@
 use diesel::prelude::*;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
 
+use crate::helpers::deployment::deployment;
+
 /// Options that resolve the `app.user` setting the RLS tests at the end of this
 /// file reference.
 fn rls_options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
-        .with_session_user_role("app_user".to_string())
+        .with_deployment(deployment([], []))
         .with_rls_audit_table_name("rls_audit".to_string())
         .with_session_variable(SessionVariableMapping::current_setting("app.user", "app_user"))
 }

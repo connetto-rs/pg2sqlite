@@ -58,13 +58,14 @@ use crate::{
         },
         replay::{is_replayable, reject_duplicated_operand},
         session_variable,
+        session_variable::SessionRead,
         shared_helpers::{
             join_constraint_mut, join_constraint_ref, minor_unit_scale, relations_scope_query,
         },
         translator_impls::column::declared_default,
     },
     options::Pg2SqliteOptions,
-    traits::{SessionVariablePattern, translator::TranslatorWithContext},
+    traits::translator::TranslatorWithContext,
     write_guard::{RLS_VIOLATION, WriteCommand, no_policy, read_only},
 };
 
@@ -540,7 +541,7 @@ fn scrub_policy_stable_exprs(
                     *expr = Expr::Value(ValueWithSpan::from(Value::Boolean(true)));
                 }
                 Expr::Function(func)
-                    if session_variable::pattern_of_function(func).is_some()
+                    if session_variable::session_read_of_function(func).is_some()
                         || last_ident(&func.name).is_some_and(|n| {
                             self.options.declares_user_defined_function(&n.value)
                                 || self
@@ -777,8 +778,8 @@ impl<'s> Rows<'s> {
     }
 }
 
-/// Who this translation runs as: the declared session role, or a caller
-/// holding none.
+/// Who this translation runs as: the deployment acting role it names, or a
+/// caller holding none.
 ///
 /// The schema owner role owns what the schema creates, and has to be declared
 /// too.
@@ -786,19 +787,16 @@ fn acting_role<'s>(
     schema: &'s ParserDB,
     options: &Pg2SqliteOptions,
 ) -> Result<ActingRole<'s, <ParserDB as DatabaseLike>::Role>, Error> {
-    let declared = |name: &str, what: &str| {
-        schema.role(name).ok_or_else(|| {
-            Error::forward_refusal(format!(
-                "the {what} '{name}' is not declared in the schema. Declare it with CREATE ROLE, \
-                 as PostgreSQL requires before a role can act or own."
-            ))
-        })
-    };
-    if let Some(name) = options.get_schema_owner_role() {
-        declared(name, "schema owner role")?;
+    if let Some(name) = options.get_schema_owner_role()
+        && schema.role(name).is_none()
+    {
+        return Err(Error::forward_refusal(format!(
+            "the schema owner role '{name}' is not declared in the schema. Declare it with \
+             CREATE ROLE, as PostgreSQL requires before a role can act or own."
+        )));
     }
-    Ok(match options.get_session_user_role() {
-        Some(name) => ActingRole::Declared(declared(name, "session role")?),
+    Ok(match session_variable::acting_role(schema, options)? {
+        Some(role) => ActingRole::Declared(role),
         None => ActingRole::Public,
     })
 }
@@ -828,7 +826,7 @@ fn row_security<'s>(
         Err(RowSecurityError::RoleRequired { policy }) => {
             refusal(format!(
                 "policy '{policy}' on table '{}' is scoped to a specific role. Call \
-                 with_session_user_role to specify which role this translation targets.",
+                 with_acting_role to specify which role this translation targets.",
                 table.table_name()
             ))
         }
@@ -862,17 +860,14 @@ impl<'a> RlsTriggerContext<'a> {
     }
 }
 
-fn push_pattern_unique(
-    patterns: &mut Vec<SessionVariablePattern>,
-    pattern: SessionVariablePattern,
-) {
+fn push_pattern_unique(patterns: &mut Vec<SessionRead>, pattern: SessionRead) {
     if !patterns.contains(&pattern) {
         patterns.push(pattern);
     }
 }
 
-fn collect_patterns_from_function(func: &Function, patterns: &mut Vec<SessionVariablePattern>) {
-    if let Some(pattern) = session_variable::pattern_of_function(func) {
+fn collect_patterns_from_function(func: &Function, patterns: &mut Vec<SessionRead>) {
+    if let Some(pattern) = session_variable::session_read_of_function(func) {
         push_pattern_unique(patterns, pattern);
     }
 
@@ -915,10 +910,7 @@ fn collect_patterns_from_function(func: &Function, patterns: &mut Vec<SessionVar
 }
 
 #[cfg_attr(feature = "std", recursive::recursive)]
-fn collect_patterns_from_table_factor(
-    factor: &TableFactor,
-    patterns: &mut Vec<SessionVariablePattern>,
-) {
+fn collect_patterns_from_table_factor(factor: &TableFactor, patterns: &mut Vec<SessionRead>) {
     match factor {
         TableFactor::Derived { subquery, .. } => {
             collect_patterns_from_query(subquery, patterns);
@@ -933,10 +925,7 @@ fn collect_patterns_from_table_factor(
     }
 }
 
-fn collect_patterns_from_select(
-    select: &sqlparser::ast::Select,
-    patterns: &mut Vec<SessionVariablePattern>,
-) {
+fn collect_patterns_from_select(select: &sqlparser::ast::Select, patterns: &mut Vec<SessionRead>) {
     for table_with_joins in &select.from {
         collect_patterns_from_table_factor(&table_with_joins.relation, patterns);
         for join in &table_with_joins.joins {
@@ -978,7 +967,7 @@ fn collect_patterns_from_select(
 #[cfg_attr(feature = "std", recursive::recursive)]
 fn collect_patterns_from_set_expr(
     set_expr: &sqlparser::ast::SetExpr,
-    patterns: &mut Vec<SessionVariablePattern>,
+    patterns: &mut Vec<SessionRead>,
 ) {
     match set_expr {
         sqlparser::ast::SetExpr::Select(select) => collect_patterns_from_select(select, patterns),
@@ -999,10 +988,7 @@ fn collect_patterns_from_set_expr(
 }
 
 #[cfg_attr(feature = "std", recursive::recursive)]
-fn collect_patterns_from_query(
-    query: &sqlparser::ast::Query,
-    patterns: &mut Vec<SessionVariablePattern>,
-) {
+fn collect_patterns_from_query(query: &sqlparser::ast::Query, patterns: &mut Vec<SessionRead>) {
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
             collect_patterns_from_query(&cte.query, patterns);
@@ -1045,12 +1031,14 @@ fn collect_patterns_from_query(
     }
 }
 
-/// Collect all session variable patterns used by an expression tree.
+/// Collect every reading of the session an expression tree makes.
 #[cfg_attr(feature = "std", recursive::recursive)]
-fn collect_session_variable_patterns(expr: &Expr, patterns: &mut Vec<SessionVariablePattern>) {
+fn collect_session_variable_patterns(expr: &Expr, patterns: &mut Vec<SessionRead>) {
     match expr {
-        Expr::Identifier(ident) if ident.value.eq_ignore_ascii_case("current_user") => {
-            push_pattern_unique(patterns, SessionVariablePattern::CurrentUser);
+        Expr::Identifier(_) => {
+            if let Some(read) = session_variable::session_read(expr) {
+                push_pattern_unique(patterns, read);
+            }
         }
         Expr::Function(func) => collect_patterns_from_function(func, patterns),
         Expr::Subquery(query) | Expr::Exists { subquery: query, .. } => {
@@ -1068,14 +1056,14 @@ fn collect_session_variable_patterns(expr: &Expr, patterns: &mut Vec<SessionVari
     }
 }
 
-/// Validates that all session variable patterns in an expression have mappings
-/// configured.
+/// Validates that everything an expression reads of the session is declared:
+/// each setting by the deployment and paired by a mapping, the acting role by
+/// `with_acting_role`, and the login role by the deployment.
 ///
 /// # Errors
 ///
-/// Returns `Error::SessionVariableMappingNotFound` if a
-/// `current_setting('name')` or `current_user` pattern is found in the
-/// expression but no corresponding SQLite function mapping is configured.
+/// Returns the error naming the first missing declaration, the table and the
+/// policy.
 pub fn validate_session_variables(
     expr: &Expr,
     options: &Pg2SqliteOptions,
@@ -1084,24 +1072,10 @@ pub fn validate_session_variables(
 ) -> Result<(), Error> {
     let mut patterns = Vec::new();
     collect_session_variable_patterns(expr, &mut patterns);
-
+    let context = format!(" in table '{table_name}', policy '{policy_name}'");
     for pattern in patterns {
-        if options.find_session_variable(&pattern).is_none() {
-            return Err(Error::SessionVariableMappingNotFound {
-                pattern: match pattern {
-                    SessionVariablePattern::CurrentUser => {
-                        format!("current_user in table '{table_name}', policy '{policy_name}'")
-                    }
-                    SessionVariablePattern::CurrentSetting { name } => {
-                        format!(
-                            "current_setting('{name}') in table '{table_name}', policy '{policy_name}'"
-                        )
-                    }
-                },
-            });
-        }
+        session_variable::check_read(&pattern, options, &context)?;
     }
-
     Ok(())
 }
 
@@ -1381,14 +1355,12 @@ fn transform_expr_generic(
             })
         }
 
-        // Handle bare column identifiers. `current_user` is not one: the
-        // PostgreSQL dialect parses the keyword as a function, so an identifier
-        // spelled that way came from a quoted `"current_user"`, which names a
-        // column.
+        // An unquoted `current_role` is the role keyword, never a column.
         Expr::Identifier(ident) => {
             let ident_lower = ident.value.to_lowercase();
 
             if let Some(pfx) = strategy.prefix
+                && crate::impls::session_variable::session_read(expr).is_none()
                 && strategy.has_column(&ident_lower)
                 && !strategy.is_inner_scope(&ident_lower)
             {
@@ -2961,9 +2933,12 @@ mod tests {
         validate_table_policies,
     };
     use crate::{
-        impls::{function_helpers::single_quoted_literal, session_variable},
+        impls::{
+            function_helpers::single_quoted_literal,
+            session_variable::{self, SessionRead},
+        },
         prelude::Pg2SqliteOptions,
-        traits::translation_options::{SessionVariableMapping, SessionVariablePattern},
+        traits::translation_options::SessionVariableMapping,
     };
 
     fn parse_statements(sql: &str) -> Vec<Statement> {
@@ -3017,7 +2992,7 @@ mod tests {
             within_group: vec![],
             parameters: FunctionArguments::None,
         };
-        assert!(session_variable::pattern_of_function(&not_setting).is_none());
+        assert!(session_variable::session_read_of_function(&not_setting).is_none());
 
         let invalid_arg = Function {
             name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("current_setting"))]),
@@ -3037,7 +3012,7 @@ mod tests {
             within_group: vec![],
             parameters: FunctionArguments::None,
         };
-        assert!(session_variable::pattern_of_function(&invalid_arg).is_none());
+        assert!(session_variable::session_read_of_function(&invalid_arg).is_none());
 
         let named_expr = Function {
             args: FunctionArguments::List(FunctionArgumentList {
@@ -3054,8 +3029,8 @@ mod tests {
             ..invalid_arg
         };
         assert_eq!(
-            session_variable::pattern_of_function(&named_expr),
-            Some(SessionVariablePattern::CurrentSetting { name: "app.user_id".to_string() })
+            session_variable::session_read_of_function(&named_expr),
+            Some(SessionRead::Setting("app.user_id".to_string()))
         );
 
         let current_setting_no_args = Function {
@@ -3068,7 +3043,7 @@ mod tests {
             within_group: vec![],
             parameters: FunctionArguments::None,
         };
-        assert!(session_variable::pattern_of_function(&current_setting_no_args).is_none());
+        assert!(session_variable::session_read_of_function(&current_setting_no_args).is_none());
     }
 
     /// The transformer owns column references and table renames. The caller's
@@ -3084,13 +3059,7 @@ mod tests {
             .table_by_target(TargetName::new("docs", false), IdentifierCase::AsWritten)
             .expect("table lookup should succeed")
             .expect("table should exist");
-        let options = crate::options::TranslationContext::from_owned(
-            Pg2SqliteOptions::default().with_session_variable(
-                crate::traits::translation_options::SessionVariableMapping::current_user(
-                    "sqlite_user",
-                ),
-            ),
-        );
+        let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
         let lowercased_columns = resolved_sets(table, &schema);
         let facts = ResolvedSchemaFacts { lowercased_columns: &lowercased_columns };
 
@@ -3106,7 +3075,7 @@ mod tests {
         assert_eq!(
             keyword.to_string(),
             "current_user",
-            "the keyword is left for the translator, which is where the mapping now lives"
+            "the keyword is left for the translator, which answers it from the deployment"
         );
 
         // PostgreSQL reads a quoted `"current_user"` as a column name, so the
@@ -3480,12 +3449,15 @@ mod tests {
         .expect_err("missing current_user mapping should error");
         assert!(err.to_string().contains("current_user"));
 
+        let deployment =
+            sql_traits::structs::Deployment::new("app", ["alice"], []).expect("a valid deployment");
         let mapped = Pg2SqliteOptions::default()
+            .with_deployment(deployment)
+            .with_acting_role("alice")
             .with_session_variable(SessionVariableMapping::current_setting(
                 "app.user_id",
                 "sqlite_user_id",
-            ))
-            .with_session_variable(SessionVariableMapping::current_user("sqlite_user"));
+            ));
         validate_session_variables(
             &parse_expr("owner_id = current_setting('app.user_id')::INT"),
             &mapped,
@@ -3499,7 +3471,7 @@ mod tests {
             "docs",
             "docs_select",
         )
-        .expect("mapped current_user should pass");
+        .expect("a named acting role should pass");
 
         validate_table_policies(table, &schema, &mapped).expect("policy validation should pass");
     }

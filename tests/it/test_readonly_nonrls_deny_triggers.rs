@@ -52,7 +52,9 @@ CREATE TABLE audit_logs (id INTEGER PRIMARY KEY, msg TEXT NOT NULL);
 ";
 
 fn options() -> Pg2SqliteOptions {
-    Pg2SqliteOptions::default().with_session_user_role("app_user")
+    Pg2SqliteOptions::default()
+        .with_deployment(crate::helpers::deployment::deployment(["app_user"], []))
+        .with_acting_role("app_user")
 }
 
 fn translate(schema: &str) -> Vec<String> {

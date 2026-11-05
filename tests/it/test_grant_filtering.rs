@@ -20,7 +20,7 @@
 //!                                ▼                ▼                ▼
 //!                      ┌─────────────────────────────────────────────────────────────┐
 //!                      │                 pg2sqlite Translation                       │
-//!                      │              (with_session_user_role("app_user"))           │
+//!                      │              (with_acting_role("app_user"))                 │
 //!                      └─────────────────────────────────────────────────────────────┘
 //!                                │                │                │
 //!                                ▼                ▼                ▼
@@ -68,12 +68,11 @@ use diesel::prelude::*;
 use helpers::{establish_connection, set_session_user_id};
 use pg2sqlite::{
     prelude::{Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation},
-    traits::SessionVariableMapping,
     warnings::TranslationWarning,
 };
 use rosetta_uuid::Uuid;
 
-use crate::helpers;
+use crate::{helpers, helpers::deployment::deployment};
 
 diesel::define_sql_function! {
     /// Reports whether generated write guards are exempt.
@@ -222,9 +221,10 @@ fn translation_options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
-        .with_session_user_role("app_user")
         .with_rls_audit_table_name("rls_audit".to_string())
-        .with_session_variable(SessionVariableMapping::current_user("current_app_user"))
+        .with_user_defined_functions(["current_app_user"])
+        .with_deployment(deployment(["app_user"], []))
+        .with_acting_role("app_user")
         .with_write_exemption_function("write_is_exempt")
 }
 
@@ -507,7 +507,11 @@ fn default_table_privileges_reach_only_tables_created_afterwards() {
              CREATE TABLE t (id INTEGER PRIMARY KEY);",
         )
         .expect("parse")
-        .translate_with_report(&Pg2SqliteOptions::default().with_session_user_role("app_user"))
+        .translate_with_report(
+            &Pg2SqliteOptions::default()
+                .with_deployment(deployment(["app_user"], []))
+                .with_acting_role("app_user"),
+        )
         .expect("translate");
     let emitted: Vec<String> = report.script.iter().map(ToString::to_string).collect();
     assert!(emitted.iter().any(|statement| statement.starts_with("CREATE TABLE t")), "{emitted:?}");
@@ -533,7 +537,11 @@ fn role_scoped_translation_drops_default_privileges_on_other_objects() {
              GRANT SELECT ON t TO app_user;",
         )
         .expect("parse")
-        .translate_with_report(&Pg2SqliteOptions::default().with_session_user_role("app_user"))
+        .translate_with_report(
+            &Pg2SqliteOptions::default()
+                .with_deployment(deployment(["app_user"], []))
+                .with_acting_role("app_user"),
+        )
         .expect("translate");
     assert!(
         report.script.iter().any(|statement| statement.to_string().starts_with("CREATE TABLE t")),

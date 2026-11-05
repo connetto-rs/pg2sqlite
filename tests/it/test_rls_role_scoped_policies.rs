@@ -9,6 +9,8 @@
 use diesel::{prelude::*, sqlite::SqliteConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
 
+use crate::helpers::deployment::deployment;
+
 #[declare_sql_function]
 extern "SQL" {
     /// Returns the session user name mapped from current_setting('app.user').
@@ -44,7 +46,7 @@ struct SeedRow {
 }
 
 // admin_read is scoped TO admin and has USING (id > 0). user_read is unscoped
-// (public) and filters by owner. With with_session_user_role("app_user"):
+// (public) and filters by owner. With with_acting_role("app_user"):
 // admin_read should NOT apply (admin != app_user), so alice sees only her rows.
 const PG: &str = "\
 CREATE TABLE docs (
@@ -63,7 +65,8 @@ fn opts_with_role() -> Pg2SqliteOptions {
         .with_rls_audit_table_name("rls_violations")
         .with_session_variable(SessionVariableMapping::current_setting("app.user", "app_user"))
         .with_user_defined_functions(["app_user"])
-        .with_session_user_role("app_user".to_string())
+        .with_deployment(deployment(["app_user"], []))
+        .with_acting_role("app_user")
 }
 
 fn opts_without_role() -> Pg2SqliteOptions {
@@ -71,7 +74,8 @@ fn opts_without_role() -> Pg2SqliteOptions {
         .with_rls_audit_table_name("rls_violations")
         .with_session_variable(SessionVariableMapping::current_setting("app.user", "app_user"))
         .with_user_defined_functions(["app_user"])
-    // no with_session_user_role
+        .with_deployment(deployment(["app_user"], []))
+    // no with_acting_role
 }
 
 fn apply(opts: &Pg2SqliteOptions) -> SqliteConnection {
@@ -210,7 +214,7 @@ fn undeclared_session_role_is_refused() {
         .map(pg2sqlite::script::Script::into_vec)
         .expect_err("app_user is never declared");
     assert!(
-        error.to_string().contains("the session role 'app_user' is not declared"),
+        matches!(&error, pg2sqlite::errors::Error::DeploymentRoleNotDeclared { role } if role == "app_user"),
         "the refusal names the undeclared role: {error}"
     );
 }
@@ -233,18 +237,18 @@ fn undeclared_schema_owner_is_refused() {
     );
 }
 
-/// Without with_session_user_role, a batch containing a non-PUBLIC TO clause
+/// Without with_acting_role, a batch containing a non-PUBLIC TO clause
 /// refuses translation naming the option so the caller knows what to set.
 #[test]
-fn translation_refuses_role_scoped_policy_without_session_user_role() {
+fn translation_refuses_role_scoped_policy_without_acting_role() {
     let error = Pg2Sqlite::default()
         .sql(&format!("CREATE ROLE admin; {PG}"))
         .expect("parse")
         .translate(&opts_without_role())
         .map(pg2sqlite::script::Script::into_vec)
-        .expect_err("a TO-scoped policy needs a session role");
+        .expect_err("a TO-scoped policy needs an acting role");
     assert!(
-        error.to_string().contains("with_session_user_role"),
+        error.to_string().contains("with_acting_role"),
         "the refusal names the option: {error}"
     );
 }

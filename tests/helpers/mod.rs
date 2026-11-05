@@ -1,5 +1,6 @@
 //! Shared test helpers for pg2sqlite integration tests.
 
+pub mod deployment;
 pub mod emitted_corpus;
 pub mod postgres;
 pub mod run_translated;

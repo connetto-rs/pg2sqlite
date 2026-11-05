@@ -1,27 +1,28 @@
-//! Tests for RLS policies that reference multiple different session variables.
+//! Tests for RLS policies that reference multiple different readings of the
+//! session.
 //!
 //! Each existing RLS test uses a single session-variable mapping.  This module
-//! verifies that two distinct mappings — one for
-//! `current_setting('app.user_id')` (binary UUID) and one for `current_user`
-//! (text username) — are applied independently and correctly within the same
-//! policy.
+//! verifies that a `current_setting('app.user_id')` reading (a binary UUID,
+//! answered by a mapped function) and a `current_user` reading (answered with
+//! the acting role's name) are applied independently and correctly within the
+//! same policy.
 
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
-use rusqlite::Connection as SqliteConn;
+
+use crate::helpers::{apply_statements, deployment::deployment};
 
 fn make_options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
-        .with_session_user_role("authenticated".to_string())
         .with_rls_audit_table_name("rls_audit".to_string())
         // UUID-based identity mapping
         .with_session_variable(SessionVariableMapping::current_setting(
             "app.user_id",
             "current_app_user",
         ))
-        // Username-based identity mapping
-        .with_session_variable(SessionVariableMapping::current_user("current_app_username"))
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated")
 }
 
 /// Snapshot of the translation output for a policy that uses both
@@ -41,10 +42,11 @@ fn test_multiple_session_vars_snapshot() {
     insta::assert_snapshot!("multiple_session_vars_translation", sql_output);
 }
 
-/// Verify that both session-variable patterns are replaced with their
-/// configured SQLite function names in the generated SQL.
+/// Verify that the policy's two session readings resolve in the generated SQL,
+/// the setting to its mapped function and `current_user` to the acting role's
+/// name.
 #[test]
-fn test_both_session_variable_patterns_are_mapped() {
+fn test_both_session_readings_are_applied() {
     let sql = concat!(
         "CREATE ROLE authenticated;\n",
         include_str!("../fixtures/rls_multi_session_vars.sql"),
@@ -60,10 +62,10 @@ fn test_both_session_variable_patterns_are_mapped() {
         sql_output.contains("current_app_user()"),
         "current_setting('app.user_id') should be mapped to current_app_user(), got:\n{sql_output}"
     );
-    // current_user → current_app_username()
+    // current_user → the acting role's name
     assert!(
-        sql_output.contains("current_app_username()"),
-        "current_user should be mapped to current_app_username(), got:\n{sql_output}"
+        sql_output.contains("recipient_username = 'authenticated'"),
+        "current_user should become the acting role's name, got:\n{sql_output}"
     );
     // No raw current_setting(...) references should remain
     assert!(
@@ -72,25 +74,27 @@ fn test_both_session_variable_patterns_are_mapped() {
     );
     // Execute the emitted statements to prove real SQLite accepts the
     // translated schema.
-    let conn = SqliteConn::open_in_memory().unwrap();
-    let script = translated.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n");
-    conn.execute_batch(&script).unwrap_or_else(|e| panic!("translated SQL must execute: {e}"));
+    apply_statements(&translated.iter().map(ToString::to_string).collect::<Vec<_>>());
 }
 
-/// When only one of the two required session-variable mappings is provided,
+/// When a policy reads a `current_setting` that no mapping pairs with,
 /// translation should fail with a clear error about the missing mapping.
 #[test]
 fn test_missing_session_variable_for_current_setting_fails() {
-    let sql = include_str!("../fixtures/rls_multi_session_vars.sql");
+    let sql = concat!(
+        "CREATE ROLE authenticated;\n",
+        include_str!("../fixtures/rls_multi_session_vars.sql"),
+        "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
+    );
 
-    // Provide ONLY the current_user mapping; omit
+    // Name the acting role, but pair no mapping with
     // current_setting('app.user_id')
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
-        .with_session_user_role("authenticated".to_string())
         .with_rls_audit_table_name("rls_audit".to_string())
-        .with_session_variable(SessionVariableMapping::current_user("current_app_username"));
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated");
 
     let result = Pg2Sqlite::default()
         .sql(sql)

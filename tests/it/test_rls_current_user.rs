@@ -1,19 +1,41 @@
 //! Test for current_user based RLS policies.
 //!
 //! Scenario: RLS policies that use PostgreSQL's `current_user` instead of
-//! `current_setting()`. The translation should map `current_user` to a
-//! configured SQLite function.
+//! `current_setting()`. The translation lowers `current_user` to the acting
+//! role's name as a literal, so every test translates the fixture once per
+//! acting role and seeds the rows straight into the backing table under the
+//! write exemption.
+
+use std::cell::Cell;
 
 use diesel::prelude::*;
-use helpers::{establish_connection, set_session_username};
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
+use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation};
 use rosetta_uuid::Uuid;
 
-use crate::helpers;
+use crate::{helpers, helpers::deployment::deployment};
+
+diesel::define_sql_function! {
+    /// Reports whether the current backing write is exempt from RLS checks.
+    fn write_is_exempt() -> diesel::sql_types::Bool;
+}
+
+thread_local! {
+    static WRITE_IS_EXEMPT: Cell<bool> = const { Cell::new(false) };
+}
 
 mod schema {
     diesel::table! {
-        /// Profiles view with RLS filtering based on current_user (username).
+        /// The RLS backing table, seeded directly.
+        profiles_rls (id) {
+            id -> Binary,
+            username -> Text,
+            email -> Text,
+            is_public -> Bool,
+        }
+    }
+
+    diesel::table! {
+        /// The RLS-filtered view of profiles.
         profiles (id) {
             id -> Binary,
             username -> Text,
@@ -25,198 +47,164 @@ mod schema {
 
 use schema::profiles;
 
-#[derive(Queryable, Insertable, Selectable, Debug, Clone)]
-#[diesel(table_name = profiles)]
-struct Profile {
-    id: Vec<u8>,
-    username: String,
-    email: String,
-    is_public: bool,
-}
+const SNAPSHOT_SQL: &str = concat!(
+    "CREATE ROLE alice;\n",
+    include_str!("../fixtures/rls_current_user.sql"),
+    "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO alice;",
+);
 
-fn translate_and_setup() -> Result<diesel::SqliteConnection, Box<dyn std::error::Error>> {
-    let sql = concat!(
-        "CREATE ROLE authenticated;\n",
-        include_str!("../fixtures/rls_current_user.sql"),
-        "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
-    );
+const FIXTURE_SQL: &str = concat!(
+    "CREATE ROLE alice;\n",
+    "CREATE ROLE bob;\n",
+    "CREATE ROLE charlie;\n",
+    include_str!("../fixtures/rls_current_user.sql"),
+    "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO alice, bob, charlie;",
+);
 
-    let options = Pg2SqliteOptions::default()
+const ROLES: [&str; 3] = ["alice", "bob", "charlie"];
+
+/// One profile per role, with only bob's public.
+const SEED: [(&str, bool); 3] = [("alice", false), ("bob", true), ("charlie", false)];
+
+fn options(role: &str) -> Pg2SqliteOptions {
+    Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
-        .with_session_user_role("authenticated".to_string())
-        .with_rls_audit_table_name("rls_audit".to_string())
-        .with_session_variable(SessionVariableMapping::current_user("current_app_username"));
+        .with_rls_audit_table_name("rls_audit")
+        .with_deployment(deployment([role], []))
+        .with_acting_role(role)
+        .with_write_exemption_function("write_is_exempt")
+}
 
-    let translated_migrations = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
+fn translate_and_setup(role: &str) -> diesel::SqliteConnection {
+    let translated = Pg2Sqlite::default()
+        .sql(FIXTURE_SQL)
+        .expect("parse fixture")
+        .translate(&options(role))
+        .expect("translate fixture")
+        .into_vec();
 
-    let mut connection = establish_connection();
+    let mut connection = helpers::establish_connection();
+    write_is_exempt_utils::register_nondeterministic_impl(&mut connection, || {
+        WRITE_IS_EXEMPT.with(Cell::get)
+    })
+    .expect("register write_is_exempt");
 
-    for translated_migration in &translated_migrations {
-        let sql_stmt = translated_migration.to_string();
-        diesel::sql_query(&sql_stmt).execute(&mut connection)?;
+    for statement in &translated {
+        // DDL emitted by the translator cannot be expressed with the typed DSL.
+        diesel::sql_query(statement.to_string())
+            .execute(&mut connection)
+            .unwrap_or_else(|error| panic!("emitted DDL failed: {error}\n{statement}"));
     }
 
-    Ok(connection)
+    connection
 }
 
-/// Snapshot test for current_user RLS translation.
-#[test]
-fn test_current_user_translation_snapshot() -> Result<(), Box<dyn std::error::Error>> {
-    let sql = concat!(
-        "CREATE ROLE authenticated;\n",
-        include_str!("../fixtures/rls_current_user.sql"),
-        "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
-    );
+fn set_write_exempt(exempt: bool) {
+    WRITE_IS_EXEMPT.with(|value| value.set(exempt));
+}
 
+/// Seeds one profile per role into the backing table. The write exemption
+/// has to hold the guards open for the foreign rows.
+fn seed_profiles(connection: &mut diesel::SqliteConnection) {
+    set_write_exempt(true);
+    for (username, is_public) in SEED {
+        diesel::insert_into(schema::profiles_rls::table)
+            .values((
+                schema::profiles_rls::id.eq(Uuid::new_v4().as_bytes().to_vec()),
+                schema::profiles_rls::username.eq(username),
+                schema::profiles_rls::email.eq(format!("{username}@example.com")),
+                schema::profiles_rls::is_public.eq(is_public),
+            ))
+            .execute(connection)
+            .expect("seed profile row");
+    }
+    set_write_exempt(false);
+}
+
+/// Snapshot test for the current_user RLS translation, acting as alice.
+#[test]
+fn test_current_user_translation_snapshot() {
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
-        .with_session_user_role("authenticated".to_string())
-        .with_rls_audit_table_name("rls_audit".to_string())
-        .with_session_variable(SessionVariableMapping::current_user("current_app_username"));
+        .with_rls_audit_table_name("rls_audit")
+        .with_deployment(deployment(["alice"], []))
+        .with_acting_role("alice");
 
-    let translated_migrations = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
+    let translated_migrations = Pg2Sqlite::default()
+        .sql(SNAPSHOT_SQL)
+        .expect("parse fixture")
+        .translate(&options)
+        .expect("translate fixture")
+        .into_vec();
 
     let translated_sql =
         translated_migrations.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
     insta::assert_snapshot!("rls_current_user_translation", translated_sql);
-
-    Ok(())
 }
 
+/// Each role sees its own profile and the public ones, and no private
+/// profile of another role.
 #[test]
-fn test_user_sees_own_profile() -> Result<(), Box<dyn std::error::Error>> {
-    let mut connection = translate_and_setup()?;
+fn test_role_sees_own_and_public_profiles() {
+    for role in ROLES {
+        let mut connection = translate_and_setup(role);
+        seed_profiles(&mut connection);
 
-    set_session_username("alice");
-    diesel::insert_into(profiles::table)
-        .values(Profile {
-            id: Uuid::new_v4().as_bytes().to_vec(),
-            username: "alice".to_string(),
-            email: "alice@example.com".to_string(),
-            is_public: false,
-        })
-        .execute(&mut connection)?;
+        let mut seen: Vec<String> = profiles::table
+            .select(profiles::username)
+            .load(&mut connection)
+            .expect("load visible profiles");
+        seen.sort_unstable();
 
-    let alice_profiles = profiles::table.select(Profile::as_select()).load(&mut connection)?;
-    assert_eq!(alice_profiles.len(), 1, "Alice should see 1 profile");
-    assert_eq!(alice_profiles[0].username, "alice");
+        let mut expected: Vec<String> = SEED
+            .iter()
+            .filter(|(username, public)| *username == role || *public)
+            .map(|(username, _)| (*username).to_owned())
+            .collect();
+        expected.sort_unstable();
 
-    Ok(())
+        assert_eq!(seen, expected, "{role} should see its own profile and the public ones only");
+    }
 }
 
+/// Each role updates its own profile, and an update aimed at another role's
+/// profile leaves that profile untouched.
 #[test]
-fn test_user_sees_public_profiles() -> Result<(), Box<dyn std::error::Error>> {
-    let mut connection = translate_and_setup()?;
+fn test_role_updates_own_profile_only() {
+    for role in ROLES {
+        let mut connection = translate_and_setup(role);
+        seed_profiles(&mut connection);
 
-    // Create a public profile for Bob
-    set_session_username("bob");
-    diesel::insert_into(profiles::table)
-        .values(Profile {
-            id: Uuid::new_v4().as_bytes().to_vec(),
-            username: "bob".to_string(),
-            email: "bob@example.com".to_string(),
-            is_public: true,
-        })
-        .execute(&mut connection)?;
+        diesel::update(profiles::table.filter(profiles::username.eq(role)))
+            .set(profiles::email.eq("updated@example.com"))
+            .execute(&mut connection)
+            .expect("update own profile");
+        let email: String = profiles::table
+            .filter(profiles::username.eq(role))
+            .select(profiles::email)
+            .first(&mut connection)
+            .expect("read own profile");
+        assert_eq!(email, "updated@example.com", "{role} should update its own profile");
 
-    // Create a private profile for Charlie
-    set_session_username("charlie");
-    diesel::insert_into(profiles::table)
-        .values(Profile {
-            id: Uuid::new_v4().as_bytes().to_vec(),
-            username: "charlie".to_string(),
-            email: "charlie@example.com".to_string(),
-            is_public: false,
-        })
-        .execute(&mut connection)?;
+        for other in ROLES {
+            if other == role {
+                continue;
+            }
+            diesel::update(profiles::table.filter(profiles::username.eq(other)))
+                .set(profiles::email.eq("hacked@example.com"))
+                .execute(&mut connection)
+                .expect("the update skips the row the policy hides");
+        }
 
-    // Alice should see Bob's public profile but not Charlie's private one
-    set_session_username("alice");
-    let visible_profiles = profiles::table.select(Profile::as_select()).load(&mut connection)?;
-    assert_eq!(visible_profiles.len(), 1, "Alice should see 1 profile (Bob's public one)");
-    assert_eq!(visible_profiles[0].username, "bob");
-
-    Ok(())
-}
-
-#[test]
-fn test_user_cannot_see_private_others() -> Result<(), Box<dyn std::error::Error>> {
-    let mut connection = translate_and_setup()?;
-
-    // Create a private profile for Bob
-    set_session_username("bob");
-    diesel::insert_into(profiles::table)
-        .values(Profile {
-            id: Uuid::new_v4().as_bytes().to_vec(),
-            username: "bob".to_string(),
-            email: "bob@example.com".to_string(),
-            is_public: false,
-        })
-        .execute(&mut connection)?;
-
-    // Alice should NOT see Bob's private profile
-    set_session_username("alice");
-    let visible_count = profiles::table.count().get_result::<i64>(&mut connection)?;
-    assert_eq!(visible_count, 0, "Alice should see 0 profiles (Bob's is private)");
-
-    Ok(())
-}
-
-#[test]
-fn test_user_can_update_own_only() -> Result<(), Box<dyn std::error::Error>> {
-    let mut connection = translate_and_setup()?;
-
-    let alice_id = Uuid::new_v4();
-    let bob_id = Uuid::new_v4();
-
-    set_session_username("alice");
-    diesel::insert_into(profiles::table)
-        .values(Profile {
-            id: alice_id.as_bytes().to_vec(),
-            username: "alice".to_string(),
-            email: "alice@example.com".to_string(),
-            is_public: false,
-        })
-        .execute(&mut connection)?;
-
-    set_session_username("bob");
-    diesel::insert_into(profiles::table)
-        .values(Profile {
-            id: bob_id.as_bytes().to_vec(),
-            username: "bob".to_string(),
-            email: "bob@example.com".to_string(),
-            is_public: true,
-        })
-        .execute(&mut connection)?;
-
-    // Alice can update her own profile
-    set_session_username("alice");
-    diesel::update(profiles::table.filter(profiles::id.eq(alice_id.as_bytes().to_vec())))
-        .set(profiles::email.eq("alice_updated@example.com"))
-        .execute(&mut connection)?;
-
-    let alice_profile = profiles::table
-        .filter(profiles::id.eq(alice_id.as_bytes().to_vec()))
-        .select(Profile::as_select())
-        .first(&mut connection)?;
-    assert_eq!(alice_profile.email, "alice_updated@example.com");
-
-    // Alice cannot update Bob's profile (update will affect 0 rows)
-    // Bob's profile is visible but the USING clause prevents Alice from
-    // updating it
-    diesel::update(profiles::table.filter(profiles::id.eq(bob_id.as_bytes().to_vec())))
-        .set(profiles::email.eq("hacked@example.com"))
-        .execute(&mut connection)?;
-
-    // Verify Bob's email was NOT changed
-    set_session_username("bob");
-    let bob_profile = profiles::table
-        .filter(profiles::id.eq(bob_id.as_bytes().to_vec()))
-        .select(Profile::as_select())
-        .first(&mut connection)?;
-    assert_eq!(bob_profile.email, "bob@example.com", "Bob's email should NOT be changed by Alice");
-
-    Ok(())
+        let emails: Vec<String> = profiles::table
+            .select(profiles::email)
+            .load(&mut connection)
+            .expect("read visible emails");
+        assert!(
+            !emails.iter().any(|email| email == "hacked@example.com"),
+            "{role} must not change another role's profile"
+        );
+    }
 }

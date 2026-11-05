@@ -112,7 +112,8 @@ fn policy_connection() -> (SqliteConnection, Arc<AtomicBool>) {
 
 fn read_only_connection() -> SqliteConnection {
     let options = Pg2SqliteOptions::default()
-        .with_session_user_role("app_user")
+        .with_deployment(crate::helpers::deployment::deployment(["app_user"], []))
+        .with_acting_role("app_user")
         .with_rls_audit_table_name("rls_audit")
         .with_write_exemption_function("write_is_exempt");
     apply(READ_ONLY_SCHEMA, &options).0
