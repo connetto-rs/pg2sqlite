@@ -16,19 +16,23 @@ use core::fmt;
 
 use sql_traits::{
     structs::{
-        Deployment, ParserDB, SessionSetting, SetPacking, SettingContent, SettingPresence,
-        SettingValue,
+        Deployment, JsonField, ParserDB, SessionSetting, SetPacking, SettingContent,
+        SettingPresence, SettingValue,
     },
     traits::DatabaseLike,
 };
 use sqlparser::ast::{
-    CastKind, DataType, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
-    FunctionArguments, ObjectName, TimezoneInfo, Value, ValueWithSpan,
+    AccessExpr, BinaryOperator, CastKind, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
+    FunctionArgumentList, FunctionArguments, ObjectName, Query, SelectItem, SetExpr, Subscript,
+    TableFactor, TimezoneInfo, Value, ValueWithSpan,
 };
 
 use crate::{
     errors::Error,
-    impls::function_helpers::{simple_function_expr, single_quoted_literal, string_literal},
+    impls::{
+        function_helpers::{simple_function_expr, single_quoted_literal, string_literal},
+        query_builder::{from_relation, single_expr_query, table_function_factor},
+    },
     options::Pg2SqliteOptions,
     traits::SessionVariableMapping,
 };
@@ -195,8 +199,8 @@ pub(crate) struct Setting<'o> {
 enum OneValue<'o> {
     /// A value of the declared type.
     Typed(&'o DataType),
-    /// A JSON document.
-    Document,
+    /// A JSON document with these fields.
+    Document(&'o [JsonField]),
 }
 
 impl<'o> Setting<'o> {
@@ -222,7 +226,7 @@ impl<'o> Setting<'o> {
                     packing: packing_description(packing),
                 })
             }
-            SettingContent::Json(_) => Ok(OneValue::Document),
+            SettingContent::Json(fields) => Ok(OneValue::Document(fields)),
         }
     }
 
@@ -238,7 +242,7 @@ impl<'o> Setting<'o> {
                     &format!("joined by '{written}'"),
                 )
             }
-            SettingContent::Json(_) => Err(json_document(self)),
+            SettingContent::Json(fields) => Err(whole_document(self, fields)),
         }
     }
 }
@@ -325,13 +329,24 @@ fn packing_description(packing: &SetPacking) -> String {
     }
 }
 
-/// Refuses reading a JSON setting, whose fields have no SQLite reading.
-fn json_document(setting: Setting<'_>) -> Error {
+/// Refuses reading a JSON setting as a whole.
+fn whole_document(setting: Setting<'_>, fields: &[JsonField]) -> Error {
     Error::forward_refusal(format!(
-        "The deployment declares {} as a JSON document, and reading a JSON setting has no \
-         SQLite translation.",
-        setting.pattern()
+        "The deployment declares {} as a JSON document whose fields are {}, and this statement \
+         reads the whole document. Read a declared field with ->>.",
+        setting.pattern(),
+        declared_paths(fields)
     ))
+}
+
+/// The declared paths of a JSON setting, comma separated.
+fn declared_paths(fields: &[JsonField]) -> String {
+    fields.iter().map(|field| path_display(field.path())).collect::<Vec<_>>().join(", ")
+}
+
+/// A path as PostgreSQL spells its keys, `'a' -> 'b'`.
+fn path_display(path: &[String]) -> String {
+    path.iter().map(|key| format!("'{key}'")).collect::<Vec<_>>().join(" -> ")
 }
 
 /// What reading the session as one value becomes.
@@ -355,7 +370,7 @@ pub(crate) fn translate_session_read(
     let setting = setting(name, options)?;
     match setting.one_value()? {
         OneValue::Typed(_) => Ok(setting.call()),
-        OneValue::Document => Err(json_document(setting)),
+        OneValue::Document(fields) => Err(whole_document(setting, fields)),
     }
 }
 
@@ -366,8 +381,11 @@ pub(crate) fn translate_expr_read(
     schema: &ParserDB,
     options: &Pg2SqliteOptions,
 ) -> Result<Option<Expr>, Error> {
-    match session_read(expr) {
-        Some(read) => translate_session_read(&read, schema, options).map(Some),
+    if let Some(read) = session_read(expr) {
+        return translate_session_read(&read, schema, options).map(Some);
+    }
+    match json_read(expr) {
+        Some(read) => translate_json_read(&read?, None, options).map(Some),
         None => Ok(None),
     }
 }
@@ -379,6 +397,9 @@ pub(crate) fn translate_cast(
     data_type: &DataType,
     options: &Pg2SqliteOptions,
 ) -> Result<Option<Expr>, Error> {
+    if let Some(read) = json_read(inner) {
+        return translate_json_read(&read?, Some(data_type), options).map(Some);
+    }
     let Expr::Function(func) = inner else { return Ok(None) };
     let Some(SessionRead::Setting(name)) = session_read_of_function(func) else {
         return Ok(None);
@@ -395,56 +416,568 @@ pub(crate) fn translate_cast(
                 written: data_type.to_string(),
             })
         }
-        OneValue::Document => Err(json_document(setting)),
+        OneValue::Document(fields) => Err(whole_document(setting, fields)),
     }
 }
 
-// ── sets ────────────────────────────────────────────────────────────────────
+// ── JSON documents ──────────────────────────────────────────────────────────
+
+/// A read of a setting's JSON document, `current_setting(name)::jsonb`
+/// followed by key steps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JsonRead {
+    /// The setting whose document is read.
+    name: String,
+    /// The keys, outermost first.
+    path: Vec<String>,
+    /// Whether the last step is `->>`, which answers text where `->` and a
+    /// subscript answer `jsonb`.
+    text: bool,
+}
+
+impl JsonRead {
+    /// The read as messages name it.
+    fn pattern(&self) -> String {
+        use core::fmt::Write as _;
+        let mut pattern = format!("current_setting('{}')::jsonb", self.name);
+        let last = self.path.len().saturating_sub(1);
+        for (index, key) in self.path.iter().enumerate() {
+            let operator = if index == last && self.text { "->>" } else { "->" };
+            write!(pattern, " {operator} '{key}'").expect("a String takes every write");
+        }
+        pattern
+    }
+}
+
+/// One step down a JSON document, outermost last.
+enum Step<'e> {
+    Operator(&'e BinaryOperator, &'e Expr),
+    Access(&'e AccessExpr),
+}
+
+/// The document read `expr` spells over a setting, its steps from the
+/// document outwards, or `None` when the root is no setting's document.
+fn document_spine(expr: &Expr) -> Option<(String, Vec<Step<'_>>)> {
+    let mut steps = Vec::new();
+    let mut current = expr;
+    let name = loop {
+        match current {
+            Expr::Nested(inner) => current = inner,
+            Expr::BinaryOp {
+                left,
+                op:
+                    op @ (BinaryOperator::Arrow
+                    | BinaryOperator::LongArrow
+                    | BinaryOperator::HashArrow
+                    | BinaryOperator::HashLongArrow),
+                right,
+            } => {
+                steps.push(Step::Operator(op, right));
+                current = left;
+            }
+            Expr::CompoundFieldAccess { root, access_chain } => {
+                steps.extend(access_chain.iter().rev().map(Step::Access));
+                current = root;
+            }
+            Expr::Cast { expr: inner, data_type: DataType::JSON | DataType::JSONB, .. } => {
+                let Expr::Function(func) = setting_operand(inner) else { return None };
+                let Some(SessionRead::Setting(name)) = session_read_of_function(func) else {
+                    return None;
+                };
+                break name;
+            }
+            _ => return None,
+        }
+    };
+    steps.reverse();
+    Some((name, steps))
+}
+
+/// The keys `steps` read and whether the last answers text.
+fn json_path(name: &str, steps: &[Step<'_>]) -> Result<(Vec<String>, bool), Error> {
+    let unsupported = |step: &str| {
+        Error::forward_refusal(format!(
+            "The statement reads the JSON setting current_setting('{name}') through {step}, and \
+             a field of a declared document is read with `-> 'key'` or `['key']` for each \
+             nesting level and `->> 'key'` for the last."
+        ))
+    };
+    let mut path = Vec::with_capacity(steps.len());
+    let mut text = false;
+    for step in steps {
+        if text {
+            return Err(unsupported("a step after ->>, which answers text rather than a document"));
+        }
+        let key = match step {
+            Step::Operator(op @ (BinaryOperator::Arrow | BinaryOperator::LongArrow), right) => {
+                text = matches!(op, BinaryOperator::LongArrow);
+                single_quoted_literal(right)
+                    .ok_or_else(|| unsupported(&format!("{op} {right}, a step that is no key")))?
+            }
+            Step::Operator(op, _) => return Err(unsupported(&op.to_string())),
+            Step::Access(AccessExpr::Subscript(Subscript::Index { index })) => {
+                single_quoted_literal(index).ok_or_else(|| {
+                    unsupported(&format!("the subscript [{index}], a step that is no key"))
+                })?
+            }
+            Step::Access(access) => return Err(unsupported(&access.to_string())),
+        };
+        path.push(key.to_string());
+    }
+    Ok((path, text))
+}
+
+/// The field read `expr` spells over a setting's JSON document, or `None`
+/// when it reads no setting's document or reads it whole.
+pub(crate) fn json_read(expr: &Expr) -> Option<Result<JsonRead, Error>> {
+    let (name, steps) = document_spine(expr)?;
+    if steps.is_empty() {
+        return None;
+    }
+    Some(json_path(&name, &steps).map(|(path, text)| JsonRead { name, path, text }))
+}
+
+/// The field `path` of a JSON setting.
+fn declared_field<'o>(setting: Setting<'o>, path: &[String]) -> Result<&'o JsonField, Error> {
+    let SettingContent::Json(fields) = setting.declared.content() else {
+        return Err(Error::forward_refusal(format!(
+            "The deployment declares {} as one value rather than a JSON document, and this \
+             statement reads the field {} of it.",
+            setting.pattern(),
+            path_display(path)
+        )));
+    };
+    fields.iter().find(|field| field.path() == path).ok_or_else(|| {
+        Error::SessionJsonFieldNotDeclared {
+            pattern: setting.pattern(),
+            path: path_display(path),
+            declared: declared_paths(fields),
+        }
+    })
+}
+
+/// A SQLite JSON path naming `path`, each key quoted so that a dot in it
+/// stays part of the key.
+fn sqlite_json_path(pattern: &str, path: &[String]) -> Result<String, Error> {
+    if let Some(key) = path.iter().find(|key| key.contains(['"', '\\'])) {
+        return Err(Error::forward_refusal(format!(
+            "{pattern} reads the key '{key}', and a key carrying a double quote or a backslash \
+             has no SQLite JSON path spelling."
+        )));
+    }
+    let mut sqlite = String::from("$");
+    for key in path {
+        sqlite.push_str(".\"");
+        sqlite.push_str(key);
+        sqlite.push('"');
+    }
+    Ok(sqlite)
+}
+
+/// `document <op> '<path>'`, SQLite's JSON operator under a full path.
+fn json_operator(document: Expr, op: BinaryOperator, path: &str) -> Expr {
+    Expr::BinaryOp { left: Box::new(document), op, right: Box::new(string_literal(path)) }
+}
+
+/// What a field read of a JSON setting becomes, `cast` being the type the
+/// statement casts the field to.
+///
+/// The field is text inside the document, so its cast is kept as the rule
+/// turning that text into the stored form.
+pub(crate) fn translate_json_read(
+    read: &JsonRead,
+    cast: Option<&DataType>,
+    options: &Pg2SqliteOptions,
+) -> Result<Expr, Error> {
+    let setting = setting(&read.name, options)?;
+    let field = declared_field(setting, &read.path)?;
+    let pattern = read.pattern();
+    let declared = match field.value() {
+        SettingValue::Caller(declared) | SettingValue::Scalar(declared) => declared,
+        SettingValue::Set { packing, .. } => {
+            return Err(Error::SessionVariableReadAsScalar {
+                pattern,
+                packing: packing_description(packing),
+            });
+        }
+    };
+    if !read.text {
+        return Err(Error::forward_refusal(format!(
+            "{pattern} answers the field as jsonb, which compares as a document rather than as \
+             its value. Read the field with ->> for its last key."
+        )));
+    }
+    let text = json_operator(
+        setting.call(),
+        BinaryOperator::LongArrow,
+        &sqlite_json_path(&pattern, &read.path)?,
+    );
+    typed_reading(&pattern, declared, cast, text, options)
+}
+
+/// The stored form of a text the statement reads as `declared`, `cast` being
+/// the type it casts the text to.
+fn typed_reading(
+    pattern: &str,
+    declared: &DataType,
+    cast: Option<&DataType>,
+    text: Expr,
+    options: &Pg2SqliteOptions,
+) -> Result<Expr, Error> {
+    match cast {
+        Some(written) if !same_postgres_type(declared, written) => {
+            Err(Error::SessionVariableTypeDisagrees {
+                pattern: pattern.to_string(),
+                declared: declared.to_string(),
+                written: written.to_string(),
+            })
+        }
+        Some(_) => stored_value(pattern, declared, text, options),
+        None if is_text_type(declared) => Ok(text),
+        None => {
+            Err(Error::SessionVariableCastMissing {
+                pattern: pattern.to_string(),
+                declared: declared.to_string(),
+            })
+        }
+    }
+}
 
 /// Whether `data_type` is stored as the text that renders it.
 fn is_text_type(data_type: &DataType) -> bool {
     matches!(canonical(data_type), DataType::Text | DataType::Varchar(_))
 }
 
-/// Why a set of `element` values has no `instr()` search.
-fn non_text_elements(pattern: &str, element: &DataType) -> String {
-    format!(
-        "The deployment declares the elements of {pattern} as '{element}', and the instr() search \
-         compares text."
+/// How the replica stores a value of `declared` from the canonical
+/// PostgreSQL rendering `text` holds, which is all the deployment promises.
+pub(crate) fn stored_value(
+    pattern: &str,
+    declared: &DataType,
+    text: Expr,
+    options: &Pg2SqliteOptions,
+) -> Result<Expr, Error> {
+    use crate::impls::translator_impls::uuid::{
+        is_blob_uuid_representation, make_uuid_conversion_call,
+    };
+    match canonical(declared) {
+        DataType::Uuid if is_blob_uuid_representation(options) => {
+            Ok(make_uuid_conversion_call(text, options))
+        }
+        DataType::Text | DataType::Varchar(_) | DataType::Uuid => Ok(text),
+        DataType::SmallInt(_) | DataType::Integer(_) | DataType::BigInt(_) => {
+            Ok(Expr::Cast {
+                kind: CastKind::Cast,
+                expr: Box::new(text),
+                data_type: DataType::Integer(None),
+                format: None,
+            })
+        }
+        DataType::Boolean => Ok(crate::impls::translator_impls::expr::boolean_from_text(text)),
+        _ => {
+            Err(Error::SessionVariableTypeUnreadable {
+                pattern: pattern.to_string(),
+                declared: declared.to_string(),
+            })
+        }
+    }
+}
+
+// ── sets ────────────────────────────────────────────────────────────────────
+
+/// The elements of a set a setting holds, as a SQLite JSON array.
+pub(crate) struct JsonSet<'o> {
+    /// The SQLite expression answering the JSON array.
+    pub(crate) array: Expr,
+    /// The type of every element.
+    pub(crate) element: &'o DataType,
+    /// The set as messages name it.
+    pub(crate) pattern: String,
+}
+
+/// The set `document` reads, when it is a setting's JSON document or a field
+/// of one.
+pub(crate) fn json_set<'o>(
+    document: &Expr,
+    options: &'o Pg2SqliteOptions,
+) -> Option<Result<JsonSet<'o>, Error>> {
+    let (name, steps) = document_spine(document)?;
+    Some(json_set_of(&name, &steps, options))
+}
+
+fn json_set_of<'o>(
+    name: &str,
+    steps: &[Step<'_>],
+    options: &'o Pg2SqliteOptions,
+) -> Result<JsonSet<'o>, Error> {
+    const WRITTEN: &str = "packed as a JSON array";
+    let setting = setting(name, options)?;
+    let (path, text) = json_path(name, steps)?;
+    let read = JsonRead { name: name.to_string(), path, text };
+    let pattern = if read.path.is_empty() { setting.pattern() } else { read.pattern() };
+    if read.text {
+        return Err(Error::forward_refusal(format!(
+            "{pattern} answers text, and a set is expanded from the jsonb that -> answers. Read \
+             its last key with ->."
+        )));
+    }
+    let (value, array) = if read.path.is_empty() {
+        match setting.declared.content() {
+            SettingContent::Value(value) => (value, setting.call()),
+            SettingContent::Json(fields) => return Err(whole_document(setting, fields)),
+        }
+    } else {
+        let field = declared_field(setting, &read.path)?;
+        let array = json_operator(
+            setting.call(),
+            BinaryOperator::Arrow,
+            &sqlite_json_path(&pattern, &read.path)?,
+        );
+        (field.value(), array)
+    };
+    let element =
+        packed_set(&pattern, value, |packing| matches!(packing, SetPacking::JsonArray), WRITTEN)?;
+    Ok(JsonSet { array, element, pattern })
+}
+
+/// The set a membership subquery expands from a setting, and the element cast
+/// it writes.
+struct SetSubquery<'q> {
+    document: &'q Expr,
+    cast: Option<&'q DataType>,
+}
+
+/// The names PostgreSQL expands a JSON array into text rows with.
+fn is_array_elements_text(name: &ObjectName) -> bool {
+    matches!(
+        function_name_lower(name).as_str(),
+        "jsonb_array_elements_text" | "json_array_elements_text"
     )
 }
 
-/// What `x = ANY(string_to_array(<setting>, written))` becomes, the
-/// [`delimited_membership`](crate::impls::idioms::delimited_membership) search
-/// over the paired call.
+/// The only argument of a call, written positionally.
+fn sole_argument(args: &[FunctionArg]) -> Option<&Expr> {
+    match args {
+        [FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))] => Some(expr),
+        _ => None,
+    }
+}
+
+/// The set and element cast of a subquery expanding a JSON array, written
+/// `SELECT jsonb_array_elements_text(d)[::T]` or
+/// `SELECT e[::T] FROM jsonb_array_elements_text(d) AS e`.
+fn set_subquery(query: &Query) -> Option<SetSubquery<'_>> {
+    if query.with.is_some()
+        || query.order_by.is_some()
+        || query.limit_clause.is_some()
+        || query.fetch.is_some()
+    {
+        return None;
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else { return None };
+    if select.distinct.is_some()
+        || select.selection.is_some()
+        || select.having.is_some()
+        || !matches!(&select.group_by, sqlparser::ast::GroupByExpr::Expressions(exprs, _) if exprs.is_empty())
+    {
+        return None;
+    }
+    let [item] = select.projection.as_slice() else { return None };
+    let (SelectItem::UnnamedExpr(projected) | SelectItem::ExprWithAlias { expr: projected, .. }) =
+        item
+    else {
+        return None;
+    };
+    let (element, cast) = match projected {
+        Expr::Cast { expr, data_type, format: None, .. } => (expr.as_ref(), Some(data_type)),
+        other => (other, None),
+    };
+    let document = match select.from.as_slice() {
+        [] => {
+            let Expr::Function(call) = element else { return None };
+            let FunctionArguments::List(list) = &call.args else { return None };
+            if !is_array_elements_text(&call.name) || call.over.is_some() || call.filter.is_some() {
+                return None;
+            }
+            sole_argument(&list.args)?
+        }
+        [from] if from.joins.is_empty() => {
+            let (name, args, alias) = match &from.relation {
+                TableFactor::Table { name, args: Some(args), alias, .. } => {
+                    (name, args.args.as_slice(), alias)
+                }
+                TableFactor::Function { name, args, alias, .. } => (name, args.as_slice(), alias),
+                _ => return None,
+            };
+            if !is_array_elements_text(name) || !names_the_element(element, alias.as_ref()) {
+                return None;
+            }
+            sole_argument(args)?
+        }
+        _ => return None,
+    };
+    Some(SetSubquery { document, cast })
+}
+
+/// Whether `expr` names the element of a `FROM` expansion aliased `alias`:
+/// its column, or the alias, which PostgreSQL reads as the row's one value.
+fn names_the_element(expr: &Expr, alias: Option<&sqlparser::ast::TableAlias>) -> bool {
+    let column = alias
+        .and_then(|alias| alias.columns.first())
+        .map_or("value", |column| column.name.value.as_str());
+    let table = alias.map(|alias| alias.name.value.as_str());
+    match expr {
+        Expr::Identifier(ident) => {
+            ident.value.eq_ignore_ascii_case(column)
+                || table.is_some_and(|table| ident.value.eq_ignore_ascii_case(table))
+        }
+        Expr::CompoundIdentifier(parts) => {
+            matches!(parts.as_slice(), [qualifier, name]
+                if table.is_some_and(|table| qualifier.value.eq_ignore_ascii_case(table))
+                    && name.value.eq_ignore_ascii_case(column))
+        }
+        _ => false,
+    }
+}
+
+/// `x IN (SELECT <stored value> FROM json_each(<array>))` for a membership
+/// test over a set packed as a JSON array, or `None` when `query` expands no
+/// setting.
 ///
-/// The search compares text split on one character, so a set of another
-/// element type or joined by a longer delimiter is refused.
+/// Both engines expand a NULL document into no row, so an unset setting is
+/// an empty set and needs no guard.
+pub(crate) fn json_set_membership(
+    translated_left: impl FnOnce() -> Result<Expr, Error>,
+    query: &Query,
+    negated: bool,
+    options: &Pg2SqliteOptions,
+) -> Result<Option<Expr>, Error> {
+    let Some(SetSubquery { document, cast }) = set_subquery(query) else { return Ok(None) };
+    let Some(set) = json_set(document, options) else { return Ok(None) };
+    let JsonSet { array, element, pattern } = set?;
+    let value = typed_reading(
+        &format!("the elements of {pattern}"),
+        element,
+        cast,
+        Expr::Identifier(sqlparser::ast::Ident::new("value")),
+        options,
+    )?;
+    let each = table_function_factor("json_each", vec![array], None, false);
+    let elements = single_expr_query(value, from_relation(each), None);
+    Ok(Some(Expr::In {
+        expr: Box::new(translated_left()?),
+        target: sqlparser::ast::InTarget::Subquery(Box::new(elements)),
+        negated,
+        global: false,
+    }))
+}
+
+/// What `x = ANY(string_to_array(<setting>, written)[::T[]])` becomes, `cast`
+/// being the element type of the written array cast.
+///
+/// A set of text split on one character keeps the `instr()` search, and
+/// anything else splits the setting into rows with [`split_membership`].
 pub(crate) fn delimited_set_membership(
     translated_left: Expr,
     name: &str,
     written: &str,
+    cast: Option<&DataType>,
     negated: bool,
     options: &Pg2SqliteOptions,
 ) -> Result<Expr, Error> {
     let setting = setting(name, options)?;
     let pattern = setting.pattern();
     let element = setting.delimited_set(written)?;
-    if !is_text_type(element) {
-        return Err(Error::forward_refusal(non_text_elements(&pattern, element)));
+    let elements = format!("the elements of {pattern}");
+    if is_text_type(element)
+        && let Some(delimiter) = crate::impls::idioms::single_character(written)
+    {
+        typed_reading(&elements, element, cast, setting.call(), options)?;
+        return Ok(crate::impls::idioms::delimited_membership(
+            translated_left,
+            setting.call(),
+            delimiter,
+            negated,
+        ));
     }
-    let Some(delimiter) = crate::impls::idioms::single_character(written) else {
-        return Err(Error::forward_refusal(format!(
-            "The deployment joins {pattern} by '{written}', and a membership test over \
-             string_to_array() becomes an instr() search, which splits on one character only."
-        )));
+    let value = typed_reading(
+        &elements,
+        element,
+        cast,
+        Expr::Identifier(sqlparser::ast::Ident::new(SPLIT_ELEMENT)),
+        options,
+    )?;
+    Ok(split_membership(translated_left, setting.call(), written, value, negated))
+}
+
+/// The column the rows of [`split_membership`] answer each element in.
+const SPLIT_ELEMENT: &str = "pg2sqlite_element";
+
+/// `x = ANY(string_to_array(text, delimiter)::T[])` as a membership test over
+/// the elements split into rows, each read through `value`.
+///
+/// The recursive query splits left to right as `string_to_array` does, so a
+/// longer delimiter splits where the server does. A NULL text answers NULL,
+/// hence the `IS NOT NULL` guard, and no element is NULL, which is what tells
+/// the anchor row apart.
+fn split_membership(left: Expr, text: Expr, delimiter: &str, value: Expr, negated: bool) -> Expr {
+    const TEMPLATE: &str = "CASE WHEN pg2sqlite_text IS NOT NULL THEN pg2sqlite_left IN (\
+        WITH RECURSIVE pg2sqlite_split(pg2sqlite_element, pg2sqlite_rest) AS (\
+        SELECT NULL, pg2sqlite_text WHERE pg2sqlite_text <> '' \
+        UNION ALL SELECT \
+        CASE WHEN instr(pg2sqlite_rest, pg2sqlite_delimiter) > 0 \
+        THEN substr(pg2sqlite_rest, 1, instr(pg2sqlite_rest, pg2sqlite_delimiter) - 1) \
+        ELSE pg2sqlite_rest END, \
+        CASE WHEN instr(pg2sqlite_rest, pg2sqlite_delimiter) > 0 \
+        THEN substr(pg2sqlite_rest, instr(pg2sqlite_rest, pg2sqlite_delimiter) + pg2sqlite_length) \
+        END \
+        FROM pg2sqlite_split WHERE pg2sqlite_rest IS NOT NULL) \
+        SELECT pg2sqlite_value FROM pg2sqlite_split WHERE pg2sqlite_element IS NOT NULL) END";
+    let mut expr = sqlparser::parser::Parser::new(&sqlparser::dialect::SQLiteDialect {})
+        .try_with_sql(TEMPLATE)
+        .and_then(|mut parser| parser.parse_expr())
+        .expect("the split template is a constant SQLite expression");
+    let mut placeholders = Placeholders {
+        text,
+        left,
+        delimiter: string_literal(delimiter),
+        length: crate::impls::function_helpers::number_literal(
+            &delimiter.chars().count().to_string(),
+        ),
+        value,
     };
-    Ok(crate::impls::idioms::delimited_membership(
-        translated_left,
-        setting.call(),
-        delimiter,
-        negated,
-    ))
+    let _: core::ops::ControlFlow<()> =
+        sqlparser::ast::VisitMut::visit(&mut expr, &mut placeholders);
+    if negated { crate::impls::expr_helpers::not_predicate(expr) } else { expr }
+}
+
+/// The expressions [`split_membership`]'s template names by placeholder.
+struct Placeholders {
+    text: Expr,
+    left: Expr,
+    delimiter: Expr,
+    length: Expr,
+    value: Expr,
+}
+
+impl sqlparser::ast::VisitorMut for Placeholders {
+    type Break = ();
+
+    fn post_visit_expr(&mut self, expr: &mut Expr) -> core::ops::ControlFlow<Self::Break> {
+        if let Expr::Identifier(ident) = expr {
+            let replacement = match ident.value.as_str() {
+                "pg2sqlite_text" => Some(&self.text),
+                "pg2sqlite_left" => Some(&self.left),
+                "pg2sqlite_delimiter" => Some(&self.delimiter),
+                "pg2sqlite_length" => Some(&self.length),
+                "pg2sqlite_value" => Some(&self.value),
+                _ => None,
+            };
+            if let Some(replacement) = replacement {
+                *expr = replacement.clone();
+            }
+        }
+        core::ops::ControlFlow::Continue(())
+    }
 }
 
 // ── reverse ─────────────────────────────────────────────────────────────────
@@ -502,7 +1035,7 @@ pub(crate) fn reverse_expression(
     Ok(match setting.one_value()? {
         OneValue::Typed(DataType::Text) => reverse_pattern(setting),
         OneValue::Typed(declared) => cast(declared.clone()),
-        OneValue::Document => cast(DataType::JSONB),
+        OneValue::Document(_) => cast(DataType::JSONB),
     })
 }
 
@@ -518,7 +1051,10 @@ pub(crate) fn reverse_delimited_set(
     if is_text_type(element) {
         Ok(reverse_pattern(setting))
     } else {
-        Err(Error::reverse_refusal(non_text_elements(&setting.pattern(), element)))
+        Err(Error::SessionVariableCastMissing {
+            pattern: setting.pattern(),
+            declared: element.to_string(),
+        })
     }
 }
 

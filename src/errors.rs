@@ -247,6 +247,33 @@ pub enum Error {
         /// The type the statement casts to.
         written: String,
     },
+    /// Error when a statement reads a value of a type other than text without
+    /// the cast to that type, which PostgreSQL refuses to compare with the
+    /// column.
+    #[error(
+        "The deployment declares {pattern} as '{declared}', and this statement reads it as text. \
+         Cast it to '{declared}', as PostgreSQL requires to compare it with a column of that \
+         type."
+    )]
+    SessionVariableCastMissing {
+        /// The setting, or the field of one, the statement reads.
+        pattern: String,
+        /// The type the deployment declares.
+        declared: String,
+    },
+    /// Error when a declared type has no rule turning its text into the
+    /// replica's stored form.
+    #[error(
+        "The deployment declares {pattern} as '{declared}', and the replica reads it from text \
+         with no rule turning that text into how SQLite stores a '{declared}'. Only text, uuid, \
+         the integer types and boolean are read that way."
+    )]
+    SessionVariableTypeUnreadable {
+        /// The setting, or the field of one, the statement reads.
+        pattern: String,
+        /// The type the deployment declares.
+        declared: String,
+    },
     /// Error when a statement reads a session setting that holds a set as one
     /// value.
     #[error(
@@ -285,6 +312,20 @@ pub enum Error {
         declared: String,
         /// How the statement unpacks it.
         written: String,
+    },
+    /// Error when a statement reads a field of a JSON setting the deployment
+    /// does not declare.
+    #[error(
+        "{pattern} reads the field {path}, which the deployment does not declare among the \
+         setting's fields ({declared}). Declare the field, or read a declared one."
+    )]
+    SessionJsonFieldNotDeclared {
+        /// The setting the statement reads.
+        pattern: String,
+        /// The path the statement reads, its keys joined by `->`.
+        path: String,
+        /// The declared paths, comma separated.
+        declared: String,
     },
     /// Error when attempting to access an RLS backing table directly.
     #[error(

@@ -18,11 +18,11 @@ use sql_traits::{
 };
 use sqlparser::{
     ast::{
-        AccessExpr, Array, BinaryOperator, CaseWhen, CastKind, DataType, DateTimeField,
-        ExactNumberInfo, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
-        InTarget, Interval, JsonKeyUniqueness, JsonPredicateType, ObjectName, ObjectNamePart,
-        Query, SelectItem, SetExpr, Subscript, TableAlias, TableFactor, UnaryOperator, Value,
-        ValueWithSpan, helpers::attached_token::AttachedToken,
+        AccessExpr, Array, ArrayElemTypeDef, BinaryOperator, CaseWhen, CastKind, DataType,
+        DateTimeField, ExactNumberInfo, Expr, Function, FunctionArg, FunctionArgExpr,
+        FunctionArguments, Ident, InTarget, Interval, JsonKeyUniqueness, JsonPredicateType,
+        ObjectName, ObjectNamePart, Query, SelectItem, SetExpr, Subscript, TableAlias, TableFactor,
+        UnaryOperator, Value, ValueWithSpan, helpers::attached_token::AttachedToken,
     },
     tokenizer::Span,
 };
@@ -332,10 +332,6 @@ fn translate_boolean_cast(
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Expr, crate::errors::Error> {
-    const TRUE_SPELLINGS: [&str; 9] = ["t", "tr", "tru", "true", "y", "ye", "yes", "on", "1"];
-    const FALSE_SPELLINGS: [&str; 10] =
-        ["f", "fa", "fal", "fals", "false", "n", "no", "of", "off", "0"];
-
     if let Some(text) = single_quoted_literal(expr) {
         let spelling = text.trim().to_ascii_lowercase();
         if TRUE_SPELLINGS.contains(&spelling.as_str()) {
@@ -350,14 +346,25 @@ fn translate_boolean_cast(
         )));
     }
 
-    let value = expr.translate_with_warnings(schema, options, emit)?;
+    Ok(boolean_from_text(expr.translate_with_warnings(schema, options, emit)?))
+}
+
+/// The spellings PostgreSQL reads as true.
+const TRUE_SPELLINGS: [&str; 9] = ["t", "tr", "tru", "true", "y", "ye", "yes", "on", "1"];
+/// The spellings PostgreSQL reads as false.
+const FALSE_SPELLINGS: [&str; 10] =
+    ["f", "fa", "fal", "fals", "false", "n", "no", "of", "off", "0"];
+
+/// The boolean PostgreSQL reads from the translated `value`, as 1 or 0, and
+/// an error for any other text, as `boolin` raises.
+pub(crate) fn boolean_from_text(value: Expr) -> Expr {
     let normalized = simple_function_expr(
         "lower",
         vec![simple_function_expr("trim", vec![value.clone()], None)],
         None,
     );
 
-    Ok(Expr::Case {
+    Expr::Case {
         case_token: AttachedToken::empty(),
         end_token: AttachedToken::empty(),
         operand: None,
@@ -407,7 +414,7 @@ fn translate_boolean_cast(
             ],
             None,
         ))),
-    })
+    }
 }
 
 /// The word PostgreSQL renders a boolean literal as, when `expr` is one.
@@ -1792,9 +1799,11 @@ fn declared_collation(
 /// `x = ANY(string_to_array(a, d))`, and its `<> ALL` negation, as the
 /// [`delimited_membership`] search.
 ///
-/// A text operand that is a session setting has to be declared a set of text
-/// joined by `d`, and is read by
-/// [`delimited_set_membership`](session_variable::delimited_set_membership).
+/// A text operand that is a session setting has to be declared a set joined
+/// by `d`, and is read by
+/// [`delimited_set_membership`](session_variable::delimited_set_membership),
+/// which also reads the element cast `string_to_array(a, d)::T[]` the
+/// declared element type asks for.
 ///
 /// `Ok(None)` when the operand is not a `string_to_array` call, which leaves
 /// the call refused everywhere no membership test consumes it: the array
@@ -1807,7 +1816,14 @@ fn translate_delimited_membership(
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Option<Expr>, crate::errors::Error> {
-    let Some(arguments) = string_to_array_arguments(right) else { return Ok(None) };
+    let (call, element_cast) = match right {
+        Expr::Cast { expr, data_type: DataType::Array(element), format: None, .. } => {
+            let ArrayElemTypeDef::SquareBracket(element, _) = element else { return Ok(None) };
+            (expr.as_ref(), Some(element.as_ref()))
+        }
+        _ => (right, None),
+    };
+    let Some(arguments) = string_to_array_arguments(call) else { return Ok(None) };
     let [text, delimiter] = arguments else {
         return Err(crate::errors::Error::forward_refusal(
             "Only the two-argument string_to_array(text, delimiter) has a membership test in \
@@ -1841,6 +1857,9 @@ fn translate_delimited_membership(
             })?;
             Split::Setting { name, written }
         }
+        // A typed array over any other text is left to the refusal the cast
+        // answers, since only a declared set says what its elements hold.
+        None if element_cast.is_some() => return Ok(None),
         None => Split::Text(membership_delimiter(delimiter)?),
     };
     match effective_collation(left, text, schema, options)? {
@@ -1875,6 +1894,7 @@ fn translate_delimited_membership(
                 translated_left,
                 &name,
                 written,
+                element_cast,
                 negated,
                 options,
             )
@@ -2009,6 +2029,20 @@ fn translate_any_all_to_in(
 ) -> Result<Expr, crate::errors::Error> {
     if let Some(membership) =
         translate_delimited_membership(left, right, negated, schema, options, emit)?
+    {
+        return Ok(membership);
+    }
+    let collected = match right {
+        Expr::Subquery(query) => Some(query.as_ref()),
+        _ => crate::impls::function_helpers::array_constructor_subquery(right),
+    };
+    if let Some(query) = collected
+        && let Some(membership) = session_variable::json_set_membership(
+            || left.translate_with_warnings(schema, options, emit),
+            query,
+            negated,
+            options,
+        )?
     {
         return Ok(membership);
     }
@@ -4627,6 +4661,14 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                          in an IN list."
                             .to_string(),
                     ));
+                }
+                if let Some(membership) = session_variable::json_set_membership(
+                    || operand.translate_with_warnings(schema, options, emit),
+                    subquery,
+                    *negated,
+                    options,
+                )? {
+                    return Ok(membership);
                 }
                 match helper_membership(subquery, schema, options, emit)? {
                     Some(set) => {

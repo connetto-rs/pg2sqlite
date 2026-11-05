@@ -1165,7 +1165,7 @@ pub(crate) fn translate_set_returning_factor(
         }
     }
 
-    let translated_document = document.translate_with_warnings(schema, options, emit)?;
+    let translated_document = expanded_document(name, shape, document, schema, options, emit)?;
     let mut subquery = make_query(
         None,
         SetExpr::Select(Box::new(make_simple_select(
@@ -1188,6 +1188,32 @@ pub(crate) fn translate_set_returning_factor(
         }),
         sample: None,
     })
+}
+
+/// The document a set-returning JSON function expands, translated.
+///
+/// A set a session setting holds expands from its paired call, since read as
+/// one value it is refused.
+fn expanded_document(
+    name: &ObjectName,
+    shape: JsonSetShape,
+    document: &Expr,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Expr, Error> {
+    let Some(set) = crate::impls::session_variable::json_set(document, options) else {
+        return document.translate_with_warnings(schema, options, emit);
+    };
+    let set = set?;
+    if !matches!(shape, JsonSetShape::Value) {
+        return Err(Error::forward_refusal(format!(
+            "{name}() reads {}, which the deployment declares as a set, and a set is expanded \
+             only into its elements, with jsonb_array_elements_text.",
+            set.pattern
+        )));
+    }
+    Ok(set.array)
 }
 
 /// The expressions of a `FROM` function's argument list.
