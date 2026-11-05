@@ -653,6 +653,7 @@ impl Pg2Sqlite {
 
         let statements = &self.pg_statements;
         crate::impls::translator_impls::rls::ensure_usable_rls_table_suffix(options)?;
+        crate::impls::session_variable::check_mappings(options)?;
         Self::reject_rename_of_secured_table(statements)?;
         if let Some(alter_view_as) = statements.iter().find(|statement| {
             matches!(

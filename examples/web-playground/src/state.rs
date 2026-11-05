@@ -5,7 +5,11 @@
 //! a checkbox in the Advanced options, and vice versa.
 
 use dioxus::prelude::*;
-use pg2sqlite::prelude::{ ArrayRepresentation, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation, };
+use pg2sqlite::prelude::{
+    ArrayRepresentation, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation,
+};
+use sql_traits::structs::{Deployment, SessionSetting, SettingValue};
+use sqlparser::{ast::DataType, dialect::PostgreSqlDialect, parser::Parser};
 
 use crate::{runner::QueryOutcome, samples::SAMPLES};
 
@@ -42,6 +46,26 @@ pub struct TranslationStats {
     pub elapsed_ms: f64,
 }
 
+/// One session-variable entry the user configured: the setting
+/// `current_setting` reads, the PostgreSQL type its values carry, and the
+/// SQLite function the replica registers as its answer.
+#[derive(Clone, PartialEq)]
+pub struct SessionVarEntry {
+    pub setting: String,
+    pub pg_type: String,
+    pub function: String,
+}
+
+impl Default for SessionVarEntry {
+    fn default() -> Self {
+        Self {
+            setting: String::new(),
+            pg_type: "text".to_string(),
+            function: String::new(),
+        }
+    }
+}
+
 /// Mirrors `Pg2SqliteOptions` with plain public fields. The upstream builder
 /// can only set fields, never clear them, so we rebuild from scratch each
 /// translation.
@@ -56,7 +80,7 @@ pub struct WebOptions {
     pub uuid_v7_function_name: String,
     /// Empty means "don't configure", which is fine for non-RLS schemas.
     pub rls_audit_table_name: String,
-    pub session_variables: Vec<SessionVariableMapping>,
+    pub session_variables: Vec<SessionVarEntry>,
 }
 
 impl Default for WebOptions {
@@ -90,11 +114,48 @@ impl WebOptions {
         if !self.rls_audit_table_name.is_empty() {
             opts = opts.with_rls_audit_table_name(self.rls_audit_table_name.clone());
         }
-        for mapping in &self.session_variables {
-            opts = opts.with_session_variable(mapping.clone());
+        // An entry whose type does not parse, or whose name is no custom
+        // setting name, is skipped from the deployment, so a read of that
+        // setting is refused as undeclared.
+        let mut settings = Vec::new();
+        let mut functions: Vec<(String, String)> = Vec::new();
+        for entry in &self.session_variables {
+            if functions
+                .iter()
+                .any(|(declared, _)| declared.eq_ignore_ascii_case(&entry.setting))
+            {
+                continue;
+            }
+            let Some(data_type) = parse_pg_type(&entry.pg_type) else {
+                continue;
+            };
+            let Ok(setting) =
+                SessionSetting::value(&entry.setting, SettingValue::Scalar(data_type))
+            else {
+                continue;
+            };
+            settings.push(setting.may_be_unset());
+            functions.push((entry.setting.clone(), entry.function.clone()));
+        }
+        if !functions.is_empty() {
+            // No acting role is named, so a role reading is refused before any role check.
+            let deployment =
+                Deployment::new("app", ["app"], settings).expect("a valid deployment");
+            opts = opts.with_deployment(deployment);
+            for (setting, function) in functions {
+                opts = opts.with_session_variable(SessionVariableMapping::new(setting, function));
+            }
         }
         opts
     }
+}
+
+/// The PostgreSQL type `spelling` names, if it names one.
+fn parse_pg_type(spelling: &str) -> Option<DataType> {
+    Parser::new(&PostgreSqlDialect {})
+        .try_with_sql(spelling)
+        .and_then(|mut parser| parser.parse_data_type())
+        .ok()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]

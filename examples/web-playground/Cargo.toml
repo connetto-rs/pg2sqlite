@@ -33,6 +33,11 @@ sqlite-wasm-rs = "0.5"
 sqlitegis = { version = "0.2.0", default-features = false, features = ["sqlite"] }
 sqlite-wasm-vec = "0.1"
 
+# The deployment `WebOptions::to_options` builds: setting declarations of the
+# type the user types, and the function names the replica registers.
+sqlparser = { version = "0.64", default-features = false }
+sql-traits = { git = "https://github.com/connetto-rs/sql-traits", branch = "main", default-features = false }
+
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [

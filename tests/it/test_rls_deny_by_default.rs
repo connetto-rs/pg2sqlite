@@ -25,6 +25,8 @@
 use diesel::{connection::SimpleConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 
+use crate::helpers::deployment::{caller, deployment};
+
 diesel::define_sql_function! {
     /// Resolves the session user the RLS policies compare rows against.
     fn current_app_user() -> diesel::sql_types::BigInt;
@@ -71,10 +73,8 @@ fn rls_opts() -> Pg2SqliteOptions {
         .with_sqlitegis_enabled()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_rls_audit_table_name("rls_violations")
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ))
+        .with_deployment(deployment([], [caller("app.user_id", "integer")]))
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
 }
 
 const SCHEMA_SELECT_INSERT_ONLY: &str = "\

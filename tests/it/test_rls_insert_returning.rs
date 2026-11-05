@@ -11,6 +11,8 @@
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 use rusqlite::Connection;
 
+use crate::helpers::deployment::{caller, deployment};
+
 const RLS_SCHEMA: &str = "\
 CREATE TABLE documents (
     id INTEGER PRIMARY KEY,
@@ -37,10 +39,8 @@ fn opts() -> Pg2SqliteOptions {
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_rls_audit_table_name("rls_violations")
         .with_strict_rls_validation()
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ))
+        .with_deployment(deployment([], [caller("app.user_id", "integer")]))
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
 }
 
 fn translate(schema: &str, opts: &Pg2SqliteOptions) -> String {
@@ -174,10 +174,8 @@ fn insert_returning_through_custom_rls_suffix() {
         .with_rls_audit_table_name("rls_violations")
         .with_strict_rls_validation()
         .with_rls_table_suffix("_inner")
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ));
+        .with_deployment(deployment([], [caller("app.user_id", "integer")]))
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"));
     let translated = Pg2Sqlite::default()
         .sql(&format!(
             "{RLS_SCHEMA};\nINSERT INTO documents (owner_id, title) VALUES (42, 'x') RETURNING id;"
@@ -226,10 +224,8 @@ fn monitor_opts() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_rls_audit_table_name("rls_violations")
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ))
+        .with_deployment(deployment([], [caller("app.user_id", "integer")]))
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
 }
 
 fn translate_error(pg_query: &str, opts: &Pg2SqliteOptions) -> String {

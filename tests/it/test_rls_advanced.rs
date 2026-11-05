@@ -10,17 +10,17 @@
 
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
 
-use crate::{helpers, helpers::deployment::deployment};
+use crate::{
+    helpers,
+    helpers::deployment::{caller, deployment, scalar},
+};
 
 fn make_options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
-        .with_deployment(deployment(["authenticated"], []))
+        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "integer")]))
         .with_acting_role("authenticated".to_string())
         .with_rls_audit_table_name("rls_audit".to_string())
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ))
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
 }
 
 fn translate(sql: &str) -> String {
@@ -287,9 +287,9 @@ fn missing_session_variable_mapping_error() {
             FOR SELECT TO authenticated
             USING (org_id = current_setting('app.org_id')::text);
     "#;
-    // Options that don't include mapping for 'app.org_id'
+    // Options that declare the setting but don't map it
     let options = Pg2SqliteOptions::default()
-        .with_deployment(deployment(["authenticated"], []))
+        .with_deployment(deployment(["authenticated"], [scalar("app.org_id", "text")]))
         .with_acting_role("authenticated".to_string())
         .with_rls_audit_table_name("rls_audit".to_string());
 
@@ -326,13 +326,13 @@ fn missing_one_of_multiple_current_setting_mappings_errors() {
     "#;
     // Only app.user_id is mapped; app.org_id is missing and should error.
     let options = Pg2SqliteOptions::default()
-        .with_deployment(deployment(["authenticated"], []))
+        .with_deployment(deployment(
+            ["authenticated"],
+            [caller("app.user_id", "text"), scalar("app.org_id", "text")],
+        ))
         .with_acting_role("authenticated".to_string())
         .with_rls_audit_table_name("rls_audit".to_string())
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ));
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"));
 
     let result = Pg2Sqlite::default()
         .sql(sql)
@@ -618,12 +618,9 @@ fn missing_audit_table_name_error() {
             USING (owner_id = CAST(current_setting('app.user_id') AS INT));
     "#;
     let options = Pg2SqliteOptions::default()
-        .with_deployment(deployment(["authenticated"], []))
+        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "integer")]))
         .with_acting_role("authenticated".to_string())
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ));
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"));
     // No audit table name configured
     let result = Pg2Sqlite::default()
         .sql(sql)
@@ -1266,12 +1263,17 @@ fn policy_with_cast_on_session_var() {
             USING (tenant_id = current_setting('app.user_id')::text);
         GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
     "#;
-    let output = translate(sql);
+    let options = Pg2SqliteOptions::default()
+        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "text")]))
+        .with_acting_role("authenticated".to_string())
+        .with_rls_audit_table_name("rls_audit".to_string())
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"));
+    let output = translate_with_options(sql, &options);
     assert!(
         output.contains("current_app_user()"),
         "Expected cast to be removed and function mapped: {output}"
     );
-    execute_rls_ddl(sql);
+    execute_rls_ddl_with_opts(sql, &options);
 }
 
 #[test]
@@ -1528,9 +1530,9 @@ fn missing_schema_qualified_current_setting_mapping_error() {
             FOR SELECT TO authenticated
             USING (owner_id = CAST(pg_catalog.current_setting('app.user_id') AS INT));
     "#;
-    // Options intentionally omit current_setting mapping.
+    // Options that declare the setting but intentionally omit its mapping.
     let options = Pg2SqliteOptions::default()
-        .with_deployment(deployment(["authenticated"], []))
+        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "integer")]))
         .with_acting_role("authenticated".to_string())
         .with_rls_audit_table_name("rls_audit".to_string());
 

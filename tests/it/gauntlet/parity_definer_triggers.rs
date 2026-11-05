@@ -10,7 +10,10 @@ use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
 use postgres_harness::{Outcome, apply, fresh_database, set_session_user};
 
-use crate::helpers::postgres as postgres_harness;
+use crate::helpers::{
+    deployment::{caller, deployment},
+    postgres as postgres_harness,
+};
 
 /// The roles, created once per cluster on PostgreSQL and declared in the
 /// translated source.
@@ -159,10 +162,8 @@ type Grant = (String, String, String);
 
 fn options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "definer_app_user",
-        ))
+        .with_deployment(deployment([], [caller("app.user_id", "text")]))
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "definer_app_user"))
         .with_rls_audit_table_name("rls_audit")
         .with_write_exemption_function("definer_write_exempt")
 }

@@ -5,7 +5,10 @@
 
 use pg2sqlite::prelude::{ArrayRepresentation, Pg2SqliteOptions, SessionVariableMapping};
 
-use crate::helpers;
+use crate::{
+    helpers,
+    helpers::deployment::{caller, deployment},
+};
 
 const SCHEMA: &str = "
 CREATE TABLE projects (id TEXT PRIMARY KEY, owner TEXT NOT NULL, tags TEXT[]);
@@ -19,7 +22,8 @@ fn options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_rls_audit_table_name("rls_audit")
         .with_array_representation(ArrayRepresentation::Json)
-        .with_session_variable(SessionVariableMapping::current_setting("app.user_id", "app_user"))
+        .with_deployment(deployment([], [caller("app.user_id", "text")]))
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "app_user"))
 }
 
 fn translate(statements: &str) -> Result<Vec<String>, pg2sqlite::errors::Error> {

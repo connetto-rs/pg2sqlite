@@ -1,8 +1,6 @@
 //! Curated sample schemas surfaced in the Step 1 dropdown.
 
-use pg2sqlite::prelude::SessionVariableMapping;
-
-use crate::state::{QueryDialect, WebOptions};
+use crate::state::{QueryDialect, SessionVarEntry, WebOptions};
 
 /// A picker entry.
 pub struct Sample {
@@ -431,13 +429,15 @@ fn postgis_options(opts: &mut WebOptions) {
 
 fn rls_options(opts: &mut WebOptions) {
     // Maps `current_setting('app.user_id')` to a SQLite UDF call
-    // `current_app_user()`.
+    // `current_app_user()`; the type is the one the sample's policies cast
+    // it to.
     *opts = WebOptions {
         rls_audit_table_name: "rls_violations".to_string(),
-        session_variables: vec![SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        )],
+        session_variables: vec![SessionVarEntry {
+            setting: "app.user_id".to_string(),
+            pg_type: "integer".to_string(),
+            function: "current_app_user".to_string(),
+        }],
         ..WebOptions::default()
     };
 }

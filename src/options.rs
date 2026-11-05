@@ -16,9 +16,7 @@ use sql_traits::structs::{
     ColumnDefinition, ColumnDefinitionScope, ColumnQueryScope, ColumnScope, Deployment, ParserDB,
 };
 
-use crate::traits::{
-    ArrayRepresentation, SessionVariableMapping, SessionVariablePattern, UuidRepresentation,
-};
+use crate::traits::{ArrayRepresentation, SessionVariableMapping, UuidRepresentation};
 
 /// Tables whose storage lives in a database attached to the replica's
 /// connection, set with [`Pg2SqliteOptions::with_attached_tables`].
@@ -86,7 +84,7 @@ pub struct Pg2SqliteOptions {
     acting_role: Option<String>,
     /// The role the schema's statements run as, owning what they create.
     schema_owner_role: Option<String>,
-    /// Mappings from PostgreSQL session variable patterns to SQLite functions.
+    /// The SQLite functions answering the deployment's session settings.
     session_variables: Vec<SessionVariableMapping>,
     /// The roles and session settings the deployment's requests run with.
     deployment: Option<Deployment>,
@@ -806,7 +804,8 @@ impl Pg2SqliteOptions {
     }
 
     #[must_use]
-    /// Adds a PostgreSQL session variable mapping.
+    /// Pairs a session setting the deployment declares with the SQLite
+    /// function the replica answers it with.
     pub fn with_session_variable(mut self, mapping: SessionVariableMapping) -> Self {
         self.session_variables.push(mapping);
         self
@@ -819,22 +818,21 @@ impl Pg2SqliteOptions {
     }
 
     #[must_use]
-    /// Returns the last mapping for the requested session variable pattern.
-    pub fn find_session_variable(
-        &self,
-        pattern: &SessionVariablePattern,
-    ) -> Option<&SessionVariableMapping> {
-        self.session_variables.iter().rev().find(|m| &m.pg_pattern == pattern)
+    /// Returns the last mapping for `setting`, compared without case as
+    /// PostgreSQL compares setting names.
+    pub fn find_session_variable(&self, setting: &str) -> Option<&SessionVariableMapping> {
+        self.session_variables.iter().rev().find(|m| m.setting.eq_ignore_ascii_case(setting))
     }
 
     #[must_use]
     /// Sets the deployment whose requests the translation serves.
     ///
-    /// The deployment declares the login role `session_user` answers and the
+    /// The deployment declares the login role `session_user` answers, the
     /// acting roles [`with_acting_role`](Self::with_acting_role) chooses
-    /// from, and a policy calling a `SECURITY DEFINER` helper translates as
-    /// the set the helper returns for the caller it declares. A statement
-    /// reading a role, or calling such a helper, is refused without one.
+    /// from, and every session setting a statement reads: its type, how a set
+    /// is packed, the fields of a JSON document and whether a request may
+    /// leave it unset. A statement reading a setting or a role is refused
+    /// without one.
     pub fn with_deployment(mut self, deployment: Deployment) -> Self {
         self.deployment = Some(deployment);
         self

@@ -1,14 +1,8 @@
-//! What a statement reads of the session, for everything that reads it.
+//! What a statement reads of the session, answered from the deployment.
 //!
 //! The role keywords become the names the deployment and `with_acting_role`
-//! give. A setting becomes the call a mapping pairs it with: going out the
-//! pattern becomes the paired call and any cast over it is dropped, and coming
-//! back the paired call becomes the pattern again, cast to the type the mapping
-//! records.
-//!
-//! The mapping also states what the setting holds, and a reading that
-//! disagrees with it is refused in either direction: a set is read only
-//! through a membership test, a scalar never is.
+//! give. A setting becomes the call a mapping pairs it with, read only the way
+//! the deployment declares it, and refused in either direction otherwise.
 
 #[cfg(not(feature = "std"))]
 use alloc::{
@@ -21,7 +15,10 @@ use alloc::{
 use core::fmt;
 
 use sql_traits::{
-    structs::{Deployment, ParserDB},
+    structs::{
+        Deployment, ParserDB, SessionSetting, SetPacking, SettingContent, SettingPresence,
+        SettingValue,
+    },
     traits::DatabaseLike,
 };
 use sqlparser::ast::{
@@ -33,7 +30,7 @@ use crate::{
     errors::Error,
     impls::function_helpers::{simple_function_expr, single_quoted_literal, string_literal},
     options::Pg2SqliteOptions,
-    traits::{SessionVariableMapping, SessionVariablePattern, SessionVariableValue},
+    traits::SessionVariableMapping,
 };
 
 /// The lower-cased last part of a function's name.
@@ -46,9 +43,6 @@ pub(crate) fn function_name_lower(name: &ObjectName) -> String {
 }
 
 /// The setting a `current_setting` call names, when it names one literally.
-///
-/// The second argument, PostgreSQL's `missing_ok`, is not read: both arities
-/// answer the same setting, so both pair with the same function.
 #[must_use]
 fn setting_name(args: &FunctionArguments) -> Option<String> {
     let FunctionArguments::List(FunctionArgumentList { args, .. }) = args else {
@@ -115,12 +109,6 @@ pub(crate) fn session_read(expr: &Expr) -> Option<SessionRead> {
     }
 }
 
-/// The mapping pattern of the setting `name`.
-#[must_use]
-pub(crate) fn setting_pattern(name: &str) -> SessionVariablePattern {
-    SessionVariablePattern::CurrentSetting { name: name.to_string() }
-}
-
 /// The deployment a reading of `reading` needs.
 fn deployment<'o>(
     options: &'o Pg2SqliteOptions,
@@ -177,12 +165,7 @@ pub(crate) fn check_read(
     context: &str,
 ) -> Result<(), Error> {
     match read {
-        SessionRead::Setting(name) => {
-            let pattern = setting_pattern(name);
-            options.find_session_variable(&pattern).map(drop).ok_or_else(|| {
-                Error::SessionVariableMappingNotFound { pattern: format!("{pattern}{context}") }
-            })
-        }
+        SessionRead::Setting(name) => setting_in(name, options, context).map(drop),
         SessionRead::ActingRole(spelling) => {
             acting_role_in_deployment(options)?.map(drop).ok_or_else(|| {
                 Error::ActingRoleRequired { reading: format!("{spelling}{context}") }
@@ -201,60 +184,270 @@ fn role_literal(name: &str, deployment: &Deployment, schema: &ParserDB) -> Resul
     Ok(string_literal(name))
 }
 
+/// A setting the deployment declares and a mapping pairs.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Setting<'o> {
+    declared: &'o SessionSetting,
+    mapping: &'o SessionVariableMapping,
+}
+
+/// What a setting read as one value holds.
+enum OneValue<'o> {
+    /// A value of the declared type.
+    Typed(&'o DataType),
+    /// A JSON document.
+    Document,
+}
+
+impl<'o> Setting<'o> {
+    /// The setting as messages name it.
+    fn pattern(self) -> String {
+        format!("current_setting('{}')", self.declared.name())
+    }
+
+    /// The call the replica makes instead of reading the setting.
+    fn call(self) -> Expr {
+        paired_call(self.mapping)
+    }
+
+    /// What the setting holds read as one value, refusing a set.
+    fn one_value(self) -> Result<OneValue<'o>, Error> {
+        match self.declared.content() {
+            SettingContent::Value(
+                SettingValue::Caller(declared) | SettingValue::Scalar(declared),
+            ) => Ok(OneValue::Typed(declared)),
+            SettingContent::Value(SettingValue::Set { packing, .. }) => {
+                Err(Error::SessionVariableReadAsScalar {
+                    pattern: self.pattern(),
+                    packing: packing_description(packing),
+                })
+            }
+            SettingContent::Json(_) => Ok(OneValue::Document),
+        }
+    }
+
+    /// The element type of the set the setting joins by `written`, refusing
+    /// one value, a document and another packing.
+    fn delimited_set(self, written: &str) -> Result<&'o DataType, Error> {
+        match self.declared.content() {
+            SettingContent::Value(value) => {
+                packed_set(
+                    &self.pattern(),
+                    value,
+                    |packing| matches!(packing, SetPacking::Delimited(delimiter) if delimiter == written),
+                    &format!("joined by '{written}'"),
+                )
+            }
+            SettingContent::Json(_) => Err(json_document(self)),
+        }
+    }
+}
+
+/// The element type of `value` when it is a set whose packing `wanted`
+/// accepts, refusing one value and another packing, `written` saying how the
+/// statement unpacks it.
+fn packed_set<'v>(
+    pattern: &str,
+    value: &'v SettingValue,
+    wanted: impl Fn(&SetPacking) -> bool,
+    written: &str,
+) -> Result<&'v DataType, Error> {
+    match value {
+        SettingValue::Set { element, packing } if wanted(packing) => Ok(element),
+        SettingValue::Set { packing, .. } => {
+            Err(Error::SessionVariablePackingDisagrees {
+                pattern: pattern.to_string(),
+                declared: packing_description(packing),
+                written: written.to_string(),
+            })
+        }
+        SettingValue::Caller(_) | SettingValue::Scalar(_) => {
+            Err(Error::SessionVariableReadAsSet {
+                pattern: pattern.to_string(),
+                written: written.to_string(),
+            })
+        }
+    }
+}
+
+/// The call the replica makes instead of reading the setting.
+#[must_use]
+fn paired_call(mapping: &SessionVariableMapping) -> Expr {
+    simple_function_expr(&mapping.sqlite_function, vec![], None)
+}
+
+/// Refuses a mapping that pairs a setting the deployment does not declare.
+pub(crate) fn check_mappings(options: &Pg2SqliteOptions) -> Result<(), Error> {
+    let Some(first) = options.get_session_variables().first() else { return Ok(()) };
+    let deployment = deployment(
+        options,
+        &format_args!("the mapping of '{}' to {}()", first.setting, first.sqlite_function),
+    )?;
+    for mapping in options.get_session_variables() {
+        if deployment.setting(&mapping.setting).is_none() {
+            return Err(Error::MappedSettingNotDeclared {
+                setting: mapping.setting.clone(),
+                sqlite_function: mapping.sqlite_function.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The setting `name` as the deployment declares it and a mapping pairs it.
+pub(crate) fn setting<'o>(name: &str, options: &'o Pg2SqliteOptions) -> Result<Setting<'o>, Error> {
+    setting_in(name, options, "")
+}
+
+/// [`setting`], its refusals naming the setting followed by `context`.
+fn setting_in<'o>(
+    name: &str,
+    options: &'o Pg2SqliteOptions,
+    context: &str,
+) -> Result<Setting<'o>, Error> {
+    let pattern = || format!("current_setting('{name}'){context}");
+    let deployment = deployment(options, &pattern())?;
+    check_mappings(options)?;
+    let declared = deployment
+        .setting(name)
+        .ok_or_else(|| Error::SessionSettingNotDeclared { pattern: pattern() })?;
+    let mapping = options
+        .find_session_variable(name)
+        .ok_or_else(|| Error::SessionVariableMappingNotFound { pattern: pattern() })?;
+    Ok(Setting { declared, mapping })
+}
+
+/// How the deployment packs a set, as messages say it.
+fn packing_description(packing: &SetPacking) -> String {
+    match packing {
+        SetPacking::Delimited(delimiter) => format!("joined by '{delimiter}'"),
+        SetPacking::JsonArray => "packed as a JSON array".to_string(),
+    }
+}
+
+/// Refuses reading a JSON setting, whose fields have no SQLite reading.
+fn json_document(setting: Setting<'_>) -> Error {
+    Error::forward_refusal(format!(
+        "The deployment declares {} as a JSON document, and reading a JSON setting has no \
+         SQLite translation.",
+        setting.pattern()
+    ))
+}
+
 /// What reading the session as one value becomes.
 pub(crate) fn translate_session_read(
     read: &SessionRead,
     schema: &ParserDB,
     options: &Pg2SqliteOptions,
 ) -> Result<Expr, Error> {
-    match read {
+    let name = match read {
         SessionRead::ActingRole(spelling) => {
             let (role, deployment) = acting_role_in_deployment(options)?
                 .ok_or_else(|| Error::ActingRoleRequired { reading: (*spelling).to_string() })?;
-            role_literal(role, deployment, schema)
+            return role_literal(role, deployment, schema);
         }
         SessionRead::LoginRole => {
             let deployment = deployment(options, &"session_user")?;
-            role_literal(deployment.login_role(), deployment, schema)
+            return role_literal(deployment.login_role(), deployment, schema);
         }
-        SessionRead::Setting(name) => {
-            let pattern = setting_pattern(name);
-            let mapping =
-                options.find_session_variable(&pattern).ok_or_else(|| unpaired(&pattern))?;
-            scalar_reading(mapping)?;
-            Ok(paired_call(mapping))
-        }
+        SessionRead::Setting(name) => name,
+    };
+    let setting = setting(name, options)?;
+    match setting.one_value()? {
+        OneValue::Typed(_) => Ok(setting.call()),
+        OneValue::Document => Err(json_document(setting)),
     }
 }
 
-/// What `expr` becomes when it reads a role, or `None` when it reads none.
-///
-/// A setting is left to the function path, which also passes through a
-/// `current_setting` the caller declared as its own function.
+/// What `expr` becomes when it reads the session as one value, or `None` when
+/// it reads nothing of the session.
 pub(crate) fn translate_expr_read(
     expr: &Expr,
     schema: &ParserDB,
     options: &Pg2SqliteOptions,
 ) -> Result<Option<Expr>, Error> {
     match session_read(expr) {
-        Some(read @ (SessionRead::ActingRole(_) | SessionRead::LoginRole)) => {
-            translate_session_read(&read, schema, options).map(Some)
-        }
-        Some(SessionRead::Setting(_)) | None => Ok(None),
+        Some(read) => translate_session_read(&read, schema, options).map(Some),
+        None => Ok(None),
     }
 }
 
-/// The call the replica makes instead of the pattern.
-#[must_use]
-pub(crate) fn paired_call(mapping: &SessionVariableMapping) -> Expr {
-    simple_function_expr(&mapping.sqlite_function, vec![], None)
+/// What a cast over a session reading becomes, or `None` when the inner
+/// expression reads nothing of the session.
+pub(crate) fn translate_cast(
+    inner: &Expr,
+    data_type: &DataType,
+    options: &Pg2SqliteOptions,
+) -> Result<Option<Expr>, Error> {
+    let Expr::Function(func) = inner else { return Ok(None) };
+    let Some(SessionRead::Setting(name)) = session_read_of_function(func) else {
+        return Ok(None);
+    };
+    let setting = setting(&name, options)?;
+    match setting.one_value()? {
+        OneValue::Typed(declared) if same_postgres_type(declared, data_type) => {
+            Ok(Some(setting.call()))
+        }
+        OneValue::Typed(declared) => {
+            Err(Error::SessionVariableTypeDisagrees {
+                pattern: setting.pattern(),
+                declared: declared.to_string(),
+                written: data_type.to_string(),
+            })
+        }
+        OneValue::Document => Err(json_document(setting)),
+    }
 }
 
-/// The refusal a pattern with no mapping carries.
-#[must_use]
-pub(crate) fn unpaired(pattern: &SessionVariablePattern) -> Error {
-    Error::SessionVariableMappingNotFound { pattern: pattern.to_string() }
+// ── sets ────────────────────────────────────────────────────────────────────
+
+/// Whether `data_type` is stored as the text that renders it.
+fn is_text_type(data_type: &DataType) -> bool {
+    matches!(canonical(data_type), DataType::Text | DataType::Varchar(_))
 }
+
+/// Why a set of `element` values has no `instr()` search.
+fn non_text_elements(pattern: &str, element: &DataType) -> String {
+    format!(
+        "The deployment declares the elements of {pattern} as '{element}', and the instr() search \
+         compares text."
+    )
+}
+
+/// What `x = ANY(string_to_array(<setting>, written))` becomes, the
+/// [`delimited_membership`](crate::impls::idioms::delimited_membership) search
+/// over the paired call.
+///
+/// The search compares text split on one character, so a set of another
+/// element type or joined by a longer delimiter is refused.
+pub(crate) fn delimited_set_membership(
+    translated_left: Expr,
+    name: &str,
+    written: &str,
+    negated: bool,
+    options: &Pg2SqliteOptions,
+) -> Result<Expr, Error> {
+    let setting = setting(name, options)?;
+    let pattern = setting.pattern();
+    let element = setting.delimited_set(written)?;
+    if !is_text_type(element) {
+        return Err(Error::forward_refusal(non_text_elements(&pattern, element)));
+    }
+    let Some(delimiter) = crate::impls::idioms::single_character(written) else {
+        return Err(Error::forward_refusal(format!(
+            "The deployment joins {pattern} by '{written}', and a membership test over \
+             string_to_array() becomes an instr() search, which splits on one character only."
+        )));
+    };
+    Ok(crate::impls::idioms::delimited_membership(
+        translated_left,
+        setting.call(),
+        delimiter,
+        negated,
+    ))
+}
+
+// ── reverse ─────────────────────────────────────────────────────────────────
 
 /// The mapping whose paired function is `name`, when one is installed.
 #[must_use]
@@ -269,97 +462,64 @@ pub(crate) fn mapping_for_function<'a>(
         .find(|mapping| mapping.sqlite_function.eq_ignore_ascii_case(name))
 }
 
-/// Refuses reading a set-valued setting as one value.
-///
-/// # Errors
-///
-/// Returns [`Error::SessionVariableReadAsScalar`] when the mapping declares a
-/// delimited set.
-pub(crate) fn scalar_reading(mapping: &SessionVariableMapping) -> Result<(), Error> {
-    match mapping.value {
-        SessionVariableValue::Scalar { .. } => Ok(()),
-        SessionVariableValue::DelimitedSet { delimiter } => {
-            Err(Error::SessionVariableReadAsScalar {
-                pattern: mapping.pg_pattern.to_string(),
-                delimiter,
-            })
-        }
-    }
-}
-
-/// Refuses a membership test that splits the setting on `written` unless the
-/// mapping declares a set joined by that delimiter.
-///
-/// # Errors
-///
-/// Returns [`Error::SessionVariableReadAsSet`] for a scalar mapping and
-/// [`Error::SessionVariableDelimiterDisagrees`] for a set joined by another
-/// delimiter.
-pub(crate) fn set_reading(mapping: &SessionVariableMapping, written: char) -> Result<(), Error> {
-    let pattern = || mapping.pg_pattern.to_string();
-    match mapping.value {
-        SessionVariableValue::Scalar { .. } => {
-            Err(Error::SessionVariableReadAsSet { pattern: pattern(), written })
-        }
-        SessionVariableValue::DelimitedSet { delimiter } if delimiter == written => Ok(()),
-        SessionVariableValue::DelimitedSet { delimiter } => {
-            Err(Error::SessionVariableDelimiterDisagrees {
-                pattern: pattern(),
-                recorded: delimiter,
-                written,
-            })
-        }
-    }
-}
-
-/// The PostgreSQL pattern the paired function stands for, without the cast.
-///
-/// For a tolerant mapping (`missing_ok = true`, the default) this is
-/// `current_setting(name, true)`, which answers NULL when the setting is unset.
-/// For a strict mapping (`missing_ok = false`) it is `current_setting(name)`
-/// with no second argument, which raises when the setting is unset.
+/// The setting a paired function answers, read as PostgreSQL reads it:
+/// `current_setting(name, true)` for a setting a request may leave unset,
+/// which answers NULL there, and `current_setting(name)` otherwise.
 #[must_use]
-pub(crate) fn reverse_pattern(mapping: &SessionVariableMapping) -> Expr {
-    let SessionVariablePattern::CurrentSetting { name } = &mapping.pg_pattern;
-    if mapping.missing_ok {
-        simple_function_expr(
-            "current_setting",
+pub(crate) fn reverse_pattern(setting: Setting<'_>) -> Expr {
+    let name = string_literal(setting.declared.name());
+    let args = match setting.declared.presence() {
+        SettingPresence::MayBeUnset => {
             vec![
-                string_literal(name),
+                name,
                 Expr::Value(ValueWithSpan {
                     value: Value::Boolean(true),
                     span: sqlparser::tokenizer::Span::empty(),
                 }),
-            ],
-            None,
-        )
-    } else {
-        simple_function_expr("current_setting", vec![string_literal(name)], None)
-    }
+            ]
+        }
+        SettingPresence::Always => vec![name],
+    };
+    simple_function_expr("current_setting", args, None)
 }
 
-/// The PostgreSQL expression the paired function stands for when read as one
-/// value: the pattern, cast to the recorded type when there is one.
-///
-/// # Errors
-///
-/// Returns [`Error::SessionVariableReadAsScalar`] when the mapping declares a
-/// set, and [`Error::SessionVariableTypeUnreadable`] when the recorded type
-/// does not parse.
-pub(crate) fn reverse_expression(mapping: &SessionVariableMapping) -> Result<Expr, Error> {
-    scalar_reading(mapping)?;
-    let pattern = reverse_pattern(mapping);
-    Ok(match mapping.pg_type_node()? {
-        Some(data_type) => {
-            Expr::Cast {
-                expr: Box::new(pattern),
-                data_type,
-                format: None,
-                kind: CastKind::DoubleColon,
-            }
+/// The PostgreSQL expression a paired function stands for when read as one
+/// value: the setting cast to its declared type, or to `jsonb` for a
+/// document.
+pub(crate) fn reverse_expression(
+    mapping: &SessionVariableMapping,
+    options: &Pg2SqliteOptions,
+) -> Result<Expr, Error> {
+    let setting = setting(&mapping.setting, options)?;
+    let cast = |data_type: DataType| {
+        Expr::Cast {
+            expr: Box::new(reverse_pattern(setting)),
+            data_type,
+            format: None,
+            kind: CastKind::DoubleColon,
         }
-        None => pattern,
+    };
+    Ok(match setting.one_value()? {
+        OneValue::Typed(DataType::Text) => reverse_pattern(setting),
+        OneValue::Typed(declared) => cast(declared.clone()),
+        OneValue::Document => cast(DataType::JSONB),
     })
+}
+
+/// The setting a reversed `instr()` search splits on `written`, which the
+/// forward direction emits only for a set of text joined by it.
+pub(crate) fn reverse_delimited_set(
+    mapping: &SessionVariableMapping,
+    written: char,
+    options: &Pg2SqliteOptions,
+) -> Result<Expr, Error> {
+    let setting = setting(&mapping.setting, options)?;
+    let element = setting.delimited_set(&written.to_string())?;
+    if is_text_type(element) {
+        Ok(reverse_pattern(setting))
+    } else {
+        Err(Error::reverse_refusal(non_text_elements(&setting.pattern(), element)))
+    }
 }
 
 /// The refusal a paired function called with arguments carries.
@@ -371,9 +531,9 @@ pub(crate) fn reverse_expression(mapping: &SessionVariableMapping) -> Result<Exp
 #[must_use]
 pub(crate) fn paired_arity_refusal(mapping: &SessionVariableMapping) -> String {
     format!(
-        "{}() pairs with {}, which takes no argument, so a call to it with arguments has no \
-         PostgreSQL equivalent.",
-        mapping.sqlite_function, mapping.pg_pattern
+        "{}() pairs with current_setting('{}'), which takes no argument, so a call to it with \
+         arguments has no PostgreSQL equivalent.",
+        mapping.sqlite_function, mapping.setting
     )
 }
 
@@ -388,52 +548,12 @@ pub(crate) fn call_has_no_arguments(args: &FunctionArguments) -> bool {
     }
 }
 
-/// What a cast over a session variable becomes, or `None` when the inner
-/// expression is not a paired pattern and the ordinary cast path applies.
-///
-/// # Errors
-///
-/// Returns [`Error::SessionVariableReadAsScalar`] when the mapping declares a
-/// set, and [`Error::SessionVariableTypeDisagrees`] when the written cast
-/// names a different type than the mapping records, since the cast is dropped
-/// here and written again from the recorded type on the way back.
-pub(crate) fn translate_cast(
-    inner: &Expr,
-    data_type: &DataType,
-    options: &Pg2SqliteOptions,
-) -> Result<Option<Expr>, Error> {
-    let Expr::Function(func) = inner else {
-        return Ok(None);
-    };
-    let Some(SessionRead::Setting(name)) = session_read_of_function(func) else {
-        return Ok(None);
-    };
-    let pattern = setting_pattern(&name);
-    let Some(mapping) = options.find_session_variable(&pattern) else {
-        return Ok(None);
-    };
-    scalar_reading(mapping)?;
-
-    if let SessionVariableValue::Scalar { pg_type: Some(spelling) } = &mapping.value
-        && let Some(recorded) = mapping.pg_type_node()?
-        && !same_postgres_type(&recorded, data_type)
-    {
-        return Err(Error::SessionVariableTypeDisagrees {
-            pattern: pattern.to_string(),
-            recorded: spelling.clone(),
-            written: data_type.to_string(),
-        });
-    }
-
-    Ok(Some(paired_call(mapping)))
-}
-
 /// Whether two spellings name one PostgreSQL type.
 ///
 /// PostgreSQL's own aliases reach the parser as distinct variants, so `int` and
 /// `integer` compare unequal as nodes while naming the same type. Folding them
-/// is what lets a document keep its own spelling while a mapping records
-/// another.
+/// is what lets a statement keep its own spelling while the deployment
+/// declares another.
 #[must_use]
 pub(crate) fn same_postgres_type(left: &DataType, right: &DataType) -> bool {
     canonical(left) == canonical(right)

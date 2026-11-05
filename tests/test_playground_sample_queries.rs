@@ -34,6 +34,7 @@
 #[expect(dead_code, reason = "this binary uses part of the shared helpers")]
 mod helpers;
 
+use helpers::deployment::{caller, deployment};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 use rusqlite::Connection;
 use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
@@ -335,10 +336,8 @@ fn rls_sample_queries() {
         .with_sqlitegis_enabled()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_rls_audit_table_name("rls_violations")
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ));
+        .with_deployment(deployment(["app"], [caller("app.user_id", "integer")]))
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"));
     let conn = open_connection();
     register_current_app_user(&conn);
     conn.execute_batch(&translate(RLS_SCHEMA, &opts)).expect("apply RLS schema");
@@ -599,10 +598,8 @@ fn rls_sample_reverse_queries() {
         .with_sqlitegis_enabled()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_rls_audit_table_name("rls_violations")
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ));
+        .with_deployment(deployment(["app"], [caller("app.user_id", "integer")]))
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"));
     run_reverse_chips(RLS_SCHEMA, RLS_REVERSE_CHIPS, &opts);
 }
 

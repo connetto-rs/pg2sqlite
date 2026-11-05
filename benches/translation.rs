@@ -122,23 +122,26 @@ fn bench_schema_translation(c: &mut Criterion) {
 }
 
 fn bench_rls_translation(c: &mut Criterion) {
-    // RLS fixtures require session variable configuration
-    let deployment = sql_traits::structs::Deployment::new("authenticated", ["authenticated"], [])
-        .expect("a valid deployment");
+    // RLS fixtures require the deployment declaring the setting their
+    // policies read, paired with the function the replica answers it with.
+    let deployment = sql_traits::structs::Deployment::new(
+        "authenticated",
+        ["authenticated"],
+        [sql_traits::structs::SessionSetting::value(
+            "app.user_id",
+            sql_traits::structs::SettingValue::Caller(sqlparser::ast::DataType::Uuid),
+        )
+        .expect("a custom setting name")
+        .may_be_unset()],
+    )
+    .expect("a valid deployment");
 
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuid7")
         .with_deployment(deployment)
         .with_acting_role("authenticated")
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ))
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.tenant_id",
-            "current_tenant",
-        ))
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
         .with_rls_audit_table_name("rls_violations")
         .with_schema_owner_role("migrator");
 

@@ -8,6 +8,8 @@ use pg2sqlite::prelude::{
     Error, FreshFiles, Pg2Sqlite, Pg2SqliteOptions, Placement, Script, SessionVariableMapping,
 };
 
+use crate::helpers::deployment::{caller, deployment};
+
 diesel::define_sql_function! {
     /// The caller the connection serves.
     fn current_app_user() -> diesel::sql_types::Text;
@@ -95,10 +97,8 @@ const PAPERS: &str = "
 
 fn options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ))
+        .with_deployment(deployment([], [caller("app.user_id", "text")]))
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
         .with_rls_audit_table_name("_rls_audit")
         .with_write_exemption_function("write_is_exempt")
 }

@@ -666,9 +666,9 @@ fn restore_lowered_idiom(
 ///
 /// The search reads its text three times and its left side twice where
 /// PostgreSQL reads each once, so a volatile operand is refused. A text that
-/// is a paired function has to be declared a set joined by `d`, and becomes
-/// the setting directly, since the ordinary function path refuses reading a
-/// set as one value.
+/// is a paired function has to be declared a set of text joined by `d`, and
+/// becomes the setting directly, since the ordinary function path refuses
+/// reading a set as one value.
 ///
 /// The search compares bytes and the restored test compares under the
 /// column's collation, which agree because the forward direction emits the
@@ -689,10 +689,7 @@ fn reverse_delimited_membership(
         }
     }
     let text = match paired_setting(text, options) {
-        Some(mapping) => {
-            session_variable::set_reading(mapping, delimiter)?;
-            session_variable::reverse_pattern(mapping)
-        }
+        Some(mapping) => session_variable::reverse_delimited_set(mapping, delimiter, options)?,
         None => text.reverse_translate(schema, options)?,
     };
     let split = simple_function_expr(

@@ -99,9 +99,7 @@ impl ReplayCheck<'_, '_> {
         let session = session_variable::session_read_of_function(function).is_some_and(|read| {
             match read {
                 session_variable::SessionRead::Setting(setting) => {
-                    self.options
-                        .find_session_variable(&session_variable::setting_pattern(&setting))
-                        .is_some()
+                    self.options.find_session_variable(&setting).is_some()
                 }
                 session_variable::SessionRead::ActingRole(_)
                 | session_variable::SessionRead::LoginRole => true,

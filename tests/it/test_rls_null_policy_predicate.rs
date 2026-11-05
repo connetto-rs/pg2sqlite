@@ -14,6 +14,8 @@
 use diesel::{prelude::*, sqlite::SqliteConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
 
+use crate::helpers::deployment::{caller, deployment};
+
 #[declare_sql_function]
 extern "SQL" {
     /// Returns the session user name mapped from current_setting('app.user').
@@ -63,7 +65,8 @@ CREATE POLICY p ON docs FOR ALL
 fn opts() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_rls_audit_table_name("rls_violations")
-        .with_session_variable(SessionVariableMapping::current_setting("app.user", "app_user"))
+        .with_deployment(deployment([], [caller("app.user", "text")]))
+        .with_session_variable(SessionVariableMapping::new("app.user", "app_user"))
         .with_user_defined_functions(["app_user"])
 }
 

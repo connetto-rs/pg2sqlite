@@ -16,6 +16,10 @@ use pg2sqlite::{
     errors::Error,
     prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping},
 };
+use sql_traits::structs::{SessionSetting, SetPacking, SettingValue};
+use sqlparser::ast::DataType;
+
+use crate::helpers::deployment::{delimited, deployment, scalar};
 
 diesel::define_sql_function! {
     /// Answers the delimited session setting the policy reads.
@@ -205,10 +209,10 @@ CREATE POLICY p ON t USING (owner = ANY(string_to_array(current_setting('app.sub
 ";
 
 fn share_key_options() -> Pg2SqliteOptions {
-    Pg2SqliteOptions::default().with_rls_audit_table_name("rls_violations").with_session_variable(
-        SessionVariableMapping::current_setting("app.subjects", "current_app_subjects")
-            .holding_set(','),
-    )
+    Pg2SqliteOptions::default()
+        .with_rls_audit_table_name("rls_violations")
+        .with_deployment(deployment([], [delimited("app.subjects", ",")]))
+        .with_session_variable(SessionVariableMapping::new("app.subjects", "current_app_subjects"))
 }
 
 fn refusal_under(pg: &str, options: &Pg2SqliteOptions) -> Error {
@@ -219,9 +223,9 @@ fn refusal_under(pg: &str, options: &Pg2SqliteOptions) -> Error {
         .expect_err("translation should be refused")
 }
 
-/// The mapping states what the setting holds, and a reading that disagrees is
-/// refused rather than emitted, since one `owner` against the whole joined
-/// text admits a row the server never does.
+/// The deployment declares what the setting holds, and a reading that
+/// disagrees is refused rather than emitted, since one `owner` against the
+/// whole joined text admits a row the server never does.
 #[test]
 fn a_set_valued_setting_read_as_one_value_is_refused() {
     for predicate in [
@@ -233,8 +237,8 @@ fn a_set_valued_setting_read_as_one_value_is_refused() {
             &share_key_options(),
         );
         assert!(
-            matches!(&error, Error::SessionVariableReadAsScalar { pattern, delimiter: ',' }
-                if pattern == "current_setting('app.subjects')"),
+            matches!(&error, Error::SessionVariableReadAsScalar { pattern, packing }
+                if pattern == "current_setting('app.subjects')" && *packing == "joined by ','"),
             "{predicate} reads the set as one value, got: {error}"
         );
     }
@@ -251,7 +255,8 @@ fn a_policy_reading_a_set_valued_setting_as_one_value_is_refused() {
         &share_key_options(),
     );
     assert!(
-        matches!(&error, Error::SessionVariableReadAsScalar { delimiter: ',', .. }),
+        matches!(&error, Error::SessionVariableReadAsScalar { packing, .. }
+            if *packing == "joined by ','"),
         "the policy reads the set as one value, got: {error}"
     );
 }
@@ -279,14 +284,21 @@ fn parentheses_or_a_text_cast_inside_the_split_keep_the_membership_reading() {
     }
 }
 
-/// A strict mapping raises on an unset setting in PostgreSQL, and the search
-/// over the replica reads the same function either way.
+/// A setting a request may not leave unset raises in PostgreSQL when it is
+/// unset, and the search over the replica reads the same function either way.
 #[test]
 fn a_strict_set_valued_setting_translates_the_same_search() {
-    let options = Pg2SqliteOptions::default().with_session_variable(
-        SessionVariableMapping::current_setting_strict("app.subjects", "current_app_subjects")
-            .holding_set(','),
-    );
+    let setting = SessionSetting::value(
+        "app.subjects",
+        SettingValue::Set {
+            element: DataType::Text,
+            packing: SetPacking::Delimited(",".to_string()),
+        },
+    )
+    .expect("a custom setting name and a delimiter");
+    let options = Pg2SqliteOptions::default()
+        .with_deployment(deployment([], [setting]))
+        .with_session_variable(SessionVariableMapping::new("app.subjects", "current_app_subjects"));
     let emitted = Pg2Sqlite::default()
         .sql(
             "CREATE TABLE t (owner TEXT);\n\
@@ -307,27 +319,28 @@ SELECT owner FROM t WHERE owner = ANY(string_to_array(current_setting('app.subje
 
 #[test]
 fn a_membership_test_over_a_scalar_setting_is_refused() {
-    let options = Pg2SqliteOptions::default().with_session_variable(
-        SessionVariableMapping::current_setting("app.subjects", "current_app_subjects"),
-    );
+    let options = Pg2SqliteOptions::default()
+        .with_deployment(deployment([], [scalar("app.subjects", "text")]))
+        .with_session_variable(SessionVariableMapping::new("app.subjects", "current_app_subjects"));
     let error = refusal_under(SHARE_KEY_QUERY, &options);
     assert!(
         matches!(&error, Error::SessionVariableReadAsSet { pattern, written }
-            if pattern == "current_setting('app.subjects')" && *written == ','),
-        "a mapping that declares no set holds one value, got: {error}"
+            if pattern == "current_setting('app.subjects')" && *written == "joined by ','"),
+        "the deployment declares the setting as one value, got: {error}"
     );
 }
 
 #[test]
 fn a_membership_test_on_another_delimiter_is_refused() {
-    let options = Pg2SqliteOptions::default().with_session_variable(
-        SessionVariableMapping::current_setting("app.subjects", "current_app_subjects")
-            .holding_set(';'),
-    );
+    let options = Pg2SqliteOptions::default()
+        .with_deployment(deployment([], [delimited("app.subjects", ";")]))
+        .with_session_variable(SessionVariableMapping::new("app.subjects", "current_app_subjects"));
     let error = refusal_under(SHARE_KEY_QUERY, &options);
     assert!(
-        matches!(&error, Error::SessionVariableDelimiterDisagrees { pattern, recorded: ';', written }
-            if pattern == "current_setting('app.subjects')" && *written == ','),
+        matches!(&error, Error::SessionVariablePackingDisagrees { pattern, declared, written }
+            if pattern == "current_setting('app.subjects')"
+                && *declared == "joined by ';'"
+                && *written == "joined by ','"),
         "the refusal names both delimiters, got: {error}"
     );
 }

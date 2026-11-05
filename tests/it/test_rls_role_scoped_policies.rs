@@ -9,7 +9,7 @@
 use diesel::{prelude::*, sqlite::SqliteConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
 
-use crate::helpers::deployment::deployment;
+use crate::helpers::deployment::{caller, deployment};
 
 #[declare_sql_function]
 extern "SQL" {
@@ -63,18 +63,18 @@ CREATE POLICY user_read ON docs USING (owner = current_setting('app.user'));
 fn opts_with_role() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_rls_audit_table_name("rls_violations")
-        .with_session_variable(SessionVariableMapping::current_setting("app.user", "app_user"))
+        .with_session_variable(SessionVariableMapping::new("app.user", "app_user"))
         .with_user_defined_functions(["app_user"])
-        .with_deployment(deployment(["app_user"], []))
+        .with_deployment(deployment(["app_user"], [caller("app.user", "text")]))
         .with_acting_role("app_user")
 }
 
 fn opts_without_role() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_rls_audit_table_name("rls_violations")
-        .with_session_variable(SessionVariableMapping::current_setting("app.user", "app_user"))
+        .with_session_variable(SessionVariableMapping::new("app.user", "app_user"))
         .with_user_defined_functions(["app_user"])
-        .with_deployment(deployment(["app_user"], []))
+        .with_deployment(deployment(["app_user"], [caller("app.user", "text")]))
     // no with_acting_role
 }
 

@@ -22,7 +22,11 @@ use rosetta_uuid::Uuid;
 // Re-use models from test_groups
 pub use test_groups::{Group, User};
 
-use crate::{helpers, test_groups};
+use crate::{
+    helpers,
+    helpers::deployment::{caller, deployment},
+    test_groups,
+};
 
 diesel::table! {
     use diesel::sql_types::*;
@@ -344,10 +348,8 @@ fn translation_options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ))
+        .with_deployment(deployment([], [caller("app.user_id", "uuid")]))
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
         .with_rls_audit_table_name("rls_audit".to_string())
         .with_schema_owner_role("migrator")
 }

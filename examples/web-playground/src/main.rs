@@ -180,7 +180,7 @@ fn run_translate(state: AppState, pg_sql: &str, opts: &state::WebOptions) {
             state.query_result.clone().set(None);
 
             let session_var_funcs: Vec<String> =
-                opts.session_variables.iter().map(|m| m.sqlite_function.clone()).collect();
+                opts.session_variables.iter().map(|entry| entry.function.clone()).collect();
             let apply_result =
                 db::reopen(&session_var_funcs).and_then(|()| db::run_script(&sqlite_sql));
             match apply_result {

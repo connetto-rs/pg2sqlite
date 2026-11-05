@@ -8,7 +8,10 @@ use helpers::{establish_connection, set_session_user_id};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 use rosetta_uuid::Uuid;
 
-use crate::{helpers, helpers::deployment::deployment};
+use crate::{
+    helpers,
+    helpers::deployment::{caller, deployment},
+};
 
 mod schema {
     diesel::table! {
@@ -60,13 +63,10 @@ fn translate_and_setup() -> Result<diesel::SqliteConnection, Box<dyn std::error:
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
-        .with_deployment(deployment(["authenticated"], []))
+        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
         .with_acting_role("authenticated")
         .with_rls_audit_table_name("rls_audit".to_string())
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ));
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"));
 
     let translated_migrations = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
 
@@ -92,13 +92,10 @@ fn test_public_access_translation_snapshot() -> Result<(), Box<dyn std::error::E
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
-        .with_deployment(deployment(["authenticated"], []))
+        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
         .with_acting_role("authenticated")
         .with_rls_audit_table_name("rls_audit".to_string())
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ));
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"));
 
     let translated_migrations = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
 
