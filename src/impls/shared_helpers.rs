@@ -1987,6 +1987,7 @@ pub(crate) fn literal_checks_apply(data_type: &DataType) -> bool {
 /// match `WHERE col = 0`, and the literal left as text dies at write time
 /// under `STRICT` with `cannot store TEXT value in REAL column` while a
 /// comparison against it is quietly never equal. PostgreSQL takes all of
+// refquiem: allow(Infinity)
 /// `NaN`, `Infinity`, `inf` and their signed spellings, case-insensitively.
 pub(crate) fn float_special_refusal(data_type: &DataType, expr: &Expr) -> Option<Error> {
     if !matches!(
