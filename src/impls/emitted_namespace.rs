@@ -17,13 +17,7 @@
 //! trigger attached to it, so each of those records what it hangs off. Without
 //! that the walk would refuse input that translates and runs today.
 
-use alloc::{collections::BTreeMap, vec::Vec};
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    format,
-    string::{String, ToString},
-};
+use alloc::collections::BTreeMap;
 
 use sql_traits::{
     structs::ParserDB,
@@ -33,6 +27,8 @@ use sqlparser::ast::{AlterTableOperation, ObjectName, ObjectType, RenameTableNam
 
 use super::object_name::last_ident_value_or_display;
 use crate::errors::Error;
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 
 /// Where an emitted statement came from, for the message a collision raises.
 #[derive(Clone)]

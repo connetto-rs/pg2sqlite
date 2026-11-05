@@ -1,20 +1,11 @@
 //! Shared helper functions for forward translation of table references,
 //! joins, and select items.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sql_traits::structs::ParserDB;
 use sqlparser::ast::{Expr, PipeOperator, Query, Setting, TableWithJoins, WindowType, With};
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{

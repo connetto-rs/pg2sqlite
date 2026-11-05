@@ -1,21 +1,12 @@
 //! Implementation of the [`ReverseTranslator`] trait for the
 //! `Delete` type.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sql_traits::structs::ParserDB;
 use sqlparser::ast::Delete;
 
 use super::helpers::{Reverse, reverse_translate_table_with_joins};
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{shared_helpers::translate_delete_core, translator_impls::delete::delete_scope_query},

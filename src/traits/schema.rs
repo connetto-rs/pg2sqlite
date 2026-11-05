@@ -1,23 +1,14 @@
 //! Submodule defining a schema for the translation between `PostgreSQL` and
 //! `SQLite`.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sql_traits::{
     structs::{IdentifierCase, TargetName},
     traits::{DatabaseLike, FunctionLike},
 };
 use sqlparser::ast::{BeginEndStatements, CreateFunction, CreateTable, ObjectName, ObjectNamePart};
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::translator_impls::plpgsql::{PlPgSqlContext, parse_body},

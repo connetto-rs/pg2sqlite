@@ -1,17 +1,6 @@
 //! Implementation of the [`Translator`](crate::traits::Translator) trait for
 //! the `Column` type.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sqlparser::ast::{
     ColumnOption, ColumnOptionDef, ConstraintReferenceMatchKind, Expr, ForeignKeyConstraint,
     FunctionArguments, GeneratedAs, UnaryOperator, Value, ValueWithSpan,
@@ -22,6 +11,8 @@ use crate::impls::{
     shared_helpers::match_partial_not_supported_error,
     translator_impls::expr::sqlite_collation,
 };
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 
 /// Warn that a `CHECK ... NO INHERIT` loses its modifier.
 ///

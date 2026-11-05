@@ -1,17 +1,6 @@
 //! Submodule with the implementations of the [`crate::traits::Translator`]
 //! trait.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 pub(crate) mod array;
 pub(crate) mod blob_operator;
 pub(crate) mod column;

@@ -1,23 +1,14 @@
 //! Implementation of the [`Translator`](crate::traits::Translator) trait for
 //! the `TableConstraint` type.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sql_traits::structs::ParserDB;
 use sqlparser::ast::{
     BinaryOperator, ConstraintReferenceMatchKind, Expr, Ident, IndexColumn, NullsDistinctOption,
     TableConstraint,
 };
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     impls::{
         object_name::{append_suffix, translation_table_has_rls},

@@ -28,19 +28,13 @@
 //!    `sqlite_schema` are SQLite system tables. All of these are refused before
 //!    the statement reaches the server.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
 use core::{convert::Infallible, ops::ControlFlow};
 
 use sqlparser::ast::{DoUpdate, Expr, Ident, ObjectName, Query, VisitMut, VisitorMut};
 
 use crate::errors::Error;
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 
 // ─── 1. Quote normalisation
 // ───────────────────────────────────────────────────

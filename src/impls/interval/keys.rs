@@ -13,14 +13,6 @@
 //! replays.
 
 use alloc::borrow::Cow;
-#[cfg(not(feature = "std"))]
-use alloc::{
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
 use core::ops::ControlFlow;
 
 use sql_traits::{errors::LookupError, structs::ParserDB};
@@ -42,6 +34,8 @@ use super::{
     keys_templates::{self, PLACEHOLDER},
     literal_comparison_key, literal_text, qualifier_typmod,
 };
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{

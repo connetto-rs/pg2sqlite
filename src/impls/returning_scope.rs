@@ -13,14 +13,6 @@
 //! PostgreSQL expands over those relations as well and which would otherwise
 //! answer a silently narrower row.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    format,
-    string::{String, ToString},
-    vec::Vec,
-};
-
 use sql_traits::{
     structs::ParserDB,
     traits::{ColumnLike, TableLike},
@@ -35,6 +27,8 @@ use super::{
     object_name::{last_ident, resolve_translation_table},
 };
 use crate::errors::Error;
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 
 /// The first relation a `DELETE` targets, which is the only one its RETURNING
 /// list can read.

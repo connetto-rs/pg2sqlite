@@ -3,17 +3,6 @@
 //! This module provides utilities for constructing CTEs that represent
 //! variable bindings and combining them into WITH clauses.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sqlparser::ast::{
     Cte, Expr, Ident, ObjectName, ObjectNamePart, SelectItem, SetExpr, TableAlias,
     TableAliasColumnDef, With, helpers::attached_token::AttachedToken,
@@ -22,6 +11,8 @@ use sqlparser::ast::{
 use crate::impls::query_builder::{
     from_relation, make_query, make_simple_select, plain_table_factor,
 };
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 
 /// Builder for constructing CTEs from variable bindings.
 pub struct CteBuilder;

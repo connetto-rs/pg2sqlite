@@ -26,8 +26,6 @@
 //! select list) is numbered by its textual position.
 
 use alloc::collections::BTreeMap;
-#[cfg(not(feature = "std"))]
-use alloc::{format, string::String, vec::Vec};
 use core::{convert::Infallible, ops::ControlFlow};
 
 use sqlparser::{
@@ -36,6 +34,8 @@ use sqlparser::{
 };
 
 use crate::errors::Error;
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 
 // Reverse direction: SQLite placeholders to PostgreSQL `$N` parameters.
 

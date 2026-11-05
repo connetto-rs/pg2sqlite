@@ -1,17 +1,6 @@
 //! Implementation of the [`crate::traits::ReverseTranslator`] trait for the
 //! `Function` type.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sql_traits::structs::ParserDB;
 use sqlparser::ast::{
     BinaryOperator, CastKind, DataType, DateTimeField, Expr, ExtractSyntax, Function, FunctionArg,
@@ -23,6 +12,8 @@ use super::{
     helpers::{Reverse, reverse_translate_window_type},
     storage_shape::{declared_data_type, is_array_type},
 };
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{

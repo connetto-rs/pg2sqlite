@@ -1,17 +1,6 @@
 //! Implementation of the [`ReverseTranslator`] trait for the
 //! `Query`, `SetExpr`, and `Select` types.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sql_traits::structs::ParserDB;
 use sqlparser::ast::{
     Distinct, Expr, OrderBy, OrderByExpr, OrderByKind, Query, Select, SelectItem, SetExpr,
@@ -19,6 +8,8 @@ use sqlparser::ast::{
 };
 
 use super::helpers::Reverse;
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{

@@ -1,8 +1,5 @@
 //! Planning of queries and the column references in them.
 
-#[cfg(not(feature = "std"))]
-use alloc::{borrow::ToOwned, string::String, vec, vec::Vec};
-
 use sql_traits::{
     errors::LookupError,
     structs::{ColumnBinding, ColumnDefinition, ColumnScope, IdentifierCase, ParserDB},
@@ -18,6 +15,8 @@ use super::{
     edits::{last_span, quoted},
     scope::last,
 };
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{impls::expr_helpers::for_each_child_expr, script::ConnectionError};
 
 /// A column reference resolved in one scope.

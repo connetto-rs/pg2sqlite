@@ -9,14 +9,6 @@
 //! PostgreSQL raises: a field that overflowed its 32-bit or 64-bit range, or
 //! a result on either infinity bound.
 
-#[cfg(not(feature = "std"))]
-use alloc::{
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
 use core::ops::ControlFlow;
 
 use sql_traits::structs::ParserDB;
@@ -31,6 +23,8 @@ use super::{
     ClockShift, IntervalShift, WRAP_IN_A_DAY, computed, fields_templates, finite_interval,
     keys::{self, IntervalSide},
 };
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{

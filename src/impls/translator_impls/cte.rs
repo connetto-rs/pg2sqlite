@@ -1,10 +1,7 @@
 //! Capture-free CTE names for SQLite's mutually visible sibling bodies.
 
-#[cfg(not(feature = "std"))]
-use alloc::{borrow::Cow, collections::BTreeSet, format, string::String, vec, vec::Vec};
+use alloc::{borrow::Cow, collections::BTreeSet};
 use core::ops::ControlFlow;
-#[cfg(feature = "std")]
-use std::{borrow::Cow, collections::BTreeSet};
 
 use sql_traits::structs::{ColumnScope, ParserDB, QueryOutput};
 use sqlparser::ast::{
@@ -13,6 +10,8 @@ use sqlparser::ast::{
 };
 
 use crate::impls::{object_name::last_ident, relation_scope::RelationScopes};
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 
 /// Completes each CTE's column list with its source output names, which a
 /// stored column rename would otherwise change in SQLite.

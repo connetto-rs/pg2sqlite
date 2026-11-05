@@ -1,15 +1,7 @@
 //! Submodule defining a set of translation options.
 
 #[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
+use crate::no_std::prelude::*;
 
 /// Enum for defining the representation of UUIDs in `SQLite`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

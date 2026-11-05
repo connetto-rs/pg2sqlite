@@ -1,16 +1,5 @@
 //! Macro helpers for defining direction-specific helper wrappers.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 macro_rules! define_direction_wrappers {
     (
         direction = $direction:ty;

@@ -15,17 +15,11 @@ mod fields_templates;
 pub(crate) mod keys;
 mod keys_templates;
 
-#[cfg(not(feature = "std"))]
-use alloc::{
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sql_values::{IntervalError, IntervalTypmod, PgInterval, parse_interval_typmod};
 use sqlparser::ast::{DataType, DateTimeField, Expr, IntervalFields};
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::function_helpers::{integer_literal, single_quoted_literal, string_literal},

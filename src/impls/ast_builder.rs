@@ -1,5 +1,3 @@
-use alloc::{boxed::Box, vec, vec::Vec};
-
 use sqlparser::{
     ast::{
         Assignment, BeginEndStatements, ColumnDef, ConditionalStatements, CreateTable,
@@ -16,6 +14,8 @@ use super::{
     function_helpers::{simple_function_expr, string_literal},
     query_builder::{from_relation, make_query, plain_table_factor, single_expr_query},
 };
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 
 pub(crate) fn keyword_token(value: &str, keyword: Keyword) -> AttachedToken {
     AttachedToken(TokenWithSpan::wrap(Token::Word(Word {

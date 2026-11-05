@@ -9,8 +9,6 @@
 //! an owner that `helper_set` has checked is exempt from every policy it reads
 //! past.
 
-#[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, format, string::ToString, vec, vec::Vec};
 use core::{convert::Infallible, ops::ControlFlow};
 
 use sql_traits::{
@@ -24,6 +22,8 @@ use sqlparser::ast::{
     ValueWithSpan, VisitMut, VisitorMut,
 };
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{

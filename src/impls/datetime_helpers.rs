@@ -1,16 +1,5 @@
 //! Shared date/time mapping helpers for forward and reverse translation.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sqlparser::ast::{
     BinaryOperator, CastKind, DataType, DateTimeField, Expr, FunctionArg, FunctionArgExpr,
     FunctionArguments, Value, ValueWithSpan,
@@ -21,6 +10,8 @@ use super::{
     function_helpers::{integer_literal, number_literal, simple_function_expr, string_literal},
 };
 use crate::errors::Error;
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 
 /// Canonical date/time part keys used for shared mappings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

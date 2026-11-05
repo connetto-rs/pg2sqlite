@@ -4,20 +4,12 @@
 //! that each specific walker only needs to handle its "interesting" arms and
 //! can delegate the mechanical child-traversal to one of these functions.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sqlparser::ast::{
     CaseWhen, Expr, InTarget, JsonPathElem, helpers::attached_token::AttachedToken,
 };
+
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 
 /// Apply `f` to every direct child [`Expr`], rebuilding the node. Callers
 /// should match their "interesting" variants first and fall through for the

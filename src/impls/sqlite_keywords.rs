@@ -1,10 +1,11 @@
 //! Quoting for identifiers that SQLite reserves.
 
-#[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
 use core::{convert::Infallible, ops::ControlFlow};
 
 use sqlparser::ast::{Expr, Ident, Statement, VisitMut, VisitorMut};
+
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 
 /// Keywords SQLite 3.51 rejects as a bare table, column or alias name, sorted
 /// for binary search, without the `DEFAULT` the translator emits as a keyword.

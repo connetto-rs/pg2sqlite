@@ -1,16 +1,6 @@
 //! Implementation of the [`ReverseTranslator`] trait for the
 //! `Statement` type.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
 use core::ops::ControlFlow;
 
 use sql_traits::{
@@ -26,6 +16,8 @@ use sqlparser::ast::{
 use sqlparser::ast::{LimitClause, TableFactor};
 
 use super::ident_quoting::normalize_identifier_quotes;
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{

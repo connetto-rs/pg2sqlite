@@ -5,15 +5,6 @@
 //! collision is an ordinary unique violation. The plain key stays for foreign
 //! keys and `ON CONFLICT` targets.
 
-#[cfg(not(feature = "std"))]
-use alloc::{
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sql_traits::{
     structs::ParserDB,
     traits::{ColumnLike, DatabaseLike, IndexLike, TableLike},
@@ -24,6 +15,8 @@ use sqlparser::ast::{
     ObjectNamePart, ObjectType, OrderByExpr, OrderByOptions, Statement, TableConstraint,
 };
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{

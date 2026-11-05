@@ -20,13 +20,6 @@ mod edits;
 mod query;
 mod scope;
 
-#[cfg(not(feature = "std"))]
-use alloc::{
-    borrow::ToOwned,
-    format,
-    string::{String, ToString},
-    vec::Vec,
-};
 use core::ops::ControlFlow;
 
 use sql_traits::{
@@ -44,6 +37,8 @@ use self::{
     scope::{Listed, Relation, last, resolve},
 };
 use super::StatementId;
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     history::placement::{Files, Homes, home},
     impls::{

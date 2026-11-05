@@ -1,15 +1,15 @@
 //! Applies a rebinding plan to a statement in one mutable pass.
 
-#[cfg(not(feature = "std"))]
-use alloc::{collections::BTreeMap, string::String, vec, vec::Vec};
+use alloc::collections::BTreeMap;
 use core::ops::ControlFlow;
-#[cfg(feature = "std")]
-use std::collections::BTreeMap;
 
 use sqlparser::{
     ast::{Expr, Ident, Select, SelectItem, VisitorMut},
     tokenizer::Span,
 };
+
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 
 /// Edits to apply, keyed by the source span of the identifier they change.
 #[derive(Default)]

@@ -10,17 +10,6 @@
 //! [`Pg2SqliteOptions::with_uuid_text_to_blob_function_name`]
 //! is configured, the translator instead emits a call to that UDF.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sql_traits::{
     errors::LookupError,
     structs::ParserDB,
@@ -28,6 +17,8 @@ use sql_traits::{
 };
 use sqlparser::ast::{BinaryOperator, DataType, Expr, Ident, Value, ValueWithSpan};
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     impls::{
         function_helpers::{

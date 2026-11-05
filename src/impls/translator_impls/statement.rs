@@ -27,17 +27,6 @@
 //! `sqlparser` variant fails to compile until it is classified here, which is
 //! stronger than discovering it at run time.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sql_traits::{structs::ParserDB, traits::TableLike};
 use sqlparser::ast::{
     AlterTable, AlterTableOperation, AlterTableType, AlterView, AlterViewOperation,
@@ -49,6 +38,8 @@ use sqlparser::ast::{
     UnaryOperator, VacuumStatement, helpers::attached_token::AttachedToken,
 };
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{

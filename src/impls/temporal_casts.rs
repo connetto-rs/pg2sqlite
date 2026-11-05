@@ -7,12 +7,11 @@
 //! functions, which would drop fraction digits past milliseconds. A value of
 //! unknown kind has no stored form to slice, so the date functions read it.
 
-#[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, format, string::ToString, vec};
-
 use sql_traits::structs::ParserDB;
 use sqlparser::ast::{BinaryOperator, DataType, Expr, Function, FunctionArguments};
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{

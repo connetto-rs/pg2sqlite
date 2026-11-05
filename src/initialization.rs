@@ -6,10 +6,10 @@
 //! target file does not have is unavailable on its own, and the other
 //! selections stay usable.
 
-#[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
 use core::iter::FusedIterator;
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::{Error, TranslationRefusal},
     history::placement::Files,

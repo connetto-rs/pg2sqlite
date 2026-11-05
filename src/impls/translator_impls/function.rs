@@ -1,16 +1,5 @@
 //! Implementation of the [`Translator`](crate::traits::Translator) trait for
 //! the `Function` type.
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sql_traits::structs::ParserDB;
 use sqlparser::ast::{
     BinaryOperator, CaseWhen, CastKind, DataType, DuplicateTreatment, Expr, Function, FunctionArg,
@@ -24,6 +13,8 @@ use super::{
     json_value::{json_argument, json_key, json_value},
     postgis,
 };
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     impls::{
         datetime_helpers::{

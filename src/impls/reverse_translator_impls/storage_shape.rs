@@ -17,13 +17,11 @@
 //! `INSERT` fills, the column an `UPDATE` assigns. Those positions call
 //! [`retype_for_declared`] with the type they already know.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{boxed::Box, format, string::ToString, vec, vec::Vec};
-
 use sql_traits::structs::ParserDB;
 use sqlparser::ast::{CastKind, DataType, Expr, FunctionArguments, ObjectNamePart};
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{errors::Error, impls::shared_helpers::declared_in_scope};
 
 /// The PostgreSQL type `expr` is declared with, when the schema names one.

@@ -1,14 +1,14 @@
 //! Lowerings that name an operand more than once, reading each operand once
 //! where SQLite allows it.
 
-#[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, format, vec::Vec};
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
     BinaryOperator, Expr, Ident, Query, SelectItem, SetExpr, TableFactor, visit_expressions,
 };
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{

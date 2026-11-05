@@ -1,19 +1,12 @@
 //! Submodule providing the error enumeration that may occur during the
 //! translation between `PostgreSQL` and `SQLite`.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
 use core::fmt;
 
 use sqlparser::parser::ParserError;
+
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 
 /// Direction of a refused translation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

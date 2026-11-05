@@ -4,14 +4,6 @@
 //! give. A setting becomes the call a mapping pairs it with, read only the way
 //! the deployment declares it, and refused in either direction otherwise.
 
-#[cfg(not(feature = "std"))]
-use alloc::{
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
 use core::fmt;
 
 use sql_traits::{
@@ -27,6 +19,8 @@ use sqlparser::ast::{
     TableFactor, TimezoneInfo, Value, ValueWithSpan,
 };
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{

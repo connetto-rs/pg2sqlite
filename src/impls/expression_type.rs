@@ -1,8 +1,6 @@
 //! The PostgreSQL type an expression has, read from what the statement writes.
 
 use alloc::borrow::Cow;
-#[cfg(not(feature = "std"))]
-use alloc::{format, string::String, vec, vec::Vec};
 
 use sql_traits::{
     prelude::DatabaseLike,
@@ -18,6 +16,8 @@ use sqlparser::{
     parser::Parser,
 };
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{

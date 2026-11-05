@@ -1,16 +1,5 @@
 //! Helpers for structured [`sqlparser::ast::ObjectName`] manipulation.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sql_traits::{
     errors::LookupError,
     structs::{IdentifierCase, ParserDB, TargetName},
@@ -20,6 +9,8 @@ use sql_traits::{
 use sqlparser::ast::{CreateTable, Ident, ObjectName, ObjectNamePart, TriggerEvent};
 
 use crate::errors::Error;
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 
 /// The comparison a column lookup takes, folded because a table carrying both
 /// `a` and `"A"` is refused where it is created.

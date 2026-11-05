@@ -1,17 +1,6 @@
 //! Implementation of the [`ReverseTranslator`] trait for the
 //! `Expr` type.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sql_traits::structs::ParserDB;
 use sqlparser::{
     ast::{
@@ -27,6 +16,8 @@ use super::{
     helpers::{Reverse, unscale_integer_literal},
     storage_shape::retype_against_peer,
 };
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{

@@ -3,6 +3,22 @@
 
 extern crate alloc;
 
+/// The `alloc` items the std prelude brings into scope, which every module
+/// glob-imports when it builds without std.
+#[cfg(not(feature = "std"))]
+mod no_std {
+    pub(crate) mod prelude {
+        pub(crate) use alloc::{
+            borrow::ToOwned,
+            boxed::Box,
+            format,
+            string::{String, ToString},
+            vec,
+            vec::Vec,
+        };
+    }
+}
+
 pub mod errors;
 pub(crate) mod history;
 pub(crate) mod impls;

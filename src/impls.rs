@@ -1,16 +1,5 @@
 //! Implementations of traits defined in `traits.rs` are defined here.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 pub(crate) mod ast_builder;
 pub(crate) mod bind_once;
 pub(crate) mod datetime_helpers;

@@ -6,12 +6,11 @@
 //! PostgreSQL defines over these types is lowered to a form that keeps the
 //! bytes, and each one it does not define is refused, as the server would.
 
-#[cfg(not(feature = "std"))]
-use alloc::{borrow::ToOwned, boxed::Box, format, string::String, vec};
-
 use sql_traits::structs::ParserDB;
 use sqlparser::ast::{BinaryOperator, CastKind, DataType, Expr};
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{

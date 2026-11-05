@@ -2,23 +2,14 @@
 //! and argument extraction. Used by both forward and reverse function
 //! translators to reduce boilerplate.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sqlparser::ast::{
     Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident,
     ObjectName, ObjectNamePart, UnaryOperator, Value, ValueWithSpan, WindowType,
 };
 
 use crate::errors::Error;
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 
 /// Create an unnamed function argument from an expression.
 #[must_use]

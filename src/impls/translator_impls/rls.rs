@@ -12,16 +12,6 @@
 //! SQLite no way to tell an omitted column from one written NULL, so a default
 //! answers for both.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
 use core::ops::ControlFlow;
 
 use sql_traits::{
@@ -46,6 +36,8 @@ use sqlparser::{
     tokenizer::{Token, Word},
 };
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{

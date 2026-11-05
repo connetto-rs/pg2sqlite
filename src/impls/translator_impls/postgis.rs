@@ -14,15 +14,7 @@
 //! its result type lands in the storage class SQLiteGIS returns.
 
 #[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
+use crate::no_std::prelude::*;
 
 /// `(lowercase-name, arity, PostgreSQL result type)` triples implemented by
 /// SQLiteGIS.

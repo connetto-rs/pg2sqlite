@@ -4,11 +4,10 @@
 //! are connection state lost on close, so the file part runs once and the
 //! setup and connection parts on every open.
 
-#[cfg(not(feature = "std"))]
-use alloc::{string::String, vec::Vec};
-
 use sqlparser::ast::Statement;
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::{Error, TranslationRefusal},
     initialization::InitializationPlan,

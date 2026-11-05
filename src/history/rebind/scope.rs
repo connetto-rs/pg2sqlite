@@ -1,9 +1,6 @@
 //! The stored relations a select lists, and what a name resolves to in the
 //! schema a statement was written for.
 
-#[cfg(not(feature = "std"))]
-use alloc::{borrow::ToOwned, string::String, vec, vec::Vec};
-
 use sql_traits::{
     structs::{IdentifierCase, ParserDB, TargetName},
     traits::{ColumnLike, DatabaseLike, TableLike, ViewLike},
@@ -13,6 +10,8 @@ use sqlparser::ast::{
 };
 
 use super::Planner;
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::script::ConnectionError;
 
 /// A stored relation a name resolves to in the schema the statement was

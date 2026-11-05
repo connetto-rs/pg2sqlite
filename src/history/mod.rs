@@ -10,9 +10,6 @@ pub(crate) mod placement;
 mod rebind;
 mod transactions;
 
-#[cfg(not(feature = "std"))]
-use alloc::{format, string::String, vec, vec::Vec};
-
 use sql_traits::{
     structs::{ParserDB, ParserDBIngestor},
     traits::{DatabaseLike, TableLike, ViewLike},
@@ -28,6 +25,8 @@ use self::{
     placement::{Files, Homes, Placed},
     transactions::{Outcome, Outline, TransactionId},
 };
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::{Error, RefusalCategory, TranslationDirection, TranslationRefusal},
     impls::transaction_blocks::Disposition,

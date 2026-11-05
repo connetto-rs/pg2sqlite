@@ -4,13 +4,12 @@
 //! covers it or by a transaction still open at the end of the batch, and the
 //! statements that survive are exactly the ones the batch commits.
 
-#[cfg(not(feature = "std"))]
-use alloc::{vec, vec::Vec};
-
 use sqlparser::ast::{Ident, Statement};
 
 use super::StatementId;
 use crate::impls::transaction_blocks::Disposition;
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 
 /// The explicit transaction a statement ran inside.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
