@@ -25,6 +25,8 @@
 use diesel::prelude::*;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
+use crate::helpers::deployment::deployment;
+
 fn options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default().with_rls_audit_table_name("rls_violations".to_string())
 }
@@ -321,7 +323,9 @@ fn a_view_owner_meeting_an_unsettled_policy_role_is_refused() {
              ALTER VIEW oo_all OWNER TO reader;"
         ))
         .expect("parse")
-        .translate_to_sql(&options().with_session_user_role("app_user"))
+        .translate_to_sql(
+            &options().with_deployment(deployment(["app_user"], [])).with_acting_role("app_user"),
+        )
         .expect_err("CURRENT_USER cannot be settled for reader");
     assert!(error.to_string().contains("CURRENT_USER"), "{error}");
 }

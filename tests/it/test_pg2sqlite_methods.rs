@@ -257,7 +257,9 @@ fn test_index_skipped_for_role_without_access() {
         CREATE TABLE private_docs(id INTEGER PRIMARY KEY, title TEXT);
         CREATE INDEX private_docs_title_idx ON private_docs(title);
     "#;
-    let options = Pg2SqliteOptions::default().with_session_user_role("app_user");
+    let options = Pg2SqliteOptions::default()
+        .with_deployment(crate::helpers::deployment::deployment(["app_user"], []))
+        .with_acting_role("app_user");
     let stmts = Pg2Sqlite::default().sql(sql).unwrap().translate(&options).unwrap().into_vec();
     assert!(
         stmts.iter().all(|s| !s.to_string().contains("CREATE INDEX private_docs_title_idx")),

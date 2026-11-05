@@ -38,10 +38,7 @@ use alloc::{
     vec::Vec,
 };
 
-use sql_traits::{
-    structs::ParserDB,
-    traits::{DatabaseLike, TableLike},
-};
+use sql_traits::{structs::ParserDB, traits::TableLike};
 use sqlparser::ast::{
     AlterTable, AlterTableOperation, AlterTableType, AlterView, AlterViewOperation,
     BeginTransactionKind, BinaryOperator, CascadeOption, ColumnDef, ColumnOption, CreateFunction,
@@ -75,7 +72,6 @@ use crate::{
             vector::{generate_vec0_statements, has_vector_columns},
         },
     },
-    prelude::Pg2SqliteOptions,
     traits::translator::TranslatorWithContext,
 };
 
@@ -431,7 +427,7 @@ fn translate_create_table_for_role(
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Option<Vec<Statement>>, Error> {
-    let Some(role) = resolve_session_role(schema, options) else {
+    let Some(role) = crate::impls::session_variable::acting_role(schema, options)? else {
         return Ok(None);
     };
     let Some(table) = resolve_declared_table(schema, create_table)? else {
@@ -581,20 +577,12 @@ enum RoleTableAccess {
     Deny,
 }
 
-fn resolve_session_role<'a>(
-    schema: &'a ParserDB,
-    options: &Pg2SqliteOptions,
-) -> Option<&'a <ParserDB as DatabaseLike>::Role> {
-    let role_name = options.get_session_user_role()?;
-    schema.role(role_name)
-}
-
 fn role_access_for_object_name(
     table_name: &sqlparser::ast::ObjectName,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
 ) -> Result<RoleTableAccess, Error> {
-    let Some(role) = resolve_session_role(schema, options) else {
+    let Some(role) = crate::impls::session_variable::acting_role(schema, options)? else {
         return Ok(RoleTableAccess::Allow);
     };
 
@@ -2433,9 +2421,8 @@ mod tests {
             "test".to_string(),
         )
         .expect("schema should build");
-        let options = crate::options::TranslationContext::from_owned(
-            Pg2SqliteOptions::default().with_session_user_role("app_user"),
-        );
+        let options =
+            crate::options::TranslationContext::from_owned(crate::options::acting_as("app_user"));
         let missing_table = parse_create_table("CREATE TABLE docs(id INTEGER PRIMARY KEY)");
         let missing =
             translate_create_table_for_role(&missing_table, &missing_schema, &options, &mut |_| {})
@@ -2505,9 +2492,8 @@ mod tests {
         )
         .expect("schema should build");
 
-        let options = crate::options::TranslationContext::from_owned(
-            Pg2SqliteOptions::default().with_session_user_role("app_user"),
-        );
+        let options =
+            crate::options::TranslationContext::from_owned(crate::options::acting_as("app_user"));
         let index_stmt = Parser::parse_sql(
             &PostgreSqlDialect {},
             "CREATE INDEX private_docs_title_idx ON private_docs(title);",
@@ -2544,9 +2530,8 @@ mod tests {
         )
         .expect("schema should build");
 
-        let options = crate::options::TranslationContext::from_owned(
-            Pg2SqliteOptions::default().with_session_user_role("app_user"),
-        );
+        let options =
+            crate::options::TranslationContext::from_owned(crate::options::acting_as("app_user"));
         let trigger_stmt = Parser::parse_sql(
             &PostgreSqlDialect {},
             "CREATE TRIGGER private_docs_ai AFTER INSERT ON private_docs FOR EACH ROW EXECUTE FUNCTION private_docs_trigger_fn();",
@@ -2621,9 +2606,8 @@ mod tests {
         )
         .expect("schema should build");
 
-        let options = crate::options::TranslationContext::from_owned(
-            Pg2SqliteOptions::default().with_session_user_role("app_user"),
-        );
+        let options =
+            crate::options::TranslationContext::from_owned(crate::options::acting_as("app_user"));
         let index_stmt = Parser::parse_sql(
             &PostgreSqlDialect {},
             "CREATE INDEX missing_docs_title_idx ON missing_docs(title);",
@@ -2647,9 +2631,8 @@ mod tests {
         )
         .expect("schema should build");
 
-        let options = crate::options::TranslationContext::from_owned(
-            Pg2SqliteOptions::default().with_session_user_role("app_user"),
-        );
+        let options =
+            crate::options::TranslationContext::from_owned(crate::options::acting_as("app_user"));
         let trigger_stmt = Parser::parse_sql(
             &PostgreSqlDialect {},
             "CREATE TRIGGER missing_docs_ai AFTER INSERT ON missing_docs FOR EACH ROW EXECUTE FUNCTION docs_trigger_fn();",
@@ -2665,56 +2648,28 @@ mod tests {
     }
 
     #[test]
-    fn unknown_session_role_does_not_filter_create_index_or_trigger() {
+    fn an_acting_role_the_schema_does_not_declare_is_refused() {
         let schema = ParserDB::from_statements(
             Parser::parse_sql(
                 &PostgreSqlDialect {},
-                r#"
-                CREATE TABLE docs(id INTEGER PRIMARY KEY, title TEXT);
-                CREATE FUNCTION docs_trigger_fn() RETURNS trigger AS $$
-                BEGIN
-                    RETURN NEW;
-                END;
-                $$ LANGUAGE plpgsql;
-                CREATE INDEX docs_title_idx ON docs(title);
-                CREATE TRIGGER docs_ai
-                AFTER INSERT ON docs
-                FOR EACH ROW
-                EXECUTE FUNCTION docs_trigger_fn();
-                "#,
+                "CREATE TABLE docs(id INTEGER PRIMARY KEY, title TEXT);",
             )
             .expect("schema SQL should parse"),
             "test".to_string(),
         )
         .expect("schema should build");
-
-        let options = crate::options::TranslationContext::from_owned(
-            Pg2SqliteOptions::default().with_session_user_role("missing_role"),
-        );
-
+        let options = crate::options::TranslationContext::from_owned(crate::options::acting_as(
+            "missing_role",
+        ));
         let index_stmt =
             Parser::parse_sql(&PostgreSqlDialect {}, "CREATE INDEX docs_title_idx ON docs(title);")
                 .expect("index SQL should parse")
                 .remove(0);
-        let trigger_stmt = Parser::parse_sql(
-            &PostgreSqlDialect {},
-            "CREATE TRIGGER docs_ai AFTER INSERT ON docs FOR EACH ROW EXECUTE FUNCTION docs_trigger_fn();",
-        )
-        .expect("trigger SQL should parse")
-        .remove(0);
 
-        let translated_index =
-            index_stmt.translate(&schema, &options).expect("index translation should succeed");
+        let err = index_stmt.translate(&schema, &options).expect_err("an undeclared role");
         assert!(
-            !translated_index.is_empty(),
-            "unknown role should not filter CREATE INDEX statements"
-        );
-
-        let translated_trigger =
-            trigger_stmt.translate(&schema, &options).expect("trigger translation should succeed");
-        assert!(
-            !translated_trigger.is_empty(),
-            "unknown role should not filter CREATE TRIGGER statements"
+            matches!(&err, crate::errors::Error::DeploymentRoleNotDeclared { role } if role == "missing_role"),
+            "names the role the schema lacks: {err}"
         );
     }
 
@@ -2734,9 +2689,8 @@ mod tests {
         )
         .expect("schema should build");
 
-        let options = crate::options::TranslationContext::from_owned(
-            Pg2SqliteOptions::default().with_session_user_role("app_user"),
-        );
+        let options =
+            crate::options::TranslationContext::from_owned(crate::options::acting_as("app_user"));
         let index_stmt = Parser::parse_sql(
             &PostgreSqlDialect {},
             "CREATE INDEX docs_title_idx ON public.docs(title);",
@@ -2765,9 +2719,8 @@ mod tests {
         )
         .expect("schema should build");
 
-        let options = crate::options::TranslationContext::from_owned(
-            Pg2SqliteOptions::default().with_session_user_role("app_user"),
-        );
+        let options =
+            crate::options::TranslationContext::from_owned(crate::options::acting_as("app_user"));
         let index_stmt = Parser::parse_sql(
             &PostgreSqlDialect {},
             "CREATE INDEX docs_title_idx ON my_custom_app.docs(title);",

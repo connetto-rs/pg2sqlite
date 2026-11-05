@@ -11,7 +11,7 @@ use helpers::establish_connection;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 use rosetta_uuid::Uuid;
 
-use crate::helpers;
+use crate::{helpers, helpers::deployment::deployment};
 
 /// Diesel table definition for the documents view.
 /// The RLS translation makes this transparent - all operations go through
@@ -61,7 +61,8 @@ fn test_rls_select_policy_filters_rows() -> Result<(), Box<dyn std::error::Error
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
-        .with_session_user_role("authenticated".to_string())
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated")
         .with_rls_audit_table_name("rls_audit".to_string())
         .with_session_variable(SessionVariableMapping::current_setting(
             "app.user_id",
@@ -149,7 +150,8 @@ fn test_rls_insert_policy_enforces_owner() -> Result<(), Box<dyn std::error::Err
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
-        .with_session_user_role("authenticated".to_string())
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated")
         .with_rls_audit_table_name("rls_audit".to_string())
         .with_session_variable(SessionVariableMapping::current_setting(
             "app.user_id",
@@ -210,7 +212,8 @@ fn test_rls_update_policy_restricts_updates() -> Result<(), Box<dyn std::error::
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
-        .with_session_user_role("authenticated".to_string())
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated")
         .with_rls_audit_table_name("rls_audit".to_string())
         .with_session_variable(SessionVariableMapping::current_setting(
             "app.user_id",
@@ -302,7 +305,8 @@ fn test_rls_delete_policy_restricts_deletes() -> Result<(), Box<dyn std::error::
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
-        .with_session_user_role("authenticated".to_string())
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated")
         .with_rls_audit_table_name("rls_audit".to_string())
         .with_session_variable(SessionVariableMapping::current_setting(
             "app.user_id",
@@ -397,7 +401,8 @@ fn test_rls_all_policy_works_like_individual_policies() -> Result<(), Box<dyn st
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
-        .with_session_user_role("authenticated".to_string())
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated")
         .with_rls_audit_table_name("rls_audit".to_string())
         .with_session_variable(SessionVariableMapping::current_setting(
             "app.user_id",
@@ -526,7 +531,7 @@ fn test_missing_session_variable_mapping_error() -> Result<(), Box<dyn std::erro
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
-        .with_session_user_role("authenticated".to_string())
+        .with_deployment(deployment([], []))
         .with_rls_audit_table_name("rls_audit".to_string());
     // Note: NOT calling .with_session_variable()
 

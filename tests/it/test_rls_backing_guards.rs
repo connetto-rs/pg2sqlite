@@ -25,10 +25,10 @@
 use std::cell::Cell;
 
 use diesel::prelude::*;
-use helpers::{apply_translated_ddl as apply, set_session_username};
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
+use helpers::apply_translated_ddl as apply;
+use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
-use crate::helpers;
+use crate::{helpers, helpers::deployment::deployment};
 
 diesel::define_sql_function! {
     /// Reports whether the current backing write is exempt from RLS checks.
@@ -45,17 +45,20 @@ thread_local! {
 
 /// Zero INSERT/ALL policies -- deny-by-default on the INSERT path.
 const ZERO_POLICY_SCHEMA: &str = "
+    CREATE ROLE alice;
     CREATE TABLE posts (
         id INTEGER PRIMARY KEY,
         body TEXT NOT NULL DEFAULT ''
     );
     ALTER TABLE posts ENABLE ROW LEVEL SECURITY;
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO alice;
 ";
 
 /// sel USING(true), ins WITH CHECK(true), upd FOR UPDATE USING(owner =
 /// current_user). WITH CHECK(true) makes INSERT always pass; UPDATE is
 /// owner-scoped.
 const GUARDED_SCHEMA: &str = "
+    CREATE ROLE alice;
     CREATE TABLE items (
         id INTEGER PRIMARY KEY,
         owner TEXT NOT NULL,
@@ -65,11 +68,13 @@ const GUARDED_SCHEMA: &str = "
     CREATE POLICY items_sel ON items FOR SELECT USING (true);
     CREATE POLICY items_ins ON items FOR INSERT WITH CHECK (true);
     CREATE POLICY items_upd ON items FOR UPDATE USING (owner = current_user);
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO alice;
 ";
 
 /// ins WITH CHECK(true), sel USING(owner = current_user) -- the R2-3 case:
 /// an insert can land without being SELECT-visible to the inserting user.
 const INVISIBLE_INSERT_SCHEMA: &str = "
+    CREATE ROLE alice;
     CREATE TABLE events (
         id INTEGER PRIMARY KEY,
         owner TEXT NOT NULL,
@@ -78,9 +83,11 @@ const INVISIBLE_INSERT_SCHEMA: &str = "
     ALTER TABLE events ENABLE ROW LEVEL SECURITY;
     CREATE POLICY events_ins ON events FOR INSERT WITH CHECK (true);
     CREATE POLICY events_sel ON events FOR SELECT USING (owner = current_user);
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO alice;
 ";
 
 const SHARED_READ_OWNER_WRITE_SCHEMA: &str = "
+    CREATE ROLE alice;
     CREATE TABLE shared_items (
         id INTEGER PRIMARY KEY,
         owner TEXT NOT NULL,
@@ -92,9 +99,11 @@ const SHARED_READ_OWNER_WRITE_SCHEMA: &str = "
         FOR INSERT WITH CHECK (owner = current_user);
     CREATE POLICY shared_items_update ON shared_items
         FOR UPDATE USING (owner = current_user) WITH CHECK (owner = current_user);
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO alice;
 ";
 
 const NESTED_OWNERSHIP_SCHEMA: &str = "
+    CREATE ROLE alice;
     CREATE TABLE item_access (
         item_id INTEGER PRIMARY KEY,
         reader TEXT NOT NULL,
@@ -119,9 +128,11 @@ const NESTED_OWNERSHIP_SCHEMA: &str = "
               AND access.writer = current_user
         )
     );
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO alice;
 ";
 
 const CASCADED_RLS_SCHEMA: &str = "
+    CREATE ROLE alice;
     CREATE TABLE parent_items (
         id INTEGER PRIMARY KEY,
         owner TEXT NOT NULL
@@ -147,9 +158,11 @@ const CASCADED_RLS_SCHEMA: &str = "
     CREATE TRIGGER copy_parent_to_child
         AFTER INSERT ON parent_items
         FOR EACH ROW EXECUTE FUNCTION copy_parent_to_child();
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO alice;
 ";
 
 const POLICY_FUNCTION_SCHEMA: &str = "
+    CREATE ROLE alice;
     CREATE TABLE policy_items (
         id INTEGER PRIMARY KEY,
         body TEXT NOT NULL
@@ -157,6 +170,7 @@ const POLICY_FUNCTION_SCHEMA: &str = "
     ALTER TABLE policy_items ENABLE ROW LEVEL SECURITY;
     CREATE POLICY policy_items_select ON policy_items FOR SELECT USING (true);
     CREATE POLICY policy_items_insert ON policy_items FOR INSERT WITH CHECK (policy_probe());
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO alice;
 ";
 
 // ---------------------------------------------------------------------------
@@ -296,13 +310,15 @@ fn strict_opts() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_rls_audit_table_name("rls_audit")
         .with_strict_rls_validation()
-        .with_session_variable(SessionVariableMapping::current_user("current_app_username"))
+        .with_deployment(deployment(["alice"], []))
+        .with_acting_role("alice")
 }
 
 fn monitor_opts() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_rls_audit_table_name("rls_audit")
-        .with_session_variable(SessionVariableMapping::current_user("current_app_username"))
+        .with_deployment(deployment(["alice"], []))
+        .with_acting_role("alice")
 }
 
 fn exemption_opts() -> Pg2SqliteOptions {
@@ -325,14 +341,16 @@ fn apply_with_exemption(pg: &str) -> SqliteConnection {
 
 fn branch_schema(policies: &str) -> String {
     format!(
-        "CREATE TABLE branch_items (
+        "CREATE ROLE alice;
+         CREATE TABLE branch_items (
              id INTEGER PRIMARY KEY,
              owner TEXT NOT NULL,
              body TEXT NOT NULL
          );
          ALTER TABLE branch_items ENABLE ROW LEVEL SECURITY;
          CREATE POLICY branch_select ON branch_items FOR SELECT USING (true);
-         {policies}"
+         {policies}
+         GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO alice;"
     )
 }
 
@@ -511,9 +529,6 @@ fn zero_policy_monitor_insert_to_backing_table_is_refused() {
 #[test]
 fn on_conflict_do_update_on_foreign_row_is_refused() {
     let mut conn = apply(GUARDED_SCHEMA, &strict_opts());
-    // Set session user to alice.
-    set_session_username("alice");
-
     // Seed bob's row directly into the backing table (bypasses INSERT trigger
     // during fixture setup; WITH CHECK(true) would also pass through the view).
     diesel::insert_into(schema::items_rls::table)
@@ -553,7 +568,6 @@ fn on_conflict_do_update_on_foreign_row_is_refused() {
 #[test]
 fn view_path_update_of_owned_row_succeeds() {
     let mut conn = apply(GUARDED_SCHEMA, &strict_opts());
-    set_session_username("alice");
 
     // Seed alice's row.
     diesel::insert_into(schema::items_rls::table)
@@ -592,7 +606,6 @@ fn view_path_update_of_owned_row_succeeds() {
 #[test]
 fn strict_monitor_allows_invisible_view_path_insert() {
     let mut conn = apply(INVISIBLE_INSERT_SCHEMA, &strict_opts());
-    set_session_username("alice");
 
     // INSERT bob-owned row through the view as alice, no RETURNING.
     // WITH CHECK(true) -> passes the INSERT trigger.
@@ -642,7 +655,6 @@ fn strict_monitor_allows_invisible_view_path_insert() {
 #[test]
 fn monitor_mode_invisible_insert_is_logged_not_refused() {
     let mut conn = apply(INVISIBLE_INSERT_SCHEMA, &monitor_opts());
-    set_session_username("alice");
 
     run_dml(
         &mut conn,
@@ -692,7 +704,6 @@ fn zero_policy_backing_insert_honours_write_exemption() {
 #[test]
 fn configured_but_unregistered_exemption_fails_closed() {
     let mut conn = apply(SHARED_READ_OWNER_WRITE_SCHEMA, &exemption_opts());
-    set_session_username("alice");
 
     let error = diesel::insert_into(schema::shared_items_rls::table)
         .values((
@@ -815,7 +826,6 @@ fn keyword_shaped_exemption_function_name_is_quoted() {
 fn hidden_exempt_row_still_reaches_monitoring() {
     let opts = exemption_opts();
     let mut conn = apply_with_exemption(INVISIBLE_INSERT_SCHEMA);
-    set_session_username("alice");
     set_write_exempt(true);
     run_dml(
         &mut conn,
@@ -901,7 +911,6 @@ fn remaining_write_guard_branches_honor_exemption() {
 #[test]
 fn exemption_covers_backing_and_view_insert() {
     let mut conn = apply_with_exemption(SHARED_READ_OWNER_WRITE_SCHEMA);
-    set_session_username("alice");
 
     assert!(
         diesel::insert_into(schema::shared_items_rls::table)
@@ -953,7 +962,6 @@ fn exemption_covers_backing_and_view_insert() {
 #[test]
 fn exemption_allows_backing_update_only_while_active() {
     let mut conn = apply_with_exemption(GUARDED_SCHEMA);
-    set_session_username("alice");
     diesel::insert_into(schema::items_rls::table)
         .values(ItemRow { id: 1, owner: "bob".to_owned(), body: "old".to_owned() })
         .execute(&mut conn)
@@ -985,7 +993,6 @@ fn exemption_allows_backing_update_only_while_active() {
 #[test]
 fn nested_ownership_policy_uses_exemption_only_at_the_backing_guard() {
     let mut conn = apply_with_exemption(NESTED_OWNERSHIP_SCHEMA);
-    set_session_username("alice");
     diesel::insert_into(schema::item_access::table)
         .values((
             schema::item_access::item_id.eq(1),
@@ -1023,7 +1030,6 @@ fn nested_ownership_policy_uses_exemption_only_at_the_backing_guard() {
 #[test]
 fn exempt_write_keeps_constraints_and_unrelated_triggers_active() {
     let mut conn = apply_with_exemption(SHARED_READ_OWNER_WRITE_SCHEMA);
-    set_session_username("alice");
     diesel::connection::SimpleConnection::batch_execute(
         &mut conn,
         "CREATE TABLE side_effects (id INTEGER PRIMARY KEY);
@@ -1065,7 +1071,6 @@ fn exempt_write_keeps_constraints_and_unrelated_triggers_active() {
 #[test]
 fn translated_trigger_view_write_inherits_exemption() {
     let mut conn = apply_with_exemption(CASCADED_RLS_SCHEMA);
-    set_session_username("alice");
     set_write_exempt(true);
 
     diesel::insert_into(schema::parent_items_rls::table)

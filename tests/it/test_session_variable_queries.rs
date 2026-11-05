@@ -13,7 +13,7 @@
 //! switching the session between two rows.
 
 use diesel::{prelude::*, sql_query};
-use helpers::{establish_connection, set_session_username};
+use helpers::{deployment::deployment, establish_connection, set_session_username};
 use pg2sqlite::{
     errors::Error,
     prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping},
@@ -114,23 +114,29 @@ fn a_query_naming_the_setting_calls_the_paired_function() {
     assert_eq!(ids_visible_to(&emitted, "bob"), vec![2]);
 }
 
+/// `current_user` answers the acting role's name as a constant, so the query
+/// answers the same rows whoever the session caller is.
 #[test]
-fn a_query_naming_current_user_calls_the_paired_function() {
+fn a_query_naming_current_user_answers_the_acting_role() {
     let options = Pg2SqliteOptions::default()
-        .with_session_variable(SessionVariableMapping::current_user(PAIRED_FUNCTION));
+        .with_deployment(deployment(["alice"], []))
+        .with_acting_role("alice");
     let emitted = translate(
-        &format!("{PG_SCHEMA} SELECT id FROM docs WHERE owner = current_user;"),
+        &format!(
+            "CREATE ROLE alice; {PG_SCHEMA} GRANT SELECT, INSERT ON docs TO alice; \
+             SELECT id FROM docs WHERE owner = current_user;"
+        ),
         &options,
     )
-    .expect("the pairing says what current_user becomes");
+    .expect("the deployment's acting role answers the reading");
 
     let query = emitted.last().expect("the query is emitted");
     assert!(
-        query.contains(&format!("{PAIRED_FUNCTION}()")),
-        "current_user becomes the paired call, got: {query}"
+        query.contains("owner = 'alice'"),
+        "current_user becomes the acting role's name, got: {query}"
     );
     assert_eq!(ids_visible_to(&emitted, "alice"), vec![1]);
-    assert_eq!(ids_visible_to(&emitted, "bob"), vec![2]);
+    assert_eq!(ids_visible_to(&emitted, "bob"), vec![1]);
 }
 
 #[test]
@@ -217,17 +223,16 @@ fn a_query_naming_an_unpaired_setting_refuses() {
 }
 
 #[test]
-fn a_query_naming_an_unpaired_current_user_refuses() {
+fn a_query_naming_current_user_without_an_acting_role_refuses() {
     let error = translate(
         &format!("{PG_SCHEMA} SELECT id FROM docs WHERE owner = current_user;"),
         &Pg2SqliteOptions::default(),
     )
-    .expect_err("nothing says what current_user becomes");
+    .expect_err("nothing names the role the statement acts as");
 
     assert!(
-        matches!(&error, Error::SessionVariableMappingNotFound { pattern }
-            if pattern.contains("current_user")),
-        "the refusal is the mapping's own, got: {error}"
+        matches!(&error, Error::ActingRoleRequired { reading } if reading == "current_user"),
+        "the refusal names the reading, got: {error}"
     );
 }
 

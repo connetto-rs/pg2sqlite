@@ -21,13 +21,14 @@
 //! section.
 
 use diesel::prelude::*;
-use helpers::{establish_connection, set_session_username};
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
+use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
-use crate::helpers;
+use crate::helpers::{deployment::deployment, establish_connection};
 
+/// The translation runs as `alice`, whose name `current_user` answers, so
 /// Alice can SELECT both rows, but UPDATE and DELETE only her own.
 const DIVERGE_SCHEMA: &str = "
+    CREATE ROLE alice;
     CREATE TABLE docs (
         id INTEGER PRIMARY KEY,
         owner TEXT NOT NULL,
@@ -38,11 +39,13 @@ const DIVERGE_SCHEMA: &str = "
     CREATE POLICY docs_upd ON docs FOR UPDATE USING (owner = current_user);
     CREATE POLICY docs_del ON docs FOR DELETE USING (owner = current_user);
     CREATE POLICY docs_ins ON docs FOR INSERT WITH CHECK (true);
+    GRANT SELECT, INSERT, UPDATE, DELETE ON docs TO alice;
 ";
 
 /// Rows 1 to 3 are readable and rows 2 to 4 writable, so row 1 is readable
 /// and not writable and row 4 writable and not readable.
 const BLIND_SCHEMA: &str = "
+    CREATE ROLE alice;
     CREATE TABLE items (
         id INTEGER PRIMARY KEY,
         v INTEGER NOT NULL
@@ -52,10 +55,12 @@ const BLIND_SCHEMA: &str = "
     CREATE POLICY items_upd ON items FOR UPDATE USING (id >= 2);
     CREATE POLICY items_del ON items FOR DELETE USING (id >= 2);
     CREATE POLICY items_ins ON items FOR INSERT WITH CHECK (true);
+    GRANT SELECT, INSERT, UPDATE, DELETE ON items TO alice;
 ";
 
 /// Every row is writable and only rows 1 and 2 are readable.
 const MOVE_OUT_SCHEMA: &str = "
+    CREATE ROLE alice;
     CREATE TABLE items (
         id INTEGER PRIMARY KEY,
         v INTEGER NOT NULL
@@ -64,6 +69,7 @@ const MOVE_OUT_SCHEMA: &str = "
     CREATE POLICY items_sel ON items FOR SELECT USING (id <= 2);
     CREATE POLICY items_upd ON items FOR UPDATE USING (true);
     CREATE POLICY items_ins ON items FOR INSERT WITH CHECK (true);
+    GRANT SELECT, INSERT, UPDATE, DELETE ON items TO alice;
 ";
 
 mod schema {
@@ -100,11 +106,13 @@ struct DocRow {
     body: String,
 }
 
+/// Runs as `alice`, the role every schema below declares.
 fn strict_opts() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_rls_audit_table_name("rls_arch_audit")
         .with_strict_rls_validation()
-        .with_session_variable(SessionVariableMapping::current_user("current_app_username"))
+        .with_deployment(deployment(["alice"], []))
+        .with_acting_role("alice")
 }
 
 fn apply(pg_schema: &str) -> SqliteConnection {
@@ -235,7 +243,6 @@ fn reading_update_matches_postgres() {
 #[test]
 fn delete_returning_through_view_reports_skipped_rows() {
     let mut conn = apply(DIVERGE_SCHEMA);
-    set_session_username("alice");
 
     // Seed: alice owns row 1, bob owns row 2.
     diesel::insert_into(schema::docs_rls::table)

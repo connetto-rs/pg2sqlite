@@ -10,7 +10,7 @@ use diesel::prelude::*;
 use helpers::establish_connection;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
-use crate::helpers;
+use crate::{helpers, helpers::deployment::deployment};
 
 // Schema definitions for test tables
 //
@@ -184,7 +184,8 @@ fn test_role_filtered_vector_translation_keeps_vec0_artifacts()
     "#;
 
     let options = Pg2SqliteOptions::default()
-        .with_session_user_role("readonly_user".to_string())
+        .with_deployment(deployment(["readonly_user"], []))
+        .with_acting_role("readonly_user")
         .with_rls_audit_table_name("rls_audit".to_string());
     let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
     let output = translated.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");

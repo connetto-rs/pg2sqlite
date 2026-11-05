@@ -48,7 +48,7 @@ use crate::{
         },
     },
     prelude::Pg2SqliteOptions,
-    traits::{SessionVariableMapping, SessionVariablePattern, translator::TranslatorWithContext},
+    traits::translator::TranslatorWithContext,
 };
 
 /// Represents a function translation result.
@@ -156,12 +156,9 @@ enum FunctionTranslation {
     /// `cbrt(x)` translated to `pow(x, (1.0 / 3.0))` when math functions are
     /// available.
     ToCbrt,
-    /// A session variable pattern no mapping pairs, which refuses in the
-    /// mapping's own words rather than as an unknown function.
-    UnpairedSessionVariable(SessionVariablePattern),
-    /// A session variable pattern a mapping pairs, read as one value, which
-    /// becomes the paired call.
-    PairedSessionVariable(SessionVariableMapping),
+    /// A reading of the session, a role the deployment answers or a setting
+    /// its mapping answers.
+    SessionRead(session_variable::SessionRead),
     /// `array_agg`, which answers NULL over no rows where `json_group_array`
     /// answers `'[]'`. Wrapped in `NULLIF(json_group_array(...), '[]')`.
     /// The reverse translator restores `json_agg` from this shape since the
@@ -574,20 +571,17 @@ fn translate_catalog_function(
     args: &FunctionArguments,
     options: &crate::options::TranslationContext<'_>,
 ) -> FunctionTranslation {
-    // The caller's identity, wherever it is named. A mapping says which
-    // function the replica answers it with, and it applies to a query exactly
-    // as it applies to a policy predicate.
-    if let Some(pattern) = session_variable::pattern_of(original_name, args) {
-        return match options.find_session_variable(&pattern) {
-            Some(mapping) => FunctionTranslation::PairedSessionVariable(mapping.clone()),
-            // A declared name is evidence the destination registered this very
-            // function, which is a different claim from a mapping and is left
-            // to stand.
-            None if options.declares_user_defined_function(original_name) => {
-                FunctionTranslation::PassThrough
-            }
-            None => FunctionTranslation::UnpairedSessionVariable(pattern),
-        };
+    // The roles and settings a statement reads, wherever they are named. A
+    // declared name is evidence the destination registered this very function,
+    // which is a different claim from a mapping and is left to stand.
+    if let Some(read) = session_variable::session_read_of(original_name, args) {
+        if let session_variable::SessionRead::Setting(name) = &read
+            && options.find_session_variable(&session_variable::setting_pattern(name)).is_none()
+            && options.declares_user_defined_function(original_name)
+        {
+            return FunctionTranslation::PassThrough;
+        }
+        return FunctionTranslation::SessionRead(read);
     }
 
     // Fast path: check static rename table first.
@@ -2671,12 +2665,8 @@ impl crate::traits::translator::TranslatorWithContext for Function {
             FunctionTranslation::Unsupported(msg) => {
                 Err(crate::errors::Error::forward_refusal(msg))
             }
-            FunctionTranslation::UnpairedSessionVariable(pattern) => {
-                Err(session_variable::unpaired(&pattern))
-            }
-            FunctionTranslation::PairedSessionVariable(mapping) => {
-                session_variable::scalar_reading(&mapping)?;
-                Ok(session_variable::paired_call(&mapping))
+            FunctionTranslation::SessionRead(read) => {
+                session_variable::translate_session_read(&read, schema, options)
             }
             FunctionTranslation::PassThrough => {
                 let translated_args =

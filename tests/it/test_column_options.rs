@@ -7,7 +7,7 @@
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 use translate_helpers::translate_default as translate;
 
-use crate::helpers::translate as translate_helpers;
+use crate::helpers::{deployment::deployment, translate as translate_helpers};
 
 fn translate_with_options(sql: &str, options: &Pg2SqliteOptions) -> String {
     Pg2Sqlite::default()
@@ -162,7 +162,8 @@ fn fk_to_rls_table_gets_renamed() {
     "#;
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
-        .with_session_user_role("authenticated".to_string())
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated")
         .with_rls_audit_table_name("rls_audit".to_string())
         .with_session_variable(SessionVariableMapping::current_setting(
             "app.user_id",

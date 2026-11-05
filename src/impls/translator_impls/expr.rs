@@ -1864,8 +1864,12 @@ fn mapped_setting<'o>(
     options: &'o crate::options::TranslationContext<'_>,
 ) -> Option<&'o SessionVariableMapping> {
     let Expr::Function(function) = session_variable::setting_operand(expr) else { return None };
-    let pattern = session_variable::pattern_of_function(function)?;
-    options.find_session_variable(&pattern)
+    let Some(session_variable::SessionRead::Setting(name)) =
+        session_variable::session_read_of_function(function)
+    else {
+        return None;
+    };
+    options.find_session_variable(&session_variable::setting_pattern(&name))
 }
 
 /// `= ANY` or `<> ALL` with an interval left side: the array literal's
@@ -3923,6 +3927,9 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
         emit: &mut dyn FnMut(crate::warnings::TranslationWarning),
     ) -> Result<Self::SQLiteEntry, crate::errors::Error> {
         reject_unstored_vector_reference(self, schema, options)?;
+        if let Some(read) = session_variable::translate_expr_read(self, schema, options)? {
+            return Ok(read);
+        }
         Ok(match self {
             // PostgreSQL's other spellings of a string literal have no SQLite
             // form: `$$hello$$` reads there as a parameter named `$hello$`,

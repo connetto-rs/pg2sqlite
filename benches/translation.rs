@@ -123,11 +123,14 @@ fn bench_schema_translation(c: &mut Criterion) {
 
 fn bench_rls_translation(c: &mut Criterion) {
     // RLS fixtures require session variable configuration
+    let deployment = sql_traits::structs::Deployment::new("authenticated", ["authenticated"], [])
+        .expect("a valid deployment");
+
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuid7")
-        .with_session_user_role("authenticated")
-        .with_session_variable(SessionVariableMapping::current_user("current_app_user"))
+        .with_deployment(deployment)
+        .with_acting_role("authenticated")
         .with_session_variable(SessionVariableMapping::current_setting(
             "app.user_id",
             "current_app_user",
@@ -141,7 +144,7 @@ fn bench_rls_translation(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("rls_translation");
 
-    // The session role acts with its grants, and the schema owner owns the
+    // The acting role acts with its grants, and the schema owner owns the
     // `_unfiltered` views rls_grants.sql reads from its policies.
     let roles = "CREATE ROLE authenticated; CREATE ROLE migrator;";
     let grants =

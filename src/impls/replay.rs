@@ -84,23 +84,30 @@ impl ReplayCheck<'_, '_> {
     /// True when the call names a function this crate knows and knows to be
     /// deterministic.
     ///
-    /// A session variable the options map counts, under either of its names
-    /// and ahead of the name inventories, since a pairing is the caller
-    /// stating what the name means here. `current_setting` and
-    /// `current_user` are STABLE in PostgreSQL, and row level security
-    /// already reads the function the mapping names once per row, so a host
-    /// whose function answered differently per call would already have an
-    /// incoherent replica. A call of the same shape with no mapping is a
-    /// function the caller declared and nothing more, so it stays unknown.
+    /// A reading of the session counts, a role keyword and a mapped setting
+    /// under either of its names, ahead of the name inventories. A role is a
+    /// literal once translated, and `current_setting` is STABLE in
+    /// PostgreSQL, and row level security already reads the function the
+    /// mapping names once per row, so a host whose function answered
+    /// differently per call would already have an incoherent replica. A
+    /// `current_setting` no mapping pairs stays unknown.
     fn call_replays(&self, function: &Function) -> bool {
         let Some(name) = crate::impls::object_name::last_ident(&function.name) else {
             return false;
         };
         let name = name.value.to_ascii_lowercase();
-        if session_variable::pattern_of_function(function)
-            .is_some_and(|pattern| self.options.find_session_variable(&pattern).is_some())
-            || session_variable::mapping_for_function(&name, self.options).is_some()
-        {
+        let session = session_variable::session_read_of_function(function).is_some_and(|read| {
+            match read {
+                session_variable::SessionRead::Setting(setting) => {
+                    self.options
+                        .find_session_variable(&session_variable::setting_pattern(&setting))
+                        .is_some()
+                }
+                session_variable::SessionRead::ActingRole(_)
+                | session_variable::SessionRead::LoginRole => true,
+            }
+        });
+        if session || session_variable::mapping_for_function(&name, self.options).is_some() {
             return true;
         }
         if VOLATILE.binary_search(&name.as_str()).is_ok() {

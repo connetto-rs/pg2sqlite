@@ -59,8 +59,6 @@ pub enum UuidVersion {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum SessionVariablePattern {
-    /// Matches `current_user` in PostgreSQL.
-    CurrentUser,
     /// Matches `current_setting('variable_name')` in PostgreSQL.
     CurrentSetting {
         /// The name of the session variable (e.g., "app.user_id").
@@ -70,10 +68,8 @@ pub enum SessionVariablePattern {
 
 impl core::fmt::Display for SessionVariablePattern {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::CurrentUser => write!(f, "current_user"),
-            Self::CurrentSetting { name } => write!(f, "current_setting('{name}')"),
-        }
+        let Self::CurrentSetting { name } = self;
+        write!(f, "current_setting('{name}')")
     }
 }
 
@@ -128,12 +124,6 @@ impl SessionVariableMapping {
             value: SessionVariableValue::Scalar { pg_type: None },
             missing_ok: true,
         }
-    }
-
-    /// Creates a mapping for `current_user`.
-    #[must_use]
-    pub fn current_user(sqlite_function: impl Into<String>) -> Self {
-        Self::new(SessionVariablePattern::CurrentUser, sqlite_function)
     }
 
     /// Creates a mapping for `current_setting('name')`.

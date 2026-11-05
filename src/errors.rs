@@ -160,12 +160,52 @@ pub enum Error {
         /// SQL rendering of the expression.
         expression: String,
     },
+    /// Error when a statement reads the session and no deployment declares
+    /// what it reads.
+    #[error(
+        "{reading} reads what the deployment declares, and no deployment is configured. Pass \
+         the deployment with `with_deployment(...)`, declaring the login role and the acting \
+         roles."
+    )]
+    DeploymentRequired {
+        /// What the statement reads, as it is written.
+        reading: String,
+    },
+    /// Error when a statement reads the acting role and the translation names
+    /// none.
+    #[error(
+        "{reading} is the acting role, and this translation names none. Name the deployment \
+         acting role the replica serves with `with_acting_role(...)`."
+    )]
+    ActingRoleRequired {
+        /// What the statement reads, as it is written.
+        reading: String,
+    },
+    /// Error when the acting role is not one of the deployment's acting roles.
+    #[error(
+        "The acting role '{role}' is not one of the deployment's acting roles ({declared}). \
+         Name one of them with `with_acting_role(...)`, or declare the role in the deployment."
+    )]
+    ActingRoleNotDeclared {
+        /// The role passed to `with_acting_role`.
+        role: String,
+        /// The deployment's acting roles, comma separated.
+        declared: String,
+    },
+    /// Error when a role the deployment names is not declared in the schema.
+    #[error(
+        "The deployment names the role '{role}', which the schema does not declare. Declare it \
+         with CREATE ROLE, as PostgreSQL requires before a role can log in or act."
+    )]
+    DeploymentRoleNotDeclared {
+        /// The role the schema lacks.
+        role: String,
+    },
     /// Error when a session variable pattern is encountered but no mapping is
     /// configured.
     #[error(
         "No session variable mapping configured for pattern '{pattern}'. \
-         Configure a mapping using `with_session_variable()` or `with_session_user()` \
-         in the translation options."
+         Configure a mapping using `with_session_variable()` in the translation options."
     )]
     SessionVariableMappingNotFound {
         /// The PostgreSQL pattern that was encountered.

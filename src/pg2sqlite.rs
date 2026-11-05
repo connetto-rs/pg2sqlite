@@ -1143,7 +1143,7 @@ impl Pg2Sqlite {
         let options = &options;
         let placed = crate::history::placement::place(&sources, &mut statements, schema, options)?;
 
-        let role = options.get_session_user_role().and_then(|name| schema.role(name));
+        let role = crate::impls::session_variable::acting_role(schema, options)?;
 
         let mut entries = Vec::new();
         for table in schema.tables() {

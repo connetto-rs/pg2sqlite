@@ -6,15 +6,18 @@
 //! - Foreign-key references pointing at the backing table
 //! - View and trigger names derived from the backing table
 
+use diesel::{connection::SimpleConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
-use rusqlite::Connection;
+
+use crate::helpers::deployment::deployment;
 
 fn make_options_with_suffix(suffix: &str) -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
         .with_rls_table_suffix(suffix)
-        .with_session_user_role("authenticated".to_string())
+        .with_deployment(deployment(["authenticated"], []))
+        .with_acting_role("authenticated")
         .with_rls_audit_table_name("rls_audit".to_string())
         .with_session_variable(SessionVariableMapping::current_setting(
             "app.user_id",
@@ -51,9 +54,9 @@ fn test_custom_suffix_renames_backing_table() {
         sql_output.contains("CREATE VIEW documents "),
         "View should still be named 'documents' (no suffix), got:\n{sql_output}"
     );
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = SqliteConnection::establish(":memory:").expect("open in-memory SQLite");
     for stmt in &translated {
-        conn.execute_batch(&format!("{stmt};")).unwrap();
+        conn.batch_execute(&format!("{stmt};")).expect("apply the emitted statement");
     }
 }
 
@@ -87,13 +90,11 @@ fn test_custom_suffix_in_foreign_keys() {
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
         .with_rls_table_suffix("_secure")
-        .with_session_user_role("authenticated".to_string())
         .with_rls_audit_table_name("rls_audit".to_string())
         .with_session_variable(SessionVariableMapping::current_setting(
             "app.user_id",
             "current_app_user",
-        ))
-        .with_session_variable(SessionVariableMapping::current_user("current_app_username"));
+        ));
 
     let translated = Pg2Sqlite::default().sql(sql).unwrap().translate(&options).unwrap().into_vec();
     let sql_output = translated.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
@@ -108,8 +109,8 @@ fn test_custom_suffix_in_foreign_keys() {
         !sql_output.contains("REFERENCES users_rls"),
         "FK must not reference 'users_rls' when custom suffix is set, got:\n{sql_output}"
     );
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = SqliteConnection::establish(":memory:").expect("open in-memory SQLite");
     for stmt in &translated {
-        conn.execute_batch(&format!("{stmt};")).unwrap();
+        conn.batch_execute(&format!("{stmt};")).expect("apply the emitted statement");
     }
 }

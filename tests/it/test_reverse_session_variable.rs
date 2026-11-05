@@ -96,35 +96,6 @@ fn a_parameterised_recorded_type_keeps_its_parameters() {
 }
 
 #[test]
-fn the_current_user_pattern_becomes_the_bare_keyword() {
-    let options = Pg2SqliteOptions::default()
-        .with_session_variable(SessionVariableMapping::current_user("sqlite_user"));
-
-    let postgres = reverse("SELECT * FROM docs WHERE title = sqlite_user()", &options)
-        .expect("the mapping says the function stands for the role");
-
-    assert!(
-        postgres.contains("current_user") && !postgres.contains("current_user()"),
-        "PostgreSQL refuses `current_user()` with parentheses, so the keyword is bare, got: \
-         {postgres}"
-    );
-}
-
-#[test]
-fn one_function_from_both_patterns_becomes_the_setting() {
-    let options = Pg2SqliteOptions::default().with_session_user(SETTING, PAIRED_FUNCTION);
-
-    let postgres = reverse("SELECT * FROM docs WHERE title = app_user_id()", &options)
-        .expect("both patterns pair with this function, and one of them has to win");
-
-    assert!(
-        postgres.contains("current_setting('app.user_id', true)"),
-        "the setting the application binds wins over the role the connection opened as, got: \
-         {postgres}"
-    );
-}
-
-#[test]
 fn the_paired_function_called_with_arguments_refuses() {
     let error = reverse("SELECT * FROM docs WHERE title = app_user_id(title)", &setting_paired())
         .expect_err("the paired function takes no arguments");

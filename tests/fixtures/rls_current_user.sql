@@ -1,5 +1,5 @@
 -- RLS policies using PostgreSQL current_user instead of current_setting()
--- Tests translation of current_user to a mapped SQLite function
+-- Exercises role-name-based identity: current_user is the acting role's name
 
 CREATE TABLE profiles (
     id UUID PRIMARY KEY DEFAULT uuidv7(),

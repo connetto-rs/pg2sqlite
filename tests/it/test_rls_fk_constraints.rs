@@ -34,7 +34,6 @@ fn translation_options() -> Pg2SqliteOptions {
             "app.user_id",
             "current_app_user",
         ))
-        .with_session_variable(SessionVariableMapping::current_user("current_app_username"))
         .with_rls_audit_table_name("rls_audit".to_string())
 }
 

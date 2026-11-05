@@ -11,10 +11,10 @@
 //! and are left untouched by the translator.
 
 use diesel::prelude::*;
-use helpers::{apply_translated_ddl as apply, set_session_username};
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
+use helpers::apply_translated_ddl as apply;
+use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
-use crate::helpers;
+use crate::{helpers, helpers::deployment::deployment};
 
 mod schema {
     diesel::table! {
@@ -40,6 +40,7 @@ use schema::{items_rls, things};
 /// Policy compares the owner column against the current user's name so that
 /// TEXT-to-TEXT comparisons work without UUID/BLOB casting.
 const SCHEMA: &str = "
+    CREATE ROLE alice;
     CREATE TABLE items (
         id INTEGER PRIMARY KEY,
         owner TEXT NOT NULL,
@@ -49,26 +50,31 @@ const SCHEMA: &str = "
     CREATE POLICY items_select ON items FOR SELECT USING (owner = current_user);
     CREATE POLICY items_write ON items FOR INSERT WITH CHECK (owner = current_user);
     CREATE POLICY items_update ON items FOR UPDATE USING (owner = current_user);
+    GRANT SELECT, INSERT, UPDATE, DELETE ON items TO alice;
 ";
 
 const NO_POLICY_SCHEMA: &str = "
+    CREATE ROLE alice;
     CREATE TABLE things (
         id INTEGER PRIMARY KEY,
         val INTEGER NOT NULL DEFAULT 0
     );
+    GRANT SELECT, INSERT, UPDATE, DELETE ON things TO alice;
 ";
 
 fn strict_opts() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_rls_audit_table_name("rls_audit")
         .with_strict_rls_validation()
-        .with_session_variable(SessionVariableMapping::current_user("current_app_username"))
+        .with_deployment(deployment(["alice"], []))
+        .with_acting_role("alice")
 }
 
 fn default_opts() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_rls_audit_table_name("rls_audit")
-        .with_session_variable(SessionVariableMapping::current_user("current_app_username"))
+        .with_deployment(deployment(["alice"], []))
+        .with_acting_role("alice")
 }
 
 /// Translates `pg_dml` in the context of `schema` and executes the result.
@@ -123,7 +129,6 @@ fn dml_translation_err(pg_dml: &str, schema: &str, opts: &Pg2SqliteOptions) -> S
 /// and the DO NOTHING is handled at the real table level.
 #[test]
 fn strict_do_nothing_leaves_existing_row_unchanged() {
-    set_session_username("alice");
     let mut conn = apply(SCHEMA, &strict_opts());
     diesel::insert_into(items_rls::table)
         .values((items_rls::id.eq(1), items_rls::owner.eq("alice"), items_rls::val.eq(10)))
@@ -151,7 +156,6 @@ fn strict_do_nothing_leaves_existing_row_unchanged() {
 /// and the DO UPDATE lands the new value.
 #[test]
 fn strict_do_update_stores_the_updated_value() {
-    set_session_username("alice");
     let mut conn = apply(SCHEMA, &strict_opts());
     diesel::insert_into(items_rls::table)
         .values((items_rls::id.eq(1), items_rls::owner.eq("alice"), items_rls::val.eq(10)))
@@ -180,7 +184,6 @@ fn strict_do_update_stores_the_updated_value() {
 /// otherwise skip the row.
 #[test]
 fn strict_upsert_policy_violation_is_refused() {
-    set_session_username("alice");
     let mut conn = apply(SCHEMA, &strict_opts());
     diesel::insert_into(items_rls::table)
         .values((items_rls::id.eq(1), items_rls::owner.eq("alice"), items_rls::val.eq(10)))
@@ -216,7 +219,6 @@ fn strict_upsert_policy_violation_is_refused() {
 /// and the remedy.
 #[test]
 fn default_mode_do_nothing_is_refused_at_translation() {
-    set_session_username("alice");
     let err = dml_translation_err(
         "INSERT INTO items (id, owner, val) VALUES (1, 'alice', 20) ON CONFLICT (id) DO NOTHING",
         SCHEMA,
@@ -230,7 +232,6 @@ fn default_mode_do_nothing_is_refused_at_translation() {
 
 #[test]
 fn default_mode_do_update_is_refused_at_translation() {
-    set_session_username("alice");
     let err = dml_translation_err(
         "INSERT INTO items (id, owner, val) VALUES (1, 'alice', 20) \
          ON CONFLICT (id) DO UPDATE SET val = excluded.val",
@@ -253,7 +254,6 @@ fn default_mode_do_update_is_refused_at_translation() {
 /// refuses on views, so only the OR IGNORE form can exercise this path.
 #[test]
 fn insert_or_ignore_through_view_still_works() {
-    set_session_username("alice");
     let mut conn = apply(SCHEMA, &default_opts());
 
     diesel::sql_query("INSERT OR IGNORE INTO items (id, owner, val) VALUES (1, 'alice', 10)")
@@ -273,7 +273,6 @@ fn insert_or_ignore_through_view_still_works() {
 /// the OR REPLACE semantics on a view.
 #[test]
 fn insert_or_replace_through_view_still_works() {
-    set_session_username("alice");
     let mut conn = apply(SCHEMA, &default_opts());
 
     diesel::sql_query("INSERT OR REPLACE INTO items (id, owner, val) VALUES (1, 'alice', 10)")
