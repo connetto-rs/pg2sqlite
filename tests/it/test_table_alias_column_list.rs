@@ -39,7 +39,7 @@ fn probe_column_names(query: &str) -> Vec<String> {
     let prepared = connection
         .prepare(&probe)
         .unwrap_or_else(|error| panic!("emitted probe failed: {error}\n{probe}"));
-    prepared.column_names().into_iter().map(str::to_string).collect()
+    prepared.column_names().map(str::to_string).collect()
 }
 
 fn refuse(query: &str) -> String {
