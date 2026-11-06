@@ -3,7 +3,10 @@
 
 use sql_traits::structs::ParserDB;
 use sqlparser::{
-    ast::{Expr, Query, TableWithJoins, UnaryOperator, Value, ValueWithSpan, WindowType},
+    ast::{
+        Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Query, TableWithJoins,
+        UnaryOperator, Value, ValueWithSpan, WindowType,
+    },
     tokenizer::Span,
 };
 
@@ -16,6 +19,7 @@ use crate::{
         object_name::validate_schema_qualified_object_name_for_sqlite,
         reverse_translator_impls::ident_quoting::refuse_sqlite_specific_names,
         shared_helpers::TranslationDirection,
+        translator_impls::expr::sqlite_json_path_to_pg_text_path,
     },
     prelude::{Pg2SqliteOptions, ReverseTranslator},
 };
@@ -151,4 +155,37 @@ define_direction_wrappers! {
     direction = Reverse;
     fn reverse_translate_table_with_joins(table_with_joins: &TableWithJoins) -> TableWithJoins = translate_table_with_joins;
     fn reverse_translate_window_type(over: Option<&WindowType>) -> Option<WindowType> = translate_window_type;
+}
+
+/// The PostgreSQL text path for the single-quoted literal at `index` in
+/// `exprs`, with the caller's refusal texts for a non-literal path and for a
+/// path the conversion cannot express.
+pub(crate) fn reversed_json_path(
+    exprs: &[&Expr],
+    index: usize,
+    literal_refusal: String,
+    path_refusal: String,
+) -> Result<String, Error> {
+    let Some(Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(literal), .. })) =
+        exprs.get(index)
+    else {
+        return Err(Error::reverse_refusal(literal_refusal));
+    };
+    sqlite_json_path_to_pg_text_path(literal).ok_or_else(|| Error::reverse_refusal(path_refusal))
+}
+
+/// The single-quoted string at `index` in the list form of `args`, when
+/// `index` is the list's last argument.
+pub(crate) fn string_modifier_at(args: &FunctionArguments, index: usize) -> Option<&str> {
+    let FunctionArguments::List(list) = args else { return None };
+    if index + 1 != list.args.len() {
+        return None;
+    }
+    match list.args.get(index)? {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(ValueWithSpan {
+            value: Value::SingleQuotedString(s),
+            ..
+        }))) => Some(s),
+        _ => None,
+    }
 }

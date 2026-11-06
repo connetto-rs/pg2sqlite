@@ -6,7 +6,7 @@ use sqlparser::ast::{Ident, ObjectName, Query, SetExpr, Statement, TableFactor, 
 
 use crate::impls::{
     object_name::{last_ident, last_ident_value_or_display},
-    relation_scope::RelationScopes,
+    relation_scope::{RelationScopes, scope_visit_hooks},
 };
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
@@ -58,10 +58,7 @@ impl RelationCollector {
 impl Visitor for RelationCollector {
     type Break = ();
 
-    fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<Self::Break> {
-        self.scopes.record_targets(statement);
-        ControlFlow::Continue(())
-    }
+    scope_visit_hooks!(&Statement, &Query);
 
     fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
         self.scopes.enter(query);
@@ -74,11 +71,6 @@ impl Visitor for RelationCollector {
             let parts = table.schema_name.iter().cloned().chain([name.clone()]);
             self.occurrences.push(ObjectName::from(parts.collect::<Vec<_>>()));
         }
-        ControlFlow::Continue(())
-    }
-
-    fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
-        self.scopes.exit();
         ControlFlow::Continue(())
     }
 

@@ -930,6 +930,17 @@ impl<'a> RlsTriggerContext<'a> {
     }
 }
 
+/// The trigger context and the row-security answer a write trigger generator
+/// reads for `statement` on `table`.
+fn write_trigger_prologue<'s>(
+    table: &'s CreateTable,
+    schema: &'s ParserDB,
+    statement: RowStatement,
+    options: &Pg2SqliteOptions,
+) -> Result<(RlsTriggerContext<'s>, Rows<'s>), Error> {
+    Ok((RlsTriggerContext::new(table, options), row_security(table, schema, statement, options)?))
+}
+
 fn push_pattern_unique(patterns: &mut Vec<SessionRead>, pattern: SessionRead) {
     if !patterns.contains(&pattern) {
         patterns.push(pattern);
@@ -2002,9 +2013,9 @@ fn generate_insert_trigger_sql(
     grants: &RoleTable,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Statement, Error> {
-    let ctx = RlsTriggerContext::new(table, options);
+    let (ctx, rows) =
+        write_trigger_prologue(table, schema, RowStatement::Insert { returning: false }, options)?;
     let table_name = ctx.table_name;
-    let rows = row_security(table, schema, RowStatement::Insert { returning: false }, options)?;
     let WriteGuard { columns, check, .. } =
         build_write_guard(&rows, GuardKind::Insert, table, schema, options, Some(grants), emit)?;
     // A column the view does not hold is left to the backing table's default.
@@ -2096,10 +2107,15 @@ pub(crate) fn write_guard_condition_expr(
     }
 }
 
+/// The guard that a denied write passes on the exemption call.
+fn exemption_guard(call: Expr) -> Expr {
+    Expr::IsTrue(Box::new(Expr::Nested(Box::new(call))))
+}
+
 fn policy_or_exemption_expr(predicate: Expr, options: &Pg2SqliteOptions) -> Expr {
     write_exemption_expr(options).map_or(predicate.clone(), |call| {
         Expr::BinaryOp {
-            left: Box::new(Expr::IsTrue(Box::new(Expr::Nested(Box::new(call))))),
+            left: Box::new(exemption_guard(call)),
             op: BinaryOperator::Or,
             right: Box::new(Expr::Nested(Box::new(predicate))),
         }
@@ -2225,8 +2241,8 @@ fn generate_insert_check_trigger_sql(
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Option<Statement>, Error> {
-    let ctx = RlsTriggerContext::new(table, options);
-    let rows = row_security(table, schema, RowStatement::Insert { returning: false }, options)?;
+    let (ctx, rows) =
+        write_trigger_prologue(table, schema, RowStatement::Insert { returning: false }, options)?;
     let (condition, message) = if rows.has_no_policy(GatedCommand::Insert, RowVersion::Inserted) {
         (write_guard_condition_expr(None, options), no_policy(WriteCommand::Insert, ctx.table_name))
     } else {
@@ -2353,9 +2369,9 @@ fn generate_update_check_trigger_sql(
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Option<Statement>, Error> {
-    let ctx = RlsTriggerContext::new(table, options);
     // Triggers cannot tell a blind write from one reading a column.
-    let rows = row_security(table, schema, RowStatement::Update { reads: true }, options)?;
+    let (ctx, rows) =
+        write_trigger_prologue(table, schema, RowStatement::Update { reads: true }, options)?;
     let violation = if rows.has_no_policy(GatedCommand::Update, RowVersion::Existing)
         && rows.has_no_policy(GatedCommand::Update, RowVersion::Updated)
     {
@@ -2390,8 +2406,8 @@ fn generate_delete_check_trigger_sql(
     if options.get_write_exemption_function().is_none() {
         return Ok(None);
     }
-    let ctx = RlsTriggerContext::new(table, options);
-    let rows = row_security(table, schema, RowStatement::Delete { reads: true }, options)?;
+    let (ctx, rows) =
+        write_trigger_prologue(table, schema, RowStatement::Delete { reads: true }, options)?;
     let violation = match combine_policy_predicates(
         rows.gate(GatedCommand::Delete, RowVersion::Existing),
         PolicyBindings { prefix: Some("OLD"), substitutions: &[], stored: &[] },
@@ -2531,10 +2547,10 @@ fn update_body(
     grants: &RoleTable,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Vec<Statement>, Error> {
-    let ctx = RlsTriggerContext::new(table, options);
-    let table_name = ctx.table_name;
     // Triggers cannot tell a blind write from one reading a column.
-    let rows = row_security(table, schema, RowStatement::Update { reads: true }, options)?;
+    let (ctx, rows) =
+        write_trigger_prologue(table, schema, RowStatement::Update { reads: true }, options)?;
+    let table_name = ctx.table_name;
     let columns = collect_column_names(table, schema)?;
     let primary_key = collect_pk_column_names(table, schema)?;
     let WriteGuard { columns: assigned, using, check, read_back } =
@@ -2557,8 +2573,7 @@ fn update_body(
     let using_denies = rows.has_no_policy(GatedCommand::Update, RowVersion::Existing)
         || matches!(using, PolicyPredicate::DenyAll);
     let authorization = if using_denies {
-        write_exemption_expr(options)
-            .map(|call| Expr::IsTrue(Box::new(Expr::Nested(Box::new(call)))))
+        write_exemption_expr(options).map(exemption_guard)
     } else {
         using_predicate.clone().map(|predicate| policy_or_exemption_expr(predicate, options))
     };
@@ -2638,9 +2653,9 @@ fn delete_body(
     grants: &RoleTable,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Vec<Statement>, Error> {
-    let ctx = RlsTriggerContext::new(table, options);
+    let (ctx, rows) =
+        write_trigger_prologue(table, schema, RowStatement::Delete { reads: true }, options)?;
     let table_name = ctx.table_name;
-    let rows = row_security(table, schema, RowStatement::Delete { reads: true }, options)?;
     let columns = collect_column_names(table, schema)?;
     let primary_key = collect_pk_column_names(table, schema)?;
     let on_view = trigger_columns(table, schema, options, Some(grants))?;
@@ -2656,8 +2671,7 @@ fn delete_body(
     let using_denies = rows.has_no_policy(GatedCommand::Delete, RowVersion::Existing)
         || matches!(using, PolicyPredicate::DenyAll);
     let authorization = if using_denies {
-        write_exemption_expr(options)
-            .map(|call| Expr::IsTrue(Box::new(Expr::Nested(Box::new(call)))))
+        write_exemption_expr(options).map(exemption_guard)
     } else {
         match &using {
             PolicyPredicate::Expr(predicate) => {

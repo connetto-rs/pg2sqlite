@@ -9,7 +9,7 @@ use sqlparser::ast::{
 };
 
 use super::{
-    helpers::{Reverse, reverse_translate_window_type},
+    helpers::{Reverse, reverse_translate_window_type, reversed_json_path, string_modifier_at},
     storage_shape::{declared_data_type, is_array_type},
 };
 #[cfg(not(feature = "std"))]
@@ -338,12 +338,7 @@ pub fn reverse_function(
             if is_now_localtime_args(args) {
                 return FunctionReversal::ToBareKeyword("LOCALTIMESTAMP");
             }
-            if let FunctionArguments::List(list) = args
-                && list.args.len() == 2
-                && let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
-                    ValueWithSpan { value: Value::SingleQuotedString(modifier), .. },
-                )))) = list.args.get(1)
-            {
+            if let Some(modifier) = string_modifier_at(args, 1) {
                 if let Some(zone) = normalize_timezone_modifier_for_postgres(modifier) {
                     return FunctionReversal::ToAtTimeZone(zone);
                 }
@@ -371,16 +366,7 @@ pub fn reverse_function(
             // an epoch conversion cannot be emitted. The refusal names the
             // modifier when there is exactly one, and stays generic for a
             // chain, whose first modifier alone would mislead (R98).
-            let sole_modifier = if let FunctionArguments::List(list) = args
-                && list.args.len() == 2
-                && let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
-                    ValueWithSpan { value: Value::SingleQuotedString(modifier), .. },
-                )))) = list.args.get(1)
-            {
-                Some(modifier.clone())
-            } else {
-                None
-            };
+            let sole_modifier = string_modifier_at(args, 1).map(String::from);
             FunctionReversal::Reject(match sole_modifier {
                 Some(modifier) => {
                     format!(
@@ -1280,22 +1266,18 @@ pub fn reverse_translate_function(
             }
             let json_expr =
                 crate::prelude::ReverseTranslator::reverse_translate(exprs[0], schema, options)?;
-            let path_str = match exprs[1] {
-                Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => {
-                    sqlite_json_path_to_pg_text_path(s).ok_or_else(|| {
-                        Error::reverse_refusal(format!(
-                            "{pg_func} JSON path must be a simple dotted literal like '$.a.b'; \
-                         paths with array indices or non-dot separators cannot be converted"
-                        ))
-                    })?
-                }
-                _ => {
-                    return Err(Error::reverse_refusal(format!(
-                        "{pg_func} JSON path must be a string literal; \
-                         non-literal paths cannot be converted at translation time"
-                    )));
-                }
-            };
+            let path_str = reversed_json_path(
+                &exprs,
+                1,
+                format!(
+                    "{pg_func} JSON path must be a string literal; \
+                     non-literal paths cannot be converted at translation time"
+                ),
+                format!(
+                    "{pg_func} JSON path must be a simple dotted literal like '$.a.b'; \
+                     paths with array indices or non-dot separators cannot be converted"
+                ),
+            )?;
             let raw_value =
                 crate::prelude::ReverseTranslator::reverse_translate(exprs[2], schema, options)?;
             let value_expr = simple_function_expr("to_jsonb", vec![raw_value], None);
@@ -1315,24 +1297,16 @@ pub fn reverse_translate_function(
             }
             let json_expr =
                 crate::prelude::ReverseTranslator::reverse_translate(exprs[0], schema, options)?;
-            let path_str = match exprs[1] {
-                Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => {
-                    sqlite_json_path_to_pg_text_path(s).ok_or_else(|| {
-                        Error::reverse_refusal(
-                            "json_remove path must be a simple dotted literal like '$.a'; \
-                                                 paths with array indices cannot be converted"
-                                .to_string(),
-                        )
-                    })?
-                }
-                _ => {
-                    return Err(Error::reverse_refusal(
-                        "json_remove JSON path must be a string literal; \
+            let path_str = reversed_json_path(
+                &exprs,
+                1,
+                "json_remove JSON path must be a string literal; \
                      non-literal paths cannot be converted at translation time"
-                            .to_string(),
-                    ));
-                }
-            };
+                    .to_string(),
+                "json_remove path must be a simple dotted literal like '$.a'; \
+                     paths with array indices cannot be converted"
+                    .to_string(),
+            )?;
             Ok(Expr::BinaryOp {
                 left: Box::new(json_expr),
                 op: BinaryOperator::HashMinus,
