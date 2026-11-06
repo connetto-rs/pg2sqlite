@@ -1,8 +1,10 @@
 //! Connection replay keeps a lexical common table expression distinct from
 //! the physical relation of the same name it shadows.
 
-use diesel::{connection::SimpleConnection, prelude::*};
+use diesel::prelude::*;
 use pg2sqlite::prelude::*;
+
+use crate::helpers::replay::{open, run, script};
 
 mod schema {
     diesel::table! {
@@ -13,24 +15,6 @@ mod schema {
     }
     diesel::table! {
         shadow_out (outer_id, inner_id) { outer_id -> Integer, inner_id -> Integer, }
-    }
-}
-
-fn script(sql: &str) -> Script<String> {
-    Pg2Sqlite::default()
-        .sql(sql)
-        .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
-        .expect("translate")
-}
-
-fn open(files: &tempfile::TempDir) -> SqliteConnection {
-    SqliteConnection::establish(files.path().join("main.db").to_str().expect("path")).expect("open")
-}
-
-fn run<'a>(connection: &mut SqliteConnection, statements: impl Iterator<Item = &'a String>) {
-    for statement in statements {
-        connection.batch_execute(statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
     }
 }
 

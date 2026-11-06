@@ -3,6 +3,8 @@
 use diesel::{connection::SimpleConnection, prelude::*};
 use pg2sqlite::prelude::*;
 
+use crate::helpers::replay::run;
+
 mod schema {
     diesel::table! {
         shared.papers (id) {
@@ -67,10 +69,12 @@ fn translated(sql: &str) -> Script<String> {
         .expect("translate")
 }
 
-fn connection(files: &tempfile::TempDir) -> SqliteConnection {
+/// A connection to the `main_file` file with the existing shared file attached.
+fn connection(files: &tempfile::TempDir, main_file: &str) -> SqliteConnection {
     let mut connection =
-        SqliteConnection::establish(files.path().join("main.db").to_str().expect("path"))
+        SqliteConnection::establish(files.path().join(main_file).to_str().expect("path"))
             .expect("open main");
+    // `ATTACH` is SQLite DDL the diesel DSL cannot express.
     diesel::sql_query("ATTACH DATABASE ? AS shared")
         .bind::<diesel::sql_types::Text, _>(files.path().join("shared.db").to_str().expect("path"))
         .execute(&mut connection)
@@ -78,21 +82,19 @@ fn connection(files: &tempfile::TempDir) -> SqliteConnection {
     connection
 }
 
-fn run<'a>(connection: &mut SqliteConnection, statements: impl Iterator<Item = &'a String>) {
-    for statement in statements {
-        connection.batch_execute(statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
-    }
-}
-
 /// A connection to a new main file with the existing shared file attached.
 fn second_connection(files: &tempfile::TempDir) -> SqliteConnection {
-    let mut connection =
-        SqliteConnection::establish(files.path().join("second-main.db").to_str().expect("path"))
-            .expect("second main");
-    diesel::sql_query("ATTACH DATABASE ? AS shared")
-        .bind::<diesel::sql_types::Text, _>(files.path().join("shared.db").to_str().expect("path"))
-        .execute(&mut connection)
-        .expect("attach shared");
+    connection(files, "second-main.db")
+}
+
+/// Opens a fresh store and runs `script`'s `mode` initializer on it.
+fn initialized(
+    files: &tempfile::TempDir,
+    script: &Script<String>,
+    mode: FreshFiles,
+) -> SqliteConnection {
+    let mut connection = connection(files, "main.db");
+    run(&mut connection, script.initialize(mode).expect("initialize"));
     connection
 }
 
@@ -107,7 +109,7 @@ fn a_failed_source_transaction_rolls_back_both_file_initializers() {
         COMMIT;";
     let script = translated(sql);
     let files = tempfile::TempDir::new().expect("files");
-    let mut connection = connection(&files);
+    let mut connection = connection(&files, "main.db");
     let failure = script
         .initialize(FreshFiles::Both)
         .expect("initialization mode")
@@ -141,8 +143,7 @@ fn attached_seed_writes_run_with_their_full_text_maintenance_triggers() {
          INSERT INTO papers VALUES(1, 'needle');",
     );
     let files = tempfile::TempDir::new().expect("files");
-    let mut connection = connection(&files);
-    run(&mut connection, script.initialize(FreshFiles::Both).expect("initialize"));
+    let mut connection = initialized(&files, &script, FreshFiles::Both);
     let matches = schema::papers_fts::table
         .filter(schema::Matches::new(
             schema::papers_fts::body,
@@ -167,8 +168,7 @@ fn a_seed_write_fires_a_temporary_trigger_that_writes_the_attached_file() {
          INSERT INTO notes VALUES(1);",
     );
     let files = tempfile::TempDir::new().expect("files");
-    let mut connection = connection(&files);
-    run(&mut connection, script.initialize(FreshFiles::Both).expect("initialize"));
+    let mut connection = initialized(&files, &script, FreshFiles::Both);
     let rows = schema::papers::table
         .select((schema::papers::id, schema::papers::body))
         .load::<(i32, String)>(&mut connection)
@@ -186,15 +186,14 @@ fn renamed_attached_columns_work_during_initialization_and_reconnect() {
     );
     let files = tempfile::TempDir::new().expect("files");
     {
-        let mut connection = connection(&files);
-        run(&mut connection, script.initialize(FreshFiles::Both).expect("initialize"));
+        let mut connection = initialized(&files, &script, FreshFiles::Both);
         let labels = schema::labels::table
             .select(schema::labels::title)
             .load::<String>(&mut connection)
             .expect("view after rename");
         assert_eq!(labels, ["retained"]);
     }
-    let mut reopened = connection(&files);
+    let mut reopened = connection(&files, "main.db");
     run(&mut reopened, script.connect().expect("connection program"));
     let labels = schema::labels::table
         .select(schema::labels::title)
@@ -213,8 +212,7 @@ fn an_existing_shared_file_is_not_initialized_for_a_second_main_file() {
     );
     let files = tempfile::TempDir::new().expect("files");
     {
-        let mut first = connection(&files);
-        run(&mut first, script.initialize(FreshFiles::Both).expect("initialize"));
+        initialized(&files, &script, FreshFiles::Both);
     }
     let mut second = second_connection(&files);
     run(&mut second, script.initialize(FreshFiles::Main).expect("main-only initialization"));
@@ -235,8 +233,7 @@ fn a_second_main_file_maintains_full_text_search_in_an_existing_shared_file() {
     );
     let files = tempfile::TempDir::new().expect("files");
     {
-        let mut first = connection(&files);
-        run(&mut first, script.initialize(FreshFiles::Both).expect("initialize"));
+        initialized(&files, &script, FreshFiles::Both);
     }
     let mut second = second_connection(&files);
     run(&mut second, script.initialize(FreshFiles::Main).expect("main-only initialization"));
@@ -268,8 +265,7 @@ fn a_second_main_file_fires_a_trigger_on_an_existing_shared_table() {
     );
     let files = tempfile::TempDir::new().expect("files");
     {
-        let mut first = connection(&files);
-        run(&mut first, script.initialize(FreshFiles::Both).expect("initialize"));
+        initialized(&files, &script, FreshFiles::Both);
     }
     let mut second = second_connection(&files);
     run(&mut second, script.initialize(FreshFiles::Main).expect("main-only initialization"));
@@ -294,8 +290,7 @@ fn a_second_main_file_initializes_a_script_that_creates_a_role() {
     );
     let files = tempfile::TempDir::new().expect("files");
     {
-        let mut first = connection(&files);
-        run(&mut first, script.initialize(FreshFiles::Both).expect("initialize"));
+        initialized(&files, &script, FreshFiles::Both);
     }
     let mut second = second_connection(&files);
     run(&mut second, script.initialize(FreshFiles::Main).expect("main-only initialization"));
@@ -335,15 +330,10 @@ fn an_existing_main_file_can_initialize_a_fresh_attached_store() {
     );
     let files = tempfile::TempDir::new().expect("files");
     {
-        let mut first = connection(&files);
-        run(&mut first, script.initialize(FreshFiles::Both).expect("initialize"));
+        initialized(&files, &script, FreshFiles::Both);
     }
     std::fs::remove_file(files.path().join("shared.db")).expect("remove the closed store");
-    let mut existing = connection(&files);
-    run(
-        &mut existing,
-        script.initialize(FreshFiles::Attached).expect("attached-only initialization"),
-    );
+    let mut existing = initialized(&files, &script, FreshFiles::Attached);
     let notes = schema::notes::table
         .select(schema::notes::id)
         .load::<i32>(&mut existing)
@@ -368,14 +358,10 @@ fn a_fresh_attached_store_next_to_an_existing_main_file_keeps_full_text_search()
     );
     let files = tempfile::TempDir::new().expect("files");
     {
-        let mut first = connection(&files);
-        run(&mut first, script.initialize(FreshFiles::Both).expect("initialize"));
+        initialized(&files, &script, FreshFiles::Both);
     }
     std::fs::remove_file(files.path().join("shared.db")).expect("remove the closed store");
-    let mut existing = connection(&files);
-    let initialization: Vec<&String> =
-        script.initialize(FreshFiles::Attached).expect("attached-only initialization").collect();
-    run(&mut existing, initialization.into_iter());
+    let mut existing = initialized(&files, &script, FreshFiles::Attached);
     let matches = schema::papers_fts::table
         .filter(schema::Matches::new(
             schema::papers_fts::body,
@@ -398,8 +384,7 @@ fn a_new_account_uses_final_column_names_in_an_existing_shared_file() {
     );
     let files = tempfile::TempDir::new().expect("files");
     {
-        let mut first = connection(&files);
-        run(&mut first, script.initialize(FreshFiles::Both).expect("initialize"));
+        initialized(&files, &script, FreshFiles::Both);
     }
     let mut second = second_connection(&files);
     run(&mut second, script.initialize(FreshFiles::Main).expect("main-only initialization"));
@@ -426,8 +411,7 @@ fn savepoints_keep_their_selected_writes_inside_the_source_transaction() {
          COMMIT;",
     );
     let files = tempfile::TempDir::new().expect("files");
-    let mut connection = connection(&files);
-    run(&mut connection, script.initialize(FreshFiles::Both).expect("initialize"));
+    let mut connection = initialized(&files, &script, FreshFiles::Both);
     let notes = schema::notes::table
         .select(schema::notes::id)
         .load::<i32>(&mut connection)
@@ -449,8 +433,7 @@ fn an_unavailable_initializer_is_refused_without_disabling_fresh_files() {
          ALTER TABLE papers ADD COLUMN obsolete INT NOT NULL DEFAULT 99;",
     );
     let files = tempfile::TempDir::new().expect("files");
-    let mut connection = connection(&files);
-    run(&mut connection, script.initialize(FreshFiles::Both).expect("fresh files"));
+    let mut connection = initialized(&files, &script, FreshFiles::Both);
     let rows = schema::notes::table
         .select(schema::notes::id)
         .load::<i32>(&mut connection)
@@ -482,8 +465,7 @@ fn skipped_attached_history_does_not_disable_fresh_main() {
         .expect("translate");
     let files = tempfile::tempdir().expect("files");
     {
-        let mut creating = connection(&files);
-        run(&mut creating, script.initialize(FreshFiles::Both).expect("fresh files"));
+        let mut creating = initialized(&files, &script, FreshFiles::Both);
         let notes = schema::notes::table
             .select(schema::notes::id)
             .load::<i32>(&mut creating)
@@ -495,8 +477,7 @@ fn skipped_attached_history_does_not_disable_fresh_main() {
             .expect("application update to attached storage");
     }
     std::fs::remove_file(files.path().join("main.db")).expect("remove closed main");
-    let mut creating = connection(&files);
-    run(&mut creating, script.initialize(FreshFiles::Main).expect("independent main program"));
+    let mut creating = initialized(&files, &script, FreshFiles::Main);
     let notes = schema::notes::table
         .select(schema::notes::id)
         .load::<i32>(&mut creating)
@@ -518,15 +499,10 @@ fn a_fresh_attached_store_binds_a_renamed_main_object_to_its_final_name() {
     );
     let files = tempfile::TempDir::new().expect("files");
     {
-        let mut first = connection(&files);
-        run(&mut first, script.initialize(FreshFiles::Both).expect("initialize"));
+        initialized(&files, &script, FreshFiles::Both);
     }
     std::fs::remove_file(files.path().join("shared.db")).expect("remove the closed store");
-    let mut second = connection(&files);
-    run(
-        &mut second,
-        script.initialize(FreshFiles::Attached).expect("attached-only initialization"),
-    );
+    let mut second = initialized(&files, &script, FreshFiles::Attached);
     diesel::insert_into(schema::records::table)
         .values(schema::records::id.eq(1))
         .execute(&mut second)
@@ -552,12 +528,10 @@ fn a_fresh_main_store_binds_a_renamed_attached_column_to_its_final_name() {
     );
     let files = tempfile::TempDir::new().expect("files");
     {
-        let mut first = connection(&files);
-        run(&mut first, script.initialize(FreshFiles::Both).expect("initialize"));
+        initialized(&files, &script, FreshFiles::Both);
     }
     std::fs::remove_file(files.path().join("main.db")).expect("remove the closed main");
-    let mut second = connection(&files);
-    run(&mut second, script.initialize(FreshFiles::Main).expect("main-only initialization"));
+    let mut second = initialized(&files, &script, FreshFiles::Main);
     let archive = schema::archive::table
         .select((schema::archive::id, schema::archive::title))
         .load::<(i32, String)>(&mut second)
@@ -576,8 +550,7 @@ fn a_fresh_attached_initializer_missing_main_history_is_refused_on_its_own() {
     );
     let files = tempfile::TempDir::new().expect("files");
     {
-        let mut creating = connection(&files);
-        run(&mut creating, script.initialize(FreshFiles::Both).expect("fresh files"));
+        let mut creating = initialized(&files, &script, FreshFiles::Both);
         let papers = schema::papers::table
             .select(schema::papers::id)
             .load::<i32>(&mut creating)
@@ -591,8 +564,7 @@ fn a_fresh_attached_initializer_missing_main_history_is_refused_on_its_own() {
         )
     ) if relation == "notes"));
     std::fs::remove_file(files.path().join("main.db")).expect("remove the closed main");
-    let mut fresh = connection(&files);
-    run(&mut fresh, script.initialize(FreshFiles::Main).expect("independent main program"));
+    let mut fresh = initialized(&files, &script, FreshFiles::Main);
     let notes = schema::sqlite_schema::table
         .filter(schema::sqlite_schema::name.eq("notes"))
         .count()
@@ -615,8 +587,7 @@ fn a_reconnect_rebinds_a_temp_view_over_a_renamed_main_object() {
     );
     let files = tempfile::TempDir::new().expect("files");
     {
-        let mut creating = connection(&files);
-        run(&mut creating, script.initialize(FreshFiles::Both).expect("initialize"));
+        let mut creating = initialized(&files, &script, FreshFiles::Both);
         diesel::insert_into(schema::records::table)
             .values(schema::records::id.eq(1))
             .execute(&mut creating)
@@ -626,7 +597,7 @@ fn a_reconnect_rebinds_a_temp_view_over_a_renamed_main_object() {
             .execute(&mut creating)
             .expect("attached row");
     }
-    let mut reopened = connection(&files);
+    let mut reopened = connection(&files, "main.db");
     run(&mut reopened, script.connect().expect("connection program"));
     let ids = schema::joins::table
         .select(schema::joins::id)

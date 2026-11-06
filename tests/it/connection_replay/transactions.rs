@@ -2,7 +2,7 @@
 
 use diesel::prelude::*;
 
-use super::{open, run, script};
+use super::{create_and_reopen, open, run, script};
 
 diesel::table! { t (id) { id -> Integer, } }
 diesel::table! { u (id) { id -> Integer, } }
@@ -114,12 +114,7 @@ fn released_catalog_changes_remain_owned_by_the_transaction() {
 fn disconnect_discards_uncommitted_catalog_changes() {
     let script = script("CREATE TEMP TABLE t(id INT); BEGIN; DROP TABLE t;");
     let files = tempfile::tempdir().expect("files");
-    {
-        let mut creating = open(&files);
-        run(&mut creating, script.iter());
-    }
-    let mut reopened = open(&files);
-    run(&mut reopened, script.connect().expect("committed catalog"));
+    let mut reopened = create_and_reopen(&files, &script);
     assert_eq!(t::table.select(t::id).load::<i32>(&mut reopened).expect("surviving table"), [0; 0]);
 }
 

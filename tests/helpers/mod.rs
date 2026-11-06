@@ -3,6 +3,7 @@
 pub mod deployment;
 pub mod emitted_corpus;
 pub mod postgres;
+pub mod replay;
 pub mod run_translated;
 pub mod statistical_aggregates;
 pub mod translate;

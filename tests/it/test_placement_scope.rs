@@ -8,6 +8,8 @@ use pg2sqlite::{
     script::FreshFiles,
 };
 
+use crate::helpers::replay::run;
+
 mod schema {
     diesel::table! {
         log (id) {
@@ -147,14 +149,6 @@ impl Files {
 impl Drop for Files {
     fn drop(&mut self) {
         self.remove();
-    }
-}
-
-fn run(connection: &mut SqliteConnection, statements: impl IntoIterator<Item = impl AsRef<str>>) {
-    for statement in statements {
-        connection
-            .batch_execute(statement.as_ref())
-            .unwrap_or_else(|error| panic!("{error}\n{}", statement.as_ref()));
     }
 }
 
