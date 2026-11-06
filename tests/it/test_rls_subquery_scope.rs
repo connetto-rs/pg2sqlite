@@ -160,6 +160,28 @@ fn opts_with_username() -> Pg2SqliteOptions {
         .with_session_variable(SessionVariableMapping::new("app.username", "current_app_username"))
 }
 
+/// The `members` rows, `alice` on the blue team and `bob` on the red team.
+fn seed_members(conn: &mut SqliteConnection) {
+    diesel::insert_into(members::table)
+        .values(&[
+            (members::owner.eq("alice"), members::team.eq("blue")),
+            (members::owner.eq("bob"), members::team.eq("red")),
+        ])
+        .execute(conn)
+        .expect("seed members");
+}
+
+/// Inserts an `id`/`owner` row into the `t` view.
+fn insert_t(
+    conn: &mut SqliteConnection,
+    id: i32,
+    owner: &str,
+) -> diesel::result::QueryResult<usize> {
+    diesel::insert_into(t::table)
+        .values((t::id.eq(id), t::owner.eq(owner), t::n.eq(0)))
+        .execute(conn)
+}
+
 /// Unaliased correlated subquery where the referenced table has a column that
 /// the guarded table does not. The prefix bug rewrites `members.team` to
 /// `NEW.team`, which SQLite rejects as "no such column" when the trigger fires.
@@ -178,19 +200,10 @@ fn unaliased_cross_table_distinct_column() {
     "#;
     let mut conn = helpers::apply_translated_ddl(SQL, &base_opts());
     // alice is in the blue team, bob in the red team.
-    diesel::insert_into(members::table)
-        .values(&[
-            (members::owner.eq("alice"), members::team.eq("blue")),
-            (members::owner.eq("bob"), members::team.eq("red")),
-        ])
-        .execute(&mut conn)
-        .expect("seed members");
+    seed_members(&mut conn);
 
     // alice is in the blue team so the policy admits her row.
-    diesel::insert_into(t::table)
-        .values((t::id.eq(1), t::owner.eq("alice"), t::n.eq(0)))
-        .execute(&mut conn)
-        .expect("admitted row must land");
+    insert_t(&mut conn, 1, "alice").expect("admitted row must land");
 
     let stored: Vec<(i32, String, i32)> = t_rls::table
         .select((t_rls::id, t_rls::owner, t_rls::n))
@@ -203,10 +216,7 @@ fn unaliased_cross_table_distinct_column() {
     );
 
     // bob is not in the blue team so the policy forbids his row.
-    let err = diesel::insert_into(t::table)
-        .values((t::id.eq(2), t::owner.eq("bob"), t::n.eq(0)))
-        .execute(&mut conn)
-        .expect_err("forbidden row must be refused");
+    let err = insert_t(&mut conn, 2, "bob").expect_err("forbidden row must be refused");
     assert!(err.to_string().contains(POLICY_VIOLATION), "expected policy violation but got: {err}");
 }
 
@@ -267,23 +277,11 @@ fn aliased_cross_table_keeps_working() {
     "#;
     let mut conn = helpers::apply_translated_ddl(SQL, &base_opts());
 
-    diesel::insert_into(members::table)
-        .values(&[
-            (members::owner.eq("alice"), members::team.eq("blue")),
-            (members::owner.eq("bob"), members::team.eq("red")),
-        ])
-        .execute(&mut conn)
-        .expect("seed");
+    seed_members(&mut conn);
 
-    diesel::insert_into(t::table)
-        .values((t::id.eq(1), t::owner.eq("alice"), t::n.eq(0)))
-        .execute(&mut conn)
-        .expect("admitted row must land");
+    insert_t(&mut conn, 1, "alice").expect("admitted row must land");
 
-    let err = diesel::insert_into(t::table)
-        .values((t::id.eq(2), t::owner.eq("bob"), t::n.eq(0)))
-        .execute(&mut conn)
-        .expect_err("forbidden row must be refused");
+    let err = insert_t(&mut conn, 2, "bob").expect_err("forbidden row must be refused");
     assert!(err.to_string().contains(POLICY_VIOLATION), "expected policy violation but got: {err}");
 }
 

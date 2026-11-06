@@ -77,6 +77,14 @@ fn default_opts() -> Pg2SqliteOptions {
         .with_acting_role("alice")
 }
 
+/// The pre-existing `alice` row that the upserts collide with.
+fn seed_row(conn: &mut SqliteConnection) {
+    diesel::insert_into(items_rls::table)
+        .values((items_rls::id.eq(1), items_rls::owner.eq("alice"), items_rls::val.eq(10)))
+        .execute(conn)
+        .expect("seed backing table");
+}
+
 /// Translates `pg_dml` in the context of `schema` and executes the result.
 ///
 /// The emitted upsert SQL is the artifact under test; diesel's typed DSL
@@ -130,10 +138,7 @@ fn dml_translation_err(pg_dml: &str, schema: &str, opts: &Pg2SqliteOptions) -> S
 #[test]
 fn strict_do_nothing_leaves_existing_row_unchanged() {
     let mut conn = apply(SCHEMA, &strict_opts());
-    diesel::insert_into(items_rls::table)
-        .values((items_rls::id.eq(1), items_rls::owner.eq("alice"), items_rls::val.eq(10)))
-        .execute(&mut conn)
-        .expect("seed backing table");
+    seed_row(&mut conn);
 
     run_dml(
         &mut conn,
@@ -157,10 +162,7 @@ fn strict_do_nothing_leaves_existing_row_unchanged() {
 #[test]
 fn strict_do_update_stores_the_updated_value() {
     let mut conn = apply(SCHEMA, &strict_opts());
-    diesel::insert_into(items_rls::table)
-        .values((items_rls::id.eq(1), items_rls::owner.eq("alice"), items_rls::val.eq(10)))
-        .execute(&mut conn)
-        .expect("seed backing table");
+    seed_row(&mut conn);
 
     run_dml(
         &mut conn,
@@ -185,10 +187,7 @@ fn strict_do_update_stores_the_updated_value() {
 #[test]
 fn strict_upsert_policy_violation_is_refused() {
     let mut conn = apply(SCHEMA, &strict_opts());
-    diesel::insert_into(items_rls::table)
-        .values((items_rls::id.eq(1), items_rls::owner.eq("alice"), items_rls::val.eq(10)))
-        .execute(&mut conn)
-        .expect("seed backing table");
+    seed_row(&mut conn);
 
     let err = run_dml(
         &mut conn,

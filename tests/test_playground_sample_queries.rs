@@ -280,14 +280,19 @@ const RLS_QUERIES: &[CannedQuery] = &[
     },
 ];
 
-#[test]
-fn rls_sample_queries() {
-    let opts = Pg2SqliteOptions::default()
+/// Options for the RLS samples, whose `app.user_id` is an integer.
+fn rls_options() -> Pg2SqliteOptions {
+    Pg2SqliteOptions::default()
         .with_sqlitegis_enabled()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_rls_audit_table_name("rls_violations")
         .with_deployment(deployment(["app"], [caller("app.user_id", "integer")]))
-        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"));
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
+}
+
+#[test]
+fn rls_sample_queries() {
+    let opts = rls_options();
     let conn = open_connection();
     register_current_app_user(&conn);
     conn.execute_batch(&translate(RLS_SCHEMA, &opts)).expect("apply RLS schema");
@@ -501,11 +506,6 @@ fn pgvector_sample_reverse_queries() {
 
 #[test]
 fn rls_sample_reverse_queries() {
-    let opts = Pg2SqliteOptions::default()
-        .with_sqlitegis_enabled()
-        .with_uuid_representation(UuidRepresentation::Blob)
-        .with_rls_audit_table_name("rls_violations")
-        .with_deployment(deployment(["app"], [caller("app.user_id", "integer")]))
-        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"));
+    let opts = rls_options();
     run_reverse_chips(RLS_SCHEMA, RLS_REVERSE_CHIPS, &opts);
 }

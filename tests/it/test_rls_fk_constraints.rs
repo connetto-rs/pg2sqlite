@@ -11,8 +11,7 @@ use std::cell::Cell;
 use diesel::{prelude::*, sql_query};
 use helpers::{Count, establish_connection, set_session_user_id};
 use pg2sqlite::{
-    options::Pg2SqliteOptions, pg2sqlite::Pg2Sqlite, prelude::UuidRepresentation,
-    traits::SessionVariableMapping,
+    options::Pg2SqliteOptions, prelude::UuidRepresentation, traits::SessionVariableMapping,
 };
 use rosetta_uuid::Uuid;
 
@@ -38,19 +37,30 @@ fn translation_options() -> Pg2SqliteOptions {
         .with_rls_audit_table_name("rls_audit".to_string())
 }
 
+/// Translates the fixture, proves every statement parses as SQLite, and
+/// snapshots the joined output.
+fn snapshot_translation(fixture_sql: &str, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let translated = helpers::translate_pg(fixture_sql, &translation_options())?;
+
+    for stmt in &translated {
+        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::SQLiteDialect {}, stmt)
+            .expect("Failed to parse as SQLite");
+    }
+
+    insta::assert_snapshot!(name, translated.join(";\n"));
+    Ok(())
+}
+
 #[test]
 fn test_fk_points_to_rls_backing_table() -> Result<(), Box<dyn std::error::Error>> {
     let fixture_sql = include_str!("../fixtures/rls_fk_simple.sql");
     let options = translation_options();
 
-    // Translate the SQL
-    let translated = Pg2Sqlite::default().sql(fixture_sql)?.translate(&options)?.into_vec();
-
-    let translated_sql: Vec<String> = translated.iter().map(ToString::to_string).collect();
+    let translated = helpers::translate_pg(fixture_sql, &options)?;
 
     // Verify that the CREATE TABLE posts statement contains REFERENCES
     // users_rls, not REFERENCES users
-    let posts_create = translated_sql
+    let posts_create = translated
         .iter()
         .find(|s| s.contains("CREATE TABLE posts"))
         .expect("Should have CREATE TABLE posts");
@@ -77,16 +87,10 @@ fn test_fk_points_to_rls_backing_table() -> Result<(), Box<dyn std::error::Error
 
 #[test]
 fn test_fk_constraint_enforcement() -> Result<(), Box<dyn std::error::Error>> {
-    let mut conn = establish_connection();
     let fixture_sql = include_str!("../fixtures/rls_fk_simple.sql");
     let options = translation_options();
 
-    // Translate and execute
-    let translated = Pg2Sqlite::default().sql(fixture_sql)?.translate(&options)?.into_vec();
-
-    for stmt in &translated {
-        sql_query(stmt.to_string()).execute(&mut conn)?;
-    }
+    let mut conn = helpers::apply_translated_ddl(fixture_sql, &options);
 
     // Insert a valid user. With the deny-by-default + backing-table guard
     // trigger fix, direct backing-table inserts now hit the WITH CHECK
@@ -146,12 +150,10 @@ fn test_fk_both_tables_rls() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     // Translate and execute
-    let translated = Pg2Sqlite::default().sql(fixture_sql)?.translate(&options)?.into_vec();
-
-    let translated_sql: Vec<String> = translated.iter().map(ToString::to_string).collect();
+    let translated = helpers::translate_pg(fixture_sql, &options)?;
 
     // Verify posts_rls references users_rls
-    let posts_create = translated_sql
+    let posts_create = translated
         .iter()
         .find(|s| s.contains("CREATE TABLE posts_rls"))
         .expect("Should have CREATE TABLE posts_rls");
@@ -162,7 +164,7 @@ fn test_fk_both_tables_rls() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     for stmt in &translated {
-        sql_query(stmt.to_string()).execute(&mut conn)?;
+        sql_query(stmt).execute(&mut conn)?;
     }
 
     // Insert a user. The backing-table BEFORE INSERT guard trigger now
@@ -213,44 +215,10 @@ fn test_fk_both_tables_rls() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn test_rls_fk_simple_translation_snapshot() -> Result<(), Box<dyn std::error::Error>> {
-    let fixture_sql = include_str!("../fixtures/rls_fk_simple.sql");
-    let options = translation_options();
-
-    let translated = Pg2Sqlite::default().sql(fixture_sql)?.translate(&options)?.into_vec();
-
-    let translated_sql: Vec<String> = translated.iter().map(ToString::to_string).collect();
-
-    // Verify each statement parses as valid SQLite
-    for stmt in &translated {
-        sqlparser::parser::Parser::parse_sql(
-            &sqlparser::dialect::SQLiteDialect {},
-            &stmt.to_string(),
-        )
-        .expect("Failed to parse as SQLite");
-    }
-
-    insta::assert_snapshot!("rls_fk_simple_translation", translated_sql.join(";\n"));
-    Ok(())
+    snapshot_translation(include_str!("../fixtures/rls_fk_simple.sql"), "rls_fk_simple_translation")
 }
 
 #[test]
 fn test_rls_fk_both_translation_snapshot() -> Result<(), Box<dyn std::error::Error>> {
-    let fixture_sql = include_str!("../fixtures/rls_fk_both.sql");
-    let options = translation_options();
-
-    let translated = Pg2Sqlite::default().sql(fixture_sql)?.translate(&options)?.into_vec();
-
-    let translated_sql: Vec<String> = translated.iter().map(ToString::to_string).collect();
-
-    // Verify each statement parses as valid SQLite
-    for stmt in &translated {
-        sqlparser::parser::Parser::parse_sql(
-            &sqlparser::dialect::SQLiteDialect {},
-            &stmt.to_string(),
-        )
-        .expect("Failed to parse as SQLite");
-    }
-
-    insta::assert_snapshot!("rls_fk_both_translation", translated_sql.join(";\n"));
-    Ok(())
+    snapshot_translation(include_str!("../fixtures/rls_fk_both.sql"), "rls_fk_both_translation")
 }

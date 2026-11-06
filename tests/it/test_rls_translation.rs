@@ -7,8 +7,7 @@
 //! 3. INSTEAD OF triggers for INSERT, UPDATE, DELETE operations
 
 use diesel::prelude::*;
-use helpers::establish_connection;
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
+use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation};
 use rosetta_uuid::Uuid;
 
 use crate::{
@@ -52,38 +51,22 @@ struct Document {
     content: String,
 }
 
+/// The `rls_basic.sql` fixture under the `authenticated` role, fully granted.
+const BASIC_SQL: &str = concat!(
+    "CREATE ROLE authenticated;\n",
+    include_str!("../fixtures/rls_basic.sql"),
+    "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
+);
+
 #[test]
 fn test_rls_select_policy_filters_rows() -> Result<(), Box<dyn std::error::Error>> {
-    let sql = concat!(
-        "CREATE ROLE authenticated;\n",
-        include_str!("../fixtures/rls_basic.sql"),
-        "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
-    );
-
-    // Configure translation with RLS options
-    let options = Pg2SqliteOptions::default()
-        .with_uuid_representation(UuidRepresentation::Blob)
-        .with_uuid_v7_function_name("uuidv7")
-        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
-        .with_acting_role("authenticated")
-        .with_rls_audit_table_name("rls_audit".to_string())
-        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"));
-
-    // Translate the SQL
-    let translated_migrations = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
+    let options = helpers::rls::options("authenticated", false);
 
     // Snapshot the translated SQL for consistency checking
-    let translated_sql =
-        translated_migrations.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    let translated_sql = helpers::translate_pg(BASIC_SQL, &options)?.join("\n");
     insta::assert_snapshot!("rls_basic_translation", translated_sql);
 
-    let mut connection = establish_connection();
-
-    // Run the translations
-    for translated_migration in &translated_migrations {
-        let sql_stmt = translated_migration.to_string();
-        diesel::sql_query(&sql_stmt).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_translated_ddl(BASIC_SQL, &options);
 
     // Create two users
     let user_alice = Uuid::new_v4();
@@ -140,29 +123,10 @@ fn test_rls_select_policy_filters_rows() -> Result<(), Box<dyn std::error::Error
 }
 
 #[test]
-fn test_rls_insert_policy_enforces_owner() -> Result<(), Box<dyn std::error::Error>> {
-    let sql = concat!(
-        "CREATE ROLE authenticated;\n",
-        include_str!("../fixtures/rls_basic.sql"),
-        "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
-    );
+fn test_rls_insert_policy_enforces_owner() {
+    let options = helpers::rls::options("authenticated", false);
 
-    let options = Pg2SqliteOptions::default()
-        .with_uuid_representation(UuidRepresentation::Blob)
-        .with_uuid_v7_function_name("uuidv7")
-        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
-        .with_acting_role("authenticated")
-        .with_rls_audit_table_name("rls_audit".to_string())
-        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"));
-
-    let translated_migrations = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection = establish_connection();
-
-    for translated_migration in &translated_migrations {
-        let sql_stmt = translated_migration.to_string();
-        diesel::sql_query(&sql_stmt).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_translated_ddl(BASIC_SQL, &options);
 
     let user_alice = Uuid::new_v4();
     let user_bob = Uuid::new_v4();
@@ -194,34 +158,13 @@ fn test_rls_insert_policy_enforces_owner() -> Result<(), Box<dyn std::error::Err
         })
         .execute(&mut connection);
     assert!(result.is_err(), "Alice should NOT be able to insert a document with Bob's owner_id");
-
-    Ok(())
 }
 
 #[test]
 fn test_rls_update_policy_restricts_updates() -> Result<(), Box<dyn std::error::Error>> {
-    let sql = concat!(
-        "CREATE ROLE authenticated;\n",
-        include_str!("../fixtures/rls_basic.sql"),
-        "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
-    );
+    let options = helpers::rls::options("authenticated", false);
 
-    let options = Pg2SqliteOptions::default()
-        .with_uuid_representation(UuidRepresentation::Blob)
-        .with_uuid_v7_function_name("uuidv7")
-        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
-        .with_acting_role("authenticated")
-        .with_rls_audit_table_name("rls_audit".to_string())
-        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"));
-
-    let translated_migrations = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection = establish_connection();
-
-    for translated_migration in &translated_migrations {
-        let sql_stmt = translated_migration.to_string();
-        diesel::sql_query(&sql_stmt).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_translated_ddl(BASIC_SQL, &options);
 
     let user_alice = Uuid::new_v4();
     let user_bob = Uuid::new_v4();
@@ -290,28 +233,9 @@ fn test_rls_update_policy_restricts_updates() -> Result<(), Box<dyn std::error::
 
 #[test]
 fn test_rls_delete_policy_restricts_deletes() -> Result<(), Box<dyn std::error::Error>> {
-    let sql = concat!(
-        "CREATE ROLE authenticated;\n",
-        include_str!("../fixtures/rls_basic.sql"),
-        "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
-    );
+    let options = helpers::rls::options("authenticated", false);
 
-    let options = Pg2SqliteOptions::default()
-        .with_uuid_representation(UuidRepresentation::Blob)
-        .with_uuid_v7_function_name("uuidv7")
-        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
-        .with_acting_role("authenticated")
-        .with_rls_audit_table_name("rls_audit".to_string())
-        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"));
-
-    let translated_migrations = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection = establish_connection();
-
-    for translated_migration in &translated_migrations {
-        let sql_stmt = translated_migration.to_string();
-        diesel::sql_query(&sql_stmt).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_translated_ddl(BASIC_SQL, &options);
 
     let user_alice = Uuid::new_v4();
     let user_bob = Uuid::new_v4();
@@ -383,33 +307,18 @@ fn test_rls_delete_policy_restricts_deletes() -> Result<(), Box<dyn std::error::
 #[test]
 #[allow(clippy::too_many_lines)]
 fn test_rls_all_policy_works_like_individual_policies() -> Result<(), Box<dyn std::error::Error>> {
+    let options = helpers::rls::options("authenticated", false);
     let sql = concat!(
         "CREATE ROLE authenticated;\n",
         include_str!("../fixtures/rls_all_policy.sql"),
         "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
     );
 
-    let options = Pg2SqliteOptions::default()
-        .with_uuid_representation(UuidRepresentation::Blob)
-        .with_uuid_v7_function_name("uuidv7")
-        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
-        .with_acting_role("authenticated")
-        .with_rls_audit_table_name("rls_audit".to_string())
-        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"));
-
-    let translated_migrations = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
     // Snapshot the translated SQL for consistency checking
-    let translated_sql =
-        translated_migrations.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    let translated_sql = helpers::translate_pg(sql, &options)?.join("\n");
     insta::assert_snapshot!("rls_all_policy_translation", translated_sql);
 
-    let mut connection = establish_connection();
-
-    for translated_migration in &translated_migrations {
-        let sql_stmt = translated_migration.to_string();
-        diesel::sql_query(&sql_stmt).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_translated_ddl(sql, &options);
 
     let user_alice = Uuid::new_v4();
     let user_bob = Uuid::new_v4();

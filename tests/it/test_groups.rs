@@ -10,7 +10,7 @@
 
 use diesel::{prelude::*, sqlite::SqliteConnection};
 use helpers::establish_connection;
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation};
+use pg2sqlite::prelude::{Pg2SqliteOptions, UuidRepresentation};
 use rosetta_uuid::Uuid;
 
 use crate::helpers;
@@ -233,33 +233,43 @@ impl GroupMembership {
     }
 }
 
-fn setup_database(connection: &mut SqliteConnection) -> Result<(), Box<dyn std::error::Error>> {
-    let sql = include_str!("../fixtures/groups.sql");
-    let options = Pg2SqliteOptions::default()
+/// Translation options for the groups fixture, whose UUID columns are BLOBs.
+fn groups_options() -> Pg2SqliteOptions {
+    Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
-        .with_uuid_v7_function_name("uuidv7");
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
+        .with_uuid_v7_function_name("uuidv7")
+}
+
+/// The `Company` > `Engineering` > `Backend` hierarchy.
+fn build_hierarchy(
+    connection: &mut SqliteConnection,
+) -> Result<(Group, Group, Group), Box<dyn std::error::Error>> {
+    let company = Group::new("Company", None).insert(connection)?;
+    let engineering = Group::new("Engineering", Some(&company)).insert(connection)?;
+    let backend = Group::new("Backend", Some(&engineering)).insert(connection)?;
+    Ok((company, engineering, backend))
+}
+
+fn setup_database(connection: &mut SqliteConnection) -> Result<(), Box<dyn std::error::Error>> {
+    let translated =
+        helpers::translate_pg(include_str!("../fixtures/groups.sql"), &groups_options())?;
     for stmt in &translated {
-        diesel::sql_query(stmt.to_string()).execute(connection)?;
+        diesel::sql_query(stmt).execute(connection)?;
     }
     Ok(())
 }
 
 #[test]
 fn test_groups_translation_snapshot() -> Result<(), Box<dyn std::error::Error>> {
-    let sql = include_str!("../fixtures/groups.sql");
-    let options = Pg2SqliteOptions::default()
-        .with_uuid_representation(UuidRepresentation::Blob)
-        .with_uuid_v7_function_name("uuidv7");
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
+    let translated =
+        helpers::translate_pg(include_str!("../fixtures/groups.sql"), &groups_options())?;
 
     // Join all statements for snapshot
-    let translated_sql = translated.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    let translated_sql = translated.join("\n");
 
     // Verify each statement is valid SQLite
     for stmt in &translated {
-        let sql_str = stmt.to_string();
-        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::SQLiteDialect {}, &sql_str)
+        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::SQLiteDialect {}, stmt)
             .expect("Failed to parse translated SQL as SQLite");
     }
 
@@ -310,9 +320,7 @@ fn test_membership_propagates_to_parents() -> Result<(), Box<dyn std::error::Err
     let alice = User::new("Alice").insert(&mut connection)?;
 
     // Create hierarchy: Company > Engineering > Backend
-    let company = Group::new("Company", None).insert(&mut connection)?;
-    let engineering = Group::new("Engineering", Some(&company)).insert(&mut connection)?;
-    let backend = Group::new("Backend", Some(&engineering)).insert(&mut connection)?;
+    let (company, engineering, backend) = build_hierarchy(&mut connection)?;
 
     let alice_membership = backend.add_member(&alice, &mut connection)?;
     let alice_memberships: Vec<GroupMembership> = alice.memberships(&mut connection)?;
@@ -345,9 +353,7 @@ fn test_membership_removal_cascades_to_children() -> Result<(), Box<dyn std::err
     let bob = User::new("Bob").insert(&mut connection)?;
 
     // Create hierarchy: Company > Engineering > Backend
-    let company = Group::new("Company", None).insert(&mut connection)?;
-    let engineering = Group::new("Engineering", Some(&company)).insert(&mut connection)?;
-    let backend = Group::new("Backend", Some(&engineering)).insert(&mut connection)?;
+    let (company, engineering, backend) = build_hierarchy(&mut connection)?;
 
     // Add Bob to Backend (will auto-propagate to Engineering and Company)
     backend.add_member(&bob, &mut connection)?;

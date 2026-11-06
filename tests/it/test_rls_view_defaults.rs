@@ -162,6 +162,14 @@ fn options() -> Pg2SqliteOptions {
         .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
 }
 
+/// An `alice` row with `id` 1 and a given `qty`, for the computed-column cases.
+fn seed_item(conn: &mut SqliteConnection, qty: i32) {
+    diesel::insert_into(items::table)
+        .values((items::id.eq(1), items::qty.eq(qty), items::owner.eq("alice")))
+        .execute(conn)
+        .expect("insert");
+}
+
 /// The one case the bug report opened with: a caller naming neither the key nor
 /// any other defaulted column lands a row carrying every default.
 #[test]
@@ -348,10 +356,7 @@ fn writing_a_computed_column_through_the_view_is_refused() {
 fn an_update_recomputes_a_computed_column() {
     let mut conn = helpers::apply_translated_ddl(ITEMS, &options());
 
-    diesel::insert_into(items::table)
-        .values((items::id.eq(1), items::qty.eq(4), items::owner.eq("alice")))
-        .execute(&mut conn)
-        .expect("insert");
+    seed_item(&mut conn, 4);
 
     diesel::update(items::table.filter(items::id.eq(1)))
         .set(items::qty.eq(10))
@@ -371,10 +376,7 @@ fn an_update_recomputes_a_computed_column() {
 fn setting_a_computed_column_through_the_view_is_refused() {
     let mut conn = helpers::apply_translated_ddl(ITEMS, &options());
 
-    diesel::insert_into(items::table)
-        .values((items::id.eq(1), items::qty.eq(4), items::owner.eq("alice")))
-        .execute(&mut conn)
-        .expect("insert");
+    seed_item(&mut conn, 4);
 
     let refused = diesel::update(items::table.filter(items::id.eq(1)))
         .set(items::doubled.eq(99))
@@ -461,10 +463,7 @@ fn a_policy_over_a_computed_column_admits_a_row_it_allows() {
 fn an_update_pushing_a_computed_value_out_of_the_policy_is_refused() {
     let mut conn = helpers::apply_translated_ddl(GUARDED_BY_COMPUTED, &options());
 
-    diesel::insert_into(items::table)
-        .values((items::id.eq(1), items::qty.eq(5), items::owner.eq("alice")))
-        .execute(&mut conn)
-        .expect("insert");
+    seed_item(&mut conn, 5);
 
     let refused = diesel::update(items::table.filter(items::id.eq(1)))
         .set(items::qty.eq(300))
@@ -485,10 +484,7 @@ fn an_update_pushing_a_computed_value_out_of_the_policy_is_refused() {
 fn an_update_keeping_a_computed_value_inside_the_policy_succeeds() {
     let mut conn = helpers::apply_translated_ddl(GUARDED_BY_COMPUTED, &options());
 
-    diesel::insert_into(items::table)
-        .values((items::id.eq(1), items::qty.eq(5), items::owner.eq("alice")))
-        .execute(&mut conn)
-        .expect("insert");
+    seed_item(&mut conn, 5);
 
     diesel::update(items::table.filter(items::id.eq(1)))
         .set(items::qty.eq(6))

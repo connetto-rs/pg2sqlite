@@ -4,7 +4,6 @@
 //! between backend RLS policies and client-side views.
 
 use diesel::prelude::*;
-use helpers::establish_connection;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 use rosetta_uuid::Uuid;
 
@@ -48,21 +47,30 @@ CREATE POLICY documents_delete_policy ON documents
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
 "#;
 
+/// Options for the validation fixtures, which declare no UUID default and so
+/// need no `uuidv7` function. The audit table is named only where a test
+/// asserts on it.
+fn rls_options(audit: Option<&str>) -> Pg2SqliteOptions {
+    let mut options = Pg2SqliteOptions::default()
+        .with_uuid_representation(UuidRepresentation::Blob)
+        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
+        .with_acting_role("authenticated")
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"));
+    if let Some(name) = audit {
+        options = options.with_rls_audit_table_name(name.to_string());
+    }
+    options
+}
+
 /// Test 1: RLS requires audit table name to be configured.
 /// This test ensures that if RLS is present but no audit table name is set,
 /// the translation fails with a clear error.
 #[test]
 fn test_rls_requires_audit_table_name() {
-    let options = Pg2SqliteOptions::default()
-        .with_uuid_representation(UuidRepresentation::Blob)
-        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
-        .with_acting_role("authenticated")
-        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"));
     // Note: NO .with_rls_audit_table_name() called
+    let options = rls_options(None);
 
-    let result = Pg2Sqlite::default()
-        .sql(RLS_SCHEMA)
-        .and_then(|t| t.translate(&options).map(pg2sqlite::script::Script::into_vec));
+    let result = helpers::translate_pg(RLS_SCHEMA, &options);
 
     // Should fail with RlsAuditTableNameRequired error
     assert!(result.is_err());
@@ -78,15 +86,10 @@ fn test_rls_requires_audit_table_name() {
 #[test]
 fn test_audit_table_uses_configured_name() -> Result<(), Box<dyn std::error::Error>> {
     let custom_audit_name = "my_custom_violations";
-    let options = Pg2SqliteOptions::default()
-        .with_uuid_representation(UuidRepresentation::Blob)
-        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
-        .with_acting_role("authenticated")
-        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
-        .with_rls_audit_table_name(custom_audit_name.to_string());
+    let options = rls_options(Some(custom_audit_name));
 
-    let translated = Pg2Sqlite::default().sql(RLS_SCHEMA)?.translate(&options)?.into_vec();
-    let sql = translated.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    let translated = helpers::translate_pg(RLS_SCHEMA, &options)?;
+    let sql = translated.join("\n");
 
     // Should contain CREATE TABLE with the custom name
     assert!(
@@ -135,15 +138,10 @@ fn the_audit_table_is_created_strict() {
 #[test]
 fn test_triggers_use_configured_audit_table() -> Result<(), Box<dyn std::error::Error>> {
     let custom_audit_name = "custom_audit";
-    let options = Pg2SqliteOptions::default()
-        .with_uuid_representation(UuidRepresentation::Blob)
-        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
-        .with_acting_role("authenticated")
-        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
-        .with_rls_audit_table_name(custom_audit_name.to_string());
+    let options = rls_options(Some(custom_audit_name));
 
-    let translated = Pg2Sqlite::default().sql(RLS_SCHEMA)?.translate(&options)?.into_vec();
-    let sql = translated.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    let translated = helpers::translate_pg(RLS_SCHEMA, &options)?;
+    let sql = translated.join("\n");
 
     // Triggers should INSERT INTO the custom audit table
     assert!(
@@ -213,18 +211,9 @@ CREATE POLICY documents_insert_policy ON documents
     WITH CHECK (true);
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
 "#;
-    let options = Pg2SqliteOptions::default()
-        .with_uuid_representation(UuidRepresentation::Blob)
-        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
-        .with_acting_role("authenticated")
-        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
-        .with_rls_audit_table_name(audit_table_name.to_string());
+    let options = rls_options(Some(audit_table_name));
 
-    let translated = Pg2Sqlite::default().sql(MONITOR_SCHEMA)?.translate(&options)?.into_vec();
-    let mut conn = establish_connection();
-    for stmt in &translated {
-        diesel::sql_query(stmt.to_string()).execute(&mut conn)?;
-    }
+    let mut conn = helpers::apply_translated_ddl(MONITOR_SCHEMA, &options);
 
     // Set session user to alice.
     let user_alice = Uuid::new_v4();
@@ -271,26 +260,14 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authentic
 #[test]
 fn test_strict_mode_blocks_violations() -> Result<(), Box<dyn std::error::Error>> {
     let audit_table_name = "rls_violations_strict";
-    let options = Pg2SqliteOptions::default()
-        .with_uuid_representation(UuidRepresentation::Blob)
-        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
-        .with_acting_role("authenticated")
-        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
-        .with_rls_audit_table_name(audit_table_name.to_string())
-        .with_strict_rls_validation(); // Enable strict mode
+    let options = rls_options(Some(audit_table_name)).with_strict_rls_validation();
 
-    let translated = Pg2Sqlite::default().sql(RLS_SCHEMA)?.translate(&options)?.into_vec();
-    let sql = translated.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    let sql = helpers::translate_pg(RLS_SCHEMA, &options)?.join("\n");
 
     // Strict mode should include RAISE(ABORT) in triggers
     assert!(sql.contains("RAISE(ABORT"), "Expected RAISE(ABORT) in strict mode, got:\n{}", sql);
 
-    let mut conn = establish_connection();
-
-    // Execute all translated statements
-    for stmt in &translated {
-        diesel::sql_query(stmt.to_string()).execute(&mut conn)?;
-    }
+    let mut conn = helpers::apply_translated_ddl(RLS_SCHEMA, &options);
 
     // Set up session user
     let user_alice = Uuid::new_v4();
@@ -357,15 +334,9 @@ CREATE POLICY documents_insert_policy ON documents
     WITH CHECK (true);
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;
 "#;
-    let options = Pg2SqliteOptions::default()
-        .with_uuid_representation(UuidRepresentation::Blob)
-        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
-        .with_acting_role("authenticated")
-        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
-        .with_rls_audit_table_name("rls_audit".to_string());
+    let options = rls_options(Some("rls_audit"));
 
-    let translated = Pg2Sqlite::default().sql(VALIDATION_SCHEMA)?.translate(&options)?.into_vec();
-    let sql = translated.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    let sql = helpers::translate_pg(VALIDATION_SCHEMA, &options)?.join("\n");
 
     assert!(
         sql.contains("CREATE VIEW documents_rls_violations"),
@@ -373,10 +344,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authentic
         sql
     );
 
-    let mut conn = establish_connection();
-    for stmt in &translated {
-        diesel::sql_query(stmt.to_string()).execute(&mut conn)?;
-    }
+    let mut conn = helpers::apply_translated_ddl(VALIDATION_SCHEMA, &options);
 
     let user_alice = Uuid::new_v4();
     let user_bob = Uuid::new_v4();
@@ -415,15 +383,9 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authentic
 
 #[test]
 fn test_monitor_mode_snapshot() -> Result<(), Box<dyn std::error::Error>> {
-    let options = Pg2SqliteOptions::default()
-        .with_uuid_representation(UuidRepresentation::Blob)
-        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
-        .with_acting_role("authenticated")
-        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
-        .with_rls_audit_table_name("rls_violations".to_string());
+    let options = rls_options(Some("rls_violations"));
 
-    let translated = Pg2Sqlite::default().sql(RLS_SCHEMA)?.translate(&options)?.into_vec();
-    let sql = translated.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    let sql = helpers::translate_pg(RLS_SCHEMA, &options)?.join("\n");
 
     insta::assert_snapshot!("rls_validation_monitor_mode", sql);
 
@@ -432,16 +394,9 @@ fn test_monitor_mode_snapshot() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn test_strict_mode_snapshot() -> Result<(), Box<dyn std::error::Error>> {
-    let options = Pg2SqliteOptions::default()
-        .with_uuid_representation(UuidRepresentation::Blob)
-        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
-        .with_acting_role("authenticated")
-        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
-        .with_rls_audit_table_name("rls_violations".to_string())
-        .with_strict_rls_validation();
+    let options = rls_options(Some("rls_violations")).with_strict_rls_validation();
 
-    let translated = Pg2Sqlite::default().sql(RLS_SCHEMA)?.translate(&options)?.into_vec();
-    let sql = translated.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    let sql = helpers::translate_pg(RLS_SCHEMA, &options)?.join("\n");
 
     insta::assert_snapshot!("rls_validation_strict_mode", sql);
 

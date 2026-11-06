@@ -16,8 +16,8 @@
 #![allow(clippy::duplicate_mod)]
 
 use diesel::{prelude::*, sqlite::SqliteConnection};
-use helpers::{establish_connection, set_session_user_id};
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
+use helpers::set_session_user_id;
+use pg2sqlite::prelude::{Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 use rosetta_uuid::Uuid;
 // Re-use models from test_groups
 pub use test_groups::{Group, User};
@@ -342,9 +342,19 @@ impl HasOwnerId for Group {
     }
 }
 
+/// The `groups.sql` and `rls_grants.sql` fixtures under the `migrator` role.
+/// The two files form one reference-closed document, the grants fixture's FKs
+/// resolving against tables groups.sql creates.
+const SQL: &str = concat!(
+    "CREATE ROLE migrator;\n",
+    include_str!("../fixtures/groups.sql"),
+    "\n",
+    include_str!("../fixtures/rls_grants.sql"),
+);
+
 /// The fixture's `_unfiltered` views read past the policies as their owner,
 /// the role that runs the schema.
-fn translation_options() -> Pg2SqliteOptions {
+fn options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7")
@@ -354,28 +364,9 @@ fn translation_options() -> Pg2SqliteOptions {
         .with_schema_owner_role("migrator")
 }
 
-fn setup_database(connection: &mut SqliteConnection) -> Result<(), Box<dyn std::error::Error>> {
-    let options = translation_options();
-
-    // groups.sql and rls_grants.sql form one reference-closed document: the
-    // grants fixture's FKs resolve against tables groups.sql creates.
-    let translated = Pg2Sqlite::default()
-        .sql("CREATE ROLE migrator;")?
-        .sql(include_str!("../fixtures/groups.sql"))?
-        .sql(include_str!("../fixtures/rls_grants.sql"))?
-        .translate(&options)?
-        .into_vec();
-    for stmt in &translated {
-        diesel::sql_query(stmt.to_string()).execute(connection)?;
-    }
-
-    Ok(())
-}
-
 #[test]
 fn test_rls_grants_schema_execution() -> Result<(), Box<dyn std::error::Error>> {
-    let mut conn = establish_connection();
-    setup_database(&mut conn)?;
+    let mut conn = helpers::apply_translated_ddl(SQL, &options());
 
     // Verify tables exist by counting rows
     let ownable_count: i64 = ownables::table.count().get_result(&mut conn)?;
@@ -391,8 +382,7 @@ fn test_rls_grants_schema_execution() -> Result<(), Box<dyn std::error::Error>> 
 /// The session user must be set before any RLS-protected operation.
 #[test]
 fn test_insert_without_session_user_fails() -> Result<(), Box<dyn std::error::Error>> {
-    let mut conn = establish_connection();
-    setup_database(&mut conn)?;
+    let mut conn = helpers::apply_translated_ddl(SQL, &options());
 
     // Create a user but DON'T set the session user
     let alice = User::new("Alice").insert(&mut conn)?;
@@ -416,8 +406,7 @@ fn test_insert_without_session_user_fails() -> Result<(), Box<dyn std::error::Er
 /// owner.
 #[test]
 fn test_creator_becomes_owner() -> Result<(), Box<dyn std::error::Error>> {
-    let mut conn = establish_connection();
-    setup_database(&mut conn)?;
+    let mut conn = helpers::apply_translated_ddl(SQL, &options());
 
     let alice = User::new("Alice").insert(&mut conn)?;
     set_session_user_id(&alice.id);
@@ -432,8 +421,7 @@ fn test_creator_becomes_owner() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn test_add_remove_owners() -> Result<(), Box<dyn std::error::Error>> {
-    let mut conn = establish_connection();
-    setup_database(&mut conn)?;
+    let mut conn = helpers::apply_translated_ddl(SQL, &options());
 
     let alice = User::new("Alice").insert(&mut conn)?;
     let bob = User::new("Bob").insert(&mut conn)?;
@@ -458,8 +446,7 @@ fn test_add_remove_owners() -> Result<(), Box<dyn std::error::Error>> {
 /// Note: This is enforced at application level, not database level.
 #[test]
 fn test_last_owner_detection() -> Result<(), Box<dyn std::error::Error>> {
-    let mut conn = establish_connection();
-    setup_database(&mut conn)?;
+    let mut conn = helpers::apply_translated_ddl(SQL, &options());
 
     let alice = User::new("Alice").insert(&mut conn)?;
     set_session_user_id(&alice.id);
@@ -480,8 +467,7 @@ fn test_last_owner_detection() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn test_add_remove_admins() -> Result<(), Box<dyn std::error::Error>> {
-    let mut conn = establish_connection();
-    setup_database(&mut conn)?;
+    let mut conn = helpers::apply_translated_ddl(SQL, &options());
 
     let alice = User::new("Alice").insert(&mut conn)?;
     let bob = User::new("Bob").insert(&mut conn)?;
@@ -502,8 +488,7 @@ fn test_add_remove_admins() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn test_grant_access() -> Result<(), Box<dyn std::error::Error>> {
-    let mut conn = establish_connection();
-    setup_database(&mut conn)?;
+    let mut conn = helpers::apply_translated_ddl(SQL, &options());
 
     let alice = User::new("Alice").insert(&mut conn)?;
     let bob = User::new("Bob").insert(&mut conn)?;
@@ -533,8 +518,7 @@ fn test_grant_access() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn test_group_as_owner() -> Result<(), Box<dyn std::error::Error>> {
-    let mut conn = establish_connection();
-    setup_database(&mut conn)?;
+    let mut conn = helpers::apply_translated_ddl(SQL, &options());
 
     let alice = User::new("Alice").insert(&mut conn)?;
     let bob = User::new("Bob").insert(&mut conn)?;
@@ -566,8 +550,7 @@ fn test_group_as_owner() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn test_group_as_admin() -> Result<(), Box<dyn std::error::Error>> {
-    let mut conn = establish_connection();
-    setup_database(&mut conn)?;
+    let mut conn = helpers::apply_translated_ddl(SQL, &options());
 
     let alice = User::new("Alice").insert(&mut conn)?;
     let admins = Group::new("Admins", None).insert(&mut conn)?;
@@ -584,8 +567,7 @@ fn test_group_as_admin() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn test_group_grant() -> Result<(), Box<dyn std::error::Error>> {
-    let mut conn = establish_connection();
-    setup_database(&mut conn)?;
+    let mut conn = helpers::apply_translated_ddl(SQL, &options());
 
     let alice = User::new("Alice").insert(&mut conn)?;
     let viewers = Group::new("Viewers", None).insert(&mut conn)?;
@@ -606,8 +588,7 @@ fn test_group_grant() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn test_group_hierarchy_with_roles() -> Result<(), Box<dyn std::error::Error>> {
-    let mut conn = establish_connection();
-    setup_database(&mut conn)?;
+    let mut conn = helpers::apply_translated_ddl(SQL, &options());
 
     // Create users
     let alice = User::new("Alice").insert(&mut conn)?;
@@ -657,8 +638,7 @@ fn test_group_hierarchy_with_roles() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn test_cascade_delete_ownable() -> Result<(), Box<dyn std::error::Error>> {
-    let mut conn = establish_connection();
-    setup_database(&mut conn)?;
+    let mut conn = helpers::apply_translated_ddl(SQL, &options());
 
     let alice = User::new("Alice").insert(&mut conn)?;
     let bob = User::new("Bob").insert(&mut conn)?;
@@ -694,8 +674,7 @@ fn test_cascade_delete_ownable() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn test_unique_grant_per_grantee() -> Result<(), Box<dyn std::error::Error>> {
-    let mut conn = establish_connection();
-    setup_database(&mut conn)?;
+    let mut conn = helpers::apply_translated_ddl(SQL, &options());
 
     let alice = User::new("Alice").insert(&mut conn)?;
     let bob = User::new("Bob").insert(&mut conn)?;
@@ -715,20 +694,12 @@ fn test_unique_grant_per_grantee() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn test_rls_grants_translation_snapshot() -> Result<(), Box<dyn std::error::Error>> {
-    // Translate both files together
-    let groups_sql = include_str!("../fixtures/groups.sql");
-    let grants_sql = include_str!("../fixtures/rls_grants.sql");
-    let combined_sql = format!("CREATE ROLE migrator;\n{groups_sql}\n{grants_sql}");
-
-    let options = translation_options();
-
-    let translated = Pg2Sqlite::default().sql(&combined_sql)?.translate(&options)?.into_vec();
-    let translated_sql = translated.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    let translated = helpers::translate_pg(SQL, &options())?;
+    let translated_sql = translated.join("\n");
 
     // Verify each statement is valid SQLite
     for stmt in &translated {
-        let sql_str = stmt.to_string();
-        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::SQLiteDialect {}, &sql_str)
+        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::SQLiteDialect {}, stmt)
             .expect("Failed to parse translated SQL as SQLite");
     }
 

@@ -230,8 +230,7 @@ fn translation_options() -> Pg2SqliteOptions {
 
 /// Helper to set up the database with all translated statements.
 fn setup_database() -> Result<SqliteConnection, Box<dyn std::error::Error>> {
-    let translated =
-        Pg2Sqlite::default().sql(SQL_FIXTURE)?.translate(&translation_options())?.into_vec();
+    let translated = helpers::translate_pg(SQL_FIXTURE, &translation_options())?;
 
     let mut conn = establish_connection();
     write_is_exempt_utils::register_nondeterministic_impl(&mut conn, || {
@@ -239,7 +238,7 @@ fn setup_database() -> Result<SqliteConnection, Box<dyn std::error::Error>> {
     })?;
 
     for stmt in &translated {
-        diesel::sql_query(stmt.to_string()).execute(&mut conn)?;
+        diesel::sql_query(stmt).execute(&mut conn)?;
     }
 
     Ok(conn)
@@ -255,12 +254,16 @@ fn insert_synced_user(
     result
 }
 
+/// A `testuser` row for the read-only tests to act on.
+fn seed_test_user(conn: &mut SqliteConnection) -> Result<User, Box<dyn std::error::Error>> {
+    let user = User::new(Uuid::new_v4(), "testuser", "test@example.com");
+    insert_synced_user(conn, &user)?;
+    Ok(user)
+}
+
 #[test]
 fn test_grant_based_filtering_snapshot() -> Result<(), Box<dyn std::error::Error>> {
-    let translated =
-        Pg2Sqlite::default().sql(SQL_FIXTURE)?.translate(&translation_options())?.into_vec();
-
-    let translated_sql = translated.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    let translated_sql = helpers::translate_pg(SQL_FIXTURE, &translation_options())?.join("\n");
 
     insta::assert_snapshot!("grant_based_filtering", translated_sql);
 
@@ -368,8 +371,7 @@ struct TriggerInfo {
 fn test_readonly_select_works() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = setup_database()?;
 
-    let user = User::new(Uuid::new_v4(), "testuser", "test@example.com");
-    insert_synced_user(&mut conn, &user)?;
+    seed_test_user(&mut conn)?;
 
     let count: i64 = users::table.count().get_result(&mut conn)?;
     assert_eq!(count, 1, "Should be able to SELECT from read-only users view");
@@ -400,8 +402,7 @@ fn test_readonly_insert_fails() -> Result<(), Box<dyn std::error::Error>> {
 fn test_readonly_update_fails() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = setup_database()?;
 
-    let user = User::new(Uuid::new_v4(), "testuser", "test@example.com");
-    insert_synced_user(&mut conn, &user)?;
+    let user = seed_test_user(&mut conn)?;
 
     // Attempt to update via the view - should fail
     let result = diesel::update(users::table.filter(users::id.eq(&user.id)))
@@ -417,8 +418,7 @@ fn test_readonly_update_fails() -> Result<(), Box<dyn std::error::Error>> {
 fn test_readonly_delete_fails() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = setup_database()?;
 
-    let user = User::new(Uuid::new_v4(), "testuser", "test@example.com");
-    insert_synced_user(&mut conn, &user)?;
+    let user = seed_test_user(&mut conn)?;
 
     // Attempt to delete via the view - should fail
     let result = diesel::delete(users::table.filter(users::id.eq(&user.id))).execute(&mut conn);
