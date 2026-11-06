@@ -6,13 +6,6 @@
 //! through the same input function `COPY` calls. The `INSERT` then takes the
 //! ordinary translation, so every column conversion applies to it.
 
-#[cfg(not(feature = "std"))]
-use alloc::{
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
 use core::{iter::Peekable, str::Chars};
 
 use sql_traits::{
@@ -25,6 +18,8 @@ use sqlparser::ast::{
 };
 
 use super::{insert::backing_table_name, rls};
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{ast_builder, object_name::resolve_translation_table},

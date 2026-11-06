@@ -1,23 +1,14 @@
 //! Implementation of the [`Translator`](crate::traits::Translator) trait for
 //! the `Column` type.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sql_traits::structs::ParserDB;
 use sqlparser::ast::{
     CheckConstraint, ColumnDef, ColumnOption, ColumnOptionDef, DataType, Expr, Ident, ObjectName,
     PrimaryKeyConstraint, TimezoneInfo, UnaryOperator, Value, ValueWithSpan,
 };
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{

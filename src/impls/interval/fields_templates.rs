@@ -8,10 +8,7 @@
 //! PostgreSQL's `interval` fields hold, or lands on either infinity bound.
 
 #[cfg(not(feature = "std"))]
-use alloc::{
-    format,
-    string::{String, ToString},
-};
+use crate::no_std::prelude::*;
 
 /// The operand placeholder the single-operand templates substitute.
 pub(super) const PLACEHOLDER: &str = crate::impls::interval::keys_templates::PLACEHOLDER;

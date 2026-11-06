@@ -6,7 +6,8 @@
 //! message is built here, so [`is_policy_refusal`] recognises exactly the
 //! messages the guards raise.
 
-use alloc::{format, string::String};
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 
 /// Raised when a written row fails a policy's `WITH CHECK` or `USING`
 /// predicate, matching PostgreSQL's wording.

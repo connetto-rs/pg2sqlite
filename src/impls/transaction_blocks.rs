@@ -15,13 +15,11 @@
 //! transaction, measured on 3.51.1 as staying 0 both inside the transaction
 //! and after the commit.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{string::ToString, vec, vec::Vec};
-
 use sqlparser::ast::Statement;
 
 use crate::errors::Error;
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 
 /// What the batch's transaction nesting says about one statement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,17 +1,6 @@
 //! Implementation of the [`Translator`](crate::traits::Translator) trait for
 //! the `DataType` type.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sqlparser::{
     ast::{
         ArrayElemTypeDef, BinaryOperator, CharLengthUnits, CharacterLength, DataType,
@@ -20,6 +9,8 @@ use sqlparser::{
     tokenizer::Span,
 };
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{impls::function_helpers::simple_function_expr, traits::UuidRepresentation};
 
 /// The largest precision a scaled integer can hold.

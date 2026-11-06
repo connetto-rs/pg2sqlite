@@ -1,17 +1,6 @@
 //! Implementation of the [`ReverseTranslator`] trait for the
 //! `Insert` type.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sql_traits::{
     errors::LookupError,
     structs::ParserDB,
@@ -24,6 +13,8 @@ use sqlparser::ast::{
 };
 
 use super::helpers::{Reverse, unscale_integer_literal};
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{

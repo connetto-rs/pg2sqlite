@@ -1,18 +1,7 @@
 //! Implementation of the [`Translator`](crate::traits::Translator) trait for
 //! the `Query`, `SetExpr`, and `Select` types.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::{Cow, ToOwned},
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-#[cfg(feature = "std")]
-use std::borrow::Cow;
+use alloc::borrow::Cow;
 
 use sql_traits::structs::ParserDB;
 use sqlparser::ast::{
@@ -26,6 +15,8 @@ use sqlparser::ast::{
 use super::helpers::{
     Forward, translate_pipe_operators, translate_query_settings, translate_with_clause,
 };
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     impls::{
         function_helpers::{integer_literal, simple_function_expr},

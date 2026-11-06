@@ -1,11 +1,12 @@
 //! Lexical CTE visibility and physical write targets in PostgreSQL queries.
 
-#[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
 use core::ptr;
 
 use sql_traits::utils::identifier_resolution::identifiers_match;
 use sqlparser::ast::{FromTable, Ident, ObjectName, Query, Statement, TableFactor};
+
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 
 #[derive(Default)]
 pub(crate) struct RelationScopes {

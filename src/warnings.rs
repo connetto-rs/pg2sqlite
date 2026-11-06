@@ -21,9 +21,7 @@
 //! list.
 
 #[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{string::String, vec::Vec};
-
+use crate::no_std::prelude::*;
 use crate::script::Script;
 
 /// A warning emitted during translation.

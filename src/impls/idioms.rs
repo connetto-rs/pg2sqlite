@@ -6,10 +6,6 @@
 //! test, so a forward idiom cannot change or appear without its way home
 //! (review findings H6 and M6 were exactly that drift).
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{boxed::Box, string::ToString, vec, vec::Vec};
-
 use sqlparser::ast::{
     BinaryOperator, CaseWhen, CastKind, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
     FunctionArguments, UnaryOperator, Value, ValueWithSpan,
@@ -22,6 +18,8 @@ use crate::impls::{
         string_literal,
     },
 };
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 
 // ── ILIKE case folding ──────────────────────────────────────────────────────
 

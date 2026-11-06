@@ -4,20 +4,11 @@
 //! two `AT TIME ZONE` operations, so the rule and the type resolution it needs
 //! live here rather than in either direction.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sql_traits::structs::ParserDB;
 use sqlparser::ast::{DataType, Expr, TimezoneInfo, Value, ValueWithSpan};
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{errors::Error, impls::shared_helpers::declared_in_scope, prelude::ReverseTranslator};
 
 /// Returns `true` when `value` is a fixed UTC offset in `+HH:MM` / `-HH:MM`

@@ -1,14 +1,3 @@
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sql_traits::{
     structs::ParserDB,
     traits::{ColumnLike, TriggerLike},
@@ -24,6 +13,8 @@ use sqlparser::{
     tokenizer::Span,
 };
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     impls::{
         ast_builder,

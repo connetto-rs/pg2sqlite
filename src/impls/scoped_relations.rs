@@ -1,7 +1,5 @@
 //! Physical relations with lexical common-table-expression bindings excluded.
 
-#[cfg(not(feature = "std"))]
-use alloc::{string::String, vec::Vec};
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{Ident, ObjectName, Query, SetExpr, Statement, TableFactor, Visit, Visitor};
@@ -10,6 +8,8 @@ use crate::impls::{
     object_name::{last_ident, last_ident_value_or_display},
     relation_scope::RelationScopes,
 };
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 
 /// Physical relation names in first-occurrence order, ASCII-folded for SQLite.
 #[must_use]

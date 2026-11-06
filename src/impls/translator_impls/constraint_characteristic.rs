@@ -1,18 +1,10 @@
 //! Implementation of the [`Translator`](crate::traits::Translator) trait for
 //! the `ConstraintCharacteristics` type.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sqlparser::ast::ConstraintCharacteristics;
+
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 
 /// Translates the characteristics of a FOREIGN KEY constraint.
 ///

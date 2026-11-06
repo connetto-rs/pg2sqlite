@@ -1,8 +1,5 @@
 //! Planning of the columns a data-modifying statement names on its target.
 
-#[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
-
 use sql_traits::{
     structs::{ColumnScope, IdentifierCase, ParserDB},
     traits::{ColumnLike, DatabaseLike, TableLike},
@@ -16,6 +13,8 @@ use super::{
     Header, Planner,
     scope::{Relation, last, resolve},
 };
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     impls::{query_builder::plain_table_factor, shared_helpers::relations_scope_query},
     script::ConnectionError,

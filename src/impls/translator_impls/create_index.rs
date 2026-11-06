@@ -1,17 +1,6 @@
 //! Implementation of the [`Translator`](crate::traits::Translator) trait for
 //! the `CreateIndex` type.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sql_traits::{
     structs::ParserDB,
     traits::{ColumnLike, TableLike},
@@ -22,6 +11,8 @@ use sqlparser::ast::{
     TriggerPeriod, Value, VisitMut, VisitorMut,
 };
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{

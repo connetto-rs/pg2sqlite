@@ -1,17 +1,6 @@
 //! Implementation of the [`Translator`](crate::traits::Translator) trait for
 //! the `Insert` type.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sql_traits::{
     structs::ParserDB,
     traits::{ColumnLike, DatabaseLike, IndexLike, TableLike, UniqueIndexLike},
@@ -19,6 +8,8 @@ use sql_traits::{
 use sqlparser::ast::{DataType, Insert, SelectItem, SetExpr, TableObject};
 
 use super::helpers::Forward;
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     impls::{
         object_name::{

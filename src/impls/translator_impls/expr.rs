@@ -1,17 +1,6 @@
 //! Implementation of the [`Translator`](crate::traits::Translator) trait for
 //! the `Expr` type.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sql_traits::{
     structs::{ColumnDefinition, ParserDB},
     traits::{ColumnLike, DatabaseLike, TableLike},
@@ -27,6 +16,8 @@ use sqlparser::{
     tokenizer::Span,
 };
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     impls::{
         datetime_helpers::{

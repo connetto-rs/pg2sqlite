@@ -5,17 +5,11 @@
 //! BLOB, so a type stored as something other than PostgreSQL's value is
 //! converted first.
 
-#[cfg(not(feature = "std"))]
-use alloc::{
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-};
-
 use sql_traits::structs::ParserDB;
 use sqlparser::ast::{BinaryOperator, CastKind, DataType, Expr, TimezoneInfo};
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{

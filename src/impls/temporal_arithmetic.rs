@@ -11,10 +11,6 @@
 //! `+` and `-` over `date`, `timestamp`, `timestamptz`, `time`, `timetz` and
 //! `interval`, minus everything the INTERVAL rewrite already owns.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{boxed::Box, format, string::ToString, vec};
-
 use sql_traits::structs::ParserDB;
 use sqlparser::ast::{
     BinaryOperator, CastKind, DataType, DateTimeField, Expr, ExtractSyntax, TimezoneInfo, Value,
@@ -30,6 +26,8 @@ use super::{
     shared_helpers::{declared_in_scope, function_argument_exprs, is_integral_expression},
     temporal_literals,
 };
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{errors::Error, prelude::ReverseTranslator, traits::translator::TranslatorWithContext};
 
 /// The temporal type of an operand, as far as it resolves without

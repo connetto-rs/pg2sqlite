@@ -23,17 +23,6 @@
 //! - Pre-filtering with WHERE clauses to reduce scan size
 //! - Keeping datasets under 100k vectors for acceptable latency
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sql_traits::{
     errors::LookupError,
     structs::ParserDB,
@@ -44,6 +33,8 @@ use sqlparser::ast::{
     SetExpr, Statement, TriggerEvent, TriggerPeriod,
 };
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{

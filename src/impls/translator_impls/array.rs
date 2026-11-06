@@ -29,16 +29,6 @@
 //!   literal, a call, a `CASE` or a scalar subquery, so a call to a function
 //!   the schema does not declare still fails in SQLite.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
 use core::ops::ControlFlow;
 
 use sql_traits::structs::ParserDB;
@@ -49,6 +39,8 @@ use sqlparser::ast::{
     ValueWithSpan, visit_expressions,
 };
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{

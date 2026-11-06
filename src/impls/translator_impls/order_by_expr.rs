@@ -1,18 +1,10 @@
 //! Implementation of the [`Translator`](crate::traits::Translator) trait for
 //! the `OrderByExpr` type.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sqlparser::ast::OrderByExpr;
+
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 
 impl crate::traits::translator::TranslatorWithContext for OrderByExpr {
     type SQLiteEntry = OrderByExpr;

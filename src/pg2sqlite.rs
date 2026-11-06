@@ -1,16 +1,6 @@
 //! Submodule defining the main translator struct.
 
 use alloc::borrow::Cow;
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
 #[cfg(feature = "std")]
 use std::path::PathBuf;
 
@@ -27,6 +17,8 @@ use sqlparser::{
 #[cfg(feature = "git")]
 use tempfile::TempDir;
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     impls::{
         emitted_namespace::{Source, reject_name_collisions, sourced},

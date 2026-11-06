@@ -7,11 +7,12 @@
 //! cannot identify breaks that, and the emitted SQL then answers from a draw
 //! PostgreSQL never made.
 
-use alloc::{format, string::String, vec::Vec};
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{Expr, Function, InTarget, Query, SetExpr, TableFactor, Visit, Visitor};
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{session_variable, sqlite_functions::classify},

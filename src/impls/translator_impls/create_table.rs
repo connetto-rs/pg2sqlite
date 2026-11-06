@@ -2,16 +2,6 @@
 //! the `CreateTable` type.
 
 use alloc::collections::BTreeSet;
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
 
 use sqlparser::ast::{
     ColumnOption, ColumnOptionDef, CreateTable, CreateTableOptions, HiveDistributionStyle,
@@ -19,6 +9,8 @@ use sqlparser::ast::{
     WithData,
 };
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     impls::{
         object_name::normalize_schema_qualified_object_name_for_sqlite,

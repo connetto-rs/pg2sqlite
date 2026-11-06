@@ -1,16 +1,6 @@
 //! Shared helper functions for translating table references, joins, and select
 //! items. Generic over translation direction (forward or reverse).
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
 use core::ops::ControlFlow;
 
 use sql_traits::{
@@ -32,6 +22,8 @@ use sqlparser::ast::{
     XmlPassingClause, XmlTableColumn, XmlTableColumnOption, visit_expressions,
 };
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{

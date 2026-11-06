@@ -15,8 +15,6 @@
 //! failure inside a definer body would leave its owner on the stack.
 //! PostgreSQL has no `OR FAIL`, and no translated statement carries one.
 
-#[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, format, string::ToString, vec, vec::Vec};
 use core::ops::ControlFlow;
 
 use sql_traits::{
@@ -29,6 +27,8 @@ use sqlparser::ast::{
     visit_relations_mut,
 };
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{

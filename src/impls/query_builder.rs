@@ -7,15 +7,14 @@
 //! fields that matter, and every new upstream field breaks each copy, so the
 //! neutral shape lives here once.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{boxed::Box, vec, vec::Vec};
-
 use sqlparser::ast::{
     Expr, FunctionArg, FunctionArgExpr, GroupByExpr, Ident, ObjectName, ObjectNamePart, Query,
     Select, SelectFlavor, SelectItem, SetExpr, TableAlias, TableFactor, TableFunctionArgs,
     TableWithJoins, With, helpers::attached_token::AttachedToken,
 };
+
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 
 /// Create a minimal [`Query`] from a WITH clause and body, with all other
 /// fields set to their defaults (no ORDER BY, no LIMIT, no FETCH, etc.).

@@ -1,13 +1,6 @@
 //! The DDL side of the interval comparison key: the uniqueness and the
 //! checks a table of interval columns earns, and the references it cannot.
 
-#[cfg(not(feature = "std"))]
-use alloc::{
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
 use core::ops::ControlFlow;
 
 use sql_traits::{structs::ParserDB, traits::TableLike};
@@ -18,6 +11,8 @@ use sqlparser::ast::{
 };
 
 use super::{is_interval_data_type, keys};
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{

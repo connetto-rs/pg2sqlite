@@ -6,10 +6,7 @@
 //! name when they run, so both are resolved at the statement that reads or
 //! fires them.
 
-#[cfg(not(feature = "std"))]
-use alloc::{collections::BTreeMap, string::String, vec::Vec};
-#[cfg(feature = "std")]
-use std::collections::BTreeMap;
+use alloc::collections::BTreeMap;
 
 use sqlparser::ast::{
     AlterTable, AlterTableOperation, ConditionalStatements, CreateTrigger, FromTable, ObjectName,
@@ -18,6 +15,8 @@ use sqlparser::ast::{
 };
 
 use crate::impls::scoped_relations::relation_names;
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 
 /// One connection-local object, from its creation to its drop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

@@ -15,16 +15,11 @@
 //! `'today'` is resolved when the server reads it rather than standing for a
 //! fixed date.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    format,
-    string::{String, ToString},
-};
-
 use sqlparser::ast::{DataType, TimezoneInfo};
 
 use crate::errors::Error;
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 
 /// The temporal type a literal is being written into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

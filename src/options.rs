@@ -1,22 +1,14 @@
 //! Submodule defining a struct providing options for the translation.
 
 use alloc::borrow::Cow;
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
 
 use sql_traits::structs::{
     ColumnDefinition, ColumnDefinitionScope, ColumnQueryScope, ColumnScope, Deployment, ParserDB,
 };
 use sqlparser::ast::{Expr, ObjectName};
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     impls::translator_impls::array::WholeRow,
     traits::{ArrayRepresentation, SessionVariableMapping, UuidRepresentation},

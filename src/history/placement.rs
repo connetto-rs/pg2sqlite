@@ -5,17 +5,7 @@
 //! through such a view, is emitted `TEMP`. Inner names stay unqualified, which
 //! is sound because the collision check keeps names unique across all three.
 
-#[cfg(feature = "std")]
 use alloc::collections::{BTreeMap, BTreeSet};
-#[cfg(not(feature = "std"))]
-use alloc::{
-    borrow::ToOwned,
-    collections::{BTreeMap, BTreeSet},
-    format,
-    string::String,
-    vec,
-    vec::Vec,
-};
 
 use sql_traits::{
     structs::ParserDB,
@@ -26,6 +16,8 @@ use sqlparser::ast::{
     ObjectType, RenameTableNameKind, SetExpr, Statement, TableConstraint, TableFactor, TableObject,
 };
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{

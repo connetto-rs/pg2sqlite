@@ -1,14 +1,3 @@
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sqlparser::ast::{Delete, Expr, Statement};
 
 use super::helpers::{Forward, spell_target_alias_with_as, translate_table_with_joins};
@@ -19,6 +8,8 @@ use crate::impls::{
     shared_helpers::translate_delete_core,
     translator_impls::postgis,
 };
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 
 /// Every relation a `DELETE` lists, so a reference qualified by a `USING`
 /// relation resolves as well as one naming the target.

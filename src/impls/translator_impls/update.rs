@@ -1,20 +1,11 @@
 //! Implementation of the [`Translator`](crate::traits::Translator) trait for
 //! the `Update` type.
 
-#[cfg(not(feature = "std"))]
-#[allow(unused_imports)]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    format,
-    string::{String, ToString},
-    vec,
-    vec::Vec,
-};
-
 use sqlparser::ast::{Update, UpdateTableFromKind};
 
 use super::helpers::{Forward, spell_target_alias_with_as};
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{returning_scope::scope_returning_to_target, shared_helpers::translate_update},
