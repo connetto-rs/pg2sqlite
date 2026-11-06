@@ -4,14 +4,10 @@
 //! own record. This is a common pattern for user profile tables.
 
 use diesel::prelude::*;
-use helpers::{establish_connection, set_session_user_id};
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
+use helpers::set_session_user_id;
 use rosetta_uuid::Uuid;
 
-use crate::{
-    helpers,
-    helpers::deployment::{caller, deployment},
-};
+use crate::helpers;
 
 mod schema {
     diesel::table! {
@@ -36,62 +32,30 @@ struct AppUser {
     settings: Option<String>,
 }
 
-fn translate_and_setup() -> Result<diesel::SqliteConnection, Box<dyn std::error::Error>> {
-    let sql = concat!(
-        "CREATE ROLE authenticated;\n",
-        include_str!("../fixtures/rls_self_referential.sql"),
-        "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
-    );
+/// The `rls_self_referential.sql` fixture under the `authenticated` role,
+/// fully granted.
+const SQL: &str = concat!(
+    "CREATE ROLE authenticated;\n",
+    include_str!("../fixtures/rls_self_referential.sql"),
+    "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
+);
 
-    let options = Pg2SqliteOptions::default()
-        .with_uuid_representation(UuidRepresentation::Blob)
-        .with_uuid_v7_function_name("uuidv7")
-        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
-        .with_acting_role("authenticated")
-        .with_rls_audit_table_name("rls_audit".to_string())
-        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"));
-
-    let translated_migrations = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection = establish_connection();
-
-    for translated_migration in &translated_migrations {
-        let sql_stmt = translated_migration.to_string();
-        diesel::sql_query(&sql_stmt).execute(&mut connection)?;
-    }
-
-    Ok(connection)
+fn translate_and_setup() -> diesel::SqliteConnection {
+    helpers::apply_translated_ddl(SQL, &helpers::rls::options("authenticated", false))
 }
 
 /// Snapshot test for self-referential RLS translation.
 #[test]
-fn test_self_referential_translation_snapshot() -> Result<(), Box<dyn std::error::Error>> {
-    let sql = concat!(
-        "CREATE ROLE authenticated;\n",
-        include_str!("../fixtures/rls_self_referential.sql"),
-        "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
-    );
-
-    let options = Pg2SqliteOptions::default()
-        .with_uuid_representation(UuidRepresentation::Blob)
-        .with_uuid_v7_function_name("uuidv7")
-        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
-        .with_acting_role("authenticated")
-        .with_rls_audit_table_name("rls_audit".to_string())
-        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"));
-
-    let translated_migrations = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let translated_sql =
-        translated_migrations.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+fn test_self_referential_translation_snapshot() {
+    let translated_sql = helpers::translate_pg(SQL, &helpers::rls::options("authenticated", false))
+        .expect("translate fixture")
+        .join("\n");
     insta::assert_snapshot!("rls_self_referential_translation", translated_sql);
-
-    Ok(())
 }
 
 #[test]
 fn test_user_sees_only_self() -> Result<(), Box<dyn std::error::Error>> {
-    let mut connection = translate_and_setup()?;
+    let mut connection = translate_and_setup();
 
     let alice_id = Uuid::new_v4();
     let bob_id = Uuid::new_v4();
@@ -135,7 +99,7 @@ fn test_user_sees_only_self() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn test_user_cannot_see_others() -> Result<(), Box<dyn std::error::Error>> {
-    let mut connection = translate_and_setup()?;
+    let mut connection = translate_and_setup();
 
     let alice_id = Uuid::new_v4();
     let bob_id = Uuid::new_v4();
@@ -172,7 +136,7 @@ fn test_user_cannot_see_others() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn test_user_can_update_own() -> Result<(), Box<dyn std::error::Error>> {
-    let mut connection = translate_and_setup()?;
+    let mut connection = translate_and_setup();
 
     let alice_id = Uuid::new_v4();
 
@@ -202,7 +166,7 @@ fn test_user_can_update_own() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn test_user_cannot_update_others() -> Result<(), Box<dyn std::error::Error>> {
-    let mut connection = translate_and_setup()?;
+    let mut connection = translate_and_setup();
 
     let alice_id = Uuid::new_v4();
     let bob_id = Uuid::new_v4();
@@ -259,7 +223,7 @@ fn test_user_cannot_update_others() -> Result<(), Box<dyn std::error::Error>> {
 /// behaviour is still reachable through `with_strict_rls_write_deny`.
 #[test]
 fn test_delete_without_explicit_policy() -> Result<(), Box<dyn std::error::Error>> {
-    let mut connection = translate_and_setup()?;
+    let mut connection = translate_and_setup();
 
     let alice_id = Uuid::new_v4();
 
@@ -289,8 +253,8 @@ fn test_delete_without_explicit_policy() -> Result<(), Box<dyn std::error::Error
 }
 
 #[test]
-fn test_insert_wrong_id_fails() -> Result<(), Box<dyn std::error::Error>> {
-    let mut connection = translate_and_setup()?;
+fn test_insert_wrong_id_fails() {
+    let mut connection = translate_and_setup();
 
     let alice_id = Uuid::new_v4();
     let bob_id = Uuid::new_v4();
@@ -307,6 +271,4 @@ fn test_insert_wrong_id_fails() -> Result<(), Box<dyn std::error::Error>> {
         .execute(&mut connection);
 
     assert!(result.is_err(), "Insert with wrong ID should fail");
-
-    Ok(())
 }

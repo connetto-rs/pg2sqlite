@@ -11,7 +11,9 @@
 use std::cell::Cell;
 
 use diesel::prelude::*;
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+use pg2sqlite::prelude::Pg2SqliteOptions;
+
+use crate::helpers;
 
 diesel::define_sql_function! {
     /// Reports whether generated write guards are exempt.
@@ -58,23 +60,11 @@ fn options() -> Pg2SqliteOptions {
 }
 
 fn translate(schema: &str) -> Vec<String> {
-    Pg2Sqlite::default()
-        .sql(schema)
-        .expect("parse")
-        .translate(&options())
-        .expect("translate")
-        .into_vec()
-        .iter()
-        .map(ToString::to_string)
-        .collect()
+    helpers::translate_pg(schema, &options()).expect("translate")
 }
 
 fn apply(schema: &str) -> SqliteConnection {
-    let mut conn = SqliteConnection::establish(":memory:").expect("connect");
-    for stmt in translate(schema) {
-        diesel::sql_query(stmt).execute(&mut conn).expect("apply statement");
-    }
-    conn
+    helpers::apply_statements(&translate(schema))
 }
 
 #[test]
@@ -99,19 +89,14 @@ fn readonly_nonrls_select_works_and_insert_fails() {
 #[test]
 fn write_exemption_bypasses_each_nonrls_deny_trigger() {
     let opts = options().with_write_exemption_function("write_is_exempt");
-    let translated = Pg2Sqlite::default()
-        .sql(SCHEMA)
-        .expect("parse")
-        .translate(&opts)
-        .expect("translate")
-        .into_vec();
+    let translated = helpers::translate_pg(SCHEMA, &opts).expect("translate");
     let mut conn = SqliteConnection::establish(":memory:").expect("connect");
     write_is_exempt_utils::register_nondeterministic_impl(&mut conn, || {
         WRITE_IS_EXEMPT.with(Cell::get)
     })
     .expect("register write_is_exempt");
-    for statement in translated {
-        diesel::sql_query(statement.to_string()).execute(&mut conn).expect("apply statement");
+    for statement in &translated {
+        diesel::sql_query(statement).execute(&mut conn).expect("apply statement");
     }
 
     WRITE_IS_EXEMPT.with(|exempt| exempt.set(false));
@@ -191,11 +176,7 @@ CREATE TABLE orders (id INTEGER PRIMARY KEY, item TEXT NOT NULL);
 GRANT SELECT ON orders TO app_user;
 CREATE TABLE \"orders__readonly_insert\" (x INTEGER);
 ";
-    let result = Pg2Sqlite::default()
-        .sql(schema)
-        .expect("parse")
-        .translate(&options())
-        .map(pg2sqlite::script::Script::into_vec);
+    let result = helpers::translate_pg(schema, &options());
     let err = result.expect_err("collision with reserved trigger name must error");
     let message = err.to_string();
     assert!(
@@ -212,11 +193,7 @@ CREATE TABLE orders (id INTEGER PRIMARY KEY, item TEXT NOT NULL);
 GRANT SELECT ON orders TO app_user;
 CREATE INDEX \"orders__readonly_update\" ON orders (item);
 ";
-    let result = Pg2Sqlite::default()
-        .sql(schema)
-        .expect("parse")
-        .translate(&options())
-        .map(pg2sqlite::script::Script::into_vec);
+    let result = helpers::translate_pg(schema, &options());
     let err = result.expect_err("collision with a reserved index name must error");
     let message = err.to_string();
     assert!(
@@ -236,11 +213,7 @@ CREATE TABLE orders (id INTEGER PRIMARY KEY, item TEXT NOT NULL);
 GRANT SELECT ON orders TO app_user;
 CREATE INDEX \"ORDERS__READONLY_INSERT\" ON orders (item);
 ";
-    let result = Pg2Sqlite::default()
-        .sql(schema)
-        .expect("parse")
-        .translate(&options())
-        .map(pg2sqlite::script::Script::into_vec);
+    let result = helpers::translate_pg(schema, &options());
     assert!(result.is_err(), "case-differing name must still collide, got: {result:?}");
 }
 
@@ -252,11 +225,7 @@ CREATE TABLE orders (id INTEGER PRIMARY KEY, item TEXT NOT NULL);
 GRANT SELECT ON orders TO app_user;
 CREATE VIEW \"orders__readonly_delete\" AS SELECT id FROM orders;
 ";
-    let result = Pg2Sqlite::default()
-        .sql(schema)
-        .expect("parse")
-        .translate(&options())
-        .map(pg2sqlite::script::Script::into_vec);
+    let result = helpers::translate_pg(schema, &options());
     let err = result.expect_err("collision with a reserved view name must error");
     let message = err.to_string();
     assert!(
@@ -273,11 +242,7 @@ CREATE TABLE orders (id INTEGER PRIMARY KEY, item TEXT NOT NULL);
 GRANT SELECT ON orders TO app_user;
 CREATE TRIGGER \"orders__readonly_update\" BEFORE UPDATE ON orders FOR EACH ROW EXECUTE FUNCTION noop();
 ";
-    let result = Pg2Sqlite::default()
-        .sql(schema)
-        .expect("parse")
-        .translate(&options())
-        .map(pg2sqlite::script::Script::into_vec);
+    let result = helpers::translate_pg(schema, &options());
     let err = result.expect_err("collision with a reserved trigger name must error");
     let message = err.to_string();
     assert!(
@@ -295,16 +260,8 @@ GRANT SELECT ON orders TO app_user;
 CREATE TABLE \"orders__readonly_insert\" (x INTEGER);
 ";
     let opts = options().with_readonly_deny_trigger_suffix("__ro");
-    // Keep the stmt vec to execute after the substring checks.
-    let stmts: Vec<String> = Pg2Sqlite::default()
-        .sql(schema)
-        .expect("parse")
-        .translate(&opts)
-        .expect("custom marker avoids the default collision")
-        .into_vec()
-        .iter()
-        .map(ToString::to_string)
-        .collect();
+    let stmts =
+        helpers::translate_pg(schema, &opts).expect("custom marker avoids the default collision");
     let joined = stmts.join("\n");
     for name in ["orders__ro_insert", "orders__ro_update", "orders__ro_delete"] {
         assert!(joined.contains(name), "expected trigger {name}, got:\n{joined}");

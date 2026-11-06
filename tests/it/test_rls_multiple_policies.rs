@@ -4,14 +4,10 @@
 //! allowing access if ANY policy matches.
 
 use diesel::prelude::*;
-use helpers::{establish_connection, set_session_department, set_session_user_id};
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
+use helpers::{set_session_department, set_session_user_id};
 use rosetta_uuid::Uuid;
 
-use crate::{
-    helpers,
-    helpers::deployment::{caller, deployment, scalar},
-};
+use crate::helpers;
 
 mod schema {
     diesel::table! {
@@ -38,76 +34,30 @@ struct Document {
     title: String,
 }
 
-fn translate_and_setup() -> Result<diesel::SqliteConnection, Box<dyn std::error::Error>> {
-    let sql = concat!(
-        "CREATE ROLE authenticated;\n",
-        include_str!("../fixtures/rls_multiple_policies.sql"),
-        "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
-    );
+/// The `rls_multiple_policies.sql` fixture under the `authenticated` role,
+/// fully granted.
+const SQL: &str = concat!(
+    "CREATE ROLE authenticated;\n",
+    include_str!("../fixtures/rls_multiple_policies.sql"),
+    "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
+);
 
-    let options = Pg2SqliteOptions::default()
-        .with_uuid_representation(UuidRepresentation::Blob)
-        .with_uuid_v7_function_name("uuidv7")
-        .with_deployment(deployment(
-            ["authenticated"],
-            [caller("app.user_id", "uuid"), scalar("app.user_department", "text")],
-        ))
-        .with_acting_role("authenticated")
-        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
-        .with_session_variable(SessionVariableMapping::new(
-            "app.user_department",
-            "current_app_department",
-        ))
-        .with_rls_audit_table_name("rls_audit".to_string());
-
-    let translated_migrations = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection = establish_connection();
-
-    for translated_migration in &translated_migrations {
-        let sql_stmt = translated_migration.to_string();
-        diesel::sql_query(&sql_stmt).execute(&mut connection)?;
-    }
-
-    Ok(connection)
+fn translate_and_setup() -> diesel::SqliteConnection {
+    helpers::apply_translated_ddl(SQL, &helpers::rls::options("authenticated", true))
 }
 
 /// Snapshot test for multiple policies RLS translation.
 #[test]
-fn test_multiple_policies_translation_snapshot() -> Result<(), Box<dyn std::error::Error>> {
-    let sql = concat!(
-        "CREATE ROLE authenticated;\n",
-        include_str!("../fixtures/rls_multiple_policies.sql"),
-        "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
-    );
-
-    let options = Pg2SqliteOptions::default()
-        .with_uuid_representation(UuidRepresentation::Blob)
-        .with_uuid_v7_function_name("uuidv7")
-        .with_deployment(deployment(
-            ["authenticated"],
-            [caller("app.user_id", "uuid"), scalar("app.user_department", "text")],
-        ))
-        .with_acting_role("authenticated")
-        .with_rls_audit_table_name("rls_audit".to_string())
-        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
-        .with_session_variable(SessionVariableMapping::new(
-            "app.user_department",
-            "current_app_department",
-        ));
-
-    let translated_migrations = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let translated_sql =
-        translated_migrations.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+fn test_multiple_policies_translation_snapshot() {
+    let translated_sql = helpers::translate_pg(SQL, &helpers::rls::options("authenticated", true))
+        .expect("translate fixture")
+        .join("\n");
     insta::assert_snapshot!("rls_multiple_policies_translation", translated_sql);
-
-    Ok(())
 }
 
 #[test]
 fn test_owner_sees_own_docs() -> Result<(), Box<dyn std::error::Error>> {
-    let mut connection = translate_and_setup()?;
+    let mut connection = translate_and_setup();
 
     let alice = Uuid::new_v4();
 
@@ -132,7 +82,7 @@ fn test_owner_sees_own_docs() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn test_anyone_sees_public_docs() -> Result<(), Box<dyn std::error::Error>> {
-    let mut connection = translate_and_setup()?;
+    let mut connection = translate_and_setup();
 
     let alice = Uuid::new_v4();
     let bob = Uuid::new_v4();
@@ -162,7 +112,7 @@ fn test_anyone_sees_public_docs() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn test_dept_member_sees_dept_docs() -> Result<(), Box<dyn std::error::Error>> {
-    let mut connection = translate_and_setup()?;
+    let mut connection = translate_and_setup();
 
     let alice = Uuid::new_v4();
     let bob = Uuid::new_v4();
@@ -199,7 +149,7 @@ fn test_dept_member_sees_dept_docs() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn test_user_sees_union_of_all_matching() -> Result<(), Box<dyn std::error::Error>> {
-    let mut connection = translate_and_setup()?;
+    let mut connection = translate_and_setup();
 
     let alice = Uuid::new_v4();
     let bob = Uuid::new_v4();
@@ -274,7 +224,7 @@ fn test_user_sees_union_of_all_matching() -> Result<(), Box<dyn std::error::Erro
 /// Multiple PERMISSIVE policies are a union: any single match grants access.
 #[test]
 fn test_policies_combine_with_or() -> Result<(), Box<dyn std::error::Error>> {
-    let mut connection = translate_and_setup()?;
+    let mut connection = translate_and_setup();
 
     let alice = Uuid::new_v4();
     let doc_id = Uuid::new_v4();
@@ -305,7 +255,7 @@ fn test_policies_combine_with_or() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn test_non_matching_sees_nothing() -> Result<(), Box<dyn std::error::Error>> {
-    let mut connection = translate_and_setup()?;
+    let mut connection = translate_and_setup();
 
     let alice = Uuid::new_v4();
     let nobody = Uuid::new_v4();

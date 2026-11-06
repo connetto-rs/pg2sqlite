@@ -7,34 +7,24 @@
 //! - View and trigger names derived from the backing table
 
 use diesel::{connection::SimpleConnection, prelude::*};
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
+use pg2sqlite::prelude::{Pg2SqliteOptions, UuidRepresentation};
 
-use crate::helpers::deployment::{caller, deployment};
+use crate::helpers;
 
-fn make_options_with_suffix(suffix: &str) -> Pg2SqliteOptions {
-    Pg2SqliteOptions::default()
-        .with_uuid_representation(UuidRepresentation::Blob)
-        .with_uuid_v7_function_name("uuidv7")
-        .with_rls_table_suffix(suffix)
-        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
-        .with_acting_role("authenticated")
-        .with_rls_audit_table_name("rls_audit".to_string())
-        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
-}
+const BASIC_SQL: &str = concat!(
+    "CREATE ROLE authenticated;\n",
+    include_str!("../fixtures/rls_basic.sql"),
+    "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
+);
 
 /// The backing table must carry the custom suffix; the view retains the
 /// original table name.
 #[test]
 fn test_custom_suffix_renames_backing_table() {
-    let sql = concat!(
-        "CREATE ROLE authenticated;\n",
-        include_str!("../fixtures/rls_basic.sql"),
-        "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
-    );
-    let options = make_options_with_suffix("_secure");
+    let options = helpers::rls::options("authenticated", false).with_rls_table_suffix("_secure");
 
-    let translated = Pg2Sqlite::default().sql(sql).unwrap().translate(&options).unwrap().into_vec();
-    let sql_output = translated.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    let translated = helpers::translate_pg(BASIC_SQL, &options).unwrap();
+    let sql_output = translated.join("\n");
 
     // Backing table should carry the custom suffix
     assert!(
@@ -61,15 +51,9 @@ fn test_custom_suffix_renames_backing_table() {
 /// future regression is immediately visible.
 #[test]
 fn test_custom_suffix_snapshot() {
-    let sql = concat!(
-        "CREATE ROLE authenticated;\n",
-        include_str!("../fixtures/rls_basic.sql"),
-        "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
-    );
-    let options = make_options_with_suffix("_secure");
+    let options = helpers::rls::options("authenticated", false).with_rls_table_suffix("_secure");
 
-    let translated = Pg2Sqlite::default().sql(sql).unwrap().translate(&options).unwrap().into_vec();
-    let sql_output = translated.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    let sql_output = helpers::translate_pg(BASIC_SQL, &options).unwrap().join("\n");
 
     insta::assert_snapshot!("custom_rls_suffix_translation", sql_output);
 }
@@ -89,8 +73,8 @@ fn test_custom_suffix_in_foreign_keys() {
         .with_rls_table_suffix("_secure")
         .with_rls_audit_table_name("rls_audit".to_string());
 
-    let translated = Pg2Sqlite::default().sql(sql).unwrap().translate(&options).unwrap().into_vec();
-    let sql_output = translated.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    let translated = helpers::translate_pg(sql, &options).unwrap();
+    let sql_output = translated.join("\n");
 
     // FK should reference the custom-suffixed backing table
     assert!(

@@ -41,6 +41,12 @@ mod schema {
 
 use schema::{docs, docs_rls};
 
+/// The `sel`/`upd` policy pair whose `USING` predicates read `is_public = 1`.
+const USING_PAIR: &str = "
+        CREATE POLICY sel ON docs FOR SELECT USING (is_public = 1);
+        CREATE POLICY upd ON docs FOR UPDATE USING (is_public = 1);
+    ";
+
 #[derive(Insertable)]
 #[diesel(table_name = docs_rls)]
 struct BackingRow {
@@ -113,12 +119,7 @@ fn stored(conn: &mut SqliteConnection) -> Result<StoredRow, Box<dyn std::error::
 #[test]
 fn for_update_using_rejects_moving_a_row_out_of_the_predicate()
 -> Result<(), Box<dyn std::error::Error>> {
-    let mut conn = setup(
-        "
-        CREATE POLICY sel ON docs FOR SELECT USING (is_public = 1);
-        CREATE POLICY upd ON docs FOR UPDATE USING (is_public = 1);
-    ",
-    )?;
+    let mut conn = setup(USING_PAIR)?;
 
     let rejected = diesel::update(docs::table.filter(docs::id.eq(1)))
         .set(docs::is_public.eq(0))
@@ -157,12 +158,7 @@ fn for_all_using_rejects_moving_a_row_out_of_the_predicate()
 /// against the fallback rejecting everything.
 #[test]
 fn update_staying_inside_the_predicate_succeeds() -> Result<(), Box<dyn std::error::Error>> {
-    let mut conn = setup(
-        "
-        CREATE POLICY sel ON docs FOR SELECT USING (is_public = 1);
-        CREATE POLICY upd ON docs FOR UPDATE USING (is_public = 1);
-    ",
-    )?;
+    let mut conn = setup(USING_PAIR)?;
 
     diesel::update(docs::table.filter(docs::id.eq(1)))
         .set(docs::body.eq("edited"))

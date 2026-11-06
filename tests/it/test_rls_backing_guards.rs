@@ -339,6 +339,29 @@ fn apply_with_exemption(pg: &str) -> SqliteConnection {
     conn
 }
 
+/// A `bob` row with `id` 1 in the `shared_items` backing table.
+fn insert_shared_item(
+    conn: &mut SqliteConnection,
+    body: &str,
+) -> diesel::result::QueryResult<usize> {
+    diesel::insert_into(schema::shared_items_rls::table)
+        .values((
+            schema::shared_items_rls::id.eq(1),
+            schema::shared_items_rls::owner.eq("bob"),
+            schema::shared_items_rls::body.eq(body),
+        ))
+        .execute(conn)
+}
+
+/// The `owner`/`body` pair of the stored `branch_items` row.
+fn read_branch_item(conn: &mut SqliteConnection) -> (String, String) {
+    schema::branch_items_rls::table
+        .find(1)
+        .select((schema::branch_items_rls::owner, schema::branch_items_rls::body))
+        .first::<(String, String)>(conn)
+        .unwrap()
+}
+
 fn branch_schema(policies: &str) -> String {
     format!(
         "CREATE ROLE alice;
@@ -380,11 +403,7 @@ fn assert_update_guard_case(case: &UpdateGuardCase) {
             schema::branch_items::body.eq("blocked"),
         ))
         .execute(&mut conn);
-    let stored = schema::branch_items_rls::table
-        .find(1)
-        .select((schema::branch_items_rls::owner, schema::branch_items_rls::body))
-        .first::<(String, String)>(&mut conn)
-        .unwrap();
+    let stored = read_branch_item(&mut conn);
     assert_eq!(stored, (case.seed_owner.to_owned(), "original".to_owned()), "{}", case.name);
 
     set_write_exempt(true);
@@ -395,11 +414,7 @@ fn assert_update_guard_case(case: &UpdateGuardCase) {
         ))
         .execute(&mut conn)
         .unwrap_or_else(|error| panic!("{} exempt update failed: {error}", case.name));
-    let stored = schema::branch_items_rls::table
-        .find(1)
-        .select((schema::branch_items_rls::owner, schema::branch_items_rls::body))
-        .first::<(String, String)>(&mut conn)
-        .unwrap();
+    let stored = read_branch_item(&mut conn);
     assert_eq!(stored, (case.update_owner.to_owned(), "restored".to_owned()), "{}", case.name);
     set_write_exempt(false);
 }
@@ -705,13 +720,7 @@ fn zero_policy_backing_insert_honours_write_exemption() {
 fn configured_but_unregistered_exemption_fails_closed() {
     let mut conn = apply(SHARED_READ_OWNER_WRITE_SCHEMA, &exemption_opts());
 
-    let error = diesel::insert_into(schema::shared_items_rls::table)
-        .values((
-            schema::shared_items_rls::id.eq(1),
-            schema::shared_items_rls::owner.eq("bob"),
-            schema::shared_items_rls::body.eq("server"),
-        ))
-        .execute(&mut conn)
+    let error = insert_shared_item(&mut conn, "server")
         .expect_err("an unavailable exemption function must not allow the write");
     assert!(
         error.to_string().contains("write_is_exempt"),
@@ -913,26 +922,12 @@ fn exemption_covers_backing_and_view_insert() {
     let mut conn = apply_with_exemption(SHARED_READ_OWNER_WRITE_SCHEMA);
 
     assert!(
-        diesel::insert_into(schema::shared_items_rls::table)
-            .values((
-                schema::shared_items_rls::id.eq(1),
-                schema::shared_items_rls::owner.eq("bob"),
-                schema::shared_items_rls::body.eq("blocked"),
-            ))
-            .execute(&mut conn)
-            .is_err(),
+        insert_shared_item(&mut conn, "blocked").is_err(),
         "a normal backing write must remain guarded"
     );
 
     set_write_exempt(true);
-    diesel::insert_into(schema::shared_items_rls::table)
-        .values((
-            schema::shared_items_rls::id.eq(1),
-            schema::shared_items_rls::owner.eq("bob"),
-            schema::shared_items_rls::body.eq("server"),
-        ))
-        .execute(&mut conn)
-        .expect("an exempt backing write must land");
+    insert_shared_item(&mut conn, "server").expect("an exempt backing write must land");
     assert_eq!(
         schema::shared_items::table
             .select(schema::shared_items::id)
@@ -1039,14 +1034,7 @@ fn exempt_write_keeps_constraints_and_unrelated_triggers_active() {
     .expect("install unrelated trigger");
     set_write_exempt(true);
 
-    diesel::insert_into(schema::shared_items_rls::table)
-        .values((
-            schema::shared_items_rls::id.eq(1),
-            schema::shared_items_rls::owner.eq("bob"),
-            schema::shared_items_rls::body.eq("server"),
-        ))
-        .execute(&mut conn)
-        .expect("the exempt write must land");
+    insert_shared_item(&mut conn, "server").expect("the exempt write must land");
     assert_eq!(
         schema::side_effects::table
             .select(schema::side_effects::id)

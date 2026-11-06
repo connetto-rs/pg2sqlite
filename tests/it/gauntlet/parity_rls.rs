@@ -9,16 +9,13 @@
 
 use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
 use helpers::{establish_connection, set_session_department, set_session_user_id};
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
+use pg2sqlite::prelude::{Pg2SqliteOptions, UuidRepresentation};
 use postgres_harness::Outcome;
 use rosetta_uuid::Uuid;
 
 use crate::{
     helpers,
-    helpers::{
-        deployment::{caller, deployment, scalar},
-        postgres as postgres_harness,
-    },
+    helpers::{deployment::deployment, postgres as postgres_harness},
 };
 
 // User UUIDs shared across all scenarios.
@@ -38,17 +35,12 @@ fn uc() -> Uuid {
 /// seeding, and authoritative loads run with triggers
 /// disabled. Diesel cannot reach sqlite3_db_config, so the toggle is
 /// replaced by applying triggers only after the seeds.
-fn apply_base_ddl(
-    conn: &mut SqliteConnection,
-    translated: &[sqlparser::ast::Statement],
-) -> Vec<String> {
-    let (triggers, base): (Vec<_>, Vec<_>) =
-        translated.iter().map(ToString::to_string).partition(|s| s.starts_with("CREATE TRIGGER"));
+fn apply_base_ddl(conn: &mut SqliteConnection, translated: Vec<String>) -> Vec<String> {
+    let (triggers, base): (Vec<String>, Vec<String>) =
+        translated.into_iter().partition(|s| s.starts_with("CREATE TRIGGER"));
     for stmt in &base {
         // DDL migration: raw SQL is the correct form here.
-        diesel::sql_query(stmt.clone())
-            .execute(conn)
-            .unwrap_or_else(|e| panic!("DDL failed: {e}\n{stmt}"));
+        diesel::sql_query(stmt).execute(conn).unwrap_or_else(|e| panic!("DDL failed: {e}\n{stmt}"));
     }
     triggers
 }
@@ -283,16 +275,6 @@ impl BasicSqliteRunner {
     }
 }
 
-fn basic_options() -> Pg2SqliteOptions {
-    Pg2SqliteOptions::default()
-        .with_uuid_representation(UuidRepresentation::Blob)
-        .with_uuid_v7_function_name("uuidv7")
-        .with_rls_audit_table_name("rls_audit")
-        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
-        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
-        .with_acting_role("authenticated")
-}
-
 fn basic_scenario() -> Vec<BasicStep> {
     let d1 = Uuid::from([0xd1; 16]);
     let d3 = Uuid::from([0xd3; 16]);
@@ -326,14 +308,13 @@ fn rls_basic_engines_agree() {
         BasicPgRunner { connection: conn, acting: ua(), current_role: String::new() }
     };
     let (mut sq, basic_triggers) = {
-        let translated = Pg2Sqlite::default()
-            .sql(RLS_BASIC_FOR_TRANSLATION)
-            .expect("parse rls_basic")
-            .translate(&basic_options())
-            .expect("translate rls_basic")
-            .into_vec();
+        let translated = helpers::translate_pg(
+            RLS_BASIC_FOR_TRANSLATION,
+            &helpers::rls::options("authenticated", false),
+        )
+        .expect("translate rls_basic");
         let mut conn = establish_connection();
-        let triggers = apply_base_ddl(&mut conn, &translated);
+        let triggers = apply_base_ddl(&mut conn, translated);
         (BasicSqliteRunner { connection: conn, acting: ua() }, triggers)
     };
 
@@ -387,17 +368,16 @@ fn an_update_into_invisibility_is_refused_on_both_engines() {
         BasicPgRunner { connection: conn, acting: ua(), current_role: String::new() }
     };
     let (mut sq, triggers) = {
-        let translated = Pg2Sqlite::default()
-            .sql(&format!(
+        let translated = helpers::translate_pg(
+            &format!(
                 "CREATE ROLE authenticated; {HIDDEN_TITLES} \
                  GRANT SELECT, UPDATE ON documents TO authenticated;"
-            ))
-            .expect("parse the schema")
-            .translate(&basic_options())
-            .expect("translate the schema")
-            .into_vec();
+            ),
+            &helpers::rls::options("authenticated", false),
+        )
+        .expect("translate the schema");
         let mut conn = establish_connection();
-        let triggers = apply_base_ddl(&mut conn, &translated);
+        let triggers = apply_base_ddl(&mut conn, translated);
         (BasicSqliteRunner { connection: conn, acting: ua() }, triggers)
     };
 
@@ -633,23 +613,6 @@ impl MultiSqliteRunner {
     }
 }
 
-fn multi_options() -> Pg2SqliteOptions {
-    Pg2SqliteOptions::default()
-        .with_uuid_representation(UuidRepresentation::Blob)
-        .with_uuid_v7_function_name("uuidv7")
-        .with_rls_audit_table_name("rls_audit")
-        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
-        .with_session_variable(SessionVariableMapping::new(
-            "app.user_department",
-            "current_app_department",
-        ))
-        .with_deployment(deployment(
-            ["authenticated"],
-            [caller("app.user_id", "uuid"), scalar("app.user_department", "text")],
-        ))
-        .with_acting_role("authenticated")
-}
-
 fn multi_scenario() -> Vec<MultiStep> {
     let d4 = Uuid::from([0xe4; 16]);
     let d5 = Uuid::from([0xe5; 16]);
@@ -699,14 +662,13 @@ fn rls_multiple_policies_engines_agree() {
         MultiPgRunner { connection: conn, acting: ua(), current_role: String::new() }
     };
     let (mut sq, multi_triggers) = {
-        let translated = Pg2Sqlite::default()
-            .sql(RLS_MULTIPLE_POLICIES_FOR_TRANSLATION)
-            .expect("parse rls_multiple_policies")
-            .translate(&multi_options())
-            .expect("translate rls_multiple_policies")
-            .into_vec();
+        let translated = helpers::translate_pg(
+            RLS_MULTIPLE_POLICIES_FOR_TRANSLATION,
+            &helpers::rls::options("authenticated", true),
+        )
+        .expect("translate rls_multiple_policies");
         let mut conn = establish_connection();
-        let triggers = apply_base_ddl(&mut conn, &translated);
+        let triggers = apply_base_ddl(&mut conn, translated);
         (MultiSqliteRunner { connection: conn, acting: ua() }, triggers)
     };
 
@@ -931,16 +893,6 @@ impl TenantSqliteRunner {
     }
 }
 
-fn tenant_options() -> Pg2SqliteOptions {
-    Pg2SqliteOptions::default()
-        .with_uuid_representation(UuidRepresentation::Blob)
-        .with_uuid_v7_function_name("uuidv7")
-        .with_rls_audit_table_name("rls_audit")
-        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
-        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
-        .with_acting_role("authenticated")
-}
-
 fn tenant_scenario(t1: Uuid, t2: Uuid, p1: Uuid) -> Vec<TenantStep> {
     let p3 = Uuid::from([0xf3; 16]);
     let p4 = Uuid::from([0xf4; 16]);
@@ -983,14 +935,13 @@ fn rls_tenant_isolation_engines_agree() {
         TenantPgRunner { connection: conn, acting: ua(), current_role: String::new() }
     };
     let (mut sq, tenant_triggers) = {
-        let translated = Pg2Sqlite::default()
-            .sql(RLS_TENANT_ISOLATION_FOR_TRANSLATION)
-            .expect("parse rls_tenant_isolation")
-            .translate(&tenant_options())
-            .expect("translate rls_tenant_isolation")
-            .into_vec();
+        let translated = helpers::translate_pg(
+            RLS_TENANT_ISOLATION_FOR_TRANSLATION,
+            &helpers::rls::options("authenticated", false),
+        )
+        .expect("translate rls_tenant_isolation");
         let mut conn = establish_connection();
-        let triggers = apply_base_ddl(&mut conn, &translated);
+        let triggers = apply_base_ddl(&mut conn, translated);
         (TenantSqliteRunner { connection: conn, acting: ua() }, triggers)
     };
 
@@ -1264,16 +1215,6 @@ impl PublicSqliteRunner {
     }
 }
 
-fn public_options() -> Pg2SqliteOptions {
-    Pg2SqliteOptions::default()
-        .with_uuid_representation(UuidRepresentation::Blob)
-        .with_uuid_v7_function_name("uuidv7")
-        .with_rls_audit_table_name("rls_audit")
-        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
-        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
-        .with_acting_role("authenticated")
-}
-
 fn public_access_scenario() -> Vec<PublicStep> {
     let cat2 = Uuid::from([0xc2; 16]);
     let item3 = Uuid::from([0x13; 16]);
@@ -1324,15 +1265,14 @@ fn rls_public_access_engines_agree() {
         PublicPgRunner { connection: conn, acting: ua(), current_role: String::new() }
     };
     let mut sq = {
-        let translated = Pg2Sqlite::default()
-            .sql(RLS_PUBLIC_ACCESS_FOR_TRANSLATION)
-            .expect("parse rls_public_access")
-            .translate(&public_options())
-            .expect("translate rls_public_access")
-            .into_vec();
+        let translated = helpers::translate_pg(
+            RLS_PUBLIC_ACCESS_FOR_TRANSLATION,
+            &helpers::rls::options("authenticated", false),
+        )
+        .expect("translate rls_public_access");
         let mut conn = establish_connection();
         for stmt in &translated {
-            diesel::sql_query(stmt.to_string())
+            diesel::sql_query(stmt)
                 .execute(&mut conn)
                 .unwrap_or_else(|e| panic!("DDL failed: {e}\n{stmt}"));
         }
@@ -1540,14 +1480,11 @@ fn assert_role_reads_agree(
         runner
     };
     let mut sq = {
-        let translated = Pg2Sqlite::default()
-            .sql(RLS_CURRENT_USER_FOR_TRANSLATION)
-            .expect("parse rls_current_user")
-            .translate(&current_user_options(acting))
-            .expect("translate rls_current_user")
-            .into_vec();
+        let translated =
+            helpers::translate_pg(RLS_CURRENT_USER_FOR_TRANSLATION, &current_user_options(acting))
+                .expect("translate rls_current_user");
         let mut conn = establish_connection();
-        let triggers = apply_base_ddl(&mut conn, &translated);
+        let triggers = apply_base_ddl(&mut conn, translated);
         let mut runner = CurrentUserSqliteRunner { connection: conn };
         for (id, username, email, is_public) in seeds {
             runner.seed(*id, username, email, *is_public);
