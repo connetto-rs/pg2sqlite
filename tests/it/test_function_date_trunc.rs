@@ -316,3 +316,18 @@ fn a_millisecond_truncation_written_to_timestamptz_keeps_the_canonical_form() {
     );
     assert_eq!(rows, vec![Some("2024-01-02 03:04:05.500000+00:00".to_string())]);
 }
+
+/// A field argument that is not a string literal names no strftime format, so
+/// the rewrite refuses instead of guessing one.
+#[test]
+fn date_trunc_with_a_non_literal_field_is_refused() {
+    let err = translate_sql("SELECT date_trunc(field, ts) FROM t", &Pg2SqliteOptions::default())
+        .expect_err("a non-literal field has no strftime format");
+    assert!(
+        err.contains(
+            "date_trunc: the field argument must be a string literal \
+             (e.g., date_trunc('day', timestamp))"
+        ),
+        "the refusal should name the function and the expected form: {err}"
+    );
+}

@@ -26,7 +26,7 @@ use crate::{
     errors::Error,
     impls::{
         ast_builder,
-        function_helpers::{simple_function_expr, string_literal},
+        function_helpers::{plain_catalog_function_args, simple_function_expr, string_literal},
         object_name::{
             append_suffix, fts_table_name, last_ident_value_or_display,
             normalize_schema_qualified_object_name_for_sqlite, postgres_catalog_function_name,
@@ -81,22 +81,7 @@ fn tsvector_document(function: &Function) -> Option<&Expr> {
 }
 
 fn lower_argument(function: &Function) -> Option<&Expr> {
-    let is_lower =
-        postgres_catalog_function_name(&function.name).is_some_and(|name| name == "lower");
-    if !is_lower
-        || function.uses_odbc_syntax
-        || !matches!(function.parameters, FunctionArguments::None)
-        || function.filter.is_some()
-        || function.null_treatment.is_some()
-        || function.over.is_some()
-        || !function.within_group.is_empty()
-    {
-        return None;
-    }
-    let FunctionArguments::List(arguments) = &function.args else { return None };
-    if !arguments.clauses.is_empty() {
-        return None;
-    }
+    let arguments = plain_catalog_function_args(function, "lower")?;
     let [argument] = arguments.args.as_slice() else { return None };
     plain_argument_expr(argument)
 }
@@ -561,13 +546,7 @@ impl crate::traits::translator::TranslatorWithContext for CreateIndex {
         // An index expression and a partial index predicate name the indexed
         // table's own columns, with no query around them.
         let indexed_source = resolve_translation_table(schema, &self.table_name)?;
-        let index_scope = indexed_source.map(|table| {
-            sql_traits::structs::ColumnScope::for_table(
-                table,
-                schema,
-                sql_traits::structs::IdentifierCase::AsWritten,
-            )
-        });
+        let index_scope = crate::options::table_column_scope(indexed_source, schema);
         let scoped = index_scope.as_ref().map(|scope| options.with_scope(scope));
         let options = scoped.as_ref().unwrap_or(options);
         let sqlite_table_name =

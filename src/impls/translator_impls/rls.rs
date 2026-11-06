@@ -2894,8 +2894,6 @@ pub fn generate_rls_audit_table(audit_table_name: &str) -> Statement {
             generated_table_column("details", DataType::Text, false),
             generated_table_column("reported_at", DataType::Text, false),
         ],
-        true,
-        true,
     )
 }
 

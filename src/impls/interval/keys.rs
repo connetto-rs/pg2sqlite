@@ -45,6 +45,7 @@ use super::{
 use crate::{
     errors::Error,
     impls::{
+        expr_helpers::null_ignoring_extremum,
         expression_type::{UNKNOWN, is_interval_typed, type_name},
         function_helpers::{integer_literal, simple_function_expr, string_literal},
         object_name::last_ident,
@@ -680,22 +681,6 @@ fn groups_rows(group_by: &GroupByExpr) -> bool {
     }
 }
 
-/// The NULL-ignoring extremum over `arguments`, one `coalesce` rotation per
-/// argument, so a slot is NULL only when every argument is.
-fn null_ignoring_extremum(arguments: &[Expr], greatest: bool) -> Expr {
-    simple_function_expr(
-        if greatest { "MAX" } else { "MIN" },
-        (0..arguments.len())
-            .map(|start| {
-                let rotated =
-                    arguments.iter().cycle().skip(start).take(arguments.len()).cloned().collect();
-                simple_function_expr("coalesce", rotated, None)
-            })
-            .collect(),
-        None,
-    )
-}
-
 /// The keyed text of one extremum argument: the comparison key with the
 /// argument's text kept behind it.
 ///
@@ -801,6 +786,25 @@ fn any_interval_typed(args: &[&Expr], schema: &ParserDB, options: &TranslationCo
     args.iter().any(|arg| is_interval_typed(arg, schema, options))
 }
 
+/// The refusal a pair of values passed to an aggregate answers, named with
+/// the types of the call's arguments.
+fn pair_of_values_refusal(
+    name: &str,
+    args: &[&Expr],
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Error {
+    let types = args
+        .iter()
+        .map(|arg| message_type_name_of(arg, schema, options))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Error::forward_refusal(format!(
+        "function {name}({types}) does not exist. PostgreSQL has no {name} over a pair of \
+         values, so this is not a statement the server runs."
+    ))
+}
+
 /// The interval translation of a `count` call.
 fn count(
     func: &Function,
@@ -829,15 +833,7 @@ fn count(
         ));
     }
     if args.len() > 1 {
-        let types = args
-            .iter()
-            .map(|arg| message_type_name_of(arg, schema, options))
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(Error::forward_refusal(format!(
-            "function count({types}) does not exist. PostgreSQL has no count over a pair of \
-             values, so this is not a statement the server runs."
-        )));
+        return Err(pair_of_values_refusal("count", args, schema, options));
     }
     let arg = args[0];
     let translated = arg.translate_with_warnings(schema, options, emit)?;
@@ -897,15 +893,7 @@ fn interval_aggregate(
         )));
     }
     if args.len() > 1 {
-        let types = args
-            .iter()
-            .map(|arg| message_type_name_of(arg, schema, options))
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(Error::forward_refusal(format!(
-            "function {name}({types}) does not exist. PostgreSQL has no {name} over a pair of \
-             values, so this is not a statement the server runs."
-        )));
+        return Err(pair_of_values_refusal(name, args, schema, options));
     }
     if func.over.is_some() {
         return Err(Error::forward_refusal(format!(

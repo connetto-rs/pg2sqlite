@@ -294,3 +294,17 @@ fn an_epoch_difference_reverses_to_extract() {
         "SELECT EXTRACT(EPOCH FROM (ts2 - ts1)) FROM dt"
     );
 }
+
+/// A field argument that is not a string literal names no part to extract, so
+/// the call is refused rather than read as a column.
+#[test]
+fn date_part_with_a_non_literal_field_is_refused() {
+    let error = refusal("date_part(field, ts1)");
+    assert!(
+        error.contains(
+            "date_part: the field argument must be a string literal \
+             (e.g., date_part('year', timestamp))"
+        ),
+        "the refusal should name the function and the expected form: {error}"
+    );
+}

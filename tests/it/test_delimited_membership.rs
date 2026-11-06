@@ -755,3 +755,15 @@ fn a_byte_collation_in_a_condition_does_not_decide() {
     );
     assert!(message.contains("NOCASE"), "the arms decide: {message}");
 }
+
+/// A call carrying a function argument clause is not the two-argument
+/// membership spelling, so the rewrite declines it and the plain function
+/// refusal answers.
+#[test]
+fn a_call_with_an_argument_clause_is_not_a_membership_test() {
+    let message = refusal("SELECT x = ANY(string_to_array(a, ',' ORDER BY a)) FROM t");
+    assert!(
+        message.contains("string_to_array() is not available in standard SQLite"),
+        "the plain refusal answers, not the membership rewrite: {message}"
+    );
+}

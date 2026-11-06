@@ -146,21 +146,16 @@ pub(crate) fn update(
         settings: None,
     })
 }
-pub(crate) fn create_table(
-    name: ObjectName,
-    columns: Vec<ColumnDef>,
-    if_not_exists: bool,
-    strict: bool,
-) -> Statement {
-    Statement::CreateTable(CreateTable {
+/// A `CreateTable` with every clause absent, so a field added upstream
+/// fails to compile here rather than leaking through a spread.
+#[must_use]
+pub(crate) fn blank_create_table(name: ObjectName) -> CreateTable {
+    CreateTable {
         name,
-        columns,
+        columns: Vec::new(),
         constraints: Vec::new(),
-        if_not_exists,
-        sqlite_table_options: SqliteTableOptions {
-            leading_comma: false,
-            options: if strict { vec![SqliteTableOption::Strict] } else { Vec::new() },
-        },
+        if_not_exists: false,
+        sqlite_table_options: SqliteTableOptions { leading_comma: false, options: Vec::new() },
         or_replace: false,
         temporary: false,
         unlogged: false,
@@ -219,7 +214,16 @@ pub(crate) fn create_table(
         multiset: None,
         fallback: None,
         with_data: None,
-    })
+    }
+}
+
+/// `CREATE TABLE IF NOT EXISTS <name> (<columns>) STRICT`.
+pub(crate) fn create_table(name: ObjectName, columns: Vec<ColumnDef>) -> Statement {
+    let mut table = blank_create_table(name);
+    table.columns = columns;
+    table.if_not_exists = true;
+    table.sqlite_table_options.options = vec![SqliteTableOption::Strict];
+    Statement::CreateTable(table)
 }
 
 pub(crate) fn create_view(

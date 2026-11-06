@@ -35,6 +35,7 @@ use crate::{
             create_index::{FtsTranslation, analyze_fts_index},
             definer, postgis,
             rls::generate_rls_audit_table,
+            statement::is_data_movement_statement,
         },
     },
     options::{Pg2SqliteOptions, TranslationContext},
@@ -449,15 +450,7 @@ impl Pg2Sqlite {
                 | Statement::Merge(_)
                 | Statement::Truncate(_)
                 | Statement::Copy { .. }
-                | Statement::Directory { .. }
-                | Statement::ExportData(_)
-                | Statement::Unload { .. }
-                | Statement::LoadData { .. }
-                | Statement::CopyIntoSnowflake { .. }
-                | Statement::Put { .. }
-                | Statement::Remove { .. }
-                | Statement::List { .. }
-        )
+        ) && !is_data_movement_statement(statement)
     }
 
     /// Adds a new SQL statement to the set of `PostgreSQL` statements to be

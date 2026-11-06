@@ -59,6 +59,34 @@ pub(crate) fn is_function_named(function: &sqlparser::ast::Function, name: &str)
         .is_some_and(|ident| ident.value.eq_ignore_ascii_case(name))
 }
 
+/// The argument list of a call to the plain catalogue function `name`, or
+/// `None` when the call is not that function or carries ODBC syntax,
+/// parameters, a filter, a null treatment, a window or an argument clause.
+#[must_use]
+pub(crate) fn plain_catalog_function_args<'a>(
+    function: &'a Function,
+    name: &str,
+) -> Option<&'a FunctionArgumentList> {
+    if crate::impls::object_name::postgres_catalog_function_name(&function.name)
+        .is_none_or(|called| called != name)
+        || function.uses_odbc_syntax
+        || !matches!(function.parameters, FunctionArguments::None)
+        || function.filter.is_some()
+        || function.null_treatment.is_some()
+        || function.over.is_some()
+        || !function.within_group.is_empty()
+    {
+        return None;
+    }
+    let FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
+    if !arguments.clauses.is_empty() {
+        return None;
+    }
+    Some(arguments)
+}
+
 /// The one expression `(SELECT <expr>)` projects, when the subquery reads
 /// nothing and answers exactly that.
 ///

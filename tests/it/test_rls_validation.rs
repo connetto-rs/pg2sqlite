@@ -107,6 +107,31 @@ fn test_audit_table_uses_configured_name() -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+/// The audit table lands as a STRICT table, so a log row cannot be stored as
+/// a type its columns do not declare.
+#[test]
+fn the_audit_table_is_created_strict() {
+    let options = Pg2SqliteOptions::default()
+        .with_uuid_representation(UuidRepresentation::Blob)
+        .with_deployment(deployment(["authenticated"], [caller("app.user_id", "uuid")]))
+        .with_acting_role("authenticated")
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
+        .with_rls_audit_table_name("rls_audit".to_string());
+
+    let translated = Pg2Sqlite::default()
+        .sql(RLS_SCHEMA)
+        .expect("parse")
+        .translate(&options)
+        .expect("translate")
+        .into_vec();
+    let audit = translated
+        .iter()
+        .map(ToString::to_string)
+        .find(|stmt| stmt.contains("CREATE TABLE IF NOT EXISTS rls_audit"))
+        .expect("the audit table is emitted for a deployed RLS schema");
+    assert!(audit.contains("STRICT"), "the audit table must be STRICT: {audit}");
+}
+
 #[test]
 fn test_triggers_use_configured_audit_table() -> Result<(), Box<dyn std::error::Error>> {
     let custom_audit_name = "custom_audit";

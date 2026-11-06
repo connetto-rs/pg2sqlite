@@ -51,8 +51,6 @@ pub(crate) fn stack_table() -> Statement {
     ast_builder::create_table(
         stack_name(),
         vec![super::rls::generated_table_column("owner", DataType::Text, true)],
-        true,
-        true,
     )
 }
 
