@@ -11,10 +11,9 @@
 //! - strpos -> INSTR
 //! - chr -> char
 
-use diesel::{Connection, RunQueryDsl, SqliteConnection};
+use diesel::RunQueryDsl;
 use helpers::translate_sql;
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use rusqlite::Connection as SqliteConn;
+use pg2sqlite::prelude::Pg2SqliteOptions;
 
 use crate::helpers;
 
@@ -24,29 +23,14 @@ fn translate(sql: &str) -> Result<String, String> {
 }
 
 fn translate_ok(sql: &str) -> String {
-    let stmts = Pg2Sqlite::default()
-        .sql(sql)
-        .unwrap()
-        .translate(&Pg2SqliteOptions::default())
-        .unwrap()
-        .into_vec();
-    stmts.iter().find(|s| matches!(s, sqlparser::ast::Statement::Query(_))).unwrap().to_string()
+    helpers::translate::translate_default_first_query(sql)
 }
 
 /// Executes all statements emitted by translating `sql` against a real
 /// in-memory SQLite. Use after a substring assert to prove the output is
 /// accepted by SQLite, not just parseable.
 fn execute_all(sql: &str) {
-    let stmts = Pg2Sqlite::default()
-        .sql(sql)
-        .unwrap()
-        .translate(&Pg2SqliteOptions::default())
-        .unwrap()
-        .into_vec();
-    let conn = SqliteConn::open_in_memory().unwrap();
-    let script = stmts.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n");
-    conn.execute_batch(&script)
-        .unwrap_or_else(|e| panic!("translated SQL must execute in SQLite: {e}\n{script}"));
+    helpers::execute_all(sql, &Pg2SqliteOptions::default());
 }
 
 #[test]
@@ -200,22 +184,14 @@ fn greatest_becomes_max() {
 fn least_still_translates_correctly() -> Result<(), Box<dyn std::error::Error>> {
     let sql = "CREATE TABLE le_test (id INT PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL);
                SELECT LEAST(a, b) AS result FROM le_test;";
-    let translated =
-        Pg2Sqlite::default().sql(sql)?.translate(&Pg2SqliteOptions::default())?.into_vec();
-    let select_sql = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .unwrap()
-        .to_string();
+    let (translated, select_sql) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
     assert!(
         select_sql.to_uppercase().contains("MIN("),
         "LEAST should still become MIN, got: {select_sql}"
     );
 
-    let mut conn = SqliteConnection::establish(":memory:")?;
-    for stmt in &translated {
-        diesel::sql_query(stmt.to_string()).execute(&mut conn)?;
-    }
+    let mut conn = helpers::apply_statements(&translated);
     diesel::sql_query("INSERT INTO le_test VALUES (1, 3, 7)").execute(&mut conn)?;
 
     #[derive(diesel::QueryableByName)]
@@ -245,25 +221,15 @@ fn filter_rewrite_semantic() -> Result<(), Box<dyn std::error::Error>> {
         CREATE TABLE scores (id SERIAL PRIMARY KEY, value INTEGER NOT NULL);
         SELECT COUNT(value) FILTER (WHERE value > 5) AS high_count FROM scores;
     ";
-    let translated =
-        Pg2Sqlite::default().sql(pg_sql)?.translate(&Pg2SqliteOptions::default())?.into_vec();
+    let (translated, select_sql) =
+        helpers::translate::translate_default_statements_and_first_query(pg_sql);
 
-    let mut conn = SqliteConnection::establish(":memory:")?;
-
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut conn)?;
-    }
+    let mut conn = helpers::apply_ddl(&translated);
 
     diesel::sql_query(
         "INSERT INTO scores (id, value) VALUES (1, 3), (2, 7), (3, 10), (4, 2), (5, 8)",
     )
     .execute(&mut conn)?;
-
-    let select_sql = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .unwrap()
-        .to_string();
 
     #[derive(diesel::QueryableByName, Debug)]
     struct CountResult {

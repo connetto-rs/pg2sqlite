@@ -8,31 +8,13 @@
 //! length of 1. `VARCHAR(5 OCTETS)` is a syntax error, so the octet unit
 //! cannot arrive from PostgreSQL.
 
-use diesel::{Connection, RunQueryDsl, SqliteConnection};
+use diesel::{RunQueryDsl, SqliteConnection};
 use pg2sqlite::{
     prelude::{Pg2Sqlite, Pg2SqliteOptions},
     warnings::TranslationWarning,
 };
 
-/// Translates `pg` and applies the emitted DDL to a fresh database.
-fn apply(pg: &str) -> SqliteConnection {
-    let statements = Pg2Sqlite::default()
-        .sql(pg)
-        .expect("script should parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
-        .unwrap_or_else(|error| panic!("script should translate: {error}"))
-        .into_vec();
-
-    let mut connection =
-        SqliteConnection::establish(":memory:").expect("in-memory SQLite should open");
-    for statement in &statements {
-        // Emitted DDL is the artifact under test, so it runs as text.
-        diesel::sql_query(statement)
-            .execute(&mut connection)
-            .unwrap_or_else(|error| panic!("emitted DDL failed: {error}\n{statement}"));
-    }
-    connection
-}
+use crate::helpers;
 
 #[derive(diesel::QueryableByName)]
 struct ColumnInfo {
@@ -57,7 +39,7 @@ fn declared_types(connection: &mut SqliteConnection, table: &str) -> Vec<(String
 
 #[test]
 fn every_character_spelling_is_stored_as_text() {
-    let mut connection = apply(
+    let mut connection = helpers::apply_default(
         "CREATE TABLE names (
              id INT PRIMARY KEY,
              a CHAR,
@@ -69,7 +51,8 @@ fn every_character_spelling_is_stored_as_text() {
              g CHARACTER VARYING,
              h CHARACTER VARYING(9)
          );",
-    );
+    )
+    .expect("apply");
 
     let declared = declared_types(&mut connection, "names");
     assert_eq!(declared.len(), 8, "every column should reach the table");
@@ -82,8 +65,10 @@ fn every_character_spelling_is_stored_as_text() {
 /// column carries a bound rather than dropping the limit.
 #[test]
 fn a_declared_length_is_enforced_by_the_emitted_column() {
-    let mut connection =
-        apply("CREATE TABLE names (id INT PRIMARY KEY, short VARCHAR(5), padded CHAR(3));");
+    let mut connection = helpers::apply_default(
+        "CREATE TABLE names (id INT PRIMARY KEY, short VARCHAR(5), padded CHAR(3));",
+    )
+    .expect("apply");
 
     let fits = diesel::sql_query("INSERT INTO names (id, short) VALUES (1, 'abcde')")
         .execute(&mut connection);
@@ -101,7 +86,9 @@ fn a_declared_length_is_enforced_by_the_emitted_column() {
 /// A length is a bound, not a requirement, so a shorter value is accepted.
 #[test]
 fn a_shorter_value_is_still_accepted() {
-    let mut connection = apply("CREATE TABLE names (id INT PRIMARY KEY, short VARCHAR(5));");
+    let mut connection =
+        helpers::apply_default("CREATE TABLE names (id INT PRIMARY KEY, short VARCHAR(5));")
+            .expect("apply");
 
     let inserted = diesel::sql_query("INSERT INTO names (id, short) VALUES (1, 'ab')")
         .execute(&mut connection);
@@ -112,7 +99,9 @@ fn a_shorter_value_is_still_accepted() {
 /// any value fits. This passes before the change too.
 #[test]
 fn an_undeclared_length_bounds_nothing() {
-    let mut connection = apply("CREATE TABLE names (id INT PRIMARY KEY, any_length VARCHAR);");
+    let mut connection =
+        helpers::apply_default("CREATE TABLE names (id INT PRIMARY KEY, any_length VARCHAR);")
+            .expect("apply");
 
     let inserted =
         diesel::sql_query("INSERT INTO names (id, any_length) VALUES (1, 'as long as you like')")

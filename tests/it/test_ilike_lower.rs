@@ -9,6 +9,8 @@
 use diesel::{QueryableByName, RunQueryDsl, SqliteConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
+use crate::helpers;
+
 // ── 1. Output shape tests ────────────────────────────────────────────────────
 
 /// Translated ILIKE must use `lower()` wrapping.
@@ -16,19 +18,11 @@ use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 fn ilike_output_uses_lower_wrapping() {
     let sql = "CREATE TABLE t (id INT, name TEXT);
                SELECT * FROM t WHERE name ILIKE '%test%'";
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql).unwrap().translate(&options).unwrap().into_vec();
-    let select = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .unwrap()
-        .to_string();
+    let (translated, select) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
     assert!(select.to_lowercase().contains("lower("), "Expected lower() wrapping, got: {select}");
     assert!(!select.to_uppercase().contains("ILIKE"), "Should not contain ILIKE, got: {select}");
-    let mut conn = SqliteConnection::establish(":memory:").unwrap();
-    for s in &translated {
-        diesel::sql_query(s.to_string()).execute(&mut conn).unwrap();
-    }
+    helpers::apply_statements(&translated);
 }
 
 /// Translated `NOT ILIKE` must use `lower()` wrapping and produce `NOT LIKE`.
@@ -36,19 +30,11 @@ fn ilike_output_uses_lower_wrapping() {
 fn not_ilike_output_uses_lower_wrapping() {
     let sql = "CREATE TABLE t (id INT, name TEXT);
                SELECT * FROM t WHERE name NOT ILIKE '%test%'";
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql).unwrap().translate(&options).unwrap().into_vec();
-    let select = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .unwrap()
-        .to_string();
+    let (translated, select) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
     assert!(select.to_lowercase().contains("lower("), "Expected lower() wrapping, got: {select}");
     assert!(select.to_uppercase().contains("NOT LIKE"), "Expected NOT LIKE, got: {select}");
-    let mut conn = SqliteConnection::establish(":memory:").unwrap();
-    for s in &translated {
-        diesel::sql_query(s.to_string()).execute(&mut conn).unwrap();
-    }
+    helpers::apply_statements(&translated);
 }
 
 /// `lower(expr) LIKE lower(pattern)` must match every case variant even though

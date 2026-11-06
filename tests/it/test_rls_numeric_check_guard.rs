@@ -2,7 +2,7 @@
 //! minor-unit value a second time against the WITH CHECK predicate.
 
 use diesel::prelude::*;
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+use pg2sqlite::prelude::Pg2SqliteOptions;
 
 use crate::helpers;
 
@@ -35,30 +35,15 @@ const TABLE_SQL: &str = "
     ALTER TABLE ledger2 ENABLE ROW LEVEL SECURITY;
 ";
 
-fn apply(policy_sql: &str) -> SqliteConnection {
-    let opts = Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit");
-    let sql = format!("{TABLE_SQL}{policy_sql}");
-    // Emitted DDL cannot be expressed with the typed DSL.
-    let stmts = Pg2Sqlite::default()
-        .sql(&sql)
-        .expect("parse")
-        .translate(&opts)
-        .expect("translate")
-        .into_vec();
-    let mut conn = helpers::establish_connection();
-    for stmt in &stmts {
-        diesel::sql_query(stmt.to_string())
-            .execute(&mut conn)
-            .unwrap_or_else(|e| panic!("DDL failed: {e}\n{stmt}"));
-    }
-    conn
-}
-
 /// `DEFAULT 1.50` (stored as 150) satisfies `amount < 5.00`; insert must land.
 #[test]
 fn numeric_default_satisfies_check_policy() {
-    let mut conn =
-        apply("CREATE POLICY ledger2_ins ON ledger2 FOR INSERT WITH CHECK (amount < 5.00);");
+    let mut conn = helpers::apply_translated_ddl(
+        &format!(
+            "{TABLE_SQL}CREATE POLICY ledger2_ins ON ledger2 FOR INSERT WITH CHECK (amount < 5.00);"
+        ),
+        &Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit"),
+    );
 
     diesel::insert_into(ledger2::table)
         .values((ledger2::id.eq(1), ledger2::owner.eq("alice")))
@@ -70,15 +55,18 @@ fn numeric_default_satisfies_check_policy() {
         .select(ledger2_rls::amount)
         .first(&mut conn)
         .expect("row must exist");
-
     assert_eq!(stored, 150, "amount must be 150 minor units");
 }
 
 /// `DEFAULT 1.50` violates `amount < 1.00`; insert must be refused.
 #[test]
 fn numeric_default_violates_check_policy() {
-    let mut conn =
-        apply("CREATE POLICY ledger2_ins ON ledger2 FOR INSERT WITH CHECK (amount < 1.00);");
+    let mut conn = helpers::apply_translated_ddl(
+        &format!(
+            "{TABLE_SQL}CREATE POLICY ledger2_ins ON ledger2 FOR INSERT WITH CHECK (amount < 1.00);"
+        ),
+        &Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit"),
+    );
 
     let err = diesel::insert_into(ledger2::table)
         .values((ledger2::id.eq(2), ledger2::owner.eq("alice")))
@@ -97,8 +85,12 @@ fn numeric_default_violates_check_policy() {
 /// A supplied `amount` that satisfies the policy must land unchanged.
 #[test]
 fn supplied_numeric_value_satisfies_check_policy() {
-    let mut conn =
-        apply("CREATE POLICY ledger2_ins ON ledger2 FOR INSERT WITH CHECK (amount < 5.00);");
+    let mut conn = helpers::apply_translated_ddl(
+        &format!(
+            "{TABLE_SQL}CREATE POLICY ledger2_ins ON ledger2 FOR INSERT WITH CHECK (amount < 5.00);"
+        ),
+        &Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit"),
+    );
 
     diesel::insert_into(ledger2::table)
         .values((ledger2::id.eq(3), ledger2::amount.eq(200i64), ledger2::owner.eq("alice")))

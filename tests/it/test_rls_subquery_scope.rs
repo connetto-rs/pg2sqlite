@@ -160,26 +160,6 @@ fn opts_with_username() -> Pg2SqliteOptions {
         .with_session_variable(SessionVariableMapping::new("app.username", "current_app_username"))
 }
 
-/// Translates `pg_sql` and applies every emitted statement to a fresh
-/// in-memory connection. The emitted DDL is the artifact under test, so it
-/// runs as generated text. All data operations use the typed DSL.
-fn apply(pg_sql: &str, opts: &Pg2SqliteOptions) -> SqliteConnection {
-    let stmts = Pg2Sqlite::default()
-        .sql(pg_sql)
-        .expect("parse")
-        .translate(opts)
-        .expect("translate")
-        .into_vec();
-    let mut conn = helpers::establish_connection();
-    for stmt in &stmts {
-        // Raw SQL is justified: the emitted DDL is the artifact under test.
-        diesel::sql_query(stmt.to_string())
-            .execute(&mut conn)
-            .unwrap_or_else(|e| panic!("emitted DDL failed: {e}\n{stmt}"));
-    }
-    conn
-}
-
 /// Unaliased correlated subquery where the referenced table has a column that
 /// the guarded table does not. The prefix bug rewrites `members.team` to
 /// `NEW.team`, which SQLite rejects as "no such column" when the trigger fires.
@@ -196,8 +176,7 @@ fn unaliased_cross_table_distinct_column() {
             EXISTS (SELECT 1 FROM members WHERE members.owner = t.owner AND members.team = 'blue')
         );
     "#;
-    let mut conn = apply(SQL, &base_opts());
-
+    let mut conn = helpers::apply_translated_ddl(SQL, &base_opts());
     // alice is in the blue team, bob in the red team.
     diesel::insert_into(members::table)
         .values(&[
@@ -246,7 +225,7 @@ fn unaliased_cross_table_shared_column_name() {
             EXISTS (SELECT 1 FROM members2 WHERE members2.owner = t2.owner)
         );
     "#;
-    let mut conn = apply(SQL, &base_opts());
+    let mut conn = helpers::apply_translated_ddl(SQL, &base_opts());
 
     // Seed alice as the only member.
     diesel::insert_into(members2::table)
@@ -286,7 +265,7 @@ fn aliased_cross_table_keeps_working() {
             EXISTS (SELECT 1 FROM members m WHERE m.owner = t.owner AND m.team = 'blue')
         );
     "#;
-    let mut conn = apply(SQL, &base_opts());
+    let mut conn = helpers::apply_translated_ddl(SQL, &base_opts());
 
     diesel::insert_into(members::table)
         .values(&[
@@ -333,7 +312,7 @@ fn policy_reads_second_rls_table_through_its_view() {
     "#;
 
     let opts = opts_with_username();
-    let mut conn = apply(SQL, &opts);
+    let mut conn = helpers::apply_translated_ddl(SQL, &opts);
 
     // Set alice as the session user before any DB operation. The monitoring
     // trigger on access_list_rls evaluates the access_list view, which calls
@@ -510,7 +489,7 @@ fn outer_reference_in_order_by_is_rewritten_in_trigger() {
         CREATE POLICY p ON guard_docs FOR INSERT WITH CHECK (
             EXISTS (SELECT 1 FROM guard_members ORDER BY guard_docs.score LIMIT 1));
     ";
-    let mut conn = apply(SQL, &base_opts());
+    let mut conn = helpers::apply_translated_ddl(SQL, &base_opts());
 
     diesel::insert_into(guard_members::table)
         .values(guard_members::id.eq(1))

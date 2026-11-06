@@ -3,7 +3,8 @@
 //! Tuple expressions like `(a, b) = (1, 2)` pass through to SQLite.
 
 use diesel::prelude::*;
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+
+use crate::helpers;
 
 mod schema {
     diesel::table! {
@@ -35,7 +36,7 @@ struct Point {
 }
 
 #[test]
-fn test_tuple_equality_translation() -> Result<(), Box<dyn std::error::Error>> {
+fn test_tuple_equality_translation() {
     let sql = "
         CREATE TABLE points (
             id INTEGER PRIMARY KEY,
@@ -45,14 +46,8 @@ fn test_tuple_equality_translation() -> Result<(), Box<dyn std::error::Error>> {
         SELECT * FROM points WHERE (x, y) = (10, 20);
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Should contain the tuple comparison
     assert!(
@@ -65,8 +60,6 @@ fn test_tuple_equality_translation() -> Result<(), Box<dyn std::error::Error>> {
         conn.execute_batch(&format!("{s};"))
             .unwrap_or_else(|e| panic!("emitted SQL failed: {e}\n{s}"));
     }
-
-    Ok(())
 }
 
 #[test]
@@ -79,14 +72,7 @@ fn test_tuple_equality_semantic() -> Result<(), Box<dyn std::error::Error>> {
         );
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut conn = diesel::SqliteConnection::establish(":memory:")?;
-
-    for stmt in &translated {
-        diesel::sql_query(&stmt.to_string()).execute(&mut conn)?;
-    }
+    let mut conn = helpers::apply_default(sql)?;
 
     // Insert test data using diesel
     diesel::insert_into(points::table).values(&Point { id: 1, x: 10, y: 20 }).execute(&mut conn)?;
@@ -107,7 +93,7 @@ fn test_tuple_equality_semantic() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn test_tuple_in_list_translation() -> Result<(), Box<dyn std::error::Error>> {
+fn test_tuple_in_list_translation() {
     let sql = "
         CREATE TABLE points (
             id INTEGER PRIMARY KEY,
@@ -117,14 +103,8 @@ fn test_tuple_in_list_translation() -> Result<(), Box<dyn std::error::Error>> {
         SELECT * FROM points WHERE (x, y) IN ((1, 2), (3, 4), (5, 6));
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     assert!(select_stmt.contains("IN"), "Should contain IN clause, got: {select_stmt}");
 
@@ -133,8 +113,6 @@ fn test_tuple_in_list_translation() -> Result<(), Box<dyn std::error::Error>> {
         conn.execute_batch(&format!("{s};"))
             .unwrap_or_else(|e| panic!("emitted SQL failed: {e}\n{s}"));
     }
-
-    Ok(())
 }
 
 #[test]
@@ -147,14 +125,7 @@ fn test_tuple_in_list_semantic() -> Result<(), Box<dyn std::error::Error>> {
         );
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut conn = diesel::SqliteConnection::establish(":memory:")?;
-
-    for stmt in &translated {
-        diesel::sql_query(&stmt.to_string()).execute(&mut conn)?;
-    }
+    let mut conn = helpers::apply_default(sql)?;
 
     diesel::insert_into(points::table).values(&Point { id: 1, x: 1, y: 2 }).execute(&mut conn)?;
     diesel::insert_into(points::table).values(&Point { id: 2, x: 3, y: 4 }).execute(&mut conn)?;

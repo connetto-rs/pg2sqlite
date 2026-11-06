@@ -51,15 +51,28 @@ pub fn translate_default_err(sql: &str) -> String {
 /// query as a string. Panics when parsing or translation fails or when no
 /// query is emitted.
 pub fn translate_default_first_query(sql: &str) -> String {
+    translate_default_statements_and_first_query(sql).1
+}
+
+/// Translates `pg` SQL with default options and returns the emitted
+/// statements as strings alongside the first emitted query as a string.
+///
+/// # Panics
+///
+/// Panics when parsing or translation fails or when the script emits no
+/// query.
+pub fn translate_default_statements_and_first_query(sql: &str) -> (Vec<String>, String) {
     use sqlparser::ast::Statement;
-    Pg2Sqlite::default()
+    let statements = Pg2Sqlite::default()
         .sql(sql)
         .unwrap()
         .translate(&Pg2SqliteOptions::default())
         .unwrap()
-        .into_vec()
-        .into_iter()
+        .into_vec();
+    let first_query = statements
+        .iter()
         .find(|s| matches!(s, Statement::Query(_)))
-        .unwrap()
-        .to_string()
+        .expect("script should emit a query")
+        .to_string();
+    (statements.iter().map(ToString::to_string).collect(), first_query)
 }

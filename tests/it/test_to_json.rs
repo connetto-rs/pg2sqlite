@@ -12,13 +12,9 @@
 //! the translation has to preserve NULL itself.
 
 use pg2sqlite::prelude::{ArrayRepresentation, Pg2Sqlite, Pg2SqliteOptions};
-use run_translated_helper::run_translated_with;
+use run_translated_helper::{run_translated_default, run_translated_with};
 
 use crate::helpers::run_translated as run_translated_helper;
-
-fn run(pg: &str) -> Vec<Option<String>> {
-    run_translated_with(pg, &Pg2SqliteOptions::default())
-}
 
 fn run_with_json_arrays(pg: &str) -> Vec<Option<String>> {
     run_translated_with(
@@ -39,35 +35,43 @@ fn translate_err(pg: &str) -> String {
 /// A string becomes a quoted JSON string. This is the case the rename broke.
 #[test]
 fn to_json_quotes_a_string() {
-    assert_eq!(run("SELECT to_json('hello'::TEXT);"), vec![Some("\"hello\"".to_string())]);
+    assert_eq!(
+        run_translated_default("SELECT to_json('hello'::TEXT);"),
+        vec![Some("\"hello\"".to_string())]
+    );
 }
 
 /// A number stays a bare JSON number rather than becoming a quoted string.
 #[test]
 fn to_json_leaves_a_number_unquoted() {
-    assert_eq!(run("SELECT to_json(42);"), vec![Some("42".to_string())]);
+    assert_eq!(run_translated_default("SELECT to_json(42);"), vec![Some("42".to_string())]);
 }
 
 /// PostgreSQL yields SQL NULL, not the JSON text `null`, so the translation has
 /// to keep NULL rather than let `json_quote` turn it into a document.
 #[test]
 fn to_json_of_null_is_sql_null() {
-    assert_eq!(run("SELECT to_json(NULL::TEXT);"), vec![None]);
+    assert_eq!(run_translated_default("SELECT to_json(NULL::TEXT);"), vec![None]);
 }
 
 /// Over a column, which is the shape a migration actually contains.
 #[test]
 fn to_json_over_columns() {
-    let rows = run("CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT);
+    let rows = run_translated_default(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT);
          INSERT INTO t (id, s) VALUES (1, 'a'), (2, NULL);
-         SELECT to_json(s) FROM t ORDER BY id;");
+         SELECT to_json(s) FROM t ORDER BY id;",
+    );
     assert_eq!(rows, vec![Some("\"a\"".to_string()), None]);
 }
 
 /// `to_jsonb` is the same conversion.
 #[test]
 fn to_jsonb_behaves_the_same() {
-    assert_eq!(run("SELECT to_jsonb('hello'::TEXT);"), vec![Some("\"hello\"".to_string())]);
+    assert_eq!(
+        run_translated_default("SELECT to_jsonb('hello'::TEXT);"),
+        vec![Some("\"hello\"".to_string())]
+    );
 }
 
 /// An array is already JSON under the JSON representation, so it must stay an
@@ -96,9 +100,11 @@ fn to_json_with_the_wrong_arity_is_rejected() {
 /// reads it rather than quoting it.
 #[test]
 fn to_json_over_a_json_column_reads_the_document() {
-    let rows = run("CREATE TABLE t (id INT PRIMARY KEY, doc JSONB);
+    let rows = run_translated_default(
+        "CREATE TABLE t (id INT PRIMARY KEY, doc JSONB);
          INSERT INTO t (id, doc) VALUES (1, '{\"a\":1}');
-         SELECT to_json(doc) FROM t;");
+         SELECT to_json(doc) FROM t;",
+    );
     assert_eq!(rows, vec![Some("{\"a\":1}".to_string())]);
 }
 

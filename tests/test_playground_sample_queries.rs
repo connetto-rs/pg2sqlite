@@ -462,22 +462,9 @@ fn postgis_sample_queries_translate() {
 #[cfg(feature = "sqlitegis")]
 #[test]
 fn postgis_sample_queries() {
-    // Register SQLiteGIS on every fresh sqlite handle via
-    // sqlite3_auto_extension, so the chip queries (ST_X, ST_Y,
-    // ST_Within, ST_MakeEnvelope, ...) execute against the rusqlite
-    // connection the same way they do in the browser playground.
-    //
-    // `rusqlite::ffi` is a re-export of the same `libsqlite3-sys` this crate
-    // depends on, so the init signatures are one type and the pointer needs no
-    // cast. Passing it directly makes the compiler enforce that: if the two
-    // ever resolve to different versions, this stops building instead of
-    // transmuting across an ABI mismatch.
-    use std::sync::Once;
-    static INIT: Once = Once::new();
-    INIT.call_once(|| unsafe {
-        rusqlite::ffi::sqlite3_auto_extension(Some(sqlitegis_init));
-    });
-
+    // The shared helper's auto-extension registration is process-wide, so the
+    // rusqlite connection below also gets the ST_* functions.
+    let _gis_connection = helpers::sqlitegis::sqlitegis_connection();
     let opts = Pg2SqliteOptions::default()
         .with_sqlitegis_enabled()
         .with_uuid_representation(UuidRepresentation::Blob);
@@ -601,13 +588,4 @@ fn rls_sample_reverse_queries() {
         .with_deployment(deployment(["app"], [caller("app.user_id", "integer")]))
         .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"));
     run_reverse_chips(RLS_SCHEMA, RLS_REVERSE_CHIPS, &opts);
-}
-
-#[cfg(feature = "sqlitegis")]
-unsafe extern "C" fn sqlitegis_init(
-    db: *mut libsqlite3_sys::sqlite3,
-    _pz_err_msg: *mut *mut std::ffi::c_char,
-    _p_api: *const libsqlite3_sys::sqlite3_api_routines,
-) -> std::ffi::c_int {
-    unsafe { sqlitegis::sqlite::register_functions(db) }
 }

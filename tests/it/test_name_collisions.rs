@@ -13,16 +13,8 @@
 //! written down, and the collisions were measured as the failures they are.
 
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use rusqlite::Connection;
 
-fn translate(sql: &str) -> Vec<String> {
-    Pg2Sqlite::default()
-        .sql(sql)
-        .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
-        .expect("translate")
-        .into_vec()
-}
+use crate::helpers;
 
 fn translate_err(sql: &str) -> String {
     Pg2Sqlite::default()
@@ -31,17 +23,6 @@ fn translate_err(sql: &str) -> String {
         .translate_to_sql(&Pg2SqliteOptions::default())
         .expect_err("translation should be refused")
         .to_string()
-}
-
-/// Applies every emitted statement, proving the script the crate hands over
-/// runs as one script rather than merely parsing.
-fn apply(sql: &str) {
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
-    for statement in translate(sql) {
-        connection
-            .execute_batch(&format!("{statement};"))
-            .unwrap_or_else(|error| panic!("emitted statement failed: {statement}: {error}"));
-    }
 }
 
 /// A PL/pgSQL trigger body, since a `CREATE TRIGGER` needs one in the batch.
@@ -195,78 +176,91 @@ fn a_generated_backing_table_collides_with_a_declared_one() {
 
 #[test]
 fn distinct_names_across_schemas_translate() {
-    apply(
+    helpers::execute_all(
         "CREATE SCHEMA x; CREATE SCHEMA y;
          CREATE TABLE x.a (id INT PRIMARY KEY);
          CREATE TABLE y.b (id INT PRIMARY KEY);",
+        &Pg2SqliteOptions::default(),
     );
 }
 
 #[test]
 fn a_dropped_view_frees_its_name() {
-    apply(
+    helpers::execute_all(
         "CREATE TABLE a (id INT PRIMARY KEY);
          CREATE VIEW v AS SELECT id FROM a;
          DROP VIEW v;
          CREATE VIEW v AS SELECT id + 1 AS id FROM a;",
+        &Pg2SqliteOptions::default(),
     );
 }
 
 #[test]
 fn a_dropped_index_frees_its_name() {
-    apply(
+    helpers::execute_all(
         "CREATE TABLE t (id INT PRIMARY KEY, n INT);
          CREATE INDEX i ON t (n);
          DROP INDEX i;
          CREATE INDEX i ON t (id);",
+        &Pg2SqliteOptions::default(),
     );
 }
 
 /// Dropping a table takes its indexes with it, so the name is free again.
 #[test]
 fn a_dropped_table_frees_the_index_attached_to_it() {
-    apply(
+    helpers::execute_all(
         "CREATE TABLE t (id INT PRIMARY KEY, n INT);
          CREATE INDEX i ON t (n);
          DROP TABLE t;
          CREATE TABLE u (id INT PRIMARY KEY, n INT);
          CREATE INDEX i ON u (n);",
+        &Pg2SqliteOptions::default(),
     );
 }
 
 #[test]
 fn a_dropped_table_frees_the_trigger_attached_to_it() {
-    apply(&format!(
-        "CREATE TABLE a (id INT PRIMARY KEY, n INT);
+    helpers::execute_all(
+        &format!(
+            "CREATE TABLE a (id INT PRIMARY KEY, n INT);
          CREATE TABLE b (id INT PRIMARY KEY, n INT);
          {TRIGGER_FUNCTION}
          CREATE TRIGGER touch BEFORE INSERT ON a FOR EACH ROW EXECUTE FUNCTION f();
          DROP TABLE a;
          CREATE TRIGGER touch BEFORE INSERT ON b FOR EACH ROW EXECUTE FUNCTION f();"
-    ));
+        ),
+        &Pg2SqliteOptions::default(),
+    );
 }
 
 #[test]
 fn a_dropped_trigger_frees_its_name() {
-    apply(&format!(
-        "CREATE TABLE a (id INT PRIMARY KEY, n INT);
+    helpers::execute_all(
+        &format!(
+            "CREATE TABLE a (id INT PRIMARY KEY, n INT);
          CREATE TABLE b (id INT PRIMARY KEY, n INT);
          {TRIGGER_FUNCTION}
          CREATE TRIGGER touch BEFORE INSERT ON a FOR EACH ROW EXECUTE FUNCTION f();
          DROP TRIGGER touch ON a;
          CREATE TRIGGER touch BEFORE INSERT ON b FOR EACH ROW EXECUTE FUNCTION f();"
-    ));
+        ),
+        &Pg2SqliteOptions::default(),
+    );
 }
 
 /// Triggers have their own namespace, so this is not a collision.
 #[test]
 fn a_trigger_may_carry_a_tables_name() {
-    apply(&format!(
-        "CREATE TABLE a (id INT PRIMARY KEY, n INT);
+    helpers::execute_all(
+        &format!(
+            "CREATE TABLE a (id INT PRIMARY KEY, n INT);
          CREATE TABLE touch (id INT PRIMARY KEY);
          {TRIGGER_FUNCTION}
          CREATE TRIGGER touch BEFORE INSERT ON a FOR EACH ROW EXECUTE FUNCTION f();"
-    ));
+        ),
+        &Pg2SqliteOptions::default(),
+    );
 }
 
 /// Before the fix, a collision with a vec0-generated artifact labelled the

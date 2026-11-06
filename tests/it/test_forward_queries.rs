@@ -504,7 +504,7 @@ struct Product {
 }
 
 #[test]
-fn test_wildcard_select_column_translation() -> Result<(), Box<dyn std::error::Error>> {
+fn test_wildcard_select_column_translation() {
     let sql = "
         CREATE TABLE products (
             id INTEGER PRIMARY KEY,
@@ -514,14 +514,7 @@ fn test_wildcard_select_column_translation() -> Result<(), Box<dyn std::error::E
         SELECT products.* FROM products;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let select_stmt = helpers::translate::translate_default_first_query(sql);
 
     assert!(
         select_stmt.contains("products.*"),
@@ -529,7 +522,6 @@ fn test_wildcard_select_column_translation() -> Result<(), Box<dyn std::error::E
     );
 
     exec_translated(sql);
-    Ok(())
 }
 
 #[test]
@@ -543,15 +535,11 @@ fn test_wildcard_semantic() -> Result<(), Box<dyn std::error::Error>> {
         SELECT products.* FROM products;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection = SqliteConnection::establish(":memory:").expect("Failed to connect");
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Execute DDL
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert test data
     diesel::insert_into(products::table)
@@ -560,12 +548,6 @@ fn test_wildcard_semantic() -> Result<(), Box<dyn std::error::Error>> {
     diesel::insert_into(products::table)
         .values(&Product { id: 2, name: "Gadget".to_string(), price: Some(19.99) })
         .execute(&mut connection)?;
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(diesel::QueryableByName, Debug)]
     struct ProductResult {

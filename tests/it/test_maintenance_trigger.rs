@@ -6,6 +6,8 @@ use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, Translator};
 use sql_traits::structs::ParserDB;
 use sqlparser::{ast::Statement, dialect::PostgreSqlDialect, parser::Parser};
 
+use crate::helpers;
+
 // Schema definitions for test tables
 diesel::table! {
     /// Brands table for testing maintenance triggers.
@@ -160,15 +162,7 @@ FOR EACH ROW EXECUTE FUNCTION update_brands_edited_at();
         println!("{stmt}");
     }
 
-    let mut connection = SqliteConnection::establish(":memory:")?;
-
-    // Setup SQLite environment
-    diesel::sql_query("PRAGMA foreign_keys = ON").execute(&mut connection)?;
-
-    // Run translations
-    for stmt in translated {
-        diesel::sql_query(stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_translated_ddl(sql, &Pg2SqliteOptions::default());
 
     // Insert data
     diesel::insert_into(brands::table)
@@ -235,13 +229,7 @@ FOR EACH ROW EXECUTE FUNCTION update_brands_edited_at();
         "maintenance trigger must carry a recursion-guard WHEN clause: {trigger_sql}"
     );
 
-    let mut connection = SqliteConnection::establish(":memory:")?;
-    diesel::sql_query("PRAGMA foreign_keys = ON").execute(&mut connection)?;
-    diesel::sql_query("PRAGMA recursive_triggers = ON").execute(&mut connection)?;
-
-    for stmt in translated {
-        diesel::sql_query(stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_translated_ddl(sql, &Pg2SqliteOptions::default());
 
     diesel::insert_into(brands::table)
         .values(&NewBrand {
@@ -296,13 +284,7 @@ FOR EACH ROW EXECUTE FUNCTION set_brands_edited_at();
         "maintenance insert trigger should be translated to AFTER INSERT: {trigger_sql}"
     );
 
-    let mut connection = SqliteConnection::establish(":memory:")?;
-    diesel::sql_query("PRAGMA foreign_keys = ON").execute(&mut connection)?;
-    diesel::sql_query("PRAGMA recursive_triggers = ON").execute(&mut connection)?;
-
-    for stmt in translated {
-        diesel::sql_query(stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_translated_ddl(sql, &Pg2SqliteOptions::default());
 
     diesel::insert_into(brands::table)
         .values(&NewBrand { id: 1, name: "Adidas".to_string(), edited_at: None })
@@ -368,13 +350,7 @@ FOR EACH ROW EXECUTE FUNCTION set_brands_edited_at();
         "maintenance insert branch should be translated to AFTER INSERT: {insert_trigger_sql}"
     );
 
-    let mut connection = SqliteConnection::establish(":memory:")?;
-    diesel::sql_query("PRAGMA foreign_keys = ON").execute(&mut connection)?;
-    diesel::sql_query("PRAGMA recursive_triggers = ON").execute(&mut connection)?;
-
-    for stmt in translated {
-        diesel::sql_query(stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_translated_ddl(sql, &Pg2SqliteOptions::default());
 
     diesel::insert_into(brands::table)
         .values(&NewBrand { id: 1, name: "Adidas".to_string(), edited_at: None })
@@ -524,13 +500,7 @@ FOR EACH ROW EXECUTE FUNCTION update_brands_edited_at();
         "maintenance trigger must carry a recursion-guard WHEN clause: {trigger_sql}"
     );
 
-    let mut connection = SqliteConnection::establish(":memory:")?;
-    diesel::sql_query("PRAGMA foreign_keys = ON").execute(&mut connection)?;
-    diesel::sql_query("PRAGMA recursive_triggers = ON").execute(&mut connection)?;
-
-    for stmt in translated {
-        diesel::sql_query(stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_translated_ddl(sql, &options);
 
     diesel::sql_query(
         "INSERT INTO brands (id, name, edited_at) VALUES (1, 'Adidas', '2020-01-01')",
@@ -599,10 +569,7 @@ FOR EACH ROW EXECUTE FUNCTION update_brands_edited_at();"
     }
 
     // The shared script runs and the trigger stamps the row.
-    let mut connection = SqliteConnection::establish(":memory:")?;
-    for stmt in &baseline {
-        diesel::sql_query(stmt.clone()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_statements(&baseline);
     diesel::insert_into(brands::table)
         .values(&NewBrand {
             id: 1,
@@ -672,12 +639,7 @@ FOR EACH ROW EXECUTE FUNCTION update_brands_edited_at();
         "maintenance trigger must carry a WHEN clause: {trigger_sql}"
     );
 
-    let mut connection = SqliteConnection::establish(":memory:")?;
-    diesel::sql_query("PRAGMA foreign_keys = ON").execute(&mut connection)?;
-    diesel::sql_query("PRAGMA recursive_triggers = ON").execute(&mut connection)?;
-    for stmt in translated {
-        diesel::sql_query(stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_translated_ddl(sql, &options);
     diesel::sql_query(
         "INSERT INTO brands (id, name, edited_at) VALUES (1, 'Adidas', '2020-01-01')",
     )
@@ -730,13 +692,7 @@ FOR EACH ROW EXECUTE FUNCTION widgets_maintain();
     );
     assert!(trigger_sql.contains(" OR "), "two conditions must be joined by OR: {trigger_sql}");
 
-    let mut conn = SqliteConnection::establish(":memory:").expect("connect");
-    diesel::sql_query("PRAGMA recursive_triggers = ON").execute(&mut conn).expect("pragma");
-    for stmt in &stmts {
-        diesel::sql_query(stmt.as_str())
-            .execute(&mut conn)
-            .unwrap_or_else(|e| panic!("DDL: {e}\n{stmt}"));
-    }
+    let mut conn = helpers::apply_translated_ddl(sql, &Pg2SqliteOptions::default());
     diesel::insert_into(widgets::table)
         .values(&NewWidget { id: 1, tag: Some("hello".into()), slug: Some("world".into()) })
         .execute(&mut conn)
@@ -798,13 +754,7 @@ FOR EACH ROW WHEN (OLD.id > 0) EXECUTE FUNCTION w2_maintain();
         "recursion guard must be present: {trigger_sql}"
     );
     // Execute: trigger fires only when OLD.id > 0, which is always true here.
-    let mut conn = SqliteConnection::establish(":memory:").expect("connect");
-    diesel::sql_query("PRAGMA recursive_triggers = ON").execute(&mut conn).expect("pragma");
-    for stmt in &stmts {
-        diesel::sql_query(stmt.as_str())
-            .execute(&mut conn)
-            .unwrap_or_else(|e| panic!("DDL: {e}\n{stmt}"));
-    }
+    let mut conn = helpers::apply_translated_ddl(sql, &Pg2SqliteOptions::default());
     // Typed Diesel DSL for DML; translator-emitted DDL above uses sql_query
     // (dynamic schema).
     diesel::insert_into(w2::table)
@@ -872,20 +822,7 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER chain_maint BEFORE UPDATE ON chain
 FOR EACH ROW EXECUTE FUNCTION chain_maintain();
 ";
-    let stmts = Pg2Sqlite::default()
-        .sql(sql)
-        .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
-        .expect("translate")
-        .into_vec();
-
-    let mut conn = SqliteConnection::establish(":memory:").expect("connect");
-    diesel::sql_query("PRAGMA recursive_triggers = ON").execute(&mut conn).expect("pragma");
-    for stmt in &stmts {
-        diesel::sql_query(stmt.as_str())
-            .execute(&mut conn)
-            .unwrap_or_else(|e| panic!("DDL: {e}\n{stmt}"));
-    }
+    let mut conn = helpers::apply_translated_ddl(sql, &Pg2SqliteOptions::default());
     diesel::insert_into(chain::table)
         .values(&NewChain { id: 1, a: Some("abc".into()), b: Some("zzz".into()) })
         .execute(&mut conn)
@@ -952,20 +889,7 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER ovr_maint BEFORE UPDATE ON ovr
 FOR EACH ROW EXECUTE FUNCTION ovr_maintain();
 ";
-    let stmts = Pg2Sqlite::default()
-        .sql(sql)
-        .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
-        .expect("translate")
-        .into_vec();
-
-    let mut conn = SqliteConnection::establish(":memory:").expect("connect");
-    diesel::sql_query("PRAGMA recursive_triggers = ON").execute(&mut conn).expect("pragma");
-    for stmt in &stmts {
-        diesel::sql_query(stmt.as_str())
-            .execute(&mut conn)
-            .unwrap_or_else(|e| panic!("DDL: {e}\n{stmt}"));
-    }
+    let mut conn = helpers::apply_translated_ddl(sql, &Pg2SqliteOptions::default());
     diesel::insert_into(ovr::table)
         .values(&NewOver { id: 1, name: Some("old".into()) })
         .execute(&mut conn)

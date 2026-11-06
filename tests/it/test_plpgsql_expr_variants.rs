@@ -4,8 +4,7 @@
 //! F2: AtTimeZone only recurses timestamp, not time_zone
 
 use helpers::translate_sql;
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation};
-use rusqlite::Connection as SqliteConn;
+use pg2sqlite::prelude::{Pg2SqliteOptions, UuidRepresentation};
 
 use crate::helpers;
 
@@ -42,10 +41,8 @@ fn plpgsql_combined_expr_types_transformed() {
     );
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
-    let stmts = Pg2Sqlite::default().sql(sql).unwrap().translate(&options).unwrap().into_vec();
-    let conn = SqliteConn::open_in_memory().unwrap();
-    conn.execute_batch(&stmts.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n"))
-        .unwrap_or_else(|e| panic!("translated DDL must execute: {e}"));
+    let stmts = helpers::translate_pg(sql, &options).unwrap();
+    helpers::apply_rusqlite_statements(&stmts);
 }
 
 #[test]
@@ -70,10 +67,8 @@ fn plpgsql_position_expr_transformed() {
     );
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
-    let stmts = Pg2Sqlite::default().sql(sql).unwrap().translate(&options).unwrap().into_vec();
-    let conn = SqliteConn::open_in_memory().unwrap();
-    conn.execute_batch(&stmts.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n"))
-        .unwrap_or_else(|e| panic!("translated DDL must execute: {e}"));
+    let stmts = helpers::translate_pg(sql, &options).unwrap();
+    helpers::apply_rusqlite_statements(&stmts);
 }
 
 #[test]
@@ -98,10 +93,8 @@ fn plpgsql_ceil_floor_expr_transformed() {
     );
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
-    let stmts = Pg2Sqlite::default().sql(sql).unwrap().translate(&options).unwrap().into_vec();
-    let conn = SqliteConn::open_in_memory().unwrap();
-    conn.execute_batch(&stmts.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n"))
-        .unwrap_or_else(|e| panic!("translated DDL must execute: {e}"));
+    let stmts = helpers::translate_pg(sql, &options).unwrap();
+    helpers::apply_rusqlite_statements(&stmts);
 }
 
 /// Renamed from `plpgsql_at_time_zone_time_zone_field_transformed`, which
@@ -141,8 +134,6 @@ fn plpgsql_at_time_zone_is_transformed() {
     );
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
-    let stmts = Pg2Sqlite::default().sql(sql).unwrap().translate(&options).unwrap().into_vec();
-    let conn = SqliteConn::open_in_memory().unwrap();
-    conn.execute_batch(&stmts.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n"))
-        .unwrap_or_else(|e| panic!("translated DDL must execute: {e}"));
+    let stmts = helpers::translate_pg(sql, &options).unwrap();
+    helpers::apply_rusqlite_statements(&stmts);
 }

@@ -7,6 +7,8 @@
 use diesel::prelude::*;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
+use crate::helpers;
+
 mod schema {
     diesel::table! {
         /// Data table for string/math tests.
@@ -37,7 +39,7 @@ struct Data {
 }
 
 #[test]
-fn test_trim_translation() -> Result<(), Box<dyn std::error::Error>> {
+fn test_trim_translation() {
     let sql = "
         CREATE TABLE data (
             id INTEGER PRIMARY KEY,
@@ -47,18 +49,9 @@ fn test_trim_translation() -> Result<(), Box<dyn std::error::Error>> {
         SELECT TRIM(text_val) as trimmed FROM data;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let select_stmt = helpers::translate::translate_default_first_query(sql);
 
     assert!(select_stmt.to_uppercase().contains("TRIM"), "Should contain TRIM, got: {select_stmt}");
-
-    Ok(())
 }
 
 #[test]
@@ -71,14 +64,7 @@ fn test_trim_semantic() -> Result<(), Box<dyn std::error::Error>> {
         );
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut conn = diesel::SqliteConnection::establish(":memory:")?;
-
-    for stmt in &translated {
-        diesel::sql_query(&stmt.to_string()).execute(&mut conn)?;
-    }
+    let mut conn = helpers::apply_default(sql)?;
 
     diesel::insert_into(data::table)
         .values(&Data { id: 1, text_val: "  hello  ".to_string(), num_val: 1.0 })
@@ -100,7 +86,7 @@ fn test_trim_semantic() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn test_trim_variants_translation() -> Result<(), Box<dyn std::error::Error>> {
+fn test_trim_variants_translation() {
     let sql = "
         CREATE TABLE data (
             id INTEGER PRIMARY KEY,
@@ -110,22 +96,13 @@ fn test_trim_variants_translation() -> Result<(), Box<dyn std::error::Error>> {
         SELECT TRIM(LEADING ' ' FROM text_val) as ltrimmed FROM data;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let select_stmt = helpers::translate::translate_default_first_query(sql);
 
     assert!(select_stmt.to_uppercase().contains("TRIM"), "Should contain TRIM, got: {select_stmt}");
-
-    Ok(())
 }
 
 #[test]
-fn test_ceil_translation() -> Result<(), Box<dyn std::error::Error>> {
+fn test_ceil_translation() {
     let sql = "
         CREATE TABLE data (
             id INTEGER PRIMARY KEY,
@@ -135,19 +112,10 @@ fn test_ceil_translation() -> Result<(), Box<dyn std::error::Error>> {
         SELECT CEIL(num_val) as ceiled FROM data;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let select_stmt = helpers::translate::translate_default_first_query(sql);
 
     // SQLite uses CEIL or CEILING
     assert!(select_stmt.to_uppercase().contains("CEIL"), "Should contain CEIL, got: {select_stmt}");
-
-    Ok(())
 }
 
 #[test]
@@ -161,13 +129,7 @@ fn test_ceil_semantic() -> Result<(), Box<dyn std::error::Error>> {
     ";
 
     let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut conn = diesel::SqliteConnection::establish(":memory:")?;
-
-    for stmt in &translated {
-        diesel::sql_query(&stmt.to_string()).execute(&mut conn)?;
-    }
+    let mut conn = helpers::apply_default(sql)?;
 
     diesel::insert_into(data::table)
         .values(&Data { id: 1, text_val: "test".to_string(), num_val: 3.2 })
@@ -200,7 +162,7 @@ fn test_ceil_semantic() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn test_floor_translation() -> Result<(), Box<dyn std::error::Error>> {
+fn test_floor_translation() {
     let sql = "
         CREATE TABLE data (
             id INTEGER PRIMARY KEY,
@@ -210,21 +172,12 @@ fn test_floor_translation() -> Result<(), Box<dyn std::error::Error>> {
         SELECT FLOOR(num_val) as floored FROM data;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let select_stmt = helpers::translate::translate_default_first_query(sql);
 
     assert!(
         select_stmt.to_uppercase().contains("FLOOR"),
         "Should contain FLOOR, got: {select_stmt}"
     );
-
-    Ok(())
 }
 
 #[test]
@@ -238,13 +191,7 @@ fn test_floor_semantic() -> Result<(), Box<dyn std::error::Error>> {
     ";
 
     let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut conn = diesel::SqliteConnection::establish(":memory:")?;
-
-    for stmt in &translated {
-        diesel::sql_query(&stmt.to_string()).execute(&mut conn)?;
-    }
+    let mut conn = helpers::apply_default(sql)?;
 
     diesel::insert_into(data::table)
         .values(&Data { id: 1, text_val: "test".to_string(), num_val: 3.2 })

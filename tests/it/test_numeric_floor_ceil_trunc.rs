@@ -6,10 +6,7 @@
 //!
 //! All expected values were read from PostgreSQL 17 before the fix was written.
 
-use pg2sqlite::prelude::Pg2SqliteOptions;
-use run_translated_helper::run_translated_with;
-
-use crate::helpers::run_translated as run_translated_helper;
+use crate::helpers::run_translated::run_translated_default;
 
 const FIXTURE: &str = "
     CREATE TABLE t (id INT PRIMARY KEY, amount NUMERIC(10,2));
@@ -22,17 +19,13 @@ const FIXTURE: &str = "
         (6,  2.00);
 ";
 
-fn run(script: &str) -> Vec<Option<String>> {
-    run_translated_with(script, &Pg2SqliteOptions::default())
-}
-
 // ── floor ────────────────────────────────────────────────────────────────────
 
 /// `floor(1.50) = 1`, `floor(-1.50) = -2`, `floor(0.25) = 0`.
 /// All measured on PostgreSQL 17.
 #[test]
 fn floor_of_numeric_column_answers_like_postgres() {
-    let rows = run(&format!(
+    let rows = run_translated_default(&format!(
         "{FIXTURE}
          SELECT floor(amount) FROM t WHERE id IN (1, 2, 3) ORDER BY id;"
     ));
@@ -47,7 +40,7 @@ fn floor_of_numeric_column_answers_like_postgres() {
 /// PostgreSQL: `floor(1.50) + 1 = 2`.
 #[test]
 fn floor_amount_plus_one_composes_correctly() {
-    let rows = run(&format!(
+    let rows = run_translated_default(&format!(
         "{FIXTURE}
          SELECT floor(amount) + 1 FROM t WHERE id = 1;"
     ));
@@ -57,7 +50,7 @@ fn floor_amount_plus_one_composes_correctly() {
 /// `WHERE floor(amount) = 1` must match rows whose floor value is 1.
 #[test]
 fn where_floor_amount_equals_integer_filters_correctly() {
-    let rows = run(&format!(
+    let rows = run_translated_default(&format!(
         "{FIXTURE}
          SELECT id FROM t WHERE floor(amount) = 1;"
     ));
@@ -72,9 +65,11 @@ fn where_floor_amount_equals_integer_filters_correctly() {
 /// `floor` over a REAL column uses CASE WHEN — no math functions needed.
 #[test]
 fn floor_of_real_column_works_without_math_functions() {
-    let rows = run("CREATE TABLE r (id INT PRIMARY KEY, x REAL);
+    let rows = run_translated_default(
+        "CREATE TABLE r (id INT PRIMARY KEY, x REAL);
          INSERT INTO r VALUES (1, 1.7), (2, -1.7);
-         SELECT floor(x) FROM r ORDER BY id;");
+         SELECT floor(x) FROM r ORDER BY id;",
+    );
     assert_eq!(
         rows,
         vec![Some("1".to_string()), Some("-2".to_string())],
@@ -88,7 +83,7 @@ fn floor_of_real_column_works_without_math_functions() {
 /// All measured on PostgreSQL 17.
 #[test]
 fn ceil_of_numeric_column_answers_like_postgres() {
-    let rows = run(&format!(
+    let rows = run_translated_default(&format!(
         "{FIXTURE}
          SELECT ceil(amount) FROM t WHERE id IN (1, 2, 3) ORDER BY id;"
     ));
@@ -103,7 +98,7 @@ fn ceil_of_numeric_column_answers_like_postgres() {
 /// `ceil`.
 #[test]
 fn ceiling_is_the_same_as_ceil() {
-    let rows = run(&format!(
+    let rows = run_translated_default(&format!(
         "{FIXTURE}
          SELECT ceiling(amount) FROM t WHERE id IN (1, 2) ORDER BY id;"
     ));
@@ -117,9 +112,11 @@ fn ceiling_is_the_same_as_ceil() {
 /// `ceil` over a REAL column uses CASE WHEN — no math functions needed.
 #[test]
 fn ceil_of_real_column_works_without_math_functions() {
-    let rows = run("CREATE TABLE r (id INT PRIMARY KEY, x REAL);
+    let rows = run_translated_default(
+        "CREATE TABLE r (id INT PRIMARY KEY, x REAL);
          INSERT INTO r VALUES (1, 1.7), (2, -1.2);
-         SELECT ceil(x) FROM r ORDER BY id;");
+         SELECT ceil(x) FROM r ORDER BY id;",
+    );
     assert_eq!(
         rows,
         vec![Some("2".to_string()), Some("-1".to_string())],
@@ -133,7 +130,7 @@ fn ceil_of_real_column_works_without_math_functions() {
 /// All measured on PostgreSQL 17.
 #[test]
 fn trunc_one_arg_of_numeric_column_answers_like_postgres() {
-    let rows = run(&format!(
+    let rows = run_translated_default(&format!(
         "{FIXTURE}
          SELECT trunc(amount) FROM t WHERE id IN (1, 2, 3) ORDER BY id;"
     ));
@@ -148,7 +145,7 @@ fn trunc_one_arg_of_numeric_column_answers_like_postgres() {
 /// PostgreSQL: `trunc(1.50) + 1 = 2`.
 #[test]
 fn trunc_amount_plus_one_composes_correctly() {
-    let rows = run(&format!(
+    let rows = run_translated_default(&format!(
         "{FIXTURE}
          SELECT trunc(amount) + 1 FROM t WHERE id = 1;"
     ));
@@ -159,7 +156,7 @@ fn trunc_amount_plus_one_composes_correctly() {
 /// but not `1.55` (whose trunc is still 1, in fact it also matches).
 #[test]
 fn where_trunc_amount_equals_integer_filters_correctly() {
-    let rows = run(&format!(
+    let rows = run_translated_default(&format!(
         "{FIXTURE}
          SELECT id FROM t WHERE trunc(amount) = 1 ORDER BY id;"
     ));
@@ -174,9 +171,11 @@ fn where_trunc_amount_equals_integer_filters_correctly() {
 /// The single-argument form still works for REAL operands (unchanged).
 #[test]
 fn trunc_one_arg_of_real_is_unchanged() {
-    let rows = run("CREATE TABLE r (id INT PRIMARY KEY, x REAL);
+    let rows = run_translated_default(
+        "CREATE TABLE r (id INT PRIMARY KEY, x REAL);
          INSERT INTO r VALUES (1, 3.7), (2, -3.7);
-         SELECT trunc(x) FROM r ORDER BY id;");
+         SELECT trunc(x) FROM r ORDER BY id;",
+    );
     assert_eq!(
         rows,
         vec![Some("3".to_string()), Some("-3".to_string())],
@@ -191,7 +190,7 @@ fn trunc_one_arg_of_real_is_unchanged() {
 /// stored `1.55`, which is off by a factor of 100.
 #[test]
 fn trunc_two_arg_of_numeric_column_answers_like_postgres() {
-    let rows = run(&format!(
+    let rows = run_translated_default(&format!(
         "{FIXTURE}
          SELECT trunc(amount, 1) FROM t WHERE id IN (4, 2) ORDER BY id;"
     ));
@@ -207,7 +206,7 @@ fn trunc_two_arg_of_numeric_column_answers_like_postgres() {
 /// `trunc(amount, 0)` truncates to the integer — same as the one-argument form.
 #[test]
 fn trunc_two_arg_zero_places_equals_one_arg() {
-    let rows = run(&format!(
+    let rows = run_translated_default(&format!(
         "{FIXTURE}
          SELECT trunc(amount, 0) FROM t WHERE id IN (1, 2) ORDER BY id;"
     ));
@@ -222,7 +221,7 @@ fn trunc_two_arg_zero_places_equals_one_arg() {
 /// `trunc(1.55, -1)` = `0` in PostgreSQL.
 #[test]
 fn trunc_two_arg_negative_scale_of_numeric() {
-    let rows = run(&format!(
+    let rows = run_translated_default(&format!(
         "{FIXTURE}
          SELECT trunc(amount, -1) FROM t WHERE id = 4;"
     ));
@@ -234,7 +233,7 @@ fn trunc_two_arg_negative_scale_of_numeric() {
 /// places are already within the precision asked for. `trunc(1.55, 2) = 1.55`.
 #[test]
 fn trunc_two_arg_scale_at_or_above_column_scale_is_identity() {
-    let rows = run(&format!(
+    let rows = run_translated_default(&format!(
         "{FIXTURE}
          SELECT trunc(amount, 2) FROM t WHERE id = 4;"
     ));
@@ -246,9 +245,11 @@ fn trunc_two_arg_scale_at_or_above_column_scale_is_identity() {
 /// must not regress).
 #[test]
 fn trunc_two_arg_of_real_is_unchanged() {
-    let rows = run("CREATE TABLE r (id INT PRIMARY KEY, x REAL);
+    let rows = run_translated_default(
+        "CREATE TABLE r (id INT PRIMARY KEY, x REAL);
          INSERT INTO r VALUES (1, 1.789), (2, -1.789);
-         SELECT trunc(x, 2) FROM r ORDER BY id;");
+         SELECT trunc(x, 2) FROM r ORDER BY id;",
+    );
     assert_eq!(
         rows,
         vec![Some("1.78".to_string()), Some("-1.78".to_string())],

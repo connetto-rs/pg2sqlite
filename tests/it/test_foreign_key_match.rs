@@ -18,6 +18,8 @@
 use diesel::prelude::*;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
+use crate::helpers;
+
 mod schema {
     diesel::table! {
         child (rowid) {
@@ -55,19 +57,6 @@ fn translate_err(pg: &str) -> String {
         .translate_to_sql(&Pg2SqliteOptions::default())
         .expect_err("this shape has no SQLite form")
         .to_string()
-}
-
-/// Runs every emitted statement with foreign keys switched on, panicking if
-/// any of them fails.
-fn apply(pg: &str) -> SqliteConnection {
-    let mut connection = SqliteConnection::establish(":memory:").expect("connect");
-    diesel::sql_query("PRAGMA foreign_keys = ON").execute(&mut connection).expect("pragma");
-    for statement in translate(pg) {
-        diesel::sql_query(&statement)
-            .execute(&mut connection)
-            .unwrap_or_else(|error| panic!("emitted statement failed: {statement}: {error}"));
-    }
-    connection
 }
 
 /// The first execution failure, for the rows PostgreSQL refuses.
@@ -114,22 +103,28 @@ fn a_mixed_null_row_is_refused() {
 /// key already gave and the guard must not take away.
 #[test]
 fn an_all_null_row_is_allowed() {
-    let mut connection = apply(&format!(
-        "{}
+    let mut connection = helpers::apply_translated_ddl(
+        &format!(
+            "{}
          INSERT INTO child (x, y) VALUES (NULL, NULL);",
-        composite("MATCH FULL")
-    ));
+            composite("MATCH FULL")
+        ),
+        &Pg2SqliteOptions::default(),
+    );
     assert_eq!(stored(&mut connection), vec![(None, None)]);
 }
 
 /// A wholly non-NULL row that matches is allowed.
 #[test]
 fn a_matching_row_is_allowed() {
-    let mut connection = apply(&format!(
-        "{}
+    let mut connection = helpers::apply_translated_ddl(
+        &format!(
+            "{}
          INSERT INTO child (x, y) VALUES (1, 1);",
-        composite("MATCH FULL")
-    ));
+            composite("MATCH FULL")
+        ),
+        &Pg2SqliteOptions::default(),
+    );
     assert_eq!(stored(&mut connection), vec![(Some(1), Some(1))]);
 }
 
@@ -210,11 +205,14 @@ fn match_simple_still_exempts_a_mixed_null_row() {
     let emitted = translate(&composite("MATCH SIMPLE")).join("\n");
     assert!(!emitted.contains("match_full"), "MATCH SIMPLE needs no guard: {emitted}");
 
-    let mut connection = apply(&format!(
-        "{}
+    let mut connection = helpers::apply_translated_ddl(
+        &format!(
+            "{}
          INSERT INTO child (x, y) VALUES (NULL, 1);",
-        composite("MATCH SIMPLE")
-    ));
+            composite("MATCH SIMPLE")
+        ),
+        &Pg2SqliteOptions::default(),
+    );
     assert_eq!(stored(&mut connection), vec![(None, Some(1))]);
 }
 
@@ -234,7 +232,10 @@ fn a_single_column_match_full_needs_no_guard() {
          CREATE TABLE c1 (x INT, FOREIGN KEY (x) REFERENCES p1 (a) MATCH FULL);";
     let emitted = translate(single).join("\n");
     assert!(!emitted.contains("match_full"), "one column needs no guard: {emitted}");
-    apply(&format!("{single}\nINSERT INTO c1 (x) VALUES (NULL);"));
+    helpers::apply_translated_ddl(
+        &format!("{single}\nINSERT INTO c1 (x) VALUES (NULL);"),
+        &Pg2SqliteOptions::default(),
+    );
 }
 
 /// The column-level spelling is single-column by construction and likewise
@@ -245,7 +246,10 @@ fn a_column_level_match_full_needs_no_guard() {
          CREATE TABLE c1 (x INT REFERENCES p1 (a) MATCH FULL);";
     let emitted = translate(column_level).join("\n");
     assert!(!emitted.contains("match_full"), "one column needs no guard: {emitted}");
-    apply(&format!("{column_level}\nINSERT INTO c1 (x) VALUES (NULL);"));
+    helpers::apply_translated_ddl(
+        &format!("{column_level}\nINSERT INTO c1 (x) VALUES (NULL);"),
+        &Pg2SqliteOptions::default(),
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -3,9 +3,10 @@
 
 #![allow(missing_docs)]
 
-use diesel::{Connection, RunQueryDsl, SqliteConnection};
+use diesel::RunQueryDsl;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use sqlparser::ast::Statement;
+
+use crate::helpers;
 
 diesel::table! {
     pairs (id) {
@@ -21,13 +22,7 @@ diesel::table! {
 #[test]
 fn test_is_distinct_from_translation_form() {
     let sql = "SELECT a IS DISTINCT FROM b FROM pairs;";
-    let translated = Pg2Sqlite::default()
-        .sql(sql)
-        .expect("parses")
-        .translate(&Pg2SqliteOptions::default())
-        .expect("translates")
-        .into_vec();
-    let out = select_sql(&translated);
+    let out = helpers::translate::translate_default_first_query(sql);
 
     assert!(out.contains("IS DISTINCT FROM"), "the operator survives, got: {out}");
     assert!(!out.contains("CASE"), "Should NOT use CASE expression, got: {out}");
@@ -79,12 +74,8 @@ fn test_is_distinct_from_semantic() -> Result<(), Box<dyn std::error::Error>> {
         CREATE TABLE pairs (id SERIAL PRIMARY KEY, a TEXT, b TEXT);
         SELECT id FROM pairs WHERE a IS DISTINCT FROM b ORDER BY id;
     ";
-    let translated =
-        Pg2Sqlite::default().sql(sql)?.translate(&Pg2SqliteOptions::default())?.into_vec();
-    let mut conn = SqliteConnection::establish(":memory:")?;
-
-    // Execute DDL (and the dialect pragma), whatever their position.
-    execute_non_query_statements(&translated, &mut conn)?;
+    let (translated, query) = helpers::translate::translate_default_statements_and_first_query(sql);
+    let mut conn = helpers::apply_ddl(&translated);
 
     diesel::sql_query(
         "INSERT INTO pairs VALUES (1,'x','x'),(2,'x','y'),(3,NULL,NULL),(4,NULL,'x'),(5,'x',NULL)",
@@ -98,7 +89,7 @@ fn test_is_distinct_from_semantic() -> Result<(), Box<dyn std::error::Error>> {
         id: i32,
     }
 
-    let rows = diesel::sql_query(select_sql(&translated)).load::<Row>(&mut conn)?;
+    let rows = diesel::sql_query(&query).load::<Row>(&mut conn)?;
     let ids: Vec<i32> = rows.into_iter().map(|r| r.id).collect();
 
     // Row 1 (x=x): NOT distinct → excluded
@@ -117,10 +108,8 @@ fn test_is_not_distinct_from_semantic() -> Result<(), Box<dyn std::error::Error>
         CREATE TABLE pairs (id SERIAL PRIMARY KEY, a TEXT, b TEXT);
         SELECT id FROM pairs WHERE a IS NOT DISTINCT FROM b ORDER BY id;
     ";
-    let translated =
-        Pg2Sqlite::default().sql(sql)?.translate(&Pg2SqliteOptions::default())?.into_vec();
-    let mut conn = SqliteConnection::establish(":memory:")?;
-    execute_non_query_statements(&translated, &mut conn)?;
+    let (translated, query) = helpers::translate::translate_default_statements_and_first_query(sql);
+    let mut conn = helpers::apply_ddl(&translated);
     diesel::sql_query(
         "INSERT INTO pairs VALUES (1,'x','x'),(2,'x','y'),(3,NULL,NULL),(4,NULL,'x')",
     )
@@ -132,7 +121,7 @@ fn test_is_not_distinct_from_semantic() -> Result<(), Box<dyn std::error::Error>
         id: i32,
     }
 
-    let rows = diesel::sql_query(select_sql(&translated)).load::<Row>(&mut conn)?;
+    let rows = diesel::sql_query(&query).load::<Row>(&mut conn)?;
     let ids: Vec<i32> = rows.into_iter().map(|r| r.id).collect();
 
     // Row 1 (x=x): not distinct → included
@@ -177,30 +166,6 @@ struct NumericValue {
     value: Option<i32>,
 }
 
-fn translate(sql: &str) -> Result<Vec<Statement>, Box<dyn std::error::Error>> {
-    let translated =
-        Pg2Sqlite::default().sql(sql)?.translate(&Pg2SqliteOptions::default())?.into_vec();
-    Ok(translated)
-}
-
-fn select_sql(translated: &[Statement]) -> String {
-    translated
-        .iter()
-        .find(|stmt| matches!(stmt, Statement::Query(_)))
-        .expect("should contain a SELECT query")
-        .to_string()
-}
-
-fn execute_non_query_statements(
-    translated: &[Statement],
-    conn: &mut SqliteConnection,
-) -> Result<(), Box<dyn std::error::Error>> {
-    for stmt in translated.iter().filter(|stmt| !matches!(stmt, Statement::Query(_))) {
-        diesel::sql_query(stmt.to_string()).execute(conn)?;
-    }
-    Ok(())
-}
-
 #[derive(Debug, diesel::QueryableByName)]
 struct IdRow {
     #[diesel(sql_type = diesel::sql_types::Integer)]
@@ -218,15 +183,13 @@ fn test_is_distinct_from_semantic_integer() -> Result<(), Box<dyn std::error::Er
         SELECT id FROM pair_values WHERE a IS DISTINCT FROM b ORDER BY id;
     ";
 
-    let translated = translate(sql)?;
-    let query = select_sql(&translated);
+    let (translated, query) = helpers::translate::translate_default_statements_and_first_query(sql);
     assert!(
         query.to_uppercase().contains("IS DISTINCT FROM"),
         "the operator is handed to SQLite unchanged, got: {query}"
     );
 
-    let mut conn = SqliteConnection::establish(":memory:")?;
-    execute_non_query_statements(&translated, &mut conn)?;
+    let mut conn = helpers::apply_ddl(&translated);
 
     diesel::insert_into(pair_values::table)
         .values(&[
@@ -256,15 +219,13 @@ fn test_is_not_distinct_from_semantic_integer() -> Result<(), Box<dyn std::error
         SELECT id FROM pair_values WHERE a IS NOT DISTINCT FROM b ORDER BY id;
     ";
 
-    let translated = translate(sql)?;
-    let query = select_sql(&translated);
+    let (translated, query) = helpers::translate::translate_default_statements_and_first_query(sql);
     assert!(
         query.to_uppercase().contains("IS NOT DISTINCT FROM"),
         "the operator is handed to SQLite unchanged, got: {query}"
     );
 
-    let mut conn = SqliteConnection::establish(":memory:")?;
-    execute_non_query_statements(&translated, &mut conn)?;
+    let mut conn = helpers::apply_ddl(&translated);
 
     diesel::insert_into(pair_values::table)
         .values(&[
@@ -293,13 +254,11 @@ fn test_is_unknown_semantic() -> Result<(), Box<dyn std::error::Error>> {
         SELECT id FROM numeric_values WHERE (value > 0) IS UNKNOWN ORDER BY id;
     ";
 
-    let translated = translate(sql)?;
-    let query = select_sql(&translated);
+    let (translated, query) = helpers::translate::translate_default_statements_and_first_query(sql);
     assert!(!query.to_uppercase().contains("UNKNOWN"), "UNKNOWN should be rewritten, got: {query}");
     assert!(query.to_uppercase().contains("IS NULL"), "Expected IS NULL rewrite, got: {query}");
 
-    let mut conn = SqliteConnection::establish(":memory:")?;
-    execute_non_query_statements(&translated, &mut conn)?;
+    let mut conn = helpers::apply_ddl(&translated);
 
     diesel::insert_into(numeric_values::table)
         .values(&[
@@ -326,16 +285,14 @@ fn test_is_not_unknown_semantic() -> Result<(), Box<dyn std::error::Error>> {
         SELECT id FROM numeric_values WHERE (value > 0) IS NOT UNKNOWN ORDER BY id;
     ";
 
-    let translated = translate(sql)?;
-    let query = select_sql(&translated);
+    let (translated, query) = helpers::translate::translate_default_statements_and_first_query(sql);
     assert!(!query.to_uppercase().contains("UNKNOWN"), "UNKNOWN should be rewritten, got: {query}");
     assert!(
         query.to_uppercase().contains("IS NOT NULL"),
         "Expected IS NOT NULL rewrite, got: {query}"
     );
 
-    let mut conn = SqliteConnection::establish(":memory:")?;
-    execute_non_query_statements(&translated, &mut conn)?;
+    let mut conn = helpers::apply_ddl(&translated);
 
     diesel::insert_into(numeric_values::table)
         .values(&[

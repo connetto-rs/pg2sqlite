@@ -5,13 +5,10 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use diesel::{
-    Connection as _, ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection,
-    connection::SimpleConnection,
-};
+use diesel::{ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
-use crate::helpers::deployment::deployment;
+use crate::{helpers, helpers::deployment::deployment};
 
 const WRITE_EXEMPTION_FUNCTION: &str = "write_is_exempt";
 
@@ -249,19 +246,11 @@ fn translated(pg: &str, options: &Pg2SqliteOptions) -> Vec<String> {
         .into_vec()
 }
 
-fn apply(pg: &str, options: &Pg2SqliteOptions) -> SqliteConnection {
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-    for statement in translated(pg, options) {
-        connection.batch_execute(&statement).expect("apply translated statement");
-    }
-    connection
-}
-
 fn apply_with_exemption(
     pg: &str,
     options: &Pg2SqliteOptions,
 ) -> (SqliteConnection, Arc<AtomicBool>) {
-    let mut connection = apply(pg, options);
+    let mut connection = helpers::apply_with_options(pg, options).expect("apply");
     let exempt = Arc::new(AtomicBool::new(false));
     let function_state = Arc::clone(&exempt);
     write_is_exempt_utils::register_nondeterministic_impl(&mut connection, move || {
@@ -274,7 +263,8 @@ fn apply_with_exemption(
 #[test]
 fn null_and_function_error_fail_closed() {
     let null_options = options().with_write_exemption_function("write_exemption_is_null");
-    let mut null_connection = apply(POLICY_SCHEMA, &null_options);
+    let mut null_connection =
+        helpers::apply_with_options(POLICY_SCHEMA, &null_options).expect("apply");
     write_exemption_is_null_utils::register_nondeterministic_impl(&mut null_connection, || {
         None::<bool>
     })
@@ -292,7 +282,8 @@ fn null_and_function_error_fail_closed() {
     );
 
     let panic_options = options().with_write_exemption_function("write_exemption_panics");
-    let mut panic_connection = apply(POLICY_SCHEMA, &panic_options);
+    let mut panic_connection =
+        helpers::apply_with_options(POLICY_SCHEMA, &panic_options).expect("apply");
     write_exemption_panics_utils::register_nondeterministic_impl(
         &mut panic_connection,
         || -> bool { panic!("exemption failure") },
@@ -733,7 +724,8 @@ fn quoted_exemption_function_name_is_safe() {
     let quoted_options = Pg2SqliteOptions::default()
         .with_rls_audit_table_name("rls_audit")
         .with_write_exemption_function(QUOTED_NAME);
-    let mut connection = apply(POLICY_SCHEMA, &quoted_options);
+    let mut connection =
+        helpers::apply_with_options(POLICY_SCHEMA, &quoted_options).expect("apply");
     connection
         .register_noarg_sql_function::<diesel::sql_types::Bool, bool, _>(
             QUOTED_NAME,

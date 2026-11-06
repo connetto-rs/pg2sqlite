@@ -3,6 +3,8 @@
 use diesel::{RunQueryDsl, SqliteConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
+use crate::helpers;
+
 diesel::table! {
     /// Users table for testing collation.
     users (id) {
@@ -45,30 +47,21 @@ fn pg_collation_name_causes_error() {
 
 /// SQLite NOCASE collation must still work after the validation is in place.
 #[test]
-fn nocase_collation_still_works() -> Result<(), Box<dyn std::error::Error>> {
+fn nocase_collation_still_works() {
     let sql = "CREATE TABLE nc_test (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
                SELECT * FROM nc_test ORDER BY name COLLATE NOCASE;";
-    let translated =
-        Pg2Sqlite::default().sql(sql)?.translate(&Pg2SqliteOptions::default())?.into_vec();
-    let select_sql = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .unwrap()
-        .to_string();
+    let (translated, select_sql) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
     assert!(
         select_sql.to_uppercase().contains("NOCASE"),
         "NOCASE must be preserved, got: {select_sql}"
     );
 
-    let mut conn = SqliteConnection::establish(":memory:")?;
-    for stmt in &translated {
-        diesel::sql_query(stmt.to_string()).execute(&mut conn)?;
-    }
-    Ok(())
+    helpers::apply_statements(&translated);
 }
 
 #[test]
-fn test_collate_translation() -> Result<(), Box<dyn std::error::Error>> {
+fn test_collate_translation() {
     let sql = "
         CREATE TABLE users (
             id INTEGER PRIMARY KEY,
@@ -77,14 +70,8 @@ fn test_collate_translation() -> Result<(), Box<dyn std::error::Error>> {
         SELECT * FROM users ORDER BY name COLLATE NOCASE;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     assert!(select_stmt.contains("COLLATE"), "Should contain COLLATE clause, got: {select_stmt}");
 
@@ -93,8 +80,6 @@ fn test_collate_translation() -> Result<(), Box<dyn std::error::Error>> {
         conn.execute_batch(&format!("{s};"))
             .unwrap_or_else(|e| panic!("emitted SQL failed: {e}\n{s}"));
     }
-
-    Ok(())
 }
 
 #[test]
@@ -107,15 +92,11 @@ fn test_collate_semantic() -> Result<(), Box<dyn std::error::Error>> {
         SELECT name FROM users ORDER BY name COLLATE NOCASE;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection = SqliteConnection::establish(":memory:").expect("Failed to connect");
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Execute DDL
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert test data with mixed case
     diesel::insert_into(users::table)
@@ -127,12 +108,6 @@ fn test_collate_semantic() -> Result<(), Box<dyn std::error::Error>> {
     diesel::insert_into(users::table)
         .values(&User { id: 3, name: "CHARLIE".to_string() })
         .execute(&mut connection)?;
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct NameResult {

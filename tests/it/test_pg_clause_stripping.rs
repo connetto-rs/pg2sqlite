@@ -1,24 +1,19 @@
 //! Tests for PostgreSQL clause stripping (FOR UPDATE/SHARE, NULLS FIRST/LAST).
 
-use diesel::{Connection, RunQueryDsl, SqliteConnection};
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+use diesel::RunQueryDsl;
+
+use crate::helpers;
 
 /// `FOR UPDATE` is a PostgreSQL row-locking hint that SQLite does not support.
 /// The translator must strip it rather than emitting invalid SQLite SQL.
 #[test]
-fn for_update_stripped_from_select() -> Result<(), Box<dyn std::error::Error>> {
+fn for_update_stripped_from_select() {
     let sql = "
         CREATE TABLE lock_test (id INTEGER PRIMARY KEY, val INTEGER NOT NULL);
         SELECT * FROM lock_test FOR UPDATE;
     ";
-    let translated =
-        Pg2Sqlite::default().sql(sql)?.translate(&Pg2SqliteOptions::default())?.into_vec();
-
-    let select_sql = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .unwrap()
-        .to_string();
+    let (translated, select_sql) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     assert!(
         !select_sql.to_uppercase().contains("FOR UPDATE"),
@@ -26,39 +21,25 @@ fn for_update_stripped_from_select() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Confirm the translated DDL + DML actually run in SQLite without error.
-    let mut conn = SqliteConnection::establish(":memory:")?;
-    for stmt in &translated {
-        diesel::sql_query(stmt.to_string()).execute(&mut conn)?;
-    }
-    Ok(())
+    helpers::apply_statements(&translated);
 }
 
 /// `FOR SHARE` is also a PostgreSQL row-locking hint; same treatment required.
 #[test]
-fn for_share_stripped_from_select() -> Result<(), Box<dyn std::error::Error>> {
+fn for_share_stripped_from_select() {
     let sql = "
         CREATE TABLE lock_test2 (id INTEGER PRIMARY KEY, val INTEGER NOT NULL);
         SELECT * FROM lock_test2 FOR SHARE;
     ";
-    let translated =
-        Pg2Sqlite::default().sql(sql)?.translate(&Pg2SqliteOptions::default())?.into_vec();
-
-    let select_sql = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .unwrap()
-        .to_string();
+    let (translated, select_sql) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     assert!(
         !select_sql.to_uppercase().contains("FOR SHARE"),
         "FOR SHARE must be stripped from translated output, got: {select_sql}"
     );
 
-    let mut conn = SqliteConnection::establish(":memory:")?;
-    for stmt in &translated {
-        diesel::sql_query(stmt.to_string()).execute(&mut conn)?;
-    }
-    Ok(())
+    helpers::apply_statements(&translated);
 }
 
 /// `NULLS FIRST` and `NULLS LAST` are emitted rather than stripped: the two
@@ -74,18 +55,10 @@ fn an_explicit_null_ordering_reaches_sqlite() -> Result<(), Box<dyn std::error::
             "CREATE TABLE nulls_test (id INTEGER PRIMARY KEY, val INTEGER);
              SELECT val FROM nulls_test ORDER BY {ordering};"
         );
-        let translated =
-            Pg2Sqlite::default().sql(&sql)?.translate(&Pg2SqliteOptions::default())?.into_vec();
-        let select_sql = translated
-            .iter()
-            .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-            .unwrap()
-            .to_string();
+        let (translated, select_sql) =
+            helpers::translate::translate_default_statements_and_first_query(&sql);
 
-        let mut conn = SqliteConnection::establish(":memory:")?;
-        for stmt in &translated {
-            diesel::sql_query(stmt.to_string()).execute(&mut conn)?;
-        }
+        let mut conn = helpers::apply_statements(&translated);
         diesel::sql_query("INSERT INTO nulls_test VALUES (1, 10), (2, 5), (3, NULL)")
             .execute(&mut conn)?;
 

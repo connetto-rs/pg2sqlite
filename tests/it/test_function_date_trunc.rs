@@ -1,8 +1,8 @@
 //! Tests for `date_trunc` translation to SQLite `strftime`.
 
-use diesel::{Connection, RunQueryDsl};
+use diesel::RunQueryDsl;
 use helpers::translate_sql;
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+use pg2sqlite::prelude::Pg2SqliteOptions;
 use run_translated_helper::run_translated_with;
 
 use crate::{helpers, helpers::run_translated as run_translated_helper};
@@ -152,25 +152,15 @@ fn date_trunc_without_over_semantic() -> Result<(), Box<dyn std::error::Error>> 
         CREATE TABLE events (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL, created_at TEXT NOT NULL);
         SELECT date_trunc('day', created_at) AS truncated FROM events;
     ";
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(pg_sql)?.translate(&options)?.into_vec();
+    let (translated, select_sql) =
+        helpers::translate::translate_default_statements_and_first_query(pg_sql);
 
-    let mut conn = diesel::SqliteConnection::establish(":memory:")?;
-
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut conn)?;
-    }
+    let mut conn = helpers::apply_ddl(&translated);
 
     diesel::sql_query(
         "INSERT INTO events (id, user_id, created_at) VALUES (1, 1, '2024-03-15 10:30:00'), (2, 1, '2024-03-15 14:00:00')",
     )
     .execute(&mut conn)?;
-
-    let select_sql = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .unwrap()
-        .to_string();
 
     #[derive(diesel::QueryableByName, Debug)]
     struct TruncResult {

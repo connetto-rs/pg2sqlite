@@ -18,6 +18,8 @@ use pg2sqlite::{
     warnings::{TranslationReport, TranslationWarning},
 };
 
+use crate::helpers;
+
 mod schema {
     diesel::table! {
         t (id) {
@@ -32,18 +34,6 @@ fn report(pg: &str) -> TranslationReport {
         .expect("parse")
         .translate_with_report(&Pg2SqliteOptions::default())
         .expect("translate")
-}
-
-/// Applies every emitted statement in order. The emitted SQL is the artifact
-/// under test, so it is applied as generated text.
-fn apply(pg: &str) -> SqliteConnection {
-    let mut conn = SqliteConnection::establish(":memory:").expect("connect");
-    for statement in report(pg).script.into_vec() {
-        diesel::sql_query(statement.to_string())
-            .execute(&mut conn)
-            .unwrap_or_else(|error| panic!("emitted statement failed: {statement}: {error}"));
-    }
-    conn
 }
 
 fn translate_err(pg: &str) -> String {
@@ -62,12 +52,13 @@ const BASE: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY);";
 /// can name, so dropping the clause cannot change what the transaction sees.
 #[test]
 fn a_transaction_with_an_isolation_level_commits() {
-    let mut conn = apply(&format!(
+    let mut conn = helpers::apply_default(&format!(
         "{BASE}
          BEGIN ISOLATION LEVEL SERIALIZABLE;
          INSERT INTO t (id) VALUES (1);
          COMMIT;"
-    ));
+    ))
+    .expect("apply");
 
     assert_eq!(schema::t::table.count().get_result::<i64>(&mut conn).expect("count"), 1);
 }
@@ -76,12 +67,13 @@ fn a_transaction_with_an_isolation_level_commits() {
 /// spelling itself has to become `BEGIN`.
 #[test]
 fn start_transaction_becomes_begin() {
-    let mut conn = apply(&format!(
+    let mut conn = helpers::apply_default(&format!(
         "{BASE}
          START TRANSACTION READ WRITE;
          INSERT INTO t (id) VALUES (1);
          COMMIT;"
-    ));
+    ))
+    .expect("apply");
 
     assert_eq!(schema::t::table.count().get_result::<i64>(&mut conn).expect("count"), 1);
 }
@@ -91,14 +83,15 @@ fn start_transaction_becomes_begin() {
 /// transaction that a later `ROLLBACK` can still undo.
 #[test]
 fn commit_and_chain_opens_the_next_transaction() {
-    let mut conn = apply(&format!(
+    let mut conn = helpers::apply_default(&format!(
         "{BASE}
          BEGIN;
          INSERT INTO t (id) VALUES (1);
          COMMIT AND CHAIN;
          INSERT INTO t (id) VALUES (2);
          ROLLBACK;"
-    ));
+    ))
+    .expect("apply");
 
     let ids: Vec<i32> = schema::t::table.select(schema::t::id).load(&mut conn).expect("load");
     assert_eq!(ids, vec![1], "the chained transaction must be open for the rollback to undo it");
@@ -107,14 +100,15 @@ fn commit_and_chain_opens_the_next_transaction() {
 /// Same for `ROLLBACK AND CHAIN`.
 #[test]
 fn rollback_and_chain_opens_the_next_transaction() {
-    let mut conn = apply(&format!(
+    let mut conn = helpers::apply_default(&format!(
         "{BASE}
          BEGIN;
          INSERT INTO t (id) VALUES (1);
          ROLLBACK AND CHAIN;
          INSERT INTO t (id) VALUES (2);
          ROLLBACK;"
-    ));
+    ))
+    .expect("apply");
 
     assert_eq!(
         schema::t::table.count().get_result::<i64>(&mut conn).expect("count"),
@@ -135,7 +129,10 @@ fn the_transaction_keyword_survives() {
         .join("; ");
 
     assert!(sql.contains("BEGIN TRANSACTION"), "expected the keyword to survive: {sql}");
-    apply(&format!("{BASE} BEGIN TRANSACTION; INSERT INTO t (id) VALUES (1); COMMIT;"));
+    helpers::apply_default(&format!(
+        "{BASE} BEGIN TRANSACTION; INSERT INTO t (id) VALUES (1); COMMIT;"
+    ))
+    .expect("apply");
 }
 
 /// `BEGIN WORK` is the standard SQL spelling PostgreSQL also accepts, and
@@ -143,8 +140,10 @@ fn the_transaction_keyword_survives() {
 /// go while the transaction itself stays.
 #[test]
 fn the_work_keyword_is_dropped() {
-    let mut conn =
-        apply(&format!("{BASE} BEGIN WORK; INSERT INTO t (id) VALUES (1); COMMIT WORK;"));
+    let mut conn = helpers::apply_default(&format!(
+        "{BASE} BEGIN WORK; INSERT INTO t (id) VALUES (1); COMMIT WORK;"
+    ))
+    .expect("apply");
 
     assert_eq!(schema::t::table.count().get_result::<i64>(&mut conn).expect("count"), 1);
 }
@@ -181,7 +180,7 @@ fn dropping_a_transaction_clause_warns() {
 /// statement executes.
 #[test]
 fn vacuum_options_are_dropped() {
-    apply(&format!("{BASE} VACUUM ANALYZE;"));
+    helpers::apply_default(&format!("{BASE} VACUUM ANALYZE;")).expect("apply");
 }
 
 /// A `VACUUM` naming a table is the dangerous one: SQLite reads the name as a
@@ -196,7 +195,7 @@ fn vacuum_of_a_table_becomes_a_bare_vacuum() {
         .join("; ");
 
     assert!(!sql.contains("VACUUM t"), "the table name must not reach the output: {sql}");
-    apply(&format!("{BASE} VACUUM t;"));
+    helpers::apply_default(&format!("{BASE} VACUUM t;")).expect("apply");
 }
 
 /// Both losses are reported.

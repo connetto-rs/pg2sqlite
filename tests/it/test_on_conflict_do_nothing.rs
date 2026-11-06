@@ -60,11 +60,6 @@ fn translate(dml: &str) -> Vec<String> {
         .into_vec()
 }
 
-/// Runs every emitted statement, and panics if any of them fails.
-fn apply(dml: &str) -> SqliteConnection {
-    helpers::apply_statements(&translate(dml))
-}
-
 /// The first execution failure, for the cases where PostgreSQL raises one.
 fn apply_err(dml: &str) -> diesel::result::Error {
     let mut connection = SqliteConnection::establish(":memory:").expect("connect");
@@ -92,7 +87,9 @@ fn rows(connection: &mut SqliteConnection) -> Vec<(i32, i32, i32)> {
 /// got right and this must not lose.
 #[test]
 fn a_conflict_on_the_target_is_ignored() {
-    let mut connection = apply("INSERT INTO oc (id, n) VALUES (1, 9) ON CONFLICT (id) DO NOTHING;");
+    let mut connection = helpers::apply_statements(&translate(
+        "INSERT INTO oc (id, n) VALUES (1, 9) ON CONFLICT (id) DO NOTHING;",
+    ));
     assert_eq!(rows(&mut connection), vec![(1, 5, 1)]);
 }
 
@@ -100,7 +97,9 @@ fn a_conflict_on_the_target_is_ignored() {
 /// and so does SQLite.
 #[test]
 fn a_targetless_conflict_is_ignored() {
-    let mut connection = apply("INSERT INTO oc (id, n) VALUES (1, 9) ON CONFLICT DO NOTHING;");
+    let mut connection = helpers::apply_statements(&translate(
+        "INSERT INTO oc (id, n) VALUES (1, 9) ON CONFLICT DO NOTHING;",
+    ));
     assert_eq!(rows(&mut connection), vec![(1, 5, 1)]);
 }
 
@@ -108,9 +107,9 @@ fn a_targetless_conflict_is_ignored() {
 /// same lookup `DO UPDATE` already used.
 #[test]
 fn a_named_constraint_target_is_ignored() {
-    let mut connection = apply(
+    let mut connection = helpers::apply_statements(&translate(
         "INSERT INTO uq (id, tag) VALUES (2, 'a') ON CONFLICT ON CONSTRAINT uq_tag DO NOTHING;",
-    );
+    ));
     let stored: Vec<(i32, String)> = schema::uq::table
         .select((schema::uq::id, schema::uq::tag))
         .load(&mut connection)
@@ -174,8 +173,9 @@ fn the_output_no_longer_carries_or_ignore() {
 /// Without it the emitted statement answers `near "DO": syntax error`.
 #[test]
 fn a_select_source_gets_the_where_sqlite_needs() {
-    let mut connection =
-        apply("INSERT INTO oc (id, n) SELECT id, n FROM src ON CONFLICT (id) DO NOTHING;");
+    let mut connection = helpers::apply_statements(&translate(
+        "INSERT INTO oc (id, n) SELECT id, n FROM src ON CONFLICT (id) DO NOTHING;",
+    ));
     assert_eq!(rows(&mut connection), vec![(1, 5, 1), (2, 8, 1)]);
 }
 
@@ -183,9 +183,9 @@ fn a_select_source_gets_the_where_sqlite_needs() {
 /// never had anything to do with DO NOTHING becoming OR IGNORE.
 #[test]
 fn a_select_source_upsert_gets_it_too() {
-    let mut connection = apply(
+    let mut connection = helpers::apply_statements(&translate(
         "INSERT INTO oc (id, n) SELECT id, n FROM src ON CONFLICT (id) DO UPDATE SET n = EXCLUDED.n;",
-    );
+    ));
     assert_eq!(rows(&mut connection), vec![(1, 7, 1), (2, 8, 1)]);
 }
 
@@ -198,9 +198,9 @@ fn a_source_that_already_disambiguates_is_untouched() {
     );
     let insert = emitted.last().expect("an emitted insert");
     assert!(!insert.contains("true"), "no second WHERE was needed: {insert}");
-    let mut connection = apply(
+    let mut connection = helpers::apply_statements(&translate(
         "INSERT INTO oc (id, n) SELECT id, n FROM src WHERE id > 1 ON CONFLICT (id) DO NOTHING;",
-    );
+    ));
     assert_eq!(rows(&mut connection), vec![(1, 5, 1), (2, 8, 1)]);
 }
 
@@ -260,21 +260,21 @@ fn partial_rows(connection: &mut SqliteConnection) -> Vec<(i32, i32, i32)> {
 
 #[test]
 fn an_index_predicate_picks_the_partial_index_as_the_arbiter() {
-    let mut connection = apply(&format!(
+    let mut connection = helpers::apply_statements(&translate(&format!(
         "{PARTIAL}
          INSERT INTO pu (id, k, n, tag) VALUES (2, 5, 2, 'b')
              ON CONFLICT (k) WHERE n > 0 AND tag ILIKE 'B%' DO NOTHING;"
-    ));
+    )));
     assert_eq!(partial_rows(&mut connection), [(1, 5, 1)]);
 }
 
 #[test]
 fn an_index_predicate_picks_the_partial_index_for_an_update() {
-    let mut connection = apply(&format!(
+    let mut connection = helpers::apply_statements(&translate(&format!(
         "{PARTIAL}
          INSERT INTO pu (id, k, n, tag) VALUES (2, 5, 2, 'b')
              ON CONFLICT (k) WHERE (n > 0) AND (tag ILIKE 'B%') DO UPDATE SET n = EXCLUDED.n;"
-    ));
+    )));
     assert_eq!(partial_rows(&mut connection), [(1, 5, 2)]);
 }
 

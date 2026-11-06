@@ -1,7 +1,8 @@
 //! Tests for EXTRACT(field FROM expr) translation to SQLite strftime.
 
-use diesel::{Connection, RunQueryDsl, SqliteConnection};
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+use diesel::RunQueryDsl;
+
+use crate::helpers;
 
 /// `EXTRACT(WEEK)` is the ISO week, which SQLite spells `%V`. `%W` is the
 /// Sunday based one and disagrees at every year boundary, so emitting it would
@@ -16,17 +17,7 @@ fn extract_week_uses_the_iso_format() {
         CREATE TABLE week_test (id INTEGER PRIMARY KEY, ts TEXT);
         SELECT EXTRACT(WEEK FROM ts) FROM week_test;
     ";
-    let statements = Pg2Sqlite::default()
-        .sql(sql)
-        .unwrap()
-        .translate(&Pg2SqliteOptions::default())
-        .unwrap()
-        .into_vec();
-    let query = statements
-        .iter()
-        .find(|statement| matches!(statement, sqlparser::ast::Statement::Query(_)))
-        .map(ToString::to_string)
-        .expect("a query");
+    let (statements, query) = helpers::translate::translate_default_statements_and_first_query(sql);
 
     assert!(query.contains("'%V'"), "expected the ISO week format: {query}");
     assert!(!query.contains("'%W'"), "%W is Sunday based, not ISO: {query}");
@@ -43,22 +34,14 @@ fn extract_week_uses_the_iso_format() {
 fn extract_second_produces_valid_sqlite() -> Result<(), Box<dyn std::error::Error>> {
     let sql = "CREATE TABLE sec2_test (id INTEGER PRIMARY KEY, ts TEXT NOT NULL);
                SELECT EXTRACT(SECOND FROM ts) AS secs FROM sec2_test;";
-    let translated =
-        Pg2Sqlite::default().sql(sql)?.translate(&Pg2SqliteOptions::default())?.into_vec();
-    let select_sql = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .unwrap()
-        .to_string();
+    let (translated, select_sql) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
     assert!(
         select_sql.to_lowercase().contains("strftime"),
         "EXTRACT(SECOND) must use strftime, got: {select_sql}"
     );
 
-    let mut conn = SqliteConnection::establish(":memory:")?;
-    for stmt in &translated {
-        diesel::sql_query(stmt.to_string()).execute(&mut conn)?;
-    }
+    let mut conn = helpers::apply_statements(&translated);
     diesel::sql_query("INSERT INTO sec2_test VALUES (1, '2024-01-15 10:30:45.123')")
         .execute(&mut conn)?;
 

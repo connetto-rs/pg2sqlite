@@ -110,23 +110,6 @@ fn translate_statement(
     Ok(result)
 }
 
-/// Helper to create a connection and run translated SQL.
-fn translate_and_execute(sql: &str) -> Result<SqliteConnection, Box<dyn std::error::Error>> {
-    let options = Pg2SqliteOptions::default();
-    let translated_migrations = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection = SqliteConnection::establish(":memory:").expect("Failed to connect");
-
-    diesel::sql_query("PRAGMA foreign_keys = ON").execute(&mut connection)?;
-
-    for translated_migration in &translated_migrations {
-        let sql_stmt = translated_migration.to_string();
-        diesel::sql_query(&sql_stmt).execute(&mut connection)?;
-    }
-
-    Ok(connection)
-}
-
 /// Helper to check if a table exists in SQLite.
 fn table_exists(conn: &mut SqliteConnection, table_name: &str) -> bool {
     let result: Result<Count, _> = diesel::sql_query(format!(
@@ -274,7 +257,7 @@ fn test_drop_table_execution() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn test_drop_view() -> Result<(), Box<dyn std::error::Error>> {
+fn test_drop_view() {
     let sql = "
         CREATE TABLE users (
             id SERIAL PRIMARY KEY,
@@ -285,25 +268,21 @@ fn test_drop_view() -> Result<(), Box<dyn std::error::Error>> {
         DROP VIEW active_users;
     ";
 
-    let mut connection = translate_and_execute(sql)?;
+    let mut connection = helpers::apply_translated_ddl(sql, &Pg2SqliteOptions::default());
 
     assert!(table_exists(&mut connection, "users"), "Table should still exist");
     assert!(!view_exists(&mut connection, "active_users"), "View should not exist after DROP");
-
-    Ok(())
 }
 
 #[test]
-fn test_drop_view_if_exists() -> Result<(), Box<dyn std::error::Error>> {
+fn test_drop_view_if_exists() {
     let sql = "
         CREATE TABLE users (id SERIAL PRIMARY KEY);
         DROP VIEW IF EXISTS nonexistent_view;
     ";
 
     // Should not error
-    let _connection = translate_and_execute(sql)?;
-
-    Ok(())
+    let _connection = helpers::apply_translated_ddl(sql, &Pg2SqliteOptions::default());
 }
 
 #[test]
@@ -322,39 +301,35 @@ fn test_drop_view_cascade_stripped() -> Result<(), Box<dyn std::error::Error>> {
 
     assert!(!drop_str.contains("CASCADE"), "CASCADE should be stripped: {drop_str}");
 
-    let mut connection = translate_and_execute(sql)?;
+    let mut connection = helpers::apply_translated_ddl(sql, &Pg2SqliteOptions::default());
     assert!(!view_exists(&mut connection, "all_users"));
 
     Ok(())
 }
 
 #[test]
-fn test_drop_index() -> Result<(), Box<dyn std::error::Error>> {
+fn test_drop_index() {
     let sql = "
         CREATE TABLE users (id SERIAL PRIMARY KEY, email TEXT NOT NULL);
         CREATE INDEX idx_users_email ON users (email);
         DROP INDEX idx_users_email;
     ";
 
-    let mut connection = translate_and_execute(sql)?;
+    let mut connection = helpers::apply_translated_ddl(sql, &Pg2SqliteOptions::default());
 
     assert!(table_exists(&mut connection, "users"), "Table should still exist");
     assert!(!index_exists(&mut connection, "idx_users_email"), "Index should not exist after DROP");
-
-    Ok(())
 }
 
 #[test]
-fn test_drop_index_if_exists() -> Result<(), Box<dyn std::error::Error>> {
+fn test_drop_index_if_exists() {
     let sql = "
         CREATE TABLE users (id SERIAL PRIMARY KEY);
         DROP INDEX IF EXISTS nonexistent_index;
     ";
 
     // Should not error
-    let _connection = translate_and_execute(sql)?;
-
-    Ok(())
+    let _connection = helpers::apply_translated_ddl(sql, &Pg2SqliteOptions::default());
 }
 
 #[test]

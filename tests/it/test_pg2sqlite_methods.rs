@@ -7,9 +7,7 @@
 
 use std::io::Write;
 
-use diesel::{Connection, RunQueryDsl, SqliteConnection};
 use pg2sqlite::{options::Pg2SqliteOptions, pg2sqlite::Pg2Sqlite};
-use rusqlite::Connection as SqliteConn;
 use tempfile::{NamedTempFile, TempDir};
 
 #[test]
@@ -27,9 +25,8 @@ fn test_statement() {
     assert!(result[0].to_string().contains("case_sensitive_like"));
     assert!(result[1].to_string().contains("CREATE TABLE test_statement"));
     // Execute to prove real SQLite accepts the translated DDL.
-    let conn = SqliteConn::open_in_memory().unwrap();
-    conn.execute_batch(&result.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n"))
-        .unwrap_or_else(|e| panic!("translated DDL must execute: {e}"));
+    let sqls: Vec<String> = result.iter().map(ToString::to_string).collect();
+    crate::helpers::apply_rusqlite_statements(&sqls);
 }
 
 #[test]
@@ -40,9 +37,8 @@ fn test_sql() {
     assert!(result[0].to_string().contains("case_sensitive_like"));
     assert!(result[1].to_string().contains("CREATE TABLE test_sql"));
     // Execute to prove real SQLite accepts the translated DDL.
-    let conn = SqliteConn::open_in_memory().unwrap();
-    conn.execute_batch(&result.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n"))
-        .unwrap_or_else(|e| panic!("translated DDL must execute: {e}"));
+    let sqls: Vec<String> = result.iter().map(ToString::to_string).collect();
+    crate::helpers::apply_rusqlite_statements(&sqls);
 }
 
 #[test]
@@ -57,9 +53,8 @@ fn test_file() {
     assert!(result[0].to_string().contains("case_sensitive_like"));
     assert!(result[1].to_string().contains("CREATE TABLE test_file"));
     // Execute to prove real SQLite accepts the translated DDL.
-    let conn = SqliteConn::open_in_memory().unwrap();
-    conn.execute_batch(&result.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n"))
-        .unwrap_or_else(|e| panic!("translated DDL must execute: {e}"));
+    let sqls: Vec<String> = result.iter().map(ToString::to_string).collect();
+    crate::helpers::apply_rusqlite_statements(&sqls);
 }
 
 #[test]
@@ -86,9 +81,8 @@ fn test_ups() {
     assert!(result[1].to_string().contains("CREATE TABLE t1"));
     assert!(result[2].to_string().contains("CREATE TABLE t2"));
     // Execute to prove real SQLite accepts the translated DDL.
-    let conn = SqliteConn::open_in_memory().unwrap();
-    conn.execute_batch(&result.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n"))
-        .unwrap_or_else(|e| panic!("translated DDL must execute: {e}"));
+    let sqls: Vec<String> = result.iter().map(ToString::to_string).collect();
+    crate::helpers::apply_rusqlite_statements(&sqls);
 }
 
 #[test]
@@ -119,9 +113,8 @@ fn test_ups_until() {
     assert!(result[1].to_string().contains("CREATE TABLE t1"));
     assert!(result[2].to_string().contains("CREATE TABLE t2"));
     // Execute to prove real SQLite accepts the translated DDL.
-    let conn = SqliteConn::open_in_memory().unwrap();
-    conn.execute_batch(&result.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n"))
-        .unwrap_or_else(|e| panic!("translated DDL must execute: {e}"));
+    let sqls: Vec<String> = result.iter().map(ToString::to_string).collect();
+    crate::helpers::apply_rusqlite_statements(&sqls);
 }
 
 #[test]
@@ -226,9 +219,8 @@ fn test_alter_table_add_column_is_translated() {
     assert_eq!(stmts.len(), 3, "pragma plus CREATE TABLE plus ADD COLUMN");
     assert!(stmts[2].to_string().contains("ADD COLUMN name TEXT"), "got: {}", stmts[2]);
     // Execute to prove real SQLite accepts the translated DDL.
-    let conn = SqliteConn::open_in_memory().unwrap();
-    conn.execute_batch(&stmts.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n"))
-        .unwrap_or_else(|e| panic!("translated DDL must execute: {e}"));
+    let sqls: Vec<String> = stmts.iter().map(ToString::to_string).collect();
+    crate::helpers::apply_rusqlite_statements(&sqls);
 }
 
 #[test]
@@ -266,9 +258,8 @@ fn test_index_skipped_for_role_without_access() {
         "Index should be filtered for role without SELECT"
     );
     // Execute to prove real SQLite accepts the translated DDL.
-    let conn = SqliteConn::open_in_memory().unwrap();
-    conn.execute_batch(&stmts.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n"))
-        .unwrap_or_else(|e| panic!("translated DDL must execute: {e}"));
+    let sqls: Vec<String> = stmts.iter().map(ToString::to_string).collect();
+    crate::helpers::apply_rusqlite_statements(&sqls);
 }
 
 /// `translate_to_sql` must return `Vec<String>` of SQL text directly.
@@ -290,9 +281,6 @@ fn translate_to_sql_returns_strings() -> Result<(), Box<dyn std::error::Error>> 
     );
 
     // The returned strings must be valid SQLite.
-    let mut conn = SqliteConnection::establish(":memory:")?;
-    for sql_str in &sql_strings {
-        diesel::sql_query(sql_str).execute(&mut conn)?;
-    }
+    crate::helpers::apply_statements(&sql_strings);
     Ok(())
 }
