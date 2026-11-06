@@ -16,6 +16,7 @@ use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
 use sql_traits::structs::{Deployment, JsonField, SessionSetting, SetPacking, SettingValue};
 use sqlparser::ast::DataType;
 
+use super::harness::apply_with_seed;
 use crate::helpers::postgres as postgres_harness;
 
 const SCHEMA: &str = "
@@ -179,21 +180,9 @@ fn sqlite(predicate: &str, acting: &str) -> SqliteConnection {
     app_team_ids_utils::register_impl(&mut connection, current_value)
         .expect("register app_team_ids");
     jwt_claims_utils::register_impl(&mut connection, current_value).expect("register jwt_claims");
-    let (triggers, base): (Vec<_>, Vec<_>) =
-        translated.iter().map(ToString::to_string).partition(|s| s.starts_with("CREATE TRIGGER"));
-    // Translated DDL is runtime text no typed DSL carries. The triggers wait
-    // for the seed, which is the replica's counterpart of a bypassing load.
-    for statement in &base {
-        diesel::sql_query(statement)
-            .execute(&mut connection)
-            .unwrap_or_else(|error| panic!("{error}\n{statement}"));
-    }
-    seed!(&mut connection, docs_rls);
-    for statement in &triggers {
-        diesel::sql_query(statement)
-            .execute(&mut connection)
-            .unwrap_or_else(|error| panic!("{error}\n{statement}"));
-    }
+    apply_with_seed(&mut connection, &translated, |connection| {
+        seed!(connection, docs_rls);
+    });
     connection
 }
 

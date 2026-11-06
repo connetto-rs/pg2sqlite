@@ -4,7 +4,7 @@
 //! - SUBSTRING(str FROM pos FOR len) translates to SUBSTR(str, pos, len)
 
 use diesel::prelude::*;
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+use pg2sqlite::prelude::Pg2SqliteOptions;
 
 use crate::helpers;
 mod schema {
@@ -65,14 +65,7 @@ fn test_position_semantic() -> Result<(), Box<dyn std::error::Error>> {
         );
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut conn = diesel::SqliteConnection::establish(":memory:")?;
-
-    for stmt in &translated {
-        diesel::sql_query(&stmt.to_string()).execute(&mut conn)?;
-    }
+    let mut conn = helpers::apply_default(sql)?;
 
     diesel::insert_into(strings::table)
         .values(&StringData { id: 1, text_val: "hello world".to_string() })
@@ -132,14 +125,7 @@ fn test_substring_semantic() -> Result<(), Box<dyn std::error::Error>> {
         );
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut conn = diesel::SqliteConnection::establish(":memory:")?;
-
-    for stmt in &translated {
-        diesel::sql_query(&stmt.to_string()).execute(&mut conn)?;
-    }
+    let mut conn = helpers::apply_default(sql)?;
 
     diesel::insert_into(strings::table)
         .values(&StringData { id: 1, text_val: "hello world".to_string() })
@@ -190,14 +176,7 @@ fn test_substring_no_length_semantic() -> Result<(), Box<dyn std::error::Error>>
         );
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut conn = diesel::SqliteConnection::establish(":memory:")?;
-
-    for stmt in &translated {
-        diesel::sql_query(&stmt.to_string()).execute(&mut conn)?;
-    }
+    let mut conn = helpers::apply_default(sql)?;
 
     diesel::insert_into(strings::table)
         .values(&StringData { id: 1, text_val: "hello world".to_string() })
@@ -267,14 +246,7 @@ fn test_overlay_with_for_semantic() {
     );
     assert!(query.to_uppercase().contains("SUBSTR"), "Expected SUBSTR rewrite, got: {query}");
 
-    let mut conn = diesel::SqliteConnection::establish(":memory:").expect("establish");
-    // Translated DDL: runtime string from the translator, cannot use the typed
-    // DSL.
-    for stmt in &stmts {
-        if !helpers::is_user_statement(stmt, "SELECT") {
-            diesel::sql_query(stmt.as_str()).execute(&mut conn).expect("DDL failed");
-        }
-    }
+    let mut conn = helpers::apply_ddl(&stmts);
 
     diesel::insert_into(overlay_samples::table)
         .values(&[
@@ -317,14 +289,7 @@ fn test_overlay_without_for_semantic() {
     );
     assert!(query.to_uppercase().contains("SUBSTR"), "Expected SUBSTR rewrite, got: {query}");
 
-    let mut conn = diesel::SqliteConnection::establish(":memory:").expect("establish");
-    // Translated DDL: runtime string from the translator, cannot use the typed
-    // DSL.
-    for stmt in &stmts {
-        if !helpers::is_user_statement(stmt, "SELECT") {
-            diesel::sql_query(stmt.as_str()).execute(&mut conn).expect("DDL failed");
-        }
-    }
+    let mut conn = helpers::apply_ddl(&stmts);
 
     diesel::insert_into(overlay_samples::table)
         .values(&[OverlaySample { id: 1, text_val: "hello world".to_string() }])

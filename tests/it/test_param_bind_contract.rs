@@ -3,29 +3,45 @@
 //! The emitted SQL performs every re-representation conversion so the stored
 //! value and the bound value are always in the same terms.
 
+use diesel::{Connection, RunQueryDsl, SqliteConnection};
 use pg2sqlite::prelude::{ArrayRepresentation, Pg2Sqlite, Pg2SqliteOptions};
+
+use crate::helpers::{is_user_statement, translate_pg, user_statement_of};
+
+/// Translates `pg` with `options`, applies every emitted statement other than
+/// the first of `kind`, and returns the connection alongside that statement.
+///
+/// The statements are the translator's own output, which the typed query
+/// builder cannot express.
+///
+/// # Panics
+///
+/// Panics when translation fails, when no statement of `kind` is emitted, or
+/// when an applied statement is rejected.
+fn setup_and_probe(pg: &str, options: &Pg2SqliteOptions, kind: &str) -> (SqliteConnection, String) {
+    let statements = translate_pg(pg, options).expect("translation should succeed");
+    let probe = user_statement_of(&statements, kind).clone();
+    let mut connection = SqliteConnection::establish(":memory:").expect("open");
+    for statement in statements.iter().filter(|statement| !is_user_statement(statement, kind)) {
+        diesel::sql_query(statement).execute(&mut connection).expect("setup");
+    }
+    (connection, probe)
+}
 
 // ── NUMERIC(p,s)
 // ──────────────────────────────────────────────────────────────
 
 mod numeric {
-    use diesel::{RunQueryDsl, prelude::*, sql_query, sqlite::SqliteConnection};
+    use diesel::{RunQueryDsl, prelude::*, sql_query};
     use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+
+    use super::setup_and_probe;
 
     diesel::table! {
         t (id) {
             id -> Integer,
             amount -> BigInt,
         }
-    }
-
-    fn stmts(pg: &str) -> Vec<String> {
-        Pg2Sqlite::default()
-            .sql(pg)
-            .expect("parse")
-            .translate_to_sql(&Pg2SqliteOptions::default())
-            .expect("translate")
-            .into_vec()
     }
 
     #[derive(QueryableByName, Debug, PartialEq)]
@@ -39,23 +55,17 @@ mod numeric {
     /// float, and 150 > 2.0 incorrectly returned the row.
     #[test]
     fn param_select_uses_postgres_scale() {
-        let all = stmts(
+        // Translator output uses STRICT and placeholder wrapping; typed DSL
+        // cannot reproduce it.
+        let (mut conn, probe) = setup_and_probe(
             "CREATE TABLE t (id INT PRIMARY KEY, amount NUMERIC(10,2));
              INSERT INTO t (id, amount) VALUES (1, 1.50);
              SELECT id FROM t WHERE amount > $1;",
+            &Pg2SqliteOptions::default(),
+            "SELECT",
         );
-        let mut conn = SqliteConnection::establish(":memory:").expect("open");
-        // Translator output uses STRICT and placeholder wrapping; typed DSL
-        // cannot reproduce it.
-        let probe = all
-            .iter()
-            .find(|s| s.to_ascii_uppercase().trim_start().starts_with("SELECT"))
-            .expect("SELECT");
-        for s in all.iter().filter(|s| !s.to_ascii_uppercase().trim_start().starts_with("SELECT")) {
-            sql_query(s.as_str()).execute(&mut conn).expect("setup");
-        }
 
-        let over_two: Vec<IdRow> = sql_query(probe)
+        let over_two: Vec<IdRow> = sql_query(&probe)
             .bind::<diesel::sql_types::Double, _>(2.0_f64)
             .load(&mut conn)
             .expect("probe 2.0");
@@ -71,21 +81,15 @@ mod numeric {
     /// A bound decimal INSERT stores minor units; typed DSL reads them back.
     #[test]
     fn param_insert_stores_minor_units() {
-        let all = stmts(
-            "CREATE TABLE t (id INT PRIMARY KEY, amount NUMERIC(10,2));
-             INSERT INTO t (id, amount) VALUES (1, $1);",
-        );
-        let mut conn = SqliteConnection::establish(":memory:").expect("open");
-        let insert = all
-            .iter()
-            .find(|s| s.to_ascii_uppercase().trim_start().starts_with("INSERT"))
-            .expect("INSERT");
         // Translator-emitted INSERT; typed DSL cannot reproduce placeholder
         // wrapping.
-        for s in all.iter().filter(|s| !s.to_ascii_uppercase().trim_start().starts_with("INSERT")) {
-            sql_query(s.as_str()).execute(&mut conn).expect("setup");
-        }
-        sql_query(insert.as_str())
+        let (mut conn, insert) = setup_and_probe(
+            "CREATE TABLE t (id INT PRIMARY KEY, amount NUMERIC(10,2));
+             INSERT INTO t (id, amount) VALUES (1, $1);",
+            &Pg2SqliteOptions::default(),
+            "INSERT",
+        );
+        sql_query(&insert)
             .bind::<diesel::sql_types::Double, _>(1.5_f64)
             .execute(&mut conn)
             .expect("parameterised INSERT must succeed");
@@ -114,19 +118,13 @@ mod numeric {
         };
         assert_eq!(scale, 2_u32);
 
-        let all = stmts(
+        let (mut conn, insert) = setup_and_probe(
             "CREATE TABLE t (id INT PRIMARY KEY, amount NUMERIC(10,2));
              INSERT INTO t (id, amount) VALUES (1, $1);",
+            &Pg2SqliteOptions::default(),
+            "INSERT",
         );
-        let mut conn = SqliteConnection::establish(":memory:").expect("open");
-        let insert = all
-            .iter()
-            .find(|s| s.to_ascii_uppercase().trim_start().starts_with("INSERT"))
-            .expect("INSERT");
-        for s in all.iter().filter(|s| !s.to_ascii_uppercase().trim_start().starts_with("INSERT")) {
-            sql_query(s.as_str()).execute(&mut conn).expect("setup");
-        }
-        sql_query(insert.as_str())
+        sql_query(&insert)
             .bind::<diesel::sql_types::Double, _>(1.5_f64)
             .execute(&mut conn)
             .expect("INSERT");
@@ -144,8 +142,10 @@ mod numeric {
 // ────────────────────────────────────────────────
 
 mod uuid_text {
-    use diesel::{RunQueryDsl, prelude::*, sql_query, sqlite::SqliteConnection};
-    use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation};
+    use diesel::{RunQueryDsl, prelude::*, sql_query};
+    use pg2sqlite::prelude::{Pg2SqliteOptions, UuidRepresentation};
+
+    use super::setup_and_probe;
 
     diesel::table! {
         u (id) {
@@ -155,17 +155,6 @@ mod uuid_text {
     }
 
     const UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
-
-    fn stmts(pg: &str) -> Vec<String> {
-        Pg2Sqlite::default()
-            .sql(pg)
-            .expect("parse")
-            .translate_to_sql(
-                &Pg2SqliteOptions::default().with_uuid_representation(UuidRepresentation::Text),
-            )
-            .expect("translate")
-            .into_vec()
-    }
 
     #[derive(QueryableByName, Debug)]
     struct NameRow {
@@ -177,21 +166,15 @@ mod uuid_text {
     /// directly.
     #[test]
     fn param_select_finds_row() {
-        let all = stmts(
+        // Text representation; typed DSL would differ from translator output.
+        let (mut conn, probe) = setup_and_probe(
             "CREATE TABLE u (id UUID PRIMARY KEY, name TEXT NOT NULL);
              INSERT INTO u (id, name) VALUES ('550e8400-e29b-41d4-a716-446655440000', 'alice');
              SELECT name FROM u WHERE id = $1;",
+            &Pg2SqliteOptions::default().with_uuid_representation(UuidRepresentation::Text),
+            "SELECT",
         );
-        let mut conn = SqliteConnection::establish(":memory:").expect("open");
-        let probe = all
-            .iter()
-            .find(|s| s.to_ascii_uppercase().trim_start().starts_with("SELECT"))
-            .expect("SELECT");
-        for s in all.iter().filter(|s| !s.to_ascii_uppercase().trim_start().starts_with("SELECT")) {
-            sql_query(s.as_str()).execute(&mut conn).expect("setup");
-        }
-        // Text representation; typed DSL would differ from translator output.
-        let rows: Vec<NameRow> = sql_query(probe)
+        let rows: Vec<NameRow> = sql_query(&probe)
             .bind::<diesel::sql_types::Text, _>(UUID)
             .load(&mut conn)
             .expect("probe");
@@ -203,21 +186,15 @@ mod uuid_text {
     /// unchanged.
     #[test]
     fn param_insert_stores_canonical_form() {
-        let all = stmts(
-            "CREATE TABLE u (id UUID PRIMARY KEY, name TEXT NOT NULL);
-             INSERT INTO u (id, name) VALUES ($1, 'alice');",
-        );
-        let mut conn = SqliteConnection::establish(":memory:").expect("open");
-        let insert = all
-            .iter()
-            .find(|s| s.to_ascii_uppercase().trim_start().starts_with("INSERT"))
-            .expect("INSERT");
         // Translator-emitted INSERT; typed DSL cannot reproduce placeholder
         // wrapping.
-        for s in all.iter().filter(|s| !s.to_ascii_uppercase().trim_start().starts_with("INSERT")) {
-            sql_query(s.as_str()).execute(&mut conn).expect("setup");
-        }
-        sql_query(insert)
+        let (mut conn, insert) = setup_and_probe(
+            "CREATE TABLE u (id UUID PRIMARY KEY, name TEXT NOT NULL);
+             INSERT INTO u (id, name) VALUES ($1, 'alice');",
+            &Pg2SqliteOptions::default().with_uuid_representation(UuidRepresentation::Text),
+            "INSERT",
+        );
+        sql_query(&insert)
             .bind::<diesel::sql_types::Text, _>(UUID)
             .execute(&mut conn)
             .expect("INSERT must succeed");
@@ -231,8 +208,10 @@ mod uuid_text {
 // ────────────────────────────────────────────────
 
 mod uuid_blob {
-    use diesel::{RunQueryDsl, prelude::*, sql_query, sqlite::SqliteConnection};
-    use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation};
+    use diesel::{RunQueryDsl, prelude::*, sql_query};
+    use pg2sqlite::prelude::{Pg2SqliteOptions, UuidRepresentation};
+
+    use super::setup_and_probe;
 
     diesel::table! {
         u (id) {
@@ -247,17 +226,6 @@ mod uuid_blob {
         0x00,
     ];
 
-    fn stmts(pg: &str) -> Vec<String> {
-        Pg2Sqlite::default()
-            .sql(pg)
-            .expect("parse")
-            .translate_to_sql(
-                &Pg2SqliteOptions::default().with_uuid_representation(UuidRepresentation::Blob),
-            )
-            .expect("translate")
-            .into_vec()
-    }
-
     #[derive(QueryableByName, Debug)]
     struct NameRow {
         #[diesel(sql_type = diesel::sql_types::Text)]
@@ -268,22 +236,16 @@ mod uuid_blob {
     /// Before the fix the emitted WHERE compared the blob against raw text.
     #[test]
     fn param_select_finds_row() {
-        let all = stmts(
+        // STRICT / CHECK / unhex wrapping; typed DSL cannot reproduce
+        // translator output.
+        let (mut conn, probe) = setup_and_probe(
             "CREATE TABLE u (id UUID PRIMARY KEY, name TEXT NOT NULL);
              INSERT INTO u (id, name) VALUES ('550e8400-e29b-41d4-a716-446655440000', 'alice');
              SELECT name FROM u WHERE id = $1;",
+            &Pg2SqliteOptions::default().with_uuid_representation(UuidRepresentation::Blob),
+            "SELECT",
         );
-        let mut conn = SqliteConnection::establish(":memory:").expect("open");
-        let probe = all
-            .iter()
-            .find(|s| s.to_ascii_uppercase().trim_start().starts_with("SELECT"))
-            .expect("SELECT");
-        // STRICT / CHECK / unhex wrapping; typed DSL cannot reproduce
-        // translator output.
-        for s in all.iter().filter(|s| !s.to_ascii_uppercase().trim_start().starts_with("SELECT")) {
-            sql_query(s.as_str()).execute(&mut conn).expect("setup");
-        }
-        let rows: Vec<NameRow> = sql_query(probe)
+        let rows: Vec<NameRow> = sql_query(&probe)
             .bind::<diesel::sql_types::Text, _>(UUID)
             .load(&mut conn)
             .expect("probe");
@@ -295,20 +257,14 @@ mod uuid_blob {
     /// form.
     #[test]
     fn param_insert_stores_correct_bytes() {
-        let all = stmts(
+        // Translator wraps ?1 in unhex/replace; typed DSL cannot reproduce it.
+        let (mut conn, insert) = setup_and_probe(
             "CREATE TABLE u (id UUID PRIMARY KEY, name TEXT NOT NULL);
              INSERT INTO u (id, name) VALUES ($1, 'alice');",
+            &Pg2SqliteOptions::default().with_uuid_representation(UuidRepresentation::Blob),
+            "INSERT",
         );
-        let mut conn = SqliteConnection::establish(":memory:").expect("open");
-        let insert = all
-            .iter()
-            .find(|s| s.to_ascii_uppercase().trim_start().starts_with("INSERT"))
-            .expect("INSERT");
-        // Translator wraps ?1 in unhex/replace; typed DSL cannot reproduce it.
-        for s in all.iter().filter(|s| !s.to_ascii_uppercase().trim_start().starts_with("INSERT")) {
-            sql_query(s.as_str()).execute(&mut conn).expect("setup");
-        }
-        sql_query(insert)
+        sql_query(&insert)
             .bind::<diesel::sql_types::Text, _>(UUID)
             .execute(&mut conn)
             .expect("INSERT must succeed");

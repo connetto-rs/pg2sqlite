@@ -8,17 +8,12 @@
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use rusqlite::Connection;
 
+use crate::support;
+
 /// Run `body` as a BEFORE INSERT trigger and return what it logged.
 fn logged(body: &str) -> Result<Option<String>, String> {
     let statements = Pg2Sqlite::default()
-        .sql(&format!(
-            "CREATE TABLE t (id INT PRIMARY KEY, val INT);
-             CREATE TABLE log (note TEXT);
-             CREATE FUNCTION f() RETURNS trigger AS $$
-             {body}
-             $$ LANGUAGE plpgsql;
-             CREATE TRIGGER go BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f();"
-        ))
+        .sql(&support::plpgsql::plpgsql_trigger_sql(body))
         .map_err(|error| error.to_string())?
         .translate_to_sql(&Pg2SqliteOptions::default())
         .map(pg2sqlite::script::Script::into_vec)

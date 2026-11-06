@@ -11,10 +11,31 @@
 
 use diesel::prelude::*;
 use pg2sqlite::prelude::Pg2SqliteOptions;
-use rusqlite::Connection as SqliteConn;
 use translate_helpers::translate_default_err as translate_err;
 
 use crate::{helpers, helpers::translate as translate_helpers};
+
+/// Applies every non-query statement of `stmts` on a fresh in-memory rusqlite
+/// connection and returns it. The query statements are left to `prepare`.
+///
+/// The statements are the translator's own output, which no typed query
+/// builder can express.
+///
+/// # Panics
+///
+/// Panics when the connection cannot be opened or a statement is rejected.
+fn apply_ddl_rusqlite(stmts: &[String]) -> rusqlite::Connection {
+    let connection = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+    let ddl = stmts
+        .iter()
+        .filter(|s| !s.to_ascii_uppercase().trim_start().starts_with("SELECT"))
+        .map(|s| format!("{s};"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    connection.execute_batch(&ddl).unwrap();
+    connection
+}
+
 diesel::table! {
     /// Test table for items (used in ROW_NUMBER and NTILE tests).
     /// Different tests create this table with different columns.
@@ -447,14 +468,7 @@ fn test_filter_clause_to_case() {
 
     // Value check: 3 rows, 2 active -> window reports active_count = 2 for
     // every row.
-    let conn = SqliteConn::open_in_memory().unwrap();
-    let ddl = translated
-        .iter()
-        .filter(|s| !s.to_ascii_uppercase().trim_start().starts_with("SELECT"))
-        .map(|s| format!("{s};"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    conn.execute_batch(&ddl).unwrap();
+    let conn = apply_ddl_rusqlite(&translated);
     conn.execute_batch(
         "INSERT INTO data (status, value) VALUES ('active', 1), ('active', 2), ('inactive', 3);",
     )
@@ -485,14 +499,7 @@ fn test_filter_clause_aggregate_to_case() {
     assert!(!lower.contains("case when"), "no CASE WHEN lowering expected: {select_stmt}");
 
     // Value check: 2 click events out of 3.
-    let conn = SqliteConn::open_in_memory().unwrap();
-    let ddl = translated
-        .iter()
-        .filter(|s| !s.to_ascii_uppercase().trim_start().starts_with("SELECT"))
-        .map(|s| format!("{s};"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    conn.execute_batch(&ddl).unwrap();
+    let conn = apply_ddl_rusqlite(&translated);
     conn.execute_batch("INSERT INTO events (event_type) VALUES ('click'), ('click'), ('view');")
         .unwrap();
     let mut stmt = conn.prepare(&select_stmt).unwrap();

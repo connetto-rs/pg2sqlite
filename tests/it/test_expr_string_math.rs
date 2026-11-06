@@ -5,7 +5,6 @@
 #![allow(clippy::float_cmp)]
 
 use diesel::prelude::*;
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
 use crate::helpers;
 
@@ -128,7 +127,6 @@ fn test_ceil_semantic() -> Result<(), Box<dyn std::error::Error>> {
         );
     ";
 
-    let options = Pg2SqliteOptions::default();
     let mut conn = helpers::apply_default(sql)?;
 
     diesel::insert_into(data::table)
@@ -139,12 +137,7 @@ fn test_ceil_semantic() -> Result<(), Box<dyn std::error::Error>> {
         .execute(&mut conn)?;
 
     let select_sql = "SELECT CEIL(num_val) as ceiled FROM data ORDER BY id";
-    let translated_select = Pg2Sqlite::default().sql(select_sql)?.translate(&options)?.into_vec();
-    let select_stmt = translated_select
-        .iter()
-        .find(|s| !s.to_string().starts_with("PRAGMA"))
-        .expect("SELECT stmt")
-        .to_string();
+    let select_stmt = helpers::translate::translate_default_first_query(select_sql);
 
     #[derive(QueryableByName, Debug)]
     struct CeilResult {
@@ -190,7 +183,6 @@ fn test_floor_semantic() -> Result<(), Box<dyn std::error::Error>> {
         );
     ";
 
-    let options = Pg2SqliteOptions::default();
     let mut conn = helpers::apply_default(sql)?;
 
     diesel::insert_into(data::table)
@@ -201,12 +193,7 @@ fn test_floor_semantic() -> Result<(), Box<dyn std::error::Error>> {
         .execute(&mut conn)?;
 
     let select_sql = "SELECT FLOOR(num_val) as floored FROM data ORDER BY id";
-    let translated_select = Pg2Sqlite::default().sql(select_sql)?.translate(&options)?.into_vec();
-    let select_stmt = translated_select
-        .iter()
-        .find(|s| !s.to_string().starts_with("PRAGMA"))
-        .expect("SELECT stmt")
-        .to_string();
+    let select_stmt = helpers::translate::translate_default_first_query(select_sql);
 
     #[derive(QueryableByName, Debug)]
     struct FloorResult {

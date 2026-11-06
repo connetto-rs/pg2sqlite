@@ -15,7 +15,7 @@
 
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
-use crate::helpers;
+use crate::{helpers, support};
 
 #[test]
 fn test_vector_type_to_blob() -> Result<(), Box<dyn std::error::Error>> {
@@ -63,14 +63,8 @@ fn test_l2_distance_operator() -> Result<(), Box<dyn std::error::Error>> {
         SELECT * FROM items ORDER BY embedding <-> '[1,2,3]';
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let translated = helpers::translate_default_statements(sql)?;
+    let select_stmt = helpers::user_statement_of(&translated, "SELECT");
 
     assert!(
         select_stmt.contains("vec_distance_L2"),
@@ -78,11 +72,7 @@ fn test_l2_distance_operator() -> Result<(), Box<dyn std::error::Error>> {
     );
     // Execute all emitted statements with sqlite-vec loaded so vec_distance_L2
     // is available at prepare time.
-    let conn = helpers::vec_connection();
-    for stmt in &translated {
-        conn.execute_batch(&format!("{stmt};"))
-            .unwrap_or_else(|e| panic!("SQLite rejected statement: {e}\n{stmt}"));
-    }
+    support::apply_vec_statements(&translated);
 
     Ok(())
 }
@@ -97,25 +87,15 @@ fn test_cosine_distance_operator() -> Result<(), Box<dyn std::error::Error>> {
         SELECT * FROM items ORDER BY embedding <=> '[1,2,3]';
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let translated = helpers::translate_default_statements(sql)?;
+    let select_stmt = helpers::user_statement_of(&translated, "SELECT");
 
     assert!(
         select_stmt.contains("vec_distance_cosine"),
         "<=> should translate to vec_distance_cosine(), got: {select_stmt}"
     );
     // Execute all emitted statements with sqlite-vec loaded.
-    let conn = helpers::vec_connection();
-    for stmt in &translated {
-        conn.execute_batch(&format!("{stmt};"))
-            .unwrap_or_else(|e| panic!("SQLite rejected statement: {e}\n{stmt}"));
-    }
+    support::apply_vec_statements(&translated);
 
     Ok(())
 }
@@ -131,14 +111,8 @@ fn test_vector_cast_to_vec_f32() -> Result<(), Box<dyn std::error::Error>> {
         SELECT * FROM items WHERE embedding <-> '[1,2,3]'::vector < 0.5;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let translated = helpers::translate_default_statements(sql)?;
+    let select_stmt = helpers::user_statement_of(&translated, "SELECT");
 
     assert!(
         select_stmt.contains("vec_f32"),
@@ -146,11 +120,7 @@ fn test_vector_cast_to_vec_f32() -> Result<(), Box<dyn std::error::Error>> {
     );
     // Execute all emitted statements with sqlite-vec loaded so vec_f32 is
     // available.
-    let conn = helpers::vec_connection();
-    for stmt in &translated {
-        conn.execute_batch(&format!("{stmt};"))
-            .unwrap_or_else(|e| panic!("SQLite rejected statement: {e}\n{stmt}"));
-    }
+    support::apply_vec_statements(&translated);
 
     Ok(())
 }
@@ -245,9 +215,8 @@ fn test_schema_qualified_vector_column_generates_vec0() -> Result<(), Box<dyn st
         );
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-    let translated_sql: Vec<_> = translated.iter().map(|s| s.to_string()).collect();
+    let translated = helpers::translate_default_statements(sql)?;
+    let translated_sql: Vec<_> = translated.clone();
 
     let has_vec0 =
         translated_sql.iter().any(|s| s.contains("CREATE VIRTUAL TABLE") && s.contains("vec0"));
@@ -257,13 +226,7 @@ fn test_schema_qualified_vector_column_generates_vec0() -> Result<(), Box<dyn st
     );
     // Execute non-vec0 statements; vec0 requires the sqlite-vec extension which
     // is unavailable in the test environment, so vec0 DDL is skipped.
-    let conn = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
-    for s in &translated_sql {
-        if !s.to_ascii_uppercase().contains("VEC0") {
-            conn.execute_batch(&format!("{s};"))
-                .unwrap_or_else(|e| panic!("SQLite rejected emitted SQL: {e}\n{s}"));
-        }
-    }
+    support::apply_statements_without_vec0(&translated);
 
     Ok(())
 }
@@ -279,10 +242,9 @@ fn test_multiple_vector_columns() -> Result<(), Box<dyn std::error::Error>> {
         );
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
+    let translated = helpers::translate_default_statements(sql)?;
 
-    let translated_sql: Vec<_> = translated.iter().map(|s| s.to_string()).collect();
+    let translated_sql: Vec<_> = translated.clone();
 
     // Check for two vec0 virtual tables
     let vec0_count = translated_sql
@@ -300,13 +262,7 @@ fn test_multiple_vector_columns() -> Result<(), Box<dyn std::error::Error>> {
     assert!(has_768, "Should have float[768] for content_embedding");
     // Execute non-vec0 statements; vec0 requires the sqlite-vec extension which
     // is unavailable in the test environment, so vec0 DDL is skipped.
-    let conn = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
-    for s in &translated_sql {
-        if !s.to_ascii_uppercase().contains("VEC0") {
-            conn.execute_batch(&format!("{s};"))
-                .unwrap_or_else(|e| panic!("SQLite rejected emitted SQL: {e}\n{s}"));
-        }
-    }
+    support::apply_statements_without_vec0(&translated);
 
     Ok(())
 }
@@ -349,14 +305,8 @@ fn test_distance_with_cast() -> Result<(), Box<dyn std::error::Error>> {
         ORDER BY embedding <-> '[1,2,3]'::vector;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let translated = helpers::translate_default_statements(sql)?;
+    let select_stmt = helpers::user_statement_of(&translated, "SELECT");
 
     // Should have vec_distance_L2 and vec_f32
     assert!(
@@ -365,11 +315,7 @@ fn test_distance_with_cast() -> Result<(), Box<dyn std::error::Error>> {
     );
     assert!(select_stmt.contains("vec_f32"), "Should contain vec_f32, got: {select_stmt}");
     // Execute all emitted statements with sqlite-vec loaded.
-    let conn = helpers::vec_connection();
-    for stmt in &translated {
-        conn.execute_batch(&format!("{stmt};"))
-            .unwrap_or_else(|e| panic!("SQLite rejected statement: {e}\n{stmt}"));
-    }
+    support::apply_vec_statements(&translated);
 
     Ok(())
 }
@@ -385,14 +331,8 @@ fn test_order_by_distance() -> Result<(), Box<dyn std::error::Error>> {
         SELECT * FROM items ORDER BY embedding <-> '[0.1,0.2,0.3]'::vector LIMIT 10;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let translated = helpers::translate_default_statements(sql)?;
+    let select_stmt = helpers::user_statement_of(&translated, "SELECT");
 
     assert!(select_stmt.contains("ORDER BY"), "Should contain ORDER BY, got: {select_stmt}");
     assert!(
@@ -401,11 +341,7 @@ fn test_order_by_distance() -> Result<(), Box<dyn std::error::Error>> {
     );
     assert!(select_stmt.contains("LIMIT 10"), "Should preserve LIMIT, got: {select_stmt}");
     // Execute all emitted statements with sqlite-vec loaded.
-    let conn = helpers::vec_connection();
-    for stmt in &translated {
-        conn.execute_batch(&format!("{stmt};"))
-            .unwrap_or_else(|e| panic!("SQLite rejected statement: {e}\n{stmt}"));
-    }
+    support::apply_vec_statements(&translated);
 
     Ok(())
 }
@@ -421,10 +357,7 @@ fn test_vector_translation_snapshot() -> Result<(), Box<dyn std::error::Error>> 
         );
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let translated_sql = translated.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    let translated_sql = helpers::translate_default_joined(sql)?;
     insta::assert_snapshot!("vector_table_translation", translated_sql);
 
     Ok(())
@@ -444,10 +377,7 @@ fn test_vector_query_snapshot() -> Result<(), Box<dyn std::error::Error>> {
         LIMIT 5;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let translated_sql = translated.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    let translated_sql = helpers::translate_default_joined(sql)?;
     insta::assert_snapshot!("vector_query_translation", translated_sql);
 
     Ok(())

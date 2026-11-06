@@ -7,16 +7,11 @@
 
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
+use crate::support;
+
 fn refuse(body: &str) -> String {
     Pg2Sqlite::default()
-        .sql(&format!(
-            "CREATE TABLE t (id INT PRIMARY KEY, val INT);
-             CREATE TABLE log (note TEXT);
-             CREATE FUNCTION f() RETURNS trigger AS $$
-             {body}
-             $$ LANGUAGE plpgsql;
-             CREATE TRIGGER go BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f();"
-        ))
+        .sql(&support::plpgsql::plpgsql_trigger_sql(body))
         .expect("parse")
         .translate(&Pg2SqliteOptions::default())
         .expect_err("SQLite has no exception handling")
@@ -69,14 +64,7 @@ fn the_word_exception_elsewhere_is_not_a_handler() {
          END;",
     ] {
         Pg2Sqlite::default()
-            .sql(&format!(
-                "CREATE TABLE t (id INT PRIMARY KEY, val INT);
-                 CREATE TABLE log (note TEXT);
-                 CREATE FUNCTION f() RETURNS trigger AS $$
-                 {body}
-                 $$ LANGUAGE plpgsql;
-                 CREATE TRIGGER go BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f();"
-            ))
+            .sql(&support::plpgsql::plpgsql_trigger_sql(body))
             .expect("parse")
             .translate(&Pg2SqliteOptions::default())
             .unwrap_or_else(|error| panic!("this is not a handler: {error}\n{body}"));

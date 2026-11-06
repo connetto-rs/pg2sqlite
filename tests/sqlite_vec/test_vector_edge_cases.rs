@@ -5,10 +5,8 @@
 //! dimensions, multiple vector columns, and vector with RLS.
 
 use helpers::translate_default_or_err as translate_err;
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use translate_helpers::translate_default as translate;
 
-use crate::{helpers, helpers::translate as translate_helpers};
+use crate::{helpers, support};
 
 #[test]
 fn vector_with_table_level_pk() {
@@ -21,20 +19,11 @@ fn vector_with_table_level_pk() {
             PRIMARY KEY (id)
         );
     ";
-    let output = translate(sql);
+    let statements = helpers::translate_default_statements(sql).unwrap();
+    let output = statements.join("\n");
     // Should produce vec0 virtual table with table-level PK
     assert!(output.contains("vec0") || output.contains("BLOB"), "Expected vec0 or BLOB: {output}");
-    let conn = helpers::vec_connection();
-    let stmts = Pg2Sqlite::default()
-        .sql(sql)
-        .unwrap()
-        .translate(&Pg2SqliteOptions::default())
-        .unwrap()
-        .into_vec();
-    for s in &stmts {
-        conn.execute_batch(&format!("{s};"))
-            .unwrap_or_else(|e| panic!("SQLite rejected: {s}\n{e}"));
-    }
+    support::apply_vec_statements(&statements);
 }
 
 #[test]
@@ -46,19 +35,10 @@ fn vector_with_column_level_pk() {
             embedding VECTOR(384)
         );
     ";
-    let output = translate(sql);
+    let statements = helpers::translate_default_statements(sql).unwrap();
+    let output = statements.join("\n");
     assert!(output.contains("vec0"), "Expected vec0 virtual table: {output}");
-    let conn = helpers::vec_connection();
-    let stmts = Pg2Sqlite::default()
-        .sql(sql)
-        .unwrap()
-        .translate(&Pg2SqliteOptions::default())
-        .unwrap()
-        .into_vec();
-    for s in &stmts {
-        conn.execute_batch(&format!("{s};"))
-            .unwrap_or_else(|e| panic!("SQLite rejected: {s}\n{e}"));
-    }
+    support::apply_vec_statements(&statements);
 }
 
 #[test]
@@ -71,20 +51,11 @@ fn multiple_vector_columns() {
             content_embedding VECTOR(768)
         );
     ";
-    let output = translate(sql);
+    let statements = helpers::translate_default_statements(sql).unwrap();
+    let output = statements.join("\n");
     // Should produce separate vec0 tables for each vector column
     assert!(output.contains("vec0"), "Expected vec0: {output}");
-    let conn = helpers::vec_connection();
-    let stmts = Pg2Sqlite::default()
-        .sql(sql)
-        .unwrap()
-        .translate(&Pg2SqliteOptions::default())
-        .unwrap()
-        .into_vec();
-    for s in &stmts {
-        conn.execute_batch(&format!("{s};"))
-            .unwrap_or_else(|e| panic!("SQLite rejected: {s}\n{e}"));
-    }
+    support::apply_vec_statements(&statements);
 }
 
 #[test]
@@ -96,20 +67,11 @@ fn vector_without_dimensions() {
             embedding VECTOR
         );
     ";
-    let output = translate(sql);
+    let statements = helpers::translate_default_statements(sql).unwrap();
+    let output = statements.join("\n");
     // VECTOR without dimensions should still translate
     assert!(output.contains("BLOB") || output.contains("vec0"), "Expected BLOB or vec0: {output}");
-    let conn = helpers::vec_connection();
-    let stmts = Pg2Sqlite::default()
-        .sql(sql)
-        .unwrap()
-        .translate(&Pg2SqliteOptions::default())
-        .unwrap()
-        .into_vec();
-    for s in &stmts {
-        conn.execute_batch(&format!("{s};"))
-            .unwrap_or_else(|e| panic!("SQLite rejected: {s}\n{e}"));
-    }
+    support::apply_vec_statements(&statements);
 }
 
 #[test]

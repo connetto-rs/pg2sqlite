@@ -7,6 +7,7 @@
 #[expect(dead_code, reason = "this binary uses part of the shared helpers")]
 mod helpers;
 
+mod support;
 mod test_bound_param_conversion;
 mod test_cast_operator;
 mod test_data_type_translation;

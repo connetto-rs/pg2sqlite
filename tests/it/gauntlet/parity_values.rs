@@ -176,18 +176,23 @@ fn pg_sql(conn: &mut PgConnection, sql: &str) -> Vec<Option<String>> {
         .collect()
 }
 
-// Translates pg_query (SCHEMA provides type context for column lookups), then
-// runs the last emitted statement on the SQLite connection.
-fn sq_sql_diesel(conn: &mut SqliteConnection, pg_query: &str) -> Vec<Option<String>> {
+/// Translates `SCHEMA` followed by `pg_query` and returns the last emitted
+/// statement, which carries the query under test.
+fn translate_last(pg_query: &str) -> String {
     let full = format!("{SCHEMA}\n{pg_query}");
-    let mut stmts = Pg2Sqlite::default()
+    let mut statements = Pg2Sqlite::default()
         .sql(&full)
         .expect("parse query")
         .translate_to_sql(&values_options())
         .expect("translate query")
         .into_vec();
-    let probe = stmts.pop().expect("translation produced at least one statement");
-    diesel::sql_query(probe.as_str())
+    statements.pop().expect("translation produced at least one statement")
+}
+
+// Runs the last emitted statement on the diesel SQLite connection.
+fn sq_sql_diesel(conn: &mut SqliteConnection, pg_query: &str) -> Vec<Option<String>> {
+    let probe = translate_last(pg_query);
+    diesel::sql_query(&probe)
         .load::<Val>(conn)
         .unwrap_or_else(|e| panic!("SQLite query failed: {e}\n{probe}"))
         .into_iter()
@@ -195,16 +200,10 @@ fn sq_sql_diesel(conn: &mut SqliteConnection, pg_query: &str) -> Vec<Option<Stri
         .collect()
 }
 
-// Translates and runs on a rusqlite Connection (for statistical aggregates).
+// Runs the last emitted statement on a rusqlite Connection (for
+// statistical aggregates).
 fn sq_sql_rusqlite(sq: &RusqliteConn, pg_query: &str) -> Vec<Option<String>> {
-    let full = format!("{SCHEMA}\n{pg_query}");
-    let mut stmts = Pg2Sqlite::default()
-        .sql(&full)
-        .expect("parse query")
-        .translate_to_sql(&values_options())
-        .expect("translate query")
-        .into_vec();
-    let probe = stmts.pop().expect("translation produced at least one statement");
+    let probe = translate_last(pg_query);
     let mut stmt =
         sq.prepare(&probe).unwrap_or_else(|e| panic!("SQLite prepare failed: {e}\n{probe}"));
     stmt.query_map([], |row| {

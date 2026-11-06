@@ -16,6 +16,7 @@ use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
 use pg2sqlite::prelude::Pg2Sqlite;
 use postgres_harness::Outcome;
 
+use super::harness::apply_with_seed;
 use crate::{
     helpers::postgres as postgres_harness,
     test_definer_helper_inlining::{R100, options},
@@ -623,30 +624,18 @@ fn sqlite_runner() -> SqliteRunner {
         answered.lock().expect("the caller lock").clone()
     })
     .expect("register app_user");
-    let (triggers, base): (Vec<_>, Vec<_>) =
-        translated.iter().map(ToString::to_string).partition(|s| s.starts_with("CREATE TRIGGER"));
-    // Translated DDL is runtime text no typed DSL carries. The triggers wait
-    // for the seed, which is the replica's counterpart of a bypassing load.
-    for statement in &base {
-        diesel::sql_query(statement)
-            .execute(&mut connection)
-            .unwrap_or_else(|error| panic!("{error}\n{statement}"));
-    }
-    seed!(
-        &mut connection,
-        organizations_rls,
-        teams_rls,
-        projects_rls,
-        orders_rls,
-        organization_grants_rls,
-        team_grants_rls,
-        project_grants_rls
-    );
-    for statement in &triggers {
-        diesel::sql_query(statement)
-            .execute(&mut connection)
-            .unwrap_or_else(|error| panic!("{error}\n{statement}"));
-    }
+    apply_with_seed(&mut connection, &translated, |connection| {
+        seed!(
+            connection,
+            organizations_rls,
+            teams_rls,
+            projects_rls,
+            orders_rls,
+            organization_grants_rls,
+            team_grants_rls,
+            project_grants_rls
+        );
+    });
     SqliteRunner { connection, caller }
 }
 

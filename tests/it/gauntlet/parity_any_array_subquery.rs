@@ -7,6 +7,7 @@ use std::cell::RefCell;
 use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
 
+use super::harness::apply_with_seed;
 use crate::helpers::{
     deployment::{caller, deployment},
     postgres as postgres_harness,
@@ -134,21 +135,9 @@ fn sqlite(policy: &str) -> SqliteConnection {
         .into_vec();
     let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
     app_owner_utils::register_impl(&mut connection, current_owner).expect("register app_owner");
-    let (triggers, base): (Vec<_>, Vec<_>) =
-        translated.iter().map(ToString::to_string).partition(|s| s.starts_with("CREATE TRIGGER"));
-    // Translated DDL is runtime text no typed DSL carries. The triggers wait
-    // for the seed, which is the replica's counterpart of a bypassing load.
-    for statement in &base {
-        diesel::sql_query(statement)
-            .execute(&mut connection)
-            .unwrap_or_else(|error| panic!("{error}\n{statement}"));
-    }
-    seed!(&mut connection, orders_rls);
-    for statement in &triggers {
-        diesel::sql_query(statement)
-            .execute(&mut connection)
-            .unwrap_or_else(|error| panic!("{error}\n{statement}"));
-    }
+    apply_with_seed(&mut connection, &translated, |connection| {
+        seed!(connection, orders_rls);
+    });
     connection
 }
 

@@ -7,6 +7,8 @@ use std::time::Instant;
 use diesel::prelude::*;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
+use crate::{helpers, support::fts5::DOCUMENTS_SQL};
+
 diesel::table! {
     /// Documents table for full-text search testing.
     documents (id) {
@@ -89,20 +91,7 @@ struct SearchResult {
 /// Snapshot test for GIN to FTS5 translation.
 #[test]
 fn test_gin_to_fts5_translation_snapshot() -> Result<(), Box<dyn std::error::Error>> {
-    let sql = "
-        CREATE TABLE documents (
-            id SERIAL PRIMARY KEY,
-            title TEXT NOT NULL,
-            body TEXT NOT NULL
-        );
-        CREATE INDEX idx_documents_search ON documents
-            USING GIN (to_tsvector('english', title || ' ' || body));
-    ";
-
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let translated_sql = translated.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    let translated_sql = helpers::translate_default_joined(DOCUMENTS_SQL)?;
 
     insta::assert_snapshot!("gin_to_fts5_translation", translated_sql);
 
@@ -134,26 +123,7 @@ fn a_conditional_fts_document_is_refused() {
 
 #[test]
 fn test_fts5_search_works() -> Result<(), Box<dyn std::error::Error>> {
-    let sql = "
-        CREATE TABLE documents (
-            id SERIAL PRIMARY KEY,
-            title TEXT NOT NULL,
-            body TEXT NOT NULL
-        );
-        CREATE INDEX idx_documents_search ON documents
-            USING GIN (to_tsvector('english', title || ' ' || body));
-    ";
-
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
-
-    // Execute translated statements
-    for stmt in &translated {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_default(DOCUMENTS_SQL)?;
 
     // Insert test documents - triggers should automatically update FTS5 index
     diesel::insert_into(documents::table)
@@ -211,26 +181,7 @@ fn test_fts5_search_works() -> Result<(), Box<dyn std::error::Error>> {
 /// the corpus is large enough for the difference to show.
 #[test]
 fn test_fts5_performance_improvement() -> Result<(), Box<dyn std::error::Error>> {
-    let sql = "
-        CREATE TABLE documents (
-            id SERIAL PRIMARY KEY,
-            title TEXT NOT NULL,
-            body TEXT NOT NULL
-        );
-        CREATE INDEX idx_documents_search ON documents
-            USING GIN (to_tsvector('english', title || ' ' || body));
-    ";
-
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
-
-    // Execute translated statements
-    for stmt in &translated {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_default(DOCUMENTS_SQL)?;
 
     // Insert many documents to make performance difference measurable
     let num_documents = 5000;
@@ -331,15 +282,7 @@ fn test_fts5_multi_column_search() -> Result<(), Box<dyn std::error::Error>> {
             USING GIN (to_tsvector('english', title || ' ' || summary || ' ' || content));
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
-
-    for stmt in &translated {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_default(sql)?;
 
     // Insert articles with search terms in different columns using Diesel ORM
     diesel::insert_into(articles::table)
@@ -402,25 +345,7 @@ fn test_fts5_multi_column_search() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn test_fts5_triggers_update_delete() -> Result<(), Box<dyn std::error::Error>> {
-    let sql = "
-        CREATE TABLE documents (
-            id SERIAL PRIMARY KEY,
-            title TEXT NOT NULL,
-            body TEXT NOT NULL
-        );
-        CREATE INDEX idx_documents_search ON documents
-            USING GIN (to_tsvector('english', title || ' ' || body));
-    ";
-
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
-
-    for stmt in &translated {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_default(DOCUMENTS_SQL)?;
 
     // Insert a document using Diesel ORM (use unique terms in body only, not in
     // title)
@@ -480,26 +405,13 @@ fn test_fts5_triggers_update_delete() -> Result<(), Box<dyn std::error::Error>> 
 }
 
 #[test]
-fn test_at_at_operator_translation() -> Result<(), Box<dyn std::error::Error>> {
-    let sql = "
-        CREATE TABLE documents (
-            id SERIAL PRIMARY KEY,
-            title TEXT NOT NULL,
-            body TEXT NOT NULL
-        );
-        CREATE INDEX idx_documents_search ON documents
-            USING GIN (to_tsvector('english', title || ' ' || body));
-        SELECT * FROM documents WHERE to_tsvector('english', title) @@ to_tsquery('rust');
-    ";
+fn test_at_at_operator_translation() {
+    let sql = format!(
+        "{DOCUMENTS_SQL}
+        SELECT * FROM documents WHERE to_tsvector('english', title) @@ to_tsquery('rust');"
+    );
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let translated_sql: Vec<_> = translated.iter().map(|s| s.to_string()).collect();
-    let select_stmt = translated_sql
-        .iter()
-        .find(|s| s.starts_with("SELECT"))
-        .expect("Should have a SELECT statement");
+    let select_stmt = helpers::translate::translate_default_first_query(&sql);
 
     assert!(
         select_stmt.contains("documents_fts"),
@@ -508,46 +420,22 @@ fn test_at_at_operator_translation() -> Result<(), Box<dyn std::error::Error>> {
     assert!(select_stmt.contains("MATCH"), "Should contain MATCH keyword, got: {select_stmt}");
     assert!(select_stmt.contains("IN"), "Should use IN subquery, got: {select_stmt}");
 
-    // Execute translated DDL/DQL to prove SQLite accepts it.
-    // Translated statements cannot be expressed via diesel's typed DSL.
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("in-memory connection");
-    for stmt in &translated {
-        diesel::sql_query(stmt.to_string())
-            .execute(&mut connection)
-            .unwrap_or_else(|e| panic!("translated statement must execute: {e}\n{stmt}"));
-    }
-
-    Ok(())
+    // Prove the emitted DDL and DQL run, which the typed DSL cannot express.
+    helpers::apply_default(&sql).expect("translated statement must execute");
 }
 
 #[test]
 fn test_at_at_operator_semantic() -> Result<(), Box<dyn std::error::Error>> {
     // Schema and query must be translated together so the schema context is
     // available
-    let sql = "
-        CREATE TABLE documents (
-            id SERIAL PRIMARY KEY,
-            title TEXT NOT NULL,
-            body TEXT NOT NULL
-        );
-        CREATE INDEX idx_documents_search ON documents
-            USING GIN (to_tsvector('english', title || ' ' || body));
-        SELECT * FROM documents WHERE to_tsvector('english', title) @@ to_tsquery('rust');
-    ";
+    let sql = format!(
+        "{DOCUMENTS_SQL}
+        SELECT * FROM documents WHERE to_tsvector('english', title) @@ to_tsquery('rust');"
+    );
 
     let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
-
-    // Execute DDL statements (everything except the SELECT)
-    let ddl_statements: Vec<_> =
-        translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))).collect();
-    for stmt in &ddl_statements {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let translated = helpers::translate_pg(&sql, &options).expect("parse and translate");
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert test documents using Diesel ORM
     diesel::insert_into(documents::table)
@@ -561,11 +449,7 @@ fn test_at_at_operator_semantic() -> Result<(), Box<dyn std::error::Error>> {
         .execute(&mut connection)?;
 
     // Get the SELECT statement
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement");
-    let translated_query = select_stmt.to_string();
+    let translated_query = helpers::user_statement_of(&translated, "SELECT").clone();
 
     // Verify the query uses FTS5 MATCH
     assert!(translated_query.contains("MATCH"), "Query should use MATCH: {translated_query}");
@@ -588,26 +472,13 @@ fn test_at_at_operator_semantic() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn test_prefix_matching_translation() -> Result<(), Box<dyn std::error::Error>> {
-    let sql = "
-        CREATE TABLE documents (
-            id SERIAL PRIMARY KEY,
-            title TEXT NOT NULL,
-            body TEXT NOT NULL
-        );
-        CREATE INDEX idx_documents_search ON documents
-            USING GIN (to_tsvector('english', title || ' ' || body));
-        SELECT * FROM documents WHERE to_tsvector('english', title) @@ to_tsquery('prog:*');
-    ";
+fn test_prefix_matching_translation() {
+    let sql = format!(
+        "{DOCUMENTS_SQL}
+        SELECT * FROM documents WHERE to_tsvector('english', title) @@ to_tsquery('prog:*');"
+    );
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let select_stmt = helpers::translate::translate_default_first_query(&sql);
 
     assert!(
         select_stmt.contains("prog*"),
@@ -618,42 +489,20 @@ fn test_prefix_matching_translation() -> Result<(), Box<dyn std::error::Error>> 
         "Should not contain PostgreSQL prefix syntax :*, got: {select_stmt}"
     );
 
-    // Execute translated DDL/DQL to prove SQLite accepts it.
-    // Translated statements cannot be expressed via diesel's typed DSL.
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("in-memory connection");
-    for stmt in &translated {
-        diesel::sql_query(stmt.to_string())
-            .execute(&mut connection)
-            .unwrap_or_else(|e| panic!("translated statement must execute: {e}\n{stmt}"));
-    }
-
-    Ok(())
+    // Prove the emitted DDL and DQL run, which the typed DSL cannot express.
+    helpers::apply_default(&sql).expect("translated statement must execute");
 }
 
 #[test]
 fn test_prefix_matching_semantic() -> Result<(), Box<dyn std::error::Error>> {
-    let sql = "
-        CREATE TABLE documents (
-            id SERIAL PRIMARY KEY,
-            title TEXT NOT NULL,
-            body TEXT NOT NULL
-        );
-        CREATE INDEX idx_documents_search ON documents
-            USING GIN (to_tsvector('english', title || ' ' || body));
-        SELECT * FROM documents WHERE to_tsvector('english', title) @@ to_tsquery('prog:*');
-    ";
+    let sql = format!(
+        "{DOCUMENTS_SQL}
+        SELECT * FROM documents WHERE to_tsvector('english', title) @@ to_tsquery('prog:*');"
+    );
 
     let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
-
-    // Execute DDL statements
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let translated = helpers::translate_pg(&sql, &options).expect("parse and translate");
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert test documents
     diesel::insert_into(documents::table)
@@ -665,11 +514,7 @@ fn test_prefix_matching_semantic() -> Result<(), Box<dyn std::error::Error>> {
         .execute(&mut connection)?;
 
     // Get and execute the SELECT statement with prefix search
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let select_stmt = helpers::user_statement_of(&translated, "SELECT").clone();
 
     let results = diesel::sql_query(&select_stmt).load::<SearchResult>(&mut connection)?;
 
@@ -680,32 +525,20 @@ fn test_prefix_matching_semantic() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn test_tsquery_operators_translation() -> Result<(), Box<dyn std::error::Error>> {
-    let options = Pg2SqliteOptions::default();
-
+fn test_tsquery_operators_translation() {
     // Test AND operator (&)
     let sql_and = "
         CREATE TABLE docs (id SERIAL PRIMARY KEY, body TEXT NOT NULL);
         CREATE INDEX idx ON docs USING GIN (to_tsvector('english', body));
         SELECT * FROM docs WHERE to_tsvector('english', body) @@ to_tsquery('rust & safety');
     ";
-    let translated_and = Pg2Sqlite::default().sql(sql_and)?.translate(&options)?.into_vec();
-    let select = translated_and
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .unwrap()
-        .to_string();
+    let select = helpers::translate::translate_default_first_query(sql_and);
     assert!(
         select.contains("rust safety") || select.contains("rust  safety"),
         "AND operator should translate to space, got: {select}"
     );
-    let mut conn_and =
-        diesel::SqliteConnection::establish(":memory:").expect("in-memory connection");
-    for stmt in &translated_and {
-        diesel::sql_query(stmt.to_string())
-            .execute(&mut conn_and)
-            .unwrap_or_else(|e| panic!("translated AND statement must execute: {e}\n{stmt}"));
-    }
+    // Prove the emitted DDL and DQL run, which the typed DSL cannot express.
+    helpers::apply_default(sql_and).expect("translated AND statement must execute");
 
     // Test OR operator (|)
     let sql_or = "
@@ -713,20 +546,10 @@ fn test_tsquery_operators_translation() -> Result<(), Box<dyn std::error::Error>
         CREATE INDEX idx2 ON docs2 USING GIN (to_tsvector('english', body));
         SELECT * FROM docs2 WHERE to_tsvector('english', body) @@ to_tsquery('rust | python');
     ";
-    let translated_or = Pg2Sqlite::default().sql(sql_or)?.translate(&options)?.into_vec();
-    let select = translated_or
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .unwrap()
-        .to_string();
+    let select = helpers::translate::translate_default_first_query(sql_or);
     assert!(select.contains("rust OR python"), "OR operator should translate to OR, got: {select}");
-    let mut conn_or =
-        diesel::SqliteConnection::establish(":memory:").expect("in-memory connection");
-    for stmt in &translated_or {
-        diesel::sql_query(stmt.to_string())
-            .execute(&mut conn_or)
-            .unwrap_or_else(|e| panic!("translated OR statement must execute: {e}\n{stmt}"));
-    }
+    // Prove the emitted DDL and DQL run, which the typed DSL cannot express.
+    helpers::apply_default(sql_or).expect("translated OR statement must execute");
 
     // Test NOT operator (!)
     let sql_not = "
@@ -734,22 +557,10 @@ fn test_tsquery_operators_translation() -> Result<(), Box<dyn std::error::Error>
         CREATE INDEX idx3 ON docs3 USING GIN (to_tsvector('english', body));
         SELECT * FROM docs3 WHERE to_tsvector('english', body) @@ to_tsquery('rust & !python');
     ";
-    let translated_not = Pg2Sqlite::default().sql(sql_not)?.translate(&options)?.into_vec();
-    let select = translated_not
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .unwrap()
-        .to_string();
+    let select = helpers::translate::translate_default_first_query(sql_not);
     assert!(select.contains("NOT python"), "NOT operator should translate to NOT, got: {select}");
-    let mut conn_not =
-        diesel::SqliteConnection::establish(":memory:").expect("in-memory connection");
-    for stmt in &translated_not {
-        diesel::sql_query(stmt.to_string())
-            .execute(&mut conn_not)
-            .unwrap_or_else(|e| panic!("translated NOT statement must execute: {e}\n{stmt}"));
-    }
-
-    Ok(())
+    // Prove the emitted DDL and DQL run, which the typed DSL cannot express.
+    helpers::apply_default(sql_not).expect("translated NOT statement must execute");
 }
 
 #[test]
@@ -835,12 +646,7 @@ fn test_fts5_with_custom_primary_key() -> Result<(), Box<dyn std::error::Error>>
     );
 
     // Test it works semantically
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
-
-    for stmt in &translated {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_default(sql)?;
 
     // Insert using Diesel ORM
     diesel::insert_into(posts::table)
@@ -868,7 +674,7 @@ fn test_fts5_with_custom_primary_key() -> Result<(), Box<dyn std::error::Error>>
 }
 
 #[test]
-fn test_at_at_operator_with_custom_primary_key() -> Result<(), Box<dyn std::error::Error>> {
+fn test_at_at_operator_with_custom_primary_key() {
     let sql = "
         CREATE TABLE posts (
             post_id SERIAL PRIMARY KEY,
@@ -878,31 +684,15 @@ fn test_at_at_operator_with_custom_primary_key() -> Result<(), Box<dyn std::erro
         SELECT * FROM posts WHERE to_tsvector('english', title) @@ to_tsquery('rust');
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let select_stmt = helpers::translate::translate_default_first_query(sql);
 
     assert!(
         select_stmt.contains("post_id IN"),
         "Should use post_id in subquery, got: {select_stmt}"
     );
 
-    // Execute translated DDL/DQL to prove SQLite accepts it.
-    // Translated statements cannot be expressed via diesel's typed DSL.
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("in-memory connection");
-    for stmt in &translated {
-        diesel::sql_query(stmt.to_string())
-            .execute(&mut connection)
-            .unwrap_or_else(|e| panic!("translated statement must execute: {e}\n{stmt}"));
-    }
-
-    Ok(())
+    // Prove the emitted DDL and DQL run, which the typed DSL cannot express.
+    helpers::apply_default(sql).expect("translated statement must execute");
 }
 
 /// FTS5 `content_rowid=` maps to the SQLite rowid, which must be an INTEGER.
@@ -950,14 +740,7 @@ fn fts5_with_integer_pk_succeeds() -> Result<(), Box<dyn std::error::Error>> {
         CREATE TABLE fts_int_pk (id INTEGER PRIMARY KEY, body TEXT);
         CREATE INDEX fts_int_pk_idx ON fts_int_pk USING GIN (to_tsvector('english', body));
     ";
-    let translated =
-        Pg2Sqlite::default().sql(sql)?.translate(&Pg2SqliteOptions::default())?.into_vec();
-
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
-    for stmt in &translated {
-        diesel::sql_query(stmt.to_string()).execute(&mut connection)?;
-    }
+    helpers::apply_default(sql)?;
     Ok(())
 }
 
@@ -1005,20 +788,8 @@ const PARTIAL_GIN_SQL: &str = "
 /// published row inserts and appears in the FTS index.
 #[test]
 fn partial_gin_trigger_published_insert_blocked_by_bare_column() {
-    let translated = Pg2Sqlite::default()
-        .sql(PARTIAL_GIN_SQL)
-        .expect("parse")
-        .translate(&Pg2SqliteOptions::default())
-        .expect("translate")
-        .into_vec();
-
-    let mut conn = diesel::SqliteConnection::establish(":memory:").expect("open db");
-    // Apply the full translated schema including the buggy triggers.
-    // diesel::sql_query is used here because the output includes CREATE TRIGGER
-    // and CREATE VIRTUAL TABLE statements the Diesel DSL cannot express.
-    for stmt in &translated {
-        diesel::sql_query(stmt.to_string()).execute(&mut conn).expect("apply schema");
-    }
+    // Applies the full translated schema including the buggy triggers.
+    let mut conn = helpers::apply_default(PARTIAL_GIN_SQL).expect("apply schema");
 
     let result = diesel::insert_into(filterable_posts::table)
         .values(&NewFilterablePost { id: 1, title: "rust programming guide", published: true })
@@ -1050,17 +821,7 @@ fn partial_gin_trigger_published_insert_blocked_by_bare_column() {
 /// the FTS index.
 #[test]
 fn partial_gin_trigger_unpublished_insert_blocked_by_bare_column() {
-    let translated = Pg2Sqlite::default()
-        .sql(PARTIAL_GIN_SQL)
-        .expect("parse")
-        .translate(&Pg2SqliteOptions::default())
-        .expect("translate")
-        .into_vec();
-
-    let mut conn = diesel::SqliteConnection::establish(":memory:").expect("open db");
-    for stmt in &translated {
-        diesel::sql_query(stmt.to_string()).execute(&mut conn).expect("apply schema");
-    }
+    let mut conn = helpers::apply_default(PARTIAL_GIN_SQL).expect("apply schema");
 
     let result = diesel::insert_into(filterable_posts::table)
         .values(&NewFilterablePost { id: 2, title: "draft content only", published: false })
@@ -1150,20 +911,9 @@ fn partial_gin_backfill_indexes_all_rows_ignoring_predicate() {
 /// for the UPDATE case.
 #[test]
 fn partial_gin_update_crossing_predicate_boundary_syncs_index() {
-    let translated = Pg2Sqlite::default()
-        .sql(PARTIAL_GIN_SQL)
-        .expect("parse")
-        .translate(&Pg2SqliteOptions::default())
-        .expect("translate")
-        .into_vec();
-
-    let mut conn = diesel::SqliteConnection::establish(":memory:").expect("open db");
-    // Apply the full translated schema (CREATE TABLE, FTS5 virtual table,
-    // triggers, backfill). diesel::sql_query is required because CREATE
-    // TRIGGER and CREATE VIRTUAL TABLE are not expressible via the typed DSL.
-    for stmt in &translated {
-        diesel::sql_query(stmt.to_string()).execute(&mut conn).expect("apply schema");
-    }
+    // Applies the full translated schema (CREATE TABLE, FTS5 virtual table,
+    // triggers, backfill).
+    let mut conn = helpers::apply_default(PARTIAL_GIN_SQL).expect("apply schema");
 
     // Insert an unpublished post. The trigger WHEN clause is false, so the
     // row must not appear in the FTS index.

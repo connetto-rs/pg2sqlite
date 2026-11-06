@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use diesel::prelude::*;
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+use pg2sqlite::prelude::Pg2SqliteOptions;
 
 mod schema {
     diesel::table! {
@@ -41,23 +41,10 @@ struct NewEvent {
 }
 
 fn translate_and_setup() -> Result<diesel::SqliteConnection, Box<dyn std::error::Error>> {
-    let sql = include_str!("../fixtures/trigger_elsif_else.sql");
-
-    let options = Pg2SqliteOptions::default();
-
-    let translated_migrations = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
-
-    diesel::sql_query("PRAGMA foreign_keys = ON").execute(&mut connection)?;
-
-    for translated_migration in &translated_migrations {
-        let sql_stmt = translated_migration.to_string();
-        diesel::sql_query(&sql_stmt).execute(&mut connection)?;
-    }
-
-    Ok(connection)
+    crate::support::fixtures::apply_fixture(
+        include_str!("../fixtures/trigger_elsif_else.sql"),
+        &Pg2SqliteOptions::default(),
+    )
 }
 
 /// Snapshot test for ELSIF/ELSE translation.
@@ -65,12 +52,7 @@ fn translate_and_setup() -> Result<diesel::SqliteConnection, Box<dyn std::error:
 fn test_elsif_else_translation_snapshot() -> Result<(), Box<dyn std::error::Error>> {
     let sql = include_str!("../fixtures/trigger_elsif_else.sql");
 
-    let options = Pg2SqliteOptions::default();
-
-    let translated_migrations = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let translated_sql =
-        translated_migrations.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    let translated_sql = crate::helpers::translate_default_joined(sql)?;
     insta::assert_snapshot!("trigger_elsif_else_translation", translated_sql);
 
     Ok(())
