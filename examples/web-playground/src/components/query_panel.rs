@@ -5,7 +5,7 @@
 use dioxus::prelude::*;
 use dioxus_free_icons::{
     Icon,
-    icons::fa_solid_icons::{FaBan, FaCircleCheck, FaPlay, FaTerminal, FaTriangleExclamation},
+    icons::fa_solid_icons::{FaPlay, FaTerminal, FaTriangleExclamation},
 };
 
 use crate::{
@@ -13,9 +13,10 @@ use crate::{
         editor::{SqlEditor, SqlViewer},
         map::{Map, extract_lonlat},
         results_table::ResultsTable,
+        sample_chip::SampleQueryChip,
     },
     runner::{self, QueryOutcome},
-    samples::{SampleQueryKind, find_sample_by_sql},
+    samples::find_sample_by_sql,
     state::{AppState, QueryDialect, QueryDisplay},
     translator,
 };
@@ -188,48 +189,15 @@ fn SampleQueriesStrip() -> Element {
                     SampleQueryChip {
                         label: query.label,
                         sql: query.sql,
-                        dialect: query.dialect,
                         kind: query.kind,
+                        on_click: move |_| {
+                            state.query_dialect.clone().set(query.dialect);
+                            state.query_input.clone().set(query.sql.to_string());
+                            run_query(state);
+                        },
                     }
                 }
             }
-        }
-    }
-}
-
-#[component]
-fn SampleQueryChip(
-    label: &'static str,
-    sql: &'static str,
-    dialect: QueryDialect,
-    kind: SampleQueryKind,
-) -> Element {
-    let state: AppState = use_context();
-    let class = match kind {
-        SampleQueryKind::Positive => "sample-query-chip",
-        SampleQueryKind::Negative => "sample-query-chip negative",
-    };
-    let on_click = move |_| {
-        state.query_dialect.clone().set(dialect);
-        state.query_input.clone().set(sql.to_string());
-        run_query(state);
-    };
-
-    rsx! {
-        button {
-            r#type: "button",
-            class: class,
-            title: "{sql}",
-            onclick: on_click,
-            match kind {
-                SampleQueryKind::Positive => rsx! {
-                    Icon { width: 12, height: 12, icon: FaCircleCheck, class: "chip-icon".to_string() }
-                },
-                SampleQueryKind::Negative => rsx! {
-                    Icon { width: 12, height: 12, icon: FaBan, class: "chip-icon".to_string() }
-                },
-            }
-            "{label}"
         }
     }
 }
