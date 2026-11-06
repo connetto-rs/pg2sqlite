@@ -8,10 +8,10 @@ use sql_traits::{
 use sqlparser::{
     ast::{
         AccessExpr, Array, ArrayElemTypeDef, BinaryOperator, CaseWhen, CastKind, DataType,
-        DateTimeField, ExactNumberInfo, Expr, Function, FunctionArg, FunctionArgExpr,
-        FunctionArguments, Ident, InTarget, Interval, JsonKeyUniqueness, JsonPredicateType,
-        ObjectName, ObjectNamePart, Query, SelectItem, SetExpr, Subscript, TableAlias, TableFactor,
-        UnaryOperator, Value, ValueWithSpan, helpers::attached_token::AttachedToken,
+        DateTimeField, ExactNumberInfo, Expr, Function, FunctionArg, FunctionArgExpr, Ident,
+        InTarget, Interval, JsonKeyUniqueness, JsonPredicateType, ObjectName, ObjectNamePart,
+        Query, SelectItem, SetExpr, Subscript, TableAlias, TableFactor, UnaryOperator, Value,
+        ValueWithSpan, helpers::attached_token::AttachedToken,
     },
     tokenizer::Span,
 };
@@ -29,7 +29,8 @@ use crate::{
         },
         function_helpers::{
             array_constructor_subquery, integer_literal, integer_literal_value, number_literal,
-            simple_function_expr, single_quoted_literal, string_literal,
+            plain_catalog_function_args, simple_function_expr, single_quoted_literal,
+            string_literal,
         },
         idioms::{delimited_membership, single_character, wrap_with_lower},
         interval::{ClockShift, IntervalShift, interval_shift, interval_shift_scaled},
@@ -1520,27 +1521,13 @@ fn interval_quantifier_elements(
     quantifier_elements(inner).map(|elements| (elements, bare_literals))
 }
 
-/// The argument list of a plain `string_to_array(...)` call.
-///
-/// A call carrying a window, a filter, a modifier or an argument clause is
-/// not what a membership test over a session setting spells, so it is left to
-/// the refusal the bare function answers.
+/// The argument list of a plain `string_to_array(...)` call. A duplicate
+/// treatment is not what a membership test over a session setting spells, so
+/// it is left to the refusal the bare function answers.
 fn string_to_array_arguments(right: &Expr) -> Option<&[FunctionArg]> {
     let Expr::Function(function) = right else { return None };
-    let names_the_split = postgres_catalog_function_name(&function.name)
-        .is_some_and(|name| name == "string_to_array");
-    if !names_the_split
-        || function.uses_odbc_syntax
-        || !matches!(function.parameters, FunctionArguments::None)
-        || function.filter.is_some()
-        || function.null_treatment.is_some()
-        || function.over.is_some()
-        || !function.within_group.is_empty()
-    {
-        return None;
-    }
-    let FunctionArguments::List(arguments) = &function.args else { return None };
-    if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
+    let arguments = plain_catalog_function_args(function, "string_to_array")?;
+    if arguments.duplicate_treatment.is_some() {
         return None;
     }
     Some(&arguments.args)
@@ -1906,6 +1893,26 @@ enum Split<'e> {
     Text(char),
 }
 
+/// The elements a quantified comparison reads on its right side, or the
+/// refusal a right side that is a subquery or an array column answers, since
+/// the comparison runs on the comparison key and the values keep their
+/// stored text.
+fn interval_quantifier_elements_or_refusal<'e>(
+    right: &'e Expr,
+    operators: &str,
+    container: &str,
+) -> Result<(&'e [Expr], crate::impls::interval::keys::BareLiterals), crate::errors::Error> {
+    let Some((elements, bare_literals)) = interval_quantifier_elements(right) else {
+        return Err(crate::errors::Error::forward_refusal(format!(
+            "{operators} over an interval with a subquery or an array column cannot be \
+             translated: the comparison runs on the comparison key, and the right side's \
+             values keep the stored text. Compare the columns against each other, or list the \
+             values {container}."
+        )));
+    };
+    Ok((elements, bare_literals))
+}
+
 /// `= ANY` or `<> ALL` with an interval left side: the array literal's
 /// elements are keyed, a cast to an interval array is peeled and its
 /// elements typed by it, and PostgreSQL's refusal is answered for the
@@ -1925,15 +1932,8 @@ fn interval_any_all(
 ) -> Result<Expr, crate::errors::Error> {
     use crate::impls::interval::keys;
     let operator = if negated { "<>" } else { "=" };
-    let Some((elements, bare_literals)) = interval_quantifier_elements(right) else {
-        return Err(crate::errors::Error::forward_refusal(
-            "= ANY and <> ALL over an interval with a subquery or an array column cannot be \
-             translated: the comparison runs on the comparison key, and the right side's \
-             values keep the stored text. Compare the columns against each other, or list the \
-             values in an IN list."
-                .to_string(),
-        ));
-    };
+    let (elements, bare_literals) =
+        interval_quantifier_elements_or_refusal(right, "= ANY and <> ALL", "in an IN list")?;
     let operand_key =
         keys::operand_key(left, operator, left, bare_literals, schema, options, emit)?;
     let key = |element: &Expr| {
@@ -1970,14 +1970,11 @@ fn interval_ordered_any_all(
     use crate::impls::interval::keys;
     let operator =
         comparison_operator_display(op).expect("the caller settles the operator to a comparison");
-    let Some((elements, bare_literals)) = interval_quantifier_elements(right) else {
-        return Err(crate::errors::Error::forward_refusal(format!(
-            "{operator} ANY and {operator} ALL over an interval with a subquery or an array \
-             column cannot be translated: the comparison runs on the comparison key, and the \
-             right side's values keep the stored text. Compare the columns against each other, \
-             or list the values in an array."
-        )));
-    };
+    let (elements, bare_literals) = interval_quantifier_elements_or_refusal(
+        right,
+        &format!("{operator} ANY and {operator} ALL"),
+        "in an array",
+    )?;
     let (fold_op, empty_value) = match quantifier {
         Quantifier::Any => (BinaryOperator::Or, false),
         Quantifier::All => (BinaryOperator::And, true),
@@ -2364,18 +2361,22 @@ fn translate_numeric_arithmetic(
                 right: Box::new(translated(right)?),
             }
         }
-        BinaryOperator::Divide => {
-            return Err(crate::errors::Error::forward_refusal(format!(
-                "dividing NUMERIC values has no faithful SQLite form: PostgreSQL chooses the \
-                     result scale from both operand precisions, answering `{left} / {right}` at a \
-                     scale neither operand has, and SQLite's integer division truncates toward zero \
-                     on top of that. Write the scale you want, as CAST({left} AS NUMERIC(18,6)) / \
-                     ..., or do the division in the application."
-            )));
-        }
+        BinaryOperator::Divide => return Err(numeric_division_refusal(left, right)),
         _ => return Ok(None),
     };
     Ok(Some(combined))
+}
+
+/// The refusal a NUMERIC division answers, which PostgreSQL scales from both
+/// operand precisions and SQLite can only truncate.
+fn numeric_division_refusal(left: &Expr, right: &Expr) -> crate::errors::Error {
+    crate::errors::Error::forward_refusal(format!(
+        "dividing NUMERIC values has no faithful SQLite form: PostgreSQL chooses the \
+             result scale from both operand precisions, answering `{left} / {right}` at a \
+             scale neither operand has, and SQLite's integer division truncates toward zero \
+             on top of that. Write the scale you want, as CAST({left} AS NUMERIC(18,6)) / \
+             ..., or do the division in the application."
+    ))
 }
 
 /// The declared precision of a NUMERIC expression, when it has one.
@@ -3087,13 +3088,7 @@ fn translate_binary_op(
         if *op == BinaryOperator::Divide
             && (scales.0.is_some_and(|s| s > 0) || scales.1.is_some_and(|s| s > 0))
         {
-            return Err(crate::errors::Error::forward_refusal(format!(
-                "dividing NUMERIC values has no faithful SQLite form: PostgreSQL chooses the \
-                 result scale from both operand precisions, answering `{left} / {right}` at a \
-                 scale neither operand has, and SQLite's integer division truncates toward zero \
-                 on top of that. Write the scale you want, as CAST({left} AS NUMERIC(18,6)) / \
-                 ..., or do the division in the application."
-            )));
+            return Err(numeric_division_refusal(left, right));
         }
 
         // Multiplication is excluded: PostgreSQL gives a product the sum of
@@ -4887,33 +4882,24 @@ fn scale_call_arguments(
     if !crate::impls::shared_helpers::is_scale_preserving_call(&function) {
         return Ok(Expr::Function(function));
     }
-    if let FunctionArguments::List(list) = &mut function.args {
-        for argument in &mut list.args {
-            let (FunctionArg::Named { arg, .. }
-            | FunctionArg::ExprNamed { arg, .. }
-            | FunctionArg::Unnamed(arg)) = argument;
-            let FunctionArgExpr::Expr(expr) = arg else { continue };
-
-            if let Some(scaled) = scale_decimal_literal(expr, scale)? {
-                *expr = scaled;
-                continue;
-            }
-            // Bound parameter: wrap with CAST(ROUND(…) AS INTEGER).
-            if is_bound_parameter(expr) {
-                let taken = core::mem::replace(expr, Expr::Wildcard(AttachedToken::empty()));
-                *expr = scale_parameter(taken, scale);
-                continue;
-            }
-            let taken = core::mem::replace(expr, Expr::Wildcard(AttachedToken::empty()));
-            *expr = match numeric_scale(&taken, schema, options)? {
-                Some(held) if held < scale => rescale_minor_units(taken, held, scale),
-                _ if matches!(taken, Expr::Function(_)) => {
-                    scale_call_arguments(taken, scale, schema, options)?
-                }
-                _ => taken,
-            };
+    crate::impls::shared_helpers::visit_scale_arguments(&mut function, &mut |expr| {
+        if let Some(scaled) = scale_decimal_literal(expr, scale)? {
+            *expr = scaled;
+            return Ok(());
         }
-    }
+        // Bound parameter: wrap with CAST(ROUND(…) AS INTEGER).
+        if is_bound_parameter(expr) {
+            let taken = core::mem::replace(expr, Expr::Wildcard(AttachedToken::empty()));
+            *expr = scale_parameter(taken, scale);
+            return Ok(());
+        }
+        let taken = core::mem::replace(expr, Expr::Wildcard(AttachedToken::empty()));
+        *expr = match numeric_scale(&taken, schema, options)? {
+            Some(held) if held < scale => rescale_minor_units(taken, held, scale),
+            _ => taken,
+        };
+        Ok(())
+    })?;
     Ok(Expr::Function(function))
 }
 

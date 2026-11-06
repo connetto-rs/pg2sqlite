@@ -1094,6 +1094,23 @@ pub(crate) fn concat(left: Expr, right: Expr) -> Expr {
     }
 }
 
+/// The NULL-ignoring extremum over `arguments`, one `coalesce` rotation per
+/// argument, so a slot is NULL only when every argument is.
+#[must_use]
+pub(crate) fn null_ignoring_extremum(arguments: &[Expr], greatest: bool) -> Expr {
+    crate::impls::function_helpers::simple_function_expr(
+        if greatest { "MAX" } else { "MIN" },
+        (0..arguments.len())
+            .map(|start| {
+                let rotated =
+                    arguments.iter().cycle().skip(start).take(arguments.len()).cloned().collect();
+                crate::impls::function_helpers::simple_function_expr("coalesce", rotated, None)
+            })
+            .collect(),
+        None,
+    )
+}
+
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use sqlparser::ast::{Expr, Ident, Value, ValueWithSpan};

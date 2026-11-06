@@ -273,7 +273,27 @@ fn disambiguate_upsert_source(insert: &mut Insert) {
     }));
 }
 
-/// Resolves `ON CONFLICT ON CONSTRAINT <name>` to the column list SQLite needs.
+/// Resolves a conflict target to the form SQLite spells it, routing the
+/// named form and the predicate form to their own lookups.
+fn resolve_conflict_target(
+    conflict_target: Option<&sqlparser::ast::ConflictTarget>,
+    table: &TableObject,
+    target: &mut ResolvedInsertTarget<'_>,
+    schema: &ParserDB,
+) -> Result<Option<sqlparser::ast::ConflictTarget>, crate::errors::Error> {
+    match conflict_target {
+        Some(sqlparser::ast::ConflictTarget::OnConstraint(constraint)) => {
+            resolve_on_constraint(constraint, table, target, schema)
+        }
+        Some(sqlparser::ast::ConflictTarget::Columns { columns, predicate: Some(predicate) }) => {
+            resolve_arbiter_predicate(columns, predicate, table, target, schema)
+        }
+        other => Ok(other.cloned()),
+    }
+}
+
+/// Resolves `ON CONFLICT ON CONSTRAINT <name>` to the column list SQLite
+/// needs.
 ///
 /// SQLite's conflict target is a column list, so the named form has to be
 /// looked up rather than passed through, which emitted `near "ON": syntax
@@ -283,16 +303,12 @@ fn disambiguate_upsert_source(insert: &mut Insert) {
 ///
 /// A constraint that cannot be resolved is an error, because guessing a
 /// different target would silently upsert on the wrong conflict.
-fn resolve_conflict_target(
-    conflict_target: Option<&sqlparser::ast::ConflictTarget>,
+fn resolve_on_constraint(
+    constraint: &sqlparser::ast::ObjectName,
     table: &TableObject,
     target: &mut ResolvedInsertTarget<'_>,
     schema: &ParserDB,
 ) -> Result<Option<sqlparser::ast::ConflictTarget>, crate::errors::Error> {
-    let Some(sqlparser::ast::ConflictTarget::OnConstraint(constraint)) = conflict_target else {
-        return resolve_arbiter_predicate(conflict_target, table, target, schema);
-    };
-
     let wanted = last_ident_value_or_display(constraint);
     let TableObject::TableName(table_name) = table else {
         return Err(unresolvable_constraint(&wanted, &table.to_string()));
@@ -377,16 +393,12 @@ fn rewrite_conflict_interval_columns(
 /// structurally. Implication is read as conjunct containment, so the emitted
 /// predicate is the index's own and SQLite picks the same index.
 fn resolve_arbiter_predicate(
-    conflict_target: Option<&sqlparser::ast::ConflictTarget>,
+    columns: &[sqlparser::ast::Ident],
+    predicate: &sqlparser::ast::Expr,
     table: &TableObject,
     target: &mut ResolvedInsertTarget<'_>,
     schema: &ParserDB,
 ) -> Result<Option<sqlparser::ast::ConflictTarget>, crate::errors::Error> {
-    let Some(sqlparser::ast::ConflictTarget::Columns { columns, predicate: Some(predicate) }) =
-        conflict_target
-    else {
-        return Ok(conflict_target.cloned());
-    };
     let unresolvable = || unresolvable_arbiter(columns, predicate, table);
     let resolved_table = target.required(unresolvable)?;
     let written = conjuncts(predicate);
@@ -405,7 +417,7 @@ fn resolve_arbiter_predicate(
     match (arbiters.next(), arbiters.next()) {
         (Some(index_predicate), None) => {
             Ok(Some(sqlparser::ast::ConflictTarget::Columns {
-                columns: columns.clone(),
+                columns: columns.to_vec(),
                 predicate: Some(index_predicate.clone()),
             }))
         }

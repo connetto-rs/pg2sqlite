@@ -937,6 +937,39 @@ pub(crate) fn is_scale_preserving_call(function: &Function) -> bool {
     })
 }
 
+/// Runs `rewrite` over the argument expressions of `function`'s argument
+/// list, following a nested scale-preserving call, which a `greatest`
+/// lowering leaves one level in.
+///
+/// # Errors
+///
+/// Propagates an error `rewrite` answers.
+#[cfg_attr(feature = "std", recursive::recursive)]
+pub(crate) fn visit_scale_arguments(
+    function: &mut Function,
+    rewrite: &mut dyn FnMut(&mut Expr) -> Result<(), Error>,
+) -> Result<(), Error> {
+    let FunctionArguments::List(list) = &mut function.args else {
+        return Ok(());
+    };
+    for argument in &mut list.args {
+        let (FunctionArg::Named { arg, .. }
+        | FunctionArg::ExprNamed { arg, .. }
+        | FunctionArg::Unnamed(arg)) = argument;
+        let FunctionArgExpr::Expr(expr) = arg else {
+            continue;
+        };
+        rewrite(expr)?;
+        let Expr::Function(nested) = expr else {
+            continue;
+        };
+        if is_scale_preserving_call(nested) {
+            visit_scale_arguments(nested, rewrite)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg_attr(feature = "std", recursive::recursive)]
 fn numeric_precision_and_scale_of(
     expr: &Expr,

@@ -4,9 +4,8 @@
 use sql_traits::structs::ParserDB;
 use sqlparser::{
     ast::{
-        BinaryOperator, CaseWhen, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
-        InTarget, ObjectName, ObjectNamePart, UnaryOperator, Value, ValueWithSpan,
-        helpers::attached_token::AttachedToken,
+        BinaryOperator, CaseWhen, Expr, Ident, InTarget, ObjectName, ObjectNamePart, UnaryOperator,
+        Value, ValueWithSpan, helpers::attached_token::AttachedToken,
     },
     tokenizer::Span,
 };
@@ -204,28 +203,17 @@ fn reverse_unscale_or_translate(
 
 /// Rescales integer literals inside an already-translated scale-preserving
 /// call.
-#[cfg_attr(feature = "std", recursive::recursive)]
 fn reverse_scale_call_arguments(call: Expr, scale: u32) -> Result<Expr, Error> {
     let Expr::Function(mut function) = call else { return Ok(call) };
     if !is_scale_preserving_call(&function) {
         return Ok(Expr::Function(function));
     }
-    if let FunctionArguments::List(list) = &mut function.args {
-        for argument in &mut list.args {
-            let (FunctionArg::Named { arg, .. }
-            | FunctionArg::ExprNamed { arg, .. }
-            | FunctionArg::Unnamed(arg)) = argument;
-            let FunctionArgExpr::Expr(expr) = arg else { continue };
-            if let Some(unscaled) = unscale_integer_literal(expr, scale) {
-                *expr = unscaled;
-                continue;
-            }
-            if matches!(expr, Expr::Function(_)) {
-                let taken = core::mem::replace(expr, Expr::Wildcard(AttachedToken::empty()));
-                *expr = reverse_scale_call_arguments(taken, scale)?;
-            }
+    crate::impls::shared_helpers::visit_scale_arguments(&mut function, &mut |expr| {
+        if let Some(unscaled) = unscale_integer_literal(expr, scale) {
+            *expr = unscaled;
         }
-    }
+        Ok(())
+    })?;
     Ok(Expr::Function(function))
 }
 

@@ -6,7 +6,7 @@ use sqlparser::{
     ast::{
         Assignment, AssignmentTarget, BinaryOperator, ConditionalStatements, CreateTrigger,
         DropTrigger, Expr, FromTable, Ident, ObjectName, ObjectNamePart, Query, SetExpr, Statement,
-        TableFactor, TableObject, TableWithJoins, TriggerEvent, TriggerExecBodyType, TriggerObject,
+        TableFactor, TableObject, TriggerEvent, TriggerExecBodyType, TriggerObject,
         TriggerObjectKind, TriggerPeriod, Update, Value, ValueWithSpan,
     },
     keywords::Keyword,
@@ -24,7 +24,7 @@ use crate::{
             resolve_translation_table, translation_table_has_rls,
             validate_schema_qualified_object_name_for_sqlite,
         },
-        query_builder::single_expr_query,
+        query_builder::{plain_table_with_joins, single_expr_query},
         shared_helpers::ColumnRewrites,
     },
     traits::{schema::Schema, translator::TranslatorWithContext},
@@ -113,22 +113,7 @@ fn generate_maintenance_trigger_body(
 
     let update_stmt = Statement::Update(Update {
         update_token: ast_builder::keyword_token("UPDATE", Keyword::UPDATE),
-        table: TableWithJoins {
-            relation: TableFactor::Table {
-                name: target_table_name.clone(),
-                alias: None,
-                args: None,
-                with_hints: vec![],
-                version: None,
-                partitions: vec![],
-                json_path: None,
-                sample: None,
-                index_directives: vec![],
-                inheritance: None,
-                with_ordinality: false,
-            },
-            joins: vec![],
-        },
+        table: plain_table_with_joins(target_table_name.clone()),
         assignments,
         from: None,
         selection: Some(Expr::BinaryOp {

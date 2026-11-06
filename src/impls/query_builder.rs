@@ -106,6 +106,12 @@ pub(crate) fn plain_table_factor(name: ObjectName) -> TableFactor {
     }
 }
 
+/// A single bare `FROM <name>` relation with no joins.
+#[must_use]
+pub(crate) fn plain_table_with_joins(name: ObjectName) -> TableWithJoins {
+    TableWithJoins { relation: plain_table_factor(name), joins: Vec::new() }
+}
+
 /// A table-valued function relation, `FROM <name>(<args>)`, as SQLite spells
 /// `json_each(x)`.
 #[must_use]

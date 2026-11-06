@@ -107,6 +107,21 @@ pub(crate) fn no_json_equivalent(construct: &str, hint: &str) -> Error {
     Error::forward_refusal(no_json_message(construct, hint))
 }
 
+/// The refusal a column argument answers, which PostgreSQL reads as an
+/// implicit LATERAL and SQLite has no equivalent for. `kept` says which
+/// column the alias cannot keep named.
+#[must_use]
+fn implicit_lateral_refusal(construct: &str, kept: &str) -> Error {
+    no_json_equivalent(
+        construct,
+        &format!(
+            "PostgreSQL reads it as an implicit LATERAL, which SQLite has no equivalent for, and \
+             SQLite accepts no column list on a table alias, so {kept}. Write `FROM t, \
+             json_each(t.col) AS e` and read `e.value`."
+        ),
+    )
+}
+
 /// True when a value of `data_type` lands as a BLOB on the replica.
 #[must_use]
 pub(crate) fn stored_as_blob(
@@ -918,11 +933,9 @@ pub(crate) fn translate_unnest_factor(
     // name cannot see a sibling FROM item, so the correlated form has no
     // translation that both runs and keeps the PostgreSQL column name.
     if references_a_column(array_expr) {
-        return Err(no_json_equivalent(
+        return Err(implicit_lateral_refusal(
             "UNNEST over a column reference",
-            "PostgreSQL reads it as an implicit LATERAL, which SQLite has no equivalent for, and \
-             SQLite accepts no column list on a table alias, so the element column cannot keep \
-             its PostgreSQL name. Write `FROM t, json_each(t.col) AS e` and read `e.value`.",
+            "the element column cannot keep its PostgreSQL name",
         ));
     }
 
@@ -1235,11 +1248,9 @@ pub(crate) fn translate_set_returning_factor(
     // item. Verified on SQLite: the correlated form runs as a bare
     // passthrough and answers `no such column` inside a derived table.
     if references_a_column(document) {
-        return Err(no_json_equivalent(
+        return Err(implicit_lateral_refusal(
             &format!("{name}() over a column reference"),
-            "PostgreSQL reads it as an implicit LATERAL, which SQLite has no equivalent for, and \
-             SQLite accepts no column list on a table alias, so the output columns cannot keep \
-             their PostgreSQL names. Write `FROM t, json_each(t.col) AS e` and read `e.value`.",
+            "the output columns cannot keep their PostgreSQL names",
         ));
     }
 

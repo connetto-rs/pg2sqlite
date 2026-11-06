@@ -5,14 +5,14 @@ use alloc::collections::BTreeSet;
 
 use sqlparser::ast::{
     ColumnOption, ColumnOptionDef, CreateTable, CreateTableOptions, HiveDistributionStyle,
-    OnCommit, PrimaryKeyConstraint, SqliteTableOption, SqliteTableOptions, TableConstraint,
-    WithData,
+    OnCommit, PrimaryKeyConstraint, SqliteTableOption, TableConstraint, WithData,
 };
 
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
 use crate::{
     impls::{
+        ast_builder::blank_create_table,
         object_name::normalize_schema_qualified_object_name_for_sqlite,
         translator_impls::column::{folded_primary_key, translate_column_def},
     },
@@ -59,14 +59,10 @@ impl crate::traits::translator::TranslatorWithContext for CreateTable {
         // A constraint check, a computed column and a default all name this
         // table's own columns, and there is no query around them, so the table
         // being defined is the scope every expression below resolves against.
-        let table_scope =
-            crate::impls::object_name::resolve_declared_table(schema, self)?.map(|table| {
-                sql_traits::structs::ColumnScope::for_table(
-                    table,
-                    schema,
-                    sql_traits::structs::IdentifierCase::AsWritten,
-                )
-            });
+        let table_scope = crate::options::table_column_scope(
+            crate::impls::object_name::resolve_declared_table(schema, self)?,
+            schema,
+        );
         let scoped = table_scope.as_ref().map(|scope| options.with_scope(scope));
         let options = scoped.as_ref().unwrap_or(options);
         // LIKE t is the most dangerous unsupported clause: SQLite would parse
@@ -214,96 +210,35 @@ impl crate::traits::translator::TranslatorWithContext for CreateTable {
             .any(|column| folded_primary_key(column, &table_primary_key).is_some());
 
         reject_case_colliding_columns(&self.columns)?;
-        // Every field is named so a field added upstream fails to compile here
-        // instead of leaking through a spread, the defect this rebuild fixes.
-        let mut created_table = Self {
-            // The table definition itself, translated.
-            name: normalize_schema_qualified_object_name_for_sqlite(schema, &self.name)?,
-            columns: self
-                .columns
-                .iter()
-                .map(|c| {
-                    translate_column_def(c, &self.name, &table_primary_key, schema, options, emit)
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            constraints: self
-                .constraints
-                .iter()
-                .filter(|c| !(folded_key && matches!(c, TableConstraint::PrimaryKey(_))))
-                .map(|c| c.translate_with_warnings(schema, options, emit))
-                .collect::<Result<Vec<Vec<TableConstraint>>, _>>()?
-                .into_iter()
-                .flatten()
-                .collect(),
-            query,
-            // SQLite STRICT mode enforces type checking (not valid on CTAS).
-            // The source carries no table options, refused above.
-            sqlite_table_options: SqliteTableOptions {
-                leading_comma: false,
-                options: if is_ctas { Vec::new() } else { vec![SqliteTableOption::Strict] },
-            },
-            // Legal in both databases and carried through unchanged.
-            temporary: self.temporary,
-            if_not_exists: self.if_not_exists,
-            // Cleared with a warning above when present.
-            unlogged: false,
-            global: None,
-            on_commit: None,
-            table_options: CreateTableOptions::None,
-            with_data: None,
-            // Refused by the checks above when present, so their defaults.
-            or_replace: false,
-            external: false,
-            dynamic: false,
-            transient: false,
-            volatile: false,
-            iceberg: false,
-            snapshot: false,
-            hive_distribution: HiveDistributionStyle::NONE,
-            hive_formats: None,
-            file_format: None,
-            location: None,
-            like: None,
-            clone: None,
-            version: None,
-            comment: None,
-            on_cluster: None,
-            primary_key: None,
-            order_by: None,
-            partition_by: None,
-            cluster_by: None,
-            clustered_by: None,
-            inherits: None,
-            partition_of: None,
-            for_values: None,
-            copy_grants: false,
-            enable_schema_evolution: None,
-            change_tracking: None,
-            data_retention_time_in_days: None,
-            max_data_extension_time_in_days: None,
-            default_ddl_collation: None,
-            with_aggregation_policy: None,
-            with_row_access_policy: None,
-            with_storage_lifecycle_policy: None,
-            with_tags: None,
-            external_volume: None,
-            with_connection: None,
-            base_location: None,
-            catalog: None,
-            catalog_sync: None,
-            storage_serialization_policy: None,
-            target_lag: None,
-            warehouse: None,
-            refresh_mode: None,
-            initialize: None,
-            require_user: false,
-            diststyle: None,
-            distkey: None,
-            sortkey: None,
-            backup: None,
-            multiset: None,
-            fallback: None,
-        };
+        // `blank_create_table` names every field, so a field added upstream
+        // fails to compile there, and every clause refused by the checks above
+        // keeps its blank default.
+        let mut created_table = blank_create_table(
+            normalize_schema_qualified_object_name_for_sqlite(schema, &self.name)?,
+        );
+        // The table definition itself, translated.
+        created_table.columns = self
+            .columns
+            .iter()
+            .map(|c| translate_column_def(c, &self.name, &table_primary_key, schema, options, emit))
+            .collect::<Result<Vec<_>, _>>()?;
+        created_table.constraints = self
+            .constraints
+            .iter()
+            .filter(|c| !(folded_key && matches!(c, TableConstraint::PrimaryKey(_))))
+            .map(|c| c.translate_with_warnings(schema, options, emit))
+            .collect::<Result<Vec<Vec<TableConstraint>>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+        created_table.query = query;
+        // SQLite STRICT mode enforces type checking (not valid on CTAS).
+        // The source carries no table options, refused above.
+        created_table.sqlite_table_options.options =
+            if is_ctas { Vec::new() } else { vec![SqliteTableOption::Strict] };
+        // Legal in both databases and carried through unchanged.
+        created_table.temporary = self.temporary;
+        created_table.if_not_exists = self.if_not_exists;
 
         let mut pk_column_names = BTreeSet::new();
 

@@ -33,9 +33,9 @@ use sqlparser::ast::{
     BeginTransactionKind, BinaryOperator, CascadeOption, ColumnDef, ColumnOption, CreateFunction,
     CreateView, Delete, DescribeAlias, DiscardObject, DropBehavior, ExceptionWhen, Expr, FromTable,
     Ident, Merge, ObjectName, ObjectNamePart, ObjectType, RenameTable, RenameTableNameKind, Set,
-    Statement, TableFactor, TableWithJoins, TransactionAccessMode, TransactionMode,
-    TransactionModifier, TriggerEvent, TriggerPeriod, Truncate, TruncateIdentityOption,
-    UnaryOperator, VacuumStatement, helpers::attached_token::AttachedToken,
+    Statement, TransactionAccessMode, TransactionMode, TransactionModifier, TriggerEvent,
+    TriggerPeriod, Truncate, TruncateIdentityOption, UnaryOperator, VacuumStatement,
+    helpers::attached_token::AttachedToken,
 };
 
 #[cfg(not(feature = "std"))]
@@ -51,6 +51,7 @@ use crate::{
             translation_table_has_rls,
         },
         placeholder::rewrite_placeholders_for_sqlite,
+        query_builder::plain_table_with_joins,
         translator_impls::{
             column::translate_column_def,
             condition_injection::inject_condition_into_dml_statement,
@@ -131,6 +132,12 @@ macro_rules! data_movement_patterns {
             | Statement::Remove { .. }
             | Statement::List { .. }
     };
+}
+
+/// Whether `statement` moves data into or out of the database.
+#[must_use]
+pub(crate) fn is_data_movement_statement(statement: &Statement) -> bool {
+    matches!(statement, data_movement_patterns!())
 }
 
 /// Procedural control flow and diagnostics. Each carries the script's own
@@ -771,13 +778,10 @@ fn translate_alter_table_operation(
             column_position,
         } => {
             reject_unsupported_added_column(column_def, alter_table.name.to_string().as_str())?;
-            let table_scope = resolve_translation_table(schema, &alter_table.name)?.map(|table| {
-                sql_traits::structs::ColumnScope::for_table(
-                    table,
-                    schema,
-                    sql_traits::structs::IdentifierCase::AsWritten,
-                )
-            });
+            let table_scope = crate::options::table_column_scope(
+                resolve_translation_table(schema, &alter_table.name)?,
+                schema,
+            );
             let scoped = table_scope.as_ref().map(|scope| options.with_scope(scope));
             let options = scoped.as_ref().unwrap_or(options);
             Ok(Some(AlterTableOperation::AddColumn {
@@ -953,22 +957,7 @@ fn translate_truncate(
         // exist and either spelling names just this table.
         let delete = Delete {
             tables: Vec::new(),
-            from: FromTable::WithFromKeyword(vec![TableWithJoins {
-                relation: TableFactor::Table {
-                    name,
-                    alias: None,
-                    args: None,
-                    with_hints: vec![],
-                    version: None,
-                    partitions: vec![],
-                    json_path: None,
-                    sample: None,
-                    index_directives: vec![],
-                    inheritance: None,
-                    with_ordinality: false,
-                },
-                joins: vec![],
-            }]),
+            from: FromTable::WithFromKeyword(vec![plain_table_with_joins(name)]),
             using: None,
             selection: None,
             returning: None,

@@ -244,15 +244,7 @@ fn null_ignoring_extremum(
         return Ok(first.clone());
     }
 
-    let rotations = (0..arguments.len())
-        .map(|start| {
-            let rotated =
-                arguments.iter().cycle().skip(start).take(arguments.len()).cloned().collect();
-            simple_function_expr("coalesce", rotated, None)
-        })
-        .collect();
-
-    Ok(simple_function_expr(if greatest { "MAX" } else { "MIN" }, rotations, None))
+    Ok(crate::impls::expr_helpers::null_ignoring_extremum(arguments, greatest))
 }
 
 /// Refuses an `OVER` clause on a function that is neither a window function
@@ -271,6 +263,61 @@ fn reject_over_on_scalar(func: &Function) -> Result<(), crate::errors::Error> {
         )));
     }
     Ok(())
+}
+
+/// Rebuilds `func` as a call to `name` with the given `args`, translating the
+/// parameters and `OVER` clause and carrying the rest over from `func`.
+///
+/// # Errors
+///
+/// Propagates the error an argument, parameter or window translation answers.
+fn rebuilt_function(
+    name: ObjectName,
+    func: Function,
+    args: FunctionArguments,
+    filter: Option<Box<Expr>>,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Expr, crate::errors::Error> {
+    Ok(Expr::Function(Function {
+        name,
+        parameters: translate_function_arguments::<Forward>(
+            &func.parameters,
+            schema,
+            options,
+            emit,
+        )?,
+        args,
+        over: translate_window_type(func.over.as_ref(), schema, options, emit)?,
+        filter,
+        ..func
+    }))
+}
+
+/// The literal field argument of a two-argument temporal call, lowercased,
+/// alongside the second argument left for translation.
+///
+/// # Errors
+///
+/// Propagates the arity refusal, and the refusal a field argument that is not
+/// a string literal answers.
+fn literal_field_argument(
+    args: &FunctionArguments,
+    function_name: &str,
+    example: &str,
+) -> Result<(String, Expr), crate::errors::Error> {
+    let exprs = extract_exactly(args, 2, function_name)?;
+    let field_str = match exprs[0] {
+        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => s.to_lowercase(),
+        _ => {
+            return Err(crate::errors::Error::forward_refusal(format!(
+                "{function_name}: the field argument must be a string literal \
+                 (e.g., {function_name}({example}, timestamp))"
+            )));
+        }
+    };
+    Ok((field_str, exprs[1].clone()))
 }
 
 /// Builds PostgreSQL's `trunc(x, n)`, which truncates toward zero, out of
@@ -1784,24 +1831,17 @@ impl crate::traits::translator::TranslatorWithContext for Function {
 
         match translate_function(&func.name, &func.args, options) {
             FunctionTranslation::Rename(new_name) => {
-                let translated_args =
+                let args =
                     translate_function_arguments::<Forward>(&func.args, schema, options, emit)?;
-                let translated_params = translate_function_arguments::<Forward>(
-                    &func.parameters,
+                rebuilt_function(
+                    ObjectName::from(vec![Ident::new(new_name)]),
+                    func,
+                    args,
+                    None,
                     schema,
                     options,
                     emit,
-                )?;
-                let translated_over =
-                    translate_window_type(func.over.as_ref(), schema, options, emit)?;
-                Ok(Expr::Function(Function {
-                    name: ObjectName::from(vec![Ident::new(new_name)]),
-                    parameters: translated_params,
-                    args: translated_args,
-                    over: translated_over,
-                    filter: None,
-                    ..func
-                }))
+                )
             }
             FunctionTranslation::WithArgs { name, args } => {
                 reject_over_on_scalar(&func)?;
@@ -1848,23 +1888,8 @@ impl crate::traits::translator::TranslatorWithContext for Function {
             FunctionTranslation::DateTrunc => {
                 reject_over_on_scalar(&func)?;
                 // date_trunc(field, timestamp) -> strftime(format, timestamp)
-                let exprs = extract_exactly(&func.args, 2, "date_trunc")?;
-                let field_expr = exprs[0];
-                let ts_expr = exprs[1].clone();
-
-                let field_str = match field_expr {
-                    Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => {
-                        s.to_lowercase()
-                    }
-                    _ => {
-                        return Err(crate::errors::Error::forward_refusal(
-                            "date_trunc: the field argument must be a string literal \
-                                         (e.g., date_trunc('day', timestamp))"
-                                .to_string(),
-                        ));
-                    }
-                };
-
+                let (field_str, ts_expr) =
+                    literal_field_argument(&func.args, "date_trunc", "'day'")?;
                 let translated_ts = ts_expr.translate_with_warnings(schema, options, emit)?;
 
                 // The finer units are a format string that zeros the
@@ -1919,23 +1944,8 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                 // date_part('field', expr) -> CAST(strftime(format, expr) AS
                 // INTEGER/REAL)
                 reject_over_on_scalar(&func)?;
-                let exprs = extract_exactly(&func.args, 2, "date_part")?;
-                let field_expr = exprs[0];
-                let ts_expr = exprs[1].clone();
-
-                let field_str = match field_expr {
-                    Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => {
-                        s.to_lowercase()
-                    }
-                    _ => {
-                        return Err(crate::errors::Error::forward_refusal(
-                            "date_part: the field argument must be a string literal \
-                                         (e.g., date_part('year', timestamp))"
-                                .to_string(),
-                        ));
-                    }
-                };
-
+                let (field_str, ts_expr) =
+                    literal_field_argument(&func.args, "date_part", "'year'")?;
                 let key = parse_date_part_key(&field_str).ok_or_else(|| {
                     crate::errors::Error::forward_refusal(format!(
                         "date_part('{field_str}', ...) is not supported in SQLite. \
@@ -2422,19 +2432,16 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                     list.args.truncate(1);
                 }
 
-                Ok(Expr::Function(Function {
-                    name: ObjectName::from(vec![Ident::new("group_concat")]),
-                    parameters: translate_function_arguments::<Forward>(
-                        &func.parameters,
-                        schema,
-                        options,
-                        emit,
-                    )?,
+                let filter = func.filter.clone();
+                Ok(rebuilt_function(
+                    ObjectName::from(vec![Ident::new("group_concat")]),
+                    func,
                     args,
-                    over: translate_window_type(func.over.as_ref(), schema, options, emit)?,
-                    filter: func.filter.clone(),
-                    ..func
-                }))
+                    filter,
+                    schema,
+                    options,
+                    emit,
+                )?)
             }
             FunctionTranslation::CharLength { label } => {
                 let exprs = extract_exactly(&func.args, 1, label)?;
@@ -2502,19 +2509,16 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                 let mut args =
                     translate_function_arguments::<Forward>(&func.args, schema, options, emit)?;
                 replace_argument(&mut args, 0, element);
-                let aggregate = Expr::Function(Function {
-                    name: ObjectName::from(vec![Ident::new("json_group_array")]),
-                    parameters: translate_function_arguments::<Forward>(
-                        &func.parameters,
-                        schema,
-                        options,
-                        emit,
-                    )?,
+                let filter = func.filter.clone();
+                let aggregate = rebuilt_function(
+                    ObjectName::from(vec![Ident::new("json_group_array")]),
+                    func,
                     args,
-                    over: translate_window_type(func.over.as_ref(), schema, options, emit)?,
-                    filter: func.filter.clone(),
-                    ..func
-                });
+                    filter,
+                    schema,
+                    options,
+                    emit,
+                )?;
 
                 // PostgreSQL answers NULL over no rows where json_group_array
                 // answers an empty array. An aggregate over one row or more
@@ -2535,19 +2539,16 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                     translate_function_arguments::<Forward>(&func.args, schema, options, emit)?;
                 replace_argument(&mut args, 0, key);
                 replace_argument(&mut args, 1, value);
-                let aggregate = Expr::Function(Function {
-                    name: ObjectName::from(vec![Ident::new("json_group_object")]),
-                    parameters: translate_function_arguments::<Forward>(
-                        &func.parameters,
-                        schema,
-                        options,
-                        emit,
-                    )?,
+                let filter = func.filter.clone();
+                let aggregate = rebuilt_function(
+                    ObjectName::from(vec![Ident::new("json_group_object")]),
+                    func,
                     args,
-                    over: translate_window_type(func.over.as_ref(), schema, options, emit)?,
-                    filter: func.filter.clone(),
-                    ..func
-                });
+                    filter,
+                    schema,
+                    options,
+                    emit,
+                )?;
                 // PostgreSQL returns NULL over no rows; json_group_object
                 // returns '{}'. An aggregate over one or more
                 // rows always has at least one key, so '{}' can
@@ -2566,22 +2567,16 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                 )?;
                 let translated_args_list =
                     translate_function_arguments::<Forward>(&func.args, schema, options, emit)?;
-                let translated_params = translate_function_arguments::<Forward>(
-                    &func.parameters,
+                let filter = func.filter.clone();
+                let aggregate = rebuilt_function(
+                    ObjectName::from(vec![Ident::new("json_group_array")]),
+                    func,
+                    translated_args_list,
+                    filter,
                     schema,
                     options,
                     emit,
                 )?;
-                let translated_over =
-                    translate_window_type(func.over.as_ref(), schema, options, emit)?;
-                let aggregate = Expr::Function(Function {
-                    name: ObjectName::from(vec![Ident::new("json_group_array")]),
-                    parameters: translated_params,
-                    args: translated_args_list,
-                    over: translated_over,
-                    filter: func.filter.clone(),
-                    ..func
-                });
                 // PostgreSQL returns NULL over no rows; json_group_array
                 // returns '[]'. The reverse translator restores
                 // json_agg from this shape (indistinguishable
@@ -2656,20 +2651,17 @@ impl crate::traits::translator::TranslatorWithContext for Function {
             FunctionTranslation::PassThrough => {
                 let translated_args =
                     translate_function_arguments::<Forward>(&func.args, schema, options, emit)?;
-                let translated_params = translate_function_arguments::<Forward>(
-                    &func.parameters,
+                let mut func = func;
+                let filter = core::mem::take(&mut func.filter);
+                rebuilt_function(
+                    func.name.clone(),
+                    func,
+                    translated_args,
+                    filter,
                     schema,
                     options,
                     emit,
-                )?;
-                let translated_over =
-                    translate_window_type(func.over.as_ref(), schema, options, emit)?;
-                Ok(Expr::Function(Function {
-                    parameters: translated_params,
-                    args: translated_args,
-                    over: translated_over,
-                    ..func
-                }))
+                )
             }
         }
     }

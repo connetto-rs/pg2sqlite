@@ -2,8 +2,12 @@
 
 use alloc::borrow::Cow;
 
-use sql_traits::structs::{
-    ColumnDefinition, ColumnDefinitionScope, ColumnQueryScope, ColumnScope, Deployment, ParserDB,
+use sql_traits::{
+    structs::{
+        ColumnDefinition, ColumnDefinitionScope, ColumnQueryScope, ColumnScope, Deployment,
+        IdentifierCase, ParserDB,
+    },
+    traits::DatabaseLike,
 };
 use sqlparser::ast::{Expr, ObjectName};
 
@@ -735,6 +739,24 @@ impl core::ops::Deref for TranslationContext<'_> {
     fn deref(&self) -> &Self::Target {
         self.options.as_ref()
     }
+}
+
+/// The scope over one declared table's columns, `None` when the table does
+/// not resolve.
+#[must_use]
+pub(crate) fn table_column_scope<'db>(
+    table: Option<&'db <ParserDB as DatabaseLike>::Table>,
+    schema: &'db ParserDB,
+) -> Option<ColumnScope<'db, 'db, ParserDB>> {
+    table.map(|table| ColumnScope::for_table(table, schema, IdentifierCase::AsWritten))
+}
+
+/// The scope over the relations `query` reads.
+pub(crate) fn query_column_scope<'db>(
+    query: &'db sqlparser::ast::Query,
+    schema: &'db ParserDB,
+) -> Result<ColumnScope<'db, 'db, ParserDB>, sql_traits::errors::LookupError> {
+    ColumnScope::from_query(query, schema, IdentifierCase::AsWritten)
 }
 
 impl Pg2SqliteOptions {

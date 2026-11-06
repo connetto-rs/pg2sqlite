@@ -108,33 +108,20 @@ impl crate::traits::translator::TranslatorWithContext for Query {
         let pipe_operators =
             translate_pipe_operators(&query.pipe_operators, schema, options, emit)?;
 
-        if let Some(rewritten) = try_translate_distinct_on_query(
-            query,
+        let args = QueryRewriteArgs {
             schema,
             options,
-            with.clone(),
-            order_by.clone(),
-            limit_clause.clone(),
-            fetch.clone(),
-            settings.clone(),
-            pipe_operators.clone(),
-            emit,
-        )? {
+            with: with.clone(),
+            order_by: order_by.clone(),
+            limit_clause: limit_clause.clone(),
+            fetch: fetch.clone(),
+            settings: settings.clone(),
+            pipe_operators: pipe_operators.clone(),
+        };
+        if let Some(rewritten) = try_translate_distinct_on_query(query, &args, emit)? {
             return Ok(rewritten);
         }
-
-        if let Some(rewritten) = try_translate_grouping_query(
-            query,
-            schema,
-            options,
-            with.clone(),
-            order_by.clone(),
-            limit_clause.clone(),
-            fetch.clone(),
-            settings.clone(),
-            pipe_operators.clone(),
-            emit,
-        )? {
+        if let Some(rewritten) = try_translate_grouping_query(query, &args, emit)? {
             return Ok(rewritten);
         }
 
@@ -710,17 +697,43 @@ fn null_literal() -> Expr {
     Expr::Value(ValueWithSpan { value: Value::Null, span: sqlparser::tokenizer::Span::empty() })
 }
 
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-fn try_translate_distinct_on_query(
-    query: &Query,
-    schema: &ParserDB,
-    options: &crate::options::TranslationContext<'_>,
+/// The context and envelope fields the two `Query` rewrites share, so a call
+/// site names each field once.
+struct QueryRewriteArgs<'a> {
+    schema: &'a ParserDB,
+    options: &'a crate::options::TranslationContext<'a>,
     with: Option<sqlparser::ast::With>,
     order_by: Option<OrderBy>,
     limit_clause: Option<LimitClause>,
     fetch: Option<Fetch>,
     settings: Option<Vec<Setting>>,
     pipe_operators: Vec<PipeOperator>,
+}
+
+/// The envelope a rewritten `Query` carries, with the shared fields cloned
+/// out of `args`.
+fn rewritten_query(
+    query: &Query,
+    args: &QueryRewriteArgs,
+    body: SetExpr,
+    order_by: Option<OrderBy>,
+) -> Query {
+    build_query_envelope(
+        body,
+        args.with.clone(),
+        order_by,
+        args.limit_clause.clone(),
+        args.fetch.clone(),
+        args.settings.clone(),
+        query.format_clause.clone(),
+        args.pipe_operators.clone(),
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn try_translate_distinct_on_query(
+    query: &Query,
+    args: &QueryRewriteArgs,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Option<Query>, crate::errors::Error> {
     let SetExpr::Select(select) = query.body.as_ref() else {
@@ -738,7 +751,8 @@ fn try_translate_distinct_on_query(
 
     let mut inner_select = select.as_ref().clone();
     inner_select.distinct = None;
-    let mut translated_inner = inner_select.translate_with_warnings(schema, options, emit)?;
+    let mut translated_inner =
+        inner_select.translate_with_warnings(args.schema, args.options, emit)?;
 
     translated_inner.projection =
         ensure_distinct_on_projection_is_rewriteable(&translated_inner.projection)?;
@@ -746,7 +760,7 @@ fn try_translate_distinct_on_query(
 
     let partition_by = distinct_on_exprs
         .iter()
-        .map(|expr| expr.translate_with_warnings(schema, options, emit))
+        .map(|expr| expr.translate_with_warnings(args.schema, args.options, emit))
         .collect::<Result<Vec<_>, _>>()?;
 
     // Two separate corrections, because the two ORDER BY positions see
@@ -767,7 +781,7 @@ fn try_translate_distinct_on_query(
     // than a compromise, and it avoids projecting helper columns, which
     // would break the reverse direction: it rebuilds this
     // shape and compares it with what it parsed.
-    let window_order = match &order_by {
+    let window_order = match args.order_by.as_ref() {
         Some(ob) => {
             match &ob.kind {
                 OrderByKind::Expressions(exprs) => {
@@ -788,7 +802,7 @@ fn try_translate_distinct_on_query(
 
     // PostgreSQL rejects DISTINCT ON when the ORDER BY doesn't open with the
     // same expressions; refuse here so the error names the cause clearly.
-    if order_by.is_some() {
+    if args.order_by.is_some() {
         if window_order.len() < partition_by.len() {
             return Err(crate::errors::Error::forward_refusal(
                 "SELECT DISTINCT ON expressions must match initial ORDER BY expressions"
@@ -805,7 +819,8 @@ fn try_translate_distinct_on_query(
         }
     }
 
-    let outer_order_by = truncate_order_by_to_partition(order_by, distinct_on_exprs.len());
+    let outer_order_by =
+        truncate_order_by_to_partition(args.order_by.clone(), distinct_on_exprs.len());
     // Outer scope sees only the derived table's aliases; original names are not
     // in scope.
     let outer_order_by =
@@ -826,16 +841,7 @@ fn try_translate_distinct_on_query(
         });
     }
 
-    Ok(Some(build_query_envelope(
-        SetExpr::Select(Box::new(outer_select)),
-        with,
-        outer_order_by,
-        limit_clause,
-        fetch,
-        settings,
-        query.format_clause.clone(),
-        pipe_operators,
-    )))
+    Ok(Some(rewritten_query(query, args, SetExpr::Select(Box::new(outer_select)), outer_order_by)))
 }
 
 /// An `ORDER BY` operand with any output alias replaced by the expression the
@@ -1123,23 +1129,15 @@ fn union_all(set_exprs: Vec<SetExpr>) -> SetExpr {
     })
 }
 
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn try_translate_grouping_query(
     query: &Query,
-    schema: &ParserDB,
-    options: &crate::options::TranslationContext<'_>,
-    with: Option<sqlparser::ast::With>,
-    order_by: Option<OrderBy>,
-    limit_clause: Option<LimitClause>,
-    fetch: Option<Fetch>,
-    settings: Option<Vec<Setting>>,
-    pipe_operators: Vec<PipeOperator>,
+    args: &QueryRewriteArgs,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Option<Query>, crate::errors::Error> {
     let SetExpr::Select(select) = query.body.as_ref() else {
         return Ok(None);
     };
-
     let GroupByExpr::Expressions(group_exprs, modifiers) = &select.group_by else {
         if matches!(&select.group_by, GroupByExpr::All(mods) if !mods.is_empty()) {
             return Err(crate::errors::Error::forward_refusal(
@@ -1219,13 +1217,13 @@ fn try_translate_grouping_query(
 
     let mut base_select = select.as_ref().clone();
     base_select.group_by = GroupByExpr::Expressions(Vec::new(), Vec::new());
-    let translated_base = base_select.translate_with_warnings(schema, options, emit)?;
+    let translated_base = base_select.translate_with_warnings(args.schema, args.options, emit)?;
 
     let translated_sets = expanded_sets
         .iter()
         .map(|set| {
             set.iter()
-                .map(|expr| expr.translate_with_warnings(schema, options, emit))
+                .map(|expr| expr.translate_with_warnings(args.schema, args.options, emit))
                 .collect::<Result<Vec<_>, crate::errors::Error>>()
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1262,16 +1260,7 @@ fn try_translate_grouping_query(
         });
     }
 
-    Ok(Some(build_query_envelope(
-        union_all(branches),
-        with,
-        order_by,
-        limit_clause,
-        fetch,
-        settings,
-        query.format_clause.clone(),
-        pipe_operators,
-    )))
+    Ok(Some(rewritten_query(query, args, union_all(branches), args.order_by.clone())))
 }
 
 impl crate::traits::translator::TranslatorWithContext for SetExpr {
@@ -1415,10 +1404,10 @@ mod tests {
     };
 
     use super::{
-        AGGREGATE_NAMES, GroupingRewriteKind, ensure_distinct_on_projection_is_rewriteable,
-        expand_cube, is_aggregate_expression, projection_aliases,
-        rewrite_projection_for_grouping_set, translate_distinct, translate_fetch,
-        translate_limit_clause, translate_named_window, translate_order_by,
+        AGGREGATE_NAMES, GroupingRewriteKind, QueryRewriteArgs,
+        ensure_distinct_on_projection_is_rewriteable, expand_cube, is_aggregate_expression,
+        projection_aliases, rewrite_projection_for_grouping_set, translate_distinct,
+        translate_fetch, translate_limit_clause, translate_named_window, translate_order_by,
         try_translate_distinct_on_query, try_translate_grouping_query,
     };
     use crate::prelude::{Pg2SqliteOptions, Translator};
@@ -1628,19 +1617,17 @@ mod tests {
                 quantity: Some(sqlparser::ast::TopQuantity::Constant(1)),
             });
         }
-        let err = try_translate_distinct_on_query(
-            &distinct_query,
-            &schema,
-            &options,
-            distinct_query.with.clone(),
-            distinct_query.order_by.clone(),
-            distinct_query.limit_clause.clone(),
-            distinct_query.fetch.clone(),
-            distinct_query.settings.clone(),
-            distinct_query.pipe_operators.clone(),
-            &mut |_| {},
-        )
-        .unwrap_err();
+        let args = QueryRewriteArgs {
+            schema: &schema,
+            options: &options,
+            with: distinct_query.with.clone(),
+            order_by: distinct_query.order_by.clone(),
+            limit_clause: distinct_query.limit_clause.clone(),
+            fetch: distinct_query.fetch.clone(),
+            settings: distinct_query.settings.clone(),
+            pipe_operators: distinct_query.pipe_operators.clone(),
+        };
+        let err = try_translate_distinct_on_query(&distinct_query, &args, &mut |_| {}).unwrap_err();
         assert!(err.to_string().contains("TOP clauses"));
         additional_query_helpers_cover_grouping_error_paths();
     }
@@ -1651,19 +1638,18 @@ mod tests {
         if let SetExpr::Select(select) = group_all_mod_query.body.as_mut() {
             select.group_by = GroupByExpr::All(vec![sqlparser::ast::GroupByWithModifier::Rollup]);
         }
-        let err = try_translate_grouping_query(
-            &group_all_mod_query,
-            &schema,
-            &options,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
-            &mut |_| {},
-        )
-        .unwrap_err();
+        let args = QueryRewriteArgs {
+            schema: &schema,
+            options: &options,
+            with: None,
+            order_by: None,
+            limit_clause: None,
+            fetch: None,
+            settings: None,
+            pipe_operators: Vec::new(),
+        };
+        let err =
+            try_translate_grouping_query(&group_all_mod_query, &args, &mut |_| {}).unwrap_err();
         assert!(err.to_string().contains("GROUP BY ALL with modifiers"));
 
         let mut group_mod_query = parse_query("SELECT id FROM users GROUP BY id");
@@ -1673,19 +1659,7 @@ mod tests {
                 vec![sqlparser::ast::GroupByWithModifier::Rollup],
             );
         }
-        let err = try_translate_grouping_query(
-            &group_mod_query,
-            &schema,
-            &options,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
-            &mut |_| {},
-        )
-        .unwrap_err();
+        let err = try_translate_grouping_query(&group_mod_query, &args, &mut |_| {}).unwrap_err();
         assert!(err.to_string().contains("WITH ROLLUP/CUBE/GROUPING SETS"));
 
         let mut top_rollup = parse_query("SELECT id, SUM(v) FROM t GROUP BY ROLLUP(id)");
@@ -1696,19 +1670,7 @@ mod tests {
                 quantity: Some(sqlparser::ast::TopQuantity::Constant(1)),
             });
         }
-        let err = try_translate_grouping_query(
-            &top_rollup,
-            &schema,
-            &options,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
-            &mut |_| {},
-        )
-        .unwrap_err();
+        let err = try_translate_grouping_query(&top_rollup, &args, &mut |_| {}).unwrap_err();
         assert!(err.to_string().contains("TOP clauses"));
     }
 
@@ -1800,38 +1762,37 @@ mod tests {
         assert!(matches!(rewritten[0], SelectItem::ExprWithAlias { .. }));
 
         let distinct_no_order = parse_query("SELECT DISTINCT ON (id) id FROM users");
-        let rewritten = try_translate_distinct_on_query(
-            &distinct_no_order,
-            &schema,
-            &options,
-            distinct_no_order.with.clone(),
-            None,
-            None,
-            None,
-            distinct_no_order.settings.clone(),
-            distinct_no_order.pipe_operators.clone(),
-            &mut |_| {},
-        )
-        .unwrap();
+        let distinct_args = QueryRewriteArgs {
+            schema: &schema,
+            options: &options,
+            with: distinct_no_order.with.clone(),
+            order_by: None,
+            limit_clause: None,
+            fetch: None,
+            settings: distinct_no_order.settings.clone(),
+            pipe_operators: distinct_no_order.pipe_operators.clone(),
+        };
+        let rewritten =
+            try_translate_distinct_on_query(&distinct_no_order, &distinct_args, &mut |_| {})
+                .unwrap();
         assert!(rewritten.is_some());
 
         let mut group_by_all = parse_query("SELECT id FROM users");
         if let SetExpr::Select(select) = group_by_all.body.as_mut() {
             select.group_by = GroupByExpr::All(Vec::new());
         }
-        let result = try_translate_grouping_query(
-            &group_by_all,
-            &schema,
-            &options,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
-            &mut |_| {},
-        )
-        .unwrap();
+        let grouping_args = QueryRewriteArgs {
+            schema: &schema,
+            options: &options,
+            with: None,
+            order_by: None,
+            limit_clause: None,
+            fetch: None,
+            settings: None,
+            pipe_operators: Vec::new(),
+        };
+        let result =
+            try_translate_grouping_query(&group_by_all, &grouping_args, &mut |_| {}).unwrap();
         assert!(result.is_none());
 
         let mut group_with_totals = parse_query("SELECT id FROM users GROUP BY id");
@@ -1841,19 +1802,8 @@ mod tests {
                 vec![sqlparser::ast::GroupByWithModifier::Totals],
             );
         }
-        let result = try_translate_grouping_query(
-            &group_with_totals,
-            &schema,
-            &options,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
-            &mut |_| {},
-        )
-        .unwrap();
+        let result =
+            try_translate_grouping_query(&group_with_totals, &grouping_args, &mut |_| {}).unwrap();
         assert!(result.is_none());
 
         let set_query = SetExpr::Query(Box::new(parse_query("SELECT 1")));
