@@ -72,7 +72,13 @@ impl crate::traits::translator::TranslatorWithContext for Query {
                 sql_traits::structs::IdentifierCase::AsWritten,
             )?)
         };
-        let scoped = scope.as_ref().map(|scope| options.with_query_scope(scope, query));
+        // ORDER BY resolves against this scope rather than the SELECT's own.
+        let whole_rows = match query.body.as_ref() {
+            SetExpr::Select(select) => super::array::WholeRow::of_relations(&select.from),
+            _ => Vec::new(),
+        };
+        let scoped =
+            scope.as_ref().map(|scope| options.with_query_scope(scope, query, &whole_rows));
         let options = scoped.as_ref().unwrap_or(options);
         let noted = options.with_cte_clause(query.with.as_ref().or_else(|| options.cte_clause()));
         let options = &noted;

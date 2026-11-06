@@ -3918,7 +3918,9 @@ pub(crate) fn translate_select_forward(
             schema,
             sql_traits::structs::IdentifierCase::AsWritten,
         )?;
-        let scoped = options.with_scope(&scope);
+        let whole_rows =
+            crate::impls::translator_impls::array::WholeRow::of_relations(&select.from);
+        let scoped = options.with_select_scope(&scope, &whole_rows);
         return translate_select_with_from::<Forward>(select, schema, &scoped, emit, from);
     }
     translate_select_with_from::<Forward>(select, schema, options, emit, from)
@@ -4093,7 +4095,11 @@ pub(crate) fn translate_set_expr_shared<D: TranslationDirection>(
                 sql_traits::structs::IdentifierCase::AsWritten,
             )?;
             let scoped = D::with_scope(options, &scope);
-            SetExpr::Select(Box::new(translate_select_shared::<D>(select, schema, &scoped, emit)?))
+            let translated = match D::forward_context(&scoped) {
+                Some(context) => translate_select_forward(select, schema, context, emit)?,
+                None => translate_select_shared::<D>(select, schema, &scoped, emit)?,
+            };
+            SetExpr::Select(Box::new(translated))
         }
         SetExpr::Query(query) => {
             SetExpr::Query(Box::new(D::translate_query(query, schema, options, emit)?))
@@ -5169,6 +5175,17 @@ pub(crate) fn translate_select_item<D: TranslationDirection>(
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<SelectItem, Error> {
     Ok(match item {
+        // A whole-row reference becomes a qualified column, which SQLite would
+        // name after the column. PostgreSQL names the output after the alias.
+        SelectItem::UnnamedExpr(expr @ Expr::Identifier(name))
+            if D::forward_context(options)
+                .is_some_and(|context| context.whole_row(expr).is_some()) =>
+        {
+            SelectItem::ExprWithAlias {
+                expr: D::translate_expr(expr, schema, options, emit)?,
+                alias: name.clone(),
+            }
+        }
         SelectItem::UnnamedExpr(expr) => {
             SelectItem::UnnamedExpr(D::translate_expr(expr, schema, options, emit)?)
         }

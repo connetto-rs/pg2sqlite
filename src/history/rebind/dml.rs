@@ -1,7 +1,7 @@
 //! Planning of the columns a data-modifying statement names on its target.
 
 #[cfg(not(feature = "std"))]
-use alloc::{borrow::ToOwned, vec::Vec};
+use alloc::vec::Vec;
 
 use sql_traits::{
     structs::{ColumnScope, IdentifierCase, ParserDB},

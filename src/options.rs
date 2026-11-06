@@ -15,8 +15,12 @@ use alloc::{
 use sql_traits::structs::{
     ColumnDefinition, ColumnDefinitionScope, ColumnQueryScope, ColumnScope, Deployment, ParserDB,
 };
+use sqlparser::ast::{Expr, ObjectName};
 
-use crate::traits::{ArrayRepresentation, SessionVariableMapping, UuidRepresentation};
+use crate::{
+    impls::translator_impls::array::WholeRow,
+    traits::{ArrayRepresentation, SessionVariableMapping, UuidRepresentation},
+};
 
 /// Tables whose storage lives in a database attached to the replica's
 /// connection, set with [`Pg2SqliteOptions::with_attached_tables`].
@@ -195,6 +199,9 @@ enum TranslationScope<'a> {
         scope: &'a ColumnScope<'a, 'a, ParserDB>,
         pseudo_row: bool,
         original_query: Option<&'a sqlparser::ast::Query>,
+        /// The set-returning JSON functions among the query's relations, whose
+        /// alias a bare name may read as a whole row.
+        whole_rows: &'a [WholeRow<'a>],
     },
     Definition(ColumnDefinitionScope<'a, 'a, 'a, ParserDB>),
 }
@@ -297,7 +304,12 @@ impl<'a> TranslationContext<'a> {
         TranslationContext {
             options: Cow::Borrowed(self.options.as_ref()),
             catalogs: Cow::Borrowed(self.catalogs.as_ref()),
-            scope: Some(TranslationScope::Query { scope, pseudo_row: false, original_query: None }),
+            scope: Some(TranslationScope::Query {
+                scope,
+                pseudo_row: false,
+                original_query: None,
+                whole_rows: &[],
+            }),
             outer: Some(self),
             with: self.with,
             variables: self.variables,
@@ -313,12 +325,35 @@ impl<'a> TranslationContext<'a> {
         &'s self,
         scope: &'s ColumnScope<'s, 's, ParserDB>,
         query: &'s sqlparser::ast::Query,
+        whole_rows: &'s [WholeRow<'s>],
     ) -> TranslationContext<'s> {
         let mut scoped = self.with_scope(scope);
-        scoped.scope =
-            Some(TranslationScope::Query { scope, pseudo_row: false, original_query: Some(query) });
+        scoped.scope = Some(TranslationScope::Query {
+            scope,
+            pseudo_row: false,
+            original_query: Some(query),
+            whole_rows,
+        });
         scoped
     }
+
+    /// The same context with the scope of one `SELECT` whose relations
+    /// include the set-returning JSON functions `whole_rows` describes.
+    pub(crate) fn with_select_scope<'s>(
+        &'s self,
+        scope: &'s ColumnScope<'s, 's, ParserDB>,
+        whole_rows: &'s [WholeRow<'s>],
+    ) -> TranslationContext<'s> {
+        let mut scoped = self.with_scope(scope);
+        scoped.scope = Some(TranslationScope::Query {
+            scope,
+            pseudo_row: false,
+            original_query: None,
+            whole_rows,
+        });
+        scoped
+    }
+
     pub(crate) fn with_pseudo_row_scope<'s>(
         &'s self,
         scope: &'s ColumnScope<'s, 's, ParserDB>,
@@ -326,7 +361,12 @@ impl<'a> TranslationContext<'a> {
         TranslationContext {
             options: Cow::Borrowed(self.options.as_ref()),
             catalogs: Cow::Borrowed(self.catalogs.as_ref()),
-            scope: Some(TranslationScope::Query { scope, pseudo_row: true, original_query: None }),
+            scope: Some(TranslationScope::Query {
+                scope,
+                pseudo_row: true,
+                original_query: None,
+                whole_rows: &[],
+            }),
             outer: Some(self),
             with: self.with,
             variables: self.variables,
@@ -479,35 +519,80 @@ impl<'a> TranslationContext<'a> {
         self.with
     }
     /// The scopes a reference may resolve against, innermost first.
+    ///
+    /// A bare name that reads the whole row of a one-column set-returning
+    /// function resolves as that column, so a reader of its type sees the
+    /// value the translation reads.
     pub(crate) fn column_definitions<'s>(
         &'s self,
-        reference: &'s sqlparser::ast::Expr,
-        pseudo_row_reference: Option<&'s sqlparser::ast::Expr>,
+        reference: &'s Expr,
+        pseudo_row_reference: Option<&'s Expr>,
     ) -> impl Iterator<
         Item = Result<
             Option<ColumnDefinition<'s, 's, 's, ParserDB>>,
             sql_traits::errors::LookupError,
         >,
     > + 's {
-        let mut context = Some(self);
+        let whole_row = self.whole_row(reference).and_then(WholeRow::column_reference);
+        let mut levels = self.levels();
         core::iter::from_fn(move || {
-            while let Some(current) = context {
-                context = current.outer;
-                if let Some(scope) = current.scope {
-                    return Some(match scope {
-                        TranslationScope::Query { scope, pseudo_row, .. } => {
-                            scope.resolve_column_definition(
-                                pseudo_row_reference.filter(|_| pseudo_row).unwrap_or(reference),
-                            )
-                        }
-                        TranslationScope::Definition(scope) => {
-                            scope.resolve_column_definition(reference)
-                        }
-                    });
-                }
-            }
-            None
+            let reference = whole_row.as_ref().unwrap_or(reference);
+            levels.next().map(|scope| Self::resolve_at(scope, reference, pseudo_row_reference))
         })
+    }
+
+    /// The scopes of this context and the ones it was derived from, innermost
+    /// first.
+    fn levels(&self) -> impl Iterator<Item = TranslationScope<'_>> {
+        core::iter::successors(Some(self), |context| context.outer)
+            .filter_map(|context| context.scope)
+    }
+
+    fn resolve_at<'s>(
+        scope: TranslationScope<'s>,
+        reference: &Expr,
+        pseudo_row_reference: Option<&Expr>,
+    ) -> Result<Option<ColumnDefinition<'s, 's, 's, ParserDB>>, sql_traits::errors::LookupError>
+    {
+        match scope {
+            TranslationScope::Query { scope, pseudo_row, .. } => {
+                scope.resolve_column_definition(
+                    pseudo_row_reference.filter(|_| pseudo_row).unwrap_or(reference),
+                )
+            }
+            TranslationScope::Definition(scope) => scope.resolve_column_definition(reference),
+        }
+    }
+
+    /// The whole row a bare `reference` reads, when it names the relation of a
+    /// set-returning JSON function and no column in scope answers it.
+    ///
+    /// PostgreSQL tries a bare name as a column at every level before it tries
+    /// it as a relation, so a column of that name anywhere in scope wins,
+    /// measured on 18.6. The innermost relation of that name then decides. An
+    /// opaque relation answers every name and so decides nothing, and an
+    /// ambiguous name is left to the refusal that reports it.
+    pub(crate) fn whole_row(&self, reference: &Expr) -> Option<&WholeRow<'_>> {
+        let Expr::Identifier(name) = reference else { return None };
+        let named = |rows: &[WholeRow<'_>]| rows.iter().any(|row| row.is_named(name));
+        let candidate = self.levels().any(|scope| {
+            matches!(scope, TranslationScope::Query { whole_rows, .. } if named(whole_rows))
+        });
+        if !candidate || (name.quote_style.is_none() && self.is_variable(&name.value)) {
+            return None;
+        }
+        for scope in self.levels() {
+            match Self::resolve_at(scope, reference, None) {
+                Ok(None | Some(ColumnDefinition::Opaque)) => {}
+                Ok(Some(_)) | Err(_) => return None,
+            }
+        }
+        let qualifier = ObjectName::from(vec![name.clone()]);
+        self.levels().find_map(|scope| {
+            let TranslationScope::Query { scope, whole_rows, .. } = scope else { return None };
+            scope.resolve_relation_binding(&qualifier)?;
+            Some(whole_rows.iter().find(|row| row.is_named(name)))
+        })?
     }
 
     /// Borrows the recorded output scope for an original query node.

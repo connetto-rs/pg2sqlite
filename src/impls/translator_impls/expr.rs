@@ -3983,6 +3983,9 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
         options: &crate::options::TranslationContext<'_>,
         emit: &mut dyn FnMut(crate::warnings::TranslationWarning),
     ) -> Result<Self::SQLiteEntry, crate::errors::Error> {
+        if let Some(whole_row) = options.whole_row(self) {
+            return whole_row.read()?.translate_with_warnings(schema, options, emit);
+        }
         reject_unstored_vector_reference(self, schema, options)?;
         if let Some(read) = session_variable::translate_expr_read(self, schema, options)? {
             return Ok(read);

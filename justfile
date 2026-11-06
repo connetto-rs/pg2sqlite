@@ -24,4 +24,4 @@ doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items
 
 no-std:
-    cargo check --no-default-features --target wasm32-unknown-unknown
+    RUSTFLAGS="-D warnings" cargo check --no-default-features --target wasm32-unknown-unknown

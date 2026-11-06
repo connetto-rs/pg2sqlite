@@ -160,6 +160,8 @@ jobs:
 
       - name: Check the crate builds without std
         run: cargo check --no-default-features --target wasm32-unknown-unknown
+        env:
+          RUSTFLAGS: -D warnings
 
   sqlite-floor:
     name: Minimum Supported SQLite Version
