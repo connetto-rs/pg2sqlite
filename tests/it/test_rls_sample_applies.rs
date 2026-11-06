@@ -9,30 +9,10 @@
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 use rusqlite::{Connection, params};
 
-use crate::helpers::deployment::{caller, deployment};
-
-const RLS_SAMPLE: &str = "\
-CREATE TABLE documents (
-    id INTEGER PRIMARY KEY,
-    owner_id INTEGER NOT NULL,
-    title TEXT NOT NULL,
-    content TEXT
-);
-
-ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY documents_select_policy ON documents
-    FOR SELECT
-    USING (owner_id = current_setting('app.user_id')::integer);
-
-CREATE POLICY documents_insert_policy ON documents
-    FOR INSERT
-    WITH CHECK (owner_id = current_setting('app.user_id')::integer);
-
-INSERT INTO documents (id, owner_id, title) VALUES
-    (1, 42, 'First draft'),
-    (2, 42, 'Second draft');
-";
+use crate::{
+    helpers::deployment::{caller, deployment},
+    sample_sql::RLS_SQL as RLS_SAMPLE,
+};
 
 fn translate_rls_sample() -> String {
     let opts = Pg2SqliteOptions::default()

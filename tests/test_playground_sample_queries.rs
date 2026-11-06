@@ -15,11 +15,14 @@
 //!    (`Pg2Sqlite::translate` for the Postgres dialect, raw SQL for the SQLite
 //!    dialect) and asserts that positive chips succeed and negative chips fail.
 //!
-//! The chip catalogue is duplicated here on purpose: the playground
-//! crate is wasm-only, and pulling it as a workspace member to share
-//! the data would drag Dioxus's transitive deps into the main
-//! pg2sqlite cargo graph. Any change to a chip in `samples.rs` must
-//! be mirrored here. The test will fail loudly when the two drift.
+//! The sample schemas come from the playground's `sample_sql.rs`, which
+//! is the single source the playground's `samples.rs` builds its
+//! dropdown from. The chip catalogue, however, is duplicated here on
+//! purpose: the playground crate is wasm-only, and pulling it as a
+//! workspace member to share the data would drag Dioxus's transitive
+//! deps into the main pg2sqlite cargo graph. Any change to a chip in
+//! `samples.rs` must be mirrored here. The test will fail loudly when
+//! the two drift.
 //!
 //! PostGIS queries that need SQLiteGIS at runtime are gated on the
 //! `sqlitegis` cargo feature: without it we exercise translation only
@@ -34,9 +37,17 @@
 #[expect(dead_code, reason = "this binary uses part of the shared helpers")]
 mod helpers;
 
+#[path = "../examples/web-playground/src/sample_sql.rs"]
+mod sample_sql;
+
 use helpers::deployment::{caller, deployment};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 use rusqlite::Connection;
+use sample_sql::{
+    CONSTRAINTS_SQL as CONSTRAINTS_SCHEMA, FTS5_SQL as FTS5_SCHEMA,
+    PGVECTOR_SQL as PGVECTOR_SCHEMA, POSTGIS_SQL as POSTGIS_SCHEMA, RLS_SQL as RLS_SCHEMA,
+    SIMPLE_SQL as SIMPLE_SCHEMA,
+};
 use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -155,16 +166,6 @@ fn run_queries_twice(
     }
 }
 
-const SIMPLE_SCHEMA: &str = "\
-CREATE TABLE users (
-    id SERIAL PRIMARY KEY,
-    name TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT NOW()
-);
-
-INSERT INTO users (name) VALUES ('alice'), ('bob'), ('carol');
-";
-
 const SIMPLE_QUERIES: &[CannedQuery] = &[
     CannedQuery {
         label: "All users",
@@ -195,20 +196,6 @@ fn simple_sample_queries() {
     conn.execute_batch(&translate(SIMPLE_SCHEMA, &opts)).expect("apply Simple schema");
     run_queries_twice(&conn, SIMPLE_SCHEMA, SIMPLE_QUERIES, &opts);
 }
-
-const FTS5_SCHEMA: &str = "\
-CREATE TABLE docs (
-    id INTEGER PRIMARY KEY,
-    body TEXT
-);
-
-CREATE INDEX docs_fts ON docs USING GIN (to_tsvector('english', body));
-
-INSERT INTO docs (id, body) VALUES
-    (1, 'pg2sqlite translates PostgreSQL schemas'),
-    (2, 'SQLite has a built-in full-text search module'),
-    (3, 'FTS5 supports MATCH queries with ranking');
-";
 
 const FTS5_QUERIES: &[CannedQuery] = &[
     CannedQuery {
@@ -241,20 +228,6 @@ fn fts5_sample_queries() {
     run_queries_twice(&conn, FTS5_SCHEMA, FTS5_QUERIES, &opts);
 }
 
-const PGVECTOR_SCHEMA: &str = "\
-CREATE EXTENSION vector;
-
-CREATE TABLE items (
-    id INTEGER PRIMARY KEY,
-    embedding vector(3)
-);
-
-INSERT INTO items (id, embedding) VALUES
-    (1, '[0.10, 0.20, 0.30]'),
-    (2, '[0.40, 0.50, 0.60]'),
-    (3, '[0.70, 0.80, 0.90]');
-";
-
 const PGVECTOR_QUERIES: &[CannedQuery] = &[
     CannedQuery {
         label: "All items",
@@ -285,29 +258,6 @@ fn pgvector_sample_queries() {
     conn.execute_batch(&translate(PGVECTOR_SCHEMA, &opts)).expect("apply pgvector schema");
     run_queries_twice(&conn, PGVECTOR_SCHEMA, PGVECTOR_QUERIES, &opts);
 }
-
-const RLS_SCHEMA: &str = "\
-CREATE TABLE documents (
-    id INTEGER PRIMARY KEY,
-    owner_id INTEGER NOT NULL,
-    title TEXT NOT NULL,
-    content TEXT
-);
-
-ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY documents_select_policy ON documents
-    FOR SELECT
-    USING (owner_id = current_setting('app.user_id')::integer);
-
-CREATE POLICY documents_insert_policy ON documents
-    FOR INSERT
-    WITH CHECK (owner_id = current_setting('app.user_id')::integer);
-
-INSERT INTO documents (id, owner_id, title) VALUES
-    (1, 42, 'First draft'),
-    (2, 42, 'Second draft');
-";
 
 const RLS_QUERIES: &[CannedQuery] = &[
     CannedQuery {
@@ -343,21 +293,6 @@ fn rls_sample_queries() {
     conn.execute_batch(&translate(RLS_SCHEMA, &opts)).expect("apply RLS schema");
     run_queries_twice(&conn, RLS_SCHEMA, RLS_QUERIES, &opts);
 }
-
-const CONSTRAINTS_SCHEMA: &str = "\
-CREATE TABLE orders (
-    id SERIAL PRIMARY KEY,
-    quantity INTEGER NOT NULL CHECK (quantity > 0),
-    unit_price NUMERIC(10,2) NOT NULL CHECK (unit_price >= 0),
-    total NUMERIC(12,2) GENERATED ALWAYS AS (quantity * unit_price) STORED,
-    placed_at TIMESTAMP NOT NULL DEFAULT NOW()
-);
-
-INSERT INTO orders (quantity, unit_price) VALUES
-    (3, 19.99),
-    (10, 4.50),
-    (1, 99.00);
-";
 
 const CONSTRAINTS_QUERIES: &[CannedQuery] = &[
     CannedQuery {
@@ -399,21 +334,6 @@ fn constraints_sample_queries() {
 // PostGIS (translation-only without the `SQLiteGIS` feature; full apply
 // behind the feature flag, since ST_GeomFromText / ST_X / ST_Within
 // need SQLiteGIS at runtime.)
-
-const POSTGIS_SCHEMA: &str = "\
-CREATE TABLE places (
-    id INTEGER PRIMARY KEY,
-    name TEXT,
-    geom geometry
-);
-
-CREATE INDEX places_geom_idx ON places USING gist (geom);
-
-INSERT INTO places (id, name, geom) VALUES
-    (1, 'Helsinki', ST_GeomFromText('POINT(24.94 60.17)')),
-    (2, 'Rome',     ST_GeomFromText('POINT(12.50 41.90)')),
-    (3, 'Tokyo',    ST_GeomFromText('POINT(139.69 35.69)'));
-";
 
 const POSTGIS_QUERIES: &[CannedQuery] = &[
     CannedQuery {

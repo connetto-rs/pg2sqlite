@@ -9,4 +9,5 @@ pub mod output_pane;
 pub mod query_panel;
 pub mod results_table;
 pub mod reverse_panel;
+pub mod sample_chip;
 pub mod sample_picker;

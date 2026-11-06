@@ -4,6 +4,7 @@
 mod components;
 mod db;
 mod runner;
+mod sample_sql;
 mod samples;
 mod state;
 mod translator;
@@ -155,16 +156,21 @@ fn AppHeader() -> Element {
     }
 }
 
+/// Clears every output signal so a fresh translation starts from a blank slate.
+fn clear_results(state: &AppState) {
+    state.sqlite_output.set(None);
+    state.translation_error.set(None);
+    state.apply_error.set(None);
+    state.apply_ok.set(false);
+    state.stats.set(None);
+    state.query_result.set(None);
+    state.reverse_output.set(None);
+}
+
 fn run_translate(state: AppState, pg_sql: &str, opts: &state::WebOptions) {
     // Empty input clears any prior output but doesn't drive an error.
     if pg_sql.trim().is_empty() {
-        state.sqlite_output.clone().set(None);
-        state.translation_error.clone().set(None);
-        state.apply_error.clone().set(None);
-        state.apply_ok.clone().set(false);
-        state.stats.clone().set(None);
-        state.query_result.clone().set(None);
-        state.reverse_output.clone().set(None);
+        clear_results(&state);
         return;
     }
 
@@ -196,13 +202,8 @@ fn run_translate(state: AppState, pg_sql: &str, opts: &state::WebOptions) {
             }
         }
         Err(err) => {
-            state.sqlite_output.clone().set(None);
+            clear_results(&state);
             state.translation_error.clone().set(Some(err));
-            state.apply_error.clone().set(None);
-            state.apply_ok.clone().set(false);
-            state.stats.clone().set(None);
-            state.query_result.clone().set(None);
-            state.reverse_output.clone().set(None);
         }
     }
 }
