@@ -63,13 +63,6 @@ const BASE: &str = "
     CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL);
 ";
 
-/// Translates `pg` with default options and applies every emitted statement.
-fn apply(pg: &str) -> Result<SqliteConnection, Box<dyn std::error::Error>> {
-    apply_with(pg, &Pg2SqliteOptions::default())
-}
-
-use helpers::apply_with_options as apply_with;
-
 /// Seeds both tables through the typed DSL.
 fn seed(conn: &mut SqliteConnection) -> Result<(), Box<dyn std::error::Error>> {
     diesel::insert_into(docs::table)
@@ -88,7 +81,7 @@ fn seed(conn: &mut SqliteConnection) -> Result<(), Box<dyn std::error::Error>> {
 /// applied, the table is empty.
 #[test]
 fn truncate_empties_the_table() -> Result<(), Box<dyn std::error::Error>> {
-    let mut conn = apply(BASE)?;
+    let mut conn = helpers::apply_default(BASE)?;
     seed(&mut conn)?;
 
     let statements = Pg2Sqlite::default()
@@ -115,7 +108,7 @@ fn truncate_empties_the_table() -> Result<(), Box<dyn std::error::Error>> {
 /// `TRUNCATE` takes a list, and each name becomes its own `DELETE FROM`.
 #[test]
 fn truncate_empties_every_named_table() -> Result<(), Box<dyn std::error::Error>> {
-    let mut conn = apply(BASE)?;
+    let mut conn = helpers::apply_default(BASE)?;
     seed(&mut conn)?;
 
     let statements = Pg2Sqlite::default()
@@ -140,7 +133,7 @@ fn truncate_empties_every_named_table() -> Result<(), Box<dyn std::error::Error>
 #[test]
 fn truncate_accepts_the_table_keyword_and_only() -> Result<(), Box<dyn std::error::Error>> {
     for form in ["TRUNCATE TABLE docs;", "TRUNCATE ONLY docs;", "TRUNCATE TABLE ONLY docs;"] {
-        let mut conn = apply(BASE)?;
+        let mut conn = helpers::apply_default(BASE)?;
         seed(&mut conn)?;
 
         let statements = Pg2Sqlite::default()
@@ -164,7 +157,7 @@ fn truncate_accepts_the_table_keyword_and_only() -> Result<(), Box<dyn std::erro
 /// this file's header, so it translates and the identifiers restart.
 #[test]
 fn truncate_restart_identity_restarts_the_identifiers() -> Result<(), Box<dyn std::error::Error>> {
-    let mut conn = apply(BASE)?;
+    let mut conn = helpers::apply_default(BASE)?;
     diesel::insert_into(docs::table)
         .values(vec![(docs::title.eq("first")), (docs::title.eq("second"))])
         .execute(&mut conn)?;
@@ -191,7 +184,7 @@ fn truncate_restart_identity_restarts_the_identifiers() -> Result<(), Box<dyn st
 /// which rows disappear and must be an error rather than a silent loss.
 #[test]
 fn truncate_cascade_is_rejected() {
-    let Err(error) = apply(&format!("{BASE} TRUNCATE docs CASCADE;")) else {
+    let Err(error) = helpers::apply_default(&format!("{BASE} TRUNCATE docs CASCADE;")) else {
         panic!("TRUNCATE CASCADE must not be translated as though it were a plain TRUNCATE");
     };
     let error = error.to_string();

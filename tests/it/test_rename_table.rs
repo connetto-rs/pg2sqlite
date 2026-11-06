@@ -19,7 +19,10 @@
 use diesel::prelude::*;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
 
-use crate::helpers::deployment::{caller, deployment};
+use crate::{
+    helpers,
+    helpers::deployment::{caller, deployment},
+};
 
 /// Options that resolve the `app.user` setting the RLS tests at the end of this
 /// file reference.
@@ -53,26 +56,6 @@ mod schema {
     }
 }
 
-/// Emitted SQLite for `pg`, one string per statement.
-fn translate(pg: &str) -> Vec<String> {
-    Pg2Sqlite::default()
-        .sql(pg)
-        .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
-        .expect("translate")
-        .into_vec()
-}
-
-/// Translates `pg` and applies every emitted statement. The emitted DDL is the
-/// artifact under test, so it is applied as generated text.
-fn apply(pg: &str) -> SqliteConnection {
-    let mut conn = SqliteConnection::establish(":memory:").expect("connect");
-    for statement in translate(pg) {
-        diesel::sql_query(statement).execute(&mut conn).expect("apply emitted statement");
-    }
-    conn
-}
-
 /// The translation error message for `pg`. Panics when it succeeds.
 fn translate_err(pg: &str) -> String {
     Pg2Sqlite::default()
@@ -89,7 +72,8 @@ const BASE: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT NOT NULL);";
 /// columns.
 #[test]
 fn alter_table_rename_to_renames_the_table() {
-    let mut conn = apply(&format!("{BASE} ALTER TABLE t RENAME TO t2;"));
+    let mut conn =
+        helpers::apply_default(&format!("{BASE} ALTER TABLE t RENAME TO t2;")).expect("apply");
 
     diesel::insert_into(schema::t2::table)
         .values((schema::t2::id.eq(1), schema::t2::a.eq("kept")))
@@ -108,7 +92,8 @@ fn alter_table_rename_to_renames_the_table() {
 /// it: the restriction is on the new name, not the old one.
 #[test]
 fn a_qualified_source_table_still_renames() {
-    let mut conn = apply(&format!("{BASE} ALTER TABLE public.t RENAME TO t2;"));
+    let mut conn = helpers::apply_default(&format!("{BASE} ALTER TABLE public.t RENAME TO t2;"))
+        .expect("apply");
 
     assert_eq!(schema::t2::table.count().get_result::<i64>(&mut conn).expect("count"), 0);
 }

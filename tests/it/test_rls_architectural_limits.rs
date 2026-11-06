@@ -23,7 +23,7 @@
 use diesel::prelude::*;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
-use crate::helpers::{deployment::deployment, establish_connection};
+use crate::helpers::{self, deployment::deployment};
 
 /// The translation runs as `alice`, whose name `current_user` answers, so
 /// Alice can SELECT both rows, but UPDATE and DELETE only her own.
@@ -115,23 +115,6 @@ fn strict_opts() -> Pg2SqliteOptions {
         .with_acting_role("alice")
 }
 
-fn apply(pg_schema: &str) -> SqliteConnection {
-    let translated = Pg2Sqlite::default()
-        .sql(pg_schema)
-        .expect("parse")
-        .translate(&strict_opts())
-        .expect("translate")
-        .into_vec();
-    let mut conn = establish_connection();
-    for statement in &translated {
-        // DDL emitted by the translator cannot be expressed with the typed DSL.
-        diesel::sql_query(statement.to_string())
-            .execute(&mut conn)
-            .unwrap_or_else(|e| panic!("emitted DDL failed: {e}\n{statement}"));
-    }
-    conn
-}
-
 fn run_dml(conn: &mut SqliteConnection, pg_schema: &str, pg_dml: &str) -> QueryResult<usize> {
     let schema_len = Pg2Sqlite::default()
         .sql(pg_schema)
@@ -176,7 +159,7 @@ fn stored_items(conn: &mut SqliteConnection) -> Vec<(i32, i32)> {
 /// column skips the `SELECT` policies.
 #[test]
 fn blind_update_skips_rows_the_select_policies_hide() {
-    let mut conn = apply(BLIND_SCHEMA);
+    let mut conn = helpers::apply_translated_ddl(BLIND_SCHEMA, &strict_opts());
     seed_items(&mut conn, &[1, 2, 3, 4]);
 
     run_dml(&mut conn, BLIND_SCHEMA, "UPDATE items SET v = 9").expect("blind UPDATE");
@@ -189,7 +172,7 @@ fn blind_update_skips_rows_the_select_policies_hide() {
 /// column skips the `SELECT` policies.
 #[test]
 fn blind_delete_skips_rows_the_select_policies_hide() {
-    let mut conn = apply(BLIND_SCHEMA);
+    let mut conn = helpers::apply_translated_ddl(BLIND_SCHEMA, &strict_opts());
     seed_items(&mut conn, &[1, 2, 3, 4]);
 
     run_dml(&mut conn, BLIND_SCHEMA, "DELETE FROM items").expect("blind DELETE");
@@ -203,7 +186,7 @@ fn blind_delete_skips_rows_the_select_policies_hide() {
 /// policy's check.
 #[test]
 fn blind_update_moving_a_row_out_of_the_select_policies_is_refused() {
-    let mut conn = apply(MOVE_OUT_SCHEMA);
+    let mut conn = helpers::apply_translated_ddl(MOVE_OUT_SCHEMA, &strict_opts());
     seed_items(&mut conn, &[1]);
 
     let error = run_dml(&mut conn, MOVE_OUT_SCHEMA, "UPDATE items SET id = 99")
@@ -220,7 +203,7 @@ fn blind_update_moving_a_row_out_of_the_select_policies_is_refused() {
 /// `SELECT` policies too and changes rows 2 and 3, as the replica does.
 #[test]
 fn reading_update_matches_postgres() {
-    let mut conn = apply(BLIND_SCHEMA);
+    let mut conn = helpers::apply_translated_ddl(BLIND_SCHEMA, &strict_opts());
     seed_items(&mut conn, &[1, 2, 3, 4]);
 
     run_dml(&mut conn, BLIND_SCHEMA, "UPDATE items SET v = v + 1").expect("reading UPDATE");
@@ -242,7 +225,7 @@ fn reading_update_matches_postgres() {
 /// UPDATE/DELETE through RLS views is made accurate.
 #[test]
 fn delete_returning_through_view_reports_skipped_rows() {
-    let mut conn = apply(DIVERGE_SCHEMA);
+    let mut conn = helpers::apply_translated_ddl(DIVERGE_SCHEMA, &strict_opts());
 
     // Seed: alice owns row 1, bob owns row 2.
     diesel::insert_into(schema::docs_rls::table)

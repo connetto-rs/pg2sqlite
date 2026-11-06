@@ -142,9 +142,5 @@ fn test_plpgsql_derived_subquery_full_transform() {
 /// SQLite. This proves the emitted CREATE TABLE and CREATE TRIGGER statements
 /// are valid.
 fn execute_plpgsql_ddl(pg: &str, options: &Pg2SqliteOptions) {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    for stmt in helpers::translate_statements(pg, options).unwrap() {
-        conn.execute_batch(&format!("{stmt};"))
-            .unwrap_or_else(|e| panic!("emitted DDL failed: {e}\n{stmt}"));
-    }
+    helpers::apply_rusqlite_statements(&helpers::translate_pg(pg, options).unwrap());
 }

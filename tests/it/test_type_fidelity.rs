@@ -14,7 +14,7 @@ use pg2sqlite::{
 use run_translated_helper::run_translated_with;
 use rusqlite::Connection;
 
-use crate::helpers::run_translated as run_translated_helper;
+use crate::helpers::{execute_all, run_translated as run_translated_helper};
 
 fn default_opts() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
@@ -27,21 +27,6 @@ fn array_opts() -> Pg2SqliteOptions {
 
 fn text_uuid_opts() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default().with_uuid_representation(UuidRepresentation::Text)
-}
-
-/// Translate and execute every emitted statement in a fresh SQLite database.
-fn run(pg: &str, opts: &Pg2SqliteOptions) {
-    let stmts = Pg2Sqlite::default()
-        .sql(pg)
-        .expect("parse")
-        .translate_to_sql(opts)
-        .expect("translate")
-        .into_vec();
-    let conn = Connection::open_in_memory().unwrap();
-    for s in &stmts {
-        conn.execute_batch(&format!("{s};"))
-            .unwrap_or_else(|e| panic!("emitted statement failed in SQLite: {e}\n{s}"));
-    }
 }
 
 /// Translate and execute, then return the first column of the last query as
@@ -108,7 +93,7 @@ fn negative_infinity_cast_to_real_is_refused() {
 #[test]
 fn finite_float_is_accepted() {
     // -0.0 is finite; no crash.
-    run(
+    execute_all(
         "CREATE TABLE t (col double precision);
          INSERT INTO t VALUES (-0.0);",
         &default_opts(),
@@ -283,7 +268,7 @@ fn a_non_binary_value_written_later_fails_the_check() {
 #[test]
 fn bytea_hex_literal_executes() {
     // '\x414243' is the hex representation of 'ABC'; must reach a BLOB column.
-    run(
+    execute_all(
         "CREATE TABLE t (col bytea);
          INSERT INTO t VALUES ('\\x414243');",
         &default_opts(),
@@ -292,7 +277,7 @@ fn bytea_hex_literal_executes() {
 
 #[test]
 fn bytea_empty_hex_literal_executes() {
-    run(
+    execute_all(
         "CREATE TABLE t (col bytea);
          INSERT INTO t VALUES ('\\x');",
         &default_opts(),
@@ -301,7 +286,7 @@ fn bytea_empty_hex_literal_executes() {
 
 #[test]
 fn bytea_two_byte_hex_literal_executes() {
-    run(
+    execute_all(
         "CREATE TABLE t (col bytea);
          INSERT INTO t VALUES ('\\xfffe');",
         &default_opts(),
@@ -336,7 +321,7 @@ fn bytea_hex_value_is_accessible_after_insert() {
 #[test]
 fn smallint_boundary_is_accepted() {
     // 32767 is within range; must not fail the CHECK.
-    run(
+    execute_all(
         "CREATE TABLE t (col smallint);
          INSERT INTO t VALUES (32767);",
         &default_opts(),
@@ -381,7 +366,7 @@ fn smallint_below_lower_bound_is_rejected() {
 
 #[test]
 fn integer_boundary_is_accepted() {
-    run(
+    execute_all(
         "CREATE TABLE t (col integer);
          INSERT INTO t VALUES (2147483647);",
         &default_opts(),
@@ -492,7 +477,7 @@ fn arrays_of_calls_returning_a_blob_stored_type_are_refused() {
 
 #[test]
 fn arrays_of_calls_returning_text_still_translate() {
-    run(
+    execute_all(
         "CREATE TABLE t (id INT PRIMARY KEY, b BYTEA);
          SELECT ARRAY[encode(b, 'hex')] FROM t;",
         &array_opts(),
@@ -557,7 +542,7 @@ fn arrays_of_case_and_subquery_results_stored_as_blob_are_refused() {
             &format!("a JSON array cannot hold the BLOB {element} is stored as"),
         );
     }
-    run(
+    execute_all(
         &format!(
             "{schema} SELECT ARRAY[CASE WHEN id > 0 THEN encode(b, 'hex') END], \
              ARRAY[(SELECT id FROM t LIMIT 1)] FROM t;"
@@ -670,7 +655,7 @@ fn an_array_of_a_subquery_with_no_readable_type_still_translates() {
     // A PL/pgSQL variable is read through a subquery the statement's scope
     // does not record, and a function relation's columns are opaque. Neither
     // says the element is a BLOB, so the array translates.
-    run(
+    execute_all(
         "CREATE TABLE t (id INTEGER PRIMARY KEY);
          CREATE TABLE log (id INTEGER PRIMARY KEY, tags INT[]);
          CREATE TABLE src (id INTEGER PRIMARY KEY, v INTEGER);
@@ -683,7 +668,7 @@ fn an_array_of_a_subquery_with_no_readable_type_still_translates() {
          INSERT INTO t VALUES (1);",
         &array_opts(),
     );
-    run(
+    execute_all(
         "CREATE TABLE t (id INT PRIMARY KEY);
          SELECT ARRAY[(SELECT name FROM pragma_table_info('t') LIMIT 1)] FROM t;",
         &array_opts().with_user_defined_functions(["pragma_table_info"]),
@@ -1772,7 +1757,7 @@ fn bytea_insert_select_executes() {
     // INSERT ... SELECT must convert \x literals at bytea-column positions just
     // as VALUES does; exercises the SetExpr::Select branch in
     // for_each_insert_position.
-    run(
+    execute_all(
         "CREATE TABLE t (b bytea);
          INSERT INTO t (b) SELECT '\\x414243';",
         &default_opts(),

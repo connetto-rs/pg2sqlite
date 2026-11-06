@@ -42,19 +42,6 @@ mod schema {
     }
 }
 
-fn translate(pg: &str) -> Vec<String> {
-    Pg2Sqlite::default()
-        .sql(pg)
-        .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
-        .expect("translate")
-        .into_vec()
-}
-
-fn apply(pg: &str) -> SqliteConnection {
-    helpers::apply_statements(&translate(pg))
-}
-
 fn translate_err(pg: &str) -> String {
     Pg2Sqlite::default()
         .sql(pg)
@@ -94,11 +81,12 @@ fn assert_upserted(conn: &mut SqliteConnection) {
 /// An explicitly named constraint resolves to its column list.
 #[test]
 fn an_explicitly_named_constraint_resolves() {
-    let mut conn = apply(&format!(
+    let mut conn = helpers::apply_default(&format!(
         "{NAMED}
          INSERT INTO t (id, v, n) VALUES (2, 'a', 5)
          ON CONFLICT ON CONSTRAINT v_is_unique DO UPDATE SET n = EXCLUDED.n;"
-    ));
+    ))
+    .expect("apply");
 
     assert_upserted(&mut conn);
 }
@@ -107,11 +95,12 @@ fn an_explicitly_named_constraint_resolves() {
 /// that is the name a migration written against PostgreSQL will use.
 #[test]
 fn an_auto_named_unique_constraint_resolves() {
-    let mut conn = apply(&format!(
+    let mut conn = helpers::apply_default(&format!(
         "{AUTO}
          INSERT INTO t (id, v, n) VALUES (2, 'a', 5)
          ON CONFLICT ON CONSTRAINT t_v_key DO UPDATE SET n = EXCLUDED.n;"
-    ));
+    ))
+    .expect("apply");
 
     assert_upserted(&mut conn);
 }
@@ -119,11 +108,12 @@ fn an_auto_named_unique_constraint_resolves() {
 /// A primary key is auto-named `<table>_pkey`.
 #[test]
 fn the_primary_key_constraint_resolves() {
-    let mut conn = apply(&format!(
+    let mut conn = helpers::apply_default(&format!(
         "{AUTO}
          INSERT INTO t (id, v, n) VALUES (1, 'a', 5)
          ON CONFLICT ON CONSTRAINT t_pkey DO UPDATE SET n = EXCLUDED.n;"
-    ));
+    ))
+    .expect("apply");
 
     assert_upserted(&mut conn);
 }
@@ -132,7 +122,7 @@ fn the_primary_key_constraint_resolves() {
 /// column has to come back out.
 #[test]
 fn a_multi_column_constraint_resolves() {
-    let mut conn = apply(
+    let mut conn = helpers::apply_default(
         "CREATE TABLE pair (
             id INTEGER PRIMARY KEY,
             a INTEGER NOT NULL,
@@ -143,7 +133,8 @@ fn a_multi_column_constraint_resolves() {
          INSERT INTO pair (id, a, b, n) VALUES (1, 1, 2, 1);
          INSERT INTO pair (id, a, b, n) VALUES (2, 1, 2, 5)
          ON CONFLICT ON CONSTRAINT pair_a_b_key DO UPDATE SET n = EXCLUDED.n;",
-    );
+    )
+    .expect("apply");
 
     let rows: Vec<(i32, i32, i32, i32)> = schema::pair::table
         .select((schema::pair::id, schema::pair::a, schema::pair::b, schema::pair::n))
@@ -173,11 +164,12 @@ fn an_unknown_constraint_is_rejected() {
 /// row.
 #[test]
 fn do_nothing_with_a_named_constraint_still_ignores() {
-    let mut conn = apply(&format!(
+    let mut conn = helpers::apply_default(&format!(
         "{AUTO}
          INSERT INTO t (id, v, n) VALUES (2, 'a', 5)
          ON CONFLICT ON CONSTRAINT t_v_key DO NOTHING;"
-    ));
+    ))
+    .expect("apply");
 
     let rows: Vec<(i32, String, i32)> = schema::t::table
         .select((schema::t::id, schema::t::v, schema::t::n))
@@ -189,11 +181,12 @@ fn do_nothing_with_a_named_constraint_still_ignores() {
 /// Guards the fix from touching the ordinary column-list target.
 #[test]
 fn a_column_list_target_still_upserts() {
-    let mut conn = apply(&format!(
+    let mut conn = helpers::apply_default(&format!(
         "{AUTO}
          INSERT INTO t (id, v, n) VALUES (2, 'a', 5)
          ON CONFLICT (v) DO UPDATE SET n = EXCLUDED.n;"
-    ));
+    ))
+    .expect("apply");
 
     assert_upserted(&mut conn);
 }

@@ -9,6 +9,8 @@
 use diesel::{Connection, RunQueryDsl, SqliteConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
+use crate::helpers;
+
 diesel::table! {
     /// Rows a deferred foreign key points at.
     parent (id) {
@@ -35,32 +37,6 @@ const DEFERRED: &str = "
     );
 ";
 
-/// Translates `pg` and applies the emitted DDL to a fresh database with foreign
-/// key enforcement switched on, which SQLite leaves off by default.
-fn apply(pg: &str) -> SqliteConnection {
-    let statements = Pg2Sqlite::default()
-        .sql(pg)
-        .expect("script should parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
-        .unwrap_or_else(|error| panic!("script should translate: {error}"))
-        .into_vec();
-
-    let mut connection =
-        SqliteConnection::establish(":memory:").expect("in-memory SQLite should open");
-    // A pragma has no diesel DSL form, and SQLite ignores foreign keys without
-    // this one.
-    diesel::sql_query("PRAGMA foreign_keys = ON")
-        .execute(&mut connection)
-        .expect("pragma should apply");
-    for statement in &statements {
-        // Emitted DDL is the artifact under test, so it runs as text.
-        diesel::sql_query(statement)
-            .execute(&mut connection)
-            .unwrap_or_else(|error| panic!("emitted DDL failed: {error}\n{statement}"));
-    }
-    connection
-}
-
 /// Inserts a child row whose parent does not exist, creating the parent before
 /// COMMIT when `repair_before_commit`. Returns whether the orphan was accepted
 /// at statement time, and whether the transaction committed.
@@ -81,7 +57,7 @@ fn insert_orphan(connection: &mut SqliteConnection, repair_before_commit: bool) 
 
 #[test]
 fn a_deferred_foreign_key_tolerates_a_violation_inside_the_transaction() {
-    let mut connection = apply(DEFERRED);
+    let mut connection = helpers::apply_translated_ddl(DEFERRED, &Pg2SqliteOptions::default());
     let (orphan_accepted, committed) = insert_orphan(&mut connection, true);
 
     assert!(orphan_accepted, "a deferred key must accept the orphan at statement time");
@@ -97,7 +73,7 @@ fn a_deferred_foreign_key_tolerates_a_violation_inside_the_transaction() {
 /// that matters, since nothing reached the database.
 #[test]
 fn a_deferred_foreign_key_still_fails_at_commit_when_the_parent_never_arrives() {
-    let mut connection = apply(DEFERRED);
+    let mut connection = helpers::apply_translated_ddl(DEFERRED, &Pg2SqliteOptions::default());
     let (orphan_accepted, committed) = insert_orphan(&mut connection, false);
 
     assert!(orphan_accepted, "the orphan is still accepted at statement time");
@@ -110,12 +86,13 @@ fn a_deferred_foreign_key_still_fails_at_commit_when_the_parent_never_arrives() 
 /// same thing.
 #[test]
 fn initially_deferred_without_the_deferrable_keyword_still_defers() {
-    let mut connection = apply(
+    let mut connection = helpers::apply_translated_ddl(
         "CREATE TABLE parent (id INTEGER PRIMARY KEY);
          CREATE TABLE child (
              id INTEGER PRIMARY KEY,
              pid INTEGER NOT NULL REFERENCES parent(id) INITIALLY DEFERRED
          );",
+        &Pg2SqliteOptions::default(),
     );
     let (orphan_accepted, committed) = insert_orphan(&mut connection, true);
 
@@ -127,12 +104,13 @@ fn initially_deferred_without_the_deferrable_keyword_still_defers() {
 /// This passes before the change too.
 #[test]
 fn a_foreign_key_without_deferral_still_fails_at_statement_time() {
-    let mut connection = apply(
+    let mut connection = helpers::apply_translated_ddl(
         "CREATE TABLE parent (id INTEGER PRIMARY KEY);
          CREATE TABLE child (
              id INTEGER PRIMARY KEY,
              pid INTEGER NOT NULL REFERENCES parent(id)
          );",
+        &Pg2SqliteOptions::default(),
     );
     let (orphan_accepted, committed) = insert_orphan(&mut connection, true);
 

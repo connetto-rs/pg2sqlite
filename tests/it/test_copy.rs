@@ -7,6 +7,8 @@
 use diesel::{connection::SimpleConnection, prelude::*};
 use pg2sqlite::prelude::{Error, Pg2Sqlite, Pg2SqliteOptions};
 
+use crate::helpers;
+
 diesel::define_sql_function! {
     /// Reports whether generated write guards are exempt, true for a restore.
     fn write_is_exempt() -> diesel::sql_types::Bool;
@@ -55,15 +57,6 @@ fn translate(pg: &str, options: &Pg2SqliteOptions) -> Result<Vec<String>, Error>
         .map(pg2sqlite::script::Script::into_vec)
 }
 
-/// Runs the translation of `pg` on a new database.
-fn apply(pg: &str) -> SqliteConnection {
-    let mut connection = SqliteConnection::establish(":memory:").expect("connect");
-    for statement in translate(pg, &Pg2SqliteOptions::default()).expect("translate") {
-        connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
-    }
-    connection
-}
-
 fn rows(connection: &mut SqliteConnection) -> Vec<(Option<i32>, Option<String>)> {
     schema::t::table
         .select((schema::t::a, schema::t::b))
@@ -79,20 +72,23 @@ fn refused(pg: &str) {
 
 #[test]
 fn a_text_payload_becomes_its_rows() {
-    let mut connection = apply(&format!("{BASE} COPY t (a, b) FROM stdin;\n1\t\\N\n2\ty\n\\.\n"));
+    let mut connection =
+        helpers::apply_default(&format!("{BASE} COPY t (a, b) FROM stdin;\n1\t\\N\n2\ty\n\\.\n"))
+            .expect("apply");
     assert_eq!(rows(&mut connection), [(Some(1), None), (Some(2), Some("y".to_owned()))]);
 }
 
 #[test]
 fn text_escapes_decode_and_the_null_string_matches_before_them() {
-    let mut connection = apply(&format!(
+    let mut connection = helpers::apply_default(&format!(
         "{BASE} COPY t (a, b) FROM stdin;\n\
          1\ttab\\there\n\
          2\t\\101\\x42\\\\\\N\n\
          3\tsplit\\\tfield\n\
          4\t\\\\N\n\
          \\."
-    ));
+    ))
+    .expect("apply");
     assert_eq!(
         rows(&mut connection),
         [
@@ -106,15 +102,16 @@ fn text_escapes_decode_and_the_null_string_matches_before_them() {
 
 #[test]
 fn a_custom_delimiter_and_null_string_apply() {
-    let mut connection = apply(&format!(
+    let mut connection = helpers::apply_default(&format!(
         "{BASE} COPY t (a, b) FROM stdin WITH (DELIMITER '|', NULL 'nil');\n1|nil\n2|x\n\\.\n"
-    ));
+    ))
+    .expect("apply");
     assert_eq!(rows(&mut connection), [(Some(1), None), (Some(2), Some("x".to_owned()))]);
 }
 
 #[test]
 fn csv_quotes_carry_delimiters_newlines_and_doubled_quotes() {
-    let mut connection = apply(&format!(
+    let mut connection = helpers::apply_default(&format!(
         "{BASE} COPY t (a, b) FROM stdin WITH (FORMAT csv, HEADER);\n\
          a,b\n\
          1,\"one, two\"\n\
@@ -123,7 +120,8 @@ fn csv_quotes_carry_delimiters_newlines_and_doubled_quotes() {
          4,\n\
          5,\"\"\n\
          \\.\n"
-    ));
+    ))
+    .expect("apply");
     assert_eq!(
         rows(&mut connection),
         [
@@ -138,20 +136,22 @@ fn csv_quotes_carry_delimiters_newlines_and_doubled_quotes() {
 
 #[test]
 fn force_null_and_force_not_null_flip_the_null_match() {
-    let mut connection = apply(&format!(
+    let mut connection = helpers::apply_default(&format!(
         "{BASE} COPY t (a, b) FROM stdin WITH (FORMAT csv, FORCE_NOT_NULL (b));\n1,\n\\.\n\
          COPY t (a, b) FROM stdin WITH (FORMAT csv, FORCE_NULL (b));\n2,\"\"\n\\.\n"
-    ));
+    ))
+    .expect("apply");
     assert_eq!(rows(&mut connection), [(Some(1), Some(String::new())), (Some(2), None)]);
 }
 
 #[test]
 fn a_copy_without_columns_fills_every_column_but_the_generated_ones() {
-    let mut connection = apply(
+    let mut connection = helpers::apply_default(
         "CREATE TABLE g (id INT PRIMARY KEY, flag BOOLEAN NOT NULL, \
          twice INT GENERATED ALWAYS AS (id * 2) STORED);\n\
          COPY g FROM stdin;\n3\tt\n4\tf\n\\.\n",
-    );
+    )
+    .expect("apply");
     let loaded: Vec<(i32, bool, i32)> = schema::g::table
         .select((schema::g::id, schema::g::flag, schema::g::twice))
         .order(schema::g::id)
@@ -162,7 +162,8 @@ fn a_copy_without_columns_fills_every_column_but_the_generated_ones() {
 
 #[test]
 fn an_empty_payload_writes_nothing() {
-    let mut connection = apply(&format!("{BASE} COPY t (a, b) FROM stdin;\n\\.\n"));
+    let mut connection =
+        helpers::apply_default(&format!("{BASE} COPY t (a, b) FROM stdin;\n\\.\n")).expect("apply");
     assert_eq!(rows(&mut connection), []);
 }
 
@@ -232,11 +233,12 @@ fn options_postgresql_refuses_or_the_translator_cannot_decode_are_refused() {
 
 #[test]
 fn the_legacy_option_spellings_apply() {
-    let mut connection = apply(&format!(
+    let mut connection = helpers::apply_default(&format!(
         "{BASE} COPY t (a, b) FROM stdin WITH DELIMITER '|' NULL 'nil';\n1|nil\n\\.\n\
          COPY t (a, b) FROM stdin WITH CSV HEADER QUOTE '|' ESCAPE '!' FORCE NOT NULL b;\n\
          a,b\n2,\n3,|x!|y!!|\n\\.\n"
-    ));
+    ))
+    .expect("apply");
     assert_eq!(
         rows(&mut connection),
         [(Some(1), None), (Some(2), Some(String::new())), (Some(3), Some("x|y!".to_owned()))]
@@ -245,8 +247,10 @@ fn the_legacy_option_spellings_apply() {
 
 #[test]
 fn carriage_return_line_endings_are_read_when_every_row_uses_them() {
-    let mut connection =
-        apply(&format!("{BASE} COPY t (a, b) FROM stdin;\r\n1\tx\r\n2\ty\r\n\\.\r\n"));
+    let mut connection = helpers::apply_default(&format!(
+        "{BASE} COPY t (a, b) FROM stdin;\r\n1\tx\r\n2\ty\r\n\\.\r\n"
+    ))
+    .expect("apply");
     assert_eq!(
         rows(&mut connection),
         [(Some(1), Some("x".to_owned())), (Some(2), Some("y".to_owned()))]
@@ -256,8 +260,10 @@ fn carriage_return_line_endings_are_read_when_every_row_uses_them() {
 
 #[test]
 fn short_octal_and_hex_escapes_decode_and_invalid_utf8_is_refused() {
-    let mut connection =
-        apply(&format!("{BASE} COPY t (a, b) FROM stdin;\n5\t\\x4g\\7z\\xq\n\\.\n"));
+    let mut connection = helpers::apply_default(&format!(
+        "{BASE} COPY t (a, b) FROM stdin;\n5\t\\x4g\\7z\\xq\n\\.\n"
+    ))
+    .expect("apply");
     assert_eq!(rows(&mut connection), [(Some(5), Some("\u{4}g\u{7}zxq".to_owned()))]);
     refused(&format!("{BASE} COPY t (a, b) FROM stdin;\n1\t\\377\n\\.\n"));
 }
@@ -289,15 +295,19 @@ fn copy_from_a_query_is_rejected() {
 
 #[test]
 fn the_control_character_escapes_decode() {
-    let mut connection =
-        apply(&format!("{BASE} COPY t (a, b) FROM stdin;\n6\t\\b\\f\\n\\r\\v\n\\.\n"));
+    let mut connection = helpers::apply_default(&format!(
+        "{BASE} COPY t (a, b) FROM stdin;\n6\t\\b\\f\\n\\r\\v\n\\.\n"
+    ))
+    .expect("apply");
     assert_eq!(rows(&mut connection), [(Some(6), Some("\u{8}\u{c}\n\r\u{b}".to_owned()))]);
 }
 
 #[test]
 fn an_explicit_text_format_reads_carriage_return_rows() {
-    let mut connection =
-        apply(&format!("{BASE} COPY t (a, b) FROM stdin WITH (FORMAT text);\r1\tx\r\\.\r"));
+    let mut connection = helpers::apply_default(&format!(
+        "{BASE} COPY t (a, b) FROM stdin WITH (FORMAT text);\r1\tx\r\\.\r"
+    ))
+    .expect("apply");
     assert_eq!(rows(&mut connection), [(Some(1), Some("x".to_owned()))]);
 }
 
@@ -310,10 +320,11 @@ fn a_line_break_in_the_delimiter_or_null_string_is_refused() {
 
 #[test]
 fn a_quoted_column_is_written_and_matched_by_its_exact_name() {
-    let mut connection = apply(
+    let mut connection = helpers::apply_default(
         "CREATE TABLE q (id INT PRIMARY KEY, \"Odd Name\" TEXT);\n\
          COPY q FROM stdin WITH (FORMAT csv, FORCE_NULL (\"Odd Name\"));\n1,\"\"\n\\.\n",
-    );
+    )
+    .expect("apply");
     let loaded: Vec<(i32, Option<String>)> = schema::q::table
         .select((schema::q::id, schema::q::odd))
         .load(&mut connection)

@@ -9,7 +9,7 @@ use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use run_translated_helper::run_translated_with;
 use rusqlite::Connection;
 
-use crate::helpers::run_translated as run_translated_helper;
+use crate::helpers::{run_translated as run_translated_helper, translate::assert_refused};
 
 const FIXTURE: &str = "CREATE TABLE t (id INT PRIMARY KEY, s TEXT);
      INSERT INTO t VALUES (1, 'one');";
@@ -82,14 +82,12 @@ fn a_longer_alias_list_is_refused() {
 /// not declare is refused naming it.
 #[test]
 fn an_alias_list_over_an_undeclared_relation_is_refused() {
-    let error = refuse("SELECT * FROM absent AS x (a)");
-    assert!(error.contains("absent"), "the refusal must name the relation, got: {error}");
+    assert_refused(&format!("{FIXTURE} SELECT * FROM absent AS x (a);"), "absent");
 }
 
 /// A data type in the list belongs to a function returning `record`, and
 /// PostgreSQL refuses it on a table.
 #[test]
 fn a_data_type_in_the_alias_list_is_refused() {
-    let error = refuse("SELECT * FROM t AS x (a INT)");
-    assert!(error.contains("data type"), "the refusal must name the construct, got: {error}");
+    assert_refused(&format!("{FIXTURE} SELECT * FROM t AS x (a INT);"), "data type");
 }

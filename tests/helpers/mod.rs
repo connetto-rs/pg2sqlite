@@ -531,6 +531,42 @@ pub fn apply_statements(stmts: &[String]) -> SqliteConnection {
     conn
 }
 
+/// Applies every non-query statement of `stmts` to a fresh in-memory
+/// connection and returns it, proving the emitted DDL runs.
+///
+/// # Panics
+///
+/// Panics when the connection cannot be opened or a statement is rejected.
+pub fn apply_ddl(stmts: &[String]) -> SqliteConnection {
+    let mut conn = SqliteConnection::establish(":memory:").expect("connect");
+    for stmt in stmts.iter().filter(|s| !s.to_ascii_uppercase().trim_start().starts_with("SELECT"))
+    {
+        // Emitted DDL is not expressible via the typed DSL.
+        diesel::sql_query(stmt)
+            .execute(&mut conn)
+            .unwrap_or_else(|error| panic!("emitted DDL failed: {error}\n{stmt}"));
+    }
+    conn
+}
+
+/// Applies every statement of `stmts` to a fresh in-memory rusqlite
+/// connection and returns it, panicking on the first failure.
+///
+/// # Panics
+///
+/// Panics when the connection cannot be opened or a statement is rejected.
+pub fn apply_rusqlite_statements(stmts: &[String]) -> rusqlite::Connection {
+    let connection = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+    for statement in stmts {
+        // Emitted SQL is the artifact under test, which no typed DSL can
+        // stand in for.
+        connection
+            .execute_batch(&format!("{statement};"))
+            .unwrap_or_else(|error| panic!("emitted statement failed: {error}\n{statement}"));
+    }
+    connection
+}
+
 /// Executes each non-empty newline-separated statement of `output` against
 /// an in-memory SQLite, proving the joined output runs.
 pub fn execute_joined_statements(output: &str) {

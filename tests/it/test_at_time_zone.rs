@@ -25,7 +25,7 @@ use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use run_translated_helper::run_translated_with;
 use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
 
-use crate::helpers::run_translated as run_translated_helper;
+use crate::helpers::{run_translated as run_translated_helper, translate::assert_refused};
 
 const TABLE: &str = "CREATE TABLE t (id INT PRIMARY KEY, naive TIMESTAMP, aware TIMESTAMPTZ);
      INSERT INTO t VALUES (1, '2023-01-15 12:00:00', '2023-01-15 12:00:00');";
@@ -57,15 +57,6 @@ fn evaluate_fractional(expression: &str) -> Vec<Option<String>> {
         &format!("{FRACTIONAL_TABLE} SELECT {expression} FROM f ORDER BY id;"),
         &Pg2SqliteOptions::default(),
     )
-}
-
-fn refuse(expression: &str) -> String {
-    Pg2Sqlite::default()
-        .sql(&format!("{TABLE} SELECT {expression} FROM t;"))
-        .expect("parse")
-        .translate(&Pg2SqliteOptions::default())
-        .expect_err("this operand has no determinable direction")
-        .to_string()
 }
 
 /// Reverse translates `sqlite` against `schema` and returns the refusal.
@@ -103,8 +94,10 @@ fn reverse_stmt(schema: &str, sqlite: &str) -> sqlparser::ast::Statement {
 /// `c()` keeps the operand non-replayable.
 #[test]
 fn at_time_zone_volatile_operand_is_refused() {
-    let message = refuse("(c()::timestamptz) AT TIME ZONE 'UTC'");
-    assert!(message.contains("AT TIME ZONE"), "the refusal names the construct: {message}");
+    assert_refused(
+        &format!("{TABLE} SELECT (c()::timestamptz) AT TIME ZONE 'UTC' FROM t;"),
+        "AT TIME ZONE",
+    );
 }
 
 /// Forward translates a whole script and returns its last emitted statement.
@@ -272,15 +265,19 @@ fn a_utc_prefixed_offset_reads_the_same_way() {
 /// is not a timestamp.
 #[test]
 fn an_operand_of_unknown_type_is_refused() {
-    let error = refuse("(SELECT max(naive) FROM t) AT TIME ZONE '+05:30'");
-    assert!(error.contains("AT TIME ZONE"), "the error must name the construct, got: {error}");
+    assert_refused(
+        &format!("{TABLE} SELECT (SELECT max(naive) FROM t) AT TIME ZONE '+05:30' FROM t;"),
+        "AT TIME ZONE",
+    );
 }
 
 /// A named zone still has no SQLite equivalent.
 #[test]
 fn a_named_zone_is_refused() {
-    let error = refuse("naive AT TIME ZONE 'America/New_York'");
-    assert!(error.contains("AT TIME ZONE"), "got: {error}");
+    assert_refused(
+        &format!("{TABLE} SELECT naive AT TIME ZONE 'America/New_York' FROM t;"),
+        "AT TIME ZONE",
+    );
 }
 
 /// An aware operand's offset is negated on the way out, so the reverse

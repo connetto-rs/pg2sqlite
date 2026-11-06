@@ -6,6 +6,8 @@
 use diesel::{Connection, QueryResult, RunQueryDsl, SqliteConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
+use crate::helpers;
+
 // The RLS view is the user-visible surface; backing table is for result reads.
 diesel::table! {
     rts (id) {
@@ -44,25 +46,6 @@ const RTS_SCHEMA: &str = "
     CREATE TRIGGER rts_tag_trg BEFORE INSERT ON rts FOR EACH ROW EXECUTE FUNCTION rts_tag();
 ";
 
-fn apply(pg: &str) -> SqliteConnection {
-    let opts = Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit");
-    let stmts = Pg2Sqlite::default()
-        .sql(pg)
-        .expect("parse")
-        .translate_to_sql(&opts)
-        .expect("translate")
-        .into_vec();
-    let mut conn = SqliteConnection::establish(":memory:").expect("connect");
-    // Translated DDL is not expressible via diesel's typed DSL.
-    diesel::sql_query("PRAGMA recursive_triggers = ON").execute(&mut conn).expect("pragma");
-    for stmt in &stmts {
-        diesel::sql_query(stmt.as_str())
-            .execute(&mut conn)
-            .unwrap_or_else(|e| panic!("DDL: {e}\n{stmt}"));
-    }
-    conn
-}
-
 fn insert_via_view(conn: &mut SqliteConnection, id: i32, tag: &str) -> QueryResult<usize> {
     // INSERT goes through the INSTEAD OF INSERT trigger on the RLS view.
     diesel::sql_query(format!("INSERT INTO rts (id, tag) VALUES ({id}, '{tag}')")).execute(conn)
@@ -71,7 +54,10 @@ fn insert_via_view(conn: &mut SqliteConnection, id: i32, tag: &str) -> QueryResu
 /// PostgreSQL: INSERT (1,'a') succeeds and tag becomes 'a*'.
 #[test]
 fn insert_through_rls_view_with_before_insert_trigger_applies_mutation() {
-    let mut conn = apply(RTS_SCHEMA);
+    let mut conn = helpers::apply_translated_ddl(
+        RTS_SCHEMA,
+        &Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit"),
+    );
     insert_via_view(&mut conn, 1, "a").expect("INSERT must succeed");
 
     let rows = rts_rls::table
@@ -87,7 +73,10 @@ fn insert_through_rls_view_with_before_insert_trigger_applies_mutation() {
 /// The INSERT policy (id > 0) must still reject id = 0.
 #[test]
 fn insert_policy_still_enforced_when_trigger_is_present() {
-    let mut conn = apply(RTS_SCHEMA);
+    let mut conn = helpers::apply_translated_ddl(
+        RTS_SCHEMA,
+        &Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit"),
+    );
     let result = insert_via_view(&mut conn, 0, "x");
     assert!(result.is_err(), "id=0 violates INSERT WITH CHECK (id > 0)");
 }
@@ -95,7 +84,10 @@ fn insert_policy_still_enforced_when_trigger_is_present() {
 /// DELETE through the view must succeed after the INSERT.
 #[test]
 fn delete_after_insert_succeeds() {
-    let mut conn = apply(RTS_SCHEMA);
+    let mut conn = helpers::apply_translated_ddl(
+        RTS_SCHEMA,
+        &Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit"),
+    );
     insert_via_view(&mut conn, 1, "a").expect("insert");
     diesel::sql_query("DELETE FROM rts WHERE id = 1")
         .execute(&mut conn)
@@ -109,7 +101,10 @@ fn delete_after_insert_succeeds() {
 /// UPDATE policy; the maintenance exemption does not cover caller writes.
 #[test]
 fn direct_backing_update_denied_without_update_policy() {
-    let mut conn = apply(RTS_SCHEMA);
+    let mut conn = helpers::apply_translated_ddl(
+        RTS_SCHEMA,
+        &Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit"),
+    );
     insert_via_view(&mut conn, 1, "a").expect("insert");
 
     // This is a caller update directly to the backing table, not a maintenance
@@ -190,7 +185,10 @@ fn rls_two_column_maintenance_trigger_exemption_fires() {
     assert!(update_check.contains(" OR "), "conditions must be joined by OR: {update_check}");
 
     // Execute: INSERT through the view must succeed.
-    let mut conn = apply(ITEMS_SCHEMA);
+    let mut conn = helpers::apply_translated_ddl(
+        ITEMS_SCHEMA,
+        &Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit"),
+    );
     diesel::insert_into(items::table)
         .values((items::id.eq(1_i32), items::tag.eq("hello"), items::slug.eq("world")))
         .execute(&mut conn)

@@ -3,7 +3,8 @@
 //! These expressions pass through directly as SQLite supports them.
 
 use diesel::prelude::*;
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+
+use crate::helpers;
 
 mod schema {
     diesel::table! {
@@ -45,14 +46,8 @@ fn test_is_true_translation() -> Result<(), Box<dyn std::error::Error>> {
         SELECT * FROM flags WHERE active IS TRUE;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     assert!(
         select_stmt.to_uppercase().contains("IS TRUE"),
@@ -79,15 +74,7 @@ fn test_is_true_semantic() -> Result<(), Box<dyn std::error::Error>> {
         );
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut conn = diesel::SqliteConnection::establish(":memory:")?;
-
-    // Execute DDL
-    for stmt in &translated {
-        diesel::sql_query(&stmt.to_string()).execute(&mut conn)?;
-    }
+    let mut conn = helpers::apply_default(sql)?;
 
     // Insert test data using diesel
     diesel::insert_into(flags::table)
@@ -122,14 +109,8 @@ fn test_is_false_translation() -> Result<(), Box<dyn std::error::Error>> {
         SELECT * FROM flags WHERE active IS FALSE;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     assert!(
         select_stmt.to_uppercase().contains("IS FALSE"),
@@ -156,14 +137,7 @@ fn test_is_false_semantic() -> Result<(), Box<dyn std::error::Error>> {
         );
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut conn = diesel::SqliteConnection::establish(":memory:")?;
-
-    for stmt in &translated {
-        diesel::sql_query(&stmt.to_string()).execute(&mut conn)?;
-    }
+    let mut conn = helpers::apply_default(sql)?;
 
     diesel::insert_into(flags::table)
         .values(&Flag { id: 1, name: "flag1".to_string(), active: Some(true) })
@@ -195,14 +169,8 @@ fn test_is_not_true_translation() -> Result<(), Box<dyn std::error::Error>> {
         SELECT * FROM flags WHERE active IS NOT TRUE;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     assert!(
         select_stmt.to_uppercase().contains("IS NOT TRUE"),
@@ -229,14 +197,8 @@ fn test_is_not_false_translation() -> Result<(), Box<dyn std::error::Error>> {
         SELECT * FROM flags WHERE active IS NOT FALSE;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     assert!(
         select_stmt.to_uppercase().contains("IS NOT FALSE"),

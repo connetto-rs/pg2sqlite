@@ -8,6 +8,8 @@
 use diesel::{RunQueryDsl, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
+use crate::helpers;
+
 /// UNION (with implicit deduplication) must survive translation.
 #[test]
 fn test_union_query_translation() {
@@ -107,26 +109,14 @@ fn test_union_all_executes_in_sqlite() -> Result<(), Box<dyn std::error::Error>>
         CREATE TABLE src2 (val INTEGER);
         SELECT val FROM src1 UNION ALL SELECT val FROM src2;
     ";
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
+    let (translated, union_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
-    let mut conn = diesel::sqlite::SqliteConnection::establish(":memory:")?;
-
-    // Execute DDL statements
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut conn)?;
-    }
+    let mut conn = helpers::apply_ddl(&translated);
 
     // Populate the tables
     diesel::sql_query("INSERT INTO src1 VALUES (1), (2), (3)").execute(&mut conn)?;
     diesel::sql_query("INSERT INTO src2 VALUES (2), (3), (4)").execute(&mut conn)?;
-
-    // Find the translated SELECT statement
-    let union_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct Row {
@@ -154,23 +144,13 @@ fn test_union_deduplicates_in_sqlite() -> Result<(), Box<dyn std::error::Error>>
         CREATE TABLE right_t (a INTEGER);
         SELECT a FROM left_t UNION SELECT a FROM right_t;
     ";
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
+    let (translated, union_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
-    let mut conn = diesel::sqlite::SqliteConnection::establish(":memory:")?;
-
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut conn)?;
-    }
+    let mut conn = helpers::apply_ddl(&translated);
 
     diesel::sql_query("INSERT INTO left_t VALUES (1), (2), (3)").execute(&mut conn)?;
     diesel::sql_query("INSERT INTO right_t VALUES (2), (3), (4)").execute(&mut conn)?;
-
-    let union_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .unwrap()
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct Row {

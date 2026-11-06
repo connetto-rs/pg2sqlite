@@ -201,16 +201,11 @@ fn test_in_list_semantic() -> Result<(), Box<dyn std::error::Error>> {
         SELECT id FROM items WHERE category IN ('electronics', 'books');
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Execute DDL
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert test data using Diesel ORM
     diesel::insert_into(items::table)
@@ -222,12 +217,6 @@ fn test_in_list_semantic() -> Result<(), Box<dyn std::error::Error>> {
     diesel::insert_into(items::table)
         .values(&Item { id: 3, category: "clothing".to_string() })
         .execute(&mut connection)?;
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct IdResult {
@@ -280,16 +269,11 @@ fn test_in_subquery_semantic() -> Result<(), Box<dyn std::error::Error>> {
         SELECT name FROM users WHERE id IN (SELECT user_id FROM orders);
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Execute DDL
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert test data using Diesel ORM
     diesel::insert_into(users::table)
@@ -306,12 +290,6 @@ fn test_in_subquery_semantic() -> Result<(), Box<dyn std::error::Error>> {
     use crate::test_expr_translation::orders::dsl::*;
     diesel::insert_into(orders).values((id.eq(1), user_id.eq(Some(1)))).execute(&mut connection)?;
     diesel::insert_into(orders).values((id.eq(2), user_id.eq(Some(2)))).execute(&mut connection)?;
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct NameResult {
@@ -356,16 +334,11 @@ fn test_between_semantic() -> Result<(), Box<dyn std::error::Error>> {
         SELECT id FROM products WHERE price BETWEEN 10 AND 50;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Execute DDL
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert test data using Diesel ORM
     diesel::insert_into(products::table)
@@ -383,12 +356,6 @@ fn test_between_semantic() -> Result<(), Box<dyn std::error::Error>> {
     diesel::insert_into(products::table)
         .values(&Product { id: 5, price: 100 })
         .execute(&mut connection)?; // too high
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct IdResult {
@@ -446,16 +413,11 @@ fn test_case_searched_semantic() -> Result<(), Box<dyn std::error::Error>> {
         FROM scores;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Execute DDL
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert test data using Diesel ORM
     diesel::insert_into(scores::table)
@@ -470,12 +432,6 @@ fn test_case_searched_semantic() -> Result<(), Box<dyn std::error::Error>> {
     diesel::insert_into(scores::table)
         .values(&Score { id: 4, score: 50 })
         .execute(&mut connection)?;
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct GradeResult {
@@ -530,16 +486,11 @@ fn test_scalar_subquery_semantic() -> Result<(), Box<dyn std::error::Error>> {
         FROM users;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Execute DDL
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert test data using Diesel ORM
     diesel::insert_into(users::table)
@@ -557,12 +508,6 @@ fn test_scalar_subquery_semantic() -> Result<(), Box<dyn std::error::Error>> {
     diesel::insert_into(orders::table)
         .values(&Order { id: 3, user_id: Some(2), amount: Some(200), status: None, date: None })
         .execute(&mut connection)?;
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct UserTotal {
@@ -615,28 +560,17 @@ fn test_extract_fields_semantic() -> Result<(), Box<dyn std::error::Error>> {
         FROM events;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Execute DDL
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert test data with ISO date format using Diesel ORM
     use crate::test_expr_translation::events::dsl::*;
     diesel::insert_into(events)
         .values((id.eq(1), event_date.eq("2024-03-15")))
         .execute(&mut connection)?;
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct DateParts {
@@ -672,27 +606,16 @@ fn test_extract_time_fields_semantic() -> Result<(), Box<dyn std::error::Error>>
         FROM logs;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Execute DDL
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert test data with ISO datetime format using Diesel ORM
     diesel::insert_into(logs::table)
         .values(&Log { id: 1, timestamp: "2024-03-15 14:30:45".to_string() })
         .execute(&mut connection)?;
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct TimeParts {
@@ -725,16 +648,11 @@ fn test_extract_in_where_clause() -> Result<(), Box<dyn std::error::Error>> {
         SELECT name FROM events WHERE EXTRACT(YEAR FROM event_date) = 2024;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Execute DDL
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert test data using Diesel ORM
     diesel::insert_into(events::table)
@@ -746,12 +664,6 @@ fn test_extract_in_where_clause() -> Result<(), Box<dyn std::error::Error>> {
     diesel::insert_into(events::table)
         .values(&Event { id: 3, date: "2024-12-25".to_string(), name: Some("Event C".to_string()) })
         .execute(&mut connection)?;
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct NameResult {
@@ -792,16 +704,11 @@ fn test_combined_expressions() -> Result<(), Box<dyn std::error::Error>> {
           AND amount BETWEEN 50 AND 5000;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Execute DDL
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert test data using Diesel ORM
     diesel::insert_into(orders::table)
@@ -840,12 +747,6 @@ fn test_combined_expressions() -> Result<(), Box<dyn std::error::Error>> {
             date: Some("2024-02-01".to_string()),
         })
         .execute(&mut connection)?; // excluded by amount
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct OrderResult {
@@ -916,14 +817,8 @@ fn test_at_time_zone_fixed_offset_semantic() -> Result<(), Box<dyn std::error::E
         ORDER BY id;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     assert!(
         !select_stmt.to_uppercase().contains("AT TIME ZONE"),
@@ -934,13 +829,8 @@ fn test_at_time_zone_fixed_offset_semantic() -> Result<(), Box<dyn std::error::E
         "Expected datetime(...) rewrite, got: {select_stmt}"
     );
 
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
-
     // Execute DDL
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     diesel::insert_into(time_samples::table)
         .values(&[

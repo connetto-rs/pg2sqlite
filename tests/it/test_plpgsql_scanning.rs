@@ -8,24 +8,25 @@
 //! The literal cases read the declared value back out of the row, so a default
 //! that is mangled rather than lost is visible.
 
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use rusqlite::Connection;
+
+use crate::helpers;
+
+/// The schema and trigger around the body under test.
+fn template(body: &str) -> String {
+    format!(
+        "CREATE TABLE t (id INT PRIMARY KEY, val INT, note TEXT);
+         CREATE TABLE log (note TEXT);
+         CREATE FUNCTION f() RETURNS trigger AS $$
+         {body}
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER go BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f();"
+    )
+}
 
 /// Translate a trigger whose function body is `body`, then apply it.
 fn apply(body: &str) -> Result<Connection, String> {
-    let statements = Pg2Sqlite::default()
-        .sql(&format!(
-            "CREATE TABLE t (id INT PRIMARY KEY, val INT, note TEXT);
-             CREATE TABLE log (note TEXT);
-             CREATE FUNCTION f() RETURNS trigger AS $$
-             {body}
-             $$ LANGUAGE plpgsql;
-             CREATE TRIGGER go BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f();"
-        ))
-        .map_err(|error| error.to_string())?
-        .translate_to_sql(&Pg2SqliteOptions::default())
-        .map(pg2sqlite::script::Script::into_vec)
-        .map_err(|error| error.to_string())?;
+    let statements = helpers::translate_default_statements(&template(body))?;
 
     let connection = Connection::open_in_memory().expect("in-memory SQLite");
     for statement in &statements {

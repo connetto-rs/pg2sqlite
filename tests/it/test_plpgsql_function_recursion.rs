@@ -1,7 +1,7 @@
 //! Tests for plpgsql function arm recursion into parameters, filter, over,
 //! and within_group clauses.
 
-use helpers::{translate_sql, translate_statements};
+use helpers::translate_sql;
 use pg2sqlite::prelude::{Pg2SqliteOptions, UuidRepresentation};
 
 use crate::helpers;
@@ -30,11 +30,8 @@ fn plpgsql_trigger_translates_function_in_window_partition() {
         lower.contains("uuid()"),
         "gen_random_uuid should be translated to uuid() in trigger body: {sql}"
     );
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    for s in &translate_statements(raw, &options).unwrap() {
-        conn.execute_batch(&format!("{s};"))
-            .unwrap_or_else(|e| panic!("emitted SQL failed: {e}\n{s}"));
-    }
+    let stmts = helpers::translate_pg(raw, &options).unwrap();
+    helpers::apply_rusqlite_statements(&stmts);
 }
 
 #[test]
@@ -61,11 +58,8 @@ fn plpgsql_trigger_translates_subquery_order_by() {
         lower.contains("uuid()"),
         "gen_random_uuid in trigger body should be translated to uuid(): {sql}"
     );
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    for s in &translate_statements(raw, &options).unwrap() {
-        conn.execute_batch(&format!("{s};"))
-            .unwrap_or_else(|e| panic!("emitted SQL failed: {e}\n{s}"));
-    }
+    let stmts = helpers::translate_pg(raw, &options).unwrap();
+    helpers::apply_rusqlite_statements(&stmts);
 }
 
 #[test]
@@ -95,11 +89,8 @@ fn plpgsql_trigger_translates_union_all_body() {
         count >= 2,
         "expected at least 2 uuid() occurrences in UNION ALL body, got {count}: {sql}"
     );
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    for s in &translate_statements(raw, &options).unwrap() {
-        conn.execute_batch(&format!("{s};"))
-            .unwrap_or_else(|e| panic!("emitted SQL failed: {e}\n{s}"));
-    }
+    let stmts = helpers::translate_pg(raw, &options).unwrap();
+    helpers::apply_rusqlite_statements(&stmts);
 }
 
 #[test]

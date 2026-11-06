@@ -28,7 +28,7 @@ use diesel::{Connection, SqliteConnection, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use run_translated_helper::run_translated_with;
 
-use crate::helpers::run_translated as run_translated_helper;
+use crate::helpers::{run_translated as run_translated_helper, translate::assert_refused};
 
 const FIXTURE: &str = "CREATE TABLE t (id INT PRIMARY KEY, payload JSONB);
      INSERT INTO t VALUES (1, '[10,20]');";
@@ -77,8 +77,7 @@ fn a_function_with_no_sqlite_form_is_refused_naming_it() {
         ("SELECT * FROM json_to_recordset('[{\"a\":1}]')", "json_to_recordset"),
         ("SELECT * FROM some_extension_function(1)", "some_extension_function"),
     ] {
-        let error = refuse(query);
-        assert!(error.contains(name), "the error must name the function, got: {error}");
+        assert_refused(&format!("{FIXTURE} {query};"), name);
     }
 }
 
@@ -86,8 +85,7 @@ fn a_function_with_no_sqlite_form_is_refused_naming_it() {
 /// recursive CTE that replaces it. A generic refusal would be a regression.
 #[test]
 fn generate_series_keeps_its_specific_advice() {
-    let error = refuse("SELECT * FROM generate_series(1, 3)");
-    assert!(error.contains("RECURSIVE"), "the CTE suggestion must survive, got: {error}");
+    assert_refused(&format!("{FIXTURE} SELECT * FROM generate_series(1, 3);"), "RECURSIVE");
 }
 
 /// A function the caller registered on the destination passes through, which is
@@ -351,6 +349,5 @@ fn a_bare_alias_of_a_two_column_function_is_refused_naming_it() {
 /// the count it saw rather than assuming there were too many.
 #[test]
 fn a_call_with_the_wrong_arity_is_refused() {
-    let error = refuse("SELECT * FROM json_each()");
-    assert!(error.contains("0 arguments"), "the count must be reported, got: {error}");
+    assert_refused(&format!("{FIXTURE} SELECT * FROM json_each();"), "0 arguments");
 }

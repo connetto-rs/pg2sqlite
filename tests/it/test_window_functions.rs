@@ -10,7 +10,7 @@
 #![allow(dead_code)]
 
 use diesel::prelude::*;
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+use pg2sqlite::prelude::Pg2SqliteOptions;
 use rusqlite::Connection as SqliteConn;
 use translate_helpers::translate_default_err as translate_err;
 
@@ -437,19 +437,8 @@ fn test_filter_clause_to_case() {
         SELECT COUNT(*) FILTER (WHERE status = 'active') OVER () AS active_count FROM data;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default()
-        .sql(sql)
-        .unwrap()
-        .translate(&options)
-        .expect("translation must succeed")
-        .into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("should have a SELECT statement")
-        .to_string();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Emission shape: native FILTER kept, no CASE WHEN lowering.
     let lower = select_stmt.to_lowercase();
@@ -461,7 +450,7 @@ fn test_filter_clause_to_case() {
     let conn = SqliteConn::open_in_memory().unwrap();
     let ddl = translated
         .iter()
-        .filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_)))
+        .filter(|s| !s.to_ascii_uppercase().trim_start().starts_with("SELECT"))
         .map(|s| format!("{s};"))
         .collect::<Vec<_>>()
         .join("\n");
@@ -487,14 +476,8 @@ fn test_filter_clause_aggregate_to_case() {
         SELECT COUNT(*) FILTER (WHERE event_type = 'click') AS click_count FROM events;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql).unwrap().translate(&options).unwrap().into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("should have SELECT")
-        .to_string();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Emission shape: FILTER kept natively.
     let lower = select_stmt.to_lowercase();
@@ -505,7 +488,7 @@ fn test_filter_clause_aggregate_to_case() {
     let conn = SqliteConn::open_in_memory().unwrap();
     let ddl = translated
         .iter()
-        .filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_)))
+        .filter(|s| !s.to_ascii_uppercase().trim_start().starts_with("SELECT"))
         .map(|s| format!("{s};"))
         .collect::<Vec<_>>()
         .join("\n");
@@ -532,16 +515,10 @@ fn test_filter_clause_semantic() -> Result<(), Box<dyn std::error::Error>> {
         FROM orders;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
-
-    // Execute DDL
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert test data using Diesel ORM
     diesel::insert_into(orders::table)
@@ -556,13 +533,6 @@ fn test_filter_clause_semantic() -> Result<(), Box<dyn std::error::Error>> {
     diesel::insert_into(orders::table)
         .values(&Order { id: 4, user_id: None, status: Some("cancelled".to_string()), amount: 25 })
         .execute(&mut connection)?;
-
-    // Execute the SELECT with FILTER->CASE conversion
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct FilterResult {
@@ -592,16 +562,10 @@ fn test_row_number_semantic() -> Result<(), Box<dyn std::error::Error>> {
         SELECT name, ROW_NUMBER() OVER (ORDER BY id) as row_num FROM items;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
-
-    // Execute DDL
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert test data using Diesel ORM
     diesel::insert_into(items::table)
@@ -613,13 +577,6 @@ fn test_row_number_semantic() -> Result<(), Box<dyn std::error::Error>> {
     diesel::insert_into(items::table)
         .values(&Item { id: 3, name: Some("cherry".to_string()), value: None })
         .execute(&mut connection)?;
-
-    // Execute the SELECT with window function
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct ItemWithRow {
@@ -653,16 +610,10 @@ fn test_lag_lead_semantic() -> Result<(), Box<dyn std::error::Error>> {
         FROM time_series;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
-
-    // Execute DDL
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert test data using Diesel ORM
     diesel::insert_into(time_series::table)
@@ -674,13 +625,6 @@ fn test_lag_lead_semantic() -> Result<(), Box<dyn std::error::Error>> {
     diesel::insert_into(time_series::table)
         .values(&TimeSeries { id: 3, value: 30 })
         .execute(&mut connection)?;
-
-    // Execute the SELECT with window function
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct ValueWithLagLead {
@@ -729,16 +673,10 @@ fn test_running_total_semantic() -> Result<(), Box<dyn std::error::Error>> {
         FROM transactions;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
-
-    // Execute DDL
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert test data using Diesel ORM
     diesel::insert_into(transactions::table)
@@ -750,13 +688,6 @@ fn test_running_total_semantic() -> Result<(), Box<dyn std::error::Error>> {
     diesel::insert_into(transactions::table)
         .values(&Transaction { id: 3, amount: 75 })
         .execute(&mut connection)?;
-
-    // Execute the SELECT with window function
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct TxWithRunningTotal {
@@ -792,16 +723,10 @@ fn test_rank_partition_semantic() -> Result<(), Box<dyn std::error::Error>> {
         FROM employees;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
-
-    // Execute DDL
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert test data - two departments using Diesel ORM
     diesel::insert_into(employees::table)
@@ -819,13 +744,6 @@ fn test_rank_partition_semantic() -> Result<(), Box<dyn std::error::Error>> {
     diesel::insert_into(employees::table)
         .values(&Employee { id: 5, dept: "sales".to_string(), salary: 70_000 })
         .execute(&mut connection)?;
-
-    // Execute the SELECT with window function
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct EmpWithRank {
@@ -872,15 +790,10 @@ fn test_dense_rank_semantic() -> Result<(), Box<dyn std::error::Error>> {
         SELECT id, score, DENSE_RANK() OVER (ORDER BY score DESC) as drank FROM scores;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
-
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert scores with ties using Diesel ORM
     diesel::insert_into(scores::table)
@@ -895,12 +808,6 @@ fn test_dense_rank_semantic() -> Result<(), Box<dyn std::error::Error>> {
     diesel::insert_into(scores::table)
         .values(&Score { id: 4, score: 80 })
         .execute(&mut connection)?;
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct ScoreWithRank {
@@ -933,15 +840,10 @@ fn test_ntile_semantic() -> Result<(), Box<dyn std::error::Error>> {
         SELECT id, value, NTILE(3) OVER (ORDER BY value) as bucket FROM items;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
-
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert 9 items so they divide evenly into 3 buckets using Diesel ORM
     for i in 1..=9 {
@@ -949,12 +851,6 @@ fn test_ntile_semantic() -> Result<(), Box<dyn std::error::Error>> {
             .values(&Item { id: i, name: None, value: Some(i) })
             .execute(&mut connection)?;
     }
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct ItemWithBucket {
@@ -992,15 +888,10 @@ fn test_first_last_value_semantic() -> Result<(), Box<dyn std::error::Error>> {
         FROM readings;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
-
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert readings for two sensors using Diesel ORM
     diesel::insert_into(readings::table)
@@ -1015,12 +906,6 @@ fn test_first_last_value_semantic() -> Result<(), Box<dyn std::error::Error>> {
     diesel::insert_into(readings::table)
         .values(&Reading { id: 4, sensor: "B".to_string(), value: 200 })
         .execute(&mut connection)?;
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct ReadingWithFirst {
@@ -1060,15 +945,10 @@ fn test_nth_value_semantic() -> Result<(), Box<dyn std::error::Error>> {
         FROM rankings;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
-
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     diesel::insert_into(rankings::table)
         .values(&Ranking { id: 1, value: 100 })
@@ -1079,12 +959,6 @@ fn test_nth_value_semantic() -> Result<(), Box<dyn std::error::Error>> {
     diesel::insert_into(rankings::table)
         .values(&Ranking { id: 3, value: 60 })
         .execute(&mut connection)?;
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct RankingWithNth {
@@ -1120,15 +994,10 @@ fn test_aggregate_window_semantic() -> Result<(), Box<dyn std::error::Error>> {
         FROM orders;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
-
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // User 1: orders of 100 and 50 using Diesel ORM
     diesel::insert_into(orders::table)
@@ -1141,12 +1010,6 @@ fn test_aggregate_window_semantic() -> Result<(), Box<dyn std::error::Error>> {
     diesel::insert_into(orders::table)
         .values(&Order { id: 3, user_id: Some(2), status: None, amount: 200 })
         .execute(&mut connection)?;
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct OrderWithAgg {

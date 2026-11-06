@@ -2,8 +2,9 @@
 
 #![allow(dead_code)]
 
-use diesel::{RunQueryDsl, SqliteConnection, prelude::*};
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+use diesel::{RunQueryDsl, prelude::*};
+
+use crate::helpers;
 
 // Schema definitions for test tables
 diesel::table! {
@@ -104,7 +105,7 @@ struct User {
 }
 
 #[test]
-fn test_now_translation() -> Result<(), Box<dyn std::error::Error>> {
+fn test_now_translation() {
     let sql = "
         CREATE TABLE events (
             id SERIAL PRIMARY KEY,
@@ -114,14 +115,8 @@ fn test_now_translation() -> Result<(), Box<dyn std::error::Error>> {
         SELECT * FROM events WHERE created_at > NOW();
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Should contain strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'), not NOW()
     assert!(
@@ -136,12 +131,14 @@ fn test_now_translation() -> Result<(), Box<dyn std::error::Error>> {
     // Execute DDL statements and prepare the SELECT to verify SQLite accepts
     // them.
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    for s in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
+    // Only `Query` nodes render SELECT-prefixed, so the text filter skips
+    // exactly the queries the AST filter used to skip.
+    for s in
+        translated.iter().filter(|s| !s.trim_start().to_ascii_uppercase().starts_with("SELECT"))
+    {
         conn.execute_batch(&format!("{s};")).unwrap();
     }
     conn.prepare(&select_stmt).unwrap();
-
-    Ok(())
 }
 
 #[test]
@@ -155,15 +152,7 @@ fn test_now_semantic() -> Result<(), Box<dyn std::error::Error>> {
         INSERT INTO events (name, created_at) VALUES ('test', NOW());
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection = SqliteConnection::establish(":memory:").expect("Failed to connect");
-
-    // Execute all statements
-    for stmt in &translated {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_default(sql)?;
 
     // Verify the row was inserted with a timestamp
     #[derive(QueryableByName, Debug)]
@@ -192,7 +181,7 @@ fn test_now_semantic() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn test_string_agg_translation() -> Result<(), Box<dyn std::error::Error>> {
+fn test_string_agg_translation() {
     let sql = "
         CREATE TABLE tags (
             id SERIAL PRIMARY KEY,
@@ -202,14 +191,8 @@ fn test_string_agg_translation() -> Result<(), Box<dyn std::error::Error>> {
         SELECT item_id, string_agg(tag, ', ') FROM tags GROUP BY item_id;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Should contain group_concat, not string_agg
     assert!(
@@ -224,12 +207,14 @@ fn test_string_agg_translation() -> Result<(), Box<dyn std::error::Error>> {
     // Execute DDL statements and prepare the SELECT to verify SQLite accepts
     // them.
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    for s in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
+    // Only `Query` nodes render SELECT-prefixed, so the text filter skips
+    // exactly the queries the AST filter used to skip.
+    for s in
+        translated.iter().filter(|s| !s.trim_start().to_ascii_uppercase().starts_with("SELECT"))
+    {
         conn.execute_batch(&format!("{s};")).unwrap();
     }
     conn.prepare(&select_stmt).unwrap();
-
-    Ok(())
 }
 
 #[test]
@@ -243,15 +228,11 @@ fn test_coalesce_semantic() -> Result<(), Box<dyn std::error::Error>> {
         SELECT COALESCE(name, description, 'default') as result FROM items;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection = SqliteConnection::establish(":memory:").expect("Failed to connect");
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Execute DDL
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert test data
     diesel::insert_into(items::table)
@@ -267,13 +248,6 @@ fn test_coalesce_semantic() -> Result<(), Box<dyn std::error::Error>> {
     diesel::insert_into(items::table)
         .values(&Item { id: 3, name: None, description: None })
         .execute(&mut connection)?;
-
-    // Get and execute the SELECT statement
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct Result {
@@ -294,7 +268,7 @@ fn test_coalesce_semantic() -> Result<(), Box<dyn std::error::Error>> {
 /// Test that ILIKE is translated to LIKE (SQLite LIKE is case-insensitive for
 /// ASCII).
 #[test]
-fn test_ilike_translation() -> Result<(), Box<dyn std::error::Error>> {
+fn test_ilike_translation() {
     let sql = "
         CREATE TABLE users (
             id SERIAL PRIMARY KEY,
@@ -303,14 +277,8 @@ fn test_ilike_translation() -> Result<(), Box<dyn std::error::Error>> {
         SELECT * FROM users WHERE name ILIKE '%test%';
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Should contain LIKE, not ILIKE
     assert!(
@@ -325,12 +293,14 @@ fn test_ilike_translation() -> Result<(), Box<dyn std::error::Error>> {
     // Execute DDL statements and prepare the SELECT to verify SQLite accepts
     // them.
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    for s in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
+    // Only `Query` nodes render SELECT-prefixed, so the text filter skips
+    // exactly the queries the AST filter used to skip.
+    for s in
+        translated.iter().filter(|s| !s.trim_start().to_ascii_uppercase().starts_with("SELECT"))
+    {
         conn.execute_batch(&format!("{s};")).unwrap();
     }
     conn.prepare(&select_stmt).unwrap();
-
-    Ok(())
 }
 
 #[test]
@@ -343,15 +313,11 @@ fn test_ilike_semantic() -> Result<(), Box<dyn std::error::Error>> {
         SELECT * FROM users WHERE name ILIKE '%test%';
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection = SqliteConnection::establish(":memory:").expect("Failed to connect");
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Execute DDL
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert test data with various cases
     diesel::insert_into(users::table)
@@ -366,13 +332,6 @@ fn test_ilike_semantic() -> Result<(), Box<dyn std::error::Error>> {
     diesel::insert_into(users::table)
         .values(&User { id: 4, name: "other".to_string() })
         .execute(&mut connection)?;
-
-    // Get and execute the SELECT statement
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct UserResult {
@@ -401,15 +360,11 @@ fn test_string_agg_semantic() -> Result<(), Box<dyn std::error::Error>> {
         SELECT item_id, string_agg(tag, ', ') as tags FROM tags GROUP BY item_id;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection = SqliteConnection::establish(":memory:").expect("Failed to connect");
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Execute DDL
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert test data
     diesel::insert_into(tags::table)
@@ -421,13 +376,6 @@ fn test_string_agg_semantic() -> Result<(), Box<dyn std::error::Error>> {
     diesel::insert_into(tags::table)
         .values(&Tag { id: 3, item_id: 2, text: "python".to_string() })
         .execute(&mut connection)?;
-
-    // Get and execute the SELECT statement
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct TagResult {

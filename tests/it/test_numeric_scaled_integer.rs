@@ -15,17 +15,10 @@ use pg2sqlite::{
 };
 use run_translated_helper::run_translated_with;
 
-use crate::helpers::run_translated as run_translated_helper;
-
-fn translate(pg: &str) -> String {
-    Pg2Sqlite::default()
-        .sql(pg)
-        .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
-        .expect("translate")
-        .into_vec()
-        .join("\n")
-}
+use crate::helpers::{
+    run_translated as run_translated_helper,
+    translate::{assert_refused, translate_default},
+};
 
 fn refuse(pg: &str) -> String {
     Pg2Sqlite::default()
@@ -58,7 +51,7 @@ fn a_scaled_numeric_becomes_an_integer() {
 /// `SELECT 9223372036854775807 + 1` answers 9.223372036854776e+18.
 #[test]
 fn the_precision_bound_is_emitted_and_enforced() {
-    let sql = translate("CREATE TABLE t (id INT PRIMARY KEY, price NUMERIC(4,2));");
+    let sql = translate_default("CREATE TABLE t (id INT PRIMARY KEY, price NUMERIC(4,2));");
     assert!(sql.contains("9999"), "expected the 10^p - 1 bound as a literal: {sql}");
 
     let error = run_translated_or_error(
@@ -91,10 +84,9 @@ fn an_unscaled_numeric_is_a_plain_integer() {
 /// integer and silently degrading to REAL is what this item removes.
 #[test]
 fn a_precision_past_eighteen_is_refused() {
-    let error = refuse("CREATE TABLE t (id INT PRIMARY KEY, price NUMERIC(19,2));");
-    assert!(error.contains("19"), "the error must name the precision, got: {error}");
+    assert_refused("CREATE TABLE t (id INT PRIMARY KEY, price NUMERIC(19,2));", "19");
     assert!(
-        translate("CREATE TABLE t (id INT PRIMARY KEY, price NUMERIC(18,2));")
+        translate_default("CREATE TABLE t (id INT PRIMARY KEY, price NUMERIC(18,2));")
             .contains("price INTEGER"),
         "18 is the last one that fits"
     );
@@ -761,7 +753,7 @@ fn a_select_from_another_table_is_unchanged() {
 #[test]
 fn dec_is_decimal_under_another_name() {
     let spell = |ty: &str| {
-        translate(&format!(
+        translate_default(&format!(
             "CREATE TABLE t (id INT PRIMARY KEY, price {ty});
              INSERT INTO t VALUES (1, 19.99);
              UPDATE t SET price = 5.50 WHERE price = 19.99;"

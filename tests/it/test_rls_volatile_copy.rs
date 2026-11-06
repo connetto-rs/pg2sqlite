@@ -11,6 +11,8 @@
 use diesel::prelude::*;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
+use crate::helpers;
+
 fn opts() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit")
 }
@@ -27,15 +29,6 @@ fn refusal(schema: &str) -> String {
     translate_to_sql(schema)
         .expect_err("translation must be refused for a volatile operand")
         .to_string()
-}
-
-fn apply(schema: &str) -> SqliteConnection {
-    let stmts = translate_to_sql(schema).expect("translation must succeed");
-    let mut conn = SqliteConnection::establish(":memory:").expect("in-memory SQLite");
-    for stmt in stmts {
-        diesel::sql_query(stmt).execute(&mut conn).expect("apply DDL");
-    }
-    conn
 }
 
 // Diesel schemas for typed reads and writes in the success tests.
@@ -100,7 +93,7 @@ fn volatile_default_read_by_policy_is_refused() {
 fn deterministic_default_read_by_policy_translates_and_lands_row() {
     use score_schema::{docs, docs_rls};
 
-    let mut conn = apply(
+    let mut conn = helpers::apply_with_options(
         "
         CREATE TABLE docs (
             id INTEGER PRIMARY KEY,
@@ -109,7 +102,9 @@ fn deterministic_default_read_by_policy_translates_and_lands_row() {
         ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
         CREATE POLICY docs_p ON docs FOR ALL USING (score > 0);
     ",
-    );
+        &opts(),
+    )
+    .expect("apply");
     diesel::insert_into(docs::table)
         .values(docs::id.eq(1))
         .execute(&mut conn)
@@ -177,7 +172,7 @@ fn the_refusal_names_the_clause_holding_the_volatile_predicate() {
 fn deterministic_policy_predicate_translates_and_lands_row() {
     use owner_schema::{docs, docs_rls};
 
-    let mut conn = apply(
+    let mut conn = helpers::apply_with_options(
         "
         CREATE TABLE docs (
             id INTEGER PRIMARY KEY,
@@ -186,7 +181,9 @@ fn deterministic_policy_predicate_translates_and_lands_row() {
         ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
         CREATE POLICY docs_p ON docs FOR ALL USING (owner = 'alice');
     ",
-    );
+        &opts(),
+    )
+    .expect("apply");
     diesel::insert_into(docs::table)
         .values((docs::id.eq(1), docs::owner.eq("alice")))
         .execute(&mut conn)

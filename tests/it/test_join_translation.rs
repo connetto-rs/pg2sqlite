@@ -6,7 +6,8 @@
 #![allow(dead_code)]
 
 use diesel::prelude::*;
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+
+use crate::helpers;
 
 diesel::table! {
     /// Test table for authors (used in JOIN tests).
@@ -195,15 +196,19 @@ struct Customer {
 /// Proves the emitted non-query statements run and the emitted `select_stmt`
 /// prepares in SQLite. The statements are translator output, a runtime
 /// string no typed DSL can carry.
-fn prove_script(translated: &[sqlparser::ast::Statement], select_stmt: &str) {
+fn prove_script(translated: &[String], select_stmt: &str) {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
+    // Only `Query` nodes render SELECT-prefixed, so the text filter skips
+    // exactly the queries the AST filter used to skip.
+    for stmt in
+        translated.iter().filter(|s| !s.trim_start().to_ascii_uppercase().starts_with("SELECT"))
+    {
         conn.execute_batch(&format!("{stmt};")).unwrap();
     }
     conn.prepare(select_stmt).unwrap();
 }
 #[test]
-fn test_join_ilike_translation() -> Result<(), Box<dyn std::error::Error>> {
+fn test_join_ilike_translation() {
     let sql = "
         CREATE TABLE users (
             id SERIAL PRIMARY KEY,
@@ -219,14 +224,8 @@ fn test_join_ilike_translation() -> Result<(), Box<dyn std::error::Error>> {
         JOIN posts p ON p.author_name ILIKE u.name;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Should contain LIKE, not ILIKE
     assert!(
@@ -238,12 +237,10 @@ fn test_join_ilike_translation() -> Result<(), Box<dyn std::error::Error>> {
         "Should not contain ILIKE, got: {select_stmt}"
     );
     prove_script(&translated, &select_stmt);
-
-    Ok(())
 }
 
 #[test]
-fn test_join_now_translation() -> Result<(), Box<dyn std::error::Error>> {
+fn test_join_now_translation() {
     let sql = "
         CREATE TABLE events (
             id SERIAL PRIMARY KEY,
@@ -260,14 +257,8 @@ fn test_join_now_translation() -> Result<(), Box<dyn std::error::Error>> {
         JOIN schedules s ON e.event_time > NOW();
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Should contain strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'), not NOW()
     assert!(
@@ -279,12 +270,10 @@ fn test_join_now_translation() -> Result<(), Box<dyn std::error::Error>> {
         "Should not contain NOW(), got: {select_stmt}"
     );
     prove_script(&translated, &select_stmt);
-
-    Ok(())
 }
 
 #[test]
-fn test_join_least_greatest_translation() -> Result<(), Box<dyn std::error::Error>> {
+fn test_join_least_greatest_translation() {
     let sql = "
         CREATE TABLE ranges (
             id SERIAL PRIMARY KEY,
@@ -301,14 +290,8 @@ fn test_join_least_greatest_translation() -> Result<(), Box<dyn std::error::Erro
                             AND v.value <= GREATEST(r.range_start, r.range_end);
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Should contain MIN/MAX, not LEAST/GREATEST
     assert!(
@@ -328,12 +311,10 @@ fn test_join_least_greatest_translation() -> Result<(), Box<dyn std::error::Erro
         "Should not contain GREATEST, got: {select_stmt}"
     );
     prove_script(&translated, &select_stmt);
-
-    Ok(())
 }
 
 #[test]
-fn test_join_subquery_function_translation() -> Result<(), Box<dyn std::error::Error>> {
+fn test_join_subquery_function_translation() {
     let sql = "
         CREATE TABLE categories (
             id SERIAL PRIMARY KEY,
@@ -353,14 +334,8 @@ fn test_join_subquery_function_translation() -> Result<(), Box<dyn std::error::E
         ) sub ON sub.category_id = c.id;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Should contain group_concat, not string_agg
     assert!(
@@ -372,12 +347,10 @@ fn test_join_subquery_function_translation() -> Result<(), Box<dyn std::error::E
         "Should not contain string_agg, got: {select_stmt}"
     );
     prove_script(&translated, &select_stmt);
-
-    Ok(())
 }
 
 #[test]
-fn test_multiple_joins_translation() -> Result<(), Box<dyn std::error::Error>> {
+fn test_multiple_joins_translation() {
     let sql = "
         CREATE TABLE users (
             id SERIAL PRIMARY KEY,
@@ -400,14 +373,8 @@ fn test_multiple_joins_translation() -> Result<(), Box<dyn std::error::Error>> {
         JOIN comments c ON c.commenter_name ILIKE u.name AND c.post_id = p.id;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Count LIKE occurrences (should be 2, translated from ILIKE)
     let like_count = select_stmt.to_uppercase().matches(" LIKE ").count();
@@ -422,12 +389,10 @@ fn test_multiple_joins_translation() -> Result<(), Box<dyn std::error::Error>> {
         "Should not contain ILIKE, got: {select_stmt}"
     );
     prove_script(&translated, &select_stmt);
-
-    Ok(())
 }
 
 #[test]
-fn test_left_join_translation() -> Result<(), Box<dyn std::error::Error>> {
+fn test_left_join_translation() {
     let sql = "
         CREATE TABLE users (
             id SERIAL PRIMARY KEY,
@@ -443,14 +408,8 @@ fn test_left_join_translation() -> Result<(), Box<dyn std::error::Error>> {
         LEFT JOIN posts p ON p.author_name ILIKE u.name;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Should preserve LEFT JOIN and translate ILIKE
     assert!(
@@ -462,8 +421,6 @@ fn test_left_join_translation() -> Result<(), Box<dyn std::error::Error>> {
         "ILIKE should translate to LIKE, got: {select_stmt}"
     );
     prove_script(&translated, &select_stmt);
-
-    Ok(())
 }
 
 #[test]
@@ -483,16 +440,11 @@ fn test_join_ilike_semantic() -> Result<(), Box<dyn std::error::Error>> {
         JOIN books b ON b.author_name ILIKE a.name;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Execute DDL
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert test data using Diesel ORM - author with lowercase name
     diesel::insert_into(authors::table)
@@ -505,13 +457,6 @@ fn test_join_ilike_semantic() -> Result<(), Box<dyn std::error::Error>> {
     diesel::insert_into(books::table)
         .values(&Book { id: 2, author_name: "Bob".to_string(), title: "Book Two".to_string() })
         .execute(&mut connection)?;
-
-    // Get and execute the SELECT statement
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct JoinResult {
@@ -547,16 +492,11 @@ fn test_join_least_greatest_semantic() -> Result<(), Box<dyn std::error::Error>>
         JOIN nums n ON n.val >= LEAST(r.low, r.high) AND n.val <= GREATEST(r.low, r.high);
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Execute DDL
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Range where low > high (to test that LEAST/GREATEST work correctly) using
     // Diesel ORM
@@ -569,13 +509,6 @@ fn test_join_least_greatest_semantic() -> Result<(), Box<dyn std::error::Error>>
     diesel::insert_into(nums::table).values(&Num { id: 3, val: 7 }).execute(&mut connection)?;
     diesel::insert_into(nums::table).values(&Num { id: 4, val: 10 }).execute(&mut connection)?;
     diesel::insert_into(nums::table).values(&Num { id: 5, val: 12 }).execute(&mut connection)?;
-
-    // Get and execute the SELECT statement
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct RangeResult {
@@ -614,16 +547,11 @@ fn test_left_join_semantic() -> Result<(), Box<dyn std::error::Error>> {
         LEFT JOIN employees e ON e.dept_name ILIKE d.name;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Execute DDL
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Two departments using Diesel ORM
     diesel::insert_into(departments::table)
@@ -642,13 +570,6 @@ fn test_left_join_semantic() -> Result<(), Box<dyn std::error::Error>> {
             name: "Alice".to_string(),
         })
         .execute(&mut connection)?;
-
-    // Get and execute the SELECT statement
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct DeptEmp {
@@ -693,16 +614,11 @@ fn test_join_derived_table_semantic() -> Result<(), Box<dyn std::error::Error>> 
         ) totals ON totals.customer_id = c.id;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Execute DDL
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Setup data using Diesel ORM
     diesel::insert_into(customers::table)
@@ -720,13 +636,6 @@ fn test_join_derived_table_semantic() -> Result<(), Box<dyn std::error::Error>> 
     diesel::insert_into(orders::table)
         .values(&Order { id: 3, customer_id: 2, amount: 200 })
         .execute(&mut connection)?;
-
-    // Get and execute the SELECT statement
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct CustomerTotal {

@@ -7,9 +7,10 @@
 //! - `remove_unsupported_check_constraints` option silently drops constraints
 //! - Nested function calls inside CHECK are handled correctly
 
-use diesel::{Connection, RunQueryDsl, SqliteConnection};
+use diesel::RunQueryDsl;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use rusqlite::Connection as SqliteConn;
+
+use crate::helpers;
 
 /// The constraint must survive translation AND still be enforced at runtime, so
 /// this executes the DDL rather than only inspecting it.
@@ -28,10 +29,7 @@ fn test_check_constraint_is_translated() -> Result<(), Box<dyn std::error::Error
     );
 
     // The CHECK must actually be enforced by SQLite at runtime
-    let mut conn = SqliteConnection::establish(":memory:")?;
-    for stmt in &translated {
-        diesel::sql_query(stmt.to_string()).execute(&mut conn)?;
-    }
+    let mut conn = helpers::apply_default(sql).expect("apply");
 
     // Valid insert should succeed
     diesel::sql_query("INSERT INTO items (id, quantity) VALUES (1, 5)").execute(&mut conn)?;
@@ -77,7 +75,8 @@ fn test_check_constraint_removed_with_option() {
     let options = Pg2SqliteOptions::default().with_remove_unsupported_check_constraints();
 
     let translated = Pg2Sqlite::default().sql(sql).unwrap().translate(&options).unwrap().into_vec();
-    let sql_output = translated.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    let stmts: Vec<String> = translated.iter().map(ToString::to_string).collect();
+    let sql_output = stmts.join("\n");
 
     // The user-declared CHECK calling the unsupported function is removed.
     assert!(
@@ -86,9 +85,7 @@ fn test_check_constraint_removed_with_option() {
     );
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
-    let conn = SqliteConn::open_in_memory().unwrap();
-    let script = translated.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n");
-    conn.execute_batch(&script).unwrap_or_else(|e| panic!("translated DDL must execute: {e}"));
+    helpers::apply_rusqlite_statements(&stmts);
 }
 
 /// A simple arithmetic CHECK (no PG-specific functions) always passes through.
@@ -98,7 +95,8 @@ fn test_valid_check_constraint_passes_through() {
     let options = Pg2SqliteOptions::default();
 
     let translated = Pg2Sqlite::default().sql(sql).unwrap().translate(&options).unwrap().into_vec();
-    let sql_output = translated.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    let stmts: Vec<String> = translated.iter().map(ToString::to_string).collect();
+    let sql_output = stmts.join("\n");
 
     assert!(
         sql_output.contains("CHECK"),
@@ -110,9 +108,7 @@ fn test_valid_check_constraint_passes_through() {
     );
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
-    let conn = SqliteConn::open_in_memory().unwrap();
-    let script = translated.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n");
-    conn.execute_batch(&script).unwrap_or_else(|e| panic!("translated DDL must execute: {e}"));
+    helpers::apply_rusqlite_statements(&stmts);
 }
 
 /// A table-level CHECK with a nested function call should fail translation
@@ -144,7 +140,8 @@ fn test_nested_function_check_constraint_removed_with_option() {
     let options = Pg2SqliteOptions::default().with_remove_unsupported_check_constraints();
 
     let translated = Pg2Sqlite::default().sql(sql).unwrap().translate(&options).unwrap().into_vec();
-    let sql_output = translated.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    let stmts: Vec<String> = translated.iter().map(ToString::to_string).collect();
+    let sql_output = stmts.join("\n");
 
     // The user-declared nested CHECK calling the unsupported function is
     // removed.
@@ -154,9 +151,7 @@ fn test_nested_function_check_constraint_removed_with_option() {
     );
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
-    let conn = SqliteConn::open_in_memory().unwrap();
-    let script = translated.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n");
-    conn.execute_batch(&script).unwrap_or_else(|e| panic!("translated DDL must execute: {e}"));
+    helpers::apply_rusqlite_statements(&stmts);
 }
 
 /// Column-level CHECK constraints are now translated to SQLite CHECK
@@ -168,7 +163,8 @@ fn test_column_level_check_is_translated() {
     let options = Pg2SqliteOptions::default();
 
     let translated = Pg2Sqlite::default().sql(sql).unwrap().translate(&options).unwrap().into_vec();
-    let sql_output = translated.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    let stmts: Vec<String> = translated.iter().map(ToString::to_string).collect();
+    let sql_output = stmts.join("\n");
 
     assert!(
         sql_output.contains("CHECK"),
@@ -180,9 +176,7 @@ fn test_column_level_check_is_translated() {
     );
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
-    let conn = SqliteConn::open_in_memory().unwrap();
-    let script = translated.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n");
-    conn.execute_batch(&script).unwrap_or_else(|e| panic!("translated DDL must execute: {e}"));
+    helpers::apply_rusqlite_statements(&stmts);
 }
 
 /// Column-level CHECK constraints are silently dropped when
@@ -193,7 +187,8 @@ fn test_column_level_check_is_dropped_with_option() {
     let options = Pg2SqliteOptions::default().with_remove_unsupported_check_constraints();
 
     let translated = Pg2Sqlite::default().sql(sql).unwrap().translate(&options).unwrap().into_vec();
-    let sql_output = translated.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    let stmts: Vec<String> = translated.iter().map(ToString::to_string).collect();
+    let sql_output = stmts.join("\n");
 
     // The user-declared column-level CHECK is dropped; translator-added range
     // bounds (e.g. for INTEGER) are not user-declared and are kept.
@@ -203,9 +198,7 @@ fn test_column_level_check_is_dropped_with_option() {
     );
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
-    let conn = SqliteConn::open_in_memory().unwrap();
-    let script = translated.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n");
-    conn.execute_batch(&script).unwrap_or_else(|e| panic!("translated DDL must execute: {e}"));
+    helpers::apply_rusqlite_statements(&stmts);
 }
 
 /// Table-level CHECK with `char_length` is translated to `length`.
@@ -218,29 +211,21 @@ fn table_check_translates_char_length() {
         .translate(&Pg2SqliteOptions::default())
         .unwrap()
         .into_vec();
-    let sql_output = translated.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    let stmts: Vec<String> = translated.iter().map(ToString::to_string).collect();
+    let sql_output = stmts.join("\n");
     let lower = sql_output.to_lowercase();
     assert!(lower.contains("length("), "expected char_length -> length translation: {sql_output}");
     assert!(!lower.contains("char_length"), "char_length should be translated: {sql_output}");
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
-    let conn = SqliteConn::open_in_memory().unwrap();
-    let script = translated.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n");
-    conn.execute_batch(&script).unwrap_or_else(|e| panic!("translated DDL must execute: {e}"));
+    helpers::apply_rusqlite_statements(&stmts);
 }
 
 /// Semantic test: table-level CHECK with `char_length` rejects empty strings.
 #[test]
-fn table_check_semantic() -> Result<(), Box<dyn std::error::Error>> {
+fn table_check_semantic() {
     let pg_sql = "CREATE TABLE validated (name TEXT NOT NULL, CHECK (char_length(name) > 0))";
-    let translated =
-        Pg2Sqlite::default().sql(pg_sql)?.translate(&Pg2SqliteOptions::default())?.into_vec();
-
-    let mut conn = SqliteConnection::establish(":memory:")?;
-
-    for stmt in &translated {
-        diesel::sql_query(&stmt.to_string()).execute(&mut conn)?;
-    }
+    let mut conn = helpers::apply_default(pg_sql).expect("apply");
 
     // Valid insert: name has length > 0
     let result =
@@ -250,21 +235,13 @@ fn table_check_semantic() -> Result<(), Box<dyn std::error::Error>> {
     // Invalid insert: empty string, length == 0 -> CHECK constraint should fail
     let result = diesel::sql_query("INSERT INTO validated (name) VALUES ('')").execute(&mut conn);
     assert!(result.is_err(), "empty string should violate CHECK constraint");
-
-    Ok(())
 }
 
 #[test]
 fn test_check_constraint_string_length() -> Result<(), Box<dyn std::error::Error>> {
     let sql = "CREATE TABLE products (id SERIAL PRIMARY KEY, code TEXT CHECK (length(code) >= 3));";
 
-    let translated =
-        Pg2Sqlite::default().sql(sql)?.translate(&Pg2SqliteOptions::default())?.into_vec();
-
-    let mut conn = SqliteConnection::establish(":memory:")?;
-    for stmt in &translated {
-        diesel::sql_query(stmt.to_string()).execute(&mut conn)?;
-    }
+    let mut conn = helpers::apply_default(sql).expect("apply");
 
     // Valid
     diesel::sql_query("INSERT INTO products (id, code) VALUES (1, 'ABC')").execute(&mut conn)?;

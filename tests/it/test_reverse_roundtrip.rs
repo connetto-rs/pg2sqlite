@@ -8,9 +8,11 @@
 //!    reverse, and parse the result with the PostgreSQL dialect to prove
 //!    syntactic validity
 
-use diesel::{Connection, ExpressionMethods, RunQueryDsl, SqliteConnection};
+use diesel::{ExpressionMethods, RunQueryDsl, SqliteConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
+
+use crate::helpers;
 
 const SCHEMA: &str = "CREATE TABLE t (id INT PRIMARY KEY, val TEXT, num INT);";
 const EVENTS: &str =
@@ -29,28 +31,14 @@ fn reverse(pg_ddl: &str, sqlite_sql: &str) -> String {
 /// SQLite database, then reverse-translate back to PG and parse the result
 /// with the PostgreSQL dialect to verify it is syntactically valid.
 fn forward_execute_reverse(pg_ddl: &str, pg_query: &str, options: &Pg2SqliteOptions) -> String {
-    let translator = Pg2Sqlite::default().sql(&format!("{pg_ddl}\n{pg_query}")).unwrap();
+    let sql = format!("{pg_ddl}\n{pg_query}");
+    let translator = Pg2Sqlite::default().sql(&sql).unwrap();
     let schema = translator.build_schema().unwrap();
-    let forward_stmts = translator.clone().translate(options).unwrap().into_vec();
 
-    // Set up in-memory SQLite and execute DDL
-    let mut conn =
-        SqliteConnection::establish(":memory:").expect("Failed to connect to in-memory SQLite");
-
-    for stmt in &forward_stmts {
-        if !matches!(stmt, sqlparser::ast::Statement::Query(_)) {
-            diesel::sql_query(&stmt.to_string())
-                .execute(&mut conn)
-                .unwrap_or_else(|e| panic!("Failed to execute DDL: {e}\nSQL: {stmt}"));
-        }
-    }
-
-    // Find the translated SELECT and execute it in SQLite
-    let select_stmt = forward_stmts
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Expected a SELECT statement in translated output");
-    let sqlite_sql = select_stmt.to_string();
+    // Set up in-memory SQLite with the emitted DDL
+    let (forward_stmts, sqlite_sql) =
+        helpers::translate::translate_default_statements_and_first_query(&sql);
+    let mut conn = helpers::apply_ddl(&forward_stmts);
 
     // Execute in SQLite to verify it's valid SQLite
     #[derive(diesel::QueryableByName, Debug)]
@@ -222,23 +210,13 @@ fn functional_to_timestamp_with_data() -> Result<(), Box<dyn std::error::Error>>
     let options = Pg2SqliteOptions::default();
     let translator = Pg2Sqlite::default().sql(pg_sql)?;
     let schema = translator.build_schema()?;
-    let forward_stmts = translator.clone().translate(&options)?.into_vec();
-
-    let mut conn = SqliteConnection::establish(":memory:")?;
-
-    for stmt in &forward_stmts {
-        if !matches!(stmt, sqlparser::ast::Statement::Query(_)) {
-            diesel::sql_query(&stmt.to_string()).execute(&mut conn)?;
-        }
-    }
+    let (forward_stmts, sqlite_sql) =
+        helpers::translate::translate_default_statements_and_first_query(pg_sql);
+    let mut conn = helpers::apply_ddl(&forward_stmts);
 
     // Insert test data: Unix epoch 0 = 1970-01-01
     diesel::sql_query("INSERT INTO t (id, epoch_val) VALUES (1, 0), (2, 1700000000)")
         .execute(&mut conn)?;
-
-    let select_stmt =
-        forward_stmts.iter().find(|s| matches!(s, sqlparser::ast::Statement::Query(_))).unwrap();
-    let sqlite_sql = select_stmt.to_string();
 
     #[derive(diesel::QueryableByName, Debug)]
     struct DateResult {
@@ -275,24 +253,14 @@ fn functional_date_trunc_with_data() -> Result<(), Box<dyn std::error::Error>> {
     let options = Pg2SqliteOptions::default();
     let translator = Pg2Sqlite::default().sql(pg_sql)?;
     let schema = translator.build_schema()?;
-    let forward_stmts = translator.clone().translate(&options)?.into_vec();
-
-    let mut conn = SqliteConnection::establish(":memory:")?;
-
-    for stmt in &forward_stmts {
-        if !matches!(stmt, sqlparser::ast::Statement::Query(_)) {
-            diesel::sql_query(&stmt.to_string()).execute(&mut conn)?;
-        }
-    }
+    let (forward_stmts, sqlite_sql) =
+        helpers::translate::translate_default_statements_and_first_query(pg_sql);
+    let mut conn = helpers::apply_ddl(&forward_stmts);
 
     diesel::sql_query(
         "INSERT INTO events (id, created_at) VALUES (1, '2024-03-15 10:30:00'), (2, '2024-03-15 23:59:59')",
     )
     .execute(&mut conn)?;
-
-    let select_stmt =
-        forward_stmts.iter().find(|s| matches!(s, sqlparser::ast::Statement::Query(_))).unwrap();
-    let sqlite_sql = select_stmt.to_string();
 
     #[derive(diesel::QueryableByName, Debug)]
     struct TruncResult {
@@ -364,21 +332,10 @@ struct LatestReading {
 /// Forward translates [`READINGS`] plus `pg_query` and returns the emitted
 /// SELECT alongside a SQLite database holding the emitted schema and a seed.
 fn forward_and_seed(pg_query: &str) -> (String, SqliteConnection) {
-    let options = Pg2SqliteOptions::default();
-    let translator =
-        Pg2Sqlite::default().sql(&format!("{READINGS}\n{pg_query}")).expect("script should parse");
-    let statements = translator.translate(&options).expect("script should translate").into_vec();
-
-    let mut connection =
-        SqliteConnection::establish(":memory:").expect("in-memory SQLite should open");
-    for statement in &statements {
-        if !matches!(statement, sqlparser::ast::Statement::Query(_)) {
-            // Emitted DDL is the artifact under test, so it runs as text.
-            diesel::sql_query(statement.to_string())
-                .execute(&mut connection)
-                .unwrap_or_else(|error| panic!("emitted DDL failed: {error}\n{statement}"));
-        }
-    }
+    let sql = format!("{READINGS}\n{pg_query}");
+    let (statements, select) =
+        helpers::translate::translate_default_statements_and_first_query(&sql);
+    let mut connection = helpers::apply_ddl(&statements);
 
     diesel::insert_into(readings::table)
         .values(vec![
@@ -410,11 +367,6 @@ fn forward_and_seed(pg_query: &str) -> (String, SqliteConnection) {
         .execute(&mut connection)
         .expect("seed should insert");
 
-    let select = statements
-        .iter()
-        .find(|statement| matches!(statement, sqlparser::ast::Statement::Query(_)))
-        .expect("script should emit a SELECT")
-        .to_string();
     (select, connection)
 }
 
@@ -481,32 +433,17 @@ fn restored_distinct_on_uses_the_restored_relation_scope() {
     let pg_query = "SELECT DISTINCT ON (id) id, naive AS aware FROM t \
                     ORDER BY id, aware AT TIME ZONE '+05:00';";
     let options = Pg2SqliteOptions::default();
-    let translator =
-        Pg2Sqlite::default().sql(&format!("{ddl} {pg_query}")).expect("source should parse");
+    let source = format!("{ddl} {pg_query}");
+    let translator = Pg2Sqlite::default().sql(&source).expect("source should parse");
     let schema = translator.build_schema().expect("schema should build");
-    let forward =
-        translator.clone().translate(&options).expect("source should translate").into_vec();
-    let sqlite_sql = forward
-        .iter()
-        .find(|statement| matches!(statement, sqlparser::ast::Statement::Query(_)))
-        .expect("source should emit a query")
-        .to_string();
+    let sqlite_sql = helpers::translate::translate_default_first_query(&source);
 
     let reversed = translator
         .reverse_sql(&format!("{sqlite_sql};"), &schema, &options)
         .expect("query should reverse")[0]
         .to_string();
-    let round_tripped = Pg2Sqlite::default()
-        .sql(&format!("{ddl} {reversed};"))
-        .expect("reversed query should parse")
-        .translate(&options)
-        .expect("reversed query should translate")
-        .into_vec();
-    let round_tripped_sql = round_tripped
-        .iter()
-        .find(|statement| matches!(statement, sqlparser::ast::Statement::Query(_)))
-        .expect("reversed query should emit a query")
-        .to_string();
+    let round_tripped_sql =
+        helpers::translate::translate_default_first_query(&format!("{ddl} {reversed};"));
 
     assert_eq!(round_tripped_sql, sqlite_sql, "restored query changed its fixed offset");
 }

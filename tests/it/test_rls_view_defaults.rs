@@ -18,8 +18,8 @@
 //! who supplies one is refused the way PostgreSQL refuses it.
 
 use diesel::prelude::*;
-use helpers::{establish_connection, set_session_user_id};
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
+use helpers::set_session_user_id;
+use pg2sqlite::prelude::{Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 use rosetta_uuid::Uuid;
 
 use crate::{
@@ -162,30 +162,11 @@ fn options() -> Pg2SqliteOptions {
         .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
 }
 
-/// Applies the translated DDL. The emitted SQL is the artifact under test, so
-/// it runs as generated text; every other statement uses the typed DSL.
-fn apply(pg: &str) -> SqliteConnection {
-    let translated = Pg2Sqlite::default()
-        .sql(pg)
-        .expect("parse")
-        .translate(&options())
-        .expect("translate")
-        .into_vec();
-
-    let mut conn = establish_connection();
-    for statement in &translated {
-        diesel::sql_query(statement.to_string())
-            .execute(&mut conn)
-            .unwrap_or_else(|error| panic!("emitted DDL failed: {error}\n{statement}"));
-    }
-    conn
-}
-
 /// The one case the bug report opened with: a caller naming neither the key nor
 /// any other defaulted column lands a row carrying every default.
 #[test]
 fn an_omitted_column_takes_its_default() {
-    let mut conn = apply(DOCS);
+    let mut conn = helpers::apply_translated_ddl(DOCS, &options());
 
     diesel::insert_into(docs::table)
         .values((docs::owner.eq("alice"), docs::qty.eq(7)))
@@ -208,7 +189,7 @@ fn an_omitted_column_takes_its_default() {
 /// The fallback must not shadow a value the caller did supply.
 #[test]
 fn a_supplied_value_beats_the_default() {
-    let mut conn = apply(DOCS);
+    let mut conn = helpers::apply_translated_ddl(DOCS, &options());
 
     diesel::insert_into(docs::table)
         .values((
@@ -235,7 +216,7 @@ fn a_supplied_value_beats_the_default() {
 /// omitted column, would store NULL here.
 #[test]
 fn an_explicit_null_takes_the_default() {
-    let mut conn = apply(DOCS);
+    let mut conn = helpers::apply_translated_ddl(DOCS, &options());
 
     diesel::insert_into(docs::table)
         .values((
@@ -261,7 +242,7 @@ fn an_explicit_null_takes_the_default() {
 /// policy admits must not be read as NULL, which satisfies no predicate.
 #[test]
 fn a_default_the_policy_admits_lands_and_is_visible() {
-    let mut conn = apply(DOCS);
+    let mut conn = helpers::apply_translated_ddl(DOCS, &options());
 
     diesel::insert_into(docs::table)
         .values((docs::id.eq("visible"), docs::qty.eq(3)))
@@ -278,7 +259,7 @@ fn a_default_the_policy_admits_lands_and_is_visible() {
 /// refused as a policy violation, not slip through because the guard saw NULL.
 #[test]
 fn a_default_the_policy_forbids_is_refused() {
-    let mut conn = apply(DOCS_HOSTILE_DEFAULT);
+    let mut conn = helpers::apply_translated_ddl(DOCS_HOSTILE_DEFAULT, &options());
 
     let refused = diesel::insert_into(docs::table)
         .values((docs::id.eq("hostile"), docs::qty.eq(3)))
@@ -298,7 +279,7 @@ fn a_default_the_policy_forbids_is_refused() {
 /// so no column is ever missing and defaults must stay out of that path.
 #[test]
 fn an_update_does_not_apply_defaults() {
-    let mut conn = apply(DOCS);
+    let mut conn = helpers::apply_translated_ddl(DOCS, &options());
 
     diesel::insert_into(docs::table)
         .values((
@@ -325,7 +306,7 @@ fn an_update_does_not_apply_defaults() {
 /// trigger named it, and SQLite refuses to be told a generated column's value.
 #[test]
 fn a_computed_column_does_not_block_a_write() {
-    let mut conn = apply(ITEMS);
+    let mut conn = helpers::apply_translated_ddl(ITEMS, &options());
 
     diesel::insert_into(items::table)
         .values((items::id.eq(1), items::qty.eq(4), items::owner.eq("alice")))
@@ -344,7 +325,7 @@ fn a_computed_column_does_not_block_a_write() {
 /// must refuse it too rather than dropping it in silence.
 #[test]
 fn writing_a_computed_column_through_the_view_is_refused() {
-    let mut conn = apply(ITEMS);
+    let mut conn = helpers::apply_translated_ddl(ITEMS, &options());
 
     let refused = diesel::insert_into(items::table)
         .values((
@@ -365,7 +346,7 @@ fn writing_a_computed_column_through_the_view_is_refused() {
 /// The UPDATE trigger assigns every column, so it hit the same wall.
 #[test]
 fn an_update_recomputes_a_computed_column() {
-    let mut conn = apply(ITEMS);
+    let mut conn = helpers::apply_translated_ddl(ITEMS, &options());
 
     diesel::insert_into(items::table)
         .values((items::id.eq(1), items::qty.eq(4), items::owner.eq("alice")))
@@ -388,7 +369,7 @@ fn an_update_recomputes_a_computed_column() {
 /// Same refusal on the update path.
 #[test]
 fn setting_a_computed_column_through_the_view_is_refused() {
-    let mut conn = apply(ITEMS);
+    let mut conn = helpers::apply_translated_ddl(ITEMS, &options());
 
     diesel::insert_into(items::table)
         .values((items::id.eq(1), items::qty.eq(4), items::owner.eq("alice")))
@@ -413,7 +394,7 @@ fn a_client_minted_key_lands_through_the_view() {
     let user = Uuid::utc_v7();
     set_session_user_id(&user);
     let user_bytes = <[u8; 16]>::from(user).to_vec();
-    let mut conn = apply(ORDERS);
+    let mut conn = helpers::apply_translated_ddl(ORDERS, &options());
 
     diesel::insert_into(orders::table)
         .values((orders::owner_id.eq(user_bytes.clone()), orders::quantity.eq(7_i64)))
@@ -437,7 +418,7 @@ fn a_client_minted_key_lands_through_the_view() {
 /// columns the row carries, defaults included.
 #[test]
 fn a_policy_over_a_computed_column_refuses_a_row_it_forbids() {
-    let mut conn = apply(GUARDED_BY_COMPUTED);
+    let mut conn = helpers::apply_translated_ddl(GUARDED_BY_COMPUTED, &options());
 
     let refused = diesel::insert_into(items::table)
         .values((items::id.eq(1), items::qty.eq(200), items::owner.eq("alice")))
@@ -457,7 +438,7 @@ fn a_policy_over_a_computed_column_refuses_a_row_it_forbids() {
 /// when the column the computation reads came from its own default.
 #[test]
 fn a_policy_over_a_computed_column_admits_a_row_it_allows() {
-    let mut conn = apply(GUARDED_BY_COMPUTED);
+    let mut conn = helpers::apply_translated_ddl(GUARDED_BY_COMPUTED, &options());
 
     diesel::insert_into(items::table)
         .values((items::id.eq(1), items::owner.eq("alice")))
@@ -478,7 +459,7 @@ fn a_policy_over_a_computed_column_admits_a_row_it_allows() {
 /// not a row that silently disappears from the view.
 #[test]
 fn an_update_pushing_a_computed_value_out_of_the_policy_is_refused() {
-    let mut conn = apply(GUARDED_BY_COMPUTED);
+    let mut conn = helpers::apply_translated_ddl(GUARDED_BY_COMPUTED, &options());
 
     diesel::insert_into(items::table)
         .values((items::id.eq(1), items::qty.eq(5), items::owner.eq("alice")))
@@ -502,7 +483,7 @@ fn an_update_pushing_a_computed_value_out_of_the_policy_is_refused() {
 /// An update that keeps the computed value inside the policy still succeeds.
 #[test]
 fn an_update_keeping_a_computed_value_inside_the_policy_succeeds() {
-    let mut conn = apply(GUARDED_BY_COMPUTED);
+    let mut conn = helpers::apply_translated_ddl(GUARDED_BY_COMPUTED, &options());
 
     diesel::insert_into(items::table)
         .values((items::id.eq(1), items::qty.eq(5), items::owner.eq("alice")))

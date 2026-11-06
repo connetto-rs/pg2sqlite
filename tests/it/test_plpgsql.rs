@@ -6,24 +6,11 @@
 //! DELETE, SetOperation in query body, inject_condition_into_statement
 //! (UPDATE/DELETE).
 
-use diesel::{Connection, RunQueryDsl, SqliteConnection};
+use diesel::RunQueryDsl;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use translate_helpers::translate_default as translate;
 
 use crate::{helpers, helpers::translate as translate_helpers};
-
-fn translate_with_options(sql: &str, options: &Pg2SqliteOptions) -> String {
-    Pg2Sqlite::default()
-        .sql(sql)
-        .unwrap()
-        .translate(options)
-        .unwrap()
-        .into_vec()
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
 
 /// Translates `sql` with default options and executes every emitted statement
 /// in an in-memory SQLite connection, verifying the output is valid SQLite.
@@ -160,7 +147,7 @@ fn declare_default_uuid_uses_configured_uuid_function() {
     "#;
 
     let options = Pg2SqliteOptions::default().with_uuid_function_name("uuid7".to_string());
-    let output = translate_with_options(sql, &options);
+    let output = helpers::translate_sql(sql, &options).expect("translate");
     assert!(
         output.contains("uuid7()"),
         "DECLARE UUID default should honor configured uuid function name: {output}"
@@ -640,10 +627,7 @@ fn raise_info_single_space_is_dropped() -> Result<(), Box<dyn std::error::Error>
     );
 
     // The resulting DDL must execute without error in SQLite.
-    let mut conn = SqliteConnection::establish(":memory:")?;
-    for stmt in &translated {
-        diesel::sql_query(stmt.to_string()).execute(&mut conn)?;
-    }
+    let mut conn = helpers::apply_default(sql).expect("apply");
 
     // The trigger must fire on INSERT into ri_test, populating ri_log.
     diesel::sql_query("INSERT INTO ri_test VALUES (1, 42)").execute(&mut conn)?;
@@ -679,16 +663,8 @@ fn a_guarded_truncate_keeps_its_condition() {
         CREATE TRIGGER tr AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION f();
     ";
 
-    let connection = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
-    for statement in Pg2Sqlite::default()
-        .sql(sql)
-        .expect("parse")
-        .translate(&Pg2SqliteOptions::default())
-        .expect("translate")
-        .into_vec()
-    {
-        connection.execute_batch(&format!("{statement};")).expect("emitted statement executes");
-    }
+    let stmts = helpers::translate_pg(sql, &Pg2SqliteOptions::default()).unwrap();
+    let connection = helpers::apply_rusqlite_statements(&stmts);
     connection.execute_batch("INSERT INTO trash (id) VALUES (1), (2), (3);").expect("rows");
 
     connection.execute_batch("INSERT INTO t (id, val) VALUES (1, -5);").expect("guard is false");
@@ -721,16 +697,8 @@ fn a_trigger_special_is_folded_in_a_statement_body() {
         CREATE TRIGGER tr AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION f();
     ";
 
-    let connection = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
-    for statement in Pg2Sqlite::default()
-        .sql(sql)
-        .expect("parse")
-        .translate(&Pg2SqliteOptions::default())
-        .expect("translate")
-        .into_vec()
-    {
-        connection.execute_batch(&format!("{statement};")).expect("emitted statement executes");
-    }
+    let stmts = helpers::translate_pg(sql, &Pg2SqliteOptions::default()).unwrap();
+    let connection = helpers::apply_rusqlite_statements(&stmts);
     connection.execute_batch("INSERT INTO t (id) VALUES (1);").expect("trigger fires");
 
     let logged: (String, String) = connection
@@ -782,16 +750,8 @@ fn a_with_update_in_a_trigger_body_runs() {
         CREATE TRIGGER tr AFTER UPDATE OF id ON t FOR EACH ROW EXECUTE FUNCTION f();
     ";
 
-    let connection = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
-    for statement in Pg2Sqlite::default()
-        .sql(sql)
-        .expect("parse")
-        .translate(&Pg2SqliteOptions::default())
-        .expect("translate")
-        .into_vec()
-    {
-        connection.execute_batch(&format!("{statement};")).expect("emitted statement executes");
-    }
+    let stmts = helpers::translate_pg(sql, &Pg2SqliteOptions::default()).unwrap();
+    let connection = helpers::apply_rusqlite_statements(&stmts);
     connection.execute_batch("INSERT INTO t (id, n) VALUES (1, 0);").expect("seed row");
     connection.execute_batch("UPDATE t SET id = 1 WHERE id = 1;").expect("trigger fires");
 
@@ -817,16 +777,8 @@ fn a_with_update_naming_its_cte_columns_runs() {
         CREATE TRIGGER tr AFTER UPDATE OF id ON t FOR EACH ROW EXECUTE FUNCTION f();
     ";
 
-    let connection = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
-    for statement in Pg2Sqlite::default()
-        .sql(sql)
-        .expect("parse")
-        .translate(&Pg2SqliteOptions::default())
-        .expect("translate")
-        .into_vec()
-    {
-        connection.execute_batch(&format!("{statement};")).expect("emitted statement executes");
-    }
+    let stmts = helpers::translate_pg(sql, &Pg2SqliteOptions::default()).unwrap();
+    let connection = helpers::apply_rusqlite_statements(&stmts);
     connection.execute_batch("INSERT INTO t (id, n) VALUES (1, 0);").expect("seed row");
     connection.execute_batch("UPDATE t SET id = 1 WHERE id = 1;").expect("trigger fires");
 
@@ -852,16 +804,8 @@ fn a_with_update_over_chained_ctes_runs() {
         CREATE TRIGGER tr AFTER UPDATE OF id ON t FOR EACH ROW EXECUTE FUNCTION f();
     ";
 
-    let connection = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
-    for statement in Pg2Sqlite::default()
-        .sql(sql)
-        .expect("parse")
-        .translate(&Pg2SqliteOptions::default())
-        .expect("translate")
-        .into_vec()
-    {
-        connection.execute_batch(&format!("{statement};")).expect("emitted statement executes");
-    }
+    let stmts = helpers::translate_pg(sql, &Pg2SqliteOptions::default()).unwrap();
+    let connection = helpers::apply_rusqlite_statements(&stmts);
     connection.execute_batch("INSERT INTO t (id, n) VALUES (1, 0);").expect("seed row");
     connection.execute_batch("UPDATE t SET id = 1 WHERE id = 1;").expect("trigger fires");
 
@@ -912,16 +856,8 @@ fn a_volatile_cte_read_once_is_inlined() {
         CREATE TRIGGER tr AFTER UPDATE OF id ON t FOR EACH ROW EXECUTE FUNCTION f();
     ";
 
-    let connection = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
-    for statement in Pg2Sqlite::default()
-        .sql(sql)
-        .expect("parse")
-        .translate(&Pg2SqliteOptions::default())
-        .expect("translate")
-        .into_vec()
-    {
-        connection.execute_batch(&format!("{statement};")).expect("emitted statement executes");
-    }
+    let stmts = helpers::translate_pg(sql, &Pg2SqliteOptions::default()).unwrap();
+    let connection = helpers::apply_rusqlite_statements(&stmts);
     connection.execute_batch("INSERT INTO t (id, a) VALUES (1, 0);").expect("seed row");
     connection.execute_batch("UPDATE t SET id = 1 WHERE id = 1;").expect("trigger fires");
 

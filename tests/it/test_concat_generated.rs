@@ -3,6 +3,8 @@
 use diesel::prelude::*;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
+use crate::helpers;
+
 diesel::table! {
     /// Table for testing CONCAT function.
     users (id) {
@@ -141,7 +143,7 @@ struct NewRectangle {
 }
 
 #[test]
-fn test_concat_translation() -> Result<(), Box<dyn std::error::Error>> {
+fn test_concat_translation() {
     let sql = "
         CREATE TABLE users (
             id SERIAL PRIMARY KEY,
@@ -151,14 +153,8 @@ fn test_concat_translation() -> Result<(), Box<dyn std::error::Error>> {
         SELECT CONCAT(first_name, ' ', last_name) as full_name FROM users;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // CONCAT should be converted to || operator
     assert!(
@@ -169,66 +165,39 @@ fn test_concat_translation() -> Result<(), Box<dyn std::error::Error>> {
         !select_stmt.to_uppercase().contains("CONCAT"),
         "CONCAT function should not appear in output, got: {select_stmt}"
     );
-    let mut conn = diesel::SqliteConnection::establish(":memory:")?;
-    for s in &translated {
-        diesel::sql_query(s.to_string()).execute(&mut conn)?;
-    }
-
-    Ok(())
+    helpers::apply_statements(&translated);
 }
 
 #[test]
-fn test_concat_two_args() -> Result<(), Box<dyn std::error::Error>> {
+fn test_concat_two_args() {
     let sql = "
         CREATE TABLE items (id SERIAL PRIMARY KEY, a TEXT, b TEXT);
         SELECT CONCAT(a, b) FROM items;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     assert!(select_stmt.contains("||"), "Should use || operator, got: {select_stmt}");
-    let mut conn = diesel::SqliteConnection::establish(":memory:")?;
-    for s in &translated {
-        diesel::sql_query(s.to_string()).execute(&mut conn)?;
-    }
-
-    Ok(())
+    helpers::apply_statements(&translated);
 }
 
 #[test]
-fn test_concat_single_arg() -> Result<(), Box<dyn std::error::Error>> {
+fn test_concat_single_arg() {
     let sql = "
         CREATE TABLE items (id SERIAL PRIMARY KEY, a TEXT);
         SELECT CONCAT(a) FROM items;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Single arg CONCAT should just return the argument
     assert!(
         !select_stmt.to_uppercase().contains("CONCAT"),
         "CONCAT should not appear, got: {select_stmt}"
     );
-    let mut conn = diesel::SqliteConnection::establish(":memory:")?;
-    for s in &translated {
-        diesel::sql_query(s.to_string()).execute(&mut conn)?;
-    }
-
-    Ok(())
+    helpers::apply_statements(&translated);
 }
 
 /// Semantic test: CONCAT translation works correctly in SQLite.
@@ -243,16 +212,11 @@ fn test_concat_semantic() -> Result<(), Box<dyn std::error::Error>> {
         SELECT CONCAT(first_name, ' ', last_name) as full_name FROM users;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Execute DDL
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert test data using Diesel ORM
     diesel::insert_into(users::table)
@@ -261,13 +225,6 @@ fn test_concat_semantic() -> Result<(), Box<dyn std::error::Error>> {
     diesel::insert_into(users::table)
         .values(&User { id: 2, first_name: "Jane".to_string(), last_name: "Smith".to_string() })
         .execute(&mut connection)?;
-
-    // Execute the SELECT
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct FullName {
@@ -291,15 +248,10 @@ fn test_concat_many_args_semantic() -> Result<(), Box<dyn std::error::Error>> {
         SELECT CONCAT(a, '-', b, '-', c, '-', d) as combined FROM data;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
-
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert test data using Diesel ORM
     diesel::insert_into(data::table)
@@ -311,12 +263,6 @@ fn test_concat_many_args_semantic() -> Result<(), Box<dyn std::error::Error>> {
             d: Some("four".to_string()),
         })
         .execute(&mut connection)?;
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct Combined {
@@ -377,16 +323,7 @@ fn test_generated_column_semantic() -> Result<(), Box<dyn std::error::Error>> {
         );
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
-
-    // Execute DDL
-    for stmt in &translated {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_default(sql)?;
 
     // Insert test data using Diesel ORM (don't specify total - it's generated)
     diesel::insert_into(products::table)
@@ -426,15 +363,7 @@ fn test_generated_column_expression() -> Result<(), Box<dyn std::error::Error>> 
         );
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
-
-    for stmt in &translated {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_default(sql)?;
 
     // Insert test data using Diesel ORM
     diesel::insert_into(rectangles::table)

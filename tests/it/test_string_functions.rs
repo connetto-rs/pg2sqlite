@@ -2,7 +2,7 @@
 
 use diesel::prelude::*;
 use helpers::translate_pg;
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+use pg2sqlite::prelude::Pg2SqliteOptions;
 
 use crate::helpers;
 
@@ -77,7 +77,7 @@ struct Name {
 /// Test that strpos(string, substring) is translated to INSTR(string,
 /// substring).
 #[test]
-fn test_strpos_translation() -> Result<(), Box<dyn std::error::Error>> {
+fn test_strpos_translation() {
     let sql = "
         CREATE TABLE texts (
             id SERIAL PRIMARY KEY,
@@ -86,14 +86,8 @@ fn test_strpos_translation() -> Result<(), Box<dyn std::error::Error>> {
         SELECT strpos(content, 'hello') as pos FROM texts;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // strpos should be converted to INSTR
     assert!(
@@ -111,8 +105,6 @@ fn test_strpos_translation() -> Result<(), Box<dyn std::error::Error>> {
         conn.execute_batch(&format!("{stmt};"))
             .unwrap_or_else(|e| panic!("SQLite rejected emitted SQL: {e}\n{stmt}"));
     }
-
-    Ok(())
 }
 
 /// Semantic test: strpos translation works correctly in SQLite.
@@ -126,16 +118,11 @@ fn test_strpos_semantic() -> Result<(), Box<dyn std::error::Error>> {
         SELECT content, strpos(content, 'world') as pos FROM texts;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // Execute DDL
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert test data using Diesel ORM
     diesel::insert_into(texts::table)
@@ -147,12 +134,6 @@ fn test_strpos_semantic() -> Result<(), Box<dyn std::error::Error>> {
     diesel::insert_into(texts::table)
         .values(&Text { id: 3, content: "world at start".to_string() })
         .execute(&mut connection)?;
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct TextPos {
@@ -171,20 +152,14 @@ fn test_strpos_semantic() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn test_chr_translation() -> Result<(), Box<dyn std::error::Error>> {
+fn test_chr_translation() {
     let sql = "
         CREATE TABLE codes (id SERIAL PRIMARY KEY, code INTEGER NOT NULL);
         SELECT chr(code) as character FROM codes;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // chr should be converted to char
     assert!(
@@ -202,8 +177,6 @@ fn test_chr_translation() -> Result<(), Box<dyn std::error::Error>> {
         conn.execute_batch(&format!("{stmt};"))
             .unwrap_or_else(|e| panic!("SQLite rejected emitted SQL: {e}\n{stmt}"));
     }
-
-    Ok(())
 }
 
 /// Semantic test: chr translation works correctly in SQLite.
@@ -214,15 +187,10 @@ fn test_chr_semantic() -> Result<(), Box<dyn std::error::Error>> {
         SELECT chr(code) as character FROM codes;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
-
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert test data using Diesel ORM
     diesel::insert_into(codes::table)
@@ -234,12 +202,6 @@ fn test_chr_semantic() -> Result<(), Box<dyn std::error::Error>> {
     diesel::insert_into(codes::table)
         .values(&Code { id: 3, code: 97 }) // 'a'
         .execute(&mut connection)?;
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct CharResult {
@@ -260,20 +222,14 @@ fn test_chr_semantic() -> Result<(), Box<dyn std::error::Error>> {
 /// Test that CONCAT_WS(sep, a, b, c) is translated to a || sep || b || sep ||
 /// c.
 #[test]
-fn test_concat_ws_translation() -> Result<(), Box<dyn std::error::Error>> {
+fn test_concat_ws_translation() {
     let sql = "
         CREATE TABLE names (id SERIAL PRIMARY KEY, first TEXT, middle TEXT, last TEXT);
         SELECT CONCAT_WS(' ', first, middle, last) as full_name FROM names;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
     // CONCAT_WS should be converted to || operators
     assert!(
@@ -291,8 +247,6 @@ fn test_concat_ws_translation() -> Result<(), Box<dyn std::error::Error>> {
         conn.execute_batch(&format!("{stmt};"))
             .unwrap_or_else(|e| panic!("SQLite rejected emitted SQL: {e}\n{stmt}"));
     }
-
-    Ok(())
 }
 
 /// Semantic test: CONCAT_WS translation works correctly in SQLite.
@@ -303,15 +257,10 @@ fn test_concat_ws_semantic() -> Result<(), Box<dyn std::error::Error>> {
         SELECT CONCAT_WS('-', first, middle, last) as full_name FROM names;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
-
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     // Insert test data using Diesel ORM
     diesel::insert_into(names::table)
@@ -330,12 +279,6 @@ fn test_concat_ws_semantic() -> Result<(), Box<dyn std::error::Error>> {
             last: Some("Doe".to_string()),
         })
         .execute(&mut connection)?;
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct FullName {
@@ -361,15 +304,10 @@ fn test_concat_ws_semantic_skips_nulls() -> Result<(), Box<dyn std::error::Error
         SELECT CONCAT_WS('-', first, middle, last) as full_name FROM names ORDER BY id;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
+    let (translated, select_stmt) =
+        helpers::translate::translate_default_statements_and_first_query(sql);
 
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
-
-    for stmt in translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_))) {
-        diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
-    }
+    let mut connection = helpers::apply_ddl(&translated);
 
     diesel::insert_into(names::table)
         .values(&Name {
@@ -393,12 +331,6 @@ fn test_concat_ws_semantic_skips_nulls() -> Result<(), Box<dyn std::error::Error
     diesel::insert_into(names::table)
         .values(&Name { id: 4, first: None, middle: None, last: None })
         .execute(&mut connection)?;
-
-    let select_stmt = translated
-        .iter()
-        .find(|s| matches!(s, sqlparser::ast::Statement::Query(_)))
-        .expect("Should have a SELECT statement")
-        .to_string();
 
     #[derive(QueryableByName, Debug)]
     struct FullName {
@@ -435,8 +367,6 @@ fn left_function_to_substr() {
 #[test]
 fn left_function_semantic() -> Result<(), Box<dyn std::error::Error>> {
     let sql = "SELECT left('hello world', 5) AS result";
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
 
     let mut conn = diesel::SqliteConnection::establish(":memory:")?;
 
@@ -447,8 +377,7 @@ fn left_function_semantic() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Skip the leading dialect PRAGMA to reach the SELECT statement.
-    let select_sql =
-        translated.iter().find(|s| !s.to_string().starts_with("PRAGMA")).unwrap().to_string();
+    let select_sql = helpers::translate::translate_default_first_query(sql);
     // Translator output is a dynamic expression; typed DSL cannot reproduce it.
     let results = diesel::sql_query(&select_sql).load::<TextResult>(&mut conn)?;
     assert_eq!(results.len(), 1);
@@ -475,8 +404,6 @@ fn right_function_to_substr() {
 #[test]
 fn right_function_semantic() -> Result<(), Box<dyn std::error::Error>> {
     let sql = "SELECT right('hello world', 5) AS result";
-    let options = Pg2SqliteOptions::default();
-    let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
 
     let mut conn = diesel::SqliteConnection::establish(":memory:")?;
 
@@ -487,8 +414,7 @@ fn right_function_semantic() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Skip the leading dialect PRAGMA to reach the SELECT statement.
-    let select_sql =
-        translated.iter().find(|s| !s.to_string().starts_with("PRAGMA")).unwrap().to_string();
+    let select_sql = helpers::translate::translate_default_first_query(sql);
     // Translator output is a dynamic expression; typed DSL cannot reproduce it.
     let results = diesel::sql_query(&select_sql).load::<TextResult>(&mut conn)?;
     assert_eq!(results.len(), 1);

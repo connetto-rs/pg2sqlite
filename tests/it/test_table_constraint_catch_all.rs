@@ -5,8 +5,7 @@
 
 use diesel::{prelude::*, result::DatabaseErrorKind};
 use helpers::{apply_translated_ddl, translate_sql};
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use rusqlite::Connection as SqliteConn;
+use pg2sqlite::prelude::Pg2SqliteOptions;
 
 use crate::helpers;
 
@@ -31,10 +30,8 @@ fn pk_constraint_columns_translated() {
     assert!(lower.contains("primary key"), "PRIMARY KEY should appear in output: {sql_str}");
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
-    let stmts = Pg2Sqlite::default().sql(sql).unwrap().translate(&options).unwrap().into_vec();
-    let conn = SqliteConn::open_in_memory().unwrap();
-    conn.execute_batch(&stmts.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n"))
-        .unwrap_or_else(|e| panic!("translated DDL must execute: {e}"));
+    let stmts = helpers::translate_pg(sql, &options).unwrap();
+    helpers::apply_rusqlite_statements(&stmts);
 }
 
 #[test]
@@ -54,10 +51,8 @@ fn unique_constraint_columns_translated() {
     assert!(lower.contains("unique"), "UNIQUE should appear in output: {sql_str}");
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
-    let stmts = Pg2Sqlite::default().sql(sql).unwrap().translate(&options).unwrap().into_vec();
-    let conn = SqliteConn::open_in_memory().unwrap();
-    conn.execute_batch(&stmts.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n"))
-        .unwrap_or_else(|e| panic!("translated DDL must execute: {e}"));
+    let stmts = helpers::translate_pg(sql, &options).unwrap();
+    helpers::apply_rusqlite_statements(&stmts);
 }
 
 #[test]
@@ -124,11 +119,8 @@ fn the_translatable_constraints_still_translate() {
     }
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
-    let stmts =
-        Pg2Sqlite::default().sql(sql).unwrap().translate(&default_options()).unwrap().into_vec();
-    let conn = SqliteConn::open_in_memory().unwrap();
-    conn.execute_batch(&stmts.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n"))
-        .unwrap_or_else(|e| panic!("translated DDL must execute: {e}"));
+    let stmts = helpers::translate_pg(sql, &default_options()).unwrap();
+    helpers::apply_rusqlite_statements(&stmts);
 }
 
 mod keyed {
@@ -238,9 +230,6 @@ fn unique_nulls_distinct_is_translated() {
     );
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
-    let stmts =
-        Pg2Sqlite::default().sql(sql).unwrap().translate(&default_options()).unwrap().into_vec();
-    let conn = SqliteConn::open_in_memory().unwrap();
-    conn.execute_batch(&stmts.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n"))
-        .unwrap_or_else(|e| panic!("translated DDL must execute: {e}"));
+    let stmts = helpers::translate_pg(sql, &default_options()).unwrap();
+    helpers::apply_rusqlite_statements(&stmts);
 }

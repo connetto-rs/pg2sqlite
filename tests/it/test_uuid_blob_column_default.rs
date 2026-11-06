@@ -12,7 +12,6 @@
 //! to reach both consumers.
 
 use diesel::prelude::*;
-use helpers::establish_connection;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation};
 use rosetta_uuid::Uuid;
 
@@ -67,25 +66,6 @@ mod text_tables {
     }
 }
 
-/// Translates `pg` and applies the emitted DDL, which is the artifact under
-/// test. Returns the connection so callers can exercise the schema.
-fn apply(pg: &str, options: &Pg2SqliteOptions) -> SqliteConnection {
-    let translated = Pg2Sqlite::default()
-        .sql(pg)
-        .expect("parse")
-        .translate(options)
-        .expect("translate")
-        .into_vec();
-    let mut conn = establish_connection();
-    for statement in &translated {
-        // DDL cannot be expressed via the typed DSL; every other statement is.
-        diesel::sql_query(statement.to_string())
-            .execute(&mut conn)
-            .unwrap_or_else(|err| panic!("emitted DDL failed: {err}\n{statement}"));
-    }
-    conn
-}
-
 const TABLE_BLOB: &str = "
     CREATE TABLE t (
         id   UUID PRIMARY KEY DEFAULT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
@@ -114,7 +94,7 @@ const TABLE_TEXT: &str = "
 #[test]
 fn blob_default_fires_as_bytes_on_plain_table() {
     use blob_tables::t;
-    let mut conn = apply(TABLE_BLOB, &blob_options());
+    let mut conn = helpers::apply_translated_ddl(TABLE_BLOB, &blob_options());
 
     diesel::insert_into(t::table)
         .values(t::owner.eq("alice"))
@@ -135,7 +115,7 @@ fn blob_default_fires_as_bytes_on_plain_table() {
 #[test]
 fn blob_default_fires_as_bytes_through_rls_view() {
     use blob_tables::{t, t_rls};
-    let mut conn = apply(TABLE_RLS, &rls_options());
+    let mut conn = helpers::apply_translated_ddl(TABLE_RLS, &rls_options());
 
     diesel::insert_into(t::table)
         .values(t::owner.eq("alice"))
@@ -177,7 +157,7 @@ fn malformed_uuid_literal_default_is_refused() {
 #[test]
 fn text_representation_preserves_default() {
     use text_tables::t;
-    let mut conn = apply(TABLE_TEXT, &text_options());
+    let mut conn = helpers::apply_translated_ddl(TABLE_TEXT, &text_options());
 
     diesel::insert_into(t::table)
         .values(t::owner.eq("alice"))

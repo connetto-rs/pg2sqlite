@@ -9,26 +9,12 @@
 //! shape SQLite misreads. Every test here seeds the backing table, reads
 //! through the policy view, and asserts which rows the policy admits.
 
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+use pg2sqlite::prelude::Pg2SqliteOptions;
+
+use crate::helpers;
 
 fn options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit".to_string())
-}
-
-/// Applies every translated statement to a fresh in-memory SQLite.
-fn apply(pg: &str) -> rusqlite::Connection {
-    let conn = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
-    let stmts = Pg2Sqlite::default()
-        .sql(pg)
-        .expect("parse")
-        .translate_to_sql(&options())
-        .expect("translate")
-        .into_vec();
-    for s in &stmts {
-        conn.execute_batch(&format!("{s};"))
-            .unwrap_or_else(|e| panic!("SQLite rejected output: {e}\n{s}"));
-    }
-    conn
 }
 /// Seeds the backing table with triggers disabled, mirroring the
 /// authoritative-apply contract (system loads run with triggers off so the
@@ -53,10 +39,14 @@ fn visible_ids(conn: &rusqlite::Connection, view: &str) -> Vec<i64> {
 
 #[test]
 fn an_ilike_policy_translates_and_filters() {
-    let conn = apply(
-        "CREATE TABLE docs (id INT PRIMARY KEY, s TEXT);
+    let conn = helpers::apply_rusqlite_statements(
+        &helpers::translate_pg(
+            "CREATE TABLE docs (id INT PRIMARY KEY, s TEXT);
          ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
          CREATE POLICY p ON docs FOR SELECT USING (s ILIKE 'a%');",
+            &options(),
+        )
+        .expect("translate"),
     );
     seed(&conn, "INSERT INTO docs_rls (id, s) VALUES (1, 'Apple'), (2, 'banana'), (3, 'avocado');");
     assert_eq!(
@@ -68,10 +58,14 @@ fn an_ilike_policy_translates_and_filters() {
 
 #[test]
 fn a_now_policy_translates_and_filters() {
-    let conn = apply(
-        "CREATE TABLE runs (id INT PRIMARY KEY, ts TIMESTAMP);
+    let conn = helpers::apply_rusqlite_statements(
+        &helpers::translate_pg(
+            "CREATE TABLE runs (id INT PRIMARY KEY, ts TIMESTAMP);
          ALTER TABLE runs ENABLE ROW LEVEL SECURITY;
          CREATE POLICY p ON runs FOR SELECT USING (ts < now());",
+            &options(),
+        )
+        .expect("translate"),
     );
     seed(
         &conn,
@@ -82,11 +76,15 @@ fn a_now_policy_translates_and_filters() {
 
 #[test]
 fn a_date_trunc_policy_translates_and_filters() {
-    let conn = apply(
-        "CREATE TABLE events (id INT PRIMARY KEY, ts TIMESTAMP);
+    let conn = helpers::apply_rusqlite_statements(
+        &helpers::translate_pg(
+            "CREATE TABLE events (id INT PRIMARY KEY, ts TIMESTAMP);
          ALTER TABLE events ENABLE ROW LEVEL SECURITY;
          CREATE POLICY p ON events FOR SELECT
              USING (date_trunc('day', ts) = '2024-03-15 00:00:00');",
+            &options(),
+        )
+        .expect("translate"),
     );
     seed(
         &conn,
@@ -102,10 +100,14 @@ fn a_date_trunc_policy_translates_and_filters() {
 
 #[test]
 fn a_position_policy_translates_and_filters() {
-    let conn = apply(
-        "CREATE TABLE tags (id INT PRIMARY KEY, s TEXT);
+    let conn = helpers::apply_rusqlite_statements(
+        &helpers::translate_pg(
+            "CREATE TABLE tags (id INT PRIMARY KEY, s TEXT);
          ALTER TABLE tags ENABLE ROW LEVEL SECURITY;
          CREATE POLICY p ON tags FOR SELECT USING (position('x' in s) > 0);",
+            &options(),
+        )
+        .expect("translate"),
     );
     seed(&conn, "INSERT INTO tags_rls (id, s) VALUES (1, 'xy'), (2, 'ab');");
     assert_eq!(visible_ids(&conn, "tags"), vec![1], "position() must become instr()");
@@ -113,11 +115,15 @@ fn a_position_policy_translates_and_filters() {
 
 #[test]
 fn a_with_check_policy_translates_into_the_write_guard() {
-    let conn = apply(
-        "CREATE TABLE names (id INT PRIMARY KEY, s TEXT);
+    let conn = helpers::apply_rusqlite_statements(
+        &helpers::translate_pg(
+            "CREATE TABLE names (id INT PRIMARY KEY, s TEXT);
          ALTER TABLE names ENABLE ROW LEVEL SECURITY;
          CREATE POLICY sel ON names FOR SELECT USING (true);
          CREATE POLICY ins ON names FOR INSERT WITH CHECK (s ILIKE 'a%');",
+            &options(),
+        )
+        .expect("translate"),
     );
     conn.execute_batch("INSERT INTO names (id, s) VALUES (1, 'Ann');")
         .expect("a row passing the translated CHECK inserts through the view");

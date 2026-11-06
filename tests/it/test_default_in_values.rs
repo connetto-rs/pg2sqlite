@@ -13,6 +13,8 @@
 use diesel::prelude::*;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
+use crate::helpers;
+
 mod schema {
     diesel::table! {
         t (id) {
@@ -36,16 +38,6 @@ fn translate(pg: &str) -> Result<Vec<String>, pg2sqlite::errors::Error> {
         .map(pg2sqlite::script::Script::into_vec)
 }
 
-fn apply(pg: &str) -> SqliteConnection {
-    let mut conn = SqliteConnection::establish(":memory:").expect("connect");
-    for statement in translate(pg).expect("translate") {
-        diesel::sql_query(&statement)
-            .execute(&mut conn)
-            .unwrap_or_else(|error| panic!("emitted statement failed: {statement}: {error}"));
-    }
-    conn
-}
-
 fn translate_err(pg: &str) -> String {
     translate(pg).expect_err("expected a translation error").to_string()
 }
@@ -53,10 +45,11 @@ fn translate_err(pg: &str) -> String {
 /// The declared default replaces the keyword, and the other row is untouched.
 #[test]
 fn a_declared_default_is_substituted() {
-    let mut conn = apply(
+    let mut conn = helpers::apply_default(
         "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT DEFAULT 'declared');
          INSERT INTO t (id, s) VALUES (1, DEFAULT), (2, 'given');",
-    );
+    )
+    .expect("apply");
 
     let rows: Vec<(i32, Option<String>)> =
         schema::t::table.select((schema::t::id, schema::t::s)).load(&mut conn).expect("load");
@@ -67,10 +60,11 @@ fn a_declared_default_is_substituted() {
 /// the emitted row would call a PostgreSQL function SQLite does not have.
 #[test]
 fn a_function_default_is_translated() {
-    let mut conn = apply(
+    let mut conn = helpers::apply_default(
         "CREATE TABLE stamped (id INTEGER PRIMARY KEY, created TIMESTAMP DEFAULT now());
          INSERT INTO stamped (id, created) VALUES (1, DEFAULT);",
-    );
+    )
+    .expect("apply");
 
     let created: Option<String> =
         schema::stamped::table.select(schema::stamped::created).first(&mut conn).expect("load");
@@ -86,10 +80,11 @@ fn a_function_default_is_translated() {
 /// two agree and the insert must keep working.
 #[test]
 fn a_default_generated_primary_key_is_assigned() {
-    let mut conn = apply(
+    let mut conn = helpers::apply_default(
         "CREATE TABLE t (id SERIAL PRIMARY KEY, s TEXT);
          INSERT INTO t (id, s) VALUES (DEFAULT, 'first'), (DEFAULT, 'second');",
-    );
+    )
+    .expect("apply");
 
     let rows: Vec<(i32, Option<String>)> = schema::t::table
         .select((schema::t::id, schema::t::s))
@@ -103,10 +98,11 @@ fn a_default_generated_primary_key_is_assigned() {
 /// PostgreSQL inserts too.
 #[test]
 fn a_nullable_column_without_a_default_takes_null() {
-    let mut conn = apply(
+    let mut conn = helpers::apply_default(
         "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT);
          INSERT INTO t (id, s) VALUES (1, DEFAULT);",
-    );
+    )
+    .expect("apply");
 
     let s: Option<String> = schema::t::table.select(schema::t::s).first(&mut conn).expect("load");
     assert_eq!(s, None);
@@ -143,10 +139,11 @@ fn default_outside_an_insert_is_rejected() {
 /// Guards the fix from disturbing an ordinary multi-row insert.
 #[test]
 fn values_without_a_default_still_insert() {
-    let mut conn = apply(
+    let mut conn = helpers::apply_default(
         "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT);
          INSERT INTO t (id, s) VALUES (1, 'a'), (2, 'b');",
-    );
+    )
+    .expect("apply");
 
     assert_eq!(schema::t::table.count().get_result::<i64>(&mut conn).expect("count"), 2);
 }
@@ -168,22 +165,24 @@ fn read_line(conn: &mut SqliteConnection, sql: &str) -> String {
 /// the keyword has to be substituted here exactly as in a VALUES row.
 #[test]
 fn update_set_default_stores_the_declared_default() {
-    let mut conn = apply(
+    let mut conn = helpers::apply_default(
         "CREATE TABLE u (id INTEGER PRIMARY KEY, c INTEGER DEFAULT 9);
          INSERT INTO u (id, c) VALUES (1, 7);
          UPDATE u SET c = DEFAULT WHERE id = 1;",
-    );
+    )
+    .expect("apply");
     assert_eq!(read_line(&mut conn, "SELECT CAST(c AS TEXT) AS line FROM u"), "9");
 }
 
 /// With no declared default PostgreSQL stores NULL, measured on 16.
 #[test]
 fn update_set_default_without_a_declared_default_stores_null() {
-    let mut conn = apply(
+    let mut conn = helpers::apply_default(
         "CREATE TABLE u (id INTEGER PRIMARY KEY, a INTEGER);
          INSERT INTO u (id, a) VALUES (1, 5);
          UPDATE u SET a = DEFAULT WHERE id = 1;",
-    );
+    )
+    .expect("apply");
     assert_eq!(
         read_line(&mut conn, "SELECT coalesce(CAST(a AS TEXT), '<null>') AS line FROM u"),
         "<null>"
@@ -194,11 +193,12 @@ fn update_set_default_without_a_declared_default_stores_null() {
 /// `SET (c, d) = (DEFAULT, 40)` stores the declared 9 beside the given 40.
 #[test]
 fn a_tuple_update_substitutes_each_default() {
-    let mut conn = apply(
+    let mut conn = helpers::apply_default(
         "CREATE TABLE u (id INTEGER PRIMARY KEY, c INTEGER DEFAULT 9, d INTEGER DEFAULT 4);
          INSERT INTO u (id, c, d) VALUES (1, 7, 8);
          UPDATE u SET (c, d) = (DEFAULT, 40) WHERE id = 1;",
-    );
+    )
+    .expect("apply");
     assert_eq!(read_line(&mut conn, "SELECT c || '|' || d AS line FROM u"), "9|40");
 }
 
@@ -206,11 +206,12 @@ fn a_tuple_update_substitutes_each_default() {
 /// measured on PostgreSQL 16.
 #[test]
 fn an_upsert_do_update_substitutes_the_default() {
-    let mut conn = apply(
+    let mut conn = helpers::apply_default(
         "CREATE TABLE u (id INTEGER PRIMARY KEY, c INTEGER DEFAULT 9);
          INSERT INTO u (id, c) VALUES (1, 7);
          INSERT INTO u (id, c) VALUES (1, 7) ON CONFLICT (id) DO UPDATE SET c = DEFAULT;",
-    );
+    )
+    .expect("apply");
     assert_eq!(read_line(&mut conn, "SELECT CAST(c AS TEXT) AS line FROM u"), "9");
 }
 
@@ -218,11 +219,12 @@ fn an_upsert_do_update_substitutes_the_default() {
 /// ordinary pipeline, so a scaled NUMERIC default lands in minor units.
 #[test]
 fn update_set_default_on_a_scaled_numeric_stores_minor_units() {
-    let mut conn = apply(
+    let mut conn = helpers::apply_default(
         "CREATE TABLE u (id INTEGER PRIMARY KEY, price NUMERIC(10,2) DEFAULT 1.50);
          INSERT INTO u (id, price) VALUES (1, 9.99);
          UPDATE u SET price = DEFAULT WHERE id = 1;",
-    );
+    )
+    .expect("apply");
     assert_eq!(read_line(&mut conn, "SELECT CAST(price AS TEXT) AS line FROM u"), "150");
 }
 

@@ -10,7 +10,7 @@ use diesel::{
     Connection as _, ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection,
     connection::SimpleConnection, result::Error,
 };
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, is_policy_refusal};
+use pg2sqlite::prelude::{Pg2SqliteOptions, is_policy_refusal};
 
 const POLICY_SCHEMA: &str = "
 CREATE TABLE orders (
@@ -90,12 +90,7 @@ fn apply(pg: &str, options: &Pg2SqliteOptions) -> (SqliteConnection, Arc<AtomicB
         function_state.load(Ordering::Relaxed)
     })
     .expect("register write exemption");
-    let statements = Pg2Sqlite::default()
-        .sql(pg)
-        .expect("parse PostgreSQL")
-        .translate_to_sql(options)
-        .expect("translate SQLite")
-        .into_vec();
+    let statements = crate::helpers::translate_pg(pg, options).expect("translate SQLite");
     for statement in statements {
         connection.batch_execute(&statement).expect("apply translated statement");
     }

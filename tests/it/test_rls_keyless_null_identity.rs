@@ -9,8 +9,7 @@
 //! treats two NULLs as equal and is otherwise identical to `=`.
 
 use diesel::prelude::*;
-use helpers::establish_connection;
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+use pg2sqlite::prelude::Pg2SqliteOptions;
 
 use crate::helpers;
 
@@ -67,34 +66,15 @@ const KEYED: &str = "
     CREATE POLICY p ON k USING (owner = 'alice');
 ";
 
-/// Translates `pg` and applies the result as DDL. The emitted SQL is the
-/// artifact under test so it runs as text; every other statement uses the
-/// typed DSL.
-fn apply(pg: &str) -> SqliteConnection {
-    let translated = Pg2Sqlite::default()
-        .sql(pg)
-        .expect("parse")
-        .translate(&Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit"))
-        .expect("translate")
-        .into_vec();
-
-    let mut conn = establish_connection();
-    for statement in &translated {
-        // DDL cannot be expressed with the typed DSL; sql_query is
-        // intentional here.
-        diesel::sql_query(statement.to_string())
-            .execute(&mut conn)
-            .unwrap_or_else(|e| panic!("emitted DDL failed: {e}\n{statement}"));
-    }
-    conn
-}
-
 /// An update through the RLS view of a row whose nullable column holds NULL
 /// must land. Before the fix, NULL = NULL was always NULL (never true) in the
 /// trigger's backing-table WHERE, so the row was silently unchanged.
 #[test]
 fn update_of_null_bearing_row_lands() {
-    let mut conn = apply(KEYLESS);
+    let mut conn = helpers::apply_translated_ddl(
+        KEYLESS,
+        &Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit"),
+    );
 
     // Insert directly into the backing table so note is genuinely NULL.
     diesel::insert_into(t_rls::table)
@@ -121,7 +101,10 @@ fn update_of_null_bearing_row_lands() {
 /// must remove it.
 #[test]
 fn delete_of_null_bearing_row_removes_it() {
-    let mut conn = apply(KEYLESS);
+    let mut conn = helpers::apply_translated_ddl(
+        KEYLESS,
+        &Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit"),
+    );
 
     diesel::insert_into(t_rls::table)
         .values((t_rls::label.eq("a"), t_rls::owner.eq("alice")))
@@ -141,7 +124,10 @@ fn delete_of_null_bearing_row_removes_it() {
 /// narrows to the correct row rather than widening into everything.
 #[test]
 fn bystander_with_non_null_note_survives_update() {
-    let mut conn = apply(KEYLESS);
+    let mut conn = helpers::apply_translated_ddl(
+        KEYLESS,
+        &Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit"),
+    );
 
     // Both rows share label='a'; only the note column distinguishes them.
     diesel::insert_into(t_rls::table)
@@ -179,7 +165,10 @@ fn bystander_with_non_null_note_survives_update() {
 /// same label but carries a non-null note.
 #[test]
 fn bystander_with_non_null_note_survives_delete() {
-    let mut conn = apply(KEYLESS);
+    let mut conn = helpers::apply_translated_ddl(
+        KEYLESS,
+        &Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit"),
+    );
 
     diesel::insert_into(t_rls::table)
         .values((t_rls::label.eq("a"), t_rls::owner.eq("alice")))
@@ -210,7 +199,10 @@ fn bystander_with_non_null_note_survives_delete() {
 /// must not change their behaviour.
 #[test]
 fn keyed_table_update_and_delete_are_unaffected() {
-    let mut conn = apply(KEYED);
+    let mut conn = helpers::apply_translated_ddl(
+        KEYED,
+        &Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit"),
+    );
 
     diesel::insert_into(k_rls::table)
         .values((k_rls::id.eq(1), k_rls::owner.eq("alice")))
