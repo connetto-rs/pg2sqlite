@@ -9,7 +9,10 @@ use sqlparser::ast::{
     TableFactor, Visit, VisitMut, Visitor, VisitorMut, With,
 };
 
-use crate::impls::{object_name::last_ident, relation_scope::RelationScopes};
+use crate::impls::{
+    object_name::last_ident,
+    relation_scope::{RelationScopes, scope_visit_hooks},
+};
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
 
@@ -99,10 +102,7 @@ impl Captures {
 impl Visitor for Captures {
     type Break = ();
 
-    fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<Self::Break> {
-        self.scopes.record_targets(statement);
-        ControlFlow::Continue(())
-    }
+    scope_visit_hooks!(&Statement, &Query);
 
     fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
         self.scopes.enter(query);
@@ -111,11 +111,6 @@ impl Visitor for Captures {
         {
             self.reference(name, table.schema_name.is_some());
         }
-        ControlFlow::Continue(())
-    }
-
-    fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
-        self.scopes.exit();
         ControlFlow::Continue(())
     }
 

@@ -110,3 +110,22 @@ impl RelationScopes {
         self.targets.contains(&ptr::from_ref(name).addr())
     }
 }
+
+/// The `RelationScopes` hooks a query visitor shares, for a struct with a
+/// `scopes` field. Records a statement's write targets before visiting it
+/// and leaves each query scope after visiting it.
+macro_rules! scope_visit_hooks {
+    ($statement:ty, $query:ty) => {
+        fn pre_visit_statement(&mut self, statement: $statement) -> ControlFlow<Self::Break> {
+            self.scopes.record_targets(statement);
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_query(&mut self, _query: $query) -> ControlFlow<Self::Break> {
+            self.scopes.exit();
+            ControlFlow::Continue(())
+        }
+    };
+}
+
+pub(crate) use scope_visit_hooks;

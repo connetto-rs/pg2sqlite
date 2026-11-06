@@ -24,6 +24,7 @@ use super::{
         string_literal,
     },
     shared_helpers::{declared_in_scope, function_argument_exprs, is_integral_expression},
+    temporal_casts::is_interval_expr,
     temporal_literals,
 };
 #[cfg(not(feature = "std"))]
@@ -141,10 +142,10 @@ fn binary_result_kind(
     // An INTERVAL keeps the other operand's type, except that it widens a date
     // to a timestamp.
     let widen = |kind| if kind == TemporalKind::Date { TemporalKind::Timestamp } else { kind };
-    if is_interval(right) {
+    if is_interval_expr(right) {
         return Ok(temporal_kind(left, schema, options)?.map(widen));
     }
-    if is_interval(left) && matches!(op, BinaryOperator::Plus) {
+    if is_interval_expr(left) && matches!(op, BinaryOperator::Plus) {
         return Ok(temporal_kind(right, schema, options)?.map(widen));
     }
 
@@ -170,15 +171,6 @@ fn binary_result_kind(
     })
 }
 
-#[cfg_attr(feature = "std", recursive::recursive)]
-fn is_interval(expr: &Expr) -> bool {
-    match expr {
-        Expr::Interval(_) => true,
-        Expr::Nested(inner) => is_interval(inner),
-        _ => false,
-    }
-}
-
 /// Rewrite or refuse `left op right` when either operand resolves to a date, a
 /// timestamp or a time.
 ///
@@ -197,7 +189,7 @@ pub(crate) fn translate_temporal_binary_op(
     }
     // The INTERVAL rewrite runs first and owns every shape it accepts. What it
     // leaves behind is an interval it cannot express, which refuses on its own.
-    if is_interval(left) || is_interval(right) {
+    if is_interval_expr(left) || is_interval_expr(right) {
         return None;
     }
     let left_kind = match temporal_kind(left, schema, options) {

@@ -118,13 +118,10 @@ fn returns_trigger(function: &CreateFunction) -> bool {
     matches!(function.return_type, Some(FunctionReturnType::DataType(DataType::Trigger)))
 }
 
-/// The guard clause that holds unless the innermost running definer body
-/// belongs to one of `owners`, `None` when there are none.
-pub(crate) fn outside_owners(owners: &[&str]) -> Option<Expr> {
-    if owners.is_empty() {
-        return None;
-    }
-    let innermost = Expr::BinaryOp {
+/// The filter that selects the row of the innermost running definer body,
+/// `rowid = (SELECT max(rowid) FROM <stack>)`.
+fn innermost_stack_rowid() -> Expr {
+    Expr::BinaryOp {
         left: Box::new(Expr::Identifier(Ident::new("rowid"))),
         op: BinaryOperator::Eq,
         right: Box::new(Expr::Subquery(Box::new(single_expr_query(
@@ -132,7 +129,16 @@ pub(crate) fn outside_owners(owners: &[&str]) -> Option<Expr> {
             from_relation(plain_table_factor(stack_name())),
             None,
         )))),
-    };
+    }
+}
+
+/// The guard clause that holds unless the innermost running definer body
+/// belongs to one of `owners`, `None` when there are none.
+pub(crate) fn outside_owners(owners: &[&str]) -> Option<Expr> {
+    if owners.is_empty() {
+        return None;
+    }
+    let innermost = innermost_stack_rowid();
     let listed = Expr::In {
         expr: Box::new(Expr::Identifier(Ident::new("owner"))),
         target: InTarget::List(owners.iter().map(|owner| string_literal(owner)).collect()),
@@ -279,18 +285,7 @@ fn push(owner: &Role) -> Statement {
 }
 
 fn pop() -> Statement {
-    ast_builder::delete(
-        stack_name(),
-        Some(Expr::BinaryOp {
-            left: Box::new(Expr::Identifier(Ident::new("rowid"))),
-            op: BinaryOperator::Eq,
-            right: Box::new(Expr::Subquery(Box::new(single_expr_query(
-                simple_function_expr("max", vec![Expr::Identifier(Ident::new("rowid"))], None),
-                from_relation(plain_table_factor(stack_name())),
-                None,
-            )))),
-        }),
-    )
+    ast_builder::delete(stack_name(), Some(innermost_stack_rowid()))
 }
 
 fn stack_name() -> ObjectName {

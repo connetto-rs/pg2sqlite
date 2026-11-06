@@ -97,12 +97,12 @@ fn binary_kind(
 ) -> Result<Option<TemporalLiteralKind>, Error> {
     // `interval + x` translates as `x + interval`, so the interval lands on
     // the right and the result takes the other operand's kind.
-    let (left, right) = if *op == BinaryOperator::Plus && is_interval(left) {
+    let (left, right) = if *op == BinaryOperator::Plus && is_interval_expr(left) {
         (right, left)
     } else {
         (left, right)
     };
-    if is_interval(right) {
+    if is_interval_expr(right) {
         let widen_date = |kind: Option<TemporalLiteralKind>| {
             match kind {
                 Some(TemporalLiteralKind::Date) => {
@@ -130,12 +130,12 @@ fn binary_kind(
     })
 }
 
-/// Whether `expr` is an INTERVAL, through parentheses.
+/// Whether `expr` is an interval value, through parentheses.
 #[cfg_attr(feature = "std", recursive::recursive)]
-fn is_interval(expr: &Expr) -> bool {
+pub(crate) fn is_interval_expr(expr: &Expr) -> bool {
     match expr {
         Expr::Interval(_) => true,
-        Expr::Nested(inner) => is_interval(inner),
+        Expr::Nested(inner) => is_interval_expr(inner),
         _ => false,
     }
 }

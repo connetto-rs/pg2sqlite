@@ -848,6 +848,30 @@ fn fraction_text(micros: Expr) -> Expr {
     )
 }
 
+/// The whole-second carry and the microsecond fraction of `rounded`
+/// microseconds.
+fn carry_and_fraction(rounded: Expr) -> (Expr, Expr) {
+    (
+        binary(rounded.clone(), BinaryOperator::Divide, integer_literal(1_000_000)),
+        binary(rounded, BinaryOperator::Modulo, integer_literal(1_000_000)),
+    )
+}
+
+/// The whole seconds of `rounded` microseconds minus `fraction`, printed the
+/// way `strftime` prints a timestamp.
+fn whole_seconds_of_micros(rounded: Expr, fraction: Expr) -> Expr {
+    let seconds = binary(
+        Expr::Nested(Box::new(binary(rounded, BinaryOperator::Minus, fraction))),
+        BinaryOperator::Divide,
+        integer_literal(1_000_000),
+    );
+    simple_function_expr(
+        "strftime",
+        vec![string_literal("%Y-%m-%d %H:%M:%S"), seconds, string_literal("unixepoch")],
+        None,
+    )
+}
+
 /// The hours, minutes and seconds of `seconds_of_day` as `HH:MM:SS`.
 fn time_of_day_call(seconds_of_day: Expr) -> Expr {
     simple_function_expr(
@@ -887,16 +911,7 @@ pub(crate) fn round_naive_timestamp(value: &Expr, precision: u32, fallback: Expr
     let total = fractional_second_total(value.clone());
     let rounded = round_micros(total, divisor);
     let fraction = binary(rounded.clone(), BinaryOperator::Modulo, integer_literal(1_000_000));
-    let seconds = binary(
-        Expr::Nested(Box::new(binary(rounded, BinaryOperator::Minus, fraction.clone()))),
-        BinaryOperator::Divide,
-        integer_literal(1_000_000),
-    );
-    let whole = simple_function_expr(
-        "strftime",
-        vec![string_literal("%Y-%m-%d %H:%M:%S"), seconds, string_literal("unixepoch")],
-        None,
-    );
+    let whole = whole_seconds_of_micros(rounded, fraction.clone());
     let guard = binary(
         simple_function_expr(
             "substr",
@@ -940,16 +955,7 @@ pub(crate) fn round_timestamptz(value: Expr, precision: u32) -> Expr {
         BinaryOperator::Modulo,
         integer_literal(1_000_000),
     );
-    let seconds = binary(
-        Expr::Nested(Box::new(binary(rounded, BinaryOperator::Minus, fraction.clone()))),
-        BinaryOperator::Divide,
-        integer_literal(1_000_000),
-    );
-    let whole = simple_function_expr(
-        "strftime",
-        vec![string_literal("%Y-%m-%d %H:%M:%S"), seconds, string_literal("unixepoch")],
-        None,
-    );
+    let whole = whole_seconds_of_micros(rounded, fraction.clone());
     let length = simple_function_expr("length", vec![value.clone()], None);
     let offset = simple_function_expr(
         "substr",
@@ -1062,8 +1068,7 @@ pub(crate) fn round_time(value: &Expr, precision: u32, fallback: Expr) -> Expr {
     let day_seconds = clock_seconds_of_day(value);
     let digits = padded_fraction_digits(value, integer_literal(10), integer_literal(6));
     let rounded = round_micros(integer_cast(digits), divisor);
-    let carry = binary(rounded.clone(), BinaryOperator::Divide, integer_literal(1_000_000));
-    let fraction = binary(rounded, BinaryOperator::Modulo, integer_literal(1_000_000));
+    let (carry, fraction) = carry_and_fraction(rounded);
     let seconds_of_day = binary(Expr::Nested(Box::new(day_seconds)), BinaryOperator::Plus, carry);
     let length = simple_function_expr("length", vec![value.clone()], None);
     let tenth = simple_function_expr(
@@ -1143,8 +1148,7 @@ fn timetz_rounded(value: &Expr, precision: u32) -> Expr {
         binary(Expr::Nested(Box::new(length.clone())), BinaryOperator::Minus, integer_literal(15)),
     );
     let rounded = round_micros(integer_cast(digits), divisor);
-    let carry = binary(rounded.clone(), BinaryOperator::Divide, integer_literal(1_000_000));
-    let fraction = binary(rounded, BinaryOperator::Modulo, integer_literal(1_000_000));
+    let (carry, fraction) = carry_and_fraction(rounded);
     let seconds_of_day = binary(Expr::Nested(Box::new(day_seconds)), BinaryOperator::Plus, carry);
     let offset = simple_function_expr(
         "substr",

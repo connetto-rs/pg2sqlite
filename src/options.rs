@@ -243,6 +243,55 @@ pub struct TranslationContext<'a> {
     written_schema: Option<&'a ParserDB>,
 }
 
+/// The fields a derived [`TranslationContext`] copies from an existing one,
+/// the options and catalogs borrowed rather than cloned.
+struct ContextFields<'a> {
+    options: Cow<'a, Pg2SqliteOptions>,
+    catalogs: Cow<'a, PrewalkCatalogs>,
+    with: Option<&'a sqlparser::ast::With>,
+    variables: &'a [String],
+    schema_is_complete: bool,
+    subqueries_allowed: bool,
+    rebound_body: Option<&'a sqlparser::ast::BeginEndStatements>,
+    written_schema: Option<&'a ParserDB>,
+}
+
+impl<'a> ContextFields<'a> {
+    fn borrowed(context: &'a TranslationContext<'a>) -> Self {
+        Self {
+            options: Cow::Borrowed(context.options.as_ref()),
+            catalogs: Cow::Borrowed(context.catalogs.as_ref()),
+            with: context.with,
+            variables: context.variables,
+            schema_is_complete: context.schema_is_complete,
+            subqueries_allowed: context.subqueries_allowed,
+            rebound_body: context.rebound_body,
+            written_schema: context.written_schema,
+        }
+    }
+
+    /// The context these fields complete, with the caller's `scope` and
+    /// `outer`.
+    fn into_context(
+        self,
+        scope: Option<TranslationScope<'a>>,
+        outer: Option<&'a TranslationContext<'a>>,
+    ) -> TranslationContext<'a> {
+        TranslationContext {
+            options: self.options,
+            catalogs: self.catalogs,
+            scope,
+            outer,
+            with: self.with,
+            variables: self.variables,
+            schema_is_complete: self.schema_is_complete,
+            subqueries_allowed: self.subqueries_allowed,
+            rebound_body: self.rebound_body,
+            written_schema: self.written_schema,
+        }
+    }
+}
+
 impl<'a> TranslationContext<'a> {
     /// Builds a context that carries `options` and no scope, which is what a
     /// caller starting a translation has.
@@ -297,23 +346,7 @@ impl<'a> TranslationContext<'a> {
         &'s self,
         scope: &'s ColumnScope<'s, 's, ParserDB>,
     ) -> TranslationContext<'s> {
-        TranslationContext {
-            options: Cow::Borrowed(self.options.as_ref()),
-            catalogs: Cow::Borrowed(self.catalogs.as_ref()),
-            scope: Some(TranslationScope::Query {
-                scope,
-                pseudo_row: false,
-                original_query: None,
-                whole_rows: &[],
-            }),
-            outer: Some(self),
-            with: self.with,
-            variables: self.variables,
-            schema_is_complete: self.schema_is_complete,
-            subqueries_allowed: self.subqueries_allowed,
-            rebound_body: self.rebound_body,
-            written_schema: self.written_schema,
-        }
+        self.query_scoped(scope, false, None, &[])
     }
 
     /// Retains original query identity alongside column resolution.
@@ -323,14 +356,7 @@ impl<'a> TranslationContext<'a> {
         query: &'s sqlparser::ast::Query,
         whole_rows: &'s [WholeRow<'s>],
     ) -> TranslationContext<'s> {
-        let mut scoped = self.with_scope(scope);
-        scoped.scope = Some(TranslationScope::Query {
-            scope,
-            pseudo_row: false,
-            original_query: Some(query),
-            whole_rows,
-        });
-        scoped
+        self.query_scoped(scope, false, Some(query), whole_rows)
     }
 
     /// The same context with the scope of one `SELECT` whose relations
@@ -340,55 +366,37 @@ impl<'a> TranslationContext<'a> {
         scope: &'s ColumnScope<'s, 's, ParserDB>,
         whole_rows: &'s [WholeRow<'s>],
     ) -> TranslationContext<'s> {
-        let mut scoped = self.with_scope(scope);
-        scoped.scope = Some(TranslationScope::Query {
-            scope,
-            pseudo_row: false,
-            original_query: None,
-            whole_rows,
-        });
-        scoped
+        self.query_scoped(scope, false, None, whole_rows)
     }
 
     pub(crate) fn with_pseudo_row_scope<'s>(
         &'s self,
         scope: &'s ColumnScope<'s, 's, ParserDB>,
     ) -> TranslationContext<'s> {
-        TranslationContext {
-            options: Cow::Borrowed(self.options.as_ref()),
-            catalogs: Cow::Borrowed(self.catalogs.as_ref()),
-            scope: Some(TranslationScope::Query {
-                scope,
-                pseudo_row: true,
-                original_query: None,
-                whole_rows: &[],
-            }),
-            outer: Some(self),
-            with: self.with,
-            variables: self.variables,
-            schema_is_complete: self.schema_is_complete,
-            subqueries_allowed: self.subqueries_allowed,
-            rebound_body: self.rebound_body,
-            written_schema: self.written_schema,
-        }
+        self.query_scoped(scope, true, None, &[])
+    }
+
+    /// The same context inside a query whose columns `scope` resolves, with
+    /// this context as the enclosing one.
+    fn query_scoped<'s>(
+        &'s self,
+        scope: &'s ColumnScope<'s, 's, ParserDB>,
+        pseudo_row: bool,
+        original_query: Option<&'s sqlparser::ast::Query>,
+        whole_rows: &'s [WholeRow<'s>],
+    ) -> TranslationContext<'s> {
+        ContextFields::borrowed(self).into_context(
+            Some(TranslationScope::Query { scope, pseudo_row, original_query, whole_rows }),
+            Some(self),
+        )
     }
 
     pub(crate) fn with_definition_scope<'s>(
         &'s self,
         scope: ColumnDefinitionScope<'s, 's, 's, ParserDB>,
     ) -> TranslationContext<'s> {
-        TranslationContext {
-            options: Cow::Borrowed(self.options.as_ref()),
-            catalogs: Cow::Borrowed(self.catalogs.as_ref()),
-            scope: Some(TranslationScope::Definition(scope)),
-            outer: Some(self),
-            with: self.with,
-            variables: self.variables,
-            schema_is_complete: self.schema_is_complete,
-            subqueries_allowed: self.subqueries_allowed,
-            rebound_body: self.rebound_body,
-            written_schema: self.written_schema,
-        }
+        ContextFields::borrowed(self)
+            .into_context(Some(TranslationScope::Definition(scope)), Some(self))
     }
 
     /// The same context noting `with` as the enclosing query's CTE clause.
@@ -396,34 +404,16 @@ impl<'a> TranslationContext<'a> {
         &'s self,
         with: Option<&'s sqlparser::ast::With>,
     ) -> TranslationContext<'s> {
-        TranslationContext {
-            options: Cow::Borrowed(self.options.as_ref()),
-            catalogs: Cow::Borrowed(self.catalogs.as_ref()),
-            scope: self.scope,
-            outer: self.outer,
-            with,
-            variables: self.variables,
-            schema_is_complete: self.schema_is_complete,
-            subqueries_allowed: self.subqueries_allowed,
-            rebound_body: self.rebound_body,
-            written_schema: self.written_schema,
-        }
+        let mut fields = ContextFields::borrowed(self);
+        fields.with = with;
+        fields.into_context(self.scope, self.outer)
     }
 
     /// The same context noting the PL/pgSQL variables in scope.
     pub(crate) fn with_variables<'s>(&'s self, variables: &'s [String]) -> TranslationContext<'s> {
-        TranslationContext {
-            options: Cow::Borrowed(self.options.as_ref()),
-            catalogs: Cow::Borrowed(self.catalogs.as_ref()),
-            scope: self.scope,
-            outer: self.outer,
-            with: self.with,
-            variables,
-            schema_is_complete: self.schema_is_complete,
-            subqueries_allowed: self.subqueries_allowed,
-            rebound_body: self.rebound_body,
-            written_schema: self.written_schema,
-        }
+        let mut fields = ContextFields::borrowed(self);
+        fields.variables = variables;
+        fields.into_context(self.scope, self.outer)
     }
 
     /// The same context translating a trigger with `body` in place of its
@@ -432,18 +422,9 @@ impl<'a> TranslationContext<'a> {
         &'s self,
         body: &'s sqlparser::ast::BeginEndStatements,
     ) -> TranslationContext<'s> {
-        TranslationContext {
-            options: Cow::Borrowed(self.options.as_ref()),
-            catalogs: Cow::Borrowed(self.catalogs.as_ref()),
-            scope: self.scope,
-            outer: self.outer,
-            with: self.with,
-            variables: self.variables,
-            schema_is_complete: self.schema_is_complete,
-            subqueries_allowed: self.subqueries_allowed,
-            rebound_body: Some(body),
-            written_schema: self.written_schema,
-        }
+        let mut fields = ContextFields::borrowed(self);
+        fields.rebound_body = Some(body);
+        fields.into_context(self.scope, self.outer)
     }
 
     /// The body a trigger translated here executes in place of its
@@ -458,18 +439,9 @@ impl<'a> TranslationContext<'a> {
         &'s self,
         schema: &'s ParserDB,
     ) -> TranslationContext<'s> {
-        TranslationContext {
-            options: Cow::Borrowed(self.options.as_ref()),
-            catalogs: Cow::Borrowed(self.catalogs.as_ref()),
-            scope: self.scope,
-            outer: self.outer,
-            with: self.with,
-            variables: self.variables,
-            schema_is_complete: self.schema_is_complete,
-            subqueries_allowed: self.subqueries_allowed,
-            rebound_body: self.rebound_body,
-            written_schema: Some(schema),
-        }
+        let mut fields = ContextFields::borrowed(self);
+        fields.written_schema = Some(schema);
+        fields.into_context(self.scope, self.outer)
     }
 
     /// The schema the statement being translated was written against.
@@ -479,18 +451,9 @@ impl<'a> TranslationContext<'a> {
 
     /// Restricts expression translation to a position that forbids subqueries.
     pub(crate) fn without_subqueries(&self) -> TranslationContext<'_> {
-        TranslationContext {
-            options: Cow::Borrowed(self.options.as_ref()),
-            catalogs: Cow::Borrowed(self.catalogs.as_ref()),
-            scope: self.scope,
-            outer: self.outer,
-            with: self.with,
-            variables: self.variables,
-            schema_is_complete: self.schema_is_complete,
-            subqueries_allowed: false,
-            rebound_body: self.rebound_body,
-            written_schema: self.written_schema,
-        }
+        let mut fields = ContextFields::borrowed(self);
+        fields.subqueries_allowed = false;
+        fields.into_context(self.scope, self.outer)
     }
 
     #[must_use]
