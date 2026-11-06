@@ -1,9 +1,10 @@
 //! Logical to physical table map for a translation.
 //!
-//! RLS translation renames a table's storage behind a view and read-only
-//! translation denies writes, so the logical (PostgreSQL) name no longer
-//! always names a plain table. The RLS suffix is configurable, so the map
-//! cannot be guessed by convention. Get it from
+//! RLS translation and the acting role's column grants rename a table's
+//! storage behind a view, and read-only translation denies writes, so the
+//! logical (PostgreSQL) name no longer always names a plain table. The RLS
+//! suffix is configurable, so the map cannot be guessed by convention. Get it
+//! from
 //! [`Pg2Sqlite::translation_manifest`](crate::pg2sqlite::Pg2Sqlite::translation_manifest).
 
 #[cfg(not(feature = "std"))]
@@ -20,6 +21,16 @@ pub enum WrapperKind {
     /// Read-only translation. The name is unchanged and BEFORE triggers deny
     /// writes.
     ReadOnly,
+    /// The acting role's grants on a table without row-level security, which
+    /// it cannot read in full or can insert into only in part. The physical
+    /// table carries the configured suffix, a view holds the logical name with
+    /// the columns the role may read, and INSTEAD OF triggers refuse the
+    /// writes it may not make.
+    PrivilegeView,
+    /// The acting role's grants on a table it reads in full and may write
+    /// only in part. The name is unchanged and BEFORE triggers refuse the
+    /// commands and columns it may not write.
+    Gated,
 }
 
 /// The database schema containing an emitted object.
@@ -39,7 +50,8 @@ pub struct TableManifestEntry {
     /// The table name in the source (PostgreSQL) schema.
     pub logical: String,
     /// Where the object named [`logical`](Self::logical) lives, which is the
-    /// view for [`WrapperKind::RlsView`] and the table itself otherwise.
+    /// view for [`WrapperKind::RlsView`] and [`WrapperKind::PrivilegeView`],
+    /// and the table itself otherwise.
     pub logical_placement: Placement,
     /// The SQLite table that physically stores the rows.
     pub physical: String,
@@ -218,6 +230,30 @@ mod tests {
         let writable = manifest.iter().find(|e| e.logical == "editable").unwrap();
         assert_eq!(writable.physical, "editable");
         assert_eq!(writable.wrapper, WrapperKind::Plain);
+    }
+
+    /// A table read in part gets a view over a renamed backing table, and one
+    /// read in full but written in part keeps its name behind deny triggers.
+    #[test]
+    fn grant_wrapped_tables_are_classified_by_their_wrapper() {
+        let sql = r#"
+            CREATE ROLE app_user;
+            CREATE TABLE profiles (id INTEGER PRIMARY KEY, name TEXT, secret TEXT);
+            GRANT SELECT (id, name), UPDATE (name) ON profiles TO app_user;
+            CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT);
+            GRANT SELECT, INSERT ON notes TO app_user;
+        "#;
+        let options = crate::options::acting_as("app_user");
+        let manifest = manifest(sql, &options);
+
+        let profiles = manifest.iter().find(|e| e.logical == "profiles").unwrap();
+        assert_eq!(profiles.physical, "profiles_rls");
+        assert_eq!(profiles.wrapper, WrapperKind::PrivilegeView);
+        assert!(generated_rls_backing_name(sql, &options).contains("profiles_rls"));
+
+        let notes = manifest.iter().find(|e| e.logical == "notes").unwrap();
+        assert_eq!(notes.physical, "notes");
+        assert_eq!(notes.wrapper, WrapperKind::Gated);
     }
 
     #[test]

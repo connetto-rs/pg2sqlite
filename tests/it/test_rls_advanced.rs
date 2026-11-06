@@ -4,9 +4,9 @@
 //! Covers: EXISTS in policy USING, Subquery in policy, UPDATE with CHECK,
 //! CompoundIdentifier rename in trigger, find_current_setting_call in BinaryOp,
 //! contains_current_user in nested expr, validate_session_variables error,
-//! generate_readonly_rls_statements, monitoring triggers, validation views,
-//! generate_rls_audit_table, In/Between/IsNull in transform_expr,
-//! In/Between in transform_outer_table_refs.
+//! the read-only path of generate_view_statements, monitoring triggers,
+//! validation views, generate_rls_audit_table, In/Between/IsNull in
+//! transform_expr, In/Between in transform_outer_table_refs.
 
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
 

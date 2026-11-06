@@ -1133,25 +1133,27 @@ impl Pg2Sqlite {
 
         let mut entries = Vec::new();
         for table in schema.tables() {
-            let access = match role {
+            let grants = match role {
                 Some(role) => {
-                    Some(crate::impls::session_variable::table_access(table, role, schema)?)
+                    Some(crate::impls::privileges::RoleTable::of(table, Some(role), schema)?)
                 }
                 None => None,
             };
-            if access.is_some_and(|access| !access.reads) {
+            if grants.as_ref().is_some_and(|grants| !grants.reads_any()) {
                 continue;
             }
 
             let logical = table.table_name().to_string();
             let physical = resolve_trigger_table_name(&logical, table, schema, options)?;
-            let readonly = access.is_some_and(|access| !access.writes);
             let wrapper = if table.has_row_level_security(schema)? {
                 WrapperKind::RlsView
-            } else if readonly {
-                WrapperKind::ReadOnly
             } else {
-                WrapperKind::Plain
+                match &grants {
+                    Some(grants) if grants.needs_view() => WrapperKind::PrivilegeView,
+                    Some(grants) if grants.is_read_only() => WrapperKind::ReadOnly,
+                    Some(grants) if !grants.writes_everything() => WrapperKind::Gated,
+                    _ => WrapperKind::Plain,
+                }
             };
 
             // Every column is listed, in declaration order, with the ones a

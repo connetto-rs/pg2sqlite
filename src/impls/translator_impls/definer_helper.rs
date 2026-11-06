@@ -5,9 +5,9 @@
 //! authz.f('admin')))`. SQLite has no functions of its own to call, so the call
 //! is replaced by the query `FunctionLike::helper_set` reads out of the
 //! helper's body, one `SELECT` per arm joined by `UNION`. Each arm reads the
-//! backing table of a table with row-level security, because the helper runs as
-//! an owner that `helper_set` has checked is exempt from every policy it reads
-//! past.
+//! backing table of a table that has one, because the helper runs as an owner
+//! that `helper_set` has checked is exempt from every policy it reads past,
+//! and the owner reads past the acting role's grants.
 
 use core::{convert::Infallible, ops::ControlFlow};
 
@@ -28,6 +28,7 @@ use crate::{
     errors::Error,
     impls::{
         function_helpers::{query_projection, simple_function_expr, string_literal},
+        privileges::has_backing_table,
         query_builder::{from_relation, make_query, plain_table_factor, single_expr_query},
     },
     options::TranslationContext,
@@ -86,7 +87,7 @@ pub(crate) fn helper_membership(
             ))
         })?;
     let mut guarded = Vec::new();
-    guarded_tables(&set, schema, &mut guarded)?;
+    guarded_tables(&set, schema, options, &mut guarded)?;
     let mut lowered = lowered_set(&set).translate_with_warnings(schema, options, emit)?;
     let ControlFlow::Continue(()) = lowered
         .visit(&mut BackingTables { guarded: &guarded, suffix: options.get_rls_table_suffix() });
@@ -118,22 +119,23 @@ fn arguments(call: &Function) -> Result<Vec<Value>, HelperSetError> {
         .collect()
 }
 
-/// The names of the tables with row-level security the arms of `set` read,
-/// its parent arms' sets included.
+/// The names of the tables with a backing table the arms of `set` read, its
+/// parent arms' sets included.
 fn guarded_tables<'db>(
     set: &HelperSet<'db, ParserDB>,
     schema: &ParserDB,
+    options: &TranslationContext<'_>,
     guarded: &mut Vec<&'db str>,
 ) -> Result<(), Error> {
     for arm in set.arms() {
         let table = match arm {
             HelperArm::Grant(grant) => grant.table(),
             HelperArm::Parent(parent) => {
-                guarded_tables(parent.set(), schema, guarded)?;
+                guarded_tables(parent.set(), schema, options, guarded)?;
                 parent.table()
             }
         };
-        if table.has_row_level_security(schema)? {
+        if has_backing_table(table, schema, options)? {
             guarded.push(table.table_name());
         }
     }

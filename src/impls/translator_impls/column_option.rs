@@ -7,9 +7,8 @@ use sqlparser::ast::{
 };
 
 use crate::impls::{
-    object_name::{append_suffix, translation_table_has_rls},
-    shared_helpers::match_partial_not_supported_error,
-    translator_impls::expr::sqlite_collation,
+    object_name::append_suffix, privileges::names_table_with_backing,
+    shared_helpers::match_partial_not_supported_error, translator_impls::expr::sqlite_collation,
 };
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
@@ -177,7 +176,7 @@ impl crate::traits::translator::TranslatorWithContext for ColumnOptionDef {
                     return Err(match_partial_not_supported_error());
                 }
                 let updated_foreign_table = {
-                    if translation_table_has_rls(schema, foreign_table)? {
+                    if names_table_with_backing(schema, foreign_table, options)? {
                         append_suffix(foreign_table, options.get_rls_table_suffix())
                     } else {
                         foreign_table.clone()

@@ -5,7 +5,9 @@ use sql_traits::{
     structs::ParserDB,
     traits::{ColumnLike, DatabaseLike, IndexLike, TableLike, UniqueIndexLike},
 };
-use sqlparser::ast::{DataType, Insert, SelectItem, SetExpr, TableObject};
+use sqlparser::ast::{
+    AssignmentTarget, DataType, Expr, Insert, ObjectName, SelectItem, SetExpr, TableObject,
+};
 
 use super::helpers::Forward;
 #[cfg(not(feature = "std"))]
@@ -14,8 +16,10 @@ use crate::{
     impls::{
         object_name::{
             COLUMN_LOOKUP_CASE, last_ident, last_ident_value_or_display,
-            normalize_schema_qualified_object_name_for_sqlite, resolve_translation_table,
+            normalize_schema_qualified_object_name_for_sqlite, quoted_ident,
+            resolve_translation_table,
         },
+        privileges::RoleTable,
         shared_helpers::{
             ColumnReferences, ColumnRewrites, carries_default_keyword, declares_always_identity,
             extract_columns_from_expr, is_default_keyword, substituted_assignment_default,
@@ -24,6 +28,7 @@ use crate::{
         translator_impls::rls,
     },
     traits::translator::TranslatorWithContext,
+    write_guard::permission_denied,
 };
 type ParserTable = <ParserDB as DatabaseLike>::Table;
 
@@ -958,12 +963,13 @@ fn rewrite_rls_view_insert<'schema>(
         return Ok(target);
     }
 
-    let TableObject::TableName(table_name) = &insert.table else { return Ok(target) };
+    let TableObject::TableName(table_name) = insert.table.clone() else { return Ok(target) };
+    let table_name = &table_name;
     let Some(table) = target.optional() else {
         return Ok(target);
     };
     let Some(last) = last_ident(table_name) else { return Ok(target) };
-    let Ok(true) = rls::table_has_rls(&last.value, schema) else {
+    let Ok(true) = rls::table_has_backing(&last.value, schema, options) else {
         return Ok(target);
     };
 
@@ -995,9 +1001,136 @@ fn rewrite_rls_view_insert<'schema>(
     }
 
     // Strict mode: redirect to the backing table. The BEFORE INSERT guard on
-    // the backing table keeps WITH CHECK enforcement on this path.
-    insert.table = TableObject::TableName(backing_table_name(table_name, options));
+    // the backing table keeps WITH CHECK enforcement on this path, and the
+    // acting role's grants are checked here, since the view's triggers that
+    // check them are bypassed.
+    let backing = backing_table_name(table_name, options);
+    gate_backing_redirect(insert, table, schema, options)?;
+    insert.table = TableObject::TableName(backing);
     Ok(target)
+}
+
+/// Holds an insert redirected past the view to what the view allows, the
+/// columns it shows written as the acting role may insert and upsert them,
+/// with a `RETURNING *` narrowed to them.
+///
+/// # Errors
+///
+/// Refuses a column the view does not show, with SQLite's message, and a
+/// column or command the role holds no privilege for, with PostgreSQL's.
+fn gate_backing_redirect(
+    insert: &mut Insert,
+    table: &ParserTable,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<(), crate::errors::Error> {
+    let grants = RoleTable::acting(table, schema, options)?;
+    let table_name = table.table_name();
+    let denied = || crate::errors::Error::forward_refusal(permission_denied(table_name));
+    let hidden = |column: &str| {
+        crate::errors::Error::forward_refusal(format!(
+            "table {table_name} has no column named {column}"
+        ))
+    };
+    if !grants.inserts_any() {
+        return Err(denied());
+    }
+    let readable: Vec<String> = grants.readable().map(str::to_owned).collect();
+    let narrowed = readable.len() < table.columns(schema)?.count();
+    let shown = |names: &[String]| -> Vec<SelectItem> {
+        names
+            .iter()
+            .map(|name| SelectItem::UnnamedExpr(Expr::Identifier(quoted_ident(name))))
+            .collect()
+    };
+
+    // The view lists only the readable columns, so a bare insert fills them in
+    // order, as many as its rows hold.
+    let targets: Vec<String> = if insert.columns.is_empty() {
+        let width = insert.source.as_deref().map_or(Some(0), |source| row_width(&source.body));
+        readable.iter().take(width.unwrap_or(readable.len())).cloned().collect()
+    } else {
+        insert.columns.iter().map(last_ident_value_or_display).collect()
+    };
+    for name in &targets {
+        if !grants.reads(name) {
+            return Err(hidden(name));
+        }
+        if !grants.inserts(name) {
+            return Err(denied());
+        }
+    }
+    if insert.columns.is_empty() && narrowed {
+        insert.columns =
+            targets.iter().map(|name| ObjectName::from(vec![quoted_ident(name)])).collect();
+    }
+
+    if let Some(sqlparser::ast::OnInsert::OnConflict(conflict)) = &insert.on
+        && let sqlparser::ast::OnConflictAction::DoUpdate(update) = &conflict.action
+    {
+        for assignment in &update.assignments {
+            let targets = match &assignment.target {
+                AssignmentTarget::ColumnName(name) => vec![name],
+                AssignmentTarget::Tuple(names) => names.iter().collect(),
+            };
+            for target in targets {
+                let name = last_ident_value_or_display(target);
+                if !grants.reads(&name) {
+                    return Err(hidden(&name));
+                }
+                if !grants.updates(&name) {
+                    return Err(denied());
+                }
+            }
+        }
+    }
+
+    if let Some(items) = &mut insert.returning {
+        let mut narrowed_items = Vec::with_capacity(items.len());
+        for item in items.drain(..) {
+            match &item {
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) if narrowed => {
+                    narrowed_items.extend(shown(&readable));
+                }
+                SelectItem::UnnamedExpr(expr)
+                | SelectItem::ExprWithAlias { expr, .. }
+                | SelectItem::ExprWithAliases { expr, .. } => {
+                    if let ColumnReferences::Complete(columns) = extract_columns_from_expr(expr)
+                        && let Some(column) = columns.iter().find(|column| !grants.reads(column))
+                    {
+                        return Err(crate::errors::Error::forward_refusal(format!(
+                            "no such column: {column}"
+                        )));
+                    }
+                    narrowed_items.push(item);
+                }
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {
+                    narrowed_items.push(item);
+                }
+            }
+        }
+        *items = narrowed_items;
+    }
+    Ok(())
+}
+
+/// How many columns each row of `body` holds, `None` when a wildcard leaves it
+/// to the relations it reads.
+#[cfg_attr(feature = "std", recursive::recursive)]
+fn row_width(body: &SetExpr) -> Option<usize> {
+    match body {
+        SetExpr::Values(values) => Some(values.rows.first().map_or(0, |row| row.content.len())),
+        SetExpr::Select(select)
+            if !select.projection.iter().any(|item| {
+                matches!(item, SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..))
+            }) =>
+        {
+            Some(select.projection.len())
+        }
+        SetExpr::SetOperation { left, .. } => row_width(left),
+        SetExpr::Query(query) => row_width(&query.body),
+        _ => None,
+    }
 }
 
 /// `table_name` with its last part renamed to the RLS backing table.

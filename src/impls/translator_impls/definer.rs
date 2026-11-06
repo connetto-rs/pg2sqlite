@@ -35,6 +35,7 @@ use crate::{
         ast_builder,
         function_helpers::{simple_function_expr, string_literal},
         object_name::{append_suffix, resolve_translation_table},
+        privileges::has_backing_table,
         query_builder::{from_relation, plain_table_factor, single_expr_query},
     },
 };
@@ -214,7 +215,8 @@ pub(crate) fn run_as_owner(
 }
 
 /// The backing table `owner` reads and writes in place of `name`, `None` when
-/// `name` is not a table with row-level security.
+/// `name` is not a table with one. The owner reads past the acting role's
+/// grants, and past row-level security where the policies exempt it.
 fn backing_name(
     function: &CreateFunction,
     owner: &Role,
@@ -225,10 +227,10 @@ fn backing_name(
     let Some(table) = resolve_translation_table(schema, name)? else {
         return Ok(None);
     };
-    if !table.has_row_level_security(schema)? {
+    if !has_backing_table(table, schema, options)? {
         return Ok(None);
     }
-    if !exempts(table, owner, schema) {
+    if table.has_row_level_security(schema)? && !exempts(table, owner, schema) {
         return Err(Error::forward_refusal(format!(
             "trigger function '{}' is SECURITY DEFINER and reads or writes table '{}' as its \
              owner '{}', whom the table's row-level security policies bind. The translation \

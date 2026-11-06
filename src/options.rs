@@ -840,35 +840,39 @@ impl Pg2SqliteOptions {
     }
 
     #[must_use]
-    /// Sets the suffix used for RLS backing tables.
+    /// Sets the suffix of the backing table behind a view, which row-level
+    /// security and the acting role's grants put there.
     pub fn with_rls_table_suffix(mut self, suffix: impl Into<String>) -> Self {
         self.rls_table_suffix = suffix.into();
         self
     }
 
     #[must_use]
-    /// Returns the suffix used for RLS backing tables.
+    /// Returns the suffix of the backing table behind a view.
     pub fn get_rls_table_suffix(&self) -> &str {
         &self.rls_table_suffix
     }
 
     #[must_use]
-    /// Sets the marker used in read only deny trigger names.
+    /// Sets the marker used in the names of the triggers denying a plain
+    /// table's writes to the acting role.
     pub fn with_readonly_deny_trigger_suffix(mut self, suffix: impl Into<String>) -> Self {
         self.readonly_deny_trigger_suffix = suffix.into();
         self
     }
 
     #[must_use]
-    /// Returns the marker used in read only deny trigger names.
+    /// Returns the marker used in the names of the triggers denying a plain
+    /// table's writes to the acting role.
     pub fn get_readonly_deny_trigger_suffix(&self) -> &str {
         &self.readonly_deny_trigger_suffix
     }
 
     #[must_use]
-    /// Names the deployment acting role this translation runs as, which
-    /// filters grants and policies and which `current_user`, `current_role`
-    /// and `user` answer.
+    /// Names the deployment acting role this translation runs as, whose grants
+    /// decide which tables, columns and writes reach the replica, which
+    /// policies apply, and which `current_user`, `current_role` and `user`
+    /// answer.
     ///
     /// The role has to be one of the acting roles of the deployment passed
     /// with [`with_deployment`](Self::with_deployment), declared in the

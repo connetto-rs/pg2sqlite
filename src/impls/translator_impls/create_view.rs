@@ -17,8 +17,12 @@ use sqlparser::ast::{
 use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
-    impls::object_name::{
-        append_suffix, normalize_schema_qualified_object_name_for_sqlite, resolve_translation_table,
+    impls::{
+        object_name::{
+            append_suffix, normalize_schema_qualified_object_name_for_sqlite,
+            resolve_translation_table,
+        },
+        privileges::has_backing_table,
     },
 };
 
@@ -112,9 +116,9 @@ fn reads_as_the_invoker(options: &CreateTableOptions) -> bool {
     )
 }
 
-/// Points the view body at the backing table of every row level security table
-/// it reads, which is how the view's owner reads a table whose policies exempt
-/// it.
+/// Points the view body at the backing table of every table it reads that has
+/// one, which is how the view's owner reads a table whose policies exempt it,
+/// or whose columns the acting role reads only in part.
 ///
 /// The same retarget a foreign key referencing such a table already gets, so a
 /// declared view and a declared reference agree about which relation holds
@@ -133,7 +137,7 @@ fn retarget_rls_reads(
             Ok(None) => return ControlFlow::Continue(()),
             Err(error) => return ControlFlow::Break(error),
         };
-        match owner_bypasses(view, table, schema) {
+        match owner_bypasses(view, table, schema, options) {
             Ok(true) => {
                 *name = append_suffix(name, options.get_rls_table_suffix());
                 ControlFlow::Continue(())
@@ -148,8 +152,9 @@ fn retarget_rls_reads(
     }
 }
 
-/// Whether `view`'s owner reads `table` past row-level security, `false`
-/// meaning the table has none.
+/// Whether `view`'s owner reads `table` through its backing table, `false`
+/// meaning the table has none. The owner reads past the acting role's grants,
+/// and past row-level security where the policies exempt it.
 ///
 /// # Errors
 ///
@@ -159,9 +164,10 @@ fn owner_bypasses(
     view: &CreateView,
     table: &CreateTable,
     schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
 ) -> Result<bool, Error> {
     if !table.has_row_level_security(schema)? {
-        return Ok(false);
+        return has_backing_table(table, schema, options);
     }
     let owner = declared_view(schema, view)?
         .map(|stored| stored.owner(schema))
