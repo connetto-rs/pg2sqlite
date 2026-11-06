@@ -5,7 +5,7 @@ use diesel::{
     result::{DatabaseErrorKind, Error as DatabaseError},
 };
 
-use super::{open, run, script};
+use super::{create_and_reopen, open, run, script};
 
 diesel::table! {
     scratch (id) { id -> Integer, value -> Integer, }
@@ -25,15 +25,9 @@ diesel::table! {
 diesel::infix_operator!(Matches, " MATCH ", backend: diesel::sqlite::Sqlite);
 
 fn reopened(source: &str) -> (tempfile::TempDir, SqliteConnection) {
-    let script = script(source);
     let files = tempfile::TempDir::new().expect("files");
-    {
-        let mut creating = open(&files);
-        run(&mut creating, script.iter());
-    }
-    let mut reopened = open(&files);
-    run(&mut reopened, script.connect().expect("connection program"));
-    (files, reopened)
+    let connection = create_and_reopen(&files, &script(source));
+    (files, connection)
 }
 
 fn rows(connection: &mut SqliteConnection) -> Vec<(i32, i32)> {

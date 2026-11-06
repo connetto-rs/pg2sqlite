@@ -4,6 +4,8 @@
 use diesel::{connection::SimpleConnection, prelude::*};
 use pg2sqlite::{prelude::*, script::ConnectionError};
 
+use crate::helpers::replay::{create_and_reopen, open, run, script};
+
 mod schema {
     diesel::table! {
         scratch (id) { id -> Integer, }
@@ -66,24 +68,6 @@ mod schema {
     }
 }
 
-fn script(sql: &str) -> Script<String> {
-    Pg2Sqlite::default()
-        .sql(sql)
-        .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
-        .expect("translate")
-}
-
-fn open(files: &tempfile::TempDir) -> SqliteConnection {
-    SqliteConnection::establish(files.path().join("main.db").to_str().expect("path")).expect("open")
-}
-
-fn run<'a>(connection: &mut SqliteConnection, statements: impl Iterator<Item = &'a String>) {
-    for statement in statements {
-        connection.batch_execute(statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
-    }
-}
-
 #[test]
 fn native_temp_table_and_seed_replay_on_reopen() {
     let script = script(
@@ -94,12 +78,7 @@ fn native_temp_table_and_seed_replay_on_reopen() {
          INSERT INTO orders VALUES(1, 10);",
     );
     let files = tempfile::TempDir::new().expect("files");
-    {
-        let mut creating = open(&files);
-        run(&mut creating, script.iter());
-    }
-    let mut reopened = open(&files);
-    run(&mut reopened, script.connect().expect("connection program"));
+    let mut reopened = create_and_reopen(&files, &script);
     let scratch = schema::scratch::table
         .select(schema::scratch::id)
         .order(schema::scratch::id)
@@ -119,12 +98,7 @@ fn temp_view_survives_persistent_column_rename() {
          ALTER TABLE source RENAME COLUMN name TO label;",
     );
     let files = tempfile::TempDir::new().expect("files");
-    {
-        let mut creating = open(&files);
-        run(&mut creating, script.iter());
-    }
-    let mut reopened = open(&files);
-    run(&mut reopened, script.connect().expect("connection program"));
+    let mut reopened = create_and_reopen(&files, &script);
     let row = schema::renamed::table
         .select(schema::renamed::label)
         .first::<String>(&mut reopened)
@@ -145,12 +119,7 @@ fn rename_rewrites_only_scoped_columns() {
          ALTER TABLE a RENAME COLUMN x TO y;",
     );
     let files = tempfile::TempDir::new().expect("files");
-    {
-        let mut creating = open(&files);
-        run(&mut creating, script.iter());
-    }
-    let mut reopened = open(&files);
-    run(&mut reopened, script.connect().expect("connection program"));
+    let mut reopened = create_and_reopen(&files, &script);
     let direct = schema::direct::table.first::<(String, String)>(&mut reopened).expect("join");
     let aliased = schema::aliased::table
         .select(schema::aliased::tx)
@@ -178,12 +147,7 @@ fn dropped_temp_objects_do_not_leak_into_replay() {
          CREATE TEMP VIEW stale AS SELECT id FROM s WHERE note = 'fresh';",
     );
     let files = tempfile::TempDir::new().expect("files");
-    {
-        let mut creating = open(&files);
-        run(&mut creating, script.iter());
-    }
-    let mut reopened = open(&files);
-    run(&mut reopened, script.connect().expect("connection program"));
+    let mut reopened = create_and_reopen(&files, &script);
     let row = schema::s::table.first::<(i32, String)>(&mut reopened).expect("surviving table");
     let stale = schema::stale::table
         .select(schema::stale::id)
@@ -206,12 +170,7 @@ fn connection_replay_excludes_rolled_back_rows() {
          INSERT INTO t VALUES(4);",
     );
     let files = tempfile::TempDir::new().expect("files");
-    {
-        let mut creating = open(&files);
-        run(&mut creating, script.iter());
-    }
-    let mut reopened = open(&files);
-    run(&mut reopened, script.connect().expect("connection program"));
+    let mut reopened = create_and_reopen(&files, &script);
     let rows = schema::t::table
         .select(schema::t::id)
         .order(schema::t::id)
@@ -229,12 +188,7 @@ fn view_alias_and_order_by_keep_the_alias_name() {
          ALTER TABLE notes RENAME COLUMN body TO value;",
     );
     let files = tempfile::TempDir::new().expect("files");
-    {
-        let mut creating = open(&files);
-        run(&mut creating, script.iter());
-    }
-    let mut reopened = open(&files);
-    run(&mut reopened, script.connect().expect("connection program"));
+    let mut reopened = create_and_reopen(&files, &script);
     let rows = schema::sorted::table.load::<(i32, i32)>(&mut reopened).expect("alias order");
     assert_eq!(rows, [(2, -20), (1, -10)]);
 }
@@ -250,12 +204,7 @@ fn scalar_subquery_bindings_do_not_capture_the_outer_projection() {
          ALTER TABLE a RENAME COLUMN x TO y;",
     );
     let files = tempfile::TempDir::new().expect("files");
-    {
-        let mut creating = open(&files);
-        run(&mut creating, script.iter());
-    }
-    let mut reopened = open(&files);
-    run(&mut reopened, script.connect().expect("connection program"));
+    let mut reopened = create_and_reopen(&files, &script);
     let row = schema::nested::table
         .first::<(String, String)>(&mut reopened)
         .expect("isolated nested bindings");
@@ -272,12 +221,7 @@ fn cte_bindings_shadow_a_renamed_physical_column() {
          ALTER TABLE a RENAME COLUMN x TO y;",
     );
     let files = tempfile::TempDir::new().expect("files");
-    {
-        let mut creating = open(&files);
-        run(&mut creating, script.iter());
-    }
-    let mut reopened = open(&files);
-    run(&mut reopened, script.connect().expect("connection program"));
+    let mut reopened = create_and_reopen(&files, &script);
     let row = schema::cte_scoped::table
         .select(schema::cte_scoped::x)
         .first::<String>(&mut reopened)
@@ -407,12 +351,7 @@ fn renamed_table_qualifiers_preserve_explicit_aliases() {
          ALTER TABLE a RENAME TO z;",
     );
     let files = tempfile::TempDir::new().expect("files");
-    {
-        let mut creating = open(&files);
-        run(&mut creating, script.iter());
-    }
-    let mut reopened = open(&files);
-    run(&mut reopened, script.connect().expect("connection program"));
+    let mut reopened = create_and_reopen(&files, &script);
     let direct = schema::physical_qualifier::table
         .select(schema::physical_qualifier::x)
         .first::<String>(&mut reopened)
@@ -434,12 +373,7 @@ fn renamed_columns_remain_quoted_when_required() {
          ALTER TABLE a RENAME COLUMN x TO \"select\";",
     );
     let files = tempfile::TempDir::new().expect("files");
-    {
-        let mut creating = open(&files);
-        run(&mut creating, script.iter());
-    }
-    let mut reopened = open(&files);
-    run(&mut reopened, script.connect().expect("connection program"));
+    let mut reopened = create_and_reopen(&files, &script);
     let row = schema::keyword_column::table
         .select(schema::keyword_column::selected)
         .first::<String>(&mut reopened)
@@ -456,12 +390,7 @@ fn replayed_ctas_consumes_the_current_persistent_rows() {
          ALTER TABLE a RENAME COLUMN id TO renamed;",
     );
     let files = tempfile::TempDir::new().expect("files");
-    {
-        let mut creating = open(&files);
-        run(&mut creating, script.iter());
-    }
-    let mut reopened = open(&files);
-    run(&mut reopened, script.connect().expect("connection program"));
+    let mut reopened = create_and_reopen(&files, &script);
     let rows = schema::scratch::table
         .select(schema::scratch::id)
         .order(schema::scratch::id)
@@ -518,12 +447,7 @@ fn replayed_ctas_output_survives_a_renamed_view_base() {
          ALTER TABLE a RENAME COLUMN id TO renamed;",
     );
     let files = tempfile::TempDir::new().expect("files");
-    {
-        let mut creating = open(&files);
-        run(&mut creating, script.iter());
-    }
-    let mut reopened = open(&files);
-    run(&mut reopened, script.connect().expect("connection program"));
+    let mut reopened = create_and_reopen(&files, &script);
     let row = schema::scratch::table
         .select(schema::scratch::id)
         .first::<i32>(&mut reopened)
@@ -572,12 +496,7 @@ fn renamed_column_referenced_only_in_join_on() {
          ALTER TABLE a RENAME COLUMN id TO renamed;",
     );
     let files = tempfile::TempDir::new().expect("files");
-    {
-        let mut creating = open(&files);
-        run(&mut creating, script.iter());
-    }
-    let mut reopened = open(&files);
-    run(&mut reopened, script.connect().expect("connection program"));
+    let mut reopened = create_and_reopen(&files, &script);
     let row = schema::direct::table
         .first::<(String, String)>(&mut reopened)
         .expect("the joined projection");
@@ -601,12 +520,7 @@ fn replay_keeps_the_temporary_history_required_by_surviving_rows() {
     ] {
         let script = script(sql);
         let files = tempfile::TempDir::new().expect("files");
-        {
-            let mut creating = open(&files);
-            run(&mut creating, script.iter());
-        }
-        let mut reopened = open(&files);
-        run(&mut reopened, script.connect().expect("connection program"));
+        let mut reopened = create_and_reopen(&files, &script);
         let rows = schema::scratch::table
             .select(schema::scratch::id)
             .load::<i32>(&mut reopened)
@@ -648,12 +562,7 @@ fn replayed_ctas_wildcard_retains_its_source_column_shape() {
          ALTER TABLE a ADD COLUMN future INT NOT NULL DEFAULT 99;",
     );
     let files = tempfile::TempDir::new().expect("files");
-    {
-        let mut creating = open(&files);
-        run(&mut creating, script.iter());
-    }
-    let mut reopened = open(&files);
-    run(&mut reopened, script.connect().expect("connection program"));
+    let mut reopened = create_and_reopen(&files, &script);
     reopened.batch_execute("INSERT INTO scratch VALUES(7)").expect("source column count");
     let rows = schema::scratch::table
         .select(schema::scratch::id)
@@ -674,12 +583,7 @@ fn replayed_ctas_wildcard_preserves_merged_outer_join_values() {
              CREATE TEMP TABLE scratch AS SELECT * FROM a {join} b USING(id);"
         ));
         let files = tempfile::TempDir::new().expect("files");
-        {
-            let mut creating = open(&files);
-            run(&mut creating, script.iter());
-        }
-        let mut reopened = open(&files);
-        run(&mut reopened, script.connect().expect("connection program"));
+        let mut reopened = create_and_reopen(&files, &script);
         let rows = schema::scratch::table
             .select(schema::scratch::id)
             .order(schema::scratch::id)

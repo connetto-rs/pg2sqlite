@@ -8,7 +8,10 @@ use pg2sqlite::prelude::{
     Error, FreshFiles, Pg2Sqlite, Pg2SqliteOptions, Placement, Script, SessionVariableMapping,
 };
 
-use crate::helpers::deployment::{caller, deployment};
+use crate::helpers::{
+    deployment::{caller, deployment},
+    replay::run,
+};
 
 diesel::define_sql_function! {
     /// The caller the connection serves.
@@ -168,12 +171,6 @@ impl Files {
 impl Drop for Files {
     fn drop(&mut self) {
         self.remove();
-    }
-}
-
-fn run<'a>(connection: &mut SqliteConnection, statements: impl Iterator<Item = &'a String>) {
-    for statement in statements {
-        connection.batch_execute(statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
     }
 }
 

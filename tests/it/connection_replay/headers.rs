@@ -3,7 +3,7 @@
 use diesel::{connection::SimpleConnection, prelude::*};
 use pg2sqlite::{prelude::*, script::ConnectionError};
 
-use super::{open, run, script};
+use super::{create_and_reopen, script};
 
 diesel::table! {
     #[sql_name = "seq"]
@@ -82,12 +82,7 @@ fn recursive_cte_shadows_the_physical_relation() {
          ALTER TABLE a RENAME COLUMN x TO y;",
     );
     let files = tempfile::TempDir::new().expect("files");
-    {
-        let mut creating = open(&files);
-        run(&mut creating, script.iter());
-    }
-    let mut reopened = open(&files);
-    run(&mut reopened, script.connect().expect("connection program"));
+    let mut reopened = create_and_reopen(&files, &script);
     let rows = seq_view::table
         .select(seq_view::x)
         .order(seq_view::x)
@@ -107,12 +102,7 @@ fn recursive_cte_column_list_pins_the_wildcard_headers() {
          ALTER TABLE a RENAME TO z;",
     );
     let files = tempfile::TempDir::new().expect("files");
-    {
-        let mut creating = open(&files);
-        run(&mut creating, script.iter());
-    }
-    let mut reopened = open(&files);
-    run(&mut reopened, script.connect().expect("connection program"));
+    let mut reopened = create_and_reopen(&files, &script);
     let row = cte_header_view::table
         .select(cte_header_view::x1)
         .first::<String>(&mut reopened)
@@ -131,12 +121,7 @@ fn cte_column_list_pins_the_derived_header() {
          ALTER TABLE a RENAME COLUMN x TO y;",
     );
     let files = tempfile::TempDir::new().expect("files");
-    {
-        let mut creating = open(&files);
-        run(&mut creating, script.iter());
-    }
-    let mut reopened = open(&files);
-    run(&mut reopened, script.connect().expect("connection program"));
+    let mut reopened = create_and_reopen(&files, &script);
     let row = cte_alias_view::table
         .select(cte_alias_view::x1)
         .first::<String>(&mut reopened)
@@ -150,12 +135,7 @@ fn derived_values_ctas_uses_the_declared_column_names() {
         "CREATE TEMP TABLE scratch AS SELECT column1 AS n, column2 AS body FROM (VALUES (1, 'a'), (2, 'b'));",
     );
     let files = tempfile::TempDir::new().expect("files");
-    {
-        let mut creating = open(&files);
-        run(&mut creating, script.iter());
-    }
-    let mut reopened = open(&files);
-    run(&mut reopened, script.connect().expect("connection program"));
+    let mut reopened = create_and_reopen(&files, &script);
     let rows = values_scratch::table
         .order(values_scratch::n)
         .load::<(i32, String)>(&mut reopened)
@@ -168,12 +148,7 @@ fn values_cte_keeps_the_positional_column_names() {
     let script =
         script("CREATE TEMP VIEW v AS WITH w AS (VALUES (7, 'k')) SELECT column1, column2 FROM w;");
     let files = tempfile::TempDir::new().expect("files");
-    {
-        let mut creating = open(&files);
-        run(&mut creating, script.iter());
-    }
-    let mut reopened = open(&files);
-    run(&mut reopened, script.connect().expect("connection program"));
+    let mut reopened = create_and_reopen(&files, &script);
     let row =
         values_view::table.first::<(i32, String)>(&mut reopened).expect("the replayed values cte");
     assert_eq!(row, (7, "k".to_owned()));
@@ -191,12 +166,7 @@ fn qualified_wildcards_track_the_renamed_table() {
          ALTER TABLE b RENAME TO bz;",
     );
     let files = tempfile::TempDir::new().expect("files");
-    {
-        let mut creating = open(&files);
-        run(&mut creating, script.iter());
-    }
-    let mut reopened = open(&files);
-    run(&mut reopened, script.connect().expect("connection program"));
+    let mut reopened = create_and_reopen(&files, &script);
     let joined =
         joined_view::table.first::<(i32, String)>(&mut reopened).expect("the joined wildcard");
     let derived = derived_shape::table
@@ -219,12 +189,7 @@ fn natural_and_using_joins_suppress_the_shared_key() {
          ALTER TABLE a RENAME COLUMN x TO renamed;",
     );
     let files = tempfile::TempDir::new().expect("files");
-    {
-        let mut creating = open(&files);
-        run(&mut creating, script.iter());
-    }
-    let mut reopened = open(&files);
-    run(&mut reopened, script.connect().expect("connection program"));
+    let mut reopened = create_and_reopen(&files, &script);
     let natural = natural_key::table
         .first::<(i32, String, String)>(&mut reopened)
         .expect("the natural join shape");
@@ -240,12 +205,7 @@ fn set_returning_ctas_keeps_the_mapped_output_columns() {
     let script =
         script(r#"CREATE TEMP TABLE scratch AS SELECT * FROM json_each('{"a":"aye","b":"bee"}');"#);
     let files = tempfile::TempDir::new().expect("files");
-    {
-        let mut creating = open(&files);
-        run(&mut creating, script.iter());
-    }
-    let mut reopened = open(&files);
-    run(&mut reopened, script.connect().expect("connection program"));
+    let mut reopened = create_and_reopen(&files, &script);
     let rows = set_returning_scratch::table
         .order(set_returning_scratch::key)
         .load::<(String, String)>(&mut reopened)
@@ -265,12 +225,7 @@ fn schema_qualified_names_bind_the_physical_relation() {
          ALTER TABLE a RENAME COLUMN x TO y;",
     );
     let files = tempfile::TempDir::new().expect("files");
-    {
-        let mut creating = open(&files);
-        run(&mut creating, script.iter());
-    }
-    let mut reopened = open(&files);
-    run(&mut reopened, script.connect().expect("connection program"));
+    let mut reopened = create_and_reopen(&files, &script);
     let row = qualified_view::table
         .select(qualified_view::y)
         .first::<String>(&mut reopened)
@@ -289,12 +244,7 @@ fn set_operation_view_keeps_the_left_arm_shape() {
          ALTER TABLE a RENAME COLUMN x TO y;",
     );
     let files = tempfile::TempDir::new().expect("files");
-    {
-        let mut creating = open(&files);
-        run(&mut creating, script.iter());
-    }
-    let mut reopened = open(&files);
-    run(&mut reopened, script.connect().expect("connection program"));
+    let mut reopened = create_and_reopen(&files, &script);
     let rows = union_view::table
         .select(union_view::y)
         .order(union_view::y)
@@ -361,12 +311,7 @@ fn temporary_foreign_key_is_enforced_after_reconnect() {
          CREATE TEMP TABLE t(id INT PRIMARY KEY, fid INT NOT NULL REFERENCES refd(id));",
     );
     let files = tempfile::TempDir::new().expect("files");
-    {
-        let mut creating = open(&files);
-        run(&mut creating, script.iter());
-    }
-    let mut reopened = open(&files);
-    run(&mut reopened, script.connect().expect("connection program"));
+    let mut reopened = create_and_reopen(&files, &script);
     reopened.batch_execute("PRAGMA foreign_keys = ON").expect("enforce the foreign key");
     diesel::insert_into(fk_child::table)
         .values((fk_child::id.eq(1), fk_child::fid.eq(1)))
