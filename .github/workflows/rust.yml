@@ -202,7 +202,7 @@ jobs:
       - name: Install MSRV toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88"
+          toolchain: "1.89"
 
       - name: Cache Cargo downloads
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
