@@ -1703,6 +1703,7 @@ fn build_concat_ws_expression(separator: &Expr, values: Vec<Expr>) -> Option<Exp
 impl crate::traits::translator::TranslatorWithContext for Function {
     type SQLiteEntry = Expr;
 
+    #[cfg_attr(feature = "std", recursive::recursive)]
     #[allow(clippy::too_many_lines)]
     fn translate_with_warnings(
         &self,
