@@ -129,6 +129,24 @@ CREATE POLICY using_only_update ON using_only_items FOR UPDATE
     USING (owner = 'alice') WITH CHECK (true);
 ";
 
+/// `gated_items` is read in full and only inserted into, so it stays a plain
+/// table, and `column_items` is read and updated in part, so it gets a view.
+const GRANT_GATED_SCHEMA: &str = "
+CREATE ROLE app_user;
+CREATE TABLE gated_items (
+    id INTEGER PRIMARY KEY,
+    body TEXT NOT NULL
+);
+CREATE TABLE column_items (
+    id INTEGER PRIMARY KEY,
+    body TEXT NOT NULL,
+    note TEXT NOT NULL,
+    secret TEXT NOT NULL DEFAULT ''
+);
+GRANT SELECT, INSERT ON gated_items TO app_user;
+GRANT SELECT (id, body, note), UPDATE (body), DELETE ON column_items TO app_user;
+";
+
 mod schema {
     diesel::table! {
         shared_items (id) {
@@ -200,6 +218,27 @@ mod schema {
             id -> Integer,
             owner -> Text,
             body -> Text,
+        }
+    }
+    diesel::table! {
+        gated_items (id) {
+            id -> Integer,
+            body -> Text,
+        }
+    }
+    diesel::table! {
+        column_items (id) {
+            id -> Integer,
+            body -> Text,
+            note -> Text,
+        }
+    }
+    diesel::table! {
+        column_items_rls (id) {
+            id -> Integer,
+            body -> Text,
+            note -> Text,
+            secret -> Text,
         }
     }
     diesel::table! {
@@ -495,6 +534,60 @@ fn read_only_non_rls_guards_honour_exemption() {
     diesel::delete(schema::reference_items::table.find(1))
         .execute(&mut connection)
         .expect("exempt read-only delete");
+}
+
+#[test]
+fn grant_gates_honour_exemption() {
+    use schema::{column_items, column_items_rls, gated_items};
+    let role_options = Pg2SqliteOptions::default()
+        .with_deployment(deployment(["app_user"], []))
+        .with_acting_role("app_user")
+        .with_write_exemption_function(WRITE_EXEMPTION_FUNCTION);
+    let (mut connection, exempt) = apply_with_exemption(GRANT_GATED_SCHEMA, &role_options);
+
+    diesel::insert_into(gated_items::table)
+        .values((gated_items::id.eq(1), gated_items::body.eq("inserted")))
+        .execute(&mut connection)
+        .expect("the role inserts");
+    let rename = || diesel::update(gated_items::table.find(1)).set(gated_items::body.eq("updated"));
+    assert!(rename().execute(&mut connection).is_err(), "the role may not update");
+    assert!(diesel::delete(gated_items::table.find(1)).execute(&mut connection).is_err());
+    exempt.store(true, Ordering::Relaxed);
+    rename().execute(&mut connection).expect("exempt update");
+    diesel::delete(gated_items::table.find(1)).execute(&mut connection).expect("exempt delete");
+
+    diesel::insert_into(column_items_rls::table)
+        .values((
+            column_items_rls::id.eq(1),
+            column_items_rls::body.eq("body"),
+            column_items_rls::note.eq("note"),
+            column_items_rls::secret.eq("secret"),
+        ))
+        .execute(&mut connection)
+        .expect("seed the backing row");
+    let annotate =
+        || diesel::update(column_items::table.find(1)).set(column_items::note.eq("noted"));
+    exempt.store(false, Ordering::Relaxed);
+    assert!(annotate().execute(&mut connection).is_err(), "the role may not update note");
+    let insert = || {
+        diesel::insert_into(column_items::table).values((
+            column_items::id.eq(2),
+            column_items::body.eq("body"),
+            column_items::note.eq("note"),
+        ))
+    };
+    assert!(insert().execute(&mut connection).is_err(), "the role may not insert");
+    exempt.store(true, Ordering::Relaxed);
+    annotate().execute(&mut connection).expect("exempt update of note");
+    insert().execute(&mut connection).expect("exempt insert");
+    assert_eq!(
+        column_items_rls::table
+            .select((column_items_rls::id, column_items_rls::note, column_items_rls::secret))
+            .order(column_items_rls::id)
+            .load::<(i32, String, String)>(&mut connection)
+            .expect("read the backing rows"),
+        [(1, "noted".to_owned(), "secret".to_owned()), (2, "note".to_owned(), String::new())]
+    );
 }
 
 #[test]

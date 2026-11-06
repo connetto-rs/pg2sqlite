@@ -11,7 +11,7 @@ use sql_traits::{
         Deployment, JsonField, ParserDB, SessionSetting, SetPacking, SettingContent,
         SettingPresence, SettingValue,
     },
-    traits::{DatabaseLike, TableLike},
+    traits::DatabaseLike,
 };
 use sqlparser::ast::{
     AccessExpr, BinaryOperator, CastKind, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
@@ -153,29 +153,6 @@ pub(crate) fn acting_role<'s>(
     let Some((role, deployment)) = acting_role_in_deployment(options)? else { return Ok(None) };
     resolve_roles(deployment, schema)?;
     Ok(schema.role(role))
-}
-
-/// What the acting role may do with a table, from its table-wide grants.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct TableAccess {
-    /// `SELECT` on the whole table.
-    pub(crate) reads: bool,
-    /// `INSERT` or `UPDATE` on the whole table, or `DELETE`.
-    pub(crate) writes: bool,
-}
-
-/// What `role` may do with `table` in `schema`. A grant on some of its columns
-/// only counts as neither.
-pub(crate) fn table_access<'db>(
-    table: &'db <ParserDB as DatabaseLike>::Table,
-    role: &'db <ParserDB as DatabaseLike>::Role,
-    schema: &'db ParserDB,
-) -> Result<TableAccess, Error> {
-    let held = table.privileges(role, schema)?;
-    Ok(TableAccess {
-        reads: held.select.on_table(),
-        writes: held.insert.on_table() || held.update.on_table() || held.delete,
-    })
 }
 
 /// Refuses a reading of the session whose declarations are missing, short of

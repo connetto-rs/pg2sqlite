@@ -99,9 +99,10 @@ pub(super) fn translate_copy(
         ast_builder::insert_body(table_name.clone(), column_names, ast_builder::values(values));
     let mut translated = insert.translate_with_warnings(schema, options, emit)?;
     // A `pg_dump` restore runs as the table owner, which PostgreSQL lets past
-    // the policies, so the rows go to the backing table.
+    // the policies and the acting role's grants, so the rows go to the backing
+    // table.
     if let Some(last) = table_name.0.last().and_then(ObjectNamePart::as_ident)
-        && rls::table_has_rls(&last.value, schema)?
+        && rls::table_has_backing(&last.value, schema, options)?
         && let TableObject::TableName(name) = &translated.table
     {
         translated.table = TableObject::TableName(backing_table_name(name, options));

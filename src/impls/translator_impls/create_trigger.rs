@@ -21,9 +21,9 @@ use crate::{
         expr_helpers::map_expr_children,
         object_name::{
             append_suffix, normalize_schema_qualified_object_name_for_sqlite,
-            resolve_translation_table, translation_table_has_rls,
-            validate_schema_qualified_object_name_for_sqlite,
+            resolve_translation_table, validate_schema_qualified_object_name_for_sqlite,
         },
+        privileges::names_table_with_backing,
         query_builder::{plain_table_with_joins, single_expr_query},
         shared_helpers::ColumnRewrites,
     },
@@ -182,7 +182,7 @@ fn route_trigger_write_name(
     let Some(ObjectNamePart::Identifier(last)) = name.0.last_mut() else {
         return Ok(());
     };
-    if super::rls::table_has_rls(&last.value, schema)? {
+    if super::rls::table_has_backing(&last.value, schema, options)? {
         last.value.push_str(options.get_rls_table_suffix());
     }
     Ok(())
@@ -603,7 +603,7 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
         // (which has been renamed to table_rls).
         let redirected_source_table_name =
             if matches!(period, Some(TriggerPeriod::Before | TriggerPeriod::After)) {
-                if translation_table_has_rls(schema, &source_table_name)? {
+                if names_table_with_backing(schema, &source_table_name, options)? {
                     append_suffix(&source_table_name, options.get_rls_table_suffix())
                 } else {
                     source_table_name.clone()

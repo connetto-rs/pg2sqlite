@@ -45,6 +45,7 @@ use crate::{
         expr_helpers::{concat, for_each_child_expr, map_expr_children},
         function_helpers::{integer_literal, simple_function_expr, string_literal},
         object_name::{append_suffix, last_ident, quote_identifier, quoted_ident},
+        privileges::{RoleTable, has_backing_table},
         query_builder::{
             from_relation, make_query, make_simple_select, plain_table_factor, single_expr_query,
         },
@@ -58,7 +59,9 @@ use crate::{
     },
     options::Pg2SqliteOptions,
     traits::translator::TranslatorWithContext,
-    write_guard::{RLS_VIOLATION, WriteCommand, no_policy, read_only},
+    write_guard::{
+        RLS_VIOLATION, WriteCommand, no_policy, permission_denied, read_only, unreadable_key,
+    },
 };
 
 /// A column of a guarded table, as the write triggers have to see it.
@@ -78,6 +81,8 @@ struct TriggerColumn {
     guard_default: Option<Expr>,
     /// The expression SQLite computes the column from, for a generated column.
     generated: Option<Expr>,
+    /// Whether the view holds the column, so a trigger on it can read `NEW`.
+    projected: bool,
 }
 
 impl TriggerColumn {
@@ -107,6 +112,11 @@ impl TriggerColumn {
     const fn is_generated(&self) -> bool {
         self.generated.is_some()
     }
+
+    /// Whether the forwarding write supplies this column.
+    const fn is_forwarded(&self) -> bool {
+        self.projected && !self.is_generated()
+    }
 }
 
 /// The raw `DEFAULT` expression from the column definition, without NUMERIC
@@ -117,7 +127,8 @@ fn raw_column_default(column: &ColumnDef) -> Option<Expr> {
     })
 }
 
-/// Reads every column of the guarded table the way the write triggers need it.
+/// Reads every column of the guarded table the way the write triggers need it,
+/// on the view `grants` projects, or on the backing table when it is `None`.
 ///
 /// # Errors
 ///
@@ -127,6 +138,7 @@ fn trigger_columns(
     table: &CreateTable,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
+    grants: Option<&RoleTable>,
 ) -> Result<Vec<TriggerColumn>, Error> {
     table
         .columns(schema)?
@@ -141,17 +153,17 @@ fn trigger_columns(
                 }
             });
             let declared = declared_default(attribute, options)?;
-            // For NUMERIC-scaled columns use the raw default in guard
-            // substitutions: translate_with_warnings will scale it
-            // once. For all other types the declared default
-            // (possibly UUID-wrapped) is already correct.
+            // The guard path scales a NUMERIC default itself, so it takes the
+            // raw one.
             let guard_default = if minor_unit_scale(&attribute.data_type).is_some() {
                 raw_column_default(attribute)
             } else {
                 declared.clone()
             };
+            let name = column.column_name().to_owned();
             Ok(TriggerColumn {
-                name: column.column_name().to_owned(),
+                projected: grants.is_none_or(|grants| grants.reads(&name)),
+                name,
                 default: declared,
                 guard_default,
                 generated,
@@ -176,28 +188,34 @@ fn coalesce(value: Expr, fallback: Expr) -> Expr {
     simple_function_expr("COALESCE", vec![value, fallback], None)
 }
 
-/// What a `NEW.<column>` reference in a write guard stands for, when the value
-/// reaching the trigger is not the value the row will carry.
+/// What a `NEW.<column>` or `OLD.<column>` reference in a write guard stands
+/// for, when the value reaching the trigger is not the value the row carries.
 type GuardSubstitution = (String, Expr);
 #[derive(Clone, Copy)]
 struct PolicyBindings<'a> {
     prefix: Option<&'a str>,
+    /// Folded before translation, so a default lands as the SQL the backing
+    /// table declares.
     substitutions: &'a [GuardSubstitution],
+    /// Reads of a column the view does not hold, folded after translation
+    /// since they are already in the stored representation.
+    stored: &'a [GuardSubstitution],
 }
 
 /// Rewrites those references, so a guard judges the row as it will be stored.
 struct GuardFolder<'a> {
+    prefix: &'a str,
     substitutions: &'a [GuardSubstitution],
 }
 
 impl VisitorMut for GuardFolder<'_> {
     type Break = ();
-    /// Folded on the way out, so a `NEW.<column>` the fold itself writes is not
+    /// Folded on the way out, so a reference the fold itself writes is not
     /// folded again.
     fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
         if let Expr::CompoundIdentifier(parts) = expr
             && let [prefix, column] = parts.as_slice()
-            && prefix.value.eq_ignore_ascii_case("NEW")
+            && prefix.value.eq_ignore_ascii_case(self.prefix)
             && let Some((_, replacement)) =
                 self.substitutions.iter().find(|(name, _)| name.eq_ignore_ascii_case(&column.value))
         {
@@ -207,8 +225,11 @@ impl VisitorMut for GuardFolder<'_> {
     }
 }
 
-fn fold_guard(expr: &mut Expr, substitutions: &[GuardSubstitution]) {
-    let _: ControlFlow<()> = VisitMut::visit(expr, &mut GuardFolder { substitutions });
+fn fold_guard(expr: &mut Expr, prefix: &str, substitutions: &[GuardSubstitution]) {
+    if substitutions.is_empty() {
+        return;
+    }
+    let _: ControlFlow<()> = VisitMut::visit(expr, &mut GuardFolder { prefix, substitutions });
 }
 
 /// Which write a guard sits in, which decides what a `NEW.<column>` reference
@@ -223,7 +244,8 @@ enum GuardKind {
     Update,
 }
 
-/// What each `NEW.<column>` reference in a guard has to be replaced by.
+/// What each `NEW.<column>` reference in a guard has to be replaced by before
+/// translation.
 ///
 /// # Errors
 ///
@@ -235,11 +257,22 @@ fn guard_substitutions(
     table: &CreateTable,
     schema: &ParserDB,
 ) -> Result<Vec<GuardSubstitution>, Error> {
-    let defaults: Vec<GuardSubstitution> = if kind == GuardKind::Insert {
+    let supplied: Vec<GuardSubstitution> = if kind == GuardKind::Insert {
         columns
             .iter()
-            .filter(|column| column.guard_default.is_some())
-            .map(|column| (column.name.clone(), column.guard_coalesce()))
+            .filter(|column| !column.is_generated())
+            .filter_map(|column| {
+                if column.projected {
+                    column
+                        .guard_default
+                        .is_some()
+                        .then(|| (column.name.clone(), column.guard_coalesce()))
+                } else {
+                    // A column the view does not hold takes its default.
+                    let default = column.guard_default.clone().unwrap_or_else(null_literal);
+                    Some((column.name.clone(), default))
+                }
+            })
             .collect()
     } else {
         Vec::new()
@@ -250,14 +283,11 @@ fn guard_substitutions(
         table.columns(schema)?.map(|c| c.column_name().to_lowercase()).collect();
     let facts = ResolvedSchemaFacts { lowercased_columns: &lowercased_columns };
 
-    let mut substitutions = defaults.clone();
+    let mut substitutions = supplied.clone();
     for column in columns.iter().filter(|column| column.is_generated()) {
         let Some(expression) = column.generated.as_ref() else { continue };
-        // The generation expression names bare columns of this same row, so it
-        // goes through the ordinary transformer to reach them as `NEW`. Folding
-        // the defaults into it afterwards covers a column computed from one the
-        // caller left out. PostgreSQL forbids a generation expression from
-        // reading another generated column, so one pass is enough.
+        // PostgreSQL forbids a generation expression from reading another
+        // generated column, so one pass is enough.
         let mut computed = transform_expr(
             expression,
             options,
@@ -267,11 +297,48 @@ fn guard_substitutions(
             Some(ctx.as_rename_tuple()),
             facts,
         );
-        fold_guard(&mut computed, &defaults);
+        fold_guard(&mut computed, "NEW", &supplied);
         substitutions.push((column.name.clone(), Expr::Nested(Box::new(computed))));
     }
 
     Ok(substitutions)
+}
+
+/// The stored value of every column the view does not hold, read from the
+/// backing row the trigger's `OLD` names, which is also its `NEW`, since such
+/// a column cannot be assigned.
+///
+/// # Errors
+///
+/// Propagates a schema lookup failure.
+fn stored_substitutions(
+    columns: &[TriggerColumn],
+    table: &CreateTable,
+    schema: &ParserDB,
+    options: &Pg2SqliteOptions,
+) -> Result<Vec<GuardSubstitution>, Error> {
+    if columns.iter().all(|column| column.projected) {
+        return Ok(Vec::new());
+    }
+    let ctx = RlsTriggerContext::new(table, options);
+    let names = collect_column_names(table, schema)?;
+    let identity = build_row_identity_clause(&names, &collect_pk_column_names(table, schema)?);
+    Ok(columns
+        .iter()
+        .filter(|column| !column.projected)
+        .map(|column| {
+            let read = single_expr_query(
+                Expr::Identifier(quoted_ident(&column.name)),
+                from_relation(plain_table_factor(generated_object_name(&ctx.inner_table_name))),
+                Some(identity.clone()),
+            );
+            (column.name.clone(), Expr::Subquery(Box::new(read)))
+        })
+        .collect())
+}
+
+fn null_literal() -> Expr {
+    Expr::Value(ValueWithSpan { value: Value::Null, span: sqlparser::tokenizer::Span::empty() })
 }
 
 fn refuse_computed_write_statements(
@@ -281,7 +348,7 @@ fn refuse_computed_write_statements(
 ) -> Vec<Statement> {
     columns
         .iter()
-        .filter(|column| column.is_generated())
+        .filter(|column| column.is_generated() && column.projected)
         .map(|column| {
             let new_value = prefixed_column_expr("NEW", &column.name);
             let supplied = match guard {
@@ -328,10 +395,8 @@ enum PolicyPredicate {
 /// `(PERMISSIVE_1 OR PERMISSIVE_2 OR ...) AND RESTRICTIVE_1 AND RESTRICTIVE_2`,
 /// so a gate with no permissive term denies every row.
 ///
-/// `substitutions` says what a `NEW.<column>` reference stands for where the
-/// value reaching the trigger is not the value the row will carry: a default
-/// for a column the caller left out, and the computation for a generated one.
-/// Empty for a predicate resolved against `OLD` or against the table itself.
+/// `bindings` says what a `NEW.<column>` or `OLD.<column>` reference stands
+/// for where the value reaching the trigger is not the value the row carries.
 fn combine_policy_predicates(
     gate: Option<&PolicyGate<'_>>,
     bindings: PolicyBindings<'_>,
@@ -341,7 +406,7 @@ fn combine_policy_predicates(
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<PolicyPredicate, Error> {
     let Some(gate) = gate else { return Ok(PolicyPredicate::AllowAll) };
-    let PolicyBindings { prefix, substitutions } = bindings;
+    let PolicyBindings { prefix, substitutions, stored } = bindings;
     // The backing table's name is what a policy naming its own table has to
     // resolve to, and it follows from the table and the options, so it is read
     // here rather than passed in and risked disagreeing with the trigger.
@@ -369,10 +434,11 @@ fn combine_policy_predicates(
     for (is_restrictive, expr) in terms {
         let mut transformed =
             transform_expr(expr, options, table, schema, prefix, table_rename, facts);
-        // Folded before translation so a substituted default travels the same
-        // path the column definition sends it down, and lands as the same SQL
-        // the backing table declares.
-        fold_guard(&mut transformed, substitutions);
+        // Folded before translation so a substituted default lands as the same
+        // SQL the backing table declares.
+        if let Some(prefix) = prefix {
+            fold_guard(&mut transformed, prefix, substitutions);
+        }
         // The transformer above owns the RLS rewrites: session variables, NEW
         // and OLD prefixes, backing table renames. The forward expression
         // translator then owns the PostgreSQL to SQLite semantics, so a policy
@@ -401,7 +467,10 @@ fn combine_policy_predicates(
             sql_traits::structs::ColumnScope::for_table(table, schema, IdentifierCase::AsWritten)
         };
         let scoped = options.with_pseudo_row_scope(&policy_scope);
-        let transformed = transformed.translate_with_warnings(schema, &scoped, emit)?;
+        let mut transformed = transformed.translate_with_warnings(schema, &scoped, emit)?;
+        if let Some(prefix) = prefix {
+            fold_guard(&mut transformed, prefix, stored);
+        }
         // A literally-true predicate constrains nothing. For a permissive
         // policy this means the permissive OR is satisfied for every row, so
         // we record that and skip adding any conjunct for it. For a restrictive
@@ -568,17 +637,23 @@ struct WriteGuard {
 }
 
 /// Builds the write-guard predicates for one DML event from `rows`, the
-/// answer for the statement the event stands for.
+/// answer for the statement the event stands for, on the view `grants`
+/// projects, or on the backing table when `grants` is `None`.
 fn build_write_guard(
     rows: &Rows<'_>,
     kind: GuardKind,
     table: &CreateTable,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
+    grants: Option<&RoleTable>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<WriteGuard, Error> {
-    let columns = trigger_columns(table, schema, options)?;
+    let columns = trigger_columns(table, schema, options, grants)?;
     let subs = guard_substitutions(&columns, kind, options, table, schema)?;
+    let stored = match kind {
+        GuardKind::Update => stored_substitutions(&columns, table, schema, options)?,
+        GuardKind::Insert => Vec::new(),
+    };
     let table_name = table.table_name();
     let (using_gate, check_gate, read_back_gate) = match kind {
         GuardKind::Insert => (None, rows.gate(GatedCommand::Insert, RowVersion::Inserted), None),
@@ -639,7 +714,7 @@ fn build_write_guard(
     let mut combine = |gate: Option<&PolicyGate<'_>>, prefix, substitutions| {
         combine_policy_predicates(
             gate,
-            PolicyBindings { prefix: Some(prefix), substitutions },
+            PolicyBindings { prefix: Some(prefix), substitutions, stored: &stored },
             options,
             table,
             schema,
@@ -659,36 +734,39 @@ fn build_write_guard(
     Ok(WriteGuard { columns, using, check, read_back })
 }
 
-/// Returns true if the table has RLS enabled.
+/// Returns whether the table named `table_name` has a backing table behind a
+/// view, as [`has_backing_table`] answers.
 ///
 /// # Errors
 ///
-/// Returns [`LookupError`] if the table is present but its metadata cannot be
-/// resolved in `schema`.
-pub fn table_has_rls(table_name: &str, schema: &ParserDB) -> Result<bool, LookupError> {
+/// As [`has_backing_table`].
+pub(crate) fn table_has_backing(
+    table_name: &str,
+    schema: &ParserDB,
+    options: &Pg2SqliteOptions,
+) -> Result<bool, Error> {
     match schema.table_by_target(TargetName::new(table_name, false), IdentifierCase::AsWritten)? {
-        Some(table) => table.has_row_level_security(schema),
+        Some(table) => has_backing_table(table, schema, options),
         None => Ok(false),
     }
 }
 
-/// Resolves the correct table name for attaching AFTER triggers.
+/// Resolves the name of the table that stores `table`'s rows, where AFTER
+/// triggers attach.
 ///
-/// When a table has RLS, it's split into a view and a backing table.
-/// AFTER triggers must be attached to the backing table (e.g., `table_rls`),
-/// not the view, because views don't fire AFTER triggers in SQLite.
+/// A table with a backing table is split into a view and the backing table
+/// (e.g., `table_rls`), and views don't fire AFTER triggers in SQLite.
 ///
 /// # Errors
 ///
-/// Returns [`LookupError`] if the table's metadata cannot be resolved in
-/// `schema`.
-pub fn resolve_trigger_table_name(
+/// As [`has_backing_table`].
+pub(crate) fn resolve_trigger_table_name(
     base_name: &str,
     table: &CreateTable,
     schema: &ParserDB,
     options: &Pg2SqliteOptions,
-) -> Result<String, LookupError> {
-    if table.has_row_level_security(schema)? {
+) -> Result<String, Error> {
+    if has_backing_table(table, schema, options)? {
         let suffix = options.get_rls_table_suffix();
         Ok(format!("{base_name}{suffix}"))
     } else {
@@ -1834,7 +1912,7 @@ fn rls_read_predicate(
     let rows = row_security(table, schema, RowStatement::Select, options)?;
     combine_policy_predicates(
         rows.gate(GatedCommand::Select, RowVersion::Existing),
-        PolicyBindings { prefix: None, substitutions: &[] },
+        PolicyBindings { prefix: None, substitutions: &[], stored: &[] },
         options,
         table,
         schema,
@@ -1850,12 +1928,13 @@ fn generate_rls_view_statement_with_context(
     table: &CreateTable,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
+    grants: &RoleTable,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Statement, Error> {
     let ctx = RlsTriggerContext::new(table, options);
-    let projection = collect_column_names(table, schema)?
-        .into_iter()
-        .map(|column| SelectItem::UnnamedExpr(Expr::Identifier(quoted_ident(&column))))
+    let projection = grants
+        .readable()
+        .map(|column| SelectItem::UnnamedExpr(Expr::Identifier(quoted_ident(column))))
         .collect();
     let selection = match rls_read_predicate(table, schema, options, emit)? {
         PolicyPredicate::DenyAll => {
@@ -1878,19 +1957,59 @@ fn generate_rls_view_statement_with_context(
     Ok(ast_builder::create_view(generated_object_name(ctx.table_name), Vec::new(), query))
 }
 
+/// `RAISE(ABORT, 'permission denied for table <t>')` where `violation` holds,
+/// everywhere when it is `None`, unless the write is exempt.
+fn permission_gate(
+    table_name: &str,
+    violation: Option<Expr>,
+    options: &Pg2SqliteOptions,
+) -> Statement {
+    ast_builder::raise_statement(
+        "ABORT",
+        Some(&permission_denied(table_name)),
+        write_guard_condition_expr(violation, options),
+    )
+}
+
+/// Refuses an insert supplying a column the role may not insert into, which
+/// is every insert when it may insert into none. A view hands the trigger an
+/// omitted column as `NULL`, so only a value tells a supplied column apart.
+fn insert_permission_gate(
+    columns: &[TriggerColumn],
+    table_name: &str,
+    grants: &RoleTable,
+    options: &Pg2SqliteOptions,
+) -> Option<Statement> {
+    if !grants.inserts_any() {
+        return Some(permission_gate(table_name, None, options));
+    }
+    columns
+        .iter()
+        .filter(|column| column.is_forwarded() && !grants.inserts(&column.name))
+        .map(|column| Expr::IsNotNull(Box::new(prefixed_column_expr("NEW", &column.name))))
+        .reduce(|left, right| {
+            Expr::BinaryOp { left: Box::new(left), op: BinaryOperator::Or, right: Box::new(right) }
+        })
+        .map(|supplied| {
+            permission_gate(table_name, Some(Expr::Nested(Box::new(supplied))), options)
+        })
+}
+
 fn generate_insert_trigger_sql(
     table: &CreateTable,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
+    grants: &RoleTable,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Statement, Error> {
     let ctx = RlsTriggerContext::new(table, options);
     let table_name = ctx.table_name;
     let rows = row_security(table, schema, RowStatement::Insert { returning: false }, options)?;
     let WriteGuard { columns, check, .. } =
-        build_write_guard(&rows, GuardKind::Insert, table, schema, options, emit)?;
+        build_write_guard(&rows, GuardKind::Insert, table, schema, options, Some(grants), emit)?;
+    // A column the view does not hold is left to the backing table's default.
     let written: Vec<&TriggerColumn> =
-        columns.iter().filter(|column| !column.is_generated()).collect();
+        columns.iter().filter(|column| column.is_forwarded()).collect();
     let target_columns = written.iter().map(|column| generated_object_name(&column.name)).collect();
     let values = written
         .iter()
@@ -1924,7 +2043,11 @@ fn generate_insert_trigger_sql(
         }
     };
 
-    let mut body = guard.into_iter().collect::<Vec<_>>();
+    // PostgreSQL checks privileges before policies.
+    let mut body = insert_permission_gate(&columns, table_name, grants, options)
+        .into_iter()
+        .chain(guard)
+        .collect::<Vec<_>>();
     body.extend(refuse_computed_write_statements(&columns, table_name, GuardKind::Insert));
     body.push(ast_builder::insert(
         generated_object_name(&ctx.inner_table_name),
@@ -2108,7 +2231,7 @@ fn generate_insert_check_trigger_sql(
         (write_guard_condition_expr(None, options), no_policy(WriteCommand::Insert, ctx.table_name))
     } else {
         let WriteGuard { check, .. } =
-            build_write_guard(&rows, GuardKind::Insert, table, schema, options, emit)?;
+            build_write_guard(&rows, GuardKind::Insert, table, schema, options, None, emit)?;
         match check {
             PolicyPredicate::DenyAll => {
                 (write_guard_condition_expr(None, options), RLS_VIOLATION.to_string())
@@ -2241,7 +2364,7 @@ fn generate_update_check_trigger_sql(
         build_maintenance_insert_exemption(table, schema, options)
     } else {
         let WriteGuard { using, check, read_back, .. } =
-            build_write_guard(&rows, GuardKind::Update, table, schema, options, emit)?;
+            build_write_guard(&rows, GuardKind::Update, table, schema, options, None, emit)?;
         match violation([using, Some(check), read_back].into_iter().flatten()) {
             Violation::Every => None,
             Violation::Rows(None) => return Ok(None),
@@ -2271,7 +2394,7 @@ fn generate_delete_check_trigger_sql(
     let rows = row_security(table, schema, RowStatement::Delete { reads: true }, options)?;
     let violation = match combine_policy_predicates(
         rows.gate(GatedCommand::Delete, RowVersion::Existing),
-        PolicyBindings { prefix: Some("OLD"), substitutions: &[] },
+        PolicyBindings { prefix: Some("OLD"), substitutions: &[], stored: &[] },
         options,
         table,
         schema,
@@ -2322,12 +2445,92 @@ fn ignored_write_body(exemption: Option<Expr>) -> Vec<Statement> {
     }
 }
 
+/// The first key column the role cannot read, which leaves an `INSTEAD OF`
+/// trigger on the view no way to name the backing row. A table without a
+/// primary key is keyed by every column.
+///
+/// # Errors
+///
+/// Propagates a schema lookup failure.
+fn unreadable_key_column(
+    table: &CreateTable,
+    schema: &ParserDB,
+    grants: &RoleTable,
+) -> Result<Option<String>, Error> {
+    let primary_key = collect_pk_column_names(table, schema)?;
+    let key =
+        if primary_key.is_empty() { collect_column_names(table, schema)? } else { primary_key };
+    Ok(key.into_iter().find(|column| !grants.reads(column)))
+}
+
+fn view_trigger(
+    name: &str,
+    table_name: &str,
+    event: TriggerEvent,
+    body: Vec<Statement>,
+) -> Statement {
+    ast_builder::trigger(
+        generated_object_name(name),
+        generated_object_name(table_name),
+        TriggerPeriod::InsteadOf,
+        event,
+        true,
+        None,
+        body,
+    )
+}
+
+/// The forwarding `INSTEAD OF UPDATE` trigger, then the one refusing an
+/// assignment to a column the role may not update, which SQLite fires first
+/// since it fires the newest trigger first, as PostgreSQL checks privileges
+/// before policies.
 fn generate_update_trigger_sql(
     table: &CreateTable,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
+    grants: &RoleTable,
     emit: crate::warnings::WarningSink<'_>,
-) -> Result<Statement, Error> {
+) -> Result<Vec<Statement>, Error> {
+    let ctx = RlsTriggerContext::new(table, options);
+    let table_name = ctx.table_name;
+    let trigger_name = format!("{table_name}_update_trigger");
+    let event = || TriggerEvent::Update(Vec::new());
+    let main = if let Some(column) = unreadable_key_column(table, schema, grants)? {
+        let refusal = unreadable_key(table_name, &column);
+        view_trigger(
+            &trigger_name,
+            table_name,
+            event(),
+            vec![ast_builder::raise_statement("ABORT", Some(&refusal), None)],
+        )
+    } else {
+        view_trigger(
+            &trigger_name,
+            table_name,
+            event(),
+            update_body(table, schema, options, grants, emit)?,
+        )
+    };
+    let mut triggers = vec![main];
+    let unwritable: Vec<Ident> = grants.readable_not_updatable().map(quoted_ident).collect();
+    if !unwritable.is_empty() {
+        triggers.push(view_trigger(
+            &format!("{table_name}_update_grant_trigger"),
+            table_name,
+            TriggerEvent::Update(unwritable),
+            vec![permission_gate(table_name, None, options)],
+        ));
+    }
+    Ok(triggers)
+}
+
+fn update_body(
+    table: &CreateTable,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    grants: &RoleTable,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Vec<Statement>, Error> {
     let ctx = RlsTriggerContext::new(table, options);
     let table_name = ctx.table_name;
     // Triggers cannot tell a blind write from one reading a column.
@@ -2335,10 +2538,10 @@ fn generate_update_trigger_sql(
     let columns = collect_column_names(table, schema)?;
     let primary_key = collect_pk_column_names(table, schema)?;
     let WriteGuard { columns: assigned, using, check, read_back } =
-        build_write_guard(&rows, GuardKind::Update, table, schema, options, emit)?;
+        build_write_guard(&rows, GuardKind::Update, table, schema, options, Some(grants), emit)?;
     let assignments = assigned
         .iter()
-        .filter(|column| !column.is_generated())
+        .filter(|column| column.is_forwarded())
         .map(|column| {
             Assignment {
                 target: AssignmentTarget::ColumnName(generated_object_name(&column.name)),
@@ -2370,7 +2573,7 @@ fn generate_update_trigger_sql(
     let mut forwarded = refuse_computed_write_statements(&assigned, table_name, GuardKind::Update);
     forwarded.push(forward);
 
-    let body = if using_denies {
+    Ok(if using_denies {
         if options.is_strict_rls_write_deny() {
             let mut body = vec![ast_builder::raise_statement(
                 "ABORT",
@@ -2394,33 +2597,57 @@ fn generate_update_trigger_sql(
             .collect::<Vec<_>>();
         body.extend(forwarded);
         body
-    };
-
-    Ok(ast_builder::trigger(
-        generated_object_name(&format!("{table_name}_update_trigger")),
-        generated_object_name(table_name),
-        sqlparser::ast::TriggerPeriod::InsteadOf,
-        sqlparser::ast::TriggerEvent::Update(Vec::new()),
-        true,
-        None,
-        body,
-    ))
+    })
 }
 
 fn generate_delete_trigger_sql(
     table: &CreateTable,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
+    grants: &RoleTable,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Statement, Error> {
+    let ctx = RlsTriggerContext::new(table, options);
+    let table_name = ctx.table_name;
+    // PostgreSQL checks privileges before policies.
+    let mut body: Vec<Statement> = (!grants.deletes())
+        .then(|| permission_gate(table_name, None, options))
+        .into_iter()
+        .collect();
+    if let Some(column) = unreadable_key_column(table, schema, grants)? {
+        body.push(ast_builder::raise_statement(
+            "ABORT",
+            Some(&unreadable_key(table_name, &column)),
+            None,
+        ));
+    } else {
+        body.extend(delete_body(table, schema, options, grants, emit)?);
+    }
+    Ok(view_trigger(
+        &format!("{table_name}_delete_trigger"),
+        table_name,
+        TriggerEvent::Delete,
+        body,
+    ))
+}
+
+fn delete_body(
+    table: &CreateTable,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    grants: &RoleTable,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Vec<Statement>, Error> {
     let ctx = RlsTriggerContext::new(table, options);
     let table_name = ctx.table_name;
     let rows = row_security(table, schema, RowStatement::Delete { reads: true }, options)?;
     let columns = collect_column_names(table, schema)?;
     let primary_key = collect_pk_column_names(table, schema)?;
+    let on_view = trigger_columns(table, schema, options, Some(grants))?;
+    let stored = stored_substitutions(&on_view, table, schema, options)?;
     let using = combine_policy_predicates(
         rows.gate(GatedCommand::Delete, RowVersion::Existing),
-        PolicyBindings { prefix: Some("OLD"), substitutions: &[] },
+        PolicyBindings { prefix: Some("OLD"), substitutions: &[], stored: &stored },
         options,
         table,
         schema,
@@ -2446,7 +2673,7 @@ fn generate_delete_trigger_sql(
             authorization,
         )),
     );
-    let body = if using_denies {
+    Ok(if using_denies {
         if options.is_strict_rls_write_deny() {
             vec![
                 ast_builder::raise_statement(
@@ -2466,16 +2693,7 @@ fn generate_delete_trigger_sql(
         }
     } else {
         vec![forward]
-    };
-    Ok(ast_builder::trigger(
-        generated_object_name(&format!("{table_name}_delete_trigger")),
-        generated_object_name(table_name),
-        sqlparser::ast::TriggerPeriod::InsteadOf,
-        sqlparser::ast::TriggerEvent::Delete,
-        true,
-        None,
-        body,
-    ))
+    })
 }
 
 fn generate_readonly_backing_guard_sql(
@@ -2509,57 +2727,61 @@ fn generate_readonly_backing_guard_sql(
     .collect()
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RlsStatementMode {
-    ReadWrite,
-    ReadOnly,
-}
-
-fn generate_rls_statements_with_mode(
+/// Generates the view standing for a table with a backing table, its write
+/// triggers as `grants` allow, and, under row-level security, its policy
+/// guards and validation monitors.
+///
+/// # Errors
+///
+/// Returns an error if table metadata or policy expressions cannot be
+/// resolved, or a table with row-level security has no audit table.
+pub(crate) fn generate_view_statements(
     table: &CreateTable,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
-    mode: RlsStatementMode,
+    grants: &RoleTable,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Vec<Statement>, Error> {
-    // Validate that audit table name is configured
-    let audit_table_name =
-        options.get_rls_audit_table_name().ok_or(Error::RlsAuditTableNameRequired)?;
+    let audit_table_name = if table.has_row_level_security(schema)? {
+        Some(options.get_rls_audit_table_name().ok_or(Error::RlsAuditTableNameRequired)?)
+    } else {
+        None
+    };
+    let unreadable_key = unreadable_key_column(table, schema, grants)?;
 
-    let mut statements = Vec::new();
+    let mut statements =
+        vec![generate_rls_view_statement_with_context(table, schema, options, grants, emit)?];
 
-    statements.push(generate_rls_view_statement_with_context(table, schema, options, emit)?);
+    if grants.is_read_only() {
+        statements.extend(generate_readonly_backing_guard_sql(table, options));
+    } else {
+        if let Some(column) = &unreadable_key
+            && (grants.updates_any() || grants.deletes())
+        {
+            emit(crate::warnings::TranslationWarning::UnreadableRowKey {
+                table: table.table_name().to_owned(),
+                column: column.clone(),
+            });
+        }
+        statements.push(generate_insert_trigger_sql(table, schema, options, grants, emit)?);
 
-    if mode == RlsStatementMode::ReadWrite {
-        statements.push(generate_insert_trigger_sql(table, schema, options, emit)?);
-
-        // Backing-table BEFORE INSERT guard: emitted in both monitor and strict
-        // mode so raw backing writes (RETURNING redirect, ON CONFLICT redirect,
-        // direct insert) are also covered. Skipped when AllowAll (no guard
-        // needed).
+        // Backing-table guards cover the writes that reach the backing table
+        // directly, the RETURNING and ON CONFLICT redirects among them.
         if let Some(check) = generate_insert_check_trigger_sql(table, schema, options, emit)? {
             statements.push(check);
         }
-
-        // Backing-table BEFORE UPDATE guard: covers ON CONFLICT DO UPDATE and
-        // any direct backing UPDATE. The view-path INSTEAD OF UPDATE trigger
-        // already filters by USING before forwarding, so this guard never
-        // raises on the view path. Skipped when AllowAll (no guard
-        // needed).
         if let Some(check) = generate_update_check_trigger_sql(table, schema, options, emit)? {
             statements.push(check);
         }
-
         if let Some(check) = generate_delete_check_trigger_sql(table, schema, options, emit)? {
             statements.push(check);
         }
 
-        statements.push(generate_update_trigger_sql(table, schema, options, emit)?);
-        statements.push(generate_delete_trigger_sql(table, schema, options, emit)?);
-    } else {
-        statements.extend(generate_readonly_backing_guard_sql(table, options));
+        statements.extend(generate_update_trigger_sql(table, schema, options, grants, emit)?);
+        statements.push(generate_delete_trigger_sql(table, schema, options, grants, emit)?);
     }
 
+    let Some(audit_table_name) = audit_table_name else { return Ok(statements) };
     // A deny-all view makes the monitor useless rather than strict: its check
     // asks whether a backing row is visible through the view, which is
     // always no here, so it would flag every write and distinguish nothing.
@@ -2568,7 +2790,8 @@ fn generate_rls_statements_with_mode(
         emit(crate::warnings::TranslationWarning::RlsDeniesEveryRow {
             table: table.table_name().to_owned(),
         });
-    } else {
+    } else if unreadable_key.is_none() {
+        // The monitor finds a written row in the view by its key.
         let validation_stmts =
             generate_rls_validation_statements(table, schema, options, audit_table_name)?;
         statements.extend(validation_stmts);
@@ -2577,7 +2800,8 @@ fn generate_rls_statements_with_mode(
     Ok(statements)
 }
 
-/// Generates all RLS-related SQL statements for a table.
+/// Generates all RLS-related SQL statements for a table, for a caller holding
+/// every privilege.
 ///
 /// # Errors
 ///
@@ -2588,7 +2812,8 @@ pub(crate) fn generate_rls_statements_with_context(
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Vec<Statement>, Error> {
-    generate_rls_statements_with_mode(table, schema, options, RlsStatementMode::ReadWrite, emit)
+    let grants = RoleTable::of(table, None, schema)?;
+    generate_view_statements(table, schema, options, &grants, emit)
 }
 /// Generates row security statements from caller configuration.
 #[cfg(test)]
@@ -2600,31 +2825,6 @@ fn generate_rls_statements(
 ) -> Result<Vec<Statement>, Error> {
     let context = crate::options::TranslationContext::new(options);
     generate_rls_statements_with_context(table, schema, &context, emit)
-}
-
-/// Generates a read-only RLS view and opt-in exemptible backing guards.
-///
-/// # Errors
-///
-/// Returns an error if table metadata or policy expressions cannot be resolved.
-pub(crate) fn generate_readonly_rls_statements_with_context(
-    table: &CreateTable,
-    schema: &ParserDB,
-    options: &crate::options::TranslationContext<'_>,
-    emit: crate::warnings::WarningSink<'_>,
-) -> Result<Vec<Statement>, Error> {
-    generate_rls_statements_with_mode(table, schema, options, RlsStatementMode::ReadOnly, emit)
-}
-/// Generates read-only row security statements from caller configuration.
-#[cfg(test)]
-fn generate_readonly_rls_statements(
-    table: &CreateTable,
-    schema: &ParserDB,
-    options: &Pg2SqliteOptions,
-    emit: crate::warnings::WarningSink<'_>,
-) -> Result<Vec<Statement>, Error> {
-    let context = crate::options::TranslationContext::new(options);
-    generate_readonly_rls_statements_with_context(table, schema, &context, emit)
 }
 
 /// Renames a CREATE TABLE statement to use the inner table name for RLS.
@@ -2915,9 +3115,9 @@ mod tests {
     };
 
     use super::{
-        ResolvedSchemaFacts, SubqueryTransformContext, generate_delete_trigger_sql,
-        generate_insert_trigger_sql, generate_readonly_rls_statements, generate_rls_audit_table,
-        generate_rls_statements, generate_rls_validation_statements, generate_update_trigger_sql,
+        ResolvedSchemaFacts, RoleTable, SubqueryTransformContext, generate_delete_trigger_sql,
+        generate_insert_trigger_sql, generate_rls_audit_table, generate_rls_statements,
+        generate_rls_validation_statements, generate_update_trigger_sql, generate_view_statements,
         rename_table_for_rls, transform_expr, transform_join_operator_for_subquery,
         transform_query, transform_table_factor_for_subquery, validate_session_variables,
         validate_table_policies,
@@ -3486,13 +3686,18 @@ mod tests {
         assert!(transformed_sql.contains("NEW.owner_id"));
         assert!(transformed_sql.contains("QUALIFY"));
 
+        let grants = RoleTable::of(table, None, &schema)?;
         let insert_trigger_sql =
-            generate_insert_trigger_sql(table, &schema, &options, &mut |_| {})?.to_string();
+            generate_insert_trigger_sql(table, &schema, &options, &grants, &mut |_| {})?
+                .to_string();
         assert!(insert_trigger_sql.contains("docs_insert_trigger"));
         assert!(insert_trigger_sql.contains("RAISE(ABORT"));
 
         let update_trigger_sql =
-            generate_update_trigger_sql(table, &schema, &options, &mut |_| {})?.to_string();
+            generate_update_trigger_sql(table, &schema, &options, &grants, &mut |_| {})?
+                .iter()
+                .map(ToString::to_string)
+                .collect::<String>();
         assert!(update_trigger_sql.contains("docs_update_trigger"));
         assert!(update_trigger_sql.contains("owner_id = NEW.owner_id"));
         assert!(
@@ -3501,7 +3706,8 @@ mod tests {
         );
 
         let delete_trigger_sql =
-            generate_delete_trigger_sql(table, &schema, &options, &mut |_| {})?.to_string();
+            generate_delete_trigger_sql(table, &schema, &options, &grants, &mut |_| {})?
+                .to_string();
         assert!(delete_trigger_sql.contains("docs_delete_trigger"));
 
         Ok(())
@@ -3512,6 +3718,8 @@ mod tests {
         let schema = schema_from_sql(
             r#"
             CREATE TABLE docs(id INTEGER PRIMARY KEY, owner_id INTEGER, body TEXT);
+            CREATE ROLE reader;
+            GRANT SELECT ON docs TO reader;
             ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
             CREATE POLICY docs_select ON docs FOR SELECT USING (owner_id > 0);
             CREATE POLICY docs_insert ON docs FOR INSERT WITH CHECK (owner_id > 0);
@@ -3520,13 +3728,15 @@ mod tests {
             "#,
         );
         let table = policy_table(&schema, "docs");
+        let reader = RoleTable::of(table, schema.role("reader"), &schema)
+            .expect("the reader's grants resolve");
 
         let missing_audit =
             crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
         let err = generate_rls_statements(table, &schema, &missing_audit, &mut |_| {})
             .expect_err("missing audit table should error");
         assert!(err.to_string().contains("RLS audit table name"));
-        let err = generate_readonly_rls_statements(table, &schema, &missing_audit, &mut |_| {})
+        let err = generate_view_statements(table, &schema, &missing_audit, &reader, &mut |_| {})
             .expect_err("missing audit table should error");
         assert!(err.to_string().contains("RLS audit table name"));
 
@@ -3544,7 +3754,7 @@ mod tests {
                 .any(|stmt| stmt.to_string().contains("CREATE TRIGGER docs_insert_trigger"))
         );
 
-        let readonly = generate_readonly_rls_statements(table, &schema, &options, &mut |_| {})
+        let readonly = generate_view_statements(table, &schema, &options, &reader, &mut |_| {})
             .expect("readonly RLS should build");
         assert!(!readonly.is_empty(), "a read-only table emits at least one statement");
         assert!(!readonly.iter().any(|stmt| stmt.to_string().contains("docs_insert_trigger")));

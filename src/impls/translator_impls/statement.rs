@@ -48,18 +48,17 @@ use crate::{
             append_suffix, last_ident, last_ident_value_or_display,
             normalize_schema_qualified_object_name_for_sqlite, quoted_ident,
             resolve_declared_table, resolve_translation_table, sqlite_unqualified_object_name,
-            translation_table_has_rls,
         },
         placeholder::rewrite_placeholders_for_sqlite,
+        privileges::{RoleTable, names_table_with_backing},
         query_builder::plain_table_with_joins,
         translator_impls::{
             column::translate_column_def,
             condition_injection::inject_condition_into_dml_statement,
             nulls_not_distinct::{companion_drops, table_companions},
             rls::{
-                generate_readonly_rls_statements_with_context,
-                generate_rls_statements_with_context, rename_table_for_rls,
-                validate_table_policies, write_guard_condition_expr,
+                generate_rls_statements_with_context, generate_view_statements,
+                rename_table_for_rls, validate_table_policies, write_guard_condition_expr,
             },
             vector::{generate_vec0_statements, has_vector_columns},
         },
@@ -432,37 +431,33 @@ fn translate_create_table_for_role(
         return Ok(None);
     };
 
-    let access = crate::impls::session_variable::table_access(table, role, schema)?;
-    if !access.reads {
+    let grants = RoleTable::of(table, Some(role), schema)?;
+    if !grants.reads_any() {
         return Ok(Some(Vec::new()));
     }
 
-    let is_readonly = !access.writes;
-    if table.has_row_level_security(schema)? {
-        validate_table_policies(table, schema, options)?;
-        let rls_statements = if is_readonly {
-            generate_readonly_rls_statements_with_context(table, schema, options, emit)?
-        } else {
-            generate_rls_statements_with_context(table, schema, options, emit)?
-        };
+    let row_security = table.has_row_level_security(schema)?;
+    if row_security || grants.needs_view() {
+        if row_security {
+            validate_table_policies(table, schema, options)?;
+        }
+        let view_statements = generate_view_statements(table, schema, options, &grants, emit)?;
         let statements = build_create_table_statements(
             create_table,
             schema,
             options,
-            Some(rls_statements),
+            Some(view_statements),
             emit,
         )?;
         return Ok(Some(statements));
     }
 
-    if is_readonly {
-        let mut statements =
-            build_create_table_statements(create_table, schema, options, None, emit)?;
-        append_readonly_deny_triggers(&mut statements, options)?;
-        return Ok(Some(statements));
+    if grants.writes_everything() {
+        return Ok(None);
     }
-
-    Ok(None)
+    let mut statements = build_create_table_statements(create_table, schema, options, None, emit)?;
+    append_deny_triggers(&mut statements, options, &grants)?;
+    Ok(Some(statements))
 }
 
 fn build_create_table_statements(
@@ -496,12 +491,12 @@ fn build_create_table_statements(
     Ok(statements)
 }
 
-const READONLY_DENY_TRIGGER_VERBS: [&str; 3] = ["insert", "update", "delete"];
-
-/// Appends deny triggers so ordinary writes to a read-only non-RLS table fail.
-fn append_readonly_deny_triggers(
+/// Appends `BEFORE` triggers refusing the writes `grants` does not allow on a
+/// plain table, every write as read-only when it allows none.
+fn append_deny_triggers(
     statements: &mut Vec<Statement>,
     options: &crate::options::TranslationContext<'_>,
+    grants: &RoleTable,
 ) -> Result<(), Error> {
     let Some(Statement::CreateTable(create_table)) = statements.first() else {
         return Ok(());
@@ -512,20 +507,31 @@ fn append_readonly_deny_triggers(
 
     let marker = options.get_readonly_deny_trigger_suffix();
     let name = |value: &str| ObjectName(vec![ObjectNamePart::Identifier(quoted_ident(value))]);
-    let message = crate::write_guard::read_only(&table_ident);
+    let message = if grants.is_read_only() {
+        crate::write_guard::read_only(&table_ident)
+    } else {
+        crate::write_guard::permission_denied(&table_ident)
+    };
     let condition = write_guard_condition_expr(None, options);
+    let unwritable: Vec<Ident> = grants.not_updatable().map(quoted_ident).collect();
+    let update = if !grants.updates_any() {
+        Some(TriggerEvent::Update(Vec::new()))
+    } else if unwritable.is_empty() {
+        None
+    } else {
+        Some(TriggerEvent::Update(unwritable))
+    };
+    let denied = [
+        ("insert", (!grants.inserts_any()).then_some(TriggerEvent::Insert)),
+        ("update", update),
+        ("delete", (!grants.deletes()).then_some(TriggerEvent::Delete)),
+    ];
 
-    let mut triggers = Vec::with_capacity(READONLY_DENY_TRIGGER_VERBS.len());
-    for verb in READONLY_DENY_TRIGGER_VERBS {
+    for (verb, event) in denied {
+        let Some(event) = event else { continue };
         let trigger_name = format!("{table_ident}{marker}_{verb}");
         reject_reserved_name_collision(options, &table_ident, &trigger_name)?;
-        let event = match verb {
-            "insert" => TriggerEvent::Insert,
-            "update" => TriggerEvent::Update(Vec::new()),
-            "delete" => TriggerEvent::Delete,
-            _ => unreachable!("the read-only trigger verb list is closed"),
-        };
-        triggers.push(ast_builder::trigger(
+        statements.push(ast_builder::trigger(
             name(&trigger_name),
             name(&table_ident),
             TriggerPeriod::Before,
@@ -535,8 +541,6 @@ fn append_readonly_deny_triggers(
             vec![ast_builder::raise_statement("ABORT", Some(&message), None)],
         ));
     }
-
-    statements.extend(triggers);
     Ok(())
 }
 
@@ -589,7 +593,7 @@ fn role_access_for_object_name(
         return Err(Error::TableNotFoundInSchema { table_name: table_name.to_string() });
     };
 
-    if crate::impls::session_variable::table_access(table, role, schema)?.reads {
+    if RoleTable::of(table, Some(role), schema)?.reads_any() {
         Ok(RoleTableAccess::Allow)
     } else {
         Ok(RoleTableAccess::Deny)
@@ -613,7 +617,7 @@ fn translate_alter_table(
     // triggers already speak the post-ALTER shape, and this redirected ALTER
     // is what brings the backing table up to it. A rename never reaches here
     // on a secured table, `reject_rename_of_secured_table` refuses it first.
-    let normalized_name = if translation_table_has_rls(schema, &alter_table.name)? {
+    let normalized_name = if names_table_with_backing(schema, &alter_table.name, options)? {
         append_suffix(
             &normalize_schema_qualified_object_name_for_sqlite(schema, &alter_table.name)?,
             options.get_rls_table_suffix(),
@@ -945,7 +949,7 @@ fn translate_truncate(
         // directly reproduces PostgreSQL. Nothing observes it: only
         // INSERT and UPDATE monitoring triggers are generated, so a
         // delete raises no validation event.
-        let rls_backed = translation_table_has_rls(schema, &target.name)?;
+        let rls_backed = names_table_with_backing(schema, &target.name, options)?;
         let name = if rls_backed {
             append_suffix(&target.name, options.get_rls_table_suffix())
         } else {

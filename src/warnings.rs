@@ -76,6 +76,18 @@ pub enum TranslationWarning {
         /// What the emitted form no longer does.
         reason: String,
     },
+    /// The acting role cannot read `column`, part of the key by which the
+    /// replica's view finds the row an `UPDATE` or `DELETE` names, so the
+    /// replica refuses every update and delete on `table` that PostgreSQL
+    /// would let the role make. Reads and inserts are unaffected, and no
+    /// row-level security monitor is emitted for the table, since the monitor
+    /// finds a written row by the same key.
+    UnreadableRowKey {
+        /// The table whose updates and deletes are refused.
+        table: String,
+        /// The first key column the role cannot read.
+        column: String,
+    },
 }
 
 /// Where a translation reports the steps that lost something.
@@ -98,6 +110,13 @@ impl core::fmt::Display for TranslationWarning {
             }
             Self::LossyDowngrade { construct, from, to, location, reason } => {
                 write!(f, "downgraded {construct} at {location} from {from} to {to}: {reason}")
+            }
+            Self::UnreadableRowKey { table, column } => {
+                write!(
+                    f,
+                    "the acting role cannot read key column {column} of {table}, so the replica \
+                     refuses its updates and deletes"
+                )
             }
         }
     }

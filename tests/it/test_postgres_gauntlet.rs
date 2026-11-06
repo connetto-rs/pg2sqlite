@@ -60,3 +60,6 @@ mod parity_json_values;
 
 #[path = "gauntlet/parity_deployment.rs"]
 mod parity_deployment;
+
+#[path = "gauntlet/parity_privileges.rs"]
+mod parity_privileges;

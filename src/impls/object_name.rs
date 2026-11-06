@@ -218,17 +218,6 @@ pub(crate) fn resolve_declared_table<'a>(
     schema.table_by_target(target, IdentifierCase::AsWritten)
 }
 
-/// Returns whether a resolved translation table has row level security.
-pub(crate) fn translation_table_has_rls(
-    schema: &ParserDB,
-    name: &ObjectName,
-) -> Result<bool, Error> {
-    match resolve_translation_table(schema, name)? {
-        Some(table) => Ok(table.has_row_level_security(schema)?),
-        None => Ok(false),
-    }
-}
-
 /// Quotes an SQL identifier with double quotes, escaping interior quotes.
 #[must_use]
 pub(crate) fn quote_identifier(name: &str) -> String {

@@ -11,7 +11,7 @@ use sqlparser::ast::{
 use crate::no_std::prelude::*;
 use crate::{
     impls::{
-        object_name::{append_suffix, translation_table_has_rls},
+        object_name::append_suffix, privileges::names_table_with_backing,
         shared_helpers::match_partial_not_supported_error,
         translator_impls::constraint_characteristic::deferrability_outside_a_foreign_key,
     },
@@ -37,7 +37,7 @@ impl crate::traits::translator::TranslatorWithContext for TableConstraint {
             Self::ForeignKey(fk_constraint) => {
                 let mut updated_fk = fk_constraint.clone();
 
-                if translation_table_has_rls(schema, &fk_constraint.foreign_table)? {
+                if names_table_with_backing(schema, &fk_constraint.foreign_table, options)? {
                     updated_fk.foreign_table =
                         append_suffix(&fk_constraint.foreign_table, options.get_rls_table_suffix());
                 }

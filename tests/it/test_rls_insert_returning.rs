@@ -496,3 +496,130 @@ CREATE POLICY m1c_all ON m1c FOR ALL USING (owner = 'alice');
         );
     }
 }
+
+/// The acting role reads `id`, `owner` and `title` of `items` and inserts and
+/// updates `note`, which it cannot read, so the table is a view over its
+/// backing table. It reads all of `notes` and inserts into part of it, which
+/// puts a view there too.
+const GRANT_SCHEMA: &str = "\
+CREATE ROLE app_user;
+CREATE TABLE items (id INTEGER PRIMARY KEY, owner TEXT, title TEXT, note TEXT);
+GRANT SELECT (id, owner, title), INSERT (id, owner, note), UPDATE (owner, note) ON items TO app_user;
+CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT, flag TEXT);
+GRANT SELECT, INSERT (id, body) ON notes TO app_user;
+CREATE TABLE logs (id INTEGER PRIMARY KEY, line TEXT);
+GRANT SELECT (id) ON logs TO app_user;
+";
+
+fn grant_opts() -> Pg2SqliteOptions {
+    Pg2SqliteOptions::default()
+        .with_strict_rls_validation()
+        .with_deployment(deployment(["app_user"], []))
+        .with_acting_role("app_user")
+}
+
+fn translate_grant_query(pg_query: &str) -> Result<String, pg2sqlite::errors::Error> {
+    let opts = grant_opts();
+    let schema_len = Pg2Sqlite::default().sql(GRANT_SCHEMA)?.translate(&opts)?.into_vec().len();
+    let statements = Pg2Sqlite::default()
+        .sql(&format!("{GRANT_SCHEMA}\n{pg_query}"))?
+        .translate(&opts)?
+        .into_vec();
+    Ok(statements.into_iter().skip(schema_len).map(|s| s.to_string()).collect())
+}
+
+/// A RETURNING insert skips the view's triggers, so the redirect answers for
+/// the acting role's grants itself, the way the view would.
+#[test]
+fn insert_returning_through_a_grant_view_keeps_to_the_grants() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(&translate(GRANT_SCHEMA, &grant_opts())).expect("apply schema");
+
+    let star = translate_grant_query("INSERT INTO items (id, owner) VALUES (1, 'a') RETURNING *")
+        .expect("an insert of insertable columns translates");
+    let mut statement = conn.prepare(&star).expect("prepare the redirected insert");
+    let names: Vec<String> = statement.column_names().map(str::to_owned).collect();
+    assert_eq!(names, ["id", "owner", "title"], "RETURNING * names the readable columns");
+    let row: (i64, String) = statement.query_row([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!(row, (1, "a".to_owned()));
+
+    let returned = |query: &str| -> Vec<String> {
+        let sql = translate_grant_query(query).expect(query);
+        let mut statement = conn.prepare(&sql).expect(query);
+        let names = statement.column_names().map(str::to_owned).collect();
+        statement.query_row([], |_| Ok(())).expect(query);
+        names
+    };
+    assert_eq!(
+        returned("INSERT INTO items VALUES (2, 'b') RETURNING items.*"),
+        ["id", "owner", "title"]
+    );
+    assert_eq!(
+        returned("INSERT INTO notes (id, body) VALUES (1, 'b') RETURNING *"),
+        ["id", "body", "flag"],
+        "RETURNING * on a table read in full names every column"
+    );
+
+    let refusal = |query: &str| translate_grant_query(query).expect_err(query).to_string();
+    assert!(
+        refusal("INSERT INTO items (id, title) VALUES (2, 't') RETURNING id")
+            .contains("permission denied for table items")
+    );
+    assert!(
+        refusal("INSERT INTO items (id, note) VALUES (2, 'n') RETURNING id")
+            .contains("table items has no column named note")
+    );
+    assert!(
+        refusal("INSERT INTO items (id) VALUES (2) RETURNING note")
+            .contains("no such column: note")
+    );
+    assert!(
+        refusal("INSERT INTO items (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET title = 'x'")
+            .contains("permission denied for table items")
+    );
+    assert!(
+        refusal("INSERT INTO items VALUES (3, 'c', 't') RETURNING id")
+            .contains("permission denied for table items"),
+        "a bare insert fills the readable columns in order"
+    );
+    assert!(
+        refusal(
+            "INSERT INTO items (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET (owner, title) = \
+             ('x', 'y')"
+        )
+        .contains("permission denied for table items")
+    );
+    assert!(
+        refusal(
+            "INSERT INTO items (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET note = 'x' \
+                 RETURNING id"
+        )
+        .contains("table items has no column named note")
+    );
+    assert!(
+        refusal("INSERT INTO notes (id, flag) VALUES (2, 'f') RETURNING id")
+            .contains("permission denied for table notes")
+    );
+    assert!(
+        refusal("INSERT INTO logs DEFAULT VALUES RETURNING id")
+            .contains("permission denied for table logs"),
+        "a role inserting into no column has no insert"
+    );
+    assert!(
+        refusal("INSERT INTO items SELECT 3, 'c', 't' RETURNING id")
+            .contains("permission denied for table items"),
+        "an insert from a query fills as many readable columns as it selects"
+    );
+    assert_eq!(returned("INSERT INTO items SELECT 4, 'd' RETURNING id"), ["id"]);
+    assert_eq!(returned("INSERT INTO notes DEFAULT VALUES RETURNING id"), ["id"]);
+    assert_eq!(
+        returned("INSERT INTO items SELECT 5, 'e' UNION ALL SELECT 6, 'f' RETURNING id"),
+        ["id"]
+    );
+    assert_eq!(returned("INSERT INTO items (SELECT 7, 'g') RETURNING id"), ["id"]);
+    assert!(
+        refusal("INSERT INTO items SELECT * FROM notes RETURNING id")
+            .contains("permission denied for table items"),
+        "a wildcard query fills every readable column"
+    );
+}
