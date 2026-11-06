@@ -740,13 +740,8 @@ pub(crate) fn aggregate(
 
 #[cfg(test)]
 mod tests {
-    use sqlparser::{ast::Expr, dialect::PostgreSqlDialect, parser::Parser};
-
     use super::{fields_templates, substitute};
-
-    fn parse_expr(sql: &str) -> Expr {
-        Parser::new(&PostgreSqlDialect {}).try_with_sql(sql).unwrap().parse_expr().unwrap()
-    }
+    use crate::impls::test_fixtures::parse_expr;
 
     #[test]
     fn a_malformed_fields_template_answers_the_parse_refusal() {

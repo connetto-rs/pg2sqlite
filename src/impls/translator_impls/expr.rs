@@ -5160,15 +5160,10 @@ fn translate_compound_field_access(
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
-    use sql_traits::structs::ParserDB;
-    use sqlparser::{
-        ast::{
-            AccessExpr, BinaryOperator, DateTimeField, Expr, Function, FunctionArg,
-            FunctionArgExpr, FunctionArgOperator, FunctionArgumentList, FunctionArguments, Ident,
-            InTarget, JsonPathElem, ObjectName, ObjectNamePart, Subscript,
-        },
-        dialect::PostgreSqlDialect,
-        parser::Parser,
+    use sqlparser::ast::{
+        AccessExpr, BinaryOperator, DateTimeField, Expr, Function, FunctionArg, FunctionArgExpr,
+        FunctionArgOperator, FunctionArgumentList, FunctionArguments, Ident, InTarget,
+        JsonPathElem, ObjectName, ObjectNamePart, Subscript,
     };
 
     use super::{
@@ -5176,19 +5171,10 @@ mod tests {
         normalize_at_time_zone_modifier, translate_any_all_to_in, translate_extract,
         translate_trim,
     };
-    use crate::prelude::{Pg2SqliteOptions, Translator};
-
-    fn empty_schema() -> ParserDB {
-        ParserDB::from_statements(Vec::new(), "test".to_string()).expect("schema should build")
-    }
-
-    fn parse_expr(sql: &str) -> Expr {
-        Parser::new(&PostgreSqlDialect {})
-            .try_with_sql(sql)
-            .expect("sql should parse")
-            .parse_expr()
-            .expect("expression should parse")
-    }
+    use crate::{
+        impls::test_fixtures::{empty_schema, parse_expr},
+        prelude::{Pg2SqliteOptions, Translator},
+    };
 
     #[test]
     fn a_cast_or_call_is_not_a_string_literal_spelling() {

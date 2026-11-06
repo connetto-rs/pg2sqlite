@@ -1071,27 +1071,12 @@ fn database_filled_column(
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
-    use sql_traits::structs::ParserDB;
-    use sqlparser::{
-        ast::{Insert, OnInsert, Statement},
-        dialect::PostgreSqlDialect,
-        parser::Parser,
+    use sqlparser::ast::OnInsert;
+
+    use crate::{
+        impls::test_fixtures::{empty_schema, parse_insert},
+        prelude::{Pg2SqliteOptions, Translator},
     };
-
-    use crate::prelude::{Pg2SqliteOptions, Translator};
-
-    fn empty_schema() -> ParserDB {
-        ParserDB::from_statements(Vec::new(), "test".to_string()).expect("schema should build")
-    }
-
-    fn parse_insert(sql: &str) -> Insert {
-        let stmt =
-            Parser::parse_sql(&PostgreSqlDialect {}, sql).expect("sql should parse").remove(0);
-        let Statement::Insert(insert) = stmt else {
-            panic!("expected insert");
-        };
-        insert
-    }
 
     #[test]
     fn translate_rejects_non_on_conflict_insert_clause() {

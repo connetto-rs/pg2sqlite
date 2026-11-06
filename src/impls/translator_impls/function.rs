@@ -2669,29 +2669,19 @@ impl crate::traits::translator::TranslatorWithContext for Function {
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
-    use sql_traits::structs::ParserDB;
-    use sqlparser::{
-        ast::{
-            Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgOperator,
-            FunctionArgumentList, FunctionArguments, Ident, ObjectName, ObjectNamePart,
-        },
-        dialect::PostgreSqlDialect,
-        parser::Parser,
+    use sqlparser::ast::{
+        Function, FunctionArg, FunctionArgExpr, FunctionArgOperator, FunctionArgumentList,
+        FunctionArguments, Ident, ObjectName, ObjectNamePart,
     };
 
     use super::{build_concat_ws_expression, wrap_with_coalesce};
     use crate::{
-        impls::shared_helpers::function_argument_exprs,
+        impls::{
+            shared_helpers::function_argument_exprs,
+            test_fixtures::{empty_schema, parse_expr},
+        },
         prelude::{Pg2SqliteOptions, Translator},
     };
-
-    fn parse_expr(sql: &str) -> Expr {
-        Parser::new(&PostgreSqlDialect {})
-            .try_with_sql(sql)
-            .expect("sql should parse")
-            .parse_expr()
-            .expect("expression should parse")
-    }
 
     #[test]
     fn helper_functions_cover_none_args_passthrough_and_separator_builder() {
@@ -2713,8 +2703,7 @@ mod tests {
 
     #[test]
     fn concat_ws_supports_expr_named_arguments() {
-        let schema =
-            ParserDB::from_statements(Vec::new(), "test".to_string()).expect("schema should build");
+        let schema = empty_schema();
         let options = Pg2SqliteOptions::default();
         let func = Function {
             name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("concat_ws"))]),

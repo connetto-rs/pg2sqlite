@@ -1903,13 +1903,12 @@ mod tests {
         PlPgSqlTranslator, ReferenceForm, VariableScope, references_variable, substitute_variables,
     };
     use crate::{
-        impls::translator_impls::plpgsql::{PlPgSqlContext, VariableBinding},
+        impls::{
+            test_fixtures::{empty_schema, parse_expr, parse_query},
+            translator_impls::plpgsql::{PlPgSqlContext, VariableBinding},
+        },
         prelude::Pg2SqliteOptions,
     };
-
-    fn empty_schema() -> ParserDB {
-        ParserDB::from_statements(Vec::new(), "test".to_string()).unwrap()
-    }
 
     /// A schema declaring the table these cases translate against, since a
     /// column reference resolves through the relations in scope.
@@ -1924,17 +1923,6 @@ mod tests {
 
     fn parse_statement(sql: &str) -> Statement {
         Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap().remove(0)
-    }
-
-    fn parse_query(sql: &str) -> Query {
-        match parse_statement(sql) {
-            Statement::Query(query) => *query,
-            other => panic!("expected query, got: {other:?}"),
-        }
-    }
-
-    fn parse_expr(expr: &str) -> Expr {
-        Parser::new(&PostgreSqlDialect {}).try_with_sql(expr).unwrap().parse_expr().unwrap()
     }
 
     #[test]
@@ -2533,16 +2521,16 @@ mod tests {
         assert!(matches!(table_set_expr, SetExpr::Table(_)));
     }
 
-    #[test]
-    fn transform_subquery_matches_cte_query_for_limit_expression() {
+    /// Transforms `query` both ways and pins the subquery transform's parity
+    /// with the CTE transform. `mutate` shapes the query before both runs.
+    fn assert_subquery_cte_parity(mut query: Query, mutate: impl FnOnce(&mut Query)) -> Query {
         let options = crate::options::TranslationContext::from_owned(
             Pg2SqliteOptions::default().with_uuid_function_name("sqlite_uuid".to_string()),
         );
         let mut cte_ctx = PlPgSqlContext::new();
         let mut subquery_ctx = PlPgSqlContext::new();
 
-        let query =
-            parse_query("SELECT id FROM teams ORDER BY id LIMIT gen_random_uuid() + uuidv4()");
+        mutate(&mut query);
         let mut cte_query = query.clone();
         let mut subquery = query;
 
@@ -2553,6 +2541,15 @@ mod tests {
             subquery.to_string(),
             cte_query.to_string(),
             "subquery transform should stay in parity with cte query transform"
+        );
+        subquery
+    }
+
+    #[test]
+    fn transform_subquery_matches_cte_query_for_limit_expression() {
+        let subquery = assert_subquery_cte_parity(
+            parse_query("SELECT id FROM teams ORDER BY id LIMIT gen_random_uuid() + uuidv4()"),
+            |_| {},
         );
         assert!(
             subquery.to_string().contains("sqlite_uuid()"),
@@ -2562,28 +2559,13 @@ mod tests {
 
     #[test]
     fn transform_subquery_matches_cte_query_for_offset_comma_limit_expression() {
-        let options = crate::options::TranslationContext::from_owned(
-            Pg2SqliteOptions::default().with_uuid_function_name("sqlite_uuid".to_string()),
-        );
-        let mut cte_ctx = PlPgSqlContext::new();
-        let mut subquery_ctx = PlPgSqlContext::new();
-
-        let mut query = parse_query("SELECT id FROM teams ORDER BY id");
-        query.limit_clause = Some(sqlparser::ast::LimitClause::OffsetCommaLimit {
-            offset: parse_expr("gen_random_uuid()"),
-            limit: parse_expr("uuidv4()"),
-        });
-        let mut cte_query = query.clone();
-        let mut subquery = query;
-
-        PlPgSqlTranslator::transform_cte_query(&mut cte_query, &mut cte_ctx, &options);
-        PlPgSqlTranslator::transform_subquery(&mut subquery, &mut subquery_ctx, &options);
-
-        assert_eq!(
-            subquery.to_string(),
-            cte_query.to_string(),
-            "subquery transform should stay in parity with cte query transform"
-        );
+        let subquery =
+            assert_subquery_cte_parity(parse_query("SELECT id FROM teams ORDER BY id"), |query| {
+                query.limit_clause = Some(sqlparser::ast::LimitClause::OffsetCommaLimit {
+                    offset: parse_expr("gen_random_uuid()"),
+                    limit: parse_expr("uuidv4()"),
+                });
+            });
         let sql = subquery.to_string();
         assert!(
             sql.contains("sqlite_uuid()"),
@@ -2593,29 +2575,14 @@ mod tests {
 
     #[test]
     fn transform_subquery_matches_cte_query_for_fetch_expression() {
-        let options = crate::options::TranslationContext::from_owned(
-            Pg2SqliteOptions::default().with_uuid_function_name("sqlite_uuid".to_string()),
-        );
-        let mut cte_ctx = PlPgSqlContext::new();
-        let mut subquery_ctx = PlPgSqlContext::new();
-
-        let mut query = parse_query("SELECT id FROM teams ORDER BY id");
-        query.fetch = Some(sqlparser::ast::Fetch {
-            with_ties: false,
-            percent: false,
-            quantity: Some(parse_expr("gen_random_uuid() + uuidv4()")),
-        });
-        let mut cte_query = query.clone();
-        let mut subquery = query;
-
-        PlPgSqlTranslator::transform_cte_query(&mut cte_query, &mut cte_ctx, &options);
-        PlPgSqlTranslator::transform_subquery(&mut subquery, &mut subquery_ctx, &options);
-
-        assert_eq!(
-            subquery.to_string(),
-            cte_query.to_string(),
-            "subquery transform should stay in parity with cte query transform"
-        );
+        let subquery =
+            assert_subquery_cte_parity(parse_query("SELECT id FROM teams ORDER BY id"), |query| {
+                query.fetch = Some(sqlparser::ast::Fetch {
+                    with_ties: false,
+                    percent: false,
+                    quantity: Some(parse_expr("gen_random_uuid() + uuidv4()")),
+                });
+            });
         assert!(
             subquery.to_string().contains("sqlite_uuid()"),
             "FETCH quantity inside subqueries should be transformed: {subquery}"

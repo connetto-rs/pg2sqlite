@@ -474,12 +474,8 @@ impl ReverseTranslator for Statement {
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
-    use sql_traits::structs::ParserDB;
     use sqlparser::{
-        ast::{
-            AccessExpr, Expr, LimitClause, Offset, Query, SetExpr, Statement, Subscript,
-            TableFactor,
-        },
+        ast::{AccessExpr, Expr, LimitClause, SetExpr, Statement, Subscript, TableFactor},
         dialect::PostgreSqlDialect,
         parser::Parser,
     };
@@ -490,24 +486,11 @@ mod tests {
     };
     use crate::{
         errors::Error,
+        impls::test_fixtures::{
+            empty_schema, limit_offset_clause, parse_expr, parse_query, select_mut,
+        },
         prelude::{Pg2SqliteOptions, ReverseTranslator},
     };
-
-    fn empty_schema() -> ParserDB {
-        ParserDB::from_statements(Vec::new(), "test".to_string()).unwrap()
-    }
-
-    fn parse_expr(expr: &str) -> Expr {
-        Parser::new(&PostgreSqlDialect {}).try_with_sql(expr).unwrap().parse_expr().unwrap()
-    }
-
-    fn parse_query(sql: &str) -> Query {
-        let stmt = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap().remove(0);
-        match stmt {
-            Statement::Query(query) => *query,
-            other => panic!("expected query, got: {other:?}"),
-        }
-    }
 
     #[test]
     fn check_expr_for_rls_accepts_many_expression_variants() {
@@ -655,11 +638,7 @@ mod tests {
             LimitClause::OffsetCommaLimit { offset: parse_expr("1"), limit: parse_expr("10") };
         check_limit_clause_for_rls(&offset_comma, &empty_schema(), &options).unwrap();
 
-        let limit_offset = LimitClause::LimitOffset {
-            limit: Some(parse_expr("10")),
-            offset: Some(Offset { value: parse_expr("1"), rows: sqlparser::ast::OffsetRows::None }),
-            limit_by: vec![parse_expr("2")],
-        };
+        let limit_offset = limit_offset_clause();
         check_limit_clause_for_rls(&limit_offset, &empty_schema(), &options).unwrap();
     }
 
@@ -712,9 +691,7 @@ mod tests {
     fn check_query_for_rls_rejects_select_side_paths_with_rls_subqueries() {
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
         let mut query = parse_query("SELECT id FROM users");
-        let SetExpr::Select(select) = query.body.as_mut() else {
-            panic!("expected select");
-        };
+        let select = select_mut(&mut query);
 
         select.prewhere =
             Some(Expr::Subquery(Box::new(parse_query("SELECT id FROM users_rls LIMIT 1"))));

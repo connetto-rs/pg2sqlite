@@ -263,6 +263,7 @@ mod tests {
         quote_identifier, quoted_ident, resolve_translation_table, sqlite_unqualified_object_name,
         validate_schema_qualified_object_name_for_sqlite,
     };
+    use crate::impls::test_fixtures::empty_schema;
 
     fn name(parts: &[&str]) -> ObjectName {
         ObjectName(
@@ -371,7 +372,7 @@ mod tests {
 
     #[test]
     fn translation_table_lookup_rejects_non_identifier_segments() {
-        let schema = ParserDB::from_statements(Vec::new(), "test".to_string()).unwrap();
+        let schema = empty_schema();
         let function_part = ObjectNamePart::Function(ObjectNamePartFunction {
             name: Ident::new("remote"),
             args: vec![],

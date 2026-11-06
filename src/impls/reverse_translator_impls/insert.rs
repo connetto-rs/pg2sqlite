@@ -532,8 +532,8 @@ mod tests {
     use sql_traits::{structs::ParserDB, traits::TableLike};
     use sqlparser::{
         ast::{
-            Assignment, AssignmentTarget, Expr, Ident, Insert, ObjectName, ObjectNamePart,
-            ObjectNamePartFunction, Statement, TableObject,
+            Assignment, AssignmentTarget, Ident, ObjectName, ObjectNamePart,
+            ObjectNamePartFunction, TableObject,
         },
         dialect::PostgreSqlDialect,
         parser::Parser,
@@ -542,29 +542,9 @@ mod tests {
     use super::resolve_insert_table;
     use crate::{
         errors::Error,
+        impls::test_fixtures::{empty_schema, parse_expr, parse_insert},
         prelude::{Pg2SqliteOptions, ReverseTranslator},
     };
-
-    fn empty_schema() -> ParserDB {
-        ParserDB::from_statements(Vec::new(), "test".to_string()).expect("schema should build")
-    }
-
-    fn parse_insert(sql: &str) -> Insert {
-        let stmt =
-            Parser::parse_sql(&PostgreSqlDialect {}, sql).expect("sql should parse").remove(0);
-        let Statement::Insert(insert) = stmt else {
-            panic!("expected insert");
-        };
-        insert
-    }
-
-    fn parse_expr(expr: &str) -> Expr {
-        Parser::new(&PostgreSqlDialect {})
-            .try_with_sql(expr)
-            .expect("expr should parse")
-            .parse_expr()
-            .expect("expr should parse")
-    }
 
     fn schema_from_sql(sql: &str) -> ParserDB {
         let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql).expect("sql should parse");

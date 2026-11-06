@@ -644,6 +644,19 @@ fn column_resolving_to_base(
 mod tests {
     use super::is_sqlitegis_function;
 
+    /// Catalog entries SQLiteGIS registers that the PostGIS catalog does not
+    /// answer.
+    #[cfg(feature = "sqlitegis")]
+    fn missing_catalog_entries(
+        specs: &[sqlitegis::core::function_catalog::SqliteFunctionSpec],
+    ) -> Vec<String> {
+        specs
+            .iter()
+            .filter(|spec| !is_sqlitegis_function(&spec.name.to_ascii_lowercase(), spec.n_arg))
+            .map(|spec| format!("{}/{}", spec.name, spec.n_arg))
+            .collect()
+    }
+
     #[test]
     fn catalog_lookup_finds_st_point_with_known_arities() {
         assert!(is_sqlitegis_function("st_point", 2));
@@ -674,11 +687,9 @@ mod tests {
     #[cfg(feature = "sqlitegis")]
     #[test]
     fn pg2sqlite_catalog_covers_every_sqlitegis_deterministic_function() {
-        let missing = sqlitegis::core::function_catalog::SQLITE_DETERMINISTIC_FUNCTIONS
-            .iter()
-            .filter(|spec| !is_sqlitegis_function(&spec.name.to_ascii_lowercase(), spec.n_arg))
-            .map(|spec| format!("{}/{}", spec.name, spec.n_arg))
-            .collect::<Vec<_>>();
+        let missing = missing_catalog_entries(
+            sqlitegis::core::function_catalog::SQLITE_DETERMINISTIC_FUNCTIONS,
+        );
         assert!(
             missing.is_empty(),
             "pg2sqlite's PostGIS catalog is missing {} SQLiteGIS deterministic entries:\n{}",
@@ -690,11 +701,9 @@ mod tests {
     #[cfg(feature = "sqlitegis")]
     #[test]
     fn pg2sqlite_catalog_covers_every_sqlitegis_direct_only_function() {
-        let missing = sqlitegis::core::function_catalog::SQLITE_DIRECT_ONLY_FUNCTIONS
-            .iter()
-            .filter(|spec| !is_sqlitegis_function(&spec.name.to_ascii_lowercase(), spec.n_arg))
-            .map(|spec| format!("{}/{}", spec.name, spec.n_arg))
-            .collect::<Vec<_>>();
+        let missing = missing_catalog_entries(
+            sqlitegis::core::function_catalog::SQLITE_DIRECT_ONLY_FUNCTIONS,
+        );
         assert!(
             missing.is_empty(),
             "pg2sqlite's PostGIS catalog is missing {} SQLiteGIS direct-only entries:\n{}",
@@ -712,10 +721,12 @@ mod tests {
         use sqlparser::ast::DataType;
 
         use super::sqlitegis_result_type;
-        use crate::prelude::{Pg2SqliteOptions, Translator};
+        use crate::{
+            impls::test_fixtures::empty_schema,
+            prelude::{Pg2SqliteOptions, Translator},
+        };
 
-        let schema = sql_traits::structs::ParserDB::from_statements(Vec::new(), "test".into())
-            .expect("schema should build");
+        let schema = empty_schema();
         let mismatched = SQLITE_DETERMINISTIC_FUNCTIONS
             .iter()
             .chain(SQLITE_DIRECT_ONLY_FUNCTIONS)

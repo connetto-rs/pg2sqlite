@@ -5260,8 +5260,8 @@ mod tests {
         ast::{
             Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgOperator,
             FunctionArgumentList, FunctionArguments, Ident, JoinConstraint, JoinOperator,
-            ObjectName, ObjectNamePart, PivotValueSource, Query, SelectItem, SetExpr, Statement,
-            TableFactor, ValueWithSpan,
+            ObjectName, ObjectNamePart, PivotValueSource, Query, SelectItem, SetExpr, TableFactor,
+            ValueWithSpan,
         },
         dialect::PostgreSqlDialect,
         parser::Parser,
@@ -5274,11 +5274,21 @@ mod tests {
         translate_pivot_value_source, translate_returning, translate_select_item,
         translate_table_factor, translate_table_with_joins, values_relation_carries_interval,
     };
-    use crate::{errors::Error, impls::translator_impls::Forward, prelude::Pg2SqliteOptions};
+    use crate::{
+        errors::Error,
+        impls::{
+            test_fixtures::{empty_schema, parse_expr, parse_query},
+            translator_impls::Forward,
+        },
+        prelude::Pg2SqliteOptions,
+    };
 
-    struct IdentityDirection;
+    /// A `TranslationDirection` whose `translate_expr` either clones the
+    /// expression or wraps it in `Expr::Nested`, chosen at compile time by
+    /// `NESTS`.
+    struct TestDirection<const NESTS: bool>;
 
-    impl TranslationDirection for IdentityDirection {
+    impl<const NESTS: bool> TranslationDirection for TestDirection<NESTS> {
         type Options<'a> = Pg2SqliteOptions;
 
         fn with_scope<'scope>(
@@ -5298,7 +5308,7 @@ mod tests {
             _options: &Pg2SqliteOptions,
             _emit: crate::warnings::WarningSink<'_>,
         ) -> Result<Expr, Error> {
-            Ok(expr.clone())
+            if NESTS { Ok(Expr::Nested(Box::new(expr.clone()))) } else { Ok(expr.clone()) }
         }
 
         fn translate_query(
@@ -5335,84 +5345,6 @@ mod tests {
             _emit: crate::warnings::WarningSink<'_>,
         ) -> Result<sqlparser::ast::Delete, Error> {
             Ok(delete.clone())
-        }
-    }
-
-    struct NestingDirection;
-
-    impl TranslationDirection for NestingDirection {
-        type Options<'a> = Pg2SqliteOptions;
-
-        fn with_scope<'scope>(
-            options: &'scope Self::Options<'_>,
-            _scope: &'scope sql_traits::structs::ColumnScope<'scope, 'scope, ParserDB>,
-        ) -> Self::Options<'scope> {
-            options.clone()
-        }
-
-        fn config<'options>(options: &'options Self::Options<'_>) -> &'options Pg2SqliteOptions {
-            options
-        }
-
-        fn translate_expr(
-            expr: &Expr,
-            _schema: &ParserDB,
-            _options: &Pg2SqliteOptions,
-            _emit: crate::warnings::WarningSink<'_>,
-        ) -> Result<Expr, Error> {
-            Ok(Expr::Nested(Box::new(expr.clone())))
-        }
-
-        fn translate_query(
-            query: &Query,
-            _schema: &ParserDB,
-            _options: &Pg2SqliteOptions,
-            _emit: crate::warnings::WarningSink<'_>,
-        ) -> Result<Query, Error> {
-            Ok(query.clone())
-        }
-
-        fn translate_insert(
-            insert: &sqlparser::ast::Insert,
-            _schema: &ParserDB,
-            _options: &Pg2SqliteOptions,
-            _emit: crate::warnings::WarningSink<'_>,
-        ) -> Result<sqlparser::ast::Insert, Error> {
-            Ok(insert.clone())
-        }
-
-        fn translate_update(
-            update: &sqlparser::ast::Update,
-            _schema: &ParserDB,
-            _options: &Pg2SqliteOptions,
-            _emit: crate::warnings::WarningSink<'_>,
-        ) -> Result<sqlparser::ast::Update, Error> {
-            Ok(update.clone())
-        }
-
-        fn translate_delete(
-            delete: &sqlparser::ast::Delete,
-            _schema: &ParserDB,
-            _options: &Pg2SqliteOptions,
-            _emit: crate::warnings::WarningSink<'_>,
-        ) -> Result<sqlparser::ast::Delete, Error> {
-            Ok(delete.clone())
-        }
-    }
-
-    fn empty_schema() -> ParserDB {
-        ParserDB::from_statements(Vec::new(), "test".to_string()).unwrap()
-    }
-
-    fn parse_expr(sql: &str) -> Expr {
-        Parser::new(&PostgreSqlDialect {}).try_with_sql(sql).unwrap().parse_expr().unwrap()
-    }
-
-    fn parse_query(sql: &str) -> Query {
-        let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
-        match stmts.into_iter().next().unwrap() {
-            Statement::Query(query) => *query,
-            other => panic!("expected query statement, got: {other:?}"),
         }
     }
 
@@ -5435,7 +5367,7 @@ mod tests {
             panic!("expected select");
         };
 
-        let translated = translate_table_with_joins::<IdentityDirection>(
+        let translated = translate_table_with_joins::<TestDirection<false>>(
             select.from.first().unwrap(),
             &schema,
             &options,
@@ -5450,12 +5382,12 @@ mod tests {
             alias: sqlparser::ast::Ident::new("b1"),
         };
         assert!(matches!(
-            translate_select_item::<IdentityDirection>(&unnamed, &schema, &options, &mut |_| {},)
+            translate_select_item::<TestDirection<false>>(&unnamed, &schema, &options, &mut |_| {},)
                 .unwrap(),
             SelectItem::UnnamedExpr(_)
         ));
         assert!(matches!(
-            translate_select_item::<IdentityDirection>(&named, &schema, &options, &mut |_| {},)
+            translate_select_item::<TestDirection<false>>(&named, &schema, &options, &mut |_| {},)
                 .unwrap(),
             SelectItem::ExprWithAlias { .. }
         ));
@@ -5498,12 +5430,13 @@ mod tests {
 
         for op in &operators {
             let _ =
-                translate_join_operator::<IdentityDirection>(op, &schema, &options, &mut |_| {})
+                translate_join_operator::<TestDirection<false>>(op, &schema, &options, &mut |_| {})
                     .unwrap();
         }
 
-        let _ = translate_join_constraint::<IdentityDirection>(&on, &schema, &options, &mut |_| {})
-            .unwrap();
+        let _ =
+            translate_join_constraint::<TestDirection<false>>(&on, &schema, &options, &mut |_| {})
+                .unwrap();
     }
 
     #[test]
@@ -5517,7 +5450,7 @@ mod tests {
 
         let derived = &select.from[0].relation;
         let _ =
-            translate_table_factor::<IdentityDirection>(derived, &schema, &options, &mut |_| {})
+            translate_table_factor::<TestDirection<false>>(derived, &schema, &options, &mut |_| {})
                 .unwrap();
 
         let nested_query = parse_query("SELECT * FROM (t JOIN u ON t.id = u.id) AS z");
@@ -5526,7 +5459,7 @@ mod tests {
         };
         let nested_factor = &nested_select.from[0].relation;
         if let TableFactor::NestedJoin { .. } = nested_factor {
-            let _ = translate_table_factor::<IdentityDirection>(
+            let _ = translate_table_factor::<TestDirection<false>>(
                 nested_factor,
                 &schema,
                 &options,
@@ -5543,7 +5476,7 @@ mod tests {
             table_with_joins: Box::new(joined_select.from[0].clone()),
             alias: None,
         };
-        let translated_manual = translate_table_factor::<IdentityDirection>(
+        let translated_manual = translate_table_factor::<TestDirection<false>>(
             &manual_nested,
             &schema,
             &options,
@@ -5560,7 +5493,7 @@ mod tests {
             },
         ];
         assert_eq!(
-            translate_returning::<IdentityDirection>(
+            translate_returning::<TestDirection<false>>(
                 Some(&returning_items),
                 &schema,
                 &options,
@@ -5572,7 +5505,7 @@ mod tests {
             2
         );
         assert!(
-            translate_returning::<IdentityDirection>(None, &schema, &options, &mut |_| {},)
+            translate_returning::<TestDirection<false>>(None, &schema, &options, &mut |_| {},)
                 .unwrap()
                 .is_none()
         );
@@ -5589,7 +5522,7 @@ mod tests {
         let mut join = select.from[0].joins[0].clone();
         join.global = true;
         let translated =
-            translate_join::<IdentityDirection>(&join, &schema, &options, &mut |_| {}).unwrap();
+            translate_join::<TestDirection<false>>(&join, &schema, &options, &mut |_| {}).unwrap();
         assert!(translated.global);
     }
 
@@ -5602,7 +5535,7 @@ mod tests {
             match_condition: parse_expr("t.id > u.id"),
         };
         let translated_as_of =
-            translate_join_operator::<NestingDirection>(&as_of, &schema, &options, &mut |_| {})
+            translate_join_operator::<TestDirection<true>>(&as_of, &schema, &options, &mut |_| {})
                 .unwrap();
         let JoinOperator::AsOf { match_condition, .. } = translated_as_of else {
             panic!("expected AS OF join");
@@ -5613,9 +5546,13 @@ mod tests {
             expr: parse_expr("a"),
             alias: sqlparser::ast::Ident::new("a1"),
         };
-        let translated_alias =
-            translate_select_item::<NestingDirection>(&alias_item, &schema, &options, &mut |_| {})
-                .unwrap();
+        let translated_alias = translate_select_item::<TestDirection<true>>(
+            &alias_item,
+            &schema,
+            &options,
+            &mut |_| {},
+        )
+        .unwrap();
         let SelectItem::ExprWithAlias { expr, .. } = translated_alias else {
             panic!("expected alias expression");
         };
@@ -5816,8 +5753,9 @@ mod tests {
         };
         let expected = ob.clone();
         let source = PivotValueSource::Any(vec![ob]);
-        let got = translate_pivot_value_source::<IdentityDirection>(&source, &s, &o, &mut |_| {})
-            .expect("a pivot ANY value source translates its order by");
+        let got =
+            translate_pivot_value_source::<TestDirection<false>>(&source, &s, &o, &mut |_| {})
+                .expect("a pivot ANY value source translates its order by");
         assert_eq!(got, PivotValueSource::Any(vec![expected]));
     }
 
