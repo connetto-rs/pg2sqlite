@@ -2,7 +2,7 @@
 name = "pg2sqlite"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "MIT"
 description = "Translates PostgreSQL SQL into valid runnable SQLite SQL, emitting semantically equivalent output for types, RLS, FTS5, pgvector, and PostGIS constructs."
 homepage = "https://pg2sqlite.luca.phd"

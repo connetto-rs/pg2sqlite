@@ -434,11 +434,12 @@ fn translate_create_table_for_role(
         return Ok(None);
     };
 
-    if !table.can_select(role, schema)? {
+    let access = crate::impls::session_variable::table_access(table, role, schema)?;
+    if !access.reads {
         return Ok(Some(Vec::new()));
     }
 
-    let is_readonly = !table.can_write(role, schema)?;
+    let is_readonly = !access.writes;
     if table.has_row_level_security(schema)? {
         validate_table_policies(table, schema, options)?;
         let rls_statements = if is_readonly {
@@ -590,7 +591,7 @@ fn role_access_for_object_name(
         return Err(Error::TableNotFoundInSchema { table_name: table_name.to_string() });
     };
 
-    if table.can_select(role, schema)? {
+    if crate::impls::session_variable::table_access(table, role, schema)?.reads {
         Ok(RoleTableAccess::Allow)
     } else {
         Ok(RoleTableAccess::Deny)

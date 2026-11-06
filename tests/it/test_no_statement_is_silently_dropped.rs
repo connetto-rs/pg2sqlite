@@ -190,7 +190,14 @@ const CASES: &[Case] = &[
     warned("DROP USER r"),
     // Warned and dropped: type-like definitions.
     warned("CREATE TYPE mood AS ENUM ('sad', 'ok')"),
-    warned("ALTER TYPE mood RENAME TO feeling"),
+    // sql-traits records types, so altering one nothing declared refuses at
+    // build, as PostgreSQL does, and the warn-drop needs the type declared.
+    Case {
+        setup: "CREATE TYPE mood AS ENUM ('sad', 'ok');",
+        sql: "ALTER TYPE mood RENAME TO feeling",
+        outcome: Outcome::Warned,
+    },
+    rejected("ALTER TYPE nope RENAME TO feeling"),
     warned("CREATE DOMAIN positive AS INTEGER CHECK (VALUE > 0)"),
     // sql-traits records domains, so a drop of one nothing declared refuses at
     // build, as PostgreSQL does, and the warn-drop needs the domain declared.

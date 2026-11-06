@@ -1148,18 +1148,19 @@ impl Pg2Sqlite {
 
         let mut entries = Vec::new();
         for table in schema.tables() {
-            if let Some(role) = role
-                && !table.can_select(role, schema)?
-            {
+            let access = match role {
+                Some(role) => {
+                    Some(crate::impls::session_variable::table_access(table, role, schema)?)
+                }
+                None => None,
+            };
+            if access.is_some_and(|access| !access.reads) {
                 continue;
             }
 
             let logical = table.table_name().to_string();
             let physical = resolve_trigger_table_name(&logical, table, schema, options)?;
-            let readonly = match role {
-                Some(role) => !table.can_write(role, schema)?,
-                None => false,
-            };
+            let readonly = access.is_some_and(|access| !access.writes);
             let wrapper = if table.has_row_level_security(schema)? {
                 WrapperKind::RlsView
             } else if readonly {
