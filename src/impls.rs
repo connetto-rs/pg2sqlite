@@ -37,6 +37,8 @@ pub(crate) mod stack_headroom;
 pub(crate) mod temporal_arithmetic;
 pub(crate) mod temporal_casts;
 pub(crate) mod temporal_literals;
+#[cfg(test)]
+pub(crate) mod test_fixtures;
 pub(crate) mod timezone;
 pub(crate) mod transaction_blocks;
 pub(crate) mod translator_impls;

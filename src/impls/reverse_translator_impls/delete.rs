@@ -88,18 +88,16 @@ impl ReverseTranslator for Delete {
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
-    use sql_traits::structs::ParserDB;
     use sqlparser::{
         ast::{FromTable, Statement},
         dialect::PostgreSqlDialect,
         parser::Parser,
     };
 
-    use crate::prelude::{Pg2SqliteOptions, ReverseTranslator};
-
-    fn empty_schema() -> ParserDB {
-        ParserDB::from_statements(Vec::new(), "test".to_string()).unwrap()
-    }
+    use crate::{
+        impls::test_fixtures::empty_schema,
+        prelude::{Pg2SqliteOptions, ReverseTranslator},
+    };
 
     fn parse_delete(sql: &str) -> sqlparser::ast::Delete {
         let stmt = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap().remove(0);

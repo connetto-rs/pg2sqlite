@@ -520,14 +520,12 @@ fn translate_custom_type(
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
-    use sql_traits::structs::ParserDB;
     use sqlparser::ast::DataType;
 
-    use crate::prelude::{Pg2SqliteOptions, Translator};
-
-    fn empty_schema() -> ParserDB {
-        ParserDB::from_statements(Vec::new(), "test".to_string()).expect("schema should build")
-    }
+    use crate::{
+        impls::test_fixtures::empty_schema,
+        prelude::{Pg2SqliteOptions, Translator},
+    };
 
     #[test]
     fn array_type_needs_a_representation() {

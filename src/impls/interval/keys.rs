@@ -1071,18 +1071,14 @@ fn with_rank(keyed_text: Expr, rank: &str) -> Expr {
 mod tests {
     use core::ops::ControlFlow;
 
-    use sql_traits::prelude::ParserDB;
     use sqlparser::{
         ast::{Expr, Ident, SelectItem, Visit, Visitor},
-        dialect::{PostgreSqlDialect, SQLiteDialect},
+        dialect::SQLiteDialect,
         parser::Parser,
     };
 
     use super::{keys_templates, select_list_item, substitute};
-
-    fn parse_expr(sql: &str) -> Expr {
-        Parser::new(&PostgreSqlDialect {}).try_with_sql(sql).unwrap().parse_expr().unwrap()
-    }
+    use crate::impls::test_fixtures::{parse_expr, with_scoped_options};
 
     #[test]
     fn a_malformed_key_template_answers_the_parse_refusal() {
@@ -1143,35 +1139,30 @@ mod tests {
 
     #[test]
     fn select_list_item_skips_the_group_by_column_check_for_a_variable() {
-        let schema =
-            ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE t (x int, iv interval)").unwrap();
-        let options = crate::options::TranslationContext::from_owned(
-            crate::prelude::Pg2SqliteOptions::default(),
+        with_scoped_options(
+            "CREATE TABLE t (x int, iv interval)",
+            "SELECT x, iv FROM t",
+            |schema, scoped| {
+                let projection = vec![
+                    SelectItem::UnnamedExpr(Expr::Identifier(Ident::new("x"))),
+                    SelectItem::UnnamedExpr(Expr::Identifier(Ident::new("iv"))),
+                ];
+                let item = Expr::Identifier(Ident::new("x"));
+                let plain = select_list_item(&item, &projection, true, schema, scoped)
+                    .expect("a group by name settles");
+                assert!(
+                    plain.is_none(),
+                    "a declared column keeps its ordinary translation under GROUP BY"
+                );
+                let variables = vec![String::from("x")];
+                let with_vars = scoped.with_variables(&variables);
+                let keyed = select_list_item(&item, &projection, true, schema, &with_vars)
+                    .expect("a group by name settles");
+                assert!(
+                    keyed.is_some(),
+                    "a variable name skips the column check and reads its output"
+                );
+            },
         );
-        let query = Parser::new(&PostgreSqlDialect {})
-            .try_with_sql("SELECT x, iv FROM t")
-            .unwrap()
-            .parse_query()
-            .unwrap();
-        let scope = sql_traits::structs::ColumnScope::from_query(
-            &query,
-            &schema,
-            sql_traits::structs::IdentifierCase::AsWritten,
-        )
-        .unwrap();
-        let scoped = options.with_scope(&scope);
-        let projection = vec![
-            SelectItem::UnnamedExpr(Expr::Identifier(Ident::new("x"))),
-            SelectItem::UnnamedExpr(Expr::Identifier(Ident::new("iv"))),
-        ];
-        let item = Expr::Identifier(Ident::new("x"));
-        let plain = select_list_item(&item, &projection, true, &schema, &scoped)
-            .expect("a group by name settles");
-        assert!(plain.is_none(), "a declared column keeps its ordinary translation under GROUP BY");
-        let variables = vec![String::from("x")];
-        let scoped = scoped.with_variables(&variables);
-        let keyed = select_list_item(&item, &projection, true, &schema, &scoped)
-            .expect("a group by name settles");
-        assert!(keyed.is_some(), "a variable name skips the column check and reads its output");
     }
 }

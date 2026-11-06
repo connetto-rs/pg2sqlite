@@ -2256,7 +2256,10 @@ mod tests {
         RESULT_NEUTRAL_SETTINGS, inject_condition, is_result_neutral_setting,
         translate_create_table_for_role,
     };
-    use crate::prelude::{Pg2SqliteOptions, Translator};
+    use crate::{
+        impls::test_fixtures::empty_schema,
+        prelude::{Pg2SqliteOptions, Translator},
+    };
 
     /// `is_result_neutral_setting` binary searches the table, so an unsorted or
     /// duplicated entry would make a lookup miss silently.
@@ -2367,7 +2370,7 @@ mod tests {
         .next()
         .unwrap();
 
-        let schema = ParserDB::from_statements(Vec::new(), "test".to_string()).unwrap();
+        let schema = empty_schema();
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
         let translated = if_stmt.translate(&schema, &options).expect("IF/ELSE should translate");
         assert_eq!(translated.len(), 2, "expected two statements for IF/ELSE");

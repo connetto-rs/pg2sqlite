@@ -1413,14 +1413,8 @@ fn translate_named_window(
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
-    use sql_traits::structs::ParserDB;
-    use sqlparser::{
-        ast::{
-            Distinct, GroupByExpr, NamedWindowDefinition, NamedWindowExpr, Query, SelectItem,
-            SetExpr, Statement,
-        },
-        dialect::PostgreSqlDialect,
-        parser::Parser,
+    use sqlparser::ast::{
+        Distinct, GroupByExpr, NamedWindowDefinition, NamedWindowExpr, SelectItem, SetExpr,
     };
 
     use super::{
@@ -1430,11 +1424,10 @@ mod tests {
         translate_limit_clause, translate_named_window, translate_order_by,
         try_translate_distinct_on_query, try_translate_grouping_query,
     };
-    use crate::prelude::{Pg2SqliteOptions, Translator};
-
-    fn empty_schema() -> ParserDB {
-        ParserDB::from_statements(Vec::new(), "test".to_string()).unwrap()
-    }
+    use crate::{
+        impls::test_fixtures::{empty_schema, parse_expr, parse_query, select_mut},
+        prelude::{Pg2SqliteOptions, Translator},
+    };
 
     /// This crate keeps its PostgreSQL names in more than one place, and the
     /// reverse direction's inventories were built from the other one. That is
@@ -1463,18 +1456,6 @@ mod tests {
                  too"
             );
         }
-    }
-
-    fn parse_query(sql: &str) -> Query {
-        let stmt = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap().remove(0);
-        match stmt {
-            Statement::Query(query) => *query,
-            other => panic!("expected query, got: {other:?}"),
-        }
-    }
-
-    fn parse_expr(expr: &str) -> sqlparser::ast::Expr {
-        Parser::new(&PostgreSqlDialect {}).try_with_sql(expr).unwrap().parse_expr().unwrap()
     }
 
     #[test]
@@ -1904,9 +1885,7 @@ mod tests {
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
 
         let mut query = parse_query("SELECT id FROM users");
-        let SetExpr::Select(select) = query.body.as_mut() else {
-            panic!("expected select");
-        };
+        let select = select_mut(&mut query);
 
         select.prewhere = Some(parse_expr("now()"));
 
@@ -1962,9 +1941,7 @@ mod tests {
 
         let refused = |mutate: &dyn Fn(&mut sqlparser::ast::Select), needle: &str| {
             let mut query = parse_query("SELECT id FROM users");
-            let SetExpr::Select(select) = query.body.as_mut() else {
-                panic!("expected select");
-            };
+            let select = select_mut(&mut query);
             mutate(select);
             let err = query
                 .translate(&schema, &options)

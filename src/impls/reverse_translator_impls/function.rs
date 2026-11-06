@@ -1617,20 +1617,18 @@ pub fn reverse_translate_function(
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
-    use sql_traits::structs::ParserDB;
-    use sqlparser::{
-        ast::{
-            Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgOperator,
-            FunctionArgumentList, FunctionArguments, Ident, ObjectName, ObjectNamePart,
-            ValueWithSpan,
-        },
-        dialect::PostgreSqlDialect,
-        parser::Parser,
+    use sqlparser::ast::{
+        Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgOperator, FunctionArgumentList,
+        FunctionArguments, Ident, ObjectName, ObjectNamePart, ValueWithSpan,
     };
 
     use super::{SQLITE_ONLY, reverse_translate_function};
     use crate::{
-        impls::{function_helpers::function_arg_expr_or_err, timezone::is_fixed_utc_offset},
+        impls::{
+            function_helpers::function_arg_expr_or_err,
+            test_fixtures::{empty_schema, parse_expr, parse_query},
+            timezone::is_fixed_utc_offset,
+        },
         prelude::Pg2SqliteOptions,
     };
 
@@ -1750,24 +1748,22 @@ mod tests {
         assert_eq!(before, reverse.len(), "duplicate key in REVERSE_RENAMES");
     }
 
-    fn empty_schema() -> ParserDB {
-        ParserDB::from_statements(Vec::new(), "test".to_string()).expect("schema should build")
-    }
-
-    fn parse_expr(sql: &str) -> Expr {
-        Parser::new(&PostgreSqlDialect {})
-            .try_with_sql(sql)
-            .expect("sql should parse")
-            .parse_expr()
-            .expect("expression should parse")
-    }
-
-    fn parse_query(sql: &str) -> sqlparser::ast::Query {
-        let stmt = Parser::parse_sql(&PostgreSqlDialect {}, sql).expect("query SQL should parse");
-        let stmt = stmt.into_iter().next().expect("query SQL should produce one statement");
-        match stmt {
-            sqlparser::ast::Statement::Query(query) => *query,
-            other => panic!("expected query, got: {other:?}"),
+    /// A `Function` named `name` carrying `args` and no filter, `OVER`, or
+    /// parameters.
+    fn function_with_args(name: &str, args: Vec<FunctionArg>) -> Function {
+        Function {
+            name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(name))]),
+            uses_odbc_syntax: false,
+            args: FunctionArguments::List(FunctionArgumentList {
+                duplicate_treatment: None,
+                args,
+                clauses: vec![],
+            }),
+            filter: None,
+            null_treatment: None,
+            over: None,
+            within_group: vec![],
+            parameters: FunctionArguments::None,
         }
     }
 
@@ -1784,25 +1780,15 @@ mod tests {
         let err = function_arg_expr_or_err(&wildcard).expect_err("wildcard should be rejected");
         assert!(err.to_string().contains("Expected expression argument"));
 
-        let func = Function {
-            name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("datetime"))]),
-            uses_odbc_syntax: false,
-            args: FunctionArguments::List(FunctionArgumentList {
-                duplicate_treatment: None,
-                args: vec![
-                    FunctionArg::Unnamed(FunctionArgExpr::Wildcard),
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(ValueWithSpan::from(
-                        sqlparser::ast::Value::SingleQuotedString("utc".to_string()),
-                    )))),
-                ],
-                clauses: vec![],
-            }),
-            filter: None,
-            null_treatment: None,
-            over: None,
-            within_group: vec![],
-            parameters: FunctionArguments::None,
-        };
+        let func = function_with_args(
+            "datetime",
+            vec![
+                FunctionArg::Unnamed(FunctionArgExpr::Wildcard),
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(ValueWithSpan::from(
+                    sqlparser::ast::Value::SingleQuotedString("utc".to_string()),
+                )))),
+            ],
+        );
 
         let schema = empty_schema();
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
@@ -1813,20 +1799,9 @@ mod tests {
 
     #[test]
     fn passthrough_reverse_translation_preserves_filter_expression() {
-        let func = Function {
-            name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("count"))]),
-            uses_odbc_syntax: false,
-            args: FunctionArguments::List(FunctionArgumentList {
-                duplicate_treatment: None,
-                args: vec![FunctionArg::Unnamed(FunctionArgExpr::Wildcard)],
-                clauses: vec![],
-            }),
-            filter: Some(Box::new(parse_expr("age > 18"))),
-            null_treatment: None,
-            over: None,
-            within_group: vec![],
-            parameters: FunctionArguments::None,
-        };
+        let mut func =
+            function_with_args("count", vec![FunctionArg::Unnamed(FunctionArgExpr::Wildcard)]);
+        func.filter = Some(Box::new(parse_expr("age > 18")));
 
         let schema = empty_schema();
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
@@ -1854,24 +1829,14 @@ mod tests {
 
     #[test]
     fn passthrough_reverse_translation_translates_expr_named_argument_expression() {
-        let func = Function {
-            name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("custom_fn"))]),
-            uses_odbc_syntax: false,
-            args: FunctionArguments::List(FunctionArgumentList {
-                duplicate_treatment: None,
-                args: vec![FunctionArg::ExprNamed {
-                    name: parse_expr("tz"),
-                    arg: FunctionArgExpr::Expr(parse_expr("datetime('now')")),
-                    operator: FunctionArgOperator::Equals,
-                }],
-                clauses: vec![],
-            }),
-            filter: None,
-            null_treatment: None,
-            over: None,
-            within_group: vec![],
-            parameters: FunctionArguments::None,
-        };
+        let func = function_with_args(
+            "custom_fn",
+            vec![FunctionArg::ExprNamed {
+                name: parse_expr("tz"),
+                arg: FunctionArgExpr::Expr(parse_expr("datetime('now')")),
+                operator: FunctionArgOperator::Equals,
+            }],
+        );
 
         let schema = empty_schema();
         // The subject here is the passthrough plumbing, so the name is
@@ -1892,23 +1857,13 @@ mod tests {
 
     #[test]
     fn ltrim_two_arg_reverses_to_trim_leading() {
-        let func = Function {
-            name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("LTRIM"))]),
-            uses_odbc_syntax: false,
-            args: FunctionArguments::List(FunctionArgumentList {
-                duplicate_treatment: None,
-                args: vec![
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(parse_expr("str"))),
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(parse_expr("'x'"))),
-                ],
-                clauses: vec![],
-            }),
-            filter: None,
-            null_treatment: None,
-            over: None,
-            within_group: vec![],
-            parameters: FunctionArguments::None,
-        };
+        let func = function_with_args(
+            "LTRIM",
+            vec![
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(parse_expr("str"))),
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(parse_expr("'x'"))),
+            ],
+        );
         let schema = empty_schema();
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
         let result = reverse_translate_function(&func, &schema, &options)
@@ -1918,23 +1873,13 @@ mod tests {
 
     #[test]
     fn rtrim_two_arg_reverses_to_trim_trailing() {
-        let func = Function {
-            name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("RTRIM"))]),
-            uses_odbc_syntax: false,
-            args: FunctionArguments::List(FunctionArgumentList {
-                duplicate_treatment: None,
-                args: vec![
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(parse_expr("str"))),
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(parse_expr("'x'"))),
-                ],
-                clauses: vec![],
-            }),
-            filter: None,
-            null_treatment: None,
-            over: None,
-            within_group: vec![],
-            parameters: FunctionArguments::None,
-        };
+        let func = function_with_args(
+            "RTRIM",
+            vec![
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(parse_expr("str"))),
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(parse_expr("'x'"))),
+            ],
+        );
         let schema = empty_schema();
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
         let result = reverse_translate_function(&func, &schema, &options)
@@ -1944,23 +1889,13 @@ mod tests {
 
     #[test]
     fn trim_two_arg_reverses_to_trim_both() {
-        let func = Function {
-            name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("TRIM"))]),
-            uses_odbc_syntax: false,
-            args: FunctionArguments::List(FunctionArgumentList {
-                duplicate_treatment: None,
-                args: vec![
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(parse_expr("str"))),
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(parse_expr("'x'"))),
-                ],
-                clauses: vec![],
-            }),
-            filter: None,
-            null_treatment: None,
-            over: None,
-            within_group: vec![],
-            parameters: FunctionArguments::None,
-        };
+        let func = function_with_args(
+            "TRIM",
+            vec![
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(parse_expr("str"))),
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(parse_expr("'x'"))),
+            ],
+        );
         let schema = empty_schema();
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
         let result = reverse_translate_function(&func, &schema, &options)
@@ -1970,20 +1905,10 @@ mod tests {
 
     #[test]
     fn ltrim_one_arg_passes_through() {
-        let func = Function {
-            name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("LTRIM"))]),
-            uses_odbc_syntax: false,
-            args: FunctionArguments::List(FunctionArgumentList {
-                duplicate_treatment: None,
-                args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(parse_expr("str")))],
-                clauses: vec![],
-            }),
-            filter: None,
-            null_treatment: None,
-            over: None,
-            within_group: vec![],
-            parameters: FunctionArguments::None,
-        };
+        let func = function_with_args(
+            "LTRIM",
+            vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(parse_expr("str")))],
+        );
         let schema = empty_schema();
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
         let result = reverse_translate_function(&func, &schema, &options)

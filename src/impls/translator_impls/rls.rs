@@ -2918,7 +2918,7 @@ mod tests {
         ast::{
             Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgOperator,
             FunctionArgumentList, FunctionArguments, Ident, JoinConstraint, JoinOperator,
-            ObjectName, ObjectNamePart, Query, SetExpr, Statement, TableFactor,
+            ObjectName, ObjectNamePart, SetExpr, Statement, TableFactor,
         },
         dialect::PostgreSqlDialect,
         parser::Parser,
@@ -2936,6 +2936,7 @@ mod tests {
         impls::{
             function_helpers::single_quoted_literal,
             session_variable::{self, SessionRead},
+            test_fixtures::{parse_expr, parse_query},
         },
         prelude::Pg2SqliteOptions,
         traits::translation_options::SessionVariableMapping,
@@ -2945,25 +2946,17 @@ mod tests {
         Parser::parse_sql(&PostgreSqlDialect {}, sql).expect("sql should parse")
     }
 
-    fn parse_query(sql: &str) -> Query {
-        let stmt = parse_statements(sql).remove(0);
-        let Statement::Query(query) = stmt else {
-            panic!("expected query");
-        };
-        *query
-    }
-
-    fn parse_expr(sql: &str) -> Expr {
-        Parser::new(&PostgreSqlDialect {})
-            .try_with_sql(sql)
-            .expect("sql should parse")
-            .parse_expr()
-            .expect("expression should parse")
-    }
-
     fn schema_from_sql(sql: &str) -> ParserDB {
         ParserDB::from_statements(parse_statements(sql), "test".to_string())
             .expect("schema should build")
+    }
+
+    /// The table named `name` in the fixture schema of an RLS policy test.
+    fn policy_table<'a>(schema: &'a ParserDB, name: &str) -> &'a <ParserDB as DatabaseLike>::Table {
+        schema
+            .table_by_target(TargetName::new(name, false), IdentifierCase::AsWritten)
+            .expect("table lookup should succeed")
+            .expect("table should exist")
     }
 
     #[test]
@@ -3055,10 +3048,7 @@ mod tests {
         let schema = schema_from_sql(
             "CREATE TABLE docs(id INTEGER PRIMARY KEY, owner_id INTEGER, title TEXT);",
         );
-        let table = schema
-            .table_by_target(TargetName::new("docs", false), IdentifierCase::AsWritten)
-            .expect("table lookup should succeed")
-            .expect("table should exist");
+        let table = policy_table(&schema, "docs");
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
         let lowercased_columns = resolved_sets(table, &schema);
         let facts = ResolvedSchemaFacts { lowercased_columns: &lowercased_columns };
@@ -3131,10 +3121,7 @@ mod tests {
         let schema = schema_from_sql(
             "CREATE TABLE reports(id INTEGER PRIMARY KEY, tenant TEXT, amount INTEGER, weight INTEGER);",
         );
-        let table = schema
-            .table_by_target(TargetName::new("reports", false), IdentifierCase::AsWritten)
-            .expect("table lookup should succeed")
-            .expect("table should exist");
+        let table = policy_table(&schema, "reports");
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
         let lowercased_columns = resolved_sets(table, &schema);
         let facts = ResolvedSchemaFacts { lowercased_columns: &lowercased_columns };
@@ -3176,10 +3163,7 @@ mod tests {
             CREATE TABLE teams(id INTEGER PRIMARY KEY, owner_id INTEGER);
             "#,
         );
-        let table = schema
-            .table_by_target(TargetName::new("docs", false), IdentifierCase::AsWritten)
-            .expect("table lookup should succeed")
-            .expect("table should exist");
+        let table = policy_table(&schema, "docs");
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
         let lowercased_columns = resolved_sets(table, &schema);
         let facts = ResolvedSchemaFacts { lowercased_columns: &lowercased_columns };
@@ -3275,10 +3259,7 @@ mod tests {
             CREATE POLICY docs_select ON docs FOR SELECT USING (owner_id > 0);
             "#,
         );
-        let table = schema
-            .table_by_target(TargetName::new("docs", false), IdentifierCase::AsWritten)
-            .expect("table lookup should succeed")
-            .expect("table should exist");
+        let table = policy_table(&schema, "docs");
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
         let lowercased_columns = resolved_sets(table, &schema);
         let context = SubqueryTransformContext {
@@ -3322,10 +3303,7 @@ mod tests {
         let schema = schema_from_sql(
             "CREATE TABLE docs(id INTEGER PRIMARY KEY, owner_id INTEGER, body TEXT);",
         );
-        let table = schema
-            .table_by_target(TargetName::new("docs", false), IdentifierCase::AsWritten)
-            .expect("table lookup should succeed")
-            .expect("table should exist");
+        let table = policy_table(&schema, "docs");
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
         let lowercased_columns = resolved_sets(table, &schema);
         let facts = ResolvedSchemaFacts { lowercased_columns: &lowercased_columns };
@@ -3374,10 +3352,7 @@ mod tests {
         let schema = schema_from_sql(
             "CREATE TABLE docs(id INTEGER PRIMARY KEY, owner_id INTEGER, body TEXT);",
         );
-        let table = schema
-            .table_by_target(TargetName::new("docs", false), IdentifierCase::AsWritten)
-            .expect("table lookup should succeed")
-            .expect("table should exist");
+        let table = policy_table(&schema, "docs");
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
         let lowercased_columns = resolved_sets(table, &schema);
         let facts = ResolvedSchemaFacts { lowercased_columns: &lowercased_columns };
@@ -3425,10 +3400,7 @@ mod tests {
             CREATE POLICY docs_select ON docs FOR SELECT USING (owner_id = current_setting('app.user_id')::INT);
             "#,
         );
-        let table = schema
-            .table_by_target(TargetName::new("docs", false), IdentifierCase::AsWritten)
-            .expect("table lookup should succeed")
-            .expect("table should exist");
+        let table = policy_table(&schema, "docs");
 
         let missing = Pg2SqliteOptions::default();
         let err = validate_session_variables(
@@ -3495,10 +3467,7 @@ mod tests {
             CREATE POLICY docs_delete ON docs FOR DELETE USING (owner_id > 0);
             "#,
         );
-        let table = schema
-            .table_by_target(TargetName::new("docs", false), IdentifierCase::AsWritten)
-            .expect("table lookup should succeed")
-            .expect("table should exist");
+        let table = policy_table(&schema, "docs");
         let options = crate::options::TranslationContext::from_owned(
             Pg2SqliteOptions::default()
                 .with_rls_audit_table_name("rls_audit")
@@ -3560,10 +3529,7 @@ mod tests {
             CREATE POLICY docs_delete ON docs FOR DELETE USING (owner_id > 0);
             "#,
         );
-        let table = schema
-            .table_by_target(TargetName::new("docs", false), IdentifierCase::AsWritten)
-            .expect("table lookup should succeed")
-            .expect("table should exist");
+        let table = policy_table(&schema, "docs");
 
         let missing_audit =
             crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());

@@ -273,37 +273,19 @@ fn call_type_name(
 
 #[cfg(test)]
 mod interval_typing {
-    use sql_traits::prelude::ParserDB;
-    use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
+    use crate::impls::test_fixtures::{parse_expr, with_scoped_options};
 
     /// Whether `expr_sql`, typed in the scope of `SELECT iv FROM t`, is an
     /// interval.
     fn interval_typed(expr_sql: &str) -> bool {
-        let schema = ParserDB::parse::<PostgreSqlDialect>(
+        with_scoped_options(
             "CREATE TABLE t (id int, iv interval, iv2 interval);",
+            "SELECT iv FROM t",
+            |schema, scoped| {
+                let expr = parse_expr(expr_sql);
+                crate::impls::expression_type::is_interval_typed(&expr, schema, scoped)
+            },
         )
-        .unwrap();
-        let options = crate::options::TranslationContext::from_owned(
-            crate::prelude::Pg2SqliteOptions::default(),
-        );
-        let query = Parser::new(&PostgreSqlDialect {})
-            .try_with_sql("SELECT iv FROM t")
-            .unwrap()
-            .parse_query()
-            .unwrap();
-        let scope = sql_traits::structs::ColumnScope::from_query(
-            &query,
-            &schema,
-            sql_traits::structs::IdentifierCase::AsWritten,
-        )
-        .unwrap();
-        let scoped = options.with_scope(&scope);
-        let expr = Parser::new(&PostgreSqlDialect {})
-            .try_with_sql(expr_sql)
-            .unwrap()
-            .parse_expr()
-            .unwrap();
-        crate::impls::expression_type::is_interval_typed(&expr, &schema, &scoped)
     }
 
     #[test]

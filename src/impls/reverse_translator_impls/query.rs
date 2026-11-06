@@ -228,36 +228,20 @@ impl ReverseTranslator for Select {
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
-    use sql_traits::structs::ParserDB;
-    use sqlparser::{
-        ast::{Distinct, LimitClause, Offset, Statement},
-        dialect::PostgreSqlDialect,
-        parser::Parser,
-    };
+    use sqlparser::ast::{Distinct, LimitClause};
 
     use super::super::helpers::Reverse;
     use crate::{
-        impls::shared_helpers::{
-            translate_distinct_shared, translate_fetch_clause, translate_limit_clause,
+        impls::{
+            shared_helpers::{
+                translate_distinct_shared, translate_fetch_clause, translate_limit_clause,
+            },
+            test_fixtures::{
+                empty_schema, limit_offset_clause, parse_expr, parse_query, select_mut,
+            },
         },
         prelude::{Pg2SqliteOptions, ReverseTranslator},
     };
-
-    fn empty_schema() -> ParserDB {
-        ParserDB::from_statements(Vec::new(), "test".to_string()).unwrap()
-    }
-
-    fn parse_query(sql: &str) -> sqlparser::ast::Query {
-        let stmt = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap().remove(0);
-        match stmt {
-            Statement::Query(query) => *query,
-            other => panic!("expected query, got: {other:?}"),
-        }
-    }
-
-    fn parse_expr(expr: &str) -> sqlparser::ast::Expr {
-        Parser::new(&PostgreSqlDialect {}).try_with_sql(expr).unwrap().parse_expr().unwrap()
-    }
 
     #[test]
     fn reverse_translate_query_preserves_complex_clauses() {
@@ -289,11 +273,7 @@ mod tests {
         let schema = empty_schema();
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
 
-        let limit_offset = LimitClause::LimitOffset {
-            limit: Some(parse_expr("10")),
-            offset: Some(Offset { value: parse_expr("1"), rows: sqlparser::ast::OffsetRows::None }),
-            limit_by: vec![parse_expr("2")],
-        };
+        let limit_offset = limit_offset_clause();
         let translated =
             translate_limit_clause::<Reverse>(Some(&limit_offset), &schema, &options, &mut |_| {})
                 .unwrap();
@@ -359,9 +339,7 @@ mod tests {
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
 
         let mut query = parse_query("SELECT id FROM users");
-        let sqlparser::ast::SetExpr::Select(select) = query.body.as_mut() else {
-            panic!("expected select");
-        };
+        let select = select_mut(&mut query);
 
         select.prewhere = Some(parse_expr("datetime('now')"));
 
@@ -416,9 +394,7 @@ mod tests {
 
         let refused = |mutate: &dyn Fn(&mut sqlparser::ast::Select), needle: &str| {
             let mut query = parse_query("SELECT id FROM users");
-            let sqlparser::ast::SetExpr::Select(select) = query.body.as_mut() else {
-                panic!("expected select");
-            };
+            let select = select_mut(&mut query);
             mutate(select);
             let err = query
                 .reverse_translate(&schema, &options)
