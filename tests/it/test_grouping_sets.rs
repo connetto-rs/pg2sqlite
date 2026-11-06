@@ -65,12 +65,7 @@ fn grouping_sets_semantic() -> Result<(), Box<dyn std::error::Error>> {
     let options = Pg2SqliteOptions::default();
     let stmts = helpers::translate_pg(&sql, &options).unwrap();
     let query = helpers::user_statement_of(&stmts, "SELECT").clone();
-    let mut conn = SqliteConnection::establish(":memory:")?;
-    // Dynamically-generated DDL; the table schema is ephemeral and has no
-    // table! macro.
-    for s in stmts.iter().filter(|s| !helpers::is_user_statement(s, "SELECT")) {
-        diesel::sql_query(s.as_str()).execute(&mut conn)?;
-    }
+    let mut conn = helpers::apply_ddl(&stmts);
     load_sales_data(&mut conn)?;
 
     let mut rows = diesel::sql_query(query).load::<AggregateRow>(&mut conn)?;
@@ -113,12 +108,7 @@ fn rollup_semantic() -> Result<(), Box<dyn std::error::Error>> {
     let options = Pg2SqliteOptions::default();
     let stmts = helpers::translate_pg(&sql, &options).unwrap();
     let query = helpers::user_statement_of(&stmts, "SELECT").clone();
-    let mut conn = SqliteConnection::establish(":memory:")?;
-    // Dynamically-generated DDL; the table schema is ephemeral and has no
-    // table! macro.
-    for s in stmts.iter().filter(|s| !helpers::is_user_statement(s, "SELECT")) {
-        diesel::sql_query(s.as_str()).execute(&mut conn)?;
-    }
+    let mut conn = helpers::apply_ddl(&stmts);
     load_sales_data(&mut conn)?;
 
     let mut rows = diesel::sql_query(query).load::<AggregateRow>(&mut conn)?;
@@ -161,12 +151,7 @@ fn cube_semantic() -> Result<(), Box<dyn std::error::Error>> {
     let options = Pg2SqliteOptions::default();
     let stmts = helpers::translate_pg(&sql, &options).unwrap();
     let query = helpers::user_statement_of(&stmts, "SELECT").clone();
-    let mut conn = SqliteConnection::establish(":memory:")?;
-    // Dynamically-generated DDL; the table schema is ephemeral and has no
-    // table! macro.
-    for s in stmts.iter().filter(|s| !helpers::is_user_statement(s, "SELECT")) {
-        diesel::sql_query(s.as_str()).execute(&mut conn)?;
-    }
+    let mut conn = helpers::apply_ddl(&stmts);
     load_sales_data(&mut conn)?;
 
     let mut rows = diesel::sql_query(query).load::<AggregateRow>(&mut conn)?;
@@ -211,12 +196,7 @@ fn rollup_with_prefix_group_key_semantic() -> Result<(), Box<dyn std::error::Err
     let options = Pg2SqliteOptions::default();
     let stmts = helpers::translate_pg(&sql, &options).unwrap();
     let query = helpers::user_statement_of(&stmts, "SELECT").clone();
-    let mut conn = SqliteConnection::establish(":memory:")?;
-    // Dynamically-generated DDL; the table schema is ephemeral and has no
-    // table! macro.
-    for s in stmts.iter().filter(|s| !helpers::is_user_statement(s, "SELECT")) {
-        diesel::sql_query(s.as_str()).execute(&mut conn)?;
-    }
+    let mut conn = helpers::apply_ddl(&stmts);
     load_sales_data(&mut conn)?;
 
     let mut rows = diesel::sql_query(query).load::<AggregateRow>(&mut conn)?;

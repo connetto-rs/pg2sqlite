@@ -6,6 +6,7 @@ use helpers::establish_connection;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use postgres_harness::Outcome;
 
+use super::harness::execute_ddl;
 use crate::{helpers, helpers::postgres as postgres_harness};
 
 const SOURCE: &str = "
@@ -170,15 +171,6 @@ fn migrate_sqlite(connection: &mut SqliteConnection) {
         .expect("translate the migration")
         .into_vec();
     execute_ddl(connection, &translated);
-}
-
-fn execute_ddl(connection: &mut SqliteConnection, statements: &[sqlparser::ast::Statement]) {
-    for statement in statements {
-        // Translated DDL, which the query DSL cannot express.
-        diesel::sql_query(statement.to_string())
-            .execute(connection)
-            .unwrap_or_else(|error| panic!("SQLite refused {statement}: {error}"));
-    }
 }
 
 runner!(PgRunner, PgConnection, migrate_postgres);

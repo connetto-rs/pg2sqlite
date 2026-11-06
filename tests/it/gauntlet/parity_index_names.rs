@@ -4,6 +4,7 @@ use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
 use helpers::establish_connection;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
+use super::harness::execute_ddl;
 use crate::{helpers, helpers::postgres as postgres_harness};
 
 const SOURCE: &str = r#"
@@ -96,15 +97,6 @@ fn sqlite_names(connection: &mut SqliteConnection) -> Vec<String> {
         .order(sqlite_master::name)
         .load(connection)
         .expect("read sqlite_master")
-}
-
-fn execute_ddl(connection: &mut SqliteConnection, statements: &[sqlparser::ast::Statement]) {
-    for statement in statements {
-        // Translated DDL, which the query DSL cannot express.
-        diesel::sql_query(statement.to_string())
-            .execute(connection)
-            .unwrap_or_else(|error| panic!("SQLite refused {statement}: {error}"));
-    }
 }
 
 fn options() -> Pg2SqliteOptions {

@@ -9,6 +9,7 @@ mod helpers;
 #[path = "../../examples/web-playground/src/sample_sql.rs"]
 mod sample_sql;
 
+mod support;
 mod test_aggregate_ordered_set;
 mod test_aggregate_window_fixes;
 mod test_alter_table_columns;

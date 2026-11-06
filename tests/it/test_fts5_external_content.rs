@@ -5,43 +5,24 @@
 use diesel::{Connection, RunQueryDsl, SqliteConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
+use crate::{helpers, support::fts5::DOCS_SQL};
+
 #[test]
 fn test_fts5_uses_external_content_mode() -> Result<(), Box<dyn std::error::Error>> {
-    let sql = "
-        CREATE TABLE docs (id INT PRIMARY KEY, body TEXT);
-        CREATE INDEX docs_fts ON docs USING GIN (to_tsvector('english', body));
-    ";
-    let translated =
-        Pg2Sqlite::default().sql(sql)?.translate(&Pg2SqliteOptions::default())?.into_vec();
-    let out = translated.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("\n");
+    let out = helpers::translate_default_joined(DOCS_SQL)?;
 
     // Must use external content mode
     assert!(out.contains("content="), "FTS5 must use content= (external content mode), got: {out}");
     assert!(out.contains("content_rowid="), "FTS5 must specify content_rowid=, got: {out}");
 
     // Execute all translated statements to verify the output is valid SQLite.
-    {
-        let conn = rusqlite::Connection::open_in_memory()?;
-        for stmt in &translated {
-            conn.execute_batch(&format!("{stmt};"))?;
-        }
-    }
+    helpers::apply_default(DOCS_SQL)?;
     Ok(())
 }
 
 #[test]
 fn test_fts5_external_content_search_works() -> Result<(), Box<dyn std::error::Error>> {
-    let sql = "
-        CREATE TABLE docs (id INT PRIMARY KEY, body TEXT);
-        CREATE INDEX docs_fts ON docs USING GIN (to_tsvector('english', body));
-    ";
-    let translated =
-        Pg2Sqlite::default().sql(sql)?.translate(&Pg2SqliteOptions::default())?.into_vec();
-    let mut conn = SqliteConnection::establish(":memory:")?;
-
-    for stmt in &translated {
-        diesel::sql_query(stmt.to_string()).execute(&mut conn)?;
-    }
+    let mut conn = helpers::apply_default(DOCS_SQL)?;
 
     // Insert rows — sync triggers should populate the FTS index
     diesel::sql_query("INSERT INTO docs VALUES (1, 'hello world')").execute(&mut conn)?;
@@ -88,13 +69,7 @@ fn test_fts5_external_content_search_works() -> Result<(), Box<dyn std::error::E
 
 #[test]
 fn test_fts5_backfill_insert_is_generated() -> Result<(), Box<dyn std::error::Error>> {
-    let sql = "
-        CREATE TABLE docs (id INT PRIMARY KEY, body TEXT);
-        CREATE INDEX docs_fts ON docs USING GIN (to_tsvector('english', body));
-    ";
-    let translated =
-        Pg2Sqlite::default().sql(sql)?.translate(&Pg2SqliteOptions::default())?.into_vec();
-    let out = translated.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("\n");
+    let out = helpers::translate_default_joined(DOCS_SQL)?;
 
     // A backfill INSERT must be present after the triggers so pre-existing
     // rows are searchable immediately after index creation.
@@ -103,23 +78,14 @@ fn test_fts5_backfill_insert_is_generated() -> Result<(), Box<dyn std::error::Er
         "Expected backfill INSERT ... SELECT: {out}"
     );
     // Execute all translated statements to verify the output is valid SQLite.
-    {
-        let conn = rusqlite::Connection::open_in_memory()?;
-        for stmt in &translated {
-            conn.execute_batch(&format!("{stmt};"))?;
-        }
-    }
+    helpers::apply_default(DOCS_SQL)?;
     Ok(())
 }
 
 #[test]
 fn test_fts5_backfill_populates_preexisting_rows() -> Result<(), Box<dyn std::error::Error>> {
-    let sql = "
-        CREATE TABLE docs (id INT PRIMARY KEY, body TEXT);
-        CREATE INDEX docs_fts ON docs USING GIN (to_tsvector('english', body));
-    ";
     let translated =
-        Pg2Sqlite::default().sql(sql)?.translate(&Pg2SqliteOptions::default())?.into_vec();
+        Pg2Sqlite::default().sql(DOCS_SQL)?.translate(&Pg2SqliteOptions::default())?.into_vec();
     let mut conn = SqliteConnection::establish(":memory:")?;
 
     // Create the table FIRST, insert rows BEFORE creating the FTS index, then
@@ -166,9 +132,7 @@ fn test_fts5_partial_index_generates_when_clause_in_triggers()
         CREATE INDEX articles_fts ON articles USING GIN (to_tsvector('english', body))
             WHERE published = true;
     ";
-    let translated =
-        Pg2Sqlite::default().sql(sql)?.translate(&Pg2SqliteOptions::default())?.into_vec();
-    let out = translated.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("\n");
+    let out = helpers::translate_default_joined(sql)?;
 
     // Four sync triggers carry the predicate: insert, delete, and the two
     // halves of update (a row can cross the predicate boundary, so the
@@ -198,11 +162,6 @@ fn test_fts5_partial_index_generates_when_clause_in_triggers()
     );
 
     // Execute all translated statements to verify the output is valid SQLite.
-    {
-        let conn = rusqlite::Connection::open_in_memory()?;
-        for stmt in &translated {
-            conn.execute_batch(&format!("{stmt};"))?;
-        }
-    }
+    helpers::apply_default(sql)?;
     Ok(())
 }
