@@ -242,6 +242,7 @@ mod test_rls_null_policy_predicate;
 mod test_rls_numeric_check_guard;
 mod test_rls_on_conflict;
 mod test_rls_policy_expr_rewrite;
+mod test_rls_policy_literals;
 mod test_rls_policy_translation;
 mod test_rls_public_access;
 mod test_rls_read_deny_by_default;

@@ -951,7 +951,9 @@ impl Pg2SqliteOptions {
     /// from, and every session setting a statement reads: its type, how a set
     /// is packed, the fields of a JSON document and whether a request may
     /// leave it unset. A statement reading a setting or a role is refused
-    /// without one.
+    /// without one. Its server zone, from
+    /// [`Deployment::with_default_time_zone`], is the zone the session running
+    /// the schema starts in, which reads a `timestamptz` literal of a policy.
     pub fn with_deployment(mut self, deployment: Deployment) -> Self {
         self.deployment = Some(deployment);
         self
