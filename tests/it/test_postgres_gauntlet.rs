@@ -61,5 +61,8 @@ mod parity_json_values;
 #[path = "gauntlet/parity_deployment.rs"]
 mod parity_deployment;
 
+#[path = "gauntlet/parity_timestamptz_zone.rs"]
+mod parity_timestamptz_zone;
+
 #[path = "gauntlet/parity_privileges.rs"]
 mod parity_privileges;

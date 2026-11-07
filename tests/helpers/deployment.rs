@@ -1,5 +1,6 @@
 //! Deployments the tests translate against.
 
+use pg2sqlite::prelude::Pg2SqliteOptions;
 use sql_traits::structs::{Deployment, SessionSetting, SetPacking, SettingValue};
 use sqlparser::{ast::DataType, dialect::PostgreSqlDialect, parser::Parser};
 
@@ -71,4 +72,23 @@ pub fn deployment<'a>(
         acting.push("app");
     }
     Deployment::new(acting[0], acting, settings).expect("a valid deployment")
+}
+
+/// The role [`utc_request`] logs in as, declared ahead of the script it
+/// translates.
+pub const UTC_REQUEST_ROLE: &str = "CREATE ROLE app;";
+
+/// Options for a request logging in as `app` on a server whose `TimeZone` is
+/// UTC, the zone a test measured PostgreSQL in, so that the months and days
+/// of an interval reach a `timestamptz` on the UTC calendar. The script names
+/// the role with [`UTC_REQUEST_ROLE`].
+///
+/// # Panics
+///
+/// Never, since UTC is a zone PostgreSQL accepts.
+#[must_use]
+pub fn utc_request() -> Pg2SqliteOptions {
+    let deployment =
+        deployment([], []).with_default_time_zone("UTC").expect("PostgreSQL accepts UTC");
+    Pg2SqliteOptions::default().with_deployment(deployment)
 }

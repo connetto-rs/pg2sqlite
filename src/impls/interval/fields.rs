@@ -34,7 +34,8 @@ use crate::{
         shared_helpers::{declared_type_matches, numeric_scale},
         temporal_arithmetic::{TemporalKind, temporal_kind_of},
         translator_impls::expr::{
-            shifted_by_modifiers, shifted_interval_target, shifted_time_of_day,
+            ZonedCalendar, shifted_by_modifiers, shifted_interval_target, shifted_time_of_day,
+            zoned_calendar, zoned_shift_call,
         },
     },
     options::TranslationContext,
@@ -320,7 +321,32 @@ fn shifted_target(
     if !options.allows_subqueries() {
         return Err(no_subquery_refusal());
     }
+    let operation = format!("{left} {op} {right}");
+    let calendar = zoned_calendar(target, Some(kind), true, &operation, schema, options)?;
     let translated_target = target.translate_with_warnings(schema, options, emit)?;
+    let body = field_shift_body(kind, calendar, negate);
+    // `printf` reads a NULL field as zero, so a NULL interval answers NULL
+    // before the modifiers see it.
+    let template = format!(
+        "(SELECT CASE WHEN fr.m IS NULL OR fr.d IS NULL OR fr.u IS NULL THEN NULL \
+         ELSE {SHIFT_BODY} END FROM (SELECT {SHIFT_TARGET} AS tg) AS tv, {} AS fr)",
+        field_sub(fields_templates::PLACEHOLDER)
+    );
+    substitute(
+        &[
+            (fields_templates::PLACEHOLDER, operand.as_ref()),
+            (SHIFT_TARGET, &translated_target),
+            (SHIFT_BODY, &body),
+        ],
+        &template,
+    )
+    .map(Some)
+}
+
+/// The shifted value of `tv.tg`, of temporal type `kind`, by the interval
+/// fields `fr.m`, `fr.d` and `fr.u`, subtracted when `negate`, on
+/// `calendar`.
+fn field_shift_body(kind: TemporalKind, calendar: ZonedCalendar<'_>, negate: bool) -> Expr {
     let field = |name: &str| Expr::CompoundIdentifier(vec![Ident::new("fr"), Ident::new(name)]);
     let signed = |expr: Expr| {
         if negate {
@@ -336,7 +362,7 @@ fn shifted_target(
         simple_function_expr("printf", vec![string_literal(format), signed(value)], None)
     };
     let target_ref = Expr::CompoundIdentifier(vec![Ident::new("tv"), Ident::new("tg")]);
-    let body = if let TemporalKind::Time { zoned } = kind {
+    if let TemporalKind::Time { zoned } = kind {
         // `time_pl_interval` adds the time field alone in 64 bits, which wrap
         // past the bound, takes the whole days off, and ignores the months
         // and days. `signed` negates a subtracted clock's modifiers.
@@ -365,39 +391,45 @@ fn shifted_target(
         };
         shifted_time_of_day(target_ref, &clock, zoned)
     } else {
-        let fraction = binary(
-            binary(field("u"), BinaryOperator::Modulo, integer_literal(1_000_000)),
-            BinaryOperator::Divide,
-            number_literal("1000000.0"),
-        );
-        let modifiers = vec![
-            printf("%+d months", field("m")),
-            string_literal("floor"),
-            printf("%+d days", field("d")),
-            printf(
-                "%+d seconds",
-                binary(field("u"), BinaryOperator::Divide, integer_literal(1_000_000)),
-            ),
-            printf("%+.6f seconds", fraction),
-        ];
-        shifted_by_modifiers(target_ref, &modifiers)
-    };
-    // `printf` reads a NULL field as zero, so a NULL interval answers NULL
-    // before the modifiers see it.
-    let template = format!(
-        "(SELECT CASE WHEN fr.m IS NULL OR fr.d IS NULL OR fr.u IS NULL THEN NULL \
-         ELSE {SHIFT_BODY} END FROM (SELECT {SHIFT_TARGET} AS tg) AS tv, {} AS fr)",
-        field_sub(fields_templates::PLACEHOLDER)
-    );
-    substitute(
-        &[
-            (fields_templates::PLACEHOLDER, operand.as_ref()),
-            (SHIFT_TARGET, &translated_target),
-            (SHIFT_BODY, &body),
-        ],
-        &template,
-    )
-    .map(Some)
+        match calendar {
+            ZonedCalendar::Clock(offset) => {
+                let fraction = binary(
+                    binary(field("u"), BinaryOperator::Modulo, integer_literal(1_000_000)),
+                    BinaryOperator::Divide,
+                    number_literal("1000000.0"),
+                );
+                let on_clock = |seconds: i32| {
+                    (offset != 0)
+                        .then(|| string_literal(&format!("{:+} seconds", i64::from(seconds))))
+                };
+                let modifiers: Vec<Expr> = on_clock(offset)
+                    .into_iter()
+                    .chain([
+                        printf("%+d months", field("m")),
+                        string_literal("floor"),
+                        printf("%+d days", field("d")),
+                    ])
+                    .chain(on_clock(-offset))
+                    .chain([
+                        printf(
+                            "%+d seconds",
+                            binary(field("u"), BinaryOperator::Divide, integer_literal(1_000_000)),
+                        ),
+                        printf("%+.6f seconds", fraction),
+                    ])
+                    .collect();
+                shifted_by_modifiers(target_ref, &modifiers)
+            }
+            ZonedCalendar::Function { function, zone } => {
+                zoned_shift_call(
+                    function,
+                    target_ref,
+                    [signed(field("m")), signed(field("d")), signed(field("u"))],
+                    zone,
+                )
+            }
+        }
+    }
 }
 
 /// The rendered text of `left` added to or subtracted from `right`,

@@ -260,7 +260,10 @@ fn conversion_of(
         _ => {
             if let Some(scale) = numeric_scale(expr, schema, options)?.filter(|scale| *scale > 0) {
                 Conversion::Stored(Stored::MinorUnits(scale))
-            } else if temporal_kind(expr, schema, options)? == Some(TemporalKind::Timestamp) {
+            } else if matches!(
+                temporal_kind(expr, schema, options)?,
+                Some(TemporalKind::Timestamp | TemporalKind::TimestampTz)
+            ) {
                 Conversion::Stored(Stored::Timestamp)
             } else {
                 Conversion::Stored(Stored::Native)
