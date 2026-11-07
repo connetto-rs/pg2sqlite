@@ -31,13 +31,14 @@ use super::{
 use crate::no_std::prelude::*;
 use crate::{errors::Error, prelude::ReverseTranslator, traits::translator::TranslatorWithContext};
 
-/// The temporal type of an operand, as far as it resolves without
-/// PostgreSQL's own type resolver.
+/// The temporal type of an operand, as far as the statement settles it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TemporalKind {
     Date,
-    /// `timestamp` and `timestamptz` alike: nothing here separates them.
+    /// `timestamp`, without a zone.
     Timestamp,
+    /// `timestamptz`, an instant whose calendar is the request's zone.
+    TimestampTz,
     /// `time` and `timetz`.
     Time {
         /// Whether a UTC offset follows the time of day.
@@ -45,8 +46,9 @@ pub(crate) enum TemporalKind {
     },
 }
 
-/// Resolve the temporal type of `expr` from its own spelling or from the
-/// declared type of the column it names.
+/// Resolve the temporal type of `expr` from its own spelling, from the
+/// declared type of the column it names, or from the type the statement
+/// settles for it.
 #[cfg_attr(feature = "std", recursive::recursive)]
 pub(crate) fn temporal_kind(
     expr: &Expr,
@@ -57,12 +59,23 @@ pub(crate) fn temporal_kind(
         Expr::Nested(inner) => temporal_kind(inner, schema, options)?,
         Expr::TypedString(typed) => kind_of_data_type(&typed.data_type),
         Expr::Cast { data_type, .. } => kind_of_data_type(data_type),
-        // Either operation answers a timestamp, aware or naive.
-        Expr::AtTimeZone { .. } => Some(TemporalKind::Timestamp),
-        Expr::Function(function) => {
-            match crate::impls::object_name::last_ident(&function.name) {
-                Some(name) => kind_of_nullary(&name.value),
+        // `AT TIME ZONE` turns an instant into a wall clock and back.
+        Expr::AtTimeZone { timestamp, .. } => {
+            match temporal_kind(timestamp, schema, options)? {
+                Some(TemporalKind::TimestampTz) => Some(TemporalKind::Timestamp),
+                Some(TemporalKind::Date | TemporalKind::Timestamp) => {
+                    Some(TemporalKind::TimestampTz)
+                }
+                Some(TemporalKind::Time { .. }) => Some(TemporalKind::Time { zoned: true }),
                 None => None,
+            }
+        }
+        Expr::Function(function) => {
+            match crate::impls::object_name::last_ident(&function.name)
+                .and_then(|name| kind_of_nullary(&name.value))
+            {
+                Some(kind) => Some(kind),
+                None => settled_kind(expr, schema, options),
             }
         }
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
@@ -77,8 +90,28 @@ pub(crate) fn temporal_kind(
         // A rewritten subexpression is an operand in its own right, so
         // `(d + 7) - d` resolves.
         Expr::BinaryOp { left, op, right } => binary_result_kind(left, op, right, schema, options)?,
-        _ => None,
+        // A `CASE` or a scalar subquery takes the type the statement settles
+        // for it.
+        _ => settled_kind(expr, schema, options),
     })
+}
+
+/// The temporal type the statement settles for a call, a `CASE` or a scalar
+/// subquery, as [`type_name`](crate::impls::expression_type::type_name)
+/// reads it.
+///
+/// A type the statement cannot settle answers no type, so the expression's
+/// own translation raises the refusal it earns.
+fn settled_kind(
+    expr: &Expr,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Option<TemporalKind> {
+    crate::impls::expression_type::type_name(expr, schema, options)
+        .ok()
+        .flatten()
+        .and_then(|name| crate::impls::expression_type::parse_type_name(&name))
+        .and_then(|data_type| kind_of_data_type(&data_type))
 }
 
 /// The temporal type of `expr`, with a reference this cannot resolve
@@ -101,6 +134,9 @@ pub(crate) fn temporal_kind_of(
 fn kind_of_data_type(data_type: &DataType) -> Option<TemporalKind> {
     match data_type {
         DataType::Date => Some(TemporalKind::Date),
+        DataType::Timestamp(_, TimezoneInfo::Tz | TimezoneInfo::WithTimeZone) => {
+            Some(TemporalKind::TimestampTz)
+        }
         DataType::Timestamp(_, _) | DataType::Datetime(_) => Some(TemporalKind::Timestamp),
         DataType::Time(_, info) => {
             Some(TemporalKind::Time {
@@ -117,10 +153,10 @@ fn kind_of_nullary(name: &str) -> Option<TemporalKind> {
         "current_date" => Some(TemporalKind::Date),
         "now"
         | "current_timestamp"
-        | "localtimestamp"
         | "transaction_timestamp"
         | "statement_timestamp"
-        | "clock_timestamp" => Some(TemporalKind::Timestamp),
+        | "clock_timestamp" => Some(TemporalKind::TimestampTz),
+        "localtimestamp" => Some(TemporalKind::Timestamp),
         "current_time" | "localtime" => Some(TemporalKind::Time { zoned: false }),
         _ => None,
     }
@@ -161,11 +197,11 @@ fn binary_result_kind(
         (None, Some(TemporalKind::Date)) if matches!(op, BinaryOperator::Plus) && left_integral => {
             Some(TemporalKind::Date)
         }
-        (Some(TemporalKind::Date), Some(TemporalKind::Time { .. }))
-        | (Some(TemporalKind::Time { .. }), Some(TemporalKind::Date))
+        (Some(TemporalKind::Date), Some(TemporalKind::Time { zoned }))
+        | (Some(TemporalKind::Time { zoned }), Some(TemporalKind::Date))
             if matches!(op, BinaryOperator::Plus) =>
         {
-            Some(TemporalKind::Timestamp)
+            Some(if zoned { TemporalKind::TimestampTz } else { TemporalKind::Timestamp })
         }
         _ => None,
     })

@@ -16,6 +16,7 @@ pub(crate) mod privileges;
 pub(crate) mod query_builder;
 pub(crate) mod relation_scope;
 pub(crate) mod replay;
+pub(crate) mod request_zone;
 pub(crate) mod returning_scope;
 pub(crate) mod reverse_translator_impls;
 pub(crate) mod scoped_relations;

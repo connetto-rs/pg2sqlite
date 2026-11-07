@@ -54,7 +54,7 @@ What the engines still answer differently.
 - **Case and collation.** SQLite folds and compares ASCII byte-wise. `ILIKE` with a non-ASCII pattern is refused unless `with_ilike_fold_function` names a Unicode-aware fold.
 - **Quiet answers.** Division by zero, a bad `CAST`, integer overflow, out-of-range dates and interval overflow give `NULL` or a float where PostgreSQL raises. `NUMERIC(p,s)` is the exception and fails on overflow.
 - **Stored representations.** `translation_manifest` reports how each column is stored when that differs from what PostgreSQL returns.
-- **Time.** Timestamps keep milliseconds, `timestamptz` is stored as UTC text, and a bound parameter is stored as bound. Interval columns behave as in PostgreSQL, apart from the operations that are refused.
+- **Time.** Timestamps keep milliseconds, `timestamptz` is stored as UTC text with its calendar arithmetic in the request's zone, and a bound parameter is stored as bound. Interval columns behave as in PostgreSQL, apart from the operations that are refused.
 - **Transactions.** A failing statement leaves a SQLite transaction open, so roll back yourself.
 - **Compound `SELECT`.** SQLite types each value, so `SELECT 1 UNION SELECT '1'` returns two rows.
 - **Generated keys.** `SERIAL` and `IDENTITY` become `AUTOINCREMENT`, whose counter moves on a supplied value and does not move on a rollback.

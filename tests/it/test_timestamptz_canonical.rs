@@ -6,7 +6,7 @@
 //! translation emits into a `timestamptz` column produces that one form.
 
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use run_translated_helper::run_translated_with;
+use run_translated_helper::{run_translated_utc, run_translated_with};
 
 use crate::helpers::run_translated as run_translated_helper;
 
@@ -84,7 +84,7 @@ fn a_computed_timestamptz_is_written_canonical() {
         ("naive AT TIME ZONE 'UTC'", "2026-09-23 13:42:07.500000+00:00"),
     ] {
         assert_eq!(
-            rows(&format!(
+            run_translated_utc(&format!(
                 "CREATE TABLE t (id int PRIMARY KEY, at timestamptz, naive timestamp);
                  INSERT INTO t (id, at, naive)
                      VALUES (1, '2026-09-23 13:42:07+00', '2026-09-23 13:42:07.5');

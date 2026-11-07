@@ -63,10 +63,17 @@ impl IntervalShift {
         }
     }
 
-    /// The SQLite date modifiers, in PostgreSQL's order of operations.
-    pub(crate) fn modifiers(&self) -> Result<Vec<String>, Error> {
+    /// The SQLite date modifiers of `timestamp_pl_interval`, in PostgreSQL's
+    /// order of operations, with the months and days counted on the clock
+    /// `offset` seconds east of UTC, as `timestamptz_pl_interval` counts them
+    /// in a zone of one fixed offset, and the time added to the instant.
+    pub(crate) fn modifiers_on_clock(&self, offset: i32) -> Result<Vec<String>, Error> {
         let interval = self.signed()?;
         let mut modifiers = Vec::new();
+        let calendar = interval.months != 0 || interval.days != 0;
+        if calendar && offset != 0 {
+            modifiers.push(signed(i64::from(offset), "seconds"));
+        }
         if interval.months != 0 {
             modifiers.push(signed(i64::from(interval.months), "months"));
             // The days below land on the clamped date, so the clamp sits here.
@@ -75,10 +82,26 @@ impl IntervalShift {
         if interval.days != 0 {
             modifiers.push(signed(i64::from(interval.days), "days"));
         }
+        if calendar && offset != 0 {
+            modifiers.push(signed(-i64::from(offset), "seconds"));
+        }
         if interval.microseconds != 0 {
             modifiers.push(time_modifier(interval.microseconds));
         }
         Ok(modifiers)
+    }
+
+    /// Whether the interval has months or days, which PostgreSQL counts on a
+    /// calendar rather than adding to the instant.
+    pub(crate) const fn moves_calendar(&self) -> bool {
+        self.interval.months != 0 || self.interval.days != 0
+    }
+
+    /// The months, days and microseconds `timestamp_pl_interval` adds,
+    /// negated for a subtraction.
+    pub(crate) fn signed_fields(&self) -> Result<(i32, i32, i64), Error> {
+        let interval = self.signed()?;
+        Ok((interval.months, interval.days, interval.microseconds))
     }
 
     /// The shift `time_pl_interval` or `time_mi_interval` applies to a time

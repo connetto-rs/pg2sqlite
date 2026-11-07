@@ -67,6 +67,19 @@ pub fn run_translated_bound_with(
         .expect("probe rows should decode")
 }
 
+/// [`run_translated_with`] for a request whose `TimeZone` is UTC, `pg` led by
+/// the role [`utc_request`](super::deployment::utc_request) logs in as.
+///
+/// # Panics
+///
+/// As [`run_translated_with`].
+pub fn run_translated_utc(pg: &str) -> Vec<Option<String>> {
+    run_translated_with(
+        &format!("{}{pg}", super::deployment::UTC_REQUEST_ROLE),
+        &super::deployment::utc_request(),
+    )
+}
+
 /// The first column of `row` as text, `None` for SQL NULL.
 ///
 /// # Errors

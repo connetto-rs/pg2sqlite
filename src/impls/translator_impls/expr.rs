@@ -41,6 +41,7 @@ use crate::{
             from_relation, plain_table_factor, single_expr_query, table_function_factor,
         },
         replay::{is_replayable, reject_duplicated_operand},
+        request_zone::RequestZone,
         session_variable,
         shared_helpers::{
             declared_in_scope, declared_numeric_precision, declared_type_matches,
@@ -2945,19 +2946,134 @@ pub(crate) fn shifted_interval_target(
         let target = left.translate_with_warnings(schema, options, emit)?;
         return Ok(shifted_time_of_day(target, &clock, zoned));
     }
+    // PostgreSQL refuses the interval's negation and a year past its range
+    // in every zone, so those refusals come before the zone's.
+    let (months, days, microseconds) = shift.signed_fields()?;
+    let operation = format!("{left} {op} {right}");
     let target = left.translate_with_warnings(schema, options, emit)?;
-    let modifiers: Vec<Expr> =
-        shift.modifiers()?.iter().map(|modifier| string_literal(modifier)).collect();
     if let Some(literal) = single_quoted_literal(&target)
         && let Some(year) = shift.year_after(literal)
         && !(1..=9999).contains(&year)
     {
         return Err(crate::impls::temporal_literals::arithmetic_outside_four_digit_years(
-            &format!("{left} {op} {right}"),
-            year,
+            &operation, year,
         ));
     }
-    Ok(shifted_by_modifiers(target, &modifiers))
+    let calendar = zoned_calendar(left, kind, shift.moves_calendar(), &operation, schema, options)?;
+    Ok(match calendar {
+        ZonedCalendar::Clock(offset) => {
+            let modifiers: Vec<Expr> = shift
+                .modifiers_on_clock(offset)?
+                .iter()
+                .map(|modifier| string_literal(modifier))
+                .collect();
+            shifted_by_modifiers(target, &modifiers)
+        }
+        ZonedCalendar::Function { function, zone } => {
+            zoned_shift_call(
+                function,
+                target,
+                [
+                    integer_literal(i64::from(months)),
+                    integer_literal(i64::from(days)),
+                    integer_literal(microseconds),
+                ],
+                zone,
+            )
+        }
+    })
+}
+
+/// How the months and days of an interval reach a date or timestamp.
+#[derive(Clone, Copy)]
+pub(crate) enum ZonedCalendar<'o> {
+    /// SQLite's date modifiers on the clock this many seconds east of UTC,
+    /// zero for a date, a `timestamp`, and a `timestamptz` in UTC.
+    Clock(i32),
+    /// The registered function, in a zone whose UTC offset changes.
+    Function {
+        /// The function's name.
+        function: &'o str,
+        /// The zone's name.
+        zone: &'o str,
+    },
+}
+
+/// The calendar PostgreSQL adds the months and days of an interval to
+/// `target` on, `kind` being its temporal type and `operation` the arithmetic
+/// as written.
+///
+/// A `timestamptz` counts them on the request's zone, and so does an operand
+/// whose type is not settled, which could be one. An interval without months
+/// or days moves the instant alike in every zone.
+///
+/// # Errors
+///
+/// Refuses a zone that does not resolve, a zone whose offset changes when no
+/// function is registered for it, and an operand whose type is not settled
+/// outside UTC.
+pub(crate) fn zoned_calendar<'o>(
+    target: &Expr,
+    kind: Option<TemporalKind>,
+    moves_calendar: bool,
+    operation: &str,
+    schema: &ParserDB,
+    options: &'o crate::options::TranslationContext<'_>,
+) -> Result<ZonedCalendar<'o>, crate::errors::Error> {
+    let settled = match kind {
+        _ if !moves_calendar => return Ok(ZonedCalendar::Clock(0)),
+        Some(TemporalKind::Date | TemporalKind::Timestamp | TemporalKind::Time { .. }) => {
+            return Ok(ZonedCalendar::Clock(0));
+        }
+        Some(TemporalKind::TimestampTz) => true,
+        None => false,
+    };
+    let zone = match options.request_zone(schema) {
+        Ok(RequestZone::Fixed(0)) => return Ok(ZonedCalendar::Clock(0)),
+        Ok(zone) if settled => zone,
+        Err(unavailable) if settled => return Err(unavailable.refusal(operation)),
+        Ok(_) | Err(_) => {
+            return Err(crate::errors::Error::forward_refusal(format!(
+                "`{operation}` adds days or months to an operand whose type this translation \
+                 cannot settle. PostgreSQL counts them on the calendar of the request's TimeZone \
+                 for a timestamptz and on a calendar of no zone for a timestamp, and outside UTC \
+                 the two answers differ. Cast the operand, as `{target}::timestamptz` or \
+                 `{target}::timestamp`, to say which it is."
+            )));
+        }
+    };
+    match zone {
+        RequestZone::Fixed(offset) => Ok(ZonedCalendar::Clock(*offset)),
+        RequestZone::Changing(zone) => {
+            match options.get_timestamptz_interval_function_name() {
+                Some(function) => Ok(ZonedCalendar::Function { function, zone }),
+                None => {
+                    Err(crate::errors::Error::forward_refusal(format!(
+                        "`{operation}` adds days or months on the calendar of the request's \
+                         TimeZone '{zone}', whose UTC offset changes, and SQLite's date \
+                         modifiers know no zone. Register a SQLite function answering \
+                         PostgreSQL's timestamptz_pl_interval in a zone, and name it with \
+                         `with_timestamptz_interval_function_name(...)`."
+                    )))
+                }
+            }
+        }
+    }
+}
+
+/// `function(target, months, days, microseconds, 'zone')`, the registered
+/// shift of a `timestamptz` in a zone whose UTC offset changes.
+pub(crate) fn zoned_shift_call(
+    function: &str,
+    target: Expr,
+    [months, days, microseconds]: [Expr; 3],
+    zone: &str,
+) -> Expr {
+    simple_function_expr(
+        function,
+        vec![target, months, days, microseconds, string_literal(zone)],
+        None,
+    )
 }
 
 /// The display spelling of a comparison operator, in PostgreSQL's spelling.
@@ -3852,8 +3968,11 @@ fn translate_binary_op(
         let rk = temporal_kind_of(right, schema, options);
         if matches!(
             (lk, rk),
-            (Some(TemporalKind::Date), Some(TemporalKind::Timestamp))
-                | (Some(TemporalKind::Timestamp), Some(TemporalKind::Date))
+            (Some(TemporalKind::Date), Some(TemporalKind::Timestamp | TemporalKind::TimestampTz))
+                | (
+                    Some(TemporalKind::Timestamp | TemporalKind::TimestampTz),
+                    Some(TemporalKind::Date)
+                )
         ) {
             let tl = left.translate_with_warnings(schema, options, emit)?;
             let tr = right.translate_with_warnings(schema, options, emit)?;

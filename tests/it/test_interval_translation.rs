@@ -2,29 +2,24 @@
 //!
 //! `ts + INTERVAL 'N unit'` becomes `datetime(ts, '+N unit')`, and minus
 //! becomes `'-N unit'`. Multi-unit intervals emit one modifier per unit.
-//! Standalone INTERVAL stays unsupported (no SQLite target).
+//! Standalone INTERVAL stays unsupported (no SQLite target). Every request
+//! runs in UTC, whose calendar SQLite's modifiers compute.
 
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+use pg2sqlite::prelude::Pg2Sqlite;
 
-use crate::helpers;
+use crate::helpers::{
+    self,
+    deployment::{UTC_REQUEST_ROLE, utc_request},
+};
+
 fn translate(sql: &str) -> String {
-    Pg2Sqlite::default()
-        .sql(sql)
-        .and_then(|t| {
-            t.translate(&Pg2SqliteOptions::default()).map(pg2sqlite::script::Script::into_vec)
-        })
-        .map_or_else(
-            |e| panic!("translation failed: {e}"),
-            |stmts| stmts.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n"),
-        )
+    try_translate(sql).unwrap_or_else(|e| panic!("translation failed: {e}"))
 }
 
 fn try_translate(sql: &str) -> Result<String, pg2sqlite::errors::Error> {
     Pg2Sqlite::default()
-        .sql(sql)
-        .and_then(|t| {
-            t.translate(&Pg2SqliteOptions::default()).map(pg2sqlite::script::Script::into_vec)
-        })
+        .sql(&format!("{UTC_REQUEST_ROLE}{sql}"))
+        .and_then(|t| t.translate(&utc_request()).map(pg2sqlite::script::Script::into_vec))
         .map(|stmts| stmts.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n"))
 }
 
@@ -162,5 +157,5 @@ fn interval_column_stays_text() {
 /// Translates `pg` and executes every emitted statement against in-memory
 /// SQLite.
 fn execute_translated(pg: &str) {
-    helpers::execute_all(pg, &Pg2SqliteOptions::default());
+    helpers::execute_all(&format!("{UTC_REQUEST_ROLE}{pg}"), &utc_request());
 }
