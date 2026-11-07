@@ -8,6 +8,7 @@ pub mod rls;
 pub mod run_translated;
 pub mod statistical_aggregates;
 pub mod translate;
+pub mod zone_functions;
 
 #[cfg(feature = "sqlitegis")]
 #[allow(dead_code, reason = "used by the sqlitegis test binary alone")]

@@ -18,7 +18,7 @@ use crate::{
         request_zone::{RequestZone, ZoneUnavailable},
         translator_impls::array::WholeRow,
     },
-    traits::{ArrayRepresentation, SessionVariableMapping, UuidRepresentation},
+    traits::{ArrayRepresentation, SessionVariableMapping, TimeZoneFunctions, UuidRepresentation},
 };
 
 /// Tables whose storage lives in a database attached to the replica's
@@ -70,11 +70,10 @@ pub struct Pg2SqliteOptions {
     /// `unhex(replace(literal, '-', ''))` inline" (pure SQLite, no UDF
     /// setup). Set via `with_uuid_text_to_blob_function_name`.
     uuid_text_to_blob_function_name: Option<String>,
-    /// The host-registered SQLite function that adds an interval to a
-    /// `timestamptz` on the calendar of a zone with transitions. `None`
-    /// refuses that arithmetic. Set via
-    /// `with_timestamptz_interval_function_name`.
-    timestamptz_interval_function_name: Option<String>,
+    /// The host-registered SQLite functions that read a zone whose UTC offset
+    /// changes. `None` refuses what needs one. Set via
+    /// `with_time_zone_functions`.
+    time_zone_functions: Option<TimeZoneFunctions>,
     /// Names of host-registered functions the destination SQLite provides,
     /// stored lower-cased because SQLite resolves function names without
     /// regard to case. A name here passes through instead of being refused as
@@ -130,7 +129,7 @@ impl<'a> arbitrary::Arbitrary<'a> for Pg2SqliteOptions {
             uuid_function_name: String::arbitrary(u)?,
             uuid_v7_function_name: Option::<String>::arbitrary(u)?,
             uuid_text_to_blob_function_name: Option::<String>::arbitrary(u)?,
-            timestamptz_interval_function_name: Option::<String>::arbitrary(u)?,
+            time_zone_functions: Option::<TimeZoneFunctions>::arbitrary(u)?,
             array_representation: Option::<ArrayRepresentation>::arbitrary(u)?,
             rls_table_suffix: String::arbitrary(u)?,
             readonly_deny_trigger_suffix: String::arbitrary(u)?,
@@ -159,7 +158,7 @@ impl Default for Pg2SqliteOptions {
             uuid_function_name: "uuid".to_string(),
             uuid_v7_function_name: None,
             uuid_text_to_blob_function_name: None,
-            timestamptz_interval_function_name: None,
+            time_zone_functions: None,
             array_representation: None,
             rls_table_suffix: "_rls".to_string(),
             readonly_deny_trigger_suffix: "__readonly".to_string(),
@@ -811,35 +810,28 @@ impl Pg2SqliteOptions {
     }
 
     #[must_use]
-    /// Sets the function that adds an interval to a `timestamptz` in a zone
-    /// whose UTC offset changes.
+    /// Sets the functions that read a zone whose UTC offset changes.
     ///
-    /// PostgreSQL adds the months and days of an interval to a `timestamptz`
-    /// on the calendar of the request's `TimeZone`, which the deployment
-    /// passed with [`with_deployment`](Self::with_deployment) resolves, for
-    /// the acting role named with [`with_acting_role`](Self::with_acting_role)
-    /// or, without one, as the connection has it before any `SET ROLE`. In
-    /// UTC and in a zone of one fixed offset the translation computes that
-    /// calendar with SQLite's date modifiers. A zone whose offset changes,
-    /// such as `Europe/Rome`, needs this function, and the arithmetic is
-    /// refused without it.
-    ///
-    /// The function takes five arguments, the `timestamptz` text the replica
-    /// holds in UTC, the interval's months, days and microseconds as
-    /// integers already negated for a subtraction, and the zone's name. It
-    /// answers `timestamptz_pl_interval` of PostgreSQL in that zone, as the
-    /// canonical text `YYYY-MM-DD HH:MM:SS.ffffff+00:00`, and NULL for a NULL
-    /// `timestamptz`. sql-values computes it with
-    /// `PgInterval::add_to_timestamptz`.
-    pub fn with_timestamptz_interval_function_name(mut self, name: impl Into<String>) -> Self {
-        self.timestamptz_interval_function_name = Some(name.into());
+    /// PostgreSQL turns an instant into a wall clock and back, and adds the
+    /// months and days of an interval to a `timestamptz`, in the request's
+    /// `TimeZone`, which the deployment passed with
+    /// [`with_deployment`](Self::with_deployment) resolves, for the acting
+    /// role named with [`with_acting_role`](Self::with_acting_role) or,
+    /// without one, as the connection has it before any `SET ROLE`. In UTC
+    /// and in a zone of one fixed offset the translation computes all of it
+    /// with SQLite's own date functions. A zone whose offset changes, such as
+    /// `Europe/Rome`, needs these two functions, and what reads that zone is
+    /// refused without them. [`TimeZoneFunctions`] states what each one
+    /// answers.
+    pub fn with_time_zone_functions(mut self, functions: TimeZoneFunctions) -> Self {
+        self.time_zone_functions = Some(functions);
         self
     }
 
     #[must_use]
-    /// Returns the configured `timestamptz` interval function name.
-    pub fn get_timestamptz_interval_function_name(&self) -> Option<&str> {
-        self.timestamptz_interval_function_name.as_deref()
+    /// Returns the configured zone functions.
+    pub fn get_time_zone_functions(&self) -> Option<&TimeZoneFunctions> {
+        self.time_zone_functions.as_ref()
     }
 
     #[must_use]

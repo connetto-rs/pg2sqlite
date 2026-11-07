@@ -68,40 +68,50 @@ impl IntervalShift {
     /// `offset` seconds east of UTC, as `timestamptz_pl_interval` counts them
     /// in a zone of one fixed offset, and the time added to the instant.
     pub(crate) fn modifiers_on_clock(&self, offset: i32) -> Result<Vec<String>, Error> {
-        let interval = self.signed()?;
+        let calendar = self.calendar_modifiers()?;
+        let on_clock = !calendar.is_empty() && offset != 0;
         let mut modifiers = Vec::new();
-        let calendar = interval.months != 0 || interval.days != 0;
-        if calendar && offset != 0 {
+        if on_clock {
             modifiers.push(signed(i64::from(offset), "seconds"));
         }
+        modifiers.extend(calendar);
+        if on_clock {
+            modifiers.push(signed(-i64::from(offset), "seconds"));
+        }
+        modifiers.extend(self.time_modifiers()?);
+        Ok(modifiers)
+    }
+
+    /// The SQLite date modifiers adding the interval's months and days, the
+    /// months clamped to the month's last day before the days land.
+    pub(crate) fn calendar_modifiers(&self) -> Result<Vec<String>, Error> {
+        let interval = self.signed()?;
+        let mut modifiers = Vec::new();
         if interval.months != 0 {
             modifiers.push(signed(i64::from(interval.months), "months"));
-            // The days below land on the clamped date, so the clamp sits here.
             modifiers.push("floor".into());
         }
         if interval.days != 0 {
             modifiers.push(signed(i64::from(interval.days), "days"));
         }
-        if calendar && offset != 0 {
-            modifiers.push(signed(-i64::from(offset), "seconds"));
-        }
-        if interval.microseconds != 0 {
-            modifiers.push(time_modifier(interval.microseconds));
-        }
         Ok(modifiers)
+    }
+
+    /// The SQLite date modifier adding the interval's time, none for an
+    /// interval without one.
+    pub(crate) fn time_modifiers(&self) -> Result<Vec<String>, Error> {
+        let interval = self.signed()?;
+        Ok(if interval.microseconds == 0 {
+            Vec::new()
+        } else {
+            vec![time_modifier(interval.microseconds)]
+        })
     }
 
     /// Whether the interval has months or days, which PostgreSQL counts on a
     /// calendar rather than adding to the instant.
     pub(crate) const fn moves_calendar(&self) -> bool {
         self.interval.months != 0 || self.interval.days != 0
-    }
-
-    /// The months, days and microseconds `timestamp_pl_interval` adds,
-    /// negated for a subtraction.
-    pub(crate) fn signed_fields(&self) -> Result<(i32, i32, i64), Error> {
-        let interval = self.signed()?;
-        Ok((interval.months, interval.days, interval.microseconds))
     }
 
     /// The shift `time_pl_interval` or `time_mi_interval` applies to a time

@@ -20,7 +20,7 @@ use crate::{
         datetime_helpers::{datetime_field_from_strftime_format, strftime_format_to_pg_to_char},
         function_helpers::{
             extract_exactly_reverse as extract_exactly, function_arg_expr_or_err, integer_literal,
-            positional_arity, simple_function_expr, string_literal,
+            positional_arity, simple_function_expr, single_quoted_literal, string_literal,
         },
         idioms::{
             extract_json_group_array_nullif, extract_json_group_object_nullif,
@@ -141,6 +141,14 @@ pub enum FunctionReversal {
     /// Emit a bare keyword with no argument list, which is the only form
     /// PostgreSQL takes for `current_date` and its relatives.
     ToBareKeyword(&'static str),
+    /// The registered zone function: `local_clock(x, 'zone')` becomes
+    /// `x::timestamptz AT TIME ZONE 'zone'` and `instant(x, 'zone')` becomes
+    /// `x::timestamp AT TIME ZONE 'zone'`, the cast naming the value's type
+    /// as the replica holds it in text, and the field saying which one.
+    ToZoneConversion {
+        /// Whether the call answers the zone's wall clock of an instant.
+        to_local: bool,
+    },
     /// Reject the named SQLite-only construct with the reason string.
     Reject(String),
 }
@@ -286,6 +294,18 @@ fn multi_argument_extremum_diverges(args: &FunctionArguments) -> bool {
 /// SQLite's scalar `min` and `max` from their aggregate namesakes.
 fn multi_argument(args: &FunctionArguments) -> bool {
     matches!(args, FunctionArguments::List(list) if list.args.len() > 1)
+}
+
+/// The reversal of a call to a registered zone function.
+fn zone_conversion(
+    name: &str,
+    options: &crate::options::TranslationContext<'_>,
+) -> FunctionReversal {
+    FunctionReversal::ToZoneConversion {
+        to_local: options
+            .get_time_zone_functions()
+            .is_some_and(|functions| functions.local_clock.eq_ignore_ascii_case(name)),
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -510,6 +530,15 @@ pub fn reverse_function(
             } else {
                 FunctionReversal::Reject(session_variable::paired_arity_refusal(mapping))
             }
+        }
+        // The registered zone functions -> AT TIME ZONE, which PostgreSQL
+        // computes in the zone named whatever the session's own.
+        name if options.get_time_zone_functions().is_some_and(|functions| {
+            functions.local_clock.eq_ignore_ascii_case(name)
+                || functions.instant.eq_ignore_ascii_case(name)
+        }) =>
+        {
+            zone_conversion(name, options)
         }
         // The declared version 7 generator -> uuidv7(). Checked before the
         // random one, so a caller who pointed both options at one name gets
@@ -1572,6 +1601,31 @@ pub fn reverse_translate_function(
                 over: None,
                 within_group: vec![],
             }))
+        }
+        FunctionReversal::ToZoneConversion { to_local } => {
+            let (value, zone) = match function_argument_exprs(&func.args)[..] {
+                [value, zone] if single_quoted_literal(zone).is_some() => (value, zone),
+                _ => {
+                    return Err(Error::reverse_refusal(format!(
+                        "{}() is a zone function named with with_time_zone_functions, which \
+                         takes a value and the zone's name as a string literal, and this call \
+                         does not, so it has no AT TIME ZONE to become.",
+                        func.name
+                    )));
+                }
+            };
+            let value =
+                crate::prelude::ReverseTranslator::reverse_translate(value, schema, options)?;
+            let timezone = if to_local { TimezoneInfo::WithTimeZone } else { TimezoneInfo::None };
+            Ok(Expr::AtTimeZone {
+                timestamp: Box::new(Expr::Cast {
+                    expr: Box::new(value),
+                    data_type: DataType::Timestamp(None, timezone),
+                    format: None,
+                    kind: CastKind::DoubleColon,
+                }),
+                time_zone: Box::new(zone.clone()),
+            })
         }
         FunctionReversal::Reject(msg) => Err(Error::reverse_refusal(msg)),
         FunctionReversal::PassThrough => {
