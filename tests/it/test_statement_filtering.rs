@@ -252,9 +252,10 @@ fn create_role_filtered() {
 
 #[test]
 fn comment_filtered() {
-    let sql = "COMMENT ON TABLE t IS 'my table';";
-    let count = translate_count(sql).unwrap();
-    assert_eq!(count, 0, "COMMENT should be filtered");
+    const TABLE: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY);";
+    let table = translate_count(TABLE).unwrap();
+    let commented = translate_count(&format!("{TABLE} COMMENT ON TABLE t IS 'my table';")).unwrap();
+    assert_eq!(commented, table, "COMMENT should be filtered");
 }
 
 #[test]
