@@ -67,6 +67,8 @@ const ROLE: &str = "CREATE ROLE r;";
 const FUNCTION: &str = "CREATE FUNCTION f() RETURNS INT AS $$ SELECT 1 $$ LANGUAGE sql;";
 const POLICY: &str = "CREATE POLICY p ON t FOR SELECT USING (true);";
 const EXTENSION: &str = "CREATE EXTENSION pgcrypto;";
+const FOREIGN_TABLE: &str = "CREATE SERVER srv FOREIGN DATA WRAPPER postgres_fdw; \
+                             CREATE FOREIGN TABLE ft (id INT) SERVER srv;";
 
 /// `GRANT` and `REVOKE` are resolved against the schema, so the role has to
 /// exist before they can be classified.
@@ -236,7 +238,13 @@ const CASES: &[Case] = &[
     warned("ALTER FOREIGN TABLE IF EXISTS ft OPTIONS (ADD schema_name 'remote')"),
     warned("DROP FOREIGN TABLE ft"),
     warned("CREATE USER MAPPING FOR PUBLIC SERVER srv OPTIONS (user 'u', password 'p')"),
-    warned("COMMENT ON FOREIGN TABLE ft IS 'note'"),
+    Case {
+        setup: FOREIGN_TABLE,
+        sql: "COMMENT ON FOREIGN TABLE ft IS 'note'",
+        outcome: Outcome::Warned,
+    },
+    // PostgreSQL refuses a comment on a relation that does not exist.
+    rejected("COMMENT ON FOREIGN TABLE ft IS 'note'"),
     warned("CREATE CONNECTOR c TYPE 'mysql'"),
     warned("ALTER CONNECTOR c SET URL 'u'"),
     warned("DROP CONNECTOR c"),
