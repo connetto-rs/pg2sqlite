@@ -95,6 +95,17 @@ impl crate::traits::translator::TranslatorWithContext for TableConstraint {
                 updated_unique.nulls_distinct = NullsDistinctOption::None;
                 Ok(vec![Self::Unique(updated_unique)])
             }
+            // Consumed by the CREATE TABLE path, which carries the requirement
+            // onto the column, and a constraint translated on its own would
+            // drop it.
+            Self::NotNull(not_null) => {
+                Err(crate::errors::Error::forward_refusal(format!(
+                    "{not_null} is the column's own not-null requirement, and SQLite carries \
+                         NOT NULL on the column rather than in the table's constraint list. \
+                         The CREATE TABLE path moves it onto the column it names, so the \
+                         constraint cannot translate on its own. Translate the table as a whole."
+                )))
+            }
             // Outcome 2 of the reporting policy in `statement.rs`. The
             // passthrough that used to stand here emitted every one of these
             // verbatim, and none has a SQLite form, so each produced SQL that
@@ -154,7 +165,9 @@ fn translate_check_constraint(
     match check_constraint.expr.translate_with_warnings(schema, &options, emit) {
         Ok(translated_expr) => {
             crate::impls::translator_impls::column_option::warn_no_inherit_dropped(
-                check_constraint,
+                "CHECK ... NO INHERIT",
+                "CHECK",
+                check_constraint.no_inherit,
                 emit,
             );
             Ok(vec![TableConstraint::Check(sqlparser::ast::CheckConstraint {
