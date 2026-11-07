@@ -9807,10 +9807,13 @@ fn an_interval_minus_a_timestamp_is_refused_with_postgresqls_message() {
 }
 
 #[test]
-fn a_side_the_statement_cannot_type_is_refused() {
-    // PostgreSQL decides the operator from NULLIF's argument types; the
-    // statement settles neither, and the translation refuses.
-    refused("SELECT (iv + NULLIF(NULL, NULL))::text FROM t;", "does not settle the type");
+fn a_non_interval_side_is_refused_with_postgresqls_message() {
+    // PostgreSQL settles NULLIF(NULL, NULL) to text, so the sum is refused the
+    // way PostgreSQL refuses it, measured on PostgreSQL 18.6.
+    refused(
+        "SELECT (iv + NULLIF(NULL, NULL))::text FROM t;",
+        "operator does not exist: interval + text",
+    );
     refused(
         "SELECT (iv + CASE WHEN id > 1 THEN NULL END)::text FROM t;",
         "operator does not exist: interval + text",

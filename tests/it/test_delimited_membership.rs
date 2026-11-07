@@ -489,59 +489,95 @@ fn an_empty_delimiter_is_refused() {
     assert!(message.contains("literal"), "names what the delimiter must be: {message}");
 }
 
-/// A case-insensitive corpus, where `'a'` and `'A'` are one value to the
+/// A case-insensitive corpus. `NOCASE` names a collation PostgreSQL 18.6
+/// refuses, so the column carries a nondeterministic ICU collation the
+/// corpus declares instead, where `'a'` and `'A'` are one value to the
 /// column's own equality and two values to a byte search.
-const CASE_INSENSITIVE_KEYS: &str = "CREATE TABLE ci (id INT PRIMARY KEY, k TEXT COLLATE NOCASE);
+const CASE_INSENSITIVE_KEYS: &str =
+    "CREATE COLLATION ci_coll (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+CREATE TABLE ci (id INT PRIMARY KEY, k TEXT COLLATE ci_coll);
 INSERT INTO ci (id, k) VALUES (1, 'a'), (2, 'A'), (3, 'b');
 ";
 
-fn case_insensitively_admitted(predicate: &str) -> Vec<i32> {
+/// A byte-collated corpus. PostgreSQL's `C` collation compares bytes, so the
+/// column's own equality and a byte search agree on it.
+const BYTE_COLLATED_KEYS: &str = "CREATE TABLE ci (id INT PRIMARY KEY, k TEXT COLLATE \"C\");
+INSERT INTO ci (id, k) VALUES (1, 'a'), (2, 'A'), (3, 'b');
+";
+
+fn byte_collated_admitted(predicate: &str) -> Vec<i32> {
     let pg =
-        format!("{CASE_INSENSITIVE_KEYS}CREATE VIEW held AS SELECT id FROM ci WHERE {predicate};");
+        format!("{BYTE_COLLATED_KEYS}CREATE VIEW held AS SELECT id FROM ci WHERE {predicate};");
     let mut connection = open(&pg, &Pg2SqliteOptions::default(), None);
     held::table.select(held::id).order(held::id).load(&mut connection).expect("read the view")
 }
 
+/// The corpus declares a collation the DDL translation refuses, so the
+/// corpus is built where it belongs, the schema, and the predicate is
+/// translated against it.
 fn case_insensitive_refusal(predicate: &str) -> String {
-    refusal(&format!("{CASE_INSENSITIVE_KEYS}SELECT id FROM ci WHERE {predicate};"))
+    let schema = Pg2Sqlite::default()
+        .sql(CASE_INSENSITIVE_KEYS)
+        .expect("parse the corpus")
+        .build_schema()
+        .expect("the corpus is valid PostgreSQL");
+    Pg2Sqlite::default()
+        .sql(&format!("SELECT id FROM ci WHERE {predicate};"))
+        .expect("parse the query")
+        .translate_with_report_and_schema(&schema, &Pg2SqliteOptions::default())
+        .expect_err("a case-insensitive column has no byte search")
+        .to_string()
 }
 
-/// SQLite's `instr()` compares bytes whatever collation its operands carry.
-/// Measured on SQLite 3.51.1, `'a' COLLATE NOCASE = 'A'` answers 1 while
-/// `instr(',a,', ',A,')` answers 0, and a column declared `COLLATE NOCASE`
-/// compares the same way, so a case-insensitive membership test has no
-/// `instr()` form and is refused rather than answered bytewise.
+/// SQLite's `instr()` compares bytes whatever collation its operands carry,
+/// so a membership test under a case-insensitive collation has no `instr()`
+/// form. Measured on PostgreSQL 18.6 over the corpus, `k = 'a'` answers
+/// 1, 2, the `'A'` row included, where a byte search over the same corpus
+/// answers only row 1, so the equality the search would replace compares
+/// differently and is refused at query time, naming the collation.
 #[test]
 fn a_case_insensitive_column_is_refused() {
     let message = case_insensitive_refusal("k = ANY(string_to_array('a,b', ','))");
-    assert!(message.contains("NOCASE"), "names the collation: {message}");
+    assert!(message.contains("CI_COLL"), "names the collation: {message}");
 }
 
-/// SQLite propagates a column's collation through parentheses and a `CAST`
-/// and through nothing else. Measured on SQLite 3.51.1, over a `NOCASE`
-/// column `(k) = 'a'` and `CAST(k AS TEXT) = 'a'` answer 1 for `k = 'A'`
-/// where `lower(k) = 'A'`, `trim(k) = 'a'` and `k || '' = 'a'` answer 0, so
-/// the two that carry the collation are refused with it.
+/// PostgreSQL propagates a column's collation through parentheses and a
+/// `CAST`. Measured on PostgreSQL 18.6 over the corpus, `(k) = 'a'` and
+/// `CAST(k AS TEXT) = 'a'` answer 1, 2, the `'A'` row included, where a
+/// byte search over the same corpus answers only row 1, so the two shapes
+/// that carry the collation are refused with it.
 #[test]
 fn a_cast_over_a_case_insensitive_column_is_refused() {
     let cast = case_insensitive_refusal("CAST(k AS TEXT) = ANY(string_to_array('a,b', ','))");
-    assert!(cast.contains("NOCASE"), "a cast keeps the collation: {cast}");
+    assert!(cast.contains("CI_COLL"), "a cast keeps the collation: {cast}");
     let nested = case_insensitive_refusal("(k) <> ALL(string_to_array('a,b', ','))");
-    assert!(nested.contains("NOCASE"), "parentheses keep the collation: {nested}");
+    assert!(nested.contains("CI_COLL"), "parentheses keep the collation: {nested}");
 }
 
-/// SQLite gives a compound select the collation of its leftmost branch,
-/// measured on 3.51.1 where a view over `SELECT k FROM ci UNION ALL SELECT
-/// 'zz'` answers 1 for `k = 'a'` on the `'A'` row while the search answers 0.
-/// The scope reports the two branches as a disagreement, so the rewrite
-/// refuses rather than reading the column as byte collated.
+/// PostgreSQL settles a compound select on the collation its branches agree
+/// on, measured on PostgreSQL 18.6, where a view over `SELECT k FROM ci
+/// UNION ALL SELECT 'zz'` settles `k` to the column's collation and
+/// `k <> ALL(string_to_array('a', ','))` answers the `b` and `zz` rows, the
+/// `'A'` row out. The scope answers the two branch expressions with two
+/// collations, so the rewrite refuses rather than reading the column as
+/// byte collated.
 #[test]
 fn an_unsettled_view_collation_is_refused() {
-    let message = refusal(
-        "CREATE TABLE ci (id INT PRIMARY KEY, k TEXT COLLATE NOCASE);\n\
-         CREATE VIEW v AS SELECT k FROM ci UNION ALL SELECT 'zz';\n\
-         SELECT k FROM v WHERE k <> ALL(string_to_array('a', ','));",
-    );
+    let schema = Pg2Sqlite::default()
+        .sql(
+            "CREATE COLLATION ci_coll (provider = icu, locale = 'und-u-ks-level2', deterministic = false);\n\
+             CREATE TABLE ci (id INT PRIMARY KEY, k TEXT COLLATE ci_coll);\n\
+             CREATE VIEW v AS SELECT k FROM ci UNION ALL SELECT 'zz';",
+        )
+        .expect("parse the schema")
+        .build_schema()
+        .expect("the schema is valid PostgreSQL");
+    let message = Pg2Sqlite::default()
+        .sql("SELECT k FROM v WHERE k <> ALL(string_to_array('a', ','));")
+        .expect("parse the query")
+        .translate_with_report_and_schema(&schema, &Pg2SqliteOptions::default())
+        .expect_err("the branches do not settle one collation")
+        .to_string();
     assert!(message.contains("do not settle the collation"), "names what is unsettled: {message}");
 }
 
@@ -584,24 +620,38 @@ fn a_scope_declined_name_still_translates() {
 
 /// A PL/pgSQL body may declare a variable whose name a column also carries,
 /// and a qualified reference is still the column, so its declared collation
-/// decides. Reading it as bytes emitted a search over a `NOCASE` column.
+/// decides. Measured on PostgreSQL 18.6 over the corpus, the body's
+/// equality compares case-insensitively, so the rewrite refuses it with the
+/// column's collation rather than reading it as bytes.
 #[test]
 fn a_variable_name_does_not_hide_a_qualified_column_collation() {
-    let message = refusal(
-        "CREATE TABLE ci (id INT PRIMARY KEY, k TEXT COLLATE NOCASE);\n\
-         CREATE TABLE log (id INT PRIMARY KEY, hit BOOLEAN);\n\
-         CREATE FUNCTION mark() RETURNS TRIGGER LANGUAGE plpgsql AS $$\n\
-         DECLARE k TEXT := 'a';\n\
-         BEGIN\n\
-           IF EXISTS (SELECT 1 FROM ci WHERE ci.k = ANY(string_to_array(k, ','))) THEN\n\
-             RAISE EXCEPTION 'held';\n\
-           END IF;\n\
-           RETURN NEW;\n\
-         END;\n\
-         $$;\n\
-         CREATE TRIGGER mark_log BEFORE INSERT ON log FOR EACH ROW EXECUTE FUNCTION mark();",
-    );
-    assert!(message.contains("NOCASE"), "the column's own collation decides: {message}");
+    let schema = Pg2Sqlite::default()
+        .sql(
+            "CREATE COLLATION ci_coll (provider = icu, locale = 'und-u-ks-level2', deterministic = false);\n\
+             CREATE TABLE ci (id INT PRIMARY KEY, k TEXT COLLATE ci_coll);\n\
+             CREATE TABLE log (id INT PRIMARY KEY, hit BOOLEAN);",
+        )
+        .expect("parse the schema")
+        .build_schema()
+        .expect("the schema is valid PostgreSQL");
+    let message = Pg2Sqlite::default()
+        .sql(
+            "CREATE FUNCTION mark() RETURNS TRIGGER LANGUAGE plpgsql AS $$\n\
+             DECLARE k TEXT := 'a';\n\
+             BEGIN\n\
+               IF EXISTS (SELECT 1 FROM ci WHERE ci.k = ANY(string_to_array(k, ','))) THEN\n\
+                 RAISE EXCEPTION 'held';\n\
+               END IF;\n\
+               RETURN NEW;\n\
+             END;\n\
+             $$;\n\
+             CREATE TRIGGER mark_log BEFORE INSERT ON log FOR EACH ROW EXECUTE FUNCTION mark();",
+        )
+        .expect("parse the trigger")
+        .translate_with_report_and_schema(&schema, &Pg2SqliteOptions::default())
+        .expect_err("the column's collation has no byte search")
+        .to_string();
+    assert!(message.contains("CI_COLL"), "the column's own collation decides: {message}");
 }
 
 /// A caller may register a function of their own named `current_setting`,
@@ -623,12 +673,11 @@ fn an_unmapped_session_shaped_function_is_refused() {
 }
 
 /// PostgreSQL carries a column's collation through the expressions built
-/// over it while SQLite does not, measured on PostgreSQL 17 over a column
-/// with a nondeterministic ICU collation holding `'A'`, where `k = 'a'`,
-/// `lower(k) = 'A'`, `trim(k) = 'a'` and `k || '' = 'a'` all answer true
-/// against 0 from the same expressions in SQLite. A wrapper is therefore no
-/// escape from the collation, and the rewrite refuses wherever a collated
-/// column is read.
+/// over it while SQLite does not. Measured on PostgreSQL 18.6 over the
+/// corpus, `lower(k) = 'a'`, `trim(k) = 'a'` and `k || '' = 'a'` all answer
+/// 1, 2, the `'A'` row included, where a byte search over the same corpus
+/// answers only row 1. A wrapper is therefore no escape from the
+/// collation, and the rewrite refuses wherever a collated column is read.
 #[test]
 fn a_collated_column_inside_a_wrapper_is_refused() {
     for predicate in [
@@ -637,7 +686,7 @@ fn a_collated_column_inside_a_wrapper_is_refused() {
         "(k || '') = ANY(string_to_array('a,b', ','))",
     ] {
         let message = case_insensitive_refusal(predicate);
-        assert!(message.contains("NOCASE"), "{predicate} names the collation: {message}");
+        assert!(message.contains("CI_COLL"), "{predicate} names the collation: {message}");
     }
 }
 
@@ -652,16 +701,17 @@ fn an_explicitly_collated_left_side_is_refused() {
 
 /// A byte collation is what the search already measures, so naming one
 /// changes nothing, and an explicit one decides the comparison in both
-/// engines even over a column declared otherwise.
+/// engines even over a column declared otherwise. Measured on PostgreSQL
+/// 18.6, where `C` is the byte collation.
 #[test]
 fn a_binary_collation_still_translates() {
     assert_eq!(
-        admitted("k COLLATE BINARY = ANY(string_to_array('a,b', ','))"),
+        admitted(r#"k COLLATE "C" = ANY(string_to_array('a,b', ','))"#),
         vec![1, 2],
-        "BINARY is the collation instr() compares under"
+        "C is the collation instr() compares under"
     );
     assert_eq!(
-        case_insensitively_admitted("k COLLATE BINARY = ANY(string_to_array('a,b', ','))"),
+        byte_collated_admitted(r#"k COLLATE "C" = ANY(string_to_array('a,b', ','))"#),
         vec![1, 3],
         "the override compares bytes, so 'A' is no element where 'a' and 'b' are"
     );
@@ -719,9 +769,9 @@ fn a_named_argument_call_is_left_refused() {
 /// it admits are the ones a byte comparison admits.
 #[test]
 fn an_explicit_byte_collation_covers_both_operands() {
-    let pg = "CREATE TABLE ci (id INT PRIMARY KEY, k TEXT, setting TEXT COLLATE NOCASE);
+    let pg = "CREATE TABLE ci (id INT PRIMARY KEY, k TEXT, setting TEXT COLLATE \"C\");
 INSERT INTO ci (id, k, setting) VALUES (1, 'a', 'a,b'), (2, 'A', 'a,b'), (3, 'b', 'a,b');
-CREATE VIEW held AS SELECT id FROM ci WHERE k COLLATE BINARY = ANY(string_to_array(setting, ','));";
+CREATE VIEW held AS SELECT id FROM ci WHERE k COLLATE \"C\" = ANY(string_to_array(setting, ','));";
     let mut connection = open(pg, &Pg2SqliteOptions::default(), None);
     let admitted: Vec<i32> =
         held::table.select(held::id).order(held::id).load(&mut connection).expect("read the view");
@@ -738,22 +788,25 @@ CREATE VIEW held AS SELECT id FROM ci WHERE k COLLATE BINARY = ANY(string_to_arr
 #[test]
 fn an_explicit_byte_collation_under_a_wrapper_keeps_the_search() {
     assert_eq!(
-        case_insensitively_admitted("lower(k COLLATE BINARY) = ANY(string_to_array('a,b', ','))"),
+        byte_collated_admitted(r#"lower(k COLLATE "C") = ANY(string_to_array('a,b', ','))"#),
         vec![1, 2, 3],
         "the fold answers 'a', 'a' and 'b', each an element under a byte comparison"
     );
 }
 
 /// PostgreSQL derives a `CASE` collation from its result arms rather than
-/// from its condition, so a byte collation named in the condition does not
-/// make the comparison bytewise while the arms read a `NOCASE` column.
+/// from its condition, measured on PostgreSQL 18.6 over the corpus, where
+/// `CASE WHEN k COLLATE "C" = 'x' THEN k ELSE k END = 'a'` answers 1, 2,
+/// the `'A'` row included, so a byte collation named in the condition does
+/// not make the comparison bytewise while the arms read a
+/// case-insensitively collated column.
 #[test]
 fn a_byte_collation_in_a_condition_does_not_decide() {
     let message = case_insensitive_refusal(
-        "CASE WHEN k COLLATE BINARY = 'x' THEN k ELSE k END \
+        "CASE WHEN k COLLATE \"C\" = 'x' THEN k ELSE k END \
          = ANY(string_to_array('a,b', ','))",
     );
-    assert!(message.contains("NOCASE"), "the arms decide: {message}");
+    assert!(message.contains("CI_COLL"), "the arms decide: {message}");
 }
 
 /// A call carrying a function argument clause is not the two-argument

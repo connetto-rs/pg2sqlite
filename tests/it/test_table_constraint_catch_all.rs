@@ -165,10 +165,12 @@ fn unique_nulls_not_distinct_refuses_a_repeated_null() {
     assert!(is_unique_violation(&repeated), "a repeated NULL key must collide: {repeated:?}");
 }
 
-/// The column's collation decides which values collide, beside a NULL too.
+/// A collation PostgreSQL has no counterpart for is refused at build, where
+/// PostgreSQL refuses the declaration, measured on PostgreSQL 18.6: `collation
+/// "nocase" for encoding "UTF8" does not exist`.
 #[test]
-fn unique_nulls_not_distinct_keeps_the_column_collation() {
-    let mut connection = apply_translated_ddl(
+fn unique_nulls_not_distinct_over_a_nocase_column_is_refused() {
+    let error = translate_sql(
         r#"CREATE TABLE t (
             id INTEGER PRIMARY KEY,
             a INTEGER,
@@ -176,10 +178,9 @@ fn unique_nulls_not_distinct_keeps_the_column_collation() {
             UNIQUE NULLS NOT DISTINCT (a, s)
         );"#,
         &default_options(),
-    );
-    insert_keyed(&mut connection, 1, None, Some("x")).expect("the first key is accepted");
-    let folded = insert_keyed(&mut connection, 2, None, Some("X"));
-    assert!(is_unique_violation(&folded), "NOCASE makes x and X the same key: {folded:?}");
+    )
+    .expect_err("PostgreSQL has no NOCASE collation");
+    assert!(error.contains("NOCASE"), "names the collation: {error}");
 }
 
 /// A named constraint with a `NOT NULL` key still collides on its nullable key.

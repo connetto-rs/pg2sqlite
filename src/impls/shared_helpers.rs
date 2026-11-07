@@ -2516,8 +2516,9 @@ fn reject_generated_key_assignment(
         };
         let attribute = column.attribute();
         let generated_always = declares_always_identity(&attribute.options);
-        let generates_its_own = declares_identity(&attribute.options)
-            || crate::impls::translator_impls::data_type::is_serial_type(&attribute.data_type);
+        // The stored node spells a serial out as an integer drawing from its
+        // sequence.
+        let generates_its_own = declares_identity(&attribute.options) || column.is_serial(schema);
         if is_default_keyword(value) {
             if !generates_its_own {
                 return Ok(());

@@ -381,22 +381,18 @@ fn comment_option_silently_dropped() {
 // Column COLLATE mapped or refused (R93)
 // ---------------------------------------------------------------------------
 
-use crate::helpers::run_translated as run_translated_helper;
-
-/// The emitted column carries the collation, and the comparison is observably
-/// case-insensitive through executed SQL.
+/// `NOCASE` names a collation PostgreSQL has no counterpart for, so the
+/// statement is refused where PostgreSQL refuses it, measured on PostgreSQL
+/// 18.6: `collation "nocase" for encoding "UTF8" does not exist`.
 #[test]
-fn a_nocase_column_collation_is_emitted_and_observable() {
-    let output = translate("CREATE TABLE t (id INT PRIMARY KEY, s TEXT COLLATE NOCASE);");
-    assert!(output.contains("COLLATE NOCASE"), "the collation must survive: {output}");
-
-    let rows = run_translated_helper::run_translated_with(
-        "CREATE TABLE t (id INT PRIMARY KEY, s TEXT COLLATE NOCASE);
-         INSERT INTO t (id, s) VALUES (1, 'Alpha'), (2, 'ALPHA');
-         SELECT count(*) FROM t WHERE s = 'alpha';",
-        &Pg2SqliteOptions::default(),
-    );
-    assert_eq!(rows, vec![Some("2".to_string())], "NOCASE must compare case-insensitively");
+fn a_nocase_column_collation_is_refused() {
+    let error = Pg2Sqlite::default()
+        .sql("CREATE TABLE t (id INT PRIMARY KEY, s TEXT COLLATE NOCASE);")
+        .expect("parse")
+        .translate_to_sql(&Pg2SqliteOptions::default())
+        .expect_err("PostgreSQL has no NOCASE collation")
+        .to_string();
+    assert!(error.contains("NOCASE"), "names the collation: {error}");
 }
 
 /// PostgreSQL's `C` and `POSIX` are byte order, which is SQLite's BINARY.

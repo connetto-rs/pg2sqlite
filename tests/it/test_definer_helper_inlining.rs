@@ -391,6 +391,25 @@ fn a_call_the_schema_does_not_declare_keeps_its_translation() {
     );
 }
 
+/// A builtin named with its schema is no helper call either.
+#[test]
+fn a_schema_qualified_builtin_is_no_helper_call() {
+    let script = translated(&read_policy("id IN (SELECT pg_catalog.lower('W'))"), &options());
+    let view = statement(&script, "docs");
+    assert!(view.ends_with("lower('W')))"), "{view}");
+}
+
+/// A name the schema declares twice settles on no one function by name, and
+/// the lookup's refusal says so.
+#[test]
+fn an_overloaded_declared_function_is_refused() {
+    let overloads = "CREATE FUNCTION pick(x INT) RETURNS TEXT LANGUAGE sql AS $$ SELECT 'a' $$;\
+                     CREATE FUNCTION pick(x TEXT) RETURNS TEXT LANGUAGE sql AS $$ SELECT 'b' $$;";
+    let error =
+        refusal(&format!("{overloads}{}", read_policy("id IN (SELECT pick(1))")), &options());
+    assert!(error.to_string().contains("pick"), "{error}");
+}
+
 #[test]
 fn a_caller_setting_without_a_mapping_is_refused() {
     let options = Pg2SqliteOptions::default()
