@@ -3,9 +3,11 @@
 
 use alloc::collections::BTreeSet;
 
+use sql_traits::utils::identifier_resolution::identifiers_match;
 use sqlparser::ast::{
     ColumnOption, ColumnOptionDef, CreateTable, CreateTableOptions, HiveDistributionStyle,
-    OnCommit, PrimaryKeyConstraint, SqliteTableOption, TableConstraint, WithData,
+    NotNullConstraint, ObjectName, OnCommit, PrimaryKeyConstraint, SqliteTableOption,
+    TableConstraint, WithData,
 };
 
 #[cfg(not(feature = "std"))]
@@ -14,7 +16,10 @@ use crate::{
     impls::{
         ast_builder::blank_create_table,
         object_name::normalize_schema_qualified_object_name_for_sqlite,
-        translator_impls::column::{folded_primary_key, translate_column_def},
+        translator_impls::{
+            column::{folded_primary_key, translate_column_def},
+            column_option::warn_no_inherit_dropped,
+        },
     },
     warnings::TranslationWarning,
 };
@@ -202,6 +207,18 @@ impl crate::traits::translator::TranslatorWithContext for CreateTable {
                 }
             })
             .collect();
+        // A table-level NOT NULL is the column's own requirement and lands on
+        // the column, so it is kept out of the constraint list below.
+        let table_not_nulls: Vec<&NotNullConstraint> = self
+            .constraints
+            .iter()
+            .filter_map(|constraint| {
+                match constraint {
+                    TableConstraint::NotNull(not_null) => Some(not_null),
+                    _ => None,
+                }
+            })
+            .collect();
         // A key folded onto its identity column so it can carry
         // `AUTOINCREMENT` must not also stay a table constraint.
         let folded_key = self
@@ -225,12 +242,18 @@ impl crate::traits::translator::TranslatorWithContext for CreateTable {
         created_table.constraints = self
             .constraints
             .iter()
-            .filter(|c| !(folded_key && matches!(c, TableConstraint::PrimaryKey(_))))
+            .filter(|c| {
+                if matches!(c, TableConstraint::NotNull(_)) {
+                    return false;
+                }
+                !(folded_key && matches!(c, TableConstraint::PrimaryKey(_)))
+            })
             .map(|c| c.translate_with_warnings(schema, options, emit))
             .collect::<Result<Vec<Vec<TableConstraint>>, _>>()?
             .into_iter()
             .flatten()
             .collect();
+        apply_table_not_null(&mut created_table, &table_not_nulls, &self.name, emit)?;
         created_table.query = query;
         // SQLite STRICT mode enforces type checking (not valid on CTAS).
         // The source carries no table options, refused above.
@@ -270,6 +293,55 @@ impl crate::traits::translator::TranslatorWithContext for CreateTable {
 
         Ok(created_table)
     }
+}
+
+/// Carries the table-level `NOT NULL` constraints onto the columns they name.
+///
+/// SQLite's table-constraint grammar has no NOT NULL, and PostgreSQL 18
+/// treats the clause as the column's own not-null requirement, so the column
+/// keeps one NOT NULL carrying the constraint name when one is written. The
+/// translation schema has already refused the spellings PostgreSQL refuses,
+/// so a requirement names a declared column and agrees with the column's
+/// own spelling on name and `NO INHERIT`, and the refusal stands only so a
+/// matching change cannot drop the requirement in silence.
+fn apply_table_not_null(
+    created_table: &mut CreateTable,
+    not_nulls: &[&NotNullConstraint],
+    table_name: &ObjectName,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<(), crate::errors::Error> {
+    for not_null in not_nulls {
+        let Some(column) = created_table.columns.iter_mut().find(|column| {
+            identifiers_match(
+                not_null.column.value.as_str(),
+                not_null.column.quote_style.is_some(),
+                column.name.value.as_str(),
+                column.name.quote_style.is_some(),
+            )
+        }) else {
+            return Err(crate::errors::Error::forward_refusal(format!(
+                "CREATE TABLE {table_name} declares NOT NULL {} over a column the table does \
+                 not declare. Name one of the table's declared columns.",
+                not_null.column
+            )));
+        };
+        warn_no_inherit_dropped("NOT NULL ... NO INHERIT", "NOT NULL", not_null.no_inherit, emit);
+        // The schema build refused two different names over one column, so a
+        // written name always agrees with the column's own spelling.
+        match (
+            column.options.iter_mut().find(|option| matches!(option.option, ColumnOption::NotNull)),
+            not_null.name.as_ref(),
+        ) {
+            (Some(option), Some(name)) => option.name = Some(name.clone()),
+            (Some(_), None) => {}
+            (None, name) => {
+                column
+                    .options
+                    .push(ColumnOptionDef { name: name.cloned(), option: ColumnOption::NotNull });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Refuses the `CREATE TABLE` modifiers that cannot reach SQLite, so

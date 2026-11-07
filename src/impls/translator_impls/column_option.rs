@@ -13,22 +13,26 @@ use crate::impls::{
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
 
-/// Warn that a `CHECK ... NO INHERIT` loses its modifier.
+/// Warn that a `NO INHERIT` modifier loses its meaning.
 ///
 /// Provably neutral: `NO INHERIT` only stops a constraint from reaching child
 /// tables, SQLite has no table inheritance, and `INHERITS` itself is refused,
-/// so no child exists for the constraint to be withheld from.
+/// so no child exists for the constraint to be withheld from. `construct`
+/// names the clause and `kept` what survives the drop.
 pub(crate) fn warn_no_inherit_dropped(
-    check: &sqlparser::ast::CheckConstraint,
+    construct: &str,
+    kept: &str,
+    no_inherit: bool,
     emit: crate::warnings::WarningSink<'_>,
 ) {
-    if check.no_inherit {
+    if no_inherit {
         emit(crate::warnings::TranslationWarning::LossyDrop {
-            construct: "CHECK ... NO INHERIT".to_string(),
-            reason: "NO INHERIT only stops a constraint from reaching child tables, and \
-                     SQLite has no table inheritance, so the modifier was dropped and the \
-                     CHECK itself is kept."
-                .to_string(),
+            construct: construct.to_string(),
+            reason: format!(
+                "NO INHERIT only stops a constraint from reaching child tables, and \
+                 SQLite has no table inheritance, so the modifier was dropped and the \
+                 {kept} itself is kept."
+            ),
         });
     }
 }
@@ -95,7 +99,12 @@ impl crate::traits::translator::TranslatorWithContext for ColumnOptionDef {
                 if options.is_remove_unsupported_check_constraints_enabled() {
                     Ok(None)
                 } else {
-                    warn_no_inherit_dropped(check, emit);
+                    warn_no_inherit_dropped(
+                        "CHECK ... NO INHERIT",
+                        "CHECK",
+                        check.no_inherit,
+                        emit,
+                    );
                     let translated_expr =
                         check.expr.translate_with_warnings(schema, options, emit)?;
                     Ok(Some(ColumnOptionDef {
