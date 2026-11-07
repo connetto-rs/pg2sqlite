@@ -8,7 +8,7 @@
 //! fails here.
 
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use run_translated_helper::{first_column_text, run_translated_with};
+use run_translated_helper::{first_column_text, run_translated_utc, run_translated_with};
 
 use crate::helpers::{run_translated as run_translated_helper, translate::assert_refused};
 
@@ -356,8 +356,10 @@ fn the_stored_text_is_unchanged_on_value_free_reads() {
 #[test]
 fn a_timestamp_shift_by_a_literal_interval_keeps_working() {
     assert_eq!(
-        ids("SELECT id FROM t WHERE ts + interval '1 day' > ts ORDER BY id"),
-        vec!["1", "2", "3"]
+        run_translated_utc(&format!(
+            "{SCHEMA}\nSELECT id FROM t WHERE ts + interval '1 day' > ts ORDER BY id"
+        )),
+        [Some("1"), Some("2"), Some("3")].map(|id| id.map(String::from))
     );
 }
 

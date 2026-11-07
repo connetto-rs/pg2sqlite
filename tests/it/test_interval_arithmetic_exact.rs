@@ -9,10 +9,14 @@
 
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use run_translated_helper::{
-    run_translated_bound_with, run_translated_default, run_translated_with,
+    run_translated_bound_with, run_translated_default, run_translated_utc, run_translated_with,
 };
 
-use crate::helpers::{run_translated as run_translated_helper, translate::assert_refused};
+use crate::helpers::{
+    deployment::{UTC_REQUEST_ROLE, utc_request},
+    run_translated as run_translated_helper,
+    translate::assert_refused,
+};
 
 /// A differential pair: the two canonical interval texts PostgreSQL stores,
 /// and its answers to negating the first and to adding or subtracting the
@@ -9524,14 +9528,16 @@ fn a_shift_passing_the_year_9999_midway_answers_null() {
     }
 }
 
+/// Measured in UTC, the zone whose calendar a `timestamptz` shift takes.
 #[test]
 fn shifting_by_an_interval_column_answers_what_the_literal_shift_answers() {
+    let options = utc_request();
     for (kind, targets, _) in SHIFTS {
-        let schema = shift_schema(kind, targets);
+        let schema = format!("{UTC_REQUEST_ROLE}{}", shift_schema(kind, targets));
         for (op, expression) in shift_expressions("tg", "iv").iter().enumerate() {
             let got = run_translated_with(
                 &format!("{schema}\nSELECT ({expression})::text FROM sh ORDER BY id;"),
-                &Pg2SqliteOptions::default(),
+                &options,
             );
             for (row, value) in got.iter().enumerate() {
                 let interval = SHIFT_INTERVALS[row % SHIFT_INTERVALS.len()];
@@ -9542,7 +9548,7 @@ fn shifting_by_an_interval_column_answers_what_the_literal_shift_answers() {
                         row + 1
                     ))
                     .expect("parse")
-                    .translate_to_sql(&Pg2SqliteOptions::default());
+                    .translate_to_sql(&options);
                 let Ok(script) = script else {
                     // The literal path refuses what it can decide is out of
                     // range; the column form answers NULL there.
@@ -9552,7 +9558,7 @@ fn shifting_by_an_interval_column_answers_what_the_literal_shift_answers() {
                 drop(script);
                 let literal_answer = run_translated_with(
                     &format!("{schema}\nSELECT ({literal})::text FROM sh WHERE id = {};", row + 1),
-                    &Pg2SqliteOptions::default(),
+                    &options,
                 );
                 assert_eq!(
                     vec![value.clone()],
@@ -9836,7 +9842,7 @@ fn an_aggregate_over_an_operand_with_an_exists_is_refused() {
 #[test]
 fn shifting_by_a_null_interval_answers_null() {
     assert_eq!(
-        run_translated_default(&format!(
+        run_translated_utc(&format!(
             "{SCHEMA}\nSELECT (t.ts + n.iv)::text FROM n, t WHERE n.id = 2 AND t.id = 1;"
         )),
         vec![None]
