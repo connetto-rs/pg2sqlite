@@ -685,14 +685,12 @@ pub(crate) fn default_expr_for_column(
         return Err(unknown_default_column(table.table_name(), column_name));
     };
 
-    // Read the default off the column definition rather than through
-    // `ColumnLike::default_value()`, which renders it back to a String that
-    // would have to be reparsed. Returned untranslated on purpose: the caller
-    // substitutes it before the source is translated, so a PostgreSQL default
-    // such as `now()` goes through the ordinary expression path.
-    for option in &column.attribute().options {
-        if let sqlparser::ast::ColumnOption::Default(expr) = &option.option {
-            return Ok(expr.clone());
+    // The raw default goes untranslated, through the caller's expression path.
+    if !column.is_serial(schema) {
+        for option in &column.attribute().options {
+            if let sqlparser::ast::ColumnOption::Default(expr) = &option.option {
+                return Ok(expr.clone());
+            }
         }
     }
 

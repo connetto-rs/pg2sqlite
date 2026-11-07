@@ -12,8 +12,8 @@
 use core::{convert::Infallible, ops::ControlFlow};
 
 use sql_traits::{
-    errors::HelperSetError,
-    structs::{HelperArm, HelperSet, IdentifierCase, ParserDB},
+    errors::{HelperSetError, LookupError},
+    structs::{HelperArm, HelperSet, IdentifierCase, ParserDB, TargetName},
     traits::{ColumnLike, DatabaseLike, FunctionLike, TableLike},
 };
 use sqlparser::ast::{
@@ -63,13 +63,22 @@ pub(crate) fn helper_membership(
     }
     let Some(target) = function_lookup_target(&call.name) else { return Ok(None) };
     // A builtin resolves too, registered in `pg_catalog`, and is no helper.
-    let declared =
-        schema.resolve_target_function(target, IdentifierCase::AsWritten)?.filter(|function| {
-            !function
-                .target_name()
-                .schema()
-                .is_some_and(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
-        });
+    let declared = match schema.resolve_target_function(target.clone(), IdentifierCase::AsWritten) {
+        Ok(function) => {
+            function.filter(|function| {
+                !function
+                    .target_name()
+                    .schema()
+                    .is_some_and(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
+            })
+        }
+        // The catalog holds the name, so the ambiguous lookup settles to the
+        // builtins.
+        Err(LookupError::AmbiguousFunctionLookup { .. }) if pg_catalog_holds(schema, &target) => {
+            None
+        }
+        Err(error) => return Err(error.into()),
+    };
     let Some(helper) = declared else { return Ok(None) };
     let name = &call.name;
     let Some(deployment) = options.get_deployment() else {
@@ -92,6 +101,25 @@ pub(crate) fn helper_membership(
     let ControlFlow::Continue(()) = lowered
         .visit(&mut BackingTables { guarded: &guarded, suffix: options.get_rls_table_suffix() });
     Ok(Some(lowered))
+}
+
+/// Whether `pg_catalog` declares the name `target` carries, which settles an
+/// ambiguous name lookup to the builtins, no helper.
+fn pg_catalog_holds(schema: &ParserDB, target: &TargetName<'_>) -> bool {
+    let case = IdentifierCase::AsWritten;
+    let name = case.compared_form(target.name(), target.name_is_quoted());
+    match target.schema() {
+        Some(stored) => case.compared_form(stored, target.schema_is_quoted()) == "pg_catalog",
+        None => {
+            schema.functions().any(|function| {
+                let stored = function.target_name();
+                case.compared_form(stored.name(), stored.name_is_quoted()) == name
+                    && stored.schema().is_some_and(|schema_name| {
+                        case.compared_form(schema_name, stored.schema_is_quoted()) == "pg_catalog"
+                    })
+            })
+        }
+    }
 }
 
 /// The literals a call passes, one per argument.

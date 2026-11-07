@@ -152,7 +152,10 @@ fn trigger_columns(
                     _ => None,
                 }
             });
-            let declared = declared_default(attribute, options)?;
+            // A serial's stored default draws its sequence, which the rowid
+            // alias answers for.
+            let declared =
+                if column.is_serial(schema) { None } else { declared_default(attribute, options)? };
             // The guard path scales a NUMERIC default itself, so it takes the
             // raw one.
             let guard_default = if minor_unit_scale(&attribute.data_type).is_some() {

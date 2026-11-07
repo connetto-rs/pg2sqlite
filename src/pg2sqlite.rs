@@ -12,7 +12,7 @@ use sqlparser::{
         AlterTableOperation, CreateIndex, Ident, IndexType, ObjectName, ObjectNamePart, ObjectType,
         RenameTableNameKind, Statement, Value, ValueWithSpan,
     },
-    dialect::GenericDialect,
+    dialect::PostgreSqlDialect,
 };
 #[cfg(feature = "git")]
 use tempfile::TempDir;
@@ -378,7 +378,7 @@ impl Pg2Sqlite {
             Some(role) => options.with_session_role(role),
             None => options,
         };
-        options.ingestor::<GenericDialect>("translation_db".to_owned())
+        options.ingestor::<PostgreSqlDialect>("translation_db".to_owned())
     }
 
     fn build_translation_schema(
