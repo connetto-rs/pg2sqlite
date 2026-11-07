@@ -8,7 +8,6 @@
 //! through the function the application registers when the offset changes.
 
 use sql_traits::{errors::DeploymentError, structs::ParserDB};
-use sql_values::{PgTimeZone, TimeZoneError};
 
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
@@ -30,8 +29,6 @@ pub(crate) enum ZoneUnavailable {
     NoDeployment,
     /// The deployment cannot answer for the request.
     Deployment(DeploymentError),
-    /// A role setting reaching the request names a zone PostgreSQL refuses.
-    Setting { setting: String, reason: TimeZoneError },
 }
 
 impl ZoneUnavailable {
@@ -51,9 +48,6 @@ impl ZoneUnavailable {
                 )
             }
             Self::Deployment(error) => format!("{error}."),
-            Self::Setting { setting, reason } => {
-                format!("PostgreSQL refuses the TimeZone setting '{setting}', {reason}.")
-            }
         };
         Error::forward_refusal(format!(
             "`{operation}` adds days or months on the calendar of the request's TimeZone, which \
@@ -63,14 +57,14 @@ impl ZoneUnavailable {
 }
 
 /// The request's zone, from the deployment in `options` against the roles and
-/// role settings `schema` declares: the acting role's when `options` names
-/// one, and the zone the connection has before any `SET ROLE` otherwise.
+/// role settings `schema` declares, the acting role's when `options` names
+/// one and the zone the connection has before any `SET ROLE` otherwise.
 pub(crate) fn resolve(
     schema: &ParserDB,
     options: &Pg2SqliteOptions,
 ) -> Result<RequestZone, ZoneUnavailable> {
     let deployment = options.get_deployment().ok_or(ZoneUnavailable::NoDeployment)?;
-    let setting = deployment
+    let zone = deployment
         .resolve(schema)
         .and_then(|resolved| {
             match options.get_acting_role() {
@@ -79,9 +73,7 @@ pub(crate) fn resolve(
             }
         })
         .map_err(ZoneUnavailable::Deployment)?
-        .name();
-    let zone = PgTimeZone::parse(setting)
-        .map_err(|reason| ZoneUnavailable::Setting { setting: setting.to_string(), reason })?;
+        .zone();
     Ok(match zone.fixed_offset() {
         Some(offset) => RequestZone::Fixed(offset),
         None => RequestZone::Changing(zone.name().to_string()),
