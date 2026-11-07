@@ -28,7 +28,10 @@ use diesel::{
 use helpers::establish_connection;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
-use crate::{helpers, helpers::postgres as postgres_harness};
+use crate::{
+    helpers,
+    helpers::{deployment::utc_script, postgres as postgres_harness},
+};
 
 // ── Known divergences ────────────────────────────────────────────────────────
 
@@ -179,8 +182,11 @@ fn seed_rows() -> Vec<MomentRow> {
 
 // ── Setup ────────────────────────────────────────────────────────────────────
 
+/// Options for the translation, carrying the UTC deployment: the test's
+/// expected values were measured with PostgreSQL in UTC, and the request's
+/// `TimeZone` is the zone timestamptz reads follow.
 fn options() -> Pg2SqliteOptions {
-    Pg2SqliteOptions::default()
+    helpers::deployment::utc_request()
 }
 
 /// Opens a fresh PostgreSQL database and applies the schema and seed data.
@@ -199,7 +205,7 @@ fn pg_setup() -> PgConnection {
 /// literals.
 fn sqlite_setup() -> SqliteConnection {
     let ddl_stmts = Pg2Sqlite::default()
-        .sql(SCHEMA_PG)
+        .sql(&utc_script(SCHEMA_PG))
         .expect("parse moments DDL")
         .translate(&options())
         .expect("translate moments DDL")
@@ -259,11 +265,11 @@ fn pg_eval(conn: &mut PgConnection, pg_expr: &str, ids: &[i32]) -> Vec<Option<St
 /// (<ids>) ORDER BY id` through pg2sqlite and runs the result on SQLite.
 fn sqlite_eval(conn: &mut SqliteConnection, pg_expr: &str, ids: &[i32]) -> Vec<Option<String>> {
     let id_list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
-    let pg_sql = format!(
+    let pg_sql = utc_script(&format!(
         "{SCHEMA_PG}\n\
          SELECT CAST({pg_expr} AS TEXT) AS val \
          FROM moments WHERE id IN ({id_list}) ORDER BY id;"
-    );
+    ));
     let stmts = Pg2Sqlite::default()
         .sql(&pg_sql)
         .expect("parse for sqlite_eval")

@@ -62,14 +62,6 @@ pub(crate) struct BlobOperator {
     result: DataType,
 }
 
-impl BlobOperator {
-    /// The type the operator answers.
-    #[must_use]
-    pub(crate) fn result_type(&self) -> &DataType {
-        &self.result
-    }
-}
-
 /// The operand's type. A type the scope cannot read is unresolved, which
 /// matters only beside a BLOB-stored operand, where [`resolve`] refuses it.
 fn operand(
@@ -126,23 +118,71 @@ pub(crate) fn resolve(
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
 ) -> Result<Option<BlobOperator>, Error> {
-    if !matches!(
+    if !resolvable(op) {
+        return Ok(None);
+    }
+    let operands = [operand(left, schema, options), operand(right, schema, options)];
+    resolve_operands(left, op, right, &operands, schema)
+}
+
+/// The type `left op right` answers, the BLOB-stored operators [`resolve`]
+/// settles and the text concatenation of two string operands, each operand's
+/// type read once.
+///
+/// # Errors
+///
+/// As [`resolve`].
+pub(crate) fn result_type(
+    left: &Expr,
+    op: &BinaryOperator,
+    right: &Expr,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<Option<DataType>, Error> {
+    if !resolvable(op) {
+        return Ok(None);
+    }
+    let operands = [operand(left, schema, options), operand(right, schema, options)];
+    if let Some(resolved) = resolve_operands(left, op, right, &operands, schema)? {
+        return Ok(Some(resolved.result));
+    }
+    let string = |side: &Operand| {
+        match side {
+            Operand::Untyped => true,
+            Operand::Typed(data_type) => is_text(data_type),
+            Operand::Unresolved => false,
+        }
+    };
+    Ok((*op == BinaryOperator::StringConcat && operands.iter().all(string))
+        .then_some(DataType::Text))
+}
+
+/// Whether [`resolve`] reads the operator at all.
+const fn resolvable(op: &BinaryOperator) -> bool {
+    matches!(
         op,
         BinaryOperator::StringConcat
             | BinaryOperator::Plus
             | BinaryOperator::Minus
             | BinaryOperator::Multiply
-    ) {
-        return Ok(None);
-    }
-    let (left_type, right_type) = (operand(left, schema, options), operand(right, schema, options));
+    )
+}
+
+/// [`resolve`] over the operand types already read.
+fn resolve_operands(
+    left: &Expr,
+    op: &BinaryOperator,
+    right: &Expr,
+    [left_type, right_type]: &[Operand; 2],
+    schema: &ParserDB,
+) -> Result<Option<BlobOperator>, Error> {
     let typed = |side: &Operand| {
         match side {
             Operand::Typed(data_type) => Some(data_type.clone()),
             _ => None,
         }
     };
-    let sides = [typed(&left_type), typed(&right_type)];
+    let sides = [typed(left_type), typed(right_type)];
     // An array operand makes `||` an append, which the array lowering owns.
     if sides.iter().flatten().any(|data_type| matches!(data_type, DataType::Array(_))) {
         return Ok(None);
@@ -160,7 +200,7 @@ pub(crate) fn resolve(
     else {
         return Ok(None);
     };
-    let other = if blob_on_left { &right_type } else { &left_type };
+    let other = if blob_on_left { right_type } else { left_type };
     let other_family = match other {
         Operand::Untyped => Some(blob_family),
         Operand::Typed(data_type) => family(data_type, schema),
@@ -183,8 +223,8 @@ pub(crate) fn resolve(
         Error::forward_refusal(format!(
             "{op} over {} and {} has no PostgreSQL operator, so the server refuses it with \
              `operator does not exist`.",
-            describe(&left_type),
-            describe(&right_type)
+            describe(left_type),
+            describe(right_type)
         ))
     };
     let lowering = match (blob_family, op) {

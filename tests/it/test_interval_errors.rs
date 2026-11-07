@@ -2,6 +2,8 @@
 
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
+use crate::helpers::deployment::{utc_request, utc_script};
+
 // Schema definitions for test tables
 diesel::table! {
     /// Events table for testing interval translations.
@@ -98,9 +100,9 @@ fn test_interval_in_arithmetic() -> Result<(), Box<dyn std::error::Error>> {
 /// statement, as text.
 fn translated_value(sql: &str) -> String {
     let statements = Pg2Sqlite::default()
-        .sql(sql)
+        .sql(&utc_script(sql))
         .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
+        .translate_to_sql(&utc_request())
         .expect("translation")
         .into_vec();
     let probe = statements.last().expect("a select").clone();

@@ -21,7 +21,7 @@ use crate::no_std::prelude::*;
 use crate::{
     impls::{
         datetime_helpers::{
-            DatePartKey, build_date_part_expr, canonical_timestamptz_text, datetime_field_key,
+            DatePartKey, canonical_timestamptz_text, datetime_field_key,
             is_offset_less_timestamp_call, local_timestamp_text,
         },
         expr_helpers::{
@@ -71,6 +71,7 @@ use crate::{
             helpers::Forward,
             vector::{UnstoredVector, is_vector_data_type},
         },
+        zone_clock::{RegisteredClock, ZoneClock, zone_clock},
     },
     traits::translator::TranslatorWithContext,
 };
@@ -263,6 +264,19 @@ fn translate_extract(
                 .to_string(),
         ));
     }
+    // The offset fields answer the instant's UTC offset, not a wall clock.
+    let unit = match field {
+        DateTimeField::Timezone => Some("timezone"),
+        DateTimeField::TimezoneHour => Some("timezone_hour"),
+        DateTimeField::TimezoneMinute => Some("timezone_minute"),
+        _ => None,
+    };
+    if let Some(unit) = unit {
+        let operation = format!("extract({unit} from {expr})");
+        return crate::impls::zone_clock::zoned_offset_of(
+            unit, expr, &operation, schema, options, emit,
+        );
+    }
     let key = datetime_field_key(field).ok_or_else(|| {
         crate::errors::Error::forward_refusal(format!(
             "EXTRACT({field}) is not supported in SQLite. Supported fields: \
@@ -277,7 +291,8 @@ fn translate_extract(
     {
         return result;
     }
-    Ok(build_date_part_expr(key, expr.translate_with_warnings(schema, options, emit)?))
+    let operation = format!("extract({field} from {expr})");
+    crate::impls::zone_clock::zoned_date_part(key, expr, &operation, schema, options, emit)
 }
 /// True when `expr` is an array: an `ARRAY[...]` literal, or a column declared
 /// with an array type.
@@ -440,7 +455,19 @@ pub(crate) fn is_boolean_expression(
         Expr::Cast { data_type, .. } => {
             matches!(data_type, DataType::Boolean | DataType::Bool)
         }
-        // Boolean by construction, whatever the operands are.
+        _ if is_boolean_by_construction(expr) => true,
+        _ => {
+            declared_type_matches(expr, schema, options, |declared| {
+                matches!(declared.to_ascii_lowercase().as_str(), "boolean" | "bool")
+            })?
+        }
+    })
+}
+
+/// Whether `expr` answers a boolean by construction, whatever its operands
+/// are.
+pub(crate) fn is_boolean_by_construction(expr: &Expr) -> bool {
+    match expr {
         Expr::Value(ValueWithSpan { value: Value::Boolean(_), .. })
         | Expr::UnaryOp { op: UnaryOperator::Not, .. }
         | Expr::IsNull(_)
@@ -453,6 +480,8 @@ pub(crate) fn is_boolean_expression(
         | Expr::IsNotUnknown(_)
         | Expr::IsDistinctFrom(_, _)
         | Expr::IsNotDistinctFrom(_, _)
+        | Expr::IsJson { .. }
+        | Expr::IsNormalized { .. }
         | Expr::In { .. }
         | Expr::Between { .. }
         | Expr::Like { .. }
@@ -476,12 +505,8 @@ pub(crate) fn is_boolean_expression(
                     | BinaryOperator::Xor
             )
         }
-        _ => {
-            declared_type_matches(expr, schema, options, |declared| {
-                matches!(declared.to_ascii_lowercase().as_str(), "boolean" | "bool")
-            })?
-        }
-    })
+        _ => false,
+    }
 }
 
 /// Renders a boolean operand the way PostgreSQL renders one as text.
@@ -2993,31 +3018,6 @@ pub(crate) enum ZonedCalendar<'o> {
     Registered(RegisteredClock<'o>),
 }
 
-/// A zone whose UTC offset changes, read through the functions the replica
-/// registers for it.
-#[derive(Clone, Copy)]
-pub(crate) struct RegisteredClock<'o> {
-    functions: &'o crate::traits::TimeZoneFunctions,
-    zone: &'o str,
-}
-
-impl RegisteredClock<'_> {
-    /// `local_clock(instant, 'zone')`, the zone's wall clock at `instant`.
-    pub(crate) fn local_clock(&self, instant: Expr) -> Expr {
-        simple_function_expr(
-            &self.functions.local_clock,
-            vec![instant, string_literal(self.zone)],
-            None,
-        )
-    }
-
-    /// `instant(local, 'zone')`, the instant the zone's wall clock `local`
-    /// names.
-    pub(crate) fn instant(&self, local: Expr) -> Expr {
-        simple_function_expr(&self.functions.instant, vec![local, string_literal(self.zone)], None)
-    }
-}
-
 /// The calendar PostgreSQL adds the months and days of an interval to
 /// `target` on, `kind` being its temporal type and `operation` the arithmetic
 /// as written.
@@ -3029,7 +3029,7 @@ impl RegisteredClock<'_> {
 /// # Errors
 ///
 /// Refuses a zone that does not resolve, a zone whose offset changes when no
-/// function is registered for it, and an operand whose type is not settled
+/// functions are registered for it, and an operand whose type is not settled
 /// outside UTC.
 pub(crate) fn zoned_calendar<'o>(
     target: &Expr,
@@ -3039,47 +3039,32 @@ pub(crate) fn zoned_calendar<'o>(
     schema: &ParserDB,
     options: &'o crate::options::TranslationContext<'_>,
 ) -> Result<ZonedCalendar<'o>, crate::errors::Error> {
-    let settled = match kind {
+    match kind {
         _ if !moves_calendar => return Ok(ZonedCalendar::Clock(0)),
         Some(TemporalKind::Date | TemporalKind::Timestamp | TemporalKind::Time { .. }) => {
             return Ok(ZonedCalendar::Clock(0));
         }
-        Some(TemporalKind::TimestampTz) => true,
-        None => false,
-    };
-    let zone = match options.request_zone(schema) {
-        Ok(RequestZone::Fixed(0)) => return Ok(ZonedCalendar::Clock(0)),
-        Ok(zone) if settled => zone,
-        Err(unavailable) if settled => return Err(unavailable.refusal(operation)),
-        Ok(_) | Err(_) => {
-            return Err(crate::errors::Error::forward_refusal(format!(
-                "`{operation}` adds days or months to an operand whose type this translation \
-                 cannot settle. PostgreSQL counts them on the calendar of the request's TimeZone \
-                 for a timestamptz and on a calendar of no zone for a timestamp, and outside UTC \
-                 the two answers differ. Cast the operand, as `{target}::timestamptz` or \
-                 `{target}::timestamp`, to say which it is."
-            )));
-        }
-    };
-    match zone {
-        RequestZone::Fixed(offset) => Ok(ZonedCalendar::Clock(*offset)),
-        RequestZone::Changing(zone) => {
-            match options.get_time_zone_functions() {
-                Some(functions) => {
-                    Ok(ZonedCalendar::Registered(RegisteredClock { functions, zone }))
-                }
-                None => {
+        Some(TemporalKind::TimestampTz) => {}
+        None => {
+            return match options.request_zone(schema) {
+                Ok(RequestZone::Fixed(0)) => Ok(ZonedCalendar::Clock(0)),
+                Ok(_) | Err(_) => {
                     Err(crate::errors::Error::forward_refusal(format!(
-                        "`{operation}` adds days or months on the calendar of the request's \
-                         TimeZone '{zone}', whose UTC offset changes, and SQLite's date \
-                         functions know no zone. Register the SQLite functions turning an \
-                         instant into the zone's wall clock and back, and name them with \
-                         `with_time_zone_functions(...)`."
+                        "`{operation}` adds days or months to an operand whose type this \
+                         translation cannot settle. PostgreSQL counts them on the calendar of \
+                         the request's TimeZone for a timestamptz and on a calendar of no zone \
+                         for a timestamp, and outside UTC the two answers differ. Cast the \
+                         operand, as `{target}::timestamptz` or `{target}::timestamp`, to say \
+                         which it is."
                     )))
                 }
-            }
+            };
         }
     }
+    Ok(match zone_clock(operation, "add days or months on the calendar of", schema, options)? {
+        ZoneClock::Offset(offset) => ZonedCalendar::Clock(offset),
+        ZoneClock::Registered(clock) => ZonedCalendar::Registered(clock),
+    })
 }
 
 /// The display spelling of a comparison operator, in PostgreSQL's spelling.
@@ -4364,69 +4349,105 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                     if let Some(info) = exact_numeric_info(data_type) {
                         return translate_numeric_cast(expr, info, schema, options, emit);
                     }
-                    // A cast to a temporal type answers the text a column of
-                    // that type holds.
-                    if let Some(kind) =
-                        crate::impls::temporal_literals::temporal_literal_kind(data_type)
-                    {
+                    // A cast to a temporal type or to text answers the text
+                    // PostgreSQL answers for the pair.
+                    let temporal_target =
+                        crate::impls::temporal_literals::temporal_literal_kind(data_type);
+                    let text_target = matches!(data_type, sqlparser::ast::DataType::Text);
+                    if temporal_target.is_some() || text_target {
                         use crate::impls::temporal_casts as casts;
-                        crate::impls::shared_helpers::temporal_precision_replay_refusal(
-                            expr, data_type, options,
-                        )?;
                         let source_kind =
                             casts::cast_source_kind(expr, schema, options).ok().flatten();
                         let awareness =
                             crate::impls::timezone::timestamp_awareness(expr, schema, options)
                                 .ok()
                                 .flatten();
-                        if source_kind.is_none()
-                            && awareness.is_none()
-                            && crate::impls::shared_helpers::is_integral_expression(
-                                expr, schema, options,
-                            )?
-                        {
-                            return Err(casts::integer_cast_refusal(kind));
+                        // A cast this translation cannot settle by kind reads
+                        // a timestamptz as the request's zone answers it.
+                        let cast = format!("{expr}::{data_type}");
+                        if source_kind.is_none() && awareness.is_none() {
+                            crate::impls::zone_clock::unsettled_operand_refusal(
+                                &cast, expr, schema, options,
+                            )?;
                         }
-                        let translated = expr.translate_with_warnings(schema, options, emit)?;
-                        // A kind change rewrites the text into the target
-                        // kind's form, or refuses the pair.
-                        if let Some(source) = source_kind
-                            && let Some(rewritten) = casts::translate_temporal_kind_cast(
+                        if let Some(kind) = temporal_target {
+                            crate::impls::shared_helpers::temporal_precision_replay_refusal(
+                                expr, data_type, options,
+                            )?;
+                            if source_kind.is_none()
+                                && awareness.is_none()
+                                && crate::impls::shared_helpers::is_integral_expression(
+                                    expr, schema, options,
+                                )?
+                            {
+                                return Err(casts::integer_cast_refusal(kind));
+                            }
+                            let translated = expr.translate_with_warnings(schema, options, emit)?;
+                            // A kind change rewrites the text into the target
+                            // kind's form, or refuses the pair.
+                            if let Some(source) = source_kind
+                                && let Some(rewritten) = casts::translate_temporal_kind_cast(
+                                    kind,
+                                    source,
+                                    &translated,
+                                    options,
+                                )?
+                            {
+                                return Ok(rewritten);
+                            }
+                            // Text of unknown kind is read by SQLite's date
+                            // functions.
+                            if source_kind.is_none()
+                                && awareness.is_none()
+                                && let Some(read) = casts::temporal_text_reader(kind)
+                            {
+                                casts::warn_text_read_by_date_functions(expr, data_type, emit);
+                                return Ok(crate::impls::shared_helpers::round_column_text(
+                                    kind,
+                                    read(translated),
+                                ));
+                            }
+                            // A timestamptz read as a wall clock answers from
+                            // the request's zone.
+                            let zoned = crate::impls::zone_clock::conversion_wall_clock(
+                                kind, awareness, &cast, schema, options,
+                            )?;
+                            let converted = crate::impls::shared_helpers::convert_temporal_value(
                                 kind,
-                                source,
-                                &translated,
+                                translated,
+                                awareness,
+                                zoned,
+                                Some(expr),
+                                Some(&cast),
+                                Some(options),
+                            )?;
+                            if matches!(converted, Expr::Function(_)) {
+                                return Ok(converted);
+                            }
+                            return Ok(Expr::Cast {
+                                expr: Box::new(converted),
+                                data_type: data_type
+                                    .translate_with_warnings(schema, options, emit)?,
+                                format: None,
+                                kind: CastKind::Cast,
+                            });
+                        }
+                        // A cast to text of a timestamptz answers PostgreSQL's
+                        // output form, the zone's wall clock with its offset.
+                        if text_target
+                            && awareness == Some(crate::impls::timezone::TimestampAwareness::Aware)
+                        {
+                            let zoned = crate::impls::zone_clock::zoned_wall_clock(
+                                &cast,
+                                "read the wall clock of",
+                                schema,
                                 options,
-                            )?
-                        {
-                            return Ok(rewritten);
+                            )?;
+                            let translated = expr.translate_with_warnings(schema, options, emit)?;
+                            return crate::impls::zone_clock::timestamptz_text_form(
+                                zoned, translated, expr, &cast, options,
+                            );
                         }
-                        // Text of unknown kind is read by SQLite's date
-                        // functions.
-                        if source_kind.is_none()
-                            && awareness.is_none()
-                            && let Some(read) = casts::temporal_text_reader(kind)
-                        {
-                            casts::warn_text_read_by_date_functions(expr, data_type, emit);
-                            return Ok(crate::impls::shared_helpers::round_column_text(
-                                kind,
-                                read(translated),
-                            ));
-                        }
-                        let converted = crate::impls::shared_helpers::convert_temporal_value(
-                            kind,
-                            translated,
-                            awareness,
-                            Some(options),
-                        )?;
-                        if matches!(converted, Expr::Function(_)) {
-                            return Ok(converted);
-                        }
-                        return Ok(Expr::Cast {
-                            expr: Box::new(converted),
-                            data_type: data_type.translate_with_warnings(schema, options, emit)?,
-                            format: None,
-                            kind: CastKind::Cast,
-                        });
                     }
                     let translated_type =
                         data_type.translate_with_warnings(schema, options, emit)?;
@@ -5353,8 +5374,19 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn translate_extract_trim_any_and_unimplemented_branches() {
-        let schema = empty_schema();
-        let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
+        // An unsettled operand reads as a timestamptz, which needs the
+        // request's zone, so the request logs in as `app` on a UTC server.
+        let schema = sql_traits::structs::ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(
+            "CREATE ROLE app;",
+        )
+        .expect("the role parses");
+        let deployment = sql_traits::structs::Deployment::new("app", ["app"], [])
+            .expect("a valid deployment")
+            .with_default_time_zone("UTC")
+            .expect("PostgreSQL accepts UTC");
+        let options = crate::options::TranslationContext::from_owned(
+            Pg2SqliteOptions::default().with_deployment(deployment),
+        );
         let emit = &mut |_| {};
 
         // EXTRACT(WEEK) is the ISO week, which SQLite spells %V. %W is the

@@ -32,8 +32,8 @@ pub(crate) enum ZoneUnavailable {
 }
 
 impl ZoneUnavailable {
-    /// The refusal of `operation`, which needs the request's zone.
-    pub(crate) fn refusal(&self, operation: &str) -> Error {
+    /// The refusal of `operation`, which needs to `need` the request's zone.
+    pub(crate) fn refusal(&self, operation: &str, need: &str) -> Error {
         let cause = match self {
             Self::NoDeployment => {
                 "no deployment is configured. Pass the deployment with `with_deployment(...)`, \
@@ -50,8 +50,8 @@ impl ZoneUnavailable {
             Self::Deployment(error) => format!("{error}."),
         };
         Error::forward_refusal(format!(
-            "`{operation}` adds days or months on the calendar of the request's TimeZone, which \
-             this translation cannot resolve, because {cause}"
+            "`{operation}` needs to {need} the request's TimeZone, which this translation cannot \
+             resolve, because {cause}"
         ))
     }
 }

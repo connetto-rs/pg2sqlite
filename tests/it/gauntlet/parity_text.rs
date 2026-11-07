@@ -6,10 +6,13 @@
 
 use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
 use helpers::establish_connection;
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+use pg2sqlite::prelude::Pg2Sqlite;
 use postgres_harness::Outcome;
 
-use crate::{helpers, helpers::postgres as postgres_harness};
+use crate::{
+    helpers,
+    helpers::{deployment::utc_script, postgres as postgres_harness},
+};
 
 // DDL in PostgreSQL dialect; the SQLite side translates it.
 const TABLE_DDL: &str =
@@ -60,9 +63,9 @@ fn sqlite_conn() -> SqliteConnection {
     // The translator output is a runtime string; raw sql_query is the correct
     // form for applying translated DDL.
     let translated = Pg2Sqlite::default()
-        .sql(TABLE_DDL)
+        .sql(&utc_script(TABLE_DDL))
         .expect("parse table DDL")
-        .translate(&Pg2SqliteOptions::default())
+        .translate(&helpers::deployment::utc_request())
         .expect("translate table DDL")
         .into_vec();
     let mut conn = establish_connection();
@@ -119,11 +122,11 @@ fn sqlite_rows(conn: &mut SqliteConnection, sql: &str) -> Outcome {
 /// The last translated statement is the SELECT.
 fn translate_select(pg_select: &str) -> String {
     let stmts = Pg2Sqlite::default()
-        .sql(TABLE_DDL)
+        .sql(&utc_script(TABLE_DDL))
         .expect("parse DDL context")
         .sql(pg_select)
         .expect("parse PG SELECT")
-        .translate(&Pg2SqliteOptions::default())
+        .translate(&helpers::deployment::utc_request())
         .expect("translate SELECT")
         .into_vec();
     stmts.last().expect("non-empty translation output").to_string()

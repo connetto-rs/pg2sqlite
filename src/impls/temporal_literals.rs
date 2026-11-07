@@ -398,6 +398,13 @@ impl UtcOffset {
     }
 }
 
+/// The `±HH:MM` text of the UTC offset `offset` seconds east.
+pub(crate) fn offset_text(offset: i32) -> String {
+    let magnitude = offset.unsigned_abs();
+    UtcOffset { negative: offset < 0, hours: magnitude / 3600, minutes: magnitude / 60 % 60 }
+        .render()
+}
+
 /// Splits a UTC offset off the end.
 ///
 /// The search starts after the time part, since a date's own separators are

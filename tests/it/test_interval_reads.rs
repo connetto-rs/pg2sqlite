@@ -365,10 +365,7 @@ fn a_timestamp_shift_by_a_literal_interval_keeps_working() {
 
 #[test]
 fn interval_addition_and_subtraction_answer_postgresqls_text() {
-    let got = run_translated_with(
-        &format!("{SCHEMA}\nSELECT (iv + iv2)::text FROM t ORDER BY id;"),
-        &Pg2SqliteOptions::default(),
-    );
+    let got = run_translated_utc(&format!("{SCHEMA}\nSELECT (iv + iv2)::text FROM t ORDER BY id;"));
     assert_eq!(
         got,
         vec![
@@ -377,10 +374,9 @@ fn interval_addition_and_subtraction_answer_postgresqls_text() {
             Some("12 days".to_string()),
         ]
     );
-    let got = run_translated_with(
-        &format!("{SCHEMA}\nSELECT (iv + interval '1 day')::text FROM t ORDER BY id;"),
-        &Pg2SqliteOptions::default(),
-    );
+    let got = run_translated_utc(&format!(
+        "{SCHEMA}\nSELECT (iv + interval '1 day')::text FROM t ORDER BY id;"
+    ));
     assert_eq!(
         got,
         vec![
@@ -393,9 +389,7 @@ fn interval_addition_and_subtraction_answer_postgresqls_text() {
 
 #[test]
 fn interval_multiplication_and_division_answer_postgresqls_text() {
-    let run = |query: &str| {
-        run_translated_with(&format!("{SCHEMA}\n{query}"), &Pg2SqliteOptions::default())
-    };
+    let run = |query: &str| run_translated_utc(&format!("{SCHEMA}\n{query}"));
     let doubled =
         vec![Some("2 days".to_string()), Some("2 mons".to_string()), Some("20 days".to_string())];
     assert_eq!(run("SELECT (iv * 2)::text FROM t ORDER BY id;"), doubled);
@@ -408,10 +402,7 @@ fn interval_multiplication_and_division_answer_postgresqls_text() {
 
 #[test]
 fn a_negated_interval_answers_postgresqls_text() {
-    let got = run_translated_with(
-        &format!("{SCHEMA}\nSELECT (-iv)::text FROM n ORDER BY id;"),
-        &Pg2SqliteOptions::default(),
-    );
+    let got = run_translated_utc(&format!("{SCHEMA}\nSELECT (-iv)::text FROM n ORDER BY id;"));
     assert_eq!(
         got,
         vec![

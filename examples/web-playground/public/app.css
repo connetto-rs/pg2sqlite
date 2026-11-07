@@ -687,6 +687,11 @@ button.primary:hover:not(:disabled) {
     font-size: 0.875rem;
 }
 
+.options-refusal {
+    color: var(--error);
+    font-size: 0.875rem;
+}
+
 .session-vars {
     gap: 6px;
 }

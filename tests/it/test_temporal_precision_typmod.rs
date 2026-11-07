@@ -15,7 +15,7 @@
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use rusqlite::Connection;
 
-use crate::helpers::run_translated::run_translated_default;
+use crate::helpers::run_translated::run_translated_utc;
 
 const DDL: &str = "CREATE TABLE t (
     ts0 TIMESTAMP(0), t2 TIME(2), ts3 TIMESTAMP(3),
@@ -37,7 +37,7 @@ INSERT INTO t VALUES ('2024-01-02 23:59:59.6', NULL, NULL, NULL, NULL, NULL, NUL
 INSERT INTO t VALUES (NULL, NULL, '2024-01-02 03:04:05.0004', NULL, NULL, NULL, NULL, NULL, NULL, NULL);";
 
 fn run(pg: &str) -> Vec<String> {
-    let rows = run_translated_default(pg);
+    let rows = run_translated_utc(pg);
     rows.into_iter().map(|row| row.expect("the probe must not answer NULL")).collect()
 }
 

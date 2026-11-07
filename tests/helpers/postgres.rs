@@ -14,7 +14,12 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use diesel::{connection::SimpleConnection, prelude::*};
+use diesel::{
+    connection::SimpleConnection,
+    declare_sql_function,
+    prelude::*,
+    sql_types::{Bool, Text},
+};
 use parking_lot::Mutex;
 use testcontainers::{Container, ImageExt, runners::SyncRunner};
 use testcontainers_modules::postgres::Postgres;
@@ -239,6 +244,26 @@ pub fn set_session_user(connection: &mut PgConnection, user: &str) {
     diesel::sql_query(format!("SET app.username = '{user}'"))
         .execute(connection)
         .expect("set the session username");
+}
+
+#[declare_sql_function]
+extern "SQL" {
+    /// PostgreSQL's `set_config`, which sets `name` to `value` for the session
+    /// or, with `is_local`, the transaction.
+    fn set_config(name: Text, value: Text, is_local: Bool) -> Text;
+}
+
+/// A [`fresh_database`] whose session runs in the `TimeZone` `zone`.
+///
+/// # Panics
+///
+/// Panics when the database cannot be made or PostgreSQL refuses the zone.
+pub fn fresh_database_in_zone(zone: &str) -> PgConnection {
+    let mut connection = fresh_database();
+    diesel::select(set_config("TimeZone", zone, false))
+        .execute(&mut connection)
+        .expect("set the session zone");
+    connection
 }
 
 /// Reads every table once as a role that does not bypass row-level security.

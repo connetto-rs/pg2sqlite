@@ -43,8 +43,13 @@ fn plpgsql_substitute_variable_in_like_pattern() {
 
 #[test]
 fn plpgsql_substitute_variable_in_extract() {
-    let options = uuid_options();
+    // `my_ts TIMESTAMP := NOW()` and the `my_ts::TEXT` cast settle only when
+    // the request's TimeZone is, so the translation runs on the UTC
+    // deployment the value was measured under.
+    let options =
+        helpers::deployment::utc_request().with_uuid_representation(UuidRepresentation::Blob);
     let pg = r#"
+        CREATE ROLE app;
         CREATE TABLE t (id BLOB PRIMARY KEY, ts TEXT, val INTEGER);
         CREATE OR REPLACE FUNCTION extract_fn() RETURNS TRIGGER AS $$
         DECLARE

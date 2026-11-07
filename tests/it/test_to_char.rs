@@ -107,8 +107,9 @@ fn to_char_args_swapped_format_before_column() {
 fn to_char_now_also_translated() {
     // NOW() inside to_char should also be translated to strftime('%Y-%m-%d
     // %H:%M:%f000+00:00', 'now')
-    let sql = "SELECT to_char(NOW(), 'YYYY-MM-DD');";
-    let output = translate(sql).unwrap();
+    let sql = helpers::deployment::utc_script("SELECT to_char(NOW(), 'YYYY-MM-DD');");
+    let options = helpers::deployment::utc_request();
+    let output = helpers::translate_sql(&sql, &options).unwrap();
     assert!(
         output.contains("strftime('%Y-%m-%d'"),
         "to_char(NOW(), ...) should produce strftime, got: {output}"
@@ -117,7 +118,7 @@ fn to_char_now_also_translated() {
         output.contains("strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"),
         "NOW() inside to_char should become strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'), got: {output}"
     );
-    assert_all_stmts_parse_as_sqlite(sql);
+    helpers::prepared_user_select(&sql, &options);
 }
 
 // Error cases
@@ -181,15 +182,6 @@ fn to_char_wrong_arg_count_causes_error() {
         err.contains('2') || err.to_lowercase().contains("argument"),
         "Error should mention argument count, got: {err}"
     );
-}
-
-#[test]
-fn to_char_tz_code_causes_error() {
-    let sql = format!("{TABLE} SELECT to_char(ts, 'YYYY-MM-DD TZ') FROM t;");
-    let result = translate(&sql);
-    assert!(result.is_err(), "TZ timezone code should produce an error");
-    let err = result.unwrap_err();
-    assert!(!err.is_empty(), "Should have a non-empty error message: {err}");
 }
 
 /// PostgreSQL's ISO codes map exactly onto strftime specifiers: IYYY is %G,

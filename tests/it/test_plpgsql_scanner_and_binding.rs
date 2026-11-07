@@ -17,6 +17,8 @@
 use diesel::prelude::*;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
+use crate::helpers;
+
 #[derive(QueryableByName, Debug, PartialEq, Eq)]
 struct Pair {
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
@@ -27,10 +29,25 @@ struct Pair {
 
 /// Applies the translated script, then reads `probe` back.
 fn run(pg: &str, probe: &str) -> Vec<Pair> {
+    run_with_options(pg, probe, &Pg2SqliteOptions::default())
+}
+
+/// [`run`] on the UTC deployment, which a translation that settles a
+/// `::TEXT` cast over a variable the translator cannot type otherwise
+/// refuses.
+fn run_utc(pg: &str, probe: &str) -> Vec<Pair> {
+    run_with_options(
+        &helpers::deployment::utc_script(pg),
+        probe,
+        &helpers::deployment::utc_request(),
+    )
+}
+
+fn run_with_options(pg: &str, probe: &str, options: &Pg2SqliteOptions) -> Vec<Pair> {
     let statements = Pg2Sqlite::default()
         .sql(pg)
         .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
+        .translate_to_sql(options)
         .expect("translate")
         .into_vec();
     let mut connection = SqliteConnection::establish(":memory:").expect("connect");
@@ -175,7 +192,7 @@ fn a_dollar_quoted_literal_holding_a_quote_is_escaped() {
 /// variable was left unbound and the trigger failed with `no such column`.
 #[test]
 fn a_variable_named_like_a_keyword_is_still_bound() {
-    let rows = run(
+    let rows = run_utc(
         "CREATE TABLE events (id INT PRIMARY KEY, amount INT);
          CREATE TABLE audit (label TEXT, src TEXT);
          CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -206,7 +223,7 @@ fn a_variable_named_like_a_keyword_is_still_bound() {
 /// variable disappear.
 #[test]
 fn the_keyword_named_variable_still_carries_its_value() {
-    let rows = run(
+    let rows = run_utc(
         "CREATE TABLE events (id INT PRIMARY KEY, amount INT);
          CREATE TABLE audit (label TEXT, src TEXT);
          CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $$

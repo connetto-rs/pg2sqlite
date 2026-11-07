@@ -8,7 +8,7 @@ use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, Uu
 use translate_helpers::translate_default as translate;
 
 use crate::helpers::{
-    deployment::{caller, deployment},
+    deployment::{caller, deployment, utc_request, utc_script},
     translate as translate_helpers,
 };
 
@@ -248,8 +248,11 @@ fn default_now_translates_to_canonical_now() {
 /// would describe a table this test is trying to discover the shape of.
 #[test]
 fn every_default_shape_produces_runnable_ddl() {
-    let ddl = translate(
-        "CREATE TABLE defaults (
+    // The temporal defaults read the zone of the request, so the DDL
+    // translates under the UTC deployment.
+    let ddl = translate_with_options(
+        &utc_script(
+            "CREATE TABLE defaults (
             id INT PRIMARY KEY,
             literal TEXT DEFAULT 'a',
             signed INT DEFAULT -1,
@@ -260,6 +263,8 @@ fn every_default_shape_produces_runnable_ddl() {
             call TEXT DEFAULT now(),
             boolean BOOLEAN DEFAULT true
          );",
+        ),
+        &utc_request(),
     );
 
     let conn = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");

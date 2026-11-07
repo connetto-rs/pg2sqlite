@@ -8,8 +8,12 @@ use crate::helpers;
 
 #[test]
 fn plpgsql_trigger_translates_function_in_window_partition() {
-    let options = Pg2SqliteOptions::default().with_uuid_representation(UuidRepresentation::Blob);
+    // `now()` reads the request's TimeZone, so the translation runs on the
+    // UTC deployment the value was measured under.
+    let options =
+        helpers::deployment::utc_request().with_uuid_representation(UuidRepresentation::Blob);
     let raw = r#"
+        CREATE ROLE app;
         CREATE TABLE events (id UUID, department_id UUID, created_at TIMESTAMP);
         CREATE OR REPLACE FUNCTION test_func()
         RETURNS TRIGGER AS $$

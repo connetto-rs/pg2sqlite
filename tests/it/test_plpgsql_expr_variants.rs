@@ -103,8 +103,13 @@ fn plpgsql_ceil_floor_expr_transformed() {
 /// operator itself is observable and is what this now checks.
 #[test]
 fn plpgsql_at_time_zone_is_transformed() {
-    let options = uuid_options();
+    // `NOW() AT TIME ZONE 'UTC'` and the `::TEXT` cast over the variable
+    // settle only when the request's TimeZone is, so the translation runs on
+    // the UTC deployment the value was measured under.
+    let options =
+        helpers::deployment::utc_request().with_uuid_representation(UuidRepresentation::Blob);
     let sql = r#"
+        CREATE ROLE app;
         CREATE TABLE t (id BLOB PRIMARY KEY, ts TEXT);
         CREATE OR REPLACE FUNCTION tz_fn() RETURNS TRIGGER AS $$
         DECLARE

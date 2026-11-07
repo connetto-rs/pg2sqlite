@@ -24,7 +24,7 @@ use crate::helpers::run_translated as run_translated_helper;
 /// the write.
 fn write_and_read(columns: &str, body: &str, values: &str, column: &str) -> Option<String> {
     run_translated_with(
-        &format!(
+        &crate::helpers::deployment::utc_script(&format!(
             "CREATE TABLE t ({columns});
              CREATE FUNCTION f() RETURNS TRIGGER AS $$
              BEGIN
@@ -35,8 +35,8 @@ fn write_and_read(columns: &str, body: &str, values: &str, column: &str) -> Opti
              CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f();
              INSERT INTO t VALUES {values};
              SELECT {column} FROM t;"
-        ),
-        &Pg2SqliteOptions::default(),
+        )),
+        &crate::helpers::deployment::utc_request(),
     )
     .into_iter()
     .next()

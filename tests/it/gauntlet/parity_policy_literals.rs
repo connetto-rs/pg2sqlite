@@ -5,7 +5,7 @@
 //! deployment names that zone as the server's default. The rows each engine
 //! shows the acting role are compared.
 
-use diesel::{pg::PgConnection, prelude::*, sql_types::Text, sqlite::SqliteConnection};
+use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
 use pg2sqlite::prelude::Pg2SqliteOptions;
 
 use super::harness::apply_with_seed;
@@ -56,12 +56,7 @@ mod schema {
 fn postgres(zone: &str) -> Vec<i32> {
     use schema::events;
 
-    let mut connection: PgConnection = postgres_harness::fresh_database();
-    // A session setting has no typed DSL form.
-    diesel::sql_query("SELECT set_config('TimeZone', $1, false)")
-        .bind::<Text, _>(zone)
-        .execute(&mut connection)
-        .expect("set the session zone");
+    let mut connection: PgConnection = postgres_harness::fresh_database_in_zone(zone);
     postgres_harness::apply(&mut connection, &format!("{SCHEMA}{SEED}"))
         .expect("apply the schema and its rows");
     // A role switch has no typed DSL form.

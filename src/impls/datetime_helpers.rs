@@ -1,5 +1,8 @@
 //! Shared date/time mapping helpers for forward and reverse translation.
 
+use alloc::borrow::Cow;
+use core::ops::Range;
+
 use sqlparser::ast::{
     BinaryOperator, CastKind, DataType, DateTimeField, Expr, FunctionArg, FunctionArgExpr,
     FunctionArguments, Value, ValueWithSpan,
@@ -276,6 +279,121 @@ fn bare_t_is_literal(rest: &str) -> bool {
     !matches!(rest.as_bytes().get(1), Some(b'H' | b'M'))
 }
 
+/// What a piece of a `to_char` format is, as the zone code scans read it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FormatPiece {
+    /// A double-quoted literal run, quotes included.
+    Quoted,
+    /// The `OF` code.
+    Offset,
+    /// The `TZ` code, or `tz` when `lowercase`.
+    ZoneName { lowercase: bool },
+    /// One character of anything else.
+    Other,
+}
+
+/// The pieces of `pg_format` with the byte range each spans.
+///
+/// # Errors
+///
+/// Refuses an unterminated quote.
+fn format_pieces(pg_format: &str) -> Result<Vec<(FormatPiece, Range<usize>)>, Error> {
+    let mut pieces = Vec::new();
+    let mut at = 0;
+    while let Some(rest) = pg_format.get(at..).filter(|rest| !rest.is_empty()) {
+        let (piece, len) = if let Some(after_quote) = rest.strip_prefix('"') {
+            let end = after_quote.find('"').ok_or_else(|| {
+                unsupported_template(
+                    pg_format,
+                    "carries an unterminated quote. A literal run is written \"like this\".",
+                )
+            })?;
+            (FormatPiece::Quoted, end + 2)
+        } else if rest.starts_with("OF") {
+            (FormatPiece::Offset, 2)
+        } else if rest.starts_with("TZ") {
+            (FormatPiece::ZoneName { lowercase: false }, 2)
+        } else if rest.starts_with("tz") {
+            (FormatPiece::ZoneName { lowercase: true }, 2)
+        } else {
+            (FormatPiece::Other, rest.chars().next().map_or(1, char::len_utf8))
+        };
+        pieces.push((piece, at..at + len));
+        at += len;
+    }
+    Ok(pieces)
+}
+
+/// The zone codes a `to_char` format carries outside its quoted runs.
+///
+/// `of` is the UTC offset code, `tz` the zone name code, which PostgreSQL
+/// reads case-sensitively as `TZ` and `tz`. `wall_clock` says whether the
+/// format carries a date part code apart from the zone codes.
+///
+/// # Errors
+///
+/// Refuses an unterminated quote.
+pub(crate) fn to_char_zone_codes(pg_format: &str) -> Result<(bool, bool, bool), Error> {
+    let pieces = format_pieces(pg_format)?;
+    let remainder: String = pieces
+        .iter()
+        .filter(|(piece, _)| *piece == FormatPiece::Other)
+        .map(|(_, range)| &pg_format[range.clone()])
+        .collect();
+    Ok((
+        pieces.iter().any(|(piece, _)| *piece == FormatPiece::Offset),
+        pieces.iter().any(|(piece, _)| matches!(piece, FormatPiece::ZoneName { .. })),
+        TO_CHAR_CODES.iter().any(|(code, _)| remainder.contains(code)),
+    ))
+}
+
+/// The `to_char` format with its `OF` and `TZ` codes replaced by quoted runs
+/// of `of` and `tz`, the lowercase `tz` code printing `tz` in lowercase.
+///
+/// # Errors
+///
+/// Refuses an unterminated quote.
+pub(crate) fn to_char_zone_codes_to_literals(
+    pg_format: &str,
+    of: &str,
+    tz: &str,
+) -> Result<String, Error> {
+    let mut result = String::with_capacity(pg_format.len());
+    for (piece, range) in format_pieces(pg_format)? {
+        let literal = match piece {
+            FormatPiece::Quoted | FormatPiece::Other => {
+                result.push_str(&pg_format[range]);
+                continue;
+            }
+            FormatPiece::Offset => Cow::Borrowed(of),
+            FormatPiece::ZoneName { lowercase: false } => Cow::Borrowed(tz),
+            FormatPiece::ZoneName { lowercase: true } => Cow::Owned(tz.to_ascii_lowercase()),
+        };
+        result.push('"');
+        result.push_str(&literal);
+        result.push('"');
+    }
+    Ok(result)
+}
+
+/// The `to_char` format split at its `OF` codes, quoted runs kept whole.
+///
+/// # Errors
+///
+/// Refuses an unterminated quote.
+pub(crate) fn split_at_offset_codes(pg_format: &str) -> Result<Vec<&str>, Error> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    for (piece, range) in format_pieces(pg_format)? {
+        if piece == FormatPiece::Offset {
+            segments.push(&pg_format[start..range.start]);
+            start = range.end;
+        }
+    }
+    segments.push(&pg_format[start..]);
+    Ok(segments)
+}
+
 /// Copy a quoted run into the format, doubling every `%`.
 ///
 /// SQLite reads a `%` as introducing a specifier and answers NULL for one it
@@ -428,11 +546,16 @@ pub(crate) fn local_timestamp_text(value: Expr, modifier: Option<&str>) -> Expr 
     binary(whole, BinaryOperator::StringConcat, trimmed_fraction_of(value))
 }
 
+/// The time of day of a `YYYY-MM-DD HH:MM:SS[.f]` text.
+#[must_use]
+pub(crate) fn time_of_day(text: Expr) -> Expr {
+    simple_function_expr("substr", vec![text, integer_literal(12)], None)
+}
+
 /// The local time of day of an aware operand's value.
 #[must_use]
 pub(crate) fn local_time_of(value: Expr) -> Expr {
-    let local = local_timestamp_text(value, None);
-    simple_function_expr("substr", vec![local, number_literal("12")], None)
+    time_of_day(local_timestamp_text(value, None))
 }
 
 /// The local `time with time zone` text of an aware operand's value.

@@ -18,9 +18,8 @@ use crate::no_std::prelude::*;
 use crate::{
     impls::{
         datetime_helpers::{
-            DatePartKey, build_date_part_expr, build_date_trunc_quarter_call,
-            build_date_trunc_week_call, build_date_trunc_year_span_call, build_strftime_call,
-            parse_date_part_key, pg_to_char_format_to_strftime,
+            DatePartKey, build_date_trunc_quarter_call, build_date_trunc_week_call,
+            build_date_trunc_year_span_call, build_strftime_call, parse_date_part_key,
         },
         expr_helpers::case_when,
         function_helpers::{
@@ -35,7 +34,11 @@ use crate::{
             function_argument_exprs, rescale_minor_units, scale_of, translate_function_arguments,
         },
         temporal_arithmetic::{
-            epoch_of_temporal_difference, subsecond_timestamp_from_epoch, trim_trailing_zeros,
+            TemporalKind, epoch_of_temporal_difference, subsecond_timestamp_from_epoch,
+            temporal_kind_of, trim_trailing_zeros,
+        },
+        zone_clock::{
+            unsettled_operand_refusal, zoned_date_part, zoned_offset_of, zoned_wall_clock,
         },
     },
     prelude::Pg2SqliteOptions,
@@ -173,6 +176,8 @@ enum FunctionTranslation {
     /// `ceiling(x)`, which sqlparser does not parse as `Expr::Ceil`.
     /// Scale-aware for NUMERIC columns; falls back to a gated-math passthrough.
     NumericCeil,
+    /// The local clock of now, answered from the request's zone.
+    LocalClock { which: crate::impls::zone_clock::LocalClock },
 }
 
 /// Simple name-only renames: `(pg_name, sqlite_name)`.
@@ -302,11 +307,11 @@ fn rebuilt_function(
 ///
 /// Propagates the arity refusal, and the refusal a field argument that is not
 /// a string literal answers.
-fn literal_field_argument(
-    args: &FunctionArguments,
+fn literal_field_argument<'a>(
+    args: &'a FunctionArguments,
     function_name: &str,
     example: &str,
-) -> Result<(String, Expr), crate::errors::Error> {
+) -> Result<(String, &'a Expr), crate::errors::Error> {
     let exprs = extract_exactly(args, 2, function_name)?;
     let field_str = match exprs[0] {
         Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => s.to_lowercase(),
@@ -317,7 +322,7 @@ fn literal_field_argument(
             )));
         }
     };
-    Ok((field_str, exprs[1].clone()))
+    Ok((field_str, exprs[1]))
 }
 
 /// Builds PostgreSQL's `trunc(x, n)`, which truncates toward zero, out of
@@ -741,15 +746,17 @@ fn translate_catalog_function(
     "chr" => FunctionTranslation::Chr,
     "json_build_object" | "jsonb_build_object" => FunctionTranslation::JsonBuildObject,
     "json_array_length" | "jsonb_array_length" => FunctionTranslation::JsonArrayLength,
-    // localtimestamp -> datetime('now', 'localtime')
-    "localtimestamp" => FunctionTranslation::WithArgs {
-        name: "datetime".to_string(),
-        args: crate::impls::idioms::now_localtime_args(),
+    "localtimestamp" => FunctionTranslation::LocalClock {
+        which: crate::impls::zone_clock::LocalClock::Timestamp,
     },
-    // localtime -> time('now', 'localtime')
-    "localtime" => FunctionTranslation::WithArgs {
-        name: "time".to_string(),
-        args: crate::impls::idioms::now_localtime_args(),
+    "localtime" => FunctionTranslation::LocalClock {
+        which: crate::impls::zone_clock::LocalClock::Time,
+    },
+    "current_date" => FunctionTranslation::LocalClock {
+        which: crate::impls::zone_clock::LocalClock::Date,
+    },
+    "current_time" => FunctionTranslation::LocalClock {
+        which: crate::impls::zone_clock::LocalClock::TimeWithZone,
     },
     "mod" => FunctionTranslation::ToModulo,
     "div" => FunctionTranslation::ToIntegerDiv,
@@ -1891,65 +1898,96 @@ impl crate::traits::translator::TranslatorWithContext for Function {
             }
             FunctionTranslation::DateTrunc => {
                 reject_over_on_scalar(&func)?;
-                // date_trunc(field, timestamp) -> strftime(format, timestamp)
+                // The written arguments, whose subqueries the scope finds by
+                // address.
                 let (field_str, ts_expr) =
-                    literal_field_argument(&func.args, "date_trunc", "'day'")?;
+                    literal_field_argument(&self.args, "date_trunc", "'day'")?;
+                let operation = format!("date_trunc('{field_str}', {ts_expr})");
+                // A timestamptz truncates the zone's wall clock and answers
+                // an instant.
+                let kind = temporal_kind_of(ts_expr, schema, options);
+                if kind.is_none() {
+                    unsettled_operand_refusal(&operation, ts_expr, schema, options)?;
+                }
+                let zoned = match kind {
+                    Some(TemporalKind::TimestampTz) => {
+                        Some(zoned_wall_clock(
+                            &operation,
+                            "truncate the wall clock of",
+                            schema,
+                            options,
+                        )?)
+                    }
+                    _ => None,
+                };
                 let translated_ts = ts_expr.translate_with_warnings(schema, options, emit)?;
-
-                // The finer units are a format string that zeros the
-                // sub-granularity components rather than dropping them:
-                // PostgreSQL's date_trunc always answers a full timestamp, so a
-                // coarse unit that stopped at the date would never compare
-                // equal to a stored one, which this crate writes as TEXT
-                // `YYYY-MM-DD HH:MM:SS`.
-                let format_str = match field_str.as_str() {
-                    "second" | "seconds" => "%Y-%m-%d %H:%M:%S",
-                    // milliseconds: SQLite %f gives fractional seconds to three
-                    // digits.
-                    "millisecond" | "milliseconds" => "%Y-%m-%d %H:%M:%f",
-                    "minute" | "minutes" => "%Y-%m-%d %H:%M:00",
-                    "hour" | "hours" => "%Y-%m-%d %H:00:00",
-                    "day" | "days" => "%Y-%m-%d 00:00:00",
-                    "month" | "months" => "%Y-%m-01 00:00:00",
-                    "year" | "years" => "%Y-01-01 00:00:00",
-                    // The rest are calendar arithmetic, not a format.
-                    "week" | "weeks" => {
-                        return Ok(build_date_trunc_week_call(translated_ts));
+                let wall_clock = match zoned {
+                    Some(zoned) => {
+                        let reads_twice = matches!(field_str.as_str(), "quarter" | "quarters")
+                            || zoned.local_reads_twice()
+                            || zoned.instant_reads_twice();
+                        if reads_twice && !is_replayable(ts_expr, options) {
+                            return Err(reject_duplicated_operand(&operation, ts_expr));
+                        }
+                        zoned.local(translated_ts)
                     }
-                    "quarter" | "quarters" => {
-                        return Ok(build_date_trunc_quarter_call(translated_ts));
+                    None => translated_ts,
+                };
+                let call = match field_str.as_str() {
+                    // A full timestamp, the sub-granularity components zeroed
+                    // rather than dropped, so the result compares against a
+                    // stored value.
+                    "second" | "seconds" => build_strftime_call("%Y-%m-%d %H:%M:%S", wall_clock),
+                    "millisecond" | "milliseconds" => {
+                        // SQLite %f prints three digits where PostgreSQL drops
+                        // trailing zeros.
+                        trim_trailing_zeros(build_strftime_call("%Y-%m-%d %H:%M:%f", wall_clock))
                     }
-                    "decade" | "decades" => {
-                        return Ok(build_date_trunc_year_span_call(translated_ts, 10, 0));
-                    }
-                    "century" | "centuries" => {
-                        return Ok(build_date_trunc_year_span_call(translated_ts, 100, 1));
-                    }
+                    "minute" | "minutes" => build_strftime_call("%Y-%m-%d %H:%M:00", wall_clock),
+                    "hour" | "hours" => build_strftime_call("%Y-%m-%d %H:00:00", wall_clock),
+                    "day" | "days" => build_strftime_call("%Y-%m-%d 00:00:00", wall_clock),
+                    "month" | "months" => build_strftime_call("%Y-%m-01 00:00:00", wall_clock),
+                    "year" | "years" => build_strftime_call("%Y-01-01 00:00:00", wall_clock),
+                    // Calendar arithmetic, not a format.
+                    "week" | "weeks" => build_date_trunc_week_call(wall_clock),
+                    "quarter" | "quarters" => build_date_trunc_quarter_call(wall_clock),
+                    "decade" | "decades" => build_date_trunc_year_span_call(wall_clock, 10, 0),
+                    "century" | "centuries" => build_date_trunc_year_span_call(wall_clock, 100, 1),
                     "millennium" | "millennia" => {
-                        return Ok(build_date_trunc_year_span_call(translated_ts, 1000, 1));
+                        build_date_trunc_year_span_call(wall_clock, 1000, 1)
                     }
                     other => {
                         return Err(crate::errors::Error::forward_refusal(format!(
                             "date_trunc('{other}', ...) is not supported by this translation. \
-                                         Supported: millisecond, second, minute, hour, day, week, month, \
-                                         quarter, year, decade, century, millennium, and their plurals."
+                            Supported: millisecond, second, minute, hour, day, week, month, \
+                            quarter, year, decade, century, millennium, and their plurals."
                         )));
                     }
                 };
-                let call = build_strftime_call(format_str, translated_ts);
-                // SQLite's %f always prints three digits where PostgreSQL drops
-                // trailing zeros.
-                if matches!(field_str.as_str(), "millisecond" | "milliseconds") {
-                    return Ok(trim_trailing_zeros(call));
+                match zoned {
+                    // The result is a timestamptz in every zone.
+                    Some(zoned) => Ok(zoned.instant(call)),
+                    None => Ok(call),
                 }
-                Ok(call)
             }
             FunctionTranslation::DatePart => {
                 // date_part('field', expr) -> CAST(strftime(format, expr) AS
                 // INTEGER/REAL)
                 reject_over_on_scalar(&func)?;
                 let (field_str, ts_expr) =
-                    literal_field_argument(&func.args, "date_part", "'year'")?;
+                    literal_field_argument(&self.args, "date_part", "'year'")?;
+                // The offset fields answer the instant's UTC offset.
+                if matches!(field_str.as_str(), "timezone" | "timezone_hour" | "timezone_minute") {
+                    let operation = format!("date_part('{field_str}', {ts_expr})");
+                    return zoned_offset_of(
+                        field_str.as_str(),
+                        ts_expr,
+                        &operation,
+                        schema,
+                        options,
+                        emit,
+                    );
+                }
                 let key = parse_date_part_key(&field_str).ok_or_else(|| {
                     crate::errors::Error::forward_refusal(format!(
                         "date_part('{field_str}', ...) is not supported in SQLite. \
@@ -1961,20 +1999,17 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                 // spelled as a function.
                 if key == DatePartKey::Epoch
                     && let Some(result) =
-                        epoch_of_temporal_difference(&ts_expr, schema, options, emit)
+                        epoch_of_temporal_difference(ts_expr, schema, options, emit)
                 {
                     return result;
                 }
-                Ok(build_date_part_expr(
-                    key,
-                    ts_expr.translate_with_warnings(schema, options, emit)?,
-                ))
+                let operation = format!("date_part('{field_str}', {ts_expr})");
+                zoned_date_part(key, ts_expr, &operation, schema, options, emit)
             }
             FunctionTranslation::ToChar => {
                 reject_over_on_scalar(&func)?;
-                // to_char(expr, format) -> strftime(mapped_format, expr)
-                let exprs = extract_exactly(&func.args, 2, "to_char")?;
-                let ts_expr = exprs[0].clone();
+                let exprs = extract_exactly(&self.args, 2, "to_char")?;
+                let ts_expr = exprs[0];
                 let format_expr = exprs[1];
                 let format_str = match format_expr {
                     Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => {
@@ -1987,9 +2022,15 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                             .to_string()));
                     }
                 };
-                let mapped_format = pg_to_char_format_to_strftime(&format_str)?;
-                let translated_ts = ts_expr.translate_with_warnings(schema, options, emit)?;
-                Ok(build_strftime_call(&mapped_format, translated_ts))
+                let operation = format!("to_char({ts_expr}, '{format_str}')");
+                crate::impls::zone_clock::zoned_to_char(
+                    ts_expr,
+                    &format_str,
+                    &operation,
+                    schema,
+                    options,
+                    emit,
+                )
             }
             FunctionTranslation::ToRandomFloat => Ok(crate::impls::idioms::uniform_random_float()),
             FunctionTranslation::ToSubstrLeft => {
@@ -2625,6 +2666,41 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                     return Err(reject_duplicated_operand("cbrt", &x));
                 }
                 Ok(cube_root_closed_form(x))
+            }
+            FunctionTranslation::LocalClock { which } => {
+                reject_over_on_scalar(&func)?;
+                // The clock holds whole seconds, so a precision narrows
+                // nothing.
+                let name = which.name();
+                let precision_form = match &func.args {
+                    FunctionArguments::None => None,
+                    FunctionArguments::List(_) => {
+                        Some(matches!(
+                            function_argument_exprs(&func.args).as_slice(),
+                            [
+                                Expr::Value(ValueWithSpan {
+                                    value: Value::Number(digits, ..),
+                                    ..
+                                })
+                            ] if !digits.contains(['.', 'e', 'E'])
+                        ))
+                    }
+                    FunctionArguments::Subquery(_) => Some(false),
+                };
+                let invalid = match precision_form {
+                    None => false,
+                    Some(precision) => {
+                        which == crate::impls::zone_clock::LocalClock::Date || !precision
+                    }
+                };
+                if invalid {
+                    return Err(crate::errors::Error::forward_refusal(format!(
+                        "PostgreSQL answers a syntax error for this argument form of {name}, \
+                         which takes no argument or one integer-constant precision in \
+                         parentheses."
+                    )));
+                }
+                crate::impls::zone_clock::local_clock_clock(which, schema, options)
             }
             FunctionTranslation::ToLowerHex => {
                 let exprs = extract_exactly(&func.args, 2, "encode")?;

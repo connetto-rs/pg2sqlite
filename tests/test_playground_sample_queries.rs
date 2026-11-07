@@ -37,17 +37,21 @@
 #[expect(dead_code, reason = "this binary uses part of the shared helpers")]
 mod helpers;
 
+#[path = "../examples/web-playground/src/request.rs"]
+mod request;
 #[path = "../examples/web-playground/src/sample_sql.rs"]
 mod sample_sql;
 
-use helpers::deployment::{caller, deployment};
+use helpers::deployment::caller;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
+use request::declaring_role;
 use rusqlite::Connection;
 use sample_sql::{
     CONSTRAINTS_SQL as CONSTRAINTS_SCHEMA, FTS5_SQL as FTS5_SCHEMA,
     PGVECTOR_SQL as PGVECTOR_SCHEMA, POSTGIS_SQL as POSTGIS_SCHEMA, RLS_SQL as RLS_SCHEMA,
     SIMPLE_SQL as SIMPLE_SCHEMA,
 };
+use sql_traits::structs::{Deployment, SessionSetting};
 use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -88,9 +92,25 @@ fn register_current_app_user(conn: &Connection) {
     .expect("register current_app_user");
 }
 
+/// The playground's deployment in the server zone it starts with, declaring
+/// `settings`.
+fn playground_deployment(settings: Vec<SessionSetting>) -> Deployment {
+    let (deployment, refusal) = request::deployment(request::DEFAULT_TIME_ZONE, settings);
+    assert!(refusal.is_none(), "PostgreSQL refuses the default zone: {refusal:?}");
+    deployment
+}
+
+/// The options the playground configures by default.
+fn playground_options() -> Pg2SqliteOptions {
+    Pg2SqliteOptions::default()
+        .with_sqlitegis_enabled()
+        .with_uuid_representation(UuidRepresentation::Blob)
+        .with_deployment(playground_deployment(Vec::new()))
+}
+
 fn translate(schema: &str, options: &Pg2SqliteOptions) -> String {
     let stmts = Pg2Sqlite::default()
-        .sql(schema)
+        .sql(&declaring_role(schema))
         .expect("parse schema")
         .translate(options)
         .expect("translate schema")
@@ -112,8 +132,9 @@ fn run_query_once(
             // translate `schema + query` together and keep only the
             // tail. That way the vector-insert wrap and other
             // schema-driven rewrites get a complete table picture.
+            let schema = declaring_role(schema);
             let schema_stmts = Pg2Sqlite::default()
-                .sql(schema)
+                .sql(&schema)
                 .and_then(|t| t.translate(options).map(pg2sqlite::script::Script::into_vec))
                 .unwrap_or_else(|e| panic!("[{}] schema translate failed: {e}", query.label));
             let combined = format!("{schema};\n{}", query.sql);
@@ -189,9 +210,7 @@ const SIMPLE_QUERIES: &[CannedQuery] = &[
 
 #[test]
 fn simple_sample_queries() {
-    let opts = Pg2SqliteOptions::default()
-        .with_sqlitegis_enabled()
-        .with_uuid_representation(UuidRepresentation::Blob);
+    let opts = playground_options();
     let conn = open_connection();
     conn.execute_batch(&translate(SIMPLE_SCHEMA, &opts)).expect("apply Simple schema");
     run_queries_twice(&conn, SIMPLE_SCHEMA, SIMPLE_QUERIES, &opts);
@@ -220,9 +239,7 @@ const FTS5_QUERIES: &[CannedQuery] = &[
 
 #[test]
 fn fts5_sample_queries() {
-    let opts = Pg2SqliteOptions::default()
-        .with_sqlitegis_enabled()
-        .with_uuid_representation(UuidRepresentation::Blob);
+    let opts = playground_options();
     let conn = open_connection();
     conn.execute_batch(&translate(FTS5_SCHEMA, &opts)).expect("apply FTS5 schema");
     run_queries_twice(&conn, FTS5_SCHEMA, FTS5_QUERIES, &opts);
@@ -251,9 +268,7 @@ const PGVECTOR_QUERIES: &[CannedQuery] = &[
 
 #[test]
 fn pgvector_sample_queries() {
-    let opts = Pg2SqliteOptions::default()
-        .with_sqlitegis_enabled()
-        .with_uuid_representation(UuidRepresentation::Blob);
+    let opts = playground_options();
     let conn = open_connection();
     conn.execute_batch(&translate(PGVECTOR_SCHEMA, &opts)).expect("apply pgvector schema");
     run_queries_twice(&conn, PGVECTOR_SCHEMA, PGVECTOR_QUERIES, &opts);
@@ -286,7 +301,7 @@ fn rls_options() -> Pg2SqliteOptions {
         .with_sqlitegis_enabled()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_rls_audit_table_name("rls_violations")
-        .with_deployment(deployment(["app"], [caller("app.user_id", "integer")]))
+        .with_deployment(playground_deployment(vec![caller("app.user_id", "integer")]))
         .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
 }
 
@@ -328,9 +343,7 @@ const CONSTRAINTS_QUERIES: &[CannedQuery] = &[
 
 #[test]
 fn constraints_sample_queries() {
-    let opts = Pg2SqliteOptions::default()
-        .with_sqlitegis_enabled()
-        .with_uuid_representation(UuidRepresentation::Blob);
+    let opts = playground_options();
     let conn = open_connection();
     conn.execute_batch(&translate(CONSTRAINTS_SCHEMA, &opts)).expect("apply Constraints schema");
     run_queries_twice(&conn, CONSTRAINTS_SCHEMA, CONSTRAINTS_QUERIES, &opts);
@@ -368,9 +381,7 @@ fn postgis_sample_queries_translate() {
     // execute ST_GeomFromText, so we cannot apply the schema here.
     // We at least confirm every chip query parses and translates
     // cleanly, which is what the playground does at click time.
-    let opts = Pg2SqliteOptions::default()
-        .with_sqlitegis_enabled()
-        .with_uuid_representation(UuidRepresentation::Blob);
+    let opts = playground_options();
     let _ = translate(POSTGIS_SCHEMA, &opts);
     for q in POSTGIS_QUERIES {
         if q.dialect == Dialect::Postgres {
@@ -390,9 +401,7 @@ fn postgis_sample_queries() {
     // The shared helper's auto-extension registration is process-wide, so the
     // rusqlite connection below also gets the ST_* functions.
     let _gis_connection = helpers::sqlitegis::sqlitegis_connection();
-    let opts = Pg2SqliteOptions::default()
-        .with_sqlitegis_enabled()
-        .with_uuid_representation(UuidRepresentation::Blob);
+    let opts = playground_options();
     let conn = open_connection();
     conn.execute_batch(&translate(POSTGIS_SCHEMA, &opts)).expect("apply PostGIS schema");
     run_queries_twice(&conn, POSTGIS_SCHEMA, POSTGIS_QUERIES, &opts);
@@ -419,7 +428,7 @@ fn reverse_translate(
     sqlite_sql: &str,
     options: &Pg2SqliteOptions,
 ) -> Result<String, pg2sqlite::errors::Error> {
-    let translator = Pg2Sqlite::default().sql(pg_schema)?;
+    let translator = Pg2Sqlite::default().sql(&declaring_role(pg_schema))?;
     let schema = translator.build_schema()?;
     let stmts = translator.reverse_sql(sqlite_sql, &schema, options)?;
     Ok(stmts.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n"))
@@ -490,17 +499,13 @@ const RLS_REVERSE_CHIPS: &[ReverseCanned] = &[ReverseCanned {
 
 #[test]
 fn simple_sample_reverse_queries() {
-    let opts = Pg2SqliteOptions::default()
-        .with_sqlitegis_enabled()
-        .with_uuid_representation(UuidRepresentation::Blob);
+    let opts = playground_options();
     run_reverse_chips(SIMPLE_SCHEMA, SIMPLE_REVERSE_CHIPS, &opts);
 }
 
 #[test]
 fn pgvector_sample_reverse_queries() {
-    let opts = Pg2SqliteOptions::default()
-        .with_sqlitegis_enabled()
-        .with_uuid_representation(UuidRepresentation::Blob);
+    let opts = playground_options();
     run_reverse_chips(PGVECTOR_SCHEMA, PGVECTOR_REVERSE_CHIPS, &opts);
 }
 

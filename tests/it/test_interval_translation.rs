@@ -9,7 +9,7 @@ use pg2sqlite::prelude::Pg2Sqlite;
 
 use crate::helpers::{
     self,
-    deployment::{UTC_REQUEST_ROLE, utc_request},
+    deployment::{utc_request, utc_script},
 };
 
 fn translate(sql: &str) -> String {
@@ -18,7 +18,7 @@ fn translate(sql: &str) -> String {
 
 fn try_translate(sql: &str) -> Result<String, pg2sqlite::errors::Error> {
     Pg2Sqlite::default()
-        .sql(&format!("{UTC_REQUEST_ROLE}{sql}"))
+        .sql(&utc_script(sql))
         .and_then(|t| t.translate(&utc_request()).map(pg2sqlite::script::Script::into_vec))
         .map(|stmts| stmts.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n"))
 }
@@ -157,5 +157,5 @@ fn interval_column_stays_text() {
 /// Translates `pg` and executes every emitted statement against in-memory
 /// SQLite.
 fn execute_translated(pg: &str) {
-    helpers::execute_all(&format!("{UTC_REQUEST_ROLE}{pg}"), &utc_request());
+    helpers::execute_all(&utc_script(pg), &utc_request());
 }

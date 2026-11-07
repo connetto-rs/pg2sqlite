@@ -8,9 +8,12 @@
 //! compile time and cannot execute an arbitrary translated SQL string.
 
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use run_translated_helper::run_translated_with;
+use run_translated_helper::{run_translated_utc, run_translated_with};
 
-use crate::helpers::run_translated as run_translated_helper;
+use crate::helpers::{
+    deployment::{utc_request, utc_script},
+    run_translated as run_translated_helper,
+};
 
 fn translate_err(pg: &str) -> String {
     Pg2Sqlite::default()
@@ -630,10 +633,7 @@ fn time_column_write_positions_take_the_shifted_value() {
 /// 18.6.
 #[test]
 fn localtime_shifted_by_a_day_wraps_to_itself() {
-    let rows = run_translated_with(
-        "SELECT localtime + interval '24 hours' = localtime;",
-        &Pg2SqliteOptions::default(),
-    );
+    let rows = run_translated_utc("SELECT localtime + interval '24 hours' = localtime;");
     assert_eq!(rows, vec![Some("1".to_string())]);
 }
 
@@ -659,10 +659,7 @@ INSERT INTO k (id, d, tm, tt, ts, tzs, x) VALUES
     (3, '2025-02-28', '03:04:05.123456', '03:04:05.123456+00', '2025-02-28 00:00:00.123456', '2025-02-28 00:00:00.123456-03', '2025-02-28 00:00:00.123456');";
 
 fn kind_cast_rows(query: &str) -> Vec<Option<String>> {
-    run_translated_with(
-        &format!("{KIND_CAST_DDL}\nSELECT {query} FROM k ORDER BY id;"),
-        &Pg2SqliteOptions::default(),
-    )
+    run_translated_utc(&format!("{KIND_CAST_DDL}\nSELECT {query} FROM k ORDER BY id;"))
 }
 
 fn text_rows(values: &[&str]) -> Vec<Option<String>> {
@@ -809,9 +806,9 @@ fn concatenated_text_is_read_by_a_timestamp_cast() {
 /// PostgreSQL 18.6 prints it for a text function.
 #[test]
 fn unknown_argument_free_function_is_read_by_a_timestamp_cast() {
-    let options = Pg2SqliteOptions::default().with_user_defined_functions(["probe_stamp"]);
+    let options = utc_request().with_user_defined_functions(["probe_stamp"]);
     let probe = Pg2Sqlite::default()
-        .sql("SELECT probe_stamp()::timestamp;")
+        .sql(&utc_script("SELECT probe_stamp()::timestamp;"))
         .expect("parse")
         .translate_to_sql(&options)
         .expect("translate")
@@ -912,10 +909,9 @@ fn cast_between_kinds_compares_with_the_stored_text() {
         ("tzs::date = d", "3"),
     ] {
         assert_eq!(
-            run_translated_with(
-                &format!("{KIND_CAST_DDL}\nSELECT count(*) FROM k WHERE {predicate};"),
-                &Pg2SqliteOptions::default(),
-            ),
+            run_translated_utc(&format!(
+                "{KIND_CAST_DDL}\nSELECT count(*) FROM k WHERE {predicate};"
+            )),
             vec![Some(count.to_string())],
             "{predicate}"
         );

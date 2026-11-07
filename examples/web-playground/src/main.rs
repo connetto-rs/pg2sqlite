@@ -3,6 +3,7 @@
 
 mod components;
 mod db;
+mod request;
 mod runner;
 mod sample_sql;
 mod samples;

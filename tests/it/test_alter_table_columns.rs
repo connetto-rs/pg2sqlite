@@ -20,7 +20,10 @@
 use diesel::{QueryableByName, prelude::*, sql_types::Text};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
-use crate::helpers;
+use crate::helpers::{
+    self,
+    deployment::{utc_request, utc_script},
+};
 
 mod schema {
     diesel::table! {
@@ -53,7 +56,11 @@ fn table_info(conn: &mut SqliteConnection) -> Result<Vec<ColumnInfo>, Box<dyn st
     Ok(diesel::sql_query("PRAGMA table_info(t)").load(conn)?)
 }
 
-use helpers::apply_default as apply;
+/// [`helpers::apply_with_options`] under the UTC deployment, which the
+/// migration's `now()` default needs to read the zone from.
+fn apply(pg: &str) -> Result<SqliteConnection, Box<dyn std::error::Error>> {
+    helpers::apply_with_options(&utc_script(pg), &utc_request())
+}
 
 const BASE: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT NOT NULL);";
 

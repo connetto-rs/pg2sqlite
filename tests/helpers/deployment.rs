@@ -78,6 +78,12 @@ pub fn deployment<'a>(
 /// translates.
 pub const UTC_REQUEST_ROLE: &str = "CREATE ROLE app;";
 
+/// `sql` led by [`UTC_REQUEST_ROLE`], the script a [`utc_request`] translates.
+#[must_use]
+pub fn utc_script(sql: &str) -> String {
+    format!("{UTC_REQUEST_ROLE}{sql}")
+}
+
 /// Options for a request logging in as `app` on a server whose `TimeZone` is
 /// UTC, the zone a test measured PostgreSQL in, so that the months and days
 /// of an interval reach a `timestamptz` on the UTC calendar. The script names
