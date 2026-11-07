@@ -66,6 +66,3 @@ mod parity_timestamptz_zone;
 
 #[path = "gauntlet/parity_privileges.rs"]
 mod parity_privileges;
-
-#[path = "gauntlet/parity_table_not_null.rs"]
-mod parity_table_not_null;

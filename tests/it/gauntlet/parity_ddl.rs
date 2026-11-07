@@ -3,8 +3,13 @@
 //! A table carrying CHECK, NOT NULL, UNIQUE, two foreign keys (CASCADE and
 //! RESTRICT), a literal default, a function default, a generated column, and
 //! a VARCHAR(n) is created in both engines from the same PostgreSQL source.
-//! Each constraint is driven with an admitted write and a forbidden write; the
-//! storage is compared after each. Both FK parent-delete paths are exercised.
+//! A further table carries the PostgreSQL 18 table-level NOT NULL clause in
+//! its unnamed, named, and renaming spellings. Each constraint is driven with
+//! an admitted write and a forbidden write; the storage is compared after
+//! each. Both FK parent-delete paths are exercised. The ALTER TABLE spellings
+//! of the table-level clause are refused by the translator, like
+//! `ALTER COLUMN ... SET NOT NULL`, so they are pinned in
+//! `tests/it/test_table_not_null.rs` instead of a live replica.
 
 #![allow(clippy::too_many_lines)]
 
@@ -15,7 +20,11 @@ use postgres_harness::Outcome;
 
 use crate::{helpers, helpers::postgres as postgres_harness};
 
-/// Three tables: two FK parents and one child carrying all the constraints.
+/// Four tables: two FK parents, a child carrying all the constraints, and a
+/// table carrying the table-level NOT NULL clause in its three spellings.
+/// `bare` carries the requirement from an unnamed table constraint, `named`
+/// from a named one, and `combined` from a table constraint that renames the
+/// column's own `CONSTRAINT cn NOT NULL`.
 const SOURCE: &str = "
 CREATE TABLE parent_cascade (
     id INTEGER PRIMARY KEY,
@@ -36,6 +45,15 @@ CREATE TABLE items (
     created_at TEXT DEFAULT now(),
     short_name VARCHAR(10),
     doubled_score INTEGER GENERATED ALWAYS AS (score * 2) STORED
+);
+CREATE TABLE not_null_tables (
+    id INTEGER PRIMARY KEY,
+    bare INT,
+    named INT,
+    combined INT CONSTRAINT cn NOT NULL,
+    NOT NULL bare,
+    CONSTRAINT nn NOT NULL named,
+    CONSTRAINT cn NOT NULL combined
 );
 ";
 
@@ -76,9 +94,20 @@ mod schema {
             doubled_score -> Integer,
         }
     }
+
+    diesel::table! {
+        // Every NOT NULL column is Nullable here so the diesel DSL can express
+        // the refused NULL, and the database enforces NOT NULL at runtime.
+        not_null_tables (id) {
+            id -> Integer,
+            bare -> Nullable<Integer>,
+            named -> Nullable<Integer>,
+            combined -> Nullable<Integer>,
+        }
+    }
 }
 
-use schema::{items, parent_cascade, parent_restrict};
+use schema::{items, not_null_tables, parent_cascade, parent_restrict};
 
 /// One move in the scenario, named for what it does, not what it expects.
 #[derive(Debug)]
@@ -135,6 +164,25 @@ enum Step {
         restrict_id: i32,
     },
 
+    /// Insert into not_null_tables naming every column, which both engines
+    /// admit.
+    InsertNotNullRow {
+        id: i32,
+        value: i32,
+    },
+    /// Insert leaving bare NULL, which the table-level requirement refuses.
+    InsertNotNullNullBare {
+        id: i32,
+    },
+    /// Insert leaving named NULL, which the table-level requirement refuses.
+    InsertNotNullNullNamed {
+        id: i32,
+    },
+    /// Insert leaving combined NULL, which the table-level requirement refuses.
+    InsertNotNullNullCombined {
+        id: i32,
+    },
+
     DeleteParentCascade {
         id: i32,
     },
@@ -157,6 +205,7 @@ enum Step {
         cascade_id: i32,
     },
     CountParentRestrict,
+    CountNotNullRows,
 }
 
 /// The step implementation is identical for both connection types; diesel's
@@ -268,6 +317,54 @@ macro_rules! runner {
                                 .execute(&mut self.connection),
                         )
                     }
+                    Step::InsertNotNullRow { id, value } => {
+                        Outcome::of(
+                            &diesel::insert_into(not_null_tables::table)
+                                .values((
+                                    not_null_tables::id.eq(*id),
+                                    not_null_tables::bare.eq(Some(*value)),
+                                    not_null_tables::named.eq(Some(*value)),
+                                    not_null_tables::combined.eq(Some(*value)),
+                                ))
+                                .execute(&mut self.connection),
+                        )
+                    }
+                    Step::InsertNotNullNullBare { id } => {
+                        Outcome::of(
+                            &diesel::insert_into(not_null_tables::table)
+                                .values((
+                                    not_null_tables::id.eq(*id),
+                                    not_null_tables::bare.eq(None::<i32>),
+                                    not_null_tables::named.eq(Some(*id)),
+                                    not_null_tables::combined.eq(Some(*id)),
+                                ))
+                                .execute(&mut self.connection),
+                        )
+                    }
+                    Step::InsertNotNullNullNamed { id } => {
+                        Outcome::of(
+                            &diesel::insert_into(not_null_tables::table)
+                                .values((
+                                    not_null_tables::id.eq(*id),
+                                    not_null_tables::bare.eq(Some(*id)),
+                                    not_null_tables::named.eq(None::<i32>),
+                                    not_null_tables::combined.eq(Some(*id)),
+                                ))
+                                .execute(&mut self.connection),
+                        )
+                    }
+                    Step::InsertNotNullNullCombined { id } => {
+                        Outcome::of(
+                            &diesel::insert_into(not_null_tables::table)
+                                .values((
+                                    not_null_tables::id.eq(*id),
+                                    not_null_tables::bare.eq(Some(*id)),
+                                    not_null_tables::named.eq(Some(*id)),
+                                    not_null_tables::combined.eq(None::<i32>),
+                                ))
+                                .execute(&mut self.connection),
+                        )
+                    }
                     Step::DeleteParentCascade { id } => {
                         Outcome::of(
                             &diesel::delete(
@@ -328,6 +425,13 @@ macro_rules! runner {
                             .count()
                             .get_result(&mut self.connection)
                             .expect("count parent_restrict");
+                        Outcome::Count(n)
+                    }
+                    Step::CountNotNullRows => {
+                        let n: i64 = not_null_tables::table
+                            .count()
+                            .get_result(&mut self.connection)
+                            .expect("count not_null_tables");
                         Outcome::Count(n)
                     }
                 }
@@ -394,6 +498,17 @@ fn scenario() -> Vec<Step> {
         Step::DeleteParentRestrict { id: 1 },
         // Both parent rows survive the refused delete.
         Step::CountParentRestrict,
+        // Table-level NOT NULL: every column with a value is admitted.
+        Step::InsertNotNullRow { id: 1, value: 10 },
+        // A NULL where the requirement stands is refused, per column.
+        Step::InsertNotNullNullBare { id: 2 },
+        Step::InsertNotNullNullNamed { id: 3 },
+        Step::InsertNotNullNullCombined { id: 4 },
+        // Only the admitted row landed.
+        Step::CountNotNullRows,
+        // A second admitted row still lands.
+        Step::InsertNotNullRow { id: 5, value: 50 },
+        Step::CountNotNullRows,
     ]
 }
 
