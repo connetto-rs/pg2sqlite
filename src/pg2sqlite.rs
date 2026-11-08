@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 #[cfg(feature = "git")]
 use git2::Repository;
-use sql_traits::structs::{AccessResolution, ParseOptions, ParserDB, ParserDBIngestor};
+use sql_traits::structs::{AccessResolution, Deployment, ParseOptions, ParserDB, ParserDBIngestor};
 use sqlparser::{
     ast::{
         AlterTableOperation, CreateIndex, Ident, IndexType, ObjectName, ObjectNamePart, ObjectType,
@@ -371,20 +371,30 @@ impl Pg2Sqlite {
 
     /// Starts incremental schema ingestion with external grants allowed, run
     /// as `session_role` when one is named, which then owns what the input
-    /// creates.
-    fn translation_ingestor(session_role: Option<&str>) -> ParserDBIngestor {
+    /// creates, in a session starting in `time_zone` when one is named.
+    ///
+    /// A schema built from nothing has no role setting that could reach the
+    /// session running it, so the zone it starts in is the server's.
+    fn translation_ingestor(
+        session_role: Option<&str>,
+        time_zone: Option<&str>,
+    ) -> Result<ParserDBIngestor, crate::errors::Error> {
         let options = ParseOptions::default().with_access_resolution(AccessResolution::OpenWorld);
         let options = match session_role {
             Some(role) => options.with_session_role(role),
             None => options,
         };
-        options.ingestor::<PostgreSqlDialect>("translation_db".to_owned())
+        let options = match time_zone {
+            Some(zone) => options.with_session_time_zone(zone)?,
+            None => options,
+        };
+        Ok(options.ingestor::<PostgreSqlDialect>("translation_db".to_owned()))
     }
 
     fn build_translation_schema(
         statements: Vec<Statement>,
     ) -> Result<ParserDB, crate::errors::Error> {
-        let mut input = Self::translation_ingestor(None);
+        let mut input = Self::translation_ingestor(None, None)?;
         for statement in statements {
             input = input.apply_statement(statement)?;
         }
@@ -660,10 +670,16 @@ impl Pg2Sqlite {
         };
         let complete = initial_schema.is_some();
         let initial_namespace = initial_schema.cloned();
-        let mut input = initial_schema.map_or_else(
-            || Self::translation_ingestor(options.get_schema_owner_role()),
-            |schema| schema.clone().into_ingestor(),
-        );
+        let mut input = match initial_schema {
+            // Ingestion resumes the session that built the schema.
+            Some(schema) => schema.clone().into_ingestor(),
+            None => {
+                Self::translation_ingestor(
+                    options.get_schema_owner_role(),
+                    options.get_deployment().and_then(Deployment::default_time_zone),
+                )?
+            }
+        };
         let mut epochs = Vec::new();
         let mut sources = Cow::Borrowed(statements.as_slice());
         let mut start = 0;

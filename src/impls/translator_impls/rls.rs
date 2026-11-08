@@ -1163,27 +1163,57 @@ pub fn validate_session_variables(
     Ok(())
 }
 
-/// Validates that all policies for a table have required session variable
-/// mappings configured.
+/// Validates that every policy of a table can be read as PostgreSQL stored it
+/// and has the session variable mappings it requires.
 ///
 /// # Errors
 ///
-/// Returns `Error::SessionVariableMappingNotFound` if any policy contains
-/// a session variable pattern without a corresponding SQLite function mapping.
+/// Returns a refusal naming the table and the policy when a clause holds a
+/// literal whose stored value the input does not settle, and
+/// `Error::SessionVariableMappingNotFound` if any policy contains a session
+/// variable pattern without a corresponding SQLite function mapping.
 pub fn validate_table_policies(
     table: &CreateTable,
     schema: &ParserDB,
     options: &Pg2SqliteOptions,
 ) -> Result<(), Error> {
     for policy in table.policies(schema)? {
-        if let Some(using_expr) = policy.using_expression(schema) {
-            validate_session_variables(using_expr, options, table.table_name(), policy.name())?;
-        }
-        if let Some(check_expr) = policy.check_expression(schema) {
-            validate_session_variables(check_expr, options, table.table_name(), policy.name())?;
+        for clause in [policy.using_expression(schema), policy.check_expression(schema)] {
+            let clause = clause.map_err(|error| unreadable_clause(table.table_name(), error))?;
+            if let Some(expr) = clause {
+                validate_session_variables(expr, options, table.table_name(), policy.name())?;
+            }
         }
     }
     Ok(())
+}
+
+/// The refusal of a policy on `table_name` holding a literal `sql-traits`
+/// cannot read as the value PostgreSQL stored, or `error` itself when it is
+/// another lookup failure.
+fn unreadable_clause(table_name: &str, error: LookupError) -> Error {
+    use sql_values::DateTimeError;
+
+    let LookupError::PolicyLiteralUnreadable { policy, literal, data_type, reason } = error else {
+        return error.into();
+    };
+    let remedy = match reason {
+        DateTimeError::NeedsTimeZone => {
+            " Declare the server's zone with `Deployment::with_default_time_zone`, or write the \
+             literal with its offset."
+        }
+        DateTimeError::NeedsDateOrder => " Write the date as YYYY-MM-DD.",
+        DateTimeError::NeedsCurrentTime => {
+            " PostgreSQL stores the moment it created the policy, which the translation cannot \
+             know. Write that moment as the literal."
+        }
+        _ => "",
+    };
+    Error::forward_refusal(format!(
+        "policy '{policy}' on table '{table_name}' holds the literal '{literal}', which \
+         PostgreSQL reads as {data_type} when it creates the policy, and the translation cannot \
+         read it that way ({reason}).{remedy}"
+    ))
 }
 
 /// Schema facts the expression transformer needs, resolved once by the caller.

@@ -64,5 +64,8 @@ mod parity_deployment;
 #[path = "gauntlet/parity_timestamptz_zone.rs"]
 mod parity_timestamptz_zone;
 
+#[path = "gauntlet/parity_policy_literals.rs"]
+mod parity_policy_literals;
+
 #[path = "gauntlet/parity_privileges.rs"]
 mod parity_privileges;
