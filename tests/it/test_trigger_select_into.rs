@@ -7,7 +7,7 @@
 
 use diesel::prelude::*;
 use helpers::establish_connection;
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation};
+use pg2sqlite::prelude::{Pg2Sqlite, UuidRepresentation};
 use rosetta_uuid::Uuid;
 
 use crate::helpers;
@@ -280,11 +280,14 @@ AFTER INSERT ON tasks
 FOR EACH ROW EXECUTE FUNCTION log_task_creation();
 ";
 
-    // Translate the SQL
-    let options = Pg2SqliteOptions::default()
+    // The CURRENT_TIMESTAMP defaults read the request's zone.
+    let options = crate::helpers::deployment::utc_request()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7");
-    let translated_migrations = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
+    let translated_migrations = Pg2Sqlite::default()
+        .sql(&crate::helpers::deployment::utc_script(sql))?
+        .translate(&options)?
+        .into_vec();
 
     // Snapshot the translated SQL for consistency checking
     let translated_sql =
@@ -461,11 +464,14 @@ AFTER INSERT ON team_members
 FOR EACH ROW EXECUTE FUNCTION audit_team_membership();
 ";
 
-    // Translate the SQL
-    let options = Pg2SqliteOptions::default()
+    // The CURRENT_TIMESTAMP defaults read the request's zone.
+    let options = crate::helpers::deployment::utc_request()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuidv7");
-    let translated_migrations = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
+    let translated_migrations = Pg2Sqlite::default()
+        .sql(&crate::helpers::deployment::utc_script(sql))?
+        .translate(&options)?
+        .into_vec();
 
     // Snapshot the translated SQL for consistency checking
     let translated_sql =

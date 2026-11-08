@@ -8,13 +8,16 @@
 //! - string_agg with nested expressions and ORDER BY clause
 //! - COUNT/SUM DISTINCT passthrough
 
-use pg2sqlite::prelude::Pg2SqliteOptions;
+use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use run_translated_helper::run_translated_with;
 use translate_helpers::{
     translate_default_err as translate_err, translate_default_first_query as translate_ok,
 };
 
-use crate::helpers::{run_translated as run_translated_helper, translate as translate_helpers};
+use crate::helpers::{
+    deployment::{utc_request, utc_script},
+    run_translated as run_translated_helper, translate as translate_helpers,
+};
 
 const SCHEMA: &str = "CREATE TABLE t (id INT PRIMARY KEY, val FLOAT, label TEXT, flag BOOLEAN);";
 
@@ -123,8 +126,20 @@ fn string_agg_with_order_by_preserves_order_clause() {
 /// not left as NOW().
 #[test]
 fn string_agg_translates_nested_now_in_args() {
-    let sql = format!("{SCHEMA} SELECT string_agg(NOW()::text, ',') FROM t;");
-    let out = translate_ok(&sql);
+    // The cast over the `NOW()` call settles the operand only against a
+    // request whose `TimeZone` is known, so the translation runs under the
+    // UTC deployment.
+    let sql = utc_script(&format!("{SCHEMA} SELECT string_agg(NOW()::text, ',') FROM t;"));
+    let options = utc_request();
+    let out = Pg2Sqlite::default()
+        .sql(&sql)
+        .expect("parse")
+        .translate_to_sql(&options)
+        .expect("translate")
+        .into_vec()
+        .last()
+        .expect("an emitted statement")
+        .clone();
     assert!(out.contains("group_concat"), "Should rename to group_concat: {out}");
     assert!(
         out.to_lowercase().contains("strftime("),
@@ -134,7 +149,7 @@ fn string_agg_translates_nested_now_in_args() {
         !out.to_uppercase().contains("NOW()"),
         "NOW() must not appear verbatim in output: {out}"
     );
-    run_translated_with(&sql, &Pg2SqliteOptions::default());
+    run_translated_with(&sql, &options);
 }
 
 /// COUNT(DISTINCT col) passes through unchanged — SQLite supports this.

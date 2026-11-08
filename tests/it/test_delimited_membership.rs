@@ -19,7 +19,7 @@ use pg2sqlite::{
 use sql_traits::structs::{SessionSetting, SetPacking, SettingValue};
 use sqlparser::ast::DataType;
 
-use crate::helpers::deployment::{delimited, deployment, scalar};
+use crate::helpers::deployment::{UTC_REQUEST_ROLE, delimited, deployment, scalar, utc_request};
 
 diesel::define_sql_function! {
     /// Answers the delimited session setting the policy reads.
@@ -87,11 +87,23 @@ fn open(pg: &str, options: &Pg2SqliteOptions, subjects: Option<&'static str>) ->
 }
 
 /// The key rows `predicate` admits, read through a typed query over the view
-/// the predicate was translated into.
-fn admitted(predicate: &str) -> Vec<i32> {
-    let pg = format!("{KEYS}CREATE VIEW held AS SELECT id FROM keys WHERE {predicate};");
-    let mut connection = open(&pg, &Pg2SqliteOptions::default(), None);
+/// the predicate was translated into, the script led by the role declaration
+/// `role` under `options`.
+fn admitted_with(predicate: &str, role: &str, options: &Pg2SqliteOptions) -> Vec<i32> {
+    let pg = format!("{role}{KEYS}CREATE VIEW held AS SELECT id FROM keys WHERE {predicate};");
+    let mut connection = open(&pg, options, None);
     held::table.select(held::id).order(held::id).load(&mut connection).expect("read the view")
+}
+
+/// [`admitted_with`] with default options.
+fn admitted(predicate: &str) -> Vec<i32> {
+    admitted_with(predicate, "", &Pg2SqliteOptions::default())
+}
+
+/// [`admitted_with`] for a request whose `TimeZone` is UTC, which the cast
+/// over `rowid` needs to settle the operand's type.
+fn admitted_utc(predicate: &str) -> Vec<i32> {
+    admitted_with(predicate, UTC_REQUEST_ROLE, &utc_request())
 }
 
 fn refusal(pg: &str) -> String {
@@ -608,11 +620,13 @@ fn an_unmappable_declared_collation_is_refused() {
 
 /// `rowid` is SQLite's own column and the scope answers nothing for it by
 /// rule, which is not a collation dispute, so the membership test over it
-/// keeps translating.
+/// keeps translating. The cast settles the operand's type only against a
+/// request whose `TimeZone` is known, so the view runs under the UTC
+/// deployment.
 #[test]
 fn a_scope_declined_name_still_translates() {
     assert_eq!(
-        admitted("CAST(rowid AS TEXT) = ANY(string_to_array('1,2', ','))"),
+        admitted_utc("CAST(rowid AS TEXT) = ANY(string_to_array('1,2', ','))"),
         vec![1, 2],
         "the first two rows carry rowid 1 and 2"
     );

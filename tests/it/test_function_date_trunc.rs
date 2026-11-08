@@ -153,7 +153,7 @@ fn date_trunc_without_over_semantic() -> Result<(), Box<dyn std::error::Error>> 
         SELECT date_trunc('day', created_at) AS truncated FROM events;
     ";
     let (translated, select_sql) =
-        helpers::translate::translate_default_statements_and_first_query(pg_sql);
+        helpers::translate::translate_utc_statements_and_first_query(pg_sql);
 
     let mut conn = helpers::apply_ddl(&translated);
 
@@ -212,19 +212,20 @@ fn a_window_aggregate_over_partition_still_translates() {
 #[test]
 fn milliseconds_granularity_translates_and_truncates_correctly() {
     let result = translate_sql(
-        "CREATE TABLE t (id INT PRIMARY KEY, ts TEXT);
+        &helpers::deployment::utc_script(
+            "CREATE TABLE t (id INT PRIMARY KEY, ts TEXT);
          SELECT date_trunc('milliseconds', ts) FROM t;",
-        &Pg2SqliteOptions::default(),
+        ),
+        &helpers::deployment::utc_request(),
     );
     assert!(
         result.is_ok(),
         "milliseconds is a valid PostgreSQL granularity and must translate: {result:?}"
     );
-    let rows = run_translated_with(
+    let rows = run_translated_helper::run_translated_utc(
         "CREATE TABLE t (id INT PRIMARY KEY, ts TEXT);
          INSERT INTO t VALUES (1, '2024-01-15 10:30:45.678');
          SELECT date_trunc('milliseconds', ts) FROM t;",
-        &Pg2SqliteOptions::default(),
     );
     assert_eq!(
         rows,
@@ -297,12 +298,11 @@ fn a_millisecond_truncated_value_compares_against_a_stored_literal() {
 /// text.
 #[test]
 fn a_millisecond_truncation_written_to_timestamptz_keeps_the_canonical_form() {
-    let rows = run_translated_with(
+    let rows = run_translated_helper::run_translated_utc(
         "CREATE TABLE t (id INT PRIMARY KEY, at timestamptz);
          INSERT INTO t (id, at) VALUES (1, '2024-01-02 03:04:05.5+00');
          UPDATE t SET at = date_trunc('millisecond', at) WHERE id = 1;
          SELECT at FROM t;",
-        &Pg2SqliteOptions::default(),
     );
     assert_eq!(rows, vec![Some("2024-01-02 03:04:05.500000+00:00".to_string())]);
 }

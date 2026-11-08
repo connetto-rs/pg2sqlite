@@ -67,49 +67,6 @@ fn json_agg_forward_emission_round_trips_without_nullif() {
     );
 }
 
-// M6: forward emissions for `localtimestamp` and `localtime` must survive the
-// round trip. Forward maps `localtimestamp` to `datetime('now', 'localtime')`
-// and `localtime` to `time('now', 'localtime')`. The reverse direction
-// currently refuses both forms, breaking direction parity.
-
-/// `localtimestamp` forward-emits `datetime('now', 'localtime')`. The reverse
-/// direction must recognise that idiom and emit `LOCALTIMESTAMP` again.
-/// Currently the reverse direction refuses.
-#[test]
-fn localtimestamp_forward_emission_round_trips() {
-    let sqlite_sql = forward("SELECT localtimestamp").expect("forward localtimestamp must succeed");
-    let result = reverse(&sqlite_sql);
-    assert!(
-        result.is_ok(),
-        "the crate's own localtimestamp emission must reverse successfully, got: {:?}",
-        result
-    );
-    let pg_sql = result.unwrap();
-    assert!(
-        pg_sql.to_uppercase().contains("LOCALTIMESTAMP"),
-        "reverse output must contain LOCALTIMESTAMP, got: {pg_sql}"
-    );
-}
-
-/// `localtime` forward-emits `time('now', 'localtime')`. The reverse direction
-/// must recognise that idiom and emit `LOCALTIME` again. Currently the reverse
-/// direction refuses.
-#[test]
-fn localtime_forward_emission_round_trips() {
-    let sqlite_sql = forward("SELECT localtime").expect("forward localtime must succeed");
-    let result = reverse(&sqlite_sql);
-    assert!(
-        result.is_ok(),
-        "the crate's own localtime emission must reverse successfully, got: {:?}",
-        result
-    );
-    let pg_sql = result.unwrap();
-    assert!(
-        pg_sql.to_uppercase().contains("LOCALTIME"),
-        "reverse output must contain LOCALTIME, got: {pg_sql}"
-    );
-}
-
 // H2-reverse: the crate's own forward emission for `json_object_agg` must
 // survive the round trip. After FixForward lands, the forward direction will
 // emit `NULLIF(json_group_object(k, v), '{}')`. The NULLIF wrapper breaks

@@ -15,7 +15,7 @@ use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{
-        datetime_helpers::canonical_timestamptz_call,
+        datetime_helpers::{canonical_timestamptz_call, time_of_day},
         function_helpers::{integer_literal, simple_function_expr, string_literal},
         object_name::last_ident,
         replay::{is_replayable, reject_duplicated_operand},
@@ -164,7 +164,7 @@ pub(crate) fn translate_temporal_kind_cast(
         (Timestamp { zoned: false, .. }, Date) => {
             crate::impls::datetime_helpers::promote_date_to_midnight(operand.clone())
         }
-        (Time { zoned: false, .. }, Timestamp { zoned: false, .. }) => time_part(operand),
+        (Time { zoned: false, .. }, Timestamp { zoned: false, .. }) => time_of_day(operand.clone()),
         (Time { zoned: false, .. }, Time { zoned: true, .. }) => wall_time(operand, options)?,
         (Time { zoned: true, .. }, Time { zoned: false, .. }) => session_offset_time(operand),
         (Time { .. }, Date) => {
@@ -194,11 +194,6 @@ fn date_part(operand: &Expr) -> Expr {
         vec![operand.clone(), integer_literal(1), integer_literal(10)],
         None,
     )
-}
-
-/// The time of day of a `YYYY-MM-DD HH:MM:SS[.f]` text.
-fn time_part(operand: &Expr) -> Expr {
-    simple_function_expr("substr", vec![operand.clone(), integer_literal(12)], None)
 }
 
 /// The wall-clock part of a `HH:MM:SS[.f]±HH:MM` text, with the six offset
@@ -293,7 +288,7 @@ fn kind_cast_refusal(
 }
 
 /// The name PostgreSQL gives `kind` in a cast refusal.
-fn type_name(kind: TemporalLiteralKind) -> &'static str {
+pub(crate) fn type_name(kind: TemporalLiteralKind) -> &'static str {
     match kind {
         TemporalLiteralKind::Date => "date",
         TemporalLiteralKind::Time { zoned: false, .. } => "time without time zone",

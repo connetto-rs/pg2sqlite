@@ -19,8 +19,12 @@ fn uuid_options() -> Pg2SqliteOptions {
 
 #[test]
 fn test_plpgsql_is_true_transform() {
-    let options = uuid_options();
+    // `NOW()` reads the request's TimeZone, so the translation runs on the
+    // UTC deployment the value was measured under.
+    let options =
+        helpers::deployment::utc_request().with_uuid_representation(UuidRepresentation::Blob);
     let pg = r#"
+        CREATE ROLE app;
         CREATE TABLE t (id BLOB PRIMARY KEY, flag BOOLEAN, ts TIMESTAMP);
         CREATE OR REPLACE FUNCTION my_trigger_fn() RETURNS TRIGGER AS $$
         BEGIN

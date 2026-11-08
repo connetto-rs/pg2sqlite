@@ -17,7 +17,7 @@ fn extract_week_uses_the_iso_format() {
         CREATE TABLE week_test (id INTEGER PRIMARY KEY, ts TEXT);
         SELECT EXTRACT(WEEK FROM ts) FROM week_test;
     ";
-    let (statements, query) = helpers::translate::translate_default_statements_and_first_query(sql);
+    let (statements, query) = helpers::translate::translate_utc_statements_and_first_query(sql);
 
     assert!(query.contains("'%V'"), "expected the ISO week format: {query}");
     assert!(!query.contains("'%W'"), "%W is Sunday based, not ISO: {query}");
@@ -35,7 +35,7 @@ fn extract_second_produces_valid_sqlite() -> Result<(), Box<dyn std::error::Erro
     let sql = "CREATE TABLE sec2_test (id INTEGER PRIMARY KEY, ts TEXT NOT NULL);
                SELECT EXTRACT(SECOND FROM ts) AS secs FROM sec2_test;";
     let (translated, select_sql) =
-        helpers::translate::translate_default_statements_and_first_query(sql);
+        helpers::translate::translate_utc_statements_and_first_query(sql);
     assert!(
         select_sql.to_lowercase().contains("strftime"),
         "EXTRACT(SECOND) must use strftime, got: {select_sql}"

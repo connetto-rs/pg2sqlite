@@ -19,6 +19,8 @@ use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 // at compile time and cannot execute an arbitrary translated SQL string.
 use rusqlite::Connection;
 
+use crate::helpers::deployment::{UTC_REQUEST_ROLE, utc_request};
+
 /// DDL for date/time tests: a TIMESTAMP and a DATE column.
 const DT_DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP, d DATE);";
 /// Seed row used by all date/time tests.
@@ -28,13 +30,13 @@ const DT_ROW: &str = "INSERT INTO t (id, ts, d) VALUES (1, '2024-03-05 14:07:09'
 /// DDL for string tests: a TEXT column and an INT column (used for NULL tests).
 const STR_DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, s TEXT, n INT);";
 
-/// Translate a PostgreSQL SQL fragment through `Pg2Sqlite`. Panics on either a
-/// parse error or a translation error.
-fn translate_sql(pg: &str) -> Vec<String> {
+/// Translate a PostgreSQL SQL fragment through `Pg2Sqlite` under `options`.
+/// Panics on either a parse error or a translation error.
+fn translate_sql(pg: &str, options: &Pg2SqliteOptions) -> Vec<String> {
     Pg2Sqlite::default()
         .sql(pg)
         .expect("parses")
-        .translate_to_sql(&Pg2SqliteOptions::default())
+        .translate_to_sql(options)
         .expect("translates")
         .into_vec()
 }
@@ -55,9 +57,23 @@ fn translate_err(pg: &str) -> String {
 }
 
 /// Applies the translated DDL of `ddl`, seeds `seed`, and probes the last
-/// emitted statement, returning its first column as `Option<T>`.
-fn eval_row<T: rusqlite::types::FromSql>(ddl: &str, seed: &str, select_list: &str) -> Option<T> {
-    let script = translate_sql(&format!("{ddl}\nSELECT {select_list} FROM t WHERE id = 1;"));
+/// emitted statement, returning its first column as `Option<T>`. The script
+/// is led by the role declaration `role` and translated under `options`.
+fn eval_row<T: rusqlite::types::FromSql>(
+    ddl: &str,
+    seed: &str,
+    select_list: &str,
+    role: &str,
+    options: &Pg2SqliteOptions,
+) -> Option<T> {
+    let script =
+        translate_sql(&format!("{role}{ddl}\nSELECT {select_list} FROM t WHERE id = 1;"), options);
+    eval_row_script(&script, seed)
+}
+
+/// Applies every statement of `script` but the last, seeds `seed`, and probes
+/// the last one, returning its first column as `Option<T>`.
+fn eval_row_script<T: rusqlite::types::FromSql>(script: &[String], seed: &str) -> Option<T> {
     let conn = Connection::open_in_memory().expect("in-memory SQLite");
     for stmt in &script[..script.len() - 1] {
         conn.execute_batch(&format!("{stmt};"))
@@ -72,30 +88,35 @@ fn eval_row<T: rusqlite::types::FromSql>(ddl: &str, seed: &str, select_list: &st
 /// Run the translated form of `select_list` against the date/time table.
 /// Returns the first column of the single result row as a string.
 fn eval_dt(select_list: &str) -> Option<String> {
-    eval_row::<String>(DT_DDL, DT_ROW, select_list)
+    eval_row::<String>(DT_DDL, DT_ROW, select_list, "", &Pg2SqliteOptions::default())
+}
+
+/// [`eval_dt`] for a request whose `TimeZone` is UTC.
+fn eval_dt_utc(select_list: &str) -> Option<String> {
+    eval_row::<String>(DT_DDL, DT_ROW, select_list, UTC_REQUEST_ROLE, &utc_request())
 }
 
 /// Like `eval_dt` but returns the first column as a 64-bit integer.
 fn eval_dt_i64(select_list: &str) -> Option<i64> {
-    eval_row::<i64>(DT_DDL, DT_ROW, select_list)
+    eval_row::<i64>(DT_DDL, DT_ROW, select_list, "", &Pg2SqliteOptions::default())
 }
 
 /// Like `eval_dt` but returns the first column as an f64.
 fn eval_dt_f64(select_list: &str) -> Option<f64> {
-    eval_row::<f64>(DT_DDL, DT_ROW, select_list)
+    eval_row::<f64>(DT_DDL, DT_ROW, select_list, "", &Pg2SqliteOptions::default())
 }
 
 /// Run the translated form of `select_list` against the string table, seeded
 /// with `row` (a raw SQLite INSERT statement). Returns the first column as a
 /// string.
 fn eval_str(row: &str, select_list: &str) -> Option<String> {
-    eval_row::<String>(STR_DDL, row, select_list)
+    eval_row::<String>(STR_DDL, row, select_list, "", &Pg2SqliteOptions::default())
 }
 
 /// Like `eval_str` but returns the first column as a 64-bit integer. Used for
 /// functions that return INTEGER in SQLite (e.g. INSTR, length).
 fn eval_str_i64(row: &str, select_list: &str) -> Option<i64> {
-    eval_row::<i64>(STR_DDL, row, select_list)
+    eval_row::<i64>(STR_DDL, row, select_list, "", &Pg2SqliteOptions::default())
 }
 
 // ── EXTRACT
@@ -378,10 +399,11 @@ fn now_returns_nonnull_timestamp() {
 }
 
 /// CURRENT_DATE is a SQL keyword that both PostgreSQL and SQLite support.
-/// The result must not be NULL.
+/// The result must not be NULL. The clock reads the request's zone, so the
+/// projection runs under the UTC deployment.
 #[test]
 fn current_date_is_nonnull() {
-    assert!(eval_dt("CURRENT_DATE").is_some(), "CURRENT_DATE returned NULL");
+    assert!(eval_dt_utc("CURRENT_DATE").is_some(), "CURRENT_DATE returned NULL");
 }
 
 /// CURRENT_TIMESTAMP is a SQL keyword that both PostgreSQL and SQLite support.
@@ -392,10 +414,11 @@ fn current_timestamp_is_nonnull() {
 }
 
 /// localtimestamp translates to datetime('now', 'localtime') and must not be
-/// NULL.
+/// NULL. The clock reads the request's zone, so the projection runs under the
+/// UTC deployment.
 #[test]
 fn localtimestamp_is_nonnull() {
-    assert!(eval_dt("localtimestamp").is_some(), "localtimestamp returned NULL");
+    assert!(eval_dt_utc("localtimestamp").is_some(), "localtimestamp returned NULL");
 }
 
 /// to_timestamp(0) translates to datetime(0, 'unixepoch') = '1970-01-01

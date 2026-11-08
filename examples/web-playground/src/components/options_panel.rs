@@ -28,6 +28,7 @@ pub fn OptionsPanel() -> Element {
                 UuidV7FunctionRow {}
                 RlsAuditRow {}
                 SessionVarsRow {}
+                TimeZoneRow {}
             }
         }
     }
@@ -189,6 +190,35 @@ fn RlsAuditRow() -> Element {
                         opts.rls_audit_table_name = evt.value();
                         options.set(opts);
                     },
+                }
+            }
+        }
+    }
+}
+
+/// The server's `TimeZone`, naming PostgreSQL's refusal for one it does not
+/// accept.
+#[component]
+fn TimeZoneRow() -> Element {
+    let state: AppState = use_context();
+    let current = state.options.read().time_zone.clone();
+    let refusal = state.options.read().time_zone_error();
+
+    rsx! {
+        div { class: "options-row",
+            span { class: "options-label", "Server time zone" }
+            div { class: "options-control",
+                input {
+                    r#type: "text",
+                    placeholder: "UTC",
+                    value: current,
+                    oninput: move |evt| {
+                        let mut options = state.options;
+                        options.write().time_zone = evt.value();
+                    },
+                }
+                if let Some(refusal) = refusal {
+                    span { class: "options-refusal", "{refusal}" }
                 }
             }
         }

@@ -7,6 +7,9 @@ mod source;
 #[path = "gauntlet/harness.rs"]
 mod harness;
 
+#[path = "gauntlet/timestamptz_harness.rs"]
+mod timestamptz_harness;
+
 #[path = "gauntlet/reverse.rs"]
 mod reverse;
 
@@ -66,6 +69,8 @@ mod parity_timestamptz_zone;
 
 #[path = "gauntlet/parity_policy_literals.rs"]
 mod parity_policy_literals;
+#[path = "gauntlet/parity_timestamptz_reads.rs"]
+mod parity_timestamptz_reads;
 
 #[path = "gauntlet/parity_privileges.rs"]
 mod parity_privileges;

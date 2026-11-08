@@ -1603,7 +1603,7 @@ pub(crate) fn convert_value_for_column_type(
         return convert_bit_literal(expr);
     }
     if let Some(kind) = crate::impls::temporal_literals::temporal_literal_kind(data_type) {
-        return convert_temporal_value(kind, expr, None, None);
+        return convert_temporal_value(kind, expr, None, None, None, None, None);
     }
     if let DataType::Interval { fields, precision } = data_type {
         return normalize_interval_literal_expr(expr, fields.as_ref(), *precision);
@@ -1854,11 +1854,17 @@ pub(crate) fn round_column_text(
 /// column takes its own form of a canonical `timestamptz`. `source` is the
 /// value's own zone where it is known, and decides a value that is neither: a
 /// zoneless one is moved to the canonical text and an instant to the column's
-/// form. Anything else already holds the column's text.
+/// form. Anything else already holds the column's text. A read that `zone`
+/// settles on a zone other than UTC answers from that zone's wall clock.
+/// `written` and `operation` name the operand and the read as written, so a
+/// refusal for an operand the read names twice can show both.
 pub(crate) fn convert_temporal_value(
     kind: crate::impls::temporal_literals::TemporalLiteralKind,
     mut expr: Expr,
     source: Option<crate::impls::timezone::TimestampAwareness>,
+    zone: Option<crate::impls::zone_clock::ZonedWallClock<'_>>,
+    written: Option<&Expr>,
+    operation: Option<&str>,
     options: Option<&crate::options::TranslationContext<'_>>,
 ) -> Result<Expr, Error> {
     use crate::impls::{
@@ -1871,8 +1877,13 @@ pub(crate) fn convert_temporal_value(
         replay::{is_replayable, reject_duplicated_operand},
         temporal_literals::TemporalLiteralKind,
         timezone::TimestampAwareness,
+        zone_clock::ZonedWallClock,
     };
-    if crate::impls::function_helpers::single_quoted_literal(&expr).is_some() {
+    // An instant's literal text is read on the zone's wall clock like any
+    // other.
+    if crate::impls::function_helpers::single_quoted_literal(&expr).is_some()
+        && source != Some(TimestampAwareness::Aware)
+    {
         return normalize_temporal_literal_expr(kind, expr);
     }
     if matches!(kind, TemporalLiteralKind::Timestamp { zoned: true, .. }) {
@@ -1902,6 +1913,9 @@ pub(crate) fn convert_temporal_value(
     {
         return Err(reject_duplicated_operand("a temporal write", &instant));
     }
+    if let Some(ZonedWallClock::Zone(clock)) = zone {
+        return zoned_temporal_value(kind, instant, is_text, clock, written, operation, options);
+    }
     let precision = kind.rounding_precision();
     Ok(match (kind, precision) {
         (TemporalLiteralKind::Date, _) => simple_function_expr("date", vec![instant], None),
@@ -1930,6 +1944,110 @@ pub(crate) fn convert_temporal_value(
             simple_function_expr("datetime", vec![instant], None)
         }
     })
+}
+
+/// [`convert_temporal_value`] of an instant, read from the wall clock of the
+/// request's zone `clock`. `is_text` says whether `instant` is the replica's
+/// own text, which the slicing builders read, or any SQLite time value.
+///
+/// # Errors
+///
+/// Refuses an operand the wall clock reads twice that cannot be replayed.
+fn zoned_temporal_value(
+    kind: crate::impls::temporal_literals::TemporalLiteralKind,
+    instant: Expr,
+    is_text: bool,
+    clock: crate::impls::zone_clock::ZoneClock<'_>,
+    written: Option<&Expr>,
+    operation: Option<&str>,
+    options: Option<&crate::options::TranslationContext<'_>>,
+) -> Result<Expr, Error> {
+    use crate::impls::{
+        datetime_helpers::{round_instant, round_time_of_instant, time_of_day},
+        expr_helpers::concat,
+        function_helpers::{simple_function_expr, string_literal},
+        replay::{is_replayable, reject_duplicated_operand},
+        temporal_literals::TemporalLiteralKind,
+        zone_clock::{OffsetForm, ZoneClock, ZonedWallClock, offset_text},
+    };
+    // A form naming the operand more than once refuses one it cannot replay.
+    // The replica's own text was checked before it got here.
+    let replay_guard = || -> Result<(), Error> {
+        if !is_text
+            && let (Some(written), Some(options)) = (written, options)
+            && !is_replayable(written, options)
+        {
+            return Err(reject_duplicated_operand(operation.unwrap_or("a temporal read"), written));
+        }
+        Ok(())
+    };
+    // A zone's function parses `now` only once SQLite computes it.
+    let base = if is_text {
+        instant.clone()
+    } else {
+        simple_function_expr("datetime", vec![instant.clone()], None)
+    };
+    let local = clock.local(base.clone());
+    let precision = kind.rounding_precision();
+    Ok(match (kind, precision, clock) {
+        (TemporalLiteralKind::Date, _, ZoneClock::Offset(offset)) if !is_text => {
+            shifted("date", vec![instant], offset)
+        }
+        (TemporalLiteralKind::Date, _, _) => simple_function_expr("date", vec![local], None),
+        (TemporalLiteralKind::Timestamp { .. }, _, _) if is_text => round_column_text(kind, local),
+        (TemporalLiteralKind::Timestamp { .. }, Some(precision), _) => {
+            replay_guard()?;
+            round_instant(&local, precision)
+        }
+        (TemporalLiteralKind::Timestamp { .. }, None, _) => {
+            if clock.reads_twice() {
+                replay_guard()?;
+            }
+            local
+        }
+        (TemporalLiteralKind::Time { zoned: false, .. }, None, ZoneClock::Offset(offset))
+            if !is_text =>
+        {
+            shifted("time", vec![instant], offset)
+        }
+        (TemporalLiteralKind::Time { zoned: true, .. }, None, ZoneClock::Offset(offset))
+            if !is_text =>
+        {
+            concat(
+                shifted("strftime", vec![string_literal("%H:%M:%S"), instant], offset),
+                string_literal(&offset_text(offset, OffsetForm::Stored)),
+            )
+        }
+        (TemporalLiteralKind::Time { zoned, .. }, precision, _) => {
+            let time = match precision {
+                Some(precision) if !is_text => {
+                    replay_guard()?;
+                    round_time_of_instant(&local, precision, false)
+                }
+                _ => time_of_day(local.clone()),
+            };
+            let time = if zoned {
+                if matches!(clock, ZoneClock::Registered(_)) {
+                    replay_guard()?;
+                }
+                concat(time, ZonedWallClock::Zone(clock).offset(local, base, OffsetForm::Stored))
+            } else {
+                time
+            };
+            if is_text { round_column_text(kind, time) } else { time }
+        }
+    })
+}
+
+/// A date function over an SQLite time value, shifted onto the clock `offset`
+/// seconds east of UTC.
+fn shifted(function: &str, mut args: Vec<Expr>, offset: i32) -> Expr {
+    use crate::impls::{
+        function_helpers::{simple_function_expr, string_literal},
+        zone_clock::shift_modifier,
+    };
+    args.extend(shift_modifier(offset).map(|modifier| string_literal(&modifier)));
+    simple_function_expr(function, args, None)
 }
 
 /// What a column of this type stores, for the translation manifest.

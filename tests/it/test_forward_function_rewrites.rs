@@ -12,25 +12,23 @@ fn default_opts() -> Pg2SqliteOptions {
 }
 
 #[test]
-fn localtimestamp_to_datetime_localtime() {
-    let sql = "SELECT localtimestamp";
-    let result = translate_sql(sql, &default_opts()).unwrap();
-    let lower = result.to_lowercase();
+fn localtimestamp_reads_sqlites_utc_clock() {
+    let sql = helpers::deployment::utc_script("SELECT localtimestamp");
+    let result = translate_sql(&sql, &helpers::deployment::utc_request()).unwrap();
     assert!(
-        lower.contains("datetime(") && lower.contains("localtime"),
-        "localtimestamp should become datetime('now', 'localtime'): {result}"
+        result.to_lowercase().contains("datetime('now')"),
+        "localtimestamp in UTC should become datetime('now'): {result}"
     );
     sqlite_accepts(&result);
 }
 
 #[test]
-fn localtime_to_time_localtime() {
-    let sql = "SELECT localtime";
-    let result = translate_sql(sql, &default_opts()).unwrap();
-    let lower = result.to_lowercase();
+fn localtime_reads_sqlites_utc_clock() {
+    let sql = helpers::deployment::utc_script("SELECT localtime");
+    let result = translate_sql(&sql, &helpers::deployment::utc_request()).unwrap();
     assert!(
-        lower.contains("time(") && lower.contains("localtime"),
-        "localtime should become time('now', 'localtime'): {result}"
+        result.to_lowercase().contains("time('now')"),
+        "localtime in UTC should become time('now'): {result}"
     );
     sqlite_accepts(&result);
 }

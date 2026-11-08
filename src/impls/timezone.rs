@@ -122,23 +122,21 @@ pub(crate) fn timestamp_awareness(
             }
         }
         // PostgreSQL's now() and its aliases and to_timestamp return
-        // timestamptz, and localtimestamp returns a bare timestamp.
-        Expr::Function(function) => {
-            match crate::impls::object_name::last_ident(&function.name) {
-                Some(ident) => {
-                    match ident.value.to_ascii_lowercase().as_str() {
-                        "now"
+        // timestamptz.
+        Expr::Function(function)
+            if crate::impls::object_name::last_ident(&function.name).is_some_and(|ident| {
+                matches!(
+                    ident.value.to_ascii_lowercase().as_str(),
+                    "now"
                         | "current_timestamp"
                         | "transaction_timestamp"
                         | "statement_timestamp"
                         | "clock_timestamp"
-                        | "to_timestamp" => Some(TimestampAwareness::Aware),
-                        "localtimestamp" => Some(TimestampAwareness::Naive),
-                        _ => None,
-                    }
-                }
-                None => None,
-            }
+                        | "to_timestamp"
+                )
+            }) =>
+        {
+            Some(TimestampAwareness::Aware)
         }
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
             declared_in_scope(
@@ -149,7 +147,17 @@ pub(crate) fn timestamp_awareness(
                 timestamp_awareness,
             )?
         }
-        _ => None,
+        // Any other expression takes the type the statement settles for it.
+        _ => {
+            use crate::impls::temporal_arithmetic::{TemporalKind, temporal_kind_of};
+            match temporal_kind_of(expr, schema, options) {
+                Some(TemporalKind::TimestampTz) => Some(TimestampAwareness::Aware),
+                Some(TemporalKind::Timestamp | TemporalKind::Date) => {
+                    Some(TimestampAwareness::Naive)
+                }
+                Some(TemporalKind::Time { .. }) | None => None,
+            }
+        }
     })
 }
 

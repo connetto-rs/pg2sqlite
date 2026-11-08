@@ -15,9 +15,6 @@
 //! | 2020-12-31 | 52 | 53 | 2020 | 4 |
 //! | 2024-03-15 | 11 | 11 | 2024 | 5 |
 
-use pg2sqlite::prelude::Pg2SqliteOptions;
-use run_translated_helper::run_translated_with;
-
 use crate::helpers::run_translated as run_translated_helper;
 
 /// The three dates the item names, plus one more year boundary and one ordinary
@@ -31,14 +28,11 @@ fn evaluate(expression: &str) -> Vec<Option<String>> {
         .map(|(index, date)| format!("({}, '{date}')", index + 1))
         .collect::<Vec<_>>()
         .join(", ");
-    run_translated_with(
-        &format!(
-            "CREATE TABLE t (id INT PRIMARY KEY, d TEXT);
+    run_translated_helper::run_translated_utc(&format!(
+        "CREATE TABLE t (id INT PRIMARY KEY, d TEXT);
              INSERT INTO t VALUES {rows};
              SELECT {expression} FROM t ORDER BY id;"
-        ),
-        &Pg2SqliteOptions::default(),
-    )
+    ))
 }
 
 fn expected(values: [&str; 5]) -> Vec<Option<String>> {

@@ -5,7 +5,10 @@ use pg2sqlite::{
     prelude::{Pg2Sqlite, Pg2SqliteOptions},
 };
 
-use crate::state::{ErrorCategory, TranslationError, TranslationStats};
+use crate::{
+    request::declaring_role,
+    state::{ErrorCategory, TranslationError, TranslationStats},
+};
 
 pub struct TranslationOutput {
     pub sqlite_sql: String,
@@ -22,7 +25,7 @@ pub fn translate(
 ) -> Result<TranslationOutput, TranslationError> {
     let start = elapsed_ms_fn();
     let stmts = Pg2Sqlite::default()
-        .sql(pg_sql)
+        .sql(&declaring_role(pg_sql))
         .and_then(|t| t.translate(options).map(pg2sqlite::script::Script::into_vec))
         .map_err(classify_error)?;
 
@@ -42,8 +45,9 @@ pub fn translate_query(
     pg_schema_sql: &str,
     options: &Pg2SqliteOptions,
 ) -> Result<String, TranslationError> {
+    let pg_schema_sql = declaring_role(pg_schema_sql);
     let schema_stmts = Pg2Sqlite::default()
-        .sql(pg_schema_sql)
+        .sql(&pg_schema_sql)
         .and_then(|t| t.translate(options).map(pg2sqlite::script::Script::into_vec))
         .map_err(classify_error)?;
     let combined_sql = format!("{pg_schema_sql};\n{pg_query}");
@@ -62,7 +66,8 @@ pub fn reverse_translate(
     pg_schema_sql: &str,
     options: &Pg2SqliteOptions,
 ) -> Result<String, TranslationError> {
-    let translator = Pg2Sqlite::default().sql(pg_schema_sql).map_err(classify_error)?;
+    let translator =
+        Pg2Sqlite::default().sql(&declaring_role(pg_schema_sql)).map_err(classify_error)?;
     let schema = translator.build_schema().map_err(classify_error)?;
     let stmts = translator.reverse_sql(sqlite_sql, &schema, options).map_err(classify_error)?;
     Ok(stmts.iter().map(ToString::to_string).collect::<Vec<_>>().join(";\n"))

@@ -9,7 +9,10 @@
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use run_translated_helper::run_translated_with;
 
-use crate::helpers::run_translated as run_translated_helper;
+use crate::helpers::{
+    deployment::{UTC_REQUEST_ROLE, utc_request},
+    run_translated as run_translated_helper,
+};
 
 const DDL: &str = "CREATE TABLE dt (id INT PRIMARY KEY, d1 DATE, d2 DATE, ts1 TIMESTAMP, \
                    ts2 TIMESTAMP, tm1 TIME, tm2 TIME, n INT, s TEXT);";
@@ -20,14 +23,23 @@ const ROWS: &str = "INSERT INTO dt (id, d1, d2, ts1, ts2, tm1, tm2, n, s) VALUES
                     '2026-08-07 12:00:00', '12:00:00', '14:00:00', 7, 'x');
                     INSERT INTO dt (id) VALUES (2);";
 
-/// Translate and run `SELECT <select_list> FROM dt WHERE id = <id>`, returning
-/// the single value it projects.
+/// Translate and run `SELECT <select_list> FROM dt WHERE id = <id>` under
+/// `options`, the script led by the role declaration `role`, returning the
+/// single value it projects.
+fn eval_with(select_list: &str, id: u8, role: &str, options: &Pg2SqliteOptions) -> Option<String> {
+    let pg = format!("{role}{DDL}\n{ROWS}\nSELECT {select_list} FROM dt WHERE id = {id};");
+    run_translated_with(&pg, options).into_iter().next().expect("the probe should project one row")
+}
+
+/// [`eval_with`] with default options.
 fn eval(select_list: &str, id: u8) -> Option<String> {
-    let pg = format!("{DDL}\n{ROWS}\nSELECT {select_list} FROM dt WHERE id = {id};");
-    run_translated_with(&pg, &Pg2SqliteOptions::default())
-        .into_iter()
-        .next()
-        .expect("the probe should project one row")
+    eval_with(select_list, id, "", &Pg2SqliteOptions::default())
+}
+
+/// [`eval_with`] for a request whose `TimeZone` is UTC, which reading
+/// `CURRENT_DATE` needs to resolve the zone from.
+fn eval_utc(select_list: &str, id: u8) -> Option<String> {
+    eval_with(select_list, id, UTC_REQUEST_ROLE, &utc_request())
 }
 
 /// The refusal message for a select list the translator must not emit.
@@ -119,10 +131,12 @@ fn rewritten_date_composes_with_further_arithmetic() {
 }
 
 /// `CURRENT_DATE` is a date without a declaration to read it from.
-/// PostgreSQL `(CURRENT_DATE + 1) - CURRENT_DATE` = 1, whatever the day.
+/// PostgreSQL `(CURRENT_DATE + 1) - CURRENT_DATE` = 1, whatever the day. The
+/// clock reads the request's zone, so the projection runs under the UTC
+/// deployment.
 #[test]
 fn current_date_is_recognised_as_a_date() {
-    assert_eq!(eval("(CURRENT_DATE + 1) - CURRENT_DATE", 1).as_deref(), Some("1"));
+    assert_eq!(eval_utc("(CURRENT_DATE + 1) - CURRENT_DATE", 1).as_deref(), Some("1"));
 }
 
 // ── the shapes PostgreSQL answers with an interval

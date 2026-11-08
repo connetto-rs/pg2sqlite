@@ -36,6 +36,7 @@ use rusqlite::Connection as RusqliteConn;
 use stat_agg::{STATISTICAL_AGGREGATES, register_statistical_aggregates};
 
 use crate::helpers::{
+    deployment::{utc_request, utc_script},
     establish_connection, postgres as postgres_harness, statistical_aggregates as stat_agg,
 };
 
@@ -88,8 +89,11 @@ INSERT INTO vals VALUES (4, 30, 3.5, 'hello', '{"a":2}', ARRAY['foo','baz'], '44
 // ── translation options
 // ───────────────────────────────────────────────────────
 
+/// Options for the translation, carrying the UTC deployment so that
+/// timestamptz reads follow the UTC request the expected values were
+/// measured in, plus the representation choices this schema needs.
 fn values_options() -> Pg2SqliteOptions {
-    Pg2SqliteOptions::default()
+    utc_request()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_array_representation(ArrayRepresentation::Json)
         .with_user_defined_functions(STATISTICAL_AGGREGATES.iter().copied())
@@ -110,7 +114,7 @@ fn setup_pg() -> PgConnection {
 // syntax (ARRAY[], JSONB literals, UUID) that has no unified typed-insert
 // representation across both backends.
 fn setup_sq_diesel() -> SqliteConnection {
-    let source = format!("{SCHEMA}{SEEDS}");
+    let source = utc_script(&format!("{SCHEMA}{SEEDS}"));
     let stmts = Pg2Sqlite::default()
         .sql(&source)
         .expect("parse schema and seeds")
@@ -134,7 +138,7 @@ fn setup_sq_diesel() -> SqliteConnection {
 // only by `statistical_aggregates_agree_within_tolerance` because diesel
 // provides no API for window-aggregate registration.
 fn setup_sq_rusqlite() -> RusqliteConn {
-    let source = format!("{SCHEMA}{SEEDS}");
+    let source = utc_script(&format!("{SCHEMA}{SEEDS}"));
     let stmts = Pg2Sqlite::default()
         .sql(&source)
         .expect("parse schema and seeds")
@@ -179,7 +183,7 @@ fn pg_sql(conn: &mut PgConnection, sql: &str) -> Vec<Option<String>> {
 /// Translates `SCHEMA` followed by `pg_query` and returns the last emitted
 /// statement, which carries the query under test.
 fn translate_last(pg_query: &str) -> String {
-    let full = format!("{SCHEMA}\n{pg_query}");
+    let full = utc_script(&format!("{SCHEMA}\n{pg_query}"));
     let mut statements = Pg2Sqlite::default()
         .sql(&full)
         .expect("parse query")

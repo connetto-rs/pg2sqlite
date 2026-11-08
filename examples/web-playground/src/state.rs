@@ -8,10 +8,10 @@ use dioxus::prelude::*;
 use pg2sqlite::prelude::{
     ArrayRepresentation, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation,
 };
-use sql_traits::structs::{Deployment, SessionSetting, SettingValue};
+use sql_traits::structs::{SessionSetting, SettingValue};
 use sqlparser::{ast::DataType, dialect::PostgreSqlDialect, parser::Parser};
 
-use crate::{runner::QueryOutcome, samples::SAMPLES};
+use crate::{request, runner::QueryOutcome, samples::SAMPLES};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCategory {
@@ -58,11 +58,7 @@ pub struct SessionVarEntry {
 
 impl Default for SessionVarEntry {
     fn default() -> Self {
-        Self {
-            setting: String::new(),
-            pg_type: "text".to_string(),
-            function: String::new(),
-        }
+        Self { setting: String::new(), pg_type: "text".to_string(), function: String::new() }
     }
 }
 
@@ -81,6 +77,9 @@ pub struct WebOptions {
     /// Empty means "don't configure", which is fine for non-RLS schemas.
     pub rls_audit_table_name: String,
     pub session_variables: Vec<SessionVarEntry>,
+    /// The server's `TimeZone`, which a `timestamptz` read and a temporal
+    /// default answer from.
+    pub time_zone: String,
 }
 
 impl Default for WebOptions {
@@ -92,6 +91,7 @@ impl Default for WebOptions {
             uuid_v7_function_name: String::new(),
             rls_audit_table_name: String::new(),
             session_variables: Vec::new(),
+            time_zone: request::DEFAULT_TIME_ZONE.to_string(),
         }
     }
 }
@@ -120,10 +120,7 @@ impl WebOptions {
         let mut settings = Vec::new();
         let mut functions: Vec<(String, String)> = Vec::new();
         for entry in &self.session_variables {
-            if functions
-                .iter()
-                .any(|(declared, _)| declared.eq_ignore_ascii_case(&entry.setting))
-            {
+            if functions.iter().any(|(declared, _)| declared.eq_ignore_ascii_case(&entry.setting)) {
                 continue;
             }
             let Some(data_type) = parse_pg_type(&entry.pg_type) else {
@@ -137,16 +134,19 @@ impl WebOptions {
             settings.push(setting.may_be_unset());
             functions.push((entry.setting.clone(), entry.function.clone()));
         }
-        if !functions.is_empty() {
-            // No acting role is named, so a role reading is refused before any role check.
-            let deployment =
-                Deployment::new("app", ["app"], settings).expect("a valid deployment");
-            opts = opts.with_deployment(deployment);
-            for (setting, function) in functions {
-                opts = opts.with_session_variable(SessionVariableMapping::new(setting, function));
-            }
+        // A zone PostgreSQL refuses leaves the server's zone unset, so a read
+        // needing it is refused and the options panel names the zone.
+        let (deployment, _) = request::deployment(&self.time_zone, settings);
+        opts = opts.with_deployment(deployment);
+        for (setting, function) in functions {
+            opts = opts.with_session_variable(SessionVariableMapping::new(setting, function));
         }
         opts
+    }
+
+    /// Why PostgreSQL refuses [`time_zone`](Self::time_zone), when it does.
+    pub fn time_zone_error(&self) -> Option<String> {
+        request::deployment(&self.time_zone, Vec::new()).1.map(|error| error.to_string())
     }
 }
 

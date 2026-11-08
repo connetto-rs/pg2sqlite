@@ -1,4 +1,5 @@
-//! Forward-translation helpers for integration tests that use default options.
+//! Forward-translation helpers for integration tests, with the default and
+//! the UTC request.
 
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
@@ -54,25 +55,38 @@ pub fn translate_default_first_query(sql: &str) -> String {
     translate_default_statements_and_first_query(sql).1
 }
 
-/// Translates `pg` SQL with default options and returns the emitted
-/// statements as strings alongside the first emitted query as a string.
+/// Translates `pg` SQL under `options` and returns the emitted statements as
+/// strings alongside the first emitted query as a string.
 ///
 /// # Panics
 ///
 /// Panics when parsing or translation fails or when the script emits no
 /// query.
-pub fn translate_default_statements_and_first_query(sql: &str) -> (Vec<String>, String) {
+pub fn translate_statements_and_first_query(
+    sql: &str,
+    options: &Pg2SqliteOptions,
+) -> (Vec<String>, String) {
     use sqlparser::ast::Statement;
-    let statements = Pg2Sqlite::default()
-        .sql(sql)
-        .unwrap()
-        .translate(&Pg2SqliteOptions::default())
-        .unwrap()
-        .into_vec();
+    let statements = Pg2Sqlite::default().sql(sql).unwrap().translate(options).unwrap().into_vec();
     let first_query = statements
         .iter()
         .find(|s| matches!(s, Statement::Query(_)))
         .expect("script should emit a query")
         .to_string();
     (statements.iter().map(ToString::to_string).collect(), first_query)
+}
+
+/// [`translate_statements_and_first_query`] with default options.
+pub fn translate_default_statements_and_first_query(sql: &str) -> (Vec<String>, String) {
+    translate_statements_and_first_query(sql, &Pg2SqliteOptions::default())
+}
+
+/// [`translate_statements_and_first_query`] for a request whose `TimeZone` is
+/// UTC, `sql` led by the role
+/// [`utc_request`](super::deployment::utc_request) logs in as.
+pub fn translate_utc_statements_and_first_query(sql: &str) -> (Vec<String>, String) {
+    translate_statements_and_first_query(
+        &super::deployment::utc_script(sql),
+        &super::deployment::utc_request(),
+    )
 }

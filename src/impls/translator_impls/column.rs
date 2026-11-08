@@ -304,7 +304,7 @@ pub(crate) fn translate_column_def(
                 &column.data_type,
                 options,
             )?;
-            temporal_default(&column.data_type, translated, source, options)
+            temporal_default(&column.data_type, translated, source, expr, schema, options)
         })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
@@ -333,11 +333,14 @@ pub(crate) fn translate_column_def(
 }
 
 /// A temporal column's translated `DEFAULT` in the text the column holds,
-/// exactly as a written value would be converted.
+/// exactly as a written value would be converted, an instant read in the
+/// request's zone.
 fn temporal_default(
     data_type: &DataType,
     option: Option<ColumnOptionDef>,
     source: Option<crate::impls::timezone::TimestampAwareness>,
+    written: &Expr,
+    schema: &sql_traits::structs::ParserDB,
     options: &crate::options::TranslationContext<'_>,
 ) -> Result<Option<ColumnOptionDef>, Error> {
     let Some(kind) = crate::impls::temporal_literals::temporal_literal_kind(data_type) else {
@@ -349,8 +352,22 @@ fn temporal_default(
     while let Expr::Nested(inner) = value {
         value = *inner;
     }
-    let value =
-        crate::impls::shared_helpers::convert_temporal_value(kind, value, source, Some(options))?;
+    let zoned = crate::impls::zone_clock::conversion_wall_clock(
+        kind,
+        source,
+        "a temporal default",
+        schema,
+        options,
+    )?;
+    let value = crate::impls::shared_helpers::convert_temporal_value(
+        kind,
+        value,
+        source,
+        zoned,
+        Some(written),
+        Some("a temporal default"),
+        Some(options),
+    )?;
     Ok(Some(ColumnOptionDef {
         name,
         option: ColumnOption::Default(

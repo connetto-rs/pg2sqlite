@@ -22,10 +22,14 @@
 //! query happens to have.
 
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use run_translated_helper::run_translated_with;
+use run_translated_helper::{run_translated_utc, run_translated_with};
 use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
 
-use crate::helpers::{run_translated as run_translated_helper, translate::assert_refused};
+use crate::helpers::{
+    deployment::{UTC_REQUEST_ROLE, utc_request, utc_script},
+    run_translated as run_translated_helper,
+    translate::assert_refused,
+};
 
 const TABLE: &str = "CREATE TABLE t (id INT PRIMARY KEY, naive TIMESTAMP, aware TIMESTAMPTZ);
      INSERT INTO t VALUES (1, '2023-01-15 12:00:00', '2023-01-15 12:00:00');";
@@ -51,12 +55,28 @@ fn evaluate(expression: &str) -> Option<String> {
     .expect("one row")
 }
 
-/// Runs `SELECT <expression> FROM f ORDER BY id` over the fractional table.
-fn evaluate_fractional(expression: &str) -> Vec<Option<String>> {
+/// Runs `SELECT <expression> FROM f ORDER BY id` over the fractional table
+/// under `options`, the script led by the role declaration `role`.
+fn evaluate_fractional_with(
+    expression: &str,
+    role: &str,
+    options: &Pg2SqliteOptions,
+) -> Vec<Option<String>> {
     run_translated_with(
-        &format!("{FRACTIONAL_TABLE} SELECT {expression} FROM f ORDER BY id;"),
-        &Pg2SqliteOptions::default(),
+        &format!("{role}{FRACTIONAL_TABLE} SELECT {expression} FROM f ORDER BY id;"),
+        options,
     )
+}
+
+/// [`evaluate_fractional_with`] with default options.
+fn evaluate_fractional(expression: &str) -> Vec<Option<String>> {
+    evaluate_fractional_with(expression, "", &Pg2SqliteOptions::default())
+}
+
+/// [`evaluate_fractional_with`] for a request whose `TimeZone` is UTC, which
+/// a cast over the `timestamptz` column needs to read the zone from.
+fn evaluate_fractional_utc(expression: &str) -> Vec<Option<String>> {
+    evaluate_fractional_with(expression, UTC_REQUEST_ROLE, &utc_request())
 }
 
 /// Reverse translates `sqlite` against `schema` and returns the refusal.
@@ -224,11 +244,10 @@ fn a_default_over_now_at_utc_stores_the_same_instant_as_a_plain_default() {
 #[test]
 fn a_timetz_default_keeps_the_fraction() {
     assert_eq!(
-        run_translated_with(
+        run_translated_utc(
             "CREATE TABLE x (id INT PRIMARY KEY, tmz TIMETZ DEFAULT to_timestamp(1.5));
              INSERT INTO x (id) VALUES (1);
              SELECT tmz = '00:00:01.5+00'::timetz FROM x;",
-            &Pg2SqliteOptions::default(),
         ),
         vec![Some("1".to_string())]
     );
@@ -238,9 +257,9 @@ fn a_timetz_default_keeps_the_fraction() {
 #[test]
 fn a_volatile_temporal_default_is_refused() {
     let message = Pg2Sqlite::default()
-        .sql("CREATE TABLE y (ts TIMESTAMP DEFAULT to_timestamp(random()));")
+        .sql(&utc_script("CREATE TABLE y (ts TIMESTAMP DEFAULT to_timestamp(random()));"))
         .expect("parse")
-        .translate(&Pg2SqliteOptions::default())
+        .translate(&utc_request())
         .expect_err("a volatile default has no single-read SQLite form")
         .to_string();
     assert!(
@@ -543,7 +562,7 @@ fn a_cast_to_local_time_keeps_the_fraction() {
         ("tz::time", ["03:04:05.5", "03:04:05", "03:04:05.123456"]),
     ] {
         assert_eq!(
-            evaluate_fractional(expression),
+            evaluate_fractional_utc(expression),
             expected.map(|text| Some(text.to_string())).to_vec(),
             "{expression}"
         );
@@ -570,19 +589,15 @@ fn the_local_conversion_keeps_the_fraction_across_a_shift() {
 #[test]
 fn the_localtime_zone_keeps_the_fraction() {
     assert_eq!(
-        run_translated_with(
-            &format!(
-                "{FRACTIONAL_TABLE} SELECT date_part('second', tz AT TIME ZONE 'localtime') \
+        run_translated_utc(&format!(
+            "{FRACTIONAL_TABLE} SELECT date_part('second', tz AT TIME ZONE 'localtime') \
                  FROM f WHERE id < 3 ORDER BY id;"
-            ),
-            &Pg2SqliteOptions::default(),
-        ),
+        ),),
         vec![Some("5.5".to_string()), Some("5".to_string())]
     );
     assert_eq!(
-        run_translated_with(
+        run_translated_utc(
             "SELECT date_part('second', TIMESTAMP '2024-01-02 03:04:05.5' AT TIME ZONE 'localtime');",
-            &Pg2SqliteOptions::default(),
         ),
         vec![Some("5.5".to_string())]
     );
@@ -613,7 +628,7 @@ fn to_timestamp_keeps_its_fraction_through_the_zone() {
 #[test]
 fn an_unresolved_operand_at_utc_keeps_the_date_functions_fraction() {
     assert_eq!(
-        evaluate_fractional("date_trunc('millisecond', tz) AT TIME ZONE 'UTC'"),
+        evaluate_fractional_utc("date_trunc('millisecond', tz) AT TIME ZONE 'UTC'"),
         vec![
             Some("2024-01-02 03:04:05.5".to_string()),
             Some("2024-01-02 03:04:05".to_string()),

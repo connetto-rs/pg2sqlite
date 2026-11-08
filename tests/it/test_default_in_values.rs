@@ -13,7 +13,10 @@
 use diesel::prelude::*;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
-use crate::helpers;
+use crate::helpers::{
+    self,
+    deployment::{utc_request, utc_script},
+};
 
 mod schema {
     diesel::table! {
@@ -57,12 +60,17 @@ fn a_declared_default_is_substituted() {
 }
 
 /// A default that is a function call has to be translated too, not copied, or
-/// the emitted row would call a PostgreSQL function SQLite does not have.
+/// the emitted row would call a PostgreSQL function SQLite does not have. The
+/// `now()` default reads the request's zone, so the script applies under the
+/// UTC deployment.
 #[test]
 fn a_function_default_is_translated() {
-    let mut conn = helpers::apply_default(
-        "CREATE TABLE stamped (id INTEGER PRIMARY KEY, created TIMESTAMP DEFAULT now());
+    let mut conn = helpers::apply_with_options(
+        &utc_script(
+            "CREATE TABLE stamped (id INTEGER PRIMARY KEY, created TIMESTAMP DEFAULT now());
          INSERT INTO stamped (id, created) VALUES (1, DEFAULT);",
+        ),
+        &utc_request(),
     )
     .expect("apply");
 

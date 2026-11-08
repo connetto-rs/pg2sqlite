@@ -8,7 +8,7 @@
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use run_translated_helper::{run_translated_utc, run_translated_with};
 
-use crate::helpers::run_translated as run_translated_helper;
+use crate::helpers::{deployment::utc_request, run_translated as run_translated_helper};
 
 fn rows(pg: &str) -> Vec<Option<String>> {
     run_translated_with(pg, &Pg2SqliteOptions::default())
@@ -171,7 +171,7 @@ fn a_value_crossing_between_zoned_and_zoneless_columns_takes_the_target_form() {
         ("INSERT INTO t (id, naive) SELECT 2, at FROM t", "2026-09-23 13:42:07"),
     ] {
         let column = if stored.ends_with("+00:00") { "at" } else { "naive" };
-        let written = rows(&format!(
+        let written = run_translated_utc(&format!(
             "CREATE TABLE t (id int PRIMARY KEY, at timestamptz, naive timestamp);
              INSERT INTO t (id, at, naive)
                  VALUES (1, '2026-09-23 13:42:07+00', '2026-09-23 13:42:07.5');
@@ -224,7 +224,7 @@ fn now_written_into_another_temporal_column_takes_that_column_form() {
         ("time", "dd:dd:dd"),
         ("time with time zone", "dd:dd:dd+00:00"),
     ] {
-        let written = rows(&format!(
+        let written = run_translated_utc(&format!(
             "CREATE TABLE t (id int PRIMARY KEY, at {declared} DEFAULT now());
              INSERT INTO t (id) VALUES (1);
              INSERT INTO t (id, at) VALUES (2, now()), (3, (now()));
@@ -248,7 +248,7 @@ fn a_column_without_a_zone_compares_with_now_as_an_instant() {
         ("d BETWEEN '2000-01-01' AND now()", "1"),
     ] {
         assert_eq!(
-            rows(&format!(
+            run_translated_utc(&format!(
                 "CREATE TABLE t (id int PRIMARY KEY, d date DEFAULT now());
                  INSERT INTO t (id) VALUES (1);
                  SELECT count(*) FROM t WHERE {predicate};"
@@ -261,11 +261,12 @@ fn a_column_without_a_zone_compares_with_now_as_an_instant() {
 
 #[test]
 fn a_default_forwarded_by_a_row_level_security_trigger_keeps_the_column_form() {
-    let options = Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit");
+    let options = utc_request().with_rls_audit_table_name("rls_audit");
     for (declared, canonical) in [("timestamptz", true), ("timestamp", false)] {
         let written = run_translated_with(
             &format!(
-                "CREATE TABLE t (id int PRIMARY KEY, at {declared} DEFAULT now());
+                "CREATE ROLE app;
+                 CREATE TABLE t (id int PRIMARY KEY, at {declared} DEFAULT now());
                  ALTER TABLE t ENABLE ROW LEVEL SECURITY;
                  CREATE POLICY p ON t USING (true) WITH CHECK (true);
                  INSERT INTO t (id) VALUES (1);

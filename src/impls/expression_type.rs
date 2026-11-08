@@ -51,14 +51,13 @@ pub(crate) fn type_name<'e>(
         Expr::TypedString(typed) => Some(normalize_sqlparser_type(&typed.data_type)),
         Expr::Value(value) => literal_type_name(&value.value).map(Cow::Borrowed),
         Expr::Interval(_) => Some(Cow::Borrowed("interval")),
+        Expr::Extract { .. } => Some(Cow::Borrowed("numeric")),
         Expr::Function(call) => call_type_name(call, schema, options)?.map(Cow::Owned),
         Expr::BinaryOp { left, op, right } => {
-            crate::impls::translator_impls::blob_operator::resolve(
+            crate::impls::translator_impls::blob_operator::result_type(
                 left, op, right, schema, options,
             )?
-            .map(|resolved| {
-                Cow::Owned(normalize_sqlparser_type(resolved.result_type()).into_owned())
-            })
+            .map(|result| Cow::Owned(normalize_sqlparser_type(&result).into_owned()))
         }
         Expr::Array(array) => {
             common_type(&array.elem, schema, options)?

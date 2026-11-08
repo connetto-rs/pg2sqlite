@@ -122,14 +122,9 @@ pub(crate) fn is_uniform_random_float(expr: &Expr) -> bool {
 
 // ── LOCALTIMESTAMP and LOCALTIME ────────────────────────────────────────────
 
-/// The argument list `('now', 'localtime')`, which `datetime(...)` and
-/// `time(...)` take to answer PostgreSQL's `localtimestamp` and `localtime`.
-#[must_use]
-pub(crate) fn now_localtime_args() -> Vec<Expr> {
-    vec![string_literal("now"), string_literal("localtime")]
-}
-
-/// True when `args` is exactly what [`now_localtime_args`] builds.
+/// True when `args` is exactly `('now', 'localtime')`, the list the reverse
+/// of `datetime(...)` and `time(...)` reads as PostgreSQL's `localtimestamp`
+/// and `localtime`.
 #[must_use]
 pub(crate) fn is_now_localtime_args(args: &FunctionArguments) -> bool {
     let FunctionArguments::List(list) = args else { return false };
@@ -426,7 +421,7 @@ mod tests {
 
     #[test]
     fn the_now_localtime_arguments_round_trip() {
-        let function = call("datetime", now_localtime_args());
+        let function = call("datetime", vec![string_literal("now"), string_literal("localtime")]);
         assert!(is_now_localtime_args(&function.args));
         let reversed = call("datetime", vec![string_literal("localtime"), string_literal("now")]);
         assert!(!is_now_localtime_args(&reversed.args), "argument order is part of the shape");

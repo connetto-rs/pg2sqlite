@@ -157,7 +157,8 @@ fn kind_of_nullary(name: &str) -> Option<TemporalKind> {
         | "statement_timestamp"
         | "clock_timestamp" => Some(TemporalKind::TimestampTz),
         "localtimestamp" => Some(TemporalKind::Timestamp),
-        "current_time" | "localtime" => Some(TemporalKind::Time { zoned: false }),
+        "localtime" => Some(TemporalKind::Time { zoned: false }),
+        "current_time" => Some(TemporalKind::Time { zoned: true }),
         _ => None,
     }
 }
@@ -178,10 +179,12 @@ fn binary_result_kind(
     // An INTERVAL keeps the other operand's type, except that it widens a date
     // to a timestamp.
     let widen = |kind| if kind == TemporalKind::Date { TemporalKind::Timestamp } else { kind };
-    if is_interval_expr(right) {
+    let interval =
+        |operand| crate::impls::expression_type::is_interval_typed(operand, schema, options);
+    if interval(right) {
         return Ok(temporal_kind(left, schema, options)?.map(widen));
     }
-    if is_interval_expr(left) && matches!(op, BinaryOperator::Plus) {
+    if interval(left) && matches!(op, BinaryOperator::Plus) {
         return Ok(temporal_kind(right, schema, options)?.map(widen));
     }
 

@@ -74,10 +74,7 @@ pub fn run_translated_bound_with(
 ///
 /// As [`run_translated_with`].
 pub fn run_translated_utc(pg: &str) -> Vec<Option<String>> {
-    run_translated_with(
-        &format!("{}{pg}", super::deployment::UTC_REQUEST_ROLE),
-        &super::deployment::utc_request(),
-    )
+    run_translated_with(&super::deployment::utc_script(pg), &super::deployment::utc_request())
 }
 
 /// The first column of `row` as text, `None` for SQL NULL.

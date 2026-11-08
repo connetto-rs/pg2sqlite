@@ -9,6 +9,7 @@ use diesel::prelude::*;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
 use crate::helpers;
+
 diesel::table! {
     /// Test table for items with categories (used in IN list tests).
     items (id) {
@@ -202,7 +203,7 @@ fn test_in_list_semantic() -> Result<(), Box<dyn std::error::Error>> {
     ";
 
     let (translated, select_stmt) =
-        helpers::translate::translate_default_statements_and_first_query(sql);
+        helpers::translate::translate_utc_statements_and_first_query(sql);
 
     // Execute DDL
     let mut connection = helpers::apply_ddl(&translated);
@@ -270,7 +271,7 @@ fn test_in_subquery_semantic() -> Result<(), Box<dyn std::error::Error>> {
     ";
 
     let (translated, select_stmt) =
-        helpers::translate::translate_default_statements_and_first_query(sql);
+        helpers::translate::translate_utc_statements_and_first_query(sql);
 
     // Execute DDL
     let mut connection = helpers::apply_ddl(&translated);
@@ -335,7 +336,7 @@ fn test_between_semantic() -> Result<(), Box<dyn std::error::Error>> {
     ";
 
     let (translated, select_stmt) =
-        helpers::translate::translate_default_statements_and_first_query(sql);
+        helpers::translate::translate_utc_statements_and_first_query(sql);
 
     // Execute DDL
     let mut connection = helpers::apply_ddl(&translated);
@@ -414,7 +415,7 @@ fn test_case_searched_semantic() -> Result<(), Box<dyn std::error::Error>> {
     ";
 
     let (translated, select_stmt) =
-        helpers::translate::translate_default_statements_and_first_query(sql);
+        helpers::translate::translate_utc_statements_and_first_query(sql);
 
     // Execute DDL
     let mut connection = helpers::apply_ddl(&translated);
@@ -487,7 +488,7 @@ fn test_scalar_subquery_semantic() -> Result<(), Box<dyn std::error::Error>> {
     ";
 
     let (translated, select_stmt) =
-        helpers::translate::translate_default_statements_and_first_query(sql);
+        helpers::translate::translate_utc_statements_and_first_query(sql);
 
     // Execute DDL
     let mut connection = helpers::apply_ddl(&translated);
@@ -538,8 +539,8 @@ fn test_extract_translation() {
         SELECT id, EXTRACT(YEAR FROM event_date) as year FROM events;
     ";
 
-    let options = Pg2SqliteOptions::default();
-    let query = helpers::prepared_user_select(sql, &options);
+    let sql = helpers::deployment::utc_script(sql);
+    let query = helpers::prepared_user_select(&sql, &helpers::deployment::utc_request());
 
     // Should contain strftime, not EXTRACT
     assert!(query.contains("strftime"), "EXTRACT should translate to strftime, got: {query}");
@@ -561,7 +562,7 @@ fn test_extract_fields_semantic() -> Result<(), Box<dyn std::error::Error>> {
     ";
 
     let (translated, select_stmt) =
-        helpers::translate::translate_default_statements_and_first_query(sql);
+        helpers::translate::translate_utc_statements_and_first_query(sql);
 
     // Execute DDL
     let mut connection = helpers::apply_ddl(&translated);
@@ -607,7 +608,7 @@ fn test_extract_time_fields_semantic() -> Result<(), Box<dyn std::error::Error>>
     ";
 
     let (translated, select_stmt) =
-        helpers::translate::translate_default_statements_and_first_query(sql);
+        helpers::translate::translate_utc_statements_and_first_query(sql);
 
     // Execute DDL
     let mut connection = helpers::apply_ddl(&translated);
@@ -649,7 +650,7 @@ fn test_extract_in_where_clause() -> Result<(), Box<dyn std::error::Error>> {
     ";
 
     let (translated, select_stmt) =
-        helpers::translate::translate_default_statements_and_first_query(sql);
+        helpers::translate::translate_utc_statements_and_first_query(sql);
 
     // Execute DDL
     let mut connection = helpers::apply_ddl(&translated);
@@ -705,7 +706,7 @@ fn test_combined_expressions() -> Result<(), Box<dyn std::error::Error>> {
     ";
 
     let (translated, select_stmt) =
-        helpers::translate::translate_default_statements_and_first_query(sql);
+        helpers::translate::translate_utc_statements_and_first_query(sql);
 
     // Execute DDL
     let mut connection = helpers::apply_ddl(&translated);
@@ -818,7 +819,7 @@ fn test_at_time_zone_fixed_offset_semantic() -> Result<(), Box<dyn std::error::E
     ";
 
     let (translated, select_stmt) =
-        helpers::translate::translate_default_statements_and_first_query(sql);
+        helpers::translate::translate_utc_statements_and_first_query(sql);
 
     assert!(
         !select_stmt.to_uppercase().contains("AT TIME ZONE"),
@@ -850,14 +851,16 @@ fn test_at_time_zone_fixed_offset_semantic() -> Result<(), Box<dyn std::error::E
 }
 
 /// EXTRACT refusal must list WEEK, ISODOW, ISOYEAR as supported fields.
-/// They are implemented but the old error text omitted them. R2-LOW.
+/// They are implemented but the old error text omitted them. R2-LOW. QUARTER
+/// is a field PostgreSQL accepts that this translation refuses, so its
+/// refusal carries the supported field list.
 #[test]
 fn extract_unsupported_field_message_lists_week_isodow_isoyear() {
     let err = Pg2Sqlite::default()
-        .sql("SELECT EXTRACT(TIMEZONE FROM TIMESTAMP '2024-01-01 12:00:00')")
+        .sql("SELECT EXTRACT(QUARTER FROM TIMESTAMP '2024-01-01 12:00:00')")
         .expect("parse")
         .translate_to_sql(&Pg2SqliteOptions::default())
-        .expect_err("EXTRACT(TIMEZONE) must fail")
+        .expect_err("EXTRACT(QUARTER) must fail")
         .to_string();
     assert!(err.contains("WEEK"), "EXTRACT refusal must list WEEK, got: {err}");
     assert!(err.contains("ISODOW"), "EXTRACT refusal must list ISODOW, got: {err}");
