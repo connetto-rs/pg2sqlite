@@ -35,7 +35,7 @@ use crate::{
         temporal_arithmetic::{TemporalKind, temporal_kind_of},
         translator_impls::expr::{
             ZonedCalendar, shifted_by_modifiers, shifted_interval_target, shifted_time_of_day,
-            zoned_calendar, zoned_shift_call,
+            zoned_calendar,
         },
     },
     options::TranslationContext,
@@ -391,42 +391,43 @@ fn field_shift_body(kind: TemporalKind, calendar: ZonedCalendar<'_>, negate: boo
         };
         shifted_time_of_day(target_ref, &clock, zoned)
     } else {
+        let fraction = binary(
+            binary(field("u"), BinaryOperator::Modulo, integer_literal(1_000_000)),
+            BinaryOperator::Divide,
+            number_literal("1000000.0"),
+        );
+        let calendar_modifiers = [
+            printf("%+d months", field("m")),
+            string_literal("floor"),
+            printf("%+d days", field("d")),
+        ];
+        let time_modifiers = [
+            printf(
+                "%+d seconds",
+                binary(field("u"), BinaryOperator::Divide, integer_literal(1_000_000)),
+            ),
+            printf("%+.6f seconds", fraction),
+        ];
         match calendar {
             ZonedCalendar::Clock(offset) => {
-                let fraction = binary(
-                    binary(field("u"), BinaryOperator::Modulo, integer_literal(1_000_000)),
-                    BinaryOperator::Divide,
-                    number_literal("1000000.0"),
-                );
                 let on_clock = |seconds: i32| {
                     (offset != 0)
                         .then(|| string_literal(&format!("{:+} seconds", i64::from(seconds))))
                 };
                 let modifiers: Vec<Expr> = on_clock(offset)
                     .into_iter()
-                    .chain([
-                        printf("%+d months", field("m")),
-                        string_literal("floor"),
-                        printf("%+d days", field("d")),
-                    ])
+                    .chain(calendar_modifiers)
                     .chain(on_clock(-offset))
-                    .chain([
-                        printf(
-                            "%+d seconds",
-                            binary(field("u"), BinaryOperator::Divide, integer_literal(1_000_000)),
-                        ),
-                        printf("%+.6f seconds", fraction),
-                    ])
+                    .chain(time_modifiers)
                     .collect();
                 shifted_by_modifiers(target_ref, &modifiers)
             }
-            ZonedCalendar::Function { function, zone } => {
-                zoned_shift_call(
-                    function,
-                    target_ref,
-                    [signed(field("m")), signed(field("d")), signed(field("u"))],
-                    zone,
-                )
+            ZonedCalendar::Registered(clock) => {
+                let mut local = vec![clock.local_clock(target_ref)];
+                local.extend(calendar_modifiers);
+                local.push(string_literal("subsec"));
+                let instant = clock.instant(simple_function_expr("datetime", local, None));
+                shifted_by_modifiers(instant, &time_modifiers)
             }
         }
     }

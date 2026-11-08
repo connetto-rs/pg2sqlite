@@ -1255,7 +1255,9 @@ fn declares_function_by_option(name: &str, options: &Pg2SqliteOptions) -> bool {
     matches(options.get_uuid_function_name())
         || options.get_uuid_v7_function_name().is_some_and(matches)
         || options.get_uuid_text_to_blob_function_name().is_some_and(matches)
-        || options.get_timestamptz_interval_function_name().is_some_and(matches)
+        || options
+            .get_time_zone_functions()
+            .is_some_and(|functions| matches(&functions.local_clock) || matches(&functions.instant))
         || options.get_session_variables().iter().any(|m| matches(&m.sqlite_function))
 }
 

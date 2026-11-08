@@ -8,25 +8,22 @@
 //! compared, and PostgreSQL's own text is checked against what 18.6 answered
 //! when the case was written.
 //!
-//! A zone with transitions needs a SQLite function the application registers.
-//! [`register_timestamptz_pl_interval`] is that function, backed by sql-values.
+//! A zone with transitions needs the two SQLite functions the application
+//! registers, [`zone_functions::register`], backed by sql-values.
 
 use diesel::{
     pg::PgConnection,
     prelude::*,
-    sql_types::{BigInt, Integer, Nullable, Text},
+    sql_types::{Nullable, Text},
     sqlite::SqliteConnection,
 };
 use pg2sqlite::prelude::{Error, Pg2Sqlite, Pg2SqliteOptions};
 use sql_traits::structs::Deployment;
-use sql_values::{InputContext, PgInterval, PgTimeZone, PgTimestamp, PgTimestampTz, ShiftError};
+use sql_values::{InputContext, PgTimestampTz};
 use sqlparser::ast::Statement;
 
 use super::harness::apply_with_seed;
-use crate::helpers::postgres as postgres_harness;
-
-/// The name the replica's SQLite connection registers the shift under.
-const SHIFT_FUNCTION: &str = "timestamptz_pl_interval";
+use crate::helpers::{postgres as postgres_harness, zone_functions};
 
 /// The roles the deployment names, declared for the translation, which reads
 /// them from the schema.
@@ -55,41 +52,6 @@ mod schema {
     }
 }
 
-#[declare_sql_function]
-extern "SQL" {
-    /// `at + interval`, `timestamptz_pl_interval`, in `zone`.
-    fn timestamptz_pl_interval(
-        at: Nullable<Text>,
-        months: Integer,
-        days: Integer,
-        microseconds: BigInt,
-        zone: Text,
-    ) -> Nullable<Text>;
-}
-
-/// Why the registered function cannot answer.
-#[derive(Debug, thiserror::Error)]
-enum ShiftFailure {
-    #[error("the zone setting is refused: {0}")]
-    Zone(#[from] sql_values::TimeZoneError),
-    #[error("the timestamptz text is refused: {0}")]
-    Instant(#[from] sql_values::DateTimeError),
-    #[error("the shift is refused: {0}")]
-    Shift(#[from] ShiftError),
-    #[error("the shifted instant leaves PostgreSQL's timestamps")]
-    OutOfRange,
-}
-
-/// `at` shifted by the interval as PostgreSQL shifts it in `zone`, in the
-/// text the replica holds a `timestamptz` as.
-fn shift(at: &str, interval: PgInterval, zone: &str) -> Result<String, ShiftFailure> {
-    let zone = PgTimeZone::parse(zone)?;
-    let micros = interval.add_to_timestamptz(parse_instant(at)?, &zone)?.pg_micros();
-    let fraction = micros.rem_euclid(1_000_000);
-    let whole = PgTimestamp::from_pg_micros(micros - fraction).ok_or(ShiftFailure::OutOfRange)?;
-    Ok(format!("{whole}.{fraction:06}+00:00"))
-}
-
 /// The instant a `timestamptz` text names, the replica's UTC text written
 /// without an offset included.
 fn parse_instant(text: &str) -> Result<PgTimestampTz, sql_values::DateTimeError> {
@@ -100,28 +62,12 @@ fn parse_instant(text: &str) -> Result<PgTimestampTz, sql_values::DateTimeError>
     }
 }
 
-/// Registers [`SHIFT_FUNCTION`] on `connection`, the way an application
-/// gives the replica PostgreSQL's calendar in a zone with transitions.
-fn register_timestamptz_pl_interval(connection: &mut SqliteConnection) {
-    timestamptz_pl_interval_utils::register_impl(
-        connection,
-        |at: Option<String>, months: i32, days: i32, microseconds: i64, zone: String| {
-            let at = at?;
-            let interval = PgInterval { months, days, microseconds };
-            Some(shift(&at, interval, &zone).unwrap_or_else(|failure| {
-                panic!("{SHIFT_FUNCTION}({at}, {interval:?}, {zone}): {failure}")
-            }))
-        },
-    )
-    .expect("register the shift function");
-}
-
-/// A request acting as `app` in `zone`, with the shift function named.
+/// A request acting as `app` in `zone`, with the zone functions named.
 fn options(zone: &str) -> Pg2SqliteOptions {
-    zoned(zone).with_timestamptz_interval_function_name(SHIFT_FUNCTION)
+    zoned(zone).with_time_zone_functions(zone_functions::functions())
 }
 
-/// A request acting as `app` in `zone`, with no shift function named.
+/// A request acting as `app` in `zone`, with no zone functions named.
 fn zoned(zone: &str) -> Pg2SqliteOptions {
     let deployment = Deployment::new("postgres", ["app"], [])
         .and_then(|deployment| deployment.with_default_time_zone(zone))
@@ -141,6 +87,11 @@ fn select(expression: &str) -> String {
 
 /// What PostgreSQL answers for `expression` under `zone`.
 fn postgres(zone: &str, expression: &str) -> String {
+    postgres_query(zone, &select(expression))
+}
+
+/// What PostgreSQL answers for the one-value `query` under `zone`.
+fn postgres_query(zone: &str, query: &str) -> String {
     let mut connection: PgConnection = postgres_harness::fresh_database();
     // A session setting has no typed DSL form.
     diesel::sql_query("SELECT set_config('TimeZone', $1, false)")
@@ -152,10 +103,10 @@ fn postgres(zone: &str, expression: &str) -> String {
         &format!("{TABLE} INSERT INTO events VALUES (1, '{AT}', '{SPAN}');"),
     )
     .expect("apply the schema and its row");
-    // The expression under test is runtime text no typed DSL carries.
-    diesel::sql_query(select(expression))
+    // The query under test is runtime text no typed DSL carries.
+    diesel::sql_query(query)
         .get_result::<TextRow>(&mut connection)
-        .expect("PostgreSQL evaluates the expression")
+        .unwrap_or_else(|error| panic!("PostgreSQL refused {query}: {error}"))
         .val
         .expect("a non-NULL answer")
 }
@@ -183,8 +134,19 @@ fn sqlite(roles: &str, expression: &str, options: &Pg2SqliteOptions) -> String {
     let mut statements = translate_with(roles, expression, options)
         .unwrap_or_else(|error| panic!("pg2sqlite refused {expression}: {error}"));
     let query = statements.pop().expect("the translated SELECT").to_string();
+    sqlite_query(&mut replica(roles, options), &query)
+}
+
+/// The replica's schema under `roles` and `options`, holding the one row, on
+/// a connection with the zone functions registered.
+fn replica(roles: &str, options: &Pg2SqliteOptions) -> SqliteConnection {
+    let statements = Pg2Sqlite::default()
+        .sql(&format!("{roles}{TABLE}{GRANT}"))
+        .and_then(|source| source.translate(options))
+        .unwrap_or_else(|error| panic!("pg2sqlite refused the schema: {error}"))
+        .into_vec();
     let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-    register_timestamptz_pl_interval(&mut connection);
+    zone_functions::register(&mut connection);
     apply_with_seed(&mut connection, &statements, |connection| {
         use schema::events;
         diesel::insert_into(events::table)
@@ -192,9 +154,14 @@ fn sqlite(roles: &str, expression: &str, options: &Pg2SqliteOptions) -> String {
             .execute(connection)
             .expect("seed the row");
     });
-    // The translated query is runtime text no typed DSL carries.
-    diesel::sql_query(&query)
-        .get_result::<TextRow>(&mut connection)
+    connection
+}
+
+/// What `connection` answers for the one-value `query`.
+fn sqlite_query(connection: &mut SqliteConnection, query: &str) -> String {
+    // The query under test is runtime text no typed DSL carries.
+    diesel::sql_query(query)
+        .get_result::<TextRow>(connection)
         .unwrap_or_else(|error| panic!("SQLite refused {query}: {error}"))
         .val
         .expect("a non-NULL answer")
@@ -360,7 +327,7 @@ fn a_request_without_an_acting_role_runs_in_the_login_zone() {
         .expect("a valid deployment");
     let options = Pg2SqliteOptions::default()
         .with_deployment(deployment)
-        .with_timestamptz_interval_function_name(SHIFT_FUNCTION);
+        .with_time_zone_functions(zone_functions::functions());
     assert_parity("Europe/Rome", "at - interval '1 day'", &options, "2026-10-24 12:00:00+02");
 }
 
@@ -387,7 +354,7 @@ fn the_role_settings_choose_the_zone() {
     let acting = Pg2SqliteOptions::default()
         .with_deployment(deployment().with_acting_role_settings())
         .with_acting_role("app")
-        .with_timestamptz_interval_function_name(SHIFT_FUNCTION);
+        .with_time_zone_functions(zone_functions::functions());
     assert_parity_with(
         roles,
         "Europe/Rome",
@@ -417,10 +384,10 @@ fn a_deployment_role_the_schema_does_not_declare_is_refused() {
 }
 
 #[test]
-fn a_zone_with_transitions_without_the_function_names_the_option() {
+fn a_zone_with_transitions_without_the_functions_names_the_option() {
     for expression in ["at - interval '1 day'", "at - span"] {
         let error = refusal(expression, &zoned("Europe/Rome"));
-        assert!(error.contains("with_timestamptz_interval_function_name"), "{error}");
+        assert!(error.contains("with_time_zone_functions"), "{error}");
     }
 }
 
@@ -434,4 +401,66 @@ fn an_operand_of_unsettled_type_is_refused_outside_utc() {
         assert!(error.contains("::timestamptz"), "{error}");
     }
     translate(unsettled, &zoned("UTC")).expect("UTC answers either type alike");
+}
+
+/// A call to a zone function reverses to `AT TIME ZONE` in the zone it names,
+/// which PostgreSQL answers alike in a session of another zone, here UTC. The
+/// wall clock 02:30 on 2026-10-25 happens twice in Rome, and both engines
+/// take the second, after the clocks go back.
+#[test]
+fn a_zone_function_reverses_to_at_time_zone() {
+    let options = options("Europe/Rome");
+    let schema = Pg2Sqlite::default()
+        .sql(&format!("{ROLES}{TABLE}{GRANT}"))
+        .and_then(|source| source.build_schema())
+        .expect("build the schema");
+    let mut replica = replica(ROLES, &options);
+    for (call, expected) in [
+        (format!("{}(at, 'Europe/Rome')", zone_functions::LOCAL_CLOCK), "2026-10-25 12:00:00"),
+        (
+            format!("{}('2026-10-25 02:30:00', 'Europe/Rome')", zone_functions::INSTANT),
+            "2026-10-25 01:30:00+00",
+        ),
+    ] {
+        let query = select(&call);
+        let reversed = Pg2Sqlite::default()
+            .reverse_sql(&query, &schema, &options)
+            .unwrap_or_else(|error| panic!("pg2sqlite refused to reverse {query}: {error}"))
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        let source = postgres_query("UTC", &reversed);
+        assert_eq!(source, expected, "PostgreSQL under UTC: {reversed}");
+        let answer = sqlite_query(&mut replica, &query);
+        assert_eq!(instant(&answer), instant(&source), "{query} reversed to {reversed}");
+    }
+}
+
+#[test]
+fn a_zone_function_call_without_a_literal_zone_is_refused_in_reverse() {
+    let options = options("Europe/Rome");
+    let schema = Pg2Sqlite::default()
+        .sql(&format!("{ROLES}{TABLE}{GRANT}"))
+        .and_then(|source| source.build_schema())
+        .expect("build the schema");
+    let error = Pg2Sqlite::default()
+        .reverse_sql(
+            &select(&format!("{}(at, span)", zone_functions::LOCAL_CLOCK)),
+            &schema,
+            &options,
+        )
+        .expect_err("the zone is not a literal");
+    assert!(error.to_string().contains("with_time_zone_functions"), "{error}");
+}
+
+/// A source calling a zone function by name reaches the replica unchanged,
+/// since naming the functions says the replica registers them.
+#[test]
+fn a_source_calling_a_zone_function_keeps_the_call() {
+    let call = format!("{}(at, 'Europe/Rome')", zone_functions::LOCAL_CLOCK);
+    let answer = sqlite(ROLES, &call, &options("Europe/Rome"));
+    assert_eq!(answer, "2026-10-25 12:00:00");
+    let error = refusal(&call, &zoned("Europe/Rome"));
+    assert!(error.contains(zone_functions::LOCAL_CLOCK), "{error}");
 }

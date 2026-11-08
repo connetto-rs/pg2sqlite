@@ -2948,7 +2948,7 @@ pub(crate) fn shifted_interval_target(
     }
     // PostgreSQL refuses the interval's negation and a year past its range
     // in every zone, so those refusals come before the zone's.
-    let (months, days, microseconds) = shift.signed_fields()?;
+    let calendar_modifiers = shift.calendar_modifiers()?;
     let operation = format!("{left} {op} {right}");
     let target = left.translate_with_warnings(schema, options, emit)?;
     if let Some(literal) = single_quoted_literal(&target)
@@ -2969,17 +2969,15 @@ pub(crate) fn shifted_interval_target(
                 .collect();
             shifted_by_modifiers(target, &modifiers)
         }
-        ZonedCalendar::Function { function, zone } => {
-            zoned_shift_call(
-                function,
-                target,
-                [
-                    integer_literal(i64::from(months)),
-                    integer_literal(i64::from(days)),
-                    integer_literal(microseconds),
-                ],
-                zone,
-            )
+        ZonedCalendar::Registered(clock) => {
+            let literals = |modifiers: Vec<String>| -> Vec<Expr> {
+                modifiers.iter().map(|modifier| string_literal(modifier)).collect()
+            };
+            let mut local = vec![clock.local_clock(target)];
+            local.extend(literals(calendar_modifiers));
+            local.push(string_literal("subsec"));
+            let instant = clock.instant(simple_function_expr("datetime", local, None));
+            shifted_by_modifiers(instant, &literals(shift.time_modifiers()?))
         }
     })
 }
@@ -2990,13 +2988,34 @@ pub(crate) enum ZonedCalendar<'o> {
     /// SQLite's date modifiers on the clock this many seconds east of UTC,
     /// zero for a date, a `timestamp`, and a `timestamptz` in UTC.
     Clock(i32),
-    /// The registered function, in a zone whose UTC offset changes.
-    Function {
-        /// The function's name.
-        function: &'o str,
-        /// The zone's name.
-        zone: &'o str,
-    },
+    /// The wall clock of a zone whose UTC offset changes, through the
+    /// functions the replica registers.
+    Registered(RegisteredClock<'o>),
+}
+
+/// A zone whose UTC offset changes, read through the functions the replica
+/// registers for it.
+#[derive(Clone, Copy)]
+pub(crate) struct RegisteredClock<'o> {
+    functions: &'o crate::traits::TimeZoneFunctions,
+    zone: &'o str,
+}
+
+impl RegisteredClock<'_> {
+    /// `local_clock(instant, 'zone')`, the zone's wall clock at `instant`.
+    pub(crate) fn local_clock(&self, instant: Expr) -> Expr {
+        simple_function_expr(
+            &self.functions.local_clock,
+            vec![instant, string_literal(self.zone)],
+            None,
+        )
+    }
+
+    /// `instant(local, 'zone')`, the instant the zone's wall clock `local`
+    /// names.
+    pub(crate) fn instant(&self, local: Expr) -> Expr {
+        simple_function_expr(&self.functions.instant, vec![local, string_literal(self.zone)], None)
+    }
 }
 
 /// The calendar PostgreSQL adds the months and days of an interval to
@@ -3045,35 +3064,22 @@ pub(crate) fn zoned_calendar<'o>(
     match zone {
         RequestZone::Fixed(offset) => Ok(ZonedCalendar::Clock(*offset)),
         RequestZone::Changing(zone) => {
-            match options.get_timestamptz_interval_function_name() {
-                Some(function) => Ok(ZonedCalendar::Function { function, zone }),
+            match options.get_time_zone_functions() {
+                Some(functions) => {
+                    Ok(ZonedCalendar::Registered(RegisteredClock { functions, zone }))
+                }
                 None => {
                     Err(crate::errors::Error::forward_refusal(format!(
                         "`{operation}` adds days or months on the calendar of the request's \
                          TimeZone '{zone}', whose UTC offset changes, and SQLite's date \
-                         modifiers know no zone. Register a SQLite function answering \
-                         PostgreSQL's timestamptz_pl_interval in a zone, and name it with \
-                         `with_timestamptz_interval_function_name(...)`."
+                         functions know no zone. Register the SQLite functions turning an \
+                         instant into the zone's wall clock and back, and name them with \
+                         `with_time_zone_functions(...)`."
                     )))
                 }
             }
         }
     }
-}
-
-/// `function(target, months, days, microseconds, 'zone')`, the registered
-/// shift of a `timestamptz` in a zone whose UTC offset changes.
-pub(crate) fn zoned_shift_call(
-    function: &str,
-    target: Expr,
-    [months, days, microseconds]: [Expr; 3],
-    zone: &str,
-) -> Expr {
-    simple_function_expr(
-        function,
-        vec![target, months, days, microseconds, string_literal(zone)],
-        None,
-    )
 }
 
 /// The display spelling of a comparison operator, in PostgreSQL's spelling.
