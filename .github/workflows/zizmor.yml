@@ -2,10 +2,16 @@
 name: zizmor
 
 "on":
+  schedule:
+    - cron: "0 4 * * 1"
   pull_request:
+    paths:
+      - .github/**
   push:
     branches:
       - main
+    paths:
+      - .github/**
 
 permissions: {}
 
