@@ -21,9 +21,7 @@ Append `-- -max_total_time=60` (or similar libfuzzer flags) to time-cap a sessio
 
 ## Seed corpus
 
-Every target has structured seeds in `fuzz/seeds/<target>/`, and the ClusterFuzzLite build fails for a target without seeds. The corpus includes encoded test inputs and fuzzer-grown inputs, reduced with edge-only set cover. Pass the seeds as a second corpus directory for a local run.
-
-`ClusterFuzzLite` stores generated corpora on the dedicated `fuzz-corpus` branch.
+Every target has structured seeds in `fuzz/seeds/<target>/`. The corpus includes encoded test inputs and fuzzer-grown inputs, reduced with edge-only set cover. Pass the seeds as a second corpus directory for a local run.
 
 ```
 mkdir -p fuzz/corpus/fuzz_sql_translation
