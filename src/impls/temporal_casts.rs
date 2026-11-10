@@ -2,10 +2,10 @@
 //!
 //! A temporal column holds its own text, so a cast that changes the kind
 //! rewrites that text into the target kind's form, or answers the refusal
-//! PostgreSQL 18.6 gives for the pair, measured under a UTC session. The
-//! rewrites slice the stored text rather than route it through SQLite's date
-//! functions, which would drop fraction digits past milliseconds. A value of
-//! unknown kind has no stored form to slice, so the date functions read it.
+//! PostgreSQL 18.6 gives for the pair. The rewrites slice the stored text
+//! rather than route it through SQLite's date functions, which would drop
+//! fraction digits past milliseconds. A value of unknown kind has no stored
+//! form to slice, so the date functions read it.
 
 use sql_traits::structs::ParserDB;
 use sqlparser::ast::{BinaryOperator, DataType, Expr, Function, FunctionArguments};
@@ -15,7 +15,8 @@ use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{
-        datetime_helpers::{canonical_timestamptz_call, time_of_day},
+        datetime_helpers::{canonical_timestamptz_call, promote_date_to_midnight, time_of_day},
+        expr_helpers::concat,
         function_helpers::{integer_literal, simple_function_expr, string_literal},
         object_name::last_ident,
         replay::{is_replayable, reject_duplicated_operand},
@@ -142,31 +143,58 @@ pub(crate) fn is_interval_expr(expr: &Expr) -> bool {
 
 /// The target-kind text of a `source`-kind value, rounded to the target's
 /// precision, or `None` when the value passes through and keeps the caller's
-/// lowering.
+/// lowering. `written` and `operation` name the operand and the cast as
+/// written, for a refusal.
+///
+/// # Errors
+///
+/// Refuses the pairs PostgreSQL refuses, a conversion into an instant or an
+/// offset whose request zone does not resolve, and an operand the conversion
+/// reads twice that cannot be replayed.
 pub(crate) fn translate_temporal_kind_cast(
     target: TemporalLiteralKind,
     source: TemporalLiteralKind,
     operand: &Expr,
+    written: &Expr,
+    operation: &str,
+    schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
 ) -> Result<Option<Expr>, Error> {
     use TemporalLiteralKind::{Date, Time, Timestamp};
+    let zoned = || {
+        crate::impls::zone_clock::zoned_wall_clock(
+            operation,
+            "read a wall clock in",
+            schema,
+            options,
+        )
+    };
     let rewritten = match (target, source) {
         // A timestamptz into the session's local zone is another lowering's.
         (_, Timestamp { zoned: true, .. })
-        | (Date | Timestamp { zoned: true, .. }, Date)
+        | (Date, Date)
         | (Time { zoned: false, .. }, Time { zoned: false, .. })
         | (Time { zoned: true, .. }, Time { zoned: true, .. })
         | (Timestamp { zoned: false, .. }, Timestamp { zoned: false, .. }) => return Ok(None),
-        (Timestamp { zoned: true, .. }, Timestamp { zoned: false, .. }) => {
-            naive_canonical(operand, options)?
+        (Timestamp { zoned: true, .. }, Timestamp { zoned: false, .. } | Date) => {
+            let zoned = zoned()?;
+            if zoned.instant_reads_twice() && !is_replayable(written, options) {
+                return Err(reject_duplicated_operand(operation, written));
+            }
+            let local = if source == Date {
+                promote_date_to_midnight(operand.clone())
+            } else {
+                operand.clone()
+            };
+            zoned.instant(local)
         }
         (Date, Timestamp { zoned: false, .. }) => date_part(operand),
-        (Timestamp { zoned: false, .. }, Date) => {
-            crate::impls::datetime_helpers::promote_date_to_midnight(operand.clone())
-        }
+        (Timestamp { zoned: false, .. }, Date) => promote_date_to_midnight(operand.clone()),
         (Time { zoned: false, .. }, Timestamp { zoned: false, .. }) => time_of_day(operand.clone()),
         (Time { zoned: false, .. }, Time { zoned: true, .. }) => wall_time(operand, options)?,
-        (Time { zoned: true, .. }, Time { zoned: false, .. }) => session_offset_time(operand),
+        (Time { zoned: true, .. }, Time { zoned: false, .. }) => {
+            concat(operand.clone(), crate::impls::zone_clock::offset_now(zoned()?))
+        }
         (Time { .. }, Date) => {
             return Err(kind_cast_refusal(source, target, "a date holds no time of day"));
         }
@@ -215,62 +243,6 @@ fn wall_time(
         vec![operand.clone(), integer_literal(1), Expr::Nested(Box::new(offset_less))],
         None,
     ))
-}
-
-/// The session zone, UTC, read onto a zoneless `HH:MM:SS[.f]` text.
-fn session_offset_time(operand: &Expr) -> Expr {
-    Expr::BinaryOp {
-        left: Box::new(operand.clone()),
-        op: BinaryOperator::StringConcat,
-        right: Box::new(string_literal("+00:00")),
-    }
-}
-
-/// The canonical `+00:00` text of a zoneless `YYYY-MM-DD HH:MM:SS[.f]`, the
-/// fraction zero-padded to the six digits a timestamptz column stores.
-fn naive_canonical(
-    operand: &Expr,
-    options: &crate::options::TranslationContext<'_>,
-) -> Result<Expr, Error> {
-    if !is_replayable(operand, options) {
-        return Err(reject_duplicated_operand("a TIMESTAMP to TIMESTAMPTZ cast", operand));
-    }
-    let whole = simple_function_expr(
-        "substr",
-        vec![operand.clone(), integer_literal(1), integer_literal(19)],
-        None,
-    );
-    let padded_fraction = simple_function_expr(
-        "substr",
-        vec![
-            Expr::Nested(Box::new(Expr::BinaryOp {
-                left: Box::new(simple_function_expr(
-                    "substr",
-                    vec![operand.clone(), integer_literal(21), integer_literal(6)],
-                    None,
-                )),
-                op: BinaryOperator::StringConcat,
-                right: Box::new(string_literal("000000")),
-            })),
-            integer_literal(1),
-            integer_literal(6),
-        ],
-        None,
-    );
-    let with_fraction = Expr::BinaryOp {
-        left: Box::new(whole),
-        op: BinaryOperator::StringConcat,
-        right: Box::new(Expr::Nested(Box::new(Expr::BinaryOp {
-            left: Box::new(string_literal(".")),
-            op: BinaryOperator::StringConcat,
-            right: Box::new(padded_fraction),
-        }))),
-    };
-    Ok(Expr::BinaryOp {
-        left: Box::new(Expr::Nested(Box::new(with_fraction))),
-        op: BinaryOperator::StringConcat,
-        right: Box::new(string_literal("+00:00")),
-    })
 }
 
 /// The refusal PostgreSQL answers for a pair of kinds it cannot cast between.

@@ -366,7 +366,7 @@ fn temporal_default(
         zoned,
         Some(written),
         Some("a temporal default"),
-        Some(options),
+        Some(crate::impls::shared_helpers::ZoneSite { schema, options }),
     )?;
     Ok(Some(ColumnOptionDef {
         name,

@@ -32,7 +32,7 @@ use crate::helpers::{
 };
 
 const TABLE: &str = "CREATE TABLE t (id INT PRIMARY KEY, naive TIMESTAMP, aware TIMESTAMPTZ);
-     INSERT INTO t VALUES (1, '2023-01-15 12:00:00', '2023-01-15 12:00:00');";
+     INSERT INTO t VALUES (1, '2023-01-15 12:00:00', '2023-01-15 12:00:00+00');";
 
 /// A timestamptz that carries a sub-second fraction, so a conversion into the
 /// local zone must keep the fraction rather than drop it to whole seconds.
@@ -224,7 +224,7 @@ fn utc_shifts_nothing() {
 #[test]
 fn a_default_over_now_at_utc_stores_the_same_instant_as_a_plain_default() {
     assert_eq!(
-        run_translated_with(
+        run_translated_utc(
             "CREATE TABLE d (
                id INT PRIMARY KEY,
                plain TIMESTAMPTZ DEFAULT now(),
@@ -233,7 +233,6 @@ fn a_default_over_now_at_utc_stores_the_same_instant_as_a_plain_default() {
              );
              INSERT INTO d (id) VALUES (1);
              SELECT plain = at_utc AND plain = stamp_at_utc FROM d;",
-            &Pg2SqliteOptions::default(),
         ),
         vec![Some("1".to_string())],
     );
@@ -344,8 +343,6 @@ fn the_reversal_is_the_expression_it_came_from() {
         "aware AT TIME ZONE '+05:30'",
         "naive AT TIME ZONE 'UTC'",
         "aware AT TIME ZONE 'UTC'",
-        "naive AT TIME ZONE 'localtime'",
-        "aware AT TIME ZONE 'localtime'",
         // Nested, because sqlparser's Display adds no parentheses and
         // PostgreSQL reads AT TIME ZONE left to right, so the reversal has to
         // come back associating the same way it went out.
@@ -583,24 +580,20 @@ fn the_local_conversion_keeps_the_fraction_across_a_shift() {
     );
 }
 
-/// The machine's own zone keeps the fraction in both directions, as PostgreSQL
-/// 18.6 answers `5.5` and `5`. The second is read so the test holds in any
-/// whole-minute zone.
+/// `AT TIME ZONE 'localtime'` reads the PostgreSQL server's operating-system
+/// zone, which neither side of the translation knows.
 #[test]
-fn the_localtime_zone_keeps_the_fraction() {
-    assert_eq!(
-        run_translated_utc(&format!(
-            "{FRACTIONAL_TABLE} SELECT date_part('second', tz AT TIME ZONE 'localtime') \
-                 FROM f WHERE id < 3 ORDER BY id;"
-        ),),
-        vec![Some("5.5".to_string()), Some("5".to_string())]
-    );
-    assert_eq!(
-        run_translated_utc(
-            "SELECT date_part('second', TIMESTAMP '2024-01-02 03:04:05.5' AT TIME ZONE 'localtime');",
-        ),
-        vec![Some("5.5".to_string())]
-    );
+fn the_localtime_zone_is_refused() {
+    for expression in
+        ["tz AT TIME ZONE 'localtime'", "TIMESTAMP '2024-01-02 03:04:05.5' AT TIME ZONE 'local'"]
+    {
+        let error = Pg2Sqlite::default()
+            .sql(&format!("{FRACTIONAL_TABLE} SELECT {expression} FROM f;"))
+            .and_then(|source| source.translate(&Pg2SqliteOptions::default()))
+            .expect_err("the server's own zone has no translation")
+            .to_string();
+        assert!(error.contains("operating system"), "{expression}: {error}");
+    }
 }
 
 /// `to_timestamp` carries a fraction the same way, so the conversion keeps it,

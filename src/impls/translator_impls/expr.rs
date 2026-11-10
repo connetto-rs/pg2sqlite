@@ -1380,16 +1380,23 @@ fn translate_at_time_zone(
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Expr, crate::errors::Error> {
     let modifier = single_quoted_literal(time_zone)
-.and_then(normalize_at_time_zone_modifier)
-.ok_or_else(|| {
-crate::errors::Error::forward_refusal("AT TIME ZONE supports only literal UTC/local or fixed offsets (+HH:MM/-HH:MM) in SQLite translation."
-    .to_string())
-})?;
-
-    // UTC shifts nothing in PostgreSQL, so the operand's type alone picks the
-    // result's text form, and an unresolvable operand keeps the plain reading.
-    // SQLite's `utc` modifier reads a value as local time and is not that
-    // shift.
+        .and_then(normalize_at_time_zone_modifier)
+        .ok_or_else(|| {
+            crate::errors::Error::forward_refusal(
+                "AT TIME ZONE supports only literal UTC or fixed offsets (+HH:MM/-HH:MM) in \
+                 SQLite translation."
+                    .to_string(),
+            )
+        })?;
+    if modifier == "localtime" {
+        return Err(crate::errors::Error::forward_refusal(format!(
+            "`{timestamp} AT TIME ZONE {time_zone}` reads the zone the PostgreSQL server's \
+             operating system runs in, which neither the request nor the replica knows. Name \
+             the zone, as `AT TIME ZONE 'Europe/Rome'`."
+        )));
+    }
+    // SQLite's `utc` modifier reads a value as local time, so UTC takes the
+    // operand's own text form.
     if modifier == "utc" || modifier == "+00:00" || modifier == "-00:00" {
         let awareness = timestamp_awareness(timestamp, schema, options).ok().flatten();
         if matches!(awareness, Some(TimestampAwareness::Naive | TimestampAwareness::Aware)) {
@@ -1406,12 +1413,9 @@ crate::errors::Error::forward_refusal("AT TIME ZONE supports only literal UTC/lo
         });
     }
 
-    // `localtime` is the machine's zone in both databases, and SQLite's `utc`
-    // reads a value as that zone's local time.
-    let (naive_shift, aware_shift) = match flipped_shifting_offset(&modifier) {
-        Some(negated) => (modifier, negated),
-        None => ("utc".to_string(), modifier),
-    };
+    let aware_shift = flipped_shifting_offset(&modifier)
+        .expect("every modifier left is a fixed offset that shifts");
+    let naive_shift = modifier;
 
     let awareness = timestamp_awareness(timestamp, schema, options)?.ok_or_else(|| {
         crate::errors::Error::forward_refusal(format!(
@@ -2569,7 +2573,13 @@ fn convert_beside_column_expr(
                 &dt,
                 options,
             )?;
-            convert_value_for_column_type(&dt, value, schema, options)
+            convert_value_for_column_type(
+                &dt,
+                value,
+                schema,
+                options,
+                Some(crate::impls::shared_helpers::ZoneSite { schema, options }),
+            )
         }
         None => Ok(value),
     }
@@ -3944,8 +3954,9 @@ fn translate_binary_op(
         }
     }
 
-    // DATE compared with TIMESTAMP: stored texts differ in length, so text
-    // comparison misses midnight timestamps. Promote the DATE side to midnight.
+    // A date or a timestamp compared with another kind takes the other's
+    // text: a date the midnight of a timestamp, either the instant its wall
+    // clock names in the request's zone beside a timestamptz.
     if matches!(
         op,
         BinaryOperator::Eq
@@ -3957,28 +3968,52 @@ fn translate_binary_op(
     ) {
         let lk = temporal_kind_of(left, schema, options);
         let rk = temporal_kind_of(right, schema, options);
-        if matches!(
-            (lk, rk),
-            (Some(TemporalKind::Date), Some(TemporalKind::Timestamp | TemporalKind::TimestampTz))
-                | (
-                    Some(TemporalKind::Timestamp | TemporalKind::TimestampTz),
-                    Some(TemporalKind::Date)
-                )
-        ) {
-            let tl = left.translate_with_warnings(schema, options, emit)?;
-            let tr = right.translate_with_warnings(schema, options, emit)?;
+        let wider = match (lk, rk) {
+            (
+                Some(TemporalKind::TimestampTz),
+                Some(TemporalKind::Date | TemporalKind::Timestamp),
+            )
+            | (
+                Some(TemporalKind::Date | TemporalKind::Timestamp),
+                Some(TemporalKind::TimestampTz),
+            ) => Some(TemporalKind::TimestampTz),
+            (Some(TemporalKind::Timestamp), Some(TemporalKind::Date))
+            | (Some(TemporalKind::Date), Some(TemporalKind::Timestamp)) => {
+                Some(TemporalKind::Timestamp)
+            }
+            _ => None,
+        };
+        if let Some(wider) = wider {
+            let operation = format!("{left} {op} {right}");
+            let zoned = (wider == TemporalKind::TimestampTz)
+                .then(|| {
+                    crate::impls::zone_clock::zoned_wall_clock(
+                        &operation,
+                        "read a wall clock in",
+                        schema,
+                        options,
+                    )
+                })
+                .transpose()?;
+            let mut to_common = |side: &Expr, kind| -> Result<Expr, crate::errors::Error> {
+                let translated = side.translate_with_warnings(schema, options, emit)?;
+                let local = match kind {
+                    Some(TemporalKind::Date) => {
+                        crate::impls::datetime_helpers::promote_date_to_midnight(translated)
+                    }
+                    Some(TemporalKind::Timestamp) if zoned.is_some() => translated,
+                    _ => return Ok(translated),
+                };
+                let Some(zoned) = zoned else { return Ok(local) };
+                if zoned.instant_reads_twice() && !is_replayable(side, options) {
+                    return Err(reject_duplicated_operand(&operation, side));
+                }
+                Ok(zoned.instant(local))
+            };
             return Ok(Expr::BinaryOp {
-                left: Box::new(if matches!(lk, Some(TemporalKind::Date)) {
-                    crate::impls::datetime_helpers::promote_date_to_midnight(tl)
-                } else {
-                    tl
-                }),
+                left: Box::new(to_common(left, lk)?),
                 op: op.clone(),
-                right: Box::new(if matches!(rk, Some(TemporalKind::Date)) {
-                    crate::impls::datetime_helpers::promote_date_to_midnight(tr)
-                } else {
-                    tr
-                }),
+                right: Box::new(to_common(right, rk)?),
             });
         }
     }
@@ -4303,6 +4338,7 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                             crate::impls::shared_helpers::normalize_temporal_literal_expr(
                                 kind,
                                 expr.as_ref().clone(),
+                                Some(crate::impls::shared_helpers::ZoneSite { schema, options }),
                             )?;
                         return normalized.translate_with_warnings(schema, options, emit);
                     }
@@ -4390,6 +4426,9 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                                     kind,
                                     source,
                                     &translated,
+                                    expr,
+                                    &cast,
+                                    schema,
                                     options,
                                 )?
                             {
@@ -4419,7 +4458,7 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                                 zoned,
                                 Some(expr),
                                 Some(&cast),
-                                Some(options),
+                                Some(crate::impls::shared_helpers::ZoneSite { schema, options }),
                             )?;
                             if matches!(converted, Expr::Function(_)) {
                                 return Ok(converted);
@@ -4671,6 +4710,7 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                         return crate::impls::shared_helpers::normalize_temporal_literal_expr(
                             kind,
                             Expr::Value(typed_string.value.clone()),
+                            Some(crate::impls::shared_helpers::ZoneSite { schema, options }),
                         );
                     }
                     Ok(Expr::Cast {

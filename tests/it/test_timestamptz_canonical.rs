@@ -104,7 +104,6 @@ fn a_timestamptz_literal_is_written_in_utc_with_microseconds() {
         ("2026-09-23 15:42:07+02", "2026-09-23 13:42:07.000000+00:00"),
         ("2026-09-23 19:12:07.5+05:30", "2026-09-23 13:42:07.500000+00:00"),
         ("2026-09-23T13:42:07Z", "2026-09-23 13:42:07.000000+00:00"),
-        ("2026-09-23 13:42:07", "2026-09-23 13:42:07.000000+00:00"),
         // PostgreSQL rounds the seventh digit with rint over the parsed
         // double, so 0.0000025 lands on 2 and 0.9999995 carries into the
         // second. Measured on PostgreSQL 16.
@@ -125,6 +124,15 @@ fn a_timestamptz_literal_is_written_in_utc_with_microseconds() {
             "{literal}"
         );
     }
+    // Text without an offset reads in the request's zone.
+    assert_eq!(
+        run_translated_utc(
+            "CREATE TABLE t (at timestamptz);
+             INSERT INTO t (at) VALUES ('2026-09-23 13:42:07');
+             SELECT at FROM t;"
+        ),
+        vec![Some("2026-09-23 13:42:07.000000+00:00".to_string())]
+    );
 }
 
 #[test]

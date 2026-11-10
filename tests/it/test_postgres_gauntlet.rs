@@ -69,6 +69,8 @@ mod parity_timestamptz_zone;
 
 #[path = "gauntlet/parity_policy_literals.rs"]
 mod parity_policy_literals;
+#[path = "gauntlet/parity_timestamptz_instants.rs"]
+mod parity_timestamptz_instants;
 #[path = "gauntlet/parity_timestamptz_reads.rs"]
 mod parity_timestamptz_reads;
 

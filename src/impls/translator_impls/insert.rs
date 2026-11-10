@@ -844,7 +844,11 @@ fn apply_column_type_conversions(
             col_types.iter().find(|(name, _)| name.eq_ignore_ascii_case(col_name))
         {
             crate::impls::shared_helpers::convert_value_for_column_type(
-                data_type, expr, schema, options,
+                data_type,
+                expr,
+                schema,
+                options,
+                Some(crate::impls::shared_helpers::ZoneSite { schema, options }),
             )
         } else {
             Ok(expr)

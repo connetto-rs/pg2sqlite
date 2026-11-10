@@ -1267,13 +1267,15 @@ impl ColumnRewrites {
     }
 
     /// Finishes a translated value written into `column`, handling both
-    /// literals and parameters.
+    /// literals and parameters, a temporal literal read in the zone `site`
+    /// settles.
     pub(crate) fn finish_value(
         &self,
         column: &str,
         value: Expr,
         schema: &ParserDB,
         options: &Pg2SqliteOptions,
+        site: Option<ZoneSite<'_, '_>>,
     ) -> Result<Expr, Error> {
         let is_param = is_bound_parameter(&value);
         if is_param && self.array_cols.iter().any(|col| col.eq_ignore_ascii_case(column)) {
@@ -1324,7 +1326,7 @@ impl ColumnRewrites {
             if let Some((_, data_type)) =
                 self.literal_checked_cols.iter().find(|(name, _)| name.eq_ignore_ascii_case(column))
             {
-                value = convert_value_for_column_type(data_type, value, schema, options)?;
+                value = convert_value_for_column_type(data_type, value, schema, options, site)?;
             }
         }
         Ok(value)
@@ -1341,6 +1343,7 @@ impl ColumnRewrites {
         value: Expr,
         schema: &ParserDB,
         options: &Pg2SqliteOptions,
+        site: Option<ZoneSite<'_, '_>>,
     ) -> Result<Expr, Error> {
         if self.is_empty() {
             return Ok(value);
@@ -1348,7 +1351,7 @@ impl ColumnRewrites {
         match target {
             AssignmentTarget::ColumnName(name) => {
                 match last_ident(name) {
-                    Some(column) => self.finish_value(&column.value, value, schema, options),
+                    Some(column) => self.finish_value(&column.value, value, schema, options, site),
                     None => Ok(value),
                 }
             }
@@ -1362,7 +1365,9 @@ impl ColumnRewrites {
                     .zip(items)
                     .map(|(name, item)| {
                         match last_ident(name) {
-                            Some(column) => self.finish_value(&column.value, item, schema, options),
+                            Some(column) => {
+                                self.finish_value(&column.value, item, schema, options, site)
+                            }
                             None => Ok(item),
                         }
                     })
@@ -1535,12 +1540,14 @@ pub(crate) fn scale_parameter(expr: Expr, scale: u32) -> Expr {
     }
 }
 
-/// Applies the storage-representation conversion for a typed column position.
+/// Applies the storage-representation conversion for a typed column position,
+/// a temporal literal read in the zone `site` settles.
 pub(crate) fn convert_value_for_column_type(
     data_type: &DataType,
     expr: Expr,
     schema: &ParserDB,
     options: &Pg2SqliteOptions,
+    site: Option<ZoneSite<'_, '_>>,
 ) -> Result<Expr, Error> {
     let expr = typed_text_literal(data_type, &expr)?.unwrap_or(expr);
     if let Some(scale) = minor_unit_scale(data_type) {
@@ -1603,7 +1610,7 @@ pub(crate) fn convert_value_for_column_type(
         return convert_bit_literal(expr);
     }
     if let Some(kind) = crate::impls::temporal_literals::temporal_literal_kind(data_type) {
-        return convert_temporal_value(kind, expr, None, None, None, None, None);
+        return convert_temporal_value(kind, expr, None, None, None, None, site);
     }
     if let DataType::Interval { fields, precision } = data_type {
         return normalize_interval_literal_expr(expr, fields.as_ref(), *precision);
@@ -1805,20 +1812,61 @@ pub(crate) fn normalize_interval_literal_expr(
     Ok(Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(normalized), span: *span }))
 }
 
+/// Where a temporal value is translated, the schema and the request that
+/// settle the zone a conversion reads.
+#[derive(Clone, Copy)]
+pub(crate) struct ZoneSite<'s, 'o> {
+    pub(crate) schema: &'s ParserDB,
+    pub(crate) options: &'s crate::options::TranslationContext<'o>,
+}
+
 /// Rewrites a string literal in a temporal column position to the text
 /// PostgreSQL prints for it, or refuses what PostgreSQL refuses.
 ///
-/// Anything that is not a string literal passes through: a function call, a
-/// parameter or an already-translated expression carries no text to read.
+/// At a `site` of the forward direction a `timestamptz` written without an
+/// offset reads in the request's zone, and a `timetz` written without one
+/// takes the zone's offset now. Without one the text is the replica's own,
+/// which holds an instant in UTC. Anything that is not a string literal
+/// passes through: a function call, a parameter or an already-translated
+/// expression carries no text to read.
 pub(crate) fn normalize_temporal_literal_expr(
     kind: crate::impls::temporal_literals::TemporalLiteralKind,
     expr: Expr,
+    site: Option<ZoneSite<'_, '_>>,
 ) -> Result<Expr, Error> {
+    use crate::impls::{
+        expr_helpers::concat,
+        function_helpers::single_quoted_literal,
+        temporal_literals::{TemporalLiteralKind, normalize_temporal_literal},
+        zone_clock::{offset_now, zoned_wall_clock},
+    };
     let Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(text), span }) = &expr else {
         return Ok(expr);
     };
-    let normalized = crate::impls::temporal_literals::normalize_temporal_literal(kind, text)?;
-    Ok(Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(normalized), span: *span }))
+    let operation = format!("'{text}'");
+    let offset_of = |local: &str| {
+        let Some(site) = site else { return Ok(0) };
+        site.options
+            .request_zone(site.schema)
+            .map_err(|unavailable| unavailable.refusal(&operation, "read a wall clock in"))?
+            .offset_at(local)
+    };
+    let normalized = normalize_temporal_literal(kind, text, &offset_of)?;
+    let literal = |text: String| {
+        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(text), span: *span })
+    };
+    let Some(site) = site.filter(|_| {
+        matches!(kind, TemporalLiteralKind::Time { zoned: true, .. })
+            && !normalized.contains(['+', '-'])
+    }) else {
+        return Ok(literal(normalized));
+    };
+    let zoned = zoned_wall_clock(&operation, "read the UTC offset of", site.schema, site.options)?;
+    let offset = offset_now(zoned);
+    Ok(match single_quoted_literal(&offset) {
+        Some(offset) => literal(format!("{normalized}{offset}")),
+        None => concat(literal(normalized), offset),
+    })
 }
 
 /// `text`, already in the form a column of `kind` holds, rounded to the
@@ -1857,7 +1905,8 @@ pub(crate) fn round_column_text(
 /// form. Anything else already holds the column's text. A read that `zone`
 /// settles on a zone other than UTC answers from that zone's wall clock.
 /// `written` and `operation` name the operand and the read as written, so a
-/// refusal for an operand the read names twice can show both.
+/// refusal for an operand the read names twice can show both, and `site`
+/// settles the zone a literal reads in, none reading the replica's own text.
 pub(crate) fn convert_temporal_value(
     kind: crate::impls::temporal_literals::TemporalLiteralKind,
     mut expr: Expr,
@@ -1865,12 +1914,12 @@ pub(crate) fn convert_temporal_value(
     zone: Option<crate::impls::zone_clock::ZonedWallClock<'_>>,
     written: Option<&Expr>,
     operation: Option<&str>,
-    options: Option<&crate::options::TranslationContext<'_>>,
+    site: Option<ZoneSite<'_, '_>>,
 ) -> Result<Expr, Error> {
     use crate::impls::{
         datetime_helpers::{
             build_strftime_call, canonical_timestamptz_call, canonical_timestamptz_value,
-            is_canonical_timestamptz_call, local_time_of, local_timestamp_text, local_timetz_of,
+            local_time_of, local_timestamp_text, local_timetz_of,
             take_canonical_timestamptz_operand,
         },
         function_helpers::simple_function_expr,
@@ -1879,21 +1928,36 @@ pub(crate) fn convert_temporal_value(
         timezone::TimestampAwareness,
         zone_clock::ZonedWallClock,
     };
+    let options = site.map(|site| site.options);
     // An instant's literal text is read on the zone's wall clock like any
     // other.
     if crate::impls::function_helpers::single_quoted_literal(&expr).is_some()
         && source != Some(TimestampAwareness::Aware)
     {
-        return normalize_temporal_literal_expr(kind, expr);
+        return normalize_temporal_literal_expr(kind, expr, site);
     }
     if matches!(kind, TemporalLiteralKind::Timestamp { zoned: true, .. }) {
-        let value = canonical_timestamptz_value(expr);
-        let value = if source == Some(TimestampAwareness::Naive)
-            && !is_canonical_timestamptz_call(&value)
-        {
-            canonical_timestamptz_call(value)
-        } else {
-            value
+        // A wall clock SQLite's date functions computed names its instant
+        // only in the zone, so it is not canonicalised as UTC first.
+        if source != Some(TimestampAwareness::Naive) {
+            return Ok(round_column_text(kind, canonical_timestamptz_value(expr)));
+        }
+        let value = match zone {
+            Some(zoned @ ZonedWallClock::Zone(_)) => {
+                if zoned.instant_reads_twice()
+                    && let (Some(written), Some(options)) = (written, options)
+                    && !is_replayable(written, options)
+                {
+                    return Err(reject_duplicated_operand(
+                        operation.unwrap_or("a temporal write"),
+                        written,
+                    ));
+                }
+                // The date functions bring any SQLite time value to the wall
+                // clock text the zone's conversion reads.
+                zoned.instant(build_strftime_call("%Y-%m-%d %H:%M:%f", expr))
+            }
+            Some(ZonedWallClock::Utc) | None => canonical_timestamptz_call(expr),
         };
         return Ok(round_column_text(kind, value));
     }
@@ -2406,7 +2470,13 @@ fn translate_column_assignment<D: TranslationDirection>(
     let value = D::translate_expr(cast.as_ref().unwrap_or(source), schema, options, emit)?;
     Ok(Assignment {
         target: target.clone(),
-        value: rewrites.finish_assignment(target, value, schema, D::config(options))?,
+        value: rewrites.finish_assignment(
+            target,
+            value,
+            schema,
+            D::config(options),
+            D::forward_context(options).map(|options| ZoneSite { schema, options }),
+        )?,
     })
 }
 

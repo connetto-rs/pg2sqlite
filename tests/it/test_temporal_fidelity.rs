@@ -1091,10 +1091,12 @@ fn timetz_to_time_cast_over_a_subquery_is_refused() {
 fn timestamp_to_timestamptz_cast_over_a_subquery_is_refused() {
     let ddl = "CREATE TABLE k (ts TIMESTAMP);";
     let error = Pg2Sqlite::default()
-        .sql(&format!("{ddl}\nSELECT ((SELECT ts FROM k LIMIT 1)::timestamp)::timestamptz;"))
+        .sql(&crate::helpers::deployment::utc_script(&format!(
+            "{ddl}\nSELECT ((SELECT ts FROM k LIMIT 1)::timestamp)::timestamptz;"
+        )))
         .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
+        .translate_to_sql(&crate::helpers::deployment::utc_request())
         .expect_err("expected a translation refusal")
         .to_string();
-    assert!(error.contains("a TIMESTAMP to TIMESTAMPTZ cast has no SQLite form"), "{error}");
+    assert!(error.contains("has no SQLite form that reads"), "{error}");
 }

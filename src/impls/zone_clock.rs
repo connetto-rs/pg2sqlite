@@ -262,8 +262,9 @@ fn may_hold_an_instant(expr: &Expr) -> bool {
     }
 }
 
-/// The wall clock a value of `source` awareness converted to `kind` reads,
-/// which only an instant turned into a zoneless kind needs.
+/// The request's zone a value of `source` awareness converted to `kind`
+/// reads, which an instant turned into a zoneless kind and a zoneless value
+/// turned into an instant need.
 ///
 /// # Errors
 ///
@@ -276,12 +277,20 @@ pub(crate) fn conversion_wall_clock<'o>(
     options: &'o TranslationContext<'_>,
 ) -> Result<Option<ZonedWallClock<'o>>, Error> {
     use crate::impls::{temporal_literals::TemporalLiteralKind, timezone::TimestampAwareness};
-    if source != Some(TimestampAwareness::Aware)
-        || matches!(kind, TemporalLiteralKind::Timestamp { zoned: true, .. })
-    {
-        return Ok(None);
-    }
-    zoned_wall_clock(operation, "read the wall clock of", schema, options).map(Some)
+    let into_instant = matches!(kind, TemporalLiteralKind::Timestamp { zoned: true, .. });
+    let need = match source {
+        Some(TimestampAwareness::Aware) if !into_instant => "read the wall clock of",
+        Some(TimestampAwareness::Naive) if into_instant => "read a wall clock in",
+        _ => return Ok(None),
+    };
+    zoned_wall_clock(operation, need, schema, options).map(Some)
+}
+
+/// The `±HH:MM` offset the zone has now, which a time of day written without
+/// one takes.
+pub(crate) fn offset_now(zoned: ZonedWallClock<'_>) -> Expr {
+    let now = simple_function_expr("datetime", vec![string_literal("now")], None);
+    zoned.offset(zoned.local(now.clone()), now, OffsetForm::Stored)
 }
 
 /// How a UTC offset prints.

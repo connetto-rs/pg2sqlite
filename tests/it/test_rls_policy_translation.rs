@@ -60,10 +60,12 @@ fn an_ilike_policy_translates_and_filters() {
 fn a_now_policy_translates_and_filters() {
     let conn = helpers::apply_rusqlite_statements(
         &helpers::translate_pg(
-            "CREATE TABLE runs (id INT PRIMARY KEY, ts TIMESTAMP);
+            &helpers::deployment::utc_script(
+                "CREATE TABLE runs (id INT PRIMARY KEY, ts TIMESTAMP);
          ALTER TABLE runs ENABLE ROW LEVEL SECURITY;
          CREATE POLICY p ON runs FOR SELECT USING (ts < now());",
-            &options(),
+            ),
+            &helpers::deployment::utc_request().with_rls_audit_table_name("rls_audit".to_string()),
         )
         .expect("translate"),
     );
