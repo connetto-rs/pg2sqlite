@@ -435,6 +435,7 @@ fn combine_policy_predicates(
         .map(|term| (false, term.expression()))
         .chain(gate.restrictive().iter().map(|term| (true, term.expression())));
     for (is_restrictive, expr) in terms {
+        let expr = expr.expression();
         let mut transformed =
             transform_expr(expr, options, table, schema, prefix, table_rename, facts);
         // Folded before translation so a substituted default lands as the same
@@ -677,9 +678,9 @@ fn build_write_guard(
                 .into_iter()
                 .flat_map(|gate| gate.permissive().iter().chain(gate.restrictive()));
             if !is_replayable(guard_default, options)
-                && read
-                    .into_iter()
-                    .any(|term| expr_contains_identifier(term.expression(), &column.name))
+                && read.into_iter().any(|term| {
+                    expr_contains_identifier(term.expression().expression(), &column.name)
+                })
             {
                 return Err(reject_duplicated_operand(
                     &format!(
@@ -695,7 +696,8 @@ fn build_write_guard(
     // forwarding WHERE or backing check, two independent draws.
     for gate in [using_gate, check_gate, read_back_gate].into_iter().flatten() {
         for term in gate.permissive().iter().chain(gate.restrictive()) {
-            if is_replayable(&scrub_policy_stable_exprs(term.expression(), options), options) {
+            let expr = term.expression().expression();
+            if is_replayable(&scrub_policy_stable_exprs(expr, options), options) {
                 continue;
             }
             let clause = match (term.clause(), gate.row()) {
@@ -710,7 +712,7 @@ fn build_write_guard(
                     term.policy().name(),
                     table_name
                 ),
-                term.expression(),
+                expr,
             ));
         }
     }
@@ -1163,8 +1165,7 @@ pub fn validate_session_variables(
     Ok(())
 }
 
-/// Validates that every policy of a table can be read as PostgreSQL stored it
-/// and has the session variable mappings it requires.
+/// Validates stored policy literals and session mappings before translation.
 ///
 /// # Errors
 ///
