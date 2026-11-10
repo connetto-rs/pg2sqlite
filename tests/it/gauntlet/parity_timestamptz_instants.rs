@@ -8,7 +8,9 @@ use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
 use super::{
     harness::execute_ddl,
-    timestamptz_harness::{Events, GRANT, ROLES, TABLE, expected, instant, refusal, zoned, zones},
+    timestamptz_harness::{
+        Events, GRANT, ROLES, TABLE, expected, instant, options, refusal, zoned, zones,
+    },
 };
 use crate::helpers::{postgres as postgres_harness, zone_functions};
 
@@ -285,6 +287,17 @@ fn a_conversion_without_a_zone_names_what_is_missing() {
     // registered function.
     let same = "(timestamptz '2026-10-25 02:30' = timestamptz '2026-10-25 01:30+00')";
     assert_eq!(EVENTS.sqlite(ROLES, same, &zoned("Europe/Rome")), "true");
+}
+
+/// Offset-less text whose instant falls past the years the zone database
+/// covers names the clock and the zone.
+#[test]
+fn text_read_past_the_zone_databases_years_names_the_clock() {
+    let error = refusal("timestamptz '9999-12-31 23:30'", &options("America/New_York"));
+    assert!(
+        error.contains("`9999-12-31 23:30:00` cannot be read in the zone 'America/New_York'"),
+        "{error}"
+    );
 }
 
 /// A conversion reading its operand twice refuses one that cannot be

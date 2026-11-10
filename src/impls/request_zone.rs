@@ -38,7 +38,7 @@ impl RequestZone {
         };
         let refusal = |reason: &dyn core::fmt::Display| {
             Error::forward_refusal(format!(
-                "the wall clock `{local}` has no instant in the zone '{name}': {reason}."
+                "the wall clock `{local}` cannot be read in the zone '{name}': {reason}."
             ))
         };
         let zone = PgTimeZone::parse(name).map_err(|error| refusal(&error))?;

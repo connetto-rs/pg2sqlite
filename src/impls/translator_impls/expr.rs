@@ -1413,9 +1413,8 @@ fn translate_at_time_zone(
         });
     }
 
-    let Some(aware_shift) = flipped_shifting_offset(&modifier) else {
-        unreachable!("every modifier left is a fixed offset that shifts")
-    };
+    let aware_shift = flipped_shifting_offset(&modifier)
+        .expect("every modifier left is a fixed offset that shifts");
     let naive_shift = modifier;
 
     let awareness = timestamp_awareness(timestamp, schema, options)?.ok_or_else(|| {
