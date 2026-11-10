@@ -115,8 +115,11 @@ fn test_now_translation() {
         SELECT * FROM events WHERE created_at > NOW();
     ";
 
-    let (translated, select_stmt) =
-        helpers::translate::translate_default_statements_and_first_query(sql);
+    // The zoneless column compares with `NOW()` in the request's zone.
+    let (translated, select_stmt) = helpers::translate::translate_statements_and_first_query(
+        &helpers::deployment::utc_script(sql),
+        &helpers::deployment::utc_request(),
+    );
 
     // Should contain strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'), not NOW()
     assert!(

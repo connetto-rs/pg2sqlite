@@ -19,8 +19,8 @@ use crate::helpers::{postgres as postgres_harness, zone_functions};
 /// them from the schema.
 pub(super) const ROLES: &str = "CREATE ROLE postgres; CREATE ROLE app;";
 
-/// What the acting role reads, which the replica keeps for it.
-pub(super) const GRANT: &str = "GRANT SELECT ON events TO app;";
+/// What the acting role reads and writes, which the replica keeps for it.
+pub(super) const GRANT: &str = "GRANT SELECT, UPDATE ON events TO app;";
 
 pub(super) const TABLE: &str = "CREATE TABLE events (id INTEGER PRIMARY KEY, \
                                  at TIMESTAMPTZ NOT NULL, ts TIMESTAMP NOT NULL, \
@@ -51,13 +51,21 @@ impl Events {
 
     /// What PostgreSQL answers for the one-value `query` under `zone`.
     pub(super) fn postgres_query(&self, zone: &str, query: &str) -> String {
+        self.postgres_query_after(zone, "", query)
+    }
+
+    /// What PostgreSQL answers for the one-value `query` under `zone` once
+    /// `statements` ran over the row.
+    fn postgres_query_after(&self, zone: &str, statements: &str, query: &str) -> String {
         let at = self.at;
         let mut connection: PgConnection = postgres_harness::fresh_database_in_zone(zone);
         postgres_harness::apply(
             &mut connection,
-            &format!("{TABLE} INSERT INTO events VALUES (1, '{at}', '{TS}', '{SPAN}');"),
+            &format!(
+                "{TABLE} INSERT INTO events VALUES (1, '{at}', '{TS}', '{SPAN}');{statements}"
+            ),
         )
-        .expect("apply the schema and its row");
+        .expect("apply the schema, its row and the statements");
         // The query under test is runtime text no typed DSL carries.
         diesel::sql_query(query)
             .get_result::<TextRow>(&mut connection)
@@ -182,6 +190,39 @@ impl Events {
             timetz_parts(&replica),
             timetz_parts(&source),
             "{expression} under {zone}: the replica answered {replica}, PostgreSQL {source}"
+        );
+    }
+
+    /// `UPDATE events SET at = {value}` stores what PostgreSQL stores under
+    /// `zone`, `expected`, and the same instant on the replica under
+    /// `options`.
+    pub(super) fn assert_assignment(
+        &self,
+        zone: &str,
+        value: &str,
+        options: &Pg2SqliteOptions,
+        expected: &str,
+    ) {
+        let update = format!("UPDATE events SET at = {value};");
+        let source = self.postgres_query_after(zone, &update, &select("at"));
+        assert_eq!(source, expected, "PostgreSQL under {zone}: {update}");
+        let mut statements = Pg2Sqlite::default()
+            .sql(&format!("{ROLES}{TABLE}{GRANT}{update}{};", select("at")))
+            .and_then(|source| source.translate(options))
+            .unwrap_or_else(|error| panic!("pg2sqlite refused {update}: {error}"))
+            .into_vec();
+        let query = statements.pop().expect("the translated SELECT").to_string();
+        let update = statements.pop().expect("the translated UPDATE").to_string();
+        let mut connection = self.replica(ROLES, options);
+        // The statement under test is runtime text no typed DSL carries.
+        diesel::sql_query(&update)
+            .execute(&mut connection)
+            .unwrap_or_else(|error| panic!("SQLite refused {update}: {error}"));
+        let replica = sqlite_query(&mut connection, &query);
+        assert_eq!(
+            instant(&replica),
+            instant(&source),
+            "{value} under {zone}: the replica stored {replica}, PostgreSQL {source}"
         );
     }
 

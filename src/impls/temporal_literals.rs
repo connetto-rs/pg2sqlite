@@ -84,10 +84,19 @@ pub(crate) fn temporal_literal_kind(data_type: &DataType) -> Option<TemporalLite
 ///
 /// A timestamp with no time part takes midnight. A `timestamp with time zone`
 /// becomes the replica's one text per instant, UTC with microseconds and a
-/// `+00:00` offset, so that equal instants compare as equal text.
+/// `+00:00` offset, so that equal instants compare as equal text, one written
+/// without an offset read on the wall clock of the zone `offset_of` answers
+/// the UTC offset in seconds of a `YYYY-MM-DD HH:MM:SS[.f]` wall clock for. A
+/// `time with time zone` written without an offset keeps none, for the caller
+/// to give the zone's.
+///
+/// # Errors
+///
+/// Refuses text PostgreSQL refuses, and passes on `offset_of`'s refusal.
 pub(crate) fn normalize_temporal_literal(
     kind: TemporalLiteralKind,
     text: &str,
+    offset_of: &dyn Fn(&str) -> Result<i64, Error>,
 ) -> Result<String, Error> {
     let trimmed = text.trim();
     reject_non_iso_input(kind, trimmed)?;
@@ -113,9 +122,15 @@ pub(crate) fn normalize_temporal_literal(
             };
             let micros_of_day = clock.micros_of_day();
             if zoned {
-                // No offset reads as UTC, the zone the replica's own clock
-                // answers in.
-                let offset = zone.map_or(0, |zone| zone.seconds());
+                let offset = match zone {
+                    Some(zone) => zone.seconds(),
+                    None => {
+                        offset_of(&format!(
+                            "{year:04}-{month:02}-{day:02} {}",
+                            time_of_day_text(micros_of_day)
+                        ))?
+                    }
+                };
                 let micros = days_from_civil(i64::from(year), month, day) * MICROS_PER_DAY
                     + micros_of_day
                     - offset * MICROS_PER_SECOND;

@@ -163,9 +163,14 @@ fn plpgsql_insert_on_conflict_transformed() {
 fn plpgsql_if_condition_translates_now() {
     // IF condition contains now() — it should be translated to datetime('now')
     // rather than silently falling back to raw PG text
-    let options = uuid_options();
+    let options = uuid_options().with_deployment(
+        helpers::deployment::deployment([], [])
+            .with_default_time_zone("UTC")
+            .expect("PostgreSQL accepts UTC"),
+    );
     let sql = translate_sql(
-        r#"
+        &helpers::deployment::utc_script(
+            r#"
         CREATE TABLE t (id BLOB PRIMARY KEY, ts TEXT);
         CREATE OR REPLACE FUNCTION if_fn() RETURNS TRIGGER AS $$
         BEGIN
@@ -177,6 +182,7 @@ fn plpgsql_if_condition_translates_now() {
         $$ LANGUAGE plpgsql;
         CREATE TRIGGER if_trigger BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION if_fn();
         "#,
+        ),
         &options,
     )
     .unwrap();

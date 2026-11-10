@@ -101,7 +101,8 @@ fn generate_maintenance_trigger_body(
             let cast = rewrites.temporal_column_cast(col.as_str(), &raw, schema, options)?;
             let value =
                 cast.as_ref().unwrap_or(&raw).translate_with_warnings(schema, options, emit)?;
-            let value = rewrites.finish_value(col.as_str(), value, schema, options)?;
+            let site = crate::impls::shared_helpers::ZoneSite { schema, options };
+            let value = rewrites.finish_value(col.as_str(), value, schema, options, Some(site))?;
             Ok(Assignment {
                 target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
                     Ident::new(col),
