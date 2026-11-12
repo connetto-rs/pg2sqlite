@@ -5,7 +5,7 @@ use alloc::borrow::Cow;
 use sql_traits::{
     prelude::DatabaseLike,
     structs::{IdentifierCase, ParserDB},
-    utils::{common_type_name, normalize_sqlparser_type},
+    utils::normalize_sqlparser_type,
 };
 use sqlparser::{
     ast::{
@@ -178,7 +178,7 @@ fn common_type<'v>(
         .map(|value| type_name(value, schema, options))
         .collect::<Result<Vec<_>, Error>>()?;
     let types: Vec<Option<&str>> = types.iter().map(Option::as_deref).collect();
-    Ok(common_type_name(&types).map(Cow::into_owned))
+    Ok(schema.common_type_name(&types).map(Cow::into_owned))
 }
 
 /// The [`DataType`] a type name answered by [`type_name`] spells.
@@ -259,7 +259,7 @@ fn call_type_name(
         name.value.to_ascii_lowercase().as_str() == "greatest"
             || name.value.to_ascii_lowercase().as_str() == "least"
     }) {
-        return Ok(common_type_name(&argument_types).map(Cow::into_owned));
+        return Ok(schema.common_type_name(&argument_types).map(Cow::into_owned));
     }
     if !options.is_sqlitegis_enabled() {
         return Ok(None);
@@ -275,10 +275,11 @@ mod interval_typing {
     use crate::impls::test_fixtures::{parse_expr, with_scoped_options};
 
     /// Whether `expr_sql`, typed in the scope of `SELECT iv FROM t`, is an
-    /// interval.
+    /// interval. `sp` is a column of a domain over `interval`.
     fn interval_typed(expr_sql: &str) -> bool {
         with_scoped_options(
-            "CREATE TABLE t (id int, iv interval, iv2 interval);",
+            "CREATE DOMAIN span AS interval;
+             CREATE TABLE t (id int, iv interval, iv2 interval, sp span);",
             "SELECT iv FROM t",
             |schema, scoped| {
                 let expr = parse_expr(expr_sql);
@@ -303,6 +304,8 @@ mod interval_typing {
             "t.iv",
             "interval '1 day'",
             "interval hour to minute '2:30'",
+            "CASE WHEN id = 1 THEN sp ELSE iv END",
+            "greatest(sp, iv)",
         ] {
             assert!(interval_typed(expr), "{expr} should be interval-typed");
         }
@@ -319,6 +322,82 @@ mod interval_typing {
             "CASE WHEN id = 1 THEN id ELSE 2 END",
         ] {
             assert!(!interval_typed(expr), "{expr} should not be interval-typed");
+        }
+    }
+}
+
+#[cfg(test)]
+mod common_typing {
+    use alloc::borrow::Cow;
+
+    use sql_traits::structs::ParserDB;
+    use sqlparser::dialect::PostgreSqlDialect;
+
+    #[cfg(not(feature = "std"))]
+    use crate::no_std::prelude::*;
+    use crate::{
+        impls::test_fixtures::{empty_schema, parse_expr, with_scoped_options},
+        options::TranslationContext,
+        prelude::Pg2SqliteOptions,
+    };
+
+    /// Expressions whose values of `INT` and `BIGINT` must share one type.
+    const MIXED_INTEGER_WIDTHS: [&str; 3] = [
+        "CASE WHEN true THEN CAST(1 AS INT) ELSE CAST(2 AS BIGINT) END",
+        "greatest(CAST(1 AS INT), CAST(2 AS BIGINT))",
+        "ARRAY[CAST(1 AS INT), CAST(2 AS BIGINT)]",
+    ];
+
+    /// The type name of `expr_sql` against `schema`, outside any query scope.
+    fn unscoped_type_name(expr_sql: &str, schema: &ParserDB) -> Option<String> {
+        let options = TranslationContext::from_owned(Pg2SqliteOptions::default());
+        super::type_name(&parse_expr(expr_sql), schema, &options).unwrap().map(Cow::into_owned)
+    }
+
+    /// The type name of `expr_sql` in the scope of `SELECT id FROM t`, where
+    /// `sp` is a column of a domain over `interval`.
+    fn domain_scoped_type_name(expr_sql: &str) -> Option<String> {
+        with_scoped_options(
+            "CREATE DOMAIN span AS interval;
+             CREATE TABLE t (id int, iv interval, sp span);",
+            "SELECT id FROM t",
+            |schema, scoped| {
+                super::type_name(&parse_expr(expr_sql), schema, scoped)
+                    .unwrap()
+                    .map(Cow::into_owned)
+            },
+        )
+    }
+
+    #[test]
+    fn postgresql_casts_settle_mixed_integer_widths() {
+        let schema = ParserDB::parse::<PostgreSqlDialect>("").unwrap();
+        let types: Vec<Option<String>> =
+            MIXED_INTEGER_WIDTHS.iter().map(|expr| unscoped_type_name(expr, &schema)).collect();
+        assert_eq!(
+            types,
+            [Some("BIGINT".to_owned()), Some("BIGINT".to_owned()), Some("BIGINT[]".to_owned())]
+        );
+    }
+
+    #[test]
+    fn schema_answering_no_casts_settles_no_mixed_integer_width() {
+        let schema = empty_schema();
+        for expr in MIXED_INTEGER_WIDTHS {
+            assert_eq!(unscoped_type_name(expr, &schema), None, "{expr}");
+        }
+    }
+
+    #[test]
+    fn domain_meeting_another_type_takes_part_as_its_base_type() {
+        for (expr, expected) in [
+            ("CASE WHEN id = 1 THEN sp ELSE iv END", Some("interval")),
+            ("greatest(sp, iv)", Some("interval")),
+            ("CASE WHEN id = 1 THEN sp ELSE sp END", Some("span")),
+            ("CASE WHEN id = 1 THEN sp ELSE id END", None),
+            ("greatest(sp, id)", None),
+        ] {
+            assert_eq!(domain_scoped_type_name(expr).as_deref(), expected, "{expr}");
         }
     }
 }
