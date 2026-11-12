@@ -5,7 +5,7 @@ use alloc::borrow::Cow;
 use sql_traits::{
     prelude::DatabaseLike,
     structs::{IdentifierCase, ParserDB},
-    utils::{common_type_name, normalize_sqlparser_type},
+    utils::normalize_sqlparser_type,
 };
 use sqlparser::{
     ast::{
@@ -178,7 +178,7 @@ fn common_type<'v>(
         .map(|value| type_name(value, schema, options))
         .collect::<Result<Vec<_>, Error>>()?;
     let types: Vec<Option<&str>> = types.iter().map(Option::as_deref).collect();
-    Ok(common_type_name(&types).map(Cow::into_owned))
+    Ok(schema.common_type_name(&types).map(Cow::into_owned))
 }
 
 /// The [`DataType`] a type name answered by [`type_name`] spells.
@@ -259,7 +259,7 @@ fn call_type_name(
         name.value.to_ascii_lowercase().as_str() == "greatest"
             || name.value.to_ascii_lowercase().as_str() == "least"
     }) {
-        return Ok(common_type_name(&argument_types).map(Cow::into_owned));
+        return Ok(schema.common_type_name(&argument_types).map(Cow::into_owned));
     }
     if !options.is_sqlitegis_enabled() {
         return Ok(None);
@@ -275,10 +275,11 @@ mod interval_typing {
     use crate::impls::test_fixtures::{parse_expr, with_scoped_options};
 
     /// Whether `expr_sql`, typed in the scope of `SELECT iv FROM t`, is an
-    /// interval.
+    /// interval. `sp` is a column of a domain over `interval`.
     fn interval_typed(expr_sql: &str) -> bool {
         with_scoped_options(
-            "CREATE TABLE t (id int, iv interval, iv2 interval);",
+            "CREATE DOMAIN span AS interval;
+             CREATE TABLE t (id int, iv interval, iv2 interval, sp span);",
             "SELECT iv FROM t",
             |schema, scoped| {
                 let expr = parse_expr(expr_sql);
@@ -303,6 +304,8 @@ mod interval_typing {
             "t.iv",
             "interval '1 day'",
             "interval hour to minute '2:30'",
+            "CASE WHEN id = 1 THEN sp ELSE iv END",
+            "greatest(sp, iv)",
         ] {
             assert!(interval_typed(expr), "{expr} should be interval-typed");
         }
@@ -317,6 +320,8 @@ mod interval_typing {
             "coalesce(id, 1)",
             "greatest(id, 1)",
             "CASE WHEN id = 1 THEN id ELSE 2 END",
+            "CASE WHEN id = 1 THEN sp ELSE id END",
+            "greatest(sp, id)",
         ] {
             assert!(!interval_typed(expr), "{expr} should not be interval-typed");
         }
