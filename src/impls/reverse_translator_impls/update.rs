@@ -4,7 +4,10 @@
 use sql_traits::structs::ParserDB;
 use sqlparser::ast::{AssignmentTarget, Expr, ObjectName, TableFactor, Update};
 
-use super::helpers::{Reverse, unscale_integer_literal};
+use super::{
+    helpers::{Reverse, unscale_integer_literal},
+    storage_shape::retype_assignment,
+};
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
 use crate::{
@@ -86,15 +89,17 @@ impl ReverseTranslator for Update {
         )?;
         let scoped = options.with_scope(&scope);
         let mut translated = translate_update::<Reverse>(self, schema, &scoped, &mut |_| {})?;
-        // Unscale integer literals assigned to NUMERIC columns.
+        // Minor units back to decimals, storage wrappers back to the declared
+        // type.
         if let TableFactor::Table { name, .. } = &self.table.relation
             && let Ok(Some(table)) = resolve_translation_table(schema, name)
         {
             let scales = numeric_minor_unit_scales_of_table(table, schema);
-            if !scales.is_empty() {
-                for assignment in &mut translated.assignments {
+            for assignment in &mut translated.assignments {
+                if !scales.is_empty() {
                     unscale_assignment(&assignment.target, &mut assignment.value, &scales);
                 }
+                retype_assignment(assignment, table, schema, &scoped)?;
             }
         }
         Ok(translated)

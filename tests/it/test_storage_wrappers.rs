@@ -143,6 +143,89 @@ fn a_hex_blob_beside_a_uuid_column_with_no_representation_is_refused() {
 }
 
 #[test]
+fn a_blob_literal_beside_a_uuid_column_reverses_to_the_uuid_text() {
+    // PostgreSQL reads `X'...'` as a bit string, and an untyped literal takes
+    // the column's type.
+    let postgres = reversed("SELECT id FROM stored WHERE X'550E8400E29B41D4A716446655440000' = u");
+    assert!(postgres.contains("'550e8400-e29b-41d4-a716-446655440000' = u"), "{postgres}");
+}
+
+#[test]
+fn blob_literals_in_a_uuid_list_and_range_reverse_to_the_uuid_text() {
+    let postgres = reversed(
+        "SELECT id FROM stored WHERE u IN (X'550E8400E29B41D4A716446655440000') \
+         AND u BETWEEN X'00000000000000000000000000000000' AND X'FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF'",
+    );
+    assert!(postgres.contains("u IN ('550e8400-e29b-41d4-a716-446655440000')"), "{postgres}");
+    assert!(
+        postgres.contains(
+            "u BETWEEN '00000000-0000-0000-0000-000000000000' \
+             AND 'ffffffff-ffff-ffff-ffff-ffffffffffff'"
+        ),
+        "{postgres}"
+    );
+}
+
+#[test]
+fn a_blob_literal_beside_a_bytea_column_is_unchanged() {
+    let postgres = reversed("SELECT id FROM stored WHERE raw = X'00FF'");
+    assert!(postgres.contains("raw = X'00FF'"), "{postgres}");
+}
+
+#[test]
+fn a_blob_literal_of_another_length_beside_a_uuid_column_is_refused() {
+    let message = reverse_refusal("SELECT id FROM stored WHERE u = X'00FF'", &options());
+    assert!(message.contains("16 bytes"), "{message}");
+}
+
+#[test]
+fn a_blob_literal_beside_a_uuid_column_held_as_text_is_refused() {
+    let text_options = Pg2SqliteOptions::default()
+        .with_uuid_representation(UuidRepresentation::Text)
+        .with_array_representation(ArrayRepresentation::Json);
+    let message = reverse_refusal(
+        "SELECT id FROM stored WHERE u = X'550E8400E29B41D4A716446655440000'",
+        &text_options,
+    );
+    assert!(message.contains("text"), "{message}");
+}
+
+#[test]
+fn values_inserted_into_typed_columns_reverse_to_the_declared_type() {
+    let postgres = reversed(
+        "INSERT INTO stored (id, u, xs) VALUES (1, X'550E8400E29B41D4A716446655440000', \
+         json_array(1, 2)), (2, unhex('660e8400e29b41d4a716446655440000'), json_array())",
+    );
+    assert!(
+        postgres.contains("(1, '550e8400-e29b-41d4-a716-446655440000', ARRAY[1, 2])"),
+        "{postgres}"
+    );
+    assert!(
+        postgres.contains("(2, '660e8400e29b41d4a716446655440000'::UUID, ARRAY[]::INT[])"),
+        "{postgres}"
+    );
+}
+
+#[test]
+fn values_assigned_to_typed_columns_reverse_to_the_declared_type() {
+    let postgres = reversed(
+        "UPDATE stored SET u = X'550E8400E29B41D4A716446655440000', \
+         (raw, xs) = (X'00FF', json_array(1)) WHERE id = 1",
+    );
+    assert!(postgres.contains("u = '550e8400-e29b-41d4-a716-446655440000'"), "{postgres}");
+    assert!(postgres.contains("(raw, xs) = (X'00FF', ARRAY[1])"), "{postgres}");
+}
+
+#[test]
+fn an_upsert_assignment_reverses_to_the_declared_type() {
+    let postgres = reversed(
+        "INSERT INTO stored (id, u) VALUES (1, X'550E8400E29B41D4A716446655440000') \
+         ON CONFLICT (id) DO UPDATE SET u = X'660E8400E29B41D4A716446655440000'",
+    );
+    assert!(postgres.contains("SET u = '660e8400-e29b-41d4-a716-446655440000'"), "{postgres}");
+}
+
+#[test]
 fn a_json_array_beside_an_array_column_reverses_to_an_array_constructor() {
     // `xs = json_build_array(1, 2)` earns `operator does not exist:
     // integer[] = json` on the server.

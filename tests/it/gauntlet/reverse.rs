@@ -17,7 +17,7 @@
 use std::collections::HashSet;
 
 use diesel::{
-    Connection, QueryableByName, RunQueryDsl, SqliteConnection, sql_query,
+    Connection, PgConnection, QueryableByName, RunQueryDsl, SqliteConnection, sql_query,
     sql_types::{Integer, Nullable, Text},
 };
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
@@ -919,26 +919,22 @@ const STORAGE_WRAPPER_PARITY: &[&str] = &[
     "SELECT CAST(json_array_length(doc) AS TEXT) AS answer FROM stored ORDER BY id",
     "SELECT CAST(count(*) AS TEXT) AS answer FROM stored \
      WHERE u = unhex('550e8400e29b41d4a716446655440000')",
+    "SELECT CAST(count(*) AS TEXT) AS answer FROM stored \
+     WHERE u = X'550E8400E29B41D4A716446655440000'",
+    "SELECT CAST(count(*) AS TEXT) AS answer FROM stored \
+     WHERE u IN (X'660E8400E29B41D4A716446655440000', X'00000000000000000000000000000000')",
     "SELECT CAST(count(*) AS TEXT) AS answer FROM stored WHERE raw = unhex('00ff')",
     "SELECT CAST(count(*) AS TEXT) AS answer FROM stored WHERE xs = json_array(1, 2)",
 ];
 
-/// The reverse direction has to answer what the replica answered, not merely
-/// produce something the server accepts.
-///
-/// The replica is built by this crate's own forward translation of the same
-/// schema and rows, so the two sides are the pair a caller really has: a
-/// PostgreSQL table and the SQLite one it was translated into.
-#[test]
-fn reversed_storage_wrappers_answer_what_the_replica_answered() {
-    let options = Pg2SqliteOptions::default()
-        .with_uuid_representation(pg2sqlite::prelude::UuidRepresentation::Blob)
-        .with_array_representation(pg2sqlite::prelude::ArrayRepresentation::Json);
-
+/// The pair a caller really has: the PostgreSQL `stored` table, the SQLite
+/// replica this crate's forward translation builds from it, and the schema
+/// the reverse direction reads.
+fn stored_pair(options: &Pg2SqliteOptions) -> (SqliteConnection, PgConnection, ParserDB) {
     let replica = Pg2Sqlite::default()
         .sql(&format!("{STORED_DDL}{STORED_ROWS}"))
         .expect("the fixture parses")
-        .translate_to_sql(&options)
+        .translate_to_sql(options)
         .expect("the fixture translates")
         .into_vec();
     let mut sqlite = SqliteConnection::establish(":memory:").expect("SQLite opens");
@@ -954,42 +950,118 @@ fn reversed_storage_wrappers_answer_what_the_replica_answered() {
         .expect("the schema parses")
         .build_schema()
         .expect("the schema builds");
+    (sqlite, postgres, schema)
+}
+
+/// Options naming both storage representations `stored` needs.
+fn stored_options() -> Pg2SqliteOptions {
+    Pg2SqliteOptions::default()
+        .with_uuid_representation(pg2sqlite::prelude::UuidRepresentation::Blob)
+        .with_array_representation(pg2sqlite::prelude::ArrayRepresentation::Json)
+}
+
+/// Reads `sqlite_sql` from the replica and its reversal from the server, and
+/// describes the divergence when the two answers differ.
+fn read_divergence(
+    sqlite_sql: &str,
+    sqlite: &mut SqliteConnection,
+    postgres: &mut PgConnection,
+    schema: &ParserDB,
+    options: &Pg2SqliteOptions,
+) -> Option<String> {
+    let replica_answer: Vec<Option<String>> = sql_query(sqlite_sql)
+        .load::<ScalarText>(sqlite)
+        .expect("the replica answers")
+        .into_iter()
+        .map(|row| row.answer)
+        .collect();
+
+    let reversed = match Pg2Sqlite::default().reverse_sql(sqlite_sql, schema, options) {
+        Ok(statements) => statements.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "),
+        Err(error) => return Some(format!("{sqlite_sql:?} was refused: {error}")),
+    };
+    match sql_query(&reversed).load::<ScalarText>(postgres) {
+        Ok(rows) => {
+            let server_answer: Vec<Option<String>> =
+                rows.into_iter().map(|row| row.answer).collect();
+            (server_answer != replica_answer).then(|| {
+                format!(
+                    "{sqlite_sql:?}\n  reversed: {reversed}\n  replica: {replica_answer:?}\n  server:  {server_answer:?}"
+                )
+            })
+        }
+        Err(error) => {
+            Some(format!("{sqlite_sql:?}\n  reversed: {reversed}\n  server refused: {error}"))
+        }
+    }
+}
+
+/// The reverse direction has to answer what the replica answered, not merely
+/// produce something the server accepts.
+#[test]
+fn reversed_storage_wrappers_answer_what_the_replica_answered() {
+    let options = stored_options();
+    let (mut sqlite, mut postgres, schema) = stored_pair(&options);
+
+    let failures: Vec<String> = STORAGE_WRAPPER_PARITY
+        .iter()
+        .filter_map(|sqlite_sql| {
+            read_divergence(sqlite_sql, &mut sqlite, &mut postgres, &schema, &options)
+        })
+        .collect();
+
+    assert!(
+        failures.is_empty(),
+        "{} case(s) diverged:\n\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
+}
+
+/// SQLite writes placing a blob or a JSON array in a column whose PostgreSQL
+/// type is not its storage type.
+const STORAGE_WRAPPER_WRITES: &[&str] = &[
+    "INSERT INTO stored (id, u, xs) \
+     VALUES (10, X'770E8400E29B41D4A716446655440000', json_array(3, 4))",
+    "INSERT INTO stored (id, u) VALUES (11, unhex('880e8400e29b41d4a716446655440000'))",
+    "UPDATE stored SET u = X'990E8400E29B41D4A716446655440000', xs = json_array(5) WHERE id = 3",
+    "UPDATE stored SET (u, xs) = (X'AA0E8400E29B41D4A716446655440000', json_array()) WHERE id = 2",
+    "INSERT INTO stored (id, u) VALUES (1, X'BB0E8400E29B41D4A716446655440000') \
+     ON CONFLICT (id) DO UPDATE SET u = X'BB0E8400E29B41D4A716446655440000'",
+];
+
+/// Reads of every row of `stored` after the writes, through the wrappers the
+/// read parity above already pins.
+const STORED_READS: &[&str] = &[
+    "SELECT CAST(hex(u) AS TEXT) AS answer FROM stored ORDER BY id",
+    "SELECT CAST(json_array_length(xs) AS TEXT) AS answer FROM stored ORDER BY id",
+];
+
+/// A reversed write lands the value the replica's write stored.
+#[test]
+fn reversed_storage_wrapper_writes_store_what_the_replica_stored() {
+    let options = stored_options();
+    let (mut sqlite, mut postgres, schema) = stored_pair(&options);
 
     let mut failures = Vec::new();
-    for &sqlite_sql in STORAGE_WRAPPER_PARITY {
-        let replica_answer: Vec<Option<String>> = sql_query(sqlite_sql)
-            .load::<ScalarText>(&mut sqlite)
-            .expect("the replica answers")
-            .into_iter()
-            .map(|row| row.answer)
-            .collect();
-
-        let reversed = match Pg2Sqlite::default().reverse_sql(sqlite_sql, &schema, &options) {
+    for &sqlite_sql in STORAGE_WRAPPER_WRITES {
+        sql_query(sqlite_sql).execute(&mut sqlite).expect("the replica takes the write");
+        match Pg2Sqlite::default().reverse_sql(sqlite_sql, &schema, &options) {
             Ok(statements) => {
-                statements.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")
-            }
-            Err(error) => {
-                failures.push(format!("{sqlite_sql:?} was refused: {error}"));
-                continue;
-            }
-        };
-        match sql_query(&reversed).load::<ScalarText>(&mut postgres) {
-            Ok(rows) => {
-                let server_answer: Vec<Option<String>> =
-                    rows.into_iter().map(|row| row.answer).collect();
-                if server_answer != replica_answer {
+                let reversed =
+                    statements.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ");
+                if let Err(error) = apply(&mut postgres, &reversed) {
                     failures.push(format!(
-                        "{sqlite_sql:?}\n  reversed: {reversed}\n  replica: {replica_answer:?}\n  server:  {server_answer:?}"
+                        "{sqlite_sql:?}\n  reversed: {reversed}\n  server refused: {error}"
                     ));
                 }
             }
-            Err(error) => {
-                failures.push(format!(
-                    "{sqlite_sql:?}\n  reversed: {reversed}\n  server refused: {error}"
-                ));
-            }
+            Err(error) => failures.push(format!("{sqlite_sql:?} was refused: {error}")),
         }
     }
+    failures.extend(STORED_READS.iter().filter_map(|sqlite_sql| {
+        read_divergence(sqlite_sql, &mut sqlite, &mut postgres, &schema, &options)
+    }));
 
     assert!(
         failures.is_empty(),

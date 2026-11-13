@@ -12,7 +12,10 @@ use sqlparser::ast::{
     TableObject,
 };
 
-use super::helpers::{Reverse, unscale_integer_literal};
+use super::{
+    helpers::{Reverse, unscale_integer_literal},
+    storage_shape::{retype_assignment, retype_for_column},
+};
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
 use crate::{
@@ -269,6 +272,23 @@ fn unscale_numeric_literals(
     })
 }
 
+/// Retypes the values of `insert`'s rows for the columns they fill.
+fn retype_insert_values(
+    insert: &mut Insert,
+    table: &ParserTable,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<(), Error> {
+    let column_names = insert_column_names(insert, table, schema)?;
+    let Some(source) = insert.source.as_deref_mut() else { return Ok(()) };
+    for_each_insert_position(source.body.as_mut(), &column_names, &mut |idx, expr| {
+        match column_names.get(idx) {
+            Some(column) => retype_for_column(expr, column, table, schema, options),
+            None => Ok(expr),
+        }
+    })
+}
+
 /// Refuses `INSERT ... DEFAULT VALUES` when a `NOT NULL` column has no
 /// declared default.
 ///
@@ -515,12 +535,23 @@ impl ReverseTranslator for Insert {
             translate_conflict_predicate::<Reverse>(conflict_target, schema, options, &mut |_| {})?;
         }
 
-        // Unscale integer literals in VALUES rows at NUMERIC column positions.
+        // Minor units back to decimals, storage wrappers back to the declared
+        // type.
         if let TableObject::TableName(name) = &self.table
             && let Ok(Some(table)) = resolve_translation_table(schema, name)
         {
             let scales = numeric_minor_unit_scales_of_table(table, schema);
             unscale_numeric_literals(&mut insert, table, schema, &scales)?;
+            retype_insert_values(&mut insert, table, schema, options)?;
+            if let Some(OnInsert::OnConflict(OnConflict {
+                action: OnConflictAction::DoUpdate(do_update),
+                ..
+            })) = &mut insert.on
+            {
+                for assignment in &mut do_update.assignments {
+                    retype_assignment(assignment, table, schema, options)?;
+                }
+            }
         }
 
         Ok(insert)
