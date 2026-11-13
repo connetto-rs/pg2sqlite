@@ -475,7 +475,9 @@ fn evaluate_definition<T: PartialEq>(
         ColumnDefinition::RecursiveUnion { anchor, .. } => {
             evaluate_definition(&anchor.definition(), schema, options, read_column, read_expression)
         }
-        ColumnDefinition::Opaque => Ok(DefinitionValue::Opaque),
+        ColumnDefinition::Parameter { .. } | ColumnDefinition::Opaque => {
+            Ok(DefinitionValue::Opaque)
+        }
     }
 }
 
@@ -672,7 +674,7 @@ fn definition_find<T>(
         ColumnDefinition::RecursiveUnion { anchor, .. } => {
             definition_find(&anchor.definition(), schema, options, read_column, read_expression)
         }
-        ColumnDefinition::Opaque => Ok(None),
+        ColumnDefinition::Parameter { .. } | ColumnDefinition::Opaque => Ok(None),
     }
 }
 
@@ -5968,5 +5970,50 @@ mod tests {
             .expect("the output's scope settles");
             assert!(carries, "{sql}: the output answers the interval read");
         }
+    }
+
+    #[test]
+    fn a_function_parameter_reads_as_an_opaque_definition() {
+        use sql_traits::{
+            structs::{ColumnDefinition, ExpressionContext, ExpressionScope, IdentifierCase},
+            traits::DatabaseLike,
+        };
+
+        let schema = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE FUNCTION f(x INT8) RETURNS INT8 LANGUAGE sql AS 'SELECT x';",
+        )
+        .unwrap();
+        let body = Parser::parse_sql(&PostgreSqlDialect {}, "SELECT x").unwrap().remove(0);
+        let function = schema.functions().next().unwrap();
+        let context = ExpressionContext::for_statement(
+            &body,
+            &ExpressionScope::FunctionBody(function),
+            &schema,
+            IdentifierCase::AsWritten,
+        )
+        .unwrap();
+        let sqlparser::ast::Statement::Query(query) = &body else { unreachable!() };
+        let SetExpr::Select(select) = query.body.as_ref() else { unreachable!() };
+        let SelectItem::UnnamedExpr(reference) = &select.projection[0] else { unreachable!() };
+        let (definition, _) = context.reference(reference).unwrap().expect("x binds");
+        assert!(matches!(definition, ColumnDefinition::Parameter { ordinal: 0, .. }));
+
+        let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
+        let read_column = |_: &sqlparser::ast::ColumnDef| Some(());
+        let read_expression =
+            |_: &Expr, _: &ParserDB, _: &crate::options::TranslationContext<'_>| Ok(Some(()));
+        let evaluated = super::evaluate_definition(
+            &definition,
+            &schema,
+            &options,
+            &read_column,
+            &read_expression,
+        )
+        .unwrap();
+        assert!(matches!(evaluated, super::DefinitionValue::Opaque));
+        let found =
+            super::definition_find(&definition, &schema, &options, &read_column, &read_expression)
+                .unwrap();
+        assert_eq!(found, None);
     }
 }
