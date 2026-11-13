@@ -6,7 +6,10 @@
 use std::{cell::RefCell, sync::Once};
 
 use diesel::{
-    connection::SimpleConnection, prelude::*, sql_types::BigInt, sqlite::SqliteConnection,
+    connection::SimpleConnection,
+    prelude::*,
+    sql_types::BigInt,
+    sqlite::{SqliteConnection, SqliteFunctionBehavior},
 };
 
 /// Stand-in for every session-variable UDF (e.g. `current_app_user()`). Matches
@@ -50,10 +53,14 @@ fn ensure_auto_extensions() {
 /// no-arg stub returning `SESSION_VAR_VALUE`.
 pub fn reopen(session_var_funcs: &[String]) -> Result<(), String> {
     ensure_auto_extensions();
-    let conn = SqliteConnection::establish(":memory:").map_err(|e| e.to_string())?;
+    let mut conn = SqliteConnection::establish(":memory:").map_err(|e| e.to_string())?;
     for name in session_var_funcs {
-        conn.register_noarg_sql_function::<BigInt, _, _>(name, true, || SESSION_VAR_VALUE)
-            .map_err(|e| format!("could not register session-variable UDF '{name}': {e}"))?;
+        conn.register_noarg_sql_function::<BigInt, _, _>(
+            name,
+            SqliteFunctionBehavior::DETERMINISTIC,
+            || SESSION_VAR_VALUE,
+        )
+        .map_err(|e| format!("could not register session-variable UDF '{name}': {e}"))?;
     }
     CONN.with(|cell| *cell.borrow_mut() = Some(conn));
     Ok(())
