@@ -179,9 +179,6 @@ pub(crate) fn retype_assignment(
         AssignmentTarget::ColumnName(name) => retype_one(name, &mut assignment.value),
         AssignmentTarget::Tuple(names) => {
             let Expr::Tuple(items) = &mut assignment.value else { return Ok(()) };
-            if items.len() != names.len() {
-                return Ok(());
-            }
             names.iter().zip(items.iter_mut()).try_for_each(|(name, item)| retype_one(name, item))
         }
     }

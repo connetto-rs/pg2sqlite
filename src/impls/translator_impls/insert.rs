@@ -813,8 +813,7 @@ fn assign_insert_values(
     });
     let scoped = scope.as_ref().map(|scope| options.with_scope(scope));
     let context = scoped.as_ref().unwrap_or(options);
-    for_each_insert_position(source.body.as_mut(), &column_names, &mut |index, expr| {
-        let Some(column) = column_names.get(index) else { return Ok(expr) };
+    for_each_insert_position(source.body.as_mut(), &column_names, &mut |column, expr| {
         rewrites.reject_untyped_array(column, &expr)?;
         Ok(rewrites.temporal_column_cast(column, &expr, schema, context)?.unwrap_or(expr))
     })
@@ -838,8 +837,7 @@ fn apply_column_type_conversions(
         .columns(schema)?
         .map(|col| (col.column_name().to_string(), col.attribute().data_type.clone()))
         .collect();
-    for_each_insert_position(source.body.as_mut(), &column_names, &mut |idx, expr| {
-        let Some(col_name) = column_names.get(idx) else { return Ok(expr) };
+    for_each_insert_position(source.body.as_mut(), &column_names, &mut |col_name, expr| {
         if let Some((_, data_type)) =
             col_types.iter().find(|(name, _)| name.eq_ignore_ascii_case(col_name))
         {
@@ -856,8 +854,8 @@ fn apply_column_type_conversions(
     })
 }
 
-/// Applies `f` at every column position in a `VALUES`/`SELECT`/set-operation
-/// source.
+/// Applies `f` to the value at every column position in a
+/// `VALUES`/`SELECT`/set-operation source, with the column it fills.
 ///
 /// Wildcards and multi-column aliases are skipped (unmappable). All three
 /// column-typed rewrites share this walk so they cover exactly the same source
@@ -866,23 +864,19 @@ fn apply_column_type_conversions(
 pub(crate) fn for_each_insert_position(
     body: &mut SetExpr,
     column_names: &[String],
-    f: &mut impl FnMut(
-        usize,
-        sqlparser::ast::Expr,
-    ) -> Result<sqlparser::ast::Expr, crate::errors::Error>,
+    f: &mut impl FnMut(&str, sqlparser::ast::Expr) -> Result<sqlparser::ast::Expr, crate::errors::Error>,
 ) -> Result<(), crate::errors::Error> {
     match body {
         SetExpr::Values(values) => {
             for row in &mut values.rows {
-                for (idx, expr) in row.content.iter_mut().enumerate() {
-                    let Some(_) = column_names.get(idx) else { break };
+                for (column, expr) in column_names.iter().zip(row.content.iter_mut()) {
                     let taken = core::mem::replace(
                         expr,
                         sqlparser::ast::Expr::Identifier(sqlparser::ast::Ident::new(
                             "__placeholder",
                         )),
                     );
-                    *expr = f(idx, taken)?;
+                    *expr = f(column, taken)?;
                 }
             }
         }
@@ -900,8 +894,7 @@ pub(crate) fn for_each_insert_position(
             }) {
                 return Ok(());
             }
-            for (idx, item) in select.projection.iter_mut().enumerate() {
-                let Some(_) = column_names.get(idx) else { break };
+            for (column, item) in column_names.iter().zip(select.projection.iter_mut()) {
                 match item {
                     SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
                         let taken = core::mem::replace(
@@ -910,7 +903,7 @@ pub(crate) fn for_each_insert_position(
                                 "__placeholder",
                             )),
                         );
-                        *expr = f(idx, taken)?;
+                        *expr = f(column, taken)?;
                     }
                     SelectItem::Wildcard(_)
                     | SelectItem::QualifiedWildcard(..)

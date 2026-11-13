@@ -260,10 +260,9 @@ fn unscale_numeric_literals(
     }
     let column_names = insert_column_names(insert, table, schema)?;
     let Some(source) = insert.source.as_deref_mut() else { return Ok(()) };
-    for_each_insert_position(source.body.as_mut(), &column_names, &mut |idx, mut expr| {
-        if let Some(column) = column_names.get(idx)
-            && let Some(scale) =
-                scales.iter().find(|(name, _)| name.eq_ignore_ascii_case(column)).map(|(_, s)| *s)
+    for_each_insert_position(source.body.as_mut(), &column_names, &mut |column, mut expr| {
+        if let Some(scale) =
+            scales.iter().find(|(name, _)| name.eq_ignore_ascii_case(column)).map(|(_, s)| *s)
             && let Some(unscaled) = unscale_integer_literal(&expr, scale)
         {
             expr = unscaled;
@@ -281,11 +280,8 @@ fn retype_insert_values(
 ) -> Result<(), Error> {
     let column_names = insert_column_names(insert, table, schema)?;
     let Some(source) = insert.source.as_deref_mut() else { return Ok(()) };
-    for_each_insert_position(source.body.as_mut(), &column_names, &mut |idx, expr| {
-        match column_names.get(idx) {
-            Some(column) => retype_for_column(expr, column, table, schema, options),
-            None => Ok(expr),
-        }
+    for_each_insert_position(source.body.as_mut(), &column_names, &mut |column, expr| {
+        retype_for_column(expr, column, table, schema, options)
     })
 }
 
