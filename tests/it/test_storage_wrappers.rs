@@ -287,3 +287,31 @@ fn hex_over_an_unresolvable_reference_keeps_its_documented_fallback() {
         .join("; ");
     assert!(reversed.contains("encode(u::BYTEA, 'hex')"), "{reversed}");
 }
+
+#[test]
+fn a_declared_decode_of_another_encoding_beside_a_uuid_column_is_unchanged() {
+    // Only the hex decode `unhex` reverses to holds a uuid's bytes.
+    let schema =
+        Pg2Sqlite::default().sql(DDL).expect("the schema parses").build_schema().expect("builds");
+    let postgres = Pg2Sqlite::default()
+        .reverse_sql(
+            "SELECT id FROM stored WHERE u = decode('x', 'base64')",
+            &schema,
+            &options().with_user_defined_functions(["decode"]),
+        )
+        .expect("the declared call reverses")
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    assert!(postgres.contains("u = decode('x', 'base64')"), "{postgres}");
+}
+
+#[test]
+fn a_blob_written_to_an_undeclared_column_is_left_for_the_server_to_refuse() {
+    let inserted =
+        reversed("INSERT INTO stored (id, nope) VALUES (1, X'550E8400E29B41D4A716446655440000')");
+    assert!(inserted.contains("(1, X'550E8400E29B41D4A716446655440000')"), "{inserted}");
+    let updated = reversed("UPDATE stored SET nope = X'550E8400E29B41D4A716446655440000'");
+    assert!(updated.contains("nope = X'550E8400E29B41D4A716446655440000'"), "{updated}");
+}
