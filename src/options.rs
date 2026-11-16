@@ -205,8 +205,23 @@ pub(crate) struct PrewalkCatalogs {
     /// kept, since holding whole trigger nodes here costs link-time drop glue
     /// out of proportion to the two fields the check needs.
     before_insert_trigger_fns: Vec<(String, sqlparser::ast::ObjectName)>,
+    /// The triggers each table carries after the statements translated so
+    /// far, which a write left off the replica with its table reads to find
+    /// one PostgreSQL fires for it.
+    table_triggers: Vec<TableTrigger>,
     /// The request's zone, resolved the first time an operation needs it.
     request_zone: core::cell::OnceCell<Result<RequestZone, ZoneUnavailable>>,
+}
+
+/// A trigger on a table.
+#[derive(Clone)]
+struct TableTrigger {
+    /// The trigger's name as written.
+    name: String,
+    /// The table's name, lower-cased.
+    table: String,
+    /// The events the trigger fires on.
+    events: Vec<sqlparser::ast::TriggerEvent>,
 }
 
 #[derive(Clone, Copy)]
@@ -724,6 +739,71 @@ impl<'a> TranslationContext<'a> {
 
     pub(crate) fn before_insert_trigger_fns(&self) -> &[(String, sqlparser::ast::ObjectName)] {
         &self.catalogs.before_insert_trigger_fns
+    }
+
+    /// Follows the triggers `statement` creates, drops, or carries to a
+    /// renamed table, and forgets those of a dropped table.
+    pub(crate) fn follow_triggers(&mut self, statement: &sqlparser::ast::Statement) {
+        use sqlparser::ast::{AlterTableOperation, ObjectType, RenameTableNameKind, Statement};
+
+        use crate::impls::object_name::last_ident_value_or_display;
+
+        let table_key = |name: &ObjectName| last_ident_value_or_display(name).to_lowercase();
+        match statement {
+            Statement::CreateTrigger(trigger) => {
+                let name = last_ident_value_or_display(&trigger.name);
+                let table = table_key(&trigger.table_name);
+                let triggers = &mut self.catalogs.to_mut().table_triggers;
+                triggers
+                    .retain(|kept| kept.table != table || !kept.name.eq_ignore_ascii_case(&name));
+                triggers.push(TableTrigger { name, table, events: trigger.events.clone() });
+            }
+            Statement::DropTrigger(drop) => {
+                let name = last_ident_value_or_display(&drop.trigger_name);
+                let table = drop.table_name.as_ref().map(table_key);
+                self.catalogs.to_mut().table_triggers.retain(|kept| {
+                    !kept.name.eq_ignore_ascii_case(&name)
+                        || table.as_ref().is_some_and(|table| *table != kept.table)
+                });
+            }
+            Statement::Drop { object_type: ObjectType::Table, names, .. } => {
+                let dropped: Vec<String> = names.iter().map(table_key).collect();
+                self.catalogs.to_mut().table_triggers.retain(|kept| !dropped.contains(&kept.table));
+            }
+            Statement::AlterTable(alter_table) => {
+                for operation in &alter_table.operations {
+                    let AlterTableOperation::RenameTable {
+                        table_name:
+                            RenameTableNameKind::As(renamed) | RenameTableNameKind::To(renamed),
+                    } = operation
+                    else {
+                        continue;
+                    };
+                    let (from, to) = (table_key(&alter_table.name), table_key(renamed));
+                    for kept in &mut self.catalogs.to_mut().table_triggers {
+                        if kept.table == from {
+                            kept.table.clone_from(&to);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The name of a trigger `table` carries that fires on an event `fires`
+    /// accepts.
+    pub(crate) fn trigger_firing(
+        &self,
+        table: &str,
+        fires: impl Fn(&sqlparser::ast::TriggerEvent) -> bool,
+    ) -> Option<&str> {
+        let table = table.to_lowercase();
+        self.catalogs
+            .table_triggers
+            .iter()
+            .find(|trigger| trigger.table == table && trigger.events.iter().any(&fires))
+            .map(|trigger| trigger.name.as_str())
     }
 
     /// The request's zone, resolved against `schema` once per translation,
