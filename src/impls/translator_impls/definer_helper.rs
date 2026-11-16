@@ -2,12 +2,14 @@
 //!
 //! A policy compares a column to what a helper returns, as
 //! `x IN (SELECT authz.f('admin'))` or `x = ANY (ARRAY(SELECT
-//! authz.f('admin')))`. SQLite has no functions of its own to call, so the call
-//! is replaced by the query `FunctionLike::helper_set` reads out of the
-//! helper's body, one `SELECT` per arm joined by `UNION`. Each arm reads the
-//! backing table of a table that has one, because the helper runs as an owner
-//! that `helper_set` has checked is exempt from every policy it reads past,
-//! and the owner reads past the acting role's grants.
+//! authz.f('admin')))`, or reads the helper's rows where a table goes, as
+//! `(a, b) IN (SELECT * FROM authz.f('admin'))`. SQLite has no functions of
+//! its own to call, so the call is replaced by the query
+//! `FunctionLike::helper_set` reads out of the helper's body, one `SELECT` per
+//! arm joined by `UNION`. Each arm reads the backing table of a table that has
+//! one, because the helper runs as an owner that `helper_set` has checked is
+//! exempt from every policy it reads past, and the owner reads past the acting
+//! role's grants.
 
 use core::{convert::Infallible, ops::ControlFlow};
 
@@ -22,11 +24,11 @@ use sql_traits::{
     traits::{ColumnLike, DatabaseLike, FunctionLike, TableLike},
 };
 use sqlparser::ast::{
-    ArrayElemTypeDef, BinaryOperator, CastKind, CreateTable, Cte, DataType, Expr, Function,
-    FunctionArg, FunctionArgExpr, FunctionArguments, Ident, InTarget, Join, JoinConstraint,
-    JoinOperator, ObjectName, ObjectNamePart, Query, SelectItem, SetExpr, SetOperator,
-    SetQuantifier, TableAlias, TableAliasColumnDef, TableFactor, TableWithJoins, Value,
-    ValueWithSpan, VisitMut, VisitorMut, With, helpers::attached_token::AttachedToken,
+    ArrayElemTypeDef, BinaryOperator, CastKind, CreateTable, Cte, DataType, Expr, FunctionArg,
+    FunctionArgExpr, FunctionArguments, Ident, InTarget, Join, JoinConstraint, JoinOperator,
+    ObjectName, ObjectNamePart, Query, SelectItem, SetExpr, SetOperator, SetQuantifier, TableAlias,
+    TableAliasColumnDef, TableFactor, TableWithJoins, Value, ValueWithSpan, VisitMut, VisitorMut,
+    With, helpers::attached_token::AttachedToken,
 };
 
 #[cfg(not(feature = "std"))]
@@ -35,6 +37,7 @@ use crate::{
     errors::Error,
     impls::{
         function_helpers::{query_projection, simple_function_expr, string_literal},
+        object_name::last_ident,
         privileges::has_backing_table,
         query_builder::{
             from_relation, make_query, make_simple_select, plain_table_factor, single_expr_query,
@@ -66,14 +69,113 @@ pub(crate) fn helper_membership(
     emit: WarningSink<'_>,
 ) -> Result<Option<Query>, Error> {
     let Some(Expr::Function(call)) = query_projection(subquery) else { return Ok(None) };
+    let name = &call.name;
     // A helper returning one value stands for its body, which the call's
     // ordinary translation writes in place of it.
     let Some(helper) =
-        declared_helper(&call.name, schema, options)?.filter(|helper| helper.returns_set())
+        declared_helper(name, schema, options)?.filter(|helper| helper.returns_set())
     else {
         return Ok(None);
     };
-    let name = &call.name;
+    let arguments = match &call.args {
+        FunctionArguments::List(list) if list.clauses.is_empty() => arguments(name, &list.args),
+        other => Err(unsupported_argument(name, other)),
+    };
+    helper_query(helper, name, arguments, &[], schema, options, emit).map(Some)
+}
+
+/// The derived table answering `FROM f(...) [AS alias [(columns)]]`, when `f`
+/// is a function the schema declares, under the relation and column names
+/// PostgreSQL gives the call's rows.
+///
+/// The relation is the alias, or the function's name without one. The
+/// columns are the ones `RETURNS TABLE (...)` declares, or the relation's name
+/// for the one column of `RETURNS SETOF` a scalar type, the alias's columns
+/// renaming the leading ones. `None` is as for [`helper_membership`].
+///
+/// # Errors
+///
+/// Refuses the call as [`helper_membership`] does, and an alias carrying a
+/// data type or naming more columns than the helper returns, both of which
+/// PostgreSQL refuses too.
+pub(crate) fn helper_rows(
+    name: &ObjectName,
+    arguments: &[FunctionArg],
+    alias: Option<&TableAlias>,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+    emit: WarningSink<'_>,
+) -> Result<Option<TableFactor>, Error> {
+    let Some(helper) = declared_helper(name, schema, options)? else { return Ok(None) };
+    let Some(function) = last_ident(name) else { return Ok(None) };
+    let relation = alias.map_or(function, |alias| &alias.name).clone();
+    let mut columns: Vec<Ident> = helper
+        .returned_columns(schema)
+        .map(|(column, _)| {
+            if column.name_is_quoted() {
+                Ident::with_quote('"', column.name())
+            } else {
+                Ident::new(column.name())
+            }
+        })
+        .collect();
+    if columns.is_empty() {
+        columns.push(relation.clone());
+    }
+    if let Some(alias) = alias {
+        if let Some(typed) = alias.columns.iter().find(|column| column.data_type.is_some()) {
+            return Err(Error::forward_refusal(format!(
+                "{name}() AS {} ({} ...) carries a data type in the column alias list, which \
+                 PostgreSQL accepts only on a function returning record. Name the columns alone.",
+                alias.name, typed.name
+            )));
+        }
+        if alias.columns.len() > columns.len() {
+            return Err(Error::forward_refusal(format!(
+                "The alias {} names {} columns for {name}(), which returns {}. PostgreSQL refuses \
+                 the longer list too. Name at most the columns the function returns.",
+                alias.name,
+                alias.columns.len(),
+                columns.len()
+            )));
+        }
+        for (column, renamed) in columns.iter_mut().zip(&alias.columns) {
+            column.clone_from(&renamed.name);
+        }
+    }
+    let rows = helper_query(
+        helper,
+        name,
+        self::arguments(name, arguments),
+        &columns,
+        schema,
+        options,
+        emit,
+    )?;
+    Ok(Some(TableFactor::Derived {
+        lateral: false,
+        subquery: Box::new(rows),
+        alias: Some(TableAlias { explicit: true, name: relation, columns: Vec::new(), at: None }),
+        sample: None,
+    }))
+}
+
+/// The refusal of a call to `name` that `helper_set` cannot answer.
+fn untranslatable(name: &ObjectName, error: &HelperSetError) -> Error {
+    Error::forward_refusal(format!("{name}() cannot be translated as the set it returns: {error}"))
+}
+
+/// The SQLite query returning the set `helper` returns for `arguments` under
+/// `names`, or the refusal of the reason they cannot be read.
+fn helper_query(
+    helper: &<ParserDB as DatabaseLike>::Function,
+    name: &ObjectName,
+    arguments: Result<Vec<Value>, HelperSetError>,
+    names: &[Ident],
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+    emit: WarningSink<'_>,
+) -> Result<Query, Error> {
     let Some(deployment) = options.get_deployment() else {
         return Err(Error::forward_refusal(format!(
             "{name}() is a function the schema declares, and a call to it translates as the set \
@@ -81,15 +183,11 @@ pub(crate) fn helper_membership(
              setting. Pass it with with_deployment(...)."
         )));
     };
-    let set = arguments(call)
+    let set = arguments
         .and_then(|arguments| helper.helper_set(&arguments, deployment, schema))
-        .map_err(|error| {
-            Error::forward_refusal(format!(
-                "{name}() cannot be translated as the set it returns: {error}"
-            ))
-        })?;
+        .map_err(|error| untranslatable(name, &error))?;
     let mut lowering = Lowering { helper: name, schema, read: Vec::new(), walks: 0 };
-    let lowered = lowering.set(&set, &[])?;
+    let lowered = lowering.set(&set, names)?;
     let mut guarded = Vec::new();
     for table in lowering.read {
         let table_name = table.table_name();
@@ -100,32 +198,30 @@ pub(crate) fn helper_membership(
     let mut lowered = lowered.translate_with_warnings(schema, options, emit)?;
     let ControlFlow::Continue(()) = lowered
         .visit(&mut BackingTables { guarded: &guarded, suffix: options.get_rls_table_suffix() });
-    Ok(Some(lowered))
+    Ok(lowered)
 }
 
 /// The literals a call passes, one per argument.
-fn arguments(call: &Function) -> Result<Vec<Value>, HelperSetError> {
-    let unsupported = |argument: &dyn ToString| {
-        HelperSetError::UnsupportedArgument {
-            function: call.name.to_string(),
-            argument: argument.to_string(),
-        }
-    };
-    let FunctionArguments::List(list) = &call.args else { return Err(unsupported(&call.args)) };
-    if !list.clauses.is_empty() {
-        return Err(unsupported(list));
-    }
-    list.args
+fn arguments(name: &ObjectName, arguments: &[FunctionArg]) -> Result<Vec<Value>, HelperSetError> {
+    arguments
         .iter()
         .map(|argument| {
             match argument {
                 FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(value))) => {
                     Ok(value.value.clone())
                 }
-                other => Err(unsupported(other)),
+                other => Err(unsupported_argument(name, other)),
             }
         })
         .collect()
+}
+
+/// The refusal of `argument`, which is no literal a helper set can bind.
+fn unsupported_argument(name: &ObjectName, argument: &dyn ToString) -> HelperSetError {
+    HelperSetError::UnsupportedArgument {
+        function: name.to_string(),
+        argument: argument.to_string(),
+    }
 }
 
 /// The alias of the table a grant or parent arm reads.
