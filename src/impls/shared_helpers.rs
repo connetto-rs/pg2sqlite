@@ -5976,6 +5976,33 @@ mod tests {
         }
     }
 
+    /// Answers `"column"` for every table column a definition reads.
+    #[expect(clippy::unnecessary_wraps, reason = "the reader `evaluate_definition` takes")]
+    fn read_column(_: &sqlparser::ast::ColumnDef) -> Option<&'static str> {
+        Some("column")
+    }
+
+    /// Answers `"expression"` for every expression a definition reads.
+    #[expect(clippy::unnecessary_wraps, reason = "the reader `evaluate_definition` takes")]
+    fn read_expression(
+        _: &Expr,
+        _: &ParserDB,
+        _: &crate::options::TranslationContext<'_>,
+    ) -> Result<Option<&'static str>, crate::errors::Error> {
+        Ok(Some("expression"))
+    }
+
+    /// The operands `expr` joins with binary operators, left to right.
+    fn operands<'e>(expr: &'e Expr, found: &mut Vec<&'e Expr>) {
+        match expr {
+            Expr::BinaryOp { left, right, .. } => {
+                operands(left, found);
+                operands(right, found);
+            }
+            operand => found.push(operand),
+        }
+    }
+
     #[test]
     fn a_function_parameter_reads_as_opaque_unless_a_column_shadows_it() {
         use sql_traits::{
@@ -5990,11 +6017,6 @@ mod tests {
         .unwrap();
         let function = schema.functions().next().unwrap();
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
-        let read_column = |_: &sqlparser::ast::ColumnDef| Some("column");
-        let read_expression =
-            |_: &Expr, _: &ParserDB, _: &crate::options::TranslationContext<'_>| {
-                Ok(Some("expression"))
-            };
 
         // `None` stands for an opaque definition.
         for (sql, expected) in [
@@ -6069,26 +6091,18 @@ mod tests {
         let sites = body.sites().unwrap();
         let [site] = sites.as_slice() else { panic!("one site") };
         let context = site.context(IdentifierCase::Folded).unwrap();
-        let Expr::BinaryOp { left, right: field, .. } = site.command() else {
-            panic!("a concatenation")
-        };
-        let Expr::BinaryOp { right: variable, .. } = left.as_ref() else {
-            panic!("a concatenation")
-        };
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
-        let read_column = |_: &sqlparser::ast::ColumnDef| Some("column");
-        let read_expression =
-            |_: &Expr, _: &ParserDB, _: &crate::options::TranslationContext<'_>| {
-                Ok(Some("expression"))
-            };
-        for reference in [variable.as_ref(), field.as_ref()] {
-            let (definition, _) = context.reference(reference).unwrap().expect("binds");
+        let mut found = Vec::new();
+        operands(site.command(), &mut found);
+        let mut bound = Vec::new();
+        for operand in found {
+            let Some((definition, _)) = context.reference(operand).unwrap() else { continue };
             assert!(
                 matches!(
                     definition,
                     ColumnDefinition::Variable(_) | ColumnDefinition::VariableField(_)
                 ),
-                "{reference}"
+                "{operand}"
             );
             let evaluated = super::evaluate_definition(
                 &definition,
@@ -6098,8 +6112,8 @@ mod tests {
                 &read_expression,
             )
             .unwrap();
-            assert!(matches!(evaluated, super::DefinitionValue::Opaque), "{reference}");
-            let found = super::definition_find(
+            assert!(matches!(evaluated, super::DefinitionValue::Opaque), "{operand}");
+            let searched = super::definition_find(
                 &definition,
                 &schema,
                 &options,
@@ -6107,7 +6121,9 @@ mod tests {
                 &read_expression,
             )
             .unwrap();
-            assert_eq!(found, None, "{reference}");
+            assert_eq!(searched, None, "{operand}");
+            bound.push(operand.to_string());
         }
+        assert_eq!(bound, ["p", "r.name"]);
     }
 }

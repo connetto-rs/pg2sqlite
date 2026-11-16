@@ -100,9 +100,14 @@ pub(crate) fn helper_membership(
                 "{name}() cannot be translated as the set it returns: {error}"
             ))
         })?;
-    let lowered = lowered_set(&set, name)?;
+    let mut read = Vec::new();
+    let lowered = lowered_set(&set, name, &mut read)?;
     let mut guarded = Vec::new();
-    guarded_tables(&set, schema, options, &mut guarded)?;
+    for table in read {
+        if has_backing_table(table, schema, options)? {
+            guarded.push(table.table_name());
+        }
+    }
     let mut lowered = lowered.translate_with_warnings(schema, options, emit)?;
     let ControlFlow::Continue(()) = lowered
         .visit(&mut BackingTables { guarded: &guarded, suffix: options.get_rls_table_suffix() });
@@ -153,48 +158,26 @@ fn arguments(call: &Function) -> Result<Vec<Value>, HelperSetError> {
         .collect()
 }
 
-/// The names of the tables with a backing table the arms of `set` read, its
-/// parent arms' sets included.
-fn guarded_tables<'db>(
-    set: &HelperSet<'db, ParserDB>,
-    schema: &ParserDB,
-    options: &TranslationContext<'_>,
-    guarded: &mut Vec<&'db str>,
-) -> Result<(), Error> {
-    for arm in set.arms() {
-        let table = match arm {
-            HelperArm::Grant(grant) => grant.table(),
-            HelperArm::Parent(parent) => {
-                guarded_tables(parent.set(), schema, options, guarded)?;
-                parent.table()
-            }
-            HelperArm::Walk(walk) => walk.table(),
-        };
-        if has_backing_table(table, schema, options)? {
-            guarded.push(table.table_name());
-        }
-    }
-    Ok(())
-}
-
 /// The set as a PostgreSQL query over the tables the helper reads, written
-/// under their declared names so the translation resolves their columns.
+/// under their declared names so the translation resolves their columns, each
+/// table it reads pushed onto `read`.
 ///
 /// # Errors
 ///
 /// Refuses a set grown along a walk, and an arm holding a condition the query
 /// does not write out, either of which would keep rows the helper does not
 /// return.
-fn lowered_set(set: &HelperSet<'_, ParserDB>, helper: &ObjectName) -> Result<Query, Error> {
-    if set.selection().is_some() || set.arms().iter().any(|arm| matches!(arm, HelperArm::Walk(_))) {
-        return Err(Error::forward_refusal(format!(
-            "{helper}() cannot be translated as the set it returns: the set grows along a walk, \
-             which the translation does not write out."
-        )));
+fn lowered_set<'db>(
+    set: &HelperSet<'db, ParserDB>,
+    helper: &ObjectName,
+    read: &mut Vec<&'db <ParserDB as DatabaseLike>::Table>,
+) -> Result<Query, Error> {
+    if set.selection().is_some() {
+        return Err(walk_refusal(helper));
     }
     let mut arms = Vec::new();
     for arm in set.arms() {
-        arms.push(lowered_arm(arm, helper)?);
+        arms.push(lowered_arm(arm, helper, read)?);
     }
     let mut arms = arms.into_iter();
     let Some(first) = arms.next() else {
@@ -217,9 +200,14 @@ fn lowered_set(set: &HelperSet<'_, ParserDB>, helper: &ObjectName) -> Result<Que
 }
 
 /// One arm as `SELECT <columns> FROM <table> WHERE <condition>`.
-fn lowered_arm(arm: &HelperArm<'_, ParserDB>, helper: &ObjectName) -> Result<Query, Error> {
+fn lowered_arm<'db>(
+    arm: &HelperArm<'db, ParserDB>,
+    helper: &ObjectName,
+    read: &mut Vec<&'db <ParserDB as DatabaseLike>::Table>,
+) -> Result<Query, Error> {
     match arm {
         HelperArm::Grant(grant) => {
+            read.push(grant.table());
             let refused = |condition: &str| {
                 Error::forward_refusal(format!(
                     "{helper}() cannot be translated as the set it returns: an arm keeps its \
@@ -292,19 +280,28 @@ fn lowered_arm(arm: &HelperArm<'_, ParserDB>, helper: &ObjectName) -> Result<Que
             ))
         }
         HelperArm::Parent(parent) => {
+            read.push(parent.table());
             Ok(single_expr_query(
                 column(parent.key()),
                 from_relation(plain_table_factor(parent.table().name.clone())),
                 Some(Expr::In {
                     expr: Box::new(column(parent.column())),
-                    target: InTarget::Subquery(Box::new(lowered_set(parent.set(), helper)?)),
+                    target: InTarget::Subquery(Box::new(lowered_set(parent.set(), helper, read)?)),
                     negated: false,
                     global: false,
                 }),
             ))
         }
-        HelperArm::Walk(_) => unreachable!("`lowered_set` refuses a set with a walk"),
+        HelperArm::Walk(_) => Err(walk_refusal(helper)),
     }
+}
+
+/// The refusal of a set grown along a walk.
+fn walk_refusal(helper: &ObjectName) -> Error {
+    Error::forward_refusal(format!(
+        "{helper}() cannot be translated as the set it returns: the set grows along a walk, \
+         which the translation does not write out."
+    ))
 }
 
 /// The first condition of `grant` beside its grantee and restrictions the

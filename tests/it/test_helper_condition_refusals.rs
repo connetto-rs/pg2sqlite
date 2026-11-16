@@ -113,7 +113,8 @@ $$;
 CREATE FUNCTION authz.caller_teams() RETURNS SETOF TEXT
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
   WITH RECURSIVE reached (id) AS (
-    SELECT member.team_id FROM public.team_members member WHERE member.user_id = authz.caller_id()
+    SELECT member.team_id FROM public.team_members member
+    WHERE member.user_id = current_setting('app.user_id', true)
     UNION
     SELECT team.parent_id FROM public.teams team JOIN reached ON team.id = reached.id
   )
