@@ -4,8 +4,10 @@
 //! row cap lifted for a request acting through no installation, a returned
 //! key capped by another helper's set, a walk down two edge tables kept to a
 //! selection, and a walk up a tree feeding a grantee set. Then for an arm
-//! reading another helper's rows. Each helper guards the same table under a
-//! policy of its own, which both engines read under every request state.
+//! reading another helper's rows, and for a helper read in `FROM`, as its
+//! rows, its columns under an alias, and its rows correlated with the row a
+//! policy reads. Each helper guards the same table under a policy of its own,
+//! which both engines read under every request state.
 
 // `register_impl` takes an unwind-safe closure, which a poisoning mutex is.
 use std::sync::{Arc, Mutex};
@@ -247,8 +249,9 @@ GRANT USAGE ON SCHEMA authz TO app;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA authz TO app;
 ";
 
-/// Each helper's policy over `docs`, one case per condition it carries.
-const CASES: [(&str, &str); 13] = [
+/// Each helper's policy over `docs`, one case per condition it carries or
+/// place its rows are read in.
+const CASES: [(&str, &str); 22] = [
     ("a joined row", "org_id IN (SELECT authz.member_orgs())"),
     ("a row cap over a joined row", "org_id IN (SELECT authz.administered_orgs())"),
     ("an anti-join, time bounds and a principal", "id IN (SELECT authz.granted_docs())"),
@@ -262,6 +265,28 @@ const CASES: [(&str, &str); 13] = [
     ("a walk up feeding a grantee set", "id IN (SELECT authz.team_docs())"),
     ("a returned key capped by another helper's set", "id IN (SELECT authz.granted_pages())"),
     ("an arm reading another helper's rows", "org_id IN (SELECT authz.called_orgs())"),
+    ("a set helper's rows", "org_id IN (SELECT member_orgs FROM authz.member_orgs())"),
+    ("a set helper's rows under an alias", "org_id IN (SELECT o FROM authz.member_orgs() o)"),
+    ("a table helper's rows", "(org_id, kind) IN (SELECT * FROM authz.capped_kinds())"),
+    (
+        "a table helper's rows excluded",
+        "(org_id, kind) NOT IN (SELECT * FROM authz.capped_kinds())",
+    ),
+    ("a table helper's column", "kind IN (SELECT capped.kind FROM authz.capped_kinds() capped)"),
+    (
+        "a table helper's columns renamed",
+        "(org_id, kind) IN (SELECT o, k FROM authz.capped_kinds() AS capped (o, k))",
+    ),
+    ("a table helper's argument", "(org_id, kind) IN (SELECT * FROM authz.kinds_for('page'))"),
+    (
+        "a table helper keeping no row for its argument",
+        "(org_id, kind) NOT IN (SELECT * FROM authz.kinds_for('file'))",
+    ),
+    (
+        "a table helper's rows correlated",
+        "EXISTS (SELECT 1 FROM authz.capped_kinds() capped \
+         WHERE capped.org_id = docs.org_id AND capped.kind = docs.kind)",
+    ),
 ];
 
 /// What a request carries, `''` standing for a setting it leaves unset.

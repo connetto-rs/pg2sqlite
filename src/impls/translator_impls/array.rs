@@ -53,6 +53,7 @@ use crate::{
             from_relation, make_query, make_simple_select, single_expr_query, table_function_factor,
         },
         replay::{is_replayable, reject_duplicated_operand},
+        translator_impls::definer_helper::helper_rows,
     },
     prelude::Pg2SqliteOptions,
     traits::{ArrayRepresentation, translator::TranslatorWithContext},
@@ -1192,13 +1193,15 @@ impl<'w> WholeRow<'w> {
 }
 
 /// Translate `FROM <set returning function>(<json>)` into a derived table over
-/// `json_each`, or refuse the function.
+/// `json_each`, `FROM <helper>(...)` into the set the helper returns, or refuse
+/// the function.
 ///
 /// SQLite has no table-valued form for any of these, so the alternative to a
 /// projection is emitting the call verbatim, which produces `no such table`
-/// when the script is applied. A name that is neither mapped here nor declared
-/// through [`Pg2SqliteOptions::with_user_defined_functions`] is refused,
-/// naming the function, which is the same policy scalar functions follow.
+/// when the script is applied. A name that is neither mapped here, nor a
+/// function the schema declares, nor declared through
+/// [`Pg2SqliteOptions::with_user_defined_functions`] is refused, naming the
+/// function, which is the same policy scalar functions follow.
 ///
 /// The projection is what supplies PostgreSQL's column names.
 /// `json_object_keys` exposes one column, the others one or two, and SQLite's
@@ -1225,6 +1228,9 @@ pub(crate) fn translate_set_returning_factor(
                 with_ordinality: false,
                 alias: alias.cloned(),
             });
+        }
+        if let Some(rows) = helper_rows(name, args, alias, schema, options, emit)? {
+            return Ok(rows);
         }
         return Err(Error::forward_refusal(format!(
             "{name}() is used where a table goes, and SQLite has no table-valued function of that \
