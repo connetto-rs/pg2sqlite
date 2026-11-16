@@ -361,9 +361,9 @@ pub(crate) fn extract_json_group_object_nullif(func: &Function) -> Option<&Funct
     extract_nullif_wrapped(func, "json_group_object", "{}")
 }
 
-/// The shared shape of the two extractors: `NULLIF(<inner_name>(...),
-/// '<sentinel>')` with the inner call as the first argument.
-fn extract_nullif_wrapped<'e>(
+/// `NULLIF(<inner_name>(...), '<sentinel>')`, answering the inner call, the
+/// first argument.
+pub(crate) fn extract_nullif_wrapped<'e>(
     func: &'e Function,
     inner_name: &str,
     sentinel: &str,
