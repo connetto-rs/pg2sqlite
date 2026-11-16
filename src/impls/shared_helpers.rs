@@ -462,15 +462,24 @@ fn evaluate_definition<T: PartialEq>(
                 read_column,
                 read_expression,
             )?;
-            Ok(match (left, right) {
-                (DefinitionValue::Known(left), DefinitionValue::Known(right)) if left == right => {
-                    DefinitionValue::Known(left)
-                }
-                (DefinitionValue::Opaque, _) | (_, DefinitionValue::Opaque) => {
-                    DefinitionValue::Opaque
-                }
-                _ => DefinitionValue::Known(None),
-            })
+            Ok(agreement(left, right))
+        }
+        ColumnDefinition::Values { rows } => {
+            let mut agreed = None;
+            for row in rows.iter() {
+                let value = evaluate_definition(
+                    &row.definition(),
+                    schema,
+                    options,
+                    read_column,
+                    read_expression,
+                )?;
+                agreed = Some(match agreed {
+                    Some(agreed) => agreement(agreed, value),
+                    None => value,
+                });
+            }
+            Ok(agreed.unwrap_or(DefinitionValue::Opaque))
         }
         ColumnDefinition::RecursiveUnion { anchor, .. } => {
             evaluate_definition(&anchor.definition(), schema, options, read_column, read_expression)
@@ -479,6 +488,21 @@ fn evaluate_definition<T: PartialEq>(
         | ColumnDefinition::Variable(_)
         | ColumnDefinition::VariableField(_)
         | ColumnDefinition::Opaque => Ok(DefinitionValue::Opaque),
+    }
+}
+
+/// What two definitions PostgreSQL resolves to one type agree on: the value
+/// both carry, nothing where they differ, and opaque where either is.
+fn agreement<T: PartialEq>(
+    left: DefinitionValue<T>,
+    right: DefinitionValue<T>,
+) -> DefinitionValue<T> {
+    match (left, right) {
+        (DefinitionValue::Known(left), DefinitionValue::Known(right)) if left == right => {
+            DefinitionValue::Known(left)
+        }
+        (DefinitionValue::Opaque, _) | (_, DefinitionValue::Opaque) => DefinitionValue::Opaque,
+        _ => DefinitionValue::Known(None),
     }
 }
 
@@ -674,6 +698,20 @@ fn definition_find<T>(
         }
         ColumnDefinition::RecursiveUnion { anchor, .. } => {
             definition_find(&anchor.definition(), schema, options, read_column, read_expression)
+        }
+        ColumnDefinition::Values { rows } => {
+            for row in rows.iter() {
+                if let Some(found) = definition_find(
+                    &row.definition(),
+                    schema,
+                    options,
+                    read_column,
+                    read_expression,
+                )? {
+                    return Ok(Some(found));
+                }
+            }
+            Ok(None)
         }
         ColumnDefinition::Parameter { .. }
         | ColumnDefinition::Variable(_)
@@ -6061,6 +6099,96 @@ mod tests {
             )
             .unwrap();
             assert_eq!(found, expected, "{sql}");
+        }
+    }
+
+    /// PostgreSQL types a column of a `VALUES` list as it types the same rows
+    /// joined by `UNION ALL`, one type across every row, so the two read
+    /// alike. A column carries what every row agrees on, nothing where two
+    /// rows disagree, and is opaque where a row is, while a search takes the
+    /// first row that answers.
+    #[test]
+    fn a_values_column_reads_as_the_union_of_its_rows() {
+        use sql_traits::{
+            structs::{ColumnDefinition, ExpressionContext, ExpressionScope, IdentifierCase},
+            traits::DatabaseLike,
+        };
+
+        let schema = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE t (x INT8);
+             CREATE FUNCTION f(p INT8) RETURNS INT8 LANGUAGE sql AS 'SELECT p';",
+        )
+        .unwrap();
+        let function = schema.functions().next().unwrap();
+        let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
+        // What `v.y` evaluates to, `None` when opaque, and what a search over
+        // it finds.
+        let read = |sql: &str, is_shape: fn(&ColumnDefinition<'_, '_, '_, ParserDB>) -> bool| {
+            let body = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap().remove(0);
+            let context = ExpressionContext::for_statement(
+                &body,
+                &ExpressionScope::FunctionBody(function),
+                &schema,
+                IdentifierCase::AsWritten,
+            )
+            .unwrap();
+            let sqlparser::ast::Statement::Query(query) = &body else { unreachable!() };
+            let SetExpr::Select(select) = query.body.as_ref() else { unreachable!() };
+            let SelectItem::UnnamedExpr(reference) = &select.projection[0] else { unreachable!() };
+            let (definition, _) = context.reference(reference).unwrap().expect("v.y binds");
+            assert!(is_shape(&definition), "{sql}");
+            let value = match super::evaluate_definition(
+                &definition,
+                &schema,
+                &options,
+                &read_column,
+                &read_expression,
+            )
+            .unwrap()
+            {
+                super::DefinitionValue::Known(value) => Some(value),
+                super::DefinitionValue::Opaque => None,
+            };
+            let found = super::definition_find(
+                &definition,
+                &schema,
+                &options,
+                &read_column,
+                &read_expression,
+            )
+            .unwrap();
+            (value, found)
+        };
+
+        for (values, union, expected) in [
+            (
+                "SELECT v.y FROM t, LATERAL (VALUES (t.x), (t.x)) AS v(y)",
+                "SELECT v.y FROM (SELECT t.x FROM t UNION ALL SELECT t.x FROM t) AS v(y)",
+                (Some(Some("column")), Some("column")),
+            ),
+            (
+                "SELECT v.y FROM t, LATERAL (VALUES (1), (t.x)) AS v(y)",
+                "SELECT v.y FROM (SELECT 1 UNION ALL SELECT t.x FROM t) AS v(y)",
+                (Some(None), Some("expression")),
+            ),
+            (
+                "SELECT v.y FROM (VALUES (p), (1)) AS v(y)",
+                "SELECT v.y FROM (SELECT p UNION ALL SELECT 1) AS v(y)",
+                (None, Some("expression")),
+            ),
+            (
+                "SELECT v.y FROM (VALUES (p), (p)) AS v(y)",
+                "SELECT v.y FROM (SELECT p UNION ALL SELECT p) AS v(y)",
+                (None, None),
+            ),
+        ] {
+            let from_values =
+                read(values, |definition| matches!(definition, ColumnDefinition::Values { .. }));
+            let from_union = read(union, |definition| {
+                matches!(definition, ColumnDefinition::SetOperation { .. })
+            });
+            assert_eq!(from_values, expected, "{values}");
+            assert_eq!(from_union, expected, "{union}");
         }
     }
 

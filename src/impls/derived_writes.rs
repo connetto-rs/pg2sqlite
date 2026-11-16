@@ -17,7 +17,9 @@ use sqlparser::{
     dialect::PostgreSqlDialect,
     parser::Parser,
 };
-use sqlparser_plpgsql::embedded::{Block, Case, If, LoopControl, Node, Open, embedded_sql};
+use sqlparser_plpgsql::embedded::{
+    Block, Case, If, LoopControl, Node, Open, ReturnQuery, embedded_sql,
+};
 
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
@@ -119,8 +121,11 @@ fn nodes_write(nodes: &[Node]) -> Option<Write> {
                 }
                 .or_else(|| nodes_write(&repeated.statements))
             }
-            Node::Open(Open::Query { query, .. }) => statement_write(query),
+            Node::Open(Open::Query { query, .. })
+            | Node::Perform { query }
+            | Node::ReturnQuery(ReturnQuery::Query(query)) => statement_write(query),
             Node::Open(Open::Bound(_) | Open::Dynamic { .. })
+            | Node::ReturnQuery(ReturnQuery::Dynamic(_))
             | Node::Assignment(_)
             | Node::Dynamic { .. }
             | Node::Fetch(_)
@@ -131,6 +136,7 @@ fn nodes_write(nodes: &[Node]) -> Option<Write> {
             | Node::Rollback { .. }
             | Node::Exit(_)
             | Node::Return { .. }
+            | Node::ReturnNext { .. }
             | Node::Raise(_)
             | Node::Assert(_) => None,
         }

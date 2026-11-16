@@ -528,6 +528,44 @@ CREATE TRIGGER notes_revised AFTER UPDATE ON notes
 }
 
 #[test]
+fn a_write_in_the_query_a_set_returning_helper_returns_is_found() {
+    let pg = "
+CREATE TABLE notes (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL);
+CREATE TABLE note_events (id INTEGER PRIMARY KEY, note_id INTEGER NOT NULL);
+CREATE FUNCTION logged_notes(note INTEGER) RETURNS SETOF INTEGER LANGUAGE plpgsql AS $$
+BEGIN
+  RETURN NEXT 0;
+  RETURN QUERY EXECUTE 'SELECT 1';
+  RETURN QUERY WITH logged AS (
+    INSERT INTO note_events (note_id) VALUES (note) RETURNING note_id
+  ) SELECT note_id FROM logged;
+END
+$$;
+CREATE FUNCTION note_logged() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM logged_notes(NEW.id);
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER notes_logged AFTER INSERT ON notes
+  FOR EACH ROW EXECUTE FUNCTION note_logged();
+";
+    assert_eq!(left_to_server(pg), owned(&[("TRIGGER", "notes_logged", "notes")]));
+    let report = Pg2Sqlite::default()
+        .sql(pg)
+        .expect("fixture parses")
+        .translate_with_report(&replica_options())
+        .expect("fixture translates");
+    let shown = report.warnings.iter().map(ToString::to_string).collect::<Vec<_>>();
+    assert!(
+        shown.iter().any(|line| {
+            line.contains("note_logged() calls logged_notes(), which runs INSERT on note_events")
+        }),
+        "{shown:?}"
+    );
+}
+
+#[test]
 fn a_trigger_setting_its_own_row_stays() {
     let pg = "
 CREATE TABLE notes (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL);
