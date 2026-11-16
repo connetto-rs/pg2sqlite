@@ -221,6 +221,54 @@ fn a_definer_function_reading_the_role_through_a_function_it_calls_is_refused() 
     );
 }
 
+/// `authz_write`, which `app` lacks `USAGE` on and `authz_owner` holds it on,
+/// with a helper only a definer body owned by `authz_owner` reaches.
+const WRITE_SCHEMA: &str = "
+CREATE SCHEMA authz_write;
+GRANT USAGE ON SCHEMA authz_write TO authz_owner;
+CREATE FUNCTION authz_write.writer_id() RETURNS UUID LANGUAGE sql STABLE
+  SET search_path = '' AS $$ SELECT NULLIF(current_setting('app.user_id', true), '')::uuid $$;
+";
+
+#[test]
+fn a_call_in_a_definer_helper_checks_usage_as_the_helper_owner() {
+    let view = policy_view(
+        &format!(
+            "{WRITE_SCHEMA}CREATE FUNCTION authz.writer() RETURNS UUID LANGUAGE sql STABLE
+               SECURITY DEFINER SET search_path = '' AS $$ SELECT authz_write.writer_id() $$;
+             ALTER FUNCTION authz.writer() OWNER TO authz_owner;"
+        ),
+        "owner_id = authz.writer()",
+    );
+    assert!(view.contains("app_user_id()"), "the nested helper expands: {view}");
+}
+
+#[test]
+fn a_call_in_a_definer_trigger_checks_usage_as_the_trigger_owner() {
+    let script = format!(
+        "{SCHEMA}{WRITE_SCHEMA}GRANT INSERT ON notes TO app;
+         CREATE POLICY notes_select ON notes FOR SELECT TO app USING (true);
+         CREATE POLICY notes_insert ON notes FOR INSERT TO app WITH CHECK (true);
+         CREATE FUNCTION stamp_owner() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER
+           SET search_path = '' AS $$
+         BEGIN
+           IF NEW.owner_id IS DISTINCT FROM authz_write.writer_id() THEN
+             RAISE EXCEPTION 'note % belongs to someone else', NEW.id;
+           END IF;
+           RETURN NEW;
+         END
+         $$;
+         ALTER FUNCTION stamp_owner() OWNER TO authz_owner;
+         CREATE TRIGGER notes_owner BEFORE INSERT ON notes
+           FOR EACH ROW EXECUTE FUNCTION stamp_owner();"
+    );
+    let translated = helpers::translate_pg(&script, &options())
+        .unwrap_or_else(|error| panic!("refused the definer trigger: {error}"))
+        .join("\n");
+    assert!(translated.contains("app_user_id()"), "the trigger helper expands: {translated}");
+    assert!(!translated.contains("writer_id"), "the trigger keeps no call: {translated}");
+}
+
 #[test]
 fn an_aggregate_over_the_function_own_row_is_refused() {
     let error = refusal(
