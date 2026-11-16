@@ -35,12 +35,13 @@ use alloc::borrow::Cow;
 
 use sql_traits::{structs::ParserDB, traits::TableLike};
 use sqlparser::ast::{
-    AlterTable, AlterTableOperation, AlterTableType, AlterView, AlterViewOperation,
-    BeginTransactionKind, BinaryOperator, CascadeOption, ColumnDef, ColumnOption, CreateFunction,
-    CreateView, Delete, DescribeAlias, DiscardObject, DropBehavior, ExceptionWhen, Expr, FromTable,
-    Ident, Merge, ObjectName, ObjectNamePart, ObjectType, RenameTable, RenameTableNameKind, Set,
-    Statement, TransactionAccessMode, TransactionMode, TransactionModifier, TriggerEvent,
-    TriggerPeriod, Truncate, TruncateIdentityOption, UnaryOperator, VacuumStatement,
+    AlterTable, AlterTableOperation, AlterTableType, AlterType, AlterTypeOperation, AlterView,
+    AlterViewOperation, BeginTransactionKind, BinaryOperator, CascadeOption, ColumnDef,
+    ColumnOption, CreateFunction, CreateView, Delete, DescribeAlias, DiscardObject, DropBehavior,
+    ExceptionWhen, Expr, FromTable, Ident, Merge, ObjectName, ObjectNamePart, ObjectType,
+    RenameTable, RenameTableNameKind, Set, Statement, TransactionAccessMode, TransactionMode,
+    TransactionModifier, TriggerEvent, TriggerPeriod, Truncate, TruncateIdentityOption,
+    UnaryOperator, UserDefinedTypeRepresentation, VacuumStatement,
     helpers::attached_token::AttachedToken,
 };
 
@@ -329,14 +330,11 @@ fn translate_view_definition(
 /// Reason shared by the publish and subscribe statements.
 const REASON_PUB_SUB: &str = "SQLite has no channel to publish on or listen to.";
 
-/// Reason shared by type and domain definitions.
-///
-/// A column whose type is defined this way is refused at translate time because
-/// the type is not known to the crate, so the definition carries no useful
-/// information forward.
-const REASON_TYPE_DEFINITION: &str = "SQLite has no composite, enum, or domain types, and a \
-     column that uses one is refused at translation time because the crate has no storage mapping \
-     for the named type. Define the column with a built-in PostgreSQL type instead.";
+/// Reason shared by the composite and domain definitions, whose columns are
+/// refused.
+const REASON_TYPE_DEFINITION: &str = "SQLite has no composite or domain types, and a column \
+     that uses one is refused at translation time because the crate has no storage mapping for \
+     the named type. Define the column with a built-in PostgreSQL type instead.";
 
 /// Reason shared by foreign data and credential definitions.
 const REASON_FOREIGN_DATA: &str = "SQLite reads only its own database file, so it has no foreign data layer for the definition \
@@ -1760,8 +1758,15 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
                 return Err(crate::impls::shared_helpers::alter_view_as_refusal(self));
             }
             // Row-level security reads a view's owner from the schema, and the
-            // SQLite view has none to change.
-            Self::AlterView(AlterView { operation: AlterViewOperation::OwnerTo(_), .. }) => {
+            // SQLite view has none to change. A column of an enum type stores
+            // the label alone, so the type's name and labels leave nothing to
+            // emit.
+            Self::AlterView(AlterView { operation: AlterViewOperation::OwnerTo(_), .. })
+            | Self::CreateType {
+                representation: Some(UserDefinedTypeRepresentation::Enum { .. }),
+                ..
+            }
+            | Self::AlterType(AlterType { operation: AlterTypeOperation::AddValue(_), .. }) => {
                 Vec::new()
             }
             Self::AlterView(_) => {
@@ -1953,6 +1958,11 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
                  the kind can exist in the output.",
                         ));
                     }
+                    ObjectType::Type
+                        if crate::impls::enum_type::drop_type(names, *cascade, schema)? =>
+                    {
+                        Vec::new()
+                    }
                     ObjectType::Schema
                     | ObjectType::Role
                     | ObjectType::Group
@@ -2014,6 +2024,24 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
                 drop_with_warning("ALTER DEFAULT PRIVILEGES", REASON_ACCESS_CONTROL, emit)
             }
             Self::Deny { .. } => drop_with_warning("DENY", REASON_ACCESS_CONTROL, emit),
+            Self::AlterType(AlterType { name, operation: AlterTypeOperation::Rename(_) })
+                if crate::impls::enum_type::is_enum(
+                    &sqlparser::ast::DataType::Custom(name.clone(), Vec::new()),
+                    schema,
+                ) =>
+            {
+                Vec::new()
+            }
+            Self::AlterType(AlterType {
+                operation: AlterTypeOperation::RenameValue(_), ..
+            }) => {
+                return Err(reject_unsupported_statement(
+                    self,
+                    "ALTER TYPE ... RENAME VALUE has no SQLite equivalent, since a column of an \
+                     enum type stores the label's text, and the rows written before the rename \
+                     would keep the old label. Add the new label and update the rows instead.",
+                ));
+            }
             Self::CreateType { .. } => {
                 drop_with_warning("CREATE TYPE", REASON_TYPE_DEFINITION, emit)
             }

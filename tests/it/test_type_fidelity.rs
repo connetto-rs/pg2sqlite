@@ -1702,24 +1702,6 @@ fn inet_type_refusal_does_not_say_unknown() {
     );
 }
 
-#[test]
-fn enum_type_refusal_does_not_say_unknown() {
-    // mood is declared in the same batch, so calling it "unknown" is false.
-    let err = Pg2Sqlite::default()
-        .sql(
-            "CREATE TYPE mood AS ENUM ('happy', 'sad');
-              CREATE TABLE t (col mood);",
-        )
-        .expect("parse")
-        .translate(&default_opts())
-        .expect_err("enum has no SQLite form");
-    let msg = err.to_string();
-    assert!(
-        !msg.contains("Unknown PostgreSQL custom type"),
-        "enum is not an unknown type, got: {msg}"
-    );
-}
-
 // ── Missing warnings: jsonb normalisation, tsvector lexeme parsing
 // ────────────
 

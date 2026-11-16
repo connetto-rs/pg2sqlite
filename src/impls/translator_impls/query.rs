@@ -49,6 +49,9 @@ impl crate::traits::translator::TranslatorWithContext for Query {
         // subquery builds its own when its own `Query` is translated.
         reject_distinct_ordered_by_an_unselected_expression(query)?;
         reject_compound_ordered_by_an_input_expression(query)?;
+        if let Some(ordered) = crate::impls::enum_type::ordered_compound(query, schema, options)? {
+            return ordered.translate_with_warnings(schema, options, emit);
+        }
         let scope_substitute = crate::impls::shared_helpers::scope_query_for(query);
         let scope_query = scope_substitute.as_ref().unwrap_or(query);
         let scope = if scope_query.with.is_none()
@@ -759,10 +762,21 @@ fn try_translate_distinct_on_query(
         ensure_distinct_on_projection_is_rewriteable(&translated_inner.projection)?;
     let projection_aliases = projection_aliases(&translated_inner.projection)?;
 
-    let partition_by = distinct_on_exprs
-        .iter()
-        .map(|expr| expr.translate_with_warnings(args.schema, args.options, emit))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut partition_by = Vec::with_capacity(distinct_on_exprs.len());
+    for expr in distinct_on_exprs {
+        let keyed = crate::impls::interval::keys::position_key(
+            expr,
+            None,
+            false,
+            args.schema,
+            args.options,
+            emit,
+        )?;
+        partition_by.push(match keyed {
+            Some(keyed) => keyed,
+            None => expr.translate_with_warnings(args.schema, args.options, emit)?,
+        });
+    }
 
     // Two separate corrections, because the two ORDER BY positions see
     // different scopes and each was wrong in its own way.
@@ -901,7 +915,8 @@ fn alias_for_expr_in_projection(expr: &Expr, projection: &[SelectItem]) -> Optio
     })
 }
 
-/// Replaces each ORDER BY expression with its projected alias.
+/// Replaces each ORDER BY expression, or the operand of the `CASE` an enum
+/// orders by, with its projected alias.
 ///
 /// The outer query of a DISTINCT ON rewrite sees only the derived table's
 /// aliases; original column names are out of scope.
@@ -914,6 +929,10 @@ fn remap_outer_order_by_to_aliases(
         for item in exprs.iter_mut() {
             if let Some(alias) = alias_for_expr_in_projection(&item.expr, projection) {
                 item.expr = Expr::Identifier(alias);
+            } else if let Expr::Case { operand: Some(operand), .. } = &mut item.expr
+                && let Some(alias) = alias_for_expr_in_projection(operand, projection)
+            {
+                **operand = Expr::Identifier(alias);
             }
         }
     }

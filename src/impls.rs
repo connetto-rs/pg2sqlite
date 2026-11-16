@@ -6,6 +6,7 @@ pub(crate) mod datetime_helpers;
 pub(crate) mod derived_writes;
 pub(crate) mod direction_wrappers;
 pub(crate) mod emitted_namespace;
+pub(crate) mod enum_type;
 pub(crate) mod expr_helpers;
 pub(crate) mod expression_type;
 pub(crate) mod function_helpers;
