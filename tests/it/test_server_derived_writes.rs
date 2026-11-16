@@ -638,18 +638,18 @@ $$;
 CREATE TRIGGER notes_logged AFTER INSERT ON notes FOR EACH ROW EXECUTE FUNCTION log_insert();
 CREATE TRIGGER notes_checked AFTER INSERT ON notes FOR EACH ROW EXECUTE FUNCTION refuse_negative();
 ";
-    Pg2Sqlite::default()
-        .sql(pg)
-        .expect("fixture parses")
-        .translate(&Pg2SqliteOptions::default())
-        .expect_err("two AFTER INSERT triggers fire in another order on SQLite");
-
     let mut connection = replica(pg);
     let refused = diesel::insert_into(notes::table)
         .values((notes::id.eq(1), notes::revision.eq(-1)))
         .execute(&mut connection)
         .expect_err("notes_checked stays");
     assert!(refused.to_string().contains("negative revision"), "{refused}");
+    diesel::insert_into(notes::table)
+        .values((notes::id.eq(2), notes::revision.eq(1)))
+        .execute(&mut connection)
+        .expect("a valid note");
+    let logged: i64 = note_events::table.count().get_result(&mut connection).expect("count");
+    assert_eq!(logged, 0, "notes_logged is left to the server");
 }
 
 #[test]

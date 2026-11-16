@@ -78,7 +78,11 @@ fn register_spatial_index(
     }
 }
 
-fn populate_prewalk_catalogs(statements: &[Statement], context: &mut TranslationContext<'_>) {
+fn populate_prewalk_catalogs(
+    statements: &[Statement],
+    initial_schema: Option<&ParserDB>,
+    context: &mut TranslationContext<'_>,
+) {
     for statement in statements {
         register_declared_object_name(statement, context);
         if let Statement::CreateIndex(create_index) = statement {
@@ -96,57 +100,25 @@ fn populate_prewalk_catalogs(statements: &[Statement], context: &mut Translation
             }
         }
     }
-    register_trigger_conflicts(statements, context);
-}
-
-/// Marks trigger names whose (table, timing, event) key is shared by another
-/// trigger.  Uses two cheap linear passes; allocates nothing when no table
-/// carries two triggers on the same event. A trigger left to the server never
-/// fires on SQLite, so it shares no key.
-fn register_trigger_conflicts(statements: &[Statement], context: &mut TranslationContext<'_>) {
-    use alloc::collections::BTreeMap;
-
-    use sqlparser::ast::{TriggerEvent, TriggerPeriod};
-
-    let mut groups: BTreeMap<(String, u8, u8), Vec<String>> = BTreeMap::new();
-
-    for statement in statements {
-        let Statement::CreateTrigger(trigger) = statement else { continue };
-        let name = crate::impls::object_name::last_ident(&trigger.name)
-            .map(|ident| ident.value.as_str())
-            .unwrap_or_default();
-        if context.is_server_derived_trigger_name(name) {
-            continue;
-        }
-        let period: u8 = match trigger.period {
-            Some(TriggerPeriod::Before) => 0,
-            Some(TriggerPeriod::After) => 1,
-            _ => continue,
-        };
-        let table = crate::impls::object_name::last_ident(&trigger.table_name)
-            .map(|ident| ident.value.to_lowercase())
-            .unwrap_or_default();
-        let name = name.to_owned();
-        for event in &trigger.events {
-            let event_kind: u8 = match event {
-                TriggerEvent::Insert => 0,
-                TriggerEvent::Update(_) => 1,
-                TriggerEvent::Delete => 2,
-                TriggerEvent::Truncate => continue,
-            };
-            groups.entry((table.clone(), period, event_kind)).or_default().push(name.clone());
-        }
-    }
-    for names in groups.values().filter(|v| v.len() >= 2) {
-        for name in names {
-            context.add_conflicting_trigger_name(name);
-        }
-    }
+    let initial_triggers = initial_schema.into_iter().flat_map(|schema| {
+        use sql_traits::traits::DatabaseLike;
+        schema.triggers()
+    });
+    // A trigger left to the server never fires on SQLite, so it shares no slot.
+    let shared = crate::impls::translator_impls::trigger_slots::shared_slot_triggers(
+        initial_triggers,
+        statements,
+        |trigger| {
+            !crate::impls::object_name::last_ident(&trigger.name)
+                .is_some_and(|name| context.is_server_derived_trigger_name(&name.value))
+        },
+    );
+    context.set_shared_slot_triggers(shared);
 }
 
 /// Registers every trigger the replica leaves to the server, each read against
-/// the schema of its own epoch, so a trigger it keeps is not refused for a
-/// firing order shared only with one that never reaches SQLite, and a
+/// the schema of its own epoch, so a trigger it keeps shares no slot with one
+/// that never reaches SQLite, and a
 /// `DROP TRIGGER` of one left out drops nothing. A trigger whose writes cannot
 /// be read counts as kept, and its translation reports why.
 fn register_server_derived_triggers(
@@ -331,6 +303,9 @@ struct PreparedStatements<'a> {
     schema: ParserDB,
     options: Pg2SqliteOptions,
     statements: Vec<Vec<Statement>>,
+    /// Whether each statement's emitted triggers were rebuilt from other
+    /// statements' triggers sharing their slots.
+    rebuilt_triggers: Vec<bool>,
     /// Tables the translation adds before the source's statements.
     prelude: Vec<Statement>,
     warnings: Vec<crate::warnings::TranslationWarning>,
@@ -795,10 +770,15 @@ impl Pg2Sqlite {
         } = prepared;
         let statements = &*sources;
         register_server_derived_triggers(statements, &epochs, context);
-        populate_prewalk_catalogs(statements, context);
+        populate_prewalk_catalogs(statements, initial_schema.as_ref(), context);
+        let mut trigger_slots =
+            crate::impls::translator_impls::trigger_slots::TriggerSlots::seeded(
+                initial_schema.as_ref(),
+            )?;
 
         let mut warnings = Vec::new();
         let mut translated = Vec::with_capacity(statements.len());
+        let mut rebuilt_triggers = Vec::with_capacity(statements.len());
         for epoch in &epochs {
             populate_spatial_index_catalog(
                 &statements[epoch.start..epoch.end],
@@ -807,6 +787,7 @@ impl Pg2Sqlite {
             );
             for (offset, statement) in statements[epoch.start..epoch.end].iter().enumerate() {
                 context.follow_triggers(statement);
+                rebuilt_triggers.push(false);
                 if !should_translate(statement) {
                     translated.push(Vec::new());
                     continue;
@@ -824,11 +805,20 @@ impl Pg2Sqlite {
                         translated.push(Vec::new());
                     }
                     crate::impls::transaction_blocks::Disposition::Translate => {
-                        translated.push(statement.translate_with_warnings(
+                        let written =
+                            context.with_written_schema(epoch.written(epoch.start + offset));
+                        let mut emitted = statement.translate_with_warnings(
                             &epoch.schema,
-                            &context.with_written_schema(epoch.written(epoch.start + offset)),
+                            &written,
                             &mut emit,
-                        )?);
+                        )?;
+                        rebuilt_triggers[epoch.start + offset] = trigger_slots.apply(
+                            statement,
+                            &mut emitted,
+                            &epoch.schema,
+                            &written,
+                        )?;
+                        translated.push(emitted);
                     }
                 }
             }
@@ -859,6 +849,7 @@ impl Pg2Sqlite {
             schema,
             options,
             statements: translated,
+            rebuilt_triggers,
             prelude: prelude.into_iter().map(|(_, statement)| statement).collect(),
             warnings,
             epochs,
@@ -878,6 +869,7 @@ impl Pg2Sqlite {
             schema,
             options: _,
             mut statements,
+            rebuilt_triggers,
             prelude,
             mut warnings,
             epochs,
@@ -895,6 +887,7 @@ impl Pg2Sqlite {
                     source: &sources[index],
                     binding,
                     emitted: &statements[index],
+                    rebuilt_trigger: rebuilt_triggers[index],
                     disposition: &dispositions[index],
                 }
             })

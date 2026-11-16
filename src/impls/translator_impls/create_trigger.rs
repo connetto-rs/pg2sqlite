@@ -13,6 +13,7 @@ use sqlparser::{
     tokenizer::Span,
 };
 
+use super::trigger_slots;
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
 use crate::{
@@ -252,19 +253,70 @@ fn route_trigger_statement_writes(
     Ok(())
 }
 
+/// Replaces the fields of the row an event lacks, `OLD` on INSERT and `NEW`
+/// on DELETE, by the NULL PostgreSQL reads there, so the `TG_OP` fold prunes
+/// the branches they guard.
+fn null_absent_row_fields(
+    body: &mut sqlparser::ast::BeginEndStatements,
+    events: &[sqlparser::ast::TriggerEvent],
+) {
+    let absent = match events {
+        [TriggerEvent::Insert] => "OLD",
+        [TriggerEvent::Delete] => "NEW",
+        _ => return,
+    };
+    for statement in &mut body.statements {
+        let _: core::ops::ControlFlow<()> =
+            sqlparser::ast::visit_expressions_mut(statement, |expr| {
+                if let Expr::CompoundIdentifier(parts) = expr
+                    && let [row, _] = parts.as_slice()
+                    && row.value.eq_ignore_ascii_case(absent)
+                {
+                    *expr = Expr::Value(ValueWithSpan { value: Value::Null, span: Span::empty() });
+                }
+                core::ops::ControlFlow::Continue(())
+            });
+    }
+}
+
+/// The SQLite trigger one source trigger contributes for some of its events.
+struct TriggerPart<'a> {
+    events: &'a [TriggerEvent],
+    /// A `WHEN` condition moved into the body, guarding every statement.
+    guard: Option<&'a Expr>,
+    /// Whether the body ends at its first top-level `RETURN`, whose value
+    /// PostgreSQL ignores after the write and whose `RAISE(IGNORE)` would
+    /// abandon the row's later SQLite trigger programs.
+    after: bool,
+}
+
+/// Translates the trigger function's body into the shape `part` asks for.
 fn generate_standard_trigger_body(
     exec_body: &sqlparser::ast::TriggerExecBody,
-    events: &[sqlparser::ast::TriggerEvent],
+    part: &TriggerPart<'_>,
     table_name: &sqlparser::ast::ObjectName,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Option<sqlparser::ast::BeginEndStatements>, crate::errors::Error> {
     let function_name = &exec_body.func_desc.name;
+    let events = part.events;
     if let Some((mut body, mut context)) = schema.function_body_with_context(function_name)? {
+        if let Some(guard) = part.guard {
+            context.push_condition(guard.to_string());
+        }
         if let Some(rebound) = options.rebound_body() {
             body.clone_from(rebound);
         }
+        if part.after
+            && let Some(end) = body
+                .statements
+                .iter()
+                .position(|statement| matches!(statement, Statement::Return(_)))
+        {
+            body.statements.truncate(end);
+        }
+        null_absent_row_fields(&mut body, events);
         // Seed trigger-specific context so the body translator can
         // constant-fold TG_OP and TG_TABLE_NAME references.
         context.trigger_events = events
@@ -515,8 +567,22 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
         if let Some(table) = resolved_table {
             trigger_for_helpers.table_name = table.name.clone();
         }
+        let is_maintenance_trigger =
+            can_use_trigger_traits && trigger_for_helpers.is_maintenance_trigger(schema)?;
+        // Checked on the trigger as written, before the split below renames
+        // its halves.
+        let shares_slot = options.shares_trigger_slot(&trigger_slots::trigger_key(self));
+        if shares_slot && is_maintenance_trigger {
+            return Err(crate::errors::Error::forward_refusal(format!(
+                "row trigger `{}` assigns to NEW, and another row trigger on table `{}` fires \
+                 on the same event and timing. pg2sqlite runs a trigger assigning NEW as an \
+                 AFTER trigger that updates the row, which cannot keep PostgreSQL's name order \
+                 among the triggers sharing that event.",
+                self.name, self.table_name
+            )));
+        }
 
-        if can_use_trigger_traits
+        if is_maintenance_trigger
             && let Some((insert_trigger, non_insert_trigger)) =
                 split_before_insert_maintenance_trigger(&trigger_for_helpers, schema)
         {
@@ -564,44 +630,36 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
             )));
         }
 
-        let mut period = period;
-        let is_maintenance_trigger =
-            can_use_trigger_traits && trigger_for_helpers.is_maintenance_trigger(schema)?;
-
-        if !is_maintenance_trigger {
-            let self_name = crate::impls::object_name::last_ident(&self.name)
-                .map_or("", |ident| ident.value.as_str());
-            if options.is_conflicting_trigger_name(self_name) {
-                let table = crate::impls::object_name::last_ident(&trigger_for_helpers.table_name)
-                    .map_or("?", |ident| ident.value.as_str());
-                return Err(crate::errors::Error::forward_refusal(format!(
-                    "multiple BEFORE/AFTER row triggers share the same event and timing on \
-                     table `{table}`: PostgreSQL fires them in name order but SQLite fires \
-                     in reverse creation order. Merge the trigger bodies into a single trigger."
-                )));
-            }
+        if or_alter {
+            return Err(crate::errors::Error::unsupported_source_syntax(
+                "Triggers with `OR ALTER` are not supported",
+            ));
+        }
+        if is_constraint {
+            return Err(crate::errors::Error::unsupported_source_syntax(
+                "Constraint triggers are not supported",
+            ));
+        }
+        if let Some(characteristics) = &characteristics {
+            return Err(crate::errors::Error::unsupported_source_syntax(format!(
+                "Triggers with characteristics are not supported: `{characteristics}`"
+            )));
         }
 
+        let mut period = period;
         let maintenance_insert_event =
             is_maintenance_trigger && maintenance_trigger_has_insert_event(&events);
         let maintenance_update_event =
             is_maintenance_trigger && events.iter().any(|e| matches!(e, TriggerEvent::Update(_)));
-        if maintenance_insert_event && matches!(period, Some(TriggerPeriod::Before)) {
-            // Row does not exist yet in BEFORE INSERT; AFTER preserves
-            // final-row semantics.
-            period = Some(TriggerPeriod::After);
-        }
-        // BEFORE UPDATE maintenance triggers are overwritten by the original
-        // UPDATE; AFTER ensures the maintenance write is the last
-        // write.
-        if maintenance_update_event && matches!(period, Some(TriggerPeriod::Before)) {
+        // BEFORE INSERT has no row to update yet, and the UPDATE itself
+        // overwrites a BEFORE UPDATE write.
+        if (maintenance_insert_event || maintenance_update_event)
+            && matches!(period, Some(TriggerPeriod::Before))
+        {
             period = Some(TriggerPeriod::After);
         }
 
-        // For BEFORE/AFTER triggers on RLS-protected tables, redirect to the
-        // underlying _rls table. INSTEAD OF triggers are used on the
-        // view, but BEFORE/AFTER triggers must target the actual table
-        // (which has been renamed to table_rls).
+        // BEFORE/AFTER triggers on an RLS table belong on its backing table.
         let redirected_source_table_name =
             if matches!(period, Some(TriggerPeriod::Before | TriggerPeriod::After)) {
                 if names_table_with_backing(schema, &source_table_name, options)? {
@@ -617,42 +675,37 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
             &redirected_source_table_name,
         )?;
 
-        let function_body = if is_maintenance_trigger {
-            let row_context = if maintenance_insert_event { "NEW" } else { "OLD" };
-            generate_maintenance_trigger_body(
-                &trigger_for_helpers,
-                &redirected_table_name,
-                row_context,
-                schema,
-                options,
-                emit,
-            )?
-        } else if let Some(body) = generate_standard_trigger_body(
-            &exec_body,
-            &events,
-            &redirected_table_name,
-            schema,
-            options,
-            emit,
-        )? {
-            body
+        let plain = !is_maintenance_trigger
+            && matches!(period, Some(TriggerPeriod::Before | TriggerPeriod::After));
+        let translated_cond = condition
+            .as_ref()
+            .map(|cond| cond.translate_with_warnings(schema, options, emit))
+            .transpose()?;
+        // A shared slot runs several members in one SQLite trigger, so each
+        // keeps its WHEN inside its own body.
+        let (in_body_guard, translated_condition) = if plain && shares_slot {
+            (translated_cond, None)
         } else {
-            return Err(crate::errors::Error::forward_refusal(format!(
-                "Trigger function '{}' body not found. Make sure the CREATE FUNCTION statement \
-                 is included in the same translation batch as the CREATE TRIGGER.",
-                exec_body.func_desc.name
-            )));
+            let recursion_guard = (is_maintenance_trigger && maintenance_update_event)
+                .then(|| {
+                    build_maintenance_recursion_when_clause(
+                        &trigger_for_helpers,
+                        schema,
+                        options,
+                        emit,
+                    )
+                })
+                .flatten();
+            (None, merge_conditions(translated_cond, recursion_guard))
         };
 
-        // SQLite requires at least one statement between BEGIN and END, so an
-        // emptied body is `near "END": syntax error` rather than a trigger that
-        // does nothing. Substituting `SELECT NULL` keeps the trigger object in
-        // place, which skipping the statement would not: a later DROP TRIGGER
-        // would find nothing, and a CREATE OR REPLACE could not emit its DROP
-        // at all, since this returns pairs in which the CREATE is not optional.
-        let function_body = substitute_no_op_body_when_empty(function_body, emit);
-
-        let maybe_drop_trigger = or_replace.then(|| {
+        // SQLite takes one event per trigger.
+        let part_events: Vec<Vec<TriggerEvent>> = if plain {
+            events.iter().map(|event| vec![event.clone()]).collect()
+        } else {
+            vec![events.clone()]
+        };
+        let mut maybe_drop_trigger = or_replace.then(|| {
             DropTrigger {
                 if_exists: true,
                 trigger_name: name.clone(),
@@ -660,64 +713,114 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
                 option: None,
             }
         });
-
-        if or_alter {
-            return Err(crate::errors::Error::unsupported_source_syntax(
-                "Triggers with `OR ALTER` are not supported",
-            ));
-        }
-
-        if is_constraint {
-            return Err(crate::errors::Error::unsupported_source_syntax(
-                "Constraint triggers are not supported",
-            ));
-        }
-
-        if let Some(characteristics) = &characteristics {
-            return Err(crate::errors::Error::unsupported_source_syntax(format!(
-                "Triggers with characteristics are not supported: `{characteristics}`"
-            )));
-        }
-
-        Ok(vec![(
-            maybe_drop_trigger,
-            CreateTrigger {
-                or_alter,
-                temporary,
-                or_replace: false,
-                is_constraint,
-                name,
-                period,
-                events,
-                table_name: redirected_table_name,
-                referenced_table_name,
-                referencing,
-                trigger_object,
-                period_before_table,
-                statements_as,
-                condition: {
-                    let translated_cond = condition
-                        .as_ref()
-                        .map(|cond| cond.translate_with_warnings(schema, options, emit))
-                        .transpose()?;
-                    let recursion_guard = (is_maintenance_trigger && maintenance_update_event)
-                        .then(|| {
-                            build_maintenance_recursion_when_clause(
-                                &trigger_for_helpers,
-                                schema,
-                                options,
-                                emit,
-                            )
-                        })
-                        .flatten();
-                    merge_conditions(translated_cond, recursion_guard)
+        let mut parts = Vec::with_capacity(part_events.len());
+        for part_events in part_events {
+            let function_body = if is_maintenance_trigger {
+                let row_context = if maintenance_insert_event { "NEW" } else { "OLD" };
+                generate_maintenance_trigger_body(
+                    &trigger_for_helpers,
+                    &redirected_table_name,
+                    row_context,
+                    schema,
+                    options,
+                    emit,
+                )?
+            } else if let Some(body) = generate_standard_trigger_body(
+                &exec_body,
+                &TriggerPart {
+                    events: &part_events,
+                    guard: in_body_guard.as_ref(),
+                    after: plain && matches!(period, Some(TriggerPeriod::After)),
                 },
-                exec_body: None,
-                statements: Some(ConditionalStatements::BeginEnd(function_body)),
-                characteristics: None,
-            },
-        )])
+                &redirected_table_name,
+                schema,
+                options,
+                emit,
+            )? {
+                body
+            } else {
+                return Err(crate::errors::Error::forward_refusal(format!(
+                    "Trigger function '{}' body not found. Make sure the CREATE FUNCTION \
+                     statement is included in the same translation batch as the CREATE TRIGGER.",
+                    exec_body.func_desc.name
+                )));
+            };
+            if plain
+                && shares_slot
+                && matches!(period, Some(TriggerPeriod::After))
+                && function_body.statements.iter().any(super::definer::ignores_the_write)
+            {
+                return Err(crate::errors::Error::forward_refusal(format!(
+                    "row trigger `{}` returns early from an AFTER trigger function under a \
+                     condition, and another row trigger on table `{}` fires on the same event. \
+                     SQLite can only end the shared trigger, which would skip the triggers \
+                     PostgreSQL fires after it.",
+                    self.name, self.table_name
+                )));
+            }
+            // SQLite rejects an empty BEGIN END, and dropping the trigger would
+            // orphan a later DROP TRIGGER.
+            let function_body = substitute_no_op_body_when_empty(function_body, emit);
+            let part_name = match part_events.as_slice() {
+                [event] if plain => trigger_slots::part_name(self, event),
+                _ => name.clone(),
+            };
+            parts.push((
+                maybe_drop_trigger.take(),
+                CreateTrigger {
+                    or_alter,
+                    temporary,
+                    or_replace: false,
+                    is_constraint,
+                    name: part_name,
+                    period,
+                    events: part_events,
+                    table_name: redirected_table_name.clone(),
+                    referenced_table_name: referenced_table_name.clone(),
+                    referencing: referencing.clone(),
+                    trigger_object,
+                    period_before_table,
+                    statements_as,
+                    condition: translated_condition.clone(),
+                    exec_body: None,
+                    statements: Some(ConditionalStatements::BeginEnd(function_body)),
+                    characteristics: None,
+                },
+            ));
+        }
+        Ok(parts)
     }
+}
+
+/// Whether `trigger` is a row trigger firing before or after the write whose
+/// SQLite form is its own body, the kind several of which share one SQLite
+/// trigger per event.
+///
+/// # Errors
+///
+/// Returns an error when the trigger's table or function does not resolve.
+pub(crate) fn is_plain_row_trigger(
+    trigger: &CreateTrigger,
+    schema: &ParserDB,
+) -> Result<bool, crate::errors::Error> {
+    if trigger.is_constraint
+        || !matches!(trigger.period, Some(TriggerPeriod::Before | TriggerPeriod::After))
+        || !matches!(
+            trigger.trigger_object,
+            Some(
+                TriggerObjectKind::For(TriggerObject::Row)
+                    | TriggerObjectKind::ForEach(TriggerObject::Row)
+            )
+        )
+    {
+        return Ok(false);
+    }
+    let Some(table) = resolve_translation_table(schema, &trigger.table_name)? else {
+        return Ok(true);
+    };
+    let mut registered = trigger.clone();
+    registered.table_name = table.name.clone();
+    Ok(!registered.is_maintenance_trigger(schema)?)
 }
 
 #[cfg(all(test, feature = "std"))]

@@ -1,9 +1,9 @@
 #![allow(missing_docs)]
 //! Finding 1: maintenance trigger must fire when the user updates the
 //! maintenance column itself and must not recurse.
-//! Finding 6: multiple non-maintenance BEFORE/AFTER triggers with the same
-//! event/timing are refused (PostgreSQL: name order; SQLite: reverse creation
-//! order — no faithful emission exists).
+//! Finding 6: non-maintenance BEFORE/AFTER triggers sharing an event and
+//! timing fire in PostgreSQL's name order, and the constructs that cannot
+//! share one SQLite trigger are refused by name.
 
 use diesel::{Connection, RunQueryDsl, SqliteConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
@@ -112,20 +112,96 @@ fn single_trigger_per_event_still_translates() {
         .expect("single trigger translates");
 }
 
-/// Three BEFORE INSERT triggers on one table: PostgreSQL fires in name order,
-/// SQLite in reverse creation order — refuse because no faithful form exists.
+diesel::table! {
+    trg3_log (seq) {
+        seq -> Integer,
+        marker -> Text,
+    }
+}
+
+/// PostgreSQL fires the three BEFORE INSERT triggers in name order, whatever
+/// order they were created in.
 #[test]
-fn multiple_standard_triggers_same_event_timing_refused() {
-    let err = Pg2Sqlite::default()
-        .sql(FIRING_ORDER_SCHEMA)
+fn standard_triggers_sharing_an_event_fire_in_name_order() {
+    let mut conn = apply_schema(FIRING_ORDER_SCHEMA);
+    diesel::sql_query("INSERT INTO trg3 (id) VALUES (1)").execute(&mut conn).expect("insert");
+    let markers: Vec<String> = trg3_log::table
+        .select(trg3_log::marker)
+        .order(trg3_log::seq.asc())
+        .load(&mut conn)
+        .expect("read log");
+    assert_eq!(markers, ["a", "m", "b"]);
+}
+
+fn refusal(sql: &str) -> String {
+    Pg2Sqlite::default()
+        .sql(sql)
         .expect("parse")
         .translate_to_sql(&Pg2SqliteOptions::default())
-        .expect_err("three BEFORE INSERT triggers must be refused");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("creation order")
-            || msg.contains("name order")
-            || msg.contains("firing order"),
-        "refusal must name the ordering divergence; got: {msg}"
-    );
+        .expect_err("must be refused")
+        .to_string()
+}
+
+const LOGGING_FUNCTIONS: &str = "
+    CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT);
+    CREATE TABLE t_log (seq SERIAL PRIMARY KEY, marker TEXT);
+    CREATE FUNCTION log_one() RETURNS trigger AS $$
+    BEGIN INSERT INTO t_log (marker) VALUES ('one'); RETURN NULL; END;
+    $$ LANGUAGE plpgsql;
+    CREATE FUNCTION log_two() RETURNS trigger AS $$
+    BEGIN INSERT INTO t_log (marker) VALUES ('two'); RETURN NULL; END;
+    $$ LANGUAGE plpgsql;
+";
+
+/// A SQLite trigger cannot tell which columns an UPDATE named, so one merged
+/// trigger cannot keep two different UPDATE OF lists.
+#[test]
+fn shared_update_triggers_with_different_columns_refused() {
+    let message = refusal(&format!(
+        "{LOGGING_FUNCTIONS}
+         CREATE TRIGGER t_one AFTER UPDATE OF a ON t FOR EACH ROW EXECUTE FUNCTION log_one();
+         CREATE TRIGGER t_two AFTER UPDATE OF b ON t FOR EACH ROW EXECUTE FUNCTION log_two();"
+    ));
+    assert!(message.contains("UPDATE OF"), "got: {message}");
+}
+
+/// A trigger assigning NEW runs as an AFTER UPDATE of the row, which cannot
+/// keep its place among the other triggers on its event.
+#[test]
+fn shared_maintenance_trigger_refused() {
+    let message = refusal(&format!(
+        "{BUMP_TAG_SCHEMA}
+         CREATE FUNCTION log_mut() RETURNS trigger AS $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql;
+         CREATE TRIGGER mut_log BEFORE UPDATE ON mut FOR EACH ROW EXECUTE FUNCTION log_mut();"
+    ));
+    assert!(message.contains("assigns to NEW"), "got: {message}");
+}
+
+/// A conditional RETURN in an AFTER trigger ends the SQLite trigger, which
+/// would skip the members after it.
+#[test]
+fn shared_after_trigger_with_conditional_return_refused() {
+    let message = refusal(&format!(
+        "{LOGGING_FUNCTIONS}
+         CREATE FUNCTION log_unless_a() RETURNS trigger AS $$
+         BEGIN
+             IF NEW.a IS NULL THEN RETURN NULL; END IF;
+             INSERT INTO t_log (marker) VALUES ('a');
+             RETURN NULL;
+         END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER t_one AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION log_unless_a();
+         CREATE TRIGGER t_two AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION log_two();"
+    ));
+    assert!(message.contains("returns early"), "got: {message}");
+}
+
+#[test]
+fn constraint_trigger_refused() {
+    let message = refusal(&format!(
+        "{LOGGING_FUNCTIONS}
+         CREATE CONSTRAINT TRIGGER t_one AFTER UPDATE ON t DEFERRABLE INITIALLY DEFERRED
+             FOR EACH ROW EXECUTE FUNCTION log_one();"
+    ));
+    assert!(message.contains("Constraint triggers"), "got: {message}");
 }

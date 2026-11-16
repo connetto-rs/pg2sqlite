@@ -85,41 +85,10 @@ fn char_column_length_check_is_enforced() {
     assert!(err.to_string().contains("CHECK"), "rejection must come from CHECK, got: {err}");
 }
 
-// ── options.rs:444 — duplicate trigger name guard
-// ─────────────────────────────
-
-/// A trigger with both INSERT and UPDATE events appears in two conflict groups
-/// during the pre-walk.  `add_conflicting_trigger_name` is called twice per
-/// trigger name; the guard at options.rs:444 ensures the name is not added a
-/// second time.  Observable: refusal cites "multiple BEFORE/AFTER" (the
-/// conflict message), not an internal duplication error.
+/// PostgreSQL allows TRUNCATE triggers only FOR EACH STATEMENT, and SQLite
+/// has neither, so the refusal names TRUNCATE.
 #[test]
-fn conflicting_trigger_name_not_added_twice() {
-    let err = Pg2Sqlite::default()
-        .sql(
-            "CREATE TABLE t (id INT PRIMARY KEY);
-             CREATE FUNCTION f1() RETURNS trigger AS $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql;
-             CREATE FUNCTION f2() RETURNS trigger AS $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql;
-             CREATE TRIGGER t1 BEFORE INSERT OR UPDATE ON t FOR EACH ROW EXECUTE FUNCTION f1();
-             CREATE TRIGGER t2 BEFORE INSERT OR UPDATE ON t FOR EACH ROW EXECUTE FUNCTION f2();",
-        )
-        .expect("parse")
-        .translate(&Pg2SqliteOptions::default())
-        .expect_err("conflicting triggers must be refused");
-    assert!(
-        err.to_string().contains("multiple BEFORE/AFTER"),
-        "expected conflict refusal, got: {err}"
-    );
-}
-
-// ── pg2sqlite.rs:136 — TriggerEvent::Truncate skipped in conflict detection ──
-
-/// Two BEFORE TRUNCATE triggers on the same table are NOT counted as
-/// conflicting (pg2sqlite.rs:136 skips TRUNCATE events in the loop).
-/// Both are refused as "TRUNCATE trigger has no SQLite equivalent", not as
-/// "multiple BEFORE/AFTER triggers".
-#[test]
-fn truncate_trigger_refused_not_as_conflicting() {
+fn truncate_trigger_refused() {
     let err = Pg2Sqlite::default()
         .sql(
             "CREATE TABLE t (id INT PRIMARY KEY);
@@ -133,37 +102,4 @@ fn truncate_trigger_refused_not_as_conflicting() {
         .expect_err("TRUNCATE triggers must be refused");
     let msg = err.to_string();
     assert!(msg.contains("TRUNCATE"), "refusal must mention TRUNCATE, got: {msg}");
-    assert!(
-        !msg.contains("multiple BEFORE/AFTER"),
-        "TRUNCATE events must not count toward conflict detection, got: {msg}"
-    );
-}
-
-// ── pg2sqlite.rs:123 — INSTEAD OF period skipped in conflict detection
-// ────────
-
-/// An INSTEAD OF trigger has period = InsteadOf, which is excluded from
-/// conflict detection at pg2sqlite.rs:123.  Even two INSTEAD OF INSERT
-/// triggers on the same view must not be refused as "multiple BEFORE/AFTER".
-#[test]
-fn instead_of_trigger_not_refused_as_conflicting() {
-    let result = Pg2Sqlite::default()
-        .sql(
-            "CREATE VIEW v AS SELECT 1 AS id;
-             CREATE FUNCTION f1() RETURNS trigger AS $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql;
-             CREATE FUNCTION f2() RETURNS trigger AS $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql;
-             CREATE TRIGGER t1 INSTEAD OF INSERT ON v FOR EACH ROW EXECUTE FUNCTION f1();
-             CREATE TRIGGER t2 INSTEAD OF INSERT ON v FOR EACH ROW EXECUTE FUNCTION f2();",
-        )
-        .expect("parse")
-        .translate(&Pg2SqliteOptions::default())
-        .map(pg2sqlite::script::Script::into_vec);
-    // The triggers may fail for other reasons but MUST NOT be flagged as
-    // "multiple BEFORE/AFTER" since INSTEAD OF is excluded from the counter.
-    if let Err(ref e) = result {
-        assert!(
-            !e.to_string().contains("multiple BEFORE/AFTER"),
-            "INSTEAD OF triggers must not be counted as BEFORE/AFTER conflicts, got: {e}"
-        );
-    }
 }

@@ -193,12 +193,13 @@ pub(crate) struct PrewalkCatalogs {
     fts_indexes: Vec<(String, String)>,
     declared_object_names: Vec<String>,
     trigger_function_names: Vec<String>,
-    /// Trigger names sharing a table, timing and event with another
-    /// non-split trigger, which `CreateTrigger` translation refuses.
-    conflicting_trigger_names: Vec<String>,
     /// The names of the triggers left to the server, whose `DROP TRIGGER`
     /// finds nothing on the replica.
     server_derived_trigger_names: Vec<String>,
+    /// The folded table and trigger names of the row triggers sharing a
+    /// table, timing and event with another, whose `WHEN` moves into the body
+    /// so the slot can run them as one SQLite trigger.
+    shared_slot_triggers: alloc::collections::BTreeSet<(String, String)>,
     /// The table name, lower-cased, and the function name of every `BEFORE
     /// INSERT` trigger, which the RLS backing-table update check reads to
     /// exempt the crate's own maintenance write. Only those two strings are
@@ -702,20 +703,20 @@ impl<'a> TranslationContext<'a> {
         self.catalogs.trigger_function_names.contains(&name)
     }
 
-    /// Registers `name` as a trigger whose firing order cannot be faithfully
-    /// reproduced in SQLite.
-    pub(crate) fn add_conflicting_trigger_name(&mut self, name: impl Into<String>) {
-        let name = name.into();
-        if !self.catalogs.conflicting_trigger_names.contains(&name) {
-            self.catalogs.to_mut().conflicting_trigger_names.push(name);
-        }
+    /// Records the row triggers sharing a slot with another, by folded table
+    /// and trigger name.
+    pub(crate) fn set_shared_slot_triggers(
+        &mut self,
+        triggers: alloc::collections::BTreeSet<(String, String)>,
+    ) {
+        self.catalogs.to_mut().shared_slot_triggers = triggers;
     }
 
-    /// Returns whether `name` was identified as a conflicting trigger during
-    /// the pre-walk.
+    /// Returns whether the row trigger keyed by folded `table` and `name`
+    /// shares its table, timing and event with another.
     #[must_use]
-    pub(crate) fn is_conflicting_trigger_name(&self, name: &str) -> bool {
-        self.catalogs.conflicting_trigger_names.iter().any(|n| n == name)
+    pub(crate) fn shares_trigger_slot(&self, key: &(String, String)) -> bool {
+        self.catalogs.shared_slot_triggers.contains(key)
     }
 
     /// Registers `name` as a trigger the replica leaves to the server.
