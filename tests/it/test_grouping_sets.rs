@@ -15,6 +15,12 @@ struct AggregateRow {
     total: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, QueryableByName)]
+struct RegionRow {
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    region: Option<String>,
+}
+
 fn sales_fixture_sql() -> &'static str {
     "
     CREATE TABLE sales (
@@ -227,6 +233,42 @@ fn rollup_with_prefix_group_key_semantic() -> Result<(), Box<dyn std::error::Err
 
     assert_eq!(rows, expected);
     Ok(())
+}
+
+/// Answers the sorted rows of emitted `select` over the sales fixture.
+fn sorted_region_rows(select: &str) -> Vec<RegionRow> {
+    let sql = format!("{}\n{select}", sales_fixture_sql());
+    let options = Pg2SqliteOptions::default();
+    let stmts = helpers::translate_pg(&sql, &options).unwrap();
+    let query = helpers::user_statement_of(&stmts, "SELECT").clone();
+    let mut conn = helpers::apply_ddl(&stmts);
+    load_sales_data(&mut conn).unwrap();
+    let mut rows = diesel::sql_query(&query)
+        .load::<RegionRow>(&mut conn)
+        .unwrap_or_else(|error| panic!("{query}: {error}"));
+    rows.sort();
+    rows
+}
+
+#[test]
+fn rollup_without_an_aggregate_answers_one_grand_total_row() {
+    let rows = sorted_region_rows("SELECT region FROM sales GROUP BY ROLLUP (region);");
+    assert_eq!(
+        rows,
+        vec![
+            RegionRow { region: None },
+            RegionRow { region: Some("North".to_string()) },
+            RegionRow { region: Some("South".to_string()) },
+        ]
+    );
+}
+
+#[test]
+fn empty_grouping_set_without_an_aggregate_answers_one_row_over_empty_input() {
+    let rows = sorted_region_rows(
+        "SELECT region FROM sales WHERE amount > 1000 GROUP BY GROUPING SETS ((region), ());",
+    );
+    assert_eq!(rows, vec![RegionRow { region: None }]);
 }
 
 #[test]
