@@ -1,0 +1,553 @@
+//! A replica that syncs its writes to PostgreSQL leaves out the writes the
+//! server derives, under `with_server_derived_writes_omitted`.
+//!
+//! The replica uploads every row its transaction changed, and the server runs
+//! its own triggers and cascades while applying the upload. A row a translated
+//! trigger or cascade derived on the replica therefore reaches the server
+//! twice, once uploaded and once derived again, and the server refuses the
+//! duplicate insert or finds the row it would delete already gone.
+
+use diesel::{connection::SimpleConnection, prelude::*};
+use pg2sqlite::{
+    prelude::{Pg2Sqlite, Pg2SqliteOptions},
+    warnings::TranslationWarning,
+};
+
+use crate::helpers::establish_connection;
+
+diesel::table! {
+    /// The organizations of the reproduction.
+    organizations (id) {
+        /// The organization.
+        id -> Integer,
+    }
+}
+
+diesel::table! {
+    /// Who belongs to which organization.
+    memberships (organization_id, user_id) {
+        /// The organization.
+        organization_id -> Integer,
+        /// The member.
+        user_id -> Integer,
+    }
+}
+
+diesel::table! {
+    /// The teams a member sits in, removed with the membership.
+    team_members (team_id, user_id) {
+        /// The team.
+        team_id -> Integer,
+        /// The organization of the membership.
+        organization_id -> Integer,
+        /// The member.
+        user_id -> Integer,
+    }
+}
+
+diesel::table! {
+    /// The roles granted to a member, removed with the membership.
+    grants (organization_id, user_id) {
+        /// The organization.
+        organization_id -> Integer,
+        /// The member.
+        user_id -> Integer,
+        /// The role granted.
+        role -> Text,
+    }
+}
+
+diesel::table! {
+    /// The audit rows the server writes for each membership.
+    audit_events (id) {
+        /// The event.
+        id -> Integer,
+        /// The table the event happened on.
+        table_name -> Text,
+    }
+}
+
+diesel::table! {
+    /// The notes of the helper fixtures.
+    notes (id) {
+        /// The note.
+        id -> Integer,
+        /// How often the note was changed.
+        revision -> Integer,
+    }
+}
+
+diesel::table! {
+    /// What the helpers record for each note.
+    note_events (id) {
+        /// The event.
+        id -> Integer,
+        /// The note the event concerns.
+        note_id -> Integer,
+    }
+}
+
+diesel::table! {
+    /// A view over the notes written through an `INSTEAD OF` trigger.
+    fresh_notes (id) {
+        /// The note.
+        id -> Integer,
+    }
+}
+
+diesel::table! {
+    /// The parent of the referential-action fixtures.
+    folders (id) {
+        /// The folder.
+        id -> Integer,
+    }
+}
+
+diesel::table! {
+    /// The child of the referential-action fixtures.
+    documents (id) {
+        /// The document.
+        id -> Integer,
+        /// The folder the document sits in, set to NULL by the server.
+        folder_id -> Nullable<Integer>,
+        /// The folder the document was created in, a plain key.
+        origin_id -> Integer,
+    }
+}
+
+/// The schema of the request: a membership whose delete removes its grants
+/// through a trigger and its team memberships through a cascade, an audit
+/// trigger inserting a row per membership, and a trigger that only refuses.
+const MEMBERSHIPS: &str = "
+CREATE TABLE organizations (id INTEGER PRIMARY KEY);
+CREATE TABLE memberships (organization_id INTEGER NOT NULL REFERENCES organizations (id),
+  user_id INTEGER NOT NULL, PRIMARY KEY (organization_id, user_id));
+CREATE TABLE team_members (team_id INTEGER NOT NULL, organization_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL, PRIMARY KEY (team_id, user_id),
+  FOREIGN KEY (organization_id, user_id) REFERENCES memberships (organization_id, user_id)
+    ON DELETE CASCADE);
+CREATE TABLE grants (organization_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+  role TEXT NOT NULL, PRIMARY KEY (organization_id, user_id));
+CREATE TABLE audit_events (id INTEGER PRIMARY KEY, table_name TEXT NOT NULL);
+CREATE FUNCTION delete_membership_grants() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  DELETE FROM grants WHERE organization_id = OLD.organization_id AND user_id = OLD.user_id;
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER memberships_grants_removed AFTER DELETE ON memberships
+  FOR EACH ROW EXECUTE FUNCTION delete_membership_grants();
+CREATE FUNCTION record_audit_event() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO audit_events (table_name) VALUES (TG_TABLE_NAME);
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER memberships_audit AFTER INSERT ON memberships
+  FOR EACH ROW EXECUTE FUNCTION record_audit_event();
+CREATE FUNCTION refuse_owner_grant() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.role = 'owner' THEN
+    RAISE EXCEPTION 'owner is granted by the server';
+  END IF;
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER grants_shape BEFORE INSERT ON grants
+  FOR EACH ROW EXECUTE FUNCTION refuse_owner_grant();
+";
+
+/// Notes whose insert trigger writes an event through two helpers, a
+/// PL/pgSQL one calling a SQL one.
+const NOTES_THROUGH_HELPERS: &str = "
+CREATE TABLE notes (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL);
+CREATE TABLE note_events (id INTEGER PRIMARY KEY, note_id INTEGER NOT NULL);
+CREATE FUNCTION record_note(note INTEGER) RETURNS VOID LANGUAGE sql AS $$
+  INSERT INTO note_events (note_id) VALUES (note)
+$$;
+CREATE FUNCTION log_note(note INTEGER) RETURNS VOID LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM record_note(note);
+END
+$$;
+CREATE FUNCTION note_logged() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM log_note(NEW.id);
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER notes_logged AFTER INSERT ON notes
+  FOR EACH ROW EXECUTE FUNCTION note_logged();
+";
+
+fn replica_options() -> Pg2SqliteOptions {
+    Pg2SqliteOptions::default().with_server_derived_writes_omitted()
+}
+
+/// A connection holding the script `pg` translates to under `options`.
+fn replica_with(pg: &str, options: &Pg2SqliteOptions) -> SqliteConnection {
+    let script = Pg2Sqlite::default()
+        .sql(pg)
+        .expect("fixture parses")
+        .translate_to_sql(options)
+        .expect("fixture translates");
+    let mut connection = establish_connection();
+    // The script is the translator's own output, which no typed query
+    // expresses.
+    for statement in script.into_vec() {
+        connection
+            .batch_execute(&format!("{statement};"))
+            .unwrap_or_else(|error| panic!("emitted statement failed: {error}\n{statement}"));
+    }
+    connection
+}
+
+fn replica(pg: &str) -> SqliteConnection {
+    replica_with(pg, &replica_options())
+}
+
+/// The construct, name and table of every object the replica leaves to the
+/// server, in report order.
+fn left_to_server(pg: &str) -> Vec<(String, String, String)> {
+    Pg2Sqlite::default()
+        .sql(pg)
+        .expect("fixture parses")
+        .translate_with_report(&replica_options())
+        .expect("fixture translates")
+        .warnings
+        .into_iter()
+        .filter_map(|warning| {
+            match warning {
+                TranslationWarning::LeftToServer { construct, name, table, .. } => {
+                    Some((construct, name, table))
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn owned(entries: &[(&str, &str, &str)]) -> Vec<(String, String, String)> {
+    entries
+        .iter()
+        .map(|(construct, name, table)| {
+            ((*construct).to_owned(), (*name).to_owned(), (*table).to_owned())
+        })
+        .collect()
+}
+
+/// Opens organization 1 with member 7, who sits in team 3 and holds `role`.
+fn seed_membership(connection: &mut SqliteConnection) {
+    diesel::insert_into(organizations::table)
+        .values(organizations::id.eq(1))
+        .execute(connection)
+        .expect("organization");
+    diesel::insert_into(memberships::table)
+        .values((memberships::organization_id.eq(1), memberships::user_id.eq(7)))
+        .execute(connection)
+        .expect("membership");
+    diesel::insert_into(team_members::table)
+        .values((
+            team_members::team_id.eq(3),
+            team_members::organization_id.eq(1),
+            team_members::user_id.eq(7),
+        ))
+        .execute(connection)
+        .expect("team membership");
+    diesel::insert_into(grants::table)
+        .values((grants::organization_id.eq(1), grants::user_id.eq(7), grants::role.eq("member")))
+        .execute(connection)
+        .expect("grant");
+}
+
+fn delete_membership(connection: &mut SqliteConnection) {
+    diesel::delete(memberships::table.find((1, 7))).execute(connection).expect("membership delete");
+}
+
+#[test]
+fn a_replica_derives_none_of_the_rows_the_server_derives() {
+    let mut connection = replica(MEMBERSHIPS);
+    seed_membership(&mut connection);
+    delete_membership(&mut connection);
+
+    let audited: i64 = audit_events::table.count().get_result(&mut connection).expect("count");
+    let granted: i64 = grants::table.count().get_result(&mut connection).expect("count");
+    let teamed: i64 = team_members::table.count().get_result(&mut connection).expect("count");
+    assert_eq!((audited, granted, teamed), (0, 1, 1));
+}
+
+#[test]
+fn without_the_option_the_replica_derives_them_as_the_server_does() {
+    let mut connection = replica_with(MEMBERSHIPS, &Pg2SqliteOptions::default());
+    seed_membership(&mut connection);
+    delete_membership(&mut connection);
+
+    let audited: i64 = audit_events::table.count().get_result(&mut connection).expect("count");
+    let granted: i64 = grants::table.count().get_result(&mut connection).expect("count");
+    let teamed: i64 = team_members::table.count().get_result(&mut connection).expect("count");
+    assert_eq!((audited, granted, teamed), (1, 0, 0));
+}
+
+#[test]
+fn a_replica_keeps_the_trigger_and_the_key_that_only_refuse() {
+    let mut connection = replica(MEMBERSHIPS);
+    seed_membership(&mut connection);
+
+    let owner = diesel::insert_into(grants::table)
+        .values((grants::organization_id.eq(1), grants::user_id.eq(8), grants::role.eq("owner")))
+        .execute(&mut connection)
+        .expect_err("grants_shape stays");
+    assert!(owner.to_string().contains("owner is granted by the server"), "{owner}");
+
+    let orphan = diesel::insert_into(memberships::table)
+        .values((memberships::organization_id.eq(9), memberships::user_id.eq(7)))
+        .execute(&mut connection)
+        .expect_err("the plain key to organizations stays");
+    assert!(orphan.to_string().contains("FOREIGN KEY constraint failed"), "{orphan}");
+}
+
+#[test]
+fn the_report_names_each_trigger_and_key_left_to_the_server() {
+    assert_eq!(
+        left_to_server(MEMBERSHIPS),
+        owned(&[
+            ("FOREIGN KEY", "(organization_id, user_id) REFERENCES memberships", "team_members"),
+            ("TRIGGER", "memberships_grants_removed", "memberships"),
+            ("TRIGGER", "memberships_audit", "memberships"),
+        ]),
+    );
+}
+
+#[test]
+fn a_trigger_writing_through_its_helpers_is_left_out() {
+    assert_eq!(
+        left_to_server(NOTES_THROUGH_HELPERS),
+        owned(&[("TRIGGER", "notes_logged", "notes")]),
+    );
+
+    let mut connection = replica(NOTES_THROUGH_HELPERS);
+    diesel::insert_into(notes::table)
+        .values((notes::id.eq(1), notes::revision.eq(0)))
+        .execute(&mut connection)
+        .expect("note");
+    let logged: i64 = note_events::table.count().get_result(&mut connection).expect("count");
+    assert_eq!(logged, 0);
+}
+
+#[test]
+fn a_write_nested_in_a_handler_a_loop_or_a_branch_is_found() {
+    let pg = "
+CREATE TABLE notes (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL);
+CREATE TABLE note_events (id INTEGER PRIMARY KEY, note_id INTEGER NOT NULL);
+CREATE FUNCTION log_failed_note() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  BEGIN
+    PERFORM 1 / NEW.revision;
+  EXCEPTION WHEN division_by_zero THEN
+    INSERT INTO note_events (note_id) VALUES (NEW.id);
+  END;
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER notes_failed AFTER INSERT ON notes
+  FOR EACH ROW EXECUTE FUNCTION log_failed_note();
+CREATE FUNCTION clear_note_events() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE
+  cleared RECORD;
+BEGIN
+  FOR cleared IN DELETE FROM note_events WHERE note_id = OLD.id RETURNING id LOOP
+    NULL;
+  END LOOP;
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER notes_cleared AFTER DELETE ON notes
+  FOR EACH ROW EXECUTE FUNCTION clear_note_events();
+CREATE FUNCTION log_revision() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.revision = OLD.revision THEN
+    RETURN NULL;
+  ELSE
+    UPDATE note_events SET note_id = NEW.id WHERE note_id = OLD.id;
+  END IF;
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER notes_revised AFTER UPDATE ON notes
+  FOR EACH ROW EXECUTE FUNCTION log_revision();
+";
+    assert_eq!(
+        left_to_server(pg),
+        owned(&[
+            ("TRIGGER", "notes_failed", "notes"),
+            ("TRIGGER", "notes_cleared", "notes"),
+            ("TRIGGER", "notes_revised", "notes"),
+        ]),
+    );
+}
+
+#[test]
+fn a_trigger_setting_its_own_row_stays() {
+    let pg = "
+CREATE TABLE notes (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL);
+CREATE FUNCTION keep_revision_positive() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  NEW.revision := abs(NEW.revision);
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER notes_revised BEFORE UPDATE ON notes
+  FOR EACH ROW EXECUTE FUNCTION keep_revision_positive();
+";
+    assert_eq!(left_to_server(pg), owned(&[]));
+
+    let mut connection = replica(pg);
+    diesel::insert_into(notes::table)
+        .values((notes::id.eq(1), notes::revision.eq(0)))
+        .execute(&mut connection)
+        .expect("note");
+    diesel::update(notes::table.find(1))
+        .set(notes::revision.eq(-3))
+        .execute(&mut connection)
+        .expect("update");
+    let revision: i32 =
+        notes::table.find(1).select(notes::revision).first(&mut connection).expect("note");
+    assert_eq!(revision, 3);
+}
+
+#[test]
+fn a_trigger_that_could_not_translate_is_left_out_when_it_writes() {
+    let pg = "
+CREATE TABLE notes (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL);
+CREATE TABLE note_events (id INTEGER PRIMARY KEY, note_id INTEGER NOT NULL);
+CREATE FUNCTION count_notes() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO note_events (note_id) VALUES (0);
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER notes_counted AFTER INSERT ON notes
+  FOR EACH STATEMENT EXECUTE FUNCTION count_notes();
+";
+    Pg2Sqlite::default()
+        .sql(pg)
+        .expect("fixture parses")
+        .translate(&Pg2SqliteOptions::default())
+        .expect_err("a statement trigger has no SQLite form");
+    assert_eq!(left_to_server(pg), owned(&[("TRIGGER", "notes_counted", "notes")]));
+}
+
+#[test]
+fn a_trigger_left_out_no_longer_shares_its_firing_order() {
+    let pg = "
+CREATE TABLE notes (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL);
+CREATE TABLE note_events (id INTEGER PRIMARY KEY, note_id INTEGER NOT NULL);
+CREATE FUNCTION log_insert() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO note_events (note_id) VALUES (NEW.id);
+  RETURN NULL;
+END
+$$;
+CREATE FUNCTION refuse_negative() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.revision < 0 THEN
+    RAISE EXCEPTION 'negative revision';
+  END IF;
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER notes_logged AFTER INSERT ON notes FOR EACH ROW EXECUTE FUNCTION log_insert();
+CREATE TRIGGER notes_checked AFTER INSERT ON notes FOR EACH ROW EXECUTE FUNCTION refuse_negative();
+";
+    Pg2Sqlite::default()
+        .sql(pg)
+        .expect("fixture parses")
+        .translate(&Pg2SqliteOptions::default())
+        .expect_err("two AFTER INSERT triggers fire in another order on SQLite");
+
+    let mut connection = replica(pg);
+    let refused = diesel::insert_into(notes::table)
+        .values((notes::id.eq(1), notes::revision.eq(-1)))
+        .execute(&mut connection)
+        .expect_err("notes_checked stays");
+    assert!(refused.to_string().contains("negative revision"), "{refused}");
+}
+
+#[test]
+fn a_dropped_trigger_that_was_left_out_drops_nothing() {
+    let pg = format!("{MEMBERSHIPS} DROP TRIGGER memberships_audit ON memberships;");
+    let mut connection = replica(&pg);
+    seed_membership(&mut connection);
+    let audited: i64 = audit_events::table.count().get_result(&mut connection).expect("count");
+    assert_eq!(audited, 0);
+}
+
+#[test]
+fn a_key_that_changes_child_rows_is_left_out_and_a_plain_key_kept() {
+    let pg = "
+CREATE TABLE folders (id INTEGER PRIMARY KEY);
+CREATE TABLE documents (id INTEGER PRIMARY KEY,
+  folder_id INTEGER REFERENCES folders (id) ON DELETE SET NULL,
+  origin_id INTEGER NOT NULL CONSTRAINT documents_origin REFERENCES folders (id) ON UPDATE RESTRICT);
+";
+    assert_eq!(
+        left_to_server(pg),
+        owned(&[("FOREIGN KEY", "(folder_id) REFERENCES folders", "documents")]),
+    );
+
+    let mut connection = replica(pg);
+    diesel::insert_into(folders::table)
+        .values(&vec![folders::id.eq(1), folders::id.eq(2)])
+        .execute(&mut connection)
+        .expect("folders");
+    diesel::insert_into(documents::table)
+        .values((documents::id.eq(1), documents::folder_id.eq(1), documents::origin_id.eq(2)))
+        .execute(&mut connection)
+        .expect("document");
+    diesel::delete(folders::table.find(1)).execute(&mut connection).expect("folder delete");
+    let folder: Option<i32> =
+        documents::table.find(1).select(documents::folder_id).first(&mut connection).expect("doc");
+    assert_eq!(folder, Some(1));
+
+    let refused = diesel::delete(folders::table.find(2))
+        .execute(&mut connection)
+        .expect_err("documents_origin stays");
+    assert!(refused.to_string().contains("FOREIGN KEY constraint failed"), "{refused}");
+}
+
+#[test]
+fn an_added_key_that_cascades_is_left_out() {
+    let pg = "
+CREATE TABLE folders (id INTEGER PRIMARY KEY);
+CREATE TABLE documents (id INTEGER PRIMARY KEY, folder_id INTEGER, origin_id INTEGER NOT NULL);
+ALTER TABLE documents ADD CONSTRAINT documents_folder
+  FOREIGN KEY (folder_id) REFERENCES folders (id) ON DELETE CASCADE;
+";
+    assert_eq!(left_to_server(pg), owned(&[("FOREIGN KEY", "documents_folder", "documents")]),);
+    replica(pg);
+}
+
+#[test]
+fn an_instead_of_trigger_stays() {
+    let pg = "
+CREATE TABLE notes (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL);
+CREATE VIEW fresh_notes AS SELECT id FROM notes;
+CREATE FUNCTION insert_fresh_note() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO notes (id, revision) VALUES (NEW.id, 0);
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER fresh_notes_insert INSTEAD OF INSERT ON fresh_notes
+  FOR EACH ROW EXECUTE FUNCTION insert_fresh_note();
+";
+    assert_eq!(left_to_server(pg), owned(&[]));
+
+    let mut connection = replica(pg);
+    diesel::insert_into(fresh_notes::table)
+        .values(fresh_notes::id.eq(1))
+        .execute(&mut connection)
+        .expect("a write through the view");
+    let written: i64 = notes::table.count().get_result(&mut connection).expect("count");
+    assert_eq!(written, 1);
+}

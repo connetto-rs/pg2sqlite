@@ -12,6 +12,7 @@ use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{
+        derived_writes::column_without_keys_left_to_server,
         object_name::last_ident_value_or_display,
         shared_helpers::{
             declares_identity, minor_unit_scale, quoted_decimal_as_number, scale_decimal_literal,
@@ -219,6 +220,10 @@ pub(crate) fn translate_column_def(
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<ColumnDef, crate::errors::Error> {
+    // A `REFERENCES` the replica leaves to the server goes before anything
+    // reads the column's options.
+    let kept_column = column_without_keys_left_to_server(column, table, options, emit);
+    let column = kept_column.as_ref().unwrap_or(column);
     // Both an identity column and a serial ask SQLite to supply values, which
     // it does only through the rowid alias, so both need the translated type
     // and the table's key before anything else is decided.

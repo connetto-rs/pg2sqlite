@@ -117,6 +117,10 @@ pub struct Pg2SqliteOptions {
     ilike_fold_function: Option<String>,
     /// Tables placed in an attached database. Set via `with_attached_tables`.
     attached_tables: Option<AttachedTables>,
+    /// Whether the triggers that write rows and the foreign keys that change
+    /// child rows are left to the server. Set via
+    /// `with_server_derived_writes_omitted`.
+    server_derived_writes_omitted: bool,
 }
 
 #[cfg(feature = "arbitrary")]
@@ -146,6 +150,7 @@ impl<'a> arbitrary::Arbitrary<'a> for Pg2SqliteOptions {
             user_defined_functions: Vec::<String>::arbitrary(u)?,
             ilike_fold_function: Option::<String>::arbitrary(u)?,
             attached_tables: Option::<AttachedTables>::arbitrary(u)?,
+            server_derived_writes_omitted: bool::arbitrary(u)?,
         })
     }
 }
@@ -175,6 +180,7 @@ impl Default for Pg2SqliteOptions {
             user_defined_functions: Vec::new(),
             ilike_fold_function: None,
             attached_tables: None,
+            server_derived_writes_omitted: false,
         }
     }
 }
@@ -190,6 +196,9 @@ pub(crate) struct PrewalkCatalogs {
     /// Trigger names sharing a table, timing and event with another
     /// non-split trigger, which `CreateTrigger` translation refuses.
     conflicting_trigger_names: Vec<String>,
+    /// The names of the triggers left to the server, whose `DROP TRIGGER`
+    /// finds nothing on the replica.
+    server_derived_trigger_names: Vec<String>,
     /// The table name, lower-cased, and the function name of every `BEFORE
     /// INSERT` trigger, which the RLS backing-table update check reads to
     /// exempt the crate's own maintenance write. Only those two strings are
@@ -694,6 +703,19 @@ impl<'a> TranslationContext<'a> {
         self.catalogs.conflicting_trigger_names.iter().any(|n| n == name)
     }
 
+    /// Registers `name` as a trigger the replica leaves to the server.
+    pub(crate) fn add_server_derived_trigger_name(&mut self, name: &str) {
+        if !self.is_server_derived_trigger_name(name) {
+            self.catalogs.to_mut().server_derived_trigger_names.push(name.to_owned());
+        }
+    }
+
+    /// Returns whether a trigger named `name` was left to the server.
+    #[must_use]
+    pub(crate) fn is_server_derived_trigger_name(&self, name: &str) -> bool {
+        self.catalogs.server_derived_trigger_names.iter().any(|left| left == name)
+    }
+
     pub(crate) fn add_before_insert_trigger_fn(
         &mut self,
         table_name: String,
@@ -1104,6 +1126,49 @@ impl Pg2SqliteOptions {
     /// Returns the tables placed in an attached database, if any.
     pub fn get_attached_tables(&self) -> Option<&AttachedTables> {
         self.attached_tables.as_ref()
+    }
+
+    #[must_use]
+    /// Leaves out the writes the server derives, for a replica that uploads
+    /// every row its transactions change to a PostgreSQL that runs its own
+    /// triggers and cascades when it applies them.
+    ///
+    /// A `BEFORE` or `AFTER` trigger whose function runs `INSERT`, `UPDATE`,
+    /// `DELETE`, `MERGE` or `TRUNCATE`, directly or in a function it calls, is
+    /// left out, since the server derives those rows again from the uploaded
+    /// one. A trigger that only refuses a write, reads, or sets columns of its
+    /// own `NEW` row stays, and so does every `INSTEAD OF` trigger, whose
+    /// writes are the view's own. A foreign key whose `ON DELETE` or
+    /// `ON UPDATE` action is `CASCADE`, `SET NULL` or `SET DEFAULT` is left
+    /// out whole, since kept as `NO ACTION` it would refuse an offline delete
+    /// of a parent whose children the server removes.
+    ///
+    /// [`Pg2Sqlite::translate_with_report`](crate::pg2sqlite::Pg2Sqlite::translate_with_report)
+    /// names each one in a
+    /// [`TranslationWarning::LeftToServer`](crate::warnings::TranslationWarning::LeftToServer).
+    ///
+    /// ```
+    /// # use pg2sqlite::prelude::*;
+    /// let options = Pg2SqliteOptions::default().with_server_derived_writes_omitted();
+    /// let script = Pg2Sqlite::default()
+    ///     .sql(
+    ///         "CREATE TABLE folders (id INT PRIMARY KEY);
+    ///          CREATE TABLE files (id INT PRIMARY KEY,
+    ///              folder INT REFERENCES folders (id) ON DELETE CASCADE);",
+    ///     )?
+    ///     .translate_to_sql(&options)?;
+    /// assert!(script.iter().all(|statement| !statement.contains("REFERENCES")));
+    /// # Ok::<(), Error>(())
+    /// ```
+    pub fn with_server_derived_writes_omitted(mut self) -> Self {
+        self.server_derived_writes_omitted = true;
+        self
+    }
+
+    #[must_use]
+    /// Returns whether the writes the server derives are left out.
+    pub fn is_server_derived_writes_omitted(&self) -> bool {
+        self.server_derived_writes_omitted
     }
 }
 
