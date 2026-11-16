@@ -19,9 +19,9 @@
 //!    level security view and trigger set is the clearest case. This list is
 //!    closed and each member says where its effect is realised.
 //!
-//! Silence is additionally permitted where a caller-set option asks for it,
-//! currently only `RoleTableAccess::Deny`, which is documented at the option
-//! that sets it.
+//! A caller-set option may also ask for a drop. `RoleTableAccess::Deny` drops
+//! in silence, and `with_server_derived_writes_omitted` drops a trigger with a
+//! `LeftToServer` warning. Each is documented at the option that sets it.
 //!
 //! The match over `Statement` has no wildcard arm on purpose: a new
 //! `sqlparser` variant fails to compile until it is classified here, which is
@@ -44,6 +44,9 @@ use crate::{
     errors::Error,
     impls::{
         ast_builder,
+        derived_writes::{
+            foreign_key_left_to_server, trigger_derived_write, trigger_left_to_server,
+        },
         object_name::{
             append_suffix, last_ident, last_ident_value_or_display,
             normalize_schema_qualified_object_name_for_sqlite, quoted_ident,
@@ -100,6 +103,11 @@ fn append_guarded_statements(
     Ok(())
 }
 
+/// Translates `create_trigger`, or leaves it to the server when the replica
+/// omits the writes the server derives and the trigger writes rows.
+///
+/// A replacing trigger left out still drops the trigger it replaces, which may
+/// have been kept.
 fn append_translated_create_trigger_statements(
     statements: &mut Vec<Statement>,
     create_trigger: &sqlparser::ast::CreateTrigger,
@@ -107,6 +115,23 @@ fn append_translated_create_trigger_statements(
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<(), Error> {
+    if options.is_server_derived_writes_omitted()
+        && let Some(reason) = trigger_derived_write(create_trigger, schema)?
+    {
+        emit(trigger_left_to_server(create_trigger, reason));
+        if create_trigger.or_replace {
+            statements.push(Statement::DropTrigger(sqlparser::ast::DropTrigger {
+                if_exists: true,
+                trigger_name: normalize_schema_qualified_object_name_for_sqlite(
+                    schema,
+                    &create_trigger.name,
+                )?,
+                table_name: None,
+                option: None,
+            }));
+        }
+        return Ok(());
+    }
     for (maybe_drop_trigger, translated_trigger) in
         create_trigger.translate_with_warnings(schema, options, emit)?
     {
@@ -816,6 +841,22 @@ fn translate_alter_table_operation(
         | AlterTableOperation::ForceRowLevelSecurity
         | AlterTableOperation::NoForceRowLevelSecurity
         | AlterTableOperation::OwnerTo { .. } => Ok(None),
+        // A key left to the server is never added, which spares the ALTER
+        // TABLE SQLite has no form for.
+        AlterTableOperation::AddConstraint {
+            constraint: sqlparser::ast::TableConstraint::ForeignKey(key),
+            ..
+        } if foreign_key_left_to_server(
+            key,
+            None,
+            &key.columns,
+            &alter_table.name,
+            options,
+            emit,
+        ) =>
+        {
+            Ok(None)
+        }
         other => {
             Err(Error::forward_refusal(format!(
                 "ALTER TABLE {} {other} has no SQLite equivalent. SQLite can only rename a table \
@@ -1896,10 +1937,13 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
                 }
             }
             // DROP TRIGGER - translate to SQLite (strip table name and
-            // CASCADE/RESTRICT)
+            // CASCADE/RESTRICT). A trigger of that name left to the server may
+            // never have reached SQLite, so the drop tolerates its absence.
             Self::DropTrigger(drop_trigger) => {
+                let left_to_server = last_ident(&drop_trigger.trigger_name)
+                    .is_some_and(|name| options.is_server_derived_trigger_name(&name.value));
                 vec![Statement::DropTrigger(sqlparser::ast::DropTrigger {
-                    if_exists: drop_trigger.if_exists,
+                    if_exists: drop_trigger.if_exists || left_to_server,
                     trigger_name: normalize_schema_qualified_object_name_for_sqlite(
                         schema,
                         &drop_trigger.trigger_name,
