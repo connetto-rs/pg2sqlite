@@ -324,6 +324,18 @@ fn a_trigger_writing_through_its_helpers_is_left_out() {
         left_to_server(NOTES_THROUGH_HELPERS),
         owned(&[("TRIGGER", "notes_logged", "notes")]),
     );
+    let report = Pg2Sqlite::default()
+        .sql(NOTES_THROUGH_HELPERS)
+        .expect("fixture parses")
+        .translate_with_report(&replica_options())
+        .expect("fixture translates");
+    let shown = report.warnings.iter().map(ToString::to_string).collect::<Vec<_>>();
+    assert!(
+        shown.iter().any(|line| {
+            line.contains("note_logged() calls log_note(), which calls record_note(), which runs INSERT on note_events")
+        }),
+        "{shown:?}"
+    );
 
     let mut connection = replica(NOTES_THROUGH_HELPERS);
     diesel::insert_into(notes::table)
@@ -332,6 +344,135 @@ fn a_trigger_writing_through_its_helpers_is_left_out() {
         .expect("note");
     let logged: i64 = note_events::table.count().get_result(&mut connection).expect("count");
     assert_eq!(logged, 0);
+}
+
+#[test]
+fn a_trigger_truncating_merging_or_writing_atomically_is_left_out() {
+    let pg = "
+CREATE TABLE notes (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL);
+CREATE TABLE note_events (id INTEGER PRIMARY KEY, note_id INTEGER NOT NULL);
+CREATE FUNCTION clear_events() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE
+  pending REFCURSOR;
+BEGIN
+  OPEN pending FOR SELECT id FROM note_events;
+  CLOSE pending;
+  WHILE OLD.revision > 0 LOOP
+    TRUNCATE note_events;
+  END LOOP;
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER notes_cleared AFTER DELETE ON notes
+  FOR EACH ROW EXECUTE FUNCTION clear_events();
+CREATE FUNCTION merge_event() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  MERGE INTO note_events USING notes ON note_events.note_id = notes.id
+    WHEN NOT MATCHED THEN INSERT (note_id) VALUES (notes.id);
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER notes_merged AFTER INSERT ON notes
+  FOR EACH ROW EXECUTE FUNCTION merge_event();
+CREATE FUNCTION record_revision(note INTEGER) RETURNS VOID LANGUAGE sql
+BEGIN ATOMIC
+  INSERT INTO note_events (note_id) VALUES (note);
+END;
+CREATE FUNCTION revision_recorded() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM record_revision(NEW.id);
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER notes_recorded AFTER UPDATE ON notes
+  FOR EACH ROW EXECUTE FUNCTION revision_recorded();
+";
+    assert_eq!(
+        left_to_server(pg),
+        owned(&[
+            ("TRIGGER", "notes_cleared", "notes"),
+            ("TRIGGER", "notes_merged", "notes"),
+            ("TRIGGER", "notes_recorded", "notes"),
+        ]),
+    );
+}
+
+#[test]
+fn a_replacing_trigger_left_out_drops_the_one_it_replaces() {
+    let pg = "
+CREATE TABLE notes (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL);
+CREATE TABLE note_events (id INTEGER PRIMARY KEY, note_id INTEGER NOT NULL);
+CREATE FUNCTION refuse_negative() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.revision < 0 THEN
+    RAISE EXCEPTION 'negative revision';
+  END IF;
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER notes_watched BEFORE INSERT ON notes
+  FOR EACH ROW EXECUTE FUNCTION refuse_negative();
+CREATE FUNCTION log_insert() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO note_events (note_id) VALUES (NEW.id);
+  RETURN NULL;
+END
+$$;
+CREATE OR REPLACE TRIGGER notes_watched AFTER INSERT ON notes
+  FOR EACH ROW EXECUTE FUNCTION log_insert();
+";
+    let mut connection = replica(pg);
+    diesel::insert_into(notes::table)
+        .values((notes::id.eq(1), notes::revision.eq(-1)))
+        .execute(&mut connection)
+        .expect("the refusing trigger is replaced");
+    let logged: i64 = note_events::table.count().get_result(&mut connection).expect("count");
+    assert_eq!(logged, 0);
+}
+
+/// Whether parsing or translating `pg` for a replica fails.
+fn replica_refuses(pg: &str) -> bool {
+    Pg2Sqlite::default()
+        .sql(pg)
+        .and_then(|parsed| parsed.translate_to_sql(&replica_options()))
+        .is_err()
+}
+
+#[test]
+fn a_trigger_whose_writes_cannot_be_read_is_refused() {
+    let in_other_language = "
+CREATE TABLE notes (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL);
+CREATE FUNCTION scripted() RETURNS TRIGGER LANGUAGE plv8 AS $$ return NEW; $$;
+CREATE TRIGGER notes_scripted BEFORE INSERT ON notes
+  FOR EACH ROW EXECUTE FUNCTION scripted();
+";
+    assert!(replica_refuses(in_other_language));
+    let unparsable_plpgsql = "
+CREATE TABLE notes (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL);
+CREATE FUNCTION broken() RETURNS TRIGGER LANGUAGE plpgsql AS $$ BEGIN INSERT INTO; END $$;
+CREATE TRIGGER notes_broken BEFORE INSERT ON notes
+  FOR EACH ROW EXECUTE FUNCTION broken();
+";
+    assert!(replica_refuses(unparsable_plpgsql));
+    let unparsable_sql = "
+CREATE TABLE notes (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL);
+CREATE FUNCTION broken_helper() RETURNS VOID LANGUAGE sql AS $$ INSERT INTO $$;
+CREATE FUNCTION calls_broken() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM broken_helper();
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER notes_broken AFTER INSERT ON notes
+  FOR EACH ROW EXECUTE FUNCTION calls_broken();
+";
+    assert!(replica_refuses(unparsable_sql));
+    let missing_function = "
+CREATE TABLE notes (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL);
+CREATE TRIGGER notes_missing AFTER INSERT ON notes
+  FOR EACH ROW EXECUTE FUNCTION missing_function();
+";
+    assert!(replica_refuses(missing_function));
 }
 
 #[test]
@@ -513,6 +654,30 @@ CREATE TABLE documents (id INTEGER PRIMARY KEY,
         .execute(&mut connection)
         .expect_err("documents_origin stays");
     assert!(refused.to_string().contains("FOREIGN KEY constraint failed"), "{refused}");
+}
+
+#[test]
+fn a_column_keeps_its_other_options_when_its_key_is_left_out() {
+    let pg = "
+CREATE TABLE folders (id INTEGER PRIMARY KEY);
+CREATE TABLE documents (id INTEGER PRIMARY KEY,
+  folder_id INTEGER REFERENCES folders (id) ON DELETE CASCADE NOT NULL,
+  origin_id INTEGER NOT NULL);
+";
+    assert_eq!(
+        left_to_server(pg),
+        owned(&[("FOREIGN KEY", "(folder_id) REFERENCES folders", "documents")]),
+    );
+    let mut connection = replica(pg);
+    let refused = diesel::insert_into(documents::table)
+        .values((
+            documents::id.eq(1),
+            documents::folder_id.eq(None::<i32>),
+            documents::origin_id.eq(1),
+        ))
+        .execute(&mut connection)
+        .expect_err("NOT NULL stays");
+    assert!(refused.to_string().contains("NOT NULL constraint failed"), "{refused}");
 }
 
 #[test]

@@ -705,9 +705,7 @@ impl<'a> TranslationContext<'a> {
 
     /// Registers `name` as a trigger the replica leaves to the server.
     pub(crate) fn add_server_derived_trigger_name(&mut self, name: &str) {
-        if !self.is_server_derived_trigger_name(name) {
-            self.catalogs.to_mut().server_derived_trigger_names.push(name.to_owned());
-        }
+        self.catalogs.to_mut().server_derived_trigger_names.push(name.to_owned());
     }
 
     /// Returns whether a trigger named `name` was left to the server.
