@@ -25,6 +25,7 @@ mod index_column;
 pub(crate) mod insert;
 mod json_value;
 mod nulls_not_distinct;
+mod off_replica;
 mod order_by_expr;
 pub mod plpgsql;
 pub mod postgis;

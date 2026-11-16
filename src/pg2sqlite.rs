@@ -806,6 +806,7 @@ impl Pg2Sqlite {
                 context,
             );
             for (offset, statement) in statements[epoch.start..epoch.end].iter().enumerate() {
+                context.follow_triggers(statement);
                 if !should_translate(statement) {
                     translated.push(Vec::new());
                     continue;

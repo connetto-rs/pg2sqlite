@@ -150,6 +150,7 @@ mod test_numeric_floor_ceil_trunc;
 mod test_numeric_scale_expr_inference;
 mod test_numeric_scaled_integer;
 mod test_odbc_function_syntax;
+mod test_off_replica_writes;
 mod test_on_conflict_constraint;
 mod test_on_conflict_do_nothing;
 mod test_operator_translation_gaps;
