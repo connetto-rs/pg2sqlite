@@ -101,7 +101,9 @@ fn default_schema_qualified_uuid_function_is_refused_without_identity() {
 #[test]
 fn default_uuid_generate_v4_function() {
     let result = Pg2Sqlite::default()
-        .sql("CREATE TABLE t (id TEXT DEFAULT uuid_generate_v4());")
+        .sql(
+            r#"CREATE EXTENSION "uuid-ossp"; CREATE TABLE t (id TEXT DEFAULT uuid_generate_v4());"#,
+        )
         .unwrap()
         .translate(&Pg2SqliteOptions::default())
         .map(pg2sqlite::script::Script::into_vec);

@@ -2,6 +2,10 @@
 -- Both tables become views with _rls backing tables
 -- FKs between them should point to the _rls backing tables
 
+-- The destination registers this function, PostgreSQL's prelude reads the same setting.
+CREATE OR REPLACE FUNCTION current_app_user() RETURNS UUID LANGUAGE sql STABLE
+    AS $$ SELECT current_setting('app.user_id', true)::uuid $$;
+
 CREATE TABLE users (
     id UUID PRIMARY KEY DEFAULT uuidv7(),
     username TEXT NOT NULL UNIQUE,

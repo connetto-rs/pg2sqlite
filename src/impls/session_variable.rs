@@ -212,7 +212,9 @@ impl<'o> Setting<'o> {
     fn one_value(self) -> Result<OneValue<'o>, Error> {
         match self.declared.content() {
             SettingContent::Value(
-                SettingValue::Caller(declared) | SettingValue::Scalar(declared),
+                SettingValue::Caller(declared)
+                | SettingValue::Principal { identity: declared, .. }
+                | SettingValue::Scalar(declared),
             ) => Ok(OneValue::Typed(declared)),
             SettingContent::Value(SettingValue::Set { packing, .. }) => {
                 Err(Error::SessionVariableReadAsScalar {
@@ -259,7 +261,7 @@ fn packed_set<'v>(
                 written: written.to_string(),
             })
         }
-        SettingValue::Caller(_) | SettingValue::Scalar(_) => {
+        SettingValue::Caller(_) | SettingValue::Principal { .. } | SettingValue::Scalar(_) => {
             Err(Error::SessionVariableReadAsSet {
                 pattern: pattern.to_string(),
                 written: written.to_string(),
@@ -449,12 +451,20 @@ enum Step<'e> {
     Access(&'e AccessExpr),
 }
 
+/// A setting's whole document, the root every read of it starts from.
+struct DocumentRoot {
+    name: String,
+    /// Read through `NULLIF(<setting>, '')`, which reads an empty setting as
+    /// no document.
+    empty_is_null: bool,
+}
+
 /// The document read `expr` spells over a setting, its steps from the
 /// document outwards, or `None` when the root is no setting's document.
-fn document_spine(expr: &Expr) -> Option<(String, Vec<Step<'_>>)> {
+fn document_spine(expr: &Expr) -> Option<(DocumentRoot, Vec<Step<'_>>)> {
     let mut steps = Vec::new();
     let mut current = expr;
-    let name = loop {
+    let root = loop {
         match current {
             Expr::Nested(inner) => current = inner,
             Expr::BinaryOp {
@@ -475,16 +485,22 @@ fn document_spine(expr: &Expr) -> Option<(String, Vec<Step<'_>>)> {
             }
             Expr::Cast { expr: inner, data_type: DataType::JSON | DataType::JSONB, .. } => {
                 let Expr::Function(func) = setting_operand(inner) else { return None };
-                let Some(SessionRead::Setting(name)) = session_read_of_function(func) else {
+                let (read, empty_is_null) =
+                    match crate::impls::idioms::extract_nullif_wrapped(func, "current_setting", "")
+                    {
+                        Some(read) => (read, true),
+                        None => (func, false),
+                    };
+                let Some(SessionRead::Setting(name)) = session_read_of_function(read) else {
                     return None;
                 };
-                break name;
+                break DocumentRoot { name, empty_is_null };
             }
             _ => return None,
         }
     };
     steps.reverse();
-    Some((name, steps))
+    Some((root, steps))
 }
 
 /// The keys `steps` read and whether the last answers text.
@@ -522,10 +538,11 @@ fn json_path(name: &str, steps: &[Step<'_>]) -> Result<(Vec<String>, bool), Erro
 }
 
 /// The field read `expr` spells over a setting's JSON document, or `None`
-/// when it reads no setting's document or reads it whole.
+/// when it reads no setting's document, reads it whole or reads it through
+/// `NULLIF`.
 pub(crate) fn json_read(expr: &Expr) -> Option<Result<JsonRead, Error>> {
-    let (name, steps) = document_spine(expr)?;
-    if steps.is_empty() {
+    let (DocumentRoot { name, empty_is_null }, steps) = document_spine(expr)?;
+    if steps.is_empty() || empty_is_null {
         return None;
     }
     Some(json_path(&name, &steps).map(|(path, text)| JsonRead { name, path, text }))
@@ -587,7 +604,9 @@ pub(crate) fn translate_json_read(
     let field = declared_field(setting, &read.path)?;
     let pattern = read.pattern();
     let declared = match field.value() {
-        SettingValue::Caller(declared) | SettingValue::Scalar(declared) => declared,
+        SettingValue::Caller(declared)
+        | SettingValue::Principal { identity: declared, .. }
+        | SettingValue::Scalar(declared) => declared,
         SettingValue::Set { packing, .. } => {
             return Err(Error::SessionVariableReadAsScalar {
                 pattern,
@@ -694,16 +713,17 @@ pub(crate) fn json_set<'o>(
     document: &Expr,
     options: &'o Pg2SqliteOptions,
 ) -> Option<Result<JsonSet<'o>, Error>> {
-    let (name, steps) = document_spine(document)?;
-    Some(json_set_of(&name, &steps, options))
+    let (root, steps) = document_spine(document)?;
+    Some(json_set_of(&root, &steps, options))
 }
 
 fn json_set_of<'o>(
-    name: &str,
+    root: &DocumentRoot,
     steps: &[Step<'_>],
     options: &'o Pg2SqliteOptions,
 ) -> Result<JsonSet<'o>, Error> {
     const WRITTEN: &str = "packed as a JSON array";
+    let name = root.name.as_str();
     let setting = setting(name, options)?;
     let (path, text) = json_path(name, steps)?;
     let read = JsonRead { name: name.to_string(), path, text };
@@ -714,15 +734,22 @@ fn json_set_of<'o>(
              its last key with ->."
         )));
     }
+    // SQLite's `json_each` raises on `''` as PostgreSQL's `::jsonb` does, so
+    // the empty setting `NULLIF` reads as no document stays no document.
+    let document = if root.empty_is_null {
+        simple_function_expr("nullif", vec![setting.call(), string_literal("")], None)
+    } else {
+        setting.call()
+    };
     let (value, array) = if read.path.is_empty() {
         match setting.declared.content() {
-            SettingContent::Value(value) => (value, setting.call()),
+            SettingContent::Value(value) => (value, document),
             SettingContent::Json(fields) => return Err(whole_document(setting, fields)),
         }
     } else {
         let field = declared_field(setting, &read.path)?;
         let array = json_operator(
-            setting.call(),
+            document,
             BinaryOperator::Arrow,
             &sqlite_json_path(&pattern, &read.path)?,
         );

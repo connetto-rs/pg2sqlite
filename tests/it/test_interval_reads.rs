@@ -1079,7 +1079,7 @@ fn a_foreign_key_to_an_interval_column_is_refused() {
 
 #[test]
 fn a_number_beside_an_interval_in_a_check_is_refused() {
-    refused("CREATE TABLE ck4 (id int, iv interval, CHECK (iv > 1));", "operator does not exist");
+    refused("CREATE TABLE ck4 (id int, iv interval, CHECK (iv > 1));", "does not exist");
 }
 
 #[test]
@@ -1697,10 +1697,7 @@ fn an_is_not_null_check_beside_an_interval_column_keeps_its_key() {
 
 #[test]
 fn a_function_call_check_beside_an_interval_column_is_refused() {
-    refused(
-        "CREATE TABLE ck_f (id int, iv interval, CHECK (length(iv) > 0))",
-        "outside a comparison",
-    );
+    refused("CREATE TABLE ck_f (id int, iv interval, CHECK (length(iv) > 0))", "length(interval)");
 }
 
 #[test]
@@ -1719,7 +1716,8 @@ fn a_unique_over_an_interval_column_keeps_its_companion() {
 #[test]
 fn a_unique_beside_an_interval_arithmetic_column_is_refused() {
     refused(
-        "CREATE TABLE uk_e (iv interval, iv2 interval, UNIQUE (iv, iv2 + '1 day'))",
+        "CREATE TABLE uk_e (iv interval, iv2 interval); \
+         CREATE UNIQUE INDEX uk_e_u ON uk_e (iv, (iv2 + interval '1 day'))",
         "scalar subquery",
     );
 }
@@ -1728,7 +1726,7 @@ fn a_unique_beside_an_interval_arithmetic_column_is_refused() {
 fn a_check_with_a_subquery_beside_an_interval_column_is_refused() {
     refused(
         "CREATE TABLE ck_s (iv interval, CHECK (iv = (SELECT max(iv) FROM n)))",
-        "comparison key",
+        "cannot use subquery in check constraint",
     );
 }
 
@@ -1736,7 +1734,7 @@ fn a_check_with_a_subquery_beside_an_interval_column_is_refused() {
 fn a_check_with_a_scalar_subquery_beside_an_interval_column_is_refused() {
     refused(
         "CREATE TABLE ck_s2 (iv interval, CHECK (iv < (SELECT iv FROM n LIMIT 1)))",
-        "has no SQLite form that reads",
+        "cannot use subquery in check constraint",
     );
 }
 

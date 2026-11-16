@@ -175,7 +175,7 @@ fn view_with_nested_join() {
     let sql = format!(
         "{SCHEMA}
          CREATE VIEW nested AS
-         SELECT *
+         SELECT users.name, posts.title, comments.body
          FROM (users JOIN posts ON users.id = posts.user_id)
          JOIN comments ON posts.id = comments.post_id;"
     );

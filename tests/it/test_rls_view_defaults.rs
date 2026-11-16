@@ -150,7 +150,7 @@ const ORDERS: &str = "
         quantity BIGINT NOT NULL
     );
     ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
-    CREATE POLICY orders_p ON orders USING (owner_id = current_setting('app.user_id'));
+    CREATE POLICY orders_p ON orders USING (owner_id = current_setting('app.user_id')::uuid);
 ";
 
 fn options() -> Pg2SqliteOptions {
@@ -158,7 +158,7 @@ fn options() -> Pg2SqliteOptions {
         .with_rls_audit_table_name("rls_audit")
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_function_name("uuidv7".to_owned())
-        .with_deployment(deployment([], [caller("app.user_id", "text")]))
+        .with_deployment(deployment([], [caller("app.user_id", "uuid")]))
         .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
 }
 

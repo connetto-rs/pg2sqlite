@@ -475,9 +475,10 @@ fn evaluate_definition<T: PartialEq>(
         ColumnDefinition::RecursiveUnion { anchor, .. } => {
             evaluate_definition(&anchor.definition(), schema, options, read_column, read_expression)
         }
-        ColumnDefinition::Parameter { .. } | ColumnDefinition::Opaque => {
-            Ok(DefinitionValue::Opaque)
-        }
+        ColumnDefinition::Parameter { .. }
+        | ColumnDefinition::Variable(_)
+        | ColumnDefinition::VariableField(_)
+        | ColumnDefinition::Opaque => Ok(DefinitionValue::Opaque),
     }
 }
 
@@ -674,7 +675,10 @@ fn definition_find<T>(
         ColumnDefinition::RecursiveUnion { anchor, .. } => {
             definition_find(&anchor.definition(), schema, options, read_column, read_expression)
         }
-        ColumnDefinition::Parameter { .. } | ColumnDefinition::Opaque => Ok(None),
+        ColumnDefinition::Parameter { .. }
+        | ColumnDefinition::Variable(_)
+        | ColumnDefinition::VariableField(_)
+        | ColumnDefinition::Opaque => Ok(None),
     }
 }
 
@@ -6035,6 +6039,75 @@ mod tests {
             )
             .unwrap();
             assert_eq!(found, expected, "{sql}");
+        }
+    }
+
+    /// A PL/pgSQL variable, and a field of a record variable, stand for values
+    /// only the running body knows.
+    #[test]
+    fn a_plpgsql_variable_and_its_field_read_as_opaque() {
+        use sql_traits::{
+            structs::{ColumnDefinition, IdentifierCase, TargetName},
+            traits::{DatabaseLike, FunctionLike},
+        };
+
+        let schema = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE t (name TEXT);
+             CREATE FUNCTION f(p TEXT) RETURNS VOID LANGUAGE plpgsql AS $$
+             DECLARE r t%ROWTYPE;
+             BEGIN
+                 SELECT * INTO r FROM t;
+                 EXECUTE 'SELECT ' || p || r.name;
+             END $$;",
+        )
+        .unwrap();
+        let function = schema
+            .function_by_target(TargetName::new("f", false), IdentifierCase::AsWritten)
+            .unwrap()
+            .expect("f is declared");
+        let body = function.dynamic_execution_sites(&schema).unwrap();
+        let sites = body.sites().unwrap();
+        let [site] = sites.as_slice() else { panic!("one site") };
+        let context = site.context(IdentifierCase::Folded).unwrap();
+        let Expr::BinaryOp { left, right: field, .. } = site.command() else {
+            panic!("a concatenation")
+        };
+        let Expr::BinaryOp { right: variable, .. } = left.as_ref() else {
+            panic!("a concatenation")
+        };
+        let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
+        let read_column = |_: &sqlparser::ast::ColumnDef| Some("column");
+        let read_expression =
+            |_: &Expr, _: &ParserDB, _: &crate::options::TranslationContext<'_>| {
+                Ok(Some("expression"))
+            };
+        for reference in [variable.as_ref(), field.as_ref()] {
+            let (definition, _) = context.reference(reference).unwrap().expect("binds");
+            assert!(
+                matches!(
+                    definition,
+                    ColumnDefinition::Variable(_) | ColumnDefinition::VariableField(_)
+                ),
+                "{reference}"
+            );
+            let evaluated = super::evaluate_definition(
+                &definition,
+                &schema,
+                &options,
+                &read_column,
+                &read_expression,
+            )
+            .unwrap();
+            assert!(matches!(evaluated, super::DefinitionValue::Opaque), "{reference}");
+            let found = super::definition_find(
+                &definition,
+                &schema,
+                &options,
+                &read_column,
+                &read_expression,
+            )
+            .unwrap();
+            assert_eq!(found, None, "{reference}");
         }
     }
 }
