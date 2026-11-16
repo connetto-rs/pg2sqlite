@@ -30,6 +30,8 @@ mod parity_helper_conditions;
 
 #[path = "gauntlet/parity_plpgsql.rs"]
 mod parity_plpgsql;
+#[path = "gauntlet/parity_scalar_helpers.rs"]
+mod parity_scalar_helpers;
 
 #[path = "gauntlet/parity_text.rs"]
 mod parity_text;

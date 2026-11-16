@@ -261,6 +261,7 @@ mod test_rls_view_defaults;
 mod test_rls_volatile_copy;
 mod test_rls_with_check_defaults;
 mod test_root_query_parentheses;
+mod test_scalar_helper_inlining;
 mod test_schema_qualified_names;
 mod test_semantic_differences_readme;
 mod test_semantic_divergence;

@@ -284,8 +284,21 @@ fn generate_standard_trigger_body(
                 sqlparser::ast::ObjectNamePart::Function(_) => None,
             }
         });
+        // A definer body's calls run as its owner, whose privileges they
+        // need.
+        let owner = match crate::traits::schema::written_function(schema, function_name)? {
+            Some(function) => super::definer::definer_owner(function, schema)?,
+            None => None,
+        };
+        let running_as =
+            owner.map(|owner| options.with_running_as(sql_traits::traits::RoleLike::name(owner)));
+        let body_options = running_as.as_ref().unwrap_or(options);
         let translated = super::plpgsql::PlPgSqlTranslator::translate_with_context(
-            &body, context, schema, options, emit,
+            &body,
+            context,
+            schema,
+            body_options,
+            emit,
         )?;
         body.statements =
             run_as_definer_or_route_writes(function_name, translated, schema, options)?;

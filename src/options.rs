@@ -276,6 +276,10 @@ pub struct TranslationContext<'a> {
     /// The schema as the statement being translated was written, which names
     /// a wildcard's columns before a later column change in its epoch.
     written_schema: Option<&'a ParserDB>,
+    /// The role the body being translated runs as, the owner of a `SECURITY
+    /// DEFINER` trigger function, which PostgreSQL checks a call's privileges
+    /// against in place of the acting role.
+    running_as: Option<&'a str>,
 }
 
 /// The fields a derived [`TranslationContext`] copies from an existing one,
@@ -289,6 +293,7 @@ struct ContextFields<'a> {
     subqueries_allowed: bool,
     rebound_body: Option<&'a sqlparser::ast::BeginEndStatements>,
     written_schema: Option<&'a ParserDB>,
+    running_as: Option<&'a str>,
 }
 
 impl<'a> ContextFields<'a> {
@@ -302,6 +307,7 @@ impl<'a> ContextFields<'a> {
             subqueries_allowed: context.subqueries_allowed,
             rebound_body: context.rebound_body,
             written_schema: context.written_schema,
+            running_as: context.running_as,
         }
     }
 
@@ -323,6 +329,7 @@ impl<'a> ContextFields<'a> {
             subqueries_allowed: self.subqueries_allowed,
             rebound_body: self.rebound_body,
             written_schema: self.written_schema,
+            running_as: self.running_as,
         }
     }
 }
@@ -343,6 +350,7 @@ impl<'a> TranslationContext<'a> {
             subqueries_allowed: true,
             rebound_body: None,
             written_schema: None,
+            running_as: None,
         }
     }
     pub(crate) fn with_complete_schema(options: &'a Pg2SqliteOptions) -> Self {
@@ -364,6 +372,7 @@ impl<'a> TranslationContext<'a> {
             subqueries_allowed: true,
             rebound_body: None,
             written_schema: None,
+            running_as: None,
         }
     }
 
@@ -482,6 +491,19 @@ impl<'a> TranslationContext<'a> {
     /// The schema the statement being translated was written against.
     pub(crate) const fn written_schema(&self) -> Option<&ParserDB> {
         self.written_schema
+    }
+
+    /// The same context translating a body that runs as `role`.
+    pub(crate) fn with_running_as<'s>(&'s self, role: &'s str) -> TranslationContext<'s> {
+        let mut fields = ContextFields::borrowed(self);
+        fields.running_as = Some(role);
+        fields.into_context(self.scope, self.outer)
+    }
+
+    /// The role the body being translated runs as, when it runs as other than
+    /// the acting role.
+    pub(crate) const fn running_as(&self) -> Option<&str> {
+        self.running_as
     }
 
     /// Restricts expression translation to a position that forbids subqueries.

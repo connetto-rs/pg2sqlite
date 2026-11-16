@@ -893,7 +893,9 @@ pub(crate) fn json_set_membership(
 }
 
 /// What `x = ANY(string_to_array(<setting>, written)[::T[]])` becomes, `cast`
-/// being the element type of the written array cast.
+/// being the element type of the written array cast. `empty_is_null` reads
+/// an empty setting as NULL, as `string_to_array(NULLIF(<setting>, ''), ...)`
+/// does, which answers NULL where an empty set answers false.
 ///
 /// A set of text split on one character keeps the `instr()` search, and
 /// anything else splits the setting into rows with [`split_membership`].
@@ -901,6 +903,7 @@ pub(crate) fn delimited_set_membership(
     translated_left: Expr,
     name: &str,
     written: &str,
+    empty_is_null: bool,
     cast: Option<&DataType>,
     negated: bool,
     options: &Pg2SqliteOptions,
@@ -909,13 +912,18 @@ pub(crate) fn delimited_set_membership(
     let pattern = setting.pattern();
     let element = setting.delimited_set(written)?;
     let elements = format!("the elements of {pattern}");
+    let text = if empty_is_null {
+        simple_function_expr("nullif", vec![setting.call(), string_literal("")], None)
+    } else {
+        setting.call()
+    };
     if is_text_type(element)
         && let Some(delimiter) = crate::impls::idioms::single_character(written)
     {
         typed_reading(&elements, element, cast, setting.call(), options)?;
         return Ok(crate::impls::idioms::delimited_membership(
             translated_left,
-            setting.call(),
+            text,
             delimiter,
             negated,
         ));
@@ -927,7 +935,7 @@ pub(crate) fn delimited_set_membership(
         Expr::Identifier(sqlparser::ast::Ident::new(SPLIT_ELEMENT)),
         options,
     )?;
-    Ok(split_membership(translated_left, setting.call(), written, value, negated))
+    Ok(split_membership(translated_left, text, written, value, negated))
 }
 
 /// The column the rows of [`split_membership`] answer each element in.
@@ -1158,6 +1166,12 @@ fn canonical(data_type: &DataType) -> DataType {
         }
         DataType::Time(precision, TimezoneInfo::Tz) => {
             DataType::Time(*precision, TimezoneInfo::WithTimeZone)
+        }
+        DataType::Array(sqlparser::ast::ArrayElemTypeDef::SquareBracket(element, size)) => {
+            DataType::Array(sqlparser::ast::ArrayElemTypeDef::SquareBracket(
+                Box::new(canonical(element)),
+                *size,
+            ))
         }
         DataType::Custom(name, modifiers) => {
             DataType::Custom(

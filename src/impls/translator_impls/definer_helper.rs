@@ -12,12 +12,11 @@
 use core::{convert::Infallible, ops::ControlFlow};
 
 use sql_traits::{
-    errors::{HelperSetError, LookupError},
+    errors::HelperSetError,
     structs::{
-        AntiJoin, CallerGate, CapOperand, GrantArm, GrantedTo, HelperArm, HelperSet,
-        IdentifierCase, ParentArm, ParserDB, Restriction, RowCap, SetPacking, SettingComparison,
-        SettingContent, SettingValue, TargetName, TimeBound, TimeComparison, WalkArm,
-        WalkDirection,
+        AntiJoin, CallerGate, CapOperand, GrantArm, GrantedTo, HelperArm, HelperSet, ParentArm,
+        ParserDB, Restriction, RowCap, SetPacking, SettingComparison, SettingContent, SettingValue,
+        TimeBound, TimeComparison, WalkArm, WalkDirection,
     },
     traits::{ColumnLike, DatabaseLike, FunctionLike, TableLike},
 };
@@ -39,9 +38,10 @@ use crate::{
         query_builder::{
             from_relation, make_query, make_simple_select, plain_table_factor, single_expr_query,
         },
+        translator_impls::sql_helper::declared_helper,
     },
     options::TranslationContext,
-    traits::{TranslatorWithContext, schema::function_lookup_target},
+    traits::TranslatorWithContext,
     warnings::WarningSink,
 };
 
@@ -65,30 +65,13 @@ pub(crate) fn helper_membership(
     emit: WarningSink<'_>,
 ) -> Result<Option<Query>, Error> {
     let Some(Expr::Function(call)) = query_projection(subquery) else { return Ok(None) };
-    if let [ObjectNamePart::Identifier(name)] = call.name.0.as_slice()
-        && options.declares_user_defined_function(&name.value)
-    {
+    // A helper returning one value stands for its body, which the call's
+    // ordinary translation writes in place of it.
+    let Some(helper) =
+        declared_helper(&call.name, schema, options)?.filter(|helper| helper.returns_set())
+    else {
         return Ok(None);
-    }
-    let Some(target) = function_lookup_target(&call.name) else { return Ok(None) };
-    // A builtin resolves too, registered in `pg_catalog`, and is no helper.
-    let declared = match schema.resolve_target_function(target.clone(), IdentifierCase::AsWritten) {
-        Ok(function) => {
-            function.filter(|function| {
-                !function
-                    .target_name()
-                    .schema()
-                    .is_some_and(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
-            })
-        }
-        // The catalog holds the name, so the ambiguous lookup settles to the
-        // builtins.
-        Err(LookupError::AmbiguousFunctionLookup { .. }) if pg_catalog_holds(schema, &target) => {
-            None
-        }
-        Err(error) => return Err(error.into()),
     };
-    let Some(helper) = declared else { return Ok(None) };
     let name = &call.name;
     let Some(deployment) = options.get_deployment() else {
         return Err(Error::forward_refusal(format!(
@@ -117,25 +100,6 @@ pub(crate) fn helper_membership(
     let ControlFlow::Continue(()) = lowered
         .visit(&mut BackingTables { guarded: &guarded, suffix: options.get_rls_table_suffix() });
     Ok(Some(lowered))
-}
-
-/// Whether `pg_catalog` declares the name `target` carries, which settles an
-/// ambiguous name lookup to the builtins, no helper.
-fn pg_catalog_holds(schema: &ParserDB, target: &TargetName<'_>) -> bool {
-    let case = IdentifierCase::AsWritten;
-    let name = case.compared_form(target.name(), target.name_is_quoted());
-    match target.schema() {
-        Some(stored) => case.compared_form(stored, target.schema_is_quoted()) == "pg_catalog",
-        None => {
-            schema.functions().any(|function| {
-                let stored = function.target_name();
-                case.compared_form(stored.name(), stored.name_is_quoted()) == name
-                    && stored.schema().is_some_and(|schema_name| {
-                        case.compared_form(schema_name, stored.schema_is_quoted()) == "pg_catalog"
-                    })
-            })
-        }
-    }
 }
 
 /// The literals a call passes, one per argument.
