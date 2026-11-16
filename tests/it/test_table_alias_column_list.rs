@@ -4,6 +4,11 @@
 //! the declared columns under their new names inside a derived table,
 //! `(SELECT id AS a, s AS b FROM t) AS x`, the same shape the UNNEST lowering
 //! already uses for the same reason.
+//!
+//! A subquery or `VALUES` list renamed the same way, `(VALUES (1)) AS v (a)`,
+//! renames its outputs by position through a CTE column list inside the
+//! derived table, since the names SQLite gives the translated outputs need not
+//! be PostgreSQL's.
 
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use run_translated_helper::run_translated_with;
@@ -90,4 +95,82 @@ fn an_alias_list_over_an_undeclared_relation_is_refused() {
 #[test]
 fn a_data_type_in_the_alias_list_is_refused() {
     assert_refused(&format!("{FIXTURE} SELECT * FROM t AS x (a INT);"), "data type");
+}
+
+/// connetto's `CROSS JOIN (VALUES ...) allowed(role)` shape, a `VALUES` list
+/// whose only name for its column is the one the alias gives it.
+#[test]
+fn an_alias_list_renames_a_values_list() {
+    assert_eq!(probe_column_names("SELECT * FROM (VALUES (1, 'one')) AS v (a, b)"), vec!["a", "b"]);
+    assert_eq!(
+        rows(
+            "SELECT allowed.role FROM t CROSS JOIN (VALUES ('writer'), ('reader')) allowed(role) \
+             ORDER BY allowed.role"
+        ),
+        vec![Some("reader".to_string()), Some("writer".to_string())]
+    );
+}
+
+/// A shorter list renames the leading outputs and the rest keep the names
+/// PostgreSQL gives them, `column2` for a `VALUES` list.
+#[test]
+fn a_shorter_alias_list_keeps_the_trailing_output_names() {
+    assert_eq!(
+        probe_column_names("SELECT * FROM (VALUES (1, 'one')) AS v (a)"),
+        vec!["a", "column2"]
+    );
+    assert_eq!(probe_column_names("SELECT * FROM (SELECT id, s FROM t) AS x (a)"), vec!["a", "s"]);
+}
+
+/// PostgreSQL names `count(*)` as `count` and SQLite as `count(*)`, so the
+/// rename has to go by position rather than by the output's name.
+#[test]
+fn an_alias_list_renames_an_expression_output() {
+    assert_eq!(
+        rows("SELECT x.n FROM (SELECT count(*) FROM t) AS x (n)"),
+        vec![Some("1".to_string())]
+    );
+}
+
+/// The subquery may read a relation carrying the alias's own name, which a
+/// rename named after the alias would read as a reference to itself.
+#[test]
+fn the_subquery_may_read_a_relation_named_like_the_alias() {
+    assert_eq!(rows("SELECT t.a FROM (SELECT s FROM t) AS t (a)"), vec![Some("one".to_string())]);
+}
+
+/// PostgreSQL refuses a list longer than the subquery's outputs.
+#[test]
+fn a_longer_alias_list_over_a_subquery_is_refused() {
+    let error = refuse("SELECT * FROM (VALUES (1)) AS v (a, b)");
+    assert!(
+        error.contains('2') && error.contains('1'),
+        "the refusal must carry both counts, got: {error}"
+    );
+}
+
+/// PostgreSQL refuses a data type in the list of a subquery's alias too.
+#[test]
+fn a_data_type_in_a_subquery_alias_list_is_refused() {
+    assert_refused(&format!("{FIXTURE} SELECT * FROM (VALUES (1)) AS v (a INT);"), "data type");
+}
+
+/// A wildcard over an undeclared relation has no known width, so which
+/// outputs the list renames is unknown.
+#[test]
+fn an_alias_list_over_outputs_of_unknown_width_is_refused() {
+    assert_refused(
+        &format!("{FIXTURE} SELECT * FROM (SELECT * FROM absent) AS x (a);"),
+        "cannot enumerate",
+    );
+}
+
+/// An output past the list keeps PostgreSQL's name for it, so one whose name
+/// is not modeled cannot be kept.
+#[test]
+fn an_unmodeled_trailing_output_name_is_refused() {
+    assert_refused(
+        &format!("{FIXTURE} SELECT * FROM (SELECT 1, s IS NORMALIZED FROM t) AS x (a);"),
+        "output 2",
+    );
 }

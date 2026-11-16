@@ -8,18 +8,19 @@ use sql_traits::{
     traits::{ColumnLike, DatabaseLike, TableLike},
 };
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, BinaryOperator, CastKind, ColumnOption, DataType, Expr,
+    Assignment, AssignmentTarget, BinaryOperator, CastKind, ColumnOption, Cte, DataType, Expr,
     ExprWithAlias, ExprWithAliasAndOrderBy, Fetch, FromTable, Function, FunctionArg,
     FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList, FunctionArguments, GeneratedAs,
     GroupByExpr, HavingBound, Ident, InTarget, Join, JoinConstraint, JoinOperator, LimitClause,
     ListAggOnOverflow, Measure, NamedWindowDefinition, NamedWindowExpr, ObjectName, ObjectNamePart,
     OrderBy, OrderByExpr, OrderByKind, PipeOperator, PivotValueSource, Query, Select, SelectItem,
     SetExpr, SetOperator, SetQuantifier, Setting, Statement, SymbolDefinition, TableAlias,
-    TableFactor, TableFunctionArgs, TableSample, TableSampleBucket, TableSampleKind,
-    TableSampleQuantity, TableVersion, TableWithJoins, UnaryOperator, UpdateTableFromKind, Value,
-    ValueWithSpan, Values, Visit, Visitor, WindowFrame, WindowFrameBound, WindowFrameUnits,
-    WindowSpec, WindowType, With, WithFill, XmlNamespaceDefinition, XmlPassingArgument,
-    XmlPassingClause, XmlTableColumn, XmlTableColumnOption, visit_expressions,
+    TableAliasColumnDef, TableFactor, TableFunctionArgs, TableSample, TableSampleBucket,
+    TableSampleKind, TableSampleQuantity, TableVersion, TableWithJoins, UnaryOperator,
+    UpdateTableFromKind, Value, ValueWithSpan, Values, Visit, Visitor, WildcardAdditionalOptions,
+    WindowFrame, WindowFrameBound, WindowFrameUnits, WindowSpec, WindowType, With, WithFill,
+    XmlNamespaceDefinition, XmlPassingArgument, XmlPassingClause, XmlTableColumn,
+    XmlTableColumnOption, helpers::attached_token::AttachedToken, visit_expressions,
 };
 
 #[cfg(not(feature = "std"))]
@@ -28,8 +29,9 @@ use crate::{
     errors::Error,
     impls::{
         object_name::{COLUMN_LOOKUP_CASE, last_ident, resolve_translation_table},
-        query_builder::{from_relation, make_query, make_simple_select},
+        query_builder::{from_relation, make_query, make_simple_select, plain_table_with_joins},
         translator_impls::{
+            unused_cte_name,
             uuid::{
                 is_blob_uuid_representation, make_uuid_conversion_call,
                 maybe_canonicalize_text_uuid_literal, maybe_wrap_text_uuid_literal,
@@ -5013,15 +5015,6 @@ pub(crate) fn translate_table_factor<D: TranslationDirection>(
         }
         TableFactor::Derived { subquery, lateral, alias, sample } => {
             if D::IS_FORWARD {
-                // SQLite grammar has no column list on a table alias.
-                // The same limitation forces the derived-table shape in
-                // array.rs::translate_unnest_factor.
-                if alias.as_ref().is_some_and(|a| !a.columns.is_empty()) {
-                    return Err(Error::forward_refusal("Table alias with a column list (AS alias(col1, col2, ...)) is not \
-                                     supported in SQLite grammar. Project the column names instead, for \
-                                     example: SELECT column1 AS a FROM (VALUES (1),(2)) AS v"
-                        .to_string()));
-                }
                 // SQLite has no LATERAL join. Drop the keyword only when the
                 // subquery is trivially uncorrelated (no FROM clause, no column
                 // references). Any other case would fail at runtime with
@@ -5039,6 +5032,11 @@ pub(crate) fn translate_table_factor<D: TranslationDirection>(
                             .to_string(),
                     ));
                 }
+            }
+            if D::IS_FORWARD
+                && let Some(alias) = alias.as_ref().filter(|alias| !alias.columns.is_empty())
+            {
+                return renamed_derived_factor::<D>(subquery, alias, schema, options, emit);
             }
             TableFactor::Derived {
                 subquery: Box::new(D::translate_query(subquery, schema, options, emit)?),
@@ -5282,16 +5280,139 @@ pub(crate) fn translate_table_factor<D: TranslationDirection>(
     })
 }
 
+/// Refuses a data type in `alias`'s column list, which PostgreSQL accepts
+/// only on a function returning `record`.
+fn refuse_typed_alias_columns(
+    relation: impl core::fmt::Display,
+    alias: &TableAlias,
+) -> Result<(), Error> {
+    match alias.columns.iter().find(|column| column.data_type.is_some()) {
+        Some(typed) => {
+            Err(Error::forward_refusal(format!(
+                "FROM {relation} AS {} ({} ...) carries a data type in the column alias list. \
+                 PostgreSQL only accepts one on a function returning record, so a file carrying \
+                 it on a table or a subquery is not the input this crate translates. Name the \
+                 columns alone.",
+                alias.name, typed.name
+            )))
+        }
+        None => Ok(()),
+    }
+}
+
+/// Rewrites `(subquery) AS x (a, b)` into
+/// `(WITH c (a, b) AS (subquery) SELECT * FROM c) AS x`.
+///
+/// A CTE column list renames by position, since SQLite names translated
+/// outputs differently from PostgreSQL (`count(*)` against `count`). Outputs
+/// past the list keep PostgreSQL's names, and `c` is a name the subquery does
+/// not read, which SQLite would take as a reference to the CTE itself.
+fn renamed_derived_factor<D: TranslationDirection>(
+    subquery: &Query,
+    alias: &TableAlias,
+    schema: &ParserDB,
+    options: &D::Options<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<TableFactor, Error> {
+    refuse_typed_alias_columns("(...)", alias)?;
+
+    let outputs =
+        with_output_scope(subquery, schema, required_forward_context::<D>(options), |scope| {
+            Ok(scope.and_then(|scope| {
+                scope
+                    .outputs()
+                    .map(|output| {
+                        match output {
+                            QueryOutput::Column { name, .. } => {
+                                Some(name.map(|(name, quoted)| {
+                                    if quoted {
+                                        Ident::with_quote('"', name)
+                                    } else {
+                                        Ident::new(name)
+                                    }
+                                }))
+                            }
+                            QueryOutput::Unexpanded => None,
+                        }
+                    })
+                    .collect::<Option<Vec<_>>>()
+            }))
+        })?;
+    let Some(outputs) = outputs else {
+        return Err(Error::forward_refusal(format!(
+            "FROM (...) AS {} (...) renames the outputs of a subquery whose columns the \
+             translation cannot enumerate, such as a wildcard over a relation the translation \
+             schema does not declare, so which outputs the list renames is unknown. Name the \
+             subquery's columns in its own select list.",
+            alias.name
+        )));
+    };
+
+    if alias.columns.len() > outputs.len() {
+        return Err(Error::forward_refusal(format!(
+            "FROM (...) AS {} (...) names {} columns for a subquery that answers only {}. \
+             PostgreSQL refuses the longer list too. Name at most the subquery's column count.",
+            alias.name,
+            alias.columns.len(),
+            outputs.len()
+        )));
+    }
+
+    let mut columns = alias.columns.clone();
+    for (position, output) in outputs.into_iter().enumerate().skip(columns.len()) {
+        let Some(name) = output else {
+            return Err(Error::forward_refusal(format!(
+                "FROM (...) AS {} (...) keeps output {} of the subquery under the name PostgreSQL \
+                 gives it, which the translation does not model. Extend the alias list to name \
+                 every output, or alias that output in the subquery.",
+                alias.name,
+                position + 1
+            )));
+        };
+        columns.push(TableAliasColumnDef { name, data_type: None });
+    }
+
+    let translated = D::translate_query(subquery, schema, options, emit)?;
+    let name = Ident::new(unused_cte_name(&translated));
+    let body = make_simple_select(
+        vec![SelectItem::Wildcard(WildcardAdditionalOptions::default())],
+        vec![plain_table_with_joins(ObjectName::from(vec![name.clone()]))],
+        None,
+    );
+    let with = With {
+        with_token: AttachedToken::empty(),
+        recursive: false,
+        cte_tables: vec![Cte {
+            alias: TableAlias { explicit: false, name, columns, at: None },
+            query: Box::new(translated),
+            from: None,
+            materialized: None,
+            closing_paren_token: AttachedToken::empty(),
+        }],
+    };
+
+    Ok(TableFactor::Derived {
+        lateral: false,
+        subquery: Box::new(make_query(Some(with), SetExpr::Select(Box::new(body)))),
+        alias: Some(TableAlias {
+            explicit: true,
+            name: alias.name.clone(),
+            columns: Vec::new(),
+            at: None,
+        }),
+        sample: None,
+    })
+}
+
 /// Rewrites `FROM t AS x (a, b)` into `(SELECT id AS a, s AS b FROM t) AS x`.
 ///
 /// PostgreSQL renames the table's leading columns positionally and keeps the
 /// rest under their declared names, and it refuses a list longer than the
 /// table or one carrying data types, which belong to a function returning
 /// `record`. SQLite accepts no column list on a table alias, so the rename
-/// happens in a projection, the shape `translate_unnest_factor` and the
-/// `Derived` arm already use for the same reason. The declared idents are
-/// rebuilt with their quoting so a quoted column name stays quoted in the
-/// projection.
+/// happens in a projection, the shape `translate_unnest_factor` already uses
+/// for the same reason. The declared idents are rebuilt with their quoting so
+/// a quoted column name stays quoted in the projection.
 fn renamed_relation_factor<D: TranslationDirection>(
     name: &ObjectName,
     alias: &TableAlias,
@@ -5299,14 +5420,7 @@ fn renamed_relation_factor<D: TranslationDirection>(
     options: &D::Options<'_>,
     _emit: crate::warnings::WarningSink<'_>,
 ) -> Result<TableFactor, Error> {
-    if let Some(typed) = alias.columns.iter().find(|column| column.data_type.is_some()) {
-        return Err(Error::forward_refusal(format!(
-            "FROM {name} AS {} ({} ...) carries a data type in the column alias list. \
-             PostgreSQL only accepts one on a function returning record, so a file carrying \
-             it on a table is not the input this crate translates. Name the columns alone.",
-            alias.name, typed.name
-        )));
-    }
+    refuse_typed_alias_columns(name, alias)?;
 
     let Some(table) = resolve_translation_table(schema, name)? else {
         return Err(Error::forward_refusal(format!(

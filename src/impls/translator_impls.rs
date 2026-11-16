@@ -13,6 +13,7 @@ mod create_table;
 mod create_trigger;
 mod create_view;
 mod cte;
+pub(crate) use cte::unused_cte_name;
 pub(crate) mod data_type;
 pub(crate) mod definer;
 mod definer_helper;

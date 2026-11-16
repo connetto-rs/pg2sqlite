@@ -56,28 +56,23 @@ pub(super) fn preserve_bindings(query: &Query) -> Cow<'_, Query> {
         return Cow::Borrowed(query);
     }
 
-    let mut names = Names::default();
-    let _: ControlFlow<()> = query.visit(&mut names);
+    let names = Names::of(query);
     let mut next = 0;
     let replacements = captures
         .aliases
         .into_iter()
-        .map(|captured| {
-            captured.then(|| {
-                loop {
-                    let candidate = format!("__pg2sqlite_cte_{next}");
-                    next += 1;
-                    if !names.0.contains(&candidate) {
-                        break candidate;
-                    }
-                }
-            })
-        })
+        .map(|captured| captured.then(|| names.fresh(&mut next)))
         .collect();
     let mut rewritten = query.clone();
     let mut renamer = Renamer { scopes: RelationScopes::default(), replacements };
     let _: ControlFlow<()> = VisitMut::visit(&mut rewritten, &mut renamer);
     Cow::Owned(rewritten)
+}
+
+/// A CTE name no relation or CTE inside `query` names, so a `WITH` wrapped
+/// around `query` captures none of its references.
+pub(crate) fn unused_cte_name(query: &Query) -> String {
+    Names::of(query).fresh(&mut 0)
 }
 
 struct Captures {
@@ -127,6 +122,26 @@ impl Visitor for Captures {
 
 #[derive(Default)]
 struct Names(BTreeSet<String>);
+
+impl Names {
+    fn of(query: &Query) -> Self {
+        let mut names = Self::default();
+        let _: ControlFlow<()> = query.visit(&mut names);
+        names
+    }
+
+    /// The first `__pg2sqlite_cte_{n}` from `next` on that no visited name
+    /// takes, advancing `next` past it.
+    fn fresh(&self, next: &mut usize) -> String {
+        loop {
+            let candidate = format!("__pg2sqlite_cte_{next}");
+            *next += 1;
+            if !self.0.contains(&candidate) {
+                return candidate;
+            }
+        }
+    }
+}
 
 impl Visitor for Names {
     type Break = ();
