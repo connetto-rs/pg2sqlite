@@ -501,6 +501,10 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
             )));
         }
 
+        if self.is_constraint {
+            super::deferred_constraint::check_clauses(self)?;
+        }
+
         let source_table_name = self.table_name.clone();
         validate_schema_qualified_object_name_for_sqlite(schema, &source_table_name)?;
         let normalized_source_table_name =
@@ -592,12 +596,8 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
                 "Triggers with `OR ALTER` are not supported",
             ));
         }
-        if is_constraint {
-            return Err(crate::errors::Error::unsupported_source_syntax(
-                "Constraint triggers are not supported",
-            ));
-        }
-        if let Some(characteristics) = &characteristics {
+        // `check_clauses` checks a constraint trigger's characteristics.
+        if let Some(characteristics) = characteristics.as_ref().filter(|_| !is_constraint) {
             return Err(crate::errors::Error::unsupported_source_syntax(format!(
                 "Triggers with characteristics are not supported: `{characteristics}`"
             )));
@@ -646,7 +646,11 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
         } else {
             let reentry_guard = (is_maintenance_trigger && maintenance_update_event)
                 .then(|| super::reentry::unmarked(&marker, "NEW"));
-            (None, merge_conditions(translated_cond, reentry_guard))
+            // A constraint check skips exempt writes, as write guards do.
+            let exemption = is_constraint
+                .then(|| super::rls::write_guard_condition_expr(None, options))
+                .flatten();
+            (None, merge_conditions(merge_conditions(exemption, translated_cond), reentry_guard))
         };
 
         // SQLite takes one event per trigger.
@@ -721,7 +725,7 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
                     or_alter,
                     temporary,
                     or_replace: false,
-                    is_constraint,
+                    is_constraint: false,
                     name: part_name,
                     period,
                     events: part_events,

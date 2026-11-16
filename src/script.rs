@@ -71,6 +71,18 @@ pub struct Script<S = Statement> {
     /// The committed `TEMP` objects and rows the source leaves behind,
     /// recreated on a connection to an existing database file.
     pub connection: Result<Vec<S>, ConnectionError>,
+    /// The statements to run before every `COMMIT` of a transaction that
+    /// writes the database, empty unless the source declares a `DEFERRABLE
+    /// INITIALLY DEFERRED` constraint trigger.
+    ///
+    /// They run the checks such a trigger queued, against the rows as they
+    /// stand, and fail with the trigger's own message on a violation, leaving
+    /// the transaction open to roll back as PostgreSQL rolls it back. A
+    /// `COMMIT` with a check still queued fails with `FOREIGN KEY constraint
+    /// failed`, and so does an autocommit write that queues one, so writes to
+    /// a table carrying such a trigger run inside a transaction. The script's
+    /// own translated `COMMIT`s already run them.
+    pub before_commit: Vec<S>,
 }
 
 impl<S> Script<S> {
@@ -133,6 +145,7 @@ impl<S> Script<S> {
             connection: self
                 .connection
                 .map(|statements| statements.into_iter().map(&mut f).collect()),
+            before_commit: self.before_commit.into_iter().map(&mut f).collect(),
         }
     }
 }

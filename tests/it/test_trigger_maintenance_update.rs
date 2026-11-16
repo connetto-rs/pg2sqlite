@@ -263,13 +263,3 @@ fn shared_after_trigger_with_conditional_return_refused() {
     ));
     assert!(message.contains("returns early"), "got: {message}");
 }
-
-#[test]
-fn constraint_trigger_refused() {
-    let message = refusal(&format!(
-        "{LOGGING_FUNCTIONS}
-         CREATE CONSTRAINT TRIGGER t_one AFTER UPDATE ON t DEFERRABLE INITIALLY DEFERRED
-             FOR EACH ROW EXECUTE FUNCTION log_one();"
-    ));
-    assert!(message.contains("Constraint triggers"), "got: {message}");
-}

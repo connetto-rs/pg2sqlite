@@ -212,6 +212,8 @@ pub(crate) struct PrewalkCatalogs {
     /// far, which a write left off the replica with its table reads to find
     /// one PostgreSQL fires for it.
     table_triggers: Vec<TableTrigger>,
+    /// The deferred constraint triggers the translation unit creates.
+    deferred_triggers: Vec<crate::impls::translator_impls::deferred_constraint::DeferredTrigger>,
     /// The request's zone, resolved the first time an operation needs it.
     request_zone: core::cell::OnceCell<Result<RequestZone, ZoneUnavailable>>,
 }
@@ -887,6 +889,21 @@ impl<'a> TranslationContext<'a> {
             .map(|trigger| trigger.name.as_str())
     }
 
+    pub(crate) fn add_deferred_trigger(
+        &mut self,
+        trigger: crate::impls::translator_impls::deferred_constraint::DeferredTrigger,
+    ) {
+        self.catalogs.to_mut().deferred_triggers.push(trigger);
+    }
+
+    /// The deferred constraint triggers the translation unit creates, whose
+    /// queue every translated `COMMIT` drains first.
+    pub(crate) fn deferred_triggers(
+        &self,
+    ) -> &[crate::impls::translator_impls::deferred_constraint::DeferredTrigger] {
+        &self.catalogs.deferred_triggers
+    }
+
     /// The request's zone, resolved against `schema` once per translation,
     /// or why it does not resolve.
     pub(crate) fn request_zone(&self, schema: &ParserDB) -> Result<&RequestZone, &ZoneUnavailable> {
@@ -1153,6 +1170,8 @@ impl Pg2SqliteOptions {
 
     #[must_use]
     /// Sets the boolean function that exempts generated write guards.
+    ///
+    /// Constraint triggers skip an exempt write too, deferred ones included.
     pub fn with_write_exemption_function(mut self, name: impl Into<String>) -> Self {
         self.write_exemption_function = Some(name.into());
         self
