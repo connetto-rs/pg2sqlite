@@ -272,6 +272,19 @@ fn conversion_of(
     }))
 }
 
+/// True when `expr` is a `uuid` stored as its 16 bytes.
+///
+/// A reference the schema cannot settle answers false rather than failing, as
+/// [`crate::impls::shared_helpers::scale_of`] does, since the reference is
+/// refused where it is translated if it cannot be.
+pub(crate) fn is_uuid_blob(
+    expr: &Expr,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> bool {
+    matches!(conversion_of(expr, schema, options), Ok(Some(Conversion::Stored(Stored::UuidBlob))))
+}
+
 fn conversion_of_type(
     data_type: &DataType,
     schema: &ParserDB,
@@ -341,7 +354,7 @@ fn bytea_text(value: &Expr) -> Expr {
 }
 
 /// The hyphenated lowercase text of a 16-byte UUID.
-fn uuid_text(value: &Expr) -> Expr {
+pub(crate) fn uuid_text(value: &Expr) -> Expr {
     let hex = simple_function_expr("hex", vec![value.clone()], None);
     let group = |start, length| substr(hex.clone(), start, number_literal(length));
     let hyphenated = [group("9", "4"), group("13", "4"), group("17", "4"), group("21", "12")]

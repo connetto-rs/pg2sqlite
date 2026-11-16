@@ -69,6 +69,7 @@ use crate::{
             definer_helper::helper_membership,
             function::cube_root_closed_form,
             helpers::Forward,
+            uuid::uuid_as_text,
             vector::{UnstoredVector, is_vector_data_type},
         },
         zone_clock::{RegisteredClock, ZoneClock, zone_clock},
@@ -3577,6 +3578,26 @@ fn translate_binary_op(
         });
     }
 
+    // `||` over a uuid stored as its 16 bytes renders its text, since SQLite
+    // concatenates the raw bytes and a leading zero byte ends the string.
+    if *op == BinaryOperator::StringConcat {
+        let left_text = uuid_as_text(left, schema, options, emit)?;
+        let right_text = uuid_as_text(right, schema, options, emit)?;
+        if left_text.is_some() || right_text.is_some() {
+            return Ok(Expr::BinaryOp {
+                left: Box::new(match left_text {
+                    Some(text) => text,
+                    None => left.translate_with_warnings(schema, options, emit)?,
+                }),
+                op: BinaryOperator::StringConcat,
+                right: Box::new(match right_text {
+                    Some(text) => text,
+                    None => right.translate_with_warnings(schema, options, emit)?,
+                }),
+            });
+        }
+    }
+
     // `||` over a value held as minor units renders the decimal PostgreSQL
     // renders, since the stored integer would concatenate as its own count:
     // `100.00 || 'x'` answered `10000x`. Two numeric operands are refused,
@@ -4544,6 +4565,13 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                         && is_boolean_expression(expr, schema, options)?
                     {
                         return render_boolean_as_text(expr, schema, options, emit);
+                    }
+                    // A uuid stored as its 16 bytes renders its text, where
+                    // the cast would answer the raw bytes.
+                    if matches!(translated_type, sqlparser::ast::DataType::Text)
+                        && let Some(text) = uuid_as_text(expr, schema, options, emit)?
+                    {
+                        return Ok(text);
                     }
                     // SQLite only accepts the `CAST(x AS type)` spelling, not
                     // PostgreSQL's `x::type` operator nor TRY_CAST / SAFE_CAST,

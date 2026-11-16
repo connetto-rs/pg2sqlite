@@ -430,7 +430,8 @@ fn round_to_multiple_of_ten(value: Expr, scale: u32, digits: u32) -> Expr {
 }
 
 /// One argument of `concat` or `concat_ws`, with a value held as minor units
-/// rendered as the decimal PostgreSQL renders.
+/// rendered as the decimal PostgreSQL renders, and a uuid stored as its 16
+/// bytes as its text.
 ///
 /// `concat(100.00, 'x')` answers `100.00x` on the server, where the stored
 /// count concatenated as `10000x`.
@@ -440,6 +441,11 @@ fn concatenated_operand(
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Expr, crate::errors::Error> {
+    if let Some(text) =
+        crate::impls::translator_impls::uuid::uuid_as_text(expr, schema, options, emit)?
+    {
+        return Ok(text);
+    }
     let translated = expr.translate_with_warnings(schema, options, emit)?;
     let Some(scale) = scale_of(expr, schema, options).filter(|scale| *scale > 0) else {
         return Ok(translated);

@@ -20,14 +20,21 @@ use sqlparser::ast::{BinaryOperator, DataType, Expr, Ident, Value, ValueWithSpan
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
 use crate::{
+    errors::Error,
     impls::{
+        bind_once::bind_once,
         function_helpers::{
             scalar_subquery_projection, simple_function_expr, single_quoted_literal, string_literal,
         },
+        object_name::last_ident,
         query_builder::single_expr_query,
+        shared_helpers::function_argument_exprs,
+        translator_impls::json_value::{is_uuid_blob, uuid_text},
     },
+    options::TranslationContext,
     prelude::Pg2SqliteOptions,
-    traits::UuidRepresentation,
+    traits::{UuidRepresentation, translator::TranslatorWithContext},
+    warnings::WarningSink,
 };
 
 /// True when the data type is the PostgreSQL `UUID` builtin.
@@ -213,6 +220,79 @@ pub(crate) fn canonical_uuid_hyphenated(text: &str) -> Option<String> {
         &hex[16..20],
         &hex[20..32],
     ))
+}
+
+/// `expr` translated to the text PostgreSQL converts a `uuid` to, or `None`
+/// when `expr` is not a uuid stored as its 16 bytes.
+///
+/// A `coalesce` over a uuid converts each argument, which answers the same
+/// text since a NULL argument's text is NULL. A `RAISE` argument arrives that
+/// way, as `coalesce(<argument>, '<NULL>')`.
+///
+/// # Errors
+///
+/// Propagates a refusal translating `expr`, and refuses an operand the
+/// rendering would read more than once where it may answer differently.
+pub(crate) fn uuid_as_text(
+    expr: &Expr,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+    emit: WarningSink<'_>,
+) -> Result<Option<Expr>, Error> {
+    if !is_blob_uuid_representation(options) || !converts_uuid(expr, schema, options) {
+        return Ok(None);
+    }
+    text_of_uuid(expr, schema, options, emit).map(Some)
+}
+
+/// The arguments of `expr` when it is a `coalesce` call.
+fn coalesce_arguments(expr: &Expr) -> Option<Vec<&Expr>> {
+    let Expr::Function(function) = expr else { return None };
+    last_ident(&function.name)
+        .is_some_and(|name| name.value.eq_ignore_ascii_case("coalesce"))
+        .then(|| function_argument_exprs(&function.args))
+}
+
+/// True when `expr` is a uuid stored as its 16 bytes, read directly or through
+/// parentheses or a `coalesce`.
+#[cfg_attr(feature = "std", recursive::recursive)]
+fn converts_uuid(expr: &Expr, schema: &ParserDB, options: &TranslationContext<'_>) -> bool {
+    if let Expr::Nested(inner) = expr {
+        return converts_uuid(inner, schema, options);
+    }
+    if let Some(arguments) = coalesce_arguments(expr) {
+        return arguments.into_iter().any(|argument| converts_uuid(argument, schema, options));
+    }
+    is_uuid_blob(expr, schema, options)
+}
+
+/// `expr` translated with every uuid it reads rendered as its text, and a
+/// literal UUID spelling written in canonical form as PostgreSQL prints it.
+#[cfg_attr(feature = "std", recursive::recursive)]
+fn text_of_uuid(
+    expr: &Expr,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+    emit: WarningSink<'_>,
+) -> Result<Expr, Error> {
+    if let Expr::Nested(inner) = expr {
+        return Ok(Expr::Nested(Box::new(text_of_uuid(inner, schema, options, emit)?)));
+    }
+    if let Some(arguments) = coalesce_arguments(expr) {
+        let texts = arguments
+            .into_iter()
+            .map(|argument| text_of_uuid(argument, schema, options, emit))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(simple_function_expr("coalesce", texts, None));
+    }
+    if let Some(canonical) = single_quoted_literal(expr).and_then(canonical_uuid_hyphenated) {
+        return Ok(string_literal(&canonical));
+    }
+    let translated = expr.translate_with_warnings(schema, options, emit)?;
+    if !is_uuid_blob(expr, schema, options) {
+        return Ok(translated);
+    }
+    bind_once("The text of a uuid", [expr], [translated], options, |[value]| uuid_text(value))
 }
 
 /// If `expr` is a single-quoted string literal, validate and canonicalize it
