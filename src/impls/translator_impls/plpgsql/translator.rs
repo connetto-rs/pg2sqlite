@@ -1,33 +1,46 @@
-//! Main translator for PL/pgSQL to `SQLite`.
-//!
-//! This module orchestrates the translation of PL/pgSQL function bodies
-//! to SQLite-compatible statements.
+//! Translates a PL/pgSQL trigger function body, read as sqlparser-plpgsql's
+//! statement tree, into the statements of a SQLite trigger body.
 
+use alloc::collections::BTreeSet;
 use core::ops::ControlFlow;
 
-use sql_traits::structs::ParserDB;
+use sql_traits::{structs::ParserDB, traits::DatabaseLike};
 use sqlparser::ast::{
-    BeginEndStatements, BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
-    GroupByExpr, Ident, InTarget, ObjectName, ObjectNamePart, Query, ReturnStatementValue, Select,
-    SelectItem, Set, SetExpr, Statement, TableAlias, TableFactor, TableWithJoins, Value,
-    ValueWithSpan, Visit, VisitMut, Visitor, VisitorMut, visit_expressions, visit_expressions_mut,
+    BinaryOperator, CaseWhen, DataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
+    FunctionReturnType, GroupByExpr, Ident, InTarget, ObjectName, ObjectNamePart, Query, Select,
+    SelectItem, SetExpr, Statement, TableAlias, TableFactor, TableWithJoins, UnaryOperator, Value,
+    Visit, VisitMut, Visitor, VisitorMut, helpers::attached_token::AttachedToken,
+    visit_expressions, visit_expressions_mut,
+};
+use sqlparser_plpgsql::embedded::{
+    self, Block, Branch, DeclarationKind, If, IntoTargets, Node, NodeKind, Target,
 };
 
-use super::{PlPgSqlContext, VariableBinding, cte_builder::CteBuilder};
+use super::{
+    cte_builder::CteBuilder,
+    raise::raise_statement,
+    scope::{Binding, BodyScope, BoundValue, TriggerFacts, expand_relation, fold},
+};
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{
         function_helpers::simple_function_expr,
-        query_builder::{make_query, make_simple_select, single_expr_query},
+        query_builder::{
+            from_relation, make_query, make_simple_select, plain_table_factor, single_expr_query,
+        },
         translator_impls::condition_injection::inject_condition_into_dml_statement,
     },
     traits::translator::TranslatorWithContext,
+    warnings::TranslationWarning,
 };
 
-/// Main translator for PL/pgSQL function bodies.
+/// Translator for PL/pgSQL trigger function bodies.
 pub struct PlPgSqlTranslator;
+
+/// The variable PostgreSQL sets after each query and data change.
+const FOUND: &str = "found";
 
 /// `SELECT RAISE(IGNORE)`, SQLite's way for a BEFORE trigger to cancel the
 /// write it was fired for.
@@ -39,177 +52,626 @@ fn raise_ignore_statement() -> Statement {
     )))
 }
 
-/// Whether `stmt` calls `uuidv7()` anywhere, under any schema qualifier.
-fn calls_uuid_v7(stmt: &Statement) -> bool {
-    let found: ControlFlow<()> = visit_expressions(stmt, |expr| {
-        if let Expr::Function(func) = expr
-            && func
-                .name
-                .0
-                .last()
-                .and_then(ObjectNamePart::as_ident)
-                .is_some_and(|ident| ident.value.eq_ignore_ascii_case("uuidv7"))
-        {
-            return ControlFlow::Break(());
+/// The last name part of `function`, lower-cased.
+fn function_name(function: &sqlparser::ast::Function) -> Option<String> {
+    crate::impls::object_name::last_ident(&function.name)
+        .map(|ident| ident.value.to_ascii_lowercase())
+}
+
+/// What the whole body reads, gathered before anything is translated.
+#[derive(Default)]
+struct Survey {
+    calls_uuid_v7: bool,
+    reads_found: bool,
+    declares_found: bool,
+}
+
+impl Visitor for Survey {
+    type Break = ();
+
+    fn post_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+        match expr {
+            Expr::Function(function) if function_name(function).as_deref() == Some("uuidv7") => {
+                self.calls_uuid_v7 = true;
+            }
+            _ if bare_identifier(expr).is_some_and(|ident| fold(ident) == FOUND) => {
+                self.reads_found = true;
+            }
+            _ => {}
         }
         ControlFlow::Continue(())
-    });
-    found.is_break()
+    }
+}
+
+impl Survey {
+    /// Surveys `block`, its declarations' defaults and its statements.
+    fn block(&mut self, block: &Block) {
+        for declaration in &block.declarations {
+            self.declares_found |= declaration.name == FOUND;
+            if let DeclarationKind::Variable(variable) = &declaration.kind
+                && let Some(default) = &variable.default
+            {
+                let _: ControlFlow<()> = default.visit(self);
+            }
+        }
+        self.nodes(&block.statements);
+    }
+
+    /// Surveys every expression `nodes` read, nested blocks and branches
+    /// included.
+    fn nodes(&mut self, nodes: &[Node]) {
+        for node in nodes {
+            match &node.kind {
+                NodeKind::Statement { statement, .. } => {
+                    let _: ControlFlow<()> = statement.visit(self);
+                }
+                NodeKind::Perform { query } => {
+                    let _: ControlFlow<()> = query.visit(self);
+                }
+                NodeKind::Assignment(assignment) => {
+                    let _: ControlFlow<()> = assignment.value.visit(self);
+                }
+                NodeKind::Block(block) => self.block(block),
+                NodeKind::If(conditional) => {
+                    for branch in &conditional.branches {
+                        let _: ControlFlow<()> = branch.condition.visit(self);
+                        self.nodes(&branch.statements);
+                    }
+                    self.nodes(&conditional.otherwise);
+                }
+                NodeKind::Return { value: Some(value) } => {
+                    let _: ControlFlow<()> = value.visit(self);
+                }
+                NodeKind::Raise(raise) => {
+                    for argument in &raise.arguments {
+                        let _: ControlFlow<()> = argument.visit(self);
+                    }
+                }
+                // Every other node is refused where it is translated.
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Refuses `node`, procedural control flow a SQLite trigger body has none of.
+fn procedural(construct: &str) -> Error {
+    Error::forward_refusal(format!(
+        "{construct} in a trigger body is procedural control flow, and a SQLite trigger body is a \
+         plain list of statements with no loop, jump or branch of its own. Express the work as \
+         set-based statements guarded by IF conditions, or move it into the application."
+    ))
+}
+
+/// Refuses a statement guarded by a condition that reads `relation`, which
+/// a statement under the same guard already wrote.
+fn rewritten_guard(relation: &str) -> Error {
+    Error::forward_refusal(format!(
+        "an IF condition reads `{relation}`, which a statement under the IF writes before this \
+         one, and the emitted trigger tests the condition again on every guarded statement, so \
+         it would see the write. Move the write after the last statement the condition guards, \
+         or test a value read before the IF."
+    ))
 }
 
 impl PlPgSqlTranslator {
-    /// Translates a PL/pgSQL function body using a pre-seeded context.
+    /// Translates the body `block` of the trigger function `function` for the
+    /// trigger `facts` describes, every statement guarded by `guard`, a
+    /// `WHEN` condition moved into the body, when there is one.
     ///
     /// # Errors
-    /// Returns an error if translation fails for any statement.
-    pub fn translate_with_context(
-        body: &BeginEndStatements,
-        mut context: PlPgSqlContext,
+    /// Returns an error when the body holds anything a SQLite trigger body
+    /// cannot run.
+    pub(crate) fn translate_body(
+        function: &str,
+        block: &Block,
+        facts: TriggerFacts,
+        guard: Option<&Expr>,
         schema: &ParserDB,
         options: &crate::options::TranslationContext<'_>,
         emit: crate::warnings::WarningSink<'_>,
     ) -> Result<Vec<Statement>, Error> {
-        let mut result = Vec::new();
-
-        context.seed_default_bindings();
-
-        // One check for the whole body, before anything is rewritten, so a
-        // `uuidv7()` with no declared function is refused for that reason
-        // wherever it sits.
-        if options.get_uuid_v7_function_name().is_none() {
-            for stmt in &body.statements {
-                if calls_uuid_v7(stmt) {
-                    return Err(Error::forward_refusal(
-                        crate::impls::translator_impls::function::uuid_v7_not_declared(),
-                    ));
-                }
-            }
+        let mut survey = Survey::default();
+        survey.block(block);
+        // Later sites swallow a refusal from a `uuidv7()` they meet, so the
+        // check runs first.
+        if survey.calls_uuid_v7 && options.get_uuid_v7_function_name().is_none() {
+            return Err(Error::forward_refusal(
+                crate::impls::translator_impls::function::uuid_v7_not_declared(),
+            ));
         }
 
-        let declared: Vec<String> =
-            context.bindings().map(|binding| binding.name.clone()).collect();
-        result.extend(Self::evaluate_assigned(
-            &declared,
-            &context,
-            schema,
-            &options.with_variables(&declared),
-            emit,
-        )?);
-
-        for stmt in &body.statements {
-            let mut translated =
-                Self::translate_statement(stmt, &mut context, schema, options, emit)?;
-            for statement in &mut translated {
-                let _: ControlFlow<()> = VisitMut::visit(statement, &mut UnreadCtePruner);
+        let mut scope = BodyScope::new(facts);
+        if survey.reads_found && survey.declares_found {
+            // A `found` declared in the outermost block shadows the one
+            // PostgreSQL sets everywhere, and one declared in a nested block
+            // only inside that block, which the translation does not track.
+            if !block.declarations.iter().any(|declaration| declaration.name == FOUND) {
+                return Err(Error::forward_refusal(
+                    "a nested block declares `found`, shadowing the FOUND PostgreSQL sets only \
+                     inside that block, and the translation does not track which one a read \
+                     sees. Rename the declared variable.",
+                ));
             }
-            result.extend(translated);
+        } else if survey.reads_found {
+            scope.tracks_found = true;
+            scope.bind(Binding {
+                name: FOUND.to_string(),
+                value: BoundValue::Expr(Expr::Value(Value::Boolean(false).with_empty_span())),
+            });
         }
 
+        if let Some(guard) = guard {
+            let folded = Self::fold_trigger_specials_in(guard.clone(), &scope.facts)?;
+            let translated = Self::translate_condition(&folded, &scope, schema, options, emit)?;
+            scope.begin_if();
+            scope.push_condition(translated);
+        }
+
+        let mut result = Self::translate_block(function, block, &mut scope, schema, options, emit)?;
+        for statement in &mut result {
+            let _: ControlFlow<()> = VisitMut::visit(statement, &mut UnreadCtePruner);
+        }
         Ok(result)
+    }
+
+    /// Translates `block`, its declarations then its statements, in `scope`.
+    fn translate_block(
+        function: &str,
+        block: &Block,
+        scope: &mut BodyScope,
+        schema: &ParserDB,
+        options: &crate::options::TranslationContext<'_>,
+        emit: crate::warnings::WarningSink<'_>,
+    ) -> Result<Vec<Statement>, Error> {
+        if !block.handlers.is_empty() {
+            return Err(Error::forward_refusal(format!(
+                "trigger function '{function}' uses exception handling, which SQLite has no \
+                 equivalent for. A trigger body can abort the statement with RAISE(ABORT) but \
+                 cannot catch anything. Move the handling into the application, or drop the \
+                 handler and let the error surface."
+            )));
+        }
+        let mut defaulted = Vec::new();
+        for declaration in &block.declarations {
+            match &declaration.kind {
+                DeclarationKind::Variable(variable) => {
+                    if scope.declares(&declaration.name) {
+                        return Err(Error::forward_refusal(format!(
+                            "the block declares `{}` again over a variable of the same name, and \
+                             the emitted trigger has one name space for the whole body. Rename \
+                             the inner variable.",
+                            declaration.name
+                        )));
+                    }
+                    scope.declare(&declaration.name);
+                    if let Some(default) = &variable.default {
+                        scope.bind_persistent(Binding {
+                            name: declaration.name.clone(),
+                            value: BoundValue::Expr(embedded::expression(default).into_owned()),
+                        });
+                        defaulted.push(declaration.name.clone());
+                    }
+                }
+                DeclarationKind::Alias(_) => {
+                    return Err(Error::forward_refusal(format!(
+                        "`{} ALIAS FOR` has no SQLite equivalent in a trigger body. Write the \
+                         name it stands for instead.",
+                        declaration.name
+                    )));
+                }
+                DeclarationKind::Cursor(_) => return Err(procedural("a cursor")),
+            }
+        }
+
+        let variables: Vec<String> = scope.bindings().map(|binding| binding.name.clone()).collect();
+        let mut result = Self::evaluate_assigned(
+            &defaulted,
+            scope,
+            schema,
+            &options.with_variables(&variables),
+            emit,
+        )?;
+        for node in &block.statements {
+            result.extend(Self::translate_node(function, node, scope, schema, options, emit)?);
+        }
+        Ok(result)
+    }
+
+    /// Translates one node of a body, refusing what a SQLite trigger cannot
+    /// run.
+    fn translate_node(
+        function: &str,
+        node: &Node,
+        scope: &mut BodyScope,
+        schema: &ParserDB,
+        options: &crate::options::TranslationContext<'_>,
+        emit: crate::warnings::WarningSink<'_>,
+    ) -> Result<Vec<Statement>, Error> {
+        let variables: Vec<String> = scope.bindings().map(|binding| binding.name.clone()).collect();
+        let scoped = options.with_variables(&variables);
+        let options = &scoped;
+
+        if !matches!(node.kind, NodeKind::Assignment(_) | NodeKind::Block(_) | NodeKind::If(_))
+            && let Some(relation) = scope.rewritten_guard_relation(schema)
+        {
+            return Err(rewritten_guard(relation));
+        }
+
+        match &node.kind {
+            NodeKind::Statement { statement, into: Some(into) } => {
+                let Statement::Query(query) = statement.as_ref() else {
+                    return Err(Error::forward_refusal(format!(
+                        "`{statement}` with INTO has no SQLite form in a trigger body, since a \
+                         SQLite trigger has no variable to receive the returned row. Read the row \
+                         back with SELECT ... INTO after the write."
+                    )));
+                };
+                let query = Self::fold_trigger_specials_in(query.as_ref().clone(), &scope.facts)?;
+                let assigned: Vec<String> = into
+                    .targets
+                    .iter()
+                    .map(|target| Self::assigned_name(target, &scope.facts))
+                    .collect::<Result<_, _>>()?;
+                Self::translate_select_into(&query, into, scope, schema, emit)?;
+                Self::evaluate_assigned(&assigned, scope, schema, options, emit)
+            }
+            NodeKind::Statement { statement, into: None } => {
+                if let Statement::Query(query) = statement.as_ref()
+                    && !matches!(
+                        query.body.as_ref(),
+                        SetExpr::Insert(_)
+                            | SetExpr::Update(_)
+                            | SetExpr::Delete(_)
+                            | SetExpr::Merge(_)
+                    )
+                {
+                    return Err(Error::forward_refusal(format!(
+                        "`{statement}` without INTO in a PL/pgSQL body is rejected by PostgreSQL, \
+                         which has no destination for its rows. Use PERFORM to run it for its \
+                         effects, or SELECT ... INTO to keep its result."
+                    )));
+                }
+                let statement =
+                    Self::fold_trigger_specials_in(statement.as_ref().clone(), &scope.facts)?;
+                Self::translate_statement(&statement, scope, schema, options, emit)
+            }
+            NodeKind::Perform { query } => {
+                let query = Self::fold_trigger_specials_in(query.as_ref().clone(), &scope.facts)?;
+                Self::translate_statement(&query, scope, schema, options, emit)
+            }
+            NodeKind::ReturnNext { .. } | NodeKind::ReturnQuery(_) => {
+                Err(Error::forward_refusal(
+                    "RETURN NEXT and RETURN QUERY add rows to a set-returning function's result, \
+                 and PostgreSQL rejects them in a trigger function, which returns one row or \
+                 NULL.",
+                ))
+            }
+            NodeKind::Assignment(assignment) => {
+                let name = Self::assigned_name(&assignment.target, &scope.facts)?;
+                let value = Self::fold_trigger_specials_in(
+                    embedded::expression(&assignment.value).into_owned(),
+                    &scope.facts,
+                )?;
+                scope.bind(Binding { name: name.clone(), value: BoundValue::Expr(value) });
+                Self::evaluate_assigned(&[name], scope, schema, options, emit)
+            }
+            NodeKind::If(conditional) => {
+                Self::translate_if(function, conditional, scope, schema, options, emit)
+            }
+            NodeKind::Return { value } => {
+                Self::translate_return(value.as_deref(), scope, schema, options, emit)
+            }
+            NodeKind::Raise(raise) => {
+                let Some(statement) = raise_statement(raise)? else { return Ok(Vec::new()) };
+                let statement = Self::fold_trigger_specials_in(statement, &scope.facts)?;
+                Self::finalize_reads(vec![statement], scope, schema, options, emit)
+            }
+            NodeKind::Block(block) => {
+                Self::translate_block(function, block, scope, schema, options, emit)
+            }
+            NodeKind::Case(_) => Err(procedural("a CASE statement")),
+            NodeKind::Loop(_) => Err(procedural("a loop")),
+            NodeKind::Exit(jump) => Err(procedural(jump.kind.keyword())),
+            NodeKind::Assert(_) => Err(procedural("ASSERT")),
+            NodeKind::Dynamic { .. } => Err(procedural("EXECUTE of a built command")),
+            NodeKind::Fetch(_)
+            | NodeKind::Move { .. }
+            | NodeKind::Open(_)
+            | NodeKind::Close { .. } => Err(procedural("a cursor")),
+            NodeKind::Commit { .. } | NodeKind::Rollback { .. } => {
+                Err(procedural("transaction control"))
+            }
+            NodeKind::Diagnostics(_) => Err(procedural("GET DIAGNOSTICS")),
+        }
     }
 
     fn translate_statement(
         stmt: &Statement,
-        context: &mut PlPgSqlContext,
+        scope: &mut BodyScope,
         schema: &ParserDB,
         options: &crate::options::TranslationContext<'_>,
         emit: crate::warnings::WarningSink<'_>,
     ) -> Result<Vec<Statement>, Error> {
-        let variables: Vec<String> =
-            context.bindings().map(|binding| binding.name.clone()).collect();
-        let scoped = options.with_variables(&variables);
-        let options = &scoped;
-        // Folded before the dispatch, so a trigger special reads the same in
-        // a statement body as it does in an `IF` condition. Read from a body
-        // and left alone, `TG_OP` was emitted as a column reference and
-        // SQLite refused the trigger.
-        let folded = Self::fold_trigger_specials_in_statement(stmt, context)?;
-        let stmt = &folded;
-
-        match stmt {
-            Statement::Set(set) => {
-                let assigned: Vec<String> =
-                    Self::handle_set_statement(set, context).into_iter().collect();
-                Self::evaluate_assigned(&assigned, context, schema, options, emit)
-            }
-
-            Statement::If(if_stmt) => {
-                Self::translate_if_statement(if_stmt, context, schema, options, emit)
-            }
-
+        let translated = match stmt {
             Statement::Insert(insert) => {
-                Self::translate_insert_statement(insert, context, schema, options, emit)
+                Self::translate_insert_statement(insert, scope, schema, options, emit)?
             }
-
-            Statement::Query(query) => {
-                Self::translate_query_statement(query, context, schema, options, emit)
-            }
-
-            Statement::Update(_) | Statement::Delete(_) => {
-                let bindings: Vec<_> = context.bindings().cloned().collect();
-                let mut translated = stmt.translate_with_warnings(schema, options, emit)?;
-                // SQLite parses no `WITH` before an `UPDATE` or a `DELETE`
-                // inside a trigger body, so the value is embedded at each
-                // read rather than bound by a CTE.
-                let (_, scope) =
-                    Self::bound_values(&bindings, ReferenceForm::Inline, schema, options, emit)?;
-                for t_stmt in &mut translated {
-                    substitute_variables(t_stmt, &scope);
+            Statement::Query(query) if !writes(stmt) => {
+                let translated = Self::translate_query_statement(query, options)?;
+                let translated = Self::finalize_reads(translated, scope, schema, options, emit)?;
+                if scope.tracks_found {
+                    let found = Self::found_after(query, schema);
+                    scope.bind(Binding { name: FOUND.to_string(), value: found });
                 }
-                if let Some(condition) = context.current_condition() {
+                return Ok(translated);
+            }
+            Statement::Query(query) => {
+                let translated = Self::translate_query_statement(query, options)?;
+                Self::finalize_query_statements(translated, scope, schema, options, emit)?
+            }
+            Statement::Update(_) | Statement::Delete(_) => {
+                let bindings: Vec<_> = scope.bindings().cloned().collect();
+                let mut translated = stmt.translate_with_warnings(schema, options, emit)?;
+                // SQLite takes no `WITH` before an `UPDATE` or `DELETE` in a
+                // trigger body.
+                let (_, variables) =
+                    Self::bound_values(&bindings, ReferenceForm::Inline, schema, options, emit);
+                for t_stmt in &mut translated {
+                    substitute_variables(t_stmt, &variables)?;
+                }
+                if let Some(condition) = scope.current_condition() {
                     for t_stmt in &mut translated {
                         Self::inject_condition_into_statement(t_stmt, &condition)?;
                     }
                 }
-                Ok(translated)
+                translated
             }
-
-            Statement::Return(ret) => {
-                Self::translate_return_statement(ret.value.as_ref(), context, schema, options, emit)
-            }
-
             other => {
                 let mut translated = other.translate_with_warnings(schema, options, emit)?;
-                // A shape this dispatch does not name still sits inside its
-                // `IF`. `TRUNCATE` is the one that mattered: it translates
-                // into a `DELETE`, which takes a guard, and emitting it
-                // unguarded emptied the table on every row.
-                if let Some(condition) = context.current_condition() {
+                // `TRUNCATE` becomes a `DELETE`, which must stay inside its
+                // `IF`.
+                if let Some(condition) = scope.current_condition() {
                     for t_stmt in &mut translated {
                         Self::inject_condition_into_statement(t_stmt, &condition)?;
                     }
                 }
-                Ok(translated)
+                translated
             }
+        };
+        Self::after_write(stmt, scope, schema);
+        Ok(translated)
+    }
+
+    /// Records what a data change does to the bindings read after it. A
+    /// write to a view counts as a write to what the view reads.
+    fn after_write(stmt: &Statement, scope: &mut BodyScope, schema: &ParserDB) {
+        let mut written = BTreeSet::new();
+        for relation in written_relations(stmt) {
+            expand_relation(relation, schema, &mut written);
+        }
+        if written.is_empty() {
+            return;
+        }
+        for relation in &written {
+            scope.invalidate_readers(relation, schema);
+        }
+        if scope.tracks_found {
+            scope.bind(Binding {
+                name: FOUND.to_string(),
+                value: BoundValue::Unreadable(
+                    "FOUND after INSERT, UPDATE or DELETE reports whether the statement touched a \
+                     row, which the emitted trigger does not track. Test for the row with EXISTS \
+                     instead."
+                        .to_string(),
+                ),
+            });
         }
     }
 
-    /// Translate a `RETURN` in a trigger body.
+    /// The variable an assignment writes, folded, refusing an assignment to a
+    /// field of a record with what keeps `facts`' trigger from the
+    /// maintenance shape.
+    fn assigned_name(target: &Target, facts: &TriggerFacts) -> Result<String, Error> {
+        if let ([ObjectNamePart::Identifier(name)], []) =
+            (target.name.0.as_slice(), target.indirection.as_slice())
+        {
+            return Ok(fold(name));
+        }
+        if let ([ObjectNamePart::Identifier(qualifier), ObjectNamePart::Identifier(name)], []) =
+            (target.name.0.as_slice(), target.indirection.as_slice())
+        {
+            if qualifier.value.eq_ignore_ascii_case("new") {
+                return Err(Error::new_assignment_refusal(
+                    &qualifier.value,
+                    &name.value,
+                    facts.maintenance_refusal.as_ref(),
+                ));
+            }
+            return Err(Error::forward_refusal(format!(
+                "assigning to `{qualifier}.{name}` has no SQLite equivalent, since a SQLite \
+                 trigger body has no plpgsql record variable to hold the change. Compute the \
+                 value in the statement that reads it."
+            )));
+        }
+        Err(Error::forward_refusal(format!(
+            "assigning to `{}` and its subscripts has no SQLite equivalent, since a SQLite \
+             trigger body has no variable to hold the value. Compute the value in the statement \
+             that reads it.",
+            target.name
+        )))
+    }
+
+    /// `SELECT <value>` for each variable of `assigned` whose value may
+    /// raise, guarded by the enclosing `IF`.
     ///
-    /// `RETURN NULL` in a BEFORE row trigger cancels the write, which SQLite
-    /// spells `SELECT RAISE(IGNORE)`. Measured on both over inserts of 5, -1,
-    /// and 7 with a trigger vetoing negatives: the same two rows survive.
-    ///
-    /// `RETURN NEW` proceeds with the row unchanged, which is what SQLite does
-    /// anyway, so it carries no statement. Every other form is refused.
-    fn translate_return_statement(
-        value: Option<&ReturnStatementValue>,
-        context: &PlPgSqlContext,
+    /// A variable is read by substituting its value at each read, so the
+    /// assignment itself emits nothing. A value that raises, a helper's check
+    /// among them, would then run only where it is read, which is never for a
+    /// variable nothing reads and too late for one read after a veto. A value
+    /// that does not translate is refused here, since whether it raises is
+    /// unknown.
+    fn evaluate_assigned(
+        assigned: &[String],
+        scope: &BodyScope,
         schema: &ParserDB,
         options: &crate::options::TranslationContext<'_>,
         emit: crate::warnings::WarningSink<'_>,
     ) -> Result<Vec<Statement>, Error> {
-        let Some(ReturnStatementValue::Expr(expr)) = value else {
+        if assigned.is_empty() {
             return Ok(Vec::new());
-        };
+        }
+        let bindings: Vec<_> = scope.bindings().cloned().collect();
+        let (values, variables) =
+            Self::bound_values(&bindings, ReferenceForm::Inline, schema, options, emit);
+        if let Some(reason) = assigned.iter().find_map(|name| variables.refusal(name)) {
+            return Err(Error::forward_refusal(reason.to_string()));
+        }
+        let condition = scope.current_condition();
+        let mut evaluated = Vec::new();
+        for (name, value) in values {
+            if !assigned.contains(&name) || !may_raise(&value, options) {
+                continue;
+            }
+            if let Some(relation) = scope.rewritten_guard_relation(schema) {
+                return Err(rewritten_guard(relation));
+            }
+            let mut statement =
+                Statement::Query(Box::new(single_expr_query(value, Vec::new(), None)));
+            if let Some(condition) = &condition {
+                Self::inject_condition_into_statement(&mut statement, condition)?;
+            }
+            evaluated.push(statement);
+        }
+        Ok(evaluated)
+    }
 
-        match expr {
-            Expr::Value(ValueWithSpan { value: Value::Null, .. }) => {
-                // A Query, so the enclosing IF's condition reaches its WHERE
-                // clause and the veto applies to the matching rows alone.
+    /// Binds each `SELECT ... INTO` target to the column it receives, read
+    /// from the first row as PostgreSQL assigns it.
+    fn translate_select_into(
+        query: &Query,
+        into: &IntoTargets,
+        scope: &mut BodyScope,
+        schema: &ParserDB,
+        emit: crate::warnings::WarningSink<'_>,
+    ) -> Result<(), Error> {
+        let targets: Vec<String> = into
+            .targets
+            .iter()
+            .map(|target| Self::assigned_name(target, &scope.facts))
+            .collect::<Result<_, _>>()?;
+        let refusal = |why: &str| {
+            Error::forward_refusal(format!(
+                "SELECT ... INTO {} in a trigger body {why}, and SQLite has no SELECT INTO of \
+                 its own.",
+                into.targets
+                    .iter()
+                    .map(|target| target.name.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        };
+        if into.strict {
+            return Err(refusal(
+                "is STRICT, which raises unless exactly one row is found, a count a trigger \
+                 body cannot check",
+            ));
+        }
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return Err(refusal("reads a set operation, where only a plain SELECT binds"));
+        };
+        let columns: Vec<&Expr> = select
+            .projection
+            .iter()
+            .map(|item| {
+                match item {
+                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                        Some(expr)
+                    }
+                    _ => None,
+                }
+            })
+            .collect::<Option<_>>()
+            .ok_or_else(|| refusal("selects a wildcard, where each target needs its own column"))?;
+        if columns.len() != targets.len() {
+            return Err(refusal("assigns a different number of columns than it names targets"));
+        }
+
+        if !query.locks.is_empty() || query.for_clause.is_some() {
+            emit(TranslationWarning::LossyDrop {
+                construct: "FOR UPDATE / FOR SHARE".to_string(),
+                reason: crate::impls::translator_impls::query::ROW_LOCK_REASON.to_string(),
+            });
+        }
+        let unlocked = Query { locks: Vec::new(), for_clause: None, ..query.clone() };
+        for (name, column) in targets.into_iter().zip(columns) {
+            let mut read = unlocked.clone();
+            if let SetExpr::Select(select) = read.body.as_mut() {
+                select.projection = vec![SelectItem::UnnamedExpr(column.clone())];
+            }
+            if read.limit_clause.is_none() && read.fetch.is_none() {
+                read.limit_clause = Some(sqlparser::ast::LimitClause::LimitOffset {
+                    limit: Some(Expr::Value(Value::Number("1".into(), false).with_empty_span())),
+                    offset: None,
+                    limit_by: Vec::new(),
+                });
+            }
+            scope.bind_persistent(Binding {
+                name,
+                value: BoundValue::Expr(Expr::Subquery(Box::new(read))),
+            });
+        }
+        if scope.tracks_found {
+            let found = Self::found_after(&unlocked, schema);
+            scope.bind(Binding { name: FOUND.to_string(), value: found });
+        }
+        Ok(())
+    }
+
+    /// What `FOUND` reads after `query` ran for its rows, which is whether it
+    /// returned one.
+    fn found_after(query: &Query, schema: &ParserDB) -> BoundValue {
+        let probe = Query { locks: Vec::new(), for_clause: None, order_by: None, ..query.clone() };
+        if let SetExpr::Select(select) = probe.body.as_ref()
+            && select.from.is_empty()
+            && select.selection.is_none()
+            && select.having.is_none()
+            && matches!(&select.group_by, GroupByExpr::Expressions(keys, _) if keys.is_empty())
+            && probe.limit_clause.is_none()
+            && probe.fetch.is_none()
+            && !returns_set(&select.projection, schema)
+        {
+            return BoundValue::Expr(Expr::Value(Value::Boolean(true).with_empty_span()));
+        }
+        if let Some(function) = schema_function_call(&probe, schema) {
+            return BoundValue::Unreadable(format!(
+                "FOUND after this query reports whether it returned a row, which the emitted \
+                 trigger learns only by running the query again, and that calls `{function}` a \
+                 second time. Test for the row with EXISTS in a query of its own."
+            ));
+        }
+        BoundValue::Expr(Expr::Exists { subquery: Box::new(probe), negated: false })
+    }
+
+    /// Translates a `RETURN` in a trigger body.
+    ///
+    /// `RETURN NULL` cancels the write, which SQLite spells `SELECT
+    /// RAISE(IGNORE)`, and `RETURN NEW` or `OLD` proceeds with it unchanged.
+    fn translate_return(
+        value: Option<&Query>,
+        scope: &BodyScope,
+        schema: &ParserDB,
+        options: &crate::options::TranslationContext<'_>,
+        emit: crate::warnings::WarningSink<'_>,
+    ) -> Result<Vec<Statement>, Error> {
+        let Some(value) = value else { return Ok(Vec::new()) };
+        match embedded::expression(value).as_ref() {
+            Expr::Value(value) if value.value == Value::Null => {
+                // A query, so the enclosing IF's condition reaches its WHERE
+                // clause.
                 Self::finalize_query_statements(
                     vec![raise_ignore_statement()],
-                    context,
+                    scope,
                     schema,
                     options,
                     emit,
@@ -224,245 +686,96 @@ impl PlPgSqlTranslator {
             other => {
                 Err(Error::forward_refusal(format!(
                     "RETURN {other} has no SQLite equivalent in a trigger body. A trigger can only \
-                             proceed, which is RETURN NEW, or cancel the write, which is RETURN NULL."
+                     proceed, which is RETURN NEW, or cancel the write, which is RETURN NULL."
                 )))
             }
         }
     }
 
-    /// Binds the variable `set` assigns, and answers its name.
-    fn handle_set_statement(set: &Set, context: &mut PlPgSqlContext) -> Option<String> {
-        let Set::SingleAssignment { variable, values, .. } = set else { return None };
-        let [value] = values.as_slice() else { return None };
-        let name = variable.to_string();
-        let binding = VariableBinding { name: name.clone(), expression: value.to_string() };
-
-        // A `SELECT ... INTO` assignment has to outlive the block it
-        // appears in, an ordinary one does not. Read off the AST rather
-        // than the rendering: the test this replaces asked whether the
-        // rendered text began with `(` and contained `SELECT`, so a
-        // variable named `SELECT_FACTOR` made `(SELECT_FACTOR *
-        // NEW.amount)` look like a subquery and the binding was filed as
-        // persistent, then never resolved.
-        if Self::contains_subquery(value) {
-            context.add_persistent_binding(binding);
-        } else {
-            context.add_binding(binding);
-        }
-        Some(name)
-    }
-
-    /// `SELECT <value>` for each variable of `assigned` whose value may
-    /// raise, guarded by the enclosing `IF`.
-    ///
-    /// A variable is read by substituting its value at each read, so the
-    /// assignment itself emits nothing. A value that raises, a helper's check
-    /// among them, would then run only where it is read, which is never for a
-    /// variable nothing reads and too late for one read after a veto. A value
-    /// read later also runs at each read.
-    fn evaluate_assigned(
-        assigned: &[String],
-        context: &PlPgSqlContext,
-        schema: &ParserDB,
-        options: &crate::options::TranslationContext<'_>,
-        emit: crate::warnings::WarningSink<'_>,
-    ) -> Result<Vec<Statement>, Error> {
-        if assigned.is_empty() {
-            return Ok(Vec::new());
-        }
-        let bindings: Vec<_> = context.bindings().cloned().collect();
-        let (values, _) =
-            Self::bound_values(&bindings, ReferenceForm::Inline, schema, options, emit)?;
-        let condition = context.current_condition();
-        let mut evaluated = Vec::new();
-        for (name, value) in values {
-            if !assigned.contains(&name) || !may_raise(&value, options) {
-                continue;
-            }
-            let mut statement =
-                Statement::Query(Box::new(single_expr_query(value, Vec::new(), None)));
-            if let Some(condition) = &condition {
-                Self::inject_condition_into_statement(&mut statement, condition)?;
-            }
-            evaluated.push(statement);
-        }
-        Ok(evaluated)
-    }
-
-    /// True when `expression` holds a subquery anywhere inside it.
-    ///
-    /// Distinguishes a `SELECT ... INTO` assignment, whose binding has to
-    /// outlive its block, from an ordinary one. Structural, so no variable
-    /// name can be mistaken for a keyword.
-    fn contains_subquery(expression: &Expr) -> bool {
-        visit_expressions(expression, |expr| {
-            if matches!(
-                expr,
-                Expr::Subquery(_)
-                    | Expr::Exists { .. }
-                    | Expr::In { target: InTarget::Subquery(_) | InTarget::Unnest(_), .. }
-            ) {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
-        })
-        .is_break()
-    }
-
     /// Translates an `IF` chain into one guarded statement per branch.
     ///
-    /// PostgreSQL scopes a variable to the block that declares it, so an
-    /// assignment made before the `IF` is visible inside every branch, and an
-    /// assignment made inside a branch is not visible to a sibling branch.
-    /// Both are arranged here by restoring the enclosing block's assignments
-    /// before each branch runs. What a branch assigned reaches the statements
-    /// after the `IF` as a `CASE` over the branch conditions, since the
-    /// emitted trigger has no control flow to make the value conditional any
-    /// other way.
-    fn translate_if_statement(
-        if_stmt: &sqlparser::ast::IfStatement,
-        context: &mut PlPgSqlContext,
+    /// Each branch starts from the assignments made before the `IF`, and what
+    /// a branch assigned reaches the statements after it as a `CASE` over the
+    /// branch conditions.
+    fn translate_if(
+        function: &str,
+        conditional: &If,
+        scope: &mut BodyScope,
         schema: &ParserDB,
         options: &crate::options::TranslationContext<'_>,
         emit: crate::warnings::WarningSink<'_>,
     ) -> Result<Vec<Statement>, Error> {
         let mut result = Vec::new();
-        let mut negated_conditions: Vec<String> = Vec::new();
-        let outer_scoped = Self::scoped_bindings(context);
-        let mut branches: Vec<(Option<String>, Vec<VariableBinding>)> = Vec::new();
-        let bindings: Vec<_> = context.bindings().cloned().collect();
+        scope.begin_if();
+        let mut negated: Vec<Expr> = Vec::new();
+        let outer = scope.scoped_bindings();
+        let mut branches: Vec<(Option<Expr>, Vec<Binding>)> = Vec::new();
 
-        let if_condition = Self::translate_plpgsql_condition(
-            if_stmt.if_block.condition.as_ref(),
-            context,
-            &bindings,
-            schema,
-            options,
-            emit,
-        )?;
-
-        context.push_condition(if_condition.clone());
-        Self::restore_scoped_bindings(context, &outer_scoped);
-        context.clear_uuid_first_use();
-
-        for stmt in if_stmt.if_block.statements() {
-            let translated = Self::translate_statement(stmt, context, schema, options, emit)?;
-            result.extend(translated);
-        }
-
-        context.pop_condition();
-        branches.push((
-            if_stmt.if_block.condition.as_ref().map(ToString::to_string),
-            Self::assignments_made(context, &outer_scoped),
-        ));
-        negated_conditions.push(format!("NOT ({if_condition})"));
-
-        for elseif_block in &if_stmt.elseif_blocks {
-            Self::restore_scoped_bindings(context, &outer_scoped);
-            let bindings: Vec<_> = context.bindings().cloned().collect();
-            let elseif_condition = Self::translate_plpgsql_condition(
-                elseif_block.condition.as_ref(),
-                context,
-                &bindings,
-                schema,
-                options,
-                emit,
+        for Branch { condition, statements } in &conditional.branches {
+            scope.restore_scoped(&outer);
+            let written = Self::fold_trigger_specials_in(
+                embedded::expression(condition).into_owned(),
+                &scope.facts,
             )?;
-
-            debug_assert!(
-                !negated_conditions.is_empty(),
-                "IF condition negation must be seeded before ELSIF translation"
-            );
-            let combined =
-                format!("{} AND ({})", negated_conditions.join(" AND "), elseif_condition);
-
-            context.push_condition(combined);
-            Self::restore_scoped_bindings(context, &outer_scoped);
-            context.clear_uuid_first_use();
-
-            for stmt in elseif_block.statements() {
-                let translated = Self::translate_statement(stmt, context, schema, options, emit)?;
-                result.extend(translated);
+            let translated = Self::translate_condition(&written, scope, schema, options, emit)?;
+            let guard = if negated.is_empty() {
+                translated.clone()
+            } else {
+                conjunction(
+                    negated.iter().cloned().chain([Expr::Nested(Box::new(translated.clone()))]),
+                )
+            };
+            scope.push_condition(guard);
+            scope.restore_scoped(&outer);
+            scope.clear_uuid_first_use();
+            for node in statements {
+                result.extend(Self::translate_node(function, node, scope, schema, options, emit)?);
             }
-
-            context.pop_condition();
-            branches.push((
-                elseif_block.condition.as_ref().map(ToString::to_string),
-                Self::assignments_made(context, &outer_scoped),
-            ));
-            negated_conditions.push(format!("NOT ({elseif_condition})"));
+            scope.pop_condition();
+            branches.push((Some(written), Self::assignments_made(scope, &outer)));
+            negated.push(Expr::UnaryOp {
+                op: UnaryOperator::Not,
+                expr: Box::new(Expr::Nested(Box::new(translated))),
+            });
         }
 
-        if let Some(else_block) = &if_stmt.else_block {
-            let else_condition = negated_conditions.join(" AND ");
-            context.push_condition(else_condition);
-            Self::restore_scoped_bindings(context, &outer_scoped);
-            context.clear_uuid_first_use();
-
-            for stmt in else_block.statements() {
-                let translated = Self::translate_statement(stmt, context, schema, options, emit)?;
-                result.extend(translated);
+        if !conditional.otherwise.is_empty() {
+            scope.push_condition(conjunction(negated.into_iter()));
+            scope.restore_scoped(&outer);
+            scope.clear_uuid_first_use();
+            for node in &conditional.otherwise {
+                result.extend(Self::translate_node(function, node, scope, schema, options, emit)?);
             }
-
-            context.pop_condition();
-            branches.push((None, Self::assignments_made(context, &outer_scoped)));
+            scope.pop_condition();
+            branches.push((None, Self::assignments_made(scope, &outer)));
         }
 
-        Self::restore_scoped_bindings(context, &outer_scoped);
-        Self::bind_branch_assignments(context, &outer_scoped, &branches);
-
+        let written = scope.end_if();
+        scope.restore_scoped(&outer);
+        Self::bind_branch_assignments(scope, &outer, &branches);
+        // A branch may have run, so what reads its writes is stale after the
+        // `IF` too, the merged branch assignments included.
+        for relation in &written {
+            scope.invalidate_readers(relation, schema);
+        }
         Ok(result)
     }
 
-    /// The assignments the enclosing block made, lifted out of the context.
-    ///
-    /// The context keeps an assignment separately from a `SELECT ... INTO`
-    /// binding but exposes neither set on its own, so the two are told apart
-    /// by clearing the assignments and reading what survives.
-    fn scoped_bindings(context: &mut PlPgSqlContext) -> Vec<VariableBinding> {
-        let visible: Vec<VariableBinding> = context.bindings().cloned().collect();
-        context.clear_scoped_bindings();
-        let surviving: Vec<VariableBinding> = context.bindings().cloned().collect();
-        let scoped: Vec<VariableBinding> = visible
-            .into_iter()
-            .filter(|binding| !surviving.iter().any(|other| same_binding(other, binding)))
-            .collect();
-        Self::restore_scoped_bindings(context, &scoped);
-        scoped
-    }
-
-    /// Puts the context's assignments back to `scoped`.
-    fn restore_scoped_bindings(context: &mut PlPgSqlContext, scoped: &[VariableBinding]) {
-        context.clear_scoped_bindings();
-        for binding in scoped {
-            context.add_binding(binding.clone());
-        }
-    }
-
-    /// What the branch just translated assigned, against the enclosing
-    /// block's assignments.
-    fn assignments_made(
-        context: &mut PlPgSqlContext,
-        outer: &[VariableBinding],
-    ) -> Vec<VariableBinding> {
-        Self::scoped_bindings(context)
-            .into_iter()
-            .filter(|binding| !outer.iter().any(|other| same_binding(other, binding)))
-            .collect()
+    /// What the branch just translated assigned, against the bindings before
+    /// the `IF`.
+    fn assignments_made(scope: &BodyScope, outer: &[Binding]) -> Vec<Binding> {
+        scope.scoped_bindings().into_iter().filter(|binding| !outer.contains(binding)).collect()
     }
 
     /// Binds each variable a branch assigned to a `CASE` over the branch
-    /// conditions, so a read after the `IF` answers what the branch that ran
-    /// assigned, and the enclosing block's value, or `NULL`, when none ran.
+    /// conditions, falling back to the value before the `IF` when none ran.
     ///
-    /// The conditions and the assigned expressions are the PostgreSQL ones,
-    /// not the emitted SQLite ones, because the binding is translated where
-    /// it is read, exactly as a hand-written `v := CASE ... END` would be.
+    /// The conditions and values are the PostgreSQL ones, translated where
+    /// the binding is read.
     fn bind_branch_assignments(
-        context: &mut PlPgSqlContext,
-        outer: &[VariableBinding],
-        branches: &[(Option<String>, Vec<VariableBinding>)],
+        scope: &mut BodyScope,
+        outer: &[Binding],
+        branches: &[(Option<Expr>, Vec<Binding>)],
     ) {
         let mut names: Vec<&str> = Vec::new();
         for (_, assignments) in branches {
@@ -473,237 +786,211 @@ impl PlPgSqlTranslator {
             }
         }
 
-        let mut bound: Vec<VariableBinding> = Vec::new();
         for name in names {
-            let mut arms = String::new();
             let mut otherwise = outer
                 .iter()
+                .chain(scope.persistent_binding(name))
                 .find(|binding| binding.name == name)
-                .map_or_else(|| "NULL".to_string(), |binding| binding.expression.clone());
-
+                .map_or_else(
+                    || BoundValue::Expr(Expr::Value(Value::Null.with_empty_span())),
+                    |binding| binding.value.clone(),
+                );
+            let mut arms: Vec<(Expr, BoundValue)> = Vec::new();
             for (condition, assignments) in branches {
                 let Some(assigned) = assignments.iter().find(|binding| binding.name == name) else {
                     continue;
                 };
                 match condition {
-                    Some(condition) => {
-                        use core::fmt::Write as _;
-                        let expression = &assigned.expression;
-                        let _ = write!(arms, " WHEN ({condition}) THEN ({expression})");
-                    }
-                    None => otherwise.clone_from(&assigned.expression),
+                    Some(condition) => arms.push((condition.clone(), assigned.value.clone())),
+                    None => otherwise = assigned.value.clone(),
                 }
             }
-
-            bound.push(VariableBinding {
+            scope.bind(Binding {
                 name: name.to_string(),
-                expression: format!("CASE{arms} ELSE ({otherwise}) END"),
+                value: Self::merged_value(arms, otherwise),
             });
-        }
-
-        for binding in bound {
-            context.add_binding(binding);
         }
     }
 
-    /// Translates a single PL/pgSQL IF or ELSIF condition expression.
+    /// The `CASE` choosing among `arms` by condition with `otherwise` as its
+    /// `ELSE`, unreadable when any value is.
+    fn merged_value(arms: Vec<(Expr, BoundValue)>, otherwise: BoundValue) -> BoundValue {
+        let mut conditions = Vec::with_capacity(arms.len());
+        for (condition, value) in arms {
+            let BoundValue::Expr(result) = value else { return value };
+            conditions.push(CaseWhen {
+                condition: Expr::Nested(Box::new(condition)),
+                result: Expr::Nested(Box::new(result)),
+            });
+        }
+        let BoundValue::Expr(otherwise) = otherwise else { return otherwise };
+        BoundValue::Expr(Expr::Case {
+            case_token: AttachedToken::empty(),
+            end_token: AttachedToken::empty(),
+            operand: None,
+            conditions,
+            else_result: Some(Box::new(Expr::Nested(Box::new(otherwise)))),
+        })
+    }
+
+    /// Translates an `IF` or `ELSIF` condition into the SQLite guard injected
+    /// into each statement of its branch.
     ///
-    /// Applies UUID renames and TG_OP constant-folding via `transform_expr`,
-    /// then folds trigger special variables, translates to SQLite, and
-    /// inline-substitutes any declared variable bindings so the resulting
-    /// string is safe to inject into a UPDATE/DELETE WHERE clause.
-    fn translate_plpgsql_condition(
-        cond: Option<&Expr>,
-        context: &mut PlPgSqlContext,
-        bindings: &[VariableBinding],
+    /// Variables are embedded rather than read from a CTE, since the guard
+    /// reaches `UPDATE` and `DELETE`, which take no `WITH` in a trigger body.
+    fn translate_condition(
+        condition: &Expr,
+        scope: &BodyScope,
         schema: &ParserDB,
         options: &crate::options::TranslationContext<'_>,
         emit: crate::warnings::WarningSink<'_>,
-    ) -> Result<String, Error> {
-        let Some(cond) = cond else {
-            return Ok("TRUE".to_string());
-        };
-        let mut transformed = cond.clone();
-        Self::transform_expr(&mut transformed, context, options);
-        Self::fold_trigger_specials(&mut transformed, context)?;
+    ) -> Result<Expr, Error> {
+        let mut transformed = condition.clone();
+        Self::transform_expr(&mut transformed, options);
         let mut translated = transformed.translate_with_warnings(schema, options, emit)?;
-        if bindings.is_empty() {
-            return Ok(translated.to_string());
-        }
-        // Embedded rather than read out of a CTE: the condition guards an
-        // UPDATE or a DELETE, and SQLite gives those no WITH scope inside a
-        // trigger body.
-        let (_, scope) =
-            Self::bound_values(bindings, ReferenceForm::Inline, schema, options, emit)?;
-        substitute_variables(&mut translated, &scope);
-        Ok(translated.to_string())
+        let bindings: Vec<_> = scope.bindings().cloned().collect();
+        let (_, variables) =
+            Self::bound_values(&bindings, ReferenceForm::Inline, schema, options, emit);
+        substitute_variables(&mut translated, &variables)?;
+        Ok(translated)
     }
 
-    /// Constant-folds every trigger special a statement reads.
-    ///
-    /// Driven by the derived traversal, so a read from any position lands:
-    /// the folding itself only ever rewrote the expression it was handed, and
-    /// the one caller handed it an `IF` condition.
-    fn fold_trigger_specials_in_statement(
-        stmt: &Statement,
-        context: &PlPgSqlContext,
-    ) -> Result<Statement, Error> {
-        let mut folded = stmt.clone();
+    /// Constant-folds every trigger special `node` reads, wherever it sits.
+    pub(crate) fn fold_trigger_specials_in<N: VisitMut>(
+        mut node: N,
+        facts: &TriggerFacts,
+    ) -> Result<N, Error> {
         let mut failure = None;
-        let _: ControlFlow<()> = visit_expressions_mut(&mut folded, |expr| {
+        let _: ControlFlow<()> = visit_expressions_mut(&mut node, |expr| {
             if failure.is_none()
-                && let Err(error) = Self::fold_trigger_specials(expr, context)
+                && let Err(error) = Self::fold_trigger_specials(expr, facts)
             {
                 failure = Some(error);
             }
             ControlFlow::Continue(())
         });
-
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(folded),
-        }
+        failure.map_or(Ok(node), Err)
     }
 
-    /// Constant-folds trigger special variables in `expr`.
-    ///
-    /// - `TG_OP` becomes the event string literal for a single-event trigger,
-    ///   or an error for a multi-event trigger.
-    /// - `TG_TABLE_NAME` becomes the table name literal.
-    /// - Any other `TG_*` name produces an error naming the variable.
-    #[cfg_attr(feature = "std", recursive::recursive)]
-    pub(crate) fn fold_trigger_specials(
-        expr: &mut Expr,
-        context: &PlPgSqlContext,
-    ) -> Result<(), Error> {
-        use crate::impls::expr_helpers::mutate_expr_children;
-
-        match expr {
-            Expr::Identifier(ident) => {
-                let upper = ident.value.to_uppercase();
-                match upper.as_str() {
-                    "TG_OP" => {
-                        if context.has_multiple_trigger_events() {
-                            return Err(Error::forward_refusal(
-                                "TG_OP is ambiguous in a multi-event trigger; split into one \
-                             trigger function per event so TG_OP can be constant-folded"
-                                    .to_string(),
-                            ));
-                        }
-                        if let Some(event) = context.single_trigger_event() {
-                            *expr = Expr::Value(
-                                Value::SingleQuotedString(event.to_uppercase()).with_empty_span(),
-                            );
-                        }
-                    }
-                    "TG_TABLE_NAME" => {
-                        if let Some(table) = &context.trigger_table {
-                            *expr = Expr::Value(
-                                Value::SingleQuotedString(table.clone()).with_empty_span(),
-                            );
-                        }
-                    }
-                    other if other.starts_with("TG_") => {
-                        return Err(Error::forward_refusal(format!(
-                            "the trigger special variable {other} has no SQLite equivalent; \
-                             only TG_OP (single-event) and TG_TABLE_NAME are constant-folded"
-                        )));
-                    }
-                    _ => {}
+    /// Constant-folds `TG_OP` for a single-event trigger and `TG_TABLE_NAME`,
+    /// refuses every other `TG_*` name, and reads a field of the row an
+    /// INSERT-only or DELETE-only trigger has none of as `NULL`, as
+    /// PostgreSQL does.
+    fn fold_trigger_specials(expr: &mut Expr, facts: &TriggerFacts) -> Result<(), Error> {
+        if let Expr::CompoundIdentifier(parts) = expr
+            && let [row, _] = parts.as_slice()
+            && facts.absent_row().is_some_and(|absent| row.value.eq_ignore_ascii_case(absent))
+        {
+            *expr = Expr::Value(Value::Null.with_empty_span());
+            return Ok(());
+        }
+        let Expr::Identifier(ident) = expr else { return Ok(()) };
+        let upper = ident.value.to_uppercase();
+        match upper.as_str() {
+            "TG_OP" => {
+                if facts.has_multiple_events() {
+                    return Err(Error::forward_refusal(
+                        "TG_OP is ambiguous in a multi-event trigger; split into one trigger \
+                         function per event so TG_OP can be constant-folded"
+                            .to_string(),
+                    ));
+                }
+                if let Some(event) = facts.single_event() {
+                    *expr =
+                        Expr::Value(Value::SingleQuotedString(event.to_string()).with_empty_span());
                 }
             }
-            other => {
-                let mut first_err: Option<Error> = None;
-                mutate_expr_children(other, &mut |child| {
-                    if first_err.is_none()
-                        && let Err(e) = Self::fold_trigger_specials(child, context)
-                    {
-                        first_err = Some(e);
-                    }
-                });
-                if let Some(e) = first_err {
-                    return Err(e);
+            "TG_TABLE_NAME" => {
+                if let Some(table) = &facts.table {
+                    *expr = Expr::Value(Value::SingleQuotedString(table.clone()).with_empty_span());
                 }
             }
+            other if other.starts_with("TG_") => {
+                return Err(Error::forward_refusal(format!(
+                    "the trigger special variable {other} has no SQLite equivalent; only TG_OP \
+                     (single-event) and TG_TABLE_NAME are constant-folded"
+                )));
+            }
+            _ => {}
         }
         Ok(())
     }
 
-    /// SQLite does not support WITH clauses in trigger bodies; this wraps the
-    /// CTE inside the INSERT's SELECT source or the DELETE's IN subquery.
+    /// Rewrites a query statement for a trigger body, which takes no `WITH`,
+    /// by moving the CTE inside the `INSERT`'s source or the `DELETE`'s
+    /// subquery.
     fn translate_query_statement(
         query: &Query,
-        context: &mut PlPgSqlContext,
-        schema: &ParserDB,
         options: &crate::options::TranslationContext<'_>,
-        emit: crate::warnings::WarningSink<'_>,
     ) -> Result<Vec<Statement>, Error> {
-        // The preprocessor rewrites `SELECT <exprs> INTO <vars> [FROM ...]`
-        // into SET bindings before parsing. An INTO surviving to this point is
-        // a shape it could not rewrite (INTO STRICT, a record field target),
-        // and emitting it would fail in SQLite as `near "INTO": syntax error`.
-        if let SetExpr::Select(select) = &*query.body
-            && let Some(into) = &select.into
-        {
-            return Err(Error::forward_refusal(format!(
-                "SELECT ... INTO {} inside a trigger body has no SET rewrite: only plain \
-             variable names can receive a SELECT INTO binding, and SQLite has no SELECT \
-             INTO of its own.",
-                into.targets.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
-            )));
-        }
-        let transformed_statements = if let Some(with) = &query.with {
-            if let SetExpr::Insert(Statement::Insert(insert)) = &*query.body {
-                Self::transform_with_insert_to_subquery(with, insert, context, options)?
-            } else if let SetExpr::Delete(Statement::Delete(delete)) = &*query.body {
-                Self::transform_with_delete_to_subquery(with, delete, context, options)
-            } else if let SetExpr::Update(update) = &*query.body {
+        let Some(with) = &query.with else {
+            let transformed_body = Self::transform_query_body(&query.body, options);
+            return Ok(vec![Statement::Query(Box::new(Query {
+                with: None,
+                body: Box::new(transformed_body),
+                ..query.clone()
+            }))]);
+        };
+        Ok(match query.body.as_ref() {
+            SetExpr::Insert(Statement::Insert(insert)) => {
+                Self::transform_with_insert_to_subquery(with, insert, options)?
+            }
+            SetExpr::Delete(Statement::Delete(delete)) => {
+                Self::transform_with_delete_to_subquery(with, delete, options)
+            }
+            SetExpr::Update(update) => {
                 let mut with = with.clone();
                 for cte in &mut with.cte_tables {
-                    Self::transform_cte_query(&mut cte.query, context, options);
+                    Self::transform_query_expressions(&mut cte.query, options);
                 }
                 let mut statement = update.clone();
                 Self::inline_ctes(&mut statement, &with, options)?;
                 vec![statement]
-            } else {
-                let transformed_body = Self::transform_query_body(&query.body, context, options)?;
-
-                let transformed_with = query.with.as_ref().map(|with| {
-                    let mut new_with = with.clone();
-                    for cte in &mut new_with.cte_tables {
-                        Self::transform_cte_query(&mut cte.query, context, options);
-                    }
-                    new_with
-                });
-
-                let transformed_query = Query {
-                    with: transformed_with,
-                    body: Box::new(transformed_body),
-                    ..query.clone()
-                };
-
-                vec![Statement::Query(Box::new(transformed_query))]
             }
-        } else {
-            let transformed_body = Self::transform_query_body(&query.body, context, options)?;
-            let transformed_query =
-                Query { with: None, body: Box::new(transformed_body), ..query.clone() };
+            body => {
+                let mut with = with.clone();
+                for cte in &mut with.cte_tables {
+                    Self::transform_query_expressions(&mut cte.query, options);
+                }
+                vec![Statement::Query(Box::new(Query {
+                    with: Some(with),
+                    body: Box::new(Self::transform_query_body(body, options)),
+                    ..query.clone()
+                }))]
+            }
+        })
+    }
 
-            vec![Statement::Query(Box::new(transformed_query))]
-        };
-
-        Self::finalize_query_statements(transformed_statements, context, schema, options, emit)
+    /// Translates query statements that only read, guarded by the enclosing
+    /// `IF`, with every variable they read embedded.
+    fn finalize_reads(
+        statements: Vec<Statement>,
+        scope: &BodyScope,
+        schema: &ParserDB,
+        options: &crate::options::TranslationContext<'_>,
+        emit: crate::warnings::WarningSink<'_>,
+    ) -> Result<Vec<Statement>, Error> {
+        let bindings: Vec<_> = scope.bindings().cloned().collect();
+        let (_, variables) =
+            Self::bound_values(&bindings, ReferenceForm::Inline, schema, options, emit);
+        let mut translated =
+            Self::finalize_query_statements(statements, scope, schema, options, emit)?;
+        for statement in &mut translated {
+            substitute_variables(statement, &variables)?;
+            Self::null_unbound_declarations(statement, scope, &bindings);
+        }
+        Ok(translated)
     }
 
     fn finalize_query_statements(
         statements: Vec<Statement>,
-        context: &PlPgSqlContext,
+        scope: &BodyScope,
         schema: &ParserDB,
         options: &crate::options::TranslationContext<'_>,
         emit: crate::warnings::WarningSink<'_>,
     ) -> Result<Vec<Statement>, Error> {
         let mut finalized = Vec::new();
-        let condition = context.current_condition();
+        let condition = scope.current_condition();
 
         for statement in statements {
             let mut translated_statements =
@@ -823,7 +1110,6 @@ impl PlPgSqlTranslator {
     fn transform_with_insert_to_subquery(
         with: &sqlparser::ast::With,
         insert: &sqlparser::ast::Insert,
-        context: &mut PlPgSqlContext,
         options: &crate::options::TranslationContext<'_>,
     ) -> Result<Vec<Statement>, Error> {
         let Some(source) = &insert.source else {
@@ -835,7 +1121,7 @@ impl PlPgSqlTranslator {
         let inner_query = Query { with: Some(with.clone()), ..source.as_ref().clone() };
 
         let mut transformed_inner = inner_query;
-        Self::transform_cte_query(&mut transformed_inner, context, options);
+        Self::transform_cte_query(&mut transformed_inner, options);
 
         let projection: Vec<SelectItem> = match &*source.body {
             SetExpr::Select(select) => select.projection.clone(),
@@ -928,13 +1214,12 @@ impl PlPgSqlTranslator {
     fn transform_with_delete_to_subquery(
         with: &sqlparser::ast::With,
         delete: &sqlparser::ast::Delete,
-        context: &mut PlPgSqlContext,
         options: &crate::options::TranslationContext<'_>,
     ) -> Vec<Statement> {
         let mut new_delete = delete.clone();
 
         if let Some(selection) = &mut new_delete.selection {
-            Self::inject_with_into_in_subqueries(selection, with, context, options);
+            Self::inject_with_into_in_subqueries(selection, with, options);
         }
 
         vec![Statement::Delete(new_delete)]
@@ -944,7 +1229,6 @@ impl PlPgSqlTranslator {
     fn inject_with_into_in_subqueries(
         expr: &mut Expr,
         with: &sqlparser::ast::With,
-        context: &mut PlPgSqlContext,
         options: &crate::options::TranslationContext<'_>,
     ) {
         use crate::impls::expr_helpers::mutate_expr_children;
@@ -952,7 +1236,6 @@ impl PlPgSqlTranslator {
         fn maybe_inject_with(
             subquery: &mut Query,
             with: &sqlparser::ast::With,
-            context: &mut PlPgSqlContext,
             options: &crate::options::TranslationContext<'_>,
         ) {
             let cte_names: Vec<String> =
@@ -960,7 +1243,7 @@ impl PlPgSqlTranslator {
             if PlPgSqlTranslator::query_references_ctes(subquery, &cte_names) {
                 let mut new_with = with.clone();
                 for cte in &mut new_with.cte_tables {
-                    PlPgSqlTranslator::transform_cte_query(&mut cte.query, context, options);
+                    PlPgSqlTranslator::transform_cte_query(&mut cte.query, options);
                 }
                 subquery.with = Some(new_with);
             }
@@ -970,7 +1253,7 @@ impl PlPgSqlTranslator {
             Expr::In { target: InTarget::Subquery(subquery), .. }
             | Expr::Subquery(subquery)
             | Expr::Exists { subquery, .. } => {
-                maybe_inject_with(subquery, with, context, options);
+                maybe_inject_with(subquery, with, options);
             }
             Expr::Function(func) => {
                 if let FunctionArguments::List(arg_list) = &mut func.args {
@@ -981,14 +1264,14 @@ impl PlPgSqlTranslator {
                             | FunctionArg::ExprNamed { arg: e, .. } => e,
                         };
                         if let FunctionArgExpr::Expr(e) = arg_expr {
-                            Self::inject_with_into_in_subqueries(e, with, context, options);
+                            Self::inject_with_into_in_subqueries(e, with, options);
                         }
                     }
                 }
             }
             other => {
                 mutate_expr_children(other, &mut |child| {
-                    Self::inject_with_into_in_subqueries(child, with, context, options);
+                    Self::inject_with_into_in_subqueries(child, with, options);
                 });
             }
         }
@@ -1038,96 +1321,85 @@ impl PlPgSqlTranslator {
         }
     }
 
-    #[allow(clippy::unnecessary_wraps)]
     fn transform_query_body(
         body: &SetExpr,
-        context: &mut PlPgSqlContext,
         options: &crate::options::TranslationContext<'_>,
-    ) -> Result<SetExpr, Error> {
+    ) -> SetExpr {
         match body {
             SetExpr::Insert(Statement::Insert(insert)) => {
-                let transformed = Self::transform_insert_for_sqlite(insert, context, options);
-                Ok(SetExpr::Insert(Statement::Insert(transformed)))
+                SetExpr::Insert(Statement::Insert(Self::transform_insert_for_sqlite(
+                    insert, options,
+                )))
             }
             SetExpr::Delete(Statement::Delete(delete)) => {
-                let transformed = Self::transform_delete_for_sqlite(delete, context, options);
-                Ok(SetExpr::Delete(Statement::Delete(transformed)))
+                SetExpr::Delete(Statement::Delete(Self::transform_delete_for_sqlite(
+                    delete, options,
+                )))
             }
             other => {
                 let mut cloned = other.clone();
-                Self::transform_set_expr(&mut cloned, context, options);
-                Ok(cloned)
+                Self::transform_set_expr(&mut cloned, options);
+                cloned
             }
         }
     }
 
     fn transform_query_expressions(
         query: &mut Query,
-        context: &mut PlPgSqlContext,
         options: &crate::options::TranslationContext<'_>,
     ) {
-        if let Ok(transformed_body) = Self::transform_query_body(&query.body, context, options) {
-            *query.body = transformed_body;
-        }
+        *query.body = Self::transform_query_body(&query.body, options);
         if let Some(with) = &mut query.with {
             for cte in &mut with.cte_tables {
-                Self::transform_cte_query(&mut cte.query, context, options);
+                Self::transform_cte_query(&mut cte.query, options);
             }
         }
         if let Some(order_by) = &mut query.order_by
             && let sqlparser::ast::OrderByKind::Expressions(exprs) = &mut order_by.kind
         {
             for ob in exprs {
-                Self::transform_expr(&mut ob.expr, context, options);
+                Self::transform_expr(&mut ob.expr, options);
             }
         }
         if let Some(limit_clause) = &mut query.limit_clause {
             match limit_clause {
                 sqlparser::ast::LimitClause::LimitOffset { limit, offset, limit_by } => {
                     if let Some(expr) = limit {
-                        Self::transform_expr(expr, context, options);
+                        Self::transform_expr(expr, options);
                     }
                     if let Some(off) = offset {
-                        Self::transform_expr(&mut off.value, context, options);
+                        Self::transform_expr(&mut off.value, options);
                     }
                     for expr in limit_by {
-                        Self::transform_expr(expr, context, options);
+                        Self::transform_expr(expr, options);
                     }
                 }
                 sqlparser::ast::LimitClause::OffsetCommaLimit { offset, limit } => {
-                    Self::transform_expr(offset, context, options);
-                    Self::transform_expr(limit, context, options);
+                    Self::transform_expr(offset, options);
+                    Self::transform_expr(limit, options);
                 }
             }
         }
         if let Some(fetch) = &mut query.fetch
             && let Some(expr) = &mut fetch.quantity
         {
-            Self::transform_expr(expr, context, options);
+            Self::transform_expr(expr, options);
         }
     }
 
-    fn transform_cte_query(
-        query: &mut Query,
-        context: &mut PlPgSqlContext,
-        options: &crate::options::TranslationContext<'_>,
-    ) {
-        Self::transform_query_expressions(query, context, options);
+    fn transform_cte_query(query: &mut Query, options: &crate::options::TranslationContext<'_>) {
+        Self::transform_query_expressions(query, options);
     }
 
     fn transform_insert_for_sqlite(
         insert: &sqlparser::ast::Insert,
-        context: &mut PlPgSqlContext,
         options: &crate::options::TranslationContext<'_>,
     ) -> sqlparser::ast::Insert {
         let mut new_insert = insert.clone();
 
         if let Some(source) = &mut new_insert.source {
-            if let Ok(transformed_body) = Self::transform_query_body(&source.body, context, options)
-            {
-                *source.body = transformed_body;
-            }
-            Self::transform_set_expr(&mut source.body, context, options);
+            *source.body = Self::transform_query_body(&source.body, options);
+            Self::transform_set_expr(&mut source.body, options);
         }
 
         new_insert
@@ -1135,17 +1407,16 @@ impl PlPgSqlTranslator {
 
     fn transform_delete_for_sqlite(
         delete: &sqlparser::ast::Delete,
-        context: &mut PlPgSqlContext,
         options: &crate::options::TranslationContext<'_>,
     ) -> sqlparser::ast::Delete {
         let mut new_delete = delete.clone();
 
-        Self::transform_selection(&mut new_delete.selection, context, options);
+        Self::transform_selection(&mut new_delete.selection, options);
         match &mut new_delete.from {
             sqlparser::ast::FromTable::WithFromKeyword(tables)
             | sqlparser::ast::FromTable::WithoutKeyword(tables) => {
                 for from in tables {
-                    Self::transform_table_with_joins(from, context, options);
+                    Self::transform_table_with_joins(from, options);
                 }
             }
         }
@@ -1156,7 +1427,6 @@ impl PlPgSqlTranslator {
     #[cfg_attr(feature = "std", recursive::recursive)]
     fn transform_set_expr(
         set_expr: &mut SetExpr,
-        context: &mut PlPgSqlContext,
         options: &crate::options::TranslationContext<'_>,
     ) {
         match set_expr {
@@ -1165,35 +1435,35 @@ impl PlPgSqlTranslator {
                     if let SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } =
                         item
                     {
-                        Self::transform_expr(expr, context, options);
+                        Self::transform_expr(expr, options);
                     }
                 }
-                Self::transform_selection(&mut select.selection, context, options);
+                Self::transform_selection(&mut select.selection, options);
                 for from in &mut select.from {
-                    Self::transform_table_with_joins(from, context, options);
+                    Self::transform_table_with_joins(from, options);
                 }
                 if let Some(having) = &mut select.having {
-                    Self::transform_expr(having, context, options);
+                    Self::transform_expr(having, options);
                 }
                 if let GroupByExpr::Expressions(exprs, _) = &mut select.group_by {
                     for e in exprs {
-                        Self::transform_expr(e, context, options);
+                        Self::transform_expr(e, options);
                     }
                 }
             }
             SetExpr::Values(values) => {
                 for row in &mut values.rows {
                     for expr in &mut row.content {
-                        Self::transform_expr(expr, context, options);
+                        Self::transform_expr(expr, options);
                     }
                 }
             }
             SetExpr::SetOperation { left, right, .. } => {
-                Self::transform_set_expr(left, context, options);
-                Self::transform_set_expr(right, context, options);
+                Self::transform_set_expr(left, options);
+                Self::transform_set_expr(right, options);
             }
             SetExpr::Query(query) => {
-                Self::transform_cte_query(query, context, options);
+                Self::transform_cte_query(query, options);
             }
             _ => {}
         }
@@ -1201,32 +1471,30 @@ impl PlPgSqlTranslator {
 
     fn transform_table_with_joins(
         table_with_joins: &mut TableWithJoins,
-        context: &mut PlPgSqlContext,
         options: &crate::options::TranslationContext<'_>,
     ) {
-        Self::transform_table_factor(&mut table_with_joins.relation, context, options);
+        Self::transform_table_factor(&mut table_with_joins.relation, options);
 
         for join in &mut table_with_joins.joins {
-            Self::transform_table_factor(&mut join.relation, context, options);
+            Self::transform_table_factor(&mut join.relation, options);
             if let Some(sqlparser::ast::JoinConstraint::On(expr)) =
                 crate::impls::shared_helpers::join_constraint_mut(&mut join.join_operator)
             {
-                Self::transform_expr(expr, context, options);
+                Self::transform_expr(expr, options);
             }
         }
     }
 
     fn transform_table_factor(
         factor: &mut TableFactor,
-        context: &mut PlPgSqlContext,
         options: &crate::options::TranslationContext<'_>,
     ) {
         match factor {
             TableFactor::Derived { subquery, .. } => {
-                Self::transform_cte_query(subquery, context, options);
+                Self::transform_cte_query(subquery, options);
             }
             TableFactor::NestedJoin { table_with_joins, .. } => {
-                Self::transform_table_with_joins(table_with_joins, context, options);
+                Self::transform_table_with_joins(table_with_joins, options);
             }
             _ => {}
         }
@@ -1234,21 +1502,16 @@ impl PlPgSqlTranslator {
 
     fn transform_selection(
         selection: &mut Option<Expr>,
-        context: &mut PlPgSqlContext,
         options: &crate::options::TranslationContext<'_>,
     ) {
         if let Some(expr) = selection {
-            Self::transform_expr(expr, context, options);
+            Self::transform_expr(expr, options);
         }
     }
 
     #[allow(clippy::too_many_lines)]
     #[cfg_attr(feature = "std", recursive::recursive)]
-    fn transform_expr(
-        expr: &mut Expr,
-        context: &mut PlPgSqlContext,
-        options: &crate::options::TranslationContext<'_>,
-    ) {
+    fn transform_expr(expr: &mut Expr, options: &crate::options::TranslationContext<'_>) {
         use crate::impls::expr_helpers::mutate_expr_children;
 
         match expr {
@@ -1276,18 +1539,18 @@ impl PlPgSqlTranslator {
                 if let Some(new_name) = renamed {
                     func.name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new(new_name))]);
                 }
-                Self::transform_function_parts(func, context, options);
+                Self::transform_function_parts(func, options);
             }
             Expr::In { expr: inner, target: InTarget::Subquery(subquery), .. } => {
-                Self::transform_expr(inner, context, options);
-                Self::transform_subquery(subquery, context, options);
+                Self::transform_expr(inner, options);
+                Self::transform_subquery(subquery, options);
             }
             Expr::Subquery(subquery) | Expr::Exists { subquery, .. } => {
-                Self::transform_subquery(subquery, context, options);
+                Self::transform_subquery(subquery, options);
             }
             other => {
                 mutate_expr_children(other, &mut |child| {
-                    Self::transform_expr(child, context, options);
+                    Self::transform_expr(child, options);
                 });
             }
         }
@@ -1295,175 +1558,80 @@ impl PlPgSqlTranslator {
 
     fn transform_function_parts(
         func: &mut sqlparser::ast::Function,
-        context: &mut PlPgSqlContext,
         options: &crate::options::TranslationContext<'_>,
     ) {
         let transform_func_args =
-            |args: &mut FunctionArguments,
-             ctx: &mut PlPgSqlContext,
-             opts: &crate::options::TranslationContext<'_>| {
+            |args: &mut FunctionArguments, opts: &crate::options::TranslationContext<'_>| {
                 if let FunctionArguments::List(list) = args {
                     for arg in &mut list.args {
                         match arg {
                             FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
                             | FunctionArg::Named { arg: FunctionArgExpr::Expr(e), .. }
                             | FunctionArg::ExprNamed { arg: FunctionArgExpr::Expr(e), .. } => {
-                                Self::transform_expr(e, ctx, opts);
+                                Self::transform_expr(e, opts);
                             }
                             _ => {}
                         }
                     }
                 }
             };
-        transform_func_args(&mut func.args, context, options);
-        transform_func_args(&mut func.parameters, context, options);
+        transform_func_args(&mut func.args, options);
+        transform_func_args(&mut func.parameters, options);
         if let Some(filter) = &mut func.filter {
-            Self::transform_expr(filter, context, options);
+            Self::transform_expr(filter, options);
         }
         if let Some(sqlparser::ast::WindowType::WindowSpec(spec)) = &mut func.over {
             for e in &mut spec.partition_by {
-                Self::transform_expr(e, context, options);
+                Self::transform_expr(e, options);
             }
             for ob in &mut spec.order_by {
-                Self::transform_expr(&mut ob.expr, context, options);
+                Self::transform_expr(&mut ob.expr, options);
             }
         }
         for ob in &mut func.within_group {
-            Self::transform_expr(&mut ob.expr, context, options);
+            Self::transform_expr(&mut ob.expr, options);
         }
     }
 
-    fn transform_subquery(
-        subquery: &mut Query,
-        context: &mut PlPgSqlContext,
-        options: &crate::options::TranslationContext<'_>,
-    ) {
-        Self::transform_query_expressions(subquery, context, options);
+    fn transform_subquery(subquery: &mut Query, options: &crate::options::TranslationContext<'_>) {
+        Self::transform_query_expressions(subquery, options);
     }
 
-    /// Translates an INSERT statement with CTE injection for variables.
+    /// Translates an `INSERT`, each variable it reads carried by a CTE.
     ///
-    /// Uses the `last_insert_rowid()` pattern for UUID variables:
-    /// - First INSERT using a UUID variable: uses the expression directly
-    ///   (e.g., `uuidv7()`)
-    /// - Subsequent INSERTTs: use `SELECT col FROM table WHERE rowid =
-    ///   last_insert_rowid()`
-    #[allow(clippy::too_many_lines)]
+    /// A generated UUID variable is read back by a later `INSERT` through
+    /// `last_insert_rowid()` from the row the first one wrote, so both see one
+    /// value.
     fn translate_insert_statement(
         insert: &sqlparser::ast::Insert,
-        context: &mut PlPgSqlContext,
+        scope: &mut BodyScope,
         schema: &ParserDB,
         options: &crate::options::TranslationContext<'_>,
         emit: crate::warnings::WarningSink<'_>,
     ) -> Result<Vec<Statement>, Error> {
-        use sqlparser::ast::TableObject;
-
-        let bindings: Vec<_> = context.bindings().cloned().collect();
-        let condition = context.current_condition();
+        let bindings: Vec<_> = scope.bindings().cloned().collect();
+        let condition = scope.current_condition();
 
         if bindings.is_empty() && condition.is_none() {
             return Statement::Insert(insert.clone())
                 .translate_with_warnings(schema, options, emit);
         }
 
-        let table_name = match &insert.table {
-            TableObject::TableName(object_name) => {
-                object_name
-                    .0
-                    .last()
-                    .map(|p| {
-                        match p {
-                            ObjectNamePart::Identifier(ident) => ident.value.clone(),
-                            ObjectNamePart::Function(_) => String::new(),
-                        }
-                    })
-                    .unwrap_or_default()
-            }
-            TableObject::TableFunction(_) | TableObject::TableQuery(_) => {
-                return Err(Error::forward_refusal(
-                    "INSERT into table function not supported".to_string(),
-                ));
-            }
-        };
-
-        let column_names: Vec<String> = insert
-            .columns
-            .iter()
-            .map(|c| {
-                c.0.last()
-                    .and_then(sqlparser::ast::ObjectNamePart::as_ident)
-                    .map_or_else(|| c.to_string(), |id| id.value.clone())
-            })
-            .collect();
-
-        // Check which bindings need the last_insert_rowid() pattern for UUID
-        // variables.
-        let mut modified_bindings = Vec::new();
-        let mut uuid_var_to_column: Vec<(String, String)> = Vec::new();
-
-        for binding in &bindings {
-            let is_uuid_gen = {
-                let expr_lower = binding.expression.to_lowercase();
-                expr_lower.contains("uuidv7()")
-                    || expr_lower.contains("uuidv4()")
-                    || expr_lower.contains("uuid_generate_v4()")
-                    || expr_lower.contains("gen_random_uuid()")
-            };
-
-            if is_uuid_gen {
-                if let Some(first_use) = context.get_uuid_first_use(&binding.name) {
-                    let new_expr = format!(
-                        "(SELECT {} FROM {} WHERE rowid = last_insert_rowid())",
-                        first_use.column_name, first_use.table_name
-                    );
-                    modified_bindings
-                        .push(VariableBinding { name: binding.name.clone(), expression: new_expr });
-                } else {
-                    if let Some(source) = &insert.source
-                        && let SetExpr::Values(values) = &*source.body
-                        && !values.rows.is_empty()
-                    {
-                        let row = &values.rows[0];
-                        for (i, expr) in row.iter().enumerate() {
-                            if references_variable(expr, &binding.name) && i < column_names.len() {
-                                uuid_var_to_column
-                                    .push((binding.name.clone(), column_names[i].clone()));
-                            }
-                        }
-                    }
-                    modified_bindings.push(binding.clone());
-                }
-            } else {
-                modified_bindings.push(binding.clone());
-            }
-        }
-
-        // Record first use of UUID variables for this INSERT
-        for (var_name, col_name) in &uuid_var_to_column {
-            if context.get_uuid_first_use(var_name).is_none() {
-                context.record_uuid_first_use(var_name, &table_name, col_name);
-            }
-        }
-
+        let modified_bindings = Self::insert_bindings(insert, bindings, scope)?;
         let mut new_insert = insert.clone();
 
-        // One CTE per bound variable, in dependency order: a variable may be
-        // defined in terms of one declared before it, and a CTE can only read
-        // one that precedes it.
-        let (values, scope) =
-            Self::bound_values(&modified_bindings, ReferenceForm::Cte, schema, options, emit)?;
+        let (values, variables) =
+            Self::bound_values(&modified_bindings, ReferenceForm::Cte, schema, options, emit);
         let ctes = values
             .into_iter()
             .map(|(name, value)| CteBuilder::create_variable_cte(&name, value))
             .collect();
 
-        let condition = context.current_condition();
-
         if let Some(source) = &insert.source {
             match &*source.body {
                 SetExpr::Values(values) => {
                     let new_source =
-                        Self::transform_values_to_select(values, &scope, condition.as_deref())?;
+                        Self::transform_values_to_select(values, &variables, condition)?;
 
                     new_insert.source =
                         Some(Box::new(make_query(CteBuilder::combine_ctes(ctes), new_source)));
@@ -1471,29 +1639,27 @@ impl PlPgSqlTranslator {
                 SetExpr::Select(select) => {
                     let mut new_select = select.as_ref().clone();
 
-                    if let Some(cond) = &condition {
-                        let cond_expr = Self::parse_expression(cond)?;
-                        new_select.selection = match new_select.selection.take() {
+                    if let Some(condition) = condition {
+                        new_select.selection = Some(match new_select.selection.take() {
                             Some(existing) => {
-                                Some(Expr::BinaryOp {
+                                Expr::BinaryOp {
                                     left: Box::new(existing),
                                     op: BinaryOperator::And,
-                                    right: Box::new(cond_expr),
-                                })
+                                    right: Box::new(condition),
+                                }
                             }
-                            None => Some(cond_expr),
-                        };
+                            None => condition,
+                        });
                     }
 
-                    // Substituted before the `WITH` is attached, so the CTE
-                    // bodies, which already read the variables they depend on,
-                    // are not walked a second time.
+                    // Substituted before the `WITH` is attached, which already
+                    // reads its variables.
                     let mut new_source = Query {
                         with: None,
                         body: Box::new(SetExpr::Select(Box::new(new_select))),
                         ..source.as_ref().clone()
                     };
-                    substitute_variables(&mut new_source, &scope);
+                    substitute_variables(&mut new_source, &variables)?;
                     new_source.with = CteBuilder::combine_ctes(ctes);
 
                     new_insert.source = Some(Box::new(new_source));
@@ -1505,32 +1671,95 @@ impl PlPgSqlTranslator {
             }
         }
 
-        // A declared variable with no assignment on this path is NULL in
-        // PostgreSQL, not a column. Left as a bare identifier the emitted
-        // trigger failed with `no such column`, which is what an ELSIF branch
-        // reading a variable the other branch assigned used to do.
         if let Some(source) = &mut new_insert.source {
-            Self::null_unbound_declarations(source, context, &modified_bindings);
+            Self::null_unbound_declarations(source.as_mut(), scope, &modified_bindings);
         }
 
         Statement::Insert(new_insert).translate_with_warnings(schema, options, emit)
     }
 
-    /// Replaces every declared variable that has no binding here with NULL.
+    /// The bindings `insert` reads, each generated UUID an earlier `INSERT`
+    /// wrote read back from that row through `last_insert_rowid()`.
     ///
-    /// PostgreSQL initialises a `DECLARE`d variable without a default to NULL,
-    /// so a branch that reads one the other branch assigned sees NULL rather
-    /// than an error. Emitted as a bare identifier it was a column reference,
-    /// and SQLite answered `no such column`.
-    fn null_unbound_declarations(
-        query: &mut Query,
-        context: &PlPgSqlContext,
-        bound: &[VariableBinding],
-    ) {
-        let _: ControlFlow<()> = visit_expressions_mut(query, |expr| {
+    /// A generated UUID this `INSERT` writes first is recorded, so later ones
+    /// read the same value back.
+    fn insert_bindings(
+        insert: &sqlparser::ast::Insert,
+        bindings: Vec<Binding>,
+        scope: &mut BodyScope,
+    ) -> Result<Vec<Binding>, Error> {
+        let sqlparser::ast::TableObject::TableName(table) = &insert.table else {
+            return Err(Error::forward_refusal(
+                "INSERT into table function not supported".to_string(),
+            ));
+        };
+        let table_name = crate::impls::object_name::last_ident(table)
+            .map(|ident| ident.value.clone())
+            .unwrap_or_default();
+        let column_names: Vec<String> = insert
+            .columns
+            .iter()
+            .map(|c| {
+                c.0.last()
+                    .and_then(sqlparser::ast::ObjectNamePart::as_ident)
+                    .map_or_else(|| c.to_string(), |id| id.value.clone())
+            })
+            .collect();
+
+        let mut modified_bindings = Vec::with_capacity(bindings.len());
+        let mut first_uses: Vec<(String, String)> = Vec::new();
+        for binding in bindings {
+            if !matches!(&binding.value, BoundValue::Expr(expr) if generates_uuid(expr)) {
+                modified_bindings.push(binding);
+                continue;
+            }
+            if let Some(first_use) = scope.uuid_first_use(&binding.name) {
+                let rowid = Expr::BinaryOp {
+                    left: Box::new(Expr::Identifier(Ident::new("rowid"))),
+                    op: BinaryOperator::Eq,
+                    right: Box::new(simple_function_expr("last_insert_rowid", Vec::new(), None)),
+                };
+                let read_back = single_expr_query(
+                    Expr::Identifier(Ident::new(first_use.column.clone())),
+                    from_relation(plain_table_factor(ObjectName::from(vec![Ident::new(
+                        first_use.table.clone(),
+                    )]))),
+                    Some(rowid),
+                );
+                modified_bindings.push(Binding {
+                    name: binding.name,
+                    value: BoundValue::Expr(Expr::Subquery(Box::new(read_back))),
+                });
+                continue;
+            }
+            if let Some(source) = &insert.source
+                && let SetExpr::Values(values) = &*source.body
+                && let Some(row) = values.rows.first()
+            {
+                for (expr, column) in row.iter().zip(&column_names) {
+                    if references_variable(expr, &binding.name) {
+                        first_uses.push((binding.name.clone(), column.clone()));
+                    }
+                }
+            }
+            modified_bindings.push(binding);
+        }
+
+        for (variable, column) in &first_uses {
+            if scope.uuid_first_use(variable).is_none() {
+                scope.record_uuid_first_use(variable, &table_name, column);
+            }
+        }
+        Ok(modified_bindings)
+    }
+
+    /// Replaces each read of a declared variable with no binding by `NULL`,
+    /// which is what PostgreSQL initialises it to.
+    fn null_unbound_declarations<N: VisitMut>(node: &mut N, scope: &BodyScope, bound: &[Binding]) {
+        let _: ControlFlow<()> = visit_expressions_mut(node, |expr| {
             if let Expr::Identifier(ident) = expr
-                && context.is_declared_variable(&ident.value)
-                && !bound.iter().any(|binding| binding.name == ident.value)
+                && scope.is_declared(ident)
+                && !bound.iter().any(|binding| binding.name == fold(ident))
             {
                 *expr = Expr::Value(Value::Null.with_empty_span());
             }
@@ -1538,147 +1767,101 @@ impl PlPgSqlTranslator {
         });
     }
 
-    /// Reorders bindings so one referenced by another comes first.
+    /// Reorders bindings so one read by another comes first.
     ///
-    /// A stable insertion pass rather than a full topological sort: the lists
-    /// are a handful of declared variables, and a cycle is impossible because
-    /// PL/pgSQL declares each in order and can only reference one already
-    /// declared. A binding whose dependency cannot be placed keeps its
-    /// original position, so the worst case is the behaviour before ordering
-    /// existed rather than a lost binding.
-    fn order_bindings_by_dependency(bindings: &[VariableBinding]) -> Vec<VariableBinding> {
-        let mut ordered: Vec<VariableBinding> = Vec::with_capacity(bindings.len());
-        let mut pending: Vec<&VariableBinding> = bindings.iter().collect();
+    /// A binding whose dependency cannot be placed keeps its position.
+    fn order_bindings_by_dependency(bindings: &[Binding]) -> Vec<&Binding> {
+        let depends_on = |candidate: &Binding, other: &Binding| matches!(&candidate.value, BoundValue::Expr(expr) if references_variable(expr, &other.name));
+        let mut ordered: Vec<&Binding> = Vec::with_capacity(bindings.len());
+        let mut pending: Vec<&Binding> = bindings.iter().collect();
 
         while !pending.is_empty() {
             let ready = pending.iter().position(|candidate| {
-                !pending.iter().any(|other| {
-                    other.name != candidate.name
-                        && Self::expression_names_variable(&candidate.expression, &other.name)
-                })
+                !pending
+                    .iter()
+                    .any(|other| other.name != candidate.name && depends_on(candidate, other))
             });
             if let Some(index) = ready {
-                ordered.push(pending.remove(index).clone());
+                ordered.push(pending.remove(index));
             } else {
-                // Nothing is free of the others, so stop reordering and keep
-                // what is left in the order it arrived.
-                ordered.extend(pending.iter().map(|binding| (*binding).clone()));
-                break;
+                ordered.append(&mut pending);
             }
         }
 
         ordered
     }
 
-    /// True when `expression` names `variable` as a whole word.
-    fn expression_names_variable(expression: &str, variable: &str) -> bool {
-        Self::parse_expression(expression).is_ok_and(|expr| references_variable(&expr, variable))
-    }
-
     /// The one-row `VALUES` of a trigger `INSERT`, as the `SELECT` that can
     /// carry the enclosing `IF` condition in a `WHERE` clause.
-    ///
-    /// No `FROM` clause: a variable is read through a scalar subquery, so
-    /// nothing has to be in scope for the row to be built.
     fn transform_values_to_select(
         values: &sqlparser::ast::Values,
-        scope: &VariableScope,
-        condition: Option<&str>,
+        variables: &VariableScope,
+        condition: Option<Expr>,
     ) -> Result<SetExpr, Error> {
-        if values.rows.len() != 1 {
+        let [row] = values.rows.as_slice() else {
             return Err(Error::unsupported_source_syntax(
                 "Multi-row VALUES in trigger not supported",
             ));
-        }
+        };
 
-        let projections = values.rows[0]
-            .content
-            .iter()
-            .map(|expr| SelectItem::UnnamedExpr(expr.clone()))
-            .collect();
-        let selection =
-            if let Some(cond) = condition { Some(Self::parse_expression(cond)?) } else { None };
-
+        let projections =
+            row.content.iter().map(|expr| SelectItem::UnnamedExpr(expr.clone())).collect();
         let mut body =
-            SetExpr::Select(Box::new(make_simple_select(projections, Vec::new(), selection)));
-        substitute_variables(&mut body, scope);
+            SetExpr::Select(Box::new(make_simple_select(projections, Vec::new(), condition)));
+        substitute_variables(&mut body, variables)?;
         Ok(body)
     }
 
-    /// The value each binding holds, in dependency order, with a scope that
-    /// reads them back in `form`.
-    ///
-    /// A binding may be defined in terms of one declared before it, so each
-    /// expression has the ones already resolved substituted into it before it
-    /// becomes readable itself.
+    /// The SQLite value of each readable binding, in dependency order, with a
+    /// scope that reads them back in `form`.
     fn bound_values(
-        bindings: &[VariableBinding],
+        bindings: &[Binding],
         form: ReferenceForm,
         schema: &ParserDB,
         options: &crate::options::TranslationContext<'_>,
         emit: crate::warnings::WarningSink<'_>,
-    ) -> Result<(Vec<(String, Expr)>, VariableScope), Error> {
+    ) -> (Vec<(String, Expr)>, VariableScope) {
         let ordered = Self::order_bindings_by_dependency(bindings);
         let mut values = Vec::with_capacity(ordered.len());
         let mut scope = VariableScope::default();
 
-        for binding in &ordered {
-            let renamed = Self::translate_uuid_function(&binding.expression, options);
-            let parsed = Self::parse_expression(&renamed)?;
-            let mut value = parsed.translate_with_warnings(schema, options, emit)?;
-            substitute_variables(&mut value, &scope);
+        for binding in ordered {
+            let expr = match &binding.value {
+                BoundValue::Expr(expr) => expr,
+                BoundValue::Unreadable(reason) => {
+                    scope.refuse(&binding.name, reason);
+                    continue;
+                }
+            };
+            let mut renamed = expr.clone();
+            Self::transform_expr(&mut renamed, options);
+            // A value that does not translate, or reads a refused name, is
+            // refused itself, so only a statement reading it fails.
+            let mut value = match renamed.translate_with_warnings(schema, options, emit) {
+                Ok(translated) => translated,
+                Err(error) => {
+                    scope.refuse(&binding.name, &error.to_string());
+                    continue;
+                }
+            };
+            if let Err(error) = substitute_variables(&mut value, &scope) {
+                scope.refuse(&binding.name, &error.to_string());
+                continue;
+            }
             scope.bind(&binding.name, form.reference(&binding.name, &value));
             values.push((binding.name.clone(), value));
         }
 
-        Ok((values, scope))
+        (values, scope)
     }
 
-    fn translate_uuid_function(
-        expr_str: &str,
-        options: &crate::options::TranslationContext<'_>,
-    ) -> String {
-        if let Ok(mut parsed_expr) = Self::parse_expression(expr_str) {
-            let mut context = PlPgSqlContext::new();
-            Self::transform_expr(&mut parsed_expr, &mut context, options);
-            return parsed_expr.to_string();
-        }
-
-        let random = options.get_uuid_function_name();
-        // The version 7 spellings are left alone when nothing was declared.
-        // An undeclared body was already refused, so the only way here is a
-        // declared name.
-        let ordered = options.get_uuid_v7_function_name().unwrap_or("uuidv7");
-
-        expr_str
-            .replace("gen_random_uuid()", &format!("{random}()"))
-            .replace("GEN_RANDOM_UUID()", &format!("{random}()"))
-            .replace("uuid_generate_v4()", &format!("{random}()"))
-            .replace("UUID_GENERATE_V4()", &format!("{random}()"))
-            .replace("uuidv4()", &format!("{random}()"))
-            .replace("UUIDV4()", &format!("{random}()"))
-            .replace("uuidv7()", &format!("{ordered}()"))
-            .replace("UUIDV7()", &format!("{ordered}()"))
-    }
-
-    fn parse_expression(expr_str: &str) -> Result<Expr, Error> {
-        let dialect = sqlparser::dialect::PostgreSqlDialect {};
-        let mut parser =
-            sqlparser::parser::Parser::new(&dialect).try_with_sql(expr_str).map_err(|e| {
-                Error::unsupported_source_syntax(format!("Failed to parse expression: {e}"))
-            })?;
-
-        parser.parse_expr().map_err(|e| {
-            Error::unsupported_source_syntax(format!("Failed to parse expression: {e}"))
-        })
-    }
-
-    /// Attach an `IF` condition to a statement's WHERE clause.
-    ///
-    /// A failure is propagated rather than dropped: a guard that does not
-    /// attach leaves the statement running for every row.
-    fn inject_condition_into_statement(stmt: &mut Statement, condition: &str) -> Result<(), Error> {
-        inject_condition_into_dml_statement(stmt, Self::parse_expression(condition)?)
+    /// Attaches an `IF` guard to a statement's `WHERE` clause, failing when it
+    /// cannot, since an unguarded statement runs for every row.
+    fn inject_condition_into_statement(
+        stmt: &mut Statement,
+        condition: &Expr,
+    ) -> Result<(), Error> {
+        inject_condition_into_dml_statement(stmt, condition.clone())
     }
 }
 
@@ -1720,6 +1903,7 @@ impl ReferenceForm {
 #[derive(Default)]
 struct VariableScope {
     replacements: Vec<(String, Expr)>,
+    refusals: Vec<(String, String)>,
 }
 
 impl VariableScope {
@@ -1727,75 +1911,245 @@ impl VariableScope {
         self.replacements.push((name.to_string(), reference));
     }
 
+    /// Makes a read of `name` fail with `reason`.
+    fn refuse(&mut self, name: &str, reason: &str) {
+        self.refusals.push((name.to_string(), reason.to_string()));
+    }
+
     fn replacement(&self, name: &str) -> Option<&Expr> {
         self.replacements.iter().find_map(|(bound, reference)| (bound == name).then_some(reference))
     }
 
+    fn refusal(&self, name: &str) -> Option<&str> {
+        self.refusals.iter().find_map(|(bound, reason)| (bound == name).then_some(reason.as_str()))
+    }
+
     fn is_empty(&self) -> bool {
-        self.replacements.is_empty()
+        self.replacements.is_empty() && self.refusals.is_empty()
     }
 }
 
-/// The name a bare identifier reads, or `None` for anything qualified.
+/// The identifier a bare name reads, or `None` for anything qualified.
 ///
-/// A single-segment compound identifier is what `(v_n)` parses to in some
-/// positions, and it names the same variable as the bare form.
+/// `(v_n)` parses to a single-segment compound identifier in some positions.
+fn bare_identifier(expr: &Expr) -> Option<&Ident> {
+    match expr {
+        Expr::Identifier(ident) => Some(ident),
+        Expr::CompoundIdentifier(parts) if parts.len() == 1 => parts.first(),
+        _ => None,
+    }
+}
+
 struct VariableSubstituter<'a>(&'a VariableScope);
 
 impl VisitorMut for VariableSubstituter<'_> {
-    type Break = ();
+    type Break = String;
 
-    /// Post-order, so the replacement subquery is not walked into again: its
-    /// own `val` column would otherwise be a candidate for a variable of that
-    /// name.
-    fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
-        let replacement = crate::impls::shared_helpers::bare_identifier_name(expr)
-            .and_then(|name| self.0.replacement(name));
-        if let Some(replacement) = replacement.cloned() {
-            *expr = replacement;
+    /// Post-order, so the replacement subquery is not walked into again.
+    fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<String> {
+        let Some(name) = bare_identifier(expr).map(fold) else { return ControlFlow::Continue(()) };
+        if let Some(reason) = self.0.refusal(&name) {
+            return ControlFlow::Break(reason.to_string());
+        }
+        if let Some(replacement) = self.0.replacement(&name) {
+            *expr = replacement.clone();
         }
         ControlFlow::Continue(())
     }
 }
 
-/// True when two bindings name the same variable and hold the same
-/// expression. `VariableBinding` carries no `PartialEq`.
-fn same_binding(left: &VariableBinding, right: &VariableBinding) -> bool {
-    left.name == right.name && left.expression == right.expression
-}
-
-/// Rewrites every read of a bound variable anywhere inside `node`.
-///
-/// Driven by the derived traversal rather than one arm per AST node, because
-/// the hand-written walk this replaced reached a projection item and a `WHERE`
-/// predicate and nothing else, so a variable read from `HAVING`, `GROUP BY`,
-/// `ORDER BY`, `LIMIT`, a derived table or a join constraint stayed a bare
-/// identifier and SQLite answered `no such column`.
-fn substitute_variables<N: VisitMut>(node: &mut N, scope: &VariableScope) {
+/// Rewrites every read of a bound variable anywhere inside `node`, failing on
+/// a read of one the emitted trigger cannot compute.
+fn substitute_variables<N: VisitMut>(node: &mut N, scope: &VariableScope) -> Result<(), Error> {
     if scope.is_empty() {
-        return;
+        return Ok(());
     }
-    let _: ControlFlow<()> = node.visit(&mut VariableSubstituter(scope));
+    match node.visit(&mut VariableSubstituter(scope)) {
+        ControlFlow::Break(reason) => Err(Error::forward_refusal(reason)),
+        ControlFlow::Continue(()) => Ok(()),
+    }
 }
 
-struct VariableSearch<'a>(&'a str);
-
-impl Visitor for VariableSearch<'_> {
-    type Break = ();
-
-    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+/// True when `node` reads the variable `var_name`, folded, anywhere inside it.
+fn references_variable<N: Visit>(node: &N, var_name: &str) -> bool {
+    visit_expressions(node, |expr| {
         let names = match expr {
-            Expr::Identifier(ident) => ident.value == self.0,
-            Expr::CompoundIdentifier(idents) => idents.iter().any(|ident| ident.value == self.0),
+            Expr::Identifier(ident) => fold(ident) == var_name,
+            Expr::CompoundIdentifier(idents) => idents.iter().any(|ident| fold(ident) == var_name),
             _ => false,
         };
         if names { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
-    }
+    })
+    .is_break()
 }
 
-/// True when `node` reads `var_name` anywhere inside it.
-fn references_variable<N: Visit>(node: &N, var_name: &str) -> bool {
-    node.visit(&mut VariableSearch(var_name)).is_break()
+/// `conditions` joined by `AND`, or `TRUE` for none.
+fn conjunction(conditions: impl Iterator<Item = Expr>) -> Expr {
+    conditions
+        .reduce(|left, right| {
+            Expr::BinaryOp { left: Box::new(left), op: BinaryOperator::And, right: Box::new(right) }
+        })
+        .unwrap_or_else(|| Expr::Value(Value::Boolean(true).with_empty_span()))
+}
+
+/// The relations `stmt` writes, folded, including from inside a `WITH`.
+fn written_relations(stmt: &Statement) -> Vec<String> {
+    struct Writes(Vec<String>);
+
+    impl Writes {
+        fn record(&mut self, name: &ObjectName) {
+            if let Some(ident) = crate::impls::object_name::last_ident(name) {
+                self.0.push(fold(ident));
+            }
+        }
+
+        fn record_tables(&mut self, tables: &[TableWithJoins]) {
+            for table in tables {
+                if let TableFactor::Table { name, .. } = &table.relation {
+                    self.record(name);
+                }
+            }
+        }
+    }
+
+    impl Visitor for Writes {
+        type Break = ();
+
+        fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<()> {
+            match statement {
+                Statement::Insert(insert) => {
+                    if let sqlparser::ast::TableObject::TableName(name) = &insert.table {
+                        self.record(name);
+                    }
+                }
+                Statement::Update(update) => {
+                    self.record_tables(core::slice::from_ref(&update.table));
+                }
+                Statement::Delete(delete) => {
+                    match &delete.from {
+                        sqlparser::ast::FromTable::WithFromKeyword(tables)
+                        | sqlparser::ast::FromTable::WithoutKeyword(tables) => {
+                            self.record_tables(tables);
+                        }
+                    }
+                }
+                Statement::Truncate(truncate) => {
+                    for target in &truncate.table_names {
+                        self.record(&target.name);
+                    }
+                }
+                Statement::Merge(merge) => {
+                    if let TableFactor::Table { name, .. } = &merge.table {
+                        self.record(name);
+                    }
+                }
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut writes = Writes(Vec::new());
+    let _: ControlFlow<()> = stmt.visit(&mut writes);
+    writes.0
+}
+
+/// Whether `stmt` changes data.
+fn writes(stmt: &Statement) -> bool {
+    !written_relations(stmt).is_empty()
+}
+
+/// PostgreSQL's built-in set-returning functions, which can answer no row from
+/// a `SELECT` without `FROM`.
+const SET_RETURNING_BUILTINS: &[&str] = &[
+    "generate_series",
+    "generate_subscripts",
+    "unnest",
+    "regexp_matches",
+    "regexp_split_to_table",
+    "string_to_table",
+    "json_array_elements",
+    "json_array_elements_text",
+    "json_each",
+    "json_each_text",
+    "json_object_keys",
+    "json_populate_recordset",
+    "json_to_recordset",
+    "jsonb_array_elements",
+    "jsonb_array_elements_text",
+    "jsonb_each",
+    "jsonb_each_text",
+    "jsonb_object_keys",
+    "jsonb_path_query",
+    "jsonb_populate_recordset",
+    "jsonb_to_recordset",
+];
+
+/// Whether `projection` calls a function that answers a set of rows.
+fn returns_set(projection: &[SelectItem], schema: &ParserDB) -> bool {
+    let declared_set = |name: &str| {
+        schema.functions().any(|function| {
+            crate::impls::object_name::last_ident(&function.name)
+                .is_some_and(|ident| ident.value.eq_ignore_ascii_case(name))
+                && matches!(
+                    function.return_type,
+                    Some(
+                        FunctionReturnType::SetOf(_)
+                            | FunctionReturnType::DataType(DataType::Table(_))
+                    )
+                )
+        })
+    };
+    projection.iter().any(|item| {
+        visit_expressions(item, |expr| {
+            if let Expr::Function(function) = expr
+                && let Some(name) = function_name(function)
+                && (SET_RETURNING_BUILTINS.contains(&name.as_str()) || declared_set(&name))
+            {
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        })
+        .is_break()
+    })
+}
+
+/// The first function `query` calls that the schema declares, whose effects a
+/// second run would repeat.
+fn schema_function_call(query: &Query, schema: &ParserDB) -> Option<String> {
+    let mut found = None;
+    let _: ControlFlow<()> = visit_expressions(query, |expr| {
+        if let Expr::Function(function) = expr
+            && let Some(name) = function_name(function)
+            && schema.functions().any(|declared| {
+                crate::impls::object_name::last_ident(&declared.name)
+                    .is_some_and(|ident| ident.value.eq_ignore_ascii_case(&name))
+            })
+        {
+            found = Some(function.name.to_string());
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    });
+    found
+}
+
+/// Whether `expr` calls a function that generates a UUID.
+fn generates_uuid(expr: &Expr) -> bool {
+    visit_expressions(expr, |inner| {
+        if let Expr::Function(function) = inner
+            && function_name(function).is_some_and(|name| {
+                matches!(
+                    name.as_str(),
+                    "uuidv7" | "uuidv4" | "uuid_generate_v4" | "gen_random_uuid"
+                )
+            })
+        {
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    })
+    .is_break()
 }
 
 /// Replaces a read of one CTE with a derived table over its body.
@@ -2041,19 +2395,15 @@ mod tests {
     };
 
     use super::{
-        PlPgSqlTranslator, ReferenceForm, VariableScope, may_raise, references_variable,
-        substitute_variables,
+        Binding, BodyScope, BoundValue, PlPgSqlTranslator, ReferenceForm, TriggerFacts,
+        VariableScope, may_raise, references_variable, substitute_variables,
     };
     use crate::{
-        impls::{
-            test_fixtures::{empty_schema, parse_expr, parse_query},
-            translator_impls::plpgsql::{PlPgSqlContext, VariableBinding},
-        },
+        impls::test_fixtures::{empty_schema, parse_expr, parse_query},
         prelude::Pg2SqliteOptions,
     };
 
-    /// A schema declaring the table these cases translate against, since a
-    /// column reference resolves through the relations in scope.
+    /// Declares the table used to resolve column references.
     fn users_schema() -> ParserDB {
         ParserDB::from_statements(
             Parser::parse_sql(&PostgreSqlDialect {}, "CREATE TABLE users(id INT, kind TEXT);")
@@ -2068,58 +2418,6 @@ mod tests {
     }
 
     #[test]
-    fn uuid_function_translation_and_expression_parsing_behave_as_expected() {
-        let options = crate::options::TranslationContext::from_owned(
-            Pg2SqliteOptions::default()
-                .with_uuid_function_name("app_uuid".to_string())
-                .with_uuid_v7_function_name("uuid7"),
-        );
-        // The random spellings take the random name and the ordered one takes
-        // its own, which is the whole point of the two options.
-        let translated = PlPgSqlTranslator::translate_uuid_function(
-            "gen_random_uuid() + uuidv4() + uuidv7()",
-            &options,
-        );
-        assert_eq!(translated, "app_uuid() + app_uuid() + uuid7()");
-
-        let qualified = PlPgSqlTranslator::translate_uuid_function(
-            "public.gen_random_uuid() + pg_catalog.uuid_generate_v4()",
-            &options,
-        );
-        assert_eq!(qualified, "app_uuid() + app_uuid()");
-
-        let parsed = PlPgSqlTranslator::parse_expression("1 + 2").unwrap();
-        assert_eq!(parsed.to_string(), "1 + 2");
-
-        let err = PlPgSqlTranslator::parse_expression("THIS IS NOT SQL").unwrap_err();
-        assert!(err.to_string().contains("Failed to parse expression"));
-    }
-
-    #[test]
-    fn handle_set_statement_tracks_scoped_and_persistent_bindings() {
-        let mut ctx = PlPgSqlContext::new();
-
-        let scoped = parse_statement("SET v_id = 42");
-        if let Statement::Set(set) = scoped {
-            PlPgSqlTranslator::handle_set_statement(&set, &mut ctx);
-        } else {
-            panic!("expected SET statement");
-        }
-        assert_eq!(ctx.get_binding("v_id").map(|b| b.expression.as_str()), Some("42"));
-
-        let persistent = parse_statement("SET v_sub = (SELECT NEW.id)");
-        if let Statement::Set(set) = persistent {
-            PlPgSqlTranslator::handle_set_statement(&set, &mut ctx);
-        } else {
-            panic!("expected SET statement");
-        }
-        assert_eq!(
-            ctx.get_binding("v_sub").map(|b| b.expression.as_str()),
-            Some("(SELECT NEW.id)")
-        );
-    }
-
-    #[test]
     fn transform_values_to_select_handles_empty_scope_and_rejects_multi_row_values() {
         let query = parse_query("VALUES (1)");
         let SetExpr::Values(values) = query.body.as_ref() else {
@@ -2129,7 +2427,7 @@ mod tests {
         let transformed = PlPgSqlTranslator::transform_values_to_select(
             values,
             &VariableScope::default(),
-            Some("TRUE"),
+            Some(parse_expr("TRUE")),
         )
         .unwrap();
         let SetExpr::Select(select) = transformed else {
@@ -2143,38 +2441,51 @@ mod tests {
         let SetExpr::Values(multi_values) = multi.body.as_ref() else {
             panic!("expected values");
         };
-        let err = PlPgSqlTranslator::transform_values_to_select(
+        let error = PlPgSqlTranslator::transform_values_to_select(
             multi_values,
             &VariableScope::default(),
             None,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("Multi-row VALUES in trigger not supported"));
+        assert!(error.to_string().contains("Multi-row VALUES in trigger not supported"));
     }
 
-    /// A scope built for one form reads every bound name back in that form,
-    /// and leaves an unbound name alone.
+    /// Bound names use their reference form and unbound names stay unchanged.
     #[test]
     fn a_scope_rewrites_bound_names_only() {
         let mut scope = VariableScope::default();
         scope.bind("v_id", ReferenceForm::Cte.reference("v_id", &parse_expr("42")));
 
-        let mut expr = parse_expr("(v_id + 1) * other");
-        substitute_variables(&mut expr, &scope);
-        assert_eq!(expr.to_string(), "((SELECT val FROM v_id) + 1) * other");
+        let mut expression = parse_expr("(v_id + 1) * other");
+        substitute_variables(&mut expression, &scope).unwrap();
+        assert_eq!(expression.to_string(), "((SELECT val FROM v_id) + 1) * other");
 
         let mut inline = VariableScope::default();
         inline.bind("v_id", ReferenceForm::Inline.reference("v_id", &parse_expr("count(*)")));
-        let mut expr = parse_expr("v_id + 1");
-        substitute_variables(&mut expr, &inline);
-        assert_eq!(expr.to_string(), "(SELECT count(*)) + 1");
+        let mut expression = parse_expr("v_id + 1");
+        substitute_variables(&mut expression, &inline).unwrap();
+        assert_eq!(expression.to_string(), "(SELECT count(*)) + 1");
 
         // An expression that is already a subquery is read as it stands.
         let mut nested = VariableScope::default();
         nested.bind("v_id", ReferenceForm::Inline.reference("v_id", &parse_expr("(SELECT 1)")));
-        let mut expr = parse_expr("v_id");
-        substitute_variables(&mut expr, &nested);
-        assert_eq!(expr.to_string(), "(SELECT 1)");
+        let mut expression = parse_expr("v_id");
+        substitute_variables(&mut expression, &nested).unwrap();
+        assert_eq!(expression.to_string(), "(SELECT 1)");
+    }
+
+    #[test]
+    fn a_refused_variable_fails_its_read() {
+        let mut scope = VariableScope::default();
+        scope.refuse("v", "why");
+
+        let mut expression = parse_expr("v + 1");
+        let error = substitute_variables(&mut expression, &scope).unwrap_err();
+        assert!(error.to_string().contains("why"));
+
+        let mut unrelated = parse_expr("other + 1");
+        substitute_variables(&mut unrelated, &scope).unwrap();
+        assert_eq!(unrelated.to_string(), "other + 1");
     }
 
     /// A value raising only through a table-valued function, such as
@@ -2195,8 +2506,7 @@ mod tests {
         assert!(!references_variable(&parse_expr("other_id + 1"), "id"));
     }
 
-    /// The two shapes that cannot take a guard now report it rather than
-    /// leaving the statement to run unguarded.
+    /// Statements without a guard clause reject conditions.
     #[test]
     fn inject_condition_into_statement_updates_where_or_reports_why_not() {
         for sql in [
@@ -2205,18 +2515,20 @@ mod tests {
             "INSERT INTO users(id) SELECT id FROM users",
         ] {
             let mut statement = parse_statement(sql);
-            PlPgSqlTranslator::inject_condition_into_statement(&mut statement, "NEW.kind = 'x'")
-                .expect("this shape has a WHERE clause");
+            PlPgSqlTranslator::inject_condition_into_statement(
+                &mut statement,
+                &parse_expr("NEW.kind = 'x'"),
+            )
+            .expect("this shape has a WHERE clause");
             assert!(statement.to_string().contains("WHERE NEW.kind = 'x'"), "{statement}");
         }
 
-        let mut unparsable = parse_statement("DELETE FROM users");
-        PlPgSqlTranslator::inject_condition_into_statement(&mut unparsable, "NOT (")
-            .expect_err("a condition that does not parse cannot be attached");
-
         let mut insert_values = parse_statement("INSERT INTO users(id) VALUES (1)");
-        PlPgSqlTranslator::inject_condition_into_statement(&mut insert_values, "NEW.kind = 'x'")
-            .expect_err("VALUES has no WHERE clause to guard");
+        PlPgSqlTranslator::inject_condition_into_statement(
+            &mut insert_values,
+            &parse_expr("NEW.kind = 'x'"),
+        )
+        .expect_err("VALUES has no WHERE clause to guard");
     }
 
     #[test]
@@ -2232,14 +2544,12 @@ mod tests {
 
         let with = query.with.as_ref().unwrap().clone();
         let SetExpr::Insert(Statement::Insert(insert)) = query.body.as_ref() else {
-            panic!("expected set-expr insert");
+            panic!("expected set-expression insert");
         };
 
-        let mut ctx = PlPgSqlContext::new();
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
         let statements =
-            PlPgSqlTranslator::transform_with_insert_to_subquery(&with, insert, &mut ctx, &options)
-                .unwrap();
+            PlPgSqlTranslator::transform_with_insert_to_subquery(&with, insert, &options).unwrap();
         let translated = match &statements[0] {
             Statement::Insert(insert) => insert,
             other => panic!("expected insert statement, got: {other:?}"),
@@ -2251,12 +2561,9 @@ mod tests {
     #[test]
     fn transform_query_body_covers_set_operation_path() {
         let query = parse_query("SELECT 1 UNION ALL SELECT 2");
-        let mut ctx = PlPgSqlContext::new();
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
 
-        let transformed =
-            PlPgSqlTranslator::transform_query_body(query.body.as_ref(), &mut ctx, &options)
-                .unwrap();
+        let transformed = PlPgSqlTranslator::transform_query_body(query.body.as_ref(), &options);
         assert!(matches!(transformed, SetExpr::SetOperation { .. }));
     }
 
@@ -2275,13 +2582,12 @@ mod tests {
         );
         let with = with_delete.with.as_ref().unwrap().clone();
         let SetExpr::Delete(Statement::Delete(delete)) = with_delete.body.as_ref() else {
-            panic!("expected set-expr delete");
+            panic!("expected set-expression delete");
         };
 
-        let mut ctx = PlPgSqlContext::new();
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
         let transformed =
-            PlPgSqlTranslator::transform_with_delete_to_subquery(&with, delete, &mut ctx, &options);
+            PlPgSqlTranslator::transform_with_delete_to_subquery(&with, delete, &options);
         assert_eq!(transformed.len(), 1);
         assert!(matches!(transformed[0], Statement::Delete(_)));
     }
@@ -2290,15 +2596,15 @@ mod tests {
     fn translate_insert_statement_uses_fast_path_without_bindings() {
         let schema = empty_schema();
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
-        let insert_stmt = parse_statement("INSERT INTO users(id) VALUES (1)");
-        let Statement::Insert(insert) = insert_stmt else {
+        let insert_statement = parse_statement("INSERT INTO users(id) VALUES (1)");
+        let Statement::Insert(insert) = insert_statement else {
             panic!("expected insert");
         };
-        let mut ctx = PlPgSqlContext::new();
+        let mut scope = BodyScope::new(TriggerFacts::default());
 
         let translated = PlPgSqlTranslator::translate_insert_statement(
             &insert,
-            &mut ctx,
+            &mut scope,
             &schema,
             &options,
             &mut |_| {},
@@ -2309,9 +2615,7 @@ mod tests {
 
     #[test]
     fn translate_query_statement_falls_back_for_non_insert_delete_with_bodies() {
-        let schema = empty_schema();
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
-        let mut ctx = PlPgSqlContext::new();
 
         let query = parse_query(
             r#"
@@ -2320,16 +2624,9 @@ mod tests {
             "#,
         );
 
-        let out = PlPgSqlTranslator::translate_query_statement(
-            &query,
-            &mut ctx,
-            &schema,
-            &options,
-            &mut |_| {},
-        )
-        .unwrap();
-        assert_eq!(out.len(), 1);
-        assert!(matches!(out[0], Statement::Query(_)));
+        let output = PlPgSqlTranslator::translate_query_statement(&query, &options).unwrap();
+        assert_eq!(output.len(), 1);
+        assert!(matches!(output[0], Statement::Query(_)));
     }
 
     #[test]
@@ -2342,67 +2639,76 @@ mod tests {
         };
         insert.source = None;
 
-        let mut ctx = PlPgSqlContext::new();
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
-        let err = PlPgSqlTranslator::transform_with_insert_to_subquery(
-            &with, &insert, &mut ctx, &options,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("without source SELECT"));
+        let error = PlPgSqlTranslator::transform_with_insert_to_subquery(&with, &insert, &options)
+            .unwrap_err();
+        assert!(error.to_string().contains("without source SELECT"));
     }
 
     #[test]
     fn transform_with_insert_to_subquery_handles_projection_shapes() {
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
-        let mut ctx = PlPgSqlContext::new();
 
-        let q1 = parse_query(
+        let identifier_query = parse_query(
             r#"
             WITH cte AS (SELECT 1 AS id)
             INSERT INTO users (id) SELECT id FROM cte
             "#,
         );
-        let with1 = q1.with.as_ref().unwrap().clone();
-        let SetExpr::Insert(Statement::Insert(insert1)) = q1.body.as_ref() else {
-            panic!("expected set-expr insert");
+        let identifier_with = identifier_query.with.as_ref().unwrap().clone();
+        let SetExpr::Insert(Statement::Insert(identifier_insert)) = identifier_query.body.as_ref()
+        else {
+            panic!("expected set-expression insert");
         };
-        let s1 = PlPgSqlTranslator::transform_with_insert_to_subquery(
-            &with1, insert1, &mut ctx, &options,
+        let identifier_statements = PlPgSqlTranslator::transform_with_insert_to_subquery(
+            &identifier_with,
+            identifier_insert,
+            &options,
         )
         .unwrap();
-        assert!(s1[0].to_string().contains("recursive_cte_subquery.id"));
+        assert!(identifier_statements[0].to_string().contains("recursive_cte_subquery.id"));
 
-        let q2 = parse_query(
+        let qualified_query = parse_query(
             r#"
             WITH cte AS (SELECT 1 AS id)
             INSERT INTO users (id) SELECT cte.id FROM cte
             "#,
         );
-        let with2 = q2.with.as_ref().unwrap().clone();
-        let SetExpr::Insert(Statement::Insert(insert2)) = q2.body.as_ref() else {
-            panic!("expected set-expr insert");
+        let qualified_with = qualified_query.with.as_ref().unwrap().clone();
+        let SetExpr::Insert(Statement::Insert(qualified_insert)) = qualified_query.body.as_ref()
+        else {
+            panic!("expected set-expression insert");
         };
-        let s2 = PlPgSqlTranslator::transform_with_insert_to_subquery(
-            &with2, insert2, &mut ctx, &options,
+        let qualified_statements = PlPgSqlTranslator::transform_with_insert_to_subquery(
+            &qualified_with,
+            qualified_insert,
+            &options,
         )
         .unwrap();
-        assert!(s2[0].to_string().contains("recursive_cte_subquery.id"));
+        assert!(qualified_statements[0].to_string().contains("recursive_cte_subquery.id"));
 
-        let q3 = parse_query(
+        let arithmetic_query = parse_query(
             r#"
             WITH cte AS (SELECT 1 AS id)
             INSERT INTO users (id) SELECT id + 1 FROM cte
             "#,
         );
-        let with3 = q3.with.as_ref().unwrap().clone();
-        let SetExpr::Insert(Statement::Insert(insert3)) = q3.body.as_ref() else {
-            panic!("expected set-expr insert");
+        let arithmetic_with = arithmetic_query.with.as_ref().unwrap().clone();
+        let SetExpr::Insert(Statement::Insert(arithmetic_insert)) = arithmetic_query.body.as_ref()
+        else {
+            panic!("expected set-expression insert");
         };
-        let s3 = PlPgSqlTranslator::transform_with_insert_to_subquery(
-            &with3, insert3, &mut ctx, &options,
+        let arithmetic_statements = PlPgSqlTranslator::transform_with_insert_to_subquery(
+            &arithmetic_with,
+            arithmetic_insert,
+            &options,
         )
         .unwrap();
-        assert!(s3[0].to_string().contains("SELECT * FROM"), "unexpected SQL: {}", s3[0]);
+        assert!(
+            arithmetic_statements[0].to_string().contains("SELECT * FROM"),
+            "unexpected SQL: {}",
+            arithmetic_statements[0]
+        );
     }
 
     #[test]
@@ -2420,9 +2726,8 @@ mod tests {
         };
         let selection = delete.selection.as_mut().unwrap();
 
-        let mut ctx = PlPgSqlContext::new();
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
-        PlPgSqlTranslator::inject_with_into_in_subqueries(selection, &with, &mut ctx, &options);
+        PlPgSqlTranslator::inject_with_into_in_subqueries(selection, &with, &options);
 
         let selection_sql = selection.to_string();
         assert!(selection_sql.contains("WITH ids AS"), "unexpected SQL: {selection_sql}");
@@ -2430,7 +2735,6 @@ mod tests {
 
     #[test]
     fn transform_query_body_and_set_expr_cover_insert_delete_select_and_other_paths() {
-        let mut ctx = PlPgSqlContext::new();
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
 
         let Statement::Insert(insert) = parse_statement("INSERT INTO users(id) VALUES (1)") else {
@@ -2438,7 +2742,7 @@ mod tests {
         };
         let insert_set = SetExpr::Insert(Statement::Insert(insert));
         assert!(matches!(
-            PlPgSqlTranslator::transform_query_body(&insert_set, &mut ctx, &options).unwrap(),
+            PlPgSqlTranslator::transform_query_body(&insert_set, &options),
             SetExpr::Insert(_)
         ));
 
@@ -2448,32 +2752,29 @@ mod tests {
         };
         let delete_set = SetExpr::Delete(Statement::Delete(delete));
         assert!(matches!(
-            PlPgSqlTranslator::transform_query_body(&delete_set, &mut ctx, &options).unwrap(),
+            PlPgSqlTranslator::transform_query_body(&delete_set, &options),
             SetExpr::Delete(_)
         ));
 
         let select_query = parse_query("SELECT gen_random_uuid(), NEW.id FROM users");
         assert!(matches!(
-            PlPgSqlTranslator::transform_query_body(select_query.body.as_ref(), &mut ctx, &options)
-                .unwrap(),
+            PlPgSqlTranslator::transform_query_body(select_query.body.as_ref(), &options),
             SetExpr::Select(_)
         ));
 
         let values_query = parse_query("VALUES (1)");
         assert!(matches!(
-            PlPgSqlTranslator::transform_query_body(values_query.body.as_ref(), &mut ctx, &options)
-                .unwrap(),
+            PlPgSqlTranslator::transform_query_body(values_query.body.as_ref(), &options),
             SetExpr::Values(_)
         ));
 
-        let mut set_expr = values_query.body.as_ref().clone();
-        PlPgSqlTranslator::transform_set_expr(&mut set_expr, &mut ctx, &options);
-        assert!(matches!(set_expr, SetExpr::Values(_)));
+        let mut set_expression = values_query.body.as_ref().clone();
+        PlPgSqlTranslator::transform_set_expr(&mut set_expression, &options);
+        assert!(matches!(set_expression, SetExpr::Values(_)));
     }
 
     #[test]
     fn transform_table_with_joins_and_expr_cover_recursive_paths() {
-        let mut ctx = PlPgSqlContext::new();
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
 
         let query = parse_query(
@@ -2484,19 +2785,19 @@ mod tests {
         };
         let mut select = (**select).clone();
         for from in &mut select.from {
-            PlPgSqlTranslator::transform_table_with_joins(from, &mut ctx, &options);
+            PlPgSqlTranslator::transform_table_with_joins(from, &options);
         }
-        PlPgSqlTranslator::transform_selection(&mut select.selection, &mut ctx, &options);
+        PlPgSqlTranslator::transform_selection(&mut select.selection, &options);
         for item in &mut select.projection {
-            if let sqlparser::ast::SelectItem::UnnamedExpr(expr) = item {
-                PlPgSqlTranslator::transform_expr(expr, &mut ctx, &options);
+            if let sqlparser::ast::SelectItem::UnnamedExpr(expression) = item {
+                PlPgSqlTranslator::transform_expr(expression, &options);
             }
         }
         let projection_sql = select.projection[0].to_string();
         assert!(projection_sql.contains("uuid"), "unexpected projection: {projection_sql}");
 
         let mut in_subquery = parse_expr("x IN (SELECT y FROM t)");
-        PlPgSqlTranslator::transform_expr(&mut in_subquery, &mut ctx, &options);
+        PlPgSqlTranslator::transform_expr(&mut in_subquery, &options);
         assert!(in_subquery.to_string().contains("SELECT y FROM t"));
     }
 
@@ -2515,10 +2816,10 @@ mod tests {
             Pg2SqliteOptions::default().with_uuid_v7_function_name("uuid7"),
         );
 
-        let mut ctx = PlPgSqlContext::new();
-        ctx.add_binding(VariableBinding {
+        let mut scope = BodyScope::new(TriggerFacts::default());
+        scope.bind(Binding {
             name: "v_id".to_string(),
-            expression: "uuidv7()".to_string(),
+            value: BoundValue::Expr(parse_expr("uuidv7()")),
         });
 
         let Statement::Insert(insert_values) =
@@ -2528,7 +2829,7 @@ mod tests {
         };
         let translated_values = PlPgSqlTranslator::translate_insert_statement(
             &insert_values,
-            &mut ctx,
+            &mut scope,
             &schema,
             &options,
             &mut |_| {},
@@ -2538,17 +2839,17 @@ mod tests {
             !translated_values.is_empty(),
             "the VALUES body should translate into at least one statement"
         );
-        assert!(ctx.get_uuid_first_use("v_id").is_some());
+        assert!(scope.uuid_first_use("v_id").is_some());
 
         let Statement::Insert(insert_select) =
             parse_statement("INSERT INTO users (id) SELECT v_id")
         else {
             panic!("expected insert");
         };
-        ctx.push_condition("NEW.kind = 'a'".to_string());
+        scope.push_condition(parse_expr("NEW.kind = 'a'"));
         let translated_select = PlPgSqlTranslator::translate_insert_statement(
             &insert_select,
-            &mut ctx,
+            &mut scope,
             &schema,
             &options,
             &mut |_| {},
@@ -2559,20 +2860,20 @@ mod tests {
             "the SELECT body should translate into at least one statement"
         );
 
-        let mut table_fn_insert = insert_values.clone();
-        let Expr::Function(func) = parse_expr("remote()") else {
+        let mut table_function_insert = insert_values.clone();
+        let Expr::Function(function) = parse_expr("remote()") else {
             panic!("expected function expression");
         };
-        table_fn_insert.table = sqlparser::ast::TableObject::TableFunction(func);
-        let err = PlPgSqlTranslator::translate_insert_statement(
-            &table_fn_insert,
-            &mut ctx,
+        table_function_insert.table = sqlparser::ast::TableObject::TableFunction(function);
+        let error = PlPgSqlTranslator::translate_insert_statement(
+            &table_function_insert,
+            &mut scope,
             &schema,
             &options,
             &mut |_| {},
         )
         .unwrap_err();
-        assert!(err.to_string().contains("table function not supported"));
+        assert!(error.to_string().contains("table function not supported"));
     }
 
     #[test]
@@ -2584,10 +2885,10 @@ mod tests {
         )
         .unwrap();
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
-        let mut ctx = PlPgSqlContext::new();
-        ctx.add_binding(VariableBinding {
+        let mut scope = BodyScope::new(TriggerFacts::default());
+        scope.bind(Binding {
             name: "v_id".to_string(),
-            expression: "pg_catalog.uuid_generate_v4()".to_string(),
+            value: BoundValue::Expr(parse_expr("pg_catalog.uuid_generate_v4()")),
         });
 
         let Statement::Insert(insert_values) =
@@ -2598,7 +2899,7 @@ mod tests {
 
         let translated = PlPgSqlTranslator::translate_insert_statement(
             &insert_values,
-            &mut ctx,
+            &mut scope,
             &schema,
             &options,
             &mut |_| {},
@@ -2606,7 +2907,7 @@ mod tests {
         .expect("values insert should translate");
         assert!(!translated.is_empty(), "the body should translate into at least one statement");
         assert!(
-            ctx.get_uuid_first_use("v_id").is_some(),
+            scope.uuid_first_use("v_id").is_some(),
             "schema-qualified uuid_generate_v4() should be tracked for last_insert_rowid pattern"
         );
     }
@@ -2615,12 +2916,12 @@ mod tests {
     fn translate_statement_other_variant_and_inject_noop_paths_are_covered() {
         let schema = empty_schema();
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
-        let mut ctx = PlPgSqlContext::new();
+        let mut scope = BodyScope::new(TriggerFacts::default());
 
-        let drop_stmt = parse_statement("DROP TABLE IF EXISTS users");
+        let drop_statement = parse_statement("DROP TABLE IF EXISTS users");
         let translated = PlPgSqlTranslator::translate_statement(
-            &drop_stmt,
-            &mut ctx,
+            &drop_statement,
+            &mut scope,
             &schema,
             &options,
             &mut |_| {},
@@ -2630,7 +2931,7 @@ mod tests {
 
         let mut insert = parse_statement("INSERT INTO users(id) VALUES (1)");
         let before = insert.to_string();
-        PlPgSqlTranslator::inject_condition_into_statement(&mut insert, "id > 0")
+        PlPgSqlTranslator::inject_condition_into_statement(&mut insert, &parse_expr("id > 0"))
             .expect_err("VALUES has no WHERE clause to guard");
         assert_eq!(insert.to_string(), before);
     }
@@ -2638,55 +2939,51 @@ mod tests {
     #[test]
     fn transform_set_expr_and_transform_expr_cover_remaining_select_and_default_paths() {
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
-        let mut ctx = PlPgSqlContext::new();
 
         let query = parse_query(
             "SELECT u.id AS uid FROM users u RIGHT JOIN teams t ON u.team_id = t.id \
              WHERE NOT (u.id IN (1, 2))",
         );
-        let mut set_expr = query.body.as_ref().clone();
-        PlPgSqlTranslator::transform_set_expr(&mut set_expr, &mut ctx, &options);
-        let SetExpr::Select(select) = set_expr else {
+        let mut set_expression = query.body.as_ref().clone();
+        PlPgSqlTranslator::transform_set_expr(&mut set_expression, &options);
+        let SetExpr::Select(select) = set_expression else {
             panic!("expected transformed select");
         };
         assert!(select.selection.is_some());
         assert_eq!(select.projection.len(), 1);
 
         let mut in_subquery = parse_expr("id IN (SELECT id FROM teams)");
-        PlPgSqlTranslator::transform_expr(&mut in_subquery, &mut ctx, &options);
+        PlPgSqlTranslator::transform_expr(&mut in_subquery, &options);
         assert!(in_subquery.to_string().contains("SELECT id FROM teams"));
 
         let mut scalar_subquery = parse_expr("(SELECT id FROM teams)");
-        PlPgSqlTranslator::transform_expr(&mut scalar_subquery, &mut ctx, &options);
+        PlPgSqlTranslator::transform_expr(&mut scalar_subquery, &options);
         assert!(scalar_subquery.to_string().contains("SELECT id FROM teams"));
 
         let mut unary = parse_expr("NOT flag");
-        PlPgSqlTranslator::transform_expr(&mut unary, &mut ctx, &options);
+        PlPgSqlTranslator::transform_expr(&mut unary, &options);
         assert!(unary.to_string().contains("NOT"));
 
-        let mut table_set_expr = SetExpr::Table(Box::new(sqlparser::ast::Table {
+        let mut table_set_expression = SetExpr::Table(Box::new(sqlparser::ast::Table {
             table_name: Some(sqlparser::ast::Ident::new("users")),
             schema_name: None,
         }));
-        PlPgSqlTranslator::transform_set_expr(&mut table_set_expr, &mut ctx, &options);
-        assert!(matches!(table_set_expr, SetExpr::Table(_)));
+        PlPgSqlTranslator::transform_set_expr(&mut table_set_expression, &options);
+        assert!(matches!(table_set_expression, SetExpr::Table(_)));
     }
 
-    /// Transforms `query` both ways and pins the subquery transform's parity
-    /// with the CTE transform. `mutate` shapes the query before both runs.
+    /// Checks parity between subquery and common table expression transforms.
     fn assert_subquery_cte_parity(mut query: Query, mutate: impl FnOnce(&mut Query)) -> Query {
         let options = crate::options::TranslationContext::from_owned(
             Pg2SqliteOptions::default().with_uuid_function_name("sqlite_uuid".to_string()),
         );
-        let mut cte_ctx = PlPgSqlContext::new();
-        let mut subquery_ctx = PlPgSqlContext::new();
 
         mutate(&mut query);
         let mut cte_query = query.clone();
         let mut subquery = query;
 
-        PlPgSqlTranslator::transform_cte_query(&mut cte_query, &mut cte_ctx, &options);
-        PlPgSqlTranslator::transform_subquery(&mut subquery, &mut subquery_ctx, &options);
+        PlPgSqlTranslator::transform_cte_query(&mut cte_query, &options);
+        PlPgSqlTranslator::transform_subquery(&mut subquery, &options);
 
         assert_eq!(
             subquery.to_string(),
@@ -2744,44 +3041,46 @@ mod tests {
     fn transform_delete_and_insert_statement_cover_function_name_and_non_select_source_paths() {
         let schema = users_schema();
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
-        let mut ctx = PlPgSqlContext::new();
-        ctx.add_binding(VariableBinding { name: "v_id".to_string(), expression: "1".to_string() });
+        let mut scope = BodyScope::new(TriggerFacts::default());
+        scope.bind(Binding { name: "v_id".to_string(), value: BoundValue::Expr(parse_expr("1")) });
 
-        let Statement::Delete(mut delete_stmt) = parse_statement("DELETE FROM users WHERE id = 1")
+        let Statement::Delete(mut delete_statement) =
+            parse_statement("DELETE FROM users WHERE id = 1")
         else {
             panic!("expected delete");
         };
-        let sqlparser::ast::FromTable::WithFromKeyword(tables) = delete_stmt.from.clone() else {
+        let sqlparser::ast::FromTable::WithFromKeyword(tables) = delete_statement.from.clone()
+        else {
             panic!("expected WITH FROM variant");
         };
-        delete_stmt.from = sqlparser::ast::FromTable::WithoutKeyword(tables);
+        delete_statement.from = sqlparser::ast::FromTable::WithoutKeyword(tables);
         let transformed_delete =
-            PlPgSqlTranslator::transform_delete_for_sqlite(&delete_stmt, &mut ctx, &options);
+            PlPgSqlTranslator::transform_delete_for_sqlite(&delete_statement, &options);
         assert!(matches!(transformed_delete.from, sqlparser::ast::FromTable::WithoutKeyword(_)));
 
-        let Statement::Insert(mut insert_fn_table) =
+        let Statement::Insert(mut insert_function_table) =
             parse_statement("INSERT INTO users(id) VALUES (v_id)")
         else {
             panic!("expected insert");
         };
-        insert_fn_table.table =
+        insert_function_table.table =
             sqlparser::ast::TableObject::TableName(sqlparser::ast::ObjectName(vec![
                 sqlparser::ast::ObjectNamePart::Function(sqlparser::ast::ObjectNamePartFunction {
                     name: sqlparser::ast::Ident::new("remote"),
                     args: vec![],
                 }),
             ]));
-        let err = PlPgSqlTranslator::translate_insert_statement(
-            &insert_fn_table,
-            &mut ctx,
+        let error = PlPgSqlTranslator::translate_insert_statement(
+            &insert_function_table,
+            &mut scope,
             &schema,
             &options,
             &mut |_| {},
         )
         .expect_err("a target built by a call names no table SQLite can write");
         assert!(
-            err.to_string().contains("table segment must be an identifier"),
-            "unexpected error: {err}"
+            error.to_string().contains("table segment must be an identifier"),
+            "unexpected error: {error}"
         );
 
         let Statement::Insert(mut insert_table_source) =
@@ -2806,7 +3105,7 @@ mod tests {
         }));
         let result = PlPgSqlTranslator::translate_insert_statement(
             &insert_table_source,
-            &mut ctx,
+            &mut scope,
             &schema,
             &options,
             &mut |_| {},
@@ -2818,18 +3117,18 @@ mod tests {
     fn translate_insert_statement_merges_condition_with_existing_selection() {
         let schema = users_schema();
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
-        let mut ctx = PlPgSqlContext::new();
-        ctx.add_binding(VariableBinding { name: "v_id".to_string(), expression: "1".to_string() });
-        ctx.push_condition("NEW.kind = 'a'".to_string());
+        let mut scope = BodyScope::new(TriggerFacts::default());
+        scope.bind(Binding { name: "v_id".to_string(), value: BoundValue::Expr(parse_expr("1")) });
+        scope.push_condition(parse_expr("NEW.kind = 'a'"));
 
-        let Statement::Insert(insert_stmt) =
+        let Statement::Insert(insert_statement) =
             parse_statement("INSERT INTO users(id) SELECT v_id WHERE id > 0")
         else {
             panic!("expected insert");
         };
         let translated = PlPgSqlTranslator::translate_insert_statement(
-            &insert_stmt,
-            &mut ctx,
+            &insert_statement,
+            &mut scope,
             &schema,
             &options,
             &mut |_| {},
@@ -2840,8 +3139,7 @@ mod tests {
         assert!(sql.contains("NEW.kind = 'a'"));
     }
 
-    /// One case per expression shape that nests another expression, because
-    /// the walk this replaced had to name each of them and missed several.
+    /// Substitution reaches nested expressions.
     #[test]
     fn substitution_reaches_every_nesting_shape() {
         let mut scope = VariableScope::default();
@@ -2865,27 +3163,25 @@ mod tests {
                 format!("sum(x) FILTER (WHERE {read} > 0)"),
             ),
         ] {
-            let mut expr = parse_expr(&input);
-            substitute_variables(&mut expr, &scope);
-            assert_eq!(expr.to_string(), expected, "substituting {input}");
+            let mut expression = parse_expr(&input);
+            substitute_variables(&mut expression, &scope).unwrap();
+            assert_eq!(expression.to_string(), expected, "substituting {input}");
         }
     }
 
     #[test]
     fn transform_with_insert_to_subquery_covers_values_and_projection_alias_edges() {
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
-        let mut ctx = PlPgSqlContext::new();
 
         let values_query =
             parse_query("WITH cte AS (SELECT 1 AS id) INSERT INTO users(id) VALUES (1)");
         let with_values = values_query.with.as_ref().expect("with should exist").clone();
         let SetExpr::Insert(Statement::Insert(values_insert)) = values_query.body.as_ref() else {
-            panic!("expected set-expr insert");
+            panic!("expected set-expression insert");
         };
         let transformed = PlPgSqlTranslator::transform_with_insert_to_subquery(
             &with_values,
             values_insert,
-            &mut ctx,
             &options,
         )
         .expect("values source should be rewritten");
@@ -2898,7 +3194,7 @@ mod tests {
         let SetExpr::Insert(Statement::Insert(mut alias_insert)) =
             alias_query.body.as_ref().clone()
         else {
-            panic!("expected set-expr insert");
+            panic!("expected set-expression insert");
         };
         if let Some(source) = &mut alias_insert.source
             && let SetExpr::Select(select) = source.body.as_mut()
@@ -2910,7 +3206,6 @@ mod tests {
         let transformed = PlPgSqlTranslator::transform_with_insert_to_subquery(
             &with_alias,
             &alias_insert,
-            &mut ctx,
             &options,
         )
         .expect("alias/empty-compound projection should rewrite");
@@ -2920,7 +3215,6 @@ mod tests {
     #[test]
     fn transform_table_with_joins_handles_inner_left_right_and_full_outer_join_variants() {
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
-        let mut ctx = PlPgSqlContext::new();
 
         let inner_query =
             parse_query("SELECT u.id FROM users u INNER JOIN teams t ON u.team_id = t.id");
@@ -2928,7 +3222,7 @@ mod tests {
             panic!("expected select");
         };
         let mut inner_from = inner_select.from[0].clone();
-        PlPgSqlTranslator::transform_table_with_joins(&mut inner_from, &mut ctx, &options);
+        PlPgSqlTranslator::transform_table_with_joins(&mut inner_from, &options);
 
         let left_query =
             parse_query("SELECT u.id FROM users u LEFT OUTER JOIN teams t ON u.team_id = t.id");
@@ -2936,7 +3230,7 @@ mod tests {
             panic!("expected select");
         };
         let mut left_from = left_select.from[0].clone();
-        PlPgSqlTranslator::transform_table_with_joins(&mut left_from, &mut ctx, &options);
+        PlPgSqlTranslator::transform_table_with_joins(&mut left_from, &options);
 
         let right_query =
             parse_query("SELECT u.id FROM users u RIGHT OUTER JOIN teams t ON u.team_id = t.id");
@@ -2944,7 +3238,7 @@ mod tests {
             panic!("expected select");
         };
         let mut right_from = right_select.from[0].clone();
-        PlPgSqlTranslator::transform_table_with_joins(&mut right_from, &mut ctx, &options);
+        PlPgSqlTranslator::transform_table_with_joins(&mut right_from, &options);
 
         let full_query =
             parse_query("SELECT u.id FROM users u FULL OUTER JOIN teams t ON u.team_id = t.id");
@@ -2952,15 +3246,6 @@ mod tests {
             panic!("expected select");
         };
         let mut full_from = full_select.from[0].clone();
-        PlPgSqlTranslator::transform_table_with_joins(&mut full_from, &mut ctx, &options);
-    }
-
-    #[test]
-    fn parse_expression_reports_both_parser_entry_and_expr_errors() {
-        let entry_err = PlPgSqlTranslator::parse_expression("'unterminated").unwrap_err();
-        assert!(entry_err.to_string().contains("Failed to parse expression"));
-
-        let expr_err = PlPgSqlTranslator::parse_expression("1 +").unwrap_err();
-        assert!(expr_err.to_string().contains("Failed to parse expression"));
+        PlPgSqlTranslator::transform_table_with_joins(&mut full_from, &options);
     }
 }

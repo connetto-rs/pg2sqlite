@@ -5,49 +5,36 @@ use sql_traits::{
     structs::{IdentifierCase, TargetName},
     traits::{DatabaseLike, FunctionLike},
 };
-use sqlparser::ast::{BeginEndStatements, CreateFunction, CreateTable, ObjectName, ObjectNamePart};
+use sqlparser::ast::{CreateFunction, CreateTable, ObjectName, ObjectNamePart};
+use sqlparser_plpgsql::embedded::{Block, embedded_sql};
 
+use crate::errors::Error;
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
-use crate::{
-    errors::Error,
-    impls::translator_impls::plpgsql::{PlPgSqlContext, parse_body},
-};
 
 /// Trait to define a schema for the translation between `PostgreSQL` and
 /// `SQLite`.
 pub trait Schema: DatabaseLike<Table = CreateTable, Function = CreateFunction> {
-    /// Returns the `BEGIN ... END` body of the named function, if it exists.
+    /// Returns the PL/pgSQL body of the named function as a statement tree,
+    /// if it exists.
     ///
     /// # Errors
     ///
     /// Returns [`Error::LookupError`] if the name carries several
     /// declarations, which a lookup by name cannot choose between, and
-    /// [`Error::TranslationRefusal`] if the body cannot be tokenized,
-    /// parsed, or does not contain a valid `BEGIN ... END` block.
-    fn function_body(&self, name: &ObjectName) -> Result<Option<BeginEndStatements>, Error> {
-        Ok(self.function_body_with_context(name)?.map(|(body, _context)| body))
-    }
-
-    /// Returns a function body plus preprocessed PL/pgSQL declaration context.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::LookupError`] if the name carries several
-    /// declarations, which a lookup by name cannot choose between, and
-    /// [`Error::TranslationRefusal`] if the function body cannot be
-    /// tokenized, parsed, or does not contain a valid `BEGIN ... END` block.
-    fn function_body_with_context(
-        &self,
-        name: &ObjectName,
-    ) -> Result<Option<(BeginEndStatements, PlPgSqlContext)>, Error> {
+    /// [`Error::TranslationRefusal`] if the body is not PL/pgSQL or an SQL
+    /// statement in it does not parse.
+    fn function_body(&self, name: &ObjectName) -> Result<Option<Block>, Error> {
         let Some(function_body) =
             written_function(self, name)?.and_then(|function| function.body())
         else {
             return Ok(None);
         };
-
-        Ok(Some(parse_body(&name.to_string(), function_body)?))
+        embedded_sql(function_body).map(Some).map_err(|error| {
+            Error::unsupported_source_syntax(format!(
+                "Failed to parse trigger function '{name}' body: {error}"
+            ))
+        })
     }
 }
 
@@ -127,102 +114,22 @@ mod tests {
     }
 
     #[test]
-    fn function_body_strips_trailing_return_new_or_old_statement() {
-        let sql = r#"
-            CREATE FUNCTION trg_new() RETURNS trigger AS $$
-            BEGIN
-                INSERT INTO logs(id) VALUES (1);
-                RETURN NEW;
-            END;
-            $$ LANGUAGE plpgsql;
-
-            CREATE FUNCTION trg_old() RETURNS trigger AS $$
-            BEGIN
-                DELETE FROM logs WHERE id = 1;
-                RETURN OLD;
-            END;
-            $$ LANGUAGE plpgsql;
-
-            CREATE FUNCTION trg_value() RETURNS trigger AS $$
-            BEGIN
-                RETURN 1;
-            END;
-            $$ LANGUAGE plpgsql;
-        "#;
-        let schema = ParserDB::from_statements(parse_statements(sql), "test".to_string())
-            .expect("schema should build");
-
-        let body_new = schema
-            .function_body(&function_name("trg_new"))
-            .expect("function body extraction should succeed")
-            .expect("function should exist");
-        assert!(body_new.statements.iter().all(|s| !matches!(s, Statement::Return(_))));
-
-        let body_old = schema
-            .function_body(&function_name("trg_old"))
-            .expect("function body extraction should succeed")
-            .expect("function should exist");
-        assert!(body_old.statements.iter().all(|s| !matches!(s, Statement::Return(_))));
-
-        let body_value = schema
-            .function_body(&function_name("trg_value"))
-            .expect("function body extraction should succeed")
-            .expect("function should exist");
-        assert!(matches!(body_value.statements.last(), Some(Statement::Return(_))));
-    }
-
-    #[test]
-    fn function_body_removes_single_trailing_return_new_statement() {
-        let sql = r#"
-            CREATE FUNCTION trg_only_new() RETURNS trigger AS $$
-            BEGIN
-                RETURN NEW;
-            END;
-            $$ LANGUAGE plpgsql;
-        "#;
-        let schema = ParserDB::from_statements(parse_statements(sql), "test".to_string())
-            .expect("schema should build");
-
-        let body = schema
-            .function_body(&function_name("trg_only_new"))
-            .expect("function body extraction should succeed")
-            .expect("function should exist");
-        assert!(
-            body.statements.is_empty(),
-            "the trigger body holds no statement, got {:?}",
-            body.statements
-        );
-    }
-
-    #[test]
-    fn function_body_reports_missing_begin_end_and_parse_errors() {
-        let missing_begin = schema_with_function("trg_missing_begin", "SELECT 1;");
-        let err = missing_begin
-            .function_body(&function_name("trg_missing_begin"))
-            .expect_err("missing BEGIN should error");
-        assert!(err.to_string().contains("must contain BEGIN"));
-
-        let missing_end = schema_with_function("trg_missing_end", "BEGIN\n    SELECT 1;");
-        let err = missing_end
-            .function_body(&function_name("trg_missing_end"))
-            .expect_err("missing END should error");
-        assert!(err.to_string().contains("must end with END"));
-
-        let parse_error = schema_with_function("trg_parse_error", "BEGIN\n    SELECT FROM;\nEND;");
-        let err = parse_error
-            .function_body(&function_name("trg_parse_error"))
-            .expect_err("invalid body statements should error");
-        assert!(err.to_string().contains("Failed to parse trigger function"));
-    }
-
-    #[test]
-    fn function_body_reports_tokenizer_errors() {
-        let tokenize_error =
-            schema_with_function("trg_tokenize_error", "BEGIN\n    SELECT \"unterminated;\nEND;");
-        let err = tokenize_error
-            .function_body(&function_name("trg_tokenize_error"))
-            .expect_err("unterminated quoted identifier should fail tokenization");
-        assert!(err.to_string().contains("Failed to tokenize trigger function"));
+    fn function_body_reports_a_body_that_does_not_read() {
+        for (name, body) in [
+            ("trg_missing_begin", "SELECT 1;"),
+            ("trg_missing_end", "BEGIN\n    SELECT 1;"),
+            ("trg_parse_error", "BEGIN\n    SELECT FROM;\nEND;"),
+            ("trg_tokenize_error", "BEGIN\n    SELECT \"unterminated;\nEND;"),
+        ] {
+            let err = schema_with_function(name, body)
+                .function_body(&function_name(name))
+                .expect_err("the body should not read");
+            assert!(
+                err.to_string()
+                    .contains(&format!("Failed to parse trigger function '{name}' body")),
+                "{name}: {err}"
+            );
+        }
     }
 
     /// The resolver, unlike the translator that refuses `SET search_path`,
@@ -247,6 +154,6 @@ mod tests {
             .function_body(&function_name("log_doc"))
             .expect("function body extraction should succeed")
             .expect("the recorded search path names `app`");
-        assert_eq!(body.statements.len(), 1, "got {:?}", body.statements);
+        assert_eq!(body.statements.len(), 2, "got {:?}", body.statements);
     }
 }

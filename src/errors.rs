@@ -506,12 +506,12 @@ impl Error {
     }
 
     /// The refusal of an assignment to `qualifier.name`, a field of `NEW`,
-    /// in a body the emulation by `UPDATE` cannot run, naming what keeps the
-    /// body of `function` from that shape when `reason` knows it.
-    fn new_assignment_refusal(
+    /// in a body the emulation by `UPDATE` cannot run, naming the trigger
+    /// function and what keeps its body from that shape when `reason` knows it.
+    pub(crate) fn new_assignment_refusal(
         qualifier: &str,
         name: &str,
-        reason: Option<(&sqlparser::ast::ObjectName, &sql_traits::structs::MaintenanceRefusal)>,
+        reason: Option<&(String, sql_traits::structs::MaintenanceRefusal)>,
     ) -> Self {
         let mut detail = format!(
             "assigning to `{qualifier}.{name}` has no SQLite equivalent here, since a SQLite \
@@ -525,102 +525,11 @@ impl Error {
         }
         Self::forward_refusal(detail)
     }
-
-    /// The error reading the body of the trigger function `function` raises,
-    /// where `reason` is what keeps the trigger from being a maintenance
-    /// trigger, which an assignment to `NEW` names.
-    pub(crate) fn from_trigger_body(
-        error: sqlparser_plpgsql::Error,
-        function: &sqlparser::ast::ObjectName,
-        reason: Option<&sql_traits::structs::MaintenanceRefusal>,
-    ) -> Self {
-        match (error, reason) {
-            (sqlparser_plpgsql::Error::QualifiedAssignment { qualifier, name }, Some(reason))
-                if qualifier.eq_ignore_ascii_case("new") =>
-            {
-                Self::new_assignment_refusal(&qualifier, &name, Some((function, reason)))
-            }
-            (error, _) => error.into(),
-        }
-    }
 }
 
 /// Boxes on the way in, so `?` still converts a schema error in one hop.
 impl From<sql_traits::errors::Error> for Error {
     fn from(error: sql_traits::errors::Error) -> Self {
         Self::SchemaError(Box::new(error))
-    }
-}
-
-/// Routes the extracted PL/pgSQL errors onto the two refusal categories this
-/// crate already uses.
-///
-/// Semantics SQLite cannot represent become `UnrepresentableSemantics`, and
-/// input it cannot read becomes `UnsupportedSourceSyntax`. The wording is kept
-/// as it was before the extraction, because tests and users match on it.
-impl From<sqlparser_plpgsql::Error> for Error {
-    fn from(error: sqlparser_plpgsql::Error) -> Self {
-        use sqlparser_plpgsql::Error as Extracted;
-        match error {
-            Extracted::ExceptionHandler { name } => {
-                Self::forward_refusal(format!(
-                    "trigger function '{name}' uses exception handling, which SQLite has no \
-                 equivalent for: a trigger body can abort the statement with RAISE(ABORT) but \
-                 cannot catch anything. Move the handling into the application, or drop the \
-                 handler and let the error surface."
-                ))
-            }
-            // NEW names the row the trigger writes, so it gets the message
-            // about emulation by UPDATE. Every other qualifier is a plpgsql
-            // record local, which SQLite has nothing to hold.
-            Extracted::QualifiedAssignment { qualifier, name }
-                if qualifier.eq_ignore_ascii_case("new") =>
-            {
-                Self::new_assignment_refusal(&qualifier, &name, None)
-            }
-            Extracted::QualifiedAssignment { qualifier, name } => {
-                Self::forward_refusal(format!(
-                    "assigning to `{qualifier}.{name}` has no SQLite equivalent, since a SQLite \
-                 trigger body has no plpgsql record variable to hold the change. Compute the \
-                 value in the statement that reads it."
-                ))
-            }
-            Extracted::UnsupportedRaiseUsing { clause } => {
-                Self::forward_refusal(format!(
-                    "RAISE EXCEPTION USING {clause} is not supported; only USING MESSAGE = \
-                 '<string literal>' translates to SQLite"
-                ))
-            }
-            // PostgreSQL refuses this RAISE when the function is created.
-            error @ Extracted::RaiseParameterCount { .. } => {
-                Self::unsupported_source_syntax(error.to_string())
-            }
-            Extracted::Tokenization { name, body, source } => {
-                Self::unsupported_source_syntax(format!(
-                    "Failed to tokenize trigger function '{name}' body: {source}. Body: {body}"
-                ))
-            }
-            Extracted::MissingBeginBlock { name, body } => {
-                Self::unsupported_source_syntax(format!(
-                    "Trigger function '{name}' body must contain BEGIN...END block. Body: {body}"
-                ))
-            }
-            Extracted::MissingEndBlock { name, body } => {
-                Self::unsupported_source_syntax(format!(
-                    "Trigger function '{name}' body must end with END. Body: {body}"
-                ))
-            }
-            Extracted::UnterminatedDollarQuote { name } => {
-                Self::unsupported_source_syntax(format!(
-                    "Trigger function '{name}' body has an unterminated dollar-quoted string"
-                ))
-            }
-            Extracted::ParseStatements { name, body, source } => {
-                Self::unsupported_source_syntax(format!(
-                    "Failed to parse trigger function '{name}' body statements: {source}. Body: \
-                     {body}"
-                ))
-            }
-        }
     }
 }

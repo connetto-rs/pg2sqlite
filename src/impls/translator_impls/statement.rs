@@ -344,7 +344,7 @@ const REASON_FOREIGN_DATA: &str = "SQLite reads only its own database file, so i
 
 /// Reason a function definition is dropped. A trigger function is not lost: its
 /// body is inlined into every trigger that calls it, which is what
-/// `create_trigger.rs` uses `function_body_with_context` for. Any other
+/// `create_trigger.rs` reads it through `Schema::function_body` for. Any other
 /// function has to be registered by the host, the same way this crate expects
 /// `current_setting` to be registered for row level security.
 const REASON_FUNCTION: &str = "SQLite has no statement that defines a function. A trigger function's body is inlined into \

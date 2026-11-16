@@ -275,7 +275,7 @@ pub struct TranslationContext<'a> {
     subqueries_allowed: bool,
     /// The body a trigger translated here executes in place of its function's
     /// stored one, set when a replay renames what the body references.
-    rebound_body: Option<&'a sqlparser::ast::BeginEndStatements>,
+    rebound_body: Option<&'a sqlparser_plpgsql::embedded::Block>,
     /// The schema as the statement being translated was written, which names
     /// a wildcard's columns before a later column change in its epoch.
     written_schema: Option<&'a ParserDB>,
@@ -311,7 +311,7 @@ struct ContextFields<'a> {
     variables: &'a [String],
     schema_is_complete: bool,
     subqueries_allowed: bool,
-    rebound_body: Option<&'a sqlparser::ast::BeginEndStatements>,
+    rebound_body: Option<&'a sqlparser_plpgsql::embedded::Block>,
     written_schema: Option<&'a ParserDB>,
     running_as: Option<&'a Role>,
     inlined_body: Option<&'a InlinedBody<'a>>,
@@ -489,7 +489,7 @@ impl<'a> TranslationContext<'a> {
     /// function's stored body.
     pub(crate) fn with_rebound_body<'s>(
         &'s self,
-        body: &'s sqlparser::ast::BeginEndStatements,
+        body: &'s sqlparser_plpgsql::embedded::Block,
     ) -> TranslationContext<'s> {
         let mut fields = ContextFields::borrowed(self);
         fields.rebound_body = Some(body);
@@ -498,7 +498,7 @@ impl<'a> TranslationContext<'a> {
 
     /// The body a trigger translated here executes in place of its
     /// function's stored one.
-    pub(crate) const fn rebound_body(&self) -> Option<&sqlparser::ast::BeginEndStatements> {
+    pub(crate) const fn rebound_body(&self) -> Option<&sqlparser_plpgsql::embedded::Block> {
         self.rebound_body
     }
 
@@ -564,10 +564,11 @@ impl<'a> TranslationContext<'a> {
         self.subqueries_allowed
     }
 
-    /// True when `name` is a PL/pgSQL variable rather than a column.
+    /// True when `name`, unquoted, is a PL/pgSQL variable rather than a
+    /// column.
     #[must_use]
     pub(crate) fn is_variable(&self, name: &str) -> bool {
-        self.variables.iter().any(|variable| variable == name)
+        self.variables.iter().any(|variable| variable.eq_ignore_ascii_case(name))
     }
 
     #[must_use]

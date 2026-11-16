@@ -1,6 +1,6 @@
 use sql_traits::{
     structs::{MaintenanceRefusal, ParserDB},
-    traits::{ColumnLike, FunctionLike, TriggerLike},
+    traits::{ColumnLike, TriggerLike},
 };
 use sqlparser::{
     ast::{
@@ -28,7 +28,7 @@ use crate::{
         query_builder::{plain_table_with_joins, single_expr_query},
         shared_helpers::ColumnRewrites,
     },
-    traits::translator::TranslatorWithContext,
+    traits::{schema::Schema, translator::TranslatorWithContext},
 };
 
 /// R106 sequential semantics: PostgreSQL runs plpgsql assignments in order,
@@ -73,17 +73,18 @@ fn maintenance_chain(
     trigger: &CreateTrigger,
     schema: &ParserDB,
 ) -> Result<Vec<(String, Expr)>, crate::errors::Error> {
-    let mut context = super::plpgsql::PlPgSqlContext::new();
-    context.trigger_events = trigger_event_names(&trigger.events);
-    context.trigger_table = last_identifier(&trigger.table_name);
-    let absent = absent_row(&trigger.events);
+    let facts = super::plpgsql::TriggerFacts {
+        events: trigger.events.clone(),
+        table: crate::impls::object_name::last_ident(&trigger.table_name)
+            .map(|ident| ident.value.clone()),
+        maintenance_refusal: None,
+    };
     let mut assigned: Vec<(String, Expr)> = Vec::new();
     for (col, raw) in trigger.maintenance_assignments(schema)? {
-        let mut composed = compose_assignment_refs(&raw, &assigned);
-        if let Some(absent) = absent {
-            null_row_fields(&mut composed, absent);
-        }
-        super::plpgsql::PlPgSqlTranslator::fold_trigger_specials(&mut composed, &context)?;
+        let composed = super::plpgsql::PlPgSqlTranslator::fold_trigger_specials_in(
+            compose_assignment_refs(&raw, &assigned),
+            &facts,
+        )?;
         assigned.push((col.column_name().to_owned(), composed));
     }
     Ok(assigned)
@@ -262,66 +263,6 @@ fn route_trigger_statement_writes(
     Ok(())
 }
 
-/// The row an event lacks, `OLD` on INSERT and `NEW` on DELETE, whose fields
-/// PostgreSQL reads as NULL.
-fn absent_row(events: &[TriggerEvent]) -> Option<&'static str> {
-    match events {
-        [TriggerEvent::Insert] => Some("OLD"),
-        [TriggerEvent::Delete] => Some("NEW"),
-        _ => None,
-    }
-}
-
-/// Replaces the fields of the `absent` row in `node` by NULL.
-fn null_row_fields<V: sqlparser::ast::VisitMut>(node: &mut V, absent: &str) {
-    let _: core::ops::ControlFlow<()> = sqlparser::ast::visit_expressions_mut(node, |expr| {
-        if let Expr::CompoundIdentifier(parts) = expr
-            && let [row, _] = parts.as_slice()
-            && row.value.eq_ignore_ascii_case(absent)
-        {
-            *expr = Expr::Value(ValueWithSpan { value: Value::Null, span: Span::empty() });
-        }
-        core::ops::ControlFlow::Continue(())
-    });
-}
-
-/// Replaces the fields of the row an event lacks by the NULL PostgreSQL reads
-/// there, so the `TG_OP` fold prunes the branches they guard.
-fn null_absent_row_fields(
-    body: &mut sqlparser::ast::BeginEndStatements,
-    events: &[sqlparser::ast::TriggerEvent],
-) {
-    let Some(absent) = absent_row(events) else { return };
-    for statement in &mut body.statements {
-        null_row_fields(statement, absent);
-    }
-}
-
-/// The `TG_OP` value of each of `events`.
-fn trigger_event_names(events: &[TriggerEvent]) -> Vec<String> {
-    events
-        .iter()
-        .map(|event| {
-            match event {
-                TriggerEvent::Insert => "INSERT",
-                TriggerEvent::Update(_) => "UPDATE",
-                TriggerEvent::Delete => "DELETE",
-                TriggerEvent::Truncate => "TRUNCATE",
-            }
-            .to_string()
-        })
-        .collect()
-}
-
-/// The last part of `name` when it is an identifier, the `TG_TABLE_NAME` of a
-/// trigger on that table.
-fn last_identifier(name: &ObjectName) -> Option<String> {
-    match name.0.last()? {
-        ObjectNamePart::Identifier(ident) => Some(ident.value.clone()),
-        ObjectNamePart::Function(_) => None,
-    }
-}
-
 /// The SQLite trigger one source trigger contributes for some of its events.
 struct TriggerPart<'a> {
     events: &'a [TriggerEvent],
@@ -347,54 +288,41 @@ fn generate_standard_trigger_body(
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Option<sqlparser::ast::BeginEndStatements>, crate::errors::Error> {
     let function_name = &exec_body.func_desc.name;
-    let events = part.events;
-    if let Some(source) = crate::traits::schema::written_function(schema, function_name)?
-        .and_then(|function| function.body())
+    let Some(stored) = schema.function_body(function_name)? else { return Ok(None) };
+    let mut body = options.rebound_body().unwrap_or(&stored).clone();
+    if part.after
+        && let Some(end) = body.statements.iter().position(|node| {
+            matches!(node.kind, sqlparser_plpgsql::embedded::NodeKind::Return { .. })
+        })
     {
-        let (mut body, mut context) =
-            super::plpgsql::parse_body(&function_name.to_string(), source).map_err(|error| {
-                crate::errors::Error::from_trigger_body(error, function_name, refusal)
-            })?;
-        if let Some(guard) = part.guard {
-            context.push_condition(guard.to_string());
-        }
-        if let Some(rebound) = options.rebound_body() {
-            body.clone_from(rebound);
-        }
-        if part.after
-            && let Some(end) = body
-                .statements
-                .iter()
-                .position(|statement| matches!(statement, Statement::Return(_)))
-        {
-            body.statements.truncate(end);
-        }
-        null_absent_row_fields(&mut body, events);
-        // Seed trigger-specific context so the body translator can
-        // constant-fold TG_OP and TG_TABLE_NAME references.
-        context.trigger_events = trigger_event_names(events);
-        context.trigger_table = last_identifier(table_name);
-        // A definer body's calls run as its owner, whose privileges they
-        // need.
-        let owner = crate::traits::schema::written_function(schema, function_name)?
-            .map(|function| super::definer::definer_owner(function, schema))
-            .transpose()?
-            .flatten();
-        let running_as = owner.map(|owner| options.with_running_as(owner));
-        let body_options = running_as.as_ref().unwrap_or(options);
-        let translated = super::plpgsql::PlPgSqlTranslator::translate_with_context(
-            &body,
-            context,
-            schema,
-            body_options,
-            emit,
-        )?;
-        body.statements =
-            run_as_definer_or_route_writes(function_name, translated, schema, options)?;
-        Ok(Some(body))
-    } else {
-        Ok(None)
+        body.statements.truncate(end);
     }
+    let facts = super::plpgsql::TriggerFacts {
+        events: part.events.to_vec(),
+        table: crate::impls::object_name::last_ident(table_name).map(|ident| ident.value.clone()),
+        maintenance_refusal: refusal.map(|refusal| (function_name.to_string(), refusal.clone())),
+    };
+    // A definer body's calls run as its owner, whose privileges they need.
+    let owner = crate::traits::schema::written_function(schema, function_name)?
+        .map(|function| super::definer::definer_owner(function, schema))
+        .transpose()?
+        .flatten();
+    let running_as = owner.map(|owner| options.with_running_as(owner));
+    let body_options = running_as.as_ref().unwrap_or(options);
+    let translated = super::plpgsql::PlPgSqlTranslator::translate_body(
+        &function_name.to_string(),
+        &body,
+        facts,
+        part.guard,
+        schema,
+        body_options,
+        emit,
+    )?;
+    Ok(Some(sqlparser::ast::BeginEndStatements {
+        begin_token: crate::impls::ast_builder::keyword_token("BEGIN", Keyword::BEGIN),
+        statements: run_as_definer_or_route_writes(function_name, translated, schema, options)?,
+        end_token: crate::impls::ast_builder::keyword_token("END", Keyword::END),
+    }))
 }
 
 /// A `SECURITY DEFINER` body reads and writes as its owner, and any other

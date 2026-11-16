@@ -27,8 +27,8 @@ fn apply_all(conn: &mut diesel::SqliteConnection, stmts: &[String]) {
 
 #[test]
 fn r2_4_non_ascii_in_trigger_body_does_not_panic() {
-    // ILIKE 'CAFÉ%' positions É at a byte boundary that used to cause
-    // preprocessor.rs:711 to panic with "byte index is not a char boundary".
+    // ILIKE 'CAFÉ%' puts É across a byte that is not a character boundary,
+    // which a body reader slicing by byte index would panic on.
     let sql = "
         CREATE TABLE r2_4_t (id INT PRIMARY KEY, name TEXT);
         CREATE FUNCTION r2_4_f() RETURNS TRIGGER LANGUAGE plpgsql AS $$

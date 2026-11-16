@@ -302,6 +302,7 @@ mod test_translator;
 mod test_translator_branch_coverage;
 mod test_translator_stack_depth;
 mod test_trigger_assignment_evaluation;
+mod test_trigger_body_statements;
 mod test_trigger_cascading;
 mod test_trigger_conditional;
 mod test_trigger_elsif_else;

@@ -71,9 +71,6 @@ fn assert_refuses(pg: &str, target: &str) -> String {
     message
 }
 
-/// The wording for a target that decides what gets written, which is `NEW`.
-const WRITTEN_ROW: &str = "cannot change the row it fired for";
-
 /// The wording for a target that is a plpgsql local, which is everything else.
 const RECORD_LOCAL: &str = "no plpgsql record variable to hold the change";
 
@@ -279,19 +276,21 @@ fn an_assignment_to_a_record_field_is_refused() {
 }
 
 /// A plpgsql `CASE` statement, which is not the `CASE` expression the test
-/// above guards. Two of its three spellings are refused, and which two is not
-/// obvious, so both are pinned. The third, a bare `=` in a `CASE` statement
-/// with no `ELSE` arm, is the one shape the rule misses: its `THEN` sits inside
-/// an open `CASE` and the closing chunk carries only `END CASE`, so it keeps
-/// the parser's own complaint. That is a miss, never a wrong refusal.
+/// above guards, is refused whole as control flow in every spelling.
 #[test]
 fn an_assignment_inside_a_case_statement_is_refused() {
     for body in [
         "CASE WHEN NEW.txt IS NULL THEN NEW.txt = 'a'; ELSE NEW.txt = 'b'; END CASE;",
         "CASE WHEN NEW.txt IS NULL THEN NEW.txt := 'a'; END CASE;",
+        "CASE WHEN NEW.txt IS NULL THEN NEW.txt = 'a'; END CASE;",
     ] {
-        let message = assert_refuses(&script_with_body(body), "NEW.txt");
-        assert!(message.contains(WRITTEN_ROW), "body `{body}`: {message}");
+        let message = Pg2Sqlite::default()
+            .sql(&script_with_body(body))
+            .expect("parse")
+            .translate(&Pg2SqliteOptions::default())
+            .expect_err("a CASE statement has no SQLite form")
+            .to_string();
+        assert!(message.contains("a CASE statement"), "body `{body}`: {message}");
     }
 }
 
