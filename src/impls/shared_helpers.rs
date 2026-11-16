@@ -483,6 +483,12 @@ fn evaluate_definition<T: PartialEq>(
             }
             Ok(agreed.unwrap_or(DefinitionValue::Opaque))
         }
+        ColumnDefinition::ArrayElement { .. } | ColumnDefinition::Ordinality => {
+            Ok(match implied_column(definition, schema, options)? {
+                Some(column) => DefinitionValue::Known(read_column(&column)),
+                None => DefinitionValue::Opaque,
+            })
+        }
         ColumnDefinition::RecursiveUnion { anchor, .. } => {
             evaluate_definition(&anchor.definition(), schema, options, read_column, read_expression)
         }
@@ -506,6 +512,36 @@ fn agreement<T: PartialEq>(
         (DefinitionValue::Opaque, _) | (_, DefinitionValue::Opaque) => DefinitionValue::Opaque,
         _ => DefinitionValue::Known(None),
     }
+}
+
+/// The column a definition no column declares stands for: the `bigint`
+/// `WITH ORDINALITY` adds, or an element of the array `unnest` expands, typed
+/// as that element. `None` when the array's type is not known.
+fn implied_column(
+    definition: &ColumnDefinition<'_, '_, '_, ParserDB>,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<Option<sqlparser::ast::ColumnDef>, Error> {
+    let data_type = match definition {
+        ColumnDefinition::Ordinality => DataType::BigInt(None),
+        ColumnDefinition::ArrayElement { array, scope } => {
+            let scoped = options.with_definition_scope(*scope);
+            let Some(name) = crate::impls::expression_type::type_name(array, schema, &scoped)?
+            else {
+                return Ok(None);
+            };
+            match crate::impls::expression_type::parse_type_name(&name) {
+                Some(DataType::Array(
+                    sqlparser::ast::ArrayElemTypeDef::SquareBracket(element, _)
+                    | sqlparser::ast::ArrayElemTypeDef::AngleBracket(element)
+                    | sqlparser::ast::ArrayElemTypeDef::Parenthesis(element),
+                )) => *element,
+                _ => return Ok(None),
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(sqlparser::ast::ColumnDef { name: Ident::new(""), data_type, options: Vec::new() }))
 }
 
 /// Runs `inspect` over the output scope of `query`, recorded or built from the
@@ -715,6 +751,9 @@ fn definition_find<T>(
             }
             Ok(None)
         }
+        ColumnDefinition::ArrayElement { .. } | ColumnDefinition::Ordinality => {
+            Ok(implied_column(definition, schema, options)?.and_then(|column| read_column(&column)))
+        }
         ColumnDefinition::Parameter { .. }
         | ColumnDefinition::Variable(_)
         | ColumnDefinition::VariableField(_)
@@ -754,6 +793,9 @@ fn scope_query_after_factor_rewrites(
         translated: &sqlparser::ast::TableFactor,
     ) -> bool {
         match (&mut *written, translated) {
+            // sql-traits types the columns of `unnest` as written, which the
+            // translated derived table would hide.
+            (written, _) if expands_an_array(written) => false,
             (
                 sqlparser::ast::TableFactor::Table { args: Some(_), .. }
                 | sqlparser::ast::TableFactor::Function { .. }
@@ -798,6 +840,20 @@ fn scope_query_after_factor_rewrites(
         sqlparser::ast::SetExpr::Select(Box::new(scoped_select)),
     );
     scope_query_for(&query).or(Some(query))
+}
+
+/// Whether `factor` is a call of `unnest`, whose columns hold the elements of
+/// the arrays it expands.
+fn expands_an_array(factor: &sqlparser::ast::TableFactor) -> bool {
+    match factor {
+        sqlparser::ast::TableFactor::UNNEST { .. } => true,
+        sqlparser::ast::TableFactor::Table { name, args: Some(_), .. }
+        | sqlparser::ast::TableFactor::Function { name, .. } => {
+            crate::impls::object_name::last_ident(name)
+                .is_some_and(|ident| ident.value.eq_ignore_ascii_case("unnest"))
+        }
+        _ => false,
+    }
 }
 
 fn has_nested_join(entry: &sqlparser::ast::TableWithJoins) -> bool {

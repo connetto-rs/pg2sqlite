@@ -196,6 +196,25 @@ fn a_scalar_subquery_with_no_declared_type_is_refused() {
     assert!(error.contains("inspectable definition"), "the refusal must name the cause: {error}");
 }
 
+/// A column of `unnest` takes the element type of the array it expands, and
+/// the `WITH ORDINALITY` column is a `bigint`.
+#[test]
+fn columns_of_unnest_convert_by_their_element_and_ordinal_types() {
+    assert_eq!(
+        run_with_json_arrays(
+            "SELECT to_json(x) FROM unnest(ARRAY['a', 'b']::text[]) AS u(x) ORDER BY x;"
+        ),
+        vec![Some("\"a\"".to_string()), Some("\"b\"".to_string())]
+    );
+    assert_eq!(
+        run_with_json_arrays(
+            "SELECT to_json(n) FROM unnest(ARRAY['a', 'b']::text[]) WITH ORDINALITY AS u(x, n) \
+             ORDER BY n;"
+        ),
+        vec![Some("1".to_string()), Some("2".to_string())]
+    );
+}
+
 /// A subquery over `VALUES` carries the type PostgreSQL gives its rows, so
 /// the integer converts as PostgreSQL converts it.
 #[test]
