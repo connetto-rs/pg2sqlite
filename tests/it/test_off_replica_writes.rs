@@ -165,6 +165,48 @@ fn an_update_trigger_on_other_columns_does_not_fire() {
          UPDATE grantees SET kind = 'b';",
     );
     assert!(message.contains("grantees_kind"), "{message}");
+
+    let message = refusal(
+        "CREATE FUNCTION touch() RETURNS trigger AS $$
+         BEGIN
+             RETURN NEW;
+         END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER grantees_kind BEFORE UPDATE OF kind ON grantees
+             FOR EACH ROW EXECUTE FUNCTION touch();
+         UPDATE grantees SET (id, kind) = (gen_random_uuid(), 'b');",
+    );
+    assert!(message.contains("grantees_kind"), "{message}");
+}
+
+#[test]
+fn only_a_trigger_on_the_written_event_refuses_the_write() {
+    let emptied = "CREATE FUNCTION forget_kinds() RETURNS trigger AS $$
+         BEGIN
+             DELETE FROM kinds;
+             RETURN NULL;
+         END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER grantees_emptied AFTER TRUNCATE ON grantees
+             FOR EACH STATEMENT EXECUTE FUNCTION forget_kinds();
+         CREATE TABLE tags (kind INTEGER REFERENCES kinds ON DELETE CASCADE);
+         GRANT ALL ON tags TO app;";
+
+    // A key cascading into another table never reaches the written one.
+    helpers::apply_with_options(
+        &script(&format!(
+            "{emptied}
+             INSERT INTO grantees VALUES (gen_random_uuid(), 'everyone');
+             UPDATE grantees SET kind = 'b';
+             DELETE FROM grantees;"
+        )),
+        &options(),
+    )
+    .expect("the script runs on SQLite");
+
+    let message = refusal(&format!("{emptied} TRUNCATE grantees;"));
+    assert!(message.contains("TRUNCATE on grantees"), "{message}");
+    assert!(message.contains("grantees_emptied"), "{message}");
 }
 
 #[test]

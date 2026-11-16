@@ -218,27 +218,6 @@ impl Write<'_> {
         }
     }
 
-    /// The assignments the write updates rows with.
-    fn assignments(&self) -> &[Assignment] {
-        match self {
-            Self::Insert { upsert: Some(assignments) } | Self::Update(assignments) => assignments,
-            Self::Insert { upsert: None } | Self::Delete | Self::Truncate => &[],
-        }
-    }
-
-    /// Whether the write assigns `column`.
-    fn assigns(&self, column: &str) -> bool {
-        self.assignments().iter().any(|assignment| {
-            let targets = match &assignment.target {
-                AssignmentTarget::ColumnName(name) => core::slice::from_ref(name),
-                AssignmentTarget::Tuple(names) => names.as_slice(),
-            };
-            targets
-                .iter()
-                .any(|name| last_ident_value_or_display(name).eq_ignore_ascii_case(column))
-        })
-    }
-
     /// Whether PostgreSQL fires a trigger on `event` for the write. An
     /// `UPDATE OF` trigger fires when the write assigns one of its columns.
     fn fires(&self, event: &TriggerEvent) -> bool {
@@ -246,8 +225,12 @@ impl Write<'_> {
             (Self::Insert { .. }, TriggerEvent::Insert)
             | (Self::Delete, TriggerEvent::Delete)
             | (Self::Truncate, TriggerEvent::Truncate) => true,
-            (Self::Insert { upsert: Some(_) } | Self::Update(_), TriggerEvent::Update(columns)) => {
-                columns.is_empty() || columns.iter().any(|column| self.assigns(&column.value))
+            (
+                Self::Insert { upsert: Some(assignments) } | Self::Update(assignments),
+                TriggerEvent::Update(columns),
+            ) => {
+                columns.is_empty()
+                    || columns.iter().any(|column| assigns(assignments, &column.value))
             }
             _ => false,
         }
@@ -262,10 +245,10 @@ impl Write<'_> {
     ) -> Result<Option<(&'static str, ReferentialAction)>, Error> {
         let (clause, action) = match self {
             Self::Delete => ("ON DELETE", key.on_delete(schema)),
-            Self::Insert { upsert: Some(_) } | Self::Update(_) => {
+            Self::Insert { upsert: Some(assignments) } | Self::Update(assignments) => {
                 let assigned = key
                     .referenced_columns(schema)?
-                    .any(|column| self.assigns(column.column_name()));
+                    .any(|column| assigns(assignments, column.column_name()));
                 if !assigned {
                     return Ok(None);
                 }
@@ -276,4 +259,15 @@ impl Write<'_> {
         Ok((!matches!(action, ReferentialAction::NoAction | ReferentialAction::Restrict))
             .then_some((clause, action)))
     }
+}
+
+/// Whether `assignments` assign `column`.
+fn assigns(assignments: &[Assignment], column: &str) -> bool {
+    assignments.iter().any(|assignment| {
+        let targets = match &assignment.target {
+            AssignmentTarget::ColumnName(name) => core::slice::from_ref(name),
+            AssignmentTarget::Tuple(names) => names.as_slice(),
+        };
+        targets.iter().any(|name| last_ident_value_or_display(name).eq_ignore_ascii_case(column))
+    })
 }
