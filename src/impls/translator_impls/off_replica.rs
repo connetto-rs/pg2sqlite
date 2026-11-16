@@ -6,7 +6,9 @@
 //! holds only while the write stays inside the table. A trigger on the table
 //! may write a table the role reads, and a foreign key acting on its
 //! referencing rows writes the table holding them, so a write PostgreSQL
-//! would follow with either is refused rather than left off.
+//! would follow with either is refused rather than left off. A replica that
+//! leaves the writes the server derives to the server leaves those triggers and
+//! keys out, and the rows they write reach it from the server.
 
 use sql_traits::{
     structs::ParserDB,
@@ -150,7 +152,8 @@ impl<'s> OffReplica<'s> {
     }
 
     /// Refuses `write` when PostgreSQL follows it with something that can
-    /// reach a table the acting role reads.
+    /// reach a table the acting role reads and the replica does not leave to
+    /// the server.
     fn refuse_reaching_effects(
         &self,
         write: &Write<'_>,
@@ -167,6 +170,10 @@ impl<'s> OffReplica<'s> {
                  privilege on {table}, or leave the write out of the translated statements.",
                 verb = write.verb(),
             )));
+        }
+        // Every key acting on its referencing rows is left to the server.
+        if options.is_server_derived_writes_omitted() {
+            return Ok(());
         }
         for referencing in schema.tables() {
             if !RoleTable::of(referencing, Some(self.role), schema)?.reads_any() {

@@ -792,7 +792,7 @@ impl<'a> TranslationContext<'a> {
     }
 
     /// The name of a trigger `table` carries that fires on an event `fires`
-    /// accepts.
+    /// accepts, among those the replica does not leave to the server.
     pub(crate) fn trigger_firing(
         &self,
         table: &str,
@@ -802,7 +802,11 @@ impl<'a> TranslationContext<'a> {
         self.catalogs
             .table_triggers
             .iter()
-            .find(|trigger| trigger.table == table && trigger.events.iter().any(&fires))
+            .find(|trigger| {
+                trigger.table == table
+                    && trigger.events.iter().any(&fires)
+                    && !self.is_server_derived_trigger_name(&trigger.name)
+            })
             .map(|trigger| trigger.name.as_str())
     }
 

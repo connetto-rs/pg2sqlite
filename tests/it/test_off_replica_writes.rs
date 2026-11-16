@@ -243,3 +243,32 @@ fn a_write_reaching_a_visible_table_through_a_foreign_key_is_refused() {
     )
     .expect("the writes leave with grantees");
 }
+
+#[test]
+fn a_replica_leaving_derived_writes_to_the_server_leaves_their_writes_off() {
+    let options = options()
+        .with_uuid_representation(pg2sqlite::prelude::UuidRepresentation::Text)
+        .with_server_derived_writes_omitted();
+    helpers::apply_with_options(
+        &script(
+            "CREATE FUNCTION note_grantee() RETURNS trigger AS $$
+             BEGIN
+                 INSERT INTO kinds VALUES (3, NEW.kind);
+                 RETURN NEW;
+             END;
+             $$ LANGUAGE plpgsql;
+             CREATE TRIGGER grantees_noted AFTER INSERT ON grantees
+                 FOR EACH ROW EXECUTE FUNCTION note_grantee();
+             CREATE TABLE memberships (
+                 id INTEGER PRIMARY KEY,
+                 grantee UUID REFERENCES grantees (id) ON DELETE CASCADE
+             );
+             GRANT ALL ON memberships TO app;
+             INSERT INTO grantees VALUES (gen_random_uuid(), 'everyone');
+             DELETE FROM grantees;
+             INSERT INTO memberships VALUES (1, NULL);",
+        ),
+        &options,
+    )
+    .expect("the script runs on SQLite");
+}
