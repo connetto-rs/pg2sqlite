@@ -14,9 +14,9 @@ use core::{convert::Infallible, ops::ControlFlow};
 use sql_traits::{
     errors::HelperSetError,
     structs::{
-        AntiJoin, CallerGate, CapOperand, GrantArm, GrantedTo, HelperArm, HelperSet, ParentArm,
-        ParserDB, Restriction, RowCap, SetPacking, SettingComparison, SettingContent, SettingValue,
-        TimeBound, TimeComparison, WalkArm, WalkDirection,
+        AntiJoin, CalledArm, CallerGate, CapOperand, GrantArm, GrantedTo, HelperArm, HelperSet,
+        ParentArm, ParserDB, Restriction, Returned, RowCap, SetPacking, SettingComparison,
+        SettingContent, SettingValue, TimeBound, TimeComparison, WalkArm, WalkDirection,
     },
     traits::{ColumnLike, DatabaseLike, FunctionLike, TableLike},
 };
@@ -88,7 +88,7 @@ pub(crate) fn helper_membership(
             ))
         })?;
     let mut lowering = Lowering { helper: name, schema, read: Vec::new(), walks: 0 };
-    let lowered = lowering.set(&set)?;
+    let lowered = lowering.set(&set, &[])?;
     let mut guarded = Vec::new();
     for table in lowering.read {
         let table_name = table.table_name();
@@ -138,6 +138,11 @@ const EDGE: &str = "edge";
 const NEXT: &str = "next";
 const PREVIOUS: &str = "previous";
 
+/// The alias of the rows a called arm reads.
+const CALLED: &str = "called";
+/// The one column of a list of labels.
+const LABEL: &str = "label";
+
 /// Writes a helper's set as a PostgreSQL query over the tables its arms read,
 /// under their declared names so the translation resolves their columns.
 struct Lowering<'h, 'db> {
@@ -152,14 +157,21 @@ struct Lowering<'h, 'db> {
 
 impl<'db> Lowering<'_, 'db> {
     /// The set as one query: its arms joined by `UNION`, grown along its
-    /// walks, and kept to the rows its selection keeps.
-    fn set(&mut self, set: &HelperSet<'db, ParserDB>) -> Result<Query, Error> {
+    /// walks, and kept to the rows its selection keeps, projecting its
+    /// columns under `names`, or unnamed where `names` is empty.
+    fn set(&mut self, set: &HelperSet<'db, ParserDB>, names: &[Ident]) -> Result<Query, Error> {
+        // A walk reads the arms' rows as its own column and names what it
+        // keeps.
+        let walked = set.selection().is_some()
+            || set.arms().iter().any(|arm| matches!(arm, HelperArm::Walk(_)));
+        let arm_names = if walked { &[] } else { names };
         let mut arms = Vec::new();
         let mut edges = Vec::new();
         for arm in set.arms() {
             match arm {
-                HelperArm::Grant(grant) => arms.push(self.grant(grant)?),
-                HelperArm::Parent(parent) => arms.push(self.parent(parent)?),
+                HelperArm::Grant(grant) => arms.push(self.grant(grant, arm_names)?),
+                HelperArm::Parent(parent) => arms.push(self.parent(parent, arm_names)?),
+                HelperArm::Called(called) => arms.push(self.called(called, arm_names)?),
                 HelperArm::Walk(walk) => edges.push(self.edge(walk)),
             }
         }
@@ -167,25 +179,27 @@ impl<'db> Lowering<'_, 'db> {
             Some(selection) => {
                 let mut kept = Vec::new();
                 for arm in selection {
-                    kept.push(self.grant(arm)?);
+                    kept.push(self.grant(arm, &[])?);
                 }
                 // A selection none of whose arms keeps a row keeps no value.
-                let Some(kept) = union(kept, SetQuantifier::None) else { return Ok(empty_set()) };
+                let Some(kept) = union(kept, SetQuantifier::None) else {
+                    return Ok(empty_set(names));
+                };
                 Some(kept)
             }
             None => None,
         };
         // A helper keeping no row for these arguments returns the empty set.
-        let Some(arms) = union(arms, SetQuantifier::None) else { return Ok(empty_set()) };
-        if edges.is_empty() && selection.is_none() {
+        let Some(arms) = union(arms, SetQuantifier::None) else { return Ok(empty_set(names)) };
+        if !walked {
             return Ok(make_query(None, arms));
         }
-        Ok(self.reached(arms, union(edges, SetQuantifier::All), selection))
+        Ok(self.reached(arms, union(edges, SetQuantifier::All), selection, names))
     }
 
     /// `WITH [RECURSIVE] <walk> (node) AS (<arms> [UNION <step>]) SELECT node
-    /// FROM <walk> [WHERE node IN (<selection>)]`, one step adding the next
-    /// row along every edge from a row the walk holds.
+    /// [AS <name>] FROM <walk> [WHERE node IN (<selection>)]`, one step adding
+    /// the next row along every edge from a row the walk holds.
     ///
     /// The step joins the walk once, to the union of the edges, since both
     /// engines read a recursive reference in only one place.
@@ -194,6 +208,7 @@ impl<'db> Lowering<'_, 'db> {
         arms: SetExpr,
         edges: Option<SetExpr>,
         selection: Option<SetExpr>,
+        names: &[Ident],
     ) -> Query {
         let walk = self.walk_name();
         let recursive = edges.is_some();
@@ -238,12 +253,12 @@ impl<'db> Lowering<'_, 'db> {
         let node = Expr::Identifier(Ident::new(NODE));
         let kept = selection.map(|selection| in_query(node.clone(), make_query(None, selection)));
         let with = With { with_token: AttachedToken::empty(), recursive, cte_tables: vec![cte] };
-        let walked = single_expr_query(
-            node,
+        let walked = make_simple_select(
+            projection([node], names),
             from_relation(plain_table_factor(ObjectName::from(vec![walk]))),
             kept,
         );
-        make_query(Some(with), *walked.body)
+        make_query(Some(with), SetExpr::Select(Box::new(walked)))
     }
 
     /// A name for the next walk that names no table, so it reaches no
@@ -280,20 +295,55 @@ impl<'db> Lowering<'_, 'db> {
     }
 
     /// `SELECT <key> FROM <table> WHERE <column> IN (<parents>)`.
-    fn parent(&mut self, parent: &ParentArm<'db, ParserDB>) -> Result<SetExpr, Error> {
+    fn parent(
+        &mut self,
+        parent: &ParentArm<'db, ParserDB>,
+        names: &[Ident],
+    ) -> Result<SetExpr, Error> {
         self.read.push(parent.table());
-        let parents = self.set(parent.set())?;
+        let parents = self.set(parent.set(), &[])?;
         Ok(SetExpr::Select(Box::new(make_simple_select(
-            vec![SelectItem::UnnamedExpr(qualified(ARM, column_ident(parent.key())))],
+            projection([qualified(ARM, column_ident(parent.key()))], names),
             from_relation(aliased_table(parent.table(), ARM)),
             Some(in_query(qualified(ARM, column_ident(parent.column())), parents)),
         ))))
     }
 
-    /// `SELECT <columns> FROM <table> [JOIN <joined table> ON <key>]... WHERE
-    /// <conditions>`, every condition the arm holds written out, so the arm
-    /// keeps no row its helper does not return.
-    fn grant(&mut self, grant: &GrantArm<'db, ParserDB>) -> Result<SetExpr, Error> {
+    /// `SELECT <returned> FROM (<set>) AS called [CROSS JOIN <labels>]...`,
+    /// the rows the called helper returns under positional column names.
+    fn called(
+        &mut self,
+        called: &CalledArm<'db, ParserDB>,
+        names: &[Ident],
+    ) -> Result<SetExpr, Error> {
+        // A helper returning `SETOF` a scalar type declares no column.
+        let arity = called.function().returned_columns(self.schema).count().max(1);
+        let columns: Vec<Ident> = (0..arity).map(called_column).collect();
+        let rows = self.set(called.set(), &columns)?;
+        let (returned, labels) = returned_values(called.returned(), |position| {
+            qualified(CALLED, called_column(*position))
+        });
+        let relation = TableFactor::Derived {
+            lateral: false,
+            subquery: Box::new(rows),
+            alias: Some(alias(CALLED)),
+            sample: None,
+        };
+        Ok(SetExpr::Select(Box::new(make_simple_select(
+            projection(returned, names),
+            vec![TableWithJoins { relation, joins: labels }],
+            None,
+        ))))
+    }
+
+    /// `SELECT <returned> FROM <table> [JOIN <joined table> ON <key>]...
+    /// [CROSS JOIN <labels>]... WHERE <conditions>`, every condition the arm
+    /// holds written out, so the arm keeps no row its helper does not return.
+    fn grant(
+        &mut self,
+        grant: &GrantArm<'db, ParserDB>,
+        names: &[Ident],
+    ) -> Result<SetExpr, Error> {
         self.read.push(grant.table());
         let mut conditions = Vec::new();
         let mut joins = Vec::new();
@@ -319,7 +369,7 @@ impl<'db> Lowering<'_, 'db> {
         match grant.granted_to() {
             GrantedTo::Request(comparison) => conditions.push(self.request(comparison)?),
             GrantedTo::Set(grantees) => {
-                let set = self.set(grantees.set())?;
+                let set = self.set(grantees.set(), &[])?;
                 conditions.push(in_query(qualified(ARM, column_ident(grantees.column())), set));
             }
             GrantedTo::Anyone => {}
@@ -335,13 +385,11 @@ impl<'db> Lowering<'_, 'db> {
         for anti_join in grant.anti_joins() {
             conditions.push(self.anti_join(anti_join));
         }
-        let projection = grant
-            .columns()
-            .iter()
-            .map(|column| SelectItem::UnnamedExpr(qualified(ARM, column_ident(column))))
-            .collect();
+        let (returned, labels) =
+            returned_values(grant.returned(), |column| qualified(ARM, column_ident(column)));
+        joins.extend(labels);
         Ok(SetExpr::Select(Box::new(make_simple_select(
-            projection,
+            projection(returned, names),
             vec![TableWithJoins { relation: aliased_table(grant.table(), ARM), joins }],
             conjunction(conditions),
         ))))
@@ -459,7 +507,7 @@ impl<'db> Lowering<'_, 'db> {
         let capped = if cap.set().arms().is_empty() {
             Expr::Value(Value::Boolean(false).into())
         } else {
-            in_query(row, self.set(cap.set())?)
+            in_query(row, self.set(cap.set(), &[])?)
         };
         Ok(match cap.lift() {
             Some(lift) => {
@@ -510,12 +558,89 @@ fn joined_alias(row: usize) -> String {
     format!("joined_{row}")
 }
 
-/// `SELECT NULL WHERE false`, the set holding no value.
-fn empty_set() -> Query {
-    single_expr_query(
-        Expr::Value(Value::Null.into()),
-        Vec::new(),
-        Some(Expr::Value(Value::Boolean(false).into())),
+/// The name a called arm reads the column of its helper's rows at `position`
+/// under.
+fn called_column(position: usize) -> Ident {
+    Ident::new(format!("column_{position}"))
+}
+
+/// The values an arm returning `returned` projects, `read` writing a value
+/// read off the arm's row, and the lists of labels it joins, one per position
+/// returning labels.
+fn returned_values<S>(
+    returned: &[Returned<S>],
+    read: impl Fn(&S) -> Expr,
+) -> (Vec<Expr>, Vec<Join>) {
+    let mut lists = Vec::new();
+    let values = returned
+        .iter()
+        .enumerate()
+        .map(|(position, returned)| {
+            match returned {
+                Returned::Read(value) => read(value),
+                Returned::Labels(labels) => {
+                    let name = format!("labels_{position}");
+                    lists.push(label_list(labels, &name));
+                    qualified(&name, Ident::new(LABEL))
+                }
+            }
+        })
+        .collect();
+    (values, lists)
+}
+
+/// `values` as a projection, each under the name at its position in `names`
+/// and unnamed past the last name.
+fn projection(values: impl IntoIterator<Item = Expr>, names: &[Ident]) -> Vec<SelectItem> {
+    let mut names = names.iter();
+    values
+        .into_iter()
+        .map(|expr| {
+            match names.next() {
+                Some(name) => SelectItem::ExprWithAlias { expr, alias: name.clone() },
+                None => SelectItem::UnnamedExpr(expr),
+            }
+        })
+        .collect()
+}
+
+/// `CROSS JOIN (SELECT <label> AS label [UNION ALL SELECT <label> AS
+/// label]...) AS <name>`, which pairs every row of the arm with each label,
+/// and with none for no label.
+fn label_list(labels: &[Value], name: &str) -> Join {
+    let column = [Ident::new(LABEL)];
+    let rows = labels.iter().map(|label| {
+        SetExpr::Select(Box::new(make_simple_select(
+            projection([Expr::Value(label.clone().into())], &column),
+            Vec::new(),
+            None,
+        )))
+    });
+    let body =
+        union(rows.collect(), SetQuantifier::All).unwrap_or_else(|| *empty_set(&column).body);
+    Join {
+        relation: TableFactor::Derived {
+            lateral: false,
+            subquery: Box::new(make_query(None, body)),
+            alias: Some(alias(name)),
+            sample: None,
+        },
+        global: false,
+        join_operator: JoinOperator::CrossJoin(JoinConstraint::None),
+    }
+}
+
+/// `SELECT NULL [AS <name>]... WHERE false`, the set holding no row, with a
+/// column per name, or one unnamed column for no name.
+fn empty_set(names: &[Ident]) -> Query {
+    let nulls = (0..names.len().max(1)).map(|_| Expr::Value(Value::Null.into()));
+    make_query(
+        None,
+        SetExpr::Select(Box::new(make_simple_select(
+            projection(nulls, names),
+            Vec::new(),
+            Some(Expr::Value(Value::Boolean(false).into())),
+        ))),
     )
 }
 
