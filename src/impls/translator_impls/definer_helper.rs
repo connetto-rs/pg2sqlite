@@ -601,27 +601,19 @@ fn label_list(labels: &[Value], name: &str) -> Join {
 }
 
 /// Names the columns every `SELECT` of `body` projects `columns`, which both
-/// engines read the columns of a `UNION` by.
+/// engines read the columns of a `UNION` by. A lowered set is a `SELECT` of
+/// unnamed expressions or a `UNION` of such sets.
 fn name_columns(body: &mut SetExpr, columns: &[Ident]) {
-    match body {
-        SetExpr::Select(select) => {
-            for (item, column) in select.projection.iter_mut().zip(columns) {
-                match item {
-                    SelectItem::UnnamedExpr(expr) => {
-                        let expr = core::mem::replace(expr, Expr::Value(Value::Null.into()));
-                        *item = SelectItem::ExprWithAlias { expr, alias: column.clone() };
-                    }
-                    SelectItem::ExprWithAlias { alias, .. } => alias.clone_from(column),
-                    _ => {}
-                }
+    if let SetExpr::SetOperation { left, right, .. } = body {
+        name_columns(left, columns);
+        name_columns(right, columns);
+    } else if let SetExpr::Select(select) = body {
+        for (item, column) in select.projection.iter_mut().zip(columns) {
+            if let SelectItem::UnnamedExpr(expr) = item {
+                let expr = core::mem::replace(expr, Expr::Value(Value::Null.into()));
+                *item = SelectItem::ExprWithAlias { expr, alias: column.clone() };
             }
         }
-        SetExpr::SetOperation { left, right, .. } => {
-            name_columns(left, columns);
-            name_columns(right, columns);
-        }
-        SetExpr::Query(query) => name_columns(&mut query.body, columns),
-        _ => {}
     }
 }
 
