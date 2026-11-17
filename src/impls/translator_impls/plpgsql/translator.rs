@@ -73,11 +73,9 @@ impl PlPgSqlTranslator {
 
         context.seed_default_bindings();
 
-        // One check for the whole body, before anything is rewritten. Every
-        // later site that could meet a `uuidv7()` either renames it or hands
-        // it to a translator whose refusal is swallowed by an `unwrap_or`, and
-        // none of them can report, so the guard sits where the parse is
-        // complete and the error channel is open.
+        // One check for the whole body, before anything is rewritten, so a
+        // `uuidv7()` with no declared function is refused for that reason
+        // wherever it sits.
         if options.get_uuid_v7_function_name().is_none() {
             for stmt in &body.statements {
                 if calls_uuid_v7(stmt) {
@@ -87,6 +85,16 @@ impl PlPgSqlTranslator {
                 }
             }
         }
+
+        let declared: Vec<String> =
+            context.bindings().map(|binding| binding.name.clone()).collect();
+        result.extend(Self::evaluate_assigned(
+            &declared,
+            &context,
+            schema,
+            &options.with_variables(&declared),
+            emit,
+        )?);
 
         for stmt in &body.statements {
             let mut translated =
@@ -120,8 +128,9 @@ impl PlPgSqlTranslator {
 
         match stmt {
             Statement::Set(set) => {
-                Self::handle_set_statement(set, context);
-                Ok(vec![])
+                let assigned: Vec<String> =
+                    Self::handle_set_statement(set, context).into_iter().collect();
+                Self::evaluate_assigned(&assigned, context, schema, options, emit)
             }
 
             Statement::If(if_stmt) => {
@@ -221,27 +230,63 @@ impl PlPgSqlTranslator {
         }
     }
 
-    fn handle_set_statement(set: &Set, context: &mut PlPgSqlContext) {
-        if let Set::SingleAssignment { variable, values, .. } = set
-            && values.len() == 1
-        {
-            let expression = values[0].to_string();
-            let binding =
-                VariableBinding { name: variable.to_string(), expression: expression.clone() };
+    /// Binds the variable `set` assigns, and answers its name.
+    fn handle_set_statement(set: &Set, context: &mut PlPgSqlContext) -> Option<String> {
+        let Set::SingleAssignment { variable, values, .. } = set else { return None };
+        let [value] = values.as_slice() else { return None };
+        let name = variable.to_string();
+        let binding = VariableBinding { name: name.clone(), expression: value.to_string() };
 
-            // A `SELECT ... INTO` assignment has to outlive the block it
-            // appears in, an ordinary one does not. Read off the AST rather
-            // than the rendering: the test this replaces asked whether the
-            // rendered text began with `(` and contained `SELECT`, so a
-            // variable named `SELECT_FACTOR` made `(SELECT_FACTOR *
-            // NEW.amount)` look like a subquery and the binding was filed as
-            // persistent, then never resolved.
-            if Self::contains_subquery(&values[0]) {
-                context.add_persistent_binding(binding);
-            } else {
-                context.add_binding(binding);
-            }
+        // A `SELECT ... INTO` assignment has to outlive the block it
+        // appears in, an ordinary one does not. Read off the AST rather
+        // than the rendering: the test this replaces asked whether the
+        // rendered text began with `(` and contained `SELECT`, so a
+        // variable named `SELECT_FACTOR` made `(SELECT_FACTOR *
+        // NEW.amount)` look like a subquery and the binding was filed as
+        // persistent, then never resolved.
+        if Self::contains_subquery(value) {
+            context.add_persistent_binding(binding);
+        } else {
+            context.add_binding(binding);
         }
+        Some(name)
+    }
+
+    /// `SELECT <value>` for each variable of `assigned` whose value may
+    /// raise, guarded by the enclosing `IF`.
+    ///
+    /// A variable is read by substituting its value at each read, so the
+    /// assignment itself emits nothing. A value that raises, a helper's check
+    /// among them, would then run only where it is read, which is never for a
+    /// variable nothing reads and too late for one read after a veto. A value
+    /// read later also runs at each read.
+    fn evaluate_assigned(
+        assigned: &[String],
+        context: &PlPgSqlContext,
+        schema: &ParserDB,
+        options: &crate::options::TranslationContext<'_>,
+        emit: crate::warnings::WarningSink<'_>,
+    ) -> Result<Vec<Statement>, Error> {
+        if assigned.is_empty() {
+            return Ok(Vec::new());
+        }
+        let bindings: Vec<_> = context.bindings().cloned().collect();
+        let (values, _) =
+            Self::bound_values(&bindings, ReferenceForm::Inline, schema, options, emit)?;
+        let condition = context.current_condition();
+        let mut evaluated = Vec::new();
+        for (name, value) in values {
+            if !assigned.contains(&name) || !may_raise(&value, options) {
+                continue;
+            }
+            let mut statement =
+                Statement::Query(Box::new(single_expr_query(value, Vec::new(), None)));
+            if let Some(condition) = &condition {
+                Self::inject_condition_into_statement(&mut statement, condition)?;
+            }
+            evaluated.push(statement);
+        }
+        Ok(evaluated)
     }
 
     /// True when `expression` holds a subquery anywhere inside it.
@@ -1577,7 +1622,7 @@ impl PlPgSqlTranslator {
         for binding in &ordered {
             let renamed = Self::translate_uuid_function(&binding.expression, options);
             let parsed = Self::parse_expression(&renamed)?;
-            let mut value = parsed.translate_with_warnings(schema, options, emit).unwrap_or(parsed);
+            let mut value = parsed.translate_with_warnings(schema, options, emit)?;
             substitute_variables(&mut value, &scope);
             scope.bind(&binding.name, form.reference(&binding.name, &value));
             values.push((binding.name.clone(), value));
@@ -1890,6 +1935,99 @@ impl Visitor for VolatileCounter<'_> {
     }
 }
 
+/// True when evaluating `node` in SQLite might raise.
+///
+/// Answered by what cannot raise, so anything this does not name counts as
+/// raising: a function call, which is how a registered function, a JSON
+/// reader or `RAISE` itself fails, an operator such as `->` that parses JSON,
+/// and a table-valued function in a `FROM` clause. The one call that cannot
+/// is a generator given no input: `random()` and the UUID functions.
+fn may_raise<N: Visit>(node: &N, options: &crate::options::TranslationContext<'_>) -> bool {
+    let generators = [
+        Some("random"),
+        Some(options.get_uuid_function_name()),
+        options.get_uuid_v7_function_name(),
+    ];
+    node.visit(&mut RaisingSearch { generators }).is_break()
+}
+
+struct RaisingSearch<'a> {
+    /// The functions that answer a fresh value from no input.
+    generators: [Option<&'a str>; 3],
+}
+
+impl Visitor for RaisingSearch<'_> {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        let quiet = match expr {
+            Expr::Function(function) => {
+                let no_input =
+                    matches!(&function.args, FunctionArguments::List(list) if list.args.is_empty());
+                no_input
+                    && crate::impls::object_name::last_ident(&function.name).is_some_and(|name| {
+                        self.generators
+                            .iter()
+                            .flatten()
+                            .any(|generator| name.value.eq_ignore_ascii_case(generator))
+                    })
+            }
+            Expr::BinaryOp { op, .. } => {
+                matches!(
+                    op,
+                    BinaryOperator::Plus
+                        | BinaryOperator::Minus
+                        | BinaryOperator::Multiply
+                        | BinaryOperator::Divide
+                        | BinaryOperator::Modulo
+                        | BinaryOperator::StringConcat
+                        | BinaryOperator::Gt
+                        | BinaryOperator::Lt
+                        | BinaryOperator::GtEq
+                        | BinaryOperator::LtEq
+                        | BinaryOperator::Eq
+                        | BinaryOperator::NotEq
+                        | BinaryOperator::And
+                        | BinaryOperator::Or
+                        | BinaryOperator::BitwiseOr
+                        | BinaryOperator::BitwiseAnd
+                )
+            }
+            Expr::Identifier(_)
+            | Expr::CompoundIdentifier(_)
+            | Expr::Value(_)
+            | Expr::Nested(_)
+            | Expr::UnaryOp { .. }
+            | Expr::Cast { .. }
+            | Expr::Case { .. }
+            | Expr::IsNull(_)
+            | Expr::IsNotNull(_)
+            | Expr::IsTrue(_)
+            | Expr::IsNotTrue(_)
+            | Expr::IsFalse(_)
+            | Expr::IsNotFalse(_)
+            | Expr::IsDistinctFrom(..)
+            | Expr::IsNotDistinctFrom(..)
+            | Expr::Between { .. }
+            | Expr::In { target: InTarget::List(_) | InTarget::Subquery(_), .. }
+            | Expr::Exists { .. }
+            | Expr::Subquery(_)
+            | Expr::Tuple(_) => true,
+            _ => false,
+        };
+        if quiet { ControlFlow::Continue(()) } else { ControlFlow::Break(()) }
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
+        match factor {
+            TableFactor::Table { args: None, .. } | TableFactor::Derived { .. } => {
+                ControlFlow::Continue(())
+            }
+            _ => ControlFlow::Break(()),
+        }
+    }
+}
+
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use sql_traits::structs::ParserDB;
@@ -1900,7 +2038,8 @@ mod tests {
     };
 
     use super::{
-        PlPgSqlTranslator, ReferenceForm, VariableScope, references_variable, substitute_variables,
+        PlPgSqlTranslator, ReferenceForm, VariableScope, may_raise, references_variable,
+        substitute_variables,
     };
     use crate::{
         impls::{
@@ -2033,6 +2172,15 @@ mod tests {
         let mut expr = parse_expr("v_id");
         substitute_variables(&mut expr, &nested);
         assert_eq!(expr.to_string(), "(SELECT 1)");
+    }
+
+    /// A value raising only through a table-valued function, such as
+    /// `json_each` over malformed JSON, still counts as raising.
+    #[test]
+    fn a_table_valued_function_may_raise_and_a_plain_table_read_does_not() {
+        let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
+        assert!(may_raise(&parse_expr("EXISTS (SELECT 1 FROM json_each(x))"), &options));
+        assert!(!may_raise(&parse_expr("EXISTS (SELECT 1 FROM t WHERE t.id = x + 1)"), &options));
     }
 
     #[test]
