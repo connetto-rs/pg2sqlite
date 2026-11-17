@@ -705,7 +705,9 @@ fn check_session_reads<'f>(
                 ["role", "session_authorization"].iter().any(|role| set.eq_ignore_ascii_case(role));
             let read = reads.iter().any(|read| {
                 match read {
-                    SessionRead::Setting(setting) => setting.eq_ignore_ascii_case(&set),
+                    SessionRead::Setting(setting) | SessionRead::ServerSetting(setting) => {
+                        setting.eq_ignore_ascii_case(&set)
+                    }
                     SessionRead::ActingRole(_) | SessionRead::LoginRole => changes_role,
                 }
             });

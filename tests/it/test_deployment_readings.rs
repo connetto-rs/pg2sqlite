@@ -196,6 +196,37 @@ fn a_setting_the_deployment_does_not_declare_is_refused() {
     );
 }
 
+/// SQLite runs every transaction serializable, so the isolation level a
+/// statement reads is that one, with or without a deployment.
+#[test]
+fn transaction_isolation_reads_serializable() {
+    for options in [options(), base()] {
+        let translated = translate(
+            "SELECT current_setting('transaction_isolation'), \
+             pg_catalog.current_setting('Transaction_Isolation', true), \
+             current_setting('transaction_isolation')::text;",
+            &options,
+        )
+        .expect("translates");
+        assert_eq!(
+            translated,
+            "SELECT 'serializable', 'serializable', CAST('serializable' AS TEXT)"
+        );
+    }
+}
+
+#[test]
+fn a_server_setting_without_a_faithful_answer_is_refused() {
+    for options in [options(), base()] {
+        let error = refusal("SELECT current_setting('work_mem');", &options);
+        assert!(
+            matches!(&error, Error::TranslationRefusal(_))
+                && error.to_string().contains("current_setting('work_mem')"),
+            "{error}"
+        );
+    }
+}
+
 #[test]
 fn a_declared_setting_no_mapping_pairs_is_refused() {
     let options = base().with_deployment(deployment());
@@ -648,6 +679,27 @@ fn a_policy_reading_a_role_without_its_declaration_is_refused() {
     );
     assert!(
         matches!(&error, Error::ActingRoleNotDeclared { role, .. } if role == "carol"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_policy_reads_server_settings_without_a_deployment() {
+    let options = base().with_rls_audit_table_name("rls_audit");
+    translate(
+        &format!(
+            "{POLICY} CREATE POLICY mine ON p \
+             USING (current_setting('transaction_isolation') = 'serializable');"
+        ),
+        &options,
+    )
+    .expect("the isolation level needs no deployment");
+    let error = refusal(
+        &format!("{POLICY} CREATE POLICY mine ON p USING (current_setting('work_mem') = '4MB');"),
+        &options,
+    );
+    assert!(
+        error.to_string().contains("current_setting('work_mem') in table 'p', policy 'mine'"),
         "{error}"
     );
 }

@@ -701,3 +701,69 @@ fn groups_trigger_engines_agree() {
         assert_eq!(actual, expected, "groups disagrees on {step:?}");
     }
 }
+
+// ══════════════════════════════════════════════════════════════
+// transaction_isolation: a trigger reading the isolation level
+// ══════════════════════════════════════════════════════════════
+
+/// A trigger refusing `repeatable read`, whose snapshot a row lock taken in
+/// the body cannot protect, and logging the level it read.
+const ISOLATION: &str = "
+CREATE TABLE teams (id INTEGER PRIMARY KEY);
+CREATE TABLE isolation_log (isolation TEXT NOT NULL);
+CREATE FUNCTION guard_isolation() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF pg_catalog.current_setting('transaction_isolation') = 'repeatable read' THEN
+    RAISE EXCEPTION 'team checks require read committed or serializable';
+  END IF;
+  INSERT INTO isolation_log VALUES (current_setting('transaction_isolation'));
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER teams_guard AFTER INSERT ON teams
+  FOR EACH ROW EXECUTE FUNCTION guard_isolation();
+";
+
+mod isolation_schema {
+    diesel::table! {
+        teams (id) {
+            id -> Integer,
+        }
+    }
+    diesel::table! {
+        isolation_log (isolation) {
+            isolation -> Text,
+        }
+    }
+}
+
+/// The isolation levels the trigger logged.
+macro_rules! isolation_log {
+    ($connection:expr) => {
+        isolation_schema::isolation_log::table
+            .select(isolation_schema::isolation_log::isolation)
+            .load::<String>($connection)
+            .expect("read isolation_log")
+    };
+}
+
+/// SQLite runs every transaction serializable, so the replica answers what
+/// PostgreSQL answers inside a serializable transaction.
+#[test]
+fn transaction_isolation_engines_agree() {
+    let insert = diesel::insert_into(isolation_schema::teams::table)
+        .values(isolation_schema::teams::id.eq(1));
+
+    let mut pg = postgres_harness::fresh_database();
+    postgres_harness::apply(&mut pg, ISOLATION).expect("apply isolation to pg");
+    let expected = Outcome::of(&pg.build_transaction().serializable().run(|pg| insert.execute(pg)));
+    let expected_log = isolation_log!(&mut pg);
+    assert_eq!(
+        (&expected, expected_log.as_slice()),
+        (&Outcome::Accepted, &["serializable".to_owned()][..])
+    );
+
+    let mut sqlite = apply_to_sqlite(ISOLATION);
+    let actual = Outcome::of(&insert.execute(&mut sqlite));
+    assert_eq!((actual, isolation_log!(&mut sqlite)), (expected, expected_log));
+}
