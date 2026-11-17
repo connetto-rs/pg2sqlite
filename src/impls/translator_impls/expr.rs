@@ -2188,10 +2188,56 @@ fn membership_subquery<'e>(
         }
     };
     Err(crate::errors::Error::forward_refusal(format!(
-        "= ANY / <> ALL over ARRAY(subquery) translates as IN / NOT IN only when the subquery \
-         answers a non-array column, since PostgreSQL stacks array rows into one \
-         multi-dimensional array and compares against its elements, and this subquery's \
+        "ARRAY(subquery) under = ANY, <> ALL, <@ or @> translates as IN over the subquery only \
+         when the subquery answers a non-array column, since PostgreSQL stacks array rows into one \
+         multi-dimensional array and compares its elements, and this subquery's \
          column {column}. {fix}"
+    )))
+}
+
+/// `haystack @> needle` written `ARRAY(<subquery>) @> ARRAY[e1, ..., en]`, as
+/// `coalesce(e1 = ANY (haystack) AND ... AND en = ANY (haystack), false)`
+/// since PostgreSQL answers false where an `= ANY` answers `NULL`, or `None`
+/// when neither operand is `ARRAY(<subquery>)`.
+fn collected_containment(
+    haystack: &Expr,
+    needle: &Expr,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Option<Expr>, crate::errors::Error> {
+    let collected = array_constructor_subquery(haystack).is_some();
+    if !collected && array_constructor_subquery(needle).is_none() {
+        return Ok(None);
+    }
+    let elements = match needle {
+        Expr::Array(array) if collected => &array.elem,
+        _ => {
+            return Err(crate::errors::Error::forward_refusal(format!(
+                "Containment in ARRAY(subquery) translates only for ARRAY[e1, e2] <@ \
+                 ARRAY(subquery) and ARRAY(subquery) @> ARRAY[e1, e2], each element tested for \
+                 membership in the subquery's rows, and the contained operand here is {needle}. \
+                 Write the elements in a bare ARRAY[...] constructor, casting each element \
+                 rather than the array, or test each one with e IN (subquery)."
+            )));
+        }
+    };
+    let mut memberships = Vec::with_capacity(elements.len());
+    for element in elements {
+        if is_array_expression(element, schema, options)? {
+            return Err(crate::errors::Error::forward_refusal(format!(
+                "Containment in ARRAY(subquery) tests each element of the contained ARRAY[...] \
+                 for membership in the subquery's rows, and the element {element} is an array, \
+                 whose scalar elements PostgreSQL compares instead. List the scalar elements, \
+                 or unnest the array in a subquery."
+            )));
+        }
+        memberships.push(translate_any_all_to_in(element, haystack, false, schema, options, emit)?);
+    }
+    Ok(Some(simple_function_expr(
+        "coalesce",
+        vec![fold_predicates(memberships, &BinaryOperator::And, true), boolean_literal(false)],
+        None,
     )))
 }
 
@@ -3720,6 +3766,9 @@ fn translate_binary_op(
         // does not mislead array callers who forgot to set
         // ArrayRepresentation::Json.
         BinaryOperator::AtArrow => {
+            if let Some(contained) = collected_containment(left, right, schema, options, emit)? {
+                return Ok(contained);
+            }
             if is_json_array_representation(options)
                 && (is_array_expression(left, schema, options)?
                     || is_array_expression(right, schema, options)?)
@@ -3739,6 +3788,9 @@ fn translate_binary_op(
             ));
         }
         BinaryOperator::ArrowAt => {
+            if let Some(contained) = collected_containment(right, left, schema, options, emit)? {
+                return Ok(contained);
+            }
             if is_json_array_representation(options)
                 && (is_array_expression(left, schema, options)?
                     || is_array_expression(right, schema, options)?)

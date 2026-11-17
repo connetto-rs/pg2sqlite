@@ -16,6 +16,7 @@ mod test_alter_table_columns;
 mod test_any_array_subquery;
 mod test_array_concat;
 mod test_array_containment;
+mod test_array_containment_subquery;
 mod test_array_to_string_empty;
 mod test_array_translation;
 mod test_ast_recursion;

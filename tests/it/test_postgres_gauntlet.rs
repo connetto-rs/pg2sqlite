@@ -22,6 +22,9 @@ mod parity_grants;
 #[path = "gauntlet/parity_any_array_subquery.rs"]
 mod parity_any_array_subquery;
 
+#[path = "gauntlet/parity_array_containment_subquery.rs"]
+mod parity_array_containment_subquery;
+
 #[path = "gauntlet/parity_definer_helpers.rs"]
 mod parity_definer_helpers;
 
