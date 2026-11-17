@@ -62,6 +62,7 @@ use crate::{
         privileges::{RoleTable, names_table_with_backing},
         query_builder::plain_table_with_joins,
         translator_impls::{
+            clock_check::split_clock_checks,
             column::translate_column_def,
             condition_injection::inject_condition_into_dml_statement,
             nulls_not_distinct::{companion_drops, table_companions},
@@ -88,7 +89,8 @@ fn or_chain(expressions: &[Expr]) -> Option<Expr> {
     }))
 }
 
-fn negate(expr: Expr) -> Expr {
+/// `NOT (expr)`.
+pub(crate) fn negate(expr: Expr) -> Expr {
     Expr::UnaryOp { op: UnaryOperator::Not, expr: Box::new(Expr::Nested(Box::new(expr))) }
 }
 
@@ -504,7 +506,14 @@ fn build_create_table_statements(
     // refused, before the ordinary translation runs.
     let interval_companions =
         crate::impls::interval::ddl::companions(create_table, schema, options)?;
-    let translated_table = create_table.translate_with_warnings(schema, options, emit)?;
+    // A check reading the clock leaves the table for triggers, which read the
+    // table's columns as the table translation does.
+    let table_scope =
+        crate::options::table_column_scope(resolve_declared_table(schema, create_table)?, schema);
+    let scoped = table_scope.as_ref().map(|scope| options.with_scope(scope));
+    let (checked_table, clock_checks) =
+        split_clock_checks(create_table, schema, scoped.as_ref().unwrap_or(options), emit)?;
+    let translated_table = checked_table.translate_with_warnings(schema, options, emit)?;
     let emitted_table = match rls_statements {
         Some(_) => rename_table_for_rls(&translated_table, options, schema),
         None => translated_table,
@@ -514,11 +523,14 @@ fn build_create_table_statements(
         &interval_companions,
         &emitted_table.name,
     );
+    let clock_triggers: Vec<Statement> =
+        clock_checks.into_triggers(&emitted_table.name, options).collect();
 
     let mut statements = vec![Statement::CreateTable(emitted_table)];
     statements.extend(rls_statements.into_iter().flatten());
     statements.extend(companions);
     statements.extend(interval_companions);
+    statements.extend(clock_triggers);
     append_vec0_statements_if_needed(&mut statements, create_table, schema, options, emit)?;
     Ok(statements)
 }
