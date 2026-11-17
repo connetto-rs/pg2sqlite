@@ -99,11 +99,7 @@ fn generate_maintenance_trigger_body(
     let assignments = maintenance_chain(trigger, schema)?
         .into_iter()
         .map(|(col, raw)| {
-            let cast = rewrites.temporal_column_cast(col.as_str(), &raw, schema, options)?;
-            let value =
-                cast.as_ref().unwrap_or(&raw).translate_with_warnings(schema, options, emit)?;
-            let site = crate::impls::shared_helpers::ZoneSite { schema, options };
-            let value = rewrites.finish_value(col.as_str(), value, schema, options, Some(site))?;
+            let value = maintained_value(&rewrites, &col, &raw, schema, options, emit)?;
             Ok(Assignment {
                 target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
                     Ident::new(col),
@@ -393,32 +389,84 @@ pub(crate) fn substitute_new_with_old(expr: &Expr) -> Expr {
     map_expr_children(expr, &substitute_new_with_old)
 }
 
+/// The SQLite value a maintenance `UPDATE` writes into `column`, `raw` being
+/// the PostgreSQL value the trigger assigns, with the cast and scaling any
+/// write into that column takes.
+fn maintained_value(
+    rewrites: &ColumnRewrites,
+    column: &str,
+    raw: &Expr,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Expr, crate::errors::Error> {
+    let cast = rewrites.temporal_column_cast(column, raw, schema, options)?;
+    let value = cast.as_ref().unwrap_or(raw).translate_with_warnings(schema, options, emit)?;
+    let site = crate::impls::shared_helpers::ZoneSite { schema, options };
+    rewrites.finish_value(column, value, schema, options, Some(site))
+}
+
+/// The SQLite condition holding when a write into `table_name` leaves some
+/// maintained column away from what `chain` computes from `OLD`, `None` when
+/// `chain` is empty.
+///
+/// The maintenance `UPDATE` sets every column to exactly that value, so the
+/// condition is false on it and true on any other write. Each side is
+/// compared as stored, so the value goes through [`maintained_value`], with
+/// `NEW` and `OLD` read as rows of `table_name`.
+///
+/// # Errors
+///
+/// Propagates the error resolving `table_name` or translating a maintained
+/// value.
+pub(crate) fn maintenance_recursion_condition(
+    table_name: &ObjectName,
+    chain: Vec<(String, Expr)>,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Option<Expr>, crate::errors::Error> {
+    let row_scope =
+        crate::impls::object_name::resolve_translation_table(schema, table_name)?.map(|table| {
+            sql_traits::structs::ColumnScope::for_table(
+                table,
+                schema,
+                sql_traits::structs::IdentifierCase::AsWritten,
+            )
+        });
+    let scoped = row_scope.as_ref().map(|scope| options.with_pseudo_row_scope(scope));
+    let options = scoped.as_ref().unwrap_or(options);
+    let rewrites = ColumnRewrites::for_named_table(schema, table_name, options);
+    let mut condition: Option<Expr> = None;
+    for (column, raw) in chain {
+        let old_value = substitute_new_with_old(&raw);
+        let value = maintained_value(&rewrites, &column, &old_value, schema, options, emit)?;
+        let new_column = Expr::CompoundIdentifier(vec![Ident::new("NEW"), Ident::new(&column)]);
+        let differs = Expr::IsDistinctFrom(Box::new(new_column), Box::new(value));
+        condition = Some(match condition {
+            None => differs,
+            Some(previous) => {
+                Expr::BinaryOp {
+                    left: Box::new(previous),
+                    op: BinaryOperator::Or,
+                    right: Box::new(differs),
+                }
+            }
+        });
+    }
+    Ok(condition)
+}
+
 /// WHEN clause for AFTER UPDATE maintenance triggers that prevents re-firing
 /// on the trigger's own UPDATE (recursion guard).
-///
-/// Fires when ANY maintained column's NEW value differs from what the
-/// maintenance expression computes from OLD — the recursion case always has
-/// every column already at its maintained value, so the clause is false there.
 fn build_maintenance_recursion_when_clause(
     trigger: &CreateTrigger,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Option<Expr> {
-    let conditions: Vec<Expr> = maintenance_chain(trigger, schema)
-        .ok()?
-        .into_iter()
-        .filter_map(|(col, raw_expr)| {
-            let old_expr = substitute_new_with_old(&raw_expr);
-            let translated = old_expr.translate_with_warnings(schema, options, emit).ok()?;
-            let new_col = Expr::CompoundIdentifier(vec![Ident::new("NEW"), Ident::new(&col)]);
-            Some(Expr::IsDistinctFrom(Box::new(new_col), Box::new(translated)))
-        })
-        .collect();
-
-    conditions.into_iter().reduce(|a, b| {
-        Expr::BinaryOp { left: Box::new(a), op: BinaryOperator::Or, right: Box::new(b) }
-    })
+    let chain = maintenance_chain(trigger, schema).ok()?;
+    maintenance_recursion_condition(&trigger.table_name, chain, schema, options, emit).ok()?
 }
 
 /// ANDs two optional conditions; used to attach the recursion guard to any
