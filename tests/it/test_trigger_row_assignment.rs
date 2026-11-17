@@ -212,9 +212,11 @@ fn an_assignment_inside_an_if_spelled_with_one_equals_is_translated() {
     );
 }
 
+/// The refusal names the statement that keeps the body from being emulated,
+/// where the function body writes it, counting lines from the one `$$` opens.
 #[test]
 fn an_assignment_beside_another_statement_is_refused() {
-    assert_refuses(
+    let message = assert_refuses(
         &format!(
             "CREATE TABLE audit (note TEXT);
              {}",
@@ -223,6 +225,13 @@ fn an_assignment_beside_another_statement_is_refused() {
             )
         ),
         "NEW.txt",
+    );
+    assert!(
+        message.contains(
+            "In the body of `f`, `INSERT INTO audit (note) VALUES ('touched');` at line 3, \
+             column 41 neither assigns a column of NEW nor is an IF over such assignments."
+        ),
+        "the refusal should name the INSERT and where it is: {message}"
     );
 }
 

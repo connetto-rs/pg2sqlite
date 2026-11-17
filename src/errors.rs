@@ -504,6 +504,45 @@ impl Error {
         )
         .into()
     }
+
+    /// The refusal of an assignment to `qualifier.name`, a field of `NEW`,
+    /// in a body the emulation by `UPDATE` cannot run, naming what keeps the
+    /// body of `function` from that shape when `reason` knows it.
+    fn new_assignment_refusal(
+        qualifier: &str,
+        name: &str,
+        reason: Option<(&sqlparser::ast::ObjectName, &sql_traits::structs::MaintenanceRefusal)>,
+    ) -> Self {
+        let mut detail = format!(
+            "assigning to `{qualifier}.{name}` has no SQLite equivalent here, since a SQLite \
+             trigger cannot change the row it fired for. It is emulated with an UPDATE over the \
+             written row, which needs the whole trigger function body to be assignments to \
+             columns the table declares, alone or under IF, ELSIF and ELSE, closed by RETURN NEW."
+        );
+        if let Some((function, reason)) = reason {
+            use core::fmt::Write as _;
+            let _ = write!(detail, " In the body of `{function}`, {reason}.");
+        }
+        Self::forward_refusal(detail)
+    }
+
+    /// The error reading the body of the trigger function `function` raises,
+    /// where `reason` is what keeps the trigger from being a maintenance
+    /// trigger, which an assignment to `NEW` names.
+    pub(crate) fn from_trigger_body(
+        error: sqlparser_plpgsql::Error,
+        function: &sqlparser::ast::ObjectName,
+        reason: Option<&sql_traits::structs::MaintenanceRefusal>,
+    ) -> Self {
+        match (error, reason) {
+            (sqlparser_plpgsql::Error::QualifiedAssignment { qualifier, name }, Some(reason))
+                if qualifier.eq_ignore_ascii_case("new") =>
+            {
+                Self::new_assignment_refusal(&qualifier, &name, Some((function, reason)))
+            }
+            (error, _) => error.into(),
+        }
+    }
 }
 
 /// Boxes on the way in, so `?` still converts a schema error in one hop.
@@ -537,13 +576,7 @@ impl From<sqlparser_plpgsql::Error> for Error {
             Extracted::QualifiedAssignment { qualifier, name }
                 if qualifier.eq_ignore_ascii_case("new") =>
             {
-                Self::forward_refusal(format!(
-                    "assigning to `{qualifier}.{name}` has no SQLite equivalent here, since a \
-                     SQLite trigger cannot change the row it fired for. It is emulated with an \
-                     UPDATE over the written row, which needs the whole trigger function body to \
-                     be assignments to columns the table declares, alone or under IF, ELSIF and \
-                     ELSE, closed by RETURN NEW."
-                ))
+                Self::new_assignment_refusal(&qualifier, &name, None)
             }
             Extracted::QualifiedAssignment { qualifier, name } => {
                 Self::forward_refusal(format!(

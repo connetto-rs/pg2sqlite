@@ -1,6 +1,6 @@
 use sql_traits::{
-    structs::ParserDB,
-    traits::{ColumnLike, TriggerLike},
+    structs::{MaintenanceRefusal, ParserDB},
+    traits::{ColumnLike, FunctionLike, TriggerLike},
 };
 use sqlparser::{
     ast::{
@@ -28,7 +28,7 @@ use crate::{
         query_builder::{plain_table_with_joins, single_expr_query},
         shared_helpers::ColumnRewrites,
     },
-    traits::{schema::Schema, translator::TranslatorWithContext},
+    traits::translator::TranslatorWithContext,
 };
 
 /// R106 sequential semantics: PostgreSQL runs plpgsql assignments in order,
@@ -334,17 +334,27 @@ struct TriggerPart<'a> {
 }
 
 /// Translates the trigger function's body into the shape `part` asks for.
+///
+/// `refusal` is what keeps the trigger from being a maintenance trigger, which
+/// the refusal of an assignment to `NEW` in the body names.
 fn generate_standard_trigger_body(
     exec_body: &sqlparser::ast::TriggerExecBody,
     part: &TriggerPart<'_>,
     table_name: &sqlparser::ast::ObjectName,
+    refusal: Option<&MaintenanceRefusal>,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Option<sqlparser::ast::BeginEndStatements>, crate::errors::Error> {
     let function_name = &exec_body.func_desc.name;
     let events = part.events;
-    if let Some((mut body, mut context)) = schema.function_body_with_context(function_name)? {
+    if let Some(source) = crate::traits::schema::written_function(schema, function_name)?
+        .and_then(|function| function.body())
+    {
+        let (mut body, mut context) =
+            super::plpgsql::parse_body(&function_name.to_string(), source).map_err(|error| {
+                crate::errors::Error::from_trigger_body(error, function_name, refusal)
+            })?;
         if let Some(guard) = part.guard {
             context.push_condition(guard.to_string());
         }
@@ -582,8 +592,12 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
         if let Some(table) = resolved_table {
             trigger_for_helpers.table_name = table.name.clone();
         }
-        let is_maintenance_trigger =
-            can_use_trigger_traits && trigger_for_helpers.is_maintenance_trigger(schema)?;
+        // What keeps the trigger from being a maintenance trigger, `Some(None)`
+        // for one, and `None` when its table does not resolve.
+        let maintenance_refusal = can_use_trigger_traits
+            .then(|| trigger_for_helpers.maintenance_refusal(schema))
+            .transpose()?;
+        let is_maintenance_trigger = matches!(maintenance_refusal, Some(None));
         // Checked on the trigger as written, before the split below renames
         // its halves.
         let shares_slot = options.shares_trigger_slot(&trigger_slots::trigger_key(self));
@@ -740,6 +754,7 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
                     after: plain && matches!(period, Some(TriggerPeriod::After)),
                 },
                 &redirected_table_name,
+                maintenance_refusal.as_ref().and_then(Option::as_ref),
                 schema,
                 options,
                 emit,
