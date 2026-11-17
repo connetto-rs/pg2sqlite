@@ -60,14 +60,30 @@ fn compose_assignment_refs(expr: &Expr, assigned: &[(String, Expr)]) -> Expr {
 }
 
 /// The maintenance assignments in body order, each value composed against the
-/// ones before it, the values the trigger body's `UPDATE` writes.
+/// ones before it and read as the trigger's events see it, with `TG_OP` and
+/// `TG_TABLE_NAME` folded and the fields of the row an event lacks NULL. These
+/// are the values the trigger body's `UPDATE` writes.
+///
+/// # Errors
+///
+/// Returns an error when the trigger's table does not resolve, or when a value
+/// reads `TG_OP` under several events or a trigger variable SQLite has no
+/// value for.
 fn maintenance_chain(
     trigger: &CreateTrigger,
     schema: &ParserDB,
-) -> Result<Vec<(String, Expr)>, sql_traits::errors::LookupError> {
+) -> Result<Vec<(String, Expr)>, crate::errors::Error> {
+    let mut context = super::plpgsql::PlPgSqlContext::new();
+    context.trigger_events = trigger_event_names(&trigger.events);
+    context.trigger_table = last_identifier(&trigger.table_name);
+    let absent = absent_row(&trigger.events);
     let mut assigned: Vec<(String, Expr)> = Vec::new();
     for (col, raw) in trigger.maintenance_assignments(schema)? {
-        let composed = compose_assignment_refs(&raw, &assigned);
+        let mut composed = compose_assignment_refs(&raw, &assigned);
+        if let Some(absent) = absent {
+            null_row_fields(&mut composed, absent);
+        }
+        super::plpgsql::PlPgSqlTranslator::fold_trigger_specials(&mut composed, &context)?;
         assigned.push((col.column_name().to_owned(), composed));
     }
     Ok(assigned)
@@ -246,29 +262,63 @@ fn route_trigger_statement_writes(
     Ok(())
 }
 
-/// Replaces the fields of the row an event lacks, `OLD` on INSERT and `NEW`
-/// on DELETE, by the NULL PostgreSQL reads there, so the `TG_OP` fold prunes
-/// the branches they guard.
+/// The row an event lacks, `OLD` on INSERT and `NEW` on DELETE, whose fields
+/// PostgreSQL reads as NULL.
+fn absent_row(events: &[TriggerEvent]) -> Option<&'static str> {
+    match events {
+        [TriggerEvent::Insert] => Some("OLD"),
+        [TriggerEvent::Delete] => Some("NEW"),
+        _ => None,
+    }
+}
+
+/// Replaces the fields of the `absent` row in `node` by NULL.
+fn null_row_fields<V: sqlparser::ast::VisitMut>(node: &mut V, absent: &str) {
+    let _: core::ops::ControlFlow<()> = sqlparser::ast::visit_expressions_mut(node, |expr| {
+        if let Expr::CompoundIdentifier(parts) = expr
+            && let [row, _] = parts.as_slice()
+            && row.value.eq_ignore_ascii_case(absent)
+        {
+            *expr = Expr::Value(ValueWithSpan { value: Value::Null, span: Span::empty() });
+        }
+        core::ops::ControlFlow::Continue(())
+    });
+}
+
+/// Replaces the fields of the row an event lacks by the NULL PostgreSQL reads
+/// there, so the `TG_OP` fold prunes the branches they guard.
 fn null_absent_row_fields(
     body: &mut sqlparser::ast::BeginEndStatements,
     events: &[sqlparser::ast::TriggerEvent],
 ) {
-    let absent = match events {
-        [TriggerEvent::Insert] => "OLD",
-        [TriggerEvent::Delete] => "NEW",
-        _ => return,
-    };
+    let Some(absent) = absent_row(events) else { return };
     for statement in &mut body.statements {
-        let _: core::ops::ControlFlow<()> =
-            sqlparser::ast::visit_expressions_mut(statement, |expr| {
-                if let Expr::CompoundIdentifier(parts) = expr
-                    && let [row, _] = parts.as_slice()
-                    && row.value.eq_ignore_ascii_case(absent)
-                {
-                    *expr = Expr::Value(ValueWithSpan { value: Value::Null, span: Span::empty() });
-                }
-                core::ops::ControlFlow::Continue(())
-            });
+        null_row_fields(statement, absent);
+    }
+}
+
+/// The `TG_OP` value of each of `events`.
+fn trigger_event_names(events: &[TriggerEvent]) -> Vec<String> {
+    events
+        .iter()
+        .map(|event| {
+            match event {
+                TriggerEvent::Insert => "INSERT",
+                TriggerEvent::Update(_) => "UPDATE",
+                TriggerEvent::Delete => "DELETE",
+                TriggerEvent::Truncate => "TRUNCATE",
+            }
+            .to_string()
+        })
+        .collect()
+}
+
+/// The last part of `name` when it is an identifier, the `TG_TABLE_NAME` of a
+/// trigger on that table.
+fn last_identifier(name: &ObjectName) -> Option<String> {
+    match name.0.last()? {
+        ObjectNamePart::Identifier(ident) => Some(ident.value.clone()),
+        ObjectNamePart::Function(_) => None,
     }
 }
 
@@ -312,23 +362,8 @@ fn generate_standard_trigger_body(
         null_absent_row_fields(&mut body, events);
         // Seed trigger-specific context so the body translator can
         // constant-fold TG_OP and TG_TABLE_NAME references.
-        context.trigger_events = events
-            .iter()
-            .map(|e| {
-                match e {
-                    sqlparser::ast::TriggerEvent::Insert => "INSERT".to_string(),
-                    sqlparser::ast::TriggerEvent::Update(_) => "UPDATE".to_string(),
-                    sqlparser::ast::TriggerEvent::Delete => "DELETE".to_string(),
-                    sqlparser::ast::TriggerEvent::Truncate => "TRUNCATE".to_string(),
-                }
-            })
-            .collect();
-        context.trigger_table = table_name.0.last().and_then(|p| {
-            match p {
-                sqlparser::ast::ObjectNamePart::Identifier(ident) => Some(ident.value.clone()),
-                sqlparser::ast::ObjectNamePart::Function(_) => None,
-            }
-        });
+        context.trigger_events = trigger_event_names(events);
+        context.trigger_table = last_identifier(table_name);
         // A definer body's calls run as its owner, whose privileges they
         // need.
         let owner = crate::traits::schema::written_function(schema, function_name)?

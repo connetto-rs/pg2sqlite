@@ -541,7 +541,8 @@ impl From<sqlparser_plpgsql::Error> for Error {
                     "assigning to `{qualifier}.{name}` has no SQLite equivalent here, since a \
                      SQLite trigger cannot change the row it fired for. It is emulated with an \
                      UPDATE over the written row, which needs the whole trigger function body to \
-                     be a run of assignments to columns the table declares, closed by RETURN NEW."
+                     be assignments to columns the table declares, alone or under IF, ELSIF and \
+                     ELSE, closed by RETURN NEW."
                 ))
             }
             Extracted::QualifiedAssignment { qualifier, name } => {

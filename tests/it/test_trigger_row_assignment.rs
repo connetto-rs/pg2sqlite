@@ -187,22 +187,28 @@ fn a_declared_variable_assignment_still_translates() {
     assert_eq!(rows, vec![Some("2".to_string())], "greatest(0, 1) * 2 is 2");
 }
 
+/// An assignment under `IF` writes its value where the condition holds, and
+/// the row keeps what was written where it does not.
 #[test]
-fn an_assignment_inside_an_if_is_refused() {
-    let message = assert_refuses(
-        &script_with_body("IF NEW.txt IS NULL THEN NEW.txt := 'fallback'; END IF;"),
-        "NEW.txt",
-    );
-    assert!(message.contains(WRITTEN_ROW), "NEW decides what is written: {message}");
+fn an_assignment_inside_an_if_is_translated() {
+    let body = "IF NEW.txt IS NULL THEN NEW.txt := 'fallback'; END IF;";
+    let columns = "id INT PRIMARY KEY, txt TEXT";
+    assert_eq!(write_and_read(columns, body, "(1, NULL)", "txt"), Some("fallback".to_string()));
+    assert_eq!(write_and_read(columns, body, "(1, 'given')", "txt"), Some("given".to_string()));
 }
 
 /// PostgreSQL accepts a bare `=` as a plpgsql assignment, measured on
-/// PostgreSQL 16, so the refusal covers both spellings.
+/// PostgreSQL 16, so both spellings translate.
 #[test]
-fn an_assignment_inside_an_if_spelled_with_one_equals_is_refused() {
-    assert_refuses(
-        &script_with_body("IF NEW.txt IS NULL THEN NEW.txt = 'fallback'; END IF;"),
-        "NEW.txt",
+fn an_assignment_inside_an_if_spelled_with_one_equals_is_translated() {
+    assert_eq!(
+        write_and_read(
+            "id INT PRIMARY KEY, txt TEXT",
+            "IF NEW.txt IS NULL THEN NEW.txt = 'fallback'; END IF;",
+            "(1, NULL)",
+            "txt",
+        ),
+        Some("fallback".to_string()),
     );
 }
 
