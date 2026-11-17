@@ -1,10 +1,11 @@
 //! Parity for every condition a `SECURITY DEFINER` helper's grant arm holds
 //! and for the walks its set grows along: a joined row, an anti-join, a time
 //! bound, a principal beside the caller, a delimited set, a caller gate, a
-//! row cap lifted for a request acting through no installation, a walk down
-//! two edge tables kept to a selection, and a walk up a tree feeding a
-//! grantee set. Each helper guards the same table under a policy of its own,
-//! which both engines read under every request state.
+//! row cap lifted for a request acting through no installation, a returned
+//! key capped by another helper's set, a walk down two edge tables kept to a
+//! selection, and a walk up a tree feeding a grantee set. Then for an arm
+//! reading another helper's rows. Each helper guards the same table under a
+//! policy of its own, which both engines read under every request state.
 
 // `register_impl` takes an unwind-safe closure, which a poisoning mutex is.
 use std::sync::{Arc, Mutex};
@@ -201,6 +202,17 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
   WHERE grant_row.grantee IN (SELECT authz.caller_teams())
 $$;
 
+CREATE FUNCTION authz.called_orgs() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT org.id FROM authz.member_orgs() org(id)
+$$;
+
+CREATE FUNCTION authz.granted_pages() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT doc.id FROM public.docs doc
+  WHERE doc.kind = 'page' AND doc.id IN (SELECT authz.granted_docs())
+$$;
+
 ALTER FUNCTION authz.caller_id() OWNER TO conditions_owner;
 ALTER FUNCTION authz.installation_id() OWNER TO conditions_owner;
 ALTER FUNCTION authz.link_ids() OWNER TO conditions_owner;
@@ -218,6 +230,8 @@ ALTER FUNCTION authz.capped_files() OWNER TO conditions_owner;
 ALTER FUNCTION authz.reachable_docs() OWNER TO conditions_owner;
 ALTER FUNCTION authz.caller_teams() OWNER TO conditions_owner;
 ALTER FUNCTION authz.team_docs() OWNER TO conditions_owner;
+ALTER FUNCTION authz.called_orgs() OWNER TO conditions_owner;
+ALTER FUNCTION authz.granted_pages() OWNER TO conditions_owner;
 REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA authz FROM PUBLIC;
 GRANT USAGE ON SCHEMA authz TO conditions_owner;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA authz TO conditions_owner;
@@ -234,7 +248,7 @@ GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA authz TO app;
 ";
 
 /// Each helper's policy over `docs`, one case per condition it carries.
-const CASES: [(&str, &str); 11] = [
+const CASES: [(&str, &str); 13] = [
     ("a joined row", "org_id IN (SELECT authz.member_orgs())"),
     ("a row cap over a joined row", "org_id IN (SELECT authz.administered_orgs())"),
     ("an anti-join, time bounds and a principal", "id IN (SELECT authz.granted_docs())"),
@@ -246,6 +260,8 @@ const CASES: [(&str, &str); 11] = [
     ("a lifted row cap over no row", "id IN (SELECT authz.capped_files())"),
     ("a walk down kept to a selection", "id IN (SELECT authz.reachable_docs())"),
     ("a walk up feeding a grantee set", "id IN (SELECT authz.team_docs())"),
+    ("a returned key capped by another helper's set", "id IN (SELECT authz.granted_pages())"),
+    ("an arm reading another helper's rows", "org_id IN (SELECT authz.called_orgs())"),
 ];
 
 /// What a request carries, `''` standing for a setting it leaves unset.

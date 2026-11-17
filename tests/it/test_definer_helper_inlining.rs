@@ -450,3 +450,150 @@ fn a_declared_user_defined_function_is_called_rather_than_inlined() {
         "CREATE VIEW docs AS SELECT id FROM docs_rls WHERE (id IN (SELECT docs_with('write')))"
     );
 }
+
+/// Resources, the grants on them, and helpers over them whose arms call
+/// another helper, pair their rows with enum labels, or cap the key they
+/// return by another helper's set.
+const SHARING: &str = "
+CREATE ROLE helper_owner NOLOGIN BYPASSRLS;
+CREATE TYPE share_role AS ENUM ('reader', 'writer', 'admin');
+CREATE TYPE no_role AS ENUM ();
+CREATE TABLE resources (id TEXT PRIMARY KEY, writers_can_share BOOLEAN NOT NULL);
+CREATE TABLE share_grants (
+  resource_id TEXT NOT NULL REFERENCES resources (id), principal_id TEXT NOT NULL, role TEXT NOT NULL
+);
+CREATE FUNCTION resources_with(min_role TEXT) RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+  SELECT resource_id FROM share_grants
+  WHERE principal_id = current_setting('app.user_id', true) AND (role = 'admin' OR role = min_role)
+$$;
+CREATE FUNCTION resources_administered(min_role TEXT) RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+  SELECT resource_id FROM share_grants
+  WHERE principal_id = current_setting('app.user_id', true) AND min_role = 'admin'
+$$;
+CREATE FUNCTION administered_resources() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+  SELECT resource.id FROM resources_with('admin') resource(id)
+$$;
+CREATE FUNCTION unreached_resources() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+  SELECT resource.id FROM resources_administered('reader') resource(id)
+$$;
+CREATE FUNCTION granted_roles() RETURNS SETOF share_role
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+  SELECT allowed.role FROM resources_with('admin') resource(id)
+  CROSS JOIN unnest(enum_range(NULL::share_role)) allowed(role)
+$$;
+CREATE FUNCTION listed_roles() RETURNS SETOF share_role
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+  SELECT allowed.role FROM share_grants grant_row
+  CROSS JOIN (VALUES ('reader'::share_role), ('writer'::share_role)) allowed(role)
+  WHERE grant_row.principal_id = current_setting('app.user_id', true)
+$$;
+CREATE FUNCTION no_roles() RETURNS SETOF no_role
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+  SELECT allowed.role FROM share_grants grant_row
+  CROSS JOIN unnest(enum_range(NULL::no_role)) allowed(role)
+  WHERE grant_row.principal_id = current_setting('app.user_id', true)
+$$;
+CREATE FUNCTION sharable_resources() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+  SELECT resource.id FROM resources resource
+  WHERE resource.writers_can_share AND resource.id IN (SELECT resources_with('writer'))
+$$;
+ALTER FUNCTION resources_with(TEXT) OWNER TO helper_owner;
+ALTER FUNCTION resources_administered(TEXT) OWNER TO helper_owner;
+ALTER FUNCTION administered_resources() OWNER TO helper_owner;
+ALTER FUNCTION unreached_resources() OWNER TO helper_owner;
+ALTER FUNCTION granted_roles() OWNER TO helper_owner;
+ALTER FUNCTION listed_roles() OWNER TO helper_owner;
+ALTER FUNCTION no_roles() OWNER TO helper_owner;
+ALTER FUNCTION sharable_resources() OWNER TO helper_owner;
+GRANT SELECT ON resources, share_grants TO helper_owner;
+ALTER TABLE resources ENABLE ROW LEVEL SECURITY;
+ALTER TABLE share_grants ENABLE ROW LEVEL SECURITY;
+";
+
+/// What `resources_with('admin')` returns, as the replica reads it under the
+/// column name a called arm reads it by.
+const ADMINISTERED: &str = "SELECT arm.resource_id AS column_0 FROM share_grants_rls AS arm \
+                            WHERE arm.principal_id = app_user() AND arm.role IN ('admin')";
+
+/// The condition the view `share_grants` keeps its rows by, under a policy
+/// keeping those `predicate` holds for.
+fn shared(predicate: &str) -> String {
+    let script = translated(
+        &format!(
+            "{SHARING}CREATE POLICY share_grants_read ON share_grants FOR SELECT \
+             USING ({predicate});"
+        ),
+        &options(),
+    );
+    let view = statement(&script, "share_grants");
+    let prefix = "CREATE VIEW share_grants AS SELECT resource_id, principal_id, role \
+                  FROM share_grants_rls WHERE ";
+    view.strip_prefix(prefix).unwrap_or_else(|| panic!("{view}")).to_owned()
+}
+
+/// An arm reading another helper's rows reads them by position.
+#[test]
+fn a_called_arm_reads_the_called_helpers_rows() {
+    assert_eq!(
+        shared("resource_id IN (SELECT administered_resources())"),
+        format!("(resource_id IN (SELECT called.column_0 FROM ({ADMINISTERED}) AS called))")
+    );
+}
+
+/// An arm calling a helper that keeps no row for its arguments keeps none.
+#[test]
+fn a_called_arm_over_no_row_keeps_no_row() {
+    assert_eq!(
+        shared("resource_id IN (SELECT unreached_resources())"),
+        "(resource_id IN (SELECT NULL WHERE false))"
+    );
+}
+
+/// Every row an arm keeps pairs with each label of an enum, in declaration
+/// order, or with each label a `VALUES` list writes.
+#[test]
+fn an_arm_pairs_its_rows_with_each_label() {
+    assert_eq!(
+        shared("role IN (SELECT granted_roles())"),
+        format!(
+            "(role IN (SELECT labels_0.label FROM ({ADMINISTERED}) AS called \
+             CROSS JOIN (SELECT 'reader' AS label UNION ALL SELECT 'writer' AS label \
+             UNION ALL SELECT 'admin' AS label) AS labels_0))"
+        )
+    );
+    assert_eq!(
+        shared("role IN (SELECT listed_roles())"),
+        "(role IN (SELECT labels_0.label FROM share_grants_rls AS arm \
+         CROSS JOIN (SELECT 'reader' AS label UNION ALL SELECT 'writer' AS label) AS labels_0 \
+         WHERE arm.principal_id = app_user()))"
+    );
+}
+
+/// An enum declaring no label pairs a row with none.
+#[test]
+fn an_enum_without_labels_pairs_a_row_with_none() {
+    assert_eq!(
+        shared("role IN (SELECT no_roles())"),
+        "(role IN (SELECT labels_0.label FROM share_grants_rls AS arm \
+         CROSS JOIN (SELECT NULL AS label WHERE false) AS labels_0 \
+         WHERE arm.principal_id = app_user()))"
+    );
+}
+
+/// The primary key an arm returns, compared with another helper's set beside
+/// other conditions, keeps the rows whose key that set holds.
+#[test]
+fn a_returned_key_is_capped_by_another_helpers_set() {
+    assert_eq!(
+        shared("resource_id IN (SELECT sharable_resources())"),
+        "(resource_id IN (SELECT arm.id FROM resources_rls AS arm \
+         WHERE arm.writers_can_share IN (true) AND arm.id IN (SELECT arm.resource_id \
+         FROM share_grants_rls AS arm \
+         WHERE arm.principal_id = app_user() AND arm.role IN ('admin', 'writer'))))"
+    );
+}

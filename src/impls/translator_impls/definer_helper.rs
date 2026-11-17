@@ -14,9 +14,9 @@ use core::{convert::Infallible, ops::ControlFlow};
 use sql_traits::{
     errors::HelperSetError,
     structs::{
-        AntiJoin, CallerGate, CapOperand, GrantArm, GrantedTo, HelperArm, HelperSet, ParentArm,
-        ParserDB, Restriction, RowCap, SetPacking, SettingComparison, SettingContent, SettingValue,
-        TimeBound, TimeComparison, WalkArm, WalkDirection,
+        AntiJoin, CalledArm, CallerGate, CapOperand, GrantArm, GrantedTo, HelperArm, HelperSet,
+        ParentArm, ParserDB, Restriction, Returned, RowCap, SetPacking, SettingComparison,
+        SettingContent, SettingValue, TimeBound, TimeComparison, WalkArm, WalkDirection,
     },
     traits::{ColumnLike, DatabaseLike, FunctionLike, TableLike},
 };
@@ -138,6 +138,11 @@ const EDGE: &str = "edge";
 const NEXT: &str = "next";
 const PREVIOUS: &str = "previous";
 
+/// The alias of the rows a called arm reads.
+const CALLED: &str = "called";
+/// The one column of a list of labels.
+const LABEL: &str = "label";
+
 /// Writes a helper's set as a PostgreSQL query over the tables its arms read,
 /// under their declared names so the translation resolves their columns.
 struct Lowering<'h, 'db> {
@@ -160,6 +165,7 @@ impl<'db> Lowering<'_, 'db> {
             match arm {
                 HelperArm::Grant(grant) => arms.push(self.grant(grant)?),
                 HelperArm::Parent(parent) => arms.push(self.parent(parent)?),
+                HelperArm::Called(called) => arms.extend(self.called(called)?),
                 HelperArm::Walk(walk) => edges.push(self.edge(walk)),
             }
         }
@@ -290,9 +296,39 @@ impl<'db> Lowering<'_, 'db> {
         ))))
     }
 
-    /// `SELECT <columns> FROM <table> [JOIN <joined table> ON <key>]... WHERE
-    /// <conditions>`, every condition the arm holds written out, so the arm
-    /// keeps no row its helper does not return.
+    /// `SELECT <returned> FROM (<set>) AS called [CROSS JOIN <labels>]...`,
+    /// the rows the called helper returns under positional column names, or
+    /// `None` where it returns no row.
+    fn called(&mut self, called: &CalledArm<'db, ParserDB>) -> Result<Option<SetExpr>, Error> {
+        // `SELECT NULL WHERE false` has one column, so it cannot stand for
+        // the rows of a helper returning several.
+        if called.set().arms().is_empty() {
+            return Ok(None);
+        }
+        let mut rows = self.set(called.set())?;
+        // A helper returning `SETOF` a scalar type declares no column.
+        let arity = called.function().returned_columns(self.schema).count().max(1);
+        let columns: Vec<Ident> = (0..arity).map(called_column).collect();
+        name_columns(&mut rows.body, &columns);
+        let (projection, labels) = returned_projection(called.returned(), |position| {
+            qualified(CALLED, called_column(*position))
+        });
+        let relation = TableFactor::Derived {
+            lateral: false,
+            subquery: Box::new(rows),
+            alias: Some(alias(CALLED)),
+            sample: None,
+        };
+        Ok(Some(SetExpr::Select(Box::new(make_simple_select(
+            projection,
+            vec![TableWithJoins { relation, joins: labels }],
+            None,
+        )))))
+    }
+
+    /// `SELECT <returned> FROM <table> [JOIN <joined table> ON <key>]...
+    /// [CROSS JOIN <labels>]... WHERE <conditions>`, every condition the arm
+    /// holds written out, so the arm keeps no row its helper does not return.
     fn grant(&mut self, grant: &GrantArm<'db, ParserDB>) -> Result<SetExpr, Error> {
         self.read.push(grant.table());
         let mut conditions = Vec::new();
@@ -335,11 +371,9 @@ impl<'db> Lowering<'_, 'db> {
         for anti_join in grant.anti_joins() {
             conditions.push(self.anti_join(anti_join));
         }
-        let projection = grant
-            .columns()
-            .iter()
-            .map(|column| SelectItem::UnnamedExpr(qualified(ARM, column_ident(column))))
-            .collect();
+        let (projection, labels) =
+            returned_projection(grant.returned(), |column| qualified(ARM, column_ident(column)));
+        joins.extend(labels);
         Ok(SetExpr::Select(Box::new(make_simple_select(
             projection,
             vec![TableWithJoins { relation: aliased_table(grant.table(), ARM), joins }],
@@ -508,6 +542,87 @@ impl<'db> Lowering<'_, 'db> {
 /// The alias of the row a grant arm joins at `row` in its joined rows.
 fn joined_alias(row: usize) -> String {
     format!("joined_{row}")
+}
+
+/// The name a called arm reads the column of its helper's rows at `position`
+/// under.
+fn called_column(position: usize) -> Ident {
+    Ident::new(format!("column_{position}"))
+}
+
+/// The projection of an arm returning `returned`, `read` writing a value read
+/// off the arm's row, and the lists of labels it joins, one per position
+/// returning labels.
+fn returned_projection<S>(
+    returned: &[Returned<S>],
+    read: impl Fn(&S) -> Expr,
+) -> (Vec<SelectItem>, Vec<Join>) {
+    let mut lists = Vec::new();
+    let projection = returned
+        .iter()
+        .enumerate()
+        .map(|(position, returned)| {
+            SelectItem::UnnamedExpr(match returned {
+                Returned::Read(value) => read(value),
+                Returned::Labels(labels) => {
+                    let name = format!("labels_{position}");
+                    lists.push(label_list(labels, &name));
+                    qualified(&name, Ident::new(LABEL))
+                }
+            })
+        })
+        .collect();
+    (projection, lists)
+}
+
+/// `CROSS JOIN (SELECT <label> AS label [UNION ALL SELECT <label>]...) AS
+/// <name>`, which pairs every row of the arm with each label, and with none
+/// for no label.
+fn label_list(labels: &[Value], name: &str) -> Join {
+    let rows = labels.iter().map(|label| {
+        SetExpr::Select(Box::new(make_simple_select(
+            vec![SelectItem::UnnamedExpr(Expr::Value(label.clone().into()))],
+            Vec::new(),
+            None,
+        )))
+    });
+    let mut body = union(rows.collect(), SetQuantifier::All).unwrap_or_else(|| *empty_set().body);
+    name_columns(&mut body, &[Ident::new(LABEL)]);
+    Join {
+        relation: TableFactor::Derived {
+            lateral: false,
+            subquery: Box::new(make_query(None, body)),
+            alias: Some(alias(name)),
+            sample: None,
+        },
+        global: false,
+        join_operator: JoinOperator::CrossJoin(JoinConstraint::None),
+    }
+}
+
+/// Names the columns every `SELECT` of `body` projects `columns`, which both
+/// engines read the columns of a `UNION` by.
+fn name_columns(body: &mut SetExpr, columns: &[Ident]) {
+    match body {
+        SetExpr::Select(select) => {
+            for (item, column) in select.projection.iter_mut().zip(columns) {
+                match item {
+                    SelectItem::UnnamedExpr(expr) => {
+                        let expr = core::mem::replace(expr, Expr::Value(Value::Null.into()));
+                        *item = SelectItem::ExprWithAlias { expr, alias: column.clone() };
+                    }
+                    SelectItem::ExprWithAlias { alias, .. } => alias.clone_from(column),
+                    _ => {}
+                }
+            }
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            name_columns(left, columns);
+            name_columns(right, columns);
+        }
+        SetExpr::Query(query) => name_columns(&mut query.body, columns),
+        _ => {}
+    }
 }
 
 /// `SELECT NULL WHERE false`, the set holding no value.
