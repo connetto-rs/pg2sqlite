@@ -28,6 +28,9 @@ mod parity_definer_helpers;
 #[path = "gauntlet/parity_helper_conditions.rs"]
 mod parity_helper_conditions;
 
+#[path = "gauntlet/parity_sharable_grants.rs"]
+mod parity_sharable_grants;
+
 #[path = "gauntlet/parity_plpgsql.rs"]
 mod parity_plpgsql;
 #[path = "gauntlet/parity_scalar_helpers.rs"]
