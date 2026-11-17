@@ -669,3 +669,32 @@ fn array_cat_null_operand_returns_nonnull_side() {
         "array_cat(NULL, x) must be x, got: {rows_left_null:?}",
     );
 }
+
+/// Rows whose columns share their names with the columns of `json_each`,
+/// which every array operation below walks in a subquery.
+const SHADOWING_FIXTURE: &str = "CREATE TABLE r (id INT PRIMARY KEY, key TEXT, value TEXT, \
+                                 ids INT[], keys TEXT[], patterns TEXT[]);
+INSERT INTO r VALUES (7, 'x', 'yy', ARRAY[7], ARRAY['x'], ARRAY['y%']);
+INSERT INTO r VALUES (2, 'z', 'ww', ARRAY[1], ARRAY['q'], ARRAY['y%']);
+";
+
+/// A column named like a column of `json_each` reads its own row inside the
+/// subquery an array operation walks, never the element the walk is on.
+#[test]
+fn a_column_named_like_a_json_each_column_reads_its_own_row() {
+    let some = |values: &[&str]| values.iter().map(|value| Some((*value).to_string())).collect();
+    for (query, expected) in [
+        ("SELECT id FROM r WHERE id = ANY (ids) ORDER BY id", some(&["7"])),
+        ("SELECT id FROM r WHERE id <> ALL (ids) ORDER BY id", some(&["2"])),
+        ("SELECT id FROM r WHERE key LIKE ANY (keys) ORDER BY id", some(&["7"])),
+        ("SELECT id FROM r WHERE key ILIKE ANY (keys) ORDER BY id", some(&["7"])),
+        ("SELECT id FROM r WHERE value LIKE ANY (patterns) ORDER BY id", some(&["7"])),
+        ("SELECT id FROM r WHERE ids && ARRAY[id] ORDER BY id", some(&["7"])),
+        ("SELECT array_position(ids, id) FROM r ORDER BY id", vec![None, Some("1".to_string())]),
+        ("SELECT array_positions(ids, id) FROM r ORDER BY id", some(&["[]", "[1]"])),
+        ("SELECT array_remove(ids, id) FROM r ORDER BY id", some(&["[1]", "[]"])),
+        ("SELECT array_replace(ids, id, 0) FROM r ORDER BY id", some(&["[1]", "[0]"])),
+    ] {
+        assert_eq!(run_translated(&format!("{SHADOWING_FIXTURE}{query};")), expected, "{query}");
+    }
+}
