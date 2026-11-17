@@ -128,11 +128,8 @@ impl PlPgSqlTranslator {
 
         match stmt {
             Statement::Set(set) => {
-                Self::handle_set_statement(set, context);
-                let assigned: Vec<String> = match set {
-                    Set::SingleAssignment { variable, .. } => vec![variable.to_string()],
-                    _ => Vec::new(),
-                };
+                let assigned: Vec<String> =
+                    Self::handle_set_statement(set, context).into_iter().collect();
                 Self::evaluate_assigned(&assigned, context, schema, options, emit)
             }
 
@@ -233,27 +230,26 @@ impl PlPgSqlTranslator {
         }
     }
 
-    fn handle_set_statement(set: &Set, context: &mut PlPgSqlContext) {
-        if let Set::SingleAssignment { variable, values, .. } = set
-            && values.len() == 1
-        {
-            let expression = values[0].to_string();
-            let binding =
-                VariableBinding { name: variable.to_string(), expression: expression.clone() };
+    /// Binds the variable `set` assigns, and answers its name.
+    fn handle_set_statement(set: &Set, context: &mut PlPgSqlContext) -> Option<String> {
+        let Set::SingleAssignment { variable, values, .. } = set else { return None };
+        let [value] = values.as_slice() else { return None };
+        let name = variable.to_string();
+        let binding = VariableBinding { name: name.clone(), expression: value.to_string() };
 
-            // A `SELECT ... INTO` assignment has to outlive the block it
-            // appears in, an ordinary one does not. Read off the AST rather
-            // than the rendering: the test this replaces asked whether the
-            // rendered text began with `(` and contained `SELECT`, so a
-            // variable named `SELECT_FACTOR` made `(SELECT_FACTOR *
-            // NEW.amount)` look like a subquery and the binding was filed as
-            // persistent, then never resolved.
-            if Self::contains_subquery(&values[0]) {
-                context.add_persistent_binding(binding);
-            } else {
-                context.add_binding(binding);
-            }
+        // A `SELECT ... INTO` assignment has to outlive the block it
+        // appears in, an ordinary one does not. Read off the AST rather
+        // than the rendering: the test this replaces asked whether the
+        // rendered text began with `(` and contained `SELECT`, so a
+        // variable named `SELECT_FACTOR` made `(SELECT_FACTOR *
+        // NEW.amount)` look like a subquery and the binding was filed as
+        // persistent, then never resolved.
+        if Self::contains_subquery(value) {
+            context.add_persistent_binding(binding);
+        } else {
+            context.add_binding(binding);
         }
+        Some(name)
     }
 
     /// `SELECT <value>` for each variable of `assigned` whose value may
@@ -1966,11 +1962,8 @@ impl Visitor for RaisingSearch<'_> {
     fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
         let quiet = match expr {
             Expr::Function(function) => {
-                let no_input = match &function.args {
-                    FunctionArguments::None => true,
-                    FunctionArguments::List(list) => list.args.is_empty(),
-                    FunctionArguments::Subquery(_) => false,
-                };
+                let no_input =
+                    matches!(&function.args, FunctionArguments::List(list) if list.args.is_empty());
                 no_input
                     && crate::impls::object_name::last_ident(&function.name).is_some_and(|name| {
                         self.generators
@@ -2045,7 +2038,8 @@ mod tests {
     };
 
     use super::{
-        PlPgSqlTranslator, ReferenceForm, VariableScope, references_variable, substitute_variables,
+        PlPgSqlTranslator, ReferenceForm, VariableScope, may_raise, references_variable,
+        substitute_variables,
     };
     use crate::{
         impls::{
@@ -2178,6 +2172,15 @@ mod tests {
         let mut expr = parse_expr("v_id");
         substitute_variables(&mut expr, &nested);
         assert_eq!(expr.to_string(), "(SELECT 1)");
+    }
+
+    /// A value raising only through a table-valued function, such as
+    /// `json_each` over malformed JSON, still counts as raising.
+    #[test]
+    fn a_table_valued_function_may_raise_and_a_plain_table_read_does_not() {
+        let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
+        assert!(may_raise(&parse_expr("EXISTS (SELECT 1 FROM json_each(x))"), &options));
+        assert!(!may_raise(&parse_expr("EXISTS (SELECT 1 FROM t WHERE t.id = x + 1)"), &options));
     }
 
     #[test]
