@@ -775,6 +775,8 @@ impl Pg2Sqlite {
             crate::impls::translator_impls::trigger_slots::TriggerSlots::seeded(
                 initial_schema.as_ref(),
             )?;
+        let mut marker_tables =
+            crate::impls::translator_impls::reentry::MarkerTables::seeded(initial_schema.as_ref())?;
 
         let mut warnings = Vec::new();
         let mut translated = Vec::with_capacity(statements.len());
@@ -818,6 +820,7 @@ impl Pg2Sqlite {
                             &epoch.schema,
                             &written,
                         )?;
+                        marker_tables.follow(statement, &mut emitted);
                         translated.push(emitted);
                     }
                 }

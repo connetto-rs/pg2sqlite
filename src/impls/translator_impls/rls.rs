@@ -2306,15 +2306,16 @@ fn generate_insert_check_trigger_sql(
     )))
 }
 
-/// Builds the WHEN condition that lets an internal maintenance UPDATE through
-/// the backing-table BEFORE UPDATE deny guard.
+/// The violation condition of the backing-table `BEFORE UPDATE` deny guard
+/// that lets an `INSERT` maintenance trigger's own `UPDATE` through, `None`
+/// when the table has no such trigger.
 ///
-/// A BEFORE INSERT maintenance trigger is converted to an AFTER INSERT trigger
-/// whose body does `UPDATE backing SET col = expr(NEW_at_insert)`. The BEFORE
-/// UPDATE guard fires on that UPDATE. To allow it through while still denying
-/// caller UPDATEs, the guard fires only when `NEW.col IS DISTINCT FROM
-/// expr(OLD)` — FALSE for the maintenance UPDATE (which sets col to exactly
-/// that value) and TRUE for unrelated UPDATEs.
+/// A `BEFORE INSERT` maintenance trigger runs as an `AFTER INSERT` trigger
+/// whose body writes the assigned values over the row with an `UPDATE`,
+/// which the guard denies with every other `UPDATE` of a table without an
+/// `UPDATE` policy. The body holds the row in the table's marker table for
+/// the duration of its `UPDATE`, so the guard denies a row the marker table
+/// does not hold.
 ///
 /// The prewalk stores (table_name, fn_name) for each BEFORE INSERT trigger so
 /// this function can reach the maintenance assignments through the epoch schema
@@ -2326,70 +2327,38 @@ fn build_maintenance_insert_exemption(
     options: &crate::options::TranslationContext<'_>,
 ) -> Option<Expr> {
     let table_name = table.table_name().to_lowercase();
-    let mut any_trigger_match: Option<Expr> = None;
-
-    for (trig_table, fn_name) in options.before_insert_trigger_fns() {
-        if trig_table != &table_name {
-            continue;
-        }
-
-        // Synthetic trigger: only table_name and exec_body matter for
-        // TriggerLike; the rest are inert defaults. The local drop
-        // stays in this compilation unit (rls.rs), which already
-        // handles CreateTable and its sub-types.
-        let synthetic = CreateTrigger {
-            or_alter: false,
-            temporary: false,
-            or_replace: false,
-            is_constraint: false,
-            name: ObjectName(Vec::new()),
-            period: Some(TriggerPeriod::Before),
-            period_before_table: true,
-            events: vec![TriggerEvent::Insert],
-            table_name: table.name.clone(),
-            referenced_table_name: None,
-            referencing: Vec::new(),
-            trigger_object: Some(TriggerObjectKind::ForEach(TriggerObject::Row)),
-            condition: None,
-            exec_body: Some(TriggerExecBody {
-                exec_type: TriggerExecBodyType::Function,
-                func_desc: FunctionDesc { name: fn_name.clone(), args: None },
-            }),
-            statements_as: false,
-            statements: None,
-            characteristics: None,
-        };
-        if !synthetic.is_maintenance_trigger(schema).unwrap_or(false) {
-            continue;
-        }
-
-        let chain =
-            crate::impls::translator_impls::create_trigger::maintenance_chain(&synthetic, schema)
-                .ok()?;
-        let trigger_matches =
-            crate::impls::translator_impls::create_trigger::maintenance_recursion_condition(
-                &table.name,
-                chain,
-                schema,
-                options,
-                &mut |_| {},
-            )
-            .ok()?;
-
-        if let Some(cond) = trigger_matches {
-            any_trigger_match = Some(match any_trigger_match {
-                None => cond,
-                Some(prev) => {
-                    Expr::BinaryOp {
-                        left: Box::new(prev),
-                        op: BinaryOperator::And,
-                        right: Box::new(cond),
-                    }
-                }
-            });
-        }
-    }
-    any_trigger_match
+    let maintained = options
+        .before_insert_trigger_fns()
+        .iter()
+        .filter(|(trig_table, _)| *trig_table == table_name)
+        .any(|(_, fn_name)| {
+            // Synthetic trigger: only table_name and exec_body matter for
+            // TriggerLike; the rest are inert defaults.
+            let synthetic = CreateTrigger {
+                or_alter: false,
+                temporary: false,
+                or_replace: false,
+                is_constraint: false,
+                name: ObjectName(Vec::new()),
+                period: Some(TriggerPeriod::Before),
+                period_before_table: true,
+                events: vec![TriggerEvent::Insert],
+                table_name: table.name.clone(),
+                referenced_table_name: None,
+                referencing: Vec::new(),
+                trigger_object: Some(TriggerObjectKind::ForEach(TriggerObject::Row)),
+                condition: None,
+                exec_body: Some(TriggerExecBody {
+                    exec_type: TriggerExecBodyType::Function,
+                    func_desc: FunctionDesc { name: fn_name.clone(), args: None },
+                }),
+                statements_as: false,
+                statements: None,
+                characteristics: None,
+            };
+            synthetic.is_maintenance_trigger(schema).unwrap_or(false)
+        });
+    maintained.then(|| super::reentry::unmarked(&super::reentry::marker_table(&table.name), "OLD"))
 }
 
 fn generate_update_check_trigger_sql(
