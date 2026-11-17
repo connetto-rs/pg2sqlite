@@ -197,8 +197,12 @@ fn json_to_text() {
 #[test]
 fn jsonb_to_text() {
     let sql = "CREATE TABLE t (id INT PRIMARY KEY, data JSONB);";
-    let output = translate(sql, &Pg2SqliteOptions::default()).unwrap();
-    assert!(output.contains("TEXT"), "JSONB should map to TEXT, got: {output}");
+    let options = helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default());
+    let output = translate(sql, &options).unwrap();
+    assert!(
+        output.contains("TEXT COLLATE pg_jsonb_order"),
+        "JSONB should map to TEXT, got: {output}"
+    );
     parse_sqlite(&output);
 }
 
@@ -255,7 +259,8 @@ fn blob_passes_through() {
 ///
 /// The `translate` helper joins multiple statements with `\n` (no `;`), so
 /// each line runs on its own. sqlite-vec is registered as an auto extension
-/// so tests that translate vector types can execute the resulting vec0 DDL.
+/// so tests that translate vector types can execute the resulting vec0 DDL,
+/// and the connection carries the `jsonb` function and collation.
 fn parse_sqlite(sql: &str) {
     use diesel::RunQueryDsl;
 

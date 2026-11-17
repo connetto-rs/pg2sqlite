@@ -815,7 +815,7 @@ fn assign_insert_values(
     let context = scoped.as_ref().unwrap_or(options);
     for_each_insert_position(source.body.as_mut(), &column_names, &mut |column, expr| {
         rewrites.reject_untyped_array(column, &expr)?;
-        Ok(rewrites.temporal_column_cast(column, &expr, schema, context)?.unwrap_or(expr))
+        Ok(rewrites.column_cast(column, &expr, schema, context)?.unwrap_or(expr))
     })
 }
 

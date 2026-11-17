@@ -138,7 +138,11 @@ fn setup_sq_diesel() -> SqliteConnection {
 // only by `statistical_aggregates_agree_within_tolerance` because diesel
 // provides no API for window-aggregate registration.
 fn setup_sq_rusqlite() -> RusqliteConn {
-    let source = utc_script(&format!("{SCHEMA}{SEEDS}"));
+    let source = utc_script(
+        "CREATE TABLE vals (id INTEGER PRIMARY KEY, n INTEGER, r DOUBLE PRECISION, s TEXT);
+         INSERT INTO vals VALUES (1, 10, 1.5, 'hello'), (2, 20, 2.5, 'world'),
+             (3, NULL, NULL, NULL), (4, 30, 3.5, 'hello');",
+    );
     let stmts = Pg2Sqlite::default()
         .sql(&source)
         .expect("parse schema and seeds")

@@ -18,7 +18,8 @@ const DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, s TEXT, n INT, r REAL, bi
 /// Every capability declared, since a refusal for want of an opt-in says
 /// nothing about whether the two directions agree on a name.
 fn options() -> Pg2SqliteOptions {
-    Pg2SqliteOptions::default().with_math_functions_available()
+    crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default())
+        .with_math_functions_available()
 }
 
 fn schema() -> ParserDB {

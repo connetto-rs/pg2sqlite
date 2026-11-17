@@ -8,7 +8,7 @@ use diesel::{
     sqlite::SqliteConnection,
 };
 use pg2sqlite::prelude::TimeZoneFunctions;
-use sql_values::{
+use sql_values::postgres::{
     DateTimeError, InputContext, PgTimeZone, PgTimestamp, PgTimestampTz, TimeZoneError,
 };
 

@@ -104,7 +104,7 @@ struct UpsertRow {
 fn translate_and_setup() -> Result<diesel::SqliteConnection, Box<dyn std::error::Error>> {
     crate::support::fixtures::apply_fixture(
         include_str!("../fixtures/data_types_extended.sql"),
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
     )
 }
 
@@ -213,7 +213,7 @@ fn test_upsert_insert_new_row() -> Result<(), Box<dyn std::error::Error>> {
     let sql = "
         CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL, counter INTEGER NOT NULL DEFAULT 0);
     ";
-    let options = Pg2SqliteOptions::default();
+    let options = crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default());
     let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
 
     let mut connection =
@@ -252,7 +252,7 @@ fn test_upsert_update_existing_row() -> Result<(), Box<dyn std::error::Error>> {
     let sql = "
         CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL, counter INTEGER NOT NULL DEFAULT 0);
     ";
-    let options = Pg2SqliteOptions::default();
+    let options = crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default());
     let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
 
     let mut connection =

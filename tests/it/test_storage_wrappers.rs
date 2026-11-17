@@ -24,7 +24,7 @@ const DDL: &str =
 /// Options naming both storage representations, which a uuid or array column
 /// needs in either direction.
 fn options() -> Pg2SqliteOptions {
-    Pg2SqliteOptions::default()
+    crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default())
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_array_representation(ArrayRepresentation::Json)
 }
@@ -120,7 +120,7 @@ fn a_hex_blob_beside_a_bytea_column_still_decodes() {
 fn a_hex_blob_beside_a_uuid_column_held_as_text_is_refused() {
     // SQLite compares a blob with text and matches nothing, and no PostgreSQL
     // expression answers that.
-    let text_options = Pg2SqliteOptions::default()
+    let text_options = crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default())
         .with_uuid_representation(UuidRepresentation::Text)
         .with_array_representation(ArrayRepresentation::Json);
     let message = reverse_refusal(
@@ -137,7 +137,7 @@ fn a_hex_blob_beside_a_uuid_column_with_no_representation_is_refused() {
     // which is also why the forward direction refuses a uuid column outright.
     let message = reverse_refusal(
         "SELECT id FROM stored WHERE u = unhex('550e8400e29b41d4a716446655440000')",
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
     );
     assert!(message.contains("representation"), "{message}");
 }
@@ -180,7 +180,7 @@ fn a_blob_literal_of_another_length_beside_a_uuid_column_is_refused() {
 
 #[test]
 fn a_blob_literal_beside_a_uuid_column_held_as_text_is_refused() {
-    let text_options = Pg2SqliteOptions::default()
+    let text_options = crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default())
         .with_uuid_representation(UuidRepresentation::Text)
         .with_array_representation(ArrayRepresentation::Json);
     let message = reverse_refusal(

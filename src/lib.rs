@@ -44,7 +44,7 @@ pub mod prelude {
         pg2sqlite::Pg2Sqlite,
         script::{FreshFiles, Script},
         traits::{
-            ArrayRepresentation, ReverseTranslator, Schema, SessionVariableMapping,
+            ArrayRepresentation, JsonbFunctions, ReverseTranslator, Schema, SessionVariableMapping,
             TimeZoneFunctions, Translator, TranslatorWithContext, UuidRepresentation, UuidVersion,
         },
         warnings::{TranslationReport, TranslationWarning, WarningSink},

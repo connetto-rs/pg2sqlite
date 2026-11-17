@@ -1194,7 +1194,7 @@ pub fn validate_table_policies(
 /// cannot read as the value PostgreSQL stored, or `error` itself when it is
 /// another lookup failure.
 fn unreadable_clause(table_name: &str, error: LookupError) -> Error {
-    use sql_values::DateTimeError;
+    use sql_values_05::DateTimeError;
 
     let LookupError::PolicyLiteralUnreadable { policy, literal, data_type, reason } = error else {
         return error.into();

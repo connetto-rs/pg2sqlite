@@ -2,6 +2,7 @@
 
 pub mod deployment;
 pub mod emitted_corpus;
+pub mod jsonb_functions;
 pub mod postgres;
 pub mod replay;
 pub mod rls;
@@ -273,6 +274,7 @@ pub fn establish_connection() -> SqliteConnection {
         .expect("Failed to register current_app_username");
     current_app_department_utils::register_impl(&mut connection, current_app_department_impl)
         .expect("Failed to register current_app_department");
+    jsonb_functions::register(&mut connection);
 
     connection
 }
@@ -315,7 +317,7 @@ pub fn reverse_translate_sql(sql: &str) -> Result<String, String> {
     let ddl = "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, val TEXT, key TEXT, value TEXT);";
     let translator = Pg2Sqlite::default().sql(ddl).map_err(|e| e.to_string())?;
     let schema = translator.build_schema().map_err(|e| e.to_string())?;
-    let options = Pg2SqliteOptions::default();
+    let options = jsonb_functions::with_functions(Pg2SqliteOptions::default());
     let stmts = translator.reverse_sql(sql, &schema, &options).map_err(|e| e.to_string())?;
     Ok(stmts.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"))
 }
@@ -422,7 +424,7 @@ pub fn translate_default_statements(pg: &str) -> Result<Vec<String>, String> {
     Pg2Sqlite::default()
         .sql(pg)
         .map_err(|e| e.to_string())?
-        .translate(&Pg2SqliteOptions::default())
+        .translate(&jsonb_functions::with_functions(Pg2SqliteOptions::default()))
         .map(|script| script.into_vec().iter().map(ToString::to_string).collect())
         .map_err(|e| e.to_string())
 }
@@ -438,7 +440,11 @@ pub fn translate_default_joined(pg: &str) -> Result<String, String> {
 /// is refused.
 #[allow(dead_code, reason = "used by the sqlite_vec test binary alone")]
 pub fn translate_default_or_err(pg: &str) -> String {
-    match Pg2Sqlite::default().sql(pg).unwrap().translate(&Pg2SqliteOptions::default()) {
+    match Pg2Sqlite::default()
+        .sql(pg)
+        .unwrap()
+        .translate(&jsonb_functions::with_functions(Pg2SqliteOptions::default()))
+    {
         Err(e) => e.to_string(),
         Ok(script) => {
             script.into_vec().iter().map(ToString::to_string).collect::<Vec<_>>().join("\n")
@@ -452,7 +458,7 @@ pub fn translate_prefixed(prefix: &str, pg: &str) -> Result<Vec<String>, String>
     Pg2Sqlite::default()
         .sql(&format!("{prefix}\n{pg}"))
         .map_err(|e| e.to_string())?
-        .translate_to_sql(&Pg2SqliteOptions::default())
+        .translate_to_sql(&jsonb_functions::with_functions(Pg2SqliteOptions::default()))
         .map(pg2sqlite::script::Script::into_vec)
         .map_err(|e| e.to_string())
 }
@@ -462,8 +468,9 @@ pub fn translate_prefixed(prefix: &str, pg: &str) -> Result<Vec<String>, String>
 pub fn translate_with_default_warnings(
     pg: &str,
 ) -> Result<(Vec<String>, Vec<pg2sqlite::warnings::TranslationWarning>), pg2sqlite::errors::Error> {
-    let report =
-        Pg2Sqlite::default().sql(pg)?.translate_with_report(&Pg2SqliteOptions::default())?;
+    let report = Pg2Sqlite::default()
+        .sql(pg)?
+        .translate_with_report(&jsonb_functions::with_functions(Pg2SqliteOptions::default()))?;
     let stmts = report.script.iter().map(ToString::to_string).collect();
     Ok((stmts, report.warnings))
 }
@@ -477,6 +484,7 @@ pub fn apply_with_options(
 ) -> Result<SqliteConnection, Box<dyn std::error::Error>> {
     let statements = Pg2Sqlite::default().sql(pg)?.translate(options)?.into_vec();
     let mut conn = SqliteConnection::establish(":memory:")?;
+    jsonb_functions::register(&mut conn);
     for statement in &statements {
         // Emitted DDL is not expressible via the typed DSL.
         diesel::sql_query(statement.to_string()).execute(&mut conn)?;
@@ -487,22 +495,25 @@ pub fn apply_with_options(
 /// Translates `pg` with default options and applies every emitted statement
 /// to a fresh in-memory connection.
 pub fn apply_default(pg: &str) -> Result<SqliteConnection, Box<dyn std::error::Error>> {
-    apply_with_options(pg, &Pg2SqliteOptions::default())
+    apply_with_options(pg, &jsonb_functions::with_functions(Pg2SqliteOptions::default()))
 }
 
 /// Translates `pg` with the `rls_audit` audit table name and returns the
 /// emitted statements joined with newlines.
 pub fn translate_rls_sql(pg: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let options = Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit");
+    let options = jsonb_functions::with_functions(Pg2SqliteOptions::default())
+        .with_rls_audit_table_name("rls_audit");
     Ok(translate_pg(pg, &options)?.join("\n"))
 }
 
 /// Translates `pg` with the `rls_audit` audit table name and applies every
 /// emitted statement to a fresh in-memory connection.
 pub fn apply_rls_sql(pg: &str) -> Result<SqliteConnection, Box<dyn std::error::Error>> {
-    let options = Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit");
+    let options = jsonb_functions::with_functions(Pg2SqliteOptions::default())
+        .with_rls_audit_table_name("rls_audit");
     let stmts = translate_pg(pg, &options)?;
     let mut conn = SqliteConnection::establish(":memory:")?;
+    jsonb_functions::register(&mut conn);
     for stmt in &stmts {
         // Emitted DDL is not expressible via the typed DSL.
         diesel::sql_query(stmt.as_str()).execute(&mut conn)?;
@@ -529,6 +540,7 @@ pub fn apply_translated_ddl(pg: &str, opts: &Pg2SqliteOptions) -> SqliteConnecti
 /// returns it, panicking on the first failure.
 pub fn apply_statements(stmts: &[String]) -> SqliteConnection {
     let mut conn = SqliteConnection::establish(":memory:").expect("connect");
+    jsonb_functions::register(&mut conn);
     for statement in stmts {
         // Emitted DDL is not expressible via the typed DSL.
         diesel::sql_query(statement)
@@ -546,6 +558,7 @@ pub fn apply_statements(stmts: &[String]) -> SqliteConnection {
 /// Panics when the connection cannot be opened or a statement is rejected.
 pub fn apply_ddl(stmts: &[String]) -> SqliteConnection {
     let mut conn = SqliteConnection::establish(":memory:").expect("connect");
+    jsonb_functions::register(&mut conn);
     for stmt in stmts.iter().filter(|s| !s.to_ascii_uppercase().trim_start().starts_with("SELECT"))
     {
         // Emitted DDL is not expressible via the typed DSL.
@@ -577,10 +590,10 @@ pub fn apply_rusqlite_statements(stmts: &[String]) -> rusqlite::Connection {
 /// Executes each non-empty newline-separated statement of `output` against
 /// an in-memory SQLite, proving the joined output runs.
 pub fn execute_joined_statements(output: &str) {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    for s in output.split('\n').filter(|s| !s.trim().is_empty()) {
-        // Translated output is a runtime string that no typed DSL can carry.
-        conn.execute_batch(&format!("{s};")).unwrap();
+    let mut connection = establish_connection();
+    for statement in output.split('\n').filter(|statement| !statement.trim().is_empty()) {
+        // Translated output is the artifact under test.
+        diesel::sql_query(statement).execute(&mut connection).unwrap();
     }
 }
 
@@ -590,7 +603,11 @@ pub fn reverse_sql_err(pg_ddl: &str, sqlite_sql: &str) -> String {
     let translator = Pg2Sqlite::default().sql(pg_ddl).unwrap();
     let schema = translator.build_schema().unwrap();
     translator
-        .reverse_sql(sqlite_sql, &schema, &Pg2SqliteOptions::default())
+        .reverse_sql(
+            sqlite_sql,
+            &schema,
+            &jsonb_functions::with_functions(Pg2SqliteOptions::default()),
+        )
         .unwrap_err()
         .to_string()
 }
@@ -602,7 +619,11 @@ pub fn reverse_sql_joined(
     schema: &sql_traits::structs::ParserDB,
 ) -> Result<String, pg2sqlite::errors::Error> {
     Pg2Sqlite::default()
-        .reverse_sql(sqlite_sql, schema, &Pg2SqliteOptions::default())
+        .reverse_sql(
+            sqlite_sql,
+            schema,
+            &jsonb_functions::with_functions(Pg2SqliteOptions::default()),
+        )
         .map(|stmts| stmts.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))
 }
 
@@ -626,7 +647,11 @@ where
 /// parses as PostgreSQL, and returns it.
 pub fn reverse_checked(sqlite_sql: &str, schema: &sql_traits::structs::ParserDB) -> String {
     let statements = Pg2Sqlite::default()
-        .reverse_sql(sqlite_sql, schema, &Pg2SqliteOptions::default())
+        .reverse_sql(
+            sqlite_sql,
+            schema,
+            &jsonb_functions::with_functions(Pg2SqliteOptions::default()),
+        )
         .expect("reverse translation");
     let sql = statements.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ");
     sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, &sql)
@@ -645,8 +670,12 @@ pub fn forward_translate_against(pg_sql: &str, schema: &str) -> String {
     stmts
         .iter()
         .flat_map(|s| {
-            pg2sqlite::prelude::Translator::translate(s, &built, &Pg2SqliteOptions::default())
-                .unwrap()
+            pg2sqlite::prelude::Translator::translate(
+                s,
+                &built,
+                &jsonb_functions::with_functions(Pg2SqliteOptions::default()),
+            )
+            .unwrap()
         })
         .map(|s| s.to_string())
         .collect::<Vec<_>>()
@@ -659,7 +688,11 @@ pub fn reverse_translate_against(sqlite_sql: &str, schema: &str) -> String {
     let translator = Pg2Sqlite::default().sql(schema).unwrap();
     let built = translator.build_schema().unwrap();
     translator
-        .reverse_sql(sqlite_sql, &built, &Pg2SqliteOptions::default())
+        .reverse_sql(
+            sqlite_sql,
+            &built,
+            &jsonb_functions::with_functions(Pg2SqliteOptions::default()),
+        )
         .unwrap()
         .into_iter()
         .map(|s| s.to_string())
@@ -679,16 +712,17 @@ pub fn evaluate_probe<T: rusqlite::types::FromSql>(probe: &str) -> T {
 /// Translates `pg_sql` with default options and proves every emitted
 /// statement runs in SQLite.
 pub fn assert_translated_statements_run(pg_sql: &str) {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut connection = establish_connection();
     for stmt in Pg2Sqlite::default()
         .sql(pg_sql)
         .expect("parse")
-        .translate(&Pg2SqliteOptions::default())
+        .translate(&jsonb_functions::with_functions(Pg2SqliteOptions::default()))
         .expect("translate")
         .into_vec()
     {
         // Translated output is a runtime string that no typed DSL can carry.
-        conn.execute_batch(&format!("{stmt};"))
+        diesel::sql_query(stmt.to_string())
+            .execute(&mut connection)
             .unwrap_or_else(|e| panic!("translated statement must run in SQLite: {e}\n{stmt}"));
     }
 }

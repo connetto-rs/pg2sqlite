@@ -4,8 +4,8 @@
 use sql_traits::structs::ParserDB;
 use sqlparser::{
     ast::{
-        BinaryOperator, CaseWhen, Expr, Ident, InTarget, ObjectName, ObjectNamePart, UnaryOperator,
-        Value, ValueWithSpan, helpers::attached_token::AttachedToken,
+        BinaryOperator, CaseWhen, DataType, Expr, Ident, InTarget, ObjectName, ObjectNamePart,
+        UnaryOperator, Value, ValueWithSpan, helpers::attached_token::AttachedToken,
     },
     tokenizer::Span,
 };
@@ -462,7 +462,9 @@ impl ReverseTranslator for Expr {
             {
                 reverse_like(self, *negated, *any, expr, pattern, schema, options)
             }
-            Expr::Collate { collation, .. } => reverse_collate(self, collation, schema, options),
+            Expr::Collate { expr, collation } => {
+                reverse_collate(self, expr, collation, schema, options)
+            }
 
             // SQLite uses JSONPath ('$.a'), PostgreSQL uses text-array ('{a}');
             // convert.
@@ -553,10 +555,14 @@ fn reverse_like(
 /// Reverses a `COLLATE`, refusing the collations only SQLite has.
 ///
 /// `NOCASE`, `BINARY` and `RTRIM` name no PostgreSQL collation, so the
-/// server would reject the statement. Any other name passes through, since
-/// PostgreSQL takes user-defined collations.
+/// server would reject the statement. The registered `jsonb` collation
+/// orders what PostgreSQL's `jsonb` orders itself, and `BINARY` over a cast to
+/// text is how the forward direction takes a `jsonb` value's text out of that
+/// collation, so only the operand of either is reversed. Any other name passes
+/// through, since PostgreSQL takes user-defined collations.
 fn reverse_collate(
     whole: &Expr,
+    operand: &Expr,
     collation: &ObjectName,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
@@ -566,6 +572,14 @@ fn reverse_collate(
         .last()
         .and_then(ObjectNamePart::as_ident)
         .map_or_else(|| collation.to_string(), |part| part.value.clone());
+    let jsonb_collation = options.get_jsonb_functions().is_some_and(|functions| {
+        functions.collation.eq_ignore_ascii_case(&name)
+            || name.eq_ignore_ascii_case("BINARY")
+                && is_jsonb_text(operand, &functions.collation, schema, options)
+    });
+    if jsonb_collation {
+        return translate_expr_recursive::<Reverse>(operand, schema, options, &mut |_| {});
+    }
     if ["NOCASE", "BINARY", "RTRIM"].iter().any(|only| name.eq_ignore_ascii_case(only)) {
         return Err(Error::reverse_refusal(format!(
             "COLLATE {name} is a SQLite-only collation with no PostgreSQL equivalent. Map it to \
@@ -574,6 +588,32 @@ fn reverse_collate(
         )));
     }
     translate_expr_recursive::<Reverse>(whole, schema, options, &mut |_| {})
+}
+
+/// Whether `operand` is the forward direction's text of a `jsonb` value, a
+/// cast to `TEXT` of a `jsonb` column or of a value under `collation`.
+fn is_jsonb_text(
+    operand: &Expr,
+    collation: &str,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> bool {
+    let Expr::Cast { data_type: DataType::Text, expr, .. } = operand else {
+        return false;
+    };
+    let mut inner = expr.as_ref();
+    while let Expr::Nested(nested) = inner {
+        inner = nested;
+    }
+    match inner {
+        Expr::Collate { collation: name, .. } => {
+            name.0
+                .last()
+                .and_then(ObjectNamePart::as_ident)
+                .is_some_and(|part| part.value.eq_ignore_ascii_case(collation))
+        }
+        _ => crate::impls::jsonb::is_jsonb_typed(inner, schema, options),
+    }
 }
 
 /// Reverses `||`, refusing an operand PostgreSQL will not concatenate.

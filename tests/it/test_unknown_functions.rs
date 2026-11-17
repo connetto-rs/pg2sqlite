@@ -26,7 +26,7 @@ fn translate(pg: &str, options: &Pg2SqliteOptions) -> Result<Vec<String>, String
 /// Translates `SELECT <call> FROM t` and asserts SQLite resolves every name in
 /// the emitted statement, which is what proves the passthrough was justified.
 fn assert_sqlite_resolves(call: &str) {
-    let options = Pg2SqliteOptions::default();
+    let options = crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default());
     let emitted = translate(&format!("{TABLE} SELECT {call} FROM t;"), &options)
         .unwrap_or_else(|error| panic!("{call} should translate: {error}"));
 
@@ -47,9 +47,11 @@ fn assert_sqlite_resolves(call: &str) {
 
 #[test]
 fn a_postgres_only_function_is_refused() {
-    let error =
-        translate(&format!("{TABLE} SELECT pg_sleep(1) FROM t;"), &Pg2SqliteOptions::default())
-            .expect_err("pg_sleep has no SQLite form and must not be emitted verbatim");
+    let error = translate(
+        &format!("{TABLE} SELECT pg_sleep(1) FROM t;"),
+        &crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
+    )
+    .expect_err("pg_sleep has no SQLite form and must not be emitted verbatim");
     assert!(error.contains("pg_sleep"), "the error should name the function: {error}");
 }
 
@@ -57,7 +59,7 @@ fn a_postgres_only_function_is_refused() {
 fn an_unrecognised_name_is_refused() {
     let error = translate(
         &format!("{TABLE} SELECT definitely_not_a_function(n) FROM t;"),
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
     )
     .expect_err("an unknown name must not be emitted verbatim");
     assert!(
@@ -144,8 +146,8 @@ fn sqlite_aggregates_and_window_functions_still_translate() {
 /// way the translator can know SQLite will resolve it.
 #[test]
 fn a_declared_user_defined_function_translates() {
-    let options =
-        Pg2SqliteOptions::default().with_user_defined_functions(["my_udf", "another_udf"]);
+    let options = crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default())
+        .with_user_defined_functions(["my_udf", "another_udf"]);
     let emitted = translate(&format!("{TABLE} SELECT my_udf(n) FROM t;"), &options)
         .expect("a declared function should translate");
     assert!(
@@ -165,7 +167,8 @@ fn a_declared_user_defined_function_translates() {
 /// whatever the caller set it to.
 #[test]
 fn the_configured_uuid_function_name_translates() {
-    let options = Pg2SqliteOptions::default().with_uuid_function_name("uuid7");
+    let options = crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default())
+        .with_uuid_function_name("uuid7");
     let emitted = translate(&format!("{TABLE} SELECT uuid7() FROM t;"), &options)
         .expect("the configured UUID function should translate");
     assert!(

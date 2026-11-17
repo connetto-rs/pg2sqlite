@@ -14,7 +14,7 @@ pub fn assert_refused(pg: &str, needle: &str) {
     let error = Pg2Sqlite::default()
         .sql(pg)
         .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
+        .translate_to_sql(&super::jsonb_functions::with_functions(Pg2SqliteOptions::default()))
         .expect_err("should be refused at translation time");
     assert!(error.to_string().contains(needle), "refusal {error} should name {needle}");
 }
@@ -28,7 +28,7 @@ pub fn translate_default(sql: &str) -> String {
     Pg2Sqlite::default()
         .sql(sql)
         .unwrap()
-        .translate(&Pg2SqliteOptions::default())
+        .translate(&super::jsonb_functions::with_functions(Pg2SqliteOptions::default()))
         .unwrap()
         .into_vec()
         .iter()
@@ -43,7 +43,7 @@ pub fn translate_default_err(sql: &str) -> String {
     Pg2Sqlite::default()
         .sql(sql)
         .unwrap()
-        .translate(&Pg2SqliteOptions::default())
+        .translate(&super::jsonb_functions::with_functions(Pg2SqliteOptions::default()))
         .unwrap_err()
         .to_string()
 }
@@ -78,7 +78,10 @@ pub fn translate_statements_and_first_query(
 
 /// [`translate_statements_and_first_query`] with default options.
 pub fn translate_default_statements_and_first_query(sql: &str) -> (Vec<String>, String) {
-    translate_statements_and_first_query(sql, &Pg2SqliteOptions::default())
+    translate_statements_and_first_query(
+        sql,
+        &super::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
+    )
 }
 
 /// [`translate_statements_and_first_query`] for a request whose `TimeZone` is

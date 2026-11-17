@@ -20,13 +20,16 @@ const DOCUMENT: &str = "CREATE TABLE jd (d jsonb);
 fn answer(expression: &str) -> Vec<Option<String>> {
     run_translated_with(
         &format!("{DOCUMENT} SELECT {expression} FROM jd;"),
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
     )
 }
 
 /// The rows of a whole script's last statement.
 fn script(pg: &str) -> Vec<Option<String>> {
-    run_translated_with(pg, &Pg2SqliteOptions::default())
+    run_translated_with(
+        pg,
+        &crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
+    )
 }
 
 /// The refusal `pg` earns.
@@ -34,7 +37,7 @@ fn refusal(pg: &str) -> String {
     Pg2Sqlite::default()
         .sql(pg)
         .expect("fixture parses")
-        .translate(&Pg2SqliteOptions::default())
+        .translate(&crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()))
         .expect_err("expected a refusal")
         .to_string()
 }
@@ -42,7 +45,7 @@ fn refusal(pg: &str) -> String {
 #[test]
 fn removing_a_key_removes_it() {
     // PostgreSQL: {"s": "x"}.
-    assert_eq!(answer("d - 'a'"), vec![Some(r#"{"s":"x"}"#.to_string())]);
+    assert_eq!(answer("d - 'a'"), vec![Some(r#"{"s": "x"}"#.to_string())]);
 }
 
 #[test]
@@ -53,8 +56,8 @@ fn removing_several_keys_removes_all_of_them() {
 
 #[test]
 fn removing_an_array_element_by_index_removes_it() {
-    // PostgreSQL: [1,3] for '[1,2,3]'::jsonb - 1.
-    assert_eq!(script("SELECT '[1,2,3]'::jsonb - 1;"), vec![Some("[1,3]".to_string())]);
+    // PostgreSQL returns the remaining elements in canonical text.
+    assert_eq!(script("SELECT '[1,2,3]'::jsonb - 1;"), vec![Some("[1, 3]".to_string())]);
 }
 
 #[test]
@@ -77,6 +80,23 @@ fn merging_two_documents_is_refused() {
     let message = refusal(&format!("{DOCUMENT} SELECT d || '{{\"b\":2}}'::jsonb FROM jd;"));
     assert!(message.contains("json_patch"), "{message}");
     assert!(message.to_lowercase().contains("null"), "{message}");
+}
+
+#[test]
+fn merging_with_an_untyped_document_or_a_built_one_is_refused() {
+    // PostgreSQL reads an untyped literal or parameter beside jsonb as jsonb,
+    // so each is the same merge as two typed documents.
+    for right in ["'{\"b\":2}'", "E'{\"b\":2}'", "$1", "jsonb_build_object('b', 2)", "to_jsonb(2)"]
+    {
+        let message = refusal(&format!("{DOCUMENT} UPDATE jd SET d = d || {right};"));
+        assert!(message.contains("json_patch"), "{right}: {message}");
+    }
+}
+
+#[test]
+fn a_document_concatenated_with_text_is_text() {
+    // jsonb || text resolves to text concatenation over the document's text.
+    assert_eq!(answer("d || 'x'::text"), vec![Some("{\"a\": 1, \"s\": \"x\"}x".to_string())]);
 }
 
 #[test]
@@ -182,5 +202,5 @@ fn the_operators_that_already_answered_correctly_still_do() {
     assert_eq!(answer("d ? 'a'"), vec![Some("1".to_string())]);
     assert_eq!(answer("jsonb_typeof(d)"), vec![Some("object".to_string())]);
     assert_eq!(answer("jsonb_extract_path(d, 'a')"), vec![Some("1".to_string())]);
-    assert_eq!(answer("d #- '{a}'"), vec![Some(r#"{"s":"x"}"#.to_string())]);
+    assert_eq!(answer("d #- '{a}'"), vec![Some(r#"{"s": "x"}"#.to_string())]);
 }

@@ -17,16 +17,18 @@ use rusqlite::Connection;
 use crate::helpers::{execute_all, run_translated as run_translated_helper};
 
 fn default_opts() -> Pg2SqliteOptions {
-    Pg2SqliteOptions::default()
+    crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default())
 }
 
 fn array_opts() -> Pg2SqliteOptions {
     use pg2sqlite::traits::ArrayRepresentation;
-    Pg2SqliteOptions::default().with_array_representation(ArrayRepresentation::Json)
+    crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default())
+        .with_array_representation(ArrayRepresentation::Json)
 }
 
 fn text_uuid_opts() -> Pg2SqliteOptions {
-    Pg2SqliteOptions::default().with_uuid_representation(UuidRepresentation::Text)
+    crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default())
+        .with_uuid_representation(UuidRepresentation::Text)
 }
 
 /// Translate and execute, then return the first column of the last query as
@@ -1686,13 +1688,15 @@ fn inet_type_refusal_does_not_say_unknown() {
 // ────────────
 
 #[test]
-fn jsonb_column_warns_about_key_order_loss() {
+fn jsonb_column_warns_about_string_order_and_numeric_reads() {
     let ws = warnings("CREATE TABLE t (col jsonb);", &default_opts());
     let has_jsonb_warn = ws.iter().any(|w| {
         matches!(
             w,
-            TranslationWarning::LossyDowngrade { construct, .. }
-            if construct.to_ascii_lowercase().contains("jsonb")
+            TranslationWarning::LossyDowngrade { construct, reason, .. }
+            if construct.eq_ignore_ascii_case("jsonb")
+                && reason.contains("orders strings inside a jsonb value bytewise")
+                && reason.contains("->> answers a number as SQLite's double")
         )
     });
     assert!(has_jsonb_warn, "jsonb column must emit a LossyDowngrade warning, got: {ws:?}");

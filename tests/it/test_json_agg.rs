@@ -21,7 +21,7 @@ const TABLE: &str = "CREATE TABLE t (id INT PRIMARY KEY, payload JSONB, note TEX
 fn probe(expression: &str) -> Vec<Option<String>> {
     run_translated_with(
         &format!("{TABLE} SELECT {expression} FROM t;"),
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
     )
 }
 
@@ -32,7 +32,7 @@ fn aggregating_a_json_column_nests_the_documents() {
 
 #[test]
 fn jsonb_agg_behaves_the_same() {
-    assert_eq!(probe("jsonb_agg(payload)"), vec![Some(r#"[{"a":1},[2,3]]"#.to_string())]);
+    assert_eq!(probe("jsonb_agg(payload)"), vec![Some(r#"[{"a": 1}, [2, 3]]"#.to_string())]);
 }
 
 /// A text column must keep being quoted, since its contents are a string and
@@ -55,7 +55,7 @@ fn aggregating_a_numeric_column_is_unchanged() {
 fn aggregating_no_rows_is_null() {
     let rows = run_translated_with(
         &format!("{TABLE} SELECT json_agg(payload) FROM t WHERE id < 0;"),
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
     );
     assert_eq!(rows, vec![None]);
 }
@@ -77,7 +77,8 @@ fn aggregating_an_array_column_nests_the_arrays() {
         "CREATE TABLE arr (id INT PRIMARY KEY, tags INT[]);
          INSERT INTO arr (id, tags) VALUES (1, ARRAY[1, 2]);
          SELECT json_agg(tags) FROM arr;",
-        &Pg2SqliteOptions::default().with_array_representation(ArrayRepresentation::Json),
+        &crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default())
+            .with_array_representation(ArrayRepresentation::Json),
     );
     assert_eq!(rows, vec![Some("[[1,2]]".to_string())]);
 }

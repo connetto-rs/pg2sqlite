@@ -19,7 +19,8 @@ use crate::helpers::run_translated as run_translated_helper;
 fn run_with_json_arrays(pg: &str) -> Vec<Option<String>> {
     run_translated_with(
         pg,
-        &Pg2SqliteOptions::default().with_array_representation(ArrayRepresentation::Json),
+        &crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default())
+            .with_array_representation(ArrayRepresentation::Json),
     )
 }
 
@@ -27,7 +28,9 @@ fn translate_err(pg: &str) -> String {
     Pg2Sqlite::default()
         .sql(pg)
         .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
+        .translate_to_sql(&crate::helpers::jsonb_functions::with_functions(
+            Pg2SqliteOptions::default(),
+        ))
         .expect_err("expected a translation error")
         .to_string()
 }

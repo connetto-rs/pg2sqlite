@@ -19,7 +19,10 @@ use crate::helpers;
 
 /// Helper: translate SQL and return the output or error string.
 fn translate(sql: &str) -> Result<String, String> {
-    translate_sql(sql, &Pg2SqliteOptions::default())
+    translate_sql(
+        sql,
+        &crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
+    )
 }
 
 fn translate_ok(sql: &str) -> String {
@@ -30,7 +33,10 @@ fn translate_ok(sql: &str) -> String {
 /// in-memory SQLite. Use after a substring assert to prove the output is
 /// accepted by SQLite, not just parseable.
 fn execute_all(sql: &str) {
-    helpers::execute_all(sql, &Pg2SqliteOptions::default());
+    helpers::execute_all(
+        sql,
+        &crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
+    );
 }
 
 #[test]
@@ -325,7 +331,7 @@ fn json_object_agg_over_empty_set_returns_null() {
     let rows = run_translated_helper::run_translated_with(
         "CREATE TABLE kv (k TEXT NOT NULL, v INT NOT NULL);
          SELECT json_object_agg(k, v) FROM kv;",
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
     );
     assert_eq!(rows, vec![None], "json_object_agg over empty set should be NULL, got: {rows:?}");
 }
@@ -337,7 +343,7 @@ fn json_object_agg_over_nonempty_set_returns_json_object() {
         "CREATE TABLE kv (k TEXT NOT NULL, v INT NOT NULL);
          INSERT INTO kv VALUES ('answer', 42);
          SELECT json_object_agg(k, v) FROM kv;",
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
     );
     let text = rows.into_iter().next().flatten().expect("non-empty result must not be NULL");
     assert!(text.contains("answer"), "result must contain the key: {text}");
@@ -353,7 +359,7 @@ fn json_agg_filter_does_not_collect_nulls() {
         "CREATE TABLE t (x INT);
          INSERT INTO t VALUES (1), (-1);
          SELECT json_agg(x) FILTER (WHERE x > 0) FROM t;",
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
     );
     assert_eq!(
         rows,

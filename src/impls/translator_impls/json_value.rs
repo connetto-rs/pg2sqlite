@@ -6,7 +6,10 @@
 //! converted first.
 
 use sql_traits::structs::ParserDB;
-use sqlparser::ast::{BinaryOperator, CastKind, DataType, Expr, TimezoneInfo};
+use sql_values::postgres::PgNumeric;
+use sqlparser::ast::{
+    BinaryOperator, CastKind, DataType, Expr, TimezoneInfo, UnaryOperator, Value, ValueWithSpan,
+};
 
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
@@ -95,6 +98,9 @@ pub(crate) fn json_argument(
     options: &TranslationContext<'_>,
     emit: WarningSink<'_>,
 ) -> Result<JsonArgument, Error> {
+    if let Some(number) = numeric_literal_text(argument) {
+        return Ok(JsonArgument::Literal(string_literal(&number)));
+    }
     let Some(conversion) = conversion_of(argument, schema, options)? else {
         return Err(Error::forward_refusal(format!(
             "{label}({argument}) reads a value the translation schema cannot settle to one \
@@ -135,6 +141,31 @@ pub(crate) fn json_argument(
         Stored::Timestamp => JsonArgument::Text(rendered(value, &iso_timestamp)?),
         Stored::TimeWithTimeZone => JsonArgument::Text(rendered(value, &time_with_time_zone_text)?),
     })
+}
+
+/// The text PostgreSQL's `numeric_out` prints for `expr` when it is a number
+/// literal PostgreSQL types `numeric`, one with a fraction or an exponent or
+/// beyond `bigint`, optionally negated, which SQLite would read as a double.
+fn numeric_literal_text(expr: &Expr) -> Option<String> {
+    let (negated, digits) = match expr {
+        Expr::Nested(inner) => return numeric_literal_text(inner),
+        Expr::Value(ValueWithSpan { value: Value::Number(digits, _), .. }) => (false, digits),
+        Expr::UnaryOp { op: UnaryOperator::Minus, expr: inner } => {
+            match inner.as_ref() {
+                Expr::Value(ValueWithSpan { value: Value::Number(digits, _), .. }) => {
+                    (true, digits)
+                }
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    if !digits.contains(['.', 'e', 'E']) && digits.parse::<i64>().is_ok() {
+        return None;
+    }
+    let number =
+        if negated { PgNumeric::parse(&format!("-{digits}")) } else { PgNumeric::parse(digits) };
+    number.ok().map(|number| number.to_string())
 }
 
 /// `argument` as an array element or object member's value, converted as
@@ -250,7 +281,13 @@ fn conversion_of(
                 conversion_of,
             );
         }
-        _ if is_already_json(expr) => Conversion::Stored(Stored::Document),
+        // A computed `jsonb` value reaches SQLite as the canonical text the
+        // replica's function answers, which carries no JSON subtype.
+        _ if is_already_json(expr)
+            || crate::impls::jsonb::is_jsonb_typed(expr, schema, options) =>
+        {
+            Conversion::Stored(Stored::Document)
+        }
         _ if is_boolean_expression(expr, schema, options)? => Conversion::Boolean,
         Expr::Cast { data_type, .. } => conversion_of_type(data_type, schema, options),
         Expr::TypedString(typed) => conversion_of_type(&typed.data_type, schema, options),

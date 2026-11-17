@@ -2821,7 +2821,7 @@ fn decimal_literal_places(expr: &Expr) -> u32 {
 /// string arrive from the parser with their escapes already resolved, so the
 /// characters themselves are what SQLite is given, which is the only form it
 /// reads: rendering `U&'A'` back made SQLite answer `no such column: U`.
-fn postgres_string_literal_text(value: &Value) -> Option<String> {
+pub(crate) fn postgres_string_literal_text(value: &Value) -> Option<String> {
     match value {
         Value::DollarQuotedString(quoted) => Some(quoted.value.clone()),
         Value::NationalStringLiteral(text)
@@ -3296,6 +3296,35 @@ fn interval_binary(
         }
     }
     crate::impls::interval::fields::binary(op, left, right, schema, options, emit).map(Some)
+}
+
+/// Whether `left || right` is PostgreSQL's document merge, two JSON documents
+/// or a `jsonb` value beside an untyped literal or bound parameter, which
+/// PostgreSQL reads as `jsonb` too.
+///
+/// # Errors
+///
+/// Propagates the error reading an operand's type.
+fn is_document_merge(
+    left: &Expr,
+    right: &Expr,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<bool, crate::errors::Error> {
+    let is_jsonb = |side: &Expr| crate::impls::jsonb::is_jsonb_typed(side, schema, options);
+    let is_document = |side: &Expr| -> Result<bool, crate::errors::Error> {
+        Ok(is_jsonb(side)
+            || crate::impls::translator_impls::function::carries_json(side, schema, options)?)
+    };
+    let is_untyped = |side: &Expr| {
+        crate::impls::shared_helpers::is_bound_parameter(side)
+            || matches!(side, Expr::Value(ValueWithSpan { value, .. })
+                if matches!(value, Value::SingleQuotedString(_))
+                    || postgres_string_literal_text(value).is_some())
+    };
+    Ok((is_document(left)? && is_document(right)?)
+        || (is_jsonb(left) && is_untyped(right))
+        || (is_untyped(left) && is_jsonb(right)))
 }
 
 /// Translate a binary operation expression.
@@ -3783,10 +3812,7 @@ fn translate_binary_op(
     // key whose new value is null and replacing an array rather than
     // concatenating it, both measured. Emitted as text concatenation it
     // answered two documents glued together, which is not JSON.
-    if *op == BinaryOperator::StringConcat
-        && crate::impls::translator_impls::function::carries_json(left, schema, options)?
-        && crate::impls::translator_impls::function::carries_json(right, schema, options)?
-    {
+    if *op == BinaryOperator::StringConcat && is_document_merge(left, right, schema, options)? {
         return Err(crate::errors::Error::forward_refusal(
             "|| over two JSON documents cannot be translated. PostgreSQL merges them, keeping \
              every key of both and preferring the right operand, and concatenates two arrays. \
@@ -4276,14 +4302,45 @@ fn reject_unstored_vector_reference(
 impl crate::traits::translator::TranslatorWithContext for Expr {
     type SQLiteEntry = Expr;
 
-    #[allow(clippy::too_many_lines)]
-    #[cfg_attr(feature = "std", recursive::recursive)]
     fn translate_with_warnings(
         &self,
         schema: &sql_traits::structs::ParserDB,
         options: &crate::options::TranslationContext<'_>,
         emit: &mut dyn FnMut(crate::warnings::TranslationWarning),
     ) -> Result<Self::SQLiteEntry, crate::errors::Error> {
+        let translated = self.translate_unfinished(schema, options, emit)?;
+        crate::impls::jsonb::finish(self, translated, schema, options)
+    }
+}
+
+/// An expression's translation before
+/// [`jsonb::finish`](crate::impls::jsonb::finish) brings a `jsonb` value to the
+/// form the replica holds.
+trait TranslateUnfinished {
+    fn translate_unfinished(
+        &self,
+        schema: &sql_traits::structs::ParserDB,
+        options: &crate::options::TranslationContext<'_>,
+        emit: &mut dyn FnMut(crate::warnings::TranslationWarning),
+    ) -> Result<Expr, crate::errors::Error>;
+}
+
+impl TranslateUnfinished for Expr {
+    #[cfg_attr(
+        not(feature = "std"),
+        expect(
+            clippy::too_many_lines,
+            reason = "one match over every expression variant PostgreSQL writes, which \
+                      `recursive` moves out of clippy's sight under std"
+        )
+    )]
+    #[cfg_attr(feature = "std", recursive::recursive)]
+    fn translate_unfinished(
+        &self,
+        schema: &sql_traits::structs::ParserDB,
+        options: &crate::options::TranslationContext<'_>,
+        emit: &mut dyn FnMut(crate::warnings::TranslationWarning),
+    ) -> Result<Expr, crate::errors::Error> {
         if let Some(whole_row) = options.whole_row(self) {
             return whole_row.read()?.translate_with_warnings(schema, options, emit);
         }
@@ -4427,6 +4484,11 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                         session_variable::translate_cast(expr, data_type, options)?
                     {
                         return Ok(paired);
+                    }
+                    if matches!(data_type, DataType::JSONB) && format.is_none() {
+                        return crate::impls::jsonb::cast_operand(expr, || {
+                            expr.translate_with_warnings(schema, options, emit)
+                        });
                     }
                     if format.is_none()
                         && let Some(distributed) =
@@ -4906,6 +4968,12 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
             }
             Expr::TypedString(typed_string) => {
                 rebuild(|| -> Result<Expr, crate::errors::Error> {
+                    if matches!(typed_string.data_type, DataType::JSONB)
+                        && let Some(document) =
+                            crate::impls::jsonb::document_literal(&typed_string.value.value)
+                    {
+                        return document;
+                    }
                     // A literal of a named temporal type is the type's own
                     // value, so it takes the column-write normalisation.
                     if let Some(kind) = crate::impls::temporal_literals::temporal_literal_kind(

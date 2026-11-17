@@ -143,6 +143,13 @@ pub(crate) fn result_type(
         return Ok(None);
     }
     let operands = [operand(left, schema, options), operand(right, schema, options)];
+    // `jsonb - key` removes from the document and answers `jsonb`. A document
+    // merge is refused, and `jsonb || text` is text concatenation.
+    if matches!(op, BinaryOperator::Minus)
+        && matches!(&operands[0], Operand::Typed(DataType::JSONB))
+    {
+        return Ok(Some(DataType::JSONB));
+    }
     if let Some(resolved) = resolve_operands(left, op, right, &operands, schema)? {
         return Ok(Some(resolved.result));
     }

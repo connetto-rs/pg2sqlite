@@ -348,8 +348,8 @@ fn run_as_definer_or_route_writes(
 }
 
 /// The SQLite value a maintenance `UPDATE` writes into `column`, `raw` being
-/// the PostgreSQL value the trigger assigns, with the cast and scaling any
-/// write into that column takes.
+/// the PostgreSQL value the trigger assigns, with the cast, scaling and
+/// canonical form any write into that column takes.
 fn maintained_value(
     rewrites: &ColumnRewrites,
     column: &str,
@@ -358,7 +358,7 @@ fn maintained_value(
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Expr, crate::errors::Error> {
-    let cast = rewrites.temporal_column_cast(column, raw, schema, options)?;
+    let cast = rewrites.column_cast(column, raw, schema, options)?;
     let value = cast.as_ref().unwrap_or(raw).translate_with_warnings(schema, options, emit)?;
     let site = crate::impls::shared_helpers::ZoneSite { schema, options };
     rewrites.finish_value(column, value, schema, options, Some(site))

@@ -19,10 +19,12 @@ fn sqlite_with(ddl: &str) -> SqliteConnection {
     let statements = Pg2Sqlite::default()
         .sql(ddl)
         .expect("schema should parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
+        .translate_to_sql(&crate::helpers::jsonb_functions::with_functions(
+            Pg2SqliteOptions::default(),
+        ))
         .expect("schema should translate")
         .into_vec();
-    let mut connection = SqliteConnection::establish(":memory:").expect("SQLite should connect");
+    let mut connection = crate::helpers::establish_connection();
     for statement in statements {
         diesel::sql_query(&statement)
             .execute(&mut connection)
@@ -44,7 +46,10 @@ fn external_schema_drives_column_dependent_rewrites() {
     let report = Pg2Sqlite::default()
         .sql("SELECT json_agg(payload) AS value FROM docs;")
         .expect("query should parse")
-        .translate_with_report_and_schema(&schema, &Pg2SqliteOptions::default())
+        .translate_with_report_and_schema(
+            &schema,
+            &crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
+        )
         .expect("query should translate");
     assert!(report.warnings.is_empty(), "translation should be lossless");
     assert_eq!(report.script.files.len(), 1, "the SELECT alone");
@@ -70,7 +75,10 @@ fn external_schema_refuses_a_returning_from_column() {
     let error = Pg2Sqlite::default()
         .sql("UPDATE t SET v = s.source_v FROM s WHERE t.id = s.id RETURNING source_v;")
         .expect("update should parse")
-        .translate_with_schema(&schema, &Pg2SqliteOptions::default())
+        .translate_with_schema(
+            &schema,
+            &crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
+        )
         .expect_err("the source column should be refused")
         .to_string();
     assert!(error.contains("RETURNING source_v"), "unexpected error: {error}");
@@ -86,7 +94,10 @@ fn loaded_ddl_updates_the_supplied_schema() {
              UPDATE t SET label = 'ok' WHERE id = 1 RETURNING label AS value;",
         )
         .expect("batch should parse")
-        .translate_to_sql_with_schema(&schema, &Pg2SqliteOptions::default())
+        .translate_to_sql_with_schema(
+            &schema,
+            &crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
+        )
         .expect("batch should translate")
         .into_vec();
 
@@ -110,7 +121,10 @@ fn complete_external_schema_refuses_an_absent_returning_target() {
     let error = Pg2Sqlite::default()
         .sql("DELETE FROM missing USING s WHERE TRUE RETURNING unknown;")
         .expect("delete should parse")
-        .translate_with_schema(&schema, &Pg2SqliteOptions::default())
+        .translate_with_schema(
+            &schema,
+            &crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
+        )
         .expect_err("the complete schema should reject the missing target")
         .to_string();
     assert!(error.contains("RETURNING unknown"), "unexpected error: {error}");

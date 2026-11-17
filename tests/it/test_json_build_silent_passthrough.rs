@@ -38,7 +38,10 @@ fn assert_translates_and_runs(pg_sql: &str) -> String {
              INSERT INTO t (a, b, c) VALUES ('x', 'y', 'z'); {pg_sql}"
         ))
         .and_then(|t| {
-            t.translate(&Pg2SqliteOptions::default()).map(pg2sqlite::script::Script::into_vec)
+            t.translate(&crate::helpers::jsonb_functions::with_functions(
+                Pg2SqliteOptions::default(),
+            ))
+            .map(pg2sqlite::script::Script::into_vec)
         })
         .expect("translation must succeed");
 

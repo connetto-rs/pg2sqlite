@@ -16,7 +16,7 @@ use alloc::borrow::Cow;
 use core::ops::ControlFlow;
 
 use sql_traits::{errors::LookupError, structs::ParserDB};
-use sql_values::IntervalTypmod;
+use sql_values::postgres::IntervalTypmod;
 use sqlparser::{
     ast::{
         BinaryOperator, Distinct, DuplicateTreatment, Expr, Function, FunctionArg, FunctionArgExpr,
