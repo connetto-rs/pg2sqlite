@@ -355,7 +355,30 @@ fn translate_boolean_cast(
         )));
     }
 
+    if answers_boolean(expr) {
+        return expr.translate_with_warnings(schema, options, emit);
+    }
     Ok(boolean_from_text(expr.translate_with_warnings(schema, options, emit)?))
+}
+
+/// Whether `expr` answers a boolean by construction, alone or as the one
+/// column of a scalar subquery, which SQLite answers as 1, 0 or `NULL`
+/// already, so the cast has nothing left to read.
+fn answers_boolean(expr: &Expr) -> bool {
+    match expr {
+        Expr::Nested(inner) => answers_boolean(inner),
+        Expr::Subquery(query) => {
+            matches!(
+                query.body.as_ref(),
+                SetExpr::Select(select) if matches!(
+                    select.projection.as_slice(),
+                    [SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. }]
+                        if answers_boolean(expr)
+                )
+            )
+        }
+        _ => is_boolean_by_construction(expr),
+    }
 }
 
 /// The spellings PostgreSQL reads as true.
@@ -2090,13 +2113,22 @@ fn translate_any_all_to_in(
     }
     // A declared SQL function answering an array is written as its body, so
     // the forms above read what the body builds, a string_to_array split
-    // among them.
-    if let Expr::Function(call) = right
-        && let Some(inlined) = super::sql_helper::inlined_call(call, schema, options)?
+    // among them. A body reading relations is already SQLite, the array the
+    // comparison below reads.
+    let inlined = match right {
+        Expr::Function(call) => super::sql_helper::inlined_call(call, schema, options, emit)?,
+        _ => None,
+    };
+    let translated_right = match inlined {
+        Some(super::sql_helper::Inlined::Postgres(inlined)) => {
+            return translate_any_all_to_in(left, &inlined, negated, schema, options, emit);
+        }
+        Some(super::sql_helper::Inlined::Sqlite(translated)) => Some(translated),
+        None => None,
+    };
+    if let Some(elements) = quantifier_elements(right)
+        && translated_right.is_none()
     {
-        return translate_any_all_to_in(left, &inlined, negated, schema, options, emit);
-    }
-    if let Some(elements) = quantifier_elements(right) {
         let scale = scale_of(left, schema, options).filter(|s| *s > 0);
         let translated_left = left.translate_with_warnings(schema, options, emit)?;
         return Ok(Expr::In {
@@ -2121,10 +2153,14 @@ fn translate_any_all_to_in(
     } else {
         (BinaryOperator::Eq, Quantifier::Any)
     };
+    let translated_right = match translated_right {
+        Some(translated) => translated,
+        None => right.translate_with_warnings(schema, options, emit)?,
+    };
     translate_quantified_over_array(
         &translated_left,
         &compare_op,
-        right.translate_with_warnings(schema, options, emit)?,
+        translated_right,
         quantifier,
         options,
     )

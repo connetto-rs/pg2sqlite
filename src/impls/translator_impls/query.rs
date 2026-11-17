@@ -41,7 +41,8 @@ impl crate::traits::translator::TranslatorWithContext for Query {
         emit: &mut dyn FnMut(crate::warnings::TranslationWarning),
     ) -> Result<Self::SQLiteEntry, crate::errors::Error> {
         let merged = merge_parenthesized_body(self)?;
-        let query: &Query = &super::cte::preserve_bindings(&merged);
+        let distributed = super::lateral::distribute_laterals(&merged, schema, options);
+        let query: &Query = &super::cte::preserve_bindings(&distributed);
         // Everything below reads column types through the relations this query
         // exposes rather than through every table of that name in the schema,
         // so the scope is attached before any expression is translated. A

@@ -223,7 +223,7 @@ pub(crate) fn run_as_owner(
 /// The backing table `owner` reads and writes in place of `name`, `None` when
 /// `name` is not a table with one. The owner reads past the acting role's
 /// grants, and past row-level security where the policies exempt it.
-fn backing_name(
+pub(crate) fn backing_name(
     function: &CreateFunction,
     owner: &Role,
     name: &ObjectName,
@@ -238,7 +238,7 @@ fn backing_name(
     }
     if table.has_row_level_security(schema)? && !exempts(table, owner, schema) {
         return Err(Error::forward_refusal(format!(
-            "trigger function '{}' is SECURITY DEFINER and reads or writes table '{}' as its \
+            "function '{}' is SECURITY DEFINER and reads or writes table '{}' as its \
              owner '{}', whom the table's row-level security policies bind. The translation \
              cannot apply another role's policies, only the caller's or none. Make the owner \
              the table's owner or a BYPASSRLS role, or declare the function SECURITY INVOKER.",

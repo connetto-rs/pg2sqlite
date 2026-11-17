@@ -283,6 +283,23 @@ pub struct TranslationContext<'a> {
     /// DEFINER` trigger function, which PostgreSQL checks a call's privileges
     /// against in place of the acting role.
     running_as: Option<&'a Role>,
+    /// The innermost `LANGUAGE sql` function whose body is being translated
+    /// in place of a call, linked to the ones enclosing it.
+    inlined_body: Option<&'a InlinedBody<'a>>,
+}
+
+/// A `LANGUAGE sql` function whose body is being translated in place of a
+/// call, linked to the function whose body holds that call, if any.
+pub(crate) struct InlinedBody<'a> {
+    pub(crate) function: &'a sqlparser::ast::CreateFunction,
+    pub(crate) outer: Option<&'a InlinedBody<'a>>,
+}
+
+impl InlinedBody<'_> {
+    /// The functions being translated in place of a call, innermost first.
+    pub(crate) fn chain(&self) -> impl Iterator<Item = &sqlparser::ast::CreateFunction> {
+        core::iter::successors(Some(self), |body| body.outer).map(|body| body.function)
+    }
 }
 
 /// The fields a derived [`TranslationContext`] copies from an existing one,
@@ -297,6 +314,7 @@ struct ContextFields<'a> {
     rebound_body: Option<&'a sqlparser::ast::BeginEndStatements>,
     written_schema: Option<&'a ParserDB>,
     running_as: Option<&'a Role>,
+    inlined_body: Option<&'a InlinedBody<'a>>,
 }
 
 impl<'a> ContextFields<'a> {
@@ -311,6 +329,7 @@ impl<'a> ContextFields<'a> {
             rebound_body: context.rebound_body,
             written_schema: context.written_schema,
             running_as: context.running_as,
+            inlined_body: context.inlined_body,
         }
     }
 
@@ -333,6 +352,7 @@ impl<'a> ContextFields<'a> {
             rebound_body: self.rebound_body,
             written_schema: self.written_schema,
             running_as: self.running_as,
+            inlined_body: self.inlined_body,
         }
     }
 }
@@ -354,6 +374,7 @@ impl<'a> TranslationContext<'a> {
             rebound_body: None,
             written_schema: None,
             running_as: None,
+            inlined_body: None,
         }
     }
     pub(crate) fn with_complete_schema(options: &'a Pg2SqliteOptions) -> Self {
@@ -376,6 +397,7 @@ impl<'a> TranslationContext<'a> {
             rebound_body: None,
             written_schema: None,
             running_as: None,
+            inlined_body: None,
         }
     }
 
@@ -509,6 +531,27 @@ impl<'a> TranslationContext<'a> {
         self.running_as
     }
 
+    /// The same context translating `body` in place of a call, running as
+    /// `running_as` when that is set.
+    pub(crate) fn with_inlined_body<'s>(
+        &'s self,
+        body: &'s InlinedBody<'s>,
+        running_as: Option<&'s Role>,
+    ) -> TranslationContext<'s> {
+        let mut fields = ContextFields::borrowed(self);
+        fields.inlined_body = Some(body);
+        if running_as.is_some() {
+            fields.running_as = running_as;
+        }
+        fields.into_context(self.scope, self.outer)
+    }
+
+    /// The innermost function whose body is being translated in place of a
+    /// call.
+    pub(crate) const fn inlined_body(&self) -> Option<&InlinedBody<'_>> {
+        self.inlined_body
+    }
+
     /// Restricts expression translation to a position that forbids subqueries.
     pub(crate) fn without_subqueries(&self) -> TranslationContext<'_> {
         let mut fields = ContextFields::borrowed(self);
@@ -537,6 +580,14 @@ impl<'a> TranslationContext<'a> {
     pub(crate) fn cte_clause(&self) -> Option<&sqlparser::ast::With> {
         self.with
     }
+
+    /// The `WITH` clauses of this context and the ones it was derived from,
+    /// innermost first.
+    pub(crate) fn cte_clauses(&self) -> impl Iterator<Item = &sqlparser::ast::With> {
+        core::iter::successors(Some(self), |context| context.outer)
+            .filter_map(|context| context.with)
+    }
+
     /// The scopes a reference may resolve against, innermost first.
     ///
     /// A bare name that reads the whole row of a one-column set-returning

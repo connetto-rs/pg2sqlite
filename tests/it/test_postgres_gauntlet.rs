@@ -31,6 +31,12 @@ mod parity_definer_helpers;
 #[path = "gauntlet/parity_helper_conditions.rs"]
 mod parity_helper_conditions;
 
+#[path = "gauntlet/parity_lateral.rs"]
+mod parity_lateral;
+
+#[path = "gauntlet/parity_boolean_helpers.rs"]
+mod parity_boolean_helpers;
+
 #[path = "gauntlet/parity_plpgsql.rs"]
 mod parity_plpgsql;
 #[path = "gauntlet/parity_scalar_helpers.rs"]

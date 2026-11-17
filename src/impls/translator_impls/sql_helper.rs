@@ -24,16 +24,16 @@ use sql_traits::{
         ColumnDefinition, ExpressionContext, ExpressionScope, FunctionKind, IdentifierCase,
         ParserDB, TargetName, UnqualifiedName,
     },
-    traits::{DatabaseLike, FunctionLike, SchemaLike},
+    traits::{ColumnLike, DatabaseLike, FunctionLike, RoleLike, SchemaLike, TableLike},
 };
 use sqlparser::{
     ast::{
-        ArgMode, BinaryOperator, CaseWhen, CastKind, CreateFunction, DataType, Expr, Function,
+        ArgMode, BinaryOperator, CaseWhen, CastKind, CreateFunction, Cte, DataType, Expr, Function,
         FunctionArg, FunctionArgExpr, FunctionArguments, FunctionBehavior, FunctionCalledOnNull,
         FunctionReturnType, FunctionSecurity, GroupByExpr, Ident, ObjectName, ObjectNamePart,
-        Query, SelectItem, SetExpr, Statement, Value, Visit, VisitMut,
-        helpers::attached_token::AttachedToken, visit_expressions, visit_expressions_mut,
-        visit_relations,
+        Query, SelectItem, SetExpr, Statement, TableAlias, TableFactor, TableWithJoins, Value,
+        Visit, VisitMut, Visitor, With, helpers::attached_token::AttachedToken, visit_expressions,
+        visit_expressions_mut, visit_relations, visit_relations_mut,
     },
     dialect::PostgreSqlDialect,
     parser::Parser,
@@ -45,11 +45,18 @@ use crate::{
     errors::Error,
     impls::{
         bind_once::is_atomic,
+        object_name::resolve_translation_table,
+        privileges::{RoleTable, names_table_with_backing},
+        query_builder::{
+            from_relation, make_query, make_simple_select, plain_table_factor, single_expr_query,
+        },
         replay::is_replayable,
         session_variable::{self, SessionRead},
+        translator_impls::definer::backing_name,
     },
-    options::TranslationContext,
-    traits::schema::function_lookup_target,
+    options::{InlinedBody, TranslationContext},
+    traits::{TranslatorWithContext, schema::function_lookup_target},
+    warnings::WarningSink,
 };
 
 type Role = <ParserDB as DatabaseLike>::Role;
@@ -108,10 +115,25 @@ fn pg_catalog_holds(schema: &ParserDB, target: &TargetName<'_>) -> bool {
     }
 }
 
-/// The PostgreSQL expression `call` stands for, when it calls a `LANGUAGE
-/// sql` function the schema declares: the function's body with the call's
-/// arguments bound, its calls to other declared functions expanded the same
-/// way. The caller translates it where the call stood.
+/// What a call to a `LANGUAGE sql` function the schema declares is written
+/// as.
+pub(crate) enum Inlined {
+    /// The PostgreSQL expression the call stands for, which the caller
+    /// translates where the call stood.
+    Postgres(Expr),
+    /// The SQLite expression the call translates to, a body reading relations
+    /// already translated as the role it runs as.
+    Sqlite(Expr),
+}
+
+/// What `call` is written as, when it calls a `LANGUAGE sql` function the
+/// schema declares: the function's body with the call's arguments bound, its
+/// calls to other declared functions expanded the same way.
+///
+/// A body reading no relation answers [`Inlined::Postgres`]. A body reading
+/// relations answers [`Inlined::Sqlite`], translated here because its
+/// relations translate to the backing tables its owner reads, which the
+/// schema does not declare.
 ///
 /// `None` leaves the call to the ordinary translation: a name
 /// [`declared_helper`] answers no function for, and a function written in
@@ -126,12 +148,18 @@ pub(crate) fn inlined_call<'s>(
     call: &Function,
     schema: &'s ParserDB,
     options: &TranslationContext<'s>,
-) -> Result<Option<Expr>, Error> {
+    emit: WarningSink<'_>,
+) -> Result<Option<Inlined>, Error> {
     let helper = declared_helper(&call.name, schema, options)?;
     let Some(helper) = helper.filter(|helper| written_in_sql(helper)) else { return Ok(None) };
     let caller = calling_role(schema, options)?;
     let mut inliner = Inliner { schema, options, expanding: Vec::new(), keep_sets: false };
-    inliner.call(call, helper, caller).map(Some)
+    match inliner.call(call, helper, caller)? {
+        Expansion::Expression(expression) => Ok(Some(Inlined::Postgres(expression))),
+        Expansion::Rows(rows) => {
+            rows.translate(schema, options, emit).map(Inlined::Sqlite).map(Some)
+        }
+    }
 }
 
 /// Whether `function`'s body is SQL, the one language whose body has an
@@ -179,20 +207,36 @@ struct Inliner<'s, 'o> {
     schema: &'s ParserDB,
     options: &'o TranslationContext<'s>,
     expanding: Vec<&'s CreateFunction>,
-    /// Leaves a call to a function returning a set as written.
+    /// Leaves a call to a function returning a set as written, and writes a
+    /// body reading relations as the PostgreSQL query it runs.
     keep_sets: bool,
 }
 
+/// What a call expands to.
+enum Expansion<'s> {
+    /// The expression a body reading no relation computes.
+    Expression(Expr),
+    /// A body reading relations, translated by [`RowsCall::translate`].
+    Rows(RowsCall<'s>),
+}
+
 impl<'s> Inliner<'s, '_> {
-    /// `call` to `helper`, made as `caller`, as the expression it stands for.
+    /// `call` to `helper`, made as `caller`, as what it expands to.
     fn call(
         &mut self,
         call: &Function,
         helper: &'s CreateFunction,
         caller: Option<&'s Role>,
-    ) -> Result<Expr, Error> {
+    ) -> Result<Expansion<'s>, Error> {
         let name = &call.name;
-        if self.expanding.iter().any(|seen| core::ptr::eq(*seen, helper)) {
+        let translating = self.options.inlined_body().map(InlinedBody::chain);
+        if self
+            .expanding
+            .iter()
+            .copied()
+            .chain(translating.into_iter().flatten())
+            .any(|seen| core::ptr::eq(seen, helper))
+        {
             return Err(refusal(name, "calls itself, directly or through other functions"));
         }
         if call.over.is_some()
@@ -225,17 +269,24 @@ impl<'s> Inliner<'s, '_> {
             self.expand(&mut argument.written, caller)?;
             argument.value = parameter_value(&argument.written, argument.data_type);
         }
-        let mut body = body_expression(name, helper, self.schema)?.into_owned();
+        let mut body = match body_shape(name, helper, self.schema)? {
+            BodyShape::Expression(body) => body.into_owned(),
+            BodyShape::Rows(query) => {
+                return self
+                    .rows(name, helper, caller, &arguments, query, returned)
+                    .map(Expansion::Rows);
+            }
+        };
         check_session_reads(
             name,
-            self.expanding.iter().copied().chain([helper]),
+            self.enclosing(helper),
             self.options.running_as().map(sql_traits::traits::RoleLike::name),
             &body,
         )?;
         check_groups_no_rows(name, &body, self.schema)?;
         self.check_immutable(helper, &body)?;
         self.qualify_calls(name, helper, &mut body)?;
-        body = arguments.null_on_null(helper, body);
+        body = arguments.null_on_null(helper, body, Bound::reference);
         body = cast_to(body, returned);
         let parameters = Parameters::of_expression(&body, helper, self.schema, arguments.len())?;
         parameters.check_references(name, &body)?;
@@ -253,7 +304,17 @@ impl<'s> Inliner<'s, '_> {
         expanded?;
         // `cast_to` left the body a `CAST(... AS ...)`, one operand of
         // whatever surrounds the call.
-        Ok(body)
+        Ok(Expansion::Expression(body))
+    }
+
+    /// The functions whose bodies a call to `helper` is expanded into, and
+    /// `helper` itself.
+    fn enclosing<'e>(
+        &'e self,
+        helper: &'e CreateFunction,
+    ) -> impl Iterator<Item = &'e CreateFunction> {
+        let translating = self.options.inlined_body().map(InlinedBody::chain);
+        translating.into_iter().flatten().chain(self.expanding.iter().copied()).chain([helper])
     }
 
     /// Refuses a body reading the session where it is, or is expanded into,
@@ -261,15 +322,12 @@ impl<'s> Inliner<'s, '_> {
     /// to the value it has when a statement is planned and keep it while the
     /// session changes. The arguments bound later are the caller's and stay
     /// out of the test.
-    fn check_immutable(&self, helper: &CreateFunction, body: &Expr) -> Result<(), Error> {
+    fn check_immutable<N: Visit>(&self, helper: &CreateFunction, body: &N) -> Result<(), Error> {
         if session_reads(body).is_empty() {
             return Ok(());
         }
         let immutable = self
-            .expanding
-            .iter()
-            .copied()
-            .chain([helper])
+            .enclosing(helper)
             .find(|function| function.volatility() == FunctionBehavior::Immutable);
         match immutable {
             Some(immutable) => {
@@ -281,6 +339,155 @@ impl<'s> Inliner<'s, '_> {
                 ))
             }
             None => Ok(()),
+        }
+    }
+
+    /// `call` to `helper`, whose body `query` reads relations, made as
+    /// `caller` with `arguments`, as the query that answers it.
+    ///
+    /// The arguments are evaluated once, in the caller's scope, as the one
+    /// row of a `WITH` query the body reads its parameters from, so a name in
+    /// an argument never resolves to a relation of the body.
+    fn rows(
+        &self,
+        name: &ObjectName,
+        helper: &'s CreateFunction,
+        caller: Option<&'s Role>,
+        arguments: &Arguments<'s>,
+        query: Box<Query>,
+        returned: &DataType,
+    ) -> Result<RowsCall<'s>, Error> {
+        if !self.options.allows_subqueries() {
+            return Err(refusal(
+                name,
+                "reads relations and is called where SQLite takes no subquery to read them",
+            ));
+        }
+        let mut statement = Statement::Query(query);
+        check_session_reads(
+            name,
+            self.enclosing(helper),
+            self.options.running_as().map(sql_traits::traits::RoleLike::name),
+            &statement,
+        )?;
+        self.check_immutable(helper, &statement)?;
+        self.qualify_calls(name, helper, &mut statement)?;
+        if let Some(bound) = arguments.bound.iter().find(|bound| {
+            !is_atomic(&bound.written) && !is_replayable(&bound.written, self.options)
+        }) {
+            return Err(refusal(
+                name,
+                &format!(
+                    "reads relations and is passed {}, which may answer differently on each \
+                     evaluation where PostgreSQL evaluates it once. Pass a column or a literal",
+                    bound.written
+                ),
+            ));
+        }
+        let owner = match helper.security_mode() {
+            FunctionSecurity::Definer => Some(self.owner(name, helper)?),
+            FunctionSecurity::Invoker => None,
+        };
+        let reader = owner.or(caller);
+        if let Some(reader) = reader {
+            let acting = session_variable::acting_role(self.schema, self.options)?;
+            check_reads_relations(name, &statement, reader, acting, self.schema)?;
+        }
+        let depth = self.expanding.len()
+            + self.options.inlined_body().map_or(0, |body| body.chain().count());
+        let relation = Ident::new(format!("{ARGUMENTS}_{depth}"));
+        let parameters = {
+            let scope = ExpressionScope::FunctionBody(helper);
+            let context = ExpressionContext::for_statement(
+                &statement,
+                &scope,
+                self.schema,
+                IdentifierCase::AsWritten,
+            )?;
+            Parameters::resolve(&statement, arguments.len(), |expr| {
+                // A relation's column copying a parameter, recursively too,
+                // reaches a FROM item.
+                Ok(match (context.reference(expr)?, reader) {
+                    (Some((ColumnDefinition::Parameter { function, ordinal }, binding)), _)
+                        if core::ptr::eq(function, helper) && binding.entry().is_none() =>
+                    {
+                        Some(ordinal)
+                    }
+                    (Some((ColumnDefinition::Base { table, column, .. }, _)), Some(reader))
+                        if !table.privileges(reader, self.schema)?.select.on_column(column) =>
+                    {
+                        return Err(refusal(
+                            name,
+                            &format!(
+                                "reads {}.{} as {}, which lacks SELECT on it, so PostgreSQL \
+                                 raises where its translation would answer",
+                                table.table_name(),
+                                column.column_name(),
+                                reader.name()
+                            ),
+                        ));
+                    }
+                    _ => None,
+                })
+            })?
+        };
+        let _: ControlFlow<()> = visit_expressions_mut(&mut statement, |expr| {
+            if let Some(position) = parameters.position(expr) {
+                *expr = argument_column(&relation, position);
+            }
+            ControlFlow::Continue(())
+        });
+        let Statement::Query(query) = statement else { unreachable!("the body stays one query") };
+        let projection = arguments.null_on_null(helper, Expr::Subquery(query), |position, _| {
+            argument_column(&relation, position)
+        });
+        Ok(RowsCall {
+            helper,
+            owner,
+            relation,
+            arguments: arguments
+                .bound
+                .iter()
+                .map(|bound| (bound.value.clone(), bound.data_type.clone()))
+                .collect(),
+            projection: cast_to(projection, returned),
+        })
+    }
+
+    /// What a call nested in the expression being expanded is written as,
+    /// once `expansion` expanded it, `None` leaving it as written.
+    ///
+    /// A body reading relations is the PostgreSQL query it runs where the
+    /// expression is only checked. Where the expression is translated, the
+    /// call stays as written for the translation to reach, which translates
+    /// it as the role translating the expression, so a call in the body of a
+    /// `SECURITY DEFINER` function, which runs as another role, is refused.
+    fn place(&self, name: &ObjectName, expansion: Expansion<'s>) -> Result<Option<Expr>, Error> {
+        match expansion {
+            Expansion::Expression(expanded) => Ok(Some(expanded)),
+            Expansion::Rows(rows) if self.keep_sets => {
+                Ok(Some(Expr::Subquery(Box::new(rows.into_query(false)))))
+            }
+            Expansion::Rows(_) => {
+                match self
+                    .expanding
+                    .iter()
+                    .find(|function| function.security_mode() == FunctionSecurity::Definer)
+                {
+                    Some(definer) => {
+                        Err(refusal(
+                            name,
+                            &format!(
+                                "reads relations and is called in the body of {}, which reads \
+                                 none and runs as its owner, and only a call translated as the \
+                                 role translating the caller reads relations",
+                                definer.name
+                            ),
+                        ))
+                    }
+                    None => Ok(None),
+                }
+            }
         }
     }
 
@@ -298,7 +505,10 @@ impl<'s> Inliner<'s, '_> {
                         {
                             Ok(None)
                         }
-                        Some(helper) => self.call(call, helper, role).map(Some),
+                        Some(helper) => {
+                            self.call(call, helper, role)
+                                .and_then(|expansion| self.place(&call.name, expansion))
+                        }
                         None => Ok(None),
                     }
                 });
@@ -368,11 +578,11 @@ impl<'s> Inliner<'s, '_> {
     /// `search_path` resolves to a declared function, so that expanding it
     /// reaches what PostgreSQL reaches. A call resolving to a builtin, or to
     /// nothing the schema holds, stays as written.
-    fn qualify_calls(
+    fn qualify_calls<N: VisitMut>(
         &self,
         name: &ObjectName,
         helper: &CreateFunction,
-        body: &mut Expr,
+        body: &mut N,
     ) -> Result<(), Error> {
         let reached = helper.unqualified_names(self.schema)?;
         let case = IdentifierCase::AsWritten;
@@ -424,22 +634,334 @@ impl<'s> Inliner<'s, '_> {
     }
 }
 
-/// The one expression `helper`'s body computes, what `SELECT <expression>`
-/// or `RETURN <expression>` selects.
+/// The prefix of the `WITH` query holding the arguments of a call to a body
+/// reading relations, suffixed by how deeply the call is nested in others.
+const ARGUMENTS: &str = "pg2sqlite_arguments";
+
+/// The column of `relation` holding the argument at `position`.
+fn argument_column(relation: &Ident, position: usize) -> Expr {
+    Expr::CompoundIdentifier(vec![
+        relation.clone(),
+        Ident::new(format!("argument_{}", position + 1)),
+    ])
+}
+
+/// A call to a function whose body reads relations, bound to its
+/// arguments.
+struct RowsCall<'s> {
+    helper: &'s CreateFunction,
+    /// The role a `SECURITY DEFINER` body runs as.
+    owner: Option<&'s Role>,
+    /// The `WITH` query holding the arguments.
+    relation: Ident,
+    /// Each argument as its parameter's type, with that type.
+    arguments: Vec<(Expr, DataType)>,
+    /// The body as the declared return type, reading each parameter from
+    /// `relation`.
+    projection: Expr,
+}
+
+impl RowsCall<'_> {
+    /// `WITH <relation> AS (SELECT <arguments>) SELECT <projection> FROM
+    /// <relation>`, each argument `NULL` of its type when `placeholder`.
+    fn into_query(self, placeholder: bool) -> Query {
+        if self.arguments.is_empty() {
+            return single_expr_query(self.projection, Vec::new(), None);
+        }
+        let arguments = self.arguments(placeholder);
+        let from = from_relation(plain_table_factor(ObjectName::from(vec![self.relation.clone()])));
+        let mut query = single_expr_query(self.projection, from, None);
+        query.with = Some(With {
+            with_token: AttachedToken::empty(),
+            recursive: false,
+            cte_tables: vec![Cte {
+                alias: TableAlias {
+                    explicit: false,
+                    name: self.relation,
+                    columns: Vec::new(),
+                    at: None,
+                },
+                query: Box::new(arguments),
+                from: None,
+                materialized: None,
+                closing_paren_token: AttachedToken::empty(),
+            }],
+        });
+        query
+    }
+
+    /// The one row of arguments, each `NULL` of its type when `placeholder`.
+    fn arguments(&self, placeholder: bool) -> Query {
+        let projection = self
+            .arguments
+            .iter()
+            .enumerate()
+            .map(|(position, (value, data_type))| {
+                SelectItem::ExprWithAlias {
+                    expr: if placeholder {
+                        Expr::Cast {
+                            kind: CastKind::Cast,
+                            expr: Box::new(Expr::Value(Value::Null.into())),
+                            data_type: data_type.clone(),
+                            format: None,
+                        }
+                    } else {
+                        value.clone()
+                    },
+                    alias: Ident::new(format!("argument_{}", position + 1)),
+                }
+            })
+            .collect();
+        make_query(
+            None,
+            SetExpr::Select(Box::new(make_simple_select(projection, Vec::new(), None))),
+        )
+    }
+
+    /// The SQLite scalar subquery answering the call where `options` reaches
+    /// it.
+    ///
+    /// The body translates as the role it runs as, a `SECURITY DEFINER` one
+    /// reading the backing table of each table it names, and the arguments
+    /// translate where the call stands.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a body or arguments that do not translate, and a definer body
+    /// naming a table whose policies bind its owner.
+    fn translate(
+        self,
+        schema: &ParserDB,
+        options: &TranslationContext<'_>,
+        emit: WarningSink<'_>,
+    ) -> Result<Expr, Error> {
+        let RowsCall { helper, owner, .. } = self;
+        let relation = self.relation.clone();
+        // Built before the body moves into its query.
+        let arguments = (!self.arguments.is_empty()).then(|| self.arguments(false));
+        let frame = InlinedBody { function: helper, outer: options.inlined_body() };
+        let body_options = options.with_inlined_body(&frame, owner);
+        let mut translated =
+            self.into_query(true).translate_with_warnings(schema, &body_options, emit)?;
+        let with = translated.with.take();
+        if let Some(owner) = owner {
+            read_backing_tables(helper, &mut translated, owner, schema, &body_options)?;
+        }
+        if let (Some(mut with), Some(arguments)) = (with, arguments) {
+            let arguments = arguments.translate_with_warnings(schema, options, emit)?;
+            let cte =
+                with.cte_tables.iter_mut().find(|cte| cte.alias.name == relation).ok_or_else(
+                    || refusal(&helper.name, "has arguments its translation lost track of"),
+                )?;
+            *cte.query = arguments;
+            translated.with = Some(with);
+        }
+        Ok(Expr::Subquery(Box::new(translated)))
+    }
+}
+
+/// Points each table `translated` names at the backing table `owner` reads
+/// in place of it, as the body of `helper`.
+///
+/// # Errors
+///
+/// Refuses a table whose policies bind `owner`, and a `WITH` query sharing
+/// its name with a table that has a backing table, since the two could not
+/// be told apart.
+fn read_backing_tables(
+    helper: &CreateFunction,
+    translated: &mut Query,
+    owner: &Role,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<(), Error> {
+    /// Collects the name of every `WITH` query.
+    struct WithNames(Vec<Ident>);
+    impl sqlparser::ast::Visitor for WithNames {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+            if let Some(with) = &query.with {
+                self.0.extend(with.cte_tables.iter().map(|cte| cte.alias.name.clone()));
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut named = WithNames(Vec::new());
+    let _: ControlFlow<()> = Visit::visit(&*translated, &mut named);
+    let WithNames(named) = named;
+    for name in named {
+        if names_table_with_backing(schema, &ObjectName::from(vec![name.clone()]), options)? {
+            return Err(refusal(
+                &helper.name,
+                &format!(
+                    "names a WITH query {name} after a table with row-level security, which its \
+                     translation could not tell apart from the table"
+                ),
+            ));
+        }
+    }
+    let flow = visit_relations_mut(translated, |relation| {
+        match backing_name(helper, owner, relation, schema, options) {
+            Ok(Some(backing)) => {
+                *relation = backing;
+                ControlFlow::Continue(())
+            }
+            Ok(None) => ControlFlow::Continue(()),
+            Err(error) => ControlFlow::Break(error),
+        }
+    });
+    match flow {
+        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Break(error) => Err(error),
+    }
+}
+
+/// Refuses a body reading a table on which `reader` holds no `SELECT` on any
+/// column, which PostgreSQL requires of every table a query reads, or not on
+/// every column where a `*` reads them all, and one on which the `acting`
+/// role holds no privilege, which the translation leaves out of the replica.
+fn check_reads_relations(
+    name: &ObjectName,
+    statement: &Statement,
+    reader: &Role,
+    acting: Option<&Role>,
+    schema: &ParserDB,
+) -> Result<(), Error> {
+    let starred = wildcard_relations(statement);
+    let check = |relation: &ObjectName| -> Result<(), Error> {
+        let Some(table) = resolve_translation_table(schema, relation)? else { return Ok(()) };
+        let held = table.privileges(reader, schema)?;
+        let lacking = if starred.contains(relation) {
+            !table.columns(schema)?.all(|column| held.select.on_column(column))
+        } else {
+            !held.select.on_any_column()
+        };
+        if lacking {
+            return Err(refusal(
+                name,
+                &format!(
+                    "reads {relation} as {}, which lacks SELECT on it, so PostgreSQL raises \
+                     where its translation would answer",
+                    reader.name()
+                ),
+            ));
+        }
+        if let Some(acting) = acting
+            && !RoleTable::of(table, Some(acting), schema)?.reads_any()
+        {
+            return Err(refusal(
+                name,
+                &format!(
+                    "reads {relation}, on which {} holds no privilege, so the translation leaves \
+                     it out of the replica. Grant {} SELECT on it, under a policy hiding its rows \
+                     if they are not the role's to read",
+                    acting.name(),
+                    acting.name()
+                ),
+            ));
+        }
+        Ok(())
+    };
+    let flow = visit_relations(statement, |relation| {
+        match check(relation) {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(error) => ControlFlow::Break(error),
+        }
+    });
+    match flow {
+        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Break(error) => Err(error),
+    }
+}
+
+/// The relations a select in `statement` reads every column of through a
+/// `*` or a `<relation>.*`, as written there.
+fn wildcard_relations(statement: &Statement) -> Vec<ObjectName> {
+    struct Wildcards(Vec<ObjectName>);
+    impl Visitor for Wildcards {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+            let mut bodies = vec![query.body.as_ref()];
+            while let Some(body) = bodies.pop() {
+                match body {
+                    SetExpr::Select(select)
+                        if select.projection.iter().any(|item| {
+                            matches!(
+                                item,
+                                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
+                            )
+                        }) =>
+                    {
+                        let mut tables: Vec<&TableWithJoins> = select.from.iter().collect();
+                        while let Some(table) = tables.pop() {
+                            for factor in core::iter::once(&table.relation)
+                                .chain(table.joins.iter().map(|join| &join.relation))
+                            {
+                                match factor {
+                                    TableFactor::Table { name, .. } => self.0.push(name.clone()),
+                                    TableFactor::NestedJoin { table_with_joins, .. } => {
+                                        tables.push(table_with_joins);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    SetExpr::SetOperation { left, right, .. } => {
+                        bodies.push(left);
+                        bodies.push(right);
+                    }
+                    _ => {}
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut wildcards = Wildcards(Vec::new());
+    let _: ControlFlow<()> = statement.visit(&mut wildcards);
+    wildcards.0
+}
+
+/// What a function's body is, as far as writing it in place of a call goes.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "returned once per call and taken apart at once, so boxing the expression would \
+              only add an allocation"
+)]
+pub(crate) enum BodyShape<'f> {
+    /// One expression that names no relation, what `SELECT <expression>` or
+    /// `RETURN <expression>` computes.
+    Expression(Cow<'f, Expr>),
+    /// A body naming a relation anywhere, subqueries included, as the query
+    /// it runs.
+    Rows(Box<Query>),
+}
+
+/// The shape of `helper`'s body.
 ///
 /// # Errors
 ///
 /// Refuses a body that is neither one query nor `RETURN <expression>`, a
-/// body naming a relation anywhere, subqueries included, a query selecting
-/// other than one expression from one row, and a body that does not parse.
-fn body_expression<'f>(
+/// query that names no relation yet selects more than one expression from
+/// one row, and a body that does not parse.
+pub(crate) fn body_shape<'f>(
     name: &ObjectName,
     helper: &'f CreateFunction,
     schema: &ParserDB,
-) -> Result<Cow<'f, Expr>, Error> {
+) -> Result<BodyShape<'f>, Error> {
     if let Some(expression) = helper.body_expression(schema)? {
-        refuse_relation(name, expression.as_ref())?;
-        return Ok(expression);
+        if names_relation(expression.as_ref()) {
+            let select = make_simple_select(
+                vec![SelectItem::UnnamedExpr(expression.into_owned())],
+                Vec::new(),
+                None,
+            );
+            let query = make_query(None, SetExpr::Select(Box::new(select)));
+            return Ok(BodyShape::Rows(Box::new(query)));
+        }
+        return Ok(BodyShape::Expression(expression));
     }
     let statements = if let Some(statements) = helper.atomic_statements(schema)? {
         statements.into_owned()
@@ -454,27 +976,17 @@ fn body_expression<'f>(
     let (Some(Statement::Query(query)), None) = (statements.next(), statements.next()) else {
         return Err(refusal(name, "has a body of other than one query"));
     };
-    refuse_relation(name, query.as_ref())?;
+    if names_relation(query.as_ref()) {
+        return Ok(BodyShape::Rows(query));
+    }
     single_expression(*query)
-        .map(Cow::Owned)
+        .map(|expression| BodyShape::Expression(Cow::Owned(expression)))
         .ok_or_else(|| refusal(name, "has a body that is not one SELECT of one expression"))
 }
 
-/// Refuses `node` when it names a table, a view or any other relation, which
-/// the body would read rows of where the call stood.
-fn refuse_relation<N: Visit>(name: &ObjectName, node: &N) -> Result<(), Error> {
-    match visit_relations(node, |relation| ControlFlow::Break(relation.to_string())) {
-        ControlFlow::Break(read) => {
-            Err(refusal(
-                name,
-                &format!(
-                    "reads {read}, and only a body reading no relation, one SELECT of one \
-                     expression, translates in place of the call"
-                ),
-            ))
-        }
-        ControlFlow::Continue(()) => Ok(()),
-    }
+/// Whether `node` names a table, a view or any other relation.
+fn names_relation<N: sqlparser::ast::Visit>(node: &N) -> bool {
+    visit_relations(node, |_| ControlFlow::Break(())).is_break()
 }
 
 /// The expression `query` selects, when it is `SELECT <expression>` over no
@@ -653,7 +1165,7 @@ fn plain_cast_type(expr: &Expr) -> Option<&DataType> {
 }
 
 /// What `body` reads of the session.
-fn session_reads(body: &Expr) -> Vec<SessionRead> {
+fn session_reads<N: Visit>(body: &N) -> Vec<SessionRead> {
     let mut reads = Vec::new();
     let _: ControlFlow<()> = visit_expressions(body, |expr| {
         if let Some(read) = session_variable::session_read(expr) {
@@ -669,11 +1181,11 @@ fn session_reads(body: &Expr) -> Vec<SessionRead> {
 /// whose body it is expanded into, sets for its own duration, and the role
 /// when one of them is `SECURITY DEFINER` or sets the role, or when the call
 /// sits in a body running as `running_as`.
-fn check_session_reads<'f>(
+fn check_session_reads<'f, N: Visit>(
     name: &ObjectName,
     enclosing: impl Iterator<Item = &'f CreateFunction>,
     running_as: Option<&str>,
-    body: &Expr,
+    body: &N,
 ) -> Result<(), Error> {
     let reads = session_reads(body);
     if reads.is_empty() {
@@ -735,6 +1247,17 @@ struct Bound<'f> {
     written: Expr,
     /// The argument as the parameter's type, which the body reads.
     value: Expr,
+}
+
+impl Bound<'_> {
+    /// The reference a body reading no relation makes to the parameter at
+    /// `position`, its name or `$n`.
+    fn reference(position: usize, bound: &Self) -> Expr {
+        match bound.name {
+            Some(name) => Expr::Identifier(name.clone()),
+            None => Expr::Value(Value::Placeholder(format!("${}", position + 1)).into()),
+        }
+    }
 }
 
 /// `written` as a parameter of type `data_type` receives it.
@@ -830,21 +1353,25 @@ impl<'f> Arguments<'f> {
     }
 
     /// `body` answering NULL whenever an argument is NULL, as a `STRICT`
-    /// function does without running its body.
-    fn null_on_null(&self, helper: &CreateFunction, body: Expr) -> Expr {
+    /// function does without running its body, `reference` writing how the
+    /// body reads the parameter at a position.
+    fn null_on_null(
+        &self,
+        helper: &CreateFunction,
+        body: Expr,
+        reference: impl Fn(usize, &Bound<'f>) -> Expr,
+    ) -> Expr {
         if !matches!(
             helper.null_input_behavior(),
             FunctionCalledOnNull::Strict | FunctionCalledOnNull::ReturnsNullOnNullInput
         ) {
             return body;
         }
-        let tested = self.bound.iter().enumerate().map(|(position, bound)| {
-            let reference = match bound.name {
-                Some(name) => Expr::Identifier(name.clone()),
-                None => Expr::Value(Value::Placeholder(format!("${}", position + 1)).into()),
-            };
-            Expr::IsNull(Box::new(reference))
-        });
+        let tested = self
+            .bound
+            .iter()
+            .enumerate()
+            .map(|(position, bound)| Expr::IsNull(Box::new(reference(position, bound))));
         let Some(any_null) = tested.reduce(|left, right| {
             Expr::BinaryOp { left: Box::new(left), op: BinaryOperator::Or, right: Box::new(right) }
         }) else {

@@ -94,19 +94,6 @@ fn an_unqualified_call_resolves_under_the_functions_search_path() {
 }
 
 #[test]
-fn a_function_whose_body_reads_a_table_is_refused_naming_it() {
-    let error = refusal(
-        "CREATE TABLE owners (id UUID);
-         GRANT SELECT ON owners TO app;
-         CREATE FUNCTION authz.first_owner() RETURNS UUID LANGUAGE sql STABLE
-           AS $$ SELECT id FROM public.owners LIMIT 1 $$;",
-        "owner_id = authz.first_owner()",
-    );
-    assert!(error.contains("authz.first_owner()"), "{error}");
-    assert!(error.contains("reads public.owners"), "{error}");
-}
-
-#[test]
 fn a_volatile_function_is_refused() {
     let error = refusal(
         "CREATE FUNCTION authz.drawn() RETURNS UUID LANGUAGE sql VOLATILE
@@ -421,17 +408,21 @@ fn standard_sql_bodies_expand() {
     }
 }
 
+/// A returned expression reading a table translates as that read, against
+/// the table the replica holds.
 #[test]
-fn a_returned_expression_reading_a_table_is_refused() {
-    assert_refused(
-        "CREATE TABLE owners (id UUID);
+fn a_returned_expression_reading_a_table_reads_it_in_place() {
+    let extra = "CREATE TABLE owners (id UUID);
          GRANT SELECT ON owners TO app;
          CREATE FUNCTION authz.first_owner() RETURNS UUID LANGUAGE sql STABLE
-           RETURN (SELECT id FROM public.owners LIMIT 1);",
-        "owner_id = authz.first_owner()",
-        "authz.first_owner()",
-        "reads owners",
-    );
+           RETURN (SELECT id FROM public.owners LIMIT 1);";
+    let translated =
+        helpers::translate_pg(&script(extra, "owner_id = authz.first_owner()"), &options())
+            .unwrap_or_else(|error| panic!("refused the call: {error}"))
+            .join("\n");
+    assert!(translated.contains("CREATE TABLE owners"), "the replica holds owners: {translated}");
+    assert!(translated.contains("FROM owners LIMIT 1"), "the view reads owners: {translated}");
+    assert!(!translated.contains("first_owner"), "the view keeps no call: {translated}");
 }
 
 #[test]
