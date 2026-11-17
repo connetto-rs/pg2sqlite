@@ -18,7 +18,7 @@ use sqlparser::{
     parser::Parser,
 };
 use sqlparser_plpgsql::embedded::{
-    Block, Case, If, LoopControl, Node, Open, ReturnQuery, embedded_sql,
+    Block, Case, If, LoopControl, Node, NodeKind, Open, ReturnQuery, embedded_sql,
 };
 
 #[cfg(not(feature = "std"))]
@@ -100,16 +100,17 @@ fn first_write(statements: &[Statement]) -> Option<Write> {
 /// function's other calls.
 fn nodes_write(nodes: &[Node]) -> Option<Write> {
     nodes.iter().find_map(|node| {
-        match node {
-            Node::Statement { statement, .. } => statement_write(statement),
-            Node::Block(block) => block_write(block),
-            Node::If(If { branches, otherwise }) | Node::Case(Case { branches, otherwise, .. }) => {
+        match &node.kind {
+            NodeKind::Statement { statement, .. } => statement_write(statement),
+            NodeKind::Block(block) => block_write(block),
+            NodeKind::If(If { branches, otherwise })
+            | NodeKind::Case(Case { branches, otherwise, .. }) => {
                 branches
                     .iter()
                     .find_map(|branch| nodes_write(&branch.statements))
                     .or_else(|| nodes_write(otherwise))
             }
-            Node::Loop(repeated) => {
+            NodeKind::Loop(repeated) => {
                 match &repeated.control {
                     LoopControl::Query { query, .. } => statement_write(query),
                     LoopControl::Unconditional
@@ -121,24 +122,24 @@ fn nodes_write(nodes: &[Node]) -> Option<Write> {
                 }
                 .or_else(|| nodes_write(&repeated.statements))
             }
-            Node::Open(Open::Query { query, .. })
-            | Node::Perform { query }
-            | Node::ReturnQuery(ReturnQuery::Query(query)) => statement_write(query),
-            Node::Open(Open::Bound(_) | Open::Dynamic { .. })
-            | Node::ReturnQuery(ReturnQuery::Dynamic(_))
-            | Node::Assignment(_)
-            | Node::Dynamic { .. }
-            | Node::Fetch(_)
-            | Node::Move { .. }
-            | Node::Diagnostics(_)
-            | Node::Close { .. }
-            | Node::Commit { .. }
-            | Node::Rollback { .. }
-            | Node::Exit(_)
-            | Node::Return { .. }
-            | Node::ReturnNext { .. }
-            | Node::Raise(_)
-            | Node::Assert(_) => None,
+            NodeKind::Open(Open::Query { query, .. })
+            | NodeKind::Perform { query }
+            | NodeKind::ReturnQuery(ReturnQuery::Query(query)) => statement_write(query),
+            NodeKind::Open(Open::Bound(_) | Open::Dynamic { .. })
+            | NodeKind::ReturnQuery(ReturnQuery::Dynamic(_))
+            | NodeKind::Assignment(_)
+            | NodeKind::Dynamic { .. }
+            | NodeKind::Fetch(_)
+            | NodeKind::Move { .. }
+            | NodeKind::Diagnostics(_)
+            | NodeKind::Close { .. }
+            | NodeKind::Commit { .. }
+            | NodeKind::Rollback { .. }
+            | NodeKind::Exit(_)
+            | NodeKind::Return { .. }
+            | NodeKind::ReturnNext { .. }
+            | NodeKind::Raise(_)
+            | NodeKind::Assert(_) => None,
         }
     })
 }
