@@ -423,22 +423,6 @@ fn a_caller_setting_without_a_mapping_is_refused() {
     assert!(matches!(error, Error::SessionVariableMappingNotFound { .. }), "{error}");
 }
 
-/// A grantee compared with a setting the deployment declares as a plain
-/// value names no principal, so the arm has no set to read.
-#[test]
-fn a_grantee_compared_with_a_scalar_setting_is_refused() {
-    let scalar = SessionSetting::value("app.user_id", SettingValue::Scalar(DataType::Text))
-        .expect("a custom setting name");
-    let options = Pg2SqliteOptions::default()
-        .with_rls_audit_table_name("rls_audit")
-        .with_session_variable(SessionVariableMapping::new("app.user_id", "app_user"))
-        .with_deployment(
-            Deployment::new("authenticator", ["app"], [scalar]).expect("a valid deployment"),
-        );
-    let error = refusal(&read_policy("id IN (SELECT docs_with('write'))"), &options);
-    assert!(error.to_string().contains("app.user_id"), "{error}");
-}
-
 /// A name declared as a function the destination registers is that function,
 /// whatever the schema declares under it.
 #[test]

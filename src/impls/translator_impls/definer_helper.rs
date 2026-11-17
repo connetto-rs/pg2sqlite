@@ -15,8 +15,9 @@ use sql_traits::{
     errors::HelperSetError,
     structs::{
         AntiJoin, CalledArm, CallerGate, CapOperand, GrantArm, GrantedTo, HelperArm, HelperSet,
-        ParentArm, ParserDB, Restriction, Returned, RowCap, SetPacking, SettingComparison,
-        SettingContent, SettingValue, TimeBound, TimeComparison, WalkArm, WalkDirection,
+        ParentArm, ParserDB, RequestNormalization, Restriction, Returned, RowCap, SetPacking,
+        SettingComparison, SettingContent, SettingValue, TimeBound, TimeComparison, WalkArm,
+        WalkDirection,
     },
     traits::{ColumnLike, DatabaseLike, FunctionLike, TableLike},
 };
@@ -367,7 +368,7 @@ impl<'db> Lowering<'_, 'db> {
             conditions.extend(time_bounds(&name, joined.time_bounds()));
         }
         match grant.granted_to() {
-            GrantedTo::Request(comparison) => conditions.push(self.request(comparison)?),
+            GrantedTo::Request(comparison) => conditions.push(request(comparison)),
             GrantedTo::Set(grantees) => {
                 let set = self.set(grantees.set(), &[])?;
                 conditions.push(in_query(qualified(ARM, column_ident(grantees.column())), set));
@@ -393,67 +394,6 @@ impl<'db> Lowering<'_, 'db> {
             vec![TableWithJoins { relation: aliased_table(grant.table(), ARM), joins }],
             conjunction(conditions),
         ))))
-    }
-
-    /// The arm's column compared with the principal or the set the request
-    /// carries, read as the body reads it.
-    fn request(&self, comparison: &SettingComparison<'db, ParserDB>) -> Result<Expr, Error> {
-        let setting = comparison.setting();
-        let read = |empty_is_null| {
-            setting_read(setting.name(), comparison.raises_when_unset(), empty_is_null)
-        };
-        let column = qualified(ARM, column_ident(comparison.column()));
-        match setting.content() {
-            SettingContent::Value(
-                SettingValue::Caller(declared) | SettingValue::Principal { identity: declared, .. },
-            ) => Ok(equals(column, cast(read(comparison.excludes_unset()), declared.clone()))),
-            SettingContent::Value(SettingValue::Set {
-                element,
-                packing: SetPacking::Delimited(delimiter),
-            }) => {
-                // `string_to_array` unpacks `''` to no element, so the read
-                // needs no `NULLIF`.
-                let elements = simple_function_expr(
-                    "string_to_array",
-                    vec![read(false), string_literal(delimiter)],
-                    None,
-                );
-                Ok(Expr::AnyOp {
-                    left: Box::new(column),
-                    compare_op: BinaryOperator::Eq,
-                    right: Box::new(cast(
-                        elements,
-                        DataType::Array(ArrayElemTypeDef::SquareBracket(
-                            Box::new(element.clone()),
-                            None,
-                        )),
-                    )),
-                    is_some: false,
-                })
-            }
-            SettingContent::Value(SettingValue::Set {
-                element,
-                packing: SetPacking::JsonArray,
-            }) => {
-                let elements = simple_function_expr(
-                    "jsonb_array_elements_text",
-                    vec![cast(read(comparison.excludes_unset()), DataType::JSONB)],
-                    None,
-                );
-                Ok(in_query(
-                    column,
-                    single_expr_query(cast(elements, element.clone()), Vec::new(), None),
-                ))
-            }
-            SettingContent::Value(SettingValue::Scalar(_)) | SettingContent::Json(_) => {
-                Err(Error::forward_refusal(format!(
-                    "{}() compares a column with {}, which the deployment declares as neither a \
-                     principal nor a set of them.",
-                    self.helper,
-                    setting.name()
-                )))
-            }
-        }
     }
 
     /// `<setting> IS NOT NULL` and `<setting> <> <value>` for each excluded
@@ -714,6 +654,57 @@ fn time_bounds<'r>(
             right: Box::new(Expr::IsNull(Box::new(column))),
         }))
     })
+}
+
+/// The arm's column compared with the value or the set the request carries,
+/// read as the body reads it.
+fn request(comparison: &SettingComparison<'_, ParserDB>) -> Expr {
+    let name = comparison.setting().name();
+    let read = |empty_is_null| setting_read(name, comparison.raises_when_unset(), empty_is_null);
+    let column = qualified(ARM, column_ident(comparison.column()));
+    match comparison.value() {
+        SettingValue::Caller(declared)
+        | SettingValue::Principal { identity: declared, .. }
+        | SettingValue::Scalar(declared) => {
+            let mut value = read(comparison.excludes_unset());
+            if let Some(normalization) = comparison.normalization() {
+                let function = match normalization {
+                    RequestNormalization::Lower => "lower",
+                };
+                value = simple_function_expr(function, vec![value], None);
+            }
+            equals(column, cast(value, declared.clone()))
+        }
+        SettingValue::Set { element, packing: SetPacking::Delimited(delimiter) } => {
+            // `string_to_array` unpacks `''` to no element, so the read needs
+            // no `NULLIF`.
+            let elements = simple_function_expr(
+                "string_to_array",
+                vec![read(false), string_literal(delimiter)],
+                None,
+            );
+            Expr::AnyOp {
+                left: Box::new(column),
+                compare_op: BinaryOperator::Eq,
+                right: Box::new(cast(
+                    elements,
+                    DataType::Array(ArrayElemTypeDef::SquareBracket(
+                        Box::new(element.clone()),
+                        None,
+                    )),
+                )),
+                is_some: false,
+            }
+        }
+        SettingValue::Set { element, packing: SetPacking::JsonArray } => {
+            let elements = simple_function_expr(
+                "jsonb_array_elements_text",
+                vec![cast(read(comparison.excludes_unset()), DataType::JSONB)],
+                None,
+            );
+            in_query(column, single_expr_query(cast(elements, element.clone()), Vec::new(), None))
+        }
+    }
 }
 
 /// `current_setting('<name>'[, true])`, through `NULLIF(..., '')` when
