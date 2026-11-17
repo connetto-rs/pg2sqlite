@@ -262,6 +262,26 @@ fn a_delimited_set_of_integers_shows_the_same_rows() {
     );
 }
 
+/// `NULLIF(..., '')` turns an empty setting into a NULL set, so the test
+/// answers NULL where the bare split answers an empty set, which tells the
+/// two apart under `NOT`.
+#[test]
+fn a_delimited_set_read_through_nullif_shows_the_same_rows() {
+    let split = "string_to_array(NULLIF(current_setting('app.teams', true), ''), ',')::int[]";
+    assert_setting_parity(
+        &format!("team = ANY ({split})"),
+        "app.teams",
+        &[None, Some("1"), Some("1,2"), Some("")],
+        &[&[], &["d1", "d4"], &["d1", "d2", "d4"], &[]],
+    );
+    assert_setting_parity(
+        &format!("NOT (team = ANY ({split}))"),
+        "app.teams",
+        &[None, Some("1"), Some("")],
+        &[&[], &["d2", "d3"], &[]],
+    );
+}
+
 /// A delimiter longer than one character splits left to right, as
 /// `string_to_array('carol~~~alice', '~~')` answers `{carol,~alice}`.
 #[test]

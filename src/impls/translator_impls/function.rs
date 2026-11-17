@@ -1772,6 +1772,11 @@ impl crate::traits::translator::TranslatorWithContext for Function {
             )));
         }
 
+        // A call to a SQL function the schema declares stands for its body.
+        if let Some(inlined) = super::sql_helper::inlined_call(self, schema, options)? {
+            return inlined.translate_with_warnings(schema, options, emit);
+        }
+
         // SQLite 3.25 added native FILTER (WHERE ...) for aggregates; our floor
         // is 3.47, so CASE lowering is never needed. Translate the filter
         // expression now so every arm can keep it natively.

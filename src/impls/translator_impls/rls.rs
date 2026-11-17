@@ -697,7 +697,8 @@ fn build_write_guard(
     for gate in [using_gate, check_gate, read_back_gate].into_iter().flatten() {
         for term in gate.permissive().iter().chain(gate.restrictive()) {
             let expr = term.expression().expression();
-            if is_replayable(&scrub_policy_stable_exprs(expr, options), options) {
+            let inlined = super::sql_helper::inlined_calls(expr, schema, options)?;
+            if is_replayable(&scrub_policy_stable_exprs(&inlined, options), options) {
                 continue;
             }
             let clause = match (term.clause(), gate.row()) {

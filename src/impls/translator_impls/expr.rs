@@ -1847,15 +1847,21 @@ fn translate_delimited_membership(
     };
     let setting = match session_variable::setting_operand(text) {
         Expr::Function(function) => {
-            match session_variable::session_read_of_function(function) {
-                Some(session_variable::SessionRead::Setting(name)) => Some(name),
+            let (read, empty_is_null) =
+                match crate::impls::idioms::extract_nullif_wrapped(function, "current_setting", "")
+                {
+                    Some(read) => (read, true),
+                    None => (function, false),
+                };
+            match session_variable::session_read_of_function(read) {
+                Some(session_variable::SessionRead::Setting(name)) => Some((name, empty_is_null)),
                 _ => None,
             }
         }
         _ => None,
     };
     let split = match setting {
-        Some(name) => {
+        Some((name, empty_is_null)) => {
             let written = single_quoted_literal(delimiter).ok_or_else(|| {
                 crate::errors::Error::forward_refusal(
                     "A membership test over a session setting's string_to_array() splits on the \
@@ -1864,7 +1870,7 @@ fn translate_delimited_membership(
                         .to_string(),
                 )
             })?;
-            Split::Setting { name, written }
+            Split::Setting { name, written, empty_is_null }
         }
         // A typed array over any other text is left to the refusal the cast
         // answers, since only a declared set says what its elements hold.
@@ -1898,11 +1904,12 @@ fn translate_delimited_membership(
 
     let translated_left = left.translate_with_warnings(schema, options, emit)?;
     match split {
-        Split::Setting { name, written } => {
+        Split::Setting { name, written, empty_is_null } => {
             session_variable::delimited_set_membership(
                 translated_left,
                 &name,
                 written,
+                empty_is_null,
                 element_cast,
                 negated,
                 options,
@@ -1918,8 +1925,9 @@ fn translate_delimited_membership(
 
 /// What a membership test over `string_to_array` splits.
 enum Split<'e> {
-    /// A session setting, split on the delimiter written.
-    Setting { name: String, written: &'e str },
+    /// A session setting, split on the delimiter written, an empty one read
+    /// as NULL when `empty_is_null`, as `NULLIF(<setting>, '')` reads it.
+    Setting { name: String, written: &'e str, empty_is_null: bool },
     /// Any other text, split on one character.
     Text(char),
 }
@@ -2079,6 +2087,14 @@ fn translate_any_all_to_in(
             negated,
             global: false,
         });
+    }
+    // A declared SQL function answering an array is written as its body, so
+    // the forms above read what the body builds, a string_to_array split
+    // among them.
+    if let Expr::Function(call) = right
+        && let Some(inlined) = super::sql_helper::inlined_call(call, schema, options)?
+    {
+        return translate_any_all_to_in(left, &inlined, negated, schema, options, emit);
     }
     if let Some(elements) = quantifier_elements(right) {
         let scale = scale_of(left, schema, options).filter(|s| *s > 0);
