@@ -8,7 +8,7 @@
 mod effects;
 pub(crate) mod placement;
 mod rebind;
-mod transactions;
+pub(crate) mod transactions;
 
 use sql_traits::{
     structs::{ParserDB, ParserDBIngestor},

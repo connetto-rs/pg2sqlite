@@ -66,6 +66,7 @@ use crate::{
             clock_check::{dropped_clock_triggers, split_clock_checks},
             column::translate_column_def,
             condition_injection::inject_condition_into_dml_statement,
+            drop_column_rebuild,
             nulls_not_distinct::{companion_drops, table_companions},
             off_replica::{self, OffReplica, Write},
             rls::{
@@ -676,7 +677,7 @@ fn translate_alter_table(
     };
 
     let mut statements = Vec::with_capacity(alter_table.operations.len());
-    for operation in &alter_table.operations {
+    for (position, operation) in alter_table.operations.iter().enumerate() {
         let Some(translated) =
             translate_alter_table_operation(operation, alter_table, schema, options, emit)?
         else {
@@ -697,6 +698,18 @@ fn translate_alter_table(
             // already.
             dependents.retain(|dependent| !statements.contains(dependent));
             statements.extend(dependents);
+            if let Some(rebuilt) = drop_column_rebuild::rebuild(
+                alter_table,
+                position,
+                column_names,
+                &normalized_name,
+                &statements,
+                schema,
+                options,
+            )? {
+                statements.extend(rebuilt);
+                continue;
+            }
         }
         // Every field is named rather than spread from the input, so a field
         // added upstream fails to compile here instead of reaching SQLite

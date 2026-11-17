@@ -23,9 +23,12 @@ use crate::{
     impls::{
         emitted_namespace::{Source, reject_name_collisions, sourced},
         object_name::last_ident_value_or_display,
+        transaction_blocks::Disposition,
         translator_impls::{
             create_index::{FtsTranslation, analyze_fts_index},
-            definer, postgis,
+            definer,
+            drop_column_rebuild::{LiveAttachments, StatementHistory},
+            postgis,
             rls::generate_rls_audit_table,
             statement::is_data_movement_statement,
         },
@@ -800,7 +803,8 @@ impl Pg2Sqlite {
             crate::impls::translator_impls::trigger_slots::TriggerSlots::seeded(
                 initial_schema.as_ref(),
             )?;
-
+        let mut attachments = LiveAttachments::seeded(initial_schema.as_ref())?;
+        let outline = crate::history::transactions::Outline::new(statements, &dispositions);
         let mut warnings = Vec::new();
         let mut translated = Vec::with_capacity(statements.len());
         let mut rebuilt_triggers = Vec::with_capacity(statements.len());
@@ -819,30 +823,32 @@ impl Pg2Sqlite {
                 }
                 let mut emit = |warning| warnings.push(warning);
                 match dispositions[epoch.start + offset] {
-                    crate::impls::transaction_blocks::Disposition::DropNoOp {
-                        construct,
-                        reason,
-                    } => {
+                    Disposition::DropNoOp { construct, reason } => {
                         emit(crate::warnings::TranslationWarning::LossyDrop {
                             construct: construct.to_string(),
                             reason: reason.to_string(),
                         });
                         translated.push(Vec::new());
                     }
-                    crate::impls::transaction_blocks::Disposition::Translate => {
-                        let written =
-                            context.with_written_schema(epoch.written(epoch.start + offset));
+                    Disposition::Translate => {
+                        let index = epoch.start + offset;
+                        let written = context.with_written_schema(epoch.written(index));
+                        let written = written.with_history(StatementHistory {
+                            attachments: &attachments,
+                            in_transaction: outline.in_transaction(index),
+                        });
                         let mut emitted = statement.translate_with_warnings(
                             &epoch.schema,
                             &written,
                             &mut emit,
                         )?;
-                        rebuilt_triggers[epoch.start + offset] = trigger_slots.apply(
+                        rebuilt_triggers[index] = trigger_slots.apply(
                             statement,
                             &mut emitted,
                             &epoch.schema,
                             &written,
                         )?;
+                        attachments.apply(statement, &emitted);
                         translated.push(emitted);
                     }
                 }

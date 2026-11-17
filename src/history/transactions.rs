@@ -121,6 +121,12 @@ impl Outline {
     pub(crate) fn transaction(&self, statement: StatementId) -> Option<TransactionId> {
         self.transactions[statement.index()]
     }
+
+    /// Whether statement `index` of the batch runs inside an explicit
+    /// transaction.
+    pub(crate) fn in_transaction(&self, index: usize) -> bool {
+        self.transactions[index].is_some()
+    }
 }
 
 /// The most recent frame named `name`, compared as PostgreSQL compares

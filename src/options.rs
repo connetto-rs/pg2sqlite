@@ -16,7 +16,7 @@ use crate::no_std::prelude::*;
 use crate::{
     impls::{
         request_zone::{RequestZone, ZoneUnavailable},
-        translator_impls::array::WholeRow,
+        translator_impls::{array::WholeRow, drop_column_rebuild::StatementHistory},
     },
     traits::{ArrayRepresentation, SessionVariableMapping, TimeZoneFunctions, UuidRepresentation},
 };
@@ -279,6 +279,9 @@ pub struct TranslationContext<'a> {
     /// The schema as the statement being translated was written, which names
     /// a wildcard's columns before a later column change in its epoch.
     written_schema: Option<&'a ParserDB>,
+    /// What the batch emitted before the statement being translated, which a
+    /// table rebuild recreates indexes and triggers from.
+    history: Option<StatementHistory<'a>>,
     /// The role the body being translated runs as, the owner of a `SECURITY
     /// DEFINER` trigger function, which PostgreSQL checks a call's privileges
     /// against in place of the acting role.
@@ -296,6 +299,7 @@ struct ContextFields<'a> {
     subqueries_allowed: bool,
     rebound_body: Option<&'a sqlparser::ast::BeginEndStatements>,
     written_schema: Option<&'a ParserDB>,
+    history: Option<StatementHistory<'a>>,
     running_as: Option<&'a Role>,
 }
 
@@ -310,6 +314,7 @@ impl<'a> ContextFields<'a> {
             subqueries_allowed: context.subqueries_allowed,
             rebound_body: context.rebound_body,
             written_schema: context.written_schema,
+            history: context.history,
             running_as: context.running_as,
         }
     }
@@ -332,6 +337,7 @@ impl<'a> ContextFields<'a> {
             subqueries_allowed: self.subqueries_allowed,
             rebound_body: self.rebound_body,
             written_schema: self.written_schema,
+            history: self.history,
             running_as: self.running_as,
         }
     }
@@ -353,6 +359,7 @@ impl<'a> TranslationContext<'a> {
             subqueries_allowed: true,
             rebound_body: None,
             written_schema: None,
+            history: None,
             running_as: None,
         }
     }
@@ -375,6 +382,7 @@ impl<'a> TranslationContext<'a> {
             subqueries_allowed: true,
             rebound_body: None,
             written_schema: None,
+            history: None,
             running_as: None,
         }
     }
@@ -494,6 +502,23 @@ impl<'a> TranslationContext<'a> {
     /// The schema the statement being translated was written against.
     pub(crate) const fn written_schema(&self) -> Option<&ParserDB> {
         self.written_schema
+    }
+
+    /// Derives a context translating a statement of the batch after the
+    /// statements `history` follows.
+    pub(crate) fn with_history<'s>(
+        &'s self,
+        history: StatementHistory<'s>,
+    ) -> TranslationContext<'s> {
+        let mut fields = ContextFields::borrowed(self);
+        fields.history = Some(history);
+        fields.into_context(self.scope, self.outer)
+    }
+
+    /// What the batch emitted before the statement being translated, absent
+    /// when the statement is translated alone.
+    pub(crate) const fn history(&self) -> Option<StatementHistory<'a>> {
+        self.history
     }
 
     /// The same context translating a body that runs as `role`.
