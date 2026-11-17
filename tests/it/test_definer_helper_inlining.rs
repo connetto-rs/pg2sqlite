@@ -550,7 +550,8 @@ fn a_called_arm_reads_the_called_helpers_rows() {
 fn a_called_arm_over_no_row_keeps_no_row() {
     assert_eq!(
         shared("resource_id IN (SELECT unreached_resources())"),
-        "(resource_id IN (SELECT NULL WHERE false))"
+        "(resource_id IN (SELECT called.column_0 FROM (SELECT NULL AS column_0 WHERE false) AS \
+         called))"
     );
 }
 
