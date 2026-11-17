@@ -25,6 +25,9 @@ mod parity_any_array_subquery;
 #[path = "gauntlet/parity_definer_helpers.rs"]
 mod parity_definer_helpers;
 
+#[path = "gauntlet/parity_helper_conditions.rs"]
+mod parity_helper_conditions;
+
 #[path = "gauntlet/parity_plpgsql.rs"]
 mod parity_plpgsql;
 

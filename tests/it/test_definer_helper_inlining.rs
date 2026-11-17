@@ -230,8 +230,8 @@ ALTER TABLE doc_notes ENABLE ROW LEVEL SECURITY;
 ";
 
 /// What `docs_with('write')` returns, as the replica reads it.
-const WRITERS: &str = "SELECT doc_id FROM doc_grants_rls \
-                       WHERE principal_id = app_user() AND role IN ('admin', 'write')";
+const WRITERS: &str = "SELECT arm.doc_id FROM doc_grants_rls AS arm \
+                       WHERE arm.principal_id = app_user() AND arm.role IN ('admin', 'write')";
 
 fn deployment() -> Deployment {
     let caller = SessionSetting::value("app.user_id", SettingValue::Caller(DataType::Text))
@@ -282,16 +282,17 @@ fn the_r100_hierarchy_reads_its_helpers_sets_from_backing_tables() {
     assert_eq!(
         statement(&script, "teams"),
         "CREATE VIEW teams AS SELECT id, organization_id FROM teams_rls WHERE (id IN (\
-         SELECT team_id FROM team_grants_rls WHERE principal_id = app_user() \
-         UNION SELECT id FROM teams_rls WHERE organization_id IN (\
-         SELECT organization_id FROM organization_grants_rls WHERE principal_id = app_user())))"
+         SELECT arm.team_id FROM team_grants_rls AS arm WHERE arm.principal_id = app_user() \
+         UNION SELECT arm.id FROM teams_rls AS arm WHERE arm.organization_id IN (\
+         SELECT arm.organization_id FROM organization_grants_rls AS arm \
+         WHERE arm.principal_id = app_user())))"
     );
     assert_eq!(
         statement(&script, "organizations_delete_trigger"),
         "CREATE TRIGGER organizations_delete_trigger INSTEAD OF DELETE ON organizations \
          FOR EACH ROW BEGIN DELETE FROM organizations_rls WHERE (id = OLD.id) AND ((OLD.id IN (\
-         SELECT organization_id FROM organization_grants_rls \
-         WHERE principal_id = app_user() AND role IN ('admin')))); END"
+         SELECT arm.organization_id FROM organization_grants_rls AS arm \
+         WHERE arm.principal_id = app_user() AND arm.role IN ('admin')))); END"
     );
 }
 
@@ -358,8 +359,9 @@ fn a_helper_reading_an_unguarded_table_reads_it_directly() {
     let script = translated(&read_policy("id IN (SELECT docs_in_group('staff'))"), &options());
     assert_eq!(
         statement(&script, "docs"),
-        "CREATE VIEW docs AS SELECT id FROM docs_rls WHERE (id IN (SELECT doc_id FROM doc_members \
-         WHERE principal_id = app_user() AND \"group\" IN ('staff')))"
+        "CREATE VIEW docs AS SELECT id FROM docs_rls WHERE (id IN (SELECT arm.doc_id \
+         FROM doc_members AS arm WHERE arm.principal_id = app_user() \
+         AND arm.\"group\" IN ('staff')))"
     );
 }
 
@@ -378,7 +380,7 @@ fn a_parent_arm_without_a_foreign_key_reads_the_called_helpers_set() {
         statement(&script, "doc_notes"),
         format!(
             "CREATE VIEW doc_notes AS SELECT id, doc FROM doc_notes_rls WHERE (id IN (\
-             SELECT id FROM doc_notes_rls WHERE doc IN ({WRITERS})))"
+             SELECT arm.id FROM doc_notes_rls AS arm WHERE arm.doc IN ({WRITERS})))"
         )
     );
 }
@@ -419,6 +421,22 @@ fn a_caller_setting_without_a_mapping_is_refused() {
         .with_deployment(deployment());
     let error = refusal(&read_policy("id IN (SELECT docs_with('write'))"), &options);
     assert!(matches!(error, Error::SessionVariableMappingNotFound { .. }), "{error}");
+}
+
+/// A grantee compared with a setting the deployment declares as a plain
+/// value names no principal, so the arm has no set to read.
+#[test]
+fn a_grantee_compared_with_a_scalar_setting_is_refused() {
+    let scalar = SessionSetting::value("app.user_id", SettingValue::Scalar(DataType::Text))
+        .expect("a custom setting name");
+    let options = Pg2SqliteOptions::default()
+        .with_rls_audit_table_name("rls_audit")
+        .with_session_variable(SessionVariableMapping::new("app.user_id", "app_user"))
+        .with_deployment(
+            Deployment::new("authenticator", ["app"], [scalar]).expect("a valid deployment"),
+        );
+    let error = refusal(&read_policy("id IN (SELECT docs_with('write'))"), &options);
+    assert!(error.to_string().contains("app.user_id"), "{error}");
 }
 
 /// A name declared as a function the destination registers is that function,

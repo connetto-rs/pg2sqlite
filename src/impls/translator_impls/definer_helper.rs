@@ -14,15 +14,19 @@ use core::{convert::Infallible, ops::ControlFlow};
 use sql_traits::{
     errors::{HelperSetError, LookupError},
     structs::{
-        GrantArm, GrantedTo, HelperArm, HelperSet, IdentifierCase, ParserDB, Restriction,
-        SettingContent, SettingValue, TargetName,
+        AntiJoin, CallerGate, CapOperand, GrantArm, GrantedTo, HelperArm, HelperSet,
+        IdentifierCase, ParentArm, ParserDB, Restriction, RowCap, SetPacking, SettingComparison,
+        SettingContent, SettingValue, TargetName, TimeBound, TimeComparison, WalkArm,
+        WalkDirection,
     },
     traits::{ColumnLike, DatabaseLike, FunctionLike, TableLike},
 };
 use sqlparser::ast::{
-    BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
-    InTarget, ObjectName, ObjectNamePart, Query, SelectItem, SetExpr, SetOperator, SetQuantifier,
-    Value, ValueWithSpan, VisitMut, VisitorMut,
+    ArrayElemTypeDef, BinaryOperator, CastKind, CreateTable, Cte, DataType, Expr, Function,
+    FunctionArg, FunctionArgExpr, FunctionArguments, Ident, InTarget, Join, JoinConstraint,
+    JoinOperator, ObjectName, ObjectNamePart, Query, SelectItem, SetExpr, SetOperator,
+    SetQuantifier, TableAlias, TableAliasColumnDef, TableFactor, TableWithJoins, Value,
+    ValueWithSpan, VisitMut, VisitorMut, With, helpers::attached_token::AttachedToken,
 };
 
 #[cfg(not(feature = "std"))]
@@ -100,12 +104,13 @@ pub(crate) fn helper_membership(
                 "{name}() cannot be translated as the set it returns: {error}"
             ))
         })?;
-    let mut read = Vec::new();
-    let lowered = lowered_set(&set, name, &mut read)?;
+    let mut lowering = Lowering { helper: name, schema, read: Vec::new(), walks: 0 };
+    let lowered = lowering.set(&set)?;
     let mut guarded = Vec::new();
-    for table in read {
-        if has_backing_table(table, schema, options)? {
-            guarded.push(table.table_name());
+    for table in lowering.read {
+        let table_name = table.table_name();
+        if !guarded.contains(&table_name) && has_backing_table(table, schema, options)? {
+            guarded.push(table_name);
         }
     }
     let mut lowered = lowered.translate_with_warnings(schema, options, emit)?;
@@ -158,179 +163,530 @@ fn arguments(call: &Function) -> Result<Vec<Value>, HelperSetError> {
         .collect()
 }
 
-/// The set as a PostgreSQL query over the tables the helper reads, written
-/// under their declared names so the translation resolves their columns, each
-/// table it reads pushed onto `read`.
-///
-/// # Errors
-///
-/// Refuses a set grown along a walk, and an arm holding a condition the query
-/// does not write out, either of which would keep rows the helper does not
-/// return.
-fn lowered_set<'db>(
-    set: &HelperSet<'db, ParserDB>,
-    helper: &ObjectName,
-    read: &mut Vec<&'db <ParserDB as DatabaseLike>::Table>,
-) -> Result<Query, Error> {
-    if set.selection().is_some() {
-        return Err(walk_refusal(helper));
-    }
-    let mut arms = Vec::new();
-    for arm in set.arms() {
-        arms.push(lowered_arm(arm, helper, read)?);
-    }
-    let mut arms = arms.into_iter();
-    let Some(first) = arms.next() else {
-        // A helper keeping no row for these arguments returns the empty set.
-        return Ok(single_expr_query(
-            Expr::Value(Value::Null.into()),
-            Vec::new(),
-            Some(Expr::Value(Value::Boolean(false).into())),
-        ));
-    };
-    let body = arms.fold(*first.body, |left, right| {
-        SetExpr::SetOperation {
-            op: SetOperator::Union,
-            set_quantifier: SetQuantifier::None,
-            left: Box::new(left),
-            right: right.body,
-        }
-    });
-    Ok(make_query(None, body))
+/// The alias of the table a grant or parent arm reads.
+const ARM: &str = "arm";
+/// The alias of the table an anti-join reads.
+const BLOCKING: &str = "blocking";
+/// The one column of a walk.
+const NODE: &str = "node";
+/// The alias of the edges a walk follows, and their two columns.
+const EDGE: &str = "edge";
+const NEXT: &str = "next";
+const PREVIOUS: &str = "previous";
+
+/// Writes a helper's set as a PostgreSQL query over the tables its arms read,
+/// under their declared names so the translation resolves their columns.
+struct Lowering<'h, 'db> {
+    /// The helper, as refusals name it.
+    helper: &'h ObjectName,
+    schema: &'db ParserDB,
+    /// Every table the query reads, in the order it reads them.
+    read: Vec<&'db CreateTable>,
+    /// How many walks the query names so far.
+    walks: usize,
 }
 
-/// One arm as `SELECT <columns> FROM <table> WHERE <condition>`.
-fn lowered_arm<'db>(
-    arm: &HelperArm<'db, ParserDB>,
-    helper: &ObjectName,
-    read: &mut Vec<&'db <ParserDB as DatabaseLike>::Table>,
-) -> Result<Query, Error> {
-    match arm {
-        HelperArm::Grant(grant) => {
-            read.push(grant.table());
-            let refused = |condition: &str| {
-                Error::forward_refusal(format!(
-                    "{helper}() cannot be translated as the set it returns: an arm keeps its \
-                     rows under {condition}, which the translation does not write out."
-                ))
-            };
-            if let Some(condition) = unwritten(grant) {
-                return Err(refused(condition));
+impl<'db> Lowering<'_, 'db> {
+    /// The set as one query: its arms joined by `UNION`, grown along its
+    /// walks, and kept to the rows its selection keeps.
+    fn set(&mut self, set: &HelperSet<'db, ParserDB>) -> Result<Query, Error> {
+        let mut arms = Vec::new();
+        let mut edges = Vec::new();
+        for arm in set.arms() {
+            match arm {
+                HelperArm::Grant(grant) => arms.push(self.grant(grant)?),
+                HelperArm::Parent(parent) => arms.push(self.parent(parent)?),
+                HelperArm::Walk(walk) => edges.push(self.edge(walk)),
             }
-            let grantee = match grant.granted_to() {
-                GrantedTo::Request(grantee) if grantee.excludes_unset() => {
-                    return Err(refused("a grantee setting read as NULL when it is empty"));
-                }
-                GrantedTo::Request(grantee)
-                    if matches!(
-                        grantee.setting().content(),
-                        SettingContent::Value(SettingValue::Caller(_))
-                    ) =>
-                {
-                    grantee
-                }
-                GrantedTo::Request(_) => {
-                    return Err(refused("a grantee setting other than the caller"));
-                }
-                GrantedTo::Set(_) => return Err(refused("a grantee set another helper returns")),
-                GrantedTo::Anyone => return Err(refused("no grantee")),
-            };
-            let caller = simple_function_expr(
-                "current_setting",
-                vec![string_literal(grantee.setting().name())],
-                None,
-            );
-            let mut condition = Expr::BinaryOp {
-                left: Box::new(column(grantee.column())),
-                op: BinaryOperator::Eq,
-                right: Box::new(caller),
-            };
-            for restriction in grant.restrictions() {
-                let Restriction::In(set) = restriction else {
-                    return Err(refused("a column required to be NULL or not NULL"));
-                };
-                condition = Expr::BinaryOp {
-                    left: Box::new(condition),
-                    op: BinaryOperator::And,
-                    right: Box::new(Expr::In {
-                        expr: Box::new(column(set.column())),
-                        target: InTarget::List(
-                            set.values()
-                                .iter()
-                                .map(|value| Expr::Value(ValueWithSpan::from(value.clone())))
-                                .collect(),
-                        ),
-                        negated: false,
-                        global: false,
-                    }),
-                };
-            }
-            let projection = grant
-                .columns()
-                .iter()
-                .map(|returned| SelectItem::UnnamedExpr(column(returned)))
-                .collect();
-            Ok(make_query(
-                None,
-                SetExpr::Select(Box::new(make_simple_select(
-                    projection,
-                    from_relation(plain_table_factor(grant.table().name.clone())),
-                    Some(condition),
-                ))),
-            ))
         }
-        HelperArm::Parent(parent) => {
-            read.push(parent.table());
-            Ok(single_expr_query(
-                column(parent.key()),
-                from_relation(plain_table_factor(parent.table().name.clone())),
-                Some(Expr::In {
-                    expr: Box::new(column(parent.column())),
-                    target: InTarget::Subquery(Box::new(lowered_set(parent.set(), helper, read)?)),
+        let selection = match set.selection() {
+            Some(selection) => {
+                let mut kept = Vec::new();
+                for arm in selection {
+                    kept.push(self.grant(arm)?);
+                }
+                // A selection none of whose arms keeps a row keeps no value.
+                let Some(kept) = union(kept, SetQuantifier::None) else { return Ok(empty_set()) };
+                Some(kept)
+            }
+            None => None,
+        };
+        // A helper keeping no row for these arguments returns the empty set.
+        let Some(arms) = union(arms, SetQuantifier::None) else { return Ok(empty_set()) };
+        if edges.is_empty() && selection.is_none() {
+            return Ok(make_query(None, arms));
+        }
+        Ok(self.reached(arms, union(edges, SetQuantifier::All), selection))
+    }
+
+    /// `WITH [RECURSIVE] <walk> (node) AS (<arms> [UNION <step>]) SELECT node
+    /// FROM <walk> [WHERE node IN (<selection>)]`, one step adding the next
+    /// row along every edge from a row the walk holds.
+    ///
+    /// The step joins the walk once, to the union of the edges, since both
+    /// engines read a recursive reference in only one place.
+    fn reached(
+        &mut self,
+        arms: SetExpr,
+        edges: Option<SetExpr>,
+        selection: Option<SetExpr>,
+    ) -> Query {
+        let walk = self.walk_name();
+        let recursive = edges.is_some();
+        let body = match edges {
+            Some(edges) => {
+                let step = make_simple_select(
+                    vec![SelectItem::UnnamedExpr(qualified(EDGE, Ident::new(NEXT)))],
+                    vec![TableWithJoins {
+                        relation: plain_table_factor(ObjectName::from(vec![walk.clone()])),
+                        joins: vec![Join {
+                            relation: TableFactor::Derived {
+                                lateral: false,
+                                subquery: Box::new(make_query(None, edges)),
+                                alias: Some(alias(EDGE)),
+                                sample: None,
+                            },
+                            global: false,
+                            join_operator: JoinOperator::Join(JoinConstraint::On(equals(
+                                qualified(EDGE, Ident::new(PREVIOUS)),
+                                qualified(&walk.value, Ident::new(NODE)),
+                            ))),
+                        }],
+                    }],
+                    None,
+                );
+                set_operation(arms, SetExpr::Select(Box::new(step)), SetQuantifier::None)
+            }
+            None => arms,
+        };
+        let cte = Cte {
+            alias: TableAlias {
+                explicit: false,
+                name: walk.clone(),
+                columns: vec![TableAliasColumnDef { name: Ident::new(NODE), data_type: None }],
+                at: None,
+            },
+            query: Box::new(make_query(None, body)),
+            from: None,
+            materialized: None,
+            closing_paren_token: AttachedToken::empty(),
+        };
+        let node = Expr::Identifier(Ident::new(NODE));
+        let kept = selection.map(|selection| in_query(node.clone(), make_query(None, selection)));
+        let with = With { with_token: AttachedToken::empty(), recursive, cte_tables: vec![cte] };
+        let walked = single_expr_query(
+            node,
+            from_relation(plain_table_factor(ObjectName::from(vec![walk]))),
+            kept,
+        );
+        make_query(Some(with), *walked.body)
+    }
+
+    /// A name for the next walk that names no table, so it reaches no
+    /// backing table either.
+    fn walk_name(&mut self) -> Ident {
+        loop {
+            let name = format!("walk_{}", self.walks);
+            self.walks += 1;
+            if !self.schema.tables().any(|table| table.table_name() == name) {
+                return Ident::new(name);
+            }
+        }
+    }
+
+    /// `SELECT <next> AS next, <previous> AS previous FROM <table>`, the edges
+    /// of one walk, each from the row the walk holds to the row it adds.
+    fn edge(&mut self, walk: &WalkArm<'db, ParserDB>) -> SetExpr {
+        self.read.push(walk.table());
+        let (next, previous) = match walk.direction() {
+            WalkDirection::Down => (walk.child(), walk.column()),
+            WalkDirection::Up => (walk.column(), walk.child()),
+        };
+        let projected = |column: &<ParserDB as DatabaseLike>::Column, name: &str| {
+            SelectItem::ExprWithAlias {
+                expr: Expr::Identifier(column_ident(column)),
+                alias: Ident::new(name),
+            }
+        };
+        SetExpr::Select(Box::new(make_simple_select(
+            vec![projected(next, NEXT), projected(previous, PREVIOUS)],
+            from_relation(plain_table_factor(walk.table().name.clone())),
+            None,
+        )))
+    }
+
+    /// `SELECT <key> FROM <table> WHERE <column> IN (<parents>)`.
+    fn parent(&mut self, parent: &ParentArm<'db, ParserDB>) -> Result<SetExpr, Error> {
+        self.read.push(parent.table());
+        let parents = self.set(parent.set())?;
+        Ok(SetExpr::Select(Box::new(make_simple_select(
+            vec![SelectItem::UnnamedExpr(qualified(ARM, column_ident(parent.key())))],
+            from_relation(aliased_table(parent.table(), ARM)),
+            Some(in_query(qualified(ARM, column_ident(parent.column())), parents)),
+        ))))
+    }
+
+    /// `SELECT <columns> FROM <table> [JOIN <joined table> ON <key>]... WHERE
+    /// <conditions>`, every condition the arm holds written out, so the arm
+    /// keeps no row its helper does not return.
+    fn grant(&mut self, grant: &GrantArm<'db, ParserDB>) -> Result<SetExpr, Error> {
+        self.read.push(grant.table());
+        let mut conditions = Vec::new();
+        let mut joins = Vec::new();
+        for (index, joined) in grant.joined_rows().iter().enumerate() {
+            let name = joined_alias(index);
+            self.read.push(joined.table());
+            let key = joined.columns().iter().map(|(host, referenced)| {
+                equals(
+                    qualified(&name, column_ident(referenced)),
+                    qualified(ARM, column_ident(host)),
+                )
+            });
+            joins.push(Join {
+                relation: aliased_table(joined.table(), &name),
+                global: false,
+                join_operator: JoinOperator::Join(
+                    conjunction(key).map_or(JoinConstraint::None, JoinConstraint::On),
+                ),
+            });
+            conditions.extend(restrictions(&name, joined.restrictions()));
+            conditions.extend(time_bounds(&name, joined.time_bounds()));
+        }
+        match grant.granted_to() {
+            GrantedTo::Request(comparison) => conditions.push(self.request(comparison)?),
+            GrantedTo::Set(grantees) => {
+                let set = self.set(grantees.set())?;
+                conditions.push(in_query(qualified(ARM, column_ident(grantees.column())), set));
+            }
+            GrantedTo::Anyone => {}
+        }
+        if let Some(gate) = grant.gate() {
+            conditions.extend(self.gate(gate)?);
+        }
+        conditions.extend(restrictions(ARM, grant.restrictions()));
+        conditions.extend(time_bounds(ARM, grant.time_bounds()));
+        for cap in grant.caps() {
+            conditions.push(self.cap(cap)?);
+        }
+        for anti_join in grant.anti_joins() {
+            conditions.push(self.anti_join(anti_join));
+        }
+        let projection = grant
+            .columns()
+            .iter()
+            .map(|column| SelectItem::UnnamedExpr(qualified(ARM, column_ident(column))))
+            .collect();
+        Ok(SetExpr::Select(Box::new(make_simple_select(
+            projection,
+            vec![TableWithJoins { relation: aliased_table(grant.table(), ARM), joins }],
+            conjunction(conditions),
+        ))))
+    }
+
+    /// The arm's column compared with the principal or the set the request
+    /// carries, read as the body reads it.
+    fn request(&self, comparison: &SettingComparison<'db, ParserDB>) -> Result<Expr, Error> {
+        let setting = comparison.setting();
+        let read = |empty_is_null| {
+            setting_read(setting.name(), comparison.raises_when_unset(), empty_is_null)
+        };
+        let column = qualified(ARM, column_ident(comparison.column()));
+        match setting.content() {
+            SettingContent::Value(
+                SettingValue::Caller(declared) | SettingValue::Principal { identity: declared, .. },
+            ) => Ok(equals(column, cast(read(comparison.excludes_unset()), declared.clone()))),
+            SettingContent::Value(SettingValue::Set {
+                element,
+                packing: SetPacking::Delimited(delimiter),
+            }) => {
+                // `string_to_array` unpacks `''` to no element, so the read
+                // needs no `NULLIF`.
+                let elements = simple_function_expr(
+                    "string_to_array",
+                    vec![read(false), string_literal(delimiter)],
+                    None,
+                );
+                Ok(Expr::AnyOp {
+                    left: Box::new(column),
+                    compare_op: BinaryOperator::Eq,
+                    right: Box::new(cast(
+                        elements,
+                        DataType::Array(ArrayElemTypeDef::SquareBracket(
+                            Box::new(element.clone()),
+                            None,
+                        )),
+                    )),
+                    is_some: false,
+                })
+            }
+            SettingContent::Value(SettingValue::Set {
+                element,
+                packing: SetPacking::JsonArray,
+            }) => {
+                let elements = simple_function_expr(
+                    "jsonb_array_elements_text",
+                    vec![cast(read(comparison.excludes_unset()), DataType::JSONB)],
+                    None,
+                );
+                Ok(in_query(
+                    column,
+                    single_expr_query(cast(elements, element.clone()), Vec::new(), None),
+                ))
+            }
+            SettingContent::Value(SettingValue::Scalar(_)) | SettingContent::Json(_) => {
+                Err(Error::forward_refusal(format!(
+                    "{}() compares a column with {}, which the deployment declares as neither a \
+                     principal nor a set of them.",
+                    self.helper,
+                    setting.name()
+                )))
+            }
+        }
+    }
+
+    /// `<setting> IS NOT NULL` and `<setting> <> <value>` for each excluded
+    /// value.
+    fn gate(&self, gate: &CallerGate<'db>) -> Result<Vec<Expr>, Error> {
+        let setting = gate.setting();
+        let mut read =
+            setting_read(setting.name(), gate.raises_when_unset(), gate.excludes_unset());
+        if gate.compares_in_declared_type() {
+            let SettingContent::Value(SettingValue::Caller(declared)) = setting.content() else {
+                return Err(Error::forward_refusal(format!(
+                    "{}() gates on {}, which the deployment declares as no caller.",
+                    self.helper,
+                    setting.name()
+                )));
+            };
+            read = cast(read, declared.clone());
+        }
+        let mut conditions = vec![Expr::IsNotNull(Box::new(read.clone()))];
+        conditions.extend(gate.excluded().iter().map(|value| {
+            Expr::BinaryOp {
+                left: Box::new(read.clone()),
+                op: BinaryOperator::NotEq,
+                right: Box::new(Expr::Value(value.clone().into())),
+            }
+        }));
+        Ok(conditions)
+    }
+
+    /// `[<setting> IS NULL OR] (<operands>) IN (<set>)`.
+    fn cap(&mut self, cap: &RowCap<'db, ParserDB>) -> Result<Expr, Error> {
+        let mut operands: Vec<Expr> = cap
+            .operands()
+            .iter()
+            .map(|operand| {
+                match operand {
+                    CapOperand::Column(column) => qualified(ARM, column_ident(column)),
+                    CapOperand::Joined { row, column } => {
+                        qualified(&joined_alias(*row), column_ident(column))
+                    }
+                    CapOperand::Value(value) => Expr::Value(value.clone().into()),
+                }
+            })
+            .collect();
+        let row = match operands.len() {
+            1 => operands.remove(0),
+            _ => Expr::Tuple(operands),
+        };
+        // `SELECT NULL WHERE false` has one column, so a row cap cannot compare
+        // with it.
+        let capped = if cap.set().arms().is_empty() {
+            Expr::Value(Value::Boolean(false).into())
+        } else {
+            in_query(row, self.set(cap.set())?)
+        };
+        Ok(match cap.lift() {
+            Some(lift) => {
+                let read = setting_read(
+                    lift.setting().name(),
+                    lift.raises_when_unset(),
+                    lift.lifts_on_empty(),
+                );
+                Expr::Nested(Box::new(Expr::BinaryOp {
+                    left: Box::new(Expr::IsNull(Box::new(read))),
+                    op: BinaryOperator::Or,
+                    right: Box::new(capped),
+                }))
+            }
+            None => capped,
+        })
+    }
+
+    /// `NOT EXISTS (SELECT 1 FROM <table> WHERE <correlations> AND
+    /// <conditions>)`.
+    fn anti_join(&mut self, anti_join: &AntiJoin<'db, ParserDB>) -> Expr {
+        self.read.push(anti_join.table());
+        let mut conditions: Vec<Expr> = anti_join
+            .correlations()
+            .iter()
+            .map(|correlation| {
+                equals(
+                    qualified(BLOCKING, column_ident(correlation.blocking_column())),
+                    qualified(ARM, column_ident(correlation.arm_column())),
+                )
+            })
+            .collect();
+        conditions.extend(restrictions(BLOCKING, anti_join.restrictions()));
+        conditions.extend(time_bounds(BLOCKING, anti_join.time_bounds()));
+        Expr::Exists {
+            subquery: Box::new(single_expr_query(
+                Expr::Value(Value::Number("1".into(), false).into()),
+                from_relation(aliased_table(anti_join.table(), BLOCKING)),
+                conjunction(conditions),
+            )),
+            negated: true,
+        }
+    }
+}
+
+/// The alias of the row a grant arm joins at `row` in its joined rows.
+fn joined_alias(row: usize) -> String {
+    format!("joined_{row}")
+}
+
+/// `SELECT NULL WHERE false`, the set holding no value.
+fn empty_set() -> Query {
+    single_expr_query(
+        Expr::Value(Value::Null.into()),
+        Vec::new(),
+        Some(Expr::Value(Value::Boolean(false).into())),
+    )
+}
+
+/// The bodies joined left to right by `UNION` under `quantifier`, `None`
+/// for no body.
+fn union(bodies: Vec<SetExpr>, quantifier: SetQuantifier) -> Option<SetExpr> {
+    bodies.into_iter().reduce(|left, right| set_operation(left, right, quantifier))
+}
+
+fn set_operation(left: SetExpr, right: SetExpr, set_quantifier: SetQuantifier) -> SetExpr {
+    SetExpr::SetOperation {
+        op: SetOperator::Union,
+        set_quantifier,
+        left: Box::new(left),
+        right: Box::new(right),
+    }
+}
+
+/// What each column has to hold, `relation` naming the row read.
+fn restrictions<'r>(
+    relation: &'r str,
+    restrictions: &'r [Restriction<'_, ParserDB>],
+) -> impl Iterator<Item = Expr> + 'r {
+    restrictions.iter().map(move |restriction| {
+        let column = Box::new(qualified(relation, column_ident(restriction.column())));
+        match restriction {
+            Restriction::In(set) => {
+                Expr::In {
+                    expr: column,
+                    target: InTarget::List(
+                        set.values()
+                            .iter()
+                            .map(|value| Expr::Value(ValueWithSpan::from(value.clone())))
+                            .collect(),
+                    ),
                     negated: false,
                     global: false,
-                }),
-            ))
+                }
+            }
+            Restriction::Null(_) => Expr::IsNull(column),
+            Restriction::NotNull(_) => Expr::IsNotNull(column),
         }
-        HelperArm::Walk(_) => Err(walk_refusal(helper)),
-    }
-}
-
-/// The refusal of a set grown along a walk.
-fn walk_refusal(helper: &ObjectName) -> Error {
-    Error::forward_refusal(format!(
-        "{helper}() cannot be translated as the set it returns: the set grows along a walk, \
-         which the translation does not write out."
-    ))
-}
-
-/// The first condition of `grant` beside its grantee and restrictions the
-/// lowering does not write out, as a refusal names it.
-fn unwritten(grant: &GrantArm<'_, ParserDB>) -> Option<&'static str> {
-    if !grant.joined_rows().is_empty() {
-        Some("a row of another table it joins")
-    } else if !grant.anti_joins().is_empty() {
-        Some("a row of another table whose existence takes it away")
-    } else if !grant.caps().is_empty() {
-        Some("a cap another helper's set puts on it")
-    } else if grant.gate().is_some() {
-        Some("a condition on a caller setting itself")
-    } else if !grant.time_bounds().is_empty() {
-        Some("a bound on the statement time")
-    } else {
-        None
-    }
-}
-
-/// A column of the one table its arm reads, left unqualified since the
-/// innermost `FROM` is the first place both engines look for it.
-fn column(column: &<ParserDB as DatabaseLike>::Column) -> Expr {
-    let name = column.column_name();
-    Expr::Identifier(if column.column_name_is_quoted() {
-        Ident::with_quote('"', name)
-    } else {
-        Ident::new(name)
     })
+}
+
+/// `(<column> <comparison> now() [OR <column> IS NULL])` for each bound,
+/// `relation` naming the row read.
+fn time_bounds<'r>(
+    relation: &'r str,
+    bounds: &'r [TimeBound<'_, ParserDB>],
+) -> impl Iterator<Item = Expr> + 'r {
+    bounds.iter().map(move |bound| {
+        let column = qualified(relation, column_ident(bound.column()));
+        let operator = match bound.comparison() {
+            TimeComparison::Later => BinaryOperator::Gt,
+            TimeComparison::LaterOrEqual => BinaryOperator::GtEq,
+            TimeComparison::Earlier => BinaryOperator::Lt,
+            TimeComparison::EarlierOrEqual => BinaryOperator::LtEq,
+        };
+        let compared = Expr::BinaryOp {
+            left: Box::new(column.clone()),
+            op: operator,
+            right: Box::new(simple_function_expr("now", Vec::new(), None)),
+        };
+        if !bound.keeps_null() {
+            return compared;
+        }
+        Expr::Nested(Box::new(Expr::BinaryOp {
+            left: Box::new(compared),
+            op: BinaryOperator::Or,
+            right: Box::new(Expr::IsNull(Box::new(column))),
+        }))
+    })
+}
+
+/// `current_setting('<name>'[, true])`, through `NULLIF(..., '')` when
+/// `empty_is_null`, `raises_when_unset` choosing the one-argument read.
+fn setting_read(name: &str, raises_when_unset: bool, empty_is_null: bool) -> Expr {
+    let mut arguments = vec![string_literal(name)];
+    if !raises_when_unset {
+        arguments.push(Expr::Value(Value::Boolean(true).into()));
+    }
+    let read = simple_function_expr("current_setting", arguments, None);
+    if !empty_is_null {
+        return read;
+    }
+    simple_function_expr("nullif", vec![read, string_literal("")], None)
+}
+
+fn cast(expr: Expr, data_type: DataType) -> Expr {
+    Expr::Cast { kind: CastKind::DoubleColon, expr: Box::new(expr), data_type, format: None }
+}
+
+fn equals(left: Expr, right: Expr) -> Expr {
+    Expr::BinaryOp { left: Box::new(left), op: BinaryOperator::Eq, right: Box::new(right) }
+}
+
+fn in_query(expr: Expr, query: Query) -> Expr {
+    Expr::In {
+        expr: Box::new(expr),
+        target: InTarget::Subquery(Box::new(query)),
+        negated: false,
+        global: false,
+    }
+}
+
+/// The conditions joined by `AND`, `None` for no condition.
+fn conjunction(conditions: impl IntoIterator<Item = Expr>) -> Option<Expr> {
+    conditions.into_iter().reduce(|left, right| {
+        Expr::BinaryOp { left: Box::new(left), op: BinaryOperator::And, right: Box::new(right) }
+    })
+}
+
+fn alias(name: &str) -> TableAlias {
+    TableAlias { explicit: true, name: Ident::new(name), columns: Vec::new(), at: None }
+}
+
+/// `<table> AS <name>`.
+fn aliased_table(table: &CreateTable, name: &str) -> TableFactor {
+    let mut relation = plain_table_factor(table.name.clone());
+    if let TableFactor::Table { alias: slot, .. } = &mut relation {
+        *slot = Some(alias(name));
+    }
+    relation
+}
+
+/// `<relation>.<column>`.
+fn qualified(relation: &str, column: Ident) -> Expr {
+    Expr::CompoundIdentifier(vec![Ident::new(relation), column])
+}
+
+/// A column's name, quoted where the schema quotes it.
+fn column_ident(column: &<ParserDB as DatabaseLike>::Column) -> Ident {
+    let name = column.column_name();
+    if column.column_name_is_quoted() { Ident::with_quote('"', name) } else { Ident::new(name) }
 }
 
 /// Points every relation of a lowered set at its table's backing table.
