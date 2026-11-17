@@ -8,12 +8,13 @@ use sql_traits::{
     traits::{DatabaseLike, ViewLike},
 };
 use sqlparser::ast::{
-    BinaryOperator, CaseWhen, Expr, Ident, TableFactor, TriggerEvent, Visit, Visitor,
+    BinaryOperator, CaseWhen, DataType, Expr, Ident, TableFactor, TriggerEvent, Visit, Visitor,
     helpers::attached_token::AttachedToken,
 };
 
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
+use crate::options::BoundVariable;
 
 /// The trigger a function body is translated for.
 #[derive(Clone, Debug, Default)]
@@ -202,7 +203,9 @@ pub(crate) struct UuidFirstUse {
 /// default are persistent and survive every branch.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct BodyScope {
-    declared: BTreeSet<String>,
+    /// Each declared name, folded, with the type it is declared with, or
+    /// `None` for a `%TYPE` or `%ROWTYPE` declaration and a helper parameter.
+    declared: BTreeMap<String, Option<DataType>>,
     persistent: BTreeMap<String, Binding>,
     scoped: BTreeMap<String, Binding>,
     conditions: Vec<Expr>,
@@ -257,20 +260,21 @@ impl BodyScope {
         &self.written
     }
 
-    /// Records `name`, folded, as declared, so a read of it before any
-    /// assignment answers `NULL`.
-    pub(crate) fn declare(&mut self, name: &str) {
-        self.declared.insert(name.to_string());
+    /// Records `name`, folded, as declared with `data_type`, so a read of it
+    /// before any assignment answers `NULL` and a read after one reads the
+    /// type.
+    pub(crate) fn declare(&mut self, name: &str, data_type: Option<DataType>) {
+        self.declared.insert(name.to_string(), data_type);
     }
 
     /// Whether `ident` reads a declared variable.
     pub(crate) fn is_declared(&self, ident: &Ident) -> bool {
-        self.declared.contains(&fold(ident))
+        self.declared.contains_key(&fold(ident))
     }
 
     /// Whether `name`, folded, is already declared.
     pub(crate) fn declares(&self, name: &str) -> bool {
-        self.declared.contains(name)
+        self.declared.contains_key(name)
     }
 
     /// Binds `binding` for the rest of the body, across `IF` branches.
@@ -286,6 +290,19 @@ impl BodyScope {
     /// Every binding in force, the scoped ones first.
     pub(crate) fn bindings(&self) -> impl Iterator<Item = &Binding> {
         self.scoped.values().chain(self.persistent.values())
+    }
+
+    /// The variable each binding in force binds, with the type its
+    /// declaration writes.
+    pub(crate) fn variables(&self) -> Vec<BoundVariable> {
+        self.bindings()
+            .map(|binding| {
+                BoundVariable::new(
+                    binding.name.clone(),
+                    self.declared.get(&binding.name).cloned().flatten(),
+                )
+            })
+            .collect()
     }
 
     /// The persistent binding of `name`, which survives every branch.

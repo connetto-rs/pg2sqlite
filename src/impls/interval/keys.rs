@@ -1131,7 +1131,7 @@ mod tests {
                     plain.is_none(),
                     "a declared column keeps its ordinary translation under GROUP BY"
                 );
-                let variables = vec![String::from("x")];
+                let variables = vec![crate::options::BoundVariable::new(String::from("x"), None)];
                 let with_vars = scoped.with_variables(&variables);
                 let keyed = select_list_item(&item, &projection, true, schema, &with_vars)
                     .expect("a group by name settles");

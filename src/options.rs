@@ -245,6 +245,37 @@ enum TranslationScope<'a> {
     Definition(ColumnDefinitionScope<'a, 'a, 'a, ParserDB>),
 }
 
+/// A PL/pgSQL variable bound in the body being translated, with the
+/// declaration a reference to it reads its type from.
+#[derive(Debug, Clone)]
+pub(crate) struct BoundVariable {
+    name: String,
+    declaration: Option<sqlparser::ast::ColumnDef>,
+}
+
+impl BoundVariable {
+    /// The variable `name` declared as `data_type`, or without a declaration
+    /// when its type is written as `%TYPE` or `%ROWTYPE`.
+    pub(crate) fn new(name: String, data_type: Option<sqlparser::ast::DataType>) -> Self {
+        let declaration = data_type.map(|data_type| {
+            sqlparser::ast::ColumnDef {
+                name: sqlparser::ast::Ident::new(name.clone()),
+                data_type,
+                options: Vec::new(),
+            }
+        });
+        Self::declared(name, declaration)
+    }
+
+    /// The variable `name` whose references read `declaration`.
+    pub(crate) const fn declared(
+        name: String,
+        declaration: Option<sqlparser::ast::ColumnDef>,
+    ) -> Self {
+        Self { name, declaration }
+    }
+}
+
 /// The options a translation runs under, together with what it has learned
 /// about the statements around the one it is translating.
 ///
@@ -271,10 +302,11 @@ pub struct TranslationContext<'a> {
     /// one arm of a set operation still reads a CTE reference as opaque rather
     /// than matching a base table of the same name.
     with: Option<&'a sqlparser::ast::With>,
-    /// Names bound as PL/pgSQL variables in the body being translated. A
-    /// variable is not a column, so a reference naming one has no declared type
-    /// to read and is neither resolved nor refused.
-    variables: &'a [String],
+    /// The PL/pgSQL variables bound in the body being translated. A variable
+    /// is not a column, so a reference naming one reads the variable's
+    /// declaration, or nothing for a variable without one, and is never
+    /// resolved against the relations in scope.
+    variables: &'a [BoundVariable],
     /// Whether every relation available to the input is present in the schema.
     schema_is_complete: bool,
     subqueries_allowed: bool,
@@ -316,7 +348,7 @@ struct ContextFields<'a> {
     options: Cow<'a, Pg2SqliteOptions>,
     catalogs: Cow<'a, PrewalkCatalogs>,
     with: Option<&'a sqlparser::ast::With>,
-    variables: &'a [String],
+    variables: &'a [BoundVariable],
     schema_is_complete: bool,
     subqueries_allowed: bool,
     rebound_body: Option<&'a sqlparser_plpgsql::embedded::Block>,
@@ -492,7 +524,10 @@ impl<'a> TranslationContext<'a> {
     }
 
     /// The same context noting the PL/pgSQL variables in scope.
-    pub(crate) fn with_variables<'s>(&'s self, variables: &'s [String]) -> TranslationContext<'s> {
+    pub(crate) fn with_variables<'s>(
+        &'s self,
+        variables: &'s [BoundVariable],
+    ) -> TranslationContext<'s> {
         let mut fields = ContextFields::borrowed(self);
         fields.variables = variables;
         fields.into_context(self.scope, self.outer)
@@ -606,7 +641,18 @@ impl<'a> TranslationContext<'a> {
     /// column.
     #[must_use]
     pub(crate) fn is_variable(&self, name: &str) -> bool {
-        self.variables.iter().any(|variable| variable.eq_ignore_ascii_case(name))
+        self.variables.iter().any(|variable| variable.name.eq_ignore_ascii_case(name))
+    }
+
+    /// The declaration of the PL/pgSQL variable `name`, unquoted, or [`None`]
+    /// when no variable of that name is bound or its type is not declared in
+    /// a form this reads.
+    #[must_use]
+    pub(crate) fn variable_declaration(&self, name: &str) -> Option<&sqlparser::ast::ColumnDef> {
+        self.variables
+            .iter()
+            .find(|variable| variable.name.eq_ignore_ascii_case(name))
+            .and_then(|variable| variable.declaration.as_ref())
     }
 
     #[must_use]

@@ -20,6 +20,7 @@ use crate::{
         shared_helpers::{
             declared_in_scope, minor_unit_scale, numeric_scale, referenced_column_name,
             render_minor_units_as_text, scalar_query_declared, scope_declines_column,
+            variable_declaration,
         },
         temporal_arithmetic::{TemporalKind, temporal_kind, trim_trailing_zeros},
         translator_impls::{
@@ -225,7 +226,9 @@ fn conversion_of(
     options: &TranslationContext<'_>,
 ) -> Result<Option<Conversion>, Error> {
     if let Some(column_name) = referenced_column_name(expr) {
-        if scope_declines_column(expr, column_name, options) {
+        if scope_declines_column(expr, column_name, options)
+            && variable_declaration(expr, options).is_none()
+        {
             return Ok(Some(Conversion::Stored(Stored::Native)));
         }
         return declared_in_scope(

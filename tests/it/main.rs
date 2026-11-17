@@ -183,6 +183,7 @@ mod test_plpgsql_var_substitution;
 mod test_plpgsql_variable_name_collisions;
 mod test_plpgsql_variable_positions;
 mod test_plpgsql_variable_scoping;
+mod test_plpgsql_variable_types;
 mod test_policy_refusal;
 mod test_postgis_dispatch;
 mod test_postgis_gist;

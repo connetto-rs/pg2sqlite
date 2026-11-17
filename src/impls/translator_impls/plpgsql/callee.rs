@@ -346,7 +346,7 @@ impl PlPgSqlTranslator {
             let value = sql_helper::inlined_calls(&value, schema, options)?;
             let value = resolved(value, scope)?;
             let parameter = fold(parameter);
-            callee.declare(&parameter);
+            callee.declare(&parameter, None);
             callee.bind_persistent(Binding {
                 name: parameter.clone(),
                 value: BoundValue::Expr(value),
@@ -361,8 +361,7 @@ impl PlPgSqlTranslator {
         };
         let running_as = owner.map(|owner| options.with_running_as(owner));
         let body_options = running_as.as_ref().unwrap_or(options);
-        let variables: Vec<String> =
-            callee.bindings().map(|binding| binding.name.clone()).collect();
+        let variables = callee.variables();
         let mut statements = Self::evaluate_assigned(
             &parameters,
             &callee,
