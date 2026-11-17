@@ -370,10 +370,14 @@ pub(crate) fn infinite_temporal_guard(
 }
 
 /// The operand and the finite lowering of an [`infinite_temporal_guard`] that
-/// keeps the operand's own infinity, or `expr` back for anything else.
+/// keeps the operand's own infinity, parenthesised or not, or `expr` back for
+/// anything else.
 pub(crate) fn split_same_temporal_guard(expr: Expr) -> Result<(Expr, Expr), Box<Expr>> {
     use crate::impls::temporal_infinity::InfiniteAnswer;
     match expr {
+        Expr::Nested(inner) => {
+            split_same_temporal_guard(*inner).map_err(|inner| Box::new(Expr::Nested(inner)))
+        }
         Expr::Case { operand: Some(operand), conditions, else_result: Some(finite), .. }
             if conditions == infinite_temporal_arms(InfiniteAnswer::Same) =>
         {

@@ -206,9 +206,41 @@ fn at_time_zone_keeps_the_infinity() {
 #[test]
 fn date_arithmetic_keeps_the_infinity_and_answers_null_where_postgresql_raises() {
     // PostgreSQL raises `cannot subtract infinite dates` on rows 2 and 3.
-    assert_parity(&["d + 1", "d - 1", "7 + d"]);
+    assert_parity(&["d + 1", "d - 1", "7 + d", "(d + 1) + id"]);
     assert_eq!(replica("d - date '2024-01-01'"), [Some("59".to_string()), None, None, None]);
     assert_eq!(replica("date '2024-01-01' - d"), [Some("-59".to_string()), None, None, None]);
+}
+
+#[test]
+fn arithmetic_postgresql_raises_over_infinite_literals_is_refused() {
+    assert_refused("SELECT date 'infinity' - date '2024-01-01';", "cannot subtract infinite dates");
+    assert_refused(
+        "SELECT extract(epoch FROM timestamp 'infinity' - timestamp 'infinity');",
+        "interval out of range",
+    );
+}
+
+#[test]
+fn a_time_of_day_read_from_an_infinity_is_null() {
+    assert_parity(&["extract(hour FROM ts::time)", "to_char(ts::time, 'HH24:MI')"]);
+}
+
+#[test]
+fn a_zoned_quarter_of_a_volatile_instant_is_refused() {
+    let error = pg2sqlite::prelude::Pg2Sqlite::default()
+        .sql(&utc_script("SELECT date_trunc('quarter', clock_timestamp());"))
+        .expect("parse")
+        .translate_to_sql(&utc_request())
+        .expect_err("the quarter reads the instant twice");
+    assert!(error.to_string().contains("has no SQLite form that reads"), "{error}");
+}
+
+#[test]
+fn a_text_cast_repeating_an_xor_in_a_check_is_refused() {
+    assert_refused(
+        "CREATE TABLE c (txt text, CHECK ((txt || (1 # 2)::text)::date IS NOT NULL));",
+        "would repeat an operand",
+    );
 }
 
 #[test]
@@ -251,6 +283,10 @@ fn a_date_shifted_by_a_volatile_count_answers_the_finite_rows() {
     assert_eq!(
         replica("d + (random() * 0)::integer"),
         [Some("2024-02-29".to_string()), None, None, None]
+    );
+    assert_eq!(
+        replica("(d + (random() * 0)::integer) + id"),
+        [Some("2024-03-01".to_string()), None, None, None]
     );
 }
 
