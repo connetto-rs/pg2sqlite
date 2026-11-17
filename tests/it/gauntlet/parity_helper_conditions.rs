@@ -1,11 +1,12 @@
 //! Parity for every condition a `SECURITY DEFINER` helper's grant arm holds
 //! and for the walks its set grows along: a joined row, an anti-join, a time
 //! bound, a principal beside the caller, a delimited set, a caller gate, a
-//! row cap lifted for a request acting through no installation, a returned
-//! key capped by another helper's set, a walk down two edge tables kept to a
-//! selection, and a walk up a tree feeding a grantee set. Then for an arm
-//! reading another helper's rows. Each helper guards the same table under a
-//! policy of its own, which both engines read under every request state.
+//! scalar compared as sent or lowered, a row cap lifted for a request acting
+//! through no installation, a returned key capped by another helper's set, a
+//! walk down two edge tables kept to a selection, and a walk up a tree
+//! feeding a grantee set. Then for an arm reading another helper's rows. Each
+//! helper guards the same table under a policy of its own, which both engines
+//! read before any request and then under every request state.
 
 // `register_impl` takes an unwind-safe closure, which a poisoning mutex is.
 use std::sync::{Arc, Mutex};
@@ -69,6 +70,11 @@ CREATE TABLE team_members (
   user_id TEXT NOT NULL,
   PRIMARY KEY (team_id, user_id)
 );
+CREATE TABLE invitations (
+  doc_id TEXT NOT NULL REFERENCES docs (id),
+  email TEXT NOT NULL,
+  PRIMARY KEY (doc_id, email)
+);
 
 CREATE SCHEMA authz;
 
@@ -129,6 +135,18 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
   SELECT doc.id FROM public.docs doc
   WHERE doc.org_id IN (
     SELECT jsonb_array_elements_text(NULLIF(current_setting('app.org_ids', true), '')::jsonb))
+$$;
+
+CREATE FUNCTION authz.invited_docs() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT invitation.doc_id FROM public.invitations invitation
+  WHERE invitation.email = NULLIF(current_setting('app.verified_email', true), '')
+$$;
+
+CREATE FUNCTION authz.lowered_invited_docs() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT invitation.doc_id FROM public.invitations invitation
+  WHERE invitation.email = lower(current_setting('app.verified_email', true))
 $$;
 
 CREATE FUNCTION authz.capped_kinds() RETURNS TABLE (org_id TEXT, kind TEXT)
@@ -223,6 +241,8 @@ ALTER FUNCTION authz.linked_docs() OWNER TO conditions_owner;
 ALTER FUNCTION authz.signed_in_docs() OWNER TO conditions_owner;
 ALTER FUNCTION authz.leveled_docs() OWNER TO conditions_owner;
 ALTER FUNCTION authz.listed_org_docs() OWNER TO conditions_owner;
+ALTER FUNCTION authz.invited_docs() OWNER TO conditions_owner;
+ALTER FUNCTION authz.lowered_invited_docs() OWNER TO conditions_owner;
 ALTER FUNCTION authz.capped_kinds() OWNER TO conditions_owner;
 ALTER FUNCTION authz.capped_docs() OWNER TO conditions_owner;
 ALTER FUNCTION authz.kinds_for(TEXT) OWNER TO conditions_owner;
@@ -248,7 +268,7 @@ GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA authz TO app;
 ";
 
 /// Each helper's policy over `docs`, one case per condition it carries.
-const CASES: [(&str, &str); 13] = [
+const CASES: [(&str, &str); 15] = [
     ("a joined row", "org_id IN (SELECT authz.member_orgs())"),
     ("a row cap over a joined row", "org_id IN (SELECT authz.administered_orgs())"),
     ("an anti-join, time bounds and a principal", "id IN (SELECT authz.granted_docs())"),
@@ -256,6 +276,8 @@ const CASES: [(&str, &str); 13] = [
     ("a caller gate", "id IN (SELECT authz.signed_in_docs())"),
     ("a caller gate in the declared type", "id IN (SELECT authz.leveled_docs())"),
     ("a JSON array set", "id IN (SELECT authz.listed_org_docs())"),
+    ("a scalar", "id IN (SELECT authz.invited_docs())"),
+    ("a lowered scalar", "id IN (SELECT authz.lowered_invited_docs())"),
     ("a lifted row cap", "id IN (SELECT authz.capped_docs())"),
     ("a lifted row cap over no row", "id IN (SELECT authz.capped_files())"),
     ("a walk down kept to a selection", "id IN (SELECT authz.reachable_docs())"),
@@ -264,27 +286,53 @@ const CASES: [(&str, &str); 13] = [
     ("an arm reading another helper's rows", "org_id IN (SELECT authz.called_orgs())"),
 ];
 
-/// What a request carries, `''` standing for a setting it leaves unset.
+/// What a request carries, `''` standing for a setting it sends empty and
+/// `None` for one the session never set, which no request reproduces once
+/// the setting was set.
 #[derive(Debug, Clone, Copy)]
 struct Request {
-    user: &'static str,
-    installation: &'static str,
-    links: &'static str,
-    orgs: &'static str,
-    level: &'static str,
+    user: Option<&'static str>,
+    installation: Option<&'static str>,
+    links: Option<&'static str>,
+    orgs: Option<&'static str>,
+    level: Option<&'static str>,
+    email: Option<&'static str>,
 }
+
+/// What a session holds before any request, the user the harness sets on
+/// every connection and no other setting.
+const UNSENT: Request = Request {
+    user: Some(postgres_harness::DEFAULT_SESSION_USER),
+    installation: None,
+    links: None,
+    orgs: None,
+    level: None,
+    email: None,
+};
 
 /// A request with nothing set but `user`, `installation` and `links`.
 const fn request(user: &'static str, installation: &'static str, links: &'static str) -> Request {
-    Request { user, installation, links, orgs: "", level: "" }
+    Request {
+        user: Some(user),
+        installation: Some(installation),
+        links: Some(links),
+        orgs: Some(""),
+        level: Some(""),
+        email: Some(""),
+    }
 }
 
 /// A request with nothing set but `level`.
 const fn leveled(level: &'static str) -> Request {
-    Request { level, ..request("", "", "") }
+    Request { level: Some(level), ..request("", "", "") }
 }
 
-const REQUESTS: [Request; 12] = [
+/// A request with nothing set but `email`.
+const fn emailed(email: &'static str) -> Request {
+    Request { email: Some(email), ..request("", "", "") }
+}
+
+const REQUESTS: [Request; 15] = [
     request("", "", ""),
     request("u1", "", ""),
     request("u2", "", ""),
@@ -293,10 +341,13 @@ const REQUESTS: [Request; 12] = [
     request("", "i1", ""),
     request("", "", "l1,l2"),
     request("u2", "", "l1"),
-    Request { orgs: "[\"o2\"]", ..request("", "", "") },
-    Request { orgs: "[\"o1\", \"o9\"]", ..request("u1", "", "") },
+    Request { orgs: Some("[\"o2\"]"), ..request("", "", "") },
+    Request { orgs: Some("[\"o1\", \"o9\"]"), ..request("u1", "", "") },
     leveled("07"),
     leveled("8"),
+    emailed("eve@example.com"),
+    emailed("Eve@Example.COM"),
+    emailed("mallory@example.com"),
 ];
 
 /// An instant well before the test runs, or well after.
@@ -358,6 +409,8 @@ const LINKS: [(&str, &str, Option<Stamp>); 2] =
 const PERMISSIONS: [(&str, &str, &str); 1] = [("i1", "o1", "page")];
 const TEAMS: [(&str, Option<&str>); 3] = [("t1", None), ("t2", Some("t1")), ("t3", Some("t2"))];
 const TEAM_MEMBERS: [(&str, &str); 1] = [("t3", "u2")];
+const INVITATIONS: [(&str, &str); 4] =
+    [("d1", "eve@example.com"), ("d2", "Eve@Example.COM"), ("d3", "bob@example.com"), ("d6", "")];
 
 mod schema {
     /// Declares the tables, every instant column holding `$instant`.
@@ -398,6 +451,7 @@ mod schema {
             }
             diesel::table! { teams (id) { id -> Text, parent_id -> Nullable<Text>, } }
             diesel::table! { team_members (team_id, user_id) { team_id -> Text, user_id -> Text, } }
+            diesel::table! { invitations (doc_id, email) { doc_id -> Text, email -> Text, } }
         };
     }
 
@@ -433,6 +487,9 @@ extern "SQL" {
     fn app_org_ids() -> diesel::sql_types::Nullable<diesel::sql_types::Text>;
     /// The replica's stand-in for `current_setting('app.level', true)`.
     fn app_level() -> diesel::sql_types::Nullable<diesel::sql_types::Text>;
+    /// The replica's stand-in for `current_setting('app.verified_email',
+    /// true)`.
+    fn app_verified_email() -> diesel::sql_types::Nullable<diesel::sql_types::Text>;
 }
 
 /// Seeds the rows through the path that bypasses the policy, the table owner
@@ -440,8 +497,8 @@ extern "SQL" {
 macro_rules! seed {
     ($connection:expr, $schema:ident, $docs:ident, $past:expr, $future:expr) => {{
         use schema::$schema::{
-            attachments, blocks, doc_parents, grants, links, members, orgs, permissions,
-            team_members, teams,
+            attachments, blocks, doc_parents, grants, invitations, links, members, orgs,
+            permissions, team_members, teams,
         };
         let stamp = |stamp: Option<Stamp>| {
             stamp.map(|stamp| {
@@ -543,6 +600,12 @@ macro_rules! seed {
                 .execute($connection)
                 .expect("seed team members");
         }
+        for (doc, email) in INVITATIONS {
+            diesel::insert_into(invitations::table)
+                .values((invitations::doc_id.eq(doc), invitations::email.eq(email)))
+                .execute($connection)
+                .expect("seed invitations");
+        }
     }};
 }
 
@@ -585,6 +648,7 @@ fn deployment() -> Deployment {
                 SettingValue::Set { element: DataType::Text, packing: SetPacking::JsonArray },
             ),
             unset("app.level", SettingValue::Caller(DataType::Int(None))),
+            unset("app.verified_email", SettingValue::Scalar(DataType::Text)),
         ],
     )
     .expect("a valid deployment")
@@ -601,6 +665,10 @@ fn options() -> Pg2SqliteOptions {
         .with_session_variable(SessionVariableMapping::new("app.link_ids", "app_link_ids"))
         .with_session_variable(SessionVariableMapping::new("app.org_ids", "app_org_ids"))
         .with_session_variable(SessionVariableMapping::new("app.level", "app_level"))
+        .with_session_variable(SessionVariableMapping::new(
+            "app.verified_email",
+            "app_verified_email",
+        ))
         .with_deployment(deployment())
 }
 
@@ -620,6 +688,7 @@ fn postgres(predicate: &str) -> PgConnection {
     connection
 }
 
+/// The replica, whose settings read what `request` holds.
 fn sqlite(predicate: &str, request: &Arc<Mutex<Request>>) -> SqliteConnection {
     let translated = Pg2Sqlite::default()
         .sql(&format!("{OWNER}{SCHEMA}{}", policy(predicate)))
@@ -628,9 +697,9 @@ fn sqlite(predicate: &str, request: &Arc<Mutex<Request>>) -> SqliteConnection {
         .unwrap_or_else(|error| panic!("pg2sqlite refused {predicate}: {error}"))
         .into_vec();
     let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-    let read = |pick: fn(&Request) -> &'static str| {
+    let read = |pick: fn(&Request) -> Option<&'static str>| {
         let request = Arc::clone(request);
-        move || Some(pick(&request.lock().expect("the request lock")).to_owned())
+        move || pick(&request.lock().expect("the request lock")).map(str::to_owned)
     };
     app_user_id_utils::register_impl(&mut connection, read(|request| request.user))
         .expect("register app_user_id");
@@ -642,12 +711,20 @@ fn sqlite(predicate: &str, request: &Arc<Mutex<Request>>) -> SqliteConnection {
         .expect("register app_org_ids");
     app_level_utils::register_impl(&mut connection, read(|request| request.level))
         .expect("register app_level");
+    app_verified_email_utils::register_impl(&mut connection, read(|request| request.email))
+        .expect("register app_verified_email");
     apply_with_seed(&mut connection, &translated, |connection| {
         seed!(connection, replica, docs_rls, STORED_PAST, STORED_FUTURE);
     });
     connection
 }
 
+/// Sets every setting `request` carries.
+///
+/// # Panics
+///
+/// Panics on a setting `request` leaves never set, which a session that set
+/// it cannot return to.
 fn send(connection: &mut PgConnection, request: Request) {
     for (name, value) in [
         ("app.user_id", request.user),
@@ -655,7 +732,9 @@ fn send(connection: &mut PgConnection, request: Request) {
         ("app.link_ids", request.links),
         ("app.org_ids", request.orgs),
         ("app.level", request.level),
+        ("app.verified_email", request.email),
     ] {
+        let value = value.unwrap_or_else(|| panic!("{name} cannot be unset once set"));
         diesel::select(set_config(name, value, false))
             .execute(connection)
             .unwrap_or_else(|error| panic!("set {name}: {error}"));
@@ -666,9 +745,11 @@ fn send(connection: &mut PgConnection, request: Request) {
 fn every_helper_condition_keeps_the_rows_postgresql_keeps() {
     for (case, predicate) in CASES {
         let mut source = postgres(predicate);
-        let current = Arc::new(Mutex::new(REQUESTS[0]));
+        let current = Arc::new(Mutex::new(UNSENT));
         let mut replica = sqlite(predicate, &current);
-        let mut kept_any = false;
+        let expected = visible(&mut source);
+        assert_eq!(visible(&mut replica), expected, "{case} before any request");
+        let mut kept_any = !expected.is_empty();
         for request in REQUESTS {
             send(&mut source, request);
             *current.lock().expect("the request lock") = request;
