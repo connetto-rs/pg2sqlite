@@ -1063,6 +1063,14 @@ fn contains_expr(targets: &[Expr], expr: &Expr) -> bool {
     targets.iter().any(|target| target == expr)
 }
 
+fn select_item_is_aggregate(item: &SelectItem) -> bool {
+    matches!(
+        item,
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. }
+            if is_aggregate_expression(expr)
+    )
+}
+
 fn rewrite_projection_for_grouping_set(
     projection: &[SelectItem],
     active_group_keys: &[Expr],
@@ -1247,6 +1255,11 @@ fn try_translate_grouping_query(
         )?;
 
         let mut branch_select = translated_base.clone();
+        // One row even over empty input, as this projection reads no row.
+        if group_set.is_empty() && !projection.iter().any(select_item_is_aggregate) {
+            branch_select.from = Vec::new();
+            branch_select.selection = None;
+        }
         branch_select.projection = projection;
         branch_select.group_by = GroupByExpr::Expressions(group_set, Vec::new());
         branches.push(SetExpr::Select(Box::new(branch_select)));
