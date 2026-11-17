@@ -19,13 +19,18 @@
 //!    level security view and trigger set is the clearest case. This list is
 //!    closed and each member says where its effect is realised.
 //!
-//! Silence is additionally permitted where a caller-set option asks for it,
-//! currently only `RoleTableAccess::Deny`, which is documented at the option
-//! that sets it.
+//! A caller-set option may also ask for a drop. `RoleTableAccess::Deny`, from
+//! the acting role named with `with_acting_role`, drops in silence a table the
+//! role holds no privilege on, and its indexes, its triggers and every
+//! statement writing or altering it leave with it, as `off_replica` describes.
+//! `with_server_derived_writes_omitted` drops a trigger with a `LeftToServer`
+//! warning. Each is documented at the option that sets it.
 //!
 //! The match over `Statement` has no wildcard arm on purpose: a new
 //! `sqlparser` variant fails to compile until it is classified here, which is
 //! stronger than discovering it at run time.
+
+use alloc::borrow::Cow;
 
 use sql_traits::{structs::ParserDB, traits::TableLike};
 use sqlparser::ast::{
@@ -44,6 +49,9 @@ use crate::{
     errors::Error,
     impls::{
         ast_builder,
+        derived_writes::{
+            foreign_key_left_to_server, trigger_derived_write, trigger_left_to_server,
+        },
         object_name::{
             append_suffix, last_ident, last_ident_value_or_display,
             normalize_schema_qualified_object_name_for_sqlite, quoted_ident,
@@ -56,6 +64,7 @@ use crate::{
             column::translate_column_def,
             condition_injection::inject_condition_into_dml_statement,
             nulls_not_distinct::{companion_drops, table_companions},
+            off_replica::{self, OffReplica, Write},
             rls::{
                 generate_rls_statements_with_context, generate_view_statements,
                 rename_table_for_rls, validate_table_policies, write_guard_condition_expr,
@@ -100,6 +109,11 @@ fn append_guarded_statements(
     Ok(())
 }
 
+/// Translates `create_trigger`, or leaves it to the server when the replica
+/// omits the writes the server derives and the trigger writes rows.
+///
+/// A replacing trigger left out still drops the trigger it replaces, which may
+/// have been kept.
 fn append_translated_create_trigger_statements(
     statements: &mut Vec<Statement>,
     create_trigger: &sqlparser::ast::CreateTrigger,
@@ -107,6 +121,23 @@ fn append_translated_create_trigger_statements(
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<(), Error> {
+    if options.is_server_derived_writes_omitted()
+        && let Some(reason) = trigger_derived_write(create_trigger, schema)?
+    {
+        emit(trigger_left_to_server(create_trigger, reason));
+        if create_trigger.or_replace {
+            statements.push(Statement::DropTrigger(sqlparser::ast::DropTrigger {
+                if_exists: true,
+                trigger_name: normalize_schema_qualified_object_name_for_sqlite(
+                    schema,
+                    &create_trigger.name,
+                )?,
+                table_name: None,
+                option: None,
+            }));
+        }
+        return Ok(());
+    }
     for (maybe_drop_trigger, translated_trigger) in
         create_trigger.translate_with_warnings(schema, options, emit)?
     {
@@ -610,6 +641,10 @@ fn translate_alter_table(
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Vec<Statement>, Error> {
+    reject_untranslatable_alter_table_clauses(alter_table, schema)?;
+    if OffReplica::of(&alter_table.name, schema, options)?.is_some() {
+        return Ok(Vec::new());
+    }
     // An RLS table is translated as a view over a suffixed backing table, and
     // a view cannot be altered, so the statement lands on the backing table
     // the way TRUNCATE's does. No wrapper rebuild is needed: every generated
@@ -625,7 +660,6 @@ fn translate_alter_table(
     } else {
         normalize_schema_qualified_object_name_for_sqlite(schema, &alter_table.name)?
     };
-    reject_untranslatable_alter_table_clauses(alter_table, schema)?;
 
     let mut statements = Vec::with_capacity(alter_table.operations.len());
     for operation in &alter_table.operations {
@@ -816,6 +850,22 @@ fn translate_alter_table_operation(
         | AlterTableOperation::ForceRowLevelSecurity
         | AlterTableOperation::NoForceRowLevelSecurity
         | AlterTableOperation::OwnerTo { .. } => Ok(None),
+        // A key left to the server is never added, which spares the ALTER
+        // TABLE SQLite has no form for.
+        AlterTableOperation::AddConstraint {
+            constraint: sqlparser::ast::TableConstraint::ForeignKey(key),
+            ..
+        } if foreign_key_left_to_server(
+            key,
+            None,
+            &key.columns,
+            &alter_table.name,
+            options,
+            emit,
+        ) =>
+        {
+            Ok(None)
+        }
         other => {
             Err(Error::forward_refusal(format!(
                 "ALTER TABLE {} {other} has no SQLite equivalent. SQLite can only rename a table \
@@ -941,6 +991,9 @@ fn translate_truncate(
 
     let mut statements = Vec::with_capacity(truncate.table_names.len());
     for target in &truncate.table_names {
+        if OffReplica::leaves_with(&target.name, &Write::Truncate, schema, options)? {
+            continue;
+        }
         // PostgreSQL does not apply policies to TRUNCATE: it needs the TRUNCATE
         // privilege and then empties the table. An RLS table is translated as a
         // view over a suffixed backing table, and the view's INSTEAD OF DELETE
@@ -1658,6 +1711,11 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
         emit: &mut dyn FnMut(crate::warnings::TranslationWarning),
     ) -> Result<Self::SQLiteEntry, crate::errors::Error> {
         crate::impls::stack_headroom::ensure();
+        if let Some((table, write)) = off_replica::row_write(self)
+            && OffReplica::leaves_with(table, &write, schema, options)?
+        {
+            return Ok(Vec::new());
+        }
         let mut translated: Vec<Statement> = match self {
             Self::CreateTable(create_table) => {
                 translate_create_table(create_table, schema, options, emit)?
@@ -1828,7 +1886,24 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
                 match object_type {
                     // SQLite supports these object types
                     ObjectType::Table | ObjectType::View | ObjectType::Index => {
-                        let normalized_names = names
+                        // `schema` has already dropped the index.
+                        let written = options.written_schema().unwrap_or(schema);
+                        let mut kept = Cow::Borrowed(names.as_slice());
+                        for (position, name) in names.iter().enumerate().rev() {
+                            if off_replica::drop_leaves_with_table(
+                                *object_type,
+                                name,
+                                schema,
+                                written,
+                                options,
+                            )? {
+                                kept.to_mut().remove(position);
+                            }
+                        }
+                        if kept.is_empty() {
+                            return Ok(Vec::new());
+                        }
+                        let normalized_names = kept
                             .iter()
                             .map(|name| {
                                 normalize_schema_qualified_object_name_for_sqlite(schema, name)
@@ -1845,9 +1920,7 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
                             table: None,
                         }];
                         if *object_type == ObjectType::Index {
-                            // `schema` has already dropped the index.
-                            let written = options.written_schema().unwrap_or(schema);
-                            statements.extend(companion_drops(names, written));
+                            statements.extend(companion_drops(&kept, written));
                         }
                         statements
                     }
@@ -1896,10 +1969,18 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
                 }
             }
             // DROP TRIGGER - translate to SQLite (strip table name and
-            // CASCADE/RESTRICT)
+            // CASCADE/RESTRICT). A trigger of that name left to the server may
+            // never have reached SQLite, so the drop tolerates its absence.
             Self::DropTrigger(drop_trigger) => {
+                if let Some(table_name) = &drop_trigger.table_name
+                    && OffReplica::of(table_name, schema, options)?.is_some()
+                {
+                    return Ok(Vec::new());
+                }
+                let left_to_server = last_ident(&drop_trigger.trigger_name)
+                    .is_some_and(|name| options.is_server_derived_trigger_name(&name.value));
                 vec![Statement::DropTrigger(sqlparser::ast::DropTrigger {
-                    if_exists: drop_trigger.if_exists,
+                    if_exists: drop_trigger.if_exists || left_to_server,
                     trigger_name: normalize_schema_qualified_object_name_for_sqlite(
                         schema,
                         &drop_trigger.trigger_name,

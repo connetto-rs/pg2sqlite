@@ -163,6 +163,7 @@ const CASCADED_RLS_SCHEMA: &str = "
 
 const POLICY_FUNCTION_SCHEMA: &str = "
     CREATE ROLE alice;
+    CREATE FUNCTION policy_probe() RETURNS BOOLEAN LANGUAGE sql STABLE AS $$ SELECT false $$;
     CREATE TABLE policy_items (
         id INTEGER PRIMARY KEY,
         body TEXT NOT NULL

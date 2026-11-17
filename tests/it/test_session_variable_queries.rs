@@ -15,7 +15,7 @@
 
 use diesel::{prelude::*, sql_query};
 use helpers::{
-    deployment::{caller, deployment, pg_type},
+    deployment::{caller, deployment, pg_type, principal},
     establish_connection, set_session_username,
 };
 use pg2sqlite::{
@@ -197,6 +197,47 @@ fn a_cast_that_disagrees_with_the_declaration_refuses() {
         matches!(&error, Error::SessionVariableTypeDisagrees { pattern, declared, written }
             if pattern.contains(SETTING) && declared == "UUID" && written == "TEXT"),
         "the refusal names both types, got: {error}"
+    );
+}
+
+/// A principal the request acts as beside the caller holds one identity, so
+/// a read of it crosses as the caller's does.
+#[test]
+fn a_principal_setting_reads_as_the_one_identity_it_holds() {
+    let options = Pg2SqliteOptions::default()
+        .with_session_variable(SessionVariableMapping::new(SETTING, PAIRED_FUNCTION))
+        .with_deployment(deployment([], [principal(SETTING, "installation", "text")]));
+    let emitted = translate(
+        &format!(
+            "{PG_SCHEMA} SELECT id FROM docs WHERE owner = current_setting('{SETTING}', true)::text;"
+        ),
+        &options,
+    )
+    .expect("the written cast agrees with the principal's declared identity");
+
+    let query = emitted.last().expect("the query is emitted");
+    assert!(query.contains(&format!("{PAIRED_FUNCTION}()")), "{query}");
+    assert_eq!(ids_visible_to(&emitted, "alice"), vec![1]);
+    assert_eq!(ids_visible_to(&emitted, "bob"), vec![2]);
+}
+
+#[test]
+fn a_principal_setting_unpacked_as_a_set_refuses() {
+    let options = Pg2SqliteOptions::default()
+        .with_session_variable(SessionVariableMapping::new(SETTING, PAIRED_FUNCTION))
+        .with_deployment(deployment([], [principal(SETTING, "installation", "text")]));
+    let error = translate(
+        &format!(
+            "{PG_SCHEMA} SELECT id FROM docs \
+             WHERE owner = ANY(string_to_array(current_setting('{SETTING}'), ','));"
+        ),
+        &options,
+    )
+    .expect_err("one identity is no set");
+
+    assert!(
+        matches!(&error, Error::SessionVariableReadAsSet { pattern, .. } if pattern.contains(SETTING)),
+        "{error}"
     );
 }
 

@@ -192,7 +192,7 @@ fn a_prefixed_builtin_is_refused_without_identity() {
 #[test]
 fn a_prefixed_extension_function_is_refused_without_identity() {
     let message = refusal(
-        "CREATE TABLE t (id TEXT DEFAULT public.gen_random_uuid());",
+        "CREATE EXTENSION pgcrypto; CREATE TABLE t (id TEXT DEFAULT public.gen_random_uuid());",
         &Pg2SqliteOptions::default(),
     );
     assert!(
@@ -216,7 +216,10 @@ fn qualified_fts_functions_are_not_taken_as_builtins() {
     for expression in ["app.to_tsvector(body)", "to_tsvector(app.lower(body))"] {
         let message = refusal(
             &format!(
-                "CREATE SCHEMA app; CREATE TABLE docs (id INT PRIMARY KEY, body TEXT); \
+                "CREATE SCHEMA app; \
+                 CREATE FUNCTION app.to_tsvector(t TEXT) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector(t) $$; \
+                 CREATE FUNCTION app.lower(t TEXT) RETURNS TEXT LANGUAGE sql IMMUTABLE AS $$ SELECT t $$; \
+                 CREATE TABLE docs (id INT PRIMARY KEY, body TEXT); \
                  CREATE INDEX docs_fts ON docs USING GIN ({expression});"
             ),
             &Pg2SqliteOptions::default(),
@@ -233,8 +236,10 @@ fn quoted_fts_functions_with_capitals_are_not_taken_as_builtins() {
     for expression in [r#""TO_TSVECTOR"(body)"#, r#"to_tsvector("LOWER"(body))"#] {
         let message = refusal(
             &format!(
-                "CREATE TABLE docs (id INT PRIMARY KEY, body TEXT); \
-                 CREATE INDEX docs_fts ON docs USING GIN ({expression});"
+                r#"CREATE FUNCTION "TO_TSVECTOR"(t TEXT) RETURNS tsvector LANGUAGE sql IMMUTABLE AS $$ SELECT to_tsvector(t) $$;
+                 CREATE FUNCTION "LOWER"(t TEXT) RETURNS TEXT LANGUAGE sql IMMUTABLE AS $$ SELECT t $$;
+                 CREATE TABLE docs (id INT PRIMARY KEY, body TEXT);
+                 CREATE INDEX docs_fts ON docs USING GIN ({expression});"#
             ),
             &Pg2SqliteOptions::default(),
         );

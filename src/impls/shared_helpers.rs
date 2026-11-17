@@ -8,18 +8,19 @@ use sql_traits::{
     traits::{ColumnLike, DatabaseLike, TableLike},
 };
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, BinaryOperator, CastKind, ColumnOption, DataType, Expr,
+    Assignment, AssignmentTarget, BinaryOperator, CastKind, ColumnOption, Cte, DataType, Expr,
     ExprWithAlias, ExprWithAliasAndOrderBy, Fetch, FromTable, Function, FunctionArg,
     FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList, FunctionArguments, GeneratedAs,
     GroupByExpr, HavingBound, Ident, InTarget, Join, JoinConstraint, JoinOperator, LimitClause,
     ListAggOnOverflow, Measure, NamedWindowDefinition, NamedWindowExpr, ObjectName, ObjectNamePart,
     OrderBy, OrderByExpr, OrderByKind, PipeOperator, PivotValueSource, Query, Select, SelectItem,
     SetExpr, SetOperator, SetQuantifier, Setting, Statement, SymbolDefinition, TableAlias,
-    TableFactor, TableFunctionArgs, TableSample, TableSampleBucket, TableSampleKind,
-    TableSampleQuantity, TableVersion, TableWithJoins, UnaryOperator, UpdateTableFromKind, Value,
-    ValueWithSpan, Values, Visit, Visitor, WindowFrame, WindowFrameBound, WindowFrameUnits,
-    WindowSpec, WindowType, With, WithFill, XmlNamespaceDefinition, XmlPassingArgument,
-    XmlPassingClause, XmlTableColumn, XmlTableColumnOption, visit_expressions,
+    TableAliasColumnDef, TableFactor, TableFunctionArgs, TableSample, TableSampleBucket,
+    TableSampleKind, TableSampleQuantity, TableVersion, TableWithJoins, UnaryOperator,
+    UpdateTableFromKind, Value, ValueWithSpan, Values, Visit, Visitor, WildcardAdditionalOptions,
+    WindowFrame, WindowFrameBound, WindowFrameUnits, WindowSpec, WindowType, With, WithFill,
+    XmlNamespaceDefinition, XmlPassingArgument, XmlPassingClause, XmlTableColumn,
+    XmlTableColumnOption, helpers::attached_token::AttachedToken, visit_expressions,
 };
 
 #[cfg(not(feature = "std"))]
@@ -28,8 +29,9 @@ use crate::{
     errors::Error,
     impls::{
         object_name::{COLUMN_LOOKUP_CASE, last_ident, resolve_translation_table},
-        query_builder::{from_relation, make_query, make_simple_select},
+        query_builder::{from_relation, make_query, make_simple_select, plain_table_with_joins},
         translator_impls::{
+            unused_cte_name,
             uuid::{
                 is_blob_uuid_representation, make_uuid_conversion_call,
                 maybe_canonicalize_text_uuid_literal, maybe_wrap_text_uuid_literal,
@@ -462,22 +464,47 @@ fn evaluate_definition<T: PartialEq>(
                 read_column,
                 read_expression,
             )?;
-            Ok(match (left, right) {
-                (DefinitionValue::Known(left), DefinitionValue::Known(right)) if left == right => {
-                    DefinitionValue::Known(left)
-                }
-                (DefinitionValue::Opaque, _) | (_, DefinitionValue::Opaque) => {
-                    DefinitionValue::Opaque
-                }
-                _ => DefinitionValue::Known(None),
-            })
+            Ok(agreement(left, right))
+        }
+        ColumnDefinition::Values { rows } => {
+            let mut agreed = None;
+            for row in rows.iter() {
+                let value = evaluate_definition(
+                    &row.definition(),
+                    schema,
+                    options,
+                    read_column,
+                    read_expression,
+                )?;
+                agreed = Some(match agreed {
+                    Some(agreed) => agreement(agreed, value),
+                    None => value,
+                });
+            }
+            Ok(agreed.unwrap_or(DefinitionValue::Opaque))
         }
         ColumnDefinition::RecursiveUnion { anchor, .. } => {
             evaluate_definition(&anchor.definition(), schema, options, read_column, read_expression)
         }
-        ColumnDefinition::Parameter { .. } | ColumnDefinition::Opaque => {
-            Ok(DefinitionValue::Opaque)
+        ColumnDefinition::Parameter { .. }
+        | ColumnDefinition::Variable(_)
+        | ColumnDefinition::VariableField(_)
+        | ColumnDefinition::Opaque => Ok(DefinitionValue::Opaque),
+    }
+}
+
+/// What two definitions PostgreSQL resolves to one type agree on: the value
+/// both carry, nothing where they differ, and opaque where either is.
+fn agreement<T: PartialEq>(
+    left: DefinitionValue<T>,
+    right: DefinitionValue<T>,
+) -> DefinitionValue<T> {
+    match (left, right) {
+        (DefinitionValue::Known(left), DefinitionValue::Known(right)) if left == right => {
+            DefinitionValue::Known(left)
         }
+        (DefinitionValue::Opaque, _) | (_, DefinitionValue::Opaque) => DefinitionValue::Opaque,
+        _ => DefinitionValue::Known(None),
     }
 }
 
@@ -674,7 +701,24 @@ fn definition_find<T>(
         ColumnDefinition::RecursiveUnion { anchor, .. } => {
             definition_find(&anchor.definition(), schema, options, read_column, read_expression)
         }
-        ColumnDefinition::Parameter { .. } | ColumnDefinition::Opaque => Ok(None),
+        ColumnDefinition::Values { rows } => {
+            for row in rows.iter() {
+                if let Some(found) = definition_find(
+                    &row.definition(),
+                    schema,
+                    options,
+                    read_column,
+                    read_expression,
+                )? {
+                    return Ok(Some(found));
+                }
+            }
+            Ok(None)
+        }
+        ColumnDefinition::Parameter { .. }
+        | ColumnDefinition::Variable(_)
+        | ColumnDefinition::VariableField(_)
+        | ColumnDefinition::Opaque => Ok(None),
     }
 }
 
@@ -5009,15 +5053,6 @@ pub(crate) fn translate_table_factor<D: TranslationDirection>(
         }
         TableFactor::Derived { subquery, lateral, alias, sample } => {
             if D::IS_FORWARD {
-                // SQLite grammar has no column list on a table alias.
-                // The same limitation forces the derived-table shape in
-                // array.rs::translate_unnest_factor.
-                if alias.as_ref().is_some_and(|a| !a.columns.is_empty()) {
-                    return Err(Error::forward_refusal("Table alias with a column list (AS alias(col1, col2, ...)) is not \
-                                     supported in SQLite grammar. Project the column names instead, for \
-                                     example: SELECT column1 AS a FROM (VALUES (1),(2)) AS v"
-                        .to_string()));
-                }
                 // SQLite has no LATERAL join. Drop the keyword only when the
                 // subquery is trivially uncorrelated (no FROM clause, no column
                 // references). Any other case would fail at runtime with
@@ -5035,6 +5070,11 @@ pub(crate) fn translate_table_factor<D: TranslationDirection>(
                             .to_string(),
                     ));
                 }
+            }
+            if D::IS_FORWARD
+                && let Some(alias) = alias.as_ref().filter(|alias| !alias.columns.is_empty())
+            {
+                return renamed_derived_factor::<D>(subquery, alias, schema, options, emit);
             }
             TableFactor::Derived {
                 subquery: Box::new(D::translate_query(subquery, schema, options, emit)?),
@@ -5278,16 +5318,139 @@ pub(crate) fn translate_table_factor<D: TranslationDirection>(
     })
 }
 
+/// Refuses a data type in `alias`'s column list, which PostgreSQL accepts
+/// only on a function returning `record`.
+fn refuse_typed_alias_columns(
+    relation: impl core::fmt::Display,
+    alias: &TableAlias,
+) -> Result<(), Error> {
+    match alias.columns.iter().find(|column| column.data_type.is_some()) {
+        Some(typed) => {
+            Err(Error::forward_refusal(format!(
+                "FROM {relation} AS {} ({} ...) carries a data type in the column alias list. \
+                 PostgreSQL only accepts one on a function returning record, so a file carrying \
+                 it on a table or a subquery is not the input this crate translates. Name the \
+                 columns alone.",
+                alias.name, typed.name
+            )))
+        }
+        None => Ok(()),
+    }
+}
+
+/// Rewrites `(subquery) AS x (a, b)` into
+/// `(WITH c (a, b) AS (subquery) SELECT * FROM c) AS x`.
+///
+/// A CTE column list renames by position, since SQLite names translated
+/// outputs differently from PostgreSQL (`count(*)` against `count`). Outputs
+/// past the list keep PostgreSQL's names, and `c` is a name the subquery does
+/// not read, which SQLite would take as a reference to the CTE itself.
+fn renamed_derived_factor<D: TranslationDirection>(
+    subquery: &Query,
+    alias: &TableAlias,
+    schema: &ParserDB,
+    options: &D::Options<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<TableFactor, Error> {
+    refuse_typed_alias_columns("(...)", alias)?;
+
+    let outputs =
+        with_output_scope(subquery, schema, required_forward_context::<D>(options), |scope| {
+            Ok(scope.and_then(|scope| {
+                scope
+                    .outputs()
+                    .map(|output| {
+                        match output {
+                            QueryOutput::Column { name, .. } => {
+                                Some(name.map(|(name, quoted)| {
+                                    if quoted {
+                                        Ident::with_quote('"', name)
+                                    } else {
+                                        Ident::new(name)
+                                    }
+                                }))
+                            }
+                            QueryOutput::Unexpanded => None,
+                        }
+                    })
+                    .collect::<Option<Vec<_>>>()
+            }))
+        })?;
+    let Some(outputs) = outputs else {
+        return Err(Error::forward_refusal(format!(
+            "FROM (...) AS {} (...) renames the outputs of a subquery whose columns the \
+             translation cannot enumerate, such as a wildcard over a relation the translation \
+             schema does not declare, so which outputs the list renames is unknown. Name the \
+             subquery's columns in its own select list.",
+            alias.name
+        )));
+    };
+
+    if alias.columns.len() > outputs.len() {
+        return Err(Error::forward_refusal(format!(
+            "FROM (...) AS {} (...) names {} columns for a subquery that answers only {}. \
+             PostgreSQL refuses the longer list too. Name at most the subquery's column count.",
+            alias.name,
+            alias.columns.len(),
+            outputs.len()
+        )));
+    }
+
+    let mut columns = alias.columns.clone();
+    for (position, output) in outputs.into_iter().enumerate().skip(columns.len()) {
+        let Some(name) = output else {
+            return Err(Error::forward_refusal(format!(
+                "FROM (...) AS {} (...) keeps output {} of the subquery under the name PostgreSQL \
+                 gives it, which the translation does not model. Extend the alias list to name \
+                 every output, or alias that output in the subquery.",
+                alias.name,
+                position + 1
+            )));
+        };
+        columns.push(TableAliasColumnDef { name, data_type: None });
+    }
+
+    let translated = D::translate_query(subquery, schema, options, emit)?;
+    let name = Ident::new(unused_cte_name(&translated));
+    let body = make_simple_select(
+        vec![SelectItem::Wildcard(WildcardAdditionalOptions::default())],
+        vec![plain_table_with_joins(ObjectName::from(vec![name.clone()]))],
+        None,
+    );
+    let with = With {
+        with_token: AttachedToken::empty(),
+        recursive: false,
+        cte_tables: vec![Cte {
+            alias: TableAlias { explicit: false, name, columns, at: None },
+            query: Box::new(translated),
+            from: None,
+            materialized: None,
+            closing_paren_token: AttachedToken::empty(),
+        }],
+    };
+
+    Ok(TableFactor::Derived {
+        lateral: false,
+        subquery: Box::new(make_query(Some(with), SetExpr::Select(Box::new(body)))),
+        alias: Some(TableAlias {
+            explicit: true,
+            name: alias.name.clone(),
+            columns: Vec::new(),
+            at: None,
+        }),
+        sample: None,
+    })
+}
+
 /// Rewrites `FROM t AS x (a, b)` into `(SELECT id AS a, s AS b FROM t) AS x`.
 ///
 /// PostgreSQL renames the table's leading columns positionally and keeps the
 /// rest under their declared names, and it refuses a list longer than the
 /// table or one carrying data types, which belong to a function returning
 /// `record`. SQLite accepts no column list on a table alias, so the rename
-/// happens in a projection, the shape `translate_unnest_factor` and the
-/// `Derived` arm already use for the same reason. The declared idents are
-/// rebuilt with their quoting so a quoted column name stays quoted in the
-/// projection.
+/// happens in a projection, the shape `translate_unnest_factor` already uses
+/// for the same reason. The declared idents are rebuilt with their quoting so
+/// a quoted column name stays quoted in the projection.
 fn renamed_relation_factor<D: TranslationDirection>(
     name: &ObjectName,
     alias: &TableAlias,
@@ -5295,14 +5458,7 @@ fn renamed_relation_factor<D: TranslationDirection>(
     options: &D::Options<'_>,
     _emit: crate::warnings::WarningSink<'_>,
 ) -> Result<TableFactor, Error> {
-    if let Some(typed) = alias.columns.iter().find(|column| column.data_type.is_some()) {
-        return Err(Error::forward_refusal(format!(
-            "FROM {name} AS {} ({} ...) carries a data type in the column alias list. \
-             PostgreSQL only accepts one on a function returning record, so a file carrying \
-             it on a table is not the input this crate translates. Name the columns alone.",
-            alias.name, typed.name
-        )));
-    }
+    refuse_typed_alias_columns(name, alias)?;
 
     let Some(table) = resolve_translation_table(schema, name)? else {
         return Err(Error::forward_refusal(format!(
@@ -5972,6 +6128,33 @@ mod tests {
         }
     }
 
+    /// Answers `"column"` for every table column a definition reads.
+    #[expect(clippy::unnecessary_wraps, reason = "the reader `evaluate_definition` takes")]
+    fn read_column(_: &sqlparser::ast::ColumnDef) -> Option<&'static str> {
+        Some("column")
+    }
+
+    /// Answers `"expression"` for every expression a definition reads.
+    #[expect(clippy::unnecessary_wraps, reason = "the reader `evaluate_definition` takes")]
+    fn read_expression(
+        _: &Expr,
+        _: &ParserDB,
+        _: &crate::options::TranslationContext<'_>,
+    ) -> Result<Option<&'static str>, crate::errors::Error> {
+        Ok(Some("expression"))
+    }
+
+    /// The operands `expr` joins with binary operators, left to right.
+    fn operands<'e>(expr: &'e Expr, found: &mut Vec<&'e Expr>) {
+        match expr {
+            Expr::BinaryOp { left, right, .. } => {
+                operands(left, found);
+                operands(right, found);
+            }
+            operand => found.push(operand),
+        }
+    }
+
     #[test]
     fn a_function_parameter_reads_as_opaque_unless_a_column_shadows_it() {
         use sql_traits::{
@@ -5986,11 +6169,6 @@ mod tests {
         .unwrap();
         let function = schema.functions().next().unwrap();
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
-        let read_column = |_: &sqlparser::ast::ColumnDef| Some("column");
-        let read_expression =
-            |_: &Expr, _: &ParserDB, _: &crate::options::TranslationContext<'_>| {
-                Ok(Some("expression"))
-            };
 
         // `None` stands for an opaque definition.
         for (sql, expected) in [
@@ -6036,5 +6214,158 @@ mod tests {
             .unwrap();
             assert_eq!(found, expected, "{sql}");
         }
+    }
+
+    /// PostgreSQL types a column of a `VALUES` list as it types the same rows
+    /// joined by `UNION ALL`, one type across every row, so the two read
+    /// alike. A column carries what every row agrees on, nothing where two
+    /// rows disagree, and is opaque where a row is, while a search takes the
+    /// first row that answers.
+    #[test]
+    fn a_values_column_reads_as_the_union_of_its_rows() {
+        use sql_traits::{
+            structs::{ColumnDefinition, ExpressionContext, ExpressionScope, IdentifierCase},
+            traits::DatabaseLike,
+        };
+
+        let schema = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE t (x INT8);
+             CREATE FUNCTION f(p INT8) RETURNS INT8 LANGUAGE sql AS 'SELECT p';",
+        )
+        .unwrap();
+        let function = schema.functions().next().unwrap();
+        let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
+        // What `v.y` evaluates to, `None` when opaque, and what a search over
+        // it finds.
+        let read = |sql: &str, is_shape: fn(&ColumnDefinition<'_, '_, '_, ParserDB>) -> bool| {
+            let body = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap().remove(0);
+            let context = ExpressionContext::for_statement(
+                &body,
+                &ExpressionScope::FunctionBody(function),
+                &schema,
+                IdentifierCase::AsWritten,
+            )
+            .unwrap();
+            let sqlparser::ast::Statement::Query(query) = &body else { unreachable!() };
+            let SetExpr::Select(select) = query.body.as_ref() else { unreachable!() };
+            let SelectItem::UnnamedExpr(reference) = &select.projection[0] else { unreachable!() };
+            let (definition, _) = context.reference(reference).unwrap().expect("v.y binds");
+            assert!(is_shape(&definition), "{sql}");
+            let value = match super::evaluate_definition(
+                &definition,
+                &schema,
+                &options,
+                &read_column,
+                &read_expression,
+            )
+            .unwrap()
+            {
+                super::DefinitionValue::Known(value) => Some(value),
+                super::DefinitionValue::Opaque => None,
+            };
+            let found = super::definition_find(
+                &definition,
+                &schema,
+                &options,
+                &read_column,
+                &read_expression,
+            )
+            .unwrap();
+            (value, found)
+        };
+
+        for (values, union, expected) in [
+            (
+                "SELECT v.y FROM t, LATERAL (VALUES (t.x), (t.x)) AS v(y)",
+                "SELECT v.y FROM (SELECT t.x FROM t UNION ALL SELECT t.x FROM t) AS v(y)",
+                (Some(Some("column")), Some("column")),
+            ),
+            (
+                "SELECT v.y FROM t, LATERAL (VALUES (1), (t.x)) AS v(y)",
+                "SELECT v.y FROM (SELECT 1 UNION ALL SELECT t.x FROM t) AS v(y)",
+                (Some(None), Some("expression")),
+            ),
+            (
+                "SELECT v.y FROM (VALUES (p), (1)) AS v(y)",
+                "SELECT v.y FROM (SELECT p UNION ALL SELECT 1) AS v(y)",
+                (None, Some("expression")),
+            ),
+            (
+                "SELECT v.y FROM (VALUES (p), (p)) AS v(y)",
+                "SELECT v.y FROM (SELECT p UNION ALL SELECT p) AS v(y)",
+                (None, None),
+            ),
+        ] {
+            let from_values =
+                read(values, |definition| matches!(definition, ColumnDefinition::Values { .. }));
+            let from_union = read(union, |definition| {
+                matches!(definition, ColumnDefinition::SetOperation { .. })
+            });
+            assert_eq!(from_values, expected, "{values}");
+            assert_eq!(from_union, expected, "{union}");
+        }
+    }
+
+    /// A PL/pgSQL variable, and a field of a record variable, stand for values
+    /// only the running body knows.
+    #[test]
+    fn a_plpgsql_variable_and_its_field_read_as_opaque() {
+        use sql_traits::{
+            structs::{ColumnDefinition, IdentifierCase, TargetName},
+            traits::{DatabaseLike, FunctionLike},
+        };
+
+        let schema = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE t (name TEXT);
+             CREATE FUNCTION f(p TEXT) RETURNS VOID LANGUAGE plpgsql AS $$
+             DECLARE r t%ROWTYPE;
+             BEGIN
+                 SELECT * INTO r FROM t;
+                 EXECUTE 'SELECT ' || p || r.name;
+             END $$;",
+        )
+        .unwrap();
+        let function = schema
+            .function_by_target(TargetName::new("f", false), IdentifierCase::AsWritten)
+            .unwrap()
+            .expect("f is declared");
+        let body = function.dynamic_execution_sites(&schema).unwrap();
+        let sites = body.sites().unwrap();
+        let [site] = sites.as_slice() else { panic!("one site") };
+        let context = site.context(IdentifierCase::Folded).unwrap();
+        let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
+        let mut found = Vec::new();
+        operands(site.command(), &mut found);
+        let mut bound = Vec::new();
+        for operand in found {
+            let Some((definition, _)) = context.reference(operand).unwrap() else { continue };
+            assert!(
+                matches!(
+                    definition,
+                    ColumnDefinition::Variable(_) | ColumnDefinition::VariableField(_)
+                ),
+                "{operand}"
+            );
+            let evaluated = super::evaluate_definition(
+                &definition,
+                &schema,
+                &options,
+                &read_column,
+                &read_expression,
+            )
+            .unwrap();
+            assert!(matches!(evaluated, super::DefinitionValue::Opaque), "{operand}");
+            let searched = super::definition_find(
+                &definition,
+                &schema,
+                &options,
+                &read_column,
+                &read_expression,
+            )
+            .unwrap();
+            assert_eq!(searched, None, "{operand}");
+            bound.push(operand.to_string());
+        }
+        assert_eq!(bound, ["p", "r.name"]);
     }
 }

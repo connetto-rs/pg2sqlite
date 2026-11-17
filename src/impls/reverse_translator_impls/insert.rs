@@ -299,8 +299,7 @@ fn refuse_default_values_without_defaults(insert: &Insert, schema: &ParserDB) ->
     let Ok(Some(target)) = resolve_translation_table(schema, name) else { return Ok(()) };
     let without_default = target.columns(schema).ok().and_then(|mut columns| {
         columns.find(|column| {
-            column.is_nullable(schema).is_ok_and(|nullable| !nullable)
-                && column.default_value().is_none()
+            column.is_nullable(schema).is_ok_and(|nullable| !nullable) && !column.has_default()
         })
     });
     match without_default {

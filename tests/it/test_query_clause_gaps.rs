@@ -203,8 +203,8 @@ fn fetch_percent_is_refused() {
 }
 
 #[test]
-fn alias_column_list_is_refused() {
-    assert_refusal("SELECT a FROM (VALUES (1),(2)) AS v(a)");
+fn alias_column_list_renames_a_values_list() {
+    assert_rows("SELECT n FROM (VALUES (1),(2)) AS v(n) ORDER BY n", &[1, 2]);
 }
 
 #[test]

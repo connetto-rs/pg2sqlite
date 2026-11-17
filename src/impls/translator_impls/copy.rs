@@ -17,7 +17,11 @@ use sqlparser::ast::{
     CopyTarget, Expr, Ident, ObjectName, ObjectNamePart, Statement, TableObject, Value,
 };
 
-use super::{insert::backing_table_name, rls};
+use super::{
+    insert::backing_table_name,
+    off_replica::{OffReplica, Write},
+    rls,
+};
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
 use crate::{
@@ -78,7 +82,9 @@ pub(super) fn translate_copy(
             columns.len()
         )));
     }
-    if rows.is_empty() {
+    if rows.is_empty()
+        || OffReplica::leaves_with(table_name, &Write::Insert { upsert: None }, schema, options)?
+    {
         return Ok(Vec::new());
     }
     let values = rows

@@ -117,6 +117,10 @@ pub struct Pg2SqliteOptions {
     ilike_fold_function: Option<String>,
     /// Tables placed in an attached database. Set via `with_attached_tables`.
     attached_tables: Option<AttachedTables>,
+    /// Whether the triggers that write rows and the foreign keys that change
+    /// child rows are left to the server. Set via
+    /// `with_server_derived_writes_omitted`.
+    server_derived_writes_omitted: bool,
 }
 
 #[cfg(feature = "arbitrary")]
@@ -146,6 +150,7 @@ impl<'a> arbitrary::Arbitrary<'a> for Pg2SqliteOptions {
             user_defined_functions: Vec::<String>::arbitrary(u)?,
             ilike_fold_function: Option::<String>::arbitrary(u)?,
             attached_tables: Option::<AttachedTables>::arbitrary(u)?,
+            server_derived_writes_omitted: bool::arbitrary(u)?,
         })
     }
 }
@@ -175,6 +180,7 @@ impl Default for Pg2SqliteOptions {
             user_defined_functions: Vec::new(),
             ilike_fold_function: None,
             attached_tables: None,
+            server_derived_writes_omitted: false,
         }
     }
 }
@@ -190,14 +196,32 @@ pub(crate) struct PrewalkCatalogs {
     /// Trigger names sharing a table, timing and event with another
     /// non-split trigger, which `CreateTrigger` translation refuses.
     conflicting_trigger_names: Vec<String>,
+    /// The names of the triggers left to the server, whose `DROP TRIGGER`
+    /// finds nothing on the replica.
+    server_derived_trigger_names: Vec<String>,
     /// The table name, lower-cased, and the function name of every `BEFORE
     /// INSERT` trigger, which the RLS backing-table update check reads to
     /// exempt the crate's own maintenance write. Only those two strings are
     /// kept, since holding whole trigger nodes here costs link-time drop glue
     /// out of proportion to the two fields the check needs.
     before_insert_trigger_fns: Vec<(String, sqlparser::ast::ObjectName)>,
+    /// The triggers each table carries after the statements translated so
+    /// far, which a write left off the replica with its table reads to find
+    /// one PostgreSQL fires for it.
+    table_triggers: Vec<TableTrigger>,
     /// The request's zone, resolved the first time an operation needs it.
     request_zone: core::cell::OnceCell<Result<RequestZone, ZoneUnavailable>>,
+}
+
+/// A trigger on a table.
+#[derive(Clone)]
+struct TableTrigger {
+    /// The trigger's name as written.
+    name: String,
+    /// The table's name, lower-cased.
+    table: String,
+    /// The events the trigger fires on.
+    events: Vec<sqlparser::ast::TriggerEvent>,
 }
 
 #[derive(Clone, Copy)]
@@ -694,6 +718,17 @@ impl<'a> TranslationContext<'a> {
         self.catalogs.conflicting_trigger_names.iter().any(|n| n == name)
     }
 
+    /// Registers `name` as a trigger the replica leaves to the server.
+    pub(crate) fn add_server_derived_trigger_name(&mut self, name: &str) {
+        self.catalogs.to_mut().server_derived_trigger_names.push(name.to_owned());
+    }
+
+    /// Returns whether a trigger named `name` was left to the server.
+    #[must_use]
+    pub(crate) fn is_server_derived_trigger_name(&self, name: &str) -> bool {
+        self.catalogs.server_derived_trigger_names.iter().any(|left| left == name)
+    }
+
     pub(crate) fn add_before_insert_trigger_fn(
         &mut self,
         table_name: String,
@@ -704,6 +739,75 @@ impl<'a> TranslationContext<'a> {
 
     pub(crate) fn before_insert_trigger_fns(&self) -> &[(String, sqlparser::ast::ObjectName)] {
         &self.catalogs.before_insert_trigger_fns
+    }
+
+    /// Follows the triggers `statement` creates, drops, or carries to a
+    /// renamed table, and forgets those of a dropped table.
+    pub(crate) fn follow_triggers(&mut self, statement: &sqlparser::ast::Statement) {
+        use sqlparser::ast::{AlterTableOperation, ObjectType, RenameTableNameKind, Statement};
+
+        use crate::impls::object_name::last_ident_value_or_display;
+
+        let table_key = |name: &ObjectName| last_ident_value_or_display(name).to_lowercase();
+        match statement {
+            Statement::CreateTrigger(trigger) => {
+                let name = last_ident_value_or_display(&trigger.name);
+                let table = table_key(&trigger.table_name);
+                let triggers = &mut self.catalogs.to_mut().table_triggers;
+                triggers
+                    .retain(|kept| kept.table != table || !kept.name.eq_ignore_ascii_case(&name));
+                triggers.push(TableTrigger { name, table, events: trigger.events.clone() });
+            }
+            Statement::DropTrigger(drop) => {
+                let name = last_ident_value_or_display(&drop.trigger_name);
+                let table = drop.table_name.as_ref().map(table_key);
+                self.catalogs.to_mut().table_triggers.retain(|kept| {
+                    !kept.name.eq_ignore_ascii_case(&name)
+                        || table.as_ref().is_some_and(|table| *table != kept.table)
+                });
+            }
+            Statement::Drop { object_type: ObjectType::Table, names, .. } => {
+                let dropped: Vec<String> = names.iter().map(table_key).collect();
+                self.catalogs.to_mut().table_triggers.retain(|kept| !dropped.contains(&kept.table));
+            }
+            Statement::AlterTable(alter_table) => {
+                for operation in &alter_table.operations {
+                    let AlterTableOperation::RenameTable {
+                        table_name:
+                            RenameTableNameKind::As(renamed) | RenameTableNameKind::To(renamed),
+                    } = operation
+                    else {
+                        continue;
+                    };
+                    let (from, to) = (table_key(&alter_table.name), table_key(renamed));
+                    for kept in &mut self.catalogs.to_mut().table_triggers {
+                        if kept.table == from {
+                            kept.table.clone_from(&to);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The name of a trigger `table` carries that fires on an event `fires`
+    /// accepts, among those the replica does not leave to the server.
+    pub(crate) fn trigger_firing(
+        &self,
+        table: &str,
+        fires: impl Fn(&sqlparser::ast::TriggerEvent) -> bool,
+    ) -> Option<&str> {
+        let table = table.to_lowercase();
+        self.catalogs
+            .table_triggers
+            .iter()
+            .find(|trigger| {
+                trigger.table == table
+                    && trigger.events.iter().any(&fires)
+                    && !self.is_server_derived_trigger_name(&trigger.name)
+            })
+            .map(|trigger| trigger.name.as_str())
     }
 
     /// The request's zone, resolved against `schema` once per translation,
@@ -1104,6 +1208,49 @@ impl Pg2SqliteOptions {
     /// Returns the tables placed in an attached database, if any.
     pub fn get_attached_tables(&self) -> Option<&AttachedTables> {
         self.attached_tables.as_ref()
+    }
+
+    #[must_use]
+    /// Leaves out the writes the server derives, for a replica that uploads
+    /// every row its transactions change to a PostgreSQL that runs its own
+    /// triggers and cascades when it applies them.
+    ///
+    /// A `BEFORE` or `AFTER` trigger whose function runs `INSERT`, `UPDATE`,
+    /// `DELETE`, `MERGE` or `TRUNCATE`, directly or in a function it calls, is
+    /// left out, since the server derives those rows again from the uploaded
+    /// one. A trigger that only refuses a write, reads, or sets columns of its
+    /// own `NEW` row stays, and so does every `INSTEAD OF` trigger, whose
+    /// writes are the view's own. A foreign key whose `ON DELETE` or
+    /// `ON UPDATE` action is `CASCADE`, `SET NULL` or `SET DEFAULT` is left
+    /// out whole, since kept as `NO ACTION` it would refuse an offline delete
+    /// of a parent whose children the server removes.
+    ///
+    /// [`Pg2Sqlite::translate_with_report`](crate::pg2sqlite::Pg2Sqlite::translate_with_report)
+    /// names each one in a
+    /// [`TranslationWarning::LeftToServer`](crate::warnings::TranslationWarning::LeftToServer).
+    ///
+    /// ```
+    /// # use pg2sqlite::prelude::*;
+    /// let options = Pg2SqliteOptions::default().with_server_derived_writes_omitted();
+    /// let script = Pg2Sqlite::default()
+    ///     .sql(
+    ///         "CREATE TABLE folders (id INT PRIMARY KEY);
+    ///          CREATE TABLE files (id INT PRIMARY KEY,
+    ///              folder INT REFERENCES folders (id) ON DELETE CASCADE);",
+    ///     )?
+    ///     .translate_to_sql(&options)?;
+    /// assert!(script.iter().all(|statement| !statement.contains("REFERENCES")));
+    /// # Ok::<(), Error>(())
+    /// ```
+    pub fn with_server_derived_writes_omitted(mut self) -> Self {
+        self.server_derived_writes_omitted = true;
+        self
+    }
+
+    #[must_use]
+    /// Returns whether the writes the server derives are left out.
+    pub fn is_server_derived_writes_omitted(&self) -> bool {
+        self.server_derived_writes_omitted
     }
 }
 

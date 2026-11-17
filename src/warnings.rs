@@ -15,7 +15,9 @@
 //! and it belongs to the closed list documented in
 //! `impls::translator_impls::statement`, which also carries the per-statement
 //! classification. `tests/it/test_no_statement_is_silently_dropped.rs` enforces
-//! the whole policy.
+//! the whole policy. A drop the caller asks for through an option is the one
+//! warning that changes results, and
+//! [`TranslationWarning::LeftToServer`] names each.
 //!
 //! Do not add a fourth mechanism. There are three outcomes, plus that closed
 //! list.
@@ -88,6 +90,25 @@ pub enum TranslationWarning {
         /// The first key column the role cannot read.
         column: String,
     },
+    /// A trigger or foreign key left out of the replica because the server
+    /// derives the rows it writes, under
+    /// [`Pg2SqliteOptions::with_server_derived_writes_omitted`](crate::options::Pg2SqliteOptions::with_server_derived_writes_omitted).
+    ///
+    /// The replica writes none of those rows, so a write the application makes
+    /// on the replica that relies on one of them sees it only once the
+    /// server's changes arrive.
+    LeftToServer {
+        /// `"TRIGGER"` or `"FOREIGN KEY"`.
+        construct: String,
+        /// The trigger's name, or the foreign key's. A foreign key declared
+        /// without a name is named by its columns and the table it
+        /// references, as `(org, member) REFERENCES memberships`.
+        name: String,
+        /// The table the trigger fires on or the foreign key is declared on.
+        table: String,
+        /// The write the server derives.
+        reason: String,
+    },
 }
 
 /// Where a translation reports the steps that lost something.
@@ -117,6 +138,9 @@ impl core::fmt::Display for TranslationWarning {
                     "the acting role cannot read key column {column} of {table}, so the replica \
                      refuses its updates and deletes"
                 )
+            }
+            Self::LeftToServer { construct, name, table, reason } => {
+                write!(f, "left {construct} {name} on {table} to the server, since {reason}")
             }
         }
     }

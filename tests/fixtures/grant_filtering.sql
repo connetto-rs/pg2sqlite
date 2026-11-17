@@ -5,6 +5,10 @@
 -- Create the application role
 CREATE ROLE app_user;
 
+-- The destination registers this function, PostgreSQL's prelude reads the same setting.
+CREATE OR REPLACE FUNCTION current_app_user() RETURNS UUID LANGUAGE sql STABLE
+    AS $$ SELECT current_setting('app.user_id', true)::uuid $$;
+
 -- Table 1: Server-only audit logs (no grants to app_user)
 CREATE TABLE audit_logs (
     id UUID PRIMARY KEY,

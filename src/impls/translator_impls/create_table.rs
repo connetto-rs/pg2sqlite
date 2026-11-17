@@ -15,6 +15,7 @@ use crate::no_std::prelude::*;
 use crate::{
     impls::{
         ast_builder::blank_create_table,
+        derived_writes::foreign_key_left_to_server,
         object_name::normalize_schema_qualified_object_name_for_sqlite,
         translator_impls::{
             column::{folded_primary_key, translate_column_def},
@@ -239,20 +240,26 @@ impl crate::traits::translator::TranslatorWithContext for CreateTable {
             .iter()
             .map(|c| translate_column_def(c, &self.name, &table_primary_key, schema, options, emit))
             .collect::<Result<Vec<_>, _>>()?;
-        created_table.constraints = self
-            .constraints
-            .iter()
-            .filter(|c| {
-                if matches!(c, TableConstraint::NotNull(_)) {
-                    return false;
+        for constraint in &self.constraints {
+            match constraint {
+                TableConstraint::NotNull(_) => {}
+                TableConstraint::PrimaryKey(_) if folded_key => {}
+                TableConstraint::ForeignKey(key)
+                    if foreign_key_left_to_server(
+                        key,
+                        None,
+                        &key.columns,
+                        &self.name,
+                        options,
+                        emit,
+                    ) => {}
+                _ => {
+                    created_table
+                        .constraints
+                        .extend(constraint.translate_with_warnings(schema, options, emit)?);
                 }
-                !(folded_key && matches!(c, TableConstraint::PrimaryKey(_)))
-            })
-            .map(|c| c.translate_with_warnings(schema, options, emit))
-            .collect::<Result<Vec<Vec<TableConstraint>>, _>>()?
-            .into_iter()
-            .flatten()
-            .collect();
+            }
+        }
         apply_table_not_null(&mut created_table, &table_not_nulls, &self.name, emit)?;
         created_table.query = query;
         // SQLite STRICT mode enforces type checking (not valid on CTAS).

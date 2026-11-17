@@ -185,13 +185,25 @@ fn a_scalar_subquery_with_two_columns_is_refused() {
     assert!(error.contains("exactly one column"), "the refusal must name the shape: {error}");
 }
 
-/// A subquery over `VALUES` declares no type, so the conversion is refused
-/// rather than guessed, as it is for a column of such a relation.
+/// A subquery over a table function declares no type, so the conversion is
+/// refused rather than guessed, as it is for a column of such a relation.
 #[test]
 fn a_scalar_subquery_with_no_declared_type_is_refused() {
     let error = translate_err(
         "CREATE TABLE t (id INT PRIMARY KEY);
-         SELECT json_build_array((SELECT column1 FROM (VALUES (1)) v)) FROM t;",
+         SELECT json_build_array((SELECT n FROM generate_series(1, 2) AS g(n) LIMIT 1)) FROM t;",
     );
     assert!(error.contains("inspectable definition"), "the refusal must name the cause: {error}");
+}
+
+/// A subquery over `VALUES` carries the type PostgreSQL gives its rows, so
+/// the integer converts as PostgreSQL converts it.
+#[test]
+fn a_scalar_subquery_over_values_converts_its_rows_type() {
+    let rows = run_translated_default(
+        "CREATE TABLE t (id INT PRIMARY KEY);
+         INSERT INTO t (id) VALUES (1);
+         SELECT json_build_array((SELECT column1 FROM (VALUES (1)) v)) FROM t;",
+    );
+    assert_eq!(rows, vec![Some("[1]".to_string())]);
 }

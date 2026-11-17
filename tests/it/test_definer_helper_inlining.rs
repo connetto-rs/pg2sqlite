@@ -342,11 +342,13 @@ fn a_helper_that_helper_set_refuses_is_refused_with_its_error() {
             && error.contains("is not SECURITY DEFINER"),
         "{error}"
     );
-    for call in ["docs_with(min_role => 'write')", "docs_with('write' ORDER BY 1)"] {
-        let error =
-            refusal(&read_policy(&format!("id IN (SELECT {call})")), &options()).to_string();
-        assert!(error.contains("not a comparable literal"), "{call}: {error}");
-    }
+    let named = refusal(&read_policy("id IN (SELECT docs_with(min_role => 'write'))"), &options())
+        .to_string();
+    assert!(named.contains("not a comparable literal"), "{named}");
+    // The schema refuses an ordered call to a function that aggregates nothing.
+    let ordered = refusal(&read_policy("id IN (SELECT docs_with('write' ORDER BY 1))"), &options())
+        .to_string();
+    assert!(ordered.contains("not an aggregate function"), "{ordered}");
 }
 
 /// A helper reading a table without row-level security reads the table

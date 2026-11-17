@@ -101,7 +101,8 @@ fn populate_prewalk_catalogs(statements: &[Statement], context: &mut Translation
 
 /// Marks trigger names whose (table, timing, event) key is shared by another
 /// trigger.  Uses two cheap linear passes; allocates nothing when no table
-/// carries two triggers on the same event.
+/// carries two triggers on the same event. A trigger left to the server never
+/// fires on SQLite, so it shares no key.
 fn register_trigger_conflicts(statements: &[Statement], context: &mut TranslationContext<'_>) {
     use alloc::collections::BTreeMap;
 
@@ -111,6 +112,12 @@ fn register_trigger_conflicts(statements: &[Statement], context: &mut Translatio
 
     for statement in statements {
         let Statement::CreateTrigger(trigger) = statement else { continue };
+        let name = crate::impls::object_name::last_ident(&trigger.name)
+            .map(|ident| ident.value.as_str())
+            .unwrap_or_default();
+        if context.is_server_derived_trigger_name(name) {
+            continue;
+        }
         let period: u8 = match trigger.period {
             Some(TriggerPeriod::Before) => 0,
             Some(TriggerPeriod::After) => 1,
@@ -119,9 +126,7 @@ fn register_trigger_conflicts(statements: &[Statement], context: &mut Translatio
         let table = crate::impls::object_name::last_ident(&trigger.table_name)
             .map(|ident| ident.value.to_lowercase())
             .unwrap_or_default();
-        let name = crate::impls::object_name::last_ident(&trigger.name)
-            .map(|ident| ident.value.clone())
-            .unwrap_or_default();
+        let name = name.to_owned();
         for event in &trigger.events {
             let event_kind: u8 = match event {
                 TriggerEvent::Insert => 0,
@@ -135,6 +140,32 @@ fn register_trigger_conflicts(statements: &[Statement], context: &mut Translatio
     for names in groups.values().filter(|v| v.len() >= 2) {
         for name in names {
             context.add_conflicting_trigger_name(name);
+        }
+    }
+}
+
+/// Registers every trigger the replica leaves to the server, each read against
+/// the schema of its own epoch, so a trigger it keeps is not refused for a
+/// firing order shared only with one that never reaches SQLite, and a
+/// `DROP TRIGGER` of one left out drops nothing. A trigger whose writes cannot
+/// be read counts as kept, and its translation reports why.
+fn register_server_derived_triggers(
+    statements: &[Statement],
+    epochs: &[PreparedEpoch],
+    context: &mut TranslationContext<'_>,
+) {
+    if !context.is_server_derived_writes_omitted() {
+        return;
+    }
+    for epoch in epochs {
+        for statement in &statements[epoch.start..epoch.end] {
+            let Statement::CreateTrigger(trigger) = statement else { continue };
+            if let Ok(Some(_)) =
+                crate::impls::derived_writes::trigger_derived_write(trigger, &epoch.schema)
+                && let Some(name) = crate::impls::object_name::last_ident(&trigger.name)
+            {
+                context.add_server_derived_trigger_name(name.value.as_str());
+            }
         }
     }
 }
@@ -763,6 +794,7 @@ impl Pg2Sqlite {
             initial_schema,
         } = prepared;
         let statements = &*sources;
+        register_server_derived_triggers(statements, &epochs, context);
         populate_prewalk_catalogs(statements, context);
 
         let mut warnings = Vec::new();
@@ -774,6 +806,7 @@ impl Pg2Sqlite {
                 context,
             );
             for (offset, statement) in statements[epoch.start..epoch.end].iter().enumerate() {
+                context.follow_triggers(statement);
                 if !should_translate(statement) {
                     translated.push(Vec::new());
                     continue;

@@ -44,6 +44,14 @@ fn deployment() -> Deployment {
                     .expect("a non-empty path"),
                     JsonField::new(["we\"ird"], SettingValue::Scalar(DataType::Text))
                         .expect("a non-empty path"),
+                    JsonField::new(
+                        ["act"],
+                        SettingValue::Principal {
+                            kind: "installation".into(),
+                            identity: DataType::Uuid,
+                        },
+                    )
+                    .expect("a non-empty path"),
                 ],
             )
             .expect("a JSON setting"),
@@ -329,7 +337,7 @@ fn a_field_the_deployment_does_not_declare_is_refused() {
     );
     assert!(
         matches!(&error, Error::SessionJsonFieldNotDeclared { path, declared, .. }
-            if path == "'email'" && declared == "'sub', 'app' -> 'role', 'admin', 'teams', 'we\"ird'"),
+            if path == "'email'" && declared == "'sub', 'app' -> 'role', 'admin', 'teams', 'we\"ird', 'act'"),
         "{error}"
     );
 }
@@ -387,6 +395,20 @@ fn declared_fields_cross_in_their_stored_form() {
             "WHERE id = uuid_blob(request_jwt_claims() ->> '$.\"sub\"') \
              AND owner = request_jwt_claims() ->> '$.\"app\".\"role\"'"
         ),
+        "{translated}"
+    );
+}
+
+/// A field holding a principal's identity crosses as the caller's does.
+#[test]
+fn a_principal_field_crosses_as_its_declared_identity() {
+    let translated = translate(
+        "SELECT id FROM t WHERE id = (current_setting('request.jwt.claims')::jsonb ->> 'act')::uuid;",
+        &options().with_uuid_text_to_blob_function_name("uuid_blob"),
+    )
+    .expect("translates");
+    assert!(
+        translated.ends_with("WHERE id = uuid_blob(request_jwt_claims() ->> '$.\"act\"')"),
         "{translated}"
     );
 }

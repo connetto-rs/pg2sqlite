@@ -212,7 +212,9 @@ impl<'o> Setting<'o> {
     fn one_value(self) -> Result<OneValue<'o>, Error> {
         match self.declared.content() {
             SettingContent::Value(
-                SettingValue::Caller(declared) | SettingValue::Scalar(declared),
+                SettingValue::Caller(declared)
+                | SettingValue::Principal { identity: declared, .. }
+                | SettingValue::Scalar(declared),
             ) => Ok(OneValue::Typed(declared)),
             SettingContent::Value(SettingValue::Set { packing, .. }) => {
                 Err(Error::SessionVariableReadAsScalar {
@@ -259,7 +261,7 @@ fn packed_set<'v>(
                 written: written.to_string(),
             })
         }
-        SettingValue::Caller(_) | SettingValue::Scalar(_) => {
+        SettingValue::Caller(_) | SettingValue::Principal { .. } | SettingValue::Scalar(_) => {
             Err(Error::SessionVariableReadAsSet {
                 pattern: pattern.to_string(),
                 written: written.to_string(),
@@ -587,7 +589,9 @@ pub(crate) fn translate_json_read(
     let field = declared_field(setting, &read.path)?;
     let pattern = read.pattern();
     let declared = match field.value() {
-        SettingValue::Caller(declared) | SettingValue::Scalar(declared) => declared,
+        SettingValue::Caller(declared)
+        | SettingValue::Principal { identity: declared, .. }
+        | SettingValue::Scalar(declared) => declared,
         SettingValue::Set { packing, .. } => {
             return Err(Error::SessionVariableReadAsScalar {
                 pattern,

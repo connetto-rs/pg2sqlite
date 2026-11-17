@@ -41,6 +41,16 @@ pub fn scalar(name: &str, pg_type: &str) -> SessionSetting {
     may_be_unset(name, SettingValue::Scalar(self::pg_type(pg_type)))
 }
 
+/// The setting `name` holding the identity of a principal of type `kind` as
+/// `pg_type`, which a request may leave unset.
+#[must_use]
+pub fn principal(name: &str, kind: &str, pg_type: &str) -> SessionSetting {
+    may_be_unset(
+        name,
+        SettingValue::Principal { kind: kind.to_owned(), identity: self::pg_type(pg_type) },
+    )
+}
+
 /// The setting `name` holding a set of `element` values packed by `packing`,
 /// which a request may leave unset.
 #[must_use]

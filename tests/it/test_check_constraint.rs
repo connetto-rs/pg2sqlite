@@ -46,11 +46,7 @@ fn test_check_constraint_is_translated() -> Result<(), Box<dyn std::error::Error
 /// should fail translation when the option is not set.
 #[test]
 fn test_check_constraint_with_unsupported_function_causes_error() {
-    // array_length is a PostgreSQL-specific function that doesn't exist in
-    // SQLite. Using it as the top-level expression of a TABLE-LEVEL check
-    // constraint (comma-separated, not inline on the column) triggers the
-    // function detection.
-    let sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, col TEXT, CHECK (array_length(col)));";
+    let sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, col TEXT, CHECK (starts_with(col, 'a')));";
     let options = Pg2SqliteOptions::default();
 
     let result = Pg2Sqlite::default()
@@ -62,7 +58,7 @@ fn test_check_constraint_with_unsupported_function_causes_error() {
     assert!(result.is_err(), "Expected translation error for unsupported function in CHECK");
     let error_msg = result.unwrap_err().to_string();
     assert!(
-        error_msg.contains("array_length") || error_msg.to_lowercase().contains("undefined"),
+        error_msg.contains("starts_with"),
         "Error should mention the function name, got: {error_msg}"
     );
 }
@@ -71,16 +67,15 @@ fn test_check_constraint_with_unsupported_function_causes_error() {
 /// silently dropped.
 #[test]
 fn test_check_constraint_removed_with_option() {
-    let sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, col TEXT, CHECK (array_length(col)));";
+    let sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, col TEXT, CHECK (starts_with(col, 'a')));";
     let options = Pg2SqliteOptions::default().with_remove_unsupported_check_constraints();
 
     let translated = Pg2Sqlite::default().sql(sql).unwrap().translate(&options).unwrap().into_vec();
     let stmts: Vec<String> = translated.iter().map(ToString::to_string).collect();
     let sql_output = stmts.join("\n");
 
-    // The user-declared CHECK calling the unsupported function is removed.
     assert!(
-        !sql_output.contains("array_length"),
+        !sql_output.contains("starts_with"),
         "unsupported user CHECK should be removed, got: {sql_output}"
     );
     // Execute the emitted DDL to prove real SQLite accepts the translated
@@ -115,7 +110,7 @@ fn test_valid_check_constraint_passes_through() {
 /// when removal is disabled.
 #[test]
 fn test_nested_function_check_constraint_causes_error() {
-    let sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, col TEXT, CHECK (col IS NULL OR array_length(col) > 0));";
+    let sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, col TEXT, CHECK (col IS NULL OR pg_column_size(col) > 0));";
     let options = Pg2SqliteOptions::default();
 
     let result = Pg2Sqlite::default()
@@ -127,7 +122,7 @@ fn test_nested_function_check_constraint_causes_error() {
     assert!(result.is_err(), "Expected translation error for nested function in CHECK");
     let error_msg = result.unwrap_err().to_string();
     assert!(
-        error_msg.contains("array_length") || error_msg.to_lowercase().contains("undefined"),
+        error_msg.contains("pg_column_size"),
         "Error should mention the nested function name, got: {error_msg}"
     );
 }
@@ -136,17 +131,15 @@ fn test_nested_function_check_constraint_causes_error() {
 /// CHECK constraints are removed as well.
 #[test]
 fn test_nested_function_check_constraint_removed_with_option() {
-    let sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, col TEXT, CHECK (col IS NULL OR array_length(col) > 0));";
+    let sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, col TEXT, CHECK (col IS NULL OR pg_column_size(col) > 0));";
     let options = Pg2SqliteOptions::default().with_remove_unsupported_check_constraints();
 
     let translated = Pg2Sqlite::default().sql(sql).unwrap().translate(&options).unwrap().into_vec();
     let stmts: Vec<String> = translated.iter().map(ToString::to_string).collect();
     let sql_output = stmts.join("\n");
 
-    // The user-declared nested CHECK calling the unsupported function is
-    // removed.
     assert!(
-        !sql_output.contains("array_length"),
+        !sql_output.contains("pg_column_size"),
         "nested unsupported user CHECK should be removed, got: {sql_output}"
     );
     // Execute the emitted DDL to prove real SQLite accepts the translated

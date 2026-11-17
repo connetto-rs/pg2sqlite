@@ -13,13 +13,16 @@ use core::{convert::Infallible, ops::ControlFlow};
 
 use sql_traits::{
     errors::{HelperSetError, LookupError},
-    structs::{HelperArm, HelperSet, IdentifierCase, ParserDB, TargetName},
+    structs::{
+        GrantArm, GrantedTo, HelperArm, HelperSet, IdentifierCase, ParserDB, Restriction,
+        SettingContent, SettingValue, TargetName,
+    },
     traits::{ColumnLike, DatabaseLike, FunctionLike, TableLike},
 };
 use sqlparser::ast::{
     BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
-    InTarget, ObjectName, ObjectNamePart, Query, SetExpr, SetOperator, SetQuantifier, Value,
-    ValueWithSpan, VisitMut, VisitorMut,
+    InTarget, ObjectName, ObjectNamePart, Query, SelectItem, SetExpr, SetOperator, SetQuantifier,
+    Value, ValueWithSpan, VisitMut, VisitorMut,
 };
 
 #[cfg(not(feature = "std"))]
@@ -29,7 +32,9 @@ use crate::{
     impls::{
         function_helpers::{query_projection, simple_function_expr, string_literal},
         privileges::has_backing_table,
-        query_builder::{from_relation, make_query, plain_table_factor, single_expr_query},
+        query_builder::{
+            from_relation, make_query, make_simple_select, plain_table_factor, single_expr_query,
+        },
     },
     options::TranslationContext,
     traits::{TranslatorWithContext, schema::function_lookup_target},
@@ -95,9 +100,15 @@ pub(crate) fn helper_membership(
                 "{name}() cannot be translated as the set it returns: {error}"
             ))
         })?;
+    let mut read = Vec::new();
+    let lowered = lowered_set(&set, name, &mut read)?;
     let mut guarded = Vec::new();
-    guarded_tables(&set, schema, options, &mut guarded)?;
-    let mut lowered = lowered_set(&set).translate_with_warnings(schema, options, emit)?;
+    for table in read {
+        if has_backing_table(table, schema, options)? {
+            guarded.push(table.table_name());
+        }
+    }
+    let mut lowered = lowered.translate_with_warnings(schema, options, emit)?;
     let ControlFlow::Continue(()) = lowered
         .visit(&mut BackingTables { guarded: &guarded, suffix: options.get_rls_table_suffix() });
     Ok(Some(lowered))
@@ -147,40 +158,35 @@ fn arguments(call: &Function) -> Result<Vec<Value>, HelperSetError> {
         .collect()
 }
 
-/// The names of the tables with a backing table the arms of `set` read, its
-/// parent arms' sets included.
-fn guarded_tables<'db>(
-    set: &HelperSet<'db, ParserDB>,
-    schema: &ParserDB,
-    options: &TranslationContext<'_>,
-    guarded: &mut Vec<&'db str>,
-) -> Result<(), Error> {
-    for arm in set.arms() {
-        let table = match arm {
-            HelperArm::Grant(grant) => grant.table(),
-            HelperArm::Parent(parent) => {
-                guarded_tables(parent.set(), schema, options, guarded)?;
-                parent.table()
-            }
-        };
-        if has_backing_table(table, schema, options)? {
-            guarded.push(table.table_name());
-        }
-    }
-    Ok(())
-}
-
 /// The set as a PostgreSQL query over the tables the helper reads, written
-/// under their declared names so the translation resolves their columns.
-fn lowered_set(set: &HelperSet<'_, ParserDB>) -> Query {
-    let mut arms = set.arms().iter().map(lowered_arm);
+/// under their declared names so the translation resolves their columns, each
+/// table it reads pushed onto `read`.
+///
+/// # Errors
+///
+/// Refuses a set grown along a walk, and an arm holding a condition the query
+/// does not write out, either of which would keep rows the helper does not
+/// return.
+fn lowered_set<'db>(
+    set: &HelperSet<'db, ParserDB>,
+    helper: &ObjectName,
+    read: &mut Vec<&'db <ParserDB as DatabaseLike>::Table>,
+) -> Result<Query, Error> {
+    if set.selection().is_some() {
+        return Err(walk_refusal(helper));
+    }
+    let mut arms = Vec::new();
+    for arm in set.arms() {
+        arms.push(lowered_arm(arm, helper, read)?);
+    }
+    let mut arms = arms.into_iter();
     let Some(first) = arms.next() else {
         // A helper keeping no row for these arguments returns the empty set.
-        return single_expr_query(
+        return Ok(single_expr_query(
             Expr::Value(Value::Null.into()),
             Vec::new(),
             Some(Expr::Value(Value::Boolean(false).into())),
-        );
+        ));
     };
     let body = arms.fold(*first.body, |left, right| {
         SetExpr::SetOperation {
@@ -190,32 +196,66 @@ fn lowered_set(set: &HelperSet<'_, ParserDB>) -> Query {
             right: right.body,
         }
     });
-    make_query(None, body)
+    Ok(make_query(None, body))
 }
 
-/// One arm as `SELECT <column> FROM <table> WHERE <condition>`.
-fn lowered_arm(arm: &HelperArm<'_, ParserDB>) -> Query {
+/// One arm as `SELECT <columns> FROM <table> WHERE <condition>`.
+fn lowered_arm<'db>(
+    arm: &HelperArm<'db, ParserDB>,
+    helper: &ObjectName,
+    read: &mut Vec<&'db <ParserDB as DatabaseLike>::Table>,
+) -> Result<Query, Error> {
     match arm {
         HelperArm::Grant(grant) => {
+            read.push(grant.table());
+            let refused = |condition: &str| {
+                Error::forward_refusal(format!(
+                    "{helper}() cannot be translated as the set it returns: an arm keeps its \
+                     rows under {condition}, which the translation does not write out."
+                ))
+            };
+            if let Some(condition) = unwritten(grant) {
+                return Err(refused(condition));
+            }
+            let grantee = match grant.granted_to() {
+                GrantedTo::Request(grantee) if grantee.excludes_unset() => {
+                    return Err(refused("a grantee setting read as NULL when it is empty"));
+                }
+                GrantedTo::Request(grantee)
+                    if matches!(
+                        grantee.setting().content(),
+                        SettingContent::Value(SettingValue::Caller(_))
+                    ) =>
+                {
+                    grantee
+                }
+                GrantedTo::Request(_) => {
+                    return Err(refused("a grantee setting other than the caller"));
+                }
+                GrantedTo::Set(_) => return Err(refused("a grantee set another helper returns")),
+                GrantedTo::Anyone => return Err(refused("no grantee")),
+            };
             let caller = simple_function_expr(
                 "current_setting",
-                vec![string_literal(grant.setting().name())],
+                vec![string_literal(grantee.setting().name())],
                 None,
             );
             let mut condition = Expr::BinaryOp {
-                left: Box::new(column(grant.caller_column())),
+                left: Box::new(column(grantee.column())),
                 op: BinaryOperator::Eq,
                 right: Box::new(caller),
             };
-            if let Some(restriction) = grant.restriction() {
+            for restriction in grant.restrictions() {
+                let Restriction::In(set) = restriction else {
+                    return Err(refused("a column required to be NULL or not NULL"));
+                };
                 condition = Expr::BinaryOp {
                     left: Box::new(condition),
                     op: BinaryOperator::And,
                     right: Box::new(Expr::In {
-                        expr: Box::new(column(restriction.column())),
+                        expr: Box::new(column(set.column())),
                         target: InTarget::List(
-                            restriction
-                                .values()
+                            set.values()
                                 .iter()
                                 .map(|value| Expr::Value(ValueWithSpan::from(value.clone())))
                                 .collect(),
@@ -225,24 +265,60 @@ fn lowered_arm(arm: &HelperArm<'_, ParserDB>) -> Query {
                     }),
                 };
             }
-            single_expr_query(
-                column(grant.column()),
-                from_relation(plain_table_factor(grant.table().name.clone())),
-                Some(condition),
-            )
+            let projection = grant
+                .columns()
+                .iter()
+                .map(|returned| SelectItem::UnnamedExpr(column(returned)))
+                .collect();
+            Ok(make_query(
+                None,
+                SetExpr::Select(Box::new(make_simple_select(
+                    projection,
+                    from_relation(plain_table_factor(grant.table().name.clone())),
+                    Some(condition),
+                ))),
+            ))
         }
         HelperArm::Parent(parent) => {
-            single_expr_query(
+            read.push(parent.table());
+            Ok(single_expr_query(
                 column(parent.key()),
                 from_relation(plain_table_factor(parent.table().name.clone())),
                 Some(Expr::In {
                     expr: Box::new(column(parent.column())),
-                    target: InTarget::Subquery(Box::new(lowered_set(parent.set()))),
+                    target: InTarget::Subquery(Box::new(lowered_set(parent.set(), helper, read)?)),
                     negated: false,
                     global: false,
                 }),
-            )
+            ))
         }
+        HelperArm::Walk(_) => Err(walk_refusal(helper)),
+    }
+}
+
+/// The refusal of a set grown along a walk.
+fn walk_refusal(helper: &ObjectName) -> Error {
+    Error::forward_refusal(format!(
+        "{helper}() cannot be translated as the set it returns: the set grows along a walk, \
+         which the translation does not write out."
+    ))
+}
+
+/// The first condition of `grant` beside its grantee and restrictions the
+/// lowering does not write out, as a refusal names it.
+fn unwritten(grant: &GrantArm<'_, ParserDB>) -> Option<&'static str> {
+    if !grant.joined_rows().is_empty() {
+        Some("a row of another table it joins")
+    } else if !grant.anti_joins().is_empty() {
+        Some("a row of another table whose existence takes it away")
+    } else if !grant.caps().is_empty() {
+        Some("a cap another helper's set puts on it")
+    } else if grant.gate().is_some() {
+        Some("a condition on a caller setting itself")
+    } else if !grant.time_bounds().is_empty() {
+        Some("a bound on the statement time")
+    } else {
+        None
     }
 }
 

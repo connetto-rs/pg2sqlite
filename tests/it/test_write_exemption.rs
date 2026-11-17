@@ -82,6 +82,7 @@ FOR EACH ROW EXECUTE FUNCTION touch_child();
 ";
 
 const FUNCTION_POLICY_SCHEMA: &str = "
+CREATE FUNCTION policy_allows(owner TEXT) RETURNS BOOLEAN LANGUAGE sql STABLE AS $$ SELECT false $$;
 CREATE TABLE function_items (
     id INTEGER PRIMARY KEY,
     owner TEXT NOT NULL
