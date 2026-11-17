@@ -56,6 +56,10 @@ pub(crate) struct Unit<'a> {
     pub(crate) binding: &'a ParserDB,
     /// The emitted statements, in order.
     pub(crate) emitted: &'a [Statement],
+    /// Whether the emitted triggers were rebuilt from the other triggers
+    /// sharing their slots, which retranslating the source alone cannot
+    /// reproduce.
+    pub(crate) rebuilt_trigger: bool,
     /// How PostgreSQL's transaction nesting rules classify the statement.
     pub(crate) disposition: &'a Disposition,
 }
@@ -281,6 +285,18 @@ fn replay_unit(
         }
         return Ok((schema, None));
     };
+    // A shared member's body also lives in the merged trigger other statements
+    // emit.
+    let shares_slot = matches!(unit.source, Statement::CreateTrigger(create)
+        if context.shares_trigger_slot(&crate::impls::translator_impls::trigger_slots::trigger_key(create)));
+    if unit.rebuilt_trigger || shares_slot {
+        return Err(refusal(format!(
+            "statement {} emits a trigger shared with other triggers on the same table, timing \
+             and event, and replaying it here renames what the trigger reads, which a \
+             retranslation of that one statement cannot carry into the shared trigger",
+            id.index()
+        )));
+    }
     // A statement ending an epoch was translated against the schema before it,
     // and every other one against the schema after it.
     let before = Pg2Sqlite::schema_ends_epoch(&statement);

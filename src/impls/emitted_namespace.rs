@@ -143,12 +143,29 @@ impl<'a> Namespaces<'a> {
                 Source::Initial(initial_description("index", index.schema(), name)),
             )?;
         }
+        let slots = super::translator_impls::trigger_slots::TriggerSlots::seeded(Some(schema))?;
         for trigger in schema.triggers() {
             let owner = sqlite_key(&trigger.table(schema)?.stored_table_name());
+            let description = initial_description("trigger", None, trigger.name());
+            // A plain row trigger lives under the names its slots were emitted
+            // with.
+            if slots.holds(trigger) {
+                for name in slots.names_of(trigger) {
+                    let name_key = key(name);
+                    if !self.triggers.contains_key(&name_key) {
+                        self.define_trigger_key(
+                            name_key,
+                            owner.clone(),
+                            Source::Initial(description.clone()),
+                        )?;
+                    }
+                }
+                continue;
+            }
             self.define_trigger_key(
                 sqlite_key(trigger.name()),
                 owner,
-                Source::Initial(initial_description("trigger", None, trigger.name())),
+                Source::Initial(description),
             )?;
         }
         Ok(())

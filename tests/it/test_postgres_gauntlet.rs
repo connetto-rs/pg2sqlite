@@ -84,3 +84,6 @@ mod parity_privileges;
 
 #[path = "gauntlet/parity_uuid_text.rs"]
 mod parity_uuid_text;
+
+#[path = "gauntlet/parity_trigger_order.rs"]
+mod parity_trigger_order;

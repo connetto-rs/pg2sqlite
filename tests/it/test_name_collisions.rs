@@ -60,6 +60,26 @@ fn a_batch_cannot_reuse_an_initial_schema_object_name() {
 }
 
 #[test]
+fn a_batch_cannot_reuse_an_initial_schema_maintenance_trigger_name() {
+    let initial = Pg2Sqlite::default()
+        .sql(&format!(
+            "CREATE TABLE a (n INT); CREATE TABLE b (n INT);
+             {TRIGGER_FUNCTION}
+             CREATE TRIGGER touch BEFORE INSERT ON a FOR EACH ROW EXECUTE FUNCTION f();"
+        ))
+        .expect("initial schema should parse")
+        .build_schema()
+        .expect("initial schema should build");
+    let error = Pg2Sqlite::default()
+        .sql("CREATE TRIGGER touch BEFORE INSERT ON b FOR EACH ROW EXECUTE FUNCTION f();")
+        .expect("batch should parse")
+        .translate_with_schema(&initial, &Pg2SqliteOptions::default())
+        .expect_err("the emitted touch trigger already exists")
+        .to_string();
+    assert!(error.contains("touch"), "{error}");
+}
+
+#[test]
 fn an_unqualified_table_collides_with_a_schema_qualified_one() {
     let error = translate_err(
         "CREATE SCHEMA x;

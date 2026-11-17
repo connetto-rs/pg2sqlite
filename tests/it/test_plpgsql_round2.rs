@@ -133,17 +133,23 @@ fn r2_5_tg_op_is_constant_folded_in_insert_trigger() {
     assert_eq!(count, 1, "audit row must land when TG_OP = 'INSERT' folds to TRUE");
 }
 
-// ── R2-5 companion: multi-event TG_OP trigger — pin current contract
+// ── R2-5 companion: multi-event TG_OP trigger folds per event
 // ──────────
 
+diesel::table! {
+    r2_5_multi_log (seq) {
+        seq -> Integer,
+        op -> Text,
+    }
+}
+
+/// SQLite takes one event per trigger, so each event gets its own trigger with
+/// `TG_OP` folded to that event.
 #[test]
-fn r2_5_multi_event_tg_op_trigger_current_contract() {
-    // An INSERT OR UPDATE trigger whose body branches on TG_OP. Measure what
-    // the translator does today and pin it. If the translator refuses, that IS
-    // the contract; if it translates, record the fire-time behavior.
+fn r2_5_multi_event_tg_op_trigger_folds_per_event() {
     let sql = "
         CREATE TABLE r2_5_multi_t (id INT PRIMARY KEY, val INT);
-        CREATE TABLE r2_5_multi_log (op TEXT);
+        CREATE TABLE r2_5_multi_log (seq SERIAL PRIMARY KEY, op TEXT NOT NULL);
 
         CREATE FUNCTION r2_5_multi_f() RETURNS TRIGGER LANGUAGE plpgsql AS $$
         BEGIN
@@ -161,15 +167,21 @@ fn r2_5_multi_event_tg_op_trigger_current_contract() {
         FOR EACH ROW EXECUTE FUNCTION r2_5_multi_f();
     ";
 
-    let result = translate(sql);
-    // Pin: multi-event TG_OP triggers are refused at translation time because
-    // TG_OP is ambiguous without per-event trigger splitting.
-    // If this unexpectedly passes, report the measured fire-time behavior.
-    assert!(
-        result.is_err(),
-        "multi-event TG_OP trigger is expected to be refused (ambiguous TG_OP); \
-         if it translates now, update this pin with the measured fire-time behavior"
-    );
+    let stmts = translate(sql).expect("multi-event trigger must translate");
+    let mut conn = establish_connection();
+    apply_all(&mut conn, &stmts);
+    diesel::sql_query("INSERT INTO r2_5_multi_t (id, val) VALUES (1, 1)")
+        .execute(&mut conn)
+        .expect("insert");
+    diesel::sql_query("UPDATE r2_5_multi_t SET val = 2 WHERE id = 1")
+        .execute(&mut conn)
+        .expect("update");
+    let ops: Vec<String> = r2_5_multi_log::table
+        .select(r2_5_multi_log::op)
+        .order(r2_5_multi_log::seq.asc())
+        .load(&mut conn)
+        .expect("read log");
+    assert_eq!(ops, ["INSERT", "UPDATE"]);
 }
 
 // ── R2-13: plpgsql variable referenced in UPDATE/DELETE path ─────────────────

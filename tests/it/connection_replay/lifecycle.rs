@@ -391,6 +391,28 @@ fn application_writes_can_use_replayed_triggers_targeting_renamed_persistent_tab
 }
 
 #[test]
+fn replay_refuses_shared_triggers_whose_target_was_renamed() {
+    let script = script(
+        "CREATE TEMP TABLE scratch(id INT PRIMARY KEY, value INT NOT NULL);
+         CREATE TABLE mirror(id INT PRIMARY KEY, value INT NOT NULL);
+         CREATE FUNCTION remember() RETURNS trigger AS $$
+         BEGIN INSERT INTO mirror(id,value) VALUES(NEW.id,NEW.value); RETURN NEW; END; $$ LANGUAGE plpgsql;
+         CREATE FUNCTION remember_twice() RETURNS trigger AS $$
+         BEGIN INSERT INTO mirror(id,value) VALUES(NEW.value,NEW.id); RETURN NEW; END; $$ LANGUAGE plpgsql;
+         CREATE TRIGGER remember AFTER INSERT ON scratch FOR EACH ROW EXECUTE FUNCTION remember();
+         CREATE TRIGGER remember_twice AFTER INSERT ON scratch FOR EACH ROW EXECUTE FUNCTION remember_twice();
+         ALTER TABLE mirror RENAME TO archive;",
+    );
+    let Err(pg2sqlite::prelude::Error::Connection(
+        pg2sqlite::script::ConnectionError::Translation(refusal),
+    )) = script.connect()
+    else {
+        panic!("a merged trigger cannot be retranslated one statement at a time");
+    };
+    assert!(refusal.to_string().contains("shared with other triggers"), "{refusal}");
+}
+
+#[test]
 fn conflict_updates_include_update_trigger_effects_in_reconnect_safety() {
     let script = script(
         "CREATE TABLE scratch(id INT PRIMARY KEY, value INT NOT NULL);
