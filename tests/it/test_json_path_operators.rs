@@ -37,28 +37,24 @@ fn forward(postgres: &str) -> Result<String, pg2sqlite::errors::Error> {
 /// here. That is the typing the plain `->>` passthrough already has, so the
 /// comparison is on the rendering.
 fn value_of(sqlite: &str) -> Option<String> {
-    let connection = rusqlite::Connection::open_in_memory().expect("open");
-    connection
-        .execute_batch(
-            r#"CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT, arr TEXT, enc TEXT);
-               INSERT INTO t VALUES (1,
-                 '{"a":{"b":2},"a,b":3,"a b":4,"0":"x","1.5":"half"}',
-                 '[10,20,30]',
-                 'hex');"#,
-        )
-        .expect("fixture");
-    connection
-        .query_row(sqlite, [], |row| row.get::<_, rusqlite::types::Value>(0))
-        .map(|value| {
-            match value {
-                rusqlite::types::Value::Null => None,
-                rusqlite::types::Value::Integer(n) => Some(n.to_string()),
-                rusqlite::types::Value::Real(r) => Some(r.to_string()),
-                rusqlite::types::Value::Text(t) => Some(t),
-                rusqlite::types::Value::Blob(_) => Some("<blob>".to_string()),
-            }
-        })
-        .expect("one row")
+    use diesel::RunQueryDsl;
+    use diesel_dynamic_schema::dynamic_value::{DynamicRow, NamedField};
+
+    use crate::helpers::run_translated::{TextCell, first_column_text};
+    let mut connection = crate::helpers::establish_connection();
+    for statement in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT, arr TEXT, enc TEXT)",
+        r#"INSERT INTO t VALUES (1,
+            '{"a":{"b":2},"a,b":3,"a b":4,"0":"x","1.5":"half"}',
+            '[10,20,30]', 'hex')"#,
+    ] {
+        diesel::sql_query(statement).execute(&mut connection).expect("fixture");
+    }
+    first_column_text(
+        diesel::sql_query(sqlite)
+            .get_result::<DynamicRow<NamedField<TextCell>>>(&mut connection)
+            .expect("one row"),
+    )
 }
 
 /// Translate, then execute, then compare with what PostgreSQL 18.4 answered

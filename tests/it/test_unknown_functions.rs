@@ -6,8 +6,11 @@
 //! that keep passing through are the ones SQLite can actually resolve: its own
 //! built-ins, and whatever the caller has declared.
 
+use diesel::RunQueryDsl;
+use diesel_dynamic_schema::dynamic_value::{DynamicRow, NamedField};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use rusqlite::Connection;
+
+use crate::helpers::run_translated::TextCell;
 
 const TABLE: &str = "CREATE TABLE t (id INT PRIMARY KEY, n INT, s TEXT, payload JSONB);";
 
@@ -27,13 +30,17 @@ fn assert_sqlite_resolves(call: &str) {
     let emitted = translate(&format!("{TABLE} SELECT {call} FROM t;"), &options)
         .unwrap_or_else(|error| panic!("{call} should translate: {error}"));
 
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = crate::helpers::establish_connection();
     for statement in &emitted {
-        // Emitted SQL is the artifact under test, so it runs as text. `prepare`
-        // resolves function names without executing anything.
-        connection
-            .execute_batch(&format!("{statement};"))
-            .or_else(|_| connection.prepare(statement).map(|_| ()))
+        // The emitted SQL is the artifact under test.
+        diesel::sql_query(statement)
+            .execute(&mut connection)
+            .map(|_| ())
+            .or_else(|_| {
+                diesel::sql_query(format!("EXPLAIN {statement}"))
+                    .load::<DynamicRow<NamedField<TextCell>>>(&mut connection)
+                    .map(|_| ())
+            })
             .unwrap_or_else(|error| panic!("SQLite rejected {call}: {error}\n{statement}"));
     }
 }
@@ -165,14 +172,14 @@ fn the_configured_uuid_function_name_translates() {
         emitted.iter().any(|statement| statement.contains("uuid7")),
         "the configured name should reach the output: {emitted:?}"
     );
-    let conn = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = crate::helpers::establish_connection();
     for statement in &emitted {
         // uuid7 is a caller-registered UDF absent in the test process; accept
         // that specific error so SQLite still validates the surrounding SQL.
-        match conn.execute_batch(&format!("{statement};")) {
-            Ok(()) => {}
-            Err(e) if e.to_string().contains("no such function: uuid7") => {}
-            Err(e) => panic!("SQLite rejected statement: {e}\n{statement}"),
+        match diesel::sql_query(statement).execute(&mut connection) {
+            Ok(_) => {}
+            Err(error) if error.to_string().contains("no such function: uuid7") => {}
+            Err(error) => panic!("SQLite rejected statement: {error}\n{statement}"),
         }
     }
 }

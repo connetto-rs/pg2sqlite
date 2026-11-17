@@ -253,18 +253,18 @@ fn blob_passes_through() {
 /// Execute each statement emitted by the `translate` helper against a fresh
 /// in-memory SQLite connection.
 ///
-/// The `translate` helper joins multiple statements with `\n` (no `;`).
-/// `execute_batch` needs semicolons between statements, so we split on newlines
-/// and execute each one individually. sqlite-vec is registered so tests that
-/// translate vector types can execute the resulting vec0 DDL.
-///
-/// rusqlite is used directly because diesel does not expose
-/// `sqlite3_auto_extension`.
+/// The `translate` helper joins multiple statements with `\n` (no `;`), so
+/// each line runs on its own. sqlite-vec is registered as an auto extension
+/// so tests that translate vector types can execute the resulting vec0 DDL.
 fn parse_sqlite(sql: &str) {
+    use diesel::RunQueryDsl;
+
     helpers::register_sqlite_vec_once();
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut connection = helpers::establish_connection();
     for stmt in sql.lines().filter(|l| !l.trim().is_empty()) {
-        conn.execute_batch(&format!("{stmt};"))
+        // The statement is translator output, a runtime string.
+        diesel::sql_query(stmt)
+            .execute(&mut connection)
             .unwrap_or_else(|e| panic!("translated DDL must run in SQLite: {e}\n{stmt}"));
     }
 }

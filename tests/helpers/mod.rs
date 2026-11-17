@@ -332,9 +332,9 @@ pub fn reverse_translate_sql(sql: &str) -> Result<String, String> {
 /// execute.
 pub fn execute_all(pg: &str, options: &Pg2SqliteOptions) {
     let statements = translate_pg(pg, options).expect("translation should succeed");
-    let connection = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = establish_connection();
     for statement in &statements {
-        connection.execute_batch(&format!("{statement};")).unwrap_or_else(|error| {
+        diesel::sql_query(statement).execute(&mut connection).unwrap_or_else(|error| {
             panic!("emitted statement must execute in SQLite: {error}\n{statement}")
         });
     }
@@ -358,18 +358,22 @@ pub fn prepared_user_select(pg: &str, options: &Pg2SqliteOptions) -> String {
         .position(|statement| is_user_statement(statement, "SELECT"))
         .unwrap_or_else(|| panic!("no user SELECT in:\n{}", statements.join("\n")));
 
-    let connection = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = establish_connection();
     for (index, statement) in statements.iter().enumerate() {
         if index == select {
             continue;
         }
-        connection.execute_batch(&format!("{statement};")).unwrap_or_else(|error| {
+        diesel::sql_query(statement).execute(&mut connection).unwrap_or_else(|error| {
             panic!("emitted statement must execute in SQLite: {error}\n{statement}")
         });
     }
-    connection.prepare(&statements[select]).unwrap_or_else(|error| {
-        panic!("SQLite must accept the query: {error}\n{}", statements[select])
-    });
+    diesel::sql_query(format!("EXPLAIN {}", statements[select]))
+        .load::<diesel_dynamic_schema::dynamic_value::DynamicRow<
+            diesel_dynamic_schema::dynamic_value::NamedField<run_translated::TextCell>,
+        >>(&mut connection)
+        .unwrap_or_else(|error| {
+            panic!("SQLite must accept the query: {error}\n{}", statements[select])
+        });
 
     statements[select].clone()
 }

@@ -38,6 +38,7 @@ arbitrary = { version = "1", features = ["derive"], optional = true }
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 diesel = { version = "2.3.9", features = ["postgres", "sqlite"] }
+diesel-dynamic-schema = { git = "https://github.com/diesel-rs/diesel", branch = "main", features = ["sqlite"] }
 half = "2.7"
 insta = "1.47.2"
 rosetta-uuid = { version = "0.2.0", features = ["diesel", "postgres", "sqlite"] }

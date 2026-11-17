@@ -22,7 +22,7 @@
 #![allow(missing_docs)]
 #![cfg(feature = "std")]
 
-use diesel::{Connection, RunQueryDsl, SqliteConnection};
+use diesel::RunQueryDsl;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
 /// Helper: translate a PG `SELECT ... FROM t` statement after a minimal
@@ -44,7 +44,7 @@ fn assert_translates_and_runs(pg_sql: &str) -> String {
 
     let translated_sql = stmts.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("; ");
 
-    let mut conn = SqliteConnection::establish(":memory:").expect("open in-memory SQLite");
+    let mut conn = crate::helpers::establish_connection();
 
     for stmt in &stmts {
         diesel::sql_query(stmt.to_string()).execute(&mut conn).unwrap_or_else(|e| {
