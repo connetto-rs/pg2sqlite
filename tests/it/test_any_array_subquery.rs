@@ -1,7 +1,8 @@
 //! `<expr> = ANY (ARRAY(<subquery>))` and `<expr> <> ALL (ARRAY(<subquery>))`,
 //! PostgreSQL's spelling of subquery membership that plans the subquery once
 //! per statement. Both translate as the `IN` and `NOT IN` they are equal to,
-//! and every other use of `ARRAY(<subquery>)` stays refused.
+//! and every other use of `ARRAY(<subquery>)` but the containment
+//! `test_array_containment_subquery` covers stays refused.
 
 use pg2sqlite::prelude::{ArrayRepresentation, Pg2SqliteOptions, SessionVariableMapping};
 
