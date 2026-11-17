@@ -483,6 +483,15 @@ fn evaluate_definition<T: PartialEq>(
             }
             Ok(agreed.unwrap_or(DefinitionValue::Opaque))
         }
+        ColumnDefinition::ArrayElement { array, scope } => {
+            Ok(match element_column(array, *scope, schema, options)? {
+                Some(column) => DefinitionValue::Known(read_column(&column)),
+                None => DefinitionValue::Opaque,
+            })
+        }
+        ColumnDefinition::Ordinality => {
+            Ok(DefinitionValue::Known(read_column(&ordinality_column())))
+        }
         ColumnDefinition::RecursiveUnion { anchor, .. } => {
             evaluate_definition(&anchor.definition(), schema, options, read_column, read_expression)
         }
@@ -506,6 +515,39 @@ fn agreement<T: PartialEq>(
         (DefinitionValue::Opaque, _) | (_, DefinitionValue::Opaque) => DefinitionValue::Opaque,
         _ => DefinitionValue::Known(None),
     }
+}
+
+/// The column an element of `array`, the argument `unnest` expands, stands
+/// for, typed as the array's element. `None` when the array's type is not
+/// known.
+fn element_column<'s>(
+    array: &Expr,
+    scope: sql_traits::structs::ColumnDefinitionScope<'s, 's, 's, ParserDB>,
+    schema: &ParserDB,
+    options: &'s crate::options::TranslationContext<'_>,
+) -> Result<Option<sqlparser::ast::ColumnDef>, Error> {
+    let scoped = options.with_definition_scope(scope);
+    let Some(name) = crate::impls::expression_type::type_name(array, schema, &scoped)? else {
+        return Ok(None);
+    };
+    Ok(match crate::impls::expression_type::parse_type_name(&name) {
+        Some(DataType::Array(
+            sqlparser::ast::ArrayElemTypeDef::SquareBracket(element, _)
+            | sqlparser::ast::ArrayElemTypeDef::AngleBracket(element)
+            | sqlparser::ast::ArrayElemTypeDef::Parenthesis(element),
+        )) => Some(implied_column(*element)),
+        _ => None,
+    })
+}
+
+/// The `bigint` column `WITH ORDINALITY` adds.
+fn ordinality_column() -> sqlparser::ast::ColumnDef {
+    implied_column(DataType::BigInt(None))
+}
+
+/// A column of `data_type` that no table declares.
+fn implied_column(data_type: DataType) -> sqlparser::ast::ColumnDef {
+    sqlparser::ast::ColumnDef { name: Ident::new(""), data_type, options: Vec::new() }
 }
 
 /// Runs `inspect` over the output scope of `query`, recorded or built from the
@@ -715,6 +757,11 @@ fn definition_find<T>(
             }
             Ok(None)
         }
+        ColumnDefinition::ArrayElement { array, scope } => {
+            Ok(element_column(array, *scope, schema, options)?
+                .and_then(|column| read_column(&column)))
+        }
+        ColumnDefinition::Ordinality => Ok(read_column(&ordinality_column())),
         ColumnDefinition::Parameter { .. }
         | ColumnDefinition::Variable(_)
         | ColumnDefinition::VariableField(_)
@@ -754,6 +801,9 @@ fn scope_query_after_factor_rewrites(
         translated: &sqlparser::ast::TableFactor,
     ) -> bool {
         match (&mut *written, translated) {
+            // sql-traits types the columns of `unnest` as written, which the
+            // translated derived table would hide.
+            (written, _) if expands_an_array(written) => false,
             (
                 sqlparser::ast::TableFactor::Table { args: Some(_), .. }
                 | sqlparser::ast::TableFactor::Function { .. }
@@ -798,6 +848,20 @@ fn scope_query_after_factor_rewrites(
         sqlparser::ast::SetExpr::Select(Box::new(scoped_select)),
     );
     scope_query_for(&query).or(Some(query))
+}
+
+/// Whether `factor` is a call of `unnest`, whose columns hold the elements of
+/// the arrays it expands.
+fn expands_an_array(factor: &sqlparser::ast::TableFactor) -> bool {
+    match factor {
+        sqlparser::ast::TableFactor::UNNEST { .. } => true,
+        sqlparser::ast::TableFactor::Table { name, args: Some(_), .. }
+        | sqlparser::ast::TableFactor::Function { name, .. } => {
+            crate::impls::object_name::last_ident(name)
+                .is_some_and(|ident| ident.value.eq_ignore_ascii_case("unnest"))
+        }
+        _ => false,
+    }
 }
 
 fn has_nested_join(entry: &sqlparser::ast::TableWithJoins) -> bool {
@@ -6303,6 +6367,97 @@ mod tests {
             });
             assert_eq!(from_values, expected, "{values}");
             assert_eq!(from_union, expected, "{union}");
+        }
+    }
+
+    /// A column of `unnest` reads as a column of the array's element type and
+    /// the `WITH ORDINALITY` column as a `bigint`, while an array whose type is
+    /// unknown, or is spelled as no array of an element, leaves its elements
+    /// opaque.
+    #[test]
+    fn an_unnest_column_reads_as_its_element_type() {
+        use sql_traits::{
+            structs::{ColumnDefinition, ExpressionContext, ExpressionScope, IdentifierCase},
+            traits::DatabaseLike,
+        };
+        use sqlparser::ast::DataType;
+
+        /// Answers the type of every column a definition reads.
+        #[expect(clippy::unnecessary_wraps, reason = "the reader `evaluate_definition` takes")]
+        fn read_type(column: &sqlparser::ast::ColumnDef) -> Option<DataType> {
+            Some(column.data_type.clone())
+        }
+        /// Answers no type for an expression, which no case here reads.
+        #[expect(clippy::unnecessary_wraps, reason = "the reader `evaluate_definition` takes")]
+        fn read_no_expression(
+            _: &Expr,
+            _: &ParserDB,
+            _: &crate::options::TranslationContext<'_>,
+        ) -> Result<Option<DataType>, crate::errors::Error> {
+            Ok(None)
+        }
+
+        let schema = ParserDB::parse::<PostgreSqlDialect>(
+            "CREATE TABLE t (tags TEXT[]);
+             CREATE FUNCTION f() RETURNS INT8 LANGUAGE sql AS 'SELECT 1';",
+        )
+        .unwrap();
+        let function = schema.functions().next().unwrap();
+        let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
+        // `None` stands for an opaque definition.
+        for (sql, ordinality, expected) in [
+            ("SELECT u.x FROM t, unnest(t.tags) AS u(x)", false, Some(DataType::Text)),
+            (
+                "SELECT u.n FROM t, unnest(t.tags) WITH ORDINALITY AS u(x, n)",
+                true,
+                Some(DataType::BigInt(None)),
+            ),
+            ("SELECT u.x FROM t, unnest(ARRAY[t.tags[1]]) AS u(x)", false, None),
+            ("SELECT u.x FROM unnest(NULL::_record) AS u(x)", false, None),
+        ] {
+            let body = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap().remove(0);
+            let context = ExpressionContext::for_statement(
+                &body,
+                &ExpressionScope::FunctionBody(function),
+                &schema,
+                IdentifierCase::AsWritten,
+            )
+            .unwrap();
+            let sqlparser::ast::Statement::Query(query) = &body else { unreachable!() };
+            let SetExpr::Select(select) = query.body.as_ref() else { unreachable!() };
+            let SelectItem::UnnamedExpr(reference) = &select.projection[0] else { unreachable!() };
+            let (definition, _) = context.reference(reference).unwrap().expect("binds");
+            assert_eq!(
+                matches!(definition, ColumnDefinition::Ordinality),
+                ordinality,
+                "{sql}: {definition:?}"
+            );
+            assert!(
+                ordinality || matches!(definition, ColumnDefinition::ArrayElement { .. }),
+                "{sql}: {definition:?}"
+            );
+            let evaluated = match super::evaluate_definition(
+                &definition,
+                &schema,
+                &options,
+                &read_type,
+                &read_no_expression,
+            )
+            .unwrap()
+            {
+                super::DefinitionValue::Known(value) => Some(value.expect("the reader answers")),
+                super::DefinitionValue::Opaque => None,
+            };
+            assert_eq!(evaluated, expected, "{sql}");
+            let found = super::definition_find(
+                &definition,
+                &schema,
+                &options,
+                &read_type,
+                &read_no_expression,
+            )
+            .unwrap();
+            assert_eq!(found, expected, "{sql}");
         }
     }
 
