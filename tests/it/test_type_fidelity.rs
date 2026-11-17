@@ -58,7 +58,7 @@ fn warnings(pg: &str, opts: &Pg2SqliteOptions) -> Vec<TranslationWarning> {
         .warnings
 }
 
-// ── Finding 1: NaN / Infinity silently become 0.0 ────────────────────────────
+// ── Finding 1: NaN silently becomes 0.0 ──────────────────────────────────────
 
 #[test]
 fn nan_cast_to_double_is_refused() {
@@ -71,23 +71,15 @@ fn nan_cast_to_double_is_refused() {
 }
 
 #[test]
-fn infinity_cast_to_double_is_refused() {
-    expect_refusal(
-        "CREATE TABLE t (col double precision);
-         INSERT INTO t VALUES ('Infinity'::double precision);",
+fn a_float_infinity_is_stored_and_compared_as_sqlite_real_infinity() {
+    let rows = query_rows(
+        "CREATE TABLE t (col double precision, other real);
+         INSERT INTO t VALUES ('Infinity'::double precision, '-Infinity'::real), (1, 1);
+         INSERT INTO t (col, other) VALUES ('-inf', '+infinity');
+         SELECT col FROM t WHERE col = 'Infinity' OR other = 'Infinity';",
         &default_opts(),
-        "Infinity",
     );
-}
-
-#[test]
-fn negative_infinity_cast_to_real_is_refused() {
-    expect_refusal(
-        "CREATE TABLE t (col real);
-         INSERT INTO t VALUES ('-Infinity'::real);",
-        &default_opts(),
-        "Infinity",
-    );
+    assert_eq!(rows, [Some("inf".to_string()), Some("-inf".to_string())]);
 }
 
 #[test]
@@ -110,18 +102,6 @@ fn nan_written_into_a_double_column_is_refused() {
          INSERT INTO t (col) VALUES ('NaN');",
         &default_opts(),
         "NaN",
-    );
-}
-
-#[test]
-fn infinity_compared_against_a_double_column_is_refused() {
-    // `col = 'Infinity'` compares a REAL against TEXT in SQLite, which is
-    // never equal, where PostgreSQL matches every infinite row.
-    expect_refusal(
-        "CREATE TABLE t (col double precision);
-         SELECT * FROM t WHERE col = 'Infinity';",
-        &default_opts(),
-        "Infinity",
     );
 }
 
@@ -1259,7 +1239,7 @@ fn the_other_locale_dependent_forms_are_refused() {
     }
     let clock = temporal_refusal("time", "12:00:00 PM");
     assert!(clock.contains("12-hour"), "{clock}");
-    let keyword = temporal_refusal("timestamp", "infinity");
+    let keyword = temporal_refusal("timestamp", "epoch");
     assert!(keyword.contains("keyword"), "{keyword}");
 }
 

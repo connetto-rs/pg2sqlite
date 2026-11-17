@@ -8,7 +8,7 @@
 
 use sqlparser::ast::{
     BinaryOperator, CaseWhen, CastKind, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArguments, UnaryOperator, Value, ValueWithSpan,
+    FunctionArguments, UnaryOperator, Value, ValueWithSpan, helpers::attached_token::AttachedToken,
 };
 
 use crate::impls::{
@@ -325,6 +325,151 @@ pub(crate) fn single_character(text: &str) -> Option<char> {
         (Some(character), None) => Some(character),
         _ => None,
     }
+}
+
+// ── infinite dates and timestamps ───────────────────────────────────────────
+
+/// The REAL infinity of the replica, `9e999` or `-9e999`, which SQLite reads
+/// as IEEE ±infinity and which stands for PostgreSQL's numeric `Infinity`.
+#[must_use]
+pub(crate) fn numeric_infinity(negative: bool) -> Expr {
+    let positive = number_literal("9e999");
+    if negative {
+        Expr::UnaryOp { op: UnaryOperator::Minus, expr: Box::new(positive) }
+    } else {
+        positive
+    }
+}
+
+/// Whether `expr` is the negative [`numeric_infinity`], or `None` when it is
+/// neither.
+#[must_use]
+pub(crate) fn numeric_infinity_sign(expr: &Expr) -> Option<bool> {
+    [false, true].into_iter().find(|&negative| *expr == numeric_infinity(negative))
+}
+
+/// `CASE operand WHEN 'infinity' THEN … WHEN '-infinity' THEN … ELSE finite
+/// END`, answering an infinite `date`, `timestamp` or `timestamptz` operand
+/// as `answer` says and every other one through `finite`.
+///
+/// A NULL operand falls to `finite`, which answers NULL for it. `operand` is
+/// read twice, once here and once inside `finite`.
+#[must_use]
+pub(crate) fn infinite_temporal_guard(
+    operand: Expr,
+    answer: crate::impls::temporal_infinity::InfiniteAnswer,
+    finite: Expr,
+) -> Expr {
+    Expr::Case {
+        case_token: AttachedToken::empty(),
+        end_token: AttachedToken::empty(),
+        operand: Some(Box::new(operand)),
+        conditions: infinite_temporal_arms(answer),
+        else_result: Some(Box::new(finite)),
+    }
+}
+
+/// The operand and the finite lowering of an [`infinite_temporal_guard`] that
+/// keeps the operand's own infinity, or `expr` back for anything else.
+pub(crate) fn split_same_temporal_guard(expr: Expr) -> Result<(Expr, Expr), Box<Expr>> {
+    use crate::impls::temporal_infinity::InfiniteAnswer;
+    match expr {
+        Expr::Case { operand: Some(operand), conditions, else_result: Some(finite), .. }
+            if conditions == infinite_temporal_arms(InfiniteAnswer::Same) =>
+        {
+            Ok((*operand, *finite))
+        }
+        other => Err(Box::new(other)),
+    }
+}
+
+/// The two `WHEN` arms of an [`infinite_temporal_guard`].
+fn infinite_temporal_arms(
+    answer: crate::impls::temporal_infinity::InfiniteAnswer,
+) -> Vec<CaseWhen> {
+    use crate::impls::{
+        temporal_infinity::InfiniteAnswer,
+        temporal_literals::{INFINITY, NEGATIVE_INFINITY},
+    };
+    [(INFINITY, false), (NEGATIVE_INFINITY, true)]
+        .into_iter()
+        .map(|(text, negative)| {
+            CaseWhen {
+                condition: string_literal(text),
+                result: match answer {
+                    InfiniteAnswer::Same => string_literal(text),
+                    InfiniteAnswer::Null => Expr::Value(Value::Null.with_empty_span()),
+                    InfiniteAnswer::Signed => numeric_infinity(negative),
+                },
+            }
+        })
+        .collect()
+}
+
+/// `CASE epoch WHEN 9e999 THEN 'infinity' WHEN -9e999 THEN '-infinity' ELSE
+/// finite END`, the timestamp an epoch of `epoch` seconds stands for.
+#[must_use]
+pub(crate) fn infinite_epoch_guard(epoch: Expr, finite: Expr) -> Expr {
+    Expr::Case {
+        case_token: AttachedToken::empty(),
+        end_token: AttachedToken::empty(),
+        operand: Some(Box::new(epoch)),
+        conditions: infinite_epoch_arms(),
+        else_result: Some(Box::new(finite)),
+    }
+}
+
+fn infinite_epoch_arms() -> Vec<CaseWhen> {
+    use crate::impls::temporal_literals::{INFINITY, NEGATIVE_INFINITY};
+    [(false, INFINITY), (true, NEGATIVE_INFINITY)]
+        .into_iter()
+        .map(|(negative, text)| {
+            CaseWhen { condition: numeric_infinity(negative), result: string_literal(text) }
+        })
+        .collect()
+}
+
+/// The finite lowering inside an [`infinite_epoch_guard`], or `None` for
+/// anything else.
+#[must_use]
+pub(crate) fn infinite_epoch_guard_finite(expr: &Expr) -> Option<&Expr> {
+    let Expr::Case { operand: Some(_), conditions, else_result: Some(finite), .. } = expr else {
+        return None;
+    };
+    (infinite_epoch_arms() == *conditions).then_some(finite.as_ref())
+}
+
+/// `CASE WHEN other IS NULL THEN NULL ELSE guarded END`, the
+/// [`infinite_temporal_guard`] `guarded` of an operation that answers NULL
+/// for a NULL `other` operand over an infinite one too.
+#[must_use]
+pub(crate) fn strict_infinite_temporal_guard(other: Expr, guarded: Expr) -> Expr {
+    crate::impls::expr_helpers::case_when(
+        Expr::IsNull(Box::new(other)),
+        Expr::Value(Value::Null.with_empty_span()),
+        Some(guarded),
+    )
+}
+
+/// The finite lowering inside an [`infinite_temporal_guard`], bare or under a
+/// [`strict_infinite_temporal_guard`], or `None` for anything else.
+#[must_use]
+pub(crate) fn infinite_temporal_guard_finite(expr: &Expr) -> Option<&Expr> {
+    use crate::impls::temporal_infinity::InfiniteAnswer;
+    if let Expr::Case { operand: None, conditions, else_result: Some(guarded), .. } = expr
+        && let [CaseWhen { condition: Expr::IsNull(_), result: Expr::Value(null) }] =
+            conditions.as_slice()
+        && null.value == Value::Null
+    {
+        return infinite_temporal_guard_finite(guarded);
+    }
+    let Expr::Case { operand: Some(_), conditions, else_result: Some(finite), .. } = expr else {
+        return None;
+    };
+    [InfiniteAnswer::Same, InfiniteAnswer::Null, InfiniteAnswer::Signed]
+        .into_iter()
+        .any(|answer| infinite_temporal_arms(answer) == *conditions)
+        .then_some(finite.as_ref())
 }
 
 // ── empty-set aggregates ─────────────────────────────────────────────────────

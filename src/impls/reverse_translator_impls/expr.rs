@@ -375,6 +375,14 @@ impl ReverseTranslator for Expr {
         if let Some(restored) = restore_lowered_idiom(self, schema, options) {
             return restored;
         }
+        if let Some(negative) = crate::impls::idioms::numeric_infinity_sign(self) {
+            return Ok(Expr::Cast {
+                expr: Box::new(string_literal(if negative { "-Infinity" } else { "Infinity" })),
+                data_type: sqlparser::ast::DataType::Float8,
+                format: None,
+                kind: sqlparser::ast::CastKind::DoubleColon,
+            });
+        }
 
         match self {
             Expr::Function(func) => reverse_numeric_call(self, func, schema, options),
@@ -634,6 +642,10 @@ fn restore_lowered_idiom(
     }
     if let Some(at_zone) = restore_at_time_zone(expr, schema, options) {
         return Some(at_zone);
+    }
+    // PostgreSQL answers an infinite operand itself.
+    if let Some(finite) = crate::impls::idioms::infinite_temporal_guard_finite(expr) {
+        return Some(finite.reverse_translate(schema, options));
     }
     reverse_temporal_arithmetic(expr, schema, options)
 }

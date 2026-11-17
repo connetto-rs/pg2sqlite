@@ -115,6 +115,7 @@ mod test_hex_encoding;
 mod test_identity_sequences;
 mod test_ilike_lower;
 mod test_index_clause_warnings;
+mod test_infinite_timestamps;
 mod test_interval_arithmetic;
 mod test_interval_arithmetic_exact;
 mod test_interval_errors;

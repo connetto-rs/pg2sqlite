@@ -1427,14 +1427,23 @@ fn translate_at_time_zone(
             require_replayable(timestamp, options)?;
         }
         let translated = timestamp.translate_with_warnings(schema, options, emit)?;
-        return Ok(match awareness {
-            Some(TimestampAwareness::Naive) => canonical_timestamptz_text(translated, None),
-            Some(TimestampAwareness::Aware) => local_timestamp_text(translated, None),
-            None if is_offset_less_timestamp_call(&translated) => {
-                local_timestamp_text(translated, None)
-            }
-            None => simple_function_expr("datetime", vec![translated], None),
-        });
+        return crate::impls::temporal_infinity::guard(
+            "AT TIME ZONE",
+            timestamp,
+            translated,
+            crate::impls::temporal_infinity::InfiniteAnswer::Same,
+            options,
+            |translated| {
+                Ok(match awareness {
+                    Some(TimestampAwareness::Naive) => canonical_timestamptz_text(translated, None),
+                    Some(TimestampAwareness::Aware) => local_timestamp_text(translated, None),
+                    None if is_offset_less_timestamp_call(&translated) => {
+                        local_timestamp_text(translated, None)
+                    }
+                    None => simple_function_expr("datetime", vec![translated], None),
+                })
+            },
+        );
     }
 
     let aware_shift = flipped_shifting_offset(&modifier)
@@ -1450,14 +1459,26 @@ fn translate_at_time_zone(
     })?;
     require_replayable(timestamp, options)?;
     let translated = timestamp.translate_with_warnings(schema, options, emit)?;
-    Ok(match awareness {
-        // A bare timestamp is read as local to the zone, so the result is the
-        // zone's instant in canonical `timestamptz` text.
-        TimestampAwareness::Naive => canonical_timestamptz_text(translated, Some(&naive_shift)),
-        // A timestamptz is already an instant, so the result is the zone's
-        // wall clock as local timestamp text.
-        TimestampAwareness::Aware => local_timestamp_text(translated, Some(&aware_shift)),
-    })
+    // Either infinity is the same infinity in every zone.
+    crate::impls::temporal_infinity::guard(
+        "AT TIME ZONE",
+        timestamp,
+        translated,
+        crate::impls::temporal_infinity::InfiniteAnswer::Same,
+        options,
+        |translated| {
+            Ok(match awareness {
+                // A bare timestamp is read as local to the zone, so the result
+                // is the zone's instant in canonical `timestamptz` text.
+                TimestampAwareness::Naive => {
+                    canonical_timestamptz_text(translated, Some(&naive_shift))
+                }
+                // A timestamptz is already an instant, so the result is the
+                // zone's wall clock as local timestamp text.
+                TimestampAwareness::Aware => local_timestamp_text(translated, Some(&aware_shift)),
+            })
+        },
+    )
 }
 
 /// Refuses an `AT TIME ZONE` whose operand the slicing form would read twice.
@@ -3094,26 +3115,36 @@ pub(crate) fn shifted_interval_target(
         ));
     }
     let calendar = zoned_calendar(left, kind, shift.moves_calendar(), &operation, schema, options)?;
-    Ok(match calendar {
-        ZonedCalendar::Clock(offset) => {
-            let modifiers: Vec<Expr> = shift
-                .modifiers_on_clock(offset)?
-                .iter()
-                .map(|modifier| string_literal(modifier))
-                .collect();
-            shifted_by_modifiers(target, &modifiers)
-        }
-        ZonedCalendar::Registered(clock) => {
-            let literals = |modifiers: Vec<String>| -> Vec<Expr> {
-                modifiers.iter().map(|modifier| string_literal(modifier)).collect()
-            };
-            let mut local = vec![clock.local_clock(target)];
-            local.extend(literals(calendar_modifiers));
-            local.push(string_literal("subsec"));
-            let instant = clock.instant(simple_function_expr("datetime", local, None));
-            shifted_by_modifiers(instant, &literals(shift.time_modifiers()?))
-        }
-    })
+    // An infinity shifted by a finite interval stays the same infinity.
+    crate::impls::temporal_infinity::guard(
+        &operation,
+        left,
+        target,
+        crate::impls::temporal_infinity::InfiniteAnswer::Same,
+        options,
+        |target| {
+            Ok(match calendar {
+                ZonedCalendar::Clock(offset) => {
+                    let modifiers: Vec<Expr> = shift
+                        .modifiers_on_clock(offset)?
+                        .iter()
+                        .map(|modifier| string_literal(modifier))
+                        .collect();
+                    shifted_by_modifiers(target, &modifiers)
+                }
+                ZonedCalendar::Registered(clock) => {
+                    let literals = |modifiers: Vec<String>| -> Vec<Expr> {
+                        modifiers.iter().map(|modifier| string_literal(modifier)).collect()
+                    };
+                    let mut local = vec![clock.local_clock(target)];
+                    local.extend(literals(calendar_modifiers));
+                    local.push(string_literal("subsec"));
+                    let instant = clock.instant(simple_function_expr("datetime", local, None));
+                    shifted_by_modifiers(instant, &literals(shift.time_modifiers()?))
+                }
+            })
+        },
+    )
 }
 
 /// How the months and days of an interval reach a date or timestamp.
@@ -4120,20 +4151,34 @@ fn translate_binary_op(
                     )
                 })
                 .transpose()?;
+            // A promoted infinity stays the same infinity and orders as
+            // PostgreSQL's.
             let mut to_common = |side: &Expr, kind| -> Result<Expr, crate::errors::Error> {
                 let translated = side.translate_with_warnings(schema, options, emit)?;
-                let local = match kind {
-                    Some(TemporalKind::Date) => {
-                        crate::impls::datetime_helpers::promote_date_to_midnight(translated)
-                    }
-                    Some(TemporalKind::Timestamp) if zoned.is_some() => translated,
-                    _ => return Ok(translated),
-                };
-                let Some(zoned) = zoned else { return Ok(local) };
-                if zoned.instant_reads_twice() && !is_replayable(side, options) {
-                    return Err(reject_duplicated_operand(&operation, side));
+                let promoted = kind == Some(TemporalKind::Date)
+                    || (kind == Some(TemporalKind::Timestamp) && zoned.is_some());
+                if !promoted {
+                    return Ok(translated);
                 }
-                Ok(zoned.instant(local))
+                crate::impls::temporal_infinity::guard(
+                    &operation,
+                    side,
+                    translated,
+                    crate::impls::temporal_infinity::InfiniteAnswer::Same,
+                    options,
+                    |translated| {
+                        let local = if kind == Some(TemporalKind::Date) {
+                            crate::impls::datetime_helpers::promote_date_to_midnight(translated)
+                        } else {
+                            translated
+                        };
+                        let Some(zoned) = zoned else { return Ok(local) };
+                        if zoned.instant_reads_twice() && !is_replayable(side, options) {
+                            return Err(reject_duplicated_operand(&operation, side));
+                        }
+                        Ok(zoned.instant(local))
+                    },
+                )
             };
             return Ok(Expr::BinaryOp {
                 left: Box::new(to_common(left, lk)?),
@@ -4434,15 +4479,11 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                         let translated = expr.translate_with_warnings(schema, options, emit)?;
                         return crate::impls::shared_helpers::convert_bytea_hex_literal(translated);
                     }
-                    // SQLite's CAST('NaN' AS REAL) and CAST('Infinity' AS REAL)
-                    // answer 0.0, not the IEEE non-finite
-                    // values, because SQLite REAL is always
-                    // finite. WHERE col = 0 then matches corrupted rows
-                    // silently.
-                    if let Some(refusal) =
-                        crate::impls::shared_helpers::float_special_refusal(data_type, expr)
+                    // SQLite's CAST('Infinity' AS REAL) answers 0.0.
+                    if let Some(special) =
+                        crate::impls::shared_helpers::float_special_value(data_type, expr)
                     {
-                        return Err(refusal);
+                        return special;
                     }
                     if let DataType::Interval { fields, precision } = data_type
                         && matches!(
@@ -4565,16 +4606,29 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                             {
                                 return Ok(rewritten);
                             }
-                            // Text of unknown kind is read by SQLite's date
-                            // functions.
+                            // SQLite's date functions read text of unknown
+                            // kind, either infinity kept.
                             if source_kind.is_none()
                                 && awareness.is_none()
                                 && let Some(read) = casts::temporal_text_reader(kind)
                             {
                                 casts::warn_text_read_by_date_functions(expr, data_type, emit);
+                                let read = match kind {
+                                    crate::impls::temporal_literals::TemporalLiteralKind::Time {
+                                        ..
+                                    } => read(translated),
+                                    _ => {
+                                        crate::impls::temporal_infinity::text_guard(
+                                            &cast,
+                                            expr,
+                                            translated,
+                                            options,
+                                            |operand| Ok(read(operand)),
+                                        )?
+                                    }
+                                };
                                 return Ok(crate::impls::shared_helpers::round_column_text(
-                                    kind,
-                                    read(translated),
+                                    kind, read,
                                 ));
                             }
                             // A timestamptz read as a wall clock answers from

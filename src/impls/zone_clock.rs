@@ -27,6 +27,7 @@ use crate::{
         replay::{is_replayable, reject_duplicated_operand},
         request_zone::RequestZone,
         temporal_arithmetic::{TemporalKind, temporal_kind_of},
+        temporal_infinity::{InfiniteAnswer, guard},
     },
     options::TranslationContext,
     traits::{TimeZoneFunctions, translator::TranslatorWithContext},
@@ -397,7 +398,8 @@ pub(crate) fn printed_offset(offset: &Expr, form: OffsetForm) -> Expr {
 }
 
 /// PostgreSQL's output form of the `timestamptz` the replica's text
-/// `instant` holds, the zone's wall clock with its offset.
+/// `instant` holds, the zone's wall clock with its offset, and the word for
+/// an infinity.
 ///
 /// # Errors
 ///
@@ -410,20 +412,25 @@ pub(crate) fn timestamptz_text_form(
     operation: &str,
     options: &TranslationContext<'_>,
 ) -> Result<Expr, Error> {
-    let local = match zoned {
-        ZonedWallClock::Utc => local_timestamp_text(instant.clone(), None),
-        ZonedWallClock::Zone(clock) => {
-            if clock.reads_twice() && !is_replayable(written, options) {
-                return Err(reject_duplicated_operand(operation, written));
+    guard(operation, written, instant, InfiniteAnswer::Same, options, |instant| {
+        let local = match zoned {
+            ZonedWallClock::Utc => local_timestamp_text(instant.clone(), None),
+            ZonedWallClock::Zone(clock) => {
+                if clock.reads_twice() && !is_replayable(written, options) {
+                    return Err(reject_duplicated_operand(operation, written));
+                }
+                clock.local(instant.clone())
             }
-            clock.local(instant.clone())
-        }
-    };
-    Ok(concat(local.clone(), zoned.offset(local, instant, OffsetForm::Printed)))
+        };
+        Ok(concat(local.clone(), zoned.offset(local, instant, OffsetForm::Printed)))
+    })
 }
 
 /// `extract(field FROM t)` and `date_part('field', t)` of a local field of
 /// the temporal kind `t` settles, `operation` being the read as written.
+///
+/// An infinite `t` answers the numeric infinity of its sign for a field that
+/// grows without bound, and NULL for every other field, as PostgreSQL does.
 ///
 /// # Errors
 ///
@@ -438,24 +445,37 @@ pub(crate) fn zoned_date_part(
     options: &TranslationContext<'_>,
     emit: WarningSink<'_>,
 ) -> Result<Expr, Error> {
-    if key == DatePartKey::Epoch {
-        return Ok(build_date_part_expr(key, expr.translate_with_warnings(schema, options, emit)?));
-    }
-    let mut value = || expr.translate_with_warnings(schema, options, emit);
-    match temporal_kind_of(expr, schema, options) {
-        Some(TemporalKind::TimestampTz) => {
+    let answer = match key {
+        DatePartKey::Year | DatePartKey::IsoYear | DatePartKey::Epoch => InfiniteAnswer::Signed,
+        _ => InfiniteAnswer::Null,
+    };
+    let kind = temporal_kind_of(expr, schema, options);
+    let zoned = match kind {
+        Some(TemporalKind::TimestampTz) if key != DatePartKey::Epoch => {
             let zoned = zoned_wall_clock(operation, "read the wall clock of", schema, options)?;
             if zoned.local_reads_twice() && !is_replayable(expr, options) {
                 return Err(reject_duplicated_operand(operation, expr));
             }
-            Ok(build_date_part_expr(key, zoned.local(value()?)))
+            Some(zoned)
         }
-        None => {
+        None if key != DatePartKey::Epoch => {
             unsettled_operand_refusal(operation, expr, schema, options)?;
-            Ok(build_date_part_expr(key, value()?))
+            None
         }
-        Some(_) => Ok(build_date_part_expr(key, value()?)),
+        _ => None,
+    };
+    let value = expr.translate_with_warnings(schema, options, emit)?;
+    let read = |value: Expr| -> Result<Expr, Error> {
+        let local = match zoned {
+            Some(zoned) => zoned.local(value),
+            None => value,
+        };
+        Ok(build_date_part_expr(key, local))
+    };
+    if matches!(kind, Some(TemporalKind::Time { .. })) {
+        return read(value);
     }
+    guard(operation, expr, value, answer, options, read)
 }
 
 /// `extract(unit FROM t)` of the UTC offset of the instant `t` holds, `unit`
@@ -501,25 +521,30 @@ pub(crate) fn zoned_offset_of(
         }));
     }
     let zoned = zoned_wall_clock(operation, "read the wall clock of", schema, options)?;
-    // The UTC offset of the zone's own clock is zero, with no read at all.
-    if let ZonedWallClock::Utc = zoned {
-        return Ok(integer_literal(0));
-    }
-    if !is_replayable(expr, options) {
-        return Err(reject_duplicated_operand(operation, expr));
-    }
     let translated = expr.translate_with_warnings(schema, options, emit)?;
-    let offset = offset_seconds(zoned.local(translated.clone()), translated);
-    Ok(match unit {
-        "timezone" => offset,
-        "timezone_hour" => bin(offset, BinaryOperator::Divide, integer_literal(3600)),
-        _ => {
-            bin(
-                bin(offset, BinaryOperator::Divide, integer_literal(60)),
-                BinaryOperator::Modulo,
-                integer_literal(60),
-            )
+    guard(operation, expr, translated, InfiniteAnswer::Null, options, |translated| {
+        if let ZonedWallClock::Utc = zoned {
+            return Ok(case_when(
+                Expr::IsNull(Box::new(translated)),
+                Expr::Value(sqlparser::ast::Value::Null.with_empty_span()),
+                Some(integer_literal(0)),
+            ));
         }
+        if !is_replayable(expr, options) {
+            return Err(reject_duplicated_operand(operation, expr));
+        }
+        let offset = offset_seconds(zoned.local(translated.clone()), translated);
+        Ok(match unit {
+            "timezone" => offset,
+            "timezone_hour" => bin(offset, BinaryOperator::Divide, integer_literal(3600)),
+            _ => {
+                bin(
+                    bin(offset, BinaryOperator::Divide, integer_literal(60)),
+                    BinaryOperator::Modulo,
+                    integer_literal(60),
+                )
+            }
+        })
     })
 }
 
@@ -571,75 +596,86 @@ pub(crate) fn zoned_to_char(
         unsettled_operand_refusal(operation, expr, schema, options)?;
     }
     let translated = expr.translate_with_warnings(schema, options, emit)?;
-    let instant_read = kind == Some(TemporalKind::TimestampTz) && (wall_clock || has_zone_code);
-    let midnight_read = kind == Some(TemporalKind::Date) && has_zone_code;
-    let (local, offset, tz) = if instant_read || midnight_read {
-        let zoned = zoned_wall_clock(operation, "read the wall clock of", schema, options)?;
-        let local =
-            if midnight_read { translated.clone() } else { zoned.local(translated.clone()) };
-        let offset = if let Some(offset) = zoned.fixed_offset() {
-            PrintedOffset::Constant(offset_text(offset, OffsetForm::Printed))
-        } else {
-            let instant =
-                if midnight_read { zoned.instant(local.clone()) } else { translated.clone() };
-            PrintedOffset::PerInstant(zoned.offset(local.clone(), instant, OffsetForm::Printed))
-        };
-        let reads_twice = match offset {
-            PrintedOffset::Constant(_) => instant_read && zoned.local_reads_twice(),
-            PrintedOffset::PerInstant(_) => saw_of,
-        };
-        if reads_twice && !is_replayable(expr, options) {
-            return Err(reject_duplicated_operand(operation, expr));
-        }
-        let tz = match zoned {
-            _ if !saw_tz => String::new(),
-            ZonedWallClock::Utc => "UTC".to_string(),
-            ZonedWallClock::Zone(_) => {
-                return Err(Error::forward_refusal(format!(
-                    "`{operation}` asks for the zone's name with TZ, which PostgreSQL answers \
+    let answer = if matches!(kind, Some(TemporalKind::Time { .. })) {
+        None
+    } else {
+        Some(InfiniteAnswer::Null)
+    };
+    let print = |translated: Expr| -> Result<Expr, Error> {
+        let instant_read = kind == Some(TemporalKind::TimestampTz) && (wall_clock || has_zone_code);
+        let midnight_read = kind == Some(TemporalKind::Date) && has_zone_code;
+        let (local, offset, tz) = if instant_read || midnight_read {
+            let zoned = zoned_wall_clock(operation, "read the wall clock of", schema, options)?;
+            let local =
+                if midnight_read { translated.clone() } else { zoned.local(translated.clone()) };
+            let offset = if let Some(offset) = zoned.fixed_offset() {
+                PrintedOffset::Constant(offset_text(offset, OffsetForm::Printed))
+            } else {
+                let instant =
+                    if midnight_read { zoned.instant(local.clone()) } else { translated.clone() };
+                PrintedOffset::PerInstant(zoned.offset(local.clone(), instant, OffsetForm::Printed))
+            };
+            let reads_twice = match offset {
+                PrintedOffset::Constant(_) => instant_read && zoned.local_reads_twice(),
+                PrintedOffset::PerInstant(_) => saw_of,
+            };
+            if reads_twice && !is_replayable(expr, options) {
+                return Err(reject_duplicated_operand(operation, expr));
+            }
+            let tz = match zoned {
+                _ if !saw_tz => String::new(),
+                ZonedWallClock::Utc => "UTC".to_string(),
+                ZonedWallClock::Zone(_) => {
+                    return Err(Error::forward_refusal(format!(
+                        "`{operation}` asks for the zone's name with TZ, which PostgreSQL answers \
                      from its tzdata tables, or the zone's POSIX name, or nothing for a fixed \
                      offset, and the replica holds none of those. Use the OF code for the \
                      offset, or set the request's zone to UTC."
-                )));
-            }
-        };
-        (local, offset, tz)
-    } else if kind.is_none() && saw_tz {
-        return Err(Error::forward_refusal(format!(
-            "`{operation}` asks for the zone's name, which PostgreSQL answers from the operand's \
+                    )));
+                }
+            };
+            (local, offset, tz)
+        } else if kind.is_none() && saw_tz {
+            return Err(Error::forward_refusal(format!(
+                "`{operation}` asks for the zone's name, which PostgreSQL answers from the operand's \
              type, and the type does not settle. It is the zone for a timestamptz or a date and \
              nothing for a timestamp. Cast the operand, as `{expr}::timestamptz` or \
              `{expr}::timestamp`, to say which it is."
-        )));
-    } else {
-        // A timestamp prints `+00` and no zone name in every zone, and an
-        // unsettled type is read in UTC, where every type prints `+00`.
-        (translated, PrintedOffset::Constant("+00".to_string()), String::new())
-    };
-    let strftime = |format: &str, of: &str| -> Result<Expr, Error> {
-        let mapped = if has_zone_code {
-            pg_to_char_format_to_strftime(&to_char_zone_codes_to_literals(format, of, &tz)?)?
+            )));
         } else {
-            pg_to_char_format_to_strftime(format)?
+            // A timestamp prints `+00` and no zone name in every zone, and an
+            // unsettled type is read in UTC, where every type prints `+00`.
+            (translated, PrintedOffset::Constant("+00".to_string()), String::new())
         };
-        Ok(build_strftime_call(&mapped, local.clone()))
-    };
-    let offset = match offset {
-        PrintedOffset::Constant(text) => return strftime(format, &text),
-        PrintedOffset::PerInstant(offset) => offset,
-    };
-    let mut printed: Option<Expr> = None;
-    for (index, segment) in split_at_offset_codes(format)?.into_iter().enumerate() {
-        let offset = (index > 0).then(|| offset.clone());
-        let segment = (!segment.is_empty()).then(|| strftime(segment, "")).transpose()?;
-        for part in offset.into_iter().chain(segment) {
-            printed = Some(match printed {
-                Some(before) => concat(before, part),
-                None => part,
-            });
+        let strftime = |format: &str, of: &str| -> Result<Expr, Error> {
+            let mapped = if has_zone_code {
+                pg_to_char_format_to_strftime(&to_char_zone_codes_to_literals(format, of, &tz)?)?
+            } else {
+                pg_to_char_format_to_strftime(format)?
+            };
+            Ok(build_strftime_call(&mapped, local.clone()))
+        };
+        let offset = match offset {
+            PrintedOffset::Constant(text) => return strftime(format, &text),
+            PrintedOffset::PerInstant(offset) => offset,
+        };
+        let mut printed: Option<Expr> = None;
+        for (index, segment) in split_at_offset_codes(format)?.into_iter().enumerate() {
+            let offset = (index > 0).then(|| offset.clone());
+            let segment = (!segment.is_empty()).then(|| strftime(segment, "")).transpose()?;
+            for part in offset.into_iter().chain(segment) {
+                printed = Some(match printed {
+                    Some(before) => concat(before, part),
+                    None => part,
+                });
+            }
         }
+        Ok(printed.expect("a format holding OF prints the offset"))
+    };
+    match answer {
+        Some(answer) => guard(operation, expr, translated, answer, options, print),
+        None => print(translated),
     }
-    Ok(printed.expect("a format holding OF prints the offset"))
 }
 
 /// The type name PostgreSQL names in the `unit ... not supported for type`

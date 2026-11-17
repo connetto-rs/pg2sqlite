@@ -88,7 +88,9 @@ pub(crate) fn temporal_literal_kind(data_type: &DataType) -> Option<TemporalLite
 /// without an offset read on the wall clock of the zone `offset_of` answers
 /// the UTC offset in seconds of a `YYYY-MM-DD HH:MM:SS[.f]` wall clock for. A
 /// `time with time zone` written without an offset keeps none, for the caller
-/// to give the zone's.
+/// to give the zone's. A date or timestamp `infinity` becomes the text
+/// `infinity` or `-infinity`, which byte order already places beyond every
+/// four-digit year on its side.
 ///
 /// # Errors
 ///
@@ -99,6 +101,16 @@ pub(crate) fn normalize_temporal_literal(
     offset_of: &dyn Fn(&str) -> Result<i64, Error>,
 ) -> Result<String, Error> {
     let trimmed = text.trim();
+    if let Some(infinity) = infinite_keyword(trimmed) {
+        return match kind {
+            TemporalLiteralKind::Time { .. } => {
+                Err(unreadable(kind, trimmed, "a time of day has no infinite value."))
+            }
+            TemporalLiteralKind::Date | TemporalLiteralKind::Timestamp { .. } => {
+                Ok(infinity.to_string())
+            }
+        };
+    }
     reject_non_iso_input(kind, trimmed)?;
     match kind {
         TemporalLiteralKind::Date => {
@@ -334,6 +346,27 @@ pub(crate) fn year_after_shift(literal: &str, months: i64, days: i64, micros: i6
     Some(civil_from_days(day_number).0)
 }
 
+/// The text the replica stores for a `date`, `timestamp` or `timestamptz`
+/// later than every other.
+pub(crate) const INFINITY: &str = "infinity";
+
+/// The text the replica stores for a `date`, `timestamp` or `timestamptz`
+/// earlier than every other.
+pub(crate) const NEGATIVE_INFINITY: &str = "-infinity";
+
+/// The stored text of the infinity `text` spells, case-insensitively and with
+/// the optional `+` PostgreSQL reads, or `None` for every other text.
+#[must_use]
+pub(crate) fn infinite_keyword(text: &str) -> Option<&'static str> {
+    if text.eq_ignore_ascii_case(INFINITY) || text.eq_ignore_ascii_case("+infinity") {
+        Some(INFINITY)
+    } else if text.eq_ignore_ascii_case(NEGATIVE_INFINITY) {
+        Some(NEGATIVE_INFINITY)
+    } else {
+        None
+    }
+}
+
 /// Refuses the PostgreSQL input forms whose meaning is not in the text.
 ///
 /// A keyword is resolved when the server reads it, so storing the word would
@@ -341,17 +374,7 @@ pub(crate) fn year_after_shift(literal: &str, months: i64, days: i64, micros: i6
 /// under the default `DateStyle` and February 1 under `DMY`. A month name
 /// depends on the server's locale, and `AM`/`PM` is not ISO.
 fn reject_non_iso_input(kind: TemporalLiteralKind, text: &str) -> Result<(), Error> {
-    const KEYWORDS: &[&str] = &[
-        "now",
-        "today",
-        "tomorrow",
-        "yesterday",
-        "epoch",
-        "infinity",
-        "-infinity",
-        "+infinity",
-        "allballs",
-    ];
+    const KEYWORDS: &[&str] = &["now", "today", "tomorrow", "yesterday", "epoch", "allballs"];
     let lowered = text.to_ascii_lowercase();
     if lowered.ends_with(" bc") {
         return Err(outside_four_digit_years(text));

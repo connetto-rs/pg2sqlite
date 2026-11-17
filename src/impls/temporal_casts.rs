@@ -22,6 +22,7 @@ use crate::{
         replay::{is_replayable, reject_duplicated_operand},
         shared_helpers::{declared_in_scope, is_integral_expression},
         temporal_arithmetic::trim_trailing_zeros,
+        temporal_infinity::{InfiniteAnswer, guard},
         temporal_literals::{TemporalLiteralKind, temporal_literal_kind},
     },
     warnings::{TranslationWarning, WarningSink},
@@ -146,6 +147,9 @@ pub(crate) fn is_interval_expr(expr: &Expr) -> bool {
 /// lowering. `written` and `operation` name the operand and the cast as
 /// written, for a refusal.
 ///
+/// An infinite date or timestamp stays the same infinity in the other kinds
+/// and is NULL as a time of day, as PostgreSQL casts it.
+///
 /// # Errors
 ///
 /// Refuses the pairs PostgreSQL refuses, a conversion into an instant or an
@@ -169,6 +173,9 @@ pub(crate) fn translate_temporal_kind_cast(
             options,
         )
     };
+    let infinite = |answer, rewrite: &dyn Fn(Expr) -> Result<Expr, Error>| {
+        guard(operation, written, operand.clone(), answer, options, rewrite)
+    };
     let rewritten = match (target, source) {
         // A timestamptz into the session's local zone is another lowering's.
         (_, Timestamp { zoned: true, .. })
@@ -181,16 +188,20 @@ pub(crate) fn translate_temporal_kind_cast(
             if zoned.instant_reads_twice() && !is_replayable(written, options) {
                 return Err(reject_duplicated_operand(operation, written));
             }
-            let local = if source == Date {
-                promote_date_to_midnight(operand.clone())
-            } else {
-                operand.clone()
-            };
-            zoned.instant(local)
+            infinite(InfiniteAnswer::Same, &|operand| {
+                let local =
+                    if source == Date { promote_date_to_midnight(operand) } else { operand };
+                Ok(zoned.instant(local))
+            })?
         }
+        // The first ten characters hold either infinity whole.
         (Date, Timestamp { zoned: false, .. }) => date_part(operand),
-        (Timestamp { zoned: false, .. }, Date) => promote_date_to_midnight(operand.clone()),
-        (Time { zoned: false, .. }, Timestamp { zoned: false, .. }) => time_of_day(operand.clone()),
+        (Timestamp { zoned: false, .. }, Date) => {
+            infinite(InfiniteAnswer::Same, &|operand| Ok(promote_date_to_midnight(operand)))?
+        }
+        (Time { zoned: false, .. }, Timestamp { zoned: false, .. }) => {
+            infinite(InfiniteAnswer::Null, &|operand| Ok(time_of_day(operand)))?
+        }
         (Time { zoned: false, .. }, Time { zoned: true, .. }) => wall_time(operand, options)?,
         (Time { zoned: true, .. }, Time { zoned: false, .. }) => {
             concat(operand.clone(), crate::impls::zone_clock::offset_now(zoned()?))

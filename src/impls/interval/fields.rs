@@ -325,6 +325,16 @@ fn shifted_target(
     let calendar = zoned_calendar(target, Some(kind), true, &operation, schema, options)?;
     let translated_target = target.translate_with_warnings(schema, options, emit)?;
     let body = field_shift_body(kind, calendar, negate);
+    // An infinite target shifted by a finite interval stays the same infinity.
+    let body = if matches!(kind, TemporalKind::Time { .. }) {
+        body
+    } else {
+        crate::impls::idioms::infinite_temporal_guard(
+            Expr::CompoundIdentifier(vec![Ident::new("tv"), Ident::new("tg")]),
+            crate::impls::temporal_infinity::InfiniteAnswer::Same,
+            body,
+        )
+    };
     // `printf` reads a NULL field as zero, so a NULL interval answers NULL
     // before the modifiers see it.
     let template = format!(
