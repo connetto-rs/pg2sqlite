@@ -27,6 +27,7 @@ pub mod manifest;
 pub mod options;
 pub mod pg2sqlite;
 pub mod script;
+pub mod sqlstate;
 pub mod traits;
 pub mod warnings;
 pub mod write_guard;
@@ -43,6 +44,7 @@ pub mod prelude {
         options::{AttachedTables, Pg2SqliteOptions, TranslationContext},
         pg2sqlite::Pg2Sqlite,
         script::{FreshFiles, Script},
+        sqlstate::{PostgresError, SqlState, postgres_error},
         traits::{
             ArrayRepresentation, JsonbFunctions, ReverseTranslator, Schema, SessionVariableMapping,
             TimeZoneFunctions, Translator, TranslatorWithContext, UuidRepresentation, UuidVersion,

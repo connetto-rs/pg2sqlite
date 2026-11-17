@@ -126,3 +126,6 @@ mod parity_perform_helpers;
 
 #[path = "gauntlet/parity_jsonb.rs"]
 mod parity_jsonb;
+
+#[path = "gauntlet/parity_raise_sqlstate.rs"]
+mod parity_raise_sqlstate;
