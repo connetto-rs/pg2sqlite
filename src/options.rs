@@ -21,6 +21,8 @@ use crate::{
     traits::{ArrayRepresentation, SessionVariableMapping, TimeZoneFunctions, UuidRepresentation},
 };
 
+type Role = <ParserDB as DatabaseLike>::Role;
+
 /// Tables whose storage lives in a database attached to the replica's
 /// connection, set with [`Pg2SqliteOptions::with_attached_tables`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,7 +281,7 @@ pub struct TranslationContext<'a> {
     /// The role the body being translated runs as, the owner of a `SECURITY
     /// DEFINER` trigger function, which PostgreSQL checks a call's privileges
     /// against in place of the acting role.
-    running_as: Option<&'a str>,
+    running_as: Option<&'a Role>,
 }
 
 /// The fields a derived [`TranslationContext`] copies from an existing one,
@@ -293,7 +295,7 @@ struct ContextFields<'a> {
     subqueries_allowed: bool,
     rebound_body: Option<&'a sqlparser::ast::BeginEndStatements>,
     written_schema: Option<&'a ParserDB>,
-    running_as: Option<&'a str>,
+    running_as: Option<&'a Role>,
 }
 
 impl<'a> ContextFields<'a> {
@@ -494,7 +496,7 @@ impl<'a> TranslationContext<'a> {
     }
 
     /// The same context translating a body that runs as `role`.
-    pub(crate) fn with_running_as<'s>(&'s self, role: &'s str) -> TranslationContext<'s> {
+    pub(crate) fn with_running_as<'s>(&'s self, role: &'s Role) -> TranslationContext<'s> {
         let mut fields = ContextFields::borrowed(self);
         fields.running_as = Some(role);
         fields.into_context(self.scope, self.outer)
@@ -502,7 +504,7 @@ impl<'a> TranslationContext<'a> {
 
     /// The role the body being translated runs as, when it runs as other than
     /// the acting role.
-    pub(crate) const fn running_as(&self) -> Option<&str> {
+    pub(crate) const fn running_as(&self) -> Option<&'a Role> {
         self.running_as
     }
 

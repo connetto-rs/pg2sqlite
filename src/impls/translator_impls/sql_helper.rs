@@ -16,7 +16,7 @@
 //! with the function's name and the reason.
 
 use alloc::borrow::Cow;
-use core::ops::ControlFlow;
+use core::{convert::Infallible, ops::ControlFlow};
 
 use sql_traits::{
     errors::LookupError,
@@ -45,7 +45,6 @@ use crate::{
     errors::Error,
     impls::{
         bind_once::is_atomic,
-        query_builder::{make_query, make_simple_select},
         replay::is_replayable,
         session_variable::{self, SessionRead},
     },
@@ -123,10 +122,10 @@ fn pg_catalog_holds(schema: &ParserDB, target: &TargetName<'_>) -> bool {
 ///
 /// Refuses a call to a declared function whose body the inliner cannot
 /// replace it with, naming the function and the reason.
-pub(crate) fn inlined_call(
+pub(crate) fn inlined_call<'s>(
     call: &Function,
-    schema: &ParserDB,
-    options: &TranslationContext<'_>,
+    schema: &'s ParserDB,
+    options: &TranslationContext<'s>,
 ) -> Result<Option<Expr>, Error> {
     let helper = declared_helper(&call.name, schema, options)?;
     let Some(helper) = helper.filter(|helper| written_in_sql(helper)) else { return Ok(None) };
@@ -150,10 +149,10 @@ fn written_in_sql(function: &CreateFunction) -> bool {
 /// # Errors
 ///
 /// Refuses as [`inlined_call`] does.
-pub(crate) fn inlined_calls(
+pub(crate) fn inlined_calls<'s>(
     expr: &Expr,
-    schema: &ParserDB,
-    options: &TranslationContext<'_>,
+    schema: &'s ParserDB,
+    options: &TranslationContext<'s>,
 ) -> Result<Expr, Error> {
     let caller = calling_role(schema, options)?;
     let mut inliner = Inliner { schema, options, expanding: Vec::new(), keep_sets: true };
@@ -168,27 +167,17 @@ pub(crate) fn inlined_calls(
 /// every privilege.
 fn calling_role<'s>(
     schema: &'s ParserDB,
-    options: &TranslationContext<'_>,
+    options: &TranslationContext<'s>,
 ) -> Result<Option<&'s Role>, Error> {
-    let Some(acting) = session_variable::acting_role(schema, options)? else { return Ok(None) };
-    match options.running_as() {
-        Some(owner) => {
-            schema.role(owner).map(Some).ok_or_else(|| {
-                Error::forward_refusal(format!(
-                    "a call in a body running as {owner} checks that role's privileges, and the \
-                     schema never declares it."
-                ))
-            })
-        }
-        None => Ok(Some(acting)),
-    }
+    let acting = session_variable::acting_role(schema, options)?;
+    Ok(acting.map(|acting| options.running_as().unwrap_or(acting)))
 }
 
 /// Expands calls to declared functions, the functions being expanded kept to
 /// refuse a cycle.
 struct Inliner<'s, 'o> {
     schema: &'s ParserDB,
-    options: &'o TranslationContext<'o>,
+    options: &'o TranslationContext<'s>,
     expanding: Vec<&'s CreateFunction>,
     /// Leaves a call to a function returning a set as written.
     keep_sets: bool,
@@ -236,28 +225,11 @@ impl<'s> Inliner<'s, '_> {
             self.expand(&mut argument.written, caller)?;
             argument.value = parameter_value(&argument.written, argument.data_type);
         }
-        let mut body = match body_shape(name, helper, self.schema)? {
-            BodyShape::Expression(body) => body.into_owned(),
-            BodyShape::Rows(query) => {
-                let read = match visit_relations(&query, |relation| {
-                    ControlFlow::Break(relation.to_string())
-                }) {
-                    ControlFlow::Break(relation) => relation,
-                    ControlFlow::Continue(()) => String::from("a relation"),
-                };
-                return Err(refusal(
-                    name,
-                    &format!(
-                        "reads {read}, and only a body reading no relation, one SELECT of one \
-                         expression, translates in place of the call"
-                    ),
-                ));
-            }
-        };
+        let mut body = body_expression(name, helper, self.schema)?.into_owned();
         check_session_reads(
             name,
             self.expanding.iter().copied().chain([helper]),
-            self.options.running_as(),
+            self.options.running_as().map(sql_traits::traits::RoleLike::name),
             &body,
         )?;
         check_groups_no_rows(name, &body, self.schema)?;
@@ -452,44 +424,22 @@ impl<'s> Inliner<'s, '_> {
     }
 }
 
-/// What a function's body is, as far as writing it in place of a call goes.
-#[expect(
-    clippy::large_enum_variant,
-    reason = "returned once per call and taken apart at once, so boxing the expression would \
-              only add an allocation"
-)]
-pub(crate) enum BodyShape<'f> {
-    /// One expression that names no relation, what `SELECT <expression>` or
-    /// `RETURN <expression>` computes.
-    Expression(Cow<'f, Expr>),
-    /// A body naming a relation anywhere, subqueries included, as the query
-    /// it runs.
-    Rows(Box<Query>),
-}
-
-/// The shape of `helper`'s body.
+/// The one expression `helper`'s body computes, what `SELECT <expression>`
+/// or `RETURN <expression>` selects.
 ///
 /// # Errors
 ///
 /// Refuses a body that is neither one query nor `RETURN <expression>`, a
-/// query that names no relation yet selects more than one expression from
-/// one row, and a body that does not parse.
-pub(crate) fn body_shape<'f>(
+/// body naming a relation anywhere, subqueries included, a query selecting
+/// other than one expression from one row, and a body that does not parse.
+fn body_expression<'f>(
     name: &ObjectName,
     helper: &'f CreateFunction,
     schema: &ParserDB,
-) -> Result<BodyShape<'f>, Error> {
+) -> Result<Cow<'f, Expr>, Error> {
     if let Some(expression) = helper.body_expression(schema)? {
-        if names_relation(expression.as_ref()) {
-            let select = make_simple_select(
-                vec![SelectItem::UnnamedExpr(expression.into_owned())],
-                Vec::new(),
-                None,
-            );
-            let query = make_query(None, SetExpr::Select(Box::new(select)));
-            return Ok(BodyShape::Rows(Box::new(query)));
-        }
-        return Ok(BodyShape::Expression(expression));
+        refuse_relation(name, expression.as_ref())?;
+        return Ok(expression);
     }
     let statements = if let Some(statements) = helper.atomic_statements(schema)? {
         statements.into_owned()
@@ -504,30 +454,36 @@ pub(crate) fn body_shape<'f>(
     let (Some(Statement::Query(query)), None) = (statements.next(), statements.next()) else {
         return Err(refusal(name, "has a body of other than one query"));
     };
-    if names_relation(query.as_ref()) {
-        return Ok(BodyShape::Rows(query));
-    }
+    refuse_relation(name, query.as_ref())?;
     single_expression(*query)
-        .map(|expression| BodyShape::Expression(Cow::Owned(expression)))
+        .map(Cow::Owned)
         .ok_or_else(|| refusal(name, "has a body that is not one SELECT of one expression"))
 }
 
-/// Whether `node` names a table, a view or any other relation.
-fn names_relation<N: sqlparser::ast::Visit>(node: &N) -> bool {
-    visit_relations(node, |_| ControlFlow::Break(())).is_break()
+/// Refuses `node` when it names a table, a view or any other relation, which
+/// the body would read rows of where the call stood.
+fn refuse_relation<N: Visit>(name: &ObjectName, node: &N) -> Result<(), Error> {
+    match visit_relations(node, |relation| ControlFlow::Break(relation.to_string())) {
+        ControlFlow::Break(read) => {
+            Err(refusal(
+                name,
+                &format!(
+                    "reads {read}, and only a body reading no relation, one SELECT of one \
+                     expression, translates in place of the call"
+                ),
+            ))
+        }
+        ControlFlow::Continue(()) => Ok(()),
+    }
 }
 
 /// The expression `query` selects, when it is `SELECT <expression>` over no
 /// source, answering exactly one row.
 fn single_expression(query: Query) -> Option<Expr> {
-    let Query { with: None, body, order_by: None, limit_clause: None, fetch: None, locks, .. } =
-        query
+    let Query { with: None, body, order_by: None, limit_clause: None, fetch: None, .. } = query
     else {
         return None;
     };
-    if !locks.is_empty() {
-        return None;
-    }
     let SetExpr::Select(select) = *body else { return None };
     let one_row = select.distinct.is_none()
         && select.top.is_none()
@@ -600,13 +556,14 @@ fn returned_type<'f>(name: &ObjectName, helper: &'f CreateFunction) -> Result<&'
 /// function's own `SELECT` over no source it folds one row, and written in
 /// place of the call it would fold the caller's.
 fn check_groups_no_rows(name: &ObjectName, body: &Expr, schema: &ParserDB) -> Result<(), Error> {
-    /// Finds a call outside every subquery that groups rows.
-    struct Grouping<'s> {
-        schema: &'s ParserDB,
+    /// Collects the calls outside every subquery.
+    #[derive(Default)]
+    struct OuterCalls {
         depth: usize,
+        calls: Vec<Function>,
     }
-    impl sqlparser::ast::Visitor for Grouping<'_> {
-        type Break = Result<String, Error>;
+    impl sqlparser::ast::Visitor for OuterCalls {
+        type Break = Infallible;
 
         fn pre_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
             self.depth += 1;
@@ -619,47 +576,43 @@ fn check_groups_no_rows(name: &ObjectName, body: &Expr, schema: &ParserDB) -> Re
         }
 
         fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
-            let Expr::Function(call) = expr else { return ControlFlow::Continue(()) };
-            if self.depth > 0 {
-                return ControlFlow::Continue(());
+            if let Expr::Function(call) = expr
+                && self.depth == 0
+            {
+                self.calls.push(call.clone());
             }
-            let groups = call.over.is_some()
-                || crate::impls::translator_impls::query::is_aggregate_call(call)
-                || match declared_kind(call, self.schema) {
-                    Ok(kind) => kind.is_some_and(|kind| kind != FunctionKind::Normal),
-                    Err(error) => return ControlFlow::Break(Err(error)),
-                };
-            if groups {
-                ControlFlow::Break(Ok(call.name.to_string()))
-            } else {
-                ControlFlow::Continue(())
-            }
+            ControlFlow::Continue(())
         }
     }
-    match body.visit(&mut Grouping { schema, depth: 0 }) {
-        ControlFlow::Continue(()) => Ok(()),
-        ControlFlow::Break(Ok(grouping)) => {
-            Err(refusal(
+    let mut outer = OuterCalls::default();
+    let _: ControlFlow<Infallible> = body.visit(&mut outer);
+    for call in &outer.calls {
+        let groups = call.over.is_some()
+            || crate::impls::translator_impls::query::is_aggregate_call(call)
+            || declared_kind(call, schema)?.is_some_and(|kind| kind != FunctionKind::Normal);
+        if groups {
+            return Err(refusal(
                 name,
                 &format!(
-                    "calls {grouping}, which over the one row its body selects folds that row, \
-                     and in place of the call would fold the caller's rows"
+                    "calls {}, which over the one row its body selects folds that row, and in \
+                     place of the call would fold the caller's rows",
+                    call.name
                 ),
-            ))
+            ));
         }
-        ControlFlow::Break(Err(error)) => Err(error),
     }
+    Ok(())
 }
 
 /// The kind of the function the schema declares under the name `call`
-/// calls, `None` for a name it does not declare.
+/// calls, `None` for a name it does not declare or declares several times.
 fn declared_kind(call: &Function, schema: &ParserDB) -> Result<Option<FunctionKind>, Error> {
     let Some(target) = function_lookup_target(&call.name) else { return Ok(None) };
-    match schema.resolve_target_function(target, IdentifierCase::AsWritten) {
-        Ok(Some(function)) => Ok(Some(function.kind(schema)?)),
-        Ok(None) | Err(LookupError::AmbiguousFunctionLookup { .. }) => Ok(None),
-        Err(error) => Err(error.into()),
-    }
+    let declared = match schema.resolve_target_function(target, IdentifierCase::AsWritten) {
+        Err(LookupError::AmbiguousFunctionLookup { .. }) => None,
+        resolved => resolved?,
+    };
+    Ok(declared.map(|function| function.kind(schema)).transpose()?)
 }
 
 /// `body` as the declared return type, as PostgreSQL coerces what a SQL
@@ -669,13 +622,10 @@ fn cast_to(body: Expr, returned: &DataType) -> Expr {
     while let Expr::Nested(inner) = written {
         written = *inner;
     }
+    let keeps = plain_cast_type(&written)
+        .is_some_and(|data_type| session_variable::same_postgres_type(data_type, returned));
     match written {
-        Expr::Cast {
-            kind: CastKind::Cast | CastKind::DoubleColon,
-            expr,
-            data_type,
-            format: None,
-        } if session_variable::same_postgres_type(&data_type, returned) => {
+        Expr::Cast { expr, data_type, .. } if keeps => {
             Expr::Cast { kind: CastKind::Cast, expr, data_type, format: None }
         }
         other => {
@@ -686,6 +636,19 @@ fn cast_to(body: Expr, returned: &DataType) -> Expr {
                 format: None,
             }
         }
+    }
+}
+
+/// The type `expr` casts to, when it is a `CAST` or `::` with no format.
+fn plain_cast_type(expr: &Expr) -> Option<&DataType> {
+    match expr {
+        Expr::Cast {
+            kind: CastKind::Cast | CastKind::DoubleColon,
+            data_type,
+            format: None,
+            ..
+        } => Some(data_type),
+        _ => None,
     }
 }
 
@@ -807,7 +770,6 @@ impl<'f> Arguments<'f> {
             )
         };
         let written: Vec<&Expr> = match &call.args {
-            FunctionArguments::None => Vec::new(),
             FunctionArguments::List(list)
                 if list.duplicate_treatment.is_none() && list.clauses.is_empty() =>
             {
@@ -944,6 +906,8 @@ pub(crate) struct Parameters {
     /// The address of each referencing node with the position of the
     /// parameter it reads, sorted by address.
     references: Vec<(usize, usize)>,
+    /// The address of each name that binds nothing, sorted.
+    unbound: Vec<usize>,
 }
 
 impl Parameters {
@@ -964,16 +928,24 @@ impl Parameters {
         let scope = ExpressionScope::FunctionBody(helper);
         let context =
             ExpressionContext::for_expression(body, &scope, schema, IdentifierCase::AsWritten)?;
-        Self::resolve(body, count, |expr| {
+        let mut unbound = Vec::new();
+        let mut parameters = Self::resolve(body, count, |expr| {
             Ok(match context.reference(expr)? {
                 Some((ColumnDefinition::Parameter { function, ordinal }, _))
                     if core::ptr::eq(function, helper) =>
                 {
                     Some(ordinal)
                 }
-                _ => None,
+                Some(_) => None,
+                None => {
+                    unbound.push(address(expr));
+                    None
+                }
             })
-        })
+        })?;
+        unbound.sort_unstable();
+        parameters.unbound = unbound;
+        Ok(parameters)
     }
 
     /// The references to `count` parameters in `node`, `named` answering
@@ -1020,7 +992,7 @@ impl Parameters {
             return Err(error);
         }
         references.sort_unstable();
-        Ok(Self { references })
+        Ok(Self { references, unbound: Vec::new() })
     }
 
     /// The position of the parameter `expr` reads, when it is one of the
@@ -1033,20 +1005,22 @@ impl Parameters {
             .map(|index| self.references[index].1)
     }
 
-    /// Refuses a name in `body` that is neither a parameter nor a reading of
-    /// the session: a body reading no relation has nothing else a name could
-    /// mean, and left as written it would name a column of the caller.
+    /// Refuses a name in `body` that binds nothing and is no reading of the
+    /// session, and a `$n` past the parameters: left as written either would
+    /// name something of the caller.
     fn check_references(&self, name: &ObjectName, body: &Expr) -> Result<(), Error> {
         let flow = visit_expressions(body, |expr| {
-            let reference = match expr {
-                Expr::Identifier(_) | Expr::CompoundIdentifier(_) => true,
-                Expr::Value(value) => matches!(value.value, Value::Placeholder(_)),
+            let stray = match expr {
+                Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+                    self.unbound.binary_search(&address(expr)).is_ok()
+                        && session_variable::session_read(expr).is_none()
+                }
+                Expr::Value(value) => {
+                    matches!(value.value, Value::Placeholder(_)) && self.position(expr).is_none()
+                }
                 _ => false,
             };
-            if reference
-                && self.position(expr).is_none()
-                && session_variable::session_read(expr).is_none()
-            {
+            if stray {
                 return ControlFlow::Break(refusal(
                     name,
                     &format!("names {expr} in its body, which is none of its parameters"),
