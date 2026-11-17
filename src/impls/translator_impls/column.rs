@@ -222,7 +222,7 @@ pub(crate) fn translate_column_def(
 ) -> Result<ColumnDef, crate::errors::Error> {
     // A `REFERENCES` the replica leaves to the server goes before anything
     // reads the column's options.
-    let kept_column = column_without_keys_left_to_server(column, table, options, emit);
+    let kept_column = column_without_keys_left_to_server(column, table, schema, options, emit)?;
     let column = kept_column.as_ref().unwrap_or(column);
     // Both an identity column and a serial ask SQLite to supply values, which
     // it does only through the rowid alias, so both need the translated type

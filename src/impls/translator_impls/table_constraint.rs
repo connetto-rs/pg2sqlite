@@ -11,16 +11,20 @@ use sqlparser::ast::{
 use crate::no_std::prelude::*;
 use crate::{
     impls::{
-        object_name::append_suffix, privileges::names_table_with_backing,
+        object_name::append_suffix,
+        privileges::names_table_with_backing,
         shared_helpers::match_partial_not_supported_error,
-        translator_impls::constraint_characteristic::deferrability_outside_a_foreign_key,
+        translator_impls::{
+            constraint_characteristic::deferrability_outside_a_foreign_key, off_replica::OffReplica,
+        },
     },
     traits::translator::TranslatorWithContext,
 };
 
 /// A constraint can translate to none, as a dropped CHECK does, to one, or
 /// to several: a composite `MATCH FULL` foreign key needs a CHECK beside
-/// it because SQLite ignores the MATCH clause.
+/// it because SQLite ignores the MATCH clause. A foreign key into a table left
+/// off the replica leaves with that table and keeps only its CHECK.
 impl crate::traits::translator::TranslatorWithContext for TableConstraint {
     type SQLiteEntry = Vec<TableConstraint>;
 
@@ -35,6 +39,9 @@ impl crate::traits::translator::TranslatorWithContext for TableConstraint {
                 translate_check_constraint(check_constraint, schema, options, emit)
             }
             Self::ForeignKey(fk_constraint) => {
+                if OffReplica::of(&fk_constraint.foreign_table, schema, options)?.is_some() {
+                    return Ok(match_full_guard(fk_constraint)?.into_iter().collect());
+                }
                 let mut updated_fk = fk_constraint.clone();
 
                 if names_table_with_backing(schema, &fk_constraint.foreign_table, options)? {

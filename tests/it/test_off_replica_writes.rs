@@ -1,13 +1,16 @@
 //! Statements writing a table the acting role holds no privilege on.
 //!
 //! Such a table is left off the replica, and every statement whose target it
-//! is leaves with it, since the replica holds only what the role reads. A
-//! statement whose effect could still reach a table the role reads, through a
-//! trigger on the table or a foreign key acting on its referencing rows, is
-//! refused instead.
+//! is leaves with it, since the replica holds only what the role reads, as
+//! does every foreign key into it. A statement whose effect could still reach
+//! a table the role reads, through a trigger on the table or a foreign key
+//! acting on its referencing rows, is refused instead.
 
 use diesel::prelude::*;
-use pg2sqlite::prelude::Pg2SqliteOptions;
+use pg2sqlite::{
+    prelude::{Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation},
+    warnings::TranslationWarning,
+};
 
 use crate::helpers;
 
@@ -18,6 +21,30 @@ diesel::table! {
         id -> Integer,
         /// Label.
         label -> Text,
+    }
+}
+
+diesel::table! {
+    /// A table the acting role writes, keyed into tables it cannot read.
+    users (id) {
+        /// Primary key, half of the composite key into `principals`.
+        id -> Text,
+        /// The other half of the composite key into `principals`.
+        kind -> Nullable<Text>,
+        /// A key into `kinds`, which the acting role reads.
+        label -> Nullable<Integer>,
+    }
+}
+
+diesel::table! {
+    /// A table the acting role writes, with column-level keys into `grantees`.
+    notes (id) {
+        /// Primary key.
+        id -> Integer,
+        /// A key into `grantees`, declared with the table.
+        author -> Nullable<Text>,
+        /// A key into `grantees`, added by `ALTER TABLE`.
+        editor -> Nullable<Text>,
     }
 }
 
@@ -271,4 +298,127 @@ fn a_replica_leaving_derived_writes_to_the_server_leaves_their_writes_off() {
         &options,
     )
     .expect("the script runs on SQLite");
+}
+
+#[test]
+fn a_foreign_key_into_a_table_left_off_the_replica_leaves_with_it() {
+    const ID: &str = "00000000-0000-0000-0000-000000000001";
+    let options = options().with_uuid_representation(pg2sqlite::prelude::UuidRepresentation::Text);
+    let mut connection = helpers::apply_with_options(
+        &script(
+            "CREATE TABLE principals (id UUID, kind TEXT, PRIMARY KEY (id, kind));
+             CREATE TABLE users (
+                 id UUID PRIMARY KEY,
+                 kind TEXT DEFAULT 'user',
+                 label INTEGER REFERENCES kinds (id),
+                 FOREIGN KEY (id, kind) REFERENCES principals MATCH FULL
+                     DEFERRABLE INITIALLY DEFERRED
+             );
+             GRANT ALL ON users TO app;
+             CREATE TABLE notes (
+                 id INTEGER PRIMARY KEY,
+                 author UUID REFERENCES grantees (id) ON DELETE CASCADE
+             );
+             GRANT ALL ON notes TO app;
+             ALTER TABLE notes ADD COLUMN editor UUID REFERENCES grantees;
+             INSERT INTO kinds VALUES (1, 'user');",
+        ),
+        &options,
+    )
+    .expect("the script runs on SQLite");
+
+    diesel::insert_into(users::table)
+        .values((users::id.eq(ID), users::label.eq(1)))
+        .execute(&mut connection)
+        .expect("a user is written without principals on the replica");
+    diesel::insert_into(notes::table)
+        .values((notes::id.eq(1), notes::author.eq(ID), notes::editor.eq(ID)))
+        .execute(&mut connection)
+        .expect("a note is written without grantees on the replica");
+    diesel::update(notes::table)
+        .set(notes::author.eq(None::<String>))
+        .execute(&mut connection)
+        .expect("a note is updated");
+    diesel::delete(notes::table).execute(&mut connection).expect("a note is deleted");
+
+    // The constraints that stay on the replica still hold: the MATCH FULL
+    // guard refuses a half-null key, and the key into `kinds` a missing kind.
+    diesel::insert_into(users::table)
+        .values((
+            users::id.eq("00000000-0000-0000-0000-000000000002"),
+            users::kind.eq(None::<String>),
+        ))
+        .execute(&mut connection)
+        .expect_err("MATCH FULL refuses a half-null key");
+    diesel::insert_into(users::table)
+        .values((users::id.eq("00000000-0000-0000-0000-000000000003"), users::label.eq(2)))
+        .execute(&mut connection)
+        .expect_err("the key into kinds refuses a missing kind");
+}
+
+#[test]
+fn a_foreign_key_over_intervals_into_a_table_left_off_the_replica_leaves_with_it() {
+    helpers::apply_with_options(
+        &script(
+            "CREATE TABLE windows (span INTERVAL PRIMARY KEY);
+             CREATE TABLE plans (
+                 id INTEGER PRIMARY KEY,
+                 span INTERVAL,
+                 FOREIGN KEY (span) REFERENCES windows (span)
+             );
+             GRANT ALL ON plans TO app;
+             INSERT INTO plans VALUES (1, '1 day');",
+        ),
+        &options(),
+    )
+    .expect("the script runs on SQLite");
+}
+
+/// `notes` keyed into `grantees` by `ALTER TABLE ADD CONSTRAINT`, one key
+/// plain and one cascading.
+const ADDED_KEYS: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, author UUID, editor UUID);
+     GRANT ALL ON notes TO app;
+     ALTER TABLE notes ADD CONSTRAINT notes_author FOREIGN KEY (author) REFERENCES grantees (id);
+     ALTER TABLE notes ADD CONSTRAINT notes_editor FOREIGN KEY (editor) REFERENCES grantees (id)
+         ON DELETE CASCADE;";
+
+#[test]
+fn an_added_foreign_key_into_a_table_left_off_the_replica_leaves_with_it() {
+    const ID: &str = "00000000-0000-0000-0000-000000000001";
+    let options = options().with_uuid_representation(UuidRepresentation::Text);
+    for options in [options.clone(), options.with_server_derived_writes_omitted()] {
+        let mut connection = helpers::apply_with_options(&script(ADDED_KEYS), &options)
+            .expect("the script runs on SQLite");
+        diesel::insert_into(notes::table)
+            .values((notes::id.eq(1), notes::author.eq(ID), notes::editor.eq(ID)))
+            .execute(&mut connection)
+            .expect("a note is written without grantees on the replica");
+    }
+}
+
+#[test]
+fn a_foreign_key_into_a_table_left_off_the_replica_is_not_reported_as_left_to_the_server() {
+    let options = options()
+        .with_uuid_representation(UuidRepresentation::Text)
+        .with_server_derived_writes_omitted();
+    let report = Pg2Sqlite::default()
+        .sql(&script(&format!(
+            "{ADDED_KEYS}
+             CREATE TABLE memberships (
+                 id INTEGER PRIMARY KEY,
+                 grantee UUID REFERENCES grantees (id) ON DELETE CASCADE,
+                 sponsor UUID,
+                 FOREIGN KEY (sponsor) REFERENCES grantees (id) ON UPDATE SET NULL
+             );
+             GRANT ALL ON memberships TO app;"
+        )))
+        .expect("the fixture parses")
+        .translate_with_report(&options)
+        .expect("the fixture translates");
+    let reported: Vec<_> = report
+        .warnings
+        .iter()
+        .filter(|warning| matches!(warning, TranslationWarning::LeftToServer { .. }))
+        .collect();
+    assert!(reported.is_empty(), "{reported:?}");
 }

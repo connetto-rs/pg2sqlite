@@ -9,6 +9,11 @@
 //! would follow with either is refused rather than left off. A replica that
 //! leaves the writes the server derives to the server leaves those triggers and
 //! keys out, and the rows they write reach it from the server.
+//!
+//! A foreign key into the table leaves with it too, since SQLite resolves the
+//! referenced table on every write to the referencing one. The refusal above
+//! reads the keys the source declares, so it still holds for a key the
+//! emitted table no longer carries.
 
 use sql_traits::{
     structs::ParserDB,

@@ -21,10 +21,11 @@
 //!
 //! A caller-set option may also ask for a drop. `RoleTableAccess::Deny`, from
 //! the acting role named with `with_acting_role`, drops in silence a table the
-//! role holds no privilege on, and its indexes, its triggers and every
-//! statement writing or altering it leave with it, as `off_replica` describes.
-//! `with_server_derived_writes_omitted` drops a trigger with a `LeftToServer`
-//! warning. Each is documented at the option that sets it.
+//! role holds no privilege on, and its indexes, its triggers, the foreign keys
+//! into it and every statement writing or altering it leave with it, as
+//! `off_replica` describes. `with_server_derived_writes_omitted` drops a
+//! trigger with a `LeftToServer` warning. Each is documented at the option
+//! that sets it.
 //!
 //! The match over `Statement` has no wildcard arm on purpose: a new
 //! `sqlparser` variant fails to compile until it is classified here, which is
@@ -850,19 +851,22 @@ fn translate_alter_table_operation(
         | AlterTableOperation::ForceRowLevelSecurity
         | AlterTableOperation::NoForceRowLevelSecurity
         | AlterTableOperation::OwnerTo { .. } => Ok(None),
-        // A key left to the server is never added, which spares the ALTER
-        // TABLE SQLite has no form for.
+        // A key into a table left off the replica leaves with it, and a key
+        // left to the server is never added, which spares the ALTER TABLE
+        // SQLite has no form for.
         AlterTableOperation::AddConstraint {
             constraint: sqlparser::ast::TableConstraint::ForeignKey(key),
             ..
-        } if foreign_key_left_to_server(
-            key,
-            None,
-            &key.columns,
-            &alter_table.name,
-            options,
-            emit,
-        ) =>
+        } if OffReplica::of(&key.foreign_table, schema, options)?.is_some()
+            || foreign_key_left_to_server(
+                key,
+                None,
+                &key.columns,
+                &alter_table.name,
+                schema,
+                options,
+                emit,
+            )? =>
         {
             Ok(None)
         }

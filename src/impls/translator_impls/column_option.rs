@@ -7,8 +7,10 @@ use sqlparser::ast::{
 };
 
 use crate::impls::{
-    object_name::append_suffix, privileges::names_table_with_backing,
-    shared_helpers::match_partial_not_supported_error, translator_impls::expr::sqlite_collation,
+    object_name::append_suffix,
+    privileges::names_table_with_backing,
+    shared_helpers::match_partial_not_supported_error,
+    translator_impls::{expr::sqlite_collation, off_replica::OffReplica},
 };
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
@@ -183,6 +185,10 @@ impl crate::traits::translator::TranslatorWithContext for ColumnOptionDef {
                 // for the same reason the table-level spelling is.
                 if matches!(match_kind, Some(ConstraintReferenceMatchKind::Partial)) {
                     return Err(match_partial_not_supported_error());
+                }
+                // A key into a table left off the replica leaves with it.
+                if OffReplica::of(foreign_table, schema, options)?.is_some() {
+                    return Ok(None);
                 }
                 let updated_foreign_table = {
                     if names_table_with_backing(schema, foreign_table, options)? {
