@@ -244,22 +244,3 @@ fn shared_maintenance_trigger_refused() {
     ));
     assert!(message.contains("assigns to NEW"), "got: {message}");
 }
-
-/// A conditional RETURN in an AFTER trigger ends the SQLite trigger, which
-/// would skip the members after it.
-#[test]
-fn shared_after_trigger_with_conditional_return_refused() {
-    let message = refusal(&format!(
-        "{LOGGING_FUNCTIONS}
-         CREATE FUNCTION log_unless_a() RETURNS trigger AS $$
-         BEGIN
-             IF NEW.a IS NULL THEN RETURN NULL; END IF;
-             INSERT INTO t_log (marker) VALUES ('a');
-             RETURN NULL;
-         END;
-         $$ LANGUAGE plpgsql;
-         CREATE TRIGGER t_one AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION log_unless_a();
-         CREATE TRIGGER t_two AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION log_two();"
-    ));
-    assert!(message.contains("returns early"), "got: {message}");
-}

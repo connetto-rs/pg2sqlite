@@ -23,9 +23,10 @@ use sqlparser::{
     },
     tokenizer::Span,
 };
-use sqlparser_plpgsql::embedded::{self, Block, If, Node, NodeKind, Raise, RaiseLevel};
+use sqlparser_plpgsql::embedded::{self, Block, Node, NodeKind, Raise, RaiseLevel};
 
 use super::{
+    returns::{with_continuation, without_early_returns},
     scope::{Binding, BodyScope, BoundValue, fold},
     translator::{FOUND, PlPgSqlTranslator, bare_identifier},
 };
@@ -560,7 +561,7 @@ fn resolved(mut expr: Expr, scope: &BodyScope) -> Result<Expr, Error> {
 }
 
 /// Writes each read of a name `values` binds in `expr` as its value.
-fn substitute(expr: &mut Expr, values: &[(String, BoundValue)]) -> Result<(), Error> {
+pub(super) fn substitute(expr: &mut Expr, values: &[(String, BoundValue)]) -> Result<(), Error> {
     let flow = visit_expressions_mut(expr, |expr| {
         let Some(name) = bare_identifier(expr).map(fold) else { return ControlFlow::Continue(()) };
         match values.iter().find(|(bound, _)| *bound == name).map(|(_, value)| value) {
@@ -576,108 +577,5 @@ fn substitute(expr: &mut Expr, values: &[(String, BoundValue)]) -> Result<(), Er
     match flow {
         ControlFlow::Break(reason) => Err(Error::forward_refusal(reason)),
         ControlFlow::Continue(()) => Ok(()),
-    }
-}
-
-/// `nodes` with what follows each `RETURN`, and each `IF` or block that may
-/// return, moved into the paths that do not return, so every `RETURN` ends
-/// the list it sits in.
-fn without_early_returns(nodes: Vec<Node>) -> Vec<Node> {
-    with_continuation(nodes, &[])
-}
-
-/// `nodes` followed by `continuation`, run on every path that does not
-/// return, with no node after a `RETURN`. `continuation` already has none.
-fn with_continuation(nodes: Vec<Node>, continuation: &[Node]) -> Vec<Node> {
-    let mut result = Vec::with_capacity(nodes.len() + continuation.len());
-    let mut nodes = nodes.into_iter();
-    while let Some(node) = nodes.next() {
-        let rest = || with_continuation(nodes.as_slice().to_vec(), continuation);
-        let Node { kind, span } = node;
-        match kind {
-            NodeKind::Return { .. } => {
-                result.push(Node { kind, span });
-                return result;
-            }
-            NodeKind::If(conditional) if may_return_in(&conditional) => {
-                let rest = rest();
-                let If { branches, otherwise } = conditional;
-                let branches = branches
-                    .into_iter()
-                    .map(|mut branch| {
-                        branch.statements = with_continuation(branch.statements, &rest);
-                        branch
-                    })
-                    .collect();
-                let otherwise = with_continuation(otherwise, &rest);
-                result.push(Node { kind: NodeKind::If(If { branches, otherwise }), span });
-                return result;
-            }
-            NodeKind::Block(block) if block.statements.iter().any(may_return) => {
-                let rest = rest();
-                let Block { label, declarations, statements, handlers } = block;
-                let statements = with_continuation(statements, &rest);
-                let block = Block { label, declarations, statements, handlers };
-                result.push(Node { kind: NodeKind::Block(block), span });
-                return result;
-            }
-            kind => result.push(Node { kind, span }),
-        }
-    }
-    result.extend(continuation.iter().cloned());
-    result
-}
-
-/// Whether `node` holds a `RETURN` on some path through it.
-fn may_return(node: &Node) -> bool {
-    match &node.kind {
-        NodeKind::Return { .. } => true,
-        NodeKind::If(conditional) => may_return_in(conditional),
-        NodeKind::Block(block) => block.statements.iter().any(may_return),
-        _ => false,
-    }
-}
-
-/// Whether a branch of `conditional` holds a `RETURN`.
-fn may_return_in(conditional: &If) -> bool {
-    conditional
-        .branches
-        .iter()
-        .flat_map(|branch| &branch.statements)
-        .chain(&conditional.otherwise)
-        .any(may_return)
-}
-
-#[cfg(test)]
-mod tests {
-    use sqlparser_plpgsql::embedded::embedded_sql;
-
-    use super::*;
-
-    fn statements(body: &str) -> Vec<Node> {
-        embedded_sql(body).expect("the body parses").statements
-    }
-
-    /// The statements after an `IF` that returns run only on the branches
-    /// that do not, and a `RETURN` ends its list.
-    #[test]
-    fn what_follows_a_return_moves_into_the_branches_that_do_not_return() {
-        let moved = without_early_returns(statements(
-            "BEGIN
-                 IF a THEN RETURN; ELSIF b THEN PERFORM 1; END IF;
-                 PERFORM 2;
-                 RETURN;
-                 PERFORM 3;
-             END",
-        ));
-        let expected = statements(
-            "BEGIN
-                 IF a THEN RETURN;
-                 ELSIF b THEN PERFORM 1; PERFORM 2; RETURN;
-                 ELSE PERFORM 2; RETURN;
-                 END IF;
-             END",
-        );
-        assert_eq!(moved, expected);
     }
 }

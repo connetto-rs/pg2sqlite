@@ -26,6 +26,9 @@ pub(crate) struct TriggerFacts {
     /// The trigger function and what keeps its body from the maintenance
     /// shape, named when the body assigns to `NEW`.
     pub(crate) maintenance_refusal: Option<(String, sql_traits::structs::MaintenanceRefusal)>,
+    /// Whether the trigger fires after the write, where PostgreSQL ignores
+    /// the row the body returns.
+    pub(crate) after: bool,
 }
 
 impl TriggerFacts {
@@ -116,6 +119,18 @@ impl RowValue {
                 })
             }
             Self::Unassigned => None,
+        }
+    }
+
+    /// Calls `visit` on each condition choosing among the rows, nested
+    /// choices included.
+    pub(crate) fn for_each_condition_mut(&mut self, visit: &mut impl FnMut(&mut Expr)) {
+        if let Self::Chosen { arms, otherwise } = self {
+            for (condition, row) in arms {
+                visit(condition);
+                row.for_each_condition_mut(visit);
+            }
+            otherwise.for_each_condition_mut(visit);
         }
     }
 }
@@ -319,6 +334,20 @@ impl BodyScope {
     pub(crate) fn restore_scoped(&mut self, scoped: &[Binding]) {
         self.scoped =
             scoped.iter().map(|binding| (binding.name.clone(), binding.clone())).collect();
+    }
+
+    /// Every binding in force, to rewrite in place.
+    pub(crate) fn bindings_mut(&mut self) -> impl Iterator<Item = &mut Binding> {
+        self.scoped.values_mut().chain(self.persistent.values_mut())
+    }
+
+    /// Takes `name` out of scope, its declaration, bindings and generated key
+    /// with it.
+    pub(crate) fn forget(&mut self, name: &str) {
+        self.declared.remove(name);
+        self.scoped.remove(name);
+        self.persistent.remove(name);
+        self.uuid_first_use.remove(name);
     }
 
     /// Makes every binding whose value reads `relation` unreadable, since a

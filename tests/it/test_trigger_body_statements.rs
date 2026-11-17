@@ -162,6 +162,18 @@ fn found_declared_in_a_nested_block_is_refused() {
     assert!(error.to_string().contains("a nested block declares `found`"), "{error}");
 }
 
+/// A nested block declaring a name still in scope is refused, since reads go
+/// by name.
+#[test]
+fn a_nested_block_redeclaring_a_variable_in_scope_is_refused() {
+    let error = translate_body(
+        "DECLARE x int := 1;",
+        "DECLARE x int := 2; BEGIN UPDATE r SET parent = NULL WHERE x = 2; END;",
+    )
+    .expect_err("the inner x shadows the outer one");
+    assert!(error.to_string().contains("declares `x` again"), "{error}");
+}
+
 /// A write to a table invalidates a variable read through a view over it.
 #[test]
 fn a_variable_read_through_a_view_is_stale_after_a_write_to_its_table() {
