@@ -1,8 +1,11 @@
-//! What a statement reads of the session, answered from the deployment.
+//! What a statement reads of the session, answered from the deployment or by
+//! the replica itself.
 //!
 //! The role keywords become the names the deployment and `with_acting_role`
-//! give. A setting becomes the call a mapping pairs it with, read only the way
-//! the deployment declares it, and refused in either direction otherwise.
+//! give. A custom setting becomes the call a mapping pairs it with, read only
+//! the way the deployment declares it, and refused in either direction
+//! otherwise. One of PostgreSQL's own settings becomes the literal the replica
+//! answers it with, or is refused when the replica has no faithful answer.
 
 use core::fmt;
 
@@ -60,8 +63,12 @@ fn setting_name(args: &FunctionArguments) -> Option<String> {
 /// What a statement reads of the session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SessionRead {
-    /// `current_setting(name[, missing_ok])`.
+    /// `current_setting(name[, missing_ok])` of a custom setting, whose
+    /// dotted name the deployment declares.
     Setting(String),
+    /// `current_setting(name[, missing_ok])` of one of PostgreSQL's own
+    /// settings, whose name has no dot.
+    ServerSetting(String),
     /// `current_user`, `current_role` or `user`, as written.
     ActingRole(&'static str),
     /// `session_user`.
@@ -79,7 +86,15 @@ pub(crate) fn session_read_of(name: &str, args: &FunctionArguments) -> Option<Se
         "current_user" if keyword => Some(SessionRead::ActingRole("current_user")),
         "user" if keyword => Some(SessionRead::ActingRole("user")),
         "session_user" if keyword => Some(SessionRead::LoginRole),
-        "current_setting" => setting_name(args).map(SessionRead::Setting),
+        "current_setting" => {
+            setting_name(args).map(|name| {
+                if name.contains('.') {
+                    SessionRead::Setting(name)
+                } else {
+                    SessionRead::ServerSetting(name)
+                }
+            })
+        }
         _ => None,
     }
 }
@@ -164,6 +179,7 @@ pub(crate) fn check_read(
 ) -> Result<(), Error> {
     match read {
         SessionRead::Setting(name) => setting_in(name, options, context).map(drop),
+        SessionRead::ServerSetting(name) => server_setting(name, context).map(drop),
         SessionRead::ActingRole(spelling) => {
             acting_role_in_deployment(options)?.map(drop).ok_or_else(|| {
                 Error::ActingRoleRequired { reading: format!("{spelling}{context}") }
@@ -180,6 +196,29 @@ pub(crate) fn check_read(
 fn role_literal(name: &str, deployment: &Deployment, schema: &ParserDB) -> Result<Expr, Error> {
     resolve_roles(deployment, schema)?;
     Ok(string_literal(name))
+}
+
+/// What the replica answers for PostgreSQL's own setting `name`, when it has a
+/// faithful answer.
+///
+/// SQLite runs every transaction serializable, since it serialises writers,
+/// so `transaction_isolation` answers what PostgreSQL answers inside a
+/// serializable transaction.
+#[must_use]
+pub(crate) fn server_setting_answer(name: &str) -> Option<&'static str> {
+    name.eq_ignore_ascii_case("transaction_isolation").then_some("serializable")
+}
+
+/// [`server_setting_answer`], refusing a setting without one, `context`
+/// saying where the statement reads it.
+fn server_setting(name: &str, context: &str) -> Result<&'static str, Error> {
+    server_setting_answer(name).ok_or_else(|| {
+        Error::forward_refusal(format!(
+            "current_setting('{name}'){context} reads one of PostgreSQL's own settings, since \
+             only a dotted name is a custom setting a deployment declares, and the SQLite \
+             replica has no faithful answer for it."
+        ))
+    })
 }
 
 /// A setting the deployment declares and a mapping pairs.
@@ -362,6 +401,7 @@ pub(crate) fn translate_session_read(
             return role_literal(deployment.login_role(), deployment, schema);
         }
         SessionRead::Setting(name) => name,
+        SessionRead::ServerSetting(name) => return server_setting(name, "").map(string_literal),
     };
     let setting = setting(name, options)?;
     match setting.one_value()? {

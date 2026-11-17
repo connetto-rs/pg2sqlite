@@ -85,9 +85,10 @@ impl ReplayCheck<'_, '_> {
     /// True when the call names a function this crate knows and knows to be
     /// deterministic.
     ///
-    /// A reading of the session counts, a role keyword and a mapped setting
-    /// under either of its names, ahead of the name inventories. A role is a
-    /// literal once translated, and `current_setting` is STABLE in
+    /// A reading of the session counts, a role keyword, a mapped setting
+    /// under either of its names and a server setting the replica answers,
+    /// ahead of the name inventories. A role and a server setting are
+    /// literals once translated, and `current_setting` is STABLE in
     /// PostgreSQL, and row level security already reads the function the
     /// mapping names once per row, so a host whose function answered
     /// differently per call would already have an incoherent replica. A
@@ -101,6 +102,9 @@ impl ReplayCheck<'_, '_> {
             match read {
                 session_variable::SessionRead::Setting(setting) => {
                     self.options.find_session_variable(&setting).is_some()
+                }
+                session_variable::SessionRead::ServerSetting(setting) => {
+                    session_variable::server_setting_answer(&setting).is_some()
                 }
                 session_variable::SessionRead::ActingRole(_)
                 | session_variable::SessionRead::LoginRole => true,
