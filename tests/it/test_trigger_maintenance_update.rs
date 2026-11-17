@@ -99,6 +99,44 @@ fn maintenance_trigger_chains_on_second_update() {
     assert_eq!(read_tag(&mut conn).as_deref(), Some("z!"));
 }
 
+diesel::table! {
+    priced (id) {
+        id -> Integer,
+        price -> Nullable<BigInt>,
+        note -> Nullable<Text>,
+    }
+}
+
+/// The trigger stores `1.25` in a `NUMERIC(10,2)` column as the scaled
+/// integer 125, so its recursion guard has to compare against 125. Comparing
+/// against `1.25` re-fires the trigger on its own write until SQLite answers
+/// `triggers nested too deep`. PostgreSQL leaves 1.25.
+#[test]
+fn maintenance_trigger_settles_on_a_scaled_numeric() {
+    let mut conn = apply_schema(
+        "CREATE TABLE priced (id INT PRIMARY KEY, price NUMERIC(10,2), note TEXT);
+         CREATE FUNCTION fix_price() RETURNS trigger AS $$
+         BEGIN
+             NEW.price := 1.25;
+             RETURN NEW;
+         END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER priced_fix BEFORE UPDATE ON priced
+             FOR EACH ROW EXECUTE FUNCTION fix_price();",
+    );
+    diesel::insert_into(priced::table)
+        .values((priced::id.eq(1), priced::note.eq("a")))
+        .execute(&mut conn)
+        .expect("insert");
+    diesel::update(priced::table.find(1))
+        .set(priced::note.eq("b"))
+        .execute(&mut conn)
+        .expect("the maintenance write must not re-fire the trigger");
+    let price: Option<i64> =
+        priced::table.find(1).select(priced::price).first(&mut conn).expect("select");
+    assert_eq!(price, Some(125));
+}
+
 #[test]
 fn single_trigger_per_event_still_translates() {
     Pg2Sqlite::default()

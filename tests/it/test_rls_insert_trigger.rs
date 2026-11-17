@@ -202,6 +202,50 @@ fn rls_two_column_maintenance_trigger_exemption_fires() {
     assert_eq!(row.slug.as_deref(), Some("WORLD"), "slug must be maintained");
 }
 
+diesel::table! {
+    priced (id) {
+        id -> Integer,
+        price -> Nullable<BigInt>,
+    }
+}
+
+diesel::table! {
+    priced_rls (id) {
+        id -> Integer,
+        price -> Nullable<BigInt>,
+    }
+}
+
+/// The maintenance write stores `1.25` in a `NUMERIC(10,2)` column as the
+/// scaled integer 125, so the exemption letting it past the missing `UPDATE`
+/// policy has to expect 125. Expecting `1.25` denies the trigger's own write
+/// and with it the insert. PostgreSQL stores 1.25.
+#[test]
+fn rls_maintenance_exemption_expects_the_scaled_numeric() {
+    let mut conn = helpers::apply_translated_ddl(
+        "CREATE TABLE priced (id INT PRIMARY KEY, price NUMERIC(10,2));
+         ALTER TABLE priced ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY priced_sel ON priced FOR SELECT USING (true);
+         CREATE POLICY priced_ins ON priced FOR INSERT WITH CHECK (true);
+         CREATE FUNCTION fix_price() RETURNS trigger AS $$
+         BEGIN
+             NEW.price := 1.25;
+             RETURN NEW;
+         END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER priced_fix BEFORE INSERT ON priced
+             FOR EACH ROW EXECUTE FUNCTION fix_price();",
+        &Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit"),
+    );
+    diesel::insert_into(priced::table)
+        .values(priced::id.eq(1))
+        .execute(&mut conn)
+        .expect("INSERT through RLS view must succeed");
+    let price: Option<i64> =
+        priced_rls::table.find(1).select(priced_rls::price).first(&mut conn).expect("select");
+    assert_eq!(price, Some(125));
+}
+
 // ── Non-maintenance BEFORE INSERT trigger → continue at rls.rs 2263 ──────────
 
 diesel::table! {

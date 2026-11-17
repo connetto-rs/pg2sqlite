@@ -2363,24 +2363,18 @@ fn build_maintenance_insert_exemption(
             continue;
         }
 
-        let per_trigger: Vec<Expr> =
+        let chain =
             crate::impls::translator_impls::create_trigger::maintenance_chain(&synthetic, schema)
-                .ok()?
-                .into_iter()
-                .map(|(col, raw_expr)| {
-                    let old_expr =
-                        crate::impls::translator_impls::create_trigger::substitute_new_with_old(
-                            &raw_expr,
-                        );
-                    let new_col =
-                        Expr::CompoundIdentifier(vec![Ident::new("NEW"), Ident::new(&col)]);
-                    Expr::IsDistinctFrom(Box::new(new_col), Box::new(old_expr))
-                })
-                .collect();
-
-        let trigger_matches = per_trigger.into_iter().reduce(|a, b| {
-            Expr::BinaryOp { left: Box::new(a), op: BinaryOperator::Or, right: Box::new(b) }
-        });
+                .ok()?;
+        let trigger_matches =
+            crate::impls::translator_impls::create_trigger::maintenance_recursion_condition(
+                &table.name,
+                chain,
+                schema,
+                options,
+                &mut |_| {},
+            )
+            .ok()?;
 
         if let Some(cond) = trigger_matches {
             any_trigger_match = Some(match any_trigger_match {
