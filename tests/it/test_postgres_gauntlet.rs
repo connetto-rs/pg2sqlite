@@ -37,6 +37,9 @@ mod parity_lateral;
 #[path = "gauntlet/parity_boolean_helpers.rs"]
 mod parity_boolean_helpers;
 
+#[path = "gauntlet/parity_sharable_grants.rs"]
+mod parity_sharable_grants;
+
 #[path = "gauntlet/parity_plpgsql.rs"]
 mod parity_plpgsql;
 #[path = "gauntlet/parity_scalar_helpers.rs"]
