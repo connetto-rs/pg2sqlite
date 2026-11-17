@@ -75,7 +75,7 @@ fn read_tag(conn: &mut SqliteConnection) -> Option<String> {
 }
 
 /// PostgreSQL ground truth: UPDATE SET tag='y' → tag='y!' (trigger fires).
-/// The WHEN clause must also prevent re-firing under recursive triggers,
+/// The trigger must not fire again on its own write under recursive triggers,
 /// which would produce 'y!!' instead of 'y!'.
 #[test]
 fn maintenance_trigger_fires_on_update_to_maintenance_column() {
@@ -108,9 +108,8 @@ diesel::table! {
 }
 
 /// The trigger stores `1.25` in a `NUMERIC(10,2)` column as the scaled
-/// integer 125, so its recursion guard has to compare against 125. Comparing
-/// against `1.25` re-fires the trigger on its own write until SQLite answers
-/// `triggers nested too deep`. PostgreSQL leaves 1.25.
+/// integer 125, and its own write of that value must not fire it again.
+/// PostgreSQL leaves 1.25.
 #[test]
 fn maintenance_trigger_settles_on_a_scaled_numeric() {
     let mut conn = apply_schema(
@@ -135,6 +134,37 @@ fn maintenance_trigger_settles_on_a_scaled_numeric() {
     let price: Option<i64> =
         priced::table.find(1).select(priced::price).first(&mut conn).expect("select");
     assert_eq!(price, Some(125));
+}
+
+diesel::table! {
+    /// SQLite's catalogue of the database's tables, views, indexes and
+    /// triggers.
+    sqlite_schema (name) {
+        name -> Text,
+    }
+}
+
+/// Dropping a table with a maintenance trigger in a later migration leaves
+/// none of the replica's own objects for it behind.
+#[test]
+fn dropping_a_maintained_table_leaves_nothing_behind() {
+    let mut conn = apply_schema(BUMP_TAG_SCHEMA);
+    let schema = Pg2Sqlite::default().sql(BUMP_TAG_SCHEMA).unwrap().build_schema().unwrap();
+    let migration = Pg2Sqlite::default()
+        .sql("DROP TABLE mut;")
+        .expect("parse")
+        .translate_to_sql_with_schema(&schema, &Pg2SqliteOptions::default())
+        .expect("translate the drop")
+        .into_vec();
+    for statement in &migration {
+        // Translated DDL cannot be expressed via diesel's typed DSL.
+        diesel::sql_query(statement.as_str())
+            .execute(&mut conn)
+            .unwrap_or_else(|error| panic!("DDL: {error}\n{statement}"));
+    }
+    let left: Vec<String> =
+        sqlite_schema::table.select(sqlite_schema::name).load(&mut conn).unwrap();
+    assert_eq!(left, Vec::<String>::new(), "the drop leaves objects behind");
 }
 
 #[test]

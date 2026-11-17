@@ -35,11 +35,10 @@ use crate::{
 /// so a value referencing a column assigned earlier in the same body
 /// must see that write. A single SQLite `UPDATE` evaluates its whole SET list
 /// against the pre-update row, so earlier values are composed into later ones
-/// instead of split across statements: splitting re-enters the trigger in an
-/// intermediate state and exhausts the recursion depth under
-/// `recursive_triggers = ON` (measured: `too many levels of trigger
-/// recursion`). References to columns assigned LATER stay raw, because reading
-/// the pre-update row is exactly what PostgreSQL does for them.
+/// instead of split across statements, each of which would fire the table's
+/// other `UPDATE` triggers once more. References to columns assigned LATER
+/// stay raw, because reading the pre-update row is exactly what PostgreSQL
+/// does for them.
 #[cfg_attr(feature = "std", recursive::recursive)]
 fn compose_assignment_refs(expr: &Expr, assigned: &[(String, Expr)]) -> Expr {
     let earlier = |name: &str| {
@@ -61,10 +60,8 @@ fn compose_assignment_refs(expr: &Expr, assigned: &[(String, Expr)]) -> Expr {
 }
 
 /// The maintenance assignments in body order, each value composed against the
-/// ones before it. One rule serves the trigger body, its recursion guard, and
-/// the RLS condition that mirrors the guard, so the three cannot disagree
-/// about what the sequential chain computes.
-pub(crate) fn maintenance_chain(
+/// ones before it, the values the trigger body's `UPDATE` writes.
+fn maintenance_chain(
     trigger: &CreateTrigger,
     schema: &ParserDB,
 ) -> Result<Vec<(String, Expr)>, sql_traits::errors::LookupError> {
@@ -76,8 +73,11 @@ pub(crate) fn maintenance_chain(
     Ok(assigned)
 }
 
-/// Builds the `UPDATE` that stands in for a plpgsql body assigning to
-/// `NEW.<column>`, which SQLite has no way to express directly.
+/// Builds the body that stands in for a plpgsql body assigning to
+/// `NEW.<column>`, which SQLite has no way to express directly. The body
+/// writes the assigned values over the row with an `UPDATE`, holding the row
+/// in `marker` for its duration so the write does not fire the table's
+/// maintenance triggers again.
 ///
 /// The assigned value is PostgreSQL and goes through `Expr::translate` like any
 /// other expression. Skipping that step emitted `AT TIME ZONE`, `::` casts, and
@@ -87,7 +87,7 @@ pub(crate) fn maintenance_chain(
 fn generate_maintenance_trigger_body(
     trigger: &CreateTrigger,
     target_table_name: &ObjectName,
-    row_context: &str,
+    marker: &ObjectName,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
@@ -117,10 +117,7 @@ fn generate_maintenance_trigger_body(
         selection: Some(Expr::BinaryOp {
             left: Box::new(Expr::Identifier(Ident::new("rowid"))),
             op: BinaryOperator::Eq,
-            right: Box::new(Expr::CompoundIdentifier(vec![
-                Ident::new(row_context),
-                Ident::new("rowid"),
-            ])),
+            right: Box::new(Expr::CompoundIdentifier(vec![Ident::new("NEW"), Ident::new("rowid")])),
         }),
         returning: None,
         output: None,
@@ -134,7 +131,7 @@ fn generate_maintenance_trigger_body(
 
     Ok(sqlparser::ast::BeginEndStatements {
         begin_token: ast_builder::keyword_token("BEGIN", Keyword::BEGIN),
-        statements: vec![update_stmt],
+        statements: vec![super::reentry::mark(marker), update_stmt, super::reentry::unmark(marker)],
         end_token: ast_builder::keyword_token("END", Keyword::END),
     })
 }
@@ -375,20 +372,6 @@ fn run_as_definer_or_route_writes(
     Ok(translated)
 }
 
-/// Replaces `NEW` with `OLD` in compound identifiers so the WHEN clause can
-/// compare the current NEW value against what the maintenance expression
-/// computes from OLD, the value the recursion UPDATE would already have set.
-pub(crate) fn substitute_new_with_old(expr: &Expr) -> Expr {
-    if let Expr::CompoundIdentifier(parts) = expr
-        && parts.first().is_some_and(|part| part.value.eq_ignore_ascii_case("NEW"))
-    {
-        let mut renamed = parts.clone();
-        renamed[0] = Ident::new("OLD");
-        return Expr::CompoundIdentifier(renamed);
-    }
-    map_expr_children(expr, &substitute_new_with_old)
-}
-
 /// The SQLite value a maintenance `UPDATE` writes into `column`, `raw` being
 /// the PostgreSQL value the trigger assigns, with the cast and scaling any
 /// write into that column takes.
@@ -406,71 +389,8 @@ fn maintained_value(
     rewrites.finish_value(column, value, schema, options, Some(site))
 }
 
-/// The SQLite condition holding when a write into `table_name` leaves some
-/// maintained column away from what `chain` computes from `OLD`, `None` when
-/// `chain` is empty.
-///
-/// The maintenance `UPDATE` sets every column to exactly that value, so the
-/// condition is false on it and true on any other write. Each side is
-/// compared as stored, so the value goes through [`maintained_value`], with
-/// `NEW` and `OLD` read as rows of `table_name`.
-///
-/// # Errors
-///
-/// Propagates the error resolving `table_name` or translating a maintained
-/// value.
-pub(crate) fn maintenance_recursion_condition(
-    table_name: &ObjectName,
-    chain: Vec<(String, Expr)>,
-    schema: &ParserDB,
-    options: &crate::options::TranslationContext<'_>,
-    emit: crate::warnings::WarningSink<'_>,
-) -> Result<Option<Expr>, crate::errors::Error> {
-    let row_scope =
-        crate::impls::object_name::resolve_translation_table(schema, table_name)?.map(|table| {
-            sql_traits::structs::ColumnScope::for_table(
-                table,
-                schema,
-                sql_traits::structs::IdentifierCase::AsWritten,
-            )
-        });
-    let scoped = row_scope.as_ref().map(|scope| options.with_pseudo_row_scope(scope));
-    let options = scoped.as_ref().unwrap_or(options);
-    let rewrites = ColumnRewrites::for_named_table(schema, table_name, options);
-    let mut condition: Option<Expr> = None;
-    for (column, raw) in chain {
-        let old_value = substitute_new_with_old(&raw);
-        let value = maintained_value(&rewrites, &column, &old_value, schema, options, emit)?;
-        let new_column = Expr::CompoundIdentifier(vec![Ident::new("NEW"), Ident::new(&column)]);
-        let differs = Expr::IsDistinctFrom(Box::new(new_column), Box::new(value));
-        condition = Some(match condition {
-            None => differs,
-            Some(previous) => {
-                Expr::BinaryOp {
-                    left: Box::new(previous),
-                    op: BinaryOperator::Or,
-                    right: Box::new(differs),
-                }
-            }
-        });
-    }
-    Ok(condition)
-}
-
-/// WHEN clause for AFTER UPDATE maintenance triggers that prevents re-firing
-/// on the trigger's own UPDATE (recursion guard).
-fn build_maintenance_recursion_when_clause(
-    trigger: &CreateTrigger,
-    schema: &ParserDB,
-    options: &crate::options::TranslationContext<'_>,
-    emit: crate::warnings::WarningSink<'_>,
-) -> Option<Expr> {
-    let chain = maintenance_chain(trigger, schema).ok()?;
-    maintenance_recursion_condition(&trigger.table_name, chain, schema, options, emit).ok()?
-}
-
-/// ANDs two optional conditions; used to attach the recursion guard to any
-/// existing WHEN clause from the source trigger.
+/// ANDs two optional conditions, attaching the re-entry guard to the source
+/// trigger's `WHEN`.
 fn merge_conditions(a: Option<Expr>, b: Option<Expr>) -> Option<Expr> {
     match (a, b) {
         (Some(a), Some(b)) => {
@@ -741,22 +661,15 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
             .as_ref()
             .map(|cond| cond.translate_with_warnings(schema, options, emit))
             .transpose()?;
+        let marker = super::reentry::marker_table(&source_table_name);
         // A shared slot runs several members in one SQLite trigger, so each
         // keeps its WHEN inside its own body.
         let (in_body_guard, translated_condition) = if plain && shares_slot {
             (translated_cond, None)
         } else {
-            let recursion_guard = (is_maintenance_trigger && maintenance_update_event)
-                .then(|| {
-                    build_maintenance_recursion_when_clause(
-                        &trigger_for_helpers,
-                        schema,
-                        options,
-                        emit,
-                    )
-                })
-                .flatten();
-            (None, merge_conditions(translated_cond, recursion_guard))
+            let reentry_guard = (is_maintenance_trigger && maintenance_update_event)
+                .then(|| super::reentry::unmarked(&marker, "NEW"));
+            (None, merge_conditions(translated_cond, reentry_guard))
         };
 
         // SQLite takes one event per trigger.
@@ -776,11 +689,10 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
         let mut parts = Vec::with_capacity(part_events.len());
         for part_events in part_events {
             let function_body = if is_maintenance_trigger {
-                let row_context = if maintenance_insert_event { "NEW" } else { "OLD" };
                 generate_maintenance_trigger_body(
                     &trigger_for_helpers,
                     &redirected_table_name,
-                    row_context,
+                    &marker,
                     schema,
                     options,
                     emit,
@@ -996,7 +908,7 @@ mod tests {
         );
         assert!(
             sql.contains("WHEN"),
-            "UPDATE branch must carry a recursion-guard WHEN clause: {sql}"
+            "UPDATE branch must carry the re-entry guard's WHEN clause: {sql}"
         );
         assert!(
             sql.contains("CREATE TRIGGER trigger_upsert_brands_edited_at_pg2sqlite_insert AFTER INSERT ON brands"),

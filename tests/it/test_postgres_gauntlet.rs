@@ -90,3 +90,6 @@ mod parity_uuid_text;
 
 #[path = "gauntlet/parity_trigger_order.rs"]
 mod parity_trigger_order;
+
+#[path = "gauntlet/parity_maintenance_reentry.rs"]
+mod parity_maintenance_reentry;
