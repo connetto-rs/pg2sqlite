@@ -27,11 +27,12 @@ use core::ops::ControlFlow;
 use sql_traits::{
     structs::ParserDB,
     traits::{CheckConstraintLike, TableLike},
+    utils::identifier_resolution::identifiers_match,
 };
 use sqlparser::ast::{
-    CheckConstraint, ColumnOption, CreateTable, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArguments, Ident, ObjectName, Statement, TableConstraint, TriggerEvent, TriggerPeriod,
-    visit_expressions, visit_expressions_mut,
+    CheckConstraint, ColumnOption, CreateTable, DropTrigger, Expr, Function, FunctionArg,
+    FunctionArgExpr, FunctionArguments, Ident, ObjectName, Statement, TableConstraint,
+    TriggerEvent, TriggerPeriod, visit_expressions, visit_expressions_mut,
 };
 
 #[cfg(not(feature = "std"))]
@@ -41,7 +42,7 @@ use crate::{
     impls::{
         ast_builder,
         function_helpers::{is_function_named, single_quoted_literal},
-        object_name::{quoted_ident, resolve_declared_table},
+        object_name::{quoted_ident, resolve_declared_table, resolve_translation_table},
         translator_impls::{
             column_option::warn_no_inherit_dropped, rls::write_guard_condition_expr,
             statement::negate,
@@ -99,26 +100,7 @@ pub(crate) fn split_clock_checks<'t>(
     let Some(stored) = resolve_declared_table(schema, create_table)? else {
         return Ok(unchanged());
     };
-    let check_options = options.without_subqueries();
-    let mut taken: Vec<(Slot, &CheckConstraint, Expr)> = Vec::new();
-    if !options.is_remove_unsupported_check_constraints_enabled() {
-        for (column_index, column) in create_table.columns.iter().enumerate() {
-            for (option_index, option) in column.options.iter().enumerate() {
-                if let ColumnOption::Check(check) = &option.option
-                    && let Some(condition) = clock_condition(check, schema, &check_options, emit)
-                {
-                    taken.push((Slot::Column(column_index, option_index), check, condition));
-                }
-            }
-        }
-    }
-    for (index, constraint) in create_table.constraints.iter().enumerate() {
-        if let TableConstraint::Check(check) = constraint
-            && let Some(condition) = clock_condition(check, schema, &check_options, emit)
-        {
-            taken.push((Slot::Table(index), check, condition));
-        }
-    }
+    let taken = clock_checks_of(create_table, schema, options, emit);
     if taken.is_empty() {
         return Ok(unchanged());
     }
@@ -156,6 +138,40 @@ enum Slot {
     Table(usize),
 }
 
+/// The checks of `create_table` that leave it for triggers, with their slots
+/// and translated conditions.
+///
+/// A column's check stays for the column translation when the caller drops
+/// every column check, and a check refused there stays to be refused.
+fn clock_checks_of<'t>(
+    create_table: &'t CreateTable,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+    emit: WarningSink<'_>,
+) -> Vec<(Slot, &'t CheckConstraint, Expr)> {
+    let check_options = options.without_subqueries();
+    let mut taken = Vec::new();
+    if !options.is_remove_unsupported_check_constraints_enabled() {
+        for (column_index, column) in create_table.columns.iter().enumerate() {
+            for (option_index, option) in column.options.iter().enumerate() {
+                if let ColumnOption::Check(check) = &option.option
+                    && let Some(condition) = clock_condition(check, schema, &check_options, emit)
+                {
+                    taken.push((Slot::Column(column_index, option_index), check, condition));
+                }
+            }
+        }
+    }
+    for (index, constraint) in create_table.constraints.iter().enumerate() {
+        if let TableConstraint::Check(check) = constraint
+            && let Some(condition) = clock_condition(check, schema, &check_options, emit)
+        {
+            taken.push((Slot::Table(index), check, condition));
+        }
+    }
+    taken
+}
+
 /// The translated condition of `check` when it reads the clock, `None` when it
 /// does not or does not translate.
 ///
@@ -181,6 +197,81 @@ fn clock_condition(
         emit(warning);
     }
     Some(condition)
+}
+
+/// Drops of the triggers enforcing the clock checks of `table` that read one
+/// of `columns`, which PostgreSQL drops along with the column.
+///
+/// `written` is the schema before the drop, still holding the checks.
+///
+/// # Errors
+///
+/// Propagates a failed schema lookup.
+pub(crate) fn dropped_clock_triggers(
+    table: &ObjectName,
+    columns: &[Ident],
+    written: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<Vec<Statement>, Error> {
+    let Some(stored) = resolve_translation_table(written, table)? else {
+        return Ok(Vec::new());
+    };
+    let scope = crate::options::table_column_scope(Some(stored), written);
+    let scoped = scope.as_ref().map(|scope| options.with_scope(scope));
+    // Their warnings reached the caller when the table was created.
+    let taken = clock_checks_of(stored, written, scoped.as_ref().unwrap_or(options), &mut |_| {});
+    if taken.is_empty() {
+        return Ok(Vec::new());
+    }
+    let names = constraint_names(stored, &taken, written)?;
+    let relation = stored.stored_table_name();
+    Ok(taken
+        .iter()
+        .zip(names)
+        .filter(|((_, check, _), _)| columns.iter().any(|column| reads_column(&check.expr, column)))
+        .flat_map(|(_, name)| {
+            [VERB_INSERT, VERB_UPDATE].map(|verb| {
+                Statement::DropTrigger(DropTrigger {
+                    if_exists: false,
+                    trigger_name: ObjectName::from(vec![quoted_ident(&trigger_name(
+                        &relation, &name, verb,
+                    ))]),
+                    table_name: None,
+                    option: None,
+                })
+            })
+        })
+        .collect())
+}
+
+/// Whether `expr` names `column`, bare or qualified.
+fn reads_column(expr: &Expr, column: &Ident) -> bool {
+    let names = |ident: &Ident| {
+        identifiers_match(
+            &ident.value,
+            ident.quote_style.is_some(),
+            &column.value,
+            column.quote_style.is_some(),
+        )
+    };
+    visit_expressions(expr, |node| {
+        match node {
+            Expr::Identifier(ident) if names(ident) => ControlFlow::Break(()),
+            Expr::CompoundIdentifier(parts) if parts.last().is_some_and(names) => {
+                ControlFlow::Break(())
+            }
+            _ => ControlFlow::Continue(()),
+        }
+    })
+    .is_break()
+}
+
+const VERB_INSERT: &str = "insert";
+const VERB_UPDATE: &str = "update";
+
+/// The name of the trigger enforcing `constraint` of `relation` on `verb`.
+fn trigger_name(relation: &str, constraint: &str, verb: &str) -> String {
+    format!("{relation}_{constraint}_{verb}")
 }
 
 /// The names PostgreSQL gives the checks in `taken`, in order.
@@ -230,9 +321,10 @@ impl ClockChecks {
             let message = crate::write_guard::check_violation(&relation, &check.name);
             let trigger = |verb: &str, event: TriggerEvent, condition: Option<Expr>| {
                 ast_builder::trigger(
-                    ObjectName::from(vec![quoted_ident(&format!(
-                        "{relation}_{}_{verb}",
-                        check.name
+                    ObjectName::from(vec![quoted_ident(&trigger_name(
+                        &relation,
+                        &check.name,
+                        verb,
                     ))]),
                     table.clone(),
                     TriggerPeriod::Before,
@@ -242,11 +334,10 @@ impl ClockChecks {
                     vec![ast_builder::raise_statement("ABORT", Some(&message), None)],
                 )
             };
-            // PostgreSQL checks the whole row on every update, whichever
-            // columns it sets.
+            // PostgreSQL rechecks the whole row on any update.
             [
-                trigger("insert", TriggerEvent::Insert, condition.clone()),
-                trigger("update", TriggerEvent::Update(Vec::new()), condition),
+                trigger(VERB_INSERT, TriggerEvent::Insert, condition.clone()),
+                trigger(VERB_UPDATE, TriggerEvent::Update(Vec::new()), condition),
             ]
         })
     }

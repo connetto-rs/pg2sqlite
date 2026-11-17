@@ -62,7 +62,7 @@ use crate::{
         privileges::{RoleTable, names_table_with_backing},
         query_builder::plain_table_with_joins,
         translator_impls::{
-            clock_check::split_clock_checks,
+            clock_check::{dropped_clock_triggers, split_clock_checks},
             column::translate_column_def,
             condition_injection::inject_condition_into_dml_statement,
             nulls_not_distinct::{companion_drops, table_companions},
@@ -506,13 +506,13 @@ fn build_create_table_statements(
     // refused, before the ordinary translation runs.
     let interval_companions =
         crate::impls::interval::ddl::companions(create_table, schema, options)?;
-    // A check reading the clock leaves the table for triggers, which read the
-    // table's columns as the table translation does.
+    // A later DROP COLUMN may strip the table as written of a clock check.
+    let written = options.written_schema().unwrap_or(schema);
     let table_scope =
-        crate::options::table_column_scope(resolve_declared_table(schema, create_table)?, schema);
+        crate::options::table_column_scope(resolve_declared_table(written, create_table)?, written);
     let scoped = table_scope.as_ref().map(|scope| options.with_scope(scope));
     let (checked_table, clock_checks) =
-        split_clock_checks(create_table, schema, scoped.as_ref().unwrap_or(options), emit)?;
+        split_clock_checks(create_table, written, scoped.as_ref().unwrap_or(options), emit)?;
     let translated_table = checked_table.translate_with_warnings(schema, options, emit)?;
     let emitted_table = match rls_statements {
         Some(_) => rename_table_for_rls(&translated_table, options, schema),
@@ -681,6 +681,14 @@ fn translate_alter_table(
         else {
             continue;
         };
+        if let AlterTableOperation::DropColumn { column_names, .. } = operation {
+            statements.extend(dropped_clock_triggers(
+                &alter_table.name,
+                column_names,
+                options.written_schema().unwrap_or(schema),
+                options,
+            )?);
+        }
         // Every field is named rather than spread from the input, so a field
         // added upstream fails to compile here instead of reaching SQLite
         // unexamined. Four of them did exactly that before this was tightened.

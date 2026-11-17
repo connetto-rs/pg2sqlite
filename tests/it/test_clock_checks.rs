@@ -120,6 +120,42 @@ fn a_table_check_qualifying_its_column_raises_its_declared_name() {
     );
 }
 
+fn insert_note(connection: &mut SqliteConnection, id: i32) -> Result<usize, DieselError> {
+    diesel::insert_into(stamped::table)
+        .values((stamped::id.eq(id), stamped::note.eq("x")))
+        .execute(connection)
+}
+
+/// PostgreSQL drops a check along with a column it reads.
+#[test]
+fn dropping_the_column_a_clock_check_reads_drops_the_check() {
+    let mut connection =
+        helpers::apply_default(&format!("{TOLERANT} ALTER TABLE stamped DROP COLUMN started_at;"))
+            .expect("the column drops");
+    insert_note(&mut connection, 1).expect("the table takes rows without the column");
+}
+
+#[test]
+fn dropping_another_column_a_table_clock_check_reads_drops_the_check() {
+    let mut connection = helpers::apply_default(
+        "CREATE TABLE stamped (id INT PRIMARY KEY, started_at TIMESTAMPTZ, note TEXT, \
+         CHECK (started_at <= now() OR note IS NOT NULL)); \
+         ALTER TABLE stamped DROP COLUMN note;",
+    )
+    .expect("the column drops");
+    let ahead = stamp(&mut connection, "+1 hour");
+    insert(&mut connection, 1, Some(&ahead)).expect("the check left with the column");
+}
+
+#[test]
+fn dropping_a_column_no_clock_check_reads_keeps_the_checks() {
+    let mut connection =
+        helpers::apply_default(&format!("{TOLERANT} ALTER TABLE stamped DROP COLUMN note;"))
+            .expect("the column drops");
+    let ahead = stamp(&mut connection, "+1 hour");
+    refusal(insert(&mut connection, 1, Some(&ahead)));
+}
+
 /// PostgreSQL checks every row the table holds when a check arrives, which a
 /// trigger cannot.
 #[test]

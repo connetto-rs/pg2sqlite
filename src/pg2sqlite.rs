@@ -252,9 +252,18 @@ struct PreparedEpoch {
     schema: ParserDB,
     /// Snapshots taken before each column change inside the epoch, which bind
     /// the references written before that change.
-    bindings: Vec<(usize, ParserDB)>,
+    bindings: Vec<ColumnChange>,
     /// Snapshots taken before each `DROP INDEX`, which still hold its indexes.
     before_index_drops: Vec<(usize, ParserDB)>,
+}
+
+/// A statement changing a table's columns, and the schema before it.
+struct ColumnChange {
+    index: usize,
+    before: ParserDB,
+    /// Whether the statement drops a column, so it was written against the
+    /// schema still holding the column and what hangs off it.
+    drops: bool,
 }
 
 impl PreparedEpoch {
@@ -262,16 +271,19 @@ impl PreparedEpoch {
     fn binding(&self, index: usize) -> &ParserDB {
         self.bindings
             .iter()
-            .find(|(change, _)| *change > index)
-            .map_or(&self.schema, |(_, schema)| schema)
+            .find(|change| change.index > index)
+            .map_or(&self.schema, |change| &change.before)
     }
 
     /// The schema statement `index` was written against.
     fn written(&self, index: usize) -> &ParserDB {
-        self.before_index_drops
+        if let Some((_, schema)) = self.before_index_drops.iter().find(|(drop, _)| *drop == index) {
+            return schema;
+        }
+        self.bindings
             .iter()
-            .find(|(drop, _)| *drop == index)
-            .map_or_else(|| self.binding(index), |(_, schema)| schema)
+            .find(|change| change.drops && change.index == index)
+            .map_or_else(|| self.binding(index), |change| &change.before)
     }
 }
 
@@ -446,6 +458,15 @@ impl Pg2Sqlite {
                     | AlterTableOperation::RenameColumn { .. }
             )
         })
+    }
+
+    /// Whether a statement drops a column of a table.
+    fn drops_columns(statement: &Statement) -> bool {
+        let Statement::AlterTable(alter_table) = statement else { return false };
+        alter_table
+            .operations
+            .iter()
+            .any(|operation| matches!(operation, AlterTableOperation::DropColumn { .. }))
     }
 
     fn manifest_statement_needs_translation(statement: &Statement) -> bool {
@@ -703,7 +724,11 @@ impl Pg2Sqlite {
             let mut before_index_drops = Vec::new();
             for (index, statement) in statements[start..schema_end].iter().enumerate() {
                 if Self::changes_columns(statement) {
-                    bindings.push((start + index, input.snapshot()));
+                    bindings.push(ColumnChange {
+                        index: start + index,
+                        before: input.snapshot(),
+                        drops: Self::drops_columns(statement),
+                    });
                 }
                 if matches!(statement, Statement::Drop { object_type: ObjectType::Index, .. }) {
                     before_index_drops.push((start + index, input.snapshot()));
