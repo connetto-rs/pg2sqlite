@@ -250,9 +250,10 @@ impl crate::traits::translator::TranslatorWithContext for CreateTable {
                         None,
                         &key.columns,
                         &self.name,
+                        schema,
                         options,
                         emit,
-                    ) => {}
+                    )? => {}
                 _ => {
                     created_table
                         .constraints

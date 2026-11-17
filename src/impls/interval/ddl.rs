@@ -17,7 +17,7 @@ use crate::{
     errors::Error,
     impls::{
         object_name::{COLUMN_LOOKUP_CASE, last_ident, quoted_ident, resolve_translation_table},
-        translator_impls::insert::postgres_constraint_name,
+        translator_impls::{insert::postgres_constraint_name, off_replica::OffReplica},
     },
     options::TranslationContext,
 };
@@ -137,7 +137,7 @@ pub(crate) fn companions(
         .filter(|column| is_interval_data_type(&column.data_type))
         .map(|column| column.name.value.clone())
         .collect();
-    reject_foreign_keys_over_intervals(create_table, schema, &interval_columns)?;
+    reject_foreign_keys_over_intervals(create_table, schema, &interval_columns, options)?;
     if interval_columns.is_empty() {
         return Ok(Vec::new());
     }
@@ -155,16 +155,17 @@ fn reject_foreign_keys_over_intervals(
     create_table: &CreateTable,
     schema: &ParserDB,
     interval_columns: &[String],
+    options: &TranslationContext<'_>,
 ) -> Result<(), Error> {
     for constraint in &create_table.constraints {
         if let TableConstraint::ForeignKey(fk) = constraint {
-            reject_foreign_key(fk, schema, interval_columns)?;
+            reject_foreign_key(fk, schema, interval_columns, options)?;
         }
     }
     for column in &create_table.columns {
         for option in &column.options {
             if let ColumnOption::ForeignKey(fk) = &option.option {
-                reject_foreign_key(fk, schema, interval_columns)?;
+                reject_foreign_key(fk, schema, interval_columns, options)?;
             }
         }
     }
@@ -172,12 +173,17 @@ fn reject_foreign_keys_over_intervals(
 }
 
 /// Refuses one foreign key whose local or referenced side names an interval
-/// column.
+/// column. A key into a table left off the replica leaves with it and is not
+/// refused.
 fn reject_foreign_key(
     fk: &ForeignKeyConstraint,
     schema: &ParserDB,
     interval_columns: &[String],
+    options: &TranslationContext<'_>,
 ) -> Result<(), Error> {
+    if OffReplica::of(&fk.foreign_table, schema, options)?.is_some() {
+        return Ok(());
+    }
     if fk.columns.iter().any(|column| column_named(interval_columns, &column.value)) {
         return Err(foreign_key_refusal());
     }

@@ -59,7 +59,7 @@ What the engines still answer differently.
 - **Compound `SELECT`.** SQLite types each value, so `SELECT 1 UNION SELECT '1'` returns two rows.
 - **Generated keys.** `SERIAL` and `IDENTITY` become `AUTOINCREMENT`, whose counter moves on a supplied value and does not move on a rollback.
 - **`NULLS NOT DISTINCT`.** A companion index enforces it, so `ON CONFLICT (key) DO UPDATE` aborts on a repeated NULL key.
-- **RLS and grants.** A replica serves one acting role. Blind `UPDATE` and `DELETE` are held to the `SELECT` policies, `SELECT *` returns the readable columns where PostgreSQL refuses, a write-only column is refused as unknown, an `UPDATE` or `DELETE` is refused when the role cannot read the key, a refused write matching no row succeeds, and an explicit `NULL` passes into a column the role may not insert.
+- **RLS and grants.** A replica serves one acting role. Blind `UPDATE` and `DELETE` are held to the `SELECT` policies, `SELECT *` returns the readable columns where PostgreSQL refuses, a write-only column is refused as unknown, an `UPDATE` or `DELETE` is refused when the role cannot read the key, a refused write matching no row succeeds, an explicit `NULL` passes into a column the role may not insert, and a foreign key into a table the role cannot read goes unenforced.
 
 ## License
 

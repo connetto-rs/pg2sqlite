@@ -26,7 +26,7 @@ use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     history::placement::primary_write_target,
-    impls::object_name::last_ident_value_or_display,
+    impls::{object_name::last_ident_value_or_display, translator_impls::off_replica::OffReplica},
     options::TranslationContext,
     traits::schema::written_function,
     warnings::{TranslationWarning, WarningSink},
@@ -268,21 +268,27 @@ fn action_writes_rows(action: Option<ReferentialAction>) -> Option<ReferentialAc
 
 /// Reports and answers `true` when the replica leaves out `key`, declared on
 /// `table` over `columns` and named `name`, because one of its actions writes
-/// child rows the server writes itself.
+/// child rows the server writes itself. A key into a table left off the
+/// replica answers `false`, since it leaves with that table unreported.
 ///
 /// The key goes whole. Kept as `NO ACTION` it would refuse an offline delete
 /// of a parent whose children the server removes, which the replica still
 /// holds until the server's changes reach it.
+///
+/// # Errors
+///
+/// Fails as [`OffReplica::of`] does.
 pub(crate) fn foreign_key_left_to_server(
     key: &ForeignKeyConstraint,
     name: Option<&Ident>,
     columns: &[Ident],
     table: &ObjectName,
+    schema: &ParserDB,
     options: &TranslationContext<'_>,
     emit: WarningSink<'_>,
-) -> bool {
+) -> Result<bool, Error> {
     if !options.is_server_derived_writes_omitted() {
-        return false;
+        return Ok(false);
     }
     let actions: Vec<String> = [
         ("ON DELETE", action_writes_rows(key.on_delete)),
@@ -291,8 +297,8 @@ pub(crate) fn foreign_key_left_to_server(
     .into_iter()
     .filter_map(|(clause, action)| action.map(|action| format!("{clause} {action}")))
     .collect();
-    if actions.is_empty() {
-        return false;
+    if actions.is_empty() || OffReplica::of(&key.foreign_table, schema, options)?.is_some() {
+        return Ok(false);
     }
     let name = name.or(key.name.as_ref()).map_or_else(
         || {
@@ -315,19 +321,24 @@ pub(crate) fn foreign_key_left_to_server(
             actions.join(" and ")
         ),
     });
-    true
+    Ok(true)
 }
 
 /// `column` without the `REFERENCES` options the replica leaves to the
 /// server, or `None` when it leaves out none of them.
+///
+/// # Errors
+///
+/// Fails as [`foreign_key_left_to_server`] does.
 pub(crate) fn column_without_keys_left_to_server(
     column: &ColumnDef,
     table: &ObjectName,
+    schema: &ParserDB,
     options: &TranslationContext<'_>,
     emit: WarningSink<'_>,
-) -> Option<ColumnDef> {
+) -> Result<Option<ColumnDef>, Error> {
     if !options.is_server_derived_writes_omitted() {
-        return None;
+        return Ok(None);
     }
     let mut kept: Option<Vec<_>> = None;
     for (index, option) in column.options.iter().enumerate() {
@@ -337,16 +348,17 @@ pub(crate) fn column_without_keys_left_to_server(
                 option.name.as_ref(),
                 core::slice::from_ref(&column.name),
                 table,
+                schema,
                 options,
                 emit,
-            )
+            )?
         {
             kept.get_or_insert_with(|| column.options[..index].to_vec());
         } else if let Some(kept) = &mut kept {
             kept.push(option.clone());
         }
     }
-    kept.map(|options| {
+    Ok(kept.map(|options| {
         ColumnDef { name: column.name.clone(), data_type: column.data_type.clone(), options }
-    })
+    }))
 }
