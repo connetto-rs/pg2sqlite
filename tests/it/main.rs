@@ -31,6 +31,7 @@ mod test_cast_array_elements;
 mod test_char_length;
 mod test_character_types;
 mod test_check_constraint;
+mod test_clock_checks;
 mod test_collate_translation;
 mod test_column_options;
 mod test_column_scope_typing;

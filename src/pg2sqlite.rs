@@ -296,9 +296,30 @@ struct PreparedEpoch {
     schema: ParserDB,
     /// Snapshots taken before each column change inside the epoch, which bind
     /// the references written before that change.
-    bindings: Vec<(usize, ParserDB)>,
+    bindings: Vec<ColumnChange>,
     /// Snapshots taken before each `DROP INDEX`, which still hold its indexes.
     before_index_drops: Vec<(usize, ParserDB)>,
+}
+
+/// A statement changing a table's columns, and the schema before it.
+struct ColumnChange {
+    index: usize,
+    before: ParserDB,
+    /// Whether the statement drops a column, so it was written against the
+    /// schema still holding the column and what hangs off it.
+    drops: bool,
+}
+
+impl ColumnChange {
+    /// Records `statement`, at `index` of the batch, against the schema
+    /// before it.
+    fn new(index: usize, statement: &Statement, before: ParserDB) -> Self {
+        let drops = matches!(statement, Statement::AlterTable(alter_table) if alter_table
+            .operations
+            .iter()
+            .any(|operation| matches!(operation, AlterTableOperation::DropColumn { .. })));
+        Self { index, before, drops }
+    }
 }
 
 impl PreparedEpoch {
@@ -306,16 +327,19 @@ impl PreparedEpoch {
     fn binding(&self, index: usize) -> &ParserDB {
         self.bindings
             .iter()
-            .find(|(change, _)| *change > index)
-            .map_or(&self.schema, |(_, schema)| schema)
+            .find(|change| change.index > index)
+            .map_or(&self.schema, |change| &change.before)
     }
 
     /// The schema statement `index` was written against.
     fn written(&self, index: usize) -> &ParserDB {
-        self.before_index_drops
+        if let Some((_, schema)) = self.before_index_drops.iter().find(|(drop, _)| *drop == index) {
+            return schema;
+        }
+        self.bindings
             .iter()
-            .find(|(drop, _)| *drop == index)
-            .map_or_else(|| self.binding(index), |(_, schema)| schema)
+            .find(|change| change.drops && change.index == index)
+            .map_or_else(|| self.binding(index), |change| &change.before)
     }
 }
 
@@ -755,7 +779,7 @@ impl Pg2Sqlite {
             )?;
             for (index, statement) in statements[start..schema_end].iter().enumerate() {
                 if Self::changes_columns(statement) {
-                    bindings.push((start + index, input.snapshot()));
+                    bindings.push(ColumnChange::new(start + index, statement, input.snapshot()));
                 }
                 if matches!(statement, Statement::Drop { object_type: ObjectType::Index, .. }) {
                     before_index_drops.push((start + index, input.snapshot()));

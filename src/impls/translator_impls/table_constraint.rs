@@ -15,7 +15,9 @@ use crate::{
         privileges::names_table_with_backing,
         shared_helpers::match_partial_not_supported_error,
         translator_impls::{
-            constraint_characteristic::deferrability_outside_a_foreign_key, off_replica::OffReplica,
+            clock_check::refuse_clock_check,
+            constraint_characteristic::deferrability_outside_a_foreign_key,
+            off_replica::OffReplica,
         },
     },
     traits::translator::TranslatorWithContext,
@@ -169,7 +171,14 @@ fn translate_check_constraint(
         )));
     }
     let options = options.without_subqueries();
-    match check_constraint.expr.translate_with_warnings(schema, &options, emit) {
+    let translated = check_constraint
+        .expr
+        .translate_with_warnings(schema, &options, emit)
+        .and_then(|translated_expr| {
+            refuse_clock_check(&check_constraint.expr, &translated_expr)?;
+            Ok(translated_expr)
+        });
+    match translated {
         Ok(translated_expr) => {
             crate::impls::translator_impls::column_option::warn_no_inherit_dropped(
                 "CHECK ... NO INHERIT",
