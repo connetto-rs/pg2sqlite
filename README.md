@@ -56,6 +56,7 @@ What the engines still answer differently.
 - **Stored representations.** `translation_manifest` reports how each column is stored when that differs from what PostgreSQL returns.
 - **Time.** Timestamps keep milliseconds, `timestamptz` is stored as UTC text with its calendar arithmetic in the request's zone, and a bound parameter is stored as bound. Interval columns behave as in PostgreSQL, apart from the operations that are refused.
 - **Transactions.** A failing statement leaves a SQLite transaction open, so roll back yourself.
+- **Deferred constraint triggers.** Their checks queue until a translated `COMMIT`, or until the `Script::before_commit` statements you run before your own, and an autocommit write that queues one fails.
 - **Compound `SELECT`.** SQLite types each value, so `SELECT 1 UNION SELECT '1'` returns two rows.
 - **Generated keys.** `SERIAL` and `IDENTITY` become `AUTOINCREMENT`, whose counter moves on a supplied value and does not move on a rollback.
 - **`NULLS NOT DISTINCT`.** A companion index enforces it, so `ON CONFLICT (key) DO UPDATE` aborts on a repeated NULL key.

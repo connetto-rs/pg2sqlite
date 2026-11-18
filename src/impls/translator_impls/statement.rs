@@ -1279,11 +1279,15 @@ fn translate_start_transaction(
 /// it outside any transaction and a later `ROLLBACK` with nothing to undo.
 /// Emitting the `BEGIN` reproduces it, minus characteristics SQLite does not
 /// have anyway.
+///
+/// Where the translation unit declares a deferred constraint trigger, its
+/// queued checks run first, which is when PostgreSQL runs them.
 fn translate_commit(
     statement: &Statement,
     chain: bool,
     end: bool,
     modifier: Option<TransactionModifier>,
+    drains_deferred_checks: bool,
 ) -> Result<Vec<Statement>, Error> {
     if let Some(TransactionModifier::Try | TransactionModifier::Catch) = modifier {
         return Err(reject_unsupported_statement(
@@ -1293,7 +1297,9 @@ fn translate_commit(
     }
 
     // `END` is SQLite's own synonym for `COMMIT`, so the spelling survives.
-    let mut translated = vec![Statement::Commit { chain: false, end, modifier: None }];
+    let mut translated: Vec<Statement> =
+        drains_deferred_checks.then(super::deferred_constraint::drain).into_iter().collect();
+    translated.push(Statement::Commit { chain: false, end, modifier: None });
     if chain {
         translated.push(sqlite_begin(None));
     }
@@ -1740,15 +1746,19 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
                     return Ok(Vec::new());
                 }
 
-                let mut statements = vec![];
-                append_translated_create_trigger_statements(
-                    &mut statements,
-                    create_trigger,
-                    schema,
-                    options,
-                    emit,
-                )?;
-                statements
+                if super::deferred_constraint::is_deferred(create_trigger) {
+                    super::deferred_constraint::translate(create_trigger, schema, options, emit)?
+                } else {
+                    let mut statements = vec![];
+                    append_translated_create_trigger_statements(
+                        &mut statements,
+                        create_trigger,
+                        schema,
+                        options,
+                        emit,
+                    )?;
+                    statements
+                }
             }
             Self::Insert(insert) => {
                 vec![insert.translate_with_warnings(schema, options, emit)?.into()]
@@ -1873,7 +1883,13 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
                 )?
             }
             Self::Commit { chain, end, modifier } => {
-                translate_commit(self, *chain, *end, *modifier)?
+                translate_commit(
+                    self,
+                    *chain,
+                    *end,
+                    *modifier,
+                    !options.deferred_triggers().is_empty(),
+                )?
             }
             Self::Rollback { chain, savepoint } => translate_rollback(*chain, savepoint.as_ref()),
             Self::Vacuum(vacuum) => translate_vacuum(vacuum, emit),
@@ -1925,6 +1941,16 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
                         }];
                         if *object_type == ObjectType::Index {
                             statements.extend(companion_drops(&kept, written));
+                        }
+                        if *object_type == ObjectType::Table {
+                            // SQLite leaves a deferred queue table behind.
+                            statements.extend(
+                                options
+                                    .deferred_triggers()
+                                    .iter()
+                                    .filter(|trigger| names.iter().any(|name| trigger.is_on(name)))
+                                    .map(|trigger| trigger.drop_payload(true)),
+                            );
                         }
                         statements
                     }
@@ -1980,6 +2006,13 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
                     && OffReplica::of(table_name, schema, options)?.is_some()
                 {
                     return Ok(Vec::new());
+                }
+                let deferred = options.deferred_triggers().iter().find(|trigger| {
+                    trigger.is_named(&drop_trigger.trigger_name)
+                        && drop_trigger.table_name.as_ref().is_none_or(|table| trigger.is_on(table))
+                });
+                if let Some(deferred) = deferred {
+                    return Ok(deferred.drop_statements(drop_trigger.if_exists));
                 }
                 let left_to_server = last_ident(&drop_trigger.trigger_name)
                     .is_some_and(|name| options.is_server_derived_trigger_name(&name.value));

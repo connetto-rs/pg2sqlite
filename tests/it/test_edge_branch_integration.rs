@@ -331,13 +331,6 @@ fn create_trigger_translation_rejects_unsupported_shapes_and_handles_missing_fun
             .contains("OR ALTER")
     );
 
-    let mut constraint = base.clone();
-    constraint.is_constraint = true;
-    assert!(
-        unsupported_message(constraint.translate(&schema, &options).unwrap_err())
-            .contains("Constraint triggers")
-    );
-
     let mut with_characteristics = base;
     with_characteristics.characteristics = Some(ConstraintCharacteristics::default());
     assert!(
