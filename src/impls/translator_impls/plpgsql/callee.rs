@@ -1,0 +1,616 @@
+//! A PL/pgSQL helper a trigger body calls, run as the helper's body written
+//! where the call stands.
+//!
+//! `PERFORM f(...)` runs the body for its effects, and a call in an `IF`
+//! condition runs it before the condition is tested, the condition reading
+//! what the body returned. The body is translated in a scope of its own, its
+//! parameters bound to the caller's arguments, its statements guarded by the
+//! caller's conditions, and as its owner when it is `SECURITY DEFINER`.
+//! A `RETURN` ends the body, so the statements after one move into the
+//! branches that do not return before the body is translated.
+
+use core::ops::ControlFlow;
+
+use sql_traits::{
+    structs::ParserDB,
+    traits::{FunctionLike, RoleLike},
+};
+use sqlparser::{
+    ast::{
+        BinaryOperator, CreateFunction, Expr, Function, FunctionArguments, FunctionReturnType,
+        FunctionSecurity, ObjectName, SetExpr, Statement, UnaryOperator, Value, visit_expressions,
+        visit_expressions_mut, visit_relations,
+    },
+    tokenizer::Span,
+};
+use sqlparser_plpgsql::embedded::{self, Block, If, Node, NodeKind, Raise, RaiseLevel};
+
+use super::{
+    scope::{Binding, BodyScope, BoundValue, fold},
+    translator::{FOUND, PlPgSqlTranslator, bare_identifier},
+};
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
+use crate::{
+    errors::Error,
+    impls::translator_impls::{
+        definer,
+        sql_helper::{self, Arguments, check_call_privileges, declared_helper, refusal},
+    },
+    options::TranslationContext,
+    traits::Schema,
+    warnings::WarningSink,
+};
+
+/// The binding a `RETURN` in a helper's body assigns its value to. Upper case,
+/// so no unquoted name in the body folds to it.
+const RESULT: &str = "RESULT";
+
+/// The PL/pgSQL function the schema declares under the name `call` calls.
+fn plpgsql_helper<'s>(
+    call: &Function,
+    schema: &'s ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<Option<&'s CreateFunction>, Error> {
+    Ok(declared_helper(&call.name, schema, options)?
+        .filter(|helper| helper.stored_language().as_deref() == Some("plpgsql")))
+}
+
+/// What a helper's body contributes where it is called.
+struct Inlined {
+    /// The body's statements, guarded by the caller's conditions.
+    statements: Vec<Statement>,
+    /// The value the body returns, read by the caller, `None` for a `VOID`
+    /// helper.
+    result: Option<BoundValue>,
+}
+
+impl PlPgSqlTranslator {
+    /// The statements `PERFORM <query>` runs when the query calls a PL/pgSQL
+    /// helper, `None` when it calls none.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a query calling a helper other than as `PERFORM f(...)` alone,
+    /// and a helper whose body does not inline.
+    pub(super) fn perform_helper(
+        statement: &Statement,
+        scope: &mut BodyScope,
+        schema: &ParserDB,
+        options: &TranslationContext<'_>,
+        emit: WarningSink<'_>,
+    ) -> Result<Option<Vec<Statement>>, Error> {
+        let Statement::Query(query) = statement else { return Ok(None) };
+        let Some(called) = first_helper_call(statement, schema, options)? else {
+            return Ok(None);
+        };
+        let lone = matches!(query.body.as_ref(), SetExpr::Select(_))
+            .then(|| embedded::expression(query))
+            .and_then(|expression| {
+                match expression.as_ref() {
+                    Expr::Function(call) => Some(call.clone()),
+                    _ => None,
+                }
+            });
+        let Some((call, helper)) = lone
+            .map(|call| plpgsql_helper(&call, schema, options).map(|helper| (call, helper)))
+            .transpose()?
+            .and_then(|(call, helper)| helper.map(|helper| (call, helper)))
+        else {
+            return Err(refusal(
+                &called,
+                "is called by a PERFORM that runs it once per row of its FROM, or beside other \
+                 expressions, and only PERFORM f(...) alone runs as the helper's body",
+            ));
+        };
+        let inlined = Self::inline_call(&call, helper, scope, schema, options, emit)?;
+        if scope.tracks_found {
+            // `SELECT f(...)` answers one row.
+            scope.bind(Binding {
+                name: FOUND.to_string(),
+                value: BoundValue::Expr(Expr::Value(Value::Boolean(true).with_empty_span())),
+            });
+        }
+        Ok(Some(inlined.statements))
+    }
+
+    /// The statements of the PL/pgSQL helpers `condition` calls, each call
+    /// replaced by the value its body returns.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a call PostgreSQL may skip, one returning no value, and a
+    /// helper whose body does not inline.
+    pub(super) fn inline_condition_calls(
+        condition: &mut Expr,
+        scope: &mut BodyScope,
+        schema: &ParserDB,
+        options: &TranslationContext<'_>,
+        emit: WarningSink<'_>,
+    ) -> Result<Vec<Statement>, Error> {
+        let mut statements = Vec::new();
+        Self::inline_calls_in(condition, true, &mut statements, scope, schema, options, emit)?;
+        Ok(statements)
+    }
+
+    /// Replaces each helper call in `expr` by its returned value, pushing the
+    /// statements of its body to `statements`. `evaluated` tells whether
+    /// PostgreSQL evaluates `expr` whenever it tests the condition.
+    fn inline_calls_in(
+        expr: &mut Expr,
+        evaluated: bool,
+        statements: &mut Vec<Statement>,
+        scope: &mut BodyScope,
+        schema: &ParserDB,
+        options: &TranslationContext<'_>,
+        emit: WarningSink<'_>,
+    ) -> Result<(), Error> {
+        let mut inline = |expr: &mut Expr, evaluated: bool, scope: &mut BodyScope| {
+            Self::inline_calls_in(expr, evaluated, statements, scope, schema, options, emit)
+        };
+        match expr {
+            Expr::Function(call) => {
+                let Some(helper) = plpgsql_helper(call, schema, options)? else {
+                    return refuse_skippable_calls(&*call, schema, options);
+                };
+                if !evaluated {
+                    return Err(refusal(
+                        &call.name,
+                        "is called where PostgreSQL may skip evaluating the call, and its body \
+                         would run every time",
+                    ));
+                }
+                // PostgreSQL evaluates the arguments first.
+                if let FunctionArguments::List(list) = &mut call.args {
+                    for argument in &mut list.args {
+                        let argument = match argument {
+                            sqlparser::ast::FunctionArg::Unnamed(argument)
+                            | sqlparser::ast::FunctionArg::Named { arg: argument, .. }
+                            | sqlparser::ast::FunctionArg::ExprNamed { arg: argument, .. } => {
+                                argument
+                            }
+                        };
+                        if let sqlparser::ast::FunctionArgExpr::Expr(argument) = argument {
+                            inline(argument, true, scope)?;
+                        }
+                    }
+                }
+                let inlined = Self::inline_call(call, helper, scope, schema, options, emit)?;
+                let value = match inlined.result {
+                    Some(BoundValue::Expr(value)) => value,
+                    Some(BoundValue::Unreadable(reason)) => {
+                        return Err(refusal(
+                            &call.name,
+                            &format!("returns a value the condition cannot read. {reason}"),
+                        ));
+                    }
+                    None => {
+                        return Err(refusal(
+                            &call.name,
+                            "returns no value, which PostgreSQL refuses to test",
+                        ));
+                    }
+                };
+                statements.extend(inlined.statements);
+                *expr = Expr::Nested(Box::new(value));
+                Ok(())
+            }
+            Expr::Nested(inner)
+            | Expr::UnaryOp {
+                op: UnaryOperator::Not | UnaryOperator::Minus | UnaryOperator::Plus,
+                expr: inner,
+            }
+            | Expr::IsTrue(inner)
+            | Expr::IsNotTrue(inner)
+            | Expr::IsFalse(inner)
+            | Expr::IsNotFalse(inner)
+            | Expr::IsNull(inner)
+            | Expr::IsNotNull(inner)
+            | Expr::IsUnknown(inner)
+            | Expr::IsNotUnknown(inner) => inline(inner, evaluated, scope),
+            // The right operand of AND and OR is skipped once the left one
+            // decides.
+            Expr::BinaryOp { left, op: BinaryOperator::And | BinaryOperator::Or, right } => {
+                inline(left, evaluated, scope)?;
+                inline(right, false, scope)
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                inline(left, evaluated, scope)?;
+                inline(right, evaluated, scope)
+            }
+            other => refuse_skippable_calls(other, schema, options),
+        }
+    }
+
+    /// The body of `helper`, called by `call` where `scope` stands.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a recursive call, a call PostgreSQL would refuse, a helper
+    /// returning a set or declared `STRICT`, and a body that does not
+    /// translate.
+    fn inline_call(
+        call: &Function,
+        helper: &CreateFunction,
+        scope: &mut BodyScope,
+        schema: &ParserDB,
+        options: &TranslationContext<'_>,
+        emit: WarningSink<'_>,
+    ) -> Result<Inlined, Error> {
+        let name = &call.name;
+        let identity = helper.name.to_string();
+        if scope.inlines(&identity) {
+            return Err(refusal(name, "calls itself, directly or through other functions"));
+        }
+        if call.over.is_some()
+            || call.filter.is_some()
+            || call.null_treatment.is_some()
+            || !call.within_group.is_empty()
+            || !matches!(call.parameters, FunctionArguments::None)
+        {
+            return Err(refusal(
+                name,
+                "carries a clause only an aggregate or a window function takes",
+            ));
+        }
+        if helper.returns_set() {
+            return Err(refusal(
+                name,
+                "returns a set, whose rows a trigger body has nowhere to keep",
+            ));
+        }
+        if !matches!(
+            helper.null_input_behavior(),
+            sqlparser::ast::FunctionCalledOnNull::CalledOnNullInput
+        ) {
+            return Err(refusal(
+                name,
+                "is STRICT, so PostgreSQL skips its body for a NULL argument, which the inlined \
+                 body does not test",
+            ));
+        }
+        check_call_privileges(name, helper, schema, options)?;
+        let (body, returns_value) = callee_body(name, helper, schema)?;
+
+        let mut callee = scope.for_callee(identity.clone());
+        let mut parameters = Vec::new();
+        for (parameter, value) in Arguments::of(call, helper)?.into_parameters() {
+            let Some(parameter) = parameter else {
+                return Err(refusal(
+                    name,
+                    "declares a parameter only $n reaches, which the inlined body cannot bind",
+                ));
+            };
+            // The arguments are the caller's expressions, so their own calls
+            // run as the caller and read the caller's variables.
+            let value = sql_helper::inlined_calls(&value, schema, options)?;
+            let value = resolved(value, scope)?;
+            let parameter = fold(parameter);
+            callee.declare(&parameter);
+            callee.bind_persistent(Binding {
+                name: parameter.clone(),
+                value: BoundValue::Expr(value),
+            });
+            parameters.push(parameter);
+        }
+        Self::open_body(&body, &mut callee, options)?;
+
+        let owner = match helper.security_mode() {
+            FunctionSecurity::Definer => Some(sql_helper::owner(name, helper, schema)?),
+            FunctionSecurity::Invoker => None,
+        };
+        let running_as = owner.map(|owner| options.with_running_as(owner));
+        let body_options = running_as.as_ref().unwrap_or(options);
+        let variables: Vec<String> =
+            callee.bindings().map(|binding| binding.name.clone()).collect();
+        let mut statements = Self::evaluate_assigned(
+            &parameters,
+            &callee,
+            schema,
+            &body_options.with_variables(&variables),
+            emit,
+        )?;
+        statements.extend(Self::translate_block(
+            &identity,
+            &body,
+            &mut callee,
+            schema,
+            body_options,
+            emit,
+        )?);
+        // A definer body running as a role other than the caller's reads and
+        // writes as its owner. Under the same role the caller's own pass does.
+        let other_owner = owner.filter(|owner| {
+            options.running_as().is_none_or(|running| running.name() != owner.name())
+        });
+        if let Some(owner) = other_owner {
+            statements = definer::run_as_owner(helper, owner, statements, schema, options)?;
+        }
+
+        for relation in callee.written() {
+            scope.invalidate_readers(relation, schema);
+        }
+        let result = returns_value.then(|| returned_value(&callee, other_owner.is_some()));
+        Ok(Inlined { statements, result })
+    }
+
+    /// Translates `RETURN <value>` in a helper's body, which binds the value
+    /// the caller reads. What follows a `RETURN` was moved into the branches
+    /// that do not return, so nothing after it runs.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a returned value that does not translate.
+    pub(super) fn callee_return(
+        value: Option<&sqlparser::ast::Query>,
+        scope: &mut BodyScope,
+        schema: &ParserDB,
+        options: &TranslationContext<'_>,
+        emit: WarningSink<'_>,
+    ) -> Result<Vec<Statement>, Error> {
+        let Some(value) = value else { return Ok(Vec::new()) };
+        let value =
+            Self::fold_trigger_specials_in(embedded::expression(value).into_owned(), &scope.facts)?;
+        scope.bind(Binding { name: RESULT.to_string(), value: BoundValue::Expr(value) });
+        // PostgreSQL computes the value where it returns, so one that may
+        // raise runs there.
+        Self::evaluate_assigned(&[RESULT.to_string()], scope, schema, options, emit)
+    }
+}
+
+/// `helper`'s body, called as `name`, with no statement after a `RETURN`,
+/// and whether it returns a value, a body returning one raising where it
+/// runs off its end as PostgreSQL does.
+fn callee_body(
+    name: &ObjectName,
+    helper: &CreateFunction,
+    schema: &ParserDB,
+) -> Result<(Block, bool), Error> {
+    let Some(mut body) = schema.function_body(name)? else {
+        return Err(refusal(name, "has no body"));
+    };
+    let returns_value = !matches!(
+        &helper.return_type,
+        Some(FunctionReturnType::DataType(returned))
+            if returned.to_string().eq_ignore_ascii_case("void")
+    );
+    body.statements = without_early_returns(core::mem::take(&mut body.statements));
+    if returns_value {
+        body.statements = with_continuation(
+            core::mem::take(&mut body.statements),
+            &[Node {
+                kind: NodeKind::Raise(Raise {
+                    level: RaiseLevel::Exception,
+                    condition: None,
+                    format: Some("control reached end of function without RETURN".to_string()),
+                    arguments: Vec::new(),
+                    options: Vec::new(),
+                }),
+                span: Span::empty(),
+            }],
+        );
+    }
+    Ok((body, returns_value))
+}
+
+/// The value an inlined body bound for its caller, unreadable when it reads a
+/// relation `as_other_owner` and the caller's condition would read it as the
+/// caller.
+fn returned_value(callee: &BodyScope, as_other_owner: bool) -> BoundValue {
+    let returned = callee.bindings().find(|binding| binding.name == RESULT);
+    match returned.map(|binding| binding.value.clone()) {
+        Some(BoundValue::Expr(value)) => {
+            match resolved(value, callee) {
+                Ok(value) if as_other_owner && reads_relation(&value) => {
+                    BoundValue::Unreadable(
+                        "reads a relation as the function's owner, which the caller's condition \
+                         would read as the caller"
+                            .to_string(),
+                    )
+                }
+                Ok(value) => BoundValue::Expr(value),
+                Err(error) => BoundValue::Unreadable(error.to_string()),
+            }
+        }
+        Some(unreadable) => unreadable,
+        None => BoundValue::Expr(Expr::Value(Value::Null.with_empty_span())),
+    }
+}
+
+/// The name of the first PL/pgSQL helper `node` calls.
+fn first_helper_call<N: sqlparser::ast::Visit>(
+    node: &N,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<Option<ObjectName>, Error> {
+    let flow = visit_expressions(node, |expr| {
+        let Expr::Function(call) = expr else { return ControlFlow::Continue(()) };
+        match plpgsql_helper(call, schema, options) {
+            Ok(Some(_)) => ControlFlow::Break(Ok(call.name.clone())),
+            Ok(None) => ControlFlow::Continue(()),
+            Err(error) => ControlFlow::Break(Err(error)),
+        }
+    });
+    match flow {
+        ControlFlow::Break(found) => found.map(Some),
+        ControlFlow::Continue(()) => Ok(None),
+    }
+}
+
+/// Refuses a PL/pgSQL helper `node` calls where PostgreSQL may skip the
+/// call or run it once per row.
+fn refuse_skippable_calls<N: sqlparser::ast::Visit>(
+    node: &N,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<(), Error> {
+    match first_helper_call(node, schema, options)? {
+        Some(name) => {
+            Err(refusal(
+                &name,
+                "is called where PostgreSQL may skip the call or make it once per row, and its \
+                 body would run once every time",
+            ))
+        }
+        None => Ok(()),
+    }
+}
+
+/// Whether `expr` reads a table or a view.
+fn reads_relation(expr: &Expr) -> bool {
+    visit_relations(expr, |_| ControlFlow::Break(())).is_break()
+}
+
+/// `expr` with every variable `scope` binds written as the value it holds,
+/// and every declared variable it leaves unbound as `NULL`, so it reads the
+/// same outside the scope.
+///
+/// # Errors
+///
+/// Refuses `expr` when it reads a variable the scope cannot compute.
+fn resolved(mut expr: Expr, scope: &BodyScope) -> Result<Expr, Error> {
+    let bindings: Vec<Binding> = scope.bindings().cloned().collect();
+    let mut values: Vec<(String, BoundValue)> = Vec::with_capacity(bindings.len());
+    for binding in PlPgSqlTranslator::order_bindings_by_dependency(&bindings) {
+        // A scoped binding comes first and shadows the persistent one.
+        if values.iter().any(|(name, _)| *name == binding.name) {
+            continue;
+        }
+        let value = match &binding.value {
+            BoundValue::Expr(value) => {
+                let mut value = value.clone();
+                match substitute(&mut value, &values) {
+                    Ok(()) => BoundValue::Expr(value),
+                    Err(reason) => BoundValue::Unreadable(reason.to_string()),
+                }
+            }
+            unreadable @ BoundValue::Unreadable(_) => unreadable.clone(),
+        };
+        values.push((binding.name.clone(), value));
+    }
+    substitute(&mut expr, &values)?;
+    PlPgSqlTranslator::null_unbound_declarations(&mut expr, scope, &bindings);
+    Ok(expr)
+}
+
+/// Writes each read of a name `values` binds in `expr` as its value.
+fn substitute(expr: &mut Expr, values: &[(String, BoundValue)]) -> Result<(), Error> {
+    let flow = visit_expressions_mut(expr, |expr| {
+        let Some(name) = bare_identifier(expr).map(fold) else { return ControlFlow::Continue(()) };
+        match values.iter().find(|(bound, _)| *bound == name).map(|(_, value)| value) {
+            Some(BoundValue::Expr(value)) => {
+                *expr = Expr::Nested(Box::new(value.clone()));
+                ControlFlow::Continue(())
+            }
+            Some(BoundValue::Unreadable(reason)) => ControlFlow::Break(reason.clone()),
+            None => ControlFlow::Continue(()),
+        }
+    });
+    match flow {
+        ControlFlow::Break(reason) => Err(Error::forward_refusal(reason)),
+        ControlFlow::Continue(()) => Ok(()),
+    }
+}
+
+/// `nodes` with what follows each `RETURN`, and each `IF` or block that may
+/// return, moved into the paths that do not return, so every `RETURN` ends
+/// the list it sits in.
+fn without_early_returns(nodes: Vec<Node>) -> Vec<Node> {
+    with_continuation(nodes, &[])
+}
+
+/// `nodes` followed by `continuation`, run on every path that does not
+/// return, with no node after a `RETURN`. `continuation` already has none.
+fn with_continuation(nodes: Vec<Node>, continuation: &[Node]) -> Vec<Node> {
+    let mut result = Vec::with_capacity(nodes.len() + continuation.len());
+    let mut nodes = nodes.into_iter();
+    while let Some(node) = nodes.next() {
+        let rest = || with_continuation(nodes.as_slice().to_vec(), continuation);
+        let Node { kind, span } = node;
+        match kind {
+            NodeKind::Return { .. } => {
+                result.push(Node { kind, span });
+                return result;
+            }
+            NodeKind::If(conditional) if may_return_in(&conditional) => {
+                let rest = rest();
+                let If { branches, otherwise } = conditional;
+                let branches = branches
+                    .into_iter()
+                    .map(|mut branch| {
+                        branch.statements = with_continuation(branch.statements, &rest);
+                        branch
+                    })
+                    .collect();
+                let otherwise = with_continuation(otherwise, &rest);
+                result.push(Node { kind: NodeKind::If(If { branches, otherwise }), span });
+                return result;
+            }
+            NodeKind::Block(block) if block.statements.iter().any(may_return) => {
+                let rest = rest();
+                let Block { label, declarations, statements, handlers } = block;
+                let statements = with_continuation(statements, &rest);
+                let block = Block { label, declarations, statements, handlers };
+                result.push(Node { kind: NodeKind::Block(block), span });
+                return result;
+            }
+            kind => result.push(Node { kind, span }),
+        }
+    }
+    result.extend(continuation.iter().cloned());
+    result
+}
+
+/// Whether `node` holds a `RETURN` on some path through it.
+fn may_return(node: &Node) -> bool {
+    match &node.kind {
+        NodeKind::Return { .. } => true,
+        NodeKind::If(conditional) => may_return_in(conditional),
+        NodeKind::Block(block) => block.statements.iter().any(may_return),
+        _ => false,
+    }
+}
+
+/// Whether a branch of `conditional` holds a `RETURN`.
+fn may_return_in(conditional: &If) -> bool {
+    conditional
+        .branches
+        .iter()
+        .flat_map(|branch| &branch.statements)
+        .chain(&conditional.otherwise)
+        .any(may_return)
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlparser_plpgsql::embedded::embedded_sql;
+
+    use super::*;
+
+    fn statements(body: &str) -> Vec<Node> {
+        embedded_sql(body).expect("the body parses").statements
+    }
+
+    /// The statements after an `IF` that returns run only on the branches
+    /// that do not, and a `RETURN` ends its list.
+    #[test]
+    fn what_follows_a_return_moves_into_the_branches_that_do_not_return() {
+        let moved = without_early_returns(statements(
+            "BEGIN
+                 IF a THEN RETURN; ELSIF b THEN PERFORM 1; END IF;
+                 PERFORM 2;
+                 RETURN;
+                 PERFORM 3;
+             END",
+        ));
+        let expected = statements(
+            "BEGIN
+                 IF a THEN RETURN;
+                 ELSIF b THEN PERFORM 1; PERFORM 2; RETURN;
+                 ELSE PERFORM 2; RETURN;
+                 END IF;
+             END",
+        );
+        assert_eq!(moved, expected);
+    }
+}

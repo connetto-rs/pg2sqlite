@@ -162,6 +162,11 @@ pub(crate) struct BodyScope {
     /// The relations written under each enclosing `IF`, innermost last.
     writes_under_if: Vec<BTreeSet<String>>,
     uuid_first_use: BTreeMap<String, UuidFirstUse>,
+    /// Every relation the body wrote, views expanded.
+    written: BTreeSet<String>,
+    /// The helpers whose bodies are inlined to reach this one, outermost
+    /// first, empty for a trigger function's own body.
+    inlining: Vec<String>,
     /// The trigger the body is translated for.
     pub(crate) facts: TriggerFacts,
     /// Whether the body reads `FOUND`, so each statement that sets it binds
@@ -173,6 +178,36 @@ impl BodyScope {
     /// An empty scope for a body translated for `facts`.
     pub(crate) fn new(facts: TriggerFacts) -> Self {
         Self { facts, ..Self::default() }
+    }
+
+    /// An empty scope for the body of the helper `function`, called where
+    /// this scope stands, so its statements run under the guards in force
+    /// here. The helper sees none of this body's variables, nor the trigger's
+    /// rows.
+    pub(crate) fn for_callee(&self, function: String) -> Self {
+        let mut inlining = self.inlining.clone();
+        inlining.push(function);
+        Self {
+            conditions: self.conditions.clone(),
+            writes_under_if: self.writes_under_if.clone(),
+            inlining,
+            ..Self::default()
+        }
+    }
+
+    /// Whether this scope translates a helper's body inlined into a trigger.
+    pub(crate) fn is_callee(&self) -> bool {
+        !self.inlining.is_empty()
+    }
+
+    /// Whether `function`'s body is already being inlined to reach this one.
+    pub(crate) fn inlines(&self, function: &str) -> bool {
+        self.inlining.iter().any(|inlined| inlined == function)
+    }
+
+    /// Every relation the body wrote, views expanded.
+    pub(crate) fn written(&self) -> &BTreeSet<String> {
+        &self.written
     }
 
     /// Records `name`, folded, as declared, so a read of it before any
@@ -224,11 +259,13 @@ impl BodyScope {
 
     /// Makes every binding whose value reads `relation` unreadable, since a
     /// read after the write would compute it again over the written rows.
-    /// The write is also recorded against every enclosing `IF`.
+    /// The write is also recorded against every enclosing `IF`, and among
+    /// the relations the body wrote.
     pub(crate) fn invalidate_readers(&mut self, relation: &str, schema: &ParserDB) {
         for writes in &mut self.writes_under_if {
             writes.insert(relation.to_string());
         }
+        self.written.insert(relation.to_string());
         for binding in self.scoped.values_mut().chain(self.persistent.values_mut()) {
             if binding.reads(relation, schema) {
                 binding.value = BoundValue::Unreadable(format!(

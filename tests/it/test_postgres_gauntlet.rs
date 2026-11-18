@@ -104,3 +104,6 @@ mod parity_maintenance_reentry;
 mod parity_new_assignments;
 #[path = "gauntlet/parity_trigger_body_statements.rs"]
 mod parity_trigger_body_statements;
+
+#[path = "gauntlet/parity_perform_helpers.rs"]
+mod parity_perform_helpers;

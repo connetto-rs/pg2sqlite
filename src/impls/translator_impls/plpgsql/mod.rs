@@ -6,6 +6,7 @@
 //! UUID variables are regenerated per INSERT via the `last_insert_rowid()`
 //! pattern.
 
+mod callee;
 mod cte_builder;
 pub(crate) use cte_builder::VARIABLE_VALUE_COLUMN;
 mod raise;

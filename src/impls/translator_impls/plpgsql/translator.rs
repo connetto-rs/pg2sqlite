@@ -40,7 +40,7 @@ use crate::{
 pub struct PlPgSqlTranslator;
 
 /// The variable PostgreSQL sets after each query and data change.
-const FOUND: &str = "found";
+pub(super) const FOUND: &str = "found";
 
 /// `SELECT RAISE(IGNORE)`, SQLite's way for a BEFORE trigger to cancel the
 /// write it was fired for.
@@ -171,6 +171,35 @@ impl PlPgSqlTranslator {
         options: &crate::options::TranslationContext<'_>,
         emit: crate::warnings::WarningSink<'_>,
     ) -> Result<Vec<Statement>, Error> {
+        let mut scope = BodyScope::new(facts);
+        Self::open_body(block, &mut scope, options)?;
+
+        if let Some(guard) = guard {
+            let folded = Self::fold_trigger_specials_in(guard.clone(), &scope.facts)?;
+            let translated = Self::translate_condition(&folded, &scope, schema, options, emit)?;
+            scope.begin_if();
+            scope.push_condition(translated);
+        }
+
+        let mut result = Self::translate_block(function, block, &mut scope, schema, options, emit)?;
+        for statement in &mut result {
+            let _: ControlFlow<()> = VisitMut::visit(statement, &mut UnreadCtePruner);
+        }
+        Ok(result)
+    }
+
+    /// Prepares `scope` for the body `block` of one function. A `uuidv7()`
+    /// the destination does not provide is refused, and `FOUND` is bound false
+    /// when the body reads it.
+    ///
+    /// # Errors
+    /// Returns an error for an undeclared `uuidv7()` and for a `found` a
+    /// nested block declares.
+    pub(super) fn open_body(
+        block: &Block,
+        scope: &mut BodyScope,
+        options: &crate::options::TranslationContext<'_>,
+    ) -> Result<(), Error> {
         let mut survey = Survey::default();
         survey.block(block);
         // Later sites swallow a refusal from a `uuidv7()` they meet, so the
@@ -180,8 +209,6 @@ impl PlPgSqlTranslator {
                 crate::impls::translator_impls::function::uuid_v7_not_declared(),
             ));
         }
-
-        let mut scope = BodyScope::new(facts);
         if survey.reads_found && survey.declares_found {
             // A `found` declared in the outermost block shadows the one
             // PostgreSQL sets everywhere, and one declared in a nested block
@@ -200,23 +227,11 @@ impl PlPgSqlTranslator {
                 value: BoundValue::Expr(Expr::Value(Value::Boolean(false).with_empty_span())),
             });
         }
-
-        if let Some(guard) = guard {
-            let folded = Self::fold_trigger_specials_in(guard.clone(), &scope.facts)?;
-            let translated = Self::translate_condition(&folded, &scope, schema, options, emit)?;
-            scope.begin_if();
-            scope.push_condition(translated);
-        }
-
-        let mut result = Self::translate_block(function, block, &mut scope, schema, options, emit)?;
-        for statement in &mut result {
-            let _: ControlFlow<()> = VisitMut::visit(statement, &mut UnreadCtePruner);
-        }
-        Ok(result)
+        Ok(())
     }
 
     /// Translates `block`, its declarations then its statements, in `scope`.
-    fn translate_block(
+    pub(super) fn translate_block(
         function: &str,
         block: &Block,
         scope: &mut BodyScope,
@@ -338,6 +353,9 @@ impl PlPgSqlTranslator {
             }
             NodeKind::Perform { query } => {
                 let query = Self::fold_trigger_specials_in(query.as_ref().clone(), &scope.facts)?;
+                if let Some(inlined) = Self::perform_helper(&query, scope, schema, options, emit)? {
+                    return Ok(inlined);
+                }
                 Self::translate_statement(&query, scope, schema, options, emit)
             }
             NodeKind::ReturnNext { .. } | NodeKind::ReturnQuery(_) => {
@@ -358,6 +376,9 @@ impl PlPgSqlTranslator {
             }
             NodeKind::If(conditional) => {
                 Self::translate_if(function, conditional, scope, schema, options, emit)
+            }
+            NodeKind::Return { value } if scope.is_callee() => {
+                Self::callee_return(value.as_deref(), scope, schema, options, emit)
             }
             NodeKind::Return { value } => {
                 Self::translate_return(value.as_deref(), scope, schema, options, emit)
@@ -511,7 +532,7 @@ impl PlPgSqlTranslator {
     /// variable nothing reads and too late for one read after a veto. A value
     /// that does not translate is refused here, since whether it raises is
     /// unknown.
-    fn evaluate_assigned(
+    pub(super) fn evaluate_assigned(
         assigned: &[String],
         scope: &BodyScope,
         schema: &ParserDB,
@@ -696,7 +717,8 @@ impl PlPgSqlTranslator {
     ///
     /// Each branch starts from the assignments made before the `IF`, and what
     /// a branch assigned reaches the statements after it as a `CASE` over the
-    /// branch conditions.
+    /// branch conditions. A PL/pgSQL helper a condition calls runs before the
+    /// condition is tested, when every earlier condition failed.
     fn translate_if(
         function: &str,
         conditional: &If,
@@ -706,17 +728,48 @@ impl PlPgSqlTranslator {
         emit: crate::warnings::WarningSink<'_>,
     ) -> Result<Vec<Statement>, Error> {
         let mut result = Vec::new();
+        // The first condition is tested whenever the `IF` runs, so what its
+        // helpers write is no write under the `IF`.
+        let mut first = match conditional.branches.first() {
+            Some(Branch { condition, .. }) => {
+                let mut written = Self::fold_trigger_specials_in(
+                    embedded::expression(condition).into_owned(),
+                    &scope.facts,
+                )?;
+                result.extend(Self::inline_condition_calls(
+                    &mut written,
+                    scope,
+                    schema,
+                    options,
+                    emit,
+                )?);
+                Some(written)
+            }
+            None => None,
+        };
         scope.begin_if();
         let mut negated: Vec<Expr> = Vec::new();
-        let outer = scope.scoped_bindings();
+        let mut outer = scope.scoped_bindings();
         let mut branches: Vec<(Option<Expr>, Vec<Binding>)> = Vec::new();
 
         for Branch { condition, statements } in &conditional.branches {
             scope.restore_scoped(&outer);
-            let written = Self::fold_trigger_specials_in(
-                embedded::expression(condition).into_owned(),
-                &scope.facts,
-            )?;
+            let written = if let Some(written) = first.take() {
+                written
+            } else {
+                let mut written = Self::fold_trigger_specials_in(
+                    embedded::expression(condition).into_owned(),
+                    &scope.facts,
+                )?;
+                scope.push_condition(conjunction(negated.iter().cloned()));
+                let inlined =
+                    Self::inline_condition_calls(&mut written, scope, schema, options, emit);
+                scope.pop_condition();
+                result.extend(inlined?);
+                // What the helpers wrote holds in every later branch.
+                outer = scope.scoped_bindings();
+                written
+            };
             let translated = Self::translate_condition(&written, scope, schema, options, emit)?;
             let guard = if negated.is_empty() {
                 translated.clone()
@@ -1755,7 +1808,11 @@ impl PlPgSqlTranslator {
 
     /// Replaces each read of a declared variable with no binding by `NULL`,
     /// which is what PostgreSQL initialises it to.
-    fn null_unbound_declarations<N: VisitMut>(node: &mut N, scope: &BodyScope, bound: &[Binding]) {
+    pub(super) fn null_unbound_declarations<N: VisitMut>(
+        node: &mut N,
+        scope: &BodyScope,
+        bound: &[Binding],
+    ) {
         let _: ControlFlow<()> = visit_expressions_mut(node, |expr| {
             if let Expr::Identifier(ident) = expr
                 && scope.is_declared(ident)
@@ -1770,7 +1827,7 @@ impl PlPgSqlTranslator {
     /// Reorders bindings so one read by another comes first.
     ///
     /// A binding whose dependency cannot be placed keeps its position.
-    fn order_bindings_by_dependency(bindings: &[Binding]) -> Vec<&Binding> {
+    pub(super) fn order_bindings_by_dependency(bindings: &[Binding]) -> Vec<&Binding> {
         let depends_on = |candidate: &Binding, other: &Binding| matches!(&candidate.value, BoundValue::Expr(expr) if references_variable(expr, &other.name));
         let mut ordered: Vec<&Binding> = Vec::with_capacity(bindings.len());
         let mut pending: Vec<&Binding> = bindings.iter().collect();
@@ -1932,7 +1989,7 @@ impl VariableScope {
 /// The identifier a bare name reads, or `None` for anything qualified.
 ///
 /// `(v_n)` parses to a single-segment compound identifier in some positions.
-fn bare_identifier(expr: &Expr) -> Option<&Ident> {
+pub(super) fn bare_identifier(expr: &Expr) -> Option<&Ident> {
     match expr {
         Expr::Identifier(ident) => Some(ident),
         Expr::CompoundIdentifier(parts) if parts.len() == 1 => parts.first(),
