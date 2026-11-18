@@ -247,7 +247,7 @@ impl PlPgSqlTranslator {
                  handler and let the error surface."
             )));
         }
-        let mut defaulted = Vec::new();
+        let mut result = Vec::new();
         for declaration in &block.declarations {
             match &declaration.kind {
                 DeclarationKind::Variable(variable) => {
@@ -261,11 +261,31 @@ impl PlPgSqlTranslator {
                     }
                     scope.declare(&declaration.name);
                     if let Some(default) = &variable.default {
+                        // PostgreSQL computes each default as the block is
+                        // entered, in the order the block declares them.
+                        let mut value = embedded::expression(default).into_owned();
+                        let variables: Vec<String> =
+                            scope.bindings().map(|binding| binding.name.clone()).collect();
+                        result.extend(Self::inline_helper_calls(
+                            &mut value,
+                            scope,
+                            schema,
+                            &options.with_variables(&variables),
+                            emit,
+                        )?);
                         scope.bind_persistent(Binding {
                             name: declaration.name.clone(),
-                            value: BoundValue::Expr(embedded::expression(default).into_owned()),
+                            value: BoundValue::Expr(value),
                         });
-                        defaulted.push(declaration.name.clone());
+                        let variables: Vec<String> =
+                            scope.bindings().map(|binding| binding.name.clone()).collect();
+                        result.extend(Self::evaluate_assigned(
+                            core::slice::from_ref(&declaration.name),
+                            scope,
+                            schema,
+                            &options.with_variables(&variables),
+                            emit,
+                        )?);
                     }
                 }
                 DeclarationKind::Alias(_) => {
@@ -279,14 +299,6 @@ impl PlPgSqlTranslator {
             }
         }
 
-        let variables: Vec<String> = scope.bindings().map(|binding| binding.name.clone()).collect();
-        let mut result = Self::evaluate_assigned(
-            &defaulted,
-            scope,
-            schema,
-            &options.with_variables(&variables),
-            emit,
-        )?;
         for node in &block.statements {
             result.extend(Self::translate_node(function, node, scope, schema, options, emit)?);
         }
@@ -323,13 +335,7 @@ impl PlPgSqlTranslator {
                     )));
                 };
                 let query = Self::fold_trigger_specials_in(query.as_ref().clone(), &scope.facts)?;
-                let assigned: Vec<String> = into
-                    .targets
-                    .iter()
-                    .map(|target| Self::assigned_name(target, &scope.facts))
-                    .collect::<Result<_, _>>()?;
-                Self::translate_select_into(&query, into, scope, schema, emit)?;
-                Self::evaluate_assigned(&assigned, scope, schema, options, emit)
+                Self::translate_select_into(query, into, scope, schema, options, emit)
             }
             NodeKind::Statement { statement, into: None } => {
                 if let Statement::Query(query) = statement.as_ref()
@@ -367,12 +373,15 @@ impl PlPgSqlTranslator {
             }
             NodeKind::Assignment(assignment) => {
                 let name = Self::assigned_name(&assignment.target, &scope.facts)?;
-                let value = Self::fold_trigger_specials_in(
+                let mut value = Self::fold_trigger_specials_in(
                     embedded::expression(&assignment.value).into_owned(),
                     &scope.facts,
                 )?;
+                let mut statements =
+                    Self::inline_helper_calls(&mut value, scope, schema, options, emit)?;
                 scope.bind(Binding { name: name.clone(), value: BoundValue::Expr(value) });
-                Self::evaluate_assigned(&[name], scope, schema, options, emit)
+                statements.extend(Self::evaluate_assigned(&[name], scope, schema, options, emit)?);
+                Ok(statements)
             }
             NodeKind::If(conditional) => {
                 Self::translate_if(function, conditional, scope, schema, options, emit)
@@ -568,14 +577,17 @@ impl PlPgSqlTranslator {
     }
 
     /// Binds each `SELECT ... INTO` target to the column it receives, read
-    /// from the first row as PostgreSQL assigns it.
+    /// from the first row as PostgreSQL assigns it, and returns the
+    /// statements of the PL/pgSQL helpers the columns call, then the `SELECT`
+    /// of each target whose value may raise.
     fn translate_select_into(
-        query: &Query,
+        mut query: Query,
         into: &IntoTargets,
         scope: &mut BodyScope,
         schema: &ParserDB,
+        options: &crate::options::TranslationContext<'_>,
         emit: crate::warnings::WarningSink<'_>,
-    ) -> Result<(), Error> {
+    ) -> Result<Vec<Statement>, Error> {
         let targets: Vec<String> = into
             .targets
             .iter()
@@ -598,6 +610,7 @@ impl PlPgSqlTranslator {
                  body cannot check",
             ));
         }
+        let mut statements = Self::inline_selected_calls(&mut query, scope, schema, options, emit)?;
         let SetExpr::Select(select) = query.body.as_ref() else {
             return Err(refusal("reads a set operation, where only a plain SELECT binds"));
         };
@@ -625,7 +638,7 @@ impl PlPgSqlTranslator {
             });
         }
         let unlocked = Query { locks: Vec::new(), for_clause: None, ..query.clone() };
-        for (name, column) in targets.into_iter().zip(columns) {
+        for (name, column) in targets.iter().cloned().zip(columns) {
             let mut read = unlocked.clone();
             if let SetExpr::Select(select) = read.body.as_mut() {
                 select.projection = vec![SelectItem::UnnamedExpr(column.clone())];
@@ -646,7 +659,8 @@ impl PlPgSqlTranslator {
             let found = Self::found_after(&unlocked, schema);
             scope.bind(Binding { name: FOUND.to_string(), value: found });
         }
-        Ok(())
+        statements.extend(Self::evaluate_assigned(&targets, scope, schema, options, emit)?);
+        Ok(statements)
     }
 
     /// What `FOUND` reads after `query` ran for its rows, which is whether it
@@ -736,7 +750,7 @@ impl PlPgSqlTranslator {
                     embedded::expression(condition).into_owned(),
                     &scope.facts,
                 )?;
-                result.extend(Self::inline_condition_calls(
+                result.extend(Self::inline_helper_calls(
                     &mut written,
                     scope,
                     schema,
@@ -762,8 +776,7 @@ impl PlPgSqlTranslator {
                     &scope.facts,
                 )?;
                 scope.push_condition(conjunction(negated.iter().cloned()));
-                let inlined =
-                    Self::inline_condition_calls(&mut written, scope, schema, options, emit);
+                let inlined = Self::inline_helper_calls(&mut written, scope, schema, options, emit);
                 scope.pop_condition();
                 result.extend(inlined?);
                 // What the helpers wrote holds in every later branch.

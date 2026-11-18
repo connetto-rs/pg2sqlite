@@ -18,8 +18,8 @@ use sql_traits::{
 use sqlparser::{
     ast::{
         BinaryOperator, CreateFunction, Expr, Function, FunctionArguments, FunctionReturnType,
-        FunctionSecurity, ObjectName, SetExpr, Statement, UnaryOperator, Value, visit_expressions,
-        visit_expressions_mut, visit_relations,
+        FunctionSecurity, GroupByExpr, ObjectName, Query, SelectItem, SetExpr, Statement,
+        UnaryOperator, Value, visit_expressions, visit_expressions_mut, visit_relations,
     },
     tokenizer::Span,
 };
@@ -114,22 +114,75 @@ impl PlPgSqlTranslator {
         Ok(Some(inlined.statements))
     }
 
-    /// The statements of the PL/pgSQL helpers `condition` calls, each call
-    /// replaced by the value its body returns.
+    /// The statements of the PL/pgSQL helpers `expr` calls, each call
+    /// replaced by the value its body returns, for an expression PostgreSQL
+    /// evaluates whenever it is reached: a condition, an assigned value or a
+    /// returned one.
     ///
     /// # Errors
     ///
     /// Refuses a call PostgreSQL may skip, one returning no value, and a
     /// helper whose body does not inline.
-    pub(super) fn inline_condition_calls(
-        condition: &mut Expr,
+    pub(super) fn inline_helper_calls(
+        expr: &mut Expr,
         scope: &mut BodyScope,
         schema: &ParserDB,
         options: &TranslationContext<'_>,
         emit: WarningSink<'_>,
     ) -> Result<Vec<Statement>, Error> {
         let mut statements = Vec::new();
-        Self::inline_calls_in(condition, true, &mut statements, scope, schema, options, emit)?;
+        Self::inline_calls_in(expr, true, &mut statements, scope, schema, options, emit)?;
+        Ok(statements)
+    }
+
+    /// The statements of the PL/pgSQL helpers the columns of `SELECT ...
+    /// INTO` call, each call replaced by the value its body returns.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a helper called by a query reading rows, which PostgreSQL
+    /// calls once per row, and whatever [`Self::inline_helper_calls`]
+    /// refuses.
+    pub(super) fn inline_selected_calls(
+        query: &mut Query,
+        scope: &mut BodyScope,
+        schema: &ParserDB,
+        options: &TranslationContext<'_>,
+        emit: WarningSink<'_>,
+    ) -> Result<Vec<Statement>, Error> {
+        let Some(called) = first_helper_call(&*query, schema, options)? else {
+            return Ok(Vec::new());
+        };
+        let one_row = query.with.is_none()
+            && query.limit_clause.is_none()
+            && query.fetch.is_none()
+            && matches!(
+                query.body.as_ref(),
+                SetExpr::Select(select)
+                    if select.from.is_empty()
+                        && select.selection.is_none()
+                        && select.having.is_none()
+                        && matches!(&select.group_by, GroupByExpr::Expressions(keys, _) if keys.is_empty())
+            );
+        let projection = match query.body.as_mut() {
+            SetExpr::Select(select) if one_row => &mut select.projection,
+            _ => {
+                return Err(refusal(
+                    &called,
+                    "is selected INTO by a query reading rows, which calls it once per row, and \
+                     only a SELECT without FROM runs as the helper's body",
+                ));
+            }
+        };
+        let mut statements = Vec::new();
+        for item in projection {
+            if let SelectItem::UnnamedExpr(column)
+            | SelectItem::ExprWithAlias { expr: column, .. } = item
+            {
+                statements.extend(Self::inline_helper_calls(column, scope, schema, options, emit)?);
+            }
+        }
+        refuse_skippable_calls(&*query, schema, options)?;
         Ok(statements)
     }
 
@@ -187,7 +240,7 @@ impl PlPgSqlTranslator {
                     None => {
                         return Err(refusal(
                             &call.name,
-                            "returns no value, which PostgreSQL refuses to test",
+                            "returns no value, which PostgreSQL refuses to read",
                         ));
                     }
                 };
@@ -207,7 +260,8 @@ impl PlPgSqlTranslator {
             | Expr::IsNull(inner)
             | Expr::IsNotNull(inner)
             | Expr::IsUnknown(inner)
-            | Expr::IsNotUnknown(inner) => inline(inner, evaluated, scope),
+            | Expr::IsNotUnknown(inner)
+            | Expr::Cast { expr: inner, .. } => inline(inner, evaluated, scope),
             // The right operand of AND and OR is skipped once the left one
             // decides.
             Expr::BinaryOp { left, op: BinaryOperator::And | BinaryOperator::Or, right } => {
@@ -349,12 +403,20 @@ impl PlPgSqlTranslator {
         emit: WarningSink<'_>,
     ) -> Result<Vec<Statement>, Error> {
         let Some(value) = value else { return Ok(Vec::new()) };
-        let value =
+        let mut value =
             Self::fold_trigger_specials_in(embedded::expression(value).into_owned(), &scope.facts)?;
+        let mut statements = Self::inline_helper_calls(&mut value, scope, schema, options, emit)?;
         scope.bind(Binding { name: RESULT.to_string(), value: BoundValue::Expr(value) });
         // PostgreSQL computes the value where it returns, so one that may
         // raise runs there.
-        Self::evaluate_assigned(&[RESULT.to_string()], scope, schema, options, emit)
+        statements.extend(Self::evaluate_assigned(
+            &[RESULT.to_string()],
+            scope,
+            schema,
+            options,
+            emit,
+        )?);
+        Ok(statements)
     }
 }
 
