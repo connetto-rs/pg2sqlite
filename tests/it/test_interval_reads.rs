@@ -798,17 +798,19 @@ fn a_bound_parameter_is_keyed_like_a_column() {
 /// Panics when translation fails, when an expected statement succeeds, or
 /// when a needle names no failing statement.
 fn run_with_failures(pg: &str, failing: &[&str]) -> Vec<Option<String>> {
-    use rusqlite::Connection;
+    use diesel::RunQueryDsl;
+    use diesel_dynamic_schema::dynamic_value::{DynamicRow, NamedField};
+    use run_translated_helper::TextCell;
     let statements = Pg2Sqlite::default()
         .sql(pg)
         .expect("parse")
         .translate_to_sql(&Pg2SqliteOptions::default())
         .expect("translate")
         .into_vec();
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = crate::helpers::establish_connection();
     let mut seen = vec![false; failing.len()];
     for statement in &statements[..statements.len() - 1] {
-        let result = connection.execute_batch(&format!("{statement};"));
+        let result = diesel::sql_query(statement).execute(&mut connection);
         match failing.iter().position(|needle| statement.contains(needle)) {
             Some(index) => {
                 assert!(result.is_err(), "the statement naming {statement:?} should fail");
@@ -822,10 +824,12 @@ fn run_with_failures(pg: &str, failing: &[&str]) -> Vec<Option<String>> {
     for (needle, hit) in failing.iter().zip(&seen) {
         assert!(*hit, "no statement failed naming {needle}");
     }
-    let mut prepared = connection
-        .prepare(statements.last().expect("the script ends in a probe"))
-        .unwrap_or_else(|error| panic!("probe failed: {error}"));
-    prepared.query_map([], first_column_text).unwrap().map(|cell| cell.unwrap()).collect()
+    diesel::sql_query(statements.last().expect("the script ends in a probe"))
+        .load::<DynamicRow<NamedField<TextCell>>>(&mut connection)
+        .unwrap_or_else(|error| panic!("probe failed: {error}"))
+        .into_iter()
+        .map(first_column_text)
+        .collect()
 }
 
 #[test]

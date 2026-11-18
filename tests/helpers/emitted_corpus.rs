@@ -237,9 +237,6 @@ pub const CORPUS_GROUPS: &[(&str, &[&str])] = &[
             "SELECT json_build_object('a', n), json_build_array(n) FROM t;",
             "SELECT jsonb_set(payload, '{a}', '1') FROM t;",
             "SELECT json_extract_path(payload::json, 'a') FROM t;",
-            "SELECT var_pop(r), var_samp(r), variance(r) FROM t;",
-            "SELECT stddev(r), stddev_pop(r), stddev_samp(r) FROM t;",
-            "SELECT covar_pop(r, r), covar_samp(r, r), corr(r, r) FROM t;",
             // Names the translator does not recognise. The sweep counts
             // `no such` as a translator fault, so these would have caught the
             // passthrough that emitted them verbatim, had the corpus ever
@@ -729,6 +726,9 @@ pub const CORPUS_GROUPS: &[(&str, &[&str])] = &[
     (
         "statistical-aggregates",
         &[
+            "SELECT var_pop(r), var_samp(r), variance(r) FROM t;",
+            "SELECT stddev(r), stddev_pop(r), stddev_samp(r) FROM t;",
+            "SELECT covar_pop(r, r), covar_samp(r, r), corr(r, r) FROM t;",
                 // The three clauses the old closed forms discarded, plus a
                 // grouped call. Each name reaches SQLite verbatim because the
                 // sweep options declare it, so what these prove is that the

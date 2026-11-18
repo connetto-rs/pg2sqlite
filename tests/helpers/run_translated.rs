@@ -3,8 +3,14 @@
 //! equivalent, is what makes an assertion proof: a drift between the shape the
 //! translator emits and the shape SQLite accepts fails here.
 
+use diesel::{
+    deserialize::{self, FromSql},
+    prelude::*,
+    sql_types::{BigInt, Binary, Double, Text},
+    sqlite::{Sqlite, SqliteType, SqliteValue},
+};
+use diesel_dynamic_schema::dynamic_value::{Any, DynamicRow, NamedField};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use rusqlite::Connection;
 
 /// Translates `pg`, applies every emitted statement but the last, then returns
 /// the first column of the last one as text, with `None` for SQL NULL.
@@ -48,23 +54,23 @@ pub fn run_translated_bound_with(
         .into_vec();
     let probe = statements.pop().expect("script should emit at least one statement");
 
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = super::establish_connection();
     for statement in &statements {
-        connection
-            .execute_batch(&format!("{statement};"))
+        diesel::sql_query(statement)
+            .execute(&mut connection)
             .unwrap_or_else(|error| panic!("emitted setup failed: {error}\n{statement}"));
     }
 
-    let bound: Vec<rusqlite::types::Value> =
-        params.iter().map(|param| rusqlite::types::Value::Text((*param).to_string())).collect();
-    let mut prepared = connection
-        .prepare(&probe)
-        .unwrap_or_else(|error| panic!("emitted probe failed: {error}\n{probe}"));
-    prepared
-        .query_map(rusqlite::params_from_iter(bound.iter()), first_column_text)
-        .unwrap_or_else(|error| panic!("emitted probe failed to run: {error}\n{probe}"))
-        .collect::<Result<Vec<_>, _>>()
-        .expect("probe rows should decode")
+    let mut query = diesel::sql_query(&probe).into_boxed::<Sqlite>();
+    for parameter in params {
+        query = query.bind::<Text, _>(*parameter);
+    }
+    query
+        .load::<DynamicRow<NamedField<TextCell>>>(&mut connection)
+        .unwrap_or_else(|error| panic!("emitted probe failed: {error}\n{probe}"))
+        .into_iter()
+        .map(first_column_text)
+        .collect()
 }
 
 /// [`run_translated_with`] for a request whose `TimeZone` is UTC, `pg` led by
@@ -77,17 +83,35 @@ pub fn run_translated_utc(pg: &str) -> Vec<Option<String>> {
     run_translated_with(&super::deployment::utc_script(pg), &super::deployment::utc_request())
 }
 
-/// The first column of `row` as text, `None` for SQL NULL.
-///
-/// # Errors
-///
-/// Propagates the error reading the column answers.
-pub fn first_column_text(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<String>> {
-    Ok(match row.get_ref(0)? {
-        rusqlite::types::ValueRef::Null => None,
-        rusqlite::types::ValueRef::Integer(i) => Some(i.to_string()),
-        rusqlite::types::ValueRef::Real(f) => Some(f.to_string()),
-        rusqlite::types::ValueRef::Text(t) => Some(String::from_utf8_lossy(t).into_owned()),
-        rusqlite::types::ValueRef::Blob(b) => Some(format!("{b:?}")),
-    })
+/// A dynamically typed SQLite cell rendered as text.
+#[derive(Debug)]
+pub struct TextCell(pub Option<String>);
+
+impl FromSql<Any, Sqlite> for TextCell {
+    fn from_sql(value: SqliteValue<'_, '_, '_>) -> deserialize::Result<Self> {
+        let text = match value.value_type() {
+            Some(SqliteType::SmallInt | SqliteType::Integer | SqliteType::Long) => {
+                <i64 as FromSql<BigInt, Sqlite>>::from_sql(value)?.to_string()
+            }
+            Some(SqliteType::Float | SqliteType::Double) => {
+                <f64 as FromSql<Double, Sqlite>>::from_sql(value)?.to_string()
+            }
+            Some(SqliteType::Text) => <String as FromSql<Text, Sqlite>>::from_sql(value)?,
+            Some(SqliteType::Binary) => {
+                let bytes = <Vec<u8> as FromSql<Binary, Sqlite>>::from_sql(value)?;
+                format!("{bytes:?}")
+            }
+            None => return Ok(Self(None)),
+        };
+        Ok(Self(Some(text)))
+    }
+
+    fn from_nullable_sql(value: Option<SqliteValue<'_, '_, '_>>) -> deserialize::Result<Self> {
+        value.map_or(Ok(Self(None)), Self::from_sql)
+    }
+}
+
+/// Returns the first cell's text.
+pub fn first_column_text(row: DynamicRow<NamedField<TextCell>>) -> Option<String> {
+    row.into_iter().next().expect("probe has a column").value.0
 }
