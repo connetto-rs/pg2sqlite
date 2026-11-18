@@ -539,3 +539,57 @@ fn uuid_round_trip_agrees() {
              WHERE uid = '11111111-1111-1111-1111-111111111111'::uuid";
     assert_sql_scalar(&pg_sql(&mut pg, q), &sq_sql_diesel(&mut sq, q), "uuid equality");
 }
+
+/// Ordered derived values preserve PostgreSQL row order.
+#[test]
+fn ordered_derived_values_agree() {
+    let mut postgres = setup_pg();
+    let mut sqlite = setup_sq_diesel();
+    let query = "SELECT column1 AS val FROM (VALUES ('b'), ('a') ORDER BY 1) AS given";
+    assert_eq!(pg_sql(&mut postgres, query), sq_sql_diesel(&mut sqlite, query));
+}
+
+/// Values retain their column names and query clauses in every query position.
+#[test]
+fn values_query_clauses_agree() {
+    #[derive(Debug, PartialEq, QueryableByName)]
+    struct ValuesRow {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        column1: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        column2: String,
+    }
+
+    let mut postgres = setup_pg();
+    let mut sqlite = setup_sq_diesel();
+    for clause in [
+        "ORDER BY 1",
+        "ORDER BY column1",
+        "ORDER BY column1 DESC",
+        "ORDER BY 1 DESC NULLS FIRST",
+        "ORDER BY 2",
+        "LIMIT 1",
+        "OFFSET 1",
+        "ORDER BY 1 LIMIT 1 OFFSET 1",
+        "ORDER BY 1 FETCH FIRST 1 ROW ONLY",
+        "ORDER BY 1 OFFSET 1 ROW FETCH NEXT 1 ROW ONLY",
+    ] {
+        let values = format!("VALUES ('b', 'x'), ('a', 'y'), (NULL, 'z') {clause}");
+        for query in [
+            values.clone(),
+            format!("SELECT column1, column2 FROM ({values}) AS given"),
+            format!("WITH given AS ({values}) SELECT column1, column2 FROM given"),
+            format!("({values}) UNION ALL SELECT 'c', 'w'"),
+            format!("SELECT 'c' AS column1, 'w' AS column2 UNION ALL ({values})"),
+        ] {
+            let expected = diesel::sql_query(&query)
+                .load::<ValuesRow>(&mut postgres)
+                .unwrap_or_else(|error| panic!("PostgreSQL refused {query}\n{error}"));
+            let translated = translate_last(&query);
+            let actual = diesel::sql_query(&translated)
+                .load::<ValuesRow>(&mut sqlite)
+                .unwrap_or_else(|error| panic!("SQLite refused {translated}\n{error}"));
+            assert_eq!(expected, actual, "{query}\n{translated}");
+        }
+    }
+}

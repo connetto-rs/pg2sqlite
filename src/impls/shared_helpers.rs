@@ -4417,7 +4417,7 @@ fn unparenthesize_compound_operand(operand: sqlparser::ast::SetExpr) -> sqlparse
 }
 
 /// `SELECT * FROM (<query>)`, one operand however compound `query` is.
-fn select_over(query: Box<sqlparser::ast::Query>) -> sqlparser::ast::SetExpr {
+pub(crate) fn select_over(query: Box<sqlparser::ast::Query>) -> sqlparser::ast::SetExpr {
     sqlparser::ast::SetExpr::Select(Box::new(crate::impls::query_builder::make_simple_select(
         vec![sqlparser::ast::SelectItem::Wildcard(
             sqlparser::ast::WildcardAdditionalOptions::default(),
