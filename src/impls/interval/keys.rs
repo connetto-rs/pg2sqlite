@@ -390,13 +390,13 @@ pub(crate) fn position_key(
     schema: &ParserDB,
     options: &TranslationContext<'_>,
     emit: WarningSink<'_>,
-) -> Result<Option<Expr>, Error> {
+) -> Result<Expr, Error> {
     let resolved = match interval_side(side, schema, options)? {
         IntervalSide::BareLiteral(text) => {
-            return Ok(Some(literal_key(&text, IntervalTypmod::default())?));
+            return literal_key(&text, IntervalTypmod::default());
         }
         IntervalSide::TypedLiteral { text, typmod } => {
-            return Ok(Some(literal_key(&text, typmod)?));
+            return literal_key(&text, typmod);
         }
         IntervalSide::Null | IntervalSide::Other | IntervalSide::Keyed(_) => side,
     };
@@ -406,13 +406,13 @@ pub(crate) fn position_key(
         .flatten()
         .unwrap_or(resolved);
     if !group_by && let Some(key) = crate::impls::enum_type::order_key(resolved, schema, options) {
-        return Ok(Some(key.translate_with_warnings(schema, options, emit)?));
+        return key.translate_with_warnings(schema, options, emit);
     }
     let translated = resolved.translate_with_warnings(schema, options, emit)?;
     if is_interval_typed(resolved, schema, options) {
-        return Ok(Some(key_expr(&translated, options)?));
+        return key_expr(&translated, options);
     }
-    Ok(Some(translated))
+    Ok(translated)
 }
 
 /// The projection item an `ORDER BY` or `GROUP BY` item names, or the

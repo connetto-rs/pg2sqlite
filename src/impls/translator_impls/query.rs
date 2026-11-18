@@ -764,18 +764,14 @@ fn try_translate_distinct_on_query(
 
     let mut partition_by = Vec::with_capacity(distinct_on_exprs.len());
     for expr in distinct_on_exprs {
-        let keyed = crate::impls::interval::keys::position_key(
+        partition_by.push(crate::impls::interval::keys::position_key(
             expr,
             None,
             false,
             args.schema,
             args.options,
             emit,
-        )?;
-        partition_by.push(match keyed {
-            Some(keyed) => keyed,
-            None => expr.translate_with_warnings(args.schema, args.options, emit)?,
-        });
+        )?);
     }
 
     // Two separate corrections, because the two ORDER BY positions see

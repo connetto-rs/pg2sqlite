@@ -3264,8 +3264,7 @@ pub(crate) fn translate_order_by_expr<D: TranslationDirection>(
                 emit,
             )
         })
-        .transpose()?
-        .flatten();
+        .transpose()?;
     Ok(OrderByExpr {
         expr: match key {
             Some(key) => key,
@@ -3704,8 +3703,7 @@ pub(crate) fn translate_group_by_expr<D: TranslationDirection>(
                                     e, projection, true, schema, ctx, emit,
                                 )
                             })
-                            .transpose()?
-                            .flatten();
+                            .transpose()?;
                         Ok::<Expr, Error>(match key {
                             Some(key) => key,
                             None => D::translate_expr(e, schema, options, emit)?,
@@ -3734,8 +3732,7 @@ fn window_partition_expr<D: TranslationDirection>(
     let Some(ctx) = D::forward_context(options) else {
         return D::translate_expr(e, schema, options, emit);
     };
-    crate::impls::interval::keys::position_key(e, None, false, schema, ctx, emit)?
-        .map_or_else(|| D::translate_expr(e, schema, options, emit), Ok)
+    crate::impls::interval::keys::position_key(e, None, false, schema, ctx, emit)
 }
 
 pub(crate) fn translate_window_spec<D: TranslationDirection>(
@@ -6168,8 +6165,7 @@ mod tests {
         use crate::impls::interval::keys::position_key;
 
         let expr = position_key(&order_by_expr.expr, None, false, schema, options, &mut |_| {})
-            .expect("the position key settles")
-            .expect("an interval operand reads a key");
+            .expect("the position key settles");
         sqlparser::ast::OrderByExpr {
             expr,
             options: sqlparser::ast::OrderByOptions { sort: None, nulls_first: Some(false) },
