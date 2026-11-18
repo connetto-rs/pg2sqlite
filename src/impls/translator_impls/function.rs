@@ -1773,8 +1773,13 @@ impl crate::traits::translator::TranslatorWithContext for Function {
         }
 
         // A call to a SQL function the schema declares stands for its body.
-        if let Some(inlined) = super::sql_helper::inlined_call(self, schema, options)? {
-            return inlined.translate_with_warnings(schema, options, emit);
+        if let Some(inlined) = super::sql_helper::inlined_call(self, schema, options, emit)? {
+            return match inlined {
+                super::sql_helper::Inlined::Postgres(expression) => {
+                    expression.translate_with_warnings(schema, options, emit)
+                }
+                super::sql_helper::Inlined::Sqlite(expression) => Ok(expression),
+            };
         }
 
         // SQLite 3.25 added native FILTER (WHERE ...) for aggregates; our floor

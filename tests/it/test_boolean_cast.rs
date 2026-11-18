@@ -98,3 +98,25 @@ fn casting_a_number_is_unchanged() {
     );
     assert_eq!(rows, vec![Some("1".to_string())]);
 }
+
+/// A comparison in parentheses answers 1, 0 or `NULL` already, so the cast
+/// keeps it as written and reads it once, where the text set reads its
+/// operand once per branch.
+#[test]
+fn a_parenthesized_comparison_casts_as_itself() {
+    let statements = Pg2Sqlite::default()
+        .sql(
+            "CREATE TABLE t (id INT PRIMARY KEY, s TEXT);
+             SELECT CAST((s = 'on') AS BOOLEAN) FROM t;",
+        )
+        .expect("parse")
+        .translate(&Pg2SqliteOptions::default())
+        .expect("translate")
+        .into_vec();
+    let select = statements.last().expect("the select").to_string();
+    assert_eq!(select.matches("s = 'on'").count(), 1, "{select}");
+    assert_eq!(
+        evaluate_over_column("on", "CAST((s = 'on') AS BOOLEAN)"),
+        vec![Some("1".to_string())]
+    );
+}

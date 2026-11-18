@@ -4377,7 +4377,12 @@ fn unparenthesize_compound_operand(operand: sqlparser::ast::SetExpr) -> sqlparse
     if !carries_its_own_clauses {
         return unparenthesize_compound_operand(*query.body);
     }
-    SetExpr::Select(Box::new(crate::impls::query_builder::make_simple_select(
+    select_over(query)
+}
+
+/// `SELECT * FROM (<query>)`, one operand however compound `query` is.
+fn select_over(query: Box<sqlparser::ast::Query>) -> sqlparser::ast::SetExpr {
+    sqlparser::ast::SetExpr::Select(Box::new(crate::impls::query_builder::make_simple_select(
         vec![sqlparser::ast::SelectItem::Wildcard(
             sqlparser::ast::WildcardAdditionalOptions::default(),
         )],
@@ -4389,6 +4394,62 @@ fn unparenthesize_compound_operand(operand: sqlparser::ast::SetExpr) -> sqlparse
         }),
         None,
     )))
+}
+
+/// `right`, the right operand of `op` and `quantifier`, as SQLite reads it
+/// in that place once printed without parentheses.
+///
+/// SQLite reads a chain of set operations left to right, so a compound on
+/// the right would take the operation before it as its own left operand.
+/// A chain of unions under a union keeps its rows written with the outer
+/// operator throughout, `x UNION (a UNION ALL b)` keeping what `x UNION a
+/// UNION b` keeps, which also leaves the step of a recursive `WITH` at the
+/// level SQLite requires of it. Any other compound becomes a select over it,
+/// so `SELECT 1 UNION SELECT 2 INTERSECT SELECT 2` keeps answering 1, 2.
+fn grouped_right_operand(
+    op: SetOperator,
+    quantifier: SetQuantifier,
+    mut right: sqlparser::ast::SetExpr,
+) -> sqlparser::ast::SetExpr {
+    use sqlparser::ast::SetExpr;
+
+    if !matches!(right, SetExpr::SetOperation { .. }) {
+        return right;
+    }
+    let all = matches!(quantifier, SetQuantifier::All);
+    if op == SetOperator::Union
+        && matches!(quantifier, SetQuantifier::All | SetQuantifier::Distinct | SetQuantifier::None)
+        && union_chain(&right, all)
+    {
+        relabel_union_chain(&mut right, quantifier);
+        return right;
+    }
+    select_over(Box::new(crate::impls::query_builder::make_query(None, right)))
+}
+
+/// Whether `expr` prints as a chain of unions only, each `UNION ALL` where
+/// `all`.
+fn union_chain(expr: &sqlparser::ast::SetExpr, all: bool) -> bool {
+    match expr {
+        sqlparser::ast::SetExpr::SetOperation { op, set_quantifier, left, right } => {
+            *op == SetOperator::Union
+                && (matches!(set_quantifier, SetQuantifier::All)
+                    || (!all
+                        && matches!(set_quantifier, SetQuantifier::Distinct | SetQuantifier::None)))
+                && union_chain(left, all)
+                && union_chain(right, all)
+        }
+        _ => true,
+    }
+}
+
+/// Writes every union of the chain `expr` with `quantifier`.
+fn relabel_union_chain(expr: &mut sqlparser::ast::SetExpr, quantifier: SetQuantifier) {
+    if let sqlparser::ast::SetExpr::SetOperation { set_quantifier, left, right, .. } = expr {
+        *set_quantifier = quantifier;
+        relabel_union_chain(left, quantifier);
+        relabel_union_chain(right, quantifier);
+    }
 }
 
 /// Shared `SetExpr` translation. Forward errors on `Table` and `Merge`.
@@ -4448,7 +4509,11 @@ pub(crate) fn translate_set_expr_shared<D: TranslationDirection>(
                 translate_set_expr_shared::<D>(right, schema, options, emit)?;
             if D::IS_FORWARD {
                 translated_left = unparenthesize_compound_operand(translated_left);
-                translated_right = unparenthesize_compound_operand(translated_right);
+                translated_right = grouped_right_operand(
+                    *op,
+                    *set_quantifier,
+                    unparenthesize_compound_operand(translated_right),
+                );
             }
             SetExpr::SetOperation {
                 op: *op,

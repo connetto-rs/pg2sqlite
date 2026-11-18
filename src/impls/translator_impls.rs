@@ -25,6 +25,7 @@ pub(crate) use helpers::Forward;
 mod index_column;
 pub(crate) mod insert;
 mod json_value;
+mod lateral;
 mod nulls_not_distinct;
 pub(crate) mod off_replica;
 mod order_by_expr;

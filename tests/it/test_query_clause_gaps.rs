@@ -105,13 +105,60 @@ fn uncorrelated_lateral_preserves_values() {
 }
 
 #[test]
-fn correlated_lateral_is_refused() {
-    assert_refusal("SELECT nums.n FROM nums, LATERAL (SELECT nums.n) AS lat");
+fn correlated_lateral_reads_each_row() {
+    assert_rows(
+        "SELECT lat.n FROM nums, LATERAL (SELECT nums.n * 2 AS n) AS lat",
+        &[2, 4, 6, 8, 10],
+    );
+}
+
+/// An aggregate keeps one row per outer row even over no input, which no
+/// select per arm keeps.
+#[test]
+fn aggregating_lateral_is_refused() {
+    assert_refusal(
+        "SELECT lat.c FROM nums CROSS JOIN LATERAL \
+         (SELECT count(*) AS c FROM nums below WHERE below.n < nums.n) AS lat",
+    );
+}
+
+#[test]
+fn left_joined_lateral_is_refused() {
+    assert_refusal(
+        "SELECT lat.m FROM nums LEFT JOIN LATERAL (SELECT nums.n * 2 AS m) AS lat ON TRUE",
+    );
 }
 
 #[test]
 fn intersect_all_is_refused() {
     assert_refusal("SELECT n FROM nums INTERSECT ALL SELECT n FROM nums");
+}
+
+/// `INTERSECT` binds tighter than `UNION` in PostgreSQL, where SQLite reads
+/// a chain of set operations left to right.
+#[test]
+fn intersect_on_the_right_of_a_union_binds_first() {
+    assert_rows(
+        "SELECT n FROM nums WHERE n = 1 UNION SELECT n FROM nums WHERE n = 2 \
+         INTERSECT SELECT n FROM nums WHERE n = 2 ORDER BY n",
+        &[1, 2],
+    );
+}
+
+/// A union in parentheses on the right of a union keeps the duplicates the
+/// outer `UNION ALL` keeps and drops those its own `UNION` drops.
+#[test]
+fn a_union_on_the_right_of_a_union_keeps_its_duplicates_apart() {
+    assert_rows(
+        "SELECT n FROM nums WHERE n = 1 UNION ALL (SELECT n FROM nums WHERE n = 1 \
+         UNION SELECT n FROM nums WHERE n = 1)",
+        &[1, 1],
+    );
+    assert_rows(
+        "SELECT n FROM nums WHERE n = 1 UNION (SELECT n FROM nums WHERE n = 2 \
+         UNION SELECT n FROM nums WHERE n = 1) ORDER BY n",
+        &[1, 2],
+    );
 }
 
 #[test]

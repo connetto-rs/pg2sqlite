@@ -64,6 +64,15 @@ pub(crate) fn is_replayable(expr: &Expr, options: &TranslationContext<'_>) -> bo
     check.replayable
 }
 
+/// True when every call `query` makes answers what it answered the first
+/// time, the relations it reads aside, so reading it again in the same
+/// statement reads the same rows wherever the relations it reads do.
+pub(crate) fn calls_replay(query: &Query, options: &TranslationContext<'_>) -> bool {
+    let mut check = CallCheck { check: ReplayCheck { options, replayable: true } };
+    let _: ControlFlow<()> = query.visit(&mut check);
+    check.check.replayable
+}
+
 /// Refuses a lowering that would name `operand` in more than one output
 /// position.
 pub(crate) fn reject_duplicated_operand(construct: &str, operand: &Expr) -> Error {
@@ -150,6 +159,43 @@ impl Visitor for ReplayCheck<'_, '_> {
             self.replayable = false;
             ControlFlow::Break(())
         }
+    }
+}
+
+struct CallCheck<'a, 'o> {
+    check: ReplayCheck<'a, 'o>,
+}
+
+impl CallCheck<'_, '_> {
+    fn found(&mut self, replays: bool) -> ControlFlow<()> {
+        if replays {
+            ControlFlow::Continue(())
+        } else {
+            self.check.replayable = false;
+            ControlFlow::Break(())
+        }
+    }
+}
+
+impl Visitor for CallCheck<'_, '_> {
+    type Break = ();
+
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
+        let replays = !matches!(
+            factor,
+            TableFactor::Table { args: Some(_), .. }
+                | TableFactor::Function { .. }
+                | TableFactor::TableFunction { .. }
+        );
+        self.found(replays)
+    }
+
+    fn post_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        let replays = match expr {
+            Expr::Function(function) => self.check.call_replays(function),
+            _ => true,
+        };
+        self.found(replays)
     }
 }
 
