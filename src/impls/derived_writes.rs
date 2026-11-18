@@ -18,7 +18,7 @@ use sqlparser::{
     parser::Parser,
 };
 use sqlparser_plpgsql::embedded::{
-    Block, Case, If, LoopControl, Node, NodeKind, Open, ReturnQuery, embedded_sql,
+    Block, Branch, Case, If, LoopControl, Node, NodeKind, Open, ReturnQuery, embedded_sql,
 };
 
 #[cfg(not(feature = "std"))]
@@ -103,12 +103,9 @@ fn nodes_write(nodes: &[Node]) -> Option<Write> {
         match &node.kind {
             NodeKind::Statement { statement, .. } => statement_write(statement),
             NodeKind::Block(block) => block_write(block),
-            NodeKind::If(If { branches, otherwise })
-            | NodeKind::Case(Case { branches, otherwise, .. }) => {
-                branches
-                    .iter()
-                    .find_map(|branch| nodes_write(&branch.statements))
-                    .or_else(|| nodes_write(otherwise))
+            NodeKind::If(If { branches, otherwise }) => branches_write(branches, otherwise),
+            NodeKind::Case(Case { branches, otherwise, .. }) => {
+                branches_write(branches, otherwise.as_deref().unwrap_or_default())
             }
             NodeKind::Loop(repeated) => {
                 match &repeated.control {
@@ -142,6 +139,16 @@ fn nodes_write(nodes: &[Node]) -> Option<Write> {
             | NodeKind::Assert(_) => None,
         }
     })
+}
+
+/// The first write in the `WHEN` or `ELSIF` `branches`, then in `otherwise`.
+/// A `CASE` without `ELSE` passes no statements there, since PostgreSQL runs
+/// none and raises `case_not_found` when no branch holds.
+fn branches_write(branches: &[Branch], otherwise: &[Node]) -> Option<Write> {
+    branches
+        .iter()
+        .find_map(|branch| nodes_write(&branch.statements))
+        .or_else(|| nodes_write(otherwise))
 }
 
 fn block_write(block: &Block) -> Option<Write> {
