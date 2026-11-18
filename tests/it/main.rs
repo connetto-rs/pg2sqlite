@@ -69,6 +69,7 @@ mod test_deployment_readings;
 mod test_direction_parity;
 mod test_distinct_on;
 mod test_drop_column_dependents;
+mod test_drop_column_rebuild;
 mod test_drop_statements;
 mod test_edge_branch_integration;
 mod test_emitted_sql_is_valid_sqlite;
