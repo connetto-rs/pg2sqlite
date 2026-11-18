@@ -2127,6 +2127,7 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
             Self::CreateExtension(_) => {
                 drop_with_warning("CREATE EXTENSION", REASON_EXTENSION, emit)
             }
+            Self::AlterExtension(_) => drop_with_warning("ALTER EXTENSION", REASON_EXTENSION, emit),
             Self::DropExtension { .. } => {
                 drop_with_warning("DROP EXTENSION", REASON_EXTENSION, emit)
             }

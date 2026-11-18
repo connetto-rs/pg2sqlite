@@ -233,6 +233,7 @@ const CASES: &[Case] = &[
     // A drop of an extension nothing declared refuses at build, as PostgreSQL
     // does, so the warn-drop needs the extension declared first.
     Case { setup: EXTENSION, sql: "DROP EXTENSION pgcrypto", outcome: Outcome::Warned },
+    Case { setup: EXTENSION, sql: "ALTER EXTENSION pgcrypto UPDATE", outcome: Outcome::Warned },
     rejected("DROP EXTENSION pgcrypto"),
     warned("CREATE SEQUENCE seq START WITH 1"),
     warned("DROP SEQUENCE seq"),
