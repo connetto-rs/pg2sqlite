@@ -70,6 +70,13 @@ const SIDE_COLUMN: &str = "pg2sqlite_side";
 /// Alias for the derived table holding both halves.
 const HALVES_ALIAS: &str = "pg2sqlite_halves";
 
+/// Alias of the one-row derived table binding the operands a walk over
+/// `json_each` reads.
+const OPERANDS_ALIAS: &str = "pg2sqlite_operands";
+
+/// Prefix of the columns of [`OPERANDS_ALIAS`], one per bound operand.
+const OPERAND_COLUMN: &str = "pg2sqlite_operand";
+
 /// True when the caller opted into the JSON array representation.
 #[must_use]
 pub(crate) fn is_json_array_representation(options: &Pg2SqliteOptions) -> bool {
@@ -184,19 +191,59 @@ fn json_each_column(name: &str) -> Expr {
     Expr::Identifier(Ident::new(name))
 }
 
-/// `(SELECT <projection> FROM json_each(<array>) [WHERE <selection>])`.
+/// The `FROM` of a walk over `array` reading `operands`, and what each operand
+/// is read as there.
+///
+/// A name in an operand written beside `json_each` resolves to its column of
+/// that name first, `id`, `key`, `value` and the rest, where PostgreSQL reads
+/// the row the operand was written in. An operand naming a column is bound
+/// in a one-row derived table ahead of `json_each`, which sees only the
+/// enclosing rows, and is read from there.
+fn json_each_beside<const N: usize>(
+    array: Expr,
+    operands: [Expr; N],
+) -> (Vec<TableWithJoins>, [Expr; N]) {
+    let mut bound = Vec::new();
+    let read = operands.map(|operand| {
+        if !references_a_column(&operand) {
+            return operand;
+        }
+        let column = format!("{OPERAND_COLUMN}_{}", bound.len());
+        let read =
+            Expr::CompoundIdentifier(vec![Ident::new(OPERANDS_ALIAS), Ident::new(column.as_str())]);
+        bound.push(aliased(operand, &column));
+        read
+    });
+    let mut from = Vec::with_capacity(2);
+    if !bound.is_empty() {
+        from.extend(from_relation(TableFactor::Derived {
+            lateral: false,
+            subquery: Box::new(make_query(
+                None,
+                SetExpr::Select(Box::new(make_simple_select(bound, Vec::new(), None))),
+            )),
+            alias: Some(TableAlias {
+                explicit: true,
+                name: Ident::new(OPERANDS_ALIAS),
+                columns: Vec::new(),
+                at: None,
+            }),
+            sample: None,
+        }));
+    }
+    from.extend(from_relation(json_each_factor(array)));
+    (from, read)
+}
+
+/// `(SELECT <projection> FROM <from> [WHERE <selection>])`.
 #[must_use]
-fn scalar_subquery_over_json_each(projection: Expr, array: Expr, selection: Option<Expr>) -> Expr {
-    Expr::Subquery(Box::new(single_expr_query(
-        projection,
-        from_relation(json_each_factor(array)),
-        selection,
-    )))
+fn scalar_subquery(projection: Expr, from: Vec<TableWithJoins>, selection: Option<Expr>) -> Expr {
+    Expr::Subquery(Box::new(single_expr_query(projection, from, selection)))
 }
 
 /// `a && b`, PostgreSQL's array overlap, as
 /// `EXISTS (SELECT 1 FROM json_each(a) WHERE value IN (SELECT value FROM
-/// json_each(b)))`.
+/// json_each(b)))`, `b` bound beside the outer walk.
 ///
 /// The inner `value` resolves to the inner `json_each` and the outer one to the
 /// outer, so the two sides really are compared, verified by executing a
@@ -206,6 +253,7 @@ fn scalar_subquery_over_json_each(projection: Expr, array: Expr, selection: Opti
 /// Like `x <op> ALL(arr)` in this module, a NULL operand yields false where
 /// PostgreSQL yields NULL. See the divergence list in the module header.
 pub(crate) fn array_overlap(left: Expr, right: Expr) -> Expr {
+    let (from, [right]) = json_each_beside(left, [right]);
     let shares_an_element = Expr::In {
         expr: Box::new(json_each_column(VALUE_COLUMN)),
         target: InTarget::Subquery(Box::new(single_expr_query(
@@ -218,11 +266,7 @@ pub(crate) fn array_overlap(left: Expr, right: Expr) -> Expr {
     };
 
     Expr::Exists {
-        subquery: Box::new(single_expr_query(
-            integer_literal(1),
-            from_relation(json_each_factor(left)),
-            Some(shares_an_element),
-        )),
+        subquery: Box::new(single_expr_query(integer_literal(1), from, Some(shares_an_element))),
         negated: false,
     }
 }
@@ -243,6 +287,7 @@ pub(crate) fn pattern_matches_any_element(
     escape_char: Option<Box<Expr>>,
     negated: bool,
 ) -> Expr {
+    let (from, [subject]) = json_each_beside(array, [subject]);
     let matches_element = Expr::Like {
         negated,
         any: false,
@@ -251,11 +296,7 @@ pub(crate) fn pattern_matches_any_element(
         escape_char,
     };
     Expr::Exists {
-        subquery: Box::new(single_expr_query(
-            integer_literal(1),
-            from_relation(json_each_factor(array)),
-            Some(matches_element),
-        )),
+        subquery: Box::new(single_expr_query(integer_literal(1), from, Some(matches_element))),
         negated: false,
     }
 }
@@ -269,6 +310,7 @@ pub(crate) fn pattern_matches_any_element_folded(
     negated: bool,
     fold_function: Option<&str>,
 ) -> Expr {
+    let (from, [subject]) = json_each_beside(array, [subject]);
     let element = match fold_function {
         Some(name) => simple_function_expr(name, vec![json_each_column(VALUE_COLUMN)], None),
         None => simple_function_expr("lower", vec![json_each_column(VALUE_COLUMN)], None),
@@ -281,11 +323,7 @@ pub(crate) fn pattern_matches_any_element_folded(
         escape_char,
     };
     Expr::Exists {
-        subquery: Box::new(single_expr_query(
-            integer_literal(1),
-            from_relation(json_each_factor(array)),
-            Some(matches_element),
-        )),
+        subquery: Box::new(single_expr_query(integer_literal(1), from, Some(matches_element))),
         negated: false,
     }
 }
@@ -708,9 +746,10 @@ fn array_lower_bound(array: Expr) -> Expr {
 /// walk.
 #[must_use]
 fn array_to_string(array: Expr, separator: Expr) -> Expr {
-    let joined = scalar_subquery_over_json_each(
+    let (from, [separator]) = json_each_beside(array.clone(), [separator]);
+    let joined = scalar_subquery(
         ordered_aggregate("group_concat", vec![json_each_column(VALUE_COLUMN), separator]),
-        array.clone(),
+        from,
         None,
     );
     case_when(
@@ -751,13 +790,14 @@ fn array_append(array: Expr, value: Expr) -> Expr {
 /// nothing.
 #[must_use]
 fn array_position(array: Expr, value: Expr) -> Expr {
-    scalar_subquery_over_json_each(
+    let (from, [value]) = json_each_beside(array, [value]);
+    scalar_subquery(
         Expr::BinaryOp {
             left: Box::new(simple_function_expr("min", vec![json_each_column(KEY_COLUMN)], None)),
             op: BinaryOperator::Plus,
             right: Box::new(integer_literal(1)),
         },
-        array,
+        from,
         Some(null_safe_eq(json_each_column(VALUE_COLUMN), value)),
     )
 }
@@ -770,7 +810,8 @@ fn array_position(array: Expr, value: Expr) -> Expr {
 /// answers `'[]'` where PostgreSQL answers NULL.
 #[must_use]
 fn array_positions(array: Expr, value: Expr) -> Expr {
-    let inner = scalar_subquery_over_json_each(
+    let (from, [value]) = json_each_beside(array.clone(), [value]);
+    let inner = scalar_subquery(
         ordered_aggregate(
             "json_group_array",
             vec![Expr::BinaryOp {
@@ -779,7 +820,7 @@ fn array_positions(array: Expr, value: Expr) -> Expr {
                 right: Box::new(integer_literal(1)),
             }],
         ),
-        array.clone(),
+        from,
         Some(null_safe_eq(json_each_column(VALUE_COLUMN), value)),
     );
     case_when(Expr::IsNotNull(Box::new(array)), inner, None)
@@ -794,9 +835,10 @@ fn array_positions(array: Expr, value: Expr) -> Expr {
 /// `array_remove(a, NULL)` working.
 #[must_use]
 fn array_remove(array: Expr, value: Expr) -> Expr {
-    let inner = scalar_subquery_over_json_each(
+    let (from, [value]) = json_each_beside(array.clone(), [value]);
+    let inner = scalar_subquery(
         ordered_aggregate("json_group_array", vec![json_each_column(VALUE_COLUMN)]),
-        array.clone(),
+        from,
         Some(null_safe_neq(json_each_column(VALUE_COLUMN), value)),
     );
     case_when(Expr::IsNotNull(Box::new(array)), inner, None)
@@ -810,16 +852,13 @@ fn array_remove(array: Expr, value: Expr) -> Expr {
 /// answers `'[]'` where PostgreSQL answers NULL.
 #[must_use]
 fn array_replace(array: Expr, from: Expr, to: Expr) -> Expr {
+    let (walk, [from, to]) = json_each_beside(array.clone(), [from, to]);
     let replaced = case_when(
         null_safe_eq(json_each_column(VALUE_COLUMN), from),
         to,
         Some(json_each_column(VALUE_COLUMN)),
     );
-    let inner = scalar_subquery_over_json_each(
-        ordered_aggregate("json_group_array", vec![replaced]),
-        array.clone(),
-        None,
-    );
+    let inner = scalar_subquery(ordered_aggregate("json_group_array", vec![replaced]), walk, None);
     case_when(Expr::IsNotNull(Box::new(array)), inner, None)
 }
 
@@ -869,8 +908,9 @@ pub(crate) fn translate_quantified_over_array(
         return Err(representation_required("A quantified comparison over an array value"));
     }
 
+    let (from, [left]) = json_each_beside(array, [translated_left.clone()]);
     let comparison = Expr::BinaryOp {
-        left: Box::new(translated_left.clone()),
+        left: Box::new(left),
         op: compare_op.clone(),
         right: Box::new(json_each_column(VALUE_COLUMN)),
     };
@@ -880,11 +920,7 @@ pub(crate) fn translate_quantified_over_array(
     };
 
     Ok(Expr::Exists {
-        subquery: Box::new(single_expr_query(
-            integer_literal(1),
-            from_relation(json_each_factor(array)),
-            Some(selection),
-        )),
+        subquery: Box::new(single_expr_query(integer_literal(1), from, Some(selection))),
         negated,
     })
 }
