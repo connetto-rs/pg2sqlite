@@ -527,6 +527,44 @@ CREATE TRIGGER notes_revised AFTER UPDATE ON notes
     );
 }
 
+/// A `CASE` without `ELSE` runs nothing when no `WHEN` holds, PostgreSQL
+/// raising `case_not_found`, so its `WHEN` branches are read and the reading
+/// goes on past `END CASE`.
+#[test]
+fn a_write_around_a_case_without_else_is_found() {
+    let pg = "
+CREATE TABLE notes (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL);
+CREATE TABLE note_events (id INTEGER PRIMARY KEY, note_id INTEGER NOT NULL);
+CREATE FUNCTION log_first_revision() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  CASE NEW.revision
+    WHEN 1 THEN
+      INSERT INTO note_events (note_id) VALUES (NEW.id);
+  END CASE;
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER notes_first AFTER INSERT ON notes
+  FOR EACH ROW EXECUTE FUNCTION log_first_revision();
+CREATE FUNCTION log_checked_revision() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  CASE
+    WHEN NEW.revision < 0 THEN
+      RAISE EXCEPTION 'negative revision';
+  END CASE;
+  INSERT INTO note_events (note_id) VALUES (NEW.id);
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER notes_checked AFTER UPDATE ON notes
+  FOR EACH ROW EXECUTE FUNCTION log_checked_revision();
+";
+    assert_eq!(
+        left_to_server(pg),
+        owned(&[("TRIGGER", "notes_first", "notes"), ("TRIGGER", "notes_checked", "notes")]),
+    );
+}
+
 #[test]
 fn a_write_in_the_query_a_set_returning_helper_returns_is_found() {
     let pg = "

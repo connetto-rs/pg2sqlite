@@ -572,7 +572,10 @@ impl PlPgSqlTranslator {
     /// - `TG_TABLE_NAME` becomes the table name literal.
     /// - Any other `TG_*` name produces an error naming the variable.
     #[cfg_attr(feature = "std", recursive::recursive)]
-    fn fold_trigger_specials(expr: &mut Expr, context: &PlPgSqlContext) -> Result<(), Error> {
+    pub(crate) fn fold_trigger_specials(
+        expr: &mut Expr,
+        context: &PlPgSqlContext,
+    ) -> Result<(), Error> {
         use crate::impls::expr_helpers::mutate_expr_children;
 
         match expr {

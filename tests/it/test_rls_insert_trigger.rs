@@ -115,8 +115,7 @@ fn direct_backing_update_denied_without_update_policy() {
     assert!(result.is_err(), "direct backing UPDATE must be denied when no UPDATE policy exists");
 }
 
-// ── Two-column BEFORE INSERT maintenance trigger → OR exemption (rls.rs
-// 2266-2284) ──
+// ── Two-column BEFORE INSERT maintenance trigger ──
 
 diesel::table! {
     items (id) {
@@ -159,31 +158,10 @@ const ITEMS_SCHEMA: &str = "
     FOR EACH ROW EXECUTE FUNCTION items_maintain();
 ";
 
-/// Two maintained columns produce an OR-joined exemption WHEN clause with two
-/// IS DISTINCT FROM conditions (rls.rs lines 2266-2284).  The INSERT must
-/// succeed because the maintenance update passes the WHEN clause.
+/// The INSERT succeeds because the backing-table guard lets the maintenance
+/// trigger's own UPDATE through.
 #[test]
 fn rls_two_column_maintenance_trigger_exemption_fires() {
-    // Verify the exemption clause has two IS DISTINCT FROM conditions.
-    let opts = Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit");
-    let stmts = Pg2Sqlite::default()
-        .sql(ITEMS_SCHEMA)
-        .expect("parse")
-        .translate_to_sql(&opts)
-        .expect("translate")
-        .into_vec();
-    let update_check = stmts
-        .iter()
-        .map(ToString::to_string)
-        .find(|s| s.contains("update_check"))
-        .expect("update-check trigger must be emitted");
-    assert_eq!(
-        update_check.matches("IS DISTINCT FROM").count(),
-        2,
-        "two maintained columns must produce two IS DISTINCT FROM clauses: {update_check}"
-    );
-    assert!(update_check.contains(" OR "), "conditions must be joined by OR: {update_check}");
-
     // Execute: INSERT through the view must succeed.
     let mut conn = helpers::apply_translated_ddl(
         ITEMS_SCHEMA,
@@ -200,6 +178,68 @@ fn rls_two_column_maintenance_trigger_exemption_fires() {
         .expect("row must be readable from backing table");
     assert_eq!(row.tag.as_deref(), Some("hello!"), "tag must be maintained");
     assert_eq!(row.slug.as_deref(), Some("WORLD"), "slug must be maintained");
+}
+
+/// A caller UPDATE of the backing table stays denied without an UPDATE policy
+/// even when it writes exactly the values the maintenance trigger computes.
+#[test]
+fn caller_update_writing_the_maintained_values_is_denied() {
+    let mut conn = helpers::apply_translated_ddl(
+        ITEMS_SCHEMA,
+        &Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit"),
+    );
+    diesel::insert_into(items::table)
+        .values((items::id.eq(1_i32), items::tag.eq("hello"), items::slug.eq("world")))
+        .execute(&mut conn)
+        .expect("INSERT through RLS view must succeed");
+    let result = diesel::update(items_rls::table.find(1))
+        .set((items_rls::tag.eq(items_rls::tag.concat("!")), items_rls::slug.eq("WORLD")))
+        .execute(&mut conn);
+    assert!(result.is_err(), "a caller UPDATE must be denied without an UPDATE policy");
+}
+
+diesel::table! {
+    priced (id) {
+        id -> Integer,
+        price -> Nullable<BigInt>,
+    }
+}
+
+diesel::table! {
+    priced_rls (id) {
+        id -> Integer,
+        price -> Nullable<BigInt>,
+    }
+}
+
+/// The maintenance write stores `1.25` in a `NUMERIC(10,2)` column as the
+/// scaled integer 125, so the exemption letting it past the missing `UPDATE`
+/// policy has to expect 125. Expecting `1.25` denies the trigger's own write
+/// and with it the insert. PostgreSQL stores 1.25.
+#[test]
+fn rls_maintenance_exemption_expects_the_scaled_numeric() {
+    let mut conn = helpers::apply_translated_ddl(
+        "CREATE TABLE priced (id INT PRIMARY KEY, price NUMERIC(10,2));
+         ALTER TABLE priced ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY priced_sel ON priced FOR SELECT USING (true);
+         CREATE POLICY priced_ins ON priced FOR INSERT WITH CHECK (true);
+         CREATE FUNCTION fix_price() RETURNS trigger AS $$
+         BEGIN
+             NEW.price := 1.25;
+             RETURN NEW;
+         END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER priced_fix BEFORE INSERT ON priced
+             FOR EACH ROW EXECUTE FUNCTION fix_price();",
+        &Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit"),
+    );
+    diesel::insert_into(priced::table)
+        .values(priced::id.eq(1))
+        .execute(&mut conn)
+        .expect("INSERT through RLS view must succeed");
+    let price: Option<i64> =
+        priced_rls::table.find(1).select(priced_rls::price).first(&mut conn).expect("select");
+    assert_eq!(price, Some(125));
 }
 
 // ── Non-maintenance BEFORE INSERT trigger → continue at rls.rs 2263 ──────────

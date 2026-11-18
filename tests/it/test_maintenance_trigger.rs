@@ -59,13 +59,6 @@ diesel::table! {
     }
 }
 
-#[derive(Queryable, Selectable, Debug)]
-#[diesel(table_name = w2)]
-#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
-struct W2Row {
-    tag: Option<String>,
-}
-
 #[derive(Insertable)]
 #[diesel(table_name = w2)]
 struct NewW2 {
@@ -653,13 +646,12 @@ FOR EACH ROW EXECUTE FUNCTION update_brands_edited_at();
     Ok(())
 }
 
-// ── Two-column maintenance trigger → OR condition in WHEN clause ─────────────
+// ── Two-column maintenance trigger ──────────────────────────────────────────
 
-/// A maintenance trigger that assigns to two columns emits a WHEN clause with
-/// two IS DISTINCT FROM conditions joined by OR (create_trigger.rs 318-320).
-/// One update changes both columns; recursion must not fire a second time.
+/// A maintenance trigger that assigns to two columns writes both once, and its
+/// own write does not fire it again.
 #[test]
-fn maintenance_trigger_two_columns_when_clause_uses_or() {
+fn maintenance_trigger_maintains_two_columns_once() {
     let sql = "
 CREATE TABLE widgets (id INT PRIMARY KEY, tag TEXT, slug TEXT);
 
@@ -674,24 +666,6 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER widgets_maint BEFORE UPDATE ON widgets
 FOR EACH ROW EXECUTE FUNCTION widgets_maintain();
 ";
-    let stmts = Pg2Sqlite::default()
-        .sql(sql)
-        .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
-        .expect("translate")
-        .into_vec();
-
-    let trigger_sql = stmts
-        .iter()
-        .map(ToString::to_string)
-        .find(|s| s.contains("AFTER UPDATE"))
-        .expect("maintenance trigger must be in output");
-    assert!(
-        trigger_sql.matches("IS DISTINCT FROM").count() >= 2,
-        "two maintained columns must produce two IS DISTINCT FROM clauses: {trigger_sql}"
-    );
-    assert!(trigger_sql.contains(" OR "), "two conditions must be joined by OR: {trigger_sql}");
-
     let mut conn = helpers::apply_translated_ddl(sql, &Pg2SqliteOptions::default());
     diesel::insert_into(widgets::table)
         .values(&NewWidget { id: 1, tag: Some("hello".into()), slug: Some("world".into()) })
@@ -711,13 +685,12 @@ FOR EACH ROW EXECUTE FUNCTION widgets_maintain();
     assert_eq!(w.slug.as_deref(), Some("WORLD"), "slug must be uppercased by maintenance");
 }
 
-// ── Maintenance trigger with a source WHEN clause → AND merge ────────────────
+// ── Maintenance trigger with a source WHEN clause ───────────────────────────
 
-/// When the source trigger already has a WHEN clause, the recursion guard
-/// appended by the translation is ANDed with it (create_trigger.rs 327-332,
-/// line 657).  The merged clause must contain both predicates.
+/// A source `WHEN` still decides whether the maintenance trigger fires,
+/// alongside the guard that keeps it from firing on its own write.
 #[test]
-fn maintenance_trigger_with_source_when_clause_merges_recursion_guard() {
+fn maintenance_trigger_keeps_its_source_when_clause() {
     let sql = "
 CREATE TABLE w2 (id INT PRIMARY KEY, tag TEXT);
 
@@ -731,44 +704,19 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER w2_maint BEFORE UPDATE ON w2
 FOR EACH ROW WHEN (OLD.id > 0) EXECUTE FUNCTION w2_maintain();
 ";
-    let stmts = Pg2Sqlite::default()
-        .sql(sql)
-        .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
-        .expect("translate")
-        .into_vec();
-
-    let trigger_sql = stmts
-        .iter()
-        .map(ToString::to_string)
-        .find(|s| s.contains("AFTER UPDATE"))
-        .expect("maintenance trigger must be in output");
-    // Source WHEN (OLD.id > 0) merged with recursion guard using AND.
-    assert!(trigger_sql.contains(" AND "), "merged WHEN clause must use AND: {trigger_sql}");
-    assert!(
-        trigger_sql.contains("OLD.id"),
-        "source WHEN predicate must survive the merge: {trigger_sql}"
-    );
-    assert!(
-        trigger_sql.contains("IS DISTINCT FROM"),
-        "recursion guard must be present: {trigger_sql}"
-    );
-    // Execute: trigger fires only when OLD.id > 0, which is always true here.
     let mut conn = helpers::apply_translated_ddl(sql, &Pg2SqliteOptions::default());
     // Typed Diesel DSL for DML; translator-emitted DDL above uses sql_query
     // (dynamic schema).
-    diesel::insert_into(w2::table)
-        .values(&NewW2 { id: 1, tag: Some("hi".into()) })
-        .execute(&mut conn)
-        .expect("insert");
-    diesel::update(w2::table.filter(w2::id.eq(1)))
-        .set(w2::tag.eq("hi"))
-        .execute(&mut conn)
-        .expect("update");
-    // After UPDATE the maintenance trigger fires and appends '!'.
-    let row =
-        w2::table.filter(w2::id.eq(1)).select(W2Row::as_select()).first(&mut conn).expect("select");
-    assert_eq!(row.tag.as_deref(), Some("hi!"), "maintenance trigger must have appended '!'");
+    let rows = [NewW2 { id: 0, tag: Some("hi".into()) }, NewW2 { id: 1, tag: Some("hi".into()) }];
+    diesel::insert_into(w2::table).values(&rows[..]).execute(&mut conn).expect("insert");
+    diesel::update(w2::table).set(w2::tag.eq("hi")).execute(&mut conn).expect("update");
+    let tags: Vec<Option<String>> =
+        w2::table.order(w2::id.asc()).select(w2::tag).load(&mut conn).expect("select");
+    assert_eq!(
+        tags,
+        [Some("hi".to_owned()), Some("hi!".to_owned())],
+        "the trigger fires once on the row its WHEN admits and never on the other"
+    );
 }
 
 // ── R106: sequential NEW.col assignments ────────────────────────────────────

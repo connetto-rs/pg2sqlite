@@ -31,6 +31,7 @@ mod order_by_expr;
 pub mod plpgsql;
 pub mod postgis;
 pub(crate) mod query;
+pub(crate) mod reentry;
 mod referential_action;
 pub mod rls;
 pub(crate) mod sql_helper;
