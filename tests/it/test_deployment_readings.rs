@@ -659,6 +659,21 @@ fn role_readings_replay_as_constants() {
     );
 }
 
+/// The isolation level is a literal once translated, so a lowering may name it
+/// twice.
+#[test]
+fn the_isolation_level_replays_as_a_constant() {
+    let translated = translate(
+        "SELECT 'serializable' = ANY(string_to_array(current_setting('transaction_isolation'), ','));",
+        &options(),
+    )
+    .expect("translates");
+    assert!(
+        translated.contains("instr(',' || 'serializable' || ',', ',' || 'serializable' || ',')"),
+        "{translated}"
+    );
+}
+
 const POLICY: &str = "CREATE TABLE p (owner TEXT); ALTER TABLE p ENABLE ROW LEVEL SECURITY;";
 
 #[test]
