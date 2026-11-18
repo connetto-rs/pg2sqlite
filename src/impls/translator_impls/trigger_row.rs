@@ -14,6 +14,8 @@ use sql_traits::{
 };
 use sqlparser::ast::{BinaryOperator, Expr, Ident, TriggerEvent, Value};
 
+#[cfg(not(feature = "std"))]
+use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::function_helpers::{simple_function_expr, string_literal},
