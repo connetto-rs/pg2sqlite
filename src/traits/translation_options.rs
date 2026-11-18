@@ -298,7 +298,8 @@ mod registration {
                     Canonical(text.as_deref().map(Self::canonical_text).transpose())
                 },
             )?;
-            connection.register_collation(&self.collation, Self::compare)
+            // diesel 2.x hands a collation SQLite's right operand first.
+            connection.register_collation(&self.collation, |right, left| Self::compare(left, right))
         }
     }
 }
