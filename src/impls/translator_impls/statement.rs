@@ -56,8 +56,9 @@ use crate::{
         },
         object_name::{
             append_suffix, last_ident, last_ident_value_or_display,
-            normalize_schema_qualified_object_name_for_sqlite, quoted_ident,
-            resolve_declared_table, resolve_translation_table, sqlite_unqualified_object_name,
+            normalize_schema_qualified_object_name_for_sqlite, quoted_ident, reads_column,
+            resolve_declared_table, resolve_translation_table, same_identifier,
+            sqlite_unqualified_object_name,
         },
         placeholder::rewrite_placeholders_for_sqlite,
         privileges::{RoleTable, names_table_with_backing},
@@ -680,12 +681,20 @@ fn translate_alter_table(
             continue;
         };
         if let AlterTableOperation::DropColumn { column_names, .. } = operation {
-            statements.extend(dropped_clock_triggers(
+            let written = options.written_schema().unwrap_or(schema);
+            let mut dependents =
+                dropped_clock_triggers(&alter_table.name, column_names, written, options)?;
+            dependents.extend(dropped_column_indexes(
                 &alter_table.name,
                 column_names,
-                options.written_schema().unwrap_or(schema),
+                schema,
                 options,
+                emit,
             )?);
+            // An earlier drop of the same statement may have taken a dependent
+            // already.
+            dependents.retain(|dependent| !statements.contains(dependent));
+            statements.extend(dependents);
         }
         // Every field is named rather than spread from the input, so a field
         // added upstream fails to compile here instead of reaching SQLite
@@ -706,6 +715,54 @@ fn translate_alter_table(
     }
 
     Ok(statements)
+}
+
+/// Drops of the indexes of `table` that read one of `columns`, which
+/// PostgreSQL drops along with the column, translated as a `DROP INDEX`.
+fn dropped_column_indexes(
+    table: &ObjectName,
+    columns: &[Ident],
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Vec<Statement>, Error> {
+    let written = options.written_schema().unwrap_or(schema);
+    let Some(stored) = resolve_translation_table(written, table)? else {
+        return Ok(Vec::new());
+    };
+    let names: Vec<ObjectName> = stored
+        .indices(written)?
+        .filter(|index| {
+            let index = index.attribute();
+            columns.iter().any(|column| {
+                index.columns.iter().any(|key| reads_column(&key.column.expr, column))
+                    || index.include.iter().any(|included| same_identifier(included, column))
+                    || index
+                        .predicate
+                        .as_ref()
+                        .is_some_and(|predicate| reads_column(predicate, column))
+            })
+        })
+        .filter_map(|index| index.attribute().name.clone())
+        .collect();
+    let mut drops = Vec::new();
+    // SQLite drops one index per statement.
+    for name in names {
+        drops.extend(
+            Statement::Drop {
+                object_type: ObjectType::Index,
+                if_exists: false,
+                names: vec![name],
+                cascade: false,
+                restrict: false,
+                purge: false,
+                temporary: false,
+                table: None,
+            }
+            .translate_with_warnings(schema, options, emit)?,
+        );
+    }
+    Ok(drops)
 }
 
 /// Refuses the `ALTER TABLE` clauses that cannot reach SQLite, so

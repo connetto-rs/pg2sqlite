@@ -27,7 +27,6 @@ use core::ops::ControlFlow;
 use sql_traits::{
     structs::ParserDB,
     traits::{CheckConstraintLike, TableLike},
-    utils::identifier_resolution::identifiers_match,
 };
 use sqlparser::ast::{
     CheckConstraint, ColumnOption, CreateTable, DropTrigger, Expr, Function, FunctionArg,
@@ -42,7 +41,9 @@ use crate::{
     impls::{
         ast_builder,
         function_helpers::{is_function_named, single_quoted_literal},
-        object_name::{quoted_ident, resolve_declared_table, resolve_translation_table},
+        object_name::{
+            quoted_ident, reads_column, resolve_declared_table, resolve_translation_table,
+        },
         translator_impls::{
             column_option::warn_no_inherit_dropped, rls::write_guard_condition_expr,
             statement::negate,
@@ -242,28 +243,6 @@ pub(crate) fn dropped_clock_triggers(
             })
         })
         .collect())
-}
-
-/// Whether `expr` names `column`, bare or qualified.
-fn reads_column(expr: &Expr, column: &Ident) -> bool {
-    let names = |ident: &Ident| {
-        identifiers_match(
-            &ident.value,
-            ident.quote_style.is_some(),
-            &column.value,
-            column.quote_style.is_some(),
-        )
-    };
-    visit_expressions(expr, |node| {
-        match node {
-            Expr::Identifier(ident) if names(ident) => ControlFlow::Break(()),
-            Expr::CompoundIdentifier(parts) if parts.last().is_some_and(names) => {
-                ControlFlow::Break(())
-            }
-            _ => ControlFlow::Continue(()),
-        }
-    })
-    .is_break()
 }
 
 const VERB_INSERT: &str = "insert";
