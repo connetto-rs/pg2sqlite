@@ -21,7 +21,7 @@ use crate::{
     impls::{
         function_helpers::{integer_literal, simple_function_expr},
         query_builder::make_query,
-        shared_helpers::TranslationDirection,
+        shared_helpers::{TranslationDirection, select_over},
     },
     traits::translator::TranslatorWithContext,
     warnings::TranslationWarning,
@@ -140,6 +140,13 @@ impl crate::traits::translator::TranslatorWithContext for Query {
                 SetExpr::Select(Box::new(select.translate_with_warnings(schema, options, emit)?))
             }
             _ => query.body.translate_with_warnings(schema, options, emit)?,
+        };
+        let body = if matches!(body, SetExpr::Values(_))
+            && (order_by.is_some() || limit_clause.is_some() || fetch.is_some())
+        {
+            select_over(Box::new(make_query(None, body)))
+        } else {
+            body
         };
         Ok(build_query_envelope(
             body,
