@@ -100,3 +100,67 @@ fn diesel_compound_queries_preserve_pagination_and_bind_identity() {
     reverse_rows.sort_unstable();
     assert_eq!(reverse_rows, source_rows);
 }
+
+/// Unselected distinct keys remain available to the outer ordering.
+#[test]
+fn distinct_on_orders_by_unprojected_keys() {
+    assert_distinct_order_parity(
+        "CREATE TABLE distinct_names (id INTEGER PRIMARY KEY, name TEXT);
+         INSERT INTO distinct_names VALUES (1, 'z'), (2, 'a'), (3, 'a'), (4, NULL), (5, 'A');",
+        &[
+            "SELECT DISTINCT ON (name) id::text AS v FROM distinct_names ORDER BY name, id",
+            "SELECT DISTINCT ON (lower(name)) id::text AS v FROM distinct_names ORDER BY lower(name) DESC NULLS LAST, id DESC",
+            "SELECT DISTINCT ON (names.name) names.id::text AS v FROM distinct_names AS names ORDER BY names.name, names.id",
+            "SELECT DISTINCT ON (name) id::text AS v, id AS __pg2sqlite_order_2 FROM distinct_names ORDER BY name, id",
+            "SELECT DISTINCT ON (name) name AS v FROM distinct_names ORDER BY v, id",
+            "SELECT DISTINCT ON (name) id::text AS v FROM distinct_names ORDER BY name, id LIMIT 1 OFFSET 1",
+        ],
+    );
+}
+
+/// Interval ordering uses the same comparison keys for partitions and outer
+/// sorting.
+#[test]
+fn distinct_on_orders_by_unprojected_intervals() {
+    assert_distinct_order_parity(
+        "CREATE TABLE distinct_intervals (id INTEGER PRIMARY KEY, duration INTERVAL);
+         INSERT INTO distinct_intervals VALUES (1, '2 months'), (2, '1 month'), (3, '30 days'), (4, NULL);",
+        &[
+            "SELECT DISTINCT ON (duration) id::text AS v FROM distinct_intervals ORDER BY duration, id",
+            "SELECT DISTINCT ON (duration) id::text AS v FROM distinct_intervals ORDER BY duration DESC NULLS LAST, id DESC",
+            "SELECT DISTINCT ON (intervals.duration) intervals.id::text AS v FROM distinct_intervals AS intervals ORDER BY intervals.duration, intervals.id",
+        ],
+    );
+}
+
+/// Runs the source and translated statements against their respective engines.
+fn assert_distinct_order_parity(source: &str, queries: &[&str]) {
+    let mut postgres = postgres_harness::fresh_database();
+    let mut sqlite = establish_connection();
+    postgres.batch_execute(source).unwrap();
+    let options = Pg2SqliteOptions::default();
+    let statements = Pg2Sqlite::default().sql(source).unwrap().translate(&options).unwrap();
+    super::harness::execute_ddl(&mut sqlite, &statements.into_vec());
+    let schema = Pg2Sqlite::default().sql(source).unwrap().build_schema().unwrap();
+    for query in queries {
+        let translated = Pg2Sqlite::default()
+            .sql(query)
+            .unwrap()
+            .translate_with_schema(&schema, &options)
+            .unwrap()
+            .into_vec()
+            .pop()
+            .unwrap()
+            .to_string();
+        // Source and emitted SQL are the artifacts under test.
+        let expected = diesel::sql_query(*query).load::<DistinctValue>(&mut postgres).unwrap();
+        let actual = diesel::sql_query(&translated).load::<DistinctValue>(&mut sqlite).unwrap();
+        assert_eq!(actual, expected, "{translated}");
+    }
+}
+
+#[derive(Debug, PartialEq, QueryableByName)]
+struct DistinctValue {
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    v: Option<String>,
+}
