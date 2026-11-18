@@ -25,7 +25,7 @@ use crate::{
         object_name::last_ident_value_or_display,
         translator_impls::{
             create_index::{FtsTranslation, analyze_fts_index},
-            definer, postgis,
+            deferred_constraint, definer, postgis,
             rls::generate_rls_audit_table,
             statement::is_data_movement_statement,
         },
@@ -83,6 +83,17 @@ fn populate_prewalk_catalogs(
     initial_schema: Option<&ParserDB>,
     context: &mut TranslationContext<'_>,
 ) {
+    use crate::impls::translator_impls::deferred_constraint::DeferredTrigger;
+
+    // An earlier batch's deferred checks still queue, so this batch drains too.
+    for trigger in initial_schema.into_iter().flat_map(|schema| {
+        use sql_traits::traits::DatabaseLike;
+        schema.triggers()
+    }) {
+        if let Some(deferred) = DeferredTrigger::of(trigger) {
+            context.add_deferred_trigger(deferred);
+        }
+    }
     for statement in statements {
         register_declared_object_name(statement, context);
         if let Statement::CreateIndex(create_index) = statement {
@@ -90,6 +101,9 @@ fn populate_prewalk_catalogs(
         }
         if let Statement::CreateTrigger(trigger) = statement {
             use sqlparser::ast::{TriggerEvent, TriggerPeriod};
+            if let Some(deferred) = DeferredTrigger::of(trigger) {
+                context.add_deferred_trigger(deferred);
+            }
             if matches!(trigger.period, Some(TriggerPeriod::Before))
                 && trigger.events.iter().any(|e| matches!(e, TriggerEvent::Insert))
                 && let Some(exec_body) = &trigger.exec_body
@@ -178,6 +192,36 @@ fn pragma_on(name: &str) -> Statement {
         }),
         is_eq: true,
     }
+}
+
+/// The tables the translation creates for itself, each labelled for a name
+/// collision report: the row-security audit table when the batch is the first
+/// to carry row-level security, the definer owner stack when a statement
+/// pushes on it, and the deferred constraint check queue.
+fn generated_prelude(
+    translated: &[Vec<Statement>],
+    schema: &ParserDB,
+    options: &Pg2SqliteOptions,
+    had_rls_tables: bool,
+    context: &TranslationContext<'_>,
+) -> Result<Vec<(&'static str, Statement)>, crate::errors::Error> {
+    use sql_traits::traits::DatabaseLike;
+
+    let audit_table = (!had_rls_tables && schema.has_rls_tables()?)
+        .then(|| options.get_rls_audit_table_name())
+        .flatten()
+        .map(|name| ("the row-security audit table", generate_rls_audit_table(name)));
+    let definer_stack = translated
+        .iter()
+        .flatten()
+        .any(definer::uses_stack)
+        .then(|| ("the definer owner stack", definer::stack_table()));
+    let deferred_queue = (!context.deferred_triggers().is_empty())
+        .then(deferred_constraint::queue_tables)
+        .into_iter()
+        .flatten()
+        .map(|statement| ("the deferred constraint check queue", statement));
+    Ok(audit_table.into_iter().chain(definer_stack).chain(deferred_queue).collect())
 }
 
 /// `PRAGMA foreign_keys = 1`, which is what makes SQLite enforce a foreign
@@ -764,8 +808,6 @@ impl Pg2Sqlite {
         context: &mut TranslationContext<'_>,
         mut should_translate: impl FnMut(&Statement) -> bool,
     ) -> Result<PreparedStatements<'a>, crate::errors::Error> {
-        use sql_traits::traits::DatabaseLike;
-
         let PreparedSchema {
             sources,
             schema,
@@ -836,16 +878,7 @@ impl Pg2Sqlite {
         }
 
         let schema = schema?;
-        let audit_table = (!had_rls_tables && schema.has_rls_tables()?)
-            .then(|| options.get_rls_audit_table_name())
-            .flatten()
-            .map(|name| ("the row-security audit table", generate_rls_audit_table(name)));
-        let definer_stack = translated
-            .iter()
-            .flatten()
-            .any(definer::uses_stack)
-            .then(|| ("the definer owner stack", definer::stack_table()));
-        let prelude: Vec<_> = audit_table.into_iter().chain(definer_stack).collect();
+        let prelude = generated_prelude(&translated, &schema, &options, had_rls_tables, context)?;
 
         reject_name_collisions(
             initial_schema.as_ref(),
@@ -912,7 +945,12 @@ impl Pg2Sqlite {
             main,
             attached,
         );
-        let mut script = Script { setup: Vec::new(), files, connection };
+        let before_commit = if context.deferred_triggers().is_empty() {
+            Vec::new()
+        } else {
+            vec![deferred_constraint::drain()]
+        };
+        let mut script = Script { setup: Vec::new(), files, connection, before_commit };
         // Last, so the replay and rebinding forms built above are covered too.
         for statement in script.files.statements_mut().chain(script.connection.iter_mut().flatten())
         {

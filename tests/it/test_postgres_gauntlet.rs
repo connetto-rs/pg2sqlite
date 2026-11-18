@@ -63,6 +63,9 @@ mod parity_nulls_not_distinct;
 #[path = "gauntlet/parity_definer_triggers.rs"]
 mod parity_definer_triggers;
 
+#[path = "gauntlet/parity_deferred_constraint_triggers.rs"]
+mod parity_deferred_constraint_triggers;
+
 #[path = "gauntlet/parity_values.rs"]
 mod parity_values;
 
@@ -105,3 +108,8 @@ mod parity_maintenance_reentry;
 
 #[path = "gauntlet/parity_new_assignments.rs"]
 mod parity_new_assignments;
+#[path = "gauntlet/parity_trigger_body_statements.rs"]
+mod parity_trigger_body_statements;
+
+#[path = "gauntlet/parity_perform_helpers.rs"]
+mod parity_perform_helpers;

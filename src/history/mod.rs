@@ -155,7 +155,7 @@ fn replay(
         let transaction = outline.transaction(StatementId(index));
         if transaction != open {
             if open.is_some() {
-                program.push(commit());
+                program.extend(commit(context));
             }
             if transaction.is_some() {
                 program.push(begin());
@@ -184,7 +184,7 @@ fn replay(
         }
     }
     if open.is_some() {
-        program.push(commit());
+        program.extend(commit(context));
     }
     Ok(program)
 }
@@ -465,8 +465,15 @@ fn begin() -> Statement {
     }
 }
 
-fn commit() -> Statement {
-    Statement::Commit { chain: false, end: false, modifier: None }
+/// The `COMMIT` of a replayed transaction, running the deferred constraint
+/// checks it queued first as a translated `COMMIT` does.
+fn commit(context: &TranslationContext<'_>) -> Vec<Statement> {
+    let mut statements: Vec<Statement> = (!context.deferred_triggers().is_empty())
+        .then(crate::impls::translator_impls::deferred_constraint::drain)
+        .into_iter()
+        .collect();
+    statements.push(Statement::Commit { chain: false, end: false, modifier: None });
+    statements
 }
 
 pub(super) fn refusal(detail: String) -> ConnectionError {

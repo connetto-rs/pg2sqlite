@@ -1,9 +1,9 @@
-//! Hazards for the PL/pgSQL preprocessor's text scanning.
+//! Hazards for reading a PL/pgSQL body.
 //!
 //! Every case here puts something that looks like PL/pgSQL syntax where the
-//! scanner must not react to it: inside a string literal, inside a comment, or
-//! inside a longer identifier. Each must translate correctly or fail with a
-//! clear error, never silently corrupt the body.
+//! body reader must not react to it, inside a string literal, inside a
+//! comment, or inside a longer identifier. Each must translate correctly or
+//! fail with a clear error, never silently corrupt the body.
 //!
 //! The literal cases read the declared value back out of the row, so a default
 //! that is mangled rather than lost is visible.

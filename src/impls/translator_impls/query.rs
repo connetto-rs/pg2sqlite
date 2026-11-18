@@ -30,6 +30,11 @@ use crate::{
 pub(crate) const DISTINCT_ON_DERIVED_ALIAS: &str = "__pg2sqlite_distinct_on";
 pub(crate) const DISTINCT_ON_ROWNUM_ALIAS: &str = "__pg2sqlite_rn";
 
+/// Why a row-locking clause is dropped.
+pub(crate) const ROW_LOCK_REASON: &str = "SQLite locks the whole database for a write \
+     transaction, which covers every row the clause would lock, so the clause is dropped. SKIP \
+     LOCKED and NOWAIT never meet a row another transaction holds, so they change no result.";
+
 impl crate::traits::translator::TranslatorWithContext for Query {
     type SQLiteEntry = Query;
 
@@ -133,7 +138,7 @@ impl crate::traits::translator::TranslatorWithContext for Query {
         if !query.locks.is_empty() || query.for_clause.is_some() {
             emit(TranslationWarning::LossyDrop {
                 construct: "FOR UPDATE / FOR SHARE".to_string(),
-                reason: "SQLite has no row-level locking; the clause is dropped".to_string(),
+                reason: ROW_LOCK_REASON.to_string(),
             });
         }
 
@@ -848,7 +853,7 @@ fn try_translate_distinct_on_query(
     if !query.locks.is_empty() || query.for_clause.is_some() {
         emit(TranslationWarning::LossyDrop {
             construct: "FOR UPDATE / FOR SHARE".to_string(),
-            reason: "SQLite has no row-level locking; the clause is dropped".to_string(),
+            reason: ROW_LOCK_REASON.to_string(),
         });
     }
 
@@ -1285,7 +1290,7 @@ fn try_translate_grouping_query(
     if !query.locks.is_empty() || query.for_clause.is_some() {
         emit(TranslationWarning::LossyDrop {
             construct: "FOR UPDATE / FOR SHARE".to_string(),
-            reason: "SQLite has no row-level locking; the clause is dropped".to_string(),
+            reason: ROW_LOCK_REASON.to_string(),
         });
     }
 

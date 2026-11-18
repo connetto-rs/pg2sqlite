@@ -61,8 +61,8 @@ fn if_else_translates() {
 
 #[test]
 fn set_variable_binding_in_trigger() {
-    // The trigger_issue.sql fixture has triggers that use SET internally
-    // through the SELECT INTO preprocessing
+    // The trigger_issue.sql fixture's triggers bind variables with
+    // SELECT INTO.
     let sql = include_str!("../fixtures/trigger_issue.sql");
     let output = translate(sql);
     // Should produce INSERT statements with proper variable substitution
@@ -364,7 +364,7 @@ fn query_statement_runs_standard_translation_pipeline() {
 
         CREATE OR REPLACE FUNCTION query_probe() RETURNS TRIGGER AS $$
         BEGIN
-            SELECT NOW() ORDER BY NOW() LIMIT NOW();
+            PERFORM NOW() ORDER BY NOW() LIMIT NOW();
             RETURN NEW;
         END;
         $$ LANGUAGE plpgsql;

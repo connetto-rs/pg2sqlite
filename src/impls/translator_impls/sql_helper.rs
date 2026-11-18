@@ -251,7 +251,7 @@ impl<'s> Inliner<'s, '_> {
             ));
         }
         if let Some(role) = caller {
-            self.check_privileges(name, helper, role)?;
+            check_privileges(name, helper, role, self.schema)?;
         }
         let returned = returned_type(name, helper)?;
         if helper.volatility() == FunctionBehavior::Volatile {
@@ -294,7 +294,7 @@ impl<'s> Inliner<'s, '_> {
 
         let runs_as = match caller {
             Some(_) if helper.security_mode() == FunctionSecurity::Definer => {
-                Some(self.owner(name, helper)?)
+                Some(owner(name, helper, self.schema)?)
             }
             _ => caller,
         };
@@ -385,7 +385,7 @@ impl<'s> Inliner<'s, '_> {
             ));
         }
         let owner = match helper.security_mode() {
-            FunctionSecurity::Definer => Some(self.owner(name, helper)?),
+            FunctionSecurity::Definer => Some(owner(name, helper, self.schema)?),
             FunctionSecurity::Invoker => None,
         };
         let reader = owner.or(caller);
@@ -527,53 +527,6 @@ impl<'s> Inliner<'s, '_> {
         }
     }
 
-    /// Refuses a call `role` may not make: PostgreSQL checks `EXECUTE` on the
-    /// function and `USAGE` on its schema before running it.
-    fn check_privileges(
-        &self,
-        name: &ObjectName,
-        helper: &CreateFunction,
-        role: &Role,
-    ) -> Result<(), Error> {
-        let role_name = sql_traits::traits::RoleLike::name(role);
-        if !helper.can_execute(role, self.schema)? {
-            return Err(refusal(
-                name,
-                &format!(
-                    "is called by {role_name}, which lacks EXECUTE on it, so PostgreSQL raises \
-                     where an expression written in its place would answer"
-                ),
-            ));
-        }
-        let Some(namespace) = helper.target_name().schema().map(str::to_owned) else {
-            return Ok(());
-        };
-        if let Some(namespace) = self.schema.schema(&namespace)
-            && !namespace.has_usage(role, self.schema)
-        {
-            return Err(refusal(
-                name,
-                &format!(
-                    "is called by {role_name}, which lacks USAGE on its schema, so PostgreSQL \
-                     raises where an expression written in its place would answer"
-                ),
-            ));
-        }
-        Ok(())
-    }
-
-    /// The role a `SECURITY DEFINER` function runs as.
-    fn owner(&self, name: &ObjectName, helper: &CreateFunction) -> Result<&'s Role, Error> {
-        helper.owner(self.schema)?.and_then(|owner| self.schema.role(owner)).ok_or_else(|| {
-            refusal(
-                name,
-                "is SECURITY DEFINER, so its body runs as its owner, and the schema never \
-                 declares that owner. Name it with ALTER FUNCTION ... OWNER TO a role the schema \
-                 creates, or call with_schema_owner_role with the role that runs the schema",
-            )
-        })
-    }
-
     /// Qualifies each unqualified call `body` makes that the function's own
     /// `search_path` resolves to a declared function, so that expanding it
     /// reaches what PostgreSQL reaches. A call resolving to a builtin, or to
@@ -632,6 +585,82 @@ impl<'s> Inliner<'s, '_> {
             ControlFlow::Break(error) => Err(error),
         }
     }
+}
+
+/// Refuses a call the role the statement runs as may not make, since
+/// PostgreSQL checks `EXECUTE` on the function and `USAGE` on its schema
+/// before running it. A translation naming no acting role runs with every
+/// privilege.
+///
+/// # Errors
+///
+/// Refuses the call `name` to `helper` naming the privilege the role lacks.
+pub(crate) fn check_call_privileges(
+    name: &ObjectName,
+    helper: &CreateFunction,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<(), Error> {
+    match calling_role(schema, options)? {
+        Some(role) => check_privileges(name, helper, role, schema),
+        None => Ok(()),
+    }
+}
+
+/// Refuses a call `role` may not make: PostgreSQL checks `EXECUTE` on the
+/// function and `USAGE` on its schema before running it.
+fn check_privileges(
+    name: &ObjectName,
+    helper: &CreateFunction,
+    role: &Role,
+    schema: &ParserDB,
+) -> Result<(), Error> {
+    let role_name = sql_traits::traits::RoleLike::name(role);
+    if !helper.can_execute(role, schema)? {
+        return Err(refusal(
+            name,
+            &format!(
+                "is called by {role_name}, which lacks EXECUTE on it, so PostgreSQL raises where \
+                 its translation in place of the call would not"
+            ),
+        ));
+    }
+    let Some(namespace) = helper.target_name().schema().map(str::to_owned) else {
+        return Ok(());
+    };
+    if let Some(namespace) = schema.schema(&namespace)
+        && !namespace.has_usage(role, schema)
+    {
+        return Err(refusal(
+            name,
+            &format!(
+                "is called by {role_name}, which lacks USAGE on its schema, so PostgreSQL raises \
+                 where its translation in place of the call would not"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The role the `SECURITY DEFINER` function `helper`, called as `name`, runs
+/// as.
+///
+/// # Errors
+///
+/// Refuses a function whose owner the schema never declares.
+pub(crate) fn owner<'s>(
+    name: &ObjectName,
+    helper: &CreateFunction,
+    schema: &'s ParserDB,
+) -> Result<&'s Role, Error> {
+    helper.owner(schema)?.and_then(|owner| schema.role(owner)).ok_or_else(|| {
+        refusal(
+            name,
+            "is SECURITY DEFINER, so its body runs as its owner, and the schema never declares \
+             that owner. Name it with ALTER FUNCTION ... OWNER TO a role the schema creates, or \
+             call with_schema_owner_role with the role that runs the schema",
+        )
+    })
 }
 
 /// The prefix of the `WITH` query holding the arguments of a call to a body
@@ -1352,6 +1381,12 @@ impl<'f> Arguments<'f> {
         self.bound.len()
     }
 
+    /// Each parameter's declared name, `None` for one only `$n` reaches,
+    /// with the argument as the parameter's type receives it.
+    pub(crate) fn into_parameters(self) -> impl Iterator<Item = (Option<&'f Ident>, Expr)> {
+        self.bound.into_iter().map(|bound| (bound.name, bound.value))
+    }
+
     /// `body` answering NULL whenever an argument is NULL, as a `STRICT`
     /// function does without running its body, `reference` writing how the
     /// body reads the parameter at a position.
@@ -1572,7 +1607,7 @@ fn address(expr: &Expr) -> usize {
 
 /// A refusal of a call to the declared function `name`, which names the
 /// other way a destination can serve the call.
-fn refusal(name: &ObjectName, reason: &str) -> Error {
+pub(crate) fn refusal(name: &ObjectName, reason: &str) -> Error {
     let bare = crate::impls::object_name::last_ident(name).map_or("...", |ident| &ident.value);
     Error::forward_refusal(format!(
         "{name}() cannot be translated in place of the call: it {reason}. If the destination \

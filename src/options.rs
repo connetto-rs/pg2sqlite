@@ -212,6 +212,8 @@ pub(crate) struct PrewalkCatalogs {
     /// far, which a write left off the replica with its table reads to find
     /// one PostgreSQL fires for it.
     table_triggers: Vec<TableTrigger>,
+    /// The deferred constraint triggers the translation unit creates.
+    deferred_triggers: Vec<crate::impls::translator_impls::deferred_constraint::DeferredTrigger>,
     /// The request's zone, resolved the first time an operation needs it.
     request_zone: core::cell::OnceCell<Result<RequestZone, ZoneUnavailable>>,
 }
@@ -275,7 +277,7 @@ pub struct TranslationContext<'a> {
     subqueries_allowed: bool,
     /// The body a trigger translated here executes in place of its function's
     /// stored one, set when a replay renames what the body references.
-    rebound_body: Option<&'a sqlparser::ast::BeginEndStatements>,
+    rebound_body: Option<&'a sqlparser_plpgsql::embedded::Block>,
     /// The schema as the statement being translated was written, which names
     /// a wildcard's columns before a later column change in its epoch.
     written_schema: Option<&'a ParserDB>,
@@ -311,7 +313,7 @@ struct ContextFields<'a> {
     variables: &'a [String],
     schema_is_complete: bool,
     subqueries_allowed: bool,
-    rebound_body: Option<&'a sqlparser::ast::BeginEndStatements>,
+    rebound_body: Option<&'a sqlparser_plpgsql::embedded::Block>,
     written_schema: Option<&'a ParserDB>,
     running_as: Option<&'a Role>,
     inlined_body: Option<&'a InlinedBody<'a>>,
@@ -489,7 +491,7 @@ impl<'a> TranslationContext<'a> {
     /// function's stored body.
     pub(crate) fn with_rebound_body<'s>(
         &'s self,
-        body: &'s sqlparser::ast::BeginEndStatements,
+        body: &'s sqlparser_plpgsql::embedded::Block,
     ) -> TranslationContext<'s> {
         let mut fields = ContextFields::borrowed(self);
         fields.rebound_body = Some(body);
@@ -498,7 +500,7 @@ impl<'a> TranslationContext<'a> {
 
     /// The body a trigger translated here executes in place of its
     /// function's stored one.
-    pub(crate) const fn rebound_body(&self) -> Option<&sqlparser::ast::BeginEndStatements> {
+    pub(crate) const fn rebound_body(&self) -> Option<&sqlparser_plpgsql::embedded::Block> {
         self.rebound_body
     }
 
@@ -564,10 +566,11 @@ impl<'a> TranslationContext<'a> {
         self.subqueries_allowed
     }
 
-    /// True when `name` is a PL/pgSQL variable rather than a column.
+    /// True when `name`, unquoted, is a PL/pgSQL variable rather than a
+    /// column.
     #[must_use]
     pub(crate) fn is_variable(&self, name: &str) -> bool {
-        self.variables.iter().any(|variable| variable == name)
+        self.variables.iter().any(|variable| variable.eq_ignore_ascii_case(name))
     }
 
     #[must_use]
@@ -886,6 +889,21 @@ impl<'a> TranslationContext<'a> {
             .map(|trigger| trigger.name.as_str())
     }
 
+    pub(crate) fn add_deferred_trigger(
+        &mut self,
+        trigger: crate::impls::translator_impls::deferred_constraint::DeferredTrigger,
+    ) {
+        self.catalogs.to_mut().deferred_triggers.push(trigger);
+    }
+
+    /// The deferred constraint triggers the translation unit creates, whose
+    /// queue every translated `COMMIT` drains first.
+    pub(crate) fn deferred_triggers(
+        &self,
+    ) -> &[crate::impls::translator_impls::deferred_constraint::DeferredTrigger] {
+        &self.catalogs.deferred_triggers
+    }
+
     /// The request's zone, resolved against `schema` once per translation,
     /// or why it does not resolve.
     pub(crate) fn request_zone(&self, schema: &ParserDB) -> Result<&RequestZone, &ZoneUnavailable> {
@@ -1152,6 +1170,8 @@ impl Pg2SqliteOptions {
 
     #[must_use]
     /// Sets the boolean function that exempts generated write guards.
+    ///
+    /// Constraint triggers skip an exempt write too, deferred ones included.
     pub fn with_write_exemption_function(mut self, name: impl Into<String>) -> Self {
         self.write_exemption_function = Some(name.into());
         self
