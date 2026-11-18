@@ -81,6 +81,9 @@ mod parity_index_names;
 #[path = "gauntlet/parity_json_values.rs"]
 mod parity_json_values;
 
+#[path = "gauntlet/parity_whole_row.rs"]
+mod parity_whole_row;
+
 #[path = "gauntlet/parity_deployment.rs"]
 mod parity_deployment;
 

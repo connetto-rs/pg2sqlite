@@ -4242,6 +4242,9 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
         if let Some(whole_row) = options.whole_row(self) {
             return whole_row.read()?.translate_with_warnings(schema, options, emit);
         }
+        if let Some(trigger_row) = options.trigger_row(self) {
+            return Err(trigger_row.refusal());
+        }
         reject_unstored_vector_reference(self, schema, options)?;
         if let Some(read) = session_variable::translate_expr_read(self, schema, options)? {
             return Ok(read);
@@ -4703,11 +4706,16 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
             Expr::IsNotUnknown(inner) => {
                 Expr::IsNotNull(Box::new(inner.translate_with_warnings(schema, options, emit)?))
             }
-            Expr::IsDistinctFrom(left, right) => {
-                translate_distinct_comparison(left, right, false, schema, options, emit)?
-            }
-            Expr::IsNotDistinctFrom(left, right) => {
-                translate_distinct_comparison(left, right, true, schema, options, emit)?
+            Expr::IsDistinctFrom(left, right) | Expr::IsNotDistinctFrom(left, right) => {
+                let is_not_distinct = matches!(self, Expr::IsNotDistinctFrom(..));
+                if let (Some(left_row), Some(right_row)) =
+                    (options.trigger_row(left), options.trigger_row(right))
+                {
+                    return left_row
+                        .distinct(&right_row, is_not_distinct, schema)?
+                        .translate_with_warnings(schema, options, emit);
+                }
+                translate_distinct_comparison(left, right, is_not_distinct, schema, options, emit)?
             }
             Expr::Like { negated, any, expr, pattern, escape_char } => {
                 rebuild(|| -> Result<Expr, crate::errors::Error> {

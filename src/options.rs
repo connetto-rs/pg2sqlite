@@ -16,7 +16,10 @@ use crate::no_std::prelude::*;
 use crate::{
     impls::{
         request_zone::{RequestZone, ZoneUnavailable},
-        translator_impls::array::WholeRow,
+        translator_impls::{
+            array::WholeRow,
+            trigger_row::{TriggerRow, TriggerRows},
+        },
     },
     traits::{ArrayRepresentation, SessionVariableMapping, TimeZoneFunctions, UuidRepresentation},
 };
@@ -288,6 +291,9 @@ pub struct TranslationContext<'a> {
     /// The innermost `LANGUAGE sql` function whose body is being translated
     /// in place of a call, linked to the ones enclosing it.
     inlined_body: Option<&'a InlinedBody<'a>>,
+    /// The table of the row trigger being translated and the rows its events
+    /// give it, which `NEW` and `OLD` read whole.
+    trigger_rows: Option<TriggerRows<'a>>,
 }
 
 /// A `LANGUAGE sql` function whose body is being translated in place of a
@@ -317,6 +323,7 @@ struct ContextFields<'a> {
     written_schema: Option<&'a ParserDB>,
     running_as: Option<&'a Role>,
     inlined_body: Option<&'a InlinedBody<'a>>,
+    trigger_rows: Option<TriggerRows<'a>>,
 }
 
 impl<'a> ContextFields<'a> {
@@ -332,6 +339,7 @@ impl<'a> ContextFields<'a> {
             written_schema: context.written_schema,
             running_as: context.running_as,
             inlined_body: context.inlined_body,
+            trigger_rows: context.trigger_rows,
         }
     }
 
@@ -355,6 +363,7 @@ impl<'a> ContextFields<'a> {
             written_schema: self.written_schema,
             running_as: self.running_as,
             inlined_body: self.inlined_body,
+            trigger_rows: self.trigger_rows,
         }
     }
 }
@@ -377,6 +386,7 @@ impl<'a> TranslationContext<'a> {
             written_schema: None,
             running_as: None,
             inlined_body: None,
+            trigger_rows: None,
         }
     }
     pub(crate) fn with_complete_schema(options: &'a Pg2SqliteOptions) -> Self {
@@ -400,6 +410,7 @@ impl<'a> TranslationContext<'a> {
             written_schema: None,
             running_as: None,
             inlined_body: None,
+            trigger_rows: None,
         }
     }
 
@@ -552,6 +563,31 @@ impl<'a> TranslationContext<'a> {
     /// call.
     pub(crate) const fn inlined_body(&self) -> Option<&InlinedBody<'_>> {
         self.inlined_body
+    }
+
+    /// The same context translating a row trigger whose table and events
+    /// `rows` describes.
+    pub(crate) fn with_trigger_rows<'s>(&'s self, rows: TriggerRows<'s>) -> TranslationContext<'s> {
+        let mut fields = ContextFields::borrowed(self);
+        fields.trigger_rows = Some(rows);
+        fields.into_context(self.scope, self.outer)
+    }
+
+    /// The same context translating the part of a row trigger that fires for
+    /// `events` alone.
+    pub(crate) fn with_trigger_events<'s>(
+        &'s self,
+        events: &[sqlparser::ast::TriggerEvent],
+    ) -> TranslationContext<'s> {
+        let mut fields = ContextFields::borrowed(self);
+        fields.trigger_rows = self.trigger_rows.map(|rows| rows.for_events(events));
+        fields.into_context(self.scope, self.outer)
+    }
+
+    /// The whole trigger row `expr` reads, when it is a bare `NEW` or `OLD`
+    /// inside a row trigger.
+    pub(crate) fn trigger_row(&self, expr: &Expr) -> Option<TriggerRow<'a>> {
+        self.trigger_rows.and_then(|rows| rows.row(expr))
     }
 
     /// Restricts expression translation to a position that forbids subqueries.

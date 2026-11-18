@@ -39,6 +39,7 @@ pub mod rls;
 pub(crate) mod sql_helper;
 pub(crate) mod statement;
 mod table_constraint;
+pub(crate) mod trigger_row;
 pub(crate) mod trigger_slots;
 pub(crate) mod update;
 pub(crate) mod uuid;
