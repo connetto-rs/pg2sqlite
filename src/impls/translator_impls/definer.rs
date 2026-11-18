@@ -95,14 +95,18 @@ fn exempts(table: &CreateTable, owner: &Role, schema: &ParserDB) -> bool {
     matches!(table.row_security(RowStatement::Select, owner, schema), Ok(RowSecurity::Exempt(_)))
 }
 
-/// The owners of the schema's definer trigger functions that `table`'s
-/// row-level security exempts, the ones whose bodies its guards let through.
+/// The owners of the schema's definer trigger functions and PL/pgSQL helpers,
+/// whose bodies a trigger runs, that `table`'s row-level security exempts,
+/// the ones whose bodies its guards let through.
 ///
 /// A definer function whose owner is undeclared exempts nothing, and a trigger
 /// running it is refused.
 pub(crate) fn exempt_owners<'s>(table: &'s CreateTable, schema: &'s ParserDB) -> Vec<&'s str> {
     let mut owners = Vec::new();
-    for function in schema.functions().filter(|function| returns_trigger(function)) {
+    let runs_in_triggers = |function: &CreateFunction| {
+        returns_trigger(function) || function.stored_language().as_deref() == Some("plpgsql")
+    };
+    for function in schema.functions().filter(|function| runs_in_triggers(function)) {
         if let Ok(Some(owner)) = definer_owner(function, schema)
             && !owners.contains(&owner.name())
             && exempts(table, owner, schema)
