@@ -4,7 +4,7 @@ use core::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use pg2sqlite::prelude::{
-    Error, Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation,
+    Error, JsonbFunctions, Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation,
 };
 
 // Schema fixtures loaded at compile time (non-RLS)
@@ -94,12 +94,11 @@ fn statement_schema() -> sql_traits::structs::ParserDB {
 }
 
 fn bench_schema_translation(c: &mut Criterion) {
-    // `groups.sql` defaults a key to `uuidv7()`, which is refused unless the
-    // destination's version 7 generator is named, so the fixtures do not
-    // translate without this.
+    // The fixtures default a key to `uuidv7()` and declare `jsonb` columns.
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
-        .with_uuid_v7_function_name("uuid7");
+        .with_uuid_v7_function_name("uuid7")
+        .with_jsonb_functions(JsonbFunctions::new("pg_jsonb", "pg_jsonb_order"));
     let mut group = c.benchmark_group("schema_translation");
 
     let fixtures: &[(&str, &str)] = &[
