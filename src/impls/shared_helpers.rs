@@ -1921,14 +1921,12 @@ pub(crate) fn convert_bytea_hex_literal(expr: Expr) -> Result<Expr, Error> {
     ))
 }
 
-/// Refuses a literal a JSON column cannot hold.
+/// Refuses a literal a JSON column cannot hold, and brings a `jsonb` document
+/// or bound parameter to the text PostgreSQL prints for it.
 ///
-/// PostgreSQL types the value: `INSERT INTO t (j) VALUES (1)` over a `jsonb`
+/// PostgreSQL types the value, so `INSERT INTO t (j) VALUES (1)` over a `jsonb`
 /// column answers `column "j" is of type jsonb but expression is of type
-/// integer`, where the replica's column is `TEXT` and took the number. A
-/// `jsonb` document and a bound parameter become the text PostgreSQL prints for
-/// the document, through
-/// [`jsonb::written_value`](crate::impls::jsonb::written_value).
+/// integer`, where the replica's `TEXT` column would take the number.
 pub(crate) fn check_json_document_literal(
     data_type: &DataType,
     expr: Expr,
@@ -1936,10 +1934,19 @@ pub(crate) fn check_json_document_literal(
 ) -> Result<Expr, Error> {
     let Expr::Value(ValueWithSpan { value, .. }) = &expr else { return Ok(expr) };
     match value {
-        Value::SingleQuotedString(_) | Value::Placeholder(_)
-            if matches!(data_type, DataType::JSONB) =>
-        {
-            crate::impls::jsonb::written_value(expr, options)
+        Value::SingleQuotedString(text) if matches!(data_type, DataType::JSONB) => {
+            Ok(crate::impls::function_helpers::string_literal(
+                &crate::impls::jsonb::canonical_text(text)?,
+            ))
+        }
+        Value::Placeholder(_) if matches!(data_type, DataType::JSONB) => {
+            let functions =
+                crate::impls::jsonb::functions(options, &format!("the parameter {expr}"))?;
+            Ok(crate::impls::function_helpers::simple_function_expr(
+                &functions.canonical,
+                vec![expr],
+                None,
+            ))
         }
         Value::SingleQuotedString(_) | Value::Null | Value::Placeholder(_) => Ok(expr),
         other => {

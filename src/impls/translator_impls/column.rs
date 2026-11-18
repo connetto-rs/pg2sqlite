@@ -136,15 +136,27 @@ fn jsonb_assignment(column: &ColumnDef, expr: &Expr) -> Option<Expr> {
 /// `option` with its generation expression cast as [`jsonb_assignment`] casts
 /// it, or `None` when it is no generated column or needs no cast.
 fn jsonb_generated(column: &ColumnDef, option: &ColumnOptionDef) -> Option<ColumnOptionDef> {
-    let ColumnOption::Generated { generation_expr: Some(expr), .. } = &option.option else {
+    let ColumnOption::Generated {
+        generated_as,
+        sequence_options,
+        generation_expr: Some(expr),
+        generation_expr_mode,
+        generated_keyword,
+    } = &option.option
+    else {
         return None;
     };
     let assigned = jsonb_assignment(column, expr)?;
-    let mut generated = option.clone();
-    if let ColumnOption::Generated { generation_expr, .. } = &mut generated.option {
-        *generation_expr = Some(assigned);
-    }
-    Some(generated)
+    Some(ColumnOptionDef {
+        name: option.name.clone(),
+        option: ColumnOption::Generated {
+            generated_as: *generated_as,
+            sequence_options: sequence_options.clone(),
+            generation_expr: Some(assigned),
+            generation_expr_mode: *generation_expr_mode,
+            generated_keyword: *generated_keyword,
+        },
+    })
 }
 
 /// A declared default in the units the translated column stores.

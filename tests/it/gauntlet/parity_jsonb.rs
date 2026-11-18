@@ -403,3 +403,120 @@ fn update_trigger_assignments_settle_on_the_canonical_text() {
         &["SELECT raw || ' ' || body::text AS value FROM docs ORDER BY id"],
     );
 }
+
+/// Typed documents retain canonical text and numeric equality after
+/// translation.
+#[test]
+fn typed_documents_and_bound_parameters_store_the_canonical_text() {
+    let rows = assert_parity(
+        TABLE,
+        &[
+            SEED,
+            Step::Sql("INSERT INTO docs (id, body) VALUES (2, NULL)"),
+            Step::Sql(r#"INSERT INTO docs (id, body) VALUES (3, JSONB '{"b":2,"a":1.00}')"#),
+            Step::Bound("INSERT INTO docs (id, body) VALUES (4, $1)", r#"{"b":2,"a":1.00}"#),
+        ],
+        &[
+            r#"SELECT (JSONB '{"b":2,"a":1.00}')::text AS value"#,
+            "SELECT (j -> 'q')::jsonb::text AS value FROM docs WHERE id = 1",
+            "SELECT (j #> '{q}')::jsonb::text AS value FROM docs WHERE id = 1",
+            "SELECT body::text AS value FROM docs WHERE id = 2",
+            "SELECT CASE WHEN body = '{\"a\":1,\"b\":2}'::jsonb THEN 'equal' ELSE 'unequal' END AS value FROM docs WHERE id = 3",
+            "SELECT body::text AS value FROM docs WHERE id = 4",
+        ],
+    );
+    assert_eq!(rows[0], [r#"{"a": 1.00, "b": 2}"#]);
+    assert_eq!(rows[3], ["NULL"]);
+    assert_eq!(rows[4], ["equal"]);
+    assert_eq!(rows[5], [r#"{"a": 1.00, "b": 2}"#]);
+}
+
+/// `JSON` constructors preserve negative numeric precision and computed signs.
+#[test]
+fn negative_numbers_keep_their_digits_in_built_documents() {
+    assert_parity(
+        "CREATE TABLE docs (id INTEGER PRIMARY KEY, number INTEGER);",
+        &[Step::Sql("INSERT INTO docs VALUES (1, 7)")],
+        &[
+            "SELECT jsonb_build_array(-1.500, -123456789012345678901234567890, -number)::text AS value FROM docs",
+            "SELECT to_jsonb(-1.250)::text AS value",
+        ],
+    );
+}
+
+/// Missing host support refuses a `JSONB` column with registration
+/// instructions.
+#[test]
+fn a_jsonb_column_without_named_functions_is_refused() {
+    let error = translated("", TABLE, &Pg2SqliteOptions::default())
+        .expect_err("JSONB requires registered host support");
+    assert!(error.contains("jsonb"), "{error}");
+    assert!(error.contains("with_jsonb_functions"), "{error}");
+    assert!(error.contains("JsonbFunctions::register"), "{error}");
+}
+
+/// The host collation places malformed documents after every valid document.
+#[test]
+fn text_jsonb_does_not_read_sorts_after_every_document() {
+    use core::cmp::Ordering;
+
+    use pg2sqlite::prelude::JsonbFunctions;
+
+    for document in ["null", "false", "1.00", "\"text\"", "[]", "{}"] {
+        assert_eq!(JsonbFunctions::compare(document, "{bad"), Ordering::Less);
+        assert_eq!(JsonbFunctions::compare("{bad", document), Ordering::Greater);
+    }
+    assert_eq!(JsonbFunctions::compare("{bad", "{worse"), Ordering::Less);
+}
+
+/// Invalid function names propagate registration errors to the caller.
+#[test]
+fn registration_reports_a_function_name_sqlite_refuses() {
+    use pg2sqlite::prelude::JsonbFunctions;
+
+    let mut connection = establish_connection();
+    let error = JsonbFunctions::new("invalid\0name", "unused_collation")
+        .register(&mut connection)
+        .expect_err("SQLite function names cannot contain NUL");
+    assert!(error.to_string().contains("nul byte"), "{error}");
+}
+
+/// Reversed canonicalisation returns PostgreSQL's canonical document text.
+#[test]
+fn the_canonicalising_function_reverses_to_postgresql_text() {
+    let translator = Pg2Sqlite::default().sql(TABLE).expect("parse schema");
+    let schema = translator.build_schema().expect("build schema");
+    let reversed = translator
+        .reverse_sql(
+            r#"SELECT CAST(pg_jsonb('{"b":2,"a":1.00,"a":3}') AS TEXT) AS value"#,
+            &schema,
+            &options(),
+        )
+        .expect("reverse canonical function");
+    let query = reversed.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ");
+    let (_, rows) = postgres(TABLE, &[], &[&query]);
+    assert_eq!(rows, [vec![r#"{"a": 3, "b": 2}"#.to_owned()]]);
+}
+
+/// SQLite byte ordering on an uncast value cannot silently become PostgreSQL
+/// ordering.
+#[test]
+fn reversing_a_sqlite_only_collation_is_refused() {
+    let translator = Pg2Sqlite::default().sql(TABLE).expect("parse schema");
+    let schema = translator.build_schema().expect("build schema");
+    let error = translator
+        .reverse_sql("SELECT raw COLLATE BINARY FROM docs", &schema, &options())
+        .expect_err("SQLite-only collation must be refused");
+    assert!(error.to_string().contains("COLLATE BINARY"), "{error}");
+    assert!(error.to_string().contains("SQLite-only"), "{error}");
+}
+
+/// Computed `JSONB` generated columns canonicalise assigned `JSON` documents.
+#[test]
+fn a_generated_jsonb_column_stores_the_canonical_text() {
+    assert_parity(
+        "CREATE TABLE docs (id INTEGER PRIMARY KEY, source JSON, body JSONB GENERATED ALWAYS AS (source) STORED);",
+        &[Step::Sql(r#"INSERT INTO docs (id, source) VALUES (1, '{"b":2,"a":1,"a":3}')"#)],
+        &["SELECT body::text AS value FROM docs"],
+    );
+}

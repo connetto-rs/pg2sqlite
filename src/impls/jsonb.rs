@@ -64,27 +64,6 @@ pub(crate) fn canonical_text(text: &str) -> Result<String, Error> {
     })
 }
 
-/// A `jsonb` document literal at a write position, as the text PostgreSQL
-/// prints for it, a bound parameter passed through the canonicalising
-/// function, and anything else as it is.
-///
-/// # Errors
-///
-/// Refuses a literal `jsonb` does not read, and a parameter when no function
-/// is named.
-pub(crate) fn written_value(expr: Expr, options: &Pg2SqliteOptions) -> Result<Expr, Error> {
-    match &expr {
-        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(text), .. }) => {
-            Ok(string_literal(&canonical_text(text)?))
-        }
-        Expr::Value(ValueWithSpan { value: Value::Placeholder(_), .. }) => {
-            let functions = functions(options, &format!("the parameter {expr}"))?;
-            Ok(simple_function_expr(&functions.canonical, vec![expr], None))
-        }
-        _ => Ok(expr),
-    }
-}
-
 /// `value` as PostgreSQL's assignment into a `jsonb` column takes it, a cast
 /// written out for anything not already `jsonb`, or `None` when the value
 /// translates as written.
