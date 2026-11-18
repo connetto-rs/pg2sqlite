@@ -222,6 +222,125 @@ fn a_bound_label_compares_by_declaration_order() {
     assert_eq!(rows, labels(&["1", "3", "5"]));
 }
 
+/// Enum comparisons preserve nulls, labels and declaration order through
+/// expression boundaries.
+#[test]
+fn nested_expressions_keep_nulls_labels_and_declaration_order() {
+    let mut replicas = Replicas::new(SOURCE);
+    for (probe, expected) in [
+        ("SELECT id::text AS v FROM grants WHERE role < NULL ORDER BY id", &[][..]),
+        ("SELECT id::text AS v FROM grants WHERE NULL::role < role ORDER BY id", &[][..]),
+        (
+            "SELECT role::role AS v FROM grants ORDER BY id",
+            &["admin", "reader", "writer", "reader", "writer"],
+        ),
+        (
+            "SELECT id::text AS v FROM grants WHERE role = ANY (ARRAY['reader'::role]) ORDER BY id",
+            &["2", "4"],
+        ),
+        (
+            "SELECT role AS \"v\" FROM grants UNION SELECT 'writer'::role ORDER BY \"v\"",
+            &["reader", "writer", "admin"],
+        ),
+        (
+            "(SELECT role AS v FROM grants) ORDER BY v",
+            &["reader", "reader", "writer", "writer", "admin"],
+        ),
+        (
+            "SELECT id::text AS v FROM grants WHERE role < (SELECT 'admin'::role) ORDER BY id",
+            &["2", "3", "4", "5"],
+        ),
+        (
+            "SELECT DISTINCT ON (role) role AS v FROM grants ORDER BY role, id",
+            &["reader", "writer", "admin"],
+        ),
+        (
+            "SELECT v::text AS v FROM (SELECT DISTINCT ON (resource_id) resource_id AS v FROM grants ORDER BY resource_id, id) AS distinct_resources",
+            &["1", "2"],
+        ),
+        ("SELECT max(role) AS v FROM grants", &["admin"]),
+        (
+            "SELECT greatest(role, max_role) AS v FROM grants ORDER BY id",
+            &["admin", "writer", "writer", "admin", "writer"],
+        ),
+        (
+            "SELECT v FROM (SELECT CASE WHEN id = 1 THEN role ELSE max_role END AS v FROM grants WHERE max_role IS NOT NULL UNION ALL SELECT role FROM grants ORDER BY 1) AS results",
+            &[
+                "reader", "reader", "reader", "writer", "writer", "writer", "admin", "admin",
+                "admin",
+            ],
+        ),
+        (
+            "SELECT kind AS v FROM (SELECT * FROM resources UNION ALL SELECT * FROM resources ORDER BY 2) AS results",
+            &["organization", "organization", "folder", "folder", "project", "project"],
+        ),
+        (
+            "SELECT v FROM (SELECT resources.*, kind AS v FROM resources UNION ALL SELECT resources.*, kind FROM resources ORDER BY 3) AS results",
+            &["organization", "organization", "folder", "folder", "project", "project"],
+        ),
+        (
+            "SELECT v FROM (SELECT 'reader' UNION ALL SELECT role FROM grants ORDER BY 1) AS results(v)",
+            &["reader", "reader", "reader", "writer", "writer", "admin"],
+        ),
+        (
+            "SELECT role AS V FROM grants UNION SELECT 'writer'::role ORDER BY v",
+            &["reader", "writer", "admin"],
+        ),
+    ] {
+        assert_eq!(replicas.assert_same_rows(probe, &[]), labels(expected), "{probe}");
+    }
+}
+
+/// A compound select whose first output is a `CASE` sorts it in declaration
+/// order under the name PostgreSQL gives it.
+#[test]
+fn a_compound_select_sorts_a_case_output_by_declaration_order() {
+    let mut replicas = Replicas::new(SOURCE);
+    replicas.assert_same_rows(
+        "SELECT v FROM (SELECT CASE WHEN id = 1 THEN role ELSE max_role END FROM grants \
+         UNION ALL SELECT role FROM grants ORDER BY 1) AS results(v)",
+        &[],
+    );
+}
+
+/// Untyped parameters inherit the enum type and compare in declaration order.
+#[test]
+fn untyped_parameters_compare_by_declaration_order() {
+    let mut replicas = Replicas::new(SOURCE);
+    let probe = "SELECT id::text AS v FROM grants WHERE role >= $1 ORDER BY id";
+    // Preparing SQL leaves parameter inference to PostgreSQL.
+    diesel::sql_query(format!("PREPARE enum_probe AS {probe}"))
+        .execute(&mut replicas.postgres)
+        .expect("prepare");
+    let postgres = diesel::sql_query("EXECUTE enum_probe('writer')")
+        .load::<Cell>(&mut replicas.postgres)
+        .expect("execute");
+    let translated = replicas.translated(probe).expect("translate");
+    let sqlite = diesel::sql_query(translated)
+        .bind::<Text, _>("writer")
+        .load::<Cell>(&mut replicas.sqlite)
+        .expect("execute");
+    let postgres: Vec<_> = postgres.into_iter().map(|cell| cell.v).collect();
+    let sqlite: Vec<_> = sqlite.into_iter().map(|cell| cell.v).collect();
+    assert_eq!(postgres, labels(&["1", "3", "5"]));
+    assert_eq!(sqlite, postgres);
+}
+
+/// Dropping an unused enum leaves unrelated stored rows intact.
+#[test]
+fn dropping_an_unused_type_keeps_the_rows() {
+    let mut replicas = Replicas::new(
+        "CREATE TYPE unused AS ENUM ('reader', 'admin');
+         CREATE TABLE retained (id INTEGER PRIMARY KEY);
+         INSERT INTO retained VALUES (7);
+         DROP TYPE unused CASCADE;",
+    );
+    assert_eq!(
+        replicas.assert_same_rows("SELECT id::text AS v FROM retained", &[]),
+        labels(&["7"])
+    );
+}
+
 #[test]
 fn sorts_and_extremes_follow_declaration_order() {
     let mut replicas = Replicas::new(SOURCE);
@@ -361,6 +480,7 @@ fn a_cast_of_an_undeclared_value_reads_null() {
     assert_eq!(sqlite.into_iter().map(|cell| cell.v).collect::<Vec<_>>(), vec![None]);
 }
 
+/// Invalid enum comparisons and labels are refused before execution.
 #[test]
 fn statements_postgresql_rejects_are_refused() {
     let mut replicas = Replicas::new(SOURCE);
@@ -374,6 +494,47 @@ fn statements_postgresql_rejects_are_refused() {
     ] {
         replicas.assert_refused(statement);
     }
+    for (statement, problem) in [
+        ("SELECT enum_range(1)", "enum_range"),
+        ("SELECT role < missing_enum_value() FROM grants", "missing_enum_value"),
+        (
+            "SELECT id FROM grants WHERE role < 'folder'::kind",
+            "operator does not exist: role < kind",
+        ),
+        ("VALUES ('owner'::role) ORDER BY 1", "invalid input value for enum role"),
+        (
+            "SELECT role FROM too.many.schema.parts UNION ALL SELECT role FROM grants ORDER BY 1",
+            "too.many.schema.parts",
+        ),
+    ] {
+        replicas.assert_refused(statement);
+        let error = replicas.translated(statement).expect_err(problem);
+        assert!(error.to_string().contains(problem), "{statement}\n{error}");
+    }
+}
+
+/// A nameless function supplied through the statement API is refused.
+#[test]
+fn a_nameless_function_call_is_refused() {
+    let replicas = Replicas::new(SOURCE);
+    let mut statements = sqlparser::parser::Parser::parse_sql(
+        &sqlparser::dialect::PostgreSqlDialect {},
+        "SELECT abs(1)",
+    )
+    .expect("parse");
+    let sqlparser::ast::Statement::Query(query) = &mut statements[0] else { panic!("query") };
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_mut() else { panic!("select") };
+    let sqlparser::ast::SelectItem::UnnamedExpr(sqlparser::ast::Expr::Function(function)) =
+        &mut select.projection[0]
+    else {
+        panic!("function")
+    };
+    function.name.0.clear();
+    let error = Pg2Sqlite::default()
+        .statement(statements.remove(0))
+        .translate_with_schema(&replicas.schema, &options())
+        .expect_err("nameless function");
+    assert!(error.to_string().contains("function"), "{error}");
 }
 
 /// Two types declaring the same labels are still two types.
@@ -394,13 +555,38 @@ fn types_with_the_same_labels_do_not_compare() {
 #[test]
 fn orderings_sqlite_cannot_key_are_refused() {
     let replicas = Replicas::new(SOURCE);
-    for statement in [
-        "SELECT id FROM grants WHERE role > ANY (ARRAY['reader'::role])",
-        "SELECT id FROM grants WHERE (role, id) > ('reader', 1)",
+    for (statement, problem) in [
+        ("SELECT id FROM grants WHERE role > ANY (ARRAY['reader'::role])", "ANY"),
+        ("SELECT id FROM grants WHERE (role, id) > ('reader', 1)", "row values"),
+        ("SELECT enum_range('reader'::role, 'admin'::role)", "two bounds"),
+        (
+            "SELECT (SELECT * FROM (SELECT role FROM grants LIMIT 1) AS chosen) UNION ALL SELECT role FROM grants ORDER BY 1",
+            "unnamed",
+        ),
+        (
+            "SELECT role, count(*) FROM grants GROUP BY ROLLUP(role) ORDER BY role, count(*) + 1",
+            "expression",
+        ),
+        (
+            "SELECT * FROM unknown_relation UNION ALL SELECT * FROM unknown_relation ORDER BY 1",
+            "columns a * hides",
+        ),
+        (
+            "SELECT *, CASE WHEN id = 1 THEN role ELSE max_role END FROM grants UNION ALL SELECT *, role FROM grants ORDER BY 4",
+            "Alias the column or list the columns",
+        ),
     ] {
-        let translated = replicas.translated(statement);
-        assert!(translated.is_err(), "{statement} translated to {translated:?}");
+        let error = replicas.translated(statement).expect_err(statement);
+        assert!(error.to_string().contains(problem), "{statement}\n{error}");
     }
+    let error = replicas.translated("SELECT CURRENT_DATE").expect_err("deployment required");
+    assert!(error.to_string().contains("with_deployment"), "{error}");
+    let error = replicas
+        .translated("SELECT role < 'admin'::unknown FROM grants")
+        .expect_err("unsupported pseudo-type")
+        .to_string();
+    assert!(error.contains("unknown has no SQLite equivalent"), "{error}");
+    assert!(!error.contains("operator does not exist"), "{error}");
 }
 
 #[test]

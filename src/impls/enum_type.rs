@@ -277,21 +277,8 @@ pub(crate) fn rewrite(
     schema: &ParserDB,
     options: &TranslationContext<'_>,
 ) -> Result<Option<Expr>, Error> {
-    if !matches!(
-        expr,
-        Expr::BinaryOp { .. }
-            | Expr::Between { .. }
-            | Expr::In { target: InTarget::List(_), .. }
-            | Expr::Cast { .. }
-            | Expr::Function(_)
-            | Expr::AnyOp { .. }
-            | Expr::AllOp { .. }
-    ) || !declares_enum(schema)
-    {
-        return Ok(None);
-    }
     match expr {
-        Expr::BinaryOp { left, op, right } => {
+        Expr::BinaryOp { left, op, right } if declares_enum(schema) => {
             let Some((operator, ordered)) = comparison(op) else {
                 return Ok(None);
             };
@@ -313,7 +300,7 @@ pub(crate) fn rewrite(
                 }
             }))
         }
-        Expr::Between { expr: operand, negated, low, high } => {
+        Expr::Between { expr: operand, negated, low, high } if declares_enum(schema) => {
             let Some(data_type) = [operand, low, high]
                 .into_iter()
                 .find_map(|side| enum_type_of(side, schema, options))
@@ -331,7 +318,7 @@ pub(crate) fn rewrite(
                 high: key(high)?,
             }))
         }
-        Expr::In { expr: operand, target: InTarget::List(list), .. } => {
+        Expr::In { expr: operand, target: InTarget::List(list), .. } if declares_enum(schema) => {
             let Some(data_type) = enum_type_of(operand, schema, options) else {
                 return Ok(None);
             };
@@ -340,7 +327,9 @@ pub(crate) fn rewrite(
             }
             Ok(None)
         }
-        Expr::AnyOp { left, compare_op, .. } | Expr::AllOp { left, compare_op, .. } => {
+        Expr::AnyOp { left, compare_op, .. } | Expr::AllOp { left, compare_op, .. }
+            if declares_enum(schema) =>
+        {
             match comparison(compare_op) {
                 Some((operator, true)) if enum_type_of(left, schema, options).is_some() => {
                     Err(Error::forward_refusal(format!(
@@ -352,8 +341,10 @@ pub(crate) fn rewrite(
                 _ => Ok(None),
             }
         }
-        Expr::Cast { expr: inner, data_type, .. } => cast(inner, data_type, schema, options),
-        Expr::Function(call) => function(call, schema, options),
+        Expr::Cast { expr: inner, data_type, .. } if declares_enum(schema) => {
+            cast(inner, data_type, schema, options)
+        }
+        Expr::Function(call) if declares_enum(schema) => function(call, schema, options),
         _ => Ok(None),
     }
 }
@@ -450,7 +441,7 @@ fn function(
             let Some(data_type) = enum_type_of(argument, schema, options) else {
                 return Ok(None);
             };
-            let keyed = keyed_call(call, |_| key((*argument).clone(), &data_type, schema));
+            let keyed = keyed_call(call, list, |_| key((*argument).clone(), &data_type, schema));
             Ok(Some(label_of_key(keyed, &data_type, schema)))
         }
         ("greatest" | "least", [_, _, ..]) => {
@@ -469,7 +460,7 @@ fn function(
             }
             let mut keys = keys.into_iter();
             let keyed =
-                keyed_call(call, |_| keys.next().unwrap_or(Expr::Value(Value::Null.into())));
+                keyed_call(call, list, |_| keys.next().unwrap_or(Expr::Value(Value::Null.into())));
             Ok(Some(label_of_key(keyed, &data_type, schema)))
         }
         ("enum_range", [argument]) => {
@@ -505,14 +496,27 @@ fn function(
 
 /// `call` with each argument replaced by what `argument` answers for its
 /// position, keeping its `OVER`, `FILTER`, `DISTINCT` and ordering.
-fn keyed_call(call: &sqlparser::ast::Function, mut argument: impl FnMut(usize) -> Expr) -> Expr {
-    let mut keyed = call.clone();
-    if let FunctionArguments::List(list) = &mut keyed.args {
-        for (position, slot) in list.args.iter_mut().enumerate() {
-            *slot = FunctionArg::Unnamed(FunctionArgExpr::Expr(argument(position)));
-        }
-    }
-    Expr::Function(keyed)
+fn keyed_call(
+    call: &sqlparser::ast::Function,
+    list: &sqlparser::ast::FunctionArgumentList,
+    mut argument: impl FnMut(usize) -> Expr,
+) -> Expr {
+    Expr::Function(sqlparser::ast::Function {
+        name: call.name.clone(),
+        uses_odbc_syntax: call.uses_odbc_syntax,
+        parameters: call.parameters.clone(),
+        args: FunctionArguments::List(sqlparser::ast::FunctionArgumentList {
+            duplicate_treatment: list.duplicate_treatment,
+            args: (0..list.args.len())
+                .map(|position| FunctionArg::Unnamed(FunctionArgExpr::Expr(argument(position))))
+                .collect(),
+            clauses: list.clauses.clone(),
+        }),
+        filter: call.filter.clone(),
+        null_treatment: call.null_treatment,
+        over: call.over.clone(),
+        within_group: call.within_group.clone(),
+    })
 }
 
 /// The ordering key of an `ORDER BY` or `PARTITION BY` item of an enum type,
@@ -609,10 +613,10 @@ pub(crate) fn ordered_compound(
     let mut ordered = Vec::with_capacity(items.len());
     for item in items {
         let mut outer = item.clone();
-        match named_output(&item.expr, &outputs) {
-            Some(position) if outputs[position].1.is_some() => {
+        match named_output(&item.expr, &outputs).map(|position| &outputs[position]) {
+            Some((name, Some(data_type))) => {
                 keyed = true;
-                let Some(name) = &outputs[position].0 else {
+                let Some(name) = name else {
                     return Err(Error::forward_refusal(format!(
                         "ORDER BY {} names an enum column the compound select leaves unnamed, \
                          and SQLite sorts it by declaration order only through the column's \
@@ -620,7 +624,8 @@ pub(crate) fn ordered_compound(
                         item.expr
                     )));
                 };
-                outer.expr = Expr::Identifier(Ident::with_quote('"', name.as_str()));
+                outer.expr =
+                    key(Expr::Identifier(Ident::with_quote('"', name.as_str())), data_type, schema);
             }
             Some(_) => {}
             None => unnamed = true,
@@ -638,9 +643,11 @@ pub(crate) fn ordered_compound(
                 .to_string(),
         ));
     }
+    let mut body = query.body.as_ref().clone();
+    name_compound_outputs(&mut body, &outputs)?;
     let derived = TableFactor::Derived {
         lateral: false,
-        subquery: Box::new(make_query(None, query.body.as_ref().clone())),
+        subquery: Box::new(make_query(None, body)),
         alias: Some(TableAlias {
             explicit: true,
             name: Ident::new(ORDERED_COMPOUND_ALIAS),
@@ -669,6 +676,55 @@ pub(crate) fn ordered_compound(
         format_clause: query.format_clause.clone(),
         pipe_operators: query.pipe_operators.clone(),
     }))
+}
+
+/// Gives SQLite's first compound arm the output names PostgreSQL exposes.
+fn name_compound_outputs(
+    mut body: &mut SetExpr,
+    outputs: &[(Option<String>, Option<DataType>)],
+) -> Result<(), Error> {
+    let select = loop {
+        match body {
+            SetExpr::Select(select) => break select,
+            SetExpr::SetOperation { left, .. } => body = left,
+            SetExpr::Query(query) => body = &mut query.body,
+            _ => return Ok(()),
+        }
+    };
+    if select
+        .projection
+        .iter()
+        .any(|item| matches!(item, SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)))
+    {
+        if select.projection.iter().any(|item| {
+            matches!(item, SelectItem::UnnamedExpr(expression)
+                if !matches!(expression, Expr::Identifier(_) | Expr::CompoundIdentifier(_)))
+        }) {
+            return Err(Error::forward_refusal(
+                "ORDER BY over a compound select mixing * with an unaliased expression \
+                 cannot key an enum output. Alias the column or list the columns."
+                    .to_string(),
+            ));
+        }
+        return Ok(());
+    }
+    for (item, (name, _)) in select.projection.iter_mut().zip(outputs) {
+        let Some(name) = name else { continue };
+        match item {
+            SelectItem::UnnamedExpr(expression) => {
+                let expression = core::mem::replace(expression, Expr::Value(Value::Null.into()));
+                *item = SelectItem::ExprWithAlias {
+                    expr: expression,
+                    alias: Ident::with_quote('"', name),
+                };
+            }
+            SelectItem::ExprWithAlias { alias, .. } if alias.value != *name => {
+                *alias = Ident::with_quote('"', name);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// The alias of the derived table [`ordered_compound`] sorts outside.
