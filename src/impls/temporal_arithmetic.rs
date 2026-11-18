@@ -23,8 +23,10 @@ use super::{
         integer_literal_value, is_function_named, simple_function_expr, single_quoted_literal,
         string_literal,
     },
+    idioms::{infinite_epoch_guard_finite, infinite_temporal_guard_finite},
     shared_helpers::{declared_in_scope, function_argument_exprs, is_integral_expression},
     temporal_casts::is_interval_expr,
+    temporal_infinity::{InfiniteAnswer, epoch_guard, guard, strict_guard},
     temporal_literals,
 };
 #[cfg(not(feature = "std"))]
@@ -261,25 +263,24 @@ fn rewrite(
     let left_integral = kinds.0.is_none() && is_integral_expression(left, schema, options)?;
     match kinds {
         (Some(TemporalKind::Date), Some(TemporalKind::Date)) if subtracting => {
-            Ok(day_difference(
-                left.translate_with_warnings(schema, options, emit)?,
-                right.translate_with_warnings(schema, options, emit)?,
-            ))
+            day_difference((left, right), schema, options, emit)
         }
         (Some(TemporalKind::Date), None) if right_integral => {
             shift_date(
-                left.translate_with_warnings(schema, options, emit)?,
+                (left, left.translate_with_warnings(schema, options, emit)?),
                 op,
-                right.translate_with_warnings(schema, options, emit)?,
+                (right, right.translate_with_warnings(schema, options, emit)?),
                 (left, op, right),
+                options,
             )
         }
         (None, Some(TemporalKind::Date)) if !subtracting && left_integral => {
             shift_date(
-                right.translate_with_warnings(schema, options, emit)?,
+                (right, right.translate_with_warnings(schema, options, emit)?),
                 &BinaryOperator::Plus,
-                left.translate_with_warnings(schema, options, emit)?,
+                (left, left.translate_with_warnings(schema, options, emit)?),
                 (left, op, right),
+                options,
             )
         }
         (Some(_), Some(_)) if subtracting => {
@@ -307,59 +308,101 @@ fn rewrite(
     }
 }
 
+/// The infinity a literal operand spells once translated, or `None` for any
+/// other operand.
+fn infinite_literal(translated: &Expr) -> Option<&'static str> {
+    single_quoted_literal(translated).and_then(temporal_literals::infinite_keyword)
+}
+
 /// `a - b` over two dates, which PostgreSQL answers in whole days.
 ///
 /// Both operands land on a midday-anchored Julian day, so the difference is an
-/// exact integer already and the cast only changes how it is held.
-fn day_difference(left: Expr, right: Expr) -> Expr {
-    Expr::Cast {
-        expr: Box::new(Expr::BinaryOp {
-            left: Box::new(simple_function_expr("julianday", vec![left], None)),
-            op: BinaryOperator::Minus,
-            right: Box::new(simple_function_expr("julianday", vec![right], None)),
-        }),
-        data_type: DataType::Integer(None),
-        format: None,
-        kind: CastKind::Cast,
+/// exact integer already and the cast only changes how it is held. PostgreSQL
+/// raises `cannot subtract infinite dates` for an infinite operand, which a
+/// literal is refused for and a value read at run time answers NULL for.
+fn day_difference(
+    (left, right): (&Expr, &Expr),
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Expr, Error> {
+    let operation = format!("{left} - {right}");
+    let translated_left = left.translate_with_warnings(schema, options, emit)?;
+    let translated_right = right.translate_with_warnings(schema, options, emit)?;
+    if infinite_literal(&translated_left).is_some() || infinite_literal(&translated_right).is_some()
+    {
+        return Err(Error::forward_refusal(format!(
+            "PostgreSQL answers `cannot subtract infinite dates` for `{operation}`, and the \
+             replica refuses it the same way."
+        )));
     }
+    guard(&operation, left, translated_left, InfiniteAnswer::Null, options, |from| {
+        guard(&operation, right, translated_right, InfiniteAnswer::Null, options, |subtracted| {
+            Ok(Expr::Cast {
+                expr: Box::new(Expr::BinaryOp {
+                    left: Box::new(simple_function_expr("julianday", vec![from], None)),
+                    op: BinaryOperator::Minus,
+                    right: Box::new(simple_function_expr("julianday", vec![subtracted], None)),
+                }),
+                data_type: DataType::Integer(None),
+                format: None,
+                kind: CastKind::Cast,
+            })
+        })
+    })
 }
 
 /// `date +/- n`, as a Julian day moved by whole days, refusing a literal date
-/// and count whose answer leaves the years SQLite's date functions hold.
+/// and count whose answer leaves the years SQLite's date functions hold. An
+/// infinite `date` stays the same infinity, and a NULL count answers NULL.
 ///
 /// The obvious `date(a, printf('%+d days', n))` is silently wrong for a NULL
 /// count: printf writes `+0 days` and the date comes back unchanged where
 /// PostgreSQL answers NULL. Julian days propagate NULL from either side and
 /// need no sign juggling for the subtracting case.
 fn shift_date(
-    date: Expr,
+    (written_date, date): (&Expr, Expr),
     op: &BinaryOperator,
-    days: Expr,
+    (written_days, days): (&Expr, Expr),
     (written_left, written_op, written_right): (&Expr, &BinaryOperator, &Expr),
+    options: &crate::options::TranslationContext<'_>,
 ) -> Result<Expr, Error> {
-    if let (Some(literal), Some(count)) =
-        (single_quoted_literal(&date), integer_literal_value(&days))
-    {
+    let operation = format!("{written_left} {written_op} {written_right}");
+    let count = integer_literal_value(&days);
+    if let (Some(literal), Some(count)) = (single_quoted_literal(&date), count) {
         let count = if *op == BinaryOperator::Minus { count.checked_neg() } else { Some(count) };
         if let Some(year) =
             count.and_then(|count| temporal_literals::year_after_shift(literal, 0, count, 0))
             && !(1..=9999).contains(&year)
         {
-            return Err(temporal_literals::arithmetic_outside_four_digit_years(
-                &format!("{written_left} {written_op} {written_right}"),
-                year,
-            ));
+            return Err(temporal_literals::arithmetic_outside_four_digit_years(&operation, year));
         }
     }
-    Ok(from_year_one(simple_function_expr(
-        "date",
-        vec![Expr::BinaryOp {
-            left: Box::new(simple_function_expr("julianday", vec![date], None)),
-            op: op.clone(),
-            right: Box::new(days),
-        }],
-        None,
-    )))
+    let shifted = |date: Expr, days: Expr| {
+        from_year_one(simple_function_expr(
+            "date",
+            vec![Expr::BinaryOp {
+                left: Box::new(simple_function_expr("julianday", vec![date], None)),
+                op: op.clone(),
+                right: Box::new(days),
+            }],
+            None,
+        ))
+    };
+    if count.is_some() {
+        return guard(&operation, written_date, date, InfiniteAnswer::Same, options, |date| {
+            Ok(shifted(date, days))
+        });
+    }
+    // A NULL count answers NULL over an infinite date too.
+    strict_guard(
+        &operation,
+        (written_date, date),
+        (written_days, days),
+        InfiniteAnswer::Same,
+        options,
+        |date, days| Ok(shifted(date, days)),
+    )
 }
 
 /// The year text a date or timestamp from year 1 on starts at or above.
@@ -432,6 +475,9 @@ pub(crate) fn epoch_of_temporal_difference(
     Some(subsec_epoch_difference(left, right, schema, options, emit))
 }
 
+/// `unixepoch(a, 'subsec') - unixepoch(b, 'subsec')`, an infinite side read as
+/// the REAL infinity of its sign, whose NaN for `infinity - infinity` SQLite
+/// answers as the NULL that stands for PostgreSQL's `interval out of range`.
 fn subsec_epoch_difference(
     left: &Expr,
     right: &Expr,
@@ -439,37 +485,79 @@ fn subsec_epoch_difference(
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Expr, Error> {
-    // `'subsec'` is what makes `unixepoch` answer a float rather than whole
-    // seconds, so it carries the fraction AND keeps the difference out of
-    // integer division. Dropping it would make `extract(epoch from (a - b)) /
-    // 60` divide as integers where PostgreSQL divides a numeric.
+    let operation = format!("extract(epoch FROM {left} - {right})");
+    let translated_left = left.translate_with_warnings(schema, options, emit)?;
+    let translated_right = right.translate_with_warnings(schema, options, emit)?;
+    if let (Some(from), Some(subtracted)) =
+        (infinite_literal(&translated_left), infinite_literal(&translated_right))
+        && from == subtracted
+    {
+        return Err(Error::forward_refusal(format!(
+            "PostgreSQL answers `interval out of range` for `{operation}`, and the replica \
+             refuses it the same way."
+        )));
+    }
+    // Without `'subsec'` the integer difference would truncate under `/ 60`.
+    let epoch = |written: &Expr, translated: Expr| {
+        guard(&operation, written, translated, InfiniteAnswer::Signed, options, |translated| {
+            Ok(build_subsecond_unixepoch_call(translated))
+        })
+    };
     Ok(Expr::Nested(Box::new(Expr::BinaryOp {
-        left: Box::new(build_subsecond_unixepoch_call(
-            left.translate_with_warnings(schema, options, emit)?,
-        )),
+        left: Box::new(epoch(left, translated_left)?),
         op: BinaryOperator::Minus,
-        right: Box::new(build_subsecond_unixepoch_call(
-            right.translate_with_warnings(schema, options, emit)?,
-        )),
+        right: Box::new(epoch(right, translated_right)?),
     })))
 }
 
 /// `to_timestamp(e)`: the instant `e` seconds after the epoch, rendered the
-/// way PostgreSQL renders it.
+/// way PostgreSQL renders it, and either infinity for a float infinity.
 ///
-/// `'subsec'` is what keeps the fraction, and it always renders three decimal
-/// places, so `to_timestamp(1709647629)` would come out `...09.000` where
-/// PostgreSQL writes `...09`. Trimming the trailing zeros and then the point
-/// answers both cases, and the point stops the trim from eating a zero second.
-/// Equality against a translated timestamp literal, which keeps its own
-/// spelling, needs the two texts to agree.
-pub(crate) fn subsecond_timestamp_from_epoch(epoch: Expr) -> Expr {
-    let rendered = simple_function_expr(
-        "datetime",
-        vec![epoch, string_literal("unixepoch"), string_literal("subsec")],
-        None,
-    );
-    trim_trailing_zeros(rendered)
+/// `'subsec'` keeps the fraction at three places, which the trim takes back to
+/// PostgreSQL's spelling.
+///
+/// # Errors
+///
+/// Refuses `NaN` as PostgreSQL does, and passes on the refusals of
+/// [`epoch_guard`].
+pub(crate) fn subsecond_timestamp_from_epoch(
+    written: &Expr,
+    epoch: Expr,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<Expr, Error> {
+    let rendered = |epoch: Expr| {
+        trim_trailing_zeros(simple_function_expr(
+            "datetime",
+            vec![epoch, string_literal("unixepoch"), string_literal("subsec")],
+            None,
+        ))
+    };
+    let special = single_quoted_literal(written)
+        .map(str::trim)
+        .filter(|text| crate::impls::shared_helpers::is_float_special(text));
+    if let Some(text) = special {
+        let text = text.to_ascii_lowercase();
+        if text == "nan" {
+            return Err(Error::forward_refusal(
+                "PostgreSQL answers `timestamp cannot be NaN` for to_timestamp('NaN'), and the \
+                 replica refuses it the same way."
+                    .to_string(),
+            ));
+        }
+        return Ok(string_literal(if text.starts_with('-') {
+            temporal_literals::NEGATIVE_INFINITY
+        } else {
+            temporal_literals::INFINITY
+        }));
+    }
+    for (negative, text) in
+        [(false, temporal_literals::INFINITY), (true, temporal_literals::NEGATIVE_INFINITY)]
+    {
+        if epoch == crate::impls::idioms::numeric_infinity(negative) {
+            return Ok(string_literal(text));
+        }
+    }
+    epoch_guard(written, epoch, options, rendered)
 }
 
 /// `rtrim(rtrim(x, '0'), '.')`, which turns `09.500` into `09.5` and `09.000`
@@ -545,8 +633,10 @@ fn julianday_argument(expr: &Expr) -> Option<&Expr> {
     }
 }
 
-/// The value argument of `unixepoch(x, 'subsec')`.
+/// The value argument of `unixepoch(x, 'subsec')`, bare or under its
+/// infinite guard.
 fn subsec_epoch_argument(expr: &Expr) -> Option<&Expr> {
+    let expr = infinite_temporal_guard_finite(expr).unwrap_or(expr);
     let Expr::Function(function) = expr else { return None };
     if !is_function_named(function, "unixepoch") {
         return None;
@@ -562,8 +652,9 @@ fn subsec_epoch_argument(expr: &Expr) -> Option<&Expr> {
 }
 
 /// The epoch argument of `rtrim(rtrim(datetime(e, 'unixepoch', 'subsec'), '0'),
-/// '.')`.
+/// '.')`, bare or under its infinite guard.
 fn trimmed_subsecond_datetime_argument(expr: &Expr) -> Option<&Expr> {
+    let expr = infinite_epoch_guard_finite(expr).unwrap_or(expr);
     let inner = rtrim_argument(expr, ".")?;
     let rendered = rtrim_argument(inner, "0")?;
     let Expr::Function(function) = rendered else { return None };

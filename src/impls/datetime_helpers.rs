@@ -712,9 +712,20 @@ fn replace_arguments(expr: &Expr) -> Option<(&Expr, &str, &str)> {
     }
 }
 
-/// `value` as canonical `timestamptz` text.
+/// `value` as canonical `timestamptz` text, an infinity kept as the word.
 #[must_use]
 pub(crate) fn canonical_timestamptz_value(value: Expr) -> Expr {
+    use crate::impls::{idioms, temporal_infinity::InfiniteAnswer};
+    let value = match idioms::split_same_temporal_guard(value) {
+        Ok((operand, finite)) => {
+            return idioms::infinite_temporal_guard(
+                operand,
+                InfiniteAnswer::Same,
+                canonical_timestamptz_value(finite),
+            );
+        }
+        Err(value) => *value,
+    };
     if is_canonical_timestamptz_call(&value) {
         return value;
     }
@@ -857,8 +868,8 @@ pub(crate) fn build_date_trunc_quarter_call(value_expr: Expr) -> Expr {
 /// millennium beginning 1001, and `offset` is 1. All three verified against
 /// PostgreSQL 16.
 ///
-/// `printf` pads the year, so a period beginning before year 1000 still forms
-/// a date SQLite can read.
+/// The year is padded to four digits by concatenation, which keeps a NULL
+/// operand NULL where `printf` would print `0000`.
 ///
 /// The subtraction is parenthesised because `*` and `/` bind tighter than `-`,
 /// so a flat `y - 1 / 100 * 100` would reduce to `y - 0`. When `offset` is
@@ -883,13 +894,21 @@ pub(crate) fn build_date_trunc_year_span_call(value_expr: Expr, span: i64, offse
         binary(floored, BinaryOperator::Plus, integer_literal(offset))
     };
 
+    let padded = simple_function_expr(
+        "substr",
+        vec![
+            binary(
+                string_literal("000"),
+                BinaryOperator::StringConcat,
+                Expr::Nested(Box::new(period_start)),
+            ),
+            integer_literal(-4),
+        ],
+        None,
+    );
     simple_function_expr(
         "datetime",
-        vec![simple_function_expr(
-            "printf",
-            vec![string_literal("%04d-01-01 00:00:00"), period_start],
-            None,
-        )],
+        vec![binary(padded, BinaryOperator::StringConcat, string_literal("-01-01 00:00:00"))],
         None,
     )
 }

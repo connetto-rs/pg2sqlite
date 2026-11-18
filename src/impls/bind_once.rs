@@ -33,18 +33,29 @@ pub(crate) fn bind_once<const N: usize>(
     sources: [&Expr; N],
     translated: [Expr; N],
     options: &TranslationContext<'_>,
-    form: impl Fn(&[Expr; N]) -> Expr,
+    form: impl FnOnce(&[Expr; N]) -> Expr,
+) -> Result<Expr, Error> {
+    try_bind_once(construct, sources, translated, options, |operands| Ok(form(operands)))
+}
+
+/// [`bind_once`] of a `form` that may refuse its operands.
+pub(crate) fn try_bind_once<const N: usize>(
+    construct: &str,
+    sources: [&Expr; N],
+    translated: [Expr; N],
+    options: &TranslationContext<'_>,
+    form: impl FnOnce(&[Expr; N]) -> Result<Expr, Error>,
 ) -> Result<Expr, Error> {
     let compound = || sources.iter().zip(&translated).filter(|(_, operand)| !is_atomic(operand));
     if let Some((source, _)) = compound().find(|(source, _)| !is_replayable(source, options)) {
         return Err(reject_duplicated_operand(construct, source));
     }
     if compound().next().is_none() {
-        return Ok(form(&translated));
+        return form(&translated);
     }
     let groups = sources.iter().any(|source| holds(source, Held::AggregateOrWindow));
     if options.allows_subqueries() && !groups {
-        return Ok(bound(translated, form));
+        return bound(translated, form);
     }
     if let Some((source, _)) = compound().find(|(source, _)| holds(source, Held::RepeatingLowering))
     {
@@ -55,7 +66,7 @@ pub(crate) fn bind_once<const N: usize>(
              subquery."
         )));
     }
-    Ok(form(&translated))
+    form(&translated)
 }
 
 /// True for an operand that is a column or a literal, which reads the same
@@ -64,7 +75,11 @@ pub(crate) fn is_atomic(expr: &Expr) -> bool {
     matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_))
 }
 
-fn bound<const N: usize>(translated: [Expr; N], form: impl Fn(&[Expr; N]) -> Expr) -> Expr {
+/// `form` over the `translated` operands bound once in a scalar subquery.
+pub(crate) fn bound<const N: usize>(
+    translated: [Expr; N],
+    form: impl FnOnce(&[Expr; N]) -> Result<Expr, Error>,
+) -> Result<Expr, Error> {
     let names: [Ident; N] =
         core::array::from_fn(|index| Ident::new(format!("pg2sqlite_operand_{index}")));
     let references = names.clone().map(Expr::Identifier);
@@ -75,8 +90,8 @@ fn bound<const N: usize>(translated: [Expr; N], form: impl Fn(&[Expr; N]) -> Exp
         .collect::<Vec<_>>();
     let operands: Query =
         make_query(None, SetExpr::Select(Box::new(make_simple_select(bindings, Vec::new(), None))));
-    Expr::Subquery(Box::new(single_expr_query(
-        form(&references),
+    Ok(Expr::Subquery(Box::new(single_expr_query(
+        form(&references)?,
         from_relation(TableFactor::Derived {
             lateral: false,
             subquery: Box::new(operands),
@@ -84,7 +99,7 @@ fn bound<const N: usize>(translated: [Expr; N], form: impl Fn(&[Expr; N]) -> Exp
             sample: None,
         }),
         None,
-    )))
+    ))))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

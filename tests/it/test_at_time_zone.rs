@@ -530,7 +530,11 @@ fn the_forward_direction_still_accepts_a_text_operand_for_a_zone_with_no_sign() 
         "CREATE TABLE d (id INT PRIMARY KEY, txt TEXT);
          SELECT txt AT TIME ZONE 'UTC' FROM d;",
     );
-    assert_eq!(sqlite, "SELECT datetime(txt) FROM d");
+    assert_eq!(
+        sqlite,
+        "SELECT CASE txt WHEN 'infinity' THEN 'infinity' WHEN '-infinity' THEN '-infinity' ELSE \
+         datetime(txt) END FROM d"
+    );
 }
 
 /// UTC is the identity, so the fraction PostgreSQL prints survives into the

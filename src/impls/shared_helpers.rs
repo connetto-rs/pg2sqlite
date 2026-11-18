@@ -1744,8 +1744,8 @@ pub(crate) fn convert_value_for_column_type(
                 .to_string(),
         ));
     }
-    if let Some(refusal) = float_special_refusal(data_type, &expr) {
-        return Err(refusal);
+    if let Some(special) = float_special_value(data_type, &expr) {
+        return special;
     }
     if matches!(data_type, DataType::Array(_))
         && crate::impls::function_helpers::single_quoted_literal(&expr).is_some()
@@ -2068,10 +2068,8 @@ pub(crate) fn convert_temporal_value(
     use crate::impls::{
         datetime_helpers::{
             build_strftime_call, canonical_timestamptz_call, canonical_timestamptz_value,
-            local_time_of, local_timestamp_text, local_timetz_of,
             take_canonical_timestamptz_operand,
         },
-        function_helpers::simple_function_expr,
         replay::{is_replayable, reject_duplicated_operand},
         temporal_literals::TemporalLiteralKind,
         timezone::TimestampAwareness,
@@ -2085,29 +2083,55 @@ pub(crate) fn convert_temporal_value(
     {
         return normalize_temporal_literal_expr(kind, expr, site);
     }
+    // The date functions keep either infinity, which is NULL as a time of day.
+    let infinite_answer = match kind {
+        TemporalLiteralKind::Time { .. } => crate::impls::temporal_infinity::InfiniteAnswer::Null,
+        _ => crate::impls::temporal_infinity::InfiniteAnswer::Same,
+    };
+    let guarded = |operand: Expr,
+                   source: &Expr,
+                   finite: &dyn Fn(Expr) -> Result<Expr, Error>|
+     -> Result<Expr, Error> {
+        match options {
+            Some(options) => {
+                crate::impls::temporal_infinity::guard(
+                    operation.unwrap_or("a temporal write"),
+                    written.unwrap_or(source),
+                    operand,
+                    infinite_answer,
+                    options,
+                    finite,
+                )
+            }
+            None => finite(operand),
+        }
+    };
     if matches!(kind, TemporalLiteralKind::Timestamp { zoned: true, .. }) {
         // A wall clock SQLite's date functions computed names its instant
         // only in the zone, so it is not canonicalised as UTC first.
         if source != Some(TimestampAwareness::Naive) {
             return Ok(round_column_text(kind, canonical_timestamptz_value(expr)));
         }
-        let value = match zone {
-            Some(zoned @ ZonedWallClock::Zone(_)) => {
-                if zoned.instant_reads_twice()
-                    && let (Some(written), Some(options)) = (written, options)
-                    && !is_replayable(written, options)
-                {
-                    return Err(reject_duplicated_operand(
-                        operation.unwrap_or("a temporal write"),
-                        written,
-                    ));
+        let source_expr = expr.clone();
+        let value = guarded(expr, &source_expr, &|expr| {
+            Ok(match zone {
+                Some(zoned @ ZonedWallClock::Zone(_)) => {
+                    if zoned.instant_reads_twice()
+                        && let (Some(written), Some(options)) = (written, options)
+                        && !is_replayable(written, options)
+                    {
+                        return Err(reject_duplicated_operand(
+                            operation.unwrap_or("a temporal write"),
+                            written,
+                        ));
+                    }
+                    // The date functions bring any SQLite time value to the
+                    // wall clock text the zone's conversion reads.
+                    zoned.instant(build_strftime_call("%Y-%m-%d %H:%M:%f", expr))
                 }
-                // The date functions bring any SQLite time value to the wall
-                // clock text the zone's conversion reads.
-                zoned.instant(build_strftime_call("%Y-%m-%d %H:%M:%f", expr))
-            }
-            Some(ZonedWallClock::Utc) | None => canonical_timestamptz_call(expr),
-        };
+                Some(ZonedWallClock::Utc) | None => canonical_timestamptz_call(expr),
+            })
+        })?;
         return Ok(round_column_text(kind, value));
     }
     // The operand of a canonical call is any SQLite time value, not text the
@@ -2126,11 +2150,34 @@ pub(crate) fn convert_temporal_value(
     {
         return Err(reject_duplicated_operand("a temporal write", &instant));
     }
-    if let Some(ZonedWallClock::Zone(clock)) = zone {
-        return zoned_temporal_value(kind, instant, is_text, clock, written, operation, options);
-    }
-    let precision = kind.rounding_precision();
-    Ok(match (kind, precision) {
+    let source_expr = instant.clone();
+    guarded(instant, &source_expr, &|instant| {
+        if let Some(ZonedWallClock::Zone(clock)) = zone {
+            return zoned_temporal_value(
+                kind, instant, is_text, clock, written, operation, options,
+            );
+        }
+        Ok(utc_temporal_value(kind, instant, is_text))
+    })
+}
+
+/// [`convert_temporal_value`] of an instant read in UTC. `is_text` says
+/// whether `instant` is the replica's own text, which the slicing builders
+/// read, or any SQLite time value.
+fn utc_temporal_value(
+    kind: crate::impls::temporal_literals::TemporalLiteralKind,
+    instant: Expr,
+    is_text: bool,
+) -> Expr {
+    use crate::impls::{
+        datetime_helpers::{
+            build_strftime_call, local_time_of, local_timestamp_text, local_timetz_of,
+            round_instant, round_time_of_instant,
+        },
+        function_helpers::simple_function_expr,
+        temporal_literals::TemporalLiteralKind,
+    };
+    match (kind, kind.rounding_precision()) {
         (TemporalLiteralKind::Date, _) => simple_function_expr("date", vec![instant], None),
         (TemporalLiteralKind::Time { zoned: true, .. }, _) if is_text => {
             round_column_text(kind, local_timetz_of(instant))
@@ -2142,10 +2189,10 @@ pub(crate) fn convert_temporal_value(
             round_column_text(kind, local_timestamp_text(instant, None))
         }
         (TemporalLiteralKind::Time { zoned, .. }, Some(precision)) => {
-            crate::impls::datetime_helpers::round_time_of_instant(&instant, precision, zoned)
+            round_time_of_instant(&instant, precision, zoned)
         }
         (TemporalLiteralKind::Timestamp { .. }, Some(precision)) => {
-            crate::impls::datetime_helpers::round_instant(&instant, precision)
+            round_instant(&instant, precision)
         }
         (TemporalLiteralKind::Time { zoned: true, .. }, None) => {
             build_strftime_call("%H:%M:%S+00:00", instant)
@@ -2156,7 +2203,7 @@ pub(crate) fn convert_temporal_value(
         (TemporalLiteralKind::Timestamp { .. }, None) => {
             simple_function_expr("datetime", vec![instant], None)
         }
-    })
+    }
 }
 
 /// [`convert_temporal_value`] of an instant, read from the wall clock of the
@@ -2335,16 +2382,15 @@ pub(crate) fn literal_checks_apply(data_type: &DataType) -> bool {
         || crate::impls::temporal_literals::temporal_literal_kind(data_type).is_some()
 }
 
-/// The refusal a non-finite float literal earns, or `None` when the position
-/// holds anything else.
+/// The value a non-finite float literal stands for in the replica, or `None`
+/// when the position holds anything else.
 ///
-/// SQLite's `REAL` is always finite: `CAST('NaN' AS REAL)` and
-/// `CAST('Infinity' AS REAL)` both answer `0.0`, so a stored special would
-/// match `WHERE col = 0`, and the literal left as text dies at write time
-/// under `STRICT` with `cannot store TEXT value in REAL column` while a
-/// comparison against it is quietly never equal. PostgreSQL takes all of
-/// `NaN`, `Infinity`, `inf` and their signed spellings, case-insensitively.
-pub(crate) fn float_special_refusal(data_type: &DataType, expr: &Expr) -> Option<Error> {
+/// The infinities become SQLite's REAL infinity. `NaN` is refused, since
+/// `CAST('NaN' AS REAL)` is `0.0`, which silently matches `WHERE col = 0`.
+pub(crate) fn float_special_value(
+    data_type: &DataType,
+    expr: &Expr,
+) -> Option<Result<Expr, Error>> {
     if !matches!(
         data_type,
         DataType::Real
@@ -2360,10 +2406,14 @@ pub(crate) fn float_special_refusal(data_type: &DataType, expr: &Expr) -> Option
     if !is_float_special(text) {
         return None;
     }
-    Some(Error::forward_refusal(format!(
-        "SQLite cannot hold {text}: CAST('{text}' AS REAL) stores 0.0, which silently matches \
-         WHERE col = 0. Store as TEXT and handle in the application, or exclude this column."
-    )))
+    let lowered = text.trim().to_ascii_lowercase();
+    if lowered == "nan" {
+        return Some(Err(Error::forward_refusal(format!(
+            "SQLite cannot hold {text}: CAST('{text}' AS REAL) stores 0.0, which silently matches \
+             WHERE col = 0. Store as TEXT and handle in the application, or exclude this column."
+        ))));
+    }
+    Some(Ok(crate::impls::idioms::numeric_infinity(lowered.starts_with('-'))))
 }
 
 /// Whether `text` is one of the non-finite floats PostgreSQL reads.

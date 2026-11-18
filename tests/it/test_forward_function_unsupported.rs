@@ -141,11 +141,6 @@ fn make_interval_unsupported() {
 }
 
 #[test]
-fn isfinite_unsupported() {
-    expect_unsupported("SELECT isfinite(TIMESTAMP '2024-01-01')");
-}
-
-#[test]
 fn justify_days_unsupported() {
     expect_unsupported("SELECT justify_days(INTERVAL '35 days')");
 }
