@@ -105,7 +105,14 @@ enum FunctionTranslation {
     /// Transform `to_json` and `to_jsonb` to `json_quote`, which CONVERTS a
     /// value to JSON, keeping SQL NULL and leaving an argument that is already
     /// JSON alone.
-    ToJson,
+    ToJson {
+        /// The constructor a trigger's whole `NEW` or `OLD` is rewritten
+        /// into, over its columns.
+        whole_row: &'static str,
+    },
+    /// `row_to_json`, which translates for a trigger's whole `NEW` or `OLD`
+    /// alone, since SQLite has no other row value.
+    RowToJson,
     /// No translation needed
     PassThrough,
     /// An array function whose body is rewritten over `json_each` /
@@ -825,7 +832,8 @@ fn translate_catalog_function(
     // PostgreSQL answers 0 and unicode answers NULL.
     "ascii" => FunctionTranslation::AsciiCodePoint,
     // to_json / to_jsonb: a conversion, not a reinterpretation.
-    "to_json" | "to_jsonb" => FunctionTranslation::ToJson,
+    "to_json" => FunctionTranslation::ToJson { whole_row: "json_build_object" },
+    "to_jsonb" => FunctionTranslation::ToJson { whole_row: "jsonb_build_object" },
     // jsonb_set / jsonb_insert: path and value both need converting.
     "jsonb_set" => FunctionTranslation::JsonSet { insert: false },
     "jsonb_insert" => FunctionTranslation::JsonSet { insert: true },
@@ -1019,11 +1027,12 @@ fn translate_catalog_function(
             "{original_name}() is not available in SQLite (no record types)."
         ))
     }
-    "json_to_record" | "jsonb_to_record" | "row_to_json" => {
+    "json_to_record" | "jsonb_to_record" => {
         FunctionTranslation::Unsupported(format!(
             "{original_name}() is not available in SQLite (no record/row types)."
         ))
     }
+    "row_to_json" => FunctionTranslation::RowToJson,
     // ROW(a, b) is a row-value constructor. SQLite has no row type.
     // Tuple comparison (a, b) = (c, d) is supported via Expr::Tuple and already works.
     "row" => FunctionTranslation::Unsupported(
@@ -2358,9 +2367,14 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                     None,
                 ))
             }
-            FunctionTranslation::ToJson => {
+            FunctionTranslation::ToJson { whole_row } => {
                 let exprs = extract_exactly(&func.args, 1, "to_json")?;
                 let argument = exprs[0];
+                if let Some(row) = options.trigger_row(argument) {
+                    return row
+                        .json_object(whole_row, schema)?
+                        .translate_with_warnings(schema, options, emit);
+                }
 
                 // PostgreSQL answers `could not determine polymorphic type
                 // because input has type unknown` for an untyped literal, so
@@ -2381,6 +2395,22 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                     )));
                 }
                 Ok(json_argument(argument, "to_json", schema, options, emit)?.into_to_json())
+            }
+            FunctionTranslation::RowToJson => {
+                let exprs = function_argument_exprs(&func.args);
+                let row = match exprs.as_slice() {
+                    [argument] => options.trigger_row(argument),
+                    _ => None,
+                };
+                let Some(row) = row else {
+                    return Err(crate::errors::Error::forward_refusal(
+                        "row_to_json() is not available in SQLite (no record/row types). Inside a \
+                         row trigger, row_to_json(NEW) and row_to_json(OLD) translate."
+                            .to_string(),
+                    ));
+                };
+                row.json_object("json_build_object", schema)?
+                    .translate_with_warnings(schema, options, emit)
             }
             FunctionTranslation::Extremum { greatest } => {
                 let exprs = function_argument_exprs(&func.args);

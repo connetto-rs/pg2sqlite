@@ -315,6 +315,7 @@ mod test_trigger_row_assignment;
 mod test_trigger_select_into;
 mod test_trigger_shared_uuid;
 mod test_trigger_simple;
+mod test_trigger_whole_row;
 mod test_trunc;
 mod test_trunc_scale_range;
 mod test_truncate;

@@ -7,7 +7,10 @@ use sql_traits::{
     structs::ParserDB,
     traits::{DatabaseLike, ViewLike},
 };
-use sqlparser::ast::{BinaryOperator, Expr, Ident, TableFactor, TriggerEvent, Visit, Visitor};
+use sqlparser::ast::{
+    BinaryOperator, CaseWhen, Expr, Ident, TableFactor, TriggerEvent, Visit, Visitor,
+    helpers::attached_token::AttachedToken,
+};
 
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
@@ -70,6 +73,50 @@ pub(crate) enum BoundValue {
     /// A value the emitted trigger cannot compute, refused with the reason
     /// where a statement reads it.
     Unreadable(String),
+    /// A whole row of the firing table, read field by field.
+    Row(RowValue),
+}
+
+/// The whole row a record variable holds.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum RowValue {
+    /// `NEW` or `OLD`.
+    Trigger(Ident),
+    /// The row of the first arm whose PostgreSQL condition holds, else
+    /// `otherwise`.
+    Chosen { arms: Vec<(Expr, Self)>, otherwise: Box<Self> },
+    /// No row, as after a branch that assigned none.
+    Unassigned,
+}
+
+impl RowValue {
+    /// The PostgreSQL expression reading `field` of the row, or `None` when
+    /// a path leaves the record unassigned, where PostgreSQL raises at the
+    /// read.
+    pub(crate) fn field(&self, field: &Ident) -> Option<Expr> {
+        match self {
+            Self::Trigger(row) => Some(Expr::CompoundIdentifier(vec![row.clone(), field.clone()])),
+            Self::Chosen { arms, otherwise } => {
+                let conditions = arms
+                    .iter()
+                    .map(|(condition, row)| {
+                        Some(CaseWhen {
+                            condition: Expr::Nested(Box::new(condition.clone())),
+                            result: row.field(field)?,
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                Some(Expr::Case {
+                    case_token: AttachedToken::empty(),
+                    end_token: AttachedToken::empty(),
+                    operand: None,
+                    conditions,
+                    else_result: Some(Box::new(otherwise.field(field)?)),
+                })
+            }
+            Self::Unassigned => None,
+        }
+    }
 }
 
 /// A variable and the value it holds.

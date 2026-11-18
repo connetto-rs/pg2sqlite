@@ -19,7 +19,7 @@ use sqlparser_plpgsql::embedded::{
 use super::{
     cte_builder::CteBuilder,
     raise::raise_statement,
-    scope::{Binding, BodyScope, BoundValue, TriggerFacts, expand_relation, fold},
+    scope::{Binding, BodyScope, BoundValue, RowValue, TriggerFacts, expand_relation, fold},
 };
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
@@ -263,20 +263,17 @@ impl PlPgSqlTranslator {
                     if let Some(default) = &variable.default {
                         // PostgreSQL computes each default as the block is
                         // entered, in the order the block declares them.
-                        let mut value = embedded::expression(default).into_owned();
                         let variables: Vec<String> =
                             scope.bindings().map(|binding| binding.name.clone()).collect();
-                        result.extend(Self::inline_helper_calls(
-                            &mut value,
+                        let (value, inlined) = Self::assigned_value(
+                            embedded::expression(default).into_owned(),
                             scope,
                             schema,
                             &options.with_variables(&variables),
                             emit,
-                        )?);
-                        scope.bind_persistent(Binding {
-                            name: declaration.name.clone(),
-                            value: BoundValue::Expr(value),
-                        });
+                        )?;
+                        result.extend(inlined);
+                        scope.bind_persistent(Binding { name: declaration.name.clone(), value });
                         let variables: Vec<String> =
                             scope.bindings().map(|binding| binding.name.clone()).collect();
                         result.extend(Self::evaluate_assigned(
@@ -334,7 +331,7 @@ impl PlPgSqlTranslator {
                          back with SELECT ... INTO after the write."
                     )));
                 };
-                let query = Self::fold_trigger_specials_in(query.as_ref().clone(), &scope.facts)?;
+                let query = Self::prepare(query.as_ref().clone(), scope)?;
                 Self::translate_select_into(query, into, scope, schema, options, emit)
             }
             NodeKind::Statement { statement, into: None } => {
@@ -353,12 +350,11 @@ impl PlPgSqlTranslator {
                          effects, or SELECT ... INTO to keep its result."
                     )));
                 }
-                let statement =
-                    Self::fold_trigger_specials_in(statement.as_ref().clone(), &scope.facts)?;
+                let statement = Self::prepare(statement.as_ref().clone(), scope)?;
                 Self::translate_statement(&statement, scope, schema, options, emit)
             }
             NodeKind::Perform { query } => {
-                let query = Self::fold_trigger_specials_in(query.as_ref().clone(), &scope.facts)?;
+                let query = Self::prepare(query.as_ref().clone(), scope)?;
                 if let Some(inlined) = Self::perform_helper(&query, scope, schema, options, emit)? {
                     return Ok(inlined);
                 }
@@ -373,13 +369,14 @@ impl PlPgSqlTranslator {
             }
             NodeKind::Assignment(assignment) => {
                 let name = Self::assigned_name(&assignment.target, &scope.facts)?;
-                let mut value = Self::fold_trigger_specials_in(
+                let (value, mut statements) = Self::assigned_value(
                     embedded::expression(&assignment.value).into_owned(),
-                    &scope.facts,
+                    scope,
+                    schema,
+                    options,
+                    emit,
                 )?;
-                let mut statements =
-                    Self::inline_helper_calls(&mut value, scope, schema, options, emit)?;
-                scope.bind(Binding { name: name.clone(), value: BoundValue::Expr(value) });
+                scope.bind(Binding { name: name.clone(), value });
                 statements.extend(Self::evaluate_assigned(&[name], scope, schema, options, emit)?);
                 Ok(statements)
             }
@@ -394,7 +391,7 @@ impl PlPgSqlTranslator {
             }
             NodeKind::Raise(raise) => {
                 let Some(statement) = raise_statement(raise)? else { return Ok(Vec::new()) };
-                let statement = Self::fold_trigger_specials_in(statement, &scope.facts)?;
+                let statement = Self::prepare(statement, scope)?;
                 Self::finalize_reads(vec![statement], scope, schema, options, emit)
             }
             NodeKind::Block(block) => {
@@ -746,10 +743,8 @@ impl PlPgSqlTranslator {
         // helpers write is no write under the `IF`.
         let mut first = match conditional.branches.first() {
             Some(Branch { condition, .. }) => {
-                let mut written = Self::fold_trigger_specials_in(
-                    embedded::expression(condition).into_owned(),
-                    &scope.facts,
-                )?;
+                let mut written =
+                    Self::prepare(embedded::expression(condition).into_owned(), scope)?;
                 result.extend(Self::inline_helper_calls(
                     &mut written,
                     scope,
@@ -771,10 +766,8 @@ impl PlPgSqlTranslator {
             let written = if let Some(written) = first.take() {
                 written
             } else {
-                let mut written = Self::fold_trigger_specials_in(
-                    embedded::expression(condition).into_owned(),
-                    &scope.facts,
-                )?;
+                let mut written =
+                    Self::prepare(embedded::expression(condition).into_owned(), scope)?;
                 scope.push_condition(conjunction(negated.iter().cloned()));
                 let inlined = Self::inline_helper_calls(&mut written, scope, schema, options, emit);
                 scope.pop_condition();
@@ -881,6 +874,14 @@ impl PlPgSqlTranslator {
     /// The `CASE` choosing among `arms` by condition with `otherwise` as its
     /// `ELSE`, unreadable when any value is.
     fn merged_value(arms: Vec<(Expr, BoundValue)>, otherwise: BoundValue) -> BoundValue {
+        if arms
+            .iter()
+            .map(|(_, value)| value)
+            .chain([&otherwise])
+            .any(|value| matches!(value, BoundValue::Row(_)))
+        {
+            return Self::merged_row(arms, otherwise);
+        }
         let mut conditions = Vec::with_capacity(arms.len());
         for (condition, value) in arms {
             let BoundValue::Expr(result) = value else { return value };
@@ -897,6 +898,26 @@ impl PlPgSqlTranslator {
             conditions,
             else_result: Some(Box::new(Expr::Nested(Box::new(otherwise)))),
         })
+    }
+
+    /// The row of the first of `arms` whose condition holds, else
+    /// `otherwise`, a value other than a row leaving the record unassigned.
+    fn merged_row(arms: Vec<(Expr, BoundValue)>, otherwise: BoundValue) -> BoundValue {
+        let row = |value: BoundValue| {
+            match value {
+                BoundValue::Row(row) => Ok(row),
+                BoundValue::Expr(_) => Ok(RowValue::Unassigned),
+                BoundValue::Unreadable(reason) => Err(reason),
+            }
+        };
+        let arms: Result<Vec<_>, String> =
+            arms.into_iter().map(|(condition, value)| Ok((condition, row(value)?))).collect();
+        match (arms, row(otherwise)) {
+            (Ok(arms), Ok(otherwise)) => {
+                BoundValue::Row(RowValue::Chosen { arms, otherwise: Box::new(otherwise) })
+            }
+            (Err(reason), _) | (_, Err(reason)) => BoundValue::Unreadable(reason),
+        }
     }
 
     /// Translates an `IF` or `ELSIF` condition into the SQLite guard injected
@@ -919,6 +940,92 @@ impl PlPgSqlTranslator {
             Self::bound_values(&bindings, ReferenceForm::Inline, schema, options, emit);
         substitute_variables(&mut translated, &variables)?;
         Ok(translated)
+    }
+
+    /// What a variable assigned `value` holds, the whole row when `value` is
+    /// `NEW`, `OLD` or a variable holding a row, with the statements running
+    /// the helpers `value` calls.
+    fn assigned_value(
+        value: Expr,
+        scope: &mut BodyScope,
+        schema: &ParserDB,
+        options: &crate::options::TranslationContext<'_>,
+        emit: crate::warnings::WarningSink<'_>,
+    ) -> Result<(BoundValue, Vec<Statement>), Error> {
+        if let Some(row) = Self::row_value(&value, scope) {
+            return Ok((BoundValue::Row(row), Vec::new()));
+        }
+        let mut value = Self::prepare(value, scope)?;
+        let statements = Self::inline_helper_calls(&mut value, scope, schema, options, emit)?;
+        Ok((BoundValue::Expr(value), statements))
+    }
+
+    /// The whole row `value` reads, when it is `NEW`, `OLD` or a variable
+    /// holding a row.
+    fn row_value(value: &Expr, scope: &BodyScope) -> Option<RowValue> {
+        if let Expr::Nested(inner) = value {
+            return Self::row_value(inner, scope);
+        }
+        let ident = bare_identifier(value)?;
+        let name = fold(ident);
+        // A helper the body calls has no `NEW` or `OLD` of its own.
+        if !scope.is_callee() && matches!(name.as_str(), "new" | "old") {
+            return Some(RowValue::Trigger(Ident::new(name.to_ascii_uppercase())));
+        }
+        match &scope.bindings().find(|binding| binding.name == name)?.value {
+            BoundValue::Row(row) => Some(row.clone()),
+            BoundValue::Expr(_) | BoundValue::Unreadable(_) => None,
+        }
+    }
+
+    /// Reads every field of a record variable `node` reads through the row
+    /// it holds, then constant-folds the trigger specials.
+    pub(super) fn prepare<N: VisitMut>(mut node: N, scope: &BodyScope) -> Result<N, Error> {
+        let mut failure = None;
+        let _: ControlFlow<()> = visit_expressions_mut(&mut node, |expr| {
+            if failure.is_none()
+                && let Err(error) = Self::read_record(expr, scope)
+            {
+                failure = Some(error);
+            }
+            ControlFlow::Continue(())
+        });
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        Self::fold_trigger_specials_in(node, &scope.facts)
+    }
+
+    /// Rewrites `rec.field` to the field of the row `rec` holds, and a bare
+    /// `rec` holding `NEW` or `OLD` to that row.
+    fn read_record(expr: &mut Expr, scope: &BodyScope) -> Result<(), Error> {
+        let (name, field) = if let Expr::CompoundIdentifier(parts) = &*expr
+            && let [head, field] = parts.as_slice()
+        {
+            (fold(head), Some(field.clone()))
+        } else if let Some(head) = bare_identifier(expr) {
+            (fold(head), None)
+        } else {
+            return Ok(());
+        };
+        let Some(binding) = scope.bindings().find(|binding| binding.name == name) else {
+            return Ok(());
+        };
+        let BoundValue::Row(row) = &binding.value else { return Ok(()) };
+        *expr = match (field, row) {
+            (Some(field), row) => {
+                row.field(&field).ok_or_else(|| Error::forward_refusal(partial_row(&name)))?
+            }
+            (None, RowValue::Trigger(row)) => Expr::Identifier(row.clone()),
+            (None, RowValue::Chosen { .. } | RowValue::Unassigned) => {
+                return Err(Error::forward_refusal(format!(
+                    "`{name}` holds `NEW` or `OLD` depending on which branch of an IF ran, and a \
+                     whole row translates only where it is read as `NEW` or `OLD` itself. Read \
+                     the fields of `{name}`, or `NEW` or `OLD` in each branch."
+                )));
+            }
+        };
+        Ok(())
     }
 
     /// Constant-folds every trigger special `node` reads, wherever it sits.
@@ -1902,6 +2009,9 @@ impl PlPgSqlTranslator {
                     scope.refuse(&binding.name, reason);
                     continue;
                 }
+                // Every read of a row went through its fields before
+                // translation.
+                BoundValue::Row(_) => continue,
             };
             let mut renamed = expr.clone();
             Self::transform_expr(&mut renamed, options);
@@ -1997,6 +2107,16 @@ impl VariableScope {
     fn is_empty(&self) -> bool {
         self.replacements.is_empty() && self.refusals.is_empty()
     }
+}
+
+/// Why a field of `name` cannot be read after an `IF` that assigned it a row
+/// in only some branches.
+fn partial_row(name: &str) -> String {
+    format!(
+        "`{name}` holds a row only after some branches of an IF, and PostgreSQL raises at a read \
+         of a field of a record no branch assigned, which the translation does not reproduce. \
+         Assign `{name}` a row in every branch, ELSE included."
+    )
 }
 
 /// The identifier a bare name reads, or `None` for anything qualified.
