@@ -4246,6 +4246,9 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
         if let Some(read) = session_variable::translate_expr_read(self, schema, options)? {
             return Ok(read);
         }
+        if let Some(rewritten) = crate::impls::enum_type::rewrite(self, schema, options)? {
+            return rewritten.translate_with_warnings(schema, options, emit);
+        }
         Ok(match self {
             // PostgreSQL's other spellings of a string literal have no SQLite
             // form: `$$hello$$` reads there as a parameter named `$hello$`,

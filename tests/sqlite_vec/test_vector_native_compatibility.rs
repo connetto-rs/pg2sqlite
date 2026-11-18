@@ -307,7 +307,7 @@ fn a_sparsevec_without_pgvector_is_an_unknown_type() {
     assert_refusal(
         "CREATE TABLE items(id INT PRIMARY KEY, s sparsevec(3));",
         None,
-        "sparsevec has no SQLite equivalent. If this is an enum or domain",
+        "sparsevec has no SQLite equivalent. If this is a domain",
     );
 }
 

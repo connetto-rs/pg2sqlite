@@ -449,6 +449,9 @@ fn translate_custom_type(
     if super::vector::stored_vector(data_type, schema)?.is_some() {
         return Ok(DataType::Blob(None));
     }
+    if crate::impls::enum_type::is_enum(data_type, schema) {
+        return Ok(DataType::Text);
+    }
     let custom_type_name = crate::impls::object_name::last_catalog_name(name);
 
     match custom_type_name.as_deref() {
@@ -501,8 +504,8 @@ fn translate_custom_type(
                 )))
             } else {
                 Err(crate::errors::Error::forward_refusal(format!(
-                    "{name} has no SQLite equivalent. If this is an enum or domain, \
-                     remap it to a base type (TEXT or INTEGER) before translating."
+                    "{name} has no SQLite equivalent. If this is a domain, remap it to its base \
+                     type before translating."
                 )))
             }
         }

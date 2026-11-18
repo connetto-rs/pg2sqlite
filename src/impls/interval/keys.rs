@@ -41,7 +41,9 @@ use crate::{
     impls::{
         expr_helpers::null_ignoring_extremum,
         expression_type::{UNKNOWN, is_interval_typed, type_name},
-        function_helpers::{integer_literal, simple_function_expr, string_literal},
+        function_helpers::{
+            integer_literal, simple_function_expr, string_literal, string_literal_text,
+        },
         object_name::last_ident,
         replay::{is_replayable, reject_duplicated_operand},
         shared_helpers::{
@@ -53,18 +55,6 @@ use crate::{
     traits::translator::TranslatorWithContext,
     warnings::WarningSink,
 };
-
-/// The string variants a literal beside an interval may be written as.
-fn string_literal_text(value: &Value) -> Option<String> {
-    match value {
-        Value::SingleQuotedString(text)
-        | Value::NationalStringLiteral(text)
-        | Value::EscapedStringLiteral(text)
-        | Value::UnicodeStringLiteral(text) => Some(text.clone()),
-        Value::DollarQuotedString(quoted) => Some(quoted.value.clone()),
-        _ => None,
-    }
-}
 
 /// The literal a value expression holds, through one level of parentheses.
 fn value_of(expr: &Expr) -> Option<&Value> {
@@ -129,7 +119,7 @@ pub(super) fn interval_side(
                 // as it reads a column.
                 Value::Placeholder(_) => IntervalSide::Keyed(Box::new(side.clone())),
                 other => {
-                    match string_literal_text(other) {
+                    match string_literal_text(other).map(str::to_owned) {
                         Some(text) => IntervalSide::BareLiteral(text),
                         None => IntervalSide::Other,
                     }
@@ -137,7 +127,9 @@ pub(super) fn interval_side(
             })
         }
         Expr::Interval(interval) => {
-            let Some(text) = value_of(interval.value.as_ref()).and_then(string_literal_text) else {
+            let Some(text) =
+                value_of(interval.value.as_ref()).and_then(string_literal_text).map(str::to_owned)
+            else {
                 return Err(Error::forward_refusal(
                     "an INTERVAL over a non-literal operand cannot be keyed: the key reads the \
                      text PostgreSQL prints, and the operand's text is not known at \
@@ -173,7 +165,7 @@ fn interval_side_cast(
         Some(Value::Null) => Ok(IntervalSide::Null),
         Some(Value::Placeholder(_)) => Ok(IntervalSide::Keyed(Box::new(expr.clone()))),
         _ => {
-            let Some(text) = value_of(expr).and_then(string_literal_text) else {
+            let Some(text) = value_of(expr).and_then(string_literal_text).map(str::to_owned) else {
                 return Err(cast_spelling_refusal());
             };
             let typmod = interval_data_type_typmod(data_type)?.unwrap_or_default();
@@ -398,13 +390,13 @@ pub(crate) fn position_key(
     schema: &ParserDB,
     options: &TranslationContext<'_>,
     emit: WarningSink<'_>,
-) -> Result<Option<Expr>, Error> {
+) -> Result<Expr, Error> {
     let resolved = match interval_side(side, schema, options)? {
         IntervalSide::BareLiteral(text) => {
-            return Ok(Some(literal_key(&text, IntervalTypmod::default())?));
+            return literal_key(&text, IntervalTypmod::default());
         }
         IntervalSide::TypedLiteral { text, typmod } => {
-            return Ok(Some(literal_key(&text, typmod)?));
+            return literal_key(&text, typmod);
         }
         IntervalSide::Null | IntervalSide::Other | IntervalSide::Keyed(_) => side,
     };
@@ -413,11 +405,14 @@ pub(crate) fn position_key(
         .transpose()?
         .flatten()
         .unwrap_or(resolved);
+    if !group_by && let Some(key) = crate::impls::enum_type::order_key(resolved, schema, options) {
+        return key.translate_with_warnings(schema, options, emit);
+    }
     let translated = resolved.translate_with_warnings(schema, options, emit)?;
     if is_interval_typed(resolved, schema, options) {
-        return Ok(Some(key_expr(&translated, options)?));
+        return key_expr(&translated, options);
     }
-    Ok(Some(translated))
+    Ok(translated)
 }
 
 /// The projection item an `ORDER BY` or `GROUP BY` item names, or the

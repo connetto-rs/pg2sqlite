@@ -85,11 +85,11 @@ fn create_type_emits_lossy_drop_warning() {
     assert_lossy_drop(&warns[0], "CREATE TYPE");
 }
 
+/// An enum's labels live on in every column of the type, so its definition
+/// drops nothing.
 #[test]
-fn create_type_enum_emits_lossy_drop_warning() {
-    let warns = warnings_for("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');");
-    assert_eq!(warns.len(), 1);
-    assert_lossy_drop(&warns[0], "CREATE TYPE");
+fn create_type_enum_warns_nothing() {
+    assert_eq!(warnings_for("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');"), vec![]);
 }
 
 #[test]

@@ -428,6 +428,10 @@ impl Pg2Sqlite {
             statement,
             Statement::Drop { object_type: ObjectType::Table | ObjectType::View, .. }
                 | Statement::RenameTable(_)
+                | Statement::AlterType(sqlparser::ast::AlterType {
+                    operation: sqlparser::ast::AlterTypeOperation::Rename(_),
+                    ..
+                })
         )
     }
 
@@ -701,6 +705,10 @@ impl Pg2Sqlite {
             let schema_end = boundary.unwrap_or(end);
             let mut bindings = Vec::new();
             let mut before_index_drops = Vec::new();
+            crate::impls::enum_type::reject_late_added_values(
+                &statements[start..schema_end],
+                || input.snapshot(),
+            )?;
             for (index, statement) in statements[start..schema_end].iter().enumerate() {
                 if Self::changes_columns(statement) {
                     bindings.push((start + index, input.snapshot()));

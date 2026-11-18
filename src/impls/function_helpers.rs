@@ -43,6 +43,20 @@ pub(crate) fn single_quoted_literal(expr: &Expr) -> Option<&str> {
     }
 }
 
+/// The text of a string literal in any of PostgreSQL's spellings, escapes
+/// already resolved by the parser.
+#[must_use]
+pub(crate) fn string_literal_text(value: &Value) -> Option<&str> {
+    match value {
+        Value::SingleQuotedString(text)
+        | Value::NationalStringLiteral(text)
+        | Value::EscapedStringLiteral(text)
+        | Value::UnicodeStringLiteral(text) => Some(text),
+        Value::DollarQuotedString(quoted) => Some(&quoted.value),
+        _ => None,
+    }
+}
+
 /// Whether `function` calls `name`, compared without case.
 #[must_use]
 pub(crate) fn is_function_named(function: &sqlparser::ast::Function, name: &str) -> bool {

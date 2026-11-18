@@ -316,7 +316,7 @@ pub(crate) fn translate_column_def(
         .flatten()
         .collect();
 
-    for bound in declared_bound_checks(column, options)? {
+    for bound in declared_bound_checks(column, schema, options)? {
         translated_options.push(ColumnOptionDef {
             name: None,
             option: ColumnOption::Check(CheckConstraint {
@@ -391,9 +391,15 @@ fn temporal_default(
 /// bound parameter never passes through the literal rewrites.
 fn declared_bound_checks(
     column: &ColumnDef,
+    schema: &sql_traits::structs::ParserDB,
     options: &crate::options::TranslationContext<'_>,
 ) -> Result<Vec<Expr>, crate::errors::Error> {
     let mut bounds = Vec::new();
+    if let Some(labels) =
+        crate::impls::enum_type::label_check(&column.name, &column.data_type, schema)
+    {
+        bounds.push(labels);
+    }
     if is_uuid_data_type(&column.data_type) && is_blob_uuid_representation(options) {
         bounds.push(uuid_blob_length_check_expr(&column.name));
     }

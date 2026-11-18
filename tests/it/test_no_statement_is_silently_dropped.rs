@@ -190,15 +190,19 @@ const CASES: &[Case] = &[
     warned("DROP ROLE r"),
     warned("DROP GROUP r"),
     warned("DROP USER r"),
-    // Warned and dropped: type-like definitions.
-    warned("CREATE TYPE mood AS ENUM ('sad', 'ok')"),
-    // sql-traits records types, so altering one nothing declared refuses at
-    // build, as PostgreSQL does, and the warn-drop needs the type declared.
+    // Warned and dropped: type-like definitions no column carries.
+    warned("CREATE TYPE address AS (street TEXT, city TEXT)"),
+    consumed(TABLE, "CREATE TYPE mood AS ENUM ('sad', 'ok')"),
+    consumed("CREATE TYPE mood AS ENUM ('sad', 'ok');", "ALTER TYPE mood ADD VALUE 'fine'"),
     Case {
         setup: "CREATE TYPE mood AS ENUM ('sad', 'ok');",
-        sql: "ALTER TYPE mood RENAME TO feeling",
-        outcome: Outcome::Warned,
+        sql: "ALTER TYPE mood RENAME VALUE 'ok' TO 'fine'",
+        outcome: Outcome::Rejected,
     },
+    consumed("CREATE TYPE mood AS ENUM ('sad', 'ok');", "ALTER TYPE mood RENAME TO feeling"),
+    consumed("CREATE TYPE mood AS ENUM ('sad', 'ok');", "DROP TYPE mood"),
+    // sql-traits records types, so altering one nothing declared refuses at
+    // build, as PostgreSQL does.
     rejected("ALTER TYPE nope RENAME TO feeling"),
     warned("CREATE DOMAIN positive AS INTEGER CHECK (VALUE > 0)"),
     // sql-traits records domains, so a drop of one nothing declared refuses at
@@ -446,6 +450,12 @@ fn only_the_documented_statements_are_silent() {
             // reads a plain view's tables as the view's owner.
             "ALTER TABLE t OWNER TO r",
             "ALTER VIEW v OWNER TO r",
+            // Realised in the CHECK and the order key of every column of the
+            // type, built from its final labels.
+            "CREATE TYPE mood AS ENUM ('sad', 'ok')",
+            "ALTER TYPE mood ADD VALUE 'fine'",
+            "ALTER TYPE mood RENAME TO feeling",
+            "DROP TYPE mood",
         ]
     );
 }

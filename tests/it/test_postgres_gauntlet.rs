@@ -51,6 +51,9 @@ mod parity_datetime;
 #[path = "gauntlet/parity_ddl.rs"]
 mod parity_ddl;
 
+#[path = "gauntlet/parity_enum.rs"]
+mod parity_enum;
+
 #[path = "gauntlet/parity_dml.rs"]
 mod parity_dml;
 

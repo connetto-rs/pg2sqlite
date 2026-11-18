@@ -632,6 +632,45 @@ pub(crate) fn query_output_carries<T>(
     Ok(false)
 }
 
+/// Each output of a query, by the name PostgreSQL stores, with what a reader
+/// answers for it.
+pub(crate) type QueryOutputs<T> = Vec<(Option<String>, Option<T>)>;
+
+/// The outputs of `query` in order, each with its name folded the way
+/// PostgreSQL stores it and what `read_column` or `read_expression` answers
+/// for it, or `None` when a `*` hides how many outputs there are.
+///
+/// # Errors
+///
+/// Propagates the refusal a scope that cannot be built answers, and the error
+/// `read_expression` answers.
+pub(crate) fn query_outputs<T>(
+    query: &Query,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    read_column: impl Fn(&sqlparser::ast::ColumnDef) -> Option<T>,
+    read_expression: impl Fn(
+        &Expr,
+        &ParserDB,
+        &crate::options::TranslationContext<'_>,
+    ) -> Result<Option<T>, Error>,
+) -> Result<Option<QueryOutputs<T>>, Error> {
+    let graph =
+        ColumnScope::from_query(query, schema, sql_traits::structs::IdentifierCase::AsWritten)?;
+    let mut read = Vec::new();
+    for output in graph.scope_for_query(query).map(|scope| scope.outputs()).into_iter().flatten() {
+        let QueryOutput::Column { name, definition } = output else {
+            return Ok(None);
+        };
+        let name = name
+            .map(|(name, quoted)| if quoted { name.to_owned() } else { name.to_ascii_lowercase() });
+        let read_value =
+            definition_find(&definition, schema, options, &read_column, &read_expression)?;
+        read.push((name, read_value));
+    }
+    Ok(Some(read))
+}
+
 /// Reads the first output column of `query`, the value a scalar subquery
 /// answers, or [`None`] when the statement records no scope for it or that
 /// output has no inspectable definition.
@@ -916,7 +955,7 @@ pub(crate) fn relations_scope_query(
 
 /// Unwraps parentheses, which carry no meaning for resolution.
 #[cfg_attr(feature = "std", recursive::recursive)]
-fn strip_nesting(expr: &Expr) -> &Expr {
+pub(crate) fn strip_nesting(expr: &Expr) -> &Expr {
     match expr {
         Expr::Nested(inner) => strip_nesting(inner),
         other => other,
@@ -3225,8 +3264,7 @@ pub(crate) fn translate_order_by_expr<D: TranslationDirection>(
                 emit,
             )
         })
-        .transpose()?
-        .flatten();
+        .transpose()?;
     Ok(OrderByExpr {
         expr: match key {
             Some(key) => key,
@@ -3665,8 +3703,7 @@ pub(crate) fn translate_group_by_expr<D: TranslationDirection>(
                                     e, projection, true, schema, ctx, emit,
                                 )
                             })
-                            .transpose()?
-                            .flatten();
+                            .transpose()?;
                         Ok::<Expr, Error>(match key {
                             Some(key) => key,
                             None => D::translate_expr(e, schema, options, emit)?,
@@ -3695,8 +3732,7 @@ fn window_partition_expr<D: TranslationDirection>(
     let Some(ctx) = D::forward_context(options) else {
         return D::translate_expr(e, schema, options, emit);
     };
-    crate::impls::interval::keys::position_key(e, None, false, schema, ctx, emit)?
-        .map_or_else(|| D::translate_expr(e, schema, options, emit), Ok)
+    crate::impls::interval::keys::position_key(e, None, false, schema, ctx, emit)
 }
 
 pub(crate) fn translate_window_spec<D: TranslationDirection>(
@@ -6129,8 +6165,7 @@ mod tests {
         use crate::impls::interval::keys::position_key;
 
         let expr = position_key(&order_by_expr.expr, None, false, schema, options, &mut |_| {})
-            .expect("the position key settles")
-            .expect("an interval operand reads a key");
+            .expect("the position key settles");
         sqlparser::ast::OrderByExpr {
             expr,
             options: sqlparser::ast::OrderByOptions { sort: None, nulls_first: Some(false) },
