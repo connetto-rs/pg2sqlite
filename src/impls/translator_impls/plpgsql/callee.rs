@@ -237,6 +237,12 @@ impl PlPgSqlTranslator {
                             &format!("returns a value the condition cannot read. {reason}"),
                         ));
                     }
+                    Some(BoundValue::Row(_)) => {
+                        return Err(refusal(
+                            &call.name,
+                            "returns a whole row, which the condition cannot read",
+                        ));
+                    }
                     None => {
                         return Err(refusal(
                             &call.name,
@@ -403,8 +409,7 @@ impl PlPgSqlTranslator {
         emit: WarningSink<'_>,
     ) -> Result<Vec<Statement>, Error> {
         let Some(value) = value else { return Ok(Vec::new()) };
-        let mut value =
-            Self::fold_trigger_specials_in(embedded::expression(value).into_owned(), &scope.facts)?;
+        let mut value = Self::prepare(embedded::expression(value).into_owned(), scope)?;
         let mut statements = Self::inline_helper_calls(&mut value, scope, schema, options, emit)?;
         scope.bind(Binding { name: RESULT.to_string(), value: BoundValue::Expr(value) });
         // PostgreSQL computes the value where it returns, so one that may
@@ -546,7 +551,7 @@ fn resolved(mut expr: Expr, scope: &BodyScope) -> Result<Expr, Error> {
                     Err(reason) => BoundValue::Unreadable(reason.to_string()),
                 }
             }
-            unreadable @ BoundValue::Unreadable(_) => unreadable.clone(),
+            other @ (BoundValue::Unreadable(_) | BoundValue::Row(_)) => other.clone(),
         };
         values.push((binding.name.clone(), value));
     }
@@ -565,7 +570,8 @@ fn substitute(expr: &mut Expr, values: &[(String, BoundValue)]) -> Result<(), Er
                 ControlFlow::Continue(())
             }
             Some(BoundValue::Unreadable(reason)) => ControlFlow::Break(reason.clone()),
-            None => ControlFlow::Continue(()),
+            // A row is read field by field before the statement resolves.
+            Some(BoundValue::Row(_)) | None => ControlFlow::Continue(()),
         }
     });
     match flow {

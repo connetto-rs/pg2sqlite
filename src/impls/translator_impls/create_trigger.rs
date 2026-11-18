@@ -308,14 +308,16 @@ fn generate_standard_trigger_body(
         .transpose()?
         .flatten();
     let running_as = owner.map(|owner| options.with_running_as(owner));
-    let body_options = running_as.as_ref().unwrap_or(options);
+    // The part fires for its own events alone, so a row another event gives
+    // reads as `NULL` here, as in PostgreSQL.
+    let body_options = running_as.as_ref().unwrap_or(options).with_trigger_events(part.events);
     let translated = super::plpgsql::PlPgSqlTranslator::translate_body(
         &function_name.to_string(),
         &body,
         facts,
         part.guard,
         schema,
-        body_options,
+        &body_options,
         emit,
     )?;
     Ok(Some(sqlparser::ast::BeginEndStatements {
@@ -434,18 +436,21 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
         // `NEW` and `OLD` or bare, and there is no query around it, so that
         // table is the outermost scope its column types resolve against. A
         // query inside the body attaches its own scope over this one.
-        let trigger_scope =
-            crate::impls::object_name::resolve_translation_table(schema, &self.table_name)?.map(
-                |table| {
-                    sql_traits::structs::ColumnScope::for_table(
-                        table,
-                        schema,
-                        sql_traits::structs::IdentifierCase::AsWritten,
-                    )
-                },
-            );
+        let trigger_table =
+            crate::impls::object_name::resolve_translation_table(schema, &self.table_name)?;
+        let trigger_scope = trigger_table.map(|table| {
+            sql_traits::structs::ColumnScope::for_table(
+                table,
+                schema,
+                sql_traits::structs::IdentifierCase::AsWritten,
+            )
+        });
         let scoped = trigger_scope.as_ref().map(|scope| options.with_pseudo_row_scope(scope));
         let options = scoped.as_ref().unwrap_or(options);
+        let with_rows = trigger_table.map(|table| {
+            options.with_trigger_rows(super::trigger_row::TriggerRows::new(table, &self.events))
+        });
+        let options = with_rows.as_ref().unwrap_or(options);
         // Checked before the FOR EACH clause because PostgreSQL allows
         // TRUNCATE triggers only FOR EACH STATEMENT, so that check would catch
         // every valid one first and advise a rewrite PostgreSQL rejects.

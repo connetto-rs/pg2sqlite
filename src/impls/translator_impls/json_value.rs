@@ -258,7 +258,17 @@ fn conversion_of(
             Conversion::Stored(Stored::Bytea)
         }
         _ => {
-            if let Some(scale) = numeric_scale(expr, schema, options)?.filter(|scale| *scale > 0) {
+            if let Expr::Case { conditions, else_result, .. } = expr
+                && let Some(settled) = case_conversion(
+                    conditions.iter().map(|when| &when.result).chain(else_result.as_deref()),
+                    schema,
+                    options,
+                )?
+            {
+                settled
+            } else if let Some(scale) =
+                numeric_scale(expr, schema, options)?.filter(|scale| *scale > 0)
+            {
                 Conversion::Stored(Stored::MinorUnits(scale))
             } else if matches!(
                 temporal_kind(expr, schema, options)?,
@@ -270,6 +280,30 @@ fn conversion_of(
             }
         }
     }))
+}
+
+/// The conversion every result of a `CASE` but a `NULL` literal settles on
+/// alike, `NULL` taking the type of the other results as PostgreSQL types
+/// it, or `None` when they do not.
+fn case_conversion<'e>(
+    results: impl Iterator<Item = &'e Expr>,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<Option<Conversion>, Error> {
+    let mut settled = None;
+    for result in results {
+        if matches!(result, Expr::Value(value) if matches!(value.value, sqlparser::ast::Value::Null))
+        {
+            continue;
+        }
+        let Some(conversion) = conversion_of(result, schema, options)? else { return Ok(None) };
+        match &settled {
+            None => settled = Some(conversion),
+            Some(agreed) if *agreed == conversion => {}
+            Some(_) => return Ok(None),
+        }
+    }
+    Ok(settled)
 }
 
 /// True when `expr` is a `uuid` stored as its 16 bytes.
