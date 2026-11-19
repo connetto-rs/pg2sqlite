@@ -5,8 +5,9 @@
 //! each write is accepted and what the tables hold after.
 
 use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
+use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 use postgres_harness::{Outcome, apply, fresh_database, set_session_user};
+use rosetta_uuid::Uuid;
 
 use crate::helpers::{
     deployment::{UTC_REQUEST_ROLE, caller, deployment},
@@ -64,6 +65,33 @@ mod schema {
     }
     diesel::table! {
         club_log_rls (club, member) {
+            club -> Text,
+            member -> Text,
+        }
+    }
+    diesel::table! {
+        use diesel::sql_types::*;
+        use rosetta_uuid::diesel_impls::Uuid;
+        parents (id) {
+            id -> Uuid,
+            published -> Bool,
+        }
+    }
+    diesel::table! {
+        use diesel::sql_types::*;
+        use rosetta_uuid::diesel_impls::Uuid;
+        children (id) {
+            id -> Uuid,
+            parent_id -> Uuid,
+        }
+    }
+    diesel::table! {
+        rosters (club) {
+            club -> Text,
+        }
+    }
+    diesel::table! {
+        roster_members (club, member) {
             club -> Text,
             member -> Text,
         }
@@ -201,6 +229,180 @@ fn a_performed_helper_checks_and_returns_as_postgres_does() {
     }
     assert_eq!(sqlite.state(), postgres.state());
     assert_eq!(postgres.state(), (vec!["bob".to_owned()], vec!["ada".to_owned(), "cy".to_owned()]));
+}
+
+/// A parent publishes only once it has a child, the check factored into a
+/// helper taking the parent's `UUID`, which the replica stores as its 16 bytes.
+const PUBLISHED_PARENTS: &str = "
+CREATE TABLE parents (id UUID PRIMARY KEY, published BOOLEAN NOT NULL DEFAULT FALSE);
+CREATE TABLE children (id UUID PRIMARY KEY, parent_id UUID NOT NULL REFERENCES parents (id));
+CREATE FUNCTION require_children(checked_parent_id UUID) RETURNS VOID LANGUAGE plpgsql AS $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM children child WHERE child.parent_id = checked_parent_id) THEN
+    RAISE EXCEPTION 'parent % has no children', checked_parent_id;
+  END IF;
+END
+$$;
+CREATE FUNCTION guard_parent() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.published AND NOT OLD.published THEN
+    PERFORM require_children(NEW.id);
+  END IF;
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER parents_guard BEFORE UPDATE ON parents
+  FOR EACH ROW EXECUTE FUNCTION guard_parent();
+";
+
+fn uuid(text: &str) -> Uuid {
+    text.parse().expect("a uuid")
+}
+
+macro_rules! parents_runner {
+    ($name:ident, $connection:ty) => {
+        struct $name {
+            connection: $connection,
+        }
+
+        impl $name {
+            fn seed(&mut self, parents: &[Uuid], child_of: Uuid) {
+                use self::schema::{children, parents};
+                for id in parents {
+                    diesel::insert_into(parents::table)
+                        .values(parents::id.eq(*id))
+                        .execute(&mut self.connection)
+                        .expect("seed a parent");
+                }
+                diesel::insert_into(children::table)
+                    .values((
+                        children::id.eq(uuid("00000000-0000-7000-8000-0000000000c1")),
+                        children::parent_id.eq(child_of),
+                    ))
+                    .execute(&mut self.connection)
+                    .expect("seed a child");
+            }
+
+            fn publish(&mut self, id: Uuid) -> QueryResult<usize> {
+                use self::schema::parents;
+                diesel::update(parents::table.filter(parents::id.eq(id)))
+                    .set(parents::published.eq(true))
+                    .execute(&mut self.connection)
+            }
+
+            fn published(&mut self) -> Vec<Uuid> {
+                use self::schema::parents;
+                parents::table
+                    .filter(parents::published)
+                    .select(parents::id)
+                    .load(&mut self.connection)
+                    .expect("read the published parents")
+            }
+        }
+    };
+}
+
+parents_runner!(ParentsPostgres, PgConnection);
+parents_runner!(ParentsSqlite, SqliteConnection);
+
+/// The helper compares the `UUID` its caller passes as the same uuid, so a
+/// parent with a child publishes and one without is refused, and the refusal
+/// prints the parent's uuid as PostgreSQL prints it, on both engines.
+#[test]
+fn a_uuid_argument_reaches_the_helper_as_postgres_passes_it() {
+    let with_child = uuid("00000000-0000-7000-8000-000000000001");
+    let childless = uuid("00000000-0000-7000-8000-000000000002");
+    let mut postgres = ParentsPostgres { connection: fresh_database() };
+    apply(&mut postgres.connection, PUBLISHED_PARENTS).expect("apply the schema on PostgreSQL");
+    let options = Pg2SqliteOptions::default().with_uuid_representation(UuidRepresentation::Blob);
+    let mut sqlite =
+        ParentsSqlite { connection: replica(&translated(PUBLISHED_PARENTS, &options)) };
+    postgres.seed(&[with_child, childless], with_child);
+    sqlite.seed(&[with_child, childless], with_child);
+
+    for id in [with_child, childless] {
+        let expected = postgres.publish(id).map_err(|error| error.to_string());
+        assert_eq!(
+            sqlite.publish(id).map_err(|error| error.to_string()),
+            expected,
+            "publishing {id}"
+        );
+    }
+    assert_eq!(sqlite.published(), postgres.published());
+    assert_eq!(postgres.published(), vec![with_child]);
+}
+
+/// A club keeps a member, the check factored into a PL/pgSQL helper taking
+/// the club as `TEXT` and asking a SQL helper whether it has one.
+const ROSTERS: &str = "
+CREATE TABLE rosters (club TEXT PRIMARY KEY);
+CREATE TABLE roster_members (club TEXT NOT NULL REFERENCES rosters (club), member TEXT NOT NULL,
+  PRIMARY KEY (club, member));
+CREATE FUNCTION has_member(target TEXT) RETURNS BOOLEAN LANGUAGE sql STABLE AS $$
+  SELECT EXISTS (SELECT 1 FROM public.roster_members roster WHERE roster.club = target)
+$$;
+CREATE FUNCTION require_member(target TEXT) RETURNS VOID LANGUAGE plpgsql AS $$
+BEGIN
+  IF NOT has_member(target) THEN
+    RAISE EXCEPTION 'club % would lose its last member', target;
+  END IF;
+END
+$$;
+CREATE FUNCTION keep_a_member() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM require_member(OLD.club);
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER roster_members_keep AFTER DELETE ON roster_members
+  FOR EACH ROW EXECUTE FUNCTION keep_a_member();
+";
+
+macro_rules! seed_rosters {
+    ($connection:expr) => {{
+        use self::schema::{roster_members, rosters};
+        diesel::insert_into(rosters::table)
+            .values(rosters::club.eq("chess"))
+            .execute($connection)
+            .expect("seed a club");
+        diesel::insert_into(roster_members::table)
+            .values(&vec![
+                (roster_members::club.eq("chess"), roster_members::member.eq("ada")),
+                (roster_members::club.eq("chess"), roster_members::member.eq("bob")),
+            ])
+            .execute($connection)
+            .expect("seed the members");
+    }};
+}
+
+macro_rules! remove_member {
+    ($connection:expr, $member:expr) => {{
+        use self::schema::roster_members;
+        diesel::delete(roster_members::table.filter(roster_members::member.eq($member)))
+            .execute($connection)
+            .map_err(|error| error.to_string())
+    }};
+}
+
+/// The helper's `TEXT` parameter reaches the SQL helper's cast with its
+/// declared type, so the trigger translates and keeps the last member, on
+/// both engines.
+#[test]
+fn a_text_parameter_reaches_a_sql_helper_as_its_declared_type() {
+    let mut postgres = fresh_database();
+    apply(&mut postgres, ROSTERS).expect("apply the schema on PostgreSQL");
+    let mut sqlite = replica(&translated(ROSTERS, &Pg2SqliteOptions::default()));
+    seed_rosters!(&mut postgres);
+    seed_rosters!(&mut sqlite);
+
+    let expected = ["ada", "bob"].map(|member| remove_member!(&mut postgres, member));
+    let actual = ["ada", "bob"].map(|member| remove_member!(&mut sqlite, member));
+    assert_eq!(actual, expected);
+    assert_eq!(
+        expected[1],
+        Err("club chess would lose its last member".to_owned()),
+        "PostgreSQL keeps bob"
+    );
 }
 
 /// The owner every definer function runs as, past row-level security.

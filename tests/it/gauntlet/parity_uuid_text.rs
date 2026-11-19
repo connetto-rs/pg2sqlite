@@ -25,7 +25,7 @@ INSERT INTO ids VALUES (3, NULL, 'ffffffff-ffff-ffff-ffff-ffffffffffff');
 ";
 
 /// Every form of text conversion, each over the column `u`.
-const PROBES: [&str; 13] = [
+const PROBES: [&str; 14] = [
     "u::text",
     "CAST(u AS TEXT)",
     "u::varchar",
@@ -39,6 +39,7 @@ const PROBES: [&str; 13] = [
     "coalesce(u, v)::text",
     "'id ' || coalesce(u, v)",
     "coalesce(u, '{99999999-9999-9999-9999-99999999999A}')::text",
+    "u::uuid::text",
 ];
 
 fn options() -> Pg2SqliteOptions {

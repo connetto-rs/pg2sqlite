@@ -334,7 +334,7 @@ impl PlPgSqlTranslator {
 
         let mut callee = scope.for_callee(identity.clone());
         let mut parameters = Vec::new();
-        for (parameter, value) in Arguments::of(call, helper)?.into_parameters() {
+        for (parameter, data_type, value) in Arguments::of(call, helper)?.into_parameters() {
             let Some(parameter) = parameter else {
                 return Err(refusal(
                     name,
@@ -346,7 +346,7 @@ impl PlPgSqlTranslator {
             let value = sql_helper::inlined_calls(&value, schema, options)?;
             let value = resolved(value, scope)?;
             let parameter = fold(parameter);
-            callee.declare(&parameter, None);
+            callee.declare(&parameter, Some(data_type.clone()));
             callee.bind_persistent(Binding {
                 name: parameter.clone(),
                 value: BoundValue::Expr(value),
