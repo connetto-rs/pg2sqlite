@@ -17,9 +17,10 @@ use sql_traits::{
 };
 use sqlparser::{
     ast::{
-        BinaryOperator, CreateFunction, Expr, Function, FunctionArguments, FunctionReturnType,
-        FunctionSecurity, GroupByExpr, ObjectName, Query, SelectItem, SetExpr, Statement,
-        UnaryOperator, Value, visit_expressions, visit_expressions_mut, visit_relations,
+        BinaryOperator, CreateFunction, Expr, Function, FunctionArg, FunctionArgExpr,
+        FunctionArguments, FunctionReturnType, FunctionSecurity, GroupByExpr, ObjectName, Query,
+        SelectItem, SetExpr, Statement, UnaryOperator, Value, visit_expressions,
+        visit_expressions_mut, visit_relations,
     },
     tokenizer::Span,
 };
@@ -68,12 +69,14 @@ struct Inlined {
 
 impl PlPgSqlTranslator {
     /// The statements `PERFORM <query>` runs when the query calls a PL/pgSQL
-    /// helper, `None` when it calls none.
+    /// helper, `None` when it calls none. A query reading rows runs the
+    /// helper's body over each of them.
     ///
     /// # Errors
     ///
-    /// Refuses a query calling a helper other than as `PERFORM f(...)` alone,
-    /// and a helper whose body does not inline.
+    /// Refuses a query calling a helper other than as its one column, a
+    /// helper whose body does not inline, and what [`Self::per_row`]
+    /// refuses.
     pub(super) fn perform_helper(
         statement: &Statement,
         scope: &mut BodyScope,
@@ -85,26 +88,27 @@ impl PlPgSqlTranslator {
         let Some(called) = first_helper_call(statement, schema, options)? else {
             return Ok(None);
         };
-        let lone = matches!(query.body.as_ref(), SetExpr::Select(_))
-            .then(|| embedded::expression(query))
-            .and_then(|expression| {
-                match expression.as_ref() {
-                    Expr::Function(call) => Some(call.clone()),
-                    _ => None,
-                }
-            });
-        let Some((call, helper)) = lone
-            .map(|call| plpgsql_helper(&call, schema, options).map(|helper| (call, helper)))
-            .transpose()?
-            .and_then(|(call, helper)| helper.map(|helper| (call, helper)))
-        else {
-            return Err(refusal(
+        let alone = || {
+            refusal(
                 &called,
-                "is called by a PERFORM that runs it once per row of its FROM, or beside other \
-                 expressions, and only PERFORM f(...) alone runs as the helper's body",
-            ));
+                "is called by a PERFORM beside other columns or inside an expression, and only a \
+                 PERFORM selecting the call alone runs as the helper's body",
+            )
         };
-        let inlined = Self::inline_call(&call, helper, scope, schema, options, emit)?;
+        let SetExpr::Select(select) = query.body.as_ref() else { return Err(alone()) };
+        let [
+            SelectItem::UnnamedExpr(Expr::Function(call))
+            | SelectItem::ExprWithAlias { expr: Expr::Function(call), .. },
+        ] = select.projection.as_slice()
+        else {
+            return Err(alone());
+        };
+        let Some(helper) = plpgsql_helper(call, schema, options)? else { return Err(alone()) };
+        if !matches!(embedded::expression(query).as_ref(), Expr::Function(_)) {
+            return Self::perform_per_row(query, call, helper, scope, schema, options, emit)
+                .map(Some);
+        }
+        let inlined = Self::inline_call(call, helper, scope, schema, options, emit)?;
         if scope.tracks_found {
             // `SELECT f(...)` answers one row.
             scope.bind(Binding {
@@ -113,6 +117,63 @@ impl PlPgSqlTranslator {
             });
         }
         Ok(Some(inlined.statements))
+    }
+
+    /// The statements of `PERFORM <call> FROM ...`, `query`, which runs
+    /// `helper`'s body over each row the query reads, its arguments read from
+    /// the row.
+    fn perform_per_row(
+        query: &Query,
+        call: &Function,
+        helper: &CreateFunction,
+        scope: &mut BodyScope,
+        schema: &ParserDB,
+        options: &TranslationContext<'_>,
+        emit: WarningSink<'_>,
+    ) -> Result<Vec<Statement>, Error> {
+        let mut arguments = Vec::new();
+        match &call.args {
+            FunctionArguments::None => {}
+            FunctionArguments::List(list) => {
+                for argument in &list.args {
+                    let (FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))
+                    | FunctionArg::Named { arg: FunctionArgExpr::Expr(argument), .. }
+                    | FunctionArg::ExprNamed { arg: FunctionArgExpr::Expr(argument), .. }) =
+                        argument
+                    else {
+                        return Err(refusal(&call.name, "takes a wildcard argument"));
+                    };
+                    arguments.push(SelectItem::UnnamedExpr(argument.clone()));
+                }
+            }
+            FunctionArguments::Subquery(_) => {
+                return Err(refusal(&call.name, "takes a query as its argument list"));
+            }
+        }
+        if arguments.is_empty() {
+            // One column, so each row the query reads stays a row.
+            arguments
+                .push(SelectItem::UnnamedExpr(Expr::Value(Value::Boolean(true).with_empty_span())));
+        }
+        let mut rows = query.clone();
+        if let SetExpr::Select(select) = rows.body.as_mut() {
+            select.projection = arguments;
+        }
+        Self::per_row(&rows, scope, schema, options, emit, |scope, columns, emit| {
+            let mut per_row = call.clone();
+            if let FunctionArguments::List(list) = &mut per_row.args {
+                for (argument, column) in list.args.iter_mut().zip(columns) {
+                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))
+                    | FunctionArg::Named { arg: FunctionArgExpr::Expr(argument), .. }
+                    | FunctionArg::ExprNamed { arg: FunctionArgExpr::Expr(argument), .. } =
+                        argument
+                    {
+                        *argument = column;
+                    }
+                }
+            }
+            Ok(Self::inline_call(&per_row, helper, scope, schema, options, emit)?.statements)
+        })
     }
 
     /// The statements of the PL/pgSQL helpers `expr` calls, each call
@@ -506,7 +567,7 @@ fn first_helper_call<N: sqlparser::ast::Visit>(
 
 /// Refuses a PL/pgSQL helper `node` calls where PostgreSQL may skip the
 /// call or run it once per row.
-fn refuse_skippable_calls<N: sqlparser::ast::Visit>(
+pub(super) fn refuse_skippable_calls<N: sqlparser::ast::Visit>(
     node: &N,
     schema: &ParserDB,
     options: &TranslationContext<'_>,

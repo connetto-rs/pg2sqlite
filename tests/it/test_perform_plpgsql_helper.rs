@@ -33,18 +33,18 @@ fn a_recursive_helper_is_refused() {
     assert!(message.contains("down()") && message.contains("calls itself"), "{message}");
 }
 
-/// `PERFORM f(x) FROM t` calls the helper once per row, which one inlined
-/// body does not.
+/// `PERFORM f(x), 1 FROM t` runs the helper beside another column, which
+/// its inlined body cannot stand in for.
 #[test]
-fn a_helper_performed_per_row_is_refused() {
+fn a_helper_performed_beside_other_columns_is_refused() {
     let message = refusal(
         "CREATE FUNCTION check_val(n INTEGER) RETURNS VOID LANGUAGE plpgsql AS $$
          BEGIN
              IF n < 0 THEN RAISE EXCEPTION 'negative'; END IF;
          END $$;",
-        "PERFORM check_val(val) FROM t;",
+        "PERFORM check_val(val), 1 FROM t;",
     );
-    assert!(message.contains("check_val()") && message.contains("once per row"), "{message}");
+    assert!(message.contains("check_val()") && message.contains("beside"), "{message}");
 }
 
 /// A definer trigger calls the helper as the trigger's owner, and an owner
