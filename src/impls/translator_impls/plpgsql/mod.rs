@@ -9,6 +9,7 @@
 mod callee;
 mod cte_builder;
 pub(crate) use cte_builder::VARIABLE_VALUE_COLUMN;
+mod per_row;
 mod raise;
 mod returns;
 mod scope;

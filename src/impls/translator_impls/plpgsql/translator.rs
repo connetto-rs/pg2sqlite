@@ -13,12 +13,14 @@ use sqlparser::ast::{
     helpers::attached_token::AttachedToken, visit_expressions, visit_expressions_mut,
 };
 use sqlparser_plpgsql::embedded::{
-    self, Block, Branch, DeclarationKind, DeclaredType, If, IntoTargets, Node, NodeKind, Target,
+    self, Block, Branch, DeclarationKind, DeclaredType, If, IntoTargets, LoopControl, Node,
+    NodeKind, Target,
 };
 
 use super::{
     callee::substitute,
     cte_builder::CteBuilder,
+    per_row::holds_row,
     raise::raise_statement,
     returns::without_early_returns,
     scope::{Binding, BodyScope, BoundValue, RowValue, TriggerFacts, expand_relation, fold},
@@ -117,6 +119,12 @@ impl Survey {
                     let _: ControlFlow<()> = assignment.value.visit(self);
                 }
                 NodeKind::Block(block) => self.block(block),
+                NodeKind::Loop(looped) => {
+                    if let LoopControl::Query { query, .. } = &looped.control {
+                        let _: ControlFlow<()> = query.visit(self);
+                    }
+                    self.nodes(&looped.statements);
+                }
                 NodeKind::If(conditional) => {
                     for branch in &conditional.branches {
                         let _: ControlFlow<()> = branch.condition.visit(self);
@@ -140,7 +148,7 @@ impl Survey {
 }
 
 /// Refuses `node`, procedural control flow a SQLite trigger body has none of.
-fn procedural(construct: &str) -> Error {
+pub(super) fn procedural(construct: &str) -> Error {
     Error::forward_refusal(format!(
         "{construct} in a trigger body is procedural control flow, and a SQLite trigger body is a \
          plain list of statements with no loop, jump or branch of its own. Express the work as \
@@ -276,6 +284,9 @@ impl PlPgSqlTranslator {
                     };
                     scope.declare(&declaration.name, data_type);
                     declared.push(declaration.name.clone());
+                    if holds_row(&variable.data_type, schema) {
+                        scope.declare_row(&declaration.name);
+                    }
                     if let Some(default) = &variable.default {
                         // PostgreSQL computes each default as the block is
                         // entered, in the order the block declares them.
@@ -394,7 +405,7 @@ impl PlPgSqlTranslator {
 
     /// Translates one node of a body, refusing what a SQLite trigger cannot
     /// run.
-    fn translate_node(
+    pub(super) fn translate_node(
         function: &str,
         node: &Node,
         scope: &mut BodyScope,
@@ -488,7 +499,9 @@ impl PlPgSqlTranslator {
                 Self::translate_block(function, block, scope, schema, options, emit)
             }
             NodeKind::Case(_) => Err(procedural("a CASE statement")),
-            NodeKind::Loop(_) => Err(procedural("a loop")),
+            NodeKind::Loop(looped) => {
+                Self::translate_loop(function, looped, scope, schema, options, emit)
+            }
             NodeKind::Exit(jump) => Err(procedural(jump.kind.keyword())),
             NodeKind::Assert(_) => Err(procedural("ASSERT")),
             NodeKind::Dynamic { .. } => Err(procedural("EXECUTE of a built command")),
@@ -596,7 +609,7 @@ impl PlPgSqlTranslator {
     /// The variable an assignment writes, folded, refusing an assignment to a
     /// field of a record with what keeps `facts`' trigger from the
     /// maintenance shape.
-    fn assigned_name(target: &Target, facts: &TriggerFacts) -> Result<String, Error> {
+    pub(super) fn assigned_name(target: &Target, facts: &TriggerFacts) -> Result<String, Error> {
         if let ([ObjectNamePart::Identifier(name)], []) =
             (target.name.0.as_slice(), target.indirection.as_slice())
         {
@@ -1269,6 +1282,29 @@ impl PlPgSqlTranslator {
         )?;
         for statement in &mut translated {
             substitute_variables(statement, &variables)?;
+        }
+        Ok(translated)
+    }
+
+    /// Translates the read `query` with every variable it reads embedded and
+    /// no guard of the enclosing `IF`, as the rows a loop runs over.
+    pub(super) fn translate_unguarded_read(
+        query: &Query,
+        scope: &BodyScope,
+        schema: &ParserDB,
+        options: &crate::options::TranslationContext<'_>,
+        emit: crate::warnings::WarningSink<'_>,
+    ) -> Result<Vec<Statement>, Error> {
+        let bindings: Vec<_> = scope.bindings().cloned().collect();
+        let (_, variables) =
+            Self::bound_values(&bindings, ReferenceForm::Inline, schema, options, emit);
+        let mut translated = Vec::new();
+        for statement in Self::translate_query_statement(query, options)? {
+            translated.extend(statement.translate_with_warnings(schema, options, emit)?);
+        }
+        for statement in &mut translated {
+            substitute_variables(statement, &variables)?;
+            Self::null_unbound_declarations(statement, scope, &bindings);
         }
         Ok(translated)
     }
@@ -2421,8 +2457,8 @@ fn conjunction(conditions: impl Iterator<Item = Expr>) -> Expr {
         .unwrap_or_else(|| Expr::Value(Value::Boolean(true).with_empty_span()))
 }
 
-/// The relations `stmt` writes, folded, including from inside a `WITH`.
-fn written_relations(stmt: &Statement) -> Vec<String> {
+/// The relations `node` writes, folded, including from inside a `WITH`.
+pub(super) fn written_relations<N: Visit>(node: &N) -> Vec<String> {
     struct Writes(Vec<String>);
 
     impl Writes {
@@ -2479,7 +2515,7 @@ fn written_relations(stmt: &Statement) -> Vec<String> {
     }
 
     let mut writes = Writes(Vec::new());
-    let _: ControlFlow<()> = stmt.visit(&mut writes);
+    let _: ControlFlow<()> = node.visit(&mut writes);
     writes.0
 }
 

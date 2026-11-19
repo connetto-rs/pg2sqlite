@@ -221,6 +221,9 @@ pub(crate) struct BodyScope {
     /// Each declared name, folded, with the type it is declared with, or
     /// `None` for a `%TYPE` or `%ROWTYPE` declaration and a helper parameter.
     declared: BTreeMap<String, Option<DataType>>,
+    /// The declared variables of a record or row type, which hold a whole
+    /// row.
+    rows: BTreeSet<String>,
     persistent: BTreeMap<String, Binding>,
     scoped: BTreeMap<String, Binding>,
     conditions: Vec<Expr>,
@@ -292,6 +295,21 @@ impl BodyScope {
         self.declared.contains_key(name)
     }
 
+    /// Records the declared `name`, folded, as holding a whole row.
+    pub(crate) fn declare_row(&mut self, name: &str) {
+        self.rows.insert(name.to_string());
+    }
+
+    /// Whether `name`, folded, is declared of a record or row type.
+    pub(crate) fn declares_row(&self, name: &str) -> bool {
+        self.rows.contains(name)
+    }
+
+    /// Every declared name, folded.
+    pub(crate) fn declared(&self) -> impl Iterator<Item = &str> {
+        self.declared.keys().map(String::as_str)
+    }
+
     /// Binds `binding` for the rest of the body, across `IF` branches.
     pub(crate) fn bind_persistent(&mut self, binding: Binding) {
         self.persistent.insert(binding.name.clone(), binding);
@@ -345,6 +363,7 @@ impl BodyScope {
     /// with it.
     pub(crate) fn forget(&mut self, name: &str) {
         self.declared.remove(name);
+        self.rows.remove(name);
         self.scoped.remove(name);
         self.persistent.remove(name);
         self.uuid_first_use.remove(name);

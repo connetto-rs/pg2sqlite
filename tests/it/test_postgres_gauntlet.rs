@@ -135,3 +135,6 @@ mod parity_trigger_if_control_flow;
 
 #[path = "gauntlet/parity_bool_aggregates.rs"]
 mod parity_bool_aggregates;
+
+#[path = "gauntlet/parity_per_row_checks.rs"]
+mod parity_per_row_checks;
