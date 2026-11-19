@@ -23,8 +23,8 @@ use crate::{
             positional_arity, simple_function_expr, single_quoted_literal, string_literal,
         },
         idioms::{
-            extract_json_group_array_nullif, extract_json_group_object_nullif,
-            is_now_localtime_args,
+            boolean_aggregate_unlowered, extract_json_group_array_nullif,
+            extract_json_group_object_nullif, is_now_localtime_args,
         },
         session_variable,
         shared_helpers::{
@@ -940,11 +940,12 @@ fn json_path_extraction(
     })
 }
 
-/// Build a reverse-translated function: translate args, params, window, filter
-/// and within_group, then wrap in `Expr::Function` with the given name.
+/// Build a reverse-translated function: translate `args`, params, window,
+/// filter and within_group, then wrap in `Expr::Function` with the given name.
 fn build_reverse_function(
     name: ObjectName,
     func: &Function,
+    args: &FunctionArguments,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
 ) -> Result<Expr, Error> {
@@ -957,7 +958,7 @@ fn build_reverse_function(
             options,
             &mut |_| {},
         )?,
-        args: translate_function_arguments::<Reverse>(&func.args, schema, options, &mut |_| {})?,
+        args: translate_function_arguments::<Reverse>(args, schema, options, &mut |_| {})?,
         filter: func
             .filter
             .as_ref()
@@ -1037,6 +1038,7 @@ pub fn reverse_translate_function(
         return build_reverse_function(
             ObjectName::from(vec![Ident::new("json_agg")]),
             inner,
+            &inner.args,
             schema,
             options,
         );
@@ -1048,6 +1050,18 @@ pub fn reverse_translate_function(
         return build_reverse_function(
             ObjectName::from(vec![Ident::new("json_object_agg")]),
             inner,
+            &inner.args,
+            schema,
+            options,
+        );
+    }
+    // Recognize the forward lowering of bool_or, bool_and and every, since
+    // PostgreSQL has no max or min over a boolean.
+    if let Some((aggregate, args)) = boolean_aggregate_unlowered(func) {
+        return build_reverse_function(
+            ObjectName::from(vec![Ident::new(aggregate)]),
+            func,
+            &args,
             schema,
             options,
         );
@@ -1058,6 +1072,7 @@ pub fn reverse_translate_function(
             build_reverse_function(
                 ObjectName::from(vec![Ident::new(new_name)]),
                 func,
+                &func.args,
                 schema,
                 options,
             )
@@ -1066,6 +1081,7 @@ pub fn reverse_translate_function(
             let reversed = build_reverse_function(
                 ObjectName::from(vec![Ident::new("string_agg")]),
                 func,
+                &func.args,
                 schema,
                 options,
             )?;
@@ -1202,7 +1218,13 @@ pub fn reverse_translate_function(
             reverse_element_cast("vec_f16", "halfvec", func, schema, options)
         }
         FunctionReversal::ToChr => {
-            build_reverse_function(ObjectName::from(vec![Ident::new("chr")]), func, schema, options)
+            build_reverse_function(
+                ObjectName::from(vec![Ident::new("chr")]),
+                func,
+                &func.args,
+                schema,
+                options,
+            )
         }
         FunctionReversal::ToAsciiNullif => {
             if let FunctionArguments::List(list) = &func.args
@@ -1437,6 +1459,7 @@ pub fn reverse_translate_function(
             build_reverse_function(
                 ObjectName::from(vec![Ident::new(target)]),
                 func,
+                &func.args,
                 schema,
                 options,
             )
@@ -1637,7 +1660,7 @@ pub fn reverse_translate_function(
         }
         FunctionReversal::Reject(msg) => Err(Error::reverse_refusal(msg)),
         FunctionReversal::PassThrough => {
-            build_reverse_function(func.name.clone(), func, schema, options)
+            build_reverse_function(func.name.clone(), func, &func.args, schema, options)
         }
     }
 }
