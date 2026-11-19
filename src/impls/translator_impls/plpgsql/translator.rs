@@ -2429,6 +2429,9 @@ const RESERVED_VARIABLE_PREFIX: &str = "pg2sqlite_variable_";
 
 /// Renames every bare read of a variable `bindings` binds anywhere inside
 /// `node` to its reserved name.
+///
+/// The reserved name is quoted, so it folds back to the binding's name
+/// whatever case a quoted declaration gave the variable.
 fn reserve_variables<N: VisitMut>(node: &mut N, bindings: &[Binding]) {
     if bindings.is_empty() {
         return;
@@ -2437,7 +2440,10 @@ fn reserve_variables<N: VisitMut>(node: &mut N, bindings: &[Binding]) {
         if let Some(name) = bare_identifier(expr).map(fold)
             && bindings.iter().any(|binding| binding.name == name)
         {
-            *expr = Expr::Identifier(Ident::new(format!("{RESERVED_VARIABLE_PREFIX}{name}")));
+            *expr = Expr::Identifier(Ident::with_quote(
+                '"',
+                format!("{RESERVED_VARIABLE_PREFIX}{name}"),
+            ));
         }
         ControlFlow::Continue(())
     });

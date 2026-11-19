@@ -161,3 +161,12 @@ fn a_numeric_variable_holds_a_narrower_column_value_at_its_own_scale() {
     let declarations = "v NUMERIC(10,3) := (SELECT amount FROM t WHERE id = 1);";
     assert!(raises(&guarded_log(declarations, "v = 1.5", "1 day")));
 }
+
+/// A variable declared under a quoted name is read under that name.
+#[test]
+fn a_quoted_variable_name_is_read() {
+    let declarations = "\"V\" int := 9;";
+    let statements = "INSERT INTO sink (id) VALUES (\"V\");";
+    let condition = "EXISTS (SELECT 1 FROM sink WHERE id = 9)";
+    assert!(raises(&guarded_script("", declarations, statements, condition, "1 day")));
+}
