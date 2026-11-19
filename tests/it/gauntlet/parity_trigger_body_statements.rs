@@ -210,6 +210,39 @@ fn an_assignment_reads_an_unassigned_variable_as_null() {
     run_found(UNASSIGNED_READ);
 }
 
+/// An `IF` condition and a `SELECT ... INTO` reading a declared variable no
+/// statement assigned, each read again by the `INSERT` after them, which an
+/// `IF` reading the same variable guards.
+const UNASSIGNED_CONDITION_AND_SELECT_INTO: &str = "
+CREATE FUNCTION note_unassigned_reads() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    fallback INTEGER;
+    noted TEXT;
+    found_parent INTEGER;
+BEGIN
+    IF fallback IS NULL THEN
+        noted := 'unset';
+    ELSE
+        noted := 'set';
+    END IF;
+    SELECT id INTO found_parent FROM parents WHERE id = coalesce(fallback, NEW.parent);
+    IF fallback IS NULL THEN
+        INSERT INTO audit (child, outcome)
+            VALUES (NEW.id, noted || ':' || coalesce(found_parent::text, 'none'));
+    END IF;
+    RETURN NULL;
+END $$;
+CREATE TRIGGER children_unassigned AFTER INSERT ON children
+    FOR EACH ROW EXECUTE FUNCTION note_unassigned_reads();
+";
+
+/// The values bound under the `IF` and by the `SELECT ... INTO`, and the
+/// guard of the `INSERT`, read the unassigned variable as `NULL`.
+#[test]
+fn a_condition_and_a_select_into_read_an_unassigned_variable_as_null() {
+    run_found(UNASSIGNED_CONDITION_AND_SELECT_INTO);
+}
+
 mod lock_schema {
     diesel::table! {
         organizations (id) {

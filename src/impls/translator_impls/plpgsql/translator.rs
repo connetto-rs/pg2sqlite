@@ -666,14 +666,13 @@ impl PlPgSqlTranslator {
         }
         let condition = scope.current_condition();
         let mut evaluated = Vec::new();
-        for (name, mut value) in values {
+        for (name, value) in values {
             if !assigned.contains(&name) || !may_raise(&value, options) {
                 continue;
             }
             if let Some(relation) = scope.rewritten_guard_relation(schema) {
                 return Err(rewritten_guard(relation));
             }
-            Self::null_unbound_declarations(&mut value, scope, &bindings);
             let mut statement =
                 Statement::Query(Box::new(single_expr_query(value, Vec::new(), None)));
             if let Some(condition) = &condition {
@@ -1063,6 +1062,7 @@ impl PlPgSqlTranslator {
     ) -> Result<Expr, Error> {
         let bindings: Vec<_> = scope.bindings().cloned().collect();
         let mut transformed = condition.clone();
+        scope.null_unassigned_reads_in(&mut transformed);
         Self::transform_expr(&mut transformed, options);
         reserve_variables(&mut transformed, &bindings);
         let reserved = reserved_variables(&bindings, options);
@@ -1283,7 +1283,7 @@ impl PlPgSqlTranslator {
             Self::bound_values(&bindings, ReferenceForm::Inline, schema, options, emit);
         let mut statements = statements;
         for statement in &mut statements {
-            Self::null_unbound_declarations(statement, scope, &bindings);
+            scope.null_unassigned_reads_in(statement);
             reserve_variables(statement, &bindings);
         }
         let reserved = reserved_variables(&bindings, options);
@@ -1318,7 +1318,7 @@ impl PlPgSqlTranslator {
         }
         for statement in &mut translated {
             substitute_variables(statement, &variables)?;
-            Self::null_unbound_declarations(statement, scope, &bindings);
+            scope.null_unassigned_reads_in(statement);
         }
         Ok(translated)
     }
@@ -2008,7 +2008,7 @@ impl PlPgSqlTranslator {
         }
 
         if let Some(source) = &mut new_insert.source {
-            Self::null_unbound_declarations(source.as_mut(), scope, &modified_bindings);
+            scope.null_unassigned_reads_in(source.as_mut());
         }
 
         // The CTE reads would hide the declared types the reserved names carry.
@@ -2102,24 +2102,6 @@ impl PlPgSqlTranslator {
             }
         }
         Ok(modified_bindings)
-    }
-
-    /// Replaces each read of a declared variable with no binding by `NULL`,
-    /// which is what PostgreSQL initialises it to.
-    pub(super) fn null_unbound_declarations<N: VisitMut>(
-        node: &mut N,
-        scope: &BodyScope,
-        bound: &[Binding],
-    ) {
-        let _: ControlFlow<()> = visit_expressions_mut(node, |expr| {
-            if let Expr::Identifier(ident) = expr
-                && scope.is_declared(ident)
-                && !bound.iter().any(|binding| binding.name == fold(ident))
-            {
-                *expr = Expr::Value(Value::Null.with_empty_span());
-            }
-            ControlFlow::Continue(())
-        });
     }
 
     /// Reorders bindings so one read by another comes first.

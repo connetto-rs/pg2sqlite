@@ -9,7 +9,8 @@ use sql_traits::{
 };
 use sqlparser::ast::{
     BinaryOperator, CaseWhen, DataType, Expr, Ident, TableFactor, TriggerEvent, Value, Visit,
-    Visitor, helpers::attached_token::AttachedToken, visit_expressions, visit_expressions_mut,
+    VisitMut, Visitor, helpers::attached_token::AttachedToken, visit_expressions,
+    visit_expressions_mut,
 };
 
 use super::translator::bare_identifier;
@@ -351,11 +352,6 @@ impl BodyScope {
         self.declared.insert(name.to_string(), data_type);
     }
 
-    /// Whether `ident` reads a declared variable.
-    pub(crate) fn is_declared(&self, ident: &Ident) -> bool {
-        self.declared.contains_key(&fold(ident))
-    }
-
     /// Whether `name`, folded, is already declared.
     pub(crate) fn declares(&self, name: &str) -> bool {
         self.declared.contains_key(name)
@@ -379,12 +375,14 @@ impl BodyScope {
     /// Binds `binding` for the rest of the body, across `IF` branches.
     pub(crate) fn bind_persistent(&mut self, mut binding: Binding) {
         self.keep_earlier_reads(&mut binding);
+        self.null_unassigned_reads(&mut binding.value);
         self.persistent.insert(binding.name.clone(), binding);
     }
 
     /// Binds `binding` until the enclosing branch ends.
     pub(crate) fn bind(&mut self, mut binding: Binding) {
         self.keep_earlier_reads(&mut binding);
+        self.null_unassigned_reads(&mut binding.value);
         self.scoped.insert(binding.name.clone(), binding);
     }
 
@@ -393,6 +391,41 @@ impl BodyScope {
     /// under the `IF` replaced already reads the value it read.
     pub(crate) fn bind_merged(&mut self, binding: Binding) {
         self.scoped.insert(binding.name.clone(), binding);
+    }
+
+    /// Rewrites each read in `value` of a declared variable no binding in
+    /// force holds to `NULL`, which PostgreSQL reads until an assignment.
+    /// PostgreSQL computes a value where it is assigned, and a binding is
+    /// translated where it is read, after the variable may be assigned.
+    fn null_unassigned_reads(&self, value: &mut BoundValue) {
+        match value {
+            BoundValue::Expr(expr) => self.null_unassigned_reads_in(expr),
+            BoundValue::Row(row) => {
+                row.for_each_condition_mut(&mut |condition| {
+                    self.null_unassigned_reads_in(condition);
+                });
+            }
+            BoundValue::Unreadable(_) => {}
+        }
+    }
+
+    /// Rewrites each read anywhere in `node` of a declared variable no
+    /// binding in force holds to `NULL`.
+    pub(crate) fn null_unassigned_reads_in<N: VisitMut>(&self, node: &mut N) {
+        let _: ControlFlow<()> = visit_expressions_mut(node, |expr| {
+            if bare_identifier(expr).is_some_and(|ident| self.unassigned(&fold(ident))) {
+                *expr = Expr::Value(Value::Null.with_empty_span());
+            }
+            ControlFlow::Continue(())
+        });
+    }
+
+    /// Whether `name`, folded, is a declared variable no binding in force
+    /// holds.
+    fn unassigned(&self, name: &str) -> bool {
+        self.declared.contains_key(name)
+            && !self.scoped.contains_key(name)
+            && !self.persistent.contains_key(name)
     }
 
     /// Makes each read of `binding`'s variable in the bindings in force, the
@@ -465,8 +498,9 @@ impl BodyScope {
 
     /// Records `condition`, an `IF` condition just tested, which the merge of
     /// the `IF`'s branches reads, so an assignment under the `IF` leaves it
-    /// reading the values it tested.
-    pub(crate) fn record_tested(&mut self, condition: Expr) {
+    /// reading the values it tested, `NULL` for a variable not yet assigned.
+    pub(crate) fn record_tested(&mut self, mut condition: Expr) {
+        self.null_unassigned_reads_in(&mut condition);
         self.tested.push(condition);
     }
 

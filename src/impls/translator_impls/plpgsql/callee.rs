@@ -613,7 +613,7 @@ fn resolved(mut expr: Expr, scope: &BodyScope) -> Result<Expr, Error> {
         values.push((binding.name.clone(), value));
     }
     substitute(&mut expr, &values)?;
-    PlPgSqlTranslator::null_unbound_declarations(&mut expr, scope, &bindings);
+    scope.null_unassigned_reads_in(&mut expr);
     Ok(expr)
 }
 
