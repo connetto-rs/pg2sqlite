@@ -40,9 +40,9 @@ use crate::{
     },
 };
 
-/// The owners of the definer bodies running on the connection, innermost
-/// last.
-pub(crate) const STACK: &str = "pg2sqlite_definer_stack";
+/// The frames of the definer bodies running on the connection, each holding
+/// its body's owner, innermost last.
+pub(crate) const STACK: &str = "pg2sqlite_definer_frames";
 
 type Role = <ParserDB as DatabaseLike>::Role;
 
@@ -51,7 +51,13 @@ type Role = <ParserDB as DatabaseLike>::Role;
 pub(crate) fn stack_table() -> Statement {
     ast_builder::create_table(
         stack_name(),
-        vec![super::rls::generated_table_column("owner", DataType::Text, true)],
+        vec![
+            super::rls::generated_key_column(),
+            super::rls::generated_text_column(
+                "owner",
+                super::rls::length_at_most("owner", super::rls::NAME_LENGTH),
+            ),
+        ],
     )
 }
 
@@ -122,14 +128,14 @@ fn returns_trigger(function: &CreateFunction) -> bool {
     matches!(function.return_type, Some(FunctionReturnType::DataType(DataType::Trigger)))
 }
 
-/// The filter that selects the row of the innermost running definer body,
-/// `rowid = (SELECT max(rowid) FROM <stack>)`.
-fn innermost_stack_rowid() -> Expr {
+/// The filter that selects the frame of the innermost running definer body,
+/// `id = (SELECT max(id) FROM <stack>)`.
+fn innermost_frame() -> Expr {
     Expr::BinaryOp {
-        left: Box::new(Expr::Identifier(Ident::new("rowid"))),
+        left: Box::new(Expr::Identifier(Ident::new("id"))),
         op: BinaryOperator::Eq,
         right: Box::new(Expr::Subquery(Box::new(single_expr_query(
-            simple_function_expr("max", vec![Expr::Identifier(Ident::new("rowid"))], None),
+            simple_function_expr("max", vec![Expr::Identifier(Ident::new("id"))], None),
             from_relation(plain_table_factor(stack_name())),
             None,
         )))),
@@ -142,7 +148,7 @@ pub(crate) fn outside_owners(owners: &[&str]) -> Option<Expr> {
     if owners.is_empty() {
         return None;
     }
-    let innermost = innermost_stack_rowid();
+    let innermost = innermost_frame();
     let listed = Expr::In {
         expr: Box::new(Expr::Identifier(Ident::new("owner"))),
         target: InTarget::List(owners.iter().map(|owner| string_literal(owner)).collect()),
@@ -289,7 +295,7 @@ fn push(owner: &Role) -> Statement {
 }
 
 fn pop() -> Statement {
-    ast_builder::delete(stack_name(), Some(innermost_stack_rowid()))
+    ast_builder::delete(stack_name(), Some(innermost_frame()))
 }
 
 fn stack_name() -> ObjectName {

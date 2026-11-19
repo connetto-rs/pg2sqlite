@@ -278,6 +278,14 @@ mod schema {
             body -> Text,
         }
     }
+    diesel::table! {
+        rls_audit (id) {
+            id -> Integer,
+            violation_type -> Text,
+            row_identifier -> Text,
+            detail -> Text,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -292,15 +300,16 @@ struct ItemRow {
     body: String,
 }
 
-/// Minimal audit record: only the columns the tests actually assert on.
-/// Using QueryableByName with an explicit SELECT keeps unused-field warnings
-/// away without broad allows; diesel needs no column-complete struct here.
-#[derive(QueryableByName, Debug)]
+/// The audit columns the tests assert on.
+#[derive(Queryable, Selectable, Debug)]
+#[diesel(table_name = schema::rls_audit)]
 struct AuditLog {
-    #[diesel(sql_type = diesel::sql_types::Text)]
     violation_type: String,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
-    details: Option<String>,
+    detail: String,
+}
+
+fn audit_rows(conn: &mut SqliteConnection) -> Vec<AuditLog> {
+    schema::rls_audit::table.select(AuditLog::as_select()).load(conn).expect("audit rows")
 }
 
 // ---------------------------------------------------------------------------
@@ -649,21 +658,17 @@ fn strict_monitor_allows_invisible_view_path_insert() {
 
     // Audit table has a log row with honest wording (no policy-violation
     // claim).
-    let audit: Vec<AuditLog> = diesel::sql_query("SELECT violation_type, details FROM rls_audit")
-        .load(&mut conn)
-        .expect("audit rows");
+    let audit = audit_rows(&mut conn);
     assert_eq!(audit.len(), 1, "monitor must log exactly one row");
     let row = &audit[0];
     assert_ne!(
         row.violation_type, "rls_policy_violation",
         "log must not claim a policy violation for a PostgreSQL-valid write"
     );
-    let details = row.details.as_deref().unwrap_or("");
+    let detail = &row.detail;
     assert!(
-        details.contains("RETURNING")
-            || details.contains("readable")
-            || details.contains("visible"),
-        "details must explain the SELECT-only mismatch, got: {details}"
+        detail.contains("RETURNING") || detail.contains("readable") || detail.contains("visible"),
+        "detail must explain the SELECT-only mismatch, got: {detail}"
     );
 }
 
@@ -680,14 +685,46 @@ fn monitor_mode_invisible_insert_is_logged_not_refused() {
     )
     .expect("INSERT must succeed in monitor mode");
 
-    let audit: Vec<AuditLog> = diesel::sql_query("SELECT violation_type, details FROM rls_audit")
-        .load(&mut conn)
-        .expect("audit rows");
+    let audit = audit_rows(&mut conn);
     assert_eq!(audit.len(), 1, "monitor must log one row");
     assert_ne!(
         audit[0].violation_type, "rls_policy_violation",
         "log must not claim a policy violation"
     );
+}
+
+/// A key whose quoted form runs past the audit table's bound is logged cut to
+/// that bound, and the write the monitor watches goes through.
+#[test]
+fn monitor_cuts_a_long_row_identifier() {
+    const LONG_KEY_SCHEMA: &str = "
+        CREATE ROLE alice;
+        CREATE TABLE notes (
+            key TEXT PRIMARY KEY,
+            owner TEXT NOT NULL
+        );
+        ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY notes_ins ON notes FOR INSERT WITH CHECK (true);
+        CREATE POLICY notes_sel ON notes FOR SELECT USING (owner = current_user);
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO alice;
+    ";
+    let mut conn = apply(LONG_KEY_SCHEMA, &monitor_opts());
+    let key = "k".repeat(5000);
+
+    run_dml(
+        &mut conn,
+        &format!("INSERT INTO notes (key, owner) VALUES ('{key}', 'bob')"),
+        LONG_KEY_SCHEMA,
+        &monitor_opts(),
+    )
+    .expect("a long key must not fail the monitored INSERT");
+
+    let identifiers: Vec<String> = schema::rls_audit::table
+        .select(schema::rls_audit::row_identifier)
+        .load(&mut conn)
+        .expect("audit rows");
+    assert_eq!(identifiers.len(), 1, "monitor must log one row");
+    assert_eq!(identifiers[0], format!("key='{}", "k".repeat(4096 - "key='".len())));
 }
 
 #[test]
@@ -846,9 +883,7 @@ fn hidden_exempt_row_still_reaches_monitoring() {
     .expect("exempt hidden insert");
     set_write_exempt(false);
 
-    let audit = diesel::sql_query("SELECT violation_type, details FROM rls_audit")
-        .load::<AuditLog>(&mut conn)
-        .expect("audit rows");
+    let audit = audit_rows(&mut conn);
     assert_eq!(audit.len(), 1);
     assert_eq!(schema::events::table.count().get_result::<i64>(&mut conn).unwrap(), 0);
 }
