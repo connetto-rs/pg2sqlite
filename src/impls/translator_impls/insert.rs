@@ -3,7 +3,7 @@
 
 use sql_traits::{
     structs::ParserDB,
-    traits::{ColumnLike, DatabaseLike, IndexLike, TableLike, UniqueIndexLike},
+    traits::{ColumnLike, DatabaseLike, TableIndexLike, TableLike, UniqueIndexLike},
 };
 use sqlparser::ast::{
     AssignmentTarget, DataType, Expr, Insert, ObjectName, SelectItem, SetExpr, TableObject,
