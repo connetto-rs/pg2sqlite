@@ -879,16 +879,7 @@ fn check_reads_relations(
         if let Some(acting) = acting
             && !RoleTable::of(table, Some(acting), schema)?.reads_any()
         {
-            return Err(refusal(
-                name,
-                &format!(
-                    "reads {relation}, on which {} holds no privilege, so the translation leaves \
-                     it out of the replica. Grant {} SELECT on it, under a policy hiding its rows \
-                     if they are not the role's to read",
-                    acting.name(),
-                    acting.name()
-                ),
-            ));
+            return Err(refusal(name, &hidden_read(relation, acting)));
         }
         Ok(())
     };
@@ -902,6 +893,17 @@ fn check_reads_relations(
         ControlFlow::Continue(()) => Ok(()),
         ControlFlow::Break(error) => Err(error),
     }
+}
+
+/// Why a helper reading `relation`, a table on which the `acting` role holds
+/// no privilege, cannot be inlined, and how the schema lets it be.
+pub(crate) fn hidden_read(relation: &dyn core::fmt::Display, acting: &Role) -> String {
+    format!(
+        "reads {relation}, on which {acting} holds no privilege, so the translation leaves it out \
+         of the replica. Grant {acting} SELECT on it, under a policy hiding its rows if they are \
+         not the role's to read",
+        acting = acting.name()
+    )
 }
 
 /// The relations a select in `statement` reads every column of through a
