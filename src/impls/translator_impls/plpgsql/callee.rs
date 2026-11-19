@@ -600,10 +600,6 @@ fn resolved(mut expr: Expr, scope: &BodyScope) -> Result<Expr, Error> {
     let bindings: Vec<Binding> = scope.bindings().cloned().collect();
     let mut values: Vec<(String, BoundValue)> = Vec::with_capacity(bindings.len());
     for binding in PlPgSqlTranslator::order_bindings_by_dependency(&bindings) {
-        // A scoped binding comes first and shadows the persistent one.
-        if values.iter().any(|(name, _)| *name == binding.name) {
-            continue;
-        }
         let value = match &binding.value {
             BoundValue::Expr(value) => {
                 let mut value = value.clone();
