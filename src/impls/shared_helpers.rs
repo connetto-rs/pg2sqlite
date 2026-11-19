@@ -307,11 +307,11 @@ pub(crate) fn bare_identifier_name(expr: &Expr) -> Option<&str> {
 /// `rowid` is SQLite's own and the variable-value column is the shape a
 /// PL/pgSQL variable is carried in, so neither has a declaration to read
 /// however it is written. A variable itself is neither resolved nor refused
-/// by contract, but it shadows only the bare name, so a qualified reference
-/// is the relation's column and is read as one. Declining `t.amount` because
-/// a variable named `amount` is in scope skipped the column's own numeric
-/// scale, which emits a comparison against major units where the column
-/// holds minor ones.
+/// by contract, its type read from [`variable_declaration`] instead, but it
+/// shadows only the bare name, so a qualified reference is the relation's
+/// column and is read as one. Declining `t.amount` because a variable named
+/// `amount` is in scope skipped the column's own numeric scale, which emits a
+/// comparison against major units where the column holds minor ones.
 pub(crate) fn scope_declines_column(
     reference: &Expr,
     column_name: &str,
@@ -320,6 +320,15 @@ pub(crate) fn scope_declines_column(
     column_name.eq_ignore_ascii_case("rowid")
         || column_name == crate::impls::translator_impls::plpgsql::VARIABLE_VALUE_COLUMN
         || (bare_identifier_name(reference).is_some() && options.is_variable(column_name))
+}
+
+/// The declaration a bare reference to a PL/pgSQL variable reads, as a
+/// reference to a column reads the column's.
+pub(crate) fn variable_declaration<'o>(
+    reference: &Expr,
+    options: &'o crate::options::TranslationContext<'_>,
+) -> Option<&'o sqlparser::ast::ColumnDef> {
+    options.variable_declaration(bare_identifier_name(strip_nesting(reference))?)
 }
 
 /// Resolves a column declaration and requires an inspectable definition.
@@ -380,6 +389,9 @@ fn read_scoped_declaration<T: PartialEq>(
     else {
         return Ok(None);
     };
+    if let Some(declaration) = variable_declaration(reference, options) {
+        return Ok(read_column(declaration));
+    }
     if scope_declines_column(reference, column_name, options) {
         return Ok(None);
     }
@@ -6297,7 +6309,7 @@ mod tests {
         let query = parse_query("SELECT x FROM (VALUES ('1 day'::interval)) v (x)");
         let select = query.body.as_ref().as_select().expect("the select body");
         assert!(values_relation_carries_interval(select, &schema, &options));
-        let variables = vec![String::from("x")];
+        let variables = vec![crate::options::BoundVariable::new(String::from("x"), None)];
         let scoped = options.with_variables(&variables);
         assert!(!values_relation_carries_interval(select, &schema, &scoped));
     }

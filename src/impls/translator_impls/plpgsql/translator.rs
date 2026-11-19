@@ -4,16 +4,16 @@
 use alloc::collections::BTreeSet;
 use core::ops::ControlFlow;
 
-use sql_traits::{structs::ParserDB, traits::DatabaseLike};
+use sql_traits::{structs::ParserDB, traits::DatabaseLike, utils::normalize_sqlparser_type};
 use sqlparser::ast::{
-    BinaryOperator, CaseWhen, DataType, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
-    FunctionReturnType, GroupByExpr, Ident, InTarget, ObjectName, ObjectNamePart, Query, Select,
-    SelectItem, SetExpr, Statement, TableAlias, TableFactor, TableWithJoins, UnaryOperator, Value,
-    Visit, VisitMut, Visitor, VisitorMut, helpers::attached_token::AttachedToken,
-    visit_expressions, visit_expressions_mut,
+    BinaryOperator, CaseWhen, CastKind, DataType, Expr, FunctionArg, FunctionArgExpr,
+    FunctionArguments, FunctionReturnType, GroupByExpr, Ident, InTarget, ObjectName,
+    ObjectNamePart, Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor,
+    TableWithJoins, UnaryOperator, Value, Visit, VisitMut, Visitor, VisitorMut,
+    helpers::attached_token::AttachedToken, visit_expressions, visit_expressions_mut,
 };
 use sqlparser_plpgsql::embedded::{
-    self, Block, Branch, DeclarationKind, If, IntoTargets, Node, NodeKind, Target,
+    self, Block, Branch, DeclarationKind, DeclaredType, If, IntoTargets, Node, NodeKind, Target,
 };
 
 use super::{
@@ -26,12 +26,15 @@ use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{
+        expression_type::type_name,
         function_helpers::simple_function_expr,
         query_builder::{
             from_relation, make_query, make_simple_select, plain_table_factor, single_expr_query,
         },
+        shared_helpers::{minor_unit_scale, scale_decimal_literal, scale_of},
         translator_impls::condition_injection::inject_condition_into_dml_statement,
     },
+    options::BoundVariable,
     traits::translator::TranslatorWithContext,
     warnings::TranslationWarning,
 };
@@ -259,12 +262,15 @@ impl PlPgSqlTranslator {
                             declaration.name
                         )));
                     }
-                    scope.declare(&declaration.name);
+                    let data_type = match &variable.data_type {
+                        DeclaredType::Data(data_type) => Some(data_type.clone()),
+                        DeclaredType::ColumnType { .. } | DeclaredType::RowType { .. } => None,
+                    };
+                    scope.declare(&declaration.name, data_type);
                     if let Some(default) = &variable.default {
                         // PostgreSQL computes each default as the block is
                         // entered, in the order the block declares them.
-                        let variables: Vec<String> =
-                            scope.bindings().map(|binding| binding.name.clone()).collect();
+                        let variables = scope.variables();
                         let (value, inlined) = Self::assigned_value(
                             embedded::expression(default).into_owned(),
                             scope,
@@ -274,8 +280,7 @@ impl PlPgSqlTranslator {
                         )?;
                         result.extend(inlined);
                         scope.bind_persistent(Binding { name: declaration.name.clone(), value });
-                        let variables: Vec<String> =
-                            scope.bindings().map(|binding| binding.name.clone()).collect();
+                        let variables = scope.variables();
                         result.extend(Self::evaluate_assigned(
                             core::slice::from_ref(&declaration.name),
                             scope,
@@ -312,7 +317,7 @@ impl PlPgSqlTranslator {
         options: &crate::options::TranslationContext<'_>,
         emit: crate::warnings::WarningSink<'_>,
     ) -> Result<Vec<Statement>, Error> {
-        let variables: Vec<String> = scope.bindings().map(|binding| binding.name.clone()).collect();
+        let variables = scope.variables();
         let scoped = options.with_variables(&variables);
         let options = &scoped;
 
@@ -441,7 +446,7 @@ impl PlPgSqlTranslator {
                 let bindings: Vec<_> = scope.bindings().cloned().collect();
                 let mut reserved = stmt.clone();
                 reserve_variables(&mut reserved, &bindings);
-                let names = reserved_variables(&bindings);
+                let names = reserved_variables(&bindings, options);
                 let mut translated = reserved.translate_with_warnings(
                     schema,
                     &options.with_variables(&names),
@@ -943,7 +948,7 @@ impl PlPgSqlTranslator {
         let mut transformed = condition.clone();
         Self::transform_expr(&mut transformed, options);
         reserve_variables(&mut transformed, &bindings);
-        let reserved = reserved_variables(&bindings);
+        let reserved = reserved_variables(&bindings, options);
         let mut translated = transformed.translate_with_warnings(
             schema,
             &options.with_variables(&reserved),
@@ -1164,7 +1169,7 @@ impl PlPgSqlTranslator {
             Self::null_unbound_declarations(statement, scope, &bindings);
             reserve_variables(statement, &bindings);
         }
-        let reserved = reserved_variables(&bindings);
+        let reserved = reserved_variables(&bindings, options);
         let mut translated = Self::finalize_query_statements(
             statements,
             scope,
@@ -2033,7 +2038,7 @@ impl PlPgSqlTranslator {
         let ordered = Self::order_bindings_by_dependency(bindings);
         let mut values = Vec::with_capacity(ordered.len());
         let mut scope = VariableScope::default();
-        let reserved = reserved_variables(bindings);
+        let reserved = reserved_variables(bindings, options);
         let reserved_options = options.with_variables(&reserved);
 
         for binding in ordered {
@@ -2052,7 +2057,15 @@ impl PlPgSqlTranslator {
             reserve_variables(&mut renamed, bindings);
             // A value that does not translate, or reads a refused name, is
             // refused itself, so only a statement reading it fails.
-            let mut value = match renamed.translate_with_warnings(schema, &reserved_options, emit) {
+            let held = Self::held_as_declared(
+                renamed,
+                options.variable_declaration(&binding.name),
+                schema,
+                &reserved_options,
+            );
+            let mut value = match held
+                .and_then(|held| held.translate_with_warnings(schema, &reserved_options, emit))
+            {
                 Ok(translated) => translated,
                 Err(error) => {
                     scope.refuse(&binding.name, &error.to_string());
@@ -2068,6 +2081,54 @@ impl PlPgSqlTranslator {
         }
 
         (values, scope)
+    }
+
+    /// `value` as a variable declared as `declaration` holds it, converted to
+    /// the declared type where the value's own type differs, as PostgreSQL
+    /// converts an assigned value.
+    ///
+    /// A reference to the variable reads the declared type, so a value left
+    /// in another type's form would be read in the wrong one. `'24 hours'`
+    /// assigned to an `interval` is held as the text PostgreSQL prints for it,
+    /// and `1.50` assigned to a `NUMERIC(10,2)` as the 150 minor units a
+    /// column of that type stores. A value whose type nothing settles is left
+    /// as written.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a literal finer than the declared scale, as a column of that
+    /// type refuses it.
+    fn held_as_declared(
+        value: Expr,
+        declaration: Option<&sqlparser::ast::ColumnDef>,
+        schema: &ParserDB,
+        options: &crate::options::TranslationContext<'_>,
+    ) -> Result<Expr, Error> {
+        let Some(declaration) = declaration else { return Ok(value) };
+        let minor_units = minor_unit_scale(&declaration.data_type);
+        if let Some(scale) = minor_units
+            && let Some(scaled) = scale_decimal_literal(&value, scale)?
+        {
+            return Ok(scaled);
+        }
+        let declared = normalize_sqlparser_type(&declaration.data_type);
+        let off_type = matches!(
+            type_name(&value, schema, options),
+            Ok(Some(found)) if !found.eq_ignore_ascii_case(&declared)
+        );
+        let off_scale = minor_units.is_some_and(|scale| {
+            scale_of(&value, schema, options).is_some_and(|held| held != scale)
+        });
+        Ok(if off_type || off_scale {
+            Expr::Cast {
+                kind: CastKind::Cast,
+                expr: Box::new(value),
+                data_type: declaration.data_type.clone(),
+                format: None,
+            }
+        } else {
+            value
+        })
     }
 
     /// Attaches an `IF` guard to a statement's `WHERE` clause, failing when it
@@ -2226,13 +2287,24 @@ fn reserve_variables<N: VisitMut>(node: &mut N, bindings: &[Binding]) {
     });
 }
 
-/// The names a translation of a node [`reserve_variables`] renamed reads as
-/// variables, each binding under its written and its reserved name.
-fn reserved_variables(bindings: &[Binding]) -> Vec<String> {
+/// The variables a translation of a node [`reserve_variables`] renamed reads,
+/// each binding under its written and its reserved name, with the
+/// declaration `options` holds for it.
+fn reserved_variables(
+    bindings: &[Binding],
+    options: &crate::options::TranslationContext<'_>,
+) -> Vec<BoundVariable> {
     bindings
         .iter()
         .flat_map(|binding| {
-            [binding.name.clone(), format!("{RESERVED_VARIABLE_PREFIX}{}", binding.name)]
+            let declaration = options.variable_declaration(&binding.name);
+            [
+                BoundVariable::declared(binding.name.clone(), declaration.cloned()),
+                BoundVariable::declared(
+                    format!("{RESERVED_VARIABLE_PREFIX}{}", binding.name),
+                    declaration.cloned(),
+                ),
+            ]
         })
         .collect()
 }
