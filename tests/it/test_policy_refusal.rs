@@ -10,7 +10,8 @@ use diesel::{
     Connection as _, ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection,
     connection::SimpleConnection, result::Error,
 };
-use pg2sqlite::prelude::{Pg2SqliteOptions, is_policy_refusal};
+use pg2sqlite::prelude::{Pg2SqliteOptions, is_policy_refusal, postgres_error};
+use sqlstate::pg;
 
 const POLICY_SCHEMA: &str = "
 CREATE TABLE orders (
@@ -199,6 +200,10 @@ fn every_guard_refusal_is_recognised() {
     for (write, result) in refusals.into_iter().chain(read_only_refusals) {
         let message = error_message(result, write);
         assert!(is_policy_refusal(&message), "{write} raised an unrecognised refusal: {message}");
+        let error = postgres_error(&message)
+            .unwrap_or_else(|| panic!("{write} does not read as a PostgreSQL error: {message}"));
+        assert_eq!(error.sqlstate(), pg::INSUFFICIENT_PRIVILEGE, "{write}");
+        assert_eq!(error.message(), message, "{write}");
     }
 }
 
@@ -228,5 +233,6 @@ fn other_write_errors_are_not_policy_refusals() {
     for (write, result) in errors {
         let message = error_message(result, write);
         assert!(!is_policy_refusal(&message), "{write} was taken for a refusal: {message}");
+        assert_eq!(postgres_error(&message), None, "{write} was read as a PostgreSQL error");
     }
 }

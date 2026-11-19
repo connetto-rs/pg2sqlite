@@ -72,3 +72,18 @@ fn a_computed_errcode_is_refused() {
     let message = refusal("RAISE EXCEPTION 'computed' USING ERRCODE = 'check_' || 'violation'");
     assert!(message.contains("only a string literal translates"), "{message}");
 }
+
+#[test]
+fn a_bare_raise_is_refused() {
+    let message = refusal("RAISE");
+    assert!(
+        message.contains("a bare RAISE re-raises the error an exception handler caught"),
+        "{message}"
+    );
+}
+
+#[test]
+fn raising_others_is_refused() {
+    let message = refusal("RAISE others");
+    assert!(message.contains("unrecognized exception condition \"others\""), "{message}");
+}
