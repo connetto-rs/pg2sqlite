@@ -190,6 +190,50 @@ fn a_choice_by_a_variable_survives_its_reassignment() {
     ));
 }
 
+/// A record an `IF` chose by a variable keeps the branch it chose when the
+/// variable is assigned a value that does not read it.
+#[test]
+fn a_record_chosen_by_a_variable_survives_a_fresh_value() {
+    assert_parity(&trigger(
+        "record_chosen",
+        "grew BOOLEAN := NEW.val > OLD.val; rec RECORD;",
+        "    IF grew THEN
+        rec := NEW;
+    ELSE
+        rec := OLD;
+    END IF;
+    grew := false;
+    INSERT INTO log (id, branch) VALUES (coalesce(rec.val, -1), 'rec');",
+    ));
+}
+
+/// A variable assigned from one not yet assigned keeps `NULL` after the other
+/// is assigned.
+#[test]
+fn a_value_read_before_the_first_assignment_keeps_null() {
+    assert_parity(&trigger(
+        "unassigned",
+        "x INT; y INT;",
+        "    y := x;
+    x := NEW.val;
+    INSERT INTO log (id, branch) VALUES (coalesce(y, -1), 'y');
+    INSERT INTO log (id, branch) VALUES (x, 'x');",
+    ));
+}
+
+/// A variable named as the translation names an earlier value keeps its own
+/// value, `NULL` before its first assignment.
+#[test]
+fn a_variable_named_like_an_earlier_value_keeps_its_own() {
+    assert_parity(&trigger(
+        "earlier_named",
+        "pg2sqlite_earlier_0 INT; x INT := NEW.val; y INT := x + 1;",
+        "    x := 0;
+    INSERT INTO log (id, branch) VALUES (y, 'y');
+    INSERT INTO log (id, branch) VALUES (coalesce(pg2sqlite_earlier_0, -1), 'named');",
+    ));
+}
+
 /// What an `IF` chose by a variable its branch assigns is chosen by the
 /// value the variable held when the `IF` tested it, and an `ELSIF` reads a
 /// value computed from the variable before the earlier branch assigned it.
