@@ -1969,10 +1969,7 @@ impl PlPgSqlTranslator {
             Self::bound_values(&modified_bindings, ReferenceForm::Cte, schema, options, emit);
         let ctes: Vec<sqlparser::ast::Cte> = values
             .into_iter()
-            .map(|(name, mut value)| {
-                Self::null_unbound_declarations(&mut value, scope, &modified_bindings);
-                CteBuilder::create_variable_cte(&name, value)
-            })
+            .map(|(name, value)| CteBuilder::create_variable_cte(&name, value))
             .collect();
 
         if let Some(source) = &insert.source {
