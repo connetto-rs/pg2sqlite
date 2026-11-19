@@ -303,6 +303,18 @@ fn a_compound_select_sorts_a_case_output_by_declaration_order() {
     );
 }
 
+/// `DISTINCT ON` an enum the query does not select keeps one row per label in
+/// declaration order.
+#[test]
+fn distinct_on_an_unselected_enum_follows_declaration_order() {
+    let mut replicas = Replicas::new(SOURCE);
+    let rows = replicas.assert_same_rows(
+        "SELECT DISTINCT ON (role) id::text AS v FROM grants ORDER BY role, id",
+        &[],
+    );
+    assert_eq!(rows, labels(&["2", "3", "1"]));
+}
+
 /// Untyped parameters inherit the enum type and compare in declaration order.
 #[test]
 fn untyped_parameters_compare_by_declaration_order() {
