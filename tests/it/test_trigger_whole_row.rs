@@ -147,3 +147,61 @@ fn a_record_assigned_in_some_branches_only_translates_when_unread() {
         .translate(&options())
         .expect("no read of the record is left to refuse");
 }
+
+/// PostgreSQL keeps the row the `IF` chose. SQLite would test the condition
+/// again at each field read, over the rows written since.
+#[test]
+fn a_record_whose_if_condition_reads_a_table_written_before_the_read_is_refused() {
+    let message = refusal(
+        "UPDATE",
+        "",
+        "DECLARE rec RECORD;
+         BEGIN
+             IF EXISTS (SELECT 1 FROM audit) THEN rec := NEW; ELSE rec := OLD; END IF;
+             INSERT INTO audit (body) VALUES (NULL);
+             INSERT INTO audit (body) VALUES (to_jsonb(rec.n));
+         END;",
+    );
+    assert!(message.contains("`rec` reads `audit`, which the body writes"), "{message}");
+}
+
+#[test]
+fn a_record_whose_nested_if_condition_reads_a_table_written_before_the_read_is_refused() {
+    let message = refusal(
+        "UPDATE",
+        "",
+        "DECLARE rec RECORD;
+         BEGIN
+             IF NEW.n > 0 THEN
+                 IF EXISTS (SELECT 1 FROM audit) THEN rec := NEW; ELSE rec := OLD; END IF;
+             ELSE
+                 rec := OLD;
+             END IF;
+             INSERT INTO audit (body) VALUES (NULL);
+             INSERT INTO audit (body) VALUES (to_jsonb(rec.n));
+         END;",
+    );
+    assert!(message.contains("`rec` reads `audit`, which the body writes"), "{message}");
+}
+
+/// Read before the write, the condition sees the rows PostgreSQL's `IF` saw.
+#[test]
+fn a_record_whose_if_condition_reads_a_table_translates_when_read_before_the_write() {
+    let rows = run_translated_with(
+        &script(
+            "UPDATE",
+            "",
+            "DECLARE rec RECORD;
+             BEGIN
+                 IF EXISTS (SELECT 1 FROM audit) THEN rec := NEW; ELSE rec := OLD; END IF;
+                 INSERT INTO audit (body) VALUES (to_jsonb(rec.n));
+             END;",
+            "INSERT INTO r VALUES ('00010203-0405-0607-0809-0a0b0c0d0e0f', 'x', 1);
+             UPDATE r SET n = 2;
+             UPDATE r SET n = 3;
+             SELECT body FROM audit;",
+        ),
+        &options(),
+    );
+    assert_eq!(rows, [Some("1".to_owned()), Some("3".to_owned())]);
+}
