@@ -350,6 +350,38 @@ fn a_helper_that_helper_set_refuses_is_refused_with_its_error() {
     let ordered = refusal(&read_policy("id IN (SELECT docs_with('write' ORDER BY 1))"), &options())
         .to_string();
     assert!(ordered.contains("not an aggregate function"), "{ordered}");
+    let read_in_from =
+        refusal(&read_policy("id IN (SELECT * FROM docs_as_invoker('write'))"), &options())
+            .to_string();
+    assert!(
+        read_in_from.contains("docs_as_invoker() cannot be translated")
+            && read_in_from.contains("is not SECURITY DEFINER"),
+        "{read_in_from}"
+    );
+}
+
+/// PostgreSQL refuses an alias naming more columns than a helper returns, and
+/// so does the translation, which has no column to give the extra name.
+#[test]
+fn an_alias_naming_more_columns_than_a_helper_returns_is_refused() {
+    let error = refusal(
+        &read_policy("id IN (SELECT doc FROM docs_with('write') AS written (doc, extra))"),
+        &options(),
+    )
+    .to_string();
+    assert!(error.contains("docs_with()") && error.contains("2 columns"), "{error}");
+}
+
+/// PostgreSQL types the alias columns of a function returning `record` only,
+/// and the translation refuses a typed column on a helper as it does.
+#[test]
+fn an_alias_typing_a_helpers_column_is_refused() {
+    let error = refusal(
+        &read_policy("id IN (SELECT doc FROM docs_with('write') AS written (doc TEXT))"),
+        &options(),
+    )
+    .to_string();
+    assert!(error.contains("docs_with()") && error.contains("data type"), "{error}");
 }
 
 /// A helper reading a table without row-level security reads the table
@@ -437,7 +469,8 @@ fn a_declared_user_defined_function_is_called_rather_than_inlined() {
 
 /// Resources, the grants on them, and helpers over them whose arms call
 /// another helper, pair their rows with enum labels, or cap the key they
-/// return by another helper's set.
+/// return by another helper's set, returning one column or, as connetto's
+/// `sharable_grants` does, which role the caller may grant on which resource.
 const SHARING: &str = "
 CREATE ROLE helper_owner NOLOGIN BYPASSRLS;
 CREATE TYPE share_role AS ENUM ('reader', 'writer', 'admin');
@@ -486,6 +519,26 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
   SELECT resource.id FROM resources resource
   WHERE resource.writers_can_share AND resource.id IN (SELECT resources_with('writer'))
 $$;
+CREATE FUNCTION administered_shares() RETURNS TABLE (resource_id TEXT, role share_role)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+  SELECT resource.id, allowed.role FROM resources_with('admin') resource(id)
+  CROSS JOIN unnest(enum_range(NULL::share_role)) allowed(role)
+$$;
+CREATE FUNCTION written_shares() RETURNS TABLE (resource_id TEXT, role share_role)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+  SELECT resource.id, allowed.role FROM resources resource
+  CROSS JOIN (VALUES ('reader'::share_role), ('writer'::share_role)) allowed(role)
+  WHERE resource.writers_can_share AND resource.id IN (SELECT resources_with('writer'))
+$$;
+CREATE FUNCTION sharable_grants() RETURNS TABLE (resource_id TEXT, role share_role)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+  SELECT resource.id, allowed.role FROM resources_with('admin') resource(id)
+  CROSS JOIN unnest(enum_range(NULL::share_role)) allowed(role)
+  UNION
+  SELECT resource.id, allowed.role FROM resources resource
+  CROSS JOIN (VALUES ('reader'::share_role), ('writer'::share_role)) allowed(role)
+  WHERE resource.writers_can_share AND resource.id IN (SELECT resources_with('writer'))
+$$;
 ALTER FUNCTION resources_with(TEXT) OWNER TO helper_owner;
 ALTER FUNCTION resources_administered(TEXT) OWNER TO helper_owner;
 ALTER FUNCTION administered_resources() OWNER TO helper_owner;
@@ -494,6 +547,9 @@ ALTER FUNCTION granted_roles() OWNER TO helper_owner;
 ALTER FUNCTION listed_roles() OWNER TO helper_owner;
 ALTER FUNCTION no_roles() OWNER TO helper_owner;
 ALTER FUNCTION sharable_resources() OWNER TO helper_owner;
+ALTER FUNCTION administered_shares() OWNER TO helper_owner;
+ALTER FUNCTION written_shares() OWNER TO helper_owner;
+ALTER FUNCTION sharable_grants() OWNER TO helper_owner;
 GRANT SELECT ON resources, share_grants TO helper_owner;
 ALTER TABLE resources ENABLE ROW LEVEL SECURITY;
 ALTER TABLE share_grants ENABLE ROW LEVEL SECURITY;
@@ -581,4 +637,72 @@ fn a_returned_key_is_capped_by_another_helpers_set() {
          FROM share_grants_rls AS arm \
          WHERE arm.principal_id = app_user() AND arm.role IN ('admin', 'writer'))))"
     );
+}
+
+/// What `administered_shares()` returns, as the replica reads it.
+const ADMINISTERED_SHARES: &str = "SELECT called.column_0 AS resource_id, labels_1.label AS role \
+     FROM (SELECT arm.resource_id AS column_0 FROM share_grants_rls AS arm \
+     WHERE arm.principal_id = app_user() AND arm.role IN ('admin')) AS called \
+     CROSS JOIN (SELECT 'reader' AS label UNION ALL SELECT 'writer' AS label \
+     UNION ALL SELECT 'admin' AS label) AS labels_1";
+
+/// What `written_shares()` returns, as the replica reads it.
+const WRITTEN_SHARES: &str = "SELECT arm.id AS resource_id, labels_1.label AS role \
+     FROM resources_rls AS arm \
+     CROSS JOIN (SELECT 'reader' AS label UNION ALL SELECT 'writer' AS label) AS labels_1 \
+     WHERE arm.writers_can_share IN (true) AND arm.id IN (SELECT arm.resource_id \
+     FROM share_grants_rls AS arm \
+     WHERE arm.principal_id = app_user() AND arm.role IN ('admin', 'writer'))";
+
+/// The condition the view `share_grants` keeps its rows by, under a policy
+/// keeping the grants whose resource `helper` returns.
+fn keyed_by(helper: &str) -> String {
+    shared(&format!("resource_id IN (SELECT share.resource_id FROM {helper}() share)"))
+}
+
+/// A `TABLE` helper calling another reads the called rows by position beside
+/// every label of an enum, in declaration order.
+#[test]
+fn a_table_helper_pairs_the_called_rows_with_every_enum_label() {
+    assert_eq!(
+        keyed_by("administered_shares"),
+        format!(
+            "(resource_id IN (SELECT share.resource_id FROM ({ADMINISTERED_SHARES}) AS share))"
+        )
+    );
+}
+
+/// A `TABLE` helper's grant arm pairs its rows with each label a `VALUES`
+/// list writes, under the cap on the key it returns.
+#[test]
+fn a_table_helper_pairs_a_capped_grant_arm_with_listed_labels() {
+    assert_eq!(
+        keyed_by("written_shares"),
+        format!("(resource_id IN (SELECT share.resource_id FROM ({WRITTEN_SHARES}) AS share))")
+    );
+}
+
+/// A `TABLE` helper uniting a called arm and a capped grant arm is read by
+/// its key and by its whole rows.
+#[test]
+fn a_table_helper_uniting_labelled_arms_is_read_by_key_and_by_row() {
+    let rows = format!("{ADMINISTERED_SHARES} UNION {WRITTEN_SHARES}");
+    assert_eq!(
+        keyed_by("sharable_grants"),
+        format!("(resource_id IN (SELECT share.resource_id FROM ({rows}) AS share))")
+    );
+    let script = translated(
+        &format!(
+            "{SHARING}CREATE POLICY share_grants_insert ON share_grants FOR INSERT \
+             WITH CHECK ((resource_id, role) IN \
+             (SELECT share.resource_id, share.role FROM sharable_grants() share));"
+        ),
+        &options(),
+    );
+    let trigger = statement(&script, "share_grants_insert_trigger");
+    let membership = format!(
+        "(NEW.resource_id, NEW.role) IN (SELECT share.resource_id, share.role FROM ({rows}) AS \
+         share)"
+    );
+    assert!(trigger.contains(&membership), "{trigger}");
 }
