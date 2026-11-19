@@ -23,7 +23,9 @@ use super::{
     per_row::holds_row,
     raise::raise_statement,
     returns::without_early_returns,
-    scope::{Binding, BodyScope, BoundValue, RowValue, TriggerFacts, expand_relation, fold},
+    scope::{
+        Binding, BodyScope, BoundValue, RowValue, TriggerFacts, UnreadField, expand_relation, fold,
+    },
 };
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
@@ -1155,9 +1157,17 @@ impl PlPgSqlTranslator {
         let BoundValue::Row(row) = &binding.value else { return Ok(()) };
         *expr = match (field, row) {
             (Some(field), row) => {
-                row.field(&field).ok_or_else(|| Error::forward_refusal(partial_row(&name)))?
+                row.field(&field).map_err(|unread| {
+                    match unread {
+                        UnreadField::Unassigned => Error::forward_refusal(partial_row(&name)),
+                        UnreadField::Unreadable(reason) => Error::forward_refusal(reason),
+                    }
+                })?
             }
             (None, RowValue::Trigger(row)) => Expr::Identifier(row.clone()),
+            (None, RowValue::Unreadable(reason)) => {
+                return Err(Error::forward_refusal(reason.as_str()));
+            }
             (None, RowValue::Chosen { .. } | RowValue::Unassigned) => {
                 return Err(Error::forward_refusal(format!(
                     "`{name}` holds `NEW` or `OLD` depending on which branch of an IF ran, and a \

@@ -116,26 +116,37 @@ pub(crate) enum RowValue {
     Chosen { arms: Vec<(Expr, Self)>, otherwise: Box<Self> },
     /// No row, as after a branch that assigned none.
     Unassigned,
+    /// A row the emitted trigger cannot read, refused with the reason where
+    /// the record is read.
+    Unreadable(String),
+}
+
+/// Why a field of a row has no PostgreSQL expression reading it.
+pub(crate) enum UnreadField<'row> {
+    /// A path leaves the record unassigned, where PostgreSQL raises at the
+    /// read.
+    Unassigned,
+    /// A path reaches a row the emitted trigger cannot read, for this
+    /// reason.
+    Unreadable(&'row str),
 }
 
 impl RowValue {
-    /// The PostgreSQL expression reading `field` of the row, or `None` when
-    /// a path leaves the record unassigned, where PostgreSQL raises at the
-    /// read.
-    pub(crate) fn field(&self, field: &Ident) -> Option<Expr> {
+    /// The PostgreSQL expression reading `field` of the row.
+    pub(crate) fn field(&self, field: &Ident) -> Result<Expr, UnreadField<'_>> {
         match self {
-            Self::Trigger(row) => Some(Expr::CompoundIdentifier(vec![row.clone(), field.clone()])),
+            Self::Trigger(row) => Ok(Expr::CompoundIdentifier(vec![row.clone(), field.clone()])),
             Self::Chosen { arms, otherwise } => {
                 let conditions = arms
                     .iter()
                     .map(|(condition, row)| {
-                        Some(CaseWhen {
+                        Ok(CaseWhen {
                             condition: Expr::Nested(Box::new(condition.clone())),
                             result: row.field(field)?,
                         })
                     })
-                    .collect::<Option<Vec<_>>>()?;
-                Some(Expr::Case {
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Expr::Case {
                     case_token: AttachedToken::empty(),
                     end_token: AttachedToken::empty(),
                     operand: None,
@@ -143,7 +154,8 @@ impl RowValue {
                     else_result: Some(Box::new(otherwise.field(field)?)),
                 })
             }
-            Self::Unassigned => None,
+            Self::Unassigned => Err(UnreadField::Unassigned),
+            Self::Unreadable(reason) => Err(UnreadField::Unreadable(reason)),
         }
     }
 
@@ -167,8 +179,17 @@ impl RowValue {
                     reads_variable(condition, name) || row.reads_variable(name)
                 }) || otherwise.reads_variable(name)
             }
-            Self::Trigger(_) | Self::Unassigned => false,
+            Self::Trigger(_) | Self::Unassigned | Self::Unreadable(_) => false,
         }
+    }
+
+    /// Whether a condition choosing among the rows, nested choices included,
+    /// reads `relation`.
+    fn reads(&self, relation: &str, schema: &ParserDB) -> bool {
+        let Self::Chosen { arms, otherwise } = self else { return false };
+        arms.iter().any(|(condition, row)| {
+            relations_read(condition, schema).contains(relation) || row.reads(relation, schema)
+        }) || otherwise.reads(relation, schema)
     }
 }
 
@@ -208,8 +229,11 @@ impl Binding {
     /// Whether the value reads `relation`, so a write to it changes what a
     /// later read answers.
     fn reads(&self, relation: &str, schema: &ParserDB) -> bool {
-        let BoundValue::Expr(expr) = &self.value else { return false };
-        relations_read(expr, schema).contains(relation)
+        match &self.value {
+            BoundValue::Expr(expr) => relations_read(expr, schema).contains(relation),
+            BoundValue::Row(row) => row.reads(relation, schema),
+            BoundValue::Unreadable(_) => false,
+        }
     }
 }
 
@@ -525,7 +549,8 @@ impl BodyScope {
     }
 
     /// Makes every binding whose value reads `relation` unreadable, since a
-    /// read after the write would compute it again over the written rows.
+    /// read after the write would compute it again over the written rows. A
+    /// record stays a row, so a read of one of its fields is refused too.
     /// The write is also recorded against every enclosing `IF`, and among
     /// the relations the body wrote.
     pub(crate) fn invalidate_readers(&mut self, relation: &str, schema: &ParserDB) {
@@ -536,12 +561,18 @@ impl BodyScope {
         for binding in self.scoped.values_mut().chain(self.persistent.values_mut()) {
             if binding.reads(relation, schema) {
                 let variable = self.earlier.get(&binding.name).unwrap_or(&binding.name);
-                binding.value = BoundValue::Unreadable(format!(
+                let reason = format!(
                     "`{variable}` reads `{relation}`, which the body writes before this read, and \
                      a SQLite trigger computes a variable again at each read where PostgreSQL \
                      keeps the value it assigned. Read the variable before the write, or \
                      compute the value in the statement that needs it."
-                ));
+                );
+                binding.value = match binding.value {
+                    BoundValue::Row(_) => BoundValue::Row(RowValue::Unreadable(reason)),
+                    BoundValue::Expr(_) | BoundValue::Unreadable(_) => {
+                        BoundValue::Unreadable(reason)
+                    }
+                };
             }
         }
     }
