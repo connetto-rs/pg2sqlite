@@ -187,6 +187,29 @@ fn found_after_perform_guards_the_same_writes() {
     run_found(FOUND_GUARD);
 }
 
+/// A value the body checks where it is assigned reads a declared variable no
+/// statement assigned yet as `NULL`.
+const UNASSIGNED_READ: &str = "
+CREATE FUNCTION note_fallback() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    fallback TEXT;
+    noted TEXT;
+BEGIN
+    noted := coalesce(fallback, 'unset');
+    INSERT INTO audit (child, outcome) VALUES (NEW.id, noted);
+    RETURN NULL;
+END $$;
+CREATE TRIGGER children_fallback AFTER INSERT ON children
+    FOR EACH ROW EXECUTE FUNCTION note_fallback();
+";
+
+/// An assignment computing from a variable not yet assigned reads `NULL`,
+/// so each child is noted as PostgreSQL notes it.
+#[test]
+fn an_assignment_reads_an_unassigned_variable_as_null() {
+    run_found(UNASSIGNED_READ);
+}
+
 mod lock_schema {
     diesel::table! {
         organizations (id) {

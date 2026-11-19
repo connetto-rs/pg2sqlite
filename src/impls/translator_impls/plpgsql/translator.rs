@@ -568,13 +568,14 @@ impl PlPgSqlTranslator {
         }
         let condition = scope.current_condition();
         let mut evaluated = Vec::new();
-        for (name, value) in values {
+        for (name, mut value) in values {
             if !assigned.contains(&name) || !may_raise(&value, options) {
                 continue;
             }
             if let Some(relation) = scope.rewritten_guard_relation(schema) {
                 return Err(rewritten_guard(relation));
             }
+            Self::null_unbound_declarations(&mut value, scope, &bindings);
             let mut statement =
                 Statement::Query(Box::new(single_expr_query(value, Vec::new(), None)));
             if let Some(condition) = &condition {
