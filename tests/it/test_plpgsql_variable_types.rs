@@ -125,3 +125,39 @@ fn an_interval_variable_compares_inside_an_insert_source() {
     assert!(raises(&guarded_script("", declarations, counted, condition, "9 days")));
     assert!(!raises(&guarded_script("", declarations, counted, condition, "8 days")));
 }
+
+/// A `NUMERIC(10,2)` variable stored into a `NUMERIC(10,3)` column keeps its
+/// value, 1.50 reading back as 1.500.
+#[test]
+fn a_numeric_variable_keeps_its_value_in_a_wider_column() {
+    let declarations = "v NUMERIC(10,2) := 1.50;";
+    let statements = "INSERT INTO sink VALUES (1, v);";
+    let condition = "(SELECT amount FROM sink WHERE id = 1) = 1.5";
+    assert!(raises(&guarded_script("", declarations, statements, condition, "1 day")));
+}
+
+/// A `NUMERIC(10,3)` variable assigned to a `NUMERIC(10,2)` column rounds to
+/// the column's scale, 2.125 storing 2.13.
+#[test]
+fn a_numeric_variable_rounds_to_a_narrower_column() {
+    let declarations = "v NUMERIC(10,3) := 2.125;";
+    let statements = "UPDATE t SET amount = v WHERE id = 1;";
+    let condition = "(SELECT amount FROM t WHERE id = 1) = 2.13";
+    assert!(raises(&guarded_script("", declarations, statements, condition, "1 day")));
+}
+
+/// A `NUMERIC(10,3)` variable that takes a `NUMERIC(10,2)` column's 1.50,
+/// by `SELECT INTO` or as its initial value, holds 1.500.
+#[test]
+fn a_numeric_variable_holds_a_narrower_column_value_at_its_own_scale() {
+    let selected = guarded_script(
+        "",
+        "v NUMERIC(10,3);",
+        "SELECT amount INTO v FROM t WHERE id = 1;",
+        "v = 1.5",
+        "1 day",
+    );
+    assert!(raises(&selected));
+    let declarations = "v NUMERIC(10,3) := (SELECT amount FROM t WHERE id = 1);";
+    assert!(raises(&guarded_log(declarations, "v = 1.5", "1 day")));
+}
