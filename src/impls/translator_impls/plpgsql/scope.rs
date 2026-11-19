@@ -303,7 +303,8 @@ pub(crate) struct UuidFirstUse {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct BodyScope {
     /// Each declared name, folded, with the type it is declared with, or
-    /// `None` for a `%TYPE` or `%ROWTYPE` declaration and a helper parameter.
+    /// `None` for a `%ROWTYPE` declaration and a `%TYPE` one naming a
+    /// variable declared without a type.
     declared: BTreeMap<String, Option<DataType>>,
     /// The declared variables of a record or row type, which hold a whole
     /// row.
@@ -392,6 +393,12 @@ impl BodyScope {
     /// Every declared name, folded.
     pub(crate) fn declared(&self) -> impl Iterator<Item = &str> {
         self.declared.keys().map(String::as_str)
+    }
+
+    /// The type `name`, folded, is declared with, or `None` when it is not
+    /// declared or its declaration names no type this reads.
+    pub(crate) fn declared_type(&self, name: &str) -> Option<&DataType> {
+        self.declared.get(name).and_then(Option::as_ref)
     }
 
     /// Binds `binding` for the rest of the body, across `IF` branches.
