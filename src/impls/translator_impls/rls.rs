@@ -2041,6 +2041,32 @@ fn insert_permission_gate(
         })
 }
 
+/// The insert an `INSTEAD OF INSERT` trigger hands `backing`, leaving a column
+/// the view does not hold to the backing table's default.
+///
+/// # Errors
+///
+/// Propagates a default that cannot be translated.
+fn forwarding_insert(
+    backing: &str,
+    columns: &[TriggerColumn],
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Statement, Error> {
+    let written: Vec<&TriggerColumn> =
+        columns.iter().filter(|column| column.is_forwarded()).collect();
+    let values = written
+        .iter()
+        .map(|column| column.forwarded_value().translate_with_warnings(schema, options, emit))
+        .collect::<Result<Vec<_>, Error>>()?;
+    Ok(ast_builder::insert(
+        generated_object_name(backing),
+        written.iter().map(|column| generated_object_name(&column.name)).collect(),
+        ast_builder::values(vec![values]),
+    ))
+}
+
 fn generate_insert_trigger_sql(
     table: &CreateTable,
     schema: &ParserDB,
@@ -2053,15 +2079,6 @@ fn generate_insert_trigger_sql(
     let table_name = ctx.table_name;
     let WriteGuard { columns, check, .. } =
         build_write_guard(&rows, GuardKind::Insert, table, schema, options, Some(grants), emit)?;
-    // A column the view does not hold is left to the backing table's default.
-    let written: Vec<&TriggerColumn> =
-        columns.iter().filter(|column| column.is_forwarded()).collect();
-    let target_columns = written.iter().map(|column| generated_object_name(&column.name)).collect();
-    let values = written
-        .iter()
-        .map(|column| column.forwarded_value().translate_with_warnings(schema, options, emit))
-        .collect::<Result<Vec<_>, Error>>()?;
-
     let guard = if rows.has_no_policy(GatedCommand::Insert, RowVersion::Inserted) {
         Some(ast_builder::raise_statement(
             "ABORT",
@@ -2095,11 +2112,7 @@ fn generate_insert_trigger_sql(
         .chain(guard)
         .collect::<Vec<_>>();
     body.extend(refuse_computed_write_statements(&columns, table_name, GuardKind::Insert));
-    body.push(ast_builder::insert(
-        generated_object_name(&ctx.inner_table_name),
-        target_columns,
-        ast_builder::values(vec![values]),
-    ));
+    body.push(forwarding_insert(&ctx.inner_table_name, &columns, schema, options, emit)?);
     Ok(ast_builder::trigger(
         generated_object_name(&format!("{table_name}_insert_trigger")),
         generated_object_name(table_name),
@@ -2733,20 +2746,9 @@ fn generate_readonly_view_trigger_sql(
         write_guard_condition_expr(None, options),
     );
     let columns = trigger_columns(table, schema, options, Some(grants))?;
-    let written: Vec<&TriggerColumn> =
-        columns.iter().filter(|column| column.is_forwarded()).collect();
-
-    let values = written
-        .iter()
-        .map(|column| column.forwarded_value().translate_with_warnings(schema, options, emit))
-        .collect::<Result<Vec<_>, Error>>()?;
     let mut insert = vec![refusal.clone()];
     insert.extend(refuse_computed_write_statements(&columns, table_name, GuardKind::Insert));
-    insert.push(ast_builder::insert(
-        backing(),
-        written.iter().map(|column| generated_object_name(&column.name)).collect(),
-        ast_builder::values(vec![values]),
-    ));
+    insert.push(forwarding_insert(&ctx.inner_table_name, &columns, schema, options, emit)?);
 
     let mut update = vec![refusal.clone()];
     let mut delete = vec![refusal];
@@ -2763,8 +2765,9 @@ fn generate_readonly_view_trigger_sql(
         update.extend(refuse_computed_write_statements(&columns, table_name, GuardKind::Update));
         update.push(ast_builder::update(
             backing(),
-            written
+            columns
                 .iter()
+                .filter(|column| column.is_forwarded())
                 .map(|column| {
                     Assignment {
                         target: AssignmentTarget::ColumnName(generated_object_name(&column.name)),

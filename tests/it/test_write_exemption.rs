@@ -161,6 +161,14 @@ INSERT INTO kinds (id) VALUES ('sample'), ('device');
 GRANT SELECT ON kinds TO app;
 ";
 
+/// Seeds a table the role reads without its key.
+const HIDDEN_KEY_SCHEMA: &str = "
+CREATE ROLE app NOLOGIN;
+CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL);
+INSERT INTO notes (body) VALUES ('first');
+GRANT SELECT (body) ON notes TO app;
+";
+
 mod schema {
     diesel::table! {
         shared_items (id) {
@@ -269,6 +277,11 @@ mod schema {
     diesel::table! {
         kinds (id) {
             id -> Text,
+        }
+    }
+    diesel::table! {
+        notes (body) {
+            body -> Text,
         }
     }
 }
@@ -860,17 +873,16 @@ fn quoted_exemption_function_name_is_safe() {
         .expect("quoted exemption function runs");
 }
 
-/// Seed rows load under the exemption into tables the role only reads, and the
-/// view forwards exempt writes while refusing the others.
-#[test]
-fn schema_seeds_load_under_exemption_into_read_only_tables() {
+/// The script `sql` translates to under a deployment acting as `app`, loaded
+/// with the exemption on, and the switch that turns it off.
+fn load_exempt(sql: &str) -> (SqliteConnection, Arc<AtomicBool>) {
     let role_options = Pg2SqliteOptions::default()
         .with_deployment(deployment(["app"], []))
         .with_acting_role("app")
         .with_rls_audit_table_name("rls_audit")
         .with_write_exemption_function(WRITE_EXEMPTION_FUNCTION);
     let script = Pg2Sqlite::default()
-        .sql(SEEDED_READ_ONLY_SCHEMA)
+        .sql(sql)
         .expect("parse PostgreSQL")
         .translate(&role_options)
         .expect("translate SQLite");
@@ -889,6 +901,14 @@ fn schema_seeds_load_under_exemption_into_read_only_tables() {
             .execute(&mut connection)
             .unwrap_or_else(|error| panic!("{statement}: {error}"));
     }
+    (connection, exempt)
+}
+
+/// Seed rows load under the exemption into tables the role only reads, and the
+/// view forwards exempt writes while refusing the others.
+#[test]
+fn schema_seeds_load_under_exemption_into_read_only_tables() {
+    let (mut connection, exempt) = load_exempt(SEEDED_READ_ONLY_SCHEMA);
 
     assert_eq!(
         schema::statuses::table
@@ -923,4 +943,29 @@ fn schema_seeds_load_under_exemption_into_read_only_tables() {
         .expect_err("the role only reads kinds");
     assert!(pg2sqlite::prelude::is_policy_refusal(&error.to_string()), "{error}");
     assert_eq!(kinds(&mut connection), ["specimen"]);
+}
+
+/// An exempt update or delete through a view hiding the key is refused, since
+/// the trigger cannot name the backing row.
+#[test]
+fn exempt_writes_through_a_view_hiding_the_key_are_refused() {
+    let (mut connection, _exempt) = load_exempt(HIDDEN_KEY_SCHEMA);
+    let unfound = "cannot update or delete a row of notes";
+
+    let error = diesel::update(schema::notes::table)
+        .set(schema::notes::body.eq("edited"))
+        .execute(&mut connection)
+        .expect_err("the view hides the key");
+    assert!(error.to_string().contains(unfound), "{error}");
+    let error = diesel::delete(schema::notes::table)
+        .execute(&mut connection)
+        .expect_err("the view hides the key");
+    assert!(error.to_string().contains(unfound), "{error}");
+    assert_eq!(
+        schema::notes::table
+            .select(schema::notes::body)
+            .load::<String>(&mut connection)
+            .expect("read notes through the view"),
+        ["first"]
+    );
 }
