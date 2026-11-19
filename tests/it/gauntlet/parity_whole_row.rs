@@ -187,9 +187,11 @@ mod schema {
 type AuditRow = (i32, String, String, Option<String>, Option<String>, Option<String>);
 
 fn options() -> Pg2SqliteOptions {
-    Pg2SqliteOptions::default()
-        .with_uuid_representation(UuidRepresentation::Blob)
-        .with_array_representation(ArrayRepresentation::Json)
+    crate::helpers::jsonb_functions::with_functions(
+        Pg2SqliteOptions::default()
+            .with_uuid_representation(UuidRepresentation::Blob)
+            .with_array_representation(ArrayRepresentation::Json),
+    )
 }
 
 /// Every write, on every table, as one script.

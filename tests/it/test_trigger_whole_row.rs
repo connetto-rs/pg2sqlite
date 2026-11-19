@@ -5,10 +5,12 @@
 
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation};
 
-use crate::helpers::run_translated::run_translated_with;
+use crate::helpers::{jsonb_functions, run_translated::run_translated_with};
 
 fn options() -> Pg2SqliteOptions {
-    Pg2SqliteOptions::default().with_uuid_representation(UuidRepresentation::Text)
+    jsonb_functions::with_functions(
+        Pg2SqliteOptions::default().with_uuid_representation(UuidRepresentation::Text),
+    )
 }
 
 /// A script whose trigger on `r` runs `body` for `event`, ending with `tail`.
@@ -35,8 +37,8 @@ fn refusal(event: &str, condition: &str, body: &str) -> String {
         .to_string()
 }
 
-/// Today's stored text, keys in column order under the stored column name, so
-/// a change to how `jsonb` is stored shows here.
+/// The stored text under the stored column names, `jsonb` in the form
+/// PostgreSQL prints it and `json` with its keys in column order.
 #[test]
 fn a_whole_row_is_stored_as_an_object_over_its_columns() {
     let rows = run_translated_with(
@@ -45,14 +47,14 @@ fn a_whole_row_is_stored_as_an_object_over_its_columns() {
             "",
             "INSERT INTO audit (body, json_body) VALUES (to_jsonb(NEW), row_to_json(NEW));",
             "INSERT INTO r VALUES ('00010203-0405-0607-0809-0a0b0c0d0e0f', 'x', NULL);
-             SELECT body || ' ' || json_body FROM audit;",
+             SELECT body::text || ' ' || json_body::text FROM audit;",
         ),
         &options(),
     );
     assert_eq!(
         rows,
         [Some(
-            r#"{"id":"00010203-0405-0607-0809-0a0b0c0d0e0f","Label":"x","n":null} {"id":"00010203-0405-0607-0809-0a0b0c0d0e0f","Label":"x","n":null}"#
+            r#"{"n": null, "id": "00010203-0405-0607-0809-0a0b0c0d0e0f", "Label": "x"} {"id":"00010203-0405-0607-0809-0a0b0c0d0e0f","Label":"x","n":null}"#
                 .to_owned()
         )]
     );
@@ -74,7 +76,7 @@ fn a_whole_row_the_event_does_not_have_is_null() {
             "",
             "INSERT INTO audit (body, json_body) VALUES (to_jsonb(OLD), row_to_json(OLD));",
             "INSERT INTO r VALUES ('00010203-0405-0607-0809-0a0b0c0d0e0f', 'x', NULL);
-             SELECT coalesce(body, 'none') || coalesce(json_body, 'none') FROM audit;",
+             SELECT coalesce(body::text, 'none') || coalesce(json_body::text, 'none') FROM audit;",
         ),
         &options(),
     );
