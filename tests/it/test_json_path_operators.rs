@@ -24,7 +24,9 @@ const DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, payload JSONB, arr JSONB,
 fn forward(postgres: &str) -> Result<String, pg2sqlite::errors::Error> {
     let statements = Pg2Sqlite::default()
         .sql(&format!("{DDL}{postgres};"))?
-        .translate_to_sql(&Pg2SqliteOptions::default())?
+        .translate_to_sql(&crate::helpers::jsonb_functions::with_functions(
+            Pg2SqliteOptions::default(),
+        ))?
         .into_vec();
     Ok(statements.last().cloned().unwrap_or_default())
 }
@@ -45,8 +47,8 @@ fn value_of(sqlite: &str) -> Option<String> {
     for statement in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT, arr TEXT, enc TEXT)",
         r#"INSERT INTO t VALUES (1,
-            '{"a":{"b":2},"a,b":3,"a b":4,"0":"x","1.5":"half"}',
-            '[10,20,30]', 'hex')"#,
+            pg_jsonb('{"a":{"b":2},"a,b":3,"a b":4,"0":"x","1.5":"half"}'),
+            pg_jsonb('[10,20,30]'), 'hex')"#,
     ] {
         diesel::sql_query(statement).execute(&mut connection).expect("fixture");
     }
@@ -176,7 +178,11 @@ fn the_existence_operators_survive_the_round_trip() {
     ] {
         let emitted = forward(postgres).expect("the operator lowers");
         let back = Pg2Sqlite::default()
-            .reverse_sql(&emitted, &schema, &Pg2SqliteOptions::default())
+            .reverse_sql(
+                &emitted,
+                &schema,
+                &crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
+            )
             .expect("what the crate emitted, it can read back")
             .iter()
             .map(ToString::to_string)

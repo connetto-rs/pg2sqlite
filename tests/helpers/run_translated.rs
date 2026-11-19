@@ -30,7 +30,7 @@ pub fn run_translated_with(pg: &str, options: &Pg2SqliteOptions) -> Vec<Option<S
 /// Panics when translation fails, when an emitted statement will not execute,
 /// or when the script emits nothing.
 pub fn run_translated_default(pg: &str) -> Vec<Option<String>> {
-    run_translated_with(pg, &Pg2SqliteOptions::default())
+    run_translated_with(pg, &super::jsonb_functions::with_functions(Pg2SqliteOptions::default()))
 }
 
 /// [`run_translated_with`] with `params` bound as text to the last

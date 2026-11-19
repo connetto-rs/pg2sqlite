@@ -66,7 +66,7 @@ const WRITTEN: &str = "decode('0102', 'hex'), '\\x0a'::bytea, \
                        '03:04:05+02'::timetz, n * 2, ts + INTERVAL '1 day', (j)";
 
 fn options() -> Pg2SqliteOptions {
-    Pg2SqliteOptions::default()
+    crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default())
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_array_representation(ArrayRepresentation::Json)
 }

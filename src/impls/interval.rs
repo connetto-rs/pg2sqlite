@@ -15,7 +15,7 @@ mod fields_templates;
 pub(crate) mod keys;
 mod keys_templates;
 
-use sql_values::{IntervalError, IntervalTypmod, PgInterval, parse_interval_typmod};
+use sql_values::postgres::{IntervalError, IntervalTypmod, PgInterval, parse_interval_typmod};
 use sqlparser::ast::{DataType, DateTimeField, Expr, IntervalFields};
 
 #[cfg(not(feature = "std"))]
@@ -354,19 +354,19 @@ fn data_type_typmod(
 ) -> Result<IntervalTypmod, Error> {
     let fields = written.map(|fields| {
         match fields {
-            IntervalFields::Year => sql_values::IntervalFields::Year,
-            IntervalFields::Month => sql_values::IntervalFields::Month,
-            IntervalFields::Day => sql_values::IntervalFields::Day,
-            IntervalFields::Hour => sql_values::IntervalFields::Hour,
-            IntervalFields::Minute => sql_values::IntervalFields::Minute,
-            IntervalFields::Second => sql_values::IntervalFields::Second,
-            IntervalFields::YearToMonth => sql_values::IntervalFields::YearToMonth,
-            IntervalFields::DayToHour => sql_values::IntervalFields::DayToHour,
-            IntervalFields::DayToMinute => sql_values::IntervalFields::DayToMinute,
-            IntervalFields::DayToSecond => sql_values::IntervalFields::DayToSecond,
-            IntervalFields::HourToMinute => sql_values::IntervalFields::HourToMinute,
-            IntervalFields::HourToSecond => sql_values::IntervalFields::HourToSecond,
-            IntervalFields::MinuteToSecond => sql_values::IntervalFields::MinuteToSecond,
+            IntervalFields::Year => sql_values::postgres::IntervalFields::Year,
+            IntervalFields::Month => sql_values::postgres::IntervalFields::Month,
+            IntervalFields::Day => sql_values::postgres::IntervalFields::Day,
+            IntervalFields::Hour => sql_values::postgres::IntervalFields::Hour,
+            IntervalFields::Minute => sql_values::postgres::IntervalFields::Minute,
+            IntervalFields::Second => sql_values::postgres::IntervalFields::Second,
+            IntervalFields::YearToMonth => sql_values::postgres::IntervalFields::YearToMonth,
+            IntervalFields::DayToHour => sql_values::postgres::IntervalFields::DayToHour,
+            IntervalFields::DayToMinute => sql_values::postgres::IntervalFields::DayToMinute,
+            IntervalFields::DayToSecond => sql_values::postgres::IntervalFields::DayToSecond,
+            IntervalFields::HourToMinute => sql_values::postgres::IntervalFields::HourToMinute,
+            IntervalFields::HourToSecond => sql_values::postgres::IntervalFields::HourToSecond,
+            IntervalFields::MinuteToSecond => sql_values::postgres::IntervalFields::MinuteToSecond,
         }
     });
     typmod(fields, precision).ok_or_else(|| {
@@ -383,7 +383,7 @@ fn data_type_typmod(
 /// clamped to six, or `None` for a precision after fields not ending in
 /// `SECOND`.
 fn typmod(
-    fields: Option<sql_values::IntervalFields>,
+    fields: Option<sql_values::postgres::IntervalFields>,
     precision: Option<u64>,
 ) -> Option<IntervalTypmod> {
     let precision = precision.map(|precision| u8::try_from(precision).unwrap_or(u8::MAX));
@@ -392,7 +392,7 @@ fn typmod(
 
 /// The typmod an `INTERVAL '…' <fields>` literal's qualifier sets.
 fn qualifier_typmod(interval: &sqlparser::ast::Interval) -> Result<IntervalTypmod, Error> {
-    use sql_values::IntervalFields as Fields;
+    use sql_values::postgres::IntervalFields as Fields;
     let Some(leading) = &interval.leading_field else { return Ok(IntervalTypmod::default()) };
     let fields = match (leading, &interval.last_field) {
         (DateTimeField::Year, None) => Fields::Year,

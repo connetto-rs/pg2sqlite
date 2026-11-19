@@ -1583,9 +1583,9 @@ impl ColumnRewrites {
         }
     }
 
-    /// The value an assignment translates, with PostgreSQL's cast into a
-    /// temporal target column written out where [`temporal_assignment_cast`]
-    /// finds one, and `None` when the value translates as written.
+    /// The value an assignment translates, with PostgreSQL's assignment cast
+    /// written out where [`Self::column_cast`] finds one, and `None` when the
+    /// value translates as written.
     pub(crate) fn assignment_cast(
         &self,
         target: &AssignmentTarget,
@@ -1596,12 +1596,16 @@ impl ColumnRewrites {
         let AssignmentTarget::ColumnName(name) = target else { return Ok(None) };
         let Some(column) = last_ident(name) else { return Ok(None) };
         let Some(context) = context else { return Ok(None) };
-        self.temporal_column_cast(&column.value, value, schema, context)
+        self.column_cast(&column.value, value, schema, context)
     }
 
-    /// [`temporal_assignment_cast`] into `column`, when it is a temporal
-    /// column of this table.
-    pub(crate) fn temporal_column_cast(
+    /// PostgreSQL's assignment cast of `value` into `column` of this table,
+    /// where the replica's text changes with it: [`temporal_assignment_cast`]
+    /// into a temporal column, and [`jsonb::assignment_cast`] into a `jsonb`
+    /// one.
+    ///
+    /// [`jsonb::assignment_cast`]: crate::impls::jsonb::assignment_cast
+    pub(crate) fn column_cast(
         &self,
         column: &str,
         value: &Expr,
@@ -1613,6 +1617,9 @@ impl ColumnRewrites {
         else {
             return Ok(None);
         };
+        if matches!(data_type, DataType::JSONB) {
+            return Ok(crate::impls::jsonb::assignment_cast(value, schema, context));
+        }
         temporal_precision_replay_refusal(value, data_type, context)?;
         Ok(temporal_assignment_cast(value, data_type, schema, context))
     }
@@ -1777,7 +1784,7 @@ pub(crate) fn convert_value_for_column_type(
         return normalize_interval_literal_expr(expr, fields.as_ref(), *precision);
     }
     if matches!(data_type, DataType::JSON | DataType::JSONB) {
-        return check_json_document_literal(data_type, expr);
+        return check_json_document_literal(data_type, expr, options);
     }
     Ok(expr)
 }
@@ -1914,29 +1921,34 @@ pub(crate) fn convert_bytea_hex_literal(expr: Expr) -> Result<Expr, Error> {
     ))
 }
 
-/// Refuses a literal a JSON column cannot hold.
+/// Refuses a literal a JSON column cannot hold, and brings a `jsonb` document
+/// or bound parameter to the text PostgreSQL prints for it.
 ///
-/// PostgreSQL types the value: `INSERT INTO t (j) VALUES (1)` over a `jsonb`
+/// PostgreSQL types the value, so `INSERT INTO t (j) VALUES (1)` over a `jsonb`
 /// column answers `column "j" is of type jsonb but expression is of type
-/// integer`, where the replica's column is `TEXT` and took the number. And a
-/// `jsonb` document carrying `\u0000` is answered `unsupported Unicode escape
-/// sequence`, because the escape has no text form, while the replica stored a
-/// raw NUL byte.
-pub(crate) fn check_json_document_literal(data_type: &DataType, expr: Expr) -> Result<Expr, Error> {
+/// integer`, where the replica's `TEXT` column would take the number.
+pub(crate) fn check_json_document_literal(
+    data_type: &DataType,
+    expr: Expr,
+    options: &Pg2SqliteOptions,
+) -> Result<Expr, Error> {
     let Expr::Value(ValueWithSpan { value, .. }) = &expr else { return Ok(expr) };
     match value {
-        Value::SingleQuotedString(text) => {
-            if matches!(data_type, DataType::JSONB) && text.to_ascii_lowercase().contains("\\u0000")
-            {
-                return Err(Error::forward_refusal(format!(
-                    "the document {text} carries a \\u0000 escape, which PostgreSQL refuses for a \
-                     jsonb column, answering `unsupported Unicode escape sequence`: a NUL has no \
-                     text form there. Remove it, or declare the column json, which does keep it."
-                )));
-            }
-            Ok(expr)
+        Value::SingleQuotedString(text) if matches!(data_type, DataType::JSONB) => {
+            Ok(crate::impls::function_helpers::string_literal(
+                &crate::impls::jsonb::canonical_text(text)?,
+            ))
         }
-        Value::Null | Value::Placeholder(_) => Ok(expr),
+        Value::Placeholder(_) if matches!(data_type, DataType::JSONB) => {
+            let functions =
+                crate::impls::jsonb::functions(options, &format!("the parameter {expr}"))?;
+            Ok(crate::impls::function_helpers::simple_function_expr(
+                &functions.canonical,
+                vec![expr],
+                None,
+            ))
+        }
+        Value::SingleQuotedString(_) | Value::Null | Value::Placeholder(_) => Ok(expr),
         other => {
             Err(Error::forward_refusal(format!(
                 "{other} is not a document a {data_type} column can hold: PostgreSQL answers \

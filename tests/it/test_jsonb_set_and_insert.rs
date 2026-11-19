@@ -26,16 +26,21 @@ use crate::helpers::run_translated as run_translated_helper;
 fn translate(pg: &str) -> Result<Vec<String>, pg2sqlite::errors::Error> {
     Pg2Sqlite::default()
         .sql(pg)?
-        .translate_to_sql(&Pg2SqliteOptions::default())
+        .translate_to_sql(&crate::helpers::jsonb_functions::with_functions(
+            Pg2SqliteOptions::default(),
+        ))
         .map(pg2sqlite::script::Script::into_vec)
 }
 
 /// The document the last statement returns.
 fn run_translated(pg: &str) -> String {
-    run_translated_with(pg, &Pg2SqliteOptions::default())
-        .pop()
-        .expect("the probe should return a row")
-        .expect("the probe should return a document")
+    run_translated_with(
+        pg,
+        &crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
+    )
+    .pop()
+    .expect("the probe should return a row")
+    .expect("the probe should return a document")
 }
 
 fn translate_err(pg: &str) -> String {
@@ -45,7 +50,7 @@ fn translate_err(pg: &str) -> String {
 /// The path becomes JSONPath and the document is updated.
 #[test]
 fn jsonb_set_updates_the_document() {
-    assert_eq!(run_translated("SELECT jsonb_set('{\"a\":1}', '{a}', '2');"), r#"{"a":2}"#);
+    assert_eq!(run_translated("SELECT jsonb_set('{\"a\":1}', '{a}', '2');"), r#"{"a": 2}"#);
 }
 
 /// The value is JSON, not text. Without the `json(...)` wrapper this returns
@@ -61,28 +66,31 @@ fn jsonb_set_keeps_the_value_typed_as_json() {
 fn a_nested_path_is_translated() {
     assert_eq!(
         run_translated("SELECT jsonb_set('{\"a\":{\"b\":1}}', '{a,b}', '2');"),
-        r#"{"a":{"b":2}}"#
+        r#"{"a": {"b": 2}}"#
     );
 }
 
 /// `create_if_missing` defaults to true, so a missing key is added.
 #[test]
 fn jsonb_set_creates_a_missing_key_by_default() {
-    assert_eq!(run_translated("SELECT jsonb_set('{\"a\":1}', '{b}', '2');"), r#"{"a":1,"b":2}"#);
+    assert_eq!(run_translated("SELECT jsonb_set('{\"a\":1}', '{b}', '2');"), r#"{"a": 1, "b": 2}"#);
 }
 
 /// `create_if_missing = false` is `json_replace`, which leaves a missing path
 /// untouched, matching PostgreSQL rather than erroring.
 #[test]
 fn create_if_missing_false_becomes_json_replace() {
-    assert_eq!(run_translated("SELECT jsonb_set('{\"a\":1}', '{b}', '2', false);"), r#"{"a":1}"#);
-    assert_eq!(run_translated("SELECT jsonb_set('{\"a\":1}', '{a}', '2', true);"), r#"{"a":2}"#);
+    assert_eq!(run_translated("SELECT jsonb_set('{\"a\":1}', '{b}', '2', false);"), r#"{"a": 1}"#);
+    assert_eq!(run_translated("SELECT jsonb_set('{\"a\":1}', '{a}', '2', true);"), r#"{"a": 2}"#);
 }
 
 /// `jsonb_insert` adds a key that is absent.
 #[test]
 fn jsonb_insert_adds_a_missing_key() {
-    assert_eq!(run_translated("SELECT jsonb_insert('{\"a\":1}', '{b}', '2');"), r#"{"a":1,"b":2}"#);
+    assert_eq!(
+        run_translated("SELECT jsonb_insert('{\"a\":1}', '{b}', '2');"),
+        r#"{"a": 1, "b": 2}"#
+    );
 }
 
 /// `insert_after` has no SQLite counterpart, so it is refused rather than
@@ -121,6 +129,6 @@ fn a_non_literal_path_is_rejected() {
 fn an_array_literal_path_is_translated() {
     assert_eq!(
         run_translated("SELECT jsonb_set('{\"a\":{\"b\":1}}', ARRAY['a','b'], '2');"),
-        r#"{"a":{"b":2}}"#
+        r#"{"a": {"b": 2}}"#
     );
 }

@@ -9,7 +9,7 @@ use diesel::{
 };
 use pg2sqlite::prelude::{Error, Pg2Sqlite, Pg2SqliteOptions};
 use sql_traits::structs::Deployment;
-use sql_values::{InputContext, PgTimestampTz};
+use sql_values::postgres::{InputContext, PgTimestampTz};
 use sqlparser::ast::Statement;
 
 use super::harness::apply_with_seed;
@@ -279,7 +279,9 @@ mod schema {
 
 /// The instant a `timestamptz` text names, the replica's UTC text written
 /// without an offset included.
-pub(super) fn parse_instant(text: &str) -> Result<PgTimestampTz, sql_values::DateTimeError> {
+pub(super) fn parse_instant(
+    text: &str,
+) -> Result<PgTimestampTz, sql_values::postgres::DateTimeError> {
     if text.get(19..).is_some_and(|tail| tail.contains(['+', '-'])) {
         PgTimestampTz::parse(text, InputContext::new())
     } else {

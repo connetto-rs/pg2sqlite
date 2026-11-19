@@ -12,7 +12,7 @@
 use core::ops::ControlFlow;
 
 use sql_traits::structs::ParserDB;
-use sql_values::{IntervalTypmod, PgInterval};
+use sql_values::postgres::{IntervalTypmod, PgInterval};
 use sqlparser::{
     ast::{BinaryOperator, Expr, Ident, UnaryOperator, Value, ValueWithSpan, VisitMut, VisitorMut},
     dialect::SQLiteDialect,

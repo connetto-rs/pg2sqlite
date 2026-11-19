@@ -8,7 +8,7 @@ use pg2sqlite::prelude::Pg2SqliteOptions;
 use crate::helpers;
 
 fn default_opts() -> Pg2SqliteOptions {
-    Pg2SqliteOptions::default()
+    crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default())
 }
 
 #[test]

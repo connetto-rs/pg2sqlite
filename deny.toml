@@ -11,6 +11,8 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "Unicode-3.0",
     "GPL-3.0",
+    # foldhash, through diesel's WebAssembly SQLite.
+    "Zlib",
 ]
 
 [bans]

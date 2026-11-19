@@ -71,28 +71,51 @@ fn hash_arrow_array_index_path_is_refused() {
     assert_rejected_with("SELECT payload #> '$.a[0]' FROM t", "cannot be converted");
 }
 
-/// Round-trip: the forward direction emits `->` chains for `#>`, and those
-/// chains pass through the reverse translator as valid PostgreSQL.
-#[test]
-fn hash_arrow_round_trip_forward_output_is_valid_postgres() {
-    let sql = format!("{SCHEMA}\nSELECT payload #> '{{a}}' FROM t;");
+/// The PostgreSQL the reverse direction answers for what the forward direction
+/// emits for `select`, parsed as PostgreSQL.
+fn round_trip(select: &str) -> String {
+    let options = crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default());
+    let sql = format!("{SCHEMA}\n{select};");
     let tr = Pg2Sqlite::default().sql(&sql).expect("forward parse");
-    let stmts =
-        tr.clone().translate(&Pg2SqliteOptions::default()).expect("forward translate").into_vec();
+    let stmts = tr.clone().translate(&options).expect("forward translate").into_vec();
     let forward_sqlite = stmts
         .iter()
         .map(ToString::to_string)
         .find(|s| s.contains("SELECT"))
         .expect("a SELECT statement");
-    // The forward direction lowers #> onto arrow chains, not #> itself.
-    assert!(!forward_sqlite.contains("#>"), "forward emits -> chains: {forward_sqlite}");
-    // The reverse direction must accept the forward output and emit valid PG.
     let reversed = tr
-        .reverse_sql(&format!("{forward_sqlite};"), &schema(), &Pg2SqliteOptions::default())
-        .expect("round-trip reverse");
+        .reverse_sql(&format!("{forward_sqlite};"), &schema(), &options)
+        .unwrap_or_else(|error| panic!("round-trip reverse of {forward_sqlite} failed: {error}"));
     let pg = reversed.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ");
     Parser::parse_sql(&PostgreSqlDialect {}, &pg)
         .unwrap_or_else(|e| panic!("round-trip output not valid PostgreSQL: {e}\n{pg}"));
+    pg
+}
+
+/// Round-trip: the forward direction emits `->` chains for `#>`, and those
+/// chains pass through the reverse translator as valid PostgreSQL.
+#[test]
+fn hash_arrow_round_trip_forward_output_is_valid_postgres() {
+    round_trip("SELECT payload #> '{a}' FROM t");
+}
+
+/// The forward direction's collations exist only on the replica, so the
+/// PostgreSQL it reverses to carries none.
+#[test]
+fn jsonb_collations_do_not_reach_postgres() {
+    for select in [
+        "SELECT payload::text FROM t",
+        "SELECT jsonb_build_object('a', 1) FROM t",
+        "SELECT payload::json FROM t",
+        "SELECT jsonb_build_object('a', 1)::text FROM t",
+        "SELECT (payload -> 'a')::text FROM t",
+    ] {
+        let pg = round_trip(select);
+        assert!(!pg.to_uppercase().contains("COLLATE"), "{select} reversed to {pg}");
+    }
+    let pg = rev("SELECT payload COLLATE PG_JSONB_ORDER FROM t").expect("reverse");
+    assert!(!pg.to_uppercase().contains("COLLATE"), "{pg}");
+    assert_rejected_with("SELECT CAST(id AS TEXT) COLLATE BINARY FROM t", "SQLite-only");
 }
 
 // === unixepoch(x) one-argument form: whole seconds ==========================

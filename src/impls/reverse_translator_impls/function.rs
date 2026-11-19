@@ -550,6 +550,14 @@ pub fn reverse_function(
         name if name == options.get_uuid_function_name() => {
             FunctionReversal::Rename("gen_random_uuid".to_string())
         }
+        // The registered jsonb canonicaliser -> CAST(x AS JSONB), which
+        // PostgreSQL brings to the same form on its own.
+        name if options
+            .get_jsonb_functions()
+            .is_some_and(|functions| functions.canonical.eq_ignore_ascii_case(name)) =>
+        {
+            FunctionReversal::ToCastAsJsonb
+        }
         // json(x) -> CAST(x AS JSONB)
         "json" => FunctionReversal::ToCastAsJsonb,
         // json_set(j, '$.path', v) -> jsonb_set(j, '{path}', to_jsonb(v))

@@ -119,8 +119,57 @@ pub(crate) fn declared_default(
         .transpose()
 }
 
+/// `expr` cast to `jsonb`, as PostgreSQL assigns a computed value to a `jsonb`
+/// column, or `None` for a literal, which the column's own conversion reads,
+/// and for any other column.
+fn jsonb_assignment(column: &ColumnDef, expr: &Expr) -> Option<Expr> {
+    (matches!(column.data_type, DataType::JSONB) && !matches!(expr, Expr::Value(_))).then(|| {
+        Expr::Cast {
+            kind: sqlparser::ast::CastKind::Cast,
+            expr: Box::new(expr.clone()),
+            data_type: DataType::JSONB,
+            format: None,
+        }
+    })
+}
+
+/// `option` with its generation expression cast as [`jsonb_assignment`] casts
+/// it, or `None` when it is no generated column or needs no cast.
+fn jsonb_generated(column: &ColumnDef, option: &ColumnOptionDef) -> Option<ColumnOptionDef> {
+    let ColumnOption::Generated {
+        generated_as,
+        sequence_options,
+        generation_expr: Some(expr),
+        generation_expr_mode,
+        generated_keyword,
+    } = &option.option
+    else {
+        return None;
+    };
+    let assigned = jsonb_assignment(column, expr)?;
+    Some(ColumnOptionDef {
+        name: option.name.clone(),
+        option: ColumnOption::Generated {
+            generated_as: *generated_as,
+            sequence_options: sequence_options.clone(),
+            generation_expr: Some(assigned),
+            generation_expr_mode: *generation_expr_mode,
+            generated_keyword: *generated_keyword,
+        },
+    })
+}
+
 /// A declared default in the units the translated column stores.
 fn scaled_default(column: &ColumnDef, expr: &Expr) -> Result<Expr, Error> {
+    if matches!(column.data_type, DataType::JSONB)
+        && let Expr::Value(literal) = expr
+        && let Some(document) = crate::impls::jsonb::document_literal(&literal.value)
+    {
+        return document;
+    }
+    if let Some(assigned) = jsonb_assignment(column, expr) {
+        return Ok(assigned);
+    }
     let Some(scale) = minor_unit_scale(&column.data_type) else {
         if let Some(boolean) = typed_text_literal(&column.data_type, expr)? {
             return Ok(boolean);
@@ -192,6 +241,32 @@ fn round_literal_to_integer(expr: &Expr) -> Option<Expr> {
     Some(Expr::Value(ValueWithSpan {
         value: Value::Number(result, false),
         span: sqlparser::tokenizer::Span::empty(),
+    }))
+}
+
+/// The `COLLATE` a `jsonb` column of `table` declares, comparing its canonical
+/// texts under `jsonb`'s own order, `None` for any other column.
+///
+/// # Errors
+///
+/// Refuses a `jsonb` column when `options` names no `jsonb` functions.
+fn jsonb_collation(
+    column: &ColumnDef,
+    table: &ObjectName,
+    options: &Pg2SqliteOptions,
+) -> Result<Option<ColumnOptionDef>, crate::errors::Error> {
+    if !matches!(column.data_type, DataType::JSONB) {
+        return Ok(None);
+    }
+    let functions = crate::impls::jsonb::functions(
+        options,
+        &format!("the column {}.{}", last_ident_value_or_display(table), column.name.value),
+    )?;
+    Ok(Some(ColumnOptionDef {
+        name: None,
+        option: ColumnOption::Collation(ObjectName::from(vec![Ident::new(
+            functions.collation.as_str(),
+        )])),
     }))
 }
 
@@ -288,7 +363,11 @@ pub(crate) fn translate_column_def(
         .iter()
         .map(|o| {
             let ColumnOption::Default(expr) = &o.option else {
-                return o.translate_with_warnings(schema, options, emit);
+                let generated = jsonb_generated(column, o);
+                return generated
+                    .as_ref()
+                    .unwrap_or(o)
+                    .translate_with_warnings(schema, options, emit);
             };
             let scaled = scaled_default(column, expr)?;
             let default_expr =
@@ -315,6 +394,8 @@ pub(crate) fn translate_column_def(
         .into_iter()
         .flatten()
         .collect();
+
+    translated_options.extend(jsonb_collation(column, table, options)?);
 
     for bound in declared_bound_checks(column, schema, options)? {
         translated_options.push(ColumnOptionDef {
@@ -652,20 +733,19 @@ fn report_column_downgrades(
         });
     }
 
-    // jsonb normalises key order, whitespace, and duplicate keys on write; TEXT
-    // stores verbatim.
+    // A jsonb value is stored as the text PostgreSQL prints for it and compared
+    // under the replica's collation, which orders strings bytewise.
     if matches!(column.data_type, DataType::JSONB) {
         emit(crate::warnings::TranslationWarning::LossyDowngrade {
             construct: "JSONB".to_string(),
             from: "JSONB".to_string(),
             to: "TEXT".to_string(),
             location: location.clone(),
-            reason: "PostgreSQL normalises key order and removes duplicate keys on write; the \
-                     replica stores the value verbatim, so ::text projections and equality \
-                     against a normalised literal diverge. Numbers differ too: SQLite reads a \
-                     JSON number as a double, so 1e400 reads back as inf, a 30-digit integer \
-                     loses its last digits, and 1.50 reads back as 1.5, where the server keeps \
-                     all three exactly."
+            reason: "The replica orders strings inside a jsonb value bytewise, as the C \
+                     collation does, where a server whose default collation is another locale \
+                     orders them by that locale. And ->> answers a number as SQLite's double, so \
+                     1.50 reads back as 1.5 and a 30-digit integer loses its last digits, where \
+                     the server answers the number's text."
                 .to_string(),
         });
     }

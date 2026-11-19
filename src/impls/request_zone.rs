@@ -31,7 +31,7 @@ impl RequestZone {
     ///
     /// Refuses a clock outside PostgreSQL's timestamps.
     pub(crate) fn offset_at(&self, local: &str) -> Result<i64, Error> {
-        use sql_values::{InputContext, PgTimeZone, PgTimestamp, PgTimestampTz};
+        use sql_values::postgres::{InputContext, PgTimeZone, PgTimestamp, PgTimestampTz};
         let name = match self {
             Self::Fixed(offset) => return Ok(i64::from(*offset)),
             Self::Changing(name) => name,

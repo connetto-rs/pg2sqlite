@@ -11,6 +11,7 @@ pub fn apply_fixture(
 ) -> Result<SqliteConnection, Box<dyn std::error::Error>> {
     let translated = Pg2Sqlite::default().sql(sql)?.translate(options)?.into_vec();
     let mut connection = SqliteConnection::establish(":memory:").expect("Failed to connect");
+    crate::helpers::jsonb_functions::register(&mut connection);
     // Vendor pragma the typed DSL cannot express.
     diesel::sql_query("PRAGMA foreign_keys = ON").execute(&mut connection)?;
     for statement in &translated {

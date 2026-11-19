@@ -54,6 +54,9 @@ pub(crate) fn type_name<'e>(
         Expr::Extract { .. } => Some(Cow::Borrowed("numeric")),
         Expr::Function(call) => call_type_name(call, schema, options)?.map(Cow::Owned),
         Expr::BinaryOp { left, op, right } => {
+            if let Some(document) = json_operator_type(left, op, schema, options)? {
+                return Ok(Some(Cow::Borrowed(document)));
+            }
             crate::impls::translator_impls::blob_operator::result_type(
                 left, op, right, schema, options,
             )?
@@ -80,6 +83,30 @@ pub(crate) fn type_name<'e>(
             )?
             .map(Cow::Owned)
         }
+    })
+}
+
+/// The type a JSON path operator answers over a `json` or `jsonb` left
+/// operand: `->` and `#>` answer the operand's own type, and `#-` over `jsonb`
+/// answers `jsonb`. `-` and `||` are typed with the other arithmetic operators,
+/// which read each operand once.
+fn json_operator_type(
+    left: &Expr,
+    op: &BinaryOperator,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<Option<&'static str>, Error> {
+    let path = matches!(op, BinaryOperator::Arrow | BinaryOperator::HashArrow);
+    if !path && !matches!(op, BinaryOperator::HashMinus) {
+        return Ok(None);
+    }
+    let Some(left_type) = type_name(left, schema, options)? else { return Ok(None) };
+    Ok(if left_type.eq_ignore_ascii_case("jsonb") {
+        Some("jsonb")
+    } else if path && left_type.eq_ignore_ascii_case("json") {
+        Some("json")
+    } else {
+        None
     })
 }
 

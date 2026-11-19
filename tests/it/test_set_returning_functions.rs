@@ -24,7 +24,7 @@
 //! `'[{"a":1}]'` both databases answer `{"a":1}` rather than a doubly quoted
 //! string, because SQLite tracks the JSON subtype through `json_each`.
 
-use diesel::{Connection, SqliteConnection, connection::SimpleConnection};
+use diesel::connection::SimpleConnection;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use run_translated_helper::run_translated_with;
 
@@ -35,14 +35,17 @@ const FIXTURE: &str = "CREATE TABLE t (id INT PRIMARY KEY, payload JSONB);
 
 /// Runs `query` against the fixture and returns the first column of every row.
 fn rows(query: &str) -> Vec<Option<String>> {
-    run_translated_with(&format!("{FIXTURE} {query};"), &Pg2SqliteOptions::default())
+    run_translated_with(
+        &format!("{FIXTURE} {query};"),
+        &crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
+    )
 }
 
 fn refuse(query: &str) -> String {
     Pg2Sqlite::default()
         .sql(&format!("{FIXTURE} {query};"))
         .expect("parse")
-        .translate(&Pg2SqliteOptions::default())
+        .translate(&crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()))
         .expect_err("this function has no SQLite table-valued form")
         .to_string()
 }
@@ -53,10 +56,12 @@ fn sqlite_refusal(query: &str) -> String {
     let statements = Pg2Sqlite::default()
         .sql(&format!("{FIXTURE} {query};"))
         .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
+        .translate_to_sql(&crate::helpers::jsonb_functions::with_functions(
+            Pg2SqliteOptions::default(),
+        ))
         .expect("translate")
         .into_vec();
-    let mut connection = SqliteConnection::establish(":memory:").expect("in-memory SQLite");
+    let mut connection = crate::helpers::establish_connection();
     // The translated script is generated text, which no typed query expresses.
     connection
         .batch_execute(&statements.join(";\n"))
@@ -92,8 +97,8 @@ fn generate_series_keeps_its_specific_advice() {
 /// the same escape hatch scalar functions get.
 #[test]
 fn a_declared_function_passes_through() {
-    let options =
-        Pg2SqliteOptions::default().with_user_defined_functions(["some_extension_function"]);
+    let options = crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default())
+        .with_user_defined_functions(["some_extension_function"]);
     let translated = Pg2Sqlite::default()
         .sql(&format!("{FIXTURE} SELECT * FROM some_extension_function(1);"))
         .expect("parse")
@@ -162,7 +167,7 @@ fn each_exposes_only_key_and_value() {
                  INSERT INTO pairs SELECT * FROM json_each('{{\"a\":1}}');
                  SELECT k || '=' || v FROM pairs;"
             ),
-            &Pg2SqliteOptions::default(),
+            &crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
         ),
         vec![Some("a=1".to_string())]
     );

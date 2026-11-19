@@ -21,7 +21,10 @@ use crate::{
             trigger_row::{TriggerRow, TriggerRows},
         },
     },
-    traits::{ArrayRepresentation, SessionVariableMapping, TimeZoneFunctions, UuidRepresentation},
+    traits::{
+        ArrayRepresentation, JsonbFunctions, SessionVariableMapping, TimeZoneFunctions,
+        UuidRepresentation,
+    },
 };
 
 type Role = <ParserDB as DatabaseLike>::Role;
@@ -79,6 +82,10 @@ pub struct Pg2SqliteOptions {
     /// changes. `None` refuses what needs one. Set via
     /// `with_time_zone_functions`.
     time_zone_functions: Option<TimeZoneFunctions>,
+    /// The host-registered SQLite function and collation that canonicalise
+    /// and compare `jsonb`. `None` refuses what needs either. Set via
+    /// `with_jsonb_functions`.
+    jsonb_functions: Option<JsonbFunctions>,
     /// Names of host-registered functions the destination SQLite provides,
     /// stored lower-cased because SQLite resolves function names without
     /// regard to case. A name here passes through instead of being refused as
@@ -139,6 +146,7 @@ impl<'a> arbitrary::Arbitrary<'a> for Pg2SqliteOptions {
             uuid_v7_function_name: Option::<String>::arbitrary(u)?,
             uuid_text_to_blob_function_name: Option::<String>::arbitrary(u)?,
             time_zone_functions: Option::<TimeZoneFunctions>::arbitrary(u)?,
+            jsonb_functions: Option::<JsonbFunctions>::arbitrary(u)?,
             array_representation: Option::<ArrayRepresentation>::arbitrary(u)?,
             rls_table_suffix: String::arbitrary(u)?,
             readonly_deny_trigger_suffix: String::arbitrary(u)?,
@@ -169,6 +177,7 @@ impl Default for Pg2SqliteOptions {
             uuid_v7_function_name: None,
             uuid_text_to_blob_function_name: None,
             time_zone_functions: None,
+            jsonb_functions: None,
             array_representation: None,
             rls_table_suffix: "_rls".to_string(),
             readonly_deny_trigger_suffix: "__readonly".to_string(),
@@ -1112,6 +1121,30 @@ impl Pg2SqliteOptions {
     /// Returns the configured zone functions.
     pub fn get_time_zone_functions(&self) -> Option<&TimeZoneFunctions> {
         self.time_zone_functions.as_ref()
+    }
+
+    #[must_use]
+    /// Names the SQLite function and collation the replica registers for
+    /// `jsonb`.
+    ///
+    /// The replica stores every `jsonb` value as the text PostgreSQL prints
+    /// for it. A literal is brought to that text during translation, while a
+    /// bound parameter, a cast from `text` or `json`, and a value computed by
+    /// a `jsonb` function or operator go through the function at run time.
+    /// PostgreSQL compares `jsonb` by value, so `'1.0'::jsonb = '1'::jsonb`,
+    /// and every comparison, `UNIQUE` constraint, index, `DISTINCT`, `GROUP
+    /// BY` and `ORDER BY` over `jsonb` names the collation. A `jsonb` column,
+    /// and anything else needing either one, is refused without them.
+    /// [`JsonbFunctions`] states what each one answers.
+    pub fn with_jsonb_functions(mut self, functions: JsonbFunctions) -> Self {
+        self.jsonb_functions = Some(functions);
+        self
+    }
+
+    #[must_use]
+    /// Returns the configured `jsonb` function and collation.
+    pub fn get_jsonb_functions(&self) -> Option<&JsonbFunctions> {
+        self.jsonb_functions.as_ref()
     }
 
     #[must_use]

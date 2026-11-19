@@ -213,5 +213,8 @@ fn view_with_chained_json_access_operators() {
 /// Translates `pg` with default options and executes every emitted statement
 /// against an in-memory SQLite connection.
 fn apply_translated_pg(pg: &str) {
-    helpers::execute_all(pg, &Pg2SqliteOptions::default());
+    helpers::execute_all(
+        pg,
+        &crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
+    );
 }

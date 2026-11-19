@@ -486,7 +486,7 @@ const TRANSLATOR_REFUSALS: &[(&str, &str)] = &[
 #[test]
 fn reverse_output_runs_in_postgres() {
     let schema = build_schema();
-    let options = Pg2SqliteOptions::default();
+    let options = crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default());
     let mut conn = fresh_database();
     apply(&mut conn, SCHEMA_DDL).expect("schema applied to fresh database");
 
@@ -650,7 +650,7 @@ fn every_aggregate_the_server_has_reverses() {
     );
 
     let schema = build_schema();
-    let options = Pg2SqliteOptions::default();
+    let options = crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default());
     let refused: Vec<String> = aggregates
         .iter()
         .filter_map(|row| {
@@ -728,7 +728,7 @@ fn every_scalar_the_forward_direction_knows_reverses() {
         .expect("the probe schema parses")
         .build_schema()
         .expect("the probe schema builds");
-    let options = Pg2SqliteOptions::default();
+    let options = crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default());
 
     let mut known = 0usize;
     let mut refused = Vec::new();
@@ -798,10 +798,10 @@ fn a_reversed_session_variable_runs_in_postgres() {
     let mut connection = fresh_database();
     apply(&mut connection, SCHEMA_DDL).expect("schema applied to fresh database");
 
-    let untyped = Pg2SqliteOptions::default()
+    let untyped = crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default())
         .with_session_variable(SessionVariableMapping::new("app.user_id", "app_user_id"))
         .with_deployment(deployment([], [caller("app.user_id", "text")]));
-    let typed = Pg2SqliteOptions::default()
+    let typed = crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default())
         .with_session_variable(SessionVariableMapping::new("app.user_id", "app_user_id"))
         .with_deployment(deployment([], [caller("app.user_id", "uuid")]));
 
@@ -864,7 +864,7 @@ struct MaybeInteger {
 #[test]
 fn the_reverse_of_unicode_agrees_with_sqlite_on_the_empty_string() {
     let schema = build_schema();
-    let options = Pg2SqliteOptions::default();
+    let options = crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default());
     let pg_sql = Pg2Sqlite::default()
         .reverse_sql("SELECT unicode('') AS val", &schema, &options)
         .expect("unicode reverses")
@@ -938,6 +938,7 @@ fn stored_pair(options: &Pg2SqliteOptions) -> (SqliteConnection, PgConnection, P
         .expect("the fixture translates")
         .into_vec();
     let mut sqlite = SqliteConnection::establish(":memory:").expect("SQLite opens");
+    crate::helpers::jsonb_functions::register(&mut sqlite);
     for statement in &replica {
         sql_query(statement).execute(&mut sqlite).expect("the emitted fixture applies");
     }
@@ -955,7 +956,7 @@ fn stored_pair(options: &Pg2SqliteOptions) -> (SqliteConnection, PgConnection, P
 
 /// Options naming both storage representations `stored` needs.
 fn stored_options() -> Pg2SqliteOptions {
-    Pg2SqliteOptions::default()
+    crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default())
         .with_uuid_representation(pg2sqlite::prelude::UuidRepresentation::Blob)
         .with_array_representation(pg2sqlite::prelude::ArrayRepresentation::Json)
 }

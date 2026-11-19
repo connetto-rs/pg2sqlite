@@ -39,7 +39,7 @@ fn postgres_answers() -> Vec<Option<String>> {
 fn json_typeof_answers_the_postgres_vocabulary() {
     let rows = run_translated_with(
         &format!("{TABLE} SELECT json_typeof(v) FROM t ORDER BY id;"),
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
     );
     assert_eq!(rows, postgres_answers());
 }
@@ -48,7 +48,7 @@ fn json_typeof_answers_the_postgres_vocabulary() {
 fn jsonb_typeof_answers_the_same() {
     let rows = run_translated_with(
         &format!("{TABLE} SELECT jsonb_typeof(v) FROM t ORDER BY id;"),
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
     );
     assert_eq!(rows, postgres_answers());
 }
@@ -59,7 +59,7 @@ fn jsonb_typeof_answers_the_same() {
 fn comparing_against_a_postgres_type_name_matches() {
     let rows = run_translated_with(
         &format!("{TABLE} SELECT count(*) FROM t WHERE json_typeof(v) = 'number';"),
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
     );
     assert_eq!(rows, vec![Some("2".to_string())], "the integer and the real are both numbers");
 }
