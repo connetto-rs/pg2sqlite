@@ -141,3 +141,6 @@ mod parity_per_row_checks;
 
 #[path = "gauntlet/parity_trigger_variable_reassignment.rs"]
 mod parity_trigger_variable_reassignment;
+
+#[path = "gauntlet/parity_trigger_unassigned_variables.rs"]
+mod parity_trigger_unassigned_variables;

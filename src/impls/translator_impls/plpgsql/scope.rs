@@ -8,8 +8,8 @@ use sql_traits::{
     traits::{DatabaseLike, ViewLike},
 };
 use sqlparser::ast::{
-    BinaryOperator, CaseWhen, DataType, Expr, Ident, TableFactor, TriggerEvent, Value, Visit,
-    Visitor, helpers::attached_token::AttachedToken, visit_expressions, visit_expressions_mut,
+    BinaryOperator, CaseWhen, DataType, Expr, Ident, TableFactor, TriggerEvent, Visit, Visitor,
+    helpers::attached_token::AttachedToken, visit_expressions, visit_expressions_mut,
 };
 
 use super::translator::bare_identifier;
@@ -344,16 +344,10 @@ impl BodyScope {
         &self.written
     }
 
-    /// Records `name`, folded, as declared with `data_type`, so a read of it
-    /// before any assignment answers `NULL` and a read after one reads the
-    /// type.
+    /// Records `name`, folded, as declared with `data_type`, the type a read
+    /// of it translates as.
     pub(crate) fn declare(&mut self, name: &str, data_type: Option<DataType>) {
         self.declared.insert(name.to_string(), data_type);
-    }
-
-    /// Whether `ident` reads a declared variable.
-    pub(crate) fn is_declared(&self, ident: &Ident) -> bool {
-        self.declared.contains_key(&fold(ident))
     }
 
     /// Whether `name`, folded, is already declared.
@@ -418,24 +412,21 @@ impl BodyScope {
         if !read {
             return;
         }
-        let replacement = match self.scoped.get(name).or_else(|| self.persistent.get(name)) {
-            Some(earlier) => {
-                let value = earlier.value.clone();
-                let held = self.unused_name();
-                if let Some(first_use) = first_use {
-                    self.uuid_first_use.insert(held.clone(), first_use);
-                }
-                // Declared with the variable's type, so a read of the earlier
-                // value translates as a read of the variable does.
-                let data_type = self.declared.get(name).cloned().flatten();
-                self.declared.insert(held.clone(), data_type);
-                self.earlier.insert(held.clone(), name.to_string());
-                self.persistent.insert(held.clone(), Binding { name: held.clone(), value });
-                Expr::Identifier(Ident::new(held))
-            }
-            None if self.declared.contains_key(name) => Expr::Value(Value::Null.with_empty_span()),
-            None => return,
+        let Some(earlier) = self.scoped.get(name).or_else(|| self.persistent.get(name)) else {
+            return;
         };
+        let value = earlier.value.clone();
+        let held = self.unused_name();
+        if let Some(first_use) = first_use {
+            self.uuid_first_use.insert(held.clone(), first_use);
+        }
+        // Declared with the variable's type, so a read of the earlier value
+        // translates as a read of the variable does.
+        let data_type = self.declared.get(name).cloned().flatten();
+        self.declared.insert(held.clone(), data_type);
+        self.earlier.insert(held.clone(), name.to_string());
+        self.persistent.insert(held.clone(), Binding { name: held.clone(), value });
+        let replacement = Expr::Identifier(Ident::new(held));
         binding.value.replace_reads(name, &replacement);
         for other in self.scoped.values_mut().chain(self.persistent.values_mut()) {
             if other.name != name {
