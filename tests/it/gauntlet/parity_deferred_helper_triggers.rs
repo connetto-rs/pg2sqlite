@@ -16,9 +16,7 @@ use postgres_harness::{Outcome, apply, fresh_database};
 use crate::helpers::postgres as postgres_harness;
 
 /// connetto-schema `f276257`'s tables reduced to the columns the guard reads,
-/// with its helpers, bodies and triggers verbatim but for the identifier type
-/// and `FOR UPDATE` in place of `FOR NO KEY UPDATE`, which sqlparser does not
-/// parse.
+/// with its helpers, bodies and triggers verbatim but for the identifier type.
 const SOURCE: &str = "
 CREATE SCHEMA authz_write;
 CREATE TABLE organizations (id TEXT PRIMARY KEY);
@@ -39,7 +37,7 @@ BEGIN
     RAISE EXCEPTION 'organization checks require read committed or serializable' USING ERRCODE = 'invalid_transaction_state';
   END IF;
   PERFORM organization.id FROM public.organizations organization
-    WHERE organization.id = target_organization FOR UPDATE;
+    WHERE organization.id = target_organization FOR NO KEY UPDATE;
   RETURN FOUND;
 END
 $$;
