@@ -56,15 +56,18 @@ use crate::{
         },
         object_name::{
             append_suffix, last_ident, last_ident_value_or_display,
-            normalize_schema_qualified_object_name_for_sqlite, quoted_ident,
-            resolve_declared_table, resolve_translation_table, sqlite_unqualified_object_name,
+            normalize_schema_qualified_object_name_for_sqlite, quoted_ident, reads_column,
+            resolve_declared_table, resolve_translation_table, same_identifier,
+            sqlite_unqualified_object_name,
         },
         placeholder::rewrite_placeholders_for_sqlite,
         privileges::{RoleTable, names_table_with_backing},
         query_builder::plain_table_with_joins,
         translator_impls::{
+            clock_check::{dropped_clock_triggers, split_clock_checks},
             column::translate_column_def,
             condition_injection::inject_condition_into_dml_statement,
+            drop_column_rebuild,
             nulls_not_distinct::{companion_drops, table_companions},
             off_replica::{self, OffReplica, Write},
             rls::{
@@ -89,7 +92,8 @@ fn or_chain(expressions: &[Expr]) -> Option<Expr> {
     }))
 }
 
-fn negate(expr: Expr) -> Expr {
+/// `NOT (expr)`.
+pub(crate) fn negate(expr: Expr) -> Expr {
     Expr::UnaryOp { op: UnaryOperator::Not, expr: Box::new(Expr::Nested(Box::new(expr))) }
 }
 
@@ -502,7 +506,14 @@ fn build_create_table_statements(
     // refused, before the ordinary translation runs.
     let interval_companions =
         crate::impls::interval::ddl::companions(create_table, schema, options)?;
-    let translated_table = create_table.translate_with_warnings(schema, options, emit)?;
+    // A later DROP COLUMN may strip the table as written of a clock check.
+    let written = options.written_schema().unwrap_or(schema);
+    let table_scope =
+        crate::options::table_column_scope(resolve_declared_table(written, create_table)?, written);
+    let scoped = table_scope.as_ref().map(|scope| options.with_scope(scope));
+    let (checked_table, clock_checks) =
+        split_clock_checks(create_table, written, scoped.as_ref().unwrap_or(options), emit)?;
+    let translated_table = checked_table.translate_with_warnings(schema, options, emit)?;
     let emitted_table = match rls_statements {
         Some(_) => rename_table_for_rls(&translated_table, options, schema),
         None => translated_table,
@@ -512,11 +523,14 @@ fn build_create_table_statements(
         &interval_companions,
         &emitted_table.name,
     );
+    let clock_triggers: Vec<Statement> =
+        clock_checks.into_triggers(&emitted_table.name, options).collect();
 
     let mut statements = vec![Statement::CreateTable(emitted_table)];
     statements.extend(rls_statements.into_iter().flatten());
     statements.extend(companions);
     statements.extend(interval_companions);
+    statements.extend(clock_triggers);
     append_vec0_statements_if_needed(&mut statements, create_table, schema, options, emit)?;
     Ok(statements)
 }
@@ -661,12 +675,40 @@ fn translate_alter_table(
     };
 
     let mut statements = Vec::with_capacity(alter_table.operations.len());
-    for operation in &alter_table.operations {
+    for (position, operation) in alter_table.operations.iter().enumerate() {
         let Some(translated) =
             translate_alter_table_operation(operation, alter_table, schema, options, emit)?
         else {
             continue;
         };
+        if let AlterTableOperation::DropColumn { column_names, .. } = operation {
+            let written = options.written_schema().unwrap_or(schema);
+            let mut dependents =
+                dropped_clock_triggers(&alter_table.name, column_names, written, options)?;
+            dependents.extend(dropped_column_indexes(
+                &alter_table.name,
+                column_names,
+                schema,
+                options,
+                emit,
+            )?);
+            // An earlier drop of the same statement may have taken a dependent
+            // already.
+            dependents.retain(|dependent| !statements.contains(dependent));
+            statements.extend(dependents);
+            if let Some(rebuilt) = drop_column_rebuild::rebuild(
+                alter_table,
+                position,
+                column_names,
+                &normalized_name,
+                &statements,
+                schema,
+                options,
+            )? {
+                statements.extend(rebuilt);
+                continue;
+            }
+        }
         // Every field is named rather than spread from the input, so a field
         // added upstream fails to compile here instead of reaching SQLite
         // unexamined. Four of them did exactly that before this was tightened.
@@ -686,6 +728,54 @@ fn translate_alter_table(
     }
 
     Ok(statements)
+}
+
+/// Drops of the indexes of `table` that read one of `columns`, which
+/// PostgreSQL drops along with the column, translated as a `DROP INDEX`.
+fn dropped_column_indexes(
+    table: &ObjectName,
+    columns: &[Ident],
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Vec<Statement>, Error> {
+    let written = options.written_schema().unwrap_or(schema);
+    let Some(stored) = resolve_translation_table(written, table)? else {
+        return Ok(Vec::new());
+    };
+    let names: Vec<ObjectName> = stored
+        .indices(written)?
+        .filter(|index| {
+            let index = index.attribute();
+            columns.iter().any(|column| {
+                index.columns.iter().any(|key| reads_column(&key.column.expr, column))
+                    || index.include.iter().any(|included| same_identifier(included, column))
+                    || index
+                        .predicate
+                        .as_ref()
+                        .is_some_and(|predicate| reads_column(predicate, column))
+            })
+        })
+        .filter_map(|index| index.attribute().name.clone())
+        .collect();
+    let mut drops = Vec::new();
+    // SQLite drops one index per statement.
+    for name in names {
+        drops.extend(
+            Statement::Drop {
+                object_type: ObjectType::Index,
+                if_exists: false,
+                names: vec![name],
+                cascade: false,
+                restrict: false,
+                purge: false,
+                temporary: false,
+                table: None,
+            }
+            .translate_with_warnings(schema, options, emit)?,
+        );
+    }
+    Ok(drops)
 }
 
 /// Refuses the `ALTER TABLE` clauses that cannot reach SQLite, so

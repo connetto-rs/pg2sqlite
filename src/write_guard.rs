@@ -1,10 +1,10 @@
 //! Messages the translated write guards raise when a policy or a role refuses
-//! a write.
+//! a write, or when a row fails a check enforced by a trigger.
 //!
 //! A guard trigger aborts with `RAISE(ABORT, message)`, which SQLite reports as
 //! `SQLITE_CONSTRAINT_TRIGGER` carrying `message` verbatim. Every refusal
 //! message is built here, so [`is_policy_refusal`] recognises exactly the
-//! messages the guards raise.
+//! messages the guards raise for a policy or a role.
 
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
@@ -64,6 +64,12 @@ pub(crate) fn unreadable_key(table: &str, column: &str) -> String {
     format!("{UNREADABLE_KEY}{table}{UNREADABLE_KEY_ROLE}{column}")
 }
 
+/// The refusal for a row of `relation` that fails the check `constraint`,
+/// matching PostgreSQL's wording.
+pub(crate) fn check_violation(relation: &str, constraint: &str) -> String {
+    format!("new row for relation \"{relation}\" violates check constraint \"{constraint}\"")
+}
+
 /// Whether `message` is a refusal raised by a translated write guard.
 ///
 /// A guard refuses a write when its row fails a row-level security predicate,
@@ -74,8 +80,9 @@ pub(crate) fn unreadable_key(table: &str, column: &str) -> String {
 /// surface as an unclassified database error, so the message is what tells a
 /// refusal apart from any other failed write.
 ///
-/// A write that supplies a generated column is refused as well, but for the
-/// schema rather than a policy, so its message is not a policy refusal.
+/// A write that supplies a generated column is refused as well, and so is a
+/// row failing a check a trigger enforces, but for the schema rather than a
+/// policy, so neither message is a policy refusal.
 ///
 /// ```
 /// use pg2sqlite::prelude::is_policy_refusal;

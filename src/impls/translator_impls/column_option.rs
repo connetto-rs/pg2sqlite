@@ -10,7 +10,9 @@ use crate::impls::{
     object_name::append_suffix,
     privileges::names_table_with_backing,
     shared_helpers::match_partial_not_supported_error,
-    translator_impls::{expr::sqlite_collation, off_replica::OffReplica},
+    translator_impls::{
+        clock_check::refuse_clock_check, expr::sqlite_collation, off_replica::OffReplica,
+    },
 };
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
@@ -109,6 +111,7 @@ impl crate::traits::translator::TranslatorWithContext for ColumnOptionDef {
                     );
                     let translated_expr =
                         check.expr.translate_with_warnings(schema, options, emit)?;
+                    refuse_clock_check(&check.expr, &translated_expr)?;
                     Ok(Some(ColumnOptionDef {
                         name: self.name.clone(),
                         option: ColumnOption::Check(sqlparser::ast::CheckConstraint {

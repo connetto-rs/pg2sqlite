@@ -1,12 +1,16 @@
 //! Helpers for structured [`sqlparser::ast::ObjectName`] manipulation.
 
+use core::ops::ControlFlow;
+
 use sql_traits::{
     errors::LookupError,
     structs::{IdentifierCase, ParserDB, TargetName},
     traits::{DatabaseLike, TableLike},
     utils::identifier_resolution::identifiers_match,
 };
-use sqlparser::ast::{CreateTable, Ident, ObjectName, ObjectNamePart, TriggerEvent};
+use sqlparser::ast::{
+    CreateTable, Expr, Ident, ObjectName, ObjectNamePart, TriggerEvent, visit_expressions,
+};
 
 use crate::errors::Error;
 #[cfg(not(feature = "std"))]
@@ -19,6 +23,33 @@ pub(crate) const COLUMN_LOOKUP_CASE: IdentifierCase = IdentifierCase::Folded;
 /// Returns the last identifier segment of an object name.
 pub(crate) fn last_ident(name: &ObjectName) -> Option<&Ident> {
     name.0.last().and_then(ObjectNamePart::as_ident)
+}
+
+/// Whether two written identifiers name the same object, as PostgreSQL folds
+/// them.
+pub(crate) fn same_identifier(left: &Ident, right: &Ident) -> bool {
+    identifiers_match(
+        &left.value,
+        left.quote_style.is_some(),
+        &right.value,
+        right.quote_style.is_some(),
+    )
+}
+
+/// Whether `expr` names `column`, bare or qualified.
+pub(crate) fn reads_column(expr: &Expr, column: &Ident) -> bool {
+    visit_expressions(expr, |node| {
+        match node {
+            Expr::Identifier(ident) if same_identifier(ident, column) => ControlFlow::Break(()),
+            Expr::CompoundIdentifier(parts)
+                if parts.last().is_some_and(|ident| same_identifier(ident, column)) =>
+            {
+                ControlFlow::Break(())
+            }
+            _ => ControlFlow::Continue(()),
+        }
+    })
+    .is_break()
 }
 
 /// The lower-case catalogue name `ident` can name, or `None` when delimiting

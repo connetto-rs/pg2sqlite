@@ -23,9 +23,12 @@ use crate::{
     impls::{
         emitted_namespace::{Source, reject_name_collisions, sourced},
         object_name::last_ident_value_or_display,
+        transaction_blocks::Disposition,
         translator_impls::{
             create_index::{FtsTranslation, analyze_fts_index},
-            deferred_constraint, definer, postgis,
+            deferred_constraint, definer,
+            drop_column_rebuild::{LiveAttachments, StatementHistory},
+            postgis,
             rls::generate_rls_audit_table,
             statement::is_data_movement_statement,
         },
@@ -296,9 +299,30 @@ struct PreparedEpoch {
     schema: ParserDB,
     /// Snapshots taken before each column change inside the epoch, which bind
     /// the references written before that change.
-    bindings: Vec<(usize, ParserDB)>,
+    bindings: Vec<ColumnChange>,
     /// Snapshots taken before each `DROP INDEX`, which still hold its indexes.
     before_index_drops: Vec<(usize, ParserDB)>,
+}
+
+/// A statement changing a table's columns, and the schema before it.
+struct ColumnChange {
+    index: usize,
+    before: ParserDB,
+    /// Whether the statement drops a column, so it was written against the
+    /// schema still holding the column and what hangs off it.
+    drops: bool,
+}
+
+impl ColumnChange {
+    /// Records `statement`, at `index` of the batch, against the schema
+    /// before it.
+    fn new(index: usize, statement: &Statement, before: ParserDB) -> Self {
+        let drops = matches!(statement, Statement::AlterTable(alter_table) if alter_table
+            .operations
+            .iter()
+            .any(|operation| matches!(operation, AlterTableOperation::DropColumn { .. })));
+        Self { index, before, drops }
+    }
 }
 
 impl PreparedEpoch {
@@ -306,16 +330,19 @@ impl PreparedEpoch {
     fn binding(&self, index: usize) -> &ParserDB {
         self.bindings
             .iter()
-            .find(|(change, _)| *change > index)
-            .map_or(&self.schema, |(_, schema)| schema)
+            .find(|change| change.index > index)
+            .map_or(&self.schema, |change| &change.before)
     }
 
     /// The schema statement `index` was written against.
     fn written(&self, index: usize) -> &ParserDB {
-        self.before_index_drops
+        if let Some((_, schema)) = self.before_index_drops.iter().find(|(drop, _)| *drop == index) {
+            return schema;
+        }
+        self.bindings
             .iter()
-            .find(|(drop, _)| *drop == index)
-            .map_or_else(|| self.binding(index), |(_, schema)| schema)
+            .find(|change| change.drops && change.index == index)
+            .map_or_else(|| self.binding(index), |change| &change.before)
     }
 }
 
@@ -755,7 +782,7 @@ impl Pg2Sqlite {
             )?;
             for (index, statement) in statements[start..schema_end].iter().enumerate() {
                 if Self::changes_columns(statement) {
-                    bindings.push((start + index, input.snapshot()));
+                    bindings.push(ColumnChange::new(start + index, statement, input.snapshot()));
                 }
                 if matches!(statement, Statement::Drop { object_type: ObjectType::Index, .. }) {
                     before_index_drops.push((start + index, input.snapshot()));
@@ -827,6 +854,8 @@ impl Pg2Sqlite {
             )?;
         let mut marker_tables =
             crate::impls::translator_impls::reentry::MarkerTables::seeded(initial_schema.as_ref())?;
+        let mut attachments = LiveAttachments::seeded(initial_schema.as_ref())?;
+        let outline = crate::history::transactions::Outline::new(statements, &dispositions);
 
         let mut warnings = Vec::new();
         let mut translated = Vec::with_capacity(statements.len());
@@ -846,31 +875,33 @@ impl Pg2Sqlite {
                 }
                 let mut emit = |warning| warnings.push(warning);
                 match dispositions[epoch.start + offset] {
-                    crate::impls::transaction_blocks::Disposition::DropNoOp {
-                        construct,
-                        reason,
-                    } => {
+                    Disposition::DropNoOp { construct, reason } => {
                         emit(crate::warnings::TranslationWarning::LossyDrop {
                             construct: construct.to_string(),
                             reason: reason.to_string(),
                         });
                         translated.push(Vec::new());
                     }
-                    crate::impls::transaction_blocks::Disposition::Translate => {
-                        let written =
-                            context.with_written_schema(epoch.written(epoch.start + offset));
+                    Disposition::Translate => {
+                        let index = epoch.start + offset;
+                        let written = context.with_written_schema(epoch.written(index));
+                        let written = written.with_history(StatementHistory {
+                            attachments: &attachments,
+                            in_transaction: outline.in_transaction(index),
+                        });
                         let mut emitted = statement.translate_with_warnings(
                             &epoch.schema,
                             &written,
                             &mut emit,
                         )?;
-                        rebuilt_triggers[epoch.start + offset] = trigger_slots.apply(
+                        rebuilt_triggers[index] = trigger_slots.apply(
                             statement,
                             &mut emitted,
                             &epoch.schema,
                             &written,
                         )?;
                         marker_tables.follow(statement, &mut emitted);
+                        attachments.apply(statement, &emitted);
                         translated.push(emitted);
                     }
                 }

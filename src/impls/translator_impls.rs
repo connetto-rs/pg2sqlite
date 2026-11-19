@@ -3,6 +3,7 @@
 
 pub(crate) mod array;
 pub(crate) mod blob_operator;
+pub(crate) mod clock_check;
 pub(crate) mod column;
 pub(crate) mod column_option;
 mod condition_injection;
@@ -13,6 +14,7 @@ mod create_table;
 mod create_trigger;
 mod create_view;
 mod cte;
+pub(crate) mod drop_column_rebuild;
 pub(crate) use cte::unused_cte_name;
 pub(crate) mod data_type;
 pub(crate) mod deferred_constraint;
