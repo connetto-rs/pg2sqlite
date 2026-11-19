@@ -170,3 +170,35 @@ fn a_quoted_variable_name_is_read() {
     let condition = "EXISTS (SELECT 1 FROM sink WHERE id = 9)";
     assert!(raises(&guarded_script("", declarations, statements, condition, "1 day")));
 }
+
+/// A `%TYPE` declaration types the variable as the column it names. `2 days`
+/// sorts after `10 days` as text, and the column on the left of the second
+/// comparison is an interval the translator orders by key.
+#[test]
+fn a_column_type_declaration_orders_as_the_column_type() {
+    let declarations = "v t.d%TYPE := '2 days';";
+    assert!(!raises(&guarded_log(declarations, "v > '10 days'", "9 days")));
+    assert!(raises(&guarded_log(declarations, "v < '10 days'", "9 days")));
+    let declarations = "v t.d%TYPE := '10 days';";
+    let condition = "(SELECT d FROM t WHERE id = 1) > v";
+    assert!(!raises(&guarded_log(declarations, condition, "9 days")));
+    assert!(raises(&guarded_log(declarations, condition, "11 days")));
+}
+
+/// A `%TYPE` declaration of a `NUMERIC(10,2)` column holds minor units, so
+/// 1.50 equals the stored 1.50.
+#[test]
+fn a_column_type_declaration_holds_the_column_scale() {
+    let declarations = "v t.amount%TYPE := 1.50;";
+    let condition = "v = (SELECT amount FROM t WHERE id = 1)";
+    assert!(raises(&guarded_log(declarations, condition, "1 day")));
+}
+
+/// A `%TYPE` declaration naming an earlier variable takes that variable's
+/// type.
+#[test]
+fn a_variable_type_declaration_orders_as_the_variable_type() {
+    let declarations = "w interval; v w%TYPE := '2 days';";
+    assert!(!raises(&guarded_log(declarations, "v > '10 days'", "9 days")));
+    assert!(raises(&guarded_log(declarations, "v < '10 days'", "9 days")));
+}

@@ -4,7 +4,11 @@
 use alloc::collections::BTreeSet;
 use core::ops::ControlFlow;
 
-use sql_traits::{structs::ParserDB, traits::DatabaseLike, utils::normalize_sqlparser_type};
+use sql_traits::{
+    structs::ParserDB,
+    traits::{DatabaseLike, TableLike},
+    utils::normalize_sqlparser_type,
+};
 use sqlparser::ast::{
     BinaryOperator, CaseWhen, CastKind, DataType, Expr, FunctionArg, FunctionArgExpr,
     FunctionArguments, FunctionReturnType, GroupByExpr, Ident, InTarget, ObjectName,
@@ -280,10 +284,7 @@ impl PlPgSqlTranslator {
                             declaration.name
                         )));
                     }
-                    let data_type = match &variable.data_type {
-                        DeclaredType::Data(data_type) => Some(data_type.clone()),
-                        DeclaredType::ColumnType { .. } | DeclaredType::RowType { .. } => None,
-                    };
+                    let data_type = declared_data_type(&variable.data_type, scope, schema)?;
                     scope.declare(&declaration.name, data_type);
                     declared.push(declaration.name.clone());
                     if holds_row(&variable.data_type, schema) {
@@ -2358,6 +2359,57 @@ fn partial_row(name: &str) -> String {
          of a field of a record no branch assigned, which the translation does not reproduce. \
          Assign `{name}` a row in every branch, ELSE included."
     )
+}
+
+/// The type a declaration gives its variable, `%TYPE` read from the column or
+/// the earlier variable it names, or `None` for `%ROWTYPE` and for a `%TYPE`
+/// naming nothing that resolves.
+///
+/// # Errors
+///
+/// Propagates a failure to look the named table up in `schema`.
+fn declared_data_type(
+    declared: &DeclaredType,
+    scope: &BodyScope,
+    schema: &ParserDB,
+) -> Result<Option<DataType>, Error> {
+    let (of, array) = match declared {
+        DeclaredType::Data(data_type) => return Ok(Some(data_type.clone())),
+        DeclaredType::RowType { .. } => return Ok(None),
+        DeclaredType::ColumnType { of, array } => (of, *array),
+    };
+    let mut parts = of.0.iter().map(|part| {
+        match part {
+            ObjectNamePart::Identifier(ident) => Some(ident),
+            ObjectNamePart::Function(_) => None,
+        }
+    });
+    let Some(Some(column)) = parts.next_back() else { return Ok(None) };
+    let Some(relation) = parts.map(|part| part.cloned()).collect::<Option<Vec<Ident>>>() else {
+        return Ok(None);
+    };
+    let element = if relation.is_empty() {
+        scope.declared_type(&fold(column)).cloned()
+    } else {
+        let relation = ObjectName::from(relation);
+        let Some(table) = crate::impls::object_name::resolve_translation_table(schema, &relation)?
+        else {
+            return Ok(None);
+        };
+        table
+            .column(&column.value, schema, crate::impls::object_name::COLUMN_LOOKUP_CASE)?
+            .map(|found| found.attribute().data_type.clone())
+    };
+    Ok(element.map(|element| {
+        if array {
+            DataType::Array(sqlparser::ast::ArrayElemTypeDef::SquareBracket(
+                Box::new(element),
+                None,
+            ))
+        } else {
+            element
+        }
+    }))
 }
 
 /// The identifier a bare name reads, or `None` for anything qualified.
