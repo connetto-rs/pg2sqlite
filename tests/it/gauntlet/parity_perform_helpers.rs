@@ -85,6 +85,17 @@ mod schema {
             parent_id -> Uuid,
         }
     }
+    diesel::table! {
+        rosters (club) {
+            club -> Text,
+        }
+    }
+    diesel::table! {
+        roster_members (club, member) {
+            club -> Text,
+            member -> Text,
+        }
+    }
 }
 
 /// A last-admin check factored as connetto-schema factors it: a `VOID`
@@ -295,7 +306,8 @@ parents_runner!(ParentsPostgres, PgConnection);
 parents_runner!(ParentsSqlite, SqliteConnection);
 
 /// The helper compares the `UUID` its caller passes as the same uuid, so a
-/// parent with a child publishes and one without is refused, on both engines.
+/// parent with a child publishes and one without is refused, and the refusal
+/// prints the parent's uuid as PostgreSQL prints it, on both engines.
 #[test]
 fn a_uuid_argument_reaches_the_helper_as_postgres_passes_it() {
     let with_child = uuid("00000000-0000-7000-8000-000000000001");
@@ -309,11 +321,88 @@ fn a_uuid_argument_reaches_the_helper_as_postgres_passes_it() {
     sqlite.seed(&[with_child, childless], with_child);
 
     for id in [with_child, childless] {
-        let expected = Outcome::of(&postgres.publish(id));
-        assert_eq!(Outcome::of(&sqlite.publish(id)), expected, "publishing {id}");
+        let expected = postgres.publish(id).map_err(|error| error.to_string());
+        assert_eq!(
+            sqlite.publish(id).map_err(|error| error.to_string()),
+            expected,
+            "publishing {id}"
+        );
     }
     assert_eq!(sqlite.published(), postgres.published());
     assert_eq!(postgres.published(), vec![with_child]);
+}
+
+/// A club keeps a member, the check factored into a PL/pgSQL helper taking
+/// the club as `TEXT` and asking a SQL helper whether it has one.
+const ROSTERS: &str = "
+CREATE TABLE rosters (club TEXT PRIMARY KEY);
+CREATE TABLE roster_members (club TEXT NOT NULL REFERENCES rosters (club), member TEXT NOT NULL,
+  PRIMARY KEY (club, member));
+CREATE FUNCTION has_member(target TEXT) RETURNS BOOLEAN LANGUAGE sql STABLE AS $$
+  SELECT EXISTS (SELECT 1 FROM public.roster_members roster WHERE roster.club = target)
+$$;
+CREATE FUNCTION require_member(target TEXT) RETURNS VOID LANGUAGE plpgsql AS $$
+BEGIN
+  IF NOT has_member(target) THEN
+    RAISE EXCEPTION 'club % would lose its last member', target;
+  END IF;
+END
+$$;
+CREATE FUNCTION keep_a_member() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM require_member(OLD.club);
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER roster_members_keep AFTER DELETE ON roster_members
+  FOR EACH ROW EXECUTE FUNCTION keep_a_member();
+";
+
+macro_rules! seed_rosters {
+    ($connection:expr) => {{
+        use self::schema::{roster_members, rosters};
+        diesel::insert_into(rosters::table)
+            .values(rosters::club.eq("chess"))
+            .execute($connection)
+            .expect("seed a club");
+        diesel::insert_into(roster_members::table)
+            .values(&vec![
+                (roster_members::club.eq("chess"), roster_members::member.eq("ada")),
+                (roster_members::club.eq("chess"), roster_members::member.eq("bob")),
+            ])
+            .execute($connection)
+            .expect("seed the members");
+    }};
+}
+
+macro_rules! remove_member {
+    ($connection:expr, $member:expr) => {{
+        use self::schema::roster_members;
+        diesel::delete(roster_members::table.filter(roster_members::member.eq($member)))
+            .execute($connection)
+            .map_err(|error| error.to_string())
+    }};
+}
+
+/// The helper's `TEXT` parameter reaches the SQL helper's cast with its
+/// declared type, so the trigger translates and keeps the last member, on
+/// both engines.
+#[test]
+fn a_text_parameter_reaches_a_sql_helper_as_its_declared_type() {
+    let mut postgres = fresh_database();
+    apply(&mut postgres, ROSTERS).expect("apply the schema on PostgreSQL");
+    let mut sqlite = replica(&translated(ROSTERS, &Pg2SqliteOptions::default()));
+    seed_rosters!(&mut postgres);
+    seed_rosters!(&mut sqlite);
+
+    let expected = ["ada", "bob"].map(|member| remove_member!(&mut postgres, member));
+    let actual = ["ada", "bob"].map(|member| remove_member!(&mut sqlite, member));
+    assert_eq!(actual, expected);
+    assert_eq!(
+        expected[1],
+        Err("club chess would lose its last member".to_owned()),
+        "PostgreSQL keeps bob"
+    );
 }
 
 /// The owner every definer function runs as, past row-level security.
