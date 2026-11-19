@@ -184,6 +184,39 @@ fn a_record_whose_nested_if_condition_reads_a_table_written_before_the_read_is_r
     assert!(message.contains("`rec` reads `audit`, which the body writes"), "{message}");
 }
 
+#[test]
+fn a_whole_record_whose_if_condition_reads_a_table_written_before_the_read_is_refused() {
+    let message = refusal(
+        "UPDATE",
+        "",
+        "DECLARE rec RECORD;
+         BEGIN
+             IF EXISTS (SELECT 1 FROM audit) THEN rec := NEW; ELSE rec := OLD; END IF;
+             INSERT INTO audit (body) VALUES (NULL);
+             INSERT INTO audit (body) VALUES (to_jsonb(rec));
+         END;",
+    );
+    assert!(message.contains("`rec` reads `audit`, which the body writes"), "{message}");
+}
+
+#[test]
+fn a_record_a_nested_if_leaves_unassigned_on_one_path_is_refused() {
+    let message = refusal(
+        "UPDATE",
+        "",
+        "DECLARE rec RECORD;
+         BEGIN
+             IF NEW.n > 0 THEN
+                 IF NEW.n > 1 THEN rec := NEW; END IF;
+             ELSE
+                 rec := OLD;
+             END IF;
+             INSERT INTO audit (body) VALUES (to_jsonb(rec.n));
+         END;",
+    );
+    assert!(message.contains("`rec` holds a row only after some branches"), "{message}");
+}
+
 /// Read before the write, the condition sees the rows PostgreSQL's `IF` saw.
 #[test]
 fn a_record_whose_if_condition_reads_a_table_translates_when_read_before_the_write() {
