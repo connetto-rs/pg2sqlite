@@ -5,8 +5,9 @@
 //! each write is accepted and what the tables hold after.
 
 use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
+use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 use postgres_harness::{Outcome, apply, fresh_database, set_session_user};
+use rosetta_uuid::Uuid;
 
 use crate::helpers::{
     deployment::{UTC_REQUEST_ROLE, caller, deployment},
@@ -66,6 +67,22 @@ mod schema {
         club_log_rls (club, member) {
             club -> Text,
             member -> Text,
+        }
+    }
+    diesel::table! {
+        use diesel::sql_types::*;
+        use rosetta_uuid::diesel_impls::Uuid;
+        parents (id) {
+            id -> Uuid,
+            published -> Bool,
+        }
+    }
+    diesel::table! {
+        use diesel::sql_types::*;
+        use rosetta_uuid::diesel_impls::Uuid;
+        children (id) {
+            id -> Uuid,
+            parent_id -> Uuid,
         }
     }
 }
@@ -201,6 +218,102 @@ fn a_performed_helper_checks_and_returns_as_postgres_does() {
     }
     assert_eq!(sqlite.state(), postgres.state());
     assert_eq!(postgres.state(), (vec!["bob".to_owned()], vec!["ada".to_owned(), "cy".to_owned()]));
+}
+
+/// A parent publishes only once it has a child, the check factored into a
+/// helper taking the parent's `UUID`, which the replica stores as its 16 bytes.
+const PUBLISHED_PARENTS: &str = "
+CREATE TABLE parents (id UUID PRIMARY KEY, published BOOLEAN NOT NULL DEFAULT FALSE);
+CREATE TABLE children (id UUID PRIMARY KEY, parent_id UUID NOT NULL REFERENCES parents (id));
+CREATE FUNCTION require_children(checked_parent_id UUID) RETURNS VOID LANGUAGE plpgsql AS $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM children child WHERE child.parent_id = checked_parent_id) THEN
+    RAISE EXCEPTION 'parent % has no children', checked_parent_id;
+  END IF;
+END
+$$;
+CREATE FUNCTION guard_parent() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.published AND NOT OLD.published THEN
+    PERFORM require_children(NEW.id);
+  END IF;
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER parents_guard BEFORE UPDATE ON parents
+  FOR EACH ROW EXECUTE FUNCTION guard_parent();
+";
+
+fn uuid(text: &str) -> Uuid {
+    text.parse().expect("a uuid")
+}
+
+macro_rules! parents_runner {
+    ($name:ident, $connection:ty) => {
+        struct $name {
+            connection: $connection,
+        }
+
+        impl $name {
+            fn seed(&mut self, parents: &[Uuid], child_of: Uuid) {
+                use self::schema::{children, parents};
+                for id in parents {
+                    diesel::insert_into(parents::table)
+                        .values(parents::id.eq(*id))
+                        .execute(&mut self.connection)
+                        .expect("seed a parent");
+                }
+                diesel::insert_into(children::table)
+                    .values((
+                        children::id.eq(uuid("00000000-0000-7000-8000-0000000000c1")),
+                        children::parent_id.eq(child_of),
+                    ))
+                    .execute(&mut self.connection)
+                    .expect("seed a child");
+            }
+
+            fn publish(&mut self, id: Uuid) -> QueryResult<usize> {
+                use self::schema::parents;
+                diesel::update(parents::table.filter(parents::id.eq(id)))
+                    .set(parents::published.eq(true))
+                    .execute(&mut self.connection)
+            }
+
+            fn published(&mut self) -> Vec<Uuid> {
+                use self::schema::parents;
+                parents::table
+                    .filter(parents::published)
+                    .select(parents::id)
+                    .load(&mut self.connection)
+                    .expect("read the published parents")
+            }
+        }
+    };
+}
+
+parents_runner!(ParentsPostgres, PgConnection);
+parents_runner!(ParentsSqlite, SqliteConnection);
+
+/// The helper compares the `UUID` its caller passes as the same uuid, so a
+/// parent with a child publishes and one without is refused, on both engines.
+#[test]
+fn a_uuid_argument_reaches_the_helper_as_postgres_passes_it() {
+    let with_child = uuid("00000000-0000-7000-8000-000000000001");
+    let childless = uuid("00000000-0000-7000-8000-000000000002");
+    let mut postgres = ParentsPostgres { connection: fresh_database() };
+    apply(&mut postgres.connection, PUBLISHED_PARENTS).expect("apply the schema on PostgreSQL");
+    let options = Pg2SqliteOptions::default().with_uuid_representation(UuidRepresentation::Blob);
+    let mut sqlite =
+        ParentsSqlite { connection: replica(&translated(PUBLISHED_PARENTS, &options)) };
+    postgres.seed(&[with_child, childless], with_child);
+    sqlite.seed(&[with_child, childless], with_child);
+
+    for id in [with_child, childless] {
+        let expected = Outcome::of(&postgres.publish(id));
+        assert_eq!(Outcome::of(&sqlite.publish(id)), expected, "publishing {id}");
+    }
+    assert_eq!(sqlite.published(), postgres.published());
+    assert_eq!(postgres.published(), vec![with_child]);
 }
 
 /// The owner every definer function runs as, past row-level security.

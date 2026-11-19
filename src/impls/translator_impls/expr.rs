@@ -4453,6 +4453,13 @@ impl crate::traits::translator::TranslatorWithContext for Expr {
                         )
                     {
                         let translated = expr.translate_with_warnings(schema, options, emit)?;
+                        // A uuid cast to uuid is the same 16 bytes, which
+                        // the text conversion would read as text.
+                        if crate::impls::translator_impls::json_value::is_uuid_blob(
+                            expr, schema, options,
+                        ) {
+                            return Ok(translated);
+                        }
                         // The literal wrapper validates and canonicalises, and
                         // passes anything else through, so the cast and the
                         // INSERT path accept and refuse exactly the same set.
