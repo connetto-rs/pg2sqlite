@@ -140,26 +140,6 @@ fn distinct_on_refuses_when_order_by_does_not_match() {
     );
 }
 
-// ── Finding 5: bool_and/bool_or advice is NULL-safe ──────────────────────────
-
-#[test]
-fn bool_and_refusal_advice_is_null_safe() {
-    let err = translate_err("CREATE TABLE t (x BOOLEAN); SELECT bool_and(x) FROM t;");
-    assert!(err.contains("bool_and"), "refusal must name the function: {err}");
-    // ELSE 0 turns NULL→0, collapsing NULL inputs to false rather than skipping
-    // them.
-    assert!(!err.contains("ELSE 0"), "advice must not use ELSE 0: {err}");
-    assert!(err.contains("WHEN NOT"), "advice must use WHEN NOT for the false branch: {err}");
-}
-
-#[test]
-fn bool_or_refusal_advice_is_null_safe() {
-    let err = translate_err("CREATE TABLE t (x BOOLEAN); SELECT bool_or(x) FROM t;");
-    assert!(err.contains("bool_or"), "refusal must name the function: {err}");
-    assert!(!err.contains("ELSE 0"), "advice must not use ELSE 0: {err}");
-    assert!(err.contains("WHEN NOT"), "advice must use WHEN NOT for the false branch: {err}");
-}
-
 // ── RANGE frame bounds that are not scaled (shared_helpers.rs other arm) ─────
 
 /// CURRENT ROW hits the `other` arm in translate_window_frame_bound — no

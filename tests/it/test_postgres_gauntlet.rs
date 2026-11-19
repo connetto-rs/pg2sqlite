@@ -132,3 +132,6 @@ mod parity_raise_sqlstate;
 
 #[path = "gauntlet/parity_trigger_if_control_flow.rs"]
 mod parity_trigger_if_control_flow;
+
+#[path = "gauntlet/parity_bool_aggregates.rs"]
+mod parity_bool_aggregates;

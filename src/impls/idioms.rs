@@ -494,6 +494,53 @@ pub(crate) fn nullif_empty_json_object(aggregate: Expr) -> Expr {
     simple_function_expr("NULLIF", vec![aggregate, string_literal("{}")], None)
 }
 
+// ── boolean aggregates ───────────────────────────────────────────────────────
+
+/// `NOT (NOT x)`, the operand `bool_or` lowers onto under `max` and
+/// `bool_and` and `every` under `min`.
+///
+/// The double negation reads `x` once and answers 1, 0 or NULL by SQLite's
+/// truthiness, which is PostgreSQL's for every value a translated boolean
+/// holds, a bare integer column holding 5 included. `max` and `min` then skip
+/// a NULL and answer NULL over no rows, as the PostgreSQL aggregates do.
+#[must_use]
+pub(crate) fn boolean_truthiness(expr: Expr) -> Expr {
+    not_predicate(not_predicate(expr))
+}
+
+/// The PostgreSQL aggregate and its operand when `func` is `max` or `min`
+/// over the [`boolean_truthiness`] shape, or `None` for anything else.
+#[must_use]
+pub(crate) fn boolean_aggregate_operand(func: &Function) -> Option<(&'static str, &Expr)> {
+    let [name] = func.name.0.as_slice() else {
+        return None;
+    };
+    let aggregate = match name.as_ident()?.value.to_ascii_lowercase().as_str() {
+        "max" => "bool_or",
+        "min" => "bool_and",
+        _ => return None,
+    };
+    let FunctionArguments::List(list) = &func.args else {
+        return None;
+    };
+    let [FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))] = list.args.as_slice() else {
+        return None;
+    };
+    let Expr::UnaryOp { op: UnaryOperator::Not, expr: outer } = argument else {
+        return None;
+    };
+    let Expr::Nested(outer) = outer.as_ref() else {
+        return None;
+    };
+    let Expr::UnaryOp { op: UnaryOperator::Not, expr: inner } = outer.as_ref() else {
+        return None;
+    };
+    let Expr::Nested(operand) = inner.as_ref() else {
+        return None;
+    };
+    Some((aggregate, operand))
+}
+
 /// Returns the inner `Function` if `func` matches
 /// `NULLIF(json_group_array(...), '[]')`, the shape
 /// [`nullif_empty_json_array`] builds for `json_agg` and `array_agg`.
@@ -637,6 +684,24 @@ mod tests {
     fn the_ascii_shape_survives_a_parse() {
         let parsed = parse_expr(&ascii_code_point(ident_expr("s")));
         assert_eq!(ascii_code_point_argument(&parsed), Some(&ident_expr("s")));
+    }
+
+    #[test]
+    fn the_boolean_aggregate_shape_round_trips_and_survives_a_parse() {
+        for (extremum, aggregate) in [("max", "bool_or"), ("min", "bool_and")] {
+            let built =
+                simple_function_expr(extremum, vec![boolean_truthiness(ident_expr("flag"))], None);
+            for shape in [built.clone(), parse_expr(&built)] {
+                assert_eq!(
+                    boolean_aggregate_operand(&call_of(shape)),
+                    Some((aggregate, &ident_expr("flag")))
+                );
+            }
+        }
+        // One negation is not the shape.
+        let single = call("max", vec![not_predicate(ident_expr("flag"))]);
+        assert_eq!(boolean_aggregate_operand(&single), None);
+        assert_eq!(boolean_aggregate_operand(&call("max", vec![ident_expr("flag")])), None);
     }
 
     fn parse_expr(built: &Expr) -> Expr {

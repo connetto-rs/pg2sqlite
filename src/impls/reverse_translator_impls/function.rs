@@ -23,8 +23,8 @@ use crate::{
             positional_arity, simple_function_expr, single_quoted_literal, string_literal,
         },
         idioms::{
-            extract_json_group_array_nullif, extract_json_group_object_nullif,
-            is_now_localtime_args,
+            boolean_aggregate_operand, extract_json_group_array_nullif,
+            extract_json_group_object_nullif, is_now_localtime_args,
         },
         session_variable,
         shared_helpers::{
@@ -1051,6 +1051,24 @@ pub fn reverse_translate_function(
             schema,
             options,
         );
+    }
+    // Recognize the forward lowering of bool_or, bool_and and every, since
+    // PostgreSQL has no max or min over a boolean.
+    if let Some((aggregate, operand)) = boolean_aggregate_operand(func) {
+        let mut reversed = build_reverse_function(
+            ObjectName::from(vec![Ident::new(aggregate)]),
+            func,
+            schema,
+            options,
+        )?;
+        if let Expr::Function(Function { args: FunctionArguments::List(list), .. }) = &mut reversed
+            && let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))) =
+                list.args.first_mut()
+        {
+            *argument =
+                crate::prelude::ReverseTranslator::reverse_translate(operand, schema, options)?;
+        }
+        return Ok(reversed);
     }
 
     match reverse_function(&func.name, &func.args, options) {

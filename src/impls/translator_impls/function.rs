@@ -167,6 +167,13 @@ enum FunctionTranslation {
     /// two aggregates are indistinguishable in the emitted SQL without type
     /// information.
     ArrayAgg,
+    /// `bool_or`, `bool_and` and `every`, which SQLite lacks, as `max` or `min`
+    /// over the operand's
+    /// [`boolean_truthiness`](crate::impls::idioms::boolean_truthiness).
+    BooleanAggregate {
+        /// True for `bool_and` and `every`, which take `min`.
+        conjunction: bool,
+    },
     /// `ascii`, which answers 0 for the empty string where SQLite's `unicode`
     /// answers NULL. Lowered onto the
     /// [`ascii_code_point`](crate::impls::idioms::ascii_code_point) shape.
@@ -649,19 +656,10 @@ fn translate_catalog_function(
     }
 
     match original_name {
-    // bool_and / bool_or / every: ELSE 0 turns NULL into 0, collapsing NULL
-    // rows to false. WHEN NOT col THEN 0 with no ELSE lets NULL propagate
-    // through MIN/MAX, matching PostgreSQL's NULL-ignoring aggregate semantics.
-    "bool_and" | "every" => FunctionTranslation::Unsupported(
-        "bool_and/every is not supported in SQLite. \
-         Rewrite as: MIN(CASE WHEN col THEN 1 WHEN NOT col THEN 0 END) = 1"
-            .to_string(),
-    ),
-    "bool_or" => FunctionTranslation::Unsupported(
-        "bool_or is not supported in SQLite. \
-         Rewrite as: MAX(CASE WHEN col THEN 1 WHEN NOT col THEN 0 END) = 1"
-            .to_string(),
-    ),
+    // MAX and MIN over the operand's truthiness skip a NULL and answer NULL
+    // over no rows, as bool_or and bool_and do.
+    "bool_and" | "every" => FunctionTranslation::BooleanAggregate { conjunction: true },
+    "bool_or" => FunctionTranslation::BooleanAggregate { conjunction: false },
     "gen_random_uuid" | "uuid_generate_v4" | "uuidv4" => {
         FunctionTranslation::Rename(options.get_uuid_function_name().to_string())
     }
@@ -2707,6 +2705,29 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                 // without type information, documented in the
                 // reverse arm comment).
                 Ok(crate::impls::idioms::nullif_empty_json_array(aggregate))
+            }
+            FunctionTranslation::BooleanAggregate { conjunction } => {
+                extract_exactly(&func.args, 1, &func.name.to_string())?;
+                let mut args =
+                    translate_function_arguments::<Forward>(&func.args, schema, options, emit)?;
+                if let FunctionArguments::List(list) = &mut args
+                    && let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(operand))) =
+                        list.args.first_mut()
+                {
+                    let read = core::mem::replace(operand, Expr::Value(Value::Null.into()));
+                    *operand = crate::impls::idioms::boolean_truthiness(read);
+                }
+                let mut func = func;
+                let filter = func.filter.take();
+                rebuilt_function(
+                    ObjectName::from(vec![Ident::new(if conjunction { "min" } else { "max" })]),
+                    func,
+                    args,
+                    filter,
+                    schema,
+                    options,
+                    emit,
+                )
             }
             FunctionTranslation::AsciiCodePoint => {
                 let exprs = extract_exactly(&func.args, 1, "ascii")?;

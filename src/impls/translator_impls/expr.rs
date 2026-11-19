@@ -529,6 +529,15 @@ pub(crate) fn is_boolean_by_construction(expr: &Expr) -> bool {
                     | BinaryOperator::Xor
             )
         }
+        Expr::Function(call) => {
+            crate::impls::object_name::last_ident(&call.name).is_some_and(|name| {
+                name.quote_style.is_none()
+                    && matches!(
+                        name.value.to_ascii_lowercase().as_str(),
+                        "bool_or" | "bool_and" | "every"
+                    )
+            })
+        }
         _ => false,
     }
 }
