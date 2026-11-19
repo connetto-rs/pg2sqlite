@@ -1202,7 +1202,7 @@ fn numeric_precision_and_scale_of(
             })
         }
         Expr::Subquery(query) => {
-            // Read in the subquery's own FROM first; scope errors decide nothing.
+            // The subquery's own FROM first, its scope errors deciding nothing.
             if let Ok(Some(found)) = scalar_query_declared(
                 query,
                 schema,
@@ -1666,17 +1666,24 @@ impl ColumnRewrites {
         }
         let held = scale_of(value, schema, context);
         let converts = match number_target(data_type)? {
-            NumberTarget::Scaled(scale) => held.map_or_else(
-                || scale > 0 && matches!(is_integral_expression(value, schema, context), Ok(true)),
-                |held| held != scale,
-            ),
+            NumberTarget::Scaled(scale) => {
+                held.map_or_else(
+                    || {
+                        scale > 0
+                            && matches!(is_integral_expression(value, schema, context), Ok(true))
+                    },
+                    |held| held != scale,
+                )
+            }
             NumberTarget::Unscaled => held.is_some_and(|held| held > 0),
         };
-        converts.then(|| Expr::Cast {
-            kind: CastKind::Cast,
-            expr: Box::new(value.clone()),
-            data_type: data_type.clone(),
-            format: None,
+        converts.then(|| {
+            Expr::Cast {
+                kind: CastKind::Cast,
+                expr: Box::new(value.clone()),
+                data_type: data_type.clone(),
+                format: None,
+            }
         })
     }
 }

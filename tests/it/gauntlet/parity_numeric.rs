@@ -601,7 +601,8 @@ fn numeric_assignments_convert_to_the_column() {
     ];
     for write in writes {
         postgres_harness::apply(&mut pg_conn, write).expect("PG write");
-        // The translated statement is the system under test, so it runs as written.
+        // The translated statement is the system under test, so it runs as
+        // written.
         diesel::sql_query(translate_dml(&base, write))
             .execute(&mut sqlite_conn)
             .unwrap_or_else(|error| panic!("SQLite write failed: {error}\n{write}"));
@@ -626,15 +627,17 @@ fn numeric_assignments_convert_to_the_column() {
             pg_column(&mut pg_conn, "whole").map(|text| to_minor_units(&text, 0)),
             pg_column(&mut pg_conn, "label"),
         );
-        let stored: (Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<String>) =
-            ledger::table
-                .filter(ledger::id.eq(id))
-                .select((ledger::price, ledger::rate, ledger::units, ledger::whole, ledger::label))
-                .get_result(&mut sqlite_conn)
-                .expect("SQLite read");
+        let stored: LedgerRow = ledger::table
+            .filter(ledger::id.eq(id))
+            .select((ledger::price, ledger::rate, ledger::units, ledger::whole, ledger::label))
+            .get_result(&mut sqlite_conn)
+            .expect("SQLite read");
         assert_eq!(stored, expected, "ledger row {id} diverges");
     }
 }
+
+/// A ledger row's price, rate, units and whole as stored, and its label.
+type LedgerRow = (Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<String>);
 
 /// A single nullable text column named `val` in a raw PostgreSQL result.
 #[derive(QueryableByName)]
