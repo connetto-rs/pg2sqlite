@@ -90,15 +90,16 @@ pub enum TranslationWarning {
         /// The first key column the role cannot read.
         column: String,
     },
-    /// A trigger or foreign key left out of the replica because the server
-    /// derives the rows it writes, under
+    /// A trigger, a write statement of a trigger, or a foreign key left out
+    /// of the replica because the server derives the rows it writes, under
     /// [`Pg2SqliteOptions::with_server_derived_writes_omitted`](crate::options::Pg2SqliteOptions::with_server_derived_writes_omitted).
     ///
     /// The replica writes none of those rows, so a write the application makes
     /// on the replica that relies on one of them sees it only once the
     /// server's changes arrive.
     LeftToServer {
-        /// `"TRIGGER"` or `"FOREIGN KEY"`.
+        /// `"TRIGGER"`, `"FOREIGN KEY"`, or the statement a kept trigger runs
+        /// without, as `"INSERT in TRIGGER"`.
         construct: String,
         /// The trigger's name, or the foreign key's. A foreign key declared
         /// without a name is named by its columns and the table it
@@ -106,7 +107,8 @@ pub enum TranslationWarning {
         name: String,
         /// The table the trigger fires on or the foreign key is declared on.
         table: String,
-        /// The write the server derives.
+        /// The write the server derives, or what a trigger left out whole
+        /// reads of it.
         reason: String,
     },
 }
