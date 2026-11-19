@@ -633,11 +633,10 @@ fn row_number_expr(partition_by: Vec<Expr>, order_by: Vec<OrderByExpr>) -> Expr 
     )
 }
 
-/// Wraps `inner` in the derived-table row number filter that stands in for
-/// `DISTINCT ON`. `inner` must project exactly `aliases`, in that order.
+/// Wraps `inner` in a row number filter exposing only `aliases`.
 ///
-/// The reverse direction rebuilds this shape from a parsed query and compares
-/// the result with what it parsed, so the two directions cannot drift apart.
+/// The reverse direction rebuilds this shape and compares it with what it
+/// parsed, so the two directions cannot drift apart.
 pub(crate) fn distinct_on_window_select(
     mut inner: Select,
     aliases: &[Ident],
@@ -774,36 +773,22 @@ fn try_translate_distinct_on_query(
         ensure_distinct_on_projection_is_rewriteable(&translated_inner.projection)?;
     let projection_aliases = projection_aliases(&translated_inner.projection)?;
 
-    let mut partition_by = Vec::with_capacity(distinct_on_exprs.len());
-    for expr in distinct_on_exprs {
-        partition_by.push(crate::impls::interval::keys::position_key(
-            expr,
-            None,
-            false,
-            args.schema,
-            args.options,
-            emit,
-        )?);
-    }
+    let partition_by = distinct_on_exprs
+        .iter()
+        .map(|expression| {
+            crate::impls::interval::keys::position_key(
+                expression,
+                Some(&select.projection),
+                false,
+                args.schema,
+                args.options,
+                emit,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
-    // Two separate corrections, because the two ORDER BY positions see
-    // different scopes and each was wrong in its own way.
-    //
-    // The window sits INSIDE the derived table, where the source table's
-    // columns are in scope, so it keeps every operand. What it cannot carry
-    // is an output alias: a column alias is invisible inside `OVER`, and
-    // SQLite answers `no such column`. So each operand is resolved back to
-    // the expression the projection aliased.
-    //
-    // The outer ORDER BY sees only what the derived table projects. PostgreSQL
-    // requires the DISTINCT ON expressions to be the leftmost ORDER BY
-    // operands, verified on 16, which rejects `DISTINCT ON (sensor) ...
-    // ORDER BY value`. So once one row per partition survives, those
-    // leading operands already order the result totally and every operand
-    // after them is unobservable. Dropping them is therefore exact rather
-    // than a compromise, and it avoids projecting helper columns, which
-    // would break the reverse direction: it rebuilds this
-    // shape and compares it with what it parsed.
+    // A column alias is invisible inside `OVER`, so each window operand reads
+    // the aliased expression.
     let window_order = match args.order_by.as_ref() {
         Some(ob) => {
             match &ob.kind {
@@ -844,10 +829,8 @@ fn try_translate_distinct_on_query(
 
     let outer_order_by =
         truncate_order_by_to_partition(args.order_by.clone(), distinct_on_exprs.len());
-    // Outer scope sees only the derived table's aliases; original names are not
-    // in scope.
     let outer_order_by =
-        remap_outer_order_by_to_aliases(outer_order_by, &translated_inner.projection);
+        remap_outer_order_by_to_aliases(outer_order_by, &mut translated_inner.projection);
 
     let outer_select = distinct_on_window_select(
         translated_inner,
@@ -923,28 +906,36 @@ fn alias_for_expr_in_projection(expr: &Expr, projection: &[SelectItem]) -> Optio
     })
 }
 
-/// Replaces each ORDER BY expression, or the operand of the `CASE` an enum
-/// orders by, with its projected alias.
-///
-/// The outer query of a DISTINCT ON rewrite sees only the derived table's
-/// aliases; original column names are out of scope.
+/// Exposes each outer ordering expression through a derived-table output.
 fn remap_outer_order_by_to_aliases(
     order_by: Option<OrderBy>,
-    projection: &[SelectItem],
+    projection: &mut Vec<SelectItem>,
 ) -> Option<OrderBy> {
-    let mut ob = order_by?;
-    if let OrderByKind::Expressions(exprs) = &mut ob.kind {
-        for item in exprs.iter_mut() {
-            if let Some(alias) = alias_for_expr_in_projection(&item.expr, projection) {
-                item.expr = Expr::Identifier(alias);
-            } else if let Expr::Case { operand: Some(operand), .. } = &mut item.expr
-                && let Some(alias) = alias_for_expr_in_projection(operand, projection)
-            {
-                **operand = Expr::Identifier(alias);
-            }
+    let mut order_by = order_by?;
+    if let OrderByKind::Expressions(expressions) = &mut order_by.kind {
+        for item in expressions {
+            let alias = alias_for_expr_in_projection(&item.expr, projection).unwrap_or_else(|| {
+                let mut suffix = projection.len();
+                let alias = loop {
+                    let candidate = Ident::new(format!("__pg2sqlite_order_{suffix}"));
+                    if !projection.iter().any(|projected| {
+                        matches!(projected, SelectItem::ExprWithAlias { alias, .. }
+                            if alias.value.eq_ignore_ascii_case(&candidate.value))
+                    }) {
+                        break candidate;
+                    }
+                    suffix += 1;
+                };
+                projection.push(SelectItem::ExprWithAlias {
+                    expr: core::mem::replace(&mut item.expr, null_literal()),
+                    alias: alias.clone(),
+                });
+                alias
+            });
+            item.expr = Expr::Identifier(alias);
         }
     }
-    Some(ob)
+    Some(order_by)
 }
 
 #[derive(Clone, Copy)]
