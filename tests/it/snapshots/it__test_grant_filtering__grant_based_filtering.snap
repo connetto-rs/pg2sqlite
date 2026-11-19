@@ -7,6 +7,9 @@ PRAGMA case_sensitive_like = 1
 CREATE TABLE IF NOT EXISTS rls_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, table_name TEXT NOT NULL, violation_type TEXT NOT NULL, row_identifier TEXT NOT NULL, policy_name TEXT, detected_at TEXT NOT NULL, severity TEXT NOT NULL, details TEXT, reported_at TEXT) STRICT
 CREATE TABLE users_rls (id BLOB PRIMARY KEY CHECK (length(id) = 16) NOT NULL, username TEXT NOT NULL UNIQUE, email TEXT NOT NULL) STRICT
 CREATE VIEW users AS SELECT id, username, email FROM users_rls
+CREATE TRIGGER users_insert_trigger INSTEAD OF INSERT ON users FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'permission denied: users is read-only for this role') WHERE ("write_is_exempt"()) IS NOT TRUE; INSERT INTO users_rls (id, username, email) VALUES (NEW.id, NEW.username, NEW.email); END
+CREATE TRIGGER users_update_trigger INSTEAD OF UPDATE ON users FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'permission denied: users is read-only for this role') WHERE ("write_is_exempt"()) IS NOT TRUE; UPDATE users_rls SET id = NEW.id, username = NEW.username, email = NEW.email WHERE id = OLD.id; END
+CREATE TRIGGER users_delete_trigger INSTEAD OF DELETE ON users FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'permission denied: users is read-only for this role') WHERE ("write_is_exempt"()) IS NOT TRUE; DELETE FROM users_rls WHERE id = OLD.id; END
 CREATE TRIGGER users_rls_insert_check BEFORE INSERT ON users_rls FOR EACH ROW WHEN ("write_is_exempt"()) IS NOT TRUE BEGIN SELECT RAISE(ABORT, 'permission denied: users is read-only for this role'); END
 CREATE TRIGGER users_rls_update_check BEFORE UPDATE ON users_rls FOR EACH ROW WHEN ("write_is_exempt"()) IS NOT TRUE BEGIN SELECT RAISE(ABORT, 'permission denied: users is read-only for this role'); END
 CREATE TRIGGER users_rls_delete_check BEFORE DELETE ON users_rls FOR EACH ROW WHEN ("write_is_exempt"()) IS NOT TRUE BEGIN SELECT RAISE(ABORT, 'permission denied: users is read-only for this role'); END
