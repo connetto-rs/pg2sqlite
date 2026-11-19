@@ -78,6 +78,7 @@ fn maintenance_chain(
         table: crate::impls::object_name::last_ident(&trigger.table_name)
             .map(|ident| ident.value.clone()),
         maintenance_refusal: None,
+        after: matches!(trigger.period, Some(TriggerPeriod::After)),
     };
     let mut assigned: Vec<(String, Expr)> = Vec::new();
     for (col, raw) in trigger.maintenance_assignments(schema)? {
@@ -268,9 +269,8 @@ struct TriggerPart<'a> {
     events: &'a [TriggerEvent],
     /// A `WHEN` condition moved into the body, guarding every statement.
     guard: Option<&'a Expr>,
-    /// Whether the body ends at its first top-level `RETURN`, whose value
-    /// PostgreSQL ignores after the write and whose `RAISE(IGNORE)` would
-    /// abandon the row's later SQLite trigger programs.
+    /// Whether the trigger fires after the write, where PostgreSQL ignores
+    /// the row the body returns.
     after: bool,
 }
 
@@ -289,18 +289,12 @@ fn generate_standard_trigger_body(
 ) -> Result<Option<sqlparser::ast::BeginEndStatements>, crate::errors::Error> {
     let function_name = &exec_body.func_desc.name;
     let Some(stored) = schema.function_body(function_name)? else { return Ok(None) };
-    let mut body = options.rebound_body().unwrap_or(&stored).clone();
-    if part.after
-        && let Some(end) = body.statements.iter().position(|node| {
-            matches!(node.kind, sqlparser_plpgsql::embedded::NodeKind::Return { .. })
-        })
-    {
-        body.statements.truncate(end);
-    }
+    let body = options.rebound_body().map_or(stored, Clone::clone);
     let facts = super::plpgsql::TriggerFacts {
         events: part.events.to_vec(),
         table: crate::impls::object_name::last_ident(table_name).map(|ident| ident.value.clone()),
         maintenance_refusal: refusal.map(|refusal| (function_name.to_string(), refusal.clone())),
+        after: part.after,
     };
     // A definer body's calls run as its owner, whose privileges they need.
     let owner = crate::traits::schema::written_function(schema, function_name)?
@@ -313,7 +307,7 @@ fn generate_standard_trigger_body(
     let body_options = running_as.as_ref().unwrap_or(options).with_trigger_events(part.events);
     let translated = super::plpgsql::PlPgSqlTranslator::translate_body(
         &function_name.to_string(),
-        &body,
+        body,
         facts,
         part.guard,
         schema,
@@ -704,19 +698,6 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
                     exec_body.func_desc.name
                 )));
             };
-            if plain
-                && shares_slot
-                && matches!(period, Some(TriggerPeriod::After))
-                && function_body.statements.iter().any(super::definer::ignores_the_write)
-            {
-                return Err(crate::errors::Error::forward_refusal(format!(
-                    "row trigger `{}` returns early from an AFTER trigger function under a \
-                     condition, and another row trigger on table `{}` fires on the same event. \
-                     SQLite can only end the shared trigger, which would skip the triggers \
-                     PostgreSQL fires after it.",
-                    self.name, self.table_name
-                )));
-            }
             // SQLite rejects an empty BEGIN END, and dropping the trigger would
             // orphan a later DROP TRIGGER.
             let function_body = substitute_no_op_body_when_empty(function_body, emit);

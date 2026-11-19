@@ -256,7 +256,7 @@ pub(crate) fn backing_name(
 
 /// Whether `statement` can raise `RAISE(IGNORE)`, which ends the trigger and
 /// keeps what it wrote.
-pub(crate) fn ignores_the_write(statement: &Statement) -> bool {
+fn ignores_the_write(statement: &Statement) -> bool {
     visit_expressions(statement, |expr| {
         if let Expr::Function(function) = expr
             && function

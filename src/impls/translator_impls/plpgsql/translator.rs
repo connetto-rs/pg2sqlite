@@ -9,7 +9,7 @@ use sqlparser::ast::{
     BinaryOperator, CaseWhen, CastKind, DataType, Expr, FunctionArg, FunctionArgExpr,
     FunctionArguments, FunctionReturnType, GroupByExpr, Ident, InTarget, ObjectName,
     ObjectNamePart, Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor,
-    TableWithJoins, UnaryOperator, Value, Visit, VisitMut, Visitor, VisitorMut,
+    TableWithJoins, Value, Visit, VisitMut, Visitor, VisitorMut,
     helpers::attached_token::AttachedToken, visit_expressions, visit_expressions_mut,
 };
 use sqlparser_plpgsql::embedded::{
@@ -17,8 +17,10 @@ use sqlparser_plpgsql::embedded::{
 };
 
 use super::{
+    callee::substitute,
     cte_builder::CteBuilder,
     raise::raise_statement,
+    returns::without_early_returns,
     scope::{Binding, BodyScope, BoundValue, RowValue, TriggerFacts, expand_relation, fold},
 };
 #[cfg(not(feature = "std"))]
@@ -160,14 +162,15 @@ fn rewritten_guard(relation: &str) -> Error {
 impl PlPgSqlTranslator {
     /// Translates the body `block` of the trigger function `function` for the
     /// trigger `facts` describes, every statement guarded by `guard`, a
-    /// `WHEN` condition moved into the body, when there is one.
+    /// `WHEN` condition moved into the body, when there is one. What follows
+    /// a `RETURN` runs only on the paths that do not reach it.
     ///
     /// # Errors
     /// Returns an error when the body holds anything a SQLite trigger body
     /// cannot run.
     pub(crate) fn translate_body(
         function: &str,
-        block: &Block,
+        mut block: Block,
         facts: TriggerFacts,
         guard: Option<&Expr>,
         schema: &ParserDB,
@@ -175,7 +178,8 @@ impl PlPgSqlTranslator {
         emit: crate::warnings::WarningSink<'_>,
     ) -> Result<Vec<Statement>, Error> {
         let mut scope = BodyScope::new(facts);
-        Self::open_body(block, &mut scope, options)?;
+        Self::open_body(&block, &mut scope, options)?;
+        block.statements = without_early_returns(core::mem::take(&mut block.statements));
 
         if let Some(guard) = guard {
             let folded = Self::fold_trigger_specials_in(guard.clone(), &scope.facts)?;
@@ -184,7 +188,8 @@ impl PlPgSqlTranslator {
             scope.push_condition(translated);
         }
 
-        let mut result = Self::translate_block(function, block, &mut scope, schema, options, emit)?;
+        let mut result =
+            Self::translate_block(function, &block, &mut scope, schema, options, emit)?;
         for statement in &mut result {
             let _: ControlFlow<()> = VisitMut::visit(statement, &mut UnreadCtePruner);
         }
@@ -234,6 +239,7 @@ impl PlPgSqlTranslator {
     }
 
     /// Translates `block`, its declarations then its statements, in `scope`.
+    /// What the block declares goes out of scope where it ends.
     pub(super) fn translate_block(
         function: &str,
         block: &Block,
@@ -251,14 +257,16 @@ impl PlPgSqlTranslator {
             )));
         }
         let mut result = Vec::new();
+        let mut declared = Vec::new();
         for declaration in &block.declarations {
             match &declaration.kind {
                 DeclarationKind::Variable(variable) => {
                     if scope.declares(&declaration.name) {
                         return Err(Error::forward_refusal(format!(
-                            "the block declares `{}` again over a variable of the same name, and \
-                             the emitted trigger has one name space for the whole body. Rename \
-                             the inner variable.",
+                            "the block declares `{}` again over a variable of the same name still \
+                             in scope, and the translation reads a variable by its name wherever \
+                             the body uses it, so it cannot tell the two apart. Rename the inner \
+                             variable.",
                             declaration.name
                         )));
                     }
@@ -267,6 +275,7 @@ impl PlPgSqlTranslator {
                         DeclaredType::ColumnType { .. } | DeclaredType::RowType { .. } => None,
                     };
                     scope.declare(&declaration.name, data_type);
+                    declared.push(declaration.name.clone());
                     if let Some(default) = &variable.default {
                         // PostgreSQL computes each default as the block is
                         // entered, in the order the block declares them.
@@ -304,7 +313,83 @@ impl PlPgSqlTranslator {
         for node in &block.statements {
             result.extend(Self::translate_node(function, node, scope, schema, options, emit)?);
         }
+        Self::close_block(scope, &declared);
         Ok(result)
+    }
+
+    /// Takes the variables `declared` out of `scope` where the block that
+    /// declared them ends. A binding that outlives them, such as an outer
+    /// variable assigned under a condition reading one, reads the value each
+    /// held at the end, `NULL` for one never assigned, since it is translated
+    /// where it is read and the name is gone by then.
+    fn close_block(scope: &mut BodyScope, declared: &[String]) {
+        if declared.is_empty() {
+            return;
+        }
+        let ending: Vec<Binding> = declared
+            .iter()
+            .map(|name| {
+                scope.bindings().find(|binding| binding.name == *name).cloned().unwrap_or_else(
+                    || {
+                        Binding {
+                            name: name.clone(),
+                            value: BoundValue::Expr(Expr::Value(Value::Null.with_empty_span())),
+                        }
+                    },
+                )
+            })
+            .collect();
+        let mut values: Vec<(String, BoundValue)> = Vec::with_capacity(ending.len());
+        for binding in Self::order_bindings_by_dependency(&ending) {
+            let mut value = binding.value.clone();
+            Self::substitute_bound(&mut value, &values);
+            values.push((binding.name.clone(), value));
+        }
+        // A read of an ending variable left in one of these values, its own
+        // or one in a cycle, has no binding once the block ends, and reads
+        // `NULL` as a variable with no value does.
+        for (_, value) in &mut values {
+            Self::for_each_bound_expr_mut(value, &mut |expr| {
+                let _: ControlFlow<()> = visit_expressions_mut(expr, |expr| {
+                    if bare_identifier(expr).is_some_and(|ident| declared.contains(&fold(ident))) {
+                        *expr = Expr::Value(Value::Null.with_empty_span());
+                    }
+                    ControlFlow::Continue(())
+                });
+            });
+        }
+        for name in declared {
+            scope.forget(name);
+        }
+        for binding in scope.bindings_mut() {
+            Self::substitute_bound(&mut binding.value, &values);
+        }
+    }
+
+    /// Substitutes `values` into every expression `value` holds, leaving it
+    /// unreadable with the reason when one cannot take them.
+    fn substitute_bound(value: &mut BoundValue, values: &[(String, BoundValue)]) {
+        let mut failure = None;
+        Self::for_each_bound_expr_mut(value, &mut |expr| {
+            if failure.is_none()
+                && let Err(reason) = substitute(expr, values)
+            {
+                failure = Some(reason);
+            }
+        });
+        if let Some(reason) = failure {
+            *value = BoundValue::Unreadable(reason.to_string());
+        }
+    }
+
+    /// Calls `visit` on every expression `value` holds, the conditions
+    /// choosing a row included.
+    fn for_each_bound_expr_mut(value: &mut BoundValue, visit: &mut impl FnMut(&mut Expr)) {
+        match value {
+            BoundValue::Expr(expr) => visit(expr),
+            BoundValue::Row(row) => row.for_each_condition_mut(visit),
+            BoundValue::Unreadable(_) => {}
+        }
     }
 
     /// Translates one node of a body, refusing what a SQLite trigger cannot
@@ -697,10 +782,13 @@ impl PlPgSqlTranslator {
         BoundValue::Expr(Expr::Exists { subquery: Box::new(probe), negated: false })
     }
 
-    /// Translates a `RETURN` in a trigger body.
+    /// Translates a `RETURN` in a trigger body, which ends its path through
+    /// the body, as nothing follows it once the body is rewritten.
     ///
-    /// `RETURN NULL` cancels the write, which SQLite spells `SELECT
-    /// RAISE(IGNORE)`, and `RETURN NEW` or `OLD` proceeds with it unchanged.
+    /// PostgreSQL ignores the row an AFTER trigger returns, so there it is
+    /// nothing. In a BEFORE trigger, `RETURN NULL` cancels the write, which
+    /// SQLite spells `SELECT RAISE(IGNORE)`, and `RETURN NEW` or `OLD`
+    /// proceeds with it unchanged.
     fn translate_return(
         value: Option<&Query>,
         scope: &BodyScope,
@@ -708,6 +796,9 @@ impl PlPgSqlTranslator {
         options: &crate::options::TranslationContext<'_>,
         emit: crate::warnings::WarningSink<'_>,
     ) -> Result<Vec<Statement>, Error> {
+        if scope.facts.after {
+            return Ok(Vec::new());
+        }
         let Some(value) = value else { return Ok(Vec::new()) };
         match embedded::expression(value).as_ref() {
             Expr::Value(value) if value.value == Value::Null => {
@@ -804,10 +895,9 @@ impl PlPgSqlTranslator {
             }
             scope.pop_condition();
             branches.push((Some(written), Self::assignments_made(scope, &outer)));
-            negated.push(Expr::UnaryOp {
-                op: UnaryOperator::Not,
-                expr: Box::new(Expr::Nested(Box::new(translated))),
-            });
+            // A `NULL` condition is not true, so it leaves the later branches
+            // to run, as in PostgreSQL.
+            negated.push(Expr::IsNotTrue(Box::new(Expr::Nested(Box::new(translated)))));
         }
 
         if !conditional.otherwise.is_empty() {

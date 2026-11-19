@@ -129,3 +129,6 @@ mod parity_jsonb;
 
 #[path = "gauntlet/parity_raise_sqlstate.rs"]
 mod parity_raise_sqlstate;
+
+#[path = "gauntlet/parity_trigger_if_control_flow.rs"]
+mod parity_trigger_if_control_flow;
