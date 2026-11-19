@@ -536,3 +536,109 @@ fn numeric_division_finding() {
         "raw SQLite integer division must give 0 for 300/1500; PG gives {pg_div:?}"
     );
 }
+
+/// A ledger whose columns hold a number at three scales, as an integer and as
+/// text.
+const LEDGER: &str = "
+CREATE TABLE ledger (
+    id     INTEGER PRIMARY KEY,
+    price  NUMERIC(10,2),
+    rate   NUMERIC(8,3),
+    units  NUMERIC(8,0),
+    whole  INTEGER,
+    label  TEXT
+);
+";
+
+mod ledger_schema {
+    diesel::table! {
+        use diesel::sql_types::*;
+        ledger (id) {
+            id    -> Integer,
+            price -> Nullable<BigInt>,
+            rate  -> Nullable<BigInt>,
+            units -> Nullable<BigInt>,
+            whole -> Nullable<BigInt>,
+            label -> Nullable<Text>,
+        }
+    }
+}
+
+/// A value written into a column of another scale or type is converted as
+/// PostgreSQL's assignment cast converts it, whether it comes from a column,
+/// an integer or a scalar subquery, through `INSERT` or `UPDATE`.
+#[test]
+fn numeric_assignments_convert_to_the_column() {
+    use ledger_schema::ledger;
+
+    let base = Pg2Sqlite::default().sql(LEDGER).expect("parse ledger DDL");
+    let manifest = base.translation_manifest(&options()).expect("manifest");
+    let scale = |column: &str| {
+        let entry = manifest
+            .iter()
+            .find(|table| table.logical == "ledger")
+            .and_then(|table| table.columns.iter().find(|found| found.name == column))
+            .unwrap_or_else(|| panic!("{column} not in ledger manifest"));
+        match entry.storage {
+            ColumnStorage::MinorUnits { scale } => scale,
+            _ => 0,
+        }
+    };
+    let mut pg_conn = postgres_harness::fresh_database();
+    postgres_harness::apply(&mut pg_conn, LEDGER).expect("apply ledger DDL to PG");
+    let mut sqlite_conn = sqlite_setup(&base);
+
+    let writes = [
+        "INSERT INTO ledger (id, price) VALUES (1, 2.50)",
+        "INSERT INTO ledger (id, price, rate, units, whole, label) \
+         SELECT 2, price, price, price, price, price FROM ledger WHERE id = 1",
+        "UPDATE ledger SET rate = 1.125 WHERE id = 1",
+        "UPDATE ledger SET price = rate WHERE id = 1",
+        "INSERT INTO ledger (id, rate) SELECT 3, id FROM ledger WHERE id = 1",
+        "INSERT INTO ledger (id, price) VALUES (4, (SELECT rate FROM ledger WHERE id = 1))",
+        "INSERT INTO ledger (id, whole) \
+         SELECT 5, count(*) FROM ledger WHERE price = (SELECT rate FROM ledger WHERE id = 2)",
+    ];
+    for write in writes {
+        postgres_harness::apply(&mut pg_conn, write).expect("PG write");
+        // The translated statement is the system under test, so it runs as written.
+        diesel::sql_query(translate_dml(&base, write))
+            .execute(&mut sqlite_conn)
+            .unwrap_or_else(|error| panic!("SQLite write failed: {error}\n{write}"));
+    }
+
+    for id in 1..=5 {
+        let pg_column = |pg_conn: &mut PgConnection, column: &str| {
+            diesel::sql_query(format!(
+                "SELECT CAST({column} AS TEXT) AS val FROM ledger WHERE id = {id}"
+            ))
+            .load::<NullableTextRow>(pg_conn)
+            .expect("PG read")
+            .into_iter()
+            .next()
+            .expect("a ledger row")
+            .val
+        };
+        let expected = (
+            pg_column(&mut pg_conn, "price").map(|text| to_minor_units(&text, scale("price"))),
+            pg_column(&mut pg_conn, "rate").map(|text| to_minor_units(&text, scale("rate"))),
+            pg_column(&mut pg_conn, "units").map(|text| to_minor_units(&text, scale("units"))),
+            pg_column(&mut pg_conn, "whole").map(|text| to_minor_units(&text, 0)),
+            pg_column(&mut pg_conn, "label"),
+        );
+        let stored: (Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<String>) =
+            ledger::table
+                .filter(ledger::id.eq(id))
+                .select((ledger::price, ledger::rate, ledger::units, ledger::whole, ledger::label))
+                .get_result(&mut sqlite_conn)
+                .expect("SQLite read");
+        assert_eq!(stored, expected, "ledger row {id} diverges");
+    }
+}
+
+/// A single nullable text column named `val` in a raw PostgreSQL result.
+#[derive(QueryableByName)]
+struct NullableTextRow {
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    val: Option<String>,
+}

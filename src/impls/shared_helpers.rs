@@ -1202,8 +1202,16 @@ fn numeric_precision_and_scale_of(
             })
         }
         Expr::Subquery(query) => {
-            // Infer from a single scalar-subquery projection; suppress scope
-            // errors.
+            // Read in the subquery's own FROM first; scope errors decide nothing.
+            if let Ok(Some(found)) = scalar_query_declared(
+                query,
+                schema,
+                options,
+                |column| read(&column.data_type),
+                numeric_precision_and_scale_of,
+            ) {
+                return Ok(Some(found));
+            }
             let SetExpr::Select(select) = query.body.as_ref() else { return Ok(None) };
             let inner = match select.projection.as_slice() {
                 [SelectItem::UnnamedExpr(e)] => e,
@@ -1358,6 +1366,9 @@ pub(crate) struct ColumnRewrites {
     /// Boolean and scaled `NUMERIC` columns, where a string literal stands for
     /// the boolean or number PostgreSQL reads it as.
     typed_text_cols: Vec<(String, DataType)>,
+    /// Columns an assigned number reaches through a cast that changes how
+    /// the replica holds it, with their types.
+    number_cols: Vec<(String, DataType)>,
 }
 
 impl ColumnRewrites {
@@ -1401,6 +1412,13 @@ impl ColumnRewrites {
                 .into_iter()
                 .flatten()
                 .filter(|col| reads_typed_text(&col.attribute().data_type))
+                .map(|col| (col.column_name().to_string(), col.attribute().data_type.clone()))
+                .collect(),
+            number_cols: table
+                .columns(schema)
+                .into_iter()
+                .flatten()
+                .filter(|col| number_target(&col.attribute().data_type).is_some())
                 .map(|col| (col.column_name().to_string(), col.attribute().data_type.clone()))
                 .collect(),
         }
@@ -1600,9 +1618,9 @@ impl ColumnRewrites {
     }
 
     /// PostgreSQL's assignment cast of `value` into `column` of this table,
-    /// where the replica's text changes with it: [`temporal_assignment_cast`]
-    /// into a temporal column, and [`jsonb::assignment_cast`] into a `jsonb`
-    /// one.
+    /// where the replica's text changes with it: [`Self::number_cast`] for a
+    /// number held at another scale, [`temporal_assignment_cast`] into a
+    /// temporal column, and [`jsonb::assignment_cast`] into a `jsonb` one.
     ///
     /// [`jsonb::assignment_cast`]: crate::impls::jsonb::assignment_cast
     pub(crate) fn column_cast(
@@ -1612,6 +1630,9 @@ impl ColumnRewrites {
         schema: &ParserDB,
         context: &crate::options::TranslationContext<'_>,
     ) -> Result<Option<Expr>, Error> {
+        if let Some(cast) = self.number_cast(column, value, schema, context) {
+            return Ok(Some(cast));
+        }
         let Some((_, data_type)) =
             self.literal_checked_cols.iter().find(|(name, _)| name.eq_ignore_ascii_case(column))
         else {
@@ -1622,6 +1643,90 @@ impl ColumnRewrites {
         }
         temporal_precision_replay_refusal(value, data_type, context)?;
         Ok(temporal_assignment_cast(value, data_type, schema, context))
+    }
+
+    /// `value` cast to `column`'s type where the replica holds the number at
+    /// another scale than the column does, a literal and a value of unsettled
+    /// scale left as written.
+    fn number_cast(
+        &self,
+        column: &str,
+        value: &Expr,
+        schema: &ParserDB,
+        context: &crate::options::TranslationContext<'_>,
+    ) -> Option<Expr> {
+        let (_, data_type) =
+            self.number_cols.iter().find(|(name, _)| name.eq_ignore_ascii_case(column))?;
+        if is_number_literal(value)
+            || is_bound_parameter(value)
+            || is_default_keyword(value)
+            || matches!(value, Expr::Value(ValueWithSpan { value: Value::Null, .. }))
+        {
+            return None;
+        }
+        let held = scale_of(value, schema, context);
+        let converts = match number_target(data_type)? {
+            NumberTarget::Scaled(scale) => held.map_or_else(
+                || scale > 0 && matches!(is_integral_expression(value, schema, context), Ok(true)),
+                |held| held != scale,
+            ),
+            NumberTarget::Unscaled => held.is_some_and(|held| held > 0),
+        };
+        converts.then(|| Expr::Cast {
+            kind: CastKind::Cast,
+            expr: Box::new(value.clone()),
+            data_type: data_type.clone(),
+            format: None,
+        })
+    }
+}
+
+/// How a column a number is assigned to holds it in the replica.
+enum NumberTarget {
+    /// An exact `NUMERIC` holding minor units at this scale.
+    Scaled(u32),
+    /// An integer, a float or text, holding the number's own value.
+    Unscaled,
+}
+
+/// How a column of `data_type` holds an assigned number, or `None` for a type
+/// no number is assigned to by a cast that changes the replica's value.
+fn number_target(data_type: &DataType) -> Option<NumberTarget> {
+    if let Some(info) = crate::impls::translator_impls::data_type::exact_numeric_info(data_type) {
+        let (_, scale) =
+            crate::impls::translator_impls::data_type::numeric_precision_and_scale(info).ok()?;
+        return Some(NumberTarget::Scaled(scale));
+    }
+    let unscaled = matches!(
+        data_type,
+        DataType::Int(_)
+            | DataType::Integer(_)
+            | DataType::SmallInt(_)
+            | DataType::BigInt(_)
+            | DataType::Int2(_)
+            | DataType::Int4(_)
+            | DataType::Int8(_)
+            | DataType::Real
+            | DataType::Float(_)
+            | DataType::Double(_)
+            | DataType::DoublePrecision
+            | DataType::Float4
+            | DataType::Float8
+            | DataType::Text
+            | DataType::Varchar(_)
+            | DataType::CharacterVarying(_)
+    );
+    unscaled.then_some(NumberTarget::Unscaled)
+}
+
+/// True when `expr` is a number literal, signed or not.
+fn is_number_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Value(ValueWithSpan { value: Value::Number(..), .. }) => true,
+        Expr::UnaryOp { op: UnaryOperator::Minus | UnaryOperator::Plus, expr } => {
+            is_number_literal(expr)
+        }
+        _ => false,
     }
 }
 
