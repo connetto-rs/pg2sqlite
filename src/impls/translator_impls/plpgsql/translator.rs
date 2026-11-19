@@ -1949,7 +1949,7 @@ impl PlPgSqlTranslator {
 
         let (values, variables) =
             Self::bound_values(&modified_bindings, ReferenceForm::Cte, schema, options, emit);
-        let ctes = values
+        let ctes: Vec<sqlparser::ast::Cte> = values
             .into_iter()
             .map(|(name, value)| CteBuilder::create_variable_cte(&name, value))
             .collect();
@@ -1957,20 +1957,13 @@ impl PlPgSqlTranslator {
         if let Some(source) = &insert.source {
             match &*source.body {
                 SetExpr::Values(values) => {
-                    let new_source = Self::transform_values_to_select(
-                        values,
-                        &modified_bindings,
-                        &variables,
-                        condition,
-                    )?;
-
-                    new_insert.source =
-                        Some(Box::new(make_query(CteBuilder::combine_ctes(ctes), new_source)));
+                    let new_source =
+                        Self::transform_values_to_select(values, &modified_bindings, condition)?;
+                    new_insert.source = Some(Box::new(make_query(None, new_source)));
                 }
                 SetExpr::Select(select) => {
                     // Reserved before the guard joins, whose translated SQL
-                    // reads no variable, and substituted before the `WITH` is
-                    // attached, which already reads its variables.
+                    // reads no variable.
                     let mut new_source = Query {
                         with: None,
                         body: Box::new(SetExpr::Select(select.clone())),
@@ -1991,9 +1984,6 @@ impl PlPgSqlTranslator {
                             None => condition,
                         });
                     }
-                    substitute_variables(&mut new_source, &variables)?;
-                    new_source.with = CteBuilder::combine_ctes(ctes);
-
                     new_insert.source = Some(Box::new(new_source));
                 }
                 _ => {
@@ -2007,7 +1997,22 @@ impl PlPgSqlTranslator {
             Self::null_unbound_declarations(source.as_mut(), scope, &modified_bindings);
         }
 
-        Statement::Insert(new_insert).translate_with_warnings(schema, options, emit)
+        // The CTE reads would hide the declared types the reserved names carry.
+        let reserved = reserved_variables(&modified_bindings, options);
+        let mut translated = Statement::Insert(new_insert).translate_with_warnings(
+            schema,
+            &options.with_variables(&reserved),
+            emit,
+        )?;
+        for statement in &mut translated {
+            substitute_variables(statement, &variables)?;
+            if let Statement::Insert(translated_insert) = statement
+                && let Some(source) = translated_insert.source.as_deref_mut()
+            {
+                prepend_ctes(source, ctes.clone());
+            }
+        }
+        Ok(translated)
     }
 
     /// The bindings `insert` reads, each generated UUID an earlier `INSERT`
@@ -2132,7 +2137,6 @@ impl PlPgSqlTranslator {
     fn transform_values_to_select(
         values: &sqlparser::ast::Values,
         bindings: &[Binding],
-        variables: &VariableScope,
         condition: Option<Expr>,
     ) -> Result<SetExpr, Error> {
         let [row] = values.rows.as_slice() else {
@@ -2146,10 +2150,7 @@ impl PlPgSqlTranslator {
         // Reserved before the guard joins, whose translated SQL reads no
         // variable.
         reserve_variables(&mut projections, bindings);
-        let mut body =
-            SetExpr::Select(Box::new(make_simple_select(projections, Vec::new(), condition)));
-        substitute_variables(&mut body, variables)?;
-        Ok(body)
+        Ok(SetExpr::Select(Box::new(make_simple_select(projections, Vec::new(), condition))))
     }
 
     /// The SQLite value of each readable binding, in dependency order, with a
@@ -2385,6 +2386,17 @@ fn substitute_variables<N: VisitMut>(node: &mut N, scope: &VariableScope) -> Res
     match node.visit(&mut VariableSubstituter(scope)) {
         ControlFlow::Break(reason) => Err(Error::forward_refusal(reason)),
         ControlFlow::Continue(()) => Ok(()),
+    }
+}
+
+/// Puts `ctes` ahead of any `WITH` entries `query` already carries, which may
+/// read them.
+fn prepend_ctes(query: &mut Query, ctes: Vec<sqlparser::ast::Cte>) {
+    match &mut query.with {
+        Some(with) => {
+            with.cte_tables.splice(0..0, ctes);
+        }
+        None => query.with = CteBuilder::combine_ctes(ctes),
     }
 }
 
@@ -2903,13 +2915,9 @@ mod tests {
             panic!("expected values");
         };
 
-        let transformed = PlPgSqlTranslator::transform_values_to_select(
-            values,
-            &[],
-            &VariableScope::default(),
-            Some(parse_expr("TRUE")),
-        )
-        .unwrap();
+        let transformed =
+            PlPgSqlTranslator::transform_values_to_select(values, &[], Some(parse_expr("TRUE")))
+                .unwrap();
         let SetExpr::Select(select) = transformed else {
             panic!("expected select output");
         };
@@ -2921,13 +2929,8 @@ mod tests {
         let SetExpr::Values(multi_values) = multi.body.as_ref() else {
             panic!("expected values");
         };
-        let error = PlPgSqlTranslator::transform_values_to_select(
-            multi_values,
-            &[],
-            &VariableScope::default(),
-            None,
-        )
-        .unwrap_err();
+        let error =
+            PlPgSqlTranslator::transform_values_to_select(multi_values, &[], None).unwrap_err();
         assert!(error.to_string().contains("Multi-row VALUES in trigger not supported"));
     }
 
