@@ -308,6 +308,13 @@ impl PlPgSqlTranslator {
                             &options.with_variables(&variables),
                             emit,
                         )?);
+                    } else if !scope.declares_row(&declaration.name) {
+                        // PostgreSQL starts a variable without a default at
+                        // `NULL`, which every statement reading it reads.
+                        scope.bind_persistent(Binding {
+                            name: declaration.name.clone(),
+                            value: BoundValue::Expr(Expr::Value(Value::Null.with_empty_span())),
+                        });
                     }
                 }
                 DeclarationKind::Alias(_) => {
@@ -666,14 +673,13 @@ impl PlPgSqlTranslator {
         }
         let condition = scope.current_condition();
         let mut evaluated = Vec::new();
-        for (name, mut value) in values {
+        for (name, value) in values {
             if !assigned.contains(&name) || !may_raise(&value, options) {
                 continue;
             }
             if let Some(relation) = scope.rewritten_guard_relation(schema) {
                 return Err(rewritten_guard(relation));
             }
-            Self::null_unbound_declarations(&mut value, scope, &bindings);
             let mut statement =
                 Statement::Query(Box::new(single_expr_query(value, Vec::new(), None)));
             if let Some(condition) = &condition {
@@ -1283,7 +1289,6 @@ impl PlPgSqlTranslator {
             Self::bound_values(&bindings, ReferenceForm::Inline, schema, options, emit);
         let mut statements = statements;
         for statement in &mut statements {
-            Self::null_unbound_declarations(statement, scope, &bindings);
             reserve_variables(statement, &bindings);
         }
         let reserved = reserved_variables(&bindings, options);
@@ -1318,7 +1323,6 @@ impl PlPgSqlTranslator {
         }
         for statement in &mut translated {
             substitute_variables(statement, &variables)?;
-            Self::null_unbound_declarations(statement, scope, &bindings);
         }
         Ok(translated)
     }
@@ -2006,10 +2010,15 @@ impl PlPgSqlTranslator {
                 }
             }
         }
-
-        if let Some(source) = &mut new_insert.source {
-            Self::null_unbound_declarations(source.as_mut(), scope, &modified_bindings);
-        }
+        reserve_variables(&mut new_insert.on, &modified_bindings);
+        // The `WITH` holding the values belongs to the source query, which
+        // the `ON CONFLICT` clause cannot read, so the clause reads each value
+        // inline.
+        let conflict_variables = if insert.on.is_some() {
+            Self::bound_values(&modified_bindings, ReferenceForm::Inline, schema, options, emit).1
+        } else {
+            VariableScope::default()
+        };
 
         // The CTE reads would hide the declared types the reserved names carry.
         let reserved = reserved_variables(&modified_bindings, options);
@@ -2019,6 +2028,9 @@ impl PlPgSqlTranslator {
             emit,
         )?;
         for statement in &mut translated {
+            if let Statement::Insert(translated_insert) = statement {
+                substitute_variables(&mut translated_insert.on, &conflict_variables)?;
+            }
             substitute_variables(statement, &variables)?;
             if let Statement::Insert(translated_insert) = statement
                 && let Some(source) = translated_insert.source.as_deref_mut()
@@ -2102,24 +2114,6 @@ impl PlPgSqlTranslator {
             }
         }
         Ok(modified_bindings)
-    }
-
-    /// Replaces each read of a declared variable with no binding by `NULL`,
-    /// which is what PostgreSQL initialises it to.
-    pub(super) fn null_unbound_declarations<N: VisitMut>(
-        node: &mut N,
-        scope: &BodyScope,
-        bound: &[Binding],
-    ) {
-        let _: ControlFlow<()> = visit_expressions_mut(node, |expr| {
-            if let Expr::Identifier(ident) = expr
-                && scope.is_declared(ident)
-                && !bound.iter().any(|binding| binding.name == fold(ident))
-            {
-                *expr = Expr::Value(Value::Null.with_empty_span());
-            }
-            ControlFlow::Continue(())
-        });
     }
 
     /// Reorders bindings so one read by another comes first.
