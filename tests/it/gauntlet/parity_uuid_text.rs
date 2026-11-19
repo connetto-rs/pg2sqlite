@@ -11,7 +11,7 @@ use diesel::{
     sql_types::{Nullable, Text},
     sqlite::SqliteConnection,
 };
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation};
+use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation, postgres_error};
 use rosetta_uuid::Uuid;
 
 use crate::helpers::{establish_connection, postgres as postgres_harness};
@@ -148,14 +148,19 @@ fn postgres_message(parent: Option<Uuid>) -> String {
         .to_string()
 }
 
+/// The message the replica's abort reports, read as PostgreSQL's.
 fn sqlite_message(parent: Option<Uuid>) -> String {
     let mut sqlite = establish_connection();
     apply_translated(&mut sqlite, GUARDED).expect("apply the trigger to SQLite");
-    diesel::insert_into(schema::resources::table)
+    let message = diesel::insert_into(schema::resources::table)
         .values((schema::resources::id.eq(1), schema::resources::parent.eq(parent)))
         .execute(&mut sqlite)
         .expect_err("the trigger aborts on SQLite")
-        .to_string()
+        .to_string();
+    postgres_error(&message)
+        .unwrap_or_else(|| panic!("{message:?} is no replica refusal"))
+        .message()
+        .to_owned()
 }
 
 #[test]

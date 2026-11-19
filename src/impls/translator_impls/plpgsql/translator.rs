@@ -395,7 +395,7 @@ impl PlPgSqlTranslator {
                 Self::translate_return(value.as_deref(), scope, schema, options, emit)
             }
             NodeKind::Raise(raise) => {
-                let Some(statement) = raise_statement(raise)? else { return Ok(Vec::new()) };
+                let Some(statement) = raise_statement(raise, emit)? else { return Ok(Vec::new()) };
                 let statement = Self::prepare(statement, scope)?;
                 Self::finalize_reads(vec![statement], scope, schema, options, emit)
             }

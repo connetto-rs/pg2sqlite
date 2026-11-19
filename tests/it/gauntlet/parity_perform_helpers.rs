@@ -4,10 +4,16 @@
 //! Each scenario runs the same writes on both engines and compares whether
 //! each write is accepted and what the tables hold after.
 
-use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
+use diesel::{
+    pg::PgConnection, prelude::*, result::Error as DieselError, sqlite::SqliteConnection,
+};
+use pg2sqlite::prelude::{
+    Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, SqlState, UuidRepresentation,
+    postgres_error,
+};
 use postgres_harness::{Outcome, apply, fresh_database, set_session_user};
 use rosetta_uuid::Uuid;
+use sqlstate::pg;
 
 use crate::helpers::{
     deployment::{UTC_REQUEST_ROLE, caller, deployment},
@@ -321,12 +327,8 @@ fn a_uuid_argument_reaches_the_helper_as_postgres_passes_it() {
     sqlite.seed(&[with_child, childless], with_child);
 
     for id in [with_child, childless] {
-        let expected = postgres.publish(id).map_err(|error| error.to_string());
-        assert_eq!(
-            sqlite.publish(id).map_err(|error| error.to_string()),
-            expected,
-            "publishing {id}"
-        );
+        let expected = postgres.publish(id).map_err(postgres_refusal);
+        assert_eq!(sqlite.publish(id).map_err(replica_refusal), expected, "publishing {id}");
     }
     assert_eq!(sqlite.published(), postgres.published());
     assert_eq!(postgres.published(), vec![with_child]);
@@ -376,11 +378,11 @@ macro_rules! seed_rosters {
 }
 
 macro_rules! remove_member {
-    ($connection:expr, $member:expr) => {{
+    ($connection:expr, $member:expr, $refusal:expr) => {{
         use self::schema::roster_members;
         diesel::delete(roster_members::table.filter(roster_members::member.eq($member)))
             .execute($connection)
-            .map_err(|error| error.to_string())
+            .map_err($refusal)
     }};
 }
 
@@ -395,14 +397,34 @@ fn a_text_parameter_reaches_a_sql_helper_as_its_declared_type() {
     seed_rosters!(&mut postgres);
     seed_rosters!(&mut sqlite);
 
-    let expected = ["ada", "bob"].map(|member| remove_member!(&mut postgres, member));
-    let actual = ["ada", "bob"].map(|member| remove_member!(&mut sqlite, member));
+    let expected =
+        ["ada", "bob"].map(|member| remove_member!(&mut postgres, member, postgres_refusal));
+    let actual = ["ada", "bob"].map(|member| remove_member!(&mut sqlite, member, replica_refusal));
     assert_eq!(actual, expected);
     assert_eq!(
         expected[1],
-        Err("club chess would lose its last member".to_owned()),
+        Err((pg::RAISE_EXCEPTION, "club chess would lose its last member".to_owned())),
         "PostgreSQL keeps bob"
     );
+}
+
+/// The SQLSTATE and message PostgreSQL refused a write with.
+fn postgres_refusal(error: DieselError) -> (SqlState, String) {
+    let DieselError::DatabaseError(_, information) = error else {
+        panic!("PostgreSQL failed with {error} instead of refusing the write");
+    };
+    let sqlstate = information.sqlstate().expect("PostgreSQL reports a SQLSTATE");
+    (sqlstate, information.message().to_owned())
+}
+
+/// The SQLSTATE and message the replica's refusal of a write reads back as.
+fn replica_refusal(error: DieselError) -> (SqlState, String) {
+    let DieselError::DatabaseError(_, information) = error else {
+        panic!("SQLite failed with {error} instead of refusing the write");
+    };
+    let refusal = postgres_error(information.message())
+        .unwrap_or_else(|| panic!("{:?} is no replica refusal", information.message()));
+    (refusal.sqlstate(), refusal.message().to_owned())
 }
 
 /// The owner every definer function runs as, past row-level security.

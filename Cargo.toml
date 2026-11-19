@@ -24,6 +24,9 @@ sql-traits = { git = "https://github.com/connetto-rs/sql-traits", branch = "main
 # zones and jsonb the way PostgreSQL 18 does.
 sql-values = { version = "0.6", default-features = false, features = ["tzdb"] }
 sql-values-05 = { package = "sql-values", version = "0.5.1", default-features = false }
+# The SQLSTATE a replica refusal reports, the type diesel reads PostgreSQL's
+# error codes as.
+sqlstate = "0.2"
 git2 = { version = "0.21", optional = true }
 tempfile = { version = "3.27", optional = true }
 thiserror = { version = "2.0", default-features = false }
@@ -127,6 +130,9 @@ sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch 
 # `SqliteConnection::set_triggers_enabled` and its db-config siblings are on
 # diesel main and absent from 2.3.12, and the RLS trigger tests need them.
 diesel = { git = "https://github.com/diesel-rs/diesel", branch = "main" }
+# Follows diesel's patch, so the `SqlState` the decoder returns is the type
+# diesel reports a PostgreSQL error's code as.
+sqlstate = { git = "https://github.com/diesel-rs/diesel", branch = "main" }
 
 [[test]]
 name = "it"

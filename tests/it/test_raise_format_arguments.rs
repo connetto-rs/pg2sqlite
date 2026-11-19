@@ -1,6 +1,6 @@
 //! A `RAISE EXCEPTION` format names each argument with a `%`, and the message
 //! the replica aborts with carries the arguments where PostgreSQL's does,
-//! `NULL` printed as `<NULL>`.
+//! `NULL` printed as `<NULL>`, after the SQLSTATE `P0001`.
 
 use diesel::{prelude::*, sqlite::SqliteConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
@@ -57,7 +57,7 @@ fn abort_message(raise: &str, val: Option<i32>) -> String {
 fn each_placeholder_shows_its_argument() {
     assert_eq!(
         abort_message("RAISE EXCEPTION 'val % of row % is negative', NEW.val, NEW.id", Some(-3)),
-        "val -3 of row 7 is negative"
+        "P0001: val -3 of row 7 is negative"
     );
 }
 
@@ -65,7 +65,7 @@ fn each_placeholder_shows_its_argument() {
 fn a_null_argument_shows_as_postgresql_prints_it() {
     assert_eq!(
         abort_message("RAISE EXCEPTION 'val % is missing', NEW.val", None),
-        "val <NULL> is missing"
+        "P0001: val <NULL> is missing"
     );
 }
 
@@ -73,6 +73,6 @@ fn a_null_argument_shows_as_postgresql_prints_it() {
 fn a_doubled_percent_is_one_percent() {
     assert_eq!(
         abort_message("RAISE EXCEPTION 'over 100%% of %', NEW.id", Some(-1)),
-        "over 100% of 7"
+        "P0001: over 100% of 7"
     );
 }
