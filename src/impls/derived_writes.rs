@@ -28,8 +28,9 @@ pub(crate) use firing::{FiringTrigger, firing_triggers};
 use sql_traits::{structs::ParserDB, traits::FunctionLike};
 use sqlparser::{
     ast::{
-        ColumnDef, ColumnOption, CreateFunction, CreateTrigger, ForeignKeyConstraint, Ident,
-        ObjectName, ReferentialAction, Statement, TriggerEvent, TriggerPeriod, Visit, Visitor,
+        ColumnDef, ColumnOption, CreateFunction, CreateTrigger, ForeignKeyConstraint, Ident, Merge,
+        ObjectName, ReferentialAction, Statement, TableFactor, TriggerEvent, TriggerObject,
+        TriggerObjectKind, TriggerPeriod, Visit, Visitor,
     },
     dialect::PostgreSqlDialect,
     parser::Parser,
@@ -78,9 +79,9 @@ pub(crate) struct DerivedWrite {
     chain: Vec<String>,
     statement: &'static str,
     /// The table written, its last name part as written.
-    table: Option<String>,
+    table: String,
     /// The table written, its last name part folded.
-    relation: Option<String>,
+    relation: String,
     /// The rows of the table it writes.
     rows: rows::Rows,
 }
@@ -104,10 +105,7 @@ impl DerivedWrite {
 
     /// The statement and the table it writes, as `INSERT on note_events`.
     fn statement_on(&self) -> String {
-        match &self.table {
-            Some(table) => format!("{} on {table}", self.statement),
-            None => self.statement.to_owned(),
-        }
+        format!("{} on {}", self.statement, self.table)
     }
 
     /// Why the replica leaves the write to the server.
@@ -143,7 +141,8 @@ struct Reach<'c> {
 }
 
 /// Collects every statement that writes rows, in body order through nested
-/// blocks, branches and data-modifying `WITH` items.
+/// blocks, branches and data-modifying `WITH` items, once for each table it
+/// writes.
 struct Writes<'c> {
     reach: Reach<'c>,
     found: Vec<DerivedWrite>,
@@ -153,22 +152,33 @@ impl Visitor for Writes<'_> {
     type Break = ();
 
     fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<()> {
-        let kind = match statement {
-            Statement::Insert(_) => "INSERT",
-            Statement::Update(_) => "UPDATE",
-            Statement::Delete(_) => "DELETE",
-            Statement::Merge(_) => "MERGE",
-            Statement::Truncate(_) => "TRUNCATE",
+        let (kind, targets): (_, Vec<&ObjectName>) = match statement {
+            Statement::Insert(_) => {
+                ("INSERT", primary_write_target(statement).into_iter().collect())
+            }
+            Statement::Update(_) => {
+                ("UPDATE", primary_write_target(statement).into_iter().collect())
+            }
+            Statement::Delete(_) => {
+                ("DELETE", primary_write_target(statement).into_iter().collect())
+            }
+            Statement::Merge(Merge { table: TableFactor::Table { name, .. }, .. }) => {
+                ("MERGE", vec![name])
+            }
+            Statement::Truncate(truncate) => {
+                ("TRUNCATE", truncate.table_names.iter().map(|target| &target.name).collect())
+            }
             _ => return ControlFlow::Continue(()),
         };
-        let target = primary_write_target(statement);
-        self.found.push(DerivedWrite {
-            chain: self.reach.chain.to_vec(),
-            statement: kind,
-            table: target.map(last_ident_value_or_display),
-            relation: target.and_then(last_ident).map(fold),
-            rows: rows::written(statement, self.reach.variables),
-        });
+        for target in targets {
+            self.found.push(DerivedWrite {
+                chain: self.reach.chain.to_vec(),
+                statement: kind,
+                table: last_ident_value_or_display(target),
+                relation: last_ident(target).map_or_else(|| target.to_string(), fold),
+                rows: rows::written(statement, self.reach.variables),
+            });
+        }
         ControlFlow::Continue(())
     }
 }
@@ -376,7 +386,9 @@ pub(crate) fn trigger_disposition(
         return Ok(Disposition::Kept);
     };
     let events: Vec<Event> = trigger.events.iter().map(Event::of).collect();
-    let before = matches!(trigger.period, Some(TriggerPeriod::Before)).then_some(events.as_slice());
+    // PostgreSQL ignores what a statement trigger returns.
+    let before = (matches!(trigger.period, Some(TriggerPeriod::Before)) && is_per_row(trigger))
+        .then_some(events.as_slice());
     let mut chain = chain::Walker::read(function, before, schema, options)?;
     if let Some(first) = chain.writes.first() {
         if let Some(index) = chain.inseparable {
@@ -421,6 +433,17 @@ pub(crate) fn trigger_disposition(
     } else {
         Disposition::Stripped(chain.writes)
     })
+}
+
+/// Whether `trigger` fires for each row rather than once for the statement.
+fn is_per_row(trigger: &CreateTrigger) -> bool {
+    matches!(
+        trigger.trigger_object,
+        Some(
+            TriggerObjectKind::For(TriggerObject::Row)
+                | TriggerObjectKind::ForEach(TriggerObject::Row)
+        )
+    )
 }
 
 /// The trigger warning for `trigger`, left out because of `reason`.
