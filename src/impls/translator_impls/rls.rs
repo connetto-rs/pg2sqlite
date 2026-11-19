@@ -2041,6 +2041,32 @@ fn insert_permission_gate(
         })
 }
 
+/// The insert an `INSTEAD OF INSERT` trigger hands `backing`, leaving a column
+/// the view does not hold to the backing table's default.
+///
+/// # Errors
+///
+/// Propagates a default that cannot be translated.
+fn forwarding_insert(
+    backing: &str,
+    columns: &[TriggerColumn],
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Statement, Error> {
+    let written: Vec<&TriggerColumn> =
+        columns.iter().filter(|column| column.is_forwarded()).collect();
+    let values = written
+        .iter()
+        .map(|column| column.forwarded_value().translate_with_warnings(schema, options, emit))
+        .collect::<Result<Vec<_>, Error>>()?;
+    Ok(ast_builder::insert(
+        generated_object_name(backing),
+        written.iter().map(|column| generated_object_name(&column.name)).collect(),
+        ast_builder::values(vec![values]),
+    ))
+}
+
 fn generate_insert_trigger_sql(
     table: &CreateTable,
     schema: &ParserDB,
@@ -2053,15 +2079,6 @@ fn generate_insert_trigger_sql(
     let table_name = ctx.table_name;
     let WriteGuard { columns, check, .. } =
         build_write_guard(&rows, GuardKind::Insert, table, schema, options, Some(grants), emit)?;
-    // A column the view does not hold is left to the backing table's default.
-    let written: Vec<&TriggerColumn> =
-        columns.iter().filter(|column| column.is_forwarded()).collect();
-    let target_columns = written.iter().map(|column| generated_object_name(&column.name)).collect();
-    let values = written
-        .iter()
-        .map(|column| column.forwarded_value().translate_with_warnings(schema, options, emit))
-        .collect::<Result<Vec<_>, Error>>()?;
-
     let guard = if rows.has_no_policy(GatedCommand::Insert, RowVersion::Inserted) {
         Some(ast_builder::raise_statement(
             "ABORT",
@@ -2095,11 +2112,7 @@ fn generate_insert_trigger_sql(
         .chain(guard)
         .collect::<Vec<_>>();
     body.extend(refuse_computed_write_statements(&columns, table_name, GuardKind::Insert));
-    body.push(ast_builder::insert(
-        generated_object_name(&ctx.inner_table_name),
-        target_columns,
-        ast_builder::values(vec![values]),
-    ));
+    body.push(forwarding_insert(&ctx.inner_table_name, &columns, schema, options, emit)?);
     Ok(ast_builder::trigger(
         generated_object_name(&format!("{table_name}_insert_trigger")),
         generated_object_name(table_name),
@@ -2708,6 +2721,87 @@ fn delete_body(
     })
 }
 
+/// The `INSTEAD OF` triggers of a view the acting role only reads, refusing a
+/// write unless it is exempt and forwarding an exempt one to the backing table.
+///
+/// # Errors
+///
+/// Propagates a lookup failure and a default that cannot be translated.
+fn generate_readonly_view_trigger_sql(
+    table: &CreateTable,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    grants: &RoleTable,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Vec<Statement>, Error> {
+    if options.get_write_exemption_function().is_none() {
+        return Ok(Vec::new());
+    }
+    let ctx = RlsTriggerContext::new(table, options);
+    let table_name = ctx.table_name;
+    let backing = || generated_object_name(&ctx.inner_table_name);
+    let refusal = ast_builder::raise_statement(
+        "ABORT",
+        Some(&read_only(table_name)),
+        write_guard_condition_expr(None, options),
+    );
+    let columns = trigger_columns(table, schema, options, Some(grants))?;
+    let mut insert = vec![refusal.clone()];
+    insert.extend(refuse_computed_write_statements(&columns, table_name, GuardKind::Insert));
+    insert.push(forwarding_insert(&ctx.inner_table_name, &columns, schema, options, emit)?);
+
+    let mut update = vec![refusal.clone()];
+    let mut delete = vec![refusal];
+    if let Some(column) = unreadable_key_column(table, schema, grants)? {
+        let unfound =
+            ast_builder::raise_statement("ABORT", Some(&unreadable_key(table_name, &column)), None);
+        update.push(unfound.clone());
+        delete.push(unfound);
+    } else {
+        let identity = build_row_identity_clause(
+            &collect_column_names(table, schema)?,
+            &collect_pk_column_names(table, schema)?,
+        );
+        update.extend(refuse_computed_write_statements(&columns, table_name, GuardKind::Update));
+        update.push(ast_builder::update(
+            backing(),
+            columns
+                .iter()
+                .filter(|column| column.is_forwarded())
+                .map(|column| {
+                    Assignment {
+                        target: AssignmentTarget::ColumnName(generated_object_name(&column.name)),
+                        value: prefixed_column_expr("NEW", &column.name),
+                    }
+                })
+                .collect(),
+            Some(identity.clone()),
+        ));
+        delete.push(ast_builder::delete(backing(), Some(identity)));
+    }
+
+    Ok(vec![
+        view_trigger(
+            &format!("{table_name}_insert_trigger"),
+            table_name,
+            TriggerEvent::Insert,
+            insert,
+        ),
+        view_trigger(
+            &format!("{table_name}_update_trigger"),
+            table_name,
+            TriggerEvent::Update(Vec::new()),
+            update,
+        ),
+        view_trigger(
+            &format!("{table_name}_delete_trigger"),
+            table_name,
+            TriggerEvent::Delete,
+            delete,
+        ),
+    ])
+}
+
 fn generate_readonly_backing_guard_sql(
     table: &CreateTable,
     options: &crate::options::TranslationContext<'_>,
@@ -2765,6 +2859,8 @@ pub(crate) fn generate_view_statements(
         vec![generate_rls_view_statement_with_context(table, schema, options, grants, emit)?];
 
     if grants.is_read_only() {
+        statements
+            .extend(generate_readonly_view_trigger_sql(table, schema, options, grants, emit)?);
         statements.extend(generate_readonly_backing_guard_sql(table, options));
     } else {
         if let Some(column) = &unreadable_key

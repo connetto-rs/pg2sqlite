@@ -44,8 +44,8 @@
 //!                      │                     │users (VIEW) │  │posts (VIEW) │        │
 //!                      │                     │             │  │             │        │
 //!                      │                     │ SELECT only │  │ SELECT with │        │
-//!                      │                     │ (no write   │  │ RLS filter  │        │
-//!                      │                     │  triggers)  │  │             │        │
+//!                      │                     │ (exempt     │  │ RLS filter  │        │
+//!                      │                     │  writes)    │  │             │        │
 //!                      │                     └─────────────┘  └──────┬──────┘        │
 //!                      │                                             │               │
 //!                      │                                      ┌──────▼──────┐        │
@@ -314,57 +314,10 @@ fn test_grant_based_filtering_execution() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-/// A read-only view has no INSTEAD OF write triggers.
-#[test]
-fn test_readonly_view_has_no_write_triggers() -> Result<(), Box<dyn std::error::Error>> {
-    let mut conn = setup_database()?;
-
-    // Get all triggers
-    let triggers: Vec<TriggerInfo> = diesel::sql_query(
-        "SELECT name, tbl_name FROM sqlite_master WHERE type='trigger' ORDER BY name",
-    )
-    .load(&mut conn)?;
-
-    // users should NOT have INSERT/UPDATE/DELETE triggers
-    let users_write_triggers: Vec<_> = triggers
-        .iter()
-        .filter(|t| {
-            t.tbl_name == "users"
-                && (t.name.contains("insert")
-                    || t.name.contains("update")
-                    || t.name.contains("delete"))
-        })
-        .collect();
-
-    assert!(
-        users_write_triggers.is_empty(),
-        "Read-only table 'users' should not have write triggers, found: {:?}",
-        users_write_triggers.iter().map(|t| &t.name).collect::<Vec<_>>()
-    );
-
-    // posts SHOULD have write triggers
-    let posts_write_triggers: Vec<_> = triggers.iter().filter(|t| t.tbl_name == "posts").collect();
-
-    assert!(
-        !posts_write_triggers.is_empty(),
-        "Writable table 'posts' should have INSTEAD OF triggers"
-    );
-
-    Ok(())
-}
-
 #[derive(QueryableByName, Debug)]
 struct TableInfo {
     #[diesel(sql_type = diesel::sql_types::Text)]
     name: String,
-}
-
-#[derive(QueryableByName, Debug)]
-struct TriggerInfo {
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    name: String,
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    tbl_name: String,
 }
 
 #[test]
