@@ -2251,30 +2251,40 @@ impl PlPgSqlTranslator {
         options: &crate::options::TranslationContext<'_>,
     ) -> Result<Expr, Error> {
         let Some(declaration) = declaration else { return Ok(value) };
-        let minor_units = minor_unit_scale(&declaration.data_type);
-        if let Some(scale) = minor_units
+        if let Some(scale) = minor_unit_scale(&declaration.data_type)
             && let Some(scaled) = scale_decimal_literal(&value, scale)?
         {
             return Ok(scaled);
         }
-        let declared = normalize_sqlparser_type(&declaration.data_type);
+        Ok(Self::converted_to(value, &declaration.data_type, schema, options))
+    }
+
+    /// `value` cast to `data_type` where its own type or `NUMERIC` scale is
+    /// known and differs, and as written otherwise.
+    pub(super) fn converted_to(
+        value: Expr,
+        data_type: &DataType,
+        schema: &ParserDB,
+        options: &crate::options::TranslationContext<'_>,
+    ) -> Expr {
+        let declared = normalize_sqlparser_type(data_type);
         let off_type = matches!(
             type_name(&value, schema, options),
             Ok(Some(found)) if !found.eq_ignore_ascii_case(&declared)
         );
-        let off_scale = minor_units.is_some_and(|scale| {
+        let off_scale = minor_unit_scale(data_type).is_some_and(|scale| {
             scale_of(&value, schema, options).is_some_and(|held| held != scale)
         });
-        Ok(if off_type || off_scale {
+        if off_type || off_scale {
             Expr::Cast {
                 kind: CastKind::Cast,
                 expr: Box::new(value),
-                data_type: declaration.data_type.clone(),
+                data_type: data_type.clone(),
                 format: None,
             }
         } else {
             value
-        })
+        }
     }
 
     /// Attaches an `IF` guard to a statement's `WHERE` clause, failing when it
