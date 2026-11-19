@@ -15,13 +15,29 @@ diesel::table! {
 /// in its `DECLARE` section, `seeded` stored in `t.d` and 1.50 in
 /// `t.amount`.
 fn guarded_log(declarations: &str, condition: &str, seeded: &str) -> String {
+    guarded_script("", declarations, "", condition, seeded)
+}
+
+/// [`guarded_log`] with `preamble` defined ahead of the trigger function and
+/// `statements` run before the condition is tested. The `sink` table keys on
+/// `id` and holds a `NUMERIC(10,3)` `amount`.
+fn guarded_script(
+    preamble: &str,
+    declarations: &str,
+    statements: &str,
+    condition: &str,
+    seeded: &str,
+) -> String {
     format!(
         "CREATE TABLE t (id INT PRIMARY KEY, d INTERVAL NOT NULL, amount NUMERIC(10,2) NOT NULL);
 CREATE TABLE log (id INT PRIMARY KEY);
+CREATE TABLE sink (id INT PRIMARY KEY, amount NUMERIC(10,3));
 INSERT INTO t VALUES (1, '{seeded}', 1.50);
+{preamble}
 CREATE FUNCTION mark() RETURNS TRIGGER LANGUAGE plpgsql AS $$
 DECLARE {declarations}
 BEGIN
+  {statements}
   IF {condition} THEN
     RAISE EXCEPTION 'hit';
   END IF;
@@ -93,4 +109,19 @@ fn a_numeric_variable_compares_against_a_column_of_its_type() {
     assert!(raises(&guarded_log(declarations, &format!("v = {amount}"), "1 day")));
     assert!(!raises(&guarded_log(declarations, &format!("v < {amount}"), "1 day")));
     assert!(raises(&guarded_log(declarations, &format!("w > {amount}"), "1 day")));
+}
+
+/// An interval variable read in the query or the `VALUES` an `INSERT` takes
+/// its row from compares as an interval, as it does in a bare `SELECT`.
+#[test]
+fn an_interval_variable_compares_inside_an_insert_source() {
+    let declarations = "v interval := '216 hours';";
+    let selected = "INSERT INTO sink (id) SELECT id FROM t WHERE d = v;";
+    let condition = "EXISTS (SELECT 1 FROM sink)";
+    assert!(raises(&guarded_script("", declarations, selected, condition, "9 days")));
+    assert!(!raises(&guarded_script("", declarations, selected, condition, "8 days")));
+    let counted = "INSERT INTO sink (id) VALUES ((SELECT count(*) FROM t WHERE d = v));";
+    let condition = "EXISTS (SELECT 1 FROM sink WHERE id = 1)";
+    assert!(raises(&guarded_script("", declarations, counted, condition, "9 days")));
+    assert!(!raises(&guarded_script("", declarations, counted, condition, "8 days")));
 }
