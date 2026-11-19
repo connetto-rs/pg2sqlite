@@ -180,6 +180,7 @@ mod test_plpgsql_round2;
 mod test_plpgsql_scanner_and_binding;
 mod test_plpgsql_scanning;
 mod test_plpgsql_var_substitution;
+mod test_plpgsql_variable_name_collisions;
 mod test_plpgsql_variable_positions;
 mod test_plpgsql_variable_scoping;
 mod test_policy_refusal;

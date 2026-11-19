@@ -439,7 +439,14 @@ impl PlPgSqlTranslator {
             }
             Statement::Update(_) | Statement::Delete(_) => {
                 let bindings: Vec<_> = scope.bindings().cloned().collect();
-                let mut translated = stmt.translate_with_warnings(schema, options, emit)?;
+                let mut reserved = stmt.clone();
+                reserve_variables(&mut reserved, &bindings);
+                let names = reserved_variables(&bindings);
+                let mut translated = reserved.translate_with_warnings(
+                    schema,
+                    &options.with_variables(&names),
+                    emit,
+                )?;
                 // SQLite takes no `WITH` before an `UPDATE` or `DELETE` in a
                 // trigger body.
                 let (_, variables) =
@@ -932,10 +939,16 @@ impl PlPgSqlTranslator {
         options: &crate::options::TranslationContext<'_>,
         emit: crate::warnings::WarningSink<'_>,
     ) -> Result<Expr, Error> {
+        let bindings: Vec<_> = scope.bindings().cloned().collect();
         let mut transformed = condition.clone();
         Self::transform_expr(&mut transformed, options);
-        let mut translated = transformed.translate_with_warnings(schema, options, emit)?;
-        let bindings: Vec<_> = scope.bindings().cloned().collect();
+        reserve_variables(&mut transformed, &bindings);
+        let reserved = reserved_variables(&bindings);
+        let mut translated = transformed.translate_with_warnings(
+            schema,
+            &options.with_variables(&reserved),
+            emit,
+        )?;
         let (_, variables) =
             Self::bound_values(&bindings, ReferenceForm::Inline, schema, options, emit);
         substitute_variables(&mut translated, &variables)?;
@@ -1146,11 +1159,21 @@ impl PlPgSqlTranslator {
         let bindings: Vec<_> = scope.bindings().cloned().collect();
         let (_, variables) =
             Self::bound_values(&bindings, ReferenceForm::Inline, schema, options, emit);
-        let mut translated =
-            Self::finalize_query_statements(statements, scope, schema, options, emit)?;
+        let mut statements = statements;
+        for statement in &mut statements {
+            Self::null_unbound_declarations(statement, scope, &bindings);
+            reserve_variables(statement, &bindings);
+        }
+        let reserved = reserved_variables(&bindings);
+        let mut translated = Self::finalize_query_statements(
+            statements,
+            scope,
+            schema,
+            &options.with_variables(&reserved),
+            emit,
+        )?;
         for statement in &mut translated {
             substitute_variables(statement, &variables)?;
-            Self::null_unbound_declarations(statement, scope, &bindings);
         }
         Ok(translated)
     }
@@ -1803,16 +1826,29 @@ impl PlPgSqlTranslator {
         if let Some(source) = &insert.source {
             match &*source.body {
                 SetExpr::Values(values) => {
-                    let new_source =
-                        Self::transform_values_to_select(values, &variables, condition)?;
+                    let new_source = Self::transform_values_to_select(
+                        values,
+                        &modified_bindings,
+                        &variables,
+                        condition,
+                    )?;
 
                     new_insert.source =
                         Some(Box::new(make_query(CteBuilder::combine_ctes(ctes), new_source)));
                 }
                 SetExpr::Select(select) => {
-                    let mut new_select = select.as_ref().clone();
-
-                    if let Some(condition) = condition {
+                    // Reserved before the guard joins, whose translated SQL
+                    // reads no variable, and substituted before the `WITH` is
+                    // attached, which already reads its variables.
+                    let mut new_source = Query {
+                        with: None,
+                        body: Box::new(SetExpr::Select(select.clone())),
+                        ..source.as_ref().clone()
+                    };
+                    reserve_variables(&mut new_source, &modified_bindings);
+                    if let Some(condition) = condition
+                        && let SetExpr::Select(new_select) = new_source.body.as_mut()
+                    {
                         new_select.selection = Some(match new_select.selection.take() {
                             Some(existing) => {
                                 Expr::BinaryOp {
@@ -1824,14 +1860,6 @@ impl PlPgSqlTranslator {
                             None => condition,
                         });
                     }
-
-                    // Substituted before the `WITH` is attached, which already
-                    // reads its variables.
-                    let mut new_source = Query {
-                        with: None,
-                        body: Box::new(SetExpr::Select(Box::new(new_select))),
-                        ..source.as_ref().clone()
-                    };
                     substitute_variables(&mut new_source, &variables)?;
                     new_source.with = CteBuilder::combine_ctes(ctes);
 
@@ -1972,6 +2000,7 @@ impl PlPgSqlTranslator {
     /// carry the enclosing `IF` condition in a `WHERE` clause.
     fn transform_values_to_select(
         values: &sqlparser::ast::Values,
+        bindings: &[Binding],
         variables: &VariableScope,
         condition: Option<Expr>,
     ) -> Result<SetExpr, Error> {
@@ -1981,8 +2010,11 @@ impl PlPgSqlTranslator {
             ));
         };
 
-        let projections =
+        let mut projections: Vec<SelectItem> =
             row.content.iter().map(|expr| SelectItem::UnnamedExpr(expr.clone())).collect();
+        // Reserved before the guard joins, whose translated SQL reads no
+        // variable.
+        reserve_variables(&mut projections, bindings);
         let mut body =
             SetExpr::Select(Box::new(make_simple_select(projections, Vec::new(), condition)));
         substitute_variables(&mut body, variables)?;
@@ -2001,6 +2033,8 @@ impl PlPgSqlTranslator {
         let ordered = Self::order_bindings_by_dependency(bindings);
         let mut values = Vec::with_capacity(ordered.len());
         let mut scope = VariableScope::default();
+        let reserved = reserved_variables(bindings);
+        let reserved_options = options.with_variables(&reserved);
 
         for binding in ordered {
             let expr = match &binding.value {
@@ -2015,9 +2049,10 @@ impl PlPgSqlTranslator {
             };
             let mut renamed = expr.clone();
             Self::transform_expr(&mut renamed, options);
+            reserve_variables(&mut renamed, bindings);
             // A value that does not translate, or reads a refused name, is
             // refused itself, so only a statement reading it fails.
-            let mut value = match renamed.translate_with_warnings(schema, options, emit) {
+            let mut value = match renamed.translate_with_warnings(schema, &reserved_options, emit) {
                 Ok(translated) => translated,
                 Err(error) => {
                     scope.refuse(&binding.name, &error.to_string());
@@ -2137,19 +2172,25 @@ impl VisitorMut for VariableSubstituter<'_> {
 
     /// Post-order, so the replacement subquery is not walked into again.
     fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<String> {
-        let Some(name) = bare_identifier(expr).map(fold) else { return ControlFlow::Continue(()) };
-        if let Some(reason) = self.0.refusal(&name) {
+        let Some(reserved) = bare_identifier(expr).map(fold) else {
+            return ControlFlow::Continue(());
+        };
+        let Some(name) = reserved.strip_prefix(RESERVED_VARIABLE_PREFIX) else {
+            return ControlFlow::Continue(());
+        };
+        if let Some(reason) = self.0.refusal(name) {
             return ControlFlow::Break(reason.to_string());
         }
-        if let Some(replacement) = self.0.replacement(&name) {
+        if let Some(replacement) = self.0.replacement(name) {
             *expr = replacement.clone();
         }
         ControlFlow::Continue(())
     }
 }
 
-/// Rewrites every read of a bound variable anywhere inside `node`, failing on
-/// a read of one the emitted trigger cannot compute.
+/// Rewrites every read of a bound variable that [`reserve_variables`] renamed
+/// anywhere inside `node`, failing on a read of one the emitted trigger cannot
+/// compute.
 fn substitute_variables<N: VisitMut>(node: &mut N, scope: &VariableScope) -> Result<(), Error> {
     if scope.is_empty() {
         return Ok(());
@@ -2158,6 +2199,42 @@ fn substitute_variables<N: VisitMut>(node: &mut N, scope: &VariableScope) -> Res
         ControlFlow::Break(reason) => Err(Error::forward_refusal(reason)),
         ControlFlow::Continue(()) => Ok(()),
     }
+}
+
+/// What a read of a bound variable is renamed to before translation, followed
+/// by the variable's name.
+///
+/// The translation emits identifiers of its own, such as the `a` and `v` the
+/// interval comparison key aliases its columns as, and a substitution by the
+/// written name after translation would read those as the variable too. The
+/// translation emits no name under this prefix.
+const RESERVED_VARIABLE_PREFIX: &str = "pg2sqlite_variable_";
+
+/// Renames every bare read of a variable `bindings` binds anywhere inside
+/// `node` to its reserved name.
+fn reserve_variables<N: VisitMut>(node: &mut N, bindings: &[Binding]) {
+    if bindings.is_empty() {
+        return;
+    }
+    let _: ControlFlow<()> = visit_expressions_mut(node, |expr| {
+        if let Some(name) = bare_identifier(expr).map(fold)
+            && bindings.iter().any(|binding| binding.name == name)
+        {
+            *expr = Expr::Identifier(Ident::new(format!("{RESERVED_VARIABLE_PREFIX}{name}")));
+        }
+        ControlFlow::Continue(())
+    });
+}
+
+/// The names a translation of a node [`reserve_variables`] renamed reads as
+/// variables, each binding under its written and its reserved name.
+fn reserved_variables(bindings: &[Binding]) -> Vec<String> {
+    bindings
+        .iter()
+        .flat_map(|binding| {
+            [binding.name.clone(), format!("{RESERVED_VARIABLE_PREFIX}{}", binding.name)]
+        })
+        .collect()
 }
 
 /// True when `node` reads the variable `var_name`, folded, anywhere inside it.
@@ -2586,7 +2663,7 @@ mod tests {
 
     use super::{
         Binding, BodyScope, BoundValue, PlPgSqlTranslator, ReferenceForm, TriggerFacts,
-        VariableScope, may_raise, references_variable, substitute_variables,
+        VariableScope, may_raise, references_variable, reserve_variables, substitute_variables,
     };
     use crate::{
         impls::test_fixtures::{empty_schema, parse_expr, parse_query},
@@ -2607,6 +2684,20 @@ mod tests {
         Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap().remove(0)
     }
 
+    /// `sql` with every bare read of a variable of `names` renamed to its
+    /// reserved name, as the body is before translation.
+    fn reserved(sql: &str, names: &[&str]) -> Expr {
+        let bindings: Vec<Binding> = names
+            .iter()
+            .map(|name| {
+                Binding { name: (*name).to_string(), value: BoundValue::Expr(parse_expr("NULL")) }
+            })
+            .collect();
+        let mut expression = parse_expr(sql);
+        reserve_variables(&mut expression, &bindings);
+        expression
+    }
+
     #[test]
     fn transform_values_to_select_handles_empty_scope_and_rejects_multi_row_values() {
         let query = parse_query("VALUES (1)");
@@ -2616,6 +2707,7 @@ mod tests {
 
         let transformed = PlPgSqlTranslator::transform_values_to_select(
             values,
+            &[],
             &VariableScope::default(),
             Some(parse_expr("TRUE")),
         )
@@ -2633,6 +2725,7 @@ mod tests {
         };
         let error = PlPgSqlTranslator::transform_values_to_select(
             multi_values,
+            &[],
             &VariableScope::default(),
             None,
         )
@@ -2646,20 +2739,20 @@ mod tests {
         let mut scope = VariableScope::default();
         scope.bind("v_id", ReferenceForm::Cte.reference("v_id", &parse_expr("42")));
 
-        let mut expression = parse_expr("(v_id + 1) * other");
+        let mut expression = reserved("(v_id + 1) * other", &["v_id"]);
         substitute_variables(&mut expression, &scope).unwrap();
         assert_eq!(expression.to_string(), "((SELECT val FROM v_id) + 1) * other");
 
         let mut inline = VariableScope::default();
         inline.bind("v_id", ReferenceForm::Inline.reference("v_id", &parse_expr("count(*)")));
-        let mut expression = parse_expr("v_id + 1");
+        let mut expression = reserved("v_id + 1", &["v_id"]);
         substitute_variables(&mut expression, &inline).unwrap();
         assert_eq!(expression.to_string(), "(SELECT count(*)) + 1");
 
         // An expression that is already a subquery is read as it stands.
         let mut nested = VariableScope::default();
         nested.bind("v_id", ReferenceForm::Inline.reference("v_id", &parse_expr("(SELECT 1)")));
-        let mut expression = parse_expr("v_id");
+        let mut expression = reserved("v_id", &["v_id"]);
         substitute_variables(&mut expression, &nested).unwrap();
         assert_eq!(expression.to_string(), "(SELECT 1)");
     }
@@ -2669,11 +2762,11 @@ mod tests {
         let mut scope = VariableScope::default();
         scope.refuse("v", "why");
 
-        let mut expression = parse_expr("v + 1");
+        let mut expression = reserved("v + 1", &["v"]);
         let error = substitute_variables(&mut expression, &scope).unwrap_err();
         assert!(error.to_string().contains("why"));
 
-        let mut unrelated = parse_expr("other + 1");
+        let mut unrelated = reserved("other + 1", &["v"]);
         substitute_variables(&mut unrelated, &scope).unwrap();
         assert_eq!(unrelated.to_string(), "other + 1");
     }
@@ -3353,7 +3446,7 @@ mod tests {
                 format!("sum(x) FILTER (WHERE {read} > 0)"),
             ),
         ] {
-            let mut expression = parse_expr(&input);
+            let mut expression = reserved(&input, &["v_id"]);
             substitute_variables(&mut expression, &scope).unwrap();
             assert_eq!(expression.to_string(), expected, "substituting {input}");
         }
