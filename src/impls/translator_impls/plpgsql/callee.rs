@@ -590,8 +590,7 @@ fn reads_relation(expr: &Expr) -> bool {
 }
 
 /// `expr` with every variable `scope` binds written as the value it holds,
-/// and every declared variable it leaves unbound as `NULL`, so it reads the
-/// same outside the scope.
+/// so it reads the same outside the scope.
 ///
 /// # Errors
 ///
@@ -613,7 +612,6 @@ fn resolved(mut expr: Expr, scope: &BodyScope) -> Result<Expr, Error> {
         values.push((binding.name.clone(), value));
     }
     substitute(&mut expr, &values)?;
-    PlPgSqlTranslator::null_unbound_declarations(&mut expr, scope, &bindings);
     Ok(expr)
 }
 
