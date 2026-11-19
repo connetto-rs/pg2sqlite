@@ -313,6 +313,12 @@ impl PlPgSqlTranslator {
                     }
                 };
                 statements.extend(inlined.statements);
+                let value = match &helper.return_type {
+                    Some(FunctionReturnType::DataType(returned)) => {
+                        Self::converted_to(value, returned, schema, options)
+                    }
+                    _ => value,
+                };
                 *expr = Expr::Nested(Box::new(value));
                 Ok(())
             }

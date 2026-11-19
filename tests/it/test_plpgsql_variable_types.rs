@@ -216,3 +216,11 @@ fn an_unresolved_type_declaration_is_refused() {
         assert!(error.to_string().contains("%TYPE"), "unexpected error: {error}");
     }
 }
+
+/// A helper declared to return `interval` answers an interval, so its
+/// `24 hours` orders below `2 days`, where as text it sorts after.
+#[test]
+fn a_helper_result_orders_as_its_declared_return_type() {
+    let helper = "CREATE FUNCTION h() RETURNS interval LANGUAGE plpgsql AS $h$ BEGIN RETURN '24 hours'; END; $h$;";
+    assert!(raises(&guarded_script(helper, "", "", "h() < '2 days'", "1 day")));
+}
