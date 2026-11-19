@@ -12,12 +12,14 @@ use sqlparser_plpgsql::embedded::{
     LoopControl, Node, NodeKind, Open, RaiseLevel, ReturnQuery, Target,
 };
 
-use super::{DerivedWrite, Event, chain_phrase, function_writes, is_builtin, parsed_body};
+use super::{
+    DerivedWrite, Event, Reach, chain_phrase, function_writes, is_builtin, parsed_body,
+    rows::{self, Rows},
+};
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
 use crate::{
-    errors::Error,
-    impls::translator_impls::{plpgsql::relations_read, sql_helper::declared_helper},
+    errors::Error, impls::translator_impls::sql_helper::declared_helper,
     options::TranslationContext,
 };
 
@@ -25,9 +27,10 @@ use crate::{
 pub(super) enum Step {
     /// The write at this index of [`Chain::writes`].
     Write(usize),
-    /// A statement the replica keeps reads `relation`, folded, from the
-    /// function `reader` names, the chain to it the trigger's own first.
-    Read { relation: String, reader: Vec<String> },
+    /// A statement the replica keeps reads these rows of `relation`, folded,
+    /// from the function `reader` names, the chain to it the trigger's own
+    /// first.
+    Read { relation: String, rows: Rows, reader: Vec<String> },
     /// The end of a loop whose statements began at this index of
     /// [`Chain::steps`], which run again after it.
     LoopEnd(usize),
@@ -68,6 +71,9 @@ pub(super) struct Walker<'s, 'o, 'c> {
     /// write `FOUND` and `GET DIAGNOSTICS` report on, when its last
     /// statement setting them was one.
     functions: Vec<(&'s CreateFunction, Option<usize>)>,
+    /// The names each function being read may read as variables, as
+    /// [`rows::variables`] gives them.
+    variables: Vec<Vec<String>>,
     chain: Chain,
 }
 
@@ -84,8 +90,14 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
         schema: &'s ParserDB,
         options: &'o TranslationContext<'c>,
     ) -> Result<Chain, Error> {
-        let mut walker =
-            Self { schema, options, before, functions: Vec::new(), chain: Chain::default() };
+        let mut walker = Self {
+            schema,
+            options,
+            before,
+            functions: Vec::new(),
+            variables: Vec::new(),
+            chain: Chain::default(),
+        };
         walker.function(function)?;
         Ok(walker.chain)
     }
@@ -93,6 +105,11 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
     /// The functions being read, by name, the trigger's own first.
     fn names(&self) -> Vec<String> {
         self.functions.iter().map(|(function, _)| function.name().to_owned()).collect()
+    }
+
+    /// The names the function being read may read as variables.
+    fn variables(&self) -> &[String] {
+        self.variables.last().map_or(&[], Vec::as_slice)
     }
 
     fn function(&mut self, function: &'s CreateFunction) -> Result<(), Error> {
@@ -109,11 +126,16 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
         let body = parsed_body(function, self.schema)?;
         self.functions.push((function, None));
         let read = match &body {
-            super::Body::PlPgSql(block) => self.block(block),
+            super::Body::PlPgSql(block) => {
+                self.variables.push(rows::variables(function, block));
+                self.block(block)
+            }
             super::Body::Sql(statements) => {
+                self.variables.push(Vec::new());
                 statements.iter().try_for_each(|statement| self.kept(statement))
             }
         };
+        self.variables.pop();
         self.functions.pop();
         read
     }
@@ -293,7 +315,10 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
     /// makes stays and what follows reads the row it returns.
     fn into(&mut self, statement: &Statement, into: &IntoTargets) -> Result<(), Error> {
         let names = self.names();
-        let direct = super::statement_writes(statement, &names);
+        let direct = super::statement_writes(
+            statement,
+            Reach { chain: &names, variables: self.variables() },
+        );
         match direct.first() {
             Some(write) => {
                 let reason = format!(
@@ -362,7 +387,8 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
     /// `LANGUAGE sql` helpers it calls.
     fn removed_writes<N: Visit>(&self, node: &N) -> Result<Vec<DerivedWrite>, Error> {
         let mut names = self.names();
-        let mut writes = super::statement_writes(node, &names);
+        let mut writes =
+            super::statement_writes(node, Reach { chain: &names, variables: self.variables() });
         for helper in helpers(node, self.schema, self.options)? {
             function_writes(helper, self.schema, &mut Vec::new(), &mut names, &mut writes)?;
         }
@@ -372,7 +398,9 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
     /// Reads a statement or expression the replica keeps, where a write it
     /// holds cannot go alone.
     fn kept<N: Visit>(&mut self, node: &N) -> Result<(), Error> {
-        let direct = super::statement_writes(node, &self.names());
+        let names = self.names();
+        let direct =
+            super::statement_writes(node, Reach { chain: &names, variables: self.variables() });
         if let Some(first) = self.record(direct) {
             self.chain.inseparable.get_or_insert(first);
         }
@@ -409,8 +437,8 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
                 None => self.function(helper)?,
             }
         }
-        for relation in relations_read(node, self.schema) {
-            self.chain.steps.push(Step::Read { relation, reader: names.clone() });
+        for (relation, rows) in rows::read(node, self.schema, self.variables()) {
+            self.chain.steps.push(Step::Read { relation, rows, reader: names.clone() });
         }
         Ok(())
     }
@@ -492,7 +520,8 @@ fn removes(
     if helpers.iter().any(|helper| is_plpgsql(helper)) {
         return Ok(false);
     }
-    if !super::statement_writes(statement.as_ref(), &[]).is_empty() {
+    if !super::statement_writes(statement.as_ref(), Reach { chain: &[], variables: &[] }).is_empty()
+    {
         return Ok(true);
     }
     if !perform {
