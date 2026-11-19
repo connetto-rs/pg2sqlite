@@ -291,7 +291,7 @@ impl PlPgSqlTranslator {
                     }
                 }
                 let inlined = Self::inline_call(call, helper, scope, schema, options, emit)?;
-                let value = match inlined.result {
+                let mut value = match inlined.result {
                     Some(BoundValue::Expr(value)) => value,
                     Some(BoundValue::Unreadable(reason)) => {
                         return Err(refusal(
@@ -313,12 +313,11 @@ impl PlPgSqlTranslator {
                     }
                 };
                 statements.extend(inlined.statements);
-                let value = match &helper.return_type {
-                    Some(FunctionReturnType::DataType(returned)) => {
-                        Self::converted_to(value, returned, schema, options)
-                    }
-                    _ => value,
-                };
+                // A set-returning or `OUT`-parameter helper is refused before
+                // it is inlined.
+                if let Some(FunctionReturnType::DataType(returned)) = &helper.return_type {
+                    value = Self::converted_to(value, returned, schema, options);
+                }
                 *expr = Expr::Nested(Box::new(value));
                 Ok(())
             }
