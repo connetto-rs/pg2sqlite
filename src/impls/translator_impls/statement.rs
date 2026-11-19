@@ -24,8 +24,8 @@
 //! role holds no privilege on, and its indexes, its triggers, the foreign keys
 //! into it and every statement writing or altering it leave with it, as
 //! `off_replica` describes. `with_server_derived_writes_omitted` drops a
-//! trigger with a `LeftToServer` warning. Each is documented at the option
-//! that sets it.
+//! trigger, or the write statements of one it keeps, with a `LeftToServer`
+//! warning. Each is documented at the option that sets it.
 //!
 //! The match over `Statement` has no wildcard arm on purpose: a new
 //! `sqlparser` variant fails to compile until it is classified here, which is
@@ -52,7 +52,8 @@ use crate::{
     impls::{
         ast_builder,
         derived_writes::{
-            foreign_key_left_to_server, trigger_derived_write, trigger_left_to_server,
+            Disposition, foreign_key_left_to_server, trigger_disposition, trigger_left_to_server,
+            write_left_to_server,
         },
         object_name::{
             append_suffix, last_ident, last_ident_value_or_display,
@@ -116,7 +117,9 @@ fn append_guarded_statements(
 }
 
 /// Translates `create_trigger`, or leaves it to the server when the replica
-/// omits the writes the server derives and the trigger writes rows.
+/// omits the writes the server derives and the trigger depends on them or
+/// does nothing besides them. A trigger the replica keeps has those writes
+/// taken out, each reported.
 ///
 /// A replacing trigger left out still drops the trigger it replaces, which may
 /// have been kept.
@@ -127,21 +130,38 @@ fn append_translated_create_trigger_statements(
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<(), Error> {
-    if options.is_server_derived_writes_omitted()
-        && let Some(reason) = trigger_derived_write(create_trigger, schema)?
-    {
-        emit(trigger_left_to_server(create_trigger, reason));
-        if create_trigger.or_replace {
-            statements.push(Statement::DropTrigger(sqlparser::ast::DropTrigger {
-                if_exists: true,
-                trigger_name: normalize_schema_qualified_object_name_for_sqlite(
-                    schema,
-                    &create_trigger.name,
-                )?,
-                table_name: None,
-                option: None,
-            }));
+    if options.is_server_derived_writes_omitted() {
+        match trigger_disposition(create_trigger, schema, options)? {
+            Disposition::Kept => {}
+            Disposition::Stripped(writes) => {
+                for write in &writes {
+                    emit(write_left_to_server(create_trigger, write));
+                }
+            }
+            Disposition::LeftOut(reason) => {
+                emit(trigger_left_to_server(create_trigger, reason));
+                if create_trigger.or_replace {
+                    statements.push(Statement::DropTrigger(sqlparser::ast::DropTrigger {
+                        if_exists: true,
+                        trigger_name: normalize_schema_qualified_object_name_for_sqlite(
+                            schema,
+                            &create_trigger.name,
+                        )?,
+                        table_name: None,
+                        option: None,
+                    }));
+                }
+                return Ok(());
+            }
         }
+    }
+    if super::deferred_constraint::is_deferred(create_trigger) {
+        statements.extend(super::deferred_constraint::translate(
+            create_trigger,
+            schema,
+            options,
+            emit,
+        )?);
         return Ok(());
     }
     for (maybe_drop_trigger, translated_trigger) in
@@ -1834,19 +1854,15 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
                     return Ok(Vec::new());
                 }
 
-                if super::deferred_constraint::is_deferred(create_trigger) {
-                    super::deferred_constraint::translate(create_trigger, schema, options, emit)?
-                } else {
-                    let mut statements = vec![];
-                    append_translated_create_trigger_statements(
-                        &mut statements,
-                        create_trigger,
-                        schema,
-                        options,
-                        emit,
-                    )?;
-                    statements
-                }
+                let mut statements = vec![];
+                append_translated_create_trigger_statements(
+                    &mut statements,
+                    create_trigger,
+                    schema,
+                    options,
+                    emit,
+                )?;
+                statements
             }
             Self::Insert(insert) => {
                 vec![insert.translate_with_warnings(schema, options, emit)?.into()]

@@ -79,6 +79,7 @@ fn maintenance_chain(
             .map(|ident| ident.value.clone()),
         maintenance_refusal: None,
         after: matches!(trigger.period, Some(TriggerPeriod::After)),
+        removes_derived_writes: false,
     };
     let mut assigned: Vec<(String, Expr)> = Vec::new();
     for (col, raw) in trigger.maintenance_assignments(schema)? {
@@ -272,6 +273,9 @@ struct TriggerPart<'a> {
     /// Whether the trigger fires after the write, where PostgreSQL ignores
     /// the row the body returns.
     after: bool,
+    /// Whether the replica leaves the trigger's writes to the server, which
+    /// an `INSTEAD OF` trigger keeps as the view's own.
+    removes_derived_writes: bool,
 }
 
 /// Translates the trigger function's body into the shape `part` asks for.
@@ -295,6 +299,7 @@ fn generate_standard_trigger_body(
         table: crate::impls::object_name::last_ident(table_name).map(|ident| ident.value.clone()),
         maintenance_refusal: refusal.map(|refusal| (function_name.to_string(), refusal.clone())),
         after: part.after,
+        removes_derived_writes: part.removes_derived_writes,
     };
     // A definer body's calls run as its owner, whose privileges they need.
     let owner = crate::traits::schema::written_function(schema, function_name)?
@@ -683,6 +688,8 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
                     events: &part_events,
                     guard: in_body_guard.as_ref(),
                     after: plain && matches!(period, Some(TriggerPeriod::After)),
+                    removes_derived_writes: options.is_server_derived_writes_omitted()
+                        && !matches!(period, Some(TriggerPeriod::InsteadOf)),
                 },
                 &redirected_table_name,
                 maintenance_refusal.as_ref().and_then(Option::as_ref),

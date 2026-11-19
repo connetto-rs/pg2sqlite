@@ -104,7 +104,11 @@ fn populate_prewalk_catalogs(
         }
         if let Statement::CreateTrigger(trigger) = statement {
             use sqlparser::ast::{TriggerEvent, TriggerPeriod};
-            if let Some(deferred) = DeferredTrigger::of(trigger) {
+            // A trigger left to the server queues nothing on the replica.
+            if let Some(deferred) = DeferredTrigger::of(trigger)
+                && !crate::impls::object_name::last_ident(&trigger.name)
+                    .is_some_and(|name| context.is_server_derived_trigger_name(&name.value))
+            {
                 context.add_deferred_trigger(deferred);
             }
             if matches!(trigger.period, Some(TriggerPeriod::Before))
@@ -136,26 +140,40 @@ fn populate_prewalk_catalogs(
 /// Registers every trigger the replica leaves to the server, each read against
 /// the schema of its own epoch, so a trigger it keeps shares no slot with one
 /// that never reaches SQLite, and a
-/// `DROP TRIGGER` of one left out drops nothing. A trigger whose writes cannot
-/// be read counts as kept, and its translation reports why.
+/// `DROP TRIGGER` of one left out drops nothing. A trigger the replica keeps
+/// without its writes is not registered, and one whose writes cannot be read
+/// counts as kept, and its translation reports why.
 fn register_server_derived_triggers(
     statements: &[Statement],
     epochs: &[PreparedEpoch],
+    initial_schema: Option<&ParserDB>,
     context: &mut TranslationContext<'_>,
 ) {
     if !context.is_server_derived_writes_omitted() {
         return;
     }
+    let initial_triggers = initial_schema.into_iter().flat_map(|schema| {
+        use sql_traits::traits::DatabaseLike;
+        schema.triggers()
+    });
+    context.set_firing_triggers(crate::impls::derived_writes::firing_triggers(
+        initial_triggers,
+        statements,
+    ));
+    let mut left_out = Vec::new();
     for epoch in epochs {
         for statement in &statements[epoch.start..epoch.end] {
             let Statement::CreateTrigger(trigger) = statement else { continue };
-            if let Ok(Some(_)) =
-                crate::impls::derived_writes::trigger_derived_write(trigger, &epoch.schema)
+            if let Ok(crate::impls::derived_writes::Disposition::LeftOut(_)) =
+                crate::impls::derived_writes::trigger_disposition(trigger, &epoch.schema, context)
                 && let Some(name) = crate::impls::object_name::last_ident(&trigger.name)
             {
-                context.add_server_derived_trigger_name(name.value.as_str());
+                left_out.push(name.value.as_str());
             }
         }
+    }
+    for name in left_out {
+        context.add_server_derived_trigger_name(name);
     }
 }
 
@@ -846,7 +864,7 @@ impl Pg2Sqlite {
             initial_schema,
         } = prepared;
         let statements = &*sources;
-        register_server_derived_triggers(statements, &epochs, context);
+        register_server_derived_triggers(statements, &epochs, initial_schema.as_ref(), context);
         populate_prewalk_catalogs(statements, initial_schema.as_ref(), context);
         let mut trigger_slots =
             crate::impls::translator_impls::trigger_slots::TriggerSlots::seeded(

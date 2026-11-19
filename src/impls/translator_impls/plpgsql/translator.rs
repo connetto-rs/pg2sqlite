@@ -191,6 +191,9 @@ impl PlPgSqlTranslator {
         options: &crate::options::TranslationContext<'_>,
         emit: crate::warnings::WarningSink<'_>,
     ) -> Result<Vec<Statement>, Error> {
+        if facts.removes_derived_writes {
+            crate::impls::derived_writes::without_removed_writes(&mut block, schema, options)?;
+        }
         let mut scope = BodyScope::new(facts);
         Self::open_body(&block, &mut scope, options)?;
         block.statements = without_early_returns(core::mem::take(&mut block.statements));

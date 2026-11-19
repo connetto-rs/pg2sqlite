@@ -211,6 +211,9 @@ pub(crate) struct PrewalkCatalogs {
     /// The names of the triggers left to the server, whose `DROP TRIGGER`
     /// finds nothing on the replica.
     server_derived_trigger_names: Vec<String>,
+    /// The triggers the schema holds once the translation unit has run,
+    /// which the server fires around the writes it derives.
+    firing_triggers: Vec<crate::impls::derived_writes::FiringTrigger>,
     /// The folded table and trigger names of the row triggers sharing a
     /// table, timing and event with another, whose `WHEN` moves into the body
     /// so the slot can run them as one SQLite trigger.
@@ -925,6 +928,21 @@ impl<'a> TranslationContext<'a> {
         self.catalogs.server_derived_trigger_names.iter().any(|left| left == name)
     }
 
+    /// Records the triggers the schema holds once the translation unit has
+    /// run.
+    pub(crate) fn set_firing_triggers(
+        &mut self,
+        triggers: Vec<crate::impls::derived_writes::FiringTrigger>,
+    ) {
+        self.catalogs.to_mut().firing_triggers = triggers;
+    }
+
+    /// The triggers the schema holds once the translation unit has run.
+    #[must_use]
+    pub(crate) fn firing_triggers(&self) -> &[crate::impls::derived_writes::FiringTrigger] {
+        &self.catalogs.firing_triggers
+    }
+
     pub(crate) fn add_before_insert_trigger_fn(
         &mut self,
         table_name: String,
@@ -1453,10 +1471,17 @@ impl Pg2SqliteOptions {
     /// triggers and cascades when it applies them.
     ///
     /// A `BEFORE` or `AFTER` trigger whose function runs `INSERT`, `UPDATE`,
-    /// `DELETE`, `MERGE` or `TRUNCATE`, directly or in a function it calls, is
-    /// left out, since the server derives those rows again from the uploaded
-    /// one. A trigger that only refuses a write, reads, or sets columns of its
-    /// own `NEW` row stays, and so does every `INSTEAD OF` trigger, whose
+    /// `DELETE`, `MERGE` or `TRUNCATE`, directly or in a function it calls,
+    /// stays without those statements, since the server derives those rows
+    /// again from the uploaded one, and keeps its refusals and its reads. It
+    /// is left out whole when nothing else is left of it, when it assigns to
+    /// `NEW` beside them, and when what it keeps reads what a write the
+    /// server derives produces before it within the same write: a later
+    /// statement of its own, `FOUND` or the row such a write returns, or a
+    /// table another trigger or a foreign key action writes before it fires,
+    /// a deferred one after every other. A trigger that only refuses a write,
+    /// reads, or sets columns of its own `NEW` row stays as it is unless it
+    /// reads such a table, and so does every `INSTEAD OF` trigger, whose
     /// writes are the view's own. A foreign key whose `ON DELETE` or
     /// `ON UPDATE` action is `CASCADE`, `SET NULL` or `SET DEFAULT` is left
     /// out whole, since kept as `NO ACTION` it would refuse an offline delete
