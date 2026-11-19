@@ -28,8 +28,9 @@ use sql_traits::{
 };
 use sqlparser::{
     ast::{
-        AlterTable, AlterTableOperation, ColumnOption, CreateTable, DataType, Ident, ObjectName,
-        ObjectType, RenameTableNameKind, Statement, TableConstraint, visit_relations_mut,
+        AlterTable, AlterTableOperation, ColumnOption, CreateTable, DataType, Expr, Ident,
+        ObjectName, ObjectNamePart, ObjectType, RenameTableNameKind, Statement, TableConstraint,
+        visit_expressions_mut, visit_relations_mut,
     },
     dialect::SQLiteDialect,
     parser::Parser,
@@ -475,8 +476,11 @@ pub(crate) fn rebuild(
         )));
     }
 
-    let aside = append_suffix(target, "_pg2sqlite_rebuild");
-    let aside_name = sqlite_unqualified_object_name(&aside);
+    // The old table is dropped rather than renamed aside, the order SQLite
+    // documents, since a legacy rename checks the old definition's column
+    // references qualified with the table's own name against the new name.
+    let fresh = append_suffix(target, "_pg2sqlite_rebuild");
+    let table_name = sqlite_unqualified_object_name(target);
     let mut statements = Vec::new();
     if referenced.is_some() {
         let message = format!(
@@ -494,10 +498,10 @@ pub(crate) fn rebuild(
              DROP TABLE temp.pg2sqlite_foreign_keys_off;"
         ))?);
     }
-    statements.extend(sqlite(&format!(
-        "PRAGMA legacy_alter_table = 1; ALTER TABLE {target} RENAME TO {aside_name};"
-    ))?);
-    statements.push(Statement::CreateTable(created.clone()));
+    let mut renamed = created.clone();
+    renamed.name = fresh.clone();
+    unqualify_own_columns(&mut renamed, &table_name);
+    statements.push(Statement::CreateTable(renamed));
     let copied: Vec<String> = core::iter::once("rowid".to_string())
         .chain(
             created
@@ -514,20 +518,23 @@ pub(crate) fn rebuild(
         .collect();
     let copied = copied.join(", ");
     statements
-        .extend(sqlite(&format!("INSERT INTO {target} ({copied}) SELECT {copied} FROM {aside};"))?);
+        .extend(sqlite(&format!("INSERT INTO {fresh} ({copied}) SELECT {copied} FROM {target};"))?);
     if autoincrements(created) {
-        // The aside's high-water mark follows the rename, and the refill
-        // left a lower one under the table's name.
-        let (table, aside) = (
+        // The table's high-water mark moves to the new table before the drop
+        // removes it, and the rename carries it back under the table's name.
+        let (table, fresh) = (
             single_quoted(&last_ident_value_or_display(target)),
-            single_quoted(&last_ident_value_or_display(&aside)),
+            single_quoted(&last_ident_value_or_display(&fresh)),
         );
         statements.extend(sqlite(&format!(
-            "DELETE FROM sqlite_sequence WHERE name = {table}; \
-             UPDATE sqlite_sequence SET name = {table} WHERE name = {aside};"
+            "DELETE FROM sqlite_sequence WHERE name = {fresh}; \
+             UPDATE sqlite_sequence SET name = {fresh} WHERE name = {table};"
         ))?);
     }
-    statements.extend(sqlite(&format!("DROP TABLE {aside};"))?);
+    statements.extend(sqlite(&format!(
+        "DROP TABLE {target}; PRAGMA legacy_alter_table = 1; \
+         ALTER TABLE {fresh} RENAME TO {table_name};"
+    ))?);
 
     let companions: Vec<&Statement> =
         post_drop.iter().filter(|statement| attached_to(statement, &owner).is_some()).collect();
@@ -541,6 +548,22 @@ pub(crate) fn rebuild(
         statements.extend(sqlite("PRAGMA foreign_keys = 1;")?);
     }
     Ok(Some(statements))
+}
+
+/// Strips `table`, the name `create` takes after the rebuild, from the column
+/// references of its definition, which SQLite resolves against the name the
+/// table is created under.
+fn unqualify_own_columns(create: &mut CreateTable, table: &ObjectName) {
+    let Some(ObjectNamePart::Identifier(table)) = table.0.last() else { return };
+    let _ = visit_expressions_mut(create, |expr| {
+        if let Expr::CompoundIdentifier(parts) = expr
+            && let [.., qualifier, column] = parts.as_slice()
+            && same_identifier(qualifier, table)
+        {
+            *expr = Expr::Identifier(column.clone());
+        }
+        ControlFlow::<()>::Continue(())
+    });
 }
 
 /// Whether `create` keeps a high-water mark in `sqlite_sequence`.
