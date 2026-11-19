@@ -8,7 +8,8 @@
 
 use sqlparser::ast::{
     BinaryOperator, CaseWhen, CastKind, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArguments, UnaryOperator, Value, ValueWithSpan, helpers::attached_token::AttachedToken,
+    FunctionArgumentList, FunctionArguments, UnaryOperator, Value, ValueWithSpan,
+    helpers::attached_token::AttachedToken,
 };
 
 use crate::impls::{
@@ -508,10 +509,13 @@ pub(crate) fn boolean_truthiness(expr: Expr) -> Expr {
     not_predicate(not_predicate(expr))
 }
 
-/// The PostgreSQL aggregate and its operand when `func` is `max` or `min`
-/// over the [`boolean_truthiness`] shape, or `None` for anything else.
+/// The PostgreSQL aggregate and its arguments without the lowering when
+/// `func` is `max` or `min` over the [`boolean_truthiness`] shape, or `None`
+/// for anything else.
 #[must_use]
-pub(crate) fn boolean_aggregate_operand(func: &Function) -> Option<(&'static str, &Expr)> {
+pub(crate) fn boolean_aggregate_unlowered(
+    func: &Function,
+) -> Option<(&'static str, FunctionArguments)> {
     let [name] = func.name.0.as_slice() else {
         return None;
     };
@@ -520,25 +524,27 @@ pub(crate) fn boolean_aggregate_operand(func: &Function) -> Option<(&'static str
         "min" => "bool_and",
         _ => return None,
     };
-    let FunctionArguments::List(list) = &func.args else {
-        return None;
-    };
-    let [FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))] = list.args.as_slice() else {
-        return None;
-    };
-    let Expr::UnaryOp { op: UnaryOperator::Not, expr: outer } = argument else {
-        return None;
-    };
-    let Expr::Nested(outer) = outer.as_ref() else {
-        return None;
-    };
-    let Expr::UnaryOp { op: UnaryOperator::Not, expr: inner } = outer.as_ref() else {
-        return None;
-    };
-    let Expr::Nested(operand) = inner.as_ref() else {
-        return None;
-    };
-    Some((aggregate, operand))
+    if let FunctionArguments::List(list) = &func.args
+        && let [
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::UnaryOp {
+                op: UnaryOperator::Not,
+                expr: outer,
+            })),
+        ] = list.args.as_slice()
+        && let Expr::Nested(outer) = outer.as_ref()
+        && let Expr::UnaryOp { op: UnaryOperator::Not, expr: inner } = outer.as_ref()
+        && let Expr::Nested(operand) = inner.as_ref()
+    {
+        return Some((
+            aggregate,
+            FunctionArguments::List(FunctionArgumentList {
+                duplicate_treatment: list.duplicate_treatment,
+                args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(operand.as_ref().clone()))],
+                clauses: list.clauses.clone(),
+            }),
+        ));
+    }
+    None
 }
 
 /// Returns the inner `Function` if `func` matches
@@ -693,15 +699,15 @@ mod tests {
                 simple_function_expr(extremum, vec![boolean_truthiness(ident_expr("flag"))], None);
             for shape in [built.clone(), parse_expr(&built)] {
                 assert_eq!(
-                    boolean_aggregate_operand(&call_of(shape)),
-                    Some((aggregate, &ident_expr("flag")))
+                    boolean_aggregate_unlowered(&call_of(shape)),
+                    Some((aggregate, call(aggregate, vec![ident_expr("flag")]).args))
                 );
             }
         }
         // One negation is not the shape.
         let single = call("max", vec![not_predicate(ident_expr("flag"))]);
-        assert_eq!(boolean_aggregate_operand(&single), None);
-        assert_eq!(boolean_aggregate_operand(&call("max", vec![ident_expr("flag")])), None);
+        assert_eq!(boolean_aggregate_unlowered(&single), None);
+        assert_eq!(boolean_aggregate_unlowered(&call("max", vec![ident_expr("flag")])), None);
     }
 
     fn parse_expr(built: &Expr) -> Expr {
