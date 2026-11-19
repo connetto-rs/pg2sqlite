@@ -2363,11 +2363,12 @@ fn partial_row(name: &str) -> String {
 
 /// The type a declaration gives its variable, `%TYPE` read from the column or
 /// the earlier variable it names, or `None` for `%ROWTYPE` and for a `%TYPE`
-/// naming nothing that resolves.
+/// naming a variable declared without a type.
 ///
 /// # Errors
 ///
-/// Propagates a failure to look the named table up in `schema`.
+/// Refuses a `%TYPE` naming no table column or earlier variable, as
+/// PostgreSQL does, and propagates a failure to look the table up.
 fn declared_data_type(
     declared: &DeclaredType,
     scope: &BodyScope,
@@ -2378,27 +2379,30 @@ fn declared_data_type(
         DeclaredType::RowType { .. } => return Ok(None),
         DeclaredType::ColumnType { of, array } => (of, *array),
     };
-    let mut parts = of.0.iter().map(|part| {
-        match part {
-            ObjectNamePart::Identifier(ident) => Some(ident),
-            ObjectNamePart::Function(_) => None,
-        }
-    });
-    let Some(Some(column)) = parts.next_back() else { return Ok(None) };
-    let Some(relation) = parts.map(|part| part.cloned()).collect::<Option<Vec<Ident>>>() else {
-        return Ok(None);
+    let unresolved = || {
+        Error::forward_refusal(format!(
+            "`{of}%TYPE` names no table column or earlier variable, and PostgreSQL refuses \
+             the declaration."
+        ))
     };
+    let names: Option<Vec<&Ident>> = of.0.iter().map(ObjectNamePart::as_ident).collect();
+    let (column, relation) =
+        names.as_deref().and_then(<[&Ident]>::split_last).ok_or_else(unresolved)?;
     let element = if relation.is_empty() {
-        scope.declared_type(&fold(column)).cloned()
+        let name = fold(column);
+        if !scope.declares(&name) {
+            return Err(unresolved());
+        }
+        scope.declared_type(&name).cloned()
     } else {
-        let relation = ObjectName::from(relation);
-        let Some(table) = crate::impls::object_name::resolve_translation_table(schema, &relation)?
-        else {
-            return Ok(None);
-        };
-        table
+        let relation =
+            ObjectName::from(relation.iter().map(|&ident| ident.clone()).collect::<Vec<_>>());
+        let table = crate::impls::object_name::resolve_translation_table(schema, &relation)?
+            .ok_or_else(unresolved)?;
+        let column = table
             .column(&column.value, schema, crate::impls::object_name::COLUMN_LOOKUP_CASE)?
-            .map(|found| found.attribute().data_type.clone())
+            .ok_or_else(unresolved)?;
+        Some(column.attribute().data_type.clone())
     };
     Ok(element.map(|element| {
         if array {
@@ -3807,5 +3811,28 @@ mod tests {
         };
         let mut full_from = full_select.from[0].clone();
         PlPgSqlTranslator::transform_table_with_joins(&mut full_from, &options);
+    }
+
+    /// `t.d%TYPE[]` declares an array of the column's type, as `INTERVAL[]`
+    /// written out does.
+    #[test]
+    fn a_column_type_array_declaration_is_an_array_of_the_column_type() {
+        let schema = ParserDB::from_statements(
+            Parser::parse_sql(&PostgreSqlDialect {}, "CREATE TABLE t (id INT, d INTERVAL);")
+                .unwrap(),
+            "test".to_string(),
+        )
+        .unwrap();
+        let declared = sqlparser_plpgsql::embedded::DeclaredType::ColumnType {
+            of: sqlparser::ast::ObjectName::from(vec![
+                sqlparser::ast::Ident::new("t"),
+                sqlparser::ast::Ident::new("d"),
+            ]),
+            array: true,
+        };
+        let data_type = super::declared_data_type(&declared, &BodyScope::default(), &schema)
+            .unwrap()
+            .expect("a type");
+        assert_eq!(data_type.to_string(), "INTERVAL[]");
     }
 }

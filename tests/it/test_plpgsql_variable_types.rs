@@ -202,3 +202,17 @@ fn a_variable_type_declaration_orders_as_the_variable_type() {
     assert!(!raises(&guarded_log(declarations, "v > '10 days'", "9 days")));
     assert!(raises(&guarded_log(declarations, "v < '10 days'", "9 days")));
 }
+
+/// A `%TYPE` naming no table, no column or no earlier variable is refused,
+/// as PostgreSQL refuses the declaration.
+#[test]
+fn an_unresolved_type_declaration_is_refused() {
+    for declarations in ["v nosuch.d%TYPE;", "v t.nosuch%TYPE;", "v w%TYPE;"] {
+        let translated = Pg2Sqlite::default()
+            .sql(&guarded_log(declarations, "v IS NULL", "1 day"))
+            .expect("parse")
+            .translate_to_sql(&Pg2SqliteOptions::default());
+        let error = translated.err().unwrap_or_else(|| panic!("`{declarations}` translated"));
+        assert!(error.to_string().contains("%TYPE"), "unexpected error: {error}");
+    }
+}
