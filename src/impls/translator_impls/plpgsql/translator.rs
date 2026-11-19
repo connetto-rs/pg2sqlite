@@ -875,7 +875,10 @@ impl PlPgSqlTranslator {
         scope.begin_if();
         let mut negated: Vec<Expr> = Vec::new();
         let mut outer = scope.scoped_bindings();
-        let mut branches: Vec<(Option<Expr>, Vec<Binding>)> = Vec::new();
+        // Each condition is recorded where it is tested, so an assignment
+        // under the `IF` leaves the merge reading the values it tested.
+        let tested_from = scope.tested_count();
+        let mut assigned: Vec<Vec<Binding>> = Vec::new();
 
         for Branch { condition, statements } in &conditional.branches {
             scope.restore_scoped(&outer);
@@ -893,6 +896,7 @@ impl PlPgSqlTranslator {
                 written
             };
             let translated = Self::translate_condition(&written, scope, schema, options, emit)?;
+            scope.record_tested(written);
             let guard = if negated.is_empty() {
                 translated.clone()
             } else {
@@ -907,13 +911,15 @@ impl PlPgSqlTranslator {
                 result.extend(Self::translate_node(function, node, scope, schema, options, emit)?);
             }
             scope.pop_condition();
-            branches.push((Some(written), Self::assignments_made(scope, &outer)));
+            assigned.push(Self::assignments_made(scope, &outer));
             // A `NULL` condition is not true, so it leaves the later branches
             // to run, as in PostgreSQL.
             negated.push(Expr::IsNotTrue(Box::new(Expr::Nested(Box::new(translated)))));
         }
 
-        if !conditional.otherwise.is_empty() {
+        let otherwise = if conditional.otherwise.is_empty() {
+            None
+        } else {
             scope.push_condition(conjunction(negated.into_iter()));
             scope.restore_scoped(&outer);
             scope.clear_uuid_first_use();
@@ -921,9 +927,16 @@ impl PlPgSqlTranslator {
                 result.extend(Self::translate_node(function, node, scope, schema, options, emit)?);
             }
             scope.pop_condition();
-            branches.push((None, Self::assignments_made(scope, &outer)));
-        }
+            Some(Self::assignments_made(scope, &outer))
+        };
 
+        let branches: Vec<(Option<Expr>, Vec<Binding>)> = scope
+            .take_tested(tested_from)
+            .into_iter()
+            .map(Some)
+            .zip(assigned)
+            .chain(otherwise.map(|assignments| (None, assignments)))
+            .collect();
         let written = scope.end_if();
         scope.restore_scoped(&outer);
         Self::bind_branch_assignments(scope, &outer, &branches);
@@ -979,7 +992,7 @@ impl PlPgSqlTranslator {
                     None => otherwise = assigned.value.clone(),
                 }
             }
-            scope.bind(Binding {
+            scope.bind_merged(Binding {
                 name: name.to_string(),
                 value: Self::merged_value(arms, otherwise),
             });

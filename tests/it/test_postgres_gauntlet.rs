@@ -138,3 +138,6 @@ mod parity_bool_aggregates;
 
 #[path = "gauntlet/parity_per_row_checks.rs"]
 mod parity_per_row_checks;
+
+#[path = "gauntlet/parity_trigger_variable_reassignment.rs"]
+mod parity_trigger_variable_reassignment;

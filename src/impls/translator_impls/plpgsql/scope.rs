@@ -8,10 +8,11 @@ use sql_traits::{
     traits::{DatabaseLike, ViewLike},
 };
 use sqlparser::ast::{
-    BinaryOperator, CaseWhen, DataType, Expr, Ident, TableFactor, TriggerEvent, Visit, Visitor,
-    helpers::attached_token::AttachedToken,
+    BinaryOperator, CaseWhen, DataType, Expr, Ident, TableFactor, TriggerEvent, Value, Visit,
+    Visitor, helpers::attached_token::AttachedToken, visit_expressions, visit_expressions_mut,
 };
 
+use super::translator::bare_identifier;
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
 use crate::options::BoundVariable;
@@ -81,6 +82,30 @@ pub(crate) enum BoundValue {
     Row(RowValue),
 }
 
+impl BoundValue {
+    /// Whether the value reads the variable `name`, folded.
+    fn reads_variable(&self, name: &str) -> bool {
+        match self {
+            Self::Expr(expr) => reads_variable(expr, name),
+            Self::Row(row) => row.reads_variable(name),
+            Self::Unreadable(_) => false,
+        }
+    }
+
+    /// Rewrites each read of the variable `name`, folded, to `replacement`.
+    fn replace_reads(&mut self, name: &str, replacement: &Expr) {
+        match self {
+            Self::Expr(expr) => replace_reads(expr, name, replacement),
+            Self::Row(row) => {
+                row.for_each_condition_mut(&mut |condition| {
+                    replace_reads(condition, name, replacement);
+                });
+            }
+            Self::Unreadable(_) => {}
+        }
+    }
+}
+
 /// The whole row a record variable holds.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum RowValue {
@@ -133,6 +158,41 @@ impl RowValue {
             otherwise.for_each_condition_mut(visit);
         }
     }
+
+    /// Whether a condition choosing the row reads the variable `name`.
+    fn reads_variable(&self, name: &str) -> bool {
+        match self {
+            Self::Chosen { arms, otherwise } => {
+                arms.iter().any(|(condition, row)| {
+                    reads_variable(condition, name) || row.reads_variable(name)
+                }) || otherwise.reads_variable(name)
+            }
+            Self::Trigger(_) | Self::Unassigned => false,
+        }
+    }
+}
+
+/// Whether `expr` reads the variable `name`, folded.
+fn reads_variable(expr: &Expr, name: &str) -> bool {
+    visit_expressions(expr, |expr| {
+        if bare_identifier(expr).is_some_and(|ident| fold(ident) == name) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .is_break()
+}
+
+/// Rewrites each read of the variable `name`, folded, in `expr` to
+/// `replacement`.
+fn replace_reads(expr: &mut Expr, name: &str, replacement: &Expr) {
+    let _: ControlFlow<()> = visit_expressions_mut(expr, |expr| {
+        if bare_identifier(expr).is_some_and(|ident| fold(ident) == name) {
+            *expr = replacement.clone();
+        }
+        ControlFlow::Continue(())
+    });
 }
 
 /// A variable and the value it holds.
@@ -229,6 +289,12 @@ pub(crate) struct BodyScope {
     conditions: Vec<Expr>,
     /// The relations written under each enclosing `IF`, innermost last.
     writes_under_if: Vec<BTreeSet<String>>,
+    /// The conditions of the enclosing `IF`s that the merge of their
+    /// branches reads, outermost first.
+    tested: Vec<Expr>,
+    /// The variable each value bound under a name of its own held before an
+    /// assignment replaced it, by that name.
+    earlier: BTreeMap<String, String>,
     uuid_first_use: BTreeMap<String, UuidFirstUse>,
     /// Every relation the body wrote, views expanded.
     written: BTreeSet<String>,
@@ -311,18 +377,116 @@ impl BodyScope {
     }
 
     /// Binds `binding` for the rest of the body, across `IF` branches.
-    pub(crate) fn bind_persistent(&mut self, binding: Binding) {
+    pub(crate) fn bind_persistent(&mut self, mut binding: Binding) {
+        self.keep_earlier_reads(&mut binding);
         self.persistent.insert(binding.name.clone(), binding);
     }
 
     /// Binds `binding` until the enclosing branch ends.
-    pub(crate) fn bind(&mut self, binding: Binding) {
+    pub(crate) fn bind(&mut self, mut binding: Binding) {
+        self.keep_earlier_reads(&mut binding);
         self.scoped.insert(binding.name.clone(), binding);
     }
 
-    /// Every binding in force, the scoped ones first.
+    /// Binds `binding`, a variable the branches of an `IF` assigned, merged
+    /// over them, until the enclosing branch ends. Each read an assignment
+    /// under the `IF` replaced already reads the value it read.
+    pub(crate) fn bind_merged(&mut self, binding: Binding) {
+        self.scoped.insert(binding.name.clone(), binding);
+    }
+
+    /// Makes each read of `binding`'s variable in the bindings in force, the
+    /// tested `IF` conditions and `binding`'s own value read the value the
+    /// variable holds before `binding` replaces it. PostgreSQL computes a
+    /// value where it is assigned, and a binding is translated where it is
+    /// read.
+    ///
+    /// The earlier value is bound under a name of its own, so a value read
+    /// many times is still computed once per statement. A generated UUID's
+    /// first `INSERT` goes with the earlier value, since the variable's new
+    /// value generates another.
+    fn keep_earlier_reads(&mut self, binding: &mut Binding) {
+        let name = binding.name.as_str();
+        let first_use = self.uuid_first_use.remove(name);
+        let read = binding.value.reads_variable(name)
+            || self
+                .scoped
+                .values()
+                .chain(self.persistent.values())
+                .any(|other| other.name != name && other.value.reads_variable(name))
+            || self.tested.iter().any(|condition| reads_variable(condition, name));
+        if !read {
+            return;
+        }
+        let replacement = match self.scoped.get(name).or_else(|| self.persistent.get(name)) {
+            Some(earlier) => {
+                let value = earlier.value.clone();
+                let held = self.unused_name();
+                if let Some(first_use) = first_use {
+                    self.uuid_first_use.insert(held.clone(), first_use);
+                }
+                // Declared with the variable's type, so a read of the earlier
+                // value translates as a read of the variable does.
+                let data_type = self.declared.get(name).cloned().flatten();
+                self.declared.insert(held.clone(), data_type);
+                self.earlier.insert(held.clone(), name.to_string());
+                self.persistent.insert(held.clone(), Binding { name: held.clone(), value });
+                Expr::Identifier(Ident::new(held))
+            }
+            None if self.declared.contains_key(name) => Expr::Value(Value::Null.with_empty_span()),
+            None => return,
+        };
+        binding.value.replace_reads(name, &replacement);
+        for other in self.scoped.values_mut().chain(self.persistent.values_mut()) {
+            if other.name != name {
+                other.value.replace_reads(name, &replacement);
+            }
+        }
+        for condition in &mut self.tested {
+            replace_reads(condition, name, &replacement);
+        }
+    }
+
+    /// A name no variable is declared or bound under, for the value a
+    /// variable held before an assignment.
+    fn unused_name(&self) -> String {
+        let mut index = self.earlier.len();
+        loop {
+            let name = format!("pg2sqlite_earlier_{index}");
+            if !self.declared.contains_key(&name)
+                && !self.scoped.contains_key(&name)
+                && !self.persistent.contains_key(&name)
+            {
+                return name;
+            }
+            index += 1;
+        }
+    }
+
+    /// Records `condition`, an `IF` condition just tested, which the merge of
+    /// the `IF`'s branches reads, so an assignment under the `IF` leaves it
+    /// reading the values it tested.
+    pub(crate) fn record_tested(&mut self, condition: Expr) {
+        self.tested.push(condition);
+    }
+
+    /// How many tested conditions are recorded, where an `IF` starts
+    /// recording its own.
+    pub(crate) fn tested_count(&self) -> usize {
+        self.tested.len()
+    }
+
+    /// The conditions recorded from `start` on, no longer recorded.
+    pub(crate) fn take_tested(&mut self, start: usize) -> Vec<Expr> {
+        self.tested.split_off(start)
+    }
+
+    /// Every binding in force, the scoped ones first, each shadowing the
+    /// persistent binding of its name.
     pub(crate) fn bindings(&self) -> impl Iterator<Item = &Binding> {
-        self.scoped.values().chain(self.persistent.values())
+        self.scoped.values().chain(
+            self.persistent.values().filter(|binding| !self.scoped.contains_key(&binding.name)),
+        )
     }
 
     /// The variable each binding in force binds, with the type its
@@ -380,12 +544,12 @@ impl BodyScope {
         self.written.insert(relation.to_string());
         for binding in self.scoped.values_mut().chain(self.persistent.values_mut()) {
             if binding.reads(relation, schema) {
+                let variable = self.earlier.get(&binding.name).unwrap_or(&binding.name);
                 binding.value = BoundValue::Unreadable(format!(
-                    "`{}` reads `{relation}`, which the body writes before this read, and a \
-                     SQLite trigger computes a variable again at each read where PostgreSQL \
+                    "`{variable}` reads `{relation}`, which the body writes before this read, and \
+                     a SQLite trigger computes a variable again at each read where PostgreSQL \
                      keeps the value it assigned. Read the variable before the write, or \
-                     compute the value in the statement that needs it.",
-                    binding.name
+                     compute the value in the statement that needs it."
                 ));
             }
         }
