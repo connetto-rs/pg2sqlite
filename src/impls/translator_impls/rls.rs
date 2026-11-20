@@ -2006,11 +2006,6 @@ fn generate_rls_view_statement_with_context(
     grants: &RoleTable,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Statement, Error> {
-    let ctx = RlsTriggerContext::new(table, options);
-    let projection = grants
-        .readable()
-        .map(|column| SelectItem::UnnamedExpr(Expr::Identifier(quoted_ident(column))))
-        .collect();
     let selection = match rls_read_predicate(table, schema, options, emit)? {
         PolicyPredicate::DenyAll => {
             Some(Expr::Value(ValueWithSpan {
@@ -2021,6 +2016,20 @@ fn generate_rls_view_statement_with_context(
         PolicyPredicate::AllowAll => None,
         PolicyPredicate::Expr(predicate) => Some(*predicate),
     };
+    Ok(backing_view(&RlsTriggerContext::new(table, options), grants, selection))
+}
+
+/// The view named after the table, reading the columns `grants` lets it read
+/// from the backing table, filtered by `selection`.
+fn backing_view(
+    ctx: &RlsTriggerContext<'_>,
+    grants: &RoleTable,
+    selection: Option<Expr>,
+) -> Statement {
+    let projection = grants
+        .readable()
+        .map(|column| SelectItem::UnnamedExpr(Expr::Identifier(quoted_ident(column))))
+        .collect();
     let query = make_query(
         None,
         SetExpr::Select(Box::new(make_simple_select(
@@ -2029,7 +2038,26 @@ fn generate_rls_view_statement_with_context(
             selection,
         ))),
     );
-    Ok(ast_builder::create_view(generated_object_name(ctx.table_name), Vec::new(), query))
+    ast_builder::create_view(generated_object_name(ctx.table_name), Vec::new(), query)
+}
+
+/// The view standing for `table` until every relation its policy view and
+/// guards read exists. It reads every row and forwards every write to the
+/// backing table, as PostgreSQL's table owner does before a policy binds it.
+///
+/// # Errors
+///
+/// Propagates a lookup failure and a default that cannot be translated.
+pub(crate) fn generate_pass_through_view_statements(
+    table: &CreateTable,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Vec<Statement>, Error> {
+    let grants = RoleTable::of(table, None, schema)?;
+    let mut statements = vec![backing_view(&RlsTriggerContext::new(table, options), &grants, None)];
+    statements.extend(forwarding_view_triggers(table, schema, options, &grants, None, emit)?);
+    Ok(statements)
 }
 
 /// `RAISE(ABORT, 'permission denied for table <t>')` where `violation` holds,
@@ -2813,21 +2841,38 @@ fn generate_readonly_view_trigger_sql(
     if options.get_write_exemption_function().is_none() {
         return Ok(Vec::new());
     }
+    let refusal = ast_builder::raise_statement(
+        "ABORT",
+        Some(&read_only(table.table_name())),
+        write_guard_condition_expr(None, options),
+    );
+    forwarding_view_triggers(table, schema, options, grants, Some(&refusal), emit)
+}
+
+/// The `INSTEAD OF` triggers forwarding a write on the view to the backing
+/// table, each running `refusal` first when one is given.
+///
+/// # Errors
+///
+/// Propagates a lookup failure and a default that cannot be translated.
+fn forwarding_view_triggers(
+    table: &CreateTable,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    grants: &RoleTable,
+    refusal: Option<&Statement>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Vec<Statement>, Error> {
     let ctx = RlsTriggerContext::new(table, options);
     let table_name = ctx.table_name;
     let backing = || generated_object_name(&ctx.inner_table_name);
-    let refusal = ast_builder::raise_statement(
-        "ABORT",
-        Some(&read_only(table_name)),
-        write_guard_condition_expr(None, options),
-    );
     let columns = trigger_columns(table, schema, options, Some(grants))?;
-    let mut insert = vec![refusal.clone()];
+    let mut insert: Vec<Statement> = refusal.into_iter().cloned().collect();
     insert.extend(refuse_computed_write_statements(&columns, table_name, GuardKind::Insert));
     insert.push(forwarding_insert(&ctx.inner_table_name, &columns, schema, options, emit)?);
 
-    let mut update = vec![refusal.clone()];
-    let mut delete = vec![refusal];
+    let mut update: Vec<Statement> = refusal.into_iter().cloned().collect();
+    let mut delete: Vec<Statement> = refusal.into_iter().cloned().collect();
     if let Some(column) = unreadable_key_column(table, schema, grants)? {
         let unfound =
             ast_builder::raise_statement("ABORT", Some(&unreadable_key(table_name, &column)), None);

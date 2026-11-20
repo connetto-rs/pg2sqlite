@@ -2,9 +2,10 @@ use sqlparser::{
     ast::{
         Assignment, BeginEndStatements, ColumnDef, ConditionalStatements, CreateTable,
         CreateTableOptions, CreateTrigger, CreateView, Delete, Expr, FromTable,
-        HiveDistributionStyle, Ident, Insert, ObjectName, Query, SelectItem, SqliteTableOption,
-        SqliteTableOptions, Statement, TableObject, TriggerEvent, TriggerObject, TriggerObjectKind,
-        TriggerPeriod, Update, Values, ViewColumnDef, helpers::attached_token::AttachedToken,
+        HiveDistributionStyle, Ident, Insert, ObjectName, ObjectType, Query, SelectItem,
+        SqliteTableOption, SqliteTableOptions, Statement, TableObject, TriggerEvent, TriggerObject,
+        TriggerObjectKind, TriggerPeriod, Update, Values, ViewColumnDef,
+        helpers::attached_token::AttachedToken,
     },
     keywords::Keyword,
     tokenizer::{Token, TokenWithSpan, Word},
@@ -250,6 +251,20 @@ pub(crate) fn create_view(
         to: None,
         params: None,
     })
+}
+
+/// `DROP VIEW [IF EXISTS] name`.
+pub(crate) fn drop_view(name: ObjectName, if_exists: bool) -> Statement {
+    Statement::Drop {
+        object_type: ObjectType::View,
+        if_exists,
+        names: vec![name],
+        cascade: false,
+        restrict: false,
+        purge: false,
+        temporary: false,
+        table: None,
+    }
 }
 
 pub(crate) fn select_statement(query: Query) -> Statement {

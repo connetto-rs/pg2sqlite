@@ -337,16 +337,8 @@ fn translate_view_definition(
 ) -> Result<Vec<Statement>, Error> {
     let mut statements: Vec<Statement> = Vec::new();
     if create_view.or_replace {
-        statements.push(Statement::Drop {
-            object_type: ObjectType::View,
-            if_exists: true,
-            names: vec![sqlite_unqualified_object_name(&create_view.name)],
-            cascade: false,
-            restrict: false,
-            purge: false,
-            temporary: false,
-            table: None,
-        });
+        statements
+            .push(ast_builder::drop_view(sqlite_unqualified_object_name(&create_view.name), true));
     }
     statements.push(create_view.translate_with_warnings(schema, options, emit)?.into());
     Ok(statements)

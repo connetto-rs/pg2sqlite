@@ -24,6 +24,7 @@ pub(crate) use definer_helper::check_lateral_calls;
 pub(crate) mod delete;
 pub(crate) mod expr;
 pub(crate) mod function;
+pub(crate) mod held_views;
 mod helpers;
 pub(crate) use helpers::Forward;
 pub(crate) mod hidden_referenced_rows;

@@ -414,6 +414,32 @@ impl PreparedEpoch {
     }
 }
 
+/// The pass-through view standing for the table `create_table`, statement
+/// `index` of the batch, until the relations its final view reads exist.
+fn pass_through_view(
+    epochs: &[PreparedEpoch],
+    context: &TranslationContext<'_>,
+    index: usize,
+    create_table: &sqlparser::ast::CreateTable,
+) -> Result<Vec<Statement>, crate::errors::Error> {
+    use sql_traits::traits::TableLike;
+
+    let epoch =
+        epochs.iter().find(|epoch| epoch.end > index).expect("the epochs cover every statement");
+    let table = crate::impls::object_name::resolve_declared_table(&epoch.schema, create_table)?
+        .ok_or_else(|| {
+            sql_traits::errors::ObjectKind::Table.not_in_database(create_table.table_name())
+        })?;
+    // The final view's triggers forward the same defaults and already reported
+    // what translating them warns about.
+    crate::impls::translator_impls::rls::generate_pass_through_view_statements(
+        table,
+        &epoch.schema,
+        &context.with_written_schema(epoch.written(index)),
+        &mut |_| {},
+    )
+}
+
 struct PreparedSchema<'a> {
     /// The statements as written, with each unnamed index given its name.
     sources: Cow<'a, [Statement]>,
@@ -445,6 +471,9 @@ struct PreparedStatements<'a> {
     /// Whether each statement's emitted triggers were rebuilt from other
     /// statements' triggers sharing their slots.
     rebuilt_triggers: Vec<bool>,
+    /// Whether a view held back until the relations it reads exist moved out
+    /// of or into each statement's emitted statements.
+    held_views: Vec<bool>,
     /// Tables the translation adds before the source's statements.
     prelude: Vec<Statement>,
     warnings: Vec<crate::warnings::TranslationWarning>,
@@ -990,6 +1019,13 @@ impl Pg2Sqlite {
                 }
             }
         }
+        let held_views = crate::impls::translator_impls::held_views::hold_forward_views(
+            statements,
+            &mut translated,
+            initial_schema.as_ref(),
+            options.get_rls_table_suffix(),
+            |index, create_table| pass_through_view(&epochs, context, index, create_table),
+        )?;
 
         let schema = schema?;
         let prelude = generated_prelude(&translated, &schema, &options, had_rls_tables, context)?;
@@ -1008,6 +1044,7 @@ impl Pg2Sqlite {
             options,
             statements: translated,
             rebuilt_triggers,
+            held_views,
             prelude: prelude.into_iter().map(|(_, statement)| statement).collect(),
             warnings,
             epochs,
@@ -1028,6 +1065,7 @@ impl Pg2Sqlite {
             options: _,
             mut statements,
             rebuilt_triggers,
+            held_views,
             prelude,
             mut warnings,
             epochs,
@@ -1046,6 +1084,7 @@ impl Pg2Sqlite {
                     binding,
                     emitted: &statements[index],
                     rebuilt_trigger: rebuilt_triggers[index],
+                    held_view: held_views[index],
                     disposition: &dispositions[index],
                 }
             })
