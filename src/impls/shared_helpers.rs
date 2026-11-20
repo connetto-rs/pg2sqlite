@@ -2286,8 +2286,11 @@ pub(crate) fn convert_temporal_value(
         Some(operand) => (operand, false),
         None if source == Some(TimestampAwareness::Aware) => (expr, true),
         // The value already holds the column's text and only the precision
-        // rounds it.
-        None => return Ok(round_column_text(kind, expr)),
+        // rounds it, apart from a `time with time zone` whose offset may be
+        // printed as `±HH`.
+        None => {
+            return Ok(round_column_text(kind, stored_timetz_offset(kind, expr, options)));
+        }
     };
     if is_text
         && let Some(options) = options
@@ -2304,6 +2307,54 @@ pub(crate) fn convert_temporal_value(
         }
         Ok(utc_temporal_value(kind, instant, is_text))
     })
+}
+
+/// `value` with a `±HH` offset written as the `±HH:MM` a `timetz` column
+/// holds, when `kind` is `time with time zone`, and `value` itself otherwise.
+///
+/// `current_time` prints its offset as PostgreSQL does, `+00` or `+05:30`,
+/// and a value already in the column's form passes unchanged. The rewrite
+/// reads `value` twice, so an operand that may answer differently each time,
+/// such as a subquery over a relation, is left as written, as are a bound
+/// parameter, which is stored as bound, and a value with no options to judge
+/// it by. One of those holding a `±HH` offset then fails the column's
+/// `CHECK`.
+fn stored_timetz_offset(
+    kind: crate::impls::temporal_literals::TemporalLiteralKind,
+    value: Expr,
+    options: Option<&crate::options::TranslationContext<'_>>,
+) -> Expr {
+    use crate::impls::{
+        function_helpers::{number_literal, simple_function_expr, string_literal},
+        replay::is_replayable,
+        temporal_literals::TemporalLiteralKind,
+    };
+    let (TemporalLiteralKind::Time { zoned: true, .. }, Some(options)) = (kind, options) else {
+        return value;
+    };
+    if is_bound_parameter(&value) || !is_replayable(&value, options) {
+        return value;
+    }
+    let sign = simple_function_expr(
+        "substr",
+        vec![value.clone(), number_literal("-3"), number_literal("1")],
+        None,
+    );
+    Expr::Case {
+        case_token: AttachedToken::empty(),
+        end_token: AttachedToken::empty(),
+        operand: None,
+        conditions: vec![sqlparser::ast::CaseWhen {
+            condition: Expr::In {
+                expr: Box::new(sign),
+                target: InTarget::List(vec![string_literal("+"), string_literal("-")]),
+                negated: false,
+                global: false,
+            },
+            result: crate::impls::expr_helpers::concat(value.clone(), string_literal(":00")),
+        }],
+        else_result: Some(Box::new(value)),
+    }
 }
 
 /// [`convert_temporal_value`] of an instant read in UTC. `is_text` says

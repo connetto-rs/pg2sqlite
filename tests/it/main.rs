@@ -330,6 +330,7 @@ mod test_trunc;
 mod test_trunc_scale_range;
 mod test_truncate;
 mod test_type_fidelity;
+mod test_typed_text_checks;
 mod test_unknown_functions;
 mod test_untyped_array_assignment;
 mod test_uuid_blob_column_default;
