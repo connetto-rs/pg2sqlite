@@ -340,6 +340,7 @@ mod test_uuid_version;
 mod test_value_fidelity_coverage;
 mod test_vector_dimensionless;
 mod test_vector_rls;
+mod test_view_triggers;
 mod test_views;
 mod test_window_functions;
 mod test_window_spec_expr_recursion;

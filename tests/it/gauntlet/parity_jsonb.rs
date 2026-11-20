@@ -520,3 +520,78 @@ fn a_generated_jsonb_column_stores_the_canonical_text() {
         &["SELECT body::text AS value FROM docs"],
     );
 }
+
+/// One document per value kind, in `body` as `jsonb` and in `j` as `json`
+/// spelled without whitespace, which PostgreSQL's `json` keeps as written and
+/// SQLite's JSON functions drop.
+const KINDS: Step = Step::Sql(
+    r#"INSERT INTO docs (id, body, j) VALUES
+       (1, '{"a": "x"}', '{"a":"x"}'),
+       (2, '{"a": 7}', '{"a":7}'),
+       (3, '{"a": 1.50}', '{"a":1.50}'),
+       (4, '{"a": true}', '{"a":true}'),
+       (5, '{"a": null}', '{"a":null}'),
+       (6, '{"a": {"c": [1, 2.0], "b": 1.50}}', '{"a":{"c":[1,2.0],"b":1.50}}'),
+       (7, '{"a": [10, "y", null]}', '{"a":[10,"y",null]}'),
+       (8, '{}', '{}'),
+       (9, '[{"a": 1}]', '[{"a":1}]'),
+       (10, '{"a.b": 1, "a\"b": 2, "$x": 3, "": 4, " 1": 5}', '{"a.b":1,"a\"b":2,"$x":3,"":4," 1":5}')"#,
+);
+
+#[test]
+fn extract_path_answers_the_value_as_a_document() {
+    assert_parity(
+        TABLE,
+        &[KINDS],
+        &[
+            "SELECT jsonb_extract_path(body, 'a')::text AS value FROM docs ORDER BY id",
+            "SELECT json_extract_path(j, 'a')::text AS value FROM docs ORDER BY id",
+            "SELECT jsonb_extract_path(body, 'a', 'b')::text AS value FROM docs ORDER BY id",
+            "SELECT json_extract_path(j, 'a', 'c')::text AS value FROM docs ORDER BY id",
+            "SELECT jsonb_extract_path(body, 'a', '1')::text AS value FROM docs ORDER BY id",
+            "SELECT json_extract_path(j, 'a', '0')::text AS value FROM docs ORDER BY id",
+            "SELECT jsonb_extract_path(body, '0', 'a')::text AS value FROM docs ORDER BY id",
+            "SELECT jsonb_extract_path(body, 'a', ' 1')::text AS value FROM docs ORDER BY id",
+            "SELECT jsonb_extract_path(body, 'a.b')::text || jsonb_extract_path(body, 'a\"b')::text \
+             || json_extract_path(j, '$x')::text || jsonb_extract_path(body, '')::text \
+             || jsonb_extract_path(body, ' 1')::text AS value FROM docs WHERE id = 10",
+        ],
+    );
+}
+
+#[test]
+fn extract_path_compares_as_jsonb() {
+    assert_parity(
+        TABLE,
+        &[KINDS],
+        &[
+            r#"SELECT id::text AS value FROM docs WHERE jsonb_extract_path(body, 'a') IN ('"x"', '7.0', '1.5', 'true', 'null', '{"b": 1.5, "c": [1.0, 2]}') ORDER BY id"#,
+            "SELECT id::text AS value FROM docs WHERE jsonb_extract_path(body, 'a') = body -> 'a' \
+             ORDER BY id",
+            "SELECT id::text AS value FROM docs WHERE jsonb_extract_path(body, 'a') IS NOT NULL \
+             ORDER BY jsonb_extract_path(body, 'a'), id",
+            "SELECT CASE WHEN json_extract_path(j, 'a')::jsonb = '1.500' THEN 'equal' ELSE \
+             'unequal' END AS value FROM docs WHERE id = 3",
+        ],
+    );
+}
+
+#[test]
+fn extract_path_is_stored_as_jsonb() {
+    assert_parity(
+        TABLE,
+        &[
+            KINDS,
+            Step::Sql(
+                "INSERT INTO docs (id, body) SELECT id + 100, jsonb_extract_path(body, 'a') FROM \
+                 docs WHERE id < 100",
+            ),
+            Step::Sql(
+                "INSERT INTO docs (id, body) SELECT id + 200, json_extract_path(j, 'a') FROM docs \
+                 WHERE id < 100",
+            ),
+            Step::Sql("UPDATE docs SET body = jsonb_extract_path(body, 'a', 'c') WHERE id = 6"),
+        ],
+        &["SELECT id::text || ' ' || coalesce(body::text, 'NULL') AS value FROM docs ORDER BY id"],
+    );
+}

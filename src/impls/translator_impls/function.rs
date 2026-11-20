@@ -97,8 +97,12 @@ enum FunctionTranslation {
         func_label: &'static str,
         fractional_seconds: bool,
     },
-    /// Transform json_extract_path(j, keys...) to json_extract(j, '$.k1.k2...')
+    /// Transform json_extract_path_text(j, keys...) to json_extract(j,
+    /// '$.k1.k2...')
     ToJsonExtractPath,
+    /// `json_extract_path` and `jsonb_extract_path`, read as the `#>` chain
+    /// of SQLite arrows their path spells.
+    JsonExtractPath { function: &'static str },
     /// Transform `jsonb_set` and `jsonb_insert` to the `json_set`,
     /// `json_replace`, or `json_insert` that matches, converting the `text[]`
     /// path to JSONPath and keeping the value typed as JSON.
@@ -839,9 +843,13 @@ fn translate_catalog_function(
     // jsonb_set / jsonb_insert: path and value both need converting.
     "jsonb_set" => FunctionTranslation::JsonSet { insert: false },
     "jsonb_insert" => FunctionTranslation::JsonSet { insert: true },
-    // json_extract_path* -> json_extract(j, '$.k1.k2...')
-    "json_extract_path" | "json_extract_path_text" | "jsonb_extract_path"
-    | "jsonb_extract_path_text" => FunctionTranslation::ToJsonExtractPath,
+    // json(b)_extract_path(j, keys...) -> j -> '$."k1"' -> '$."k2"'
+    "json_extract_path" => FunctionTranslation::JsonExtractPath { function: "json_extract_path" },
+    "jsonb_extract_path" => {
+        FunctionTranslation::JsonExtractPath { function: "jsonb_extract_path" }
+    }
+    // json(b)_extract_path_text -> json_extract(j, '$.k1.k2...')
+    "json_extract_path_text" | "jsonb_extract_path_text" => FunctionTranslation::ToJsonExtractPath,
     // date_part('field', expr) -> CAST(strftime(format, expr) AS type)
     "date_part" => FunctionTranslation::DatePart,
     // lpad / rpad: not in standard SQLite
@@ -2255,6 +2263,28 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                     }
                 }
                 Ok(make_closed_form(format, &translated, fractional_seconds))
+            }
+            FunctionTranslation::JsonExtractPath { function } => {
+                let exprs = function_argument_exprs(&func.args);
+                let Some((document, path)) =
+                    exprs.split_first().filter(|(_, path)| !path.is_empty())
+                else {
+                    return Err(crate::errors::Error::forward_refusal(format!(
+                        "{function} requires at least 2 arguments"
+                    )));
+                };
+                let Some(elements) = path
+                    .iter()
+                    .map(|element| crate::impls::function_helpers::single_quoted_literal(element))
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    return Err(crate::errors::Error::forward_refusal(format!(
+                        "{function} requires string literal keys for SQLite translation"
+                    )));
+                };
+                crate::impls::translator_impls::expr::translate_json_extract_path(
+                    function, document, &elements, schema, options, emit,
+                )
             }
             FunctionTranslation::ToJsonExtractPath => {
                 // json_extract_path(j, 'k1', 'k2') → json_extract(j, '$.k1.k2')

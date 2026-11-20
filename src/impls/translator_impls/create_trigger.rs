@@ -1,6 +1,9 @@
+use alloc::borrow::Cow;
+
 use sql_traits::{
+    errors::LookupError,
     structs::{MaintenanceRefusal, ParserDB},
-    traits::{ColumnLike, TriggerLike},
+    traits::{ColumnLike, DatabaseLike, Relation, TableLike, TriggerLike, ViewLike},
 };
 use sqlparser::{
     ast::{
@@ -736,6 +739,46 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
             ));
         }
         Ok(parts)
+    }
+}
+
+/// The relation a trigger fires on, which SQLite drops the trigger with.
+#[derive(Clone, Copy)]
+pub(crate) enum TriggerRelation<'db> {
+    /// A table or a foreign table.
+    Table(&'db <ParserDB as DatabaseLike>::Table),
+    /// A plain view, the relation of an `INSTEAD OF` trigger.
+    View(&'db <ParserDB as DatabaseLike>::View),
+}
+
+impl TriggerRelation<'_> {
+    /// The name SQLite stores the relation under.
+    pub(crate) fn stored_name(&self) -> Cow<'_, str> {
+        match self {
+            Self::Table(table) => table.stored_table_name(),
+            Self::View(view) => view.stored_view_name(),
+        }
+    }
+}
+
+/// The relation `trigger` fires on in `schema`.
+///
+/// # Errors
+///
+/// Returns an error when the trigger's target resolves to no table, foreign
+/// table or view.
+pub(crate) fn trigger_relation<'db>(
+    trigger: &'db CreateTrigger,
+    schema: &'db ParserDB,
+) -> Result<TriggerRelation<'db>, LookupError> {
+    match trigger.relation(schema)? {
+        Relation::Table(table) | Relation::ForeignTable(table) => Ok(TriggerRelation::Table(table)),
+        Relation::View(view) => Ok(TriggerRelation::View(view)),
+        Relation::MaterializedView(_) | Relation::Sequence(_) => {
+            Err(LookupError::RelationNotFound {
+                object_name: trigger.target_relation_name().to_string(),
+            })
+        }
     }
 }
 

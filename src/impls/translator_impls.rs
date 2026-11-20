@@ -11,7 +11,7 @@ mod constraint_characteristic;
 mod copy;
 pub(crate) mod create_index;
 mod create_table;
-mod create_trigger;
+pub(crate) mod create_trigger;
 mod create_view;
 mod cte;
 pub(crate) mod drop_column_rebuild;

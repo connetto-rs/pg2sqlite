@@ -206,30 +206,6 @@ fn make_timestamp_to_printf() {
 }
 
 #[test]
-fn json_extract_path_to_json_extract() {
-    let sql = "SELECT json_extract_path('{\"a\": {\"b\": 1}}', 'a', 'b')";
-    let result = translate_sql(sql, &default_opts()).unwrap();
-    let lower = result.to_lowercase();
-    assert!(
-        lower.contains("json_extract("),
-        "json_extract_path should become json_extract: {result}"
-    );
-    sqlite_accepts(&result);
-}
-
-#[test]
-fn jsonb_extract_path_to_json_extract() {
-    let sql = "SELECT jsonb_extract_path('{\"a\": 1}', 'a')";
-    let result = translate_sql(sql, &default_opts()).unwrap();
-    let lower = result.to_lowercase();
-    assert!(
-        lower.contains("json_extract("),
-        "jsonb_extract_path should become json_extract: {result}"
-    );
-    sqlite_accepts(&result);
-}
-
-#[test]
 fn json_extract_path_text_to_json_extract() {
     let sql = "SELECT json_extract_path_text('{\"a\": 1}', 'a')";
     let result = translate_sql(sql, &default_opts()).unwrap();
