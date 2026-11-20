@@ -1476,56 +1476,15 @@ fn json_set_target_function(
 }
 
 /// Converts PostgreSQL's `text[]` path to the JSONPath string SQLite takes,
-/// so `'{a,b}'` and `ARRAY['a','b']` both become `$.a.b`.
+/// so `'{a,b}'` and `ARRAY['a','b']` both become `$."a"."b"`.
 ///
-/// A numeric element is refused rather than guessed. PostgreSQL decides at run
-/// time whether it indexes an array or names an object key, verified both ways
-/// against PostgreSQL 16: `'{arr,0}'` set element 0 of an array, and `'{0}'`
-/// set the key `"0"` of an object. JSONPath has to commit to one at translation
-/// time, and picking wrong writes to the wrong place silently.
+/// The empty path is refused. PostgreSQL answers the document unchanged when
+/// the value is not NULL and NULL when it is.
 fn json_path_from_text_array(path: &Expr, label: &str) -> Result<String, crate::errors::Error> {
-    let elements = match path {
-        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(literal), .. }) => {
-            let trimmed = literal.trim();
-            let inner = trimmed
-                .strip_prefix('{')
-                .and_then(|rest| rest.strip_suffix('}'))
-                .ok_or_else(|| json_path_not_literal(label, path))?;
-            inner.split(',').map(|element| element.trim().to_owned()).collect::<Vec<_>>()
-        }
-        Expr::Array(array) => {
-            array
-                .elem
-                .iter()
-                .map(|element| {
-                    match element {
-                        Expr::Value(ValueWithSpan {
-                            value: Value::SingleQuotedString(key),
-                            ..
-                        }) => Ok(key.clone()),
-                        other => Err(json_path_not_literal(label, other)),
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?
-        }
-        other => return Err(json_path_not_literal(label, other)),
-    };
-
-    if elements.iter().any(String::is_empty) {
-        return Err(json_path_not_literal(label, path));
-    }
-
-    let mut json_path = String::from("$");
-    for element in &elements {
-        if crate::impls::translator_impls::expr::is_numeric_path_element(element) {
-            return Err(crate::impls::translator_impls::expr::numeric_json_path_element(
-                label, element,
-            ));
-        }
-        json_path.push_str(&crate::impls::translator_impls::expr::sqlite_json_path_key(element));
-    }
-
-    Ok(json_path)
+    let elements = crate::impls::translator_impls::expr::text_array_path_elements(path)
+        .filter(|elements| !elements.is_empty())
+        .ok_or_else(|| json_path_not_literal(label, path))?;
+    crate::impls::translator_impls::expr::json_update_path(label, elements)
 }
 
 fn json_path_not_literal(label: &str, path: &Expr) -> crate::errors::Error {

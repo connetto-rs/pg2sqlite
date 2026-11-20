@@ -890,30 +890,6 @@ fn boolean_literal(value: bool) -> Expr {
     })
 }
 
-/// Convert a PostgreSQL text-array path literal `{a,b}` to a SQLite JSON path
-/// `$."a"."b"`.
-///
-/// Double-quoted keys have their outer quotes stripped first, since that is
-/// how PostgreSQL writes a key carrying a comma. `None` means the outer
-/// braces are missing.
-pub(crate) fn pg_text_path_to_sqlite_json_path(s: &str) -> Option<String> {
-    let inner = s.strip_prefix('{')?.strip_suffix('}')?;
-    if inner.is_empty() {
-        return Some("$".to_string());
-    }
-    let mut path = String::from("$");
-    for key in inner.split(',') {
-        let key = key.trim();
-        let key = if key.starts_with('"') && key.ends_with('"') && key.len() >= 2 {
-            &key[1..key.len() - 1]
-        } else {
-            key
-        };
-        path.push_str(&sqlite_json_path_key(key));
-    }
-    Some(path)
-}
-
 /// One `."key"` step of a SQLite JSON path.
 ///
 /// Every key is quoted, with its quotes and backslashes escaped, since SQLite
@@ -1010,13 +986,6 @@ pub(crate) fn numeric_json_path_element(construct: &str, element: &str) -> crate
          known to be an array, as json_remove(doc, '$[{element}]') or json_extract(doc, \
          '$[{element}]'), or name a key that is not a number."
     ))
-}
-
-/// True when `key` is written as a plain number, which a JSON path cannot
-/// read unambiguously.
-#[must_use]
-pub(crate) fn is_numeric_path_element(key: &str) -> bool {
-    !key.is_empty() && key.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// Convert a SQLite JSON path `$.a.b` to a PostgreSQL text-array path `{a,b}`.
@@ -1166,7 +1135,7 @@ fn translate_distinct_comparison(
 }
 
 /// One element of a PostgreSQL path, after quoting is gone.
-enum JsonPathElement {
+pub(crate) enum JsonPathElement {
     /// Integer-shaped, so PostgreSQL reads it by the runtime shape of the
     /// value at that depth: an index when it is an array, a key otherwise.
     /// `index` is the converted number and `verbatim` the element text, which
@@ -1209,7 +1178,7 @@ fn parse_text_array_path(literal: &str) -> Option<Vec<Option<JsonPathElement>>> 
             while chars.peek().is_some_and(|c| c.is_whitespace()) {
                 chars.next();
             }
-            Some(JsonPathElement::Key(text))
+            Some(classify_path_text(&text))
         } else {
             let mut text = String::new();
             while chars.peek().is_some_and(|c| *c != ',') {
@@ -1235,6 +1204,58 @@ fn parse_text_array_path(literal: &str) -> Option<Vec<Option<JsonPathElement>>> 
             Some(_) => return None,
         }
     }
+}
+
+/// The elements of a `'{a,b}'` or `ARRAY['a','b']` path, `None` when it is
+/// neither or malformed.
+pub(crate) fn text_array_path_elements(path: &Expr) -> Option<Vec<Option<JsonPathElement>>> {
+    match path {
+        Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(literal), .. }) => {
+            parse_text_array_path(literal)
+        }
+        Expr::Array(Array { elem, .. }) => {
+            elem.iter()
+                .map(|element| {
+                    match element {
+                        Expr::Value(ValueWithSpan { value: Value::Null, .. }) => Some(None),
+                        other => {
+                            single_quoted_literal(other).map(|text| Some(classify_path_text(text)))
+                        }
+                    }
+                })
+                .collect()
+        }
+        _ => None,
+    }
+}
+
+/// The SQLite JSON path naming `elements` for `construct`, which writes at
+/// that path and so cannot read a numeric element both ways as `#>` does.
+///
+/// # Errors
+///
+/// Refuses a NULL element, which PostgreSQL refuses, and a numeric one, which
+/// PostgreSQL reads as an index or a key by the value it meets.
+pub(crate) fn json_update_path(
+    construct: &str,
+    elements: Vec<Option<JsonPathElement>>,
+) -> Result<String, crate::errors::Error> {
+    let mut path = String::from("$");
+    for (position, element) in (1..).zip(elements) {
+        match element {
+            None => {
+                return Err(crate::errors::Error::forward_refusal(format!(
+                    "{construct} cannot take a NULL path element, as PostgreSQL refuses it with \
+                     `path element at position {position} is null`."
+                )));
+            }
+            Some(JsonPathElement::Numeric { verbatim, .. }) => {
+                return Err(numeric_json_path_element(construct, &verbatim));
+            }
+            Some(JsonPathElement::Key(key)) => path.push_str(&sqlite_json_path_key(&key)),
+        }
+    }
+    Ok(path)
 }
 
 /// Whether an element is integer-shaped, which decides the emitted form.
@@ -4091,39 +4112,21 @@ fn translate_binary_op(
                 Ok(fold_predicates(predicates, &fold_op, is_all))
             });
         }
-        // doc #- '{a,b}' -> json_remove(doc, '$.a.b')
-        // Reuses the same {a,b} -> $.a.b path conversion used by #> / #>>.
         BinaryOperator::HashMinus => {
             return rebuild(|| {
                 let translated_doc = left.translate_with_warnings(schema, options, emit)?;
-                let path = match right {
-                    Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => {
-                        if let Some(element) = s
-                            .trim_start_matches('{')
-                            .trim_end_matches('}')
-                            .split(',')
-                            .map(str::trim)
-                            .find(|element| is_numeric_path_element(element))
-                        {
-                            return Err(numeric_json_path_element("#-", element));
-                        }
-                        pg_text_path_to_sqlite_json_path(s).ok_or_else(|| {
-                            crate::errors::Error::forward_refusal(
-                                "#- path must be a '{key1,key2}' PostgreSQL text-array literal."
-                                    .to_string(),
-                            )
-                        })?
-                    }
-                    _ => {
-                        return Err(crate::errors::Error::forward_refusal(
-                            "#- path must be a '{key1,key2}' PostgreSQL text-array literal."
-                                .to_string(),
-                        ));
-                    }
-                };
+                let elements = text_array_path_elements(right).ok_or_else(|| {
+                    crate::errors::Error::forward_refusal(
+                        "#- path must be a '{key1,key2}' PostgreSQL text-array literal."
+                            .to_string(),
+                    )
+                })?;
+                if elements.is_empty() {
+                    return Ok(translated_doc);
+                }
                 Ok(simple_function_expr(
                     "json_remove",
-                    vec![translated_doc, string_literal(&path)],
+                    vec![translated_doc, string_literal(&json_update_path("#-", elements)?)],
                     None,
                 ))
             });
