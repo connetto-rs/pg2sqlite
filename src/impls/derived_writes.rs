@@ -614,20 +614,7 @@ fn referenced_rows_left_to_server<'o>(
     if triggers.peek().is_none() {
         return Ok(None);
     }
-    let columns: Vec<String> = if key.referred_columns.is_empty() {
-        schema
-            .tables()
-            .find(|declared| Some(declared.stored_table_name().as_ref()) == referenced.as_deref())
-            .map(|declared| {
-                declared
-                    .primary_key_columns(schema)
-                    .map(|columns| columns.map(|column| column.column_name().to_owned()).collect())
-            })
-            .transpose()?
-            .unwrap_or_default()
-    } else {
-        key.referred_columns.iter().map(fold).collect()
-    };
+    let columns = referenced_columns(key, referenced.as_deref(), schema)?;
     Ok(triggers
         .find(|rows| {
             rows.written.iter().any(|(relation, fresh)| {
@@ -635,6 +622,29 @@ fn referenced_rows_left_to_server<'o>(
             })
         })
         .map(|rows| rows.name.as_str()))
+}
+
+/// The columns `key` references in `referenced`, its table, folded: those it
+/// names, or else the primary key of the table.
+fn referenced_columns(
+    key: &ForeignKeyConstraint,
+    referenced: Option<&str>,
+    schema: &ParserDB,
+) -> Result<Vec<String>, Error> {
+    if !key.referred_columns.is_empty() {
+        return Ok(key.referred_columns.iter().map(fold).collect());
+    }
+    schema
+        .tables()
+        .find(|declared| Some(declared.stored_table_name().as_ref()) == referenced)
+        .map(|declared| {
+            declared
+                .primary_key_columns(schema)
+                .map(|columns| columns.map(|column| column.column_name().to_owned()).collect())
+        })
+        .transpose()
+        .map(Option::unwrap_or_default)
+        .map_err(Into::into)
 }
 
 /// Reports and answers `true` when the replica leaves out `key`, declared on
