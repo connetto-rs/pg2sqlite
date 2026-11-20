@@ -191,6 +191,7 @@ fn translate_check_constraint(
                 expr: Box::new(translated_expr),
                 enforced: check_constraint.enforced,
                 no_inherit: false,
+                on_conflict: check_constraint.on_conflict,
             })])
         }
         Err(_) if options.is_remove_unsupported_check_constraints_enabled() => Ok(Vec::new()),
@@ -283,6 +284,7 @@ fn match_full_guard(
         }),
         enforced: None,
         no_inherit: false,
+        on_conflict: None,
     })))
 }
 

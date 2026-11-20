@@ -3212,6 +3212,7 @@ pub(crate) fn generated_text_column(name: &str, check: Expr) -> ColumnDef {
             expr: Box::new(check),
             enforced: None,
             no_inherit: false,
+            on_conflict: None,
         }),
     });
     column
@@ -3256,6 +3257,7 @@ pub(crate) fn generated_key_column() -> ColumnDef {
                 include: Vec::new(),
                 index_options: Vec::new(),
                 characteristics: None,
+                on_conflict: None,
             }),
         }],
     }

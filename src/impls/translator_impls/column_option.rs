@@ -119,6 +119,7 @@ impl crate::traits::translator::TranslatorWithContext for ColumnOptionDef {
                             expr: Box::new(translated_expr),
                             enforced: check.enforced,
                             no_inherit: false,
+                            on_conflict: check.on_conflict,
                         }),
                     }))
                 }
