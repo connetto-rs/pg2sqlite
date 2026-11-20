@@ -223,12 +223,17 @@ pub(crate) struct PrewalkCatalogs {
     /// table, timing and event with another, whose `WHEN` moves into the body
     /// so the slot can run them as one SQLite trigger.
     shared_slot_triggers: alloc::collections::BTreeSet<(String, String)>,
-    /// The table name, lower-cased, and the function name of every `BEFORE
-    /// INSERT` trigger, which the RLS backing-table update check reads to
-    /// exempt the crate's own maintenance write. Only those two strings are
-    /// kept, since holding whole trigger nodes here costs link-time drop glue
-    /// out of proportion to the two fields the check needs.
-    before_insert_trigger_fns: Vec<(String, sqlparser::ast::ObjectName)>,
+    /// The table name, lower-cased, the function name and the event of every
+    /// `BEFORE INSERT` or `BEFORE UPDATE` trigger, one entry per event, which
+    /// the RLS backing-table update check reads to let the crate's own
+    /// maintenance write through. Only those fields are kept, since holding
+    /// whole trigger nodes here costs link-time drop glue out of proportion
+    /// to what the check needs.
+    before_row_trigger_fns: Vec<(
+        String,
+        sqlparser::ast::ObjectName,
+        crate::impls::translator_impls::reentry::MaintainedEvent,
+    )>,
     /// The triggers each table carries after the statements translated so
     /// far, which a write left off the replica with its table reads to find
     /// one PostgreSQL fires for it.
@@ -961,16 +966,23 @@ impl<'a> TranslationContext<'a> {
         &self.catalogs.server_rows
     }
 
-    pub(crate) fn add_before_insert_trigger_fn(
+    pub(crate) fn add_before_row_trigger_fn(
         &mut self,
         table_name: String,
         fn_name: sqlparser::ast::ObjectName,
+        event: crate::impls::translator_impls::reentry::MaintainedEvent,
     ) {
-        self.catalogs.to_mut().before_insert_trigger_fns.push((table_name, fn_name));
+        self.catalogs.to_mut().before_row_trigger_fns.push((table_name, fn_name, event));
     }
 
-    pub(crate) fn before_insert_trigger_fns(&self) -> &[(String, sqlparser::ast::ObjectName)] {
-        &self.catalogs.before_insert_trigger_fns
+    pub(crate) fn before_row_trigger_fns(
+        &self,
+    ) -> &[(
+        String,
+        sqlparser::ast::ObjectName,
+        crate::impls::translator_impls::reentry::MaintainedEvent,
+    )] {
+        &self.catalogs.before_row_trigger_fns
     }
 
     /// Follows the triggers `statement` creates, drops, or carries to a

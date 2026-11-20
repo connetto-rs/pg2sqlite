@@ -55,7 +55,7 @@ use crate::{
         shared_helpers::{
             join_constraint_mut, join_constraint_ref, minor_unit_scale, relations_scope_query,
         },
-        translator_impls::column::declared_default,
+        translator_impls::{column::declared_default, reentry::MaintainedEvent},
     },
     options::Pg2SqliteOptions,
     traits::translator::TranslatorWithContext,
@@ -2182,6 +2182,36 @@ enum Violation {
     Rows(Option<Box<Expr>>),
 }
 
+impl Violation {
+    /// The rows violating `self` or `other`.
+    fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Every, _) | (_, Self::Every) => Self::Every,
+            (Self::Rows(None), rows) | (rows, Self::Rows(None)) => rows,
+            (Self::Rows(Some(left)), Self::Rows(Some(right))) => {
+                Self::Rows(Some(Box::new(Expr::BinaryOp { left, op: BinaryOperator::Or, right })))
+            }
+        }
+    }
+
+    /// The rows violating `self` that `guard` holds for, every one of them
+    /// when `guard` is `None`.
+    fn restricted_to(self, guard: Option<Expr>) -> Self {
+        let Some(guard) = guard else { return self };
+        match self {
+            Self::Every => Self::Rows(Some(Box::new(guard))),
+            Self::Rows(None) => Self::Rows(None),
+            Self::Rows(Some(rows)) => {
+                Self::Rows(Some(Box::new(Expr::BinaryOp {
+                    left: Box::new(Expr::Nested(rows)),
+                    op: BinaryOperator::And,
+                    right: Box::new(guard),
+                })))
+            }
+        }
+    }
+}
+
 /// A predicate appearing twice, as a `FOR ALL USING (p)` policy's check and
 /// read-back do, is tested once.
 fn violation(predicates: impl IntoIterator<Item = PolicyPredicate>) -> Violation {
@@ -2319,32 +2349,27 @@ fn generate_insert_check_trigger_sql(
     )))
 }
 
-/// The violation condition of the backing-table `BEFORE UPDATE` deny guard
-/// that lets an `INSERT` maintenance trigger's own `UPDATE` through, `None`
-/// when the table has no such trigger.
+/// Whether `table` carries a `BEFORE` maintenance trigger firing on `event`,
+/// whose body writes the assigned values over the row with an `UPDATE` once
+/// `event` is done.
 ///
-/// A `BEFORE INSERT` maintenance trigger runs as an `AFTER INSERT` trigger
-/// whose body writes the assigned values over the row with an `UPDATE`,
-/// which the guard denies with every other `UPDATE` of a table without an
-/// `UPDATE` policy. The body holds the row in the table's marker table for
-/// the duration of its `UPDATE`, so the guard denies a row the marker table
-/// does not hold.
-///
-/// The prewalk stores (table_name, fn_name) for each BEFORE INSERT trigger so
-/// this function can reach the maintenance assignments through the epoch schema
-/// (which has functions and tables but not triggers). A synthetic CreateTrigger
-/// carrying only the table and function fields lets TriggerLike do the lookup.
-fn build_maintenance_insert_exemption(
+/// The prewalk stores the table, function and event of each `BEFORE` row
+/// trigger so this function can reach the maintenance assignments through
+/// the epoch schema, which has functions and tables but not triggers. A
+/// synthetic `CreateTrigger` carrying only the table and function fields lets
+/// `TriggerLike` do the lookup.
+fn maintains(
     table: &CreateTable,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
-) -> Option<Expr> {
+    event: MaintainedEvent,
+) -> bool {
     let table_name = table.table_name().to_lowercase();
-    let maintained = options
-        .before_insert_trigger_fns()
+    options
+        .before_row_trigger_fns()
         .iter()
-        .filter(|(trig_table, _)| *trig_table == table_name)
-        .any(|(_, fn_name)| {
+        .filter(|(trig_table, _, fired)| *trig_table == table_name && *fired == event)
+        .any(|(_, fn_name, _)| {
             // Synthetic trigger: only table_name and exec_body matter for
             // TriggerLike; the rest are inert defaults.
             let synthetic = CreateTrigger {
@@ -2355,7 +2380,7 @@ fn build_maintenance_insert_exemption(
                 name: ObjectName(Vec::new()),
                 period: Some(TriggerPeriod::Before),
                 period_before_table: true,
-                events: vec![TriggerEvent::Insert],
+                events: Vec::new(),
                 table_name: table.name.clone(),
                 referenced_table_name: None,
                 referencing: Vec::new(),
@@ -2370,10 +2395,19 @@ fn build_maintenance_insert_exemption(
                 characteristics: None,
             };
             synthetic.is_maintenance_trigger(schema).unwrap_or(false)
-        });
-    maintained.then(|| super::reentry::unmarked(&super::reentry::marker_table(&table.name), "OLD"))
+        })
 }
 
+/// The backing-table `BEFORE UPDATE` guard, which also sees the `UPDATE` a
+/// maintenance body writes once the event its `BEFORE` trigger fires on is
+/// done.
+///
+/// PostgreSQL holds the row a `BEFORE INSERT` trigger returns to the `INSERT`
+/// policies alone, so the guard skips the write of the `INSERT` body. It
+/// holds the row a `BEFORE UPDATE` trigger returns to the checks of the new
+/// row, while the existing row is the one the caller's `UPDATE` already
+/// answered `USING` for, so the guard holds the write of the `UPDATE` body
+/// to every predicate but `USING`.
 fn generate_update_check_trigger_sql(
     table: &CreateTable,
     schema: &ParserDB,
@@ -2383,20 +2417,33 @@ fn generate_update_check_trigger_sql(
     // Triggers cannot tell a blind write from one reading a column.
     let (ctx, rows) =
         write_trigger_prologue(table, schema, RowStatement::Update { reads: true }, options)?;
-    let violation = if rows.has_no_policy(GatedCommand::Update, RowVersion::Existing)
+    let (using, check, read_back) = if rows
+        .has_no_policy(GatedCommand::Update, RowVersion::Existing)
         && rows.has_no_policy(GatedCommand::Update, RowVersion::Updated)
     {
-        // The crate's own AFTER INSERT trigger UPDATEs still pass a table with
-        // no UPDATE policy, through `build_maintenance_insert_exemption`.
-        build_maintenance_insert_exemption(table, schema, options)
+        (PolicyPredicate::DenyAll, PolicyPredicate::DenyAll, None)
     } else {
         let WriteGuard { using, check, read_back, .. } =
             build_write_guard(&rows, GuardKind::Update, table, schema, options, None, emit)?;
-        match violation([using, Some(check), read_back].into_iter().flatten()) {
-            Violation::Every => None,
-            Violation::Rows(None) => return Ok(None),
-            Violation::Rows(Some(violation)) => Some(*violation),
+        (using.unwrap_or(PolicyPredicate::AllowAll), check, read_back)
+    };
+    let marker = super::reentry::marker_table(&table.name);
+    let unmarked_after = |event| {
+        maintains(table, schema, options, event)
+            .then(|| super::reentry::unmarked_after(&marker, "OLD", event))
+    };
+    let violation = match unmarked_after(MaintainedEvent::Update) {
+        None => violation([Some(using), Some(check), read_back].into_iter().flatten()),
+        Some(unmarked) => {
+            violation([using])
+                .restricted_to(Some(unmarked))
+                .or(violation([Some(check), read_back].into_iter().flatten()))
         }
+    };
+    let violation = match violation.restricted_to(unmarked_after(MaintainedEvent::Insert)) {
+        Violation::Every => None,
+        Violation::Rows(None) => return Ok(None),
+        Violation::Rows(Some(violation)) => Some(*violation),
     };
     Ok(Some(backing_abort_trigger(
         &format!("{}_update_check", ctx.inner_table_name),

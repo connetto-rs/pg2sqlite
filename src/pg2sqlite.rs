@@ -103,7 +103,9 @@ fn populate_prewalk_catalogs(
             register_fts_index(create_index, context);
         }
         if let Statement::CreateTrigger(trigger) = statement {
-            use sqlparser::ast::{TriggerEvent, TriggerPeriod};
+            use sqlparser::ast::TriggerPeriod;
+
+            use crate::impls::translator_impls::reentry::MaintainedEvent;
             // A trigger left to the server queues nothing on the replica.
             if let Some(deferred) = DeferredTrigger::of(trigger)
                 && !crate::impls::object_name::last_ident(&trigger.name)
@@ -112,12 +114,16 @@ fn populate_prewalk_catalogs(
                 context.add_deferred_trigger(deferred);
             }
             if matches!(trigger.period, Some(TriggerPeriod::Before))
-                && trigger.events.iter().any(|e| matches!(e, TriggerEvent::Insert))
                 && let Some(exec_body) = &trigger.exec_body
             {
                 let table_name = last_ident_value_or_display(&trigger.table_name).to_lowercase();
-                let fn_name = exec_body.func_desc.name.clone();
-                context.add_before_insert_trigger_fn(table_name, fn_name);
+                for event in trigger.events.iter().filter_map(MaintainedEvent::after) {
+                    context.add_before_row_trigger_fn(
+                        table_name.clone(),
+                        exec_body.func_desc.name.clone(),
+                        event,
+                    );
+                }
             }
         }
     }

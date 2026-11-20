@@ -115,6 +115,9 @@ mod parity_trigger_order;
 #[path = "gauntlet/parity_maintenance_reentry.rs"]
 mod parity_maintenance_reentry;
 
+#[path = "gauntlet/parity_maintenance_policies.rs"]
+mod parity_maintenance_policies;
+
 #[path = "gauntlet/parity_new_assignments.rs"]
 mod parity_new_assignments;
 

@@ -199,6 +199,60 @@ fn caller_update_writing_the_maintained_values_is_denied() {
 }
 
 diesel::table! {
+    guarded (id) {
+        id -> Integer,
+        tag -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    guarded_rls (id) {
+        id -> Integer,
+        tag -> Nullable<Text>,
+    }
+}
+
+/// An `UPDATE` policy admitting no row, beside a `BEFORE INSERT` maintenance
+/// trigger.
+const GUARDED_SCHEMA: &str = "
+    CREATE TABLE guarded (id INT PRIMARY KEY, tag TEXT);
+    ALTER TABLE guarded ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY guarded_sel ON guarded FOR SELECT USING (true);
+    CREATE POLICY guarded_ins ON guarded FOR INSERT WITH CHECK (true);
+    CREATE POLICY guarded_upd ON guarded FOR UPDATE USING (false);
+    CREATE FUNCTION guarded_tag() RETURNS trigger AS $$
+    BEGIN
+        NEW.tag := NEW.tag || '*';
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+    CREATE TRIGGER guarded_tag_trg BEFORE INSERT ON guarded
+        FOR EACH ROW EXECUTE FUNCTION guarded_tag();
+";
+
+/// PostgreSQL runs no `UPDATE` for a `BEFORE INSERT` trigger, so the insert
+/// answers to the `INSERT` policy alone and stores `a*`, while a caller
+/// `UPDATE` stays held to the `UPDATE` policy.
+#[test]
+fn maintenance_write_passes_an_update_policy_refusing_the_row() {
+    let mut conn = helpers::apply_translated_ddl(
+        GUARDED_SCHEMA,
+        &Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit"),
+    );
+    diesel::insert_into(guarded::table)
+        .values((guarded::id.eq(1_i32), guarded::tag.eq("a")))
+        .execute(&mut conn)
+        .expect("INSERT through RLS view must succeed");
+    let tag: Option<String> =
+        guarded_rls::table.find(1).select(guarded_rls::tag).first(&mut conn).expect("select");
+    assert_eq!(tag.as_deref(), Some("a*"));
+
+    let result =
+        diesel::update(guarded_rls::table.find(1)).set(guarded_rls::tag.eq("b")).execute(&mut conn);
+    assert!(result.is_err(), "a caller UPDATE must answer to the UPDATE policy");
+}
+
+diesel::table! {
     priced (id) {
         id -> Integer,
         price -> Nullable<BigInt>,

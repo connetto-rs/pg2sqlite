@@ -153,7 +153,11 @@ fn generate_maintenance_trigger_body(
 
     Ok(sqlparser::ast::BeginEndStatements {
         begin_token: ast_builder::keyword_token("BEGIN", Keyword::BEGIN),
-        statements: vec![super::reentry::mark(marker), update_stmt, super::reentry::unmark(marker)],
+        statements: vec![
+            super::reentry::mark(marker, super::reentry::MaintainedEvent::of(&trigger.events)),
+            update_stmt,
+            super::reentry::unmark(marker),
+        ],
         end_token: ast_builder::keyword_token("END", Keyword::END),
     })
 }
