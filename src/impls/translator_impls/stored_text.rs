@@ -36,8 +36,6 @@ use sqlparser::{
     parser::Parser,
 };
 
-#[cfg(not(feature = "std"))]
-use crate::no_std::prelude::*;
 use crate::{
     impls::{
         temporal_literals::{TemporalLiteralKind, temporal_literal_kind},
