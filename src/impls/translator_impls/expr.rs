@@ -1229,33 +1229,109 @@ pub(crate) fn text_array_path_elements(path: &Expr) -> Option<Vec<Option<JsonPat
     }
 }
 
-/// The SQLite JSON path naming `elements` for `construct`, which writes at
-/// that path and so cannot read a numeric element both ways as `#>` does.
+/// The keys `elements` names for `construct`, which writes at that path and so
+/// cannot read a numeric element both ways as `#>` does.
 ///
 /// # Errors
 ///
 /// Refuses a NULL element, which PostgreSQL refuses, and a numeric one, which
 /// PostgreSQL reads as an index or a key by the value it meets.
-pub(crate) fn json_update_path(
+pub(crate) fn json_update_keys(
     construct: &str,
     elements: Vec<Option<JsonPathElement>>,
-) -> Result<String, crate::errors::Error> {
+) -> Result<Vec<String>, crate::errors::Error> {
+    (1..)
+        .zip(elements)
+        .map(|(position, element)| {
+            match element {
+                None => {
+                    Err(crate::errors::Error::forward_refusal(format!(
+                        "{construct} cannot take a NULL path element, as PostgreSQL refuses it \
+                         with `path element at position {position} is null`."
+                    )))
+                }
+                Some(JsonPathElement::Numeric { verbatim, .. }) => {
+                    Err(numeric_json_path_element(construct, &verbatim))
+                }
+                Some(JsonPathElement::Key(key)) => Ok(key),
+            }
+        })
+        .collect()
+}
+
+/// `write` over `document` and the SQLite path naming `keys`, failing and
+/// declining where PostgreSQL's path writes do.
+///
+/// PostgreSQL raises `scalar_error` when the document is a scalar, the empty
+/// path included, and refuses a key that meets an array, while a key that
+/// meets a scalar or nothing leaves the document as it was, measured on 18.7.
+/// SQLite's writers raise nothing and create the objects a path is missing,
+/// so each failing shape is a `CASE` branch raising PostgreSQL's message, and
+/// a missing parent of the last key answers the document. `document` is named
+/// once per branch, so the caller checks that it replays.
+pub(crate) fn guarded_json_write(
+    document: &Expr,
+    keys: &[String],
+    scalar_error: &str,
+    write: impl FnOnce(Expr, String) -> Expr,
+) -> Expr {
+    let mut conditions = vec![CaseWhen {
+        condition: Expr::In {
+            expr: Box::new(simple_function_expr("json_type", vec![document.clone()], None)),
+            target: InTarget::List(vec![string_literal("object"), string_literal("array")]),
+            negated: true,
+            global: false,
+        },
+        result: raised_error(scalar_error),
+    }];
     let mut path = String::from("$");
-    for (position, element) in (1..).zip(elements) {
-        match element {
-            None => {
-                return Err(crate::errors::Error::forward_refusal(format!(
-                    "{construct} cannot take a NULL path element, as PostgreSQL refuses it with \
-                     `path element at position {position} is null`."
-                )));
-            }
-            Some(JsonPathElement::Numeric { verbatim, .. }) => {
-                return Err(numeric_json_path_element(construct, &verbatim));
-            }
-            Some(JsonPathElement::Key(key)) => path.push_str(&sqlite_json_path_key(&key)),
-        }
+    let mut parent_length = path.len();
+    for (position, key) in (1..).zip(keys) {
+        conditions.push(CaseWhen {
+            condition: Expr::BinaryOp {
+                left: Box::new(simple_function_expr(
+                    "json_type",
+                    vec![document.clone(), string_literal(&path)],
+                    None,
+                )),
+                op: BinaryOperator::Eq,
+                right: Box::new(string_literal("array")),
+            },
+            result: raised_error(&format!(
+                "path element at position {position} is not an integer: \"{key}\""
+            )),
+        });
+        parent_length = path.len();
+        path.push_str(&sqlite_json_path_key(key));
     }
-    Ok(path)
+    if keys.len() > 1 {
+        conditions.push(CaseWhen {
+            condition: Expr::IsNull(Box::new(simple_function_expr(
+                "json_type",
+                vec![document.clone(), string_literal(&path[..parent_length])],
+                None,
+            ))),
+            result: document.clone(),
+        });
+    }
+    Expr::Case {
+        case_token: AttachedToken::empty(),
+        end_token: AttachedToken::empty(),
+        operand: None,
+        conditions,
+        else_result: Some(Box::new(write(document.clone(), path))),
+    }
+}
+
+/// An expression that aborts the statement with `message` when SQLite
+/// evaluates it.
+///
+/// SQLite has no `RAISE` outside a trigger, but `json_extract` fails the
+/// statement on a path that does not start with `$`, quoting the path as
+/// `bad JSON path: '<message>'`. A `CASE` evaluates only the branch it takes,
+/// so the error fires only for the rows PostgreSQL refuses.
+fn raised_error(message: &str) -> Expr {
+    simple_function_expr("json_extract", vec![string_literal("{}"), string_literal(message)], None)
 }
 
 /// Whether an element is integer-shaped, which decides the emitted form.
@@ -4114,20 +4190,32 @@ fn translate_binary_op(
         }
         BinaryOperator::HashMinus => {
             return rebuild(|| {
-                let translated_doc = left.translate_with_warnings(schema, options, emit)?;
                 let elements = text_array_path_elements(right).ok_or_else(|| {
                     crate::errors::Error::forward_refusal(
                         "#- path must be a '{key1,key2}' PostgreSQL text-array literal."
                             .to_string(),
                     )
                 })?;
-                if elements.is_empty() {
-                    return Ok(translated_doc);
+                let keys = json_update_keys("#-", elements)?;
+                if !is_replayable(left, options) {
+                    return Err(reject_duplicated_operand("#-", left));
                 }
-                Ok(simple_function_expr(
-                    "json_remove",
-                    vec![translated_doc, string_literal(&json_update_path("#-", elements)?)],
-                    None,
+                let translated_doc = left.translate_with_warnings(schema, options, emit)?;
+                Ok(guarded_json_write(
+                    &translated_doc,
+                    &keys,
+                    "cannot delete path in scalar",
+                    |document, path| {
+                        if keys.is_empty() {
+                            document
+                        } else {
+                            simple_function_expr(
+                                "json_remove",
+                                vec![document, string_literal(&path)],
+                                None,
+                            )
+                        }
+                    },
                 ))
             });
         }
