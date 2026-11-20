@@ -24,7 +24,7 @@ use sqlparser_plpgsql::embedded::{
 use super::{
     callee::substitute,
     cte_builder::CteBuilder,
-    per_row::holds_row,
+    per_row::unassigned_row,
     raise::raise_statement,
     returns::without_early_returns,
     scope::{
@@ -290,7 +290,8 @@ impl PlPgSqlTranslator {
                     let data_type = declared_data_type(&variable.data_type, scope, schema)?;
                     scope.declare(&declaration.name, data_type);
                     declared.push(declaration.name.clone());
-                    if holds_row(&variable.data_type, schema) {
+                    let unassigned = unassigned_row(&variable.data_type, schema);
+                    if unassigned.is_some() {
                         scope.declare_row(&declaration.name);
                     }
                     if let Some(default) = &variable.default {
@@ -314,12 +315,13 @@ impl PlPgSqlTranslator {
                             &options.with_variables(&variables),
                             emit,
                         )?);
-                    } else if !scope.declares_row(&declaration.name) {
-                        // PostgreSQL starts a variable without a default at
-                        // `NULL`, which every statement reading it reads.
+                    } else {
                         scope.bind_persistent(Binding {
                             name: declaration.name.clone(),
-                            value: BoundValue::Expr(Expr::Value(Value::Null.with_empty_span())),
+                            value: unassigned.map_or_else(
+                                || BoundValue::Expr(Expr::Value(Value::Null.with_empty_span())),
+                                BoundValue::Row,
+                            ),
                         });
                     }
                 }
@@ -1160,6 +1162,13 @@ impl PlPgSqlTranslator {
         };
         let BoundValue::Row(row) = &binding.value else { return Ok(()) };
         *expr = match (field, row) {
+            (_, RowValue::Unassigned) => {
+                return Err(Error::forward_refusal(format!(
+                    "`{name}` is read before any statement assigns it a row, where PostgreSQL \
+                     raises that the record is not assigned yet, which the translation does not \
+                     reproduce. Assign `{name}` a row before reading it."
+                )));
+            }
             (Some(field), row) => {
                 row.field(&field).map_err(|unread| {
                     match unread {
@@ -1169,10 +1178,11 @@ impl PlPgSqlTranslator {
                 })?
             }
             (None, RowValue::Trigger(row)) => Expr::Identifier(row.clone()),
+            (None, RowValue::Null) => Expr::Value(Value::Null.with_empty_span()),
             (None, RowValue::Unreadable(reason)) => {
                 return Err(Error::forward_refusal(reason.as_str()));
             }
-            (None, RowValue::Chosen { .. } | RowValue::Unassigned) => {
+            (None, RowValue::Chosen { .. }) => {
                 return Err(Error::forward_refusal(format!(
                     "`{name}` holds `NEW` or `OLD` depending on which branch of an IF ran, and a \
                      whole row translates only where it is read as `NEW` or `OLD` itself. Read \

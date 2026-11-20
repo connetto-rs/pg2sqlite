@@ -8,7 +8,8 @@ use sql_traits::{
     traits::{DatabaseLike, ViewLike},
 };
 use sqlparser::ast::{
-    BinaryOperator, CaseWhen, DataType, Expr, Ident, TableFactor, TriggerEvent, Visit, Visitor,
+    BinaryOperator, CaseWhen, DataType, Expr, Ident, TableFactor, TriggerEvent, Value, Visit,
+    Visitor,
     helpers::attached_token::AttachedToken, visit_expressions, visit_expressions_mut,
 };
 
@@ -119,7 +120,9 @@ pub(crate) enum RowValue {
     /// The row of the first arm whose PostgreSQL condition holds, else
     /// `otherwise`.
     Chosen { arms: Vec<(Expr, Self)>, otherwise: Box<Self> },
-    /// No row, as after a branch that assigned none.
+    /// The `NULL` row a row-typed variable holds before any assignment.
+    Null,
+    /// No row, as a `RECORD` before any assignment.
     Unassigned,
     /// A row the emitted trigger cannot read, refused with the reason where
     /// the record is read.
@@ -159,6 +162,7 @@ impl RowValue {
                     else_result: Some(Box::new(otherwise.field(field)?)),
                 })
             }
+            Self::Null => Ok(Expr::Value(Value::Null.with_empty_span())),
             Self::Unassigned => Err(UnreadField::Unassigned),
             Self::Unreadable(reason) => Err(UnreadField::Unreadable(reason)),
         }
@@ -184,7 +188,7 @@ impl RowValue {
                     reads_variable(condition, name) || row.reads_variable(name)
                 }) || otherwise.reads_variable(name)
             }
-            Self::Trigger(_) | Self::Unassigned | Self::Unreadable(_) => false,
+            Self::Trigger(_) | Self::Null | Self::Unassigned | Self::Unreadable(_) => false,
         }
     }
 

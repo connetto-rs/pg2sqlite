@@ -217,6 +217,24 @@ fn a_record_a_nested_if_leaves_unassigned_on_one_path_is_refused() {
     assert!(message.contains("`rec` holds a row only after some branches"), "{message}");
 }
 
+/// PostgreSQL raises at the read of a record no statement assigned.
+#[test]
+fn a_record_read_before_any_assignment_is_refused() {
+    for read in ["to_jsonb(rec.n)", "to_jsonb(rec)"] {
+        let message = refusal(
+            "UPDATE",
+            "",
+            &format!(
+                "DECLARE rec RECORD;
+                 BEGIN
+                     INSERT INTO audit (body) VALUES ({read});
+                 END;"
+            ),
+        );
+        assert!(message.contains("`rec` is read before any statement assigns it"), "{message}");
+    }
+}
+
 /// Read before the write, the condition sees the rows PostgreSQL's `IF` saw.
 #[test]
 fn a_record_whose_if_condition_reads_a_table_translates_when_read_before_the_write() {

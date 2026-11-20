@@ -45,13 +45,17 @@ CREATE TABLE audit (child INTEGER PRIMARY KEY, outcome TEXT NOT NULL);
 /// without defaults and running `statements`, fired `timing` every insert
 /// into `children`.
 fn trigger(timing: &str, statements: &str) -> String {
+    trigger_declaring("fallback TEXT; noted TEXT; picked TEXT;", timing, statements)
+}
+
+/// The trigger function `t` with `declarations` running `statements`, fired
+/// `timing` every insert into `children`.
+fn trigger_declaring(declarations: &str, timing: &str, statements: &str) -> String {
     format!(
         "
 CREATE FUNCTION t() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
-    fallback TEXT;
-    noted TEXT;
-    picked TEXT;
+    {declarations}
 BEGIN
 {statements}
 END $$;
@@ -276,6 +280,52 @@ fn a_nested_block_reads_its_unassigned_variable_as_null() {
     BEGIN
         INSERT INTO audit (child, outcome) VALUES (NEW.id, coalesce(inner_value, 'inner'));
     END;
+    RETURN NULL;",
+    ));
+}
+
+/// A variable of a row type that no statement assigned holds a row of
+/// `NULL` fields, whether declared through `%ROWTYPE` or the table's name.
+#[test]
+fn an_unassigned_row_type_variable_reads_null_fields() {
+    assert_parity(&trigger_declaring(
+        "typed children%ROWTYPE; named children;",
+        "AFTER",
+        "    INSERT INTO audit (child, outcome)
+        VALUES (NEW.id, coalesce(typed.label, 'typed') || coalesce(named.label, ':named'));
+    RETURN NULL;",
+    ));
+}
+
+/// A row-typed variable an `IF` assigned only in a branch that did not run
+/// keeps its row of `NULL` fields.
+#[test]
+fn a_row_type_variable_assigned_in_one_branch_reads_null_fields_otherwise() {
+    assert_parity(&trigger_declaring(
+        "chosen children%ROWTYPE;",
+        "AFTER",
+        "    IF NEW.parent = 1 THEN
+        chosen := NEW;
+    END IF;
+    INSERT INTO audit (child, outcome)
+        VALUES (NEW.id, CASE WHEN chosen.id IS NULL THEN 'none' ELSE 'row' END);
+    RETURN NULL;",
+    ));
+}
+
+/// An unassigned row-typed variable is `NULL` as a whole, in a test and as
+/// the text of the row.
+#[test]
+fn an_unassigned_row_type_variable_is_null() {
+    assert_parity(&trigger_declaring(
+        "typed children%ROWTYPE;",
+        "AFTER",
+        "    IF typed IS NULL THEN
+        INSERT INTO audit (child, outcome)
+            VALUES (NEW.id, coalesce(typed::text, 'null'));
+    ELSE
+        INSERT INTO audit (child, outcome) VALUES (NEW.id, 'set');
+    END IF;
     RETURN NULL;",
     ));
 }
