@@ -74,7 +74,7 @@ pub(crate) struct FiringTrigger {
 }
 
 impl FiringTrigger {
-    fn of(trigger: &CreateTrigger) -> Option<Self> {
+    pub(crate) fn of(trigger: &CreateTrigger) -> Option<Self> {
         let per_row = is_per_row(trigger);
         let rank = match trigger.period {
             Some(TriggerPeriod::InsteadOf) => Rank::InsteadOf,
@@ -93,8 +93,19 @@ impl FiringTrigger {
         })
     }
 
-    fn fires_on(&self, event: Event) -> bool {
+    pub(super) fn fires_on(&self, event: Event) -> bool {
         self.events.contains(&event)
+    }
+
+    /// The table or view the trigger fires on, its last name part folded.
+    pub(super) fn table(&self) -> &str {
+        &self.table
+    }
+
+    /// Whether `other` is the same trigger, by its name and the table it
+    /// fires on.
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        (self.name.as_str(), self.table.as_str()) == (other.name.as_str(), other.table.as_str())
     }
 
     /// Whether the trigger fires before `other` on a write firing both.
@@ -104,7 +115,7 @@ impl FiringTrigger {
 
     /// Every write the trigger's function runs, none when the schema does not
     /// hold that function.
-    fn writes(&self, schema: &ParserDB) -> Result<Vec<DerivedWrite>, Error> {
+    pub(super) fn writes(&self, schema: &ParserDB) -> Result<Vec<DerivedWrite>, Error> {
         let mut writes = Vec::new();
         if let Some(function) = written_function(schema, &self.function)? {
             function_writes(function, schema, &mut Vec::new(), &mut Vec::new(), &mut writes)?;
@@ -291,6 +302,48 @@ impl Firing<'_> {
         Ok(())
     }
 
+    /// Adds to `writes` every write the server runs when it applies a write
+    /// of `event` on `table`, through the triggers it fires and the foreign
+    /// key actions it runs, and through what their writes set off in turn.
+    /// `visited` holds the writes already followed.
+    fn writes_set_off(
+        &self,
+        table: &str,
+        event: Event,
+        writes: &mut Vec<DerivedWrite>,
+        visited: &mut BTreeSet<(String, Event)>,
+    ) -> Result<(), Error> {
+        if !visited.insert((table.to_owned(), event)) {
+            return Ok(());
+        }
+        for trigger in self.triggers {
+            if trigger.table == table && trigger.fires_on(event) {
+                for write in trigger.writes(self.schema)? {
+                    self.follow(&write, writes, visited)?;
+                    writes.push(write);
+                }
+            }
+        }
+        for (child, set_off, _) in self.key_actions(table, event)? {
+            self.writes_set_off(&child, set_off, writes, visited)?;
+        }
+        Ok(())
+    }
+
+    /// Adds to `writes` every write the server runs for `write`, as
+    /// [`Self::writes_set_off`] does for each event it sets off.
+    fn follow(
+        &self,
+        write: &DerivedWrite,
+        writes: &mut Vec<DerivedWrite>,
+        visited: &mut BTreeSet<(String, Event)>,
+    ) -> Result<(), Error> {
+        for (relation, event) in write.set_off() {
+            self.writes_set_off(relation, event, writes, visited)?;
+        }
+        Ok(())
+    }
+
     /// The first read among `steps` of rows the server writes into a table
     /// in `written`. A read by the trigger's own function reads `NEW` and
     /// `OLD` as rows of `record`.
@@ -376,6 +429,28 @@ pub(super) fn own_dependency(
         }
     }
     Ok(None)
+}
+
+/// `writes`, a trigger's own, and every write they set off on the server:
+/// those of the triggers they fire, and so on through what those and the
+/// foreign key actions they run set off.
+///
+/// # Errors
+///
+/// Fails when a trigger set off cannot be read.
+pub(super) fn with_set_off(
+    writes: Vec<DerivedWrite>,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<Vec<DerivedWrite>, Error> {
+    let firing = Firing { schema, triggers: options.firing_triggers() };
+    let mut all = Vec::new();
+    let mut visited = BTreeSet::new();
+    for write in writes {
+        firing.follow(&write, &mut all, &mut visited)?;
+        all.push(write);
+    }
+    Ok(all)
 }
 
 /// Why a statement `trigger` keeps reads what the server writes before it

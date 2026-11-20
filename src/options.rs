@@ -214,6 +214,11 @@ pub(crate) struct PrewalkCatalogs {
     /// The triggers the schema holds once the translation unit has run,
     /// which the server fires around the writes it derives.
     firing_triggers: Vec<crate::impls::derived_writes::FiringTrigger>,
+    /// The rows the server writes, and the replica does not, for each
+    /// trigger left on the schema once the translation unit has run whose
+    /// writes the replica leaves out, which a foreign key on its table may
+    /// reference.
+    server_rows: Vec<crate::impls::derived_writes::ServerRows>,
     /// The folded table and trigger names of the row triggers sharing a
     /// table, timing and event with another, whose `WHEN` moves into the body
     /// so the slot can run them as one SQLite trigger.
@@ -943,6 +948,19 @@ impl<'a> TranslationContext<'a> {
         &self.catalogs.firing_triggers
     }
 
+    /// Records the rows the server writes, and the replica does not, for
+    /// each trigger whose writes the replica leaves out.
+    pub(crate) fn set_server_rows(&mut self, rows: Vec<crate::impls::derived_writes::ServerRows>) {
+        self.catalogs.to_mut().server_rows = rows;
+    }
+
+    /// The rows the server writes, and the replica does not, for each
+    /// trigger whose writes the replica leaves out.
+    #[must_use]
+    pub(crate) fn server_rows(&self) -> &[crate::impls::derived_writes::ServerRows] {
+        &self.catalogs.server_rows
+    }
+
     pub(crate) fn add_before_insert_trigger_fn(
         &mut self,
         table_name: String,
@@ -1488,7 +1506,10 @@ impl Pg2SqliteOptions {
     /// writes are the view's own. A foreign key whose `ON DELETE` or
     /// `ON UPDATE` action is `CASCADE`, `SET NULL` or `SET DEFAULT` is left
     /// out whole, since kept as `NO ACTION` it would refuse an offline delete
-    /// of a parent whose children the server removes.
+    /// of a parent whose children the server removes. So is a foreign key
+    /// into rows that an insert or an update of its table leads the server
+    /// to write through a trigger whose writes the replica leaves out, since
+    /// kept it would refuse every such write PostgreSQL accepts.
     ///
     /// [`Pg2Sqlite::translate_with_report`](crate::pg2sqlite::Pg2Sqlite::translate_with_report)
     /// names each one in a

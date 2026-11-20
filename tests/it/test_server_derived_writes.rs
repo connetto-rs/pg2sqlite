@@ -769,6 +769,207 @@ ALTER TABLE documents ADD CONSTRAINT documents_folder
     replica(pg);
 }
 
+/// Organizations whose deferred key into `grantees` holds only through the
+/// row a trigger on `organizations` inserts, and grants whose key into
+/// `grantees` no trigger on `grants` serves. `extra` adds the triggers.
+fn organization_grantees(extra: &str) -> String {
+    format!(
+        "
+CREATE TABLE grantees (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, seen INTEGER NOT NULL DEFAULT 0,
+  UNIQUE (id, kind));
+CREATE TABLE organizations (id INTEGER PRIMARY KEY,
+  kind TEXT GENERATED ALWAYS AS ('organization') STORED NOT NULL,
+  FOREIGN KEY (id, kind) REFERENCES grantees (id, kind) DEFERRABLE INITIALLY DEFERRED);
+CREATE TABLE grants (grantee_id INTEGER NOT NULL REFERENCES grantees);
+CREATE FUNCTION insert_grantee() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO grantees (id, kind) VALUES (NEW.id, NEW.kind);
+  RETURN NULL;
+END
+$$;
+{extra}"
+    )
+}
+
+const ORGANIZATIONS_GRANTEE: &str = "
+CREATE TRIGGER organizations_grantee AFTER INSERT ON organizations
+  FOR EACH ROW EXECUTE FUNCTION insert_grantee();
+";
+
+#[test]
+fn a_key_into_the_row_a_trigger_left_to_the_server_writes_is_left_out() {
+    let pg = organization_grantees(ORGANIZATIONS_GRANTEE);
+    assert_eq!(
+        left_to_server_shown(&pg),
+        [
+            "left FOREIGN KEY (id, kind) REFERENCES grantees on organizations to the server, \
+             since the grantees rows it references come from TRIGGER organizations_grantee, whose \
+             writes the server runs when it applies the upload",
+            "left TRIGGER organizations_grantee on organizations to the server, since \
+             insert_grantee() runs INSERT on grantees, which the server runs again when it applies \
+             the upload",
+        ],
+    );
+
+    let mut connection = replica(&pg);
+    connection
+        .batch_execute("BEGIN; INSERT INTO organizations (id) VALUES (1); COMMIT;")
+        .expect("the organization commits without its grantee, as on PostgreSQL");
+    assert_eq!(
+        (count(&mut connection, "organizations"), count(&mut connection, "grantees")),
+        (1, 0)
+    );
+    let orphan = connection
+        .batch_execute("INSERT INTO grants (grantee_id) VALUES (1);")
+        .expect_err("the key of grants, whose rows no trigger serves, stays");
+    assert!(orphan.to_string().contains("FOREIGN KEY constraint failed"), "{orphan}");
+}
+
+/// The organizations key into `grantees`, as the report names it.
+const ORGANIZATIONS_KEY: (&str, &str, &str) =
+    ("FOREIGN KEY", "(id, kind) REFERENCES grantees", "organizations");
+
+/// What the report names left to the server once `extra` joins the
+/// organization grantees.
+fn grantees_left_with(extra: &str) -> Vec<(String, String, String)> {
+    left_to_server(&organization_grantees(extra))
+}
+
+#[test]
+fn a_key_goes_with_an_insert_of_its_row_the_replica_removes() {
+    let stripped = "
+CREATE FUNCTION insert_checked_grantee() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO grantees (id, kind) VALUES (NEW.id, NEW.kind);
+  IF NEW.id < 0 THEN
+    RAISE EXCEPTION 'organizations need a positive id';
+  END IF;
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER organizations_grantee AFTER INSERT ON organizations
+  FOR EACH ROW EXECUTE FUNCTION insert_checked_grantee();
+";
+    assert_eq!(
+        grantees_left_with(stripped),
+        owned(&[
+            ORGANIZATIONS_KEY,
+            ("INSERT in TRIGGER", "organizations_grantee", "organizations")
+        ]),
+    );
+    let chained = "
+CREATE TABLE organization_events (id INTEGER NOT NULL, kind TEXT NOT NULL);
+CREATE FUNCTION record_organization() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO organization_events (id, kind) VALUES (NEW.id, NEW.kind);
+  INSERT INTO organization_events (id, kind) VALUES (-NEW.id, NEW.kind);
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER organizations_recorded AFTER INSERT ON organizations
+  FOR EACH ROW EXECUTE FUNCTION record_organization();
+CREATE TRIGGER organization_events_grantee AFTER INSERT ON organization_events
+  FOR EACH ROW EXECUTE FUNCTION insert_grantee();
+";
+    assert_eq!(
+        grantees_left_with(chained),
+        owned(&[
+            ORGANIZATIONS_KEY,
+            ("TRIGGER", "organizations_recorded", "organizations"),
+            ("TRIGGER", "organization_events_grantee", "organization_events"),
+        ]),
+    );
+    let cascaded = "
+CREATE TABLE stale_organizations (id INTEGER PRIMARY KEY);
+CREATE TABLE stale_grantees (kind TEXT NOT NULL,
+  organization_id INTEGER NOT NULL REFERENCES stale_organizations (id) ON DELETE CASCADE);
+CREATE FUNCTION clear_stale_organization() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  DELETE FROM stale_organizations WHERE id = NEW.id;
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER organizations_cleared AFTER INSERT ON organizations
+  FOR EACH ROW EXECUTE FUNCTION clear_stale_organization();
+CREATE FUNCTION restore_grantee() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO grantees (id, kind) VALUES (OLD.organization_id, OLD.kind);
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER stale_grantees_restored AFTER DELETE ON stale_grantees
+  FOR EACH ROW EXECUTE FUNCTION restore_grantee();
+";
+    assert_eq!(
+        grantees_left_with(cascaded),
+        owned(&[
+            ORGANIZATIONS_KEY,
+            ("FOREIGN KEY", "(organization_id) REFERENCES stale_organizations", "stale_grantees"),
+            ("TRIGGER", "organizations_cleared", "organizations"),
+            ("TRIGGER", "stale_grantees_restored", "stale_grantees"),
+        ]),
+        "the row comes from a trigger the cascade of a removed delete fires",
+    );
+}
+
+#[test]
+fn a_key_goes_with_a_removed_update_giving_a_column_it_references_a_new_value() {
+    let updating = |table: &str, set: &str| {
+        format!(
+            "
+CREATE FUNCTION update_grantee() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE grantees SET {set} WHERE id = -1;
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER {table}_grantee_updated AFTER INSERT OR UPDATE ON {table}
+  FOR EACH ROW EXECUTE FUNCTION update_grantee();
+"
+        )
+    };
+    let organizations_trigger = ("TRIGGER", "organizations_grantee_updated", "organizations");
+    let grants_trigger = ("TRIGGER", "grants_grantee_updated", "grants");
+    let grants_key = ("FOREIGN KEY", "(grantee_id) REFERENCES grantees", "grants");
+    for set in ["id = NEW.id", "(id, kind) = (NEW.id, NEW.kind)"] {
+        assert_eq!(
+            grantees_left_with(&updating("organizations", set)),
+            owned(&[ORGANIZATIONS_KEY, organizations_trigger]),
+            "{set}",
+        );
+    }
+    assert_eq!(
+        grantees_left_with(&updating("organizations", "seen = seen + 1, id = id")),
+        owned(&[organizations_trigger]),
+    );
+    assert_eq!(
+        grantees_left_with(&updating("grants", "id = NEW.grantee_id")),
+        owned(&[grants_key, grants_trigger]),
+        "a key naming no columns references the primary key",
+    );
+    assert_eq!(
+        grantees_left_with(&updating("grants", "kind = 'granted'")),
+        owned(&[grants_trigger]),
+    );
+}
+
+#[test]
+fn a_key_stays_beside_an_insert_trigger_firing_on_delete_or_dropped() {
+    let on_delete = "
+CREATE TRIGGER organizations_grantee AFTER DELETE ON organizations
+  FOR EACH ROW EXECUTE FUNCTION insert_grantee();
+";
+    let dropped =
+        &format!("{ORGANIZATIONS_GRANTEE}DROP TRIGGER organizations_grantee ON organizations;");
+    for extra in [on_delete, dropped] {
+        assert_eq!(
+            grantees_left_with(extra),
+            owned(&[("TRIGGER", "organizations_grantee", "organizations")]),
+            "{extra}"
+        );
+    }
+}
+
 #[test]
 fn an_instead_of_trigger_stays() {
     let pg = "

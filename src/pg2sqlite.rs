@@ -143,12 +143,20 @@ fn populate_prewalk_catalogs(
 /// `DROP TRIGGER` of one left out drops nothing. A trigger the replica keeps
 /// without its writes is not registered, and one whose writes cannot be read
 /// counts as kept, and its translation reports why.
+///
+/// Also records the rows the server writes, and the replica does not, for
+/// every trigger left out or kept without its writes that the unit leaves on
+/// the schema, for the foreign keys referencing those rows to go with it.
 fn register_server_derived_triggers(
     statements: &[Statement],
     epochs: &[PreparedEpoch],
     initial_schema: Option<&ParserDB>,
     context: &mut TranslationContext<'_>,
 ) {
+    use crate::impls::derived_writes::{
+        Disposition, FiringTrigger, ServerRows, trigger_disposition,
+    };
+
     if !context.is_server_derived_writes_omitted() {
         return;
     }
@@ -161,17 +169,30 @@ fn register_server_derived_triggers(
         statements,
     ));
     let mut left_out = Vec::new();
+    let mut server_rows: Vec<ServerRows> = Vec::new();
     for epoch in epochs {
         for statement in &statements[epoch.start..epoch.end] {
             let Statement::CreateTrigger(trigger) = statement else { continue };
-            if let Ok(crate::impls::derived_writes::Disposition::LeftOut(_)) =
-                crate::impls::derived_writes::trigger_disposition(trigger, &epoch.schema, context)
+            let created = FiringTrigger::of(trigger);
+            server_rows.retain(|rows| {
+                !created.as_ref().is_some_and(|created| created.same(rows.trigger()))
+            });
+            let disposition = trigger_disposition(trigger, &epoch.schema, context);
+            if let Ok(Disposition::LeftOut(_) | Disposition::Stripped(_)) = disposition
+                && let Ok(Some(rows)) = ServerRows::of(trigger, &epoch.schema, context)
+            {
+                server_rows.push(rows);
+            }
+            if let Ok(Disposition::LeftOut(_)) = disposition
                 && let Some(name) = crate::impls::object_name::last_ident(&trigger.name)
             {
                 left_out.push(name.value.as_str());
             }
         }
     }
+    server_rows
+        .retain(|rows| context.firing_triggers().iter().any(|kept| kept.same(rows.trigger())));
+    context.set_server_rows(server_rows);
     for name in left_out {
         context.add_server_derived_trigger_name(name);
     }
