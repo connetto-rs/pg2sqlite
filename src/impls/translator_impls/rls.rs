@@ -1986,15 +1986,12 @@ pub(crate) fn hiding_policies(
         return Ok(None);
     }
     let rows = row_security(table, schema, RowStatement::Select, options)?;
-    let mut names: Vec<String> = Vec::new();
-    if let Some(gate) = rows.gate(GatedCommand::Select, RowVersion::Existing) {
-        for term in gate.permissive().iter().chain(gate.restrictive()) {
-            let name = term.policy().name();
-            if !names.iter().any(|known| known == name) {
-                names.push(name.to_string());
-            }
-        }
-    }
+    // A table whose policies hide rows gates its `SELECT`, every policy once.
+    let names =
+        rows.gate(GatedCommand::Select, RowVersion::Existing).map_or_else(Vec::new, |gate| {
+            let terms = gate.permissive().iter().chain(gate.restrictive());
+            terms.map(|term| term.policy().name().to_string()).collect()
+        });
     Ok(Some(names))
 }
 

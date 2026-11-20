@@ -34,18 +34,20 @@
 //! in part. A key into a table the acting role reads in full stays a SQLite
 //! foreign key, as every key does when no acting role is named.
 
+use alloc::borrow::Cow;
+
 use sql_traits::{
     structs::ParserDB,
     traits::{ColumnLike, DatabaseLike, ForeignKeyLike, TableLike},
 };
 use sqlparser::{
     ast::{
-        AlterTable, AlterTableOperation, ColumnOption, ConditionalStatements, CreateTable,
-        CreateTrigger, DeferrableInitial, DropTrigger, ForeignKeyConstraint, Ident, ObjectName,
-        ReferentialAction, Statement, TableConstraint,
+        AlterTable, AlterTableOperation, ColumnOption, CreateTable, DeferrableInitial, DropTrigger,
+        ForeignKeyConstraint, Ident, ObjectName, ReferentialAction, Statement, TableConstraint,
+        TriggerEvent, TriggerPeriod,
     },
     dialect::SQLiteDialect,
-    parser::Parser,
+    parser::{Parser, ParserError},
 };
 
 #[cfg(not(feature = "std"))]
@@ -53,6 +55,7 @@ use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{
+        ast_builder,
         object_name::{
             COLUMN_LOOKUP_CASE, append_suffix, last_ident_value_or_display,
             normalize_schema_qualified_object_name_for_sqlite, quoted_ident,
@@ -72,6 +75,8 @@ use crate::{
     traits::translator::TranslatorWithContext,
     warnings::{TranslationWarning, WarningSink},
 };
+
+type ForeignKey = <ParserDB as DatabaseLike>::ForeignKey;
 
 /// What every object keeping a referenced side carries in its name.
 const MARKER: &str = "_pg2sqlite_key";
@@ -161,11 +166,10 @@ impl<'r> Rename<'r> {
         if folded(name) != folded(self.from) {
             return name.clone();
         }
-        let mut renamed = name.clone();
-        if let (Some(last), Some(to)) = (renamed.0.last_mut(), self.to.0.last()) {
-            last.clone_from(to);
-        }
-        renamed
+        let mut parts = name.0.clone();
+        parts.pop();
+        parts.extend(self.to.0.last().cloned());
+        ObjectName(parts)
     }
 }
 
@@ -177,9 +181,11 @@ fn renamed(name: &ObjectName, rename: Option<Rename<'_>>) -> ObjectName {
 struct Key<'s> {
     /// The table declaring the key.
     table: &'s CreateTable,
+    /// The key as the schema holds it.
+    held: &'s ForeignKey,
     /// The key as the table declares it.
     constraint: &'s ForeignKeyConstraint,
-    /// The name PostgreSQL gives the key.
+    /// The name PostgreSQL gives the key, which names every key it holds.
     name: String,
 }
 
@@ -187,18 +193,18 @@ impl<'s> Key<'s> {
     /// Every key `table` holds in `schema`, in the order they were declared.
     fn of(table: &'s CreateTable, schema: &'s ParserDB) -> Result<Vec<Self>, Error> {
         let mut keys = Vec::new();
-        for key in table.foreign_keys(schema)? {
-            let attribute = key.attribute();
-            let name = if let Some(name) = key.constraint_name(schema)? {
-                name.into_owned()
-            } else {
-                let columns: Vec<&str> =
-                    attribute.columns.iter().map(|column| column.value.as_str()).collect();
-                format!("{}_{}_fkey", last_ident_value_or_display(&table.name), columns.join("_"))
-            };
-            keys.push(Self { table, constraint: attribute, name });
+        for held in table.foreign_keys(schema)? {
+            let name = held.constraint_name(schema)?.map(Cow::into_owned).unwrap_or_default();
+            keys.push(Self { table, held, constraint: held.attribute(), name });
         }
         Ok(keys)
+    }
+
+    /// Every key the table `name` names holds in `schema`, none when it holds
+    /// no such table.
+    fn of_named(name: &ObjectName, schema: &'s ParserDB) -> Result<Vec<Self>, Error> {
+        let table = resolve_translation_table(schema, name)?;
+        Ok(table.map(|table| Self::of(table, schema)).transpose()?.unwrap_or_default())
     }
 
     /// Every key `schema` holds.
@@ -218,21 +224,10 @@ impl<'s> Key<'s> {
     /// The referenced columns, the primary key of the referenced table when
     /// the key names none.
     fn referenced_columns(&self, schema: &ParserDB) -> Result<Vec<String>, Error> {
-        if !self.constraint.referred_columns.is_empty() {
-            return Ok(self
-                .constraint
-                .referred_columns
-                .iter()
-                .map(|column| column.value.clone())
-                .collect());
-        }
-        let Some(parent) = resolve_translation_table(schema, &self.constraint.foreign_table)?
-        else {
-            return Ok(Vec::new());
-        };
-        Ok(parent
-            .primary_key_columns(schema)?
-            .map(|column| column.column_name().to_string())
+        Ok(self
+            .held
+            .referenced_columns(schema)?
+            .map(|column| column.column_name().to_owned())
             .collect())
     }
 
@@ -367,8 +362,7 @@ pub(crate) fn declared(
     emit: WarningSink<'_>,
 ) -> Result<Vec<Statement>, Error> {
     let written = options.written_schema().unwrap_or(schema);
-    let Some(stored) = resolve_translation_table(written, table)? else { return Ok(Vec::new()) };
-    let keys = Key::of(stored, written)?;
+    let keys = Key::of_named(table, written)?;
     let skipped = added.map_or(0, |added| keys.len().saturating_sub(added));
     let mut statements = Vec::new();
     for key in &keys[skipped..] {
@@ -427,16 +421,20 @@ fn referenced_side(
                 parts.assign(&defaults)
             }
         };
-        let trigger = parts.trigger(&names.trigger(event), event, &body, options)?;
+        let firing = parts.event(event, &body, options)?;
         if key.queues(action) {
-            let CreateTrigger { table_name, condition, statements: body, mut events, .. } = trigger;
-            let (Some(ConditionalStatements::BeginEnd(body)), Some(event)) = (body, events.pop())
-            else {
-                unreachable!("the trigger is built with one event and a BEGIN ... END body")
-            };
-            queued.push(QueuedEvent { table: table_name, event, condition, body: body.statements });
+            queued.push(firing);
         } else {
-            statements.push(Statement::CreateTrigger(trigger));
+            let QueuedEvent { table, event: fired, condition, body, .. } = firing;
+            statements.push(ast_builder::trigger(
+                plain_name(&names.trigger(event)),
+                table,
+                TriggerPeriod::After,
+                fired,
+                true,
+                condition,
+                body,
+            ));
         }
     }
     if !queued.is_empty() {
@@ -613,14 +611,14 @@ pub(crate) fn deferred_checks(
 ///
 /// Fails as [`hidden_rows`] does.
 pub(crate) fn dropped(
-    table: &CreateTable,
+    table: &ObjectName,
     columns: Option<&[Ident]>,
     written: &ParserDB,
     schema: &ParserDB,
     options: &TranslationContext<'_>,
 ) -> Result<Vec<Statement>, Error> {
     let mut drops = Vec::new();
-    for key in Key::of(table, written)? {
+    for key in Key::of_named(table, written)? {
         let reads_dropped = |dropped: &[Ident]| {
             key.constraint
                 .columns
@@ -636,10 +634,12 @@ pub(crate) fn dropped(
     Ok(drops)
 }
 
-/// The statements moving the referenced sides of the keys that a rename of
-/// the table `rename` names touches, the keys the table declares and the keys
-/// into it, as the drops to run before the rename and the triggers to create
-/// after it.
+/// The statements moving the referenced sides of the keys the table `rename`
+/// names declares, as the drops to run before the rename and the triggers to
+/// create after it.
+///
+/// A key into the table needs no move, since a policy hiding its rows puts
+/// the table under row security, whose rename is refused.
 ///
 /// # Errors
 ///
@@ -650,14 +650,9 @@ pub(crate) fn moved(
     options: &TranslationContext<'_>,
 ) -> Result<(Vec<Statement>, Vec<Statement>), Error> {
     let written = options.written_schema().unwrap_or(schema);
-    let Some(table) = resolve_translation_table(written, rename.from)? else {
-        return Ok((Vec::new(), Vec::new()));
-    };
     let (mut drops, mut creates) = (Vec::new(), Vec::new());
-    for key in Key::all(written)? {
-        let touched = core::ptr::eq(key.table, table)
-            || key.parent(written)?.is_some_and(|parent| core::ptr::eq(parent, table));
-        if !touched || hidden_rows(&key.constraint.foreign_table, schema, options)?.is_none() {
+    for key in Key::of_named(rename.from, written)? {
+        if hidden_rows(&key.constraint.foreign_table, schema, options)?.is_none() {
             continue;
         }
         drops.extend(key.drops());
@@ -695,13 +690,13 @@ struct Parts {
     /// The table holding the referencing rows.
     referencing: String,
     /// The backing table holding the referenced rows.
-    referenced: String,
+    referenced: ObjectName,
     /// The referencing columns, as declared.
     names: Vec<String>,
     /// The referencing columns.
     columns: Vec<String>,
     /// The referenced columns, in the order of `columns`.
-    referenced_columns: Vec<String>,
+    referenced_columns: Vec<Ident>,
 }
 
 impl Parts {
@@ -727,34 +722,24 @@ impl Parts {
             ),
             options.get_rls_table_suffix(),
         );
-        let referenced_columns: Vec<String> = key
-            .referenced_columns(written)?
-            .iter()
-            .map(|column| quoted_ident(column).to_string())
-            .collect();
-        if referenced_columns.len() != key.constraint.columns.len() {
-            return Err(Error::forward_refusal(format!(
-                "the foreign key of {table} into {} names {} referencing columns and {} \
-                 referenced ones, which PostgreSQL refuses.",
-                key.constraint.foreign_table,
-                key.constraint.columns.len(),
-                referenced_columns.len()
-            )));
-        }
         let names: Vec<String> =
             key.constraint.columns.iter().map(|column| column.value.clone()).collect();
         Ok(Self {
             referencing: quoted_name(&referencing),
-            referenced: quoted_name(&referenced_name),
+            referenced: plain_name(&last_ident_value_or_display(&referenced_name)),
             columns: names.iter().map(|name| quoted_ident(name).to_string()).collect(),
             names,
-            referenced_columns,
+            referenced_columns: key
+                .referenced_columns(written)?
+                .iter()
+                .map(|column| quoted_ident(column))
+                .collect(),
         })
     }
 
     /// Whether the referencing rows sit in the referenced table.
     fn references_itself(&self) -> bool {
-        self.referencing == self.referenced
+        self.referencing == self.referenced.to_string()
     }
 
     /// The referencing rows of the referenced row as it stood, `OLD`.
@@ -804,7 +789,8 @@ impl Parts {
 
     /// Deletes the referencing rows of `OLD` and, row by row, theirs.
     fn delete_descendants(&self) -> String {
-        let keys = self.referenced_columns.join(", ");
+        let keys = self.referenced_columns.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let keys = keys.join(", ");
         let outputs: Vec<String> = (1..=self.referenced_columns.len())
             .map(|position| format!("pg2sqlite_key_{position}"))
             .collect();
@@ -878,21 +864,20 @@ impl Parts {
         Ok(defaults)
     }
 
-    /// The trigger `name` running `body` after `event` on the referenced
-    /// table, for an update only when it moves the key.
-    fn trigger(
+    /// The firing of `event` on the referenced table running `body`, for an
+    /// update only when it moves the key.
+    fn event(
         &self,
-        name: &str,
         event: Event,
         body: &str,
         options: &TranslationContext<'_>,
-    ) -> Result<CreateTrigger, Error> {
+    ) -> Result<QueuedEvent, Error> {
         let mut conditions: Vec<String> = write_guard_condition_expr(None, options)
             .map(|guard| guard.to_string())
             .into_iter()
             .collect();
-        let event = match event {
-            Event::Delete => "DELETE".to_string(),
+        let fired = match event {
+            Event::Delete => TriggerEvent::Delete,
             Event::Update => {
                 conditions.push(format!(
                     "({})",
@@ -902,33 +887,37 @@ impl Parts {
                         .collect::<Vec<_>>()
                         .join(" OR ")
                 ));
-                format!("UPDATE OF {}", self.referenced_columns.join(", "))
+                TriggerEvent::Update(self.referenced_columns.clone())
             }
         };
         let condition = if conditions.is_empty() {
-            String::new()
+            None
         } else {
-            format!(" WHEN {}", conditions.join(" AND "))
+            Some(sqlite(&conditions.join(" AND "), |parser| parser.parse_expr())?)
         };
-        let text = format!(
-            "CREATE TRIGGER {} AFTER {event} ON {} FOR EACH ROW{condition} BEGIN {body} END",
-            quoted_ident(name),
-            self.referenced
-        );
-        match Parser::parse_sql(&SQLiteDialect {}, &text) {
-            Ok(mut statements) => {
-                match (statements.pop(), statements.is_empty()) {
-                    (Some(Statement::CreateTrigger(trigger)), true) => Ok(trigger),
-                    _ => unreachable!("the text is one CREATE TRIGGER"),
-                }
-            }
-            Err(error) => {
-                Err(Error::forward_refusal(format!(
-                    "the trigger keeping a foreign key `{text}` fails to parse: {error}"
-                )))
-            }
-        }
+        Ok(QueuedEvent {
+            table: self.referenced.clone(),
+            kind: event.deferred(),
+            event: fired,
+            condition,
+            body: sqlite(body, |parser| parser.parse_statements())?,
+        })
     }
+}
+
+/// `text`, which this module writes, parsed by `parse` as SQLite.
+fn sqlite<T>(
+    text: &str,
+    parse: impl FnOnce(&mut Parser<'_>) -> Result<T, ParserError>,
+) -> Result<T, Error> {
+    Parser::new(&SQLiteDialect {})
+        .try_with_sql(text)
+        .and_then(|mut parser| parse(&mut parser))
+        .map_err(|error| {
+            Error::forward_refusal(format!(
+                "the trigger keeping a foreign key reads `{text}`, which fails to parse: {error}"
+            ))
+        })
 }
 
 /// `name` as one quoted identifier, named as SQLite names it unqualified.

@@ -1,8 +1,10 @@
 //! Execution contracts for `DEFERRABLE INITIALLY DEFERRED` constraint
 //! triggers, whose checks run at commit against the rows as they stand then.
 
-use diesel::{QueryDsl, QueryResult, RunQueryDsl, SqliteConnection, connection::SimpleConnection};
+use diesel::{QueryDsl, RunQueryDsl, SqliteConnection, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+
+use crate::support::transaction::transaction;
 
 const SCHEMA: &str = "
 CREATE TABLE resources (id TEXT PRIMARY KEY, kind TEXT NOT NULL);
@@ -56,24 +58,6 @@ fn replica(source: &str, options: &Pg2SqliteOptions) -> (SqliteConnection, Vec<S
         connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
     }
     (connection, before_commit)
-}
-
-/// Runs `writes` in one transaction, committing through `before_commit` and
-/// rolling back when the commit fails, as PostgreSQL does.
-fn transaction(
-    connection: &mut SqliteConnection,
-    before_commit: &[String],
-    writes: &str,
-) -> QueryResult<()> {
-    connection.batch_execute("BEGIN").expect("begin");
-    let committed = connection.batch_execute(writes).and_then(|()| {
-        before_commit.iter().try_for_each(|statement| connection.batch_execute(statement))?;
-        connection.batch_execute("COMMIT")
-    });
-    if committed.is_err() {
-        connection.batch_execute("ROLLBACK").expect("roll back");
-    }
-    committed
 }
 
 fn resource_ids(connection: &mut SqliteConnection) -> Vec<String> {

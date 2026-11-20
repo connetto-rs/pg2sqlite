@@ -274,13 +274,22 @@ pub(crate) fn translate(
     for event in &trigger.events {
         let CreateTrigger { table_name, condition, statements: body, events: mut fired, .. } =
             immediate(trigger, event, schema, options, emit)?;
+        let Some(kind) = DeferredEvent::of(event) else {
+            unreachable!("the immediate translation refuses a TRUNCATE trigger")
+        };
         let (Some(ConditionalStatements::BeginEnd(body)), Some(event)) = (body, fired.pop()) else {
             return Err(Error::forward_refusal(format!(
                 "constraint trigger `{}` translated without a body",
                 trigger.name
             )));
         };
-        events.push(QueuedEvent { table: table_name, event, condition, body: body.statements });
+        events.push(QueuedEvent {
+            table: table_name,
+            kind,
+            event,
+            condition,
+            body: body.statements,
+        });
     }
     queued(&trigger.name, events)
 }
@@ -289,7 +298,9 @@ pub(crate) fn translate(
 pub(crate) struct QueuedEvent {
     /// The table the event happens on.
     pub(crate) table: ObjectName,
-    /// The event, which is no `TRUNCATE`.
+    /// What the event is to the check.
+    pub(crate) kind: DeferredEvent,
+    /// The event as the queueing trigger fires on it.
     pub(crate) event: TriggerEvent,
     /// Whether the event queues a firing, read when it happens.
     pub(crate) condition: Option<Expr>,
@@ -314,20 +325,15 @@ pub(crate) fn queued(
     mut events: Vec<QueuedEvent>,
 ) -> Result<Vec<Statement>, Error> {
     let mut columns = PayloadColumns::default();
-    let mut kinds = Vec::with_capacity(events.len());
     for event in &mut events {
-        let Some(kind) = DeferredEvent::of(&event.event) else {
-            unreachable!("no deferred check queues a TRUNCATE")
-        };
         for statement in &mut event.body {
             columns.read_from(statement)?;
         }
-        kinds.push(kind);
     }
 
     let payload = payload_name(name);
     let mut statements = vec![columns.table(&payload)];
-    for (kind, QueuedEvent { table, event, condition, body }) in kinds.into_iter().zip(events) {
+    for QueuedEvent { table, kind, event, condition, body } in events {
         statements.push(ast_builder::trigger(
             queue_trigger_name(name, kind),
             table,

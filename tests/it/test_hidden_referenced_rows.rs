@@ -13,7 +13,7 @@ use pg2sqlite::{
 };
 use sqlstate::pg;
 
-use crate::helpers;
+use crate::{helpers, support::transaction::transaction};
 
 diesel::table! {
     /// The referencing table.
@@ -142,7 +142,9 @@ fn a_write_referencing_a_row_the_role_cannot_read_commits() {
 
 #[test]
 fn deleting_a_referenced_row_is_refused_while_a_referencing_row_remains() {
-    for key in ["REFERENCES users (id)", "REFERENCES users (id) ON DELETE RESTRICT"] {
+    for key in
+        ["REFERENCES users (id)", "REFERENCES users", "REFERENCES users (id) ON DELETE RESTRICT"]
+    {
         let mut connection = replica(key);
         connection.batch_execute("INSERT INTO memberships VALUES (1, 1)").expect("membership");
         assert_eq!(refusal(&mut connection, "DELETE FROM users WHERE id = 1"), REFUSAL, "{key}");
@@ -182,26 +184,29 @@ fn set_null_and_set_default_rewrite_the_referencing_rows() {
 }
 
 #[test]
+fn set_default_without_a_default_clears_the_referencing_rows() {
+    let pg = script_with("name = 'visible'", "REFERENCES users (id) ON DELETE SET DEFAULT", "")
+        .replace("DEFAULT 1 ", "");
+    let (mut connection, _) = replica_with(&pg, &options());
+    connection.batch_execute("INSERT INTO memberships VALUES (1, 1)").expect("membership");
+    connection.batch_execute("DELETE FROM users WHERE id = 1").expect("delete");
+    assert_eq!(memberships(&mut connection), [(1, None)]);
+}
+
+#[test]
 fn a_deferred_key_checks_the_referencing_rows_at_commit() {
     let (mut connection, before_commit) =
         replica_with(&script("REFERENCES users (id) DEFERRABLE INITIALLY DEFERRED"), &options());
     connection.batch_execute("INSERT INTO memberships VALUES (1, 1)").expect("membership");
-    let commit = |connection: &mut SqliteConnection, writes: &str| {
-        connection.batch_execute("BEGIN").expect("begin");
-        let committed = connection.batch_execute(writes).and_then(|()| {
-            before_commit.iter().try_for_each(|statement| connection.batch_execute(statement))?;
-            connection.batch_execute("COMMIT")
-        });
-        if committed.is_err() {
-            connection.batch_execute("ROLLBACK").expect("roll back");
-        }
-        committed
-    };
-    let error = commit(&mut connection, "DELETE FROM users WHERE id = 1")
+    let error = transaction(&mut connection, &before_commit, "DELETE FROM users WHERE id = 1")
         .expect_err("the membership still references the user at commit");
     assert!(error.to_string().contains(REFUSAL), "{error}");
-    commit(&mut connection, "DELETE FROM users WHERE id = 1; DELETE FROM memberships;")
-        .expect("nothing references the user by the commit");
+    transaction(
+        &mut connection,
+        &before_commit,
+        "DELETE FROM users WHERE id = 1; DELETE FROM memberships;",
+    )
+    .expect("nothing references the user by the commit");
     assert_eq!(memberships(&mut connection), Vec::new());
 }
 
@@ -243,10 +248,17 @@ fn a_key_added_later_keeps_its_referenced_side() {
 
 #[test]
 fn dropping_the_referencing_table_or_column_drops_the_referenced_side() {
-    for extra in ["DROP TABLE memberships;", "ALTER TABLE memberships DROP COLUMN user_id;"] {
-        let pg = script_with("name = 'visible'", "REFERENCES users (id)", extra);
-        let (mut connection, _) = replica_with(&pg, &options());
-        connection.batch_execute("DELETE FROM users WHERE id = 1").expect(extra);
+    for key in ["REFERENCES users (id)", "REFERENCES users (id) DEFERRABLE INITIALLY DEFERRED"] {
+        for extra in [
+            "DROP TABLE memberships;",
+            "ALTER TABLE memberships DROP COLUMN user_id;",
+            "ALTER TABLE memberships RENAME TO members; DROP TABLE members;",
+        ] {
+            let pg = script_with("name = 'visible'", key, extra);
+            let (mut connection, before_commit) = replica_with(&pg, &options());
+            transaction(&mut connection, &before_commit, "DELETE FROM users WHERE id = 1")
+                .unwrap_or_else(|error| panic!("{key} {extra}: {error}"));
+        }
     }
 }
 
@@ -281,6 +293,33 @@ fn the_report_names_the_key_and_the_hiding_policy() {
             policies: vec!["users_select".to_owned()],
         }]
     );
+    assert_eq!(
+        hidden[0].to_string(),
+        "the replica leaves the check of foreign key memberships_user_id_fkey on memberships to \
+         the server, since users_select may hide rows of users from the acting role"
+    );
+}
+
+#[test]
+fn the_report_names_no_policy_when_none_lets_the_role_read() {
+    let pg = script_with("true", "REFERENCES users (id)", "")
+        .replace("CREATE POLICY users_select ON users FOR SELECT TO app USING (true);", "");
+    let report = Pg2Sqlite::default()
+        .sql(&pg)
+        .expect("parse")
+        .translate_with_report(&options())
+        .expect("translate");
+    let hidden: Vec<String> = report
+        .warnings
+        .iter()
+        .filter(|warning| matches!(warning, TranslationWarning::HiddenReferencedRows { .. }))
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(
+        hidden,
+        ["the replica leaves the check of foreign key memberships_user_id_fkey on memberships to \
+          the server, since no policy lets the acting role read users"]
+    );
 }
 
 #[test]
@@ -288,24 +327,20 @@ fn renaming_the_referencing_table_moves_the_referenced_side() {
     let pg = script_with(
         "name = 'visible'",
         "REFERENCES users (id)",
-        "ALTER TABLE memberships RENAME TO members;",
+        "CREATE TABLE teams (id INT PRIMARY KEY);
+         GRANT SELECT ON teams TO app;
+         ALTER TABLE memberships ADD COLUMN team_id INT REFERENCES teams (id);
+         ALTER TABLE memberships RENAME TO members;",
     );
     let (mut connection, _) = replica_with(&pg, &options());
-    connection.batch_execute("INSERT INTO members VALUES (1, 1)").expect("membership");
+    connection
+        .batch_execute("INSERT INTO members (id, user_id) VALUES (1, 1)")
+        .expect("membership");
     assert_eq!(
         refusal(&mut connection, "DELETE FROM users WHERE id = 1"),
         "update or delete on table \"users\" violates foreign key constraint \
          \"memberships_user_id_fkey\" on table \"members\""
     );
-    let pg = script_with(
-        "name = 'visible'",
-        "REFERENCES users (id)",
-        "ALTER TABLE memberships RENAME TO members; DROP TABLE members;",
-    );
-    let (mut connection, _) = replica_with(&pg, &options());
-    connection
-        .batch_execute("DELETE FROM users WHERE id = 1")
-        .expect("nothing references the user");
 }
 
 #[test]
@@ -364,8 +399,12 @@ fn a_key_into_its_own_table_cascades_through_every_descendant() {
     let pg = "CREATE ROLE app;
          CREATE TABLE nodes (id INT PRIMARY KEY, parent INT REFERENCES nodes (id) ON DELETE CASCADE,
              name TEXT NOT NULL);
+         CREATE TABLE leaves (id INT PRIMARY KEY, node INT REFERENCES nodes (id) ON DELETE CASCADE,
+             first_node INT REFERENCES nodes (id) ON DELETE CASCADE);
+         CREATE TABLE tags (id INT PRIMARY KEY, leaf INT REFERENCES leaves (id));
          ALTER TABLE nodes ENABLE ROW LEVEL SECURITY;
          GRANT SELECT, DELETE ON nodes TO app;
+         GRANT SELECT ON leaves, tags TO app;
          CREATE POLICY nodes_select ON nodes FOR SELECT TO app USING (name = 'visible');
          CREATE POLICY nodes_delete ON nodes FOR DELETE TO app USING (true);";
     let script = Pg2Sqlite::default()
@@ -394,24 +433,35 @@ fn a_key_into_its_own_table_cascades_through_every_descendant() {
 }
 
 #[test]
-fn a_cycle_of_cascades_through_hidden_rows_is_refused() {
-    let pg = "CREATE ROLE app;
-         CREATE TABLE a (id INT PRIMARY KEY, name TEXT NOT NULL, b_id INT);
+fn a_cycle_of_actions_through_hidden_rows_is_refused() {
+    let deletes = "CREATE TABLE a (id INT PRIMARY KEY, name TEXT NOT NULL, b_id INT);
          CREATE TABLE b (id INT PRIMARY KEY, name TEXT NOT NULL,
              a_id INT REFERENCES a (id) ON DELETE CASCADE);
          ALTER TABLE a ADD FOREIGN KEY (b_id) REFERENCES b (id) ON DELETE CASCADE;
-         ALTER TABLE a ENABLE ROW LEVEL SECURITY;
-         ALTER TABLE b ENABLE ROW LEVEL SECURITY;
-         GRANT SELECT ON a, b TO app;
-         CREATE POLICY a_select ON a FOR SELECT TO app USING (name = 'visible');
-         CREATE POLICY b_select ON b FOR SELECT TO app USING (name = 'visible');";
-    let refusal = Pg2Sqlite::default()
-        .sql(pg)
-        .expect("parse")
-        .translate_to_sql(&options())
-        .expect_err("the cycle is refused")
-        .to_string();
-    assert!(refusal.contains("leads back to its own trigger"), "{refusal}");
+         CREATE TABLE secret (id INT PRIMARY KEY);
+         ALTER TABLE b ADD COLUMN secret_id INT REFERENCES secret (id);";
+    let updates = "CREATE TABLE a (id INT PRIMARY KEY, name TEXT NOT NULL);
+         CREATE TABLE b (id INT PRIMARY KEY, name TEXT NOT NULL,
+             a_id INT UNIQUE REFERENCES a (id) ON UPDATE CASCADE);
+         ALTER TABLE a ADD FOREIGN KEY (id) REFERENCES b (a_id) ON UPDATE CASCADE;";
+    for (tables, action) in [(deletes, "ON DELETE"), (updates, "ON UPDATE")] {
+        let pg = format!(
+            "CREATE ROLE app;
+             {tables}
+             ALTER TABLE a ENABLE ROW LEVEL SECURITY;
+             ALTER TABLE b ENABLE ROW LEVEL SECURITY;
+             GRANT SELECT ON a, b TO app;
+             CREATE POLICY a_select ON a FOR SELECT TO app USING (name = 'visible');
+             CREATE POLICY b_select ON b FOR SELECT TO app USING (name = 'visible');"
+        );
+        let refusal = Pg2Sqlite::default()
+            .sql(&pg)
+            .expect("parse")
+            .translate_to_sql(&options())
+            .expect_err("the cycle is refused")
+            .to_string();
+        assert!(refusal.contains(&format!("its {action} action leads back")), "{refusal}");
+    }
 }
 
 #[test]
@@ -428,6 +478,35 @@ fn rebuilding_the_referenced_table_keeps_the_referenced_side() {
     let (mut connection, _) = replica_with(pg, &options());
     connection.batch_execute("INSERT INTO memberships VALUES (1, 1)").expect("membership");
     assert_eq!(refusal(&mut connection, "DELETE FROM users WHERE id = 1"), REFUSAL);
+}
+
+#[test]
+fn a_deferred_key_of_the_starting_schema_survives_a_rebuild_of_the_referenced_table() {
+    let pg = "CREATE ROLE app;
+         CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE);
+         ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+         GRANT SELECT, DELETE ON users TO app;
+         CREATE POLICY users_select ON users FOR SELECT TO app USING (name = 'visible');
+         CREATE POLICY users_delete ON users FOR DELETE TO app USING (true);
+         CREATE TABLE memberships (id INT PRIMARY KEY,
+             user_id INT REFERENCES users (id) DEFERRABLE INITIALLY DEFERRED);
+         GRANT SELECT, INSERT ON memberships TO app;";
+    let starting = Pg2Sqlite::default().sql(pg).expect("parse").build_schema().expect("schema");
+    let (mut connection, _) = replica_with(pg, &options());
+    let migration = Pg2Sqlite::default()
+        .sql("ALTER TABLE users DROP COLUMN email;")
+        .expect("parse")
+        .translate_to_sql_with_schema(&starting, &options())
+        .expect("translate");
+    let before_commit = migration.before_commit.clone();
+    for statement in migration.into_vec() {
+        connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
+    }
+    connection.batch_execute("INSERT INTO memberships VALUES (1, 1)").expect("membership");
+    // The view built with the starting schema still reads the dropped column.
+    let error = transaction(&mut connection, &before_commit, "DELETE FROM users_rls WHERE id = 1")
+        .expect_err("the membership still references the user at commit");
+    assert!(error.to_string().contains(REFUSAL), "{error}");
 }
 
 #[test]

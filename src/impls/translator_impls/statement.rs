@@ -724,15 +724,13 @@ fn translate_alter_table(
                 options,
                 emit,
             )?);
-            if let Some(table) = resolve_translation_table(written, &alter_table.name)? {
-                dependents.extend(hidden_referenced_rows::dropped(
-                    table,
-                    Some(column_names),
-                    written,
-                    schema,
-                    options,
-                )?);
-            }
+            dependents.extend(hidden_referenced_rows::dropped(
+                &alter_table.name,
+                Some(column_names),
+                written,
+                schema,
+                options,
+            )?);
             // An earlier drop of the same statement may have taken a dependent
             // already.
             dependents.retain(|dependent| !statements.contains(dependent));
@@ -2092,11 +2090,9 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
                             // Their keys' triggers sit on the referenced
                             // tables.
                             for name in kept.iter() {
-                                if let Some(table) = resolve_translation_table(written, name)? {
-                                    statements.extend(hidden_referenced_rows::dropped(
-                                        table, None, written, schema, options,
-                                    )?);
-                                }
+                                statements.extend(hidden_referenced_rows::dropped(
+                                    name, None, written, schema, options,
+                                )?);
                             }
                         }
                         statements
