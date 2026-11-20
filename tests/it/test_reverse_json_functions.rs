@@ -85,6 +85,41 @@ fn json_remove_nested_path() {
     assert_emits("SELECT json_remove(payload, '$.a.b') FROM t", "#- '{a,b}'");
 }
 
+/// A quoted label is a JSON string, and the key it decodes to is quoted in the
+/// `text[]` path wherever PostgreSQL would read it as something else.
+#[test]
+fn json_remove_reads_a_quoted_label_as_a_json_string() {
+    for (path, want) in [
+        (r#"$."a.b".c"#, "#- '{a.b,c}'"),
+        (r#"$."\u00e9\/x""#, "#- '{é/x}'"),
+        (r#"$."a\"b\\c""#, r#"#- '{"a\"b\\c"}'"#),
+        (r#"$."a b""#, r#"#- '{"a b"}'"#),
+        (r#"$."null""#, r#"#- '{"null"}'"#),
+        ("$.\"\"", r#"#- '{""}'"#),
+        ("$.\"\\b\\f\\n\\r\\t\"", "#- '{\"\u{8}\u{c}\n\r\t\"}'"),
+    ] {
+        assert_emits(&format!("SELECT json_remove(payload, '{path}') FROM t"), want);
+    }
+}
+
+/// An array step, the whole document, an empty bare label and a label that
+/// is not a JSON string have no `text[]` path.
+#[test]
+fn json_remove_refuses_a_path_without_object_keys() {
+    for path in ["$", "$.a[0]", "$.", "$..a", r#"$."a"#, r#"$."a\x""#, r#"$."\u00zz""#, "$x"] {
+        assert_rejected_with(&format!("SELECT json_remove(payload, '{path}') FROM t"), "path");
+    }
+}
+
+/// SQLite reads an arrow's text operand starting with `$` as a path.
+#[test]
+fn an_arrow_path_becomes_the_path_operator() {
+    assert_emits("SELECT payload -> '$.a' FROM t", "#> '{a}'");
+    assert_emits("SELECT payload ->> '$.\"a,b\"' FROM t", r#"#>> '{"a,b"}'"#);
+    assert_emits("SELECT payload -> 'a' FROM t", "-> 'a'");
+    assert_rejected_with("SELECT payload -> '$[0]' FROM t", "path");
+}
+
 // --- json_extract(j, '$.path') is refused (E2) ---
 // Neither #> nor #>> preserves all SQLite value types faithfully.
 

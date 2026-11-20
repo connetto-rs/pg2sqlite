@@ -472,7 +472,22 @@ impl ReverseTranslator for Expr {
                 op: op @ (BinaryOperator::HashArrow | BinaryOperator::HashLongArrow),
                 left,
                 right,
-            } => reverse_json_path_operator(op, left, right, schema, options),
+            } => reverse_json_path_operator(op, op, left, right, schema, options),
+
+            // SQLite reads a text operand starting with `$` as a path, which
+            // PostgreSQL's arrows would read as a key.
+            Expr::BinaryOp {
+                op: op @ (BinaryOperator::Arrow | BinaryOperator::LongArrow),
+                left,
+                right,
+            } if single_quoted_literal(right).is_some_and(|path| path.starts_with('$')) => {
+                let path_op = if *op == BinaryOperator::LongArrow {
+                    BinaryOperator::HashLongArrow
+                } else {
+                    BinaryOperator::HashArrow
+                };
+                reverse_json_path_operator(op, &path_op, left, right, schema, options)
+            }
 
             Expr::BinaryOp { op: BinaryOperator::StringConcat, left, right } => {
                 reverse_string_concat(self, left, right, schema, options)
@@ -858,36 +873,36 @@ fn reverse_numeric_binary_op(
     translate_expr_recursive::<Reverse>(whole, schema, options, &mut |_| {})
 }
 
-/// Rewrites `#>` and `#>>` from SQLite's JSONPath right operand onto
-/// PostgreSQL's `text[]` one.
+/// Rewrites `source`, an operator whose right operand is SQLite's JSONPath,
+/// as `target` over PostgreSQL's `text[]` path.
 ///
 /// The same text means different paths in the two engines: SQLite reads
 /// `'$.a'` as the key `a`, and PostgreSQL reads it as a one-element array
 /// holding the three characters, so the lookup finds nothing and answers
 /// NULL. A path this cannot read is refused rather than passed through.
 fn reverse_json_path_operator(
-    op: &BinaryOperator,
+    source: &BinaryOperator,
+    target: &BinaryOperator,
     left: &Expr,
     right: &Expr,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
 ) -> Result<Expr, Error> {
-    let operator = if *op == BinaryOperator::HashLongArrow { "#>>" } else { "#>" };
     let Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(path), .. }) = right else {
         return Err(Error::reverse_refusal(format!(
-            "{operator} needs its right operand as a string literal; non-literal paths cannot be \
+            "{source} needs its right operand as a string literal; non-literal paths cannot be \
              converted at translation time"
         )));
     };
     let pg_path = sqlite_json_path_to_pg_text_path(path).ok_or_else(|| {
         Error::reverse_refusal(format!(
-            "{operator} path '{path}' cannot be converted: only simple dotted paths like '$.a' or \
-             '$.a.b' are supported"
+            "{source} path '{path}' cannot be converted: only paths of object keys like '$.a' or \
+             '$.a.\"b\"' are supported"
         ))
     })?;
     Ok(Expr::BinaryOp {
         left: Box::new(left.reverse_translate(schema, options)?),
-        op: op.clone(),
+        op: target.clone(),
         right: Box::new(string_literal(&pg_path)),
     })
 }
