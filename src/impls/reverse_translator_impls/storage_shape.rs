@@ -67,7 +67,7 @@ pub(crate) fn declared_data_type(
 /// neither, and a JSON array is an array column or a document. Everything else
 /// reverses the same whatever the column is declared as, so it never asks.
 pub(crate) fn needs_declared_type(value: &Expr) -> bool {
-    uuid_blob(value).is_some() || is_json_array_construction(value)
+    sqlite_blob(value).is_some() || is_json_array_construction(value)
 }
 
 /// True when `value` is the JSON array construction an array column's value
@@ -82,10 +82,11 @@ fn is_json_array_construction(value: &Expr) -> bool {
 ///
 /// A `decode(x, 'hex')` landing in a `uuid` column becomes `CAST(x AS UUID)`,
 /// which PostgreSQL accepts for the 32 hex digits SQLite's `unhex` took, a
-/// blob literal `X'...'` becomes the uuid's text, and a `json_build_array(...)`
+/// blob literal `X'...'` becomes the uuid's text in a `uuid` column and the
+/// bytea's hex text `'\x...'` in a `bytea` one, and a `json_build_array(...)`
 /// landing in an array column becomes an `ARRAY[...]` constructor. Anything
-/// else is returned untouched, including the `bytea` and `json` columns the
-/// original mapping was right for.
+/// else is returned untouched, including the `decode(x, 'hex')` a `bytea`
+/// column takes and the `json_build_array(...)` a `json` column takes.
 ///
 /// # Errors
 ///
@@ -100,6 +101,7 @@ pub(crate) fn retype_for_declared(
 ) -> Result<Expr, Error> {
     match declared {
         DataType::Uuid => retype_blob_as_uuid(value, options),
+        DataType::Bytea => Ok(retype_blob_literal_as_bytea(value)),
         DataType::Array(_) => Ok(retype_json_array_as_array(value, declared)),
         _ => Ok(value),
     }
@@ -184,16 +186,15 @@ pub(crate) fn retype_assignment(
     }
 }
 
-/// A blob reaching a `uuid` column, in the two shapes the reverse direction
-/// meets it.
-enum UuidBlob<'value> {
+/// A SQLite blob, in the two shapes the reverse direction meets it.
+enum SqliteBlob<'value> {
     /// The argument of the `decode(x, 'hex')` SQLite's `unhex(x)` reverses to.
     Decoded(&'value Expr),
-    /// The hex digits of a blob literal `X'...'`, the form a bound uuid takes.
+    /// The hex digits of a blob literal `X'...'`, the form a bound blob takes.
     Literal(&'value str),
 }
 
-impl core::fmt::Display for UuidBlob<'_> {
+impl core::fmt::Display for SqliteBlob<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Decoded(argument) => write!(f, "unhex({argument})"),
@@ -208,12 +209,12 @@ fn retype_blob_as_uuid(
     value: Expr,
     options: &crate::options::TranslationContext<'_>,
 ) -> Result<Expr, Error> {
-    let Some(blob) = uuid_blob(&value) else { return Ok(value) };
+    let Some(blob) = sqlite_blob(&value) else { return Ok(value) };
 
     match options.get_uuid_representation() {
         Some(crate::prelude::UuidRepresentation::Blob) => {
             match blob {
-                UuidBlob::Decoded(hex_argument) => {
+                SqliteBlob::Decoded(hex_argument) => {
                     Ok(Expr::Cast {
                         expr: Box::new(hex_argument.clone()),
                         data_type: DataType::Uuid,
@@ -221,7 +222,7 @@ fn retype_blob_as_uuid(
                         kind: CastKind::DoubleColon,
                     })
                 }
-                UuidBlob::Literal(digits) => uuid_text_literal(digits),
+                SqliteBlob::Literal(digits) => uuid_text_literal(digits),
             }
         }
         Some(crate::prelude::UuidRepresentation::Text) => {
@@ -239,6 +240,23 @@ fn retype_blob_as_uuid(
                  no faithful reversal at all. Set the uuid representation on the options."
             )))
         }
+    }
+}
+
+/// `X'...'` -> the untyped `'\x...'` for a `bytea` column.
+///
+/// PostgreSQL reads `X'...'` as a bit string, which a `bytea` column refuses
+/// with `column is of type bytea but expression is of type bit` and compares
+/// with `operator does not exist: bytea = bit`. The hex text is untyped, so
+/// the column it meets types it as `bytea`, as [`uuid_text_literal`] does for
+/// a `uuid`. A `decode(x, 'hex')` is already a `bytea` and stays.
+fn retype_blob_literal_as_bytea(value: Expr) -> Expr {
+    match value {
+        Expr::Value(ValueWithSpan { value: Value::HexStringLiteral(mut digits), span }) => {
+            digits.insert_str(0, "\\x");
+            Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(digits), span })
+        }
+        other => other,
     }
 }
 
@@ -262,12 +280,12 @@ fn uuid_text_literal(digits: &str) -> Result<Expr, Error> {
     Ok(Expr::Value(Value::SingleQuotedString(text).with_empty_span()))
 }
 
-/// The blob `value` hands a `uuid` column, when it is one of the shapes the
-/// reverse direction builds for a SQLite blob.
-fn uuid_blob(value: &Expr) -> Option<UuidBlob<'_>> {
+/// The blob `value` is, when it is one of the shapes the reverse direction
+/// builds for a SQLite blob.
+fn sqlite_blob(value: &Expr) -> Option<SqliteBlob<'_>> {
     match value {
         Expr::Value(ValueWithSpan { value: Value::HexStringLiteral(digits), .. }) => {
-            Some(UuidBlob::Literal(digits))
+            Some(SqliteBlob::Literal(digits))
         }
         Expr::Function(function) => {
             if !function_is_named(function, "decode") {
@@ -278,7 +296,7 @@ fn uuid_blob(value: &Expr) -> Option<UuidBlob<'_>> {
             if !second.to_string().eq_ignore_ascii_case("'hex'") {
                 return None;
             }
-            argument_expr(first).map(UuidBlob::Decoded)
+            argument_expr(first).map(SqliteBlob::Decoded)
         }
         _ => None,
     }
