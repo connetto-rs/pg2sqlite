@@ -169,6 +169,51 @@ INSERT INTO notes (body) VALUES ('first');
 GRANT SELECT (body) ON notes TO app;
 ";
 
+/// Seeds and changes a table whose policy reads a table created after them.
+const SEED_BEFORE_POLICY_READ_SCHEMA: &str = "
+CREATE ROLE app NOLOGIN;
+CREATE TABLE kinds (id TEXT PRIMARY KEY);
+ALTER TABLE kinds ENABLE ROW LEVEL SECURITY;
+INSERT INTO kinds (id) VALUES ('sample'), ('device'), ('reagent');
+UPDATE kinds SET id = 'specimen' WHERE id = 'reagent';
+CREATE TABLE labels (name TEXT PRIMARY KEY);
+ALTER TABLE labels RENAME COLUMN name TO label;
+CREATE TABLE allowed (id TEXT PRIMARY KEY);
+INSERT INTO allowed (id) VALUES ('sample'), ('specimen');
+GRANT SELECT ON kinds, labels, allowed TO app;
+CREATE POLICY kinds_read ON kinds FOR SELECT TO app USING (id IN (SELECT id FROM allowed));
+";
+
+/// Seeds a table whose policy reads a later table under a policy reading a
+/// table later still.
+const SEED_BEFORE_POLICY_READ_CHAIN_SCHEMA: &str = "
+CREATE ROLE app NOLOGIN;
+CREATE TABLE kinds (id TEXT PRIMARY KEY);
+ALTER TABLE kinds ENABLE ROW LEVEL SECURITY;
+INSERT INTO kinds (id) VALUES ('sample'), ('device');
+CREATE TABLE allowed (id TEXT PRIMARY KEY);
+ALTER TABLE allowed ENABLE ROW LEVEL SECURITY;
+INSERT INTO allowed (id) VALUES ('sample'), ('device');
+CREATE TABLE granted (id TEXT PRIMARY KEY);
+INSERT INTO granted (id) VALUES ('sample');
+GRANT SELECT ON kinds, allowed, granted TO app;
+CREATE POLICY kinds_read ON kinds FOR SELECT TO app USING (id IN (SELECT id FROM allowed));
+CREATE POLICY allowed_read ON allowed FOR SELECT TO app USING (id IN (SELECT id FROM granted));
+";
+
+/// Holds a table's view back into a `TEMP` table's unit, which every
+/// connection replays and a later rename makes it rebind.
+const HELD_VIEW_REBOUND_SCHEMA: &str = "
+CREATE ROLE app NOLOGIN;
+CREATE TABLE things (code TEXT PRIMARY KEY);
+CREATE TABLE kinds (id TEXT PRIMARY KEY);
+ALTER TABLE kinds ENABLE ROW LEVEL SECURITY;
+CREATE TEMP TABLE allowed AS SELECT code AS id FROM things;
+GRANT SELECT ON kinds, allowed, things TO app;
+CREATE POLICY kinds_read ON kinds FOR SELECT TO app USING (id IN (SELECT id FROM allowed));
+ALTER TABLE things RENAME TO stuff;
+";
+
 mod schema {
     diesel::table! {
         shared_items (id) {
@@ -276,6 +321,11 @@ mod schema {
     }
     diesel::table! {
         kinds (id) {
+            id -> Text,
+        }
+    }
+    diesel::table! {
+        kinds_rls (id) {
             id -> Text,
         }
     }
@@ -968,4 +1018,64 @@ fn exempt_writes_through_a_view_hiding_the_key_are_refused() {
             .expect("read notes through the view"),
         ["first"]
     );
+}
+
+/// Before the table its policy reads exists, a table's seeds reach every row as
+/// its owner's do in PostgreSQL, and nothing names the later table, so a
+/// column rename there still loads. The policy applies once the script ends.
+#[test]
+fn seeds_load_before_the_table_the_policy_reads() {
+    let (mut connection, _exempt) = load_exempt(SEED_BEFORE_POLICY_READ_SCHEMA);
+
+    assert_eq!(
+        schema::kinds_rls::table
+            .select(schema::kinds_rls::id)
+            .order(schema::kinds_rls::id)
+            .load::<String>(&mut connection)
+            .expect("read the backing table"),
+        ["device", "sample", "specimen"]
+    );
+    assert_eq!(
+        schema::kinds::table
+            .select(schema::kinds::id)
+            .order(schema::kinds::id)
+            .load::<String>(&mut connection)
+            .expect("read kinds through the view"),
+        ["sample", "specimen"]
+    );
+}
+
+/// A policy reading a table whose own policy reads a later table applies both
+/// once the script ends.
+#[test]
+fn seeds_load_before_a_chain_of_policy_reads() {
+    let (mut connection, _exempt) = load_exempt(SEED_BEFORE_POLICY_READ_CHAIN_SCHEMA);
+
+    assert_eq!(
+        schema::kinds::table
+            .select(schema::kinds::id)
+            .load::<String>(&mut connection)
+            .expect("read kinds through the view"),
+        ["sample"]
+    );
+}
+
+/// A connection is refused when it would retranslate on its own a unit a
+/// held-back view moved into, which would leave the view out.
+#[test]
+fn connection_refuses_rebinding_a_unit_holding_a_view() {
+    let script = Pg2Sqlite::default()
+        .sql(HELD_VIEW_REBOUND_SCHEMA)
+        .expect("parse PostgreSQL")
+        .translate(
+            &Pg2SqliteOptions::default()
+                .with_deployment(deployment(["app"], []))
+                .with_acting_role("app")
+                .with_rls_audit_table_name("rls_audit"),
+        )
+        .expect("translate SQLite");
+    let Err(error) = script.connect() else {
+        panic!("a held view cannot follow its unit through a retranslation");
+    };
+    assert!(error.to_string().contains("held back"), "{error}");
 }

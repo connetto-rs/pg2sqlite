@@ -60,6 +60,10 @@ pub(crate) struct Unit<'a> {
     /// sharing their slots, which retranslating the source alone cannot
     /// reproduce.
     pub(crate) rebuilt_trigger: bool,
+    /// Whether a view held back until the relations it reads exist moved out
+    /// of or into the emitted statements, which retranslating the source alone
+    /// cannot reproduce.
+    pub(crate) held_view: bool,
     /// How PostgreSQL's transaction nesting rules classify the statement.
     pub(crate) disposition: &'a Disposition,
 }
@@ -294,6 +298,14 @@ fn replay_unit(
             "statement {} emits a trigger shared with other triggers on the same table, timing \
              and event, and replaying it here renames what the trigger reads, which a \
              retranslation of that one statement cannot carry into the shared trigger",
+            id.index()
+        )));
+    }
+    if unit.held_view {
+        return Err(refusal(format!(
+            "statement {} emits part of a table's row-security view held back until the \
+             relations its policies read exist, and replaying it here renames what it reads, \
+             which a retranslation of that one statement cannot carry into the held view",
             id.index()
         )));
     }
