@@ -6,7 +6,7 @@ use crate::impls::{
     query_builder::single_expr_query,
     returning_scope::{delete_target, scope_returning_to_target},
     shared_helpers::translate_delete_core,
-    translator_impls::postgis,
+    translator_impls::{check_lateral_calls, postgis},
 };
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
@@ -39,6 +39,9 @@ impl crate::traits::translator::TranslatorWithContext for Delete {
         let target_scope = Some(crate::options::query_column_scope(&scope_query, schema)?);
         let scoped = target_scope.as_ref().map(|scope| options.with_scope(scope));
         let options = scoped.as_ref().unwrap_or(options);
+        if let Some(using) = &self.using {
+            check_lateral_calls(using, schema, options)?;
+        }
         let (selection, from, returning, order_by, limit) =
             translate_delete_core::<Forward>(self, schema, options, emit)?;
 

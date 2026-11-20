@@ -45,6 +45,9 @@ mod parity_plpgsql;
 #[path = "gauntlet/parity_scalar_helpers.rs"]
 mod parity_scalar_helpers;
 
+#[path = "gauntlet/parity_set_returning_helpers.rs"]
+mod parity_set_returning_helpers;
+
 #[path = "gauntlet/parity_text.rs"]
 mod parity_text;
 

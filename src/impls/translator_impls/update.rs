@@ -8,7 +8,10 @@ use super::helpers::{Forward, spell_target_alias_with_as};
 use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
-    impls::{returning_scope::scope_returning_to_target, shared_helpers::translate_update},
+    impls::{
+        returning_scope::scope_returning_to_target, shared_helpers::translate_update,
+        translator_impls::check_lateral_calls,
+    },
 };
 
 /// Every relation an `UPDATE` lists, so a reference qualified by a `FROM`
@@ -39,6 +42,12 @@ impl crate::traits::translator::TranslatorWithContext for Update {
         let target_scope = Some(crate::options::query_column_scope(&scope_query, schema)?);
         let scoped = target_scope.as_ref().map(|scope| options.with_scope(scope));
         let options = scoped.as_ref().unwrap_or(options);
+        if let Some(
+            UpdateTableFromKind::BeforeSet(tables) | UpdateTableFromKind::AfterSet(tables),
+        ) = &self.from
+        {
+            check_lateral_calls(tables, schema, options)?;
+        }
         let mut update = translate_update::<Forward>(self, schema, options, emit)?;
         spell_target_alias_with_as(&mut update.table.relation);
         let auxiliary = update.from.as_ref().map_or(&[][..], |from| {

@@ -29,7 +29,7 @@ use sqlparser::ast::{
     FunctionArgExpr, FunctionArguments, Ident, InTarget, Join, JoinConstraint, JoinOperator,
     ObjectName, ObjectNamePart, Query, SelectItem, SetExpr, SetOperator, SetQuantifier, TableAlias,
     TableAliasColumnDef, TableFactor, TableWithJoins, Value, ValueWithSpan, VisitMut, VisitorMut,
-    With, helpers::attached_token::AttachedToken,
+    With, helpers::attached_token::AttachedToken, visit_expressions,
 };
 
 #[cfg(not(feature = "std"))]
@@ -44,7 +44,7 @@ use crate::{
             from_relation, make_query, make_simple_select, plain_table_factor, single_expr_query,
         },
         session_variable,
-        translator_impls::sql_helper::{declared_helper, hidden_read},
+        translator_impls::sql_helper::{declared_helper, hidden_read, inlined_rows},
     },
     options::TranslationContext,
     traits::TranslatorWithContext,
@@ -95,13 +95,15 @@ pub(crate) fn helper_membership(
 /// The relation is the alias, or the function's name without one. The
 /// columns are the ones `RETURNS TABLE (...)` declares, or the relation's name
 /// for the one column of `RETURNS SETOF` a scalar type, the alias's columns
-/// renaming the leading ones. `None` is as for [`helper_membership`].
+/// renaming the leading ones. A `LANGUAGE sql` helper running as its caller
+/// reads the rows of its body, as [`inlined_rows`] writes them, and any other
+/// the set `helper_set` reads. `None` is as for [`helper_membership`].
 ///
 /// # Errors
 ///
-/// Refuses the call as [`helper_membership`] does, and an alias carrying a
-/// data type or naming more columns than the helper returns, both of which
-/// PostgreSQL refuses too.
+/// Refuses the call as [`helper_membership`] or [`inlined_rows`] does, and an
+/// alias carrying a data type or naming more columns than the helper
+/// returns, both of which PostgreSQL refuses too.
 pub(crate) fn helper_rows(
     name: &ObjectName,
     arguments: &[FunctionArg],
@@ -147,21 +149,92 @@ pub(crate) fn helper_rows(
             column.clone_from(&renamed.name);
         }
     }
-    let rows = helper_query(
-        helper,
-        name,
-        self::arguments(name, arguments),
-        &columns,
-        schema,
-        options,
-        emit,
-    )?;
+    let rows = match inlined_rows(name, arguments, helper, &columns, schema, options, emit)? {
+        Some(rows) => rows,
+        None => {
+            helper_query(
+                helper,
+                name,
+                self::arguments(name, arguments),
+                &columns,
+                schema,
+                options,
+                emit,
+            )?
+        }
+    };
     Ok(Some(TableFactor::Derived {
         lateral: false,
         subquery: Box::new(rows),
         alias: Some(TableAlias { explicit: true, name: relation, columns: Vec::new(), at: None }),
         sample: None,
     }))
+}
+
+/// Refuses a call in the FROM list `from` to a function the schema declares
+/// that is passed a column, when another item sits in that list.
+///
+/// PostgreSQL reads such a call `LATERAL`, in the FROM list of a `SELECT` or
+/// an `UPDATE` and the `USING` list of a `DELETE` alike, so the column may
+/// name another item of the list, and SQLite reads the derived table written
+/// in place of the call only against the queries around it, where the same
+/// name may read another relation. A PL/pgSQL variable, a field of one, and a
+/// field of a trigger's `NEW` or `OLD` are no item of the list and pass.
+///
+/// # Errors
+///
+/// Refuses the first such call, naming it.
+pub(crate) fn check_lateral_calls(
+    from: &[TableWithJoins],
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<(), Error> {
+    let mut factors = Vec::new();
+    let mut tables: Vec<&TableWithJoins> = from.iter().collect();
+    while let Some(table) = tables.pop() {
+        for factor in
+            core::iter::once(&table.relation).chain(table.joins.iter().map(|join| &join.relation))
+        {
+            match factor {
+                TableFactor::NestedJoin { table_with_joins, .. } => tables.push(table_with_joins),
+                other => factors.push(other),
+            }
+        }
+    }
+    if factors.len() < 2 {
+        return Ok(());
+    }
+    for factor in factors {
+        let (name, arguments) = match factor {
+            TableFactor::Table { name, args: Some(arguments), .. } => (name, &arguments.args),
+            TableFactor::Function { name, args, .. } => (name, args),
+            _ => continue,
+        };
+        let reads_column = visit_expressions(arguments, |expr| {
+            let (first, field) = match expr {
+                Expr::Identifier(ident) => (ident, false),
+                Expr::CompoundIdentifier(parts) => {
+                    match parts.first() {
+                        Some(first) => (first, true),
+                        None => return ControlFlow::Continue(()),
+                    }
+                }
+                _ => return ControlFlow::Continue(()),
+            };
+            let outside = options.is_variable(&first.value)
+                || (field && options.trigger_row(&Expr::Identifier(first.clone())).is_some());
+            if outside { ControlFlow::Continue(()) } else { ControlFlow::Break(()) }
+        })
+        .is_break();
+        if reads_column && declared_helper(name, schema, options)?.is_some() {
+            return Err(Error::forward_refusal(format!(
+                "{name}() is passed a column beside another item of the FROM list, which \
+                 PostgreSQL reads LATERAL, reaching that item, and SQLite has no LATERAL. Call \
+                 it alone in the FROM list of a subquery, as EXISTS (SELECT 1 FROM {name}(...))."
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The refusal of a call to `name` that `helper_set` cannot answer.

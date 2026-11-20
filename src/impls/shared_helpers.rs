@@ -4459,6 +4459,7 @@ pub(crate) fn translate_select_forward(
 ) -> Result<sqlparser::ast::Select, Error> {
     use crate::impls::translator_impls::Forward;
 
+    crate::impls::translator_impls::check_lateral_calls(&select.from, schema, options)?;
     let from = select
         .from
         .iter()
