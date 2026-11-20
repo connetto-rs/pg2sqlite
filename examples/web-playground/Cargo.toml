@@ -61,6 +61,7 @@ dx_icons = { version = "0.1.0", features = ["simple"] }
 # Patches don't inherit across workspace boundaries, duplicated from the parent pg2sqlite workspace.
 [patch.crates-io]
 sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
+sql-values = { git = "https://github.com/connetto-rs/sql-values", branch = "main" }
 
 [profile.release]
 opt-level = "z"
