@@ -1964,6 +1964,40 @@ fn rls_read_predicate(
     )
 }
 
+/// The `SELECT` policies that may hide rows of `table` from the acting role,
+/// permissive ones first, or `None` when the role reads every row, as the
+/// view [`rls_read_predicate`] builds reads them.
+///
+/// # Errors
+///
+/// Fails as [`rls_read_predicate`] does.
+pub(crate) fn hiding_policies(
+    table: &CreateTable,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<Option<Vec<String>>, Error> {
+    if !table.has_row_level_security(schema)? {
+        return Ok(None);
+    }
+    // The view reports what its predicate loses, so this second reading of
+    // the same policies reports nothing.
+    if matches!(rls_read_predicate(table, schema, options, &mut |_| {})?, PolicyPredicate::AllowAll)
+    {
+        return Ok(None);
+    }
+    let rows = row_security(table, schema, RowStatement::Select, options)?;
+    let mut names: Vec<String> = Vec::new();
+    if let Some(gate) = rows.gate(GatedCommand::Select, RowVersion::Existing) {
+        for term in gate.permissive().iter().chain(gate.restrictive()) {
+            let name = term.policy().name();
+            if !names.iter().any(|known| known == name) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    Ok(Some(names))
+}
+
 fn generated_object_name(name: &str) -> ObjectName {
     ObjectName(vec![ObjectNamePart::Identifier(quoted_ident(name))])
 }

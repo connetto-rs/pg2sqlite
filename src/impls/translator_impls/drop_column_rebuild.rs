@@ -38,6 +38,7 @@ use sqlparser::{
 
 use super::{
     create_trigger::{TriggerRelation, trigger_relation},
+    hidden_referenced_rows,
     trigger_slots::{TriggerSlots, trigger_key},
 };
 #[cfg(not(feature = "std"))]
@@ -71,6 +72,8 @@ fn fold(name: &ObjectName) -> String {
 enum Origin {
     Index(String),
     Trigger(String),
+    /// The referenced side of a key into rows the acting role may not read.
+    Key,
 }
 
 /// One live index or trigger.
@@ -99,17 +102,25 @@ pub(crate) struct LiveAttachments {
 impl LiveAttachments {
     /// The objects `schema` holds, known only from their PostgreSQL
     /// definitions.
-    pub(crate) fn seeded(schema: Option<&ParserDB>) -> Result<Self, Error> {
+    pub(crate) fn seeded(
+        schema: Option<&ParserDB>,
+        options: &TranslationContext<'_>,
+    ) -> Result<Self, Error> {
         let mut live = Self::default();
         if let Some(schema) = schema {
-            live.seed(schema, None)?;
+            live.seed(schema, None, options)?;
         }
         Ok(live)
     }
 
     /// Adds the indexes and triggers of `schema`, of the table `owner` only
     /// when given.
-    fn seed(&mut self, schema: &ParserDB, owner: Option<&str>) -> Result<(), Error> {
+    fn seed(
+        &mut self,
+        schema: &ParserDB,
+        owner: Option<&str>,
+        options: &TranslationContext<'_>,
+    ) -> Result<(), Error> {
         for index in schema.indexes() {
             let Some(name) = index.name() else { continue };
             let table = index.table().stored_table_name().to_ascii_lowercase();
@@ -156,6 +167,17 @@ impl LiveAttachments {
                 }
             }
         }
+        for statement in hidden_referenced_rows::triggers_on(owner, schema, options)? {
+            let Statement::CreateTrigger(create) = statement else { continue };
+            self.remove(&fold(&create.name), true);
+            self.entries.push(Attachment {
+                name: fold(&create.name),
+                owner: fold(&create.table_name),
+                trigger: true,
+                statement: None,
+                origin: Some(Origin::Key),
+            });
+        }
         Ok(())
     }
 
@@ -186,6 +208,11 @@ impl LiveAttachments {
                 }
             }
             Statement::CreateTrigger(create) => {
+                let origin = if hidden_referenced_rows::is_key_trigger(&create.name) {
+                    Some(&Origin::Key)
+                } else {
+                    origin
+                };
                 self.add(fold(&create.name), fold(&create.table_name), true, statement, origin);
             }
             Statement::Drop { object_type: ObjectType::Index, names, .. } => {
@@ -604,7 +631,7 @@ fn recreated(
         // Translated alone, the statement knows the objects of the table
         // only from their PostgreSQL definitions.
         let mut live = LiveAttachments::default();
-        live.seed(written, Some(owner))?;
+        live.seed(written, Some(owner), options)?;
         seeded = live;
         &seeded
     };
@@ -671,6 +698,15 @@ fn regenerated(
                 return Err(merged_trigger_refusal(&entry.name, owner));
             }
             Statement::CreateTrigger(trigger.clone())
+        }
+        Some(Origin::Key) => {
+            let triggers = hidden_referenced_rows::triggers_on(Some(owner), after, options)?;
+            return Ok(triggers
+                .into_iter()
+                .filter(|statement| {
+                    matches!(statement, Statement::CreateTrigger(create) if fold(&create.name) == entry.name)
+                })
+                .collect());
         }
         None => return Err(merged_trigger_refusal(&entry.name, owner)),
     };

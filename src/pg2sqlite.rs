@@ -28,7 +28,7 @@ use crate::{
             create_index::{FtsTranslation, analyze_fts_index},
             deferred_constraint, definer,
             drop_column_rebuild::{LiveAttachments, StatementHistory},
-            postgis,
+            hidden_referenced_rows, postgis,
             rls::generate_rls_audit_table,
             statement::is_data_movement_statement,
         },
@@ -79,6 +79,28 @@ fn register_spatial_index(
     for col in spatial_columns {
         context.add_spatial_index(&table_name, &col);
     }
+}
+
+/// Registers the deferred checks of the foreign keys into rows the acting
+/// role may not read that each of `schemas` holds, so a commit drains them.
+fn register_deferred_key_checks<'s>(
+    schemas: impl Iterator<Item = &'s ParserDB>,
+    context: &mut TranslationContext<'_>,
+) -> Result<(), crate::errors::Error> {
+    use sql_traits::traits::DatabaseLike;
+
+    for schema in schemas {
+        let mut checks = Vec::new();
+        for table in schema.tables() {
+            checks.extend(hidden_referenced_rows::deferred_checks(table, schema, context)?);
+        }
+        for check in checks {
+            if !context.deferred_triggers().contains(&check) {
+                context.add_deferred_trigger(check);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn populate_prewalk_catalogs(
@@ -568,6 +590,13 @@ impl Pg2Sqlite {
         })
     }
 
+    /// Whether a statement adds a foreign key to an existing table, which the
+    /// history snapshots so the key reads as the last its table holds.
+    fn adds_foreign_key(statement: &Statement) -> bool {
+        matches!(statement, Statement::AlterTable(alter_table)
+            if crate::impls::translator_impls::hidden_referenced_rows::keys_added_by(alter_table) > 0)
+    }
+
     fn manifest_statement_needs_translation(statement: &Statement) -> bool {
         !matches!(
             statement,
@@ -826,7 +855,7 @@ impl Pg2Sqlite {
                 || input.snapshot(),
             )?;
             for (index, statement) in statements[start..schema_end].iter().enumerate() {
-                if Self::changes_columns(statement) {
+                if Self::changes_columns(statement) || Self::adds_foreign_key(statement) {
                     bindings.push(ColumnChange::new(start + index, statement, input.snapshot()));
                 }
                 if matches!(statement, Statement::Drop { object_type: ObjectType::Index, .. }) {
@@ -893,13 +922,17 @@ impl Pg2Sqlite {
         let statements = &*sources;
         register_server_derived_triggers(statements, &epochs, initial_schema.as_ref(), context);
         populate_prewalk_catalogs(statements, initial_schema.as_ref(), context);
+        register_deferred_key_checks(
+            initial_schema.iter().chain(epochs.iter().map(|epoch| &epoch.schema)),
+            context,
+        )?;
         let mut trigger_slots =
             crate::impls::translator_impls::trigger_slots::TriggerSlots::seeded(
                 initial_schema.as_ref(),
             )?;
         let mut marker_tables =
             crate::impls::translator_impls::reentry::MarkerTables::seeded(initial_schema.as_ref())?;
-        let mut attachments = LiveAttachments::seeded(initial_schema.as_ref())?;
+        let mut attachments = LiveAttachments::seeded(initial_schema.as_ref(), context)?;
         let outline = crate::history::transactions::Outline::new(statements, &dispositions);
 
         let mut warnings = Vec::new();

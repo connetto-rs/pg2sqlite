@@ -17,7 +17,7 @@ use crate::{
         translator_impls::{
             clock_check::refuse_clock_check,
             constraint_characteristic::deferrability_outside_a_foreign_key,
-            off_replica::OffReplica,
+            hidden_referenced_rows::no_sqlite_key,
         },
     },
     traits::translator::TranslatorWithContext,
@@ -26,7 +26,9 @@ use crate::{
 /// A constraint can translate to none, as a dropped CHECK does, to one, or
 /// to several: a composite `MATCH FULL` foreign key needs a CHECK beside
 /// it because SQLite ignores the MATCH clause. A foreign key into a table left
-/// off the replica leaves with that table and keeps only its CHECK.
+/// off the replica leaves with that table and keeps only its CHECK, as does
+/// one into rows the acting role may not read, whose referencing check the
+/// replica leaves to the server.
 impl crate::traits::translator::TranslatorWithContext for TableConstraint {
     type SQLiteEntry = Vec<TableConstraint>;
 
@@ -41,7 +43,7 @@ impl crate::traits::translator::TranslatorWithContext for TableConstraint {
                 translate_check_constraint(check_constraint, schema, options, emit)
             }
             Self::ForeignKey(fk_constraint) => {
-                if OffReplica::of(&fk_constraint.foreign_table, schema, options)?.is_some() {
+                if no_sqlite_key(&fk_constraint.foreign_table, schema, options)? {
                     return Ok(match_full_guard(fk_constraint)?.into_iter().collect());
                 }
                 let mut updated_fk = fk_constraint.clone();

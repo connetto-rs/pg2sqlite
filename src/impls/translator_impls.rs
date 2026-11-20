@@ -25,6 +25,7 @@ pub(crate) mod expr;
 pub(crate) mod function;
 mod helpers;
 pub(crate) use helpers::Forward;
+pub(crate) mod hidden_referenced_rows;
 mod index_column;
 pub(crate) mod insert;
 mod json_value;

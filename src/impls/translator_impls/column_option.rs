@@ -11,7 +11,8 @@ use crate::impls::{
     privileges::names_table_with_backing,
     shared_helpers::match_partial_not_supported_error,
     translator_impls::{
-        clock_check::refuse_clock_check, expr::sqlite_collation, off_replica::OffReplica,
+        clock_check::refuse_clock_check, expr::sqlite_collation,
+        hidden_referenced_rows::no_sqlite_key,
     },
 };
 #[cfg(not(feature = "std"))]
@@ -190,8 +191,10 @@ impl crate::traits::translator::TranslatorWithContext for ColumnOptionDef {
                 if matches!(match_kind, Some(ConstraintReferenceMatchKind::Partial)) {
                     return Err(match_partial_not_supported_error());
                 }
-                // A key into a table left off the replica leaves with it.
-                if OffReplica::of(foreign_table, schema, options)?.is_some() {
+                // A key into a table left off the replica leaves with it, and
+                // a key into rows the acting role may not read leaves its
+                // referencing check to the server.
+                if no_sqlite_key(foreign_table, schema, options)? {
                     return Ok(None);
                 }
                 let updated_foreign_table = {
