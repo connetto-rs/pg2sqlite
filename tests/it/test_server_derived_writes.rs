@@ -942,11 +942,20 @@ CREATE TRIGGER grants_expiry AFTER INSERT ON grants FOR EACH ROW EXECUTE FUNCTIO
 
 /// Notes whose insert trigger runs `body` before `RETURN NULL`.
 fn notes_logged_by(body: &str) -> String {
+    notes_logged_with("", "", body)
+}
+
+/// Notes whose insert trigger declares `declarations` and runs `body` before
+/// `RETURN NULL`, with `helpers` created after the tables.
+fn notes_logged_with(helpers: &str, declarations: &str, body: &str) -> String {
     format!(
         "
 CREATE TABLE notes (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL);
 CREATE TABLE note_events (id INTEGER PRIMARY KEY, note_id INTEGER NOT NULL);
+{helpers}
 CREATE FUNCTION log_once() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE
+{declarations}
 BEGIN
 {body}
   RETURN NULL;
@@ -1243,6 +1252,591 @@ CREATE TRIGGER notes_revised BEFORE UPDATE ON notes
     assert_eq!(left_to_server(pg), owned(&[("TRIGGER", "notes_revised", "notes")]));
     let shown = left_to_server_shown(pg);
     assert!(shown[0].contains("assigns NEW beside INSERT on note_events"), "{shown:?}");
+}
+
+/// The removed write the coverage fixtures log each note with.
+const LOG: &str = "  INSERT INTO note_events (note_id) VALUES (NEW.id);";
+
+/// The refusal the coverage fixtures keep beside it.
+const REFUSE: &str = "  IF NEW.revision < 0 THEN
+    RAISE EXCEPTION 'negative revision %', NEW.revision;
+  END IF;";
+
+#[test]
+fn a_refusal_beside_statements_that_only_read_keeps_its_trigger() {
+    let note_exists = "
+CREATE FUNCTION note_exists(note INTEGER) RETURNS BOOLEAN LANGUAGE sql STABLE AS $$
+  SELECT EXISTS (SELECT 1 FROM notes WHERE id = note)
+$$;";
+    let check_revision = "
+CREATE FUNCTION check_revision(revision INTEGER) RETURNS VOID LANGUAGE plpgsql AS $$
+BEGIN
+  IF revision < 0 THEN
+    RAISE EXCEPTION 'negative revision';
+  END IF;
+  RETURN;
+END
+$$;";
+    let cases = [
+        ("", "  bumped INTEGER := NEW.revision + 1;", format!("{LOG}\n{REFUSE}")),
+        ("", "  doubled INTEGER;", format!("  doubled := NEW.revision * 2;\n{LOG}\n{REFUSE}")),
+        ("", "", format!("  RAISE NOTICE 'logging note %', NEW.id;\n{LOG}\n{REFUSE}")),
+        (
+            "",
+            "  total INTEGER;",
+            format!("  SELECT count(*) INTO total FROM notes;\n{LOG}\n{REFUSE}"),
+        ),
+        ("", "", format!("  BEGIN\n{LOG}\n  END;\n{REFUSE}")),
+        (
+            "",
+            "  revised INTEGER;",
+            format!(
+                "  FOR revised IN SELECT id FROM notes WHERE id = NEW.id LOOP\n{LOG}\n  END LOOP;\n{REFUSE}"
+            ),
+        ),
+        (
+            note_exists,
+            "",
+            format!(
+                "{LOG}\n  PERFORM note_exists(NEW.id);\n  IF NOT note_exists(NEW.id) AND NOT note_exists(-NEW.id) THEN\n    RAISE EXCEPTION 'note vanished';\n  END IF;"
+            ),
+        ),
+        (check_revision, "", format!("  PERFORM check_revision(NEW.revision);\n{LOG}")),
+    ];
+    for (helpers, declarations, body) in cases {
+        let pg = notes_logged_with(helpers, declarations, &body);
+        assert_eq!(
+            left_to_server(&pg),
+            owned(&[("INSERT in TRIGGER", "notes_logged", "notes")]),
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn a_write_beside_what_a_sqlite_trigger_cannot_run_leaves_the_trigger_out() {
+    let cases = [
+        ("  note ALIAS FOR NEW;", format!("{LOG}\n{REFUSE}"), "beside ALIAS FOR"),
+        (
+            "  pending CURSOR FOR SELECT id FROM notes;",
+            format!("{LOG}\n  FOR listed IN pending LOOP\n    NULL;\n  END LOOP;\n{REFUSE}"),
+            "beside a cursor",
+        ),
+        (
+            "",
+            format!(
+                "{LOG}\n  CASE NEW.revision\n    WHEN 0 THEN RAISE EXCEPTION 'unrevised';\n    ELSE NULL;\n  END CASE;"
+            ),
+            "beside a CASE statement",
+        ),
+        (
+            "",
+            format!(
+                "{LOG}\n  LOOP\n    EXIT WHEN NEW.revision >= 0;\n    EXIT;\n  END LOOP;\n{REFUSE}"
+            ),
+            "beside a loop other than FOR ... IN query",
+        ),
+        (
+            "  step INTEGER;",
+            format!(
+                "{LOG}\n  FOR step IN 1..NEW.revision BY 2 LOOP\n    NULL;\n  END LOOP;\n{REFUSE}"
+            ),
+            "beside a loop other than FOR ... IN query",
+        ),
+        (
+            "  step INTEGER;",
+            format!("{LOG}\n  FOR step IN 1..NEW.revision LOOP\n    NULL;\n  END LOOP;\n{REFUSE}"),
+            "beside a loop other than FOR ... IN query",
+        ),
+        (
+            "  revision INTEGER;",
+            format!(
+                "{LOG}\n  FOREACH revision IN ARRAY ARRAY[NEW.revision] LOOP\n    NULL;\n  END LOOP;\n{REFUSE}"
+            ),
+            "beside a loop other than FOR ... IN query",
+        ),
+        ("", format!("{LOG}\n  ASSERT NEW.revision >= 0, 'negative revision';"), "beside ASSERT"),
+        (
+            "  counted INTEGER;",
+            format!("  GET DIAGNOSTICS counted = ROW_COUNT;\n{LOG}\n{REFUSE}"),
+            "beside GET DIAGNOSTICS",
+        ),
+        ("", format!("{LOG}\n  COMMIT;\n{REFUSE}"), "beside transaction control"),
+        ("", format!("{LOG}\n  RETURN NEXT;\n{REFUSE}"), "beside RETURN NEXT"),
+        (
+            "",
+            format!("  SELECT max(revision) INTO NEW.revision FROM notes;\n{LOG}"),
+            "assigns NEW beside INSERT on note_events",
+        ),
+    ];
+    for (declarations, body, reason) in cases {
+        let pg = notes_logged_with("", declarations, &body);
+        assert_eq!(left_to_server(&pg), owned(&[("TRIGGER", "notes_logged", "notes")]), "{body}");
+        let shown = left_to_server_shown(&pg);
+        assert!(shown[0].contains(reason), "{shown:?}");
+    }
+    let executed = notes_logged_by(&format!("{LOG}\n  EXECUTE 'SELECT 1';\n{REFUSE}"));
+    assert_eq!(left_to_server(&executed), owned(&[("TRIGGER", "notes_logged", "notes")]));
+}
+
+#[test]
+fn a_write_inside_a_statement_the_trigger_keeps_leaves_it_out() {
+    let through_plpgsql = notes_logged_with(
+        "
+CREATE FUNCTION next_note(note INTEGER) RETURNS INTEGER LANGUAGE plpgsql AS $$
+BEGIN
+  RETURN note + 1;
+END
+$$;",
+        "",
+        &format!("  INSERT INTO note_events (note_id) VALUES (next_note(NEW.id));\n{REFUSE}"),
+    );
+    let through_sql = notes_logged_with(
+        "
+CREATE FUNCTION logged_event(note INTEGER) RETURNS INTEGER LANGUAGE sql AS $$
+  INSERT INTO note_events (note_id) VALUES (note) RETURNING id
+$$;",
+        "",
+        "  IF logged_event(NEW.id) > 100 THEN
+    RAISE EXCEPTION 'too many events';
+  END IF;",
+    );
+    for pg in [through_plpgsql, through_sql] {
+        assert_eq!(left_to_server(&pg), owned(&[("TRIGGER", "notes_logged", "notes")]));
+        let shown = left_to_server_shown(&pg);
+        assert!(shown[0].contains("inside a statement the trigger keeps"), "{shown:?}");
+    }
+}
+
+#[test]
+fn a_sql_helper_reading_what_a_removed_write_produces_leaves_the_trigger_out() {
+    let pg = notes_logged_with(
+        "
+CREATE FUNCTION events_of(note INTEGER) RETURNS BIGINT LANGUAGE sql AS $$
+  SELECT count(*) FROM note_events WHERE note_id = note
+$$;",
+        "",
+        &format!(
+            "{LOG}\n  IF events_of(NEW.id) > 1 THEN\n    RAISE EXCEPTION 'logged twice';\n  END IF;"
+        ),
+    );
+    assert_eq!(left_to_server(&pg), owned(&[("TRIGGER", "notes_logged", "notes")]));
+    let shown = left_to_server_shown(&pg);
+    assert!(
+        shown[0].contains("log_once() calls events_of(), which reads note_events after its INSERT"),
+        "{shown:?}"
+    );
+}
+
+#[test]
+fn a_read_inside_a_loop_after_its_removed_write_leaves_the_trigger_out() {
+    let pg = notes_logged_with(
+        "",
+        "  revised RECORD;",
+        &format!(
+            "  FOR revised IN SELECT id FROM notes LOOP
+    IF (SELECT count(*) FROM note_events WHERE note_id = revised.id) > 1 THEN
+      RAISE EXCEPTION 'logged twice';
+    END IF;
+{LOG}
+  END LOOP;"
+        ),
+    );
+    assert_eq!(left_to_server(&pg), owned(&[("TRIGGER", "notes_logged", "notes")]));
+    let shown = left_to_server_shown(&pg);
+    assert!(shown[0].contains("reads note_events after its INSERT on note_events"), "{shown:?}");
+}
+
+#[test]
+fn a_read_after_a_truncate_or_a_merge_it_removes_leaves_the_trigger_out() {
+    let check = "  IF EXISTS (SELECT 1 FROM note_events WHERE note_id = NEW.id) THEN
+    RAISE EXCEPTION 'note already logged';
+  END IF;";
+    let cases = [
+        ("  TRUNCATE note_events;", "TRUNCATE on note_events"),
+        (
+            "  MERGE INTO note_events USING notes ON note_events.note_id = notes.id
+    WHEN NOT MATCHED THEN INSERT (note_id) VALUES (notes.id);",
+            "MERGE on note_events",
+        ),
+    ];
+    for (write, statement) in cases {
+        let pg = notes_logged_by(&format!("{write}\n{check}"));
+        assert_eq!(left_to_server(&pg), owned(&[("TRIGGER", "notes_logged", "notes")]), "{write}");
+        let shown = left_to_server_shown(&pg);
+        assert!(
+            shown[0].contains(&format!("reads note_events after its {statement}")),
+            "{shown:?}"
+        );
+    }
+}
+
+#[test]
+fn a_check_reading_what_a_truncate_or_a_merge_sets_off_is_left_out() {
+    let pg = "
+CREATE TABLE notes (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL);
+CREATE TABLE note_events (id INTEGER PRIMARY KEY, note_id INTEGER NOT NULL);
+CREATE TABLE event_counts (total INTEGER NOT NULL);
+CREATE FUNCTION count_events() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE event_counts SET total = total + 1;
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER note_events_cleared AFTER TRUNCATE ON note_events
+  FOR EACH STATEMENT EXECUTE FUNCTION count_events();
+CREATE TRIGGER note_events_counted AFTER INSERT ON note_events
+  FOR EACH ROW EXECUTE FUNCTION count_events();
+CREATE FUNCTION clear_and_check() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  TRUNCATE note_events;
+  IF (SELECT total FROM event_counts) > 10 THEN
+    RAISE EXCEPTION 'too many events';
+  END IF;
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER notes_cleared AFTER DELETE ON notes FOR EACH ROW EXECUTE FUNCTION clear_and_check();
+CREATE FUNCTION merge_and_check() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  MERGE INTO note_events USING notes ON note_events.note_id = notes.id
+    WHEN NOT MATCHED THEN INSERT (note_id) VALUES (notes.id);
+  IF (SELECT total FROM event_counts) > 10 THEN
+    RAISE EXCEPTION 'too many events';
+  END IF;
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER notes_merged AFTER INSERT ON notes FOR EACH ROW EXECUTE FUNCTION merge_and_check();
+";
+    assert_eq!(
+        left_to_server(pg),
+        owned(&[
+            ("TRIGGER", "note_events_cleared", "note_events"),
+            ("TRIGGER", "note_events_counted", "note_events"),
+            ("TRIGGER", "notes_cleared", "notes"),
+            ("TRIGGER", "notes_merged", "notes"),
+        ]),
+    );
+}
+
+#[test]
+fn a_before_trigger_skipping_the_row_keeps_its_skip() {
+    let pg = "
+CREATE TABLE notes (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL);
+CREATE TABLE note_events (id INTEGER PRIMARY KEY, note_id INTEGER NOT NULL);
+CREATE FUNCTION log_or_skip() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO note_events (note_id) VALUES (NEW.id);
+  IF NEW.revision < 0 THEN
+    RETURN NULL;
+  END IF;
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER notes_skipped BEFORE INSERT ON notes FOR EACH ROW EXECUTE FUNCTION log_or_skip();
+";
+    assert_eq!(left_to_server(pg), owned(&[("INSERT in TRIGGER", "notes_skipped", "notes")]));
+    let mut connection = replica(pg);
+    connection
+        .batch_execute("INSERT INTO notes (id, revision) VALUES (1, -1), (2, 1);")
+        .expect("notes");
+    assert_eq!(count(&mut connection, "notes"), 1, "the negative revision is skipped");
+    assert_eq!(count(&mut connection, "note_events"), 0, "the log rows are the server's");
+}
+
+#[test]
+fn a_trigger_setting_itself_off_again_is_read_once() {
+    let pg = "
+CREATE TABLE notes (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL);
+CREATE FUNCTION touch_note() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE notes SET revision = 0 WHERE id = NEW.id AND revision < 0;
+  IF NEW.revision > 100 THEN
+    RAISE EXCEPTION 'revised too often';
+  END IF;
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER notes_touched AFTER UPDATE ON notes FOR EACH ROW EXECUTE FUNCTION touch_note();
+";
+    assert_eq!(left_to_server(pg), owned(&[("UPDATE in TRIGGER", "notes_touched", "notes")]));
+}
+
+/// A check reading the events another trigger logs on the same insert, the
+/// logging trigger firing first.
+fn notes_checked_after(log_function: &str) -> String {
+    format!(
+        "
+CREATE TABLE notes (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL);
+CREATE TABLE note_events (id INTEGER PRIMARY KEY, note_id INTEGER NOT NULL);
+CREATE FUNCTION log_note() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+{log_function}
+$$;
+CREATE TRIGGER notes_a_logged AFTER INSERT ON notes FOR EACH ROW EXECUTE FUNCTION log_note();
+CREATE FUNCTION refuse_relogged() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF (SELECT count(*) FROM note_events WHERE note_id = NEW.id) > 1 THEN
+    RAISE EXCEPTION 'logged twice';
+  END IF;
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER notes_b_checked AFTER INSERT ON notes
+  FOR EACH ROW EXECUTE FUNCTION refuse_relogged();
+"
+    )
+}
+
+#[test]
+fn a_check_after_a_write_nested_in_another_trigger_is_left_out() {
+    let functions = [
+        format!("BEGIN\n  BEGIN\n{LOG}\n  END;\n  RETURN NULL;\nEND"),
+        format!(
+            "BEGIN\n  CASE NEW.revision\n    WHEN 0 THEN\n{LOG}\n    ELSE\n      NULL;\n  END CASE;\n  RETURN NULL;\nEND"
+        ),
+        format!(
+            "DECLARE\n  revised RECORD;\nBEGIN\n  FOR revised IN SELECT id FROM notes LOOP\n{LOG}\n  END LOOP;\n  RETURN NULL;\nEND"
+        ),
+        format!(
+            "BEGIN\n  FOR step IN 1..NEW.revision LOOP\n{LOG}\n  END LOOP;\n  RETURN NULL;\nEND"
+        ),
+        format!(
+            "BEGIN\n  PERFORM 1 / NEW.revision;\nEXCEPTION WHEN division_by_zero THEN\n{LOG}\n  RETURN NULL;\nEND"
+        ),
+        format!("BEGIN\n{LOG}\n  EXECUTE 'SELECT 1';\n  RETURN NULL;\nEND"),
+    ];
+    for function in functions {
+        assert_eq!(
+            left_to_server(&notes_checked_after(&function)),
+            owned(&[
+                ("TRIGGER", "notes_a_logged", "notes"),
+                ("TRIGGER", "notes_b_checked", "notes")
+            ]),
+            "{function}"
+        );
+    }
+}
+
+#[test]
+fn a_check_after_a_statement_trigger_writing_before_it_is_left_out() {
+    let logged_per_statement = |period: &str| {
+        format!(
+            "
+CREATE TABLE notes (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL);
+CREATE TABLE note_events (id INTEGER PRIMARY KEY, note_id INTEGER);
+CREATE FUNCTION log_statement() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO note_events (note_id) VALUES (NULL);
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER notes_logged {period} INSERT ON notes
+  FOR EACH STATEMENT EXECUTE FUNCTION log_statement();
+CREATE FUNCTION refuse_overflow() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF (SELECT count(*) FROM note_events) > 100 THEN
+    RAISE EXCEPTION 'too many events';
+  END IF;
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER notes_checked AFTER INSERT ON notes
+  FOR EACH ROW EXECUTE FUNCTION refuse_overflow();
+"
+        )
+    };
+    assert_eq!(
+        left_to_server(&logged_per_statement("BEFORE")),
+        owned(&[("TRIGGER", "notes_logged", "notes"), ("TRIGGER", "notes_checked", "notes")]),
+    );
+    assert_eq!(
+        left_to_server(&logged_per_statement("AFTER")),
+        owned(&[("TRIGGER", "notes_logged", "notes")]),
+    );
+}
+
+#[test]
+fn a_check_after_a_trigger_dropped_with_its_table_stays() {
+    let pg = "
+CREATE TABLE notes (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL);
+CREATE TABLE note_events (id INTEGER PRIMARY KEY, note_id INTEGER NOT NULL);
+CREATE FUNCTION log_note() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO note_events (note_id) VALUES (NEW.id);
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER notes_a_logged AFTER INSERT ON notes FOR EACH ROW EXECUTE FUNCTION log_note();
+DROP TABLE notes;
+CREATE TABLE notes (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL);
+CREATE FUNCTION refuse_relogged() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF (SELECT count(*) FROM note_events WHERE note_id = NEW.id) > 1 THEN
+    RAISE EXCEPTION 'logged twice';
+  END IF;
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER notes_b_checked AFTER INSERT ON notes
+  FOR EACH ROW EXECUTE FUNCTION refuse_relogged();
+";
+    assert_eq!(left_to_server(pg), owned(&[("TRIGGER", "notes_a_logged", "notes")]));
+}
+
+#[test]
+fn a_check_after_a_key_setting_children_null_is_left_out() {
+    let pg = "
+CREATE TABLE teams (id INTEGER PRIMARY KEY);
+CREATE TABLE team_members (team_id INTEGER REFERENCES teams (id) ON DELETE SET NULL,
+  user_id INTEGER NOT NULL);
+CREATE FUNCTION refuse_orphaning() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM team_members WHERE team_id IS NULL) THEN
+    RAISE EXCEPTION 'members left without a team';
+  END IF;
+  RETURN OLD;
+END
+$$;
+CREATE TRIGGER teams_orphaning AFTER DELETE ON teams
+  FOR EACH ROW EXECUTE FUNCTION refuse_orphaning();
+";
+    assert_eq!(
+        left_to_server(pg),
+        owned(&[
+            ("FOREIGN KEY", "(team_id) REFERENCES teams", "team_members"),
+            ("TRIGGER", "teams_orphaning", "teams"),
+        ]),
+    );
+}
+
+#[test]
+fn a_check_after_a_trigger_of_the_initial_schema_is_left_out() {
+    let initial = Pg2Sqlite::default()
+        .sql(
+            "
+CREATE TABLE notes (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL);
+CREATE TABLE note_events (id INTEGER PRIMARY KEY, note_id INTEGER NOT NULL);
+CREATE FUNCTION log_note() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO note_events (note_id) VALUES (NEW.id);
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER notes_a_logged AFTER INSERT ON notes FOR EACH ROW EXECUTE FUNCTION log_note();
+",
+        )
+        .expect("initial schema parses")
+        .build_schema()
+        .expect("initial schema builds");
+    let report = Pg2Sqlite::default()
+        .sql(
+            "
+CREATE FUNCTION refuse_relogged() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF (SELECT count(*) FROM note_events WHERE note_id = NEW.id) > 1 THEN
+    RAISE EXCEPTION 'logged twice';
+  END IF;
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER notes_b_checked AFTER INSERT ON notes
+  FOR EACH ROW EXECUTE FUNCTION refuse_relogged();
+",
+        )
+        .expect("batch parses")
+        .translate_with_report_and_schema(&initial, &replica_options())
+        .expect("batch translates");
+    let left_out: Vec<String> = report
+        .warnings
+        .iter()
+        .filter_map(|warning| {
+            match warning {
+                TranslationWarning::LeftToServer { name, .. } => Some(name.clone()),
+                _ => None,
+            }
+        })
+        .collect();
+    assert_eq!(left_out, ["notes_b_checked"]);
+}
+
+#[test]
+fn a_trigger_whose_reading_cannot_finish_is_refused() {
+    let built_without_writes = notes_logged_by(&format!("  EXECUTE 'SELECT 1';\n{REFUSE}"));
+    assert!(replica_refuses(&built_without_writes));
+    let set_off_without_function = format!(
+        "{}
+CREATE TRIGGER note_events_missing AFTER INSERT ON note_events
+  FOR EACH ROW EXECUTE FUNCTION missing_function();
+",
+        notes_logged_by(&format!("{LOG}\n{REFUSE}"))
+    );
+    assert!(replica_refuses(&set_off_without_function));
+    let set_off_building_its_sql = format!(
+        "{}
+CREATE FUNCTION built() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE 'SELECT 1';
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER note_events_built AFTER INSERT ON note_events
+  FOR EACH ROW EXECUTE FUNCTION built();
+",
+        notes_logged_by(&format!("{LOG}\n{REFUSE}"))
+    );
+    assert!(replica_refuses(&set_off_building_its_sql));
+    let instead_of_without_function = format!(
+        "{}
+CREATE VIEW fresh_notes AS SELECT id FROM notes;
+CREATE TRIGGER fresh_notes_insert INSTEAD OF INSERT ON fresh_notes
+  FOR EACH ROW EXECUTE FUNCTION missing_function();
+",
+        notes_logged_by(&format!(
+            "{LOG}\n  IF (SELECT count(*) FROM notes) > 100 THEN\n    RAISE EXCEPTION 'too many notes';\n  END IF;"
+        ))
+    );
+    assert!(replica_refuses(&instead_of_without_function));
+    let ambiguous_helper = notes_logged_with(
+        "
+CREATE FUNCTION note_exists(note INTEGER) RETURNS BOOLEAN LANGUAGE sql STABLE AS $$
+  SELECT EXISTS (SELECT 1 FROM notes WHERE id = note)
+$$;
+CREATE FUNCTION note_exists(note TEXT) RETURNS BOOLEAN LANGUAGE sql STABLE AS $$
+  SELECT EXISTS (SELECT 1 FROM notes WHERE id::TEXT = note)
+$$;",
+        "",
+        &format!(
+            "{LOG}\n  IF NOT note_exists(NULL) THEN\n    RAISE EXCEPTION 'note vanished';\n  END IF;"
+        ),
+    );
+    assert!(replica_refuses(&ambiguous_helper));
+}
+
+#[test]
+fn a_recursive_helper_beside_a_write_is_read_once() {
+    let pg = notes_logged_with(
+        "
+CREATE FUNCTION check_depth(depth INTEGER) RETURNS VOID LANGUAGE plpgsql AS $$
+BEGIN
+  IF depth > 3 THEN
+    RAISE EXCEPTION 'too deep';
+  END IF;
+  IF depth < 0 THEN
+    PERFORM check_depth(depth + 1);
+  END IF;
+END
+$$;",
+        "",
+        &format!("{LOG}\n  PERFORM check_depth(NEW.revision);"),
+    );
+    assert!(replica_refuses(&pg));
+}
+
+#[test]
+fn a_lock_beside_a_removed_write_keeps_the_refusal() {
+    let pg = notes_logged_by(&format!("  LOCK TABLE note_events IN SHARE MODE;\n{LOG}\n{REFUSE}"));
+    assert_eq!(left_to_server(&pg), owned(&[("INSERT in TRIGGER", "notes_logged", "notes")]));
 }
 
 /// Teams, each copied into `grantees` by a trigger the replica leaves to the

@@ -10,14 +10,13 @@ use sql_traits::{
     traits::{DatabaseLike, ForeignKeyLike, TableLike},
 };
 use sqlparser::ast::{
-    CreateTrigger, ObjectName, ObjectType, ReferentialAction, Statement, TriggerObject,
-    TriggerObjectKind, TriggerPeriod,
+    CreateTrigger, ObjectName, ObjectType, ReferentialAction, Statement, TriggerPeriod,
 };
 
 use super::{
     DerivedWrite, Event,
     chain::{Chain, Step, Walker},
-    chain_phrase, function_writes,
+    chain_phrase, function_writes, is_per_row,
     rows::Held,
 };
 #[cfg(not(feature = "std"))]
@@ -76,13 +75,7 @@ pub(crate) struct FiringTrigger {
 
 impl FiringTrigger {
     fn of(trigger: &CreateTrigger) -> Option<Self> {
-        let per_row = matches!(
-            trigger.trigger_object,
-            Some(
-                TriggerObjectKind::For(TriggerObject::Row)
-                    | TriggerObjectKind::ForEach(TriggerObject::Row)
-            )
-        );
+        let per_row = is_per_row(trigger);
         let rank = match trigger.period {
             Some(TriggerPeriod::InsteadOf) => Rank::InsteadOf,
             _ if is_deferred(trigger) => Rank::Deferred,
@@ -130,13 +123,12 @@ pub(crate) fn firing_triggers<'a>(
     for statement in statements {
         match statement {
             Statement::CreateTrigger(trigger) => {
-                if let Some(created) = FiringTrigger::of(trigger) {
-                    triggers.retain(|kept| {
-                        (kept.name.as_str(), kept.table.as_str())
-                            != (created.name.as_str(), created.table.as_str())
-                    });
-                    triggers.push(created);
-                }
+                let Some(created) = FiringTrigger::of(trigger) else { continue };
+                triggers.retain(|kept| {
+                    (kept.name.as_str(), kept.table.as_str())
+                        != (created.name.as_str(), created.table.as_str())
+                });
+                triggers.push(created);
             }
             Statement::DropTrigger(drop) => {
                 let name = last_ident(&drop.trigger_name).map(fold);
@@ -261,29 +253,28 @@ impl Firing<'_> {
         record: &str,
         written: &mut Written,
     ) -> Result<(), Error> {
-        let Some(relation) = &write.relation else { return Ok(()) };
-        let rows = self.produced(write, relation, record)?;
+        let rows = self.produced(write, record)?;
         written
-            .entry(relation.clone())
+            .entry(write.relation.clone())
             .or_default()
             .push(Produced { writer: writer.to_owned(), rows });
         Ok(())
     }
 
-    /// The rows `write` produces in `relation`, its table, run by a trigger
-    /// on `record`. Any row when a `BEFORE` row trigger on the table may
-    /// change the row the write gives.
-    fn produced(&self, write: &DerivedWrite, relation: &str, record: &str) -> Result<Held, Error> {
+    /// The rows `write` produces in its table, run by a trigger on `record`.
+    /// Any row when a `BEFORE` row trigger on the table may change the row
+    /// the write gives.
+    fn produced(&self, write: &DerivedWrite, record: &str) -> Result<Held, Error> {
         let rewritten = self.triggers.iter().any(|trigger| {
             trigger.rank == Rank::BeforeRow
-                && trigger.table == relation
+                && trigger.table == write.relation
                 && write.events().iter().any(|&event| trigger.fires_on(event))
         });
         if rewritten {
             return Ok(Held::any());
         }
         let record = (write.chain.len() == 1).then_some(record);
-        write.rows.held(relation, record, self.schema)
+        write.rows.held(&write.relation, record, self.schema)
     }
 
     /// Adds to `written` the tables the triggers and foreign key actions
@@ -294,10 +285,8 @@ impl Firing<'_> {
         written: &mut Written,
         visited: &mut BTreeSet<(String, Event)>,
     ) -> Result<(), Error> {
-        if let Some(relation) = &write.relation {
-            for &event in write.events() {
-                self.set_off(relation, event, written, visited)?;
-            }
+        for &event in write.events() {
+            self.set_off(&write.relation, event, written, visited)?;
         }
         Ok(())
     }
@@ -456,7 +445,7 @@ fn instead_of_dependency(
         let mut written = Written::new();
         let mut visited = BTreeSet::new();
         for write in &kept.writes {
-            let sets_it_off = write.relation.as_deref() == Some(fired.table.as_str())
+            let sets_it_off = write.relation == fired.table
                 && write.events().iter().any(|&event| fired.fires_on(event));
             if sets_it_off
                 && let Some(Dependent { reader, relation: read, writer }) =

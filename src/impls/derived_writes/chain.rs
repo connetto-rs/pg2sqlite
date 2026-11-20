@@ -64,13 +64,14 @@ pub(super) struct Chain {
 pub(super) struct Walker<'s, 'o, 'c> {
     schema: &'s ParserDB,
     options: &'o TranslationContext<'c>,
-    /// The events of a `BEFORE` trigger, whose own `RETURN` decides the row
-    /// the write keeps.
+    /// The events of a `BEFORE` row trigger, whose own `RETURN` decides the
+    /// row the write keeps.
     before: Option<&'o [Event]>,
-    /// The functions being read, the trigger's own first, each with the
-    /// write `FOUND` and `GET DIAGNOSTICS` report on, when its last
-    /// statement setting them was one.
-    functions: Vec<(&'s CreateFunction, Option<usize>)>,
+    /// The functions being read, the trigger's own first.
+    functions: Vec<&'s CreateFunction>,
+    /// The write `FOUND` and `GET DIAGNOSTICS` report on in the function
+    /// being read, when its last statement setting them was one.
+    found: Option<usize>,
     /// The names each function being read may read as variables, as
     /// [`rows::variables`] gives them.
     variables: Vec<Vec<String>>,
@@ -95,6 +96,7 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
             options,
             before,
             functions: Vec::new(),
+            found: None,
             variables: Vec::new(),
             chain: Chain::default(),
         };
@@ -104,7 +106,7 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
 
     /// The functions being read, by name, the trigger's own first.
     fn names(&self) -> Vec<String> {
-        self.functions.iter().map(|(function, _)| function.name().to_owned()).collect()
+        self.functions.iter().map(|function| function.name().to_owned()).collect()
     }
 
     /// The names the function being read may read as variables.
@@ -113,8 +115,7 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
     }
 
     fn function(&mut self, function: &'s CreateFunction) -> Result<(), Error> {
-        if is_builtin(function)
-            || self.functions.iter().any(|(seen, _)| core::ptr::eq(*seen, function))
+        if is_builtin(function) || self.functions.iter().any(|seen| core::ptr::eq(*seen, function))
         {
             return Ok(());
         }
@@ -124,7 +125,8 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
             self.chain.unreadable.get_or_insert(error.into());
         }
         let body = parsed_body(function, self.schema)?;
-        self.functions.push((function, None));
+        self.functions.push(function);
+        let outer = self.found.take();
         let read = match &body {
             super::Body::PlPgSql(block) => {
                 self.variables.push(rows::variables(function, block));
@@ -137,6 +139,7 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
         };
         self.variables.pop();
         self.functions.pop();
+        self.found = outer;
         read
     }
 
@@ -161,16 +164,13 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
 
     /// Notes that the last statement of the function being read that sets
     /// `FOUND` was the write at `index`, or no write.
-    fn sets_found(&mut self, index: Option<usize>) {
-        if let Some((_, last)) = self.functions.last_mut() {
-            *last = index;
-        }
+    const fn sets_found(&mut self, index: Option<usize>) {
+        self.found = index;
     }
 
     /// The write `FOUND` reports on in the function being read.
     fn found_write(&self) -> Option<&DerivedWrite> {
-        let (_, index) = self.functions.last()?;
-        index.map(|index| &self.chain.writes[index])
+        self.found.map(|index| &self.chain.writes[index])
     }
 
     fn block(&mut self, block: &Block) -> Result<(), Error> {
@@ -445,7 +445,8 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
 }
 
 /// Takes out of `block` every statement [`removes`] takes out, through its
-/// nested blocks, their handlers, branches and loops.
+/// nested blocks, branches and loops. An exception handler and a `CASE` are
+/// not read, since the translation refuses a body holding either.
 ///
 /// # Errors
 ///
@@ -455,11 +456,7 @@ pub(crate) fn without_removed_writes(
     schema: &ParserDB,
     options: &TranslationContext<'_>,
 ) -> Result<(), Error> {
-    retain_kept(&mut block.statements, schema, options)?;
-    for handler in &mut block.handlers {
-        retain_kept(&mut handler.statements, schema, options)?;
-    }
-    Ok(())
+    retain_kept(&mut block.statements, schema, options)
 }
 
 fn retain_kept(
@@ -479,14 +476,6 @@ fn retain_kept(
                     retain_kept(&mut branch.statements, schema, options)?;
                 }
                 retain_kept(&mut conditional.otherwise, schema, options)?;
-            }
-            NodeKind::Case(case) => {
-                for branch in &mut case.branches {
-                    retain_kept(&mut branch.statements, schema, options)?;
-                }
-                if let Some(otherwise) = &mut case.otherwise {
-                    retain_kept(otherwise, schema, options)?;
-                }
             }
             NodeKind::Loop(looped) => retain_kept(&mut looped.statements, schema, options)?,
             _ => {}
@@ -601,9 +590,8 @@ fn passes_row(value: Option<&sqlparser::ast::Query>, events: &[Event]) -> bool {
     let Expr::Identifier(row) = embedded::expression(value).into_owned() else { return false };
     if row.value.eq_ignore_ascii_case("new") {
         events.iter().all(|event| matches!(event, Event::Insert | Event::Update))
-    } else if row.value.eq_ignore_ascii_case("old") {
-        events.iter().all(|event| matches!(event, Event::Delete))
     } else {
-        false
+        row.value.eq_ignore_ascii_case("old")
+            && events.iter().all(|event| matches!(event, Event::Delete))
     }
 }
