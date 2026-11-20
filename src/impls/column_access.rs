@@ -162,6 +162,61 @@ pub(crate) fn with_ambiguity<T>(
     }
 }
 
+/// Refuses a name of the `WHEN` condition of a trigger on `table` that
+/// PostgreSQL refuses, where the row is in reach only as `NEW` and `OLD`,
+/// both carrying every column of `table`.
+///
+/// # Errors
+///
+/// Returns [`Error::Postgres`] for a name reaching no column, a bare column,
+/// which reaches both rows, and a relation other than `NEW` and `OLD`, and the
+/// lookup errors resolution meets.
+pub(crate) fn resolve_trigger_condition(
+    condition: &Expr,
+    table: &Table,
+    schema: &ParserDB,
+) -> Result<(), Error> {
+    let mut failure = None;
+    let _ = visit_expressions(condition, |expression| {
+        let Some(parts) = name_parts(expression) else { return ControlFlow::Continue(()) };
+        match condition_name(parts, table, schema) {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(error) => {
+                failure = Some(error);
+                ControlFlow::Break(())
+            }
+        }
+    });
+    failure.map_or(Ok(()), Err)
+}
+
+/// What PostgreSQL answers for the name `parts` in the `WHEN` condition of a
+/// trigger on `table`.
+fn condition_name(parts: &[Ident], table: &Table, schema: &ParserDB) -> Result<(), Error> {
+    let row = |ident: &Ident| matches!(stored_ident_name(ident).as_ref(), "new" | "old");
+    match parts {
+        [ident] if row(ident) || names_function(ident) => Ok(()),
+        [ident] if declared(table, ident, schema)?.is_some() => {
+            Err(ambiguous_column(&stored_ident_name(ident)))
+        }
+        [ident] => Err(undefined_column(ident)),
+        [qualifier, column] if row(qualifier) => {
+            if declared(table, column, schema)?.is_some() {
+                Ok(())
+            } else {
+                Err(undefined_qualified_column(parts))
+            }
+        }
+        [.., qualifier, _]
+            if row(qualifier) || stored_ident_name(qualifier) == table.table_name() =>
+        {
+            Err(invalid_reference(qualifier))
+        }
+        [.., qualifier, _] => Err(missing_relation(qualifier)),
+        [] => Ok(()),
+    }
+}
+
 /// The parts of the name `expression` writes, when it is a name.
 fn name_parts(expression: &Expr) -> Option<&[Ident]> {
     match expression {

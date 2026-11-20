@@ -319,6 +319,7 @@ mod test_translator_stack_depth;
 mod test_trigger_assignment_evaluation;
 mod test_trigger_body_statements;
 mod test_trigger_cascading;
+mod test_trigger_condition_columns;
 mod test_trigger_conditional;
 mod test_trigger_elsif_else;
 mod test_trigger_maintenance_update;
