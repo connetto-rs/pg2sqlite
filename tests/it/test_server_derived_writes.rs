@@ -862,6 +862,7 @@ CREATE TABLE organization_events (id INTEGER NOT NULL, kind TEXT NOT NULL);
 CREATE FUNCTION record_organization() RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
   INSERT INTO organization_events (id, kind) VALUES (NEW.id, NEW.kind);
+  INSERT INTO organization_events (id, kind) VALUES (-NEW.id, NEW.kind);
   RETURN NULL;
 END
 $$;
@@ -877,6 +878,37 @@ CREATE TRIGGER organization_events_grantee AFTER INSERT ON organization_events
             ("TRIGGER", "organizations_recorded", "organizations"),
             ("TRIGGER", "organization_events_grantee", "organization_events"),
         ]),
+    );
+    let cascaded = "
+CREATE TABLE stale_organizations (id INTEGER PRIMARY KEY);
+CREATE TABLE stale_grantees (kind TEXT NOT NULL,
+  organization_id INTEGER NOT NULL REFERENCES stale_organizations (id) ON DELETE CASCADE);
+CREATE FUNCTION clear_stale_organization() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  DELETE FROM stale_organizations WHERE id = NEW.id;
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER organizations_cleared AFTER INSERT ON organizations
+  FOR EACH ROW EXECUTE FUNCTION clear_stale_organization();
+CREATE FUNCTION restore_grantee() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO grantees (id, kind) VALUES (OLD.organization_id, OLD.kind);
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER stale_grantees_restored AFTER DELETE ON stale_grantees
+  FOR EACH ROW EXECUTE FUNCTION restore_grantee();
+";
+    assert_eq!(
+        grantees_left_with(cascaded),
+        owned(&[
+            ORGANIZATIONS_KEY,
+            ("FOREIGN KEY", "(organization_id) REFERENCES stale_organizations", "stale_grantees"),
+            ("TRIGGER", "organizations_cleared", "organizations"),
+            ("TRIGGER", "stale_grantees_restored", "stale_grantees"),
+        ]),
+        "the row comes from a trigger the cascade of a removed delete fires",
     );
 }
 
@@ -899,10 +931,13 @@ CREATE TRIGGER {table}_grantee_updated AFTER INSERT OR UPDATE ON {table}
     let organizations_trigger = ("TRIGGER", "organizations_grantee_updated", "organizations");
     let grants_trigger = ("TRIGGER", "grants_grantee_updated", "grants");
     let grants_key = ("FOREIGN KEY", "(grantee_id) REFERENCES grantees", "grants");
-    assert_eq!(
-        grantees_left_with(&updating("organizations", "id = NEW.id")),
-        owned(&[ORGANIZATIONS_KEY, organizations_trigger]),
-    );
+    for set in ["id = NEW.id", "(id, kind) = (NEW.id, NEW.kind)"] {
+        assert_eq!(
+            grantees_left_with(&updating("organizations", set)),
+            owned(&[ORGANIZATIONS_KEY, organizations_trigger]),
+            "{set}",
+        );
+    }
     assert_eq!(
         grantees_left_with(&updating("organizations", "seen = seen + 1, id = id")),
         owned(&[organizations_trigger]),

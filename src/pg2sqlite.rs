@@ -153,7 +153,9 @@ fn register_server_derived_triggers(
     initial_schema: Option<&ParserDB>,
     context: &mut TranslationContext<'_>,
 ) {
-    use crate::impls::derived_writes::{Disposition, ServerRows, fired, trigger_disposition};
+    use crate::impls::derived_writes::{
+        Disposition, FiringTrigger, ServerRows, trigger_disposition,
+    };
 
     if !context.is_server_derived_writes_omitted() {
         return;
@@ -171,8 +173,10 @@ fn register_server_derived_triggers(
     for epoch in epochs {
         for statement in &statements[epoch.start..epoch.end] {
             let Statement::CreateTrigger(trigger) = statement else { continue };
-            let created = fired(trigger);
-            server_rows.retain(|rows| Some(rows.fired()) != created.as_ref());
+            let created = FiringTrigger::of(trigger);
+            server_rows.retain(|rows| {
+                !created.as_ref().is_some_and(|created| created.same(rows.trigger()))
+            });
             let disposition = trigger_disposition(trigger, &epoch.schema, context);
             if let Ok(Disposition::LeftOut(_) | Disposition::Stripped(_)) = disposition
                 && let Ok(Some(rows)) = ServerRows::of(trigger, &epoch.schema, context)
@@ -186,7 +190,8 @@ fn register_server_derived_triggers(
             }
         }
     }
-    server_rows.retain(|rows| context.firing_triggers().iter().any(|kept| kept.is(rows.fired())));
+    server_rows
+        .retain(|rows| context.firing_triggers().iter().any(|kept| kept.same(rows.trigger())));
     context.set_server_rows(server_rows);
     for name in left_out {
         context.add_server_derived_trigger_name(name);

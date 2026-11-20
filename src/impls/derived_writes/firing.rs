@@ -74,7 +74,7 @@ pub(crate) struct FiringTrigger {
 }
 
 impl FiringTrigger {
-    fn of(trigger: &CreateTrigger) -> Option<Self> {
+    pub(crate) fn of(trigger: &CreateTrigger) -> Option<Self> {
         let per_row = is_per_row(trigger);
         let rank = match trigger.period {
             Some(TriggerPeriod::InsteadOf) => Rank::InsteadOf,
@@ -93,14 +93,19 @@ impl FiringTrigger {
         })
     }
 
-    fn fires_on(&self, event: Event) -> bool {
+    pub(super) fn fires_on(&self, event: Event) -> bool {
         self.events.contains(&event)
     }
 
-    /// Whether the trigger is `fired`, a folded trigger name and the folded
-    /// table it fires on.
-    pub(crate) fn is(&self, fired: &(String, String)) -> bool {
-        (self.name.as_str(), self.table.as_str()) == (fired.0.as_str(), fired.1.as_str())
+    /// The table or view the trigger fires on, its last name part folded.
+    pub(super) fn table(&self) -> &str {
+        &self.table
+    }
+
+    /// Whether `other` is the same trigger, by its name and the table it
+    /// fires on.
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        (self.name.as_str(), self.table.as_str()) == (other.name.as_str(), other.table.as_str())
     }
 
     /// Whether the trigger fires before `other` on a write firing both.
@@ -110,7 +115,7 @@ impl FiringTrigger {
 
     /// Every write the trigger's function runs, none when the schema does not
     /// hold that function.
-    fn writes(&self, schema: &ParserDB) -> Result<Vec<DerivedWrite>, Error> {
+    pub(super) fn writes(&self, schema: &ParserDB) -> Result<Vec<DerivedWrite>, Error> {
         let mut writes = Vec::new();
         if let Some(function) = written_function(schema, &self.function)? {
             function_writes(function, schema, &mut Vec::new(), &mut Vec::new(), &mut writes)?;
@@ -314,17 +319,27 @@ impl Firing<'_> {
         for trigger in self.triggers {
             if trigger.table == table && trigger.fires_on(event) {
                 for write in trigger.writes(self.schema)? {
-                    if let Some(relation) = &write.relation {
-                        for &set_off in write.events() {
-                            self.writes_set_off(relation, set_off, writes, visited)?;
-                        }
-                    }
+                    self.follow(&write, writes, visited)?;
                     writes.push(write);
                 }
             }
         }
         for (child, set_off, _) in self.key_actions(table, event)? {
             self.writes_set_off(&child, set_off, writes, visited)?;
+        }
+        Ok(())
+    }
+
+    /// Adds to `writes` every write the server runs for `write`, as
+    /// [`Self::writes_set_off`] does for each event it sets off.
+    fn follow(
+        &self,
+        write: &DerivedWrite,
+        writes: &mut Vec<DerivedWrite>,
+        visited: &mut BTreeSet<(String, Event)>,
+    ) -> Result<(), Error> {
+        for (relation, event) in write.set_off() {
+            self.writes_set_off(relation, event, writes, visited)?;
         }
         Ok(())
     }
@@ -432,11 +447,7 @@ pub(super) fn with_set_off(
     let mut all = Vec::new();
     let mut visited = BTreeSet::new();
     for write in writes {
-        if let Some(relation) = &write.relation {
-            for &event in write.events() {
-                firing.writes_set_off(relation, event, &mut all, &mut visited)?;
-            }
-        }
+        firing.follow(&write, &mut all, &mut visited)?;
         all.push(write);
     }
     Ok(all)

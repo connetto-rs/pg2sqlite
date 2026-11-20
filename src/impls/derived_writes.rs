@@ -160,6 +160,11 @@ impl DerivedWrite {
         }
     }
 
+    /// The folded table the write writes with each event it sets off there.
+    fn set_off(&self) -> impl Iterator<Item = (&str, Event)> {
+        self.events().iter().map(|&event| (self.relation.as_str(), event))
+    }
+
     /// The statement and the table it writes, as `INSERT on note_events`.
     fn statement_on(&self) -> String {
         format!("{} on {}", self.statement, self.table)
@@ -544,9 +549,9 @@ fn action_writes_rows(action: Option<ReferentialAction>) -> Option<ReferentialAc
 #[derive(Clone, Debug)]
 pub(crate) struct ServerRows {
     /// The trigger, its last name part as written.
-    trigger: String,
-    /// The trigger's name and the table it fires on, folded.
-    fired: (String, String),
+    name: String,
+    /// The trigger, as the server fires it.
+    trigger: FiringTrigger,
     /// Each table the rows go into, folded, with the columns of those rows
     /// that may hold values no row held before.
     written: Vec<(String, Fresh)>,
@@ -565,37 +570,26 @@ impl ServerRows {
         schema: &ParserDB,
         options: &TranslationContext<'_>,
     ) -> Result<Option<Self>, Error> {
-        let checked = trigger
-            .events
-            .iter()
-            .any(|event| matches!(Event::of(event), Event::Insert | Event::Update));
-        let (Some(fired), Some(exec_body), true) = (fired(trigger), &trigger.exec_body, checked)
+        let Some(fired) = FiringTrigger::of(trigger)
+            .filter(|fired| fired.fires_on(Event::Insert) || fired.fires_on(Event::Update))
         else {
             return Ok(None);
         };
-        let Some(function) = written_function(schema, &exec_body.func_desc.name)? else {
-            return Ok(None);
-        };
-        let mut writes = Vec::new();
-        function_writes(function, schema, &mut Vec::new(), &mut Vec::new(), &mut writes)?;
-        let written: Vec<(String, Fresh)> = firing::with_set_off(writes, schema, options)?
-            .into_iter()
-            .filter(|write| write.fresh != Fresh::Columns(Vec::new()))
-            .map(|write| (write.relation, write.fresh))
-            .collect();
-        Ok((!written.is_empty())
-            .then(|| Self { trigger: last_ident_value_or_display(&trigger.name), fired, written }))
+        let written: Vec<(String, Fresh)> =
+            firing::with_set_off(fired.writes(schema)?, schema, options)?
+                .into_iter()
+                .filter(|write| write.fresh != Fresh::Columns(Vec::new()))
+                .map(|write| (write.relation, write.fresh))
+                .collect();
+        Ok((!written.is_empty()).then(|| {
+            Self { name: last_ident_value_or_display(&trigger.name), trigger: fired, written }
+        }))
     }
 
-    /// The trigger's name and the table it fires on, folded.
-    pub(crate) const fn fired(&self) -> &(String, String) {
-        &self.fired
+    /// The trigger, as the server fires it.
+    pub(crate) const fn trigger(&self) -> &FiringTrigger {
+        &self.trigger
     }
-}
-
-/// The trigger's name and the table it fires on, folded.
-pub(crate) fn fired(trigger: &CreateTrigger) -> Option<(String, String)> {
-    Some((fold(last_ident(&trigger.name)?), fold(last_ident(&trigger.table_name)?)))
 }
 
 /// The trigger on `table` that leaves to the server the rows `key` references,
@@ -607,41 +601,40 @@ fn referenced_rows_left_to_server<'o>(
     schema: &ParserDB,
     options: &'o TranslationContext<'_>,
 ) -> Result<Option<&'o str>, Error> {
-    let (Some(host), Some(referenced)) =
-        (last_ident(table).map(fold), last_ident(&key.foreign_table).map(fold))
-    else {
-        return Ok(None);
-    };
+    let host = last_ident(table).map(fold);
+    let referenced = last_ident(&key.foreign_table).map(fold);
     let mut triggers = options
         .server_rows()
         .iter()
         .filter(|rows| {
-            rows.fired.1 == host && rows.written.iter().any(|(relation, _)| *relation == referenced)
+            host.as_deref() == Some(rows.trigger.table())
+                && rows.written.iter().any(|(relation, _)| Some(relation) == referenced.as_ref())
         })
         .peekable();
     if triggers.peek().is_none() {
         return Ok(None);
     }
     let columns: Vec<String> = if key.referred_columns.is_empty() {
-        match schema.tables().find(|declared| declared.stored_table_name() == referenced) {
-            Some(declared) => {
+        schema
+            .tables()
+            .find(|declared| Some(declared.stored_table_name().as_ref()) == referenced.as_deref())
+            .map(|declared| {
                 declared
-                    .primary_key_columns(schema)?
-                    .map(|column| column.column_name().to_owned())
-                    .collect()
-            }
-            None => Vec::new(),
-        }
+                    .primary_key_columns(schema)
+                    .map(|columns| columns.map(|column| column.column_name().to_owned()).collect())
+            })
+            .transpose()?
+            .unwrap_or_default()
     } else {
         key.referred_columns.iter().map(fold).collect()
     };
     Ok(triggers
         .find(|rows| {
-            rows.written
-                .iter()
-                .any(|(relation, fresh)| *relation == referenced && fresh.reaches(&columns))
+            rows.written.iter().any(|(relation, fresh)| {
+                Some(relation) == referenced.as_ref() && fresh.reaches(&columns)
+            })
         })
-        .map(|rows| rows.trigger.as_str()))
+        .map(|rows| rows.name.as_str()))
 }
 
 /// Reports and answers `true` when the replica leaves out `key`, declared on
