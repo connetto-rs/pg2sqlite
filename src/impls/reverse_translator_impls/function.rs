@@ -81,6 +81,9 @@ pub enum FunctionReversal {
     ToTimestamptz,
     /// Transform json(x) to CAST(x AS JSONB)
     ToCastAsJsonb,
+    /// Transform the registered `jsonb` text function's call to
+    /// `CAST(x AS JSONB) #>> '{}'`
+    ToJsonbText,
     /// Transform json_set/json_insert to their PG equivalents with path
     /// conversion.
     ///
@@ -558,6 +561,14 @@ pub fn reverse_function(
         {
             FunctionReversal::ToCastAsJsonb
         }
+        // The registered jsonb text function -> CAST(x AS JSONB) #>> '{}',
+        // the text PostgreSQL extracts from the value.
+        name if options
+            .get_jsonb_functions()
+            .is_some_and(|functions| functions.text.eq_ignore_ascii_case(name)) =>
+        {
+            FunctionReversal::ToJsonbText
+        }
         // json(x) -> CAST(x AS JSONB)
         "json" => FunctionReversal::ToCastAsJsonb,
         // json_set(j, '$.path', v) -> jsonb_set(j, '{path}', to_jsonb(v))
@@ -568,9 +579,7 @@ pub fn reverse_function(
         "json_remove" => FunctionReversal::ToJsonPathRemove,
         // Neither #> (returns JSONB: strings quoted, booleans not 1) nor #>>
         // (returns text for all types) preserves all SQLite value kinds.
-        // The forward direction maps json_extract_path_text and
-        // jsonb_extract_path_text onto json_extract, so the reverse cannot
-        // tell them apart. Write the PostgreSQL operator directly.
+        // Write the PostgreSQL operator directly.
         "json_extract" => {
             FunctionReversal::Reject(
                 "json_extract: neither #> (returns JSONB, so strings arrive quoted and \
@@ -1306,6 +1315,24 @@ pub fn reverse_translate_function(
                 ),
                 format: None,
                 kind: CastKind::Cast,
+            })
+        }
+        FunctionReversal::ToJsonbText => {
+            let exprs = extract_exactly(&func.args, 1, "the jsonb text function")?;
+            let reversed =
+                crate::prelude::ReverseTranslator::reverse_translate(exprs[0], schema, options)?;
+            Ok(Expr::BinaryOp {
+                left: Box::new(Expr::Cast {
+                    expr: Box::new(reversed),
+                    data_type: DataType::Custom(
+                        ObjectName(vec![ObjectNamePart::Identifier(Ident::new("JSONB"))]),
+                        vec![],
+                    ),
+                    format: None,
+                    kind: CastKind::Cast,
+                }),
+                op: BinaryOperator::HashLongArrow,
+                right: Box::new(string_literal("{}")),
             })
         }
         FunctionReversal::ToJsonbPathFunc(pg_func) => {

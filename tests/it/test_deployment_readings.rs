@@ -424,8 +424,8 @@ fn declared_fields_cross_in_their_stored_form() {
     .expect("translates");
     assert!(
         translated.ends_with(
-            "WHERE id = uuid_blob(request_jwt_claims() ->> '$.\"sub\"') \
-             AND owner = request_jwt_claims() ->> '$.\"app\".\"role\"'"
+            "WHERE id = uuid_blob(pg_jsonb_text(request_jwt_claims() -> '$.\"sub\"')) \
+             AND owner = pg_jsonb_text(request_jwt_claims() -> '$.\"app\".\"role\"')"
         ),
         "{translated}"
     );
@@ -440,9 +440,28 @@ fn a_principal_field_crosses_as_its_declared_identity() {
     )
     .expect("translates");
     assert!(
-        translated.ends_with("WHERE id = uuid_blob(request_jwt_claims() ->> '$.\"act\"')"),
+        translated
+            .ends_with("WHERE id = uuid_blob(pg_jsonb_text(request_jwt_claims() -> '$.\"act\"'))"),
         "{translated}"
     );
+}
+
+/// A field crosses through the registered `jsonb` text function, so a
+/// translation that names none is refused with the instructions.
+#[test]
+fn a_field_read_without_jsonb_functions_is_refused() {
+    let options = mapped(
+        Pg2SqliteOptions::default()
+            .with_uuid_representation(UuidRepresentation::Blob)
+            .with_deployment(deployment()),
+    )
+    .with_acting_role("alice");
+    let error = refusal(
+        "SELECT id FROM t WHERE owner = (current_setting('request.jwt.claims')::jsonb -> 'app' ->> 'role');",
+        &options,
+    );
+    assert!(error.to_string().contains("with_jsonb_functions"), "{error}");
+    assert!(error.to_string().contains("JsonbFunctions::register"), "{error}");
 }
 
 /// Coming back, the deployment says whether a request may leave the setting
@@ -476,7 +495,12 @@ fn a_cast_over_a_whole_json_setting_is_refused() {
 fn a_json_read_over_anything_but_a_setting_keeps_its_translation() {
     let translated =
         translate("SELECT upper('{\"a\":\"x\"}')::jsonb ->> 'a';", &options()).expect("translates");
-    assert!(translated.contains("->> 'a'"), "{translated}");
+    assert!(
+        translated.ends_with(
+            "pg_jsonb_text((pg_jsonb(upper('{\"a\":\"x\"}')) COLLATE pg_jsonb_order) -> 'a')"
+        ),
+        "{translated}"
+    );
 }
 
 #[test]
@@ -532,8 +556,8 @@ fn text_and_boolean_fields_cross_through_their_rules() {
     )
     .expect("translates");
     assert!(
-        translated.contains("owner = request_jwt_claims() ->> '$.\"app\".\"role\"'")
-            && translated.contains("typeof(request_jwt_claims() ->> '$.\"admin\"')"),
+        translated.contains("owner = pg_jsonb_text(request_jwt_claims() -> '$.\"app\".\"role\"')")
+            && translated.contains("trim(pg_jsonb_text(request_jwt_claims() -> '$.\"admin\"'))"),
         "{translated}"
     );
 }

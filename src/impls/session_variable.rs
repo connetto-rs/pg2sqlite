@@ -660,11 +660,12 @@ pub(crate) fn translate_json_read(
              its value. Read the field with ->> for its last key."
         )));
     }
-    let text = json_operator(
+    let json = json_operator(
         setting.call(),
-        BinaryOperator::LongArrow,
+        BinaryOperator::Arrow,
         &sqlite_json_path(&pattern, &read.path)?,
     );
+    let text = crate::impls::jsonb::extracted_text(json, options, &pattern)?;
     typed_reading(&pattern, declared, cast, text, options)
 }
 

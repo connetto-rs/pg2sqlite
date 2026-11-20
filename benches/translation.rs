@@ -98,7 +98,7 @@ fn bench_schema_translation(c: &mut Criterion) {
     let options = Pg2SqliteOptions::default()
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_uuid_v7_function_name("uuid7")
-        .with_jsonb_functions(JsonbFunctions::new("pg_jsonb", "pg_jsonb_order"));
+        .with_jsonb_functions(JsonbFunctions::new("pg_jsonb", "pg_jsonb_text", "pg_jsonb_order"));
     let mut group = c.benchmark_group("schema_translation");
 
     let fixtures: &[(&str, &str)] = &[

@@ -1688,7 +1688,7 @@ fn inet_type_refusal_does_not_say_unknown() {
 // ────────────
 
 #[test]
-fn jsonb_column_warns_about_string_order_and_numeric_reads() {
+fn jsonb_column_warns_about_string_order() {
     let ws = warnings("CREATE TABLE t (col jsonb);", &default_opts());
     let has_jsonb_warn = ws.iter().any(|w| {
         matches!(
@@ -1696,7 +1696,6 @@ fn jsonb_column_warns_about_string_order_and_numeric_reads() {
             TranslationWarning::LossyDowngrade { construct, reason, .. }
             if construct.eq_ignore_ascii_case("jsonb")
                 && reason.contains("orders strings inside a jsonb value bytewise")
-                && reason.contains("->> answers a number as SQLite's double")
         )
     });
     assert!(has_jsonb_warn, "jsonb column must emit a LossyDowngrade warning, got: {ws:?}");

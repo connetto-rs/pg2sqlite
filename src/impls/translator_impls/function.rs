@@ -97,12 +97,15 @@ enum FunctionTranslation {
         func_label: &'static str,
         fractional_seconds: bool,
     },
-    /// Transform json_extract_path_text(j, keys...) to json_extract(j,
-    /// '$.k1.k2...')
-    ToJsonExtractPath,
     /// `json_extract_path` and `jsonb_extract_path`, read as the `#>` chain
-    /// of SQLite arrows their path spells.
-    JsonExtractPath { function: &'static str },
+    /// of SQLite arrows their path spells, and their `_text` forms, read as
+    /// the text `#>>` extracts.
+    JsonExtractPath {
+        /// The PostgreSQL function's name.
+        function: &'static str,
+        /// Whether the function answers text, as `#>>` does.
+        text: bool,
+    },
     /// Transform `jsonb_set` and `jsonb_insert` to the `json_set`,
     /// `json_replace`, or `json_insert` that matches, converting the `text[]`
     /// path to JSONPath and keeping the value typed as JSON.
@@ -844,12 +847,19 @@ fn translate_catalog_function(
     "jsonb_set" => FunctionTranslation::JsonSet { insert: false },
     "jsonb_insert" => FunctionTranslation::JsonSet { insert: true },
     // json(b)_extract_path(j, keys...) -> j -> '$."k1"' -> '$."k2"'
-    "json_extract_path" => FunctionTranslation::JsonExtractPath { function: "json_extract_path" },
-    "jsonb_extract_path" => {
-        FunctionTranslation::JsonExtractPath { function: "jsonb_extract_path" }
+    "json_extract_path" => {
+        FunctionTranslation::JsonExtractPath { function: "json_extract_path", text: false }
     }
-    // json(b)_extract_path_text -> json_extract(j, '$.k1.k2...')
-    "json_extract_path_text" | "jsonb_extract_path_text" => FunctionTranslation::ToJsonExtractPath,
+    "jsonb_extract_path" => {
+        FunctionTranslation::JsonExtractPath { function: "jsonb_extract_path", text: false }
+    }
+    // json(b)_extract_path_text(j, keys...) -> text(j -> '$."k1"' -> '$."k2"')
+    "json_extract_path_text" => {
+        FunctionTranslation::JsonExtractPath { function: "json_extract_path_text", text: true }
+    }
+    "jsonb_extract_path_text" => {
+        FunctionTranslation::JsonExtractPath { function: "jsonb_extract_path_text", text: true }
+    }
     // date_part('field', expr) -> CAST(strftime(format, expr) AS type)
     "date_part" => FunctionTranslation::DatePart,
     // lpad / rpad: not in standard SQLite
@@ -2264,7 +2274,7 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                 }
                 Ok(make_closed_form(format, &translated, fractional_seconds))
             }
-            FunctionTranslation::JsonExtractPath { function } => {
+            FunctionTranslation::JsonExtractPath { function, text } => {
                 let exprs = function_argument_exprs(&func.args);
                 let Some((document, path)) =
                     exprs.split_first().filter(|(_, path)| !path.is_empty())
@@ -2283,47 +2293,8 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                     )));
                 };
                 crate::impls::translator_impls::expr::translate_json_extract_path(
-                    function, document, &elements, schema, options, emit,
+                    function, document, &elements, text, schema, options, emit,
                 )
-            }
-            FunctionTranslation::ToJsonExtractPath => {
-                // json_extract_path(j, 'k1', 'k2') → json_extract(j, '$.k1.k2')
-                let exprs = function_argument_exprs(&func.args);
-                if exprs.len() < 2 {
-                    return Err(crate::errors::Error::forward_refusal(
-                        "json_extract_path requires at least 2 arguments".to_string(),
-                    ));
-                }
-                let json_expr = exprs[0].translate_with_warnings(schema, options, emit)?;
-                let mut path = String::from("$");
-                for key_expr in &exprs[1..] {
-                    let Expr::Value(ValueWithSpan {
-                        value: Value::SingleQuotedString(key), ..
-                    }) = key_expr
-                    else {
-                        return Err(crate::errors::Error::forward_refusal(
-                            "json_extract_path requires string literal keys for SQLite translation"
-                                .to_string(),
-                        ));
-                    };
-                    // A numeric element is the one shape a JSON path cannot
-                    // read the way PostgreSQL reads it, so it is refused
-                    // rather than written as a key.
-                    if crate::impls::translator_impls::expr::is_numeric_path_element(key) {
-                        return Err(
-                            crate::impls::translator_impls::expr::numeric_json_path_element(
-                                "json_extract_path",
-                                key,
-                            ),
-                        );
-                    }
-                    path.push_str(&crate::impls::translator_impls::expr::sqlite_json_path_key(key));
-                }
-                Ok(simple_function_expr(
-                    "json_extract",
-                    vec![json_expr, string_literal(&path)],
-                    None,
-                ))
             }
             FunctionTranslation::JsonSet { insert } => {
                 let exprs = function_argument_exprs(&func.args);

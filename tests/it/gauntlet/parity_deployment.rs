@@ -17,7 +17,7 @@ use sql_traits::structs::{Deployment, JsonField, SessionSetting, SetPacking, Set
 use sqlparser::ast::DataType;
 
 use super::harness::apply_with_seed;
-use crate::helpers::postgres as postgres_harness;
+use crate::helpers::{jsonb_functions, postgres as postgres_harness};
 
 const SCHEMA: &str = "
 CREATE TABLE docs (id TEXT PRIMARY KEY, owner TEXT NOT NULL, team INTEGER NOT NULL);
@@ -157,7 +157,7 @@ fn postgres(predicate: &str, acting: &str) -> PgConnection {
 }
 
 fn options(acting: &str) -> Pg2SqliteOptions {
-    Pg2SqliteOptions::default()
+    jsonb_functions::with_functions(Pg2SqliteOptions::default())
         .with_rls_audit_table_name("rls_audit")
         .with_deployment(deployment())
         .with_acting_role(acting)
@@ -180,6 +180,7 @@ fn sqlite(predicate: &str, acting: &str) -> SqliteConnection {
     app_team_ids_utils::register_impl(&mut connection, current_value)
         .expect("register app_team_ids");
     jwt_claims_utils::register_impl(&mut connection, current_value).expect("register jwt_claims");
+    jsonb_functions::register(&mut connection);
     apply_with_seed(&mut connection, &translated, |connection| {
         seed!(connection, docs_rls);
     });
@@ -344,5 +345,43 @@ fn the_fields_of_a_json_setting_show_the_same_rows() {
         "request.jwt.claims",
         &[None, Some(r#"{"admin": false}"#), Some(r#"{"admin": true}"#)],
         &[&[], &[], &["d1", "d2", "d3", "d4"]],
+    );
+}
+
+/// A field read with `->>` answers PostgreSQL's text whatever the claim
+/// holds, so a number or a boolean compares as the text it prints, and so
+/// does a number a document built from a row holds.
+#[test]
+fn a_json_setting_field_reads_as_text_for_every_value_kind() {
+    let claims = "current_setting('request.jwt.claims', true)::jsonb";
+    assert_setting_parity(
+        &format!("{claims} ->> 'sub' IN ('true', '7', '1.50', '100')"),
+        "request.jwt.claims",
+        &[
+            None,
+            Some(r#"{"sub": true}"#),
+            Some(r#"{"sub": 7}"#),
+            Some(r#"{"sub": 1.50}"#),
+            Some(r#"{"sub": 1e2}"#),
+            Some(r#"{"sub": "7"}"#),
+            Some(r#"{"sub": 1.5}"#),
+            Some(r#"{"sub": null}"#),
+        ],
+        &[
+            &[],
+            &["d1", "d2", "d3", "d4"],
+            &["d1", "d2", "d3", "d4"],
+            &["d1", "d2", "d3", "d4"],
+            &["d1", "d2", "d3", "d4"],
+            &["d1", "d2", "d3", "d4"],
+            &[],
+            &[],
+        ],
+    );
+    assert_setting_parity(
+        &format!("jsonb_build_object('team', team) ->> 'team' = {claims} ->> 'sub'"),
+        "request.jwt.claims",
+        &[None, Some(r#"{"sub": "1"}"#), Some(r#"{"sub": 2}"#)],
+        &[&[], &["d1", "d4"], &["d2"]],
     );
 }
