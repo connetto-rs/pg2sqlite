@@ -422,14 +422,12 @@ fn pass_through_view(
     index: usize,
     create_table: &sqlparser::ast::CreateTable,
 ) -> Result<Vec<Statement>, crate::errors::Error> {
-    use sql_traits::traits::TableLike;
-
     let epoch =
         epochs.iter().find(|epoch| epoch.end > index).expect("the epochs cover every statement");
+    // A statement that drops or renames a table ends its epoch, so the schema
+    // of the epoch creating a table still holds it.
     let table = crate::impls::object_name::resolve_declared_table(&epoch.schema, create_table)?
-        .ok_or_else(|| {
-            sql_traits::errors::ObjectKind::Table.not_in_database(create_table.table_name())
-        })?;
+        .expect("the epoch creating a table holds it");
     // The final view's triggers forward the same defaults and already reported
     // what translating them warns about.
     crate::impls::translator_impls::rls::generate_pass_through_view_statements(
@@ -480,6 +478,10 @@ struct PreparedStatements<'a> {
     epochs: Vec<PreparedEpoch>,
     dispositions: Vec<crate::impls::transaction_blocks::Disposition>,
 }
+
+/// Each statement's emitted statements, whether its triggers were rebuilt from
+/// others sharing their slots, and the warnings the translation raised.
+type TranslatedUnits = (Vec<Vec<Statement>>, Vec<bool>, Vec<crate::warnings::TranslationWarning>);
 
 struct PreparedTranslation {
     script: Script,
@@ -937,7 +939,7 @@ impl Pg2Sqlite {
     fn translate_prepared<'a>(
         prepared: PreparedSchema<'a>,
         context: &mut TranslationContext<'_>,
-        mut should_translate: impl FnMut(&Statement) -> bool,
+        should_translate: impl FnMut(&Statement) -> bool,
     ) -> Result<PreparedStatements<'a>, crate::errors::Error> {
         let PreparedSchema {
             sources,
@@ -956,19 +958,69 @@ impl Pg2Sqlite {
             initial_schema.iter().chain(epochs.iter().map(|epoch| &epoch.schema)),
             context,
         )?;
+        let (mut translated, rebuilt_triggers, warnings) = Self::translate_units(
+            statements,
+            &epochs,
+            &dispositions,
+            initial_schema.as_ref(),
+            context,
+            should_translate,
+        )?;
+        let held_views = crate::impls::translator_impls::held_views::hold_forward_views(
+            statements,
+            &mut translated,
+            initial_schema.as_ref(),
+            options.get_rls_table_suffix(),
+            |index, create_table| pass_through_view(&epochs, context, index, create_table),
+        )?;
+
+        let schema = schema?;
+        let prelude = generated_prelude(&translated, &schema, &options, had_rls_tables, context)?;
+
+        reject_name_collisions(
+            initial_schema.as_ref(),
+            prelude
+                .iter()
+                .map(|(label, statement)| (Source::Generated(label), statement))
+                .chain(sourced(statements, &translated)),
+        )?;
+
+        Ok(PreparedStatements {
+            sources,
+            schema,
+            options,
+            statements: translated,
+            rebuilt_triggers,
+            held_views,
+            prelude: prelude.into_iter().map(|(_, statement)| statement).collect(),
+            warnings,
+            epochs,
+            dispositions,
+        })
+    }
+
+    /// Translates each statement of `statements` in order, answering its
+    /// emitted statements, whether its triggers were rebuilt from others
+    /// sharing their slots, and the warnings the translation raised.
+    fn translate_units(
+        statements: &[Statement],
+        epochs: &[PreparedEpoch],
+        dispositions: &[Disposition],
+        initial_schema: Option<&ParserDB>,
+        context: &mut TranslationContext<'_>,
+        mut should_translate: impl FnMut(&Statement) -> bool,
+    ) -> Result<TranslatedUnits, crate::errors::Error> {
         let mut trigger_slots =
-            crate::impls::translator_impls::trigger_slots::TriggerSlots::seeded(
-                initial_schema.as_ref(),
-            )?;
+            crate::impls::translator_impls::trigger_slots::TriggerSlots::seeded(initial_schema)?;
         let mut marker_tables =
-            crate::impls::translator_impls::reentry::MarkerTables::seeded(initial_schema.as_ref())?;
-        let mut attachments = LiveAttachments::seeded(initial_schema.as_ref(), context)?;
-        let outline = crate::history::transactions::Outline::new(statements, &dispositions);
+            crate::impls::translator_impls::reentry::MarkerTables::seeded(initial_schema)?;
+        let mut attachments = LiveAttachments::seeded(initial_schema, context)?;
+        let outline = crate::history::transactions::Outline::new(statements, dispositions);
 
         let mut warnings = Vec::new();
         let mut translated = Vec::with_capacity(statements.len());
         let mut rebuilt_triggers = Vec::with_capacity(statements.len());
-        for epoch in &epochs {
+        for epoch in epochs {
             populate_spatial_index_catalog(
                 &statements[epoch.start..epoch.end],
                 &epoch.schema,
@@ -1019,37 +1071,7 @@ impl Pg2Sqlite {
                 }
             }
         }
-        let held_views = crate::impls::translator_impls::held_views::hold_forward_views(
-            statements,
-            &mut translated,
-            initial_schema.as_ref(),
-            options.get_rls_table_suffix(),
-            |index, create_table| pass_through_view(&epochs, context, index, create_table),
-        )?;
-
-        let schema = schema?;
-        let prelude = generated_prelude(&translated, &schema, &options, had_rls_tables, context)?;
-
-        reject_name_collisions(
-            initial_schema.as_ref(),
-            prelude
-                .iter()
-                .map(|(label, statement)| (Source::Generated(label), statement))
-                .chain(sourced(statements, &translated)),
-        )?;
-
-        Ok(PreparedStatements {
-            sources,
-            schema,
-            options,
-            statements: translated,
-            rebuilt_triggers,
-            held_views,
-            prelude: prelude.into_iter().map(|(_, statement)| statement).collect(),
-            warnings,
-            epochs,
-            dispositions,
-        })
+        Ok((translated, rebuilt_triggers, warnings))
     }
 
     fn prepare_translation(

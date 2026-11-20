@@ -201,6 +201,19 @@ CREATE POLICY kinds_read ON kinds FOR SELECT TO app USING (id IN (SELECT id FROM
 CREATE POLICY allowed_read ON allowed FOR SELECT TO app USING (id IN (SELECT id FROM granted));
 ";
 
+/// Holds a table's view back into a `TEMP` table's unit, which every
+/// connection replays and a later rename makes it rebind.
+const HELD_VIEW_REBOUND_SCHEMA: &str = "
+CREATE ROLE app NOLOGIN;
+CREATE TABLE things (code TEXT PRIMARY KEY);
+CREATE TABLE kinds (id TEXT PRIMARY KEY);
+ALTER TABLE kinds ENABLE ROW LEVEL SECURITY;
+CREATE TEMP TABLE allowed AS SELECT code AS id FROM things;
+GRANT SELECT ON kinds, allowed, things TO app;
+CREATE POLICY kinds_read ON kinds FOR SELECT TO app USING (id IN (SELECT id FROM allowed));
+ALTER TABLE things RENAME TO stuff;
+";
+
 mod schema {
     diesel::table! {
         shared_items (id) {
@@ -1045,4 +1058,24 @@ fn seeds_load_before_a_chain_of_policy_reads() {
             .expect("read kinds through the view"),
         ["sample"]
     );
+}
+
+/// A connection is refused when it would retranslate on its own a unit a
+/// held-back view moved into, which would leave the view out.
+#[test]
+fn connection_refuses_rebinding_a_unit_holding_a_view() {
+    let script = Pg2Sqlite::default()
+        .sql(HELD_VIEW_REBOUND_SCHEMA)
+        .expect("parse PostgreSQL")
+        .translate(
+            &Pg2SqliteOptions::default()
+                .with_deployment(deployment(["app"], []))
+                .with_acting_role("app")
+                .with_rls_audit_table_name("rls_audit"),
+        )
+        .expect("translate SQLite");
+    let Err(error) = script.connect() else {
+        panic!("a held view cannot follow its unit through a retranslation");
+    };
+    assert!(error.to_string().contains("held back"), "{error}");
 }
