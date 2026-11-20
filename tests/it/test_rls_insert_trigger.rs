@@ -296,7 +296,8 @@ fn rls_maintenance_exemption_expects_the_scaled_numeric() {
     assert_eq!(price, Some(125));
 }
 
-// ── Non-maintenance BEFORE INSERT trigger → continue at rls.rs 2263 ──────────
+// ── Non-maintenance BEFORE INSERT trigger
+// ─────────────────────────────────────
 
 diesel::table! {
     notes (id) {
@@ -318,10 +319,9 @@ struct NoteRow {
     body: Option<String>,
 }
 
-/// RLS table with a BEFORE INSERT trigger that does NOT assign to NEW — not a
-/// maintenance trigger.  `build_maintenance_insert_exemption` hits the
-/// `continue` at rls.rs:2263 and returns None (no exemption in the
-/// update-check trigger).  INSERT through the view must still succeed.
+/// RLS table with a BEFORE INSERT trigger that does NOT assign to NEW, so it
+/// is no maintenance trigger and the update-check trigger lets no write of it
+/// through. INSERT through the view must still succeed.
 const NOTES_SCHEMA: &str = "
     CREATE TABLE notes (id INT PRIMARY KEY, body TEXT);
     ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
@@ -336,8 +336,8 @@ const NOTES_SCHEMA: &str = "
     FOR EACH ROW EXECUTE FUNCTION notes_passthru();
 ";
 
-/// The non-maintenance trigger is skipped in the exemption builder; no
-/// IS DISTINCT FROM appears in the update-check trigger, and INSERT succeeds.
+/// The non-maintenance trigger gets no exemption, so no IS DISTINCT FROM
+/// appears in the update-check trigger, and INSERT succeeds.
 #[test]
 fn rls_non_maintenance_before_insert_trigger_has_no_exemption() {
     let opts = Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit");
