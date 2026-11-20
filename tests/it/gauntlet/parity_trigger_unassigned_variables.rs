@@ -329,3 +329,18 @@ fn an_unassigned_row_type_variable_is_null() {
     RETURN NULL;",
     ));
 }
+
+/// A variable of a type no table names, an enum here, holds a scalar `NULL`
+/// until assigned.
+#[test]
+fn an_unassigned_enum_variable_reads_null() {
+    assert_parity(&format!(
+        "CREATE TYPE mood AS ENUM ('calm', 'angry');{}",
+        trigger_declaring(
+            "felt mood;",
+            "AFTER",
+            "    INSERT INTO audit (child, outcome) VALUES (NEW.id, coalesce(felt::text, 'unset'));
+    RETURN NULL;",
+        )
+    ));
+}

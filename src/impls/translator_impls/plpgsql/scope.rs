@@ -9,8 +9,7 @@ use sql_traits::{
 };
 use sqlparser::ast::{
     BinaryOperator, CaseWhen, DataType, Expr, Ident, TableFactor, TriggerEvent, Value, Visit,
-    Visitor,
-    helpers::attached_token::AttachedToken, visit_expressions, visit_expressions_mut,
+    Visitor, helpers::attached_token::AttachedToken, visit_expressions, visit_expressions_mut,
 };
 
 use super::translator::bare_identifier;

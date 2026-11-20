@@ -36,7 +36,8 @@ fn column(index: usize) -> Ident {
     Ident::new(format!("{ROWS}_{index}"))
 }
 
-/// The row a variable declared as `declared` holds before any assignment, `None` for a scalar.
+/// The row a variable declared as `declared` holds before any assignment,
+/// `None` for a scalar.
 pub(super) fn unassigned_row(declared: &DeclaredType, schema: &ParserDB) -> Option<RowValue> {
     match declared {
         DeclaredType::RowType { .. } => Some(RowValue::Null),
