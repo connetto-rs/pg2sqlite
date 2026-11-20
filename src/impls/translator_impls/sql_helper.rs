@@ -30,10 +30,12 @@ use sqlparser::{
     ast::{
         ArgMode, BinaryOperator, CaseWhen, CastKind, CreateFunction, Cte, DataType, Expr, Function,
         FunctionArg, FunctionArgExpr, FunctionArguments, FunctionBehavior, FunctionCalledOnNull,
-        FunctionReturnType, FunctionSecurity, GroupByExpr, Ident, ObjectName, ObjectNamePart,
-        Query, SelectItem, SetExpr, Statement, TableAlias, TableFactor, TableWithJoins, Value,
-        Visit, VisitMut, Visitor, With, helpers::attached_token::AttachedToken, visit_expressions,
-        visit_expressions_mut, visit_relations, visit_relations_mut,
+        FunctionReturnType, FunctionSecurity, GroupByExpr, Ident, JoinConstraint, JoinOperator,
+        ObjectName, ObjectNamePart, Query, Select, SelectItem, SelectItemQualifiedWildcardKind,
+        SetExpr, Statement, TableAlias, TableAliasColumnDef, TableFactor, TableWithJoins,
+        UnaryOperator, Value, Visit, VisitMut, Visitor, With,
+        helpers::attached_token::AttachedToken, visit_expressions, visit_expressions_mut,
+        visit_relations, visit_relations_mut,
     },
     dialect::PostgreSqlDialect,
     parser::Parser,
@@ -45,10 +47,11 @@ use crate::{
     errors::Error,
     impls::{
         bind_once::is_atomic,
-        object_name::resolve_translation_table,
+        object_name::{last_ident, resolve_translation_table},
         privileges::{RoleTable, names_table_with_backing},
         query_builder::{
-            from_relation, make_query, make_simple_select, plain_table_factor, single_expr_query,
+            from_relation, make_query, make_simple_select, plain_table_factor,
+            plain_table_with_joins, single_expr_query,
         },
         replay::is_replayable,
         session_variable::{self, SessionRead},
@@ -157,9 +160,48 @@ pub(crate) fn inlined_call<'s>(
     match inliner.call(call, helper, caller)? {
         Expansion::Expression(expression) => Ok(Some(Inlined::Postgres(expression))),
         Expansion::Rows(rows) => {
-            rows.translate(schema, options, emit).map(Inlined::Sqlite).map(Some)
+            rows.translate(schema, options, emit)
+                .map(|query| Some(Inlined::Sqlite(Expr::Subquery(Box::new(query)))))
         }
     }
+}
+
+/// The rows `FROM name(arguments)` reads, when `helper` is a set-returning
+/// `LANGUAGE sql` function running as its caller: the query its body runs,
+/// with the arguments bound to the parameters, each column under its name in
+/// `columns` and cast to its declared type.
+///
+/// The arguments may read the queries around the call, as a column of an
+/// enclosing query or a trigger's `NEW` and `OLD` do. `None` leaves a
+/// `SECURITY DEFINER` helper and one written in another language to the set
+/// `FunctionLike::helper_set` reads out of the helper.
+///
+/// # Errors
+///
+/// Refuses a call whose body the inliner cannot replace it with, naming the
+/// function and the reason.
+pub(crate) fn inlined_rows<'s>(
+    name: &ObjectName,
+    arguments: &[FunctionArg],
+    helper: &'s CreateFunction,
+    columns: &[Ident],
+    schema: &'s ParserDB,
+    options: &TranslationContext<'s>,
+    emit: WarningSink<'_>,
+) -> Result<Option<Query>, Error> {
+    if !written_in_sql(helper)
+        || !helper.returns_set()
+        || helper.security_mode() == FunctionSecurity::Definer
+    {
+        return Ok(None);
+    }
+    let columns = columns.iter().cloned().zip(returned_row_types(name, helper, schema)?).collect();
+    let caller = calling_role(schema, options)?;
+    let mut inliner = Inliner { schema, options, expanding: Vec::new(), keep_sets: false };
+    inliner
+        .set(name, arguments, helper, caller, columns)?
+        .translate(schema, options, emit)
+        .map(Some)
 }
 
 /// Whether `function`'s body is SQL, the one language whose body has an
@@ -229,16 +271,7 @@ impl<'s> Inliner<'s, '_> {
         caller: Option<&'s Role>,
     ) -> Result<Expansion<'s>, Error> {
         let name = &call.name;
-        let translating = self.options.inlined_body().map(InlinedBody::chain);
-        if self
-            .expanding
-            .iter()
-            .copied()
-            .chain(translating.into_iter().flatten())
-            .any(|seen| core::ptr::eq(seen, helper))
-        {
-            return Err(refusal(name, "calls itself, directly or through other functions"));
-        }
+        self.check_cycle(name, helper)?;
         if call.over.is_some()
             || call.filter.is_some()
             || call.null_treatment.is_some()
@@ -254,26 +287,14 @@ impl<'s> Inliner<'s, '_> {
             check_privileges(name, helper, role, self.schema)?;
         }
         let returned = returned_type(name, helper)?;
-        if helper.volatility() == FunctionBehavior::Volatile {
-            return Err(refusal(
-                name,
-                "is VOLATILE, so PostgreSQL may answer differently on each evaluation of the \
-                 call, which an expression written in its place does not keep",
-            ));
-        }
+        check_volatility(name, helper)?;
         let mut arguments = Arguments::of(call, helper)?;
-        // The arguments are the caller's expressions, so their own calls run
-        // as the caller, before binding carries them into a body that may
-        // run as its owner.
-        for argument in &mut arguments.bound {
-            self.expand(&mut argument.written, caller)?;
-            argument.value = parameter_value(&argument.written, argument.data_type);
-        }
+        self.expand_arguments(&mut arguments, caller)?;
         let mut body = match body_shape(name, helper, self.schema)? {
             BodyShape::Expression(body) => body.into_owned(),
             BodyShape::Rows(query) => {
                 return self
-                    .rows(name, helper, caller, &arguments, query, returned)
+                    .rows(name, helper, caller, &arguments, query, Answer::Value(returned))
                     .map(Expansion::Rows);
             }
         };
@@ -305,6 +326,58 @@ impl<'s> Inliner<'s, '_> {
         // `cast_to` left the body a `CAST(... AS ...)`, one operand of
         // whatever surrounds the call.
         Ok(Expansion::Expression(body))
+    }
+
+    /// `FROM name(arguments)`, a call to the set-returning `helper` made as
+    /// `caller`, as the query answering its rows under `columns`.
+    fn set(
+        &mut self,
+        name: &ObjectName,
+        arguments: &[FunctionArg],
+        helper: &'s CreateFunction,
+        caller: Option<&'s Role>,
+        columns: Vec<(Ident, &'s DataType)>,
+    ) -> Result<RowsCall<'s>, Error> {
+        self.check_cycle(name, helper)?;
+        if let Some(role) = caller {
+            check_privileges(name, helper, role, self.schema)?;
+        }
+        check_volatility(name, helper)?;
+        let mut arguments = Arguments::of_list(name, arguments, helper)?;
+        self.expand_arguments(&mut arguments, caller)?;
+        let query = body_query(name, helper, self.schema)?;
+        self.rows(name, helper, caller, &arguments, query, Answer::Rows(columns))
+    }
+
+    /// Refuses a call to `helper` made in its own body, directly or through
+    /// the bodies it is expanded into.
+    fn check_cycle(&self, name: &ObjectName, helper: &CreateFunction) -> Result<(), Error> {
+        let translating = self.options.inlined_body().map(InlinedBody::chain);
+        if self
+            .expanding
+            .iter()
+            .copied()
+            .chain(translating.into_iter().flatten())
+            .any(|seen| core::ptr::eq(seen, helper))
+        {
+            return Err(refusal(name, "calls itself, directly or through other functions"));
+        }
+        Ok(())
+    }
+
+    /// Expands the calls `arguments` make. The arguments are the caller's
+    /// expressions, so their own calls run as the caller, before binding
+    /// carries them into a body that may run as its owner.
+    fn expand_arguments(
+        &mut self,
+        arguments: &mut Arguments<'s>,
+        caller: Option<&'s Role>,
+    ) -> Result<(), Error> {
+        for argument in &mut arguments.bound {
+            self.expand(&mut argument.written, caller)?;
+            argument.value = parameter_value(&argument.written, argument.data_type);
+        }
+        Ok(())
     }
 
     /// The functions whose bodies a call to `helper` is expanded into, and
@@ -343,7 +416,8 @@ impl<'s> Inliner<'s, '_> {
     }
 
     /// `call` to `helper`, whose body `query` reads relations, made as
-    /// `caller` with `arguments`, as the query that answers it.
+    /// `caller` with `arguments`, as the query that answers it, one value or
+    /// the rows of a set as `answer` says.
     ///
     /// The arguments are evaluated once, in the caller's scope, as the one
     /// row of a `WITH` query the body reads its parameters from, so a name in
@@ -355,7 +429,7 @@ impl<'s> Inliner<'s, '_> {
         caller: Option<&'s Role>,
         arguments: &Arguments<'s>,
         query: Box<Query>,
-        returned: &DataType,
+        answer: Answer<'s>,
     ) -> Result<RowsCall<'s>, Error> {
         if !self.options.allows_subqueries() {
             return Err(refusal(
@@ -396,51 +470,34 @@ impl<'s> Inliner<'s, '_> {
         let depth = self.expanding.len()
             + self.options.inlined_body().map_or(0, |body| body.chain().count());
         let relation = Ident::new(format!("{ARGUMENTS}_{depth}"));
-        let parameters = {
-            let scope = ExpressionScope::FunctionBody(helper);
-            let context = ExpressionContext::for_statement(
-                &statement,
-                &scope,
-                self.schema,
-                IdentifierCase::AsWritten,
-            )?;
-            Parameters::resolve(&statement, arguments.len(), |expr| {
-                // A relation's column copying a parameter, recursively too,
-                // reaches a FROM item.
-                Ok(match (context.reference(expr)?, reader) {
-                    (Some((ColumnDefinition::Parameter { function, ordinal }, binding)), _)
-                        if core::ptr::eq(function, helper) && binding.entry().is_none() =>
-                    {
-                        Some(ordinal)
-                    }
-                    (Some((ColumnDefinition::Base { table, column, .. }, _)), Some(reader))
-                        if !table.privileges(reader, self.schema)?.select.on_column(column) =>
-                    {
-                        return Err(refusal(
-                            name,
-                            &format!(
-                                "reads {}.{} as {}, which lacks SELECT on it, so PostgreSQL \
-                                 raises where its translation would answer",
-                                table.table_name(),
-                                column.column_name(),
-                                reader.name()
-                            ),
-                        ));
-                    }
-                    _ => None,
-                })
-            })?
-        };
+        let parameters = self.body_parameters(name, helper, reader, &statement, arguments.len())?;
         let _: ControlFlow<()> = visit_expressions_mut(&mut statement, |expr| {
             if let Some(position) = parameters.position(expr) {
                 *expr = argument_column(&relation, position);
             }
             ControlFlow::Continue(())
         });
-        let Statement::Query(query) = statement else { unreachable!("the body stays one query") };
-        let projection = arguments.null_on_null(helper, Expr::Subquery(query), |position, _| {
-            argument_column(&relation, position)
-        });
+        let Statement::Query(mut query) = statement else {
+            unreachable!("the body stays one query")
+        };
+        let reference = |position, _: &Bound<'_>| argument_column(&relation, position);
+        let answered = match answer {
+            Answer::Value(returned) => {
+                let projection = arguments.null_on_null(helper, Expr::Subquery(query), reference);
+                Answered::Value(cast_to(projection, returned))
+            }
+            Answer::Rows(columns) => {
+                if !arguments.bound.is_empty() {
+                    join_arguments(name, &mut query, &relation)?;
+                }
+                Answered::Rows {
+                    rows: Ident::new(format!("{ROWS}_{depth}")),
+                    body: query,
+                    columns,
+                    any_null: arguments.any_null(helper, reference),
+                }
+            }
+        };
         Ok(RowsCall {
             helper,
             owner,
@@ -450,7 +507,52 @@ impl<'s> Inliner<'s, '_> {
                 .iter()
                 .map(|bound| (bound.value.clone(), bound.data_type.clone()))
                 .collect(),
-            projection: cast_to(projection, returned),
+            answered,
+        })
+    }
+
+    /// The references `statement`, the body of `helper`, makes to its
+    /// `count` parameters, refusing a column `reader` lacks `SELECT` on.
+    fn body_parameters(
+        &self,
+        name: &ObjectName,
+        helper: &'s CreateFunction,
+        reader: Option<&'s Role>,
+        statement: &Statement,
+        count: usize,
+    ) -> Result<Parameters, Error> {
+        let scope = ExpressionScope::FunctionBody(helper);
+        let context = ExpressionContext::for_statement(
+            statement,
+            &scope,
+            self.schema,
+            IdentifierCase::AsWritten,
+        )?;
+        Parameters::resolve(statement, count, |expr| {
+            // A relation's column copying a parameter, recursively too,
+            // reaches a FROM item.
+            Ok(match (context.reference(expr)?, reader) {
+                (Some((ColumnDefinition::Parameter { function, ordinal }, binding)), _)
+                    if core::ptr::eq(function, helper) && binding.entry().is_none() =>
+                {
+                    Some(ordinal)
+                }
+                (Some((ColumnDefinition::Base { table, column, .. }, _)), Some(reader))
+                    if !table.privileges(reader, self.schema)?.select.on_column(column) =>
+                {
+                    return Err(refusal(
+                        name,
+                        &format!(
+                            "reads {}.{} as {}, which lacks SELECT on it, so PostgreSQL raises \
+                             where its translation would answer",
+                            table.table_name(),
+                            column.column_name(),
+                            reader.name()
+                        ),
+                    ));
+                }
+                _ => None,
+            })
         })
     }
 
@@ -667,12 +769,42 @@ pub(crate) fn owner<'s>(
 /// reading relations, suffixed by how deeply the call is nested in others.
 const ARGUMENTS: &str = "pg2sqlite_arguments";
 
+/// The prefix of the `WITH` query holding the rows of a call to a function
+/// returning a set, suffixed as [`ARGUMENTS`] is.
+const ROWS: &str = "pg2sqlite_rows";
+
 /// The column of `relation` holding the argument at `position`.
 fn argument_column(relation: &Ident, position: usize) -> Expr {
     Expr::CompoundIdentifier(vec![
         relation.clone(),
         Ident::new(format!("argument_{}", position + 1)),
     ])
+}
+
+/// What a call to a function whose body reads relations answers.
+enum Answer<'s> {
+    /// One value of the declared return type.
+    Value(&'s DataType),
+    /// The rows of a set, each column under the name the caller reads it
+    /// by, with its declared type.
+    Rows(Vec<(Ident, &'s DataType)>),
+}
+
+/// The body of a call to a function reading relations, reading each
+/// parameter from the `WITH` query holding the arguments.
+enum Answered<'s> {
+    /// The body as the declared return type.
+    Value(Expr),
+    /// The body as the `WITH` query `rows` over `columns`, each select of it
+    /// reading a parameter joining the arguments.
+    Rows {
+        rows: Ident,
+        body: Box<Query>,
+        columns: Vec<(Ident, &'s DataType)>,
+        /// Whether an argument is `NULL`, for a `STRICT` function, which
+        /// then returns no row without running its body.
+        any_null: Option<Expr>,
+    },
 }
 
 /// A call to a function whose body reads relations, bound to its
@@ -685,37 +817,82 @@ struct RowsCall<'s> {
     relation: Ident,
     /// Each argument as its parameter's type, with that type.
     arguments: Vec<(Expr, DataType)>,
-    /// The body as the declared return type, reading each parameter from
-    /// `relation`.
-    projection: Expr,
+    answered: Answered<'s>,
+}
+
+/// `name [(columns)] AS (query)`.
+fn cte(name: Ident, columns: Vec<TableAliasColumnDef>, query: Query) -> Cte {
+    Cte {
+        alias: TableAlias { explicit: false, name, columns, at: None },
+        query: Box::new(query),
+        from: None,
+        materialized: None,
+        closing_paren_token: AttachedToken::empty(),
+    }
 }
 
 impl RowsCall<'_> {
-    /// `WITH <relation> AS (SELECT <arguments>) SELECT <projection> FROM
-    /// <relation>`, each argument `NULL` of its type when `placeholder`.
+    /// The query answering the call, each argument `NULL` of its type when
+    /// `placeholder`: `WITH <relation> AS (SELECT <arguments>) SELECT <value>
+    /// FROM <relation>` for one value, and for a set `WITH <relation> AS
+    /// (SELECT <arguments>), <rows> (<columns>) AS (<body>) SELECT <columns>
+    /// FROM <rows>`, each column cast to its declared type.
     fn into_query(self, placeholder: bool) -> Query {
-        if self.arguments.is_empty() {
-            return single_expr_query(self.projection, Vec::new(), None);
+        let mut ctes = Vec::new();
+        let mut from = Vec::new();
+        if !self.arguments.is_empty() {
+            ctes.push(cte(self.relation.clone(), Vec::new(), self.arguments(placeholder)));
+            from = from_relation(plain_table_factor(ObjectName::from(vec![self.relation])));
         }
-        let arguments = self.arguments(placeholder);
-        let from = from_relation(plain_table_factor(ObjectName::from(vec![self.relation.clone()])));
-        let mut query = single_expr_query(self.projection, from, None);
-        query.with = Some(With {
-            with_token: AttachedToken::empty(),
-            recursive: false,
-            cte_tables: vec![Cte {
-                alias: TableAlias {
-                    explicit: false,
-                    name: self.relation,
-                    columns: Vec::new(),
-                    at: None,
-                },
-                query: Box::new(arguments),
-                from: None,
-                materialized: None,
-                closing_paren_token: AttachedToken::empty(),
-            }],
-        });
+        let mut query = match self.answered {
+            Answered::Value(projection) => single_expr_query(projection, from, None),
+            Answered::Rows { rows, body, columns, any_null } => {
+                let projection = columns
+                    .iter()
+                    .map(|(column, data_type)| {
+                        SelectItem::ExprWithAlias {
+                            expr: Expr::Cast {
+                                kind: CastKind::Cast,
+                                expr: Box::new(Expr::CompoundIdentifier(vec![
+                                    rows.clone(),
+                                    column.clone(),
+                                ])),
+                                data_type: (*data_type).clone(),
+                                format: None,
+                            },
+                            alias: column.clone(),
+                        }
+                    })
+                    .collect();
+                let names = columns
+                    .into_iter()
+                    .map(|(name, _)| TableAliasColumnDef { name, data_type: None })
+                    .collect();
+                ctes.push(cte(rows.clone(), names, *body));
+                // The arguments stay in the FROM list only to be tested.
+                let selection = any_null.map(|any_null| {
+                    Expr::UnaryOp {
+                        op: UnaryOperator::Not,
+                        expr: Box::new(Expr::Nested(Box::new(any_null))),
+                    }
+                });
+                if selection.is_none() {
+                    from.clear();
+                }
+                from.extend(from_relation(plain_table_factor(ObjectName::from(vec![rows]))));
+                make_query(
+                    None,
+                    SetExpr::Select(Box::new(make_simple_select(projection, from, selection))),
+                )
+            }
+        };
+        if !ctes.is_empty() {
+            query.with = Some(With {
+                with_token: AttachedToken::empty(),
+                recursive: false,
+                cte_tables: ctes,
+            });
+        }
         query
     }
 
@@ -747,8 +924,7 @@ impl RowsCall<'_> {
         )
     }
 
-    /// The SQLite scalar subquery answering the call where `options` reaches
-    /// it.
+    /// The SQLite query answering the call where `options` reaches it.
     ///
     /// The body translates as the role it runs as, a `SECURITY DEFINER` one
     /// reading the backing table of each table it names, and the arguments
@@ -763,7 +939,7 @@ impl RowsCall<'_> {
         schema: &ParserDB,
         options: &TranslationContext<'_>,
         emit: WarningSink<'_>,
-    ) -> Result<Expr, Error> {
+    ) -> Result<Query, Error> {
         let RowsCall { helper, owner, .. } = self;
         let relation = self.relation.clone();
         // Built before the body moves into its query.
@@ -772,21 +948,213 @@ impl RowsCall<'_> {
         let body_options = options.with_inlined_body(&frame, owner);
         let mut translated =
             self.into_query(true).translate_with_warnings(schema, &body_options, emit)?;
-        let with = translated.with.take();
+        let lost = || refusal(&helper.name, "has arguments its translation lost track of");
+        // The arguments are the caller's, so they stay out of the body's
+        // reads and translate where the call stands.
+        let placeholder = match arguments {
+            Some(arguments) => {
+                let with = translated.with.as_mut().ok_or_else(lost)?;
+                let index = with
+                    .cte_tables
+                    .iter()
+                    .position(|cte| cte.alias.name == relation)
+                    .ok_or_else(lost)?;
+                Some((index, with.cte_tables.remove(index), arguments))
+            }
+            None => None,
+        };
         if let Some(owner) = owner {
             read_backing_tables(helper, &mut translated, owner, schema, &body_options)?;
         }
-        if let (Some(mut with), Some(arguments)) = (with, arguments) {
-            let arguments = arguments.translate_with_warnings(schema, options, emit)?;
-            let cte =
-                with.cte_tables.iter_mut().find(|cte| cte.alias.name == relation).ok_or_else(
-                    || refusal(&helper.name, "has arguments its translation lost track of"),
-                )?;
-            *cte.query = arguments;
-            translated.with = Some(with);
+        if let Some((index, mut cte, arguments)) = placeholder {
+            *cte.query = arguments.translate_with_warnings(schema, options, emit)?;
+            translated.with.as_mut().ok_or_else(lost)?.cte_tables.insert(index, cte);
         }
-        Ok(Expr::Subquery(Box::new(translated)))
+        Ok(translated)
     }
+}
+
+/// Joins `relation`, the one row of a call's arguments, into each select of
+/// `query`'s body that reads a parameter, which then reads it from there.
+///
+/// SQLite resolves the names in the arguments, the caller's, where the
+/// `WITH` query holding them is read, so it is read only as an item of a
+/// select's FROM list, which no other item of that list reaches. PostgreSQL
+/// reads the parameters as constants, so the one row joined in changes no
+/// row the select keeps.
+///
+/// # Errors
+///
+/// Refuses a body reading a parameter outside every select, in a FROM item,
+/// beside a `RIGHT` or `FULL` join, which would read the arguments as NULL in
+/// a row it keeps of its right side alone, and through a `*` over a `USING`
+/// or `NATURAL` join or a FROM item it cannot name.
+fn join_arguments(name: &ObjectName, query: &mut Query, relation: &Ident) -> Result<(), Error> {
+    let Query { with, body, order_by, limit_clause, fetch, .. } = query;
+    if reads_arguments(with, relation)
+        || reads_arguments(order_by, relation)
+        || reads_arguments(limit_clause, relation)
+        || reads_arguments(fetch, relation)
+    {
+        return Err(refusal(name, OUTSIDE_SELECTS));
+    }
+    join_set_arguments(name, body, relation)
+}
+
+/// Why a body reading a parameter outside its selects is refused.
+const OUTSIDE_SELECTS: &str = "reads a parameter outside the SELECT lists, FROM lists and \
+                               conditions of its body, as in a WITH query, a VALUES list, an \
+                               ORDER BY or a LIMIT, where its translation reads none of the \
+                               call's arguments";
+
+/// [`join_arguments`] over each select `body` combines.
+fn join_set_arguments(
+    name: &ObjectName,
+    body: &mut SetExpr,
+    relation: &Ident,
+) -> Result<(), Error> {
+    match body {
+        SetExpr::Select(select) if reads_arguments(select, relation) => {
+            join_select_arguments(name, select, relation)
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            join_set_arguments(name, left, relation)?;
+            join_set_arguments(name, right, relation)
+        }
+        SetExpr::Query(query) => join_arguments(name, query, relation),
+        other if reads_arguments(other, relation) => Err(refusal(name, OUTSIDE_SELECTS)),
+        _ => Ok(()),
+    }
+}
+
+/// [`join_arguments`] for one select reading a parameter.
+fn join_select_arguments(
+    name: &ObjectName,
+    select: &mut Select,
+    relation: &Ident,
+) -> Result<(), Error> {
+    for table in &select.from {
+        let mut factors =
+            core::iter::once(&table.relation).chain(table.joins.iter().map(|join| &join.relation));
+        if factors.any(|factor| reads_arguments(factor, relation)) {
+            return Err(refusal(
+                name,
+                "reads a parameter in an item of a FROM list, which SQLite lets read no other \
+                 item of that list, so its translation has nowhere to read the call's \
+                 arguments from",
+            ));
+        }
+        if table.joins.iter().any(|join| {
+            matches!(
+                join.join_operator,
+                JoinOperator::Right(_) | JoinOperator::RightOuter(_) | JoinOperator::FullOuter(_)
+            )
+        }) {
+            return Err(refusal(
+                name,
+                "reads a parameter in a select joining RIGHT or FULL, whose rows of the right \
+                 side alone would read the call's arguments as NULL in its translation",
+            ));
+        }
+    }
+    if select.projection.iter().any(|item| matches!(item, SelectItem::Wildcard(_))) {
+        let mut qualifiers = Vec::new();
+        for table in &select.from {
+            wildcard_qualifiers(name, table, &mut qualifiers)?;
+        }
+        let mut projection = Vec::with_capacity(select.projection.len() + qualifiers.len());
+        for item in core::mem::take(&mut select.projection) {
+            match item {
+                SelectItem::Wildcard(options) => {
+                    projection.extend(qualifiers.iter().map(|qualifier| {
+                        SelectItem::QualifiedWildcard(
+                            SelectItemQualifiedWildcardKind::ObjectName(qualifier.clone()),
+                            options.clone(),
+                        )
+                    }));
+                }
+                other => projection.push(other),
+            }
+        }
+        select.projection = projection;
+    }
+    select.from.insert(0, plain_table_with_joins(ObjectName::from(vec![relation.clone()])));
+    Ok(())
+}
+
+/// Pushes the name `<name>.*` reads each item of `table` by, in the order a
+/// `*` reads them, so that a `*` over `table` keeps its columns once the
+/// arguments join it.
+///
+/// # Errors
+///
+/// Refuses a `USING` or `NATURAL` join, of whose two columns a `*` reads
+/// one, and an item without a name.
+fn wildcard_qualifiers(
+    name: &ObjectName,
+    table: &TableWithJoins,
+    qualifiers: &mut Vec<ObjectName>,
+) -> Result<(), Error> {
+    let unnamed = || {
+        refusal(
+            name,
+            "reads a parameter in a select reading * over a USING or NATURAL join or over a FROM \
+             item without a name, which its translation cannot read once the call's arguments \
+             join it. Name the columns",
+        )
+    };
+    if table.joins.iter().any(|join| {
+        matches!(
+            &join.join_operator,
+            JoinOperator::Join(constraint)
+                | JoinOperator::Inner(constraint)
+                | JoinOperator::Left(constraint)
+                | JoinOperator::LeftOuter(constraint)
+                if matches!(
+                    constraint,
+                    JoinConstraint::Using(_)
+                        | JoinConstraint::UsingAlias(..)
+                        | JoinConstraint::Natural
+                )
+        )
+    }) {
+        return Err(unnamed());
+    }
+    for factor in
+        core::iter::once(&table.relation).chain(table.joins.iter().map(|join| &join.relation))
+    {
+        match factor {
+            TableFactor::Table { alias: Some(alias), .. }
+            | TableFactor::Derived { alias: Some(alias), .. }
+            | TableFactor::Function { alias: Some(alias), .. }
+            | TableFactor::NestedJoin { alias: Some(alias), .. } => {
+                qualifiers.push(ObjectName::from(vec![alias.name.clone()]));
+            }
+            TableFactor::Table { name: table_name, alias: None, .. }
+            | TableFactor::Function { name: table_name, alias: None, .. } => {
+                let last = last_ident(table_name).ok_or_else(unnamed)?;
+                qualifiers.push(ObjectName::from(vec![last.clone()]));
+            }
+            TableFactor::NestedJoin { table_with_joins, alias: None } => {
+                wildcard_qualifiers(name, table_with_joins, qualifiers)?;
+            }
+            _ => return Err(unnamed()),
+        }
+    }
+    Ok(())
+}
+
+/// Whether `node` reads a column of `relation`, the arguments of a call.
+fn reads_arguments<N: Visit>(node: &N, relation: &Ident) -> bool {
+    visit_expressions(node, |expr| {
+        match expr {
+            Expr::CompoundIdentifier(parts) if parts.first() == Some(relation) => {
+                ControlFlow::Break(())
+            }
+            _ => ControlFlow::Continue(()),
+        }
+    })
+    .is_break()
 }
 
 /// Points each table `translated` names at the backing table `owner` reads
@@ -982,18 +1350,58 @@ pub(crate) fn body_shape<'f>(
     helper: &'f CreateFunction,
     schema: &ParserDB,
 ) -> Result<BodyShape<'f>, Error> {
-    if let Some(expression) = helper.body_expression(schema)? {
-        if names_relation(expression.as_ref()) {
-            let select = make_simple_select(
-                vec![SelectItem::UnnamedExpr(expression.into_owned())],
-                Vec::new(),
-                None,
-            );
-            let query = make_query(None, SetExpr::Select(Box::new(select)));
-            return Ok(BodyShape::Rows(Box::new(query)));
+    match helper.body_expression(schema)? {
+        Some(expression) if !names_relation(expression.as_ref()) => {
+            Ok(BodyShape::Expression(expression))
         }
-        return Ok(BodyShape::Expression(expression));
+        Some(expression) => Ok(BodyShape::Rows(Box::new(select_of(expression.into_owned())))),
+        None => {
+            let query = statement_query(name, helper, schema)?;
+            if names_relation(query.as_ref()) {
+                return Ok(BodyShape::Rows(query));
+            }
+            single_expression(*query)
+                .map(|expression| BodyShape::Expression(Cow::Owned(expression)))
+                .ok_or_else(|| refusal(name, "has a body that is not one SELECT of one expression"))
+        }
     }
+}
+
+/// The one query `helper`'s body runs, a `RETURN <expression>` body as
+/// `SELECT <expression>`.
+///
+/// # Errors
+///
+/// Refuses a body that is neither one query nor `RETURN <expression>`, and a
+/// body that does not parse.
+fn body_query(
+    name: &ObjectName,
+    helper: &CreateFunction,
+    schema: &ParserDB,
+) -> Result<Box<Query>, Error> {
+    match helper.body_expression(schema)? {
+        Some(expression) => Ok(Box::new(select_of(expression.into_owned()))),
+        None => statement_query(name, helper, schema),
+    }
+}
+
+/// `SELECT <expression>`.
+fn select_of(expression: Expr) -> Query {
+    let select = make_simple_select(vec![SelectItem::UnnamedExpr(expression)], Vec::new(), None);
+    make_query(None, SetExpr::Select(Box::new(select)))
+}
+
+/// The one query statement `helper`'s body holds, written as a string or
+/// as `BEGIN ATOMIC ... END`.
+///
+/// # Errors
+///
+/// Refuses a body of other than one query, and a body that does not parse.
+fn statement_query(
+    name: &ObjectName,
+    helper: &CreateFunction,
+    schema: &ParserDB,
+) -> Result<Box<Query>, Error> {
     let statements = if let Some(statements) = helper.atomic_statements(schema)? {
         statements.into_owned()
     } else {
@@ -1004,15 +1412,10 @@ pub(crate) fn body_shape<'f>(
             .map_err(|error| refusal(name, &format!("has a body that does not parse: {error}")))?
     };
     let mut statements = statements.into_iter();
-    let (Some(Statement::Query(query)), None) = (statements.next(), statements.next()) else {
-        return Err(refusal(name, "has a body of other than one query"));
-    };
-    if names_relation(query.as_ref()) {
-        return Ok(BodyShape::Rows(query));
+    match (statements.next(), statements.next()) {
+        (Some(Statement::Query(query)), None) => Ok(query),
+        _ => Err(refusal(name, "has a body of other than one query")),
     }
-    single_expression(*query)
-        .map(|expression| BodyShape::Expression(Cow::Owned(expression)))
-        .ok_or_else(|| refusal(name, "has a body that is not one SELECT of one expression"))
 }
 
 /// Whether `node` names a table, a view or any other relation.
@@ -1067,32 +1470,81 @@ fn returned_type<'f>(name: &ObjectName, helper: &'f CreateFunction) -> Result<&'
         Some(FunctionReturnType::SetOf(_) | FunctionReturnType::DataType(_)) => {
             return Err(refusal(
                 name,
-                "returns a set, which translates only where a policy compares a value with it, \
-                 as `x IN (SELECT f(...))`",
+                "returns a set, which translates only where a query reads its rows, as `FROM \
+                 f(...)`, or where a policy compares a value with it, as `x IN (SELECT f(...))`",
             ));
         }
         None => return Err(refusal(name, "declares no return type")),
     };
-    let written = returned.to_string().to_ascii_lowercase();
-    let pseudo = matches!(returned, DataType::Table(_))
-        || written.starts_with("any")
-        || [
-            "record",
-            "void",
-            "trigger",
-            "event_trigger",
-            "internal",
-            "cstring",
-            "language_handler",
-        ]
-        .contains(&written.as_str());
-    if pseudo {
+    if is_pseudo_type(returned) {
         return Err(refusal(
             name,
             &format!("returns {returned}, which is no one value of a known type"),
         ));
     }
     Ok(returned)
+}
+
+/// Whether `data_type` is a pseudo-type or a row, which no column holds.
+fn is_pseudo_type(data_type: &DataType) -> bool {
+    let written = data_type.to_string().to_ascii_lowercase();
+    matches!(data_type, DataType::Table(_))
+        || written.starts_with("any")
+        || ["record", "void", "trigger", "event_trigger", "internal", "cstring", "language_handler"]
+            .contains(&written.as_str())
+}
+
+/// The type of each column of the rows the set-returning `helper` returns.
+///
+/// # Errors
+///
+/// Refuses rows of a table's type or of a pseudo-type, whose columns the
+/// declaration does not name.
+fn returned_row_types<'f>(
+    name: &ObjectName,
+    helper: &'f CreateFunction,
+    schema: &ParserDB,
+) -> Result<Vec<&'f DataType>, Error> {
+    match &helper.return_type {
+        Some(FunctionReturnType::DataType(DataType::Table(Some(columns)))) => {
+            Ok(columns.iter().map(|column| &column.data_type).collect())
+        }
+        Some(FunctionReturnType::SetOf(element)) => {
+            let row = match element {
+                DataType::Custom(type_name, _) => {
+                    resolve_translation_table(schema, type_name)?.is_some()
+                }
+                _ => false,
+            };
+            if row || is_pseudo_type(element) {
+                return Err(refusal(
+                    name,
+                    &format!(
+                        "returns SETOF {element}, whose columns its declaration does not name. \
+                         Declare them with RETURNS TABLE (...)"
+                    ),
+                ));
+            }
+            Ok(vec![element])
+        }
+        Some(FunctionReturnType::DataType(returned)) => {
+            Err(refusal(name, &format!("returns {returned}, which is no set of rows")))
+        }
+        None => Err(refusal(name, "declares no return type")),
+    }
+}
+
+/// Refuses a `VOLATILE` function, which PostgreSQL may answer differently
+/// on each evaluation of a call.
+fn check_volatility(name: &ObjectName, helper: &CreateFunction) -> Result<(), Error> {
+    if helper.volatility() == FunctionBehavior::Volatile {
+        return Err(refusal(
+            name,
+            "is VOLATILE, so PostgreSQL may answer differently on each evaluation of the call, \
+             which its body written in place of the call does not keep",
+        ));
+    }
+    Ok(())
 }
 
 /// Refuses a body whose expression aggregates or windows rows: run as the
@@ -1316,33 +1768,36 @@ impl<'f> Arguments<'f> {
     /// Refuses named arguments, a parameter other than `IN`, and an argument
     /// count the declaration does not take.
     pub(crate) fn of(call: &Function, helper: &'f CreateFunction) -> Result<Self, Error> {
-        let name = &call.name;
-        let positional_only = |passed: &dyn core::fmt::Display| {
-            refusal(
-                name,
-                &format!(
-                    "is passed {passed}, and only positional arguments bind to its parameters"
-                ),
-            )
-        };
-        let written: Vec<&Expr> = match &call.args {
+        match &call.args {
             FunctionArguments::List(list)
                 if list.duplicate_treatment.is_none() && list.clauses.is_empty() =>
             {
-                list.args
-                    .iter()
-                    .map(|argument| {
-                        match argument {
-                            FunctionArg::Unnamed(FunctionArgExpr::Expr(expression)) => {
-                                Ok(expression)
-                            }
-                            other => Err(positional_only(other)),
-                        }
-                    })
-                    .collect::<Result<_, _>>()?
+                Self::of_list(&call.name, &list.args, helper)
             }
-            other => return Err(positional_only(other)),
-        };
+            other => Err(positional_only(&call.name, other)),
+        }
+    }
+
+    /// The arguments a call to `helper` written as `name` passes in `list`,
+    /// as [`Arguments::of`] binds them.
+    ///
+    /// # Errors
+    ///
+    /// Refuses as [`Arguments::of`] does.
+    fn of_list(
+        name: &ObjectName,
+        list: &[FunctionArg],
+        helper: &'f CreateFunction,
+    ) -> Result<Self, Error> {
+        let written: Vec<&Expr> = list
+            .iter()
+            .map(|argument| {
+                match argument {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(expression)) => Ok(expression),
+                    other => Err(positional_only(name, other)),
+                }
+            })
+            .collect::<Result<_, _>>()?;
         let parameters = helper.args.as_deref().unwrap_or_default();
         if let Some(parameter) =
             parameters.iter().find(|parameter| !matches!(parameter.mode, None | Some(ArgMode::In)))
@@ -1400,22 +1855,7 @@ impl<'f> Arguments<'f> {
         body: Expr,
         reference: impl Fn(usize, &Bound<'f>) -> Expr,
     ) -> Expr {
-        if !matches!(
-            helper.null_input_behavior(),
-            FunctionCalledOnNull::Strict | FunctionCalledOnNull::ReturnsNullOnNullInput
-        ) {
-            return body;
-        }
-        let tested = self
-            .bound
-            .iter()
-            .enumerate()
-            .map(|(position, bound)| Expr::IsNull(Box::new(reference(position, bound))));
-        let Some(any_null) = tested.reduce(|left, right| {
-            Expr::BinaryOp { left: Box::new(left), op: BinaryOperator::Or, right: Box::new(right) }
-        }) else {
-            return body;
-        };
+        let Some(any_null) = self.any_null(helper, reference) else { return body };
         Expr::Case {
             case_token: AttachedToken::empty(),
             end_token: AttachedToken::empty(),
@@ -1426,6 +1866,34 @@ impl<'f> Arguments<'f> {
             }],
             else_result: Some(Box::new(body)),
         }
+    }
+
+    /// Whether any argument is NULL, for a `STRICT` function, which then
+    /// answers without running its body, `reference` writing how the body
+    /// reads the parameter at a position. `None` for a function that runs
+    /// its body on NULL arguments and for a call passing none.
+    fn any_null(
+        &self,
+        helper: &CreateFunction,
+        reference: impl Fn(usize, &Bound<'f>) -> Expr,
+    ) -> Option<Expr> {
+        if !matches!(
+            helper.null_input_behavior(),
+            FunctionCalledOnNull::Strict | FunctionCalledOnNull::ReturnsNullOnNullInput
+        ) {
+            return None;
+        }
+        self.bound
+            .iter()
+            .enumerate()
+            .map(|(position, bound)| Expr::IsNull(Box::new(reference(position, bound))))
+            .reduce(|left, right| {
+                Expr::BinaryOp {
+                    left: Box::new(left),
+                    op: BinaryOperator::Or,
+                    right: Box::new(right),
+                }
+            })
     }
 
     /// Replaces every reference `parameters` finds in `node` with the
@@ -1618,4 +2086,13 @@ pub(crate) fn refusal(name: &ObjectName, reason: &str) -> Error {
          registers the function, write the call unqualified and declare the bare name with \
          with_user_defined_functions([\"{bare}\"])."
     ))
+}
+
+/// The refusal of `passed`, an argument list or argument other than a
+/// positional one, in a call to `name`.
+fn positional_only(name: &ObjectName, passed: &dyn core::fmt::Display) -> Error {
+    refusal(
+        name,
+        &format!("is passed {passed}, and only positional arguments bind to its parameters"),
+    )
 }

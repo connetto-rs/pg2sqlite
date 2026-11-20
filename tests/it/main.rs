@@ -286,6 +286,7 @@ mod test_session_variable_queries;
 mod test_set_expr_edge_cases;
 mod test_set_operations;
 mod test_set_returning_functions;
+mod test_set_returning_helper_rows;
 mod test_sqlite_keyword_identifiers;
 mod test_sqlitegis_types;
 mod test_sqlparser_ast_compatibility;

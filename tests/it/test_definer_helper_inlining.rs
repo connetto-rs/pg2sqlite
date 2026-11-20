@@ -350,14 +350,6 @@ fn a_helper_that_helper_set_refuses_is_refused_with_its_error() {
     let ordered = refusal(&read_policy("id IN (SELECT docs_with('write' ORDER BY 1))"), &options())
         .to_string();
     assert!(ordered.contains("not an aggregate function"), "{ordered}");
-    let read_in_from =
-        refusal(&read_policy("id IN (SELECT * FROM docs_as_invoker('write'))"), &options())
-            .to_string();
-    assert!(
-        read_in_from.contains("docs_as_invoker() cannot be translated")
-            && read_in_from.contains("is not SECURITY DEFINER"),
-        "{read_in_from}"
-    );
 }
 
 /// PostgreSQL refuses an alias naming more columns than a helper returns, and
