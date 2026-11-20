@@ -190,7 +190,7 @@ fn view_with_json_access_operator_arrow_text() {
     ";
     let output = translate(sql);
     assert!(
-        output.contains("pg_jsonb_text(payload -> 'author')"),
+        output.contains(r#"pg_jsonb_text(payload -> '$."author"')"#),
         "Expected the text function over the JSON access operator: {output}"
     );
     apply_translated_pg(sql);
