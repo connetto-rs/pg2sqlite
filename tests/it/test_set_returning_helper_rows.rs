@@ -62,8 +62,8 @@ fn a_body_of_two_statements_is_refused() {
 }
 
 /// SQLite reads the arguments only from a select's FROM list, so a body
-/// reading a parameter in a LIMIT or inside one of its FROM items has nowhere
-/// to read it from.
+/// reading a parameter in a LIMIT, a VALUES list or inside one of its FROM
+/// items has nowhere to read it from.
 #[test]
 fn a_parameter_the_selects_of_the_body_cannot_reach_is_refused() {
     let limited = refusal(
@@ -71,6 +71,15 @@ fn a_parameter_the_selects_of_the_body_cannot_reach_is_refused() {
         DEVIATING,
     );
     assert!(limited.contains("outside the SELECT lists"), "{limited}");
+    let values = refusal(
+        &deviations(
+            "STABLE",
+            "SELECT 'measured'::text FROM runs run WHERE run.id = checked_run_id \
+             UNION VALUES ((SELECT run.note FROM runs run WHERE run.id = checked_run_id))",
+        ),
+        DEVIATING,
+    );
+    assert!(values.contains("outside the SELECT lists"), "{values}");
     let derived = refusal(
         &deviations(
             "STABLE",
@@ -91,16 +100,63 @@ fn a_parameter_the_selects_of_the_body_cannot_reach_is_refused() {
     assert!(right.contains("joining RIGHT or FULL"), "{right}");
 }
 
-/// PostgreSQL reads a call beside another FROM item `LATERAL`, so `run.id`
-/// names the `run` beside it, which a derived table in SQLite cannot reach.
+/// PostgreSQL reads a call beside another FROM item `LATERAL`, written so or
+/// not, so `run.id` or `id` names the `run` beside it, which a derived table
+/// in SQLite cannot reach.
 #[test]
 fn a_call_passed_a_column_beside_another_from_item_is_refused() {
-    let error = refusal(
-        &deviations("STABLE", BODY),
+    for caller in [
         "CREATE VIEW deviations AS SELECT run.id, deviation.kind
            FROM runs run, run_deviations(run.id) AS deviation (kind);",
-    );
-    assert!(error.contains("run_deviations()") && error.contains("LATERAL"), "{error}");
+        "CREATE VIEW deviations AS SELECT run.id, deviation.kind
+           FROM runs run, LATERAL run_deviations(run.id) AS deviation (kind);",
+        "CREATE VIEW deviations AS SELECT runs.id, deviation.kind
+           FROM runs, run_deviations(id) AS deviation (kind);",
+    ] {
+        let error = refusal(&deviations("STABLE", BODY), caller);
+        assert!(
+            error.contains("run_deviations()") && error.contains("LATERAL"),
+            "{caller}\n{error}"
+        );
+    }
+}
+
+/// A `*` over a `USING` or `NATURAL` join reads one of each pair of joined
+/// columns, and a `*` over a FROM item without a name has no name to read
+/// it by, so neither keeps its columns once the arguments join the select.
+#[test]
+fn a_star_the_joined_arguments_would_change_is_refused() {
+    for body in [
+        "SELECT * FROM runs JOIN links USING (id) WHERE runs.id = checked_run_id",
+        "SELECT * FROM runs NATURAL JOIN links WHERE runs.id = checked_run_id",
+        "SELECT * FROM runs CROSS JOIN (links JOIN links other USING (run_id)) \
+         WHERE runs.id = checked_run_id",
+        "SELECT * FROM (SELECT run.note FROM runs run) WHERE note = checked_run_id::text",
+    ] {
+        let error = refusal(&deviations("STABLE", body), DEVIATING);
+        assert!(error.contains("USING or NATURAL join"), "{body}\n{error}");
+    }
+}
+
+/// Rows of a table's type or of a pseudo-type take the columns of a table
+/// or of the caller's column list, which the inliner does not read.
+#[test]
+fn rows_whose_columns_the_declaration_does_not_name_are_refused() {
+    for returned in ["SETOF runs", "SETOF record"] {
+        let helper = format!(
+            "CREATE FUNCTION run_rows(wanted INTEGER) RETURNS {returned} LANGUAGE sql STABLE \
+             AS $$ SELECT * FROM runs run WHERE run.id = wanted $$;"
+        );
+        let error = refusal(
+            &helper,
+            "CREATE VIEW linked AS SELECT link.id FROM links link
+               WHERE EXISTS (SELECT 1 FROM run_rows(link.run_id));",
+        );
+        assert!(
+            error.contains("run_rows()") && error.contains("does not name"),
+            "{returned}\n{error}"
+        );
+    }
 }
 
 /// PostgreSQL reads the FROM list of an `UPDATE` and the `USING` list of a

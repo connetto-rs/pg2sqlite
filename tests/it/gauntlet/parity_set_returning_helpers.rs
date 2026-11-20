@@ -170,3 +170,112 @@ fn a_trigger_passing_its_new_row_reads_the_helper_rows_it_filters() {
         ],
     );
 }
+
+/// Helpers whose bodies take the other shapes the inliner joins the
+/// arguments into, a `*` over an unnamed table, beside another item and over
+/// a parenthesised join, a union with a parenthesised arm and a VALUES arm,
+/// no parameter, and a `RETURN` body, each read by one column of a view.
+const SHAPES: &str = "
+CREATE TABLE runs (id INTEGER PRIMARY KEY, note TEXT);
+CREATE TABLE tags (run_id INTEGER, tag TEXT);
+
+CREATE FUNCTION run_tags(wanted INTEGER) RETURNS TABLE (run_id INTEGER, tag TEXT)
+LANGUAGE sql STABLE AS $$ SELECT * FROM tags WHERE tags.run_id = wanted $$;
+
+CREATE FUNCTION marked_tags(wanted INTEGER) RETURNS TABLE (run_id INTEGER, tag TEXT, mark TEXT)
+LANGUAGE sql STABLE AS $$ SELECT *, '!'::text FROM tags tag WHERE tag.run_id = wanted $$;
+
+CREATE FUNCTION noted_tags(wanted INTEGER)
+  RETURNS TABLE (id INTEGER, note TEXT, run_id INTEGER, tag TEXT)
+LANGUAGE sql STABLE AS $$
+SELECT * FROM (runs run JOIN tags tag ON tag.run_id = run.id) WHERE run.id = wanted
+$$;
+
+CREATE FUNCTION run_labels(wanted INTEGER) RETURNS SETOF TEXT
+LANGUAGE sql STABLE AS $$
+SELECT tag.tag FROM tags tag WHERE tag.run_id = wanted
+UNION (SELECT run.note FROM runs run WHERE run.id = wanted)
+UNION VALUES ('any'::text)
+$$;
+
+CREATE FUNCTION tagged_runs() RETURNS SETOF INTEGER
+LANGUAGE sql STABLE AS $$ SELECT DISTINCT tag.run_id FROM tags tag $$;
+
+CREATE FUNCTION following_run(wanted INTEGER) RETURNS SETOF INTEGER
+LANGUAGE sql STABLE RETURN wanted + 1;
+
+CREATE VIEW run_shapes AS SELECT run.id,
+  (SELECT string_agg(found.tag, ',' ORDER BY found.tag) FROM run_tags(run.id) AS found) AS tags,
+  (SELECT string_agg(found.tag || found.mark, ',' ORDER BY found.tag)
+     FROM marked_tags(run.id) AS found) AS marked,
+  (SELECT string_agg(found.note || ':' || found.tag, ',' ORDER BY found.tag)
+     FROM noted_tags(run.id) AS found) AS noted,
+  (SELECT string_agg(found.label, ',' ORDER BY found.label)
+     FROM run_labels(run.id) AS found (label)) AS labels,
+  (SELECT count(*) FROM tagged_runs() AS tagged (run_id) WHERE tagged.run_id = run.id) AS tagged,
+  (SELECT min(following.id) FROM following_run(run.id) AS following (id)) AS following
+FROM runs run;
+";
+
+/// The rows both engines hold before the view is read.
+const SHAPE_ROWS: &str = "
+INSERT INTO runs VALUES (1, 'cold'), (2, 'warm'), (3, NULL);
+INSERT INTO tags VALUES (1, 'b'), (1, 'a'), (2, 'c');
+";
+
+diesel::table! {
+    run_shapes (id) {
+        id -> Integer,
+        tags -> Nullable<Text>,
+        marked -> Nullable<Text>,
+        noted -> Nullable<Text>,
+        labels -> Nullable<Text>,
+        tagged -> BigInt,
+        following -> Nullable<Integer>,
+    }
+}
+
+/// One row of `run_shapes`.
+type Shapes =
+    (i32, Option<String>, Option<String>, Option<String>, Option<String>, i64, Option<i32>);
+
+/// Translated without a deployment, where a call runs with every privilege.
+#[test]
+fn each_body_shape_answers_the_rows_postgresql_answers() {
+    let script = Pg2Sqlite::default()
+        .sql(SHAPES)
+        .expect("parse")
+        .translate_to_sql(&Pg2SqliteOptions::default())
+        .unwrap_or_else(|error| panic!("the schema should translate: {error}"));
+    let mut replica = SqliteConnection::establish(":memory:").expect("open SQLite");
+    for statement in script.into_vec() {
+        replica.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
+    }
+    let mut postgres = fresh_database();
+    apply(&mut postgres, SHAPES).expect("apply the schema on PostgreSQL");
+    postgres.batch_execute(SHAPE_ROWS).expect("seed PostgreSQL");
+    replica.batch_execute(SHAPE_ROWS).expect("seed the replica");
+    let on_postgres: Vec<Shapes> =
+        run_shapes::table.order(run_shapes::id).load(&mut postgres).expect("read on PostgreSQL");
+    let text = |value: &str| Some(value.to_owned());
+    assert_eq!(
+        on_postgres,
+        [
+            (
+                1,
+                text("a,b"),
+                text("a!,b!"),
+                text("cold:a,cold:b"),
+                text("a,any,b,cold"),
+                1,
+                Some(2)
+            ),
+            (2, text("c"), text("c!"), text("warm:c"), text("any,c,warm"), 1, Some(3)),
+            (3, None, None, None, text("any"), 0, Some(4)),
+        ],
+        "PostgreSQL disagrees with the expectation"
+    );
+    let on_replica: Vec<Shapes> =
+        run_shapes::table.order(run_shapes::id).load(&mut replica).expect("read on the replica");
+    assert_eq!(on_replica, on_postgres, "the replica disagrees with PostgreSQL");
+}

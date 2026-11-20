@@ -211,16 +211,12 @@ pub(crate) fn check_lateral_calls(
             _ => continue,
         };
         let reads_column = visit_expressions(arguments, |expr| {
-            let (first, field) = match expr {
-                Expr::Identifier(ident) => (ident, false),
-                Expr::CompoundIdentifier(parts) => {
-                    match parts.first() {
-                        Some(first) => (first, true),
-                        None => return ControlFlow::Continue(()),
-                    }
-                }
-                _ => return ControlFlow::Continue(()),
+            let read = match expr {
+                Expr::Identifier(ident) => Some((ident, false)),
+                Expr::CompoundIdentifier(parts) => parts.first().map(|first| (first, true)),
+                _ => None,
             };
+            let Some((first, field)) = read else { return ControlFlow::Continue(()) };
             let outside = options.is_variable(&first.value)
                 || (field && options.trigger_row(&Expr::Identifier(first.clone())).is_some());
             if outside { ControlFlow::Continue(()) } else { ControlFlow::Break(()) }
