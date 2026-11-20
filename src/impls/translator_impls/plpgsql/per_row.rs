@@ -18,7 +18,7 @@ use sqlparser_plpgsql::embedded::{DeclaredType, Loop, LoopControl, Node, NodeKin
 
 use super::{
     callee::refuse_skippable_calls,
-    scope::{Binding, BodyScope, BoundValue, fold},
+    scope::{Binding, BodyScope, BoundValue, RowValue, fold},
     translator::{FOUND, PlPgSqlTranslator, procedural, written_relations},
 };
 #[cfg(not(feature = "std"))]
@@ -36,19 +36,24 @@ fn column(index: usize) -> Ident {
     Ident::new(format!("{ROWS}_{index}"))
 }
 
-/// Whether a variable declared as `declared` holds a whole row, a `RECORD`,
-/// a `%ROWTYPE` or the row type of a table or view.
-pub(super) fn holds_row(declared: &DeclaredType, schema: &ParserDB) -> bool {
+/// The row a variable declared as `declared` holds before any assignment,
+/// `None` for a scalar.
+pub(super) fn unassigned_row(declared: &DeclaredType, schema: &ParserDB) -> Option<RowValue> {
     match declared {
-        DeclaredType::RowType { .. } => true,
+        DeclaredType::RowType { .. } => Some(RowValue::Null),
         DeclaredType::Data(DataType::Custom(name, _)) => {
-            let Some(ident) = crate::impls::object_name::last_ident(name) else { return false };
-            let name = fold(ident);
-            name == "record"
-                || schema.tables().any(|table| table.table_name() == name)
+            let name = fold(crate::impls::object_name::last_ident(name)?);
+            if name == "record" {
+                Some(RowValue::Unassigned)
+            } else if schema.tables().any(|table| table.table_name() == name)
                 || schema.views().any(|view| view.stored_view_name() == name.as_str())
+            {
+                Some(RowValue::Null)
+            } else {
+                None
+            }
         }
-        DeclaredType::Data(_) | DeclaredType::ColumnType { .. } => false,
+        DeclaredType::Data(_) | DeclaredType::ColumnType { .. } => None,
     }
 }
 
