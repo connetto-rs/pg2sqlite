@@ -91,7 +91,8 @@ pub enum TranslationWarning {
         column: String,
     },
     /// A trigger, a write statement of a trigger, or a foreign key left out
-    /// of the replica because the server derives the rows it writes, under
+    /// of the replica because the server derives the rows it writes or, for
+    /// a foreign key, the rows it references, under
     /// [`Pg2SqliteOptions::with_server_derived_writes_omitted`](crate::options::Pg2SqliteOptions::with_server_derived_writes_omitted).
     ///
     /// The replica writes none of those rows, so a write the application makes

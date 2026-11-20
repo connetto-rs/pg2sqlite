@@ -25,12 +25,15 @@ use core::{fmt::Write as _, ops::ControlFlow};
 
 pub(crate) use chain::without_removed_writes;
 pub(crate) use firing::{FiringTrigger, firing_triggers};
-use sql_traits::{structs::ParserDB, traits::FunctionLike};
+use sql_traits::{
+    structs::ParserDB,
+    traits::{ColumnLike, DatabaseLike, FunctionLike, TableLike},
+};
 use sqlparser::{
     ast::{
-        ColumnDef, ColumnOption, CreateFunction, CreateTrigger, ForeignKeyConstraint, Ident, Merge,
-        ObjectName, ReferentialAction, Statement, TableFactor, TriggerEvent, TriggerObject,
-        TriggerObjectKind, TriggerPeriod, Visit, Visitor,
+        AssignmentTarget, ColumnDef, ColumnOption, CreateFunction, CreateTrigger, Expr,
+        ForeignKeyConstraint, Ident, Merge, ObjectName, ReferentialAction, Statement, TableFactor,
+        TriggerEvent, TriggerObject, TriggerObjectKind, TriggerPeriod, Visit, Visitor,
     },
     dialect::PostgreSqlDialect,
     parser::Parser,
@@ -73,6 +76,58 @@ impl Event {
     }
 }
 
+/// The columns of its table, folded, to which a write may give a value no
+/// row held before.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Fresh {
+    /// Any column, as a row an `INSERT` or a `MERGE` adds.
+    Every,
+    /// These columns, as an `UPDATE` sets them to anything but themselves.
+    /// None for a `DELETE` or a `TRUNCATE`.
+    Columns(Vec<String>),
+}
+
+impl Fresh {
+    /// The columns `statement` may give new values, run where `variables`
+    /// are the names its function may read as variables, which a bare name
+    /// on the right of an assignment may stand for instead of the column.
+    fn of(statement: &Statement, variables: &[String]) -> Self {
+        match statement {
+            Statement::Update(update) => {
+                let mut columns = Vec::new();
+                for assignment in &update.assignments {
+                    let targets = match &assignment.target {
+                        AssignmentTarget::ColumnName(column) => core::slice::from_ref(column),
+                        AssignmentTarget::Tuple(columns) => columns.as_slice(),
+                    };
+                    for column in targets.iter().filter_map(last_ident) {
+                        let itself = matches!(
+                            &assignment.value,
+                            Expr::Identifier(value)
+                                if fold(value) == fold(column) && !variables.contains(&fold(value))
+                        );
+                        if !itself {
+                            columns.push(fold(column));
+                        }
+                    }
+                }
+                Self::Columns(columns)
+            }
+            Statement::Delete(_) | Statement::Truncate(_) => Self::Columns(Vec::new()),
+            _ => Self::Every,
+        }
+    }
+
+    /// Whether the write may give a row of its table one of the `columns`,
+    /// folded, a value no row held before.
+    fn reaches(&self, columns: &[String]) -> bool {
+        match self {
+            Self::Every => true,
+            Self::Columns(fresh) => fresh.iter().any(|column| columns.contains(column)),
+        }
+    }
+}
+
 /// A statement that writes rows, and the chain of functions that reaches it,
 /// the trigger's own function first.
 pub(crate) struct DerivedWrite {
@@ -84,6 +139,8 @@ pub(crate) struct DerivedWrite {
     relation: String,
     /// The rows of the table it writes.
     rows: rows::Rows,
+    /// The columns it may give new values.
+    fresh: Fresh,
 }
 
 impl DerivedWrite {
@@ -177,6 +234,7 @@ impl Visitor for Writes<'_> {
                 table: last_ident_value_or_display(target),
                 relation: last_ident(target).map_or_else(|| target.to_string(), fold),
                 rows: rows::written(statement, self.reach.variables),
+                fresh: Fresh::of(statement, self.reach.variables),
             });
         }
         ControlFlow::Continue(())
@@ -481,18 +539,128 @@ fn action_writes_rows(action: Option<ReferentialAction>) -> Option<ReferentialAc
     })
 }
 
+/// The rows the server writes, and the replica does not, when it applies an
+/// insert or an update firing a trigger whose writes the replica leaves out.
+#[derive(Clone, Debug)]
+pub(crate) struct ServerRows {
+    /// The trigger, its last name part as written.
+    trigger: String,
+    /// The trigger's name and the table it fires on, folded.
+    fired: (String, String),
+    /// Each table the rows go into, folded, with the columns of those rows
+    /// that may hold values no row held before.
+    written: Vec<(String, Fresh)>,
+}
+
+impl ServerRows {
+    /// The rows the server writes for `trigger`: those its function writes,
+    /// and those its writes set off in turn. `None` when it fires on neither
+    /// an insert nor an update, or writes no row a key could reference.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the function or a trigger set off cannot be read.
+    pub(crate) fn of(
+        trigger: &CreateTrigger,
+        schema: &ParserDB,
+        options: &TranslationContext<'_>,
+    ) -> Result<Option<Self>, Error> {
+        let checked = trigger
+            .events
+            .iter()
+            .any(|event| matches!(Event::of(event), Event::Insert | Event::Update));
+        let (Some(fired), Some(exec_body), true) = (fired(trigger), &trigger.exec_body, checked)
+        else {
+            return Ok(None);
+        };
+        let Some(function) = written_function(schema, &exec_body.func_desc.name)? else {
+            return Ok(None);
+        };
+        let mut writes = Vec::new();
+        function_writes(function, schema, &mut Vec::new(), &mut Vec::new(), &mut writes)?;
+        let written: Vec<(String, Fresh)> = firing::with_set_off(writes, schema, options)?
+            .into_iter()
+            .filter(|write| write.fresh != Fresh::Columns(Vec::new()))
+            .map(|write| (write.relation, write.fresh))
+            .collect();
+        Ok((!written.is_empty())
+            .then(|| Self { trigger: last_ident_value_or_display(&trigger.name), fired, written }))
+    }
+
+    /// The trigger's name and the table it fires on, folded.
+    pub(crate) const fn fired(&self) -> &(String, String) {
+        &self.fired
+    }
+}
+
+/// The trigger's name and the table it fires on, folded.
+pub(crate) fn fired(trigger: &CreateTrigger) -> Option<(String, String)> {
+    Some((fold(last_ident(&trigger.name)?), fold(last_ident(&trigger.table_name)?)))
+}
+
+/// The trigger on `table` that leaves to the server the rows `key` references,
+/// as [`ServerRows`] holds them, or `None` when none does. A key naming no
+/// columns references the primary key of its table.
+fn referenced_rows_left_to_server<'o>(
+    key: &ForeignKeyConstraint,
+    table: &ObjectName,
+    schema: &ParserDB,
+    options: &'o TranslationContext<'_>,
+) -> Result<Option<&'o str>, Error> {
+    let (Some(host), Some(referenced)) =
+        (last_ident(table).map(fold), last_ident(&key.foreign_table).map(fold))
+    else {
+        return Ok(None);
+    };
+    let mut triggers = options
+        .server_rows()
+        .iter()
+        .filter(|rows| {
+            rows.fired.1 == host && rows.written.iter().any(|(relation, _)| *relation == referenced)
+        })
+        .peekable();
+    if triggers.peek().is_none() {
+        return Ok(None);
+    }
+    let columns: Vec<String> = if key.referred_columns.is_empty() {
+        match schema.tables().find(|declared| declared.stored_table_name() == referenced) {
+            Some(declared) => {
+                declared
+                    .primary_key_columns(schema)?
+                    .map(|column| column.column_name().to_owned())
+                    .collect()
+            }
+            None => Vec::new(),
+        }
+    } else {
+        key.referred_columns.iter().map(fold).collect()
+    };
+    Ok(triggers
+        .find(|rows| {
+            rows.written
+                .iter()
+                .any(|(relation, fresh)| *relation == referenced && fresh.reaches(&columns))
+        })
+        .map(|rows| rows.trigger.as_str()))
+}
+
 /// Reports and answers `true` when the replica leaves out `key`, declared on
 /// `table` over `columns` and named `name`, because one of its actions writes
-/// child rows the server writes itself. A key into a table left off the
-/// replica answers `false`, since it leaves with that table unreported.
+/// child rows the server writes itself, or because the rows it references
+/// come from a trigger on `table` whose writes the replica leaves to the
+/// server. A key into a table left off the replica answers `false`, since it
+/// leaves with that table unreported.
 ///
 /// The key goes whole. Kept as `NO ACTION` it would refuse an offline delete
 /// of a parent whose children the server removes, which the replica still
-/// holds until the server's changes reach it.
+/// holds until the server's changes reach it. Kept beside a trigger left to
+/// the server, it would refuse every write of `table` the trigger lets
+/// PostgreSQL accept, since the replica never holds the row it references.
 ///
 /// # Errors
 ///
-/// Fails as [`OffReplica::of`] does.
+/// Fails as [`OffReplica::of`] does, and when the primary key of the table
+/// `key` references cannot be read.
 pub(crate) fn foreign_key_left_to_server(
     key: &ForeignKeyConstraint,
     name: Option<&Ident>,
@@ -512,29 +680,37 @@ pub(crate) fn foreign_key_left_to_server(
     .into_iter()
     .filter_map(|(clause, action)| action.map(|action| format!("{clause} {action}")))
     .collect();
-    if actions.is_empty() || OffReplica::of(&key.foreign_table, schema, options)?.is_some() {
+    let referenced = last_ident_value_or_display(&key.foreign_table);
+    let reason = if actions.is_empty() {
+        let Some(trigger) = referenced_rows_left_to_server(key, table, schema, options)? else {
+            return Ok(false);
+        };
+        format!(
+            "the {referenced} rows it references come from TRIGGER {trigger}, whose writes the \
+             server runs when it applies the upload"
+        )
+    } else {
+        let verb = if actions.len() == 1 { "writes" } else { "write" };
+        format!(
+            "its {} {verb} rows the server writes itself when it applies the upload",
+            actions.join(" and ")
+        )
+    };
+    if OffReplica::of(&key.foreign_table, schema, options)?.is_some() {
         return Ok(false);
     }
     let name = name.or(key.name.as_ref()).map_or_else(
         || {
             let columns: Vec<&str> = columns.iter().map(|column| column.value.as_str()).collect();
-            format!(
-                "({}) REFERENCES {}",
-                columns.join(", "),
-                last_ident_value_or_display(&key.foreign_table)
-            )
+            format!("({}) REFERENCES {referenced}", columns.join(", "))
         },
         |name| name.value.clone(),
     );
-    let verb = if actions.len() == 1 { "writes" } else { "write" };
     emit(TranslationWarning::LeftToServer {
         construct: "FOREIGN KEY".to_owned(),
         name,
         table: last_ident_value_or_display(table),
-        reason: format!(
-            "its {} {verb} rows the server writes itself when it applies the upload",
-            actions.join(" and ")
-        ),
+        reason,
     });
     Ok(true)
 }

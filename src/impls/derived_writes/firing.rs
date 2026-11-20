@@ -97,6 +97,12 @@ impl FiringTrigger {
         self.events.contains(&event)
     }
 
+    /// Whether the trigger is `fired`, a folded trigger name and the folded
+    /// table it fires on.
+    pub(crate) fn is(&self, fired: &(String, String)) -> bool {
+        (self.name.as_str(), self.table.as_str()) == (fired.0.as_str(), fired.1.as_str())
+    }
+
     /// Whether the trigger fires before `other` on a write firing both.
     fn fires_before(&self, other: &Self) -> bool {
         (self.rank, self.name.as_str()) < (other.rank, other.name.as_str())
@@ -291,6 +297,38 @@ impl Firing<'_> {
         Ok(())
     }
 
+    /// Adds to `writes` every write the server runs when it applies a write
+    /// of `event` on `table`, through the triggers it fires and the foreign
+    /// key actions it runs, and through what their writes set off in turn.
+    /// `visited` holds the writes already followed.
+    fn writes_set_off(
+        &self,
+        table: &str,
+        event: Event,
+        writes: &mut Vec<DerivedWrite>,
+        visited: &mut BTreeSet<(String, Event)>,
+    ) -> Result<(), Error> {
+        if !visited.insert((table.to_owned(), event)) {
+            return Ok(());
+        }
+        for trigger in self.triggers {
+            if trigger.table == table && trigger.fires_on(event) {
+                for write in trigger.writes(self.schema)? {
+                    if let Some(relation) = &write.relation {
+                        for &set_off in write.events() {
+                            self.writes_set_off(relation, set_off, writes, visited)?;
+                        }
+                    }
+                    writes.push(write);
+                }
+            }
+        }
+        for (child, set_off, _) in self.key_actions(table, event)? {
+            self.writes_set_off(&child, set_off, writes, visited)?;
+        }
+        Ok(())
+    }
+
     /// The first read among `steps` of rows the server writes into a table
     /// in `written`. A read by the trigger's own function reads `NEW` and
     /// `OLD` as rows of `record`.
@@ -376,6 +414,32 @@ pub(super) fn own_dependency(
         }
     }
     Ok(None)
+}
+
+/// `writes`, a trigger's own, and every write they set off on the server:
+/// those of the triggers they fire, and so on through what those and the
+/// foreign key actions they run set off.
+///
+/// # Errors
+///
+/// Fails when a trigger set off cannot be read.
+pub(super) fn with_set_off(
+    writes: Vec<DerivedWrite>,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<Vec<DerivedWrite>, Error> {
+    let firing = Firing { schema, triggers: options.firing_triggers() };
+    let mut all = Vec::new();
+    let mut visited = BTreeSet::new();
+    for write in writes {
+        if let Some(relation) = &write.relation {
+            for &event in write.events() {
+                firing.writes_set_off(relation, event, &mut all, &mut visited)?;
+            }
+        }
+        all.push(write);
+    }
+    Ok(all)
 }
 
 /// Why a statement `trigger` keeps reads what the server writes before it
