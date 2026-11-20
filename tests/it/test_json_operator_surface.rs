@@ -101,14 +101,46 @@ fn a_document_concatenated_with_text_is_text() {
 
 #[test]
 fn a_numeric_path_element_is_refused_rather_than_answered_wrongly() {
-    // `#-` answered the document unchanged and extract_path answered NULL,
-    // because a numeric element was written as a key rather than an index,
-    // and PostgreSQL decides which it is from the container at run time.
+    // `#-` answered the document unchanged, because a numeric element was
+    // written as a key rather than an index, and PostgreSQL decides which it
+    // is from the container at run time.
     let removal = refusal("SELECT '[1,2,3]'::jsonb #- '{1}';");
     assert!(removal.contains('1'), "{removal}");
     assert!(removal.to_lowercase().contains("array"), "{removal}");
-    let extraction = refusal("SELECT jsonb_extract_path('[1,2,3]'::jsonb, '0');");
-    assert!(extraction.to_lowercase().contains("array"), "{extraction}");
+}
+
+#[test]
+fn a_numeric_extract_path_element_reads_an_array_or_an_object() {
+    // PostgreSQL 18.7: 2 and "z".
+    assert_eq!(
+        script("SELECT jsonb_extract_path('[1,2,3]'::jsonb, '1')::text;"),
+        vec![Some("2".to_string())]
+    );
+    assert_eq!(
+        script(r#"SELECT jsonb_extract_path('{"1":"z"}'::jsonb, '1')::text;"#),
+        vec![Some(r#""z""#.to_string())]
+    );
+    // The element is read both ways, so a document that may answer
+    // differently on a second reading is refused.
+    let refused = refusal("SELECT jsonb_extract_path(jsonb_build_array(random()), '0');");
+    assert!(refused.contains("jsonb_extract_path"), "{refused}");
+    assert!(refused.contains("random()"), "{refused}");
+}
+
+#[test]
+fn a_nested_json_value_loses_its_whitespace_as_the_arrow_does() {
+    // PostgreSQL 18.7 keeps the spelling `json` was written in and answers
+    // {"b" : [1,  2]} for both. SQLite's arrows answer the minified document,
+    // which is the divergence the README names.
+    let document = r#"CREATE TABLE jw (j json);
+        INSERT INTO jw VALUES ('{"a": {"b" : [1,  2]}}');"#;
+    for expression in ["json_extract_path(j, 'a')", "j -> 'a'"] {
+        assert_eq!(
+            script(&format!("{document} SELECT {expression} FROM jw;")),
+            vec![Some(r#"{"b":[1,2]}"#.to_string())],
+            "{expression}"
+        );
+    }
 }
 
 #[test]
