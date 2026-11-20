@@ -5,10 +5,14 @@ use sql_traits::{
     structs::ParserDB,
     traits::{ColumnLike, TableLike},
 };
-use sqlparser::ast::{
-    BinaryOperator, CreateIndex, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
-    Ident, IndexColumn, IndexType, ObjectName, ObjectNamePart, SetExpr, Statement, TriggerEvent,
-    TriggerPeriod, Value, VisitMut, VisitorMut,
+use sqlparser::{
+    ast::{
+        BinaryOperator, CreateIndex, Expr, Function, FunctionArg, FunctionArgExpr,
+        FunctionArguments, Ident, IndexColumn, IndexType, ObjectName, ObjectNamePart, SetExpr,
+        Statement, TriggerEvent, TriggerPeriod, Value, VirtualTableModuleArgument, VisitMut,
+        VisitorMut,
+    },
+    tokenizer::Span,
 };
 
 #[cfg(not(feature = "std"))]
@@ -176,11 +180,14 @@ fn create_fts5_virtual_table(
     let fts_name =
         ObjectName(vec![ObjectNamePart::Identifier(quoted_ident(&fts_table_name(base_name)))]);
 
-    // Column names followed by external content mode options (unquoted, as
-    // SQLite parses FTS5 module args as plain strings).
-    let mut module_args: Vec<Ident> = columns.iter().map(|c| quoted_ident(c)).collect();
-    module_args.push(Ident::new(format!("content={content_table}")));
-    module_args.push(Ident::new(format!("content_rowid={pk_column}")));
+    // Column names followed by external content mode options, each written
+    // as FTS5 reads it.
+    let module_args = columns
+        .iter()
+        .map(|column| quoted_ident(column).to_string())
+        .chain([format!("content={content_table}"), format!("content_rowid={pk_column}")])
+        .map(|value| VirtualTableModuleArgument { value, span: Span::empty() })
+        .collect();
 
     Statement::CreateVirtualTable {
         name: fts_name,

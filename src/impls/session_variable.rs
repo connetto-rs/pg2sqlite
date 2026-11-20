@@ -84,6 +84,7 @@ pub(crate) fn session_read_of(name: &str, args: &FunctionArguments) -> Option<Se
     let keyword = matches!(args, FunctionArguments::None);
     match name {
         "current_user" if keyword => Some(SessionRead::ActingRole("current_user")),
+        "current_role" if keyword => Some(SessionRead::ActingRole("current_role")),
         "user" if keyword => Some(SessionRead::ActingRole("user")),
         "session_user" if keyword => Some(SessionRead::LoginRole),
         "current_setting" => {
@@ -106,18 +107,10 @@ pub(crate) fn session_read_of_function(func: &Function) -> Option<SessionRead> {
 }
 
 /// What `expr` reads of the session.
-///
-/// sqlparser reads `current_role` as an identifier, and PostgreSQL reserves
-/// the word, so only a quoted one names a column.
 #[must_use]
 pub(crate) fn session_read(expr: &Expr) -> Option<SessionRead> {
     match expr {
         Expr::Function(func) => session_read_of_function(func),
-        Expr::Identifier(ident)
-            if ident.quote_style.is_none() && ident.value.eq_ignore_ascii_case("current_role") =>
-        {
-            Some(SessionRead::ActingRole("current_role"))
-        }
         _ => None,
     }
 }
