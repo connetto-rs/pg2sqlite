@@ -15,8 +15,8 @@ use sql_traits::{
 };
 use sqlparser::ast::{
     Assignment, AssignmentTarget, ConflictTarget, Expr, FunctionArg, FunctionArguments, Ident,
-    Insert, OnConflictAction, OnInsert, Statement, TableAlias, TableFactor, TableObject, Visit,
-    Visitor, visit_expressions,
+    Insert, OnConflictAction, OnInsert, Select, Statement, TableAlias, TableFactor, TableObject,
+    TableWithJoins, Visit, Visitor, visit_expressions,
 };
 use sqlstate::{SqlState, pg};
 
@@ -205,14 +205,14 @@ fn resolve<'c>(
                 parts.last().map_or_else(String::new, |ident| ident.value.clone()),
             ))
         }
-        Ok(None) => unbound(parts, relations).map(|()| Reference::Other),
+        Ok(None) => unbound(expression, parts, relations).map(|()| Reference::Other),
         Err(error) => Err(error.into()),
     }
 }
 
-/// What PostgreSQL answers for the name `parts`, which no column in scope
-/// holds.
-fn unbound(parts: &[Ident], relations: &Relations) -> Result<(), Error> {
+/// What PostgreSQL answers for the name `parts` of `expression`, which no
+/// column in scope holds.
+fn unbound(expression: &Expr, parts: &[Ident], relations: &Relations) -> Result<(), Error> {
     match parts {
         [ident]
             if ident.quote_style.is_none()
@@ -226,6 +226,12 @@ fn unbound(parts: &[Ident], relations: &Relations) -> Result<(), Error> {
         // A whole-row reference.
         [ident] if relations.exposes(ident) => Ok(()),
         [ident] => Err(undefined_column(&ident.value)),
+        [.., qualifier, _] if relations.hidden.contains(&ptr::from_ref(expression).addr()) => {
+            Err(postgres(
+                pg::UNDEFINED_TABLE,
+                format!("invalid reference to FROM-clause entry for table \"{}\"", qualifier.value),
+            ))
+        }
         [.., qualifier, _] if !relations.exposes(qualifier) => {
             Err(postgres(
                 pg::UNDEFINED_TABLE,
@@ -460,12 +466,23 @@ struct Relations {
     /// Copied, since the visitor lends each node to its callback alone.
     names: Vec<Ident>,
     argument_names: Vec<usize>,
+    /// The `FROM` items of each enclosing query level, innermost last, with
+    /// how many non-`LATERAL` derived tables of that level are being visited.
+    levels: Vec<(Vec<Ident>, usize)>,
+    /// Qualified references whose qualifier names a `FROM` item of an
+    /// enclosing level that a non-`LATERAL` derived table cannot see.
+    hidden: Vec<usize>,
 }
 
 impl Relations {
     fn of(statement: &Statement) -> Self {
-        let mut relations =
-            Self { factors: Vec::new(), names: Vec::new(), argument_names: Vec::new() };
+        let mut relations = Self {
+            factors: Vec::new(),
+            names: Vec::new(),
+            argument_names: Vec::new(),
+            levels: Vec::new(),
+            hidden: Vec::new(),
+        };
         if let Statement::Insert(Insert {
             table: TableObject::TableName(name), table_alias, ..
         }) = statement
@@ -478,14 +495,7 @@ impl Relations {
     }
 
     fn exposes(&self, name: &Ident) -> bool {
-        self.names.iter().any(|exposed| {
-            identifiers_match(
-                &exposed.value,
-                exposed.quote_style.is_some(),
-                &name.value,
-                name.quote_style.is_some(),
-            )
-        })
+        holds(&self.names, name)
     }
 
     /// Whether `binding` reads `table` itself rather than through a view or a
@@ -505,6 +515,28 @@ impl Relations {
         let TableFactor::Table { name, .. } = factor else { return Ok(false) };
         Ok(resolve_translation_table(schema, name)?.is_some_and(|named| ptr::eq(named, table)))
     }
+
+    /// Whether `qualifier` names a `FROM` item of the nearest level holding
+    /// it that a non-`LATERAL` derived table being visited cannot see.
+    fn hides(&self, qualifier: &Ident) -> bool {
+        self.levels
+            .iter()
+            .rev()
+            .find_map(|(level, hiding)| holds(level, qualifier).then_some(*hiding > 0))
+            == Some(true)
+    }
+}
+
+/// Whether `names` holds a name `name` reaches.
+fn holds(names: &[Ident], name: &Ident) -> bool {
+    names.iter().any(|held| {
+        identifiers_match(
+            &held.value,
+            held.quote_style.is_some(),
+            &name.value,
+            name.quote_style.is_some(),
+        )
+    })
 }
 
 impl Visitor for Relations {
@@ -512,27 +544,45 @@ impl Visitor for Relations {
 
     fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
         self.factors.push(ptr::from_ref(factor).addr());
-        let alias = match factor {
-            TableFactor::Table { alias, .. }
-            | TableFactor::Derived { alias, .. }
-            | TableFactor::Function { alias, .. }
-            | TableFactor::UNNEST { alias, .. }
-            | TableFactor::TableFunction { alias, .. }
-            | TableFactor::NestedJoin { alias, .. } => alias.as_ref(),
-            _ => None,
-        };
-        let exposed = match (alias, factor) {
-            (Some(TableAlias { name, .. }), _) => Some(name),
-            (None, TableFactor::Table { name, .. } | TableFactor::Function { name, .. }) => {
-                last_ident(name)
-            }
-            (None, _) => None,
-        };
-        self.names.extend(exposed.cloned());
+        self.names.extend(exposed_name(factor).cloned());
+        if let TableFactor::Derived { lateral: false, .. } = factor
+            && let Some((_, hiding)) = self.levels.last_mut()
+        {
+            *hiding += 1;
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
+        if let TableFactor::Derived { lateral: false, .. } = factor
+            && let Some((_, hiding)) = self.levels.last_mut()
+        {
+            *hiding -= 1;
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_select(&mut self, select: &Select) -> ControlFlow<Self::Break> {
+        let mut names = Vec::new();
+        for from in &select.from {
+            from_names(from, &mut names);
+        }
+        self.levels.push((names, 0));
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_select(&mut self, _select: &Select) -> ControlFlow<Self::Break> {
+        self.levels.pop();
         ControlFlow::Continue(())
     }
 
     fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<Self::Break> {
+        if let Expr::CompoundIdentifier(parts) = expression
+            && let [.., qualifier, _] = parts.as_slice()
+            && self.hides(qualifier)
+        {
+            self.hidden.push(ptr::from_ref(expression).addr());
+        }
         if let Expr::Function(function) = expression
             && let FunctionArguments::List(list) = &function.args
         {
@@ -543,5 +593,37 @@ impl Visitor for Relations {
             }
         }
         ControlFlow::Continue(())
+    }
+}
+
+/// The name `factor` exposes, its alias or its own name.
+fn exposed_name(factor: &TableFactor) -> Option<&Ident> {
+    let alias = match factor {
+        TableFactor::Table { alias, .. }
+        | TableFactor::Derived { alias, .. }
+        | TableFactor::Function { alias, .. }
+        | TableFactor::UNNEST { alias, .. }
+        | TableFactor::TableFunction { alias, .. }
+        | TableFactor::NestedJoin { alias, .. } => alias.as_ref(),
+        _ => None,
+    };
+    match (alias, factor) {
+        (Some(TableAlias { name, .. }), _) => Some(name),
+        (None, TableFactor::Table { name, .. } | TableFactor::Function { name, .. }) => {
+            last_ident(name)
+        }
+        (None, _) => None,
+    }
+}
+
+/// Appends the names the items of `from` expose.
+fn from_names(from: &TableWithJoins, names: &mut Vec<Ident>) {
+    for factor in
+        core::iter::once(&from.relation).chain(from.joins.iter().map(|join| &join.relation))
+    {
+        names.extend(exposed_name(factor).cloned());
+        if let TableFactor::NestedJoin { table_with_joins, .. } = factor {
+            from_names(table_with_joins, names);
+        }
     }
 }

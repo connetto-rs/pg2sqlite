@@ -195,6 +195,23 @@ fn a_column_no_relation_holds_does_not_exist() {
     );
 }
 
+/// A derived table without `LATERAL` sees none of the `FROM` items beside it.
+#[test]
+fn a_derived_table_without_lateral_does_not_see_its_siblings() {
+    assert_refused(
+        r#"SELECT * FROM docs d, (SELECT "id") s"#,
+        pg::UNDEFINED_COLUMN,
+        r#"column "id" does not exist"#,
+    );
+    assert_refused(
+        "SELECT * FROM docs d, (SELECT d.id) s",
+        pg::UNDEFINED_TABLE,
+        r#"invalid reference to FROM-clause entry for table "d""#,
+    );
+    let lateral = refusal(r#"SELECT * FROM docs d, LATERAL (SELECT d."id") s"#, &as_app());
+    assert!(lateral.postgres_error().is_none(), "LATERAL sees d, {lateral}");
+}
+
 /// Without an acting role every column is readable, and a name no relation
 /// holds is refused all the same.
 #[test]
