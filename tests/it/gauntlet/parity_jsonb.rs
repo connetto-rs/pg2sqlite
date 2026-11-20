@@ -735,3 +735,28 @@ fn path_writes_fail_where_postgresql_fails() {
         &["SELECT id::text || ' ' || coalesce(body::text, 'NULL') AS value FROM docs ORDER BY id"],
     );
 }
+
+/// `jsonb_set` and `jsonb_insert` answer an object or array unchanged at the
+/// empty path and refuse a scalar there, and answer NULL for a NULL value
+/// before looking at the document, where SQLite would write a JSON null.
+#[test]
+fn path_writes_take_the_empty_path_and_a_null_value_as_postgresql_does() {
+    assert_parity(
+        TABLE,
+        &[
+            KINDS,
+            Step::Sql("UPDATE docs SET body = jsonb_set(body -> 'a', '{}', '9') WHERE id = 2"),
+            Step::Sql("UPDATE docs SET body = jsonb_insert(body -> 'a', '{}', '9') WHERE id = 2"),
+            Step::Sql("UPDATE docs SET body = jsonb_set(body, '{}', '9') WHERE id IN (6, 9)"),
+            Step::Sql("UPDATE docs SET body = jsonb_insert(body, '{}', '9') WHERE id = 7"),
+            Step::Sql("UPDATE docs SET body = jsonb_set(body -> 'a', '{}', NULL) WHERE id = 3"),
+            Step::Sql("UPDATE docs SET body = jsonb_set(body, '{a}', body -> 'z') WHERE id = 1"),
+            Step::Sql("UPDATE docs SET body = jsonb_insert(body, '{b}', NULL) WHERE id = 8"),
+        ],
+        &[
+            "SELECT id::text || ' ' || coalesce(body::text, 'NULL') AS value FROM docs ORDER BY id",
+            "SELECT coalesce(jsonb_set(body, '{a}', NULL, false)::text, 'NULL') AS value \
+             FROM docs ORDER BY id",
+        ],
+    );
+}

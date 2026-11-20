@@ -135,11 +135,11 @@ fn a_null_path_element_is_rejected() {
     }
 }
 
-/// The empty path, a malformed one and a bound parameter all lack the literal
-/// elements the SQLite path is written from.
+/// A malformed path and a bound parameter lack the literal elements the
+/// SQLite path is written from.
 #[test]
 fn a_path_without_literal_elements_is_rejected() {
-    for path in ["'{}'", "'{a,}'", "$1"] {
+    for path in ["'{a,}'", "$1"] {
         let error = translate_err(&format!(
             "CREATE TABLE t (d JSONB); SELECT jsonb_set(d, {path}, '2') FROM t;"
         ));
