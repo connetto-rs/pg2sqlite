@@ -1471,12 +1471,10 @@ fn transform_expr_generic(
             })
         }
 
-        // An unquoted `current_role` is the role keyword, never a column.
         Expr::Identifier(ident) => {
             let ident_lower = ident.value.to_lowercase();
 
             if let Some(pfx) = strategy.prefix
-                && crate::impls::session_variable::session_read(expr).is_none()
                 && strategy.has_column(&ident_lower)
                 && !strategy.is_inner_scope(&ident_lower)
             {

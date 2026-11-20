@@ -28,9 +28,12 @@ use sql_traits::{
     structs::ParserDB,
     traits::{ColumnLike, DataTypeLike, TableLike, VectorKind, VectorType},
 };
-use sqlparser::ast::{
-    BinaryOperator, CreateTable, DataType, Expr, Ident, ObjectName, ObjectNamePart, SelectItem,
-    SetExpr, Statement, TriggerEvent, TriggerPeriod,
+use sqlparser::{
+    ast::{
+        BinaryOperator, CreateTable, DataType, Expr, Ident, ObjectName, ObjectNamePart, SelectItem,
+        SetExpr, Statement, TriggerEvent, TriggerPeriod, VirtualTableModuleArgument,
+    },
+    tokenizer::Span,
 };
 
 #[cfg(not(feature = "std"))]
@@ -193,7 +196,10 @@ fn create_vec0_virtual_table(
     let dim_spec = vec_col.dimensions.map_or_else(String::new, |d| format!("[{d}]"));
     let vec_arg = format!("{} float{dim_spec}", quote_identifier(&vec_col.column_name));
 
-    let module_args = vec![Ident::new(pk_arg), Ident::new(vec_arg)];
+    let module_args = [pk_arg, vec_arg]
+        .into_iter()
+        .map(|value| VirtualTableModuleArgument { value, span: Span::empty() })
+        .collect();
 
     Statement::CreateVirtualTable {
         name,
