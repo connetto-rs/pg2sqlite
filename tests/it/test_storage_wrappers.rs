@@ -167,9 +167,12 @@ fn blob_literals_in_a_uuid_list_and_range_reverse_to_the_uuid_text() {
 }
 
 #[test]
-fn a_blob_literal_beside_a_bytea_column_is_unchanged() {
-    let postgres = reversed("SELECT id FROM stored WHERE raw = X'00FF'");
-    assert!(postgres.contains("raw = X'00FF'"), "{postgres}");
+fn a_blob_literal_beside_a_bytea_column_reverses_to_the_bytea_text() {
+    // `raw = X'00FF'` earns `operator does not exist: bytea = bit` on the
+    // server, and `'\x00FF'` is the bytea's hex text the column types it as.
+    let postgres = reversed("SELECT id FROM stored WHERE X'00FF' = raw OR raw IN (X'', X'0A')");
+    assert!(postgres.contains("'\\x00FF' = raw"), "{postgres}");
+    assert!(postgres.contains("raw IN ('\\x', '\\x0A')"), "{postgres}");
 }
 
 #[test]
@@ -193,15 +196,16 @@ fn a_blob_literal_beside_a_uuid_column_held_as_text_is_refused() {
 #[test]
 fn values_inserted_into_typed_columns_reverse_to_the_declared_type() {
     let postgres = reversed(
-        "INSERT INTO stored (id, u, xs) VALUES (1, X'550E8400E29B41D4A716446655440000', \
-         json_array(1, 2)), (2, unhex('660e8400e29b41d4a716446655440000'), json_array())",
+        "INSERT INTO stored (id, u, raw, xs) VALUES (1, X'550E8400E29B41D4A716446655440000', \
+         X'0303', json_array(1, 2)), (2, unhex('660e8400e29b41d4a716446655440000'), NULL, \
+         json_array())",
     );
     assert!(
-        postgres.contains("(1, '550e8400-e29b-41d4-a716-446655440000', ARRAY[1, 2])"),
+        postgres.contains("(1, '550e8400-e29b-41d4-a716-446655440000', '\\x0303', ARRAY[1, 2])"),
         "{postgres}"
     );
     assert!(
-        postgres.contains("(2, '660e8400e29b41d4a716446655440000'::UUID, ARRAY[]::INT[])"),
+        postgres.contains("(2, '660e8400e29b41d4a716446655440000'::UUID, NULL, ARRAY[]::INT[])"),
         "{postgres}"
     );
 }
@@ -213,7 +217,7 @@ fn values_assigned_to_typed_columns_reverse_to_the_declared_type() {
          (raw, xs) = (X'00FF', json_array(1)) WHERE id = 1",
     );
     assert!(postgres.contains("u = '550e8400-e29b-41d4-a716-446655440000'"), "{postgres}");
-    assert!(postgres.contains("(raw, xs) = (X'00FF', ARRAY[1])"), "{postgres}");
+    assert!(postgres.contains("(raw, xs) = ('\\x00FF', ARRAY[1])"), "{postgres}");
 }
 
 #[test]

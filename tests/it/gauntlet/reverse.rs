@@ -924,6 +924,8 @@ const STORAGE_WRAPPER_PARITY: &[&str] = &[
     "SELECT CAST(count(*) AS TEXT) AS answer FROM stored \
      WHERE u IN (X'660E8400E29B41D4A716446655440000', X'00000000000000000000000000000000')",
     "SELECT CAST(count(*) AS TEXT) AS answer FROM stored WHERE raw = unhex('00ff')",
+    "SELECT CAST(count(*) AS TEXT) AS answer FROM stored WHERE raw = X'00FF'",
+    "SELECT CAST(count(*) AS TEXT) AS answer FROM stored WHERE raw IN (X'', X'0A')",
     "SELECT CAST(count(*) AS TEXT) AS answer FROM stored WHERE xs = json_array(1, 2)",
 ];
 
@@ -1022,19 +1024,21 @@ fn reversed_storage_wrappers_answer_what_the_replica_answered() {
 /// SQLite writes placing a blob or a JSON array in a column whose PostgreSQL
 /// type is not its storage type.
 const STORAGE_WRAPPER_WRITES: &[&str] = &[
-    "INSERT INTO stored (id, u, xs) \
-     VALUES (10, X'770E8400E29B41D4A716446655440000', json_array(3, 4))",
+    "INSERT INTO stored (id, u, raw, xs) \
+     VALUES (10, X'770E8400E29B41D4A716446655440000', X'0303', json_array(3, 4))",
     "INSERT INTO stored (id, u) VALUES (11, unhex('880e8400e29b41d4a716446655440000'))",
-    "UPDATE stored SET u = X'990E8400E29B41D4A716446655440000', xs = json_array(5) WHERE id = 3",
+    "UPDATE stored SET u = X'990E8400E29B41D4A716446655440000', raw = X'', xs = json_array(5) \
+     WHERE id = 3",
     "UPDATE stored SET (u, xs) = (X'AA0E8400E29B41D4A716446655440000', json_array()) WHERE id = 2",
     "INSERT INTO stored (id, u) VALUES (1, X'BB0E8400E29B41D4A716446655440000') \
-     ON CONFLICT (id) DO UPDATE SET u = X'BB0E8400E29B41D4A716446655440000'",
+     ON CONFLICT (id) DO UPDATE SET u = X'BB0E8400E29B41D4A716446655440000', raw = X'0A0B'",
 ];
 
 /// Reads of every row of `stored` after the writes, through the wrappers the
 /// read parity above already pins.
 const STORED_READS: &[&str] = &[
     "SELECT CAST(hex(u) AS TEXT) AS answer FROM stored ORDER BY id",
+    "SELECT CAST(hex(raw) AS TEXT) AS answer FROM stored ORDER BY id",
     "SELECT CAST(json_array_length(xs) AS TEXT) AS answer FROM stored ORDER BY id",
 ];
 
