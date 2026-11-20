@@ -544,6 +544,24 @@ impl<'a> TranslationContext<'a> {
             .into_context(Some(TranslationScope::Definition(scope)), Some(self))
     }
 
+    /// The same context for the body of a derived table that is not
+    /// `LATERAL`, in the `FROM` clause of the query whose scope this context
+    /// carries.
+    ///
+    /// PostgreSQL resolves that body against the queries enclosing the one
+    /// holding it and never against that query's own `FROM` items, measured
+    /// on 18.6, so the query's level is left out and the levels above it
+    /// stay.
+    pub(crate) fn derived_table_body(&self) -> TranslationContext<'_> {
+        let (scope, outer) = match self.scope {
+            Some(TranslationScope::Query { .. }) => {
+                self.outer.map_or((None, None), |outer| (outer.scope, outer.outer))
+            }
+            _ => (self.scope, self.outer),
+        };
+        ContextFields::borrowed(self).into_context(scope, outer)
+    }
+
     /// The same context noting `with` as the enclosing query's CTE clause.
     pub(crate) fn with_cte_clause<'s>(
         &'s self,

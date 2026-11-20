@@ -77,6 +77,13 @@ pub(crate) trait TranslationDirection {
         scope: &'scope sql_traits::structs::ColumnScope<'scope, 'scope, ParserDB>,
     ) -> Self::Options<'scope>;
 
+    /// The same options for the body of a derived table that is not
+    /// `LATERAL`, which sees the queries enclosing the one holding it and none
+    /// of that query's own `FROM` items.
+    fn derived_table_body<'options>(
+        options: &'options Self::Options<'_>,
+    ) -> Self::Options<'options>;
+
     fn translate_expr(
         expr: &Expr,
         schema: &ParserDB,
@@ -507,7 +514,8 @@ fn evaluate_definition<T: PartialEq>(
         ColumnDefinition::RecursiveUnion { anchor, .. } => {
             evaluate_definition(&anchor.definition(), schema, options, read_column, read_expression)
         }
-        ColumnDefinition::Parameter { .. }
+        ColumnDefinition::FunctionResult { .. }
+        | ColumnDefinition::Parameter { .. }
         | ColumnDefinition::Variable(_)
         | ColumnDefinition::VariableField(_)
         | ColumnDefinition::Opaque => Ok(DefinitionValue::Opaque),
@@ -813,7 +821,8 @@ fn definition_find<T>(
                 .and_then(|column| read_column(&column)))
         }
         ColumnDefinition::Ordinality => Ok(read_column(&ordinality_column())),
-        ColumnDefinition::Parameter { .. }
+        ColumnDefinition::FunctionResult { .. }
+        | ColumnDefinition::Parameter { .. }
         | ColumnDefinition::Variable(_)
         | ColumnDefinition::VariableField(_)
         | ColumnDefinition::Opaque => Ok(None),
@@ -5421,13 +5430,18 @@ pub(crate) fn translate_table_factor<D: TranslationDirection>(
                     ));
                 }
             }
+            // Forward translation refuses a LATERAL body that reads a column
+            // and SQLite has no LATERAL, so every body here takes the scope of
+            // a non-LATERAL one.
+            let body_options = D::derived_table_body(options);
+            let body_options = &body_options;
             if D::IS_FORWARD
                 && let Some(alias) = alias.as_ref().filter(|alias| !alias.columns.is_empty())
             {
-                return renamed_derived_factor::<D>(subquery, alias, schema, options, emit);
+                return renamed_derived_factor::<D>(subquery, alias, schema, body_options, emit);
             }
             TableFactor::Derived {
-                subquery: Box::new(D::translate_query(subquery, schema, options, emit)?),
+                subquery: Box::new(D::translate_query(subquery, schema, body_options, emit)?),
                 // Drop LATERAL; uncorrelated subqueries are safe without it and
                 // correlated ones are rejected above.
                 lateral: false,
@@ -5992,6 +6006,12 @@ mod tests {
             options: &'scope Self::Options<'_>,
             _scope: &'scope sql_traits::structs::ColumnScope<'scope, 'scope, ParserDB>,
         ) -> Self::Options<'scope> {
+            options.clone()
+        }
+
+        fn derived_table_body<'options>(
+            options: &'options Self::Options<'_>,
+        ) -> Self::Options<'options> {
             options.clone()
         }
 
