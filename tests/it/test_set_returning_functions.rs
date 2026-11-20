@@ -24,7 +24,6 @@
 //! `'[{"a":1}]'` both databases answer `{"a":1}` rather than a doubly quoted
 //! string, because SQLite tracks the JSON subtype through `json_each`.
 
-use diesel::connection::SimpleConnection;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use run_translated_helper::run_translated_with;
 
@@ -47,25 +46,6 @@ fn refuse(query: &str) -> String {
         .expect("parse")
         .translate(&crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()))
         .expect_err("this function has no SQLite table-valued form")
-        .to_string()
-}
-
-/// Translates `query` over the fixture, applies it to SQLite, and returns the
-/// error SQLite answers.
-fn sqlite_refusal(query: &str) -> String {
-    let statements = Pg2Sqlite::default()
-        .sql(&format!("{FIXTURE} {query};"))
-        .expect("parse")
-        .translate_to_sql(&crate::helpers::jsonb_functions::with_functions(
-            Pg2SqliteOptions::default(),
-        ))
-        .expect("translate")
-        .into_vec();
-    let mut connection = crate::helpers::establish_connection();
-    // The translated script is generated text, which no typed query expresses.
-    connection
-        .batch_execute(&statements.join(";\n"))
-        .expect_err("SQLite should refuse the emitted reference")
         .to_string()
 }
 
@@ -396,7 +376,7 @@ fn an_alias_names_only_an_undeclared_column() {
 }
 
 /// The references PostgreSQL 18.6 answers with `column ... does not exist`
-/// fail in SQLite too rather than starting to resolve.
+/// are refused with its message.
 #[test]
 fn a_column_the_function_does_not_have_stays_missing() {
     for (query, column) in [
@@ -405,8 +385,7 @@ fn a_column_the_function_does_not_have_stays_missing() {
         ("SELECT e.value FROM json_object_keys('{\"a\":1}') AS e", "e.value"),
         ("SELECT e.json_object_keys FROM json_object_keys('{\"a\":1}') AS e", "e.json_object_keys"),
     ] {
-        let error = sqlite_refusal(query);
-        assert!(error.contains(&format!("no such column: {column}")), "{query}: {error}");
+        assert_eq!(refuse(query), format!("column {column} does not exist"), "{query}");
     }
 }
 

@@ -313,7 +313,7 @@ fn an_epoch_difference_reverses_to_extract() {
 /// the call is refused rather than read as a column.
 #[test]
 fn date_part_with_a_non_literal_field_is_refused() {
-    let error = refusal("date_part(field, ts1)");
+    let error = refusal("date_part(s, ts1)");
     assert!(
         error.contains(
             "date_part: the field argument must be a string literal \

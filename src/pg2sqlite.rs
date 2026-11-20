@@ -21,6 +21,7 @@ use tempfile::TempDir;
 use crate::no_std::prelude::*;
 use crate::{
     impls::{
+        column_access,
         emitted_namespace::{Source, reject_name_collisions, sourced},
         object_name::last_ident_value_or_display,
         transaction_blocks::Disposition,
@@ -967,10 +968,14 @@ impl Pg2Sqlite {
                             attachments: &attachments,
                             in_transaction: outline.in_transaction(index),
                         });
-                        let mut emitted = statement.translate_with_warnings(
-                            &epoch.schema,
+                        let ambiguous = column_access::resolve_columns(
+                            statement,
+                            epoch.written(index),
                             &written,
-                            &mut emit,
+                        )?;
+                        let mut emitted = column_access::with_ambiguity(
+                            ambiguous,
+                            statement.translate_with_warnings(&epoch.schema, &written, &mut emit),
                         )?;
                         rebuilt_triggers[index] = trigger_slots.apply(
                             statement,

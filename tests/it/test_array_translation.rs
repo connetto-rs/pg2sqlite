@@ -459,12 +459,6 @@ fn gt_all_over_an_array_column_filters_rows() {
     assert_eq!(rows, vec![Some("1".to_string())]);
 }
 
-#[test]
-fn quantified_comparison_over_an_array_needs_a_representation() {
-    let err = reject_default("CREATE TABLE t (v INT);\nSELECT * FROM t WHERE v = ANY(other);");
-    assert!(err.contains("with_array_representation"), "got: {err}");
-}
-
 /// A schema, an insert, and a query using arrays throughout must translate and
 /// run as one script.
 #[test]

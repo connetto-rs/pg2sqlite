@@ -21,20 +21,20 @@ const DDL: &str = "CREATE TABLE t (
     ts0 TIMESTAMP(0), t2 TIME(2), ts3 TIMESTAMP(3),
     tstz0 TIMESTAMPTZ(0), tstz1 TIMESTAMPTZ(1), tt2 TIMETZ(2),
     ts TIMESTAMP, tstz TIMESTAMPTZ,
-    t TIME, tt TIME WITH TIME ZONE);";
+    t TIME, tt TIME WITH TIME ZONE, seq SERIAL PRIMARY KEY);";
 
 /// The ten literals the insert tests write, one row per statement.
 const TEN_LITERALS: &str = "INSERT INTO t VALUES (
     '2024-01-02 03:04:05.5', '03:04:05.125', '2024-01-02 03:04:05.1235',
     NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL);
-INSERT INTO t VALUES (NULL, '03:04:05.135', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
-INSERT INTO t VALUES (NULL, '03:04:05.999', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
-INSERT INTO t VALUES (NULL, '23:59:59.996', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
-INSERT INTO t VALUES ('2024-01-02 03:04:05.4', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
-INSERT INTO t VALUES ('2024-01-02 03:04:05.499', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
-INSERT INTO t VALUES ('2024-01-02 23:59:59.6', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
-INSERT INTO t VALUES (NULL, NULL, '2024-01-02 03:04:05.0004', NULL, NULL, NULL, NULL, NULL, NULL, NULL);";
+    NULL, NULL, NULL, NULL, DEFAULT);
+INSERT INTO t VALUES (NULL, '03:04:05.135', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, DEFAULT);
+INSERT INTO t VALUES (NULL, '03:04:05.999', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, DEFAULT);
+INSERT INTO t VALUES (NULL, '23:59:59.996', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, DEFAULT);
+INSERT INTO t VALUES ('2024-01-02 03:04:05.4', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, DEFAULT);
+INSERT INTO t VALUES ('2024-01-02 03:04:05.499', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, DEFAULT);
+INSERT INTO t VALUES ('2024-01-02 23:59:59.6', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, DEFAULT);
+INSERT INTO t VALUES (NULL, NULL, '2024-01-02 03:04:05.0004', NULL, NULL, NULL, NULL, NULL, NULL, NULL, DEFAULT);";
 
 fn run(pg: &str) -> Vec<String> {
     let rows = run_translated_utc(pg);
@@ -49,14 +49,13 @@ fn run(pg: &str) -> Vec<String> {
 /// 2024-01-02 03:04:05.124 and 2024-01-02 03:04:05 for the ten literals.
 #[test]
 fn insert_rounds_literals_to_the_column_precision() {
-    let rows = run(&format!(
-        "{DDL}\n{TEN_LITERALS}\nSELECT t2 FROM t WHERE t2 IS NOT NULL ORDER BY rowid;"
-    ));
+    let rows =
+        run(&format!("{DDL}\n{TEN_LITERALS}\nSELECT t2 FROM t WHERE t2 IS NOT NULL ORDER BY seq;"));
     assert_eq!(rows, vec!["03:04:05.13", "03:04:05.14", "03:04:06", "24:00:00"]);
     let rows = run(&format!("{DDL}\n{TEN_LITERALS}\nSELECT ts3 FROM t WHERE ts3 IS NOT NULL;"));
     assert_eq!(rows, vec!["2024-01-02 03:04:05.124", "2024-01-02 03:04:05"]);
     let rows = run(&format!(
-        "{DDL}\n{TEN_LITERALS}\nSELECT ts0 FROM t WHERE ts0 IS NOT NULL ORDER BY rowid;"
+        "{DDL}\n{TEN_LITERALS}\nSELECT ts0 FROM t WHERE ts0 IS NOT NULL ORDER BY seq;"
     ));
     assert_eq!(
         rows,
@@ -75,13 +74,13 @@ fn insert_rounds_literals_to_the_column_precision() {
 fn the_rounding_is_half_away_from_zero_not_per_digit() {
     let rows = run(&format!(
         "{DDL}\n\
-         INSERT INTO t VALUES ('2024-01-02 03:04:05.499', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);\n\
+         INSERT INTO t VALUES ('2024-01-02 03:04:05.499', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, DEFAULT);\n\
          SELECT ts0 FROM t;\n"
     ));
     assert_eq!(rows, vec!["2024-01-02 03:04:05"]);
     let rows = run(&format!(
         "{DDL}\n\
-         INSERT INTO t VALUES (NULL, '03:04:05.499', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);\n\
+         INSERT INTO t VALUES (NULL, '03:04:05.499', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, DEFAULT);\n\
          SELECT t2 FROM t;\n"
     ));
     assert_eq!(rows, vec!["03:04:05.5"]);
@@ -95,10 +94,10 @@ fn the_rounding_is_half_away_from_zero_not_per_digit() {
 fn insert_rounds_timestamptz_literals_in_canonical_form() {
     let rows = run(&format!(
         "{DDL}\n\
-         INSERT INTO t VALUES (NULL, NULL, NULL, '2024-01-02 03:04:05.5', '2024-01-02 03:04:05.25', NULL, NULL, NULL, NULL, NULL);\n\
-         INSERT INTO t VALUES (NULL, NULL, NULL, '2024-01-02 23:59:59.999499', NULL, NULL, NULL, NULL, NULL, NULL);\n\
-         INSERT INTO t VALUES (NULL, NULL, NULL, '2024-01-02 22:04:05.5-01:00', '2024-01-02 03:04:05.35', NULL, NULL, NULL, NULL, NULL);\n\
-         SELECT tstz0 FROM t ORDER BY rowid;"
+         INSERT INTO t VALUES (NULL, NULL, NULL, '2024-01-02 03:04:05.5', '2024-01-02 03:04:05.25', NULL, NULL, NULL, NULL, NULL, DEFAULT);\n\
+         INSERT INTO t VALUES (NULL, NULL, NULL, '2024-01-02 23:59:59.999499', NULL, NULL, NULL, NULL, NULL, NULL, DEFAULT);\n\
+         INSERT INTO t VALUES (NULL, NULL, NULL, '2024-01-02 22:04:05.5-01:00', '2024-01-02 03:04:05.35', NULL, NULL, NULL, NULL, NULL, DEFAULT);\n\
+         SELECT tstz0 FROM t ORDER BY seq;"
     ));
     assert_eq!(
         rows,
@@ -110,9 +109,9 @@ fn insert_rounds_timestamptz_literals_in_canonical_form() {
     );
     let rows = run(&format!(
         "{DDL}\n\
-         INSERT INTO t VALUES (NULL, NULL, NULL, '2024-01-02 03:04:05.5', '2024-01-02 03:04:05.25', NULL, NULL, NULL, NULL, NULL);\n\
-         INSERT INTO t VALUES (NULL, NULL, NULL, '2024-01-02 22:04:05.5-01:00', '2024-01-02 03:04:05.35', NULL, NULL, NULL, NULL, NULL);\n\
-         SELECT tstz1 FROM t WHERE tstz1 IS NOT NULL ORDER BY rowid;"
+         INSERT INTO t VALUES (NULL, NULL, NULL, '2024-01-02 03:04:05.5', '2024-01-02 03:04:05.25', NULL, NULL, NULL, NULL, NULL, DEFAULT);\n\
+         INSERT INTO t VALUES (NULL, NULL, NULL, '2024-01-02 22:04:05.5-01:00', '2024-01-02 03:04:05.35', NULL, NULL, NULL, NULL, NULL, DEFAULT);\n\
+         SELECT tstz1 FROM t WHERE tstz1 IS NOT NULL ORDER BY seq;"
     ));
     assert_eq!(rows, vec!["2024-01-02 03:04:05.300000+00:00", "2024-01-02 03:04:05.400000+00:00"]);
 }
@@ -125,13 +124,13 @@ fn insert_rounds_timestamptz_literals_in_canonical_form() {
 fn a_negative_instant_rounds_away_from_zero() {
     let rows = run(&format!(
         "{DDL}\n\
-         INSERT INTO t VALUES (NULL, NULL, NULL, '1969-12-31 23:59:59.5+00:00', NULL, NULL, NULL, NULL, NULL, NULL);\n\
+         INSERT INTO t VALUES (NULL, NULL, NULL, '1969-12-31 23:59:59.5+00:00', NULL, NULL, NULL, NULL, NULL, NULL, DEFAULT);\n\
          SELECT tstz0 FROM t;"
     ));
     assert_eq!(rows, vec!["1969-12-31 23:59:59.000000+00:00"]);
     let rows = run(&format!(
         "{DDL}\n\
-         INSERT INTO t VALUES (NULL, NULL, NULL, NULL, '1969-12-31 23:59:57.75+00:00', NULL, NULL, NULL, NULL, NULL);\n\
+         INSERT INTO t VALUES (NULL, NULL, NULL, NULL, '1969-12-31 23:59:57.75+00:00', NULL, NULL, NULL, NULL, NULL, DEFAULT);\n\
          SELECT tstz1 FROM t WHERE tstz1 IS NOT NULL;"
     ));
     assert_eq!(rows, vec!["1969-12-31 23:59:57.700000+00:00"]);
@@ -144,10 +143,10 @@ fn a_negative_instant_rounds_away_from_zero() {
 fn insert_rounds_timetz_literals_and_keeps_the_offset() {
     let rows = run(&format!(
         "{DDL}\n\
-         INSERT INTO t VALUES (NULL, NULL, NULL, NULL, NULL, '03:04:05.125+02:00', NULL, NULL, NULL, NULL);\n\
-         INSERT INTO t VALUES (NULL, NULL, NULL, NULL, NULL, '23:59:59.996+02:00', NULL, NULL, NULL, NULL);\n\
-         INSERT INTO t VALUES (NULL, NULL, NULL, NULL, NULL, '03:04:05.135+02:00', NULL, NULL, NULL, NULL);\n\
-         SELECT tt2 FROM t ORDER BY rowid;"
+         INSERT INTO t VALUES (NULL, NULL, NULL, NULL, NULL, '03:04:05.125+02:00', NULL, NULL, NULL, NULL, DEFAULT);\n\
+         INSERT INTO t VALUES (NULL, NULL, NULL, NULL, NULL, '23:59:59.996+02:00', NULL, NULL, NULL, NULL, DEFAULT);\n\
+         INSERT INTO t VALUES (NULL, NULL, NULL, NULL, NULL, '03:04:05.135+02:00', NULL, NULL, NULL, NULL, DEFAULT);\n\
+         SELECT tt2 FROM t ORDER BY seq;"
     ));
     assert_eq!(rows, vec!["03:04:05.13+02:00", "24:00:00+02:00", "03:04:05.14+02:00"]);
 }
@@ -190,7 +189,7 @@ fn unique_rejects_a_fraction_that_rounds_to_the_stored_second() {
 fn the_literal_beside_a_precision_column_is_rounded() {
     const INSERT: &str =
         "INSERT INTO t VALUES ('2024-01-02 03:04:06', '03:04:05.13', '2024-01-02 03:04:05.124',
-        '2024-01-02 03:04:06.000000+00:00', NULL, '03:04:05.13+02:00', NULL, NULL, NULL, NULL);";
+        '2024-01-02 03:04:06.000000+00:00', NULL, '03:04:05.13+02:00', NULL, NULL, NULL, NULL, DEFAULT);";
     for probe in [
         "SELECT ts0 = '2024-01-02 03:04:05.5' FROM t;",
         "SELECT t2 = '03:04:05.125' FROM t;",
@@ -263,7 +262,7 @@ fn a_cast_over_a_timestamp_column_rounds_at_run_time() {
         "INSERT INTO t (ts) VALUES ('2024-01-02 03:04:05.499'), ('2024-01-02 03:04:05.5'),
         ('2024-01-02 03:04:05.999499'), ('2024-01-02 03:04:05.25');";
     let rows =
-        run(&format!("{DDL}\n{INSERT}\nSELECT CAST(ts AS TIMESTAMP(0)) FROM t ORDER BY rowid;"));
+        run(&format!("{DDL}\n{INSERT}\nSELECT CAST(ts AS TIMESTAMP(0)) FROM t ORDER BY seq;"));
     assert_eq!(
         rows,
         vec![
@@ -274,7 +273,7 @@ fn a_cast_over_a_timestamp_column_rounds_at_run_time() {
         ]
     );
     let rows =
-        run(&format!("{DDL}\n{INSERT}\nSELECT CAST(ts AS TIMESTAMP(1)) FROM t ORDER BY rowid;"));
+        run(&format!("{DDL}\n{INSERT}\nSELECT CAST(ts AS TIMESTAMP(1)) FROM t ORDER BY seq;"));
     assert_eq!(
         rows,
         vec![
@@ -285,7 +284,7 @@ fn a_cast_over_a_timestamp_column_rounds_at_run_time() {
         ]
     );
     let rows =
-        run(&format!("{DDL}\n{INSERT}\nSELECT CAST(ts AS TIMESTAMP(2)) FROM t ORDER BY rowid;"));
+        run(&format!("{DDL}\n{INSERT}\nSELECT CAST(ts AS TIMESTAMP(2)) FROM t ORDER BY seq;"));
     assert_eq!(
         rows,
         vec![
@@ -305,9 +304,8 @@ fn a_cast_over_a_timestamp_column_rounds_at_run_time() {
 fn a_cast_over_a_timestamptz_column_rounds_at_run_time() {
     const INSERT: &str = "INSERT INTO t (tstz) VALUES ('2024-01-02 03:04:05.500000+00:00'),
         ('2024-01-02 03:04:05.123456+00:00'), ('2024-01-02 03:04:05.999499+00:00');";
-    let rows = run(&format!(
-        "{DDL}\n{INSERT}\nSELECT CAST(tstz AS TIMESTAMPTZ(0)) FROM t ORDER BY rowid;"
-    ));
+    let rows =
+        run(&format!("{DDL}\n{INSERT}\nSELECT CAST(tstz AS TIMESTAMPTZ(0)) FROM t ORDER BY seq;"));
     assert_eq!(
         rows,
         vec![
@@ -316,9 +314,8 @@ fn a_cast_over_a_timestamptz_column_rounds_at_run_time() {
             "2024-01-02 03:04:06.000000+00:00"
         ]
     );
-    let rows = run(&format!(
-        "{DDL}\n{INSERT}\nSELECT CAST(tstz AS TIMESTAMPTZ(2)) FROM t ORDER BY rowid;"
-    ));
+    let rows =
+        run(&format!("{DDL}\n{INSERT}\nSELECT CAST(tstz AS TIMESTAMPTZ(2)) FROM t ORDER BY seq;"));
     assert_eq!(
         rows,
         vec![
@@ -328,13 +325,11 @@ fn a_cast_over_a_timestamptz_column_rounds_at_run_time() {
         ]
     );
     let rows =
-        run(&format!("{DDL}\n{INSERT}\nSELECT CAST(tstz AS TIMESTAMP(1)) FROM t ORDER BY rowid;"));
+        run(&format!("{DDL}\n{INSERT}\nSELECT CAST(tstz AS TIMESTAMP(1)) FROM t ORDER BY seq;"));
     assert_eq!(rows, vec!["2024-01-02 03:04:05.5", "2024-01-02 03:04:05.1", "2024-01-02 03:04:06"]);
-    let rows =
-        run(&format!("{DDL}\n{INSERT}\nSELECT CAST(tstz AS TIME(2)) FROM t ORDER BY rowid;"));
+    let rows = run(&format!("{DDL}\n{INSERT}\nSELECT CAST(tstz AS TIME(2)) FROM t ORDER BY seq;"));
     assert_eq!(rows, vec!["03:04:05.5", "03:04:05.12", "03:04:06"]);
-    let rows =
-        run(&format!("{DDL}\n{INSERT}\nSELECT CAST(tstz AS TIME(0)) FROM t ORDER BY rowid;"));
+    let rows = run(&format!("{DDL}\n{INSERT}\nSELECT CAST(tstz AS TIME(0)) FROM t ORDER BY seq;"));
     assert_eq!(rows, vec!["03:04:06", "03:04:05", "03:04:06"]);
 }
 
@@ -346,15 +341,13 @@ fn a_cast_over_a_timestamptz_column_rounds_at_run_time() {
 fn a_cast_over_time_and_timetz_columns_rounds_at_run_time() {
     const INSERT: &str = "INSERT INTO t (t, tt) VALUES ('03:04:05.499', '03:04:05.499+02:00'),
         ('03:04:05.999499', '23:59:59.996+02:00');";
-    let rows = run(&format!("{DDL}\n{INSERT}\nSELECT CAST(t AS TIME(0)) FROM t ORDER BY rowid;"));
+    let rows = run(&format!("{DDL}\n{INSERT}\nSELECT CAST(t AS TIME(0)) FROM t ORDER BY seq;"));
     assert_eq!(rows, vec!["03:04:05", "03:04:06"]);
-    let rows = run(&format!("{DDL}\n{INSERT}\nSELECT CAST(t AS TIME(2)) FROM t ORDER BY rowid;"));
+    let rows = run(&format!("{DDL}\n{INSERT}\nSELECT CAST(t AS TIME(2)) FROM t ORDER BY seq;"));
     assert_eq!(rows, vec!["03:04:05.5", "03:04:06"]);
-    let rows =
-        run(&format!("{DDL}\n{INSERT}\nSELECT CAST(tt AS TIMETZ(0)) FROM t ORDER BY rowid;"));
+    let rows = run(&format!("{DDL}\n{INSERT}\nSELECT CAST(tt AS TIMETZ(0)) FROM t ORDER BY seq;"));
     assert_eq!(rows, vec!["03:04:05+02:00", "24:00:00+02:00"]);
-    let rows =
-        run(&format!("{DDL}\n{INSERT}\nSELECT CAST(tt AS TIMETZ(2)) FROM t ORDER BY rowid;"));
+    let rows = run(&format!("{DDL}\n{INSERT}\nSELECT CAST(tt AS TIMETZ(2)) FROM t ORDER BY seq;"));
     assert_eq!(rows, vec!["03:04:05.5+02:00", "24:00:00+02:00"]);
 }
 
@@ -370,7 +363,7 @@ fn an_instant_rounds_as_the_target_type() {
         ("TIMESTAMP(0)", ["2024-01-02 03:04:06", "2024-01-02 03:04:05", "2025-01-01 00:00:00"]),
     ] {
         let rows = run(&format!(
-            "{DDL}\n{INSERT}\nSELECT CAST(CAST(ts AS TIMESTAMPTZ) AS {target}) FROM t ORDER BY rowid;"
+            "{DDL}\n{INSERT}\nSELECT CAST(CAST(ts AS TIMESTAMPTZ) AS {target}) FROM t ORDER BY seq;"
         ));
         assert_eq!(rows, expected, "{target}");
     }
@@ -408,7 +401,7 @@ fn a_computed_value_is_rounded_where_it_lands() {
 INSERT INTO t (ts0) SELECT CAST(ts AS TIMESTAMP(0)) FROM t;
 INSERT INTO t (tstz0) VALUES (timestamptz '2024-01-02 03:04:05.5' + interval '1 millisecond');";
     let rows =
-        run(&format!("{DDL}\n{SETUP}\nSELECT ts0 FROM t WHERE ts0 IS NOT NULL ORDER BY rowid;"));
+        run(&format!("{DDL}\n{SETUP}\nSELECT ts0 FROM t WHERE ts0 IS NOT NULL ORDER BY seq;"));
     assert_eq!(rows, vec!["2024-01-02 03:04:05", "2024-01-02 03:04:06", "2024-01-02 03:04:06"]);
     // The interval step lands on .501, which rounds to the next second.
     let rows = run(&format!("{DDL}\n{SETUP}\nSELECT tstz0 FROM t WHERE tstz0 IS NOT NULL;"));

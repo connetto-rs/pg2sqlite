@@ -11,7 +11,8 @@ use sqlparser::ast::DataType;
 use crate::helpers::deployment::{caller, delimited, set};
 
 const ROLES: &str = "CREATE ROLE web; CREATE ROLE alice; CREATE ROLE bob;";
-const TABLE: &str = "CREATE TABLE t (id UUID, owner TEXT, team INTEGER, price NUMERIC(10,2));";
+const TABLE: &str = "CREATE TABLE t (id UUID, owner TEXT, team INTEGER, price NUMERIC(10,2)); \
+                     GRANT SELECT ON t TO PUBLIC;";
 
 /// Requests log in as `web`, act as `alice` or `bob`, and carry these settings.
 fn deployment() -> Deployment {
@@ -115,7 +116,8 @@ fn role_keywords_answer_the_names_postgresql_answers() {
 #[test]
 fn a_quoted_current_role_is_a_column() {
     let translated = translate(
-        "CREATE TABLE r (\"current_role\" TEXT); SELECT \"current_role\" FROM r;",
+        "CREATE TABLE r (\"current_role\" TEXT); GRANT SELECT ON r TO alice; \
+         SELECT \"current_role\" FROM r;",
         &options(),
     )
     .expect("translates");

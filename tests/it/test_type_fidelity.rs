@@ -664,10 +664,7 @@ fn an_unresolved_column_in_an_array_element_is_reported() {
         .expect("parse")
         .translate(&array_opts())
         .expect_err("missing is no column of t");
-    assert!(
-        matches!(error, pg2sqlite::errors::Error::UnresolvedColumnReference { .. }),
-        "{error:?}"
-    );
+    assert_eq!(error.to_string(), r#"column "missing" does not exist"#, "{error:?}");
 }
 
 #[test]

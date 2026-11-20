@@ -172,7 +172,7 @@ fn a_value_crossing_between_zoned_and_zoneless_columns_takes_the_target_form() {
         ),
         ("UPDATE t SET at = naive", "2026-09-23 13:42:07.500000+00:00"),
         (
-            "INSERT INTO t (id, at) VALUES (1, now()) ON CONFLICT (id) DO UPDATE SET at = naive",
+            "INSERT INTO t (id, at) VALUES (1, now()) ON CONFLICT (id) DO UPDATE SET at = t.naive",
             "2026-09-23 13:42:07.500000+00:00",
         ),
         ("UPDATE t SET naive = at", "2026-09-23 13:42:07"),

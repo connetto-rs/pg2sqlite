@@ -468,8 +468,45 @@ pub enum Error {
         /// The reserved trigger name that collides with an existing object.
         trigger_name: String,
     },
+    /// PostgreSQL refuses the statement with `sqlstate` and `message`, read
+    /// through [`Error::postgres_error`].
+    #[error("{message}")]
+    Postgres {
+        /// The SQLSTATE PostgreSQL reports.
+        sqlstate: crate::sqlstate::SqlState,
+        /// The message PostgreSQL reports beside the SQLSTATE.
+        message: String,
+    },
 }
 impl Error {
+    /// The SQLSTATE and message PostgreSQL refuses the statement with, for
+    /// an [`Error::Postgres`], and `None` for any other error.
+    ///
+    /// ```
+    /// use pg2sqlite::prelude::*;
+    /// use sql_traits::structs::ParserDB;
+    /// use sqlparser::dialect::PostgreSqlDialect;
+    ///
+    /// let schema = ParserDB::parse::<PostgreSqlDialect>("CREATE TABLE docs (id INT);")?;
+    /// let error = Pg2Sqlite::default()
+    ///     .sql(r#"SELECT "nosuch" FROM docs"#)?
+    ///     .translate_with_schema(&schema, &Pg2SqliteOptions::default())
+    ///     .unwrap_err();
+    /// let refusal = error.postgres_error().expect("PostgreSQL refuses the statement");
+    /// assert_eq!(refusal.sqlstate(), sqlstate::pg::UNDEFINED_COLUMN);
+    /// assert_eq!(refusal.message(), r#"column "nosuch" does not exist"#);
+    /// # Ok::<(), Error>(())
+    /// ```
+    #[must_use]
+    pub fn postgres_error(&self) -> Option<crate::sqlstate::PostgresError<'_>> {
+        match self {
+            Self::Postgres { sqlstate, message } => {
+                Some(crate::sqlstate::PostgresError::new(*sqlstate, message))
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn unsupported_source_syntax(detail: impl Into<String>) -> Self {
         TranslationRefusal::new(
             TranslationDirection::PostgreSqlToSqlite,

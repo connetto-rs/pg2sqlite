@@ -323,7 +323,8 @@ fn the_membership_shape_over_a_volatile_operand_refuses() {
 #[test]
 fn the_membership_test_round_trips() {
     let options = set_paired();
-    let postgres_source = format!("{DDL} SELECT id FROM project_members WHERE {SET_MEMBERSHIP};");
+    let postgres_source =
+        format!("{DDL} SELECT project_id FROM project_members WHERE {SET_MEMBERSHIP};");
 
     let forward = Pg2Sqlite::default()
         .sql(&postgres_source)
@@ -335,5 +336,5 @@ fn the_membership_test_round_trips() {
     assert!(sqlite_query.contains("instr("), "forward emits the search, got: {sqlite_query}");
 
     let back = reverse(&sqlite_query, &options).expect("and the search becomes the test again");
-    assert_eq!(back, format!("SELECT id FROM project_members WHERE {SET_MEMBERSHIP}"));
+    assert_eq!(back, format!("SELECT project_id FROM project_members WHERE {SET_MEMBERSHIP}"));
 }

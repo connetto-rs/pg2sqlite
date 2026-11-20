@@ -24,7 +24,8 @@ pub(crate) fn message_prefix(sqlstate: SqlState) -> String {
 }
 
 /// An error as PostgreSQL would report it, read from the message of a SQLite
-/// error the replica raised.
+/// error the replica raised or from a statement the translation refused as
+/// PostgreSQL does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PostgresError<'a> {
     sqlstate: SqlState,
@@ -32,6 +33,10 @@ pub struct PostgresError<'a> {
 }
 
 impl<'a> PostgresError<'a> {
+    pub(crate) const fn new(sqlstate: SqlState, message: &'a str) -> Self {
+        Self { sqlstate, message }
+    }
+
     /// The SQLSTATE, such as `23514` for `check_violation`, the type diesel
     /// reports a PostgreSQL error's code as.
     #[must_use]
