@@ -511,6 +511,9 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
         // query inside the body attaches its own scope over this one.
         let trigger_table =
             crate::impls::object_name::resolve_translation_table(schema, &self.table_name)?;
+        if let (Some(table), Some(condition)) = (trigger_table, &self.condition) {
+            crate::impls::column_access::resolve_trigger_condition(condition, table, schema)?;
+        }
         let trigger_scope = trigger_table.map(|table| {
             sql_traits::structs::ColumnScope::for_table(
                 table,
