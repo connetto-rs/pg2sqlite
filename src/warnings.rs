@@ -90,6 +90,27 @@ pub enum TranslationWarning {
         /// The first key column the role cannot read.
         column: String,
     },
+    /// A foreign key into a table whose rows a `SELECT` policy may hide from
+    /// the acting role, which the replica checks only from the referenced
+    /// side.
+    ///
+    /// PostgreSQL checks a foreign key without row security, so a write may
+    /// reference a row the writer cannot read. The replica holds only the rows
+    /// the role reads, so it leaves the check that a referencing row has its
+    /// referenced row to the server. What deleting or rekeying a referenced
+    /// row does to the referencing rows the replica holds stays, as triggers
+    /// on the referenced table.
+    HiddenReferencedRows {
+        /// The foreign key's name, as PostgreSQL names it.
+        name: String,
+        /// The table the foreign key is declared on.
+        table: String,
+        /// The table the foreign key references.
+        referenced: String,
+        /// The `SELECT` policies on `referenced` that may hide its rows from
+        /// the acting role, empty when none lets it read a row.
+        policies: Vec<String>,
+    },
     /// A trigger, a write statement of a trigger, or a foreign key left out
     /// of the replica because the server derives the rows it writes or, for
     /// a foreign key, the rows it references, under
@@ -141,6 +162,22 @@ impl core::fmt::Display for TranslationWarning {
                     "the acting role cannot read key column {column} of {table}, so the replica \
                      refuses its updates and deletes"
                 )
+            }
+            Self::HiddenReferencedRows { name, table, referenced, policies } => {
+                write!(
+                    f,
+                    "the replica leaves the check of foreign key {name} on {table} to the server, \
+                     since "
+                )?;
+                if policies.is_empty() {
+                    write!(f, "no policy lets the acting role read {referenced}")
+                } else {
+                    write!(
+                        f,
+                        "{} may hide rows of {referenced} from the acting role",
+                        policies.join(", ")
+                    )
+                }
             }
             Self::LeftToServer { construct, name, table, reason } => {
                 write!(f, "left {construct} {name} on {table} to the server, since {reason}")

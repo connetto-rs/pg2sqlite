@@ -117,6 +117,7 @@ mod test_groups;
 mod test_guarded_insert_values;
 mod test_guarded_raise;
 mod test_hex_encoding;
+mod test_hidden_referenced_rows;
 mod test_identity_sequences;
 mod test_ilike_lower;
 mod test_index_clause_warnings;

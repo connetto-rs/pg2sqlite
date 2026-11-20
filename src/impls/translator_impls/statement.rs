@@ -69,6 +69,7 @@ use crate::{
             column::translate_column_def,
             condition_injection::inject_condition_into_dml_statement,
             drop_column_rebuild,
+            hidden_referenced_rows::{self, Rename, declared},
             nulls_not_distinct::{companion_drops, table_companions},
             off_replica::{self, OffReplica, Write},
             rls::{
@@ -545,12 +546,14 @@ fn build_create_table_statements(
     );
     let clock_triggers: Vec<Statement> =
         clock_checks.into_triggers(&emitted_table.name, options).collect();
+    let referenced_sides = declared(&create_table.name, None, schema, options, emit)?;
 
     let mut statements = vec![Statement::CreateTable(emitted_table)];
     statements.extend(rls_statements.into_iter().flatten());
     statements.extend(companions);
     statements.extend(interval_companions);
     statements.extend(clock_triggers);
+    statements.extend(referenced_sides);
     append_vec0_statements_if_needed(&mut statements, create_table, schema, options, emit)?;
     Ok(statements)
 }
@@ -696,11 +699,20 @@ fn translate_alter_table(
 
     let mut statements = Vec::with_capacity(alter_table.operations.len());
     for (position, operation) in alter_table.operations.iter().enumerate() {
+        let (drops, moved) = match operation {
+            AlterTableOperation::RenameTable {
+                table_name: RenameTableNameKind::To(to) | RenameTableNameKind::As(to),
+            } => {
+                hidden_referenced_rows::moved(Rename::new(&alter_table.name, to), schema, options)?
+            }
+            _ => (Vec::new(), Vec::new()),
+        };
         let Some(translated) =
             translate_alter_table_operation(operation, alter_table, schema, options, emit)?
         else {
             continue;
         };
+        statements.extend(drops);
         if let AlterTableOperation::DropColumn { column_names, .. } = operation {
             let written = options.written_schema().unwrap_or(schema);
             let mut dependents =
@@ -711,6 +723,13 @@ fn translate_alter_table(
                 schema,
                 options,
                 emit,
+            )?);
+            dependents.extend(hidden_referenced_rows::dropped(
+                &alter_table.name,
+                Some(column_names),
+                written,
+                schema,
+                options,
             )?);
             // An earlier drop of the same statement may have taken a dependent
             // already.
@@ -745,6 +764,11 @@ fn translate_alter_table(
             table_type: None,
             end_token: alter_table.end_token.clone(),
         }));
+        statements.extend(moved);
+    }
+    let added = hidden_referenced_rows::keys_added_by(alter_table);
+    if added > 0 {
+        statements.extend(declared(&alter_table.name, Some(added), schema, options, emit)?);
     }
 
     Ok(statements)
@@ -959,9 +983,8 @@ fn translate_alter_table_operation(
         | AlterTableOperation::ForceRowLevelSecurity
         | AlterTableOperation::NoForceRowLevelSecurity
         | AlterTableOperation::OwnerTo { .. } => Ok(None),
-        // A key into a table left off the replica leaves with it, and a key
-        // left to the server is never added, which spares the ALTER TABLE
-        // SQLite has no form for.
+        // A key into a table off the replica, left to the server, or into
+        // hidden rows adds nothing.
         AlterTableOperation::AddConstraint {
             constraint: sqlparser::ast::TableConstraint::ForeignKey(key),
             ..
@@ -974,7 +997,9 @@ fn translate_alter_table_operation(
                 schema,
                 options,
                 emit,
-            )? =>
+            )?
+            || hidden_referenced_rows::hidden_rows(&key.foreign_table, schema, options)?
+                .is_some() =>
         {
             Ok(None)
         }
@@ -2062,6 +2087,13 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
                                     .filter(|trigger| names.iter().any(|name| trigger.is_on(name)))
                                     .map(|trigger| trigger.drop_payload(true)),
                             );
+                            // Their keys' triggers sit on the referenced
+                            // tables.
+                            for name in kept.iter() {
+                                statements.extend(hidden_referenced_rows::dropped(
+                                    name, None, written, schema, options,
+                                )?);
+                            }
                         }
                         statements
                     }

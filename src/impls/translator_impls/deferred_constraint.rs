@@ -118,6 +118,12 @@ impl DeferredTrigger {
         })
     }
 
+    /// The record of the check [`queued`] builds as `name`, firing on
+    /// `events` of the table PostgreSQL names `table`.
+    pub(crate) fn of_queued(name: ObjectName, table: &str, events: Vec<DeferredEvent>) -> Self {
+        Self { name, table: table.to_ascii_lowercase(), events }
+    }
+
     /// Whether the trigger is named `name`, as SQLite compares names.
     pub(crate) fn is_named(&self, name: &ObjectName) -> bool {
         match (last_ident(&self.name), last_ident(name)) {
@@ -264,36 +270,73 @@ pub(crate) fn translate(
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Vec<Statement>, Error> {
     check_clauses(trigger)?;
-    let mut columns = PayloadColumns::default();
     let mut events = Vec::with_capacity(trigger.events.len());
     for event in &trigger.events {
-        let mut immediate = immediate(trigger, event, schema, options, emit)?;
+        let CreateTrigger { table_name, condition, statements: body, events: mut fired, .. } =
+            immediate(trigger, event, schema, options, emit)?;
         let Some(kind) = DeferredEvent::of(event) else {
             unreachable!("the immediate translation refuses a TRUNCATE trigger")
         };
-        let Some(ConditionalStatements::BeginEnd(body)) = &mut immediate.statements else {
+        let (Some(ConditionalStatements::BeginEnd(body)), Some(event)) = (body, fired.pop()) else {
             return Err(Error::forward_refusal(format!(
                 "constraint trigger `{}` translated without a body",
                 trigger.name
             )));
         };
-        for statement in &mut body.statements {
+        events.push(QueuedEvent {
+            table: table_name,
+            kind,
+            event,
+            condition,
+            body: body.statements,
+        });
+    }
+    queued(&trigger.name, events)
+}
+
+/// One event whose firings a deferred check queues.
+pub(crate) struct QueuedEvent {
+    /// The table the event happens on.
+    pub(crate) table: ObjectName,
+    /// What the event is to the check.
+    pub(crate) kind: DeferredEvent,
+    /// The event as the queueing trigger fires on it.
+    pub(crate) event: TriggerEvent,
+    /// Whether the event queues a firing, read when it happens.
+    pub(crate) condition: Option<Expr>,
+    /// What the drain runs, reading `NEW` and `OLD` one column at a time.
+    pub(crate) body: Vec<Statement>,
+}
+
+/// The payload table of the check `name`, one trigger per event queueing its
+/// firings, and one per event running its body when the drain deletes the
+/// firing.
+///
+/// The body moves to the payload table, its `NEW` and `OLD` columns read from
+/// the values queued with the firing, `NULL` where the event has no such row
+/// as in PostgreSQL.
+///
+/// # Errors
+///
+/// Returns [`Error::TranslationRefusal`] when a body reads `NEW` or `OLD`
+/// other than one column at a time.
+pub(crate) fn queued(
+    name: &ObjectName,
+    mut events: Vec<QueuedEvent>,
+) -> Result<Vec<Statement>, Error> {
+    let mut columns = PayloadColumns::default();
+    for event in &mut events {
+        for statement in &mut event.body {
             columns.read_from(statement)?;
         }
-        events.push((kind, immediate));
     }
 
-    let payload = payload_name(&trigger.name);
+    let payload = payload_name(name);
     let mut statements = vec![columns.table(&payload)];
-    for (kind, immediate) in events {
-        let CreateTrigger { table_name, condition, statements: body, events: mut fired, .. } =
-            immediate;
-        let (Some(ConditionalStatements::BeginEnd(body)), Some(event)) = (body, fired.pop()) else {
-            unreachable!("every queued event was checked for a BEGIN ... END body above")
-        };
+    for QueuedEvent { table, kind, event, condition, body } in events {
         statements.push(ast_builder::trigger(
-            queue_trigger_name(&trigger.name, kind),
-            table_name,
+            queue_trigger_name(name, kind),
+            table,
             TriggerPeriod::After,
             event,
             true,
@@ -301,7 +344,7 @@ pub(crate) fn translate(
             columns.queue(&payload, kind),
         ));
         statements.push(ast_builder::trigger(
-            append_suffix(&trigger.name, &format!("_pg2sqlite_check_{}", kind.suffix())),
+            append_suffix(name, &format!("_pg2sqlite_check_{}", kind.suffix())),
             payload.clone(),
             TriggerPeriod::After,
             TriggerEvent::Delete,
@@ -311,7 +354,7 @@ pub(crate) fn translate(
                 op: BinaryOperator::Eq,
                 right: Box::new(string_literal(kind.keyword())),
             }),
-            body.statements,
+            body,
         ));
     }
     Ok(statements)

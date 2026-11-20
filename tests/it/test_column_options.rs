@@ -150,8 +150,7 @@ fn fk_to_rls_table_gets_renamed() {
             name TEXT NOT NULL
         );
         ALTER TABLE users ENABLE ROW LEVEL SECURITY;
-        CREATE POLICY users_policy ON users FOR SELECT TO authenticated
-            USING (id = current_setting('app.user_id')::uuid);
+        CREATE POLICY users_policy ON users FOR SELECT TO authenticated USING (true);
         CREATE POLICY users_insert ON users FOR INSERT TO authenticated
             WITH CHECK (id = current_setting('app.user_id')::uuid);
         CREATE POLICY users_update ON users FOR UPDATE TO authenticated
