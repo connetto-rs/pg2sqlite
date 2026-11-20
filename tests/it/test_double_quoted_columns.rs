@@ -195,6 +195,27 @@ fn a_column_no_relation_holds_does_not_exist() {
     );
 }
 
+/// PostgreSQL folds an unquoted name to lower case before it looks the name
+/// up, and names it folded when the lookup fails.
+#[test]
+fn an_unquoted_name_is_reported_folded() {
+    let undefined = |statement, message| assert_refused(statement, pg::UNDEFINED_COLUMN, message);
+    undefined("SELECT NoSuch FROM docs", r#"column "nosuch" does not exist"#);
+    undefined(r#"SELECT "NoSuch" FROM docs"#, r#"column "NoSuch" does not exist"#);
+    undefined("SELECT D.NoSuch FROM docs d", "column d.nosuch does not exist");
+    undefined("UPDATE docs SET NoSuch = 1", r#"column "nosuch" of relation "docs" does not exist"#);
+    assert_refused(
+        "SELECT X.id FROM docs",
+        pg::UNDEFINED_TABLE,
+        r#"missing FROM-clause entry for table "x""#,
+    );
+    assert_refused(
+        "SELECT ID FROM docs, notes",
+        pg::AMBIGUOUS_COLUMN,
+        r#"column reference "id" is ambiguous"#,
+    );
+}
+
 /// A derived table without `LATERAL` sees none of the `FROM` items beside it.
 #[test]
 fn a_derived_table_without_lateral_does_not_see_its_siblings() {
