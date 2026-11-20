@@ -36,7 +36,10 @@ use sqlparser::{
     parser::Parser,
 };
 
-use super::trigger_slots::{TriggerSlots, trigger_key};
+use super::{
+    create_trigger::{TriggerRelation, trigger_relation},
+    trigger_slots::{TriggerSlots, trigger_key},
+};
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
 use crate::{
@@ -123,7 +126,11 @@ impl LiveAttachments {
         }
         let slots = TriggerSlots::seeded(Some(schema))?;
         for trigger in schema.triggers() {
-            let table = trigger.table(schema)?.stored_table_name().to_ascii_lowercase();
+            // A rebuild replaces one table, which no view's trigger hangs off.
+            let TriggerRelation::Table(table) = trigger_relation(trigger, schema)? else {
+                continue;
+            };
+            let table = table.stored_table_name().to_ascii_lowercase();
             if owner.is_some_and(|owner| owner != table) {
                 continue;
             }

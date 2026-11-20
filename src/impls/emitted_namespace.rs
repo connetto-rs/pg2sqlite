@@ -25,7 +25,9 @@ use sql_traits::{
 };
 use sqlparser::ast::{AlterTableOperation, ObjectName, ObjectType, RenameTableNameKind, Statement};
 
-use super::object_name::last_ident_value_or_display;
+use super::{
+    object_name::last_ident_value_or_display, translator_impls::create_trigger::trigger_relation,
+};
 use crate::errors::Error;
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
@@ -145,7 +147,7 @@ impl<'a> Namespaces<'a> {
         }
         let slots = super::translator_impls::trigger_slots::TriggerSlots::seeded(Some(schema))?;
         for trigger in schema.triggers() {
-            let owner = sqlite_key(&trigger.table(schema)?.stored_table_name());
+            let owner = sqlite_key(&trigger_relation(trigger, schema)?.stored_name());
             let description = initial_description("trigger", None, trigger.name());
             // A plain row trigger lives under the names its slots were emitted
             // with.
