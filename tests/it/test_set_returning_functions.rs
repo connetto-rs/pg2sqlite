@@ -108,6 +108,43 @@ fn a_declared_function_passes_through() {
     assert!(!translated.is_empty(), "the document should translate into at least one statement");
 }
 
+/// A view reads the columns of a declared function called in `FROM`, whether
+/// the function returns a `TABLE` or declares output arguments, through a
+/// derived table too.
+#[test]
+fn a_view_reads_the_columns_of_a_declared_function() {
+    let functions = "
+        CREATE TABLE items (id INT PRIMARY KEY, flag BOOLEAN, doc JSONB);
+        CREATE FUNCTION rows_of() RETURNS TABLE (id INT, flag BOOLEAN, doc JSONB)
+        LANGUAGE sql STABLE AS $$ SELECT id, flag, doc FROM items $$;
+        CREATE FUNCTION pair_of(OUT id INT, OUT flag BOOLEAN)
+        LANGUAGE sql STABLE AS $$ SELECT 1, true $$;";
+    let options = crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default())
+        .with_user_defined_functions(["rows_of", "pair_of"]);
+    for (view, expected) in [
+        (
+            "CREATE VIEW v AS SELECT r.id, r.doc ->> 'a' AS a FROM rows_of() AS r WHERE r.flag",
+            "CREATE VIEW v AS SELECT r.id, pg_jsonb_text(r.doc -> '$.\"a\"') AS a \
+             FROM rows_of() AS r WHERE r.flag",
+        ),
+        (
+            "CREATE VIEW v AS SELECT x.flag FROM (SELECT p.flag FROM pair_of() AS p) AS x \
+             WHERE x.flag",
+            "CREATE VIEW v AS SELECT x.flag FROM (SELECT p.flag FROM pair_of() AS p) AS x \
+             WHERE x.flag",
+        ),
+    ] {
+        let translated = Pg2Sqlite::default()
+            .sql(&format!("{functions}{view};"))
+            .expect("parse")
+            .translate_to_sql(&options)
+            .expect("a declared function's columns translate")
+            .into_vec();
+        let emitted = translated.iter().find(|statement| statement.starts_with("CREATE VIEW"));
+        assert_eq!(emitted.map(String::as_str), Some(expected), "{view}");
+    }
+}
+
 /// The json-returning variants keep PostgreSQL's quoting, so a string element
 /// comes back quoted.
 #[test]
@@ -296,6 +333,44 @@ fn a_column_named_like_the_alias_wins_over_the_whole_row() {
         (
             "SELECT (SELECT e FROM jsonb_array_elements_text('[\"a\"]'::jsonb) AS e) \
              FROM (SELECT 'z' AS e) AS o",
+            &["z"],
+        ),
+    ] {
+        assert_eq!(rows(query), texts(expected), "{query}");
+    }
+}
+
+/// The body of a derived table that is not `LATERAL` cannot see the other
+/// `FROM` items of the query holding it, so a sibling's column named like the
+/// alias does not win over the whole row. Measured on PostgreSQL 18.6, which
+/// refuses `SELECT x.v FROM (SELECT 1 AS a) t, (SELECT t.a AS v) x` with
+/// `invalid reference to FROM-clause entry for table "t"`.
+#[test]
+fn a_derived_table_does_not_see_its_siblings() {
+    assert_eq!(
+        rows(
+            "SELECT x.e FROM (SELECT 'z' AS e) AS y, \
+             (SELECT e FROM jsonb_array_elements_text('[\"a\"]'::jsonb) AS e) AS x"
+        ),
+        texts(&["a"])
+    );
+}
+
+/// The body of a derived table still sees the queries enclosing the one
+/// holding it, so the whole row and a column there both resolve as in
+/// PostgreSQL 18.6, while the function beside the derived table stays out of
+/// reach.
+#[test]
+fn a_derived_table_sees_the_queries_enclosing_its_own() {
+    for (query, expected) in [
+        (
+            "SELECT (SELECT s.v FROM (SELECT e AS v) AS s) \
+             FROM jsonb_array_elements_text('[\"a\"]'::jsonb) AS e",
+            &["a"][..],
+        ),
+        (
+            "SELECT (SELECT s.v FROM (SELECT e AS v) AS s, \
+             jsonb_array_elements_text('[\"a\"]'::jsonb) AS e) FROM (SELECT 'z' AS e) AS o",
             &["z"],
         ),
     ] {

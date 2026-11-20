@@ -40,6 +40,12 @@ impl TranslationDirection for Forward {
     ) -> Self::Options<'scope> {
         options.with_scope(scope)
     }
+
+    fn derived_table_body<'options>(
+        options: &'options Self::Options<'_>,
+    ) -> Self::Options<'options> {
+        options.derived_table_body()
+    }
     fn config<'options>(options: &'options Self::Options<'_>) -> &'options Pg2SqliteOptions {
         options
     }
