@@ -916,13 +916,83 @@ pub(crate) fn pg_text_path_to_sqlite_json_path(s: &str) -> Option<String> {
 
 /// One `."key"` step of a SQLite JSON path.
 ///
-/// Every key is quoted and every quote inside it escaped: a key is written
-/// unquoted only while it happens to look like an identifier, and `a"b` wrote
-/// `$."a"b"`, which ends the key early and matches nothing. Measured on
-/// SQLite 3.51: `json_extract('{"a\"b":1}', '$."a\"b"')` answers 1.
+/// Every key is quoted, with its quotes and backslashes escaped, since SQLite
+/// reads the quoted key as a JSON string and compares it with the decoded key.
+/// Measured on SQLite 3.51, `json_extract('{"a\"b":1}', '$."a\"b"')` answers 1
+/// and `json_extract('{"a\\b":6}', '$."a\\b"')` answers 6, where `$."a\b"`
+/// reads `\b` as a backspace and matches nothing.
 #[must_use]
 pub(crate) fn sqlite_json_path_key(key: &str) -> String {
-    format!(".\"{}\"", key.replace('"', "\\\""))
+    format!(".\"{}\"", key.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// The SQLite JSON path `$."key"`, which reads `key` and nothing else.
+fn sqlite_json_key_path(key: &str) -> Expr {
+    string_literal(&format!("${}", sqlite_json_path_key(key)))
+}
+
+/// [`sqlite_json_key_path`] for a key computed when the statement runs,
+/// escaped as [`sqlite_json_path_key`] escapes a literal one.
+fn computed_sqlite_json_key_path(key: Expr) -> Expr {
+    let escaped = simple_function_expr(
+        "replace",
+        vec![
+            simple_function_expr(
+                "replace",
+                vec![key, string_literal("\\"), string_literal("\\\\")],
+                None,
+            ),
+            string_literal("\""),
+            string_literal("\\\""),
+        ],
+        None,
+    );
+    let concat = |left, right| {
+        Expr::BinaryOp {
+            left: Box::new(left),
+            op: BinaryOperator::StringConcat,
+            right: Box::new(right),
+        }
+    };
+    // SQLite's arrows bind tighter than `||`, so the path is parenthesised.
+    Expr::Nested(Box::new(concat(concat(string_literal("$.\""), escaped), string_literal("\""))))
+}
+
+/// The right operand of `->` or `->>` as the SQLite path of the object key
+/// it names, or `None` when it is an index or its type is left open.
+///
+/// PostgreSQL reads a text operand as a key and nothing else. SQLite reads a
+/// bare text operand as a path when it starts with `$` and finds no key that
+/// is empty or carries a quote, measured on 3.51, so a key is written as the
+/// path `$."key"`. A text literal, a bound parameter and an untyped `NULL`
+/// are text there, as PostgreSQL resolves them for these operators.
+///
+/// # Errors
+///
+/// Propagates the translation of a computed key.
+fn arrow_key_path(
+    right: &Expr,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Option<Expr>, crate::errors::Error> {
+    const TEXTUAL: [&str; 8] =
+        ["text", "varchar", "character varying", "char", "character", "bpchar", "citext", "name"];
+
+    if let Expr::Value(ValueWithSpan { value, .. }) = right
+        && let Some(key) = crate::impls::function_helpers::string_literal_text(value)
+    {
+        return Ok(Some(sqlite_json_key_path(key)));
+    }
+    let names_key = crate::impls::shared_helpers::is_bound_parameter(right)
+        || crate::impls::expression_type::type_name(right, schema, options)?.is_some_and(|name| {
+            let base = name.split('(').next().unwrap_or_default().trim().to_ascii_lowercase();
+            base == crate::impls::expression_type::UNKNOWN || TEXTUAL.contains(&base.as_str())
+        });
+    if !names_key {
+        return Ok(None);
+    }
+    Ok(Some(computed_sqlite_json_key_path(right.translate_with_warnings(schema, options, emit)?)))
 }
 
 /// The refusal a numeric path element earns.
@@ -1284,18 +1354,20 @@ fn json_path_chain(
         return Err(reject_duplicated_operand(construct, document));
     }
 
-    let key = |key: &str| string_literal(&format!("${}", sqlite_json_path_key(key)));
     let hop = |value: Expr, key: Expr| {
         Expr::BinaryOp { left: Box::new(value), op: BinaryOperator::Arrow, right: Box::new(key) }
     };
     let mut value = document.translate_with_warnings(schema, options, emit)?;
     for element in elements {
         value = match element {
-            JsonPathElement::Key(name) => hop(value, key(&name)),
+            JsonPathElement::Key(name) => hop(value, sqlite_json_key_path(&name)),
             JsonPathElement::Numeric { index, verbatim } => {
                 simple_function_expr(
                     "COALESCE",
-                    vec![hop(value.clone(), integer_literal(index)), hop(value, key(&verbatim))],
+                    vec![
+                        hop(value.clone(), integer_literal(index)),
+                        hop(value, sqlite_json_key_path(&verbatim)),
+                    ],
                     None,
                 )
             }
@@ -3584,16 +3656,25 @@ fn translate_binary_op(
         ));
     }
 
-    // PostgreSQL's ->> answers the text a value prints, where SQLite's
-    // answers the value as an integer, a real or 1 and 0, so the value `->`
-    // reads goes through the registered text function.
-    if *op == BinaryOperator::LongArrow {
-        let json = Expr::BinaryOp {
-            left: Box::new(left.translate_with_warnings(schema, options, emit)?),
-            op: BinaryOperator::Arrow,
-            right: Box::new(right.translate_with_warnings(schema, options, emit)?),
-        };
-        return crate::impls::jsonb::extracted_text(json, options, &"`->>`");
+    // SQLite's ->> answers integers, reals and 1/0 where PostgreSQL prints
+    // text.
+    if matches!(op, BinaryOperator::Arrow | BinaryOperator::LongArrow) {
+        let key = arrow_key_path(right, schema, options, emit)?;
+        if key.is_some() || *op == BinaryOperator::LongArrow {
+            let key = match key {
+                Some(key) => key,
+                None => right.translate_with_warnings(schema, options, emit)?,
+            };
+            let json = Expr::BinaryOp {
+                left: Box::new(left.translate_with_warnings(schema, options, emit)?),
+                op: BinaryOperator::Arrow,
+                right: Box::new(key),
+            };
+            if *op == BinaryOperator::Arrow {
+                return Ok(json);
+            }
+            return crate::impls::jsonb::extracted_text(json, options, &"`->>`");
+        }
     }
 
     // PostgreSQL's #> and #>> read a value at a path. SQLite has no path

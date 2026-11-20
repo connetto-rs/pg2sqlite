@@ -205,12 +205,9 @@ fn view_with_chained_json_access_operators() {
         FROM docs;
     ";
     let output = translate(sql);
+    assert!(output.contains("-> '$.\"author\"'"), "Expected chained JSON access output: {output}");
     assert!(
-        output.contains("->'author'") || output.contains("-> 'author'"),
-        "Expected chained JSON access output: {output}"
-    );
-    assert!(
-        output.contains("pg_jsonb_text(") && output.contains("-> 'name')"),
+        output.contains("pg_jsonb_text(") && output.contains("-> '$.\"name\"')"),
         "Expected the text function over the chained access: {output}"
     );
     apply_translated_pg(sql);
