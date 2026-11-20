@@ -39,7 +39,11 @@ CREATE TABLE dv (id SERIAL PRIMARY KEY, note TEXT DEFAULT 'unset');
 #[must_use]
 pub fn sweep_options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
-        .with_jsonb_functions(pg2sqlite::prelude::JsonbFunctions::new("pg_jsonb", "pg_jsonb_order"))
+        .with_jsonb_functions(pg2sqlite::prelude::JsonbFunctions::new(
+            "pg_jsonb",
+            "pg_jsonb_text",
+            "pg_jsonb_order",
+        ))
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_array_representation(ArrayRepresentation::Json)
         .with_math_functions_available()

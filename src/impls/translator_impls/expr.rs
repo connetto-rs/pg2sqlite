@@ -1178,13 +1178,12 @@ fn classify_path_text(text: &str) -> JsonPathElement {
     }
 }
 
-/// PostgreSQL's `#>` and `#>>`, read into SQLite's `->`/`->>` chains by
-/// [`json_path_chain`].
+/// PostgreSQL's `#>` and `#>>`, read into SQLite's `->` chains by
+/// [`json_path_chain`], with `#>>` handing the value to the registered text
+/// function, as `->>` does.
 ///
-/// The empty path is the document itself: the operand for `#>`, and its text
-/// for `#>>`, which `->> '$'` answers. A composite document's text differs in
-/// whitespace between the engines, the same divergence the plain `->>`
-/// passthrough already carries; a scalar's does not, measured.
+/// The empty path is the document itself: the operand for `#>`, and the text
+/// function over the operand for `#>>`.
 fn translate_json_path_operator(
     left: &Expr,
     right: &Expr,
@@ -1213,46 +1212,48 @@ fn translate_json_path_operator(
              write the path without NULL."
         )));
     };
-    if elements.is_empty() {
-        let document = left.translate_with_warnings(schema, options, emit)?;
-        return Ok(if text_form {
-            Expr::BinaryOp {
-                left: Box::new(document),
-                op: BinaryOperator::LongArrow,
-                right: Box::new(string_literal("$")),
-            }
-        } else {
-            document
-        });
+    let value = if elements.is_empty() {
+        left.translate_with_warnings(schema, options, emit)?
+    } else {
+        json_path_chain(operator, left, elements, schema, options, emit)?
+    };
+    if text_form {
+        return crate::impls::jsonb::extracted_text(value, options, &format_args!("`{operator}`"));
     }
-    json_path_chain(operator, left, elements, text_form, schema, options, emit)
+    Ok(value)
 }
 
 /// PostgreSQL's `json_extract_path` and `jsonb_extract_path`, which are `#>`
 /// with the path written as arguments, so `jsonb_extract_path(d, 'a', 'b')`
-/// answers the chain `d #> '{a,b}'` does.
+/// answers the chain `d #> '{a,b}'` does, and their `_text` forms, which
+/// answer the text `#>>` does when `text_form` is set.
 ///
 /// An argument is the element's text as written, so `'null'` is a key where
 /// an array literal reads a NULL element.
 ///
 /// # Errors
 ///
-/// As [`json_path_chain`].
+/// As [`json_path_chain`], and refuses the `_text` forms when
+/// `with_jsonb_functions` names no functions.
 pub(crate) fn translate_json_extract_path(
     function: &str,
     document: &Expr,
     elements: &[&str],
+    text_form: bool,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Expr, crate::errors::Error> {
     let elements = elements.iter().map(|element| classify_path_text(element)).collect();
-    json_path_chain(function, document, elements, false, schema, options, emit)
+    let value = json_path_chain(function, document, elements, schema, options, emit)?;
+    if text_form {
+        return crate::impls::jsonb::extracted_text(value, options, &format_args!("`{function}`"));
+    }
+    Ok(value)
 }
 
-/// `document` read along the non-empty `elements` as a chain of SQLite
-/// arrows, the `->>` text arrow on the last hop when `text_form` is set and
-/// `->` everywhere else.
+/// `document` read along the non-empty `elements` as a chain of SQLite `->`
+/// arrows.
 ///
 /// A key is written as the path `$."key"`, since SQLite reads a bare label
 /// starting with `$` as a path and finds no key that is empty or carries a
@@ -1274,7 +1275,6 @@ fn json_path_chain(
     construct: &str,
     document: &Expr,
     elements: Vec<JsonPathElement>,
-    text_form: bool,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
@@ -1285,17 +1285,11 @@ fn json_path_chain(
     }
 
     let key = |key: &str| string_literal(&format!("${}", sqlite_json_path_key(key)));
+    let hop = |value: Expr, key: Expr| {
+        Expr::BinaryOp { left: Box::new(value), op: BinaryOperator::Arrow, right: Box::new(key) }
+    };
     let mut value = document.translate_with_warnings(schema, options, emit)?;
-    let last = elements.len() - 1;
-    for (position, element) in elements.into_iter().enumerate() {
-        let op = if text_form && position == last {
-            BinaryOperator::LongArrow
-        } else {
-            BinaryOperator::Arrow
-        };
-        let hop = |value: Expr, key: Expr| {
-            Expr::BinaryOp { left: Box::new(value), op: op.clone(), right: Box::new(key) }
-        };
+    for element in elements {
         value = match element {
             JsonPathElement::Key(name) => hop(value, key(&name)),
             JsonPathElement::Numeric { index, verbatim } => {
@@ -3588,6 +3582,18 @@ fn translate_binary_op(
              write the predicate as SQL over json_extract, as json_extract(doc, '$.a') > 0."
                 .to_string(),
         ));
+    }
+
+    // PostgreSQL's ->> answers the text a value prints, where SQLite's
+    // answers the value as an integer, a real or 1 and 0, so the value `->`
+    // reads goes through the registered text function.
+    if *op == BinaryOperator::LongArrow {
+        let json = Expr::BinaryOp {
+            left: Box::new(left.translate_with_warnings(schema, options, emit)?),
+            op: BinaryOperator::Arrow,
+            right: Box::new(right.translate_with_warnings(schema, options, emit)?),
+        };
+        return crate::impls::jsonb::extracted_text(json, options, &"`->>`");
     }
 
     // PostgreSQL's #> and #>> read a value at a path. SQLite has no path

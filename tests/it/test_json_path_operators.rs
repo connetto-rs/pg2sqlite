@@ -3,7 +3,7 @@
 //! Both were refused outright, whatever the path, while the crate passed `->`
 //! and `->>` chains through untouched, so the refusal declined a rewrite the
 //! crate was equipped to perform. `x #> '{a,b}'` is `x -> 'a' -> 'b'`, and
-//! `#>>` takes `->>` on the last hop.
+//! `#>>` reads that value through the registered `jsonb` text function.
 //!
 //! Every expectation here is a value PostgreSQL 18.4 answered, not a shape:
 //! the sharp edges are in the path literal, and a reader that fetched the
@@ -33,11 +33,6 @@ fn forward(postgres: &str) -> Result<String, pg2sqlite::errors::Error> {
 
 /// Runs a translated expression over the fixture row and answers the one value
 /// rendered as text, `None` for SQL NULL.
-///
-/// Rendered, because SQLite's `->>` answers a typed value where PostgreSQL's
-/// `#>>` answers text: `->> 'b'` on `{"b":2}` is INTEGER 2 there and text `2`
-/// here. That is the typing the plain `->>` passthrough already has, so the
-/// comparison is on the rendering.
 fn value_of(sqlite: &str) -> Option<String> {
     use diesel::RunQueryDsl;
     use diesel_dynamic_schema::dynamic_value::{DynamicRow, NamedField};
@@ -80,7 +75,7 @@ fn a_single_key_reads_the_value() {
 }
 
 #[test]
-fn the_text_form_takes_the_last_hop_only() {
+fn the_text_form_answers_the_text_of_the_value() {
     assert_answers("SELECT payload #>> '{a,b}' FROM t", Some("2"));
     // PG answers x for '{"0":"x"}' at the key, unquoted by #>>.
     assert_answers("SELECT payload #>> '{0}' FROM t", Some("x"));
@@ -123,9 +118,7 @@ fn an_absent_path_answers_null() {
 
 #[test]
 fn the_empty_path_is_the_document() {
-    // PG: x #> '{}' answers x itself, and #>> '{}' its text. The text of a
-    // scalar is unquoted on both engines, measured; a composite's text differs
-    // in whitespace exactly as the existing ->> passthrough does.
+    // PG: x #> '{}' answers x itself, and #>> '{}' its text.
     assert_answers("SELECT payload #> '{}' -> 'a' -> 'b' FROM t", Some("2"));
     assert_answers("SELECT payload #> '{a,b}' #>> '{}' FROM t", Some("2"));
 }

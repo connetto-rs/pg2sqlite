@@ -29,7 +29,7 @@ use crate::{
 /// The collation SQLite compares bytes under.
 const BINARY: &str = "BINARY";
 
-/// The function and collation `options` names, or the refusal naming the
+/// The functions and collation `options` names, or the refusal naming the
 /// option, with `construct` saying what needs them.
 ///
 /// # Errors
@@ -39,15 +39,56 @@ pub(crate) fn functions<'o>(
     options: &'o Pg2SqliteOptions,
     construct: &str,
 ) -> Result<&'o JsonbFunctions, Error> {
+    named(options, || {
+        format!(
+            "{construct} is jsonb, which the replica stores as the text PostgreSQL prints for \
+             it and compares under jsonb's own order, so `'1.0'::jsonb = '1'::jsonb` holds. \
+             That takes a SQLite function bringing a text to that form and a collation \
+             comparing two of them."
+        )
+    })
+}
+
+/// The functions and collation `options` names, or the refusal opening with
+/// `need` and closing with how to name them.
+fn named(
+    options: &Pg2SqliteOptions,
+    need: impl FnOnce() -> String,
+) -> Result<&JsonbFunctions, Error> {
     options.get_jsonb_functions().ok_or_else(|| {
         Error::forward_refusal(format!(
-            "{construct} is jsonb, which the replica stores as the text PostgreSQL prints for it \
-             and compares under jsonb's own order, so `'1.0'::jsonb = '1'::jsonb` holds. That \
-             takes a SQLite function bringing a text to that form and a collation comparing two \
-             of them. Register both on the connection, with `JsonbFunctions::register` under the \
-             `diesel` feature, and name them with `with_jsonb_functions(...)`."
+            "{} Register the jsonb functions and collation on the connection, with \
+             `JsonbFunctions::register` under the `diesel` feature, and name them with \
+             `with_jsonb_functions(...)`.",
+            need()
         ))
     })
+}
+
+/// The text `->>` and `#>>` extract from `json`, the value SQLite's `->`
+/// reads, through the registered text function, with `construct` saying
+/// what extracts it.
+///
+/// SQLite's `->>` answers a number as an integer or a real and a boolean as
+/// 1 or 0, where PostgreSQL answers the text the value prints.
+///
+/// # Errors
+///
+/// Refuses when `with_jsonb_functions` names no functions.
+pub(crate) fn extracted_text(
+    json: Expr,
+    options: &Pg2SqliteOptions,
+    construct: &dyn core::fmt::Display,
+) -> Result<Expr, Error> {
+    let functions = named(options, || {
+        format!(
+            "{construct} extracts text from a JSON value, which PostgreSQL answers as the text \
+             the value prints, so `'{{\"a\": 7}}'::jsonb ->> 'a'` is the text '7' and `true` \
+             reads as 'true'. SQLite's ->> answers them as the integers 7 and 1, so the replica \
+             reads the value through a SQLite function answering PostgreSQL's text."
+        )
+    })?;
+    Ok(simple_function_expr(&functions.text, vec![json], None))
 }
 
 /// The text PostgreSQL prints for the `jsonb` document `text`.

@@ -2,7 +2,7 @@
 
 #![allow(missing_docs)]
 
-use diesel::{Connection, RunQueryDsl, SqliteConnection};
+use diesel::RunQueryDsl;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
 #[test]
@@ -20,7 +20,7 @@ fn test_regular_arrow_still_passes_through() -> Result<(), Box<dyn std::error::E
 #[test]
 fn test_json_access_in_trigger_body() -> Result<(), Box<dyn std::error::Error>> {
     let sql = "
-        CREATE TABLE events (id SERIAL PRIMARY KEY, payload TEXT);
+        CREATE TABLE events (id SERIAL PRIMARY KEY, payload JSONB);
         CREATE TABLE event_log (id SERIAL PRIMARY KEY, field_value TEXT);
 
         CREATE FUNCTION log_field() RETURNS TRIGGER AS $$
@@ -34,10 +34,12 @@ fn test_json_access_in_trigger_body() -> Result<(), Box<dyn std::error::Error>> 
         AFTER INSERT ON events FOR EACH ROW EXECUTE FUNCTION log_field();
     ";
 
-    let translated =
-        Pg2Sqlite::default().sql(sql)?.translate(&Pg2SqliteOptions::default())?.into_vec();
+    let translated = Pg2Sqlite::default()
+        .sql(sql)?
+        .translate(&crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()))?
+        .into_vec();
 
-    let mut conn = SqliteConnection::establish(":memory:")?;
+    let mut conn = crate::helpers::establish_connection();
     for stmt in &translated {
         diesel::sql_query(stmt.to_string()).execute(&mut conn)?;
     }

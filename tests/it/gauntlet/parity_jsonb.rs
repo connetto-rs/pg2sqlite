@@ -444,6 +444,46 @@ fn negative_numbers_keep_their_digits_in_built_documents() {
     );
 }
 
+/// `->>`, `#>>` and `jsonb_extract_path_text` answer text for every value
+/// kind: a string's contents, the printed value for a number, a boolean, an
+/// object or an array, and NULL for `null` and for a missing key.
+#[test]
+fn text_extraction_answers_postgresql_text_for_every_value_kind() {
+    let rows = assert_parity(
+        TABLE,
+        &[Step::Sql(
+            r#"INSERT INTO docs (id, body) VALUES
+                (1, '{"k": "a\nb \"q\" é"}'), (2, '{"k": "8"}'), (3, '{"k": 7}'),
+                (4, '{"k": 1.50}'), (5, '{"k": 1e2}'), (6, '{"k": -0}'),
+                (7, '{"k": 123456789012345678901234567890}'), (8, '{"k": 1e400}'),
+                (9, '{"k": true}'), (10, '{"k": false}'), (11, '{"k": null}'),
+                (12, '{"k": {"b": 1, "a": [1, 2]}}'), (13, '{"k": [1, "x"]}'), (14, '{}')"#,
+        )],
+        &[
+            "SELECT body ->> 'k' AS value FROM docs ORDER BY id",
+            "SELECT body #>> '{k}' AS value FROM docs ORDER BY id",
+            "SELECT jsonb_build_object('w', body) #>> '{w,k}' AS value FROM docs ORDER BY id",
+            "SELECT jsonb_build_array(body -> 'k') #>> '{0}' AS value FROM docs ORDER BY id",
+            "SELECT (body -> 'k') #>> '{}' AS value FROM docs ORDER BY id",
+            "SELECT jsonb_extract_path_text(body, 'k') AS value FROM docs ORDER BY id",
+            "SELECT jsonb_build_object('w', body) ->> 'w' AS value FROM docs ORDER BY id",
+            "SELECT id::text AS value FROM docs \
+             WHERE body ->> 'k' IN ('7', 'true', 'false', '1.50', '100', '0') ORDER BY id",
+            "SELECT id::text AS value FROM docs WHERE body #>> '{k}' = '7' ORDER BY id",
+            "SELECT id::text AS value FROM docs \
+             WHERE jsonb_extract_path_text(body, 'k') = '123456789012345678901234567890' \
+             ORDER BY id",
+        ],
+    );
+    assert_eq!(rows[0][0], "a\nb \"q\" é");
+    assert_eq!(rows[0][3..5], ["1.50", "100"]);
+    assert_eq!(
+        rows[0][8..14],
+        ["true", "false", "NULL", r#"{"a": [1, 2], "b": 1}"#, r#"[1, "x"]"#, "NULL"]
+    );
+    assert_eq!(rows[7], ["3", "4", "5", "6", "9", "10"]);
+}
+
 /// Missing host support refuses a `JSONB` column with registration
 /// instructions.
 #[test]
@@ -475,7 +515,7 @@ fn registration_reports_a_function_name_sqlite_refuses() {
     use pg2sqlite::prelude::JsonbFunctions;
 
     let mut connection = establish_connection();
-    let error = JsonbFunctions::new("invalid\0name", "unused_collation")
+    let error = JsonbFunctions::new("invalid\0name", "unused_text", "unused_collation")
         .register(&mut connection)
         .expect_err("SQLite function names cannot contain NUL");
     assert!(error.to_string().contains("nul byte"), "{error}");
@@ -496,6 +536,29 @@ fn the_canonicalising_function_reverses_to_postgresql_text() {
     let query = reversed.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ");
     let (_, rows) = postgres(TABLE, &[], &[&query]);
     assert_eq!(rows, [vec![r#"{"a": 3, "b": 2}"#.to_owned()]]);
+}
+
+/// The text function reverses to the text PostgreSQL extracts, so a
+/// translated `->>` read comes back answering the same rows.
+#[test]
+fn the_text_function_reverses_to_postgresql_text() {
+    let translator = Pg2Sqlite::default().sql(TABLE).expect("parse schema");
+    let schema = translator.build_schema().expect("build schema");
+    let reversed = translator
+        .reverse_sql(
+            r#"SELECT pg_jsonb_text(body -> 'k') AS value FROM docs
+               UNION ALL SELECT pg_jsonb_text('"a\nb"') UNION ALL SELECT pg_jsonb_text('true')"#,
+            &schema,
+            &options(),
+        )
+        .expect("reverse the text function");
+    let query = reversed.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ");
+    let (_, rows) = postgres(
+        TABLE,
+        &[Step::Sql(r#"INSERT INTO docs (id, body) VALUES (1, '{"k": 1.50}')"#)],
+        &[&query],
+    );
+    assert_eq!(rows, [vec!["1.50".to_owned(), "a\nb".to_owned(), "true".to_owned()]]);
 }
 
 /// SQLite byte ordering on an uncast value cannot silently become PostgreSQL

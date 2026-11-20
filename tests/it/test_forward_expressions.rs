@@ -189,7 +189,10 @@ fn view_with_json_access_operator_arrow_text() {
         FROM docs;
     ";
     let output = translate(sql);
-    assert!(output.contains("->>"), "Expected JSON text access operator in output: {output}");
+    assert!(
+        output.contains("pg_jsonb_text(payload -> 'author')"),
+        "Expected the text function over the JSON access operator: {output}"
+    );
     apply_translated_pg(sql);
 }
 
@@ -206,7 +209,10 @@ fn view_with_chained_json_access_operators() {
         output.contains("->'author'") || output.contains("-> 'author'"),
         "Expected chained JSON access output: {output}"
     );
-    assert!(output.contains("->>"), "Expected chained JSON text access output: {output}");
+    assert!(
+        output.contains("pg_jsonb_text(") && output.contains("-> 'name')"),
+        "Expected the text function over the chained access: {output}"
+    );
     apply_translated_pg(sql);
 }
 

@@ -743,9 +743,7 @@ fn report_column_downgrades(
             location: location.clone(),
             reason: "The replica orders strings inside a jsonb value bytewise, as the C \
                      collation does, where a server whose default collation is another locale \
-                     orders them by that locale. And ->> answers a number as SQLite's double, so \
-                     1.50 reads back as 1.5 and a 30-digit integer loses its last digits, where \
-                     the server answers the number's text."
+                     orders them by that locale."
                 .to_string(),
         });
     }

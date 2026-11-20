@@ -133,6 +133,9 @@ diesel = { git = "https://github.com/diesel-rs/diesel", branch = "main" }
 # Follows diesel's patch, so the `SqlState` the decoder returns is the type
 # diesel reports a PostgreSQL error's code as.
 sqlstate = { git = "https://github.com/diesel-rs/diesel", branch = "main" }
+# `PgJsonb::to_text`, which the registered `->>` function answers with, is on
+# sql-values main and absent from 0.6.0.
+sql-values = { git = "https://github.com/connetto-rs/sql-values", branch = "main" }
 
 [[test]]
 name = "it"

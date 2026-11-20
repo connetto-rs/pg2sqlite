@@ -206,25 +206,23 @@ fn make_timestamp_to_printf() {
 }
 
 #[test]
-fn json_extract_path_text_to_json_extract() {
+fn json_extract_path_text_reads_through_the_text_function() {
     let sql = "SELECT json_extract_path_text('{\"a\": 1}', 'a')";
     let result = translate_sql(sql, &default_opts()).unwrap();
-    let lower = result.to_lowercase();
     assert!(
-        lower.contains("json_extract("),
-        "json_extract_path_text should become json_extract: {result}"
+        result.contains(r#"pg_jsonb_text('{"a": 1}' -> '$."a"')"#),
+        "json_extract_path_text should read through the text function: {result}"
     );
     sqlite_accepts(&result);
 }
 
 #[test]
-fn jsonb_extract_path_text_to_json_extract() {
+fn jsonb_extract_path_text_reads_through_the_text_function() {
     let sql = "SELECT jsonb_extract_path_text('{\"a\": 1}', 'a')";
     let result = translate_sql(sql, &default_opts()).unwrap();
-    let lower = result.to_lowercase();
     assert!(
-        lower.contains("json_extract("),
-        "jsonb_extract_path_text should become json_extract: {result}"
+        result.contains(r#"pg_jsonb_text('{"a": 1}' -> '$."a"')"#),
+        "jsonb_extract_path_text should read through the text function: {result}"
     );
     sqlite_accepts(&result);
 }
