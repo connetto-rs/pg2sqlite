@@ -598,7 +598,7 @@ const KINDS: Step = Step::Sql(
        (7, '{"a": [10, "y", null]}', '{"a":[10,"y",null]}'),
        (8, '{}', '{}'),
        (9, '[{"a": 1}]', '[{"a":1}]'),
-       (10, '{"a.b": 1, "a\"b": 2, "$x": 3, "": 4, " 1": 5}', '{"a.b":1,"a\"b":2,"$x":3,"":4," 1":5}')"#,
+       (10, '{"a.b": 1, "a\"b": 2, "$x": 3, "": 4, " 1": 5, "a\\b": 6}', '{"a.b":1,"a\"b":2,"$x":3,"":4," 1":5,"a\\b":6}')"#,
 );
 
 #[test]
@@ -656,5 +656,34 @@ fn extract_path_is_stored_as_jsonb() {
             Step::Sql("UPDATE docs SET body = jsonb_extract_path(body, 'a', 'c') WHERE id = 6"),
         ],
         &["SELECT id::text || ' ' || coalesce(body::text, 'NULL') AS value FROM docs ORDER BY id"],
+    );
+}
+
+/// The keys of the `id = 10` document, one per spelling SQLite could read as
+/// something other than that key, and the indexes of the `id = 7` array.
+const KEYS: &str = r#"CREATE TABLE keys (id INTEGER PRIMARY KEY, k TEXT);
+    INSERT INTO keys VALUES (0, 'a.b'), (1, 'a"b'), (2, '$x'), (3, ''), (4, ' 1'), (5, 'a\b');"#;
+
+#[test]
+fn the_arrows_read_every_key_as_that_key() {
+    assert_parity(
+        &format!("{TABLE}{KEYS}"),
+        &[KINDS],
+        &[
+            "SELECT (body -> 'a.b')::text || (body -> 'a\"b')::text || (body -> '$x')::text \
+             || (body -> '')::text || (body -> ' 1')::text || (body -> 'a\\b')::text AS value \
+             FROM docs WHERE id = 10",
+            "SELECT (body ->> 'a.b') || (body ->> 'a\"b') || (body ->> '$x') || (body ->> '') \
+             || (body ->> ' 1') || (body ->> 'a\\b') AS value FROM docs WHERE id = 10",
+            "SELECT (j -> 'a\"b')::text || (j -> '$x')::text || (j -> '')::text \
+             || (j ->> 'a\\b') AS value FROM docs WHERE id = 10",
+            "SELECT (body #> '{\"a\\\\b\"}')::text || jsonb_extract_path(body, 'a\\b')::text \
+             AS value FROM docs WHERE id = 10",
+            "SELECT k.id::text || ' ' || coalesce((d.body -> k.k)::text, 'NULL') || ' ' \
+             || coalesce(d.body ->> k.k, 'NULL') AS value FROM docs d, keys k WHERE d.id = 10 \
+             ORDER BY k.id",
+            "SELECT coalesce((d.body -> 'a' -> k.id)::text, 'NULL') AS value FROM docs d, keys k \
+             WHERE d.id = 7 ORDER BY k.id",
+        ],
     );
 }

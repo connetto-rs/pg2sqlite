@@ -497,7 +497,7 @@ fn a_json_read_over_anything_but_a_setting_keeps_its_translation() {
         translate("SELECT upper('{\"a\":\"x\"}')::jsonb ->> 'a';", &options()).expect("translates");
     assert!(
         translated.ends_with(
-            "pg_jsonb_text((pg_jsonb(upper('{\"a\":\"x\"}')) COLLATE pg_jsonb_order) -> 'a')"
+            "pg_jsonb_text((pg_jsonb(upper('{\"a\":\"x\"}')) COLLATE pg_jsonb_order) -> '$.\"a\"')"
         ),
         "{translated}"
     );
