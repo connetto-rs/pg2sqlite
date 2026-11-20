@@ -4,6 +4,7 @@ use sql_traits::{
     errors::LookupError,
     structs::{MaintenanceRefusal, ParserDB},
     traits::{ColumnLike, DatabaseLike, Relation, TableLike, TriggerLike, ViewLike},
+    utils::identifier_resolution::stored_ident_name,
 };
 use sqlparser::{
     ast::{
@@ -90,7 +91,7 @@ fn maintenance_chain(
     let facts = maintenance_facts(trigger);
     let undeclared: Vec<(&str, String)> = trigger
         .maintenance_undeclared_fields(schema)?
-        .map(|field| (field.row().name(), stored_field(field.field())))
+        .map(|field| (field.row().name(), stored_ident_name(field.field()).into_owned()))
         .collect();
     let mut assigned: Vec<(String, Expr)> = Vec::new();
     for (col, raw) in trigger.maintenance_assignments(schema)? {
@@ -101,15 +102,6 @@ fn maintenance_chain(
         assigned.push((col.column_name().to_owned(), composed));
     }
     Ok(assigned)
-}
-
-/// `ident` as PostgreSQL stores it.
-fn stored_field(ident: &Ident) -> String {
-    sql_traits::utils::identifier_resolution::stored_identifier(
-        &ident.value,
-        ident.quote_style.is_some(),
-    )
-    .into_owned()
 }
 
 /// `expr` with each read of a field `undeclared` lists, and of a nested field,
@@ -126,7 +118,7 @@ fn without_undeclared(expr: &Expr, undeclared: &[(&str, String)]) -> Expr {
                         .any(|row| parts[0].value.eq_ignore_ascii_case(row))
                     || undeclared.iter().any(|(row, field)| {
                         parts[0].value.eq_ignore_ascii_case(row)
-                            && *field == stored_field(&parts[1])
+                            && *field == stored_ident_name(&parts[1])
                     })) =>
         {
             Expr::Value(ValueWithSpan { value: Value::Null, span: Span::empty() })

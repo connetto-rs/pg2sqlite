@@ -200,6 +200,7 @@ fn a_column_no_relation_holds_does_not_exist() {
 fn an_unquoted_name_is_refused_as_postgresql_folds_it() {
     let undefined = |statement, message| assert_refused(statement, pg::UNDEFINED_COLUMN, message);
     undefined("SELECT Nosuch FROM docs", r#"column "nosuch" does not exist"#);
+    undefined(r#"SELECT "Nosuch" FROM docs"#, r#"column "Nosuch" does not exist"#);
     undefined("SELECT D.Nosuch FROM docs d", "column d.nosuch does not exist");
     undefined("UPDATE docs SET Nosuch = 1", r#"column "nosuch" of relation "docs" does not exist"#);
     assert_refused(
@@ -211,6 +212,11 @@ fn an_unquoted_name_is_refused_as_postgresql_folds_it() {
         "SELECT * FROM docs D, (SELECT D.id) s",
         pg::UNDEFINED_TABLE,
         r#"invalid reference to FROM-clause entry for table "d""#,
+    );
+    assert_refused(
+        "SELECT ID FROM docs, notes",
+        pg::AMBIGUOUS_COLUMN,
+        r#"column reference "id" is ambiguous"#,
     );
 }
 

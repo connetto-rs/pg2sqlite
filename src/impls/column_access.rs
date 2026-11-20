@@ -2,7 +2,6 @@
 //! expression of a PL/pgSQL body, names before SQLite, which reads a
 //! double-quoted name no column in scope holds as a string, sees it.
 
-use alloc::borrow::Cow;
 use core::{ops::ControlFlow, ptr};
 
 use sql_traits::{
@@ -12,7 +11,7 @@ use sql_traits::{
         ParserDB, TargetName,
     },
     traits::{ColumnLike, DatabaseLike, TableLike},
-    utils::identifier_resolution::{identifiers_match, stored_identifier},
+    utils::identifier_resolution::{identifiers_match, stored_ident_name},
 };
 use sqlparser::ast::{
     Assignment, AssignmentTarget, ConflictTarget, Expr, FunctionArg, FunctionArguments, Ident,
@@ -217,7 +216,7 @@ fn missing_relation<V: Visit>(node: &V, schema: &ParserDB) -> Result<(), Error> 
             continue;
         }
         let written: Vec<_> =
-            name.0.iter().filter_map(ObjectNamePart::as_ident).map(folded).collect();
+            name.0.iter().filter_map(ObjectNamePart::as_ident).map(stored_ident_name).collect();
         return Err(postgres(
             pg::UNDEFINED_TABLE,
             format!("relation \"{}\" does not exist", written.join(".")),
@@ -251,7 +250,7 @@ fn relation_exists(name: &ObjectName, schema: &ParserDB) -> Option<bool> {
         _ => return None,
     };
     let target = TargetName::new(&last.value, last.quote_style.is_some());
-    let candidates = match qualifier.map(|qualifier| (folded(qualifier), qualifier)) {
+    let candidates = match qualifier.map(|qualifier| (stored_ident_name(qualifier), qualifier)) {
         None => vec![target.clone().with_schema("pg_temp", false), target],
         Some((stored, qualifier)) if stored == "public" || stored == "pg_temp" => {
             vec![target.with_schema(&qualifier.value, qualifier.quote_style.is_some())]
@@ -376,7 +375,9 @@ fn resolve<'c>(
         Ok(Some(_)) => Ok(Reference::Other),
         Err(LookupError::AmbiguousTableLookup { .. }) => {
             Ok(Reference::Ambiguous(
-                parts.last().map_or_else(String::new, |ident| ident.value.clone()),
+                parts
+                    .last()
+                    .map_or_else(String::new, |ident| stored_ident_name(ident).into_owned()),
             ))
         }
         Ok(None) => {
@@ -422,18 +423,18 @@ fn unbound(
                 pg::UNDEFINED_TABLE,
                 format!(
                     "invalid reference to FROM-clause entry for table \"{}\"",
-                    folded(qualifier)
+                    stored_ident_name(qualifier)
                 ),
             ))
         }
         [.., qualifier, _] if !relations.exposes(qualifier) => {
             Err(postgres(
                 pg::UNDEFINED_TABLE,
-                format!("missing FROM-clause entry for table \"{}\"", folded(qualifier)),
+                format!("missing FROM-clause entry for table \"{}\"", stored_ident_name(qualifier)),
             ))
         }
         _ => {
-            let written: Vec<_> = parts.iter().map(folded).collect();
+            let written: Vec<_> = parts.iter().map(stored_ident_name).collect();
             Err(postgres(
                 pg::UNDEFINED_COLUMN,
                 format!("column {} does not exist", written.join(".")),
@@ -459,7 +460,7 @@ impl Variables<'_> {
     /// declare, as PostgreSQL does, and returns the lookup errors that
     /// meets.
     fn reach(&self, parts: &[Ident], schema: &ParserDB) -> Result<bool, Error> {
-        let stored: Vec<_> = parts.iter().map(folded).collect();
+        let stored: Vec<_> = parts.iter().map(stored_ident_name).collect();
         let Some((name, consumed)) = self.namespace.lookup(&stored, |_| true) else {
             return Ok(false);
         };
@@ -473,7 +474,7 @@ impl Variables<'_> {
         {
             return Err(postgres(
                 pg::UNDEFINED_COLUMN,
-                format!("record \"{record}\" has no field \"{}\"", folded(field)),
+                format!("record \"{record}\" has no field \"{}\"", stored_ident_name(field)),
             ));
         }
         Ok(true)
@@ -482,7 +483,7 @@ impl Variables<'_> {
     /// PostgreSQL's error for a read naming more than one part past `NEW` or
     /// `OLD`, which it takes for a column of a relation the query lists.
     fn nested_row_read(&self, parts: &[Ident]) -> Option<Error> {
-        let stored: Vec<_> = parts.iter().map(folded).collect();
+        let stored: Vec<_> = parts.iter().map(stored_ident_name).collect();
         let (name, consumed) = self.namespace.lookup(stored.get(..1)?, |_| true)?;
         if !matches!(name.kind(), NameKind::Trigger(TriggerVariable::New | TriggerVariable::Old)) {
             return None;
@@ -524,12 +525,7 @@ fn postgres(sqlstate: SqlState, message: String) -> Error {
 }
 
 fn undefined_column(name: &Ident) -> Error {
-    postgres(pg::UNDEFINED_COLUMN, format!("column \"{}\" does not exist", folded(name)))
-}
-
-/// `name` as PostgreSQL stores it and names it in its errors.
-fn folded(name: &Ident) -> Cow<'_, str> {
-    stored_identifier(&name.value, name.quote_style.is_some())
+    postgres(pg::UNDEFINED_COLUMN, format!("column \"{}\" does not exist", stored_ident_name(name)))
 }
 
 fn denied(table: &Table) -> Error {
@@ -721,7 +717,7 @@ fn target<'s>(
             pg::UNDEFINED_COLUMN,
             format!(
                 "column \"{}\" of relation \"{}\" does not exist",
-                folded(written),
+                stored_ident_name(written),
                 table.table_name()
             ),
         ));
