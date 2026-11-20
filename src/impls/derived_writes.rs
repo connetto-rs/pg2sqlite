@@ -11,11 +11,14 @@
 //! left out whole when it does nothing else, and when what it keeps reads
 //! what a write the server derives produces before it, which the replica
 //! never sees: a later statement of its own, `FOUND` or the row a write
-//! returns, or a table another trigger or a foreign key action writes on the
-//! same write before it fires.
+//! returns, or rows of a table another trigger or a foreign key action
+//! writes on the same write before it fires. [`rows`] holds a read and a
+//! write to the labels of enum columns they filter or write, where only
+//! disjoint labels prove that they share no row.
 
 mod chain;
 mod firing;
+mod rows;
 
 use alloc::borrow::Cow;
 use core::{fmt::Write as _, ops::ControlFlow};
@@ -78,6 +81,8 @@ pub(crate) struct DerivedWrite {
     table: Option<String>,
     /// The table written, its last name part folded.
     relation: Option<String>,
+    /// The rows of the table it writes.
+    rows: rows::Rows,
 }
 
 impl DerivedWrite {
@@ -128,10 +133,19 @@ fn chain_phrase(chain: &[String]) -> String {
     phrase
 }
 
+/// Where a statement runs: the chain of functions reaching it, the trigger's
+/// own first, and the names the last of them may read as variables, as
+/// [`rows::variables`] gives them.
+#[derive(Clone, Copy)]
+struct Reach<'c> {
+    chain: &'c [String],
+    variables: &'c [String],
+}
+
 /// Collects every statement that writes rows, in body order through nested
 /// blocks, branches and data-modifying `WITH` items.
 struct Writes<'c> {
-    chain: &'c [String],
+    reach: Reach<'c>,
     found: Vec<DerivedWrite>,
 }
 
@@ -149,19 +163,19 @@ impl Visitor for Writes<'_> {
         };
         let target = primary_write_target(statement);
         self.found.push(DerivedWrite {
-            chain: self.chain.to_vec(),
+            chain: self.reach.chain.to_vec(),
             statement: kind,
             table: target.map(last_ident_value_or_display),
             relation: target.and_then(last_ident).map(fold),
+            rows: rows::written(statement, self.reach.variables),
         });
         ControlFlow::Continue(())
     }
 }
 
-/// Every write `node` makes itself, reached through the functions `chain`
-/// names.
-fn statement_writes<N: Visit>(node: &N, chain: &[String]) -> Vec<DerivedWrite> {
-    let mut writes = Writes { chain, found: Vec::new() };
+/// Every write `node` makes itself, run where `reach` says.
+fn statement_writes<N: Visit>(node: &N, reach: Reach<'_>) -> Vec<DerivedWrite> {
+    let mut writes = Writes { reach, found: Vec::new() };
     let _: ControlFlow<()> = node.visit(&mut writes);
     writes.found
 }
@@ -172,27 +186,27 @@ fn statement_writes<N: Visit>(node: &N, chain: &[String]) -> Vec<DerivedWrite> {
 /// refuses it. A cursor's query, an assigned value and a returned value are a
 /// `SELECT` PostgreSQL refuses to write in, and a call they make is read with
 /// the function's other calls.
-fn nodes_writes(nodes: &[Node], chain: &[String], writes: &mut Vec<DerivedWrite>) {
+fn nodes_writes(nodes: &[Node], reach: Reach<'_>, writes: &mut Vec<DerivedWrite>) {
     for node in nodes {
         match &node.kind {
             NodeKind::Statement { statement, .. }
             | NodeKind::Open(Open::Query { query: statement, .. })
             | NodeKind::Perform { query: statement }
             | NodeKind::ReturnQuery(ReturnQuery::Query(statement)) => {
-                writes.extend(statement_writes(statement.as_ref(), chain));
+                writes.extend(statement_writes(statement.as_ref(), reach));
             }
-            NodeKind::Block(block) => block_writes(block, chain, writes),
+            NodeKind::Block(block) => block_writes(block, reach, writes),
             NodeKind::If(If { branches, otherwise }) => {
-                branches_writes(branches, otherwise, chain, writes);
+                branches_writes(branches, otherwise, reach, writes);
             }
             NodeKind::Case(Case { branches, otherwise, .. }) => {
-                branches_writes(branches, otherwise.as_deref().unwrap_or_default(), chain, writes);
+                branches_writes(branches, otherwise.as_deref().unwrap_or_default(), reach, writes);
             }
             NodeKind::Loop(repeated) => {
                 if let LoopControl::Query { query, .. } = &repeated.control {
-                    writes.extend(statement_writes(query.as_ref(), chain));
+                    writes.extend(statement_writes(query.as_ref(), reach));
                 }
-                nodes_writes(&repeated.statements, chain, writes);
+                nodes_writes(&repeated.statements, reach, writes);
             }
             NodeKind::Open(Open::Bound(_) | Open::Dynamic { .. })
             | NodeKind::ReturnQuery(ReturnQuery::Dynamic(_))
@@ -219,19 +233,19 @@ fn nodes_writes(nodes: &[Node], chain: &[String], writes: &mut Vec<DerivedWrite>
 fn branches_writes(
     branches: &[Branch],
     otherwise: &[Node],
-    chain: &[String],
+    reach: Reach<'_>,
     writes: &mut Vec<DerivedWrite>,
 ) {
     for branch in branches {
-        nodes_writes(&branch.statements, chain, writes);
+        nodes_writes(&branch.statements, reach, writes);
     }
-    nodes_writes(otherwise, chain, writes);
+    nodes_writes(otherwise, reach, writes);
 }
 
-fn block_writes(block: &Block, chain: &[String], writes: &mut Vec<DerivedWrite>) {
-    nodes_writes(&block.statements, chain, writes);
+fn block_writes(block: &Block, reach: Reach<'_>, writes: &mut Vec<DerivedWrite>) {
+    nodes_writes(&block.statements, reach, writes);
     for handler in &block.handlers {
-        nodes_writes(&handler.statements, chain, writes);
+        nodes_writes(&handler.statements, reach, writes);
     }
 }
 
@@ -301,10 +315,13 @@ fn function_writes<'db>(
     visited.push(function);
     chain.push(function.name().to_owned());
     match parsed_body(function, schema)? {
-        Body::PlPgSql(block) => block_writes(&block, chain, writes),
+        Body::PlPgSql(block) => {
+            let variables = rows::variables(function, &block);
+            block_writes(&block, Reach { chain, variables: &variables }, writes);
+        }
         Body::Sql(statements) => {
             for statement in statements.iter() {
-                writes.extend(statement_writes(statement, chain));
+                writes.extend(statement_writes(statement, Reach { chain, variables: &[] }));
             }
         }
     }
@@ -374,7 +391,8 @@ pub(crate) fn trigger_disposition(
         if let Some(dependency) = chain.dependency.take() {
             return Ok(Disposition::LeftOut(dependency));
         }
-        if let Some(dependency) = firing::own_dependency(&chain, schema, options)? {
+        let record = last_ident(&trigger.table_name).map(fold).unwrap_or_default();
+        if let Some(dependency) = firing::own_dependency(&chain, &record, schema, options)? {
             return Ok(Disposition::LeftOut(dependency));
         }
         if let Some(construct) = chain.procedural {

@@ -1244,3 +1244,211 @@ CREATE TRIGGER notes_revised BEFORE UPDATE ON notes
     let shown = left_to_server_shown(pg);
     assert!(shown[0].contains("assigns NEW beside INSERT on note_events"), "{shown:?}");
 }
+
+/// Teams, each copied into `grantees` by a trigger the replica leaves to the
+/// server, and a check firing after it that refuses a team while the `open`
+/// query counts no grantee.
+struct TeamGrantees<'s> {
+    /// The type of the kind columns.
+    kind: &'s str,
+    /// The statement copying a team into `grantees`.
+    insert: &'s str,
+    open: &'s str,
+    /// More of the schema.
+    extra: &'s str,
+}
+
+impl Default for TeamGrantees<'_> {
+    fn default() -> Self {
+        Self {
+            kind: "grantee_kind",
+            insert: "INSERT INTO grantees (id, kind) VALUES (NEW.id, NEW.kind)",
+            open: "SELECT count(*) FROM grantees grantee WHERE grantee.kind IN ('user', 'everyone')",
+            extra: "",
+        }
+    }
+}
+
+impl TeamGrantees<'_> {
+    fn sql(&self) -> String {
+        let Self { kind, insert, open, extra } = self;
+        format!(
+            "
+CREATE TYPE grantee_kind AS ENUM ('user', 'team', 'everyone');
+CREATE TABLE grantees (id INTEGER PRIMARY KEY, kind {kind} NOT NULL);
+CREATE TABLE teams (id INTEGER PRIMARY KEY,
+  kind {kind} GENERATED ALWAYS AS ('team'::{kind}) STORED NOT NULL);
+CREATE VIEW everyone AS SELECT id FROM grantees WHERE kind = 'everyone';
+CREATE FUNCTION insert_grantee() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  {insert};
+  RETURN NULL;
+END
+$$;
+CREATE FUNCTION open_grantees() RETURNS BIGINT LANGUAGE sql STABLE AS $$
+  {open}
+$$;
+CREATE FUNCTION refuse_closed_team() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF open_grantees() = 0 THEN
+    RAISE EXCEPTION 'no grantee is open' USING ERRCODE = 'check_violation';
+  END IF;
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER teams_a_grantee AFTER INSERT ON teams FOR EACH ROW EXECUTE FUNCTION insert_grantee();
+CREATE TRIGGER teams_b_open AFTER INSERT ON teams FOR EACH ROW EXECUTE FUNCTION refuse_closed_team();
+{extra}"
+        )
+    }
+
+    /// Whether the replica keeps the check, leaving only the copy to the
+    /// server.
+    fn keeps_the_check(&self) -> bool {
+        let left = left_to_server(&self.sql());
+        let copy = ("TRIGGER", "teams_a_grantee", "teams");
+        let check = ("TRIGGER", "teams_b_open", "teams");
+        if left == owned(&[copy]) {
+            true
+        } else {
+            assert_eq!(left, owned(&[copy, check]));
+            false
+        }
+    }
+}
+
+#[test]
+fn a_check_reading_other_labels_than_a_removed_write_inserts_stays() {
+    let pg = TeamGrantees::default().sql();
+    assert_eq!(left_to_server(&pg), owned(&[("TRIGGER", "teams_a_grantee", "teams")]));
+    let mut connection = replica(&pg);
+    assert_eq!(
+        refusal_of(&mut connection, "INSERT INTO teams (id) VALUES (1)"),
+        Some((pg::CHECK_VIOLATION, "no grantee is open".to_owned())),
+    );
+    connection.batch_execute("INSERT INTO grantees (id, kind) VALUES (9, 'everyone')").unwrap();
+    assert_eq!(refusal_of(&mut connection, "INSERT INTO teams (id) VALUES (1)"), None);
+    assert_eq!(count(&mut connection, "grantees"), 1);
+}
+
+#[test]
+fn only_a_read_held_to_other_labels_in_every_naming_of_the_table_stays() {
+    for (open, kept) in [
+        ("SELECT count(*) FROM grantees WHERE grantees.kind = 'everyone'", true),
+        ("SELECT count(*) FROM grantees WHERE kind = 'everyone' AND id > 0", true),
+        (
+            "SELECT count(*) FROM (SELECT id FROM grantees g WHERE g.kind = 'user' UNION \
+             SELECT g.id FROM teams t JOIN grantees g ON g.id = t.id WHERE (g.kind = 'everyone')) o",
+            true,
+        ),
+        ("SELECT count(*) FROM grantees g WHERE g.kind IN ('user', 'team')", false),
+        ("SELECT count(*) FROM grantees g WHERE g.kind = 'everyone' OR g.id > 0", false),
+        ("SELECT count(*) FROM grantees g WHERE g.kind <> 'team'", false),
+        ("SELECT count(*) FROM grantees g WHERE g.kind NOT IN ('team')", false),
+        ("SELECT count(*) FROM grantees g JOIN teams t ON t.id = g.id WHERE kind = 'user'", false),
+        (
+            "SELECT count(*) FROM grantees g WHERE g.kind = 'user' AND g.id IN \
+             (SELECT id FROM grantees)",
+            false,
+        ),
+        ("SELECT count(*) FROM everyone", false),
+    ] {
+        assert_eq!(
+            TeamGrantees { open, ..TeamGrantees::default() }.keeps_the_check(),
+            kept,
+            "{open}"
+        );
+    }
+}
+
+#[test]
+fn only_a_write_of_listed_labels_into_an_enum_column_lets_the_check_stay() {
+    for (insert, kept) in [
+        ("INSERT INTO grantees (id, kind) VALUES (NEW.id, 'team'::grantee_kind)", true),
+        ("INSERT INTO grantees (kind, id) VALUES ('team', NEW.id), ('team', -NEW.id)", true),
+        ("INSERT INTO grantees (id, kind) VALUES (NEW.id, 'team'), (-NEW.id, 'user')", false),
+        ("INSERT INTO grantees VALUES (NEW.id, 'team')", false),
+        ("INSERT INTO grantees (id, kind) SELECT NEW.id, 'team'", false),
+        (
+            "INSERT INTO grantees (id, kind) VALUES (NEW.id, 'team') ON CONFLICT (id) DO UPDATE \
+             SET kind = 'user'",
+            false,
+        ),
+    ] {
+        assert_eq!(
+            TeamGrantees { insert, ..TeamGrantees::default() }.keeps_the_check(),
+            kept,
+            "{insert}"
+        );
+    }
+    assert!(!TeamGrantees { kind: "TEXT", ..TeamGrantees::default() }.keeps_the_check());
+}
+
+#[test]
+fn a_trigger_able_to_change_the_written_row_leaves_the_check_out() {
+    let fixture = TeamGrantees {
+        extra: "
+CREATE FUNCTION open_grantee() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  NEW.kind := 'everyone';
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER grantees_opened BEFORE INSERT ON grantees
+  FOR EACH ROW EXECUTE FUNCTION open_grantee();
+",
+        ..TeamGrantees::default()
+    };
+    assert!(!fixture.keeps_the_check());
+}
+
+#[test]
+fn a_check_reading_other_labels_than_a_removed_write_deletes_or_updates_stays() {
+    let removing = |declare: &str, statement: &str| {
+        TeamGrantees {
+            extra: &format!(
+                "
+CREATE FUNCTION remove_grantee() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+{declare}
+BEGIN
+  {statement};
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER teams_grantee_removed AFTER DELETE ON teams
+  FOR EACH ROW EXECUTE FUNCTION remove_grantee();
+CREATE TRIGGER teams_open_removed AFTER DELETE ON teams
+  FOR EACH ROW EXECUTE FUNCTION refuse_closed_team();
+"
+            ),
+            ..TeamGrantees::default()
+        }
+        .sql()
+    };
+    let kept = owned(&[
+        ("TRIGGER", "teams_a_grantee", "teams"),
+        ("TRIGGER", "teams_grantee_removed", "teams"),
+    ]);
+    let left_out = owned(&[
+        ("TRIGGER", "teams_a_grantee", "teams"),
+        ("TRIGGER", "teams_grantee_removed", "teams"),
+        ("TRIGGER", "teams_open_removed", "teams"),
+    ]);
+    let hiding = "#variable_conflict use_variable\nDECLARE kind grantee_kind := 'team';";
+    for (declare, statement, expected) in [
+        ("", "DELETE FROM grantees WHERE id = OLD.id AND kind = 'team'", &kept),
+        ("", "DELETE FROM grantees removed WHERE removed.kind = OLD.kind", &kept),
+        ("", "DELETE FROM grantees WHERE id = OLD.id", &left_out),
+        ("", "UPDATE grantees SET kind = 'team' WHERE kind = 'team' AND id = OLD.id", &kept),
+        ("", "UPDATE grantees SET kind = 'user' WHERE kind = 'team'", &left_out),
+        ("", "UPDATE grantees SET id = id + 1 WHERE kind = 'team'", &kept),
+        (hiding, "DELETE FROM grantees WHERE kind = 'team'", &left_out),
+        (
+            "#variable_conflict use_variable\nDECLARE removed record;",
+            "DELETE FROM grantees removed WHERE removed.kind = 'team'",
+            &left_out,
+        ),
+    ] {
+        assert_eq!(&left_to_server(&removing(declare, statement)), expected, "{statement}");
+    }
+}

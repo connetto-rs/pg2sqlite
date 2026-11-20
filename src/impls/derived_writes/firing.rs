@@ -18,6 +18,7 @@ use super::{
     DerivedWrite, Event,
     chain::{Chain, Step, Walker},
     chain_phrase, function_writes,
+    rows::Held,
 };
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
@@ -31,8 +32,15 @@ use crate::{
     traits::schema::written_function,
 };
 
-/// The tables the server writes, folded, each with what writes it.
-type Written = BTreeMap<String, String>;
+/// Rows the server writes into a table, and what writes them.
+struct Produced {
+    writer: String,
+    rows: Held,
+}
+
+/// The tables the server writes, folded, each with the rows every writer
+/// produces there.
+type Written = BTreeMap<String, Vec<Produced>>;
 
 /// The name PostgreSQL gives the trigger running a foreign key's action on
 /// the referenced table, which fires among the `AFTER` row triggers in name
@@ -224,7 +232,7 @@ impl Firing<'_> {
     ) -> Result<(), Error> {
         for (child, set_off_event, writer) in self.key_actions(table, event)? {
             self.set_off(&child, set_off_event, written, visited)?;
-            written.entry(child).or_insert(writer);
+            written.entry(child).or_default().push(Produced { writer, rows: Held::any() });
         }
         Ok(())
     }
@@ -239,11 +247,43 @@ impl Firing<'_> {
     ) -> Result<(), Error> {
         for write in trigger.writes(self.schema)? {
             self.write_set_off(&write, written, visited)?;
-            if let Some(relation) = write.relation {
-                written.entry(relation).or_insert_with(|| trigger.name.clone());
-            }
+            self.add(&write, &trigger.name, &trigger.table, written)?;
         }
         Ok(())
+    }
+
+    /// Adds to `written` the rows `write` produces in its table, run by
+    /// `writer` in a trigger on `record`.
+    fn add(
+        &self,
+        write: &DerivedWrite,
+        writer: &str,
+        record: &str,
+        written: &mut Written,
+    ) -> Result<(), Error> {
+        let Some(relation) = &write.relation else { return Ok(()) };
+        let rows = self.produced(write, relation, record)?;
+        written
+            .entry(relation.clone())
+            .or_default()
+            .push(Produced { writer: writer.to_owned(), rows });
+        Ok(())
+    }
+
+    /// The rows `write` produces in `relation`, its table, run by a trigger
+    /// on `record`. Any row when a `BEFORE` row trigger on the table may
+    /// change the row the write gives.
+    fn produced(&self, write: &DerivedWrite, relation: &str, record: &str) -> Result<Held, Error> {
+        let rewritten = self.triggers.iter().any(|trigger| {
+            trigger.rank == Rank::BeforeRow
+                && trigger.table == relation
+                && write.events().iter().any(|&event| trigger.fires_on(event))
+        });
+        if rewritten {
+            return Ok(Held::any());
+        }
+        let record = (write.chain.len() == 1).then_some(record);
+        write.rows.held(relation, record, self.schema)
     }
 
     /// Adds to `written` the tables the triggers and foreign key actions
@@ -261,30 +301,53 @@ impl Firing<'_> {
         }
         Ok(())
     }
+
+    /// The first read among `steps` of rows the server writes into a table
+    /// in `written`. A read by the trigger's own function reads `NEW` and
+    /// `OLD` as rows of `record`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the columns of a table read cannot be read.
+    fn first_read<'c, 'w>(
+        &self,
+        steps: &'c [Step],
+        written: &'w Written,
+        record: &str,
+    ) -> Result<Option<Dependent<'c, 'w>>, Error> {
+        for step in steps {
+            let Step::Read { relation, rows, reader } = step else { continue };
+            let Some(produced) = written.get(relation) else { continue };
+            let read = rows.held(relation, (reader.len() == 1).then_some(record), self.schema)?;
+            if let Some(found) = produced.iter().find(|produced| produced.rows.overlaps(&read)) {
+                return Ok(Some(Dependent { reader, relation, writer: &found.writer }));
+            }
+        }
+        Ok(None)
+    }
 }
 
-/// The first read among `steps` of a table in `written`, with the chain of
-/// functions reading it.
-fn first_read<'c>(steps: &'c [Step], written: &Written) -> Option<(&'c [String], &'c str)> {
-    steps.iter().find_map(|step| {
-        match step {
-            Step::Read { relation, reader } if written.contains_key(relation) => {
-                Some((reader.as_slice(), relation.as_str()))
-            }
-            Step::Read { .. } | Step::Write(_) | Step::LoopEnd(_) => None,
-        }
-    })
+/// A read of rows the server writes before it.
+struct Dependent<'c, 'w> {
+    /// The chain of functions reading them, the trigger's own first.
+    reader: &'c [String],
+    /// The table read, folded.
+    relation: &'c str,
+    /// What writes them.
+    writer: &'w str,
 }
 
 /// Why a statement the trigger keeps reads what one of its own removed
 /// writes produces, through what it sets off, or `None` when none does. A
 /// loop runs its statements again, so its reads follow its writes too.
+/// `record` is the table the trigger fires on.
 ///
 /// # Errors
 ///
 /// Fails when a trigger set off cannot be read.
 pub(super) fn own_dependency(
     chain: &Chain,
+    record: &str,
     schema: &ParserDB,
     options: &TranslationContext<'_>,
 ) -> Result<Option<String>, Error> {
@@ -293,9 +356,7 @@ pub(super) fn own_dependency(
     for write in &chain.writes {
         let mut written = Written::new();
         firing.write_set_off(write, &mut written, &mut BTreeSet::new())?;
-        if let Some(relation) = &write.relation {
-            written.insert(relation.clone(), String::new());
-        }
+        firing.add(write, "", record, &mut written)?;
         written_by.push(written);
     }
     let dependency = |reader: &[String], relation: &str, index: usize| {
@@ -306,28 +367,22 @@ pub(super) fn own_dependency(
             chain.writes[index].statement_on()
         )
     };
-    // Each table written so far, with the first write producing it.
-    let mut written: BTreeMap<&str, usize> = BTreeMap::new();
+    // The writes run so far, in order.
+    let mut run: Vec<usize> = Vec::new();
     for (position, step) in chain.steps.iter().enumerate() {
-        match step {
+        let (reads, writes) = match step {
             Step::Write(index) => {
-                for relation in written_by[*index].keys() {
-                    written.entry(relation.as_str()).or_insert(*index);
-                }
+                run.push(*index);
+                continue;
             }
-            Step::Read { relation, reader } => {
-                if let Some(&index) = written.get(relation.as_str()) {
-                    return Ok(Some(dependency(reader, relation, index)));
-                }
-            }
-            Step::LoopEnd(start) => {
-                let repeated = &chain.steps[*start..position];
-                for step in repeated {
-                    let Step::Write(index) = step else { continue };
-                    if let Some((reader, relation)) = first_read(repeated, &written_by[*index]) {
-                        return Ok(Some(dependency(reader, relation, *index)));
-                    }
-                }
+            Step::Read { .. } => (core::slice::from_ref(step), run.as_slice()),
+            Step::LoopEnd(start) => (&chain.steps[*start..position], run.as_slice()),
+        };
+        for &index in writes {
+            if let Some(Dependent { reader, relation, .. }) =
+                firing.first_read(reads, &written_by[index], record)?
+            {
+                return Ok(Some(dependency(reader, relation, index)));
             }
         }
     }
@@ -372,11 +427,12 @@ pub(super) fn fired_dependency(
         if (Rank::AfterRow, ACTION_TRIGGER) < (fired.rank, fired.name.as_str()) {
             firing.actions_set_off(&fired.table, event, &mut written, &mut visited)?;
         }
-        if let Some((reader, relation)) = first_read(&chain.steps, &written) {
+        if let Some(Dependent { reader, relation, writer }) =
+            firing.first_read(&chain.steps, &written, &fired.table)?
+        {
             return Ok(Some(format!(
-                "{} reads {relation}, which {} writes before it on the same write",
+                "{} reads {relation}, which {writer} writes before it on the same write",
                 chain_phrase(reader),
-                written[relation]
             )));
         }
     }
@@ -402,12 +458,14 @@ fn instead_of_dependency(
         for write in &kept.writes {
             let sets_it_off = write.relation.as_deref() == Some(fired.table.as_str())
                 && write.events().iter().any(|&event| fired.fires_on(event));
-            if sets_it_off && let Some((reader, read)) = first_read(&chain.steps, &written) {
+            if sets_it_off
+                && let Some(Dependent { reader, relation: read, writer }) =
+                    firing.first_read(&chain.steps, &written, &fired.table)?
+            {
                 return Ok(Some(format!(
-                    "{} reads {read}, which {} writes before it when INSTEAD OF trigger {} runs \
-                     {}",
+                    "{} reads {read}, which {writer} writes before it when INSTEAD OF trigger {} \
+                     runs {}",
                     chain_phrase(reader),
-                    written[read],
                     instead.name,
                     write.statement_on()
                 )));

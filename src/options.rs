@@ -1477,11 +1477,14 @@ impl Pg2SqliteOptions {
     /// is left out whole when nothing else is left of it, when it assigns to
     /// `NEW` beside them, and when what it keeps reads what a write the
     /// server derives produces before it within the same write: a later
-    /// statement of its own, `FOUND` or the row such a write returns, or a
-    /// table another trigger or a foreign key action writes before it fires,
-    /// a deferred one after every other. A trigger that only refuses a write,
-    /// reads, or sets columns of its own `NEW` row stays as it is unless it
-    /// reads such a table, and so does every `INSTEAD OF` trigger, whose
+    /// statement of its own, `FOUND` or the row such a write returns, or
+    /// rows of a table another trigger or a foreign key action writes before
+    /// it fires, a deferred one after every other. A read and a write that
+    /// each hold an enum column of the table to labels the other excludes,
+    /// with `=` or `IN` against literals or a generated label of the trigger's
+    /// own row, share no row. A trigger that only refuses a write, reads, or
+    /// sets columns of its own `NEW` row stays as it is unless it reads such
+    /// rows, and so does every `INSTEAD OF` trigger, whose
     /// writes are the view's own. A foreign key whose `ON DELETE` or
     /// `ON UPDATE` action is `CASCADE`, `SET NULL` or `SET DEFAULT` is left
     /// out whole, since kept as `NO ACTION` it would refuse an offline delete
