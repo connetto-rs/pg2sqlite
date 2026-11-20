@@ -56,11 +56,10 @@ mod schema {
             table_name -> Text,
             violation_type -> Text,
             row_identifier -> Text,
-            policy_name -> Nullable<Text>,
+            policy_name -> Text,
             detected_at -> Text,
             severity -> Text,
-            details -> Nullable<Text>,
-            reported_at -> Nullable<Text>,
+            detail -> Text,
         }
     }
 }

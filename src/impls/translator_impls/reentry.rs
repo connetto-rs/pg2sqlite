@@ -46,9 +46,9 @@ use crate::{
 };
 
 /// What a table's name takes on to name its marker table.
-const SUFFIX: &str = "_pg2sqlite_reentry";
+const SUFFIX: &str = "_pg2sqlite_reentries";
 
-/// The marker table's one column, the `rowid` of the row being written.
+/// The marker table's column holding the `rowid` of the row being written.
 const ROW: &str = "row_id";
 
 /// The marker table of `table`, which SQLite names without a schema.
@@ -216,11 +216,15 @@ impl MarkerTables {
     }
 }
 
-/// `CREATE TABLE IF NOT EXISTS <marker> (row_id INTEGER NOT NULL) STRICT`.
+/// `CREATE TABLE IF NOT EXISTS <marker> (id INTEGER PRIMARY KEY, row_id
+/// INTEGER NOT NULL) STRICT`.
 fn create(marker: ObjectName) -> Statement {
     ast_builder::create_table(
         marker,
-        vec![super::rls::generated_table_column(ROW, DataType::Integer(None), true)],
+        vec![
+            super::rls::generated_key_column(),
+            super::rls::generated_table_column(ROW, DataType::Integer(None), true),
+        ],
     )
 }
 

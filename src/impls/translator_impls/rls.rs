@@ -2998,6 +2998,44 @@ fn row_visibility_expr(table_name: &str, pk_columns: &[String], prefix: &str) ->
     }
 }
 
+/// The `violation_type` the monitor records for a written row the view does
+/// not show.
+const SELECT_NOT_VISIBLE: &str = "select_not_visible";
+
+/// The `policy_name` the monitor records, the policy that hides the row.
+const SELECT_POLICY: &str = "SELECT policy";
+
+/// The operations the monitor watches, each named as in its trigger's name.
+const MONITORED_OPERATIONS: [&str; 2] = ["insert", "update"];
+
+/// The `severity` the monitor records, under strict validation and without.
+const SEVERITIES: [&str; 2] = ["error", "warning"];
+
+/// The longest `row_identifier` the monitor records, the rest of a longer one
+/// cut off.
+const ROW_IDENTIFIER_LENGTH: i64 = 4096;
+
+/// The length of the `datetime('now')` text the monitor records as
+/// `detected_at`.
+const DATETIME_LENGTH: i64 = 19;
+
+/// The longest name PostgreSQL gives a table or a role, `NAMEDATALEN - 1`
+/// bytes, so at most as many characters.
+pub(crate) const NAME_LENGTH: i64 = 63;
+
+fn severity(strict_mode: bool) -> &'static str {
+    if strict_mode { SEVERITIES[0] } else { SEVERITIES[1] }
+}
+
+/// The `detail` the monitor records for a row written by `operation`.
+fn monitor_detail(operation: &str) -> String {
+    let past_participle = if operation == "insert" { "inserted into" } else { "updated in" };
+    format!(
+        "Row {past_participle} backing table but not readable through the RLS view\x3b \
+         PostgreSQL allows this for writes without RETURNING"
+    )
+}
+
 fn generate_monitoring_trigger_statement(
     table_name: &str,
     inner_table_name: &str,
@@ -3008,26 +3046,25 @@ fn generate_monitoring_trigger_statement(
 ) -> Statement {
     let event =
         if operation == "insert" { TriggerEvent::Insert } else { TriggerEvent::Update(Vec::new()) };
-    let past_participle = if operation == "insert" { "inserted into" } else { "updated in" };
-    let details = format!(
-        "Row {past_participle} backing table but not readable through the RLS view\x3b \
-         PostgreSQL allows this for writes without RETURNING"
-    );
     let source = make_query(
         None,
         SetExpr::Select(Box::new(make_simple_select(
             ast_builder::select_items(vec![
                 string_literal(table_name),
-                string_literal("select_not_visible"),
-                row_identifier_expr(pk_columns, "NEW"),
-                string_literal("SELECT policy"),
+                string_literal(SELECT_NOT_VISIBLE),
+                simple_function_expr(
+                    "substr",
+                    vec![
+                        row_identifier_expr(pk_columns, "NEW"),
+                        integer_literal(1),
+                        integer_literal(ROW_IDENTIFIER_LENGTH),
+                    ],
+                    None,
+                ),
+                string_literal(SELECT_POLICY),
                 simple_function_expr("datetime", vec![string_literal("now")], None),
-                string_literal(if strict_mode { "error" } else { "warning" }),
-                string_literal(&details),
-                Expr::Value(ValueWithSpan {
-                    value: Value::Null,
-                    span: sqlparser::tokenizer::Span::empty(),
-                }),
+                string_literal(severity(strict_mode)),
+                string_literal(&monitor_detail(operation)),
             ]),
             Vec::new(),
             Some(Expr::UnaryOp {
@@ -3045,8 +3082,7 @@ fn generate_monitoring_trigger_statement(
         "policy_name",
         "detected_at",
         "severity",
-        "details",
-        "reported_at",
+        "detail",
     ]
     .into_iter()
     .map(generated_object_name)
@@ -3118,6 +3154,66 @@ pub(crate) fn generated_table_column(name: &str, data_type: DataType, not_null: 
     ColumnDef { name: quoted_ident(name), data_type, options }
 }
 
+/// A `NOT NULL` text column of a table the translation adds, holding only
+/// what `check` admits.
+pub(crate) fn generated_text_column(name: &str, check: Expr) -> ColumnDef {
+    let mut column = generated_table_column(name, DataType::Text, true);
+    column.options.push(ColumnOptionDef {
+        name: None,
+        option: ColumnOption::Check(sqlparser::ast::CheckConstraint {
+            name: None,
+            expr: Box::new(check),
+            enforced: None,
+            no_inherit: false,
+        }),
+    });
+    column
+}
+
+/// `length(<column>) <= <bound>`.
+pub(crate) fn length_at_most(column: &str, bound: i64) -> Expr {
+    Expr::BinaryOp {
+        left: Box::new(simple_function_expr(
+            "length",
+            vec![Expr::Identifier(quoted_ident(column))],
+            None,
+        )),
+        op: BinaryOperator::LtEq,
+        right: Box::new(integer_literal(bound)),
+    }
+}
+
+/// `<column> IN (<values>)`.
+pub(crate) fn one_of<S: AsRef<str>>(column: &str, values: &[S]) -> Expr {
+    Expr::In {
+        expr: Box::new(Expr::Identifier(quoted_ident(column))),
+        target: InTarget::List(values.iter().map(|value| string_literal(value.as_ref())).collect()),
+        negated: false,
+        global: false,
+    }
+}
+
+/// `"id" INTEGER PRIMARY KEY`, the key of a table the translation adds, which
+/// names the table's `rowid`.
+pub(crate) fn generated_key_column() -> ColumnDef {
+    ColumnDef {
+        name: quoted_ident("id"),
+        data_type: DataType::Integer(None),
+        options: vec![ColumnOptionDef {
+            name: None,
+            option: ColumnOption::PrimaryKey(sqlparser::ast::PrimaryKeyConstraint {
+                name: None,
+                index_name: None,
+                index_type: None,
+                columns: Vec::new(),
+                include: Vec::new(),
+                index_options: Vec::new(),
+                characteristics: None,
+            }),
+        }],
+    }
+}
+
 fn audit_id_column() -> ColumnDef {
     let words = ["PRIMARY", "KEY", "AUTOINCREMENT"]
         .into_iter()
@@ -3153,46 +3249,49 @@ pub fn generate_rls_validation_statements(
     let all_columns = collect_column_names(table, schema)?;
     let strict_mode = options.is_strict_rls_validation();
 
-    Ok(vec![
-        generate_monitoring_trigger_statement(
-            table_name,
-            &inner_table_name,
-            &pk_columns,
-            audit_table_name,
-            strict_mode,
-            "insert",
-        ),
-        generate_monitoring_trigger_statement(
-            table_name,
-            &inner_table_name,
-            &pk_columns,
-            audit_table_name,
-            strict_mode,
-            "update",
-        ),
-        generate_validation_view_statement(
-            table_name,
-            &inner_table_name,
-            &all_columns,
-            &pk_columns,
-        ),
-    ])
+    let mut statements: Vec<Statement> = MONITORED_OPERATIONS
+        .into_iter()
+        .map(|operation| {
+            generate_monitoring_trigger_statement(
+                table_name,
+                &inner_table_name,
+                &pk_columns,
+                audit_table_name,
+                strict_mode,
+                operation,
+            )
+        })
+        .collect();
+    statements.push(generate_validation_view_statement(
+        table_name,
+        &inner_table_name,
+        &all_columns,
+        &pk_columns,
+    ));
+    Ok(statements)
 }
 
-/// Builds the RLS audit table statement.
+/// Builds the RLS audit table statement, each text column admitting only
+/// what the monitor records.
 pub fn generate_rls_audit_table(audit_table_name: &str) -> Statement {
+    let details: Vec<String> = MONITORED_OPERATIONS.into_iter().map(monitor_detail).collect();
     ast_builder::create_table(
         generated_object_name(audit_table_name),
         vec![
             audit_id_column(),
-            generated_table_column("table_name", DataType::Text, true),
-            generated_table_column("violation_type", DataType::Text, true),
-            generated_table_column("row_identifier", DataType::Text, true),
-            generated_table_column("policy_name", DataType::Text, false),
-            generated_table_column("detected_at", DataType::Text, true),
-            generated_table_column("severity", DataType::Text, true),
-            generated_table_column("details", DataType::Text, false),
-            generated_table_column("reported_at", DataType::Text, false),
+            generated_text_column("table_name", length_at_most("table_name", NAME_LENGTH)),
+            generated_text_column(
+                "violation_type",
+                one_of("violation_type", &[SELECT_NOT_VISIBLE]),
+            ),
+            generated_text_column(
+                "row_identifier",
+                length_at_most("row_identifier", ROW_IDENTIFIER_LENGTH),
+            ),
+            generated_text_column("policy_name", one_of("policy_name", &[SELECT_POLICY])),
+            generated_text_column("detected_at", length_at_most("detected_at", DATETIME_LENGTH)),
+            generated_text_column("severity", one_of("severity", &SEVERITIES)),
+            generated_text_column("detail", one_of("detail", &details)),
         ],
     )
 }

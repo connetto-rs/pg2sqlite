@@ -3,8 +3,8 @@
 //!
 //! SQLite has no commit-time hook in SQL, and the one check it defers is the
 //! foreign key counter. So each firing is queued with the `OLD` and `NEW`
-//! values its body reads. A queued row holds a deferred foreign key into
-//! [`NEVER`], which no row ever satisfies, so a `COMMIT` fails with `FOREIGN
+//! values its body reads. A queued row's key is a deferred foreign key into
+//! [`BARRIERS`], which never holds a row, so a `COMMIT` fails with `FOREIGN
 //! KEY constraint failed` while any firing is still queued, and so does an
 //! autocommit write that queues one. [`drain`] runs the queue: deleting a row
 //! from [`CHECKS`] cascades to the firing's payload row, whose `AFTER DELETE`
@@ -18,8 +18,8 @@ use core::ops::ControlFlow;
 use sqlparser::ast::{
     BinaryOperator, ColumnDef, ColumnOption, ColumnOptionDef, ConditionalStatements,
     ConstraintCharacteristics, CreateTrigger, DataType, DeferrableInitial, DropTrigger, Expr,
-    ForeignKeyConstraint, Ident, ObjectName, ObjectNamePart, ObjectType, PrimaryKeyConstraint,
-    ReferentialAction, Statement, TriggerEvent, TriggerPeriod, VisitMut, VisitorMut,
+    ForeignKeyConstraint, Ident, ObjectName, ObjectNamePart, ObjectType, ReferentialAction,
+    Statement, TriggerEvent, TriggerPeriod, VisitMut, VisitorMut,
 };
 
 #[cfg(not(feature = "std"))]
@@ -30,6 +30,7 @@ use crate::{
         ast_builder,
         function_helpers::{simple_function_expr, string_literal},
         object_name::{append_suffix, last_ident, quoted_ident},
+        translator_impls::rls::{generated_key_column, generated_text_column, one_of},
     },
     traits::translator::TranslatorWithContext,
 };
@@ -38,14 +39,11 @@ use crate::{
 pub(crate) const CHECKS: &str = "pg2sqlite_deferred_checks";
 
 /// The always-empty table a queued firing's deferred foreign key names.
-const NEVER: &str = "pg2sqlite_deferred_never";
+const BARRIERS: &str = "pg2sqlite_deferred_barriers";
 
-/// The column of [`CHECKS`] whose deferred foreign key into [`NEVER`] fails
-/// the commit while the row exists.
-const PENDING: &str = "pending";
-
-/// The firing order, shared by [`CHECKS`] and every payload table.
-const SEQ: &str = "seq";
+/// The key of [`BARRIERS`], of [`CHECKS`] and of every payload table, which
+/// orders the firings.
+const ID: &str = "id";
 
 /// The payload column naming the event that queued the firing.
 const EVENT: &str = "event";
@@ -59,6 +57,8 @@ pub(crate) enum DeferredEvent {
 }
 
 impl DeferredEvent {
+    const ALL: [Self; 3] = [Self::Insert, Self::Update, Self::Delete];
+
     fn keyword(self) -> &'static str {
         match self {
             Self::Insert => "INSERT",
@@ -220,36 +220,18 @@ pub(crate) fn check_clauses(trigger: &CreateTrigger) -> Result<(), Error> {
     Ok(())
 }
 
-/// `CREATE TABLE IF NOT EXISTS` for [`NEVER`] and [`CHECKS`], which a
+/// `CREATE TABLE IF NOT EXISTS` for [`BARRIERS`] and [`CHECKS`], which a
 /// translation creating a deferred constraint trigger needs.
+///
+/// The key of [`CHECKS`] references the key of [`BARRIERS`], so a queued row
+/// extends a barrier row that never exists. The `ON DELETE CASCADE` such an
+/// extension carries never fires.
 pub(crate) fn queue_tables() -> [Statement; 2] {
-    let never = ast_builder::create_table(
-        plain_name(NEVER),
-        vec![ColumnDef {
-            name: quoted_ident("id"),
-            data_type: DataType::Integer(None),
-            options: vec![primary_key()],
-        }],
-    );
-    let checks = ast_builder::create_table(
-        plain_name(CHECKS),
-        vec![
-            ColumnDef {
-                name: quoted_ident(SEQ),
-                data_type: DataType::Integer(None),
-                options: vec![primary_key()],
-            },
-            ColumnDef {
-                name: quoted_ident(PENDING),
-                data_type: DataType::Integer(None),
-                options: vec![
-                    ColumnOptionDef { name: None, option: ColumnOption::NotNull },
-                    foreign_key(NEVER, "id", None, true),
-                ],
-            },
-        ],
-    );
-    [never, checks]
+    let barriers = ast_builder::create_table(plain_name(BARRIERS), vec![generated_key_column()]);
+    let mut key = generated_key_column();
+    key.options.push(foreign_key(BARRIERS, Some(ReferentialAction::Cascade), true));
+    let checks = ast_builder::create_table(plain_name(CHECKS), vec![key]);
+    [barriers, checks]
 }
 
 /// `DELETE FROM` [`CHECKS`], which runs every queued body and fails on the
@@ -374,24 +356,8 @@ fn plain_name(name: &str) -> ObjectName {
     ObjectName(vec![ObjectNamePart::Identifier(Ident::new(name))])
 }
 
-fn primary_key() -> ColumnOptionDef {
-    ColumnOptionDef {
-        name: None,
-        option: ColumnOption::PrimaryKey(PrimaryKeyConstraint {
-            name: None,
-            index_name: None,
-            index_type: None,
-            columns: Vec::new(),
-            include: Vec::new(),
-            index_options: Vec::new(),
-            characteristics: None,
-        }),
-    }
-}
-
 fn foreign_key(
     table: &str,
-    column: &str,
     on_delete: Option<ReferentialAction>,
     deferred: bool,
 ) -> ColumnOptionDef {
@@ -402,7 +368,7 @@ fn foreign_key(
             index_name: None,
             columns: Vec::new(),
             foreign_table: plain_name(table),
-            referred_columns: vec![quoted_ident(column)],
+            referred_columns: vec![quoted_ident(ID)],
             on_delete,
             on_update: None,
             match_kind: None,
@@ -475,20 +441,14 @@ impl PayloadColumns {
     }
 
     fn table(&self, name: &ObjectName) -> Statement {
+        let mut key = generated_key_column();
+        key.options.push(foreign_key(CHECKS, Some(ReferentialAction::Cascade), false));
         let mut columns = vec![
-            ColumnDef {
-                name: quoted_ident(SEQ),
-                data_type: DataType::Integer(None),
-                options: vec![
-                    primary_key(),
-                    foreign_key(CHECKS, SEQ, Some(ReferentialAction::Cascade), false),
-                ],
-            },
-            ColumnDef {
-                name: quoted_ident(EVENT),
-                data_type: DataType::Text,
-                options: vec![ColumnOptionDef { name: None, option: ColumnOption::NotNull }],
-            },
+            key,
+            generated_text_column(
+                EVENT,
+                one_of(EVENT, &DeferredEvent::ALL.map(DeferredEvent::keyword)),
+            ),
         ];
         columns.extend(self.read.iter().map(|((row, _), column)| {
             ColumnDef {
@@ -503,7 +463,7 @@ impl PayloadColumns {
     /// The statements queueing one firing of `event`.
     fn queue(&self, payload: &ObjectName, event: DeferredEvent) -> Vec<Statement> {
         let (has_old, has_new) = event.rows();
-        let mut targets = vec![plain_column(SEQ), plain_column(EVENT)];
+        let mut targets = vec![plain_column(ID), plain_column(EVENT)];
         let mut values = vec![
             simple_function_expr("last_insert_rowid", Vec::new(), None),
             string_literal(event.keyword()),
@@ -525,11 +485,8 @@ impl PayloadColumns {
         vec![
             ast_builder::insert(
                 plain_name(CHECKS),
-                vec![plain_column(PENDING)],
-                ast_builder::values(vec![vec![Expr::value(sqlparser::ast::Value::Number(
-                    "0".into(),
-                    false,
-                ))]]),
+                vec![plain_column(ID)],
+                ast_builder::values(vec![vec![Expr::Value(sqlparser::ast::Value::Null.into())]]),
             ),
             ast_builder::insert(payload.clone(), targets, ast_builder::values(vec![values])),
         ]
