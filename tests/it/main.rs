@@ -95,6 +95,7 @@ mod test_forward_indexes;
 mod test_forward_placeholders;
 mod test_forward_queries;
 mod test_forward_update;
+mod test_fresh_main_global_objects;
 mod test_fts5;
 mod test_fts5_external_content;
 mod test_fts5_rls;

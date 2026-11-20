@@ -384,9 +384,9 @@ impl ReplaySchema {
 
     /// Whether `statement` changes this schema. A change to a relation counts
     /// when the replay recreates that relation, since one it keeps already has
-    /// its final form. Functions and roles belong to no file and keep their
-    /// final form too. Any other statement counts when its unit is `owned`,
-    /// run in full by the replay.
+    /// its final form. Functions, roles, schemas, types and domains belong to
+    /// no file and keep their final form too. Any other statement counts when
+    /// its unit is `owned`, run in full by the replay.
     fn replays(&self, statement: &Statement, owned: bool, homes: &Homes) -> bool {
         let recreated =
             |name: &ObjectName| self.homes.contains_placement(placement::home_of(homes, name));
@@ -410,7 +410,16 @@ impl ReplaySchema {
             | Statement::DropFunction(_)
             | Statement::CreateRole(_)
             | Statement::AlterRole { .. }
-            | Statement::Drop { object_type: ObjectType::Role, .. } => false,
+            | Statement::CreateSchema { .. }
+            | Statement::AlterSchema(_)
+            | Statement::CreateType { .. }
+            | Statement::AlterType(_)
+            | Statement::CreateDomain(_)
+            | Statement::DropDomain(_)
+            | Statement::Drop {
+                object_type: ObjectType::Role | ObjectType::Schema | ObjectType::Type,
+                ..
+            } => false,
             _ => owned,
         }
     }
