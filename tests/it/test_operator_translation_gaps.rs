@@ -469,7 +469,7 @@ fn geometric_prefix_operators_are_refused() {
         ("SELECT @@ NULL", "@@"),
         ("SELECT ?- NULL", "?-"),
         ("SELECT ?| NULL", "?|"),
-        ("CREATE VIEW v AS SELECT#c", "#"),
+        ("CREATE VIEW v AS SELECT#NULL::path", "#"),
     ] {
         let pg2sqlite::errors::Error::TranslationRefusal(refusal) = tr_err(source) else {
             panic!("expected a structured translation refusal for {source}");
