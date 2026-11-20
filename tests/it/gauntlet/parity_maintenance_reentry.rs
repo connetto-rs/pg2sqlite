@@ -1,7 +1,8 @@
 //! Parity for row triggers assigning `NEW`, which the replica runs as `AFTER`
 //! triggers whose `UPDATE` writes the assigned values over the row. That
 //! `UPDATE` must not fire the table's maintenance triggers again, whatever the
-//! trigger reads and whatever the caller wrote.
+//! trigger reads and whatever the caller wrote, and answers to the
+//! row-security policies PostgreSQL holds the row the trigger returns to.
 
 use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
 use helpers::establish_connection;
@@ -56,6 +57,10 @@ enum Step {
         tag: &'static str,
     },
     Read,
+    /// Acts as `app` from here on, which the row-security policies hold where
+    /// they spare the table owner. The replica has no roles, and its policies
+    /// hold every caller.
+    ActAsApp,
 }
 
 /// Sets `tag` on row `id`.
@@ -64,7 +69,7 @@ const fn set_tag(id: i32, tag: &'static str) -> Step {
 }
 
 macro_rules! run_step {
-    ($name:ident, $conn:ty) => {
+    ($name:ident, $conn:ty, $act_as_app:expr) => {
         fn $name(connection: &mut $conn, step: &Step) -> Outcome {
             match step {
                 Step::Insert { id, tag, note } => {
@@ -94,13 +99,22 @@ macro_rules! run_step {
                         .expect("read items");
                     Outcome::Rows(rows.into_iter().map(|row| format!("{row:?}")).collect())
                 }
+                Step::ActAsApp => $act_as_app(connection),
             }
         }
     };
 }
 
-run_step!(run_postgres, PgConnection);
-run_step!(run_sqlite, SqliteConnection);
+/// Grants `app` the writes the steps make and switches the session to it.
+fn act_as_app_on_postgres(connection: &mut PgConnection) -> Outcome {
+    postgres_harness::apply(connection, "GRANT SELECT, INSERT, UPDATE ON items TO app")
+        .expect("grant to app");
+    postgres_harness::apply(connection, "SET ROLE app").expect("act as app");
+    Outcome::Accepted
+}
+
+run_step!(run_postgres, PgConnection, act_as_app_on_postgres);
+run_step!(run_sqlite, SqliteConnection, |_: &mut SqliteConnection| Outcome::Accepted);
 
 fn execute_ddl(connection: &mut SqliteConnection, statements: &[String]) {
     for statement in statements {
@@ -116,16 +130,17 @@ fn execute_ddl(connection: &mut SqliteConnection, statements: &[String]) {
 fn engines(batches: &[&str]) -> (PgConnection, SqliteConnection) {
     let mut postgres = postgres_harness::fresh_database();
     let mut sqlite = establish_connection();
+    let options = Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit");
     let mut applied = String::new();
     for batch in batches {
         postgres_harness::apply(&mut postgres, batch)
             .unwrap_or_else(|error| panic!("PostgreSQL refused the batch: {error}"));
         let translator = Pg2Sqlite::default().sql(batch).expect("parse");
         let translated = if applied.is_empty() {
-            translator.translate_to_sql(&Pg2SqliteOptions::default())
+            translator.translate_to_sql(&options)
         } else {
             let schema = Pg2Sqlite::default().sql(&applied).unwrap().build_schema().unwrap();
-            translator.translate_to_sql_with_schema(&schema, &Pg2SqliteOptions::default())
+            translator.translate_to_sql_with_schema(&schema, &options)
         };
         execute_ddl(&mut sqlite, &translated.expect("translate").into_vec());
         applied.push_str(batch);
@@ -317,4 +332,67 @@ fn a_scaled_numeric_assignment_settles() {
         .first(&mut sqlite)
         .expect("read replica");
     assert_eq!(price, Some(125), "1.25 in minor units of a NUMERIC(10,2)");
+}
+
+/// `items` under the `UPDATE` policy `clauses`, with a trigger firing
+/// `BEFORE` `events` that appends `*` to `tag`.
+fn policed_trigger(clauses: &str, events: &str) -> String {
+    format!(
+        "CREATE TABLE items (id INT PRIMARY KEY, tag TEXT, note TEXT);
+         ALTER TABLE items ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY items_select ON items FOR SELECT USING (true);
+         CREATE POLICY items_insert ON items FOR INSERT WITH CHECK (true);
+         CREATE POLICY items_update ON items FOR UPDATE {clauses};
+         CREATE FUNCTION stamp() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN NEW.tag := NEW.tag || '*'; RETURN NEW; END $$;
+         CREATE TRIGGER items_stamp BEFORE {events} ON items
+             FOR EACH ROW EXECUTE FUNCTION stamp();"
+    )
+}
+
+/// The row a `BEFORE INSERT` trigger returns answers to the `INSERT` policies
+/// alone, whatever the `UPDATE` policies admit, and a caller's `UPDATE` still
+/// answers to them.
+#[test]
+fn an_insert_answers_to_no_update_policy() {
+    assert_agree(
+        &[&policed_trigger("USING (false)", "INSERT")],
+        &[
+            Step::ActAsApp,
+            Step::Insert { id: 1, tag: "a", note: None },
+            set_tag(1, "b"),
+            Step::Read,
+        ],
+    );
+}
+
+/// The row a `BEFORE UPDATE` trigger returns answers to `WITH CHECK`, which
+/// refuses what the trigger appends although it admits what the caller wrote.
+#[test]
+fn the_row_an_update_trigger_returns_answers_to_with_check() {
+    assert_agree(
+        &[&policed_trigger("USING (true) WITH CHECK (tag NOT LIKE '%*')", "INSERT OR UPDATE")],
+        &[
+            Step::ActAsApp,
+            Step::Insert { id: 1, tag: "a", note: None },
+            Step::Read,
+            set_tag(1, "b"),
+            Step::Read,
+        ],
+    );
+}
+
+/// `USING` reads the row before the caller's `UPDATE`, never the row the
+/// caller wrote, which `USING` refuses here.
+#[test]
+fn using_reads_the_row_before_the_update() {
+    assert_agree(
+        &[&policed_trigger("USING (tag NOT LIKE 'b%') WITH CHECK (true)", "INSERT OR UPDATE")],
+        &[
+            Step::ActAsApp,
+            Step::Insert { id: 1, tag: "a", note: None },
+            set_tag(1, "b"),
+            Step::Read,
+        ],
+    );
 }

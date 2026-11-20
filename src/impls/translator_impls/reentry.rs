@@ -5,10 +5,17 @@
 //! whose body writes the assigned values over the row with an `UPDATE`, and
 //! under `recursive_triggers = ON` that `UPDATE` fires the table's `UPDATE`
 //! triggers again. The body holds the row's `rowid` in its table's marker
-//! table for the duration of the `UPDATE`, each `UPDATE` maintenance trigger
-//! fires only on a row its table's marker table does not hold, and the
-//! row-security guard that lets the body's write past a missing `UPDATE`
-//! policy lets through a row it does hold.
+//! table for the duration of the `UPDATE`, with the event the body runs
+//! after, and each `UPDATE` maintenance trigger fires only on a row its
+//! table's marker table does not hold.
+//!
+//! The row-security guard on the table's `UPDATE` reads the marker too.
+//! PostgreSQL holds the row a `BEFORE INSERT` trigger returns to the `INSERT`
+//! policies alone, so the guard lets the `INSERT` body's write past the
+//! `UPDATE` policies. It holds the row a `BEFORE UPDATE` trigger returns to
+//! the `UPDATE` policies' checks of the new row, whose existing row the
+//! caller's `UPDATE` already answered for, so the guard lets the `UPDATE`
+//! body's write past their `USING`.
 //!
 //! Each table has a marker table of its own, named after the table and named
 //! in every trigger as a table. SQLite rewrites those references when the
@@ -30,7 +37,7 @@ use sql_traits::{
 };
 use sqlparser::ast::{
     AlterTable, AlterTableOperation, BinaryOperator, DataType, Expr, Ident, ObjectName,
-    ObjectNamePart, ObjectType, RenameTableNameKind, Statement,
+    ObjectNamePart, ObjectType, RenameTableNameKind, Statement, TriggerEvent,
     helpers::attached_token::AttachedToken, visit_relations,
 };
 
@@ -40,6 +47,7 @@ use crate::{
     errors::Error,
     impls::{
         ast_builder,
+        function_helpers::string_literal,
         object_name::{append_suffix, last_ident, last_ident_value_or_display},
         query_builder::{from_relation, plain_table_factor, single_expr_query},
     },
@@ -50,6 +58,49 @@ const SUFFIX: &str = "_pg2sqlite_reentries";
 
 /// The marker table's column holding the `rowid` of the row being written.
 const ROW: &str = "row_id";
+
+/// The marker table's column holding the event the body runs after.
+const EVENT: &str = "event";
+
+/// The event a maintenance body runs after, which its marker records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MaintainedEvent {
+    Insert,
+    Update,
+}
+
+impl MaintainedEvent {
+    /// Every event, in the order the marker table's check lists them.
+    const ALL: [Self; 2] = [Self::Insert, Self::Update];
+
+    /// The event a maintenance body running after `event` records, `None` for
+    /// an event no maintenance body runs after.
+    pub(crate) const fn after(event: &TriggerEvent) -> Option<Self> {
+        match event {
+            TriggerEvent::Insert => Some(Self::Insert),
+            TriggerEvent::Update(_) => Some(Self::Update),
+            _ => None,
+        }
+    }
+
+    /// The event a maintenance trigger firing on `events` runs after. A
+    /// trigger firing on `INSERT` and another event is split into an
+    /// `INSERT` half and a half for the rest before its body is built.
+    pub(crate) fn of(events: &[TriggerEvent]) -> Self {
+        if events.iter().any(|event| matches!(event, TriggerEvent::Insert)) {
+            Self::Insert
+        } else {
+            Self::Update
+        }
+    }
+
+    const fn keyword(self) -> &'static str {
+        match self {
+            Self::Insert => "INSERT",
+            Self::Update => "UPDATE",
+        }
+    }
+}
 
 /// The marker table of `table`, which SQLite names without a schema.
 pub(crate) fn marker_table(table: &ObjectName) -> ObjectName {
@@ -65,28 +116,54 @@ fn marks_row(row: &str) -> Expr {
     }
 }
 
-/// The condition holding unless `marker` holds the `rowid` of `row`, `NEW` or
-/// `OLD`, so unless the row is a maintenance body's own write.
-pub(crate) fn unmarked(marker: &ObjectName, row: &str) -> Expr {
+/// The condition holding unless `marker` holds a marker `selection` picks.
+fn no_marker(marker: &ObjectName, selection: Expr) -> Expr {
     Expr::Exists {
         subquery: Box::new(single_expr_query(
             Expr::Value(sqlparser::ast::Value::Number("1".to_string(), false).into()),
             from_relation(plain_table_factor(marker.clone())),
-            Some(marks_row(row)),
+            Some(selection),
         )),
         negated: true,
     }
 }
 
-/// Records `NEW.rowid` in `marker` before the maintenance body's `UPDATE`.
-pub(crate) fn mark(marker: &ObjectName) -> Statement {
+/// The condition holding unless `marker` holds the `rowid` of `row`, `NEW` or
+/// `OLD`, so unless the row is a maintenance body's own write.
+pub(crate) fn unmarked(marker: &ObjectName, row: &str) -> Expr {
+    no_marker(marker, marks_row(row))
+}
+
+/// The condition holding unless `marker` holds the `rowid` of `row` for the
+/// body running after `event`, so unless the row is that body's own write.
+pub(crate) fn unmarked_after(marker: &ObjectName, row: &str, event: MaintainedEvent) -> Expr {
+    no_marker(
+        marker,
+        Expr::BinaryOp {
+            left: Box::new(marks_row(row)),
+            op: BinaryOperator::And,
+            right: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Identifier(Ident::new(EVENT))),
+                op: BinaryOperator::Eq,
+                right: Box::new(string_literal(event.keyword())),
+            }),
+        },
+    )
+}
+
+/// Records `NEW.rowid` in `marker` before the maintenance body running after
+/// `event` makes its `UPDATE`.
+pub(crate) fn mark(marker: &ObjectName, event: MaintainedEvent) -> Statement {
     ast_builder::insert(
         marker.clone(),
-        vec![ObjectName(vec![ObjectNamePart::Identifier(Ident::new(ROW))])],
-        ast_builder::values(vec![vec![Expr::CompoundIdentifier(vec![
-            Ident::new("NEW"),
-            Ident::new("rowid"),
-        ])]]),
+        [ROW, EVENT]
+            .into_iter()
+            .map(|column| ObjectName(vec![ObjectNamePart::Identifier(Ident::new(column))]))
+            .collect(),
+        ast_builder::values(vec![vec![
+            Expr::CompoundIdentifier(vec![Ident::new("NEW"), Ident::new("rowid")]),
+            string_literal(event.keyword()),
+        ]]),
     )
 }
 
@@ -217,13 +294,18 @@ impl MarkerTables {
 }
 
 /// `CREATE TABLE IF NOT EXISTS <marker> (id INTEGER PRIMARY KEY, row_id
-/// INTEGER NOT NULL) STRICT`.
+/// INTEGER NOT NULL, event TEXT NOT NULL CHECK (event IN ('INSERT',
+/// 'UPDATE'))) STRICT`.
 fn create(marker: ObjectName) -> Statement {
     ast_builder::create_table(
         marker,
         vec![
             super::rls::generated_key_column(),
             super::rls::generated_table_column(ROW, DataType::Integer(None), true),
+            super::rls::generated_text_column(
+                EVENT,
+                super::rls::one_of(EVENT, &MaintainedEvent::ALL.map(MaintainedEvent::keyword)),
+            ),
         ],
     )
 }

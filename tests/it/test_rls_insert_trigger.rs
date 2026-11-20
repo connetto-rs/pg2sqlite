@@ -199,6 +199,60 @@ fn caller_update_writing_the_maintained_values_is_denied() {
 }
 
 diesel::table! {
+    guarded (id) {
+        id -> Integer,
+        tag -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    guarded_rls (id) {
+        id -> Integer,
+        tag -> Nullable<Text>,
+    }
+}
+
+/// An `UPDATE` policy admitting no row, beside a `BEFORE INSERT` maintenance
+/// trigger.
+const GUARDED_SCHEMA: &str = "
+    CREATE TABLE guarded (id INT PRIMARY KEY, tag TEXT);
+    ALTER TABLE guarded ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY guarded_sel ON guarded FOR SELECT USING (true);
+    CREATE POLICY guarded_ins ON guarded FOR INSERT WITH CHECK (true);
+    CREATE POLICY guarded_upd ON guarded FOR UPDATE USING (false);
+    CREATE FUNCTION guarded_tag() RETURNS trigger AS $$
+    BEGIN
+        NEW.tag := NEW.tag || '*';
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+    CREATE TRIGGER guarded_tag_trg BEFORE INSERT ON guarded
+        FOR EACH ROW EXECUTE FUNCTION guarded_tag();
+";
+
+/// PostgreSQL runs no `UPDATE` for a `BEFORE INSERT` trigger, so the insert
+/// answers to the `INSERT` policy alone and stores `a*`, while a caller
+/// `UPDATE` stays held to the `UPDATE` policy.
+#[test]
+fn maintenance_write_passes_an_update_policy_refusing_the_row() {
+    let mut conn = helpers::apply_translated_ddl(
+        GUARDED_SCHEMA,
+        &Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit"),
+    );
+    diesel::insert_into(guarded::table)
+        .values((guarded::id.eq(1_i32), guarded::tag.eq("a")))
+        .execute(&mut conn)
+        .expect("INSERT through RLS view must succeed");
+    let tag: Option<String> =
+        guarded_rls::table.find(1).select(guarded_rls::tag).first(&mut conn).expect("select");
+    assert_eq!(tag.as_deref(), Some("a*"));
+
+    let result =
+        diesel::update(guarded_rls::table.find(1)).set(guarded_rls::tag.eq("b")).execute(&mut conn);
+    assert!(result.is_err(), "a caller UPDATE must answer to the UPDATE policy");
+}
+
+diesel::table! {
     priced (id) {
         id -> Integer,
         price -> Nullable<BigInt>,
@@ -242,7 +296,8 @@ fn rls_maintenance_exemption_expects_the_scaled_numeric() {
     assert_eq!(price, Some(125));
 }
 
-// ── Non-maintenance BEFORE INSERT trigger → continue at rls.rs 2263 ──────────
+// ── Non-maintenance BEFORE INSERT trigger
+// ─────────────────────────────────────
 
 diesel::table! {
     notes (id) {
@@ -264,10 +319,9 @@ struct NoteRow {
     body: Option<String>,
 }
 
-/// RLS table with a BEFORE INSERT trigger that does NOT assign to NEW — not a
-/// maintenance trigger.  `build_maintenance_insert_exemption` hits the
-/// `continue` at rls.rs:2263 and returns None (no exemption in the
-/// update-check trigger).  INSERT through the view must still succeed.
+/// RLS table with a BEFORE INSERT trigger that does NOT assign to NEW, so it
+/// is no maintenance trigger and the update-check trigger lets no write of it
+/// through. INSERT through the view must still succeed.
 const NOTES_SCHEMA: &str = "
     CREATE TABLE notes (id INT PRIMARY KEY, body TEXT);
     ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
@@ -282,8 +336,8 @@ const NOTES_SCHEMA: &str = "
     FOR EACH ROW EXECUTE FUNCTION notes_passthru();
 ";
 
-/// The non-maintenance trigger is skipped in the exemption builder; no
-/// IS DISTINCT FROM appears in the update-check trigger, and INSERT succeeds.
+/// The non-maintenance trigger gets no exemption, so no IS DISTINCT FROM
+/// appears in the update-check trigger, and INSERT succeeds.
 #[test]
 fn rls_non_maintenance_before_insert_trigger_has_no_exemption() {
     let opts = Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit");
