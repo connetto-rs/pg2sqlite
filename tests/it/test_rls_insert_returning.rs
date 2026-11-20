@@ -567,11 +567,11 @@ fn insert_returning_through_a_grant_view_keeps_to_the_grants() {
     );
     assert!(
         refusal("INSERT INTO items (id, note) VALUES (2, 'n') RETURNING id")
-            .contains("table items has no column named note")
+            .contains("may insert into column note of items but not read it")
     );
     assert!(
         refusal("INSERT INTO items (id) VALUES (2) RETURNING note")
-            .contains("no such column: note")
+            .contains("permission denied for table items")
     );
     assert!(
         refusal("INSERT INTO items (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET title = 'x'")
@@ -594,7 +594,7 @@ fn insert_returning_through_a_grant_view_keeps_to_the_grants() {
             "INSERT INTO items (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET note = 'x' \
                  RETURNING id"
         )
-        .contains("table items has no column named note")
+        .contains("may update column note of items but not read it")
     );
     assert!(
         refusal("INSERT INTO notes (id, flag) VALUES (2, 'f') RETURNING id")

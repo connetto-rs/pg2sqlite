@@ -1112,7 +1112,7 @@ fn gate_backing_redirect(
 /// How many columns each row of `body` holds, `None` when a wildcard leaves it
 /// to the relations it reads.
 #[cfg_attr(feature = "std", recursive::recursive)]
-fn row_width(body: &SetExpr) -> Option<usize> {
+pub(crate) fn row_width(body: &SetExpr) -> Option<usize> {
     match body {
         SetExpr::Values(values) => Some(values.rows.first().map_or(0, |row| row.content.len())),
         SetExpr::Select(select)

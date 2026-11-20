@@ -119,16 +119,11 @@ fn the_with_ties_refusal_names_the_rewrite_that_answers_the_same() {
 
 #[test]
 fn a_compound_select_ordered_by_an_input_column_says_so() {
-    // PostgreSQL answers `column "a" does not exist` for the unqualified
-    // spelling and `missing FROM-clause entry for table "t"` for the
-    // qualified one: after a UNION only the output columns are in scope. The
-    // old message talked about declared types and reading a column off the
-    // schema.
+    // After a UNION only the output columns are in scope.
     let message = refusal(&format!(
         "{ROWS} SELECT a + 1 AS x FROM t UNION SELECT a + 1 AS x FROM t ORDER BY a + 1;"
     ));
-    assert!(message.to_lowercase().contains("union"), "{message}");
-    assert!(message.to_lowercase().contains("output column"), "{message}");
+    assert_eq!(message, r#"column "a" does not exist"#);
 }
 
 #[test]

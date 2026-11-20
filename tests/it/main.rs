@@ -69,6 +69,7 @@ mod test_dependency_hygiene;
 mod test_deployment_readings;
 mod test_direction_parity;
 mod test_distinct_on;
+mod test_double_quoted_columns;
 mod test_drop_column_dependents;
 mod test_drop_column_rebuild;
 mod test_drop_statements;

@@ -11,15 +11,15 @@
 //! - `RETURNING "Note"` over a policy-bearing table was emitted against the
 //!   view, whose row would answer NULL for a defaulted column.
 //!
-//! The lookups fold, so one column answers to `"ColA"` and to `cola`, which
-//! costs nothing because a table carrying both is refused where it is created.
-//!
-//! A name no column answers to is nobody's business here, and both guards
-//! leave that statement to the engine that will refuse it.
+//! A name no column answers to under PostgreSQL's case rules, an unquoted
+//! `cola` for `"ColA"` among them, is refused with PostgreSQL's message.
 
 use helpers::translate_pg as translate;
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
+use pg2sqlite::prelude::{
+    Error, Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, SqlState, UuidRepresentation,
+};
 use rusqlite::Connection;
+use sqlstate::pg;
 
 use crate::{
     helpers,
@@ -33,17 +33,6 @@ fn apply(connection: &Connection, statements: &[String]) {
             .execute_batch(&format!("{statement};"))
             .unwrap_or_else(|error| panic!("SQLite rejected emitted SQL: {error}\n{statement}"));
     }
-}
-
-/// What SQLite answers for the last emitted statement, the ones before it
-/// having been applied.
-fn engine_refusal(connection: &Connection, statements: &[String]) -> String {
-    let (last, setup) = statements.split_last().expect("at least one statement");
-    apply(connection, setup);
-    connection
-        .execute_batch(&format!("{last};"))
-        .expect_err("SQLite has to be the one refusing this")
-        .to_string()
 }
 
 #[test]
@@ -67,17 +56,24 @@ fn a_quoted_column_carries_its_default_into_the_values_row() {
 }
 
 #[test]
-fn the_folded_spelling_reaches_the_same_quoted_column() {
-    let statements = translate(
+fn the_folded_spelling_of_a_quoted_column_does_not_exist() {
+    let error = translate(
         "CREATE TABLE t (id INT PRIMARY KEY, \"ColA\" INT DEFAULT 7);\n\
          INSERT INTO t (id, cola) VALUES (1, DEFAULT);",
         &Pg2SqliteOptions::default(),
     )
-    .expect("the emitted table holds one column under either spelling");
+    .expect_err("PostgreSQL folds cola, which names no column of t");
 
-    let insert = statements.last().expect("an insert statement");
-    assert!(insert.contains("VALUES (1, 7)"), "the declared default must be substituted: {insert}");
-    apply(&Connection::open_in_memory().expect("in-memory SQLite"), &statements);
+    assert_postgres(
+        &error,
+        pg::UNDEFINED_COLUMN,
+        r#"column "cola" of relation "t" does not exist"#,
+    );
+}
+
+fn assert_postgres(error: &Error, sqlstate: SqlState, message: &str) {
+    let refused = error.postgres_error().unwrap_or_else(|| panic!("not PostgreSQL's: {error}"));
+    assert_eq!((refused.sqlstate(), refused.message()), (sqlstate, message));
 }
 
 #[test]
@@ -140,52 +136,28 @@ fn returning_a_quoted_defaulted_column_is_refused_on_a_policy_table() {
 }
 
 #[test]
-fn returning_an_undeclared_column_is_left_to_the_engine() {
-    let statements: Vec<String> = Pg2Sqlite::default()
+fn returning_an_undeclared_column_does_not_exist() {
+    let error = Pg2Sqlite::default()
         .sql(&policy_schema("nosuch"))
         .expect("parse")
         .translate(&monitor_options())
-        .expect("a name no column answers to is not a column the database fills in")
-        .into_vec()
-        .iter()
-        .map(ToString::to_string)
-        .collect();
+        .expect_err("RETURNING names no column of documents");
 
-    let insert = statements.last().expect("an insert statement");
-    assert!(insert.contains("RETURNING nosuch"), "the name must reach SQLite intact: {insert}");
-
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
-    connection
-        .create_scalar_function(
-            "current_app_user",
-            0,
-            rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
-            |_| Ok(42i64),
-        )
-        .expect("register the session variable function");
-    let error = engine_refusal(&connection, &statements);
-    assert!(
-        error.contains("no such column: nosuch"),
-        "SQLite must refuse it as an undeclared column: {error}"
-    );
+    assert_postgres(&error, pg::UNDEFINED_COLUMN, r#"column "nosuch" does not exist"#);
 }
 
 #[test]
-fn an_assignment_to_an_undeclared_column_is_left_to_the_engine() {
-    let statements = translate(
+fn an_assignment_to_an_undeclared_column_does_not_exist() {
+    let error = translate(
         "CREATE TABLE t (id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, note TEXT);\n\
          UPDATE t SET missing = 5 WHERE note = 'x';",
         &Pg2SqliteOptions::default(),
     )
-    .expect("the identity guard has nothing to say about a column the schema lacks");
+    .expect_err("SET names no column of t");
 
-    let update = statements.last().expect("an update statement");
-    assert!(update.contains("missing = 5"), "the assignment must reach SQLite intact: {update}");
-
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
-    let error = engine_refusal(&connection, &statements);
-    assert!(
-        error.contains("no such column: missing"),
-        "SQLite must refuse it as an undeclared column: {error}"
+    assert_postgres(
+        &error,
+        pg::UNDEFINED_COLUMN,
+        r#"column "missing" of relation "t" does not exist"#,
     );
 }

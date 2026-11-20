@@ -464,11 +464,11 @@ fn historical_factorial_operators_are_refused() {
 #[test]
 fn geometric_prefix_operators_are_refused() {
     for (source, operator) in [
-        ("SELECT # p", "#"),
-        ("SELECT @-@ p", "@-@"),
-        ("SELECT @@ p", "@@"),
-        ("SELECT ?- p", "?-"),
-        ("SELECT ?| p", "?|"),
+        ("SELECT # NULL", "#"),
+        ("SELECT @-@ NULL", "@-@"),
+        ("SELECT @@ NULL", "@@"),
+        ("SELECT ?- NULL", "?-"),
+        ("SELECT ?| NULL", "?|"),
         ("CREATE VIEW v AS SELECT#c", "#"),
     ] {
         let pg2sqlite::errors::Error::TranslationRefusal(refusal) = tr_err(source) else {

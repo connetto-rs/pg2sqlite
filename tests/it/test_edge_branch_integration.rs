@@ -564,7 +564,7 @@ fn forward_expr_translation_covers_remaining_fts_extract_and_timezone_paths() {
         .sql(
             "CREATE TABLE docs(id INTEGER PRIMARY KEY, title TEXT); \
              CREATE INDEX docs_fts ON docs USING GIN (to_tsvector('english', title)); \
-             SELECT id FROM docs WHERE to_tsvector('english', title) @@ to_tsquery(search_term);",
+             SELECT id FROM docs WHERE to_tsvector('english', title) @@ to_tsquery(title);",
         )
         .expect("parse")
         .translate(&options)

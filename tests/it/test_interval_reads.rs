@@ -1761,14 +1761,17 @@ fn an_insert_conflict_over_a_missing_table_answers_the_sqlite_error() {
 
 #[test]
 fn an_interval_compared_to_a_column_of_a_relation_outside_the_scope_is_refused() {
-    refused("SELECT id FROM t WHERE iv = out_of_scope.iv", "does not exist");
+    refused(
+        "SELECT id FROM t WHERE iv = out_of_scope.iv",
+        r#"missing FROM-clause entry for table "out_of_scope""#,
+    );
 }
 
 #[test]
 fn a_values_union_without_an_alias_over_an_interval_is_refused() {
     refused(
         "SELECT v.column1 FROM (VALUES ('1 day'::interval)) UNION SELECT '2 days'::interval",
-        "UNION over an interval column",
+        r#"missing FROM-clause entry for table "v""#,
     );
 }
 
@@ -1776,7 +1779,7 @@ fn a_values_union_without_an_alias_over_an_interval_is_refused() {
 fn a_values_union_naming_a_mismatched_alias_over_an_interval_is_refused() {
     refused(
         "SELECT w.column1 FROM (VALUES ('1 day'::interval)) v UNION SELECT '2 days'::interval",
-        "UNION over an interval column",
+        r#"missing FROM-clause entry for table "w""#,
     );
 }
 
@@ -1784,7 +1787,7 @@ fn a_values_union_naming_a_mismatched_alias_over_an_interval_is_refused() {
 fn a_values_union_with_a_three_part_reference_over_an_interval_is_refused() {
     refused(
         "SELECT a.b.c FROM (VALUES ('1 day'::interval)) v UNION SELECT '2 days'::interval",
-        "UNION over an interval column",
+        r#"missing FROM-clause entry for table "b""#,
     );
 }
 
