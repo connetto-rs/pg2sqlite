@@ -9,7 +9,8 @@
 //! arm joined by `UNION`. Each arm reads the backing table of a table that has
 //! one, because the helper runs as an owner that `helper_set` has checked is
 //! exempt from every policy it reads past, and the owner reads past the acting
-//! role's grants.
+//! role's grants. A table on which the acting role holds no privilege is left
+//! out of the replica, so a helper reading one is refused.
 
 use core::{convert::Infallible, ops::ControlFlow};
 
@@ -38,11 +39,12 @@ use crate::{
     impls::{
         function_helpers::{query_projection, simple_function_expr, string_literal},
         object_name::last_ident,
-        privileges::has_backing_table,
+        privileges::{RoleTable, has_backing_table},
         query_builder::{
             from_relation, make_query, make_simple_select, plain_table_factor, single_expr_query,
         },
-        translator_impls::sql_helper::declared_helper,
+        session_variable,
+        translator_impls::sql_helper::{declared_helper, hidden_read},
     },
     options::TranslationContext,
     traits::TranslatorWithContext,
@@ -60,8 +62,10 @@ use crate::{
 /// # Errors
 ///
 /// Refuses the call when no deployment is configured, when
-/// `FunctionLike::helper_set` cannot answer the helper, and when the query
-/// over its tables does not translate.
+/// `FunctionLike::helper_set` cannot answer the helper, when the helper reads
+/// a table the acting role holds no privilege on, which the translation
+/// leaves out of the replica, and when the query over its tables does not
+/// translate.
 pub(crate) fn helper_membership(
     subquery: &Query,
     schema: &ParserDB,
@@ -188,8 +192,17 @@ fn helper_query(
         .map_err(|error| untranslatable(name, &error))?;
     let mut lowering = Lowering { helper: name, schema, read: Vec::new(), walks: 0 };
     let lowered = lowering.set(&set, names)?;
+    let acting = session_variable::acting_role(schema, options)?;
     let mut guarded = Vec::new();
     for table in lowering.read {
+        if let Some(acting) = acting
+            && !RoleTable::of(table, Some(acting), schema)?.reads_any()
+        {
+            return Err(Error::forward_refusal(format!(
+                "{name}() cannot be translated as the set it returns: it {}.",
+                hidden_read(&table.name, acting)
+            )));
+        }
         let table_name = table.table_name();
         if !guarded.contains(&table_name) && has_backing_table(table, schema, options)? {
             guarded.push(table_name);

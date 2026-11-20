@@ -62,6 +62,7 @@ mod test_default_in_values;
 mod test_deferrable_constraints;
 mod test_deferred_constraint_trigger;
 mod test_definer_helper_inlining;
+mod test_definer_read_hidden_table;
 mod test_delete_using;
 mod test_delimited_membership;
 mod test_dependency_hygiene;
