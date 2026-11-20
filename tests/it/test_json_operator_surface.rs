@@ -110,12 +110,14 @@ fn a_numeric_path_element_is_refused_rather_than_answered_wrongly() {
 }
 
 #[test]
-fn a_quoted_numeric_or_null_removal_element_is_refused() {
+fn a_removal_path_without_literal_keys_is_refused() {
     let quoted = refusal(r#"SELECT '[1,2,3]'::jsonb #- '{"1"}';"#);
     assert!(quoted.to_lowercase().contains("array"), "{quoted}");
     // PostgreSQL 18.7: path element at position 2 is null.
     let null = refusal(r#"SELECT '{"a":1}'::jsonb #- '{a,NULL}';"#);
     assert!(null.contains("NULL"), "{null}");
+    let computed = refusal("CREATE TABLE jd (d jsonb); SELECT d #- $1 FROM jd;");
+    assert!(computed.contains("text-array literal"), "{computed}");
 }
 
 #[test]
