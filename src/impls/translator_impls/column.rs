@@ -26,6 +26,7 @@ use crate::{
                 numeric_precision_bound_expr, regular_int_range_bound_expr,
                 small_int_range_bound_expr,
             },
+            stored_text::stored_text_check,
             uuid::{
                 is_blob_uuid_representation, is_uuid_data_type, uuid_blob_length_check_expr,
                 wrap_uuid_column_default,
@@ -468,9 +469,10 @@ fn temporal_default(
 ///
 /// SQLite's `INTEGER` is 64 bits and its `TEXT` is unbounded, and it promotes
 /// an overflowing integer to `REAL` rather than failing, so without these a
-/// replica would hold values PostgreSQL refuses. The UUID bound is here for
-/// the same reason it is a `CHECK` rather than a translate-time rewrite: a
-/// bound parameter never passes through the literal rewrites.
+/// replica would hold values PostgreSQL refuses. The UUID bound and the
+/// stored text forms are here for the same reason they are a `CHECK` rather
+/// than a translate-time rewrite: a bound parameter never passes through the
+/// literal rewrites.
 fn declared_bound_checks(
     column: &ColumnDef,
     schema: &sql_traits::structs::ParserDB,
@@ -485,6 +487,7 @@ fn declared_bound_checks(
     if is_uuid_data_type(&column.data_type) && is_blob_uuid_representation(options) {
         bounds.push(uuid_blob_length_check_expr(&column.name));
     }
+    bounds.extend(stored_text_check(&column.name, &column.data_type, options)?);
     if let Some(info) = exact_numeric_info(&column.data_type) {
         let (precision, _) = numeric_precision_and_scale(info)?;
         bounds.push(numeric_precision_bound_expr(&column.name, precision));

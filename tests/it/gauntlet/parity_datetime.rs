@@ -102,10 +102,9 @@ CREATE TABLE moments (
 
 /// Seed data applied together with the DDL via batch_execute.
 ///
-/// The tstz values are stored without a zone marker so that SQLite's datetime()
-/// function (which requires HH:MM format for offsets, not bare +00) can process
-/// them. PostgreSQL interprets a TIMESTAMPTZ literal without a zone as UTC in a
-/// UTC session, which is the same instant.
+/// The tstz values carry no zone marker, which PostgreSQL reads as UTC in a
+/// UTC session. The replica's rows hold the same instants in the replica's
+/// own UTC text.
 ///
 /// Interval values use day-unit strings ('1 day', '30 days'). PostgreSQL
 /// normalizes those to text that matches the stored literal exactly, so the
@@ -135,7 +134,7 @@ mod schema {
     }
 }
 
-/// A seed row in its SQLite-compatible TEXT form.
+/// A seed row in the TEXT the replica holds, the form the translation writes.
 #[derive(Insertable)]
 #[diesel(table_name = schema::moments)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
@@ -153,28 +152,28 @@ fn seed_rows() -> Vec<MomentRow> {
             id: 1,
             d: "2024-12-30",
             ts: "2024-12-30 08:30:00",
-            tstz: "2024-12-30 08:30:00",
+            tstz: "2024-12-30 08:30:00.000000+00:00",
             ivl: "1 day",
         },
         MomentRow {
             id: 2,
             d: "2024-02-29",
             ts: "2024-02-29 23:59:59",
-            tstz: "2024-02-29 23:59:59",
+            tstz: "2024-02-29 23:59:59.000000+00:00",
             ivl: "30 days",
         },
         MomentRow {
             id: 3,
             d: "2024-03-05",
             ts: "2024-03-05 14:07:09",
-            tstz: "2024-03-05 14:07:09",
+            tstz: "2024-03-05 14:07:09.000000+00:00",
             ivl: "1 day",
         },
         MomentRow {
             id: 4,
             d: "2024-03-05",
             ts: "2024-03-05 14:07:09.250",
-            tstz: "2024-03-05 14:07:09.250",
+            tstz: "2024-03-05 14:07:09.250000+00:00",
             ivl: "1 day",
         },
     ]

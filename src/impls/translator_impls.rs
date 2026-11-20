@@ -42,6 +42,7 @@ mod referential_action;
 pub mod rls;
 pub(crate) mod sql_helper;
 pub(crate) mod statement;
+mod stored_text;
 mod table_constraint;
 pub(crate) mod trigger_row;
 pub(crate) mod trigger_slots;

@@ -77,10 +77,12 @@ pub struct ColumnManifestEntry {
 /// What a column's stored value is, where that is not the value PostgreSQL
 /// holds.
 ///
-/// Only the read direction needs this. A caller binds and writes what
-/// PostgreSQL takes, and the emitted SQL performs whatever conversion the
-/// column's storage needs, so nothing here is applied to a value on its way
-/// in.
+/// Only the read direction needs this. A caller writes what PostgreSQL takes,
+/// and the emitted SQL performs whatever conversion the column's storage
+/// needs. A parameter bound into a text-represented `uuid` or a temporal
+/// column is stored as bound, so it is bound already in
+/// [`ColumnStorage::UuidText`] form or the temporal text the translation
+/// writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnStorage {
     /// The stored value is the value, and the emitted SQLite type says what

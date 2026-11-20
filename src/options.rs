@@ -134,6 +134,10 @@ pub struct Pg2SqliteOptions {
     /// child rows are left to the server. Set via
     /// `with_server_derived_writes_omitted`.
     server_derived_writes_omitted: bool,
+    /// Whether the columns stored as text for a type PostgreSQL bounds go
+    /// without the `CHECK` holding them to the text the translation writes.
+    /// Set via `with_stored_text_checks_omitted`.
+    stored_text_checks_omitted: bool,
 }
 
 #[cfg(feature = "arbitrary")]
@@ -165,6 +169,7 @@ impl<'a> arbitrary::Arbitrary<'a> for Pg2SqliteOptions {
             ilike_fold_function: Option::<String>::arbitrary(u)?,
             attached_tables: Option::<AttachedTables>::arbitrary(u)?,
             server_derived_writes_omitted: bool::arbitrary(u)?,
+            stored_text_checks_omitted: bool::arbitrary(u)?,
         })
     }
 }
@@ -196,6 +201,7 @@ impl Default for Pg2SqliteOptions {
             ilike_fold_function: None,
             attached_tables: None,
             server_derived_writes_omitted: false,
+            stored_text_checks_omitted: false,
         }
     }
 }
@@ -1571,6 +1577,39 @@ impl Pg2SqliteOptions {
     /// Returns whether the writes the server derives are left out.
     pub fn is_server_derived_writes_omitted(&self) -> bool {
         self.server_derived_writes_omitted
+    }
+
+    #[must_use]
+    /// Leaves out the `CHECK` that holds each column stored as text for a
+    /// type PostgreSQL bounds to the text the translation writes for it: a
+    /// `uuid` under [`UuidRepresentation::Text`], a `date`, `time`, `timetz`,
+    /// `timestamp` or `timestamptz`, and a `json` or `jsonb` document.
+    ///
+    /// Such a column then takes any text, so a bound parameter or a row
+    /// applied directly may hold a value PostgreSQL refuses for the type,
+    /// such as `not a uuid`, `yesterday-ish` or `{not json`, and a replica
+    /// that uploads it has it refused by the server. Every other declared
+    /// bound stays.
+    ///
+    /// ```
+    /// # use pg2sqlite::prelude::*;
+    /// let options = Pg2SqliteOptions::default().with_stored_text_checks_omitted();
+    /// let script = Pg2Sqlite::default()
+    ///     .sql("CREATE TABLE events (id BIGINT PRIMARY KEY, at TIMESTAMPTZ, doc JSON);")?
+    ///     .translate_to_sql(&options)?;
+    /// assert!(script.iter().all(|statement| !statement.contains("CHECK")));
+    /// # Ok::<(), Error>(())
+    /// ```
+    pub fn with_stored_text_checks_omitted(mut self) -> Self {
+        self.stored_text_checks_omitted = true;
+        self
+    }
+
+    #[must_use]
+    /// Returns whether the columns stored as text go without the `CHECK`
+    /// holding them to the text the translation writes.
+    pub fn is_stored_text_checks_omitted(&self) -> bool {
+        self.stored_text_checks_omitted
     }
 }
 

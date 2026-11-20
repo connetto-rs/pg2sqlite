@@ -1070,14 +1070,14 @@ fn a_trigger_that_writes_and_refuses_keeps_its_refusals() {
     assert_eq!(
         refusal_of(
             &mut connection,
-            "INSERT INTO grants (id, user_id, expires_at) VALUES (2, 1, '1999-01-01 00:00:00+00:00');"
+            "INSERT INTO grants (id, user_id, expires_at) VALUES (2, 1, '1999-01-01 00:00:00.000000+00:00');"
         ),
         Some((pg::CHECK_VIOLATION, "grants cannot expire before 2000".to_owned())),
     );
     assert_eq!(
         refusal_of(
             &mut connection,
-            "INSERT INTO grants (id, user_id, expires_at) VALUES (3, 1, '2030-01-01 00:00:00+00:00');"
+            "INSERT INTO grants (id, user_id, expires_at) VALUES (3, 1, '2030-01-01 00:00:00.000000+00:00');"
         ),
         None,
     );
@@ -1135,7 +1135,7 @@ CREATE TRIGGER grants_expiry AFTER INSERT ON grants FOR EACH ROW EXECUTE FUNCTIO
     assert_eq!(
         refusal_of(
             &mut connection,
-            "INSERT INTO grants (id, user_id, expires_at) VALUES (2, 1, '2030-01-01 00:00:00+00:00');"
+            "INSERT INTO grants (id, user_id, expires_at) VALUES (2, 1, '2030-01-01 00:00:00.000000+00:00');"
         ),
         None,
     );
