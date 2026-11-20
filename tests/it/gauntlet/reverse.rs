@@ -1003,14 +1003,13 @@ fn read_divergence(
     }
 }
 
-/// The reverse direction has to answer what the replica answered, not merely
-/// produce something the server accepts.
-#[test]
-fn reversed_storage_wrappers_answer_what_the_replica_answered() {
+/// Asserts that every SQLite read in `cases`, reversed, answers on the server
+/// what it answered on the replica.
+fn assert_reversed_reads_match(cases: &[&str]) {
     let options = stored_options();
     let (mut sqlite, mut postgres, schema) = stored_pair(&options);
 
-    let failures: Vec<String> = STORAGE_WRAPPER_PARITY
+    let failures: Vec<String> = cases
         .iter()
         .filter_map(|sqlite_sql| {
             read_divergence(sqlite_sql, &mut sqlite, &mut postgres, &schema, &options)
@@ -1023,6 +1022,13 @@ fn reversed_storage_wrappers_answer_what_the_replica_answered() {
         failures.len(),
         failures.join("\n\n")
     );
+}
+
+/// The reverse direction has to answer what the replica answered, not merely
+/// produce something the server accepts.
+#[test]
+fn reversed_storage_wrappers_answer_what_the_replica_answered() {
+    assert_reversed_reads_match(STORAGE_WRAPPER_PARITY);
 }
 
 /// SQLite reads over `docs` whose arrow operand or path is a JSON path, with
@@ -1041,22 +1047,7 @@ const JSON_PATH_PARITY: &[&str] = &[
 /// A reversed JSON path names the keys SQLite's path named.
 #[test]
 fn reversed_json_paths_read_what_the_replica_read() {
-    let options = stored_options();
-    let (mut sqlite, mut postgres, schema) = stored_pair(&options);
-
-    let failures: Vec<String> = JSON_PATH_PARITY
-        .iter()
-        .filter_map(|sqlite_sql| {
-            read_divergence(sqlite_sql, &mut sqlite, &mut postgres, &schema, &options)
-        })
-        .collect();
-
-    assert!(
-        failures.is_empty(),
-        "{} case(s) diverged:\n\n{}",
-        failures.len(),
-        failures.join("\n\n")
-    );
+    assert_reversed_reads_match(JSON_PATH_PARITY);
 }
 
 /// SQLite writes placing a blob or a JSON array in a column whose PostgreSQL
