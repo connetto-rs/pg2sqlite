@@ -405,6 +405,7 @@ pub(crate) fn translate_column_def(
                 expr: Box::new(bound),
                 enforced: None,
                 no_inherit: false,
+                on_conflict: None,
             }),
         });
     }
