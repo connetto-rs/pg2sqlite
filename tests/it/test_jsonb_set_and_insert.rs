@@ -115,6 +115,26 @@ fn a_numeric_path_element_is_rejected() {
     );
 }
 
+/// A quoted number is the same `text[]` element as a bare one, and `-1` counts
+/// from the end of an array, so both are as ambiguous as `0`.
+#[test]
+fn a_quoted_or_signed_numeric_path_element_is_rejected() {
+    for path in ["'{arr,\"0\"}'", "'{arr,-1}'", "ARRAY['arr', '-1']"] {
+        let error = translate_err(&format!("SELECT jsonb_set('{{\"arr\":[1,2]}}', {path}, '9');"));
+        assert!(error.to_lowercase().contains("index"), "{path}: {error}");
+    }
+}
+
+/// PostgreSQL 18.7 refuses a NULL element with `path element at position 2 is
+/// null`.
+#[test]
+fn a_null_path_element_is_rejected() {
+    for path in ["'{a,NULL}'", "ARRAY['a', NULL]"] {
+        let error = translate_err(&format!("SELECT jsonb_set('{{\"a\":1}}', {path}, '9');"));
+        assert!(error.contains("NULL"), "{path}: {error}");
+    }
+}
+
 /// A path that is not a literal cannot be converted at translation time.
 #[test]
 fn a_non_literal_path_is_rejected() {

@@ -687,3 +687,23 @@ fn the_arrows_read_every_key_as_that_key() {
         ],
     );
 }
+
+/// A double-quoted `text[]` path element keeps its spaces and commas and
+/// unescapes `\x` to `x`, and a quoted number is the same element as a bare
+/// one.
+#[test]
+fn path_literals_read_quoted_elements_as_postgresql_does() {
+    assert_parity(
+        TABLE,
+        &[KINDS],
+        &[
+            "SELECT jsonb_set(body, '{\"a\\\\b\"}', '9')::text || jsonb_set(body, '{\"a\\\"b\"}', \
+             '9')::text || jsonb_set(body, '{\"a,b\"}', '9')::text || jsonb_set(body, '{\" a \"}', \
+             '9')::text AS value FROM docs WHERE id = 10",
+            "SELECT (body #- '{\"a\\\\b\"}')::text || (body #- '{\"a\\\"b\"}')::text \
+             || (body #- '{\"a.b\"}')::text || (body #- '{}')::text AS value FROM docs WHERE id = 10",
+            "SELECT (body #> '{a,\"1\"}')::text || (body #>> '{a, \"0\"}') AS value FROM docs \
+             WHERE id = 7",
+        ],
+    );
+}
