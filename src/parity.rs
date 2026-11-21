@@ -35,10 +35,12 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use diesel::{
     connection::SimpleConnection,
+    deserialize::{self, FromSql},
     prelude::*,
     result::Error as DieselError,
+    serialize::{self, IsNull, Output, ToSql},
     sql_types::{Binary, Bool, Nullable, Text},
-    sqlite::SqliteFunctionBehavior,
+    sqlite::{Sqlite, SqliteFunctionBehavior, SqliteType, SqliteValue},
 };
 use sql_traits::{
     errors::DeploymentError,
@@ -95,8 +97,8 @@ pub enum ParityError {
         #[source]
         source: DieselError,
     },
-    /// pg2sqlite translated the schema and then failed to describe it, or
-    /// refused the seed.
+    /// pg2sqlite translated the schema and then failed to describe it,
+    /// refused the seed, or has no stored form for a caller's setting.
     #[error("Cannot build the replica of {role}")]
     Translation {
         /// The acting role.
@@ -250,16 +252,18 @@ impl Measured {
 /// The caller each replica function answers for, whether writes are exempt, and
 /// how many UUIDs the replica has minted.
 struct Session {
-    callers: Vec<BTreeMap<String, String>>,
+    /// Each caller's settings, as the replica stores them.
+    callers: Vec<BTreeMap<String, Stored>>,
     caller: AtomicUsize,
     exempt: AtomicBool,
     minted: AtomicU64,
 }
 
 impl Session {
-    /// The current caller's value of `setting`, `NULL` when the caller sets
-    /// none, as `current_setting(setting, true)` reads it.
-    fn setting(&self, setting: &str) -> Option<String> {
+    /// The current caller's value of `setting` as the replica stores it,
+    /// `NULL` when the caller sets none, as `current_setting(setting, true)`
+    /// reads it.
+    fn setting(&self, setting: &str) -> Option<Stored> {
         self.callers[self.caller.load(Ordering::Relaxed)].get(setting).cloned()
     }
 
@@ -273,6 +277,78 @@ impl Session {
         bytes[8] |= 0x80;
         bytes
     }
+}
+
+/// A value in whichever storage class SQLite holds it.
+///
+/// It crosses diesel as `Text`, a name only, since SQLite types each value
+/// and not a function's result.
+#[derive(Clone, Debug)]
+enum Stored {
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+impl FromSql<Text, Sqlite> for Stored {
+    fn from_sql(mut value: SqliteValue<'_, '_, '_>) -> deserialize::Result<Self> {
+        Ok(match value.value_type() {
+            Some(SqliteType::Long | SqliteType::Integer | SqliteType::SmallInt) => {
+                Self::Integer(value.read_long())
+            }
+            Some(SqliteType::Double | SqliteType::Float) => Self::Real(value.read_double()),
+            Some(SqliteType::Binary) => Self::Blob(value.read_blob().to_vec()),
+            Some(SqliteType::Text) | None => Self::Text(value.read_text().to_owned()),
+        })
+    }
+}
+
+impl ToSql<Text, Sqlite> for Stored {
+    fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Sqlite>) -> serialize::Result {
+        match self {
+            Self::Integer(value) => out.set_value(*value),
+            Self::Real(value) => out.set_value(*value),
+            Self::Text(value) => out.set_value(value.as_str()),
+            Self::Blob(value) => out.set_value(value.as_slice()),
+        }
+        Ok(IsNull::No)
+    }
+}
+
+/// Each setting `owner` maps that `settings` sets, as the replica stores it,
+/// which is what the paired function answers.
+///
+/// pg2sqlite's own conversion turns the case's text into the stored form, so
+/// the replica runs it once per setting.
+fn stored_settings(
+    connection: &mut SqliteConnection,
+    owner: &Pg2SqliteOptions,
+    settings: &BTreeMap<String, String>,
+    role: &str,
+) -> Result<BTreeMap<String, Stored>, ParityError> {
+    let mut stored = BTreeMap::new();
+    for mapping in owner.get_session_variables() {
+        let Some(text) = settings.get(&mapping.setting) else { continue };
+        let answer = crate::impls::session_variable::paired_answer(mapping, text, owner).map_err(
+            |source| ParityError::Translation { role: role.to_owned(), source: Box::new(source) },
+        )?;
+        // The case's setting is runtime fixture data, as pg2sqlite converted
+        // it.
+        let value = diesel::select(diesel::dsl::sql::<Nullable<Text>>(&answer.to_string()))
+            .get_result::<Option<Stored>>(connection)
+            .map_err(|source| {
+                ParityError::Database {
+                    role: role.to_owned(),
+                    action: format!("Storing {} as {answer}", mapping.setting),
+                    source,
+                }
+            })?;
+        if let Some(value) = value {
+            stored.insert(mapping.setting.clone(), value);
+        }
+    }
+    Ok(stored)
 }
 
 /// The temporary table [`track_changes`] fills, private so `table!` adds
@@ -333,8 +409,14 @@ impl Replica {
             .map_err(failed)?;
         let mut connection = SqliteConnection::establish(":memory:")
             .map_err(|source| ParityError::Connection { role: role.to_owned(), source })?;
+        let callers = case
+            .config
+            .callers
+            .iter()
+            .map(|caller| stored_settings(&mut connection, owner, &caller.settings, role))
+            .collect::<Result<_, _>>()?;
         let session = Arc::new(Session {
-            callers: case.config.callers.iter().map(|caller| caller.settings.clone()).collect(),
+            callers,
             caller: AtomicUsize::new(0),
             exempt: AtomicBool::new(false),
             minted: AtomicU64::new(0),
@@ -467,8 +549,9 @@ impl Replica {
 }
 
 /// Register on `connection` the functions `options` name: each session
-/// variable's function answering the current caller's setting, the write
-/// exemption, the UUID minter, and the `jsonb` functions and collation.
+/// variable's function answering the current caller's setting as the replica
+/// stores it, the write exemption, the UUID minter, and the `jsonb` functions
+/// and collation.
 fn register_functions(
     connection: &mut SqliteConnection,
     options: &Pg2SqliteOptions,
@@ -698,6 +781,46 @@ mod tests {
             refused_write("Unsupported SQLite feature: write-only column".into()),
             Measured::Refused(reason) if reason == "Unsupported SQLite feature: write-only column"
         ));
+    }
+
+    /// A session function answers a one-value setting as the replica stores
+    /// it, so a `uuid` caller is the sixteen bytes a blob-stored `uuid`
+    /// column holds and each caller sees the row it owns.
+    #[test]
+    fn a_uuid_caller_answers_its_stored_bytes() {
+        use sql_traits::structs::{Deployment, SessionSetting, SetPacking, SettingValue};
+        use sqlparser::ast::DataType;
+
+        let case = case("uuid_owner_blob");
+        let deployment = Deployment::new(
+            case.config.callers[0].role.as_str(),
+            case.config.acting_roles(),
+            [
+                SessionSetting::value("app.user_id", SettingValue::Caller(DataType::Uuid))
+                    .expect("a caller setting"),
+                SessionSetting::value(
+                    "app.subjects",
+                    SettingValue::Set {
+                        element: DataType::Text,
+                        packing: SetPacking::Delimited(",".into()),
+                    },
+                )
+                .expect("a set setting"),
+            ],
+        )
+        .expect("a deployment");
+        let owner =
+            case_options(&case).expect("the case has a deployment").with_deployment(deployment);
+        let statement = case.config.tables[0].statement(Shape::Select);
+        let probes: Vec<Probe<'_>> =
+            [("a", "udocs:1"), ("a", "udocs:2"), ("b", "udocs:1"), ("b", "udocs:2")]
+                .into_iter()
+                .map(|(caller, row)| Probe { caller, row, statement: &statement })
+                .collect();
+        let replay = replay(&case, &owner, &probes).expect("replays");
+        assert_eq!(replay.refusal, None);
+        let answers: Vec<&Answer> = replay.answers.iter().map(|answer| &answer.answer).collect();
+        assert_eq!(answers, [&Answer::Visible, &Answer::Hidden, &Answer::Hidden, &Answer::Visible]);
     }
 
     /// A UUID minted as text spells its bytes in the canonical hyphenated form.
