@@ -167,6 +167,7 @@ pub(crate) fn companion_index(
 
     Ok(Some(Statement::CreateIndex(CreateIndex {
         name: Some(single_name(&companion_name(name))),
+        only: false,
         table_name: emitted_table.clone(),
         using: None,
         columns,

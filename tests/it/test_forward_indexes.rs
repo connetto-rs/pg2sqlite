@@ -41,6 +41,20 @@ fn unique_index() {
     execute_translated(sql);
 }
 
+#[test]
+fn index_on_only_a_table_without_partitions_is_an_ordinary_index() {
+    let sql = "
+        CREATE TABLE users (id INT PRIMARY KEY, name TEXT);
+        CREATE INDEX idx_users_name ON ONLY users (name);
+    ";
+    let output = translate(sql);
+    assert!(
+        output.contains("CREATE INDEX idx_users_name ON users"),
+        "Expected plain index: {output}"
+    );
+    execute_translated(sql);
+}
+
 mod catalogue {
     diesel::table! {
         sqlite_master (name) {

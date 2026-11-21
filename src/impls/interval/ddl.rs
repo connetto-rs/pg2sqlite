@@ -98,6 +98,7 @@ pub(crate) fn companion_statements(
                 name: Some(ObjectName(vec![ObjectNamePart::Identifier(quoted_ident(
                     &companion.name,
                 ))])),
+                only: false,
                 table_name: table_name.clone(),
                 using: None,
                 columns: companion.columns.clone(),
