@@ -5,22 +5,22 @@
 //! authz.f('admin')))`, or reads the helper's rows where a table goes, as
 //! `(a, b) IN (SELECT * FROM authz.f('admin'))`. SQLite has no functions of
 //! its own to call, so the call is replaced by the query
-//! `FunctionLike::helper_set` reads out of the helper's body, one `SELECT` per
-//! arm joined by `UNION`. Each arm reads the backing table of a table that has
-//! one, because the helper runs as an owner that `helper_set` has checked is
-//! exempt from every policy it reads past, and the owner reads past the acting
-//! role's grants. A table on which the acting role holds no privilege is left
-//! out of the replica, so a helper reading one is refused.
+//! `FunctionLike::helper_set_with_exclusions` reads out of the helper's body,
+//! one `SELECT` per arm joined by `UNION`. Each arm reads the backing table of
+//! a table that has one, because the helper runs as an owner that this reading
+//! has checked is exempt from every policy it reads past, and the owner reads
+//! past the acting role's grants. A table on which the acting role holds no
+//! privilege is left out of the replica, so a helper reading one is refused.
 
 use core::{convert::Infallible, ops::ControlFlow};
 
 use sql_traits::{
     errors::HelperSetError,
     structs::{
-        AntiJoin, CalledArm, CallerGate, CapOperand, GrantArm, GrantedTo, HelperArm, HelperSet,
-        ParentArm, ParserDB, RequestNormalization, Restriction, Returned, RowCap, SetPacking,
-        SettingComparison, SettingContent, SettingValue, TimeBound, TimeComparison, WalkArm,
-        WalkDirection,
+        AntiJoin, CalledArm, CallerGate, CapOperand, ExcludedSet, GrantArm, GrantedTo, HelperArm,
+        HelperSet, ParentArm, ParserDB, RequestNormalization, Restriction, Returned, RowCap,
+        SetPacking, SettingComparison, SettingContent, SettingValue, TimeBound, TimeComparison,
+        WalkArm, WalkDirection,
     },
     traits::{ColumnLike, DatabaseLike, FunctionLike, TableLike},
 };
@@ -62,10 +62,10 @@ use crate::{
 /// # Errors
 ///
 /// Refuses the call when no deployment is configured, when
-/// `FunctionLike::helper_set` cannot answer the helper, when the helper reads
-/// a table the acting role holds no privilege on, which the translation
-/// leaves out of the replica, and when the query over its tables does not
-/// translate.
+/// `FunctionLike::helper_set_with_exclusions` cannot answer the helper, when
+/// the helper or a set it excludes reads a table the acting role holds no
+/// privilege on, which the translation leaves out of the replica, and when
+/// the query over its tables does not translate.
 pub(crate) fn helper_membership(
     subquery: &Query,
     schema: &ParserDB,
@@ -97,7 +97,8 @@ pub(crate) fn helper_membership(
 /// for the one column of `RETURNS SETOF` a scalar type, the alias's columns
 /// renaming the leading ones. A `LANGUAGE sql` helper running as its caller
 /// reads the rows of its body, as [`inlined_rows`] writes them, and any other
-/// the set `helper_set` reads. `None` is as for [`helper_membership`].
+/// the set `helper_set_with_exclusions` reads. `None` is as for
+/// [`helper_membership`].
 ///
 /// # Errors
 ///
@@ -233,7 +234,8 @@ pub(crate) fn check_lateral_calls(
     Ok(())
 }
 
-/// The refusal of a call to `name` that `helper_set` cannot answer.
+/// The refusal of a call to `name` that `helper_set_with_exclusions` cannot
+/// answer.
 fn untranslatable(name: &ObjectName, error: &HelperSetError) -> Error {
     Error::forward_refusal(format!("{name}() cannot be translated as the set it returns: {error}"))
 }
@@ -257,7 +259,7 @@ fn helper_query(
         )));
     };
     let set = arguments
-        .and_then(|arguments| helper.helper_set(&arguments, deployment, schema))
+        .and_then(|arguments| helper.helper_set_with_exclusions(&arguments, deployment, schema))
         .map_err(|error| untranslatable(name, &error))?;
     let mut lowering = Lowering { helper: name, schema, read: Vec::new(), walks: 0 };
     let lowered = lowering.set(&set, names)?;
@@ -564,6 +566,9 @@ impl<'db> Lowering<'_, 'db> {
         for anti_join in grant.anti_joins() {
             conditions.push(self.anti_join(anti_join));
         }
+        for exclusion in grant.exclusions() {
+            conditions.push(self.exclusion(exclusion)?);
+        }
         let (returned, labels) =
             returned_values(grant.returned(), |column| qualified(ARM, column_ident(column)));
         joins.extend(labels);
@@ -668,6 +673,14 @@ impl<'db> Lowering<'_, 'db> {
             )),
             negated: true,
         }
+    }
+
+    /// `<column> NOT IN (<set>)`, which is `NULL`, dropping the row, where
+    /// the column holds `NULL` and the set any row, or the set holds `NULL`
+    /// but not the column's value, as PostgreSQL's exclusion is.
+    fn exclusion(&mut self, exclusion: &ExcludedSet<'db, ParserDB>) -> Result<Expr, Error> {
+        let excluded = self.set(exclusion.set(), &[])?;
+        Ok(not_in_query(qualified(ARM, column_ident(exclusion.column())), excluded))
     }
 }
 
@@ -912,6 +925,15 @@ fn in_query(expr: Expr, query: Query) -> Expr {
         expr: Box::new(expr),
         target: InTarget::Subquery(Box::new(query)),
         negated: false,
+        global: false,
+    }
+}
+
+fn not_in_query(expr: Expr, query: Query) -> Expr {
+    Expr::In {
+        expr: Box::new(expr),
+        target: InTarget::Subquery(Box::new(query)),
+        negated: true,
         global: false,
     }
 }

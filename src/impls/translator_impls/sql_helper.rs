@@ -174,7 +174,7 @@ pub(crate) fn inlined_call<'s>(
 /// The arguments may read the queries around the call, as a column of an
 /// enclosing query or a trigger's `NEW` and `OLD` do. `None` leaves a
 /// `SECURITY DEFINER` helper and one written in another language to the set
-/// `FunctionLike::helper_set` reads out of the helper.
+/// `FunctionLike::helper_set_with_exclusions` reads out of the helper.
 ///
 /// # Errors
 ///
