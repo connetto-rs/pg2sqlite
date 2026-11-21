@@ -379,16 +379,6 @@ fn json_all_keys_exist_executes_correctly() {
 }
 
 #[test]
-fn json_delete_path_translates_to_json_remove() {
-    // doc #- '{a}' -> json_remove(doc, '$."a"')
-    let sql = tr(r#"SELECT '{"a":1,"b":2}' #- '{a}'"#);
-    assert_eq!(
-        sql, r#"SELECT json_remove('{"a":1,"b":2}', '$."a"')"#,
-        "unexpected emitted SQL: {sql}"
-    );
-}
-
-#[test]
 fn json_delete_path_executes_correctly() {
     let mut conn = establish_connection();
     // sql_query: executing dynamically generated SQL, not a static schema
@@ -398,17 +388,6 @@ fn json_delete_path_executes_correctly() {
         .expect("execute json_remove")
         .r;
     assert_eq!(result, r#"{"b":2}"#, "json_remove must delete key 'a'");
-}
-
-#[test]
-fn json_delete_nested_path_translates() {
-    // #- with a two-element path: doc #- '{a,b}' -> json_remove(doc,
-    // '$."a"."b"')
-    let sql = tr(r#"SELECT '{"a":{"b":1}}' #- '{a,b}'"#);
-    assert_eq!(
-        sql, r#"SELECT json_remove('{"a":{"b":1}}', '$."a"."b"')"#,
-        "unexpected emitted SQL: {sql}"
-    );
 }
 
 #[test]

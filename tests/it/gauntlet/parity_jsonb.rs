@@ -707,3 +707,31 @@ fn path_literals_read_quoted_elements_as_postgresql_does() {
         ],
     );
 }
+
+/// PostgreSQL refuses a write whose key step meets an array or whose document
+/// is a scalar, and leaves the document unchanged when a key step meets a
+/// scalar or a missing key, where SQLite would create the missing objects.
+#[test]
+fn path_writes_fail_where_postgresql_fails() {
+    assert_parity(
+        TABLE,
+        &[
+            KINDS,
+            Step::Sql("UPDATE docs SET body = jsonb_set(body, '{a,x}', '9') WHERE id = 7"),
+            Step::Sql("UPDATE docs SET body = jsonb_set(body, '{a,x}', '9', false) WHERE id = 7"),
+            Step::Sql("UPDATE docs SET body = jsonb_insert(body, '{a,x}', '9') WHERE id = 7"),
+            Step::Sql("UPDATE docs SET body = body #- '{a,x}' WHERE id = 7"),
+            Step::Sql("UPDATE docs SET body = jsonb_set(body, '{x}', '9') WHERE id = 9"),
+            Step::Sql("UPDATE docs SET body = body #- '{x}' WHERE id = 9"),
+            Step::Sql("UPDATE docs SET body = jsonb_set(body, '{a,c,x}', '9') WHERE id = 6"),
+            Step::Sql("UPDATE docs SET body = jsonb_set(body -> 'a', '{x}', '9') WHERE id = 2"),
+            Step::Sql("UPDATE docs SET body = jsonb_insert(body -> 'a', '{x}', '9') WHERE id = 2"),
+            Step::Sql("UPDATE docs SET body = (body -> 'a') #- '{x}' WHERE id = 2"),
+            Step::Sql("UPDATE docs SET body = (body -> 'a') #- '{}' WHERE id = 2"),
+            Step::Sql("UPDATE docs SET body = jsonb_set(body, '{a,x}', '9') WHERE id IN (1, 2, 8)"),
+            Step::Sql("UPDATE docs SET body = body #- '{a,b,x}' WHERE id IN (3, 6, 8)"),
+            Step::Sql("UPDATE docs SET body = jsonb_set(body, '{a,c,x}', '9') WHERE id = 8"),
+        ],
+        &["SELECT id::text || ' ' || coalesce(body::text, 'NULL') AS value FROM docs ORDER BY id"],
+    );
+}
