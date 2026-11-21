@@ -23,7 +23,7 @@ use crate::{
     impls::{
         function_helpers::positional_arity,
         object_name::last_ident,
-        shared_helpers::{declared_in_scope, first_query_output, function_arg_expr},
+        shared_helpers::{combined_in_scope, first_query_output, function_arg_expr},
         translator_impls::postgis,
     },
 };
@@ -74,12 +74,13 @@ pub(crate) fn type_name<'e>(
         }
         Expr::Subquery(query) => query_output_type_name(query, schema, options)?.map(Cow::Owned),
         _ => {
-            declared_in_scope(
+            combined_in_scope(
                 expr,
                 schema,
                 options,
                 |column| Some(declared_type_name(column)),
                 owned_type_name,
+                &arms_common_type(schema),
             )?
             .map(Cow::Owned)
         }
@@ -127,7 +128,18 @@ pub(crate) fn query_output_type_name(
         options,
         |column| Some(declared_type_name(column)),
         owned_type_name,
+        &arms_common_type(schema),
     )
+}
+
+/// The type PostgreSQL's `select_common_type` settles the arms of a set
+/// operation or the rows of a `VALUES` list on, an untyped literal taking the
+/// type of the arms beside it.
+fn arms_common_type(schema: &ParserDB) -> impl Fn(Vec<Option<String>>) -> Option<String> + '_ {
+    move |types| {
+        let types: Vec<Option<&str>> = types.iter().map(Option::as_deref).collect();
+        schema.common_type_name(&types).map(Cow::into_owned)
+    }
 }
 
 /// Whether a type name, as [`type_name`] spells it, names an array type.
