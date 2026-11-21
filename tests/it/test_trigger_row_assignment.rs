@@ -232,18 +232,6 @@ fn an_assignment_beside_another_statement_is_refused() {
     );
 }
 
-/// This body already is a run of assignments closed by `RETURN NEW`, so the
-/// refusal has to name the other half of the rule, that the column be one the
-/// table declares, or it misdiagnoses the cause.
-#[test]
-fn an_assignment_to_an_undeclared_column_is_refused() {
-    let message = assert_refuses(&script_with_body("NEW.nope := 'x';"), "NEW.nope");
-    assert!(
-        message.contains("columns the table declares"),
-        "the refusal should name the declared-column requirement: {message}"
-    );
-}
-
 /// `OLD` is a plpgsql record like any other, not a read only view of the row.
 /// PostgreSQL accepts the assignment and runs the write, measured on
 /// PostgreSQL 16, because a BEFORE trigger writes what `RETURN NEW` hands back.

@@ -9,7 +9,7 @@ use sqlparser::ast::{
     Expr, Ident, ObjectName, ObjectNamePart, Select, SelectItem, SetExpr, TableFactor,
 };
 
-use super::Planner;
+use super::{Names, Planner};
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
 use crate::script::ConnectionError;
@@ -31,8 +31,9 @@ pub(super) struct Listed {
     /// Whether the relation is a common table expression or derived table,
     /// whose columns no stored rename reaches.
     pub(super) lexical: bool,
-    /// For a view, the ASCII-folded names of the outputs that are bare column
-    /// references and so follow a renamed column, as SQLite renames them.
+    /// For a view, the ASCII-folded names of the outputs that follow a renamed
+    /// column: under SQLite the bare column references, as its rename rewrites
+    /// them, and none under PostgreSQL, whose views keep their output names.
     pub(super) view: Option<Vec<String>>,
     /// The name a replayed reference uses, the alias or the final name.
     pub(super) replay_name: String,
@@ -102,7 +103,11 @@ impl Planner<'_> {
                 let (temporary, view, columns) = match resolve(self.epoch, name) {
                     Relation::Table(table) => (table.is_temporary(), None, self.columns(table)?),
                     Relation::View(view) => {
-                        (view.is_temporary(), Some(following_outputs(view)), None)
+                        let following = match self.names {
+                            Names::Sqlite => following_outputs(view),
+                            Names::Postgres => Vec::new(),
+                        };
+                        (view.is_temporary(), Some(following), None)
                     }
                     Relation::Other => return Ok(()),
                 };

@@ -264,28 +264,30 @@ fn replay_unit(
 ) -> Result<(ReplaySchema, Option<Vec<Statement>>), ConnectionError> {
     let replay_homes = schema.homes;
     let replays = schema.replays(unit.source, owned, &placed.homes);
-    let rebound =
-        rebind::rebind(unit.source, id, unit.binding, final_schema, replay_homes, &placed.homes)?;
-    let body = match unit.source {
-        Statement::CreateTrigger(create) => {
-            rebind::rebind_trigger_body(
-                create,
-                id,
-                unit.binding,
-                final_schema,
-                replay_homes,
-                &placed.homes,
-            )?
-        }
-        _ => None,
+    // Triggers a statement that does not replay rebuilt keep their emitted,
+    // resolved form.
+    if unit.rebuilt_trigger && !replays {
+        return Ok((schema, None));
+    }
+    let rebound_as = |names| {
+        rebind::rebind(
+            unit.source,
+            id,
+            unit.binding,
+            final_schema,
+            replay_homes,
+            &placed.homes,
+            names,
+        )
     };
-    let rebound = match (rebound, &body) {
-        (None, Some(_)) => Some(unit.source.clone()),
-        (rebound, _) => rebound,
-    };
+    let rebound = rebound_as(rebind::Names::Sqlite)?;
+    // The schema models PostgreSQL, so it takes the statement in PostgreSQL's
+    // names, where a view keeps the output names SQLite's rename moves.
+    let checked = rebound_as(rebind::Names::Postgres)?;
+    let checked = checked.as_ref().unwrap_or(unit.source);
     let Some(statement) = rebound else {
         if replays {
-            schema = schema.apply(unit.source)?;
+            schema = schema.apply(checked)?;
         }
         return Ok((schema, None));
     };
@@ -313,16 +315,8 @@ fn replay_unit(
     // and every other one against the schema after it.
     let before = Pg2Sqlite::schema_ends_epoch(&statement);
     if replays && !before {
-        schema = schema.apply(&statement)?;
+        schema = schema.apply(checked)?;
     }
-    let rebound_context;
-    let context = match &body {
-        Some(body) => {
-            rebound_context = context.with_rebound_body(body);
-            &rebound_context
-        }
-        None => context,
-    };
     let index = id.index();
     let mut statements =
         match statement.translate_with_warnings(&schema.snapshot(), context, &mut |_| {}) {
@@ -343,7 +337,7 @@ fn replay_unit(
         })?;
     }
     if replays && before {
-        schema = schema.apply(&statement)?;
+        schema = schema.apply(checked)?;
     }
     Ok((schema, Some(statements)))
 }

@@ -339,9 +339,6 @@ pub struct TranslationContext<'a> {
     /// Whether every relation available to the input is present in the schema.
     schema_is_complete: bool,
     subqueries_allowed: bool,
-    /// The body a trigger translated here executes in place of its function's
-    /// stored one, set when a replay renames what the body references.
-    rebound_body: Option<&'a sqlparser_plpgsql::embedded::Block>,
     /// The schema as the statement being translated was written, which names
     /// a wildcard's columns before a later column change in its epoch.
     written_schema: Option<&'a ParserDB>,
@@ -383,7 +380,6 @@ struct ContextFields<'a> {
     variables: &'a [BoundVariable],
     schema_is_complete: bool,
     subqueries_allowed: bool,
-    rebound_body: Option<&'a sqlparser_plpgsql::embedded::Block>,
     written_schema: Option<&'a ParserDB>,
     history: Option<StatementHistory<'a>>,
     running_as: Option<&'a Role>,
@@ -400,7 +396,6 @@ impl<'a> ContextFields<'a> {
             variables: context.variables,
             schema_is_complete: context.schema_is_complete,
             subqueries_allowed: context.subqueries_allowed,
-            rebound_body: context.rebound_body,
             written_schema: context.written_schema,
             history: context.history,
             running_as: context.running_as,
@@ -425,7 +420,6 @@ impl<'a> ContextFields<'a> {
             variables: self.variables,
             schema_is_complete: self.schema_is_complete,
             subqueries_allowed: self.subqueries_allowed,
-            rebound_body: self.rebound_body,
             written_schema: self.written_schema,
             history: self.history,
             running_as: self.running_as,
@@ -449,7 +443,6 @@ impl<'a> TranslationContext<'a> {
             variables: &[],
             schema_is_complete: false,
             subqueries_allowed: true,
-            rebound_body: None,
             written_schema: None,
             history: None,
             running_as: None,
@@ -474,7 +467,6 @@ impl<'a> TranslationContext<'a> {
             variables: &[],
             schema_is_complete: false,
             subqueries_allowed: true,
-            rebound_body: None,
             written_schema: None,
             history: None,
             running_as: None,
@@ -585,23 +577,6 @@ impl<'a> TranslationContext<'a> {
         let mut fields = ContextFields::borrowed(self);
         fields.variables = variables;
         fields.into_context(self.scope, self.outer)
-    }
-
-    /// The same context translating a trigger with `body` in place of its
-    /// function's stored body.
-    pub(crate) fn with_rebound_body<'s>(
-        &'s self,
-        body: &'s sqlparser_plpgsql::embedded::Block,
-    ) -> TranslationContext<'s> {
-        let mut fields = ContextFields::borrowed(self);
-        fields.rebound_body = Some(body);
-        fields.into_context(self.scope, self.outer)
-    }
-
-    /// The body a trigger translated here executes in place of its
-    /// function's stored one.
-    pub(crate) const fn rebound_body(&self) -> Option<&sqlparser_plpgsql::embedded::Block> {
-        self.rebound_body
     }
 
     /// The same context noting `schema` as the one the statement was written
