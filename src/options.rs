@@ -559,12 +559,11 @@ impl<'a> TranslationContext<'a> {
     /// on 18.6, so the query's level is left out and the levels above it
     /// stay.
     pub(crate) fn derived_table_body(&self) -> TranslationContext<'_> {
-        let (scope, outer) = match self.scope {
-            Some(TranslationScope::Query { .. }) => {
-                self.outer.map_or((None, None), |outer| (outer.scope, outer.outer))
-            }
-            _ => (self.scope, self.outer),
-        };
+        debug_assert!(
+            matches!(self.scope, Some(TranslationScope::Query { .. })),
+            "a FROM item is translated under the scope of the query holding it"
+        );
+        let (scope, outer) = self.outer.map_or((None, None), |outer| (outer.scope, outer.outer));
         ContextFields::borrowed(self).into_context(scope, outer)
     }
 
