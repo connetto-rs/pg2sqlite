@@ -11,12 +11,13 @@
 //! left out whole when it does nothing else, and when what it keeps reads
 //! what a write the server derives produces before it, which the replica
 //! never sees: a later statement of its own, `FOUND` or the row a write
-//! returns, or rows of a table another trigger or a foreign key action
-//! writes on the same write before it fires. [`rows`] holds a read and a
-//! write to the labels of enum columns they filter or write, where only
-//! disjoint labels prove that they share no row.
+//! returns, or rows of a table another trigger writes or columns a foreign
+//! key action changes on the same write before it fires. [`rows`] holds a
+//! read and a write to the labels of enum columns they filter or write,
+//! where only disjoint labels prove that they share no row.
 
 mod chain;
+mod columns;
 mod firing;
 mod rows;
 

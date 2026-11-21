@@ -2,21 +2,29 @@
 //! it: its own writes and what they set off, the triggers and foreign key
 //! actions firing before it on the same write, and what an `INSTEAD OF`
 //! trigger's earlier writes set off before the write that fires it.
+//!
+//! A foreign key action writes only the columns of the key, and an update
+//! runs it only when it changes a referenced column. The write the replica
+//! uploads changes only the columns the acting role may update, so a read of
+//! none of the columns an action changes answers on the replica as on the
+//! server.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 
 use sql_traits::{
     structs::ParserDB,
-    traits::{DatabaseLike, ForeignKeyLike, TableLike},
+    traits::{ColumnLike, DatabaseLike, ForeignKeyLike, TableLike},
 };
 use sqlparser::ast::{
-    CreateTrigger, ObjectName, ObjectType, ReferentialAction, Statement, TriggerPeriod,
+    CreateTable, CreateTrigger, ObjectName, ObjectType, ReferentialAction, Statement, TriggerPeriod,
 };
 
 use super::{
     DerivedWrite, Event,
     chain::{Chain, Step, Walker},
-    chain_phrase, function_writes, is_per_row,
+    chain_phrase,
+    columns::Columns,
+    function_writes, is_per_row,
     rows::Held,
 };
 #[cfg(not(feature = "std"))]
@@ -25,16 +33,19 @@ use crate::{
     errors::Error,
     impls::{
         object_name::last_ident,
+        privileges::RoleTable,
         translator_impls::{deferred_constraint::is_deferred, plpgsql::fold},
     },
     options::TranslationContext,
     traits::schema::written_function,
 };
 
-/// Rows the server writes into a table, and what writes them.
+/// Rows the server writes into a table, the columns it changes in them, and
+/// what writes them.
 struct Produced {
     writer: String,
     rows: Held,
+    columns: Columns,
 }
 
 /// The tables the server writes, folded, each with the rows every writer
@@ -122,6 +133,17 @@ impl FiringTrigger {
         }
         Ok(writes)
     }
+
+    /// Whether the trigger's function assigns `NEW`, changing columns of the
+    /// row beside those the write sets.
+    fn assigns_new(
+        &self,
+        schema: &ParserDB,
+        options: &TranslationContext<'_>,
+    ) -> Result<bool, Error> {
+        let Some(function) = written_function(schema, &self.function)? else { return Ok(false) };
+        Ok(Walker::read(function, Some(&self.events), schema, options)?.assigns_new)
+    }
 }
 
 /// The triggers the initial schema and `statements` leave in place, each
@@ -161,20 +183,111 @@ pub(crate) fn firing_triggers<'a>(
     triggers
 }
 
+/// The writes already followed: each table, folded, with the event and the
+/// columns it takes.
+type Visited = BTreeSet<(String, Event, Columns)>;
+
+/// A foreign key action a write runs: the table it writes, the event it takes
+/// there, the columns it changes, and what writes it.
+struct KeyAction<'s> {
+    child: &'s CreateTable,
+    event: Event,
+    columns: Columns,
+    writer: String,
+}
+
 /// The schema and the triggers it fires, read for what the server writes.
-struct Firing<'s> {
+struct Firing<'s, 'o> {
     schema: &'s ParserDB,
+    options: &'s TranslationContext<'o>,
     triggers: &'s [FiringTrigger],
 }
 
-impl Firing<'_> {
-    /// The tables the foreign keys referencing `table` write when a row of it
-    /// takes `event`, with the event each sets off and what writes it.
+impl<'s, 'o> Firing<'s, 'o> {
+    fn new(schema: &'s ParserDB, options: &'s TranslationContext<'o>) -> Self {
+        Self { schema, options, triggers: options.firing_triggers() }
+    }
+
+    /// The table `name`, folded, names.
+    fn table(&self, name: &str) -> Option<&'s CreateTable> {
+        self.schema.tables().find(|table| table.stored_table_name() == name)
+    }
+
+    /// The columns of `table` a write of `event` the replica uploads changes:
+    /// for an update, those the acting role may update, and every one when
+    /// an `INSTEAD OF` trigger, which the replica keeps, updates the table.
+    ///
+    /// # Errors
+    ///
+    /// Refuses an acting role the schema does not declare, and fails when a
+    /// trigger's writes cannot be read.
+    fn uploaded(&self, stored: &CreateTable, event: Event) -> Result<Columns, Error> {
+        if event != Event::Update {
+            return Ok(Columns::Row);
+        }
+        let table = stored.stored_table_name();
+        for instead in self.triggers.iter().filter(|trigger| trigger.rank == Rank::InsteadOf) {
+            if instead
+                .writes(self.schema)?
+                .iter()
+                .any(|write| *write.relation == *table && write.events().contains(&Event::Update))
+            {
+                return Ok(Columns::Row);
+            }
+        }
+        let role = RoleTable::acting(stored, self.schema, self.options)?;
+        let mut columns = Columns::none();
+        for column in stored.columns(self.schema)? {
+            if role.updates(column.column_name()) {
+                columns.insert(column.stored_column_name().into_owned());
+            }
+        }
+        Ok(columns)
+    }
+
+    /// The columns of `table` a write of `event` changing `columns` changes
+    /// once its `BEFORE` row triggers have run: every one when a trigger
+    /// assigns `NEW`, and its generated columns beside the others.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a trigger's function cannot be read.
+    fn changed(
+        &self,
+        table: &CreateTable,
+        event: Event,
+        mut columns: Columns,
+    ) -> Result<Columns, Error> {
+        if columns.is_empty() || columns == Columns::Row {
+            return Ok(columns);
+        }
+        for trigger in self.triggers {
+            if *trigger.table == *table.stored_table_name()
+                && trigger.rank == Rank::BeforeRow
+                && trigger.fires_on(event)
+                && trigger.assigns_new(self.schema, self.options)?
+            {
+                return Ok(Columns::Row);
+            }
+        }
+        for column in table.columns(self.schema)? {
+            if column.generation_expression().is_some() {
+                columns.insert(column.stored_column_name().into_owned());
+            }
+        }
+        Ok(columns)
+    }
+
+    /// The foreign key actions a write of `event` changing `changed` of
+    /// `table` runs. An update runs an action only when it changes a column
+    /// the key references, and a cascade changes the referencing columns of
+    /// those alone.
     fn key_actions(
         &self,
         table: &str,
         event: Event,
-    ) -> Result<Vec<(String, Event, String)>, Error> {
+        changed: &Columns,
+    ) -> Result<Vec<KeyAction<'s>>, Error> {
         let mut actions = Vec::new();
         let clause = match event {
             Event::Delete => "DELETE",
@@ -190,30 +303,52 @@ impl Firing<'_> {
                     Event::Delete => key.on_delete(self.schema),
                     _ => key.on_update(self.schema),
                 };
-                let set_off = match action {
-                    ReferentialAction::Cascade => event,
-                    ReferentialAction::SetNull | ReferentialAction::SetDefault => Event::Update,
-                    ReferentialAction::NoAction | ReferentialAction::Restrict => continue,
+                if matches!(action, ReferentialAction::NoAction | ReferentialAction::Restrict) {
+                    continue;
+                }
+                let mut every = Columns::none();
+                let mut cascaded = Columns::none();
+                for (column, referenced) in
+                    key.host_columns(self.schema)?.zip(key.referenced_columns(self.schema)?)
+                {
+                    let column = column.stored_column_name().into_owned();
+                    if event == Event::Delete || changed.contains(&referenced.stored_column_name())
+                    {
+                        cascaded.insert(column.clone());
+                    }
+                    every.insert(column);
+                }
+                let (set_off, columns) = match action {
+                    _ if cascaded.is_empty() => continue,
+                    ReferentialAction::Cascade if event == Event::Delete => {
+                        (Event::Delete, Columns::Row)
+                    }
+                    ReferentialAction::Cascade => (Event::Update, cascaded),
+                    _ => (Event::Update, every),
                 };
-                let child = host.stored_table_name().into_owned();
-                let writer = format!("the ON {clause} {action} of a foreign key on {child}");
-                actions.push((child, set_off, writer));
+                let writer = format!(
+                    "the ON {clause} {action} of a foreign key on {}",
+                    host.stored_table_name()
+                );
+                actions.push(KeyAction { child: host, event: set_off, columns, writer });
             }
         }
         Ok(actions)
     }
 
-    /// Adds to `written` every table the server writes when it applies a
-    /// write of `event` on `table`, through the triggers and foreign key
-    /// actions it sets off. `visited` holds the writes already followed.
+    /// Adds to `written` what the server writes when it applies a write of
+    /// `event` changing `columns` of `table`, through the triggers and
+    /// foreign key actions it sets off. `visited` holds the writes already
+    /// followed.
     fn set_off(
         &self,
         table: &str,
         event: Event,
+        columns: &Columns,
         written: &mut Written,
-        visited: &mut BTreeSet<(String, Event)>,
+        visited: &mut Visited,
     ) -> Result<(), Error> {
-        if !visited.insert((table.to_owned(), event)) {
+        if !visited.insert((table.to_owned(), event, columns.clone())) {
             return Ok(());
         }
         for trigger in self.triggers {
@@ -221,21 +356,27 @@ impl Firing<'_> {
                 self.trigger_set_off(trigger, written, visited)?;
             }
         }
-        self.actions_set_off(table, event, written, visited)
+        self.actions_set_off(table, event, columns, written, visited)
     }
 
-    /// Adds to `written` the tables the foreign key actions a write of
-    /// `event` on `table` runs write, and what those writes set off.
+    /// Adds to `written` what the foreign key actions a write of `event`
+    /// changing `changed` of `table` runs write, and what those writes set
+    /// off.
     fn actions_set_off(
         &self,
         table: &str,
         event: Event,
+        changed: &Columns,
         written: &mut Written,
-        visited: &mut BTreeSet<(String, Event)>,
+        visited: &mut Visited,
     ) -> Result<(), Error> {
-        for (child, set_off_event, writer) in self.key_actions(table, event)? {
-            self.set_off(&child, set_off_event, written, visited)?;
-            written.entry(child).or_default().push(Produced { writer, rows: Held::any() });
+        for KeyAction { child, event, columns, writer } in
+            self.key_actions(table, event, changed)?
+        {
+            let columns = self.changed(child, event, columns)?;
+            let child = child.stored_table_name().into_owned();
+            self.set_off(&child, event, &columns, written, visited)?;
+            written.entry(child).or_default().push(Produced { writer, rows: Held::any(), columns });
         }
         Ok(())
     }
@@ -246,7 +387,7 @@ impl Firing<'_> {
         &self,
         trigger: &FiringTrigger,
         written: &mut Written,
-        visited: &mut BTreeSet<(String, Event)>,
+        visited: &mut Visited,
     ) -> Result<(), Error> {
         for write in trigger.writes(self.schema)? {
             self.write_set_off(&write, written, visited)?;
@@ -265,10 +406,11 @@ impl Firing<'_> {
         written: &mut Written,
     ) -> Result<(), Error> {
         let rows = self.produced(write, record)?;
-        written
-            .entry(write.relation.clone())
-            .or_default()
-            .push(Produced { writer: writer.to_owned(), rows });
+        written.entry(write.relation.clone()).or_default().push(Produced {
+            writer: writer.to_owned(),
+            rows,
+            columns: Columns::Row,
+        });
         Ok(())
     }
 
@@ -294,10 +436,10 @@ impl Firing<'_> {
         &self,
         write: &DerivedWrite,
         written: &mut Written,
-        visited: &mut BTreeSet<(String, Event)>,
+        visited: &mut Visited,
     ) -> Result<(), Error> {
         for &event in write.events() {
-            self.set_off(&write.relation, event, written, visited)?;
+            self.set_off(&write.relation, event, &Columns::Row, written, visited)?;
         }
         Ok(())
     }
@@ -324,8 +466,10 @@ impl Firing<'_> {
                 }
             }
         }
-        for (child, set_off, _) in self.key_actions(table, event)? {
-            self.writes_set_off(&child, set_off, writes, visited)?;
+        for KeyAction { child, event: set_off, .. } in
+            self.key_actions(table, event, &Columns::Row)?
+        {
+            self.writes_set_off(&child.stored_table_name(), set_off, writes, visited)?;
         }
         Ok(())
     }
@@ -358,10 +502,13 @@ impl Firing<'_> {
         record: &str,
     ) -> Result<Option<Dependent<'c, 'w>>, Error> {
         for step in steps {
-            let Step::Read { relation, rows, reader } = step else { continue };
+            let Step::Read { relation, rows, columns, reader } = step else { continue };
             let Some(produced) = written.get(relation) else { continue };
             let read = rows.held(relation, (reader.len() == 1).then_some(record), self.schema)?;
-            if let Some(found) = produced.iter().find(|produced| produced.rows.overlaps(&read)) {
+            if let Some(found) = produced
+                .iter()
+                .find(|produced| produced.rows.overlaps(&read) && produced.columns.meets(columns))
+            {
                 return Ok(Some(Dependent { reader, relation, writer: &found.writer }));
             }
         }
@@ -393,11 +540,11 @@ pub(super) fn own_dependency(
     schema: &ParserDB,
     options: &TranslationContext<'_>,
 ) -> Result<Option<String>, Error> {
-    let firing = Firing { schema, triggers: options.firing_triggers() };
+    let firing = Firing::new(schema, options);
     let mut written_by: Vec<Written> = Vec::with_capacity(chain.writes.len());
     for write in &chain.writes {
         let mut written = Written::new();
-        firing.write_set_off(write, &mut written, &mut BTreeSet::new())?;
+        firing.write_set_off(write, &mut written, &mut Visited::new())?;
         firing.add(write, "", record, &mut written)?;
         written_by.push(written);
     }
@@ -443,7 +590,7 @@ pub(super) fn with_set_off(
     schema: &ParserDB,
     options: &TranslationContext<'_>,
 ) -> Result<Vec<DerivedWrite>, Error> {
-    let firing = Firing { schema, triggers: options.firing_triggers() };
+    let firing = Firing::new(schema, options);
     let mut all = Vec::new();
     let mut visited = BTreeSet::new();
     for write in writes {
@@ -475,10 +622,10 @@ pub(super) fn fired_dependency(
         return Ok(None);
     }
     let Some(fired) = FiringTrigger::of(trigger) else { return Ok(None) };
-    let firing = Firing { schema, triggers: options.firing_triggers() };
+    let firing = Firing::new(schema, options);
     for &event in &fired.events {
         let mut written = Written::new();
-        let mut visited = BTreeSet::new();
+        let mut visited = Visited::new();
         for peer in firing.triggers {
             if peer.rank != Rank::InsteadOf
                 && peer.table == fired.table
@@ -488,8 +635,11 @@ pub(super) fn fired_dependency(
                 firing.trigger_set_off(peer, &mut written, &mut visited)?;
             }
         }
-        if (Rank::AfterRow, ACTION_TRIGGER) < (fired.rank, fired.name.as_str()) {
-            firing.actions_set_off(&fired.table, event, &mut written, &mut visited)?;
+        if (Rank::AfterRow, ACTION_TRIGGER) < (fired.rank, fired.name.as_str())
+            && let Some(stored) = firing.table(&fired.table)
+        {
+            let changed = firing.changed(stored, event, firing.uploaded(stored, event)?)?;
+            firing.actions_set_off(&fired.table, event, &changed, &mut written, &mut visited)?;
         }
         if let Some(Dependent { reader, relation, writer }) =
             firing.first_read(&chain.steps, &written, &fired.table)?
@@ -500,7 +650,7 @@ pub(super) fn fired_dependency(
             )));
         }
     }
-    instead_of_dependency(&fired, chain, &firing, options)
+    instead_of_dependency(&fired, chain, &firing)
 }
 
 /// Why a statement `fired` keeps reads what an `INSTEAD OF` trigger's
@@ -509,16 +659,15 @@ pub(super) fn fired_dependency(
 fn instead_of_dependency(
     fired: &FiringTrigger,
     chain: &Chain,
-    firing: &Firing<'_>,
-    options: &TranslationContext<'_>,
+    firing: &Firing<'_, '_>,
 ) -> Result<Option<String>, Error> {
     for instead in firing.triggers.iter().filter(|trigger| trigger.rank == Rank::InsteadOf) {
         let Some(function) = written_function(firing.schema, &instead.function)? else {
             continue;
         };
-        let kept = Walker::read(function, None, firing.schema, options)?;
+        let kept = Walker::read(function, None, firing.schema, firing.options)?;
         let mut written = Written::new();
-        let mut visited = BTreeSet::new();
+        let mut visited = Visited::new();
         for write in &kept.writes {
             let sets_it_off = write.relation == fired.table
                 && write.events().iter().any(|&event| fired.fires_on(event));

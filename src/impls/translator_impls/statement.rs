@@ -68,6 +68,7 @@ use crate::{
             clock_check::{dropped_clock_triggers, split_clock_checks},
             column::translate_column_def,
             condition_injection::inject_condition_into_dml_statement,
+            create_trigger::{TriggerRelation, trigger_relation},
             drop_column_rebuild,
             hidden_referenced_rows::{self, Rename, declared},
             nulls_not_distinct::{companion_drops, table_companions},
@@ -1865,8 +1866,9 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
             }
 
             Self::CreateTrigger(create_trigger) => {
-                if let RoleTableAccess::Deny =
-                    role_access_for_object_name(&create_trigger.table_name, schema, options)?
+                if !matches!(trigger_relation(create_trigger, schema), Ok(TriggerRelation::View(_)))
+                    && let RoleTableAccess::Deny =
+                        role_access_for_object_name(&create_trigger.table_name, schema, options)?
                 {
                     return Ok(Vec::new());
                 }

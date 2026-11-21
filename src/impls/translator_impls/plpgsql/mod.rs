@@ -13,7 +13,7 @@ mod per_row;
 mod raise;
 mod returns;
 mod scope;
-pub(crate) use scope::{TriggerFacts, fold, relations_read};
+pub(crate) use scope::{TriggerFacts, expand_relation, fold, relations_read};
 mod translator;
 mod unresolved;
 pub use translator::PlPgSqlTranslator;
