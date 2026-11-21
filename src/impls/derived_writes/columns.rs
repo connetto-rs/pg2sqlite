@@ -35,6 +35,12 @@ pub(super) enum Columns {
     Named(BTreeSet<String>),
 }
 
+impl Default for Columns {
+    fn default() -> Self {
+        Self::none()
+    }
+}
+
 impl Columns {
     pub(super) const fn none() -> Self {
         Self::Named(BTreeSet::new())
@@ -58,6 +64,20 @@ impl Columns {
             (Self::Named(written), _) if written.is_empty() => false,
             (Self::Row, _) | (_, Self::Row) => true,
             (Self::Named(written), Self::Named(read)) => !written.is_disjoint(read),
+        }
+    }
+
+    /// The columns of `read` a write changing these columns changes, each
+    /// once, empty when both are whole rows or `read` reads only which rows
+    /// are there. Answers only what [`Self::meets`] admits.
+    pub(super) fn shared_with(&self, read: &Self) -> Vec<String> {
+        match (self, read) {
+            (Self::Row, Self::Row) => Vec::new(),
+            (Self::Named(written), Self::Row) => written.iter().cloned().collect(),
+            (Self::Row, Self::Named(read)) => read.iter().cloned().collect(),
+            (Self::Named(written), Self::Named(read)) => {
+                written.intersection(read).cloned().collect()
+            }
         }
     }
 
@@ -278,8 +298,37 @@ pub(super) fn columns_read<N: Visit>(
     node: &N,
     schema: &ParserDB,
 ) -> Result<BTreeMap<String, Columns>, Error> {
+    reads_of(node, None, schema)
+}
+
+/// The columns `node` reads of each relation it names, as [`columns_read`]
+/// answers them, and of `own`, folded, the table whose row it judges, whose
+/// columns a bare name or one qualified by the table's name reads. The
+/// policies of `own` filter nothing `node` reads unless it names the table
+/// itself.
+///
+/// # Errors
+///
+/// Fails as [`columns_read`] does.
+pub(super) fn row_columns_read<N: Visit>(
+    node: &N,
+    own: &str,
+    schema: &ParserDB,
+) -> Result<BTreeMap<String, Columns>, Error> {
+    reads_of(node, Some(own), schema)
+}
+
+fn reads_of<N: Visit>(
+    node: &N,
+    own: Option<&str>,
+    schema: &ParserDB,
+) -> Result<BTreeMap<String, Columns>, Error> {
     let mut factors = Factors::default();
     let _: ControlFlow<()> = node.visit(&mut factors);
+    let named = factors.factors.len();
+    if let Some(own) = own {
+        factors.factors.push(Factor { relation: own.to_owned(), alias: None });
+    }
     let mut reads = Reads {
         factors: &factors.factors,
         read: factors
@@ -293,26 +342,32 @@ pub(super) fn columns_read<N: Visit>(
     for relation in &factors.renamed {
         read.insert(relation.clone(), Columns::Row);
     }
-    for factor in &factors.factors {
-        if schema.views().any(|view| view.stored_view_name() == factor.relation.as_str()) {
+    for factor in &factors.factors[..named] {
+        let relation = &factor.relation;
+        if schema.views().any(|view| view.stored_view_name() == relation.as_str()) {
             let mut through = BTreeSet::new();
-            expand_relation(factor.relation.clone(), schema, &mut through);
+            expand_relation(relation.clone(), schema, &mut through);
             for relation in through {
                 read.insert(relation, Columns::Row);
             }
         }
     }
     for (relation, columns) in &mut read {
+        if own == Some(relation.as_str())
+            && !factors.factors[..named].iter().any(|factor| factor.relation == *relation)
+        {
+            continue;
+        }
         let Some(table) =
             schema.tables().find(|table| table.stored_table_name() == relation.as_str())
         else {
             continue;
         };
-        let own = [Factor { relation: relation.clone(), alias: None }];
+        let filtered = [Factor { relation: relation.clone(), alias: None }];
         for policy in table.policies(schema)? {
             let Some(using) = policy.using_expression(schema)? else { continue };
             let mut policy_reads = Reads {
-                factors: &own,
+                factors: &filtered,
                 read: BTreeMap::from([(relation.clone(), Columns::none())]),
             };
             let _: ControlFlow<()> = using.visit(&mut policy_reads);

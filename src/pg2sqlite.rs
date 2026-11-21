@@ -1359,6 +1359,12 @@ impl Pg2Sqlite {
             epochs,
             dispositions,
         } = Self::translate_prepared(prepared, &mut context, |_| true)?;
+        warnings.extend(crate::impls::derived_writes::reads_left_to_server(
+            &schema,
+            initial_schema,
+            &sources,
+            &context,
+        )?);
         let mut placed =
             crate::history::placement::place(&sources, &mut statements, &schema, options)?;
         let units: Vec<crate::history::Unit<'_>> = epochs

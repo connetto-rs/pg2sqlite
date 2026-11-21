@@ -209,6 +209,7 @@ mod test_quoted_column_lookup;
 mod test_raise_format_arguments;
 mod test_raise_sqlstate;
 mod test_readonly_nonrls_deny_triggers;
+mod test_reads_left_to_server;
 mod test_recursive_view;
 mod test_rename_table;
 mod test_returning_scope;

@@ -1614,7 +1614,17 @@ $$;",
     RAISE EXCEPTION 'too many events';
   END IF;",
     );
-    for pg in [through_plpgsql, through_sql] {
+    let through_from = notes_logged_with(
+        "
+CREATE FUNCTION logged_events(note INTEGER) RETURNS TABLE (id INTEGER) LANGUAGE sql AS $$
+  INSERT INTO note_events (note_id) VALUES (note) RETURNING id
+$$;",
+        "",
+        "  IF (SELECT max(logged.id) FROM logged_events(NEW.id) logged) > 100 THEN
+    RAISE EXCEPTION 'too many events';
+  END IF;",
+    );
+    for pg in [through_plpgsql, through_sql, through_from] {
         assert_eq!(left_to_server(&pg), owned(&[("TRIGGER", "notes_logged", "notes")]));
         let shown = left_to_server_shown(&pg);
         assert!(shown[0].contains("inside a statement the trigger keeps"), "{shown:?}");

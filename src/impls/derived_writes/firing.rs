@@ -20,7 +20,7 @@ use sqlparser::ast::{
 };
 
 use super::{
-    DerivedWrite, Event,
+    DerivedWrite, Event, Fresh,
     chain::{Chain, Step, Walker},
     chain_phrase,
     columns::Columns,
@@ -150,23 +150,29 @@ impl FiringTrigger {
 /// created one replacing an earlier one of its name on its table.
 pub(crate) fn firing_triggers<'a>(
     initial: impl Iterator<Item = &'a CreateTrigger>,
-    statements: &[Statement],
+    statements: &'a [Statement],
 ) -> Vec<FiringTrigger> {
-    let mut triggers: Vec<FiringTrigger> = initial.filter_map(FiringTrigger::of).collect();
+    live_triggers(initial, statements).into_iter().map(|(_, fired)| fired).collect()
+}
+
+/// [`firing_triggers`], each beside the statement creating it.
+pub(super) fn live_triggers<'a>(
+    initial: impl Iterator<Item = &'a CreateTrigger>,
+    statements: &'a [Statement],
+) -> Vec<(&'a CreateTrigger, FiringTrigger)> {
+    let mut triggers: Vec<(&'a CreateTrigger, FiringTrigger)> =
+        initial.filter_map(|trigger| Some((trigger, FiringTrigger::of(trigger)?))).collect();
     for statement in statements {
         match statement {
             Statement::CreateTrigger(trigger) => {
                 let Some(created) = FiringTrigger::of(trigger) else { continue };
-                triggers.retain(|kept| {
-                    (kept.name.as_str(), kept.table.as_str())
-                        != (created.name.as_str(), created.table.as_str())
-                });
-                triggers.push(created);
+                triggers.retain(|(_, kept)| !kept.same(&created));
+                triggers.push((trigger, created));
             }
             Statement::DropTrigger(drop) => {
                 let name = last_ident(&drop.trigger_name).map(fold);
                 let table = drop.table_name.as_ref().and_then(last_ident).map(fold);
-                triggers.retain(|kept| {
+                triggers.retain(|(_, kept)| {
                     name.as_deref() != Some(kept.name.as_str())
                         || table.as_deref().is_some_and(|table| table != kept.table)
                 });
@@ -175,7 +181,7 @@ pub(crate) fn firing_triggers<'a>(
                 object_type: ObjectType::Table | ObjectType::View, names, ..
             } => {
                 let dropped: Vec<String> = names.iter().filter_map(last_ident).map(fold).collect();
-                triggers.retain(|kept| !dropped.contains(&kept.table));
+                triggers.retain(|(_, kept)| !dropped.contains(&kept.table));
             }
             _ => {}
         }
@@ -576,6 +582,30 @@ pub(super) fn own_dependency(
         }
     }
     Ok(None)
+}
+
+/// The columns of its table `write` changes on the server: for an update,
+/// those it gives new values, beside the generated columns and every one
+/// where a `BEFORE` row trigger of the table assigns `NEW`, and for any
+/// other write the whole row, which rows the table holds among it.
+///
+/// # Errors
+///
+/// Fails when a trigger's function cannot be read.
+pub(super) fn changed_by(
+    write: &DerivedWrite,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<Columns, Error> {
+    let (Fresh::Columns(columns), "UPDATE") = (&write.fresh, write.statement) else {
+        return Ok(Columns::Row);
+    };
+    let firing = Firing::new(schema, options);
+    let set = Columns::Named(columns.iter().cloned().collect());
+    match firing.table(&write.relation) {
+        Some(table) => firing.changed(table, Event::Update, set),
+        None => Ok(set),
+    }
 }
 
 /// `writes`, a trigger's own, and every write they set off on the server:
