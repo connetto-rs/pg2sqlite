@@ -26,28 +26,48 @@ pub(crate) fn message_prefix(sqlstate: SqlState) -> String {
 /// An error as PostgreSQL would report it, read from the message of a SQLite
 /// error the replica raised or from a statement the translation refused as
 /// PostgreSQL does.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PostgresError<'a> {
-    sqlstate: SqlState,
-    message: &'a str,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PostgresError<'a>(Source<'a>);
+
+/// Where a [`PostgresError`] holds its SQLSTATE and message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Source<'a> {
+    Message {
+        sqlstate: SqlState,
+        message: &'a str,
+    },
+    /// A schema refusal sql-traits raised, which owns its message.
+    Schema(sql_traits::errors::PostgresError),
 }
 
 impl<'a> PostgresError<'a> {
     pub(crate) const fn new(sqlstate: SqlState, message: &'a str) -> Self {
-        Self { sqlstate, message }
+        Self(Source::Message { sqlstate, message })
     }
 
     /// The SQLSTATE, such as `23514` for `check_violation`, the type diesel
     /// reports a PostgreSQL error's code as.
     #[must_use]
     pub const fn sqlstate(&self) -> SqlState {
-        self.sqlstate
+        match &self.0 {
+            Source::Message { sqlstate, .. } => *sqlstate,
+            Source::Schema(error) => error.sqlstate(),
+        }
     }
 
     /// The message PostgreSQL reports beside the SQLSTATE.
     #[must_use]
-    pub const fn message(&self) -> &'a str {
-        self.message
+    pub fn message(&self) -> &str {
+        match &self.0 {
+            Source::Message { message, .. } => message,
+            Source::Schema(error) => error.message(),
+        }
+    }
+}
+
+impl From<sql_traits::errors::PostgresError> for PostgresError<'_> {
+    fn from(error: sql_traits::errors::PostgresError) -> Self {
+        Self(Source::Schema(error))
     }
 }
 
@@ -80,8 +100,7 @@ pub fn postgres_error(message: &str) -> Option<PostgresError<'_>> {
         && let Ok(sqlstate) = code.parse::<SqlState>()
         && let Some(message) = rest.strip_prefix(SEPARATOR)
     {
-        return Some(PostgresError { sqlstate, message });
+        return Some(PostgresError::new(sqlstate, message));
     }
-    is_policy_refusal(message)
-        .then_some(PostgresError { sqlstate: pg::INSUFFICIENT_PRIVILEGE, message })
+    is_policy_refusal(message).then_some(PostgresError::new(pg::INSUFFICIENT_PRIVILEGE, message))
 }

@@ -43,10 +43,7 @@ fn build_schema_returns_valid_schema() {
 
 #[test]
 fn build_schema_rejects_index_on_unknown_schema_qualified_table() {
-    // sql-traits HEAD (no_std refactor) is strict during schema construction:
-    // an index referencing `my_custom_app.users` while the only `users` table
-    // is unqualified surfaces as TableNotFoundForIndex at build_schema time
-    // rather than only at translate time.
+    // PostgreSQL 18 refuses the index for its schema before its table.
     let translator = Pg2Sqlite::default()
         .sql(
             "
@@ -58,9 +55,10 @@ fn build_schema_rejects_index_on_unknown_schema_qualified_table() {
 
     let err =
         translator.build_schema().expect_err("build_schema should reject mismatched index target");
-    assert!(
-        err.to_string().contains("TableNotFoundForIndex") || err.to_string().contains("users"),
-        "expected schema-side TableNotFoundForIndex error, got: {err}"
+    let refused = err.postgres_error().unwrap_or_else(|| panic!("{err:?}"));
+    assert_eq!(
+        (refused.sqlstate(), refused.message()),
+        (sqlstate::pg::INVALID_SCHEMA_NAME, r#"schema "my_custom_app" does not exist"#)
     );
 }
 
