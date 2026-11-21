@@ -316,3 +316,45 @@ fn deny_triggers_are_inert_when_disabled_and_block_when_enabled() {
     let after: i64 = orders::table.count().get_result(&mut conn).expect("count after denials");
     assert_eq!(after, 1, "denied writes must not change the table");
 }
+
+#[test]
+fn acting_role_view_trigger_writes_to_base_table() {
+    diesel::table! {
+        writable_orders (id) {
+            id -> Integer,
+            item -> Text,
+        }
+    }
+
+    let schema = "
+CREATE ROLE postgres SUPERUSER;
+CREATE ROLE app NOLOGIN;
+CREATE TABLE orders (id INTEGER PRIMARY KEY, item TEXT NOT NULL);
+GRANT SELECT, INSERT, UPDATE, DELETE ON orders TO app;
+CREATE VIEW writable_orders AS SELECT id, item FROM orders;
+CREATE FUNCTION insert_order() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO orders (id, item) VALUES (NEW.id, NEW.item);
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER writable_orders_insert INSTEAD OF INSERT ON writable_orders
+  FOR EACH ROW EXECUTE FUNCTION insert_order();
+";
+    let options = Pg2SqliteOptions::default()
+        .with_deployment(
+            sql_traits::structs::Deployment::new("postgres", ["app"], []).expect("deployment"),
+        )
+        .with_acting_role("app");
+    let statements = helpers::translate_pg(schema, &options).expect("translate view trigger");
+    let mut connection = helpers::apply_statements(&statements);
+    diesel::insert_into(writable_orders::table)
+        .values((writable_orders::id.eq(7), writable_orders::item.eq("widget")))
+        .execute(&mut connection)
+        .expect("insert through view");
+    let written = orders::table
+        .select((orders::id, orders::item))
+        .load::<(i32, String)>(&mut connection)
+        .expect("read base table");
+    assert_eq!(written, vec![(7, "widget".to_owned())]);
+}
