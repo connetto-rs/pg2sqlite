@@ -36,10 +36,7 @@ use sqlparser::{
     parser::Parser,
 };
 
-#[cfg(not(feature = "std"))]
-use crate::no_std::prelude::*;
 use crate::{
-    errors::Error,
     impls::{
         temporal_literals::{TemporalLiteralKind, temporal_literal_kind},
         translator_impls::uuid::is_uuid_data_type,
@@ -69,18 +66,13 @@ const JSON: &str = "json_valid(pg2sqlite_stored_text)";
 /// `data_type`, or `None` for a type stored as anything else and when
 /// [`Pg2SqliteOptions::with_stored_text_checks_omitted`] leaves the checks
 /// out.
-///
-/// # Errors
-///
-/// Returns [`Error::TranslationRefusal`] when a template fails to parse,
-/// which no input can cause.
 pub(crate) fn stored_text_check(
     column: &Ident,
     data_type: &DataType,
     options: &Pg2SqliteOptions,
-) -> Result<Option<Expr>, Error> {
+) -> Option<Expr> {
     if options.is_stored_text_checks_omitted() {
-        return Ok(None);
+        return None;
     }
     let template = match (temporal_literal_kind(data_type), data_type) {
         (Some(TemporalLiteralKind::Timestamp { zoned: true, .. }), _) => TIMESTAMPTZ,
@@ -95,23 +87,24 @@ pub(crate) fn stored_text_check(
         {
             UUID
         }
-        (None, _) => return Ok(None),
+        (None, _) => return None,
     };
-    substitute(template, column).map(Some)
+    Some(substitute(template, column))
 }
 
 /// `template` parsed, with every [`PLACEHOLDER`] naming `column`.
-fn substitute(template: &str, column: &Ident) -> Result<Expr, Error> {
+///
+/// # Panics
+///
+/// Panics when `template` is not a SQLite expression, which only an edit to
+/// one of the constant templates above can cause.
+fn substitute(template: &str, column: &Ident) -> Expr {
     let mut expr = Parser::new(&SQLiteDialect {})
         .try_with_sql(template)
         .and_then(|mut parser| parser.parse_expr())
-        .map_err(|error| {
-            Error::forward_refusal(format!(
-                "the stored text check template fails to parse as an expression: {error}"
-            ))
-        })?;
+        .expect("every stored text template is a SQLite expression");
     let _: ControlFlow<()> = expr.visit(&mut NameColumn { column });
-    Ok(expr)
+    expr
 }
 
 /// Replaces the template's placeholder with the column.
