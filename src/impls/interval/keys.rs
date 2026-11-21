@@ -568,7 +568,7 @@ pub(crate) fn distinct_select(
                     &query,
                     schema,
                     options,
-                    |column| is_interval_data_type(&column.data_type).then_some(()),
+                    |column| is_interval_data_type(column.data_type()).then_some(()),
                     |expr, schema, o| Ok(is_interval_typed(expr, schema, o).then_some(())),
                 )?;
                 // A derived relation's outputs do not always expand under a
