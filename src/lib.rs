@@ -25,6 +25,8 @@ pub(crate) mod impls;
 pub mod initialization;
 pub mod manifest;
 pub mod options;
+#[cfg(feature = "parity")]
+pub mod parity;
 pub mod pg2sqlite;
 pub mod script;
 pub mod sqlstate;
