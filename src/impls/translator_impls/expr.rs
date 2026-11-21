@@ -988,19 +988,71 @@ pub(crate) fn numeric_json_path_element(construct: &str, element: &str) -> crate
     ))
 }
 
-/// Convert a SQLite JSON path `$.a.b` to a PostgreSQL text-array path `{a,b}`.
+/// Convert a SQLite JSON path `$.a."b.c"` to a PostgreSQL text-array path
+/// `{a,"b.c"}`.
 ///
-/// Only handles simple dotted-key paths produced by the forward translator.
-/// Returns `None` for paths that contain array-index steps (`$[0]`), bare `$`
-/// with no key, or any other shape that cannot round-trip through text-array
-/// notation.
+/// SQLite reads a quoted label as a JSON string and a bare one up to the next
+/// `.` or `[`. Returns `None` for an array step, the bare `$`, and a label it
+/// cannot read.
 pub(crate) fn sqlite_json_path_to_pg_text_path(s: &str) -> Option<String> {
-    let rest = s.strip_prefix("$.")?;
-    let keys: Vec<&str> = rest.split('.').collect();
-    if keys.is_empty() || keys.iter().any(|k| k.is_empty() || k.contains('[')) {
-        return None;
+    let mut rest = s.strip_prefix('$')?;
+    let mut elements = Vec::new();
+    while let Some(label) = rest.strip_prefix('.') {
+        let (key, after) = if let Some(quoted) = label.strip_prefix('"') {
+            json_string_label(quoted)?
+        } else {
+            let end = label.find(['.', '[']).unwrap_or(label.len());
+            if end == 0 {
+                return None;
+            }
+            (label[..end].to_string(), &label[end..])
+        };
+        elements.push(text_array_element(&key));
+        rest = after;
     }
-    Some(format!("{{{}}}", keys.join(",")))
+    (rest.is_empty() && !elements.is_empty()).then(|| format!("{{{}}}", elements.join(",")))
+}
+
+/// The JSON string a quoted path label holds, decoded, and the path after its
+/// closing quote. `quoted` starts after the opening quote.
+fn json_string_label(quoted: &str) -> Option<(String, &str)> {
+    let mut key = String::new();
+    let mut chars = quoted.char_indices();
+    while let Some((index, c)) = chars.next() {
+        match c {
+            '"' => return Some((key, &quoted[index + 1..])),
+            '\\' => {
+                key.push(match chars.next()?.1 {
+                    'b' => '\u{8}',
+                    'f' => '\u{c}',
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    'u' => {
+                        let hex: String =
+                            (0..4).map(|_| chars.next().map(|(_, c)| c)).collect::<Option<_>>()?;
+                        char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?
+                    }
+                    escaped @ ('"' | '\\' | '/') => escaped,
+                    _ => return None,
+                });
+            }
+            other => key.push(other),
+        }
+    }
+    None
+}
+
+/// `key` as one element of a PostgreSQL `text[]` literal, double-quoted when
+/// PostgreSQL would otherwise read it as something else.
+fn text_array_element(key: &str) -> String {
+    let bare = !key.is_empty()
+        && !key.eq_ignore_ascii_case("null")
+        && !key.chars().any(|c| matches!(c, '{' | '}' | ',' | '"' | '\\') || c.is_whitespace());
+    if bare {
+        return key.to_string();
+    }
+    format!("\"{}\"", key.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 /// Extract a slice of string key literals from an `ARRAY[...]` expression.

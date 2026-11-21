@@ -893,10 +893,12 @@ struct ScalarText {
     answer: Option<String>,
 }
 
-/// The PostgreSQL table the parity check reads, holding one column per storage
-/// wrapper the reverse direction has to undo.
+/// The PostgreSQL tables the parity check reads: `stored` holds one column per
+/// storage wrapper the reverse direction has to undo, and `docs` a document
+/// whose keys a SQLite JSON path can only name quoted.
 const STORED_DDL: &str = "CREATE TABLE stored (\
-     id INT PRIMARY KEY, u UUID, raw BYTEA, xs INT[], doc JSONB);";
+     id INT PRIMARY KEY, u UUID, raw BYTEA, xs INT[], doc JSONB); \
+     CREATE TABLE docs (id INT PRIMARY KEY, doc JSONB);";
 
 /// Three rows, the second one empty where emptiness is what diverges, and the
 /// third NULL where NULL is: SQLite answers 0 for the length of an empty array
@@ -907,7 +909,9 @@ const STORED_ROWS: &str = "\
      (1, '550e8400-e29b-41d4-a716-446655440000'::uuid, '\\x00ff'::bytea, ARRAY[1,2], '[1,2,3]'::jsonb); \
      INSERT INTO stored (id, u, raw, xs, doc) VALUES \
      (2, '660e8400-e29b-41d4-a716-446655440000'::uuid, '\\x'::bytea, ARRAY[]::int[], '[]'::jsonb); \
-     INSERT INTO stored (id) VALUES (3);";
+     INSERT INTO stored (id) VALUES (3); \
+     INSERT INTO docs (id, doc) VALUES \
+     (1, '{\"a.b\": 1, \"a\": {\"b\": 2}, \"$x\": 3, \"k\\\"q\": 4}'::jsonb);";
 
 /// SQLite expressions over `stored`, each one a storage wrapper whose
 /// PostgreSQL form depends on the column's declared type rather than on the
@@ -999,14 +1003,13 @@ fn read_divergence(
     }
 }
 
-/// The reverse direction has to answer what the replica answered, not merely
-/// produce something the server accepts.
-#[test]
-fn reversed_storage_wrappers_answer_what_the_replica_answered() {
+/// Asserts that every SQLite read in `cases`, reversed, answers on the server
+/// what it answered on the replica.
+fn assert_reversed_reads_match(cases: &[&str]) {
     let options = stored_options();
     let (mut sqlite, mut postgres, schema) = stored_pair(&options);
 
-    let failures: Vec<String> = STORAGE_WRAPPER_PARITY
+    let failures: Vec<String> = cases
         .iter()
         .filter_map(|sqlite_sql| {
             read_divergence(sqlite_sql, &mut sqlite, &mut postgres, &schema, &options)
@@ -1019,6 +1022,32 @@ fn reversed_storage_wrappers_answer_what_the_replica_answered() {
         failures.len(),
         failures.join("\n\n")
     );
+}
+
+/// The reverse direction has to answer what the replica answered, not merely
+/// produce something the server accepts.
+#[test]
+fn reversed_storage_wrappers_answer_what_the_replica_answered() {
+    assert_reversed_reads_match(STORAGE_WRAPPER_PARITY);
+}
+
+/// SQLite reads over `docs` whose arrow operand or path is a JSON path, with
+/// keys holding a dot, a dollar and a quote, and one bare key SQLite reads as
+/// a key.
+const JSON_PATH_PARITY: &[&str] = &[
+    "SELECT CAST(doc ->> '$.\"a.b\"' AS TEXT) AS answer FROM docs",
+    "SELECT CAST(doc ->> '$.a.b' AS TEXT) AS answer FROM docs",
+    "SELECT CAST(doc ->> '$.\"$x\"' AS TEXT) AS answer FROM docs",
+    "SELECT CAST(doc ->> '$.\"k\\\"q\"' AS TEXT) AS answer FROM docs",
+    "SELECT CAST(doc -> '$.a' -> '$.b' AS TEXT) AS answer FROM docs",
+    "SELECT CAST(doc ->> 'a.b' AS TEXT) AS answer FROM docs",
+    "SELECT CAST(json_remove(doc, '$.\"a.b\"') ->> 'a.b' AS TEXT) AS answer FROM docs",
+];
+
+/// A reversed JSON path names the keys SQLite's path named.
+#[test]
+fn reversed_json_paths_read_what_the_replica_read() {
+    assert_reversed_reads_match(JSON_PATH_PARITY);
 }
 
 /// SQLite writes placing a blob or a JSON array in a column whose PostgreSQL
