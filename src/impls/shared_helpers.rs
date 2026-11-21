@@ -1,10 +1,14 @@
 //! Shared helper functions for translating table references, joins, and select
 //! items. Generic over translation direction (forward or reverse).
 
+use alloc::borrow::Cow;
 use core::ops::ControlFlow;
 
 use sql_traits::{
-    structs::{ColumnDefinition, ColumnQueryScope, ColumnScope, ParserDB, QueryOutput},
+    structs::{
+        ColumnDefinition, ColumnDefinitionScope, ColumnQueryScope, ColumnScope, FunctionResultType,
+        ParserDB, QueryOutput,
+    },
     traits::{ColumnLike, DatabaseLike, TableLike},
 };
 use sqlparser::ast::{
@@ -338,12 +342,133 @@ pub(crate) fn variable_declaration<'o>(
     options.variable_declaration(bare_identifier_name(strip_nesting(reference))?)
 }
 
+/// What a column's declaration says about it, its type and where its
+/// collation comes from, as the readers of a declared column read it.
+pub(crate) struct ColumnDeclaration<'d> {
+    data_type: Cow<'d, DataType>,
+    collation: DeclaredCollation<'d>,
+}
+
+/// Where the collation of a declared column comes from.
+pub(crate) enum DeclaredCollation<'d> {
+    /// The default collation of the column's type.
+    TypeDefault,
+    /// The collation a `COLLATE` clause names.
+    Named(Cow<'d, ObjectName>),
+    /// The collation PostgreSQL derives for a call from the arguments it
+    /// writes, read in `scope`, which the column of a function of one output
+    /// called in `FROM` takes.
+    Call { arguments: &'d [FunctionArg], scope: ColumnDefinitionScope<'d, 'd, 'd, ParserDB> },
+    /// A collation the declaration changes without naming it.
+    Unnamed,
+}
+
+impl<'d> ColumnDeclaration<'d> {
+    /// A column of `data_type` under its type's default collation, which no
+    /// statement declares.
+    fn implied(data_type: DataType) -> Self {
+        Self { data_type: Cow::Owned(data_type), collation: DeclaredCollation::TypeDefault }
+    }
+
+    /// The type the column declares.
+    pub(crate) fn data_type(&self) -> &DataType {
+        &self.data_type
+    }
+
+    /// Where the column's collation comes from.
+    pub(crate) const fn collation(&self) -> &DeclaredCollation<'d> {
+        &self.collation
+    }
+}
+
+impl<'d> From<&'d sqlparser::ast::ColumnDef> for ColumnDeclaration<'d> {
+    fn from(column: &'d sqlparser::ast::ColumnDef) -> Self {
+        let collation = column
+            .options
+            .iter()
+            .find_map(|option| {
+                match &option.option {
+                    ColumnOption::Collation(name) => {
+                        Some(DeclaredCollation::Named(Cow::Borrowed(name)))
+                    }
+                    _ => None,
+                }
+            })
+            .unwrap_or(DeclaredCollation::TypeDefault);
+        Self { data_type: Cow::Borrowed(&column.data_type), collation }
+    }
+}
+
+/// The declaration of a column of the result a function called in `FROM`
+/// returns, or `None` when sqlparser reads no type in the name the function
+/// declares, and for a column of a row type, which the definition it names
+/// declares instead.
+fn function_result_declaration<'d>(
+    data_type: &FunctionResultType<'d, 'd, 'd, ParserDB>,
+) -> Option<ColumnDeclaration<'d>> {
+    let declared =
+        |name: &str| crate::impls::expression_type::parse_type_name(name).map(Cow::Owned);
+    Some(match data_type {
+        FunctionResultType::Signature(name) => {
+            ColumnDeclaration {
+                data_type: declared(name)?,
+                collation: DeclaredCollation::TypeDefault,
+            }
+        }
+        FunctionResultType::Scalar { name, arguments, scope } => {
+            ColumnDeclaration {
+                data_type: declared(name)?,
+                collation: DeclaredCollation::Call { arguments, scope: *scope },
+            }
+        }
+        FunctionResultType::Attribute { field, .. } => {
+            let collation = match field.collation() {
+                sql_traits::traits::ColumnCollation::DatabaseDefault => {
+                    DeclaredCollation::TypeDefault
+                }
+                sql_traits::traits::ColumnCollation::Named(named) => {
+                    DeclaredCollation::Named(Cow::Owned(target_object_name(named.name())))
+                }
+                sql_traits::traits::ColumnCollation::Unknown => DeclaredCollation::Unnamed,
+            };
+            ColumnDeclaration { data_type: Cow::Borrowed(field.data_type()), collation }
+        }
+        FunctionResultType::DefinitionList(data_type) => {
+            ColumnDeclaration {
+                data_type: Cow::Borrowed(*data_type),
+                collation: DeclaredCollation::TypeDefault,
+            }
+        }
+        FunctionResultType::RowType(_) => return None,
+    })
+}
+
+/// The name `target` spells, schema first when it has one, each part quoted
+/// as written.
+fn target_object_name(target: &sql_traits::structs::TargetName<'_>) -> ObjectName {
+    let part = |name: &str, quoted: bool| {
+        ObjectNamePart::Identifier(if quoted {
+            Ident::with_quote('"', name)
+        } else {
+            Ident::new(name)
+        })
+    };
+    ObjectName(
+        target
+            .schema()
+            .map(|schema| part(schema, target.schema_is_quoted()))
+            .into_iter()
+            .chain([part(target.name(), target.name_is_quoted())])
+            .collect(),
+    )
+}
+
 /// Resolves a column declaration and requires an inspectable definition.
 pub(crate) fn declared_in_scope<T: PartialEq>(
     expr: &Expr,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
-    read_column: impl Fn(&sqlparser::ast::ColumnDef) -> Option<T>,
+    read_column: impl Fn(&ColumnDeclaration<'_>) -> Option<T>,
     read_expression: impl Fn(
         &Expr,
         &ParserDB,
@@ -368,7 +493,7 @@ pub(crate) fn combined_in_scope<T>(
     expr: &Expr,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
-    read_column: impl Fn(&sqlparser::ast::ColumnDef) -> Option<T>,
+    read_column: impl Fn(&ColumnDeclaration<'_>) -> Option<T>,
     read_expression: impl Fn(
         &Expr,
         &ParserDB,
@@ -384,7 +509,7 @@ pub(crate) fn inspect_declared_in_scope<T: PartialEq>(
     expr: &Expr,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
-    read_column: impl Fn(&sqlparser::ast::ColumnDef) -> Option<T>,
+    read_column: impl Fn(&ColumnDeclaration<'_>) -> Option<T>,
     read_expression: impl Fn(
         &Expr,
         &ParserDB,
@@ -406,7 +531,7 @@ fn read_scoped_declaration<T>(
     expr: &Expr,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
-    read_column: impl Fn(&sqlparser::ast::ColumnDef) -> Option<T>,
+    read_column: impl Fn(&ColumnDeclaration<'_>) -> Option<T>,
     read_expression: impl Fn(
         &Expr,
         &ParserDB,
@@ -432,7 +557,7 @@ fn read_scoped_declaration<T>(
         return Ok(None);
     };
     if let Some(declaration) = variable_declaration(reference, options) {
-        return Ok(read_column(declaration));
+        return Ok(read_column(&ColumnDeclaration::from(declaration)));
     }
     if scope_declines_column(reference, column_name, options) {
         return Ok(None);
@@ -489,7 +614,7 @@ fn evaluate_definition<T>(
     definition: &ColumnDefinition<'_, '_, '_, ParserDB>,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
-    read_column: &impl Fn(&sqlparser::ast::ColumnDef) -> Option<T>,
+    read_column: &impl Fn(&ColumnDeclaration<'_>) -> Option<T>,
     read_expression: &impl Fn(
         &Expr,
         &ParserDB,
@@ -502,7 +627,7 @@ fn evaluate_definition<T>(
     };
     match definition {
         ColumnDefinition::Base { column, .. } => {
-            Ok(DefinitionValue::Known(read_column(column.attribute())))
+            Ok(DefinitionValue::Known(read_column(&ColumnDeclaration::from(column.attribute()))))
         }
         ColumnDefinition::Expression { expression, scope } => {
             let scoped = options.with_definition_scope(*scope);
@@ -530,8 +655,16 @@ fn evaluate_definition<T>(
             Ok(DefinitionValue::Known(read_column(&ordinality_column())))
         }
         ColumnDefinition::RecursiveUnion { anchor, .. } => evaluate(&anchor.definition()),
-        ColumnDefinition::FunctionResult { .. }
-        | ColumnDefinition::Parameter { .. }
+        ColumnDefinition::FunctionResult {
+            data_type: FunctionResultType::RowType(column), ..
+        } => evaluate(&column.definition()),
+        ColumnDefinition::FunctionResult { data_type, .. } => {
+            Ok(match function_result_declaration(data_type) {
+                Some(declaration) => DefinitionValue::Known(read_column(&declaration)),
+                None => DefinitionValue::Opaque,
+            })
+        }
+        ColumnDefinition::Parameter { .. }
         | ColumnDefinition::Variable(_)
         | ColumnDefinition::VariableField(_)
         | ColumnDefinition::Opaque => Ok(DefinitionValue::Opaque),
@@ -565,10 +698,10 @@ fn equal_values<T: PartialEq>(values: Vec<Option<T>>) -> Option<T> {
 /// known.
 fn element_column<'s>(
     array: &Expr,
-    scope: sql_traits::structs::ColumnDefinitionScope<'s, 's, 's, ParserDB>,
+    scope: ColumnDefinitionScope<'s, 's, 's, ParserDB>,
     schema: &ParserDB,
     options: &'s crate::options::TranslationContext<'_>,
-) -> Result<Option<sqlparser::ast::ColumnDef>, Error> {
+) -> Result<Option<ColumnDeclaration<'static>>, Error> {
     let scoped = options.with_definition_scope(scope);
     let Some(name) = crate::impls::expression_type::type_name(array, schema, &scoped)? else {
         return Ok(None);
@@ -578,19 +711,14 @@ fn element_column<'s>(
             sqlparser::ast::ArrayElemTypeDef::SquareBracket(element, _)
             | sqlparser::ast::ArrayElemTypeDef::AngleBracket(element)
             | sqlparser::ast::ArrayElemTypeDef::Parenthesis(element),
-        )) => Some(implied_column(*element)),
+        )) => Some(ColumnDeclaration::implied(*element)),
         _ => None,
     })
 }
 
 /// The `bigint` column `WITH ORDINALITY` adds.
-fn ordinality_column() -> sqlparser::ast::ColumnDef {
-    implied_column(DataType::BigInt(None))
-}
-
-/// A column of `data_type` that no table declares.
-fn implied_column(data_type: DataType) -> sqlparser::ast::ColumnDef {
-    sqlparser::ast::ColumnDef { name: Ident::new(""), data_type, options: Vec::new() }
+fn ordinality_column() -> ColumnDeclaration<'static> {
+    ColumnDeclaration::implied(DataType::BigInt(None))
 }
 
 /// Runs `inspect` over the output scope of `query`, recorded or built from the
@@ -621,7 +749,7 @@ pub(crate) fn query_output_find<T>(
     query: &Query,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
-    read_column: impl Fn(&sqlparser::ast::ColumnDef) -> Option<T>,
+    read_column: impl Fn(&ColumnDeclaration<'_>) -> Option<T>,
     read_expression: impl Fn(
         &Expr,
         &ParserDB,
@@ -654,7 +782,7 @@ pub(crate) fn query_output_carries<T>(
     query: &Query,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
-    read_column: impl Fn(&sqlparser::ast::ColumnDef) -> Option<T>,
+    read_column: impl Fn(&ColumnDeclaration<'_>) -> Option<T>,
     read_expression: impl Fn(
         &Expr,
         &ParserDB,
@@ -691,7 +819,7 @@ pub(crate) fn query_outputs<T>(
     query: &Query,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
-    read_column: impl Fn(&sqlparser::ast::ColumnDef) -> Option<T>,
+    read_column: impl Fn(&ColumnDeclaration<'_>) -> Option<T>,
     read_expression: impl Fn(
         &Expr,
         &ParserDB,
@@ -722,7 +850,7 @@ pub(crate) fn first_query_output<T>(
     query: &Query,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
-    read_column: impl Fn(&sqlparser::ast::ColumnDef) -> Option<T>,
+    read_column: impl Fn(&ColumnDeclaration<'_>) -> Option<T>,
     read_expression: impl Fn(
         &Expr,
         &ParserDB,
@@ -763,7 +891,7 @@ pub(crate) fn scalar_query_declared<T: PartialEq>(
     query: &Query,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
-    read_column: impl Fn(&sqlparser::ast::ColumnDef) -> Option<T>,
+    read_column: impl Fn(&ColumnDeclaration<'_>) -> Option<T>,
     read_expression: impl Fn(
         &Expr,
         &ParserDB,
@@ -805,7 +933,7 @@ fn definition_find<T>(
     definition: &ColumnDefinition<'_, '_, '_, ParserDB>,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
-    read_column: &impl Fn(&sqlparser::ast::ColumnDef) -> Option<T>,
+    read_column: &impl Fn(&ColumnDeclaration<'_>) -> Option<T>,
     read_expression: &impl Fn(
         &Expr,
         &ParserDB,
@@ -813,7 +941,9 @@ fn definition_find<T>(
     ) -> Result<Option<T>, Error>,
 ) -> Result<Option<T>, Error> {
     match definition {
-        ColumnDefinition::Base { column, .. } => Ok(read_column(column.attribute())),
+        ColumnDefinition::Base { column, .. } => {
+            Ok(read_column(&ColumnDeclaration::from(column.attribute())))
+        }
         ColumnDefinition::Expression { expression, scope } => {
             read_expression(expression, schema, &options.with_definition_scope(*scope))
         }
@@ -859,8 +989,13 @@ fn definition_find<T>(
                 .and_then(|column| read_column(&column)))
         }
         ColumnDefinition::Ordinality => Ok(read_column(&ordinality_column())),
-        ColumnDefinition::FunctionResult { .. }
-        | ColumnDefinition::Parameter { .. }
+        ColumnDefinition::FunctionResult {
+            data_type: FunctionResultType::RowType(column), ..
+        } => definition_find(&column.definition(), schema, options, read_column, read_expression),
+        ColumnDefinition::FunctionResult { data_type, .. } => {
+            Ok(function_result_declaration(data_type).and_then(|column| read_column(&column)))
+        }
+        ColumnDefinition::Parameter { .. }
         | ColumnDefinition::Variable(_)
         | ColumnDefinition::VariableField(_)
         | ColumnDefinition::Opaque => Ok(None),
@@ -1041,7 +1176,7 @@ pub(crate) fn declared_type_matches(
         expr,
         schema,
         options,
-        |column| predicate(&column.data_type.to_string()).then_some(()),
+        |column| predicate(&column.data_type().to_string()).then_some(()),
         |expression, schema, options| {
             Ok(declared_type_matches(expression, schema, options, predicate)?.then_some(()))
         },
@@ -1254,7 +1389,7 @@ fn numeric_precision_and_scale_of(
                 query,
                 schema,
                 options,
-                |column| read(&column.data_type),
+                |column| read(column.data_type()),
                 numeric_precision_and_scale_of,
             ) {
                 return Ok(Some(found));
@@ -1272,7 +1407,7 @@ fn numeric_precision_and_scale_of(
                 expr,
                 schema,
                 options,
-                |column| read(&column.data_type),
+                |column| read(column.data_type()),
                 numeric_precision_and_scale_of,
             )
         }
@@ -5001,7 +5136,7 @@ pub(crate) fn set_branch_output_carries_interval(
                 schema,
                 options,
                 |column| {
-                    crate::impls::interval::is_interval_data_type(&column.data_type).then_some(())
+                    crate::impls::interval::is_interval_data_type(column.data_type()).then_some(())
                 },
                 |expr, schema, options| {
                     Ok(crate::impls::expression_type::is_interval_typed(expr, schema, options)
@@ -6575,7 +6710,7 @@ mod tests {
                 &schema,
                 &options,
                 |column| {
-                    crate::impls::interval::is_interval_data_type(&column.data_type).then_some(())
+                    crate::impls::interval::is_interval_data_type(column.data_type()).then_some(())
                 },
                 |expr, schema, options| {
                     Ok(crate::impls::expression_type::is_interval_typed(expr, schema, options)
@@ -6589,7 +6724,7 @@ mod tests {
 
     /// Answers `"column"` for every table column a definition reads.
     #[expect(clippy::unnecessary_wraps, reason = "the reader `evaluate_definition` takes")]
-    fn read_column(_: &sqlparser::ast::ColumnDef) -> Option<&'static str> {
+    fn read_column(_: &super::ColumnDeclaration<'_>) -> Option<&'static str> {
         Some("column")
     }
 
@@ -6781,8 +6916,8 @@ mod tests {
 
         /// Answers the type of every column a definition reads.
         #[expect(clippy::unnecessary_wraps, reason = "the reader `evaluate_definition` takes")]
-        fn read_type(column: &sqlparser::ast::ColumnDef) -> Option<DataType> {
-            Some(column.data_type.clone())
+        fn read_type(column: &super::ColumnDeclaration<'_>) -> Option<DataType> {
+            Some(column.data_type().clone())
         }
         /// Answers no type for an expression, which no case here reads.
         #[expect(clippy::unnecessary_wraps, reason = "the reader `evaluate_definition` takes")]

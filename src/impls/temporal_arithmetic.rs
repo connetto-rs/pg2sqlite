@@ -85,7 +85,7 @@ pub(crate) fn temporal_kind(
                 expr,
                 schema,
                 options,
-                |column| kind_of_data_type(&column.data_type),
+                |column| kind_of_data_type(column.data_type()),
                 temporal_kind,
             )?
         }

@@ -9,8 +9,8 @@ use sql_traits::{
 };
 use sqlparser::{
     ast::{
-        BinaryOperator, ColumnDef, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
-        FunctionArguments, UnaryOperator, Value,
+        BinaryOperator, DataType, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
+        UnaryOperator, Value,
     },
     dialect::PostgreSqlDialect,
     parser::Parser,
@@ -23,7 +23,9 @@ use crate::{
     impls::{
         function_helpers::positional_arity,
         object_name::last_ident,
-        shared_helpers::{combined_in_scope, first_query_output, function_arg_expr},
+        shared_helpers::{
+            ColumnDeclaration, combined_in_scope, first_query_output, function_arg_expr,
+        },
         translator_impls::postgis,
     },
 };
@@ -192,8 +194,8 @@ fn is_interval_type_name(lower: &str) -> bool {
 }
 
 /// The type name of a column's declaration.
-fn declared_type_name(column: &ColumnDef) -> String {
-    normalize_sqlparser_type(&column.data_type).into_owned()
+fn declared_type_name(column: &ColumnDeclaration<'_>) -> String {
+    normalize_sqlparser_type(column.data_type()).into_owned()
 }
 
 /// [`type_name`] for an expression a relation in scope defines a column by.

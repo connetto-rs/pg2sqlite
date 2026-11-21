@@ -44,11 +44,12 @@ use crate::{
         request_zone::RequestZone,
         session_variable,
         shared_helpers::{
-            declared_in_scope, declared_numeric_precision, declared_type_matches,
-            extract_column_references_from_function, function_argument_exprs,
-            inspect_declared_in_scope, is_bound_parameter, is_integral_expression, numeric_scale,
-            query_output_find, referenced_column_name, rescale_minor_units, scale_decimal_literal,
-            scale_of, scale_parameter, scope_declines_column, translate_expr_recursive,
+            DeclaredCollation, declared_in_scope, declared_numeric_precision,
+            declared_type_matches, extract_column_references_from_function, function_arg_expr,
+            function_argument_exprs, inspect_declared_in_scope, is_bound_parameter,
+            is_integral_expression, numeric_scale, query_output_find, referenced_column_name,
+            rescale_minor_units, scale_decimal_literal, scale_of, scale_parameter,
+            scope_declines_column, translate_expr_recursive,
         },
         temporal_arithmetic::{
             TemporalKind, epoch_of_temporal_difference, from_year_one, temporal_kind_of,
@@ -1689,7 +1690,7 @@ fn unstored_vector_operand(
             query,
             schema,
             options,
-            |column| UnstoredVector::declared(&column.data_type, schema),
+            |column| UnstoredVector::declared(column.data_type(), schema),
             unstored_vector_operand,
         );
     }
@@ -1697,7 +1698,7 @@ fn unstored_vector_operand(
         expr,
         schema,
         options,
-        |column| UnstoredVector::declared(&column.data_type, schema),
+        |column| UnstoredVector::declared(column.data_type(), schema),
         unstored_vector_operand,
     )?;
     if declared.is_some() {
@@ -1885,22 +1886,45 @@ fn derived_collation(
             Ok(Derivation::Inherited(reference_collation(expr, schema, options)?))
         }
         _ => {
-            let mut inherited = ComparisonCollation::Byte;
-            let mut refusal = None;
-            for_each_child_expr(expr, &mut |child| {
-                match derived_collation(child, schema, options) {
-                    Ok(Derivation::Explicit(collation) | Derivation::Inherited(collation)) => {
-                        if inherited == ComparisonCollation::Byte {
-                            inherited = collation;
-                        }
-                    }
-                    Err(error) => refusal = refusal.take().or(Some(error)),
+            let mut inherited = InheritedCollation::default();
+            for_each_child_expr(expr, &mut |child| inherited.read(child, schema, options));
+            Ok(Derivation::Inherited(inherited.settle()?))
+        }
+    }
+}
+
+/// The collation an expression inherits from its operands, the first other
+/// than bytes, refused only when an unsettled operand leaves none settled.
+#[derive(Default)]
+struct InheritedCollation {
+    inherited: Option<ComparisonCollation>,
+    refusal: Option<crate::errors::Error>,
+}
+
+impl InheritedCollation {
+    /// Takes in the collation `operand` carries.
+    fn read(
+        &mut self,
+        operand: &Expr,
+        schema: &ParserDB,
+        options: &crate::options::TranslationContext<'_>,
+    ) {
+        match derived_collation(operand, schema, options) {
+            Ok(Derivation::Explicit(collation) | Derivation::Inherited(collation)) => {
+                if collation != ComparisonCollation::Byte && self.inherited.is_none() {
+                    self.inherited = Some(collation);
                 }
-            });
-            match refusal {
-                Some(error) if inherited == ComparisonCollation::Byte => Err(error),
-                _ => Ok(Derivation::Inherited(inherited)),
             }
+            Err(error) => self.refusal = self.refusal.take().or(Some(error)),
+        }
+    }
+
+    /// The collation the operands read so far settle on.
+    fn settle(self) -> Result<ComparisonCollation, crate::errors::Error> {
+        match (self.inherited, self.refusal) {
+            (Some(collation), _) => Ok(collation),
+            (None, Some(error)) => Err(error),
+            (None, None) => Ok(ComparisonCollation::Byte),
         }
     }
 }
@@ -2008,20 +2032,21 @@ fn declared_collation(
         schema,
         options,
         |column| {
-            Some(
-                column
-                    .options
-                    .iter()
-                    .find_map(|option| {
-                        match &option.option {
-                            sqlparser::ast::ColumnOption::Collation(collation) => {
-                                Some(classify_collation(collation))
-                            }
-                            _ => None,
-                        }
-                    })
-                    .unwrap_or(ComparisonCollation::Byte),
-            )
+            match column.collation() {
+                DeclaredCollation::TypeDefault => Some(ComparisonCollation::Byte),
+                DeclaredCollation::Named(collation) => Some(classify_collation(collation)),
+                DeclaredCollation::Call { arguments, scope } => {
+                    let scoped = options.with_definition_scope(*scope);
+                    let mut inherited = InheritedCollation::default();
+                    for argument in arguments.iter().filter_map(function_arg_expr) {
+                        inherited.read(argument, schema, &scoped);
+                    }
+                    // An argument whose collation is unsettled leaves the
+                    // call's unsettled too.
+                    inherited.settle().ok()
+                }
+                DeclaredCollation::Unnamed => None,
+            }
         },
         |expression, schema, options| {
             // A view column's own expression carries the collation it reads,
@@ -2848,7 +2873,7 @@ fn convert_beside_column_expr(
         column_expr,
         schema,
         options,
-        |column| Some(column.data_type.clone()),
+        |column| Some(column.data_type().clone()),
         |_, _, _| Ok(None),
     )
     .ok()
@@ -3674,7 +3699,7 @@ fn translate_binary_op(
                     schema,
                     options,
                     |column| {
-                        let dt = &column.data_type;
+                        let dt = column.data_type();
                         if is_vector_data_type(dt, schema)
                             || matches!(dt, DataType::Array(_))
                             || (crate::impls::shared_helpers::literal_checks_apply(dt)

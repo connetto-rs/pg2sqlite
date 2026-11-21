@@ -55,7 +55,7 @@ pub(crate) fn declared_data_type(
         expr,
         schema,
         options,
-        |column| Some(column.data_type.clone()),
+        |column| Some(column.data_type().clone()),
         declared_data_type,
     )
 }

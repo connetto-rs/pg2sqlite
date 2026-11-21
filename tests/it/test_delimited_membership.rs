@@ -554,6 +554,60 @@ fn a_cast_over_a_case_insensitive_column_is_refused() {
     assert!(nested.contains("CI_COLL"), "parentheses keep the collation: {nested}");
 }
 
+/// Functions called in `FROM` over the case-insensitive corpus, one for each
+/// declaration a column of a function's result takes its collation from.
+const COLLATED_FUNCTIONS: &str = "CREATE TYPE ci_row AS (v TEXT COLLATE ci_coll);
+CREATE FUNCTION echo(t TEXT) RETURNS SETOF TEXT LANGUAGE sql AS $$ SELECT t $$;
+CREATE FUNCTION rows_of() RETURNS SETOF ci_row LANGUAGE sql AS $$ SELECT k FROM ci $$;
+CREATE FUNCTION keys_of() RETURNS SETOF ci LANGUAGE sql AS $$ SELECT * FROM ci $$;
+CREATE FUNCTION pairs_of() RETURNS TABLE (id INT, v TEXT) LANGUAGE sql AS $$ SELECT id, k FROM ci $$;
+";
+
+/// What `query` translates to against the case-insensitive corpus and
+/// [`COLLATED_FUNCTIONS`].
+fn translated_over_collated_functions(query: &str) -> Result<Vec<String>, Error> {
+    let schema = Pg2Sqlite::default()
+        .sql(&format!("{CASE_INSENSITIVE_KEYS}{COLLATED_FUNCTIONS}"))
+        .expect("parse the corpus")
+        .build_schema()
+        .expect("the corpus is valid PostgreSQL");
+    let options = Pg2SqliteOptions::default()
+        .with_user_defined_functions(["echo", "rows_of", "keys_of", "pairs_of"]);
+    Pg2Sqlite::default()
+        .sql(query)
+        .expect("parse the query")
+        .translate_with_report_and_schema(&schema, &options)
+        .map(|report| report.script.map(|statement| statement.to_string()).into_vec())
+}
+
+/// A column of a function called in `FROM` carries the collation PostgreSQL
+/// 18.6 gives it, the call's for a single output, the declared one for a
+/// composite attribute or a table row, and its type's default for a `RETURNS
+/// TABLE` column.
+#[test]
+fn a_function_result_column_carries_the_collation_postgresql_gives_it() {
+    for query in [
+        "SELECT e.v FROM echo('A' COLLATE ci_coll) AS e(v) \
+         WHERE e.v = ANY(string_to_array('a,b', ','));",
+        "SELECT r.v FROM rows_of() AS r WHERE r.v = ANY(string_to_array('a,b', ','));",
+        "SELECT r.id FROM keys_of() AS r WHERE r.k = ANY(string_to_array('a,b', ','));",
+    ] {
+        let message = match translated_over_collated_functions(query) {
+            Ok(script) => panic!("{query}\nwas translated: {}", script.join("\n")),
+            Err(error) => error.to_string(),
+        };
+        assert!(message.contains("CI_COLL"), "{query}\nnames the collation: {message}");
+    }
+    for query in [
+        "SELECT e.v FROM echo('A') AS e(v) WHERE e.v = ANY(string_to_array('a,b', ','));",
+        "SELECT p.id FROM pairs_of() AS p WHERE p.v = ANY(string_to_array('a,b', ','));",
+    ] {
+        if let Err(error) = translated_over_collated_functions(query) {
+            panic!("{query}\nwas refused: {error}");
+        }
+    }
+}
+
 /// PostgreSQL settles a compound select on the collation its branches agree
 /// on, measured on PostgreSQL 18.6, where a view over `SELECT k FROM ci
 /// UNION ALL SELECT 'zz'` settles `k` to the column's collation and
