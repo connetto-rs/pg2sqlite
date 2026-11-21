@@ -13,7 +13,9 @@ use sqlparser_plpgsql::embedded::{
 };
 
 use super::{
-    DerivedWrite, Event, Reach, chain_phrase, function_writes, is_builtin, parsed_body,
+    DerivedWrite, Event, Reach, chain_phrase,
+    columns::{Columns, columns_read},
+    function_writes, is_builtin, parsed_body,
     rows::{self, Rows},
 };
 #[cfg(not(feature = "std"))]
@@ -27,10 +29,10 @@ use crate::{
 pub(super) enum Step {
     /// The write at this index of [`Chain::writes`].
     Write(usize),
-    /// A statement the replica keeps reads these rows of `relation`, folded,
-    /// from the function `reader` names, the chain to it the trigger's own
-    /// first.
-    Read { relation: String, rows: Rows, reader: Vec<String> },
+    /// A statement the replica keeps reads these rows and `columns` of
+    /// `relation`, folded, from the function `reader` names, the chain to it
+    /// the trigger's own first.
+    Read { relation: String, rows: Rows, columns: Columns, reader: Vec<String> },
     /// The end of a loop whose statements began at this index of
     /// [`Chain::steps`], which run again after it.
     LoopEnd(usize),
@@ -437,8 +439,10 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
                 None => self.function(helper)?,
             }
         }
+        let mut columns = columns_read(node, self.schema)?;
         for (relation, rows) in rows::read(node, self.schema, self.variables()) {
-            self.chain.steps.push(Step::Read { relation, rows, reader: names.clone() });
+            let columns = columns.remove(&relation).unwrap_or(Columns::Row);
+            self.chain.steps.push(Step::Read { relation, rows, columns, reader: names.clone() });
         }
         Ok(())
     }

@@ -12,9 +12,10 @@ use pg2sqlite::{
     prelude::{Pg2Sqlite, Pg2SqliteOptions, postgres_error},
     warnings::TranslationWarning,
 };
+use sql_traits::structs::Deployment;
 use sqlstate::{SqlState, pg};
 
-use crate::helpers::establish_connection;
+use crate::{helpers::establish_connection, support::transaction::transaction};
 
 diesel::table! {
     /// The organizations of the reproduction.
@@ -187,11 +188,17 @@ fn replica_options() -> Pg2SqliteOptions {
 
 /// A connection holding the script `pg` translates to under `options`.
 fn replica_with(pg: &str, options: &Pg2SqliteOptions) -> SqliteConnection {
-    let script = Pg2Sqlite::default()
+    replica_committing(pg, options).0
+}
+
+/// [`replica_with`], with the statements the script runs before `COMMIT`.
+fn replica_committing(pg: &str, options: &Pg2SqliteOptions) -> (SqliteConnection, Vec<String>) {
+    let mut script = Pg2Sqlite::default()
         .sql(pg)
         .expect("fixture parses")
         .translate_to_sql(options)
         .expect("fixture translates");
+    let before_commit = core::mem::take(&mut script.before_commit);
     let mut connection = establish_connection();
     // The script is the translator's own output, which no typed query
     // expresses.
@@ -200,7 +207,7 @@ fn replica_with(pg: &str, options: &Pg2SqliteOptions) -> SqliteConnection {
             .batch_execute(&format!("{statement};"))
             .unwrap_or_else(|error| panic!("emitted statement failed: {error}\n{statement}"));
     }
-    connection
+    (connection, before_commit)
 }
 
 fn replica(pg: &str) -> SqliteConnection {
@@ -210,10 +217,15 @@ fn replica(pg: &str) -> SqliteConnection {
 /// The construct, name and table of every object the replica leaves to the
 /// server, in report order.
 fn left_to_server(pg: &str) -> Vec<(String, String, String)> {
+    left_to_server_with(pg, &replica_options())
+}
+
+/// [`left_to_server`] under `options`.
+fn left_to_server_with(pg: &str, options: &Pg2SqliteOptions) -> Vec<(String, String, String)> {
     Pg2Sqlite::default()
         .sql(pg)
         .expect("fixture parses")
-        .translate_with_report(&replica_options())
+        .translate_with_report(options)
         .expect("fixture translates")
         .warnings
         .into_iter()
@@ -2246,4 +2258,223 @@ CREATE TRIGGER teams_open_removed AFTER DELETE ON teams
     ] {
         assert_eq!(&left_to_server(&removing(declare, statement)), expected, "{statement}");
     }
+}
+
+/// Parents whose state each child copies through an `ON UPDATE CASCADE` key,
+/// and a deferred check on the parent reading its children through
+/// `condition`. The acting role `app` may update only `state` and `item`, and
+/// each child stores whether it is `open`.
+fn cascaded_states(condition: &str, extra: &str) -> String {
+    format!(
+        "
+CREATE ROLE postgres SUPERUSER;
+CREATE ROLE app NOLOGIN;
+CREATE TABLE parents (id INT PRIMARY KEY, state TEXT NOT NULL, UNIQUE (id, state));
+CREATE TABLE children (
+    id INT PRIMARY KEY,
+    parent_id INT NOT NULL,
+    parent_state TEXT NOT NULL,
+    item INT,
+    open BOOLEAN GENERATED ALWAYS AS (parent_state = 'open') STORED,
+    FOREIGN KEY (parent_id, parent_state) REFERENCES parents (id, state) ON UPDATE CASCADE
+);
+CREATE FUNCTION check_parent() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.state = 'done' AND EXISTS (
+        SELECT 1 FROM children child WHERE {condition}
+    ) THEN
+        RAISE EXCEPTION 'parent % is done with an empty child', NEW.id USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+CREATE CONSTRAINT TRIGGER parents_check AFTER UPDATE ON parents
+    DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION check_parent();
+GRANT SELECT, INSERT, UPDATE (state) ON parents TO app;
+GRANT SELECT, INSERT, UPDATE (item) ON children TO app;
+{extra}"
+    )
+}
+
+/// The check of [`cascaded_states`] reading only the child's key to its
+/// parent's `id` and its `item`.
+const EMPTY_CHILD: &str = "child.parent_id = NEW.id AND child.item IS NULL";
+
+fn acting_options() -> Pg2SqliteOptions {
+    let deployment = Deployment::new("postgres", ["app"], []).expect("a valid deployment");
+    replica_options()
+        .with_deployment(deployment)
+        .with_acting_role("app")
+        .with_rls_audit_table_name("rls_audit")
+}
+
+fn left_to_server_acting(pg: &str) -> Vec<(String, String, String)> {
+    left_to_server_with(pg, &acting_options())
+}
+
+#[test]
+fn a_check_reading_no_column_a_cascade_changes_keeps_its_refusal() {
+    let pg = cascaded_states(EMPTY_CHILD, "");
+    assert_eq!(
+        left_to_server_acting(&pg),
+        owned(&[("FOREIGN KEY", "(parent_id, parent_state) REFERENCES parents", "children")]),
+    );
+    let (mut connection, before_commit) = replica_committing(&pg, &acting_options());
+    transaction(
+        &mut connection,
+        &before_commit,
+        "INSERT INTO parents (id, state) VALUES (1, 'open');
+         INSERT INTO children (id, parent_id, parent_state, item) VALUES (1, 1, 'open', NULL);",
+    )
+    .expect("seed");
+    let error = transaction(
+        &mut connection,
+        &before_commit,
+        "UPDATE parents SET state = 'done' WHERE id = 1;",
+    )
+    .expect_err("a parent with an empty child cannot be done")
+    .to_string();
+    let refused = postgres_error(&error).unwrap_or_else(|| panic!("no refusal: {error}"));
+    assert_eq!(
+        (refused.sqlstate(), refused.message()),
+        (pg::CHECK_VIOLATION, "parent 1 is done with an empty child"),
+    );
+}
+
+#[test]
+fn a_check_reading_a_column_a_cascade_changes_is_left_out() {
+    let reads = [
+        "child.parent_state = 'open'",
+        "parent_state = 'open'",
+        "child.open",
+        "child IS NOT NULL",
+        "child.* IS NOT NULL",
+        "to_jsonb(child.*) IS NOT NULL",
+        "EXISTS (SELECT * FROM children other WHERE other.id = child.id)",
+        "EXISTS (SELECT other.* FROM children other JOIN parents p ON p.id = other.parent_id)",
+        "EXISTS (SELECT 1 FROM children other JOIN children another USING (parent_state))",
+        "EXISTS (SELECT 1 FROM (children other JOIN children another USING (parent_state)))",
+        "EXISTS (SELECT 1 FROM children other NATURAL JOIN parents p)",
+        "EXISTS (SELECT 1 FROM children AS renamed (rid) WHERE rid = child.id)",
+    ];
+    let variants =
+        reads.iter().map(|read| cascaded_states(&format!("{EMPTY_CHILD} AND {read}"), "")).chain([
+            cascaded_states(EMPTY_CHILD, "GRANT UPDATE (id) ON parents TO app;"),
+            cascaded_states(
+                EMPTY_CHILD,
+                "ALTER TABLE children ENABLE ROW LEVEL SECURITY;
+CREATE POLICY children_open ON children FOR SELECT TO app USING (parent_state <> 'archived');",
+            ),
+            cascaded_states(
+                EMPTY_CHILD,
+                "ALTER TABLE children ENABLE ROW LEVEL SECURITY;
+CREATE POLICY children_seen ON children FOR SELECT TO app USING (children IS NOT NULL);",
+            ),
+        ]);
+    for pg in variants {
+        assert_eq!(
+            left_to_server_acting(&pg),
+            owned(&[
+                ("FOREIGN KEY", "(parent_id, parent_state) REFERENCES parents", "children"),
+                ("TRIGGER", "parents_check", "parents"),
+            ]),
+            "{pg}",
+        );
+    }
+}
+
+#[test]
+fn a_cascade_firing_a_trigger_that_assigns_the_child_row_is_left_out() {
+    let pg = cascaded_states(
+        EMPTY_CHILD,
+        "CREATE FUNCTION empty_child() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.item := NULL;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER children_emptied BEFORE UPDATE ON children
+    FOR EACH ROW EXECUTE FUNCTION empty_child();",
+    );
+    assert_eq!(
+        left_to_server_acting(&pg),
+        owned(&[
+            ("FOREIGN KEY", "(parent_id, parent_state) REFERENCES parents", "children"),
+            ("TRIGGER", "parents_check", "parents"),
+        ]),
+    );
+}
+
+#[test]
+fn a_check_calling_a_function_without_arguments_keeps_its_refusal() {
+    let pg = cascaded_states(&format!("{EMPTY_CHILD} AND current_user IS NOT NULL"), "");
+    assert_eq!(
+        left_to_server_acting(&pg),
+        owned(&[("FOREIGN KEY", "(parent_id, parent_state) REFERENCES parents", "children")]),
+    );
+}
+
+#[test]
+fn a_parent_trigger_that_assigns_the_row_cascades_every_key_column() {
+    let pg = cascaded_states(
+        EMPTY_CHILD,
+        "CREATE FUNCTION trim_state() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.state := trim(NEW.state);
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER parents_trimmed BEFORE UPDATE ON parents
+    FOR EACH ROW EXECUTE FUNCTION trim_state();",
+    );
+    assert_eq!(
+        left_to_server_acting(&pg),
+        owned(&[
+            ("FOREIGN KEY", "(parent_id, parent_state) REFERENCES parents", "children"),
+            ("TRIGGER", "parents_check", "parents"),
+        ]),
+    );
+}
+
+#[test]
+fn a_view_updating_the_parent_through_its_own_trigger_cascades_every_key_column() {
+    let pg = cascaded_states(
+        EMPTY_CHILD,
+        "CREATE VIEW parent_rows AS SELECT id, state FROM parents;
+CREATE FUNCTION rekey_parent() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE parents SET id = NEW.id, state = NEW.state WHERE id = OLD.id;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER parent_rows_rekeyed INSTEAD OF UPDATE ON parent_rows
+    FOR EACH ROW EXECUTE FUNCTION rekey_parent();",
+    );
+    assert_eq!(
+        left_to_server_acting(&pg),
+        owned(&[
+            ("FOREIGN KEY", "(parent_id, parent_state) REFERENCES parents", "children"),
+            ("TRIGGER", "parents_check", "parents"),
+        ]),
+    );
+}
+
+#[test]
+fn a_view_inserting_parents_through_its_own_trigger_keeps_the_refusal() {
+    let pg = cascaded_states(
+        EMPTY_CHILD,
+        "CREATE VIEW parent_rows AS SELECT id, state FROM parents;
+CREATE FUNCTION add_parent() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO parents (id, state) VALUES (NEW.id, NEW.state);
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER parent_rows_added INSTEAD OF UPDATE ON parent_rows
+    FOR EACH ROW EXECUTE FUNCTION add_parent();",
+    );
+    assert_eq!(
+        left_to_server_acting(&pg),
+        owned(&[("FOREIGN KEY", "(parent_id, parent_state) REFERENCES parents", "children")]),
+    );
 }
