@@ -399,16 +399,21 @@ impl<'d> From<&'d sqlparser::ast::ColumnDef> for ColumnDeclaration<'d> {
     }
 }
 
-/// The declaration of a column of the result a function called in `FROM`
-/// returns, or `None` when sqlparser reads no type in the name the function
-/// declares, and for a column of a row type, which the definition it names
-/// declares instead.
+/// What decides the type and collation of a column of a function's result,
+/// its own declaration or, for a row type, the column of the definition it
+/// names.
+enum FunctionResultDeclaration<'d> {
+    Column(ColumnDeclaration<'d>),
+    Row(ColumnDefinition<'d, 'd, 'd, ParserDB>),
+}
+
+/// The declaration or row column that determines a function result's type.
 fn function_result_declaration<'d>(
     data_type: &FunctionResultType<'d, 'd, 'd, ParserDB>,
-) -> Option<ColumnDeclaration<'d>> {
+) -> Option<FunctionResultDeclaration<'d>> {
     let declared =
         |name: &str| crate::impls::expression_type::parse_type_name(name).map(Cow::Owned);
-    Some(match data_type {
+    Some(FunctionResultDeclaration::Column(match data_type {
         FunctionResultType::Signature(name) => {
             ColumnDeclaration {
                 data_type: declared(name)?,
@@ -439,8 +444,10 @@ fn function_result_declaration<'d>(
                 collation: DeclaredCollation::TypeDefault,
             }
         }
-        FunctionResultType::RowType(_) => return None,
-    })
+        FunctionResultType::RowType(column) => {
+            return Some(FunctionResultDeclaration::Row(column.definition()));
+        }
+    }))
 }
 
 /// The name `target` spells, schema first when it has one, each part quoted
@@ -655,12 +662,12 @@ fn evaluate_definition<T>(
             Ok(DefinitionValue::Known(read_column(&ordinality_column())))
         }
         ColumnDefinition::RecursiveUnion { anchor, .. } => evaluate(&anchor.definition()),
-        ColumnDefinition::FunctionResult {
-            data_type: FunctionResultType::RowType(column), ..
-        } => evaluate(&column.definition()),
         ColumnDefinition::FunctionResult { data_type, .. } => {
             Ok(match function_result_declaration(data_type) {
-                Some(declaration) => DefinitionValue::Known(read_column(&declaration)),
+                Some(FunctionResultDeclaration::Column(declaration)) => {
+                    DefinitionValue::Known(read_column(&declaration))
+                }
+                Some(FunctionResultDeclaration::Row(definition)) => return evaluate(&definition),
                 None => DefinitionValue::Opaque,
             })
         }
@@ -989,11 +996,14 @@ fn definition_find<T>(
                 .and_then(|column| read_column(&column)))
         }
         ColumnDefinition::Ordinality => Ok(read_column(&ordinality_column())),
-        ColumnDefinition::FunctionResult {
-            data_type: FunctionResultType::RowType(column), ..
-        } => definition_find(&column.definition(), schema, options, read_column, read_expression),
         ColumnDefinition::FunctionResult { data_type, .. } => {
-            Ok(function_result_declaration(data_type).and_then(|column| read_column(&column)))
+            match function_result_declaration(data_type) {
+                Some(FunctionResultDeclaration::Column(column)) => Ok(read_column(&column)),
+                Some(FunctionResultDeclaration::Row(definition)) => {
+                    definition_find(&definition, schema, options, read_column, read_expression)
+                }
+                None => Ok(None),
+            }
         }
         ColumnDefinition::Parameter { .. }
         | ColumnDefinition::Variable(_)

@@ -557,6 +557,8 @@ fn a_cast_over_a_case_insensitive_column_is_refused() {
 /// Functions called in `FROM` over the case-insensitive corpus, one for each
 /// declaration a column of a function's result takes its collation from.
 const COLLATED_FUNCTIONS: &str = "CREATE TYPE ci_row AS (v TEXT COLLATE ci_coll);
+CREATE TYPE ci_qualified_row AS (v TEXT COLLATE public.\"ci_coll\");
+CREATE FUNCTION qualified_rows_of() RETURNS SETOF ci_qualified_row LANGUAGE sql AS $$ SELECT k FROM ci $$;
 CREATE FUNCTION echo(t TEXT) RETURNS SETOF TEXT LANGUAGE sql AS $$ SELECT t $$;
 CREATE FUNCTION rows_of() RETURNS SETOF ci_row LANGUAGE sql AS $$ SELECT k FROM ci $$;
 CREATE FUNCTION keys_of() RETURNS SETOF ci LANGUAGE sql AS $$ SELECT * FROM ci $$;
@@ -571,8 +573,13 @@ fn translated_over_collated_functions(query: &str) -> Result<Vec<String>, Error>
         .expect("parse the corpus")
         .build_schema()
         .expect("the corpus is valid PostgreSQL");
-    let options = Pg2SqliteOptions::default()
-        .with_user_defined_functions(["echo", "rows_of", "keys_of", "pairs_of"]);
+    let options = Pg2SqliteOptions::default().with_user_defined_functions([
+        "echo",
+        "rows_of",
+        "qualified_rows_of",
+        "keys_of",
+        "pairs_of",
+    ]);
     Pg2Sqlite::default()
         .sql(query)
         .expect("parse the query")
@@ -606,6 +613,28 @@ fn a_function_result_column_carries_the_collation_postgresql_gives_it() {
             panic!("{query}\nwas refused: {error}");
         }
     }
+}
+
+#[test]
+fn a_qualified_quoted_function_attribute_collation_is_refused() {
+    let message = translated_over_collated_functions(
+        "SELECT r.v FROM qualified_rows_of() AS r \
+         WHERE r.v = ANY(string_to_array('a,b', ','));",
+    )
+    .expect_err("the composite attribute compares case-insensitively")
+    .to_string();
+    assert!(message.contains("CI_COLL"), "{message}");
+}
+
+#[test]
+fn a_function_argument_with_an_unsettled_collation_is_refused() {
+    let message = translated_over_collated_functions(
+        "SELECT e.v FROM (SELECT k FROM ci UNION ALL SELECT 'zz') AS disputed, \
+         echo(disputed.k) AS e(v) WHERE e.v = ANY(string_to_array('a,b', ','));",
+    )
+    .expect_err("the argument leaves the function result's collation unsettled")
+    .to_string();
+    assert!(message.contains("do not settle the collation of e.v"), "{message}");
 }
 
 /// PostgreSQL settles a compound select on the collation its branches agree
