@@ -10,7 +10,7 @@
 use alloc::collections::BTreeSet;
 use core::ops::ControlFlow;
 
-use sql_traits::{structs::ParserDB, utils::identifier_resolution::stored_identifier};
+use sql_traits::{structs::ParserDB, utils::identifier_resolution::stored_ident_name};
 use sqlparser::{
     ast::{
         CreateFunction, Expr, Ident, ObjectName, ObjectNamePart, SetExpr, Spanned, Statement,
@@ -94,8 +94,7 @@ pub(crate) fn helper_raising_unresolved(
     helper: &CreateFunction,
     schema: &ParserDB,
 ) -> Block {
-    let stored =
-        |ident: &Ident| stored_identifier(&ident.value, ident.quote_style.is_some()).into_owned();
+    let stored = |ident: &Ident| stored_ident_name(ident).into_owned();
     let signature = Signature {
         name: last_ident(&helper.name).map_or_else(String::new, stored),
         parameters: helper
@@ -208,9 +207,8 @@ pub(crate) fn unresolved_aborts(
 /// What PL/pgSQL knows of the trigger function `function` beyond its body.
 fn trigger_signature(function: &ObjectName) -> Signature {
     Signature {
-        name: last_ident(function).map_or_else(String::new, |ident| {
-            stored_identifier(&ident.value, ident.quote_style.is_some()).into_owned()
-        }),
+        name: last_ident(function)
+            .map_or_else(String::new, |ident| stored_ident_name(ident).into_owned()),
         parameters: Vec::new(),
         kind: FunctionKind::Trigger,
     }
