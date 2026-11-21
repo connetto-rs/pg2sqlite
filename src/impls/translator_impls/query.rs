@@ -48,6 +48,13 @@ impl crate::traits::translator::TranslatorWithContext for Query {
         let merged = merge_parenthesized_body(self)?;
         let distributed = super::lateral::distribute_laterals(&merged, schema, options);
         let query: &Query = &super::cte::preserve_bindings(&distributed);
+        let whole = options.locks_whole_query();
+        let locked = super::locking::locked_relations(query, options.cte_clause(), whole);
+        super::locking::check_update_privilege(&locked, schema, options)?;
+        let addresses: Vec<usize> =
+            locked.iter().map(|factor| core::ptr::from_ref(*factor).addr()).collect();
+        let locking = (whole || !addresses.is_empty()).then(|| options.with_locked(&addresses));
+        let options = locking.as_ref().unwrap_or(options);
         // Everything below reads column types through the relations this query
         // exposes rather than through every table of that name in the schema,
         // so the scope is attached before any expression is translated. A

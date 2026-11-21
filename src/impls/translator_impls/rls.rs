@@ -2026,19 +2026,93 @@ fn backing_view(
     grants: &RoleTable,
     selection: Option<Expr>,
 ) -> Statement {
+    ast_builder::create_view(
+        generated_object_name(ctx.table_name),
+        Vec::new(),
+        backing_rows(ctx, grants, selection),
+    )
+}
+
+/// The columns `grants` lets the role read from the backing table, filtered
+/// by `selection`.
+fn backing_rows(
+    ctx: &RlsTriggerContext<'_>,
+    grants: &RoleTable,
+    selection: Option<Expr>,
+) -> sqlparser::ast::Query {
     let projection = grants
         .readable()
         .map(|column| SelectItem::UnnamedExpr(Expr::Identifier(quoted_ident(column))))
         .collect();
-    let query = make_query(
+    make_query(
         None,
         SetExpr::Select(Box::new(make_simple_select(
             projection,
             from_relation(plain_table_factor(generated_object_name(&ctx.inner_table_name))),
             selection,
         ))),
-    );
-    ast_builder::create_view(generated_object_name(ctx.table_name), Vec::new(), query)
+    )
+}
+
+/// The rows of `table` a locking read of the acting role reads, as the body
+/// of a derived table standing for the table, or `None` where the `UPDATE`
+/// policies hide no row the view shows.
+///
+/// PostgreSQL filters the existing row of `SELECT ... FOR UPDATE` and `FOR
+/// SHARE` by the `USING` clauses of the `UPDATE` policies as well as by the
+/// `SELECT` policies, so the body reads the backing table through both and
+/// projects the columns the view projects.
+///
+/// # Errors
+///
+/// Fails as [`rls_read_predicate`] does.
+pub(crate) fn locking_read_rows(
+    table: &CreateTable,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Option<sqlparser::ast::Query>, Error> {
+    let rows = row_security(table, schema, RowStatement::SelectLocking, options)?;
+    let bindings = || PolicyBindings { prefix: None, substitutions: &[], stored: &[] };
+    let gate = |command| rows.gate(command, RowVersion::Existing);
+    let update = match combine_policy_predicates(
+        gate(GatedCommand::Update),
+        bindings(),
+        options,
+        table,
+        schema,
+        emit,
+    )? {
+        PolicyPredicate::AllowAll => return Ok(None),
+        PolicyPredicate::DenyAll => None,
+        PolicyPredicate::Expr(update) => Some(update),
+    };
+    let select = combine_policy_predicates(
+        gate(GatedCommand::Select),
+        bindings(),
+        options,
+        table,
+        schema,
+        emit,
+    )?;
+    let selection = match (select, update) {
+        (PolicyPredicate::DenyAll, _) | (_, None) => {
+            Expr::Value(ValueWithSpan {
+                value: Value::Boolean(false),
+                span: sqlparser::tokenizer::Span::empty(),
+            })
+        }
+        (PolicyPredicate::AllowAll, Some(update)) => *update,
+        (PolicyPredicate::Expr(select), Some(update)) => {
+            Expr::BinaryOp {
+                left: Box::new(Expr::Nested(select)),
+                op: BinaryOperator::And,
+                right: Box::new(Expr::Nested(update)),
+            }
+        }
+    };
+    let grants = RoleTable::acting(table, schema, options)?;
+    Ok(Some(backing_rows(&RlsTriggerContext::new(table, options), &grants, Some(selection))))
 }
 
 /// The view standing for `table` until every relation its policy view and

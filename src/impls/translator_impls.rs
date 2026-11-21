@@ -32,6 +32,7 @@ mod index_column;
 pub(crate) mod insert;
 mod json_value;
 mod lateral;
+pub(crate) mod locking;
 mod nulls_not_distinct;
 pub(crate) mod off_replica;
 mod order_by_expr;
