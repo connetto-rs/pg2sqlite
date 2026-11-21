@@ -120,9 +120,9 @@ fn a_semicolon_inside_the_expression_does_not_end_it() {
 #[test]
 fn a_named_argument_call_refuses_identically_whatever_the_spelling() {
     let outcomes: Vec<String> = [
-        "v := scaled(factor := 2, base := NEW.n)",
-        "v := scaled(factor => 2, base => NEW.n)",
-        "v := scaled(2, NEW.n)",
+        "v := scaled(factor := 2, base := NEW.val)",
+        "v := scaled(factor => 2, base => NEW.val)",
+        "v := scaled(2, NEW.val)",
     ]
     .iter()
     .map(|call| {

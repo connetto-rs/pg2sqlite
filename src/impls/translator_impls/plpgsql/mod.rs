@@ -15,5 +15,6 @@ mod returns;
 mod scope;
 pub(crate) use scope::{TriggerFacts, fold, relations_read};
 mod translator;
-
+mod unresolved;
 pub use translator::PlPgSqlTranslator;
+pub(crate) use unresolved::{body_reach, raising_unresolved, unresolved_aborts};

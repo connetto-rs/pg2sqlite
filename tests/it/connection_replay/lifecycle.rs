@@ -367,49 +367,40 @@ fn unrelated_trigger_events_do_not_refuse_temporary_writes() {
     assert_eq!(mirror::table.load::<(i32, i32)>(&mut connection).expect("persistent rows"), []);
 }
 
+/// A replayed trigger writing into a persistent table renamed after it fails
+/// each run with `42P01`, alone or sharing its slot, as on PostgreSQL 18.
 #[test]
-fn application_writes_can_use_replayed_triggers_targeting_renamed_persistent_tables() {
+fn replayed_triggers_writing_into_a_renamed_persistent_table_fail() {
     diesel::table! {
         archive (id) { id -> Integer, value -> Integer, }
     }
-    let (_files, mut connection) = reopened(
-        "CREATE TEMP TABLE scratch(id INT PRIMARY KEY, value INT NOT NULL);
-         CREATE TABLE mirror(id INT PRIMARY KEY, value INT NOT NULL);
-         CREATE FUNCTION remember() RETURNS trigger AS $$
-         BEGIN INSERT INTO mirror(id,value) VALUES(NEW.id,NEW.value); RETURN NEW; END; $$ LANGUAGE plpgsql;
-         CREATE TRIGGER remember AFTER INSERT ON scratch FOR EACH ROW EXECUTE FUNCTION remember();
-         ALTER TABLE mirror RENAME TO archive;",
-    );
-    diesel::insert_into(scratch::table)
-        .values((scratch::id.eq(1), scratch::value.eq(42)))
-        .execute(&mut connection)
-        .expect("application trigger write");
-    assert_eq!(
-        archive::table.load::<(i32, i32)>(&mut connection).expect("renamed persistent target"),
-        [(1, 42)]
-    );
-}
-
-#[test]
-fn replay_refuses_shared_triggers_whose_target_was_renamed() {
-    let script = script(
-        "CREATE TEMP TABLE scratch(id INT PRIMARY KEY, value INT NOT NULL);
-         CREATE TABLE mirror(id INT PRIMARY KEY, value INT NOT NULL);
-         CREATE FUNCTION remember() RETURNS trigger AS $$
-         BEGIN INSERT INTO mirror(id,value) VALUES(NEW.id,NEW.value); RETURN NEW; END; $$ LANGUAGE plpgsql;
-         CREATE FUNCTION remember_twice() RETURNS trigger AS $$
+    let twice = "CREATE FUNCTION remember_twice() RETURNS trigger AS $$
          BEGIN INSERT INTO mirror(id,value) VALUES(NEW.value,NEW.id); RETURN NEW; END; $$ LANGUAGE plpgsql;
-         CREATE TRIGGER remember AFTER INSERT ON scratch FOR EACH ROW EXECUTE FUNCTION remember();
-         CREATE TRIGGER remember_twice AFTER INSERT ON scratch FOR EACH ROW EXECUTE FUNCTION remember_twice();
-         ALTER TABLE mirror RENAME TO archive;",
-    );
-    let Err(pg2sqlite::prelude::Error::Connection(
-        pg2sqlite::script::ConnectionError::Translation(refusal),
-    )) = script.connect()
-    else {
-        panic!("a merged trigger cannot be retranslated one statement at a time");
-    };
-    assert!(refusal.to_string().contains("shared with other triggers"), "{refusal}");
+         CREATE TRIGGER remember_twice AFTER INSERT ON scratch FOR EACH ROW EXECUTE FUNCTION remember_twice();";
+    for shared in ["", twice] {
+        let (_files, mut connection) = reopened(&format!(
+            "CREATE TEMP TABLE scratch(id INT PRIMARY KEY, value INT NOT NULL);
+             CREATE TABLE mirror(id INT PRIMARY KEY, value INT NOT NULL);
+             CREATE FUNCTION remember() RETURNS trigger AS $$
+             BEGIN INSERT INTO mirror(id,value) VALUES(NEW.id,NEW.value); RETURN NEW; END; $$ LANGUAGE plpgsql;
+             CREATE TRIGGER remember AFTER INSERT ON scratch FOR EACH ROW EXECUTE FUNCTION remember();
+             {shared}
+             ALTER TABLE mirror RENAME TO archive;"
+        ));
+        let inserted = diesel::insert_into(scratch::table)
+            .values((scratch::id.eq(1), scratch::value.eq(42)))
+            .execute(&mut connection);
+        let Err(DatabaseError::DatabaseError(_, information)) = inserted else {
+            panic!("the insert answered {inserted:?}");
+        };
+        let refused = pg2sqlite::prelude::postgres_error(information.message())
+            .unwrap_or_else(|| panic!("{:?} is no replica refusal", information.message()));
+        assert_eq!(
+            (refused.sqlstate(), refused.message()),
+            (sqlstate::pg::UNDEFINED_TABLE, r#"relation "mirror" does not exist"#)
+        );
+        assert_eq!(archive::table.load::<(i32, i32)>(&mut connection).expect("archive"), []);
+    }
 }
 
 #[test]
