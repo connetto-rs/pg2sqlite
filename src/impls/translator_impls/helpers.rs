@@ -43,8 +43,9 @@ impl TranslationDirection for Forward {
 
     fn derived_table_body<'options>(
         options: &'options Self::Options<'_>,
+        item: &sqlparser::ast::TableFactor,
     ) -> Self::Options<'options> {
-        options.derived_table_body()
+        options.derived_table_body(item)
     }
     fn config<'options>(options: &'options Self::Options<'_>) -> &'options Pg2SqliteOptions {
         options

@@ -46,7 +46,6 @@ use crate::{
     },
     options::BoundVariable,
     traits::translator::TranslatorWithContext,
-    warnings::TranslationWarning,
 };
 
 /// Translator for PL/pgSQL trigger function bodies.
@@ -753,15 +752,8 @@ impl PlPgSqlTranslator {
             return Err(refusal("assigns a different number of columns than it names targets"));
         }
 
-        if !query.locks.is_empty() || query.for_clause.is_some() {
-            emit(TranslationWarning::LossyDrop {
-                construct: "FOR UPDATE / FOR SHARE".to_string(),
-                reason: crate::impls::translator_impls::query::ROW_LOCK_REASON.to_string(),
-            });
-        }
-        let unlocked = Query { locks: Vec::new(), for_clause: None, ..query.clone() };
         for (name, column) in targets.iter().cloned().zip(columns) {
-            let mut read = unlocked.clone();
+            let mut read = query.clone();
             if let SetExpr::Select(select) = read.body.as_mut() {
                 select.projection = vec![SelectItem::UnnamedExpr(column.clone())];
             }
@@ -778,7 +770,7 @@ impl PlPgSqlTranslator {
             });
         }
         if scope.tracks_found {
-            let found = Self::found_after(&unlocked, schema);
+            let found = Self::found_after(&query, schema);
             scope.bind(Binding { name: FOUND.to_string(), value: found });
         }
         statements.extend(Self::evaluate_assigned(&targets, scope, schema, options, emit)?);
@@ -788,7 +780,7 @@ impl PlPgSqlTranslator {
     /// What `FOUND` reads after `query` ran for its rows, which is whether it
     /// returned one.
     fn found_after(query: &Query, schema: &ParserDB) -> BoundValue {
-        let probe = Query { locks: Vec::new(), for_clause: None, order_by: None, ..query.clone() };
+        let probe = Query { order_by: None, ..query.clone() };
         if let SetExpr::Select(select) = probe.body.as_ref()
             && select.from.is_empty()
             && select.selection.is_none()

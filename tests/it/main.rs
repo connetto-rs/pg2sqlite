@@ -257,6 +257,7 @@ mod test_rls_inner_scope_bare_col;
 mod test_rls_insert_returning;
 mod test_rls_insert_trigger;
 mod test_rls_keyless_null_identity;
+mod test_rls_locking_read;
 mod test_rls_multiple_policies;
 mod test_rls_null_policy_predicate;
 mod test_rls_numeric_check_guard;

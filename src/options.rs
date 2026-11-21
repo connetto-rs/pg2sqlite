@@ -355,6 +355,14 @@ pub struct TranslationContext<'a> {
     /// The table of the row trigger being translated and the rows its events
     /// give it, which `NEW` and `OLD` read whole.
     trigger_rows: Option<TriggerRows<'a>>,
+    /// The addresses of the `FROM` items of the query being translated that
+    /// a row-locking clause covers, which PostgreSQL filters by the `UPDATE`
+    /// policies as well. Only a node of that query matches one, so a context
+    /// a subquery of an expression inherits matches nothing.
+    locked: &'a [usize],
+    /// Whether the query about to be translated sits in a locked `FROM` item,
+    /// which locks every item of its own `FROM`.
+    locks_whole_query: bool,
 }
 
 /// A `LANGUAGE sql` function whose body is being translated in place of a
@@ -385,6 +393,8 @@ struct ContextFields<'a> {
     running_as: Option<&'a Role>,
     inlined_body: Option<&'a InlinedBody<'a>>,
     trigger_rows: Option<TriggerRows<'a>>,
+    locked: &'a [usize],
+    locks_whole_query: bool,
 }
 
 impl<'a> ContextFields<'a> {
@@ -401,6 +411,8 @@ impl<'a> ContextFields<'a> {
             running_as: context.running_as,
             inlined_body: context.inlined_body,
             trigger_rows: context.trigger_rows,
+            locked: context.locked,
+            locks_whole_query: context.locks_whole_query,
         }
     }
 
@@ -425,6 +437,8 @@ impl<'a> ContextFields<'a> {
             running_as: self.running_as,
             inlined_body: self.inlined_body,
             trigger_rows: self.trigger_rows,
+            locked: self.locked,
+            locks_whole_query: self.locks_whole_query,
         }
     }
 }
@@ -448,6 +462,8 @@ impl<'a> TranslationContext<'a> {
             running_as: None,
             inlined_body: None,
             trigger_rows: None,
+            locked: &[],
+            locks_whole_query: false,
         }
     }
     pub(crate) fn with_complete_schema(options: &'a Pg2SqliteOptions) -> Self {
@@ -472,6 +488,8 @@ impl<'a> TranslationContext<'a> {
             running_as: None,
             inlined_body: None,
             trigger_rows: None,
+            locked: &[],
+            locks_whole_query: false,
         }
     }
 
@@ -550,13 +568,21 @@ impl<'a> TranslationContext<'a> {
     /// holding it and never against that query's own `FROM` items, measured
     /// on 18.6, so the query's level is left out and the levels above it
     /// stay.
-    pub(crate) fn derived_table_body(&self) -> TranslationContext<'_> {
+    ///
+    /// When a row-locking clause covers `item`, the query of that body locks
+    /// every item of its own `FROM`.
+    pub(crate) fn derived_table_body(
+        &self,
+        item: &sqlparser::ast::TableFactor,
+    ) -> TranslationContext<'_> {
         debug_assert!(
             matches!(self.scope, Some(TranslationScope::Query { .. })),
             "a FROM item is translated under the scope of the query holding it"
         );
         let (scope, outer) = self.outer.map_or((None, None), |outer| (outer.scope, outer.outer));
-        ContextFields::borrowed(self).into_context(scope, outer)
+        let mut fields = ContextFields::borrowed(self);
+        fields.locks_whole_query = self.locks(item);
+        fields.into_context(scope, outer)
     }
 
     /// The same context noting `with` as the enclosing query's CTE clause.
@@ -652,6 +678,25 @@ impl<'a> TranslationContext<'a> {
         let mut fields = ContextFields::borrowed(self);
         fields.trigger_rows = Some(rows);
         fields.into_context(self.scope, self.outer)
+    }
+
+    /// The same context translating a query whose locking clauses cover the
+    /// `FROM` items at `locked`.
+    pub(crate) fn with_locked<'s>(&'s self, locked: &'s [usize]) -> TranslationContext<'s> {
+        let mut fields = ContextFields::borrowed(self);
+        fields.locked = locked;
+        fields.locks_whole_query = false;
+        fields.into_context(self.scope, self.outer)
+    }
+
+    /// Whether the query about to be translated sits in a locked `FROM` item.
+    pub(crate) const fn locks_whole_query(&self) -> bool {
+        self.locks_whole_query
+    }
+
+    /// Whether a row-locking clause covers `factor`.
+    pub(crate) fn locks(&self, factor: &sqlparser::ast::TableFactor) -> bool {
+        self.locked.contains(&core::ptr::from_ref(factor).addr())
     }
 
     /// The same context translating the part of a row trigger that fires for

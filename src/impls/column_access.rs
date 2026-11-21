@@ -590,7 +590,9 @@ fn missing_from_entry(table: &str) -> Error {
     postgres(pg::UNDEFINED_TABLE, format!("missing FROM-clause entry for table \"{table}\""))
 }
 
-fn denied(table: &Table) -> Error {
+/// PostgreSQL's refusal of a statement needing a privilege the acting role
+/// lacks on `table`.
+pub(crate) fn denied(table: &Table) -> Error {
     postgres(pg::INSUFFICIENT_PRIVILEGE, permission_denied(table.table_name()))
 }
 

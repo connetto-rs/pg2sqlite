@@ -33,7 +33,10 @@ use crate::{
     errors::Error,
     impls::{
         object_name::{COLUMN_LOOKUP_CASE, last_ident, resolve_translation_table},
-        query_builder::{from_relation, make_query, make_simple_select, plain_table_with_joins},
+        query_builder::{
+            from_relation, make_query, make_simple_select, plain_table_factor,
+            plain_table_with_joins,
+        },
         translator_impls::{
             unused_cte_name,
             uuid::{
@@ -81,11 +84,12 @@ pub(crate) trait TranslationDirection {
         scope: &'scope sql_traits::structs::ColumnScope<'scope, 'scope, ParserDB>,
     ) -> Self::Options<'scope>;
 
-    /// The same options for the body of a derived table that is not
+    /// The same options for the body of a derived table `item` that is not
     /// `LATERAL`, which sees the queries enclosing the one holding it and none
     /// of that query's own `FROM` items.
     fn derived_table_body<'options>(
         options: &'options Self::Options<'_>,
+        item: &TableFactor,
     ) -> Self::Options<'options>;
 
     fn translate_expr(
@@ -5610,6 +5614,17 @@ pub(crate) fn translate_table_factor<D: TranslationDirection>(
                 return Err(Error::reverse_refusal(reason));
             }
 
+            if let Some(context) = D::forward_context(options)
+                && context.locks(table_factor)
+                && let Some(locked) = crate::impls::translator_impls::locking::locked_factor(
+                    table_factor,
+                    schema,
+                    context,
+                    emit,
+                )?
+            {
+                return Ok(locked);
+            }
             // SQLite accepts no column list on a table alias, the same
             // limitation that forces the derived shape in
             // translate_unnest_factor, so the rename happens in a projection
@@ -5617,7 +5632,8 @@ pub(crate) fn translate_table_factor<D: TranslationDirection>(
             if D::IS_FORWARD
                 && let Some(alias) = alias.as_ref().filter(|alias| !alias.columns.is_empty())
             {
-                return renamed_relation_factor::<D>(name, alias, schema, options, emit);
+                let relation = plain_table_factor(D::translate_object_name(name, schema, options)?);
+                return renamed_relation_factor(name, alias, relation, schema);
             }
             TableFactor::Table {
                 name: D::translate_object_name(name, schema, options)?,
@@ -5668,7 +5684,7 @@ pub(crate) fn translate_table_factor<D: TranslationDirection>(
             // Forward translation refuses a LATERAL body that reads a column
             // and SQLite has no LATERAL, so every body here takes the scope of
             // a non-LATERAL one.
-            let body_options = D::derived_table_body(options);
+            let body_options = D::derived_table_body(options, table_factor);
             let body_options = &body_options;
             if D::IS_FORWARD
                 && let Some(alias) = alias.as_ref().filter(|alias| !alias.columns.is_empty())
@@ -5944,7 +5960,7 @@ fn refuse_typed_alias_columns(
 /// outputs differently from PostgreSQL (`count(*)` against `count`). Outputs
 /// past the list keep PostgreSQL's names, and `c` is a name the subquery does
 /// not read, which SQLite would take as a reference to the CTE itself.
-fn renamed_derived_factor<D: TranslationDirection>(
+pub(crate) fn renamed_derived_factor<D: TranslationDirection>(
     subquery: &Query,
     alias: &TableAlias,
     schema: &ParserDB,
@@ -6041,7 +6057,8 @@ fn renamed_derived_factor<D: TranslationDirection>(
     })
 }
 
-/// Rewrites `FROM t AS x (a, b)` into `(SELECT id AS a, s AS b FROM t) AS x`.
+/// Rewrites `FROM t AS x (a, b)` into `(SELECT id AS a, s AS b FROM t) AS x`,
+/// reading `relation` in place of `t`.
 ///
 /// PostgreSQL renames the table's leading columns positionally and keeps the
 /// rest under their declared names, and it refuses a list longer than the
@@ -6050,12 +6067,11 @@ fn renamed_derived_factor<D: TranslationDirection>(
 /// happens in a projection, the shape `translate_unnest_factor` already uses
 /// for the same reason. The declared idents are rebuilt with their quoting so
 /// a quoted column name stays quoted in the projection.
-fn renamed_relation_factor<D: TranslationDirection>(
+pub(crate) fn renamed_relation_factor(
     name: &ObjectName,
     alias: &TableAlias,
+    relation: TableFactor,
     schema: &ParserDB,
-    options: &D::Options<'_>,
-    _emit: crate::warnings::WarningSink<'_>,
 ) -> Result<TableFactor, Error> {
     refuse_typed_alias_columns(name, alias)?;
 
@@ -6104,21 +6120,6 @@ fn renamed_relation_factor<D: TranslationDirection>(
             }
         })
         .collect();
-
-    let relation = TableFactor::Table {
-        name: D::translate_object_name(name, schema, options)?,
-        alias: None,
-        args: None,
-        with_hints: Vec::new(),
-        version: None,
-        with_ordinality: false,
-        partitions: Vec::new(),
-        json_path: None,
-        sample: None,
-        index_directives: Vec::new(),
-        inheritance: None,
-    };
-
     Ok(TableFactor::Derived {
         lateral: false,
         subquery: Box::new(make_query(
@@ -6246,6 +6247,7 @@ mod tests {
 
         fn derived_table_body<'options>(
             options: &'options Self::Options<'_>,
+            _item: &TableFactor,
         ) -> Self::Options<'options> {
             options.clone()
         }
