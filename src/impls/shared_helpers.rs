@@ -350,7 +350,33 @@ pub(crate) fn declared_in_scope<T: PartialEq>(
         &crate::options::TranslationContext<'_>,
     ) -> Result<Option<T>, crate::errors::Error>,
 ) -> Result<Option<T>, crate::errors::Error> {
-    read_scoped_declaration(expr, schema, options, read_column, read_expression, true)
+    read_scoped_declaration(
+        expr,
+        schema,
+        options,
+        read_column,
+        read_expression,
+        true,
+        &equal_values,
+    )
+}
+
+/// [`declared_in_scope`] with the arms of a set operation and the rows of a
+/// `VALUES` list settled by `combine`, where they otherwise settle only on a
+/// value every one of them carries.
+pub(crate) fn combined_in_scope<T>(
+    expr: &Expr,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    read_column: impl Fn(&sqlparser::ast::ColumnDef) -> Option<T>,
+    read_expression: impl Fn(
+        &Expr,
+        &ParserDB,
+        &crate::options::TranslationContext<'_>,
+    ) -> Result<Option<T>, crate::errors::Error>,
+    combine: &impl Fn(Vec<Option<T>>) -> Option<T>,
+) -> Result<Option<T>, crate::errors::Error> {
+    read_scoped_declaration(expr, schema, options, read_column, read_expression, true, combine)
 }
 
 /// Inspects a column declaration without claiming a type for opaque bindings.
@@ -365,10 +391,18 @@ pub(crate) fn inspect_declared_in_scope<T: PartialEq>(
         &crate::options::TranslationContext<'_>,
     ) -> Result<Option<T>, crate::errors::Error>,
 ) -> Result<Option<T>, crate::errors::Error> {
-    read_scoped_declaration(expr, schema, options, read_column, read_expression, false)
+    read_scoped_declaration(
+        expr,
+        schema,
+        options,
+        read_column,
+        read_expression,
+        false,
+        &equal_values,
+    )
 }
 
-fn read_scoped_declaration<T: PartialEq>(
+fn read_scoped_declaration<T>(
     expr: &Expr,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
@@ -379,6 +413,7 @@ fn read_scoped_declaration<T: PartialEq>(
         &crate::options::TranslationContext<'_>,
     ) -> Result<Option<T>, crate::errors::Error>,
     opaque_is_error: bool,
+    combine: &impl Fn(Vec<Option<T>>) -> Option<T>,
 ) -> Result<Option<T>, crate::errors::Error> {
     let reference = strip_nesting(expr);
     let bare_column;
@@ -421,6 +456,7 @@ fn read_scoped_declaration<T: PartialEq>(
             options,
             &read_column,
             &read_expression,
+            combine,
         )? {
             DefinitionValue::Known(value) => Ok(value),
             DefinitionValue::Opaque if !opaque_is_error => Ok(None),
@@ -449,7 +485,7 @@ enum DefinitionValue<T> {
 }
 
 #[cfg_attr(feature = "std", recursive::recursive)]
-fn evaluate_definition<T: PartialEq>(
+fn evaluate_definition<T>(
     definition: &ColumnDefinition<'_, '_, '_, ParserDB>,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
@@ -459,7 +495,11 @@ fn evaluate_definition<T: PartialEq>(
         &ParserDB,
         &crate::options::TranslationContext<'_>,
     ) -> Result<Option<T>, crate::errors::Error>,
+    combine: &impl Fn(Vec<Option<T>>) -> Option<T>,
 ) -> Result<DefinitionValue<T>, crate::errors::Error> {
+    let evaluate = |definition: &ColumnDefinition<'_, '_, '_, ParserDB>| {
+        evaluate_definition(definition, schema, options, read_column, read_expression, combine)
+    };
     match definition {
         ColumnDefinition::Base { column, .. } => {
             Ok(DefinitionValue::Known(read_column(column.attribute())))
@@ -468,39 +508,17 @@ fn evaluate_definition<T: PartialEq>(
             let scoped = options.with_definition_scope(*scope);
             Ok(DefinitionValue::Known(read_expression(expression, schema, &scoped)?))
         }
+        // PostgreSQL settles a set operation on its two arms, a nested one
+        // first, and a VALUES list on all of its rows at once.
         ColumnDefinition::SetOperation { left, right, .. } => {
-            let left = evaluate_definition(
-                &left.definition(),
-                schema,
-                options,
-                read_column,
-                read_expression,
-            )?;
-            let right = evaluate_definition(
-                &right.definition(),
-                schema,
-                options,
-                read_column,
-                read_expression,
-            )?;
-            Ok(agreement(left, right))
+            Ok(combined([evaluate(&left.definition())?, evaluate(&right.definition())?], combine))
         }
         ColumnDefinition::Values { rows } => {
-            let mut agreed = None;
-            for row in rows.iter() {
-                let value = evaluate_definition(
-                    &row.definition(),
-                    schema,
-                    options,
-                    read_column,
-                    read_expression,
-                )?;
-                agreed = Some(match agreed {
-                    Some(agreed) => agreement(agreed, value),
-                    None => value,
-                });
-            }
-            Ok(agreed.unwrap_or(DefinitionValue::Opaque))
+            let rows = rows
+                .iter()
+                .map(|row| evaluate(&row.definition()))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(if rows.is_empty() { DefinitionValue::Opaque } else { combined(rows, combine) })
         }
         ColumnDefinition::ArrayElement { array, scope } => {
             Ok(match element_column(array, *scope, schema, options)? {
@@ -511,9 +529,7 @@ fn evaluate_definition<T: PartialEq>(
         ColumnDefinition::Ordinality => {
             Ok(DefinitionValue::Known(read_column(&ordinality_column())))
         }
-        ColumnDefinition::RecursiveUnion { anchor, .. } => {
-            evaluate_definition(&anchor.definition(), schema, options, read_column, read_expression)
-        }
+        ColumnDefinition::RecursiveUnion { anchor, .. } => evaluate(&anchor.definition()),
         ColumnDefinition::FunctionResult { .. }
         | ColumnDefinition::Parameter { .. }
         | ColumnDefinition::Variable(_)
@@ -522,19 +538,26 @@ fn evaluate_definition<T: PartialEq>(
     }
 }
 
-/// What two definitions PostgreSQL resolves to one type agree on: the value
-/// both carry, nothing where they differ, and opaque where either is.
-fn agreement<T: PartialEq>(
-    left: DefinitionValue<T>,
-    right: DefinitionValue<T>,
+/// What `combine` settles the known `arms` on, opaque where any arm is.
+fn combined<T>(
+    arms: impl IntoIterator<Item = DefinitionValue<T>>,
+    combine: &impl Fn(Vec<Option<T>>) -> Option<T>,
 ) -> DefinitionValue<T> {
-    match (left, right) {
-        (DefinitionValue::Known(left), DefinitionValue::Known(right)) if left == right => {
-            DefinitionValue::Known(left)
+    let mut known = Vec::new();
+    for arm in arms {
+        match arm {
+            DefinitionValue::Known(value) => known.push(value),
+            DefinitionValue::Opaque => return DefinitionValue::Opaque,
         }
-        (DefinitionValue::Opaque, _) | (_, DefinitionValue::Opaque) => DefinitionValue::Opaque,
-        _ => DefinitionValue::Known(None),
     }
+    DefinitionValue::Known(combine(known))
+}
+
+/// The value every one of `values` carries, `None` where two differ.
+fn equal_values<T: PartialEq>(values: Vec<Option<T>>) -> Option<T> {
+    let mut values = values.into_iter();
+    let first = values.next().flatten()?;
+    values.all(|value| value.as_ref() == Some(&first)).then_some(first)
 }
 
 /// The column an element of `array`, the argument `unnest` expands, stands
@@ -693,8 +716,9 @@ pub(crate) fn query_outputs<T>(
 
 /// Reads the first output column of `query`, the value a scalar subquery
 /// answers, or [`None`] when the statement records no scope for it or that
-/// output has no inspectable definition.
-pub(crate) fn first_query_output<T: PartialEq>(
+/// output has no inspectable definition. `combine` settles the arms of a set
+/// operation and the rows of a `VALUES` list, as [`combined_in_scope`] does.
+pub(crate) fn first_query_output<T>(
     query: &Query,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
@@ -704,6 +728,7 @@ pub(crate) fn first_query_output<T: PartialEq>(
         &ParserDB,
         &crate::options::TranslationContext<'_>,
     ) -> Result<Option<T>, Error>,
+    combine: &impl Fn(Vec<Option<T>>) -> Option<T>,
 ) -> Result<Option<T>, Error> {
     with_output_scope(query, schema, options, |scope| {
         let Some(QueryOutput::Column { definition, .. }) =
@@ -711,13 +736,18 @@ pub(crate) fn first_query_output<T: PartialEq>(
         else {
             return Ok(None);
         };
-        Ok(
-            match evaluate_definition(&definition, schema, options, &read_column, &read_expression)?
-            {
-                DefinitionValue::Known(value) => value,
-                DefinitionValue::Opaque => None,
-            },
-        )
+        let value = evaluate_definition(
+            &definition,
+            schema,
+            options,
+            &read_column,
+            &read_expression,
+            combine,
+        )?;
+        Ok(match value {
+            DefinitionValue::Known(value) => value,
+            DefinitionValue::Opaque => None,
+        })
     })
 }
 
@@ -750,7 +780,15 @@ pub(crate) fn scalar_query_declared<T: PartialEq>(
              requires of a scalar subquery with `subquery must return only one column`."
         )));
     };
-    match evaluate_definition(&definition, schema, options, &read_column, &read_expression)? {
+    let value = evaluate_definition(
+        &definition,
+        schema,
+        options,
+        &read_column,
+        &read_expression,
+        &equal_values,
+    )?;
+    match value {
         DefinitionValue::Known(value) => Ok(value),
         DefinitionValue::Opaque => {
             Err(Error::UnresolvedColumnReference {
@@ -6618,6 +6656,7 @@ mod tests {
                 &options,
                 &read_column,
                 &read_expression,
+                &super::equal_values,
             )
             .unwrap()
             {
@@ -6678,6 +6717,7 @@ mod tests {
                 &options,
                 &read_column,
                 &read_expression,
+                &super::equal_values,
             )
             .unwrap()
             {
@@ -6799,6 +6839,7 @@ mod tests {
                 &options,
                 &read_type,
                 &read_no_expression,
+                &super::equal_values,
             )
             .unwrap()
             {
@@ -6864,6 +6905,7 @@ mod tests {
                 &options,
                 &read_column,
                 &read_expression,
+                &super::equal_values,
             )
             .unwrap();
             assert!(matches!(evaluated, super::DefinitionValue::Opaque), "{operand}");
