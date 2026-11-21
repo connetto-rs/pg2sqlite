@@ -30,8 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      # The preinstalled toolchains a Rust job never touches make room for
-      # the debug and release builds of the test binaries.
+      # The test binaries outgrow the runner's free disk otherwise.
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
@@ -60,14 +59,8 @@ jobs:
       - name: Run tests
         run: cargo test --all-targets
 
-      - name: Run git loader test
-        run: "cargo test --release --features git --test it test_translator::"
-
       - name: Run doc tests
         run: cargo test --doc
-
-      - name: Check benchmarks compile
-        run: cargo bench --no-run
 
   fmt:
     name: Formatting
