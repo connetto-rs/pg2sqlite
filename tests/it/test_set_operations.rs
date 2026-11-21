@@ -171,6 +171,51 @@ fn test_union_deduplicates_in_sqlite() -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
+diesel::table! {
+    tags (tag) {
+        tag -> Text,
+    }
+}
+
+diesel::table! {
+    labels (label) {
+        label -> Text,
+    }
+}
+
+/// An arm written as an untyped literal takes the type of the arms beside
+/// it, as PostgreSQL's `select_common_type` settles a set operation's column,
+/// so a cast of that column reads text whichever side the literal is on.
+#[test]
+fn an_untyped_literal_arm_takes_the_type_of_the_arms_beside_it() {
+    for view in [
+        "SELECT s.x::text AS label FROM (SELECT tag FROM tags UNION SELECT 'any') AS s (x)",
+        "SELECT s.x::text AS label FROM (SELECT 'any' UNION SELECT tag FROM tags) AS s (x)",
+        "WITH s (x) AS (SELECT tag FROM tags UNION ALL SELECT 'any') SELECT s.x::text AS label FROM s",
+    ] {
+        let script = Pg2Sqlite::default()
+            .sql(&format!("CREATE TABLE tags (tag TEXT NOT NULL); CREATE VIEW labels AS {view};"))
+            .expect("parse")
+            .translate_to_sql(&Pg2SqliteOptions::default())
+            .unwrap_or_else(|error| panic!("{view}\nshould translate: {error}"));
+        let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
+        for statement in script.into_vec() {
+            diesel::connection::SimpleConnection::batch_execute(&mut connection, &statement)
+                .unwrap_or_else(|error| panic!("{error}\n{statement}"));
+        }
+        diesel::insert_into(tags::table)
+            .values(tags::tag.eq("red"))
+            .execute(&mut connection)
+            .expect("seed tags");
+        let found: Vec<String> = labels::table
+            .select(labels::label)
+            .order(labels::label)
+            .load(&mut connection)
+            .expect("read labels");
+        assert_eq!(found, ["any", "red"], "{view}");
+    }
+}
+
 /// [H5] SQLite has no multiset EXCEPT (EXCEPT ALL): its EXCEPT always
 /// deduplicates. PostgreSQL accepts the ALL quantifier but SQLite refuses
 /// it at parse time. A translation that succeeds but that SQLite then
