@@ -131,6 +131,80 @@ fn an_array_subquery_over_array_rows_is_refused() {
     }
 }
 
+/// Functions a subquery reads in `FROM`, one for each declaration a column of
+/// a function's result takes its type from.
+const FUNCTIONS: &str = "
+CREATE TYPE project_row AS (id TEXT, tags TEXT[]);
+CREATE FUNCTION owned_table() RETURNS TABLE (id TEXT, tags TEXT[])
+LANGUAGE sql STABLE AS $$ SELECT id, tags FROM projects $$;
+CREATE FUNCTION owned_ids() RETURNS SETOF TEXT
+LANGUAGE sql STABLE AS $$ SELECT id FROM projects $$;
+CREATE FUNCTION owned_tags() RETURNS SETOF TEXT[]
+LANGUAGE sql STABLE AS $$ SELECT tags FROM projects $$;
+CREATE FUNCTION owned_rows() RETURNS SETOF projects
+LANGUAGE sql STABLE AS $$ SELECT * FROM projects $$;
+CREATE FUNCTION owned_composites() RETURNS SETOF project_row
+LANGUAGE sql STABLE AS $$ SELECT id, tags FROM projects $$;
+CREATE FUNCTION owned_records() RETURNS SETOF record
+LANGUAGE sql STABLE AS $$ SELECT id, tags FROM projects $$;
+";
+
+/// Each `FROM` item over [`FUNCTIONS`], with its id column and its tags
+/// column, empty for a column the function does not return.
+const FUNCTION_ITEMS: [(&str, &str, &str); 6] = [
+    ("owned_table() s", "s.id", "s.tags"),
+    ("owned_ids() s(id)", "s.id", ""),
+    ("owned_tags() s(tags)", "", "s.tags"),
+    ("owned_rows() s", "s.id", "s.tags"),
+    ("owned_composites() s", "s.id", "s.tags"),
+    ("owned_records() AS s(id TEXT, tags TEXT[])", "s.id", "s.tags"),
+];
+
+fn translate_with_functions(statement: &str) -> Result<Vec<String>, pg2sqlite::errors::Error> {
+    let declared = options().with_user_defined_functions([
+        "owned_table",
+        "owned_ids",
+        "owned_tags",
+        "owned_rows",
+        "owned_composites",
+        "owned_records",
+    ]);
+    helpers::translate_pg(&format!("{SCHEMA}{FUNCTIONS}{statement}"), &declared)
+}
+
+/// A column of a function's result has the type the function declares for
+/// it, so collecting a scalar one is the `IN` over the subquery.
+#[test]
+fn an_array_subquery_over_a_function_result_column_translates_as_in() {
+    for (item, id, _) in FUNCTION_ITEMS.iter().filter(|(_, id, _)| !id.is_empty()) {
+        let subquery = format!("SELECT {id} FROM {item}");
+        let array_form =
+            format!("SELECT id FROM orders WHERE project_id = ANY (ARRAY({subquery}));");
+        let in_form = format!("SELECT id FROM orders WHERE project_id IN ({subquery});");
+        let translated = |statement: &str| {
+            translate_with_functions(statement)
+                .unwrap_or_else(|error| panic!("{statement}\nwas refused: {error}"))
+        };
+        assert_eq!(translated(&array_form), translated(&in_form), "{array_form}");
+    }
+}
+
+/// A function's result column declared as an array stacks into a
+/// multi-dimensional array, as an array column of a table does.
+#[test]
+fn an_array_subquery_over_a_function_result_array_column_is_refused() {
+    for (item, _, tags) in FUNCTION_ITEMS.iter().filter(|(_, _, tags)| !tags.is_empty()) {
+        let statement = format!(
+            "SELECT id FROM orders WHERE project_id = ANY (ARRAY(SELECT {tags} FROM {item}));"
+        );
+        let error = match translate_with_functions(&statement) {
+            Ok(output) => panic!("{statement}\nwas translated: {}", output.join("\n")),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("is the array type"), "{statement}\nrefused otherwise: {error}");
+    }
+}
+
 /// An unresolved output type could be an array, so the translation would be a
 /// guess that answers false where PostgreSQL answers true.
 #[test]

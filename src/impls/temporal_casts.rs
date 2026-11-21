@@ -49,7 +49,7 @@ pub(crate) fn cast_source_kind(
                 expr,
                 schema,
                 options,
-                |column| temporal_literal_kind(&column.data_type),
+                |column| temporal_literal_kind(column.data_type()),
                 cast_source_kind,
             )?
         }

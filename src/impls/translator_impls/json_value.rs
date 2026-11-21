@@ -266,7 +266,7 @@ fn conversion_of(
             expr,
             schema,
             options,
-            |column| Some(conversion_of_type(&column.data_type, schema, options)),
+            |column| Some(conversion_of_type(column.data_type(), schema, options)),
             conversion_of,
         );
     }
@@ -277,7 +277,7 @@ fn conversion_of(
                 query,
                 schema,
                 options,
-                |column| Some(conversion_of_type(&column.data_type, schema, options)),
+                |column| Some(conversion_of_type(column.data_type(), schema, options)),
                 conversion_of,
             );
         }

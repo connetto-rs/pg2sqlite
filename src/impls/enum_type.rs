@@ -597,7 +597,7 @@ pub(crate) fn ordered_compound(
         query,
         schema,
         options,
-        |column| is_enum(&column.data_type, schema).then(|| column.data_type.clone()),
+        |column| is_enum(column.data_type(), schema).then(|| column.data_type().clone()),
         |expr, schema, options| Ok(enum_type_of(expr, schema, options)),
     )?
     else {

@@ -1424,7 +1424,7 @@ pub(crate) fn carries_json(
         expr,
         schema,
         options,
-        |column| is_json_document_type(&column.data_type, options).then_some(()),
+        |column| is_json_document_type(column.data_type(), options).then_some(()),
         |expression, schema, options| Ok(carries_json(expression, schema, options)?.then_some(())),
     )?
     .is_some())
