@@ -52,7 +52,8 @@ use crate::{
 };
 
 /// `statement` with every reference to a file object renamed to the name the
-/// final schema gives the same identity, or `None` when no name changed.
+/// final schema gives the same identity under `names`, or `None` when no name
+/// changed.
 pub(super) fn rebind(
     statement: &Statement,
     position: StatementId,
@@ -60,6 +61,7 @@ pub(super) fn rebind(
     final_schema: &ParserDB,
     replay_homes: Files,
     homes: &Homes,
+    names: Names,
 ) -> Result<Option<Statement>, ConnectionError> {
     let mut planner = Planner {
         epoch,
@@ -67,6 +69,7 @@ pub(super) fn rebind(
         position,
         replay_homes,
         homes,
+        names,
         edits: Edits::default(),
         frames: Vec::new(),
         scopes: RelationScopes::default(),
@@ -79,6 +82,17 @@ pub(super) fn rebind(
     let mut rebound = statement.clone();
     let _: ControlFlow<()> = rebound.visit(&mut planner.edits);
     Ok(Some(rebound))
+}
+
+/// Which engine's view of a rename a rebound statement follows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Names {
+    /// SQLite's, whose rename makes a view's bare outputs follow the renamed
+    /// column. A replay runs this form.
+    Sqlite,
+    /// PostgreSQL's, where every view keeps its output names. The schema a
+    /// replay is checked against takes this form.
+    Postgres,
 }
 
 /// The body of the trigger function `create` executes, renamed like
@@ -193,6 +207,7 @@ impl BodyRebinder<'_> {
             position: self.position,
             replay_homes: self.replay_homes,
             homes: self.homes,
+            names: Names::Sqlite,
             edits: Edits::default(),
             frames: Vec::new(),
             scopes: RelationScopes::default(),
@@ -229,6 +244,7 @@ struct Planner<'a> {
     replay_homes: Files,
     /// The home of each created object, keyed by its SQLite-folded name.
     homes: &'a Homes,
+    names: Names,
     edits: Edits,
     /// The relations each enclosing select lists, innermost last.
     frames: Vec<Vec<Listed>>,
@@ -295,7 +311,13 @@ impl Planner<'_> {
     fn statement(&mut self, statement: &Statement) -> Result<(), ConnectionError> {
         match statement {
             Statement::Query(query) => self.root(query, Header::Follow),
-            Statement::CreateView(create) => self.root(&create.query, Header::Follow),
+            Statement::CreateView(create) => {
+                let header = match self.names {
+                    Names::Sqlite => Header::Follow,
+                    Names::Postgres => Header::Keep,
+                };
+                self.root(&create.query, header)
+            }
             Statement::CreateTable(create) => {
                 match &create.query {
                     Some(query) => self.root(query, Header::Keep),

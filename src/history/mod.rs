@@ -264,8 +264,22 @@ fn replay_unit(
 ) -> Result<(ReplaySchema, Option<Vec<Statement>>), ConnectionError> {
     let replay_homes = schema.homes;
     let replays = schema.replays(unit.source, owned, &placed.homes);
-    let rebound =
-        rebind::rebind(unit.source, id, unit.binding, final_schema, replay_homes, &placed.homes)?;
+    let rebound_as = |names| {
+        rebind::rebind(
+            unit.source,
+            id,
+            unit.binding,
+            final_schema,
+            replay_homes,
+            &placed.homes,
+            names,
+        )
+    };
+    let rebound = rebound_as(rebind::Names::Sqlite)?;
+    // The schema models PostgreSQL, so it takes the statement in PostgreSQL's
+    // names, where a view keeps the output names SQLite's rename moves.
+    let checked = rebound_as(rebind::Names::Postgres)?;
+    let checked = checked.as_ref().unwrap_or(unit.source);
     let body = match unit.source {
         Statement::CreateTrigger(create) => {
             rebind::rebind_trigger_body(
@@ -285,7 +299,7 @@ fn replay_unit(
     };
     let Some(statement) = rebound else {
         if replays {
-            schema = schema.apply(unit.source)?;
+            schema = schema.apply(checked)?;
         }
         return Ok((schema, None));
     };
@@ -313,7 +327,7 @@ fn replay_unit(
     // and every other one against the schema after it.
     let before = Pg2Sqlite::schema_ends_epoch(&statement);
     if replays && !before {
-        schema = schema.apply(&statement)?;
+        schema = schema.apply(checked)?;
     }
     let rebound_context;
     let context = match &body {
@@ -343,7 +357,7 @@ fn replay_unit(
         })?;
     }
     if replays && before {
-        schema = schema.apply(&statement)?;
+        schema = schema.apply(checked)?;
     }
     Ok((schema, Some(statements)))
 }

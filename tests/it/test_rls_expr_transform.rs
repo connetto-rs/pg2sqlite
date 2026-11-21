@@ -138,14 +138,15 @@ fn rls_outer_table_ref_in_function_arg() -> Result<(), Box<dyn std::error::Error
         ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
         CREATE POLICY psel ON docs FOR SELECT USING (true);
         CREATE POLICY pins ON docs FOR INSERT WITH CHECK (
-            EXISTS (SELECT 1 FROM docs WHERE lower(docs.owner) = lower(NEW.owner))
+            EXISTS (SELECT 1 FROM docs d WHERE lower(d.owner) = lower(docs.owner))
         );
     "#;
 
     let output = translate(sql)?;
 
     // The inner reference to docs should be renamed to docs_rls (the inner
-    // table) inside the EXISTS subquery
+    // table) inside the EXISTS subquery, and the outer one kept as the row
+    // checked
     assert!(output.contains("lower("), "lower() function should be preserved, got:\n{output}");
     let _conn = apply_all(sql)?;
 

@@ -17,6 +17,8 @@ pub(super) struct Edits {
     pub(super) renames: BTreeMap<Span, String>,
     pub(super) qualifiers: BTreeMap<Span, Ident>,
     pub(super) aliases: BTreeMap<Span, Ident>,
+    /// The items each wildcard is spelled out as, keyed by the span of its
+    /// `*`.
     pub(super) expansions: BTreeMap<Span, Vec<SelectItem>>,
 }
 
@@ -48,8 +50,20 @@ impl VisitorMut for Edits {
     type Break = ();
 
     fn pre_visit_select(&mut self, select: &mut Select) -> ControlFlow<()> {
-        if let Some(items) = self.expansions.get(&select.select_token.0.span) {
-            select.projection.clone_from(items);
+        if !self.expansions.is_empty() {
+            let projection = core::mem::take(&mut select.projection);
+            for item in projection {
+                let wildcard = match &item {
+                    SelectItem::Wildcard(options) | SelectItem::QualifiedWildcard(_, options) => {
+                        self.expansions.get(&options.wildcard_token.0.span)
+                    }
+                    _ => None,
+                };
+                match wildcard {
+                    Some(items) => select.projection.extend(items.iter().cloned()),
+                    None => select.projection.push(item),
+                }
+            }
         }
         for item in &mut select.projection {
             if let SelectItem::UnnamedExpr(expr) = item
