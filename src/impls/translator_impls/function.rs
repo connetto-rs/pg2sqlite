@@ -1475,16 +1475,18 @@ fn json_set_target_function(
     }
 }
 
-/// Converts PostgreSQL's `text[]` path to the JSONPath string SQLite takes,
-/// so `'{a,b}'` and `ARRAY['a','b']` both become `$."a"."b"`.
+/// The keys of PostgreSQL's `text[]` path, from `'{a,b}'` or `ARRAY['a','b']`.
 ///
 /// The empty path is refused. PostgreSQL answers the document unchanged when
 /// the value is not NULL and NULL when it is.
-fn json_path_from_text_array(path: &Expr, label: &str) -> Result<String, crate::errors::Error> {
+fn json_keys_from_text_array(
+    path: &Expr,
+    label: &str,
+) -> Result<Vec<String>, crate::errors::Error> {
     let elements = crate::impls::translator_impls::expr::text_array_path_elements(path)
         .filter(|elements| !elements.is_empty())
         .ok_or_else(|| json_path_not_literal(label, path))?;
-    crate::impls::translator_impls::expr::json_update_path(label, elements)
+    crate::impls::translator_impls::expr::json_update_keys(label, elements)
 }
 
 fn json_path_not_literal(label: &str, path: &Expr) -> crate::errors::Error {
@@ -2267,6 +2269,10 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                 };
 
                 let sqlite_name = json_set_target_function(insert, exprs.get(3).copied(), label)?;
+                let keys = json_keys_from_text_array(path, label)?;
+                if !crate::impls::replay::is_replayable(target, options) {
+                    return Err(crate::impls::replay::reject_duplicated_operand(label, target));
+                }
                 // The value is `jsonb` in PostgreSQL, so `'2'` means the number
                 // 2. SQLite reads a bare text argument as a string, which would
                 // store `"2"`, so it is wrapped rather than passed along.
@@ -2275,14 +2281,17 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                     vec![value.translate_with_warnings(schema, options, emit)?],
                     None,
                 );
-                Ok(simple_function_expr(
-                    sqlite_name,
-                    vec![
-                        target.translate_with_warnings(schema, options, emit)?,
-                        string_literal(&json_path_from_text_array(path, label)?),
-                        value,
-                    ],
-                    None,
+                Ok(crate::impls::translator_impls::expr::guarded_json_write(
+                    &target.translate_with_warnings(schema, options, emit)?,
+                    &keys,
+                    "cannot set path in scalar",
+                    |document, path| {
+                        simple_function_expr(
+                            sqlite_name,
+                            vec![document, string_literal(&path), value],
+                            None,
+                        )
+                    },
                 ))
             }
             FunctionTranslation::Chr => {
