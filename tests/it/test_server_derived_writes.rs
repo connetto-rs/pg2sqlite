@@ -2262,7 +2262,8 @@ CREATE TRIGGER teams_open_removed AFTER DELETE ON teams
 
 /// Parents whose state each child copies through an `ON UPDATE CASCADE` key,
 /// and a deferred check on the parent reading its children through
-/// `condition`. The acting role `app` may update only `state` and `item`.
+/// `condition`. The acting role `app` may update only `state` and `item`, and
+/// each child stores whether it is `open`.
 fn cascaded_states(condition: &str, extra: &str) -> String {
     format!(
         "
@@ -2274,6 +2275,7 @@ CREATE TABLE children (
     parent_id INT NOT NULL,
     parent_state TEXT NOT NULL,
     item INT,
+    open BOOLEAN GENERATED ALWAYS AS (parent_state = 'open') STORED,
     FOREIGN KEY (parent_id, parent_state) REFERENCES parents (id, state) ON UPDATE CASCADE
 );
 CREATE FUNCTION check_parent() RETURNS TRIGGER LANGUAGE plpgsql AS $$
@@ -2344,9 +2346,16 @@ fn a_check_reading_a_column_a_cascade_changes_is_left_out() {
     let reads = [
         "child.parent_state = 'open'",
         "parent_state = 'open'",
+        "child.open",
         "child IS NOT NULL",
+        "child.* IS NOT NULL",
         "to_jsonb(child.*) IS NOT NULL",
         "EXISTS (SELECT * FROM children other WHERE other.id = child.id)",
+        "EXISTS (SELECT other.* FROM children other JOIN parents p ON p.id = other.parent_id)",
+        "EXISTS (SELECT 1 FROM children other JOIN children another USING (parent_state))",
+        "EXISTS (SELECT 1 FROM (children other JOIN children another USING (parent_state)))",
+        "EXISTS (SELECT 1 FROM children other NATURAL JOIN parents p)",
+        "EXISTS (SELECT 1 FROM children AS renamed (rid) WHERE rid = child.id)",
     ];
     let variants =
         reads.iter().map(|read| cascaded_states(&format!("{EMPTY_CHILD} AND {read}"), "")).chain([
@@ -2355,6 +2364,11 @@ fn a_check_reading_a_column_a_cascade_changes_is_left_out() {
                 EMPTY_CHILD,
                 "ALTER TABLE children ENABLE ROW LEVEL SECURITY;
 CREATE POLICY children_open ON children FOR SELECT TO app USING (parent_state <> 'archived');",
+            ),
+            cascaded_states(
+                EMPTY_CHILD,
+                "ALTER TABLE children ENABLE ROW LEVEL SECURITY;
+CREATE POLICY children_seen ON children FOR SELECT TO app USING (children IS NOT NULL);",
             ),
         ]);
     for pg in variants {
@@ -2381,6 +2395,37 @@ END;
 $$;
 CREATE TRIGGER children_emptied BEFORE UPDATE ON children
     FOR EACH ROW EXECUTE FUNCTION empty_child();",
+    );
+    assert_eq!(
+        left_to_server_acting(&pg),
+        owned(&[
+            ("FOREIGN KEY", "(parent_id, parent_state) REFERENCES parents", "children"),
+            ("TRIGGER", "parents_check", "parents"),
+        ]),
+    );
+}
+
+#[test]
+fn a_check_calling_a_function_without_arguments_keeps_its_refusal() {
+    let pg = cascaded_states(&format!("{EMPTY_CHILD} AND current_user IS NOT NULL"), "");
+    assert_eq!(
+        left_to_server_acting(&pg),
+        owned(&[("FOREIGN KEY", "(parent_id, parent_state) REFERENCES parents", "children")]),
+    );
+}
+
+#[test]
+fn a_parent_trigger_that_assigns_the_row_cascades_every_key_column() {
+    let pg = cascaded_states(
+        EMPTY_CHILD,
+        "CREATE FUNCTION trim_state() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.state := trim(NEW.state);
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER parents_trimmed BEFORE UPDATE ON parents
+    FOR EACH ROW EXECUTE FUNCTION trim_state();",
     );
     assert_eq!(
         left_to_server_acting(&pg),

@@ -10,9 +10,9 @@ use sql_traits::{
     traits::{DatabaseLike, PolicyLike, TableLike, ViewLike},
 };
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, JoinConstraint, JoinOperator,
-    ObjectName, Select, SelectItem, SelectItemQualifiedWildcardKind, Statement, TableFactor,
-    TableWithJoins, Visit, Visitor,
+    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, JoinConstraint, ObjectName, Select,
+    SelectItem, SelectItemQualifiedWildcardKind, Statement, TableFactor, TableWithJoins, Visit,
+    Visitor,
 };
 
 #[cfg(not(feature = "std"))]
@@ -21,6 +21,7 @@ use crate::{
     errors::Error,
     impls::{
         object_name::last_ident,
+        shared_helpers::join_constraint_ref,
         translator_impls::plpgsql::{expand_relation, fold},
     },
 };
@@ -131,10 +132,8 @@ impl Reads<'_> {
 
     /// Reads `column`, folded, of every table, since nothing qualifies it.
     fn unqualified(&mut self, column: &str) {
-        for factor in self.factors {
-            if let Some(read) = self.read.get_mut(&factor.relation) {
-                read.insert(column.to_owned());
-            }
+        for read in self.read.values_mut() {
+            read.insert(column.to_owned());
         }
     }
 
@@ -154,20 +153,16 @@ impl Reads<'_> {
     /// after.
     fn name(&mut self, parts: &[String]) {
         let mut qualified = false;
-        for factor in self.factors {
-            for (position, part) in parts.iter().enumerate() {
-                if !factor.qualified_by(part) {
-                    continue;
-                }
-                qualified = true;
-                match parts.get(position + 1) {
-                    Some(column) => {
-                        if let Some(read) = self.read.get_mut(&factor.relation) {
-                            read.insert(column.clone());
-                        }
+        for (relation, read) in &mut self.read {
+            for factor in self.factors.iter().filter(|factor| &factor.relation == relation) {
+                for (position, part) in parts.iter().enumerate() {
+                    if !factor.qualified_by(part) {
+                        continue;
                     }
-                    None => {
-                        self.read.insert(factor.relation.clone(), Columns::Row);
+                    qualified = true;
+                    match parts.get(position + 1) {
+                        Some(column) => read.insert(column.clone()),
+                        None => *read = Columns::Row,
                     }
                 }
             }
@@ -179,29 +174,7 @@ impl Reads<'_> {
 
     fn joins(&mut self, from: &TableWithJoins) {
         for join in &from.joins {
-            let constraint = match &join.join_operator {
-                JoinOperator::Join(constraint)
-                | JoinOperator::Inner(constraint)
-                | JoinOperator::Left(constraint)
-                | JoinOperator::LeftOuter(constraint)
-                | JoinOperator::Right(constraint)
-                | JoinOperator::RightOuter(constraint)
-                | JoinOperator::FullOuter(constraint)
-                | JoinOperator::CrossJoin(constraint)
-                | JoinOperator::Semi(constraint)
-                | JoinOperator::LeftSemi(constraint)
-                | JoinOperator::RightSemi(constraint)
-                | JoinOperator::Anti(constraint)
-                | JoinOperator::LeftAnti(constraint)
-                | JoinOperator::RightAnti(constraint)
-                | JoinOperator::StraightJoin(constraint)
-                | JoinOperator::AsOf { constraint, .. } => constraint,
-                JoinOperator::CrossApply
-                | JoinOperator::OuterApply
-                | JoinOperator::ArrayJoin
-                | JoinOperator::LeftArrayJoin
-                | JoinOperator::InnerArrayJoin => continue,
-            };
+            let Some(constraint) = join_constraint_ref(&join.join_operator) else { continue };
             match constraint {
                 JoinConstraint::Using(columns) | JoinConstraint::UsingAlias(columns, _) => {
                     for column in columns.iter().filter_map(last_ident) {
@@ -343,7 +316,7 @@ pub(super) fn columns_read<N: Visit>(
                 read: BTreeMap::from([(relation.clone(), Columns::none())]),
             };
             let _: ControlFlow<()> = using.visit(&mut policy_reads);
-            if let Some(policy_columns) = policy_reads.read.remove(relation.as_str()) {
+            for policy_columns in policy_reads.read.into_values() {
                 columns.extend(policy_columns);
             }
         }
