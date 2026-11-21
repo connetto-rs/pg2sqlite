@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
 # A superseding push cancels the run it replaced. main keeps every verdict.
 concurrency:

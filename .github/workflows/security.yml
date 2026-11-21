@@ -12,7 +12,6 @@ on:
       - .cargo/audit.toml
       - .github/workflows/security.yml
   pull_request:
-    branches: [main]
     paths:
       - Cargo.lock
       - "**/Cargo.toml"
