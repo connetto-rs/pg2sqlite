@@ -275,7 +275,7 @@ fn a_view_over_a_column_the_script_drops_is_refused() {
     assert!(
         matches!(
             &*schema_error,
-            sql_traits::errors::Error::ColumnReferenced { table_name, column_name }
+            sql_traits::errors::Error::ColumnReferenced { table_name, column_name, .. }
                 if table_name == "a" && column_name == "id"
         ),
         "{schema_error:?}"

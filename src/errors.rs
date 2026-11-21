@@ -480,7 +480,8 @@ pub enum Error {
 }
 impl Error {
     /// The SQLSTATE and message PostgreSQL refuses the statement with, for
-    /// an [`Error::Postgres`], and `None` for any other error.
+    /// an [`Error::Postgres`] and a schema error sql-traits words as
+    /// PostgreSQL, and `None` for any other error.
     ///
     /// ```
     /// use pg2sqlite::prelude::*;
@@ -503,6 +504,8 @@ impl Error {
             Self::Postgres { sqlstate, message } => {
                 Some(crate::sqlstate::PostgresError::new(*sqlstate, message))
             }
+            Self::SchemaError(error) => error.postgres_error().map(Into::into),
+            Self::LookupError(error) => error.postgres_error().map(Into::into),
             _ => None,
         }
     }

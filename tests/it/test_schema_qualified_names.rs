@@ -175,8 +175,11 @@ fn non_public_schema_qualified_index_target_is_rejected() {
         .translate(&Pg2SqliteOptions::default())
         .expect_err("non-public schema-qualified index target should be rejected");
 
-    let message = err.to_string();
-    assert!(message.contains("users"), "the error must name the index target: {message}");
+    let refused = err.postgres_error().unwrap_or_else(|| panic!("{err:?}"));
+    assert_eq!(
+        (refused.sqlstate(), refused.message()),
+        (sqlstate::pg::INVALID_SCHEMA_NAME, r#"schema "my_custom_app" does not exist"#)
+    );
 }
 
 #[test]

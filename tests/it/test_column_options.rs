@@ -396,9 +396,15 @@ fn a_nocase_column_collation_is_refused() {
         .sql("CREATE TABLE t (id INT PRIMARY KEY, s TEXT COLLATE NOCASE);")
         .expect("parse")
         .translate_to_sql(&Pg2SqliteOptions::default())
-        .expect_err("PostgreSQL has no NOCASE collation")
-        .to_string();
-    assert!(error.contains("NOCASE"), "names the collation: {error}");
+        .expect_err("PostgreSQL has no NOCASE collation");
+    let refused = error.postgres_error().unwrap_or_else(|| panic!("{error:?}"));
+    assert_eq!(
+        (refused.sqlstate(), refused.message()),
+        (
+            sqlstate::pg::UNDEFINED_OBJECT,
+            r#"collation "nocase" for encoding "UTF8" does not exist"#
+        )
+    );
 }
 
 /// PostgreSQL's `C` and `POSIX` are byte order, which is SQLite's BINARY.
