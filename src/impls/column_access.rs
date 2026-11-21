@@ -304,12 +304,7 @@ fn read_names<'c, N: Visit>(
         match resolved {
             Ok(Reference::Column(table, column)) => reads.columns.push((table, column)),
             Ok(Reference::Ambiguous(name)) => {
-                reads.ambiguous.get_or_insert_with(|| {
-                    postgres(
-                        pg::AMBIGUOUS_COLUMN,
-                        format!("column reference \"{name}\" is ambiguous"),
-                    )
-                });
+                reads.ambiguous.get_or_insert_with(|| ambiguous_column(&name));
             }
             Ok(Reference::Other) => {}
             Err(error) => {
@@ -338,6 +333,78 @@ pub(crate) fn with_ambiguity<T>(
     }
 }
 
+/// Refuses a name of the `WHEN` condition of a trigger on `table` that
+/// PostgreSQL refuses, where the row is in reach only as `NEW` and `OLD`,
+/// both carrying every column of `table`.
+///
+/// # Errors
+///
+/// Returns [`Error::Postgres`] for a name reaching no column, a bare column,
+/// which reaches both rows, and a relation other than `NEW` and `OLD`, and the
+/// lookup errors resolution meets.
+pub(crate) fn resolve_trigger_condition(
+    condition: &Expr,
+    table: &Table,
+    schema: &ParserDB,
+) -> Result<(), Error> {
+    let mut failure = None;
+    let _ = visit_expressions(condition, |expression| {
+        let Some(parts) = name_parts(expression) else { return ControlFlow::Continue(()) };
+        match condition_name(parts, table, schema) {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(error) => {
+                failure = Some(error);
+                ControlFlow::Break(())
+            }
+        }
+    });
+    failure.map_or(Ok(()), Err)
+}
+
+/// What PostgreSQL answers for the name `parts` in the `WHEN` condition of a
+/// trigger on `table`.
+fn condition_name(parts: &[Ident], table: &Table, schema: &ParserDB) -> Result<(), Error> {
+    let row = |ident: &Ident| matches!(stored_ident_name(ident).as_ref(), "new" | "old");
+    match parts {
+        [ident] if row(ident) || names_function(ident) => Ok(()),
+        [ident] if declared(table, ident, schema)?.is_some() => {
+            Err(ambiguous_column(&stored_ident_name(ident)))
+        }
+        [ident] => Err(undefined_column(ident)),
+        [qualifier, column] if row(qualifier) => {
+            if declared(table, column, schema)?.is_some() {
+                Ok(())
+            } else {
+                Err(undefined_qualified_column(parts))
+            }
+        }
+        [.., qualifier, _]
+            if row(qualifier) || stored_ident_name(qualifier) == table.table_name() =>
+        {
+            Err(invalid_reference(qualifier))
+        }
+        [.., qualifier, _] => Err(missing_from_entry(&stored_ident_name(qualifier))),
+        [] => Ok(()),
+    }
+}
+
+/// The parts of the name `expression` writes, when it is a name.
+fn name_parts(expression: &Expr) -> Option<&[Ident]> {
+    match expression {
+        Expr::Identifier(ident) => Some(core::slice::from_ref(ident)),
+        Expr::CompoundIdentifier(parts) => Some(parts),
+        _ => None,
+    }
+}
+
+/// Whether the bare name `ident` is a keyword PostgreSQL reads as a function
+/// or as `DEFAULT`, never as a column.
+fn names_function(ident: &Ident) -> bool {
+    ident.quote_style.is_none()
+        && (ident.value.eq_ignore_ascii_case("default")
+            || NAMED_FUNCTIONS.iter().any(|name| ident.value.eq_ignore_ascii_case(name)))
+}
+
 /// What a node of the statement reads.
 enum Reference<'c> {
     /// A stored column the acting role's privileges on its own table decide.
@@ -361,11 +428,7 @@ fn resolve<'c>(
     schema: &ParserDB,
     variables: Option<&Variables<'_>>,
 ) -> Result<Reference<'c>, Error> {
-    let parts = match expression {
-        Expr::Identifier(ident) => core::slice::from_ref(ident),
-        Expr::CompoundIdentifier(parts) => parts.as_slice(),
-        _ => return Ok(Reference::Other),
-    };
+    let Some(parts) = name_parts(expression) else { return Ok(Reference::Other) };
     match context.reference(expression) {
         Ok(Some((ColumnDefinition::Base { table, column, .. }, binding)))
             if relations.binds_directly(&binding, table, schema)? =>
@@ -406,40 +469,17 @@ fn unbound(
         }
     }
     match parts {
-        [ident]
-            if ident.quote_style.is_none()
-                && (ident.value.eq_ignore_ascii_case("default")
-                    || NAMED_FUNCTIONS
-                        .iter()
-                        .any(|name| ident.value.eq_ignore_ascii_case(name))) =>
-        {
-            Ok(())
-        }
+        [ident] if names_function(ident) => Ok(()),
         // A whole-row reference.
         [ident] if relations.exposes(ident) => Ok(()),
         [ident] => Err(undefined_column(ident)),
         [.., qualifier, _] if relations.hidden.contains(&ptr::from_ref(expression).addr()) => {
-            Err(postgres(
-                pg::UNDEFINED_TABLE,
-                format!(
-                    "invalid reference to FROM-clause entry for table \"{}\"",
-                    stored_ident_name(qualifier)
-                ),
-            ))
+            Err(invalid_reference(qualifier))
         }
         [.., qualifier, _] if !relations.exposes(qualifier) => {
-            Err(postgres(
-                pg::UNDEFINED_TABLE,
-                format!("missing FROM-clause entry for table \"{}\"", stored_ident_name(qualifier)),
-            ))
+            Err(missing_from_entry(&stored_ident_name(qualifier)))
         }
-        _ => {
-            let written: Vec<_> = parts.iter().map(stored_ident_name).collect();
-            Err(postgres(
-                pg::UNDEFINED_COLUMN,
-                format!("column {} does not exist", written.join(".")),
-            ))
-        }
+        _ => Err(undefined_qualified_column(parts)),
     }
 }
 
@@ -490,12 +530,7 @@ impl Variables<'_> {
         }
         match parts.len().checked_sub(consumed)? {
             0 | 1 => None,
-            2 => {
-                Some(postgres(
-                    pg::UNDEFINED_TABLE,
-                    format!("missing FROM-clause entry for table \"{}\"", stored[consumed]),
-                ))
-            }
+            2 => Some(missing_from_entry(&stored[consumed])),
             _ => {
                 Some(postgres(
                     pg::FEATURE_NOT_SUPPORTED,
@@ -526,6 +561,33 @@ fn postgres(sqlstate: SqlState, message: String) -> Error {
 
 fn undefined_column(name: &Ident) -> Error {
     postgres(pg::UNDEFINED_COLUMN, format!("column \"{}\" does not exist", stored_ident_name(name)))
+}
+
+fn undefined_qualified_column(parts: &[Ident]) -> Error {
+    let stored: Vec<_> = parts.iter().map(stored_ident_name).collect();
+    postgres(pg::UNDEFINED_COLUMN, format!("column {} does not exist", stored.join(".")))
+}
+
+/// The refusal of `name`, as PostgreSQL stores it, reaching more than one
+/// column.
+fn ambiguous_column(name: &str) -> Error {
+    postgres(pg::AMBIGUOUS_COLUMN, format!("column reference \"{name}\" is ambiguous"))
+}
+
+fn invalid_reference(qualifier: &Ident) -> Error {
+    postgres(
+        pg::UNDEFINED_TABLE,
+        format!(
+            "invalid reference to FROM-clause entry for table \"{}\"",
+            stored_ident_name(qualifier)
+        ),
+    )
+}
+
+/// The refusal of a qualifier `table`, as PostgreSQL stores it, that no
+/// `FROM` entry exposes.
+fn missing_from_entry(table: &str) -> Error {
+    postgres(pg::UNDEFINED_TABLE, format!("missing FROM-clause entry for table \"{table}\""))
 }
 
 fn denied(table: &Table) -> Error {
