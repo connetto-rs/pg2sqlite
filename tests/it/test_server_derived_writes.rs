@@ -15,7 +15,7 @@ use pg2sqlite::{
 use sql_traits::structs::Deployment;
 use sqlstate::{SqlState, pg};
 
-use crate::helpers::establish_connection;
+use crate::{helpers::establish_connection, support::transaction::transaction};
 
 diesel::table! {
     /// The organizations of the reproduction.
@@ -188,11 +188,17 @@ fn replica_options() -> Pg2SqliteOptions {
 
 /// A connection holding the script `pg` translates to under `options`.
 fn replica_with(pg: &str, options: &Pg2SqliteOptions) -> SqliteConnection {
-    let script = Pg2Sqlite::default()
+    replica_committing(pg, options).0
+}
+
+/// [`replica_with`], with the statements the script runs before `COMMIT`.
+fn replica_committing(pg: &str, options: &Pg2SqliteOptions) -> (SqliteConnection, Vec<String>) {
+    let mut script = Pg2Sqlite::default()
         .sql(pg)
         .expect("fixture parses")
         .translate_to_sql(options)
         .expect("fixture translates");
+    let before_commit = core::mem::take(&mut script.before_commit);
     let mut connection = establish_connection();
     // The script is the translator's own output, which no typed query
     // expresses.
@@ -201,7 +207,7 @@ fn replica_with(pg: &str, options: &Pg2SqliteOptions) -> SqliteConnection {
             .batch_execute(&format!("{statement};"))
             .unwrap_or_else(|error| panic!("emitted statement failed: {error}\n{statement}"));
     }
-    connection
+    (connection, before_commit)
 }
 
 fn replica(pg: &str) -> SqliteConnection {
@@ -2311,37 +2317,21 @@ fn a_check_reading_no_column_a_cascade_changes_keeps_its_refusal() {
         left_to_server_acting(&pg),
         owned(&[("FOREIGN KEY", "(parent_id, parent_state) REFERENCES parents", "children")]),
     );
-    let mut script = Pg2Sqlite::default()
-        .sql(&pg)
-        .expect("fixture parses")
-        .translate_to_sql(&acting_options())
-        .expect("fixture translates");
-    let before_commit = core::mem::take(&mut script.before_commit);
-    let mut connection = establish_connection();
-    for statement in script.into_vec() {
-        connection
-            .batch_execute(&format!("{statement};"))
-            .unwrap_or_else(|error| panic!("emitted statement failed: {error}\n{statement}"));
-    }
-    let mut commit = |writes: &str| {
-        connection.batch_execute("BEGIN").expect("begin");
-        let committed = connection.batch_execute(writes).and_then(|()| {
-            before_commit.iter().try_for_each(|statement| connection.batch_execute(statement))?;
-            connection.batch_execute("COMMIT")
-        });
-        if committed.is_err() {
-            connection.batch_execute("ROLLBACK").expect("roll back");
-        }
-        committed
-    };
-    commit(
+    let (mut connection, before_commit) = replica_committing(&pg, &acting_options());
+    transaction(
+        &mut connection,
+        &before_commit,
         "INSERT INTO parents (id, state) VALUES (1, 'open');
          INSERT INTO children (id, parent_id, parent_state, item) VALUES (1, 1, 'open', NULL);",
     )
     .expect("seed");
-    let error = commit("UPDATE parents SET state = 'done' WHERE id = 1;")
-        .expect_err("a parent with an empty child cannot be done")
-        .to_string();
+    let error = transaction(
+        &mut connection,
+        &before_commit,
+        "UPDATE parents SET state = 'done' WHERE id = 1;",
+    )
+    .expect_err("a parent with an empty child cannot be done")
+    .to_string();
     let refused = postgres_error(&error).unwrap_or_else(|| panic!("no refusal: {error}"));
     assert_eq!(
         (refused.sqlstate(), refused.message()),
