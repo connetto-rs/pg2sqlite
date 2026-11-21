@@ -1319,8 +1319,9 @@ pub(crate) fn json_update_keys(
 /// meets a scalar or nothing leaves the document as it was, measured on 18.7.
 /// SQLite's writers raise nothing and create the objects a path is missing,
 /// so each failing shape is a `CASE` branch raising PostgreSQL's message, and
-/// a missing parent of the last key answers the document. `document` is named
-/// once per branch, so the caller checks that it replays.
+/// a missing parent of the last key answers the document, as does the empty
+/// path, which `write` never sees. `document` is named once per branch, so the
+/// caller checks that it replays.
 pub(crate) fn guarded_json_write(
     document: &Expr,
     keys: &[String],
@@ -1366,12 +1367,13 @@ pub(crate) fn guarded_json_write(
             result: document.clone(),
         });
     }
+    let written = if keys.is_empty() { document.clone() } else { write(document.clone(), path) };
     Expr::Case {
         case_token: AttachedToken::empty(),
         end_token: AttachedToken::empty(),
         operand: None,
         conditions,
-        else_result: Some(Box::new(write(document.clone(), path))),
+        else_result: Some(Box::new(written)),
     }
 }
 
@@ -4258,15 +4260,11 @@ fn translate_binary_op(
                     &keys,
                     "cannot delete path in scalar",
                     |document, path| {
-                        if keys.is_empty() {
-                            document
-                        } else {
-                            simple_function_expr(
-                                "json_remove",
-                                vec![document, string_literal(&path)],
-                                None,
-                            )
-                        }
+                        simple_function_expr(
+                            "json_remove",
+                            vec![document, string_literal(&path)],
+                            None,
+                        )
                     },
                 ))
             });
