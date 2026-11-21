@@ -213,6 +213,7 @@ jobs:
           cargo check --lib --no-default-features --features std
           cargo check --lib --features sqlitegis
           cargo check --lib --features arbitrary
+          cargo check --lib --features parity
 
       - name: Check std leaves out libgit2
         shell: bash

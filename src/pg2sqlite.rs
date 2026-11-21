@@ -833,6 +833,12 @@ impl Pg2Sqlite {
         self
     }
 
+    /// The PostgreSQL statements added so far.
+    #[cfg(feature = "parity")]
+    pub(crate) fn statements(&self) -> &[Statement] {
+        &self.pg_statements
+    }
+
     /// Parses `sql` as PostgreSQL and appends the resulting statements.
     ///
     /// # Errors

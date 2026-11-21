@@ -55,8 +55,9 @@ testcontainers-modules = { version = "0.15", features = ["postgres"] }
 testcontainers = { version = "0.27", features = ["blocking"] }
 parking_lot = "0.13.0"
 # The tests register the replica's `jsonb` function and collation through
-# `JsonbFunctions::register`.
-pg2sqlite = { path = ".", features = ["diesel"] }
+# `JsonbFunctions::register`, and replay sql-traits' parity fixtures through
+# `parity::replay`.
+pg2sqlite = { path = ".", features = ["diesel", "parity"] }
 
 # Optional integration gated by the `sqlitegis` feature. Declared in
 # `[dependencies]` (not `[dev-dependencies]`) because Cargo only honors
@@ -109,6 +110,9 @@ arbitrary = ["dep:arbitrary"]
 # `JsonbFunctions::register`, adding the replica's `jsonb` function and
 # collation to a diesel `SqliteConnection`.
 diesel = ["dep:diesel"]
+# `parity::replay`, answering rls-parity's row-level security cases, which
+# sql-traits ships behind `parity-fixtures`, on the SQLite replica.
+parity = ["std", "diesel", "sql-traits/parity-fixtures"]
 
 # Every crate in this graph targets unreleased sqlparser AST, so this patch is
 # not droppable. Against released 0.62.0 the build dies inside `sql-traits`

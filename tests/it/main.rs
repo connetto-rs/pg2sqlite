@@ -167,6 +167,7 @@ mod test_operator_translation_gaps;
 mod test_options_builder;
 mod test_ordered_attached_initialization;
 mod test_param_bind_contract;
+mod test_parity_fixtures;
 mod test_parser_pathology_regressions;
 mod test_per_row_checks;
 mod test_perform_plpgsql_helper;
