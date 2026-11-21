@@ -110,7 +110,9 @@ fn eval_dt_f64(select_list: &str) -> Option<f64> {
 /// with `row` (a raw SQLite INSERT statement). Returns the first column as a
 /// string.
 fn eval_str(row: &str, select_list: &str) -> Option<String> {
-    eval_row::<String>(STR_DDL, row, select_list, "", &Pg2SqliteOptions::default())
+    let options =
+        crate::helpers::case_fold_functions::with_ascii_builtins(Pg2SqliteOptions::default());
+    eval_row::<String>(STR_DDL, row, select_list, "", &options)
 }
 
 /// Like `eval_str` but returns the first column as a 64-bit integer. Used for
@@ -648,25 +650,4 @@ fn upper_ascii_input() {
 fn lower_ascii_input() {
     let row = "INSERT INTO t (id, s) VALUES (1, 'HELLO');";
     assert_eq!(eval_str(row, "lower(s)").as_deref(), Some("hello"));
-}
-
-/// DIVERGENCE: SQLite's upper() only case-folds ASCII letters (U+0041-U+005A).
-///
-/// PostgreSQL upper('straße') with an ICU-enabled locale returns 'STRASSE'
-/// because the German sharp-s (U+00DF) maps to two characters 'SS'. Without ICU
-/// (the default C locale), PostgreSQL also returns 'STRAßE' because 'ß' has no
-/// single-character uppercase mapping. SQLite's built-in upper() always returns
-/// 'STRAßE' because 'ß' is not in the ASCII range.
-///
-/// This test pins the SQLite output. Callers that need full Unicode
-/// case-folding must load an ICU extension rather than relying on the built-in
-/// upper().
-#[test]
-fn upper_non_ascii_sqlite_behavior() {
-    let row = "INSERT INTO t (id, s) VALUES (1, 'straße');";
-    // SQLite folds only the ASCII prefix 's','t','r','a' -> 'S','T','R','A'.
-    // 'ß' (U+00DF) is left unchanged because it is outside the ASCII range.
-    // This matches PostgreSQL without ICU. Callers needing 'STRASSE' must use
-    // ICU.
-    assert_eq!(eval_str(row, "upper(s)").as_deref(), Some("STRAßE"));
 }

@@ -32,7 +32,7 @@ use crate::{
             plain_catalog_function_args, simple_function_expr, single_quoted_literal,
             string_literal,
         },
-        idioms::{delimited_membership, single_character, wrap_with_lower},
+        idioms::{delimited_membership, single_character},
         interval::{ClockShift, IntervalShift, interval_shift, interval_shift_scaled},
         object_name::{
             fts_table_name, last_ident_value_or_display, postgres_catalog_function_name,
@@ -61,11 +61,12 @@ use crate::{
         },
         translator_impls::{
             array::{
-                Quantifier, array_concat, array_overlap, is_json_array_representation,
+                self, Quantifier, array_concat, array_overlap, is_json_array_representation,
                 json_array_call, refuse_blob_element, representation_required,
                 translate_array_literal, translate_array_subscript,
                 translate_quantified_over_array,
             },
+            case_fold,
             data_type::{MAX_NUMERIC_PRECISION, exact_numeric_info, numeric_precision_and_scale},
             definer_helper::helper_membership,
             function::cube_root_closed_form,
@@ -3227,37 +3228,6 @@ fn reject_quantified_pattern_all(
     )))
 }
 
-/// Reports that `ILIKE` folds ASCII only when its pattern cannot be read.
-///
-/// A literal pattern carrying a non-ASCII letter is refused, and a pattern
-/// held in a column or a parameter cannot be inspected at all, so the caller
-/// is told that `lower` folds ASCII only and named the option that replaces
-/// it. Nothing is reported once that option is set, since the fold function
-/// is then the caller's own.
-fn warn_ascii_only_ilike_folding(
-    pattern: &Expr,
-    options: &crate::options::TranslationContext<'_>,
-    emit: crate::warnings::WarningSink<'_>,
-) {
-    if options.get_ilike_fold_function().is_some() {
-        return;
-    }
-    if matches!(pattern, Expr::Value(_) | Expr::Array(_)) {
-        return;
-    }
-    emit(crate::warnings::TranslationWarning::LossyDowngrade {
-        construct: "ILIKE".to_string(),
-        from: "case folding by the database collation".to_string(),
-        to: "lower(), which folds ASCII only".to_string(),
-        location: format!("ILIKE with the pattern {pattern}"),
-        reason: "the pattern is not a literal, so it cannot be read here, and SQLite's lower() \
-                 folds ASCII letters only: a pattern carrying a non-ASCII letter then matches \
-                 nothing where PostgreSQL under a UTF-8 locale matches. Name a Unicode-aware \
-                 folding function with with_ilike_fold_function to fold the whole of Unicode."
-            .to_string(),
-    });
-}
-
 /// `datetime(target, modifier..., 'subsec')` with its trailing fractional zeros
 /// trimmed.
 fn shifted_datetime(target: Expr, modifiers: &[Expr]) -> Expr {
@@ -5168,56 +5138,32 @@ impl TranslateUnfinished for Expr {
                         pattern.translate_with_warnings(schema, options, emit)?;
                     let escape = sqlite_like_escape(lowered_ilike_escape(escape_char.as_deref())?);
                     reject_quantified_pattern_all(pattern, "ILIKE")?;
+                    let fold = case_fold::fold_function(
+                        case_fold::Case::Lower,
+                        self,
+                        &[expr.as_ref(), pattern.as_ref()],
+                        schema,
+                        options,
+                    )?;
+                    let subject = simple_function_expr(fold, vec![translated_expr], None);
                     if *any {
-                        let fold: fn(Expr, &crate::options::TranslationContext<'_>) -> Expr =
-                            |expression, options| {
-                                match options.get_ilike_fold_function() {
-                                    Some(fold_fn) => {
-                                        simple_function_expr(fold_fn, vec![expression], None)
-                                    }
-                                    None => wrap_with_lower(expression),
-                                }
-                            };
-                        warn_ascii_only_ilike_folding(pattern, options, emit);
-                        let subject = fold(translated_expr, options);
-                        let elements = pattern.translate_with_warnings(schema, options, emit)?;
-                        return Ok(crate::impls::translator_impls::array::
-                            pattern_matches_any_element_folded(
-                                subject,
-                                elements,
-                                escape,
-                                *negated,
-                                options.get_ilike_fold_function(),
-                            ));
-                    }
-                    if let Some(fold_fn) = options.get_ilike_fold_function() {
-                        // Use the caller-provided fold function instead of
-                        // lower().
-                        let fold = |e| simple_function_expr(fold_fn, vec![e], None);
-                        return Ok(Expr::Like {
-                            negated: *negated,
-                            any: *any,
-                            expr: Box::new(fold(translated_expr)),
-                            pattern: Box::new(fold(translated_pattern)),
-                            escape_char: escape,
-                        });
-                    }
-                    // No fold function. Refuse a literal pattern with non-ASCII
-                    // alphabetic characters: SQLite lower() is ASCII-only and
-                    // would produce silent wrong results.
-                    warn_ascii_only_ilike_folding(pattern, options, emit);
-                    if has_non_ascii_alpha_literal(pattern) {
-                        return Err(crate::errors::Error::forward_refusal("ILIKE with a pattern containing non-ASCII alphabetic characters \
-                                         cannot translate faithfully because SQLite lower() folds ASCII \
-                                         only. Declare a Unicode-capable fold function via \
-                                         .with_ilike_fold_function() to enable non-ASCII ILIKE."
-                            .to_string()));
+                        return Ok(array::pattern_matches_any_element_folded(
+                            subject,
+                            translated_pattern,
+                            escape,
+                            *negated,
+                            fold,
+                        ));
                     }
                     Ok(Expr::Like {
                         negated: *negated,
-                        any: *any,
-                        expr: Box::new(wrap_with_lower(translated_expr)),
-                        pattern: Box::new(wrap_with_lower(translated_pattern)),
+                        any: false,
+                        expr: Box::new(subject),
+                        pattern: Box::new(simple_function_expr(
+                            fold,
+                            vec![translated_pattern],
+                            None,
+                        )),
                         escape_char: escape,
                     })
                 })?
@@ -5728,21 +5674,6 @@ fn lowered_ilike_escape(
         value: Value::SingleQuotedString(lowered),
         span,
     }))))
-}
-
-/// True when `expr` is a string literal containing at least one character that
-/// is alphabetic but not ASCII. Used to gate the ILIKE refusal: SQLite
-/// `lower()` only folds ASCII, so a non-ASCII alphabetic pattern produces
-/// silent wrong answers.
-fn has_non_ascii_alpha_literal(expr: &Expr) -> bool {
-    let mut e = expr;
-    while let Expr::Nested(inner) = e {
-        e = inner.as_ref();
-    }
-    let Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) = e else {
-        return false;
-    };
-    s.chars().any(|c| c.is_alphabetic() && !c.is_ascii())
 }
 
 /// The escape character a translated `LIKE` carries.

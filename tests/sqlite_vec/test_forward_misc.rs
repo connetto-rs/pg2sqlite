@@ -228,10 +228,10 @@ fn expression_index_with_function() {
         CREATE TABLE users (id INT PRIMARY KEY, name TEXT);
         CREATE INDEX idx_upper ON users ((upper(name)));
     ";
-    let output = translate(sql);
-    // Expression indexes may or may not be supported
-    assert!(output.contains("users"), "Expected table reference: {output}");
-    execute_emitted(sql);
+    let options = helpers::case_fold_functions::with_functions(Pg2SqliteOptions::default());
+    let output = helpers::translate_sql(sql, &options).expect("translates");
+    assert!(output.contains("pg_upper(name)"), "Expected the registered fold: {output}");
+    execute_emitted_with_options(sql, &options);
 }
 
 #[test]

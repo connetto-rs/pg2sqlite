@@ -333,8 +333,7 @@ struct LatestReading {
 /// SELECT alongside a SQLite database holding the emitted schema and a seed.
 fn forward_and_seed(pg_query: &str) -> (String, SqliteConnection) {
     let sql = format!("{READINGS}\n{pg_query}");
-    let (statements, select) =
-        helpers::translate::translate_default_statements_and_first_query(&sql);
+    let (statements, select) = helpers::translate::translate_ascii_statements_and_first_query(&sql);
     let mut connection = helpers::apply_ddl(&statements);
 
     diesel::insert_into(readings::table)

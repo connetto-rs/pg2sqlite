@@ -136,6 +136,54 @@ impl TimeZoneFunctions {
     }
 }
 
+/// The SQLite functions the replica registers to fold case as the server
+/// does, set with
+/// [`with_case_fold_functions`](crate::options::Pg2SqliteOptions::with_case_fold_functions).
+///
+/// PostgreSQL's `lower` and `upper` fold by the `LC_CTYPE` of the text's
+/// collation, which for the database default under a UTF-8 locale such as
+/// `en_US.utf8` covers every cased letter, so `lower('Ä')` answers `ä`.
+/// SQLite's own `lower` and `upper` fold ASCII letters only. `ILIKE` compares
+/// the two sides folded through `lower` under their collation, so it goes
+/// through `lower` here too.
+///
+/// - `lower(text)` answers what the server's `lower` answers for the default
+///   collation, and NULL for NULL.
+/// - `upper(text)` answers what the server's `upper` answers for the default
+///   collation, and NULL for NULL.
+///
+/// Both have to be registered deterministic, since an index, a generated
+/// column or a `CHECK` constraint may call them. A text collated `C` or
+/// `POSIX` folds ASCII only on both engines, so it keeps SQLite's builtins.
+/// A server whose `LC_CTYPE` is `C` folds ASCII only everywhere, and its
+/// replica names SQLite's builtins, `CaseFoldFunctions::new("lower",
+/// "upper")`.
+///
+/// # Example
+/// ```
+/// use pg2sqlite::prelude::*;
+///
+/// let functions = CaseFoldFunctions::new("pg_lower", "pg_upper");
+/// assert_eq!(functions.lower, "pg_lower");
+/// assert_eq!(functions.upper, "pg_upper");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct CaseFoldFunctions {
+    /// The function folding a text to lower case.
+    pub lower: String,
+    /// The function folding a text to upper case.
+    pub upper: String,
+}
+
+impl CaseFoldFunctions {
+    /// Pairs the lower case fold `lower` with the upper case fold `upper`.
+    #[must_use]
+    pub fn new(lower: impl Into<String>, upper: impl Into<String>) -> Self {
+        Self { lower: lower.into(), upper: upper.into() }
+    }
+}
+
 /// The SQLite functions and collation the replica registers for `jsonb`, set
 /// with [`with_jsonb_functions`](crate::options::Pg2SqliteOptions::with_jsonb_functions).
 ///

@@ -9,6 +9,6 @@ pub mod schema;
 pub use schema::Schema;
 pub mod translation_options;
 pub use translation_options::{
-    ArrayRepresentation, JsonbFunctions, SessionVariableMapping, TimeZoneFunctions,
-    UuidRepresentation, UuidVersion,
+    ArrayRepresentation, CaseFoldFunctions, JsonbFunctions, SessionVariableMapping,
+    TimeZoneFunctions, UuidRepresentation, UuidVersion,
 };

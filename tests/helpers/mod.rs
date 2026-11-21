@@ -1,5 +1,6 @@
 //! Shared test helpers for pg2sqlite integration tests.
 
+pub mod case_fold_functions;
 pub mod deployment;
 pub mod emitted_corpus;
 pub mod jsonb_functions;
@@ -275,6 +276,7 @@ pub fn establish_connection() -> SqliteConnection {
     current_app_department_utils::register_impl(&mut connection, current_app_department_impl)
         .expect("Failed to register current_app_department");
     jsonb_functions::register(&mut connection);
+    case_fold_functions::register(&mut connection);
 
     connection
 }
@@ -485,6 +487,7 @@ pub fn apply_with_options(
     let statements = Pg2Sqlite::default().sql(pg)?.translate(options)?.into_vec();
     let mut conn = SqliteConnection::establish(":memory:")?;
     jsonb_functions::register(&mut conn);
+    case_fold_functions::register(&mut conn);
     for statement in &statements {
         // Emitted DDL is not expressible via the typed DSL.
         diesel::sql_query(statement.to_string()).execute(&mut conn)?;
@@ -501,19 +504,24 @@ pub fn apply_default(pg: &str) -> Result<SqliteConnection, Box<dyn std::error::E
 /// Translates `pg` with the `rls_audit` audit table name and returns the
 /// emitted statements joined with newlines.
 pub fn translate_rls_sql(pg: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let options = jsonb_functions::with_functions(Pg2SqliteOptions::default())
-        .with_rls_audit_table_name("rls_audit");
+    let options = case_fold_functions::with_functions(jsonb_functions::with_functions(
+        Pg2SqliteOptions::default(),
+    ))
+    .with_rls_audit_table_name("rls_audit");
     Ok(translate_pg(pg, &options)?.join("\n"))
 }
 
 /// Translates `pg` with the `rls_audit` audit table name and applies every
 /// emitted statement to a fresh in-memory connection.
 pub fn apply_rls_sql(pg: &str) -> Result<SqliteConnection, Box<dyn std::error::Error>> {
-    let options = jsonb_functions::with_functions(Pg2SqliteOptions::default())
-        .with_rls_audit_table_name("rls_audit");
+    let options = case_fold_functions::with_functions(jsonb_functions::with_functions(
+        Pg2SqliteOptions::default(),
+    ))
+    .with_rls_audit_table_name("rls_audit");
     let stmts = translate_pg(pg, &options)?;
     let mut conn = SqliteConnection::establish(":memory:")?;
     jsonb_functions::register(&mut conn);
+    case_fold_functions::register(&mut conn);
     for stmt in &stmts {
         // Emitted DDL is not expressible via the typed DSL.
         diesel::sql_query(stmt.as_str()).execute(&mut conn)?;

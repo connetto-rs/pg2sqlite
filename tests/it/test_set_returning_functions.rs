@@ -36,7 +36,9 @@ const FIXTURE: &str = "CREATE TABLE t (id INT PRIMARY KEY, payload JSONB);
 fn rows(query: &str) -> Vec<Option<String>> {
     run_translated_with(
         &format!("{FIXTURE} {query};"),
-        &crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
+        &crate::helpers::case_fold_functions::with_functions(
+            crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
+        ),
     )
 }
 

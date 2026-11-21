@@ -48,8 +48,9 @@ pub mod prelude {
         script::{FreshFiles, Script},
         sqlstate::{PostgresError, SqlState, postgres_error},
         traits::{
-            ArrayRepresentation, JsonbFunctions, ReverseTranslator, Schema, SessionVariableMapping,
-            TimeZoneFunctions, Translator, TranslatorWithContext, UuidRepresentation, UuidVersion,
+            ArrayRepresentation, CaseFoldFunctions, JsonbFunctions, ReverseTranslator, Schema,
+            SessionVariableMapping, TimeZoneFunctions, Translator, TranslatorWithContext,
+            UuidRepresentation, UuidVersion,
         },
         warnings::{TranslationReport, TranslationWarning, WarningSink},
         write_guard::is_policy_refusal,

@@ -138,7 +138,7 @@ fn assert_distinct_order_parity(source: &str, queries: &[&str]) {
     let mut postgres = postgres_harness::fresh_database();
     let mut sqlite = establish_connection();
     postgres.batch_execute(source).unwrap();
-    let options = Pg2SqliteOptions::default();
+    let options = crate::helpers::case_fold_functions::with_functions(Pg2SqliteOptions::default());
     let statements = Pg2Sqlite::default().sql(source).unwrap().translate(&options).unwrap();
     super::harness::execute_ddl(&mut sqlite, &statements.into_vec());
     let schema = Pg2Sqlite::default().sql(source).unwrap().build_schema().unwrap();

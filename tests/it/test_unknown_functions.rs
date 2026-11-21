@@ -80,8 +80,6 @@ fn sqlite_builtins_still_translate() {
         "ifnull(n, 0)",
         "iif(n > 0, 1, 0)",
         "length(s)",
-        "lower(s)",
-        "upper(s)",
         "ltrim(s)",
         "rtrim(s)",
         "trim(s)",
@@ -184,5 +182,23 @@ fn the_configured_uuid_function_name_translates() {
             Err(error) if error.to_string().contains("no such function: uuid7") => {}
             Err(error) => panic!("SQLite rejected statement: {error}\n{statement}"),
         }
+    }
+}
+
+/// The case fold functions are host-registered too, so naming them declares
+/// them, and a source calling one by name reaches SQLite, which answers it.
+#[test]
+fn the_configured_case_fold_functions_translate() {
+    let jsonb = crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default());
+    let undeclared = translate(&format!("{TABLE} SELECT pg_lower(s) FROM t;"), &jsonb)
+        .expect_err("the names are declared only once the option names them");
+    assert!(undeclared.contains("pg_lower"), "the error should name the function: {undeclared}");
+    let options = crate::helpers::case_fold_functions::with_functions(jsonb);
+    for (call, expected) in [("pg_lower('ÄB')", "äb"), ("pg_upper('äb')", "ÄB")] {
+        let rows = crate::helpers::run_translated::run_translated_with(
+            &format!("{TABLE} SELECT {call};"),
+            &options,
+        );
+        assert_eq!(rows, vec![Some(expected.to_string())], "{call}");
     }
 }

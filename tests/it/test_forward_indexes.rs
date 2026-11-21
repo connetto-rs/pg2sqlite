@@ -175,9 +175,10 @@ fn expression_index() {
         CREATE TABLE users (id INT PRIMARY KEY, name TEXT);
         CREATE INDEX idx_lower_name ON users ((lower(name)));
     ";
-    let output = translate(sql);
-    assert!(output.contains("users"), "Expected output: {output}");
-    execute_translated(sql);
+    let options = helpers::case_fold_functions::with_functions(Pg2SqliteOptions::default());
+    let output = helpers::translate_sql(sql, &options).expect("translates");
+    assert!(output.contains("pg_lower(name)"), "Expected output: {output}");
+    helpers::execute_all(sql, &options);
 }
 
 #[test]
