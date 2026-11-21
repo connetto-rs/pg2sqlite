@@ -2435,3 +2435,46 @@ CREATE TRIGGER parents_trimmed BEFORE UPDATE ON parents
         ]),
     );
 }
+
+#[test]
+fn a_view_updating_the_parent_through_its_own_trigger_cascades_every_key_column() {
+    let pg = cascaded_states(
+        EMPTY_CHILD,
+        "CREATE VIEW parent_rows AS SELECT id, state FROM parents;
+CREATE FUNCTION rekey_parent() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE parents SET id = NEW.id, state = NEW.state WHERE id = OLD.id;
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER parent_rows_rekeyed INSTEAD OF UPDATE ON parent_rows
+    FOR EACH ROW EXECUTE FUNCTION rekey_parent();",
+    );
+    assert_eq!(
+        left_to_server_acting(&pg),
+        owned(&[
+            ("FOREIGN KEY", "(parent_id, parent_state) REFERENCES parents", "children"),
+            ("TRIGGER", "parents_check", "parents"),
+        ]),
+    );
+}
+
+#[test]
+fn a_view_inserting_parents_through_its_own_trigger_keeps_the_refusal() {
+    let pg = cascaded_states(
+        EMPTY_CHILD,
+        "CREATE VIEW parent_rows AS SELECT id, state FROM parents;
+CREATE FUNCTION add_parent() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO parents (id, state) VALUES (NEW.id, NEW.state);
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER parent_rows_added INSTEAD OF UPDATE ON parent_rows
+    FOR EACH ROW EXECUTE FUNCTION add_parent();",
+    );
+    assert_eq!(
+        left_to_server_acting(&pg),
+        owned(&[("FOREIGN KEY", "(parent_id, parent_state) REFERENCES parents", "children")]),
+    );
+}
