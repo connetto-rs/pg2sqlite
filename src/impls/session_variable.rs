@@ -729,6 +729,28 @@ pub(crate) fn stored_value(
     }
 }
 
+/// The SQLite expression answering what the function `mapping` pairs returns
+/// while its setting holds `text`, the setting's canonical PostgreSQL
+/// rendering. One value takes the form the replica stores it in, and a set or
+/// a document stays the text.
+#[cfg(feature = "parity")]
+pub(crate) fn paired_answer(
+    mapping: &SessionVariableMapping,
+    text: &str,
+    options: &Pg2SqliteOptions,
+) -> Result<Expr, Error> {
+    let setting = setting(&mapping.setting, options)?;
+    let text = string_literal(text);
+    match setting.declared.content() {
+        SettingContent::Value(
+            SettingValue::Caller(declared)
+            | SettingValue::Principal { identity: declared, .. }
+            | SettingValue::Scalar(declared),
+        ) => stored_value(&setting.pattern(), declared, text, options),
+        SettingContent::Value(SettingValue::Set { .. }) | SettingContent::Json(_) => Ok(text),
+    }
+}
+
 // ── sets ────────────────────────────────────────────────────────────────────
 
 /// The elements of a set a setting holds, as a SQLite JSON array.
