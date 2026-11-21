@@ -419,6 +419,28 @@ fn an_owner_the_policies_bind_founds_nothing() {
     );
 }
 
+/// Handing the founding function to an owner the policies bind in a later
+/// batch reaches the trigger already installed, which PostgreSQL then runs as
+/// that owner, so the change is refused as it is in one batch.
+#[test]
+fn a_later_owner_change_reaches_the_installed_trigger() {
+    let installed = Pg2Sqlite::default()
+        .sql(&[BOUND_OWNER, &FOUNDED_BY_BYPASSING_OWNER.source()].concat())
+        .expect("parse")
+        .build_schema()
+        .expect("schema");
+    let message = Pg2Sqlite::default()
+        .sql(&FOUNDED_BY_BOUND_OWNER.ownership())
+        .expect("parse")
+        .translate_to_sql_with_schema(&installed, &options())
+        .expect_err("SQLite cannot apply the new owner's policies")
+        .to_string();
+    assert!(
+        message.contains("trigger_bound_owner") && message.contains("organization_grants"),
+        "{message}"
+    );
+}
+
 /// Nina's own grant, which she may delete under the delete policy.
 fn ninas_grant() -> diesel::dsl::Filter<
     schema::organization_grants::table,

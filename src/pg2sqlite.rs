@@ -1,6 +1,6 @@
 //! Submodule defining the main translator struct.
 
-use alloc::borrow::Cow;
+use alloc::{borrow::Cow, collections::BTreeSet};
 #[cfg(feature = "std")]
 use std::path::PathBuf;
 
@@ -9,8 +9,8 @@ use git2::Repository;
 use sql_traits::structs::{AccessResolution, Deployment, ParseOptions, ParserDB, ParserDBIngestor};
 use sqlparser::{
     ast::{
-        AlterTableOperation, CreateIndex, Ident, IndexType, ObjectName, ObjectNamePart, ObjectType,
-        RenameTableNameKind, Statement, Value, ValueWithSpan,
+        AlterTableOperation, CreateIndex, DropTrigger, Ident, IndexType, ObjectName,
+        ObjectNamePart, ObjectType, RenameTableNameKind, Statement, Value, ValueWithSpan,
     },
     dialect::PostgreSqlDialect,
 };
@@ -30,8 +30,11 @@ use crate::{
             deferred_constraint, definer,
             drop_column_rebuild::{LiveAttachments, StatementHistory},
             hidden_referenced_rows, postgis,
+            reentry::MarkerTables,
             rls::generate_rls_audit_table,
             statement::is_data_movement_statement,
+            trigger_follower::TriggerFollower,
+            trigger_slots::{TriggerSlots, folded},
         },
     },
     options::{Pg2SqliteOptions, TranslationContext},
@@ -370,6 +373,24 @@ struct PreparedEpoch {
     bindings: Vec<ColumnChange>,
     /// Snapshots taken before each `DROP INDEX`, which still hold its indexes.
     before_index_drops: Vec<(usize, ParserDB)>,
+    /// Snapshots taken at each `CREATE TRIGGER`, which hold the function it
+    /// runs and the names its body reaches where it fires.
+    trigger_positions: Vec<(usize, ParserDB)>,
+    /// The schemas on either side of each statement a live trigger's
+    /// translation can depend on.
+    events: Vec<EventSnapshots>,
+}
+
+/// The schemas before and after statement `index`.
+struct EventSnapshots {
+    index: usize,
+    before: ParserDB,
+    after: ParserDB,
+}
+
+/// The snapshot of `snapshots` taken at statement `index`.
+fn snapshot_at(snapshots: &[(usize, ParserDB)], index: usize) -> Option<&ParserDB> {
+    snapshots.iter().find(|(position, _)| *position == index).map(|(_, schema)| schema)
 }
 
 /// A statement changing a table's columns, and the schema before it.
@@ -404,13 +425,21 @@ impl PreparedEpoch {
 
     /// The schema statement `index` was written against.
     fn written(&self, index: usize) -> &ParserDB {
-        if let Some((_, schema)) = self.before_index_drops.iter().find(|(drop, _)| *drop == index) {
+        if let Some(schema) = snapshot_at(&self.before_index_drops, index)
+            .or_else(|| snapshot_at(&self.trigger_positions, index))
+        {
             return schema;
         }
         self.bindings
             .iter()
             .find(|change| change.drops && change.index == index)
             .map_or_else(|| self.binding(index), |change| &change.before)
+    }
+
+    /// The schemas on either side of statement `index`, when live triggers can
+    /// depend on it.
+    fn event(&self, index: usize) -> Option<&EventSnapshots> {
+        self.events.iter().find(|event| event.index == index)
     }
 }
 
@@ -486,6 +515,149 @@ type TranslatedUnits = (Vec<Vec<Statement>>, Vec<bool>, Vec<crate::warnings::Tra
 struct PreparedTranslation {
     script: Script,
     warnings: Vec<crate::warnings::TranslationWarning>,
+}
+
+/// Where in the batch a statement is translated.
+#[derive(Clone, Copy)]
+struct Position<'s, 'c> {
+    /// The epoch's schema, which holds the replica's shape.
+    schema: &'s ParserDB,
+    /// The schema the statement was written against.
+    binding: &'s ParserDB,
+    context: &'s TranslationContext<'c>,
+    in_transaction: bool,
+}
+
+/// What the statements translated so far leave live.
+struct Trackers {
+    trigger_slots: TriggerSlots,
+    marker_tables: MarkerTables,
+    attachments: LiveAttachments,
+}
+
+impl Trackers {
+    /// `statement` translated at `at`.
+    fn translate(
+        &self,
+        statement: &Statement,
+        at: Position<'_, '_>,
+        emit: crate::warnings::WarningSink<'_>,
+    ) -> Result<Vec<Statement>, crate::errors::Error> {
+        let written = at.context.with_written_schema(at.binding);
+        let written = written.with_history(StatementHistory {
+            attachments: &self.attachments,
+            in_transaction: at.in_transaction,
+        });
+        let ambiguous = column_access::resolve_columns(statement, at.binding, &written)?;
+        column_access::with_ambiguity(
+            ambiguous,
+            statement.translate_with_warnings(at.schema, &written, emit),
+        )
+    }
+
+    /// Follows `emitted`, `statement`'s translation, and answers whether
+    /// merging slots rewrote it.
+    ///
+    /// `superseded` names SQLite triggers `statement` takes off that `emitted`
+    /// leaves alone.
+    fn follow(
+        &mut self,
+        statement: &Statement,
+        emitted: &mut Vec<Statement>,
+        at: Position<'_, '_>,
+        superseded: &[ObjectName],
+    ) -> Result<bool, crate::errors::Error> {
+        let written = at.context.with_written_schema(at.binding);
+        let written = written.with_history(StatementHistory {
+            attachments: &self.attachments,
+            in_transaction: at.in_transaction,
+        });
+        let rebuilt = self.trigger_slots.apply(statement, emitted, at.schema, &written)?;
+        let named: BTreeSet<String> = emitted
+            .iter()
+            .filter_map(|emitted| {
+                match emitted {
+                    Statement::CreateTrigger(create) => Some(folded(&create.name)),
+                    Statement::DropTrigger(drop) => Some(folded(&drop.trigger_name)),
+                    _ => None,
+                }
+            })
+            .collect();
+        let left: Vec<Statement> = superseded
+            .iter()
+            .filter(|name| !named.contains(&folded(name)))
+            .map(|name| {
+                Statement::DropTrigger(DropTrigger {
+                    if_exists: true,
+                    trigger_name: name.clone(),
+                    table_name: None,
+                    option: None,
+                })
+            })
+            .collect();
+        emitted.extend(left);
+        self.marker_tables.follow(statement, emitted);
+        self.attachments.apply(statement, emitted);
+        Ok(rebuilt)
+    }
+}
+
+/// Translates `statement` at `at`, re-emitting around it each live trigger
+/// whose translation it changes.
+///
+/// `sides` are the positions before and after the statement, present when a
+/// trigger can depend on it, and `initial` is the schema a seeded trigger was
+/// last translated on. Answers the statements and whether retranslating
+/// `statement` alone cannot reproduce them.
+fn translate_followed(
+    statement: &Statement,
+    at: Position<'_, '_>,
+    sides: Option<(Position<'_, '_>, Position<'_, '_>)>,
+    initial: Option<&ParserDB>,
+    trackers: &mut Trackers,
+    follower: &mut TriggerFollower,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<(Vec<Statement>, bool), crate::errors::Error> {
+    let reemissions = match sides {
+        Some((before, after)) if !follower.is_empty() => {
+            let seeded = initial
+                .map_or(before, |initial| Position { schema: initial, binding: initial, ..before });
+            follower.reemissions(
+                statement,
+                before.binding,
+                after.binding,
+                &mut |source, sink| trackers.translate(source, seeded, sink),
+                &mut |source, sink| trackers.translate(source, after, sink),
+            )?
+        }
+        _ => Vec::new(),
+    };
+    let mut emitted = Vec::new();
+    if let Some((before, _)) = sides {
+        for reemission in &reemissions {
+            let mut dropped = trackers.translate(&reemission.drop, before, &mut *emit)?;
+            trackers.follow(&reemission.drop, &mut dropped, before, &reemission.created)?;
+            emitted.append(&mut dropped);
+        }
+    }
+    let mut own = trackers.translate(statement, at, &mut *emit)?;
+    let rendered =
+        if matches!(statement, Statement::CreateTrigger(_)) { own.clone() } else { Vec::new() };
+    let mut rebuilt = trackers.follow(statement, &mut own, at, &[])?;
+    follower.follow(statement, &rendered);
+    emitted.append(&mut own);
+    if let Some((_, after)) = sides {
+        for reemission in reemissions {
+            for warning in reemission.warnings {
+                emit(warning);
+            }
+            let mut created = reemission.rendered;
+            trackers.follow(&reemission.create, &mut created, after, &[])?;
+            emitted.append(&mut created);
+            rebuilt = true;
+        }
+    }
+    Ok((emitted, rebuilt))
 }
 
 impl Pg2Sqlite {
@@ -868,6 +1040,9 @@ impl Pg2Sqlite {
             }
         };
         let mut epochs = Vec::new();
+        let follows_triggers = initial_schema
+            .is_some_and(|schema| schema.triggers().next().is_some())
+            || statements.iter().any(|statement| matches!(statement, Statement::CreateTrigger(_)));
         let mut sources = Cow::Borrowed(statements.as_slice());
         let mut start = 0;
         let schema = loop {
@@ -880,45 +1055,25 @@ impl Pg2Sqlite {
                 .map(|offset| start + offset);
             let end = boundary.map_or(statements.len(), |index| index + 1);
             let schema_end = boundary.unwrap_or(end);
-            let mut bindings = Vec::new();
-            let mut before_index_drops = Vec::new();
-            crate::impls::enum_type::reject_late_added_values(
-                &statements[start..schema_end],
-                || input.snapshot(),
+            let epoch;
+            (input, epoch) = Self::prepare_epoch(
+                statements,
+                &mut sources,
+                (start, schema_end, end),
+                follows_triggers,
+                input,
             )?;
-            for (index, statement) in statements[start..schema_end].iter().enumerate() {
-                if Self::changes_columns(statement) || Self::adds_foreign_key(statement) {
-                    bindings.push(ColumnChange::new(start + index, statement, input.snapshot()));
-                }
-                if matches!(statement, Statement::Drop { object_type: ObjectType::Index, .. }) {
-                    before_index_drops.push((start + index, input.snapshot()));
-                }
-                if !Self::schema_statement_is_ignored(statement) {
-                    let mut applied = statement.clone();
-                    // PostgreSQL names an unnamed index against the catalog as
-                    // it stands.
-                    if let Statement::CreateIndex(create_index) = &mut applied
-                        && create_index.name.is_none()
-                        && let Some(name) = input.create_index_name(create_index)?
-                    {
-                        create_index.name =
-                            Some(ObjectName(vec![ObjectNamePart::Identifier(name)]));
-                        sources.to_mut()[start + index] = applied.clone();
-                    }
-                    input = input.apply_statement(applied)?;
-                }
-            }
-            epochs.push(PreparedEpoch {
-                start,
-                end,
-                schema: input.snapshot(),
-                bindings,
-                before_index_drops,
-            });
+            epochs.push(epoch);
             if let Some(index) = boundary {
+                let event_before = (follows_triggers
+                    && TriggerFollower::is_event(&statements[index]))
+                .then(|| input.snapshot());
                 match input.apply_statement(statements[index].clone()) {
                     Ok(next) => input = next,
                     Err(error) => break Err(error.into()),
+                }
+                if let (Some(before), Some(epoch)) = (event_before, epochs.last_mut()) {
+                    epoch.events.push(EventSnapshots { index, before, after: input.snapshot() });
                 }
             }
             start = end;
@@ -936,6 +1091,99 @@ impl Pg2Sqlite {
         })
     }
 
+    /// The epoch of `statements` from `start` to `end`, whose statements up to
+    /// `schema_end` are applied to `input`, with the snapshots its translation
+    /// reads, and the ingestor after them.
+    fn prepare_epoch(
+        statements: &[Statement],
+        sources: &mut Cow<'_, [Statement]>,
+        (start, schema_end, end): (usize, usize, usize),
+        follows_triggers: bool,
+        mut input: ParserDBIngestor,
+    ) -> Result<(ParserDBIngestor, PreparedEpoch), crate::errors::Error> {
+        let mut bindings = Vec::new();
+        let mut before_index_drops = Vec::new();
+        let mut trigger_positions = Vec::new();
+        let mut events = Vec::new();
+        crate::impls::enum_type::reject_late_added_values(&statements[start..schema_end], || {
+            input.snapshot()
+        })?;
+        for (index, statement) in statements[start..schema_end].iter().enumerate() {
+            if Self::changes_columns(statement) || Self::adds_foreign_key(statement) {
+                bindings.push(ColumnChange::new(start + index, statement, input.snapshot()));
+            }
+            if matches!(statement, Statement::Drop { object_type: ObjectType::Index, .. }) {
+                before_index_drops.push((start + index, input.snapshot()));
+            }
+            if matches!(statement, Statement::CreateTrigger(_)) {
+                trigger_positions.push((start + index, input.snapshot()));
+            }
+            let event_before = (follows_triggers && TriggerFollower::is_event(statement))
+                .then(|| input.snapshot());
+            if !Self::schema_statement_is_ignored(statement) {
+                let mut applied = statement.clone();
+                // PostgreSQL names an unnamed index against the catalog as
+                // it stands.
+                if let Statement::CreateIndex(create_index) = &mut applied
+                    && create_index.name.is_none()
+                    && let Some(name) = input.create_index_name(create_index)?
+                {
+                    create_index.name = Some(ObjectName(vec![ObjectNamePart::Identifier(name)]));
+                    sources.to_mut()[start + index] = applied.clone();
+                }
+                input = input.apply_statement(applied)?;
+            }
+            if let Some(before) = event_before {
+                events.push(EventSnapshots {
+                    index: start + index,
+                    before,
+                    after: input.snapshot(),
+                });
+            }
+        }
+        let schema = input.snapshot();
+        let epoch = PreparedEpoch {
+            start,
+            end,
+            schema,
+            bindings,
+            before_index_drops,
+            trigger_positions,
+            events,
+        };
+        Ok((input, epoch))
+    }
+}
+
+/// The positions before and after `statement`, at `index` of epoch
+/// `epoch_index`, when it is an event a trigger can depend on, `at` being the
+/// statement's own position.
+fn event_sides<'s, 'c>(
+    statement: &Statement,
+    epochs: &'s [PreparedEpoch],
+    (epoch_index, index): (usize, usize),
+    final_schema: Option<&'s ParserDB>,
+    at: Position<'s, 'c>,
+) -> Option<(Position<'s, 'c>, Position<'s, 'c>)> {
+    let epoch = &epochs[epoch_index];
+    let event = epoch.event(index)?;
+    // An epoch-ending statement leaves the next epoch's shape.
+    let shape = if Pg2Sqlite::schema_ends_epoch(statement) {
+        epochs
+            .get(epoch_index + 1)
+            .map(|next| &next.schema)
+            .or(final_schema)
+            .unwrap_or(&event.after)
+    } else {
+        &epoch.schema
+    };
+    Some((
+        Position { binding: &event.before, ..at },
+        Position { schema: shape, binding: &event.after, ..at },
+    ))
+}
+
+impl Pg2Sqlite {
     fn translate_prepared<'a>(
         prepared: PreparedSchema<'a>,
         context: &mut TranslationContext<'_>,
@@ -962,7 +1210,7 @@ impl Pg2Sqlite {
             statements,
             &epochs,
             &dispositions,
-            initial_schema.as_ref(),
+            (initial_schema.as_ref(), schema.as_ref().ok()),
             context,
             should_translate,
         )?;
@@ -999,28 +1247,30 @@ impl Pg2Sqlite {
         })
     }
 
-    /// Translates each statement of `statements` in order, answering its
-    /// emitted statements, whether its triggers were rebuilt from others
-    /// sharing their slots, and the warnings the translation raised.
+    /// Translates each statement of `statements` in order, between the
+    /// `(initial, final)` schemas, answering its emitted statements, whether
+    /// its triggers were rebuilt from others sharing their slots, and the
+    /// warnings the translation raised.
     fn translate_units(
         statements: &[Statement],
         epochs: &[PreparedEpoch],
         dispositions: &[Disposition],
-        initial_schema: Option<&ParserDB>,
+        (initial_schema, final_schema): (Option<&ParserDB>, Option<&ParserDB>),
         context: &mut TranslationContext<'_>,
         mut should_translate: impl FnMut(&Statement) -> bool,
     ) -> Result<TranslatedUnits, crate::errors::Error> {
-        let mut trigger_slots =
-            crate::impls::translator_impls::trigger_slots::TriggerSlots::seeded(initial_schema)?;
-        let mut marker_tables =
-            crate::impls::translator_impls::reentry::MarkerTables::seeded(initial_schema)?;
-        let mut attachments = LiveAttachments::seeded(initial_schema, context)?;
+        let mut trackers = Trackers {
+            trigger_slots: TriggerSlots::seeded(initial_schema)?,
+            marker_tables: MarkerTables::seeded(initial_schema)?,
+            attachments: LiveAttachments::seeded(initial_schema, context)?,
+        };
+        let mut follower = TriggerFollower::seeded(initial_schema);
         let outline = crate::history::transactions::Outline::new(statements, dispositions);
 
         let mut warnings = Vec::new();
         let mut translated = Vec::with_capacity(statements.len());
         let mut rebuilt_triggers = Vec::with_capacity(statements.len());
-        for epoch in epochs {
+        for (epoch_index, epoch) in epochs.iter().enumerate() {
             populate_spatial_index_catalog(
                 &statements[epoch.start..epoch.end],
                 &epoch.schema,
@@ -1044,28 +1294,24 @@ impl Pg2Sqlite {
                     }
                     Disposition::Translate => {
                         let index = epoch.start + offset;
-                        let written = context.with_written_schema(epoch.written(index));
-                        let written = written.with_history(StatementHistory {
-                            attachments: &attachments,
+                        let at = Position {
+                            schema: &epoch.schema,
+                            binding: epoch.written(index),
+                            context: &*context,
                             in_transaction: outline.in_transaction(index),
-                        });
-                        let ambiguous = column_access::resolve_columns(
+                        };
+                        let sides =
+                            event_sides(statement, epochs, (epoch_index, index), final_schema, at);
+                        let (emitted, rebuilt) = translate_followed(
                             statement,
-                            epoch.written(index),
-                            &written,
+                            at,
+                            sides,
+                            initial_schema,
+                            &mut trackers,
+                            &mut follower,
+                            &mut emit,
                         )?;
-                        let mut emitted = column_access::with_ambiguity(
-                            ambiguous,
-                            statement.translate_with_warnings(&epoch.schema, &written, &mut emit),
-                        )?;
-                        rebuilt_triggers[index] = trigger_slots.apply(
-                            statement,
-                            &mut emitted,
-                            &epoch.schema,
-                            &written,
-                        )?;
-                        marker_tables.follow(statement, &mut emitted);
-                        attachments.apply(statement, &emitted);
+                        rebuilt_triggers[index] = rebuilt;
                         translated.push(emitted);
                     }
                 }

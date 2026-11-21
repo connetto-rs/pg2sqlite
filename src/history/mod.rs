@@ -264,6 +264,11 @@ fn replay_unit(
 ) -> Result<(ReplaySchema, Option<Vec<Statement>>), ConnectionError> {
     let replay_homes = schema.homes;
     let replays = schema.replays(unit.source, owned, &placed.homes);
+    // Triggers a statement that does not replay rebuilt keep their emitted,
+    // resolved form.
+    if unit.rebuilt_trigger && !replays {
+        return Ok((schema, None));
+    }
     let rebound_as = |names| {
         rebind::rebind(
             unit.source,
@@ -280,23 +285,6 @@ fn replay_unit(
     // names, where a view keeps the output names SQLite's rename moves.
     let checked = rebound_as(rebind::Names::Postgres)?;
     let checked = checked.as_ref().unwrap_or(unit.source);
-    let body = match unit.source {
-        Statement::CreateTrigger(create) => {
-            rebind::rebind_trigger_body(
-                create,
-                id,
-                unit.binding,
-                final_schema,
-                replay_homes,
-                &placed.homes,
-            )?
-        }
-        _ => None,
-    };
-    let rebound = match (rebound, &body) {
-        (None, Some(_)) => Some(unit.source.clone()),
-        (rebound, _) => rebound,
-    };
     let Some(statement) = rebound else {
         if replays {
             schema = schema.apply(checked)?;
@@ -329,14 +317,6 @@ fn replay_unit(
     if replays && !before {
         schema = schema.apply(checked)?;
     }
-    let rebound_context;
-    let context = match &body {
-        Some(body) => {
-            rebound_context = context.with_rebound_body(body);
-            &rebound_context
-        }
-        None => context,
-    };
     let index = id.index();
     let mut statements =
         match statement.translate_with_warnings(&schema.snapshot(), context, &mut |_| {}) {
