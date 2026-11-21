@@ -1075,8 +1075,9 @@ fn a_column_foreign_key_over_an_interval_column_is_refused() {
 #[test]
 fn a_foreign_key_to_an_interval_column_is_refused() {
     refused(
-        "CREATE TABLE fk_p5 (iv interval, PRIMARY KEY (iv));
-         CREATE TABLE fk_c5 (id int, FOREIGN KEY (id) REFERENCES fk_p5 (iv));",
+        "CREATE DOMAIN span AS interval;
+         CREATE TABLE fk_p5 (iv interval, PRIMARY KEY (iv));
+         CREATE TABLE fk_c5 (id span, FOREIGN KEY (id) REFERENCES fk_p5 (iv));",
         "stored values",
     );
 }
@@ -1895,7 +1896,7 @@ fn a_union_chain_with_the_interval_column_first_is_refused() {
 fn a_foreign_key_referencing_an_interval_column_is_refused() {
     refused(
         "CREATE TABLE u7 (id int, iv interval UNIQUE);
-         CREATE TABLE q6 (f int, FOREIGN KEY (f) REFERENCES u7 (iv))",
+         CREATE TABLE q6 (f interval, FOREIGN KEY (f) REFERENCES u7 (iv))",
         "a foreign key over interval columns",
     );
 }

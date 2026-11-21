@@ -220,10 +220,10 @@ fn using_btree_is_dropped() {
 }
 
 #[test]
-fn gin_index_non_tsvector_causes_error() {
+fn gin_index_without_to_tsvector_causes_error() {
     let sql = "
-        CREATE TABLE documents (id SERIAL PRIMARY KEY, content TEXT);
-        CREATE INDEX idx_content ON documents USING GIN (content);
+        CREATE TABLE documents (id SERIAL PRIMARY KEY, search TSVECTOR);
+        CREATE INDEX idx_search ON documents USING GIN (search);
     ";
     let result = translate_result(sql);
     assert!(result.is_err());
@@ -232,10 +232,10 @@ fn gin_index_non_tsvector_causes_error() {
 }
 
 #[test]
-fn gist_index_non_tsvector_causes_error() {
+fn gist_index_without_to_tsvector_causes_error() {
     let sql = "
-        CREATE TABLE locations (id SERIAL PRIMARY KEY, point TEXT);
-        CREATE INDEX idx_point ON locations USING GiST (point);
+        CREATE TABLE articles (id SERIAL PRIMARY KEY, search TSVECTOR);
+        CREATE INDEX idx_search ON articles USING GiST (search);
     ";
     let result = translate_result(sql);
     assert!(result.is_err());
