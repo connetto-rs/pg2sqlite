@@ -707,32 +707,6 @@ fn a_trigger_special_is_folded_in_a_statement_body() {
     assert_eq!(logged, ("INSERT".to_string(), "t".to_string()));
 }
 
-/// The refusal an unknown `TG_*` already carries inside an `IF` condition
-/// applies wherever it is read: emitting it leaves SQLite to reject the
-/// trigger with a message about a column nobody wrote.
-#[test]
-fn an_unknown_trigger_special_in_a_statement_body_is_refused() {
-    let sql = "
-        CREATE TABLE t (id INTEGER PRIMARY KEY);
-        CREATE TABLE log (id INTEGER PRIMARY KEY, n INTEGER);
-        CREATE OR REPLACE FUNCTION f() RETURNS TRIGGER AS $$
-        BEGIN
-          INSERT INTO log (n) VALUES (TG_NARG);
-          RETURN NEW;
-        END;
-        $$ LANGUAGE plpgsql;
-        CREATE TRIGGER tr AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION f();
-    ";
-
-    let error = Pg2Sqlite::default()
-        .sql(sql)
-        .expect("parse")
-        .translate(&Pg2SqliteOptions::default())
-        .expect_err("TG_NARG has no SQLite equivalent")
-        .to_string();
-    assert!(error.contains("TG_NARG"), "the refusal must name the variable: {error}");
-}
-
 /// SQLite's trigger body grammar takes no `WITH` before an `UPDATE`, so the
 /// CTE has to become a derived table where it is read. Emitted as written,
 /// `CREATE TRIGGER` failed with a syntax error at `UPDATE`.

@@ -11,7 +11,7 @@ use sqlparser::{
 };
 
 use super::{
-    Header, Planner,
+    Header, Names, Planner,
     edits::{last_span, quoted},
     scope::last,
 };
@@ -171,7 +171,7 @@ impl Planner<'_> {
                 }
                 SelectItem::QualifiedWildcard(
                     sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(name),
-                    _,
+                    options,
                 ) => {
                     if let Some(ident) = last(name)
                         && let Some(entry) = self.listed(&ident.value)
@@ -182,12 +182,12 @@ impl Planner<'_> {
                         self.edits.rename(ident.span, replay_name);
                     }
                     if header == Header::Keep {
-                        self.expand(select, Some(name));
+                        self.expand(select, Some(name), options.wildcard_token.0.span);
                     }
                 }
-                SelectItem::Wildcard(_) => {
+                SelectItem::Wildcard(options) => {
                     if header == Header::Keep {
-                        self.expand(select, None);
+                        self.expand(select, None, options.wildcard_token.0.span);
                     }
                 }
                 SelectItem::QualifiedWildcard(..) => {}
@@ -341,10 +341,16 @@ impl Planner<'_> {
     }
 
     /// Spells out a wildcard whose columns a replay would name differently,
-    /// so a table created from the query keeps its column names. A wildcard
-    /// over a relation without enumerable columns, or over an outer join that
-    /// merges columns, is left as written.
-    pub(super) fn expand(&mut self, select: &Select, qualifier: Option<&ObjectName>) {
+    /// so a table created from the query keeps its column names, `wildcard`
+    /// being the span of its `*`. A wildcard over a relation without
+    /// enumerable columns, or over an outer join that merges columns, is left
+    /// as written, and so is a qualified one under SQLite.
+    pub(super) fn expand(
+        &mut self,
+        select: &Select,
+        qualifier: Option<&ObjectName>,
+        wildcard: Span,
+    ) {
         let Some(frame) = self.frames.last() else { return };
         let mut items = Vec::new();
         let mut renamed = false;
@@ -388,8 +394,8 @@ impl Planner<'_> {
                 }
             }
         }
-        if renamed && qualifier.is_none() {
-            self.edits.expansions.insert(select.select_token.0.span, items);
+        if renamed && (qualifier.is_none() || self.names == Names::Postgres) {
+            self.edits.expansions.insert(wildcard, items);
         }
     }
 }
