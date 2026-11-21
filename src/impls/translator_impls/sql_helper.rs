@@ -1104,18 +1104,16 @@ fn wildcard_qualifiers(
         )
     };
     if table.joins.iter().any(|join| {
+        let (JoinOperator::Join(constraint)
+        | JoinOperator::Inner(constraint)
+        | JoinOperator::Left(constraint)
+        | JoinOperator::LeftOuter(constraint)) = &join.join_operator
+        else {
+            return false;
+        };
         matches!(
-            &join.join_operator,
-            JoinOperator::Join(constraint)
-                | JoinOperator::Inner(constraint)
-                | JoinOperator::Left(constraint)
-                | JoinOperator::LeftOuter(constraint)
-                if matches!(
-                    constraint,
-                    JoinConstraint::Using(_)
-                        | JoinConstraint::UsingAlias(..)
-                        | JoinConstraint::Natural
-                )
+            constraint,
+            JoinConstraint::Using(_) | JoinConstraint::UsingAlias(..) | JoinConstraint::Natural
         )
     }) {
         return Err(unnamed());
@@ -1505,32 +1503,30 @@ fn returned_row_types<'f>(
     helper: &'f CreateFunction,
     schema: &ParserDB,
 ) -> Result<Vec<&'f DataType>, Error> {
-    match &helper.return_type {
-        Some(FunctionReturnType::DataType(DataType::Table(Some(columns)))) => {
-            Ok(columns.iter().map(|column| &column.data_type).collect())
+    if let Some(FunctionReturnType::DataType(DataType::Table(Some(columns)))) = &helper.return_type
+    {
+        return Ok(columns.iter().map(|column| &column.data_type).collect());
+    }
+    if let Some(FunctionReturnType::SetOf(element)) = &helper.return_type
+        && !is_pseudo_type(element)
+        && !is_row_type(element, schema)?
+    {
+        return Ok(vec![element]);
+    }
+    Err(refusal(
+        name,
+        "returns rows whose columns its declaration does not name, as SETOF a table or a \
+         pseudo-type does. Declare them with RETURNS TABLE (...)",
+    ))
+}
+
+/// Whether `data_type` names a table, whose rows it types.
+fn is_row_type(data_type: &DataType, schema: &ParserDB) -> Result<bool, Error> {
+    match data_type {
+        DataType::Custom(type_name, _) => {
+            Ok(resolve_translation_table(schema, type_name)?.is_some())
         }
-        Some(FunctionReturnType::SetOf(element)) => {
-            let row = match element {
-                DataType::Custom(type_name, _) => {
-                    resolve_translation_table(schema, type_name)?.is_some()
-                }
-                _ => false,
-            };
-            if row || is_pseudo_type(element) {
-                return Err(refusal(
-                    name,
-                    &format!(
-                        "returns SETOF {element}, whose columns its declaration does not name. \
-                         Declare them with RETURNS TABLE (...)"
-                    ),
-                ));
-            }
-            Ok(vec![element])
-        }
-        Some(FunctionReturnType::DataType(returned)) => {
-            Err(refusal(name, &format!("returns {returned}, which is no set of rows")))
-        }
-        None => Err(refusal(name, "declares no return type")),
+        _ => Ok(false),
     }
 }
 
