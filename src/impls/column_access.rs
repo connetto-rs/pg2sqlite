@@ -1,22 +1,27 @@
-//! Resolves the columns a statement of the acting role names before SQLite,
-//! which reads a double-quoted name no column in scope holds as a string,
-//! sees it.
+//! Resolves the columns a statement of the acting role, or a statement or
+//! expression of a PL/pgSQL body, names before SQLite, which reads a
+//! double-quoted name no column in scope holds as a string, sees it.
 
+use alloc::borrow::Cow;
 use core::{ops::ControlFlow, ptr};
 
 use sql_traits::{
     errors::LookupError,
     structs::{
         ColumnBinding, ColumnDefinition, ExpressionContext, ExpressionScope, IdentifierCase,
-        ParserDB,
+        ParserDB, TargetName,
     },
     traits::{ColumnLike, DatabaseLike, TableLike},
-    utils::identifier_resolution::identifiers_match,
+    utils::identifier_resolution::{identifiers_match, stored_identifier},
 };
 use sqlparser::ast::{
     Assignment, AssignmentTarget, ConflictTarget, Expr, FunctionArg, FunctionArguments, Ident,
-    Insert, OnConflictAction, OnInsert, Select, Statement, TableAlias, TableFactor, TableObject,
-    TableWithJoins, Visit, Visitor, visit_expressions,
+    Insert, ObjectName, ObjectNamePart, OnConflictAction, OnInsert, Select, Statement, TableAlias,
+    TableFactor, TableObject, TableWithJoins, Visit, Visitor, visit_expressions,
+};
+use sqlparser_plpgsql::{
+    embedded,
+    namespace::{NameKind, Namespace, Sql, TriggerVariable},
 };
 use sqlstate::{SqlState, pg};
 
@@ -27,6 +32,7 @@ use crate::{
     impls::{
         object_name::{last_ident, resolve_translation_table},
         privileges::RoleTable,
+        scoped_relations::relation_occurrences,
         translator_impls::{
             insert::row_width,
             off_replica::{self, OffReplica},
@@ -36,7 +42,7 @@ use crate::{
     write_guard::permission_denied,
 };
 
-type Table = <ParserDB as DatabaseLike>::Table;
+pub(crate) type Table = <ParserDB as DatabaseLike>::Table;
 
 /// SQL keywords PostgreSQL reads as functions, which the parser hands over as
 /// bare names.
@@ -80,43 +86,13 @@ pub(crate) fn resolve_columns(
     )?;
     let relations = Relations::of(statement);
     let arbiter = Arbiter::of(statement, schema)?;
-    let mut read = Vec::new();
-    let mut ambiguous = None;
-    let mut failure = None;
-    let _ = visit_expressions(statement, |expression| {
-        let address = ptr::from_ref(expression).addr();
-        let resolved = if relations.argument_names.contains(&address) {
-            Ok(Reference::Other)
-        } else if arbiter.predicate.contains(&address) {
-            arbiter.resolve(expression, schema).map(|()| Reference::Other)
-        } else {
-            resolve(expression, &context, &relations, schema)
-        };
-        match resolved {
-            Ok(Reference::Column(table, column)) => read.push((table, column)),
-            Ok(Reference::Ambiguous(name)) => {
-                ambiguous.get_or_insert_with(|| {
-                    postgres(
-                        pg::AMBIGUOUS_COLUMN,
-                        format!("column reference \"{name}\" is ambiguous"),
-                    )
-                });
-            }
-            Ok(Reference::Other) => {}
-            Err(error) => {
-                failure = Some(error);
-                return ControlFlow::Break(());
-            }
-        }
-        ControlFlow::Continue(())
-    });
-    if let Some(error) = failure {
-        return Err(error);
-    }
+    let mut written = insert_targets(statement, schema)?;
+    let Reads { columns: read, ambiguous } =
+        read_names(statement, &context, &relations, &arbiter, schema, None)?;
     if ambiguous.is_some() {
         return Ok(ambiguous);
     }
-    let written = write_targets(statement, schema)?;
+    written.extend(set_targets(statement, schema)?);
 
     let mut grants = Grants { held: Vec::new(), schema, options };
     for (table, column) in read {
@@ -151,6 +127,202 @@ pub(crate) fn resolve_columns(
     )))
 }
 
+/// The SQLSTATE and message PostgreSQL raises where a PL/pgSQL body runs
+/// `sql`, for a relation it names that `schema` lacks, a name no relation in
+/// scope holds and no variable reaches, a field of `NEW` or `OLD` the
+/// trigger's table lacks, or a column an `INSERT` or `UPDATE` writes that
+/// its table does not declare.
+///
+/// `None` when every name resolves, for SQL other than an expression, a
+/// query, an `INSERT`, an `UPDATE` or a `DELETE`, and where `schema` cannot
+/// settle a name, such as one of a schema it does not model, which the
+/// translation of the SQL then answers for.
+pub(crate) fn unresolved_in_body(
+    sql: Sql<'_>,
+    variables: &Variables<'_>,
+    schema: &ParserDB,
+) -> Option<(SqlState, String)> {
+    let resolved = match sql {
+        Sql::Statement(
+            statement @ (Statement::Query(_)
+            | Statement::Insert(_)
+            | Statement::Update(_)
+            | Statement::Delete(_)),
+        ) => statement_in_body(statement, variables, schema),
+        Sql::Expression(query) => {
+            expression_in_body(&embedded::expression(query), variables, schema)
+        }
+        Sql::Statement(_) | Sql::Dynamic(_) => return None,
+    };
+    match resolved {
+        Err(Error::Postgres { sqlstate, message }) => Some((sqlstate, message)),
+        Ok(()) | Err(_) => None,
+    }
+}
+
+/// Refuses the first relation `statement`, a statement of a PL/pgSQL body,
+/// names that `schema` lacks, then its first target, read or written name
+/// that does not resolve, in the order PostgreSQL meets them.
+fn statement_in_body(
+    statement: &Statement,
+    variables: &Variables<'_>,
+    schema: &ParserDB,
+) -> Result<(), Error> {
+    missing_relation(statement, schema)?;
+    let context = ExpressionContext::for_statement(
+        statement,
+        &ExpressionScope::Empty,
+        schema,
+        IdentifierCase::AsWritten,
+    )?;
+    let arbiter = Arbiter::of(statement, schema)?;
+    let relations = Relations::of(statement);
+    insert_targets(statement, schema)?;
+    read_names(statement, &context, &relations, &arbiter, schema, Some(variables))?;
+    set_targets(statement, schema).map(drop)
+}
+
+/// Refuses the first relation `expression`, an expression of a PL/pgSQL
+/// body, names that `schema` lacks, then its first name that does not
+/// resolve.
+fn expression_in_body(
+    expression: &Expr,
+    variables: &Variables<'_>,
+    schema: &ParserDB,
+) -> Result<(), Error> {
+    missing_relation(expression, schema)?;
+    let context = ExpressionContext::for_expression(
+        expression,
+        &ExpressionScope::Empty,
+        schema,
+        IdentifierCase::AsWritten,
+    )?;
+    let relations = Relations::default().read(expression);
+    read_names(expression, &context, &relations, &Arbiter::default(), schema, Some(variables))
+        .map(drop)
+}
+
+/// Refuses the first stored relation `node` names that `schema` holds
+/// neither as a table nor as a view, as PostgreSQL does.
+///
+/// A name in a schema other than `public` and `pg_temp`, which `schema`
+/// does not model, and a set-returning function called in `FROM` are left
+/// alone.
+fn missing_relation<V: Visit>(node: &V, schema: &ParserDB) -> Result<(), Error> {
+    let mut functions = FunctionFactors(Vec::new());
+    let _ = node.visit(&mut functions);
+    let FunctionFactors(functions) = functions;
+    for name in relation_occurrences(node) {
+        if functions.contains(&name) || relation_exists(&name, schema) != Some(false) {
+            continue;
+        }
+        let written: Vec<_> =
+            name.0.iter().filter_map(ObjectNamePart::as_ident).map(folded).collect();
+        return Err(postgres(
+            pg::UNDEFINED_TABLE,
+            format!("relation \"{}\" does not exist", written.join(".")),
+        ));
+    }
+    Ok(())
+}
+
+/// The names of the set-returning functions a node calls in `FROM`.
+struct FunctionFactors(Vec<ObjectName>);
+
+impl Visitor for FunctionFactors {
+    type Break = ();
+
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Self::Break> {
+        if let TableFactor::Table { name, args: Some(_), .. } = factor {
+            self.0.push(name.clone());
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Whether `schema` holds `name` as a table or a view, searching `pg_temp`
+/// first for an unqualified name as PostgreSQL does, or `None` for a name
+/// `schema` cannot settle.
+fn relation_exists(name: &ObjectName, schema: &ParserDB) -> Option<bool> {
+    let idents: Vec<&Ident> = name.0.iter().filter_map(ObjectNamePart::as_ident).collect();
+    let (last, qualifier) = match idents.as_slice() {
+        [last] => (*last, None),
+        [qualifier, last] => (*last, Some(*qualifier)),
+        _ => return None,
+    };
+    let target = TargetName::new(&last.value, last.quote_style.is_some());
+    let candidates = match qualifier.map(|qualifier| (folded(qualifier), qualifier)) {
+        None => vec![target.clone().with_schema("pg_temp", false), target],
+        Some((stored, qualifier)) if stored == "public" || stored == "pg_temp" => {
+            vec![target.with_schema(&qualifier.value, qualifier.quote_style.is_some())]
+        }
+        Some(_) => return None,
+    };
+    for candidate in candidates {
+        let table = schema.table_by_target(candidate.clone(), IdentifierCase::AsWritten);
+        let view = schema.view_by_target(candidate, IdentifierCase::AsWritten);
+        match (table, view) {
+            (Ok(Some(_)), _) | (_, Ok(Some(_))) => return Some(true),
+            (Err(_), _) | (_, Err(_)) => return None,
+            (Ok(None), Ok(None)) => {}
+        }
+    }
+    Some(false)
+}
+
+/// The stored columns a statement reads and its first ambiguous name.
+struct Reads<'c> {
+    columns: Vec<(&'c Table, &'c str)>,
+    ambiguous: Option<Error>,
+}
+
+/// What the names of `root` read, its `FROM` items being `relations`, a name
+/// a variable of `variables` reaches reading no column.
+///
+/// # Errors
+///
+/// Refuses the first name no relation in scope holds, as PostgreSQL does,
+/// and returns the lookup errors resolution meets.
+fn read_names<'c, N: Visit>(
+    root: &N,
+    context: &'c ExpressionContext<'_, '_, ParserDB>,
+    relations: &Relations,
+    arbiter: &Arbiter<'_>,
+    schema: &ParserDB,
+    variables: Option<&Variables<'_>>,
+) -> Result<Reads<'c>, Error> {
+    let mut reads = Reads { columns: Vec::new(), ambiguous: None };
+    let mut failure = None;
+    let _ = visit_expressions(root, |expression| {
+        let address = ptr::from_ref(expression).addr();
+        let resolved = if relations.argument_names.contains(&address) {
+            Ok(Reference::Other)
+        } else if arbiter.predicate.contains(&address) {
+            arbiter.resolve(expression, schema).map(|()| Reference::Other)
+        } else {
+            resolve(expression, context, relations, schema, variables)
+        };
+        match resolved {
+            Ok(Reference::Column(table, column)) => reads.columns.push((table, column)),
+            Ok(Reference::Ambiguous(name)) => {
+                reads.ambiguous.get_or_insert_with(|| {
+                    postgres(
+                        pg::AMBIGUOUS_COLUMN,
+                        format!("column reference \"{name}\" is ambiguous"),
+                    )
+                });
+            }
+            Ok(Reference::Other) => {}
+            Err(error) => {
+                failure = Some(error);
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
+    });
+    failure.map_or(Ok(reads), Err)
+}
+
 /// What a statement answers given the ambiguity [`resolve_columns`] found and
 /// its translation, PostgreSQL's `42702` unless the translation refuses the
 /// statement for another reason.
@@ -177,7 +349,8 @@ enum Reference<'c> {
     Other,
 }
 
-/// What `expression` reads.
+/// What `expression` reads, a name a variable of `variables` reaches reading
+/// no column.
 ///
 /// # Errors
 ///
@@ -187,6 +360,7 @@ fn resolve<'c>(
     context: &'c ExpressionContext<'_, '_, ParserDB>,
     relations: &Relations,
     schema: &ParserDB,
+    variables: Option<&Variables<'_>>,
 ) -> Result<Reference<'c>, Error> {
     let parts = match expression {
         Expr::Identifier(ident) => core::slice::from_ref(ident),
@@ -205,14 +379,31 @@ fn resolve<'c>(
                 parts.last().map_or_else(String::new, |ident| ident.value.clone()),
             ))
         }
-        Ok(None) => unbound(expression, parts, relations).map(|()| Reference::Other),
+        Ok(None) => {
+            unbound(expression, parts, relations, variables, schema).map(|()| Reference::Other)
+        }
         Err(error) => Err(error.into()),
     }
 }
 
 /// What PostgreSQL answers for the name `parts` of `expression`, which no
-/// column in scope holds.
-fn unbound(expression: &Expr, parts: &[Ident], relations: &Relations) -> Result<(), Error> {
+/// column in scope holds and which reads a variable of `variables` when one
+/// reaches it.
+fn unbound(
+    expression: &Expr,
+    parts: &[Ident],
+    relations: &Relations,
+    variables: Option<&Variables<'_>>,
+    schema: &ParserDB,
+) -> Result<(), Error> {
+    if let Some(variables) = variables {
+        if let Some(error) = variables.nested_row_read(parts) {
+            return Err(error);
+        }
+        if variables.reach(parts, schema)? {
+            return Ok(());
+        }
+    }
     match parts {
         [ident]
             if ident.quote_style.is_none()
@@ -225,21 +416,24 @@ fn unbound(expression: &Expr, parts: &[Ident], relations: &Relations) -> Result<
         }
         // A whole-row reference.
         [ident] if relations.exposes(ident) => Ok(()),
-        [ident] => Err(undefined_column(&ident.value)),
+        [ident] => Err(undefined_column(ident)),
         [.., qualifier, _] if relations.hidden.contains(&ptr::from_ref(expression).addr()) => {
             Err(postgres(
                 pg::UNDEFINED_TABLE,
-                format!("invalid reference to FROM-clause entry for table \"{}\"", qualifier.value),
+                format!(
+                    "invalid reference to FROM-clause entry for table \"{}\"",
+                    folded(qualifier)
+                ),
             ))
         }
         [.., qualifier, _] if !relations.exposes(qualifier) => {
             Err(postgres(
                 pg::UNDEFINED_TABLE,
-                format!("missing FROM-clause entry for table \"{}\"", qualifier.value),
+                format!("missing FROM-clause entry for table \"{}\"", folded(qualifier)),
             ))
         }
         _ => {
-            let written: Vec<&str> = parts.iter().map(|ident| ident.value.as_str()).collect();
+            let written: Vec<_> = parts.iter().map(folded).collect();
             Err(postgres(
                 pg::UNDEFINED_COLUMN,
                 format!("column {} does not exist", written.join(".")),
@@ -248,12 +442,94 @@ fn unbound(expression: &Expr, parts: &[Ident], relations: &Relations) -> Result<
     }
 }
 
+/// The names in reach at one point of a trigger body, and the table the
+/// trigger fires on, whose row `NEW` and `OLD` hold.
+pub(crate) struct Variables<'a> {
+    pub(crate) namespace: &'a Namespace,
+    pub(crate) rows: Option<&'a Table>,
+}
+
+impl Variables<'_> {
+    /// Whether the name `parts` reaches a variable, a variable of any type
+    /// taken to hold a row whose fields the parts after its name read.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a field of `NEW` or `OLD` the trigger's table does not
+    /// declare, as PostgreSQL does, and returns the lookup errors that
+    /// meets.
+    fn reach(&self, parts: &[Ident], schema: &ParserDB) -> Result<bool, Error> {
+        let stored: Vec<_> = parts.iter().map(folded).collect();
+        let Some((name, consumed)) = self.namespace.lookup(&stored, |_| true) else {
+            return Ok(false);
+        };
+        let record = match name.kind() {
+            NameKind::Trigger(TriggerVariable::New) => "new",
+            NameKind::Trigger(TriggerVariable::Old) => "old",
+            _ => return Ok(true),
+        };
+        if let (Some(table), Some(field)) = (self.rows, parts.get(consumed))
+            && declared(table, field, schema)?.is_none()
+        {
+            return Err(postgres(
+                pg::UNDEFINED_COLUMN,
+                format!("record \"{record}\" has no field \"{}\"", folded(field)),
+            ));
+        }
+        Ok(true)
+    }
+
+    /// PostgreSQL's error for a read naming more than one part past `NEW` or
+    /// `OLD`, which it takes for a column of a relation the query lists.
+    fn nested_row_read(&self, parts: &[Ident]) -> Option<Error> {
+        let stored: Vec<_> = parts.iter().map(folded).collect();
+        let (name, consumed) = self.namespace.lookup(stored.get(..1)?, |_| true)?;
+        if !matches!(name.kind(), NameKind::Trigger(TriggerVariable::New | TriggerVariable::Old)) {
+            return None;
+        }
+        match parts.len().checked_sub(consumed)? {
+            0 | 1 => None,
+            2 => {
+                Some(postgres(
+                    pg::UNDEFINED_TABLE,
+                    format!("missing FROM-clause entry for table \"{}\"", stored[consumed]),
+                ))
+            }
+            _ => {
+                Some(postgres(
+                    pg::FEATURE_NOT_SUPPORTED,
+                    format!("cross-database references are not implemented: {}", stored.join(".")),
+                ))
+            }
+        }
+    }
+}
+
+/// The SQLSTATE and message PostgreSQL raises where a PL/pgSQL body assigns
+/// the target `parts`, for a field of `NEW` or `OLD` the trigger's table
+/// does not declare.
+pub(crate) fn unresolved_target(
+    parts: &[Ident],
+    variables: &Variables<'_>,
+    schema: &ParserDB,
+) -> Option<(SqlState, String)> {
+    match variables.reach(parts, schema) {
+        Err(Error::Postgres { sqlstate, message }) => Some((sqlstate, message)),
+        Ok(_) | Err(_) => None,
+    }
+}
+
 fn postgres(sqlstate: SqlState, message: String) -> Error {
     Error::Postgres { sqlstate, message }
 }
 
-fn undefined_column(name: &str) -> Error {
-    postgres(pg::UNDEFINED_COLUMN, format!("column \"{name}\" does not exist"))
+fn undefined_column(name: &Ident) -> Error {
+    postgres(pg::UNDEFINED_COLUMN, format!("column \"{}\" does not exist", folded(name)))
+}
+
+/// `name` as PostgreSQL stores it and names it in its errors.
+fn folded(name: &Ident) -> Cow<'_, str> {
+    stored_identifier(&name.value, name.quote_style.is_some())
 }
 
 fn denied(table: &Table) -> Error {
@@ -262,6 +538,7 @@ fn denied(table: &Table) -> Error {
 
 /// The `WHERE` of an `INSERT`'s `ON CONFLICT` target, which reads the
 /// target table's columns.
+#[derive(Default)]
 struct Arbiter<'s> {
     table: Option<&'s Table>,
     /// The address of every node of the predicate.
@@ -270,7 +547,7 @@ struct Arbiter<'s> {
 
 impl<'s> Arbiter<'s> {
     fn of(statement: &Statement, schema: &'s ParserDB) -> Result<Self, Error> {
-        let mut arbiter = Self { table: None, predicate: Vec::new() };
+        let mut arbiter = Self::default();
         if let Statement::Insert(insert) = statement
             && let Some(OnInsert::OnConflict(conflict)) = &insert.on
             && let Some(ConflictTarget::Columns { predicate: Some(predicate), .. }) =
@@ -301,7 +578,7 @@ impl<'s> Arbiter<'s> {
         if declared(table, ident, schema)?.is_some() {
             Ok(())
         } else {
-            Err(undefined_column(&ident.value))
+            Err(undefined_column(ident))
         }
     }
 }
@@ -348,51 +625,64 @@ struct Target<'s> {
     write: Write,
 }
 
-/// The columns `statement` writes, an `INSERT` naming none writing the
-/// leading columns its rows fill, and none known behind a wildcard.
+/// The columns the rows `statement` inserts fill, an `INSERT` naming none
+/// filling the leading columns its rows fill, and none known behind a
+/// wildcard.
 ///
 /// # Errors
 ///
-/// Refuses a target the table does not declare, as PostgreSQL does.
-fn write_targets<'s>(
+/// Refuses a target the table does not declare, as PostgreSQL does before
+/// reading any name of the statement.
+fn insert_targets<'s>(
     statement: &Statement,
     schema: &'s ParserDB,
 ) -> Result<Vec<Target<'s>>, Error> {
     let mut targets = Vec::new();
-    match statement {
+    let Statement::Insert(insert) = statement else { return Ok(targets) };
+    let TableObject::TableName(name) = &insert.table else { return Ok(targets) };
+    let Some(table) = resolve_translation_table(schema, name)? else { return Ok(targets) };
+    if insert.columns.is_empty() {
+        let width = insert.source.as_deref().map_or(Some(0), |source| row_width(&source.body));
+        for column in table.columns(schema)?.take(width.unwrap_or(0)) {
+            targets.push(Target { table, column: column.column_name(), write: Write::Insert });
+        }
+    } else {
+        for column in insert.columns.iter().filter_map(last_ident) {
+            targets.push(target(table, column, Write::Insert, schema)?);
+        }
+    }
+    Ok(targets)
+}
+
+/// The columns the `SET` of an `UPDATE` or of an `INSERT`'s `ON CONFLICT DO
+/// UPDATE` writes.
+///
+/// # Errors
+///
+/// Refuses a target the table does not declare, as PostgreSQL does after
+/// reading the names of the statement.
+fn set_targets<'s>(statement: &Statement, schema: &'s ParserDB) -> Result<Vec<Target<'s>>, Error> {
+    let mut targets = Vec::new();
+    let (name, assignments) = match statement {
         Statement::Insert(insert) => {
-            let TableObject::TableName(name) = &insert.table else { return Ok(targets) };
-            let Some(table) = resolve_translation_table(schema, name)? else { return Ok(targets) };
-            if insert.columns.is_empty() {
-                let width =
-                    insert.source.as_deref().map_or(Some(0), |source| row_width(&source.body));
-                for column in table.columns(schema)?.take(width.unwrap_or(0)) {
-                    targets.push(Target {
-                        table,
-                        column: column.column_name(),
-                        write: Write::Insert,
-                    });
-                }
-            } else {
-                for column in insert.columns.iter().filter_map(last_ident) {
-                    targets.push(target(table, column, Write::Insert, schema)?);
-                }
-            }
-            if let Some(OnInsert::OnConflict(conflict)) = &insert.on
-                && let OnConflictAction::DoUpdate(update) = &conflict.action
-            {
-                assigned(&update.assignments, table, schema, &mut targets)?;
-            }
+            let (TableObject::TableName(name), Some(OnInsert::OnConflict(conflict))) =
+                (&insert.table, &insert.on)
+            else {
+                return Ok(targets);
+            };
+            let OnConflictAction::DoUpdate(update) = &conflict.action else { return Ok(targets) };
+            (name, &update.assignments)
         }
         Statement::Update(update) => {
             let TableFactor::Table { name, .. } = &update.table.relation else {
                 return Ok(targets);
             };
-            let Some(table) = resolve_translation_table(schema, name)? else { return Ok(targets) };
-            assigned(&update.assignments, table, schema, &mut targets)?;
+            (name, &update.assignments)
         }
-        _ => {}
-    }
+        _ => return Ok(targets),
+    };
+    let Some(table) = resolve_translation_table(schema, name)? else { return Ok(targets) };
+    assigned(assignments, table, schema, &mut targets)?;
     Ok(targets)
 }
 
@@ -431,7 +721,7 @@ fn target<'s>(
             pg::UNDEFINED_COLUMN,
             format!(
                 "column \"{}\" of relation \"{}\" does not exist",
-                written.value,
+                folded(written),
                 table.table_name()
             ),
         ));
@@ -461,6 +751,7 @@ impl<'s> Grants<'s, '_> {
 
 /// The `FROM` items of one statement, the names its relations expose, and
 /// the names of its named function arguments.
+#[derive(Default)]
 struct Relations {
     factors: Vec<usize>,
     /// Copied, since the visitor lends each node to its callback alone.
@@ -476,22 +767,29 @@ struct Relations {
 
 impl Relations {
     fn of(statement: &Statement) -> Self {
-        let mut relations = Self {
-            factors: Vec::new(),
-            names: Vec::new(),
-            argument_names: Vec::new(),
-            levels: Vec::new(),
-            hidden: Vec::new(),
-        };
+        let mut relations = Self::default();
         if let Statement::Insert(Insert {
-            table: TableObject::TableName(name), table_alias, ..
+            table: TableObject::TableName(name),
+            table_alias,
+            on,
+            ..
         }) = statement
         {
             let exposed = table_alias.as_ref().map(|alias| &alias.alias).or(last_ident(name));
             relations.names.extend(exposed.cloned());
+            if let Some(OnInsert::OnConflict(conflict)) = on
+                && let OnConflictAction::DoUpdate(_) = conflict.action
+            {
+                relations.names.push(Ident::new("excluded"));
+            }
         }
-        let _ = statement.visit(&mut relations);
-        relations
+        relations.read(statement)
+    }
+
+    /// These relations with the `FROM` items `node` holds.
+    fn read<N: Visit>(mut self, node: &N) -> Self {
+        let _ = node.visit(&mut self);
+        self
     }
 
     fn exposes(&self, name: &Ident) -> bool {

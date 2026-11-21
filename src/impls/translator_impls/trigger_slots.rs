@@ -94,12 +94,25 @@ struct SlotKey {
 
 /// The name PostgreSQL stores for the last part of `name`, which folds an
 /// undelimited identifier to lower case and keeps a delimited one.
-fn folded(name: &ObjectName) -> String {
+pub(crate) fn folded(name: &ObjectName) -> String {
     last_ident(name).map_or_else(String::new, folded_ident)
 }
 
 fn folded_ident(ident: &Ident) -> String {
     if ident.quote_style.is_some() { ident.value.clone() } else { ident.value.to_ascii_lowercase() }
+}
+
+/// The table `statement` renames, and the name it takes.
+pub(crate) fn renamed_table(statement: &Statement) -> Option<(&ObjectName, &ObjectName)> {
+    let Statement::AlterTable(alter) = statement else { return None };
+    alter.operations.iter().find_map(|operation| {
+        match operation {
+            AlterTableOperation::RenameTable {
+                table_name: RenameTableNameKind::As(to) | RenameTableNameKind::To(to),
+            } => Some((&alter.name, to)),
+            _ => None,
+        }
+    })
 }
 
 /// The folded table and trigger name identifying `trigger`, since PostgreSQL
@@ -196,17 +209,7 @@ impl Roster {
                 self.triggers.retain(|(table, _), _| !dropped.contains(table));
                 None
             }
-            Statement::AlterTable(alter) => {
-                alter.operations.iter().find_map(|operation| {
-                    match operation {
-                        AlterTableOperation::RenameTable {
-                            table_name: RenameTableNameKind::As(to) | RenameTableNameKind::To(to),
-                        } => Some(self.rename_table(&alter.name, to)),
-                        _ => None,
-                    }
-                })
-            }
-            _ => None,
+            _ => renamed_table(statement).map(|(from, to)| self.rename_table(from, to)),
         }
     }
 
@@ -391,7 +394,11 @@ impl TriggerSlots {
         let key = trigger_key(trigger);
         let creates =
             emitted.iter().any(|statement| matches!(statement, Statement::CreateTrigger(_)));
-        let plain = creates && super::create_trigger::is_plain_row_trigger(trigger, schema)?;
+        let plain = creates
+            && super::create_trigger::is_plain_row_trigger(
+                trigger,
+                super::create_trigger::body_schema(schema, context),
+            )?;
         let previous = self.roster.triggers.remove(&key);
         if previous.is_none() && !plain {
             return Ok(false);

@@ -26,12 +26,7 @@ use sql_traits::{
     structs::ParserDB,
     traits::{DatabaseLike, TableLike, ViewLike},
 };
-use sqlparser::{
-    ast::{Expr, ObjectName, Query, Statement, TableFactor, VisitMut},
-    dialect::PostgreSqlDialect,
-    parser::Parser,
-};
-use sqlparser_plpgsql::embedded::{Block, DeclarationKind, Node, NodeKind};
+use sqlparser::ast::{Expr, ObjectName, Statement, TableFactor, VisitMut};
 
 use self::{
     edits::Edits,
@@ -48,7 +43,6 @@ use crate::{
         translator_impls::{delete::delete_scope_query, update::update_scope_query},
     },
     script::ConnectionError,
-    traits::schema::Schema,
 };
 
 /// `statement` with every reference to a file object renamed to the name the
@@ -93,135 +87,6 @@ pub(super) enum Names {
     /// PostgreSQL's, where every view keeps its output names. The schema a
     /// replay is checked against takes this form.
     Postgres,
-}
-
-/// The body of the trigger function `create` executes, renamed like
-/// [`rebind`], or `None` when no name changed.
-pub(super) fn rebind_trigger_body(
-    create: &sqlparser::ast::CreateTrigger,
-    position: StatementId,
-    epoch: &ParserDB,
-    final_schema: &ParserDB,
-    replay_homes: Files,
-    homes: &Homes,
-) -> Result<Option<Block>, ConnectionError> {
-    let Some(exec_body) = &create.exec_body else { return Ok(None) };
-    let Ok(Some(mut body)) = epoch.function_body(&exec_body.func_desc.name) else {
-        return Ok(None);
-    };
-    let mut rebinder =
-        BodyRebinder { epoch, final_schema, position, replay_homes, homes, changed: false };
-    rebinder.block(&mut body)?;
-    Ok(rebinder.changed.then_some(body))
-}
-
-/// Renames each statement and expression of a trigger body on its own, since
-/// edits are keyed by source spans and each is parsed again from its text.
-struct BodyRebinder<'a> {
-    epoch: &'a ParserDB,
-    final_schema: &'a ParserDB,
-    position: StatementId,
-    replay_homes: Files,
-    homes: &'a Homes,
-    changed: bool,
-}
-
-impl BodyRebinder<'_> {
-    /// Renames the declaration defaults and statements of `block`.
-    fn block(&mut self, block: &mut Block) -> Result<(), ConnectionError> {
-        for declaration in &mut block.declarations {
-            if let DeclarationKind::Variable(variable) = &mut declaration.kind
-                && let Some(default) = &mut variable.default
-            {
-                self.query(default)?;
-            }
-        }
-        self.nodes(&mut block.statements)
-    }
-
-    /// Renames every expression and statement `nodes` hold, branches and
-    /// nested blocks included.
-    fn nodes(&mut self, nodes: &mut [Node]) -> Result<(), ConnectionError> {
-        for node in nodes {
-            match &mut node.kind {
-                NodeKind::Statement { statement, .. } => self.statement(statement)?,
-                NodeKind::Assignment(assignment) => self.query(&mut assignment.value)?,
-                NodeKind::Block(block) => self.block(block)?,
-                NodeKind::Perform { query } => self.statement(query)?,
-                NodeKind::If(conditional) => {
-                    for branch in &mut conditional.branches {
-                        self.query(&mut branch.condition)?;
-                        self.nodes(&mut branch.statements)?;
-                    }
-                    self.nodes(&mut conditional.otherwise)?;
-                }
-                NodeKind::Return { value: Some(value) } => self.query(value)?,
-                NodeKind::Raise(raise) => {
-                    for argument in &mut raise.arguments {
-                        self.query(argument)?;
-                    }
-                    for option in &mut raise.options {
-                        self.query(&mut option.value)?;
-                    }
-                }
-                // The translator refuses every other node.
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-
-    /// Renames `query` by wrapping it as a statement.
-    fn query(&mut self, query: &mut Query) -> Result<(), ConnectionError> {
-        let mut statement = Statement::Query(Box::new(query.clone()));
-        self.statement(&mut statement)?;
-        if let Statement::Query(renamed) = statement {
-            *query = *renamed;
-        }
-        Ok(())
-    }
-
-    /// Renames `statement` against the replay schema at this position.
-    fn statement(&mut self, statement: &mut Statement) -> Result<(), ConnectionError> {
-        let text = statement.to_string();
-        let mut parsed = Parser::parse_sql(&PostgreSqlDialect {}, &text).map_err(|error| {
-            super::refusal(format!(
-                "statement {} runs a trigger body statement `{text}` that does not parse again \
-                 for replay: {error}",
-                self.position.index()
-            ))
-        })?;
-        let mut reparsed = match parsed.pop() {
-            Some(reparsed) if parsed.is_empty() => reparsed,
-            _ => {
-                return Err(super::refusal(format!(
-                    "statement {} runs a trigger body statement `{text}` that does not parse \
-                     again as one statement",
-                    self.position.index()
-                )));
-            }
-        };
-        let mut planner = Planner {
-            epoch: self.epoch,
-            final_schema: self.final_schema,
-            position: self.position,
-            replay_homes: self.replay_homes,
-            homes: self.homes,
-            names: Names::Sqlite,
-            edits: Edits::default(),
-            frames: Vec::new(),
-            scopes: RelationScopes::default(),
-        };
-        planner.relations(&reparsed)?;
-        planner.statement(&reparsed)?;
-        if planner.edits.is_empty() {
-            return Ok(());
-        }
-        let _: ControlFlow<()> = reparsed.visit(&mut planner.edits);
-        *statement = reparsed;
-        self.changed = true;
-        Ok(())
-    }
 }
 
 /// How a query's output names behave when the columns it reads are renamed.
