@@ -690,6 +690,36 @@ fn a_distinct_wildcard_over_an_interval_column_is_refused() {
 }
 
 #[test]
+fn a_distinct_wildcard_over_a_function_interval_result_is_refused() {
+    let schema = Pg2Sqlite::default()
+        .sql(
+            "CREATE TABLE durations (v INTERVAL);
+             INSERT INTO durations VALUES ('1 day'), ('24 hours');
+             CREATE FUNCTION duration_values() RETURNS SETOF INTERVAL
+             LANGUAGE sql AS $$ SELECT v FROM durations $$;
+             CREATE FUNCTION duration_rows() RETURNS SETOF durations
+             LANGUAGE sql AS $$ SELECT * FROM durations $$;",
+        )
+        .expect("parse the interval functions")
+        .build_schema()
+        .expect("build the interval schema");
+    let options = Pg2SqliteOptions::default()
+        .with_user_defined_functions(["duration_values", "duration_rows"]);
+    for function in ["duration_values", "duration_rows"] {
+        let message = Pg2Sqlite::default()
+            .sql(&format!("SELECT DISTINCT * FROM {function}();"))
+            .expect("parse the distinct query")
+            .translate_with_report_and_schema(&schema, &options)
+            .expect_err("interval equality must not compare stored text")
+            .to_string();
+        assert!(
+            message.contains("SELECT DISTINCT * over a relation with an interval column"),
+            "{function}: {message}"
+        );
+    }
+}
+
+#[test]
 fn a_distinct_qualified_wildcard_over_an_interval_column_is_refused() {
     refused("SELECT DISTINCT t.* FROM t", "DISTINCT");
 }

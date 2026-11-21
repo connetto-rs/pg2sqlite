@@ -143,7 +143,7 @@ pub(crate) fn timestamp_awareness(
                 expr,
                 schema,
                 options,
-                |column| from_data_type(&column.data_type),
+                |column| from_data_type(column.data_type()),
                 timestamp_awareness,
             )?
         }
