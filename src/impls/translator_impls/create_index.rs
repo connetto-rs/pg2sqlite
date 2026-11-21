@@ -629,10 +629,11 @@ impl crate::traits::translator::TranslatorWithContext for CreateIndex {
         };
 
         // Regular index - translate normally, explicitly dropping PG-only
-        // fields (using, concurrently, include, nulls_distinct, with,
+        // fields (only, using, concurrently, include, nulls_distinct, with,
         // index_options, alter_options) that are not valid in SQLite.
         let mut statements = vec![Statement::CreateIndex(CreateIndex {
             name: Some(name.clone()),
+            only: false,
             table_name: indexed_table,
             using: None,
             columns,
