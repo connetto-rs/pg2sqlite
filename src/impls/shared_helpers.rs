@@ -5160,10 +5160,16 @@ pub(crate) fn set_branch_output_carries_interval(
             set_branch_output_carries_interval(query.body.as_ref(), schema, options)
         }
         SetExpr::Select(select) => {
-            let query = crate::impls::query_builder::make_query(
+            // The outputs read only the projection and the relations, so the
+            // conditions, which may hold whole helper sets, stay uncopied.
+            let mut outputs = crate::impls::query_builder::make_simple_select(
+                select.projection.clone(),
+                select.from.clone(),
                 None,
-                SetExpr::Select(Box::new(select.as_ref().clone())),
             );
+            outputs.named_window.clone_from(&select.named_window);
+            let query =
+                crate::impls::query_builder::make_query(None, SetExpr::Select(Box::new(outputs)));
             Ok(query_output_carries(
                 &query,
                 schema,

@@ -330,6 +330,6 @@ fn a_program_past_sqlites_cursor_limit_is_refused_naming_the_repeated_helpers() 
 
 #[test]
 fn a_deep_helper_chain_is_refused_on_a_default_thread() {
-    let message = refusal(&walk_chain(5, 1));
-    assert!(message.contains("ids_5()"), "the refusal names the policy's helper: {message}");
+    let message = refusal(&walk_chain(7, 1));
+    assert!(message.contains("ids_7()"), "the refusal names the policy's helper: {message}");
 }
