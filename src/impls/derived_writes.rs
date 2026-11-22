@@ -26,6 +26,7 @@ use alloc::borrow::Cow;
 use core::{fmt::Write as _, ops::ControlFlow};
 
 pub(crate) use chain::without_removed_writes;
+use columns::Columns;
 pub(crate) use firing::{FiringTrigger, firing_triggers};
 pub(crate) use readers::reads_left_to_server;
 use sql_traits::{
@@ -547,6 +548,65 @@ fn is_per_row(trigger: &CreateTrigger) -> bool {
                 | TriggerObjectKind::ForEach(TriggerObject::Row)
         )
     )
+}
+
+/// What a row trigger does that another trigger firing on the same write can
+/// see, or can change under it, read through every helper its function
+/// calls.
+pub(crate) struct Footprint {
+    /// The fields of `NEW` the function and the trigger's `WHEN` read.
+    new: Columns,
+    /// Whether the function may write a table, which a call it cannot read
+    /// counts as.
+    writes: bool,
+    /// Whether the function reads a table.
+    reads: bool,
+}
+
+impl Footprint {
+    /// What `trigger` does, every field read, every table written and read
+    /// when the schema does not hold its function.
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`chain::Walker::read_whole`] does.
+    pub(crate) fn of(
+        trigger: &CreateTrigger,
+        schema: &ParserDB,
+        options: &TranslationContext<'_>,
+    ) -> Result<Self, Error> {
+        let function = match &trigger.exec_body {
+            Some(exec_body) => written_function(schema, &exec_body.func_desc.name)?,
+            None => None,
+        };
+        let Some(function) = function else {
+            return Ok(Self { new: Columns::Row, writes: true, reads: true });
+        };
+        let mut chain = chain::Walker::read_whole(function, schema, options)?;
+        if let Some(condition) = &trigger.condition {
+            chain::record_reads(condition, &mut Columns::none(), &mut chain.new);
+        }
+        Ok(Self {
+            new: chain.new,
+            writes: !chain.writes.is_empty() || chain.unreadable.is_some(),
+            reads: chain.steps.iter().any(|step| matches!(step, chain::Step::Read { .. })),
+        })
+    }
+
+    /// Whether the trigger reads the field `column`, folded, of `NEW`.
+    pub(crate) fn reads_new(&self, column: &str) -> bool {
+        self.new.contains(column)
+    }
+
+    /// Whether the trigger may write a table.
+    pub(crate) const fn writes(&self) -> bool {
+        self.writes
+    }
+
+    /// Whether the trigger reads a table.
+    pub(crate) const fn reads(&self) -> bool {
+        self.reads
+    }
 }
 
 /// The trigger warning for `trigger`, left out because of `reason`.

@@ -233,14 +233,209 @@ fn shared_update_triggers_with_different_columns_refused() {
     assert!(message.contains("UPDATE OF"), "got: {message}");
 }
 
-/// A trigger assigning NEW runs as an AFTER UPDATE of the row, which cannot
-/// keep its place among the other triggers on its event.
+/// A trigger PostgreSQL runs after one assigning NEW sees what it assigns,
+/// which the replica, running the assignment after the write, cannot give it.
 #[test]
-fn shared_maintenance_trigger_refused() {
+fn a_later_trigger_reading_an_assigned_field_is_refused() {
     let message = refusal(&format!(
         "{BUMP_TAG_SCHEMA}
-         CREATE FUNCTION log_mut() RETURNS trigger AS $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql;
-         CREATE TRIGGER mut_log BEFORE UPDATE ON mut FOR EACH ROW EXECUTE FUNCTION log_mut();"
+         CREATE FUNCTION veto_untagged() RETURNS trigger AS $$
+         BEGIN IF NEW.tag IS NULL THEN RETURN NULL; END IF; RETURN NEW; END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER mut_veto BEFORE UPDATE ON mut FOR EACH ROW EXECUTE FUNCTION veto_untagged();"
     ));
-    assert!(message.contains("assigns to NEW"), "got: {message}");
+    assert!(
+        message.contains("`mut_veto` reads NEW.tag, which `mut_bump` assigns"),
+        "got: {message}"
+    );
+}
+
+/// The pair is refused whichever of the two the batch creates first.
+#[test]
+fn a_later_trigger_created_first_is_refused_too() {
+    let message = refusal(
+        "CREATE TABLE mut (id INT PRIMARY KEY, tag TEXT);
+         CREATE FUNCTION veto_untagged() RETURNS trigger AS $$
+         BEGIN IF NEW.tag IS NULL THEN RETURN NULL; END IF; RETURN NEW; END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER mut_veto BEFORE UPDATE ON mut FOR EACH ROW
+             WHEN (NEW.tag <> 'x') EXECUTE FUNCTION veto_untagged();
+         CREATE FUNCTION bump_tag() RETURNS trigger AS $$
+         BEGIN NEW.tag := NEW.tag || '!'; RETURN NEW; END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER mut_bump BEFORE UPDATE ON mut FOR EACH ROW EXECUTE FUNCTION bump_tag();",
+    );
+    assert!(
+        message.contains("`mut_veto` reads NEW.tag, which `mut_bump` assigns"),
+        "got: {message}"
+    );
+}
+
+/// A trigger PostgreSQL runs after one assigning NEW writes a table that the
+/// assignment reads, which the replica runs the assignment after.
+#[test]
+fn a_later_writer_of_a_table_the_assignment_reads_is_refused() {
+    let message = refusal(
+        "CREATE TABLE mut (id INT PRIMARY KEY, tag TEXT);
+         CREATE TABLE mut_log (seq SERIAL PRIMARY KEY, id INT);
+         CREATE FUNCTION count_tag() RETURNS trigger AS $$
+         BEGIN NEW.tag := (SELECT count(*) FROM mut_log)::TEXT; RETURN NEW; END;
+         $$ LANGUAGE plpgsql;
+         CREATE FUNCTION log_mut() RETURNS trigger AS $$
+         BEGIN INSERT INTO mut_log (id) VALUES (NEW.id); RETURN NEW; END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER mut_count BEFORE INSERT ON mut FOR EACH ROW EXECUTE FUNCTION count_tag();
+         CREATE TRIGGER mut_log BEFORE INSERT ON mut FOR EACH ROW EXECUTE FUNCTION log_mut();",
+    );
+    assert!(message.contains("`mut_log` may write a table, and `mut_count`"), "got: {message}");
+}
+
+/// Two triggers assigning the same field keep the later one's value, which
+/// the replica runs in no set order.
+#[test]
+fn two_triggers_assigning_one_field_are_refused() {
+    let message = refusal(&format!(
+        "{BUMP_TAG_SCHEMA}
+         CREATE FUNCTION fix_tag() RETURNS trigger AS $$
+         BEGIN NEW.tag := 'fixed'; RETURN NEW; END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER mut_fix BEFORE UPDATE ON mut FOR EACH ROW EXECUTE FUNCTION fix_tag();"
+    ));
+    assert!(message.contains("`mut_bump` and `mut_fix` both assign NEW.tag"), "got: {message}");
+}
+
+/// PostgreSQL raises for a column it does not find before a later trigger
+/// can skip the row, which the replica, running the assignment after the
+/// write, lets that trigger skip.
+#[test]
+fn an_assigning_trigger_naming_a_missing_column_is_refused() {
+    let message = refusal(
+        "CREATE TABLE parents (id INT PRIMARY KEY, name TEXT);
+         CREATE TABLE mut (id INT PRIMARY KEY, tag TEXT);
+         CREATE FUNCTION copy_name() RETURNS trigger AS $$
+         BEGIN NEW.tag := (SELECT p.nme FROM parents p WHERE p.id = NEW.id); RETURN NEW; END;
+         $$ LANGUAGE plpgsql;
+         CREATE FUNCTION skip_negative() RETURNS trigger AS $$
+         BEGIN IF NEW.id < 0 THEN RETURN NULL; END IF; RETURN NEW; END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER mut_a BEFORE INSERT ON mut FOR EACH ROW EXECUTE FUNCTION copy_name();
+         CREATE TRIGGER mut_b BEFORE INSERT ON mut FOR EACH ROW EXECUTE FUNCTION skip_negative();",
+    );
+    assert!(
+        message
+            .contains("`mut_a` names a field of NEW or OLD or a column PostgreSQL does not find"),
+        "got: {message}"
+    );
+}
+
+/// An earlier session's trigger assigning NEW is checked against a trigger
+/// the batch adds to its slot.
+#[test]
+fn a_later_trigger_beside_an_earlier_session_assignment_is_refused() {
+    let initial = Pg2Sqlite::default()
+        .sql(BUMP_TAG_SCHEMA)
+        .expect("parse")
+        .build_schema()
+        .expect("the earlier session builds");
+    let message = Pg2Sqlite::default()
+        .sql(
+            "CREATE FUNCTION veto_untagged() RETURNS trigger AS $$
+             BEGIN IF NEW.tag IS NULL THEN RETURN NULL; END IF; RETURN NEW; END;
+             $$ LANGUAGE plpgsql;
+             CREATE TRIGGER mut_veto BEFORE UPDATE ON mut FOR EACH ROW
+                 EXECUTE FUNCTION veto_untagged();",
+        )
+        .expect("parse")
+        .translate_to_sql_with_schema(&initial, &Pg2SqliteOptions::default())
+        .expect_err("must be refused")
+        .to_string();
+    assert!(
+        message.contains("`mut_veto` reads NEW.tag, which `mut_bump` assigns"),
+        "got: {message}"
+    );
+}
+
+/// Replacing a member's function checks the pair again against its new body.
+#[test]
+fn a_replaced_function_reading_an_assigned_field_is_refused() {
+    let message = refusal(&format!(
+        "{BUMP_TAG_SCHEMA}
+         CREATE FUNCTION veto() RETURNS trigger AS $$
+         BEGIN IF NEW.id < 0 THEN RETURN NULL; END IF; RETURN NEW; END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER mut_veto BEFORE UPDATE ON mut FOR EACH ROW EXECUTE FUNCTION veto();
+         CREATE OR REPLACE FUNCTION veto() RETURNS trigger AS $$
+         BEGIN IF NEW.tag IS NULL THEN RETURN NULL; END IF; RETURN NEW; END;
+         $$ LANGUAGE plpgsql;"
+    ));
+    assert!(
+        message.contains("`mut_veto` reads NEW.tag, which `mut_bump` assigns"),
+        "got: {message}"
+    );
+}
+
+/// A trigger assigning NEW that fires after the write shares its slot with
+/// nothing the replica can order.
+#[test]
+fn an_assigning_trigger_after_the_write_beside_another_is_refused() {
+    let message = refusal(&format!(
+        "{LOGGING_FUNCTIONS}
+         CREATE FUNCTION bump_a() RETURNS trigger AS $$
+         BEGIN NEW.a := 1; RETURN NEW; END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER t_bump AFTER UPDATE ON t FOR EACH ROW EXECUTE FUNCTION bump_a();
+         CREATE TRIGGER t_one AFTER UPDATE ON t FOR EACH ROW EXECUTE FUNCTION log_one();"
+    ));
+    assert!(
+        message.contains("`t_bump` assigns to NEW in a trigger firing after the write"),
+        "got: {message}"
+    );
+}
+
+/// A trigger assigning NEW whose function a later session replaces with a
+/// plain body joins the slot of its neighbour, and each keeps its own WHEN.
+#[test]
+fn an_assignment_turned_plain_keeps_both_conditions() {
+    let earlier = "CREATE TABLE edges (id INT PRIMARY KEY, parent_id INT NOT NULL, tag TEXT);
+         CREATE FUNCTION copy_tag() RETURNS trigger AS $$
+         BEGIN NEW.tag := 'copied'; RETURN NEW; END;
+         $$ LANGUAGE plpgsql;
+         CREATE FUNCTION check_edge() RETURNS trigger AS $$
+         BEGIN RAISE EXCEPTION 'self edge'; END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER edges_copy BEFORE INSERT ON edges FOR EACH ROW
+             WHEN (NEW.parent_id > 10) EXECUTE FUNCTION copy_tag();
+         CREATE TRIGGER edges_shape BEFORE INSERT ON edges FOR EACH ROW
+             WHEN (NEW.parent_id = NEW.id) EXECUTE FUNCTION check_edge();";
+    let mut connection = apply_schema(earlier);
+    let initial = Pg2Sqlite::default()
+        .sql(earlier)
+        .expect("parse")
+        .build_schema()
+        .expect("the earlier session builds");
+    let statements = Pg2Sqlite::default()
+        .sql(
+            "CREATE OR REPLACE FUNCTION copy_tag() RETURNS trigger AS $$
+             BEGIN RAISE EXCEPTION 'far parent'; END;
+             $$ LANGUAGE plpgsql;",
+        )
+        .expect("parse")
+        .translate_to_sql_with_schema(&initial, &Pg2SqliteOptions::default())
+        .expect("translate")
+        .into_vec();
+    for statement in &statements {
+        diesel::sql_query(statement.as_str())
+            .execute(&mut connection)
+            .unwrap_or_else(|error| panic!("DDL: {error}\n{statement}"));
+    }
+    let insert = |connection: &mut SqliteConnection, id: i32, parent_id: i32| {
+        diesel::sql_query(format!("INSERT INTO edges (id, parent_id) VALUES ({id}, {parent_id})"))
+            .execute(connection)
+            .map_err(|error| error.to_string())
+    };
+    insert(&mut connection, 1, 2).expect("neither condition holds");
+    let self_edge = insert(&mut connection, 5, 5).expect_err("edges_shape fires");
+    assert!(self_edge.contains("self edge"), "got: {self_edge}");
+    let far = insert(&mut connection, 3, 20).expect_err("edges_copy fires");
+    assert!(far.contains("far parent"), "got: {far}");
 }

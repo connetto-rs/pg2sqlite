@@ -88,6 +88,21 @@ pub(crate) fn raising_unresolved(
     raising(block, &trigger_signature(function), rows(table, schema), schema)
 }
 
+/// Whether the trigger function `function` that a trigger on `table` runs
+/// names SQL PostgreSQL does not find in `schema`.
+///
+/// # Errors
+///
+/// Returns the error reading the body returns.
+pub(crate) fn names_unresolved(
+    function: &ObjectName,
+    table: &ObjectName,
+    schema: &ParserDB,
+) -> Result<bool, Error> {
+    let Some(block) = schema.function_body(function)? else { return Ok(false) };
+    Ok(!unresolved(&block, &trigger_signature(function), rows(table, schema), schema).is_empty())
+}
+
 /// `block`, the body of the helper `helper`, rewritten as
 /// [`raising_unresolved`] rewrites a trigger function's.
 pub(crate) fn helper_raising_unresolved(

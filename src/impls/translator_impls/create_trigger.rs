@@ -614,18 +614,6 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
             .then(|| trigger_for_helpers.maintenance_refusal(body_schema(schema, options)))
             .transpose()?;
         let is_maintenance_trigger = matches!(maintenance_refusal, Some(None));
-        // Checked on the trigger as written, before the split below renames
-        // its halves.
-        let shares_slot = options.shares_trigger_slot(&trigger_slots::trigger_key(self));
-        if shares_slot && is_maintenance_trigger {
-            return Err(crate::errors::Error::forward_refusal(format!(
-                "row trigger `{}` assigns to NEW, and another row trigger on table `{}` fires \
-                 on the same event and timing. pg2sqlite runs a trigger assigning NEW as an \
-                 AFTER trigger that updates the row, which cannot keep PostgreSQL's name order \
-                 among the triggers sharing that event.",
-                self.name, self.table_name
-            )));
-        }
 
         if is_maintenance_trigger
             && let Some((insert_trigger, non_insert_trigger)) =
@@ -728,6 +716,7 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
         let marker = super::reentry::marker_table(&source_table_name);
         // A shared slot runs several members in one SQLite trigger, so each
         // keeps its WHEN inside its own body.
+        let shares_slot = options.shares_trigger_slot(&trigger_slots::trigger_key(self));
         let (in_body_guard, translated_condition) = if plain && shares_slot {
             (translated_cond, None)
         } else {

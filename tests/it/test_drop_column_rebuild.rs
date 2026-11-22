@@ -302,6 +302,39 @@ fn a_resumed_batch_with_merged_triggers_is_refused() {
     assert!(error.to_string().contains("merges several PostgreSQL triggers"), "{error}");
 }
 
+/// A trigger assigning NEW runs as its own SQLite trigger beside the plain
+/// one on its event, so the rebuild creates both again.
+#[test]
+fn a_resumed_batch_regenerates_an_assignment_beside_a_trigger() {
+    let stamped = "CREATE TABLE t (id INT PRIMARY KEY, a INT NOT NULL, b INT UNIQUE, c INT); \
+                   CREATE FUNCTION low() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+                   IF NEW.a < 0 THEN RAISE EXCEPTION 'too low'; END IF; RETURN NEW; END $$; \
+                   CREATE FUNCTION stamp() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+                   NEW.c := 7; RETURN NEW; END $$; \
+                   CREATE TRIGGER t_low BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION low(); \
+                   CREATE TRIGGER t_stamp BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION stamp();";
+    let mut connection = helpers::apply_default(stamped).expect("the first session applies");
+    let schema = Pg2Sqlite::default().sql(stamped).unwrap().build_schema().unwrap();
+    let statements = Pg2Sqlite::default()
+        .sql("ALTER TABLE t DROP COLUMN b;")
+        .unwrap()
+        .translate_with_schema(&schema, &Pg2SqliteOptions::default())
+        .expect("the drop translates")
+        .into_vec();
+    for statement in &statements {
+        diesel::sql_query(statement.to_string())
+            .execute(&mut connection)
+            .unwrap_or_else(|error| panic!("{statement}: {error}"));
+    }
+    insert(&mut connection, 1, 10).expect("a row lands");
+    assert_eq!(refusal(insert(&mut connection, 2, -1)), "P0001: too low");
+    let stamped_rows = diesel::sql_query("SELECT count(*) AS count FROM t WHERE c = 7")
+        .get_result::<helpers::Count>(&mut connection)
+        .expect("the rows read")
+        .count;
+    assert_eq!(stamped_rows, 1);
+}
+
 /// The drop translated on its own, outside a batch, still brings back the
 /// table's index and trigger, and leaves those of other tables alone.
 #[test]
