@@ -3235,6 +3235,40 @@ fn generate_rls_statements(
     generate_rls_statements_with_context(table, schema, &context, emit)
 }
 
+/// The statements dropping the view standing for `table`, the views generated
+/// beside it and its backing table, whose triggers SQLite drops with it.
+///
+/// # Errors
+///
+/// Propagates a failed lookup of the table's row-level security.
+pub(crate) fn drop_view_statements(
+    table: &CreateTable,
+    schema: &ParserDB,
+    options: &Pg2SqliteOptions,
+    if_exists: bool,
+) -> Result<Vec<Statement>, Error> {
+    let ctx = RlsTriggerContext::new(table, options);
+    let mut statements =
+        vec![ast_builder::drop_view(generated_object_name(ctx.table_name), if_exists)];
+    if marks_forwarding(table, schema, options)? {
+        statements.push(ast_builder::drop_view(
+            generated_object_name(&conflict_skipping_view(ctx.table_name)),
+            true,
+        ));
+    }
+    if table.has_row_level_security(schema)? {
+        // Generated only when the role can read the key through a view that
+        // admits rows.
+        statements.push(ast_builder::drop_view(
+            generated_object_name(&format!("{}_violations", ctx.inner_table_name)),
+            true,
+        ));
+    }
+    statements
+        .push(ast_builder::drop_table(generated_object_name(&ctx.inner_table_name), if_exists));
+    Ok(statements)
+}
+
 /// Renames a CREATE TABLE statement to use the inner table name for RLS.
 /// Also updates any foreign key references to other RLS tables.
 #[must_use]

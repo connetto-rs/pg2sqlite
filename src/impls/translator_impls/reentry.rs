@@ -312,7 +312,7 @@ impl MarkerTables {
                 for marker in names.iter().flat_map(markers_of) {
                     let key = table_key(&marker);
                     if self.created.remove(&key) | self.inherited.remove(&key) {
-                        emitted.push(drop(marker));
+                        emitted.push(ast_builder::drop_table(marker, true));
                     }
                 }
             }
@@ -368,17 +368,4 @@ fn create(marker: ObjectName) -> Statement {
         ]
     };
     ast_builder::create_table(marker, columns)
-}
-
-fn drop(marker: ObjectName) -> Statement {
-    Statement::Drop {
-        object_type: ObjectType::Table,
-        if_exists: true,
-        names: vec![marker],
-        cascade: false,
-        restrict: false,
-        purge: false,
-        temporary: false,
-        table: None,
-    }
 }

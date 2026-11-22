@@ -255,8 +255,18 @@ pub(crate) fn create_view(
 
 /// `DROP VIEW [IF EXISTS] name`.
 pub(crate) fn drop_view(name: ObjectName, if_exists: bool) -> Statement {
+    drop_object(ObjectType::View, name, if_exists)
+}
+
+/// `DROP TABLE [IF EXISTS] name`.
+pub(crate) fn drop_table(name: ObjectName, if_exists: bool) -> Statement {
+    drop_object(ObjectType::Table, name, if_exists)
+}
+
+/// `DROP <object_type> [IF EXISTS] name`.
+pub(crate) fn drop_object(object_type: ObjectType, name: ObjectName, if_exists: bool) -> Statement {
     Statement::Drop {
-        object_type: ObjectType::View,
+        object_type,
         if_exists,
         names: vec![name],
         cascade: false,
