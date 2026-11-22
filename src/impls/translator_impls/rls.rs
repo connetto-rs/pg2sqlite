@@ -2415,13 +2415,16 @@ fn exemption_guard(call: Expr) -> Expr {
 }
 
 fn policy_or_exemption_expr(predicate: Expr, options: &Pg2SqliteOptions) -> Expr {
-    write_exemption_expr(options).map_or(predicate.clone(), |call| {
-        Expr::BinaryOp {
-            left: Box::new(exemption_guard(call)),
-            op: BinaryOperator::Or,
-            right: Box::new(Expr::Nested(Box::new(predicate))),
+    match write_exemption_expr(options) {
+        Some(call) => {
+            Expr::BinaryOp {
+                left: Box::new(exemption_guard(call)),
+                op: BinaryOperator::Or,
+                right: Box::new(Expr::Nested(Box::new(predicate))),
+            }
         }
-    })
+        None => predicate,
+    }
 }
 
 fn policy_violation(predicate: Expr) -> Expr {
@@ -2902,12 +2905,12 @@ fn update_body(
         })
         .collect();
     let using = using.expect("update guard always has a USING predicate");
-    let using_predicate = match &using {
-        PolicyPredicate::Expr(predicate) => Some(predicate.as_ref().clone()),
-        PolicyPredicate::AllowAll | PolicyPredicate::DenyAll => None,
-    };
     let using_denies = rows.has_no_policy(GatedCommand::Update, RowVersion::Existing)
         || matches!(using, PolicyPredicate::DenyAll);
+    let using_predicate = match using {
+        PolicyPredicate::Expr(predicate) => Some(*predicate),
+        PolicyPredicate::AllowAll | PolicyPredicate::DenyAll => None,
+    };
     let authorization = if using_denies {
         write_exemption_expr(options).map(exemption_guard)
     } else {

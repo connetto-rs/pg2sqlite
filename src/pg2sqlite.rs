@@ -1413,6 +1413,18 @@ impl Pg2Sqlite {
         options: &Pg2SqliteOptions,
         initial_schema: Option<&ParserDB>,
     ) -> Result<PreparedTranslation, crate::errors::Error> {
+        crate::impls::stack_headroom::on_deep_stack(|| {
+            self.prepare_translation_here(options, initial_schema)
+        })
+    }
+
+    /// The translation [`prepare_translation`](Self::prepare_translation)
+    /// answers, run on the current stack.
+    fn prepare_translation_here(
+        &self,
+        options: &Pg2SqliteOptions,
+        initial_schema: Option<&ParserDB>,
+    ) -> Result<PreparedTranslation, crate::errors::Error> {
         let prepared = self.prepare_schema(options, initial_schema)?;
         let mut context = prepared.context(options);
         let PreparedStatements {
@@ -1641,7 +1653,9 @@ impl Pg2Sqlite {
         &self,
         options: &Pg2SqliteOptions,
     ) -> Result<Script<String>, crate::errors::Error> {
-        Ok(self.translate(options)?.map(|statement| statement.to_string()))
+        crate::impls::stack_headroom::on_deep_stack(|| {
+            Ok(self.translate(options)?.map(|statement| statement.to_string()))
+        })
     }
 
     /// Translates against a complete starting `schema` and returns SQL strings.
@@ -1654,7 +1668,9 @@ impl Pg2Sqlite {
         schema: &ParserDB,
         options: &Pg2SqliteOptions,
     ) -> Result<Script<String>, crate::errors::Error> {
-        Ok(self.translate_with_schema(schema, options)?.map(|statement| statement.to_string()))
+        crate::impls::stack_headroom::on_deep_stack(|| {
+            Ok(self.translate_with_schema(schema, options)?.map(|statement| statement.to_string()))
+        })
     }
 
     /// Builds a [`ParserDB`] schema from the loaded PostgreSQL statements,
@@ -1722,6 +1738,15 @@ impl Pg2Sqlite {
     /// assert_eq!(format!("{}.{:02}", stored / divisor, stored % divisor), "19.99");
     /// ```
     pub fn translation_manifest(
+        &self,
+        options: &Pg2SqliteOptions,
+    ) -> Result<Vec<crate::manifest::TableManifestEntry>, crate::errors::Error> {
+        crate::impls::stack_headroom::on_deep_stack(|| self.translation_manifest_here(options))
+    }
+
+    /// The manifest [`translation_manifest`](Self::translation_manifest)
+    /// answers, built on the current stack.
+    fn translation_manifest_here(
         &self,
         options: &Pg2SqliteOptions,
     ) -> Result<Vec<crate::manifest::TableManifestEntry>, crate::errors::Error> {
@@ -1836,8 +1861,10 @@ impl Pg2Sqlite {
         schema: &ParserDB,
         options: &Pg2SqliteOptions,
     ) -> Result<Statement, crate::errors::Error> {
-        let context = TranslationContext::new(options);
-        sqlite_stmt.reverse_translate(schema, &context)
+        crate::impls::stack_headroom::on_deep_stack(|| {
+            let context = TranslationContext::new(options);
+            sqlite_stmt.reverse_translate(schema, &context)
+        })
     }
 
     /// Parses SQLite SQL and reverse translates all statements to PostgreSQL.
