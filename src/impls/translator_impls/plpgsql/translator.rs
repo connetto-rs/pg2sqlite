@@ -1333,9 +1333,13 @@ impl PlPgSqlTranslator {
         let bindings: Vec<_> = scope.bindings().cloned().collect();
         let (_, variables) =
             Self::bound_values(&bindings, ReferenceForm::Inline, schema, options, emit);
+        let mut reserved_query = query.clone();
+        reserve_variables(&mut reserved_query, &bindings);
+        let reserved = reserved_variables(&bindings, options);
+        let options = options.with_variables(&reserved);
         let mut translated = Vec::new();
-        for statement in Self::translate_query_statement(query, options)? {
-            translated.extend(statement.translate_with_warnings(schema, options, emit)?);
+        for statement in Self::translate_query_statement(&reserved_query, &options)? {
+            translated.extend(statement.translate_with_warnings(schema, &options, emit)?);
         }
         for statement in &mut translated {
             substitute_variables(statement, &variables)?;

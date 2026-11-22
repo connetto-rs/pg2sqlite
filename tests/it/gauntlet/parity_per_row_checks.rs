@@ -40,6 +40,16 @@ BEGIN
     END IF;
 END;
 $$;
+CREATE FUNCTION require_light_children(closing_id INTEGER) RETURNS VOID LANGUAGE plpgsql AS $$
+DECLARE
+    kid_id INTEGER;
+BEGIN
+    FOR kid_id IN WITH kids AS (SELECT child.id FROM children child WHERE child.parent_id = closing_id)
+        SELECT kid.id FROM kids kid LOOP
+        PERFORM require_light(kid_id);
+    END LOOP;
+END;
+$$;
 ";
 
 /// The trigger running `body` after a parent changes.
@@ -78,6 +88,33 @@ const LOOPED_AFTER_A_ROW_BLOCK: &str = "
             PERFORM require_light(kid);
         END LOOP;
     END;";
+
+/// The loop of [`LOOPED`] reading the parent through a variable.
+const LOOPED_OVER_A_VARIABLE: &str = "
+    DECLARE closing_id INTEGER := NEW.id; BEGIN
+        FOR child_id IN SELECT child.id FROM children child WHERE child.parent_id = closing_id LOOP
+            PERFORM require_light(child_id);
+        END LOOP;
+    END;";
+
+/// The check of [`PERFORMED`] reading the parent through a variable.
+const PERFORMED_OVER_A_VARIABLE: &str = "
+    DECLARE closing_id INTEGER := NEW.id; BEGIN
+        PERFORM require_light(child.id) FROM children child WHERE child.parent_id = closing_id;
+    END;";
+
+/// The loop of [`LOOPED_OVER_A_VARIABLE`] reading the variable in a `WITH`
+/// query.
+const LOOPED_OVER_A_WITH_QUERY: &str = "
+    DECLARE closing_id INTEGER := NEW.id; BEGIN
+        FOR child_id IN WITH kids AS (SELECT child.id FROM children child WHERE child.parent_id = closing_id)
+            SELECT kid.id FROM kids kid LOOP
+            PERFORM require_light(child_id);
+        END LOOP;
+    END;";
+
+/// The loop of [`LOOPED_OVER_A_WITH_QUERY`] in a function passed the parent.
+const CALLED_LOOP_OVER_A_WITH_QUERY: &str = "PERFORM require_light_children(NEW.id);";
 
 /// Parent 1 has light children only, parent 2 one heavy child, parent 3 two,
 /// and parent 4 none.
@@ -203,4 +240,24 @@ fn a_perform_over_rows_checks_every_row_as_postgres_does() {
 #[test]
 fn a_loop_variable_named_as_an_ended_blocks_row_checks_every_row_as_postgres_does() {
     checks_every_row_as_postgres_does(LOOPED_AFTER_A_ROW_BLOCK);
+}
+
+#[test]
+fn a_loop_over_a_with_query_reading_a_variable_checks_every_row_as_postgres_does() {
+    checks_every_row_as_postgres_does(LOOPED_OVER_A_WITH_QUERY);
+}
+
+#[test]
+fn a_loop_reading_a_variable_checks_every_row_as_postgres_does() {
+    checks_every_row_as_postgres_does(LOOPED_OVER_A_VARIABLE);
+}
+
+#[test]
+fn a_called_loop_over_a_with_query_reading_a_parameter_checks_every_row_as_postgres_does() {
+    checks_every_row_as_postgres_does(CALLED_LOOP_OVER_A_WITH_QUERY);
+}
+
+#[test]
+fn a_perform_over_rows_reading_a_variable_checks_every_row_as_postgres_does() {
+    checks_every_row_as_postgres_does(PERFORMED_OVER_A_VARIABLE);
 }

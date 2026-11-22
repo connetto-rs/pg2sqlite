@@ -75,6 +75,9 @@ mod parity_deferred_constraint_triggers;
 #[path = "gauntlet/parity_deferred_helper_triggers.rs"]
 mod parity_deferred_helper_triggers;
 
+#[path = "gauntlet/parity_deferred_loop_checks.rs"]
+mod parity_deferred_loop_checks;
+
 #[path = "gauntlet/parity_values.rs"]
 mod parity_values;
 
