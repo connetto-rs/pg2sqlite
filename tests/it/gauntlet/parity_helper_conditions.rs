@@ -3,6 +3,7 @@
 //! bound, a principal beside the caller, a delimited set, a caller gate, a
 //! scalar compared as sent or lowered, a row cap lifted for a request acting
 //! through no installation, a returned key capped by another helper's set, a
+//! column kept outside another helper's set, that set holding `NULL` or not, a
 //! walk down two edge tables kept to a selection, and a walk up a tree
 //! feeding a grantee set. Then for an arm reading another helper's rows, and
 //! for a helper read in `FROM`, as its rows, its columns under an alias, and
@@ -239,6 +240,24 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
   WHERE doc.kind = 'page' AND doc.id IN (SELECT authz.granted_docs())
 $$;
 
+CREATE FUNCTION authz.blocked_orgs() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT block.org_id FROM public.blocks block
+  WHERE block.user_id = authz.caller_id() AND block.state = 'active'
+$$;
+
+CREATE FUNCTION authz.unblocked_pages() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT doc.id FROM public.docs doc
+  WHERE doc.kind = 'page' AND NOT (doc.org_id = ANY (ARRAY(SELECT authz.blocked_orgs())))
+$$;
+
+CREATE FUNCTION authz.non_team_docs() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT grant_row.doc_id FROM public.grants grant_row
+  WHERE grant_row.grantee NOT IN (SELECT authz.caller_teams())
+$$;
+
 ALTER FUNCTION authz.caller_id() OWNER TO conditions_owner;
 ALTER FUNCTION authz.installation_id() OWNER TO conditions_owner;
 ALTER FUNCTION authz.link_ids() OWNER TO conditions_owner;
@@ -261,6 +280,9 @@ ALTER FUNCTION authz.caller_teams() OWNER TO conditions_owner;
 ALTER FUNCTION authz.team_docs() OWNER TO conditions_owner;
 ALTER FUNCTION authz.called_orgs() OWNER TO conditions_owner;
 ALTER FUNCTION authz.granted_pages() OWNER TO conditions_owner;
+ALTER FUNCTION authz.blocked_orgs() OWNER TO conditions_owner;
+ALTER FUNCTION authz.unblocked_pages() OWNER TO conditions_owner;
+ALTER FUNCTION authz.non_team_docs() OWNER TO conditions_owner;
 REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA authz FROM PUBLIC;
 GRANT USAGE ON SCHEMA authz TO conditions_owner;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA authz TO conditions_owner;
@@ -278,7 +300,7 @@ GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA authz TO app;
 
 /// Each helper's policy over `docs`, one case per condition it carries or
 /// place its rows are read in.
-const CASES: [(&str, &str); 25] = [
+const CASES: [(&str, &str); 27] = [
     ("a joined row", "org_id IN (SELECT authz.member_orgs())"),
     ("a row cap over a joined row", "org_id IN (SELECT authz.administered_orgs())"),
     ("an anti-join, time bounds and a principal", "id IN (SELECT authz.granted_docs())"),
@@ -293,6 +315,8 @@ const CASES: [(&str, &str); 25] = [
     ("a walk down kept to a selection", "id IN (SELECT authz.reachable_docs())"),
     ("a walk up feeding a grantee set", "id IN (SELECT authz.team_docs())"),
     ("a returned key capped by another helper's set", "id IN (SELECT authz.granted_pages())"),
+    ("a column outside another helper's set", "id IN (SELECT authz.unblocked_pages())"),
+    ("a column outside a set holding NULL", "id IN (SELECT authz.non_team_docs())"),
     ("an arm reading another helper's rows", "org_id IN (SELECT authz.called_orgs())"),
     ("a set helper's rows", "org_id IN (SELECT member_orgs FROM authz.member_orgs())"),
     ("a set helper's rows under an alias", "org_id IN (SELECT o FROM authz.member_orgs() o)"),

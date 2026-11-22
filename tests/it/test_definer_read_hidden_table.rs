@@ -93,6 +93,22 @@ fn a_write_check_calling_a_helper_over_a_hidden_table_is_refused() {
     assert_eq!(refusal(&pg), REFUSAL);
 }
 
+/// A helper keeping its rows outside the set of a helper over a hidden table
+/// reads that table too.
+#[test]
+fn a_helper_excluding_a_set_over_a_hidden_table_is_refused() {
+    let pg = script(
+        "CREATE TABLE open_ids (id INT PRIMARY KEY);
+         GRANT SELECT ON open_ids TO owner_role, app;
+         CREATE FUNCTION unhidden_ids() RETURNS SETOF INT LANGUAGE sql STABLE SECURITY DEFINER
+           SET search_path = pg_catalog, pg_temp AS $$
+           SELECT id FROM public.open_ids WHERE id NOT IN (SELECT public.visible_ids()) $$;
+         ALTER FUNCTION unhidden_ids() OWNER TO owner_role;",
+        "FOR SELECT TO app USING (owner IN (SELECT unhidden_ids()))",
+    );
+    assert_eq!(refusal(&pg), REFUSAL.replace("visible_ids()", "unhidden_ids()"));
+}
+
 /// The grant the refusal names keeps `secret` on the replica, its rows hidden
 /// from `app` and read by the helper.
 #[test]
