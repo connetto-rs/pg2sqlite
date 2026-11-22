@@ -3,13 +3,15 @@
 //! bound, a principal beside the caller, a delimited set, a caller gate, a
 //! scalar compared as sent or lowered, a row cap lifted for a request acting
 //! through no installation, a returned key capped by another helper's set, a
-//! column kept outside another helper's set, that set holding `NULL` or not, a
-//! walk down two edge tables kept to a selection, and a walk up a tree
-//! feeding a grantee set. Then for an arm reading another helper's rows, and
-//! for a helper read in `FROM`, as its rows, its columns under an alias, and
-//! its rows correlated with the row a policy reads. Each helper guards the
-//! same table under a policy of its own, which both engines read before any
-//! request and then under every request state.
+//! column capped by another helper's set beside the caller, a column kept
+//! outside another helper's set, that set holding `NULL` or not, a setting
+//! left unset, read through `NULLIF` or as sent, a walk down two edge tables
+//! kept to a selection, and a walk up a tree feeding a grantee set. Then for
+//! an arm reading another helper's rows, and for a helper read in `FROM`, as
+//! its rows, its columns under an alias, and its rows correlated with the row
+//! a policy reads. Each helper guards the same table under a policy of its
+//! own, which both engines read before any request and then under every
+//! request state.
 
 // `register_impl` takes an unwind-safe closure, which a poisoning mutex is.
 use std::sync::{Arc, Mutex};
@@ -258,6 +260,24 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
   WHERE grant_row.grantee NOT IN (SELECT authz.caller_teams())
 $$;
 
+CREATE FUNCTION authz.member_granted_docs() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT grant_row.doc_id FROM public.grants grant_row
+  WHERE grant_row.grantee = authz.caller_id() AND grant_row.org_id IN (SELECT authz.member_orgs())
+$$;
+
+CREATE FUNCTION authz.uninstalled_grants() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT grant_row.doc_id FROM public.grants grant_row
+  WHERE grant_row.grantee = authz.caller_id() AND authz.installation_id() IS NULL
+$$;
+
+CREATE FUNCTION authz.never_installed_files() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT doc.id FROM public.docs doc
+  WHERE doc.kind = 'file' AND current_setting('app.installation_id', true) IS NULL
+$$;
+
 ALTER FUNCTION authz.caller_id() OWNER TO conditions_owner;
 ALTER FUNCTION authz.installation_id() OWNER TO conditions_owner;
 ALTER FUNCTION authz.link_ids() OWNER TO conditions_owner;
@@ -283,6 +303,9 @@ ALTER FUNCTION authz.granted_pages() OWNER TO conditions_owner;
 ALTER FUNCTION authz.blocked_orgs() OWNER TO conditions_owner;
 ALTER FUNCTION authz.unblocked_pages() OWNER TO conditions_owner;
 ALTER FUNCTION authz.non_team_docs() OWNER TO conditions_owner;
+ALTER FUNCTION authz.member_granted_docs() OWNER TO conditions_owner;
+ALTER FUNCTION authz.uninstalled_grants() OWNER TO conditions_owner;
+ALTER FUNCTION authz.never_installed_files() OWNER TO conditions_owner;
 REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA authz FROM PUBLIC;
 GRANT USAGE ON SCHEMA authz TO conditions_owner;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA authz TO conditions_owner;
@@ -300,7 +323,7 @@ GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA authz TO app;
 
 /// Each helper's policy over `docs`, one case per condition it carries or
 /// place its rows are read in.
-const CASES: [(&str, &str); 27] = [
+const CASES: [(&str, &str); 30] = [
     ("a joined row", "org_id IN (SELECT authz.member_orgs())"),
     ("a row cap over a joined row", "org_id IN (SELECT authz.administered_orgs())"),
     ("an anti-join, time bounds and a principal", "id IN (SELECT authz.granted_docs())"),
@@ -317,6 +340,9 @@ const CASES: [(&str, &str); 27] = [
     ("a returned key capped by another helper's set", "id IN (SELECT authz.granted_pages())"),
     ("a column outside another helper's set", "id IN (SELECT authz.unblocked_pages())"),
     ("a column outside a set holding NULL", "id IN (SELECT authz.non_team_docs())"),
+    ("a column capped beside the caller", "id IN (SELECT authz.member_granted_docs())"),
+    ("a setting left unset through NULLIF", "id IN (SELECT authz.uninstalled_grants())"),
+    ("a setting left unset as sent", "id IN (SELECT authz.never_installed_files())"),
     ("an arm reading another helper's rows", "org_id IN (SELECT authz.called_orgs())"),
     ("a set helper's rows", "org_id IN (SELECT member_orgs FROM authz.member_orgs())"),
     ("a set helper's rows under an alias", "org_id IN (SELECT o FROM authz.member_orgs() o)"),
