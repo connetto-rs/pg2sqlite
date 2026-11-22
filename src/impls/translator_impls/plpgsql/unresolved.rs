@@ -37,6 +37,7 @@ use crate::{
         object_name::{last_ident, resolve_translation_table},
         query_builder::single_expr_query,
         translator_impls::{create_trigger::body_schema, trigger_slots::folded},
+        unlabelled_body::signature,
     },
     options::TranslationContext,
     traits::{schema::Schema, translator::TranslatorWithContext},
@@ -94,18 +95,7 @@ pub(crate) fn helper_raising_unresolved(
     helper: &CreateFunction,
     schema: &ParserDB,
 ) -> Block {
-    let stored = |ident: &Ident| stored_ident_name(ident).into_owned();
-    let signature = Signature {
-        name: last_ident(&helper.name).map_or_else(String::new, stored),
-        parameters: helper
-            .args
-            .iter()
-            .flatten()
-            .map(|argument| argument.name.as_ref().map(stored))
-            .collect(),
-        kind: FunctionKind::Plain,
-    };
-    raising(block, &signature, None, schema)
+    raising(block, &signature(helper), None, schema)
 }
 
 /// `block` with each step naming what PostgreSQL does not find in `schema`

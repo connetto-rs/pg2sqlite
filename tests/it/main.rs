@@ -144,6 +144,7 @@ mod test_json_operators;
 mod test_json_path_operators;
 mod test_json_typeof;
 mod test_jsonb_set_and_insert;
+mod test_labelled_references;
 mod test_like_escape;
 mod test_literal_forms;
 mod test_literal_scale_folding;

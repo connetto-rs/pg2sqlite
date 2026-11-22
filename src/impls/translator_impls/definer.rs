@@ -124,7 +124,8 @@ pub(crate) fn exempt_owners<'s>(table: &'s CreateTable, schema: &'s ParserDB) ->
     owners
 }
 
-fn returns_trigger(function: &CreateFunction) -> bool {
+/// Whether `function` is a trigger function.
+pub(crate) fn returns_trigger(function: &CreateFunction) -> bool {
     matches!(function.return_type, Some(FunctionReturnType::DataType(DataType::Trigger)))
 }
 

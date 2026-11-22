@@ -31,6 +31,7 @@ use crate::{
         privileges::names_table_with_backing,
         query_builder::{plain_table_with_joins, single_expr_query},
         shared_helpers::ColumnRewrites,
+        unlabelled_body::{folded_namespace, unlabelled_value},
     },
     traits::{schema::Schema, translator::TranslatorWithContext},
 };
@@ -93,8 +94,10 @@ fn maintenance_chain(
         .maintenance_undeclared_fields(schema)?
         .map(|field| (field.row().name(), stored_ident_name(field.field()).into_owned()))
         .collect();
+    let namespace = folded_namespace(trigger, schema)?;
     let mut assigned: Vec<(String, Expr)> = Vec::new();
     for (col, raw) in trigger.maintenance_assignments(schema)? {
+        let raw = unlabelled_value(raw, namespace.as_ref());
         let composed = super::plpgsql::PlPgSqlTranslator::fold_trigger_specials_in(
             compose_assignment_refs(&without_undeclared(&raw, &undeclared), &assigned),
             &facts,
