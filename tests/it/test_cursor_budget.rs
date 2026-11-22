@@ -19,6 +19,46 @@ use crate::helpers;
 /// down the hierarchy and each next one calling the previous one twice, with
 /// the update policy calling the last `calls` times.
 fn walk_chain(levels: usize, calls: usize) -> String {
+    helper_chain(levels, calls, |previous| {
+        format!(
+            "SELECT item.id FROM public.items item WHERE item.id IN (SELECT public.ids_{previous}())
+  UNION
+  SELECT item.id FROM public.items item WHERE item.parent_id IN (SELECT public.ids_{previous}())"
+        )
+    })
+}
+
+/// Helpers `ids_0` to `ids_<levels>`, the first walking the caller's items
+/// down the hierarchy and each next one answering `body(previous)`, with the
+/// update policy calling the last `calls` times.
+fn helper_chain(levels: usize, calls: usize, body: impl Fn(usize) -> String) -> String {
+    let using = vec![format!("id IN (SELECT ids_{levels}())"); calls].join(" OR ");
+    chain_schema(
+        "ids",
+        "SETOF UUID",
+        "WITH RECURSIVE reached (id) AS (
+    SELECT item.id FROM public.items item WHERE item.owner_id = NULLIF(current_setting('app.user_id', true), '')::uuid
+    UNION
+    SELECT item.id FROM public.items item JOIN reached ON item.parent_id = reached.id
+  )
+  SELECT reached.id FROM reached",
+        levels,
+        body,
+        &using,
+    )
+}
+
+/// The items schema with helpers `<name>_0` to `<name>_<levels>` returning
+/// `returns`, the first answering `first` and each next one answering
+/// `body(previous)`, and an update policy using `using`.
+fn chain_schema(
+    name: &str,
+    returns: &str,
+    first: &str,
+    levels: usize,
+    body: impl Fn(usize) -> String,
+    using: &str,
+) -> String {
     let mut sql = String::from(
         "CREATE ROLE app;
 CREATE ROLE authenticator LOGIN NOINHERIT;
@@ -28,33 +68,21 @@ CREATE TABLE items (id UUID PRIMARY KEY, owner_id UUID NOT NULL, parent_id UUID 
 ALTER TABLE items ENABLE ROW LEVEL SECURITY;
 GRANT SELECT, UPDATE (value) ON items TO app;
 GRANT SELECT ON items TO helper_owner;
-CREATE FUNCTION ids_0() RETURNS SETOF UUID LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
-  WITH RECURSIVE reached (id) AS (
-    SELECT item.id FROM public.items item WHERE item.owner_id = NULLIF(current_setting('app.user_id', true), '')::uuid
-    UNION
-    SELECT item.id FROM public.items item JOIN reached ON item.parent_id = reached.id
-  )
-  SELECT reached.id FROM reached
-$$;
-ALTER FUNCTION ids_0() OWNER TO helper_owner;
 ",
     );
-    for level in 1..=levels {
-        let previous = level - 1;
+    for level in 0..=levels {
+        let answer = if level == 0 { first.to_owned() } else { body(level - 1) };
         write!(
             sql,
-            "CREATE FUNCTION ids_{level}() RETURNS SETOF UUID LANGUAGE sql STABLE SECURITY DEFINER \
+            "CREATE FUNCTION {name}_{level}() RETURNS {returns} LANGUAGE sql STABLE SECURITY DEFINER \
              SET search_path = pg_catalog, pg_temp AS $$
-  SELECT item.id FROM public.items item WHERE item.id IN (SELECT public.ids_{previous}())
-  UNION
-  SELECT item.id FROM public.items item WHERE item.parent_id IN (SELECT public.ids_{previous}())
+  {answer}
 $$;
-ALTER FUNCTION ids_{level}() OWNER TO helper_owner;
+ALTER FUNCTION {name}_{level}() OWNER TO helper_owner;
 "
         )
         .expect("writing to a string");
     }
-    let using = vec![format!("id IN (SELECT ids_{levels}())"); calls].join(" OR ");
     write!(
         sql,
         "CREATE POLICY read_items ON items FOR SELECT TO app USING (true);
@@ -332,4 +360,38 @@ fn a_program_past_sqlites_cursor_limit_is_refused_naming_the_repeated_helpers() 
 fn a_deep_helper_chain_is_refused_on_a_default_thread() {
     let message = refusal(&walk_chain(7, 1));
     assert!(message.contains("ids_7()"), "the refusal names the policy's helper: {message}");
+}
+
+/// Translates `sql`, failing the test when translation errors.
+fn assert_translates(sql: &str) {
+    helpers::translate_pg(sql, &options())
+        .unwrap_or_else(|error| panic!("the chain translates: {error}"));
+}
+
+#[test]
+fn a_helper_chain_read_through_from_translates_on_a_default_thread() {
+    assert_translates(&helper_chain(40, 1, |previous| {
+        format!("SELECT x.id FROM public.ids_{previous}() AS x(id)")
+    }));
+}
+
+#[test]
+fn a_helper_chain_read_through_in_translates_on_a_default_thread() {
+    assert_translates(&helper_chain(40, 1, |previous| {
+        format!(
+            "SELECT item.id FROM public.items item WHERE item.id IN (SELECT public.ids_{previous}())"
+        )
+    }));
+}
+
+#[test]
+fn a_helper_chain_read_through_a_scalar_subquery_translates_on_a_default_thread() {
+    assert_translates(&chain_schema(
+        "me",
+        "UUID",
+        "SELECT NULLIF(current_setting('app.user_id', true), '')::uuid",
+        40,
+        |previous| format!("SELECT (SELECT public.me_{previous}())"),
+        "owner_id = me_40()",
+    ));
 }

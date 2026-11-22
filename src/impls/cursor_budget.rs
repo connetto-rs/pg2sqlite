@@ -98,12 +98,41 @@ const FOREIGN_KEY: usize = 2;
 pub(crate) fn check<'s>(
     executed: impl IntoIterator<Item = &'s Statement> + Clone,
     recreated: impl IntoIterator<Item = &'s Statement> + Clone,
-    helper_sets: &BTreeMap<Query, Vec<String>>,
+    helper_sets: &BTreeMap<HelperSetKey, Vec<String>>,
 ) -> Result<(), Error> {
     for (program, tally) in tallies(executed, recreated, helper_sets) {
         refuse(&program, &tally)?;
     }
     Ok(())
+}
+
+/// The key a helper set is recorded under, a 64-bit FNV-1a hash of its
+/// query, so recording a set deep inside a translation never copies it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct HelperSetKey(u64);
+
+impl HelperSetKey {
+    /// The key of `query`.
+    pub(crate) fn of(query: &Query) -> Self {
+        let mut hasher = Fnv1a(0xcbf2_9ce4_8422_2325);
+        core::hash::Hash::hash(query, &mut hasher);
+        Self(core::hash::Hasher::finish(&hasher))
+    }
+}
+
+/// The 64-bit FNV-1a hash of the bytes written so far.
+struct Fnv1a(u64);
+
+impl core::hash::Hasher for Fnv1a {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
 }
 
 /// A program the database holds.
@@ -129,7 +158,7 @@ impl core::fmt::Display for Program<'_> {
 fn tallies<'s>(
     executed: impl IntoIterator<Item = &'s Statement> + Clone,
     recreated: impl IntoIterator<Item = &'s Statement> + Clone,
-    helper_sets: &BTreeMap<Query, Vec<String>>,
+    helper_sets: &BTreeMap<HelperSetKey, Vec<String>>,
 ) -> Vec<(Program<'s>, Tally)> {
     let mut live = Live::default();
     for statement in executed.clone() {
@@ -568,7 +597,7 @@ impl Tables {
 struct Counter<'c, 's> {
     tables: Tables,
     views: Views<'s>,
-    helper_sets: &'c BTreeMap<Query, Vec<String>>,
+    helper_sets: &'c BTreeMap<HelperSetKey, Vec<String>>,
 }
 
 impl Counter<'_, '_> {
@@ -690,7 +719,7 @@ impl<'h> Skeleton<'h> {
         root: &impl Visit,
         relation: Option<&Query>,
         tables: &Tables,
-        helper_sets: &'h BTreeMap<Query, Vec<String>>,
+        helper_sets: &'h BTreeMap<HelperSetKey, Vec<String>>,
     ) -> Self {
         let mut builder = Builder {
             levels: vec![Level::default()],
@@ -826,7 +855,7 @@ struct Builder<'t, 'h> {
     /// reading them or push its conditions into.
     flattened: BTreeSet<usize>,
     tables: &'t Tables,
-    helper_sets: &'h BTreeMap<Query, Vec<String>>,
+    helper_sets: &'h BTreeMap<HelperSetKey, Vec<String>>,
 }
 
 impl<'h> Builder<'_, 'h> {
@@ -1041,7 +1070,7 @@ impl Visitor for Builder<'_, '_> {
             flattened: self.flattened.contains(&address),
             ordered: merged || query.order_by.is_some(),
             enclosing: Some(parent),
-            helpers: self.helper_sets.get(query).map(Vec::as_slice),
+            helpers: self.helper_sets.get(&HelperSetKey::of(query)).map(Vec::as_slice),
             ..Level::default()
         };
         match self.definitions.iter().position(|(defined, ..)| *defined == address) {

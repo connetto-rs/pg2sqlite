@@ -1038,16 +1038,21 @@ pub(crate) fn scope_query_for(query: &Query) -> Option<Query> {
     substitute.with.clone_from(&query.with);
     Some(substitute)
 }
+/// The query the columns of `select` resolve against once its function
+/// relations read as the derived tables `translated_from` holds, or `None`
+/// when no relation of `select` is rewritten.
 fn scope_query_after_factor_rewrites(
     select: &sqlparser::ast::Select,
     translated_from: &[sqlparser::ast::TableWithJoins],
-    with: Option<sqlparser::ast::With>,
+    with: Option<&sqlparser::ast::With>,
 ) -> Option<Query> {
-    fn replace_factor(
-        written: &mut sqlparser::ast::TableFactor,
+    /// Whether the translation turns `written` into the derived table
+    /// `translated`, directly or inside a nested join.
+    fn rewrites(
+        written: &sqlparser::ast::TableFactor,
         translated: &sqlparser::ast::TableFactor,
     ) -> bool {
-        match (&mut *written, translated) {
+        match (written, translated) {
             // sql-traits types the columns of `unnest` as written, which the
             // translated derived table would hide.
             (written, _) if expands_an_array(written) => false,
@@ -1056,42 +1061,76 @@ fn scope_query_after_factor_rewrites(
                 | sqlparser::ast::TableFactor::Function { .. }
                 | sqlparser::ast::TableFactor::UNNEST { .. },
                 sqlparser::ast::TableFactor::Derived { .. },
-            ) => {
-                *written = translated.clone();
-                true
-            }
+            ) => true,
             (
                 sqlparser::ast::TableFactor::NestedJoin { table_with_joins: written, .. },
                 sqlparser::ast::TableFactor::NestedJoin { table_with_joins: translated, .. },
-            ) => replace_entry(written, translated),
+            ) => entry_rewrites(written, translated),
             _ => false,
         }
     }
 
+    /// Whether the translation rewrites a relation of `written`.
+    fn entry_rewrites(
+        written: &sqlparser::ast::TableWithJoins,
+        translated: &sqlparser::ast::TableWithJoins,
+    ) -> bool {
+        rewrites(&written.relation, &translated.relation)
+            || written
+                .joins
+                .iter()
+                .zip(&translated.joins)
+                .any(|(written, translated)| rewrites(&written.relation, &translated.relation))
+    }
+
+    /// Replaces each relation of `written` the translation rewrites with its
+    /// translation.
+    fn replace_factor(
+        written: &mut sqlparser::ast::TableFactor,
+        translated: &sqlparser::ast::TableFactor,
+    ) {
+        match (&mut *written, translated) {
+            (
+                sqlparser::ast::TableFactor::NestedJoin { table_with_joins: written, .. },
+                sqlparser::ast::TableFactor::NestedJoin { table_with_joins: translated, .. },
+            ) => replace_entry(written, translated),
+            (written, translated) if rewrites(written, translated) => {
+                *written = translated.clone();
+            }
+            _ => {}
+        }
+    }
+
+    /// Replaces the relations of `written` the translation rewrites.
     fn replace_entry(
         written: &mut sqlparser::ast::TableWithJoins,
         translated: &sqlparser::ast::TableWithJoins,
-    ) -> bool {
-        let mut changed = replace_factor(&mut written.relation, &translated.relation);
+    ) {
+        replace_factor(&mut written.relation, &translated.relation);
         for (written, translated) in written.joins.iter_mut().zip(&translated.joins) {
-            changed |= replace_factor(&mut written.relation, &translated.relation);
+            replace_factor(&mut written.relation, &translated.relation);
         }
-        changed
     }
 
-    let mut relations = select.from.clone();
-    let mut changed = false;
-    for (written, translated) in relations.iter_mut().zip(translated_from) {
-        changed |= replace_entry(written, translated);
-    }
-    if !changed {
+    // The relations may hold whole inlined helper sets, so they are copied
+    // only when a rewrite needs them.
+    if !select
+        .from
+        .iter()
+        .zip(translated_from)
+        .any(|(written, translated)| entry_rewrites(written, translated))
+    {
         return None;
+    }
+    let mut relations = select.from.clone();
+    for (written, translated) in relations.iter_mut().zip(translated_from) {
+        replace_entry(written, translated);
     }
 
     let mut scoped_select = select.clone();
     scoped_select.from = relations;
     let query = crate::impls::query_builder::make_query(
-        with,
+        with.cloned(),
         sqlparser::ast::SetExpr::Select(Box::new(scoped_select)),
     );
     scope_query_for(&query).or(Some(query))
@@ -4828,8 +4867,7 @@ pub(crate) fn translate_select_forward(
         .iter()
         .map(|twj| translate_table_with_joins::<Forward>(twj, schema, options, emit))
         .collect::<Result<Vec<_>, _>>()?;
-    let scope_query =
-        scope_query_after_factor_rewrites(select, &from, options.cte_clause().cloned());
+    let scope_query = scope_query_after_factor_rewrites(select, &from, options.cte_clause());
     if let Some(scope_query) = scope_query {
         let scope = sql_traits::structs::ColumnScope::from_query(
             &scope_query,
