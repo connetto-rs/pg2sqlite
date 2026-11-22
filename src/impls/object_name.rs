@@ -226,13 +226,14 @@ pub(crate) fn normalize_schema_qualified_object_name_for_sqlite(
     Ok(ObjectName(vec![parts.object_part]))
 }
 
-/// Resolves a table under the crate's fixed implicit `public` policy.
+/// Resolves the table a statement names, an unqualified name searching
+/// `pg_temp` before `public` as PostgreSQL does.
 pub(crate) fn resolve_translation_table<'a>(
     schema: &'a ParserDB,
     name: &ObjectName,
 ) -> Result<Option<&'a <ParserDB as DatabaseLike>::Table>, Error> {
     validate_schema_qualified_object_name_for_sqlite(schema, name)?;
-    Ok(schema.resolve_table_object_name(name)?)
+    Ok(schema.resolve_table_object_name_on_search_path(name)?)
 }
 
 /// Resolves a table declaration to the catalogue node for its stored owner.

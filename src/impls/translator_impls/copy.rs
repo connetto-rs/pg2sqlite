@@ -131,12 +131,7 @@ fn reject_copy(subject: &str, to: bool) -> Error {
 /// The columns a `COPY` without a column list writes, every column but the
 /// generated ones, in declaration order.
 fn table_columns(table_name: &ObjectName, schema: &ParserDB) -> Result<Vec<Ident>, Error> {
-    // PostgreSQL looks an unqualified name up in `pg_temp` first.
-    let resolved = match resolve_translation_table(schema, table_name)? {
-        Some(table) => Some(table),
-        None => schema.resolve_table_object_name_on_search_path(table_name)?,
-    };
-    let Some(table) = resolved else {
+    let Some(table) = resolve_translation_table(schema, table_name)? else {
         return Err(Error::forward_refusal(format!(
             "COPY {table_name} names no table the translation declares, so the columns its rows \
              fill are unknown."
