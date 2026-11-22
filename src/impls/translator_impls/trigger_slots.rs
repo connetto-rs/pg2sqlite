@@ -282,28 +282,6 @@ pub(crate) fn shared_slot_triggers<'a>(
     shared
 }
 
-/// Whether `trigger` is emitted merged with another plain row trigger on one
-/// of its slots, as `schema` holds them.
-///
-/// # Errors
-///
-/// Returns an error when a trigger's table or function does not resolve.
-pub(crate) fn is_merged(trigger: &CreateTrigger, schema: &ParserDB) -> Result<bool, Error> {
-    if !super::create_trigger::is_plain_row_trigger(trigger, schema)? {
-        return Ok(false);
-    }
-    let key = trigger_key(trigger);
-    for other in schema.triggers() {
-        if trigger_key(other) != key
-            && slots_of(other).any(|slot| slots_of(trigger).any(|own| own == slot))
-            && super::create_trigger::is_plain_row_trigger(other, schema)?
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 /// Why running a row trigger assigning `NEW` as an `AFTER` trigger that
 /// updates the row, after every other trigger on its slot, gives another
 /// outcome than PostgreSQL's name order.

@@ -39,7 +39,7 @@ use sqlparser::{
 use super::{
     create_trigger::{TriggerRelation, trigger_relation},
     hidden_referenced_rows,
-    trigger_slots::{TriggerSlots, is_merged},
+    trigger_slots::TriggerSlots,
 };
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
@@ -699,9 +699,6 @@ fn regenerated(
             let Some(trigger) = after.triggers().find(|trigger| trigger.name() == name) else {
                 return Ok(Vec::new());
             };
-            if is_merged(trigger, after)? {
-                return Err(merged_trigger_refusal(&entry.name, owner));
-            }
             Statement::CreateTrigger(trigger.clone())
         }
         Some(Origin::Key) => {
