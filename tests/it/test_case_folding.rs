@@ -74,14 +74,15 @@ fn a_fold_by_the_server_locale_is_refused_without_fold_functions() {
     }
 }
 
-/// `äbc`, `ÄBC`, `σιγμα` and `STRAßE` are PostgreSQL's answers, `ß` having no
-/// one-letter upper case.
+/// The registered folds answer what PostgreSQL answers under glibc.
 #[test]
 fn fold_functions_answer_as_the_server_does() {
     assert_eq!(answer("SELECT lower('ÄBC');"), vec![Some("äbc".to_string())]);
     assert_eq!(answer("SELECT upper('äbc');"), vec![Some("ÄBC".to_string())]);
     assert_eq!(answer("SELECT lower('ΣΙΓΜΑ');"), vec![Some("σιγμα".to_string())]);
     assert_eq!(answer("SELECT upper('straße');"), vec![Some("STRAßE".to_string())]);
+    assert_eq!(answer("SELECT lower('İSTANBUL');"), vec![Some("istanbul".to_string())]);
+    assert_eq!(answer("SELECT upper('ᾳ');"), vec![Some("ᾼ".to_string())]);
     assert_eq!(answer("SELECT 'ÄBC' ILIKE 'äbc';"), vec![Some("1".to_string())]);
 }
 
