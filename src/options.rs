@@ -256,8 +256,9 @@ pub(crate) struct PrewalkCatalogs {
     /// The helpers each query written as the set of a helper call reads,
     /// the helper called and the ones its set calls, which a refusal of a
     /// program past SQLite's cursor limit counts.
-    helper_sets:
-        core::cell::RefCell<alloc::collections::BTreeMap<sqlparser::ast::Query, Vec<String>>>,
+    helper_sets: core::cell::RefCell<
+        alloc::collections::BTreeMap<crate::impls::cursor_budget::HelperSetKey, Vec<String>>,
+    >,
 }
 
 /// A trigger on a table.
@@ -1134,14 +1135,20 @@ impl<'a> TranslationContext<'a> {
     /// Records `query` as the set of a call to the helper first in
     /// `helpers`, its set calling the others.
     pub(crate) fn record_helper_set(&self, query: &sqlparser::ast::Query, helpers: Vec<String>) {
-        self.catalogs.helper_sets.borrow_mut().insert(query.clone(), helpers);
+        self.catalogs
+            .helper_sets
+            .borrow_mut()
+            .insert(crate::impls::cursor_budget::HelperSetKey::of(query), helpers);
     }
 
     /// The queries written as the set of a helper call, each with the
     /// helpers it reads.
     pub(crate) fn helper_sets(
         &self,
-    ) -> core::cell::Ref<'_, alloc::collections::BTreeMap<sqlparser::ast::Query, Vec<String>>> {
+    ) -> core::cell::Ref<
+        '_,
+        alloc::collections::BTreeMap<crate::impls::cursor_budget::HelperSetKey, Vec<String>>,
+    > {
         self.catalogs.helper_sets.borrow()
     }
 }
