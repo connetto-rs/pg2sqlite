@@ -756,6 +756,22 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
         });
         let mut parts = Vec::with_capacity(part_events.len());
         for part_events in part_events {
+            // PostgreSQL fires no UPDATE trigger for an INSERT, so none fires
+            // for the write of what a BEFORE INSERT trigger assigned to NEW.
+            let maintained_insert = (plain
+                && part_events.iter().any(|event| matches!(event, TriggerEvent::Update(_))))
+            .then(|| {
+                super::reentry::unmarked_after(
+                    &marker,
+                    "OLD",
+                    super::reentry::MaintainedEvent::Insert,
+                )
+            });
+            let (guard, condition) = if plain && shares_slot {
+                (merge_conditions(in_body_guard.clone(), maintained_insert), None)
+            } else {
+                (None, merge_conditions(translated_condition.clone(), maintained_insert))
+            };
             let function_body = if is_maintenance_trigger {
                 generate_maintenance_trigger_body(
                     &trigger_for_helpers,
@@ -769,7 +785,7 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
                 &exec_body,
                 &TriggerPart {
                     events: &part_events,
-                    guard: in_body_guard.as_ref(),
+                    guard: guard.as_ref(),
                     after: plain && matches!(period, Some(TriggerPeriod::After)),
                     removes_derived_writes: options.is_server_derived_writes_omitted()
                         && !matches!(period, Some(TriggerPeriod::InsteadOf)),
@@ -811,7 +827,7 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
                     trigger_object,
                     period_before_table,
                     statements_as,
-                    condition: translated_condition.clone(),
+                    condition,
                     exec_body: None,
                     statements: Some(ConditionalStatements::BeginEnd(function_body)),
                     characteristics: None,

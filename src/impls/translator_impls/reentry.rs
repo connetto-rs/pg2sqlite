@@ -1,5 +1,5 @@
-//! The marker rows that keep a maintenance trigger from firing again on its
-//! own write.
+//! The marker rows that keep a maintenance trigger's own write from firing
+//! the triggers PostgreSQL does not fire for it.
 //!
 //! A `BEFORE` row trigger assigning `NEW` columns runs as an `AFTER` trigger
 //! whose body writes the assigned values over the row with an `UPDATE`, and
@@ -7,7 +7,11 @@
 //! triggers again. The body holds the row's `rowid` in its table's marker
 //! table for the duration of the `UPDATE`, with the event the body runs
 //! after, and each `UPDATE` maintenance trigger fires only on a row its
-//! table's marker table does not hold.
+//! table's marker table does not hold. PostgreSQL fires no `UPDATE` trigger
+//! for an `INSERT`, so every other `BEFORE` or `AFTER UPDATE` trigger skips a
+//! row the `INSERT` body holds. Those triggers name the marker table whether
+//! or not the table has a maintenance trigger yet, so one created later
+//! needs none of them translated again.
 //!
 //! The row-security guard on the table's `UPDATE` reads the marker too.
 //! PostgreSQL holds the row a `BEFORE INSERT` trigger returns to the `INSERT`
@@ -45,9 +49,9 @@ use sql_traits::{
     traits::{DatabaseLike, TableLike, TriggerLike},
 };
 use sqlparser::ast::{
-    AlterTable, AlterTableOperation, BinaryOperator, DataType, Expr, Ident, ObjectName,
-    ObjectNamePart, ObjectType, RenameTableNameKind, Statement, TriggerEvent,
-    helpers::attached_token::AttachedToken, visit_relations,
+    AlterTable, AlterTableOperation, BinaryOperator, CreateTrigger, DataType, Expr, Ident,
+    ObjectName, ObjectNamePart, ObjectType, RenameTableNameKind, Statement, TriggerEvent,
+    TriggerPeriod, helpers::attached_token::AttachedToken, visit_relations,
 };
 
 #[cfg(not(feature = "std"))]
@@ -220,7 +224,7 @@ fn stripped<'m>(marker: &'m ObjectName, suffix: &str) -> Option<&'m str> {
 
 /// The name of the table `marker` belongs to, when `marker` names a marker
 /// table of either kind.
-fn marked_table(marker: &ObjectName) -> Option<&str> {
+pub(crate) fn marked_table(marker: &ObjectName) -> Option<&str> {
     stripped(marker, SUFFIX).or_else(|| stripped(marker, FORWARD_SUFFIX))
 }
 
@@ -258,7 +262,7 @@ impl MarkerTables {
         let mut tables = Self::default();
         let Some(schema) = initial else { return Ok(tables) };
         for trigger in schema.triggers() {
-            if trigger.is_maintenance_trigger(schema)? {
+            if reads_marker(trigger, schema)? {
                 tables.inherited.insert(table_key(&marker_table(&trigger.table_name)));
             }
         }
@@ -348,6 +352,15 @@ impl MarkerTables {
 /// The marker tables `table` may have, of each kind.
 fn markers_of(table: &ObjectName) -> [ObjectName; 2] {
     [marker_table(table), forward_marker_table(table)]
+}
+
+/// Whether the translation of `trigger` names its table's marker table, as a
+/// maintenance trigger or as a `BEFORE` or `AFTER UPDATE` trigger skipping the
+/// write of an `INSERT` maintenance body.
+fn reads_marker(trigger: &CreateTrigger, schema: &ParserDB) -> Result<bool, Error> {
+    Ok(matches!(trigger.period, Some(TriggerPeriod::Before | TriggerPeriod::After))
+        && trigger.events.iter().any(|event| matches!(event, TriggerEvent::Update(_)))
+        || trigger.is_maintenance_trigger(schema)?)
 }
 
 /// `CREATE TABLE IF NOT EXISTS <marker> (id INTEGER PRIMARY KEY, row_id
