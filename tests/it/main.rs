@@ -50,6 +50,7 @@ mod test_cte_bindings;
 mod test_cte_output_names;
 mod test_cte_replay_bindings;
 mod test_cube_root;
+mod test_cursor_budget;
 mod test_custom_rls_suffix;
 mod test_custom_type_blob;
 mod test_data_type_aliases;

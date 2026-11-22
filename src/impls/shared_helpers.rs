@@ -1117,6 +1117,28 @@ fn has_nested_join(entry: &sqlparser::ast::TableWithJoins) -> bool {
         .any(|factor| matches!(factor, sqlparser::ast::TableFactor::NestedJoin { .. }))
 }
 
+/// The relations `from` reads, joined ones and those inside nested joins
+/// included.
+pub(crate) fn leaf_factors<'a>(
+    from: impl IntoIterator<Item = &'a sqlparser::ast::TableWithJoins>,
+) -> Vec<&'a sqlparser::ast::TableFactor> {
+    let mut factors = Vec::new();
+    let mut pending: Vec<&sqlparser::ast::TableWithJoins> = from.into_iter().collect();
+    while let Some(table) = pending.pop() {
+        for factor in
+            core::iter::once(&table.relation).chain(table.joins.iter().map(|join| &join.relation))
+        {
+            match factor {
+                sqlparser::ast::TableFactor::NestedJoin { table_with_joins, .. } => {
+                    pending.push(table_with_joins);
+                }
+                factor => factors.push(factor),
+            }
+        }
+    }
+    factors
+}
+
 /// Appends `entry` and everything a nested join inside it hides.
 #[cfg_attr(feature = "std", recursive::recursive)]
 fn flatten_relations(
@@ -4935,13 +4957,10 @@ pub(crate) fn translate_set_expr_shared<D: TranslationDirection>(
             SetExpr::Select(Box::new(translate_select_shared::<D>(select, schema, options, emit)?))
         }
         SetExpr::Select(select) => {
-            // A SELECT's own FROM is what its column references resolve
-            // against, and each arm of a set operation has its own, so the
-            // scope is attached here rather than at the query around it.
-            let scope_query = crate::impls::query_builder::make_query(
-                D::cte_clause(options).cloned(),
-                SetExpr::Select(select.clone()),
-            );
+            // Each SELECT resolves against its own FROM, so nested subqueries
+            // stay uncopied.
+            let mut scope_query = relations_scope_query(select.from.clone());
+            scope_query.with = D::cte_clause(options).cloned();
             let scope_substitute = scope_query_for(&scope_query);
             let scope = sql_traits::structs::ColumnScope::from_query(
                 scope_substitute.as_ref().unwrap_or(&scope_query),

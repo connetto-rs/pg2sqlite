@@ -44,6 +44,7 @@ use crate::{
             from_relation, make_query, make_simple_select, plain_table_factor, single_expr_query,
         },
         session_variable,
+        shared_helpers::leaf_factors,
         translator_impls::sql_helper::{declared_helper, hidden_read, inlined_rows},
     },
     options::TranslationContext,
@@ -189,18 +190,7 @@ pub(crate) fn check_lateral_calls(
     schema: &ParserDB,
     options: &TranslationContext<'_>,
 ) -> Result<(), Error> {
-    let mut factors = Vec::new();
-    let mut tables: Vec<&TableWithJoins> = from.iter().collect();
-    while let Some(table) = tables.pop() {
-        for factor in
-            core::iter::once(&table.relation).chain(table.joins.iter().map(|join| &join.relation))
-        {
-            match factor {
-                TableFactor::NestedJoin { table_with_joins, .. } => tables.push(table_with_joins),
-                other => factors.push(other),
-            }
-        }
-    }
+    let factors = leaf_factors(from);
     if factors.len() < 2 {
         return Ok(());
     }
@@ -259,7 +249,8 @@ fn helper_query(
     let set = arguments
         .and_then(|arguments| helper.helper_set(&arguments, deployment, schema))
         .map_err(|error| untranslatable(name, &error))?;
-    let mut lowering = Lowering { helper: name, schema, read: Vec::new(), walks: 0 };
+    let mut lowering =
+        Lowering { helper: name, schema, read: Vec::new(), walks: 0, called: Vec::new() };
     let lowered = lowering.set(&set, names)?;
     let acting = session_variable::acting_role(schema, options)?;
     let mut guarded = Vec::new();
@@ -280,6 +271,9 @@ fn helper_query(
     let mut lowered = lowered.translate_with_warnings(schema, options, emit)?;
     let ControlFlow::Continue(()) = lowered
         .visit(&mut BackingTables { guarded: &guarded, suffix: options.get_rls_table_suffix() });
+    let mut helpers = vec![helper.target_name().to_string()];
+    helpers.append(&mut lowering.called);
+    options.record_helper_set(&lowered, helpers);
     Ok(lowered)
 }
 
@@ -332,12 +326,15 @@ struct Lowering<'h, 'db> {
     read: Vec<&'db CreateTable>,
     /// How many walks the query names so far.
     walks: usize,
+    /// The helpers whose sets the query reads, one entry per call.
+    called: Vec<String>,
 }
 
 impl<'db> Lowering<'_, 'db> {
     /// The set as one query: its arms joined by `UNION`, grown along its
     /// walks, and kept to the rows its selection keeps, projecting its
     /// columns under `names`, or unnamed where `names` is empty.
+    #[cfg_attr(feature = "std", recursive::recursive)]
     fn set(&mut self, set: &HelperSet<'db, ParserDB>, names: &[Ident]) -> Result<Query, Error> {
         // A walk reads the arms' rows as its own column and names what it
         // keeps.
@@ -374,6 +371,17 @@ impl<'db> Lowering<'_, 'db> {
             return Ok(make_query(None, arms));
         }
         Ok(self.reached(arms, union(edges, SetQuantifier::All), selection, names))
+    }
+
+    /// [`Self::set`] for the set a call to `function` returns.
+    fn called_set(
+        &mut self,
+        function: &<ParserDB as DatabaseLike>::Function,
+        set: &HelperSet<'db, ParserDB>,
+        names: &[Ident],
+    ) -> Result<Query, Error> {
+        self.called.push(function.target_name().to_string());
+        self.set(set, names)
     }
 
     /// `WITH [RECURSIVE] <walk> (node) AS (<arms> [UNION <step>]) SELECT node
@@ -480,7 +488,7 @@ impl<'db> Lowering<'_, 'db> {
         names: &[Ident],
     ) -> Result<SetExpr, Error> {
         self.read.push(parent.table());
-        let parents = self.set(parent.set(), &[])?;
+        let parents = self.called_set(parent.function(), parent.set(), &[])?;
         Ok(SetExpr::Select(Box::new(make_simple_select(
             projection([qualified(ARM, column_ident(parent.key()))], names),
             from_relation(aliased_table(parent.table(), ARM)),
@@ -498,7 +506,7 @@ impl<'db> Lowering<'_, 'db> {
         // A helper returning `SETOF` a scalar type declares no column.
         let arity = called.function().returned_columns(self.schema).count().max(1);
         let columns: Vec<Ident> = (0..arity).map(called_column).collect();
-        let rows = self.set(called.set(), &columns)?;
+        let rows = self.called_set(called.function(), called.set(), &columns)?;
         let (returned, labels) = returned_values(called.returned(), |position| {
             qualified(CALLED, called_column(*position))
         });
@@ -548,7 +556,7 @@ impl<'db> Lowering<'_, 'db> {
         match grant.granted_to() {
             GrantedTo::Request(comparison) => conditions.push(request(comparison)),
             GrantedTo::Set(grantees) => {
-                let set = self.set(grantees.set(), &[])?;
+                let set = self.called_set(grantees.function(), grantees.set(), &[])?;
                 conditions.push(in_query(qualified(ARM, column_ident(grantees.column())), set));
             }
             GrantedTo::Anyone => {}
@@ -625,7 +633,7 @@ impl<'db> Lowering<'_, 'db> {
         let capped = if cap.set().arms().is_empty() {
             Expr::Value(Value::Boolean(false).into())
         } else {
-            in_query(row, self.set(cap.set(), &[])?)
+            in_query(row, self.called_set(cap.function(), cap.set(), &[])?)
         };
         Ok(match cap.lift() {
             Some(lift) => {
