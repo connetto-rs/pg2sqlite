@@ -17,4 +17,6 @@ pub(crate) use scope::{TriggerFacts, expand_relation, fold, relations_read};
 mod translator;
 mod unresolved;
 pub use translator::PlPgSqlTranslator;
-pub(crate) use unresolved::{body_reach, names_unresolved, raising_unresolved, unresolved_aborts};
+pub(crate) use unresolved::{
+    ReadBodies, body_reach, names_unresolved, raising_unresolved, unresolved_aborts,
+};

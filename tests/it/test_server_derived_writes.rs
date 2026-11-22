@@ -1652,6 +1652,41 @@ $$;",
 }
 
 #[test]
+fn a_helper_called_again_after_a_removed_write_is_read_where_it_runs_again() {
+    let pg = notes_logged_with(
+        "
+CREATE FUNCTION check_events(note INTEGER) RETURNS VOID LANGUAGE plpgsql AS $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM note_events WHERE note_id = note) THEN
+    RAISE EXCEPTION 'note already logged';
+  END IF;
+END
+$$;
+CREATE FUNCTION before_log(note INTEGER) RETURNS VOID LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM check_events(note);
+END
+$$;
+CREATE FUNCTION after_log(note INTEGER) RETURNS VOID LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM check_events(note);
+END
+$$;",
+        "",
+        &format!("  PERFORM before_log(NEW.id);\n{LOG}\n  PERFORM after_log(NEW.id);"),
+    );
+    assert_eq!(left_to_server(&pg), owned(&[("TRIGGER", "notes_logged", "notes")]));
+    let shown = left_to_server_shown(&pg);
+    assert!(
+        shown[0].contains(
+            "log_once() calls after_log(), which calls check_events(), which reads note_events \
+             after its INSERT on note_events"
+        ),
+        "{shown:?}"
+    );
+}
+
+#[test]
 fn a_read_inside_a_loop_after_its_removed_write_leaves_the_trigger_out() {
     let pg = notes_logged_with(
         "",

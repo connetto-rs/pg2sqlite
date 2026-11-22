@@ -3,6 +3,7 @@
 //! them read, and whether anything besides the writes refuses the write or
 //! changes its row.
 
+use alloc::collections::BTreeMap;
 use core::ops::ControlFlow;
 
 use sql_traits::{structs::ParserDB, traits::FunctionLike};
@@ -91,7 +92,29 @@ pub(super) struct Walker<'s, 'o, 'c> {
     /// Whether the replica takes out the writes it leaves to the server,
     /// rather than running every one as written.
     strips: bool,
+    /// What each function read so far added to the chain, by address, for
+    /// those whose calls reach no function being read.
+    recorded: BTreeMap<*const CreateFunction, Recorded>,
+    /// How many calls the walk passed over because their function was being
+    /// read.
+    recursions: usize,
     chain: Chain,
+}
+
+/// What reading one function added to a chain. The function reached no
+/// function being read, so another call of it adds the same writes and
+/// steps, reached through that call's chain.
+#[derive(Clone, Copy)]
+struct Recorded {
+    /// How many functions were being read when it was called, so its own
+    /// name is this entry of every chain it recorded.
+    depth: usize,
+    /// The first write it added to [`Chain::writes`] and the one past its
+    /// last.
+    writes: (usize, usize),
+    /// The first step it added to [`Chain::steps`] and the one past its
+    /// last.
+    steps: (usize, usize),
 }
 
 impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
@@ -139,6 +162,8 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
             found: None,
             variables: Vec::new(),
             strips,
+            recorded: BTreeMap::new(),
+            recursions: 0,
             chain: Chain::default(),
         };
         walker.function(function)?;
@@ -167,8 +192,15 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
     }
 
     fn function(&mut self, function: &'s CreateFunction) -> Result<(), Error> {
-        if is_builtin(function) || self.functions.iter().any(|seen| core::ptr::eq(*seen, function))
-        {
+        if is_builtin(function) {
+            return Ok(());
+        }
+        if self.functions.iter().any(|seen| core::ptr::eq(*seen, function)) {
+            self.recursions += 1;
+            return Ok(());
+        }
+        if let Some(&recorded) = self.recorded.get(&core::ptr::from_ref(function)) {
+            self.repeat(recorded);
             return Ok(());
         }
         // SQL a body builds at run time leaves its calls unreadable, which
@@ -177,6 +209,8 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
             self.chain.unreadable.get_or_insert(error.into());
         }
         let body = parsed_body(function, self.schema)?;
+        let (depth, recursions) = (self.functions.len(), self.recursions);
+        let (writes, steps) = (self.chain.writes.len(), self.chain.steps.len());
         self.functions.push(function);
         let outer = self.found.take();
         let read = match &body {
@@ -192,7 +226,58 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
         self.variables.pop();
         self.functions.pop();
         self.found = outer;
-        read
+        read?;
+        if self.recursions == recursions {
+            self.recorded.insert(
+                core::ptr::from_ref(function),
+                Recorded {
+                    depth,
+                    writes: (writes, self.chain.writes.len()),
+                    steps: (steps, self.chain.steps.len()),
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Adds again the writes and steps a function added when `recorded`
+    /// says, reached through the functions being read. What else it set in
+    /// the chain holds the first value set, or is a flag already raised.
+    fn repeat(&mut self, recorded: Recorded) {
+        let names = self.names();
+        let (writes, steps) = (recorded.writes, recorded.steps);
+        let moved_writes = self.chain.writes.len() - writes.0;
+        let moved_steps = self.chain.steps.len() - steps.0;
+        let rechain = |chain: &[String]| {
+            names.iter().chain(&chain[recorded.depth..]).cloned().collect::<Vec<_>>()
+        };
+        for index in writes.0..writes.1 {
+            let write = &self.chain.writes[index];
+            let repeated = DerivedWrite {
+                chain: rechain(&write.chain),
+                statement: write.statement,
+                table: write.table.clone(),
+                relation: write.relation.clone(),
+                rows: write.rows.clone(),
+                fresh: write.fresh.clone(),
+            };
+            self.chain.writes.push(repeated);
+        }
+        for index in steps.0..steps.1 {
+            let repeated = match &self.chain.steps[index] {
+                Step::Write(write) => Step::Write(write + moved_writes),
+                Step::Read { relation, rows, columns, reader } => {
+                    Step::Read {
+                        relation: relation.clone(),
+                        rows: rows.clone(),
+                        columns: columns.clone(),
+                        reader: rechain(reader),
+                    }
+                }
+                Step::LoopEnd(start) => Step::LoopEnd(start + moved_steps),
+            };
+            self.chain.steps.push(repeated);
+        }
     }
 
     fn procedural(&mut self, construct: &'static str) {

@@ -10,7 +10,10 @@ use sqlparser::ast::{
     ObjectName, ObjectType, Statement,
 };
 
-use super::trigger_slots::{folded, renamed_table};
+use super::{
+    plpgsql::{ReadBodies, body_reach},
+    trigger_slots::{folded, renamed_table},
+};
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
 use crate::{errors::Error, warnings::TranslationWarning};
@@ -78,19 +81,20 @@ impl Touched {
     }
 
     /// Whether `trigger`'s translation reads what this changes, its body read
-    /// from `before` and from `after`.
+    /// from `before` and from `after`, `bodies` holding what each body read
+    /// before names.
     fn reaches(
         &self,
         trigger: &CreateTrigger,
-        before: &ParserDB,
-        after: &ParserDB,
+        (before, after): (&ParserDB, &ParserDB),
+        bodies: &mut ReadBodies,
     ) -> Result<bool, Error> {
         if self.relations.contains(&folded(&trigger.table_name)) {
             return Ok(true);
         }
         let Some(exec_body) = &trigger.exec_body else { return Ok(false) };
         for schema in [before, after] {
-            match super::plpgsql::body_reach(&exec_body.func_desc.name, schema)? {
+            match body_reach(&exec_body.func_desc.name, schema, bodies)? {
                 Some(reach)
                     if reach.relations.is_disjoint(&self.relations)
                         && reach.functions.is_disjoint(&self.functions) => {}
@@ -104,6 +108,7 @@ impl Touched {
 /// The triggers live at the point of the batch being translated.
 pub(crate) struct TriggerFollower {
     live: Vec<Followed>,
+    bodies: ReadBodies,
 }
 
 impl TriggerFollower {
@@ -114,7 +119,7 @@ impl TriggerFollower {
             .flat_map(DatabaseLike::triggers)
             .map(|trigger| Followed { create: trigger.clone(), rendered: None })
             .collect();
-        Self { live }
+        Self { live, bodies: ReadBodies::default() }
     }
 
     /// Whether no trigger is live.
@@ -192,7 +197,9 @@ impl TriggerFollower {
         let mut reemissions = Vec::new();
         for followed in &mut self.live {
             let table = folded(&followed.create.table_name);
-            if dropped.contains(&table) || !touched.reaches(&followed.create, before, after)? {
+            if dropped.contains(&table)
+                || !touched.reaches(&followed.create, (before, after), &mut self.bodies)?
+            {
                 continue;
             }
             let mut moved = followed.create.clone();

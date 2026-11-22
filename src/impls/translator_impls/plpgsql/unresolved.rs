@@ -7,14 +7,16 @@
 //! is rewritten into a step that raises PostgreSQL's error where the run
 //! reaches it.
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use core::ops::ControlFlow;
 
-use sql_traits::{structs::ParserDB, utils::identifier_resolution::stored_ident_name};
+use sql_traits::{
+    structs::ParserDB, traits::FunctionLike, utils::identifier_resolution::stored_ident_name,
+};
 use sqlparser::{
     ast::{
         CreateFunction, Expr, Ident, ObjectName, ObjectNamePart, SetExpr, Spanned, Statement,
-        Value, visit_expressions, visit_expressions_mut, visit_relations,
+        TableFactor, Value, Visit, Visitor, visit_expressions_mut,
     },
     tokenizer::Span,
 };
@@ -34,9 +36,12 @@ use crate::{
     errors::Error,
     impls::{
         column_access::{Table, Variables, unresolved_in_body, unresolved_target},
+        derived_writes::{Body, parsed_body},
         object_name::{last_ident, resolve_translation_table},
         query_builder::single_expr_query,
-        translator_impls::{create_trigger::body_schema, trigger_slots::folded},
+        translator_impls::{
+            create_trigger::body_schema, sql_helper::schema_helper, trigger_slots::folded,
+        },
         unlabelled_body::signature,
     },
     options::TranslationContext,
@@ -227,9 +232,134 @@ pub(crate) struct BodyReach {
     pub(crate) functions: BTreeSet<String>,
 }
 
+/// What each function body [`body_reach`] read names, by its text and how it
+/// was read, so each body is parsed once.
+#[derive(Default)]
+pub(crate) struct ReadBodies {
+    read: BTreeMap<String, Vec<(Reading, BodyNames)>>,
+}
+
+/// How a body was read, as the name the call resolving to its function
+/// wrote, the names of that function's parameters, and its language. These
+/// and the text decide what a body names.
+#[derive(PartialEq, Eq)]
+struct Reading {
+    read_as: String,
+    parameters: Vec<Option<String>>,
+    language: Option<String>,
+}
+
+/// What one function body names.
+enum BodyNames {
+    /// The relations its SQL names, folded, and the functions it calls, in
+    /// the order the body names them.
+    Known { relations: BTreeSet<String>, calls: Vec<ObjectName> },
+    /// Its names are not all known before it runs, as with SQL it builds at
+    /// run time.
+    Unknown,
+    /// It does not parse, or is written in a language other than SQL and
+    /// PL/pgSQL.
+    Unparsed,
+}
+
+impl BodyNames {
+    /// What the body of `function` names, a PL/pgSQL one read as the trigger
+    /// function `signature` describes.
+    fn of(function: &CreateFunction, schema: &ParserDB, signature: &Signature) -> Self {
+        let (mut relations, mut calls) = (BTreeSet::new(), Vec::new());
+        match parsed_body(function, schema) {
+            Ok(Body::PlPgSql(block)) => {
+                let Ok(sites) = block.sites(signature, |_| true) else { return Self::Unknown };
+                for site in sites {
+                    match site.sql {
+                        Sql::Statement(statement) => names(statement, &mut relations, &mut calls),
+                        Sql::Expression(query) => names(query, &mut relations, &mut calls),
+                        Sql::Dynamic(_) => return Self::Unknown,
+                    }
+                }
+            }
+            Ok(Body::Sql(statements)) => {
+                for statement in statements.iter() {
+                    names(statement, &mut relations, &mut calls);
+                }
+            }
+            Err(_) => return Self::Unparsed,
+        }
+        Self::Known { relations, calls }
+    }
+}
+
+/// Adds the relations `sql` names, folded, to `relations`, and the functions
+/// it calls, in an expression or as a set-returning function in `FROM`, to
+/// `calls`.
+fn names<S: Visit>(sql: &S, relations: &mut BTreeSet<String>, calls: &mut Vec<ObjectName>) {
+    let _: ControlFlow<()> = sql.visit(&mut Names { relations, calls });
+}
+
+/// The relations and functions SQL names, as [`names`] reads them.
+struct Names<'n> {
+    relations: &'n mut BTreeSet<String>,
+    calls: &'n mut Vec<ObjectName>,
+}
+
+impl Visitor for Names<'_> {
+    type Break = ();
+
+    fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<()> {
+        self.relations.insert(folded(relation));
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+        if let Expr::Function(call) = expr {
+            self.calls.push(call.name.clone());
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<()> {
+        if let TableFactor::Table { name, args: Some(_), .. } | TableFactor::Function { name, .. } =
+            factor
+        {
+            self.calls.push(name.clone());
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+impl ReadBodies {
+    /// What `body`, the body of `function`, which the call `name` resolves
+    /// to, names.
+    fn names(
+        &mut self,
+        body: &str,
+        function: &CreateFunction,
+        name: &ObjectName,
+        schema: &ParserDB,
+    ) -> &BodyNames {
+        let trigger = trigger_signature(name);
+        let reading = Reading {
+            read_as: trigger.name.clone(),
+            parameters: signature(function).parameters,
+            language: function.language().map(str::to_ascii_lowercase),
+        };
+        if !self.read.contains_key(body) {
+            self.read.insert(body.to_owned(), Vec::new());
+        }
+        let read = self.read.get_mut(body).expect("the body was just added");
+        if let Some(position) = read.iter().position(|(read, _)| *read == reading) {
+            return &read[position].1;
+        }
+        let names = BodyNames::of(function, schema, &trigger);
+        read.push((reading, names));
+        &read[read.len() - 1].1
+    }
+}
+
 /// What `function`'s body in `schema` reaches, the bodies of the functions it
 /// calls included, or `None` when its names are not all known before it runs,
-/// as with SQL it builds at run time.
+/// as with SQL it builds at run time. A builtin reaches nothing. `bodies`
+/// holds what each body read before names.
 ///
 /// # Errors
 ///
@@ -237,6 +367,7 @@ pub(crate) struct BodyReach {
 pub(crate) fn body_reach(
     function: &ObjectName,
     schema: &ParserDB,
+    bodies: &mut ReadBodies,
 ) -> Result<Option<BodyReach>, Error> {
     let mut reach = BodyReach { relations: BTreeSet::new(), functions: BTreeSet::new() };
     let mut pending = vec![function.clone()];
@@ -244,38 +375,30 @@ pub(crate) fn body_reach(
         if !reach.functions.insert(folded(&function)) {
             continue;
         }
-        let block = match schema.function_body(&function) {
-            Ok(Some(block)) => block,
+        let declared = match schema_helper(&function, schema) {
+            Ok(Some(declared)) => declared,
             Ok(None) => continue,
             // A callee the schema cannot settle may reach anything.
             Err(_) if reach.functions.len() > 1 => return Ok(None),
             Err(error) => return Err(error),
         };
-        let Ok(sites) = block.sites(&trigger_signature(&function), |_| true) else {
-            return Ok(None);
+        let atomic;
+        let names = if let Some(body) = declared.body() {
+            bodies.names(body, declared, &function, schema)
+        } else {
+            atomic = BodyNames::of(declared, schema, &trigger_signature(&function));
+            &atomic
         };
-        for site in sites {
-            let mut named = |relation: &ObjectName| {
-                reach.relations.insert(folded(relation));
-                ControlFlow::<()>::Continue(())
-            };
-            let mut called = |expr: &Expr| {
-                if let Expr::Function(call) = expr {
-                    pending.push(call.name.clone());
-                }
-                ControlFlow::<()>::Continue(())
-            };
-            let _: ControlFlow<()> = match site.sql {
-                Sql::Statement(statement) => {
-                    let _: ControlFlow<()> = visit_relations(statement, &mut named);
-                    visit_expressions(statement, &mut called)
-                }
-                Sql::Expression(query) => {
-                    let _: ControlFlow<()> = visit_relations(query, &mut named);
-                    visit_expressions(query, &mut called)
-                }
-                Sql::Dynamic(_) => return Ok(None),
-            };
+        match names {
+            BodyNames::Known { relations, calls } => {
+                reach.relations.extend(relations.iter().cloned());
+                pending.extend(calls.iter().cloned());
+            }
+            BodyNames::Unknown => return Ok(None),
+            BodyNames::Unparsed if reach.functions.len() > 1 => return Ok(None),
+            // The trigger's own function refuses with the error reading it
+            // as a trigger body returns.
+            BodyNames::Unparsed => return schema.function_body(&function).map(|_| None),
         }
     }
     Ok(Some(reach))

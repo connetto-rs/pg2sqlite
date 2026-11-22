@@ -254,3 +254,28 @@ fn a_helper_the_trigger_calls_resolves_when_a_run_reaches_it() {
         r#"relation "audit" does not exist"#,
     );
 }
+
+/// `labels` returning `label` as the note of every row it returns.
+fn labels(label: &str) -> String {
+    format!(
+        "CREATE OR REPLACE FUNCTION labels(item integer) RETURNS TABLE (note text)
+         LANGUAGE sql IMMUTABLE AS $$ SELECT '{label}' $$;"
+    )
+}
+
+/// A trigger reading rows from a `LANGUAGE sql` function in `FROM` runs the
+/// body that function holds when the run happens, replaced in the trigger's
+/// batch or a later one.
+#[test]
+fn a_function_the_trigger_reads_rows_from_runs_its_body_when_the_run_happens() {
+    let schema = with_body(
+        "INSERT INTO audit (id, note) SELECT NEW.id, labelled.note FROM labels(NEW.id) labelled;",
+    ) + &labels("v1");
+    let replaced = labels("v2");
+    for batches in [vec![schema.clone() + &replaced], vec![schema.clone(), replaced.clone()]] {
+        let batches: Vec<&str> = batches.iter().map(String::as_str).collect();
+        let mut connection = replica(&batches);
+        run(&mut connection, "INSERT INTO docs (id, owner) VALUES (2, 'alice')").unwrap();
+        assert_eq!(audited(&mut connection), [(2, Some("v2".to_owned()))]);
+    }
+}
