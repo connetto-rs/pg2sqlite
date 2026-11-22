@@ -886,7 +886,7 @@ impl Relations {
 }
 
 /// Whether `names` holds a name `name` reaches.
-fn holds(names: &[Ident], name: &Ident) -> bool {
+pub(crate) fn holds(names: &[Ident], name: &Ident) -> bool {
     names.iter().any(|held| {
         identifiers_match(
             &held.value,
@@ -975,7 +975,7 @@ fn exposed_name(factor: &TableFactor) -> Option<&Ident> {
 }
 
 /// Appends the names the items of `from` expose.
-fn from_names(from: &TableWithJoins, names: &mut Vec<Ident>) {
+pub(crate) fn from_names(from: &TableWithJoins, names: &mut Vec<Ident>) {
     for factor in
         core::iter::once(&from.relation).chain(from.joins.iter().map(|join| &join.relation))
     {

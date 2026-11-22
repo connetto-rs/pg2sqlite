@@ -37,6 +37,7 @@ use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{
+        column_access::{from_names, holds},
         function_helpers::{query_projection, simple_function_expr, string_literal},
         object_name::{declared_column_ident, last_ident},
         privileges::{RoleTable, has_backing_table},
@@ -173,14 +174,16 @@ pub(crate) fn helper_rows(
 }
 
 /// Refuses a call in the FROM list `from` to a function the schema declares
-/// that is passed a column, when another item sits in that list.
+/// that is passed a column another item of that list may hold.
 ///
 /// PostgreSQL reads such a call `LATERAL`, in the FROM list of a `SELECT` or
-/// an `UPDATE` and the `USING` list of a `DELETE` alike, so the column may
-/// name another item of the list, and SQLite reads the derived table written
-/// in place of the call only against the queries around it, where the same
-/// name may read another relation. A PL/pgSQL variable, a field of one, and a
-/// field of a trigger's `NEW` or `OLD` are no item of the list and pass.
+/// an `UPDATE` and the `USING` list of a `DELETE` alike, so a bare column or
+/// one qualified by the name an item of the list exposes reads that item, and
+/// SQLite reads the derived table written in place of the call only against
+/// the queries around it, where the same name may read another relation. A
+/// column qualified by a name no item exposes reads an enclosing query in
+/// both. A PL/pgSQL variable, a field of one, and a field of a trigger's
+/// `NEW` or `OLD` are no item of the list and pass.
 ///
 /// # Errors
 ///
@@ -194,6 +197,10 @@ pub(crate) fn check_lateral_calls(
     if factors.len() < 2 {
         return Ok(());
     }
+    let mut exposed = Vec::new();
+    for item in from {
+        from_names(item, &mut exposed);
+    }
     for factor in factors {
         let (name, arguments) = match factor {
             TableFactor::Table { name, args: Some(arguments), .. } => (name, &arguments.args),
@@ -201,15 +208,30 @@ pub(crate) fn check_lateral_calls(
             _ => continue,
         };
         let reads_column = visit_expressions(arguments, |expr| {
-            let read = match expr {
-                Expr::Identifier(ident) => Some((ident, false)),
-                Expr::CompoundIdentifier(parts) => parts.first().map(|first| (first, true)),
-                _ => None,
+            let reaches = match expr {
+                Expr::Identifier(ident) => !options.is_variable(&ident.value),
+                Expr::CompoundIdentifier(parts) => {
+                    match parts.as_slice() {
+                        [first, ..]
+                            if options.is_variable(&first.value)
+                                || options
+                                    .trigger_row(&Expr::Identifier(first.clone()))
+                                    .is_some() =>
+                        {
+                            false
+                        }
+                        parts => {
+                            parts
+                                .iter()
+                                .rev()
+                                .nth(1)
+                                .is_none_or(|qualifier| holds(&exposed, qualifier))
+                        }
+                    }
+                }
+                _ => false,
             };
-            let Some((first, field)) = read else { return ControlFlow::Continue(()) };
-            let outside = options.is_variable(&first.value)
-                || (field && options.trigger_row(&Expr::Identifier(first.clone())).is_some());
-            if outside { ControlFlow::Continue(()) } else { ControlFlow::Break(()) }
+            if reaches { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
         })
         .is_break();
         if reads_column && declared_helper(name, schema, options)?.is_some() {
