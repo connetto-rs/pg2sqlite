@@ -62,7 +62,7 @@ use crate::{
             sqlite_unqualified_object_name,
         },
         placeholder::rewrite_placeholders_for_sqlite,
-        privileges::{RoleTable, names_table_with_backing},
+        privileges::{RoleTable, has_backing_table, names_table_with_backing},
         query_builder::plain_table_with_joins,
         translator_impls::{
             clock_check::{dropped_clock_triggers, split_clock_checks},
@@ -74,8 +74,9 @@ use crate::{
             nulls_not_distinct::{companion_drops, table_companions},
             off_replica::{self, OffReplica, Write},
             rls::{
-                generate_rls_statements_with_context, generate_view_statements,
-                rename_table_for_rls, validate_table_policies, write_guard_condition_expr,
+                drop_view_statements, generate_rls_statements_with_context,
+                generate_view_statements, rename_table_for_rls, validate_table_policies,
+                write_guard_condition_expr,
             },
             vector::{generate_vec0_statements, has_vector_columns},
         },
@@ -2053,22 +2054,30 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
                         if kept.is_empty() {
                             return Ok(Vec::new());
                         }
-                        let normalized_names = kept
-                            .iter()
-                            .map(|name| {
-                                normalize_schema_qualified_object_name_for_sqlite(schema, name)
-                            })
-                            .collect::<Result<Vec<_>, _>>()?;
-                        let mut statements = vec![Statement::Drop {
-                            object_type: *object_type,
-                            if_exists: *if_exists,
-                            names: normalized_names,
-                            cascade: false,  // SQLite doesn't support CASCADE
-                            restrict: false, // SQLite doesn't support RESTRICT
-                            purge: false,
-                            temporary: false,
-                            table: None,
-                        }];
+                        // SQLite drops one object per statement.
+                        let mut statements = Vec::with_capacity(kept.len());
+                        for name in kept.iter() {
+                            let table = match object_type {
+                                ObjectType::Table => resolve_translation_table(schema, name)?,
+                                _ => None,
+                            };
+                            match table {
+                                Some(table) if has_backing_table(table, schema, options)? => {
+                                    statements.extend(drop_view_statements(
+                                        table, schema, options, *if_exists,
+                                    )?);
+                                }
+                                _ => {
+                                    statements.push(ast_builder::drop_object(
+                                        *object_type,
+                                        normalize_schema_qualified_object_name_for_sqlite(
+                                            schema, name,
+                                        )?,
+                                        *if_exists,
+                                    ));
+                                }
+                            }
+                        }
                         if *object_type == ObjectType::Index {
                             statements.extend(companion_drops(&kept, written));
                         }

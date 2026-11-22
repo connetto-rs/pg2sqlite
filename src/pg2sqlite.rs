@@ -270,18 +270,28 @@ fn pragma_on(name: &str) -> Statement {
 
 /// The tables the translation creates for itself, each labelled for a name
 /// collision report: the row-security audit table when the batch is the first
-/// to carry row-level security, the definer owner stack when a statement
-/// pushes on it, and the deferred constraint check queue.
-fn generated_prelude(
+/// to carry row-level security in any of its `schemas`, a table it drops
+/// included, the definer owner stack when a statement pushes on it, and the
+/// deferred constraint check queue.
+fn generated_prelude<'s>(
     translated: &[Vec<Statement>],
-    schema: &ParserDB,
+    schemas: impl Iterator<Item = &'s ParserDB>,
     options: &Pg2SqliteOptions,
     had_rls_tables: bool,
     context: &TranslationContext<'_>,
 ) -> Result<Vec<(&'static str, Statement)>, crate::errors::Error> {
     use sql_traits::traits::DatabaseLike;
 
-    let audit_table = (!had_rls_tables && schema.has_rls_tables()?)
+    let mut first_with_rls = false;
+    if !had_rls_tables {
+        for schema in schemas {
+            if schema.has_rls_tables()? {
+                first_with_rls = true;
+                break;
+            }
+        }
+    }
+    let audit_table = first_with_rls
         .then(|| options.get_rls_audit_table_name())
         .flatten()
         .map(|name| ("the row-security audit table", generate_rls_audit_table(name)));
@@ -1229,7 +1239,8 @@ impl Pg2Sqlite {
         )?;
 
         let schema = schema?;
-        let prelude = generated_prelude(&translated, &schema, &options, had_rls_tables, context)?;
+        let schemas = core::iter::once(&schema).chain(epochs.iter().map(|epoch| &epoch.schema));
+        let prelude = generated_prelude(&translated, schemas, &options, had_rls_tables, context)?;
 
         reject_name_collisions(
             initial_schema.as_ref(),

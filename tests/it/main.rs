@@ -249,6 +249,7 @@ mod test_rls_architectural_limits;
 mod test_rls_backing_guards;
 mod test_rls_current_user;
 mod test_rls_deny_by_default;
+mod test_rls_drop_table;
 mod test_rls_expr_transform;
 mod test_rls_field_translation;
 mod test_rls_fk_constraints;
