@@ -2016,6 +2016,48 @@ pub(crate) fn hiding_policies(
     Ok(Some(names))
 }
 
+/// Each clause of a policy the replica enforces on `table` for the acting
+/// role, once, with the policy's name and whether the clause judges a row
+/// the table stores, its columns read from the stored row, rather than the
+/// row an `INSERT` proposes.
+///
+/// # Errors
+///
+/// Fails as [`row_security`] does.
+pub(crate) fn enforced_policy_clauses<'s>(
+    table: &'s CreateTable,
+    schema: &'s ParserDB,
+    options: &Pg2SqliteOptions,
+) -> Result<Vec<(&'s str, &'s Expr, bool)>, Error> {
+    let mut clauses: Vec<(&'s str, &'s Expr, bool)> = Vec::new();
+    if !table.has_row_level_security(schema)? {
+        return Ok(clauses);
+    }
+    for statement in [
+        RowStatement::Select,
+        RowStatement::Insert { returning: false },
+        RowStatement::Update { reads: true },
+        RowStatement::Delete { reads: true },
+    ] {
+        let Rows::Gated(gates) = row_security(table, schema, statement, options)? else {
+            continue;
+        };
+        for gate in &gates {
+            for term in gate.permissive().iter().chain(gate.restrictive()) {
+                let clause = (
+                    term.policy().name(),
+                    term.expression().expression(),
+                    gate.row() != RowVersion::Inserted,
+                );
+                if !clauses.contains(&clause) {
+                    clauses.push(clause);
+                }
+            }
+        }
+    }
+    Ok(clauses)
+}
+
 fn generated_object_name(name: &str) -> ObjectName {
     ObjectName(vec![ObjectNamePart::Identifier(quoted_ident(name))])
 }

@@ -6,7 +6,11 @@
 use core::ops::ControlFlow;
 
 use sql_traits::{structs::ParserDB, traits::FunctionLike};
-use sqlparser::ast::{CreateFunction, Expr, ObjectNamePart, Statement, Visit, visit_expressions};
+use sqlparser::ast::{
+    CreateFunction, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName,
+    ObjectNamePart, Select, SelectItem, SelectItemQualifiedWildcardKind, Statement, TableFactor,
+    Visit, Visitor, visit_expressions,
+};
 use sqlparser_plpgsql::embedded::{
     self, Block, Branch, DeclarationKind, Diagnostics, DiagnosticsKind, IntoTargets, Loop,
     LoopControl, Node, NodeKind, Open, RaiseLevel, ReturnQuery, Target,
@@ -60,6 +64,11 @@ pub(super) struct Chain {
     /// Why the calls of a function in the chain cannot be read, SQL it
     /// builds at run time among the reasons.
     pub(super) unreadable: Option<Error>,
+    /// The fields of `OLD` the statements the replica keeps read in the
+    /// trigger's own function, the whole row where one reads the record.
+    pub(super) old: Columns,
+    /// The fields of `NEW` read as [`Self::old`] holds those of `OLD`.
+    pub(super) new: Columns,
 }
 
 /// Reads a trigger function's call chain.
@@ -77,6 +86,9 @@ pub(super) struct Walker<'s, 'o, 'c> {
     /// The names each function being read may read as variables, as
     /// [`rows::variables`] gives them.
     variables: Vec<Vec<String>>,
+    /// Whether the replica takes out the writes it leaves to the server,
+    /// rather than running every one as written.
+    strips: bool,
     chain: Chain,
 }
 
@@ -93,6 +105,30 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
         schema: &'s ParserDB,
         options: &'o TranslationContext<'c>,
     ) -> Result<Chain, Error> {
+        Self::walk(function, before, true, schema, options)
+    }
+
+    /// Reads `function` as the replica runs it whole, its writes kept, as
+    /// it keeps an `INSTEAD OF` trigger.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read`].
+    pub(super) fn read_whole(
+        function: &'s CreateFunction,
+        schema: &'s ParserDB,
+        options: &'o TranslationContext<'c>,
+    ) -> Result<Chain, Error> {
+        Self::walk(function, None, false, schema, options)
+    }
+
+    fn walk(
+        function: &'s CreateFunction,
+        before: Option<&'o [Event]>,
+        strips: bool,
+        schema: &'s ParserDB,
+        options: &'o TranslationContext<'c>,
+    ) -> Result<Chain, Error> {
         let mut walker = Self {
             schema,
             options,
@@ -100,6 +136,7 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
             functions: Vec::new(),
             found: None,
             variables: Vec::new(),
+            strips,
             chain: Chain::default(),
         };
         walker.function(function)?;
@@ -210,8 +247,9 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
     }
 
     fn node(&mut self, node: &Node) -> Result<(), Error> {
-        if let NodeKind::Statement { statement: written, .. } | NodeKind::Perform { query: written } =
-            &node.kind
+        if self.strips
+            && let NodeKind::Statement { statement: written, .. }
+            | NodeKind::Perform { query: written } = &node.kind
             && removes(node, self.schema, self.options)?
         {
             let writes = self.removed_writes(written)?;
@@ -270,17 +308,7 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
                     self.kept(condition.as_ref())?;
                 }
             }
-            NodeKind::Return { value } => {
-                if let Some(value) = value {
-                    self.kept(value.as_ref())?;
-                }
-                if self.functions.len() == 1
-                    && let Some(events) = self.before
-                    && !passes_row(value.as_deref(), events)
-                {
-                    self.chain.residue = true;
-                }
-            }
+            NodeKind::Return { value } => self.returned(value.as_deref())?,
             NodeKind::ReturnNext { value } => {
                 self.procedural("RETURN NEXT");
                 if let Some(value) = value {
@@ -309,6 +337,23 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
                 self.chain.residue = true;
                 self.kept(assert.condition.as_ref())?;
             }
+        }
+        Ok(())
+    }
+
+    /// Reads a `RETURN` of `value`. `RETURN NEW` and `RETURN OLD` hand the
+    /// row on and decide nothing the replica's trigger body runs.
+    fn returned(&mut self, value: Option<&sqlparser::ast::Query>) -> Result<(), Error> {
+        if let Some(value) = value
+            && returned_record(value).is_none()
+        {
+            self.kept(value)?;
+        }
+        if self.functions.len() == 1
+            && let Some(events) = self.before
+            && !passes_row(value, events)
+        {
+            self.chain.residue = true;
         }
         Ok(())
     }
@@ -414,6 +459,9 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
     /// calls run before it, and it reads the relations it names.
     fn around<N: Visit>(&mut self, node: &N) -> Result<(), Error> {
         let mut names = self.names();
+        if self.functions.len() == 1 {
+            record_reads(node, &mut self.chain.old, &mut self.chain.new);
+        }
         if reads_found(node)
             && let Some(write) = self.found_write()
         {
@@ -535,29 +583,59 @@ fn is_plpgsql(function: &CreateFunction) -> bool {
 }
 
 /// The functions the schema declares that `node` calls, in the order it names
-/// them, each once.
-fn helpers<'s, N: Visit>(
+/// them, each once: in an expression, and as a set-returning function in
+/// `FROM`.
+pub(super) fn helpers<'s, N: Visit>(
     node: &N,
     schema: &'s ParserDB,
     options: &TranslationContext<'_>,
 ) -> Result<Vec<&'s CreateFunction>, Error> {
-    let mut called: Vec<&'s CreateFunction> = Vec::new();
-    let flow = visit_expressions(node, |expr| {
-        let Expr::Function(call) = expr else { return ControlFlow::Continue(()) };
-        match declared_helper(&call.name, schema, options) {
+    let mut calls = Calls { schema, options, called: Vec::new() };
+    match node.visit(&mut calls) {
+        ControlFlow::Break(error) => Err(error),
+        ControlFlow::Continue(()) => Ok(calls.called),
+    }
+}
+
+/// The functions the schema declares that a node calls.
+struct Calls<'s, 'o, 'c> {
+    schema: &'s ParserDB,
+    options: &'o TranslationContext<'c>,
+    called: Vec<&'s CreateFunction>,
+}
+
+impl Calls<'_, '_, '_> {
+    fn call(&mut self, name: &ObjectName) -> ControlFlow<Error> {
+        match declared_helper(name, self.schema, self.options) {
             Ok(Some(helper)) => {
-                if !called.iter().any(|seen| core::ptr::eq(*seen, helper)) {
-                    called.push(helper);
+                if !self.called.iter().any(|seen| core::ptr::eq(*seen, helper)) {
+                    self.called.push(helper);
                 }
                 ControlFlow::Continue(())
             }
             Ok(None) => ControlFlow::Continue(()),
             Err(error) => ControlFlow::Break(error),
         }
-    });
-    match flow {
-        ControlFlow::Break(error) => Err(error),
-        ControlFlow::Continue(()) => Ok(called),
+    }
+}
+
+impl Visitor for Calls<'_, '_, '_> {
+    type Break = Error;
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Error> {
+        match expr {
+            Expr::Function(call) => self.call(&call.name),
+            _ => ControlFlow::Continue(()),
+        }
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<Error> {
+        match factor {
+            TableFactor::Table { name, args: Some(_), .. } | TableFactor::Function { name, .. } => {
+                self.call(name)
+            }
+            _ => ControlFlow::Continue(()),
+        }
     }
 }
 
@@ -586,16 +664,121 @@ fn reads_found<N: Visit>(node: &N) -> bool {
     .is_break()
 }
 
+/// Adds the fields of `OLD` and `NEW` that `node` reads to `old` and `new`,
+/// folded, the whole row where it reads a record itself or `OLD.*`.
+pub(super) fn record_reads<N: Visit>(node: &N, old: &mut Columns, new: &mut Columns) {
+    let _: ControlFlow<()> = node.visit(&mut RecordReads { old, new });
+}
+
+/// The fields of `OLD` and `NEW` a node reads.
+struct RecordReads<'r> {
+    old: &'r mut Columns,
+    new: &'r mut Columns,
+}
+
+impl RecordReads<'_> {
+    /// Records a read of `record`, of its `field` or of all of it.
+    fn read(&mut self, record: &Ident, field: Option<&Ident>) {
+        if record.quote_style.is_some() {
+            return;
+        }
+        let read = if record.value.eq_ignore_ascii_case("old") {
+            &mut *self.old
+        } else if record.value.eq_ignore_ascii_case("new") {
+            &mut *self.new
+        } else {
+            return;
+        };
+        match field {
+            Some(field) => read.insert(crate::impls::translator_impls::plpgsql::fold(field)),
+            None => *read = Columns::Row,
+        }
+    }
+
+    /// Records the read of `record.*`.
+    fn wildcard(&mut self, record: &ObjectName) {
+        if let [ObjectNamePart::Identifier(record)] = record.0.as_slice() {
+            self.read(record, None);
+        }
+    }
+}
+
+impl Visitor for RecordReads<'_> {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+        match expr {
+            Expr::Identifier(record) => self.read(record, None),
+            Expr::CompoundIdentifier(parts) => {
+                if let [record, field, ..] = parts.as_slice() {
+                    self.read(record, Some(field));
+                }
+            }
+            Expr::QualifiedWildcard(record, _) => self.wildcard(record),
+            Expr::Function(call) => {
+                if let FunctionArguments::List(list) = &call.args {
+                    for argument in &list.args {
+                        if let FunctionArg::Unnamed(FunctionArgExpr::QualifiedWildcard(record))
+                        | FunctionArg::Named {
+                            arg: FunctionArgExpr::QualifiedWildcard(record),
+                            ..
+                        }
+                        | FunctionArg::ExprNamed {
+                            arg: FunctionArgExpr::QualifiedWildcard(record),
+                            ..
+                        } = argument
+                        {
+                            self.wildcard(record);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_select(&mut self, select: &Select) -> ControlFlow<()> {
+        for item in &select.projection {
+            if let SelectItem::QualifiedWildcard(
+                SelectItemQualifiedWildcardKind::ObjectName(record),
+                _,
+            ) = item
+            {
+                self.wildcard(record);
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
 /// Whether a `BEFORE` trigger firing on `events` returning `value` keeps the
 /// row as the write gives it, `NEW` for an insert or an update and `OLD` for
 /// a delete.
 fn passes_row(value: Option<&sqlparser::ast::Query>, events: &[Event]) -> bool {
-    let Some(value) = value else { return false };
-    let Expr::Identifier(row) = embedded::expression(value).into_owned() else { return false };
+    match value.and_then(returned_record) {
+        Some(Record::New) => {
+            events.iter().all(|event| matches!(event, Event::Insert | Event::Update))
+        }
+        Some(Record::Old) => events.iter().all(|event| matches!(event, Event::Delete)),
+        None => false,
+    }
+}
+
+/// The row records of a trigger function.
+enum Record {
+    New,
+    Old,
+}
+
+/// The record `value` returns when it is `NEW` or `OLD` itself.
+fn returned_record(value: &sqlparser::ast::Query) -> Option<Record> {
+    let Expr::Identifier(row) = embedded::expression(value).into_owned() else { return None };
     if row.value.eq_ignore_ascii_case("new") {
-        events.iter().all(|event| matches!(event, Event::Insert | Event::Update))
+        Some(Record::New)
+    } else if row.value.eq_ignore_ascii_case("old") {
+        Some(Record::Old)
     } else {
-        row.value.eq_ignore_ascii_case("old")
-            && events.iter().all(|event| matches!(event, Event::Delete))
+        None
     }
 }

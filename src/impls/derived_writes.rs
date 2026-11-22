@@ -19,6 +19,7 @@
 mod chain;
 mod columns;
 mod firing;
+mod readers;
 mod rows;
 
 use alloc::borrow::Cow;
@@ -26,6 +27,7 @@ use core::{fmt::Write as _, ops::ControlFlow};
 
 pub(crate) use chain::without_removed_writes;
 pub(crate) use firing::{FiringTrigger, firing_triggers};
+pub(crate) use readers::reads_left_to_server;
 use sql_traits::{
     structs::ParserDB,
     traits::{ColumnLike, DatabaseLike, FunctionLike, TableLike},
@@ -445,15 +447,25 @@ pub(crate) fn trigger_disposition(
     if matches!(trigger.period, Some(TriggerPeriod::InsteadOf)) {
         return Ok(Disposition::Kept);
     }
-    let Some(exec_body) = &trigger.exec_body else { return Ok(Disposition::Kept) };
-    let Some(function) = written_function(schema, &exec_body.func_desc.name)? else {
+    let Some((function, mut chain)) = trigger_chain(trigger, schema, options)? else {
         return Ok(Disposition::Kept);
     };
-    let events: Vec<Event> = trigger.events.iter().map(Event::of).collect();
-    // PostgreSQL ignores what a statement trigger returns.
-    let before = (matches!(trigger.period, Some(TriggerPeriod::Before)) && is_per_row(trigger))
-        .then_some(events.as_slice());
-    let mut chain = chain::Walker::read(function, before, schema, options)?;
+    chain_disposition(trigger, function, &mut chain, schema, options)
+}
+
+/// What the replica does with `trigger`, whose `function` does what `chain`
+/// holds, taking the writes it leaves to the server out of `chain`.
+///
+/// # Errors
+///
+/// As [`trigger_disposition`].
+fn chain_disposition(
+    trigger: &CreateTrigger,
+    function: &CreateFunction,
+    chain: &mut chain::Chain,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<Disposition, Error> {
     if let Some(first) = chain.writes.first() {
         if let Some(index) = chain.inseparable {
             return Ok(Disposition::LeftOut(format!(
@@ -468,7 +480,7 @@ pub(crate) fn trigger_disposition(
             return Ok(Disposition::LeftOut(dependency));
         }
         let record = last_ident(&trigger.table_name).map(fold).unwrap_or_default();
-        if let Some(dependency) = firing::own_dependency(&chain, &record, schema, options)? {
+        if let Some(dependency) = firing::own_dependency(chain, &record, schema, options)? {
             return Ok(Disposition::LeftOut(dependency));
         }
         if let Some(construct) = chain.procedural {
@@ -489,14 +501,40 @@ pub(crate) fn trigger_disposition(
     if let Some(error) = chain.unreadable.take() {
         return Err(error);
     }
-    if let Some(dependency) = firing::fired_dependency(trigger, &chain, schema, options)? {
+    if let Some(dependency) = firing::fired_dependency(trigger, chain, schema, options)? {
         return Ok(Disposition::LeftOut(dependency));
     }
     Ok(if chain.writes.is_empty() {
         Disposition::Kept
     } else {
-        Disposition::Stripped(chain.writes)
+        Disposition::Stripped(core::mem::take(&mut chain.writes))
     })
+}
+
+/// The function `trigger` runs and what it does as the replica reads it,
+/// every write kept for an `INSTEAD OF` trigger, which the replica keeps
+/// whole, or `None` when the schema does not hold the function.
+///
+/// # Errors
+///
+/// Fails as [`chain::Walker::read`] does.
+fn trigger_chain<'s>(
+    trigger: &CreateTrigger,
+    schema: &'s ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<Option<(&'s CreateFunction, chain::Chain)>, Error> {
+    let Some(exec_body) = &trigger.exec_body else { return Ok(None) };
+    let Some(function) = written_function(schema, &exec_body.func_desc.name)? else {
+        return Ok(None);
+    };
+    if matches!(trigger.period, Some(TriggerPeriod::InsteadOf)) {
+        return Ok(Some((function, chain::Walker::read_whole(function, schema, options)?)));
+    }
+    let events: Vec<Event> = trigger.events.iter().map(Event::of).collect();
+    // PostgreSQL ignores what a statement trigger returns.
+    let before = (matches!(trigger.period, Some(TriggerPeriod::Before)) && is_per_row(trigger))
+        .then_some(events.as_slice());
+    Ok(Some((function, chain::Walker::read(function, before, schema, options)?)))
 }
 
 /// Whether `trigger` fires for each row rather than once for the statement.
@@ -703,13 +741,7 @@ pub(crate) fn foreign_key_left_to_server(
     if OffReplica::of(&key.foreign_table, schema, options)?.is_some() {
         return Ok(false);
     }
-    let name = name.or(key.name.as_ref()).map_or_else(
-        || {
-            let columns: Vec<&str> = columns.iter().map(|column| column.value.as_str()).collect();
-            format!("({}) REFERENCES {referenced}", columns.join(", "))
-        },
-        |name| name.value.clone(),
-    );
+    let name = key_name(key, name, columns);
     emit(TranslationWarning::LeftToServer {
         construct: "FOREIGN KEY".to_owned(),
         name,
@@ -717,6 +749,23 @@ pub(crate) fn foreign_key_left_to_server(
         reason,
     });
     Ok(true)
+}
+
+/// The name `key`, declared over `columns` and named `name` where the
+/// declaration names it, carries in a report: its own, or else its columns
+/// and the table it references, as `(org, member) REFERENCES memberships`.
+fn key_name(key: &ForeignKeyConstraint, name: Option<&Ident>, columns: &[Ident]) -> String {
+    name.or(key.name.as_ref()).map_or_else(
+        || {
+            let columns: Vec<&str> = columns.iter().map(|column| column.value.as_str()).collect();
+            format!(
+                "({}) REFERENCES {}",
+                columns.join(", "),
+                last_ident_value_or_display(&key.foreign_table)
+            )
+        },
+        |name| name.value.clone(),
+    )
 }
 
 /// `column` without the `REFERENCES` options the replica leaves to the

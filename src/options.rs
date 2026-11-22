@@ -1579,7 +1579,12 @@ impl Pg2SqliteOptions {
     ///
     /// [`Pg2Sqlite::translate_with_report`](crate::pg2sqlite::Pg2Sqlite::translate_with_report)
     /// names each one in a
-    /// [`TranslationWarning::LeftToServer`](crate::warnings::TranslationWarning::LeftToServer).
+    /// [`TranslationWarning::LeftToServer`](crate::warnings::TranslationWarning::LeftToServer),
+    /// and each policy, `CHECK`, trigger, unique key or index and foreign key
+    /// the replica keeps that reads what such a write changes, which it
+    /// judges on the rows as they were before the write until the server's
+    /// rows arrive, in a
+    /// [`TranslationWarning::ReadsLeftToServer`](crate::warnings::TranslationWarning::ReadsLeftToServer).
     ///
     /// ```
     /// # use pg2sqlite::prelude::*;

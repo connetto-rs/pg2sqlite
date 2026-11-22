@@ -17,7 +17,9 @@
 //! classification. `tests/it/test_no_statement_is_silently_dropped.rs` enforces
 //! the whole policy. A drop the caller asks for through an option is the one
 //! warning that changes results, and
-//! [`TranslationWarning::LeftToServer`] names each.
+//! [`TranslationWarning::LeftToServer`] names each, with
+//! [`TranslationWarning::ReadsLeftToServer`] naming every construct the
+//! replica keeps that reads what such a drop changes.
 //!
 //! Do not add a fourth mechanism. There are three outcomes, plus that closed
 //! list.
@@ -133,6 +135,41 @@ pub enum TranslationWarning {
         /// reads of it.
         reason: String,
     },
+    /// A construct the replica keeps reads what a write it leaves to the
+    /// server changes, under
+    /// [`Pg2SqliteOptions::with_server_derived_writes_omitted`](crate::options::Pg2SqliteOptions::with_server_derived_writes_omitted).
+    ///
+    /// Until the server's rows arrive, the replica holds the rows the write
+    /// changes as they were before it, so the construct may admit or refuse a
+    /// later write, or show a row, where the server decides otherwise. A
+    /// policy of any command, a `CHECK`, a trigger, a unique key or index and
+    /// a foreign key each count, reading the table itself or through the
+    /// functions it calls.
+    ReadsLeftToServer {
+        /// The kind of the construct that reads, as SQL spells it.
+        construct: String,
+        /// Its name, a foreign key named as in
+        /// [`TranslationWarning::LeftToServer`].
+        name: String,
+        /// The table it is declared on, as written.
+        table: String,
+        /// The functions it reads through, the one it calls first, empty
+        /// when it reads the table itself.
+        through: Vec<String>,
+        /// The table it reads, which the write changes, folded as
+        /// PostgreSQL folds an unquoted name.
+        read: String,
+        /// The columns of `read` it reads that the write changes, folded,
+        /// empty when it reads whole rows or which rows the table holds.
+        columns: Vec<String>,
+        /// The kind of what leaves the write to the server, as
+        /// [`TranslationWarning::LeftToServer`] names it.
+        writer: String,
+        /// Its name.
+        writer_name: String,
+        /// The table it is declared on, as written.
+        writer_table: String,
+    },
 }
 
 /// Where a translation reports the steps that lost something.
@@ -181,6 +218,33 @@ impl core::fmt::Display for TranslationWarning {
             }
             Self::LeftToServer { construct, name, table, reason } => {
                 write!(f, "left {construct} {name} on {table} to the server, since {reason}")
+            }
+            Self::ReadsLeftToServer {
+                construct,
+                name,
+                table,
+                through,
+                read,
+                columns,
+                writer,
+                writer_name,
+                writer_table,
+            } => {
+                write!(f, "kept {construct} {name} on {table} reads ")?;
+                if columns.is_empty() {
+                    write!(f, "rows of {read}")?;
+                } else {
+                    write!(f, "{} of {read}", columns.join(", "))?;
+                }
+                for (depth, function) in through.iter().enumerate() {
+                    let joint = if depth == 0 { " through" } else { " calling" };
+                    write!(f, "{joint} {function}()")?;
+                }
+                write!(
+                    f,
+                    ", which {writer} {writer_name} on {writer_table} changes on the server alone, \
+                     so the replica decides on them as they were before"
+                )
             }
         }
     }
