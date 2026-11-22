@@ -170,6 +170,97 @@ fn a_write_through_an_automatically_updatable_view_changes_its_table() {
     );
 }
 
+/// A view over a view lands its write on the table beneath both, each level
+/// renaming the columns it declares.
+#[test]
+fn a_write_through_nested_views_with_declared_names_changes_their_table() {
+    let pg = INVITATIONS.replace(
+        "UPDATE invitations SET accepted_by_id = NEW.user_id WHERE id = NEW.invitation_id",
+        "UPDATE unaccepted SET acceptor = NEW.user_id WHERE invitation = NEW.invitation_id",
+    ) + "CREATE VIEW open_invitations (invitation, organization, accepted) AS
+  SELECT id, organization_id, accepted_by_id FROM invitations;
+CREATE VIEW unaccepted AS
+  SELECT invitation, accepted AS acceptor FROM open_invitations WHERE accepted IS NULL;";
+    assert_eq!(
+        readers(&pg),
+        owned(&[
+            (
+                "FOREIGN KEY",
+                "(accepted_by_id) REFERENCES users",
+                "accepted_by_id of invitations",
+                "memberships_invitation_accepted"
+            ),
+            (
+                "POLICY",
+                "memberships_insert",
+                "accepted_by_id of invitations",
+                "memberships_invitation_accepted"
+            ),
+        ]),
+    );
+}
+
+/// PostgreSQL refuses an update through a view with `DISTINCT` and a
+/// `TRUNCATE` of any view, so neither changes the table beneath.
+#[test]
+fn a_write_postgresql_refuses_on_a_view_changes_no_table() {
+    for (write, view) in [
+        (
+            "UPDATE distinct_invitations SET accepted_by_id = NEW.user_id",
+            "CREATE VIEW distinct_invitations AS
+  SELECT DISTINCT id, accepted_by_id FROM invitations;",
+        ),
+        (
+            "TRUNCATE open_invitations",
+            "CREATE VIEW open_invitations AS SELECT id, accepted_by_id FROM invitations;",
+        ),
+    ] {
+        let pg = INVITATIONS.replace(
+            "UPDATE invitations SET accepted_by_id = NEW.user_id WHERE id = NEW.invitation_id",
+            write,
+        ) + view;
+        assert_eq!(readers(&pg), Vec::new(), "{write}");
+    }
+}
+
+/// An `INSTEAD OF` trigger on the view beneath takes the write, which then
+/// changes only what the trigger writes, and the trigger reads the rows of
+/// the table beneath its view.
+#[test]
+fn a_write_reaching_a_view_with_an_instead_of_trigger_changes_what_the_trigger_writes() {
+    let pg = INVITATIONS.replace(
+        "UPDATE invitations SET accepted_by_id = NEW.user_id",
+        "UPDATE open_invitations SET acceptor = NEW.user_id",
+    ) + "CREATE VIEW invitation_rows AS SELECT id, organization_id, accepted_by_id FROM invitations;
+CREATE FUNCTION move_invitation() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE invitations SET organization_id = 0 WHERE id = OLD.id;
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER invitation_rows_move INSTEAD OF UPDATE ON invitation_rows
+  FOR EACH ROW EXECUTE FUNCTION move_invitation();
+CREATE VIEW open_invitations AS
+  SELECT id, accepted_by_id AS acceptor FROM invitation_rows WHERE accepted_by_id IS NULL;";
+    assert_eq!(
+        readers(&pg),
+        owned(&[
+            (
+                "POLICY",
+                "memberships_insert",
+                "organization_id of invitations",
+                "memberships_invitation_accepted"
+            ),
+            (
+                "TRIGGER",
+                "invitation_rows_move",
+                "organization_id of invitations",
+                "memberships_invitation_accepted"
+            ),
+        ]),
+    );
+}
+
 #[test]
 fn without_the_option_nothing_is_named() {
     let deployment = Deployment::new("postgres", ["app"], []).expect("a valid deployment");
@@ -542,6 +633,74 @@ CREATE TRIGGER memberships_audit AFTER INSERT ON memberships
                 "(organization_id, user_id) REFERENCES memberships"
             ),
         ]),
+    );
+}
+
+/// The readers of `pg`, a schema a trigger on `memberships` audits, under
+/// the option alone.
+fn audit_readers(pg: &str) -> Vec<(String, String, String, String)> {
+    let pg = format!(
+        "CREATE TABLE memberships (organization_id INT NOT NULL, user_id INT NOT NULL,
+  PRIMARY KEY (organization_id, user_id));
+CREATE TABLE audit_events (id INT PRIMARY KEY, table_name TEXT NOT NULL);
+{pg}
+CREATE TRIGGER memberships_audit AFTER INSERT ON memberships
+  FOR EACH ROW EXECUTE FUNCTION record_audit_event();"
+    );
+    let warnings = Pg2Sqlite::default()
+        .sql(&pg)
+        .expect("fixture parses")
+        .translate_with_report(&Pg2SqliteOptions::default().with_server_derived_writes_omitted())
+        .expect("fixture translates")
+        .warnings;
+    readers_in(warnings)
+}
+
+#[test]
+fn rows_a_trigger_adds_through_a_view_are_rows_of_its_table() {
+    let readers = audit_readers(
+        "CREATE VIEW audit_log AS SELECT id, table_name AS source FROM audit_events;
+CREATE FUNCTION record_audit_event() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO audit_log (id, source) VALUES (NEW.user_id, TG_TABLE_NAME);
+  RETURN NULL;
+END
+$$;",
+    );
+    assert_eq!(
+        readers,
+        owned(&[("PRIMARY KEY", "audit_events_pkey", "id of audit_events", "memberships_audit")]),
+    );
+}
+
+/// PostgreSQL runs the `INSTEAD OF` trigger again for its own write to its
+/// view, which the analysis follows once.
+#[test]
+fn an_instead_of_trigger_writing_its_own_view_is_followed_once() {
+    let readers = audit_readers(
+        "CREATE VIEW audit_entries AS SELECT id, table_name FROM audit_events;
+CREATE FUNCTION file_audit_entry() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.table_name IS NULL THEN
+    INSERT INTO audit_entries (id, table_name) VALUES (NEW.id, 'unknown');
+  ELSE
+    INSERT INTO audit_events (id, table_name) VALUES (NEW.id, NEW.table_name);
+  END IF;
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER audit_entries_file INSTEAD OF INSERT ON audit_entries
+  FOR EACH ROW EXECUTE FUNCTION file_audit_entry();
+CREATE FUNCTION record_audit_event() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO audit_entries (id, table_name) VALUES (NEW.user_id, NULL);
+  RETURN NULL;
+END
+$$;",
+    );
+    assert_eq!(
+        readers,
+        owned(&[("PRIMARY KEY", "audit_events_pkey", "id of audit_events", "memberships_audit")]),
     );
 }
 

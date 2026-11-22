@@ -19,7 +19,9 @@ use sqlparser_plpgsql::embedded::{
 use super::{
     DerivedWrite, Event, Reach, chain_phrase,
     columns::{Columns, columns_read},
-    function_writes, is_builtin, parsed_body,
+    function_writes, is_builtin,
+    landing::Landing,
+    parsed_body,
     rows::{self, Rows},
 };
 #[cfg(not(feature = "std"))]
@@ -151,6 +153,17 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
     /// The names the function being read may read as variables.
     fn variables(&self) -> &[String] {
         self.variables.last().map_or(&[], Vec::as_slice)
+    }
+
+    /// Where the writes of the functions being read land.
+    fn landing(&self) -> Landing<'_> {
+        Landing::new(self.schema, self.options)
+    }
+
+    /// Where a statement of the function being read runs, reached through
+    /// `names`.
+    fn reach<'a>(&'a self, names: &'a [String]) -> Reach<'a> {
+        Reach { chain: names, variables: self.variables(), landing: self.landing() }
     }
 
     fn function(&mut self, function: &'s CreateFunction) -> Result<(), Error> {
@@ -362,10 +375,7 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
     /// makes stays and what follows reads the row it returns.
     fn into(&mut self, statement: &Statement, into: &IntoTargets) -> Result<(), Error> {
         let names = self.names();
-        let direct = super::statement_writes(
-            statement,
-            Reach { chain: &names, variables: self.variables() },
-        );
+        let direct = super::statement_writes(statement, self.reach(&names))?;
         match direct.first() {
             Some(write) => {
                 let reason = format!(
@@ -434,10 +444,9 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
     /// `LANGUAGE sql` helpers it calls.
     fn removed_writes<N: Visit>(&self, node: &N) -> Result<Vec<DerivedWrite>, Error> {
         let mut names = self.names();
-        let mut writes =
-            super::statement_writes(node, Reach { chain: &names, variables: self.variables() });
+        let mut writes = super::statement_writes(node, self.reach(&names))?;
         for helper in helpers(node, self.schema, self.options)? {
-            function_writes(helper, self.schema, &mut Vec::new(), &mut names, &mut writes)?;
+            function_writes(helper, self.landing(), &mut Vec::new(), &mut names, &mut writes)?;
         }
         Ok(writes)
     }
@@ -446,8 +455,7 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
     /// holds cannot go alone.
     fn kept<N: Visit>(&mut self, node: &N) -> Result<(), Error> {
         let names = self.names();
-        let direct =
-            super::statement_writes(node, Reach { chain: &names, variables: self.variables() });
+        let direct = super::statement_writes(node, self.reach(&names))?;
         if let Some(first) = self.record(direct) {
             self.chain.inseparable.get_or_insert(first);
         }
@@ -479,7 +487,7 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
                 continue;
             }
             let mut writes = Vec::new();
-            function_writes(helper, self.schema, &mut Vec::new(), &mut names, &mut writes)?;
+            function_writes(helper, self.landing(), &mut Vec::new(), &mut names, &mut writes)?;
             match self.record(writes) {
                 Some(first) => {
                     self.chain.inseparable.get_or_insert(first);
@@ -561,7 +569,9 @@ fn removes(
     if helpers.iter().any(|helper| is_plpgsql(helper)) {
         return Ok(false);
     }
-    if !super::statement_writes(statement.as_ref(), Reach { chain: &[], variables: &[] }).is_empty()
+    let landing = Landing::new(schema, options);
+    if !super::statement_writes(statement.as_ref(), Reach { chain: &[], variables: &[], landing })?
+        .is_empty()
     {
         return Ok(true);
     }
@@ -570,7 +580,7 @@ fn removes(
     }
     for helper in helpers {
         let mut writes = Vec::new();
-        function_writes(helper, schema, &mut Vec::new(), &mut Vec::new(), &mut writes)?;
+        function_writes(helper, landing, &mut Vec::new(), &mut Vec::new(), &mut writes)?;
         if !writes.is_empty() {
             return Ok(true);
         }

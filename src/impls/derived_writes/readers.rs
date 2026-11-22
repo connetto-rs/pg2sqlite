@@ -27,7 +27,9 @@ use super::{
     chain_disposition,
     columns::{Columns, columns_read, row_columns_read},
     firing::{changed_by, live_triggers},
-    foreign_key_left_to_server, is_per_row, key_name, trigger_chain,
+    foreign_key_left_to_server, is_per_row, key_name,
+    landing::Landing,
+    trigger_chain,
 };
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
@@ -231,6 +233,7 @@ fn omitted_writes(
             name: last_ident_value_or_display(&trigger.name),
             table: last_ident_value_or_display(&trigger.table_name),
         };
+        let landing = Landing::new(schema, options);
         let left_out;
         let derived = match disposition {
             Disposition::Kept => continue,
@@ -244,13 +247,14 @@ fn omitted_writes(
                 {
                     add(&mut omitted, &writer, fold(record), Columns::Row);
                 }
-                left_out = fired.writes(schema)?;
+                left_out = fired.writes(landing)?;
                 &left_out
             }
         };
-        for write in derived {
+        landing.taken(derived, &mut |write| {
             add(&mut omitted, &writer, write.relation.clone(), changed_by(write, schema, options)?);
-        }
+            Ok(())
+        })?;
     }
     for table in schema.tables() {
         if OffReplica::of(&table.name, schema, options)?.is_some() {
