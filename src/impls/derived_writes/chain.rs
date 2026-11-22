@@ -192,11 +192,9 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
     }
 
     fn function(&mut self, function: &'s CreateFunction) -> Result<(), Error> {
-        if is_builtin(function) {
-            return Ok(());
-        }
-        if self.functions.iter().any(|seen| core::ptr::eq(*seen, function)) {
-            self.recursions += 1;
+        let reading = self.functions.iter().any(|seen| core::ptr::eq(*seen, function));
+        if is_builtin(function) || reading {
+            self.recursions += usize::from(reading);
             return Ok(());
         }
         if let Some(&recorded) = self.recorded.get(&core::ptr::from_ref(function)) {
