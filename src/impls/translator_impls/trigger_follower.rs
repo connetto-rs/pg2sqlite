@@ -6,8 +6,9 @@ use alloc::collections::BTreeSet;
 
 use sql_traits::{structs::ParserDB, traits::DatabaseLike};
 use sqlparser::ast::{
-    AlterFunction, AlterFunctionOperation, AlterFunctionSignature, CreateTrigger, DropTrigger,
-    ObjectName, ObjectType, Statement,
+    AlterFunction, AlterFunctionOperation, AlterFunctionSignature, AlterTableOperation,
+    CreateTrigger, DropTrigger, ObjectName, ObjectType, RenameTableNameKind, Statement,
+    TriggerEvent,
 };
 
 use super::{
@@ -16,7 +17,7 @@ use super::{
 };
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
-use crate::{errors::Error, warnings::TranslationWarning};
+use crate::{errors::Error, impls::object_name::same_identifier, warnings::TranslationWarning};
 
 /// Translates a statement as the batch stands on one side of an event.
 pub(crate) type Translate<'t> =
@@ -24,7 +25,8 @@ pub(crate) type Translate<'t> =
 
 /// One live trigger.
 struct Followed {
-    /// The trigger as PostgreSQL holds it, on its table's current name.
+    /// The trigger as PostgreSQL holds it, naming its table and the columns
+    /// of its `UPDATE OF` list by their current names.
     create: CreateTrigger,
     /// Its last translation before slot merging, `None` until an event
     /// translates a seeded one.
@@ -105,6 +107,33 @@ impl Touched {
     }
 }
 
+/// Carries `trigger` along `event`, which renames its table or a column its
+/// `UPDATE OF` list names.
+fn carry(trigger: &mut CreateTrigger, event: &Statement) {
+    let Statement::AlterTable(alter) = event else { return };
+    if folded(&alter.name) != folded(&trigger.table_name) {
+        return;
+    }
+    for operation in &alter.operations {
+        match operation {
+            AlterTableOperation::RenameTable {
+                table_name: RenameTableNameKind::As(to) | RenameTableNameKind::To(to),
+            } => trigger.table_name.clone_from(to),
+            AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
+                for event in &mut trigger.events {
+                    let TriggerEvent::Update(columns) = event else { continue };
+                    for column in columns {
+                        if same_identifier(column, old_column_name) {
+                            column.clone_from(new_column_name);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The triggers live at the point of the batch being translated.
 pub(crate) struct TriggerFollower {
     live: Vec<Followed>,
@@ -151,13 +180,8 @@ impl TriggerFollower {
                     .retain(|followed| !dropped.contains(&folded(&followed.create.table_name)));
             }
             _ => {
-                if let Some((from, to)) = renamed_table(source) {
-                    let from = folded(from);
-                    for followed in &mut self.live {
-                        if folded(&followed.create.table_name) == from {
-                            followed.create.table_name = to.clone();
-                        }
-                    }
+                for followed in &mut self.live {
+                    carry(&mut followed.create, source);
                 }
             }
         }
@@ -193,7 +217,6 @@ impl TriggerFollower {
             } => names.iter().map(folded).collect(),
             _ => BTreeSet::new(),
         };
-        let renamed = renamed_table(event);
         let mut reemissions = Vec::new();
         for followed in &mut self.live {
             let table = folded(&followed.create.table_name);
@@ -203,11 +226,7 @@ impl TriggerFollower {
                 continue;
             }
             let mut moved = followed.create.clone();
-            if let Some((from, to)) = renamed
-                && folded(from) == table
-            {
-                moved.table_name = to.clone();
-            }
+            carry(&mut moved, event);
             let create = Statement::CreateTrigger(moved);
             let mut warnings = Vec::new();
             let rendered = translate_after(&create, &mut |warning| warnings.push(warning))?;
