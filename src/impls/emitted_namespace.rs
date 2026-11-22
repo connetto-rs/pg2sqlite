@@ -370,7 +370,7 @@ fn generated_artifact_label(statement: &Statement) -> &'static str {
         Statement::CreateTable(create)
             if super::translator_impls::reentry::is_marker_table(&create.name) =>
         {
-            "a generated re-entry marker table"
+            "a generated marker table"
         }
         Statement::CreateTable(_) => "a generated backing table",
         Statement::CreateIndex(_) => "a generated NULLS NOT DISTINCT index",

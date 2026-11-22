@@ -1267,7 +1267,10 @@ impl Pg2Sqlite {
     ) -> Result<TranslatedUnits, crate::errors::Error> {
         let mut trackers = Trackers {
             trigger_slots: TriggerSlots::seeded(initial_schema)?,
-            marker_tables: MarkerTables::seeded(initial_schema)?,
+            marker_tables: MarkerTables::seeded(
+                initial_schema,
+                context.is_strict_rls_validation(),
+            )?,
             attachments: LiveAttachments::seeded(initial_schema, context)?,
         };
         let mut follower = TriggerFollower::seeded(initial_schema);

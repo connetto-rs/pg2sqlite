@@ -272,6 +272,7 @@ mod test_rls_role_scoped_policies;
 mod test_rls_sample_applies;
 mod test_rls_self_referential;
 mod test_rls_self_referential_policy;
+mod test_rls_strict_select_gate;
 mod test_rls_subquery_scope;
 mod test_rls_tenant_isolation;
 mod test_rls_translation;

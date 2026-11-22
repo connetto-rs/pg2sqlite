@@ -28,10 +28,10 @@ use sqlparser::{
         CreatePolicy, CreateTable, CreateTrigger, DataType, Expr, Function, FunctionArg,
         FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList, FunctionArguments,
         FunctionDesc, HavingBound, Ident, InTarget, JoinConstraint, JoinOperator,
-        ListAggOnOverflow, ObjectName, ObjectNamePart, SelectItem, SetExpr, Statement, TableAlias,
-        TableFactor, TriggerEvent, TriggerExecBody, TriggerExecBodyType, TriggerObject,
-        TriggerObjectKind, TriggerPeriod, UnaryOperator, Value, ValueWithSpan, Visit, VisitMut,
-        Visitor, VisitorMut, WindowType,
+        ListAggOnOverflow, ObjectName, ObjectNamePart, OnConflict, OnConflictAction, OnInsert,
+        SelectItem, SetExpr, Statement, TableAlias, TableFactor, TriggerEvent, TriggerExecBody,
+        TriggerExecBodyType, TriggerObject, TriggerObjectKind, TriggerPeriod, UnaryOperator, Value,
+        ValueWithSpan, Visit, VisitMut, Visitor, VisitorMut, WindowType,
     },
     tokenizer::{Token, Word},
 };
@@ -634,9 +634,13 @@ struct WriteGuard {
     columns: Vec<TriggerColumn>,
     /// `USING` on the existing row, for UPDATE.
     using: Option<PolicyPredicate>,
+    /// The `SELECT` policies an upsert holds the existing row it updates to,
+    /// for the backing table's UPDATE under strict validation.
+    visible: Option<PolicyPredicate>,
     /// `WITH CHECK` on the written row.
     check: PolicyPredicate,
-    /// The `SELECT` policies an UPDATE reading a column holds its new row to.
+    /// The `SELECT` policies an UPDATE reading a column, or an INSERT reading
+    /// its row back, holds the new row to.
     read_back: Option<PolicyPredicate>,
 }
 
@@ -660,7 +664,13 @@ fn build_write_guard(
     };
     let table_name = table.table_name();
     let (using_gate, check_gate, read_back_gate) = match kind {
-        GuardKind::Insert => (None, rows.gate(GatedCommand::Insert, RowVersion::Inserted), None),
+        GuardKind::Insert => {
+            (
+                None,
+                rows.gate(GatedCommand::Insert, RowVersion::Inserted),
+                rows.gate(GatedCommand::Select, RowVersion::Inserted),
+            )
+        }
         GuardKind::Update => {
             (
                 rows.gate(GatedCommand::Update, RowVersion::Existing),
@@ -669,6 +679,13 @@ fn build_write_guard(
             )
         }
     };
+    // Strict validation sends an upsert past the view, so the backing table's
+    // UPDATE has to hold the row it updates to the SELECT policies the view
+    // reads through.
+    let visible_gate =
+        (kind == GuardKind::Update && grants.is_none() && options.is_strict_rls_validation())
+            .then(|| rows.gate(GatedCommand::Select, RowVersion::Existing))
+            .flatten();
     // A volatile column default reaches both the guard and the forwarding
     // INSERT, two independent draws.
     if kind == GuardKind::Insert {
@@ -694,7 +711,7 @@ fn build_write_guard(
     }
     // A volatile policy predicate reaches both the trigger guard and the
     // forwarding WHERE or backing check, two independent draws.
-    for gate in [using_gate, check_gate, read_back_gate].into_iter().flatten() {
+    for gate in [using_gate, visible_gate, check_gate, read_back_gate].into_iter().flatten() {
         for term in gate.permissive().iter().chain(gate.restrictive()) {
             let expr = term.expression().expression();
             let inlined = super::sql_helper::inlined_calls(expr, schema, options)?;
@@ -732,12 +749,16 @@ fn build_write_guard(
         GuardKind::Update => Some(combine(using_gate, "OLD", &[])?),
         GuardKind::Insert => None,
     };
+    let visible = match visible_gate {
+        Some(gate) => Some(combine(Some(gate), "OLD", &[])?),
+        None => None,
+    };
     let check = combine(check_gate, "NEW", &subs)?;
     let read_back = match read_back_gate {
         Some(gate) => Some(combine(Some(gate), "NEW", &subs)?),
         None => None,
     };
-    Ok(WriteGuard { columns, using, check, read_back })
+    Ok(WriteGuard { columns, using, visible, check, read_back })
 }
 
 /// Returns whether the table named `table_name` has a backing table behind a
@@ -2198,13 +2219,43 @@ fn forwarding_insert(
     ))
 }
 
+/// What a table's name takes on to name the view taking its inserts written
+/// `ON CONFLICT DO NOTHING` without a conflict target, under strict
+/// validation.
+const CONFLICT_SKIPPING_SUFFIX: &str = "_pg2sqlite_conflict_skips";
+
+/// The view taking `table`'s inserts written `ON CONFLICT DO NOTHING` without
+/// a conflict target, where [`marks_forwarding`] holds.
+pub(crate) fn conflict_skipping_view(table: &str) -> String {
+    format!("{table}{CONFLICT_SKIPPING_SUFFIX}")
+}
+
+/// Whether the view over `table` marks the rows it forwards to the backing
+/// table, so that the backing table's guard holds only the inserts strict
+/// validation sends past the view to the `SELECT` policies.
+///
+/// # Errors
+///
+/// Propagates a failed lookup of the table's row-level security.
+pub(crate) fn marks_forwarding(
+    table: &CreateTable,
+    schema: &ParserDB,
+    options: &Pg2SqliteOptions,
+) -> Result<bool, Error> {
+    Ok(options.is_strict_rls_validation() && table.has_row_level_security(schema)?)
+}
+
+/// The view's `INSTEAD OF INSERT` trigger and, where [`marks_forwarding`]
+/// holds, the [`conflict_skipping_view`] with its own, forwarding the row
+/// `ON CONFLICT DO NOTHING`. PostgreSQL holds neither insert to the `SELECT`
+/// policies, so both triggers mark the row they forward.
 fn generate_insert_trigger_sql(
     table: &CreateTable,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
     grants: &RoleTable,
     emit: crate::warnings::WarningSink<'_>,
-) -> Result<Statement, Error> {
+) -> Result<Vec<Statement>, Error> {
     let (ctx, rows) =
         write_trigger_prologue(table, schema, RowStatement::Insert { returning: false }, options)?;
     let table_name = ctx.table_name;
@@ -2243,16 +2294,46 @@ fn generate_insert_trigger_sql(
         .chain(guard)
         .collect::<Vec<_>>();
     body.extend(refuse_computed_write_statements(&columns, table_name, GuardKind::Insert));
-    body.push(forwarding_insert(&ctx.inner_table_name, &columns, schema, options, emit)?);
-    Ok(ast_builder::trigger(
-        generated_object_name(&format!("{table_name}_insert_trigger")),
-        generated_object_name(table_name),
-        sqlparser::ast::TriggerPeriod::InsteadOf,
-        sqlparser::ast::TriggerEvent::Insert,
-        true,
-        None,
-        body,
-    ))
+    let forwarded = forwarding_insert(&ctx.inner_table_name, &columns, schema, options, emit)?;
+    let trigger_name = format!("{table_name}_insert_trigger");
+    if !marks_forwarding(table, schema, options)? {
+        body.push(forwarded);
+        return Ok(vec![view_trigger(&trigger_name, table_name, TriggerEvent::Insert, body)]);
+    }
+
+    let forwards = super::reentry::forward_marker_table(&table.name);
+    let marked = |insert: Statement| -> Vec<Statement> {
+        body.iter()
+            .cloned()
+            .chain([
+                super::reentry::mark_forward(&forwards),
+                insert,
+                super::reentry::clear_forward(&forwards),
+            ])
+            .collect()
+    };
+    let mut skipping = forwarded.clone();
+    if let Statement::Insert(insert) = &mut skipping {
+        insert.on = Some(OnInsert::OnConflict(OnConflict {
+            conflict_target: None,
+            action: OnConflictAction::DoNothing,
+        }));
+    }
+    let skipping_view = conflict_skipping_view(table_name);
+    Ok(vec![
+        view_trigger(&trigger_name, table_name, TriggerEvent::Insert, marked(forwarded)),
+        ast_builder::create_view(
+            generated_object_name(&skipping_view),
+            Vec::new(),
+            backing_rows(&ctx, grants, Some(Expr::Value(Value::Boolean(false).into()))),
+        ),
+        view_trigger(
+            &format!("{skipping_view}_insert_trigger"),
+            &skipping_view,
+            TriggerEvent::Insert,
+            marked(skipping),
+        ),
+    ])
 }
 
 fn write_exemption_expr(options: &Pg2SqliteOptions) -> Option<Expr> {
@@ -2444,39 +2525,61 @@ fn backing_abort_trigger(
     )
 }
 
+/// The backing-table `BEFORE INSERT` guard, holding the row to `WITH CHECK`
+/// and, where [`marks_forwarding`] holds, a row the view did not forward to
+/// the `SELECT` policies too, as PostgreSQL does for the inserts strict
+/// validation sends past the view. That guard clears the view's mark.
 fn generate_insert_check_trigger_sql(
     table: &CreateTable,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Option<Statement>, Error> {
+    let marks = marks_forwarding(table, schema, options)?;
     let (ctx, rows) =
-        write_trigger_prologue(table, schema, RowStatement::Insert { returning: false }, options)?;
-    let (condition, message) = if rows.has_no_policy(GatedCommand::Insert, RowVersion::Inserted) {
-        (write_guard_condition_expr(None, options), no_policy(WriteCommand::Insert, ctx.table_name))
+        write_trigger_prologue(table, schema, RowStatement::Insert { returning: marks }, options)?;
+    let marker = super::reentry::forward_marker_table(&table.name);
+    let (failing, message) = if rows.has_no_policy(GatedCommand::Insert, RowVersion::Inserted) {
+        (Violation::Every, no_policy(WriteCommand::Insert, ctx.table_name))
     } else {
-        let WriteGuard { check, .. } =
+        let WriteGuard { check, read_back, .. } =
             build_write_guard(&rows, GuardKind::Insert, table, schema, options, None, emit)?;
-        match check {
-            PolicyPredicate::DenyAll => {
-                (write_guard_condition_expr(None, options), RLS_VIOLATION.to_string())
-            }
-            PolicyPredicate::AllowAll => return Ok(None),
-            PolicyPredicate::Expr(predicate) => {
-                (
-                    write_guard_condition_expr(Some(policy_violation(*predicate)), options),
-                    RLS_VIOLATION.to_string(),
-                )
-            }
-        }
+        let unforwarded = violation(read_back)
+            .restricted_to(marks.then(|| super::reentry::not_forwarding(&marker)));
+        (violation([check]).or(unforwarded), RLS_VIOLATION.to_string())
     };
-    Ok(Some(backing_abort_trigger(
-        &format!("{}_insert_check", ctx.inner_table_name),
-        &ctx.inner_table_name,
-        sqlparser::ast::TriggerEvent::Insert,
-        condition,
-        &super::definer::exempt_owners(table, schema),
-        &message,
+    let condition = match failing {
+        Violation::Every => Some(write_guard_condition_expr(None, options)),
+        Violation::Rows(None) => None,
+        Violation::Rows(Some(rows)) => Some(write_guard_condition_expr(Some(*rows), options)),
+    };
+    let name = format!("{}_insert_check", ctx.inner_table_name);
+    let exempt = super::definer::exempt_owners(table, schema);
+    if !marks {
+        return Ok(condition.map(|condition| {
+            backing_abort_trigger(
+                &name,
+                &ctx.inner_table_name,
+                TriggerEvent::Insert,
+                condition,
+                &exempt,
+                &message,
+            )
+        }));
+    }
+    let body = condition
+        .map(|condition| ast_builder::raise_statement("ABORT", Some(&message), condition))
+        .into_iter()
+        .chain([super::reentry::clear_forward(&marker)])
+        .collect();
+    Ok(Some(ast_builder::trigger(
+        generated_object_name(&name),
+        generated_object_name(&ctx.inner_table_name),
+        TriggerPeriod::Before,
+        TriggerEvent::Insert,
+        true,
+        super::definer::outside_owners(&exempt),
+        body,
     )))
 }
 
@@ -2548,25 +2651,27 @@ fn generate_update_check_trigger_sql(
     // Triggers cannot tell a blind write from one reading a column.
     let (ctx, rows) =
         write_trigger_prologue(table, schema, RowStatement::Update { reads: true }, options)?;
-    let (using, check, read_back) = if rows
+    let (using, visible, check, read_back) = if rows
         .has_no_policy(GatedCommand::Update, RowVersion::Existing)
         && rows.has_no_policy(GatedCommand::Update, RowVersion::Updated)
     {
-        (PolicyPredicate::DenyAll, PolicyPredicate::DenyAll, None)
+        (PolicyPredicate::DenyAll, None, PolicyPredicate::DenyAll, None)
     } else {
-        let WriteGuard { using, check, read_back, .. } =
+        let WriteGuard { using, visible, check, read_back, .. } =
             build_write_guard(&rows, GuardKind::Update, table, schema, options, None, emit)?;
-        (using.unwrap_or(PolicyPredicate::AllowAll), check, read_back)
+        (using.unwrap_or(PolicyPredicate::AllowAll), visible, check, read_back)
     };
     let marker = super::reentry::marker_table(&table.name);
     let unmarked_after = |event| {
         maintains(table, schema, options, event)
             .then(|| super::reentry::unmarked_after(&marker, "OLD", event))
     };
+    // The existing row answers to the policies of the caller's statement.
+    let existing = [Some(using), visible].into_iter().flatten();
     let violation = match unmarked_after(MaintainedEvent::Update) {
-        None => violation([Some(using), Some(check), read_back].into_iter().flatten()),
+        None => violation(existing.chain([Some(check), read_back].into_iter().flatten())),
         Some(unmarked) => {
-            violation([using])
+            violation(existing)
                 .restricted_to(Some(unmarked))
                 .or(violation([Some(check), read_back].into_iter().flatten()))
         }
@@ -2742,7 +2847,7 @@ fn update_body(
     let table_name = ctx.table_name;
     let columns = collect_column_names(table, schema)?;
     let primary_key = collect_pk_column_names(table, schema)?;
-    let WriteGuard { columns: assigned, using, check, read_back } =
+    let WriteGuard { columns: assigned, using, check, read_back, .. } =
         build_write_guard(&rows, GuardKind::Update, table, schema, options, Some(grants), emit)?;
     let assignments = assigned
         .iter()
@@ -3066,7 +3171,7 @@ pub(crate) fn generate_view_statements(
                 column: column.clone(),
             });
         }
-        statements.push(generate_insert_trigger_sql(table, schema, options, grants, emit)?);
+        statements.extend(generate_insert_trigger_sql(table, schema, options, grants, emit)?);
 
         // Backing-table guards cover the writes that reach the backing table
         // directly, the RETURNING and ON CONFLICT redirects among them.
@@ -4093,7 +4198,9 @@ mod tests {
         let grants = RoleTable::of(table, None, &schema)?;
         let insert_trigger_sql =
             generate_insert_trigger_sql(table, &schema, &options, &grants, &mut |_| {})?
-                .to_string();
+                .iter()
+                .map(ToString::to_string)
+                .collect::<String>();
         assert!(insert_trigger_sql.contains("docs_insert_trigger"));
         assert!(insert_trigger_sql.contains("RAISE(ABORT"));
 
