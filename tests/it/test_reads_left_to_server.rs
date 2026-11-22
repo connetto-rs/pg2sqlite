@@ -262,6 +262,35 @@ CREATE TRIGGER invitation_emails_readdress INSTEAD OF UPDATE ON invitation_email
 }
 
 #[test]
+fn a_trigger_reading_the_stored_row_through_the_function_label_is_named() {
+    let pg = format!(
+        "{INVITATIONS}
+CREATE FUNCTION refuse_reaccepting() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF refuse_reaccepting.old.accepted_by_id IS NOT NULL THEN
+    RAISE EXCEPTION 'invitation already accepted';
+  END IF;
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER invitations_once BEFORE UPDATE ON invitations
+  FOR EACH ROW EXECUTE FUNCTION refuse_reaccepting();
+"
+    );
+    let triggers: Vec<(String, String, String, String)> =
+        readers(&pg).into_iter().filter(|(construct, ..)| construct == "TRIGGER").collect();
+    assert_eq!(
+        triggers,
+        owned(&[(
+            "TRIGGER",
+            "invitations_once",
+            "accepted_by_id of invitations",
+            "memberships_invitation_accepted"
+        )]),
+    );
+}
+
+#[test]
 fn an_instead_of_trigger_reading_the_view_row_names_the_tables_beneath() {
     let pg = "
 CREATE TABLE invitations (id INT PRIMARY KEY, email TEXT NOT NULL, accepted_by_id INT);

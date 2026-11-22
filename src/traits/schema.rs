@@ -6,11 +6,11 @@ use sql_traits::{
     traits::{DatabaseLike, FunctionLike},
 };
 use sqlparser::ast::{CreateFunction, CreateTable, ObjectName, ObjectNamePart};
-use sqlparser_plpgsql::embedded::{Block, embedded_sql};
+use sqlparser_plpgsql::embedded::Block;
 
-use crate::errors::Error;
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
+use crate::{errors::Error, impls::unlabelled_body::unlabelled_body};
 
 /// Trait to define a schema for the translation between `PostgreSQL` and
 /// `SQLite`.
@@ -25,16 +25,14 @@ pub trait Schema: DatabaseLike<Table = CreateTable, Function = CreateFunction> {
     /// [`Error::TranslationRefusal`] if the body is not PL/pgSQL or an SQL
     /// statement in it does not parse.
     fn function_body(&self, name: &ObjectName) -> Result<Option<Block>, Error> {
-        let Some(function_body) =
-            written_function(self, name)?.and_then(|function| function.body())
-        else {
-            return Ok(None);
-        };
-        embedded_sql(function_body).map(Some).map_err(|error| {
+        let Some(function) = written_function(self, name)? else { return Ok(None) };
+        let Some(text) = function.body() else { return Ok(None) };
+        unlabelled_body(function, text, |error| {
             Error::unsupported_source_syntax(format!(
                 "Failed to parse trigger function '{name}' body: {error}"
             ))
         })
+        .map(Some)
     }
 }
 

@@ -42,7 +42,7 @@ use sqlparser::{
     parser::Parser,
 };
 use sqlparser_plpgsql::embedded::{
-    Block, Branch, Case, If, LoopControl, Node, NodeKind, Open, ReturnQuery, embedded_sql,
+    Block, Branch, Case, If, LoopControl, Node, NodeKind, Open, ReturnQuery,
 };
 
 #[cfg(not(feature = "std"))]
@@ -53,6 +53,7 @@ use crate::{
     impls::{
         object_name::{last_ident, last_ident_value_or_display},
         translator_impls::{off_replica::OffReplica, plpgsql::fold},
+        unlabelled_body::unlabelled_body,
     },
     options::TranslationContext,
     traits::schema::written_function,
@@ -350,7 +351,7 @@ fn parsed_body<'f>(function: &'f CreateFunction, schema: &'f ParserDB) -> Result
     match language.as_deref() {
         Some("plpgsql") => {
             let Some(text) = function.body() else { return Ok(Body::Sql(Cow::Borrowed(&[]))) };
-            embedded_sql(text).map(Body::PlPgSql).map_err(|error| unparsed(&error))
+            unlabelled_body(function, text, |error| unparsed(&error)).map(Body::PlPgSql)
         }
         None | Some("sql") => {
             if let Some(statements) = function.atomic_statements(schema)? {
