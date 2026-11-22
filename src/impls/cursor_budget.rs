@@ -22,20 +22,20 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use core::{convert::Infallible, ops::ControlFlow, ptr};
 
 use sqlparser::ast::{
-    AlterTableOperation, BinaryOperator, ColumnDef, ColumnOption, CreateTrigger, Delete, Distinct,
-    DuplicateTreatment, Expr, FromTable, FunctionArgumentClause, FunctionArguments, GroupByExpr,
-    Ident, InTarget, Insert, JoinConstraint, ObjectName, ObjectType, Query, RenameTableNameKind,
-    Select, SetExpr, SetQuantifier, Statement, TableConstraint, TableFactor, TableObject,
-    TableWithJoins, Update, UpdateTableFromKind, Visit, Visitor,
+    AlterTableOperation, BinaryOperator, ColumnDef, ColumnOption, ConditionalStatements,
+    CreateTrigger, Distinct, DuplicateTreatment, Expr, FunctionArgumentClause, FunctionArguments,
+    GroupByExpr, Ident, InTarget, JoinConstraint, ObjectType, Query, RenameTableNameKind, Select,
+    SetExpr, SetQuantifier, Statement, TableConstraint, TableFactor, TableWithJoins, Update,
+    UpdateTableFromKind, Visit, Visitor,
 };
 
 use super::{
     emitted_namespace::key,
     shared_helpers::{join_constraint_ref, leaf_factors},
 };
-use crate::errors::Error;
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
+use crate::{errors::Error, history::placement::primary_write_target};
 
 /// The cursors a program may hold when SQLite expands a `WITH` query in it,
 /// `SQLITE_LIMIT_EXPR_DEPTH` as SQLite builds it unless told otherwise.
@@ -157,7 +157,7 @@ fn tallies<'s>(
     let triggers = live.triggers.values().map(|(statement, _)| *statement);
     for statement in triggers.chain(recreated_triggers) {
         let Statement::CreateTrigger(trigger) = statement else { continue };
-        tallies.push((Program::Trigger(trigger), counter.program(statement)));
+        tallies.push((Program::Trigger(trigger), counter.program(statement, trigger)));
     }
     tallies
 }
@@ -546,9 +546,6 @@ impl Tables {
                     self.current(table).columns.insert(ident_key(&column_def.name));
                     self.read_column_options(table, column_def);
                 }
-                AlterTableOperation::AddConstraint { constraint, .. } => {
-                    self.read_constraint(table, constraint);
-                }
                 AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
                     self.current(table)
                         .rename_column(&ident_key(old_column_name), &ident_key(new_column_name));
@@ -575,16 +572,12 @@ struct Counter<'c, 's> {
 }
 
 impl Counter<'_, '_> {
-    /// What the program running `statement`, a trigger, opens.
-    fn program(&mut self, statement: &Statement) -> Tally {
-        let mut skeleton = Skeleton::of(statement, None, &self.tables, self.helper_sets);
-        let mut tally = skeleton.count(0, self);
-        if let Statement::CreateTrigger(trigger) = statement
-            && let Some(steps) = &trigger.statements
-        {
-            for step in steps.statements() {
-                self.write(step, &mut tally);
-            }
+    /// What the program running `statement`, which creates `trigger`, opens.
+    fn program(&mut self, statement: &Statement, trigger: &CreateTrigger) -> Tally {
+        let mut tally =
+            Skeleton::of(statement, None, &self.tables, self.helper_sets).count(0, self);
+        for step in trigger.statements.iter().flat_map(ConditionalStatements::statements) {
+            self.write(step, &mut tally);
         }
         tally
     }
@@ -593,44 +586,21 @@ impl Counter<'_, '_> {
     /// target with the target's indexes and foreign keys, and a view it
     /// writes through.
     fn write(&mut self, step: &Statement, tally: &mut Tally) {
-        let (target, read): (Option<&ObjectName>, &[TableWithJoins]) = match step {
-            Statement::Update(Update { table, from, .. }) => {
-                let read = match from {
-                    Some(
-                        UpdateTableFromKind::BeforeSet(from) | UpdateTableFromKind::AfterSet(from),
-                    ) => from.as_slice(),
-                    None => &[],
-                };
-                let target = match &table.relation {
-                    TableFactor::Table { name, .. } => Some(name),
-                    _ => None,
-                };
-                (target, read)
-            }
-            Statement::Delete(Delete { tables, from, using, .. }) => {
-                let (FromTable::WithFromKeyword(from) | FromTable::WithoutKeyword(from)) = from;
-                let target = tables.first().or_else(|| {
-                    from.first().and_then(|table| {
-                        match &table.relation {
-                            TableFactor::Table { name, .. } => Some(name),
-                            _ => None,
-                        }
-                    })
-                });
-                (target, using.as_deref().unwrap_or_default())
-            }
-            Statement::Insert(Insert { table: TableObject::TableName(name), .. }) => {
-                (Some(name), &[])
-            }
-            _ => (None, &[]),
-        };
-        if let Some(target) = target {
+        if let Some(target) = primary_write_target(step) {
             let target = key(target);
             tally.open(self.tables.write(&target));
             if self.views.queries.contains_key(&target) {
                 tally.add(&self.view(&target));
             }
         }
+        let read: &[TableWithJoins] = match step {
+            Statement::Update(Update {
+                from:
+                    Some(UpdateTableFromKind::BeforeSet(from) | UpdateTableFromKind::AfterSet(from)),
+                ..
+            }) => from,
+            _ => &[],
+        };
         for factor in leaf_factors(read) {
             tally.open(RELATION);
             if let TableFactor::Table { name, .. } = factor {
@@ -654,17 +624,14 @@ impl Counter<'_, '_> {
         if !self.views.queries.contains_key(name) || !self.views.counting.insert(name.to_owned()) {
             return Tally::default();
         }
-        let mut widest = Tally::default();
-        let mut expands_with = false;
-        for position in 0..self.views.queries[name].len() {
-            let query = self.views.queries[name][position];
-            let tally =
-                Skeleton::of(query, Some(query), &self.tables, self.helper_sets).count(0, self);
-            expands_with |= tally.expands_with;
-            if tally.cursors >= widest.cursors {
-                widest = tally;
-            }
-        }
+        let copies: Vec<Tally> = (0..self.views.queries[name].len())
+            .map(|position| {
+                let query = self.views.queries[name][position];
+                Skeleton::of(query, Some(query), &self.tables, self.helper_sets).count(0, self)
+            })
+            .collect();
+        let expands_with = copies.iter().any(|copy| copy.expands_with);
+        let mut widest = copies.into_iter().max_by_key(|copy| copy.cursors).unwrap_or_default();
         widest.expands_with = expands_with;
         self.views.counting.remove(name);
         self.views.counted.insert(name.to_owned(), widest.clone());
@@ -732,7 +699,6 @@ impl<'h> Skeleton<'h> {
             scopes: Vec::new(),
             defining: Vec::new(),
             flattened: BTreeSet::new(),
-            ordered_arms: BTreeSet::new(),
             tables,
             helper_sets,
         };
@@ -859,9 +825,6 @@ struct Builder<'t, 'h> {
     /// The queries, by address, that SQLite may flatten into the select
     /// reading them or push its conditions into.
     flattened: BTreeSet<usize>,
-    /// The queries, by address, that are arms of a compound SQLite merges in
-    /// order.
-    ordered_arms: BTreeSet<usize>,
     tables: &'t Tables,
     helper_sets: &'h BTreeMap<Query, Vec<String>>,
 }
@@ -929,13 +892,11 @@ impl<'h> Builder<'_, 'h> {
             let mut holders = scope.items.iter_mut().filter(|item| {
                 matches!(&item.kind, ItemKind::Table(table) if tables.has_column(table, &column))
             });
-            match (holders.next(), holders.next()) {
-                (Some(item), None) => {
+            if let Some(item) = holders.next() {
+                if holders.next().is_none() {
                     item.columns.insert(column);
-                    return;
                 }
-                (Some(_), Some(_)) => return,
-                _ => {}
+                return;
             }
         }
     }
@@ -971,12 +932,10 @@ impl<'h> Builder<'_, 'h> {
 fn flattens(query: &Query) -> bool {
     let SetExpr::Select(select) = query.body.as_ref() else { return false };
     let mut calls = false;
-    let ControlFlow::<()>::Continue(()) = sqlparser::ast::visit_expressions(select, |expr| {
+    let ControlFlow::Continue(()) = sqlparser::ast::visit_expressions(select, |expr| {
         calls |= matches!(expr, Expr::Function(_));
-        ControlFlow::Continue(())
-    }) else {
-        return false;
-    };
+        ControlFlow::<Infallible>::Continue(())
+    });
     query.with.is_none()
         && query.order_by.is_none()
         && query.limit_clause.is_none()
@@ -997,14 +956,17 @@ fn inner_joins_only(table: &TableWithJoins) -> bool {
             sqlparser::ast::JoinOperator::Join(_)
                 | sqlparser::ast::JoinOperator::Inner(_)
                 | sqlparser::ast::JoinOperator::CrossJoin(_)
-        ) && match &join.relation {
-            TableFactor::NestedJoin { table_with_joins, .. } => inner_joins_only(table_with_joins),
-            _ => true,
-        }
-    }) && match &table.relation {
-        TableFactor::NestedJoin { table_with_joins, .. } => inner_joins_only(table_with_joins),
-        _ => true,
-    }
+        )
+    }) && core::iter::once(&table.relation)
+        .chain(table.joins.iter().map(|join| &join.relation))
+        .all(|factor| {
+            match factor {
+                TableFactor::NestedJoin { table_with_joins, .. } => {
+                    inner_joins_only(table_with_joins)
+                }
+                _ => true,
+            }
+        })
 }
 
 /// Marks the relations of `items` the condition `term` may read through an
@@ -1033,7 +995,7 @@ fn constrain(items: &mut [Item], term: &Expr, tables: &Tables) {
 
 /// The operands of `term` SQLite may look up through an index.
 fn constrained_sides(term: &Expr) -> Vec<&Expr> {
-    match term {
+    match unnested(term) {
         Expr::BinaryOp {
             left,
             op:
@@ -1053,7 +1015,6 @@ fn constrained_sides(term: &Expr) -> Vec<&Expr> {
         | Expr::ILike { expr, .. }
         | Expr::IsNotDistinctFrom(expr, _)
         | Expr::IsDistinctFrom(expr, _) => vec![unnested(expr)],
-        Expr::Nested(inner) => constrained_sides(inner),
         _ => Vec::new(),
     }
 }
@@ -1074,16 +1035,11 @@ impl Visitor for Builder<'_, '_> {
         let parent = *self.open.last().unwrap_or(&0);
         let address = ptr::from_ref(query).addr();
         let (own, last_arm_merge, merged) = compound_cursors(query);
-        if merged {
-            for arm in parenthesized_arms(&query.body) {
-                self.ordered_arms.insert(ptr::from_ref(arm).addr());
-            }
-        }
         let mut level = Level {
             own,
             last_arm_merge,
             flattened: self.flattened.contains(&address),
-            ordered: merged || query.order_by.is_some() || self.ordered_arms.contains(&address),
+            ordered: merged || query.order_by.is_some(),
             enclosing: Some(parent),
             helpers: self.helper_sets.get(query).map(Vec::as_slice),
             ..Level::default()
@@ -1180,10 +1136,8 @@ impl Visitor for Builder<'_, '_> {
         if distinct {
             own += DISTINCT;
         }
-        let grouped = match &select.group_by {
-            GroupByExpr::All(_) => true,
-            GroupByExpr::Expressions(expressions, _) => !expressions.is_empty(),
-        } || select.having.is_some()
+        let grouped = !matches!(&select.group_by, GroupByExpr::Expressions(expressions, _) if expressions.is_empty())
+            || select.having.is_some()
             || select.projection.iter().any(aggregates);
         if grouped {
             own += GROUPING;
@@ -1315,28 +1269,13 @@ fn arms(body: &SetExpr) -> usize {
     }
 }
 
-/// The parenthesized queries among the arms of the compound `body`.
-fn parenthesized_arms(body: &SetExpr) -> Vec<&Query> {
-    match body {
-        SetExpr::SetOperation { left, right, .. } => {
-            let mut arms = parenthesized_arms(left);
-            arms.extend(parenthesized_arms(right));
-            arms
-        }
-        SetExpr::Query(query) => vec![query.as_ref()],
-        _ => Vec::new(),
-    }
-}
-
 /// Whether `item` calls a function, which may aggregate the select's rows.
 fn aggregates(item: &sqlparser::ast::SelectItem) -> bool {
     let mut calls = false;
-    let ControlFlow::<()>::Continue(()) = sqlparser::ast::visit_expressions(item, |expr| {
+    let ControlFlow::Continue(()) = sqlparser::ast::visit_expressions(item, |expr| {
         calls |= matches!(expr, Expr::Function(function) if function.over.is_none());
-        ControlFlow::Continue(())
-    }) else {
-        return calls;
-    };
+        ControlFlow::<Infallible>::Continue(())
+    });
     calls
 }
 
@@ -1391,7 +1330,7 @@ fn disjuncts(condition: &Expr) -> Vec<&Expr> {
 /// read the rows it holds through that index.
 fn constrains_indexed(term: &Expr, indexed: &dyn Fn(&str) -> bool) -> bool {
     let column_indexed = |expr: &Expr| column(expr).is_some_and(|column| indexed(&column));
-    match term {
+    match unnested(term) {
         Expr::BinaryOp {
             left,
             op:
@@ -1410,17 +1349,15 @@ fn constrains_indexed(term: &Expr, indexed: &dyn Fn(&str) -> bool) -> bool {
         | Expr::Like { expr, .. }
         | Expr::ILike { expr, .. }
         | Expr::IsNotDistinctFrom(expr, _) => column_indexed(expr),
-        Expr::Nested(inner) => constrains_indexed(inner, indexed),
         _ => false,
     }
 }
 
 /// The name of the column `expr` reads, when it reads one directly.
 fn column(expr: &Expr) -> Option<String> {
-    match expr {
+    match unnested(expr) {
         Expr::Identifier(column) => Some(ident_key(column)),
         Expr::CompoundIdentifier(parts) => parts.last().map(ident_key),
-        Expr::Nested(inner) => column(inner),
         _ => None,
     }
 }

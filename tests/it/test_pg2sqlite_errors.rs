@@ -2,6 +2,7 @@
 //!
 //! Covers:
 //! - `sql()` with invalid SQL -> `ParserError`
+//! - `starting_sqlite()` with invalid SQL -> `ParserError`
 //! - `file()` with nonexistent path -> `IoError`
 //! - `build_schema()` -> returns valid schema
 //! - `statement()` builder -> chainable
@@ -17,6 +18,17 @@ use pg2sqlite::{
 fn sql_with_invalid_sql_produces_parser_error() {
     let input = "THIS IS NOT VALID SQL !!!";
     let error = Pg2Sqlite::default().sql(input).expect_err("invalid SQL must fail");
+    let Error::SqlParse(parse_error) = error else {
+        panic!("expected owned parse error");
+    };
+    assert_eq!(parse_error.input(), input);
+    assert!(std::error::Error::source(&parse_error).is_some());
+}
+
+#[test]
+fn starting_sqlite_with_invalid_sql_produces_parser_error() {
+    let input = "CREATE TABLE t (id INTEGER PRIMARY KEY";
+    let error = Pg2Sqlite::default().starting_sqlite(input).expect_err("invalid SQL must fail");
     let Error::SqlParse(parse_error) = error else {
         panic!("expected owned parse error");
     };
