@@ -564,6 +564,12 @@ pub(crate) struct Footprint {
 }
 
 impl Footprint {
+    /// The footprint of a function that cannot be read, every field read and
+    /// every table written and read.
+    const fn unread() -> Self {
+        Self { new: Columns::Row, writes: true, reads: true }
+    }
+
     /// What `trigger` does, every field read, every table written and read
     /// when the schema does not hold its function.
     ///
@@ -575,13 +581,14 @@ impl Footprint {
         schema: &ParserDB,
         options: &TranslationContext<'_>,
     ) -> Result<Self, Error> {
-        let function = match &trigger.exec_body {
-            Some(exec_body) => written_function(schema, &exec_body.func_desc.name)?,
-            None => None,
-        };
-        let Some(function) = function else {
-            return Ok(Self { new: Columns::Row, writes: true, reads: true });
-        };
+        let function = trigger
+            .exec_body
+            .as_ref()
+            .map(|exec_body| written_function(schema, &exec_body.func_desc.name))
+            .transpose()?
+            .flatten();
+        // Translation refuses a trigger whose function the schema lacks first.
+        let Some(function) = function else { return Ok(Self::unread()) };
         let mut chain = chain::Walker::read_whole(function, schema, options)?;
         if let Some(condition) = &trigger.condition {
             chain::record_reads(condition, &mut Columns::none(), &mut chain.new);

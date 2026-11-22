@@ -319,10 +319,6 @@ enum OrderDependence {
     /// Both triggers assign the same field, which keeps the later one's value.
     #[error("`{earlier}` and `{later}` both assign NEW.{column}")]
     BothAssign { earlier: String, later: String, column: String },
-    /// A trigger assigning `NEW` writes a table through what it calls, which
-    /// the other may see out of PostgreSQL's order.
-    #[error("`{maintenance}` may write a table, which `{other}` would see out of name order")]
-    Writes { maintenance: String, other: String },
     /// A trigger PostgreSQL runs later writes a table, which the trigger
     /// assigning `NEW` would read.
     #[error("`{writer}` may write a table, and `{maintenance}`, which runs before it, reads one")]
@@ -358,25 +354,29 @@ impl<'t> Member<'t> {
 
     /// A member assigning the fields of `NEW` its function assigns.
     fn assigning(trigger: &'t CreateTrigger, schema: &ParserDB) -> Result<Self, Error> {
-        let mut registered = trigger.clone();
-        if let Some(table) = resolve_translation_table(schema, &trigger.table_name)? {
-            registered.table_name = table.name.clone();
-        }
+        let table = resolve_translation_table(schema, &trigger.table_name)?;
+        let registered = CreateTrigger {
+            table_name: table
+                .map_or_else(|| trigger.table_name.clone(), |table| table.name.clone()),
+            ..trigger.clone()
+        };
         let assigned = registered
             .maintenance_assignments(schema)?
             .map(|(column, _)| column.stored_column_name().into_owned())
             .collect();
+        let names_unresolved = trigger
+            .exec_body
+            .as_ref()
+            .map(|exec_body| {
+                super::plpgsql::names_unresolved(
+                    &exec_body.func_desc.name,
+                    &trigger.table_name,
+                    schema,
+                )
+            })
+            .transpose()?;
         let undeclared = registered.maintenance_undeclared_fields(schema)?.next().is_some()
-            || match &trigger.exec_body {
-                Some(exec_body) => {
-                    super::plpgsql::names_unresolved(
-                        &exec_body.func_desc.name,
-                        &trigger.table_name,
-                        schema,
-                    )?
-                }
-                None => false,
-            };
+            || names_unresolved == Some(true);
         Ok(Self { assigned: Some(assigned), undeclared, ..Self::plain(trigger) })
     }
 
@@ -417,16 +417,10 @@ fn pair_dependence(
             column: column.clone(),
         }));
     }
-    if first.writes() {
-        return Ok(Some(OrderDependence::Writes {
-            maintenance: earlier.shown(),
-            other: later.shown(),
-        }));
-    }
+    // Translation refuses a write in a trigger assigning NEW, whose helpers
+    // must be non-volatile to be written in place of their calls.
     if later.assigned.is_some() {
-        return Ok(second.writes().then(|| {
-            OrderDependence::Writes { maintenance: later.shown(), other: earlier.shown() }
-        }));
+        return Ok(None);
     }
     if second.writes() && first.reads() {
         return Ok(Some(OrderDependence::WritesRead {

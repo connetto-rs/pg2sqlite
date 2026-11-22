@@ -439,3 +439,43 @@ fn an_assignment_turned_plain_keeps_both_conditions() {
     let far = insert(&mut connection, 3, 20).expect_err("edges_copy fires");
     assert!(far.contains("far parent"), "got: {far}");
 }
+
+/// Two triggers assigning different fields of NEW and a check reading neither
+/// share both of their events, and each still does its part on either event.
+#[test]
+fn commuting_assignments_on_insert_and_update_keep_their_effects() {
+    let mut connection = apply_schema(
+        "CREATE TABLE mut (id INT PRIMARY KEY, tag TEXT, note TEXT);
+         CREATE FUNCTION set_tag() RETURNS trigger AS $$
+         BEGIN NEW.tag := 'tagged'; RETURN NEW; END;
+         $$ LANGUAGE plpgsql;
+         CREATE FUNCTION set_note() RETURNS trigger AS $$
+         BEGIN NEW.note := 'noted'; RETURN NEW; END;
+         $$ LANGUAGE plpgsql;
+         CREATE FUNCTION check_id() RETURNS trigger AS $$
+         BEGIN IF NEW.id < 0 THEN RAISE EXCEPTION 'negative id'; END IF; RETURN NEW; END;
+         $$ LANGUAGE plpgsql;
+         CREATE TRIGGER mut_a BEFORE INSERT OR UPDATE ON mut FOR EACH ROW
+             EXECUTE FUNCTION set_tag();
+         CREATE TRIGGER mut_b BEFORE INSERT OR UPDATE ON mut FOR EACH ROW
+             EXECUTE FUNCTION check_id();
+         CREATE TRIGGER mut_c BEFORE INSERT OR UPDATE ON mut FOR EACH ROW
+             EXECUTE FUNCTION set_note();",
+    );
+    diesel::sql_query("INSERT INTO mut (id) VALUES (1)").execute(&mut connection).expect("insert");
+    assert_eq!(read_tag(&mut connection).as_deref(), Some("tagged"));
+    diesel::sql_query("UPDATE mut SET tag = 'x', note = 'y'")
+        .execute(&mut connection)
+        .expect("update");
+    assert_eq!(read_tag(&mut connection).as_deref(), Some("tagged"));
+    let notes = diesel::sql_query("SELECT note AS tag FROM mut WHERE id = 1")
+        .get_result::<TagRow>(&mut connection)
+        .expect("select")
+        .tag;
+    assert_eq!(notes.as_deref(), Some("noted"));
+    let negative = diesel::sql_query("INSERT INTO mut (id) VALUES (-1)")
+        .execute(&mut connection)
+        .expect_err("mut_b refuses")
+        .to_string();
+    assert!(negative.contains("negative id"), "got: {negative}");
+}
