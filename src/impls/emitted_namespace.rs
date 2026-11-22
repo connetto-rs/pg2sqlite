@@ -149,6 +149,16 @@ impl<'a> Namespaces<'a> {
         for trigger in schema.triggers() {
             let owner = sqlite_key(&trigger_relation(trigger, schema)?.stored_name());
             let description = initial_description("trigger", None, trigger.name());
+            for name in slots.frame_names_of(trigger) {
+                let name_key = key(name);
+                if !self.triggers.contains_key(&name_key) {
+                    self.define_trigger_key(
+                        name_key,
+                        owner.clone(),
+                        Source::Initial(description.clone()),
+                    )?;
+                }
+            }
             // A plain row trigger lives under the names its slots were emitted
             // with.
             if slots.holds(trigger) {

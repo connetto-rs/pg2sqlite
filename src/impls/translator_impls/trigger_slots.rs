@@ -13,6 +13,10 @@
 //! takes the form its members give it at the statement that changes it: a
 //! later `CREATE TRIGGER` drops the slot's trigger and creates the merged one,
 //! and a `DROP TRIGGER` recreates what remains.
+//!
+//! A table's `AFTER UPDATE` slot is framed by [`super::trigger_frame`] when the
+//! table has `BEFORE UPDATE` triggers assigning `NEW` or its members name
+//! different `UPDATE OF` columns.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 
@@ -30,7 +34,10 @@ use sqlparser::ast::{
 use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
-    impls::object_name::{append_suffix, last_ident, quoted_ident, resolve_translation_table},
+    impls::{
+        object_name::{append_suffix, last_ident, quoted_ident, resolve_translation_table},
+        translator_impls::trigger_frame::{Frame, FrameMember},
+    },
     options::TranslationContext,
     traits::translator::TranslatorWithContext,
 };
@@ -237,25 +244,40 @@ impl Roster {
 /// The triggers that share a slot with another row trigger at some statement
 /// of the batch, by folded table and trigger name, counting the triggers
 /// `initial` already holds. A batch trigger `kept` refuses never reaches
-/// SQLite and joins no slot.
+/// SQLite and joins no slot, and one `maintains` accepts assigns `NEW`, so
+/// that it frames its table's `AFTER UPDATE` triggers.
 pub(crate) fn shared_slot_triggers<'a>(
     initial: impl IntoIterator<Item = &'a CreateTrigger>,
     statements: &[Statement],
     kept: impl Fn(&CreateTrigger) -> bool,
+    maintains: impl Fn(&CreateTrigger) -> bool,
 ) -> BTreeSet<(String, String)> {
     let mut roster = Roster::default();
+    let mut constraints = Roster::default();
+    let mut maintainers = BTreeSet::new();
     let mut shared = BTreeSet::new();
-    let initial: Vec<&CreateTrigger> = initial.into_iter().filter(|t| is_slotted(t)).collect();
+    let initial: Vec<&CreateTrigger> =
+        initial.into_iter().filter(|t| is_slotted(t) || is_constraint_row(t)).collect();
     for trigger in &initial {
-        roster.triggers.insert(trigger_key(trigger), (*trigger).clone());
+        let into = if is_slotted(trigger) { &mut roster } else { &mut constraints };
+        into.triggers.insert(trigger_key(trigger), (*trigger).clone());
+        if maintains(trigger) {
+            maintainers.insert(trigger_key(trigger));
+        }
     }
     for trigger in initial {
         roster.mark_shared(trigger, &mut shared);
+        mark_framed(&roster, &constraints, &maintainers, &folded(&trigger.table_name), &mut shared);
     }
     for statement in statements {
         // Statements before a rename still look triggers up under the old
         // table.
+        constraints.follow_tables(statement);
         if let Some((from, to)) = roster.follow_tables(statement) {
+            maintainers = core::mem::take(&mut maintainers)
+                .into_iter()
+                .map(|(table, name)| (if table == from { to.clone() } else { table }, name))
+                .collect();
             let renamed: Vec<_> = shared
                 .iter()
                 .filter(|(table, _)| *table == from)
@@ -265,21 +287,58 @@ pub(crate) fn shared_slot_triggers<'a>(
         }
         match statement {
             Statement::CreateTrigger(trigger) => {
-                roster.triggers.remove(&trigger_key(trigger));
-                if is_slotted(trigger) && kept(trigger) {
-                    roster.triggers.insert(trigger_key(trigger), trigger.clone());
-                    roster.mark_shared(trigger, &mut shared);
+                let key = trigger_key(trigger);
+                roster.triggers.remove(&key);
+                constraints.triggers.remove(&key);
+                maintainers.remove(&key);
+                if !kept(trigger) {
+                    continue;
                 }
+                if is_slotted(trigger) {
+                    roster.triggers.insert(key.clone(), trigger.clone());
+                    roster.mark_shared(trigger, &mut shared);
+                } else if is_constraint_row(trigger) {
+                    constraints.triggers.insert(key.clone(), trigger.clone());
+                }
+                if maintains(trigger) {
+                    maintainers.insert(key.clone());
+                }
+                mark_framed(&roster, &constraints, &maintainers, &key.0, &mut shared);
             }
             Statement::DropTrigger(drop) => {
-                if let Some(key) = roster.dropped_key(drop) {
-                    roster.triggers.remove(&key);
+                for roster in [&mut roster, &mut constraints] {
+                    if let Some(key) = roster.dropped_key(drop) {
+                        roster.triggers.remove(&key);
+                        maintainers.remove(&key);
+                    }
                 }
             }
             _ => {}
         }
     }
     shared
+}
+
+/// Adds to `shared` every trigger of `table`'s framed `AFTER UPDATE` slot.
+fn mark_framed(
+    slotted: &Roster,
+    constraints: &Roster,
+    maintainers: &BTreeSet<(String, String)>,
+    table: &str,
+    shared: &mut BTreeSet<(String, String)>,
+) {
+    let after = SlotKey { table: table.to_string(), timing: Timing::After, event: Event::Update };
+    let before = SlotKey { timing: Timing::Before, ..after.clone() };
+    let maintaining: Vec<&CreateTrigger> = slotted
+        .members(&before)
+        .into_iter()
+        .filter(|trigger| maintainers.contains(&trigger_key(trigger)))
+        .collect();
+    let mut members = slotted.members(&after);
+    members.extend(constraints.members(&after));
+    if !maintaining.is_empty() && !members.is_empty() {
+        shared.extend(maintaining.into_iter().chain(members).map(trigger_key));
+    }
 }
 
 /// Why running a row trigger assigning `NEW` as an `AFTER` trigger that
@@ -423,8 +482,12 @@ pub(crate) struct TriggerSlots {
     roster: Roster,
     /// The row triggers assigning `NEW` in force.
     assigning: Roster,
+    /// The constraint row triggers in force, which join a framed slot.
+    constraints: Roster,
     /// The SQLite name each occupied slot is emitted under.
     names: BTreeMap<SlotKey, ObjectName>,
+    /// The `BEFORE UPDATE OF` twins of each framed slot.
+    frames: BTreeMap<SlotKey, Vec<ObjectName>>,
 }
 
 impl TriggerSlots {
@@ -442,13 +505,32 @@ impl TriggerSlots {
                 slots.roster.triggers.insert(trigger_key(trigger), trigger.clone());
             } else if is_slotted(trigger) {
                 slots.assigning.triggers.insert(trigger_key(trigger), trigger.clone());
+            } else if is_constraint_row(trigger) {
+                slots.constraints.triggers.insert(trigger_key(trigger), trigger.clone());
             }
         }
-        let occupied: BTreeSet<SlotKey> =
-            slots.roster.triggers.values().flat_map(slots_of).collect();
+        let occupied: BTreeSet<SlotKey> = slots
+            .roster
+            .triggers
+            .values()
+            .flat_map(slots_of)
+            .chain(slots.constraints.triggers.values().filter_map(frame_slot))
+            .collect();
         for slot in occupied {
+            if slots.is_framed(&slot) {
+                let twins = slots
+                    .frame_members(&slot)
+                    .into_iter()
+                    .filter(|member| !update_columns(member).is_empty())
+                    .map(twin_name)
+                    .collect();
+                slots.frames.insert(slot.clone(), twins);
+                slots.names.insert(slot.clone(), merged_name(&slot));
+                continue;
+            }
             let members = slots.roster.members(&slot);
             let name = match members.as_slice() {
+                [] => continue,
                 [member] => {
                     let event =
                         member.events.iter().find(|event| Event::of(event) == Some(slot.event));
@@ -466,12 +548,74 @@ impl TriggerSlots {
         self.roster.triggers.contains_key(&trigger_key(trigger))
     }
 
-    /// The SQLite names the slots of `trigger` are emitted under.
+    /// The SQLite names the slots of `trigger` are emitted under, with the
+    /// twins of a framed one.
     pub(crate) fn names_of<'a>(
         &'a self,
         trigger: &'a CreateTrigger,
     ) -> impl Iterator<Item = &'a ObjectName> + 'a {
-        slots_of(trigger).filter_map(|slot| self.names.get(&slot))
+        slots_of(trigger).flat_map(|slot| {
+            self.names.get(&slot).into_iter().chain(self.frames.get(&slot).into_iter().flatten())
+        })
+    }
+
+    /// Whether `trigger` runs from a framed slot's trigger.
+    fn in_frame(&self, trigger: &CreateTrigger) -> bool {
+        let key = trigger_key(trigger);
+        let framed = |slot: SlotKey| {
+            self.is_framed(&slot)
+                && self.frame_members(&slot).into_iter().any(|member| trigger_key(member) == key)
+        };
+        frame_slot(trigger).is_some_and(framed) || slots_of(trigger).any(framed)
+    }
+
+    /// The SQLite names of the framed trigger `trigger` runs from and of that
+    /// frame's twins.
+    pub(crate) fn frame_names_of<'a>(
+        &'a self,
+        trigger: &'a CreateTrigger,
+    ) -> impl Iterator<Item = &'a ObjectName> + 'a {
+        frame_slot(trigger).filter(|_| self.in_frame(trigger)).into_iter().flat_map(|slot| {
+            self.names.get(&slot).into_iter().chain(self.frames.get(&slot).into_iter().flatten())
+        })
+    }
+
+    /// The `BEFORE UPDATE` triggers assigning `NEW` whose writes `slot` runs
+    /// first, when it is a table's `AFTER UPDATE` slot.
+    fn maintainers(&self, slot: &SlotKey) -> Vec<&CreateTrigger> {
+        if slot.timing != Timing::After || slot.event != Event::Update {
+            return Vec::new();
+        }
+        self.assigning.members(&SlotKey { timing: Timing::Before, ..slot.clone() })
+    }
+
+    /// The `AFTER UPDATE` triggers of `slot`, plain and constraint, in name
+    /// order.
+    fn after_members(&self, slot: &SlotKey) -> Vec<&CreateTrigger> {
+        let mut members = self.roster.members(slot);
+        members.extend(self.constraints.members(slot));
+        members.sort_by_key(|member| trigger_key(member));
+        members
+    }
+
+    /// Every trigger a framed `slot` runs.
+    fn frame_members(&self, slot: &SlotKey) -> Vec<&CreateTrigger> {
+        let mut members = self.maintainers(slot);
+        members.extend(self.after_members(slot));
+        members
+    }
+
+    /// Whether `slot` runs from one trigger after the writes of its
+    /// maintainers, or because its members name different `UPDATE OF`
+    /// columns.
+    fn is_framed(&self, slot: &SlotKey) -> bool {
+        if slot.timing != Timing::After || slot.event != Event::Update {
+            return false;
+        }
+        let plain = self.roster.members(slot);
+        let differ =
+            plain.windows(2).any(|pair| update_columns(pair[0]) != update_columns(pair[1]));
+        differ || (!self.maintainers(slot).is_empty() && !self.after_members(slot).is_empty())
     }
 
     /// Brings the slots `source` changes up to date, rewriting `emitted`,
@@ -490,36 +634,85 @@ impl TriggerSlots {
         context: &TranslationContext<'_>,
     ) -> Result<bool, Error> {
         self.assigning.follow_tables(source);
+        self.constraints.follow_tables(source);
         if let Some((from, to)) = self.roster.follow_tables(source) {
+            let renamed = |slot: SlotKey| {
+                if slot.table == from { SlotKey { table: to.clone(), ..slot } } else { slot }
+            };
+            self.frames = core::mem::take(&mut self.frames)
+                .into_iter()
+                .map(|(slot, twins)| (renamed(slot), twins))
+                .collect();
             let mut merged = BTreeSet::new();
             for (slot, name) in core::mem::take(&mut self.names) {
-                let slot =
-                    if slot.table == from { SlotKey { table: to.clone(), ..slot } } else { slot };
-                if slot.table == to && self.roster.members(&slot).len() >= 2 {
+                let slot = renamed(slot);
+                if slot.table == to
+                    && (self.roster.members(&slot).len() >= 2 || self.frames.contains_key(&slot))
+                {
                     merged.insert(slot.clone());
                 }
                 self.names.insert(slot, name);
             }
             // A merged trigger's name carries its table's.
             if !merged.is_empty() {
-                emitted.extend(self.rebuild(merged, None, Vec::new(), schema, context)?);
+                emitted.extend(self.rebuild(merged, None, &mut Vec::new(), schema, context)?);
                 return Ok(true);
             }
         }
         if let Statement::Drop { object_type: ObjectType::Table, names, .. } = source {
             let dropped: BTreeSet<String> = names.iter().map(folded).collect();
             self.names.retain(|slot, _| !dropped.contains(&slot.table));
+            self.frames.retain(|slot, _| !dropped.contains(&slot.table));
         }
         match source {
             Statement::CreateTrigger(trigger) => self.create(trigger, emitted, schema, context),
             Statement::DropTrigger(drop) => {
-                if let Some(key) = self.assigning.dropped_key(drop) {
-                    self.assigning.triggers.remove(&key);
+                // A framed member's own UPDATE part went when its table was
+                // framed, so only the framed trigger still runs it.
+                let mut gone = Vec::new();
+                for roster in [&self.assigning, &self.constraints] {
+                    let Some(previous) =
+                        roster.dropped_key(drop).and_then(|key| roster.triggers.get(&key))
+                    else {
+                        continue;
+                    };
+                    if self.in_frame(previous)
+                        && let Some(part) =
+                            update_part(previous, None, &mut Vec::new(), schema, context)?
+                    {
+                        gone.push(folded(&part.name));
+                    }
                 }
-                let Some(key) = self.roster.dropped_key(drop) else { return Ok(false) };
-                let Some(previous) = self.roster.triggers.remove(&key) else { return Ok(false) };
-                let affected: BTreeSet<SlotKey> = slots_of(&previous).collect();
-                *emitted = self.rebuild(affected, None, Vec::new(), schema, context)?;
+                emitted.retain(|statement| {
+                    !matches!(statement, Statement::DropTrigger(dropped)
+                        if gone.contains(&folded(&dropped.trigger_name)))
+                });
+                let mut affected = BTreeSet::new();
+                for roster in [&mut self.assigning, &mut self.constraints] {
+                    if let Some(key) = roster.dropped_key(drop)
+                        && let Some(previous) = roster.triggers.remove(&key)
+                    {
+                        affected.extend(frame_slot(&previous));
+                    }
+                }
+                affected.retain(|slot| self.frames.contains_key(slot));
+                let dropped_plain =
+                    self.roster.dropped_key(drop).and_then(|key| self.roster.triggers.remove(&key));
+                let Some(previous) = dropped_plain else {
+                    if affected.is_empty() {
+                        return Ok(false);
+                    }
+                    emitted.extend(self.rebuild(
+                        affected,
+                        None,
+                        &mut Vec::new(),
+                        schema,
+                        context,
+                    )?);
+                    return Ok(true);
+                };
+                affected.extend(slots_of(&previous));
+                *emitted = self.rebuild(affected, None, &mut Vec::new(), schema, context)?;
                 Ok(true)
             }
             _ => Ok(false),
@@ -542,7 +735,12 @@ impl TriggerSlots {
                 super::create_trigger::body_schema(schema, context),
             )?;
         let assigns = creates && !plain && is_slotted(trigger);
-        self.assigning.triggers.remove(&key);
+        let constraint = creates && is_constraint_row(trigger);
+        let mut affected: BTreeSet<SlotKey> = [&mut self.assigning, &mut self.constraints]
+            .into_iter()
+            .filter_map(|roster| roster.triggers.remove(&key))
+            .filter_map(|previous| frame_slot(&previous))
+            .collect();
         if plain || assigns {
             self.check_order(
                 trigger,
@@ -554,21 +752,31 @@ impl TriggerSlots {
         if assigns {
             self.assigning.triggers.insert(key.clone(), trigger.clone());
         }
-        let previous = self.roster.triggers.remove(&key);
-        if previous.is_none() && !plain {
-            return Ok(false);
+        if constraint {
+            self.constraints.triggers.insert(key.clone(), trigger.clone());
         }
-        let mut affected: BTreeSet<SlotKey> = previous.iter().flat_map(slots_of).collect();
+        if assigns || constraint {
+            affected.extend(frame_slot(trigger));
+        }
+        affected.retain(|slot| self.is_framed(slot) || self.frames.contains_key(slot));
+        let previous = self.roster.triggers.remove(&key);
+        affected.extend(previous.iter().flat_map(slots_of));
         if plain {
             affected.extend(slots_of(trigger));
             self.roster.triggers.insert(key.clone(), trigger.clone());
         }
-        let shared = affected.iter().any(|slot| self.roster.members(slot).len() >= 2);
-        if previous.is_none() && !shared {
-            self.names.extend(affected.into_iter().filter_map(|slot| {
-                let name = own_part(emitted, slot.event)?.name.clone();
-                Some((slot, name))
-            }));
+        let reshaped = affected.iter().any(|slot| {
+            self.roster.members(slot).len() >= 2
+                || self.is_framed(slot)
+                || self.frames.contains_key(slot)
+        });
+        if previous.is_none() && !reshaped {
+            if plain {
+                self.names.extend(affected.into_iter().filter_map(|slot| {
+                    let name = own_part(emitted, slot.event)?.name.clone();
+                    Some((slot, name))
+                }));
+            }
             return Ok(false);
         }
         let mut own_parts = Vec::new();
@@ -579,20 +787,12 @@ impl TriggerSlots {
                 statement => other.push(statement),
             }
         }
-        let rebuilt = if plain {
-            // `other` holds the OR REPLACE drop of a predecessor these slots
-            // never held.
-            other.extend(self.rebuild(affected, Some(&key), own_parts, schema, context)?);
-            other
-        } else {
-            // A trigger replaced by one these slots do not hold keeps its own
-            // translation, after the slots it left are rebuilt.
-            let mut rebuilt = self.rebuild(affected, None, Vec::new(), schema, context)?;
-            rebuilt.extend(other);
-            rebuilt.extend(own_parts.into_iter().map(Statement::CreateTrigger));
-            rebuilt
-        };
-        *emitted = rebuilt;
+        // The rebuilt slots may name a deferred check's queue `other` creates.
+        other.extend(self.rebuild(affected, Some(&key), &mut own_parts, schema, context)?);
+        if !plain {
+            other.extend(own_parts.into_iter().map(Statement::CreateTrigger));
+        }
+        *emitted = other;
         Ok(true)
     }
 
@@ -669,28 +869,49 @@ impl TriggerSlots {
         &mut self,
         affected: BTreeSet<SlotKey>,
         own: Option<&(String, String)>,
-        mut own_parts: Vec<CreateTrigger>,
+        own_parts: &mut Vec<CreateTrigger>,
         schema: &ParserDB,
         context: &TranslationContext<'_>,
     ) -> Result<Vec<Statement>, Error> {
-        let mut statements: Vec<Statement> = affected
-            .iter()
-            .filter_map(|slot| self.names.remove(slot))
-            .map(|name| {
-                Statement::DropTrigger(DropTrigger {
-                    if_exists: true,
-                    trigger_name: name,
-                    table_name: None,
-                    option: None,
-                })
-            })
-            .collect();
+        let mut statements = Vec::new();
+        let mut unframed = BTreeSet::new();
+        for slot in &affected {
+            statements.extend(self.names.remove(slot).map(drop_trigger));
+            if let Some(twins) = self.frames.remove(slot) {
+                statements.extend(twins.into_iter().map(drop_trigger));
+                unframed.insert(slot.clone());
+            }
+        }
         for slot in affected {
+            if self.is_framed(&slot) {
+                let (created, twins) = self.frame(&slot, own, own_parts, schema, context)?;
+                statements.extend(created);
+                self.frames.insert(slot.clone(), twins);
+                self.names.insert(slot.clone(), merged_name(&slot));
+                continue;
+            }
+            if unframed.contains(&slot) {
+                // What the frame ran of the maintainers and constraint triggers
+                // stands alone again.
+                let standalone: Vec<&CreateTrigger> = self
+                    .maintainers(&slot)
+                    .into_iter()
+                    .chain(self.constraints.members(&slot))
+                    .collect();
+                for member in standalone {
+                    if own != Some(&trigger_key(member))
+                        && let Some(part) = update_part(member, None, own_parts, schema, context)?
+                    {
+                        statements.push(drop_trigger(part.name.clone()));
+                        statements.push(Statement::CreateTrigger(part));
+                    }
+                }
+            }
             let members = self.roster.members(&slot);
             let mut parts = Vec::with_capacity(members.len());
             for member in members {
                 let part = if own == Some(&trigger_key(member)) {
-                    take_part(&mut own_parts, slot.event)
+                    take_part(own_parts, slot.event)
                 } else {
                     let mut translated: Vec<CreateTrigger> = member
                         .translate_with_warnings(schema, context, &mut |_| {})?
@@ -711,6 +932,133 @@ impl TriggerSlots {
         }
         Ok(statements)
     }
+
+    /// The twins and the framed trigger of `slot`, after dropping what its
+    /// maintainers and constraint triggers would run alone, and the twins'
+    /// names.
+    fn frame(
+        &self,
+        slot: &SlotKey,
+        own: Option<&(String, String)>,
+        own_parts: &mut Vec<CreateTrigger>,
+        schema: &ParserDB,
+        context: &TranslationContext<'_>,
+    ) -> Result<(Vec<Statement>, Vec<ObjectName>), Error> {
+        let written = super::create_trigger::body_schema(schema, context);
+        let mut statements = Vec::new();
+        let mut assigned: Vec<String> = Vec::new();
+        let mut maintainers = Vec::new();
+        for member in self.maintainers(slot) {
+            let Some(part) = update_part(member, own, own_parts, schema, context)? else {
+                continue;
+            };
+            statements.push(drop_trigger(part.name.clone()));
+            for column in Member::assigning(member, written)?.assigned.into_iter().flatten() {
+                if !assigned.contains(&column) {
+                    assigned.push(column);
+                }
+            }
+            maintainers.push(FrameMember {
+                name: folded(&member.name),
+                twin: twin_name(member),
+                part,
+            });
+        }
+        let mut members = Vec::new();
+        for member in self.after_members(slot) {
+            let Some(part) = update_part(member, own, own_parts, schema, context)? else {
+                continue;
+            };
+            if !self.holds(member) {
+                statements.push(drop_trigger(part.name.clone()));
+            }
+            members.push(FrameMember { name: folded(&member.name), twin: twin_name(member), part });
+        }
+        let Some(table) = self.frame_members(slot).first().map(|member| member.table_name.clone())
+        else {
+            return Ok((statements, Vec::new()));
+        };
+        let created = Frame { table, maintainers, assigned, members }.emit(merged_name(slot))?;
+        let twins = created
+            .iter()
+            .filter_map(|statement| {
+                match statement {
+                    Statement::CreateTrigger(twin)
+                        if twin.period == Some(TriggerPeriod::Before) =>
+                    {
+                        Some(twin.name.clone())
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        statements.extend(created);
+        Ok((statements, twins))
+    }
+}
+
+fn drop_trigger(name: ObjectName) -> Statement {
+    Statement::DropTrigger(DropTrigger {
+        if_exists: true,
+        trigger_name: name,
+        table_name: None,
+        option: None,
+    })
+}
+
+/// The SQLite trigger `member` runs on `UPDATE` alone, taken from `own_parts`
+/// when `own` names it.
+fn update_part(
+    member: &CreateTrigger,
+    own: Option<&(String, String)>,
+    own_parts: &mut Vec<CreateTrigger>,
+    schema: &ParserDB,
+    context: &TranslationContext<'_>,
+) -> Result<Option<CreateTrigger>, Error> {
+    if own == Some(&trigger_key(member)) {
+        return Ok(take_part(own_parts, Event::Update));
+    }
+    let translated = Statement::CreateTrigger(member.clone()).translate_with_warnings(
+        schema,
+        context,
+        &mut |_| {},
+    )?;
+    Ok(translated.into_iter().find_map(|statement| {
+        match statement {
+            Statement::CreateTrigger(part)
+                if fires_on(&part, Event::Update) && part.period == Some(TriggerPeriod::After) =>
+            {
+                Some(part)
+            }
+            _ => None,
+        }
+    }))
+}
+
+/// The SQLite name of the twin recording that an `UPDATE` named the columns
+/// of `member`'s `UPDATE OF` clause.
+fn twin_name(member: &CreateTrigger) -> ObjectName {
+    append_suffix(&member.name, "_pg2sqlite_of")
+}
+
+/// The `AFTER UPDATE` slot of the table of `trigger` when it fires on
+/// `UPDATE`, which frames it beside the table's maintainers.
+fn frame_slot(trigger: &CreateTrigger) -> Option<SlotKey> {
+    trigger.events.iter().any(|event| matches!(event, TriggerEvent::Update(_))).then(|| {
+        SlotKey { table: folded(&trigger.table_name), timing: Timing::After, event: Event::Update }
+    })
+}
+
+/// Whether `trigger` is a constraint row trigger, which fires after the write.
+fn is_constraint_row(trigger: &CreateTrigger) -> bool {
+    trigger.is_constraint
+        && matches!(
+            trigger.trigger_object,
+            Some(
+                TriggerObjectKind::For(TriggerObject::Row)
+                    | TriggerObjectKind::ForEach(TriggerObject::Row)
+            )
+        )
 }
 
 /// The trigger among `statements` firing on `event`.

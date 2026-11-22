@@ -9,8 +9,9 @@ use git2::Repository;
 use sql_traits::structs::{AccessResolution, Deployment, ParseOptions, ParserDB, ParserDBIngestor};
 use sqlparser::{
     ast::{
-        AlterTableOperation, CreateIndex, DropTrigger, Ident, IndexType, ObjectName,
-        ObjectNamePart, ObjectType, RenameTableNameKind, Statement, Value, ValueWithSpan,
+        AlterTableOperation, CreateIndex, CreateTrigger, DropTrigger, Ident, IndexType, ObjectName,
+        ObjectNamePart, ObjectType, RenameTableNameKind, Statement, TriggerEvent, Value,
+        ValueWithSpan,
     },
     dialect::PostgreSqlDialect,
 };
@@ -109,6 +110,7 @@ fn register_deferred_key_checks<'s>(
 
 fn populate_prewalk_catalogs(
     statements: &[Statement],
+    epochs: &[PreparedEpoch],
     initial_schema: Option<&ParserDB>,
     context: &mut TranslationContext<'_>,
 ) {
@@ -157,6 +159,29 @@ fn populate_prewalk_catalogs(
         use sql_traits::traits::DatabaseLike;
         schema.triggers()
     });
+    let maintains = |trigger: &CreateTrigger, schema: &ParserDB| {
+        matches!(trigger.period, Some(sqlparser::ast::TriggerPeriod::Before))
+            && trigger.events.iter().any(|event| matches!(event, TriggerEvent::Update(_)))
+            && crate::impls::translator_impls::create_trigger::is_plain_row_trigger(trigger, schema)
+                .is_ok_and(|plain| !plain)
+    };
+    let maintainers: Vec<&CreateTrigger> = initial_schema
+        .into_iter()
+        .flat_map(|schema| {
+            use sql_traits::traits::DatabaseLike;
+            schema.triggers().filter(move |trigger| maintains(trigger, schema))
+        })
+        .chain(epochs.iter().flat_map(|epoch| {
+            statements[epoch.start..epoch.end].iter().filter_map(|statement| {
+                match statement {
+                    Statement::CreateTrigger(trigger) if maintains(trigger, &epoch.schema) => {
+                        Some(trigger)
+                    }
+                    _ => None,
+                }
+            })
+        }))
+        .collect();
     // A trigger left to the server never fires on SQLite, so it shares no slot.
     let shared = crate::impls::translator_impls::trigger_slots::shared_slot_triggers(
         initial_triggers,
@@ -165,6 +190,7 @@ fn populate_prewalk_catalogs(
             !crate::impls::object_name::last_ident(&trigger.name)
                 .is_some_and(|name| context.is_server_derived_trigger_name(&name.value))
         },
+        |trigger| maintainers.iter().any(|maintainer| core::ptr::eq(*maintainer, trigger)),
     );
     context.set_shared_slot_triggers(shared);
 }
@@ -1256,7 +1282,7 @@ impl Pg2Sqlite {
         } = prepared;
         let statements = &*sources;
         register_server_derived_triggers(statements, &epochs, initial_schema.as_ref(), context);
-        populate_prewalk_catalogs(statements, initial_schema.as_ref(), context);
+        populate_prewalk_catalogs(statements, &epochs, initial_schema.as_ref(), context);
         register_deferred_key_checks(
             initial_schema.iter().chain(epochs.iter().map(|epoch| &epoch.schema)),
             context,

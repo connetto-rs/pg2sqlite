@@ -48,6 +48,7 @@ pub(crate) mod statement;
 mod stored_text;
 mod table_constraint;
 pub(crate) mod trigger_follower;
+pub(crate) mod trigger_frame;
 pub(crate) mod trigger_row;
 pub(crate) mod trigger_slots;
 pub(crate) mod update;

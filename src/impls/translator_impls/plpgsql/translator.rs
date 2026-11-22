@@ -824,13 +824,21 @@ impl PlPgSqlTranslator {
             Expr::Value(value) if value.value == Value::Null => {
                 // A query, so the enclosing IF's condition reaches its WHERE
                 // clause.
-                Self::finalize_query_statements(
+                let mut statements = Self::finalize_query_statements(
                     vec![raise_ignore_statement()],
                     scope,
                     schema,
                     options,
                     emit,
-                )
+                )?;
+                if let Some(named) = &scope.facts.skip_clears {
+                    let mut clear = crate::impls::translator_impls::reentry::clear_unclaimed(named);
+                    if let Some(condition) = scope.current_condition() {
+                        Self::inject_condition_into_statement(&mut clear, &condition)?;
+                    }
+                    statements.insert(0, clear);
+                }
+                Ok(statements)
             }
             Expr::Identifier(ident)
                 if ident.value.eq_ignore_ascii_case("new")

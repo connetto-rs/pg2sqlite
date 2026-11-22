@@ -140,6 +140,7 @@ fn maintenance_facts(trigger: &CreateTrigger) -> super::plpgsql::TriggerFacts {
         maintenance_refusal: None,
         after: matches!(trigger.period, Some(TriggerPeriod::After)),
         removes_derived_writes: false,
+        skip_clears: None,
     }
 }
 
@@ -351,6 +352,8 @@ struct TriggerPart<'a> {
     /// Whether the replica leaves the trigger's writes to the server, which
     /// an `INSTEAD OF` trigger keeps as the view's own.
     removes_derived_writes: bool,
+    /// The named table a `RETURN NULL` clears the row's unclaimed records from.
+    skip_clears: Option<ObjectName>,
 }
 
 /// Translates the trigger function's body into the shape `part` asks for.
@@ -376,6 +379,7 @@ fn generate_standard_trigger_body(
         maintenance_refusal: refusal.map(|refusal| (function_name.to_string(), refusal.clone())),
         after: part.after,
         removes_derived_writes: part.removes_derived_writes,
+        skip_clears: part.skip_clears.clone(),
     };
     // A definer body runs as its owner, read from the epoch like row-level
     // security.
@@ -714,9 +718,10 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
             .map(|cond| cond.translate_with_warnings(schema, options, emit))
             .transpose()?;
         let marker = super::reentry::marker_table(&source_table_name);
-        // A shared slot runs several members in one SQLite trigger, so each
-        // keeps its WHEN inside its own body.
-        let shares_slot = options.shares_trigger_slot(&trigger_slots::trigger_key(self));
+        // A constraint trigger keeps its WHEN on the trigger, which a deferred
+        // check queues by.
+        let shares_slot =
+            !is_constraint && options.shares_trigger_slot(&trigger_slots::trigger_key(self));
         let (in_body_guard, translated_condition) = if plain && shares_slot {
             (translated_cond, None)
         } else {
@@ -745,21 +750,15 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
         });
         let mut parts = Vec::with_capacity(part_events.len());
         for part_events in part_events {
-            // PostgreSQL fires no UPDATE trigger for an INSERT, so none fires
-            // for the write of what a BEFORE INSERT trigger assigned to NEW.
-            let maintained_insert = (plain
-                && part_events.iter().any(|event| matches!(event, TriggerEvent::Update(_))))
-            .then(|| {
-                super::reentry::unmarked_after(
-                    &marker,
-                    "OLD",
-                    super::reentry::MaintainedEvent::Insert,
-                )
-            });
+            let updates = part_events.iter().any(|event| matches!(event, TriggerEvent::Update(_)));
+            // PostgreSQL fires no trigger for what a BEFORE trigger assigns to
+            // NEW.
+            let maintained_write =
+                (plain && updates).then(|| super::reentry::unmarked(&marker, "OLD"));
             let (guard, condition) = if plain && shares_slot {
-                (merge_conditions(in_body_guard.clone(), maintained_insert), None)
+                (merge_conditions(in_body_guard.clone(), maintained_write), None)
             } else {
-                (None, merge_conditions(translated_condition.clone(), maintained_insert))
+                (None, merge_conditions(translated_condition.clone(), maintained_write))
             };
             let function_body = if is_maintenance_trigger {
                 generate_maintenance_trigger_body(
@@ -778,6 +777,10 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
                     after: plain && matches!(period, Some(TriggerPeriod::After)),
                     removes_derived_writes: options.is_server_derived_writes_omitted()
                         && !matches!(period, Some(TriggerPeriod::InsteadOf)),
+                    skip_clears: (plain
+                        && updates
+                        && matches!(period, Some(TriggerPeriod::Before)))
+                    .then(|| super::reentry::named_table(&source_table_name)),
                 },
                 &redirected_table_name,
                 maintenance_refusal.as_ref().and_then(Option::as_ref),

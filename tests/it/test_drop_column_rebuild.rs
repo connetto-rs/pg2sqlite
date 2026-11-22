@@ -335,6 +335,29 @@ fn a_resumed_batch_regenerates_an_assignment_beside_a_trigger() {
     assert_eq!(stamped_rows, 1);
 }
 
+/// An earlier session's `AFTER UPDATE` trigger running from one SQLite trigger
+/// after a trigger assigning NEW has no single definition to translate again,
+/// so the rebuild is refused rather than firing it on the unmaintained row.
+#[test]
+fn a_resumed_batch_with_a_framed_update_slot_is_refused() {
+    let framed = "CREATE TABLE t (id INT PRIMARY KEY, a INT NOT NULL, b INT UNIQUE, c INT); \
+                  CREATE TABLE t_log (seq SERIAL PRIMARY KEY, old_c INT, new_c INT); \
+                  CREATE FUNCTION stamp() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+                  NEW.c := NEW.a * 2; RETURN NEW; END $$; \
+                  CREATE FUNCTION log_c() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+                  INSERT INTO t_log (old_c, new_c) VALUES (OLD.c, NEW.c); RETURN NULL; END $$; \
+                  CREATE TRIGGER t_stamp BEFORE INSERT OR UPDATE ON t FOR EACH ROW \
+                  EXECUTE FUNCTION stamp(); \
+                  CREATE TRIGGER t_log_c AFTER UPDATE ON t FOR EACH ROW EXECUTE FUNCTION log_c();";
+    let schema = Pg2Sqlite::default().sql(framed).unwrap().build_schema().unwrap();
+    let error = Pg2Sqlite::default()
+        .sql("ALTER TABLE t DROP COLUMN b;")
+        .unwrap()
+        .translate_with_schema(&schema, &Pg2SqliteOptions::default())
+        .expect_err("the drop is refused");
+    assert!(error.to_string().contains("merges several PostgreSQL triggers"), "{error}");
+}
+
 /// The drop translated on its own, outside a batch, still brings back the
 /// table's index and trigger, and leaves those of other tables alone.
 #[test]
