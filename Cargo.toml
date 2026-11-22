@@ -53,9 +53,7 @@ tempfile = "3.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 testcontainers = { version = "0.27", features = ["blocking"] }
 parking_lot = "0.13.0"
-# The tests register the replica's `jsonb` function and collation through
-# `JsonbFunctions::register`, and replay sql-traits' parity fixtures through
-# `parity::replay`.
+# The tests register the replica's functions through `diesel` and replay sql-traits' parity fixtures.
 pg2sqlite = { path = ".", features = ["diesel", "parity"] }
 
 # Optional integration gated by the `sqlitegis` feature. Declared in
@@ -72,8 +70,7 @@ optional = true
 version = "0.39"
 optional = true
 
-# Registers the replica's `jsonb` function and collation on a diesel SQLite
-# connection, native or WebAssembly, with the `diesel` feature.
+# Registers the replica's `jsonb` and case fold functions on a native or WebAssembly diesel connection.
 [dependencies.diesel]
 version = "2.4"
 default-features = false
@@ -106,8 +103,7 @@ sqlitegis = [
 # `SessionVariableMapping`. Consumed by the fuzz harnesses; not used by
 # production code.
 arbitrary = ["dep:arbitrary"]
-# `JsonbFunctions::register`, adding the replica's `jsonb` function and
-# collation to a diesel `SqliteConnection`.
+# `JsonbFunctions::register` and `CaseFoldFunctions::register` on a diesel `SqliteConnection`.
 diesel = ["dep:diesel"]
 # `parity::replay`, answering rls-parity's row-level security cases, which
 # sql-traits ships behind `parity-fixtures`, on the SQLite replica.

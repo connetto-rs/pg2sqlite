@@ -130,7 +130,8 @@ pub(crate) fn fold_function<'o>(
             "{call} folds case by the server's LC_CTYPE, which under a UTF-8 locale folds every \
              cased letter, and SQLite's {builtin}() folds ASCII letters only, so a letter such as \
              Ä or ä would keep its case where PostgreSQL changes it. Register functions folding as \
-             the server does and name them with \
+             the server does, with CaseFoldFunctions::register under the diesel feature for a \
+             glibc UTF-8 LC_CTYPE, and name them with \
              with_case_fold_functions(CaseFoldFunctions::new(\"pg_lower\", \"pg_upper\")), or \
              with CaseFoldFunctions::new(\"lower\", \"upper\") when the server's LC_CTYPE is C.",
             builtin = case.builtin()
