@@ -1,6 +1,6 @@
-//! The one SQLite trigger running a table's `AFTER UPDATE` triggers once per
-//! row, after the writes of its `BEFORE UPDATE` triggers assigning `NEW`,
-//! with those writes read as `NEW`.
+//! The one SQLite trigger running a table's `AFTER INSERT` or `AFTER UPDATE`
+//! triggers once per row, after the writes of its `BEFORE` triggers on that
+//! event assigning `NEW`, with those writes read as `NEW`.
 //!
 //! Each run opens a frame, a named-table row whose `id` its records carry, so
 //! a member updating its own row nests a frame and finds its records after.
@@ -240,12 +240,16 @@ fn body(part: CreateTrigger) -> Vec<Statement> {
 
 impl Frame {
     /// The twins recording the members' `UPDATE OF` columns and the framed
-    /// trigger, named `name`.
+    /// trigger, named `name`, firing after `event`.
     ///
     /// # Errors
     ///
     /// Refuses a member whose body holds a statement no condition reaches.
-    pub(crate) fn emit(self, name: ObjectName) -> Result<Vec<Statement>, Error> {
+    pub(crate) fn emit(
+        self,
+        name: ObjectName,
+        event: TriggerEvent,
+    ) -> Result<Vec<Statement>, Error> {
         let Self { table, maintainers, assigned, mut members } = self;
         let marker = marker_table(&table);
         let named = named_table(&table);
@@ -320,13 +324,15 @@ impl Frame {
             Some(equals(identifier("id"), frame_id(&named))),
         ));
 
+        // A maintenance write is an UPDATE, so only an UPDATE frame skips one.
+        let skip_maintained = matches!(event, TriggerEvent::Update(_));
         twins.push(ast_builder::trigger(
             name,
             target,
             TriggerPeriod::After,
-            TriggerEvent::Update(Vec::new()),
+            event,
             true,
-            Some(unmarked(&marker, "OLD")),
+            skip_maintained.then(|| unmarked(&marker, "OLD")),
             statements,
         ));
         Ok(twins)

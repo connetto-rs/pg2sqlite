@@ -161,7 +161,10 @@ fn populate_prewalk_catalogs(
     });
     let maintains = |trigger: &CreateTrigger, schema: &ParserDB| {
         matches!(trigger.period, Some(sqlparser::ast::TriggerPeriod::Before))
-            && trigger.events.iter().any(|event| matches!(event, TriggerEvent::Update(_)))
+            && trigger
+                .events
+                .iter()
+                .any(|event| matches!(event, TriggerEvent::Insert | TriggerEvent::Update(_)))
             && crate::impls::translator_impls::create_trigger::is_plain_row_trigger(trigger, schema)
                 .is_ok_and(|plain| !plain)
     };

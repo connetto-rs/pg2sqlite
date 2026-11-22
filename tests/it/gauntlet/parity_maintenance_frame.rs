@@ -1,7 +1,7 @@
-//! Parity for a `BEFORE UPDATE` row trigger assigning `NEW` beside the
-//! table's other `UPDATE` triggers. PostgreSQL fires each of them once per
-//! row, an `AFTER` one with the row before the write as `OLD` and the row
-//! the assigning trigger returned as `NEW`.
+//! Parity for a `BEFORE` row trigger assigning `NEW` beside the table's other
+//! triggers on its event. PostgreSQL fires each of them once per row, an
+//! `AFTER` one with the row the assigning trigger returned as `NEW` and, on
+//! `UPDATE`, the row before the write as `OLD`.
 
 use diesel::{QueryResult, connection::SimpleConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
@@ -512,5 +512,202 @@ fn an_after_trigger_updating_its_own_row_nests() {
             ),
         )],
         &[SEED, "UPDATE items SET note = 'bump', tag = 'b' WHERE id = 1;"],
+    );
+}
+
+const STAMP_INSERT: &str =
+    "CREATE TRIGGER items_stamp BEFORE INSERT ON items FOR EACH ROW EXECUTE FUNCTION stamp();";
+
+const AUDIT_INSERT: &str =
+    "CREATE TRIGGER items_audit AFTER INSERT ON items FOR EACH ROW EXECUTE FUNCTION audit_after();";
+
+/// An `AFTER INSERT` trigger fires once, with the row the stamp returned.
+#[test]
+fn an_after_insert_trigger_sees_the_stamped_row_once() {
+    assert_agree(&[&schema(&["after"], &format!("{STAMP_INSERT}{AUDIT_INSERT}"))], &[SEED]);
+}
+
+/// Every row of a multi-row insert fires the `AFTER INSERT` trigger once.
+#[test]
+fn each_row_of_an_insert_fires_once() {
+    assert_agree(
+        &[&schema(&["after"], &format!("{STAMP_INSERT}{AUDIT_INSERT}"))],
+        &["INSERT INTO items (id, tag) VALUES (1, 'a'), (2, 'b');"],
+    );
+}
+
+/// Several `AFTER INSERT` triggers fire once each, in name order.
+#[test]
+fn several_after_insert_triggers_fire_once_each_in_name_order() {
+    assert_agree(
+        &[&schema(
+            &["a", "z"],
+            &format!(
+                "{STAMP_INSERT}
+                 CREATE TRIGGER items_z AFTER INSERT ON items FOR EACH ROW EXECUTE FUNCTION audit_z();
+                 CREATE TRIGGER items_a AFTER INSERT ON items FOR EACH ROW EXECUTE FUNCTION audit_a();"
+            ),
+        )],
+        &[SEED],
+    );
+}
+
+/// A `WHEN` reading the field the stamp assigns compares the stamped row.
+#[test]
+fn an_after_insert_when_reading_the_stamped_field_sees_the_stamp() {
+    assert_agree(
+        &[&schema(
+            &["after"],
+            &format!(
+                "{STAMP_INSERT}
+                 CREATE TRIGGER items_audit AFTER INSERT ON items FOR EACH ROW
+                     WHEN (NEW.stamped = 'a*') EXECUTE FUNCTION audit_after();"
+            ),
+        )],
+        &["INSERT INTO items (id, tag) VALUES (1, 'a'), (2, 'b');"],
+    );
+}
+
+/// A constraint trigger fires once on insert, with the stamped row.
+#[test]
+fn a_constraint_trigger_sees_the_stamped_insert_once() {
+    assert_agree(
+        &[&schema(
+            &["checked"],
+            &format!(
+                "{STAMP_INSERT}
+                 CREATE CONSTRAINT TRIGGER items_checked AFTER INSERT ON items
+                     FOR EACH ROW EXECUTE FUNCTION audit_checked();"
+            ),
+        )],
+        &[SEED],
+    );
+}
+
+/// A deferred constraint trigger queues one firing per insert, with the
+/// stamped row.
+#[test]
+fn a_deferred_trigger_queues_the_stamped_insert_once() {
+    assert_agree(
+        &[&schema(
+            &["deferred"],
+            &format!(
+                "{STAMP_INSERT}
+                 CREATE CONSTRAINT TRIGGER items_deferred AFTER INSERT ON items
+                     DEFERRABLE INITIALLY DEFERRED
+                     FOR EACH ROW EXECUTE FUNCTION audit_deferred();"
+            ),
+        )],
+        &[SEED],
+    );
+}
+
+/// A stamp and an audit firing on `INSERT OR UPDATE` each fire once per
+/// write, the audit with the stamped row.
+#[test]
+fn an_insert_or_update_audit_sees_every_stamped_write_once() {
+    assert_agree(
+        &[&schema(
+            &["after"],
+            "CREATE TRIGGER items_stamp BEFORE INSERT OR UPDATE ON items
+                 FOR EACH ROW EXECUTE FUNCTION stamp();
+             CREATE TRIGGER items_audit AFTER INSERT OR UPDATE ON items
+                 FOR EACH ROW EXECUTE FUNCTION audit_after();",
+        )],
+        &[SEED, "UPDATE items SET tag = 'b' WHERE id = 1;"],
+    );
+}
+
+/// The stamp created in a later migration than the `AFTER INSERT` trigger.
+#[test]
+fn an_insert_stamp_of_a_later_migration_reaches_the_after_trigger() {
+    assert_agree(&[&schema(&["after"], AUDIT_INSERT), STAMP_INSERT], &[SEED]);
+}
+
+/// Dropping the stamp leaves the `AFTER INSERT` trigger firing once on the
+/// caller's row.
+#[test]
+fn dropping_the_insert_stamp_keeps_the_after_trigger() {
+    assert_agree(
+        &[
+            &schema(&["after"], &format!("{STAMP_INSERT}{AUDIT_INSERT}")),
+            "DROP TRIGGER items_stamp ON items;",
+        ],
+        &[SEED],
+    );
+}
+
+/// Dropping the `AFTER INSERT` trigger leaves the stamp in force.
+#[test]
+fn dropping_the_after_insert_trigger_keeps_the_stamp() {
+    assert_agree(
+        &[
+            &schema(&["after"], &format!("{STAMP_INSERT}{AUDIT_INSERT}")),
+            "DROP TRIGGER items_audit ON items;",
+        ],
+        &[SEED],
+    );
+}
+
+/// A row a `BEFORE INSERT` trigger skips fires nothing after it.
+#[test]
+fn a_skipped_insert_fires_no_after_trigger() {
+    assert_agree(
+        &[&schema(
+            &["after"],
+            &format!(
+                "CREATE FUNCTION skip_marked() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN IF NEW.tag = 'skip' THEN RETURN NULL; END IF; RETURN NEW; END $$;
+                 CREATE TRIGGER items_skip BEFORE INSERT ON items
+                     FOR EACH ROW EXECUTE FUNCTION skip_marked();
+                 {STAMP_INSERT}{AUDIT_INSERT}"
+            ),
+        )],
+        &["INSERT INTO items (id, tag) VALUES (1, 'skip'), (2, 'b');"],
+    );
+}
+
+/// An `AFTER INSERT` trigger inserting a row into its own table runs the
+/// nested insert's triggers inside it, and the triggers after it still see
+/// the outer row.
+#[test]
+fn an_after_insert_trigger_inserting_into_its_table_nests() {
+    assert_agree(
+        &[&schema(
+            &["a", "z"],
+            &format!(
+                "{STAMP_INSERT}
+                 CREATE FUNCTION spawn() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN INSERT INTO items (id, tag) VALUES (NEW.id + 100, NEW.tag || '+');
+                 RETURN NULL; END $$;
+                 CREATE TRIGGER items_a AFTER INSERT ON items FOR EACH ROW EXECUTE FUNCTION audit_a();
+                 CREATE TRIGGER items_m AFTER INSERT ON items FOR EACH ROW
+                     WHEN (NEW.id < 100) EXECUTE FUNCTION spawn();
+                 CREATE TRIGGER items_z AFTER INSERT ON items FOR EACH ROW EXECUTE FUNCTION audit_z();"
+            ),
+        )],
+        &[SEED],
+    );
+}
+
+/// An upsert taking its update branch fires the update triggers with the
+/// stamped row, and its insert branch fires the insert triggers.
+#[test]
+fn an_upsert_fires_the_triggers_of_the_branch_it_takes() {
+    assert_agree(
+        &[&schema(
+            &["inserted", "updated"],
+            "CREATE TRIGGER items_stamp BEFORE INSERT OR UPDATE ON items
+                 FOR EACH ROW EXECUTE FUNCTION stamp();
+             CREATE TRIGGER items_inserted AFTER INSERT ON items
+                 FOR EACH ROW EXECUTE FUNCTION audit_inserted();
+             CREATE TRIGGER items_updated AFTER UPDATE ON items
+                 FOR EACH ROW EXECUTE FUNCTION audit_updated();",
+        )],
+        &[
+            SEED,
+            "INSERT INTO items (id, tag) VALUES (1, 'c') ON CONFLICT (id) DO UPDATE SET tag = 'd';",
+            "INSERT INTO items (id, tag) VALUES (2, 'e') ON CONFLICT (id) DO UPDATE SET tag = 'f';",
+        ],
     );
 }
