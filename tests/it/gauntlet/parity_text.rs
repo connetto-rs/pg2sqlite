@@ -126,7 +126,9 @@ fn translate_select(pg_select: &str) -> String {
         .expect("parse DDL context")
         .sql(pg_select)
         .expect("parse PG SELECT")
-        .translate(&helpers::deployment::utc_request())
+        .translate(
+            &helpers::case_fold_functions::with_functions(helpers::deployment::utc_request()),
+        )
         .expect("translate SELECT")
         .into_vec();
     stmts.last().expect("non-empty translation output").to_string()

@@ -302,20 +302,17 @@ pub(crate) fn pattern_matches_any_element(
     }
 }
 
-/// `subject ILIKE ANY (array)`, with each element folded the same way the
-/// subject was.
+/// `subject ILIKE ANY (array)`, with each element folded through
+/// `fold_function` as the subject was.
 pub(crate) fn pattern_matches_any_element_folded(
     subject: Expr,
     array: Expr,
     escape_char: Option<Box<Expr>>,
     negated: bool,
-    fold_function: Option<&str>,
+    fold_function: &str,
 ) -> Expr {
     let (from, [subject]) = json_each_beside(array, [subject]);
-    let element = match fold_function {
-        Some(name) => simple_function_expr(name, vec![json_each_column(VALUE_COLUMN)], None),
-        None => simple_function_expr("lower", vec![json_each_column(VALUE_COLUMN)], None),
-    };
+    let element = simple_function_expr(fold_function, vec![json_each_column(VALUE_COLUMN)], None);
     let matches_element = Expr::Like {
         negated,
         any: false,

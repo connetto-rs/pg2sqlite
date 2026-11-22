@@ -281,7 +281,7 @@ fn test_ilike_translation() {
     ";
 
     let (translated, select_stmt) =
-        helpers::translate::translate_default_statements_and_first_query(sql);
+        helpers::translate::translate_ascii_statements_and_first_query(sql);
 
     // Should contain LIKE, not ILIKE
     assert!(
@@ -317,7 +317,7 @@ fn test_ilike_semantic() -> Result<(), Box<dyn std::error::Error>> {
     ";
 
     let (translated, select_stmt) =
-        helpers::translate::translate_default_statements_and_first_query(sql);
+        helpers::translate::translate_ascii_statements_and_first_query(sql);
 
     // Execute DDL
     let mut connection = helpers::apply_ddl(&translated);

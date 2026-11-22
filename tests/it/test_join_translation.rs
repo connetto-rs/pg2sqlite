@@ -225,7 +225,7 @@ fn test_join_ilike_translation() {
     ";
 
     let (translated, select_stmt) =
-        helpers::translate::translate_default_statements_and_first_query(sql);
+        helpers::translate::translate_ascii_statements_and_first_query(sql);
 
     // Should contain LIKE, not ILIKE
     assert!(
@@ -377,7 +377,7 @@ fn test_multiple_joins_translation() {
     ";
 
     let (translated, select_stmt) =
-        helpers::translate::translate_default_statements_and_first_query(sql);
+        helpers::translate::translate_ascii_statements_and_first_query(sql);
 
     // Count LIKE occurrences (should be 2, translated from ILIKE)
     let like_count = select_stmt.to_uppercase().matches(" LIKE ").count();
@@ -412,7 +412,7 @@ fn test_left_join_translation() {
     ";
 
     let (translated, select_stmt) =
-        helpers::translate::translate_default_statements_and_first_query(sql);
+        helpers::translate::translate_ascii_statements_and_first_query(sql);
 
     // Should preserve LEFT JOIN and translate ILIKE
     assert!(
@@ -444,7 +444,7 @@ fn test_join_ilike_semantic() -> Result<(), Box<dyn std::error::Error>> {
     ";
 
     let (translated, select_stmt) =
-        helpers::translate::translate_default_statements_and_first_query(sql);
+        helpers::translate::translate_ascii_statements_and_first_query(sql);
 
     // Execute DDL
     let mut connection = helpers::apply_ddl(&translated);
@@ -551,7 +551,7 @@ fn test_left_join_semantic() -> Result<(), Box<dyn std::error::Error>> {
     ";
 
     let (translated, select_stmt) =
-        helpers::translate::translate_default_statements_and_first_query(sql);
+        helpers::translate::translate_ascii_statements_and_first_query(sql);
 
     // Execute DDL
     let mut connection = helpers::apply_ddl(&translated);

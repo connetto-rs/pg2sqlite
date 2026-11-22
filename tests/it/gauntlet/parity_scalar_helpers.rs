@@ -199,7 +199,7 @@ fn uuid(text: &str) -> Uuid {
 }
 
 fn options() -> Pg2SqliteOptions {
-    Pg2SqliteOptions::default()
+    crate::helpers::case_fold_functions::with_functions(Pg2SqliteOptions::default())
         .with_rls_audit_table_name("rls_audit")
         .with_uuid_representation(UuidRepresentation::Text)
         .with_array_representation(ArrayRepresentation::Json)
@@ -256,6 +256,7 @@ fn sqlite(predicate: &str, request: &Arc<Mutex<Request>>) -> SqliteConnection {
         .unwrap_or_else(|error| panic!("pg2sqlite refused {predicate}: {error}"))
         .into_vec();
     let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
+    crate::helpers::case_fold_functions::register(&mut connection);
     let read = |pick: fn(&Request) -> Option<&'static str>| {
         let request = Arc::clone(request);
         move || pick(&request.lock().expect("the request lock")).map(str::to_owned)

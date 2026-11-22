@@ -22,7 +22,13 @@ const SUBJECTS: &str = "CREATE TABLE t (id INT PRIMARY KEY, s TEXT);
 
 fn count(pg_predicate: &str) -> Option<String> {
     let script = format!("{SUBJECTS} SELECT count(*) FROM t WHERE {pg_predicate};");
-    run_translated_with(&script, &Pg2SqliteOptions::default()).remove(0)
+    run_translated_with(&script, &ascii()).remove(0)
+}
+
+/// Default options for a server whose `LC_CTYPE` is `C`, since the subjects
+/// are ASCII.
+fn ascii() -> Pg2SqliteOptions {
+    crate::helpers::case_fold_functions::with_ascii_builtins(Pg2SqliteOptions::default())
 }
 
 // ---------------------------------------------------------------------------
@@ -182,7 +188,7 @@ fn a_lowered_like_with_the_default_escape_restores_ilike() {
 /// the same and this one is the text the round trip started from.
 #[test]
 fn ilike_survives_a_round_trip() {
-    let options = Pg2SqliteOptions::default();
+    let options = ascii();
     let translator = Pg2Sqlite::default().sql("CREATE TABLE t (a TEXT, b TEXT);").unwrap();
     let schema = translator.build_schema().unwrap();
     let forward = Pg2Sqlite::default()

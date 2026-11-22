@@ -666,7 +666,8 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER widgets_maint BEFORE UPDATE ON widgets
 FOR EACH ROW EXECUTE FUNCTION widgets_maintain();
 ";
-    let mut conn = helpers::apply_translated_ddl(sql, &Pg2SqliteOptions::default());
+    let options = helpers::case_fold_functions::with_functions(Pg2SqliteOptions::default());
+    let mut conn = helpers::apply_translated_ddl(sql, &options);
     diesel::insert_into(widgets::table)
         .values(&NewWidget { id: 1, tag: Some("hello".into()), slug: Some("world".into()) })
         .execute(&mut conn)
@@ -770,7 +771,8 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER chain_maint BEFORE UPDATE ON chain
 FOR EACH ROW EXECUTE FUNCTION chain_maintain();
 ";
-    let mut conn = helpers::apply_translated_ddl(sql, &Pg2SqliteOptions::default());
+    let options = helpers::case_fold_functions::with_functions(Pg2SqliteOptions::default());
+    let mut conn = helpers::apply_translated_ddl(sql, &options);
     diesel::insert_into(chain::table)
         .values(&NewChain { id: 1, a: Some("abc".into()), b: Some("zzz".into()) })
         .execute(&mut conn)

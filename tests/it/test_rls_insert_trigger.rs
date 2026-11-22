@@ -165,7 +165,8 @@ fn rls_two_column_maintenance_trigger_exemption_fires() {
     // Execute: INSERT through the view must succeed.
     let mut conn = helpers::apply_translated_ddl(
         ITEMS_SCHEMA,
-        &Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit"),
+        &helpers::case_fold_functions::with_functions(Pg2SqliteOptions::default())
+            .with_rls_audit_table_name("rls_audit"),
     );
     diesel::insert_into(items::table)
         .values((items::id.eq(1_i32), items::tag.eq("hello"), items::slug.eq("world")))
@@ -186,7 +187,8 @@ fn rls_two_column_maintenance_trigger_exemption_fires() {
 fn caller_update_writing_the_maintained_values_is_denied() {
     let mut conn = helpers::apply_translated_ddl(
         ITEMS_SCHEMA,
-        &Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit"),
+        &helpers::case_fold_functions::with_functions(Pg2SqliteOptions::default())
+            .with_rls_audit_table_name("rls_audit"),
     );
     diesel::insert_into(items::table)
         .values((items::id.eq(1_i32), items::tag.eq("hello"), items::slug.eq("world")))

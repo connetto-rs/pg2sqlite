@@ -6,10 +6,7 @@
 //! was read as a position too. `LIKE ANY` emitted SQL SQLite cannot run at
 //! all. Every expected value is what PostgreSQL 17.3 answers, measured.
 
-use pg2sqlite::{
-    prelude::{ArrayRepresentation, Pg2Sqlite, Pg2SqliteOptions},
-    warnings::TranslationWarning,
-};
+use pg2sqlite::prelude::{ArrayRepresentation, Pg2Sqlite, Pg2SqliteOptions};
 use run_translated_helper::run_translated_with;
 
 use crate::helpers::run_translated as run_translated_helper;
@@ -41,16 +38,6 @@ fn refusal_with(pg: &str, options: &Pg2SqliteOptions) -> String {
 /// The refusal `pg` earns under the default options.
 fn refusal(pg: &str) -> String {
     refusal_with(pg, &Pg2SqliteOptions::default())
-}
-
-/// The warnings `pg` emits under `options`.
-fn warnings(pg: &str, options: &Pg2SqliteOptions) -> Vec<TranslationWarning> {
-    Pg2Sqlite::default()
-        .sql(pg)
-        .expect("fixture parses")
-        .translate_with_report(options)
-        .expect("fixture translates")
-        .warnings
 }
 
 #[test]
@@ -159,46 +146,5 @@ fn a_null_separator_makes_the_whole_concatenation_null() {
     assert_eq!(
         answer("SELECT concat_ws(',', NULL, 'a', NULL, 'b');"),
         vec![Some("a,b".to_string())]
-    );
-}
-
-#[test]
-fn ascii_only_case_folding_is_reported_when_the_pattern_is_not_a_literal() {
-    // A literal pattern carrying a non-ASCII letter is refused already. A
-    // pattern held in a column cannot be inspected, and `lower` folds ASCII
-    // only, so the caller is told rather than left with a silent mismatch.
-    let reported = warnings(
-        "CREATE TABLE t (v text, p text);
-         SELECT v ILIKE p FROM t;",
-        &Pg2SqliteOptions::default(),
-    );
-    let named: Vec<String> = reported
-        .iter()
-        .filter_map(|warning| {
-            match warning {
-                TranslationWarning::LossyDowngrade { construct, reason, .. }
-                    if construct == "ILIKE" =>
-                {
-                    Some(reason.clone())
-                }
-                _ => None,
-            }
-        })
-        .collect();
-    assert_eq!(named.len(), 1, "{reported:?}");
-    assert!(named[0].contains("ASCII"), "{}", named[0]);
-    assert!(named[0].contains("with_ilike_fold_function"), "{}", named[0]);
-}
-
-#[test]
-fn naming_a_unicode_aware_fold_function_reports_nothing() {
-    let reported = warnings(
-        "CREATE TABLE t (v text, p text);
-         SELECT v ILIKE p FROM t;",
-        &Pg2SqliteOptions::default().with_ilike_fold_function("icu_lower"),
-    );
-    assert!(
-        !reported.iter().any(|warning| format!("{warning:?}").contains("ILIKE")),
-        "{reported:?}"
     );
 }

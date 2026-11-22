@@ -84,6 +84,17 @@ pub fn translate_default_statements_and_first_query(sql: &str) -> (Vec<String>, 
     )
 }
 
+/// [`translate_statements_and_first_query`] with default options for a server
+/// whose `LC_CTYPE` is `C`, for a test folding ASCII text.
+pub fn translate_ascii_statements_and_first_query(sql: &str) -> (Vec<String>, String) {
+    translate_statements_and_first_query(
+        sql,
+        &super::case_fold_functions::with_ascii_builtins(super::jsonb_functions::with_functions(
+            Pg2SqliteOptions::default(),
+        )),
+    )
+}
+
 /// [`translate_statements_and_first_query`] for a request whose `TimeZone` is
 /// UTC, `sql` led by the role
 /// [`utc_request`](super::deployment::utc_request) logs in as.

@@ -47,7 +47,7 @@ fn reject_default(pg: &str) -> String {
 /// Translate a whole PostgreSQL script under JSON arrays and return the first
 /// column of its last statement, having applied the rest.
 fn run_translated(pg: &str) -> Vec<Option<String>> {
-    run_translated_with(pg, &json_arrays())
+    run_translated_with(pg, &crate::helpers::case_fold_functions::with_functions(json_arrays()))
 }
 
 /// A table with an array column plus the seed rows every function test shares.

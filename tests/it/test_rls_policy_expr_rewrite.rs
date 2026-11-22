@@ -8,12 +8,14 @@ use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use sqlparser::ast::Statement;
 
 fn translate(sql: &str) -> Result<Vec<Statement>, Box<dyn std::error::Error>> {
-    let options = Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit");
+    let options = crate::helpers::case_fold_functions::with_functions(Pg2SqliteOptions::default())
+        .with_rls_audit_table_name("rls_audit");
     Ok(Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec())
 }
 
 fn apply_all(stmts: &[Statement]) -> Result<SqliteConnection, Box<dyn std::error::Error>> {
     let mut conn = SqliteConnection::establish(":memory:")?;
+    crate::helpers::case_fold_functions::register(&mut conn);
     for stmt in stmts {
         diesel::sql_query(stmt.to_string()).execute(&mut conn)?;
     }

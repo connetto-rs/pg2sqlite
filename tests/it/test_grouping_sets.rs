@@ -305,7 +305,9 @@ fn grouping_rewrite_rejects_a_scalar_call_projection() {
     let err = Pg2Sqlite::default()
         .sql(&sql)
         .unwrap()
-        .translate(&Pg2SqliteOptions::default())
+        .translate(&crate::helpers::case_fold_functions::with_ascii_builtins(
+            Pg2SqliteOptions::default(),
+        ))
         .expect_err("a scalar call over a non-key column is not a grouped value")
         .to_string();
     assert!(err.contains("GROUPING SETS/ROLLUP/CUBE"), "{err}");

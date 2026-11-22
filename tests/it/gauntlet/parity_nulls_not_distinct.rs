@@ -167,7 +167,10 @@ fn migrate_sqlite(connection: &mut SqliteConnection) {
     let translated = Pg2Sqlite::default()
         .sql(MIGRATION)
         .unwrap()
-        .translate_with_schema(&schema, &Pg2SqliteOptions::default())
+        .translate_with_schema(
+            &schema,
+            &helpers::case_fold_functions::with_functions(Pg2SqliteOptions::default()),
+        )
         .expect("translate the migration")
         .into_vec();
     execute_ddl(connection, &translated);
@@ -221,7 +224,7 @@ fn nulls_not_distinct_engines_agree() {
     let translated = Pg2Sqlite::default()
         .sql(SOURCE)
         .unwrap()
-        .translate(&Pg2SqliteOptions::default())
+        .translate(&helpers::case_fold_functions::with_functions(Pg2SqliteOptions::default()))
         .expect("translate the source")
         .into_vec();
     let mut sqlite = SqliteRunner { connection: establish_connection() };

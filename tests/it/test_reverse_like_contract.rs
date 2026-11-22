@@ -113,7 +113,9 @@ fn an_ilike_only_script_carries_the_pragma() {
     let statements = Pg2Sqlite::default()
         .sql(&format!("{SCHEMA}\nSELECT s FROM t WHERE s ILIKE 'a%';"))
         .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
+        .translate_to_sql(&crate::helpers::case_fold_functions::with_ascii_builtins(
+            Pg2SqliteOptions::default(),
+        ))
         .expect("translate")
         .into_vec();
     assert!(statements.iter().any(|s| s.contains("case_sensitive_like")), "{statements:?}");

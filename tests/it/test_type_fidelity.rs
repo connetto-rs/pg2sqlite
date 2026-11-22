@@ -288,11 +288,11 @@ fn bytea_odd_nibble_hex_literal_is_refused() {
 
 #[test]
 fn bytea_hex_value_is_accessible_after_insert() {
-    // The stored bytes must be retrievable; lower(hex(col)) reads them back.
+    // The stored bytes must be retrievable; encode(col, 'hex') reads them back.
     let rows = query_rows(
         "CREATE TABLE t (col bytea);
          INSERT INTO t VALUES ('\\x414243');
-         SELECT lower(hex(col)) FROM t;",
+         SELECT encode(col, 'hex') FROM t;",
         &default_opts(),
     );
     assert_eq!(rows, vec![Some("414243".to_string())]);
@@ -1762,7 +1762,7 @@ fn bytea_multi_row_values_later_row_is_converted() {
     let rows = query_rows(
         "CREATE TABLE t (id INTEGER, b bytea);
          INSERT INTO t VALUES (1, NULL), (2, '\\x414243');
-         SELECT lower(hex(b)) FROM t WHERE id = 2;",
+         SELECT encode(b, 'hex') FROM t WHERE id = 2;",
         &default_opts(),
     );
     assert_eq!(rows, vec![Some("414243".to_string())]);

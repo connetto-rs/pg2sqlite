@@ -14,7 +14,8 @@ use pg2sqlite::prelude::Pg2SqliteOptions;
 use crate::helpers;
 
 fn options() -> Pg2SqliteOptions {
-    Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit".to_string())
+    helpers::case_fold_functions::with_ascii_builtins(Pg2SqliteOptions::default())
+        .with_rls_audit_table_name("rls_audit".to_string())
 }
 /// Seeds the backing table with triggers disabled, mirroring the
 /// authoritative-apply contract (system loads run with triggers off so the

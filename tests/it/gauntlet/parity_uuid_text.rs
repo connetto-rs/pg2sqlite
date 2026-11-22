@@ -43,7 +43,8 @@ const PROBES: [&str; 14] = [
 ];
 
 fn options() -> Pg2SqliteOptions {
-    Pg2SqliteOptions::default().with_uuid_representation(UuidRepresentation::Blob)
+    crate::helpers::case_fold_functions::with_functions(Pg2SqliteOptions::default())
+        .with_uuid_representation(UuidRepresentation::Blob)
 }
 
 /// Translates `source` and applies every statement, answering the error of the

@@ -9,6 +9,7 @@ use sqlparser::ast::{
 
 use super::{
     array::{self, ArrayFunction},
+    case_fold,
     helpers::{Forward, translate_window_type},
     json_value::{json_argument, json_key, json_value},
     postgis,
@@ -203,6 +204,8 @@ enum FunctionTranslation {
     IsFinite,
     /// The local clock of now, answered from the request's zone.
     LocalClock { which: crate::impls::zone_clock::LocalClock },
+    /// `lower` and `upper`, which fold by the text's collation.
+    CaseFold(case_fold::Case),
 }
 
 /// Simple name-only renames: `(pg_name, sqlite_name)`.
@@ -837,6 +840,8 @@ fn translate_catalog_function(
     // greatest / least ignore NULLs, MAX / MIN do not.
     "greatest" => FunctionTranslation::Extremum { greatest: true },
     "least" => FunctionTranslation::Extremum { greatest: false },
+    "lower" => FunctionTranslation::CaseFold(case_fold::Case::Lower),
+    "upper" => FunctionTranslation::CaseFold(case_fold::Case::Upper),
     // ascii agrees with unicode everywhere but the empty string, where
     // PostgreSQL answers 0 and unicode answers NULL.
     "ascii" => FunctionTranslation::AsciiCodePoint,
@@ -1301,6 +1306,9 @@ fn declares_function_by_option(name: &str, options: &Pg2SqliteOptions) -> bool {
             .get_time_zone_functions()
             .is_some_and(|functions| matches(&functions.local_clock) || matches(&functions.instant))
         || options.get_session_variables().iter().any(|m| matches(&m.sqlite_function))
+        || options
+            .get_case_fold_functions()
+            .is_some_and(|functions| matches(&functions.lower) || matches(&functions.upper))
 }
 
 /// True when `expr` already carries JSON, so `to_json` has nothing to convert.
@@ -2713,6 +2721,16 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                 }
                 Ok(crate::impls::idioms::ascii_code_point(
                     exprs[0].translate_with_warnings(schema, options, emit)?,
+                ))
+            }
+            FunctionTranslation::CaseFold(case) => {
+                let exprs = extract_exactly(&func.args, 1, &func.name.to_string())?;
+                reject_over_on_scalar(&func)?;
+                let function = case_fold::fold_function(case, &func, &exprs, schema, options)?;
+                Ok(simple_function_expr(
+                    function,
+                    vec![exprs[0].translate_with_warnings(schema, options, emit)?],
+                    None,
                 ))
             }
             FunctionTranslation::NumericCeil => {

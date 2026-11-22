@@ -19,7 +19,9 @@ fn translate(pg: &str) -> Vec<String> {
     Pg2Sqlite::default()
         .sql(pg)
         .expect("parses")
-        .translate_to_sql(&Pg2SqliteOptions::default())
+        .translate_to_sql(&crate::helpers::case_fold_functions::with_ascii_builtins(
+            Pg2SqliteOptions::default(),
+        ))
         .expect("translates")
         .into_vec()
 }

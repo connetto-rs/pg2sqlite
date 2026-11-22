@@ -80,8 +80,10 @@ fn mapped(options: Pg2SqliteOptions) -> Pg2SqliteOptions {
 
 /// Options storing UUIDs as blobs, which the table's `id` needs.
 fn base() -> Pg2SqliteOptions {
-    crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default())
-        .with_uuid_representation(UuidRepresentation::Blob)
+    crate::helpers::case_fold_functions::with_functions(
+        crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
+    )
+    .with_uuid_representation(UuidRepresentation::Blob)
 }
 
 fn options() -> Pg2SqliteOptions {

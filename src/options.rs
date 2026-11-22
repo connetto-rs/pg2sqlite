@@ -23,8 +23,8 @@ use crate::{
         },
     },
     traits::{
-        ArrayRepresentation, JsonbFunctions, SessionVariableMapping, TimeZoneFunctions,
-        UuidRepresentation,
+        ArrayRepresentation, CaseFoldFunctions, JsonbFunctions, SessionVariableMapping,
+        TimeZoneFunctions, UuidRepresentation,
     },
 };
 
@@ -87,6 +87,10 @@ pub struct Pg2SqliteOptions {
     /// read as text and compare `jsonb`. `None` refuses what needs any of
     /// them. Set via `with_jsonb_functions`.
     jsonb_functions: Option<JsonbFunctions>,
+    /// The host-registered SQLite functions that fold case as the server
+    /// does. `None` refuses a fold SQLite's own `lower` and `upper` cannot
+    /// answer. Set via `with_case_fold_functions`.
+    case_fold_functions: Option<CaseFoldFunctions>,
     /// Names of host-registered functions the destination SQLite provides,
     /// stored lower-cased because SQLite resolves function names without
     /// regard to case. A name here passes through instead of being refused as
@@ -123,11 +127,6 @@ pub struct Pg2SqliteOptions {
     /// Whether the destination SQLite is declared to provide the math
     /// functions, which ship only under `SQLITE_ENABLE_MATH_FUNCTIONS`.
     math_functions_available: bool,
-    /// The name of the SQLite UDF to use for ILIKE case folding. When Some,
-    /// both sides of an ILIKE expression are wrapped in this function rather
-    /// than `lower()`. This enables Unicode-aware case folding for non-ASCII
-    /// patterns. Set via `with_ilike_fold_function`.
-    ilike_fold_function: Option<String>,
     /// Tables placed in an attached database. Set via `with_attached_tables`.
     attached_tables: Option<AttachedTables>,
     /// Whether the triggers that write rows and the foreign keys that change
@@ -152,6 +151,7 @@ impl<'a> arbitrary::Arbitrary<'a> for Pg2SqliteOptions {
             uuid_text_to_blob_function_name: Option::<String>::arbitrary(u)?,
             time_zone_functions: Option::<TimeZoneFunctions>::arbitrary(u)?,
             jsonb_functions: Option::<JsonbFunctions>::arbitrary(u)?,
+            case_fold_functions: Option::<CaseFoldFunctions>::arbitrary(u)?,
             array_representation: Option::<ArrayRepresentation>::arbitrary(u)?,
             rls_table_suffix: String::arbitrary(u)?,
             readonly_deny_trigger_suffix: String::arbitrary(u)?,
@@ -166,7 +166,6 @@ impl<'a> arbitrary::Arbitrary<'a> for Pg2SqliteOptions {
             sqlitegis_enabled: bool::arbitrary(u)?,
             math_functions_available: bool::arbitrary(u)?,
             user_defined_functions: Vec::<String>::arbitrary(u)?,
-            ilike_fold_function: Option::<String>::arbitrary(u)?,
             attached_tables: Option::<AttachedTables>::arbitrary(u)?,
             server_derived_writes_omitted: bool::arbitrary(u)?,
             stored_text_checks_omitted: bool::arbitrary(u)?,
@@ -184,6 +183,7 @@ impl Default for Pg2SqliteOptions {
             uuid_text_to_blob_function_name: None,
             time_zone_functions: None,
             jsonb_functions: None,
+            case_fold_functions: None,
             array_representation: None,
             rls_table_suffix: "_rls".to_string(),
             readonly_deny_trigger_suffix: "__readonly".to_string(),
@@ -198,7 +198,6 @@ impl Default for Pg2SqliteOptions {
             sqlitegis_enabled: false,
             math_functions_available: false,
             user_defined_functions: Vec::new(),
-            ilike_fold_function: None,
             attached_tables: None,
             server_derived_writes_omitted: false,
             stored_text_checks_omitted: false,
@@ -1241,6 +1240,27 @@ impl Pg2SqliteOptions {
     }
 
     #[must_use]
+    /// Names the SQLite functions the replica registers to fold case as the
+    /// server does.
+    ///
+    /// A `lower` or `upper` call, an `ILIKE`, and a policy reading a setting
+    /// through `lower`, over anything but ASCII text or a text collated `C`
+    /// or `POSIX`, folds by the server's `LC_CTYPE`, which SQLite's own
+    /// `lower` and `upper` answer only for ASCII letters. Each such fold calls
+    /// these functions, and is refused without them. [`CaseFoldFunctions`]
+    /// states what each one answers.
+    pub fn with_case_fold_functions(mut self, functions: CaseFoldFunctions) -> Self {
+        self.case_fold_functions = Some(functions);
+        self
+    }
+
+    #[must_use]
+    /// Returns the configured case fold functions.
+    pub fn get_case_fold_functions(&self) -> Option<&CaseFoldFunctions> {
+        self.case_fold_functions.as_ref()
+    }
+
+    #[must_use]
     /// Names the SQLite functions and collation the replica registers for
     /// `jsonb`.
     ///
@@ -1490,19 +1510,6 @@ impl Pg2SqliteOptions {
     pub fn declares_user_defined_function(&self, name: &str) -> bool {
         let name = name.to_ascii_lowercase();
         self.user_defined_functions.contains(&name)
-    }
-
-    #[must_use]
-    /// Sets the Unicode aware case folding function used for ILIKE.
-    pub fn with_ilike_fold_function(mut self, name: impl Into<String>) -> Self {
-        self.ilike_fold_function = Some(name.into());
-        self
-    }
-
-    #[must_use]
-    /// Returns the configured ILIKE case folding function name.
-    pub fn get_ilike_fold_function(&self) -> Option<&str> {
-        self.ilike_fold_function.as_deref()
     }
 
     #[must_use]

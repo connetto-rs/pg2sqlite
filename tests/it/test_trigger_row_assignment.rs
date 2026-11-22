@@ -36,7 +36,9 @@ fn write_and_read(columns: &str, body: &str, values: &str, column: &str) -> Opti
              INSERT INTO t VALUES {values};
              SELECT {column} FROM t;"
         )),
-        &crate::helpers::deployment::utc_request(),
+        &crate::helpers::case_fold_functions::with_ascii_builtins(
+            crate::helpers::deployment::utc_request(),
+        ),
     )
     .into_iter()
     .next()
@@ -154,7 +156,7 @@ fn a_row_assignment_on_the_update_branch_is_translated() {
          INSERT INTO t VALUES (1, 0, 'abc');
          UPDATE t SET n = 1 WHERE id = 1;
          SELECT txt FROM t;",
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::case_fold_functions::with_ascii_builtins(Pg2SqliteOptions::default()),
     );
     assert_eq!(rows, vec![Some("y".to_string())], "ILIKE must be translated on the update branch");
 }

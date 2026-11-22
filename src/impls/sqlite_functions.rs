@@ -588,9 +588,16 @@ mod tests {
                        ts TIMESTAMP, payload JSONB);";
 
     fn options() -> Pg2SqliteOptions {
-        Pg2SqliteOptions::default().with_math_functions_available().with_jsonb_functions(
-            crate::prelude::JsonbFunctions::new("pg_jsonb", "pg_jsonb_text", "pg_jsonb_order"),
-        )
+        Pg2SqliteOptions::default()
+            .with_math_functions_available()
+            .with_jsonb_functions(crate::prelude::JsonbFunctions::new(
+                "pg_jsonb",
+                "pg_jsonb_text",
+                "pg_jsonb_order",
+            ))
+            .with_case_fold_functions(crate::prelude::CaseFoldFunctions::new(
+                "pg_lower", "pg_upper",
+            ))
     }
 
     fn schema() -> ParserDB {

@@ -100,7 +100,8 @@ fn sqlite_names(connection: &mut SqliteConnection) -> Vec<String> {
 }
 
 fn options() -> Pg2SqliteOptions {
-    Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit")
+    helpers::case_fold_functions::with_functions(Pg2SqliteOptions::default())
+        .with_rls_audit_table_name("rls_audit")
 }
 
 fn has_companion(connection: &mut SqliteConnection) -> bool {
