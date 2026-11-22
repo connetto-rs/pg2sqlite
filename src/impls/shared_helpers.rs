@@ -4935,13 +4935,10 @@ pub(crate) fn translate_set_expr_shared<D: TranslationDirection>(
             SetExpr::Select(Box::new(translate_select_shared::<D>(select, schema, options, emit)?))
         }
         SetExpr::Select(select) => {
-            // A SELECT's own FROM is what its column references resolve
-            // against, and each arm of a set operation has its own, so the
-            // scope is attached here rather than at the query around it.
-            let scope_query = crate::impls::query_builder::make_query(
-                D::cte_clause(options).cloned(),
-                SetExpr::Select(select.clone()),
-            );
+            // Each SELECT resolves against its own FROM, so nested subqueries
+            // stay uncopied.
+            let mut scope_query = relations_scope_query(select.from.clone());
+            scope_query.with = D::cte_clause(options).cloned();
             let scope_substitute = scope_query_for(&scope_query);
             let scope = sql_traits::structs::ColumnScope::from_query(
                 scope_substitute.as_ref().unwrap_or(&scope_query),
