@@ -22,8 +22,9 @@ use crate::{
         privileges::RoleTable,
         shared_helpers::{
             ColumnReferences, ColumnRewrites, carries_default_keyword, declares_always_identity,
-            extract_columns_from_expr, is_default_keyword, substituted_assignment_default,
-            translate_conflict_predicate, translate_on_conflict_do_update, translate_returning,
+            extract_columns_from_expr, is_default_keyword, is_generated_expression_column,
+            substituted_assignment_default, translate_conflict_predicate,
+            translate_on_conflict_do_update, translate_returning, without_generated_defaults,
         },
         translator_impls::rls,
     },
@@ -140,6 +141,7 @@ impl crate::traits::translator::TranslatorWithContext for Insert {
         reject_explicit_identity_values(self, schema)?;
         let mut prepared = self.clone();
         name_implied_columns(&mut prepared, schema, options)?;
+        drop_generated_defaults(&mut prepared, schema)?;
         substitute_default_values(&mut prepared, schema, options, emit)?;
         assign_insert_values(&mut prepared, schema, options)?;
 
@@ -240,6 +242,88 @@ fn name_implied_columns(
             .take(width)
             .map(|column| ObjectName::from(vec![declared_column_ident(column)]))
             .collect();
+    }
+    Ok(())
+}
+
+/// Leaves out of a `VALUES` insert each generated column every row writes
+/// `DEFAULT` into, naming the columns that remain.
+///
+/// PostgreSQL takes only `DEFAULT` for a generated column and computes it from
+/// its expression, where SQLite refuses a value written for one and leaves it
+/// out of the columns an insert without a list fills. A generated column some
+/// row writes a value into stays, for SQLite to refuse as PostgreSQL does. A
+/// single row left with no column inserts its defaults alone.
+///
+/// # Errors
+///
+/// Returns an error when the schema cannot list the table's columns, or when
+/// several rows are left with no column, which SQLite has no spelling for.
+fn drop_generated_defaults(
+    insert: &mut Insert,
+    schema: &ParserDB,
+) -> Result<(), crate::errors::Error> {
+    if !carries_default(insert) {
+        return Ok(());
+    }
+    let TableObject::TableName(table_name) = &insert.table else { return Ok(()) };
+    let Some(table) = resolve_translation_table(schema, table_name)? else { return Ok(()) };
+    let Some(SetExpr::Values(values)) = insert.source.as_deref().map(|source| source.body.as_ref())
+    else {
+        return Ok(());
+    };
+    let columns: Vec<ObjectName> = if insert.columns.is_empty() {
+        table
+            .columns(schema)?
+            .map(|column| ObjectName::from(vec![declared_column_ident(column)]))
+            .collect()
+    } else {
+        insert.columns.clone()
+    };
+    let mut dropped = Vec::new();
+    for (index, column) in columns.iter().enumerate() {
+        if values.rows.iter().all(|row| row.content.get(index).is_some_and(is_default_keyword))
+            && is_generated_expression_column(column, table, schema)?
+        {
+            dropped.push(index);
+        }
+    }
+    if dropped.is_empty() {
+        return Ok(());
+    }
+
+    if dropped.len() == columns.len() {
+        if values.rows.len() > 1 || insert.on.is_some() {
+            return Err(crate::errors::Error::forward_refusal(format!(
+                "this INSERT INTO {table_name} writes DEFAULT into generated columns alone, which \
+                 SQLite refuses a value for, and SQLite inserts a row of defaults only as DEFAULT \
+                 VALUES, one row per statement and without an ON CONFLICT clause. Write one \
+                 INSERT INTO {table_name} DEFAULT VALUES per row."
+            )));
+        }
+        insert.columns.clear();
+        insert.source = None;
+        return Ok(());
+    }
+
+    let keep = |index: &usize| dropped.binary_search(index).is_err();
+    insert.columns = columns
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, column)| keep(&index).then_some(column))
+        .collect();
+    let Some(SetExpr::Values(values)) =
+        insert.source.as_deref_mut().map(|source| source.body.as_mut())
+    else {
+        return Ok(());
+    };
+    for row in &mut values.rows {
+        let mut index = 0;
+        row.content.retain(|_| {
+            let kept = keep(&index);
+            index += 1;
+            kept
+        });
     }
     Ok(())
 }
@@ -589,8 +673,7 @@ fn substitute_do_update_defaults(
     };
     let table = target.required(|| unknown_default_table(table_name))?;
 
-    let assignments = do_update
-        .assignments
+    let assignments = without_generated_defaults(&do_update.assignments, table, schema)?
         .iter()
         .map(|a| {
             let substituted =
