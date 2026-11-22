@@ -221,14 +221,14 @@ const LOGGING_FUNCTIONS: &str = "
     $$ LANGUAGE plpgsql;
 ";
 
-/// A SQLite trigger cannot tell which columns an UPDATE named, so one merged
-/// trigger cannot keep two different UPDATE OF lists.
+/// SQLite fires BEFORE triggers in no documented order, so a BEFORE slot cannot
+/// record which UPDATE OF lists an UPDATE named ahead of its merged trigger.
 #[test]
-fn shared_update_triggers_with_different_columns_refused() {
+fn shared_before_update_triggers_with_different_columns_refused() {
     let message = refusal(&format!(
         "{LOGGING_FUNCTIONS}
-         CREATE TRIGGER t_one AFTER UPDATE OF a ON t FOR EACH ROW EXECUTE FUNCTION log_one();
-         CREATE TRIGGER t_two AFTER UPDATE OF b ON t FOR EACH ROW EXECUTE FUNCTION log_two();"
+         CREATE TRIGGER t_one BEFORE UPDATE OF a ON t FOR EACH ROW EXECUTE FUNCTION log_one();
+         CREATE TRIGGER t_two BEFORE UPDATE OF b ON t FOR EACH ROW EXECUTE FUNCTION log_two();"
     ));
     assert!(message.contains("UPDATE OF"), "got: {message}");
 }

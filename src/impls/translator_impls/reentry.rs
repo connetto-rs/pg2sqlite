@@ -6,12 +6,11 @@
 //! under `recursive_triggers = ON` that `UPDATE` fires the table's `UPDATE`
 //! triggers again. The body holds the row's `rowid` in its table's marker
 //! table for the duration of the `UPDATE`, with the event the body runs
-//! after, and each `UPDATE` maintenance trigger fires only on a row its
-//! table's marker table does not hold. PostgreSQL fires no `UPDATE` trigger
-//! for an `INSERT`, so every other `BEFORE` or `AFTER UPDATE` trigger skips a
-//! row the `INSERT` body holds. Those triggers name the marker table whether
-//! or not the table has a maintenance trigger yet, so one created later
-//! needs none of them translated again.
+//! after, and every `BEFORE` or `AFTER UPDATE` trigger fires only on a row
+//! the marker table does not hold, since PostgreSQL fires no trigger for
+//! what a `BEFORE` trigger assigns. Those triggers name the marker table
+//! whether or not the table has a maintenance trigger yet, so one created
+//! later needs none of them translated again.
 //!
 //! The row-security guard on the table's `UPDATE` reads the marker too.
 //! PostgreSQL holds the row a `BEFORE INSERT` trigger returns to the `INSERT`
@@ -40,6 +39,10 @@
 //! past the view, and not to a plain insert. The view marks right before its
 //! forwarding insert, whose `BEFORE INSERT` guard clears the mark, so a write
 //! a trigger of the forwarded row makes is held to the policies again.
+//!
+//! The named table keeps per-row records a framed `AFTER UPDATE` trigger of
+//! [`trigger_slots`](super::trigger_slots) reads, cleared by a `BEFORE
+//! UPDATE` trigger skipping the row since no frame will claim them.
 
 use alloc::collections::BTreeSet;
 use core::ops::ControlFlow;
@@ -73,8 +76,21 @@ const SUFFIX: &str = "_pg2sqlite_reentries";
 /// forwarding insert.
 const FORWARD_SUFFIX: &str = "_pg2sqlite_forwards";
 
+/// What a table's name takes on to name its named table.
+const NAMED_SUFFIX: &str = "_pg2sqlite_named";
+
+/// The named table's column holding what a record is about.
+pub(crate) const MEMBER: &str = "member";
+
+/// The named table's column holding a recorded value.
+pub(crate) const VALUE: &str = "value";
+
+/// The named table's column holding the `id` of the frame that claimed the
+/// record, `NULL` until one does.
+pub(crate) const FRAME: &str = "frame";
+
 /// The marker table's column holding the `rowid` of the row being written.
-const ROW: &str = "row_id";
+pub(crate) const ROW: &str = "row_id";
 
 /// The marker table's column holding the event the body runs after.
 const EVENT: &str = "event";
@@ -124,8 +140,26 @@ pub(crate) fn marker_table(table: &ObjectName) -> ObjectName {
     append_suffix(&ObjectName(table.0.last().cloned().into_iter().collect()), SUFFIX)
 }
 
+/// The named table of `table`, which SQLite names without a schema.
+pub(crate) fn named_table(table: &ObjectName) -> ObjectName {
+    append_suffix(&ObjectName(table.0.last().cloned().into_iter().collect()), NAMED_SUFFIX)
+}
+
+/// Deletes the records of the row a `BEFORE UPDATE` trigger skips that no
+/// frame claimed, from `named`.
+pub(crate) fn clear_unclaimed(named: &ObjectName) -> Statement {
+    ast_builder::delete(
+        named.clone(),
+        Some(Expr::BinaryOp {
+            left: Box::new(marks_row("NEW")),
+            op: BinaryOperator::And,
+            right: Box::new(Expr::IsNull(Box::new(Expr::Identifier(Ident::new(FRAME))))),
+        }),
+    )
+}
+
 /// `row_id = NEW.rowid`, selecting the marker of the row being written.
-fn marks_row(row: &str) -> Expr {
+pub(crate) fn marks_row(row: &str) -> Expr {
     Expr::BinaryOp {
         left: Box::new(Expr::Identifier(Ident::new(ROW))),
         op: BinaryOperator::Eq,
@@ -223,9 +257,11 @@ fn stripped<'m>(marker: &'m ObjectName, suffix: &str) -> Option<&'m str> {
 }
 
 /// The name of the table `marker` belongs to, when `marker` names a marker
-/// table of either kind.
+/// table of any kind.
 pub(crate) fn marked_table(marker: &ObjectName) -> Option<&str> {
-    stripped(marker, SUFFIX).or_else(|| stripped(marker, FORWARD_SUFFIX))
+    stripped(marker, SUFFIX)
+        .or_else(|| stripped(marker, FORWARD_SUFFIX))
+        .or_else(|| stripped(marker, NAMED_SUFFIX))
 }
 
 /// Whether `name` names a marker table.
@@ -251,9 +287,10 @@ pub(crate) struct MarkerTables {
 }
 
 impl MarkerTables {
-    /// The marker tables of the maintenance triggers `initial` holds, and,
-    /// under `strict` validation, of the views over its tables with
-    /// row-level security.
+    /// The marker tables of the maintenance triggers `initial` holds, the
+    /// named tables of the tables whose `UPDATE` triggers may read one, and,
+    /// under `strict` validation, the forwarding markers of the views over
+    /// its tables with row-level security.
     ///
     /// # Errors
     ///
@@ -264,6 +301,7 @@ impl MarkerTables {
         for trigger in schema.triggers() {
             if reads_marker(trigger, schema)? {
                 tables.inherited.insert(table_key(&marker_table(&trigger.table_name)));
+                tables.inherited.insert(table_key(&named_table(&trigger.table_name)));
             }
         }
         if strict {
@@ -350,13 +388,13 @@ impl MarkerTables {
 }
 
 /// The marker tables `table` may have, of each kind.
-fn markers_of(table: &ObjectName) -> [ObjectName; 2] {
-    [marker_table(table), forward_marker_table(table)]
+fn markers_of(table: &ObjectName) -> [ObjectName; 3] {
+    [marker_table(table), forward_marker_table(table), named_table(table)]
 }
 
 /// Whether the translation of `trigger` names its table's marker table, as a
-/// maintenance trigger or as a `BEFORE` or `AFTER UPDATE` trigger skipping the
-/// write of an `INSERT` maintenance body.
+/// maintenance trigger or as a `BEFORE` or `AFTER UPDATE` trigger skipping a
+/// maintenance body's write.
 fn reads_marker(trigger: &CreateTrigger, schema: &ParserDB) -> Result<bool, Error> {
     Ok(matches!(trigger.period, Some(TriggerPeriod::Before | TriggerPeriod::After))
         && trigger.events.iter().any(|event| matches!(event, TriggerEvent::Update(_)))
@@ -365,11 +403,28 @@ fn reads_marker(trigger: &CreateTrigger, schema: &ParserDB) -> Result<bool, Erro
 
 /// `CREATE TABLE IF NOT EXISTS <marker> (id INTEGER PRIMARY KEY, row_id
 /// INTEGER NOT NULL, event TEXT NOT NULL CHECK (event IN ('INSERT',
-/// 'UPDATE'))) STRICT`, or `CREATE TABLE IF NOT EXISTS <marker> (id INTEGER
-/// PRIMARY KEY) STRICT` for a forwarding marker.
+/// 'UPDATE'))) STRICT`, `CREATE TABLE IF NOT EXISTS <marker> (id INTEGER
+/// PRIMARY KEY) STRICT` for a forwarding marker, and `CREATE TABLE IF NOT
+/// EXISTS <named> (id INTEGER PRIMARY KEY, row_id INTEGER NOT NULL, member
+/// TEXT NOT NULL, value ANY, frame INTEGER) STRICT` for a named table.
 fn create(marker: ObjectName) -> Statement {
     let columns = if stripped(&marker, FORWARD_SUFFIX).is_some() {
         vec![super::rls::generated_key_column()]
+    } else if stripped(&marker, NAMED_SUFFIX).is_some() {
+        vec![
+            super::rls::generated_key_column(),
+            super::rls::generated_table_column(ROW, DataType::Integer(None), true),
+            super::rls::generated_table_column(MEMBER, DataType::Text, true),
+            super::rls::generated_table_column(
+                VALUE,
+                DataType::Custom(
+                    ObjectName(vec![ObjectNamePart::Identifier(Ident::new("ANY"))]),
+                    Vec::new(),
+                ),
+                false,
+            ),
+            super::rls::generated_table_column(FRAME, DataType::Integer(None), false),
+        ]
     } else {
         vec![
             super::rls::generated_key_column(),

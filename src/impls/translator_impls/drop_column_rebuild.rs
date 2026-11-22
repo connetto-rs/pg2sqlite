@@ -145,11 +145,16 @@ impl LiveAttachments {
             if owner.is_some_and(|owner| owner != table) {
                 continue;
             }
-            let names: Vec<String> = if slots.holds(trigger) {
+            let mut names: Vec<String> = if slots.holds(trigger) {
                 slots.names_of(trigger).map(fold).collect()
             } else {
                 vec![trigger.name().to_ascii_lowercase()]
             };
+            for name in slots.frame_names_of(trigger).map(fold) {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
             for name in names {
                 match self.entries.iter_mut().find(|entry| entry.trigger && entry.name == name) {
                     // Triggers sharing a slot are merged into one SQLite
