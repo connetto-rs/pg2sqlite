@@ -124,22 +124,33 @@ pub enum ParityError {
 /// The options a case translates its replica under before choosing its acting
 /// role: the case's deployment, UUIDs stored as blobs and minted by `uuidv4`,
 /// the `rls_audit` table, `connetto_write_exempt` exempting the seed, the
-/// `jsonb` functions, and `app.user_id` and `app.subjects` answered by
-/// `current_app_user` and `current_app_subjects`.
+/// `jsonb` functions, and every setting the deployment declares answered by
+/// `case_setting_N`, `N` counting the declarations from zero.
 ///
 /// # Errors
 ///
 /// Returns [`ParityError::Deployment`] when the case declares no caller.
 pub fn case_options(case: &Case) -> Result<Pg2SqliteOptions, ParityError> {
-    Ok(Pg2SqliteOptions::default()
-        .with_deployment(case.config.deployment()?)
-        .with_uuid_representation(UuidRepresentation::Blob)
-        .with_uuid_function_name("uuidv4")
-        .with_rls_audit_table_name("rls_audit".to_owned())
-        .with_write_exemption_function("connetto_write_exempt")
-        .with_jsonb_functions(JsonbFunctions::new("jsonb_canonical", "jsonb_text", "jsonb_order"))
-        .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
-        .with_session_variable(SessionVariableMapping::new("app.subjects", "current_app_subjects")))
+    let deployment = case.config.deployment()?;
+    let options = deployment.settings().iter().enumerate().fold(
+        Pg2SqliteOptions::default()
+            .with_uuid_representation(UuidRepresentation::Blob)
+            .with_uuid_function_name("uuidv4")
+            .with_rls_audit_table_name("rls_audit".to_owned())
+            .with_write_exemption_function("connetto_write_exempt")
+            .with_jsonb_functions(JsonbFunctions::new(
+                "jsonb_canonical",
+                "jsonb_text",
+                "jsonb_order",
+            )),
+        |options, (index, setting)| {
+            options.with_session_variable(SessionVariableMapping::new(
+                setting.name(),
+                format!("case_setting_{index}"),
+            ))
+        },
+    );
+    Ok(options.with_deployment(deployment))
 }
 
 /// Answer every probe on the replica of its caller's acting role, `owner`
@@ -679,8 +690,8 @@ mod tests {
 
     #[diesel::declare_sql_function]
     extern "SQL" {
-        fn current_app_user() -> Nullable<Text>;
-        fn current_app_subjects() -> Nullable<Text>;
+        fn case_setting_0() -> Nullable<Text>;
+        fn case_setting_1() -> Nullable<Text>;
         fn connetto_write_exempt() -> Bool;
         fn uuidv4() -> Binary;
     }
@@ -713,13 +724,10 @@ mod tests {
                 replica.run(table, index, &select),
                 Ok(Measured::Read(keys)) if !keys.is_empty()
             ));
-            let actual = diesel::select((
-                current_app_user(),
-                current_app_subjects(),
-                connetto_write_exempt(),
-            ))
-            .get_result::<(Option<String>, Option<String>, bool)>(&mut replica.connection)
-            .expect("the session functions answer");
+            let actual =
+                diesel::select((case_setting_0(), case_setting_1(), connetto_write_exempt()))
+                    .get_result::<(Option<String>, Option<String>, bool)>(&mut replica.connection)
+                    .expect("the session functions answer");
             assert_eq!(
                 actual,
                 (
@@ -781,6 +789,127 @@ mod tests {
             refused_write("Unsupported SQLite feature: write-only column".into()),
             Measured::Refused(reason) if reason == "Unsupported SQLite feature: write-only column"
         ));
+    }
+
+    /// The caller and row of every row the case's callers see on its one
+    /// table, three rows keyed 1 to 3, the replica refusing no acting role.
+    fn visible_rows(case: &Case) -> Vec<(String, String)> {
+        let table = &case.config.tables[0];
+        let statement = table.statement(Shape::Select);
+        let rows: Vec<String> = (1..=3).map(|key| format!("{}:{key}", table.name)).collect();
+        let probes: Vec<Probe<'_>> = case
+            .config
+            .callers
+            .iter()
+            .flat_map(|caller| {
+                rows.iter().map(|row| Probe { caller: &caller.name, row, statement: &statement })
+            })
+            .collect();
+        let owner = case_options(case).expect("the case has a deployment");
+        let replay = replay(case, &owner, &probes).expect("replays");
+        assert_eq!(replay.refusal, None);
+        replay
+            .answers
+            .into_iter()
+            .filter(|answer| answer.answer == Answer::Visible)
+            .map(|answer| (answer.caller, answer.row))
+            .collect()
+    }
+
+    /// Every setting the case declares is answered in its declared type, so
+    /// a `uuid` setting beside the text caller matches a blob-stored `uuid`
+    /// column and each caller sees the rows PostgreSQL shows it.
+    #[test]
+    fn every_declared_setting_is_answered() {
+        let case = Case::parse(
+            "uuid_setting_beside_text_caller",
+            "CREATE ROLE r0 NOLOGIN;
+             CREATE ROLE r1 NOLOGIN;
+             CREATE TABLE t0 (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, c0 UUID);
+             ALTER TABLE t0 ENABLE ROW LEVEL SECURITY;
+             GRANT SELECT ON t0 TO r0;
+             GRANT SELECT ON t0 TO r1;
+             CREATE POLICY p0 ON t0 USING (
+                 (c0 = current_setting('app.user_uuid', true)::uuid)
+                 OR (owner = current_setting('app.user_id', true))
+             );",
+            "INSERT INTO t0 (id, owner, c0) VALUES
+                 (1, '00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002'),
+                 (2, '00000000-0000-0000-0000-000000000003', '00000000-0000-0000-0000-000000000003'),
+                 (3, '00000000-0000-0000-0000-000000000004', '00000000-0000-0000-0000-000000000001');",
+            r#"
+            [[settings]]
+            name = "app.user_id"
+            value = { caller = "text" }
+
+            [[settings]]
+            name = "app.user_uuid"
+            value = { caller = "uuid" }
+
+            [[settings]]
+            name = "app.subjects"
+            value = { set = { element = "text", packing = { delimited = "," } } }
+
+            [[tables]]
+            name = "t0"
+            key = ["id"]
+            columns = ["id", "owner", "c0"]
+
+            [[callers]]
+            name = "c0"
+            role = "r0"
+            settings = { "app.user_id" = "00000000-0000-0000-0000-000000000001", "app.user_uuid" = "00000000-0000-0000-0000-000000000001", "app.subjects" = "" }
+
+            [[callers]]
+            name = "c1"
+            role = "r1"
+            settings = { "app.user_id" = "00000000-0000-0000-0000-000000000002", "app.user_uuid" = "00000000-0000-0000-0000-000000000002", "app.subjects" = "red" }
+            "#,
+        )
+        .expect("the case reads");
+        assert_eq!(
+            visible_rows(&case),
+            [
+                ("c0".into(), "t0:1".into()),
+                ("c0".into(), "t0:3".into()),
+                ("c1".into(), "t0:1".into())
+            ]
+        );
+    }
+
+    /// A case declaring neither `app.user_id` nor `app.subjects` replays, its
+    /// one setting answered and no undeclared setting paired.
+    #[test]
+    fn a_case_without_the_default_settings_replays() {
+        let case = Case::parse(
+            "tenant_only",
+            "CREATE ROLE r0 NOLOGIN;
+             CREATE TABLE t0 (id INTEGER PRIMARY KEY, tenant TEXT NOT NULL);
+             ALTER TABLE t0 ENABLE ROW LEVEL SECURITY;
+             GRANT SELECT ON t0 TO r0;
+             CREATE POLICY p0 ON t0 USING (tenant = current_setting('app.tenant', true));",
+            "INSERT INTO t0 (id, tenant) VALUES (1, 'red'), (2, 'blue'), (3, 'red');",
+            r#"
+            [[settings]]
+            name = "app.tenant"
+            value = { scalar = "text" }
+
+            [[tables]]
+            name = "t0"
+            key = ["id"]
+            columns = ["id", "tenant"]
+
+            [[callers]]
+            name = "c0"
+            role = "r0"
+            settings = { "app.tenant" = "red" }
+            "#,
+        )
+        .expect("the case reads");
+        assert_eq!(
+            visible_rows(&case),
+            [("c0".into(), "t0:1".into()), ("c0".into(), "t0:3".into())]
+        );
     }
 
     /// A session function answers a one-value setting as the replica stores
