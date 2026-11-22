@@ -720,6 +720,11 @@ impl<'a> TranslationContext<'a> {
         fields.into_context(self.scope, self.outer)
     }
 
+    /// The rows of the row trigger being translated, if any.
+    pub(crate) const fn trigger_rows(&self) -> Option<TriggerRows<'a>> {
+        self.trigger_rows
+    }
+
     /// The whole trigger row `expr` reads, when it is a bare `NEW` or `OLD`
     /// inside a row trigger.
     pub(crate) fn trigger_row(&self, expr: &Expr) -> Option<TriggerRow<'a>> {

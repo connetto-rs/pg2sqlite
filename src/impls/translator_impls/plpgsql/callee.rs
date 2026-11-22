@@ -479,7 +479,8 @@ impl PlPgSqlTranslator {
         emit: WarningSink<'_>,
     ) -> Result<Vec<Statement>, Error> {
         let Some(value) = value else { return Ok(Vec::new()) };
-        let mut value = Self::prepare(embedded::expression(value).into_owned(), scope)?;
+        let mut value =
+            Self::prepare(embedded::expression(value).into_owned(), scope, schema, options)?;
         let mut statements = Self::inline_helper_calls(&mut value, scope, schema, options, emit)?;
         scope.bind(Binding { name: RESULT.to_string(), value: BoundValue::Expr(value) });
         // PostgreSQL computes the value where it returns, so one that may

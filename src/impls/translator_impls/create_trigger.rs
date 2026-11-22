@@ -721,6 +721,10 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
 
         let plain = !is_maintenance_trigger
             && matches!(period, Some(TriggerPeriod::Before | TriggerPeriod::After));
+        let mut condition = condition;
+        if let (Some(rows), Some(condition)) = (options.trigger_rows(), condition.as_mut()) {
+            rows.unstar(condition, &|_| None, schema)?;
+        }
         let translated_cond = condition
             .as_ref()
             .map(|cond| cond.translate_with_warnings(schema, options, emit))
