@@ -5,22 +5,22 @@
 //! authz.f('admin')))`, or reads the helper's rows where a table goes, as
 //! `(a, b) IN (SELECT * FROM authz.f('admin'))`. SQLite has no functions of
 //! its own to call, so the call is replaced by the query
-//! `FunctionLike::helper_set_with_exclusions` reads out of the helper's body,
-//! one `SELECT` per arm joined by `UNION`. Each arm reads the backing table of
-//! a table that has one, because the helper runs as an owner that this reading
-//! has checked is exempt from every policy it reads past, and the owner reads
-//! past the acting role's grants. A table on which the acting role holds no
-//! privilege is left out of the replica, so a helper reading one is refused.
+//! `FunctionLike::helper_set` reads out of the helper's body, one `SELECT` per
+//! arm joined by `UNION`. Each arm reads the backing table of a table that has
+//! one, because the helper runs as an owner that this reading has checked is
+//! exempt from every policy it reads past, and the owner reads past the acting
+//! role's grants. A table on which the acting role holds no privilege is left
+//! out of the replica, so a helper reading one is refused.
 
 use core::{convert::Infallible, ops::ControlFlow};
 
 use sql_traits::{
     errors::HelperSetError,
     structs::{
-        AntiJoin, CalledArm, CallerGate, CapOperand, ExcludedSet, GrantArm, GrantedTo, HelperArm,
-        HelperSet, ParentArm, ParserDB, RequestNormalization, Restriction, Returned, RowCap,
-        SetPacking, SettingComparison, SettingContent, SettingValue, TimeBound, TimeComparison,
-        WalkArm, WalkDirection,
+        AntiJoin, ArmCondition, CalledArm, CallerGate, CapOperand, ExcludedSet, GrantArm,
+        GrantedTo, HelperArm, HelperSet, ParentArm, ParserDB, RequestNormalization, Restriction,
+        Returned, RowCap, SetPacking, SettingComparison, SettingContent, SettingValue, TimeBound,
+        TimeComparison, UnsetSetting, WalkArm, WalkDirection,
     },
     traits::{ColumnLike, DatabaseLike, FunctionLike, TableLike},
 };
@@ -63,10 +63,10 @@ use crate::{
 /// # Errors
 ///
 /// Refuses the call when no deployment is configured, when
-/// `FunctionLike::helper_set_with_exclusions` cannot answer the helper, when
-/// the helper or a set it excludes reads a table the acting role holds no
-/// privilege on, which the translation leaves out of the replica, and when
-/// the query over its tables does not translate.
+/// `FunctionLike::helper_set` cannot answer the helper, when the helper or a
+/// set it excludes reads a table the acting role holds no privilege on, which
+/// the translation leaves out of the replica, and when the query over its
+/// tables does not translate.
 pub(crate) fn helper_membership(
     subquery: &Query,
     schema: &ParserDB,
@@ -98,8 +98,7 @@ pub(crate) fn helper_membership(
 /// for the one column of `RETURNS SETOF` a scalar type, the alias's columns
 /// renaming the leading ones. A `LANGUAGE sql` helper running as its caller
 /// reads the rows of its body, as [`inlined_rows`] writes them, and any other
-/// the set `helper_set_with_exclusions` reads. `None` is as for
-/// [`helper_membership`].
+/// the set `helper_set` reads. `None` is as for [`helper_membership`].
 ///
 /// # Errors
 ///
@@ -224,8 +223,7 @@ pub(crate) fn check_lateral_calls(
     Ok(())
 }
 
-/// The refusal of a call to `name` that `helper_set_with_exclusions` cannot
-/// answer.
+/// The refusal of a call to `name` that `helper_set` cannot answer.
 fn untranslatable(name: &ObjectName, error: &HelperSetError) -> Error {
     Error::forward_refusal(format!("{name}() cannot be translated as the set it returns: {error}"))
 }
@@ -249,7 +247,14 @@ fn helper_query(
         )));
     };
     let set = arguments
-        .and_then(|arguments| helper.helper_set_with_exclusions(&arguments, deployment, schema))
+        .and_then(|arguments| {
+            helper.helper_set(
+                &arguments,
+                deployment,
+                schema,
+                &[ArmCondition::Exclusion, ArmCondition::UnsetSetting],
+            )
+        })
         .map_err(|error| untranslatable(name, &error))?;
     let mut lowering =
         Lowering { helper: name, schema, read: Vec::new(), walks: 0, called: Vec::new() };
@@ -566,6 +571,7 @@ impl<'db> Lowering<'_, 'db> {
         if let Some(gate) = grant.gate() {
             conditions.extend(self.gate(gate)?);
         }
+        conditions.extend(grant.unset_settings().iter().map(unset));
         conditions.extend(restrictions(ARM, grant.restrictions()));
         conditions.extend(time_bounds(ARM, grant.time_bounds()));
         for cap in grant.caps() {
@@ -642,13 +648,8 @@ impl<'db> Lowering<'_, 'db> {
         };
         Ok(match cap.lift() {
             Some(lift) => {
-                let read = setting_read(
-                    lift.setting().name(),
-                    lift.raises_when_unset(),
-                    lift.lifts_on_empty(),
-                );
                 Expr::Nested(Box::new(Expr::BinaryOp {
-                    left: Box::new(Expr::IsNull(Box::new(read))),
+                    left: Box::new(unset(lift)),
                     op: BinaryOperator::Or,
                     right: Box::new(capped),
                 }))
@@ -904,6 +905,15 @@ fn request(comparison: &SettingComparison<'_, ParserDB>) -> Expr {
             in_query(column, single_expr_query(cast(elements, element.clone()), Vec::new(), None))
         }
     }
+}
+
+/// `<setting> IS NULL`, read as the body reads it.
+fn unset(setting: &UnsetSetting<'_>) -> Expr {
+    Expr::IsNull(Box::new(setting_read(
+        setting.setting().name(),
+        setting.raises_when_unset(),
+        setting.reads_empty_as_unset(),
+    )))
 }
 
 /// `current_setting('<name>'[, true])`, through `NULLIF(..., '')` when
