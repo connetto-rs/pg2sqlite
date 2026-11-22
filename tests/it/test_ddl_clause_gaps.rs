@@ -244,6 +244,16 @@ fn partition_of_is_rejected() {
     assert_unrepresentable(sql);
 }
 
+/// A typed table takes its columns from a composite type, which SQLite has no
+/// counterpart for, and the refusal names that clause.
+#[test]
+fn typed_table_is_rejected() {
+    let sql = "CREATE TYPE pair AS (a INT, b INT); CREATE TABLE a OF pair;";
+    assert_unrepresentable(sql);
+    let error = translate(sql).expect_err("translation refusal");
+    assert!(error.to_string().contains("OF pair"), "{error}");
+}
+
 // ---------------------------------------------------------------------------
 // CREATE TABLE modifier leaks (R103)
 // ---------------------------------------------------------------------------

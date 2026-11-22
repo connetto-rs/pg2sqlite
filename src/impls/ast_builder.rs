@@ -190,6 +190,7 @@ pub(crate) fn blank_create_table(name: ObjectName) -> CreateTable {
         copy_grants: false,
         enable_schema_evolution: None,
         change_tracking: None,
+        of_type: None,
         data_retention_time_in_days: None,
         max_data_extension_time_in_days: None,
         default_ddl_collation: None,
