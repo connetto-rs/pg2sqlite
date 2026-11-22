@@ -101,6 +101,15 @@ impl crate::traits::translator::TranslatorWithContext for CreateTable {
             )));
         }
 
+        // A typed table takes its columns from a composite type.
+        if let Some(of_type) = &self.of_type {
+            let table_name = self.name.to_string();
+            return Err(crate::errors::Error::forward_refusal(format!(
+                "CREATE TABLE {table_name} OF {of_type} cannot be translated to SQLite. \
+                 SQLite has no typed tables. Spell out the columns of {of_type} explicitly."
+            )));
+        }
+
         // PARTITION BY declares a partitioned parent, which SQLite cannot
         // express any more than the PARTITION OF children it would carry.
         if self.partition_by.is_some() {
