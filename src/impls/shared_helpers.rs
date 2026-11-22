@@ -3234,6 +3234,106 @@ pub(crate) fn substituted_assignment_default(
     }
 }
 
+/// Whether `name` is a column of `table` computed from a generation
+/// expression.
+///
+/// # Errors
+///
+/// Returns an error when the schema cannot look the column up.
+pub(crate) fn is_generated_expression_column(
+    name: &ObjectName,
+    table: &<ParserDB as DatabaseLike>::Table,
+    schema: &ParserDB,
+) -> Result<bool, Error> {
+    let Some(column) = last_ident(name) else { return Ok(false) };
+    Ok(table
+        .column(&column.value, schema, COLUMN_LOOKUP_CASE)?
+        .is_some_and(|column| column.generation_expression().is_some()))
+}
+
+/// `assignments` without each `DEFAULT` written for a generated column of
+/// `table`, borrowed when there is none.
+///
+/// PostgreSQL accepts the keyword there and keeps computing the column from
+/// its expression, where SQLite refuses any assignment to a generated column.
+/// Leaving the assignment out keeps the column to its expression in both. A
+/// tuple assignment loses the positions such a `DEFAULT` holds.
+///
+/// # Errors
+///
+/// Returns an error when the schema cannot look a column up, or when every
+/// assignment is such a `DEFAULT`, which leaves SQLite nothing to assign.
+pub(crate) fn without_generated_defaults<'a>(
+    assignments: &'a [Assignment],
+    table: &<ParserDB as DatabaseLike>::Table,
+    schema: &ParserDB,
+) -> Result<Cow<'a, [Assignment]>, Error> {
+    let generated_default = |name: &ObjectName, value: &Expr| -> Result<bool, Error> {
+        Ok(is_default_keyword(value) && is_generated_expression_column(name, table, schema)?)
+    };
+    let mut drops_any = false;
+    for assignment in assignments {
+        drops_any = match (&assignment.target, &assignment.value) {
+            (AssignmentTarget::ColumnName(name), value) => generated_default(name, value)?,
+            (AssignmentTarget::Tuple(names), Expr::Tuple(items)) if names.len() == items.len() => {
+                let mut any = false;
+                for (name, item) in names.iter().zip(items) {
+                    any |= generated_default(name, item)?;
+                }
+                any
+            }
+            (AssignmentTarget::Tuple(_), _) => false,
+        };
+        if drops_any {
+            break;
+        }
+    }
+    if !drops_any {
+        return Ok(Cow::Borrowed(assignments));
+    }
+
+    let mut kept = Vec::with_capacity(assignments.len());
+    for assignment in assignments {
+        match (&assignment.target, &assignment.value) {
+            (AssignmentTarget::ColumnName(name), value) if generated_default(name, value)? => {}
+            (AssignmentTarget::Tuple(names), Expr::Tuple(items)) if names.len() == items.len() => {
+                let mut names_kept = Vec::with_capacity(names.len());
+                let mut items_kept = Vec::with_capacity(items.len());
+                for (name, item) in names.iter().zip(items) {
+                    if !generated_default(name, item)? {
+                        names_kept.push(name.clone());
+                        items_kept.push(item.clone());
+                    }
+                }
+                match (names_kept.pop(), items_kept.pop()) {
+                    (Some(name), Some(value)) if names_kept.is_empty() => {
+                        kept.push(Assignment { target: AssignmentTarget::ColumnName(name), value });
+                    }
+                    (Some(name), Some(value)) => {
+                        names_kept.push(name);
+                        items_kept.push(value);
+                        kept.push(Assignment {
+                            target: AssignmentTarget::Tuple(names_kept),
+                            value: Expr::Tuple(items_kept),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            _ => kept.push(assignment.clone()),
+        }
+    }
+    if kept.is_empty() {
+        return Err(Error::forward_refusal(
+            "every assignment of this UPDATE writes DEFAULT into a generated column, which \
+             PostgreSQL accepts and keeps computing from its expression, but SQLite refuses an \
+             assignment to a generated column and an UPDATE assigning nothing. Assign another \
+             column of the row to itself alongside it.",
+        ));
+    }
+    Ok(Cow::Owned(kept))
+}
+
 /// Whether the column options declare an identity column, which asks the
 /// database to supply the column's values.
 ///
@@ -4493,8 +4593,11 @@ pub(crate) fn translate_update<D: TranslationDirection>(
         (ColumnRewrites::default(), None)
     };
 
-    let assignments = update
-        .assignments
+    let written = match target_table {
+        Some(table) => without_generated_defaults(&update.assignments, table, schema)?,
+        None => Cow::Borrowed(update.assignments.as_slice()),
+    };
+    let assignments = written
         .iter()
         .map(|a| {
             if D::IS_FORWARD
