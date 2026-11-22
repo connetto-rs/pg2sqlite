@@ -256,3 +256,94 @@ fn a_record_whose_if_condition_reads_a_table_translates_when_read_before_the_wri
     );
     assert_eq!(rows, [Some("1".to_owned()), Some("3".to_owned())]);
 }
+
+/// A script whose insert trigger on `r` runs `body` with `r_log` to write,
+/// inserting one row and reading back what `r_log` holds.
+fn logged(body: &str) -> Vec<Option<String>> {
+    run_translated_with(
+        &format!(
+            r#"CREATE TABLE r (id UUID PRIMARY KEY, "Label" TEXT, n INTEGER);
+               CREATE TABLE r_log (id UUID, "Label" TEXT, n INTEGER, extra TEXT);
+               CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $$
+               DECLARE rec RECORD;
+               BEGIN
+                   {body}
+                   RETURN NULL;
+               END $$;
+               CREATE TRIGGER t AFTER INSERT ON r FOR EACH ROW EXECUTE FUNCTION f();
+               INSERT INTO r VALUES ('00010203-0405-0607-0809-0a0b0c0d0e0f', 'x', 7);
+               SELECT coalesce(id::text, 'null') || ' ' || coalesce("Label", 'null') || ' '
+                   || coalesce(n::text, 'null') || ' ' || coalesce(extra, 'none')
+               FROM r_log ORDER BY coalesce(extra, '');"#
+        ),
+        &options(),
+    )
+}
+
+/// `NEW.*` at the top of a select list or a `VALUES` row stands for each
+/// column of the row in order, as does a record holding the row.
+#[test]
+fn a_starred_row_in_a_list_is_its_columns() {
+    let rows = logged(
+        r#"INSERT INTO r_log (id, "Label", n) SELECT NEW.*;
+           INSERT INTO r_log VALUES (NEW.*, 'values');
+           INSERT INTO r_log (extra, id, "Label", n) SELECT NEW."Label", NEW.*;
+           rec := NEW;
+           INSERT INTO r_log SELECT rec.*, 'record';"#,
+    );
+    let uuid = "00010203-0405-0607-0809-0a0b0c0d0e0f";
+    assert_eq!(
+        rows,
+        [
+            Some(format!("{uuid} x 7 none")),
+            Some(format!("{uuid} x 7 record")),
+            Some(format!("{uuid} x 7 values")),
+            Some(format!("{uuid} x 7 x")),
+        ]
+    );
+}
+
+#[test]
+fn a_starred_row_the_event_does_not_have_is_a_null_per_column() {
+    let rows = logged("INSERT INTO r_log SELECT OLD.*, 'old';");
+    assert_eq!(rows, [Some("null null null old".to_owned())]);
+}
+
+/// A table's star inside the body reads the table, whatever the trigger rows.
+#[test]
+fn a_starred_table_in_the_body_reads_the_table() {
+    let rows = logged("INSERT INTO r_log SELECT r.*, 'table' FROM r;");
+    assert_eq!(rows, [Some("00010203-0405-0607-0809-0a0b0c0d0e0f x 7 table".to_owned())]);
+}
+
+/// Anywhere else `NEW.*` is the whole row, which translates where `NEW`
+/// does, in the trigger's condition too.
+#[test]
+fn a_starred_row_in_an_expression_is_the_whole_row() {
+    let rows = run_translated_with(
+        &script(
+            "UPDATE",
+            "WHEN (OLD.* IS DISTINCT FROM NEW.*)",
+            "INSERT INTO audit (body, json_body) VALUES (to_jsonb(NEW.*), row_to_json(OLD.*));",
+            "INSERT INTO r VALUES ('00010203-0405-0607-0809-0a0b0c0d0e0f', 'x', 7);
+             UPDATE r SET n = 8;
+             UPDATE r SET n = 8;
+             SELECT body::text || ' ' || json_body::text FROM audit;",
+        ),
+        &options(),
+    );
+    assert_eq!(
+        rows,
+        [Some(
+            r#"{"n": 8, "id": "00010203-0405-0607-0809-0a0b0c0d0e0f", "Label": "x"} {"id":"00010203-0405-0607-0809-0a0b0c0d0e0f","Label":"x","n":7}"#
+                .to_owned()
+        )]
+    );
+}
+
+#[test]
+fn a_starred_row_tested_for_null_is_refused_as_the_whole_row() {
+    let message =
+        refusal("INSERT", "", "INSERT INTO audit (body) SELECT NULL WHERE NEW.* IS NOT NULL;");
+    assert!(message.contains("`NEW` reads the whole row of `r`"), "{message}");
+}

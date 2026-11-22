@@ -6,13 +6,20 @@
 //! PostgreSQL, before translation: a JSON object of the row is the matching
 //! constructor over its columns, and two rows compare column by column. The
 //! rewritten expression is then translated as written, so each column converts
-//! and compares as that column read on its own does.
+//! and compares as that column read on its own does. `NEW.*` is first read as
+//! PostgreSQL reads it, its columns in a list and the whole row elsewhere.
+
+use core::ops::ControlFlow;
 
 use sql_traits::{
     structs::ParserDB,
     traits::{ColumnLike, DatabaseLike, TableLike},
 };
-use sqlparser::ast::{BinaryOperator, Expr, Ident, TriggerEvent, Value};
+use sqlparser::ast::{
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName,
+    Query, SelectItem, SelectItemQualifiedWildcardKind, SetExpr, TriggerEvent, Value, VisitMut,
+    VisitorMut, WildcardAdditionalOptions,
+};
 
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
@@ -98,6 +105,41 @@ impl<'a> TriggerRows<'a> {
         };
         Some(TriggerRow { rows: self, which, present })
     }
+
+    /// Rewrites each `NEW.*` and `OLD.*` in `node` as PostgreSQL reads it:
+    /// at the top of a select list or a `VALUES` row as the row's columns in
+    /// order, and anywhere else as the whole row. `record` names the row a
+    /// record variable holds, so `rec.*` reads it as well.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the schema cannot list the table's columns.
+    pub(crate) fn unstar<N: VisitMut>(
+        self,
+        node: &mut N,
+        record: &dyn Fn(&Ident) -> Option<Ident>,
+        schema: &ParserDB,
+    ) -> Result<(), Error> {
+        match node.visit(&mut Unstar { rows: self, record, schema }) {
+            ControlFlow::Break(error) => Err(error),
+            ControlFlow::Continue(()) => Ok(()),
+        }
+    }
+
+    /// The row `name.*` reads, with the name that reads it whole, or `None`
+    /// when `name` is neither row nor a record holding one.
+    fn starred(
+        self,
+        name: &ObjectName,
+        record: &dyn Fn(&Ident) -> Option<Ident>,
+    ) -> Option<(Ident, TriggerRow<'a>)> {
+        let [part] = name.0.as_slice() else { return None };
+        let written = part.as_ident()?;
+        let row =
+            if PseudoRow::named(written).is_some() { written.clone() } else { record(written)? };
+        let read = self.row(&Expr::Identifier(row.clone()))?;
+        Some((row, read))
+    }
 }
 
 /// One of a row trigger's two rows, read whole.
@@ -110,16 +152,42 @@ pub(crate) struct TriggerRow<'a> {
     present: bool,
 }
 
+/// `column`'s name, spelled as it was declared.
+fn declared_name(column: &<ParserDB as DatabaseLike>::Column) -> Ident {
+    if column.column_name_is_quoted() {
+        Ident::with_quote('"', column.column_name())
+    } else {
+        Ident::new(column.column_name())
+    }
+}
+
 impl TriggerRow<'_> {
     /// The reference that reads `column` from this row, spelled as the column
     /// was declared.
     fn reference(&self, column: &<ParserDB as DatabaseLike>::Column) -> Expr {
-        let name = if column.column_name_is_quoted() {
-            Ident::with_quote('"', column.column_name())
-        } else {
-            Ident::new(column.column_name())
-        };
-        Expr::CompoundIdentifier(vec![Ident::new(self.which.keyword()), name])
+        Expr::CompoundIdentifier(vec![Ident::new(self.which.keyword()), declared_name(column)])
+    }
+
+    /// Each column of the row, named as declared, beside the value it holds,
+    /// `NULL` for a row the event does not give.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the schema cannot list the table's columns.
+    fn columns(&self, schema: &ParserDB) -> Result<Vec<(Ident, Expr)>, Error> {
+        Ok(self
+            .rows
+            .table
+            .columns(schema)?
+            .map(|column| {
+                let value = if self.present {
+                    self.reference(column)
+                } else {
+                    Expr::Value(Value::Null.into())
+                };
+                (declared_name(column), value)
+            })
+            .collect())
     }
 
     /// `constructor` over every column of the row, keyed by the name
@@ -195,5 +263,111 @@ impl TriggerRow<'_> {
             keyword = self.which.keyword(),
             table = self.rows.table.table_name(),
         ))
+    }
+}
+
+/// The visitor behind [`TriggerRows::unstar`].
+struct Unstar<'r, 'a> {
+    rows: TriggerRows<'a>,
+    record: &'r dyn Fn(&Ident) -> Option<Ident>,
+    schema: &'r ParserDB,
+}
+
+impl Unstar<'_, '_> {
+    /// Expands each starred row at the top of `body`'s select lists and
+    /// `VALUES` rows into its columns.
+    fn expand(&self, body: &mut SetExpr) -> Result<(), Error> {
+        match body {
+            SetExpr::Select(select) => {
+                let mut projection = Vec::with_capacity(select.projection.len());
+                for item in core::mem::take(&mut select.projection) {
+                    let starred = match &item {
+                        SelectItem::QualifiedWildcard(
+                            SelectItemQualifiedWildcardKind::ObjectName(name),
+                            options,
+                        ) if *options == WildcardAdditionalOptions::default() => {
+                            self.rows.starred(name, self.record)
+                        }
+                        _ => None,
+                    };
+                    match starred {
+                        Some((_, row)) => {
+                            projection.extend(
+                                row.columns(self.schema)?
+                                    .into_iter()
+                                    .map(|(alias, expr)| SelectItem::ExprWithAlias { expr, alias }),
+                            );
+                        }
+                        None => projection.push(item),
+                    }
+                }
+                select.projection = projection;
+            }
+            SetExpr::Values(values) => {
+                for row in &mut values.rows {
+                    let mut expanded = Vec::with_capacity(row.content.len());
+                    for expr in core::mem::take(&mut row.content) {
+                        let starred = match &expr {
+                            Expr::QualifiedWildcard(name, _) => {
+                                self.rows.starred(name, self.record)
+                            }
+                            _ => None,
+                        };
+                        match starred {
+                            Some((_, read)) => {
+                                expanded.extend(
+                                    read.columns(self.schema)?.into_iter().map(|(_, value)| value),
+                                );
+                            }
+                            None => expanded.push(expr),
+                        }
+                    }
+                    row.content = expanded;
+                }
+            }
+            SetExpr::SetOperation { left, right, .. } => {
+                self.expand(left)?;
+                self.expand(right)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+impl VisitorMut for Unstar<'_, '_> {
+    type Break = Error;
+
+    fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
+        match self.expand(&mut query.body) {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(error) => ControlFlow::Break(error),
+        }
+    }
+
+    fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+        match expr {
+            Expr::QualifiedWildcard(name, _) => {
+                if let Some((row, _)) = self.rows.starred(name, self.record) {
+                    *expr = Expr::Identifier(row);
+                }
+            }
+            Expr::Function(function) => {
+                if let FunctionArguments::List(list) = &mut function.args {
+                    for argument in &mut list.args {
+                        let (FunctionArg::Unnamed(value)
+                        | FunctionArg::Named { arg: value, .. }
+                        | FunctionArg::ExprNamed { arg: value, .. }) = argument;
+                        if let FunctionArgExpr::QualifiedWildcard(name) = value
+                            && let Some((row, _)) = self.rows.starred(name, self.record)
+                        {
+                            *value = FunctionArgExpr::Expr(Expr::Identifier(row));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
     }
 }

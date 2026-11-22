@@ -446,7 +446,7 @@ impl PlPgSqlTranslator {
                          back with SELECT ... INTO after the write."
                     )));
                 };
-                let query = Self::prepare(query.as_ref().clone(), scope)?;
+                let query = Self::prepare(query.as_ref().clone(), scope, schema, options)?;
                 Self::translate_select_into(query, into, scope, schema, options, emit)
             }
             NodeKind::Statement { statement, into: None } => {
@@ -465,11 +465,11 @@ impl PlPgSqlTranslator {
                          effects, or SELECT ... INTO to keep its result."
                     )));
                 }
-                let statement = Self::prepare(statement.as_ref().clone(), scope)?;
+                let statement = Self::prepare(statement.as_ref().clone(), scope, schema, options)?;
                 Self::translate_statement(&statement, scope, schema, options, emit)
             }
             NodeKind::Perform { query } => {
-                let query = Self::prepare(query.as_ref().clone(), scope)?;
+                let query = Self::prepare(query.as_ref().clone(), scope, schema, options)?;
                 if let Some(inlined) = Self::perform_helper(&query, scope, schema, options, emit)? {
                     return Ok(inlined);
                 }
@@ -506,7 +506,7 @@ impl PlPgSqlTranslator {
             }
             NodeKind::Raise(raise) => {
                 let Some(statement) = raise_statement(raise, emit)? else { return Ok(Vec::new()) };
-                let statement = Self::prepare(statement, scope)?;
+                let statement = Self::prepare(statement, scope, schema, options)?;
                 Self::finalize_reads(vec![statement], scope, schema, options, emit)
             }
             NodeKind::Block(block) => {
@@ -874,8 +874,12 @@ impl PlPgSqlTranslator {
         // helpers write is no write under the `IF`.
         let mut first = match conditional.branches.first() {
             Some(Branch { condition, .. }) => {
-                let mut written =
-                    Self::prepare(embedded::expression(condition).into_owned(), scope)?;
+                let mut written = Self::prepare(
+                    embedded::expression(condition).into_owned(),
+                    scope,
+                    schema,
+                    options,
+                )?;
                 result.extend(Self::inline_helper_calls(
                     &mut written,
                     scope,
@@ -900,8 +904,12 @@ impl PlPgSqlTranslator {
             let written = if let Some(written) = first.take() {
                 written
             } else {
-                let mut written =
-                    Self::prepare(embedded::expression(condition).into_owned(), scope)?;
+                let mut written = Self::prepare(
+                    embedded::expression(condition).into_owned(),
+                    scope,
+                    schema,
+                    options,
+                )?;
                 scope.push_condition(conjunction(negated.iter().cloned()));
                 let inlined = Self::inline_helper_calls(&mut written, scope, schema, options, emit);
                 scope.pop_condition();
@@ -1104,7 +1112,7 @@ impl PlPgSqlTranslator {
         if let Some(row) = Self::row_value(&value, scope) {
             return Ok((BoundValue::Row(row), Vec::new()));
         }
-        let mut value = Self::prepare(value, scope)?;
+        let mut value = Self::prepare(value, scope, schema, options)?;
         let statements = Self::inline_helper_calls(&mut value, scope, schema, options, emit)?;
         Ok((BoundValue::Expr(value), statements))
     }
@@ -1127,9 +1135,27 @@ impl PlPgSqlTranslator {
         }
     }
 
-    /// Reads every field of a record variable `node` reads through the row
-    /// it holds, then constant-folds the trigger specials.
-    pub(super) fn prepare<N: VisitMut>(mut node: N, scope: &BodyScope) -> Result<N, Error> {
+    /// Reads each starred trigger row as PostgreSQL does, reads every field of
+    /// a record variable `node` reads through the row it holds, then
+    /// constant-folds the trigger specials.
+    pub(super) fn prepare<N: VisitMut>(
+        mut node: N,
+        scope: &BodyScope,
+        schema: &ParserDB,
+        options: &crate::options::TranslationContext<'_>,
+    ) -> Result<N, Error> {
+        // A helper the body calls has no `NEW` or `OLD` of its own.
+        if !scope.is_callee()
+            && let Some(rows) = options.trigger_rows()
+        {
+            let record = |name: &Ident| {
+                match Self::row_value(&Expr::Identifier(name.clone()), scope) {
+                    Some(RowValue::Trigger(row)) => Some(row),
+                    _ => None,
+                }
+            };
+            rows.unstar(&mut node, &record, schema)?;
+        }
         let mut failure = None;
         let _: ControlFlow<()> = visit_expressions_mut(&mut node, |expr| {
             if failure.is_none()

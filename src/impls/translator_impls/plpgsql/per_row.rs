@@ -97,7 +97,7 @@ impl PlPgSqlTranslator {
                  a query reading them."
             )));
         };
-        let rows = Self::prepare(rows.as_ref().clone(), scope)?;
+        let rows = Self::prepare(rows.as_ref().clone(), scope, schema, options)?;
         let outer: Vec<(String, Option<Binding>)> = scope
             .declared()
             .filter(|name| !names.iter().any(|target| target == name) && *name != FOUND)
