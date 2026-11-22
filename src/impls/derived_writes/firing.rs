@@ -25,6 +25,7 @@ use super::{
     chain_phrase,
     columns::Columns,
     function_writes, is_per_row,
+    landing::Landing,
     rows::Held,
 };
 #[cfg(not(feature = "std"))]
@@ -108,6 +109,14 @@ impl FiringTrigger {
         self.events.contains(&event)
     }
 
+    /// Whether the trigger takes, in place of the view `relation`, folded,
+    /// a write of one of `events` to it.
+    pub(super) fn takes(&self, relation: &str, events: &[Event]) -> bool {
+        self.rank == Rank::InsteadOf
+            && self.table == relation
+            && events.iter().any(|&event| self.fires_on(event))
+    }
+
     /// The table or view the trigger fires on, its last name part folded.
     pub(super) fn table(&self) -> &str {
         &self.table
@@ -126,10 +135,10 @@ impl FiringTrigger {
 
     /// Every write the trigger's function runs, none when the schema does not
     /// hold that function.
-    pub(super) fn writes(&self, schema: &ParserDB) -> Result<Vec<DerivedWrite>, Error> {
+    pub(super) fn writes(&self, landing: Landing<'_>) -> Result<Vec<DerivedWrite>, Error> {
         let mut writes = Vec::new();
-        if let Some(function) = written_function(schema, &self.function)? {
-            function_writes(function, schema, &mut Vec::new(), &mut Vec::new(), &mut writes)?;
+        if let Some(function) = written_function(landing.schema, &self.function)? {
+            function_writes(function, landing, &mut Vec::new(), &mut Vec::new(), &mut writes)?;
         }
         Ok(writes)
     }
@@ -219,6 +228,11 @@ impl<'s, 'o> Firing<'s, 'o> {
         self.schema.tables().find(|table| table.stored_table_name() == name)
     }
 
+    /// Where the writes of the schema's functions land.
+    fn landing(&self) -> Landing<'s> {
+        Landing::new(self.schema, self.options)
+    }
+
     /// The columns of `table` a write of `event` the replica uploads changes:
     /// for an update, those the acting role may update, and every one when
     /// an `INSTEAD OF` trigger, which the replica keeps, updates the table.
@@ -234,7 +248,7 @@ impl<'s, 'o> Firing<'s, 'o> {
         let table = stored.stored_table_name();
         for instead in self.triggers.iter().filter(|trigger| trigger.rank == Rank::InsteadOf) {
             if instead
-                .writes(self.schema)?
+                .writes(self.landing())?
                 .iter()
                 .any(|write| *write.relation == *table && write.events().contains(&Event::Update))
             {
@@ -395,7 +409,7 @@ impl<'s, 'o> Firing<'s, 'o> {
         written: &mut Written,
         visited: &mut Visited,
     ) -> Result<(), Error> {
-        for write in trigger.writes(self.schema)? {
+        for write in trigger.writes(self.landing())? {
             self.write_set_off(&write, written, visited)?;
             self.add(&write, &trigger.name, &trigger.table, written)?;
         }
@@ -466,7 +480,7 @@ impl<'s, 'o> Firing<'s, 'o> {
         }
         for trigger in self.triggers {
             if trigger.table == table && trigger.fires_on(event) {
-                for write in trigger.writes(self.schema)? {
+                for write in trigger.writes(self.landing())? {
                     self.follow(&write, writes, visited)?;
                     writes.push(write);
                 }

@@ -19,6 +19,7 @@
 mod chain;
 mod columns;
 mod firing;
+mod landing;
 mod readers;
 mod rows;
 
@@ -28,6 +29,7 @@ use core::{fmt::Write as _, ops::ControlFlow};
 pub(crate) use chain::without_removed_writes;
 use columns::Columns;
 pub(crate) use firing::{FiringTrigger, firing_triggers};
+use landing::Landing;
 pub(crate) use readers::reads_left_to_server;
 use sql_traits::{
     structs::ParserDB,
@@ -199,12 +201,13 @@ fn chain_phrase(chain: &[String]) -> String {
 }
 
 /// Where a statement runs: the chain of functions reaching it, the trigger's
-/// own first, and the names the last of them may read as variables, as
-/// [`rows::variables`] gives them.
+/// own first, the names the last of them may read as variables, as
+/// [`rows::variables`] gives them, and where its writes land.
 #[derive(Clone, Copy)]
 struct Reach<'c> {
     chain: &'c [String],
     variables: &'c [String],
+    landing: Landing<'c>,
 }
 
 /// Collects every statement that writes rows, in body order through nested
@@ -251,11 +254,16 @@ impl Visitor for Writes<'_> {
     }
 }
 
-/// Every write `node` makes itself, run where `reach` says.
-fn statement_writes<N: Visit>(node: &N, reach: Reach<'_>) -> Vec<DerivedWrite> {
+/// Every write `node` makes itself, run where `reach` says, on the relation
+/// it lands on.
+///
+/// # Errors
+///
+/// Returns the lookup errors reading a view a write goes through runs into.
+fn statement_writes<N: Visit>(node: &N, reach: Reach<'_>) -> Result<Vec<DerivedWrite>, Error> {
     let mut writes = Writes { reach, found: Vec::new() };
     let _: ControlFlow<()> = node.visit(&mut writes);
-    writes.found
+    writes.found.into_iter().map(|write| reach.landing.land(write)).collect()
 }
 
 /// Adds every write among the PL/pgSQL `nodes` to `writes`, through nested
@@ -264,27 +272,31 @@ fn statement_writes<N: Visit>(node: &N, reach: Reach<'_>) -> Vec<DerivedWrite> {
 /// refuses it. A cursor's query, an assigned value and a returned value are a
 /// `SELECT` PostgreSQL refuses to write in, and a call they make is read with
 /// the function's other calls.
-fn nodes_writes(nodes: &[Node], reach: Reach<'_>, writes: &mut Vec<DerivedWrite>) {
+fn nodes_writes(
+    nodes: &[Node],
+    reach: Reach<'_>,
+    writes: &mut Vec<DerivedWrite>,
+) -> Result<(), Error> {
     for node in nodes {
         match &node.kind {
             NodeKind::Statement { statement, .. }
             | NodeKind::Open(Open::Query { query: statement, .. })
             | NodeKind::Perform { query: statement }
             | NodeKind::ReturnQuery(ReturnQuery::Query(statement)) => {
-                writes.extend(statement_writes(statement.as_ref(), reach));
+                writes.extend(statement_writes(statement.as_ref(), reach)?);
             }
-            NodeKind::Block(block) => block_writes(block, reach, writes),
+            NodeKind::Block(block) => block_writes(block, reach, writes)?,
             NodeKind::If(If { branches, otherwise }) => {
-                branches_writes(branches, otherwise, reach, writes);
+                branches_writes(branches, otherwise, reach, writes)?;
             }
             NodeKind::Case(Case { branches, otherwise, .. }) => {
-                branches_writes(branches, otherwise.as_deref().unwrap_or_default(), reach, writes);
+                branches_writes(branches, otherwise.as_deref().unwrap_or_default(), reach, writes)?;
             }
             NodeKind::Loop(repeated) => {
                 if let LoopControl::Query { query, .. } = &repeated.control {
-                    writes.extend(statement_writes(query.as_ref(), reach));
+                    writes.extend(statement_writes(query.as_ref(), reach)?);
                 }
-                nodes_writes(&repeated.statements, reach, writes);
+                nodes_writes(&repeated.statements, reach, writes)?;
             }
             NodeKind::Open(Open::Bound(_) | Open::Dynamic { .. })
             | NodeKind::ReturnQuery(ReturnQuery::Dynamic(_))
@@ -303,6 +315,7 @@ fn nodes_writes(nodes: &[Node], reach: Reach<'_>, writes: &mut Vec<DerivedWrite>
             | NodeKind::Assert(_) => {}
         }
     }
+    Ok(())
 }
 
 /// Adds the writes in the `WHEN` or `ELSIF` `branches`, then in `otherwise`.
@@ -313,18 +326,23 @@ fn branches_writes(
     otherwise: &[Node],
     reach: Reach<'_>,
     writes: &mut Vec<DerivedWrite>,
-) {
+) -> Result<(), Error> {
     for branch in branches {
-        nodes_writes(&branch.statements, reach, writes);
+        nodes_writes(&branch.statements, reach, writes)?;
     }
-    nodes_writes(otherwise, reach, writes);
+    nodes_writes(otherwise, reach, writes)
 }
 
-fn block_writes(block: &Block, reach: Reach<'_>, writes: &mut Vec<DerivedWrite>) {
-    nodes_writes(&block.statements, reach, writes);
+fn block_writes(
+    block: &Block,
+    reach: Reach<'_>,
+    writes: &mut Vec<DerivedWrite>,
+) -> Result<(), Error> {
+    nodes_writes(&block.statements, reach, writes)?;
     for handler in &block.handlers {
-        nodes_writes(&handler.statements, reach, writes);
+        nodes_writes(&handler.statements, reach, writes)?;
     }
+    Ok(())
 }
 
 /// Whether PostgreSQL provides `function` itself, which writes no row of the
@@ -382,7 +400,7 @@ fn parsed_body<'f>(function: &'f CreateFunction, schema: &'f ParserDB) -> Result
 /// the reasons, is refused only when no write was found before it.
 fn function_writes<'db>(
     function: &'db CreateFunction,
-    schema: &'db ParserDB,
+    landing: Landing<'db>,
     visited: &mut Vec<&'db CreateFunction>,
     chain: &mut Vec<String>,
     writes: &mut Vec<DerivedWrite>,
@@ -392,21 +410,23 @@ fn function_writes<'db>(
     }
     visited.push(function);
     chain.push(function.name().to_owned());
+    let schema = landing.schema;
     match parsed_body(function, schema)? {
         Body::PlPgSql(block) => {
             let variables = rows::variables(function, &block);
-            block_writes(&block, Reach { chain, variables: &variables }, writes);
+            block_writes(&block, Reach { chain, variables: &variables, landing }, writes)?;
         }
         Body::Sql(statements) => {
             for statement in statements.iter() {
-                writes.extend(statement_writes(statement, Reach { chain, variables: &[] }));
+                writes
+                    .extend(statement_writes(statement, Reach { chain, variables: &[], landing })?);
             }
         }
     }
     match function.referenced_functions(schema) {
         Ok(called) => {
             for called in called {
-                function_writes(called, schema, visited, chain, writes)?;
+                function_writes(called, landing, visited, chain, writes)?;
             }
         }
         Err(error) if writes.is_empty() => return Err(error.into()),
@@ -683,7 +703,7 @@ impl ServerRows {
             return Ok(None);
         };
         let written: Vec<(String, Fresh)> =
-            firing::with_set_off(fired.writes(schema)?, schema, options)?
+            firing::with_set_off(fired.writes(Landing::new(schema, options))?, schema, options)?
                 .into_iter()
                 .filter(|write| write.fresh != Fresh::Columns(Vec::new()))
                 .map(|write| (write.relation, write.fresh))
