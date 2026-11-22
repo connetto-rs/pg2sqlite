@@ -17,7 +17,10 @@
 //! [`LiveAttachments`] follows the emitted indexes and triggers through the
 //! batch. An object it holds no SQLite statement for, because an earlier
 //! session created it or a column rename has changed what SQLite stores for
-//! it since, is translated again from its PostgreSQL definition.
+//! it since, is translated again from its PostgreSQL definition. A trigger
+//! the batch translated from a `CREATE TRIGGER` keeps its statement across a
+//! column rename, since the batch emits it again whenever the rename changes
+//! its translation.
 
 use alloc::borrow::Cow;
 use core::ops::ControlFlow;
@@ -312,11 +315,14 @@ impl LiveAttachments {
     }
 
     /// SQLite renames the column inside the indexes of its table and inside
-    /// every trigger reading it, which the recorded statements no longer
-    /// match, so those are translated again when needed.
+    /// every trigger reading it. A trigger translated from a `CREATE TRIGGER`
+    /// is emitted again when the rename changes its translation, so its
+    /// statement stays current. Every other recorded statement no longer
+    /// matches what SQLite stores, so those are translated again when needed.
     fn rename_column(&mut self, owner: &str) {
         for entry in &mut self.entries {
-            if entry.trigger || entry.owner == owner {
+            let followed = matches!(entry.origin, Some(Origin::Trigger(_)));
+            if !followed && (entry.trigger || entry.owner == owner) {
                 entry.statement = None;
             }
         }

@@ -22,6 +22,16 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// `t` once `c` is renamed to `d` and `b` is gone.
+    #[sql_name = "t"]
+    renamed (id) {
+        id -> Integer,
+        a -> Integer,
+        d -> Nullable<Integer>,
+    }
+}
+
 fn insert(connection: &mut SqliteConnection, id: i32, a: i32) -> Result<usize, DieselError> {
     diesel::insert_into(t::table).values((t::id.eq(id), t::a.eq(a))).execute(connection)
 }
@@ -254,6 +264,67 @@ fn an_index_over_a_renamed_column_comes_back() {
     )
     .expect("the column drops");
     assert!(refusal(insert(&mut connection, 2, 10)).contains("UNIQUE"));
+}
+
+const RENAMED: &str = "CREATE TABLE t (id INT PRIMARY KEY, a INT NOT NULL, c INT, b INT UNIQUE); \
+                       CREATE FUNCTION low() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+                       IF NEW.a < 0 THEN RAISE EXCEPTION 'too low'; END IF; RETURN NEW; END $$; \
+                       CREATE TRIGGER t_low BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION low();";
+
+/// A trigger the batch created before a column rename comes back after the
+/// rebuild.
+#[test]
+fn a_trigger_created_before_a_column_rename_comes_back() {
+    let mut connection = helpers::apply_default(&format!(
+        "{RENAMED} ALTER TABLE t RENAME COLUMN c TO d; ALTER TABLE t DROP COLUMN b;"
+    ))
+    .expect("the column drops");
+    insert(&mut connection, 1, 10).expect("a row lands");
+    assert_eq!(refusal(insert(&mut connection, 2, -1)), "P0001: too low");
+}
+
+/// Triggers the batch merged into one SQLite trigger before a column rename
+/// come back after the rebuild.
+#[test]
+fn merged_triggers_created_before_a_column_rename_come_back() {
+    let mut connection = helpers::apply_default(&format!(
+        "{RENAMED} CREATE FUNCTION high() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+         IF NEW.a > 1000 THEN RAISE EXCEPTION 'too high'; END IF; RETURN NEW; END $$; \
+         CREATE TRIGGER t_high BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION high(); \
+         ALTER TABLE t RENAME COLUMN c TO d; ALTER TABLE t DROP COLUMN b;"
+    ))
+    .expect("the column drops");
+    insert(&mut connection, 1, 10).expect("a row lands");
+    assert_eq!(refusal(insert(&mut connection, 2, -1)), "P0001: too low");
+    assert_eq!(refusal(insert(&mut connection, 3, 1001)), "P0001: too high");
+}
+
+/// A trigger on the update of a column keeps firing on that column under its
+/// new name, and only on it.
+#[test]
+fn an_update_of_trigger_follows_the_renamed_column() {
+    let mut connection = helpers::apply_default(
+        "CREATE TABLE t (id INT PRIMARY KEY, a INT NOT NULL, c INT, b INT UNIQUE); \
+         INSERT INTO t (id, a, c, b) VALUES (1, 10, 100, 1000); \
+         CREATE FUNCTION low() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+         IF NEW.a < 0 THEN RAISE EXCEPTION 'too low'; END IF; RETURN NEW; END $$; \
+         CREATE TRIGGER t_low BEFORE UPDATE OF c ON t FOR EACH ROW EXECUTE FUNCTION low(); \
+         ALTER TABLE t RENAME COLUMN c TO d; ALTER TABLE t DROP COLUMN b;",
+    )
+    .expect("the column drops");
+    let row = renamed::table.find(1);
+    assert_eq!(
+        refusal(
+            diesel::update(row)
+                .set((renamed::d.eq(Some(1)), renamed::a.eq(-5)))
+                .execute(&mut connection)
+        ),
+        "P0001: too low"
+    );
+    diesel::update(row)
+        .set(renamed::a.eq(-5))
+        .execute(&mut connection)
+        .expect("an update leaving the column alone fires no trigger");
 }
 
 const RESUMED: &str = "CREATE TABLE t (id INT PRIMARY KEY, a INT NOT NULL, b INT UNIQUE); \
