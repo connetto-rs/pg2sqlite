@@ -23,7 +23,7 @@ use crate::{
     impls::{
         object_name::{last_ident_value_or_display, quoted_ident},
         scoped_relations::relation_names,
-        translator_impls::rls::resolve_trigger_table_name,
+        translator_impls::{reentry::marked_table, rls::resolve_trigger_table_name},
     },
     manifest::Placement,
     options::{AttachedTables, Pg2SqliteOptions},
@@ -368,7 +368,11 @@ fn homes(
         for statement in emitted {
             let table = match statement {
                 Statement::CreateTable(create) => {
-                    if create.temporary {
+                    // A marker table lives with a `TEMP` table it marks, so
+                    // the table's triggers find it on every connection.
+                    let marks_temporary = marked_table(&create.name)
+                        .is_some_and(|marked| homes.get(&key(marked)) == Some(&Placement::Temp));
+                    if create.temporary || marks_temporary {
                         homes.insert(key_of(&create.name), Placement::Temp);
                         continue;
                     }

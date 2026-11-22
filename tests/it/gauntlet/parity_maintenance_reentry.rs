@@ -1,8 +1,9 @@
 //! Parity for row triggers assigning `NEW`, which the replica runs as `AFTER`
 //! triggers whose `UPDATE` writes the assigned values over the row. That
 //! `UPDATE` must not fire the table's maintenance triggers again, whatever the
-//! trigger reads and whatever the caller wrote, and answers to the
-//! row-security policies PostgreSQL holds the row the trigger returns to.
+//! trigger reads and whatever the caller wrote, must fire none of its
+//! `UPDATE` triggers for an `INSERT`, and answers to the row-security
+//! policies PostgreSQL holds the row the trigger returns to.
 
 use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
 use helpers::establish_connection;
@@ -19,9 +20,15 @@ mod schema {
             note -> Nullable<Text>,
         }
     }
+    diesel::table! {
+        fired (id) {
+            id -> Integer,
+            kind -> Text,
+        }
+    }
 }
 
-use schema::items;
+use schema::{fired, items};
 
 #[derive(Insertable)]
 #[diesel(table_name = items)]
@@ -57,6 +64,8 @@ enum Step {
         tag: &'static str,
     },
     Read,
+    /// Reads the labels the recording triggers logged, in firing order.
+    Fired,
     /// Acts as `app` from here on, which the row-security policies hold where
     /// they spare the table owner. The replica has no roles, and its policies
     /// hold every caller.
@@ -98,6 +107,14 @@ macro_rules! run_step {
                         .load(connection)
                         .expect("read items");
                     Outcome::Rows(rows.into_iter().map(|row| format!("{row:?}")).collect())
+                }
+                Step::Fired => {
+                    let kinds: Vec<String> = fired::table
+                        .select(fired::kind)
+                        .order(fired::id.asc())
+                        .load(connection)
+                        .expect("read fired");
+                    Outcome::Rows(kinds)
                 }
                 Step::ActAsApp => $act_as_app(connection),
             }
@@ -394,5 +411,107 @@ fn using_reads_the_row_before_the_update() {
             set_tag(1, "b"),
             Step::Read,
         ],
+    );
+}
+
+const RECORDERS: &str = "
+CREATE TABLE fired (id SERIAL PRIMARY KEY, kind TEXT NOT NULL);
+CREATE FUNCTION record_one() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN INSERT INTO fired (kind) VALUES ('one'); RETURN NEW; END $$;
+CREATE FUNCTION record_two() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN INSERT INTO fired (kind) VALUES ('two'); RETURN NULL; END $$;
+";
+
+const ITEMS: &str = "CREATE TABLE items (id INT PRIMARY KEY, tag TEXT, note TEXT);";
+
+const STAMP_ON_INSERT: &str = "
+CREATE FUNCTION stamp() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN NEW.tag := NEW.tag || '*'; RETURN NEW; END $$;
+CREATE TRIGGER items_stamp BEFORE INSERT ON items FOR EACH ROW EXECUTE FUNCTION stamp();
+";
+
+const RECORD_ON_UPDATE: &str = "
+CREATE TRIGGER items_one BEFORE UPDATE ON items FOR EACH ROW EXECUTE FUNCTION record_one();
+CREATE TRIGGER items_two AFTER UPDATE ON items FOR EACH ROW EXECUTE FUNCTION record_two();
+";
+
+/// An insert, then the caller's own update of the same row, which fires the
+/// `UPDATE` triggers once.
+fn insert_then_update() -> [Step; 5] {
+    [
+        Step::Insert { id: 1, tag: "a", note: None },
+        Step::Fired,
+        set_tag(1, "b"),
+        Step::Fired,
+        Step::Read,
+    ]
+}
+
+/// The write of what a `BEFORE INSERT` trigger assigned fires neither the
+/// `BEFORE` nor the `AFTER UPDATE` triggers of the table.
+#[test]
+fn an_insert_fires_no_update_trigger() {
+    assert_agree(
+        &[&format!("{RECORDERS}{ITEMS}{STAMP_ON_INSERT}{RECORD_ON_UPDATE}")],
+        &insert_then_update(),
+    );
+}
+
+/// The `UPDATE` triggers translated in an earlier migration than the
+/// `BEFORE INSERT` trigger skip its write too.
+#[test]
+fn update_triggers_of_an_earlier_migration_skip_a_later_insert_trigger() {
+    assert_agree(
+        &[&format!("{RECORDERS}{ITEMS}{RECORD_ON_UPDATE}"), STAMP_ON_INSERT],
+        &insert_then_update(),
+    );
+}
+
+/// Two `AFTER UPDATE` triggers sharing one SQLite trigger each skip the write.
+#[test]
+fn update_triggers_sharing_a_slot_skip_the_insert_write() {
+    assert_agree(
+        &[&format!(
+            "{RECORDERS}{ITEMS}{STAMP_ON_INSERT}
+             CREATE TRIGGER items_a AFTER UPDATE ON items FOR EACH ROW EXECUTE FUNCTION record_one();
+             CREATE TRIGGER items_b AFTER UPDATE ON items FOR EACH ROW EXECUTE FUNCTION record_two();"
+        )],
+        &insert_then_update(),
+    );
+}
+
+/// A trigger firing on `INSERT OR UPDATE` fires once for the insert.
+#[test]
+fn an_insert_or_update_trigger_fires_once_for_the_insert() {
+    assert_agree(
+        &[&format!(
+            "{RECORDERS}{ITEMS}{STAMP_ON_INSERT}
+             CREATE TRIGGER items_logged AFTER INSERT OR UPDATE ON items
+                 FOR EACH ROW EXECUTE FUNCTION record_two();"
+        )],
+        &insert_then_update(),
+    );
+}
+
+/// A constraint trigger on `UPDATE` skips the write as well.
+#[test]
+fn an_update_constraint_trigger_skips_the_insert_write() {
+    assert_agree(
+        &[&format!(
+            "{RECORDERS}{ITEMS}{STAMP_ON_INSERT}
+             CREATE CONSTRAINT TRIGGER items_checked AFTER UPDATE ON items
+                 FOR EACH ROW EXECUTE FUNCTION record_two();"
+        )],
+        &insert_then_update(),
+    );
+}
+
+/// On a table under row-level security the triggers move to its backing
+/// table, and still skip the write.
+#[test]
+fn update_triggers_of_a_policed_table_skip_the_insert_write() {
+    assert_agree(
+        &[&format!("{RECORDERS}{}{RECORD_ON_UPDATE}", policed_trigger("USING (true)", "INSERT"))],
+        &insert_then_update(),
     );
 }
