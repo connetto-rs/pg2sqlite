@@ -5,8 +5,8 @@
 //! the next run does. Each scenario below was measured on PostgreSQL 18.7.
 
 use diesel::{
-    Connection, QueryDsl, RunQueryDsl, SqliteConnection, connection::SimpleConnection,
-    result::Error as DieselError,
+    Connection, ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection,
+    connection::SimpleConnection, result::Error as DieselError,
 };
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SqlState, postgres_error};
 use sql_traits::structs::ParserDB;
@@ -16,6 +16,15 @@ diesel::table! {
     audit (id) {
         id -> Integer,
         note -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    /// `docs` once `body` is renamed to `content`.
+    docs (id) {
+        id -> Integer,
+        owner -> Text,
+        content -> Nullable<Text>,
     }
 }
 
@@ -158,6 +167,27 @@ fn a_rename_of_the_trigger_table_keeps_only_the_trigger() {
         pg::UNDEFINED_TABLE,
         r#"relation "docs2" does not exist"#,
     );
+}
+
+/// A trigger on the update of a column fires on that column under its new
+/// name, and its body fails on the field the rename took from the row.
+#[test]
+fn an_update_of_trigger_follows_a_column_rename() {
+    let schema = with_body(COPY_BODY).replace("AFTER INSERT", "AFTER UPDATE OF body")
+        + "INSERT INTO docs (id, owner, body) VALUES (1, 'alice', 'a');";
+    let rename = "ALTER TABLE docs RENAME COLUMN body TO content;";
+    for batches in [vec![schema.clone() + rename], vec![schema.clone(), rename.to_owned()]] {
+        let batches: Vec<&str> = batches.iter().map(String::as_str).collect();
+        let mut connection = replica(&batches);
+        let row = docs::table.find(1);
+        diesel::update(row).set(docs::owner.eq("bob")).execute(&mut connection).unwrap();
+        assert_refused(
+            diesel::update(row).set(docs::content.eq(Some("b"))).execute(&mut connection),
+            pg::UNDEFINED_COLUMN,
+            r#"record "new" has no field "body""#,
+        );
+        assert_eq!(audited(&mut connection), []);
+    }
 }
 
 /// A trigger runs the body its function holds when the run happens, whether
