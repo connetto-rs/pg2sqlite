@@ -557,3 +557,174 @@ fn a_translation_bringing_the_writer_names_the_readers_already_there() {
         ]),
     );
 }
+
+#[test]
+fn a_trigger_reading_the_stored_row_through_a_quoted_record_is_named() {
+    let pg = format!(
+        "{INVITATIONS}
+CREATE FUNCTION refuse_reaccepting() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF \"old\".accepted_by_id IS NOT NULL THEN
+    RAISE EXCEPTION 'invitation already accepted';
+  END IF;
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER invitations_once BEFORE UPDATE ON invitations
+  FOR EACH ROW EXECUTE FUNCTION refuse_reaccepting();
+"
+    );
+    let triggers: Vec<(String, String, String, String)> =
+        readers(&pg).into_iter().filter(|(construct, ..)| construct == "TRIGGER").collect();
+    assert_eq!(
+        triggers,
+        owned(&[(
+            "TRIGGER",
+            "invitations_once",
+            "accepted_by_id of invitations",
+            "memberships_invitation_accepted"
+        )]),
+    );
+}
+
+#[test]
+fn a_key_declared_twice_is_named_once() {
+    let pg = INVITATIONS.replace(
+        "accepted_by_id INT REFERENCES users (id));",
+        "accepted_by_id INT REFERENCES users (id),
+  FOREIGN KEY (accepted_by_id) REFERENCES users (id));",
+    );
+    assert_eq!(
+        readers(&pg),
+        owned(&[
+            (
+                "FOREIGN KEY",
+                "(accepted_by_id) REFERENCES users",
+                "accepted_by_id of invitations",
+                "memberships_invitation_accepted"
+            ),
+            (
+                "POLICY",
+                "memberships_insert",
+                "accepted_by_id of invitations",
+                "memberships_invitation_accepted"
+            ),
+        ]),
+    );
+}
+
+#[test]
+fn a_policy_judging_the_stored_and_the_written_row_is_named_once() {
+    let pg = format!(
+        "{INVITATIONS}
+CREATE POLICY memberships_move ON memberships FOR UPDATE TO app
+  USING (invitation_id IN (SELECT id FROM invitations WHERE accepted_by_id IS NULL))
+  WITH CHECK (invitation_id IN (SELECT id FROM invitations WHERE accepted_by_id IS NOT NULL));
+GRANT UPDATE ON memberships TO app;
+"
+    );
+    let moves: Vec<(String, String, String, String)> =
+        readers(&pg).into_iter().filter(|(_, name, ..)| name == "memberships_move").collect();
+    assert_eq!(
+        moves,
+        owned(&[(
+            "POLICY",
+            "memberships_move",
+            "accepted_by_id of invitations",
+            "memberships_invitation_accepted"
+        )]),
+    );
+}
+
+#[test]
+fn partial_and_unnamed_keys_are_named_as_postgresql_names_them() {
+    let keyed = INVITATIONS.replace(
+        "accepted_by_id INT REFERENCES users (id));",
+        "accepted_by_id INT REFERENCES users (id),
+  CHECK (accepted_by_id > 0), UNIQUE (accepted_by_id, email));",
+    );
+    let pg = format!(
+        "{keyed}
+CREATE UNIQUE INDEX invitations_open_email ON invitations (email) WHERE accepted_by_id IS NULL;
+"
+    );
+    let named = readers(&pg);
+    for (construct, name) in [
+        ("UNIQUE INDEX", "invitations_open_email"),
+        ("CHECK", "invitations_accepted_by_id_check"),
+        ("UNIQUE", "invitations_accepted_by_id_email_key"),
+    ] {
+        let expected = owned(&[(
+            construct,
+            name,
+            "accepted_by_id of invitations",
+            "memberships_invitation_accepted",
+        )]);
+        assert!(named.contains(&expected[0]), "{expected:?} in {named:#?}");
+    }
+}
+
+#[test]
+fn the_policies_of_a_role_exempt_from_row_security_are_not_named() {
+    let warnings = Pg2Sqlite::default()
+        .sql(&INVITATIONS.replace("CREATE ROLE app NOLOGIN;", "CREATE ROLE app NOLOGIN BYPASSRLS;"))
+        .expect("fixture parses")
+        .translate_with_report(&options())
+        .expect("fixture translates")
+        .warnings;
+    assert_eq!(
+        readers_in(warnings),
+        owned(&[(
+            "FOREIGN KEY",
+            "(accepted_by_id) REFERENCES users",
+            "accepted_by_id of invitations",
+            "memberships_invitation_accepted"
+        )]),
+    );
+}
+
+#[test]
+fn a_reader_of_whole_rows_a_trigger_adds_is_told_it_reads_the_rows() {
+    let pg = "
+CREATE ROLE postgres SUPERUSER;
+CREATE ROLE app NOLOGIN;
+CREATE TABLE memberships (organization_id INT NOT NULL, user_id INT NOT NULL,
+  PRIMARY KEY (organization_id, user_id));
+CREATE TABLE audit_events (id INT PRIMARY KEY, table_name TEXT NOT NULL);
+CREATE VIEW membership_events AS
+  SELECT id FROM audit_events WHERE table_name = 'memberships';
+ALTER VIEW membership_events OWNER TO postgres;
+CREATE FUNCTION record_audit_event() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO audit_events (id, table_name) VALUES (NEW.user_id, TG_TABLE_NAME);
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER memberships_audit AFTER INSERT ON memberships
+  FOR EACH ROW EXECUTE FUNCTION record_audit_event();
+ALTER TABLE memberships ENABLE ROW LEVEL SECURITY;
+CREATE POLICY memberships_audited ON memberships FOR SELECT TO app
+  USING (EXISTS (SELECT 1 FROM membership_events WHERE id = user_id));
+GRANT SELECT ON audit_events, membership_events TO app;
+GRANT SELECT, INSERT ON memberships TO app;
+";
+    let shown: Vec<String> = Pg2Sqlite::default()
+        .sql(pg)
+        .expect("fixture parses")
+        .translate_with_report(&options())
+        .expect("fixture translates")
+        .warnings
+        .iter()
+        .filter(|warning| {
+            matches!(warning, TranslationWarning::ReadsLeftToServer { construct, .. }
+                if construct == "POLICY")
+        })
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(
+        shown,
+        ["kept POLICY memberships_audited on memberships reads rows of audit_events, which \
+          TRIGGER memberships_audit on memberships changes on the server alone, so the replica \
+          decides on them as they were before"],
+    );
+}

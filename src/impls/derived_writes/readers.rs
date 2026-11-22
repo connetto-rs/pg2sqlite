@@ -111,11 +111,12 @@ fn read_triggers<'a>(
         }
         let mut run = trigger_chain(trigger, schema, options)?;
         let disposition = match &mut run {
-            _ if matches!(trigger.period, Some(TriggerPeriod::InsteadOf)) => Disposition::Kept,
-            None => Disposition::Kept,
-            Some((function, chain)) => {
+            Some((function, chain))
+                if !matches!(trigger.period, Some(TriggerPeriod::InsteadOf)) =>
+            {
                 chain_disposition(trigger, function, chain, schema, options)?
             }
+            _ => Disposition::Kept,
         };
         read.push(ReadTrigger { trigger, fired, run, disposition });
     }
@@ -366,20 +367,10 @@ fn table_readers(
 ) -> Result<(), Error> {
     let own = table.stored_table_name();
     let declared = last_ident_value_or_display(&table.name);
-    // An unnamed check, key or index goes by what it judges, as a foreign
-    // key goes by its columns.
-    let reader = |construct, name: Option<Cow<'_, str>>, judged: &Expr, reads| {
+    let reader = |construct, name: Option<Cow<'_, str>>, reads| {
         Reader {
             construct,
-            name: name.map_or_else(
-                || {
-                    match judged {
-                        Expr::Tuple(_) | Expr::Nested(_) => judged.to_string(),
-                        _ => format!("({judged})"),
-                    }
-                },
-                Cow::into_owned,
-            ),
+            name: name.map(Cow::into_owned).unwrap_or_default(),
             table: declared.clone(),
             reads,
         }
@@ -403,16 +394,12 @@ fn table_readers(
     for check in table.check_constraints(schema)? {
         let expression = check.expression(schema);
         let reads = expression_reads(expression, Some(&own), schema, options)?;
-        readers.push(reader("CHECK", check.constraint_name(schema)?, expression, reads));
+        readers.push(reader("CHECK", check.constraint_name(schema)?, reads));
     }
     for key in table.unique_indices(schema)? {
-        let expression = key.expression(schema)?;
-        let mut reads = expression_reads(expression, Some(&own), schema, options)?;
-        if let Some(predicate) = key.predicate() {
-            reads.extend(expression_reads(predicate, Some(&own), schema, options)?);
-        }
+        let reads = expression_reads(key.expression(schema)?, Some(&own), schema, options)?;
         let construct = if key.is_primary_key(schema)? { "PRIMARY KEY" } else { "UNIQUE" };
-        readers.push(reader(construct, key.constraint_name(schema)?, expression, reads));
+        readers.push(reader(construct, key.constraint_name(schema)?, reads));
     }
     for index in table.indices(schema)?.filter(|index| index.is_unique()) {
         let expression = index.expression(schema)?;
@@ -420,7 +407,7 @@ fn table_readers(
         if let Some(predicate) = index.predicate() {
             reads.extend(expression_reads(predicate, Some(&own), schema, options)?);
         }
-        readers.push(reader("UNIQUE INDEX", index.name().map(Cow::Borrowed), expression, reads));
+        readers.push(reader("UNIQUE INDEX", index.name().map(Cow::Borrowed), reads));
     }
     for key in table.foreign_keys(schema)? {
         let constraint = key.attribute();
