@@ -112,6 +112,8 @@ fn a_call_passed_a_column_beside_another_from_item_is_refused() {
            FROM runs run, LATERAL run_deviations(run.id) AS deviation (kind);",
         "CREATE VIEW deviations AS SELECT runs.id, deviation.kind
            FROM runs, run_deviations(id) AS deviation (kind);",
+        "CREATE VIEW deviations AS SELECT runs.id, deviation.kind
+           FROM runs, run_deviations(runs.id) AS deviation (kind);",
     ] {
         let error = refusal(&deviations("STABLE", BODY), caller);
         assert!(
@@ -213,6 +215,48 @@ fn a_call_passed_a_trigger_field_beside_another_from_item_reads_the_row() {
         .batch_execute("INSERT INTO links VALUES (12, 2)")
         .expect_err("a deviating run without a note");
     assert!(error.to_string().contains("needs a note"), "{error}");
+}
+
+diesel::table! {
+    deviating_linked (id) {
+        id -> Integer,
+    }
+}
+
+/// A column of an enclosing query is no item of the FROM list either, so
+/// PostgreSQL reads a call passed one beside another item for each row of
+/// that query, without `LATERAL`.
+#[test]
+fn a_call_passed_an_enclosing_column_beside_another_from_item_reads_that_row() {
+    let source = format!(
+        "{RUNS}{}
+        CREATE VIEW deviating_linked AS SELECT run.id FROM runs run
+          WHERE EXISTS (SELECT 1 FROM run_deviations(run.id) AS deviation (kind)
+            JOIN links link ON link.run_id = run.id);
+        GRANT SELECT ON deviating_linked TO app;",
+        deviations("STABLE", BODY)
+    );
+    let script = Pg2Sqlite::default()
+        .sql(&source)
+        .expect("parse")
+        .translate_to_sql(&options())
+        .unwrap_or_else(|error| panic!("the schema should translate: {error}"));
+    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
+    for statement in script.into_vec() {
+        connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
+    }
+    connection
+        .batch_execute(
+            "INSERT INTO runs VALUES (1, NULL, 5, 5), (2, NULL, 5, 6), (3, NULL, 5, 6);
+             INSERT INTO links VALUES (10, 1), (11, 2);",
+        )
+        .expect("seed the replica");
+    let rows: Vec<i32> = deviating_linked::table
+        .select(deviating_linked::id)
+        .order(deviating_linked::id)
+        .load(&mut connection)
+        .expect("read deviating_linked");
+    assert_eq!(rows, [2]);
 }
 
 diesel::table! {
