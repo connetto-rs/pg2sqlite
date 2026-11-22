@@ -170,9 +170,9 @@ impl crate::traits::translator::TranslatorWithContext for Insert {
         // One pass for all column-type conversions: literals and parameters.
         apply_column_type_conversions(&mut insert, target.optional(), schema, options)?;
 
-        if let Some(on_insert) = &self.on {
+        if let Some(on_insert) = insert.on.take() {
             translate_on_insert(
-                on_insert,
+                &on_insert,
                 &mut insert,
                 &mut target,
                 &rewrites,
@@ -923,25 +923,11 @@ pub(crate) fn for_each_insert_position(
     Ok(())
 }
 
-/// Redirect an INSERT against a policy-bearing RLS view when it carries a
-/// clause SQLite cannot handle on a view: a `RETURNING` clause or an
-/// `ON CONFLICT` upsert clause.
-///
-/// **RETURNING:** The INSTEAD OF INSERT trigger forwards the row to the
-/// backing table, but `RETURNING` reads from the view's NEW row and never
-/// sees the rowid the backing table assigned. Redirecting the INSERT at the
-/// backing table lets `RETURNING` surface the correct values.
-///
-/// **ON CONFLICT (DO NOTHING / DO UPDATE):** SQLite refuses these forms on a
-/// view entirely ("cannot UPSERT a view"). `INSERT OR IGNORE` and
-/// `INSERT OR REPLACE` use a different AST field and are NOT touched here.
-///
-/// In both cases the redirect is safe only in strict mode, because the
-/// backing-table BEFORE INSERT guard (`generate_insert_check_trigger_sql`)
-/// is emitted only then. Default mode logs rather than blocks, so
-/// redirecting there would write past the policy.
-///
-/// Non-RLS tables and unresolvable targets are left untouched.
+/// Sends an insert on a policy-bearing view that SQLite cannot run there, one
+/// with `RETURNING` or `ON CONFLICT`, to the backing table, or a targetless
+/// `ON CONFLICT DO NOTHING` to the view skipping conflicts, under strict
+/// validation, whose backing guards keep the policies, and refuses it
+/// otherwise.
 fn rewrite_rls_view_insert<'schema>(
     insert: &mut Insert,
     schema: &'schema ParserDB,
@@ -995,10 +981,23 @@ fn rewrite_rls_view_insert<'schema>(
         return Ok(target);
     }
 
-    // Strict mode: redirect to the backing table. The BEFORE INSERT guard on
-    // the backing table keeps WITH CHECK enforcement on this path, and the
-    // acting role's grants are checked here, since the view's triggers that
-    // check them are bypassed.
+    // PostgreSQL holds no SELECT policy to a targetless DO NOTHING, which the
+    // backing guard would.
+    if let Some(sqlparser::ast::OnInsert::OnConflict(conflict)) = &insert.on
+        && conflict.conflict_target.is_none()
+        && matches!(conflict.action, sqlparser::ast::OnConflictAction::DoNothing)
+        && returning.is_none()
+        && rls::marks_forwarding(table, schema, options)?
+    {
+        insert.on = None;
+        insert.table = TableObject::TableName(ObjectName::from(vec![quoted_ident(
+            &rls::conflict_skipping_view(table.table_name()),
+        )]));
+        return Ok(target);
+    }
+
+    // The backing guards keep the policies, and the view's grant checks run
+    // here.
     let backing = backing_table_name(table_name, options);
     gate_backing_redirect(insert, table, schema, options)?;
     insert.table = TableObject::TableName(backing);

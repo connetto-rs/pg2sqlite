@@ -89,6 +89,14 @@ mod schema {
     }
 
     diesel::table! {
+        /// The RLS view, whose plain insert lands a row the `SELECT` policies hide.
+        items (id) {
+            id -> Integer,
+            v -> Integer,
+        }
+    }
+
+    diesel::table! {
         /// The RLS view: SELECT USING (true) means all rows are readable.
         docs (id) {
             id -> Integer,
@@ -138,11 +146,11 @@ fn run_dml(conn: &mut SqliteConnection, pg_schema: &str, pg_dml: &str) -> QueryR
     Ok(last)
 }
 
-/// Seeds `items_rls` with `rows`, each `v` set to 0, bypassing the view.
+/// Seeds `items` with `rows`, each `v` set to 0.
 fn seed_items(conn: &mut SqliteConnection, rows: &[i32]) {
     let values: Vec<_> =
-        rows.iter().map(|id| (schema::items_rls::id.eq(id), schema::items_rls::v.eq(0))).collect();
-    diesel::insert_into(schema::items_rls::table).values(values).execute(conn).expect("seed items");
+        rows.iter().map(|id| (schema::items::id.eq(id), schema::items::v.eq(0))).collect();
+    diesel::insert_into(schema::items::table).values(values).execute(conn).expect("seed items");
 }
 
 /// Every stored `(id, v)` pair, read from the backing table.

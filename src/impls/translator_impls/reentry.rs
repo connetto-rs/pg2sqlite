@@ -27,13 +27,22 @@
 //! the body's `UPDATE` would leave the marker behind, and the row's
 //! maintenance triggers would stop firing. PostgreSQL has no `OR FAIL`, and
 //! no translated statement carries one.
+//!
+//! Under strict validation a table's view marks its forwarding insert in a
+//! second marker table, so that the backing table's guard holds only the rows
+//! a statement writes there directly to the `SELECT` policies. PostgreSQL
+//! applies them to an `INSERT ... RETURNING` and to an `INSERT ... ON
+//! CONFLICT` naming a conflict target, the inserts strict validation sends
+//! past the view, and not to a plain insert. The view marks right before its
+//! forwarding insert, whose `BEFORE INSERT` guard clears the mark, so a write
+//! a trigger of the forwarded row makes is held to the policies again.
 
 use alloc::collections::BTreeSet;
 use core::ops::ControlFlow;
 
 use sql_traits::{
     structs::ParserDB,
-    traits::{DatabaseLike, TriggerLike},
+    traits::{DatabaseLike, TableLike, TriggerLike},
 };
 use sqlparser::ast::{
     AlterTable, AlterTableOperation, BinaryOperator, DataType, Expr, Ident, ObjectName,
@@ -55,6 +64,10 @@ use crate::{
 
 /// What a table's name takes on to name its marker table.
 const SUFFIX: &str = "_pg2sqlite_reentries";
+
+/// What a table's name takes on to name the marker table of its view's
+/// forwarding insert.
+const FORWARD_SUFFIX: &str = "_pg2sqlite_forwards";
 
 /// The marker table's column holding the `rowid` of the row being written.
 const ROW: &str = "row_id";
@@ -173,13 +186,42 @@ pub(crate) fn unmark(marker: &ObjectName) -> Statement {
     ast_builder::delete(marker.clone(), Some(marks_row("NEW")))
 }
 
-/// The name of the table `marker` belongs to, when `marker` names a marker
-/// table.
-fn marked_table(marker: &ObjectName) -> Option<&str> {
+/// The marker table of `table`'s view's forwarding insert.
+pub(crate) fn forward_marker_table(table: &ObjectName) -> ObjectName {
+    append_suffix(&ObjectName(table.0.last().cloned().into_iter().collect()), FORWARD_SUFFIX)
+}
+
+/// Records in `marker` that the view is forwarding a row.
+pub(crate) fn mark_forward(marker: &ObjectName) -> Statement {
+    ast_builder::insert(
+        marker.clone(),
+        vec![ObjectName(vec![ObjectNamePart::Identifier(Ident::new("id"))])],
+        ast_builder::values(vec![vec![Expr::Value(sqlparser::ast::Value::Null.into())]]),
+    )
+}
+
+/// Clears the mark [`mark_forward`] recorded, as the guard passes the
+/// forwarded row.
+pub(crate) fn clear_forward(marker: &ObjectName) -> Statement {
+    ast_builder::delete(marker.clone(), None)
+}
+
+/// The condition holding unless the view is forwarding a row.
+pub(crate) fn not_forwarding(marker: &ObjectName) -> Expr {
+    no_marker(marker, Expr::Value(sqlparser::ast::Value::Boolean(true).into()))
+}
+
+/// The name `marker` takes on `suffix` to, when it ends with `suffix`.
+fn stripped<'m>(marker: &'m ObjectName, suffix: &str) -> Option<&'m str> {
     let marker = last_ident(marker)?.value.as_str();
-    let split = marker.len().checked_sub(SUFFIX.len())?;
-    let suffix = marker.get(split..)?;
-    suffix.eq_ignore_ascii_case(SUFFIX).then(|| marker.get(..split)).flatten()
+    let split = marker.len().checked_sub(suffix.len())?;
+    marker.get(split..)?.eq_ignore_ascii_case(suffix).then(|| marker.get(..split)).flatten()
+}
+
+/// The name of the table `marker` belongs to, when `marker` names a marker
+/// table of either kind.
+fn marked_table(marker: &ObjectName) -> Option<&str> {
+    stripped(marker, SUFFIX).or_else(|| stripped(marker, FORWARD_SUFFIX))
 }
 
 /// Whether `name` names a marker table.
@@ -193,30 +235,38 @@ fn table_key(name: &ObjectName) -> String {
     last_ident_value_or_display(name).to_ascii_lowercase()
 }
 
-/// The tables whose marker table the replica has, followed through a batch so
-/// that each statement creates, renames and drops the marker tables it
-/// affects.
+/// The marker tables the replica has, followed through a batch so that each
+/// statement creates, renames and drops the marker tables it affects.
 #[derive(Default)]
 pub(crate) struct MarkerTables {
-    /// Created by a statement of the batch, by folded table name.
+    /// Created by a statement of the batch, by folded marker table name.
     created: BTreeSet<String>,
-    /// Holding a maintenance trigger in the schema the batch starts from,
-    /// whose translation created its marker table, by folded table name.
+    /// Created by the translation of the schema the batch starts from, by
+    /// folded marker table name.
     inherited: BTreeSet<String>,
 }
 
 impl MarkerTables {
-    /// The marker tables of the maintenance triggers `initial` holds.
+    /// The marker tables of the maintenance triggers `initial` holds, and,
+    /// under `strict` validation, of the views over its tables with
+    /// row-level security.
     ///
     /// # Errors
     ///
     /// Returns an error when a trigger's table or function does not resolve.
-    pub(crate) fn seeded(initial: Option<&ParserDB>) -> Result<Self, Error> {
+    pub(crate) fn seeded(initial: Option<&ParserDB>, strict: bool) -> Result<Self, Error> {
         let mut tables = Self::default();
         let Some(schema) = initial else { return Ok(tables) };
         for trigger in schema.triggers() {
             if trigger.is_maintenance_trigger(schema)? {
-                tables.inherited.insert(table_key(&trigger.table_name));
+                tables.inherited.insert(table_key(&marker_table(&trigger.table_name)));
+            }
+        }
+        if strict {
+            for table in schema.tables() {
+                if table.has_row_level_security(schema)? {
+                    tables.inherited.insert(table_key(&forward_marker_table(&table.name)));
+                }
             }
         }
         Ok(tables)
@@ -229,20 +279,21 @@ impl MarkerTables {
         let mut named = Vec::new();
         for statement in emitted.iter() {
             let _ = visit_relations(statement, |name: &ObjectName| {
-                if let Some(table) = marked_table(name).map(str::to_ascii_lowercase)
-                    && !self.created.contains(&table)
-                    && !named.iter().any(|(known, _)| *known == table)
+                let key = table_key(name);
+                if is_marker_table(name)
+                    && !self.created.contains(&key)
+                    && !named.iter().any(|(known, _)| *known == key)
                 {
-                    named.push((table, name.clone()));
+                    named.push((key, name.clone()));
                 }
                 ControlFlow::<()>::Continue(())
             });
         }
-        for (table, marker) in named {
+        for (key, marker) in named {
             // A marker table the schema inherits is created again, since a
             // replica built before marker tables existed has none.
-            self.inherited.remove(&table);
-            self.created.insert(table);
+            self.inherited.remove(&key);
+            self.created.insert(key);
             emitted.push(create(marker));
         }
 
@@ -258,10 +309,10 @@ impl MarkerTables {
                 }
             }
             Statement::Drop { object_type: ObjectType::Table, names, .. } => {
-                for name in names {
-                    let table = table_key(name);
-                    if self.created.remove(&table) | self.inherited.remove(&table) {
-                        emitted.push(drop(marker_table(name)));
+                for marker in names.iter().flat_map(markers_of) {
+                    let key = table_key(&marker);
+                    if self.created.remove(&key) | self.inherited.remove(&key) {
+                        emitted.push(drop(marker));
                     }
                 }
             }
@@ -270,35 +321,43 @@ impl MarkerTables {
     }
 
     fn rename(&mut self, from: &ObjectName, to: &ObjectName, emitted: &mut Vec<Statement>) {
-        let table = table_key(from);
-        let marker = marker_table(from);
-        if self.inherited.remove(&table) {
-            emitted.push(create(marker.clone()));
-        } else if !self.created.remove(&table) {
-            return;
+        for (marker, renamed) in markers_of(from).into_iter().zip(markers_of(to)) {
+            let key = table_key(&marker);
+            if self.inherited.remove(&key) {
+                emitted.push(create(marker.clone()));
+            } else if !self.created.remove(&key) {
+                continue;
+            }
+            self.created.insert(table_key(&renamed));
+            emitted.push(Statement::AlterTable(AlterTable {
+                name: marker,
+                operations: vec![AlterTableOperation::RenameTable {
+                    table_name: RenameTableNameKind::To(renamed),
+                }],
+                if_exists: false,
+                only: false,
+                location: None,
+                on_cluster: None,
+                table_type: None,
+                end_token: AttachedToken::empty(),
+            }));
         }
-        self.created.insert(table_key(to));
-        emitted.push(Statement::AlterTable(AlterTable {
-            name: marker,
-            operations: vec![AlterTableOperation::RenameTable {
-                table_name: RenameTableNameKind::To(marker_table(to)),
-            }],
-            if_exists: false,
-            only: false,
-            location: None,
-            on_cluster: None,
-            table_type: None,
-            end_token: AttachedToken::empty(),
-        }));
     }
+}
+
+/// The marker tables `table` may have, of each kind.
+fn markers_of(table: &ObjectName) -> [ObjectName; 2] {
+    [marker_table(table), forward_marker_table(table)]
 }
 
 /// `CREATE TABLE IF NOT EXISTS <marker> (id INTEGER PRIMARY KEY, row_id
 /// INTEGER NOT NULL, event TEXT NOT NULL CHECK (event IN ('INSERT',
-/// 'UPDATE'))) STRICT`.
+/// 'UPDATE'))) STRICT`, or `CREATE TABLE IF NOT EXISTS <marker> (id INTEGER
+/// PRIMARY KEY) STRICT` for a forwarding marker.
 fn create(marker: ObjectName) -> Statement {
-    ast_builder::create_table(
-        marker,
+    let columns = if stripped(&marker, FORWARD_SUFFIX).is_some() {
+        vec![super::rls::generated_key_column()]
+    } else {
         vec![
             super::rls::generated_key_column(),
             super::rls::generated_table_column(ROW, DataType::Integer(None), true),
@@ -306,8 +365,9 @@ fn create(marker: ObjectName) -> Statement {
                 EVENT,
                 super::rls::one_of(EVENT, &MaintainedEvent::ALL.map(MaintainedEvent::keyword)),
             ),
-        ],
-    )
+        ]
+    };
+    ast_builder::create_table(marker, columns)
 }
 
 fn drop(marker: ObjectName) -> Statement {
