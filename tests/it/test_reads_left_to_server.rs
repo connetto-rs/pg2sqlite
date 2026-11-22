@@ -140,6 +140,36 @@ fn a_policy_reading_the_column_through_a_helper_is_named() {
     );
 }
 
+/// PostgreSQL rewrites a write through a view with one table in its `FROM`
+/// and plain columns onto that table, under the column each view column
+/// passes through.
+#[test]
+fn a_write_through_an_automatically_updatable_view_changes_its_table() {
+    let pg = INVITATIONS.replace(
+        "UPDATE invitations SET accepted_by_id = NEW.user_id",
+        "UPDATE open_invitations SET acceptor = NEW.user_id",
+    ) + "CREATE VIEW open_invitations AS
+  SELECT id, organization_id, accepted_by_id AS acceptor FROM invitations
+  WHERE accepted_by_id IS NULL;";
+    assert_eq!(
+        readers(&pg),
+        owned(&[
+            (
+                "FOREIGN KEY",
+                "(accepted_by_id) REFERENCES users",
+                "accepted_by_id of invitations",
+                "memberships_invitation_accepted"
+            ),
+            (
+                "POLICY",
+                "memberships_insert",
+                "accepted_by_id of invitations",
+                "memberships_invitation_accepted"
+            ),
+        ]),
+    );
+}
+
 #[test]
 fn without_the_option_nothing_is_named() {
     let deployment = Deployment::new("postgres", ["app"], []).expect("a valid deployment");
