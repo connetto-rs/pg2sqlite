@@ -22,7 +22,7 @@ use sql_traits::{
         Returned, RowCap, SetPacking, SettingComparison, SettingContent, SettingValue, TimeBound,
         TimeComparison, UnsetSetting, WalkArm, WalkDirection,
     },
-    traits::{ColumnLike, DatabaseLike, FunctionLike, TableLike},
+    traits::{DatabaseLike, FunctionLike, TableLike},
 };
 use sqlparser::ast::{
     ArrayElemTypeDef, BinaryOperator, CastKind, CreateTable, Cte, DataType, Expr, FunctionArg,
@@ -38,7 +38,7 @@ use crate::{
     errors::Error,
     impls::{
         function_helpers::{query_projection, simple_function_expr, string_literal},
-        object_name::last_ident,
+        object_name::{declared_column_ident, last_ident},
         privileges::{RoleTable, has_backing_table},
         query_builder::{
             from_relation, make_query, make_simple_select, plain_table_factor, single_expr_query,
@@ -477,7 +477,7 @@ impl<'db> Lowering<'_, 'db> {
         };
         let projected = |column: &<ParserDB as DatabaseLike>::Column, name: &str| {
             SelectItem::ExprWithAlias {
-                expr: Expr::Identifier(column_ident(column)),
+                expr: Expr::Identifier(declared_column_ident(column)),
                 alias: Ident::new(name),
             }
         };
@@ -497,9 +497,9 @@ impl<'db> Lowering<'_, 'db> {
         self.read.push(parent.table());
         let parents = self.called_set(parent.function(), parent.set(), &[])?;
         Ok(SetExpr::Select(Box::new(make_simple_select(
-            projection([qualified(ARM, column_ident(parent.key()))], names),
+            projection([qualified(ARM, declared_column_ident(parent.key()))], names),
             from_relation(aliased_table(parent.table(), ARM)),
-            Some(in_query(qualified(ARM, column_ident(parent.column())), parents)),
+            Some(in_query(qualified(ARM, declared_column_ident(parent.column())), parents)),
         ))))
     }
 
@@ -546,8 +546,8 @@ impl<'db> Lowering<'_, 'db> {
             self.read.push(joined.table());
             let key = joined.columns().iter().map(|(host, referenced)| {
                 equals(
-                    qualified(&name, column_ident(referenced)),
-                    qualified(ARM, column_ident(host)),
+                    qualified(&name, declared_column_ident(referenced)),
+                    qualified(ARM, declared_column_ident(host)),
                 )
             });
             joins.push(Join {
@@ -564,7 +564,8 @@ impl<'db> Lowering<'_, 'db> {
             GrantedTo::Request(comparison) => conditions.push(request(comparison)),
             GrantedTo::Set(grantees) => {
                 let set = self.called_set(grantees.function(), grantees.set(), &[])?;
-                conditions.push(in_query(qualified(ARM, column_ident(grantees.column())), set));
+                conditions
+                    .push(in_query(qualified(ARM, declared_column_ident(grantees.column())), set));
             }
             GrantedTo::Anyone => {}
         }
@@ -583,8 +584,9 @@ impl<'db> Lowering<'_, 'db> {
         for exclusion in grant.exclusions() {
             conditions.push(self.exclusion(exclusion)?);
         }
-        let (returned, labels) =
-            returned_values(grant.returned(), |column| qualified(ARM, column_ident(column)));
+        let (returned, labels) = returned_values(grant.returned(), |column| {
+            qualified(ARM, declared_column_ident(column))
+        });
         joins.extend(labels);
         Ok(SetExpr::Select(Box::new(make_simple_select(
             projection(returned, names),
@@ -627,9 +629,9 @@ impl<'db> Lowering<'_, 'db> {
             .iter()
             .map(|operand| {
                 match operand {
-                    CapOperand::Column(column) => qualified(ARM, column_ident(column)),
+                    CapOperand::Column(column) => qualified(ARM, declared_column_ident(column)),
                     CapOperand::Joined { row, column } => {
-                        qualified(&joined_alias(*row), column_ident(column))
+                        qualified(&joined_alias(*row), declared_column_ident(column))
                     }
                     CapOperand::Value(value) => Expr::Value(value.clone().into()),
                 }
@@ -667,8 +669,8 @@ impl<'db> Lowering<'_, 'db> {
             .iter()
             .map(|correlation| {
                 equals(
-                    qualified(BLOCKING, column_ident(correlation.blocking_column())),
-                    qualified(ARM, column_ident(correlation.arm_column())),
+                    qualified(BLOCKING, declared_column_ident(correlation.blocking_column())),
+                    qualified(ARM, declared_column_ident(correlation.arm_column())),
                 )
             })
             .collect();
@@ -689,7 +691,7 @@ impl<'db> Lowering<'_, 'db> {
     /// but not the column's value, as PostgreSQL's exclusion is.
     fn exclusion(&mut self, exclusion: &ExcludedSet<'db, ParserDB>) -> Result<Expr, Error> {
         let excluded = self.set(exclusion.set(), &[])?;
-        Ok(not_in_query(qualified(ARM, column_ident(exclusion.column())), excluded))
+        Ok(not_in_query(qualified(ARM, declared_column_ident(exclusion.column())), excluded))
     }
 }
 
@@ -805,7 +807,7 @@ fn restrictions<'r>(
     restrictions: &'r [Restriction<'_, ParserDB>],
 ) -> impl Iterator<Item = Expr> + 'r {
     restrictions.iter().map(move |restriction| {
-        let column = Box::new(qualified(relation, column_ident(restriction.column())));
+        let column = Box::new(qualified(relation, declared_column_ident(restriction.column())));
         match restriction {
             Restriction::In(set) => {
                 Expr::In {
@@ -833,7 +835,7 @@ fn time_bounds<'r>(
     bounds: &'r [TimeBound<'_, ParserDB>],
 ) -> impl Iterator<Item = Expr> + 'r {
     bounds.iter().map(move |bound| {
-        let column = qualified(relation, column_ident(bound.column()));
+        let column = qualified(relation, declared_column_ident(bound.column()));
         let operator = match bound.comparison() {
             TimeComparison::Later => BinaryOperator::Gt,
             TimeComparison::LaterOrEqual => BinaryOperator::GtEq,
@@ -861,7 +863,7 @@ fn time_bounds<'r>(
 fn request(comparison: &SettingComparison<'_, ParserDB>) -> Expr {
     let name = comparison.setting().name();
     let read = |empty_is_null| setting_read(name, comparison.raises_when_unset(), empty_is_null);
-    let column = qualified(ARM, column_ident(comparison.column()));
+    let column = qualified(ARM, declared_column_ident(comparison.column()));
     match comparison.value() {
         SettingValue::Caller(declared)
         | SettingValue::Principal { identity: declared, .. }
@@ -979,12 +981,6 @@ fn aliased_table(table: &CreateTable, name: &str) -> TableFactor {
 /// `<relation>.<column>`.
 fn qualified(relation: &str, column: Ident) -> Expr {
     Expr::CompoundIdentifier(vec![Ident::new(relation), column])
-}
-
-/// A column's name, quoted where the schema quotes it.
-fn column_ident(column: &<ParserDB as DatabaseLike>::Column) -> Ident {
-    let name = column.column_name();
-    if column.column_name_is_quoted() { Ident::with_quote('"', name) } else { Ident::new(name) }
 }
 
 /// Points every relation of a lowered set at its table's backing table.

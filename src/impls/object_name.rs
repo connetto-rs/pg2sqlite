@@ -5,7 +5,7 @@ use core::ops::ControlFlow;
 use sql_traits::{
     errors::LookupError,
     structs::{IdentifierCase, ParserDB, TargetName},
-    traits::{DatabaseLike, TableLike},
+    traits::{ColumnLike, DatabaseLike, TableLike},
     utils::identifier_resolution::identifiers_match,
 };
 use sqlparser::ast::{
@@ -267,6 +267,12 @@ pub(crate) fn quote_identifier(name: &str) -> String {
 #[must_use]
 pub(crate) fn quoted_ident(name: &str) -> Ident {
     if quote_identifier(name) == name { Ident::new(name) } else { Ident::with_quote('"', name) }
+}
+
+/// A column's name, quoted where the schema quotes it.
+pub(crate) fn declared_column_ident(column: &<ParserDB as DatabaseLike>::Column) -> Ident {
+    let name = column.column_name();
+    if column.column_name_is_quoted() { Ident::with_quote('"', name) } else { Ident::new(name) }
 }
 
 #[cfg(all(test, feature = "std"))]
