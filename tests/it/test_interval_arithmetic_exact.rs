@@ -9892,7 +9892,7 @@ fn interval_arithmetic_in_an_index_expression_is_refused() {
 fn interval_sum_in_a_generated_column_is_refused() {
     refused(
         "CREATE TABLE gen_s (g text GENERATED ALWAYS AS (sum(interval '1 day')) STORED)",
-        "scalar subquery",
+        "aggregate functions are not allowed in column generation expressions",
     );
 }
 

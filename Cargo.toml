@@ -23,7 +23,6 @@ sql-traits = { git = "https://github.com/connetto-rs/sql-traits", branch = "main
 # Reads, prints, computes and compares PostgreSQL intervals, timestamps, time
 # zones and jsonb the way PostgreSQL 18 does.
 sql-values = { version = "0.6", default-features = false, features = ["tzdb"] }
-sql-values-05 = { package = "sql-values", version = "0.5.1", default-features = false }
 # The SQLSTATE a replica refusal reports, the type diesel reads PostgreSQL's
 # error codes as.
 sqlstate = "0.2"

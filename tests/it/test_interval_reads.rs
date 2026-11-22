@@ -1777,7 +1777,7 @@ fn a_check_with_a_scalar_subquery_beside_an_interval_column_is_refused() {
 fn a_generated_column_with_an_aggregate_over_an_interval_is_refused() {
     refused(
         "CREATE TABLE ck_g (iv interval, g text GENERATED ALWAYS AS (min(iv)) STORED)",
-        "comparison key",
+        "aggregate functions are not allowed in column generation expressions",
     );
 }
 
