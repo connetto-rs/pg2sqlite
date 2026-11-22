@@ -29,7 +29,10 @@ use sqlparser::ast::{
     TableWithJoins, Update, UpdateTableFromKind, Visit, Visitor,
 };
 
-use super::{emitted_namespace::key, shared_helpers::join_constraint_ref};
+use super::{
+    emitted_namespace::key,
+    shared_helpers::{join_constraint_ref, leaf_factors},
+};
 use crate::errors::Error;
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
@@ -628,12 +631,10 @@ impl Counter<'_, '_> {
                 tally.add(&self.view(&target));
             }
         }
-        for table in read {
-            for factor in factors(table) {
-                tally.open(RELATION);
-                if let TableFactor::Table { name, .. } = factor {
-                    tally.add(&self.relation(&key(name)));
-                }
+        for factor in leaf_factors(read) {
+            tally.open(RELATION);
+            if let TableFactor::Table { name, .. } = factor {
+                tally.add(&self.relation(&key(name)));
             }
         }
     }
@@ -1152,7 +1153,7 @@ impl Visitor for Builder<'_, '_> {
         let mut conditions: Vec<&Expr> = select.selection.iter().collect();
         for table in &select.from {
             conditions.extend(join_conditions(table));
-            for factor in factors(table) {
+            for factor in leaf_factors([table]) {
                 items.push(self.item(factor));
                 if let TableFactor::Table { name, args: None, .. } = factor {
                     read.push(key(name));
@@ -1443,23 +1444,6 @@ fn join_conditions(table: &TableWithJoins) -> Vec<&Expr> {
         }
     }
     conditions
-}
-
-/// The relations `table` reads, joined ones and nested joins included.
-fn factors(table: &TableWithJoins) -> Vec<&TableFactor> {
-    let mut factors = Vec::new();
-    let mut pending: Vec<&TableWithJoins> = vec![table];
-    while let Some(table) = pending.pop() {
-        for factor in
-            core::iter::once(&table.relation).chain(table.joins.iter().map(|join| &join.relation))
-        {
-            match factor {
-                TableFactor::NestedJoin { table_with_joins, .. } => pending.push(table_with_joins),
-                factor => factors.push(factor),
-            }
-        }
-    }
-    factors
 }
 
 /// The name SQLite files `name` under, which folds ASCII case.

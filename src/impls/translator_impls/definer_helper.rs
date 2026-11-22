@@ -44,6 +44,7 @@ use crate::{
             from_relation, make_query, make_simple_select, plain_table_factor, single_expr_query,
         },
         session_variable,
+        shared_helpers::leaf_factors,
         translator_impls::sql_helper::{declared_helper, hidden_read, inlined_rows},
     },
     options::TranslationContext,
@@ -189,18 +190,7 @@ pub(crate) fn check_lateral_calls(
     schema: &ParserDB,
     options: &TranslationContext<'_>,
 ) -> Result<(), Error> {
-    let mut factors = Vec::new();
-    let mut tables: Vec<&TableWithJoins> = from.iter().collect();
-    while let Some(table) = tables.pop() {
-        for factor in
-            core::iter::once(&table.relation).chain(table.joins.iter().map(|join| &join.relation))
-        {
-            match factor {
-                TableFactor::NestedJoin { table_with_joins, .. } => tables.push(table_with_joins),
-                other => factors.push(other),
-            }
-        }
-    }
+    let factors = leaf_factors(from);
     if factors.len() < 2 {
         return Ok(());
     }

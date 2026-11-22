@@ -1117,6 +1117,28 @@ fn has_nested_join(entry: &sqlparser::ast::TableWithJoins) -> bool {
         .any(|factor| matches!(factor, sqlparser::ast::TableFactor::NestedJoin { .. }))
 }
 
+/// The relations `from` reads, joined ones and those inside nested joins
+/// included.
+pub(crate) fn leaf_factors<'a>(
+    from: impl IntoIterator<Item = &'a sqlparser::ast::TableWithJoins>,
+) -> Vec<&'a sqlparser::ast::TableFactor> {
+    let mut factors = Vec::new();
+    let mut pending: Vec<&sqlparser::ast::TableWithJoins> = from.into_iter().collect();
+    while let Some(table) = pending.pop() {
+        for factor in
+            core::iter::once(&table.relation).chain(table.joins.iter().map(|join| &join.relation))
+        {
+            match factor {
+                sqlparser::ast::TableFactor::NestedJoin { table_with_joins, .. } => {
+                    pending.push(table_with_joins);
+                }
+                factor => factors.push(factor),
+            }
+        }
+    }
+    factors
+}
+
 /// Appends `entry` and everything a nested join inside it hides.
 #[cfg_attr(feature = "std", recursive::recursive)]
 fn flatten_relations(
