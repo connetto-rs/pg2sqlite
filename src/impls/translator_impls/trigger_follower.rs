@@ -189,10 +189,38 @@ impl TriggerFollower {
 
     fn forget(&mut self, name: &ObjectName, table: Option<&ObjectName>) {
         let (name, table) = (folded(name), table.map(folded));
-        self.live.retain(|followed| {
-            folded(&followed.create.name) != name
-                || table.as_ref().is_some_and(|table| *table != folded(&followed.create.table_name))
-        });
+        self.live.retain(|followed| !followed.is(&name, table.as_deref()));
+    }
+
+    /// The SQLite triggers the last translation of the live trigger `name`,
+    /// on `table` when given, created, a seeded one first translated with
+    /// `translate_seeded`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error translating a seeded trigger returns.
+    pub(crate) fn created(
+        &mut self,
+        name: &ObjectName,
+        table: Option<&ObjectName>,
+        translate_seeded: &mut Translate<'_>,
+    ) -> Result<Vec<ObjectName>, Error> {
+        let (name, table) = (folded(name), table.map(folded));
+        let Some(followed) =
+            self.live.iter_mut().find(|followed| followed.is(&name, table.as_deref()))
+        else {
+            return Ok(Vec::new());
+        };
+        let rendered = match &mut followed.rendered {
+            Some(rendered) => rendered,
+            unrendered @ None => {
+                unrendered.insert(translate_seeded(
+                    &Statement::CreateTrigger(followed.create.clone()),
+                    &mut |_| {},
+                )?)
+            }
+        };
+        Ok(created_triggers(rendered))
     }
 
     /// The live triggers whose translation changes across `event`, from
@@ -243,15 +271,7 @@ impl TriggerFollower {
             if rendered == last {
                 continue;
             }
-            let created = last
-                .iter()
-                .filter_map(|statement| {
-                    match statement {
-                        Statement::CreateTrigger(part) => Some(part.name.clone()),
-                        _ => None,
-                    }
-                })
-                .collect();
+            let created = created_triggers(&last);
             reemissions.push(Reemission {
                 drop: Statement::DropTrigger(DropTrigger {
                     if_exists: true,
@@ -267,4 +287,25 @@ impl TriggerFollower {
         }
         Ok(reemissions)
     }
+}
+
+impl Followed {
+    /// Whether this is the trigger `name`, folded, on `table` when given.
+    fn is(&self, name: &str, table: Option<&str>) -> bool {
+        folded(&self.create.name) == name
+            && table.is_none_or(|table| table == folded(&self.create.table_name))
+    }
+}
+
+/// The names of the SQLite triggers `rendered` creates.
+fn created_triggers(rendered: &[Statement]) -> Vec<ObjectName> {
+    rendered
+        .iter()
+        .filter_map(|statement| {
+            match statement {
+                Statement::CreateTrigger(part) => Some(part.name.clone()),
+                _ => None,
+            }
+        })
+        .collect()
 }

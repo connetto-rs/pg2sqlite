@@ -57,7 +57,8 @@ pub(crate) struct Unit<'a> {
     /// The emitted statements, in order.
     pub(crate) emitted: &'a [Statement],
     /// Whether the emitted triggers were rebuilt from the other triggers
-    /// sharing their slots, which retranslating the source alone cannot
+    /// sharing their slots, or drop SQLite triggers an earlier statement's
+    /// translation created, which retranslating the source alone cannot
     /// reproduce.
     pub(crate) rebuilt_trigger: bool,
     /// Whether a view held back until the relations it reads exist moved out
@@ -297,9 +298,9 @@ fn replay_unit(
         if context.shares_trigger_slot(&crate::impls::translator_impls::trigger_slots::trigger_key(create)));
     if unit.rebuilt_trigger || shares_slot {
         return Err(refusal(format!(
-            "statement {} emits a trigger shared with other triggers on the same table, timing \
-             and event, and replaying it here renames what the trigger reads, which a \
-             retranslation of that one statement cannot carry into the shared trigger",
+            "statement {} emits triggers that other statements of the batch shape, and \
+             replaying it here renames what they read, which a retranslation of that one \
+             statement cannot carry into them",
             id.index()
         )));
     }
