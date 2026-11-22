@@ -677,19 +677,15 @@ struct RecordReads<'r> {
 }
 
 impl RecordReads<'_> {
-    /// Records a read of `record`, of its `field` or of all of it.
-    fn read(&mut self, record: &Ident, field: Option<&Ident>) {
-        if record.quote_style.is_some() {
-            return;
-        }
-        let read = if record.value.eq_ignore_ascii_case("old") {
-            &mut *self.old
-        } else if record.value.eq_ignore_ascii_case("new") {
-            &mut *self.new
-        } else {
-            return;
+    /// Records a read through a name of `parts`: of the field after `OLD` or
+    /// `NEW`, or of all of the record where the name ends at it.
+    fn read<'n>(&mut self, mut parts: impl Iterator<Item = Option<&'n Ident>>) {
+        let read = match parts.next().flatten() {
+            Some(record) if names_record(record, "old") => &mut *self.old,
+            Some(record) if names_record(record, "new") => &mut *self.new,
+            _ => return,
         };
-        match field {
+        match parts.next().flatten() {
             Some(field) => read.insert(crate::impls::translator_impls::plpgsql::fold(field)),
             None => *read = Columns::Row,
         }
@@ -697,9 +693,17 @@ impl RecordReads<'_> {
 
     /// Records the read of `record.*`.
     fn wildcard(&mut self, record: &ObjectName) {
-        if let [ObjectNamePart::Identifier(record)] = record.0.as_slice() {
-            self.read(record, None);
-        }
+        self.read(record.0.iter().map(ObjectNamePart::as_ident));
+    }
+}
+
+/// Whether `ident` names `record`, a lowercase name, as PostgreSQL folds an
+/// unquoted name and keeps a quoted one.
+fn names_record(ident: &Ident, record: &str) -> bool {
+    if ident.quote_style.is_some() {
+        ident.value == record
+    } else {
+        ident.value.eq_ignore_ascii_case(record)
     }
 }
 
@@ -708,12 +712,8 @@ impl Visitor for RecordReads<'_> {
 
     fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
         match expr {
-            Expr::Identifier(record) => self.read(record, None),
-            Expr::CompoundIdentifier(parts) => {
-                if let [record, field, ..] = parts.as_slice() {
-                    self.read(record, Some(field));
-                }
-            }
+            Expr::Identifier(record) => self.read(core::iter::once(Some(record))),
+            Expr::CompoundIdentifier(parts) => self.read(parts.iter().map(Some)),
             Expr::QualifiedWildcard(record, _) => self.wildcard(record),
             Expr::Function(call) => {
                 if let FunctionArguments::List(list) = &call.args {
@@ -774,11 +774,7 @@ enum Record {
 /// The record `value` returns when it is `NEW` or `OLD` itself.
 fn returned_record(value: &sqlparser::ast::Query) -> Option<Record> {
     let Expr::Identifier(row) = embedded::expression(value).into_owned() else { return None };
-    if row.value.eq_ignore_ascii_case("new") {
-        Some(Record::New)
-    } else if row.value.eq_ignore_ascii_case("old") {
-        Some(Record::Old)
-    } else {
-        None
-    }
+    [(Record::New, "new"), (Record::Old, "old")]
+        .into_iter()
+        .find_map(|(record, name)| names_record(&row, name).then_some(record))
 }
