@@ -1687,6 +1687,48 @@ $$;",
 }
 
 #[test]
+fn a_helper_writing_in_a_loop_reports_its_write_on_each_call_path() {
+    let pg = notes_logged_with(
+        "
+CREATE FUNCTION log_note(note INTEGER) RETURNS VOID LANGUAGE plpgsql AS $$
+DECLARE
+  revised INTEGER;
+BEGIN
+  FOR revised IN SELECT id FROM notes WHERE id = note LOOP
+    INSERT INTO note_events (note_id) VALUES (revised);
+  END LOOP;
+END
+$$;
+CREATE FUNCTION first_log(note INTEGER) RETURNS VOID LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM log_note(note);
+END
+$$;
+CREATE FUNCTION second_log(note INTEGER) RETURNS VOID LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM log_note(note);
+END
+$$;",
+        "",
+        &format!("  PERFORM first_log(NEW.id);\n  PERFORM second_log(NEW.id);\n{REFUSE}"),
+    );
+    assert_eq!(
+        left_to_server(&pg),
+        owned(&[
+            ("INSERT in TRIGGER", "notes_logged", "notes"),
+            ("INSERT in TRIGGER", "notes_logged", "notes"),
+        ])
+    );
+    let shown = left_to_server_shown(&pg);
+    for helper in ["first_log", "second_log"] {
+        let reason = format!(
+            "log_once() calls {helper}(), which calls log_note(), which runs INSERT on note_events"
+        );
+        assert!(shown.iter().any(|line| line.contains(&reason)), "{shown:?}");
+    }
+}
+
+#[test]
 fn a_read_inside_a_loop_after_its_removed_write_leaves_the_trigger_out() {
     let pg = notes_logged_with(
         "",

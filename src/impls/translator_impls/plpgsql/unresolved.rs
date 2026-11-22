@@ -255,11 +255,9 @@ enum BodyNames {
     /// the order the body names them.
     Known { relations: BTreeSet<String>, calls: Vec<ObjectName> },
     /// Its names are not all known before it runs, as with SQL it builds at
-    /// run time.
+    /// run time, or it does not parse, or is written in a language other
+    /// than SQL and PL/pgSQL.
     Unknown,
-    /// It does not parse, or is written in a language other than SQL and
-    /// PL/pgSQL.
-    Unparsed,
 }
 
 impl BodyNames {
@@ -267,8 +265,9 @@ impl BodyNames {
     /// function `signature` describes.
     fn of(function: &CreateFunction, schema: &ParserDB, signature: &Signature) -> Self {
         let (mut relations, mut calls) = (BTreeSet::new(), Vec::new());
-        match parsed_body(function, schema) {
-            Ok(Body::PlPgSql(block)) => {
+        let Ok(body) = parsed_body(function, schema) else { return Self::Unknown };
+        match body {
+            Body::PlPgSql(block) => {
                 let Ok(sites) = block.sites(signature, |_| true) else { return Self::Unknown };
                 for site in sites {
                     match site.sql {
@@ -278,12 +277,11 @@ impl BodyNames {
                     }
                 }
             }
-            Ok(Body::Sql(statements)) => {
+            Body::Sql(statements) => {
                 for statement in statements.iter() {
                     names(statement, &mut relations, &mut calls);
                 }
             }
-            Err(_) => return Self::Unparsed,
         }
         Self::Known { relations, calls }
     }
@@ -358,12 +356,12 @@ impl ReadBodies {
 
 /// What `function`'s body in `schema` reaches, the bodies of the functions it
 /// calls included, or `None` when its names are not all known before it runs,
-/// as with SQL it builds at run time. A builtin reaches nothing. `bodies`
-/// holds what each body read before names.
+/// as with SQL it builds at run time or a body that does not parse. A builtin
+/// reaches nothing. `bodies` holds what each body read before names.
 ///
 /// # Errors
 ///
-/// Returns the error reading a body returns.
+/// Returns the error looking up `function` itself returns.
 pub(crate) fn body_reach(
     function: &ObjectName,
     schema: &ParserDB,
@@ -395,10 +393,6 @@ pub(crate) fn body_reach(
                 pending.extend(calls.iter().cloned());
             }
             BodyNames::Unknown => return Ok(None),
-            BodyNames::Unparsed if reach.functions.len() > 1 => return Ok(None),
-            // The trigger's own function refuses with the error reading it
-            // as a trigger body returns.
-            BodyNames::Unparsed => return schema.function_body(&function).map(|_| None),
         }
     }
     Ok(Some(reach))

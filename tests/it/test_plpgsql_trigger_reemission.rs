@@ -279,3 +279,24 @@ fn a_function_the_trigger_reads_rows_from_runs_its_body_when_the_run_happens() {
         assert_eq!(audited(&mut connection), [(2, Some("v2".to_owned()))]);
     }
 }
+
+/// A trigger reading rows from a function whose body is `BEGIN ATOMIC` runs
+/// the body of the function that one calls as it is when the run happens.
+#[test]
+fn a_function_an_atomic_body_calls_runs_its_body_when_the_run_happens() {
+    let label = |label: &str| {
+        format!(
+            "CREATE OR REPLACE FUNCTION label() RETURNS text LANGUAGE sql IMMUTABLE
+             AS $$ SELECT '{label}' $$;"
+        )
+    };
+    let schema = label("v1")
+        + "CREATE FUNCTION labels(item integer) RETURNS TABLE (note text) LANGUAGE sql IMMUTABLE
+           BEGIN ATOMIC SELECT label(); END;"
+        + &with_body(
+            "INSERT INTO audit (id, note) SELECT NEW.id, labelled.note FROM labels(NEW.id) labelled;",
+        );
+    let mut connection = replica(&[&schema, &label("v2")]);
+    run(&mut connection, "INSERT INTO docs (id, owner) VALUES (2, 'alice')").unwrap();
+    assert_eq!(audited(&mut connection), [(2, Some("v2".to_owned()))]);
+}
