@@ -175,14 +175,16 @@ fn reject_foreign_keys_over_intervals(
 
 /// Refuses one foreign key whose local or referenced side names an interval
 /// column. A key into a table left off the replica leaves with it and is not
-/// refused.
+/// refused, and neither is any key the replica leaves to the server.
 fn reject_foreign_key(
     fk: &ForeignKeyConstraint,
     schema: &ParserDB,
     interval_columns: &[String],
     options: &TranslationContext<'_>,
 ) -> Result<(), Error> {
-    if OffReplica::of(&fk.foreign_table, schema, options)?.is_some() {
+    if options.is_foreign_keys_omitted()
+        || OffReplica::of(&fk.foreign_table, schema, options)?.is_some()
+    {
         return Ok(());
     }
     if fk.columns.iter().any(|column| column_named(interval_columns, &column.value)) {

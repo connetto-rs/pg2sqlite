@@ -687,11 +687,12 @@ fn referenced_columns(
 }
 
 /// Reports and answers `true` when the replica leaves out `key`, declared on
-/// `table` over `columns` and named `name`, because one of its actions writes
-/// child rows the server writes itself, or because the rows it references
-/// come from a trigger on `table` whose writes the replica leaves to the
-/// server. A key into a table left off the replica answers `false`, since it
-/// leaves with that table unreported.
+/// `table` over `columns` and named `name`: every key under
+/// [`Pg2SqliteOptions::with_foreign_keys_omitted`](crate::options::Pg2SqliteOptions::with_foreign_keys_omitted),
+/// else one whose actions write child rows the server writes itself, or
+/// whose referenced rows come from a trigger on `table` whose writes the
+/// replica leaves to the server. A key into a table left off the replica
+/// answers `false`, since it leaves with that table unreported.
 ///
 /// The key goes whole. Kept as `NO ACTION` it would refuse an offline delete
 /// of a parent whose children the server removes, which the replica still
@@ -712,31 +713,8 @@ pub(crate) fn foreign_key_left_to_server(
     options: &TranslationContext<'_>,
     emit: WarningSink<'_>,
 ) -> Result<bool, Error> {
-    if !options.is_server_derived_writes_omitted() {
+    let Some(reason) = reason_left_to_server(key, table, schema, options)? else {
         return Ok(false);
-    }
-    let actions: Vec<String> = [
-        ("ON DELETE", action_writes_rows(key.on_delete)),
-        ("ON UPDATE", action_writes_rows(key.on_update)),
-    ]
-    .into_iter()
-    .filter_map(|(clause, action)| action.map(|action| format!("{clause} {action}")))
-    .collect();
-    let referenced = last_ident_value_or_display(&key.foreign_table);
-    let reason = if actions.is_empty() {
-        let Some(trigger) = referenced_rows_left_to_server(key, table, schema, options)? else {
-            return Ok(false);
-        };
-        format!(
-            "the {referenced} rows it references come from TRIGGER {trigger}, whose writes the \
-             server runs when it applies the upload"
-        )
-    } else {
-        let verb = if actions.len() == 1 { "writes" } else { "write" };
-        format!(
-            "its {} {verb} rows the server writes itself when it applies the upload",
-            actions.join(" and ")
-        )
     };
     if OffReplica::of(&key.foreign_table, schema, options)?.is_some() {
         return Ok(false);
@@ -768,6 +746,47 @@ fn key_name(key: &ForeignKeyConstraint, name: Option<&Ident>, columns: &[Ident])
     )
 }
 
+/// Why the replica leaves `key`, declared on `table`, to the server, or
+/// `None` when it keeps the key.
+fn reason_left_to_server(
+    key: &ForeignKeyConstraint,
+    table: &ObjectName,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<Option<String>, Error> {
+    if options.is_foreign_keys_omitted() {
+        return Ok(Some(
+            "the replica holds a partial copy of the rows, so the server checks every foreign key \
+             and runs its actions when it applies the upload"
+                .to_owned(),
+        ));
+    }
+    if !options.is_server_derived_writes_omitted() {
+        return Ok(None);
+    }
+    let actions: Vec<String> = [
+        ("ON DELETE", action_writes_rows(key.on_delete)),
+        ("ON UPDATE", action_writes_rows(key.on_update)),
+    ]
+    .into_iter()
+    .filter_map(|(clause, action)| action.map(|action| format!("{clause} {action}")))
+    .collect();
+    if !actions.is_empty() {
+        let verb = if actions.len() == 1 { "writes" } else { "write" };
+        return Ok(Some(format!(
+            "its {} {verb} rows the server writes itself when it applies the upload",
+            actions.join(" and ")
+        )));
+    }
+    let referenced = last_ident_value_or_display(&key.foreign_table);
+    Ok(referenced_rows_left_to_server(key, table, schema, options)?.map(|trigger| {
+        format!(
+            "the {referenced} rows it references come from TRIGGER {trigger}, whose writes the \
+             server runs when it applies the upload"
+        )
+    }))
+}
+
 /// `column` without the `REFERENCES` options the replica leaves to the
 /// server, or `None` when it leaves out none of them.
 ///
@@ -781,7 +800,7 @@ pub(crate) fn column_without_keys_left_to_server(
     options: &TranslationContext<'_>,
     emit: WarningSink<'_>,
 ) -> Result<Option<ColumnDef>, Error> {
-    if !options.is_server_derived_writes_omitted() {
+    if !options.is_server_derived_writes_omitted() && !options.is_foreign_keys_omitted() {
         return Ok(None);
     }
     let mut kept: Option<Vec<_>> = None;

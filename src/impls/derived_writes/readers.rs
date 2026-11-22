@@ -112,7 +112,8 @@ fn read_triggers<'a>(
         let mut run = trigger_chain(trigger, schema, options)?;
         let disposition = match &mut run {
             Some((function, chain))
-                if !matches!(trigger.period, Some(TriggerPeriod::InsteadOf)) =>
+                if options.is_server_derived_writes_omitted()
+                    && !matches!(trigger.period, Some(TriggerPeriod::InsteadOf)) =>
             {
                 chain_disposition(trigger, function, chain, schema, options)?
             }
@@ -126,8 +127,9 @@ fn read_triggers<'a>(
 /// A [`TranslationWarning::ReadsLeftToServer`] for each construct the replica
 /// keeps on `schema`, the schema `statements` leave on `initial`, and each
 /// writer whose writes it leaves to the server that changes what the
-/// construct reads, none unless the replica leaves those writes out. A pair
-/// `initial` already holds is reported by the translation that brought it.
+/// construct reads, none unless the replica leaves those writes or every
+/// foreign key out. A pair `initial` already holds is reported by the
+/// translation that brought it.
 ///
 /// # Errors
 ///
@@ -139,7 +141,7 @@ pub(crate) fn reads_left_to_server(
     statements: &[Statement],
     options: &TranslationContext<'_>,
 ) -> Result<Vec<TranslationWarning>, Error> {
-    if !options.is_server_derived_writes_omitted() {
+    if !options.is_server_derived_writes_omitted() && !options.is_foreign_keys_omitted() {
         return Ok(Vec::new());
     }
     let triggers = live_triggers(initial.into_iter().flat_map(DatabaseLike::triggers), statements);
@@ -215,7 +217,8 @@ fn add(omitted: &mut Vec<Omitted>, writer: &Writer, relation: String, changes: C
 /// leaves out or keeps without them, the row a `BEFORE` row trigger it
 /// leaves out assigns in `NEW`, every column of it as for a firing write, and
 /// those of each foreign key action that writes rows. A table left off the
-/// replica takes its triggers and keys with it.
+/// replica takes its triggers and keys with it, and a replica leaving only
+/// its foreign keys to the server runs every trigger itself.
 fn omitted_writes(
     schema: &ParserDB,
     triggers: &[ReadTrigger<'_>],
