@@ -285,3 +285,46 @@ fn a_referenced_table_drops_a_column_inside_a_transaction() {
     let mut connection = helpers::apply_with_options(pg, &omitted()).expect("apply");
     connection.batch_execute("INSERT INTO t (id, a) VALUES (2, 2)").expect("t keeps a and id");
 }
+
+#[test]
+fn readers_of_rows_a_cascade_removes_are_named_and_a_kept_trigger_writes_none() {
+    let pg = "
+CREATE TABLE memberships (organization_id INT NOT NULL, user_id INT NOT NULL,
+  PRIMARY KEY (organization_id, user_id));
+CREATE TABLE team_members (team_id INT NOT NULL, organization_id INT NOT NULL,
+  user_id INT NOT NULL, PRIMARY KEY (team_id, user_id),
+  FOREIGN KEY (organization_id, user_id) REFERENCES memberships (organization_id, user_id)
+    ON DELETE CASCADE);
+CREATE TABLE audit_events (id INT PRIMARY KEY, table_name TEXT NOT NULL);
+CREATE FUNCTION record_audit_event() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO audit_events (id, table_name) VALUES (NEW.user_id, TG_TABLE_NAME);
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER memberships_audit AFTER INSERT ON memberships
+  FOR EACH ROW EXECUTE FUNCTION record_audit_event();
+";
+
+    let stale: Vec<(String, String, String)> = report(pg, &omitted())
+        .warnings
+        .into_iter()
+        .filter_map(|warning| {
+            match warning {
+                TranslationWarning::ReadsLeftToServer { construct, name, writer_name, .. } => {
+                    Some((construct, name, writer_name))
+                }
+                _ => None,
+            }
+        })
+        .collect();
+
+    assert_eq!(
+        stale,
+        [(
+            "PRIMARY KEY".to_owned(),
+            "team_members_pkey".to_owned(),
+            "(organization_id, user_id) REFERENCES memberships".to_owned(),
+        )]
+    );
+}
