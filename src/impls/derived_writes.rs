@@ -30,6 +30,7 @@ pub(crate) use chain::without_removed_writes;
 use columns::Columns;
 pub(crate) use firing::{FiringTrigger, firing_triggers};
 use landing::Landing;
+pub(crate) use landing::output_names;
 pub(crate) use readers::reads_left_to_server;
 use sql_traits::{
     structs::ParserDB,
@@ -73,7 +74,7 @@ pub(crate) enum Event {
 }
 
 impl Event {
-    fn of(event: &TriggerEvent) -> Self {
+    pub(crate) fn of(event: &TriggerEvent) -> Self {
         match event {
             TriggerEvent::Insert => Self::Insert,
             TriggerEvent::Update(_) => Self::Update,

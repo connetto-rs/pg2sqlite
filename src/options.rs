@@ -261,15 +261,17 @@ pub(crate) struct PrewalkCatalogs {
     >,
 }
 
-/// A trigger on a table.
+/// A trigger on a table or a view.
 #[derive(Clone)]
 struct TableTrigger {
     /// The trigger's name as written.
     name: String,
-    /// The table's name, lower-cased.
+    /// The table's or view's name, lower-cased.
     table: String,
     /// The events the trigger fires on.
     events: Vec<sqlparser::ast::TriggerEvent>,
+    /// Whether the trigger runs `INSTEAD OF` the write.
+    instead_of: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1059,7 +1061,12 @@ impl<'a> TranslationContext<'a> {
                 let triggers = &mut self.catalogs.to_mut().table_triggers;
                 triggers
                     .retain(|kept| kept.table != table || !kept.name.eq_ignore_ascii_case(&name));
-                triggers.push(TableTrigger { name, table, events: trigger.events.clone() });
+                triggers.push(TableTrigger {
+                    name,
+                    table,
+                    events: trigger.events.clone(),
+                    instead_of: trigger.period == Some(sqlparser::ast::TriggerPeriod::InsteadOf),
+                });
             }
             Statement::DropTrigger(drop) => {
                 let name = last_ident_value_or_display(&drop.trigger_name);
@@ -1111,6 +1118,19 @@ impl<'a> TranslationContext<'a> {
                     && !self.is_server_derived_trigger_name(&trigger.name)
             })
             .map(|trigger| trigger.name.as_str())
+    }
+
+    /// Whether an `INSTEAD OF` trigger on the view `view` takes a write of an
+    /// event `fires` accepts.
+    pub(crate) fn instead_of_trigger_takes(
+        &self,
+        view: &str,
+        fires: impl Fn(&sqlparser::ast::TriggerEvent) -> bool,
+    ) -> bool {
+        let view = view.to_lowercase();
+        self.catalogs.table_triggers.iter().any(|trigger| {
+            trigger.instead_of && trigger.table == view && trigger.events.iter().any(&fires)
+        })
     }
 
     pub(crate) fn add_deferred_trigger(

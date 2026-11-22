@@ -125,6 +125,12 @@ impl crate::traits::translator::TranslatorWithContext for Insert {
             ));
         }
 
+        // A write to an automatically updatable view is PostgreSQL's write to
+        // the relation the view reads.
+        if let Some(landed) = super::view_writes::land_insert(self, schema, options)? {
+            return landed.translate_with_warnings(schema, options, emit);
+        }
+
         // Replace DEFAULT with the column's declared default BEFORE translating
         // the source, for two reasons. The substituted expression is PostgreSQL
         // SQL and gets translated by the same path as a written-out value
