@@ -240,6 +240,48 @@ CREATE TABLE rows (id INTEGER PRIMARY KEY, p1 INTEGER REFERENCES parents (id), p
 }
 
 #[test]
+fn a_write_reading_other_relations_counts_them() {
+    let script = |writes| {
+        format!(
+            "CREATE TABLE parents (id INTEGER PRIMARY KEY, v INTEGER);
+CREATE TABLE rows (id INTEGER PRIMARY KEY, v INTEGER);
+{}",
+            writing_trigger(
+                "rows",
+                "UPDATE rows SET v = parents.v FROM parents, (SELECT v FROM parents JOIN events USING (v)) AS shared WHERE parents.id = rows.id AND shared.v = parents.v AND rows.id = NEW.id",
+                writes
+            )
+        )
+    };
+    sweep(
+        None,
+        script,
+        (10..=200).step_by(10),
+        "UPDATE events SET v = 1",
+        &Pg2SqliteOptions::default(),
+    );
+}
+
+/// `walk_chain(levels, 1)` and a view reading `ids_<levels>` once.
+fn reaching_view(levels: usize) -> String {
+    format!(
+        "{}CREATE VIEW reached WITH (security_invoker = true) AS SELECT id FROM items WHERE id IN (SELECT ids_{levels}());
+GRANT SELECT ON reached TO app;
+",
+        walk_chain(levels, 1)
+    )
+}
+
+#[test]
+fn a_view_past_the_limit_is_refused_as_the_statement_reading_it() {
+    sweep(None, reaching_view, 1..=6, "SELECT count(*) FROM reached", &options());
+    let message = refusal(&reaching_view(6));
+    for named in ["view `reached`", "ids_6() once"] {
+        assert!(message.contains(named), "the refusal names {named}: {message}");
+    }
+}
+
+#[test]
 fn a_view_of_the_starting_schema_counts_in_the_programs_reading_it() {
     let starting = format!(
         "{}CREATE VIEW reached WITH (security_invoker = true) AS SELECT id FROM items WHERE id IN (SELECT ids_2());
@@ -269,18 +311,18 @@ GRANT SELECT, UPDATE ON events TO app;
     );
 }
 
-/// The refusal translating `walk_chain(levels, calls)` raises.
-fn refusal(levels: usize, calls: usize) -> String {
-    let error = helpers::translate_pg(&walk_chain(levels, calls), &options())
+/// The refusal translating `sql` raises.
+fn refusal(sql: &str) -> String {
+    let error = helpers::translate_pg(sql, &options())
         .map(|script| script.join("\n"))
-        .expect_err("SQLite refuses to prepare the update of items");
+        .expect_err("SQLite refuses to prepare a program of the script");
     let Error::TranslationRefusal(refusal) = &error else { panic!("not a refusal: {error}") };
     refusal.to_string()
 }
 
 #[test]
 fn a_program_past_sqlites_cursor_limit_is_refused_naming_the_repeated_helpers() {
-    let message = refusal(1, 16);
+    let message = refusal(&walk_chain(1, 16));
     for named in ["items_update_trigger", "cursors", "ids_0() 96 times", "ids_1() 48 times"] {
         assert!(message.contains(named), "the refusal names {named}: {message}");
     }
@@ -288,6 +330,6 @@ fn a_program_past_sqlites_cursor_limit_is_refused_naming_the_repeated_helpers() 
 
 #[test]
 fn a_deep_helper_chain_is_refused_on_a_default_thread() {
-    let message = refusal(5, 1);
+    let message = refusal(&walk_chain(5, 1));
     assert!(message.contains("ids_5()"), "the refusal names the policy's helper: {message}");
 }
