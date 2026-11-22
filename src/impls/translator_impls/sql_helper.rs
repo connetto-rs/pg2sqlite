@@ -84,6 +84,19 @@ pub(crate) fn declared_helper<'s>(
     {
         return Ok(None);
     }
+    schema_helper(name, schema)
+}
+
+/// The function the schema declares under `name`, outside `pg_catalog`, or
+/// `None` for a name the schema does not declare and for a builtin.
+///
+/// # Errors
+///
+/// Propagates a lookup failure, an overloaded name among them.
+pub(crate) fn schema_helper<'s>(
+    name: &ObjectName,
+    schema: &'s ParserDB,
+) -> Result<Option<&'s CreateFunction>, Error> {
     let Some(target) = function_lookup_target(name) else { return Ok(None) };
     match schema.resolve_target_function(target.clone(), IdentifierCase::AsWritten) {
         Ok(function) => Ok(function.filter(|function| !in_pg_catalog(function))),

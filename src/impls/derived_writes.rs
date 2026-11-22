@@ -352,13 +352,21 @@ fn is_builtin(function: &CreateFunction) -> bool {
 }
 
 /// A function body, parsed.
-enum Body<'f> {
+pub(crate) enum Body<'f> {
     PlPgSql(Block),
     Sql(Cow<'f, [Statement]>),
 }
 
 /// `function`'s own body, parsed.
-fn parsed_body<'f>(function: &'f CreateFunction, schema: &'f ParserDB) -> Result<Body<'f>, Error> {
+///
+/// # Errors
+///
+/// Refuses a body that does not parse, and one in a language other than SQL
+/// and PL/pgSQL.
+pub(crate) fn parsed_body<'f>(
+    function: &'f CreateFunction,
+    schema: &'f ParserDB,
+) -> Result<Body<'f>, Error> {
     let unparsed = |error: &dyn core::fmt::Display| {
         Error::forward_refusal(format!(
             "the body of {}() does not parse, so whether it writes rows the server derives \
