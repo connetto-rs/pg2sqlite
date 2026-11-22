@@ -2,11 +2,11 @@
 //! the `Insert` type.
 
 use sql_traits::{
-    structs::ParserDB,
+    structs::{ColumnScope, IdentifierCase, ParserDB, QueryOutput},
     traits::{ColumnLike, DatabaseLike, TableIndexLike, TableLike, UniqueIndexLike},
 };
 use sqlparser::ast::{
-    AssignmentTarget, DataType, Expr, Insert, ObjectName, SelectItem, SetExpr, TableObject,
+    AssignmentTarget, DataType, Expr, Insert, ObjectName, Query, SelectItem, SetExpr, TableObject,
 };
 
 use super::helpers::Forward;
@@ -15,7 +15,7 @@ use crate::no_std::prelude::*;
 use crate::{
     impls::{
         object_name::{
-            COLUMN_LOOKUP_CASE, last_ident, last_ident_value_or_display,
+            COLUMN_LOOKUP_CASE, declared_column_ident, last_ident, last_ident_value_or_display,
             normalize_schema_qualified_object_name_for_sqlite, quoted_ident,
             resolve_translation_table,
         },
@@ -139,6 +139,7 @@ impl crate::traits::translator::TranslatorWithContext for Insert {
         let options = scoped.as_ref().unwrap_or(options);
         reject_explicit_identity_values(self, schema)?;
         let mut prepared = self.clone();
+        name_implied_columns(&mut prepared, schema, options)?;
         substitute_default_values(&mut prepared, schema, options, emit)?;
         assign_insert_values(&mut prepared, schema, options)?;
 
@@ -198,6 +199,77 @@ impl crate::traits::translator::TranslatorWithContext for Insert {
 
         Ok(insert)
     }
+}
+
+/// Lists the columns an `INSERT` without a column list fills when its rows
+/// hold fewer values than the table has columns. PostgreSQL fills the first
+/// ones in declared order and gives the rest their defaults, where SQLite
+/// refuses the statement. Both widths are read in the schema the statement was
+/// written against. A source whose width rests on a wildcard over a relation
+/// of unknown columns is left as written.
+///
+/// # Errors
+///
+/// Returns an error when the schema cannot list the table's columns or build
+/// the source's scope.
+fn name_implied_columns(
+    insert: &mut Insert,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<(), crate::errors::Error> {
+    if !insert.columns.is_empty() {
+        return Ok(());
+    }
+    let Some(source) = insert.source.as_deref() else { return Ok(()) };
+    let written = options.written_schema().unwrap_or(schema);
+    let Some(table) = ResolvedInsertTarget::new(&insert.table, written).optional() else {
+        return Ok(());
+    };
+    let width = match row_width(&source.body) {
+        Some(width) => width,
+        None => {
+            match wildcard_width(source, written, options)? {
+                Some(width) => width,
+                None => return Ok(()),
+            }
+        }
+    };
+    if width < table.columns(written)?.count() {
+        insert.columns = table
+            .columns(written)?
+            .take(width)
+            .map(|column| ObjectName::from(vec![declared_column_ident(column)]))
+            .collect();
+    }
+    Ok(())
+}
+
+/// How many columns each row of `source` holds, with every wildcard counted
+/// over the relations it reads, a `WITH` clause around the statement
+/// included, or `None` when a wildcard reads a relation of unknown columns.
+///
+/// # Errors
+///
+/// Returns an error when the source's scope cannot be built.
+fn wildcard_width(
+    source: &Query,
+    written: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<Option<usize>, crate::errors::Error> {
+    let with_statement_ctes;
+    let source = match (&source.with, options.cte_clause()) {
+        (None, Some(with)) => {
+            with_statement_ctes = Query { with: Some(with.clone()), ..source.clone() };
+            &with_statement_ctes
+        }
+        _ => source,
+    };
+    let scope = ColumnScope::from_query(source, written, IdentifierCase::AsWritten)?;
+    Ok(scope.scope_for_query(source).and_then(|scope| {
+        let mut outputs = scope.outputs();
+        let width = outputs.len();
+        outputs.all(|output| matches!(output, QueryOutput::Column { .. })).then_some(width)
+    }))
 }
 
 /// Translates the `ON CONFLICT` clause onto `insert`, refusing every other
