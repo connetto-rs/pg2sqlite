@@ -63,6 +63,44 @@ fn a_row_naming_generated_columns_alone_inserts_the_defaults() {
     );
 }
 
+/// A row assignment keeps the positions that write something.
+#[test]
+fn a_row_assignment_drops_only_its_generated_defaults() {
+    assert_eq!(
+        run_translated_default(
+            "CREATE TABLE g (
+                 a INTEGER DEFAULT 3,
+                 b INTEGER GENERATED ALWAYS AS (a * 2) STORED,
+                 c TEXT DEFAULT 'gc',
+                 v INTEGER GENERATED ALWAYS AS (a + 1)
+             );
+             INSERT INTO g (a) VALUES (1), (2), (7);
+             UPDATE g SET (b, c, a) = (DEFAULT, 'w', 5) WHERE a = 1;
+             UPDATE g SET (b, c) = (DEFAULT, 'q'), v = DEFAULT WHERE a = 2;
+             UPDATE g SET (b, v) = (DEFAULT, DEFAULT), c = 'z' WHERE a = 7;
+             SELECT a || ' ' || b || ' ' || c || ' ' || v FROM g ORDER BY a;"
+        ),
+        [Some("2 4 q 3".to_owned()), Some("5 10 w 6".to_owned()), Some("7 14 z 8".to_owned())]
+    );
+}
+
+/// SQLite inserts a row of defaults only as `DEFAULT VALUES`, one row per
+/// statement and without an upsert clause.
+#[test]
+fn several_rows_naming_generated_columns_alone_are_refused() {
+    for insert in [
+        "INSERT INTO g (b) VALUES (DEFAULT), (DEFAULT);",
+        "INSERT INTO g (b) VALUES (DEFAULT) ON CONFLICT DO NOTHING;",
+    ] {
+        assert_refused(
+            &format!(
+                "CREATE TABLE g (a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2) STORED); {insert}"
+            ),
+            "writes DEFAULT into generated columns alone",
+        );
+    }
+}
+
 /// SQLite runs no `UPDATE` without an assignment, and a generated column
 /// takes none.
 #[test]
