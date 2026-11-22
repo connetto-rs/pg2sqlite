@@ -1114,9 +1114,12 @@ fn scope_query_after_factor_rewrites(
 
     // The relations may hold whole inlined helper sets, so they are copied
     // only when a rewrite needs them.
-    if !select.from.iter().zip(translated_from).any(|(written, translated)| {
-        entry_rewrites(written, translated)
-    }) {
+    if !select
+        .from
+        .iter()
+        .zip(translated_from)
+        .any(|(written, translated)| entry_rewrites(written, translated))
+    {
         return None;
     }
     let mut relations = select.from.clone();

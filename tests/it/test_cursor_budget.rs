@@ -378,7 +378,9 @@ fn a_helper_chain_read_through_from_translates_on_a_default_thread() {
 #[test]
 fn a_helper_chain_read_through_in_translates_on_a_default_thread() {
     assert_translates(&helper_chain(40, 1, |previous| {
-        format!("SELECT item.id FROM public.items item WHERE item.id IN (SELECT public.ids_{previous}())")
+        format!(
+            "SELECT item.id FROM public.items item WHERE item.id IN (SELECT public.ids_{previous}())"
+        )
     }));
 }
 
