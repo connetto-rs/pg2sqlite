@@ -8,7 +8,8 @@
 //! referencing rows writes the table holding them, so a write PostgreSQL
 //! would follow with either is refused rather than left off. A replica that
 //! leaves the writes the server derives to the server leaves those triggers and
-//! keys out, and the rows they write reach it from the server.
+//! keys out, and the rows they write reach it from the server. So does a
+//! replica leaving every foreign key to the server, for the keys.
 //!
 //! A foreign key into the table leaves with it too, since SQLite resolves the
 //! referenced table on every write to the referencing one. The refusal above
@@ -177,7 +178,7 @@ impl<'s> OffReplica<'s> {
             )));
         }
         // Every key acting on its referencing rows is left to the server.
-        if options.is_server_derived_writes_omitted() {
+        if options.is_server_derived_writes_omitted() || options.is_foreign_keys_omitted() {
             return Ok(());
         }
         for referencing in schema.tables() {

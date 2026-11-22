@@ -137,6 +137,10 @@ pub struct Pg2SqliteOptions {
     /// without the `CHECK` holding them to the text the translation writes.
     /// Set via `with_stored_text_checks_omitted`.
     stored_text_checks_omitted: bool,
+    /// Whether every foreign key is left to the server, read for the
+    /// translation's analysis and emitted nowhere. Set via
+    /// `with_foreign_keys_omitted`.
+    foreign_keys_omitted: bool,
 }
 
 #[cfg(feature = "arbitrary")]
@@ -169,6 +173,7 @@ impl<'a> arbitrary::Arbitrary<'a> for Pg2SqliteOptions {
             attached_tables: Option::<AttachedTables>::arbitrary(u)?,
             server_derived_writes_omitted: bool::arbitrary(u)?,
             stored_text_checks_omitted: bool::arbitrary(u)?,
+            foreign_keys_omitted: bool::arbitrary(u)?,
         })
     }
 }
@@ -201,6 +206,7 @@ impl Default for Pg2SqliteOptions {
             attached_tables: None,
             server_derived_writes_omitted: false,
             stored_text_checks_omitted: false,
+            foreign_keys_omitted: false,
         }
     }
 }
@@ -1660,6 +1666,45 @@ impl Pg2SqliteOptions {
     /// holding them to the text the translation writes.
     pub fn is_stored_text_checks_omitted(&self) -> bool {
         self.stored_text_checks_omitted
+    }
+
+    #[must_use]
+    /// Leaves every foreign key to the server, for a replica holding a
+    /// partial copy of its rows, where a child may arrive without its parent
+    /// and a SQLite key would refuse writes PostgreSQL accepted.
+    ///
+    /// The translation still reads each key the schema declares, which is
+    /// what tells the arms of a helper's grant walk apart. The script then
+    /// declares no foreign key, keeps no trigger standing in for the
+    /// referenced side of one, and runs none of their `ON DELETE` or
+    /// `ON UPDATE` actions, which the server runs when it applies the
+    /// upload.
+    ///
+    /// [`Pg2Sqlite::translate_with_report`](crate::pg2sqlite::Pg2Sqlite::translate_with_report)
+    /// names each one in a
+    /// [`TranslationWarning::LeftToServer`](crate::warnings::TranslationWarning::LeftToServer).
+    ///
+    /// ```
+    /// # use pg2sqlite::prelude::*;
+    /// let options = Pg2SqliteOptions::default().with_foreign_keys_omitted();
+    /// let script = Pg2Sqlite::default()
+    ///     .sql(
+    ///         "CREATE TABLE folders (id INT PRIMARY KEY);
+    ///          CREATE TABLE files (id INT PRIMARY KEY, folder INT REFERENCES folders (id));",
+    ///     )?
+    ///     .translate_to_sql(&options)?;
+    /// assert!(script.iter().all(|statement| !statement.contains("REFERENCES")));
+    /// # Ok::<(), Error>(())
+    /// ```
+    pub fn with_foreign_keys_omitted(mut self) -> Self {
+        self.foreign_keys_omitted = true;
+        self
+    }
+
+    #[must_use]
+    /// Returns whether every foreign key is left to the server.
+    pub fn is_foreign_keys_omitted(&self) -> bool {
+        self.foreign_keys_omitted
     }
 }
 

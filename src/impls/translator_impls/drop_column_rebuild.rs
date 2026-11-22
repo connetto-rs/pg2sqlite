@@ -442,11 +442,16 @@ fn dropped_by(statement: &Statement) -> Vec<(String, bool)> {
     }
 }
 
-/// The table other than `table` whose foreign key references it.
+/// The table other than `table` whose foreign key references it, none when
+/// the replica leaves every foreign key to the server.
 fn referencing_table<'s>(
     schema: &'s ParserDB,
     table: &CreateTable,
+    options: &TranslationContext<'_>,
 ) -> Result<Option<&'s CreateTable>, Error> {
+    if options.is_foreign_keys_omitted() {
+        return Ok(None);
+    }
     for referencing in schema.tables() {
         if core::ptr::eq(referencing, table) {
             continue;
@@ -496,7 +501,7 @@ pub(crate) fn rebuild(
         return Ok(None);
     };
 
-    let referenced = referencing_table(&after, stored)?;
+    let referenced = referencing_table(&after, stored, options)?;
     let in_transaction = options.history().is_some_and(|history| history.in_transaction);
     if let (Some(referencing), true) = (referenced, in_transaction) {
         return Err(Error::forward_refusal(format!(

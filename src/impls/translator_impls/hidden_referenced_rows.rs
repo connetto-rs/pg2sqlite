@@ -32,7 +32,9 @@
 //! No part of the referencing check stays, even where a policy reads the key
 //! columns alone, since such a policy may still read tables the replica holds
 //! in part. A key into a table the acting role reads in full stays a SQLite
-//! foreign key, as every key does when no acting role is named.
+//! foreign key, as every key does when no acting role is named. Under
+//! [`with_foreign_keys_omitted`](crate::options::Pg2SqliteOptions::with_foreign_keys_omitted)
+//! neither half of any key stays.
 
 use alloc::borrow::Cow;
 
@@ -83,8 +85,8 @@ const MARKER: &str = "_pg2sqlite_key";
 
 /// The policies on the table `foreign_table` names that may hide its rows from
 /// the acting role, with the table, or `None` when no acting role is named,
-/// the name is no table, the table is left off the replica, or the role reads
-/// every row of it.
+/// the replica leaves every foreign key to the server, the name is no table,
+/// the table is left off the replica, or the role reads every row of it.
 ///
 /// # Errors
 ///
@@ -94,7 +96,8 @@ pub(crate) fn hidden_rows<'s>(
     schema: &'s ParserDB,
     options: &TranslationContext<'_>,
 ) -> Result<Option<(&'s CreateTable, Vec<String>)>, Error> {
-    if session_variable::acting_role(schema, options)?.is_none()
+    if options.is_foreign_keys_omitted()
+        || session_variable::acting_role(schema, options)?.is_none()
         || OffReplica::of(foreign_table, schema, options)?.is_some()
     {
         return Ok(None);

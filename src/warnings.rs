@@ -116,11 +116,14 @@ pub enum TranslationWarning {
     /// A trigger, a write statement of a trigger, or a foreign key left out
     /// of the replica because the server derives the rows it writes or, for
     /// a foreign key, the rows it references, under
-    /// [`Pg2SqliteOptions::with_server_derived_writes_omitted`](crate::options::Pg2SqliteOptions::with_server_derived_writes_omitted).
+    /// [`Pg2SqliteOptions::with_server_derived_writes_omitted`](crate::options::Pg2SqliteOptions::with_server_derived_writes_omitted),
+    /// or any foreign key under
+    /// [`Pg2SqliteOptions::with_foreign_keys_omitted`](crate::options::Pg2SqliteOptions::with_foreign_keys_omitted).
     ///
     /// The replica writes none of those rows, so a write the application makes
     /// on the replica that relies on one of them sees it only once the
-    /// server's changes arrive.
+    /// server's changes arrive. A foreign key left out is checked, and its
+    /// actions run, only by the server.
     LeftToServer {
         /// `"TRIGGER"`, `"FOREIGN KEY"`, or the statement a kept trigger runs
         /// without, as `"INSERT in TRIGGER"`.

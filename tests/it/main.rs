@@ -88,6 +88,7 @@ mod test_extract;
 mod test_fk_target_validation;
 mod test_foreign_key_enforcement;
 mod test_foreign_key_match;
+mod test_foreign_keys_omitted;
 mod test_forward_delete;
 mod test_forward_expressions;
 mod test_forward_function_gaps;
