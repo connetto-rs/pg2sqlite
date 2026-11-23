@@ -40,7 +40,7 @@
 //! forwarding insert, whose `BEFORE INSERT` guard clears the mark, so a write
 //! a trigger of the forwarded row makes is held to the policies again.
 //!
-//! The named table keeps per-row records a framed `AFTER UPDATE` trigger of
+//! The record table keeps per-row records a framed `AFTER UPDATE` trigger of
 //! [`trigger_slots`](super::trigger_slots) reads, cleared by a `BEFORE
 //! UPDATE` trigger skipping the row since no frame will claim them.
 
@@ -78,16 +78,17 @@ const SUFFIX: &str = "_pg2sqlite_reentries";
 /// forwarding insert.
 const FORWARD_SUFFIX: &str = "_pg2sqlite_forwards";
 
-/// What a table's name takes on to name its named table.
-const NAMED_SUFFIX: &str = "_pg2sqlite_named";
+/// What a table's name takes on to name its record table.
+const RECORD_SUFFIX: &str = "_pg2sqlite_records";
 
-/// The named table's column holding what a record is about.
+/// The record table's column holding the code of what a record is about,
+/// which the frame writing it numbers.
 pub(crate) const MEMBER: &str = "member";
 
-/// The named table's column holding a recorded value.
+/// The record table's column holding a recorded value.
 pub(crate) const VALUE: &str = "value";
 
-/// The named table's column holding the `id` of the frame that claimed the
+/// The record table's column holding the `id` of the frame that claimed the
 /// record, `NULL` until one does.
 pub(crate) const FRAME: &str = "frame";
 
@@ -142,9 +143,9 @@ pub(crate) fn marker_table(table: &ObjectName) -> ObjectName {
     marker_name(table, SUFFIX)
 }
 
-/// The named table in its owner's SQLite namespace.
-pub(crate) fn named_table(table: &ObjectName) -> ObjectName {
-    marker_name(table, NAMED_SUFFIX)
+/// The record table in its owner's SQLite namespace.
+pub(crate) fn record_table(table: &ObjectName) -> ObjectName {
+    marker_name(table, RECORD_SUFFIX)
 }
 
 fn marker_name(table: &ObjectName, suffix: &str) -> ObjectName {
@@ -163,10 +164,10 @@ fn marker_name(table: &ObjectName, suffix: &str) -> ObjectName {
 }
 
 /// Deletes the records of the row a `BEFORE UPDATE` trigger skips that no
-/// frame claimed, from `named`.
-pub(crate) fn clear_unclaimed(named: &ObjectName) -> Statement {
+/// frame claimed, from `records`.
+pub(crate) fn clear_unclaimed(records: &ObjectName) -> Statement {
     ast_builder::delete(
-        named.clone(),
+        records.clone(),
         Some(Expr::BinaryOp {
             left: Box::new(marks_row("NEW")),
             op: BinaryOperator::And,
@@ -278,7 +279,7 @@ fn stripped<'m>(marker: &'m ObjectName, suffix: &str) -> Option<&'m str> {
 pub(crate) fn marked_table(marker: &ObjectName) -> Option<&str> {
     stripped(marker, SUFFIX)
         .or_else(|| stripped(marker, FORWARD_SUFFIX))
-        .or_else(|| stripped(marker, NAMED_SUFFIX))
+        .or_else(|| stripped(marker, RECORD_SUFFIX))
 }
 
 /// Whether `name` names a marker table.
@@ -320,7 +321,7 @@ pub(crate) struct MarkerTables {
 
 impl MarkerTables {
     /// The marker tables of the maintenance triggers `initial` holds, the
-    /// named tables of the tables whose `UPDATE` triggers may read one, and,
+    /// record tables of the tables whose `UPDATE` triggers may read one, and,
     /// under `strict` validation, the forwarding markers of the views over
     /// its tables with row-level security.
     ///
@@ -333,7 +334,7 @@ impl MarkerTables {
         for trigger in schema.triggers() {
             if reads_marker(trigger, schema)? {
                 tables.inherited.insert(table_key(&marker_table(&trigger.table_name)));
-                tables.inherited.insert(table_key(&named_table(&trigger.table_name)));
+                tables.inherited.insert(table_key(&record_table(&trigger.table_name)));
             }
         }
         if strict {
@@ -424,7 +425,7 @@ impl MarkerTables {
 
 /// The marker tables `table` may have, of each kind.
 fn markers_of(table: &ObjectName) -> [ObjectName; 3] {
-    [marker_table(table), forward_marker_table(table), named_table(table)]
+    [marker_table(table), forward_marker_table(table), record_table(table)]
 }
 
 /// Whether the translation of `trigger` names its table's marker table, as a
@@ -440,16 +441,16 @@ fn reads_marker(trigger: &CreateTrigger, schema: &ParserDB) -> Result<bool, Erro
 /// INTEGER NOT NULL, event TEXT NOT NULL CHECK (event IN ('INSERT',
 /// 'UPDATE'))) STRICT`, `CREATE TABLE IF NOT EXISTS <marker> (id INTEGER
 /// PRIMARY KEY) STRICT` for a forwarding marker, and `CREATE TABLE IF NOT
-/// EXISTS <named> (id INTEGER PRIMARY KEY, row_id INTEGER NOT NULL, member
-/// TEXT NOT NULL, value ANY, frame INTEGER) STRICT` for a named table.
+/// EXISTS <records> (id INTEGER PRIMARY KEY, row_id INTEGER NOT NULL, member
+/// INTEGER NOT NULL, value ANY, frame INTEGER) STRICT` for a record table.
 fn create(marker: ObjectName) -> Statement {
     let columns = if stripped(&marker, FORWARD_SUFFIX).is_some() {
         vec![super::rls::generated_key_column()]
-    } else if stripped(&marker, NAMED_SUFFIX).is_some() {
+    } else if stripped(&marker, RECORD_SUFFIX).is_some() {
         vec![
             super::rls::generated_key_column(),
             super::rls::generated_table_column(ROW, DataType::Integer(None), true),
-            super::rls::generated_table_column(MEMBER, DataType::Text, true),
+            super::rls::generated_table_column(MEMBER, DataType::Integer(None), true),
             super::rls::generated_table_column(
                 VALUE,
                 DataType::Custom(

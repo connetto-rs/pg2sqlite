@@ -55,7 +55,7 @@ pub(crate) fn stack_table() -> Statement {
             super::rls::generated_key_column(),
             super::rls::generated_text_column(
                 "owner",
-                super::rls::length_at_most("owner", super::rls::NAME_LENGTH),
+                super::rls::non_empty_at_most("owner", super::rls::NAME_LENGTH),
             ),
         ],
     )

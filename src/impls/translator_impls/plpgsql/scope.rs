@@ -35,7 +35,8 @@ pub(crate) struct TriggerFacts {
     /// [`without_removed_writes`](crate::impls::derived_writes::without_removed_writes)
     /// takes out.
     pub(crate) removes_derived_writes: bool,
-    /// The named table a `RETURN NULL` clears the row's unclaimed records from.
+    /// The record table a `RETURN NULL` clears the row's unclaimed records
+    /// from.
     pub(crate) skip_clears: Option<sqlparser::ast::ObjectName>,
 }
 

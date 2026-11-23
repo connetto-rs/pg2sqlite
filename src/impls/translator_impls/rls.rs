@@ -3561,16 +3561,21 @@ pub(crate) fn generated_text_column(name: &str, check: Expr) -> ColumnDef {
     column
 }
 
-/// `length(<column>) <= <bound>`.
-pub(crate) fn length_at_most(column: &str, bound: i64) -> Expr {
+/// `<column> <> '' AND length(<column>) <= <bound>`.
+pub(crate) fn non_empty_at_most(column: &str, bound: i64) -> Expr {
+    let column = || Expr::Identifier(quoted_ident(column));
     Expr::BinaryOp {
-        left: Box::new(simple_function_expr(
-            "length",
-            vec![Expr::Identifier(quoted_ident(column))],
-            None,
-        )),
-        op: BinaryOperator::LtEq,
-        right: Box::new(integer_literal(bound)),
+        left: Box::new(Expr::BinaryOp {
+            left: Box::new(column()),
+            op: BinaryOperator::NotEq,
+            right: Box::new(string_literal("")),
+        }),
+        op: BinaryOperator::And,
+        right: Box::new(Expr::BinaryOp {
+            left: Box::new(simple_function_expr("length", vec![column()], None)),
+            op: BinaryOperator::LtEq,
+            right: Box::new(integer_literal(bound)),
+        }),
     }
 }
 
@@ -3671,17 +3676,17 @@ pub fn generate_rls_audit_table(audit_table_name: &str) -> Statement {
         generated_object_name(audit_table_name),
         vec![
             audit_id_column(),
-            generated_text_column("table_name", length_at_most("table_name", NAME_LENGTH)),
+            generated_text_column("table_name", non_empty_at_most("table_name", NAME_LENGTH)),
             generated_text_column(
                 "violation_type",
                 one_of("violation_type", &[SELECT_NOT_VISIBLE]),
             ),
             generated_text_column(
                 "row_identifier",
-                length_at_most("row_identifier", ROW_IDENTIFIER_LENGTH),
+                non_empty_at_most("row_identifier", ROW_IDENTIFIER_LENGTH),
             ),
             generated_text_column("policy_name", one_of("policy_name", &[SELECT_POLICY])),
-            generated_text_column("detected_at", length_at_most("detected_at", DATETIME_LENGTH)),
+            generated_text_column("detected_at", non_empty_at_most("detected_at", DATETIME_LENGTH)),
             generated_text_column("severity", one_of("severity", &SEVERITIES)),
             generated_text_column("detail", one_of("detail", &details)),
         ],
