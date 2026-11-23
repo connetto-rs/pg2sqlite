@@ -860,3 +860,33 @@ fn dropping_the_stamp_and_then_its_function_in_their_creating_batch() {
         &[SEED, "UPDATE items SET tag = 'b' WHERE id = 1;"],
     );
 }
+
+/// Dropping the stamp and then its function leaves the audit firing once on
+/// the caller's rows.
+#[test]
+fn dropping_the_stamp_and_then_its_function() {
+    assert_agree(
+        &[
+            &schema(&["after"], &format!("{STAMP_BOTH}{AUDIT_BOTH}")),
+            "DROP TRIGGER items_stamp ON items; DROP FUNCTION stamp();",
+        ],
+        &[SEED, "UPDATE items SET tag = 'b' WHERE id = 1;"],
+    );
+}
+
+/// Replacing the stamp onto another function and then dropping the first
+/// leaves the replacement stamping.
+#[test]
+fn replacing_the_stamp_and_then_dropping_its_function() {
+    assert_agree(
+        &[
+            &schema(&["after"], &format!("{STAMP_BOTH}{AUDIT_BOTH}")),
+            "CREATE FUNCTION stamp_twice() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN NEW.stamped := coalesce(NEW.tag, '') || '**'; RETURN NEW; END $$;
+             CREATE OR REPLACE TRIGGER items_stamp BEFORE INSERT OR UPDATE ON items
+                 FOR EACH ROW EXECUTE FUNCTION stamp_twice();
+             DROP FUNCTION stamp();",
+        ],
+        &[SEED, "UPDATE items SET tag = 'b' WHERE id = 1;"],
+    );
+}
