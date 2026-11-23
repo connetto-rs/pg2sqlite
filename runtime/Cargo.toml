@@ -1,0 +1,47 @@
+[package]
+name = "pg2sqlite-runtime"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+description = "The SQLite functions and collation a pg2sqlite replica registers so jsonb, case folds and SQL helpers answer as PostgreSQL does."
+homepage = "https://pg2sqlite.luca.phd"
+repository = "https://github.com/connetto-rs/pg2sqlite"
+documentation = "https://docs.rs/pg2sqlite-runtime"
+readme = "README.md"
+keywords = ["postgresql", "sqlite", "jsonb", "collation", "diesel"]
+categories = ["database", "no-std"]
+
+[dependencies]
+# Reads, prints and compares jsonb the way PostgreSQL 18 does.
+sql-values = { version = "0.6", default-features = false }
+# Derives `Arbitrary` on both function sets for pg2sqlite's fuzz harnesses.
+arbitrary = { version = "1", features = ["derive"], optional = true }
+
+# Registers the functions and collation on a native or WebAssembly diesel connection.
+[dependencies.diesel]
+version = "2.4"
+default-features = false
+features = ["sqlite"]
+optional = true
+
+[dependencies.diesel-dynamic-schema]
+git = "https://github.com/diesel-rs/diesel"
+branch = "upstream/sqlite-table-valued-functions-dynamic"
+default-features = false
+features = ["sqlite"]
+optional = true
+
+[dev-dependencies]
+diesel = { version = "2.4", features = ["sqlite"] }
+# The doctests and tests register the functions through `diesel`.
+pg2sqlite-runtime = { path = ".", features = ["diesel"] }
+
+[features]
+# Derives `Arbitrary` on `JsonbFunctions` and `CaseFoldFunctions`.
+arbitrary = ["dep:arbitrary"]
+# The `register` of `JsonbFunctions`, `CaseFoldFunctions` and `HelperFunction` on a diesel `SqliteConnection`.
+diesel = ["dep:diesel", "dep:diesel-dynamic-schema"]
+
+[lints]
+workspace = true

@@ -52,24 +52,9 @@ pub enum FreshFiles {
     Both,
 }
 
-/// A helper the replica runs as a table-valued function, as PostgreSQL calls
-/// it instead of inlining its body.
-///
-/// A call site reads it as `name(arguments)` in a `FROM` list, binding each
-/// argument to the parameter `?k` of `body` at the same position, and reads
-/// its rows under `columns`. The body runs as a statement of its own, so its
-/// relations open no cursor in the program of the statement calling it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HelperFunction<S = Statement> {
-    /// The name a call site reads the function by.
-    pub name: String,
-    /// The parameters, which a call site passes as arguments in this order.
-    pub parameters: Vec<String>,
-    /// The columns of each row the function answers.
-    pub columns: Vec<String>,
-    /// The query answering a call, reading each argument as `?k`.
-    pub body: S,
-}
+/// A helper the replica runs as a table-valued function, its body a
+/// translated statement unless `S` names another form.
+pub type HelperFunction<S = Statement> = pg2sqlite_runtime::HelperFunction<S>;
 
 /// A translation's statements, in parts run in field order.
 ///
@@ -198,43 +183,5 @@ impl<S: core::fmt::Display> Script<S> {
         connection: &mut diesel::sqlite::SqliteConnection,
     ) -> diesel::QueryResult<()> {
         self.functions.iter().try_for_each(|function| function.register(connection))
-    }
-}
-
-#[cfg(feature = "diesel")]
-impl<S: core::fmt::Display> HelperFunction<S> {
-    /// Registers the function on `connection` as a table-valued function
-    /// running its body as a statement of its own on that connection, with
-    /// each argument bound to its parameter as SQLite passed it.
-    ///
-    /// # Errors
-    ///
-    /// The error SQLite answers when it refuses the registration.
-    pub fn register(
-        &self,
-        connection: &mut diesel::sqlite::SqliteConnection,
-    ) -> diesel::QueryResult<()> {
-        use diesel::RunQueryDsl;
-        use diesel_dynamic_schema::dynamic_value::{Any, DynamicRow, SqliteAnyValue};
-
-        let function = diesel_dynamic_schema::table(self.name.clone());
-        let columns = |names: &[String]| -> Vec<_> {
-            names.iter().map(|name| function.column::<Any, _>(name.clone())).collect()
-        };
-        let body = self.body.to_string();
-        connection.register_table_valued_function(
-            columns(&self.columns),
-            columns(&self.parameters),
-            diesel::sqlite::SqliteFunctionBehavior::INNOCUOUS,
-            move |connection, arguments: DynamicRow<SqliteAnyValue>| {
-                arguments
-                    .iter()
-                    .fold(
-                        diesel::sql_query(body.as_str()).into_boxed::<diesel::sqlite::Sqlite>(),
-                        |query, argument| argument.bind_to(query),
-                    )
-                    .load::<DynamicRow<SqliteAnyValue>>(connection)
-            },
-        )
     }
 }

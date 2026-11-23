@@ -495,32 +495,6 @@ fn a_jsonb_column_without_named_functions_is_refused() {
     assert!(error.contains("JsonbFunctions::register"), "{error}");
 }
 
-/// The host collation places malformed documents after every valid document.
-#[test]
-fn text_jsonb_does_not_read_sorts_after_every_document() {
-    use core::cmp::Ordering;
-
-    use pg2sqlite::prelude::JsonbFunctions;
-
-    for document in ["null", "false", "1.00", "\"text\"", "[]", "{}"] {
-        assert_eq!(JsonbFunctions::compare(document, "{bad"), Ordering::Less);
-        assert_eq!(JsonbFunctions::compare("{bad", document), Ordering::Greater);
-    }
-    assert_eq!(JsonbFunctions::compare("{bad", "{worse"), Ordering::Less);
-}
-
-/// Invalid function names propagate registration errors to the caller.
-#[test]
-fn registration_reports_a_function_name_sqlite_refuses() {
-    use pg2sqlite::prelude::JsonbFunctions;
-
-    let mut connection = establish_connection();
-    let error = JsonbFunctions::new("invalid\0name", "unused_text", "unused_collation")
-        .register(&mut connection)
-        .expect_err("SQLite function names cannot contain NUL");
-    assert!(error.to_string().contains("nul byte"), "{error}");
-}
-
 /// Reversed canonicalisation returns PostgreSQL's canonical document text.
 #[test]
 fn the_canonicalising_function_reverses_to_postgresql_text() {
