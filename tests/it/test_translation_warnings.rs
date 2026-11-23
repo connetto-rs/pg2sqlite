@@ -218,7 +218,16 @@ fn alter_user_emits_lossy_drop_warning() {
 /// The downgrades a translation reports, each as its location, source and
 /// target.
 fn downgrades_for(pg: &str) -> Vec<(DowngradeLocation, String, String)> {
-    warnings_for(pg)
+    downgrades_under(pg, &Pg2SqliteOptions::default())
+}
+
+/// The downgrades a translation under `options` reports, each as its
+/// location, source and target.
+fn downgrades_under(
+    pg: &str,
+    options: &Pg2SqliteOptions,
+) -> Vec<(DowngradeLocation, String, String)> {
+    warnings_under(pg, options)
         .into_iter()
         .filter_map(|warning| {
             match warning {
@@ -267,14 +276,41 @@ fn expression(object: Option<DeclaredObject>, text: &str) -> DowngradeLocation {
     DowngradeLocation::Expression { object, text: text.to_owned() }
 }
 
-/// SQLite has no zone-aware temporal type, so the column becomes TEXT holding
-/// whatever offset the writer put in it. Every PostgreSQL spelling that
-/// carries a zone loses it, and all four used to say nothing.
+/// SQLite has no zone-aware temporal type, so a `timetz` column becomes TEXT
+/// holding whatever offset the writer put in it, and its values order as that
+/// text rather than as times in UTC.
 #[test]
-fn a_zone_carrying_column_reports_the_zone_it_loses() {
-    for declared in ["TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE", "TIMETZ", "TIME WITH TIME ZONE"] {
+fn a_time_with_time_zone_column_reports_the_zone_it_loses() {
+    for declared in ["TIMETZ", "TIME WITH TIME ZONE"] {
         let downgrades =
             downgrades_for(&format!("CREATE TABLE events (id INT PRIMARY KEY, at {declared});"));
+        assert_eq!(downgrades.len(), 1, "{declared} should report one downgrade: {downgrades:?}");
+        assert_eq!(downgrades[0].0, column("events", "at"));
+        assert_eq!(downgrades[0].2, "TEXT");
+    }
+}
+
+/// The stored-text `CHECK` admits one spelling per instant, UTC text of fixed
+/// width, so a `timestamptz` column compares as PostgreSQL compares it.
+#[test]
+fn a_checked_timestamptz_column_reports_nothing() {
+    for declared in ["TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE", "TIMESTAMPTZ(3)"] {
+        let downgrades =
+            downgrades_for(&format!("CREATE TABLE events (id INT PRIMARY KEY, at {declared});"));
+        assert!(downgrades.is_empty(), "{declared} loses nothing under its CHECK: {downgrades:?}");
+    }
+}
+
+/// Without the stored-text `CHECK` a `timestamptz` column takes any offset, so
+/// two spellings of one instant compare unequal.
+#[test]
+fn an_unchecked_timestamptz_column_reports_the_zone_it_loses() {
+    let options = Pg2SqliteOptions::default().with_stored_text_checks_omitted();
+    for declared in ["TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE"] {
+        let downgrades = downgrades_under(
+            &format!("CREATE TABLE events (id INT PRIMARY KEY, at {declared});"),
+            &options,
+        );
         assert_eq!(downgrades.len(), 1, "{declared} should report one downgrade: {downgrades:?}");
         assert_eq!(downgrades[0].0, column("events", "at"));
         assert_eq!(downgrades[0].2, "TEXT");
@@ -306,7 +342,7 @@ fn a_column_downgrade_names_its_table() {
 fn an_added_column_downgrade_names_its_table() {
     let downgrades = downgrades_for(
         "CREATE TABLE people (id INT PRIMARY KEY);
-         ALTER TABLE people ADD COLUMN seen_at TIMESTAMPTZ;",
+         ALTER TABLE people ADD COLUMN seen_at TIMETZ;",
     );
     assert_eq!(downgrades.len(), 1, "{downgrades:?}");
     assert_eq!(downgrades[0].0, column("people", "seen_at"));
