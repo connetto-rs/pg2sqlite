@@ -19,8 +19,7 @@ use crate::{
     errors::Error,
     impls::{
         object_name::{
-            append_suffix, normalize_schema_qualified_object_name_for_sqlite,
-            resolve_translation_table,
+            append_suffix, normalize_declared_relation_name_for_sqlite, resolve_translation_table,
         },
         privileges::has_backing_table,
     },
@@ -87,7 +86,7 @@ impl crate::traits::translator::TranslatorWithContext for CreateView {
             materialized: false,
             secure: false,
             copy_grants: false,
-            name: normalize_schema_qualified_object_name_for_sqlite(schema, &self.name)?,
+            name: normalize_declared_relation_name_for_sqlite(schema, &self.name, self.temporary)?,
             name_before_not_exists: self.name_before_not_exists,
             columns: self.columns.clone(),
             query: Box::new(query),

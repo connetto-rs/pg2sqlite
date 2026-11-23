@@ -2,18 +2,19 @@
 //!
 //! A permanent view or trigger binds unqualified names to its own database and
 //! may not name another, so whatever reads attached storage, directly or
-//! through such a view, is emitted `TEMP`. Inner names stay unqualified, which
-//! is sound because the collision check keeps names unique across all three.
+//! through such a view, is emitted `TEMP`.
 
 use alloc::collections::{BTreeMap, BTreeSet};
+use core::ops::ControlFlow;
 
 use sql_traits::{
     structs::ParserDB,
     traits::{DatabaseLike, TableLike},
 };
 use sqlparser::ast::{
-    AlterTableOperation, ColumnOption, CreateTable, FromTable, ObjectName, ObjectNamePart,
-    ObjectType, RenameTableNameKind, SetExpr, Statement, TableConstraint, TableFactor, TableObject,
+    AlterTableOperation, ColumnOption, CreateTable, CreateTrigger, FromTable, ObjectName,
+    ObjectNamePart, ObjectType, RenameTableNameKind, SetExpr, Statement, TableConstraint,
+    TableFactor, TableObject, Visit, visit_statements_mut,
 };
 
 #[cfg(not(feature = "std"))]
@@ -22,7 +23,7 @@ use crate::{
     errors::Error,
     impls::{
         object_name::{last_ident_value_or_display, quoted_ident},
-        scoped_relations::relation_names,
+        scoped_relations::relation_occurrences,
         translator_impls::{reentry::marked_table, rls::resolve_trigger_table_name},
     },
     manifest::Placement,
@@ -68,12 +69,18 @@ impl core::ops::BitOr for Files {
 
 /// Where each created table, view and index lives, keyed as SQLite folds
 /// names.
-pub(crate) type Homes = BTreeMap<String, Placement>;
+pub(crate) type Homes = BTreeMap<HomeKey, Placement>;
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct HomeKey {
+    main: bool,
+    name: String,
+}
 
 /// Where the table, view or index named `name` lives, `Main` for an object
 /// the batch does not create.
 pub(crate) fn home(homes: &Homes, name: &str) -> Placement {
-    homes.get(&key(name)).copied().unwrap_or(Placement::Main)
+    homes.get(&unqualified_key(name)).copied().unwrap_or(Placement::Main)
 }
 
 /// Where the table, view or index `name` lives, `Main` for an object the
@@ -140,19 +147,23 @@ pub(crate) fn place(
     let mut logical_storage = Homes::new();
     for table in schema.tables() {
         let physical = resolve_trigger_table_name(table.table_name(), table, schema, options)?;
-        let physical_key = key(&physical);
+        let mut physical_key = HomeKey { main: !table.temporary, name: key(&physical) };
+        if !homes.contains_key(&physical_key) {
+            physical_key.main = false;
+        }
         // Nothing the batch emits relocates a table it does not create.
         let placement = homes.get(&physical_key).copied().unwrap_or_else(|| {
             if table.temporary {
                 Placement::Temp
-            } else if storage.contains(&physical_key) {
+            } else if storage.contains(&physical_key.name) {
                 Placement::Attached
             } else {
                 Placement::Main
             }
         });
+        let logical_key = HomeKey { main: physical_key.main, name: key(table.table_name()) };
         homes.insert(physical_key, placement);
-        logical_storage.insert(key(table.table_name()), placement);
+        logical_storage.insert(logical_key, placement);
     }
     let mut trigger_homes = Homes::new();
     let mut placed_unit_files = Vec::with_capacity(sources.len());
@@ -278,10 +289,10 @@ fn attached_storage(
         for statement in emitted {
             match statement {
                 Statement::CreateTable(create) => {
-                    storage.insert(key_of(&create.name));
+                    storage.insert(key(&last_ident_value_or_display(&create.name)));
                 }
                 Statement::CreateVirtualTable { name, .. } => {
-                    storage.insert(key_of(name));
+                    storage.insert(key(&last_ident_value_or_display(name)));
                 }
                 Statement::CreateIndex(_)
                 | Statement::CreateView(_)
@@ -360,18 +371,24 @@ fn homes(
     let mut homes = Homes::new();
     let mut views = Vec::new();
     for (input, emitted) in inputs.iter().zip(translated) {
-        let temporary = subject_table(input).is_some_and(|subject| {
-            schema
-                .tables()
-                .any(|table| table.table_name().eq_ignore_ascii_case(&subject) && table.temporary)
-        });
+        let temporary = match input {
+            Statement::CreateTable(create) => create.temporary,
+            _ => {
+                subject_table(input).is_some_and(|subject| {
+                    schema.tables().any(|table| {
+                        table.table_name().eq_ignore_ascii_case(&subject) && table.temporary
+                    })
+                })
+            }
+        };
         for statement in emitted {
             let table = match statement {
                 Statement::CreateTable(create) => {
                     // A marker table lives with a `TEMP` table it marks, so
                     // the table's triggers find it on every connection.
-                    let marks_temporary = marked_table(&create.name)
-                        .is_some_and(|marked| homes.get(&key(marked)) == Some(&Placement::Temp));
+                    let marks_temporary = marked_table(&create.name).is_some_and(|marked| {
+                        homes.get(&unqualified_key(marked)) == Some(&Placement::Temp)
+                    });
                     if create.temporary || marks_temporary {
                         homes.insert(key_of(&create.name), Placement::Temp);
                         continue;
@@ -390,7 +407,7 @@ fn homes(
             let name = key_of(table);
             let placement = if temporary {
                 Placement::Temp
-            } else if storage.contains(&name) {
+            } else if storage.contains(&name.name) {
                 Placement::Attached
             } else {
                 Placement::Main
@@ -493,6 +510,7 @@ fn place_statement(
                     Placement::Temp => {}
                 }
             }
+            unqualify_trigger_writes(trigger, placement)?;
             trigger_homes.entry(key_of(&trigger.name)).or_insert(placement);
             placement
         }
@@ -557,6 +575,63 @@ fn place_statement(
         }
         _ => placement,
     })
+}
+
+/// Removes trigger write qualifiers only when the trigger's database preserves
+/// their target.
+fn unqualify_trigger_writes(
+    trigger: &mut CreateTrigger,
+    placement: Placement,
+) -> Result<(), Error> {
+    let result = visit_statements_mut(&mut trigger.statements, |statement| {
+        let target = match statement {
+            Statement::Insert(insert) => {
+                match &mut insert.table {
+                    TableObject::TableName(name) => Some(name),
+                    _ => None,
+                }
+            }
+            Statement::Update(update) => {
+                match &mut update.table.relation {
+                    TableFactor::Table { name, .. } => Some(name),
+                    _ => None,
+                }
+            }
+            Statement::Delete(delete) => {
+                let tables = match &mut delete.from {
+                    FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => {
+                        tables
+                    }
+                };
+                tables.first_mut().and_then(|table| {
+                    match &mut table.relation {
+                        TableFactor::Table { name, .. } => Some(name),
+                        _ => None,
+                    }
+                })
+            }
+            _ => None,
+        };
+        let Some(target) = target.filter(|target| target.0.len() > 1) else {
+            return ControlFlow::Continue(());
+        };
+        let preserves_target = target.0[0].as_ident().is_some_and(|database| {
+            (placement == Placement::Main && database.value.eq_ignore_ascii_case("main"))
+                || (placement == Placement::Temp && database.value.eq_ignore_ascii_case("temp"))
+        });
+        if !preserves_target {
+            let kind = if placement == Placement::Temp { "temporary" } else { "permanent" };
+            return ControlFlow::Break(Error::forward_refusal(format!(
+                "cannot write to qualified relation \"{target}\" from a {kind} trigger"
+            )));
+        }
+        target.0.remove(0);
+        ControlFlow::Continue(())
+    });
+    match result {
+        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Break(error) => Err(error),
+    }
 }
 
 #[cfg_attr(feature = "std", recursive::recursive)]
@@ -648,7 +723,7 @@ fn qualified(name: &ObjectName, schema: &str) -> ObjectName {
 }
 
 /// Whether any of `reads` lives in the attached database or in `temp`.
-fn reads_placed(reads: &[String], homes: &Homes) -> bool {
+fn reads_placed(reads: &[HomeKey], homes: &Homes) -> bool {
     reads.iter().any(|name| homes.get(name).is_some_and(|placement| *placement != Placement::Main))
 }
 
@@ -656,8 +731,22 @@ fn key(name: &str) -> String {
     name.to_ascii_lowercase()
 }
 
-fn key_of(name: &ObjectName) -> String {
-    key(&last_ident_value_or_display(name))
+fn key_of(name: &ObjectName) -> HomeKey {
+    HomeKey {
+        main: name.0.len() > 1
+            && name.0[0]
+                .as_ident()
+                .is_some_and(|identifier| identifier.value.eq_ignore_ascii_case("main")),
+        name: key(&last_ident_value_or_display(name)),
+    }
+}
+
+fn unqualified_key(name: &str) -> HomeKey {
+    HomeKey { main: false, name: key(name) }
+}
+
+fn relation_names<Node: Visit>(node: &Node) -> Vec<HomeKey> {
+    relation_occurrences(node).iter().map(key_of).collect()
 }
 
 fn unusable(reason: String) -> Error {
