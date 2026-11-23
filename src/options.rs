@@ -261,12 +261,12 @@ pub(crate) struct PrewalkCatalogs {
     batch_cache: Box<core::cell::RefCell<crate::impls::batch_cache::BatchCache>>,
 }
 
-/// A trigger on a table.
+/// A trigger on a table or a view.
 #[derive(Clone)]
 pub(crate) struct TableTrigger {
     /// The trigger's name as written.
     pub(crate) name: String,
-    /// The table's identity.
+    /// The table's or view's identity.
     table: TableKey,
     /// The events the trigger fires on.
     pub(crate) events: Vec<sqlparser::ast::TriggerEvent>,
@@ -1285,6 +1285,20 @@ impl<'a> TranslationContext<'a> {
                     && !self.is_server_derived_trigger_name(&trigger.name)
             })
             .map(|trigger| trigger.name.as_str())
+    }
+
+    /// Whether an `INSTEAD OF` trigger on the view stored as `view` takes a
+    /// write of an event `fires` accepts.
+    pub(crate) fn instead_of_trigger_takes(
+        &self,
+        view: &str,
+        fires: impl Fn(&sqlparser::ast::TriggerEvent) -> bool,
+    ) -> bool {
+        self.catalogs.table_triggers.iter().any(|trigger| {
+            trigger.period == Some(sqlparser::ast::TriggerPeriod::InsteadOf)
+                && trigger.table.name == view
+                && trigger.events.iter().any(&fires)
+        })
     }
 
     pub(crate) fn add_deferred_trigger(

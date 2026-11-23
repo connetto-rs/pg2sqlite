@@ -118,7 +118,7 @@ impl FiringTrigger {
 
     /// Whether the trigger takes, in place of the view `relation`, folded,
     /// a write of one of `events` to it.
-    pub(super) fn takes(&self, relation: &str, events: &[Event]) -> bool {
+    pub(crate) fn takes(&self, relation: &str, events: &[Event]) -> bool {
         self.rank == Rank::InsteadOf
             && self.table == relation
             && events.iter().any(|&event| self.fires_on(event))

@@ -58,3 +58,4 @@ pub(crate) mod update;
 pub(crate) mod uuid;
 pub mod vector;
 mod view_outputs;
+pub(crate) mod view_writes;

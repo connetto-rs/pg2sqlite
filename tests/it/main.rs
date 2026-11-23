@@ -186,6 +186,7 @@ mod test_pg_clause_stripping;
 mod test_pk_not_null;
 mod test_placeholder_roundtrip;
 mod test_placement_scope;
+mod test_plain_view_writes;
 mod test_plpgsql;
 mod test_plpgsql_completeness;
 mod test_plpgsql_cte_injection;

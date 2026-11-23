@@ -35,6 +35,11 @@ impl crate::traits::translator::TranslatorWithContext for Update {
         options: &crate::options::TranslationContext<'_>,
         emit: &mut dyn FnMut(crate::warnings::TranslationWarning),
     ) -> Result<Self::SQLiteEntry, Error> {
+        // A write to an automatically updatable view is PostgreSQL's write to
+        // the relation the view reads.
+        if let Some(landed) = super::view_writes::land_update(self, schema, options)? {
+            return landed.translate_with_warnings(schema, options, emit);
+        }
         // The statement's target is the relation an unqualified column names,
         // and a query inside the statement attaches its own scope over this
         // one, so an outer reference still resolves.
