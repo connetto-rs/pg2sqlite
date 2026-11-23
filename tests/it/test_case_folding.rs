@@ -82,7 +82,7 @@ fn fold_functions_answer_as_the_server_does() {
     assert_eq!(answer("SELECT lower('ΣΙΓΜΑ');"), vec![Some("σιγμα".to_string())]);
     assert_eq!(answer("SELECT upper('straße');"), vec![Some("STRAßE".to_string())]);
     assert_eq!(answer("SELECT lower('İSTANBUL');"), vec![Some("istanbul".to_string())]);
-    assert_eq!(answer("SELECT upper('ᾳ');"), vec![Some("ᾼ".to_string())]);
+    assert_eq!(answer("SELECT upper('ᾀᾇᾐᾗᾠᾧᾳῃῳ');"), vec![Some("ᾈᾏᾘᾟᾨᾯᾼῌῼ".to_string())]);
     assert_eq!(answer("SELECT 'ÄBC' ILIKE 'äbc';"), vec![Some("1".to_string())]);
 }
 
