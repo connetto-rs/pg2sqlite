@@ -120,8 +120,9 @@ fn granting_the_table_under_a_hiding_policy_lets_the_helper_read_it() {
          GRANT SELECT ON secret TO app;",
         "FOR SELECT TO app USING (owner IN (SELECT visible_ids()))",
     );
-    let script = helpers::translate_pg(&pg, &options()).unwrap_or_else(|error| panic!("{error}"));
-    let mut connection = helpers::apply_statements(&script);
+    let script =
+        helpers::translate_script(&pg, &options()).unwrap_or_else(|error| panic!("{error}"));
+    let mut connection = helpers::applied_script(&script, None);
     // The rows arrive as the sync delivers them, past the guards on the
     // backing tables.
     connection.set_triggers_enabled(false).expect("disable triggers for the seed");

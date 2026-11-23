@@ -45,7 +45,7 @@ arbitrary = { version = "1", features = ["derive"], optional = true }
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 diesel = { version = "2.3.9", features = ["postgres", "sqlite"] }
-diesel-dynamic-schema = { git = "https://github.com/diesel-rs/diesel", branch = "main", features = ["sqlite"] }
+diesel-dynamic-schema = { git = "https://github.com/diesel-rs/diesel", branch = "upstream/sqlite-table-valued-functions-dynamic", features = ["sqlite"] }
 half = "2.7"
 insta = "1.47.2"
 rosetta-uuid = { version = "0.2.0", features = ["diesel", "postgres", "sqlite"] }
@@ -81,6 +81,13 @@ default-features = false
 features = ["sqlite"]
 optional = true
 
+[dependencies.diesel-dynamic-schema]
+git = "https://github.com/diesel-rs/diesel"
+branch = "upstream/sqlite-table-valued-functions-dynamic"
+default-features = false
+features = ["sqlite"]
+optional = true
+
 [features]
 # Drop the defaults with `--no-default-features` to build for `wasm32-unknown-unknown` or other no_std targets.
 # The sqlparser patch below is what lets `sqlparser/visitor` build without std.
@@ -108,8 +115,8 @@ sqlitegis = [
 # `SessionVariableMapping`. Consumed by the fuzz harnesses; not used by
 # production code.
 arbitrary = ["dep:arbitrary"]
-# `JsonbFunctions::register` and `CaseFoldFunctions::register` on a diesel `SqliteConnection`.
-diesel = ["dep:diesel"]
+# `JsonbFunctions::register`, `CaseFoldFunctions::register` and `Script::register_functions` on a diesel `SqliteConnection`.
+diesel = ["dep:diesel", "dep:diesel-dynamic-schema"]
 # `parity::replay`, answering rls-parity's row-level security cases, which
 # sql-traits ships behind `parity-fixtures`, on the SQLite replica.
 parity = ["std", "diesel", "sql-traits/parity-fixtures"]
@@ -131,12 +138,12 @@ parity = ["std", "diesel", "sql-traits/parity-fixtures"]
 [patch.crates-io]
 sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
 
-# `SqliteConnection::set_triggers_enabled` and its db-config siblings are on
-# diesel main and absent from 2.3.12, and the RLS trigger tests need them.
-diesel = { git = "https://github.com/diesel-rs/diesel", branch = "main" }
+# Table-valued functions are on diesel#5395 and their run-time declaration on
+# diesel#5396, stacked on it, whose branch follows diesel main.
+diesel = { git = "https://github.com/diesel-rs/diesel", branch = "upstream/sqlite-table-valued-functions-dynamic" }
 # Follows diesel's patch, so the `SqlState` the decoder returns is the type
 # diesel reports a PostgreSQL error's code as.
-sqlstate = { git = "https://github.com/diesel-rs/diesel", branch = "main" }
+sqlstate = { git = "https://github.com/diesel-rs/diesel", branch = "upstream/sqlite-table-valued-functions-dynamic" }
 # `PgJsonb::to_text`, which the registered `->>` function answers with, is on
 # sql-values main and absent from 0.6.0.
 sql-values = { git = "https://github.com/connetto-rs/sql-values", branch = "main" }

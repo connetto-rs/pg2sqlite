@@ -61,6 +61,7 @@ fn replica(batches: &[&str]) -> SqliteConnection {
             parsed.translate_to_sql_with_schema(&schema(&written), &Pg2SqliteOptions::default())
         }
         .unwrap_or_else(|error| panic!("{error}"));
+        script.register_functions(&mut connection).expect("register helper functions");
         connection.batch_execute(&script.into_vec().join(";\n")).unwrap();
         written.push_str(batch);
         written.push('\n');

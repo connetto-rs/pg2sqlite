@@ -135,6 +135,7 @@ fn replica() -> Replica {
         .unwrap_or_else(|error| panic!("the schema should translate: {error}"));
     let before_commit = script.before_commit.clone();
     let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
+    script.register_functions(&mut connection).expect("register helper functions");
     for statement in script.into_vec() {
         connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
     }

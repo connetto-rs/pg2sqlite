@@ -29,6 +29,9 @@ pub(crate) enum Source<'a> {
     Generated(&'a str),
     /// An object already represented by the supplied starting schema.
     Initial(String),
+    /// A helper the translation registers as a table-valued function, which
+    /// SQLite reads only where no table or view holds its name.
+    HelperFunction(String),
 }
 
 impl Source<'_> {
@@ -38,6 +41,7 @@ impl Source<'_> {
         let statement = match self {
             Self::Generated(label) => return (*label).to_string(),
             Self::Initial(label) => return label.clone(),
+            Self::HelperFunction(name) => return format!("helper function {name}"),
             Self::Input(statement) => statement,
         };
         match statement {
@@ -60,14 +64,26 @@ impl Source<'_> {
 }
 
 /// Refuses the first emitted definition that lands on a name the script already
-/// holds.
+/// holds, `functions` naming the helper functions every connection registers.
 pub(crate) fn reject_name_collisions<'a>(
     initial_schema: Option<&ParserDB>,
+    functions: impl IntoIterator<Item = String>,
     emitted: impl IntoIterator<Item = (Source<'a>, &'a Statement)>,
 ) -> Result<(), Error> {
     let mut namespaces = Databases::default();
     if let Some(schema) = initial_schema {
         namespaces.seed(schema)?;
+    }
+    for function in functions {
+        // SQLite reads a table of either database ahead of an eponymous
+        // table-valued function of the same name.
+        for namespace in [&mut namespaces.main, &mut namespaces.temporary] {
+            namespace.define_object_key(
+                sqlite_key(&function),
+                None,
+                Source::HelperFunction(function.clone()),
+            )?;
+        }
     }
     for (source, statement) in emitted {
         namespaces.apply(statement, source)?;
@@ -341,7 +357,7 @@ impl<'a> Namespaces<'a> {
 }
 
 /// The name SQLite would file an object under, which folds ASCII case.
-fn key(name: &ObjectName) -> String {
+pub(crate) fn key(name: &ObjectName) -> String {
     last_ident_value_or_display(name).to_ascii_lowercase()
 }
 

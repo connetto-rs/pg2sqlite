@@ -28,13 +28,16 @@ pub fn run(
     }
 }
 
-/// Runs `script` on a fresh store and returns the replayed connection.
+/// Runs `script` on a fresh store and returns the replayed connection, each
+/// connection holding the script's helper functions.
 pub fn create_and_reopen(files: &tempfile::TempDir, script: &Script<String>) -> SqliteConnection {
     {
         let mut creating = open(files);
+        script.register_functions(&mut creating).expect("helper functions");
         run(&mut creating, script.iter());
     }
     let mut reopened = open(files);
+    script.register_functions(&mut reopened).expect("helper functions");
     run(&mut reopened, script.connect().expect("connection program"));
     reopened
 }

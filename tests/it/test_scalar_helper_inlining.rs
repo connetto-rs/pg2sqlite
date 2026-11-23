@@ -167,6 +167,19 @@ fn an_argument_read_twice_that_may_change_is_refused() {
 }
 
 #[test]
+fn a_volatile_argument_reading_no_column_of_the_row_is_refused() {
+    assert_refused(
+        "CREATE TABLE odds (p FLOAT8);
+GRANT SELECT ON odds TO app;
+CREATE FUNCTION authz.lucky(roll FLOAT8) RETURNS BOOLEAN LANGUAGE sql STABLE
+  AS $$ SELECT roll < (SELECT max(p) FROM public.odds) $$;",
+        "authz.lucky(random())",
+        "authz.lucky()",
+        "once for the whole statement",
+    );
+}
+
+#[test]
 fn functions_calling_each_other_are_refused() {
     let error = refusal(
         "CREATE FUNCTION authz.ping() RETURNS UUID LANGUAGE sql STABLE
@@ -408,21 +421,27 @@ fn standard_sql_bodies_expand() {
     }
 }
 
-/// A returned expression reading a table translates as that read, against
-/// the table the replica holds.
+/// A returned expression reading a table translates as a call of the helper
+/// function reading it, against the table the replica holds.
 #[test]
-fn a_returned_expression_reading_a_table_reads_it_in_place() {
+fn a_returned_expression_reading_a_table_is_read_through_its_helper_function() {
     let extra = "CREATE TABLE owners (id UUID);
          GRANT SELECT ON owners TO app;
          CREATE FUNCTION authz.first_owner() RETURNS UUID LANGUAGE sql STABLE
            RETURN (SELECT id FROM public.owners LIMIT 1);";
-    let translated =
-        helpers::translate_pg(&script(extra, "owner_id = authz.first_owner()"), &options())
-            .unwrap_or_else(|error| panic!("refused the call: {error}"))
-            .join("\n");
-    assert!(translated.contains("CREATE TABLE owners"), "the replica holds owners: {translated}");
-    assert!(translated.contains("FROM owners LIMIT 1"), "the view reads owners: {translated}");
-    assert!(!translated.contains("first_owner"), "the view keeps no call: {translated}");
+    let script =
+        helpers::translate_script(&script(extra, "owner_id = authz.first_owner()"), &options())
+            .unwrap_or_else(|error| panic!("refused the call: {error}"));
+    assert!(
+        script.iter().any(|statement| statement.starts_with("CREATE TABLE owners ")),
+        "the replica holds owners"
+    );
+    let view = script
+        .iter()
+        .find(|statement| statement.starts_with("CREATE VIEW notes "))
+        .expect("the policy view");
+    let body = &helpers::called_function(&script, view, "first_owner").body;
+    assert!(body.contains("FROM owners LIMIT 1"), "the function reads owners: {body}");
 }
 
 #[test]
@@ -648,4 +667,56 @@ fn a_function_without_a_body_is_refused() {
         "authz.bodiless()",
         "has no SQL body",
     );
+}
+
+/// The rows of `count_query` once the schema-only translation of `sql` runs.
+fn counted(sql: &str, count_query: &str) -> i64 {
+    use diesel::RunQueryDsl;
+    let script = helpers::translate_script(sql, &Pg2SqliteOptions::default())
+        .unwrap_or_else(|error| panic!("refused: {error}"));
+    let mut connection = helpers::applied_script(&script, None);
+    diesel::select(diesel::dsl::sql::<diesel::sql_types::BigInt>(&format!("({count_query})")))
+        .get_result(&mut connection)
+        .unwrap_or_else(|error| panic!("SQLite refuses {count_query}: {error}"))
+}
+
+#[test]
+fn an_argument_named_as_the_helper_functions_own_column_reads_the_callers_row() {
+    let rows = counted(
+        "CREATE TABLE readings (id INT PRIMARY KEY, value INT);
+CREATE TABLE limits (cap INT);
+CREATE FUNCTION over_cap(v INT) RETURNS BOOLEAN LANGUAGE sql STABLE AS $$ SELECT count(*) > 0 FROM limits WHERE cap < v $$;
+CREATE VIEW over_limit AS SELECT id FROM readings WHERE over_cap(value);
+INSERT INTO limits VALUES (5);
+INSERT INTO readings VALUES (1, 3), (2, 7);",
+        "SELECT count(*) FROM over_limit",
+    );
+    assert_eq!(rows, 1);
+}
+
+#[test]
+fn a_helper_named_from_a_digit_is_called_by_a_name_sqlite_reads() {
+    let rows = counted(
+        "CREATE TABLE readings (id INT PRIMARY KEY, amount INT);
+CREATE TABLE limits (cap INT);
+CREATE FUNCTION \"2fa_over\"(v INT) RETURNS BOOLEAN LANGUAGE sql STABLE AS $$ SELECT count(*) > 0 FROM limits WHERE cap < v $$;
+CREATE VIEW over_limit AS SELECT id FROM readings WHERE \"2fa_over\"(amount);
+INSERT INTO limits VALUES (5);
+INSERT INTO readings VALUES (1, 3), (2, 7);",
+        "SELECT count(*) FROM over_limit",
+    );
+    assert_eq!(rows, 1);
+}
+
+#[test]
+fn an_insert_reading_its_target_through_a_helper_sees_none_of_its_own_rows() {
+    let rows = counted(
+        "CREATE TABLE src (v INT);
+CREATE TABLE t (v INT);
+CREATE FUNCTION seen(x INT) RETURNS BIGINT LANGUAGE sql STABLE AS $$ SELECT count(*) FROM t WHERE t.v = x $$;
+INSERT INTO src VALUES (1), (1);
+INSERT INTO t SELECT v FROM src WHERE seen(v) = 0;",
+        "SELECT count(*) FROM t",
+    );
+    assert_eq!(rows, 2);
 }

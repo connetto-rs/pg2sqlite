@@ -40,7 +40,7 @@ use crate::{
     },
     options::{Declaration, Pg2SqliteOptions, TranslationContext},
     prelude::ReverseTranslator,
-    script::Script,
+    script::{HelperFunction, Script},
     traits::translator::TranslatorWithContext,
 };
 
@@ -408,6 +408,8 @@ fn register_declared_object_name(statement: &Statement, context: &mut Translatio
 pub struct Pg2Sqlite {
     /// The set of `PostgreSQL` statements to be translated.
     pg_statements: Vec<Statement>,
+    /// The helper functions the statements the database holds may call.
+    starting_functions: Vec<HelperFunction>,
 }
 
 struct PreparedEpoch {
@@ -976,6 +978,61 @@ impl Pg2Sqlite {
         Ok(self)
     }
 
+    /// Takes `functions` as the helper functions the statements the target
+    /// database already holds may call, as the [`Script::functions`] of the
+    /// translations that built it. The script translated keeps every one of
+    /// them beside its own, so a connection registers the functions of the
+    /// last script alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a body does not parse as one SQLite statement.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use pg2sqlite::prelude::*;
+    /// let options = Pg2SqliteOptions::default();
+    /// let source = Pg2Sqlite::default().sql("CREATE TABLE t (a INT);")?;
+    /// let schema = source.build_schema()?;
+    /// let held = source.translate_to_sql(&options)?;
+    /// let migration = Pg2Sqlite::default()
+    ///     .sql("CREATE INDEX t_a ON t (a);")?
+    ///     .starting_functions(&held.functions)?
+    ///     .translate_to_sql_with_schema(&schema, &options)?;
+    /// assert!(migration.functions.is_empty());
+    /// # Ok::<(), Error>(())
+    /// ```
+    pub fn starting_functions<S: AsRef<str>>(
+        mut self,
+        functions: &[HelperFunction<S>],
+    ) -> Result<Self, crate::errors::Error> {
+        for function in functions {
+            let sql = function.body.as_ref();
+            let parse_error = |source| {
+                crate::errors::Error::from(crate::errors::SqlParseError::new(
+                    sql.to_owned(),
+                    source,
+                ))
+            };
+            let mut statements =
+                sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::SQLiteDialect {}, sql)
+                    .map_err(parse_error)?;
+            let (Some(body), None) = (statements.pop(), statements.pop()) else {
+                return Err(parse_error(sqlparser::parser::ParserError::ParserError(
+                    "a helper function body is one statement".to_owned(),
+                )));
+            };
+            self.starting_functions.push(HelperFunction {
+                name: function.name.clone(),
+                parameters: function.parameters.clone(),
+                columns: function.columns.clone(),
+                body,
+            });
+        }
+        Ok(self)
+    }
+
     /// Reads and parses a PostgreSQL SQL file, appending the statements.
     ///
     /// Only available with the `std` feature.
@@ -1432,8 +1489,22 @@ impl Pg2Sqlite {
         let schemas = core::iter::once(&schema).chain(epochs.iter().map(|epoch| &epoch.schema));
         let prelude = generated_prelude(&translated, schemas, &options, had_rls_tables, context)?;
 
+        let names: Vec<String> = {
+            let functions = context.helper_functions();
+            let reached = crate::impls::helper_functions::called(
+                &functions,
+                prelude.iter().map(|(_, statement)| statement).chain(translated.iter().flatten()),
+            );
+            functions
+                .iter()
+                .zip(reached)
+                .filter(|(_, reached)| *reached)
+                .map(|(function, _)| function.name.clone())
+                .collect()
+        };
         reject_name_collisions(
             initial_schema.as_ref(),
+            names,
             prelude
                 .iter()
                 .map(|(label, statement)| (Source::Generated(label), statement))
@@ -1619,6 +1690,15 @@ impl Pg2Sqlite {
         let connection = crate::history::connection_program(&units, &schema, &context, &mut placed);
         let (main, attached) = crate::history::fresh_forms(&units, &mut placed, &schema, &context);
         drop(units);
+        let functions = self.reached_functions(
+            context.take_helper_functions(),
+            prelude
+                .iter()
+                .chain(statements.iter().flatten())
+                .chain(connection.iter().flatten())
+                .chain(main.iter().flatten().flatten().flatten())
+                .chain(attached.iter().flatten().flatten().flatten()),
+        );
         let files = crate::initialization::InitializationPlan::new(
             prelude,
             placed.unit_files.into_iter().zip(statements),
@@ -1630,9 +1710,13 @@ impl Pg2Sqlite {
         } else {
             vec![deferred_constraint::drain()]
         };
-        let mut script = Script { setup: Vec::new(), files, connection, before_commit };
+        let mut script = Script { setup: Vec::new(), files, connection, before_commit, functions };
         // Last, so the replay and rebinding forms built above are covered too.
-        for statement in script.files.statements_mut().chain(script.connection.iter_mut().flatten())
+        for statement in script
+            .files
+            .statements_mut()
+            .chain(script.connection.iter_mut().flatten())
+            .chain(script.functions.iter_mut().map(|function| &mut function.body))
         {
             crate::impls::sqlite_keywords::quote_reserved_identifiers(statement);
         }
@@ -1662,6 +1746,24 @@ impl Pg2Sqlite {
         }
 
         Ok(PreparedTranslation { script, warnings })
+    }
+
+    /// The helper functions of `translated` that `emitted` calls, and every
+    /// starting function, which a view or trigger the database holds may
+    /// call.
+    fn reached_functions<'s>(
+        &'s self,
+        mut translated: Vec<HelperFunction>,
+        emitted: impl Iterator<Item = &'s Statement>,
+    ) -> Vec<HelperFunction> {
+        let mut reached = crate::impls::helper_functions::called(&translated, emitted).into_iter();
+        translated.retain(|_| reached.next().unwrap_or(false));
+        for function in &self.starting_functions {
+            if translated.iter().all(|kept| kept.name != function.name) {
+                translated.push(function.clone());
+            }
+        }
+        translated
     }
 
     /// Translates loaded PostgreSQL statements to SQLite.

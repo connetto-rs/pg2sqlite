@@ -19,7 +19,10 @@ pub mod sqlitegis;
 use std::{cell::RefCell, sync::Once};
 
 use diesel::{prelude::*, sqlite::SqliteConnection};
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+use pg2sqlite::{
+    prelude::{Pg2Sqlite, Pg2SqliteOptions},
+    script::{HelperFunction, Script},
+};
 use rosetta_uuid::Uuid;
 use sqlite_vec::sqlite3_vec_init;
 use sqlparser::ast::Statement;
@@ -33,7 +36,86 @@ pub fn translate_pg(
     pg: &str,
     opts: &Pg2SqliteOptions,
 ) -> Result<Vec<String>, pg2sqlite::errors::Error> {
-    Pg2Sqlite::default().sql(pg)?.translate_to_sql(opts).map(pg2sqlite::script::Script::into_vec)
+    translate_script(pg, opts).map(Script::into_vec)
+}
+
+/// The script `pg` translates to under `opts`, its statements and helper
+/// function bodies rendered.
+pub fn translate_script(
+    pg: &str,
+    opts: &Pg2SqliteOptions,
+) -> Result<Script<String>, pg2sqlite::errors::Error> {
+    Pg2Sqlite::default().sql(pg)?.translate_to_sql(opts)
+}
+
+/// A connection from [`establish_connection`] holding the helper functions
+/// of `script` and every statement of it but the one at `skipped`.
+///
+/// # Panics
+///
+/// Panics naming the function or statement SQLite refuses.
+pub fn applied_script(script: &Script<String>, skipped: Option<usize>) -> SqliteConnection {
+    let mut connection = establish_connection();
+    script
+        .register_functions(&mut connection)
+        .unwrap_or_else(|error| panic!("SQLite must register the helper functions: {error}"));
+    for (index, statement) in script.iter().enumerate() {
+        if Some(index) == skipped {
+            continue;
+        }
+        diesel::sql_query(statement).execute(&mut connection).unwrap_or_else(|error| {
+            panic!("emitted statement must execute in SQLite: {error}\n{statement}")
+        });
+    }
+    connection
+}
+
+/// The digits of the hash naming a helper function after its helper.
+const HASH_DIGITS: usize = 16;
+
+/// `sql` with the hash in each call of a helper function written `#`, as
+/// `teams_with_#()`, so an assertion names the helper a call reads without
+/// pinning the hash of its body.
+#[must_use]
+pub fn unhashed(sql: &str) -> String {
+    let mut written = String::with_capacity(sql.len());
+    let mut rest = sql;
+    while let Some(position) = rest.find('_') {
+        written.push_str(&rest[..=position]);
+        rest = &rest[position + 1..];
+        let hashed = rest.as_bytes().get(..=HASH_DIGITS).is_some_and(|name| {
+            name[..HASH_DIGITS].iter().all(|digit| matches!(digit, b'0'..=b'9' | b'a'..=b'f'))
+                && name[HASH_DIGITS] == b'('
+        });
+        if hashed {
+            written.push('#');
+            rest = &rest[HASH_DIGITS..];
+        }
+    }
+    written.push_str(rest);
+    written
+}
+
+/// The helper function of `script` that `statement` calls as
+/// `<helper>_<hash>(...)`.
+///
+/// # Panics
+///
+/// Panics when `statement` calls no function of `script` named after
+/// `helper`.
+pub fn called_function<'s>(
+    script: &'s Script<String>,
+    statement: &str,
+    helper: &str,
+) -> &'s HelperFunction<String> {
+    let prefix = format!("{helper}_");
+    statement
+        .match_indices(&prefix)
+        .find_map(|(position, _)| {
+            let name = statement.get(position..position + prefix.len() + HASH_DIGITS)?;
+            script.functions.iter().find(|function| function.name == name)
+        })
+        .unwrap_or_else(|| panic!("{statement} calls no function of {helper}"))
 }
 
 /// Returns `true` when `stmt` is a translated user-level statement of `kind`
@@ -335,13 +417,7 @@ pub fn reverse_translate_sql(sql: &str) -> Result<String, String> {
 /// Panics when translation fails or when an emitted statement will not
 /// execute.
 pub fn execute_all(pg: &str, options: &Pg2SqliteOptions) {
-    let statements = translate_pg(pg, options).expect("translation should succeed");
-    let mut connection = establish_connection();
-    for statement in &statements {
-        diesel::sql_query(statement).execute(&mut connection).unwrap_or_else(|error| {
-            panic!("emitted statement must execute in SQLite: {error}\n{statement}")
-        });
-    }
+    applied_script(&translate_script(pg, options).expect("translation should succeed"), None);
 }
 
 /// Applies everything `pg` emits except the query under test, then returns
@@ -356,21 +432,14 @@ pub fn execute_all(pg: &str, options: &Pg2SqliteOptions) {
 /// Panics when translation fails, when no user `SELECT` is emitted, or when
 /// SQLite rejects any emitted statement.
 pub fn prepared_user_select(pg: &str, options: &Pg2SqliteOptions) -> String {
-    let statements = translate_pg(pg, options).expect("translation should succeed");
+    let script = translate_script(pg, options).expect("translation should succeed");
+    let statements: Vec<&str> = script.iter().map(String::as_str).collect();
     let select = statements
         .iter()
         .position(|statement| is_user_statement(statement, "SELECT"))
         .unwrap_or_else(|| panic!("no user SELECT in:\n{}", statements.join("\n")));
 
-    let mut connection = establish_connection();
-    for (index, statement) in statements.iter().enumerate() {
-        if index == select {
-            continue;
-        }
-        diesel::sql_query(statement).execute(&mut connection).unwrap_or_else(|error| {
-            panic!("emitted statement must execute in SQLite: {error}\n{statement}")
-        });
-    }
+    let mut connection = applied_script(&script, Some(select));
     diesel::sql_query(format!("EXPLAIN {}", statements[select]))
         .load::<diesel_dynamic_schema::dynamic_value::DynamicRow<
             diesel_dynamic_schema::dynamic_value::NamedField<run_translated::TextCell>,
@@ -379,7 +448,7 @@ pub fn prepared_user_select(pg: &str, options: &Pg2SqliteOptions) -> String {
             panic!("SQLite must accept the query: {error}\n{}", statements[select])
         });
 
-    statements[select].clone()
+    statements[select].to_owned()
 }
 
 /// Registers sqlite-vec once per process, so every later connection has it.
@@ -484,11 +553,12 @@ pub fn apply_with_options(
     pg: &str,
     options: &Pg2SqliteOptions,
 ) -> Result<SqliteConnection, Box<dyn std::error::Error>> {
-    let statements = Pg2Sqlite::default().sql(pg)?.translate(options)?.into_vec();
+    let script = Pg2Sqlite::default().sql(pg)?.translate(options)?;
     let mut conn = SqliteConnection::establish(":memory:")?;
     jsonb_functions::register(&mut conn);
     case_fold_functions::register(&mut conn);
-    for statement in &statements {
+    script.register_functions(&mut conn)?;
+    for statement in script.iter() {
         // Emitted DDL is not expressible via the typed DSL.
         diesel::sql_query(statement.to_string()).execute(&mut conn)?;
     }
@@ -518,11 +588,12 @@ pub fn apply_rls_sql(pg: &str) -> Result<SqliteConnection, Box<dyn std::error::E
         Pg2SqliteOptions::default(),
     ))
     .with_rls_audit_table_name("rls_audit");
-    let stmts = translate_pg(pg, &options)?;
+    let script = translate_script(pg, &options)?;
     let mut conn = SqliteConnection::establish(":memory:")?;
     jsonb_functions::register(&mut conn);
     case_fold_functions::register(&mut conn);
-    for stmt in &stmts {
+    script.register_functions(&mut conn)?;
+    for stmt in script.iter() {
         // Emitted DDL is not expressible via the typed DSL.
         diesel::sql_query(stmt.as_str()).execute(&mut conn)?;
     }
@@ -532,10 +603,12 @@ pub fn apply_rls_sql(pg: &str) -> Result<SqliteConnection, Box<dyn std::error::E
 /// Translates `pg` with `opts` and applies every emitted statement to a
 /// fresh in-memory connection with recursive triggers on.
 pub fn apply_translated_ddl(pg: &str, opts: &Pg2SqliteOptions) -> SqliteConnection {
-    let translated =
-        Pg2Sqlite::default().sql(pg).expect("parse").translate(opts).expect("translate").into_vec();
+    let script = Pg2Sqlite::default().sql(pg).expect("parse").translate(opts).expect("translate");
     let mut conn = establish_connection();
-    for statement in &translated {
+    script
+        .register_functions(&mut conn)
+        .unwrap_or_else(|e| panic!("SQLite must register the helper functions: {e}"));
+    for statement in script.iter() {
         // DDL emitted by the translator cannot be expressed with the typed DSL.
         diesel::sql_query(statement.to_string())
             .execute(&mut conn)

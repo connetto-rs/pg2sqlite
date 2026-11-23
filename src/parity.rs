@@ -437,6 +437,9 @@ impl Replica {
         };
         register_functions(&mut connection, owner, &session)
             .map_err(database("Registering the replica functions".to_owned()))?;
+        script
+            .register_functions(&mut connection)
+            .map_err(database("Registering the helper functions".to_owned()))?;
         for statement in script.iter() {
             connection
                 .batch_execute(&format!("{statement};"))
@@ -487,7 +490,18 @@ impl Replica {
         };
         let reads = matches!(source.statements(), [Statement::Query(_)]);
         let translated = match source.translate_with_schema(&self.schema, &self.options) {
-            Ok(script) => script.into_vec(),
+            Ok(script) => {
+                match script.register_functions(&mut self.connection) {
+                    Ok(()) => script.into_vec(),
+                    Err(source) => {
+                        return Err(ParityError::Database {
+                            role: self.options.get_acting_role().unwrap_or_default().to_owned(),
+                            action: format!("Registering the helper functions of {statement}"),
+                            source,
+                        });
+                    }
+                }
+            }
             Err(error) if reads => return Ok(Measured::Refused(error.to_string())),
             Err(error) => return Ok(refused_write(error.to_string())),
         };

@@ -12,6 +12,7 @@ pub(crate) mod enum_type;
 pub(crate) mod expr_helpers;
 pub(crate) mod expression_type;
 pub(crate) mod function_helpers;
+pub(crate) mod helper_functions;
 pub(crate) mod idioms;
 pub(crate) mod interval;
 pub(crate) mod jsonb;

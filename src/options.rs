@@ -259,6 +259,9 @@ pub(crate) struct PrewalkCatalogs {
     /// What the batch's translation works out once, kept for the schemas it
     /// holds alive, boxed so every context stays as small.
     batch_cache: Box<core::cell::RefCell<crate::impls::batch_cache::BatchCache>>,
+    /// The helpers the translation calls as table-valued functions, in the
+    /// order first called.
+    helper_functions: core::cell::RefCell<Vec<crate::script::HelperFunction>>,
 }
 
 /// A trigger on a table or a view.
@@ -379,6 +382,9 @@ pub struct TranslationContext<'a> {
     locks_whole_query: bool,
     /// The declaration whose expressions a warning names, `None` for a query.
     declaration: Option<Declaration<'a>>,
+    /// The key of the table the `INSERT` whose source is being translated
+    /// writes.
+    inserting_into: Option<&'a str>,
 }
 
 /// A declaration whose expressions a translation reads.
@@ -443,6 +449,7 @@ struct ContextFields<'a> {
     locked: &'a [usize],
     locks_whole_query: bool,
     declaration: Option<Declaration<'a>>,
+    inserting_into: Option<&'a str>,
 }
 
 impl<'a> ContextFields<'a> {
@@ -463,6 +470,7 @@ impl<'a> ContextFields<'a> {
             locked: context.locked,
             locks_whole_query: context.locks_whole_query,
             declaration: context.declaration,
+            inserting_into: context.inserting_into,
         }
     }
 
@@ -491,6 +499,7 @@ impl<'a> ContextFields<'a> {
             locked: self.locked,
             locks_whole_query: self.locks_whole_query,
             declaration: self.declaration,
+            inserting_into: self.inserting_into,
         }
     }
 }
@@ -518,6 +527,7 @@ impl<'a> TranslationContext<'a> {
             locked: &[],
             locks_whole_query: false,
             declaration: None,
+            inserting_into: None,
         }
     }
     pub(crate) fn with_complete_schema(options: &'a Pg2SqliteOptions) -> Self {
@@ -546,6 +556,7 @@ impl<'a> TranslationContext<'a> {
             locked: &[],
             locks_whole_query: false,
             declaration: None,
+            inserting_into: None,
         }
     }
 
@@ -747,8 +758,10 @@ impl<'a> TranslationContext<'a> {
     /// The context the set a helper call returns translates under. A function
     /// body sees none of the query calling it, so its scope, `WITH` clause,
     /// variables, trigger rows, trigger catalog, row locks and declaration
-    /// stay out, and the set reads the schema as it stands. Boxed so the
-    /// recursion through a helper's set holds no copy of it.
+    /// stay out, and the set reads the schema as it stands. The table an
+    /// enclosing `INSERT` writes stays in, since the body reads the
+    /// statement's snapshot of it too. Boxed so the recursion through a
+    /// helper's set holds no copy of it.
     pub(crate) fn helper_body(&self) -> Box<TranslationContext<'_>> {
         Box::new(TranslationContext {
             options: Cow::Borrowed(self.options.as_ref()),
@@ -768,6 +781,7 @@ impl<'a> TranslationContext<'a> {
             locked: &[],
             locks_whole_query: false,
             declaration: None,
+            inserting_into: self.inserting_into,
         })
     }
 
@@ -804,6 +818,20 @@ impl<'a> TranslationContext<'a> {
     /// Whether a row-locking clause covers `factor`.
     pub(crate) fn locks(&self, factor: &sqlparser::ast::TableFactor) -> bool {
         self.locked.contains(&core::ptr::from_ref(factor).addr())
+    }
+
+    /// The same context translating the source of an `INSERT` writing the
+    /// table whose key is `table`.
+    pub(crate) fn with_inserting_into<'s>(&'s self, table: &'s str) -> TranslationContext<'s> {
+        let mut fields = ContextFields::borrowed(self);
+        fields.inserting_into = Some(table);
+        fields.into_context(self.scope, self.outer)
+    }
+
+    /// The key of the table the `INSERT` whose source is being translated
+    /// writes.
+    pub(crate) const fn inserting_into(&self) -> Option<&str> {
+        self.inserting_into
     }
 
     /// The same context translating the part of a row trigger that fires for
@@ -1323,6 +1351,56 @@ impl<'a> TranslationContext<'a> {
             .request_zone
             .get_or_init(|| crate::impls::request_zone::resolve(schema, self.options.as_ref()))
             .as_ref()
+    }
+
+    /// The name a call site reads `body` by, a function answering a call
+    /// to `helper` with `parameters` under `columns`, recorded the first
+    /// time a call needs it.
+    ///
+    /// The name is `<helper>_<hash>`, the hash that of the function's SQL,
+    /// so every translation names the same function alike and a statement
+    /// translated on its own registers no other function under a name the
+    /// script uses.
+    pub(crate) fn record_helper_function(
+        &self,
+        helper: &str,
+        parameters: Vec<String>,
+        columns: Vec<String>,
+        body: sqlparser::ast::Query,
+    ) -> String {
+        use core::hash::Hasher as _;
+
+        let body = sqlparser::ast::Statement::Query(Box::new(body));
+        let mut hasher = crate::impls::helper_functions::Fnv1a::new();
+        hasher.write(body.to_string().as_bytes());
+        for name in parameters.iter().chain(&columns) {
+            hasher.write(&[0]);
+            hasher.write(name.as_bytes());
+        }
+        let name = format!("{helper}_{:016x}", hasher.finish());
+        let mut functions = self.catalogs.helper_functions.borrow_mut();
+        if !functions.iter().any(|function| function.name == name) {
+            functions.push(crate::script::HelperFunction {
+                name: name.clone(),
+                parameters,
+                columns,
+                body,
+            });
+        }
+        name
+    }
+
+    /// The helper functions recorded so far.
+    pub(crate) fn helper_functions(
+        &self,
+    ) -> core::cell::Ref<'_, Vec<crate::script::HelperFunction>> {
+        self.catalogs.helper_functions.borrow()
+    }
+
+    /// The helpers the translation calls as table-valued functions, taken
+    /// out of the catalog once the translation is done.
+    pub(crate) fn take_helper_functions(&self) -> Vec<crate::script::HelperFunction> {
+        core::mem::take(&mut *self.catalogs.helper_functions.borrow_mut())
     }
 }
 

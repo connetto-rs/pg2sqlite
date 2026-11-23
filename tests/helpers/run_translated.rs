@@ -46,15 +46,15 @@ pub fn run_translated_bound_with(
     options: &Pg2SqliteOptions,
     params: &[&str],
 ) -> Vec<Option<String>> {
-    let mut statements = Pg2Sqlite::default()
-        .sql(pg)
-        .expect("parse")
-        .translate_to_sql(options)
-        .expect("translate")
-        .into_vec();
+    let script =
+        Pg2Sqlite::default().sql(pg).expect("parse").translate_to_sql(options).expect("translate");
+    let mut connection = super::establish_connection();
+    script
+        .register_functions(&mut connection)
+        .unwrap_or_else(|error| panic!("SQLite must register the helper functions: {error}"));
+    let mut statements = script.into_vec();
     let probe = statements.pop().expect("script should emit at least one statement");
 
-    let mut connection = super::establish_connection();
     for statement in &statements {
         diesel::sql_query(statement)
             .execute(&mut connection)
