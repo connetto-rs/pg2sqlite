@@ -11,7 +11,7 @@
 use diesel::{RunQueryDsl, SqliteConnection};
 use pg2sqlite::{
     prelude::{Pg2Sqlite, Pg2SqliteOptions},
-    warnings::TranslationWarning,
+    warnings::{DowngradeLocation, TranslationWarning},
 };
 
 use crate::helpers;
@@ -130,8 +130,10 @@ fn blank_padding_loss_is_reported_for_every_padded_spelling() {
             reported.iter().any(|warning| {
                 matches!(
                     warning,
-                    TranslationWarning::LossyDowngrade { location, .. }
-                    if location == "names.padded"
+                    TranslationWarning::LossyDowngrade {
+                        location: DowngradeLocation::Column { table, column },
+                        ..
+                    } if table == "names" && column == "padded"
                 )
             }),
             "{spelling} should report the padding loss on the qualified column, got {reported:?}"

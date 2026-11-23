@@ -609,6 +609,11 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
             normalize_schema_qualified_object_name_for_sqlite(schema, &source_table_name)?;
 
         let mut normalized_trigger = self.clone();
+        super::generated_update::normalize(
+            &mut normalized_trigger,
+            body_schema(schema, options),
+            options,
+        )?;
         normalized_trigger.table_name = normalized_source_table_name;
 
         // The sql-traits trigger machinery resolves the table by its declared
@@ -618,7 +623,7 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
         let resolved_table = resolve_translation_table(schema, &source_table_name)?;
         let can_use_trigger_traits = resolved_table.is_some();
 
-        let mut trigger_for_helpers = self.clone();
+        let mut trigger_for_helpers = normalized_trigger.clone();
         if let Some(table) = resolved_table {
             trigger_for_helpers.table_name = table.name.clone();
         }

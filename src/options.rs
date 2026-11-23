@@ -26,6 +26,7 @@ use crate::{
         ArrayRepresentation, CaseFoldFunctions, JsonbFunctions, SessionVariableMapping,
         TimeZoneFunctions, UuidRepresentation,
     },
+    warnings::DeclaredObject,
 };
 
 type Role = <ParserDB as DatabaseLike>::Role;
@@ -263,15 +264,15 @@ pub(crate) struct PrewalkCatalogs {
 
 /// A trigger on a table or a view.
 #[derive(Clone)]
-struct TableTrigger {
+pub(crate) struct TableTrigger {
     /// The trigger's name as written.
-    name: String,
+    pub(crate) name: String,
     /// The table's or view's name, lower-cased.
     table: String,
     /// The events the trigger fires on.
-    events: Vec<sqlparser::ast::TriggerEvent>,
-    /// Whether the trigger runs `INSTEAD OF` the write.
-    instead_of: bool,
+    pub(crate) events: Vec<sqlparser::ast::TriggerEvent>,
+    pub(crate) period: Option<sqlparser::ast::TriggerPeriod>,
+    pub(crate) row_level: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -368,6 +369,7 @@ pub struct TranslationContext<'a> {
     /// The table of the row trigger being translated and the rows its events
     /// give it, which `NEW` and `OLD` read whole.
     trigger_rows: Option<TriggerRows<'a>>,
+    trigger_catalog: Option<&'a [TableTrigger]>,
     /// The addresses of the `FROM` items of the query being translated that
     /// a row-locking clause covers, which PostgreSQL filters by the `UPDATE`
     /// policies as well. Only a node of that query matches one, so a context
@@ -376,6 +378,29 @@ pub struct TranslationContext<'a> {
     /// Whether the query about to be translated sits in a locked `FROM` item,
     /// which locks every item of its own `FROM`.
     locks_whole_query: bool,
+    /// The declaration whose expressions a warning names, `None` for a query
+    /// or a write.
+    declaration: Option<Declaration<'a>>,
+}
+
+/// A declaration whose expressions a translation reads.
+#[derive(Clone, Copy)]
+pub(crate) enum Declaration<'a> {
+    /// A statement, which names an object when it declares or alters one.
+    Statement(&'a sqlparser::ast::Statement),
+    /// A row level security policy, whose expressions are translated under
+    /// whichever statement builds its table's view and triggers.
+    Policy(&'a sqlparser::ast::CreatePolicy),
+}
+
+impl Declaration<'_> {
+    /// The object it declares, `None` for a statement that declares none.
+    fn object(self) -> Option<DeclaredObject> {
+        match self {
+            Self::Statement(statement) => DeclaredObject::of_statement(statement),
+            Self::Policy(policy) => Some(DeclaredObject::of_policy(policy)),
+        }
+    }
 }
 
 /// A `LANGUAGE sql` function whose body is being translated in place of a
@@ -406,8 +431,10 @@ struct ContextFields<'a> {
     running_as: Option<&'a Role>,
     inlined_body: Option<&'a InlinedBody<'a>>,
     trigger_rows: Option<TriggerRows<'a>>,
+    trigger_catalog: Option<&'a [TableTrigger]>,
     locked: &'a [usize],
     locks_whole_query: bool,
+    declaration: Option<Declaration<'a>>,
 }
 
 impl<'a> ContextFields<'a> {
@@ -424,8 +451,10 @@ impl<'a> ContextFields<'a> {
             running_as: context.running_as,
             inlined_body: context.inlined_body,
             trigger_rows: context.trigger_rows,
+            trigger_catalog: context.trigger_catalog,
             locked: context.locked,
             locks_whole_query: context.locks_whole_query,
+            declaration: context.declaration,
         }
     }
 
@@ -450,8 +479,10 @@ impl<'a> ContextFields<'a> {
             running_as: self.running_as,
             inlined_body: self.inlined_body,
             trigger_rows: self.trigger_rows,
+            trigger_catalog: self.trigger_catalog,
             locked: self.locked,
             locks_whole_query: self.locks_whole_query,
+            declaration: self.declaration,
         }
     }
 }
@@ -475,8 +506,10 @@ impl<'a> TranslationContext<'a> {
             running_as: None,
             inlined_body: None,
             trigger_rows: None,
+            trigger_catalog: None,
             locked: &[],
             locks_whole_query: false,
+            declaration: None,
         }
     }
     pub(crate) fn with_complete_schema(options: &'a Pg2SqliteOptions) -> Self {
@@ -501,8 +534,10 @@ impl<'a> TranslationContext<'a> {
             running_as: None,
             inlined_body: None,
             trigger_rows: None,
+            trigger_catalog: None,
             locked: &[],
             locks_whole_query: false,
+            declaration: None,
         }
     }
 
@@ -606,6 +641,22 @@ impl<'a> TranslationContext<'a> {
         let mut fields = ContextFields::borrowed(self);
         fields.with = with;
         fields.into_context(self.scope, self.outer)
+    }
+
+    /// The same context translating the expressions of `declaration`.
+    pub(crate) fn with_declaration<'s>(
+        &'s self,
+        declaration: Declaration<'s>,
+    ) -> TranslationContext<'s> {
+        let mut fields = ContextFields::borrowed(self);
+        fields.declaration = Some(declaration);
+        fields.into_context(self.scope, self.outer)
+    }
+
+    /// The object whose expressions are being translated, `None` for a query
+    /// or a write.
+    pub(crate) fn declared_object(&self) -> Option<DeclaredObject> {
+        self.declaration.and_then(Declaration::object)
     }
 
     /// The same context noting the PL/pgSQL variables in scope.
@@ -1055,19 +1106,7 @@ impl<'a> TranslationContext<'a> {
 
         let table_key = |name: &ObjectName| last_ident_value_or_display(name).to_lowercase();
         match statement {
-            Statement::CreateTrigger(trigger) => {
-                let name = last_ident_value_or_display(&trigger.name);
-                let table = table_key(&trigger.table_name);
-                let triggers = &mut self.catalogs.to_mut().table_triggers;
-                triggers
-                    .retain(|kept| kept.table != table || !kept.name.eq_ignore_ascii_case(&name));
-                triggers.push(TableTrigger {
-                    name,
-                    table,
-                    events: trigger.events.clone(),
-                    instead_of: trigger.period == Some(sqlparser::ast::TriggerPeriod::InsteadOf),
-                });
-            }
+            Statement::CreateTrigger(trigger) => self.register_table_trigger(trigger),
             Statement::DropTrigger(drop) => {
                 let name = last_ident_value_or_display(&drop.trigger_name);
                 let table = drop.table_name.as_ref().map(table_key);
@@ -1101,6 +1140,58 @@ impl<'a> TranslationContext<'a> {
         }
     }
 
+    fn register_table_trigger(&mut self, trigger: &sqlparser::ast::CreateTrigger) {
+        use crate::impls::object_name::last_ident_value_or_display;
+        let name = last_ident_value_or_display(&trigger.name);
+        let table = last_ident_value_or_display(&trigger.table_name).to_lowercase();
+        let triggers = &mut self.catalogs.to_mut().table_triggers;
+        triggers.retain(|kept| kept.table != table || !kept.name.eq_ignore_ascii_case(&name));
+        triggers.push(TableTrigger {
+            name,
+            table,
+            events: trigger.events.clone(),
+            period: trigger.period,
+            row_level: matches!(
+                trigger.trigger_object,
+                Some(
+                    sqlparser::ast::TriggerObjectKind::For(sqlparser::ast::TriggerObject::Row)
+                        | sqlparser::ast::TriggerObjectKind::ForEach(
+                            sqlparser::ast::TriggerObject::Row
+                        )
+                )
+            ),
+        });
+    }
+
+    pub(crate) fn seed_table_triggers(&mut self, schema: Option<&ParserDB>) -> Vec<TableTrigger> {
+        use sql_traits::traits::DatabaseLike;
+        if let Some(schema) = schema {
+            for trigger in schema.triggers() {
+                self.register_table_trigger(trigger);
+            }
+        }
+        self.catalogs.table_triggers.clone()
+    }
+
+    pub(crate) fn with_table_triggers<'s>(
+        &'s self,
+        triggers: &'s [TableTrigger],
+    ) -> TranslationContext<'s> {
+        let mut fields = ContextFields::borrowed(self);
+        fields.trigger_catalog = Some(triggers);
+        fields.into_context(self.scope, self.outer)
+    }
+
+    pub(crate) fn table_triggers<'s>(
+        &'s self,
+        table: &'s ObjectName,
+    ) -> impl Iterator<Item = &'s TableTrigger> {
+        let name = crate::impls::object_name::last_ident(table);
+        self.trigger_catalog.unwrap_or(&self.catalogs.table_triggers).iter().filter(
+            move |trigger| name.is_some_and(|name| trigger.table.eq_ignore_ascii_case(&name.value)),
+        )
+    }
+
     /// The name of a trigger `table` carries that fires on an event `fires`
     /// accepts, among those the replica does not leave to the server.
     pub(crate) fn trigger_firing(
@@ -1129,7 +1220,9 @@ impl<'a> TranslationContext<'a> {
     ) -> bool {
         let view = view.to_lowercase();
         self.catalogs.table_triggers.iter().any(|trigger| {
-            trigger.instead_of && trigger.table == view && trigger.events.iter().any(&fires)
+            trigger.period == Some(sqlparser::ast::TriggerPeriod::InsteadOf)
+                && trigger.table == view
+                && trigger.events.iter().any(&fires)
         })
     }
 

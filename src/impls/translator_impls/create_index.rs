@@ -464,7 +464,10 @@ fn translate_index_column(
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<IndexColumn, crate::errors::Error> {
     use crate::traits::translator::TranslatorWithContext;
-    let mut translated = column.translate_with_warnings(schema, options, emit)?;
+    let mut translated = IndexColumn {
+        column: column.column.translate_with_warnings(schema, options, emit)?,
+        operator_class: None,
+    };
     if crate::impls::expression_type::is_interval_typed(&column.column.expr, schema, options) {
         translated.column.expr =
             crate::impls::interval::keys::key_expr(&translated.column.expr, options)?;
@@ -479,7 +482,17 @@ fn translate_index_column(
 /// one. Only the clauses a `PostgreSqlDialect` parse can deliver are here:
 /// `index_options` and `alter_options` belong to other dialects and never
 /// arrive populated.
-fn report_dropped_index_clauses(index: &CreateIndex, emit: crate::warnings::WarningSink<'_>) {
+fn report_dropped_index_clauses(
+    index: &CreateIndex,
+    name: &ObjectName,
+    emit: crate::warnings::WarningSink<'_>,
+) {
+    let location = || {
+        crate::warnings::DowngradeLocation::Object(crate::warnings::DeclaredObject::Index {
+            table: last_ident_value_or_display(&index.table_name),
+            name: last_ident_value_or_display(name),
+        })
+    };
     if !index.include.is_empty() {
         let included = index.include.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
         let key = index.columns.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
@@ -487,7 +500,7 @@ fn report_dropped_index_clauses(index: &CreateIndex, emit: crate::warnings::Warn
             construct: "index INCLUDE".to_string(),
             from: format!("({key}) INCLUDE ({included})"),
             to: format!("({key})"),
-            location: index.table_name.to_string(),
+            location: location(),
             reason: "SQLite has no covering index, so a query PostgreSQL answers from the index \
                      alone, an index-only scan, visits the table here instead. An INCLUDE \
                      column is payload rather than key, so nothing about which rows the index \
@@ -501,7 +514,7 @@ fn report_dropped_index_clauses(index: &CreateIndex, emit: crate::warnings::Warn
             construct: "index method".to_string(),
             from: format!("USING {method}"),
             to: "a SQLite b-tree index".to_string(),
-            location: index.table_name.to_string(),
+            location: location(),
             reason: "SQLite builds one kind of index, so the emitted one serves whatever a \
                      b-tree serves. For hash and BRIN that loses nothing, since a b-tree \
                      answers equality and ranges alike, but a method chosen for a query shape \
@@ -530,6 +543,23 @@ fn report_dropped_index_clauses(index: &CreateIndex, emit: crate::warnings::Warn
                  answers."
             ),
         });
+    }
+
+    // A class changes a UNIQUE index's rows only under a collation
+    // `Expr::Collate` refuses.
+    for column in &index.columns {
+        if let Some(operator_class) = &column.operator_class {
+            emit(crate::warnings::TranslationWarning::LossyDowngrade {
+                construct: "index operator class".to_string(),
+                from: format!("{} {operator_class}", column.column),
+                to: column.column.to_string(),
+                location: location(),
+                reason: "SQLite has no operator classes, so the index serves fewer queries than \
+                         the PostgreSQL one, notably the pattern matches a text pattern class \
+                         exists for."
+                    .to_string(),
+            });
+        }
     }
 }
 
@@ -594,7 +624,7 @@ impl crate::traits::translator::TranslatorWithContext for CreateIndex {
                  this index cannot be predicted. Name the index."
             )));
         };
-        report_dropped_index_clauses(self, emit);
+        report_dropped_index_clauses(self, name, emit);
         let backing_table = if names_table_with_backing(schema, &self.table_name, options)? {
             append_suffix(&sqlite_table_name, options.get_rls_table_suffix())
         } else {

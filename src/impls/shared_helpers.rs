@@ -3293,6 +3293,7 @@ pub(crate) fn without_generated_defaults<'a>(
     assignments: &'a [Assignment],
     table: &<ParserDB as DatabaseLike>::Table,
     schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
 ) -> Result<Cow<'a, [Assignment]>, Error> {
     let generated_default = |name: &ObjectName, value: &Expr| -> Result<bool, Error> {
         Ok(is_default_keyword(value) && is_generated_expression_column(name, table, schema)?)
@@ -3357,6 +3358,13 @@ pub(crate) fn without_generated_defaults<'a>(
              column of the row to itself alongside it.",
         ));
     }
+    crate::impls::translator_impls::generated_update::check_dropped_defaults(
+        assignments,
+        &kept,
+        table,
+        schema,
+        options,
+    )?;
     Ok(Cow::Owned(kept))
 }
 
@@ -4590,6 +4598,34 @@ where
     }
 }
 
+/// The column rewrites of an `UPDATE` target and its table, when the target
+/// resolves to one.
+///
+/// Best-effort: falls back to passthrough for unknown tables (CTEs, etc.).
+/// Forward-only. Reverse receives an already-rewritten input, and it never
+/// unwraps or unscales, so rewriting there would put the two directions out
+/// of step rather than into it.
+fn update_target<'schema, D: TranslationDirection>(
+    update: &sqlparser::ast::Update,
+    schema: &'schema ParserDB,
+    options: &D::Options<'_>,
+) -> (ColumnRewrites, Option<&'schema <ParserDB as DatabaseLike>::Table>) {
+    if !D::IS_FORWARD {
+        return (ColumnRewrites::default(), None);
+    }
+    match &update.table.relation {
+        TableFactor::Table { name, .. } => {
+            match resolve_translation_table(schema, name) {
+                Ok(Some(table)) => {
+                    (ColumnRewrites::of_table(table, schema, D::config(options)), Some(table))
+                }
+                _ => (ColumnRewrites::default(), None),
+            }
+        }
+        _ => (ColumnRewrites::default(), None),
+    }
+}
+
 /// Shared UPDATE translation. Forward rejects joins on the target table.
 pub(crate) fn translate_update<D: TranslationDirection>(
     update: &sqlparser::ast::Update,
@@ -4604,28 +4640,13 @@ pub(crate) fn translate_update<D: TranslationDirection>(
         ));
     }
 
-    // Best-effort: falls back to passthrough for unknown tables (CTEs, etc.).
-    // Forward-only. Reverse receives an already-rewritten input, and it never
-    // unwraps or unscales, so rewriting here would put the two directions out
-    // of step rather than into it.
-    let (rewrites, target_table) = if D::IS_FORWARD {
-        match &update.table.relation {
-            TableFactor::Table { name, .. } => {
-                match resolve_translation_table(schema, name) {
-                    Ok(Some(table)) => {
-                        (ColumnRewrites::of_table(table, schema, D::config(options)), Some(table))
-                    }
-                    _ => (ColumnRewrites::default(), None),
-                }
-            }
-            _ => (ColumnRewrites::default(), None),
-        }
-    } else {
-        (ColumnRewrites::default(), None)
-    };
+    let (rewrites, target_table) = update_target::<D>(update, schema, options);
 
     let written = match target_table {
-        Some(table) => without_generated_defaults(&update.assignments, table, schema)?,
+        Some(table) => {
+            let context = required_forward_context::<D>(options);
+            without_generated_defaults(&update.assignments, table, schema, context)?
+        }
         None => Cow::Borrowed(update.assignments.as_slice()),
     };
     let assignments = written

@@ -622,7 +622,7 @@ fn report_rowid_sequence_divergence(
         construct: construct.to_string(),
         from: construct.to_string(),
         to: "INTEGER PRIMARY KEY AUTOINCREMENT".to_string(),
-        location: format!("{}.{}", last_ident_value_or_display(table), column.name.value),
+        location: column_location(column, table),
         reason: "SQLite counts from the table's high-water mark rather than from a sequence, \
                  so a deleted key is not reissued but two differences remain: a value supplied \
                  by an insert moves the counter, where a sequence ignores one, and a rolled \
@@ -701,7 +701,7 @@ fn report_column_downgrades(
     table: &ObjectName,
     emit: crate::warnings::WarningSink<'_>,
 ) {
-    let location = format!("{}.{}", last_ident_value_or_display(table), column.name.value);
+    let location = || column_location(column, table);
 
     // CHAR pads to its declared width and TEXT stores what it is given.
     if matches!(column.data_type, DataType::Char(_) | DataType::Character(_)) {
@@ -709,7 +709,7 @@ fn report_column_downgrades(
             construct: "CHAR".to_string(),
             from: column.data_type.to_string(),
             to: "TEXT".to_string(),
-            location: location.clone(),
+            location: location(),
             reason: "SQLite stores the value as given, so it is no longer blank padded to \
                      the declared width."
                 .to_string(),
@@ -727,7 +727,7 @@ fn report_column_downgrades(
             construct: "WITH TIME ZONE".to_string(),
             from: column.data_type.to_string(),
             to: "TEXT".to_string(),
-            location: location.clone(),
+            location: location(),
             reason: "SQLite has no zone-aware temporal type, so the value is stored as text and \
                      compares as text. The translation writes a timestamptz as UTC text with a \
                      +00:00 offset, so those compare as instants, but a bound parameter or a \
@@ -744,7 +744,7 @@ fn report_column_downgrades(
             construct: "JSONB".to_string(),
             from: "JSONB".to_string(),
             to: "TEXT".to_string(),
-            location: location.clone(),
+            location: location(),
             reason: "The replica orders strings inside a jsonb value bytewise, as the C \
                      collation does, where a server whose default collation is another locale \
                      orders them by that locale."
@@ -759,10 +759,18 @@ fn report_column_downgrades(
             construct: "TSVECTOR".to_string(),
             from: "TSVECTOR".to_string(),
             to: "TEXT".to_string(),
-            location,
+            location: location(),
             reason: "PostgreSQL parses tsvector input into normalised lexemes on write; \
                      the replica stores the raw string, so ::text projections differ."
                 .to_string(),
         });
+    }
+}
+
+/// Where a downgrade of `column`, declared on `table`, happened.
+fn column_location(column: &ColumnDef, table: &ObjectName) -> crate::warnings::DowngradeLocation {
+    crate::warnings::DowngradeLocation::Column {
+        table: last_ident_value_or_display(table),
+        column: column.name.value.clone(),
     }
 }
