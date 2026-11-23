@@ -1708,14 +1708,18 @@ impl Pg2SqliteOptions {
     }
 
     #[must_use]
-    /// Sets the boolean function marking a statement as the table owner's.
+    /// Sets the boolean function marking a statement as one applying the
+    /// server's rows.
     ///
     /// While it answers true, row-level security binds neither the
     /// statement's writes nor its reads, as it binds neither for PostgreSQL's
     /// table owner. The generated write guards and grant gates let the write
     /// through, and a row-secured view shows every row of its backing table,
-    /// still projecting only the columns the acting role may read. Constraint
-    /// triggers skip an exempt write too, deferred ones included.
+    /// still projecting only the columns the acting role may read. No `BEFORE`
+    /// or `AFTER` trigger translated from a `CREATE TRIGGER` fires, constraint
+    /// triggers and deferred ones included, as none fires where a PostgreSQL
+    /// subscriber applies replicated rows with `session_replication_role =
+    /// replica`, so a delivered row is stored as the server sent it.
     pub fn with_rls_exemption_function(mut self, name: impl Into<String>) -> Self {
         self.rls_exemption_function = Some(name.into());
         self

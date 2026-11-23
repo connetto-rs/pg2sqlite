@@ -66,6 +66,7 @@ mod test_definer_helper_inlining;
 mod test_definer_read_hidden_table;
 mod test_delete_using;
 mod test_delimited_membership;
+mod test_delivered_rows;
 mod test_dependency_hygiene;
 mod test_deployment_readings;
 mod test_direction_parity;
