@@ -509,6 +509,46 @@ fn a_cast_downgrade_in_a_query_names_no_object() {
     );
 }
 
+/// A write's cast names the table the write changes, whichever form the write
+/// takes.
+#[test]
+fn a_cast_downgrade_in_a_write_names_the_written_table() {
+    let table = |name: &str| Some(DeclaredObject::Table { name: name.to_owned() });
+    assert_eq!(
+        locations_for(
+            "CREATE TABLE notes (id INT PRIMARY KEY, title TEXT, at TIMESTAMP);
+             CREATE TABLE log (id INT PRIMARY KEY, at TIMESTAMP);
+             INSERT INTO log (id, at) SELECT id, CAST(title AS timestamp) FROM notes;
+             UPDATE public.notes SET at = CAST(title AS timestamp);
+             DELETE FROM log WHERE at < CAST((SELECT title FROM notes LIMIT 1) AS timestamp);
+             WITH titled AS (SELECT id, title FROM notes)
+             INSERT INTO log (id, at) SELECT id + 100, CAST(title AS timestamp) FROM titled;",
+        ),
+        [
+            expression(table("log"), "CAST(title AS TIMESTAMP)"),
+            expression(table("notes"), "CAST(title AS TIMESTAMP)"),
+            expression(table("log"), "CAST((SELECT title FROM notes LIMIT 1) AS TIMESTAMP)"),
+            expression(table("log"), "CAST(title AS TIMESTAMP)"),
+        ]
+    );
+}
+
+/// A write through an updatable view names the view it was written against.
+#[test]
+fn a_cast_downgrade_in_a_write_through_a_view_names_the_view() {
+    assert_eq!(
+        locations_for(
+            "CREATE TABLE notes (id INT PRIMARY KEY, title TEXT, at TIMESTAMP);
+             CREATE VIEW recent AS SELECT id, title, at FROM notes;
+             UPDATE recent SET at = CAST(title AS timestamp);",
+        ),
+        [expression(
+            Some(DeclaredObject::View { name: "recent".to_owned() }),
+            "CAST(title AS TIMESTAMP)"
+        )]
+    );
+}
+
 /// Foreign keys are enforced only under a connection setting, which no
 /// table, column or index owns.
 #[test]

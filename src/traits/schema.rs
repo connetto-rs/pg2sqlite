@@ -46,20 +46,21 @@ pub(crate) fn written_function<'s, S: Schema>(
     schema: &'s S,
     name: &ObjectName,
 ) -> Result<Option<&'s CreateFunction>, Error> {
-    let Some(target) = function_lookup_target(name) else {
+    let Some(target) = lookup_target(name) else {
         return Ok(None);
     };
     Ok(schema.resolve_target_function(target, IdentifierCase::AsWritten)?)
 }
 
-/// Reads a written function reference as the name to resolve, keeping each
-/// part spelled as the statement wrote it so that quoting decides whether the
-/// part folds and an unqualified name goes through the search path.
+/// Reads a written function or relation reference as the name to resolve,
+/// keeping each part spelled as the statement wrote it so that quoting
+/// decides whether the part folds and an unqualified name goes through the
+/// search path.
 ///
 /// Returns [`None`] for a reference no catalog lookup can answer: a part built
 /// while the statement runs, or a name reaching past a schema into another
 /// catalog.
-pub(crate) fn function_lookup_target(name: &ObjectName) -> Option<TargetName<'_>> {
+pub(crate) fn lookup_target(name: &ObjectName) -> Option<TargetName<'_>> {
     fn written(part: &ObjectNamePart) -> Option<(&str, bool)> {
         match part {
             ObjectNamePart::Identifier(ident) => {

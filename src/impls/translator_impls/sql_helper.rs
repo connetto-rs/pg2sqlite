@@ -58,7 +58,7 @@ use crate::{
         translator_impls::definer::backing_name,
     },
     options::{InlinedBody, TranslationContext},
-    traits::{TranslatorWithContext, schema::function_lookup_target},
+    traits::{TranslatorWithContext, schema::lookup_target},
     warnings::WarningSink,
 };
 
@@ -97,7 +97,7 @@ pub(crate) fn schema_helper<'s>(
     name: &ObjectName,
     schema: &'s ParserDB,
 ) -> Result<Option<&'s CreateFunction>, Error> {
-    let Some(target) = function_lookup_target(name) else { return Ok(None) };
+    let Some(target) = lookup_target(name) else { return Ok(None) };
     match schema.resolve_target_function(target.clone(), IdentifierCase::AsWritten) {
         Ok(function) => Ok(function.filter(|function| !in_pg_catalog(function))),
         // The catalog holds the name, so the ambiguous lookup settles to the
@@ -1637,7 +1637,7 @@ fn check_groups_no_rows(name: &ObjectName, body: &Expr, schema: &ParserDB) -> Re
 /// The kind of the function the schema declares under the name `call`
 /// calls, `None` for a name it does not declare or declares several times.
 fn declared_kind(call: &Function, schema: &ParserDB) -> Result<Option<FunctionKind>, Error> {
-    let Some(target) = function_lookup_target(&call.name) else { return Ok(None) };
+    let Some(target) = lookup_target(&call.name) else { return Ok(None) };
     let declared = match schema.resolve_target_function(target, IdentifierCase::AsWritten) {
         Err(LookupError::AmbiguousFunctionLookup { .. }) => None,
         resolved => resolved?,
