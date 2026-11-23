@@ -165,7 +165,7 @@ fn options() -> Pg2SqliteOptions {
         .with_deployment(deployment([], [caller("app.user_id", "text")]))
         .with_session_variable(SessionVariableMapping::new("app.user_id", "definer_app_user"))
         .with_rls_audit_table_name("rls_audit")
-        .with_write_exemption_function("definer_write_exempt")
+        .with_rls_exemption_function("definer_write_exempt")
 }
 
 fn translate(source: &str) -> Result<Vec<String>, pg2sqlite::errors::Error> {
@@ -275,7 +275,7 @@ fn postgres(scenario: &Scenario, seeded: &[(&str, &str)]) -> PgConnection {
 }
 
 /// The translated schema on SQLite, seeded through the backing tables under
-/// the write exemption, then with `nina` signed in.
+/// the RLS exemption, then with `nina` signed in.
 fn replica(translated: &[String], seeded: &[(&str, &str)]) -> SqliteConnection {
     let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
     definer_app_user_utils::register_nondeterministic_impl(&mut connection, || Some("nina"))

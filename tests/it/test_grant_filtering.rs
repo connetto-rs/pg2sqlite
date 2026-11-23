@@ -225,7 +225,7 @@ fn translation_options() -> Pg2SqliteOptions {
         .with_user_defined_functions(["current_app_user"])
         .with_deployment(deployment(["app_user"], []))
         .with_acting_role("app_user")
-        .with_write_exemption_function("write_is_exempt")
+        .with_rls_exemption_function("write_is_exempt")
 }
 
 /// Helper to set up the database with all translated statements.

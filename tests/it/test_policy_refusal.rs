@@ -90,7 +90,7 @@ fn apply(pg: &str, options: &Pg2SqliteOptions) -> (SqliteConnection, Arc<AtomicB
     write_is_exempt_utils::register_nondeterministic_impl(&mut connection, move || {
         function_state.load(Ordering::Relaxed)
     })
-    .expect("register write exemption");
+    .expect("register RLS exemption");
     let statements = crate::helpers::translate_pg(pg, options).expect("translate SQLite");
     for statement in statements {
         connection.batch_execute(&statement).expect("apply translated statement");
@@ -102,7 +102,7 @@ fn policy_connection() -> (SqliteConnection, Arc<AtomicBool>) {
     let options = Pg2SqliteOptions::default()
         .with_rls_audit_table_name("rls_audit")
         .with_strict_rls_write_deny()
-        .with_write_exemption_function("write_is_exempt");
+        .with_rls_exemption_function("write_is_exempt");
     apply(POLICY_SCHEMA, &options)
 }
 
@@ -111,7 +111,7 @@ fn read_only_connection() -> SqliteConnection {
         .with_deployment(crate::helpers::deployment::deployment(["app_user"], []))
         .with_acting_role("app_user")
         .with_rls_audit_table_name("rls_audit")
-        .with_write_exemption_function("write_is_exempt");
+        .with_rls_exemption_function("write_is_exempt");
     apply(READ_ONLY_SCHEMA, &options).0
 }
 

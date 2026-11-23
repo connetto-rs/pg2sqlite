@@ -50,7 +50,7 @@ fn replica(source: &str, options: &Pg2SqliteOptions) -> (SqliteConnection, Vec<S
     let before_commit = script.before_commit.clone();
     let mut connection =
         diesel::Connection::establish(":memory:").expect("open an in-memory SQLite");
-    if options.get_write_exemption_function().is_some() {
+    if options.get_rls_exemption_function().is_some() {
         constraint_write_exempt_utils::register_nondeterministic_impl(&mut connection, || false)
             .expect("register the exemption");
     }
@@ -143,7 +143,7 @@ fn the_script_commit_runs_the_checks() {
 #[test]
 fn an_exempt_write_queues_no_check() {
     let (mut connection, before_commit) =
-        replica("", &Pg2SqliteOptions::default().with_write_exemption_function(EXEMPTION_FUNCTION));
+        replica("", &Pg2SqliteOptions::default().with_rls_exemption_function(EXEMPTION_FUNCTION));
     constraint_write_exempt_utils::register_nondeterministic_impl(&mut connection, || true)
         .expect("exempt the write");
     transaction(&mut connection, &before_commit, "INSERT INTO resources VALUES ('f1', 'folder');")

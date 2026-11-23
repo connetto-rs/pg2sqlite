@@ -1,4 +1,5 @@
-//! Execution contracts for caller-scoped exemption from generated write guards.
+//! Execution contracts for the caller-scoped exemption from row-level security
+//! and generated write guards.
 
 use std::sync::{
     Arc,
@@ -10,7 +11,7 @@ use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
 use crate::{helpers, helpers::deployment::deployment};
 
-const WRITE_EXEMPTION_FUNCTION: &str = "write_is_exempt";
+const EXEMPTION_FUNCTION: &str = "write_is_exempt";
 
 const POLICY_SCHEMA: &str = "
 CREATE TABLE shared_items (
@@ -214,6 +215,20 @@ CREATE POLICY kinds_read ON kinds FOR SELECT TO app USING (id IN (SELECT id FROM
 ALTER TABLE things RENAME TO stuff;
 ";
 
+const HIDDEN_ROWS_SCHEMA: &str = "
+CREATE ROLE app NOLOGIN;
+CREATE TABLE owned_notes (id TEXT PRIMARY KEY, owner TEXT NOT NULL);
+ALTER TABLE owned_notes ENABLE ROW LEVEL SECURITY;
+CREATE POLICY owned_notes_read ON owned_notes FOR SELECT TO app USING (owner = 'alice');
+CREATE POLICY owned_notes_write ON owned_notes FOR INSERT TO app WITH CHECK (owner = 'alice');
+CREATE POLICY owned_notes_update ON owned_notes FOR UPDATE TO app USING (owner = 'alice');
+GRANT SELECT, INSERT, UPDATE ON owned_notes TO app;
+CREATE TABLE sealed_notes (id TEXT PRIMARY KEY);
+ALTER TABLE sealed_notes ENABLE ROW LEVEL SECURITY;
+CREATE POLICY sealed_notes_write ON sealed_notes FOR INSERT TO app WITH CHECK (true);
+GRANT SELECT, INSERT ON sealed_notes TO app;
+";
+
 mod schema {
     diesel::table! {
         shared_items (id) {
@@ -334,6 +349,17 @@ mod schema {
             body -> Text,
         }
     }
+    diesel::table! {
+        owned_notes (id) {
+            id -> Text,
+            owner -> Text,
+        }
+    }
+    diesel::table! {
+        sealed_notes (id) {
+            id -> Text,
+        }
+    }
 }
 
 diesel::define_sql_function! {
@@ -360,7 +386,7 @@ fn options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_rls_audit_table_name("rls_audit")
         .with_strict_rls_write_deny()
-        .with_write_exemption_function(WRITE_EXEMPTION_FUNCTION)
+        .with_rls_exemption_function(EXEMPTION_FUNCTION)
 }
 
 fn translated(pg: &str, options: &Pg2SqliteOptions) -> Vec<String> {
@@ -382,13 +408,13 @@ fn apply_with_exemption(
     write_is_exempt_utils::register_nondeterministic_impl(&mut connection, move || {
         function_state.load(Ordering::Relaxed)
     })
-    .expect("register write exemption");
+    .expect("register RLS exemption");
     (connection, exempt)
 }
 
 #[test]
 fn null_and_function_error_fail_closed() {
-    let null_options = options().with_write_exemption_function("write_exemption_is_null");
+    let null_options = options().with_rls_exemption_function("write_exemption_is_null");
     let mut null_connection =
         helpers::apply_with_options(POLICY_SCHEMA, &null_options).expect("apply");
     write_exemption_is_null_utils::register_nondeterministic_impl(&mut null_connection, || {
@@ -407,7 +433,7 @@ fn null_and_function_error_fail_closed() {
         "NULL must enforce the write policy"
     );
 
-    let panic_options = options().with_write_exemption_function("write_exemption_panics");
+    let panic_options = options().with_rls_exemption_function("write_exemption_panics");
     let mut panic_connection =
         helpers::apply_with_options(POLICY_SCHEMA, &panic_options).expect("apply");
     write_exemption_panics_utils::register_nondeterministic_impl(
@@ -584,7 +610,7 @@ fn read_only_non_rls_guards_honour_exemption() {
     let role_options = Pg2SqliteOptions::default()
         .with_deployment(deployment(["app_user"], []))
         .with_acting_role("app_user")
-        .with_write_exemption_function(WRITE_EXEMPTION_FUNCTION);
+        .with_rls_exemption_function(EXEMPTION_FUNCTION);
     let (mut connection, exempt) = apply_with_exemption(READ_ONLY_SCHEMA, &role_options);
 
     assert!(
@@ -629,7 +655,7 @@ fn grant_gates_honour_exemption() {
     let role_options = Pg2SqliteOptions::default()
         .with_deployment(deployment(["app_user"], []))
         .with_acting_role("app_user")
-        .with_write_exemption_function(WRITE_EXEMPTION_FUNCTION);
+        .with_rls_exemption_function(EXEMPTION_FUNCTION);
     let (mut connection, exempt) = apply_with_exemption(GRANT_GATED_SCHEMA, &role_options);
 
     diesel::insert_into(gated_items::table)
@@ -683,7 +709,7 @@ fn read_only_rls_backing_guards_honour_exemption() {
         .with_deployment(deployment(["app_user"], []))
         .with_acting_role("app_user")
         .with_rls_audit_table_name("rls_audit")
-        .with_write_exemption_function(WRITE_EXEMPTION_FUNCTION);
+        .with_rls_exemption_function(EXEMPTION_FUNCTION);
     let (mut connection, exempt) = apply_with_exemption(READ_ONLY_RLS_SCHEMA, &role_options);
 
     assert!(
@@ -727,8 +753,12 @@ fn read_only_rls_backing_guards_honour_exemption() {
         .expect("exempt read-only RLS delete");
 }
 
+/// A translated trigger run by an exempt write reaches a row the policies hide,
+/// and the exempt statement reads it through the view as PostgreSQL's table
+/// owner does, so the monitor records nothing. The view hides it again once
+/// the exemption is off.
 #[test]
-fn translated_trigger_writes_backing_storage_while_reads_stay_filtered() {
+fn translated_trigger_writes_backing_storage_that_exempt_reads_see() {
     let (mut connection, exempt) = apply_with_exemption(TRIGGER_CHAIN_SCHEMA, &options());
     exempt.store(true, Ordering::Relaxed);
     diesel::insert_into(schema::child_items_rls::table)
@@ -744,30 +774,22 @@ fn translated_trigger_writes_backing_storage_while_reads_stay_filtered() {
         .execute(&mut connection)
         .expect("insert parent and run translated trigger");
 
-    assert_eq!(
-        schema::child_items_rls::table
-            .find(1)
-            .select(schema::child_items_rls::note)
-            .get_result::<String>(&mut connection)
-            .expect("read child backing row"),
-        "touched"
-    );
-    assert_eq!(
+    let visible_notes = |connection: &mut SqliteConnection| {
         schema::child_items::table
-            .count()
-            .get_result::<i64>(&mut connection)
-            .expect("count visible children"),
-        0,
-        "ordinary reads must remain filtered"
-    );
-    assert!(
+            .select(schema::child_items::note)
+            .load::<String>(connection)
+            .expect("read children through the view")
+    };
+    assert_eq!(visible_notes(&mut connection), ["touched"]);
+    assert_eq!(
         schema::rls_audit::table
             .count()
             .get_result::<i64>(&mut connection)
-            .expect("count monitoring rows")
-            >= 1,
-        "monitoring must stay active"
+            .expect("count monitoring rows"),
+        0
     );
+    exempt.store(false, Ordering::Relaxed);
+    assert_eq!(visible_notes(&mut connection), Vec::<String>::new());
 }
 
 #[test]
@@ -865,12 +887,12 @@ fn hardened_connection_accepts_only_innocuous_exemption_function() {
         POLICY_SCHEMA,
         &Pg2SqliteOptions::default()
             .with_rls_audit_table_name("rls_audit")
-            .with_write_exemption_function(WRITE_EXEMPTION_FUNCTION),
+            .with_rls_exemption_function(EXEMPTION_FUNCTION),
     );
     let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_INNOCUOUS;
     let connection = rusqlite::Connection::open_in_memory().expect("open hardened SQLite");
     connection
-        .create_scalar_function(WRITE_EXEMPTION_FUNCTION, 0, flags, |_| Ok(true))
+        .create_scalar_function(EXEMPTION_FUNCTION, 0, flags, |_| Ok(true))
         .expect("register innocuous exemption");
     connection.execute_batch("PRAGMA trusted_schema = OFF").expect("disable trusted schema");
     for statement in &translated {
@@ -884,9 +906,7 @@ fn hardened_connection_accepts_only_innocuous_exemption_function() {
 
     let unsafe_connection = rusqlite::Connection::open_in_memory().expect("open unsafe SQLite");
     unsafe_connection
-        .create_scalar_function(WRITE_EXEMPTION_FUNCTION, 0, FunctionFlags::SQLITE_UTF8, |_| {
-            Ok(true)
-        })
+        .create_scalar_function(EXEMPTION_FUNCTION, 0, FunctionFlags::SQLITE_UTF8, |_| Ok(true))
         .expect("register non-innocuous exemption");
     unsafe_connection.execute_batch("PRAGMA trusted_schema = OFF").expect("disable trusted schema");
     for statement in &translated {
@@ -903,7 +923,7 @@ fn quoted_exemption_function_name_is_safe() {
     const QUOTED_NAME: &str = "select";
     let quoted_options = Pg2SqliteOptions::default()
         .with_rls_audit_table_name("rls_audit")
-        .with_write_exemption_function(QUOTED_NAME);
+        .with_rls_exemption_function(QUOTED_NAME);
     let mut connection =
         helpers::apply_with_options(POLICY_SCHEMA, &quoted_options).expect("apply");
     connection
@@ -923,18 +943,21 @@ fn quoted_exemption_function_name_is_safe() {
         .expect("quoted exemption function runs");
 }
 
-/// The script `sql` translates to under a deployment acting as `app`, loaded
-/// with the exemption on, and the switch that turns it off.
-fn load_exempt(sql: &str) -> (SqliteConnection, Arc<AtomicBool>) {
-    let role_options = Pg2SqliteOptions::default()
+fn role_options() -> Pg2SqliteOptions {
+    Pg2SqliteOptions::default()
         .with_deployment(deployment(["app"], []))
         .with_acting_role("app")
         .with_rls_audit_table_name("rls_audit")
-        .with_write_exemption_function(WRITE_EXEMPTION_FUNCTION);
+        .with_rls_exemption_function(EXEMPTION_FUNCTION)
+}
+
+/// The script `sql` translates to under a deployment acting as `app`, loaded
+/// with the exemption on, and the switch that turns it off.
+fn load_exempt(sql: &str) -> (SqliteConnection, Arc<AtomicBool>) {
     let script = Pg2Sqlite::default()
         .sql(sql)
         .expect("parse PostgreSQL")
-        .translate(&role_options)
+        .translate(&role_options())
         .expect("translate SQLite");
     let mut connection =
         <SqliteConnection as diesel::Connection>::establish(":memory:").expect("connect");
@@ -943,7 +966,7 @@ fn load_exempt(sql: &str) -> (SqliteConnection, Arc<AtomicBool>) {
     write_is_exempt_utils::register_nondeterministic_impl(&mut connection, move || {
         function_state.load(Ordering::Relaxed)
     })
-    .expect("register write exemption");
+    .expect("register RLS exemption");
     for statement in script.iter() {
         // The emitted script is the artifact under test, which no typed DSL
         // can stand in for.
@@ -1025,7 +1048,7 @@ fn exempt_writes_through_a_view_hiding_the_key_are_refused() {
 /// column rename there still loads. The policy applies once the script ends.
 #[test]
 fn seeds_load_before_the_table_the_policy_reads() {
-    let (mut connection, _exempt) = load_exempt(SEED_BEFORE_POLICY_READ_SCHEMA);
+    let (mut connection, exempt) = load_exempt(SEED_BEFORE_POLICY_READ_SCHEMA);
 
     assert_eq!(
         schema::kinds_rls::table
@@ -1035,6 +1058,7 @@ fn seeds_load_before_the_table_the_policy_reads() {
             .expect("read the backing table"),
         ["device", "sample", "specimen"]
     );
+    exempt.store(false, Ordering::Relaxed);
     assert_eq!(
         schema::kinds::table
             .select(schema::kinds::id)
@@ -1049,7 +1073,8 @@ fn seeds_load_before_the_table_the_policy_reads() {
 /// once the script ends.
 #[test]
 fn seeds_load_before_a_chain_of_policy_reads() {
-    let (mut connection, _exempt) = load_exempt(SEED_BEFORE_POLICY_READ_CHAIN_SCHEMA);
+    let (mut connection, exempt) = load_exempt(SEED_BEFORE_POLICY_READ_CHAIN_SCHEMA);
+    exempt.store(false, Ordering::Relaxed);
 
     assert_eq!(
         schema::kinds::table
@@ -1058,6 +1083,62 @@ fn seeds_load_before_a_chain_of_policy_reads() {
             .expect("read kinds through the view"),
         ["sample"]
     );
+}
+
+#[derive(diesel::QueryableByName)]
+struct NoteId {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    id: String,
+}
+
+/// An exempt statement reads every row through a row-secured view, the row it
+/// just wrote included, as PostgreSQL's table owner does, under policies that
+/// hide some rows, under none admitting any row, and in a locking read. The
+/// views filter again once the exemption is off.
+#[test]
+fn exempt_reads_see_every_row_through_the_view() {
+    let (mut connection, exempt) = load_exempt(HIDDEN_ROWS_SCHEMA);
+    diesel::insert_into(schema::owned_notes::table)
+        .values((schema::owned_notes::id.eq("n1"), schema::owned_notes::owner.eq("bob")))
+        .execute(&mut connection)
+        .expect("exempt insert of a hidden row");
+    diesel::insert_into(schema::sealed_notes::table)
+        .values(schema::sealed_notes::id.eq("s1"))
+        .execute(&mut connection)
+        .expect("exempt insert into a sealed table");
+    let locking_read = Pg2Sqlite::default()
+        .sql(&format!("{HIDDEN_ROWS_SCHEMA}SELECT id FROM owned_notes FOR UPDATE;"))
+        .expect("parse PostgreSQL")
+        .translate(&role_options())
+        .expect("translate SQLite")
+        .iter()
+        .last()
+        .expect("the locking read translates")
+        .to_string();
+
+    let reads = |connection: &mut SqliteConnection| {
+        let owned = schema::owned_notes::table
+            .filter(schema::owned_notes::id.eq("n1"))
+            .select(schema::owned_notes::id)
+            .load::<String>(connection)
+            .expect("read owned notes through the view");
+        let sealed = schema::sealed_notes::table
+            .select(schema::sealed_notes::id)
+            .load::<String>(connection)
+            .expect("read sealed notes through the view");
+        // The translated locking read is pg2sqlite's output, which no typed
+        // query can state.
+        let locked = diesel::sql_query(&locking_read)
+            .load::<NoteId>(connection)
+            .unwrap_or_else(|error| panic!("{locking_read}: {error}"))
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        (owned, sealed, locked)
+    };
+    assert_eq!(reads(&mut connection), (vec!["n1".into()], vec!["s1".into()], vec!["n1".into()]));
+    exempt.store(false, Ordering::Relaxed);
+    assert_eq!(reads(&mut connection), (Vec::new(), Vec::new(), Vec::new()));
 }
 
 /// A connection is refused when it would retranslate on its own a unit a
