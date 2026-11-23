@@ -54,6 +54,9 @@ pub(crate) struct Reemission {
 struct Touched {
     /// The relations it creates, alters, renames or drops, folded.
     relations: BTreeSet<String>,
+    /// The tables it creates or drops a trigger on, folded, which only the
+    /// translation of a trigger on one of them or whose body writes one reads.
+    trigger_tables: BTreeSet<String>,
     /// The functions it creates, replaces, or changes the owner or attributes
     /// of, folded.
     functions: BTreeSet<String>,
@@ -62,8 +65,13 @@ struct Touched {
 impl Touched {
     fn of(event: &Statement) -> Option<Self> {
         let folded_names = |names: &[&ObjectName]| names.iter().map(|name| folded(name)).collect();
-        let relations = |relations| Some(Self { relations, functions: BTreeSet::new() });
-        let functions = |functions| Some(Self { relations: BTreeSet::new(), functions });
+        let none = BTreeSet::new;
+        let relations =
+            |relations| Some(Self { relations, trigger_tables: none(), functions: none() });
+        let trigger_tables =
+            |trigger_tables| Some(Self { relations: none(), trigger_tables, functions: none() });
+        let functions =
+            |functions| Some(Self { relations: none(), trigger_tables: none(), functions });
         match event {
             Statement::AlterTable(alter) => {
                 let mut touched: BTreeSet<String> = folded_names(&[&alter.name]);
@@ -72,9 +80,11 @@ impl Touched {
             }
             Statement::CreateTable(create) => relations(folded_names(&[&create.name])),
             Statement::CreateView(view) => relations(folded_names(&[&view.name])),
-            Statement::CreateTrigger(trigger) => relations(folded_names(&[&trigger.table_name])),
+            Statement::CreateTrigger(trigger) => {
+                trigger_tables(folded_names(&[&trigger.table_name]))
+            }
             Statement::DropTrigger(drop) => {
-                drop.table_name.as_ref().and_then(|table| relations(folded_names(&[table])))
+                drop.table_name.as_ref().and_then(|table| trigger_tables(folded_names(&[table])))
             }
             Statement::Drop {
                 object_type: ObjectType::Table | ObjectType::View, names, ..
@@ -102,7 +112,8 @@ impl Touched {
         (before, after): (&ParserDB, &ParserDB),
         bodies: &mut ReadBodies,
     ) -> Result<bool, Error> {
-        if self.relations.contains(&folded(&trigger.table_name)) {
+        let table = folded(&trigger.table_name);
+        if self.relations.contains(&table) || self.trigger_tables.contains(&table) {
             return Ok(true);
         }
         let Some(exec_body) = &trigger.exec_body else { return Ok(false) };
@@ -113,6 +124,7 @@ impl Touched {
             match body_reach(&exec_body.func_desc.name, schema, bodies)? {
                 Some(reach)
                     if reach.relations.is_disjoint(&self.relations)
+                        && reach.written.is_disjoint(&self.trigger_tables)
                         && reach.functions.is_disjoint(&self.functions) => {}
                 Some(_) | None => return Ok(true),
             }

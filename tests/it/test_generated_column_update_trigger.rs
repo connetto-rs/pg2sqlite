@@ -227,6 +227,34 @@ fn generated_default_gate_loss_is_refused_for_tuple_and_upsert() {
     }
 }
 
+/// A trigger whose body discards a generated-column gate is refused once a
+/// later trigger puts the gate on the table the body updates, by an `UPDATE`
+/// or by an upsert.
+#[test]
+fn later_generated_gate_refuses_a_trigger_updating_its_table() {
+    for write in [
+        "UPDATE subject SET b = DEFAULT, c = c",
+        "INSERT INTO subject (a, c) VALUES (1, 1) ON CONFLICT (a) DO UPDATE SET b = DEFAULT, c = 1",
+    ] {
+        assert_refused(
+            &format!(
+                "CREATE TABLE subject (a INTEGER PRIMARY KEY, b INTEGER GENERATED ALWAYS AS (a * 2) STORED, c INTEGER);
+                 CREATE TABLE source (x INTEGER);
+                 CREATE TABLE audit (fired INTEGER);
+                 CREATE FUNCTION touch() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN {write}; RETURN NEW; END; $$;
+                 CREATE TRIGGER touch_subject AFTER INSERT ON source
+                 FOR EACH ROW EXECUTE FUNCTION touch();
+                 CREATE FUNCTION recorder() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN INSERT INTO audit VALUES (1); RETURN NEW; END; $$;
+                 CREATE TRIGGER generated_update AFTER UPDATE OF b ON subject
+                 FOR EACH ROW EXECUTE FUNCTION recorder();"
+            ),
+            "cannot preserve AFTER UPDATE OF trigger",
+        );
+    }
+}
+
 /// Seeded trigger catalogs preserve gate changes across translation batches.
 #[test]
 fn seeded_generated_gate_rebuilds_when_before_trigger_changes() {

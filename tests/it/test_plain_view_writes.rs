@@ -129,6 +129,31 @@ fn an_instead_of_trigger_keeps_the_write_on_the_view() {
     );
 }
 
+/// An `INSTEAD OF` trigger created after a trigger writing the view takes
+/// that trigger's write too.
+#[test]
+fn a_later_instead_of_trigger_takes_an_earlier_triggers_write() {
+    assert_eq!(
+        run("CREATE TABLE src (x INTEGER);
+             CREATE FUNCTION g() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+                 INSERT INTO v (key, score) VALUES (NEW.x, 3);
+                 RETURN NEW;
+             END $$;
+             CREATE TRIGGER t AFTER INSERT ON src FOR EACH ROW EXECUTE FUNCTION g();
+             CREATE FUNCTION redirect() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+                 INSERT INTO base (id, name, score) VALUES (100, 'trigger', 7);
+                 RETURN NEW;
+             END $$;
+             CREATE TRIGGER redirect INSTEAD OF INSERT ON v
+                 FOR EACH ROW EXECUTE FUNCTION redirect();
+             INSERT INTO src VALUES (4);
+             SELECT id || ' ' || name || ' ' || score FROM base;"),
+        [Some("100 trigger 7".to_owned())]
+    );
+}
+
 /// An `INSTEAD OF` trigger of the schema a later script is translated against
 /// takes that script's write too.
 #[test]
