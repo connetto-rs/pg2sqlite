@@ -14,6 +14,7 @@ use sqlparser::ast::{
 
 use super::{
     function_cascade::{drop_of, runs_dropped},
+    function_moves,
     plpgsql::{ReadBodies, body_reach},
     trigger_slots::{folded, renamed_table},
 };
@@ -84,15 +85,19 @@ impl Touched {
                 operation:
                     AlterFunctionOperation::OwnerTo(_) | AlterFunctionOperation::Actions { .. },
             }) => functions(folded_names(&[&function.name])),
+            // An event so a seeded trigger renders before its function's move
+            // is carried.
+            _ if function_moves::moves_functions(event) => functions(BTreeSet::new()),
             _ => None,
         }
     }
 
     /// Whether `trigger`'s translation reads what this changes, its body read
     /// from `before` and from `after`, `bodies` holding what each body read
-    /// before names.
+    /// before names, or `event` moves the function it runs.
     fn reaches(
         &self,
+        event: &Statement,
         trigger: &CreateTrigger,
         (before, after): (&ParserDB, &ParserDB),
         bodies: &mut ReadBodies,
@@ -101,6 +106,9 @@ impl Touched {
             return Ok(true);
         }
         let Some(exec_body) = &trigger.exec_body else { return Ok(false) };
+        if function_moves::moved(event, &exec_body.func_desc.name).is_some() {
+            return Ok(true);
+        }
         for schema in [before, after] {
             match body_reach(&exec_body.func_desc.name, schema, bodies)? {
                 Some(reach)
@@ -113,9 +121,10 @@ impl Touched {
     }
 }
 
-/// Carries `trigger` along `event`, which renames its table or a column its
-/// `UPDATE OF` list or `WHEN` condition names.
+/// Carries `trigger` along `event`, which renames its table, a column its
+/// `UPDATE OF` list or `WHEN` condition names, or moves the function it runs.
 fn carry(trigger: &mut CreateTrigger, event: &Statement) {
+    function_moves::carry(trigger, event);
     let Statement::AlterTable(alter) = event else { return };
     if folded(&alter.name) != folded(&trigger.table_name) {
         return;
@@ -288,7 +297,7 @@ impl TriggerFollower {
             }
             let table = folded(&followed.create.table_name);
             if dropped.contains(&table)
-                || !touched.reaches(&followed.create, (before, after), &mut self.bodies)?
+                || !touched.reaches(event, &followed.create, (before, after), &mut self.bodies)?
             {
                 continue;
             }

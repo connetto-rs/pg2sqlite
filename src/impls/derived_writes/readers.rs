@@ -87,7 +87,7 @@ struct Reader {
 
 /// The triggers a schema leaves in place, each beside how the server fires
 /// it.
-type Triggers<'a> = [(&'a CreateTrigger, FiringTrigger)];
+type Triggers<'a> = [(Cow<'a, CreateTrigger>, FiringTrigger)];
 
 /// A trigger on a table the replica holds, read once for both what it
 /// leaves to the server and what it reads.

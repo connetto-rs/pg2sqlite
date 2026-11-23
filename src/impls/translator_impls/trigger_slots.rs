@@ -634,6 +634,11 @@ impl TriggerSlots {
         schema: &ParserDB,
         context: &TranslationContext<'_>,
     ) -> Result<bool, Error> {
+        for roster in [&mut self.roster, &mut self.assigning, &mut self.constraints] {
+            for trigger in roster.triggers.values_mut() {
+                super::function_moves::carry(trigger, source);
+            }
+        }
         self.assigning.follow_tables(source);
         self.constraints.follow_tables(source);
         if let Some((from, to)) = self.roster.follow_tables(source) {

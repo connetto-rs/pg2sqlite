@@ -431,6 +431,37 @@ fn temp_shadows_named_constraints_keep_separate_owners() {
 }
 
 #[test]
+fn temp_shadows_foreign_keys_keep_their_qualified_parent() {
+    for temporary_first in [false, true] {
+        let permanent = "CREATE TABLE public.scratch (id INTEGER PRIMARY KEY);";
+        let temporary = "CREATE TEMP TABLE scratch (id INTEGER PRIMARY KEY);";
+        let tables = if temporary_first {
+            format!("{temporary} {permanent}")
+        } else {
+            format!("{permanent} {temporary}")
+        };
+        for (storage, parent, identifier) in
+            [("", "public.scratch", 10), ("TEMP", "pg_temp.scratch", 20)]
+        {
+            for columns in [
+                format!("id INTEGER REFERENCES {parent}(id)"),
+                format!("id INTEGER, FOREIGN KEY (id) REFERENCES {parent}(id)"),
+            ] {
+                let rows = run_translated_default(&format!(
+                    "{tables}
+                     INSERT INTO public.scratch VALUES (10);
+                     INSERT INTO pg_temp.scratch VALUES (20);
+                     CREATE {storage} TABLE child ({columns});
+                     INSERT INTO child VALUES ({identifier});
+                     SELECT id FROM child;"
+                ));
+                assert_eq!(rows, vec![Some(identifier.to_string())]);
+            }
+        }
+    }
+}
+
+#[test]
 fn temp_shadows_views_keep_their_bound_table() {
     for temporary_first in [false, true] {
         for relation in ["public.scratch", "pg_temp.scratch", "scratch"] {

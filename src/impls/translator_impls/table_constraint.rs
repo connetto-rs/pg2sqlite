@@ -11,8 +11,7 @@ use sqlparser::ast::{
 use crate::no_std::prelude::*;
 use crate::{
     impls::{
-        object_name::append_suffix,
-        privileges::names_table_with_backing,
+        privileges::sqlite_referenced_table,
         shared_helpers::match_partial_not_supported_error,
         translator_impls::{
             clock_check::refuse_clock_check,
@@ -47,11 +46,8 @@ impl crate::traits::translator::TranslatorWithContext for TableConstraint {
                     return Ok(match_full_guard(fk_constraint)?.into_iter().collect());
                 }
                 let mut updated_fk = fk_constraint.clone();
-
-                if names_table_with_backing(schema, &fk_constraint.foreign_table, options)? {
-                    updated_fk.foreign_table =
-                        append_suffix(&fk_constraint.foreign_table, options.get_rls_table_suffix());
-                }
+                updated_fk.foreign_table =
+                    sqlite_referenced_table(schema, &fk_constraint.foreign_table, options)?;
 
                 updated_fk.on_delete = fk_constraint
                     .on_delete
