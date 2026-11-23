@@ -283,3 +283,59 @@ fn conflicts_through_a_view_can_skip_the_write() {
         [Some("1 5".to_owned())]
     );
 }
+
+#[test]
+fn conflict_skipping_and_a_quoted_view_alias_write_the_table() {
+    assert_eq!(
+        run("INSERT INTO base VALUES (1, 'a', 5);
+             INSERT INTO v (key, score) VALUES (1, 9) ON CONFLICT DO NOTHING;
+             INSERT INTO v (key, score) VALUES (1, 9) ON CONFLICT (key) DO NOTHING;
+             INSERT INTO v AS \"Chosen\" (key, score) VALUES (1, 9)
+                 ON CONFLICT (key) DO UPDATE SET score = \"Chosen\".score + excluded.score;
+             SELECT id || ' ' || score FROM base;"),
+        [Some("1 14".to_owned())]
+    );
+}
+
+#[test]
+fn returning_new_reads_the_view_column() {
+    assert_eq!(
+        run("INSERT INTO v (key, score) VALUES (2, 7) RETURNING new.key;"),
+        [Some("2".to_owned())]
+    );
+}
+
+#[test]
+fn an_unquoted_view_alias_reads_the_conflicting_row() {
+    assert_eq!(
+        run("INSERT INTO base VALUES (1, 'a', 5);
+             INSERT INTO v AS chosen (key, score) VALUES (1, 9)
+                 ON CONFLICT (key) DO UPDATE SET score = chosen.score + excluded.score;
+             SELECT id || ' ' || score FROM base;"),
+        [Some("1 14".to_owned())]
+    );
+}
+
+#[test]
+fn returning_an_absent_view_row_version_is_null() {
+    assert_eq!(run("INSERT INTO v (key, score) VALUES (2, 7) RETURNING old.key;"), [None]);
+    assert_eq!(
+        run("INSERT INTO base VALUES (1, 'a', 5);
+             DELETE FROM v WHERE key = 1 RETURNING new.key;"),
+        [None]
+    );
+}
+
+#[test]
+fn returning_current_view_versions_reads_computed_columns() {
+    assert_eq!(
+        run("INSERT INTO base VALUES (2, 'a', 7);
+             UPDATE v SET score = 8 WHERE key = 2 RETURNING new.key || ' ' || new.doubled;"),
+        [Some("2 16".to_owned())]
+    );
+    assert_eq!(
+        run("INSERT INTO base VALUES (2, 'a', 8);
+             DELETE FROM v WHERE key = 2 RETURNING old.key || ' ' || old.doubled;"),
+        [Some("2 16".to_owned())]
+    );
+}

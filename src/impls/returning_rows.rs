@@ -1,5 +1,6 @@
 //! PostgreSQL row versions in `RETURNING` lists.
 
+use alloc::borrow::Cow;
 use core::{ops::ControlFlow, ptr};
 
 use sql_traits::{
@@ -105,24 +106,51 @@ impl<'a> ReturningRows<'a> {
         options: &D::Options<'_>,
         emit: crate::warnings::WarningSink<'_>,
     ) -> Result<Option<Vec<SelectItem>>, Error> {
+        if !D::IS_FORWARD {
+            return returning
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(|item| translate_select_item::<D>(item, schema, options, emit))
+                        .collect()
+                })
+                .transpose();
+        }
+        self.map(returning.map(|items| items.iter().map(Cow::Borrowed)), schema, |item| {
+            translate_select_item::<D>(&item, schema, options, emit)
+        })
+    }
+
+    pub(crate) fn rewrite(
+        &self,
+        returning: Option<Vec<SelectItem>>,
+        schema: &ParserDB,
+    ) -> Result<Option<Vec<SelectItem>>, Error> {
+        self.map(returning.map(|items| items.into_iter().map(Cow::Owned)), schema, |item| {
+            Ok(item.into_owned())
+        })
+    }
+
+    fn map<'item>(
+        &self,
+        returning: Option<impl ExactSizeIterator<Item = Cow<'item, SelectItem>>>,
+        schema: &ParserDB,
+        mut transform: impl FnMut(Cow<'item, SelectItem>) -> Result<SelectItem, Error>,
+    ) -> Result<Option<Vec<SelectItem>>, Error> {
         let Some(items) = returning else { return Ok(None) };
         let mut output = Vec::with_capacity(items.len());
         for item in items {
-            if !D::IS_FORWARD {
-                output.push(translate_select_item::<D>(item, schema, options, emit)?);
-                continue;
-            }
             if let SelectItem::QualifiedWildcard(
                 SelectItemQualifiedWildcardKind::ObjectName(name),
                 wildcard,
-            ) = item
+            ) = item.as_ref()
                 && name.0.len() == 1
                 && let Some(version) = last_ident(name).and_then(|ident| self.version(ident, &[]))
             {
                 match version {
                     RowValue::Unavailable => return Err(unavailable()),
                     RowValue::Current if self.qualifier.is_none() => {
-                        output.push(SelectItem::Wildcard(wildcard.clone()));
+                        output.push(transform(Cow::Owned(SelectItem::Wildcard(wildcard.clone())))?);
                     }
                     RowValue::Current | RowValue::Absent => {
                         let table = self
@@ -139,18 +167,16 @@ impl<'a> ReturningRows<'a> {
                             } else {
                                 Expr::Value(Value::Null.into())
                             };
-                            output.push(translate_select_item::<D>(
-                                &SelectItem::ExprWithAlias { expr, alias },
-                                schema,
-                                options,
-                                emit,
-                            )?);
+                            output.push(transform(Cow::Owned(SelectItem::ExprWithAlias {
+                                expr,
+                                alias,
+                            }))?);
                         }
                     }
                 }
                 continue;
             }
-            let mentions_version = visit_expressions(item, |expr| {
+            let mentions_version = visit_expressions(item.as_ref(), |expr| {
                 let possible = match expr {
                     Expr::Identifier(ident) => version_index(ident).is_some(),
                     Expr::CompoundIdentifier(parts) => parts.first().is_some_and(|ident| version_index(ident).is_some()),
@@ -172,16 +198,16 @@ impl<'a> ReturningRows<'a> {
                 };
                 if possible { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
             }).is_break();
-            if !mentions_version && Visit::visit(item, &mut StarProbe).is_continue() {
-                output.push(translate_select_item::<D>(item, schema, options, emit)?);
+            if !mentions_version && Visit::visit(item.as_ref(), &mut StarProbe).is_continue() {
+                output.push(transform(item)?);
                 continue;
             }
-            let mut rewritten = item.clone();
+            let mut rewritten = item.into_owned();
             let mut visitor = Rewrite::new(self, schema);
             if let ControlFlow::Break(error) = VisitMut::visit(&mut rewritten, &mut visitor) {
                 return Err(error);
             }
-            output.push(translate_select_item::<D>(&rewritten, schema, options, emit)?);
+            output.push(transform(Cow::Owned(rewritten))?);
         }
         Ok(Some(output))
     }

@@ -32,6 +32,8 @@ use crate::{
     impls::{
         derived_writes::{Event, FiringTrigger, output_names},
         object_name::{declared_column_ident, last_ident},
+        query_builder::aliased_table_factor,
+        returning_rows::ReturningRows,
         translator_impls::insert::row_width,
     },
     options::TranslationContext,
@@ -81,7 +83,10 @@ pub(crate) fn land_insert(
     };
     let (rows, _) = Rows::of(schema, &landing, exposed_name, &qualifier)?;
 
-    let mut statement = Statement::Insert(insert.clone());
+    let mut prepared = insert.clone();
+    prepared.returning =
+        ReturningRows::insert(insert).rewrite(prepared.returning.take(), schema)?;
+    let mut statement = Statement::Insert(prepared);
     let replacements = {
         let context = ExpressionContext::for_statement(
             &statement,
@@ -158,7 +163,10 @@ pub(crate) fn land_update(
     let qualifier = exposed(name, alias.as_ref());
     let (rows, condition) = Rows::of(schema, &landing, qualifier.clone(), &qualifier)?;
 
-    let mut statement = Statement::Update(update.clone());
+    let mut prepared = update.clone();
+    prepared.returning =
+        ReturningRows::update(update).rewrite(prepared.returning.take(), schema)?;
+    let mut statement = Statement::Update(prepared);
     let replacements = {
         let context = ExpressionContext::for_statement(
             &statement,
@@ -201,7 +209,10 @@ pub(crate) fn land_delete(
     let qualifier = exposed(name, alias.as_ref());
     let (rows, condition) = Rows::of(schema, &landing, qualifier.clone(), &qualifier)?;
 
-    let mut statement = Statement::Delete(delete.clone());
+    let mut prepared = delete.clone();
+    prepared.returning =
+        ReturningRows::delete(delete).rewrite(prepared.returning.take(), schema)?;
+    let mut statement = Statement::Delete(prepared);
     let replacements = {
         let context = ExpressionContext::for_statement(
             &statement,
@@ -337,24 +348,7 @@ impl Landing<'_> {
     /// The written relation as the target of an update or a delete, under
     /// `qualifier`.
     fn target(&self, qualifier: &Ident) -> TableFactor {
-        TableFactor::Table {
-            name: self.relation.clone(),
-            alias: Some(TableAlias {
-                explicit: true,
-                name: qualifier.clone(),
-                columns: Vec::new(),
-                at: None,
-            }),
-            args: None,
-            with_hints: Vec::new(),
-            version: None,
-            with_ordinality: false,
-            partitions: Vec::new(),
-            json_path: None,
-            sample: None,
-            index_directives: Vec::new(),
-            inheritance: None,
-        }
+        aliased_table_factor(self.relation.clone(), Some(qualifier.clone()))
     }
 }
 
