@@ -1355,7 +1355,7 @@ impl Pg2Sqlite {
             initial_schema.iter().chain(epochs.iter().map(|epoch| &epoch.schema)),
             context,
         )?;
-        context.helper_queries().borrow_mut().keep_for(
+        context.batch_cache().borrow_mut().keep_for(
             initial_schema
                 .iter()
                 .chain(schema.as_ref().ok())
@@ -1369,7 +1369,7 @@ impl Pg2Sqlite {
             context,
             should_translate,
         );
-        context.helper_queries().borrow_mut().forget();
+        context.batch_cache().borrow_mut().forget();
         let (mut translated, rebuilt_triggers, warnings) = units?;
         let held_views = crate::impls::translator_impls::held_views::hold_forward_views(
             statements,
@@ -1537,12 +1537,18 @@ impl Pg2Sqlite {
             epochs,
             dispositions,
         } = Self::translate_prepared(prepared, &mut context, |_| true)?;
-        warnings.extend(crate::impls::derived_writes::reads_left_to_server(
+        context
+            .batch_cache()
+            .borrow_mut()
+            .keep_for(core::iter::once(&schema).chain(initial_schema));
+        let left_to_server = crate::impls::derived_writes::reads_left_to_server(
             &schema,
             initial_schema,
             &sources,
             &context,
-        )?);
+        );
+        context.batch_cache().borrow_mut().forget();
+        warnings.extend(left_to_server?);
         let mut placed =
             crate::history::placement::place(&sources, &mut statements, &schema, options)?;
         let units: Vec<crate::history::Unit<'_>> = epochs
