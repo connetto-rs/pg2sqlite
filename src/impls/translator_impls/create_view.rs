@@ -83,7 +83,8 @@ impl crate::traits::translator::TranslatorWithContext for CreateView {
         let written = options.written_schema().unwrap_or(schema);
         let stored = declared_view(written, self)?;
         let temporary = self.temporary || stored.is_some_and(ViewLike::is_temporary);
-        let mut query = self.query.translate_with_warnings(schema, options, emit)?;
+        let pinned = super::view_outputs::pin_outputs(&self.query, written)?;
+        let mut query = pinned.translate_with_warnings(schema, options, emit)?;
         retarget_reads(&mut query, self, schema, options, temporary, security_invoker)?;
         let name = if temporary {
             sqlite_unqualified_object_name(&self.name)

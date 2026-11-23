@@ -56,3 +56,4 @@ pub(crate) mod trigger_slots;
 pub(crate) mod update;
 pub(crate) mod uuid;
 pub mod vector;
+mod view_outputs;

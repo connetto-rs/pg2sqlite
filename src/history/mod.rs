@@ -270,25 +270,11 @@ fn replay_unit(
     if unit.rebuilt_trigger && !replays {
         return Ok((schema, None));
     }
-    let rebound_as = |names| {
-        rebind::rebind(
-            unit.source,
-            id,
-            unit.binding,
-            final_schema,
-            replay_homes,
-            &placed.homes,
-            names,
-        )
-    };
-    let rebound = rebound_as(rebind::Names::Sqlite)?;
-    // The schema models PostgreSQL, so it takes the statement in PostgreSQL's
-    // names, where a view keeps the output names SQLite's rename moves.
-    let checked = rebound_as(rebind::Names::Postgres)?;
-    let checked = checked.as_ref().unwrap_or(unit.source);
+    let rebound =
+        rebind::rebind(unit.source, id, unit.binding, final_schema, replay_homes, &placed.homes)?;
     let Some(statement) = rebound else {
         if replays {
-            schema = schema.apply(checked)?;
+            schema = schema.apply(unit.source)?;
         }
         return Ok((schema, None));
     };
@@ -316,7 +302,7 @@ fn replay_unit(
     // and every other one against the schema after it.
     let before = Pg2Sqlite::schema_ends_epoch(&statement);
     if replays && !before {
-        schema = schema.apply(checked)?;
+        schema = schema.apply(&statement)?;
     }
     let index = id.index();
     let mut statements =
@@ -338,7 +324,7 @@ fn replay_unit(
         })?;
     }
     if replays && before {
-        schema = schema.apply(checked)?;
+        schema = schema.apply(&statement)?;
     }
     Ok((schema, Some(statements)))
 }

@@ -106,13 +106,13 @@ fn a_view_reads_the_columns_of_a_declared_function() {
     for (view, expected) in [
         (
             "CREATE VIEW v AS SELECT r.id, r.doc ->> 'a' AS a FROM rows_of() AS r WHERE r.flag",
-            "CREATE VIEW v AS SELECT r.id, pg_jsonb_text(r.doc -> '$.\"a\"') AS a \
+            "CREATE VIEW v AS SELECT r.id AS id, pg_jsonb_text(r.doc -> '$.\"a\"') AS a \
              FROM rows_of() AS r WHERE r.flag",
         ),
         (
             "CREATE VIEW v AS SELECT x.flag FROM (SELECT p.flag FROM pair_of() AS p) AS x \
              WHERE x.flag",
-            "CREATE VIEW v AS SELECT x.flag FROM (SELECT p.flag FROM pair_of() AS p) AS x \
+            "CREATE VIEW v AS SELECT x.flag AS flag FROM (SELECT p.flag AS flag FROM pair_of() AS p) AS x \
              WHERE x.flag",
         ),
     ] {

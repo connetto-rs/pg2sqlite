@@ -411,7 +411,7 @@ pub(crate) fn translate_column_def(
         });
     }
 
-    report_column_downgrades(column, table, emit);
+    report_column_downgrades(column, table, options, emit);
 
     Ok(ColumnDef {
         name: column.name.clone(),
@@ -699,6 +699,7 @@ fn no_value_source(column: &Ident, is_serial: bool) -> Error {
 fn report_column_downgrades(
     column: &ColumnDef,
     table: &ObjectName,
+    options: &Pg2SqliteOptions,
     emit: crate::warnings::WarningSink<'_>,
 ) {
     let location = || column_location(column, table);
@@ -716,24 +717,37 @@ fn report_column_downgrades(
         });
     }
 
-    // SQLite has no zone-aware temporal type; values compare as text, not as
-    // instants.
-    if matches!(
-        column.data_type,
+    // SQLite has no zone-aware temporal type, so the value is stored as text
+    // and compares as text. The stored-text CHECK holds a timestamptz to one
+    // fixed-width UTC spelling per instant, whose text order is instant order.
+    let zone_loss = match column.data_type {
         DataType::Timestamp(_, TimezoneInfo::Tz | TimezoneInfo::WithTimeZone)
-            | DataType::Time(_, TimezoneInfo::Tz | TimezoneInfo::WithTimeZone)
-    ) {
+            if options.is_stored_text_checks_omitted() =>
+        {
+            Some(
+                "SQLite has no zone-aware temporal type, so the value is stored as text and \
+                 compares as text. The translation writes a timestamptz as UTC text with a \
+                 +00:00 offset, but with the stored-text checks omitted a bound parameter or a \
+                 row applied directly is stored as given, and two spellings of one moment \
+                 (+02:00 vs +00:00) compare unequal.",
+            )
+        }
+        DataType::Time(_, TimezoneInfo::Tz | TimezoneInfo::WithTimeZone) => {
+            Some(
+                "SQLite has no zone-aware temporal type, so a time with time zone is stored as \
+                 text with the offset it was written with and compares as text, and \
+                 10:00:00+02:00 sorts after 09:00:00+00:00 although it is the earlier time in UTC.",
+            )
+        }
+        _ => None,
+    };
+    if let Some(reason) = zone_loss {
         emit(crate::warnings::TranslationWarning::LossyDowngrade {
             construct: "WITH TIME ZONE".to_string(),
             from: column.data_type.to_string(),
             to: "TEXT".to_string(),
             location: location(),
-            reason: "SQLite has no zone-aware temporal type, so the value is stored as text and \
-                     compares as text. The translation writes a timestamptz as UTC text with a \
-                     +00:00 offset, so those compare as instants, but a bound parameter or a \
-                     time with time zone is stored as given, and two spellings of one moment \
-                     (+02:00 vs +00:00) compare unequal."
-                .to_string(),
+            reason: reason.to_string(),
         });
     }
 

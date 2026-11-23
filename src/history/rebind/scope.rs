@@ -5,11 +5,9 @@ use sql_traits::{
     structs::{IdentifierCase, ParserDB, TargetName},
     traits::{ColumnLike, DatabaseLike, TableLike, ViewLike},
 };
-use sqlparser::ast::{
-    Expr, Ident, ObjectName, ObjectNamePart, Select, SelectItem, SetExpr, TableFactor,
-};
+use sqlparser::ast::{Ident, ObjectName, ObjectNamePart, Select, TableFactor};
 
-use super::{Names, Planner};
+use super::Planner;
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
 use crate::script::ConnectionError;
@@ -31,10 +29,9 @@ pub(super) struct Listed {
     /// Whether the relation is a common table expression or derived table,
     /// whose columns no stored rename reaches.
     pub(super) lexical: bool,
-    /// For a view, the ASCII-folded names of the outputs that follow a renamed
-    /// column: under SQLite the bare column references, as its rename rewrites
-    /// them, and none under PostgreSQL, whose views keep their output names.
-    pub(super) view: Option<Vec<String>>,
+    /// Whether the relation is a view, whose output names no stored rename
+    /// moves.
+    pub(super) view: bool,
     /// The name a replayed reference uses, the alias or the final name.
     pub(super) replay_name: String,
     /// The columns as the epoch names them, each with its replay name.
@@ -47,7 +44,7 @@ impl Listed {
             qualifier: qualifier.value.to_ascii_lowercase(),
             aliased,
             lexical: true,
-            view: None,
+            view: false,
             replay_name: qualifier.value.clone(),
             columns: None,
         }
@@ -101,14 +98,8 @@ impl Planner<'_> {
                     return Ok(());
                 }
                 let (temporary, view, columns) = match resolve(self.epoch, name) {
-                    Relation::Table(table) => (table.is_temporary(), None, self.columns(table)?),
-                    Relation::View(view) => {
-                        let following = match self.names {
-                            Names::Sqlite => following_outputs(view),
-                            Names::Postgres => Vec::new(),
-                        };
-                        (view.is_temporary(), Some(following), None)
-                    }
+                    Relation::Table(table) => (table.is_temporary(), false, self.columns(table)?),
+                    Relation::View(view) => (view.is_temporary(), true, None),
                     Relation::Other => return Ok(()),
                 };
                 let replay_name = match alias {
@@ -223,26 +214,6 @@ pub(super) fn resolve<'a>(schema: &'a ParserDB, name: &ObjectName) -> Relation<'
         }
     }
     Relation::Other
-}
-
-/// The ASCII-folded output names of `view` that are bare column references.
-pub(super) fn following_outputs(view: &<ParserDB as DatabaseLike>::View) -> Vec<String> {
-    let SetExpr::Select(select) = view.definition().body.as_ref() else { return Vec::new() };
-    select
-        .projection
-        .iter()
-        .filter_map(|item| {
-            match item {
-                SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
-                    Some(ident.value.to_ascii_lowercase())
-                }
-                SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) => {
-                    parts.last().map(|ident| ident.value.to_ascii_lowercase())
-                }
-                _ => None,
-            }
-        })
-        .collect()
 }
 
 /// The last identifier of `name`, the object it names.
