@@ -753,12 +753,12 @@ fn read_only_rls_backing_guards_honour_exemption() {
         .expect("exempt read-only RLS delete");
 }
 
-/// A translated trigger run by an exempt write reaches a row the policies hide,
-/// and the exempt statement reads it through the view as PostgreSQL's table
-/// owner does, so the monitor records nothing. The view hides it again once
-/// the exemption is off.
+/// A delivered parent fires no translated trigger, so the hidden child its
+/// trigger would touch keeps the note the server delivered, which the exempt
+/// statement reads through the view as PostgreSQL's table owner does, and the
+/// monitor records nothing. The view hides it again once the exemption is off.
 #[test]
-fn translated_trigger_writes_backing_storage_that_exempt_reads_see() {
+fn a_delivered_row_fires_no_translated_trigger() {
     let (mut connection, exempt) = apply_with_exemption(TRIGGER_CHAIN_SCHEMA, &options());
     exempt.store(true, Ordering::Relaxed);
     diesel::insert_into(schema::child_items_rls::table)
@@ -772,7 +772,7 @@ fn translated_trigger_writes_backing_storage_that_exempt_reads_see() {
     diesel::insert_into(schema::parent_items_rls::table)
         .values((schema::parent_items_rls::id.eq(1), schema::parent_items_rls::owner.eq("bob")))
         .execute(&mut connection)
-        .expect("insert parent and run translated trigger");
+        .expect("deliver the parent");
 
     let visible_notes = |connection: &mut SqliteConnection| {
         schema::child_items::table
@@ -780,7 +780,7 @@ fn translated_trigger_writes_backing_storage_that_exempt_reads_see() {
             .load::<String>(connection)
             .expect("read children through the view")
     };
-    assert_eq!(visible_notes(&mut connection), ["touched"]);
+    assert_eq!(visible_notes(&mut connection), ["original"]);
     assert_eq!(
         schema::rls_audit::table
             .count()

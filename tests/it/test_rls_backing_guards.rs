@@ -131,36 +131,6 @@ const NESTED_OWNERSHIP_SCHEMA: &str = "
     GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO alice;
 ";
 
-const CASCADED_RLS_SCHEMA: &str = "
-    CREATE ROLE alice;
-    CREATE TABLE parent_items (
-        id INTEGER PRIMARY KEY,
-        owner TEXT NOT NULL
-    );
-    CREATE TABLE child_items (
-        id INTEGER PRIMARY KEY,
-        owner TEXT NOT NULL
-    );
-    ALTER TABLE parent_items ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE child_items ENABLE ROW LEVEL SECURITY;
-    CREATE POLICY parent_items_select ON parent_items FOR SELECT USING (true);
-    CREATE POLICY child_items_select ON child_items FOR SELECT USING (true);
-    CREATE POLICY parent_items_insert ON parent_items
-        FOR INSERT WITH CHECK (owner = current_user);
-    CREATE POLICY child_items_insert ON child_items
-        FOR INSERT WITH CHECK (owner = current_user);
-    CREATE FUNCTION copy_parent_to_child() RETURNS TRIGGER AS $$
-    BEGIN
-        INSERT INTO child_items (id, owner) VALUES (NEW.id, NEW.owner);
-        RETURN NEW;
-    END;
-    $$ LANGUAGE plpgsql;
-    CREATE TRIGGER copy_parent_to_child
-        AFTER INSERT ON parent_items
-        FOR EACH ROW EXECUTE FUNCTION copy_parent_to_child();
-    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO alice;
-";
-
 const POLICY_FUNCTION_SCHEMA: &str = "
     CREATE ROLE alice;
     CREATE FUNCTION policy_probe() RETURNS BOOLEAN LANGUAGE sql STABLE AS $$ SELECT false $$;
@@ -243,18 +213,6 @@ mod schema {
     }
     diesel::table! {
         nested_items (id) {
-            id -> Integer,
-            owner -> Text,
-        }
-    }
-    diesel::table! {
-        parent_items_rls (id) {
-            id -> Integer,
-            owner -> Text,
-        }
-    }
-    diesel::table! {
-        child_items_rls (id) {
             id -> Integer,
             owner -> Text,
         }
@@ -1091,24 +1049,5 @@ fn exempt_write_keeps_constraints_and_unrelated_triggers_active() {
             .execute(&mut conn)
             .is_err(),
         "the exemption must not bypass physical uniqueness"
-    );
-}
-
-#[test]
-fn translated_trigger_view_write_inherits_exemption() {
-    let mut conn = apply_with_exemption(CASCADED_RLS_SCHEMA);
-    set_write_exempt(true);
-
-    diesel::insert_into(schema::parent_items_rls::table)
-        .values((schema::parent_items_rls::id.eq(1), schema::parent_items_rls::owner.eq("bob")))
-        .execute(&mut conn)
-        .expect("the exempt parent write must land");
-    assert_eq!(
-        schema::child_items_rls::table
-            .select(schema::child_items_rls::id)
-            .load::<i32>(&mut conn)
-            .expect("read cascaded child"),
-        vec![1],
-        "the nested backing write must inherit the exemption"
     );
 }

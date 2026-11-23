@@ -446,9 +446,8 @@ fn maintained_value(
     rewrites.finish_value(column, value, schema, options, Some(site))
 }
 
-/// ANDs two optional conditions, attaching the re-entry guard to the source
-/// trigger's `WHEN`.
-fn merge_conditions(a: Option<Expr>, b: Option<Expr>) -> Option<Expr> {
+/// ANDs two optional conditions, `a` first.
+pub(crate) fn merge_conditions(a: Option<Expr>, b: Option<Expr>) -> Option<Expr> {
     match (a, b) {
         (Some(a), Some(b)) => {
             Some(Expr::BinaryOp {
@@ -459,6 +458,35 @@ fn merge_conditions(a: Option<Expr>, b: Option<Expr>) -> Option<Expr> {
         }
         (Some(a), None) | (None, Some(a)) => Some(a),
         (None, None) => None,
+    }
+}
+
+/// The condition a `BEFORE` or `AFTER` trigger translated from PostgreSQL
+/// fires under, false while the exemption function answers true.
+///
+/// The exemption marks the rows the server delivers, which a PostgreSQL
+/// subscriber applies with `session_replication_role = replica`, so none of
+/// the table's triggers fires on them. Firing them on the replica would
+/// compute again, from the partial rows it holds mid-delivery, the columns and
+/// rows the server already computed and delivers too.
+pub(crate) fn delivery_guard(options: &crate::options::TranslationContext<'_>) -> Option<Expr> {
+    super::rls::write_guard_condition_expr(None, options)
+}
+
+/// `condition`, the `WHEN` of a translated row trigger, without the leading
+/// `delivery` guard [`delivery_guard`] answered for it, for a trigger that
+/// runs it inside another trigger already holding that guard.
+pub(crate) fn without_delivery_guard(condition: Option<Expr>, delivery: &Expr) -> Option<Expr> {
+    let leads = |left: &Expr| matches!(left, Expr::Nested(guard) if **guard == *delivery);
+    match condition? {
+        condition if condition == *delivery => None,
+        Expr::BinaryOp { left, op: BinaryOperator::And, right } if leads(&left) => {
+            match *right {
+                Expr::Nested(rest) => Some(*rest),
+                rest => Some(rest),
+            }
+        }
+        condition => Some(condition),
     }
 }
 
@@ -751,12 +779,11 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
         } else {
             let reentry_guard = (is_maintenance_trigger && maintenance_update_event)
                 .then(|| super::reentry::unmarked(&marker, "NEW"));
-            // A constraint check skips exempt writes, as write guards do.
-            let exemption = is_constraint
-                .then(|| super::rls::write_guard_condition_expr(None, options))
-                .flatten();
-            (None, merge_conditions(merge_conditions(exemption, translated_cond), reentry_guard))
+            (None, merge_conditions(translated_cond, reentry_guard))
         };
+        let delivery = matches!(period, Some(TriggerPeriod::Before | TriggerPeriod::After))
+            .then(|| delivery_guard(options))
+            .flatten();
 
         // SQLite takes one event per trigger.
         let part_events: Vec<Vec<TriggerEvent>> = if plain {
@@ -786,6 +813,7 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
             } else {
                 (None, merge_conditions(translated_condition.clone(), maintained_write))
             };
+            let condition = merge_conditions(delivery.clone(), condition);
             let function_body = if is_maintenance_trigger {
                 generate_maintenance_trigger_body(
                     &trigger_for_helpers,

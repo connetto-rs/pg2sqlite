@@ -1065,7 +1065,14 @@ impl TriggerSlots {
             return Ok((statements, Vec::new()));
         };
         let name = owned_name(&merged_name(slot), &table, schema)?;
-        let created = Frame { table, maintainers, assigned, members }.emit(
+        let created = Frame {
+            table,
+            maintainers,
+            assigned,
+            members,
+            delivery: super::create_trigger::delivery_guard(context),
+        }
+        .emit(
             name,
             match slot.event {
                 Event::Insert => TriggerEvent::Insert,
@@ -1205,7 +1212,8 @@ fn update_columns(part: &CreateTrigger) -> Vec<String> {
     columns
 }
 
-/// One SQLite trigger running the parts of a slot's members in name order.
+/// One SQLite trigger running the parts of a slot's members in name order,
+/// under the delivery guard every part carries as its `WHEN`.
 fn merge(
     slot: &SlotKey,
     parts: Vec<(&CreateTrigger, CreateTrigger)>,
@@ -1228,7 +1236,7 @@ fn merge(
     let mut statements = Vec::new();
     for (member, part) in parts {
         debug_assert!(
-            part.condition.is_none(),
+            first.as_ref().is_none_or(|first: &CreateTrigger| first.condition == part.condition),
             "shared member `{}` keeps its WHEN inside its body",
             member.name
         );

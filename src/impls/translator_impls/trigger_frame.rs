@@ -21,6 +21,7 @@ use crate::{
         query_builder::{from_relation, make_query, make_simple_select, plain_table_factor},
         translator_impls::{
             condition_injection::inject_condition_into_dml_statement,
+            create_trigger::{merge_conditions, without_delivery_guard},
             reentry::{FRAME, MEMBER, ROW, VALUE, marker_table, marks_row, named_table, unmarked},
         },
     },
@@ -45,6 +46,9 @@ pub(crate) struct Frame {
     pub(crate) assigned: Vec<String>,
     /// The `AFTER UPDATE` triggers, in name order.
     pub(crate) members: Vec<FrameMember>,
+    /// The delivery guard the members' `WHEN` starts with, which the frame and
+    /// its twins fire under instead.
+    pub(crate) delivery: Option<Expr>,
 }
 
 fn identifier(name: &str) -> Expr {
@@ -250,7 +254,13 @@ impl Frame {
         name: ObjectName,
         event: TriggerEvent,
     ) -> Result<Vec<Statement>, Error> {
-        let Self { table, maintainers, assigned, mut members } = self;
+        let Self { table, mut maintainers, assigned, mut members, delivery } = self;
+        if let Some(delivery) = &delivery {
+            for member in maintainers.iter_mut().chain(&mut members) {
+                member.part.condition =
+                    without_delivery_guard(member.part.condition.take(), delivery);
+            }
+        }
         let marker = marker_table(&table);
         let named = named_table(&table);
         let Some(target) =
@@ -270,7 +280,7 @@ impl Frame {
                 TriggerPeriod::Before,
                 TriggerEvent::Update(named_columns.to_vec()),
                 true,
-                Some(unmarked(&marker, "OLD")),
+                merge_conditions(delivery.clone(), Some(unmarked(&marker, "OLD"))),
                 vec![record(&named, &named_member(&member.name), false, None)],
             ));
         }
@@ -332,7 +342,7 @@ impl Frame {
             TriggerPeriod::After,
             event,
             true,
-            skip_maintained.then(|| unmarked(&marker, "OLD")),
+            merge_conditions(delivery, skip_maintained.then(|| unmarked(&marker, "OLD"))),
             statements,
         ));
         Ok(twins)
