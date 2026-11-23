@@ -208,6 +208,25 @@ fn an_update_of_trigger_keeps_its_other_columns_across_a_rename() {
     }
 }
 
+/// A trigger's `WHEN` condition reads a renamed column under its new name.
+#[test]
+fn a_when_condition_follows_a_column_rename() {
+    let schema = with_body("INSERT INTO audit (id, note) VALUES (NEW.id, NEW.owner);").replace(
+        "AFTER INSERT ON docs FOR EACH ROW",
+        "AFTER UPDATE ON docs FOR EACH ROW WHEN (OLD.body IS DISTINCT FROM NEW.body)",
+    ) + "INSERT INTO docs (id, owner, body) VALUES (1, 'alice', 'a');";
+    let rename = "ALTER TABLE docs RENAME COLUMN body TO content;";
+    for batches in [vec![schema.clone() + rename], vec![schema.clone(), rename.to_owned()]] {
+        let batches: Vec<&str> = batches.iter().map(String::as_str).collect();
+        let mut connection = replica(&batches);
+        let row = docs::table.find(1);
+        diesel::update(row).set(docs::owner.eq("bob")).execute(&mut connection).unwrap();
+        assert_eq!(audited(&mut connection), []);
+        diesel::update(row).set(docs::content.eq(Some("b"))).execute(&mut connection).unwrap();
+        assert_eq!(audited(&mut connection), [(1, Some("bob".to_owned()))]);
+    }
+}
+
 /// A trigger runs the body its function holds when the run happens, whether
 /// the function was replaced in the batch creating the trigger or a later
 /// one, and whether the trigger came from a starting schema.
