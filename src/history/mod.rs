@@ -57,7 +57,8 @@ pub(crate) struct Unit<'a> {
     /// The emitted statements, in order.
     pub(crate) emitted: &'a [Statement],
     /// Whether the emitted triggers were rebuilt from the other triggers
-    /// sharing their slots, which retranslating the source alone cannot
+    /// sharing their slots, or drop SQLite triggers an earlier statement's
+    /// translation created, which retranslating the source alone cannot
     /// reproduce.
     pub(crate) rebuilt_trigger: bool,
     /// Whether a view held back until the relations it reads exist moved out

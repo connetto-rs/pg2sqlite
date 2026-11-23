@@ -711,3 +711,86 @@ fn an_upsert_fires_the_triggers_of_the_branch_it_takes() {
         ],
     );
 }
+
+const STAMP_BOTH: &str = "CREATE TRIGGER items_stamp BEFORE INSERT OR UPDATE ON items
+                              FOR EACH ROW EXECUTE FUNCTION stamp();";
+
+const AUDIT_BOTH: &str = "CREATE TRIGGER items_audit AFTER INSERT OR UPDATE ON items
+                              FOR EACH ROW EXECUTE FUNCTION audit_after();";
+
+/// Dropping a stamp firing on `INSERT OR UPDATE` stops it on both events.
+#[test]
+fn dropping_an_insert_or_update_stamp_stops_it_on_both_events() {
+    assert_agree(
+        &[&schema(&[], STAMP_BOTH), "DROP TRIGGER items_stamp ON items;"],
+        &[SEED, "UPDATE items SET tag = 'b' WHERE id = 1;"],
+    );
+}
+
+/// Dropping a stamp firing on `INSERT OR UPDATE` beside an audit on both
+/// events leaves the audit firing once on the caller's rows.
+#[test]
+fn dropping_an_insert_or_update_stamp_beside_an_audit() {
+    assert_agree(
+        &[
+            &schema(&["after"], &format!("{STAMP_BOTH}{AUDIT_BOTH}")),
+            "DROP TRIGGER items_stamp ON items;",
+        ],
+        &[SEED, "UPDATE items SET tag = 'b' WHERE id = 1;"],
+    );
+}
+
+const NOTE_BOTH: &str = "CREATE FUNCTION annotate() RETURNS trigger LANGUAGE plpgsql AS $$
+                          BEGIN NEW.note := coalesce(NEW.note, '') || '+'; RETURN NEW; END $$;
+                          CREATE TRIGGER items_note BEFORE INSERT OR UPDATE ON items
+                              FOR EACH ROW EXECUTE FUNCTION annotate();";
+
+/// A stamp replaced to fire on `UPDATE` alone stops firing on `INSERT`.
+#[test]
+fn a_stamp_replaced_onto_update_alone_stops_on_insert() {
+    assert_agree(
+        &[
+            &schema(&[], NOTE_BOTH),
+            "CREATE OR REPLACE TRIGGER items_note BEFORE UPDATE ON items
+                 FOR EACH ROW EXECUTE FUNCTION annotate();",
+        ],
+        &[SEED, "UPDATE items SET tag = 'b' WHERE id = 1;"],
+    );
+}
+
+/// Dropping a stamp after its table's rename stops it on both events.
+#[test]
+fn dropping_a_stamp_of_a_renamed_table() {
+    assert_agree(
+        &[
+            &schema(&[], NOTE_BOTH),
+            "ALTER TABLE items RENAME TO things;
+             DROP TRIGGER items_note ON things;
+             ALTER TABLE things RENAME TO items;",
+        ],
+        &[SEED, "UPDATE items SET tag = 'b' WHERE id = 1;"],
+    );
+}
+
+/// Dropping a stamp in the batch creating it stops it on both events.
+#[test]
+fn dropping_a_stamp_in_its_creating_batch() {
+    assert_agree(
+        &[&format!("{}DROP TRIGGER items_note ON items;", schema(&[], NOTE_BOTH))],
+        &[SEED, "UPDATE items SET tag = 'b' WHERE id = 1;"],
+    );
+}
+
+/// A stamp beside an audit replaced to fire on `UPDATE` alone leaves the
+/// audit reading the caller's inserted row.
+#[test]
+fn a_stamp_beside_an_audit_replaced_onto_update_alone() {
+    assert_agree(
+        &[
+            &schema(&["after"], &format!("{STAMP_BOTH}{AUDIT_BOTH}")),
+            "CREATE OR REPLACE TRIGGER items_stamp BEFORE UPDATE ON items
+                 FOR EACH ROW EXECUTE FUNCTION stamp();",
+        ],
+        &[SEED, "UPDATE items SET tag = 'b' WHERE id = 1;"],
+    );
+}

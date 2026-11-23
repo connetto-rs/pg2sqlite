@@ -537,7 +537,8 @@ struct PreparedStatements<'a> {
     options: Pg2SqliteOptions,
     statements: Vec<Vec<Statement>>,
     /// Whether each statement's emitted triggers were rebuilt from other
-    /// statements' triggers sharing their slots.
+    /// statements' triggers sharing their slots, or drop SQLite triggers an
+    /// earlier statement's translation created.
     rebuilt_triggers: Vec<bool>,
     /// Whether a view held back until the relations it reads exist moved out
     /// of or into each statement's emitted statements.
@@ -597,7 +598,7 @@ impl Trackers {
     }
 
     /// Follows `emitted`, `statement`'s translation, and answers whether
-    /// merging slots rewrote it.
+    /// merging slots rewrote it or it drops one of `superseded`.
     ///
     /// `superseded` names SQLite triggers `statement` takes off that `emitted`
     /// leaves alone.
@@ -636,10 +637,11 @@ impl Trackers {
                 })
             })
             .collect();
+        let drops_superseded = !left.is_empty();
         emitted.extend(left);
         self.marker_tables.follow(statement, emitted);
         self.attachments.apply(statement, emitted);
-        Ok(rebuilt)
+        Ok(rebuilt || drops_superseded)
     }
 }
 
@@ -681,10 +683,28 @@ fn translate_followed(
             emitted.append(&mut dropped);
         }
     }
+    // A dropped or replaced trigger takes every SQLite trigger it created.
+    let replaced = match statement {
+        Statement::DropTrigger(drop) => Some((&drop.trigger_name, drop.table_name.as_ref())),
+        Statement::CreateTrigger(create) if create.or_replace => {
+            Some((&create.name, Some(&create.table_name)))
+        }
+        _ => None,
+    };
+    let superseded = match replaced {
+        Some((name, table)) => {
+            let seeded =
+                initial.map_or(at, |initial| Position { schema: initial, binding: initial, ..at });
+            follower.created(name, table, &mut |source, sink| {
+                trackers.translate(source, seeded, sink)
+            })?
+        }
+        None => Vec::new(),
+    };
     let mut own = trackers.translate(statement, at, &mut *emit)?;
     let rendered =
         if matches!(statement, Statement::CreateTrigger(_)) { own.clone() } else { Vec::new() };
-    let mut rebuilt = trackers.follow(statement, &mut own, at, &[])?;
+    let mut rebuilt = trackers.follow(statement, &mut own, at, &superseded)?;
     follower.follow(statement, &rendered);
     emitted.append(&mut own);
     if let Some((_, after)) = sides {
