@@ -460,3 +460,111 @@ fn temp_shadows_foreign_keys_keep_their_qualified_parent() {
         }
     }
 }
+
+#[test]
+fn temp_shadows_dropping_trigger_preserves_the_other_owner() {
+    for temporary_first in [false, true] {
+        let permanent = "CREATE TABLE public.scratch (id INTEGER PRIMARY KEY);";
+        let temporary = "CREATE TEMP TABLE scratch (id INTEGER PRIMARY KEY);";
+        let tables = if temporary_first {
+            format!("{temporary} {permanent}")
+        } else {
+            format!("{permanent} {temporary}")
+        };
+        for (relation, expected) in
+            [("public.scratch", "4"), ("pg_temp.scratch", "3"), ("scratch", "3")]
+        {
+            let rows = run_translated_default(&format!(
+                "{tables}
+                 CREATE TABLE audit (id INTEGER);
+                 CREATE FUNCTION record_row() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN INSERT INTO audit VALUES (NEW.id); RETURN NEW; END; $$;
+                 CREATE TRIGGER record_row AFTER INSERT ON public.scratch
+                 FOR EACH ROW EXECUTE FUNCTION record_row();
+                 CREATE TRIGGER record_row AFTER INSERT ON pg_temp.scratch
+                 FOR EACH ROW EXECUTE FUNCTION record_row();
+                 DROP TRIGGER record_row ON {relation};
+                 INSERT INTO public.scratch VALUES (3);
+                 INSERT INTO pg_temp.scratch VALUES (4);
+                 SELECT id FROM audit;"
+            ));
+            assert_eq!(rows, vec![Some(expected.to_string())]);
+        }
+    }
+}
+
+#[test]
+fn temp_shadows_table_events_preserve_the_other_trigger_owner() {
+    for temporary_first in [false, true] {
+        let permanent = "CREATE TABLE public.scratch (id INTEGER PRIMARY KEY);";
+        let temporary = "CREATE TEMP TABLE scratch (id INTEGER PRIMARY KEY);";
+        let tables = if temporary_first {
+            format!("{temporary} {permanent}")
+        } else {
+            format!("{permanent} {temporary}")
+        };
+        for (event, expected) in [
+            ("DROP TABLE scratch; INSERT INTO public.scratch VALUES (3);", vec!["3"]),
+            (
+                "ALTER TABLE scratch RENAME TO moved;
+                 INSERT INTO public.scratch VALUES (3);
+                 INSERT INTO pg_temp.moved VALUES (4);",
+                vec!["3", "4"],
+            ),
+        ] {
+            let sql = format!(
+                "{tables}
+                 CREATE TABLE audit (id INTEGER);
+                 CREATE FUNCTION record_row() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN INSERT INTO audit VALUES (NEW.id); RETURN NEW; END; $$;
+                 CREATE TRIGGER record_row AFTER INSERT ON public.scratch
+                 FOR EACH ROW EXECUTE FUNCTION record_row();
+                 CREATE TRIGGER record_row AFTER INSERT ON pg_temp.scratch
+                 FOR EACH ROW EXECUTE FUNCTION record_row();
+                 {event}
+                 SELECT id FROM audit ORDER BY id;"
+            );
+            let rows = run_translated_default(&sql);
+            assert_eq!(
+                rows,
+                expected.into_iter().map(|value| Some(value.to_string())).collect::<Vec<_>>(),
+                "{event}"
+            );
+        }
+    }
+}
+
+#[test]
+fn temp_shadows_merged_trigger_slots_keep_separate_owners() {
+    for temporary_first in [false, true] {
+        let permanent = "CREATE TABLE public.scratch (id INTEGER PRIMARY KEY);";
+        let temporary = "CREATE TEMP TABLE scratch (id INTEGER PRIMARY KEY);";
+        let tables = if temporary_first {
+            format!("{temporary} {permanent}")
+        } else {
+            format!("{permanent} {temporary}")
+        };
+        let sql = format!(
+            "{tables}
+             CREATE TABLE audit (id INTEGER);
+             CREATE FUNCTION record_row() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN INSERT INTO audit VALUES (NEW.id); RETURN NEW; END; $$;
+             CREATE TRIGGER record_row AFTER INSERT ON public.scratch
+             FOR EACH ROW EXECUTE FUNCTION record_row();
+             CREATE TRIGGER record_row AFTER INSERT ON pg_temp.scratch
+             FOR EACH ROW EXECUTE FUNCTION record_row();
+             CREATE TRIGGER record_second AFTER INSERT ON public.scratch
+             FOR EACH ROW EXECUTE FUNCTION record_row();
+             CREATE TRIGGER record_second AFTER INSERT ON scratch
+             FOR EACH ROW EXECUTE FUNCTION record_row();
+             INSERT INTO public.scratch VALUES (3);
+             INSERT INTO scratch VALUES (4);
+             SELECT id FROM audit ORDER BY id;"
+        );
+        let emitted = crate::helpers::translate::translate_default(&sql);
+        assert!(!emitted.contains("\"pg_temp."));
+        println!("{emitted}");
+        let rows = run_translated_default(&sql);
+        assert_eq!(rows, ["3", "3", "4", "4"].map(|value| Some(value.to_string())));
+    }
+}

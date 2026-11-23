@@ -764,14 +764,16 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
         } else {
             vec![events.clone()]
         };
-        let mut maybe_drop_trigger = or_replace.then(|| {
-            DropTrigger {
+        let mut maybe_drop_trigger = if or_replace {
+            Some(DropTrigger {
                 if_exists: true,
-                trigger_name: name.clone(),
+                trigger_name: trigger_slots::owned_name(&name, &source_table_name, schema)?,
                 table_name: None,
                 option: None,
-            }
-        });
+            })
+        } else {
+            None
+        };
         let mut parts = Vec::with_capacity(part_events.len());
         for part_events in part_events {
             let updates = part_events.iter().any(|event| matches!(event, TriggerEvent::Update(_)));
@@ -827,6 +829,7 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
                 [event] if plain => trigger_slots::part_name(self, event),
                 _ => name.clone(),
             };
+            let part_name = trigger_slots::owned_name(&part_name, &source_table_name, schema)?;
             parts.push((
                 maybe_drop_trigger.take(),
                 CreateTrigger {
