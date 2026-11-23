@@ -33,7 +33,8 @@ thiserror = { version = "2.0", default-features = false }
 # `recursive-protection` does in its parser.
 recursive = { version = "0.1", optional = true }
 # Runs each translation on a stack deep enough for `sqlparser`'s unguarded
-# derived walks over a whole statement.
+# derived walks over a whole statement, and grows the stack for copying a kept
+# translation, whose depth it knows.
 stacker = { version = "0.1", optional = true }
 # Optional Arbitrary impls on the public option types so fuzz harnesses
 # can drive `Pg2SqliteOptions` (and its dependent enums) from libfuzzer
