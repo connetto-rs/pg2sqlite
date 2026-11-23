@@ -8,8 +8,8 @@
 
 use sql_traits::structs::ParserDBIngestor;
 use sqlparser::ast::{
-    ArgMode, CreateTrigger, DropBehavior, DropFunction, DropTrigger, Ident, ObjectName,
-    ObjectNamePart, Statement,
+    ArgMode, CreateTrigger, DropBehavior, DropFunction, DropTrigger, FunctionDesc, Ident,
+    ObjectName, ObjectNamePart, Statement,
 };
 
 #[cfg(not(feature = "std"))]
@@ -27,29 +27,33 @@ pub(crate) fn runs_dropped(statement: &Statement, function: &ObjectName) -> bool
     else {
         return false;
     };
+    func_desc.iter().any(|dropped| trigger_runs(dropped, function))
+}
+
+/// Whether a trigger running `function` runs the function `desc` names.
+pub(crate) fn trigger_runs(desc: &FunctionDesc, function: &ObjectName) -> bool {
     // A trigger function takes no argument.
-    func_desc.iter().any(|dropped| {
-        dropped
-            .args
-            .as_deref()
-            .is_none_or(|args| args.iter().all(|arg| arg.mode == Some(ArgMode::Out)))
-            && same_function(&dropped.name, function)
-    })
+    desc.args.as_deref().is_none_or(|args| args.iter().all(|arg| arg.mode == Some(ArgMode::Out)))
+        && same_function(&desc.name, function)
 }
 
 /// Whether two written names reach one function, a bare one in `public`.
 fn same_function(left: &ObjectName, right: &ObjectName) -> bool {
-    let public = Ident::new("public");
     let ((Some(left), left_schema), (Some(right), right_schema)) = (parts(left), parts(right))
     else {
         return false;
     };
     same_identifier(left, right)
-        && same_identifier(left_schema.unwrap_or(&public), right_schema.unwrap_or(&public))
+        && same_identifier(&schema_or_public(left_schema), &schema_or_public(right_schema))
+}
+
+/// `schema`, or `public` for a bare name.
+pub(crate) fn schema_or_public(schema: Option<&Ident>) -> Ident {
+    schema.cloned().unwrap_or_else(|| Ident::new("public"))
 }
 
 /// The last part of `name` and the schema before it.
-fn parts(name: &ObjectName) -> (Option<&Ident>, Option<&Ident>) {
+pub(crate) fn parts(name: &ObjectName) -> (Option<&Ident>, Option<&Ident>) {
     let mut idents = name.0.iter().rev().filter_map(ObjectNamePart::as_ident);
     (idents.next(), idents.next())
 }

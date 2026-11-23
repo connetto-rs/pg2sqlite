@@ -20,6 +20,7 @@ use crate::{
             array::WholeRow,
             drop_column_rebuild::StatementHistory,
             trigger_row::{TriggerRow, TriggerRows},
+            trigger_slots::{TableKey, table_key},
         },
     },
     traits::{
@@ -235,15 +236,15 @@ pub(crate) struct PrewalkCatalogs {
     /// The folded table and trigger names of the row triggers sharing a
     /// table, timing and event with another, whose `WHEN` moves into the body
     /// so the slot can run them as one SQLite trigger.
-    shared_slot_triggers: alloc::collections::BTreeSet<(String, String)>,
-    /// The table name, lower-cased, the function name and the event of every
+    shared_slot_triggers: alloc::collections::BTreeSet<(TableKey, String)>,
+    /// The table identity, function name and event of every
     /// `BEFORE INSERT` or `BEFORE UPDATE` trigger, one entry per event, which
     /// the RLS backing-table update check reads to let the crate's own
     /// maintenance write through. Only those fields are kept, since holding
     /// whole trigger nodes here costs link-time drop glue out of proportion
     /// to what the check needs.
     before_row_trigger_fns: Vec<(
-        String,
+        TableKey,
         sqlparser::ast::ObjectName,
         crate::impls::translator_impls::reentry::MaintainedEvent,
     )>,
@@ -271,8 +272,8 @@ pub(crate) struct PrewalkCatalogs {
 pub(crate) struct TableTrigger {
     /// The trigger's name as written.
     pub(crate) name: String,
-    /// The table's or view's name, lower-cased.
-    table: String,
+    /// The table's or view's identity.
+    table: TableKey,
     /// The events the trigger fires on.
     pub(crate) events: Vec<sqlparser::ast::TriggerEvent>,
     pub(crate) period: Option<sqlparser::ast::TriggerPeriod>,
@@ -1075,7 +1076,7 @@ impl<'a> TranslationContext<'a> {
     /// and trigger name.
     pub(crate) fn set_shared_slot_triggers(
         &mut self,
-        triggers: alloc::collections::BTreeSet<(String, String)>,
+        triggers: alloc::collections::BTreeSet<(TableKey, String)>,
     ) {
         self.catalogs.to_mut().shared_slot_triggers = triggers;
     }
@@ -1083,7 +1084,7 @@ impl<'a> TranslationContext<'a> {
     /// Returns whether the row trigger keyed by folded `table` and `name`
     /// shares its table, timing and event with another.
     #[must_use]
-    pub(crate) fn shares_trigger_slot(&self, key: &(String, String)) -> bool {
+    pub(crate) fn shares_trigger_slot(&self, key: &(TableKey, String)) -> bool {
         self.catalogs.shared_slot_triggers.contains(key)
     }
 
@@ -1130,7 +1131,7 @@ impl<'a> TranslationContext<'a> {
 
     pub(crate) fn add_before_row_trigger_fn(
         &mut self,
-        table_name: String,
+        table_name: TableKey,
         fn_name: sqlparser::ast::ObjectName,
         event: crate::impls::translator_impls::reentry::MaintainedEvent,
     ) {
@@ -1140,11 +1141,39 @@ impl<'a> TranslationContext<'a> {
     pub(crate) fn before_row_trigger_fns(
         &self,
     ) -> &[(
-        String,
+        TableKey,
         sqlparser::ast::ObjectName,
         crate::impls::translator_impls::reentry::MaintainedEvent,
     )] {
         &self.catalogs.before_row_trigger_fns
+    }
+
+    /// Records each trigger function `statement` moves under its new name as
+    /// well, since the triggers keep running it.
+    pub(crate) fn carry_trigger_functions(&mut self, statement: &sqlparser::ast::Statement) {
+        use sqlparser::ast::{AlterFunction, AlterFunctionOperation, AlterFunctionSignature};
+
+        use crate::impls::{
+            object_name::last_ident_value_or_display, translator_impls::function_moves::moved,
+        };
+
+        let carried: Vec<_> = self
+            .catalogs
+            .before_row_trigger_fns
+            .iter()
+            .filter_map(|(table, function, event)| {
+                Some((table.clone(), moved(statement, function)?, *event))
+            })
+            .collect();
+        self.catalogs.to_mut().before_row_trigger_fns.extend(carried);
+        if let sqlparser::ast::Statement::AlterFunction(AlterFunction {
+            signature: AlterFunctionSignature::Function(function),
+            operation: AlterFunctionOperation::RenameTo { new_name },
+        }) = statement
+            && self.has_trigger_function_name(&last_ident_value_or_display(&function.name))
+        {
+            self.add_trigger_function_name(new_name.value.clone());
+        }
     }
 
     /// Follows the triggers `statement` creates, drops, or carries to a
@@ -1154,7 +1183,6 @@ impl<'a> TranslationContext<'a> {
 
         use crate::impls::object_name::last_ident_value_or_display;
 
-        let table_key = |name: &ObjectName| last_ident_value_or_display(name).to_lowercase();
         match statement {
             Statement::CreateTrigger(trigger) => self.register_table_trigger(trigger),
             Statement::DropTrigger(drop) => {
@@ -1166,7 +1194,7 @@ impl<'a> TranslationContext<'a> {
                 });
             }
             Statement::Drop { object_type: ObjectType::Table, names, .. } => {
-                let dropped: Vec<String> = names.iter().map(table_key).collect();
+                let dropped: Vec<TableKey> = names.iter().map(table_key).collect();
                 self.catalogs.to_mut().table_triggers.retain(|kept| !dropped.contains(&kept.table));
             }
             Statement::AlterTable(alter_table) => {
@@ -1178,7 +1206,11 @@ impl<'a> TranslationContext<'a> {
                     else {
                         continue;
                     };
-                    let (from, to) = (table_key(&alter_table.name), table_key(renamed));
+                    let from = table_key(&alter_table.name);
+                    let mut to = table_key(renamed);
+                    if renamed.0.len() == 1 {
+                        to.temporary = from.temporary;
+                    }
                     for kept in &mut self.catalogs.to_mut().table_triggers {
                         if kept.table == from {
                             kept.table.clone_from(&to);
@@ -1193,7 +1225,7 @@ impl<'a> TranslationContext<'a> {
     fn register_table_trigger(&mut self, trigger: &sqlparser::ast::CreateTrigger) {
         use crate::impls::object_name::last_ident_value_or_display;
         let name = last_ident_value_or_display(&trigger.name);
-        let table = last_ident_value_or_display(&trigger.table_name).to_lowercase();
+        let table = table_key(&trigger.table_name);
         let triggers = &mut self.catalogs.to_mut().table_triggers;
         triggers.retain(|kept| kept.table != table || !kept.name.eq_ignore_ascii_case(&name));
         triggers.push(TableTrigger {
@@ -1234,44 +1266,43 @@ impl<'a> TranslationContext<'a> {
 
     pub(crate) fn table_triggers<'s>(
         &'s self,
-        table: &'s ObjectName,
+        table: &'s sqlparser::ast::CreateTable,
     ) -> impl Iterator<Item = &'s TableTrigger> {
-        let name = crate::impls::object_name::last_ident(table);
-        self.trigger_catalog.unwrap_or(&self.catalogs.table_triggers).iter().filter(
-            move |trigger| name.is_some_and(|name| trigger.table.eq_ignore_ascii_case(&name.value)),
-        )
+        let key = TableKey::from(table);
+        self.trigger_catalog
+            .unwrap_or(&self.catalogs.table_triggers)
+            .iter()
+            .filter(move |trigger| trigger.table == key)
     }
 
     /// The name of a trigger `table` carries that fires on an event `fires`
     /// accepts, among those the replica does not leave to the server.
     pub(crate) fn trigger_firing(
         &self,
-        table: &str,
+        table: &TableKey,
         fires: impl Fn(&sqlparser::ast::TriggerEvent) -> bool,
     ) -> Option<&str> {
-        let table = table.to_lowercase();
         self.catalogs
             .table_triggers
             .iter()
             .find(|trigger| {
-                trigger.table == table
+                trigger.table == *table
                     && trigger.events.iter().any(&fires)
                     && !self.is_server_derived_trigger_name(&trigger.name)
             })
             .map(|trigger| trigger.name.as_str())
     }
 
-    /// Whether an `INSTEAD OF` trigger on the view `view` takes a write of an
-    /// event `fires` accepts.
+    /// Whether an `INSTEAD OF` trigger on the view stored as `view` takes a
+    /// write of an event `fires` accepts.
     pub(crate) fn instead_of_trigger_takes(
         &self,
         view: &str,
         fires: impl Fn(&sqlparser::ast::TriggerEvent) -> bool,
     ) -> bool {
-        let view = view.to_lowercase();
         self.catalogs.table_triggers.iter().any(|trigger| {
             trigger.period == Some(sqlparser::ast::TriggerPeriod::InsteadOf)
-                && trigger.table == view
+                && trigger.table.name == view
                 && trigger.events.iter().any(&fires)
         })
     }

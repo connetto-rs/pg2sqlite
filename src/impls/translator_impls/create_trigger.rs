@@ -358,8 +358,10 @@ struct TriggerPart<'a> {
 
 /// Translates the trigger function's body into the shape `part` asks for.
 ///
-/// `refusal` is what keeps the trigger from being a maintenance trigger, which
-/// the refusal of an assignment to `NEW` in the body names.
+/// `table_name` is the table the trigger was created on, which `NEW`, `OLD`
+/// and `TG_TABLE_NAME` read also where the replica emits the trigger on its
+/// backing table. `refusal` is what keeps the trigger from being a maintenance
+/// trigger, which the refusal of an assignment to `NEW` in the body names.
 fn generate_standard_trigger_body(
     exec_body: &sqlparser::ast::TriggerExecBody,
     part: &TriggerPart<'_>,
@@ -658,7 +660,7 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
             name,
             period,
             events,
-            table_name: _table_name,
+            table_name: normalized_source_table_name,
             referenced_table_name,
             referencing,
             trigger_object,
@@ -762,14 +764,16 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
         } else {
             vec![events.clone()]
         };
-        let mut maybe_drop_trigger = or_replace.then(|| {
-            DropTrigger {
+        let mut maybe_drop_trigger = if or_replace {
+            Some(DropTrigger {
                 if_exists: true,
-                trigger_name: name.clone(),
+                trigger_name: trigger_slots::owned_name(&name, &source_table_name, schema)?,
                 table_name: None,
                 option: None,
-            }
-        });
+            })
+        } else {
+            None
+        };
         let mut parts = Vec::with_capacity(part_events.len());
         for part_events in part_events {
             let updates = part_events.iter().any(|event| matches!(event, TriggerEvent::Update(_)));
@@ -804,7 +808,7 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
                         && matches!(period, Some(TriggerPeriod::Before)))
                     .then(|| super::reentry::named_table(&source_table_name)),
                 },
-                &redirected_table_name,
+                &normalized_source_table_name,
                 maintenance_refusal.as_ref().and_then(Option::as_ref),
                 schema,
                 options,
@@ -825,6 +829,7 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
                 [event] if plain => trigger_slots::part_name(self, event),
                 _ => name.clone(),
             };
+            let part_name = trigger_slots::owned_name(&part_name, &source_table_name, schema)?;
             parts.push((
                 maybe_drop_trigger.take(),
                 CreateTrigger {

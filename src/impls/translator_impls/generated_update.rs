@@ -36,7 +36,7 @@ fn has_before_row_update(
     table: &CreateTable,
     options: &crate::options::TranslationContext<'_>,
 ) -> bool {
-    options.table_triggers(&table.name).any(|trigger| {
+    options.table_triggers(table).any(|trigger| {
         trigger.row_level
             && trigger.period == Some(TriggerPeriod::Before)
             && trigger.events.iter().any(|event| matches!(event, TriggerEvent::Update(_)))
@@ -120,9 +120,8 @@ pub(crate) fn check_dropped_defaults(
     if has_before_row_update(table, options) {
         return Ok(());
     }
-    for trigger in options
-        .table_triggers(&table.name)
-        .filter(|trigger| trigger.period == Some(TriggerPeriod::After))
+    for trigger in
+        options.table_triggers(table).filter(|trigger| trigger.period == Some(TriggerPeriod::After))
     {
         for event in &trigger.events {
             let TriggerEvent::Update(columns) = event else { continue };

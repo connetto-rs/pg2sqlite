@@ -18,7 +18,10 @@ use sqlparser::ast::{CreateTable, ObjectName};
 use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
-    impls::{object_name::resolve_translation_table, session_variable},
+    impls::{
+        object_name::{append_suffix, resolve_translation_table, sqlite_unqualified_object_name},
+        session_variable,
+    },
     options::Pg2SqliteOptions,
 };
 
@@ -212,4 +215,23 @@ pub(crate) fn names_table_with_backing(
         Some(table) => has_backing_table(table, schema, options),
         None => Ok(false),
     }
+}
+
+/// The table a SQLite foreign key into `name` references. SQLite looks a key's
+/// parent up in the child's own database, so the name carries no qualifier,
+/// and a table with a backing table is referenced through it.
+///
+/// # Errors
+///
+/// As [`has_backing_table`].
+pub(crate) fn sqlite_referenced_table(
+    schema: &ParserDB,
+    name: &ObjectName,
+    options: &Pg2SqliteOptions,
+) -> Result<ObjectName, Error> {
+    let referenced = sqlite_unqualified_object_name(name);
+    if names_table_with_backing(schema, name, options)? {
+        return Ok(append_suffix(&referenced, options.get_rls_table_suffix()));
+    }
+    Ok(referenced)
 }

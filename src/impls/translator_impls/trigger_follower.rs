@@ -14,8 +14,9 @@ use sqlparser::ast::{
 
 use super::{
     function_cascade::{drop_of, runs_dropped},
+    function_moves,
     plpgsql::{ReadBodies, body_reach},
-    trigger_slots::{folded, renamed_table},
+    trigger_slots::{TableKey, folded, renamed_owner, renamed_table, table_key},
 };
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
@@ -84,15 +85,19 @@ impl Touched {
                 operation:
                     AlterFunctionOperation::OwnerTo(_) | AlterFunctionOperation::Actions { .. },
             }) => functions(folded_names(&[&function.name])),
+            // An event so a seeded trigger renders before its function's move
+            // is carried.
+            _ if function_moves::moves_functions(event) => functions(BTreeSet::new()),
             _ => None,
         }
     }
 
     /// Whether `trigger`'s translation reads what this changes, its body read
     /// from `before` and from `after`, `bodies` holding what each body read
-    /// before names.
+    /// before names, or `event` moves the function it runs.
     fn reaches(
         &self,
+        event: &Statement,
         trigger: &CreateTrigger,
         (before, after): (&ParserDB, &ParserDB),
         bodies: &mut ReadBodies,
@@ -101,6 +106,9 @@ impl Touched {
             return Ok(true);
         }
         let Some(exec_body) = &trigger.exec_body else { return Ok(false) };
+        if function_moves::moved(event, &exec_body.func_desc.name).is_some() {
+            return Ok(true);
+        }
         for schema in [before, after] {
             match body_reach(&exec_body.func_desc.name, schema, bodies)? {
                 Some(reach)
@@ -113,18 +121,19 @@ impl Touched {
     }
 }
 
-/// Carries `trigger` along `event`, which renames its table or a column its
-/// `UPDATE OF` list or `WHEN` condition names.
+/// Carries `trigger` along `event`, which renames its table, a column its
+/// `UPDATE OF` list or `WHEN` condition names, or moves the function it runs.
 fn carry(trigger: &mut CreateTrigger, event: &Statement) {
+    function_moves::carry(trigger, event);
     let Statement::AlterTable(alter) = event else { return };
-    if folded(&alter.name) != folded(&trigger.table_name) {
+    if table_key(&alter.name) != table_key(&trigger.table_name) {
         return;
     }
     for operation in &alter.operations {
         match operation {
             AlterTableOperation::RenameTable {
                 table_name: RenameTableNameKind::As(to) | RenameTableNameKind::To(to),
-            } => trigger.table_name.clone_from(to),
+            } => trigger.table_name = renamed_owner(&alter.name, to),
             AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
                 for event in &mut trigger.events {
                     let TriggerEvent::Update(columns) = event else { continue };
@@ -208,9 +217,9 @@ impl TriggerFollower {
             Statement::Drop {
                 object_type: ObjectType::Table | ObjectType::View, names, ..
             } => {
-                let dropped: BTreeSet<String> = names.iter().map(folded).collect();
+                let dropped: BTreeSet<TableKey> = names.iter().map(table_key).collect();
                 self.live
-                    .retain(|followed| !dropped.contains(&folded(&followed.create.table_name)));
+                    .retain(|followed| !dropped.contains(&table_key(&followed.create.table_name)));
             }
             _ => {
                 for followed in &mut self.live {
@@ -221,8 +230,8 @@ impl TriggerFollower {
     }
 
     fn forget(&mut self, name: &ObjectName, table: Option<&ObjectName>) {
-        let (name, table) = (folded(name), table.map(folded));
-        self.live.retain(|followed| !followed.is(&name, table.as_deref()));
+        let (name, table) = (folded(name), table.map(table_key));
+        self.live.retain(|followed| !followed.is(&name, table.as_ref()));
     }
 
     /// The SQLite triggers the last translation of the live trigger `name`,
@@ -238,9 +247,9 @@ impl TriggerFollower {
         table: Option<&ObjectName>,
         translate_seeded: &mut Translate<'_>,
     ) -> Result<Vec<ObjectName>, Error> {
-        let (name, table) = (folded(name), table.map(folded));
+        let (name, table) = (folded(name), table.map(table_key));
         let Some(followed) =
-            self.live.iter_mut().find(|followed| followed.is(&name, table.as_deref()))
+            self.live.iter_mut().find(|followed| followed.is(&name, table.as_ref()))
         else {
             return Ok(Vec::new());
         };
@@ -263,22 +272,22 @@ impl TriggerFollower {
         translate_after: &mut Translate<'_>,
     ) -> Result<Vec<Reemission>, Error> {
         let Some(touched) = Touched::of(event) else { return Ok(Vec::new()) };
-        let dropped: BTreeSet<String> = match event {
+        let dropped: BTreeSet<TableKey> = match event {
             Statement::Drop {
                 object_type: ObjectType::Table | ObjectType::View, names, ..
-            } => names.iter().map(folded).collect(),
+            } => names.iter().map(table_key).collect(),
             _ => BTreeSet::new(),
         };
         let mut reemissions = Vec::new();
         for followed in &mut self.live {
             let replaced = match event {
                 Statement::CreateTrigger(trigger) => {
-                    followed.is(&folded(&trigger.name), Some(&folded(&trigger.table_name)))
+                    followed.is(&folded(&trigger.name), Some(&table_key(&trigger.table_name)))
                 }
                 Statement::DropTrigger(drop) => {
                     followed.is(
                         &folded(&drop.trigger_name),
-                        drop.table_name.as_ref().map(folded).as_deref(),
+                        drop.table_name.as_ref().map(table_key).as_ref(),
                     )
                 }
                 _ => false,
@@ -286,9 +295,9 @@ impl TriggerFollower {
             if replaced {
                 continue;
             }
-            let table = folded(&followed.create.table_name);
+            let table = table_key(&followed.create.table_name);
             if dropped.contains(&table)
-                || !touched.reaches(&followed.create, (before, after), &mut self.bodies)?
+                || !touched.reaches(event, &followed.create, (before, after), &mut self.bodies)?
             {
                 continue;
             }
@@ -296,8 +305,27 @@ impl TriggerFollower {
             carry(&mut moved, event);
             let create = Statement::CreateTrigger(moved);
             let mut warnings = Vec::new();
-            let rendered = translate_after(&create, &mut |warning| warnings.push(warning))?;
-            let last = core::mem::replace(followed.rendering(translate_seeded)?, rendered.clone());
+            let mut rendered = translate_after(&create, &mut |warning| warnings.push(warning))?;
+            let previous = followed.rendering(translate_seeded)?;
+            if let Some(owner) = previous.iter().find_map(|statement| {
+                match statement {
+                    Statement::CreateTrigger(trigger) => Some(trigger),
+                    _ => None,
+                }
+            }) {
+                for statement in &mut rendered {
+                    if let Statement::CreateTrigger(trigger) = statement {
+                        if trigger.name.0.len() == 1 && owner.name.0.len() > 1 {
+                            trigger.name = renamed_owner(&owner.name, &trigger.name);
+                        }
+                        if trigger.table_name.0.len() == 1 && owner.table_name.0.len() > 1 {
+                            trigger.table_name =
+                                renamed_owner(&owner.table_name, &trigger.table_name);
+                        }
+                    }
+                }
+            }
+            let last = core::mem::replace(previous, rendered.clone());
             if rendered == last {
                 continue;
             }
@@ -321,9 +349,9 @@ impl TriggerFollower {
 
 impl Followed {
     /// Whether this is the trigger `name`, folded, on `table` when given.
-    fn is(&self, name: &str, table: Option<&str>) -> bool {
+    fn is(&self, name: &str, table: Option<&TableKey>) -> bool {
         folded(&self.create.name) == name
-            && table.is_none_or(|table| table == folded(&self.create.table_name))
+            && table.is_none_or(|table| *table == table_key(&self.create.table_name))
     }
 
     /// Its last translation, a seeded one first translated with

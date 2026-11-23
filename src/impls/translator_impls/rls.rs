@@ -2654,7 +2654,7 @@ fn maintains(
     options: &crate::options::TranslationContext<'_>,
     event: MaintainedEvent,
 ) -> bool {
-    let table_name = table.table_name().to_lowercase();
+    let table_name = super::trigger_slots::TableKey::from(table);
     options
         .before_row_trigger_fns()
         .iter()

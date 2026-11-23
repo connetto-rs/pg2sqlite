@@ -26,6 +26,7 @@ pub(crate) mod delete;
 pub(crate) mod expr;
 pub(crate) mod function;
 pub(crate) mod function_cascade;
+pub(crate) mod function_moves;
 pub(crate) mod generated_update;
 pub(crate) mod held_views;
 mod helpers;
