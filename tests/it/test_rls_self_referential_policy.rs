@@ -213,7 +213,7 @@ fn a_policy_may_consult_a_view_over_its_own_table() {
 
     let emitted = translate(&pg).join("\n");
     assert!(
-        emitted.contains("CREATE VIEW oo_all AS SELECT id, owner_id FROM oo_rls"),
+        emitted.contains("CREATE VIEW oo_all AS SELECT id AS id, owner_id AS owner_id FROM oo_rls"),
         "the view must read the backing table, not the policy view: {emitted}"
     );
 }
@@ -268,7 +268,10 @@ fn a_view_owned_by_the_schema_owner_reads_the_backing_table() {
         .expect("the schema owner owns oo")
         .into_vec()
         .join("\n");
-    assert!(emitted.contains("CREATE VIEW oo_all AS SELECT id, owner_id FROM oo_rls"), "{emitted}");
+    assert!(
+        emitted.contains("CREATE VIEW oo_all AS SELECT id AS id, owner_id AS owner_id FROM oo_rls"),
+        "{emitted}"
+    );
 }
 
 /// A schema-qualified view finds the owner its `ALTER VIEW` names, so a view
@@ -284,7 +287,7 @@ fn a_qualified_view_reads_as_the_owner_its_alter_view_names() {
          ALTER VIEW app.oo_all OWNER TO migrator;"
     ))
     .join("\n");
-    assert!(emitted.contains("AS SELECT id, owner_id FROM oo_rls"), "{emitted}");
+    assert!(emitted.contains("AS SELECT id AS id, owner_id AS owner_id FROM oo_rls"), "{emitted}");
 }
 
 /// A view owned by a role the table's policies bind would show that role's
@@ -341,11 +344,11 @@ fn a_security_invoker_view_keeps_reading_the_policy_view() {
     ))
     .join("\n");
     assert!(
-        emitted.contains("CREATE VIEW oo_seen AS SELECT id, owner_id FROM oo"),
+        emitted.contains("CREATE VIEW oo_seen AS SELECT id AS id, owner_id AS owner_id FROM oo"),
         "a security_invoker view reads the policy view: {emitted}"
     );
     assert!(
-        !emitted.contains("oo_seen AS SELECT id, owner_id FROM oo_rls"),
+        !emitted.contains("oo_seen AS SELECT id AS id, owner_id AS owner_id FROM oo_rls"),
         "and must not be retargeted: {emitted}"
     );
 }
@@ -360,7 +363,7 @@ fn a_view_over_an_ordinary_table_is_untouched() {
     )
     .join("\n");
     assert!(
-        emitted.contains("CREATE VIEW plain_all AS SELECT id, v FROM plain"),
+        emitted.contains("CREATE VIEW plain_all AS SELECT id AS id, v AS v FROM plain"),
         "an ordinary table keeps its name: {emitted}"
     );
 }

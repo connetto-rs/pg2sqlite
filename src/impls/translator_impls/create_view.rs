@@ -76,7 +76,11 @@ impl crate::traits::translator::TranslatorWithContext for CreateView {
             ));
         }
 
-        let mut query = self.query.translate_with_warnings(schema, options, emit)?;
+        let pinned = super::view_outputs::pin_outputs(
+            &self.query,
+            options.written_schema().unwrap_or(schema),
+        )?;
+        let mut query = pinned.translate_with_warnings(schema, options, emit)?;
         if !security_invoker {
             retarget_rls_reads(&mut query, self, schema, options)?;
         }

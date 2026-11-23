@@ -561,7 +561,7 @@ fn create_view_non_public_schema_name_is_unqualified_when_schema_resolves() {
         ",
     );
     assert!(
-        output.contains("CREATE VIEW active_users AS SELECT id FROM users"),
+        output.contains("CREATE VIEW active_users AS SELECT id AS id FROM users"),
         "expected schema-qualified view + source to be unqualified in output, got: {output}"
     );
     execute_as_sqlite(

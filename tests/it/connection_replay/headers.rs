@@ -58,12 +58,12 @@ diesel::table! {
 
 diesel::table! {
     #[sql_name = "v"]
-    qualified_view (y) { y -> Text, }
+    qualified_view (x) { x -> Text, }
 }
 
 diesel::table! {
     #[sql_name = "v"]
-    union_view (y) { y -> Text, }
+    union_view (x) { x -> Text, }
 }
 
 diesel::table! {
@@ -227,7 +227,7 @@ fn schema_qualified_names_bind_the_physical_relation() {
     let files = tempfile::TempDir::new().expect("files");
     let mut reopened = create_and_reopen(&files, &script);
     let row = qualified_view::table
-        .select(qualified_view::y)
+        .select(qualified_view::x)
         .first::<String>(&mut reopened)
         .expect("the schema-qualified view");
     assert_eq!(row, "qualified");
@@ -246,8 +246,8 @@ fn set_operation_view_keeps_the_left_arm_shape() {
     let files = tempfile::TempDir::new().expect("files");
     let mut reopened = create_and_reopen(&files, &script);
     let rows = union_view::table
-        .select(union_view::y)
-        .order(union_view::y)
+        .select(union_view::x)
+        .order(union_view::x)
         .load::<String>(&mut reopened)
         .expect("the union view rows");
     assert_eq!(rows, ["ax".to_owned(), "bn".to_owned()]);
