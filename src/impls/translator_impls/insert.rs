@@ -191,6 +191,7 @@ impl crate::traits::translator::TranslatorWithContext for Insert {
             }
         });
         let returning = crate::impls::returning_scope::translate_target_returning::<Forward>(
+            &crate::impls::returning_rows::ReturningRows::insert(self),
             insert.returning.as_deref(),
             (returning_target, "INSERT"),
             schema,

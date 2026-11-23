@@ -30,7 +30,8 @@ use sqlparser::ast::{
 use super::{
     expr_helpers::try_map_expr_children,
     object_name::{last_ident, resolve_translation_table, same_identifier},
-    shared_helpers::{TranslationDirection, translate_returning},
+    returning_rows::ReturningRows,
+    shared_helpers::TranslationDirection,
 };
 use crate::errors::Error;
 #[cfg(not(feature = "std"))]
@@ -101,15 +102,17 @@ pub(crate) fn aliased_target(target: &TableFactor) -> Option<(&Ident, &ObjectNam
     Some((&alias.name, name))
 }
 
-/// Translates a returned list and resolves its correlated target aliases.
+/// Translates a returned list through its statement's row versions and
+/// resolves its correlated target aliases.
 pub(crate) fn translate_target_returning<D: TranslationDirection>(
+    rows: &ReturningRows<'_>,
     returning: Option<&[SelectItem]>,
     (target, statement): (Option<(&Ident, &ObjectName)>, &'static str),
     schema: &ParserDB,
     options: &D::Options<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Option<Vec<SelectItem>>, Error> {
-    let mut returning = translate_returning::<D>(returning, schema, options, emit)?;
+    let mut returning = rows.translate::<D>(returning, schema, options, emit)?;
     if !D::IS_FORWARD {
         return Ok(returning);
     }

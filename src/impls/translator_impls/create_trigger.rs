@@ -516,8 +516,14 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
         // `OLD`.
         let trigger_table =
             crate::impls::object_name::resolve_translation_table(schema, &self.table_name)?;
-        if let (Some(table), Some(condition)) = (trigger_table, &self.condition) {
-            crate::impls::column_access::resolve_trigger_condition(condition, table, schema)?;
+        // PostgreSQL binds the `WHEN` condition where the trigger is created,
+        // and a later column rename in the batch carries the binding along.
+        let written = options.written_schema().unwrap_or(schema);
+        if let (Some(table), Some(condition)) = (
+            crate::impls::object_name::resolve_translation_table(written, &self.table_name)?,
+            &self.condition,
+        ) {
+            crate::impls::column_access::resolve_trigger_condition(condition, table, written)?;
         }
         let scope_query;
         let trigger_scope = if let Some(table) = trigger_table {
