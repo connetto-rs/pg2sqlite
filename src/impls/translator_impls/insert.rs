@@ -174,17 +174,7 @@ impl crate::traits::translator::TranslatorWithContext for Insert {
         // One pass for all column-type conversions: literals and parameters.
         apply_column_type_conversions(&mut insert, target.optional(), schema, options)?;
 
-        if let Some(on_insert) = insert.on.take() {
-            translate_on_insert(
-                &on_insert,
-                &mut insert,
-                &mut target,
-                &rewrites,
-                schema,
-                options,
-                emit,
-            )?;
-        }
+        translate_on_insert(self, &mut insert, &mut target, &rewrites, schema, options, emit)?;
 
         if matches!(insert.on, Some(sqlparser::ast::OnInsert::OnConflict(_))) {
             disambiguate_upsert_source(&mut insert);
@@ -381,7 +371,7 @@ fn conflict_update_scope_query(insert: &Insert) -> Query {
 /// Translates the `ON CONFLICT` clause onto `insert`, refusing every other
 /// `ON` clause.
 fn translate_on_insert(
-    on_insert: &sqlparser::ast::OnInsert,
+    original: &Insert,
     insert: &mut Insert,
     target: &mut ResolvedInsertTarget<'_>,
     rewrites: &ColumnRewrites,
@@ -389,6 +379,9 @@ fn translate_on_insert(
     options: &crate::options::TranslationContext<'_>,
     emit: &mut dyn FnMut(crate::warnings::TranslationWarning),
 ) -> Result<(), crate::errors::Error> {
+    let Some(on_insert) = insert.on.take() else {
+        return Ok(());
+    };
     let sqlparser::ast::OnInsert::OnConflict(on_conflict) = on_insert else {
         return Err(crate::errors::Error::forward_refusal(format!(
             "Unsupported ON INSERT clause: {on_insert:?}"
@@ -412,7 +405,8 @@ fn translate_on_insert(
             }));
         }
         sqlparser::ast::OnConflictAction::DoUpdate(do_update) => {
-            let scope_query = conflict_update_scope_query(insert);
+            let scope_query = conflict_update_scope_query(original);
+            // Resolve against the logical target's schema.
             let scope = crate::options::query_column_scope(&scope_query, schema)?;
             let scoped = options.with_scope(&scope);
             let options = &scoped;
