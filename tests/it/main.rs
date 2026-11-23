@@ -115,6 +115,7 @@ mod test_function_rewrites;
 mod test_function_translation;
 mod test_generate_series;
 mod test_generated_column_default;
+mod test_generated_column_update_trigger;
 mod test_generated_trigger_identifiers;
 mod test_grant_filtering;
 mod test_greatest_least;
