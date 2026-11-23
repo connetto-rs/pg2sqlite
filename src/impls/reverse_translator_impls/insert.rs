@@ -512,28 +512,17 @@ impl ReverseTranslator for Insert {
                 &crate::impls::shared_helpers::ColumnRewrites::default(),
                 &mut |_| {},
             )?;
-            let mut conflict_target = on_conflict.conflict_target.clone();
-            translate_conflict_predicate::<Reverse>(
-                &mut conflict_target,
-                schema,
-                options,
-                &mut |_| {},
-            )?;
             if let TableObject::TableName(target) = &self.table
                 && let Some(target) = last_ident(target)
             {
                 qualify_do_update_column_refs(&mut translated, &target.value);
             }
             insert.on = Some(OnInsert::OnConflict(OnConflict {
-                conflict_target,
+                conflict_target: on_conflict.conflict_target.clone(),
                 action: OnConflictAction::DoUpdate(translated),
             }));
         }
-        if let Some(OnInsert::OnConflict(OnConflict {
-            conflict_target,
-            action: OnConflictAction::DoNothing,
-        })) = &mut insert.on
-        {
+        if let Some(OnInsert::OnConflict(OnConflict { conflict_target, .. })) = &mut insert.on {
             translate_conflict_predicate::<Reverse>(conflict_target, schema, options, &mut |_| {})?;
         }
 
