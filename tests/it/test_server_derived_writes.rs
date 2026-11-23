@@ -2350,11 +2350,14 @@ fn only_a_check_holding_the_column_to_one_label_lets_the_check_stay() {
         ("grantee_kind NOT NULL CHECK ('team'::grantee_kind = kind)", true),
         ("grantee_kind NOT NULL, CHECK (kind = 'team')", true),
         ("grantee_kind NOT NULL CHECK (kind = 'team' AND id > 0)", true),
+        ("grantee_kind NOT NULL CHECK ((kind = 'team') AND id > 0)", true),
+        ("grantee_kind NOT NULL CHECK (abs(id) = id AND kind = 'team')", true),
         ("grantee_kind NOT NULL", false),
         ("grantee_kind NOT NULL CHECK (kind = 'team' OR id > 0)", false),
         ("grantee_kind NOT NULL CHECK (kind IN ('team', 'user'))", false),
         ("grantee_kind NOT NULL CHECK (kind <> 'user')", false),
         ("grantee_kind NOT NULL CHECK (NOT (kind = 'team'))", false),
+        ("grantee_kind NOT NULL CHECK (kind = kind)", false),
     ] {
         assert_eq!(
             TeamGrantees { team: Some(team), ..TeamGrantees::default() }.keeps_the_check(),
@@ -2718,6 +2721,8 @@ fn a_trigger_whose_when_needs_a_column_the_upload_cannot_change_never_fires_befo
     for (when, grant, left) in [
         ("OLD.id IS DISTINCT FROM NEW.id", "", false),
         ("OLD.id <> NEW.id", "", false),
+        ("(OLD.id) IS DISTINCT FROM NEW.id", "", false),
+        ("OLD.id IS DISTINCT FROM (NEW.id)", "", false),
         ("OLD.id IS DISTINCT FROM NEW.id AND NEW.state = 'done'", "", false),
         ("OLD.id IS DISTINCT FROM NEW.id", "GRANT UPDATE (id) ON parents TO app;", true),
         ("NEW.state IS DISTINCT FROM OLD.state", "", true),

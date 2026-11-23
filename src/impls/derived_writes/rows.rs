@@ -412,13 +412,10 @@ pub(super) fn written(statement: &Statement, variables: &[String]) -> Rows {
 /// Whether an `INSERT` with `on` writes only the rows it adds, which is so
 /// without a conflict clause or with one doing nothing.
 fn adds_only(on: Option<&OnInsert>) -> bool {
-    match on {
-        None => true,
-        Some(OnInsert::OnConflict(conflict)) => {
-            matches!(conflict.action, OnConflictAction::DoNothing)
-        }
-        Some(_) => false,
-    }
+    on.is_none_or(|on| {
+        matches!(on, OnInsert::OnConflict(conflict)
+            if matches!(conflict.action, OnConflictAction::DoNothing))
+    })
 }
 
 /// The filters of the tables each `SELECT` reads, and how many times each

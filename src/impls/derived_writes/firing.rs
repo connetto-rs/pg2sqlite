@@ -255,11 +255,9 @@ impl FiringTrigger {
         schema: &ParserDB,
         options: &TranslationContext<'_>,
     ) -> Result<(Columns, bool), Error> {
-        let Some(function) = written_function(schema, &self.function)? else {
-            return Ok((Columns::none(), false));
-        };
-        let chain = Walker::read(function, Some(&self.events), schema, options)?;
-        Ok((chain.assigned, chain.skips))
+        let read = |function| Walker::read(function, Some(&self.events), schema, options);
+        let chain = written_function(schema, &self.function)?.map(read).transpose()?;
+        Ok(chain.map_or((Columns::none(), false), |chain| (chain.assigned, chain.skips)))
     }
 }
 
@@ -452,12 +450,13 @@ impl<'s, 'o> Firing<'s, 'o> {
         if event != Event::Update || matches!(trigger.needs, Needs::Nothing) {
             return Ok(true);
         }
-        let mut declared = BTreeSet::new();
-        if let Some(table) = self.table(&trigger.table) {
-            for column in table.columns(self.schema)? {
-                declared.insert(column.stored_column_name().into_owned());
-            }
-        }
+        let columns =
+            self.table(&trigger.table).map(|table| table.columns(self.schema)).transpose()?;
+        let declared: BTreeSet<String> = columns
+            .into_iter()
+            .flatten()
+            .map(|column| column.stored_column_name().into_owned())
+            .collect();
         Ok(trigger.needs.met_by(changed, &declared))
     }
 
@@ -871,10 +870,14 @@ pub(super) fn fired_dependency(
     let record = Record { table: &fired.table, unchecked: &unchecked };
     for &event in &fired.events {
         let stored = firing.table(&fired.table);
-        let changed = match stored {
-            Some(stored) => firing.changed(stored, event, firing.uploaded(stored, event)?)?,
-            None => Columns::Row,
-        };
+        let changed = stored
+            .map(|stored| {
+                firing
+                    .uploaded(stored, event)
+                    .and_then(|uploaded| firing.changed(stored, event, uploaded))
+            })
+            .transpose()?
+            .unwrap_or(Columns::Row);
         let mut written = Written::new();
         let mut visited = Visited::new();
         for peer in firing.triggers {
