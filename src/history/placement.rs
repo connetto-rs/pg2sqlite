@@ -458,7 +458,9 @@ fn statement_placement(
         }
         Statement::CreateTable(create) => home(&create.name),
         Statement::CreateVirtualTable { name, .. } => home(name),
-        Statement::CreateIndex(index) => home(&index.table_name),
+        Statement::CreateIndex(index) => {
+            index.name.as_ref().map_or_else(|| home(&index.table_name), home)
+        }
         Statement::AlterTable(alter) => home(&alter.name),
         Statement::CreateView(view) => home(&view.name),
         Statement::Drop {
@@ -535,6 +537,9 @@ fn place_statement(
                     Placement::Temp => *name = qualified(name, "temp"),
                     Placement::Main => {}
                 }
+            }
+            if index.table_name.0.len() > 1 {
+                index.table_name.0.drain(..index.table_name.0.len() - 1);
             }
             placement
         }

@@ -630,7 +630,6 @@ impl crate::traits::translator::TranslatorWithContext for CreateIndex {
         } else {
             sqlite_table_name
         };
-        let indexed_table = sqlite_unqualified_object_name(&backing_table);
         let definition_options = options.without_subqueries();
         let options = &definition_options;
         let columns = self
@@ -647,7 +646,7 @@ impl crate::traits::translator::TranslatorWithContext for CreateIndex {
         let companion = if self.unique && self.nulls_distinct == Some(false) {
             companion_index(
                 &last_ident_value_or_display(name),
-                &indexed_table,
+                &backing_table,
                 &columns,
                 indexed_source,
                 schema,
@@ -662,9 +661,9 @@ impl crate::traits::translator::TranslatorWithContext for CreateIndex {
         // fields (only, using, concurrently, include, nulls_distinct, with,
         // index_options, alter_options) that are not valid in SQLite.
         let mut statements = vec![Statement::CreateIndex(CreateIndex {
-            name: Some(name.clone()),
+            name: Some(sqlite_unqualified_object_name(name)),
             only: false,
-            table_name: indexed_table,
+            table_name: backing_table,
             using: None,
             columns,
             unique: self.unique,
@@ -679,6 +678,14 @@ impl crate::traits::translator::TranslatorWithContext for CreateIndex {
             alter_options: vec![],
         })];
         statements.extend(companion);
+        for statement in &mut statements {
+            if let Statement::CreateIndex(index) = statement
+                && index.table_name.0.len() > 1
+                && let Some(name) = &mut index.name
+            {
+                name.0.insert(0, index.table_name.0[0].clone());
+            }
+        }
         Ok(statements)
     }
 }

@@ -191,3 +191,99 @@ fn temporary_trigger_writes_qualified_temporary_table() {
     );
     assert_eq!(rows, vec![Some("updated".to_string())]);
 }
+
+#[test]
+fn shadowed_tables_keep_unique_indexes_on_their_owners() {
+    for temporary_index in ["scratch_id", "scratch_tag"] {
+        let rows = run_translated_default(&format!(
+            "CREATE TABLE scratch (id INTEGER, tag INTEGER);
+             CREATE TEMP TABLE scratch (id INTEGER, tag INTEGER);
+             CREATE UNIQUE INDEX scratch_id ON public.scratch(id);
+             CREATE UNIQUE INDEX {temporary_index} ON scratch(tag);
+             INSERT INTO public.scratch VALUES (1,10),(1,20),(2,10) ON CONFLICT DO NOTHING;
+             INSERT INTO scratch VALUES (1,10),(1,20),(2,10) ON CONFLICT DO NOTHING;
+             SELECT sum(id) FROM public.scratch UNION ALL SELECT sum(id) FROM scratch;"
+        ));
+        assert_eq!(rows, vec![Some("3".to_string()), Some("2".to_string())]);
+    }
+}
+
+#[test]
+fn dropping_shadowing_index_preserves_permanent_unique_index() {
+    let rows = run_translated_default(
+        "CREATE TABLE scratch (id INTEGER, tag INTEGER);
+         CREATE TEMP TABLE scratch (id INTEGER, tag INTEGER);
+         CREATE UNIQUE INDEX scratch_id ON public.scratch(id);
+         CREATE UNIQUE INDEX scratch_id ON scratch(tag);
+         INSERT INTO public.scratch VALUES (1,10),(1,20),(2,10) ON CONFLICT DO NOTHING;
+         INSERT INTO scratch VALUES (1,10),(1,20),(2,10) ON CONFLICT DO NOTHING;
+         DROP INDEX scratch_id;
+         INSERT INTO scratch VALUES (2,10);
+         INSERT INTO public.scratch VALUES (1,30) ON CONFLICT DO NOTHING;
+         SELECT count(*) FROM public.scratch UNION ALL SELECT count(*) FROM scratch;",
+    );
+    assert_eq!(rows, vec![Some("2".to_string()), Some("3".to_string())]);
+}
+
+#[test]
+fn dropping_qualified_permanent_index_preserves_temporary_unique_index() {
+    let rows = run_translated_default(
+        "CREATE TABLE scratch (id INTEGER, tag INTEGER);
+         CREATE TEMP TABLE scratch (id INTEGER, tag INTEGER);
+         CREATE UNIQUE INDEX scratch_id ON public.scratch(id);
+         CREATE UNIQUE INDEX scratch_id ON scratch(tag);
+         INSERT INTO public.scratch VALUES (1,10);
+         INSERT INTO scratch VALUES (1,10);
+         DROP INDEX public.scratch_id;
+         INSERT INTO public.scratch VALUES (1,30);
+         INSERT INTO scratch VALUES (2,10) ON CONFLICT DO NOTHING;
+         SELECT count(*) FROM public.scratch UNION ALL SELECT count(*) FROM scratch;",
+    );
+    assert_eq!(rows, vec![Some("2".to_string()), Some("1".to_string())]);
+}
+
+#[test]
+fn shadowed_tables_allow_same_and_different_index_names() {
+    for temporary_index in ["scratch_id", "scratch_tag"] {
+        for temporary_first in [false, true] {
+            let permanent = "CREATE INDEX scratch_id ON public.scratch(id);";
+            let temporary = format!("CREATE INDEX {temporary_index} ON scratch(tag);");
+            let indexes = if temporary_first {
+                format!("{temporary} {permanent}")
+            } else {
+                format!("{permanent} {temporary}")
+            };
+            let rows = run_translated_default(&format!(
+                "CREATE TABLE scratch (id INTEGER, tag INTEGER);
+                 CREATE TEMP TABLE scratch (id INTEGER, tag INTEGER);
+                 {indexes}
+                 SELECT count(*) FROM public.scratch UNION ALL SELECT count(*) FROM scratch;"
+            ));
+            assert_eq!(rows, vec![Some("0".to_string()), Some("0".to_string())]);
+        }
+    }
+}
+
+#[test]
+fn dropping_temporary_indexes_reveals_permanent_index() {
+    for (temporary_index, dropped_index) in [
+        ("scratch_id", "scratch_id"),
+        ("scratch_id", "pg_temp.scratch_id"),
+        ("scratch_tag", "scratch_tag"),
+    ] {
+        let rows = run_translated_default(&format!(
+            "CREATE TABLE scratch (id INTEGER);
+             CREATE TEMP TABLE scratch (id INTEGER);
+             CREATE UNIQUE INDEX scratch_id ON public.scratch(id);
+             CREATE UNIQUE INDEX {temporary_index} ON scratch(id);
+             INSERT INTO public.scratch VALUES (1);
+             INSERT INTO scratch VALUES (1);
+             DROP INDEX {dropped_index};
+             DROP INDEX scratch_id;
+             INSERT INTO public.scratch VALUES (1);
+             INSERT INTO scratch VALUES (1);
+             SELECT count(*) FROM public.scratch UNION ALL SELECT count(*) FROM scratch;"
+        ));
+        assert_eq!(rows, vec![Some("2".to_string()), Some("2".to_string())]);
+    }
+}
