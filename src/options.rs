@@ -750,9 +750,9 @@ impl<'a> TranslationContext<'a> {
 
     /// The context the set a helper call returns translates under. A function
     /// body sees none of the query calling it, so its scope, `WITH` clause,
-    /// variables, trigger rows and row locks stay out, and the set reads the
-    /// schema as it stands. Boxed so the recursion through a helper's set
-    /// holds no copy of it.
+    /// variables, trigger rows, trigger catalog, row locks and declaration
+    /// stay out, and the set reads the schema as it stands. Boxed so the
+    /// recursion through a helper's set holds no copy of it.
     pub(crate) fn helper_body(&self) -> Box<TranslationContext<'_>> {
         Box::new(TranslationContext {
             options: Cow::Borrowed(self.options.as_ref()),
@@ -768,8 +768,10 @@ impl<'a> TranslationContext<'a> {
             running_as: self.running_as,
             inlined_body: self.inlined_body,
             trigger_rows: None,
+            trigger_catalog: None,
             locked: &[],
             locks_whole_query: false,
+            declaration: None,
         })
     }
 
