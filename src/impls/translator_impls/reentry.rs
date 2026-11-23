@@ -50,6 +50,7 @@ use core::ops::ControlFlow;
 use sql_traits::{
     structs::ParserDB,
     traits::{DatabaseLike, TableLike, TriggerLike},
+    utils::identifier_resolution::is_temporary_schema,
 };
 use sqlparser::ast::{
     AlterTable, AlterTableOperation, BinaryOperator, CreateTrigger, DataType, Expr, Ident,
@@ -57,6 +58,7 @@ use sqlparser::ast::{
     TriggerPeriod, helpers::attached_token::AttachedToken, visit_relations,
 };
 
+use super::trigger_slots::{TableKey, renamed_owner};
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
 use crate::{
@@ -135,14 +137,29 @@ impl MaintainedEvent {
     }
 }
 
-/// The marker table of `table`, which SQLite names without a schema.
+/// The marker table in its owner's SQLite namespace.
 pub(crate) fn marker_table(table: &ObjectName) -> ObjectName {
-    append_suffix(&ObjectName(table.0.last().cloned().into_iter().collect()), SUFFIX)
+    marker_name(table, SUFFIX)
 }
 
-/// The named table of `table`, which SQLite names without a schema.
+/// The named table in its owner's SQLite namespace.
 pub(crate) fn named_table(table: &ObjectName) -> ObjectName {
-    append_suffix(&ObjectName(table.0.last().cloned().into_iter().collect()), NAMED_SUFFIX)
+    marker_name(table, NAMED_SUFFIX)
+}
+
+fn marker_name(table: &ObjectName, suffix: &str) -> ObjectName {
+    let mut name =
+        append_suffix(&ObjectName(table.0.last().cloned().into_iter().collect()), suffix);
+    if table.0.len() > 1
+        && table
+            .0
+            .first()
+            .and_then(ObjectNamePart::as_ident)
+            .is_some_and(|schema| is_temporary_schema(&schema.value, schema.quote_style.is_some()))
+    {
+        name.0.insert(0, ObjectNamePart::Identifier(Ident::new("temp")));
+    }
+    name
 }
 
 /// Deletes the records of the row a `BEFORE UPDATE` trigger skips that no
@@ -226,7 +243,7 @@ pub(crate) fn unmark(marker: &ObjectName) -> Statement {
 
 /// The marker table of `table`'s view's forwarding insert.
 pub(crate) fn forward_marker_table(table: &ObjectName) -> ObjectName {
-    append_suffix(&ObjectName(table.0.last().cloned().into_iter().collect()), FORWARD_SUFFIX)
+    marker_name(table, FORWARD_SUFFIX)
 }
 
 /// Records in `marker` that the view is forwarding a row.
@@ -271,8 +288,23 @@ pub(crate) fn is_marker_table(name: &ObjectName) -> bool {
 
 /// The folded name SQLite files `name` under, which the marker tables are
 /// followed by.
-fn table_key(name: &ObjectName) -> String {
-    last_ident_value_or_display(name).to_ascii_lowercase()
+fn table_key(name: &ObjectName) -> TableKey {
+    TableKey {
+        temporary: is_temporary_marker(name),
+        name: last_ident_value_or_display(name).to_ascii_lowercase(),
+    }
+}
+
+fn is_temporary_marker(name: &ObjectName) -> bool {
+    name.0.len() > 1
+        && name.0[0].as_ident().is_some_and(|schema| schema.value.eq_ignore_ascii_case("temp"))
+}
+
+fn qualify_marker(mut marker: ObjectName) -> ObjectName {
+    if marker.0.len() == 1 {
+        marker.0.insert(0, ObjectNamePart::Identifier(Ident::new("main")));
+    }
+    marker
 }
 
 /// The marker tables the replica has, followed through a batch so that each
@@ -280,10 +312,10 @@ fn table_key(name: &ObjectName) -> String {
 #[derive(Default)]
 pub(crate) struct MarkerTables {
     /// Created by a statement of the batch, by folded marker table name.
-    created: BTreeSet<String>,
+    created: BTreeSet<TableKey>,
     /// Created by the translation of the schema the batch starts from, by
     /// folded marker table name.
-    inherited: BTreeSet<String>,
+    inherited: BTreeSet<TableKey>,
 }
 
 impl MarkerTables {
@@ -354,7 +386,7 @@ impl MarkerTables {
                 for marker in names.iter().flat_map(markers_of) {
                     let key = table_key(&marker);
                     if self.created.remove(&key) | self.inherited.remove(&key) {
-                        emitted.push(ast_builder::drop_table(marker, true));
+                        emitted.push(ast_builder::drop_table(qualify_marker(marker), true));
                     }
                 }
             }
@@ -363,7 +395,8 @@ impl MarkerTables {
     }
 
     fn rename(&mut self, from: &ObjectName, to: &ObjectName, emitted: &mut Vec<Statement>) {
-        for (marker, renamed) in markers_of(from).into_iter().zip(markers_of(to)) {
+        let to = renamed_owner(from, to);
+        for (marker, renamed) in markers_of(from).into_iter().zip(markers_of(&to)) {
             let key = table_key(&marker);
             if self.inherited.remove(&key) {
                 emitted.push(create(marker.clone()));
@@ -372,9 +405,11 @@ impl MarkerTables {
             }
             self.created.insert(table_key(&renamed));
             emitted.push(Statement::AlterTable(AlterTable {
-                name: marker,
+                name: qualify_marker(marker),
                 operations: vec![AlterTableOperation::RenameTable {
-                    table_name: RenameTableNameKind::To(renamed),
+                    table_name: RenameTableNameKind::To(ObjectName(
+                        renamed.0.last().cloned().into_iter().collect(),
+                    )),
                 }],
                 if_exists: false,
                 only: false,
@@ -435,5 +470,10 @@ fn create(marker: ObjectName) -> Statement {
             ),
         ]
     };
-    ast_builder::create_table(marker, columns)
+    let temporary = is_temporary_marker(&marker);
+    let mut statement = ast_builder::create_table(marker, columns);
+    if let Statement::CreateTable(create) = &mut statement {
+        create.temporary = temporary;
+    }
+    statement
 }

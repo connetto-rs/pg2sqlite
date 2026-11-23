@@ -1217,22 +1217,13 @@ impl Pg2Sqlite {
         schema: &ParserDB,
         name: &ObjectName,
     ) -> Result<Option<ObjectName>, crate::errors::Error> {
-        use sql_traits::traits::TableLike;
-
         let Some(table) = crate::impls::object_name::resolve_translation_table(schema, name)?
         else {
             return Ok(None);
         };
         let mut owner = table.name.clone();
         if owner.0.len() == 1 {
-            owner.0.insert(
-                0,
-                ObjectNamePart::Identifier(Ident::new(if table.is_temporary() {
-                    "pg_temp"
-                } else {
-                    "public"
-                })),
-            );
+            owner.0.insert(0, ObjectNamePart::Identifier(Ident::new("public")));
         }
         Ok(Some(owner))
     }

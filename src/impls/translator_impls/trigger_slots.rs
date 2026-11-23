@@ -958,17 +958,11 @@ impl TriggerSlots {
         for slot in affected {
             if self.is_framed(&slot) {
                 let (created, twins) = self.frame(&slot, own, own_parts, schema, context)?;
-                let name = created.iter().rev().find_map(|statement| {
-                    match statement {
-                        Statement::CreateTrigger(trigger) => Some(trigger.name.clone()),
-                        _ => None,
-                    }
-                });
-                statements.extend(created);
-                self.frames.insert(slot.clone(), twins);
-                if let Some(name) = name {
-                    self.names.insert(slot, name);
+                if let Some(Statement::CreateTrigger(trigger)) = created.last() {
+                    self.names.insert(slot.clone(), trigger.name.clone());
                 }
+                statements.extend(created);
+                self.frames.insert(slot, twins);
                 continue;
             }
             if unframed.contains(&slot) {
