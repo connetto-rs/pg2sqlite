@@ -1,6 +1,7 @@
 //! Implementations of traits defined in `traits.rs` are defined here.
 
 pub(crate) mod ast_builder;
+pub(crate) mod batch_cache;
 pub(crate) mod bind_once;
 pub(crate) mod column_access;
 pub(crate) mod cursor_budget;

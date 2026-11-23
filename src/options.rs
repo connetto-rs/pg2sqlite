@@ -259,9 +259,9 @@ pub(crate) struct PrewalkCatalogs {
     helper_sets: core::cell::RefCell<
         alloc::collections::BTreeMap<crate::impls::cursor_budget::HelperSetKey, Vec<String>>,
     >,
-    /// The helper sets translated so far against the schemas the batch's
-    /// translation holds alive, boxed so every context stays as small.
-    helper_queries: Box<core::cell::RefCell<crate::impls::translator_impls::HelperQueries>>,
+    /// What the batch's translation works out once, kept for the schemas it
+    /// holds alive, boxed so every context stays as small.
+    batch_cache: Box<core::cell::RefCell<crate::impls::batch_cache::BatchCache>>,
 }
 
 /// A trigger on a table.
@@ -711,12 +711,12 @@ impl<'a> TranslationContext<'a> {
         })
     }
 
-    /// The helper sets translated so far, kept for the schemas the batch's
-    /// translation holds alive.
-    pub(crate) fn helper_queries(
+    /// What the batch's translation worked out so far, kept for the schemas
+    /// it holds alive.
+    pub(crate) fn batch_cache(
         &self,
-    ) -> &core::cell::RefCell<crate::impls::translator_impls::HelperQueries> {
-        &self.catalogs.helper_queries
+    ) -> &core::cell::RefCell<crate::impls::batch_cache::BatchCache> {
+        &self.catalogs.batch_cache
     }
 
     /// The same context translating a row trigger whose table and events
@@ -1034,12 +1034,14 @@ impl<'a> TranslationContext<'a> {
     }
 
     /// Records the triggers the schema holds once the translation unit has
-    /// run.
+    /// run, forgetting the writes kept for the triggers recorded before.
     pub(crate) fn set_firing_triggers(
         &mut self,
         triggers: Vec<crate::impls::derived_writes::FiringTrigger>,
     ) {
-        self.catalogs.to_mut().firing_triggers = triggers;
+        let catalogs = self.catalogs.to_mut();
+        catalogs.firing_triggers = triggers;
+        catalogs.batch_cache.get_mut().function_writes.clear();
     }
 
     /// The triggers the schema holds once the translation unit has run.

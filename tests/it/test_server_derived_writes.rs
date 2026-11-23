@@ -1729,6 +1729,42 @@ $$;",
 }
 
 #[test]
+fn two_triggers_keeping_a_call_to_one_sql_writer_each_name_their_own_function() {
+    let pg = "
+CREATE TABLE notes (id INTEGER PRIMARY KEY, revision INTEGER NOT NULL);
+CREATE TABLE note_events (id INTEGER PRIMARY KEY, note_id INTEGER NOT NULL);
+CREATE FUNCTION log_note(note INTEGER) RETURNS INTEGER LANGUAGE sql AS $$
+  INSERT INTO note_events (note_id) VALUES (note) RETURNING note_id
+$$;
+CREATE FUNCTION first_log() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF log_note(NEW.id) IS NULL THEN
+    RAISE EXCEPTION 'unlogged';
+  END IF;
+  RETURN NULL;
+END
+$$;
+CREATE FUNCTION second_log() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF log_note(NEW.id) IS NULL THEN
+    RAISE EXCEPTION 'unlogged';
+  END IF;
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER notes_first AFTER INSERT ON notes
+  FOR EACH ROW EXECUTE FUNCTION first_log();
+CREATE TRIGGER notes_second AFTER INSERT ON notes
+  FOR EACH ROW EXECUTE FUNCTION second_log();
+";
+    let shown = left_to_server_shown(pg);
+    for function in ["first_log", "second_log"] {
+        let reason = format!("{function}() calls log_note(), which runs INSERT on note_events");
+        assert!(shown.iter().any(|line| line.contains(&reason)), "{shown:?}");
+    }
+}
+
+#[test]
 fn a_read_inside_a_loop_after_its_removed_write_leaves_the_trigger_out() {
     let pg = notes_logged_with(
         "",

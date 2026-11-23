@@ -39,6 +39,7 @@ use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{
+        batch_cache::address,
         column_access::{from_names, holds},
         function_helpers::{query_projection, simple_function_expr, string_literal},
         object_name::{declared_column_ident, last_ident},
@@ -315,7 +316,10 @@ fn helper_query(
     helpers.append(&mut lowering.called);
     options.record_helper_set(&lowered, helpers);
     if let Some(call) = call {
-        options.helper_queries().borrow_mut().keep(call, &lowered, &warnings);
+        let mut cache = options.batch_cache().borrow_mut();
+        if cache.holds(call.schema) {
+            cache.helper_queries.keep(call, &lowered, &warnings);
+        }
     }
     raise(warnings, emit);
     Ok(lowered)
@@ -327,8 +331,8 @@ fn kept_query(
     caller: &TranslationContext<'_>,
     emit: WarningSink<'_>,
 ) -> Option<Query> {
-    let queries = caller.helper_queries().borrow();
-    let kept = queries.get(call)?;
+    let cache = caller.batch_cache().borrow();
+    let kept = cache.helper_queries.get(call)?;
     for warning in &kept.warnings {
         emit(warning.clone());
     }
@@ -345,44 +349,26 @@ fn raise(warnings: Vec<TranslationWarning>, emit: WarningSink<'_>) {
 /// The helper sets translated against the schemas a batch's translation
 /// holds alive, so a call repeated across its policies translates once.
 #[derive(Default, Clone)]
-pub(crate) struct HelperQueries {
-    /// The addresses of the schemas sets are kept for.
-    schemas: Vec<usize>,
-    translated: BTreeMap<Box<HelperCall>, TranslatedSet>,
-}
+pub(crate) struct HelperQueries(BTreeMap<Box<HelperCall>, TranslatedSet>);
 
 impl HelperQueries {
-    /// Keeps the sets translated against `schemas`, which the caller holds
-    /// alive until it calls [`Self::forget`].
-    pub(crate) fn keep_for<'s>(&mut self, schemas: impl IntoIterator<Item = &'s ParserDB>) {
-        self.schemas.extend(schemas.into_iter().map(|schema| core::ptr::from_ref(schema).addr()));
-    }
-
-    /// Forgets every schema and set kept, before a schema kept for is freed.
-    pub(crate) fn forget(&mut self) {
-        self.schemas.clear();
-        self.translated.clear();
-    }
-
     fn get(&self, call: &HelperCall) -> Option<&TranslatedSet> {
-        self.translated.get(call)
+        self.0.get(call)
     }
 
-    /// Keeps `query` and `warnings` for `call` when its schema is kept for.
+    /// Keeps `query` and `warnings` for `call`.
     #[cfg_attr(feature = "std", recursive::recursive)]
     fn keep(&mut self, call: Box<HelperCall>, query: &Query, warnings: &[TranslationWarning]) {
-        if self.schemas.contains(&call.schema) {
-            let mut nesting = Nesting { depth: 0, deepest: 0 };
-            let ControlFlow::Continue(()) = sqlparser::ast::Visit::visit(query, &mut nesting);
-            self.translated.insert(
-                call,
-                TranslatedSet {
-                    query: copied(query, nesting.deepest),
-                    nesting: nesting.deepest,
-                    warnings: warnings.to_vec(),
-                },
-            );
-        }
+        let mut nesting = Nesting { depth: 0, deepest: 0 };
+        let ControlFlow::Continue(()) = sqlparser::ast::Visit::visit(query, &mut nesting);
+        self.0.insert(
+            call,
+            TranslatedSet {
+                query: copied(query, nesting.deepest),
+                nesting: nesting.deepest,
+                warnings: warnings.to_vec(),
+            },
+        );
     }
 }
 
@@ -441,8 +427,8 @@ fn helper_call(
         return None;
     }
     Some(Box::new(HelperCall {
-        schema: core::ptr::from_ref(schema).addr(),
-        helper: core::ptr::from_ref(helper).addr(),
+        schema: address(schema),
+        helper: address(helper),
         name: name.clone(),
         arguments: arguments?.to_vec(),
         names: names.to_vec(),
