@@ -26,6 +26,7 @@ use crate::{
         ArrayRepresentation, CaseFoldFunctions, JsonbFunctions, SessionVariableMapping,
         TimeZoneFunctions, UuidRepresentation,
     },
+    warnings::DeclaredObject,
 };
 
 type Role = <ParserDB as DatabaseLike>::Role;
@@ -374,6 +375,29 @@ pub struct TranslationContext<'a> {
     /// Whether the query about to be translated sits in a locked `FROM` item,
     /// which locks every item of its own `FROM`.
     locks_whole_query: bool,
+    /// The declaration whose expressions a warning names, `None` for a query
+    /// or a write.
+    declaration: Option<Declaration<'a>>,
+}
+
+/// A declaration whose expressions a translation reads.
+#[derive(Clone, Copy)]
+pub(crate) enum Declaration<'a> {
+    /// A statement, which names an object when it declares or alters one.
+    Statement(&'a sqlparser::ast::Statement),
+    /// A row level security policy, whose expressions are translated under
+    /// whichever statement builds its table's view and triggers.
+    Policy(&'a sqlparser::ast::CreatePolicy),
+}
+
+impl Declaration<'_> {
+    /// The object it declares, `None` for a statement that declares none.
+    fn object(self) -> Option<DeclaredObject> {
+        match self {
+            Self::Statement(statement) => DeclaredObject::of_statement(statement),
+            Self::Policy(policy) => Some(DeclaredObject::of_policy(policy)),
+        }
+    }
 }
 
 /// A `LANGUAGE sql` function whose body is being translated in place of a
@@ -406,6 +430,7 @@ struct ContextFields<'a> {
     trigger_rows: Option<TriggerRows<'a>>,
     locked: &'a [usize],
     locks_whole_query: bool,
+    declaration: Option<Declaration<'a>>,
 }
 
 impl<'a> ContextFields<'a> {
@@ -424,6 +449,7 @@ impl<'a> ContextFields<'a> {
             trigger_rows: context.trigger_rows,
             locked: context.locked,
             locks_whole_query: context.locks_whole_query,
+            declaration: context.declaration,
         }
     }
 
@@ -450,6 +476,7 @@ impl<'a> ContextFields<'a> {
             trigger_rows: self.trigger_rows,
             locked: self.locked,
             locks_whole_query: self.locks_whole_query,
+            declaration: self.declaration,
         }
     }
 }
@@ -475,6 +502,7 @@ impl<'a> TranslationContext<'a> {
             trigger_rows: None,
             locked: &[],
             locks_whole_query: false,
+            declaration: None,
         }
     }
     pub(crate) fn with_complete_schema(options: &'a Pg2SqliteOptions) -> Self {
@@ -501,6 +529,7 @@ impl<'a> TranslationContext<'a> {
             trigger_rows: None,
             locked: &[],
             locks_whole_query: false,
+            declaration: None,
         }
     }
 
@@ -604,6 +633,22 @@ impl<'a> TranslationContext<'a> {
         let mut fields = ContextFields::borrowed(self);
         fields.with = with;
         fields.into_context(self.scope, self.outer)
+    }
+
+    /// The same context translating the expressions of `declaration`.
+    pub(crate) fn with_declaration<'s>(
+        &'s self,
+        declaration: Declaration<'s>,
+    ) -> TranslationContext<'s> {
+        let mut fields = ContextFields::borrowed(self);
+        fields.declaration = Some(declaration);
+        fields.into_context(self.scope, self.outer)
+    }
+
+    /// The object whose expressions are being translated, `None` for a query
+    /// or a write.
+    pub(crate) fn declared_object(&self) -> Option<DeclaredObject> {
+        self.declaration.and_then(Declaration::object)
     }
 
     /// The same context noting the PL/pgSQL variables in scope.

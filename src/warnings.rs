@@ -24,9 +24,11 @@
 //! Do not add a fourth mechanism. There are three outcomes, plus that closed
 //! list.
 
+use sqlparser::ast::{CreatePolicy, Statement};
+
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
-use crate::script::Script;
+use crate::{impls::object_name::last_ident_value_or_display, script::Script};
 
 /// A warning emitted during translation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,8 +77,8 @@ pub enum TranslationWarning {
         from: String,
         /// What was emitted in its place, such as `"TEXT"`.
         to: String,
-        /// Where it was declared. Currently the column name.
-        location: String,
+        /// Where the downgrade happened.
+        location: DowngradeLocation,
         /// What the emitted form no longer does.
         reason: String,
     },
@@ -173,6 +175,134 @@ pub enum TranslationWarning {
         /// The table it is declared on, as written.
         writer_table: String,
     },
+}
+
+/// Where a [`TranslationWarning::LossyDowngrade`] happened, each name being
+/// the last identifier as written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DowngradeLocation {
+    /// A column whose declared type was downgraded.
+    Column {
+        /// The table declaring the column.
+        table: String,
+        /// The column.
+        column: String,
+    },
+    /// A declared object that lost one of its clauses.
+    Object(DeclaredObject),
+    /// An expression translated into one that reads its operand differently.
+    Expression {
+        /// The declared object whose statement holds the expression, a
+        /// function body counting as its caller's, `None` for a query or a
+        /// write.
+        object: Option<DeclaredObject>,
+        /// The expression as written.
+        text: String,
+    },
+    /// Every connection that writes to the replica, for a downgrade that
+    /// connection state decides rather than any declared object.
+    Script,
+}
+
+/// A declared object, as a [`DowngradeLocation`] names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeclaredObject {
+    /// A table, which also holds the expressions of an index declared
+    /// without a name.
+    Table {
+        /// The table.
+        name: String,
+    },
+    /// A view.
+    View {
+        /// The view.
+        name: String,
+    },
+    /// An index.
+    Index {
+        /// The indexed table.
+        table: String,
+        /// The index.
+        name: String,
+    },
+    /// A row level security policy.
+    Policy {
+        /// The table the policy is declared on.
+        table: String,
+        /// The policy.
+        name: String,
+    },
+    /// A trigger, which also holds the body of the function it executes.
+    Trigger {
+        /// The table or view the trigger fires on.
+        table: String,
+        /// The trigger.
+        name: String,
+    },
+}
+
+impl DeclaredObject {
+    /// The object `statement` declares or alters, `None` for a statement
+    /// that names none.
+    pub(crate) fn of_statement(statement: &Statement) -> Option<Self> {
+        match statement {
+            Statement::CreateTable(create_table) => {
+                Some(Self::Table { name: last_ident_value_or_display(&create_table.name) })
+            }
+            Statement::AlterTable(alter_table) => {
+                Some(Self::Table { name: last_ident_value_or_display(&alter_table.name) })
+            }
+            Statement::CreateView(create_view) => {
+                Some(Self::View { name: last_ident_value_or_display(&create_view.name) })
+            }
+            Statement::CreateIndex(create_index) => {
+                let table = last_ident_value_or_display(&create_index.table_name);
+                Some(match &create_index.name {
+                    Some(name) => Self::Index { table, name: last_ident_value_or_display(name) },
+                    None => Self::Table { name: table },
+                })
+            }
+            Statement::CreateTrigger(create_trigger) => {
+                Some(Self::Trigger {
+                    table: last_ident_value_or_display(&create_trigger.table_name),
+                    name: last_ident_value_or_display(&create_trigger.name),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// `policy`, by its table and name.
+    pub(crate) fn of_policy(policy: &CreatePolicy) -> Self {
+        Self::Policy {
+            table: last_ident_value_or_display(&policy.table_name),
+            name: policy.name.value.clone(),
+        }
+    }
+}
+
+impl core::fmt::Display for DowngradeLocation {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Column { table, column } => write!(f, "{table}.{column}"),
+            Self::Object(object) => write!(f, "{object}"),
+            Self::Expression { object: Some(object), text } => write!(f, "{text} in {object}"),
+            Self::Expression { object: None, text } => write!(f, "{text}"),
+            Self::Script => write!(f, "every connection that writes"),
+        }
+    }
+}
+
+impl core::fmt::Display for DeclaredObject {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Table { name } => write!(f, "table {name}"),
+            Self::View { name } => write!(f, "view {name}"),
+            Self::Index { table, name } => write!(f, "index {name} on {table}"),
+            Self::Policy { table, name } => write!(f, "policy {name} on {table}"),
+            Self::Trigger { table, name } => write!(f, "trigger {name} on {table}"),
+        }
+    }
 }
 
 /// Where a translation reports the steps that lost something.

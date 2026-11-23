@@ -1,5 +1,5 @@
 //! Implementation of the [`Translator`](crate::traits::Translator) trait for
-//! the `IndexColumn` type.
+//! the `IndexColumn` type of a `PRIMARY KEY` or `UNIQUE` constraint.
 
 use sqlparser::ast::IndexColumn;
 
@@ -15,25 +15,12 @@ impl crate::traits::translator::TranslatorWithContext for IndexColumn {
         options: &crate::options::TranslationContext<'_>,
         emit: &mut dyn FnMut(crate::warnings::TranslationWarning),
     ) -> Result<Self::SQLiteEntry, crate::errors::Error> {
-        // SQLite has no operator classes, so the clause cannot be emitted:
-        // `CREATE INDEX i ON t (s text_pattern_ops)` is `near
-        // "text_pattern_ops": syntax error`. Dropping it does not change which
-        // rows the database accepts, even on a UNIQUE index, where an opclass
-        // is the one thing that could: PostgreSQL's pattern classes compare
-        // bitwise while the default compares by collation, and those disagree
-        // only under a nondeterministic collation, which `Expr::Collate`
-        // already refuses.
         if let Some(operator_class) = &self.operator_class {
-            emit(crate::warnings::TranslationWarning::LossyDowngrade {
-                construct: "index operator class".to_string(),
-                from: format!("{} {operator_class}", self.column),
-                to: self.column.to_string(),
-                location: self.column.to_string(),
-                reason: "SQLite has no operator classes, so the index serves fewer queries than \
-             the PostgreSQL one, notably the pattern matches a text pattern class \
-             exists for."
-                    .to_string(),
-            });
+            return Err(crate::errors::Error::forward_refusal(format!(
+                "PostgreSQL refuses the operator class {operator_class} on {} in a PRIMARY KEY or \
+                 UNIQUE constraint, so declare it on a CREATE INDEX instead.",
+                self.column
+            )));
         }
 
         // Every field is listed, with no `..self.clone()`, so a field added

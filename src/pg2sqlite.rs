@@ -38,7 +38,7 @@ use crate::{
             trigger_slots::{TriggerSlots, folded},
         },
     },
-    options::{Pg2SqliteOptions, TranslationContext},
+    options::{Declaration, Pg2SqliteOptions, TranslationContext},
     prelude::ReverseTranslator,
     script::Script,
     traits::translator::TranslatorWithContext,
@@ -365,7 +365,7 @@ fn foreign_key_pragma_warning() -> crate::warnings::TranslationWarning {
         construct: "FOREIGN KEY".to_string(),
         from: "always enforced".to_string(),
         to: "enforced under PRAGMA foreign_keys".to_string(),
-        location: "every connection that writes".to_string(),
+        location: crate::warnings::DowngradeLocation::Script,
         reason: "SQLite enforces a foreign key only while the connection carries PRAGMA \
                  foreign_keys = ON, which is off by default and is connection state rather than \
                  database state. The script's setup part sets it, and every connection that \
@@ -590,6 +590,7 @@ impl Trackers {
             attachments: &self.attachments,
             in_transaction: at.in_transaction,
         });
+        let written = written.with_declaration(Declaration::Statement(statement));
         let ambiguous = column_access::resolve_columns(statement, at.binding, &written)?;
         column_access::with_ambiguity(
             ambiguous,

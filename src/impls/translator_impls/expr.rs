@@ -4949,7 +4949,9 @@ impl TranslateUnfinished for Expr {
                                 && awareness.is_none()
                                 && let Some(read) = casts::temporal_text_reader(kind)
                             {
-                                casts::warn_text_read_by_date_functions(expr, data_type, emit);
+                                casts::warn_text_read_by_date_functions(
+                                    expr, data_type, options, emit,
+                                );
                                 let read = match kind {
                                     crate::impls::temporal_literals::TemporalLiteralKind::Time {
                                         ..

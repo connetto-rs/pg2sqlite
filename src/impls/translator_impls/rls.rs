@@ -432,10 +432,10 @@ fn combine_policy_predicates(
     let terms = gate
         .permissive()
         .iter()
-        .map(|term| (false, term.expression()))
-        .chain(gate.restrictive().iter().map(|term| (true, term.expression())));
-    for (is_restrictive, expr) in terms {
-        let expr = expr.expression();
+        .map(|term| (false, term))
+        .chain(gate.restrictive().iter().map(|term| (true, term)));
+    for (is_restrictive, term) in terms {
+        let expr = term.expression().expression();
         let mut transformed =
             transform_expr(expr, options, table, schema, prefix, table_rename, facts);
         // Folded before translation so a substituted default lands as the same
@@ -470,7 +470,8 @@ fn combine_policy_predicates(
         } else {
             sql_traits::structs::ColumnScope::for_table(table, schema, IdentifierCase::AsWritten)
         };
-        let scoped = options.with_pseudo_row_scope(&policy_scope);
+        let declared = options.with_declaration(crate::options::Declaration::Policy(term.policy()));
+        let scoped = declared.with_pseudo_row_scope(&policy_scope);
         let mut transformed = transformed.translate_with_warnings(schema, &scoped, emit)?;
         if let Some(prefix) = prefix {
             fold_guard(&mut transformed, prefix, stored);

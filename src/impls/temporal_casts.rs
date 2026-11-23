@@ -25,7 +25,7 @@ use crate::{
         temporal_infinity::{InfiniteAnswer, guard},
         temporal_literals::{TemporalLiteralKind, temporal_literal_kind},
     },
-    warnings::{TranslationWarning, WarningSink},
+    warnings::{DowngradeLocation, TranslationWarning, WarningSink},
 };
 
 /// The temporal kind a non-literal cast operand carries, from its own spelling
@@ -318,17 +318,21 @@ fn read_subsec(function: &str, operand: Expr) -> Expr {
 }
 
 /// Reports that `operand` is read by SQLite's date functions on its way to
-/// `data_type`.
+/// `data_type`, in the object `options` translates.
 pub(crate) fn warn_text_read_by_date_functions(
     operand: &Expr,
     data_type: &DataType,
+    options: &crate::options::TranslationContext<'_>,
     emit: WarningSink<'_>,
 ) {
     emit(TranslationWarning::LossyDowngrade {
         construct: "CAST".to_string(),
         from: "PostgreSQL date and time input".to_string(),
         to: "SQLite's date functions".to_string(),
-        location: format!("CAST({operand} AS {data_type})"),
+        location: DowngradeLocation::Expression {
+            object: options.declared_object(),
+            text: format!("CAST({operand} AS {data_type})"),
+        },
         reason: "the value is text known only at run time, and SQLite's date functions read \
                  ISO 8601 text to milliseconds, answering NULL for any other spelling where \
                  PostgreSQL parses it or raises an error."
