@@ -458,7 +458,9 @@ impl<'l> Rows<'l> {
 
     /// The replacement of each column reference of `statement` that reads the
     /// view's row, through the `FROM` item at `target` or through a name the
-    /// statement gives the row, the view output it reads.
+    /// statement gives the row, the view output it reads. A reference already
+    /// reading that output on the written relation keeps the text it was
+    /// written with.
     fn replacements(
         &self,
         statement: &Statement,
@@ -467,13 +469,14 @@ impl<'l> Rows<'l> {
     ) -> Result<Vec<(usize, Expr)>, Error> {
         decide(statement, |expression| {
             let Some((_, binding)) = context.reference(expression)? else { return Ok(None) };
-            Ok(match binding.entry() {
+            let replacement = match binding.entry() {
                 Some(entry) if Some(address(entry.factor())) == target => {
                     self.target.get(entry.ordinal()).cloned()
                 }
                 Some(_) => None,
                 None => self.through_name(&binding),
-            })
+            };
+            Ok(replacement.filter(|replacement| !reads_the_same(expression, replacement)))
         })
     }
 
@@ -503,6 +506,33 @@ fn same_name(relation: &str, name: &Ident) -> bool {
     } else {
         relation.eq_ignore_ascii_case(&name.value)
     }
+}
+
+/// Whether `reference` reads the column `replacement` names on the written
+/// relation, the same column through the same qualifier or bare.
+fn reads_the_same(reference: &Expr, replacement: &Expr) -> bool {
+    let Expr::CompoundIdentifier(parts) = replacement else { return false };
+    let [qualifier, column] = parts.as_slice() else { return false };
+    match reference {
+        Expr::Identifier(name) => same_ident(name, column),
+        Expr::CompoundIdentifier(written) => {
+            matches!(written.as_slice(), [written_qualifier, name]
+                if written_qualifier == qualifier && same_ident(name, column))
+        }
+        _ => false,
+    }
+}
+
+/// Whether `left` and `right` name the same stored identifier, an unquoted
+/// one folded to lower case as PostgreSQL stores it.
+fn same_ident(left: &Ident, right: &Ident) -> bool {
+    stored_bytes(left).eq(stored_bytes(right))
+}
+
+/// The bytes of `ident` as PostgreSQL stores it.
+fn stored_bytes(ident: &Ident) -> impl Iterator<Item = u8> + '_ {
+    let quoted = ident.quote_style.is_some();
+    ident.value.bytes().map(move |byte| if quoted { byte } else { byte.to_ascii_lowercase() })
 }
 
 /// The view's condition and the statement's own, both holding.
