@@ -552,8 +552,7 @@ fn chain_disposition(
         if let Some(dependency) = chain.dependency.take() {
             return Ok(Disposition::LeftOut(dependency));
         }
-        let record = last_ident(&trigger.table_name).map(fold).unwrap_or_default();
-        if let Some(dependency) = firing::own_dependency(chain, &record, schema, options)? {
+        if let Some(dependency) = firing::own_dependency(trigger, chain, schema, options)? {
             return Ok(Disposition::LeftOut(dependency));
         }
         if let Some(construct) = chain.procedural {
@@ -562,7 +561,7 @@ fn chain_disposition(
                 first.reason()
             )));
         }
-        if chain.assigns_new {
+        if !chain.assigned.is_empty() {
             return Ok(Disposition::LeftOut(format!(
                 "{}() assigns NEW beside {}, which the server runs again when it applies the \
                  upload",

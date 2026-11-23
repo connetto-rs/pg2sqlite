@@ -2182,6 +2182,11 @@ fn a_lock_beside_a_removed_write_keeps_the_refusal() {
 struct TeamGrantees<'s> {
     /// The type of the kind columns.
     kind: &'s str,
+    /// The declaration of the kind of a team after its name, a generated
+    /// `'team'` when `None`.
+    team: Option<&'s str>,
+    /// When the copy fires, `AFTER` or `BEFORE`.
+    timing: &'s str,
     /// The statement copying a team into `grantees`.
     insert: &'s str,
     open: &'s str,
@@ -2193,6 +2198,8 @@ impl Default for TeamGrantees<'_> {
     fn default() -> Self {
         Self {
             kind: "grantee_kind",
+            team: None,
+            timing: "AFTER",
             insert: "INSERT INTO grantees (id, kind) VALUES (NEW.id, NEW.kind)",
             open: "SELECT count(*) FROM grantees grantee WHERE grantee.kind IN ('user', 'everyone')",
             extra: "",
@@ -2202,18 +2209,19 @@ impl Default for TeamGrantees<'_> {
 
 impl TeamGrantees<'_> {
     fn sql(&self) -> String {
-        let Self { kind, insert, open, extra } = self;
+        let Self { kind, team, timing, insert, open, extra } = self;
+        let generated = format!("{kind} GENERATED ALWAYS AS ('team'::{kind}) STORED NOT NULL");
+        let team = team.unwrap_or(&generated);
         format!(
             "
 CREATE TYPE grantee_kind AS ENUM ('user', 'team', 'everyone');
 CREATE TABLE grantees (id INTEGER PRIMARY KEY, kind {kind} NOT NULL);
-CREATE TABLE teams (id INTEGER PRIMARY KEY,
-  kind {kind} GENERATED ALWAYS AS ('team'::{kind}) STORED NOT NULL);
+CREATE TABLE teams (id INTEGER PRIMARY KEY, kind {team});
 CREATE VIEW everyone AS SELECT id FROM grantees WHERE kind = 'everyone';
 CREATE FUNCTION insert_grantee() RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
   {insert};
-  RETURN NULL;
+  RETURN NEW;
 END
 $$;
 CREATE FUNCTION open_grantees() RETURNS BIGINT LANGUAGE sql STABLE AS $$
@@ -2227,7 +2235,7 @@ BEGIN
   RETURN NULL;
 END
 $$;
-CREATE TRIGGER teams_a_grantee AFTER INSERT ON teams FOR EACH ROW EXECUTE FUNCTION insert_grantee();
+CREATE TRIGGER teams_a_grantee {timing} INSERT ON teams FOR EACH ROW EXECUTE FUNCTION insert_grantee();
 CREATE TRIGGER teams_b_open AFTER INSERT ON teams FOR EACH ROW EXECUTE FUNCTION refuse_closed_team();
 {extra}"
         )
@@ -2331,6 +2339,88 @@ CREATE TRIGGER grantees_opened BEFORE INSERT ON grantees
         ..TeamGrantees::default()
     };
     assert!(!fixture.keeps_the_check());
+}
+
+const TEAM_CHECKED: &str = "grantee_kind NOT NULL DEFAULT 'team' CHECK (kind = 'team')";
+
+#[test]
+fn only_a_check_holding_the_column_to_one_label_lets_the_check_stay() {
+    for (team, kept) in [
+        (TEAM_CHECKED, true),
+        ("grantee_kind NOT NULL CHECK ('team'::grantee_kind = kind)", true),
+        ("grantee_kind NOT NULL, CHECK (kind = 'team')", true),
+        ("grantee_kind NOT NULL CHECK (kind = 'team' AND id > 0)", true),
+        ("grantee_kind NOT NULL CHECK ((kind = 'team') AND id > 0)", true),
+        ("grantee_kind NOT NULL CHECK (abs(id) = id AND kind = 'team')", true),
+        ("grantee_kind NOT NULL", false),
+        ("grantee_kind NOT NULL CHECK (kind = 'team' OR id > 0)", false),
+        ("grantee_kind NOT NULL CHECK (kind IN ('team', 'user'))", false),
+        ("grantee_kind NOT NULL CHECK (kind <> 'user')", false),
+        ("grantee_kind NOT NULL CHECK (NOT (kind = 'team'))", false),
+        ("grantee_kind NOT NULL CHECK (kind = kind)", false),
+    ] {
+        assert_eq!(
+            TeamGrantees { team: Some(team), ..TeamGrantees::default() }.keeps_the_check(),
+            kept,
+            "{team}"
+        );
+    }
+}
+
+/// A `BEFORE INSERT` trigger on teams named `name`, whose function `does`
+/// and then returns `returns`.
+fn team_trigger(name: &str, does: &str, returns: &str) -> String {
+    format!(
+        "
+CREATE FUNCTION {name}() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  {does}
+  RETURN {returns};
+END
+$$;
+CREATE TRIGGER {name} BEFORE INSERT ON teams FOR EACH ROW EXECUTE FUNCTION {name}();
+"
+    )
+}
+
+#[test]
+fn a_checked_label_holds_in_a_before_trigger_only_while_no_later_one_changes_or_skips_the_row() {
+    for (timing, extra, kept) in [
+        ("BEFORE", String::new(), true),
+        ("BEFORE", team_trigger("teams_0_kind", "NEW.kind := 'user';", "NEW"), true),
+        ("BEFORE", team_trigger("teams_b_id", "NEW.id := abs(NEW.id);", "NEW"), true),
+        ("BEFORE", team_trigger("teams_b_kind", "NEW.kind := 'team';", "NEW"), false),
+        ("BEFORE", team_trigger("teams_b_kind", "NEW := NEW;", "NEW"), false),
+        ("BEFORE", team_trigger("teams_b_skip", "", "NULL"), false),
+        ("AFTER", team_trigger("teams_b_kind", "NEW.kind := 'team';", "NEW"), true),
+    ] {
+        let fixture = TeamGrantees {
+            team: Some(TEAM_CHECKED),
+            timing,
+            extra: &extra,
+            ..TeamGrantees::default()
+        };
+        assert_eq!(fixture.keeps_the_check(), kept, "{timing} {extra}");
+    }
+}
+
+#[test]
+fn an_insert_doing_nothing_on_conflict_adds_only_the_rows_it_lists() {
+    for (insert, kept) in [
+        ("INSERT INTO grantees (id, kind) VALUES (NEW.id, NEW.kind) ON CONFLICT DO NOTHING", true),
+        (
+            "INSERT INTO grantees (id, kind) VALUES (NEW.id, NEW.kind) ON CONFLICT (id) DO NOTHING",
+            true,
+        ),
+        (
+            "INSERT INTO grantees (id, kind) VALUES (NEW.id, NEW.kind) \
+             ON CONFLICT (id) DO UPDATE SET kind = 'user'",
+            false,
+        ),
+    ] {
+        let fixture = TeamGrantees { insert, ..TeamGrantees::default() };
+        assert_eq!(fixture.keeps_the_check(), kept, "{insert}");
+    }
 }
 
 #[test]
@@ -2508,25 +2598,64 @@ CREATE POLICY children_seen ON children FOR SELECT TO app USING (children IS NOT
 }
 
 #[test]
-fn a_cascade_firing_a_trigger_that_assigns_the_child_row_is_left_out() {
-    let pg = cascaded_states(
-        EMPTY_CHILD,
-        "CREATE FUNCTION empty_child() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+fn a_read_takes_the_columns_of_only_the_policies_filtering_it() {
+    let policy = |command: &str| {
+        format!(
+            "ALTER TABLE children ENABLE ROW LEVEL SECURITY;
+CREATE POLICY children_open ON children FOR {command} TO app USING (parent_state <> 'archived');"
+        )
+    };
+    for (condition, command, left) in [
+        (EMPTY_CHILD, "UPDATE", KEY_ONLY),
+        (EMPTY_CHILD, "DELETE", KEY_ONLY),
+        (EMPTY_CHILD, "ALL", KEY_AND_CHECK),
+        (&format!("{EMPTY_CHILD} FOR UPDATE") as &str, "UPDATE", KEY_AND_CHECK),
+        (&format!("{EMPTY_CHILD} FOR SHARE") as &str, "UPDATE", KEY_AND_CHECK),
+        (&format!("{EMPTY_CHILD} FOR UPDATE") as &str, "DELETE", KEY_ONLY),
+    ] {
+        let pg = cascaded_states(condition, &policy(command));
+        assert_eq!(left_to_server_acting(&pg), owned(left), "{pg}");
+    }
+}
+
+/// The trigger `name` firing `BEFORE UPDATE` on `table`, whose function
+/// `does` and returns `NEW`.
+fn assigning(name: &str, table: &str, does: &str) -> String {
+    format!(
+        "CREATE FUNCTION {name}() RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
-    NEW.item := NULL;
+    {does}
     RETURN NEW;
 END;
 $$;
-CREATE TRIGGER children_emptied BEFORE UPDATE ON children
-    FOR EACH ROW EXECUTE FUNCTION empty_child();",
-    );
-    assert_eq!(
-        left_to_server_acting(&pg),
-        owned(&[
-            ("FOREIGN KEY", "(parent_id, parent_state) REFERENCES parents", "children"),
-            ("TRIGGER", "parents_check", "parents"),
-        ]),
-    );
+CREATE TRIGGER {name} BEFORE UPDATE ON {table}
+    FOR EACH ROW EXECUTE FUNCTION {name}();"
+    )
+}
+
+const KEY_ONLY: &[(&str, &str, &str)] =
+    &[("FOREIGN KEY", "(parent_id, parent_state) REFERENCES parents", "children")];
+
+const KEY_AND_CHECK: &[(&str, &str, &str)] = &[
+    ("FOREIGN KEY", "(parent_id, parent_state) REFERENCES parents", "children"),
+    ("TRIGGER", "parents_check", "parents"),
+];
+
+#[test]
+fn a_cascade_firing_a_child_trigger_changes_the_columns_it_assigns() {
+    for (does, left) in [
+        ("NEW.item := NULL;", KEY_AND_CHECK),
+        ("NEW := NEW;", KEY_AND_CHECK),
+        ("NEW.parent_state := trim(NEW.parent_state);", KEY_ONLY),
+        (
+            "NEW.parent_state := coalesce((SELECT parent.state FROM parents parent \
+             WHERE parent.id = NEW.parent_id), NEW.parent_state);",
+            KEY_ONLY,
+        ),
+    ] {
+        let pg = cascaded_states(EMPTY_CHILD, &assigning("children_assigned", "children", does));
+        assert_eq!(left_to_server_acting(&pg), owned(left), "{does}");
+    }
 }
 
 #[test]
@@ -2539,25 +2668,141 @@ fn a_check_calling_a_function_without_arguments_keeps_its_refusal() {
 }
 
 #[test]
-fn a_parent_trigger_that_assigns_the_row_cascades_every_key_column() {
-    let pg = cascaded_states(
-        EMPTY_CHILD,
-        "CREATE FUNCTION trim_state() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+fn a_parent_trigger_widens_the_cascade_by_the_key_columns_it_assigns() {
+    for (does, left) in [
+        ("NEW.state := trim(NEW.state);", KEY_ONLY),
+        ("NEW.id := abs(NEW.id);", KEY_AND_CHECK),
+        ("NEW := NEW;", KEY_AND_CHECK),
+    ] {
+        let pg = cascaded_states(EMPTY_CHILD, &assigning("parents_assigned", "parents", does));
+        assert_eq!(left_to_server_acting(&pg), owned(left), "{does}");
+    }
+}
+
+/// Whether the replica leaves `parents_check` of [`cascaded_states`] to the
+/// server.
+fn parents_check_left(pg: &str) -> bool {
+    left_to_server_acting(pg).iter().any(|(_, name, _)| name == "parents_check")
+}
+
+#[test]
+fn an_update_a_trigger_runs_changes_only_the_columns_it_sets() {
+    let reading_parents = format!(
+        "{EMPTY_CHILD} AND EXISTS (SELECT 1 FROM parents parent WHERE parent.id = child.parent_id \
+         AND parent.state = 'open')"
+    );
+    for (condition, set, left) in [
+        (EMPTY_CHILD, "touched = 1", false),
+        (EMPTY_CHILD, "touched = 1, state = state", false),
+        (EMPTY_CHILD, "id = id + 0", true),
+        (reading_parents.as_str(), "touched = 1", false),
+        (reading_parents.as_str(), "state = 'open'", true),
+    ] {
+        let pg = cascaded_states(
+            condition,
+            &format!(
+                "ALTER TABLE parents ADD COLUMN touched INT;
+CREATE FUNCTION touch_parent() RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
-    NEW.state := trim(NEW.state);
-    RETURN NEW;
+    UPDATE parents SET {set} WHERE id = NEW.id;
+    RETURN NULL;
 END;
 $$;
-CREATE TRIGGER parents_trimmed BEFORE UPDATE ON parents
-    FOR EACH ROW EXECUTE FUNCTION trim_state();",
-    );
-    assert_eq!(
-        left_to_server_acting(&pg),
-        owned(&[
-            ("FOREIGN KEY", "(parent_id, parent_state) REFERENCES parents", "children"),
-            ("TRIGGER", "parents_check", "parents"),
-        ]),
-    );
+CREATE TRIGGER parents_touched AFTER UPDATE ON parents
+    FOR EACH ROW WHEN (OLD.state IS DISTINCT FROM NEW.state) EXECUTE FUNCTION touch_parent();"
+            ),
+        );
+        assert_eq!(parents_check_left(&pg), left, "{condition} after SET {set}");
+    }
+}
+
+#[test]
+fn a_trigger_whose_when_needs_a_column_the_upload_cannot_change_never_fires_before_it() {
+    for (when, grant, left) in [
+        ("OLD.id IS DISTINCT FROM NEW.id", "", false),
+        ("OLD.id <> NEW.id", "", false),
+        ("(OLD.id) IS DISTINCT FROM NEW.id", "", false),
+        ("OLD.id IS DISTINCT FROM (NEW.id)", "", false),
+        ("OLD.id IS DISTINCT FROM NEW.id AND NEW.state = 'done'", "", false),
+        ("OLD.id IS DISTINCT FROM NEW.id", "GRANT UPDATE (id) ON parents TO app;", true),
+        ("NEW.state IS DISTINCT FROM OLD.state", "", true),
+        ("(OLD.id, OLD.state) IS DISTINCT FROM (NEW.id, NEW.state)", "", true),
+        ("OLD.id IS DISTINCT FROM NEW.id OR NEW.state = 'done'", "", true),
+        ("OLD IS DISTINCT FROM NEW", "", true),
+    ] {
+        let pg = cascaded_states(
+            EMPTY_CHILD,
+            &format!(
+                "CREATE FUNCTION drop_children() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    DELETE FROM children WHERE parent_id = OLD.id;
+    RETURN NULL;
+END;
+$$;
+CREATE TRIGGER parents_rekeyed AFTER UPDATE ON parents
+    FOR EACH ROW WHEN ({when}) EXECUTE FUNCTION drop_children();
+{grant}"
+            ),
+        );
+        assert_eq!(parents_check_left(&pg), left, "WHEN ({when}) {grant}");
+    }
+}
+
+/// Grants whose update touches the grantee's user, a trigger dropping the
+/// grantee of a user updated `when` so, which cascades to its grants, and a
+/// deferred check that some grant is still an admin.
+fn touched_users(set: &str, when: &str) -> String {
+    format!(
+        "
+CREATE TABLE users (id INT PRIMARY KEY, kind TEXT NOT NULL);
+CREATE TABLE grantees (id INT PRIMARY KEY);
+CREATE TABLE grants (id INT PRIMARY KEY,
+    grantee_id INT NOT NULL REFERENCES grantees (id) ON DELETE CASCADE, role TEXT NOT NULL);
+CREATE FUNCTION touch_user() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE users SET {set} WHERE id = NEW.grantee_id;
+    RETURN NULL;
+END;
+$$;
+CREATE FUNCTION drop_grantee() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    DELETE FROM grantees WHERE id = OLD.id;
+    RETURN NULL;
+END;
+$$;
+CREATE FUNCTION check_last_admin() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM grants held WHERE held.role = 'admin') THEN
+        RAISE EXCEPTION 'no admin is left' USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+CREATE TRIGGER grants_touched AFTER UPDATE ON grants
+    FOR EACH ROW EXECUTE FUNCTION touch_user();
+CREATE TRIGGER users_rekeyed AFTER UPDATE ON users
+    FOR EACH ROW WHEN ({when}) EXECUTE FUNCTION drop_grantee();
+CREATE CONSTRAINT TRIGGER grants_last_admin AFTER UPDATE OR DELETE ON grants
+    DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION check_last_admin();
+"
+    )
+}
+
+#[test]
+fn a_trigger_the_writes_before_a_check_cannot_fire_takes_nothing_from_it() {
+    for (set, when, left) in [
+        ("kind = kind", "OLD.id IS DISTINCT FROM NEW.id", false),
+        ("kind = kind", "OLD.kind IS DISTINCT FROM NEW.kind", false),
+        ("kind = upper(kind)", "OLD.id IS DISTINCT FROM NEW.id", false),
+        ("kind = upper(kind)", "OLD.kind IS DISTINCT FROM NEW.kind", true),
+        ("kind = upper(kind)", "OLD IS DISTINCT FROM NEW", true),
+        ("id = id + 0", "OLD.id IS DISTINCT FROM NEW.id", true),
+    ] {
+        let left_out = left_to_server(&touched_users(set, when))
+            .iter()
+            .any(|(_, name, _)| name == "grants_last_admin");
+        assert_eq!(left_out, left, "SET {set} WHEN ({when})");
+    }
 }
 
 #[test]

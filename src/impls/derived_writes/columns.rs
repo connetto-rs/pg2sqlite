@@ -10,9 +10,9 @@ use sql_traits::{
     traits::{DatabaseLike, PolicyLike, TableLike, ViewLike},
 };
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, JoinConstraint, ObjectName, Select,
-    SelectItem, SelectItemQualifiedWildcardKind, Statement, TableFactor, TableWithJoins, Visit,
-    Visitor,
+    CreatePolicyCommand, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, JoinConstraint,
+    ObjectName, Query, Select, SelectItem, SelectItemQualifiedWildcardKind, Statement, TableFactor,
+    TableWithJoins, Visit, Visitor,
 };
 
 #[cfg(not(feature = "std"))]
@@ -137,10 +137,12 @@ impl Visitor for Factors {
     }
 }
 
-/// What a node reads of each table it names.
+/// What a node reads of each table it names, and whether a query of it locks
+/// the rows it reads.
 struct Reads<'f> {
     factors: &'f [Factor],
     read: BTreeMap<String, Columns>,
+    locks: bool,
 }
 
 impl Reads<'_> {
@@ -224,6 +226,11 @@ impl Visitor for Reads<'_> {
         ControlFlow::Continue(())
     }
 
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+        self.locks |= !query.locks.is_empty();
+        ControlFlow::Continue(())
+    }
+
     fn pre_visit_select(&mut self, select: &Select) -> ControlFlow<()> {
         for item in &select.projection {
             match item {
@@ -288,8 +295,9 @@ impl Visitor for Reads<'_> {
 
 /// The columns `node` reads of each relation it names, folded. A view and
 /// every relation its definition reads are read whole, and so is a table an
-/// alias renames the columns of. A table's policies read their columns too,
-/// since they filter what the read answers.
+/// alias renames the columns of. The policies filtering a read read their
+/// columns too: those for every command or for `SELECT`, and those for
+/// `UPDATE` where a query locks the rows it reads.
 ///
 /// # Errors
 ///
@@ -336,8 +344,10 @@ fn reads_of<N: Visit>(
             .iter()
             .map(|factor| (factor.relation.clone(), Columns::none()))
             .collect(),
+        locks: false,
     };
     let _: ControlFlow<()> = node.visit(&mut reads);
+    let locks = reads.locks;
     let mut read = reads.read;
     for relation in &factors.renamed {
         read.insert(relation.clone(), Columns::Row);
@@ -365,10 +375,14 @@ fn reads_of<N: Visit>(
         };
         let filtered = [Factor { relation: relation.clone(), alias: None }];
         for policy in table.policies(schema)? {
+            if !filters_read(policy, locks) {
+                continue;
+            }
             let Some(using) = policy.using_expression(schema)? else { continue };
             let mut policy_reads = Reads {
                 factors: &filtered,
                 read: BTreeMap::from([(relation.clone(), Columns::none())]),
+                locks: false,
             };
             let _: ControlFlow<()> = using.visit(&mut policy_reads);
             for policy_columns in policy_reads.read.into_values() {
@@ -377,4 +391,20 @@ fn reads_of<N: Visit>(
         }
     }
     Ok(read)
+}
+
+/// Whether `policy` may filter a read, one that `locks` the rows it reads
+/// or not, for some role: one for every command or for `SELECT`, or for
+/// `UPDATE` where the read locks its rows.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the role a read runs as is not known here, so a policy counts for every role \
+              TableLike::row_security would answer it for"
+)]
+fn filters_read(policy: &<ParserDB as DatabaseLike>::Policy, locks: bool) -> bool {
+    match policy.command() {
+        CreatePolicyCommand::All | CreatePolicyCommand::Select => true,
+        CreatePolicyCommand::Update => locks,
+        CreatePolicyCommand::Insert | CreatePolicyCommand::Delete => false,
+    }
 }
