@@ -502,8 +502,10 @@ fn place_statement(
     let home = |name: &ObjectName| home_of(homes, name);
     Ok(match statement {
         Statement::CreateTrigger(trigger) => {
+            let name = key_of(&trigger.name);
             if placement == Placement::Temp {
                 trigger.temporary = true;
+                trigger.name.0.drain(..trigger.name.0.len().saturating_sub(1));
                 match home(&trigger.table_name) {
                     Placement::Main => trigger.table_name = qualified(&trigger.table_name, "main"),
                     Placement::Attached => {
@@ -513,7 +515,7 @@ fn place_statement(
                 }
             }
             unqualify_trigger_writes(trigger, placement)?;
-            trigger_homes.entry(key_of(&trigger.name)).or_insert(placement);
+            trigger_homes.entry(name).or_insert(placement);
             placement
         }
         Statement::CreateTable(create) => {
@@ -565,6 +567,12 @@ fn place_statement(
         Statement::CreateView(view) => {
             if placement == Placement::Temp {
                 view.temporary = true;
+            }
+            placement
+        }
+        Statement::DropTrigger(drop) => {
+            if placement == Placement::Temp {
+                drop.trigger_name = qualified(&drop.trigger_name, "temp");
             }
             placement
         }
