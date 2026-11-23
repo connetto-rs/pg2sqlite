@@ -7,7 +7,7 @@ use sqlparser::ast::{
 };
 
 use crate::impls::{
-    object_name::append_suffix,
+    object_name::{append_suffix, sqlite_unqualified_object_name},
     privileges::names_table_with_backing,
     shared_helpers::match_partial_not_supported_error,
     translator_impls::{
@@ -197,13 +197,11 @@ impl crate::traits::translator::TranslatorWithContext for ColumnOptionDef {
                 if no_sqlite_key(foreign_table, schema, options)? {
                     return Ok(None);
                 }
-                let updated_foreign_table = {
-                    if names_table_with_backing(schema, foreign_table, options)? {
-                        append_suffix(foreign_table, options.get_rls_table_suffix())
-                    } else {
-                        foreign_table.clone()
-                    }
-                };
+                let mut updated_foreign_table = sqlite_unqualified_object_name(foreign_table);
+                if names_table_with_backing(schema, foreign_table, options)? {
+                    updated_foreign_table =
+                        append_suffix(&updated_foreign_table, options.get_rls_table_suffix());
+                }
 
                 Ok(Some(Self {
                     name: self.name.clone(),

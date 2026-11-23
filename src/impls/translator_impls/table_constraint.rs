@@ -11,7 +11,7 @@ use sqlparser::ast::{
 use crate::no_std::prelude::*;
 use crate::{
     impls::{
-        object_name::append_suffix,
+        object_name::{append_suffix, sqlite_unqualified_object_name},
         privileges::names_table_with_backing,
         shared_helpers::match_partial_not_supported_error,
         translator_impls::{
@@ -42,34 +42,8 @@ impl crate::traits::translator::TranslatorWithContext for TableConstraint {
             Self::Check(check_constraint) => {
                 translate_check_constraint(check_constraint, schema, options, emit)
             }
-            Self::ForeignKey(fk_constraint) => {
-                if no_sqlite_key(&fk_constraint.foreign_table, schema, options)? {
-                    return Ok(match_full_guard(fk_constraint)?.into_iter().collect());
-                }
-                let mut updated_fk = fk_constraint.clone();
-
-                if names_table_with_backing(schema, &fk_constraint.foreign_table, options)? {
-                    updated_fk.foreign_table =
-                        append_suffix(&fk_constraint.foreign_table, options.get_rls_table_suffix());
-                }
-
-                updated_fk.on_delete = fk_constraint
-                    .on_delete
-                    .map(|a| a.translate_with_warnings(schema, options, emit))
-                    .transpose()?;
-                updated_fk.on_update = fk_constraint
-                    .on_update
-                    .map(|a| a.translate_with_warnings(schema, options, emit))
-                    .transpose()?;
-
-                updated_fk.characteristics = fk_constraint
-                    .characteristics
-                    .map(|c| c.translate_with_warnings(schema, options, emit))
-                    .transpose()?;
-
-                let mut constraints = vec![Self::ForeignKey(updated_fk)];
-                constraints.extend(match_full_guard(fk_constraint)?);
-                Ok(constraints)
+            Self::ForeignKey(foreign_key) => {
+                translate_foreign_key(foreign_key, schema, options, emit)
             }
             Self::PrimaryKey(pk_constraint) => {
                 let mut updated_pk = pk_constraint.clone();
@@ -152,6 +126,39 @@ impl crate::traits::translator::TranslatorWithContext for TableConstraint {
             }
         }
     }
+}
+
+/// Translates a foreign key within its owning SQLite database.
+fn translate_foreign_key(
+    foreign_key: &sqlparser::ast::ForeignKeyConstraint,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Vec<TableConstraint>, crate::errors::Error> {
+    if no_sqlite_key(&foreign_key.foreign_table, schema, options)? {
+        return Ok(match_full_guard(foreign_key)?.into_iter().collect());
+    }
+    let mut translated = foreign_key.clone();
+    translated.foreign_table = sqlite_unqualified_object_name(&foreign_key.foreign_table);
+    if names_table_with_backing(schema, &foreign_key.foreign_table, options)? {
+        translated.foreign_table =
+            append_suffix(&translated.foreign_table, options.get_rls_table_suffix());
+    }
+    translated.on_delete = foreign_key
+        .on_delete
+        .map(|action| action.translate_with_warnings(schema, options, emit))
+        .transpose()?;
+    translated.on_update = foreign_key
+        .on_update
+        .map(|action| action.translate_with_warnings(schema, options, emit))
+        .transpose()?;
+    translated.characteristics = foreign_key
+        .characteristics
+        .map(|characteristics| characteristics.translate_with_warnings(schema, options, emit))
+        .transpose()?;
+    let mut constraints = vec![TableConstraint::ForeignKey(translated)];
+    constraints.extend(match_full_guard(foreign_key)?);
+    Ok(constraints)
 }
 
 /// Translates a table-level `CHECK`, refusing the `NOT ENFORCED` spelling.
