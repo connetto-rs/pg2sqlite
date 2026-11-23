@@ -12,23 +12,128 @@
 //! rest are refused, including a bare `*` beside a USING or FROM clause, which
 //! PostgreSQL expands over those relations as well and which would otherwise
 //! answer a silently narrower row.
+//!
+//! Subqueries name the changed row through its real table name unless a local
+//! relation would capture that name.
+
+use core::ops::ControlFlow;
 
 use sql_traits::{
-    structs::ParserDB,
+    structs::{ColumnScope, IdentifierCase, ParserDB},
     traits::{ColumnLike, TableLike},
 };
 use sqlparser::ast::{
-    Expr, FromTable, Ident, ObjectName, SelectItem, SelectItemQualifiedWildcardKind, TableFactor,
-    TableWithJoins,
+    Expr, FromTable, Ident, ObjectName, Query, SelectItem, SelectItemQualifiedWildcardKind,
+    TableFactor, TableWithJoins, VisitMut, VisitorMut,
 };
 
 use super::{
     expr_helpers::try_map_expr_children,
-    object_name::{last_ident, resolve_translation_table},
+    object_name::{last_ident, resolve_translation_table, same_identifier},
+    returning_rows::ReturningRows,
+    shared_helpers::TranslationDirection,
 };
 use crate::errors::Error;
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
+
+struct ReturningAliasReferences<'schema> {
+    alias: &'schema Ident,
+    qualifier: ObjectName,
+    target: &'schema Ident,
+    target_qualifier: ObjectName,
+    schema: &'schema ParserDB,
+    statement: &'static str,
+    shadowed: Vec<(bool, bool)>,
+}
+
+impl VisitorMut for ReturningAliasReferences<'_> {
+    type Break = Error;
+
+    fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
+        let (mut alias_shadowed, mut target_shadowed) =
+            self.shadowed.last().copied().unwrap_or_default();
+        if !alias_shadowed {
+            let scope = match crate::options::query_column_scope(query, self.schema) {
+                Ok(scope) => scope,
+                Err(error) => return ControlFlow::Break(error.into()),
+            };
+            alias_shadowed = scope.resolve_relation_binding(&self.qualifier).is_some();
+            if !alias_shadowed && !target_shadowed {
+                let scope =
+                    match ColumnScope::from_query(query, self.schema, IdentifierCase::Folded) {
+                        Ok(scope) => scope,
+                        Err(error) => return ControlFlow::Break(error.into()),
+                    };
+                target_shadowed = scope.resolve_relation_binding(&self.target_qualifier).is_some();
+            }
+        }
+        self.shadowed.push((alias_shadowed, target_shadowed));
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _: &mut Query) -> ControlFlow<Self::Break> {
+        self.shadowed.pop();
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expression: &mut Expr) -> ControlFlow<Self::Break> {
+        if let Some(&(false, target_shadowed)) = self.shadowed.last()
+            && let Expr::CompoundIdentifier(parts) = expression
+            && parts.len() == 2
+            && same_identifier(&parts[0], self.alias)
+        {
+            if target_shadowed {
+                return ControlFlow::Break(Error::forward_refusal(format!(
+                    "SQLite cannot preserve {} target alias `{}` inside a RETURNING subquery \
+                     that shadows table `{}`.",
+                    self.statement, self.alias, self.target
+                )));
+            }
+            parts[0] = self.target.clone();
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// The alias and declared name of a named, aliased write target.
+pub(crate) fn aliased_target(target: &TableFactor) -> Option<(&Ident, &ObjectName)> {
+    let TableFactor::Table { name, alias: Some(alias), .. } = target else { return None };
+    Some((&alias.name, name))
+}
+
+/// Translates a returned list through its statement's row versions and
+/// resolves its correlated target aliases.
+pub(crate) fn translate_target_returning<D: TranslationDirection>(
+    rows: &ReturningRows<'_>,
+    returning: Option<&[SelectItem]>,
+    (target, statement): (Option<(&Ident, &ObjectName)>, &'static str),
+    schema: &ParserDB,
+    options: &D::Options<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Option<Vec<SelectItem>>, Error> {
+    let mut returning = rows.translate::<D>(returning, schema, options, emit)?;
+    if !D::IS_FORWARD {
+        return Ok(returning);
+    }
+    let Some((alias, name)) = target else { return Ok(returning) };
+    let Some(items) = &mut returning else { return Ok(None) };
+    let emitted_name = D::translate_object_name(name, schema, options)?;
+    let Some(target) = last_ident(&emitted_name) else { return Ok(returning) };
+    let mut references = ReturningAliasReferences {
+        alias,
+        qualifier: ObjectName::from(alias.clone()),
+        target,
+        target_qualifier: ObjectName::from(target.clone()),
+        schema,
+        statement,
+        shadowed: vec![],
+    };
+    if let ControlFlow::Break(error) = items.visit(&mut references) {
+        return Err(error);
+    }
+    Ok(returning)
+}
 
 /// The first relation a `DELETE` targets, which is the only one its RETURNING
 /// list can read.
@@ -195,8 +300,7 @@ impl<'a> Scope<'a> {
             Expr::Identifier(ident) if self.is_outside_the_target(&ident.value) => {
                 Err(self.outside_error(&ident.value))
             }
-            // A subquery carries its own relations, and a correlated reference
-            // back to the target resolves, so the walk stops at its boundary.
+            // Subquery qualifiers are resolved by the shared alias visitor.
             _ => {
                 try_map_expr_children(expr, &mut |child| self.rewrite_expr(child), &mut |query| {
                     Ok(query.clone())

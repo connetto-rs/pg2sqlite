@@ -1,15 +1,13 @@
 //! Implementation of the [`Translator`](crate::traits::Translator) trait for
 //! the `Insert` type.
 
-use core::ops::ControlFlow;
-
 use sql_traits::{
     structs::{ColumnScope, IdentifierCase, ParserDB, QueryOutput},
     traits::{ColumnLike, DatabaseLike, TableIndexLike, TableLike, UniqueIndexLike},
 };
 use sqlparser::ast::{
     AssignmentTarget, DataType, Expr, Ident, Insert, ObjectName, Query, SelectItem, SetExpr,
-    TableObject, TableWithJoins, Visit, Visitor,
+    TableObject, TableWithJoins,
 };
 
 use super::helpers::Forward;
@@ -20,7 +18,7 @@ use crate::{
         object_name::{
             COLUMN_LOOKUP_CASE, declared_column_ident, last_ident, last_ident_value_or_display,
             normalize_schema_qualified_object_name_for_sqlite, quoted_ident,
-            resolve_translation_table, same_identifier,
+            resolve_translation_table,
         },
         privileges::RoleTable,
         shared_helpers::{
@@ -111,70 +109,6 @@ fn insert_target_scope_query(
     Ok(None)
 }
 
-struct ReturningAliasReferences<'schema> {
-    alias: &'schema Ident,
-    qualifier: ObjectName,
-    schema: &'schema ParserDB,
-    shadowed: Vec<bool>,
-}
-
-impl Visitor for ReturningAliasReferences<'_> {
-    type Break = crate::errors::Error;
-
-    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
-        let shadowed = if self.shadowed.last() == Some(&true) {
-            true
-        } else {
-            let scope = match crate::options::query_column_scope(query, self.schema) {
-                Ok(scope) => scope,
-                Err(error) => return ControlFlow::Break(error.into()),
-            };
-            scope.resolve_relation_binding(&self.qualifier).is_some()
-        };
-        self.shadowed.push(shadowed);
-        ControlFlow::Continue(())
-    }
-
-    fn post_visit_query(&mut self, _: &Query) -> ControlFlow<Self::Break> {
-        self.shadowed.pop();
-        ControlFlow::Continue(())
-    }
-
-    fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<Self::Break> {
-        if self.shadowed.last() == Some(&false)
-            && let Expr::CompoundIdentifier(parts) = expression
-            && parts.len() == 2
-            && same_identifier(&parts[0], self.alias)
-        {
-            return ControlFlow::Break(crate::errors::Error::forward_refusal(format!(
-                "SQLite cannot resolve INSERT target alias `{}` inside a RETURNING subquery.",
-                self.alias
-            )));
-        }
-        ControlFlow::Continue(())
-    }
-}
-
-/// Refuses correlated target aliases that SQLite cannot resolve in a returned
-/// subquery.
-fn refuse_returning_alias_subqueries(
-    insert: &Insert,
-    schema: &ParserDB,
-) -> Result<(), crate::errors::Error> {
-    let Some(alias) = &insert.table_alias else { return Ok(()) };
-    let Some(returning) = &insert.returning else { return Ok(()) };
-    let mut references = ReturningAliasReferences {
-        alias: &alias.alias,
-        qualifier: ObjectName::from(alias.alias.clone()),
-        schema,
-        shadowed: vec![],
-    };
-    match returning.visit(&mut references) {
-        ControlFlow::Break(error) => Err(error),
-        ControlFlow::Continue(()) => Ok(()),
-    }
-}
-
 impl crate::traits::translator::TranslatorWithContext for Insert {
     type SQLiteEntry = Insert;
 
@@ -242,16 +176,27 @@ impl crate::traits::translator::TranslatorWithContext for Insert {
             .map(|q| q.translate_with_warnings(schema, options, emit))
             .transpose()?
             .map(Box::new);
+        let mut insert = Insert { source, ..prepared };
+        let mut target = rewrite_rls_view_insert(&mut insert, schema, options, emit)?;
+        let returning_target = match (&insert.table, &insert.table_alias) {
+            (TableObject::TableName(name), Some(alias)) => Some((&alias.alias, name)),
+            _ => None,
+        };
 
-        refuse_returning_alias_subqueries(self, schema)?;
-        let returning = crate::impls::returning_rows::ReturningRows::insert(self)
-            .translate::<Forward>(self.returning.as_deref(), schema, options, emit)?;
         let target_relation = target_query
             .as_ref()
             .and_then(|query| query.body.as_select())
             .and_then(|select| select.from.first())
             .map(|target| &target.relation);
-        let returning = crate::impls::returning_scope::scope_returning_to_target(
+        let returning = crate::impls::returning_scope::translate_target_returning::<Forward>(
+            &crate::impls::returning_rows::ReturningRows::insert(self),
+            insert.returning.as_deref(),
+            (returning_target, "INSERT"),
+            schema,
+            options,
+            emit,
+        )?;
+        insert.returning = crate::impls::returning_scope::scope_returning_to_target(
             returning,
             target_relation,
             &[],
@@ -259,18 +204,6 @@ impl crate::traits::translator::TranslatorWithContext for Insert {
             options.schema_is_complete(),
             "INSERT",
         )?;
-
-        let mut insert = Insert { source, returning, ..prepared };
-
-        // INSERT INTO <RLS view> ... RETURNING ...: rewrite to target
-        // the backing table so RETURNING surfaces the row that was
-        // actually written (the INSTEAD OF view trigger writes to the
-        // backing table, but RETURNING from the view sees the original
-        // NEW row and returns NULL for auto-assigned PKs). The paired
-        // BEFORE INSERT guard trigger emitted in `rls.rs` keeps WITH
-        // CHECK enforcement on this path. Plain INSERTs (no RETURNING)
-        // keep going through the view's INSTEAD OF trigger.
-        let mut target = rewrite_rls_view_insert(&mut insert, schema, options, emit)?;
 
         let rewrites = target.optional().map_or_else(ColumnRewrites::default, |table| {
             ColumnRewrites::of_table(table, schema, options)

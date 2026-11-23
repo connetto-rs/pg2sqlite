@@ -38,6 +38,7 @@ use crate::{
             plain_table_with_joins,
         },
         returning_rows::ReturningRows,
+        returning_scope::{aliased_target, delete_target, translate_target_returning},
         translator_impls::{
             unused_cte_name,
             uuid::{
@@ -3541,12 +3542,10 @@ pub(crate) fn translate_delete_core<D: TranslationDirection>(
     let from = map_from_table(&delete.from, |table| {
         translate_table_with_joins::<D>(table, schema, options, emit)
     })?;
-    let returning = ReturningRows::delete(delete).translate::<D>(
-        delete.returning.as_deref(),
-        schema,
-        options,
-        emit,
-    )?;
+    let target = (delete_target(&delete.from).and_then(aliased_target), "DELETE");
+    let (rows, returning) = (ReturningRows::delete(delete), delete.returning.as_deref());
+    let returning =
+        translate_target_returning::<D>(&rows, returning, target, schema, options, emit)?;
     let order_by = delete
         .order_by
         .iter()
@@ -4697,8 +4696,10 @@ pub(crate) fn translate_update<D: TranslationDirection>(
         })
         .transpose()?;
 
-    let rows = ReturningRows::update(update);
-    let returning = rows.translate::<D>(update.returning.as_deref(), schema, options, emit)?;
+    let target = (aliased_target(&update.table.relation), "UPDATE");
+    let (rows, returning) = (ReturningRows::update(update), update.returning.as_deref());
+    let returning =
+        translate_target_returning::<D>(&rows, returning, target, schema, options, emit)?;
     let limit = update
         .limit
         .as_ref()
@@ -6352,7 +6353,7 @@ pub(crate) fn translate_select_item<D: TranslationDirection>(
 }
 
 pub(crate) fn translate_returning<D: TranslationDirection>(
-    returning: Option<&Vec<SelectItem>>,
+    returning: Option<&[SelectItem]>,
     schema: &ParserDB,
     options: &D::Options<'_>,
     emit: crate::warnings::WarningSink<'_>,
