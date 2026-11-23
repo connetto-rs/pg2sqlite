@@ -10,15 +10,16 @@ use core::ops::ControlFlow;
 
 use sql_traits::{
     structs::ParserDB,
-    traits::{DatabaseLike, TableLike, ViewLike},
+    traits::{CheckConstraintLike, DatabaseLike, TableLike, ViewLike},
 };
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, ColumnDef, ColumnOption, CreateFunction, CreateTable, Expr,
-    FromTable, InTarget, Query, Select, SetExpr, Statement, TableFactor, TableObject,
-    TableWithJoins, Value, Visit, Visitor,
+    FromTable, InTarget, OnConflictAction, OnInsert, Query, Select, SetExpr, Statement,
+    TableFactor, TableObject, TableWithJoins, Value, Visit, Visitor,
 };
 use sqlparser_plpgsql::embedded::{Block, Case, If, LoopControl, Node, NodeKind};
 
+use super::columns::Columns;
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
 use crate::{
@@ -29,6 +30,17 @@ use crate::{
         translator_impls::plpgsql::{fold, relations_read},
     },
 };
+
+/// The row a trigger function reads as `NEW` and `OLD`.
+#[derive(Clone, Copy)]
+pub(super) struct Record<'r> {
+    /// The table the trigger fires on, folded.
+    pub(super) table: &'r str,
+    /// The columns, folded, whose value in the row the function reads the
+    /// checks of the table may not hold, since a trigger may still change
+    /// it or keep the row from being written.
+    pub(super) unchecked: &'r Columns,
+}
 
 /// A value a statement compares a column with or writes into it.
 #[derive(Clone, Debug)]
@@ -57,16 +69,17 @@ impl Rows {
 
     /// These rows of `relation`, each column held only where it is of an
     /// enum type and every value it may hold is a label. A field stands for
-    /// the label its column on `record`, the table the trigger fires on, is
-    /// generated as.
+    /// the label its column on `record` is generated as, or held to by a
+    /// check of the table.
     ///
     /// # Errors
     ///
-    /// Fails when the columns of `relation` or `record` cannot be read.
+    /// Fails when the columns or checks of `relation` or `record` cannot be
+    /// read.
     pub(super) fn held(
         &self,
         relation: &str,
-        record: Option<&str>,
+        record: Option<Record<'_>>,
         schema: &ParserDB,
     ) -> Result<Held, Error> {
         let Some(table) = table(relation, schema) else { return Ok(Held::any()) };
@@ -145,15 +158,22 @@ fn column_of_table<'s>(
 }
 
 /// The label `term` stands for, `None` when it may stand for any value. A
-/// field stands for the label its column on `record` is generated as.
-fn label(term: &Term, record: Option<&str>, schema: &ParserDB) -> Result<Option<String>, Error> {
+/// field stands for the label its column on `record` is generated as, or
+/// that a validated check of the table holds the column of the enum type
+/// to where the row `record` reads is the one the checks pass.
+fn label(
+    term: &Term,
+    record: Option<Record<'_>>,
+    schema: &ParserDB,
+) -> Result<Option<String>, Error> {
     let column = match term {
         Term::Label(value) => return Ok(Some(value.clone())),
         Term::Field(column) => column,
     };
-    let Some(table) = record.and_then(|record| table(record, schema)) else { return Ok(None) };
+    let Some(record) = record else { return Ok(None) };
+    let Some(table) = table(record.table, schema) else { return Ok(None) };
     let Some(declared) = column_of_table(table, column, schema)? else { return Ok(None) };
-    Ok(declared.options.iter().find_map(|option| {
+    let generated = declared.options.iter().find_map(|option| {
         match &option.option {
             ColumnOption::Generated { generation_expr: Some(expr), .. } => {
                 match term_of(expr, &[]) {
@@ -163,7 +183,50 @@ fn label(term: &Term, record: Option<&str>, schema: &ParserDB) -> Result<Option<
             }
             _ => None,
         }
-    }))
+    });
+    if generated.is_some()
+        || record.unchecked.contains(column)
+        || !is_enum(&declared.data_type, schema)
+    {
+        return Ok(generated);
+    }
+    for check in table.check_constraints(schema)? {
+        if check.is_validated(schema)?
+            && let Some(label) = pinned(check.expression(schema), column)
+        {
+            return Ok(Some(label));
+        }
+    }
+    Ok(None)
+}
+
+/// The label `check` holds `column`, folded, to, through its conjuncts: one
+/// it compares equal to a string literal.
+fn pinned(check: &Expr, column: &str) -> Option<String> {
+    match check {
+        Expr::Nested(inner) => pinned(inner, column),
+        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+            pinned(left, column).or_else(|| pinned(right, column))
+        }
+        Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+            let names =
+                |expr: &Expr| matches!(expr, Expr::Identifier(name) if fold(name) == column);
+            let literal = |expr: &Expr| {
+                match term_of(expr, &[]) {
+                    Some(Term::Label(value)) => Some(value),
+                    _ => None,
+                }
+            };
+            if names(left) {
+                literal(right)
+            } else if names(right) {
+                literal(left)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 /// The value `expr` compares or writes, `None` for one that may vary from
@@ -281,13 +344,15 @@ fn exposed(factor: &TableFactor) -> Option<String> {
 }
 
 /// The rows of its table `statement` writes: those an `INSERT` of listed
-/// values without `ON CONFLICT` adds, and those a `DELETE` or an `UPDATE` of
-/// one table takes, an `UPDATE`'s both before and after it. Any row for
-/// every other statement. `variables` are the names its function may read
-/// as variables.
+/// values adds, unless a conflict updates a row, and those a `DELETE` or an
+/// `UPDATE` of one table takes, an `UPDATE`'s both before and after it. Any
+/// row for every other statement. `variables` are the names its function
+/// may read as variables.
 pub(super) fn written(statement: &Statement, variables: &[String]) -> Rows {
     match statement {
-        Statement::Insert(insert) if insert.on.is_none() && !insert.columns.is_empty() => {
+        Statement::Insert(insert)
+            if adds_only(insert.on.as_ref()) && !insert.columns.is_empty() =>
+        {
             let TableObject::TableName(_) = &insert.table else { return Rows::any() };
             let Some(SetExpr::Values(values)) = insert.source.as_ref().map(|query| &*query.body)
             else {
@@ -341,6 +406,18 @@ pub(super) fn written(statement: &Statement, variables: &[String]) -> Rows {
             Rows(vec![before, after])
         }
         _ => Rows::any(),
+    }
+}
+
+/// Whether an `INSERT` with `on` writes only the rows it adds, which is so
+/// without a conflict clause or with one doing nothing.
+fn adds_only(on: Option<&OnInsert>) -> bool {
+    match on {
+        None => true,
+        Some(OnInsert::OnConflict(conflict)) => {
+            matches!(conflict.action, OnConflictAction::DoNothing)
+        }
+        Some(_) => false,
     }
 }
 

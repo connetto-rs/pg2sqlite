@@ -216,11 +216,11 @@ fn add(omitted: &mut Vec<Omitted>, writer: &Writer, relation: String, changes: C
 }
 
 /// The writes the replica leaves to the server: those of each trigger it
-/// leaves out or keeps without them, the row a `BEFORE` row trigger it
-/// leaves out assigns in `NEW`, every column of it as for a firing write, and
-/// those of each foreign key action that writes rows. A table left off the
-/// replica takes its triggers and keys with it, and a replica leaving only
-/// its foreign keys to the server runs every trigger itself.
+/// leaves out or keeps without them, the fields of `NEW` a `BEFORE` row
+/// trigger it leaves out assigns, and those of each foreign key action that
+/// writes rows. A table left off the replica takes its triggers and keys with
+/// it, and a replica leaving only its foreign keys to the server runs every
+/// trigger itself.
 fn omitted_writes(
     schema: &ParserDB,
     triggers: &[ReadTrigger<'_>],
@@ -242,10 +242,10 @@ fn omitted_writes(
                 if matches!(trigger.period, Some(TriggerPeriod::Before))
                     && is_per_row(trigger)
                     && let Some((_, chain)) = run
-                    && chain.assigns_new
+                    && !chain.assigned.is_empty()
                     && let Some(record) = last_ident(&trigger.table_name)
                 {
-                    add(&mut omitted, &writer, fold(record), Columns::Row);
+                    add(&mut omitted, &writer, fold(record), chain.assigned.clone());
                 }
                 left_out = fired.writes(landing)?;
                 &left_out

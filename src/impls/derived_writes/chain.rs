@@ -29,7 +29,8 @@ use super::{
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
 use crate::{
-    errors::Error, impls::translator_impls::sql_helper::declared_helper,
+    errors::Error,
+    impls::translator_impls::{plpgsql::fold, sql_helper::declared_helper},
     options::TranslationContext,
 };
 
@@ -63,8 +64,12 @@ pub(super) struct Chain {
     /// Whether a statement the replica keeps refuses the write or changes
     /// its row, so the trigger keeps something once its writes are out.
     pub(super) residue: bool,
-    /// Whether the function assigns to `NEW`.
-    pub(super) assigns_new: bool,
+    /// The fields of `NEW` the function assigns, folded, the whole row where
+    /// it assigns the record itself.
+    pub(super) assigned: Columns,
+    /// Whether a `BEFORE` row trigger running the function may hand on
+    /// another row than the one the write gives, or none.
+    pub(super) skips: bool,
     /// Why the calls of a function in the chain cannot be read, SQL it
     /// builds at run time among the reasons.
     pub(super) unreadable: Option<Error>,
@@ -362,8 +367,8 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
                 self.sets_found(None);
             }
             NodeKind::Assignment(assignment) => {
-                if names_new(&assignment.target) {
-                    self.chain.assigns_new = true;
+                if let Some(assigned) = new_field(&assignment.target) {
+                    self.chain.assigned.extend(assigned);
                     self.chain.residue = true;
                 }
                 self.kept(assignment.value.as_ref())?;
@@ -451,6 +456,7 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
             && !passes_row(value, events)
         {
             self.chain.residue = true;
+            self.chain.skips = true;
         }
         Ok(())
     }
@@ -476,8 +482,8 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
             None => self.kept(statement)?,
         }
         self.chain.residue |= into.strict;
-        if into.targets.iter().any(names_new) {
-            self.chain.assigns_new = true;
+        for assigned in into.targets.iter().filter_map(new_field) {
+            self.chain.assigned.extend(assigned);
             self.chain.residue = true;
         }
         self.sets_found(None);
@@ -730,10 +736,18 @@ impl Visitor for Calls<'_, '_, '_> {
     }
 }
 
-/// Whether `target` is `NEW` or one of its fields.
-fn names_new(target: &Target) -> bool {
-    matches!(target.name.0.first(), Some(ObjectNamePart::Identifier(name))
-        if name.value.eq_ignore_ascii_case("new"))
+/// The field of `NEW` that `target` names, folded, or the whole row where it
+/// names the record itself, `None` when it does not name `NEW`.
+fn new_field(target: &Target) -> Option<Columns> {
+    let mut parts = target.name.0.iter();
+    match parts.next() {
+        Some(ObjectNamePart::Identifier(name)) if name.value.eq_ignore_ascii_case("new") => {}
+        _ => return None,
+    }
+    Some(match parts.next().and_then(ObjectNamePart::as_ident) {
+        Some(field) => Columns::Named([fold(field)].into()),
+        None => Columns::Row,
+    })
 }
 
 fn targets(into: &IntoTargets) -> String {

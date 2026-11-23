@@ -19,7 +19,8 @@ use sql_traits::{
     traits::{ColumnLike, DatabaseLike, ForeignKeyLike, TableLike},
 };
 use sqlparser::ast::{
-    CreateTable, CreateTrigger, ObjectName, ObjectType, ReferentialAction, Statement, TriggerPeriod,
+    BinaryOperator, CreateTable, CreateTrigger, Expr, ObjectName, ObjectType, ReferentialAction,
+    Statement, TriggerPeriod,
 };
 
 use super::{
@@ -29,7 +30,7 @@ use super::{
     columns::Columns,
     is_per_row,
     landing::Landing,
-    rows::Held,
+    rows::{Held, Record},
     writes_of,
 };
 #[cfg(not(feature = "std"))]
@@ -79,6 +80,99 @@ enum Rank {
     Deferred,
 }
 
+/// What an update has to change for a trigger's `WHEN` to hold.
+#[derive(Clone, Debug)]
+enum Needs {
+    /// Nothing the condition proves.
+    Nothing,
+    /// A new value in one of these columns, folded, as `OLD.c IS DISTINCT
+    /// FROM NEW.c` or `OLD.c <> NEW.c` asks, a row of such pairs in one of
+    /// its columns.
+    AnyOf(BTreeSet<String>),
+    /// What both sides of an `AND` need.
+    Both(Box<Self>, Box<Self>),
+    /// What one side of an `OR` needs.
+    Either(Box<Self>, Box<Self>),
+}
+
+impl Needs {
+    fn of(condition: &Expr) -> Self {
+        match condition {
+            Expr::Nested(inner) => Self::of(inner),
+            Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+                Self::Both(Box::new(Self::of(left)), Box::new(Self::of(right)))
+            }
+            Expr::BinaryOp { left, op: BinaryOperator::Or, right } => {
+                Self::Either(Box::new(Self::of(left)), Box::new(Self::of(right)))
+            }
+            Expr::IsDistinctFrom(left, right)
+            | Expr::BinaryOp { left, op: BinaryOperator::NotEq, right } => {
+                let mut columns = BTreeSet::new();
+                if compared_fields(left, right, &mut columns) {
+                    Self::AnyOf(columns)
+                } else {
+                    Self::Nothing
+                }
+            }
+            _ => Self::Nothing,
+        }
+    }
+
+    /// Whether an update changing `changed` of a table whose columns, folded,
+    /// `declared` holds may meet the need. A column the table does not
+    /// declare, as one a later rename gave another name, may be any of them.
+    fn met_by(&self, changed: &Columns, declared: &BTreeSet<String>) -> bool {
+        match self {
+            Self::Nothing => true,
+            Self::AnyOf(columns) => {
+                columns.iter().any(|column| changed.contains(column) || !declared.contains(column))
+            }
+            Self::Both(left, right) => {
+                left.met_by(changed, declared) && right.met_by(changed, declared)
+            }
+            Self::Either(left, right) => {
+                left.met_by(changed, declared) || right.met_by(changed, declared)
+            }
+        }
+    }
+}
+
+/// Adds to `columns` the fields `left` and `right` compare between `OLD` and
+/// `NEW`, answering whether every pair they hold compares one field of both,
+/// alone or in rows of the same length.
+fn compared_fields(left: &Expr, right: &Expr, columns: &mut BTreeSet<String>) -> bool {
+    match (left, right) {
+        (Expr::Nested(left), _) => compared_fields(left, right, columns),
+        (_, Expr::Nested(right)) => compared_fields(left, right, columns),
+        (Expr::Tuple(lefts), Expr::Tuple(rights)) => {
+            lefts.len() == rights.len()
+                && lefts
+                    .iter()
+                    .zip(rights)
+                    .all(|(left, right)| compared_fields(left, right, columns))
+        }
+        _ => {
+            match (record_field(left), record_field(right)) {
+                (Some((first, column)), Some((second, other)))
+                    if first != second && column == other =>
+                {
+                    columns.insert(column);
+                    true
+                }
+                _ => false,
+            }
+        }
+    }
+}
+
+/// The record, `old` or `new`, and the field, folded, `expr` names.
+fn record_field(expr: &Expr) -> Option<(String, String)> {
+    let Expr::CompoundIdentifier(parts) = expr else { return None };
+    let [record, field] = parts.as_slice() else { return None };
+    let record = fold(record);
+    matches!(record.as_str(), "old" | "new").then(|| (record, fold(field)))
+}
+
 /// A trigger the schema holds once the translation unit has run, as the
 /// server fires it around the writes it derives.
 #[derive(Clone, Debug)]
@@ -90,6 +184,8 @@ pub(crate) struct FiringTrigger {
     events: Vec<Event>,
     rank: Rank,
     function: ObjectName,
+    /// What an update has to change for its `WHEN` to hold.
+    needs: Needs,
 }
 
 impl FiringTrigger {
@@ -109,6 +205,7 @@ impl FiringTrigger {
             events: trigger.events.iter().map(Event::of).collect(),
             rank,
             function: trigger.exec_body.as_ref()?.func_desc.name.clone(),
+            needs: trigger.condition.as_ref().map_or(Needs::Nothing, Needs::of),
         })
     }
 
@@ -149,15 +246,20 @@ impl FiringTrigger {
         }
     }
 
-    /// Whether the trigger's function assigns `NEW`, changing columns of the
-    /// row beside those the write sets.
-    fn assigns_new(
+    /// What the trigger's function does to the row as a `BEFORE` row
+    /// trigger: the fields of `NEW` it assigns, beside those the write sets,
+    /// and whether it may hand on another row or none. Nothing when the
+    /// schema does not hold that function.
+    fn row_effect(
         &self,
         schema: &ParserDB,
         options: &TranslationContext<'_>,
-    ) -> Result<bool, Error> {
-        let Some(function) = written_function(schema, &self.function)? else { return Ok(false) };
-        Ok(Walker::read(function, Some(&self.events), schema, options)?.assigns_new)
+    ) -> Result<(Columns, bool), Error> {
+        let Some(function) = written_function(schema, &self.function)? else {
+            return Ok((Columns::none(), false));
+        };
+        let chain = Walker::read(function, Some(&self.events), schema, options)?;
+        Ok((chain.assigned, chain.skips))
     }
 }
 
@@ -285,8 +387,8 @@ impl<'s, 'o> Firing<'s, 'o> {
     }
 
     /// The columns of `table` a write of `event` changing `columns` changes
-    /// once its `BEFORE` row triggers have run: every one when a trigger
-    /// assigns `NEW`, and its generated columns beside the others.
+    /// once its `BEFORE` row triggers have run: beside them, the fields of
+    /// `NEW` those triggers assign and the generated columns.
     ///
     /// # Errors
     ///
@@ -297,16 +399,15 @@ impl<'s, 'o> Firing<'s, 'o> {
         event: Event,
         mut columns: Columns,
     ) -> Result<Columns, Error> {
-        if columns.is_empty() || columns == Columns::Row {
-            return Ok(columns);
-        }
         for trigger in self.triggers {
+            if columns == Columns::Row {
+                return Ok(columns);
+            }
             if *trigger.table == *table.stored_table_name()
                 && trigger.rank == Rank::BeforeRow
                 && trigger.fires_on(event)
-                && trigger.assigns_new(self.schema, self.options)?
             {
-                return Ok(Columns::Row);
+                columns.extend(trigger.row_effect(self.schema, self.options)?.0);
             }
         }
         for column in table.columns(self.schema)? {
@@ -315,6 +416,79 @@ impl<'s, 'o> Firing<'s, 'o> {
             }
         }
         Ok(columns)
+    }
+
+    /// The columns of its table `write` changes on the server: for an
+    /// update, those it gives new values and those [`Self::changed`] adds,
+    /// and for any other write the whole row, which rows the table holds
+    /// among it.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a trigger's function cannot be read.
+    fn changes(&self, write: &DerivedWrite) -> Result<Columns, Error> {
+        let (Fresh::Columns(columns), "UPDATE") = (&write.fresh, write.statement) else {
+            return Ok(Columns::Row);
+        };
+        let set = Columns::Named(columns.iter().cloned().collect());
+        match self.table(&write.relation) {
+            Some(table) => self.changed(table, Event::Update, set),
+            None => Ok(set),
+        }
+    }
+
+    /// Whether `trigger` may fire on a write of `event` changing `changed`
+    /// of its table: on an update, only where its `WHEN` may hold.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the columns of the table cannot be read.
+    fn may_fire(
+        &self,
+        trigger: &FiringTrigger,
+        event: Event,
+        changed: &Columns,
+    ) -> Result<bool, Error> {
+        if event != Event::Update || matches!(trigger.needs, Needs::Nothing) {
+            return Ok(true);
+        }
+        let mut declared = BTreeSet::new();
+        if let Some(table) = self.table(&trigger.table) {
+            for column in table.columns(self.schema)? {
+                declared.insert(column.stored_column_name().into_owned());
+            }
+        }
+        Ok(trigger.needs.met_by(changed, &declared))
+    }
+
+    /// The columns of the row `fired` reads as `NEW` whose value there the
+    /// checks of its table may not hold: none once the row is written, and
+    /// before, the fields a `BEFORE` row trigger firing from `fired` on, on
+    /// one of its events, assigns, or every column where one of those may
+    /// hand on another row or none.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a trigger's function cannot be read.
+    fn unchecked(&self, fired: &FiringTrigger) -> Result<Columns, Error> {
+        let mut unchecked = Columns::none();
+        if fired.rank != Rank::BeforeRow {
+            return Ok(unchecked);
+        }
+        for trigger in self.triggers {
+            if trigger.rank == Rank::BeforeRow
+                && trigger.table == fired.table
+                && !trigger.fires_before(fired)
+                && fired.events.iter().any(|&event| trigger.fires_on(event))
+            {
+                let (assigned, skips) = trigger.row_effect(self.schema, self.options)?;
+                if skips {
+                    return Ok(Columns::Row);
+                }
+                unchecked.extend(assigned);
+            }
+        }
+        Ok(unchecked)
     }
 
     /// The foreign key actions a write of `event` changing `changed` of
@@ -391,7 +565,10 @@ impl<'s, 'o> Firing<'s, 'o> {
             return Ok(());
         }
         for trigger in self.triggers {
-            if trigger.table == table && trigger.fires_on(event) {
+            if trigger.table == table
+                && trigger.fires_on(event)
+                && self.may_fire(trigger, event, columns)?
+            {
                 self.trigger_set_off(trigger, written, visited)?;
             }
         }
@@ -428,35 +605,44 @@ impl<'s, 'o> Firing<'s, 'o> {
         written: &mut Written,
         visited: &mut Visited,
     ) -> Result<(), Error> {
-        for write in trigger.writes(self.landing())? {
-            self.write_set_off(&write, written, visited)?;
-            self.add(&write, &trigger.name, &trigger.table, written)?;
+        let writes = trigger.writes(self.landing())?;
+        if writes.is_empty() {
+            return Ok(());
+        }
+        let unchecked = self.unchecked(trigger)?;
+        let record = Record { table: &trigger.table, unchecked: &unchecked };
+        for write in writes {
+            let changes = self.changes(&write)?;
+            self.write_set_off(&write, &changes, written, visited)?;
+            self.add(&write, &trigger.name, record, changes, written)?;
         }
         Ok(())
     }
 
-    /// Adds to `written` the rows `write` produces in its table, run by
-    /// `writer` in a trigger on `record`.
+    /// Adds to `written` the rows `write` produces in its table and the
+    /// `columns` it changes there, run by `writer` in a trigger reading
+    /// `record`.
     fn add(
         &self,
         write: &DerivedWrite,
         writer: &str,
-        record: &str,
+        record: Record<'_>,
+        columns: Columns,
         written: &mut Written,
     ) -> Result<(), Error> {
         let rows = self.produced(write, record)?;
         written.entry(write.relation.clone()).or_default().push(Produced {
             writer: writer.to_owned(),
             rows,
-            columns: Columns::Row,
+            columns,
         });
         Ok(())
     }
 
-    /// The rows `write` produces in its table, run by a trigger on `record`.
-    /// Any row when a `BEFORE` row trigger on the table may change the row
-    /// the write gives.
-    fn produced(&self, write: &DerivedWrite, record: &str) -> Result<Held, Error> {
+    /// The rows `write` produces in its table, run by a trigger reading
+    /// `record`. Any row when a `BEFORE` row trigger on the table may change
+    /// the row the write gives.
+    fn produced(&self, write: &DerivedWrite, record: Record<'_>) -> Result<Held, Error> {
         let rewritten = self.triggers.iter().any(|trigger| {
             trigger.rank == Rank::BeforeRow
                 && trigger.table == write.relation
@@ -470,15 +656,17 @@ impl<'s, 'o> Firing<'s, 'o> {
     }
 
     /// Adds to `written` the tables the triggers and foreign key actions
-    /// `write` sets off write, without the table `write` writes itself.
+    /// `write`, changing `changes` of its table, sets off write, without the
+    /// table `write` writes itself.
     fn write_set_off(
         &self,
         write: &DerivedWrite,
+        changes: &Columns,
         written: &mut Written,
         visited: &mut Visited,
     ) -> Result<(), Error> {
         for &event in write.events() {
-            self.set_off(&write.relation, event, &Columns::Row, written, visited)?;
+            self.set_off(&write.relation, event, changes, written, visited)?;
         }
         Ok(())
     }
@@ -529,7 +717,7 @@ impl<'s, 'o> Firing<'s, 'o> {
 
     /// The first read among `steps` of rows the server writes into a table
     /// in `written`. A read by the trigger's own function reads `NEW` and
-    /// `OLD` as rows of `record`.
+    /// `OLD` as `record`.
     ///
     /// # Errors
     ///
@@ -538,7 +726,7 @@ impl<'s, 'o> Firing<'s, 'o> {
         &self,
         steps: &'c [Step],
         written: &'w Written,
-        record: &str,
+        record: Record<'_>,
     ) -> Result<Option<Dependent<'c, 'w>>, Error> {
         for step in steps {
             let Step::Read { relation, rows, columns, reader } = step else { continue };
@@ -565,26 +753,29 @@ struct Dependent<'c, 'w> {
     writer: &'w str,
 }
 
-/// Why a statement the trigger keeps reads what one of its own removed
-/// writes produces, through what it sets off, or `None` when none does. A
-/// loop runs its statements again, so its reads follow its writes too.
-/// `record` is the table the trigger fires on.
+/// Why a statement `trigger` keeps reads what one of its own removed writes
+/// produces, through what it sets off, or `None` when none does. A loop runs
+/// its statements again, so its reads follow its writes too.
 ///
 /// # Errors
 ///
 /// Fails when a trigger set off cannot be read.
 pub(super) fn own_dependency(
+    trigger: &CreateTrigger,
     chain: &Chain,
-    record: &str,
     schema: &ParserDB,
     options: &TranslationContext<'_>,
 ) -> Result<Option<String>, Error> {
+    let Some(fired) = FiringTrigger::of(trigger) else { return Ok(None) };
     let firing = Firing::new(schema, options);
+    let unchecked = firing.unchecked(&fired)?;
+    let record = Record { table: &fired.table, unchecked: &unchecked };
     let mut written_by: Vec<Written> = Vec::with_capacity(chain.writes.len());
     for write in &chain.writes {
         let mut written = Written::new();
-        firing.write_set_off(write, &mut written, &mut Visited::new())?;
-        firing.add(write, "", record, &mut written)?;
+        let changes = firing.changes(write)?;
+        firing.write_set_off(write, &changes, &mut written, &mut Visited::new())?;
+        firing.add(write, "", record, changes, &mut written)?;
         written_by.push(written);
     }
     let dependency = |reader: &[String], relation: &str, index: usize| {
@@ -617,10 +808,8 @@ pub(super) fn own_dependency(
     Ok(None)
 }
 
-/// The columns of its table `write` changes on the server: for an update,
-/// those it gives new values, beside the generated columns and every one
-/// where a `BEFORE` row trigger of the table assigns `NEW`, and for any
-/// other write the whole row, which rows the table holds among it.
+/// The columns of its table `write` changes on the server, as
+/// [`Firing::changes`] answers them.
 ///
 /// # Errors
 ///
@@ -630,15 +819,7 @@ pub(super) fn changed_by(
     schema: &ParserDB,
     options: &TranslationContext<'_>,
 ) -> Result<Columns, Error> {
-    let (Fresh::Columns(columns), "UPDATE") = (&write.fresh, write.statement) else {
-        return Ok(Columns::Row);
-    };
-    let firing = Firing::new(schema, options);
-    let set = Columns::Named(columns.iter().cloned().collect());
-    match firing.table(&write.relation) {
-        Some(table) => firing.changed(table, Event::Update, set),
-        None => Ok(set),
-    }
+    Firing::new(schema, options).changes(write)
 }
 
 /// `writes`, a trigger's own, and every write they set off on the server:
@@ -686,7 +867,14 @@ pub(super) fn fired_dependency(
     }
     let Some(fired) = FiringTrigger::of(trigger) else { return Ok(None) };
     let firing = Firing::new(schema, options);
+    let unchecked = firing.unchecked(&fired)?;
+    let record = Record { table: &fired.table, unchecked: &unchecked };
     for &event in &fired.events {
+        let stored = firing.table(&fired.table);
+        let changed = match stored {
+            Some(stored) => firing.changed(stored, event, firing.uploaded(stored, event)?)?,
+            None => Columns::Row,
+        };
         let mut written = Written::new();
         let mut visited = Visited::new();
         for peer in firing.triggers {
@@ -694,18 +882,17 @@ pub(super) fn fired_dependency(
                 && peer.table == fired.table
                 && peer.fires_on(event)
                 && peer.fires_before(&fired)
+                && firing.may_fire(peer, event, &changed)?
             {
                 firing.trigger_set_off(peer, &mut written, &mut visited)?;
             }
         }
-        if (Rank::AfterRow, ACTION_TRIGGER) < (fired.rank, fired.name.as_str())
-            && let Some(stored) = firing.table(&fired.table)
+        if (Rank::AfterRow, ACTION_TRIGGER) < (fired.rank, fired.name.as_str()) && stored.is_some()
         {
-            let changed = firing.changed(stored, event, firing.uploaded(stored, event)?)?;
             firing.actions_set_off(&fired.table, event, &changed, &mut written, &mut visited)?;
         }
         if let Some(Dependent { reader, relation, writer }) =
-            firing.first_read(&chain.steps, &written, &fired.table)?
+            firing.first_read(&chain.steps, &written, record)?
         {
             return Ok(Some(format!(
                 "{} reads {relation}, which {writer} writes before it on the same write",
@@ -713,16 +900,18 @@ pub(super) fn fired_dependency(
             )));
         }
     }
-    instead_of_dependency(&fired, chain, &firing)
+    instead_of_dependency(&fired, chain, &firing, record)
 }
 
 /// Why a statement `fired` keeps reads what an `INSTEAD OF` trigger's
 /// earlier writes set off before its write on the table of `fired` fires it,
-/// or `None` when none does.
+/// or `None` when none does. A read by the trigger's own function reads
+/// `NEW` and `OLD` as `record`.
 fn instead_of_dependency(
     fired: &FiringTrigger,
     chain: &Chain,
     firing: &Firing<'_, '_>,
+    record: Record<'_>,
 ) -> Result<Option<String>, Error> {
     for instead in firing.triggers.iter().filter(|trigger| trigger.rank == Rank::InsteadOf) {
         let Some(function) = written_function(firing.schema, &instead.function)? else {
@@ -736,7 +925,7 @@ fn instead_of_dependency(
                 && write.events().iter().any(|&event| fired.fires_on(event));
             if sets_it_off
                 && let Some(Dependent { reader, relation: read, writer }) =
-                    firing.first_read(&chain.steps, &written, &fired.table)?
+                    firing.first_read(&chain.steps, &written, record)?
             {
                 return Ok(Some(format!(
                     "{} reads {read}, which {writer} writes before it when INSTEAD OF trigger {} \
@@ -746,7 +935,7 @@ fn instead_of_dependency(
                     write.statement_on()
                 )));
             }
-            firing.write_set_off(write, &mut written, &mut visited)?;
+            firing.write_set_off(write, &firing.changes(write)?, &mut written, &mut visited)?;
         }
     }
     Ok(None)
