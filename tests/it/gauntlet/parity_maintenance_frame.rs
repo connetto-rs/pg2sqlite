@@ -924,3 +924,97 @@ fn an_insert_or_update_stamp_beside_an_audit_on_a_temporary_table() {
         &[SEED, "UPDATE items SET tag = 'b' WHERE id = 1;"],
     );
 }
+
+/// `annotate()` replaced under its new name, which the stamp still runs.
+const ANNOTATE_TWICE: &str = "CREATE OR REPLACE FUNCTION annotate_twice() RETURNS trigger
+                                  LANGUAGE plpgsql AS $$
+                              BEGIN NEW.note := coalesce(NEW.note, '') || '++'; RETURN NEW; END $$;";
+
+/// A stamp keeps the function it runs across that function's rename.
+#[test]
+fn a_stamp_follows_its_renamed_function() {
+    assert_agree(
+        &[
+            &schema(&[], NOTE_BOTH),
+            &format!("ALTER FUNCTION annotate() RENAME TO annotate_twice;{ANNOTATE_TWICE}"),
+        ],
+        &[SEED, "UPDATE items SET tag = 'b' WHERE id = 1;"],
+    );
+}
+
+/// A stamp keeps the function it runs across that function's rename in the
+/// batch creating them.
+#[test]
+fn a_stamp_follows_its_renamed_function_in_their_creating_batch() {
+    assert_agree(
+        &[&format!(
+            "{}ALTER FUNCTION annotate() RENAME TO annotate_twice;{ANNOTATE_TWICE}",
+            schema(&[], NOTE_BOTH)
+        )],
+        &[SEED, "UPDATE items SET tag = 'b' WHERE id = 1;"],
+    );
+}
+
+/// A stamp whose function was renamed joins the frame an audit created
+/// after the rename builds.
+#[test]
+fn a_renamed_stamp_function_framed_with_a_later_audit() {
+    assert_agree(
+        &[
+            &schema(&["after"], STAMP_BOTH),
+            &format!("ALTER FUNCTION stamp() RENAME TO stamp_renamed;{AUDIT_BOTH}"),
+        ],
+        &[SEED, "UPDATE items SET tag = 'b' WHERE id = 1;"],
+    );
+}
+
+/// Dropping a renamed function with `CASCADE` drops the trigger running it.
+#[test]
+fn dropping_a_renamed_function_with_its_trigger() {
+    assert_agree(
+        &[
+            &schema(&["after"], &format!("{STAMP_BOTH}{AUDIT_BOTH}")),
+            "ALTER FUNCTION stamp() RENAME TO stamp_renamed;
+             DROP FUNCTION stamp_renamed() CASCADE;",
+        ],
+        &[SEED, "UPDATE items SET tag = 'b' WHERE id = 1;"],
+    );
+}
+
+/// A stamp keeps the function it runs across that function's move to
+/// another schema.
+#[test]
+fn a_stamp_follows_its_function_into_another_schema() {
+    assert_agree(
+        &[
+            &schema(&[], NOTE_BOTH),
+            "CREATE SCHEMA notes;
+             ALTER FUNCTION annotate() SET SCHEMA notes;
+             CREATE OR REPLACE FUNCTION notes.annotate() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN NEW.note := coalesce(NEW.note, '') || '++'; RETURN NEW; END $$;",
+        ],
+        &[SEED, "UPDATE items SET tag = 'b' WHERE id = 1;"],
+    );
+}
+
+/// A stamp keeps the function it runs across the rename of that function's
+/// schema.
+#[test]
+fn a_stamp_follows_its_function_across_a_schema_rename() {
+    assert_agree(
+        &[
+            &format!(
+                "{}CREATE SCHEMA notes;
+                 CREATE FUNCTION notes.annotate() RETURNS trigger LANGUAGE plpgsql AS $$
+                 BEGIN NEW.note := coalesce(NEW.note, '') || '+'; RETURN NEW; END $$;
+                 CREATE TRIGGER items_note BEFORE INSERT OR UPDATE ON items
+                     FOR EACH ROW EXECUTE FUNCTION notes.annotate();",
+                schema(&[], "")
+            ),
+            "ALTER SCHEMA notes RENAME TO remarks;
+             CREATE OR REPLACE FUNCTION remarks.annotate() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN NEW.note := coalesce(NEW.note, '') || '++'; RETURN NEW; END $$;",
+        ],
+        &[SEED, "UPDATE items SET tag = 'b' WHERE id = 1;"],
+    );
+}

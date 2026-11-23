@@ -21,7 +21,7 @@
 
 use pg2sqlite::{
     prelude::{Pg2Sqlite, Pg2SqliteOptions},
-    warnings::TranslationReport,
+    warnings::{TranslationReport, TranslationWarning},
 };
 
 /// What the translator did with a statement.
@@ -536,6 +536,38 @@ fn a_trigger_function_is_silent_while_a_lone_one_warns() {
         with_trigger.script.iter().any(|statement| statement.to_string().contains("'stamped'")),
         "the function body must appear inside the emitted trigger: {:?}",
         with_trigger.script.iter().map(ToString::to_string).collect::<Vec<_>>()
+    );
+}
+
+/// A trigger function replaced under the name a rename gave it is still
+/// inlined into the trigger, so its replacement reports no loss.
+#[test]
+fn a_renamed_trigger_function_replaced_is_silent() {
+    let report = report(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT);
+         CREATE FUNCTION stamp() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+         BEGIN UPDATE t SET a = 'stamped' WHERE id = NEW.id; RETURN NEW; END $$;
+         CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION stamp();
+         ALTER FUNCTION stamp() RENAME TO restamp;
+         CREATE OR REPLACE FUNCTION restamp() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+         BEGIN UPDATE t SET a = 'restamped' WHERE id = NEW.id; RETURN NEW; END $$;",
+    )
+    .expect("translate");
+    let constructs: Vec<String> = report
+        .warnings
+        .iter()
+        .filter_map(|warning| {
+            match warning {
+                TranslationWarning::LossyDrop { construct, .. } => Some(construct.clone()),
+                _ => None,
+            }
+        })
+        .collect();
+    assert_eq!(constructs, ["ALTER FUNCTION"], "{:?}", report.warnings);
+    assert!(
+        report.script.iter().any(|statement| statement.to_string().contains("'restamped'")),
+        "the replacement body must appear inside the emitted trigger: {:?}",
+        report.script.iter().map(ToString::to_string).collect::<Vec<_>>()
     );
 }
 

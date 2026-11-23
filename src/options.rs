@@ -1147,6 +1147,34 @@ impl<'a> TranslationContext<'a> {
         &self.catalogs.before_row_trigger_fns
     }
 
+    /// Records each trigger function `statement` moves under its new name as
+    /// well, since the triggers keep running it.
+    pub(crate) fn carry_trigger_functions(&mut self, statement: &sqlparser::ast::Statement) {
+        use sqlparser::ast::{AlterFunction, AlterFunctionOperation, AlterFunctionSignature};
+
+        use crate::impls::{
+            object_name::last_ident_value_or_display, translator_impls::function_moves::moved,
+        };
+
+        let carried: Vec<_> = self
+            .catalogs
+            .before_row_trigger_fns
+            .iter()
+            .filter_map(|(table, function, event)| {
+                Some((table.clone(), moved(statement, function)?, *event))
+            })
+            .collect();
+        self.catalogs.to_mut().before_row_trigger_fns.extend(carried);
+        if let sqlparser::ast::Statement::AlterFunction(AlterFunction {
+            signature: AlterFunctionSignature::Function(function),
+            operation: AlterFunctionOperation::RenameTo { new_name },
+        }) = statement
+            && self.has_trigger_function_name(&last_ident_value_or_display(&function.name))
+        {
+            self.add_trigger_function_name(new_name.value.clone());
+        }
+    }
+
     /// Follows the triggers `statement` creates, drops, or carries to a
     /// renamed table, and forgets those of a dropped table.
     pub(crate) fn follow_triggers(&mut self, statement: &sqlparser::ast::Statement) {
