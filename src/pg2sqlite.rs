@@ -820,6 +820,25 @@ impl Pg2Sqlite {
         }
     }
 
+    /// The `DROP TRIGGER IF EXISTS` taking out of the translation schema a
+    /// seeded trigger `statement` drops or replaces, since the schema holds
+    /// none of the batch's own triggers.
+    fn seeded_trigger_drop(statement: &Statement) -> Option<Statement> {
+        let (trigger_name, table_name) = match statement {
+            Statement::DropTrigger(drop) => (&drop.trigger_name, drop.table_name.as_ref()),
+            Statement::CreateTrigger(create) if create.or_replace => {
+                (&create.name, Some(&create.table_name))
+            }
+            _ => return None,
+        };
+        Some(Statement::DropTrigger(DropTrigger {
+            if_exists: true,
+            trigger_name: trigger_name.clone(),
+            table_name: table_name.cloned(),
+            option: None,
+        }))
+    }
+
     pub(crate) fn schema_ends_epoch(statement: &Statement) -> bool {
         if let Statement::AlterTable(alter_table) = statement {
             return alter_table
@@ -1245,6 +1264,9 @@ impl Pg2Sqlite {
                     sources.to_mut()[start + index] = applied.clone();
                 }
                 input = input.apply_statement(applied)?;
+            }
+            if let Some(drop) = Self::seeded_trigger_drop(statement) {
+                input = input.apply_statement(drop)?;
             }
             if let Some(before) = event_before {
                 events.push(EventSnapshots {
