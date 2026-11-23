@@ -1,5 +1,5 @@
-//! A trigger or a view whose program SQLite refuses to prepare is refused at
-//! translation, naming the helpers it repeats.
+//! Every trigger and view a loaded connection holds that SQLite refuses to
+//! prepare is listed, and nothing SQLite prepares.
 //!
 //! SQLite refuses to expand a `WITH` query in a program already holding
 //! `SQLITE_LIMIT_EXPR_DEPTH` table cursors, and every call site of a helper
@@ -8,8 +8,11 @@
 
 use core::fmt::Write as _;
 
-use diesel::RunQueryDsl;
-use pg2sqlite::{errors::Error, pg2sqlite::Pg2Sqlite, prelude::Pg2SqliteOptions};
+use diesel::{RunQueryDsl, connection::SimpleConnection};
+use pg2sqlite::{
+    prelude::Pg2SqliteOptions,
+    programs::{UnpreparedProgram, unprepared_programs},
+};
 use sql_traits::structs::{Deployment, SessionSetting, SettingValue};
 use sqlparser::ast::DataType;
 
@@ -120,77 +123,42 @@ fn options() -> Pg2SqliteOptions {
         .with_acting_role("app")
 }
 
-/// A trigger on `events` running `writes` copies of `write`, then a write
-/// whose `WITH` query SQLite expands once the copies hold their cursors.
-fn writing_trigger(target: &str, write: &str, writes: usize) -> String {
-    format!(
-        "CREATE TABLE events (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);
-CREATE FUNCTION touch() RETURNS trigger LANGUAGE plpgsql AS $$
-BEGIN
-{}
-  UPDATE {target} SET v = NEW.v WHERE id IN (WITH last (id) AS (SELECT NEW.id) SELECT id FROM last);
-  RETURN NEW;
-END
-$$;
-CREATE TRIGGER touch AFTER UPDATE ON events FOR EACH ROW EXECUTE FUNCTION touch();
-",
-        vec![format!("  {write};"); writes].join("\n")
-    )
-}
-
-/// Translates `script(count)` for each of `counts`, over the translation of
-/// `starting` when given, which the translation also reads as the SQLite
-/// statements the database holds, and runs `firing` on each script
-/// translated, which prepares every program it fires.
+/// Translates `script(count)` for each of `counts`, loads it, lists the
+/// programs SQLite refuses to prepare, and runs `firing`, which prepares
+/// `program`.
 ///
-/// Asserts that SQLite prepares every program of a script translated, and
-/// that the translation refuses the larger counts.
+/// Asserts that `program` is listed exactly when SQLite refuses `firing`,
+/// and that the sweep reaches both sides of the limit.
 fn sweep(
-    starting: Option<&str>,
     script: impl Fn(usize) -> String,
     counts: impl IntoIterator<Item = usize>,
     firing: &str,
-    options: &Pg2SqliteOptions,
+    program: &str,
 ) {
-    let starting = starting.map(|sql| {
-        let translator = Pg2Sqlite::default().sql(sql).expect("the starting schema parses");
-        let schema = translator.build_schema().expect("the starting schema builds");
-        let script = translator
-            .translate_to_sql(options)
-            .unwrap_or_else(|error| panic!("the starting schema is refused: {error}"))
-            .into_vec();
-        (schema, script)
-    });
     let mut refused = None;
     let mut accepted = None;
     for count in counts {
-        let translator = Pg2Sqlite::default().sql(&script(count)).expect("the script parses");
-        let translated = match &starting {
-            Some((schema, held)) => {
-                translator
-                    .starting_sqlite(&held.join(";\n"))
-                    .expect("the starting script parses as SQLite")
-                    .translate_to_sql_with_schema(schema, options)
-            }
-            None => translator.translate_to_sql(options),
-        };
-        match translated {
-            Ok(translated) => {
-                assert!(refused.is_none(), "{count} translates past a refusal at {refused:?}");
-                let mut connection = helpers::establish_connection();
-                let base = starting.iter().flat_map(|(_, script)| script);
-                for statement in base.chain(&translated.into_vec()) {
-                    diesel::sql_query(statement).execute(&mut connection).unwrap_or_else(|error| {
-                        panic!("emitted statement failed: {error}\n{statement}")
-                    });
-                }
-                diesel::sql_query(firing)
-                    .execute(&mut connection)
-                    .unwrap_or_else(|error| panic!("SQLite refuses {firing} at {count}: {error}"));
+        let translated = helpers::translate_pg(&script(count), &options())
+            .unwrap_or_else(|error| panic!("{count} fails to translate: {error}"));
+        let mut connection = helpers::establish_connection();
+        connection.batch_execute(&translated.join(";\n")).expect("the script loads");
+        let unprepared = unprepared_programs(&mut connection).expect("the schema reads");
+        let listed = unprepared.iter().any(|unprepared| lists(unprepared, program));
+        // The statement a client sends, written as text the way a client sends
+        // it.
+        match diesel::sql_query(firing).execute(&mut connection) {
+            Ok(_) => {
+                assert!(!listed, "{count} lists {program}, which SQLite prepares: {unprepared:?}");
+                assert!(refused.is_none(), "{count} prepares past a refusal at {refused:?}");
                 accepted = Some(count);
             }
-            Err(Error::TranslationRefusal(_)) => refused = refused.or(Some(count)),
-            Err(error) => panic!("{count} fails to translate: {error}"),
+            Err(error) => {
+                assert!(
+                    listed,
+                    "{count} leaves out {program}, which fails with {error}: {unprepared:?}"
+                );
+                refused = refused.or(Some(count));
+            }
         }
     }
     assert!(
@@ -199,105 +167,18 @@ fn sweep(
     );
 }
 
-#[test]
-fn every_policy_translated_prepares() {
-    sweep(None, |calls| walk_chain(1, calls), 1..=16, "UPDATE items SET value = 1", &options());
+/// Whether `unprepared` names `program` among the programs it compiles.
+fn lists(unprepared: &UnpreparedProgram, program: &str) -> bool {
+    unprepared.programs.iter().any(|name| name == program)
 }
 
 #[test]
-fn a_table_renamed_keeps_its_indexes_and_foreign_keys() {
-    let script = |writes| {
-        format!(
-            "CREATE TABLE parents (id INTEGER PRIMARY KEY);
-CREATE TABLE rows_old (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parents (id), a INTEGER, b INTEGER, c INTEGER, d INTEGER, v INTEGER);
-CREATE INDEX rows_a ON rows_old (a);
-CREATE INDEX rows_b ON rows_old (b);
-CREATE INDEX rows_c ON rows_old (c);
-CREATE INDEX rows_d ON rows_old (d);
-ALTER TABLE rows_old RENAME TO rows;
-{}",
-            writing_trigger("rows", "UPDATE rows SET v = NEW.v, parent_id = NULL WHERE a = NEW.id", writes)
-        )
-    };
+fn a_policy_trigger_is_listed_exactly_when_sqlite_refuses_it() {
     sweep(
-        None,
-        script,
-        (10..=200).step_by(10),
-        "UPDATE events SET v = 1",
-        &Pg2SqliteOptions::default(),
-    );
-}
-
-#[test]
-fn a_foreign_key_added_to_a_table_is_checked_by_its_writes() {
-    let script = |writes| {
-        format!(
-            "CREATE TABLE parents (id INTEGER PRIMARY KEY);
-CREATE TABLE rows (id INTEGER PRIMARY KEY, v INTEGER);
-ALTER TABLE rows ADD COLUMN p1 INTEGER REFERENCES parents (id);
-ALTER TABLE rows ADD COLUMN p2 INTEGER REFERENCES parents (id);
-ALTER TABLE rows ADD COLUMN p3 INTEGER REFERENCES parents (id);
-ALTER TABLE rows ADD COLUMN p4 INTEGER REFERENCES parents (id);
-{}",
-            writing_trigger(
-                "rows",
-                "UPDATE rows SET v = NEW.v, p1 = NEW.id, p2 = NEW.id, p3 = NEW.id, p4 = NEW.id WHERE id = NEW.id",
-                writes
-            )
-        )
-    };
-    sweep(
-        None,
-        script,
-        (10..=200).step_by(10),
-        "UPDATE events SET v = 1",
-        &Pg2SqliteOptions::default(),
-    );
-}
-
-#[test]
-fn a_table_referenced_by_several_columns_checks_each_on_its_writes() {
-    let script = |writes| {
-        format!(
-            "CREATE TABLE parents (id INTEGER PRIMARY KEY, v INTEGER);
-CREATE TABLE rows (id INTEGER PRIMARY KEY, p1 INTEGER REFERENCES parents (id), p2 INTEGER REFERENCES parents (id), p3 INTEGER REFERENCES parents (id), p4 INTEGER REFERENCES parents (id));
-{}",
-            writing_trigger(
-                "parents",
-                "UPDATE parents SET id = NEW.id WHERE id = NEW.id",
-                writes
-            )
-        )
-    };
-    sweep(
-        None,
-        script,
-        (10..=200).step_by(10),
-        "UPDATE events SET v = 1",
-        &Pg2SqliteOptions::default(),
-    );
-}
-
-#[test]
-fn a_write_reading_other_relations_counts_them() {
-    let script = |writes| {
-        format!(
-            "CREATE TABLE parents (id INTEGER PRIMARY KEY, v INTEGER);
-CREATE TABLE rows (id INTEGER PRIMARY KEY, v INTEGER);
-{}",
-            writing_trigger(
-                "rows",
-                "UPDATE rows SET v = parents.v FROM parents, (SELECT v FROM parents JOIN events USING (v)) AS shared WHERE parents.id = rows.id AND shared.v = parents.v AND rows.id = NEW.id",
-                writes
-            )
-        )
-    };
-    sweep(
-        None,
-        script,
-        (10..=200).step_by(10),
-        "UPDATE events SET v = 1",
-        &Pg2SqliteOptions::default(),
+        |calls| walk_chain(1, calls),
+        [1, 8, 16, 24, 32, 48, 64],
+        "UPDATE items SET value = 1",
+        "items_update_trigger",
     );
 }
 
@@ -312,69 +193,88 @@ GRANT SELECT ON reached TO app;
 }
 
 #[test]
-fn a_view_past_the_limit_is_refused_as_the_statement_reading_it() {
-    sweep(None, reaching_view, 1..=6, "SELECT count(*) FROM reached", &options());
-    let message = refusal(&reaching_view(6));
-    for named in ["view `reached`", "ids_6() once"] {
-        assert!(message.contains(named), "the refusal names {named}: {message}");
-    }
+fn a_view_is_listed_exactly_when_sqlite_refuses_to_read_it() {
+    sweep(reaching_view, 1..=8, "SELECT count(*) FROM reached", "reached");
 }
 
-#[test]
-fn a_view_of_the_starting_schema_counts_in_the_programs_reading_it() {
-    let starting = format!(
-        "{}CREATE VIEW reached WITH (security_invoker = true) AS SELECT id FROM items WHERE id IN (SELECT ids_2());
-GRANT SELECT ON reached TO app;
+/// Views `v0` to `v<levels>` over `t`, `v0` reading a `WITH` query and each
+/// next one reading the previous one twice, so SQLite expands `2^levels`
+/// copies of it.
+fn doubling_views(levels: usize) -> String {
+    let mut sql = String::from(
+        "CREATE TABLE t (x);
+CREATE VIEW v0 AS WITH c (x) AS (SELECT x FROM t) SELECT x FROM c;
 ",
-        walk_chain(2, 1)
     );
-    let script = |reads| {
-        format!(
-            "CREATE TABLE tallies (id INTEGER PRIMARY KEY, v INTEGER NOT NULL);
-{}GRANT SELECT, UPDATE ON tallies TO app;
-GRANT SELECT, UPDATE ON events TO app;
-",
-            writing_trigger(
-                "tallies",
-                "UPDATE tallies SET v = (SELECT count(*) FROM reached) WHERE id = NEW.id",
-                reads
-            )
+    for level in 1..=levels {
+        let previous = level - 1;
+        writeln!(
+            sql,
+            "CREATE VIEW v{level} AS SELECT x FROM v{previous} UNION ALL SELECT x FROM v{previous};"
         )
-    };
-    sweep(
-        Some(&starting),
-        script,
-        (1..=20).map(|reads| reads * 2),
-        "UPDATE events SET v = 1",
-        &options(),
-    );
-}
-
-/// The refusal translating `sql` raises.
-fn refusal(sql: &str) -> String {
-    let error = helpers::translate_pg(sql, &options())
-        .map(|script| script.join("\n"))
-        .expect_err("SQLite refuses to prepare a program of the script");
-    let Error::TranslationRefusal(refusal) = &error else { panic!("not a refusal: {error}") };
-    refusal.to_string()
+        .expect("writing to a string");
+    }
+    sql
 }
 
 #[test]
-fn a_program_past_sqlites_cursor_limit_is_refused_naming_the_repeated_helpers() {
-    let message = refusal(&walk_chain(1, 16));
-    for named in ["items_update_trigger", "cursors", "ids_0() 96 times", "ids_1() 48 times"] {
-        assert!(message.contains(named), "the refusal names {named}: {message}");
+fn every_refused_program_is_listed_with_the_write_compiling_it() {
+    let mut connection = helpers::establish_connection();
+    connection
+        .batch_execute(&format!(
+            "{}CREATE TABLE a (x);
+CREATE TRIGGER a_deleted AFTER DELETE ON a BEGIN SELECT x FROM v10; END;
+CREATE TRIGGER a_inserted AFTER INSERT ON a BEGIN SELECT x FROM v1; END;
+CREATE TABLE b (x, y, z AS (x + 1));
+CREATE TRIGGER \"update\" AFTER INSERT ON b BEGIN SELECT x FROM v10; END;
+CREATE TRIGGER b_updated AFTER UPDATE OF y ON b BEGIN SELECT x FROM v10; END;
+CREATE VIEW w AS SELECT x FROM t;
+CREATE TRIGGER w_inserted INSTEAD OF INSERT ON w BEGIN INSERT INTO t VALUES (NEW.x); END;
+CREATE TEMP TRIGGER /* DELETE */ t_updated AFTER UPDATE OF x ON t BEGIN SELECT x FROM v10; END;
+CREATE VIEW deep AS SELECT x FROM v10;
+CREATE TRIGGER deep_updated INSTEAD OF UPDATE ON deep BEGIN SELECT 1; END;
+",
+            doubling_views(10)
+        ))
+        .expect("the script loads");
+    let unprepared = unprepared_programs(&mut connection).expect("the schema reads");
+    let mut listed: Vec<(&str, Vec<&str>)> = unprepared
+        .iter()
+        .map(|unprepared| {
+            (
+                unprepared.statement.as_str(),
+                unprepared.programs.iter().map(String::as_str).collect(),
+            )
+        })
+        .collect();
+    listed.sort_unstable();
+    let view_reads: Vec<(String, String)> = ["v8", "v9", "v10", "deep"]
+        .into_iter()
+        .map(|view| (format!("SELECT * FROM \"main\".\"{view}\""), view.to_owned()))
+        .collect();
+    let mut expected: Vec<(&str, Vec<&str>)> = vec![
+        ("DELETE FROM \"main\".\"a\"", vec!["a_deleted"]),
+        ("INSERT INTO \"main\".\"b\" DEFAULT VALUES", vec!["update"]),
+        ("UPDATE \"main\".\"b\" SET \"x\" = \"x\", \"y\" = \"y\"", vec!["b_updated"]),
+        ("UPDATE \"main\".\"t\" SET \"x\" = \"x\"", vec!["t_updated"]),
+        ("UPDATE \"main\".\"deep\"", vec!["deep_updated"]),
+    ];
+    expected.extend(view_reads.iter().map(|(read, view)| (read.as_str(), vec![view.as_str()])));
+    expected.sort_unstable();
+    assert_eq!(listed, expected);
+    for unprepared in &unprepared {
+        assert!(
+            unprepared.message.contains("nested too deep"),
+            "SQLite's own refusal is kept: {unprepared}"
+        );
     }
 }
 
 #[test]
-fn a_deep_helper_chain_is_refused_on_a_default_thread() {
-    let message = refusal(&walk_chain(7, 1));
-    assert!(message.contains("ids_7()"), "the refusal names the policy's helper: {message}");
+fn a_deep_helper_chain_translates_on_a_default_thread() {
+    assert_translates(&walk_chain(7, 1));
 }
 
-/// Past the 60 helpers whose inlined sets a debug build copied into an abort
-/// on a default thread.
 const CHAIN_DEPTH: usize = 100;
 
 /// Translates `sql`, failing the test when translation errors.

@@ -288,8 +288,7 @@ fn helper_query(
             )
         })
         .map_err(|error| untranslatable(name, &error))?;
-    let mut lowering =
-        Lowering { helper: name, schema, read: Vec::new(), walks: 0, called: Vec::new() };
+    let mut lowering = Lowering { helper: name, schema, read: Vec::new(), walks: 0 };
     let lowered = lowering.set(&set, names)?;
     let acting = session_variable::acting_role(schema, options)?;
     let mut guarded = Vec::new();
@@ -312,9 +311,6 @@ fn helper_query(
         lowered.translate_with_warnings(schema, options, &mut |warning| warnings.push(warning))?;
     let ControlFlow::Continue(()) = lowered
         .visit(&mut BackingTables { guarded: &guarded, suffix: options.get_rls_table_suffix() });
-    let mut helpers = vec![helper.target_name().to_string()];
-    helpers.append(&mut lowering.called);
-    options.record_helper_set(&lowered, helpers);
     if let Some(call) = call {
         let mut cache = options.batch_cache().borrow_mut();
         if cache.holds(call.schema) {
@@ -514,8 +510,6 @@ struct Lowering<'h, 'db> {
     read: Vec<&'db CreateTable>,
     /// How many walks the query names so far.
     walks: usize,
-    /// The helpers whose sets the query reads, one entry per call.
-    called: Vec<String>,
 }
 
 impl<'db> Lowering<'_, 'db> {
@@ -580,17 +574,6 @@ impl<'db> Lowering<'_, 'db> {
             return Ok(make_query(None, arms));
         }
         Ok(self.reached(arms, union(edges, SetQuantifier::All), selection, names))
-    }
-
-    /// [`Self::set`] for the set a call to `function` returns.
-    fn called_set(
-        &mut self,
-        function: &<ParserDB as DatabaseLike>::Function,
-        set: &HelperSet<'db, ParserDB>,
-        names: &[Ident],
-    ) -> Result<Query, Error> {
-        self.called.push(function.target_name().to_string());
-        self.set(set, names)
     }
 
     /// `WITH [RECURSIVE] <walk> (node) AS (<arms> [UNION <step>]) SELECT node
@@ -697,7 +680,7 @@ impl<'db> Lowering<'_, 'db> {
         names: &[Ident],
     ) -> Result<SetExpr, Error> {
         self.read.push(parent.table());
-        let parents = self.called_set(parent.function(), parent.set(), &[])?;
+        let parents = self.set(parent.set(), &[])?;
         Ok(SetExpr::Select(Box::new(make_simple_select(
             projection([qualified(ARM, declared_column_ident(parent.key()))], names),
             from_relation(aliased_table(parent.table(), ARM)),
@@ -720,7 +703,7 @@ impl<'db> Lowering<'_, 'db> {
         names: &[Ident],
     ) -> Result<SetExpr, Error> {
         self.read.push(membership.table);
-        let set = self.called_set(membership.function, membership.set, &[called_column(0)])?;
+        let set = self.set(membership.set, &[called_column(0)])?;
         let mut select = make_simple_select(
             projection([qualified(ARM, declared_column_ident(membership.key))], names),
             vec![TableWithJoins {
@@ -762,7 +745,7 @@ impl<'db> Lowering<'_, 'db> {
         // A helper returning `SETOF` a scalar type declares no column.
         let arity = called.function().returned_columns(self.schema).count().max(1);
         let columns: Vec<Ident> = (0..arity).map(called_column).collect();
-        let rows = self.called_set(called.function(), called.set(), &columns)?;
+        let rows = self.set(called.set(), &columns)?;
         let (returned, labels) = returned_values(called.returned(), |position| {
             qualified(CALLED, called_column(*position))
         });
@@ -812,7 +795,7 @@ impl<'db> Lowering<'_, 'db> {
         match grant.granted_to() {
             GrantedTo::Request(comparison) => conditions.push(request(comparison)),
             GrantedTo::Set(grantees) => {
-                let set = self.called_set(grantees.function(), grantees.set(), &[])?;
+                let set = self.set(grantees.set(), &[])?;
                 conditions
                     .push(in_query(qualified(ARM, declared_column_ident(grantees.column())), set));
             }
@@ -895,7 +878,7 @@ impl<'db> Lowering<'_, 'db> {
         let capped = if cap.set().arms().is_empty() {
             Expr::Value(Value::Boolean(false).into())
         } else {
-            in_query(row, self.called_set(cap.function(), cap.set(), &[])?)
+            in_query(row, self.set(cap.set(), &[])?)
         };
         Ok(match cap.lift() {
             Some(lift) => {

@@ -408,8 +408,6 @@ fn register_declared_object_name(statement: &Statement, context: &mut Translatio
 pub struct Pg2Sqlite {
     /// The set of `PostgreSQL` statements to be translated.
     pg_statements: Vec<Statement>,
-    /// The SQLite statements the database the translation runs on holds.
-    starting_sqlite: Vec<Statement>,
 }
 
 struct PreparedEpoch {
@@ -975,43 +973,6 @@ impl Pg2Sqlite {
         for statement in stmt {
             self = self.statement(statement);
         }
-        Ok(self)
-    }
-
-    /// Parses `sql` as the SQLite statements the target database already
-    /// holds, which the translation counts when it bounds the cursors its
-    /// triggers and views open.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if parsing fails.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use pg2sqlite::prelude::*;
-    /// let options = Pg2SqliteOptions::default();
-    /// let source = Pg2Sqlite::default().sql("CREATE TABLE t (a INT);")?;
-    /// let schema = source.build_schema()?;
-    /// let held = source.translate_to_sql(&options)?.into_vec().join(";\n");
-    /// let migration = Pg2Sqlite::default()
-    ///     .sql("CREATE INDEX t_a ON t (a);")?
-    ///     .starting_sqlite(&held)?
-    ///     .translate_to_sql_with_schema(&schema, &options)?
-    ///     .into_vec();
-    /// assert_eq!(migration.last().map(String::as_str), Some("CREATE INDEX t_a ON t(a)"));
-    /// # Ok::<(), Error>(())
-    /// ```
-    pub fn starting_sqlite(mut self, sql: &str) -> Result<Self, crate::errors::Error> {
-        let statements =
-            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::SQLiteDialect {}, sql)
-                .map_err(|source| {
-                    crate::errors::Error::from(crate::errors::SqlParseError::new(
-                        sql.to_owned(),
-                        source,
-                    ))
-                })?;
-        self.starting_sqlite.extend(statements);
         Ok(self)
     }
 
@@ -1667,15 +1628,6 @@ impl Pg2Sqlite {
         let connection = crate::history::connection_program(&units, &schema, &context, &mut placed);
         let (main, attached) = crate::history::fresh_forms(&units, &mut placed, &schema, &context);
         drop(units);
-        crate::impls::cursor_budget::check(
-            self.starting_sqlite.iter().chain(&prelude).chain(statements.iter().flatten()),
-            connection
-                .iter()
-                .flatten()
-                .chain(main.iter().flatten().flatten().flatten())
-                .chain(attached.iter().flatten().flatten().flatten()),
-            &context.helper_sets(),
-        )?;
         let files = crate::initialization::InitializationPlan::new(
             prelude,
             placed.unit_files.into_iter().zip(statements),

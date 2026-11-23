@@ -256,12 +256,6 @@ pub(crate) struct PrewalkCatalogs {
     deferred_triggers: Vec<crate::impls::translator_impls::deferred_constraint::DeferredTrigger>,
     /// The request's zone, resolved the first time an operation needs it.
     request_zone: core::cell::OnceCell<Result<RequestZone, ZoneUnavailable>>,
-    /// The helpers each query written as the set of a helper call reads,
-    /// the helper called and the ones its set calls, which a refusal of a
-    /// program past SQLite's cursor limit counts.
-    helper_sets: core::cell::RefCell<
-        alloc::collections::BTreeMap<crate::impls::cursor_budget::HelperSetKey, Vec<String>>,
-    >,
     /// What the batch's translation works out once, kept for the schemas it
     /// holds alive, boxed so every context stays as small.
     batch_cache: Box<core::cell::RefCell<crate::impls::batch_cache::BatchCache>>,
@@ -1315,26 +1309,6 @@ impl<'a> TranslationContext<'a> {
             .request_zone
             .get_or_init(|| crate::impls::request_zone::resolve(schema, self.options.as_ref()))
             .as_ref()
-    }
-
-    /// Records `query` as the set of a call to the helper first in
-    /// `helpers`, its set calling the others.
-    pub(crate) fn record_helper_set(&self, query: &sqlparser::ast::Query, helpers: Vec<String>) {
-        self.catalogs
-            .helper_sets
-            .borrow_mut()
-            .insert(crate::impls::cursor_budget::HelperSetKey::of(query), helpers);
-    }
-
-    /// The queries written as the set of a helper call, each with the
-    /// helpers it reads.
-    pub(crate) fn helper_sets(
-        &self,
-    ) -> core::cell::Ref<
-        '_,
-        alloc::collections::BTreeMap<crate::impls::cursor_budget::HelperSetKey, Vec<String>>,
-    > {
-        self.catalogs.helper_sets.borrow()
     }
 }
 
