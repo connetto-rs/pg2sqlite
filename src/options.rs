@@ -768,8 +768,10 @@ impl<'a> TranslationContext<'a> {
             running_as: self.running_as,
             inlined_body: self.inlined_body,
             trigger_rows: None,
+            trigger_catalog: None,
             locked: &[],
             locks_whole_query: false,
+            declaration: None,
         })
     }
 
