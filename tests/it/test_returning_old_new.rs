@@ -1,6 +1,9 @@
 //! Row versions in `RETURNING` expressions.
 
-use crate::helpers::{run_translated::run_translated_default, translate::assert_refused};
+use crate::helpers::{
+    run_translated::{run_translated_default, run_translated_utc},
+    translate::assert_refused,
+};
 
 /// `UPDATE RETURNING` refuses the unavailable pre-update row.
 #[test]
@@ -260,4 +263,153 @@ fn returning_old_new_nested_column_names() {
             vec![Some(expected.to_owned())],
         );
     }
+}
+
+/// An insertion alias leaves the implicit new row available.
+#[test]
+fn returning_insert_alias() {
+    assert_eq!(
+        run_translated_default(
+            "CREATE TABLE base (score INTEGER);
+             INSERT INTO base AS inserted VALUES (6) RETURNING new.score;",
+        ),
+        vec![Some("6".to_owned())],
+    );
+}
+
+/// A parenthesized absent row is null.
+#[test]
+fn returning_absent_whole_row() {
+    for returned in ["(old.*)", "old"] {
+        assert_eq!(
+            run_translated_default(&format!(
+                "CREATE TABLE base (score INTEGER);
+                 INSERT INTO base VALUES (7) RETURNING {returned};"
+            )),
+            vec![None],
+        );
+    }
+}
+
+/// Available composite rows require a translation-time refusal.
+#[test]
+fn returning_current_whole_row() {
+    for returned in ["(new.*)", "new", "row_to_json(new.*)"] {
+        assert_refused(
+            &format!(
+                "CREATE TABLE base (score INTEGER);
+                 INSERT INTO base VALUES (6);
+                 UPDATE base SET score = score + 1 RETURNING {returned};"
+            ),
+            "whole row cannot be translated",
+        );
+    }
+}
+
+/// Nested queries preserve the current row and their own table bindings.
+#[test]
+fn returning_nested_queries() {
+    for returned in [
+        "(SELECT (SELECT new.score))",
+        "(SELECT new.score FROM (SELECT score FROM base) AS nested)",
+    ] {
+        assert_eq!(
+            run_translated_default(&format!(
+                "CREATE TABLE base (score INTEGER); INSERT INTO base VALUES (6);
+                 UPDATE base SET score = 8 RETURNING {returned};"
+            )),
+            vec![Some("8".to_owned())],
+        );
+    }
+}
+
+/// A row star can share a nested projection with an ordinary expression.
+#[test]
+fn returning_mixed_nested_projection() {
+    assert_eq!(
+        run_translated_default(
+            "CREATE TABLE base (score INTEGER); INSERT INTO base VALUES (6);
+             UPDATE base SET score = 8
+             RETURNING (SELECT count(*) FROM (SELECT new.*, 1 AS marker) AS projected);",
+        ),
+        vec![Some("1".to_owned())],
+    );
+}
+
+/// A correlated star cannot bind an inner relation with the target's name.
+#[test]
+fn returning_shadowed_target_star() {
+    assert_refused(
+        "CREATE TABLE base (score INTEGER); INSERT INTO base VALUES (6);
+         UPDATE base SET score = 9
+         RETURNING (SELECT new.* FROM (VALUES (99)) AS base(score));",
+        "shadows the target",
+    );
+}
+
+/// A nested local column can coexist with an outer row-version reference.
+#[test]
+fn returning_nested_local_column() {
+    assert_eq!(
+        run_translated_default(
+            "CREATE TABLE base (score INTEGER); CREATE TABLE other (old INTEGER);
+             INSERT INTO base VALUES (6); INSERT INTO other VALUES (70);
+             UPDATE base SET score = 10
+             RETURNING (SELECT new.score + (SELECT old FROM other));",
+        ),
+        vec![Some("80".to_owned())],
+    );
+}
+
+/// Keyword functions remain available in a returned expression.
+#[test]
+fn returning_keyword_function() {
+    assert_eq!(
+        run_translated_utc(
+            "CREATE TABLE base (score INTEGER); INSERT INTO base VALUES (6);
+             UPDATE base SET score = 11 RETURNING (CURRENT_DATE IS NOT NULL)::INTEGER;",
+        ),
+        vec![Some("1".to_owned())],
+    );
+}
+
+/// Converting an absent row to `JSON` still requires row conversion support.
+#[test]
+fn returning_absent_row_to_json() {
+    assert_refused(
+        "CREATE TABLE base (score INTEGER);
+         INSERT INTO base VALUES (7) RETURNING row_to_json(old.*);",
+        "row_to_json() is not available",
+    );
+}
+
+/// Expanding an absent row requires the target's column definitions.
+#[test]
+fn returning_absent_star_without_schema() {
+    for returned in ["old.*", "(SELECT old.*)"] {
+        assert_refused(
+            &format!("INSERT INTO base VALUES (7) RETURNING {returned};"),
+            "requires the target table definition",
+        );
+    }
+}
+
+/// A whole current row is refused even without a target schema.
+#[test]
+fn returning_current_row_without_schema() {
+    assert_refused("UPDATE base SET score = 7 RETURNING new;", "whole row cannot be translated");
+}
+
+/// An unsupported `XML` input conversion is refused inside a returned query.
+#[test]
+fn returning_xml_source() {
+    assert_refused(
+        "CREATE TABLE base (score INTEGER); INSERT INTO base VALUES (6);
+         UPDATE base SET score = 7
+         RETURNING (SELECT new.score FROM XMLTABLE(
+             '/root' PASSING XMLPARSE(DOCUMENT '<root/>')
+             COLUMNS marker INTEGER PATH '1'
+         ) AS expanded);",
+        "xmlparse()",
+    );
 }

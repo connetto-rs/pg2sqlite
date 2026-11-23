@@ -125,15 +125,19 @@ impl<'a> ReturningRows<'a> {
                         output.push(SelectItem::Wildcard(wildcard.clone()));
                     }
                     RowValue::Current | RowValue::Absent => {
-                        let table = self.target.map(|name| resolve_translation_table(schema, name)).transpose()?.flatten()
-                            .ok_or_else(|| Error::forward_refusal("RETURNING a row's columns requires the target table definition."))?;
+                        let table = self
+                            .target
+                            .map(|name| resolve_translation_table(schema, name))
+                            .transpose()?
+                            .flatten()
+                            .ok_or_else(target_definition)?;
                         let visitor = Rewrite::new(self, schema);
                         for column in table.columns(schema)? {
                             let alias = Ident::with_quote('"', column.column_name());
-                            let expr = match version {
-                                RowValue::Current => visitor.current_column(&alias)?,
-                                RowValue::Absent => Expr::Value(Value::Null.into()),
-                                RowValue::Unavailable => return Err(unavailable()),
+                            let expr = if matches!(version, RowValue::Current) {
+                                visitor.current_column(&alias)?
+                            } else {
+                                Expr::Value(Value::Null.into())
                             };
                             output.push(translate_select_item::<D>(
                                 &SelectItem::ExprWithAlias { expr, alias },
@@ -291,32 +295,7 @@ impl VisitorMut for Rewrite<'_, '_> {
     type Break = Error;
 
     fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Error> {
-        if self.query_depth == 0
-            && visit_expressions(query, |expr| {
-                if matches!(expr, Expr::Identifier(ident) if version_index(ident).is_some()) {
-                    ControlFlow::Break(())
-                } else {
-                    ControlFlow::Continue(())
-                }
-            })
-            .is_break()
-        {
-            let scope = match crate::options::query_column_scope(query, self.schema) {
-                Ok(scope) => scope,
-                Err(error) => return ControlFlow::Break(error.into()),
-            };
-            let mut collector = LocalColumns {
-                scope: &scope,
-                output: &mut self.local_columns,
-                references: [
-                    Expr::Identifier(Ident::new("old")),
-                    Expr::Identifier(Ident::new("new")),
-                ],
-            };
-            let _ = Visit::visit(&*query, &mut collector);
-        }
-        self.query_depth += 1;
-        ControlFlow::Continue(())
+        self.enter_query(query).map_or_else(ControlFlow::Break, |()| ControlFlow::Continue(()))
     }
 
     fn post_visit_query(&mut self, _: &mut Query) -> ControlFlow<Error> {
@@ -354,22 +333,19 @@ impl VisitorMut for Rewrite<'_, '_> {
                 return ControlFlow::Break(unavailable());
             }
             let result = (|| {
-                let target = self.rows.target.ok_or_else(|| {
-                    Error::forward_refusal(
-                        "RETURNING a row's columns requires a named target table.",
-                    )
-                })?;
-                let table = resolve_translation_table(self.schema, target)?.ok_or_else(|| {
-                    Error::forward_refusal(
-                        "RETURNING a row's columns requires the target table definition.",
-                    )
-                })?;
+                let table = self
+                    .rows
+                    .target
+                    .map(|target| resolve_translation_table(self.schema, target))
+                    .transpose()?
+                    .flatten()
+                    .ok_or_else(target_definition)?;
                 for column in table.columns(self.schema)? {
                     let alias = Ident::with_quote('"', column.column_name());
-                    let expr = match version {
-                        RowValue::Absent => Expr::Value(Value::Null.into()),
-                        RowValue::Current => self.current_column(&alias)?,
-                        RowValue::Unavailable => return Err(unavailable()),
+                    let expr = if matches!(version, RowValue::Current) {
+                        self.current_column(&alias)?
+                    } else {
+                        Expr::Value(Value::Null.into())
                     };
                     projection.push(SelectItem::ExprWithAlias { expr, alias });
                 }
@@ -389,6 +365,38 @@ impl VisitorMut for Rewrite<'_, '_> {
     }
 
     fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Error> {
+        self.rewrite_expr(expr).map_or_else(ControlFlow::Break, |()| ControlFlow::Continue(()))
+    }
+}
+
+impl Rewrite<'_, '_> {
+    fn enter_query(&mut self, query: &Query) -> Result<(), Error> {
+        if self.query_depth == 0
+            && visit_expressions(query, |expr| {
+                if matches!(expr, Expr::Identifier(ident) if version_index(ident).is_some()) {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })
+            .is_break()
+        {
+            let scope = crate::options::query_column_scope(query, self.schema)?;
+            let mut collector = LocalColumns {
+                scope: &scope,
+                output: &mut self.local_columns,
+                references: [
+                    Expr::Identifier(Ident::new("old")),
+                    Expr::Identifier(Ident::new("new")),
+                ],
+            };
+            let _ = Visit::visit(query, &mut collector);
+        }
+        self.query_depth += 1;
+        Ok(())
+    }
+
+    fn rewrite_expr(&mut self, expr: &mut Expr) -> Result<(), Error> {
         if let Expr::Function(function) = expr
             && let FunctionArguments::List(arguments) = &mut function.args
         {
@@ -402,83 +410,57 @@ impl VisitorMut for Rewrite<'_, '_> {
                     && let Some(version) = self.rows.version(ident, &self.scopes)
                 {
                     match version {
-                        RowValue::Unavailable => return ControlFlow::Break(unavailable()),
+                        RowValue::Unavailable => return Err(unavailable()),
                         RowValue::Absent => {
                             *value = FunctionArgExpr::Expr(Expr::Value(Value::Null.into()));
                         }
-                        RowValue::Current => {
-                            return ControlFlow::Break(Error::forward_refusal(
-                                "RETURNING a whole row cannot be translated to a SQLite row value. Return its columns individually.",
-                            ));
-                        }
+                        RowValue::Current => return Err(whole_row()),
                     }
                 }
             }
         }
         if let Expr::Identifier(ident) = expr
             && let Some(index) = version_index(ident)
-            && self.scopes.iter().any(|scope| scope.columns[index])
         {
-            return ControlFlow::Continue(());
-        }
-        if let Expr::Identifier(ident) = expr
-            && version_index(ident).is_some()
-            && let Some(name) = self.rows.target
-        {
-            match resolve_translation_table(self.schema, name) {
-                Ok(Some(table)) => {
-                    match table.columns(self.schema) {
-                        Ok(mut columns) => {
-                            if columns.any(|column| {
-                                sql_traits::utils::identifier_resolution::identifiers_match(
-                                    column.column_name(),
-                                    true,
-                                    &ident.value,
-                                    ident.quote_style.is_some(),
-                                )
-                            }) {
-                                return ControlFlow::Continue(());
-                            }
-                        }
-                        Err(error) => return ControlFlow::Break(error.into()),
-                    }
-                }
-                Err(error) => return ControlFlow::Break(error),
-                _ => {}
+            if self.scopes.iter().any(|scope| scope.columns[index]) {
+                return Ok(());
+            }
+            if let Some(table) = self
+                .rows
+                .target
+                .map(|name| resolve_translation_table(self.schema, name))
+                .transpose()?
+                .flatten()
+                && table.columns(self.schema)?.any(|column| {
+                    sql_traits::utils::identifier_resolution::identifiers_match(
+                        column.column_name(),
+                        true,
+                        &ident.value,
+                        ident.quote_style.is_some(),
+                    )
+                })
+            {
+                return Ok(());
             }
         }
         let (ident, column) = match &*expr {
             Expr::CompoundIdentifier(parts) if parts.len() == 2 => (&parts[0], Some(&parts[1])),
             Expr::Identifier(ident) => (ident, None),
             Expr::QualifiedWildcard(name, _) if name.0.len() == 1 => {
-                let Some(ident) = last_ident(name) else { return ControlFlow::Continue(()) };
+                let Some(ident) = last_ident(name) else { return Ok(()) };
                 (ident, None)
             }
-            _ => return ControlFlow::Continue(()),
+            _ => return Ok(()),
         };
-        let Some(version) = self.rows.version(ident, &self.scopes) else {
-            return ControlFlow::Continue(());
-        };
+        let Some(version) = self.rows.version(ident, &self.scopes) else { return Ok(()) };
         match version {
-            RowValue::Unavailable => return ControlFlow::Break(unavailable()),
+            RowValue::Unavailable => return Err(unavailable()),
             RowValue::Absent => *expr = Expr::Value(Value::Null.into()),
-            RowValue::Current => {
-                let Some(column) = column else {
-                    return ControlFlow::Break(Error::forward_refusal(
-                        "RETURNING a whole row cannot be translated to a SQLite row value. Return its columns individually.",
-                    ));
-                };
-                match self.current_column(column) {
-                    Ok(rewritten) => *expr = rewritten,
-                    Err(error) => return ControlFlow::Break(error),
-                }
-            }
+            RowValue::Current => *expr = self.current_column(column.ok_or_else(whole_row)?)?,
         }
-        ControlFlow::Continue(())
+        Ok(())
     }
-}
 
-impl Rewrite<'_, '_> {
     fn current_column(&self, column: &Ident) -> Result<Expr, Error> {
         if self.scopes.is_empty() {
             return Ok(match self.rows.qualifier {
@@ -493,11 +475,7 @@ impl Rewrite<'_, '_> {
                 "A RETURNING subquery shadows the target table's name, so SQLite cannot read the correlated row version.",
             ));
         }
-        let target = self.rows.target.and_then(last_ident).ok_or_else(|| {
-            Error::forward_refusal(
-                "RETURNING a correlated row version requires a named target table.",
-            )
-        })?;
+        let target = self.rows.target.and_then(last_ident).ok_or_else(target_definition)?;
         Ok(Expr::CompoundIdentifier(vec![target.clone(), column.clone()]))
     }
 }
@@ -546,15 +524,28 @@ impl Visitor for LocalColumns<'_, '_, '_> {
     type Break = ();
 
     fn pre_visit_select(&mut self, select: &Select) -> ControlFlow<()> {
-        if let Some(scope) = self.scope.scope_for_select(select) {
-            let columns = self
-                .references
-                .each_ref()
-                .map(|reference| !matches!(scope.resolve_column_definition(reference), Ok(None)));
-            if columns.iter().any(|bound| *bound) {
-                self.output.push((ptr::from_ref(select).addr(), columns));
-            }
+        if let Some(columns) = self
+            .scope
+            .scope_for_select(select)
+            .map(|scope| {
+                self.references.each_ref().map(|reference| {
+                    !matches!(scope.resolve_column_definition(reference), Ok(None))
+                })
+            })
+            .filter(|columns| columns.iter().any(|bound| *bound))
+        {
+            self.output.push((ptr::from_ref(select).addr(), columns));
         }
         ControlFlow::Continue(())
     }
+}
+
+fn whole_row() -> Error {
+    Error::forward_refusal(
+        "RETURNING a whole row cannot be translated to a SQLite row value. Return its columns individually.",
+    )
+}
+
+fn target_definition() -> Error {
+    Error::forward_refusal("RETURNING a row version requires the target table definition.")
 }
