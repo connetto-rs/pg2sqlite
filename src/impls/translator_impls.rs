@@ -21,7 +21,7 @@ pub(crate) mod data_type;
 pub(crate) mod deferred_constraint;
 pub(crate) mod definer;
 mod definer_helper;
-pub(crate) use definer_helper::check_lateral_calls;
+pub(crate) use definer_helper::{HelperQueries, check_lateral_calls};
 pub(crate) mod delete;
 pub(crate) mod expr;
 pub(crate) mod function;

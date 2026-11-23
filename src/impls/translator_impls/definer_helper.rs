@@ -12,6 +12,7 @@
 //! role's grants. A table on which the acting role holds no privilege is left
 //! out of the replica, so a helper reading one is refused.
 
+use alloc::collections::BTreeMap;
 use core::{convert::Infallible, ops::ControlFlow, ptr};
 
 use sql_traits::{
@@ -22,14 +23,14 @@ use sql_traits::{
         Returned, RowCap, SetPacking, SettingComparison, SettingContent, SettingValue, TimeBound,
         TimeComparison, UnsetSetting, WalkArm, WalkDirection,
     },
-    traits::{DatabaseLike, FunctionLike, TableLike},
+    traits::{DatabaseLike, FunctionLike, RoleLike, TableLike},
 };
 use sqlparser::ast::{
     ArrayElemTypeDef, BinaryOperator, CastKind, CreateTable, Cte, DataType, Distinct, Expr,
     FunctionArg, FunctionArgExpr, FunctionArguments, Ident, InTarget, Join, JoinConstraint,
     JoinOperator, ObjectName, ObjectNamePart, Query, SelectItem, SetExpr, SetOperator,
     SetQuantifier, TableAlias, TableAliasColumnDef, TableFactor, TableWithJoins, Value,
-    ValueWithSpan, VisitMut, VisitorMut, With, helpers::attached_token::AttachedToken,
+    ValueWithSpan, VisitMut, Visitor, VisitorMut, With, helpers::attached_token::AttachedToken,
     visit_expressions,
 };
 
@@ -51,7 +52,7 @@ use crate::{
     },
     options::TranslationContext,
     traits::TranslatorWithContext,
-    warnings::WarningSink,
+    warnings::{TranslationWarning, WarningSink},
 };
 
 /// The SQLite query answering `subquery`, when `subquery` is `SELECT f(...)`
@@ -252,16 +253,23 @@ fn untranslatable(name: &ObjectName, error: &HelperSetError) -> Error {
 }
 
 /// The SQLite query returning the set `helper` returns for `arguments` under
-/// `names`, or the refusal of the reason they cannot be read.
+/// `names`, or the refusal of the reason they cannot be read. A call
+/// repeating one [`HelperQueries`] kept answers the query that one
+/// translated to, raising its warnings again.
 fn helper_query(
     helper: &<ParserDB as DatabaseLike>::Function,
     name: &ObjectName,
     arguments: Result<Vec<Value>, HelperSetError>,
     names: &[Ident],
     schema: &ParserDB,
-    options: &TranslationContext<'_>,
+    caller: &TranslationContext<'_>,
     emit: WarningSink<'_>,
 ) -> Result<Query, Error> {
+    let call = helper_call(helper, name, arguments.as_deref().ok(), names, schema, caller);
+    if let Some(kept) = call.as_deref().and_then(|call| kept_query(call, caller, emit)) {
+        return Ok(kept);
+    }
+    let options = &*caller.helper_body();
     let Some(deployment) = options.get_deployment() else {
         return Err(Error::forward_refusal(format!(
             "{name}() is a function the schema declares, and a call to it translates as the set \
@@ -298,13 +306,177 @@ fn helper_query(
             guarded.push(table_name);
         }
     }
-    let mut lowered = lowered.translate_with_warnings(schema, options, emit)?;
+    let mut warnings = Vec::new();
+    let mut lowered =
+        lowered.translate_with_warnings(schema, options, &mut |warning| warnings.push(warning))?;
     let ControlFlow::Continue(()) = lowered
         .visit(&mut BackingTables { guarded: &guarded, suffix: options.get_rls_table_suffix() });
     let mut helpers = vec![helper.target_name().to_string()];
     helpers.append(&mut lowering.called);
     options.record_helper_set(&lowered, helpers);
+    if let Some(call) = call {
+        options.helper_queries().borrow_mut().keep(call, &lowered, &warnings);
+    }
+    raise(warnings, emit);
     Ok(lowered)
+}
+
+/// The query kept for `call`, raising the warnings its translation raised.
+fn kept_query(
+    call: &HelperCall,
+    caller: &TranslationContext<'_>,
+    emit: WarningSink<'_>,
+) -> Option<Query> {
+    let queries = caller.helper_queries().borrow();
+    let kept = queries.get(call)?;
+    for warning in &kept.warnings {
+        emit(warning.clone());
+    }
+    Some(copied(&kept.query, kept.nesting))
+}
+
+/// Raises `warnings` through `emit`.
+fn raise(warnings: Vec<TranslationWarning>, emit: WarningSink<'_>) {
+    for warning in warnings {
+        emit(warning);
+    }
+}
+
+/// The helper sets translated against the schemas a batch's translation
+/// holds alive, so a call repeated across its policies translates once.
+#[derive(Default, Clone)]
+pub(crate) struct HelperQueries {
+    /// The addresses of the schemas sets are kept for.
+    schemas: Vec<usize>,
+    translated: BTreeMap<Box<HelperCall>, TranslatedSet>,
+}
+
+impl HelperQueries {
+    /// Keeps the sets translated against `schemas`, which the caller holds
+    /// alive until it calls [`Self::forget`].
+    pub(crate) fn keep_for<'s>(&mut self, schemas: impl IntoIterator<Item = &'s ParserDB>) {
+        self.schemas.extend(schemas.into_iter().map(|schema| core::ptr::from_ref(schema).addr()));
+    }
+
+    /// Forgets every schema and set kept, before a schema kept for is freed.
+    pub(crate) fn forget(&mut self) {
+        self.schemas.clear();
+        self.translated.clear();
+    }
+
+    fn get(&self, call: &HelperCall) -> Option<&TranslatedSet> {
+        self.translated.get(call)
+    }
+
+    /// Keeps `query` and `warnings` for `call` when its schema is kept for.
+    #[cfg_attr(feature = "std", recursive::recursive)]
+    fn keep(&mut self, call: Box<HelperCall>, query: &Query, warnings: &[TranslationWarning]) {
+        if self.schemas.contains(&call.schema) {
+            let mut nesting = Nesting { depth: 0, deepest: 0 };
+            let ControlFlow::Continue(()) = sqlparser::ast::Visit::visit(query, &mut nesting);
+            self.translated.insert(
+                call,
+                TranslatedSet {
+                    query: copied(query, nesting.deepest),
+                    nesting: nesting.deepest,
+                    warnings: warnings.to_vec(),
+                },
+            );
+        }
+    }
+}
+
+/// The stack copying one nested query takes, about 40 KiB in a debug build.
+#[cfg(feature = "std")]
+const QUERY_STACK: usize = 64 * 1024;
+
+/// A copy of `query`, which nests `nesting` queries, made on a stack grown to
+/// the recursion through them, since the copy runs outside the translator's
+/// stack growth.
+#[cfg(feature = "std")]
+fn copied(query: &Query, nesting: usize) -> Query {
+    let stack = nesting.saturating_add(1).saturating_mul(QUERY_STACK);
+    stacker::maybe_grow(stack, stack, || query.clone())
+}
+
+/// A copy of `query`.
+#[cfg(not(feature = "std"))]
+fn copied(query: &Query, _nesting: usize) -> Query {
+    query.clone()
+}
+
+/// The depth of the query a walk is in and the deepest it reached.
+struct Nesting {
+    depth: usize,
+    deepest: usize,
+}
+
+impl Visitor for Nesting {
+    type Break = Infallible;
+
+    fn pre_visit_query(&mut self, _query: &Query) -> ControlFlow<Infallible> {
+        self.depth += 1;
+        self.deepest = self.deepest.max(self.depth);
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<Infallible> {
+        self.depth -= 1;
+        ControlFlow::Continue(())
+    }
+}
+
+/// The call of `helper` as `name` with `arguments` under `names`, which a
+/// translation in `context` can keep, boxed so the recursion through a
+/// helper's set holds no copy of it.
+fn helper_call(
+    helper: &<ParserDB as DatabaseLike>::Function,
+    name: &ObjectName,
+    arguments: Option<&[Value]>,
+    names: &[Ident],
+    schema: &ParserDB,
+    context: &TranslationContext<'_>,
+) -> Option<Box<HelperCall>> {
+    if context.inlined_body().is_some() {
+        return None;
+    }
+    Some(Box::new(HelperCall {
+        schema: core::ptr::from_ref(schema).addr(),
+        helper: core::ptr::from_ref(helper).addr(),
+        name: name.clone(),
+        arguments: arguments?.to_vec(),
+        names: names.to_vec(),
+        schema_is_complete: context.schema_is_complete(),
+        subqueries_allowed: context.allows_subqueries(),
+        running_as: context.running_as().map(|role| role.name().to_owned()),
+    }))
+}
+
+/// A helper call, by what its translation reads.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct HelperCall {
+    /// The address of the schema it translates against.
+    schema: usize,
+    /// The address of the helper it calls.
+    helper: usize,
+    /// The name the call writes, which refusals and warnings name.
+    name: ObjectName,
+    arguments: Vec<Value>,
+    /// The names its rows take.
+    names: Vec<Ident>,
+    schema_is_complete: bool,
+    subqueries_allowed: bool,
+    /// The role the body holding the call runs as, if not the acting role.
+    running_as: Option<String>,
+}
+
+/// A helper call's query and the warnings its translation raised.
+#[derive(Clone)]
+struct TranslatedSet {
+    query: Query,
+    /// The most queries `query` nests.
+    nesting: usize,
+    warnings: Vec<TranslationWarning>,
 }
 
 /// The literals a call passes, one per argument.

@@ -260,6 +260,9 @@ pub(crate) struct PrewalkCatalogs {
     helper_sets: core::cell::RefCell<
         alloc::collections::BTreeMap<crate::impls::cursor_budget::HelperSetKey, Vec<String>>,
     >,
+    /// The helper sets translated so far against the schemas the batch's
+    /// translation holds alive, boxed so every context stays as small.
+    helper_queries: Box<core::cell::RefCell<crate::impls::translator_impls::HelperQueries>>,
 }
 
 /// A trigger on a table.
@@ -734,6 +737,39 @@ impl<'a> TranslationContext<'a> {
     /// call.
     pub(crate) const fn inlined_body(&self) -> Option<&InlinedBody<'_>> {
         self.inlined_body
+    }
+
+    /// The context the set a helper call returns translates under. A function
+    /// body sees none of the query calling it, so its scope, `WITH` clause,
+    /// variables, trigger rows and row locks stay out, and the set reads the
+    /// schema as it stands. Boxed so the recursion through a helper's set
+    /// holds no copy of it.
+    pub(crate) fn helper_body(&self) -> Box<TranslationContext<'_>> {
+        Box::new(TranslationContext {
+            options: Cow::Borrowed(self.options.as_ref()),
+            catalogs: Cow::Borrowed(self.catalogs.as_ref()),
+            scope: None,
+            outer: None,
+            with: None,
+            variables: &[],
+            schema_is_complete: self.schema_is_complete,
+            subqueries_allowed: self.subqueries_allowed,
+            written_schema: None,
+            history: None,
+            running_as: self.running_as,
+            inlined_body: self.inlined_body,
+            trigger_rows: None,
+            locked: &[],
+            locks_whole_query: false,
+        })
+    }
+
+    /// The helper sets translated so far, kept for the schemas the batch's
+    /// translation holds alive.
+    pub(crate) fn helper_queries(
+        &self,
+    ) -> &core::cell::RefCell<crate::impls::translator_impls::HelperQueries> {
+        &self.catalogs.helper_queries
     }
 
     /// The same context translating a row trigger whose table and events

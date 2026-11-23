@@ -456,6 +456,15 @@ impl ColumnChange {
 }
 
 impl PreparedEpoch {
+    /// Every schema the epoch holds.
+    fn schemas(&self) -> impl Iterator<Item = &ParserDB> {
+        core::iter::once(&self.schema)
+            .chain(self.bindings.iter().map(|change| &change.before))
+            .chain(self.before_index_drops.iter().map(|(_, schema)| schema))
+            .chain(self.trigger_positions.iter().map(|(_, schema)| schema))
+            .chain(self.events.iter().flat_map(|event| [&event.before, &event.after]))
+    }
+
     /// The schema a column reference in statement `index` binds against.
     fn binding(&self, index: usize) -> &ParserDB {
         self.bindings
@@ -1346,14 +1355,22 @@ impl Pg2Sqlite {
             initial_schema.iter().chain(epochs.iter().map(|epoch| &epoch.schema)),
             context,
         )?;
-        let (mut translated, rebuilt_triggers, warnings) = Self::translate_units(
+        context.helper_queries().borrow_mut().keep_for(
+            initial_schema
+                .iter()
+                .chain(schema.as_ref().ok())
+                .chain(epochs.iter().flat_map(PreparedEpoch::schemas)),
+        );
+        let units = Self::translate_units(
             statements,
             &epochs,
             &dispositions,
             (initial_schema.as_ref(), schema.as_ref().ok()),
             context,
             should_translate,
-        )?;
+        );
+        context.helper_queries().borrow_mut().forget();
+        let (mut translated, rebuilt_triggers, warnings) = units?;
         let held_views = crate::impls::translator_impls::held_views::hold_forward_views(
             statements,
             &mut translated,
