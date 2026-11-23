@@ -15,8 +15,8 @@ use sql_traits::{
 };
 use sqlparser::{
     ast::{
-        CreateFunction, Expr, Ident, ObjectName, ObjectNamePart, SetExpr, Spanned, Statement,
-        TableFactor, Value, Visit, Visitor, visit_expressions_mut,
+        CreateFunction, Expr, Ident, Merge, ObjectName, ObjectNamePart, SetExpr, Spanned,
+        Statement, TableFactor, Value, Visit, Visitor, visit_expressions_mut,
     },
     tokenizer::Span,
 };
@@ -34,6 +34,7 @@ use super::{PlPgSqlTranslator, TriggerFacts, raise::raise_statement};
 use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
+    history::placement::primary_write_target,
     impls::{
         column_access::{Table, Variables, unresolved_in_body, unresolved_target},
         derived_writes::{Body, parsed_body},
@@ -228,6 +229,9 @@ fn trigger_signature(function: &ObjectName) -> Signature {
 pub(crate) struct BodyReach {
     /// The relations its SQL names, folded as PostgreSQL stores them.
     pub(crate) relations: BTreeSet<String>,
+    /// The relations of `relations` its SQL inserts into, updates, deletes
+    /// from, merges into or truncates, folded.
+    pub(crate) written: BTreeSet<String>,
     /// The function itself and every function its SQL calls, folded.
     pub(crate) functions: BTreeSet<String>,
 }
@@ -251,9 +255,8 @@ struct Reading {
 
 /// What one function body names.
 enum BodyNames {
-    /// The relations its SQL names, folded, and the functions it calls, in
-    /// the order the body names them.
-    Known { relations: BTreeSet<String>, calls: Vec<ObjectName> },
+    /// What its SQL names.
+    Known(Names),
     /// Its names are not all known before it runs, as with SQL it builds at
     /// run time, or it does not parse, or is written in a language other
     /// than SQL and PL/pgSQL.
@@ -264,47 +267,57 @@ impl BodyNames {
     /// What the body of `function` names, a PL/pgSQL one read as the trigger
     /// function `signature` describes.
     fn of(function: &CreateFunction, schema: &ParserDB, signature: &Signature) -> Self {
-        let (mut relations, mut calls) = (BTreeSet::new(), Vec::new());
+        let mut names = Names::default();
         let Ok(body) = parsed_body(function, schema) else { return Self::Unknown };
         match body {
             Body::PlPgSql(block) => {
                 let Ok(sites) = block.sites(signature, |_| true) else { return Self::Unknown };
                 for site in sites {
-                    match site.sql {
-                        Sql::Statement(statement) => names(statement, &mut relations, &mut calls),
-                        Sql::Expression(query) => names(query, &mut relations, &mut calls),
+                    let _: ControlFlow<()> = match site.sql {
+                        Sql::Statement(statement) => statement.visit(&mut names),
+                        Sql::Expression(query) => query.visit(&mut names),
                         Sql::Dynamic(_) => return Self::Unknown,
-                    }
+                    };
                 }
             }
             Body::Sql(statements) => {
                 for statement in statements.iter() {
-                    names(statement, &mut relations, &mut calls);
+                    let _: ControlFlow<()> = statement.visit(&mut names);
                 }
             }
         }
-        Self::Known { relations, calls }
+        Self::Known(names)
     }
 }
 
-/// Adds the relations `sql` names, folded, to `relations`, and the functions
-/// it calls, in an expression or as a set-returning function in `FROM`, to
-/// `calls`.
-fn names<S: Visit>(sql: &S, relations: &mut BTreeSet<String>, calls: &mut Vec<ObjectName>) {
-    let _: ControlFlow<()> = sql.visit(&mut Names { relations, calls });
+/// The relations SQL names, folded, those of them it writes, and the
+/// functions it calls, in an expression or as a set-returning function in
+/// `FROM`, in the order it names them.
+#[derive(Default)]
+struct Names {
+    relations: BTreeSet<String>,
+    written: BTreeSet<String>,
+    calls: Vec<ObjectName>,
 }
 
-/// The relations and functions SQL names, as [`names`] reads them.
-struct Names<'n> {
-    relations: &'n mut BTreeSet<String>,
-    calls: &'n mut Vec<ObjectName>,
-}
-
-impl Visitor for Names<'_> {
+impl Visitor for Names {
     type Break = ();
 
     fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<()> {
         self.relations.insert(folded(relation));
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<()> {
+        match statement {
+            Statement::Merge(Merge { table: TableFactor::Table { name, .. }, .. }) => {
+                self.written.insert(folded(name));
+            }
+            Statement::Truncate(truncate) => {
+                self.written.extend(truncate.table_names.iter().map(|target| folded(&target.name)));
+            }
+            _ => self.written.extend(primary_write_target(statement).map(folded)),
+        }
         ControlFlow::Continue(())
     }
 
@@ -367,7 +380,11 @@ pub(crate) fn body_reach(
     schema: &ParserDB,
     bodies: &mut ReadBodies,
 ) -> Result<Option<BodyReach>, Error> {
-    let mut reach = BodyReach { relations: BTreeSet::new(), functions: BTreeSet::new() };
+    let mut reach = BodyReach {
+        relations: BTreeSet::new(),
+        written: BTreeSet::new(),
+        functions: BTreeSet::new(),
+    };
     let mut pending = vec![function.clone()];
     while let Some(function) = pending.pop() {
         if !reach.functions.insert(folded(&function)) {
@@ -388,9 +405,10 @@ pub(crate) fn body_reach(
             &atomic
         };
         match names {
-            BodyNames::Known { relations, calls } => {
-                reach.relations.extend(relations.iter().cloned());
-                pending.extend(calls.iter().cloned());
+            BodyNames::Known(names) => {
+                reach.relations.extend(names.relations.iter().cloned());
+                reach.written.extend(names.written.iter().cloned());
+                pending.extend(names.calls.iter().cloned());
             }
             BodyNames::Unknown => return Ok(None),
         }
