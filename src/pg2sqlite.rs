@@ -116,13 +116,18 @@ fn populate_prewalk_catalogs(
 ) {
     use crate::impls::translator_impls::deferred_constraint::DeferredTrigger;
 
-    // An earlier batch's deferred checks still queue, so this batch drains too.
+    // An earlier batch's triggers still queue deferred checks and inline their
+    // functions.
     for trigger in initial_schema.into_iter().flat_map(|schema| {
         use sql_traits::traits::DatabaseLike;
         schema.triggers()
     }) {
         if let Some(deferred) = DeferredTrigger::of(trigger) {
             context.add_deferred_trigger(deferred);
+        }
+        if let Some(exec_body) = &trigger.exec_body {
+            context
+                .add_trigger_function_name(last_ident_value_or_display(&exec_body.func_desc.name));
         }
     }
     for statement in statements {

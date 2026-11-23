@@ -571,6 +571,36 @@ fn a_renamed_trigger_function_replaced_is_silent() {
     );
 }
 
+/// A later migration replacing the function a trigger from an earlier one
+/// runs reaches the output inlined in that trigger, so it reports no loss.
+#[test]
+fn replacing_an_earlier_trigger_function_is_silent() {
+    let schema = Pg2Sqlite::default()
+        .sql(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT);
+             CREATE FUNCTION stamp() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+             BEGIN UPDATE t SET a = 'stamped' WHERE id = NEW.id; RETURN NEW; END $$;
+             CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION stamp();",
+        )
+        .expect("parse")
+        .build_schema()
+        .expect("schema");
+    let report = Pg2Sqlite::default()
+        .sql(
+            "CREATE OR REPLACE FUNCTION stamp() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+             BEGIN UPDATE t SET a = 'restamped' WHERE id = NEW.id; RETURN NEW; END $$;",
+        )
+        .expect("parse")
+        .translate_with_report_and_schema(&schema, &Pg2SqliteOptions::default())
+        .expect("translate");
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert!(
+        report.script.iter().any(|statement| statement.to_string().contains("'restamped'")),
+        "the replacement body must appear inside the emitted trigger: {:?}",
+        report.script.iter().map(ToString::to_string).collect::<Vec<_>>()
+    );
+}
+
 /// A `DO` block is refused while the schema is built, since its effects on
 /// the catalog depend on a database the model does not have.
 #[test]
