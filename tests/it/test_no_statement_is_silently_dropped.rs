@@ -622,8 +622,6 @@ fn an_earlier_native_sqlite_trigger_keeps_firing() {
     let report = Pg2Sqlite::default()
         .sql("INSERT INTO t (id, a) VALUES (1, 'input');")
         .expect("parse")
-        .starting_sqlite(held)
-        .expect("SQLite statements")
         .translate_with_report_and_schema(&schema, &Pg2SqliteOptions::default())
         .expect("translate");
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);

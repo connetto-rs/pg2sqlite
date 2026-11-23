@@ -32,7 +32,8 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 
 use diesel::{
-    QueryableByName, RunQueryDsl,
+    RunQueryDsl,
+    dsl::sql,
     result::Error as DieselError,
     sql_types::{Nullable, Text},
     sqlite::SqliteConnection,
@@ -71,8 +72,9 @@ pub enum ProgramsError {
     /// The connection failed other than by refusing a statement.
     #[error(transparent)]
     Connection(#[from] DieselError),
-    /// A trigger whose definition names no event SQLite fires it on.
-    #[error("trigger `{name}` in `{schema}` names no event")]
+    /// A trigger whose stored definition does not open the way SQLite writes
+    /// one, which only a write to `sqlite_schema` leaves.
+    #[error("trigger `{name}` in `{schema}` is not stored as SQLite writes one")]
     UnreadTrigger {
         /// The schema holding the trigger.
         schema: String,
@@ -87,8 +89,8 @@ pub enum ProgramsError {
 ///
 /// # Errors
 ///
-/// Returns [`ProgramsError`] when the schema cannot be read, or a trigger's
-/// definition names no event.
+/// Returns [`ProgramsError`] when the schema cannot be read, or a trigger is
+/// not stored as SQLite writes one.
 pub fn unprepared_programs(
     connection: &mut SqliteConnection,
 ) -> Result<Vec<UnpreparedProgram>, ProgramsError> {
@@ -99,16 +101,13 @@ pub fn unprepared_programs(
     for schema in &schemas {
         let held = relations.entry(schema.as_str()).or_default();
         for object in objects(connection, schema)? {
-            match object.kind.as_str() {
-                "table" => {
-                    held.insert(object.name.to_ascii_lowercase());
-                }
-                "view" => {
-                    held.insert(object.name.to_ascii_lowercase());
+            if object.kind == "trigger" {
+                triggers.push((schema.as_str(), object));
+            } else {
+                held.insert(object.name.to_ascii_lowercase());
+                if object.kind == "view" {
                     views.push((schema.as_str(), object.name));
                 }
-                "trigger" => triggers.push((schema.as_str(), object)),
-                _ => {}
             }
         }
     }
@@ -154,7 +153,7 @@ pub fn unprepared_programs(
                     }
                     // A view's columns are read by preparing its query.
                     Err(error) => {
-                        let message = refusal(error)?;
+                        let message = error.to_string();
                         let statement = format!("UPDATE {target}");
                         unprepared.push(UnpreparedProgram { statement, programs, message });
                         continue;
@@ -162,11 +161,11 @@ pub fn unprepared_programs(
                 }
             }
         };
-        prepare(connection, statement, programs, &mut unprepared)?;
+        prepare(connection, statement, programs, &mut unprepared);
     }
     for (schema, view) in views {
         let statement = format!("SELECT * FROM {}.{}", quoted(schema), quoted(&view));
-        prepare(connection, statement, vec![view], &mut unprepared)?;
+        prepare(connection, statement, vec![view], &mut unprepared);
     }
     Ok(unprepared)
 }
@@ -178,65 +177,45 @@ fn prepare(
     statement: String,
     programs: Vec<String>,
     unprepared: &mut Vec<UnpreparedProgram>,
-) -> Result<(), ProgramsError> {
+) {
     // The statement is built from the schema at run time, which the typed DSL
     // cannot name.
-    match diesel::sql_query(format!("EXPLAIN {statement}")).execute(connection) {
-        Ok(_) => Ok(()),
-        Err(error) => {
-            let message = refusal(error)?;
-            unprepared.push(UnpreparedProgram { statement, programs, message });
-            Ok(())
-        }
+    if let Err(error) = diesel::sql_query(format!("EXPLAIN {statement}")).execute(connection) {
+        unprepared.push(UnpreparedProgram { statement, programs, message: error.to_string() });
     }
-}
-
-/// SQLite's message refusing a statement, or `error` when the connection
-/// failed otherwise.
-fn refusal(error: DieselError) -> Result<String, ProgramsError> {
-    match error {
-        DieselError::DatabaseError(_, information) => Ok(information.message().to_owned()),
-        error => Err(error.into()),
-    }
-}
-
-#[derive(QueryableByName)]
-struct Name {
-    #[diesel(sql_type = Text)]
-    name: String,
 }
 
 /// The schemas `connection` holds, in the order SQLite searches them.
 fn schemas(connection: &mut SqliteConnection) -> Result<Vec<String>, DieselError> {
-    let names: Vec<Name> = diesel::sql_query(
-        "SELECT name FROM pragma_database_list WHERE name <> 'temp' ORDER BY seq",
-    )
+    let names: Vec<String> = diesel::select(sql::<Text>(
+        "name FROM pragma_database_list WHERE name <> 'temp' ORDER BY seq",
+    ))
     .load(connection)?;
     // The temporary schema is searched first, and listed only once something
     // creates it.
-    Ok(core::iter::once("temp".to_owned()).chain(names.into_iter().map(|name| name.name)).collect())
+    Ok(core::iter::once("temp".to_owned()).chain(names).collect())
 }
 
-#[derive(QueryableByName)]
 struct Object {
-    #[diesel(sql_type = Text)]
     kind: String,
-    #[diesel(sql_type = Text)]
     name: String,
-    #[diesel(sql_type = Text)]
     relation: String,
-    #[diesel(sql_type = Nullable<Text>)]
     sql: Option<String>,
 }
 
 /// The tables, views and triggers of `schema`.
 fn objects(connection: &mut SqliteConnection, schema: &str) -> Result<Vec<Object>, DieselError> {
-    diesel::sql_query(format!(
-        "SELECT type AS kind, name, tbl_name AS relation, sql FROM {}.sqlite_schema \
-         WHERE type IN ('table', 'view', 'trigger') ORDER BY name",
-        quoted(schema)
-    ))
-    .load(connection)
+    let rows: Vec<(String, String, String, Option<String>)> =
+        diesel::select(sql::<(Text, Text, Text, Nullable<Text>)>(&format!(
+            "type, name, tbl_name, sql FROM {}.sqlite_schema \
+             WHERE type IN ('table', 'view', 'trigger') ORDER BY name",
+            quoted(schema)
+        )))
+        .load(connection)?;
+    Ok(rows
+        .into_iter()
+        .map(|(kind, name, relation, sql)| Object { kind, name, relation, sql })
+        .collect())
 }
 
 /// The columns of `relation` in `schema` a write may set.
@@ -245,13 +224,14 @@ fn columns(
     schema: &str,
     relation: &str,
 ) -> Result<Vec<String>, DieselError> {
-    let names: Vec<Name> = diesel::sql_query(
-        "SELECT name FROM pragma_table_xinfo(?, ?) WHERE hidden = 0 ORDER BY cid",
+    diesel::select(
+        sql::<Text>("name FROM pragma_table_xinfo(")
+            .bind::<Text, _>(relation)
+            .sql(", ")
+            .bind::<Text, _>(schema)
+            .sql(") WHERE hidden = 0 ORDER BY cid"),
     )
-    .bind::<Text, _>(relation)
-    .bind::<Text, _>(schema)
-    .load(connection)?;
-    Ok(names.into_iter().map(|name| name.name).collect())
+    .load(connection)
 }
 
 /// `name` as a quoted SQLite identifier.
@@ -268,59 +248,35 @@ enum Event {
 }
 
 impl Event {
-    /// The event the `CREATE TRIGGER` statement `sql` fires on, read from its
-    /// head `CREATE [TEMP] TRIGGER [IF NOT EXISTS] [schema.]name [timing]
-    /// event`.
+    /// The event the trigger `sql` fires on, read from the head `CREATE
+    /// TRIGGER name [timing] event` SQLite stores every trigger under.
     fn of(sql: &str) -> Option<Self> {
-        let mut tokens = Tokens { rest: sql };
-        while !tokens.next()?.is_word("trigger") {}
-        let mut name = tokens.next()?;
-        if name.is_word("if") {
-            let mut lookahead = Tokens { rest: tokens.rest };
-            if lookahead.next()?.is_word("not") && lookahead.next()?.is_word("exists") {
-                tokens = lookahead;
-                name = tokens.next()?;
-            }
-        }
-        if !matches!(name, Token::Word(_) | Token::Quoted) {
-            return None;
-        }
-        let mut token = tokens.next()?;
-        if token == Token::Other('.') {
-            tokens.next()?;
-            token = tokens.next()?;
-        }
-        while ["before", "after", "instead", "of"].iter().any(|word| token.is_word(word)) {
-            token = tokens.next()?;
+        let mut tokens = Tokens { rest: sql.strip_prefix("CREATE TRIGGER ")? };
+        tokens.next()?;
+        let mut word = tokens.next()?;
+        while ["before", "after", "instead", "of"]
+            .iter()
+            .any(|timing| word.eq_ignore_ascii_case(timing))
+        {
+            word = tokens.next()?;
         }
         [("delete", Self::Delete), ("insert", Self::Insert), ("update", Self::Update)]
             .into_iter()
-            .find_map(|(word, event)| token.is_word(word).then_some(event))
+            .find_map(|(name, event)| word.eq_ignore_ascii_case(name).then_some(event))
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Token<'s> {
-    Word(&'s str),
-    Quoted,
-    Other(char),
-}
-
-impl Token<'_> {
-    fn is_word(self, word: &str) -> bool {
-        matches!(self, Token::Word(read) if read.eq_ignore_ascii_case(word))
-    }
-}
-
-/// The tokens of SQLite text, skipping whitespace and comments.
+/// The tokens of SQLite text, skipping whitespace and comments, a quoted
+/// identifier with its quotes so it never reads as a keyword.
 struct Tokens<'s> {
     rest: &'s str,
 }
 
 impl<'s> Tokens<'s> {
-    fn next(&mut self) -> Option<Token<'s>> {
+    fn next(&mut self) -> Option<&'s str> {
         loop {
-            self.rest = self.rest.trim_start();
+            self.rest =
+                self.rest.trim_start_matches(|character: char| character.is_ascii_whitespace());
             if let Some(comment) = self.rest.strip_prefix("--") {
                 self.rest = comment.find('\n').map_or("", |end| &comment[end..]);
             } else if let Some(comment) = self.rest.strip_prefix("/*") {
@@ -329,44 +285,39 @@ impl<'s> Tokens<'s> {
                 break;
             }
         }
-        let first = self.rest.chars().next()?;
-        let closing = match first {
+        let closing = match self.rest.chars().next()? {
             '"' => Some('"'),
             '\'' => Some('\''),
             '`' => Some('`'),
             '[' => Some(']'),
             _ => None,
         };
-        if let Some(closing) = closing {
-            let mut position = first.len_utf8();
-            loop {
-                let end = position + self.rest[position..].find(closing)?;
-                position = end + closing.len_utf8();
-                // A doubled closing quote stands for itself, except in
-                // brackets.
-                if closing == ']' || !self.rest[position..].starts_with(closing) {
-                    break;
+        let end = match closing {
+            Some(closing) => {
+                let mut position = 1;
+                loop {
+                    position += self.rest[position..].find(closing)? + 1;
+                    // A doubled closing quote stands for itself, except in
+                    // brackets.
+                    if closing == ']' || !self.rest[position..].starts_with(closing) {
+                        break position;
+                    }
+                    position += 1;
                 }
-                position += closing.len_utf8();
             }
-            self.rest = &self.rest[position..];
-            return Some(Token::Quoted);
-        }
-        let word_end = self
-            .rest
-            .find(|character: char| {
-                !(character.is_ascii_alphanumeric()
-                    || character == '_'
-                    || character == '$'
-                    || !character.is_ascii())
-            })
-            .unwrap_or(self.rest.len());
-        if word_end == 0 {
-            self.rest = &self.rest[first.len_utf8()..];
-            return Some(Token::Other(first));
-        }
-        let word = &self.rest[..word_end];
-        self.rest = &self.rest[word_end..];
-        Some(Token::Word(word))
+            None => {
+                self.rest
+                    .find(|character: char| {
+                        !(character.is_ascii_alphanumeric()
+                            || character == '_'
+                            || character == '$'
+                            || !character.is_ascii())
+                    })
+                    .unwrap_or(self.rest.len())
+            }
+        };
+        let (token, rest) = self.rest.split_at(end);
+        self.rest = rest;
+        Some(token)
     }
 }

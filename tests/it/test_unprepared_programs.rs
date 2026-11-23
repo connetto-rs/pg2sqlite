@@ -11,7 +11,7 @@ use core::fmt::Write as _;
 use diesel::{RunQueryDsl, connection::SimpleConnection};
 use pg2sqlite::{
     prelude::Pg2SqliteOptions,
-    programs::{UnpreparedProgram, unprepared_programs},
+    programs::{ProgramsError, UnpreparedProgram, unprepared_programs},
 };
 use sql_traits::structs::{Deployment, SessionSetting, SettingValue};
 use sqlparser::ast::DataType;
@@ -228,6 +228,11 @@ CREATE TRIGGER a_inserted AFTER INSERT ON a BEGIN SELECT x FROM v1; END;
 CREATE TABLE b (x, y, z AS (x + 1));
 CREATE TRIGGER \"update\" AFTER INSERT ON b BEGIN SELECT x FROM v10; END;
 CREATE TRIGGER b_updated AFTER UPDATE OF y ON b BEGIN SELECT x FROM v10; END;
+CREATE TRIGGER \"q\"\" AFTER INSERT\" -- AFTER INSERT
+ BEFORE DELETE ON b BEGIN SELECT x FROM v10; END;
+CREATE TRIGGER 's AFTER INSERT' /* INSERT */ DELETE ON b BEGIN SELECT x FROM v10; END;
+CREATE TRIGGER `t AFTER INSERT` AFTER DELETE ON b BEGIN SELECT x FROM v10; END;
+CREATE TRIGGER [u AFTER INSERT] AFTER DELETE ON b BEGIN SELECT x FROM v10; END;
 CREATE VIEW w AS SELECT x FROM t;
 CREATE TRIGGER w_inserted INSTEAD OF INSERT ON w BEGIN INSERT INTO t VALUES (NEW.x); END;
 CREATE TEMP TRIGGER /* DELETE */ t_updated AFTER UPDATE OF x ON t BEGIN SELECT x FROM v10; END;
@@ -255,6 +260,10 @@ CREATE TRIGGER deep_updated INSTEAD OF UPDATE ON deep BEGIN SELECT 1; END;
     let mut expected: Vec<(&str, Vec<&str>)> = vec![
         ("DELETE FROM \"main\".\"a\"", vec!["a_deleted"]),
         ("INSERT INTO \"main\".\"b\" DEFAULT VALUES", vec!["update"]),
+        (
+            "DELETE FROM \"main\".\"b\"",
+            vec!["q\" AFTER INSERT", "s AFTER INSERT", "t AFTER INSERT", "u AFTER INSERT"],
+        ),
         ("UPDATE \"main\".\"b\" SET \"x\" = \"x\", \"y\" = \"y\"", vec!["b_updated"]),
         ("UPDATE \"main\".\"t\" SET \"x\" = \"x\"", vec!["t_updated"]),
         ("UPDATE \"main\".\"deep\"", vec!["deep_updated"]),
@@ -263,11 +272,30 @@ CREATE TRIGGER deep_updated INSTEAD OF UPDATE ON deep BEGIN SELECT 1; END;
     expected.sort_unstable();
     assert_eq!(listed, expected);
     for unprepared in &unprepared {
+        let shown = unprepared.to_string();
         assert!(
-            unprepared.message.contains("nested too deep"),
-            "SQLite's own refusal is kept: {unprepared}"
+            shown.contains(&unprepared.statement) && shown.contains("nested too deep"),
+            "the statement is shown with SQLite's own refusal: {shown}"
         );
     }
+}
+
+#[test]
+fn a_trigger_not_stored_as_sqlite_writes_one_is_refused_by_name() {
+    let mut connection = helpers::establish_connection();
+    connection
+        .batch_execute(
+            "CREATE TABLE t (x);
+PRAGMA writable_schema = ON;
+INSERT INTO sqlite_schema VALUES ('trigger', 'written', 't', 0, 'create trigger written after delete on t begin select 1; end');
+PRAGMA writable_schema = RESET;",
+        )
+        .expect("the schema is written");
+    let error = unprepared_programs(&mut connection).expect_err("the trigger is not read");
+    assert!(
+        matches!(&error, ProgramsError::UnreadTrigger { schema, name } if schema == "main" && name == "written"),
+        "{error:?}"
+    );
 }
 
 #[test]
