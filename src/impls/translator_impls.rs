@@ -25,6 +25,7 @@ pub(crate) use definer_helper::check_lateral_calls;
 pub(crate) mod delete;
 pub(crate) mod expr;
 pub(crate) mod function;
+pub(crate) mod function_cascade;
 pub(crate) mod held_views;
 mod helpers;
 pub(crate) use helpers::Forward;

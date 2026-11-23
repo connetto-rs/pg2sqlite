@@ -13,6 +13,7 @@ use sqlparser::ast::{
 };
 
 use super::{
+    function_cascade::{drop_of, runs_dropped},
     plpgsql::{ReadBodies, body_reach},
     trigger_slots::{folded, renamed_table},
 };
@@ -166,6 +167,22 @@ impl TriggerFollower {
     /// Whether no trigger is live.
     pub(crate) fn is_empty(&self) -> bool {
         self.live.is_empty()
+    }
+
+    /// The `DROP TRIGGER` of each live trigger running a function `statement`
+    /// drops with `CASCADE`.
+    pub(crate) fn cascaded(&self, statement: &Statement) -> Vec<Statement> {
+        self.live
+            .iter()
+            .filter(|followed| {
+                followed
+                    .create
+                    .exec_body
+                    .as_ref()
+                    .is_some_and(|body| runs_dropped(statement, &body.func_desc.name))
+            })
+            .map(|followed| drop_of(&followed.create))
+            .collect()
     }
 
     /// Whether `statement` can change what a live trigger's translation reads.

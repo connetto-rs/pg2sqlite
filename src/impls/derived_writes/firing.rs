@@ -35,7 +35,9 @@ use crate::{
     impls::{
         object_name::last_ident,
         privileges::RoleTable,
-        translator_impls::{deferred_constraint::is_deferred, plpgsql::fold},
+        translator_impls::{
+            deferred_constraint::is_deferred, function_cascade::runs_dropped, plpgsql::fold,
+        },
     },
     options::TranslationContext,
     traits::schema::written_function,
@@ -191,6 +193,9 @@ pub(super) fn live_triggers<'a>(
             } => {
                 let dropped: Vec<String> = names.iter().filter_map(last_ident).map(fold).collect();
                 triggers.retain(|(_, kept)| !dropped.contains(&kept.table));
+            }
+            Statement::DropFunction(_) => {
+                triggers.retain(|(_, kept)| !runs_dropped(statement, &kept.function));
             }
             _ => {}
         }

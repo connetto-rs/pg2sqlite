@@ -794,3 +794,69 @@ fn a_stamp_beside_an_audit_replaced_onto_update_alone() {
         &[SEED, "UPDATE items SET tag = 'b' WHERE id = 1;"],
     );
 }
+
+/// Dropping an audit's function with its trigger stops the audit.
+#[test]
+fn dropping_an_audit_function_with_its_trigger() {
+    assert_agree(
+        &[&schema(&["after"], AUDIT_BOTH), "DROP FUNCTION audit_after() CASCADE;"],
+        &[SEED, "UPDATE items SET tag = 'b' WHERE id = 1;"],
+    );
+}
+
+/// Dropping the stamp's function with its trigger leaves the audit firing
+/// once on the caller's rows.
+#[test]
+fn dropping_the_stamp_function_with_its_trigger() {
+    assert_agree(
+        &[
+            &schema(&["after"], &format!("{STAMP_BOTH}{AUDIT_BOTH}")),
+            "DROP FUNCTION stamp() CASCADE;",
+        ],
+        &[SEED, "UPDATE items SET tag = 'b' WHERE id = 1;"],
+    );
+}
+
+/// Dropping the stamp's function in the batch creating its trigger leaves the
+/// audit firing once on the caller's rows.
+#[test]
+fn dropping_the_stamp_function_in_its_creating_batch() {
+    assert_agree(
+        &[&format!(
+            "{}DROP FUNCTION stamp() CASCADE;",
+            schema(&["after"], &format!("{STAMP_BOTH}{AUDIT_BOTH}"))
+        )],
+        &[SEED, "UPDATE items SET tag = 'b' WHERE id = 1;"],
+    );
+}
+
+/// Dropping a function two triggers run stops both.
+#[test]
+fn dropping_a_function_two_triggers_run() {
+    assert_agree(
+        &[
+            &schema(
+                &["after"],
+                &format!(
+                    "{AUDIT_AFTER}CREATE TRIGGER items_audit_insert AFTER INSERT ON items
+                         FOR EACH ROW EXECUTE FUNCTION audit_after();"
+                ),
+            ),
+            "DROP FUNCTION audit_after() CASCADE;",
+        ],
+        &[SEED, "UPDATE items SET tag = 'b' WHERE id = 1;"],
+    );
+}
+
+/// Dropping the stamp and then its function in the batch creating them leaves
+/// the audit firing once on the caller's rows.
+#[test]
+fn dropping_the_stamp_and_then_its_function_in_their_creating_batch() {
+    assert_agree(
+        &[&format!(
+            "{}DROP TRIGGER items_stamp ON items; DROP FUNCTION stamp();",
+            schema(&["after"], &format!("{STAMP_BOTH}{AUDIT_BOTH}"))
+        )],
+        &[SEED, "UPDATE items SET tag = 'b' WHERE id = 1;"],
+    );
+}
