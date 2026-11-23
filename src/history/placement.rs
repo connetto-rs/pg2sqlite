@@ -24,7 +24,7 @@ use crate::{
     impls::{
         object_name::{last_ident_value_or_display, quoted_ident},
         scoped_relations::relation_occurrences,
-        translator_impls::{reentry::marked_table, rls::resolve_trigger_table_name},
+        translator_impls::{reentry::is_marker_table, rls::resolve_trigger_table_name},
     },
     manifest::Placement,
     options::{AttachedTables, Pg2SqliteOptions},
@@ -86,7 +86,13 @@ pub(crate) fn home(homes: &Homes, name: &str) -> Placement {
 /// Where the table, view or index `name` lives, `Main` for an object the
 /// batch does not create.
 pub(crate) fn home_of(homes: &Homes, name: &ObjectName) -> Placement {
-    homes.get(&key_of(name)).copied().unwrap_or(Placement::Main)
+    if name.0.len() > 1
+        && name.0[0].as_ident().is_some_and(|schema| schema.value.eq_ignore_ascii_case("temp"))
+    {
+        Placement::Temp
+    } else {
+        homes.get(&key_of(name)).copied().unwrap_or(Placement::Main)
+    }
 }
 
 /// The placement of every object, with the emitted statements qualified and
@@ -384,12 +390,7 @@ fn homes(
         for statement in emitted {
             let table = match statement {
                 Statement::CreateTable(create) => {
-                    // A marker table lives with a `TEMP` table it marks, so
-                    // the table's triggers find it on every connection.
-                    let marks_temporary = marked_table(&create.name).is_some_and(|marked| {
-                        homes.get(&unqualified_key(marked)) == Some(&Placement::Temp)
-                    });
-                    if create.temporary || marks_temporary {
+                    if create.temporary {
                         homes.insert(key_of(&create.name), Placement::Temp);
                         continue;
                     }
@@ -746,10 +747,11 @@ fn key(name: &str) -> String {
 
 fn key_of(name: &ObjectName) -> HomeKey {
     HomeKey {
-        main: name.0.len() > 1
-            && name.0[0]
-                .as_ident()
-                .is_some_and(|identifier| identifier.value.eq_ignore_ascii_case("main")),
+        main: (name.0.len() == 1 && is_marker_table(name))
+            || (name.0.len() > 1
+                && name.0[0]
+                    .as_ident()
+                    .is_some_and(|identifier| identifier.value.eq_ignore_ascii_case("main"))),
         name: key(&last_ident_value_or_display(name)),
     }
 }

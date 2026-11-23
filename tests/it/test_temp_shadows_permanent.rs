@@ -686,8 +686,228 @@ fn temp_shadows_merged_trigger_slots_keep_separate_owners() {
         );
         let emitted = crate::helpers::translate::translate_default(&sql);
         assert!(!emitted.contains("\"pg_temp."));
-        println!("{emitted}");
         let rows = run_translated_default(&sql);
         assert_eq!(rows, ["3", "3", "4", "4"].map(|value| Some(value.to_string())));
+    }
+}
+
+/// Dropping a seeded column-specific trigger preserves the other owner's frame.
+#[test]
+fn temp_shadows_dropping_seeded_column_trigger_preserves_other_owner() {
+    use diesel::{RunQueryDsl, connection::SimpleConnection};
+    use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+
+    let source = "
+        CREATE TABLE scratch (id INTEGER PRIMARY KEY, tag INTEGER, note INTEGER);
+        CREATE TEMP TABLE scratch (id INTEGER PRIMARY KEY, tag INTEGER, note INTEGER);
+        CREATE TABLE audit (value INTEGER);
+        CREATE FUNCTION record_tag() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN INSERT INTO audit VALUES (NEW.tag); RETURN NEW; END; $$;
+        CREATE FUNCTION record_note() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN INSERT INTO audit VALUES (NEW.note); RETURN NEW; END; $$;
+        CREATE TRIGGER record_tag AFTER UPDATE OF tag ON public.scratch
+        FOR EACH ROW EXECUTE FUNCTION record_tag();
+        CREATE TRIGGER record_note AFTER UPDATE OF note ON public.scratch
+        FOR EACH ROW EXECUTE FUNCTION record_note();
+        CREATE TRIGGER record_tag AFTER UPDATE OF tag ON pg_temp.scratch
+        FOR EACH ROW EXECUTE FUNCTION record_tag();
+        CREATE TRIGGER record_note AFTER UPDATE OF note ON pg_temp.scratch
+        FOR EACH ROW EXECUTE FUNCTION record_note();";
+    let options = Pg2SqliteOptions::default();
+    let parsed = Pg2Sqlite::default().sql(source).unwrap();
+    let schema = parsed.build_schema().unwrap();
+    let setup = Pg2Sqlite::default().sql(source).unwrap().translate(&options).unwrap();
+    let mut connection = crate::helpers::establish_connection();
+    for statement in setup.into_vec() {
+        connection.batch_execute(&statement.to_string()).unwrap();
+    }
+    let migration = Pg2Sqlite::default()
+        .sql(
+            "DROP TRIGGER record_tag ON scratch;
+             INSERT INTO public.scratch VALUES (1, 0, 0);
+             INSERT INTO pg_temp.scratch VALUES (1, 0, 0);
+             UPDATE public.scratch SET tag = 3, note = 4;
+             UPDATE pg_temp.scratch SET tag = 5, note = 6;",
+        )
+        .unwrap()
+        .translate_with_schema(&schema, &options)
+        .unwrap()
+        .into_vec();
+    for statement in &migration {
+        connection.batch_execute(&statement.to_string()).unwrap();
+    }
+    let values =
+        diesel::dsl::sql::<diesel::sql_types::Integer>("SELECT value FROM audit ORDER BY value")
+            .load::<i32>(&mut connection)
+            .unwrap();
+    assert_eq!(
+        values,
+        vec![3, 4, 6],
+        "{}",
+        migration.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n")
+    );
+}
+
+/// Permanent table events keep a renamed trigger on its owner.
+#[test]
+fn temp_shadows_permanent_table_events_preserve_trigger_owner() {
+    for event in [
+        "ALTER TABLE scratch RENAME TO moved;
+         INSERT INTO moved VALUES (3);
+         DROP TABLE moved;",
+        "INSERT INTO scratch VALUES (3);
+         DROP TABLE scratch;",
+        "ALTER TABLE public.scratch RENAME TO moved;
+         INSERT INTO moved VALUES (3);
+         DROP TABLE public.moved;",
+        "INSERT INTO scratch VALUES (3);
+         DROP TABLE public.scratch;",
+    ] {
+        let rows = run_translated_default(&format!(
+            "CREATE TABLE scratch (id INTEGER PRIMARY KEY);
+             CREATE TABLE audit (id INTEGER);
+             CREATE FUNCTION record_row() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN INSERT INTO audit VALUES (NEW.id); RETURN NEW; END; $$;
+             CREATE TRIGGER record_row AFTER INSERT ON scratch
+             FOR EACH ROW EXECUTE FUNCTION record_row();
+             {event}
+             CREATE TEMP TABLE scratch (id INTEGER PRIMARY KEY);
+             INSERT INTO scratch VALUES (4);
+             SELECT id FROM audit;"
+        ));
+        assert_eq!(rows, vec![Some("3".to_string())]);
+    }
+}
+
+/// Inaccessible column-trigger frames leave accessible table writes intact.
+#[test]
+fn temp_shadows_inaccessible_frames_preserve_accessible_writes() {
+    use diesel::{RunQueryDsl, connection::SimpleConnection};
+    use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+
+    let options = Pg2SqliteOptions::default()
+        .with_deployment(crate::helpers::deployment::deployment(["app_user"], []))
+        .with_acting_role("app_user");
+    let source = "CREATE ROLE app_user;
+         CREATE TABLE private_rows (id INTEGER PRIMARY KEY, tag INTEGER, note INTEGER);
+         CREATE TABLE visible_rows (id INTEGER PRIMARY KEY);
+         GRANT SELECT, INSERT, UPDATE, DELETE ON visible_rows TO app_user;
+         CREATE FUNCTION record_row() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN INSERT INTO visible_rows VALUES (NEW.id); RETURN NEW; END; $$;
+         CREATE TRIGGER record_tag AFTER UPDATE OF tag ON private_rows
+         FOR EACH ROW EXECUTE FUNCTION record_row();
+         CREATE TRIGGER record_note AFTER UPDATE OF note ON private_rows
+         FOR EACH ROW EXECUTE FUNCTION record_row();
+         CREATE TRIGGER record_both AFTER UPDATE ON private_rows
+         FOR EACH ROW EXECUTE FUNCTION record_row();";
+    let schema = Pg2Sqlite::default().sql(source).unwrap().build_schema().unwrap();
+    let setup = Pg2Sqlite::default().sql(source).unwrap().translate(&options).unwrap();
+    let mut connection = crate::helpers::establish_connection();
+    for statement in setup.into_vec() {
+        connection.batch_execute(&statement.to_string()).unwrap();
+    }
+    let migration = Pg2Sqlite::default()
+        .sql(
+            "DROP TRIGGER record_both ON private_rows;
+             INSERT INTO visible_rows VALUES (7);",
+        )
+        .unwrap()
+        .translate_with_schema(&schema, &options)
+        .unwrap();
+    for statement in migration.into_vec() {
+        connection.batch_execute(&statement.to_string()).unwrap();
+    }
+    let values = diesel::dsl::sql::<diesel::sql_types::Integer>("SELECT id FROM visible_rows")
+        .load::<i32>(&mut connection)
+        .unwrap();
+    assert_eq!(values, vec![7]);
+}
+
+/// A trigger drop naming no table, which PostgreSQL rejects, still drops the
+/// emitted trigger by name.
+#[test]
+fn temp_shadows_tableless_trigger_drop_drops_by_name() {
+    let translated = crate::helpers::translate::translate_default(
+        "CREATE TABLE scratch (id INTEGER PRIMARY KEY);
+         CREATE FUNCTION record_row() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN RETURN NEW; END; $$;
+         CREATE TRIGGER record_row AFTER INSERT ON scratch
+         FOR EACH ROW EXECUTE FUNCTION record_row();
+         DROP TRIGGER record_row;",
+    );
+    assert!(translated.ends_with("DROP TRIGGER IF EXISTS record_row"), "{translated}");
+}
+
+/// Same-named column triggers on shadowed tables keep separate recording twins.
+#[test]
+fn temp_shadows_column_frames_keep_separate_owners() {
+    use core::fmt::Write as _;
+
+    for temporary_first in [false, true] {
+        let permanent = "CREATE TABLE scratch (note INTEGER);";
+        let temporary = "CREATE TEMP TABLE scratch (note INTEGER);";
+        let tables = if temporary_first {
+            format!("{temporary} {permanent}")
+        } else {
+            format!("{permanent} {temporary}")
+        };
+        let owners = if temporary_first {
+            ["pg_temp.scratch", "public.scratch"]
+        } else {
+            ["public.scratch", "pg_temp.scratch"]
+        };
+        let mut source = format!(
+            "{tables}
+             CREATE FUNCTION noop() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN RETURN NEW; END; $$;"
+        );
+        for owner in owners {
+            write!(
+                source,
+                "CREATE TRIGGER all_rows AFTER UPDATE ON {owner}
+                 FOR EACH ROW EXECUTE FUNCTION noop();
+                 CREATE TRIGGER record_note AFTER UPDATE OF note ON {owner}
+                 FOR EACH ROW EXECUTE FUNCTION noop();"
+            )
+            .unwrap();
+        }
+        source.push_str(
+            "INSERT INTO public.scratch VALUES (0);
+             INSERT INTO pg_temp.scratch VALUES (0);
+             UPDATE public.scratch SET note = 2;
+             UPDATE pg_temp.scratch SET note = 3;",
+        );
+        for (event, expected) in [
+            ("SELECT (SELECT note FROM public.scratch) + (SELECT note FROM pg_temp.scratch);", "5"),
+            (
+                "DROP TABLE scratch;
+                 UPDATE public.scratch SET note = 4;
+                 SELECT note FROM public.scratch;",
+                "4",
+            ),
+            (
+                "DROP TABLE public.scratch;
+                 UPDATE pg_temp.scratch SET note = 6;
+                 SELECT note FROM pg_temp.scratch;",
+                "6",
+            ),
+            (
+                "ALTER TABLE scratch RENAME TO moved;
+                 UPDATE pg_temp.moved SET note = 7;
+                 UPDATE public.scratch SET note = 8;
+                 SELECT (SELECT note FROM public.scratch) + (SELECT note FROM pg_temp.moved);",
+                "15",
+            ),
+            (
+                "ALTER TABLE public.scratch RENAME TO moved;
+                 UPDATE public.moved SET note = 9;
+                 UPDATE pg_temp.scratch SET note = 10;
+                 SELECT (SELECT note FROM public.moved) + (SELECT note FROM pg_temp.scratch);",
+                "19",
+            ),
+        ] {
+            let rows = run_translated_default(&format!("{source}{event}"));
+            assert_eq!(rows, vec![Some(expected.to_string())], "{event}");
+        }
     }
 }

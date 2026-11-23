@@ -175,8 +175,9 @@ fn rewritten_guard(relation: &str) -> Error {
 impl PlPgSqlTranslator {
     /// Translates the body `block` of the trigger function `function` for the
     /// trigger `facts` describes, every statement guarded by `guard`, a
-    /// `WHEN` condition moved into the body, when there is one. What follows
-    /// a `RETURN` runs only on the paths that do not reach it.
+    /// `WHEN` condition already translated to SQLite and moved into the body,
+    /// when there is one. What follows a `RETURN` runs only on the paths that
+    /// do not reach it.
     ///
     /// # Errors
     /// Returns an error when the body holds anything a SQLite trigger body
@@ -199,9 +200,8 @@ impl PlPgSqlTranslator {
 
         if let Some(guard) = guard {
             let folded = Self::fold_trigger_specials_in(guard.clone(), &scope.facts)?;
-            let translated = Self::translate_condition(&folded, &scope, schema, options, emit)?;
             scope.begin_if();
-            scope.push_condition(translated);
+            scope.push_condition(folded);
         }
 
         let mut result =
@@ -2029,33 +2029,16 @@ impl PlPgSqlTranslator {
         if let Some(source) = &insert.source {
             match &*source.body {
                 SetExpr::Values(values) => {
-                    let new_source =
-                        Self::transform_values_to_select(values, &modified_bindings, condition)?;
+                    let new_source = Self::transform_values_to_select(values, &modified_bindings)?;
                     new_insert.source = Some(Box::new(make_query(None, new_source)));
                 }
                 SetExpr::Select(select) => {
-                    // Reserved before the guard joins, whose translated SQL
-                    // reads no variable.
                     let mut new_source = Query {
                         with: None,
                         body: Box::new(SetExpr::Select(select.clone())),
                         ..source.as_ref().clone()
                     };
                     reserve_variables(&mut new_source, &modified_bindings);
-                    if let Some(condition) = condition
-                        && let SetExpr::Select(new_select) = new_source.body.as_mut()
-                    {
-                        new_select.selection = Some(match new_select.selection.take() {
-                            Some(existing) => {
-                                Expr::BinaryOp {
-                                    left: Box::new(existing),
-                                    op: BinaryOperator::And,
-                                    right: Box::new(condition),
-                                }
-                            }
-                            None => condition,
-                        });
-                    }
                     new_insert.source = Some(Box::new(new_source));
                 }
                 _ => {
@@ -2090,6 +2073,9 @@ impl PlPgSqlTranslator {
                 && let Some(source) = translated_insert.source.as_deref_mut()
             {
                 prepend_ctes(source, ctes.clone());
+            }
+            if let Some(condition) = &condition {
+                Self::inject_condition_into_statement(statement, condition)?;
             }
         }
         Ok(translated)
@@ -2199,7 +2185,6 @@ impl PlPgSqlTranslator {
     fn transform_values_to_select(
         values: &sqlparser::ast::Values,
         bindings: &[Binding],
-        condition: Option<Expr>,
     ) -> Result<SetExpr, Error> {
         let [row] = values.rows.as_slice() else {
             return Err(Error::unsupported_source_syntax(
@@ -2209,10 +2194,8 @@ impl PlPgSqlTranslator {
 
         let mut projections: Vec<SelectItem> =
             row.content.iter().map(|expr| SelectItem::UnnamedExpr(expr.clone())).collect();
-        // Reserved before the guard joins, whose translated SQL reads no
-        // variable.
         reserve_variables(&mut projections, bindings);
-        Ok(SetExpr::Select(Box::new(make_simple_select(projections, Vec::new(), condition))))
+        Ok(SetExpr::Select(Box::new(make_simple_select(projections, Vec::new(), None))))
     }
 
     /// The SQLite value of each readable binding, in dependency order, with a
@@ -3048,22 +3031,18 @@ mod tests {
             panic!("expected values");
         };
 
-        let transformed =
-            PlPgSqlTranslator::transform_values_to_select(values, &[], Some(parse_expr("TRUE")))
-                .unwrap();
+        let transformed = PlPgSqlTranslator::transform_values_to_select(values, &[]).unwrap();
         let SetExpr::Select(select) = transformed else {
             panic!("expected select output");
         };
         assert!(select.from.is_empty(), "a scalar-subquery read needs no relation in scope");
-        let selection = select.selection.as_ref().map(ToString::to_string).unwrap();
-        assert!(selection.eq_ignore_ascii_case("true"), "unexpected selection: {selection}");
+        assert!(select.selection.is_none());
 
         let multi = parse_query("VALUES (1), (2)");
         let SetExpr::Values(multi_values) = multi.body.as_ref() else {
             panic!("expected values");
         };
-        let error =
-            PlPgSqlTranslator::transform_values_to_select(multi_values, &[], None).unwrap_err();
+        let error = PlPgSqlTranslator::transform_values_to_select(multi_values, &[]).unwrap_err();
         assert!(error.to_string().contains("Multi-row VALUES in trigger not supported"));
     }
 
