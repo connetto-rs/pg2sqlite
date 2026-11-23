@@ -633,8 +633,7 @@ fn an_index_operator_class_is_dropped() {
 
 /// Dropping it is reported, since the index then serves fewer queries than the
 /// PostgreSQL one. The report is a downgrade rather than a drop: the index is
-/// still emitted, and it names which column lost which class, where the old
-/// warning could only say that some index somewhere had one.
+/// still emitted, and it names which index lost which class on which column.
 #[test]
 fn dropping_an_index_operator_class_warns() {
     let warnings = Pg2Sqlite::default()
@@ -651,13 +650,21 @@ fn dropping_an_index_operator_class_warns() {
         warnings.iter().any(|warning| {
             matches!(
                 warning,
-                pg2sqlite::warnings::TranslationWarning::LossyDowngrade { construct, from, location, .. }
-                    if construct == "index operator class"
-                        && from.contains("text_pattern_ops")
-                        && location == "s"
+                pg2sqlite::warnings::TranslationWarning::LossyDowngrade {
+                    construct,
+                    from,
+                    location:
+                        pg2sqlite::warnings::DowngradeLocation::Object(
+                            pg2sqlite::warnings::DeclaredObject::Index { table, name },
+                        ),
+                    ..
+                } if construct == "index operator class"
+                    && from.contains("text_pattern_ops")
+                    && table == "t"
+                    && name == "i"
             )
         }),
-        "expected a LossyDowngrade naming the column and the class, got {warnings:?}"
+        "expected a LossyDowngrade naming the index, the column and the class, got {warnings:?}"
     );
 }
 
