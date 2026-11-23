@@ -16,16 +16,27 @@ use sqlparser::ast::DataType;
 use crate::helpers;
 
 /// Helpers `ids_0` to `ids_<levels>`, the first walking the caller's items
-/// down the hierarchy and each next one calling the previous one twice, with
-/// the update policy calling the last `calls` times.
+/// down the hierarchy and each next one calling the previous one twice, in
+/// arms keeping rows on different conditions, so its set is read once per
+/// arm, with the update policy calling the last `calls` times.
 fn walk_chain(levels: usize, calls: usize) -> String {
     helper_chain(levels, calls, |previous| {
         format!(
-            "SELECT item.id FROM public.items item WHERE item.id IN (SELECT public.ids_{previous}())
+            "SELECT item.id FROM public.items item WHERE item.id IN (SELECT public.ids_{previous}()) AND item.value = 0
   UNION
   SELECT item.id FROM public.items item WHERE item.parent_id IN (SELECT public.ids_{previous}())"
         )
     })
+}
+
+/// The answer of a helper reading `ids_<previous>` twice, as its rows and as
+/// their parents.
+fn doubling(previous: usize) -> String {
+    format!(
+        "SELECT item.id FROM public.items item WHERE item.id IN (SELECT public.ids_{previous}())
+  UNION
+  SELECT item.id FROM public.items item WHERE item.parent_id IN (SELECT public.ids_{previous}())"
+    )
 }
 
 /// Helpers `ids_0` to `ids_<levels>`, the first walking the caller's items
@@ -398,4 +409,68 @@ fn a_helper_chain_read_through_a_scalar_subquery_translates_on_a_default_thread(
         |previous| format!("SELECT (SELECT public.me_{previous}())"),
         &format!("owner_id = me_{CHAIN_DEPTH}()"),
     ));
+}
+
+/// Helpers `ids_0` to `ids_<levels>`, the first answering the root items and
+/// each next one calling the previous one twice, so `ids_<level>` holds the
+/// items at most `level` levels below a root.
+fn doubled_chain(levels: usize) -> String {
+    chain_schema(
+        "ids",
+        "SETOF UUID",
+        "SELECT item.id FROM public.items item WHERE item.parent_id IS NULL",
+        levels,
+        doubling,
+        &format!("id IN (SELECT ids_{levels}())"),
+    )
+}
+
+#[test]
+fn a_helper_reading_another_twice_grows_the_script_linearly() {
+    let bytes = |levels| {
+        helpers::translate_pg(&doubled_chain(levels), &options())
+            .unwrap_or_else(|error| panic!("{levels} levels translate: {error}"))
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
+    };
+    let (half, full) = (bytes(4), bytes(8));
+    assert!(full < 3 * half, "8 levels write {full} bytes against {half} for 4");
+}
+
+#[test]
+fn a_helper_reading_another_twice_keeps_the_rows_postgresql_keeps() {
+    const LEVELS: u8 = 8;
+    let script = helpers::translate_pg(&doubled_chain(LEVELS.into()), &options())
+        .unwrap_or_else(|error| panic!("the chain translates: {error}"));
+    let blob = |byte: u8| format!("X'{}'", format!("{byte:02x}").repeat(16));
+    let mut connection = helpers::establish_connection();
+    for statement in &script {
+        diesel::sql_query(statement)
+            .execute(&mut connection)
+            .unwrap_or_else(|error| panic!("emitted statement failed: {error}\n{statement}"));
+        if !statement.starts_with("CREATE TABLE items_rls ") {
+            continue;
+        }
+        // Stored before the triggers refusing writes outside a helper exist.
+        // Item `depth + 1` sits `depth` levels below the root item 1.
+        for depth in 0..LEVELS + 4 {
+            let parent = if depth == 0 { "NULL".to_owned() } else { blob(depth) };
+            let owned_by = blob(0xaa);
+            diesel::sql_query(format!(
+                "INSERT INTO items_rls (id, owner_id, parent_id, value) VALUES ({}, {owned_by}, {parent}, 0)",
+                blob(depth + 1)
+            ))
+            .execute(&mut connection)
+            .expect("the item is stored");
+        }
+    }
+    helpers::set_session_user_id(&rosetta_uuid::Uuid::from([0xaa; 16]));
+    diesel::sql_query("UPDATE items SET value = 1")
+        .execute(&mut connection)
+        .expect("the caller updates the items it reaches");
+    let updated = diesel::sql_query("SELECT count(*) AS count FROM items_rls WHERE value = 1")
+        .get_result::<helpers::Count>(&mut connection)
+        .expect("the items are counted");
+    assert_eq!(updated.count, i64::from(LEVELS) + 1, "ids_{LEVELS} reaches {LEVELS} levels down");
 }
