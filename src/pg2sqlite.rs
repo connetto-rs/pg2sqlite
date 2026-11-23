@@ -590,7 +590,8 @@ impl Trackers {
             attachments: &self.attachments,
             in_transaction: at.in_transaction,
         });
-        let written = written.with_declaration(Declaration::Statement(statement));
+        let written =
+            written.with_declaration(Declaration::Statement { statement, schema: at.binding });
         let ambiguous = column_access::resolve_columns(statement, at.binding, &written)?;
         column_access::with_ambiguity(
             ambiguous,

@@ -378,26 +378,35 @@ pub struct TranslationContext<'a> {
     /// Whether the query about to be translated sits in a locked `FROM` item,
     /// which locks every item of its own `FROM`.
     locks_whole_query: bool,
-    /// The declaration whose expressions a warning names, `None` for a query
-    /// or a write.
+    /// The declaration whose expressions a warning names, `None` for a query.
     declaration: Option<Declaration<'a>>,
 }
 
 /// A declaration whose expressions a translation reads.
 #[derive(Clone, Copy)]
 pub(crate) enum Declaration<'a> {
-    /// A statement, which names an object when it declares or alters one.
-    Statement(&'a sqlparser::ast::Statement),
+    /// A statement, which names an object when it declares or alters one or
+    /// writes a table or view, and the schema it was written against, which
+    /// tells a written view from a table.
+    Statement {
+        /// The statement.
+        statement: &'a sqlparser::ast::Statement,
+        /// The schema it was written against.
+        schema: &'a ParserDB,
+    },
     /// A row level security policy, whose expressions are translated under
     /// whichever statement builds its table's view and triggers.
     Policy(&'a sqlparser::ast::CreatePolicy),
 }
 
 impl Declaration<'_> {
-    /// The object it declares, `None` for a statement that declares none.
+    /// The object it declares or writes, `None` for a statement that names
+    /// none.
     fn object(self) -> Option<DeclaredObject> {
         match self {
-            Self::Statement(statement) => DeclaredObject::of_statement(statement),
+            Self::Statement { statement, schema } => {
+                DeclaredObject::of_statement(statement, schema)
+            }
             Self::Policy(policy) => Some(DeclaredObject::of_policy(policy)),
         }
     }
@@ -653,8 +662,8 @@ impl<'a> TranslationContext<'a> {
         fields.into_context(self.scope, self.outer)
     }
 
-    /// The object whose expressions are being translated, `None` for a query
-    /// or a write.
+    /// The object whose expressions are being translated or the table or
+    /// view written, `None` for a query.
     pub(crate) fn declared_object(&self) -> Option<DeclaredObject> {
         self.declaration.and_then(Declaration::object)
     }
