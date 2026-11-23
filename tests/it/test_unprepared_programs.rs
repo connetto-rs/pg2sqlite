@@ -13,7 +13,7 @@ use core::fmt::Write as _;
 use diesel::{RunQueryDsl, connection::SimpleConnection};
 use pg2sqlite::{
     pg2sqlite::Pg2Sqlite,
-    prelude::{Pg2SqliteOptions, Script},
+    prelude::{Error, HelperFunction, Pg2SqliteOptions, Script},
     programs::{ProgramsError, UnpreparedProgram, unprepared_programs},
 };
 use sql_traits::structs::{Deployment, SessionSetting, SettingValue};
@@ -385,6 +385,74 @@ DROP VIEW reached;",
     diesel::sql_query("SELECT count(*) FROM counts")
         .execute(&mut connection)
         .unwrap_or_else(|error| panic!("SQLite refuses the migration: {error}"));
+}
+
+/// A malformed starting helper reports the body that failed to parse.
+#[test]
+fn a_starting_helper_with_invalid_sql_is_refused() {
+    let body = "SELECT (";
+    let function = HelperFunction {
+        name: "held_helper".to_owned(),
+        parameters: Vec::new(),
+        columns: vec!["value".to_owned()],
+        body,
+    };
+    let Err(Error::SqlParse(error)) = Pg2Sqlite::default().starting_functions(&[function]) else {
+        panic!("invalid helper SQL must produce a parse error");
+    };
+    assert_eq!(error.input(), body);
+}
+
+/// A starting helper must contain exactly one statement.
+#[test]
+fn a_starting_helper_with_multiple_statements_is_refused() {
+    let body = "SELECT 1; SELECT 2;";
+    let function = HelperFunction {
+        name: "held_helper".to_owned(),
+        parameters: Vec::new(),
+        columns: vec!["value".to_owned()],
+        body,
+    };
+    let Err(Error::SqlParse(error)) = Pg2Sqlite::default().starting_functions(&[function]) else {
+        panic!("multiple helper statements must produce a parse error");
+    };
+    assert_eq!(error.input(), body);
+    assert!(error.to_string().contains("a helper function body is one statement"));
+}
+
+/// A helper emitted by the translation is retained only once when also supplied
+/// as a starting helper.
+#[test]
+fn a_starting_helper_already_emitted_is_retained_once() {
+    let source = Pg2Sqlite::default().sql(&walk_chain(0, 1)).expect("the source parses");
+    let held = source.translate_to_sql(&options()).expect("the source translates");
+    assert_eq!(held.functions.len(), 1);
+    let translated = source
+        .starting_functions(&held.functions)
+        .expect("the starting helpers parse")
+        .translate_to_sql(&options())
+        .expect("the source translates with starting helpers");
+    assert_eq!(translated.functions, held.functions);
+}
+
+/// A table cannot shadow a helper function registered by the translation.
+#[test]
+fn a_table_colliding_with_an_emitted_helper_is_refused_by_name() {
+    let source = walk_chain(0, 1);
+    let translated = helpers::translate_script(&source, &options()).expect("the source translates");
+    let function = translated.functions.first().expect("the policy calls a helper");
+    let colliding = format!(
+        "{source}\nCREATE TABLE \"{0}\" (value INTEGER);\nGRANT SELECT ON \"{0}\" TO app;",
+        function.name
+    );
+    let error = helpers::translate_script(&colliding, &options())
+        .expect_err("a table shadowing a helper must produce a name collision");
+    let Error::EmittedNameCollision { name, first, second, .. } = error else {
+        panic!("expected a helper name collision, got {error}");
+    };
+    assert_eq!(name, function.name);
+    assert_eq!(first, format!("helper function {}", function.name));
+    assert_eq!(second, format!("\"{}\"", function.name));
 }
 
 #[test]

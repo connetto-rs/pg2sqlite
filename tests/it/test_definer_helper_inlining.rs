@@ -4,6 +4,7 @@
 //! A helper that answer refuses, or a call made without the deployment naming
 //! the caller, stays refused.
 
+use diesel::prelude::*;
 use pg2sqlite::{
     errors::Error,
     prelude::{Pg2SqliteOptions, SessionVariableMapping},
@@ -781,4 +782,118 @@ fn a_table_helper_uniting_labelled_arms_is_read_by_key_and_by_row() {
         "{trigger}"
     );
     assert_eq!(called_body(&script, trigger, "sharable_grants"), rows);
+}
+
+const CAPPED_RESOURCES: &str = "
+CREATE ROLE helper_owner NOLOGIN BYPASSRLS;
+CREATE TABLE cap_resources (id TEXT PRIMARY KEY);
+CREATE TABLE cap_permissions (
+  resource_id TEXT NOT NULL REFERENCES cap_resources(id),
+  role TEXT NOT NULL,
+  PRIMARY KEY (resource_id, role)
+);
+CREATE FUNCTION permitted_pairs() RETURNS TABLE (resource_id TEXT, role TEXT)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+  SELECT resource_id, role FROM cap_permissions WHERE role = 'reader'
+$$;
+CREATE FUNCTION capped_resources() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+  SELECT id FROM cap_resources
+  WHERE (id, 'reader') IN (SELECT * FROM permitted_pairs())
+$$;
+ALTER FUNCTION permitted_pairs() OWNER TO helper_owner;
+ALTER FUNCTION capped_resources() OWNER TO helper_owner;
+GRANT SELECT ON cap_resources, cap_permissions TO helper_owner;
+";
+
+diesel::table! {
+    cap_resources (id) {
+        id -> Text,
+    }
+}
+
+diesel::table! {
+    cap_permissions (resource_id, role) {
+        resource_id -> Text,
+        role -> Text,
+    }
+}
+
+diesel::table! {
+    permitted_resources (id) {
+        id -> Text,
+    }
+}
+
+diesel::table! {
+    repeated_resources (id) {
+        id -> Text,
+    }
+}
+
+/// Seeds resources whose permissions distinguish each column of a row cap.
+fn seed_capped_resources(connection: &mut diesel::sqlite::SqliteConnection) {
+    diesel::insert_into(cap_resources::table)
+        .values(&["allowed", "wrong-role", "ungranted"].map(|name| cap_resources::id.eq(name)))
+        .execute(connection)
+        .expect("seed resources");
+    diesel::insert_into(cap_permissions::table)
+        .values(&[
+            (cap_permissions::resource_id.eq("allowed"), cap_permissions::role.eq("reader")),
+            (cap_permissions::resource_id.eq("wrong-role"), cap_permissions::role.eq("writer")),
+        ])
+        .execute(connection)
+        .expect("seed permissions");
+}
+
+/// A tuple cap retains both its resource column and its literal role.
+#[test]
+fn a_tuple_capped_helper_returns_only_matching_resources() {
+    let script = translated(
+        &format!(
+            "{CAPPED_RESOURCES}
+             CREATE VIEW permitted_resources AS
+             SELECT resource.id FROM capped_resources() resource(id);"
+        ),
+        &options(),
+    );
+    let mut connection = helpers::applied_script(&script, None);
+    seed_capped_resources(&mut connection);
+    let rows = permitted_resources::table
+        .select(permitted_resources::id)
+        .order(permitted_resources::id)
+        .load::<String>(&mut connection)
+        .expect("read tuple-capped resources");
+    assert_eq!(rows, ["allowed"]);
+}
+
+/// Repeated helper calls keep their rows across statements and call sites.
+#[test]
+fn repeated_definer_calls_return_rows_at_every_call_site() {
+    let script = translated(
+        &format!(
+            "{CAPPED_RESOURCES}
+             CREATE VIEW permitted_resources AS
+             SELECT resource.id FROM capped_resources() resource(id);
+             CREATE VIEW repeated_resources AS
+             SELECT first_resource.id FROM capped_resources() first_resource(id)
+             JOIN capped_resources() second_resource(id)
+               ON first_resource.id = second_resource.id;"
+        ),
+        &options(),
+    );
+    let mut connection = helpers::applied_script(&script, None);
+    seed_capped_resources(&mut connection);
+    for _ in 0..2 {
+        let first = permitted_resources::table
+            .select(permitted_resources::id)
+            .load::<String>(&mut connection)
+            .expect("read the first helper call");
+        let repeated = repeated_resources::table
+            .select(repeated_resources::id)
+            .load::<String>(&mut connection)
+            .expect("read repeated helper calls");
+        assert_eq!(first, ["allowed"]);
+        assert_eq!(repeated, first);
+    }
 }
