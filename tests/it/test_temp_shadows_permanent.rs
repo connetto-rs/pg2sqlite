@@ -287,3 +287,87 @@ fn dropping_temporary_indexes_reveals_permanent_index() {
         assert_eq!(rows, vec![Some("2".to_string()), Some("2".to_string())]);
     }
 }
+
+#[test]
+fn temp_shadows_views_keep_their_bound_table() {
+    for temporary_first in [false, true] {
+        for relation in ["public.scratch", "pg_temp.scratch", "scratch"] {
+            let permanent = "CREATE TABLE public.scratch (id INTEGER);";
+            let temporary = "CREATE TEMP TABLE scratch (id INTEGER);";
+            let tables = if temporary_first {
+                format!("{temporary} {permanent}")
+            } else {
+                format!("{permanent} {temporary}")
+            };
+            let rows = run_translated_default(&format!(
+                "{tables}
+                 INSERT INTO public.scratch VALUES (10);
+                 INSERT INTO pg_temp.scratch VALUES (20);
+                 CREATE VIEW seen AS SELECT id FROM {relation};
+                 SELECT id FROM seen;"
+            ));
+            let expected = if relation == "public.scratch" { "10" } else { "20" };
+            assert_eq!(rows, vec![Some(expected.to_string())]);
+        }
+    }
+}
+
+#[test]
+fn temp_shadows_views_created_before_shadowing_keep_their_bound_table() {
+    for relation in ["public.scratch", "scratch"] {
+        let rows = run_translated_default(&format!(
+            "CREATE TABLE public.scratch (id INTEGER);
+             INSERT INTO public.scratch VALUES (10);
+             CREATE VIEW seen AS SELECT id FROM {relation};
+             CREATE TEMP TABLE scratch (id INTEGER);
+             INSERT INTO pg_temp.scratch VALUES (20);
+             SELECT id FROM seen;"
+        ));
+        assert_eq!(rows, vec![Some("10".to_string())]);
+    }
+}
+
+#[test]
+fn temp_shadows_views_created_before_permanent_table_keep_their_bound_table() {
+    for relation in ["pg_temp.scratch", "scratch"] {
+        let rows = run_translated_default(&format!(
+            "CREATE TEMP TABLE scratch (id INTEGER);
+             INSERT INTO pg_temp.scratch VALUES (20);
+             CREATE VIEW seen AS SELECT id FROM {relation};
+             CREATE TABLE public.scratch (id INTEGER);
+             INSERT INTO public.scratch VALUES (10);
+             SELECT id FROM seen;"
+        ));
+        assert_eq!(rows, vec![Some("20".to_string())]);
+    }
+}
+
+#[test]
+fn temp_shadows_views_bind_both_databases_and_preserve_ctes() {
+    let rows = run_translated_default(
+        "CREATE TABLE public.scratch (id INTEGER);
+         INSERT INTO public.scratch VALUES (10);
+         CREATE TEMP TABLE scratch (id INTEGER);
+         INSERT INTO pg_temp.scratch VALUES (20);
+         CREATE VIEW seen AS
+             WITH scratch AS (SELECT 30 AS id)
+             SELECT id FROM public.scratch
+             UNION ALL SELECT id FROM pg_temp.scratch
+             UNION ALL SELECT id FROM scratch;
+         SELECT id FROM seen ORDER BY id;",
+    );
+    assert_eq!(rows, vec![Some("10".into()), Some("20".into()), Some("30".into())]);
+}
+
+#[test]
+fn temp_shadows_views_promote_without_main_qualification() {
+    let rows = run_translated_default(
+        "CREATE TABLE public.scratch (id INTEGER);
+         CREATE VIEW seen AS SELECT id FROM public.scratch;
+         CREATE TEMP TABLE scratch (id INTEGER);
+         INSERT INTO pg_temp.scratch VALUES (20);
+         CREATE VIEW seen AS SELECT id FROM scratch;
+         SELECT id FROM seen;",
+    );
+    assert_eq!(rows, vec![Some("20".into())]);
+}

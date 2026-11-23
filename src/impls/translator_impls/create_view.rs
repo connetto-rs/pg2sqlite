@@ -1,16 +1,17 @@
 //! Implementation of the [`Translator`](crate::traits::Translator) trait for
 //! the `CreateView` type.
 
+use alloc::collections::BTreeMap;
 use core::ops::ControlFlow;
 
 use sql_traits::{
     errors::{LookupError, RowSecurityError},
     structs::{IdentifierCase, ParserDB, RowSecurity, RowStatement, TargetName},
-    traits::{DatabaseLike, RoleLike, TableLike, ViewLike},
+    traits::{DatabaseLike, Relation, RoleLike, TableLike, ViewLike},
 };
 use sqlparser::ast::{
     CreateTable, CreateTableOptions, CreateView, Expr, Ident, ObjectName, ObjectNamePart, Query,
-    SqlOption, Value, visit_relations_mut,
+    SqlOption, TableFactor, Value, VisitMut, VisitorMut,
 };
 
 #[cfg(not(feature = "std"))]
@@ -19,9 +20,13 @@ use crate::{
     errors::Error,
     impls::{
         object_name::{
-            append_suffix, normalize_declared_relation_name_for_sqlite, resolve_translation_table,
+            append_suffix, last_ident, normalize_declared_relation_name_for_sqlite,
+            normalize_schema_qualified_object_name_for_sqlite, resolve_translation_table,
+            sqlite_unqualified_object_name,
         },
         privileges::has_backing_table,
+        relation_scope::RelationScopes,
+        scoped_relations::relation_occurrences,
     },
 };
 
@@ -75,10 +80,16 @@ impl crate::traits::translator::TranslatorWithContext for CreateView {
             ));
         }
 
+        let written = options.written_schema().unwrap_or(schema);
+        let stored = declared_view(written, self)?;
+        let temporary = self.temporary || stored.is_some_and(ViewLike::is_temporary);
         let mut query = self.query.translate_with_warnings(schema, options, emit)?;
-        if !security_invoker {
-            retarget_rls_reads(&mut query, self, schema, options)?;
-        }
+        retarget_reads(&mut query, self, schema, options, temporary, security_invoker)?;
+        let name = if temporary {
+            sqlite_unqualified_object_name(&self.name)
+        } else {
+            normalize_declared_relation_name_for_sqlite(schema, &self.name, false)?
+        };
 
         Ok(CreateView {
             or_alter: false,
@@ -86,7 +97,7 @@ impl crate::traits::translator::TranslatorWithContext for CreateView {
             materialized: false,
             secure: false,
             copy_grants: false,
-            name: normalize_declared_relation_name_for_sqlite(schema, &self.name, self.temporary)?,
+            name,
             name_before_not_exists: self.name_before_not_exists,
             columns: self.columns.clone(),
             query: Box::new(query),
@@ -94,7 +105,7 @@ impl crate::traits::translator::TranslatorWithContext for CreateView {
             cluster_by: Vec::new(),
             comment: self.comment.clone(), // Comments are harmless, pass through
             if_not_exists: self.if_not_exists,
-            temporary: self.temporary,
+            temporary,
             to: None,
             params: None,
             with_no_schema_binding: false,
@@ -115,39 +126,106 @@ fn reads_as_the_invoker(options: &CreateTableOptions) -> bool {
     )
 }
 
-/// Points the view body at the backing table of every table it reads that has
-/// one, which is how the view's owner reads a table whose policies exempt it,
-/// or whose columns the acting role reads only in part.
+/// Binds every relation the view body reads to the database PostgreSQL bound
+/// it to when the view was created, so a temporary table created later under
+/// the same name does not capture the read.
 ///
-/// The same retarget a foreign key referencing such a table already gets, so a
-/// declared view and a declared reference agree about which relation holds
-/// the rows. A plain view reads as its owner, named by `OWNER TO` or else the
-/// schema owner. An owner the policies bind is refused, since the view would
-/// show that owner's rows rather than the table's or the caller's.
-fn retarget_rls_reads(
+/// Also points the view body at the backing table of every table it reads
+/// that has one, which is how the view's owner reads a table whose policies
+/// exempt it, or whose columns the acting role reads only in part. The same
+/// retarget a foreign key referencing such a table already gets, so a declared
+/// view and a declared reference agree about which relation holds the rows. A
+/// plain view reads as its owner, named by `OWNER TO` or else the schema owner.
+/// An owner the policies bind is refused, since the view would show that
+/// owner's rows rather than the table's or the caller's.
+fn retarget_reads(
     query: &mut Query,
     view: &CreateView,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
+    temporary: bool,
+    security_invoker: bool,
 ) -> Result<(), Error> {
-    let outcome = visit_relations_mut(query, |name: &mut ObjectName| {
-        let table = match resolve_translation_table(schema, name) {
-            Ok(Some(table)) => table,
-            Ok(None) => return ControlFlow::Continue(()),
-            Err(error) => return ControlFlow::Break(error),
+    let written = options.written_schema().unwrap_or(schema);
+    let mut replacements = BTreeMap::new();
+    for name in relation_occurrences(view.query.as_ref()) {
+        let Some(identifier) = last_ident(&name) else { continue };
+        let Some(target) = crate::traits::schema::lookup_target(&name) else { continue };
+        let (is_temporary, namespace, quoted) =
+            match written.resolve_target_relation(target, IdentifierCase::AsWritten)? {
+                Some(Relation::Table(table)) => {
+                    (table.is_temporary(), table.table_schema(), table.table_schema_is_quoted())
+                }
+                Some(Relation::View(view)) => {
+                    (view.is_temporary(), view.view_schema(), view.view_schema_is_quoted())
+                }
+                _ => continue,
+            };
+        let namespace = if is_temporary {
+            Ident::new("pg_temp")
+        } else if quoted {
+            Ident::with_quote('"', namespace.unwrap_or("public"))
+        } else {
+            Ident::new(namespace.unwrap_or("public"))
         };
-        match owner_bypasses(view, table, schema, options) {
-            Ok(true) => {
-                *name = append_suffix(name, options.get_rls_table_suffix());
-                ControlFlow::Continue(())
-            }
-            Ok(false) => ControlFlow::Continue(()),
-            Err(error) => ControlFlow::Break(error),
+        let bound = ObjectName::from(vec![namespace, identifier.clone()]);
+        let translated = normalize_schema_qualified_object_name_for_sqlite(schema, &name)?;
+        let mut replacement = if temporary {
+            ObjectName::from(vec![
+                Ident::new(if is_temporary { "temp" } else { "main" }),
+                identifier.clone(),
+            ])
+        } else {
+            normalize_schema_qualified_object_name_for_sqlite(schema, &bound)?
+        };
+        if !security_invoker
+            && let Some(table) = resolve_translation_table(schema, &bound)?
+            && owner_bypasses(view, table, schema, options)?
+        {
+            replacement = append_suffix(&replacement, options.get_rls_table_suffix());
         }
-    });
-    match outcome {
-        ControlFlow::Continue(()) => Ok(()),
-        ControlFlow::Break(error) => Err(error),
+        if translated != replacement {
+            replacements.insert(translated, replacement);
+        }
+    }
+    if !replacements.is_empty() {
+        let _: ControlFlow<()> =
+            query.visit(&mut BoundReads { replacements, scopes: RelationScopes::default() });
+    }
+    Ok(())
+}
+
+struct BoundReads {
+    replacements: BTreeMap<ObjectName, ObjectName>,
+    scopes: RelationScopes,
+}
+
+impl VisitorMut for BoundReads {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
+        self.scopes.enter(query);
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &mut Query) -> ControlFlow<Self::Break> {
+        self.scopes.exit();
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<Self::Break> {
+        if let TableFactor::Table { name, args: None, .. } = factor {
+            if name.0.len() == 1
+                && let Some(identifier) = last_ident(name)
+                && self.scopes.binding(identifier).is_some()
+            {
+                return ControlFlow::Continue(());
+            }
+            if let Some(replacement) = self.replacements.get(name) {
+                name.clone_from(replacement);
+            }
+        }
+        ControlFlow::Continue(())
     }
 }
 
@@ -168,7 +246,7 @@ fn owner_bypasses(
     if !table.has_row_level_security(schema)? {
         return has_backing_table(table, schema, options);
     }
-    let owner = declared_view(schema, view)?
+    let owner = declared_view(options.written_schema().unwrap_or(schema), view)?
         .map(|stored| stored.owner(schema))
         .transpose()?
         .flatten()
@@ -215,7 +293,35 @@ fn declared_view<'a>(
             target.with_schema(&schema_name.value, schema_name.quote_style.is_some())
         }
         None if view.temporary => target.with_schema("pg_temp", false),
-        None => target,
+        None => {
+            let temporary = schema.view_by_target(
+                target.clone().with_schema("pg_temp", false),
+                IdentifierCase::AsWritten,
+            )?;
+            if temporary.is_some()
+                && (schema.view_by_target(target.clone(), IdentifierCase::AsWritten)?.is_none()
+                    || reads_temporary_relation(schema, &view.query)?)
+            {
+                return Ok(temporary);
+            }
+            target
+        }
     };
     schema.view_by_target(target, IdentifierCase::AsWritten)
+}
+
+/// Whether a query binds to a temporary table or view.
+fn reads_temporary_relation(schema: &ParserDB, query: &Query) -> Result<bool, LookupError> {
+    for name in relation_occurrences(query) {
+        let Some(target) = crate::traits::schema::lookup_target(&name) else { continue };
+        let temporary = match schema.resolve_target_relation(target, IdentifierCase::AsWritten)? {
+            Some(Relation::Table(table)) => table.is_temporary(),
+            Some(Relation::View(view)) => view.is_temporary(),
+            _ => false,
+        };
+        if temporary {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
