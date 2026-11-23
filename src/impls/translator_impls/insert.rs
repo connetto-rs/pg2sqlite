@@ -701,7 +701,7 @@ fn substitute_do_update_defaults(
     };
     let table = target.required(|| unknown_default_table(table_name))?;
 
-    let assignments = without_generated_defaults(&do_update.assignments, table, schema)?
+    let assignments = without_generated_defaults(&do_update.assignments, table, schema, options)?
         .iter()
         .map(|a| {
             let substituted =

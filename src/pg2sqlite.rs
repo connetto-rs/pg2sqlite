@@ -656,15 +656,18 @@ fn translate_followed(
     statement: &Statement,
     at: Position<'_, '_>,
     sides: Option<(Position<'_, '_>, Position<'_, '_>)>,
-    initial: Option<&ParserDB>,
+    initial: Option<(&ParserDB, &[crate::options::TableTrigger])>,
     trackers: &mut Trackers,
     follower: &mut TriggerFollower,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<(Vec<Statement>, bool), crate::errors::Error> {
+    let seeded_context =
+        at.context.with_table_triggers(initial.map_or(&[], |(_, triggers)| triggers));
     let reemissions = match sides {
         Some((before, after)) if !follower.is_empty() => {
-            let seeded = initial
-                .map_or(before, |initial| Position { schema: initial, binding: initial, ..before });
+            let seeded = initial.map_or(before, |(initial, _)| {
+                Position { schema: initial, binding: initial, context: &seeded_context, ..before }
+            });
             follower.reemissions(
                 statement,
                 before.binding,
@@ -693,8 +696,9 @@ fn translate_followed(
     };
     let superseded = match replaced {
         Some((name, table)) => {
-            let seeded =
-                initial.map_or(at, |initial| Position { schema: initial, binding: initial, ..at });
+            let seeded = initial.map_or(at, |(initial, _)| {
+                Position { schema: initial, binding: initial, context: &seeded_context, ..at }
+            });
             follower.created(name, table, &mut |source, sink| {
                 trackers.translate(source, seeded, sink)
             })?
@@ -1404,6 +1408,7 @@ impl Pg2Sqlite {
             attachments: LiveAttachments::seeded(initial_schema, context)?,
         };
         let mut follower = TriggerFollower::seeded(initial_schema);
+        let initial_triggers = context.seed_table_triggers(initial_schema);
         let outline = crate::history::transactions::Outline::new(statements, dispositions);
 
         let mut warnings = Vec::new();
@@ -1449,12 +1454,14 @@ impl Pg2Sqlite {
                             event_sides(statement, epochs, (epoch_index, index), final_schema, at);
                         let mut emitted = Vec::new();
                         let mut rebuilt = false;
+                        let initial =
+                            initial_schema.map(|schema| (schema, initial_triggers.as_slice()));
                         for drop in &cascaded {
                             let (mut dropped, _) = translate_followed(
                                 drop,
                                 at,
                                 None,
-                                initial_schema,
+                                initial,
                                 &mut trackers,
                                 &mut follower,
                                 &mut emit,
@@ -1466,7 +1473,7 @@ impl Pg2Sqlite {
                             statement,
                             at,
                             sides,
-                            initial_schema,
+                            initial,
                             &mut trackers,
                             &mut follower,
                             &mut emit,

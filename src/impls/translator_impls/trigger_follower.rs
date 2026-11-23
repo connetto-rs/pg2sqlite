@@ -71,6 +71,10 @@ impl Touched {
             }
             Statement::CreateTable(create) => relations(folded_names(&[&create.name])),
             Statement::CreateView(view) => relations(folded_names(&[&view.name])),
+            Statement::CreateTrigger(trigger) => relations(folded_names(&[&trigger.table_name])),
+            Statement::DropTrigger(drop) => {
+                drop.table_name.as_ref().and_then(|table| relations(folded_names(&[table])))
+            }
             Statement::Drop {
                 object_type: ObjectType::Table | ObjectType::View, names, ..
             } => relations(names.iter().map(folded).collect()),
@@ -267,6 +271,21 @@ impl TriggerFollower {
         };
         let mut reemissions = Vec::new();
         for followed in &mut self.live {
+            let replaced = match event {
+                Statement::CreateTrigger(trigger) => {
+                    followed.is(&folded(&trigger.name), Some(&folded(&trigger.table_name)))
+                }
+                Statement::DropTrigger(drop) => {
+                    followed.is(
+                        &folded(&drop.trigger_name),
+                        drop.table_name.as_ref().map(folded).as_deref(),
+                    )
+                }
+                _ => false,
+            };
+            if replaced {
+                continue;
+            }
             let table = folded(&followed.create.table_name);
             if dropped.contains(&table)
                 || !touched.reaches(&followed.create, (before, after), &mut self.bodies)?
