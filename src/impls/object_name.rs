@@ -6,7 +6,7 @@ use sql_traits::{
     errors::LookupError,
     structs::{IdentifierCase, ParserDB, TargetName},
     traits::{ColumnLike, DatabaseLike, TableLike},
-    utils::identifier_resolution::identifiers_match,
+    utils::identifier_resolution::{identifiers_match, is_temporary_schema},
 };
 use sqlparser::ast::{
     CreateTable, Expr, Ident, ObjectName, ObjectNamePart, TriggerEvent, visit_expressions,
@@ -186,6 +186,7 @@ fn parse_schema_qualified_name_parts(
 
 fn schema_resolves(schema: &ParserDB, schema_name: &Ident) -> bool {
     identifiers_match("public", false, &schema_name.value, schema_name.quote_style.is_some())
+        || is_temporary_schema(&schema_name.value, schema_name.quote_style.is_some())
         || schema.resolve_schema_ident(schema_name).is_some()
 }
 
@@ -215,15 +216,21 @@ pub(crate) fn validate_schema_qualified_object_name_for_sqlite(
     ensure_schema_resolves(schema, name, parts.explicit_schema)
 }
 
-/// Normalizes an object name to SQLite output shape while enforcing that any
-/// explicit schema is resolvable in `schema`.
+/// Maps `pg_temp` to SQLite's `temp` and removes other resolvable schema
+/// qualifiers.
 pub(crate) fn normalize_schema_qualified_object_name_for_sqlite(
     schema: &ParserDB,
     name: &ObjectName,
 ) -> Result<ObjectName, Error> {
     let parts = parse_schema_qualified_name_parts(name)?;
     ensure_schema_resolves(schema, name, parts.explicit_schema)?;
-    Ok(ObjectName(vec![parts.object_part]))
+    if parts.explicit_schema.is_some_and(|schema_name| {
+        is_temporary_schema(&schema_name.value, schema_name.quote_style.is_some())
+    }) {
+        Ok(ObjectName(vec![ObjectNamePart::Identifier(Ident::new("temp")), parts.object_part]))
+    } else {
+        Ok(ObjectName(vec![parts.object_part]))
+    }
 }
 
 /// Resolves the table a statement names, an unqualified name searching

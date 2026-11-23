@@ -3,7 +3,7 @@
 
 use alloc::collections::BTreeSet;
 
-use sql_traits::utils::identifier_resolution::identifiers_match;
+use sql_traits::{traits::TableLike, utils::identifier_resolution::identifiers_match};
 use sqlparser::ast::{
     ColumnOption, ColumnOptionDef, CreateTable, CreateTableOptions, HiveDistributionStyle,
     NotNullConstraint, ObjectName, OnCommit, PrimaryKeyConstraint, SqliteTableOption,
@@ -277,7 +277,7 @@ impl crate::traits::translator::TranslatorWithContext for CreateTable {
         created_table.sqlite_table_options.options =
             if is_ctas { Vec::new() } else { vec![SqliteTableOption::Strict] };
         // Legal in both databases and carried through unchanged.
-        created_table.temporary = self.temporary;
+        created_table.temporary = self.is_temporary();
         created_table.if_not_exists = self.if_not_exists;
 
         let mut pk_column_names = BTreeSet::new();
