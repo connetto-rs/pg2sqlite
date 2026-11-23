@@ -372,3 +372,140 @@ fn a_called_helper_passes_reals_and_blobs_through() {
         .expect("read echoed_samples");
     assert_eq!(rows, [(1, Some(2.5), Some(vec![0x00, 0xff])), (2, None, None)]);
 }
+
+diesel::table! {
+    deviating (id) {
+        id -> Integer,
+    }
+}
+
+/// An inlined call cannot duplicate an argument that changes between
+/// evaluations.
+#[test]
+fn an_inlined_helper_refuses_a_changing_argument() {
+    let error = refusal(
+        &deviations("STABLE", BODY),
+        "CREATE VIEW deviating AS SELECT run.id FROM runs run WHERE EXISTS \
+         (SELECT 1 FROM run_deviations(CASE WHEN random() < 2 THEN run.id END));",
+    );
+    assert!(error.contains("run_deviations()"), "{error}");
+    assert!(error.contains("may answer differently on each evaluation"), "{error}");
+}
+
+/// A snapshot read cannot duplicate a changing argument when its body is
+/// written in place.
+#[test]
+fn an_insert_helper_reading_its_target_refuses_a_changing_argument() {
+    let error = refusal(
+        &deviations("STABLE STRICT", BODY),
+        "INSERT INTO runs SELECT link.id, NULL, 1, 2 FROM links link WHERE EXISTS \
+         (SELECT 1 FROM run_deviations(CASE WHEN random() < 2 THEN link.run_id END));",
+    );
+    assert!(error.contains("run_deviations()"), "{error}");
+    assert!(error.contains("reads the table the INSERT writes"), "{error}");
+    assert!(error.contains("may answer differently on each evaluation"), "{error}");
+}
+
+/// A subquery argument does not make a changing call correlated with its outer
+/// row.
+#[test]
+fn a_helper_with_a_subquery_argument_refuses_statement_wide_random_evaluation() {
+    let error = refusal(
+        &deviations("STABLE STRICT", BODY),
+        "CREATE VIEW deviating AS SELECT run.id FROM runs run WHERE EXISTS \
+         (SELECT 1 FROM run_deviations(CASE WHEN random() < 2 \
+          THEN (SELECT max(link.run_id) FROM links link) END));",
+    );
+    assert!(error.contains("run_deviations()"), "{error}");
+    assert!(error.contains("SQLite evaluates once for the whole statement"), "{error}");
+}
+
+/// Hosted calls inside parenthesized joins retain their rows.
+#[test]
+fn a_hosted_helper_inside_a_nested_join_returns_matching_rows() {
+    let source = format!(
+        "{RUNS}{}
+         CREATE VIEW deviating AS SELECT link.id FROM
+           (run_deviations(2) AS deviation(kind) JOIN links link ON link.run_id = 2);
+         GRANT SELECT ON deviating TO app;",
+        deviations("STABLE STRICT", BODY)
+    );
+    let script = helpers::translate_script(&source, &options()).expect("translate nested join");
+    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
+    script.register_functions(&mut connection).expect("register helpers");
+    for statement in script.into_vec() {
+        connection.batch_execute(&statement).expect("create replica");
+    }
+    connection
+        .batch_execute(
+            "INSERT INTO runs VALUES (1, NULL, 5, 5), (2, NULL, 5, 6);
+             INSERT INTO links VALUES (10, 1), (11, 2), (12, 2);",
+        )
+        .expect("seed replica");
+    let rows: Vec<i32> = deviating::table
+        .select(deviating::id)
+        .order(deviating::id)
+        .load(&mut connection)
+        .expect("read nested join");
+    assert_eq!(rows, [11, 12]);
+}
+
+/// Nested helper reads share the snapshot taken before an insert writes any
+/// row.
+#[test]
+fn an_insert_reading_its_target_through_nested_helpers_keeps_the_original_count() {
+    let source = format!(
+        "{RUNS}
+         CREATE FUNCTION run_counts() RETURNS SETOF BIGINT LANGUAGE sql STABLE STRICT
+           AS $$ SELECT count(*) FROM runs $$;
+         CREATE FUNCTION nested_counts() RETURNS SETOF BIGINT LANGUAGE sql STABLE STRICT
+           AS $$ SELECT amount FROM run_counts() AS counted(amount) $$;
+         CREATE VIEW deviating AS SELECT id FROM runs WHERE measured = 1;
+         GRANT SELECT ON deviating TO app;
+         INSERT INTO runs VALUES (1, NULL, 0, 0);
+         INSERT INTO links VALUES (2, NULL), (3, NULL);
+         INSERT INTO runs SELECT link.id, NULL,
+           (SELECT amount FROM nested_counts() AS counted(amount)), 0 FROM links link;"
+    );
+    let script = helpers::translate_script(&source, &options()).expect("translate snapshot read");
+    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
+    script.register_functions(&mut connection).expect("register helpers");
+    for statement in script.into_vec() {
+        connection.batch_execute(&statement).expect("execute snapshot insert");
+    }
+    let rows: Vec<i32> = deviating::table
+        .select(deviating::id)
+        .order(deviating::id)
+        .load(&mut connection)
+        .expect("read inserted counts");
+    assert_eq!(rows, [2, 3]);
+}
+
+/// Helpers reading another table remain callable while an insert copies their
+/// rows.
+#[test]
+fn an_insert_reads_another_table_through_nested_helpers() {
+    let source = format!(
+        "{RUNS}
+         CREATE FUNCTION linked_ids() RETURNS SETOF INTEGER LANGUAGE sql STABLE STRICT
+           AS $$ SELECT id FROM links $$;
+         CREATE FUNCTION nested_ids() RETURNS SETOF INTEGER LANGUAGE sql STABLE STRICT
+           AS $$ SELECT id FROM linked_ids() AS linked(id) $$;
+         CREATE VIEW deviating AS SELECT id FROM runs;
+         GRANT SELECT ON deviating TO app;
+         INSERT INTO links VALUES (2, NULL), (3, NULL);
+         INSERT INTO runs SELECT id, NULL, 0, 0 FROM nested_ids() AS linked(id);"
+    );
+    let script = helpers::translate_script(&source, &options()).expect("translate nested helpers");
+    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
+    script.register_functions(&mut connection).expect("register helpers");
+    for statement in script.into_vec() {
+        connection.batch_execute(&statement).expect("execute nested helper insert");
+    }
+    let rows: Vec<i32> = deviating::table
+        .select(deviating::id)
+        .order(deviating::id)
+        .load(&mut connection)
+        .expect("read inserted rows");
+    assert_eq!(rows, [2, 3]);
+}
