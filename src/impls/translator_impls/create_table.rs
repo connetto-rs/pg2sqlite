@@ -52,6 +52,25 @@ fn reject_case_colliding_columns(
     Ok(())
 }
 
+/// Refuses tables whose columns are all generated expressions.
+pub(crate) fn reject_all_generated_columns(
+    table: &CreateTable,
+) -> Result<(), crate::errors::Error> {
+    if !table.columns.is_empty()
+        && table.columns.iter().all(|column| {
+            column.options.iter().any(|option| {
+                matches!(option.option, ColumnOption::Generated { generation_expr: Some(_), .. })
+            })
+        })
+    {
+        return Err(crate::errors::Error::forward_refusal(format!(
+            "SQLite requires at least one non-generated column in table {}. Add a plain column.",
+            table.name
+        )));
+    }
+    Ok(())
+}
+
 impl crate::traits::translator::TranslatorWithContext for CreateTable {
     type SQLiteEntry = CreateTable;
 
@@ -125,6 +144,8 @@ impl crate::traits::translator::TranslatorWithContext for CreateTable {
                 "SQLite tables require at least one output column".to_string(),
             ));
         }
+
+        reject_all_generated_columns(self)?;
 
         reject_foreign_create_table_modifiers(self)?;
 

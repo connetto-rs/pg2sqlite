@@ -12,6 +12,7 @@ mod sample_sql;
 mod support;
 mod test_aggregate_ordered_set;
 mod test_aggregate_window_fixes;
+mod test_all_generated_table;
 mod test_alter_table_columns;
 mod test_any_array_subquery;
 mod test_array_concat;
