@@ -146,16 +146,17 @@ fn engines() -> (PgConnection, SqliteConnection) {
         .sql(SCHEMA)
         .expect("parse schema")
         .translate(&Pg2SqliteOptions::default())
-        .expect("translate schema")
-        .into_vec();
+        .expect("translate schema");
     let mut sqlite = establish_connection();
+    translated.register_functions(&mut sqlite).expect("register schema helper functions");
+    let translated = translated.into_vec();
     execute_ddl(&mut sqlite, &translated);
     seed!(&mut sqlite);
     (postgres, sqlite)
 }
 
-/// The SQLite text `probe` translates to, with [`SCHEMA`] in scope.
-fn translated_probe(probe: &str) -> String {
+/// The SQLite script for `probe`, with [`SCHEMA`] in scope.
+fn translated_probe(probe: &str) -> pg2sqlite::script::Script {
     Pg2Sqlite::default()
         .sql(SCHEMA)
         .expect("parse schema")
@@ -163,10 +164,6 @@ fn translated_probe(probe: &str) -> String {
         .expect("parse probe")
         .translate(&Pg2SqliteOptions::default())
         .unwrap_or_else(|error| panic!("{probe} does not translate: {error}"))
-        .into_vec()
-        .last()
-        .expect("a translated probe")
-        .to_string()
 }
 
 #[derive(QueryableByName)]
@@ -232,6 +229,8 @@ fn boolean_aggregates_answer_as_postgresql_does() {
     for probe in CALL_PROBES.iter().chain(CONTEXT_PROBES) {
         let source = postgres_flags(&mut postgres, probe);
         let translated = translated_probe(probe);
+        translated.register_functions(&mut sqlite).expect("register probe helper functions");
+        let translated = translated.iter().last().expect("a translated probe").to_string();
         let counterpart: Vec<(i32, Option<bool>)> = diesel::sql_query(&translated)
             .load::<SqliteFlag>(&mut sqlite)
             .unwrap_or_else(|error| panic!("SQLite refused {translated}: {error}"))
@@ -261,6 +260,7 @@ fn boolean_aggregate_lowering_reverses_to_the_aggregate() {
     let schema = Pg2Sqlite::default().sql(SCHEMA).unwrap().build_schema().unwrap();
     for probe in CALL_PROBES {
         let translated = translated_probe(probe);
+        let translated = translated.iter().last().expect("a translated probe").to_string();
         let reversed = Pg2Sqlite::default()
             .reverse_sql(&translated, &schema, &Pg2SqliteOptions::default())
             .unwrap_or_else(|error| panic!("{translated} does not reverse: {error}"))
@@ -299,6 +299,8 @@ fn boolean_aggregates_render_as_words() {
             .map(|row| (row.id, row.rendered))
             .collect();
         let translated = translated_probe(probe);
+        translated.register_functions(&mut sqlite).expect("register probe helper functions");
+        let translated = translated.iter().last().expect("a translated probe").to_string();
         let counterpart: Vec<(i32, Option<String>)> = diesel::sql_query(&translated)
             .load::<Rendered>(&mut sqlite)
             .unwrap_or_else(|error| panic!("SQLite refused {translated}: {error}"))

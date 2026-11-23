@@ -2,15 +2,18 @@
 //! prepare is listed, and nothing SQLite prepares.
 //!
 //! SQLite refuses to expand a `WITH` query in a program already holding
-//! `SQLITE_LIMIT_EXPR_DEPTH` table cursors, and every call site of a helper
-//! is written as its own copy of the helper's set, so a schema whose helpers
-//! call one another repeatedly loads and then fails on the first write.
+//! `SQLITE_LIMIT_EXPR_DEPTH` table cursors. A helper PostgreSQL inlines is
+//! written at each call site as its own copy of the helper's set, so a schema
+//! whose inlined helpers read one another repeatedly loads and then fails on
+//! the first write. A helper PostgreSQL calls is a table-valued function,
+//! costing its call site one cursor, with its body a program of its own.
 
 use core::fmt::Write as _;
 
 use diesel::{RunQueryDsl, connection::SimpleConnection};
 use pg2sqlite::{
-    prelude::Pg2SqliteOptions,
+    pg2sqlite::Pg2Sqlite,
+    prelude::{Pg2SqliteOptions, Script},
     programs::{ProgramsError, UnpreparedProgram, unprepared_programs},
 };
 use sql_traits::structs::{Deployment, SessionSetting, SettingValue};
@@ -18,18 +21,23 @@ use sqlparser::ast::DataType;
 
 use crate::helpers;
 
-/// Helpers `ids_0` to `ids_<levels>`, the first walking the caller's items
-/// down the hierarchy and each next one calling the previous one twice, in
-/// arms keeping rows on different conditions, so its set is read once per
-/// arm, with the update policy calling the last `calls` times.
+/// `SECURITY DEFINER` helpers `ids_0` to `ids_<levels>`, the first walking
+/// the caller's items down the hierarchy and each next one calling the
+/// previous one twice, in arms keeping rows on different conditions, so its
+/// set is read once per arm, with the update policy calling the last `calls`
+/// times.
 fn walk_chain(levels: usize, calls: usize) -> String {
-    helper_chain(levels, calls, |previous| {
-        format!(
-            "SELECT item.id FROM public.items item WHERE item.id IN (SELECT public.ids_{previous}()) AND item.value = 0
+    helper_chain(levels, calls, walk)
+}
+
+/// The items below the items `ids_<previous>` answers, calling it twice in
+/// arms keeping rows on different conditions.
+fn walk(previous: usize) -> String {
+    format!(
+        "SELECT item.id FROM public.items item WHERE item.id IN (SELECT public.ids_{previous}()) AND item.value = 0
   UNION
   SELECT item.id FROM public.items item WHERE item.parent_id IN (SELECT public.ids_{previous}())"
-        )
-    })
+    )
 }
 
 /// The answer of a helper reading `ids_<previous>` twice, as its rows and as
@@ -42,35 +50,57 @@ fn doubling(previous: usize) -> String {
     )
 }
 
-/// Helpers `ids_0` to `ids_<levels>`, the first walking the caller's items
-/// down the hierarchy and each next one answering `body(previous)`, with the
-/// update policy calling the last `calls` times.
-fn helper_chain(levels: usize, calls: usize, body: impl Fn(usize) -> String) -> String {
-    let using = vec![format!("id IN (SELECT ids_{levels}())"); calls].join(" OR ");
-    chain_schema(
-        "ids",
-        "SETOF UUID",
-        "WITH RECURSIVE reached (id) AS (
+/// Invoker helpers `ids_0` to `ids_<levels>` that PostgreSQL inlines, the
+/// first walking the caller's items down the hierarchy and each next one
+/// reading the previous one twice, with the update policy reading the last
+/// `calls` times.
+fn inlined_walk_chain(levels: usize, calls: usize) -> String {
+    let using =
+        vec![format!("id IN (SELECT x.id FROM ids_{levels}() AS x(id))"); calls].join(" OR ");
+    chain_schema("ids", "SETOF UUID", WALK, levels, inlined_walk, "", &using)
+}
+
+/// The items below the items `ids_<previous>` answers, read twice through
+/// `FROM`, where PostgreSQL inlines an invoker helper.
+fn inlined_walk(previous: usize) -> String {
+    format!(
+        "SELECT item.id FROM public.items item JOIN public.ids_{previous}() AS x(id) ON item.id = x.id
+  UNION
+  SELECT item.id FROM public.items item JOIN public.ids_{previous}() AS x(id) ON item.parent_id = x.id"
+    )
+}
+
+/// The caller's items and every item below them.
+const WALK: &str = "WITH RECURSIVE reached (id) AS (
     SELECT item.id FROM public.items item WHERE item.owner_id = NULLIF(current_setting('app.user_id', true), '')::uuid
     UNION
     SELECT item.id FROM public.items item JOIN reached ON item.parent_id = reached.id
   )
-  SELECT reached.id FROM reached",
-        levels,
-        body,
-        &using,
-    )
+  SELECT reached.id FROM reached";
+
+/// The attributes of a `SECURITY DEFINER` helper pinning its search path,
+/// which PostgreSQL calls.
+const DEFINER: &str = "SECURITY DEFINER SET search_path = pg_catalog, pg_temp";
+
+/// `SECURITY DEFINER` helpers `ids_0` to `ids_<levels>`, the first walking
+/// the caller's items down the hierarchy and each next one answering
+/// `body(previous)`, with the update policy calling the last `calls` times.
+fn helper_chain(levels: usize, calls: usize, body: impl Fn(usize) -> String) -> String {
+    let using = vec![format!("id IN (SELECT ids_{levels}())"); calls].join(" OR ");
+    chain_schema("ids", "SETOF UUID", WALK, levels, body, DEFINER, &using)
 }
 
-/// The items schema with helpers `<name>_0` to `<name>_<levels>` returning
-/// `returns`, the first answering `first` and each next one answering
-/// `body(previous)`, and an update policy using `using`.
+/// The items schema with `STABLE` helpers `<name>_0` to `<name>_<levels>`
+/// declared with `attributes` and returning `returns`, the first answering
+/// `first` and each next one answering `body(previous)`, and an update policy
+/// using `using`.
 fn chain_schema(
     name: &str,
     returns: &str,
     first: &str,
     levels: usize,
     body: impl Fn(usize) -> String,
+    attributes: &str,
     using: &str,
 ) -> String {
     let mut sql = String::from(
@@ -88,8 +118,7 @@ GRANT SELECT ON items TO helper_owner;
         let answer = if level == 0 { first.to_owned() } else { body(level - 1) };
         write!(
             sql,
-            "CREATE FUNCTION {name}_{level}() RETURNS {returns} LANGUAGE sql STABLE SECURITY DEFINER \
-             SET search_path = pg_catalog, pg_temp AS $$
+            "CREATE FUNCTION {name}_{level}() RETURNS {returns} LANGUAGE sql STABLE {attributes} AS $$
   {answer}
 $$;
 ALTER FUNCTION {name}_{level}() OWNER TO helper_owner;
@@ -138,10 +167,9 @@ fn sweep(
     let mut refused = None;
     let mut accepted = None;
     for count in counts {
-        let translated = helpers::translate_pg(&script(count), &options())
+        let translated = helpers::translate_script(&script(count), &options())
             .unwrap_or_else(|error| panic!("{count} fails to translate: {error}"));
-        let mut connection = helpers::establish_connection();
-        connection.batch_execute(&translated.join(";\n")).expect("the script loads");
+        let mut connection = loaded(None, &translated);
         let unprepared = unprepared_programs(&mut connection).expect("the schema reads");
         let listed = unprepared.iter().any(|unprepared| lists(unprepared, program));
         // The statement a client sends, written as text the way a client sends
@@ -167,6 +195,19 @@ fn sweep(
     );
 }
 
+/// A connection registering the helper functions of `translated` and
+/// holding `held` then `translated`.
+fn loaded(held: Option<&Script<String>>, translated: &Script<String>) -> diesel::SqliteConnection {
+    let mut connection = helpers::establish_connection();
+    translated.register_functions(&mut connection).expect("register helper functions");
+    for script in held.into_iter().chain([translated]) {
+        connection
+            .batch_execute(&script.iter().map(String::as_str).collect::<Vec<_>>().join(";\n"))
+            .expect("the script loads");
+    }
+    connection
+}
+
 /// Whether `unprepared` names `program` among the programs it compiles.
 fn lists(unprepared: &UnpreparedProgram, program: &str) -> bool {
     unprepared.programs.iter().any(|name| name == program)
@@ -175,20 +216,20 @@ fn lists(unprepared: &UnpreparedProgram, program: &str) -> bool {
 #[test]
 fn a_policy_trigger_is_listed_exactly_when_sqlite_refuses_it() {
     sweep(
-        |calls| walk_chain(1, calls),
+        |calls| inlined_walk_chain(1, calls),
         [1, 8, 16, 24, 32, 48, 64],
         "UPDATE items SET value = 1",
         "items_update_trigger",
     );
 }
 
-/// `walk_chain(levels, 1)` and a view reading `ids_<levels>` once.
+/// `inlined_walk_chain(levels, 1)` and a view reading `ids_<levels>` once.
 fn reaching_view(levels: usize) -> String {
     format!(
-        "{}CREATE VIEW reached WITH (security_invoker = true) AS SELECT id FROM items WHERE id IN (SELECT ids_{levels}());
+        "{}CREATE VIEW reached WITH (security_invoker = true) AS SELECT id FROM items WHERE id IN (SELECT x.id FROM ids_{levels}() AS x(id));
 GRANT SELECT ON reached TO app;
 ",
-        walk_chain(levels, 1)
+        inlined_walk_chain(levels, 1)
     )
 }
 
@@ -280,6 +321,72 @@ CREATE TRIGGER deep_updated INSTEAD OF UPDATE ON deep BEGIN SELECT 1; END;
     }
 }
 
+/// Each call of a helper PostgreSQL calls costs its program one cursor,
+/// however many sets the helper's body reads.
+#[test]
+fn a_called_helper_chain_prepares_however_deep_or_often_called() {
+    for sql in [walk_chain(7, 1), walk_chain(1, 64)] {
+        let script = helpers::translate_script(&sql, &options())
+            .unwrap_or_else(|error| panic!("the chain translates: {error}"));
+        let mut connection = loaded(None, &script);
+        let unprepared = unprepared_programs(&mut connection).expect("the schema reads");
+        assert!(unprepared.is_empty(), "SQLite refuses a program: {unprepared:?}");
+        diesel::sql_query("UPDATE items SET value = 1")
+            .execute(&mut connection)
+            .unwrap_or_else(|error| panic!("SQLite refuses the update: {error}"));
+    }
+}
+
+/// The translation of a database holding `tallies` and `reached`, a view
+/// calling the helper function of `ids_2`, which no policy calls, and of
+/// `migration` over it.
+fn migrated(migration: &str) -> (Script<String>, Script<String>) {
+    let starting = format!(
+        "{}CREATE TABLE tallies (id INTEGER PRIMARY KEY);
+GRANT SELECT ON tallies TO app;
+CREATE VIEW reached WITH (security_invoker = true) AS SELECT id FROM items WHERE id IN (SELECT ids_2());
+GRANT SELECT ON reached TO app;
+",
+        chain_schema("ids", "SETOF UUID", WALK, 2, walk, DEFINER, "true")
+    );
+    let source = Pg2Sqlite::default().sql(&starting).expect("the starting schema parses");
+    let schema = source.build_schema().expect("the starting schema builds");
+    let held = source.translate_to_sql(&options()).expect("the starting schema translates");
+    let migration = Pg2Sqlite::default()
+        .sql(migration)
+        .expect("the migration parses")
+        .starting_functions(&held.functions)
+        .expect("the starting functions parse as SQLite")
+        .translate_to_sql_with_schema(&schema, &options())
+        .expect("the migration translates");
+    (held, migration)
+}
+
+/// A view the database holds keeps reading the helper function it calls on
+/// a connection registering the functions of the last migration alone.
+#[test]
+fn a_migration_keeps_the_helper_functions_its_held_views_call() {
+    let (held, migration) = migrated("ALTER TABLE tallies ADD COLUMN v INTEGER;");
+    let mut connection = loaded(Some(&held), &migration);
+    diesel::sql_query("SELECT count(*) FROM reached")
+        .execute(&mut connection)
+        .unwrap_or_else(|error| panic!("SQLite refuses the held view: {error}"));
+}
+
+/// SQLite reparses every view on a table rename, so a view the migration
+/// drops afterwards still needs its helper function then.
+#[test]
+fn a_migration_keeps_the_helper_functions_of_a_view_it_drops_after_a_rename() {
+    let (held, migration) = migrated(
+        "ALTER TABLE tallies RENAME TO counts;
+DROP VIEW reached;",
+    );
+    let mut connection = loaded(Some(&held), &migration);
+    diesel::sql_query("SELECT count(*) FROM counts")
+        .execute(&mut connection)
+        .unwrap_or_else(|error| panic!("SQLite refuses the migration: {error}"));
+}
+
 #[test]
 fn a_trigger_not_stored_as_sqlite_writes_one_is_refused_by_name() {
     let mut connection = helpers::establish_connection();
@@ -335,6 +442,7 @@ fn a_helper_chain_read_through_a_scalar_subquery_translates_on_a_default_thread(
         "SELECT NULLIF(current_setting('app.user_id', true), '')::uuid",
         CHAIN_DEPTH,
         |previous| format!("SELECT (SELECT public.me_{previous}())"),
+        DEFINER,
         &format!("owner_id = me_{CHAIN_DEPTH}()"),
     ));
 }
@@ -349,6 +457,7 @@ fn doubled_chain(levels: usize) -> String {
         "SELECT item.id FROM public.items item WHERE item.parent_id IS NULL",
         levels,
         doubling,
+        DEFINER,
         &format!("id IN (SELECT ids_{levels}())"),
     )
 }
@@ -356,11 +465,10 @@ fn doubled_chain(levels: usize) -> String {
 #[test]
 fn a_helper_reading_another_twice_grows_the_script_linearly() {
     let bytes = |levels| {
-        helpers::translate_pg(&doubled_chain(levels), &options())
-            .unwrap_or_else(|error| panic!("{levels} levels translate: {error}"))
-            .iter()
-            .map(String::len)
-            .sum::<usize>()
+        let script = helpers::translate_script(&doubled_chain(levels), &options())
+            .unwrap_or_else(|error| panic!("{levels} levels translate: {error}"));
+        script.iter().map(String::len).sum::<usize>()
+            + script.functions.iter().map(|function| function.body.len()).sum::<usize>()
     };
     let (half, full) = (bytes(4), bytes(8));
     assert!(full < 3 * half, "8 levels write {full} bytes against {half} for 4");
@@ -369,11 +477,12 @@ fn a_helper_reading_another_twice_grows_the_script_linearly() {
 #[test]
 fn a_helper_reading_another_twice_keeps_the_rows_postgresql_keeps() {
     const LEVELS: u8 = 8;
-    let script = helpers::translate_pg(&doubled_chain(LEVELS.into()), &options())
+    let script = helpers::translate_script(&doubled_chain(LEVELS.into()), &options())
         .unwrap_or_else(|error| panic!("the chain translates: {error}"));
     let blob = |byte: u8| format!("X'{}'", format!("{byte:02x}").repeat(16));
     let mut connection = helpers::establish_connection();
-    for statement in &script {
+    script.register_functions(&mut connection).expect("register helper functions");
+    for statement in script.iter() {
         diesel::sql_query(statement)
             .execute(&mut connection)
             .unwrap_or_else(|error| panic!("emitted statement failed: {error}\n{statement}"));

@@ -191,17 +191,17 @@ macro_rules! last_admin_runner {
 last_admin_runner!(LastAdminPostgres, PgConnection);
 last_admin_runner!(LastAdminSqlite, SqliteConnection);
 
-fn translated(source: &str, options: &Pg2SqliteOptions) -> Vec<String> {
+fn translated(source: &str, options: &Pg2SqliteOptions) -> pg2sqlite::script::Script<String> {
     Pg2Sqlite::default()
         .sql(source)
         .and_then(|parsed| parsed.translate_to_sql(options))
         .unwrap_or_else(|error| panic!("the schema should translate: {error}"))
-        .into_vec()
 }
 
-fn replica(statements: &[String]) -> SqliteConnection {
+fn replica(statements: &pg2sqlite::script::Script<String>) -> SqliteConnection {
     let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-    for statement in statements {
+    statements.register_functions(&mut connection).expect("register helper functions");
+    for statement in statements.iter() {
         diesel::connection::SimpleConnection::batch_execute(&mut connection, statement)
             .unwrap_or_else(|error| panic!("{error}\n{statement}"));
     }
@@ -541,8 +541,10 @@ fn sqlite_clubs() -> SqliteConnection {
         .expect("register the signed-in user");
     perform_write_exempt_utils::register_nondeterministic_impl(&mut connection, || true)
         .expect("exempt the seed");
-    for statement in translated(&[UTC_REQUEST_ROLE, OWNER, CLUBS].concat(), &club_options()) {
-        diesel::connection::SimpleConnection::batch_execute(&mut connection, &statement)
+    let script = translated(&[UTC_REQUEST_ROLE, OWNER, CLUBS].concat(), &club_options());
+    script.register_functions(&mut connection).expect("register helper functions");
+    for statement in script.iter() {
+        diesel::connection::SimpleConnection::batch_execute(&mut connection, statement)
             .unwrap_or_else(|error| panic!("{error}\n{statement}"));
     }
     for (id, created_by, founded) in SEEDED_CLUBS {

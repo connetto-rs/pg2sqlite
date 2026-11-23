@@ -2,11 +2,11 @@
 //! wherever its translation would answer differently from PostgreSQL: an
 //! owner the table's policies bind, an owner or caller lacking `SELECT` on a
 //! table or on a column the body reads, a table the replica leaves out, a
-//! helper calling itself, an argument that may answer differently on each
-//! evaluation, a setting the helper pins and a function in its body reads, a
-//! call in the body of a `SECURITY DEFINER` helper reading no relation, a
-//! `WITH` query named after a table with row-level security, and a call
-//! where SQLite takes no subquery.
+//! helper calling itself, a setting the helper pins and a function in its
+//! body reads, a call in the body of a `SECURITY DEFINER` helper reading no
+//! relation, a `WITH` query named after a table with row-level security, and
+//! a call where SQLite takes no subquery. Any other call reads the helper
+//! function holding the body, which takes each argument once.
 
 use pg2sqlite::prelude::{Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 
@@ -132,20 +132,23 @@ fn an_owner_lacking_select_is_refused_without_an_acting_role() {
 }
 
 /// Without an acting role an invoker helper's body has no role to check its
-/// reads against, and reads its tables in place.
+/// reads against, and its helper function reads its tables in place.
 #[test]
 fn an_invoker_helper_without_an_acting_role_reads_its_tables_in_place() {
     let invoker = HELPER
         .replace("SECURITY DEFINER ", "")
         .replace("ALTER FUNCTION authz.is_archived(UUID) OWNER TO archive_owner;", "");
-    let translated = helpers::translate_pg(
+    let script = helpers::translate_script(
         &format!("{}{invoker}{}", roles(""), read_by_every_role()),
         &without_acting_role(),
     )
-    .unwrap_or_else(|error| panic!("refused the call: {error}"))
-    .join("\n");
-    assert!(translated.contains("FROM resource_parents edge"), "{translated}");
-    assert!(!translated.contains("is_archived"), "the view keeps no call: {translated}");
+    .unwrap_or_else(|error| panic!("refused the call: {error}"));
+    let view = script
+        .iter()
+        .find(|statement| statement.starts_with("CREATE VIEW resources "))
+        .expect("the policy view");
+    let body = &helpers::called_function(&script, view, "is_archived").body;
+    assert!(body.contains("FROM resource_parents edge"), "{body}");
 }
 
 /// [`READ`] under a policy for every role, which needs no acting role.
@@ -197,15 +200,28 @@ GRANT EXECUTE ON FUNCTION authz.is_archived(UUID) TO app, archive_owner;
     assert!(error.contains("is_archived") && error.contains("calls itself"), "{error}");
 }
 
+/// The helper function takes each argument once per call, as PostgreSQL
+/// evaluates it once, so an argument that may answer differently on each
+/// evaluation is passed to the function where the call stands.
 #[test]
-fn an_argument_answering_differently_per_evaluation_is_refused() {
+fn an_argument_answering_differently_per_evaluation_is_passed_once() {
     let read = "
 GRANT SELECT ON resources TO app;
 CREATE POLICY resources_read ON resources FOR SELECT TO app
   USING (NOT authz.is_archived(CASE WHEN random() < 0.5 THEN id END));
 ";
-    let error = refusal(&format!("{}{HELPER}{GRANTS}{read}", roles("BYPASSRLS")));
-    assert!(error.contains("is_archived") && error.contains("evaluates it once"), "{error}");
+    let script = helpers::translate_script(
+        &format!("{}{HELPER}{GRANTS}{read}", roles("BYPASSRLS")),
+        &options(),
+    )
+    .unwrap_or_else(|error| panic!("refused the call: {error}"));
+    let view = script
+        .iter()
+        .find(|statement| statement.starts_with("CREATE VIEW resources "))
+        .expect("the policy view");
+    assert_eq!(view.matches("random()").count(), 1, "{view}");
+    let body = &helpers::called_function(&script, view, "is_archived").body;
+    assert!(!body.contains("random()"), "the body reads the argument as a parameter: {body}");
 }
 
 /// A `*` reads every column, so PostgreSQL wants `SELECT` on each of them

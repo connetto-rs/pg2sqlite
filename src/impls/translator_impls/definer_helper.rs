@@ -4,13 +4,14 @@
 //! `x IN (SELECT authz.f('admin'))` or `x = ANY (ARRAY(SELECT
 //! authz.f('admin')))`, or reads the helper's rows where a table goes, as
 //! `(a, b) IN (SELECT * FROM authz.f('admin'))`. SQLite has no functions of
-//! its own to call, so the call is replaced by the query
-//! `FunctionLike::helper_set` reads out of the helper's body, one `SELECT` per
-//! arm joined by `UNION`. Each arm reads the backing table of a table that has
-//! one, because the helper runs as an owner that this reading has checked is
-//! exempt from every policy it reads past, and the owner reads past the acting
-//! role's grants. A table on which the acting role holds no privilege is left
-//! out of the replica, so a helper reading one is refused.
+//! the schema's own to call, so the call reads the rows of a helper function
+//! the replica registers, one per helper and arguments, whose body is the
+//! query `FunctionLike::helper_set` reads out of the helper's body, one
+//! `SELECT` per arm joined by `UNION`. Each arm reads the backing table of a
+//! table that has one, because the helper runs as an owner that this reading
+//! has checked is exempt from every policy it reads past, and the owner reads
+//! past the acting role's grants. A table on which the acting role holds no
+//! privilege is left out of the replica, so a helper reading one is refused.
 
 use alloc::collections::BTreeMap;
 use core::{convert::Infallible, ops::ControlFlow, ptr};
@@ -27,11 +28,11 @@ use sql_traits::{
 };
 use sqlparser::ast::{
     ArrayElemTypeDef, BinaryOperator, CastKind, CreateTable, Cte, DataType, Distinct, Expr,
-    FunctionArg, FunctionArgExpr, FunctionArguments, Ident, InTarget, Join, JoinConstraint,
-    JoinOperator, ObjectName, ObjectNamePart, Query, SelectItem, SetExpr, SetOperator,
-    SetQuantifier, TableAlias, TableAliasColumnDef, TableFactor, TableWithJoins, Value,
-    ValueWithSpan, VisitMut, Visitor, VisitorMut, With, helpers::attached_token::AttachedToken,
-    visit_expressions,
+    Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident,
+    InTarget, Join, JoinConstraint, JoinOperator, ObjectName, ObjectNamePart, Query, SelectItem,
+    SetExpr, SetOperator, SetQuantifier, TableAlias, TableAliasColumnDef, TableFactor,
+    TableFunctionArgs, TableWithJoins, Value, ValueWithSpan, VisitMut, Visitor, VisitorMut,
+    WildcardAdditionalOptions, With, helpers::attached_token::AttachedToken, visit_expressions,
 };
 
 #[cfg(not(feature = "std"))]
@@ -49,7 +50,7 @@ use crate::{
         },
         session_variable,
         shared_helpers::leaf_factors,
-        translator_impls::sql_helper::{declared_helper, hidden_read, inlined_rows},
+        translator_impls::sql_helper::{self, declared_helper, hidden_read, inlined_rows},
     },
     options::TranslationContext,
     traits::TranslatorWithContext,
@@ -120,16 +121,7 @@ pub(crate) fn helper_rows(
     let Some(helper) = declared_helper(name, schema, options)? else { return Ok(None) };
     let Some(function) = last_ident(name) else { return Ok(None) };
     let relation = alias.map_or(function, |alias| &alias.name).clone();
-    let mut columns: Vec<Ident> = helper
-        .returned_columns(schema)
-        .map(|(column, _)| {
-            if column.name_is_quoted() {
-                Ident::with_quote('"', column.name())
-            } else {
-                Ident::new(column.name())
-            }
-        })
-        .collect();
+    let mut columns = returned_columns(helper, schema);
     if columns.is_empty() {
         columns.push(relation.clone());
     }
@@ -257,6 +249,11 @@ fn untranslatable(name: &ObjectName, error: &HelperSetError) -> Error {
 /// `names`, or the refusal of the reason they cannot be read. A call
 /// repeating one [`HelperQueries`] kept answers the query that one
 /// translated to, raising its warnings again.
+///
+/// The set is the body of a helper function taking no parameter, one per
+/// helper and arguments, answering the columns the helper returns, or one
+/// named as the helper for a set of a scalar type, and the query reads them
+/// by `names`, a column past the end of `names` by its own.
 fn helper_query(
     helper: &<ParserDB as DatabaseLike>::Function,
     name: &ObjectName,
@@ -289,7 +286,7 @@ fn helper_query(
         })
         .map_err(|error| untranslatable(name, &error))?;
     let mut lowering = Lowering { helper: name, schema, read: Vec::new(), walks: 0 };
-    let lowered = lowering.set(&set, names)?;
+    let lowered = lowering.set(&set, &[])?;
     let acting = session_variable::acting_role(schema, options)?;
     let mut guarded = Vec::new();
     for table in lowering.read {
@@ -311,14 +308,37 @@ fn helper_query(
         lowered.translate_with_warnings(schema, options, &mut |warning| warnings.push(warning))?;
     let ControlFlow::Continue(()) = lowered
         .visit(&mut BackingTables { guarded: &guarded, suffix: options.get_rls_table_suffix() });
+    let mut columns = returned_columns(helper, schema);
+    if columns.is_empty() {
+        columns.extend(last_ident(name).cloned());
+    }
+    let query = sql_helper::helper_call(helper, &columns, names, Vec::new(), lowered, options);
     if let Some(call) = call {
         let mut cache = options.batch_cache().borrow_mut();
         if cache.holds(call.schema) {
-            cache.helper_queries.keep(call, &lowered, &warnings);
+            cache.helper_queries.keep(call, &query, &warnings);
         }
     }
     raise(warnings, emit);
-    Ok(lowered)
+    Ok(query)
+}
+
+/// The columns `RETURNS TABLE (...)` declares on `helper`, none for a
+/// function returning a scalar type or a set of one.
+fn returned_columns(
+    helper: &<ParserDB as DatabaseLike>::Function,
+    schema: &ParserDB,
+) -> Vec<Ident> {
+    helper
+        .returned_columns(schema)
+        .map(|(column, _)| {
+            if column.name_is_quoted() {
+                Ident::with_quote('"', column.name())
+            } else {
+                Ident::new(column.name())
+            }
+        })
+        .collect()
 }
 
 /// The query kept for `call`, raising the warnings its translation raised.
@@ -543,14 +563,14 @@ impl<'db> Lowering<'_, 'db> {
                     }
                 }
                 if columns.len() > 1 {
-                    arms.push(self.memberships(&membership, &columns, arm_names)?);
+                    arms.push(self.memberships(&membership, &columns, arm_names));
                     continue;
                 }
             }
             match arm {
                 HelperArm::Grant(grant) => arms.push(self.grant(grant, arm_names)?),
-                HelperArm::Parent(parent) => arms.push(self.parent(parent, arm_names)?),
-                HelperArm::Called(called) => arms.push(self.called(called, arm_names)?),
+                HelperArm::Parent(parent) => arms.push(self.parent(parent, arm_names)),
+                HelperArm::Called(called) => arms.push(self.called(called, arm_names)),
                 HelperArm::Walk(walk) => edges.push(self.edge(walk)),
             }
         }
@@ -574,6 +594,101 @@ impl<'db> Lowering<'_, 'db> {
             return Ok(make_query(None, arms));
         }
         Ok(self.reached(arms, union(edges, SetQuantifier::All), selection, names))
+    }
+
+    /// The name and arguments of a call to `function` with `arguments`.
+    ///
+    /// The call is written as PostgreSQL makes it from the body calling it,
+    /// and the translation reads it through the helper function holding the
+    /// called set.
+    fn call(
+        function: &<ParserDB as DatabaseLike>::Function,
+        arguments: &[Value],
+    ) -> (ObjectName, Vec<FunctionArg>) {
+        let target = function.target_name();
+        let ident = |name: &str, quoted: bool| {
+            if quoted { Ident::with_quote('"', name) } else { Ident::new(name) }
+        };
+        let mut name = Vec::new();
+        if let Some(schema) = target.schema() {
+            name.push(ObjectNamePart::Identifier(ident(schema, target.schema_is_quoted())));
+        }
+        name.push(ObjectNamePart::Identifier(ident(target.name(), target.name_is_quoted())));
+        let arguments = arguments
+            .iter()
+            .map(|value| FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::value(value.clone()))))
+            .collect();
+        (ObjectName(name), arguments)
+    }
+
+    /// The set a call to `function` with `arguments` returns, for a
+    /// membership test: `SELECT f(...)` for a set of a scalar type and
+    /// `SELECT * FROM f(...)` for rows of declared columns.
+    fn called_set(
+        &self,
+        function: &<ParserDB as DatabaseLike>::Function,
+        arguments: &[Value],
+    ) -> Query {
+        if function.returned_columns(self.schema).next().is_some() {
+            let relation = Self::called_relation(function, arguments, None);
+            return make_query(
+                None,
+                SetExpr::Select(Box::new(make_simple_select(
+                    vec![SelectItem::Wildcard(WildcardAdditionalOptions::default())],
+                    from_relation(relation),
+                    None,
+                ))),
+            );
+        }
+        let (name, arguments) = Self::call(function, arguments);
+        let call = Expr::Function(Function {
+            name,
+            uses_odbc_syntax: false,
+            parameters: FunctionArguments::None,
+            args: FunctionArguments::List(FunctionArgumentList {
+                duplicate_treatment: None,
+                args: arguments,
+                clauses: Vec::new(),
+            }),
+            filter: None,
+            null_treatment: None,
+            over: None,
+            within_group: Vec::new(),
+        });
+        single_expr_query(call, Vec::new(), None)
+    }
+
+    /// `f(...) [AS <alias> (<columns>)]`, the rows a call to `function` with
+    /// `arguments` returns as a `FROM` item.
+    fn called_relation(
+        function: &<ParserDB as DatabaseLike>::Function,
+        arguments: &[Value],
+        alias: Option<(&str, &[Ident])>,
+    ) -> TableFactor {
+        let (name, arguments) = Self::call(function, arguments);
+        TableFactor::Table {
+            name,
+            alias: alias.map(|(name, columns)| {
+                TableAlias {
+                    explicit: true,
+                    name: Ident::new(name),
+                    columns: columns
+                        .iter()
+                        .map(|column| TableAliasColumnDef { name: column.clone(), data_type: None })
+                        .collect(),
+                    at: None,
+                }
+            }),
+            args: Some(TableFunctionArgs { args: arguments, settings: None }),
+            with_hints: Vec::new(),
+            version: None,
+            with_ordinality: false,
+            partitions: Vec::new(),
+            json_path: None,
+            sample: None,
+            index_directives: Vec::new(),
+            inheritance: None,
+        }
     }
 
     /// `WITH [RECURSIVE] <walk> (node) AS (<arms> [UNION <step>]) SELECT node
@@ -674,45 +789,40 @@ impl<'db> Lowering<'_, 'db> {
     }
 
     /// `SELECT <key> FROM <table> WHERE <column> IN (<parents>)`.
-    fn parent(
-        &mut self,
-        parent: &ParentArm<'db, ParserDB>,
-        names: &[Ident],
-    ) -> Result<SetExpr, Error> {
+    fn parent(&mut self, parent: &ParentArm<'db, ParserDB>, names: &[Ident]) -> SetExpr {
         self.read.push(parent.table());
-        let parents = self.set(parent.set(), &[])?;
-        Ok(SetExpr::Select(Box::new(make_simple_select(
+        let parents = self.called_set(parent.function(), parent.arguments());
+        SetExpr::Select(Box::new(make_simple_select(
             projection([qualified(ARM, declared_column_ident(parent.key()))], names),
             from_relation(aliased_table(parent.table(), ARM)),
             Some(in_query(qualified(ARM, declared_column_ident(parent.column())), parents)),
-        ))))
+        )))
     }
 
-    /// `SELECT DISTINCT <key> FROM (<set>) AS called CROSS JOIN <table> WHERE
-    /// called.column_0 IN (<columns>)`, the arms reading `membership`'s set
-    /// through each of `columns` as one.
+    /// `SELECT DISTINCT <key> FROM f(...) AS called (column_0) CROSS JOIN
+    /// <table> WHERE called.column_0 IN (<columns>)`, the arms reading
+    /// `membership`'s set through each of `columns` as one.
     ///
-    /// SQLite writes out a set at each place a query reads it, so a helper
-    /// reading another's set once per column, which reads its own callee
-    /// once per column too, doubles with every level. The `CROSS JOIN` reads
-    /// the set ahead of the table, so SQLite answers it once.
+    /// SQLite runs a called helper's function at each place a query reads
+    /// it, so the `CROSS JOIN` reads the set ahead of the table and calls the
+    /// function once for every column.
     fn memberships(
         &mut self,
         membership: &Membership<'_, 'db>,
         columns: &[&'db <ParserDB as DatabaseLike>::Column],
         names: &[Ident],
-    ) -> Result<SetExpr, Error> {
+    ) -> SetExpr {
         self.read.push(membership.table);
-        let set = self.set(membership.set, &[called_column(0)])?;
+        let called_columns = [called_column(0)];
+        let relation = Self::called_relation(
+            membership.function,
+            membership.arguments,
+            Some((CALLED, &called_columns)),
+        );
         let mut select = make_simple_select(
             projection([qualified(ARM, declared_column_ident(membership.key))], names),
             vec![TableWithJoins {
-                relation: TableFactor::Derived {
-                    lateral: false,
-                    subquery: Box::new(set),
-                    alias: Some(alias(CALLED)),
-                    sample: None,
-                },
+                relation,
                 joins: vec![Join {
                     relation: aliased_table(membership.table, ARM),
                     global: false,
@@ -732,34 +842,26 @@ impl<'db> Lowering<'_, 'db> {
             }),
         );
         select.distinct = Some(Distinct::Distinct);
-        Ok(SetExpr::Select(Box::new(select)))
+        SetExpr::Select(Box::new(select))
     }
 
-    /// `SELECT <returned> FROM (<set>) AS called [CROSS JOIN <labels>]...`,
-    /// the rows the called helper returns under positional column names.
-    fn called(
-        &mut self,
-        called: &CalledArm<'db, ParserDB>,
-        names: &[Ident],
-    ) -> Result<SetExpr, Error> {
+    /// `SELECT <returned> FROM f(...) AS called (<columns>) [CROSS JOIN
+    /// <labels>]...`, the rows the called helper returns under positional
+    /// column names.
+    fn called(&mut self, called: &CalledArm<'db, ParserDB>, names: &[Ident]) -> SetExpr {
         // A helper returning `SETOF` a scalar type declares no column.
         let arity = called.function().returned_columns(self.schema).count().max(1);
         let columns: Vec<Ident> = (0..arity).map(called_column).collect();
-        let rows = self.set(called.set(), &columns)?;
+        let relation =
+            Self::called_relation(called.function(), called.arguments(), Some((CALLED, &columns)));
         let (returned, labels) = returned_values(called.returned(), |position| {
             qualified(CALLED, called_column(*position))
         });
-        let relation = TableFactor::Derived {
-            lateral: false,
-            subquery: Box::new(rows),
-            alias: Some(alias(CALLED)),
-            sample: None,
-        };
-        Ok(SetExpr::Select(Box::new(make_simple_select(
+        SetExpr::Select(Box::new(make_simple_select(
             projection(returned, names),
             vec![TableWithJoins { relation, joins: labels }],
             None,
-        ))))
+        )))
     }
 
     /// `SELECT <returned> FROM <table> [JOIN <joined table> ON <key>]...
@@ -795,7 +897,7 @@ impl<'db> Lowering<'_, 'db> {
         match grant.granted_to() {
             GrantedTo::Request(comparison) => conditions.push(request(comparison)),
             GrantedTo::Set(grantees) => {
-                let set = self.set(grantees.set(), &[])?;
+                let set = self.called_set(grantees.function(), grantees.arguments());
                 conditions
                     .push(in_query(qualified(ARM, declared_column_ident(grantees.column())), set));
             }
@@ -808,7 +910,7 @@ impl<'db> Lowering<'_, 'db> {
         conditions.extend(restrictions(ARM, grant.restrictions()));
         conditions.extend(time_bounds(ARM, grant.time_bounds()));
         for cap in grant.caps() {
-            conditions.push(self.cap(cap)?);
+            conditions.push(self.cap(cap));
         }
         for anti_join in grant.anti_joins() {
             conditions.push(self.anti_join(anti_join));
@@ -855,7 +957,7 @@ impl<'db> Lowering<'_, 'db> {
     }
 
     /// `[<setting> IS NULL OR] (<operands>) IN (<set>)`.
-    fn cap(&mut self, cap: &RowCap<'db, ParserDB>) -> Result<Expr, Error> {
+    fn cap(&mut self, cap: &RowCap<'db, ParserDB>) -> Expr {
         let mut operands: Vec<Expr> = cap
             .operands()
             .iter()
@@ -878,9 +980,9 @@ impl<'db> Lowering<'_, 'db> {
         let capped = if cap.set().arms().is_empty() {
             Expr::Value(Value::Boolean(false).into())
         } else {
-            in_query(row, self.set(cap.set(), &[])?)
+            in_query(row, self.called_set(cap.function(), cap.arguments()))
         };
-        Ok(match cap.lift() {
+        match cap.lift() {
             Some(lift) => {
                 Expr::Nested(Box::new(Expr::BinaryOp {
                     left: Box::new(unset(lift)),
@@ -889,7 +991,7 @@ impl<'db> Lowering<'_, 'db> {
                 }))
             }
             None => capped,
-        })
+        }
     }
 
     /// `NOT EXISTS (SELECT 1 FROM <table> WHERE <correlations> AND
@@ -935,7 +1037,6 @@ struct Membership<'a, 'db> {
     column: &'db <ParserDB as DatabaseLike>::Column,
     function: &'db <ParserDB as DatabaseLike>::Function,
     arguments: &'a [Value],
-    set: &'a HelperSet<'db, ParserDB>,
 }
 
 impl<'a, 'db> Membership<'a, 'db> {
@@ -951,7 +1052,6 @@ impl<'a, 'db> Membership<'a, 'db> {
                     column: parent.column(),
                     function: parent.function(),
                     arguments: parent.arguments(),
-                    set: parent.set(),
                 })
             }
             HelperArm::Grant(grant) => {
@@ -966,25 +1066,20 @@ impl<'a, 'db> Membership<'a, 'db> {
                 if !unconditioned {
                     return None;
                 }
-                let (column, function, arguments, set) = match (grant.granted_to(), grant.caps()) {
+                let (column, function, arguments) = match (grant.granted_to(), grant.caps()) {
                     (GrantedTo::Set(grantees), []) => {
-                        (
-                            grantees.column(),
-                            grantees.function(),
-                            grantees.arguments(),
-                            grantees.set(),
-                        )
+                        (grantees.column(), grantees.function(), grantees.arguments())
                     }
                     (GrantedTo::Anyone, [cap]) => {
                         let ([CapOperand::Column(column)], None) = (cap.operands(), cap.lift())
                         else {
                             return None;
                         };
-                        (*column, cap.function(), cap.arguments(), cap.set())
+                        (*column, cap.function(), cap.arguments())
                     }
                     _ => return None,
                 };
-                Some(Self { table: grant.table(), key, column, function, arguments, set })
+                Some(Self { table: grant.table(), key, column, function, arguments })
             }
             HelperArm::Called(_) | HelperArm::Walk(_) => None,
         }

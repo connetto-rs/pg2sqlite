@@ -1,12 +1,16 @@
 //! A call to a `LANGUAGE sql` function the schema declares, written as its
-//! body.
+//! body or as a call to a helper function holding its body.
 //!
-//! SQLite has no functions of the schema's own to call, so a call to one is
-//! replaced by the expression its body selects, with the call's arguments
-//! bound to the parameters and the result cast to the declared return type.
-//! The caller then translates that expression where the call stood, so the
-//! setting reads in an accessor such as `authz.caller_id()` go through the
-//! deployment's session variable mappings as if written in place.
+//! SQLite has no functions of the schema's own to call. A call to one whose
+//! body reads no relation is replaced by the expression its body selects,
+//! with the call's arguments bound to the parameters and the result cast to
+//! the declared return type. The caller then translates that expression where
+//! the call stood, so the setting reads in an accessor such as
+//! `authz.caller_id()` go through the deployment's session variable mappings
+//! as if written in place. A call to one whose body reads relations reads the
+//! rows of a helper function the replica registers, whose body runs as a
+//! statement of its own, as PostgreSQL calls such a function, and a call in
+//! `FROM` that PostgreSQL inlines reads the body in place.
 //!
 //! The body is read as PostgreSQL runs it. Its unqualified calls resolve
 //! under the function's own `search_path`, its own calls to other helpers
@@ -51,7 +55,7 @@ use crate::{
         privileges::{RoleTable, names_table_with_backing},
         query_builder::{
             from_relation, make_query, make_simple_select, plain_table_factor,
-            plain_table_with_joins, single_expr_query,
+            plain_table_with_joins, single_expr_query, table_function_factor,
         },
         replay::is_replayable,
         session_variable::{self, SessionRead},
@@ -147,9 +151,9 @@ pub(crate) enum Inlined {
 /// calls to other declared functions expanded the same way.
 ///
 /// A body reading no relation answers [`Inlined::Postgres`]. A body reading
-/// relations answers [`Inlined::Sqlite`], translated here because its
-/// relations translate to the backing tables its owner reads, which the
-/// schema does not declare.
+/// relations answers [`Inlined::Sqlite`], a call to the helper function
+/// holding the body, translated here because its relations translate to the
+/// backing tables its owner reads, which the schema does not declare.
 ///
 /// `None` leaves the call to the ordinary translation: a name
 /// [`declared_helper`] answers no function for, and a function written in
@@ -173,7 +177,7 @@ pub(crate) fn inlined_call<'s>(
     match inliner.call(call, helper, caller)? {
         Expansion::Expression(expression) => Ok(Some(Inlined::Postgres(expression))),
         Expansion::Rows(rows) => {
-            rows.translate(schema, options, emit)
+            rows.translate_call(schema, options, emit)
                 .map(|query| Some(Inlined::Sqlite(Expr::Subquery(Box::new(query)))))
         }
     }
@@ -182,7 +186,9 @@ pub(crate) fn inlined_call<'s>(
 /// The rows `FROM name(arguments)` reads, when `helper` is a set-returning
 /// `LANGUAGE sql` function running as its caller: the query its body runs,
 /// with the arguments bound to the parameters, each column under its name in
-/// `columns` and cast to its declared type.
+/// `columns` and cast to its declared type. A `STRICT` function, which
+/// PostgreSQL calls, is read through the helper function holding that query,
+/// and any other has the query written in place of the call.
 ///
 /// The arguments may read the queries around the call, as a column of an
 /// enclosing query or a trigger's `NEW` and `OLD` do. `None` leaves a
@@ -211,16 +217,29 @@ pub(crate) fn inlined_rows<'s>(
     let columns = columns.iter().cloned().zip(returned_row_types(name, helper, schema)?).collect();
     let caller = calling_role(schema, options)?;
     let mut inliner = Inliner { schema, options, expanding: Vec::new(), keep_sets: false };
-    inliner
-        .set(name, arguments, helper, caller, columns)?
-        .translate(schema, options, emit)
-        .map(Some)
+    let rows = inliner.set(name, arguments, helper, caller, columns)?;
+    // PostgreSQL inlines a set-returning SQL function in FROM only when it is
+    // not STRICT, and calls it otherwise.
+    if is_strict(helper) {
+        rows.translate_call(schema, options, emit).map(Some)
+    } else {
+        rows.translate_inline(schema, options, emit).map(Some)
+    }
 }
 
 /// Whether `function`'s body is SQL, the one language whose body has an
 /// expression to write in place of a call.
 fn written_in_sql(function: &CreateFunction) -> bool {
     function.stored_language().as_deref() == Some("sql")
+}
+
+/// Whether `function` answers NULL, or no row, for a NULL argument without
+/// running its body.
+fn is_strict(function: &CreateFunction) -> bool {
+    matches!(
+        function.null_input_behavior(),
+        FunctionCalledOnNull::Strict | FunctionCalledOnNull::ReturnsNullOnNullInput
+    )
 }
 
 /// `expr` with every call it makes to a scalar `LANGUAGE sql` function the
@@ -459,8 +478,12 @@ impl<'s> Inliner<'s, '_> {
         )?;
         self.check_immutable(helper, &statement)?;
         self.qualify_calls(name, helper, &mut statement)?;
+        // A helper function evaluates each argument once per call, as
+        // PostgreSQL does, and a body written in place reads it where it reads
+        // the parameter.
+        let hosted = matches!(answer, Answer::Value(_)) || is_strict(helper);
         if let Some(bound) = arguments.bound.iter().find(|bound| {
-            !is_atomic(&bound.written) && !is_replayable(&bound.written, self.options)
+            !hosted && !is_atomic(&bound.written) && !is_replayable(&bound.written, self.options)
         }) {
             return Err(refusal(
                 name,
@@ -794,6 +817,53 @@ fn argument_column(relation: &Ident, position: usize) -> Expr {
     ])
 }
 
+/// The query reading the `columns` of the rows a call to `helper` with
+/// `arguments` answers, each under the name at its position in `names` or
+/// its own past the end of `names`, from the helper function whose body is
+/// `body`, recorded in `options` under a name derived from `helper`'s.
+///
+/// The body reads the argument at position `k`, from one, as `?k`.
+pub(crate) fn helper_call(
+    helper: &CreateFunction,
+    columns: &[Ident],
+    names: &[Ident],
+    arguments: Vec<Expr>,
+    body: Query,
+    options: &TranslationContext<'_>,
+) -> Query {
+    let stem: String =
+        helper
+            .target_name()
+            .name()
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() { character.to_ascii_lowercase() } else { '_' }
+            })
+            .collect();
+    let parameters = (1..=arguments.len()).map(|position| format!("argument_{position}")).collect();
+    let function = options.record_helper_function(
+        &stem,
+        parameters,
+        columns.iter().map(|column| column.value.clone()).collect(),
+        body,
+    );
+    let projection = columns.iter().enumerate().map(|(position, column)| {
+        let expr = Expr::Identifier(column.clone());
+        match names.get(position) {
+            Some(name) if name != column => SelectItem::ExprWithAlias { expr, alias: name.clone() },
+            _ => SelectItem::UnnamedExpr(expr),
+        }
+    });
+    make_query(
+        None,
+        SetExpr::Select(Box::new(make_simple_select(
+            projection.collect(),
+            from_relation(table_function_factor(&function, arguments, None, false)),
+            None,
+        ))),
+    )
+}
+
 /// What a call to a function whose body reads relations answers.
 enum Answer<'s> {
     /// One value of the declared return type.
@@ -937,7 +1007,8 @@ impl RowsCall<'_> {
         )
     }
 
-    /// The SQLite query answering the call where `options` reaches it.
+    /// The SQLite query answering the call where `options` reaches it, the
+    /// body written in place of the call.
     ///
     /// The body translates as the role it runs as, a `SECURITY DEFINER` one
     /// reading the backing table of each table it names, and the arguments
@@ -947,44 +1018,128 @@ impl RowsCall<'_> {
     ///
     /// Refuses a body or arguments that do not translate, and a definer body
     /// naming a table whose policies bind its owner.
-    fn translate(
+    fn translate_inline(
         self,
         schema: &ParserDB,
         options: &TranslationContext<'_>,
         emit: WarningSink<'_>,
     ) -> Result<Query, Error> {
+        let arguments = (!self.arguments.is_empty()).then(|| self.arguments(false));
+        let (mut translated, slot) = self.translate_body(schema, options, emit)?;
+        if let (Some((index, mut cte)), Some(arguments)) = (slot, arguments) {
+            *cte.query = arguments.translate_with_warnings(schema, options, emit)?;
+            translated.with.get_or_insert_with(empty_with).cte_tables.insert(index, cte);
+        }
+        Ok(translated)
+    }
+
+    /// The SQLite query answering the call through the helper function whose
+    /// body answers it, as PostgreSQL calls a function it does not inline.
+    ///
+    /// The body reads the arguments as the parameters `?1..?n` and runs as a
+    /// statement of its own, and the arguments translate where the call
+    /// stands and are passed to the function there.
+    ///
+    /// # Errors
+    ///
+    /// Refuses as [`Self::translate_inline`] does.
+    fn translate_call(
+        self,
+        schema: &ParserDB,
+        options: &TranslationContext<'_>,
+        emit: WarningSink<'_>,
+    ) -> Result<Query, Error> {
+        let helper = self.helper;
+        let count = self.arguments.len();
+        let arguments = (count > 0).then(|| self.arguments(false));
+        let columns = match &self.answered {
+            Answered::Value(_) => vec![Ident::new(VALUE)],
+            Answered::Rows { columns, .. } => {
+                columns.iter().map(|(column, _)| column.clone()).collect()
+            }
+        };
+        let (mut body, slot) = self.translate_body(schema, options, emit)?;
+        let mut passed = Vec::new();
+        if let (Some((index, mut cte)), Some(arguments)) = (slot, arguments) {
+            *cte.query = parameters_row(count);
+            body.with.get_or_insert_with(empty_with).cte_tables.insert(index, cte);
+            let translated = arguments.translate_with_warnings(schema, options, emit)?;
+            let SetExpr::Select(select) = *translated.body else {
+                return Err(refusal(&helper.name, "has arguments its translation lost track of"));
+            };
+            for item in select.projection {
+                match item {
+                    SelectItem::ExprWithAlias { expr, .. } | SelectItem::UnnamedExpr(expr) => {
+                        passed.push(expr);
+                    }
+                    _ => {
+                        return Err(refusal(
+                            &helper.name,
+                            "has arguments its translation lost track of",
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(helper_call(helper, &columns, &[], passed, body, options))
+    }
+
+    /// The body translated as the role it runs as, with the `WITH` query
+    /// holding the arguments taken out at its position, when the call passes
+    /// any.
+    fn translate_body(
+        self,
+        schema: &ParserDB,
+        options: &TranslationContext<'_>,
+        emit: WarningSink<'_>,
+    ) -> Result<(Query, Option<(usize, Cte)>), Error> {
         let RowsCall { helper, owner, .. } = self;
         let relation = self.relation.clone();
-        // Built before the body moves into its query.
-        let arguments = (!self.arguments.is_empty()).then(|| self.arguments(false));
+        let passes = !self.arguments.is_empty();
         let frame = InlinedBody { function: helper, outer: options.inlined_body() };
         let body_options = options.with_inlined_body(&frame, owner);
         let mut translated =
             self.into_query(true).translate_with_warnings(schema, &body_options, emit)?;
         let lost = || refusal(&helper.name, "has arguments its translation lost track of");
         // The arguments are the caller's, so they stay out of the body's
-        // reads and translate where the call stands.
-        let placeholder = match arguments {
-            Some(arguments) => {
-                let with = translated.with.as_mut().ok_or_else(lost)?;
-                let index = with
-                    .cte_tables
-                    .iter()
-                    .position(|cte| cte.alias.name == relation)
-                    .ok_or_else(lost)?;
-                Some((index, with.cte_tables.remove(index), arguments))
-            }
-            None => None,
+        // reads.
+        let slot = if passes {
+            let with = translated.with.as_mut().ok_or_else(lost)?;
+            let index = with
+                .cte_tables
+                .iter()
+                .position(|cte| cte.alias.name == relation)
+                .ok_or_else(lost)?;
+            Some((index, with.cte_tables.remove(index)))
+        } else {
+            None
         };
         if let Some(owner) = owner {
             read_backing_tables(helper, &mut translated, owner, schema, &body_options)?;
         }
-        if let Some((index, mut cte, arguments)) = placeholder {
-            *cte.query = arguments.translate_with_warnings(schema, options, emit)?;
-            translated.with.as_mut().ok_or_else(lost)?.cte_tables.insert(index, cte);
-        }
-        Ok(translated)
+        Ok((translated, slot))
     }
+}
+
+const VALUE: &str = "value";
+
+/// The one row of a helper function's parameters, `?k` under the name the
+/// body reads the argument at position `k` by.
+fn parameters_row(count: usize) -> Query {
+    let projection = (1..=count)
+        .map(|position| {
+            SelectItem::ExprWithAlias {
+                expr: Expr::Value(Value::Placeholder(format!("?{position}")).into()),
+                alias: Ident::new(format!("argument_{position}")),
+            }
+        })
+        .collect();
+    make_query(None, SetExpr::Select(Box::new(make_simple_select(projection, Vec::new(), None))))
+}
+
+/// A `WITH` list holding no query yet.
+fn empty_with() -> With {
+    With { with_token: AttachedToken::empty(), recursive: false, cte_tables: Vec::new() }
 }
 
 /// Joins `relation`, the one row of a call's arguments, into each select of
@@ -1886,10 +2041,7 @@ impl<'f> Arguments<'f> {
         helper: &CreateFunction,
         reference: impl Fn(usize, &Bound<'f>) -> Expr,
     ) -> Option<Expr> {
-        if !matches!(
-            helper.null_input_behavior(),
-            FunctionCalledOnNull::Strict | FunctionCalledOnNull::ReturnsNullOnNullInput
-        ) {
+        if !is_strict(helper) {
             return None;
         }
         self.bound

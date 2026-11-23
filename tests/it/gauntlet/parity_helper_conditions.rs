@@ -780,9 +780,10 @@ fn sqlite(predicate: &str, request: &Arc<Mutex<Request>>) -> SqliteConnection {
         .sql(&format!("{OWNER}{SCHEMA}{}", policy(predicate)))
         .expect("parse")
         .translate(&options())
-        .unwrap_or_else(|error| panic!("pg2sqlite refused {predicate}: {error}"))
-        .into_vec();
+        .unwrap_or_else(|error| panic!("pg2sqlite refused {predicate}: {error}"));
     let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
+    translated.register_functions(&mut connection).expect("register helper functions");
+    let translated = translated.into_vec();
     crate::helpers::case_fold_functions::register(&mut connection);
     let read = |pick: fn(&Request) -> Option<&'static str>| {
         let request = Arc::clone(request);

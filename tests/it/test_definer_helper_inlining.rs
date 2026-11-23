@@ -7,6 +7,7 @@
 use pg2sqlite::{
     errors::Error,
     prelude::{Pg2SqliteOptions, SessionVariableMapping},
+    script::Script,
 };
 use sql_traits::structs::{Deployment, SessionSetting, SettingValue};
 use sqlparser::ast::DataType;
@@ -229,7 +230,7 @@ ALTER TABLE doc_grants ENABLE ROW LEVEL SECURITY;
 ALTER TABLE doc_notes ENABLE ROW LEVEL SECURITY;
 ";
 
-/// What `docs_with('write')` returns, as the replica reads it.
+/// What `docs_with('write')` returns, as the body of its helper function.
 const WRITERS: &str = "SELECT arm.doc_id FROM doc_grants_rls AS arm \
                        WHERE arm.principal_id = app_user() AND arm.role IN ('admin', 'write')";
 
@@ -253,18 +254,29 @@ fn read_policy(predicate: &str) -> String {
 }
 
 /// The statement creating the view or trigger `name`.
-fn statement<'s>(script: &'s [String], name: &str) -> &'s str {
+fn statement<'s>(script: &'s Script<String>, name: &str) -> &'s str {
     script
         .iter()
         .find(|statement| {
             statement.starts_with(&format!("CREATE VIEW {name} "))
                 || statement.starts_with(&format!("CREATE TRIGGER {name} "))
         })
-        .unwrap_or_else(|| panic!("no statement creates {name} in\n{}", script.join("\n")))
+        .unwrap_or_else(|| {
+            panic!(
+                "no statement creates {name} in\n{}",
+                script.iter().cloned().collect::<Vec<_>>().join("\n")
+            )
+        })
 }
 
-fn translated(sql: &str, options: &Pg2SqliteOptions) -> Vec<String> {
-    helpers::translate_pg(sql, options).unwrap_or_else(|error| panic!("refused: {error}"))
+/// The body of the function of `helper` that `statement` calls, with the
+/// hash of each helper function the body calls written `#`.
+fn called_body(script: &Script<String>, statement: &str, helper: &str) -> String {
+    helpers::unhashed(&helpers::called_function(script, statement, helper).body)
+}
+
+fn translated(sql: &str, options: &Pg2SqliteOptions) -> Script<String> {
+    helpers::translate_script(sql, options).unwrap_or_else(|error| panic!("refused: {error}"))
 }
 
 fn refusal(sql: &str, options: &Pg2SqliteOptions) -> Error {
@@ -275,45 +287,67 @@ fn refusal(sql: &str, options: &Pg2SqliteOptions) -> Error {
 }
 
 /// A grant arm reads the caller's own grants, a parent arm the children of
-/// what the helper it calls returns, and every arm a backing table.
+/// what the helper it calls returns, and every arm a backing table, each
+/// helper read through a helper function of its own.
 #[test]
 fn the_r100_hierarchy_reads_its_helpers_sets_from_backing_tables() {
     let script = translated(R100, &options());
+    let teams = statement(&script, "teams");
     assert_eq!(
-        statement(&script, "teams"),
+        helpers::unhashed(teams),
         "CREATE VIEW teams AS SELECT id, organization_id FROM teams_rls WHERE (id IN (\
-         SELECT arm.team_id FROM team_grants_rls AS arm WHERE arm.principal_id = app_user() \
+         SELECT teams_with FROM teams_with_#()))"
+    );
+    let teams_with = &helpers::called_function(&script, teams, "teams_with").body;
+    assert_eq!(
+        helpers::unhashed(teams_with),
+        "SELECT arm.team_id FROM team_grants_rls AS arm WHERE arm.principal_id = app_user() \
          UNION SELECT arm.id FROM teams_rls AS arm WHERE arm.organization_id IN (\
-         SELECT arm.organization_id FROM organization_grants_rls AS arm \
-         WHERE arm.principal_id = app_user())))"
+         SELECT organizations_with FROM organizations_with_#())"
     );
     assert_eq!(
-        statement(&script, "organizations_delete_trigger"),
+        called_body(&script, teams_with, "organizations_with"),
+        "SELECT arm.organization_id FROM organization_grants_rls AS arm \
+         WHERE arm.principal_id = app_user()"
+    );
+    let delete = statement(&script, "organizations_delete_trigger");
+    assert_eq!(
+        helpers::unhashed(delete),
         "CREATE TRIGGER organizations_delete_trigger INSTEAD OF DELETE ON organizations \
          FOR EACH ROW BEGIN DELETE FROM organizations_rls WHERE (id = OLD.id) AND ((OLD.id IN (\
-         SELECT arm.organization_id FROM organization_grants_rls AS arm \
-         WHERE arm.principal_id = app_user() AND arm.role IN ('admin')))); END"
+         SELECT organizations_with FROM organizations_with_#()))); END"
+    );
+    assert_eq!(
+        called_body(&script, delete, "organizations_with"),
+        "SELECT arm.organization_id FROM organization_grants_rls AS arm \
+         WHERE arm.principal_id = app_user() AND arm.role IN ('admin')"
     );
 }
 
 #[test]
 fn every_membership_spelling_reads_the_same_set() {
     let options = options();
-    let policy = |predicate: &str| translated(&read_policy(predicate), &options);
-    let view = format!("CREATE VIEW docs AS SELECT id FROM docs_rls WHERE (id IN ({WRITERS}))");
+    let view = "CREATE VIEW docs AS SELECT id FROM docs_rls WHERE (id IN (SELECT docs_with FROM \
+                docs_with_#()))";
     for predicate in [
         "id IN (SELECT docs_with('write'))",
         "id = ANY (ARRAY(SELECT docs_with('write')))",
         "id = ANY (SELECT public.docs_with('write'))",
     ] {
-        assert_eq!(statement(&policy(predicate), "docs"), view, "{predicate}");
+        let script = translated(&read_policy(predicate), &options);
+        let docs = statement(&script, "docs");
+        assert_eq!(helpers::unhashed(docs), view, "{predicate}");
+        assert_eq!(called_body(&script, docs, "docs_with"), WRITERS, "{predicate}");
     }
-    let excluded =
-        format!("CREATE VIEW docs AS SELECT id FROM docs_rls WHERE (id NOT IN ({WRITERS}))");
+    let excluded = "CREATE VIEW docs AS SELECT id FROM docs_rls WHERE (id NOT IN (SELECT \
+                    docs_with FROM docs_with_#()))";
     for predicate in
         ["id NOT IN (SELECT docs_with('write'))", "id <> ALL (ARRAY(SELECT docs_with('write')))"]
     {
-        assert_eq!(statement(&policy(predicate), "docs"), excluded, "{predicate}");
+        let script = translated(&read_policy(predicate), &options);
+        let docs = statement(&script, "docs");
+        assert_eq!(helpers::unhashed(docs), excluded, "{predicate}");
+        assert_eq!(called_body(&script, docs, "docs_with"), WRITERS, "{predicate}");
     }
 }
 
@@ -321,10 +355,8 @@ fn every_membership_spelling_reads_the_same_set() {
 #[test]
 fn a_helper_keeping_no_row_for_its_arguments_is_the_empty_set() {
     let script = translated(&read_policy("id IN (SELECT docs_administered('read'))"), &options());
-    assert_eq!(
-        statement(&script, "docs"),
-        "CREATE VIEW docs AS SELECT id FROM docs_rls WHERE (id IN (SELECT NULL WHERE false))"
-    );
+    let docs = statement(&script, "docs");
+    assert_eq!(called_body(&script, docs, "docs_administered"), "SELECT NULL WHERE false");
 }
 
 #[test]
@@ -381,11 +413,11 @@ fn an_alias_typing_a_helpers_column_is_refused() {
 #[test]
 fn a_helper_reading_an_unguarded_table_reads_it_directly() {
     let script = translated(&read_policy("id IN (SELECT docs_in_group('staff'))"), &options());
+    let docs = statement(&script, "docs");
     assert_eq!(
-        statement(&script, "docs"),
-        "CREATE VIEW docs AS SELECT id FROM docs_rls WHERE (id IN (SELECT arm.doc_id \
-         FROM doc_members AS arm WHERE arm.principal_id = app_user() \
-         AND arm.\"group\" IN ('staff')))"
+        called_body(&script, docs, "docs_in_group"),
+        "SELECT arm.doc_id FROM doc_members AS arm WHERE arm.principal_id = app_user() \
+         AND arm.\"group\" IN ('staff')"
     );
 }
 
@@ -400,13 +432,14 @@ fn a_parent_arm_without_a_foreign_key_reads_the_called_helpers_set() {
         ),
         &options(),
     );
+    let notes_with =
+        &helpers::called_function(&script, statement(&script, "doc_notes"), "notes_with").body;
     assert_eq!(
-        statement(&script, "doc_notes"),
-        format!(
-            "CREATE VIEW doc_notes AS SELECT id, doc FROM doc_notes_rls WHERE (id IN (\
-             SELECT arm.id FROM doc_notes_rls AS arm WHERE arm.doc IN ({WRITERS})))"
-        )
+        helpers::unhashed(notes_with),
+        "SELECT arm.id FROM doc_notes_rls AS arm WHERE arm.doc IN (SELECT docs_with FROM \
+         docs_with_#())"
     );
+    assert_eq!(called_body(&script, notes_with, "docs_with"), WRITERS);
 }
 
 /// A call to a function the schema does not declare is no helper call.
@@ -547,14 +580,20 @@ ALTER TABLE resources ENABLE ROW LEVEL SECURITY;
 ALTER TABLE share_grants ENABLE ROW LEVEL SECURITY;
 ";
 
-/// What `resources_with('admin')` returns, as the replica reads it under the
-/// column name a called arm reads it by.
-const ADMINISTERED: &str = "SELECT arm.resource_id AS column_0 FROM share_grants_rls AS arm \
+/// What `resources_with('admin')` returns, as the body of its helper
+/// function.
+const ADMINISTERED: &str = "SELECT arm.resource_id FROM share_grants_rls AS arm \
                             WHERE arm.principal_id = app_user() AND arm.role IN ('admin')";
 
-/// The condition the view `share_grants` keeps its rows by, under a policy
-/// keeping those `predicate` holds for.
-fn shared(predicate: &str) -> String {
+/// What `resources_with('writer')` returns, as the body of its helper
+/// function.
+const WRITTEN: &str = "SELECT arm.resource_id FROM share_grants_rls AS arm \
+                       WHERE arm.principal_id = app_user() AND arm.role IN ('admin', 'writer')";
+
+/// The script translating [`SHARING`] under a policy keeping the grants
+/// `predicate` holds for, and the condition its view `share_grants` keeps
+/// them by.
+fn shared(predicate: &str) -> (Script<String>, String) {
     let script = translated(
         &format!(
             "{SHARING}CREATE POLICY share_grants_read ON share_grants FOR SELECT \
@@ -565,56 +604,78 @@ fn shared(predicate: &str) -> String {
     let view = statement(&script, "share_grants");
     let prefix = "CREATE VIEW share_grants AS SELECT resource_id, principal_id, role \
                   FROM share_grants_rls WHERE ";
-    view.strip_prefix(prefix).unwrap_or_else(|| panic!("{view}")).to_owned()
+    let condition = view.strip_prefix(prefix).unwrap_or_else(|| panic!("{view}")).to_owned();
+    (script, condition)
+}
+
+/// The body of the function `helper` answers a call by, under a policy
+/// keeping the grants whose `column` that call returns, with the hash of
+/// each helper function the body calls written `#`, and the script holding
+/// those.
+fn helper_body(column: &str, helper: &str) -> (Script<String>, String) {
+    let (script, condition) = shared(&format!("{column} IN (SELECT {helper}())"));
+    assert_eq!(
+        helpers::unhashed(&condition),
+        format!("({column} IN (SELECT {helper} FROM {helper}_#()))")
+    );
+    let body = helpers::called_function(&script, &condition, helper).body.clone();
+    (script, body)
 }
 
 /// An arm reading another helper's rows reads them by position.
 #[test]
 fn a_called_arm_reads_the_called_helpers_rows() {
+    let (script, body) = helper_body("resource_id", "administered_resources");
     assert_eq!(
-        shared("resource_id IN (SELECT administered_resources())"),
-        format!("(resource_id IN (SELECT called.column_0 FROM ({ADMINISTERED}) AS called))")
+        helpers::unhashed(&body),
+        "SELECT called.column_0 FROM (SELECT resources_with AS column_0 FROM resources_with_#()) \
+         AS called"
     );
+    assert_eq!(called_body(&script, &body, "resources_with"), ADMINISTERED);
 }
 
 /// An arm calling a helper that keeps no row for its arguments keeps none.
 #[test]
 fn a_called_arm_over_no_row_keeps_no_row() {
+    let (script, body) = helper_body("resource_id", "unreached_resources");
     assert_eq!(
-        shared("resource_id IN (SELECT unreached_resources())"),
-        "(resource_id IN (SELECT called.column_0 FROM (SELECT NULL AS column_0 WHERE false) AS \
-         called))"
+        helpers::unhashed(&body),
+        "SELECT called.column_0 FROM (SELECT resources_administered AS column_0 FROM \
+         resources_administered_#()) AS called"
     );
+    assert_eq!(called_body(&script, &body, "resources_administered"), "SELECT NULL WHERE false");
 }
 
 /// Every row an arm keeps pairs with each label of an enum, in declaration
 /// order, or with each label a `VALUES` list writes.
 #[test]
 fn an_arm_pairs_its_rows_with_each_label() {
+    let (script, body) = helper_body("role", "granted_roles");
     assert_eq!(
-        shared("role IN (SELECT granted_roles())"),
-        format!(
-            "(role IN (SELECT labels_0.label FROM ({ADMINISTERED}) AS called \
-             CROSS JOIN (SELECT 'reader' AS label UNION ALL SELECT 'writer' AS label \
-             UNION ALL SELECT 'admin' AS label) AS labels_0))"
-        )
+        helpers::unhashed(&body),
+        "SELECT labels_0.label FROM (SELECT resources_with AS column_0 FROM resources_with_#()) \
+         AS called CROSS JOIN (SELECT 'reader' AS label UNION ALL SELECT 'writer' AS label \
+         UNION ALL SELECT 'admin' AS label) AS labels_0"
     );
+    assert_eq!(called_body(&script, &body, "resources_with"), ADMINISTERED);
+    let (_, body) = helper_body("role", "listed_roles");
     assert_eq!(
-        shared("role IN (SELECT listed_roles())"),
-        "(role IN (SELECT labels_0.label FROM share_grants_rls AS arm \
+        body,
+        "SELECT labels_0.label FROM share_grants_rls AS arm \
          CROSS JOIN (SELECT 'reader' AS label UNION ALL SELECT 'writer' AS label) AS labels_0 \
-         WHERE arm.principal_id = app_user()))"
+         WHERE arm.principal_id = app_user()"
     );
 }
 
 /// An enum declaring no label pairs a row with none.
 #[test]
 fn an_enum_without_labels_pairs_a_row_with_none() {
+    let (_, body) = helper_body("role", "no_roles");
     assert_eq!(
-        shared("role IN (SELECT no_roles())"),
-        "(role IN (SELECT labels_0.label FROM share_grants_rls AS arm \
+        body,
+        "SELECT labels_0.label FROM share_grants_rls AS arm \
          CROSS JOIN (SELECT NULL AS label WHERE false) AS labels_0 \
-         WHERE arm.principal_id = app_user()))"
+         WHERE arm.principal_id = app_user()"
     );
 }
 
@@ -622,56 +683,60 @@ fn an_enum_without_labels_pairs_a_row_with_none() {
 /// other conditions, keeps the rows whose key that set holds.
 #[test]
 fn a_returned_key_is_capped_by_another_helpers_set() {
+    let (script, body) = helper_body("resource_id", "sharable_resources");
     assert_eq!(
-        shared("resource_id IN (SELECT sharable_resources())"),
-        "(resource_id IN (SELECT arm.id FROM resources_rls AS arm \
-         WHERE arm.writers_can_share IN (true) AND arm.id IN (SELECT arm.resource_id \
-         FROM share_grants_rls AS arm \
-         WHERE arm.principal_id = app_user() AND arm.role IN ('admin', 'writer'))))"
+        helpers::unhashed(&body),
+        "SELECT arm.id FROM resources_rls AS arm WHERE arm.writers_can_share IN (true) \
+         AND arm.id IN (SELECT resources_with FROM resources_with_#())"
     );
+    assert_eq!(called_body(&script, &body, "resources_with"), WRITTEN);
 }
 
-/// What `administered_shares()` returns, as the replica reads it.
-const ADMINISTERED_SHARES: &str = "SELECT called.column_0 AS resource_id, labels_1.label AS role \
-     FROM (SELECT arm.resource_id AS column_0 FROM share_grants_rls AS arm \
-     WHERE arm.principal_id = app_user() AND arm.role IN ('admin')) AS called \
+/// What `administered_shares()` returns, as the body of its helper function.
+const ADMINISTERED_SHARES: &str = "SELECT called.column_0, labels_1.label \
+     FROM (SELECT resources_with AS column_0 FROM resources_with_#()) AS called \
      CROSS JOIN (SELECT 'reader' AS label UNION ALL SELECT 'writer' AS label \
      UNION ALL SELECT 'admin' AS label) AS labels_1";
 
-/// What `written_shares()` returns, as the replica reads it.
-const WRITTEN_SHARES: &str = "SELECT arm.id AS resource_id, labels_1.label AS role \
-     FROM resources_rls AS arm \
+/// What `written_shares()` returns, as the body of its helper function.
+const WRITTEN_SHARES: &str = "SELECT arm.id, labels_1.label FROM resources_rls AS arm \
      CROSS JOIN (SELECT 'reader' AS label UNION ALL SELECT 'writer' AS label) AS labels_1 \
-     WHERE arm.writers_can_share IN (true) AND arm.id IN (SELECT arm.resource_id \
-     FROM share_grants_rls AS arm \
-     WHERE arm.principal_id = app_user() AND arm.role IN ('admin', 'writer'))";
+     WHERE arm.writers_can_share IN (true) \
+     AND arm.id IN (SELECT resources_with FROM resources_with_#())";
 
-/// The condition the view `share_grants` keeps its rows by, under a policy
-/// keeping the grants whose resource `helper` returns.
-fn keyed_by(helper: &str) -> String {
-    shared(&format!("resource_id IN (SELECT share.resource_id FROM {helper}() share)"))
+/// The body of the function `helper` answers a call by, under a policy
+/// keeping the grants whose resource `helper` returns, and the script
+/// holding it.
+fn keyed_by(helper: &str) -> (Script<String>, String) {
+    let (script, condition) =
+        shared(&format!("resource_id IN (SELECT share.resource_id FROM {helper}() share)"));
+    assert_eq!(
+        helpers::unhashed(&condition),
+        format!(
+            "(resource_id IN (SELECT share.resource_id FROM (SELECT resource_id, role FROM \
+             {helper}_#()) AS share))"
+        )
+    );
+    let body = helpers::called_function(&script, &condition, helper).body.clone();
+    (script, body)
 }
 
 /// A `TABLE` helper calling another reads the called rows by position beside
 /// every label of an enum, in declaration order.
 #[test]
 fn a_table_helper_pairs_the_called_rows_with_every_enum_label() {
-    assert_eq!(
-        keyed_by("administered_shares"),
-        format!(
-            "(resource_id IN (SELECT share.resource_id FROM ({ADMINISTERED_SHARES}) AS share))"
-        )
-    );
+    let (script, body) = keyed_by("administered_shares");
+    assert_eq!(helpers::unhashed(&body), ADMINISTERED_SHARES);
+    assert_eq!(called_body(&script, &body, "resources_with"), ADMINISTERED);
 }
 
 /// A `TABLE` helper's grant arm pairs its rows with each label a `VALUES`
 /// list writes, under the cap on the key it returns.
 #[test]
 fn a_table_helper_pairs_a_capped_grant_arm_with_listed_labels() {
-    assert_eq!(
-        keyed_by("written_shares"),
-        format!("(resource_id IN (SELECT share.resource_id FROM ({WRITTEN_SHARES}) AS share))")
-    );
+    let (script, body) = keyed_by("written_shares");
+    assert_eq!(helpers::unhashed(&body), WRITTEN_SHARES);
+    assert_eq!(called_body(&script, &body, "resources_with"), WRITTEN);
 }
 
 /// A `TABLE` helper uniting a called arm and a capped grant arm is read by
@@ -679,10 +744,8 @@ fn a_table_helper_pairs_a_capped_grant_arm_with_listed_labels() {
 #[test]
 fn a_table_helper_uniting_labelled_arms_is_read_by_key_and_by_row() {
     let rows = format!("{ADMINISTERED_SHARES} UNION {WRITTEN_SHARES}");
-    assert_eq!(
-        keyed_by("sharable_grants"),
-        format!("(resource_id IN (SELECT share.resource_id FROM ({rows}) AS share))")
-    );
+    let (_, body) = keyed_by("sharable_grants");
+    assert_eq!(helpers::unhashed(&body), rows);
     let script = translated(
         &format!(
             "{SHARING}CREATE POLICY share_grants_insert ON share_grants FOR INSERT \
@@ -692,9 +755,12 @@ fn a_table_helper_uniting_labelled_arms_is_read_by_key_and_by_row() {
         &options(),
     );
     let trigger = statement(&script, "share_grants_insert_trigger");
-    let membership = format!(
-        "(NEW.resource_id, NEW.role) IN (SELECT share.resource_id, share.role FROM ({rows}) AS \
-         share)"
+    assert!(
+        helpers::unhashed(trigger).contains(
+            "(NEW.resource_id, NEW.role) IN (SELECT share.resource_id, share.role FROM (SELECT \
+             resource_id, role FROM sharable_grants_#()) AS share)"
+        ),
+        "{trigger}"
     );
-    assert!(trigger.contains(&membership), "{trigger}");
+    assert_eq!(called_body(&script, trigger, "sharable_grants"), rows);
 }

@@ -47,7 +47,7 @@ pub mod prelude {
         },
         options::{AttachedTables, Pg2SqliteOptions, TranslationContext},
         pg2sqlite::Pg2Sqlite,
-        script::{FreshFiles, Script},
+        script::{FreshFiles, HelperFunction, Script},
         sqlstate::{PostgresError, SqlState, postgres_error},
         traits::{
             ArrayRepresentation, CaseFoldFunctions, JsonbFunctions, ReverseTranslator, Schema,

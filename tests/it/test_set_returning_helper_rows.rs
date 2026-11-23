@@ -203,6 +203,7 @@ fn a_call_passed_a_trigger_field_beside_another_from_item_reads_the_row() {
         .translate_to_sql(&options())
         .unwrap_or_else(|error| panic!("the schema should translate: {error}"));
     let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
+    script.register_functions(&mut connection).expect("register helper functions");
     for statement in script.into_vec() {
         connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
     }
@@ -242,6 +243,7 @@ fn a_call_passed_an_enclosing_column_beside_another_from_item_reads_that_row() {
         .translate_to_sql(&options())
         .unwrap_or_else(|error| panic!("the schema should translate: {error}"));
     let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
+    script.register_functions(&mut connection).expect("register helper functions");
     for statement in script.into_vec() {
         connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
     }
@@ -292,6 +294,7 @@ fn a_star_body_keeps_its_columns_and_a_strict_helper_skips_null() {
         .translate_to_sql(&options())
         .unwrap_or_else(|error| panic!("the schema should translate: {error}"));
     let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
+    script.register_functions(&mut connection).expect("register helper functions");
     for statement in script.into_vec() {
         connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
     }

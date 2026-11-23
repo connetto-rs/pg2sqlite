@@ -200,6 +200,7 @@ fn replica_committing(pg: &str, options: &Pg2SqliteOptions) -> (SqliteConnection
         .expect("fixture translates");
     let before_commit = core::mem::take(&mut script.before_commit);
     let mut connection = establish_connection();
+    script.register_functions(&mut connection).expect("register helper functions");
     // The script is the translator's own output, which no typed query
     // expresses.
     for statement in script.into_vec() {

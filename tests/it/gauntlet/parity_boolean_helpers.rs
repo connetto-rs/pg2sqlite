@@ -290,9 +290,10 @@ fn sqlite(policy: &str) -> SqliteConnection {
         .sql(&format!("{OWNER}{SCHEMA}{policy}"))
         .expect("parse")
         .translate(&options())
-        .unwrap_or_else(|error| panic!("pg2sqlite refused {policy}: {error}"))
-        .into_vec();
+        .unwrap_or_else(|error| panic!("pg2sqlite refused {policy}: {error}"));
     let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
+    translated.register_functions(&mut connection).expect("register helper functions");
+    let translated = translated.into_vec();
     apply_with_seed(&mut connection, &translated, |connection| {
         seed!(
             connection,

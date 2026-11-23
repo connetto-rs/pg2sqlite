@@ -615,9 +615,10 @@ fn sqlite_runner() -> SqliteRunner {
         .sql(R100)
         .expect("parse")
         .translate(&options())
-        .unwrap_or_else(|error| panic!("pg2sqlite refused the document: {error}"))
-        .into_vec();
+        .unwrap_or_else(|error| panic!("pg2sqlite refused the document: {error}"));
     let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
+    translated.register_functions(&mut connection).expect("register helper functions");
+    let translated = translated.into_vec();
     let caller = Arc::new(Mutex::new(None));
     let answered = Arc::clone(&caller);
     app_user_utils::register_impl(&mut connection, move || {

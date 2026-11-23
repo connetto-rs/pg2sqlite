@@ -408,21 +408,27 @@ fn standard_sql_bodies_expand() {
     }
 }
 
-/// A returned expression reading a table translates as that read, against
-/// the table the replica holds.
+/// A returned expression reading a table translates as a call of the helper
+/// function reading it, against the table the replica holds.
 #[test]
-fn a_returned_expression_reading_a_table_reads_it_in_place() {
+fn a_returned_expression_reading_a_table_is_read_through_its_helper_function() {
     let extra = "CREATE TABLE owners (id UUID);
          GRANT SELECT ON owners TO app;
          CREATE FUNCTION authz.first_owner() RETURNS UUID LANGUAGE sql STABLE
            RETURN (SELECT id FROM public.owners LIMIT 1);";
-    let translated =
-        helpers::translate_pg(&script(extra, "owner_id = authz.first_owner()"), &options())
-            .unwrap_or_else(|error| panic!("refused the call: {error}"))
-            .join("\n");
-    assert!(translated.contains("CREATE TABLE owners"), "the replica holds owners: {translated}");
-    assert!(translated.contains("FROM owners LIMIT 1"), "the view reads owners: {translated}");
-    assert!(!translated.contains("first_owner"), "the view keeps no call: {translated}");
+    let script =
+        helpers::translate_script(&script(extra, "owner_id = authz.first_owner()"), &options())
+            .unwrap_or_else(|error| panic!("refused the call: {error}"));
+    assert!(
+        script.iter().any(|statement| statement.starts_with("CREATE TABLE owners ")),
+        "the replica holds owners"
+    );
+    let view = script
+        .iter()
+        .find(|statement| statement.starts_with("CREATE VIEW notes "))
+        .expect("the policy view");
+    let body = &helpers::called_function(&script, view, "first_owner").body;
+    assert!(body.contains("FROM owners LIMIT 1"), "the function reads owners: {body}");
 }
 
 #[test]

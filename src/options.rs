@@ -259,6 +259,9 @@ pub(crate) struct PrewalkCatalogs {
     /// What the batch's translation works out once, kept for the schemas it
     /// holds alive, boxed so every context stays as small.
     batch_cache: Box<core::cell::RefCell<crate::impls::batch_cache::BatchCache>>,
+    /// The helpers the translation calls as table-valued functions, in the
+    /// order first called.
+    helper_functions: core::cell::RefCell<Vec<crate::script::HelperFunction>>,
 }
 
 /// A trigger on a table or a view.
@@ -1323,6 +1326,56 @@ impl<'a> TranslationContext<'a> {
             .request_zone
             .get_or_init(|| crate::impls::request_zone::resolve(schema, self.options.as_ref()))
             .as_ref()
+    }
+
+    /// The name a call site reads `body` by, a function answering a call
+    /// to `helper` with `parameters` under `columns`, recorded the first
+    /// time a call needs it.
+    ///
+    /// The name is `<helper>_<hash>`, the hash that of the function's SQL,
+    /// so every translation names the same function alike and a statement
+    /// translated on its own registers no other function under a name the
+    /// script uses.
+    pub(crate) fn record_helper_function(
+        &self,
+        helper: &str,
+        parameters: Vec<String>,
+        columns: Vec<String>,
+        body: sqlparser::ast::Query,
+    ) -> String {
+        use core::hash::Hasher as _;
+
+        let body = sqlparser::ast::Statement::Query(Box::new(body));
+        let mut hasher = crate::impls::helper_functions::Fnv1a::new();
+        hasher.write(body.to_string().as_bytes());
+        for name in parameters.iter().chain(&columns) {
+            hasher.write(&[0]);
+            hasher.write(name.as_bytes());
+        }
+        let name = format!("{helper}_{:016x}", hasher.finish());
+        let mut functions = self.catalogs.helper_functions.borrow_mut();
+        if !functions.iter().any(|function| function.name == name) {
+            functions.push(crate::script::HelperFunction {
+                name: name.clone(),
+                parameters,
+                columns,
+                body,
+            });
+        }
+        name
+    }
+
+    /// The helper functions recorded so far.
+    pub(crate) fn helper_functions(
+        &self,
+    ) -> core::cell::Ref<'_, Vec<crate::script::HelperFunction>> {
+        self.catalogs.helper_functions.borrow()
+    }
+
+    /// The helpers the translation calls as table-valued functions, taken
+    /// out of the catalog once the translation is done.
+    pub(crate) fn take_helper_functions(&self) -> Vec<crate::script::HelperFunction> {
+        core::mem::take(&mut *self.catalogs.helper_functions.borrow_mut())
     }
 }
 
