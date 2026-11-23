@@ -9,7 +9,10 @@
 //! none of the columns an action changes answers on the replica as on the
 //! server.
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use sql_traits::{
     structs::ParserDB,
@@ -37,7 +40,8 @@ use crate::{
         object_name::last_ident,
         privileges::RoleTable,
         translator_impls::{
-            deferred_constraint::is_deferred, function_cascade::runs_dropped, plpgsql::fold,
+            deferred_constraint::is_deferred, function_cascade::runs_dropped, function_moves,
+            plpgsql::fold,
         },
     },
     options::TranslationContext,
@@ -166,19 +170,21 @@ pub(crate) fn firing_triggers<'a>(
     live_triggers(initial, statements).into_iter().map(|(_, fired)| fired).collect()
 }
 
-/// [`firing_triggers`], each beside the statement creating it.
+/// [`firing_triggers`], each beside the statement creating it, carried to
+/// the name its function takes.
 pub(super) fn live_triggers<'a>(
     initial: impl Iterator<Item = &'a CreateTrigger>,
     statements: &'a [Statement],
-) -> Vec<(&'a CreateTrigger, FiringTrigger)> {
-    let mut triggers: Vec<(&'a CreateTrigger, FiringTrigger)> =
-        initial.filter_map(|trigger| Some((trigger, FiringTrigger::of(trigger)?))).collect();
+) -> Vec<(Cow<'a, CreateTrigger>, FiringTrigger)> {
+    let mut triggers: Vec<(Cow<'a, CreateTrigger>, FiringTrigger)> = initial
+        .filter_map(|trigger| Some((Cow::Borrowed(trigger), FiringTrigger::of(trigger)?)))
+        .collect();
     for statement in statements {
         match statement {
             Statement::CreateTrigger(trigger) => {
                 let Some(created) = FiringTrigger::of(trigger) else { continue };
                 triggers.retain(|(_, kept)| !kept.same(&created));
-                triggers.push((trigger, created));
+                triggers.push((Cow::Borrowed(trigger), created));
             }
             Statement::DropTrigger(drop) => {
                 let name = last_ident(&drop.trigger_name).map(fold);
@@ -196,6 +202,14 @@ pub(super) fn live_triggers<'a>(
             }
             Statement::DropFunction(_) => {
                 triggers.retain(|(_, kept)| !runs_dropped(statement, &kept.function));
+            }
+            _ if function_moves::moves_functions(statement) => {
+                for (trigger, kept) in &mut triggers {
+                    if let Some(moved) = function_moves::moved(statement, &kept.function) {
+                        function_moves::carry(trigger.to_mut(), statement);
+                        kept.function = moved;
+                    }
+                }
             }
             _ => {}
         }

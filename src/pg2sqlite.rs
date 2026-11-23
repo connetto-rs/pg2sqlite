@@ -127,6 +127,7 @@ fn populate_prewalk_catalogs(
     }
     for statement in statements {
         register_declared_object_name(statement, context);
+        context.carry_trigger_functions(statement);
         if let Statement::CreateIndex(create_index) = statement {
             register_fts_index(create_index, context);
         }
@@ -870,7 +871,7 @@ impl Pg2Sqlite {
                     operation: sqlparser::ast::AlterTypeOperation::Rename(_),
                     ..
                 })
-        )
+        ) || crate::impls::translator_impls::function_moves::moves_functions(statement)
     }
 
     /// Whether a statement changes a table's columns, which can change what a

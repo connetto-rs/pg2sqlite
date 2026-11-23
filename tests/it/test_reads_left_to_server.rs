@@ -140,6 +140,18 @@ fn a_policy_reading_the_column_through_a_helper_is_named() {
     );
 }
 
+/// A trigger keeps running its function across the function's rename, so its
+/// writes are left to the server as before.
+#[test]
+fn a_trigger_whose_function_is_renamed_is_named_as_before() {
+    assert_eq!(
+        readers(&format!(
+            "{INVITATIONS}ALTER FUNCTION accept_invitation() RENAME TO take_invitation;"
+        )),
+        readers(INVITATIONS),
+    );
+}
+
 /// PostgreSQL rewrites a write through a view with one table in its `FROM`
 /// and plain columns onto that table, under the column each view column
 /// passes through.
