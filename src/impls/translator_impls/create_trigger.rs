@@ -512,24 +512,28 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
         options: &crate::options::TranslationContext<'_>,
         emit: &mut dyn FnMut(crate::warnings::TranslationWarning),
     ) -> Result<Self::SQLiteEntry, crate::errors::Error> {
-        // A trigger body reads the row of the table it is attached to, through
-        // `NEW` and `OLD` or bare, and there is no query around it, so that
-        // table is the outermost scope its column types resolve against. A
-        // query inside the body attaches its own scope over this one.
+        // The trigger relation supplies the column definitions of `NEW` and
+        // `OLD`.
         let trigger_table =
             crate::impls::object_name::resolve_translation_table(schema, &self.table_name)?;
         if let (Some(table), Some(condition)) = (trigger_table, &self.condition) {
             crate::impls::column_access::resolve_trigger_condition(condition, table, schema)?;
         }
-        let trigger_scope = trigger_table.map(|table| {
+        let scope_query;
+        let trigger_scope = if let Some(table) = trigger_table {
             sql_traits::structs::ColumnScope::for_table(
                 table,
                 schema,
                 sql_traits::structs::IdentifierCase::AsWritten,
             )
-        });
-        let scoped = trigger_scope.as_ref().map(|scope| options.with_pseudo_row_scope(scope));
-        let options = scoped.as_ref().unwrap_or(options);
+        } else {
+            scope_query =
+                crate::impls::shared_helpers::relations_scope_query(vec![plain_table_with_joins(
+                    self.table_name.clone(),
+                )]);
+            crate::options::query_column_scope(&scope_query, schema)?
+        };
+        let options = &options.with_pseudo_row_scope(&trigger_scope);
         let with_rows = trigger_table.map(|table| {
             options.with_trigger_rows(super::trigger_row::TriggerRows::new(table, &self.events))
         });

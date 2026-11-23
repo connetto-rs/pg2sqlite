@@ -12,7 +12,7 @@
 //! role's grants. A table on which the acting role holds no privilege is left
 //! out of the replica, so a helper reading one is refused.
 
-use core::{convert::Infallible, ops::ControlFlow};
+use core::{convert::Infallible, ops::ControlFlow, ptr};
 
 use sql_traits::{
     errors::HelperSetError,
@@ -25,11 +25,12 @@ use sql_traits::{
     traits::{DatabaseLike, FunctionLike, TableLike},
 };
 use sqlparser::ast::{
-    ArrayElemTypeDef, BinaryOperator, CastKind, CreateTable, Cte, DataType, Expr, FunctionArg,
-    FunctionArgExpr, FunctionArguments, Ident, InTarget, Join, JoinConstraint, JoinOperator,
-    ObjectName, ObjectNamePart, Query, SelectItem, SetExpr, SetOperator, SetQuantifier, TableAlias,
-    TableAliasColumnDef, TableFactor, TableWithJoins, Value, ValueWithSpan, VisitMut, VisitorMut,
-    With, helpers::attached_token::AttachedToken, visit_expressions,
+    ArrayElemTypeDef, BinaryOperator, CastKind, CreateTable, Cte, DataType, Distinct, Expr,
+    FunctionArg, FunctionArgExpr, FunctionArguments, Ident, InTarget, Join, JoinConstraint,
+    JoinOperator, ObjectName, ObjectNamePart, Query, SelectItem, SetExpr, SetOperator,
+    SetQuantifier, TableAlias, TableAliasColumnDef, TableFactor, TableWithJoins, Value,
+    ValueWithSpan, VisitMut, VisitorMut, With, helpers::attached_token::AttachedToken,
+    visit_expressions,
 };
 
 #[cfg(not(feature = "std"))]
@@ -372,7 +373,28 @@ impl<'db> Lowering<'_, 'db> {
         let arm_names = if walked { &[] } else { names };
         let mut arms = Vec::new();
         let mut edges = Vec::new();
-        for arm in set.arms() {
+        let mut merged = vec![false; set.arms().len()];
+        for (index, arm) in set.arms().iter().enumerate() {
+            if merged[index] {
+                continue;
+            }
+            if let Some(membership) = Membership::of(arm) {
+                let mut columns = vec![membership.column];
+                for (later, other) in set.arms().iter().enumerate().skip(index + 1) {
+                    if let Some(other) = Membership::of(other)
+                        && membership.reads_like(&other)
+                    {
+                        merged[later] = true;
+                        if !columns.iter().any(|column| ptr::eq(*column, other.column)) {
+                            columns.push(other.column);
+                        }
+                    }
+                }
+                if columns.len() > 1 {
+                    arms.push(self.memberships(&membership, &columns, arm_names)?);
+                    continue;
+                }
+            }
             match arm {
                 HelperArm::Grant(grant) => arms.push(self.grant(grant, arm_names)?),
                 HelperArm::Parent(parent) => arms.push(self.parent(parent, arm_names)?),
@@ -523,6 +545,53 @@ impl<'db> Lowering<'_, 'db> {
             from_relation(aliased_table(parent.table(), ARM)),
             Some(in_query(qualified(ARM, declared_column_ident(parent.column())), parents)),
         ))))
+    }
+
+    /// `SELECT DISTINCT <key> FROM (<set>) AS called CROSS JOIN <table> WHERE
+    /// called.column_0 IN (<columns>)`, the arms reading `membership`'s set
+    /// through each of `columns` as one.
+    ///
+    /// SQLite writes out a set at each place a query reads it, so a helper
+    /// reading another's set once per column, which reads its own callee
+    /// once per column too, doubles with every level. The `CROSS JOIN` reads
+    /// the set ahead of the table, so SQLite answers it once.
+    fn memberships(
+        &mut self,
+        membership: &Membership<'_, 'db>,
+        columns: &[&'db <ParserDB as DatabaseLike>::Column],
+        names: &[Ident],
+    ) -> Result<SetExpr, Error> {
+        self.read.push(membership.table);
+        let set = self.called_set(membership.function, membership.set, &[called_column(0)])?;
+        let mut select = make_simple_select(
+            projection([qualified(ARM, declared_column_ident(membership.key))], names),
+            vec![TableWithJoins {
+                relation: TableFactor::Derived {
+                    lateral: false,
+                    subquery: Box::new(set),
+                    alias: Some(alias(CALLED)),
+                    sample: None,
+                },
+                joins: vec![Join {
+                    relation: aliased_table(membership.table, ARM),
+                    global: false,
+                    join_operator: JoinOperator::CrossJoin(JoinConstraint::None),
+                }],
+            }],
+            Some(Expr::In {
+                expr: Box::new(qualified(CALLED, called_column(0))),
+                target: InTarget::List(
+                    columns
+                        .iter()
+                        .map(|column| qualified(ARM, declared_column_ident(column)))
+                        .collect(),
+                ),
+                negated: false,
+                global: false,
+            }),
+        );
+        select.distinct = Some(Distinct::Distinct);
+        Ok(SetExpr::Select(Box::new(select)))
     }
 
     /// `SELECT <returned> FROM (<set>) AS called [CROSS JOIN <labels>]...`,
@@ -714,6 +783,79 @@ impl<'db> Lowering<'_, 'db> {
     fn exclusion(&mut self, exclusion: &ExcludedSet<'db, ParserDB>) -> Result<Expr, Error> {
         let excluded = self.set(exclusion.set(), &[])?;
         Ok(not_in_query(qualified(ARM, declared_column_ident(exclusion.column())), excluded))
+    }
+}
+
+/// An arm returning the key of each row of its table whose column holds a
+/// value of another helper's set, and keeping rows on nothing else.
+struct Membership<'a, 'db> {
+    table: &'db CreateTable,
+    key: &'db <ParserDB as DatabaseLike>::Column,
+    column: &'db <ParserDB as DatabaseLike>::Column,
+    function: &'db <ParserDB as DatabaseLike>::Function,
+    arguments: &'a [Value],
+    set: &'a HelperSet<'db, ParserDB>,
+}
+
+impl<'a, 'db> Membership<'a, 'db> {
+    /// `arm` as a membership, a parent arm or a grant arm whose one
+    /// condition is its grantee set or a cap on one of its columns, or `None`
+    /// for any other arm.
+    fn of(arm: &'a HelperArm<'db, ParserDB>) -> Option<Self> {
+        match arm {
+            HelperArm::Parent(parent) => {
+                Some(Self {
+                    table: parent.table(),
+                    key: parent.key(),
+                    column: parent.column(),
+                    function: parent.function(),
+                    arguments: parent.arguments(),
+                    set: parent.set(),
+                })
+            }
+            HelperArm::Grant(grant) => {
+                let [Returned::Read(key)] = grant.returned() else { return None };
+                let unconditioned = grant.joined_rows().is_empty()
+                    && grant.gate().is_none()
+                    && grant.unset_settings().is_empty()
+                    && grant.restrictions().is_empty()
+                    && grant.time_bounds().is_empty()
+                    && grant.anti_joins().is_empty()
+                    && grant.exclusions().is_empty();
+                if !unconditioned {
+                    return None;
+                }
+                let (column, function, arguments, set) = match (grant.granted_to(), grant.caps()) {
+                    (GrantedTo::Set(grantees), []) => {
+                        (
+                            grantees.column(),
+                            grantees.function(),
+                            grantees.arguments(),
+                            grantees.set(),
+                        )
+                    }
+                    (GrantedTo::Anyone, [cap]) => {
+                        let ([CapOperand::Column(column)], None) = (cap.operands(), cap.lift())
+                        else {
+                            return None;
+                        };
+                        (*column, cap.function(), cap.arguments(), cap.set())
+                    }
+                    _ => return None,
+                };
+                Some(Self { table: grant.table(), key, column, function, arguments, set })
+            }
+            HelperArm::Called(_) | HelperArm::Walk(_) => None,
+        }
+    }
+
+    /// Whether `other` returns the key `self` returns from the set of the
+    /// same call, so the two differ at most in the column they compare.
+    fn reads_like(&self, other: &Self) -> bool {
+        ptr::eq(self.table, other.table)
+            && ptr::eq(self.key, other.key)
+            && ptr::eq(self.function, other.function)
+            && self.arguments == other.arguments
     }
 }
 

@@ -138,7 +138,7 @@ fn output_names(view: &View, schema: &ParserDB) -> Result<Vec<Option<String>>, E
         .map_while(|output| {
             match output {
                 QueryOutput::Column { name, .. } => Some(name),
-                QueryOutput::Unexpanded => None,
+                QueryOutput::Unexpanded { .. } => None,
             }
         })
         .map(|produced| {
