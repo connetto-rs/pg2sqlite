@@ -24,7 +24,7 @@
 //! Do not add a fourth mechanism. There are three outcomes, plus that closed
 //! list.
 
-use sqlparser::ast::{CreatePolicy, Statement};
+use sqlparser::ast::{CreateIndex, CreatePolicy, Statement};
 
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
@@ -207,8 +207,7 @@ pub enum DowngradeLocation {
 /// A declared object, as a [`DowngradeLocation`] names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeclaredObject {
-    /// A table, which also holds the expressions of an index declared
-    /// without a name.
+    /// A table.
     Table {
         /// The table.
         name: String,
@@ -255,11 +254,10 @@ impl DeclaredObject {
             Statement::CreateView(create_view) => {
                 Some(Self::View { name: last_ident_value_or_display(&create_view.name) })
             }
-            Statement::CreateIndex(create_index) => {
-                let table = last_ident_value_or_display(&create_index.table_name);
-                Some(match &create_index.name {
-                    Some(name) => Self::Index { table, name: last_ident_value_or_display(name) },
-                    None => Self::Table { name: table },
+            Statement::CreateIndex(CreateIndex { name: Some(name), table_name, .. }) => {
+                Some(Self::Index {
+                    table: last_ident_value_or_display(table_name),
+                    name: last_ident_value_or_display(name),
                 })
             }
             Statement::CreateTrigger(create_trigger) => {

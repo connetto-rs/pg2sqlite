@@ -390,6 +390,72 @@ fn a_cast_downgrade_in_a_check_names_the_table() {
     );
 }
 
+/// A cast in a column that `ALTER TABLE` adds names the table.
+#[test]
+fn a_cast_downgrade_in_an_added_column_names_the_table() {
+    assert_eq!(
+        locations_for(
+            "CREATE TABLE notes (id INT PRIMARY KEY, title TEXT);
+             ALTER TABLE notes ADD COLUMN day TEXT CHECK (CAST(day AS date) > DATE '2000-01-01');",
+        ),
+        [expression(Some(DeclaredObject::Table { name: "notes".to_owned() }), "CAST(day AS DATE)")]
+    );
+}
+
+/// A cast in a partial index's predicate names the index.
+#[test]
+fn a_cast_downgrade_in_a_partial_index_names_the_index() {
+    assert_eq!(
+        locations_for(
+            "CREATE TABLE notes (id INT PRIMARY KEY, title TEXT);
+             CREATE INDEX dated ON notes (title) WHERE CAST(title AS date) > DATE '2000-01-01';",
+        ),
+        [expression(
+            Some(DeclaredObject::Index { table: "notes".to_owned(), name: "dated".to_owned() }),
+            "CAST(title AS DATE)"
+        )]
+    );
+}
+
+/// A warning renders each kind of location in its message.
+#[test]
+fn a_downgrade_location_renders_the_place_it_names() {
+    let object = DowngradeLocation::Object;
+    let cases = [
+        (column("notes", "at"), "notes.at"),
+        (index("notes", "dated"), "index dated on notes"),
+        (object(DeclaredObject::Table { name: "notes".to_owned() }), "table notes"),
+        (object(DeclaredObject::View { name: "recent".to_owned() }), "view recent"),
+        (
+            object(DeclaredObject::Policy { table: "notes".to_owned(), name: "fresh".to_owned() }),
+            "policy fresh on notes",
+        ),
+        (
+            object(DeclaredObject::Trigger { table: "notes".to_owned(), name: "stamp".to_owned() }),
+            "trigger stamp on notes",
+        ),
+        (
+            expression(
+                Some(DeclaredObject::View { name: "recent".to_owned() }),
+                "CAST(title AS DATE)",
+            ),
+            "CAST(title AS DATE) in view recent",
+        ),
+        (expression(None, "CAST(title AS DATE)"), "CAST(title AS DATE)"),
+        (DowngradeLocation::Script, "every connection that writes"),
+    ];
+    for (location, rendered) in cases {
+        let warning = TranslationWarning::LossyDowngrade {
+            construct: "CAST".to_owned(),
+            from: "a".to_owned(),
+            to: "b".to_owned(),
+            location,
+            reason: "c".to_owned(),
+        };
+        assert_eq!(warning.to_string(), format!("downgraded CAST at {rendered} from a to b: c"));
+    }
+}
+
 /// A cast in a policy names the policy and its table, whichever statement
 /// the policy's view and triggers are built under.
 #[test]
