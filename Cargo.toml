@@ -16,13 +16,18 @@ categories = ["database", "parser-implementations"]
 # test target needs its own process.
 autotests = false
 
+[workspace]
+members = ["runtime"]
+default-members = [".", "runtime"]
+
 [dependencies]
 sqlparser = { version = "0.64", default-features = false, features = ["visitor"] }
 sqlparser-plpgsql = { git = "https://github.com/connetto-rs/sqlparser-plpgsql", branch = "main", features = ["body-parse"] }
 sql-traits = { git = "https://github.com/connetto-rs/sql-traits", branch = "main", default-features = false }
-# Reads, prints, computes and compares PostgreSQL intervals, timestamps, time
-# zones and jsonb the way PostgreSQL 18 does.
+# Reads, prints and computes PostgreSQL intervals, timestamps and time zones the way PostgreSQL 18 does.
 sql-values = { version = "0.6", default-features = false, features = ["tzdb"] }
+# The `jsonb` and case fold functions a replica registers, which the options name.
+pg2sqlite-runtime = { version = "0.1", path = "runtime" }
 # The SQLSTATE a replica refusal reports, the type diesel reads PostgreSQL's
 # error codes as.
 sqlstate = "0.2"
@@ -81,13 +86,6 @@ default-features = false
 features = ["sqlite"]
 optional = true
 
-[dependencies.diesel-dynamic-schema]
-git = "https://github.com/diesel-rs/diesel"
-branch = "upstream/sqlite-table-valued-functions-dynamic"
-default-features = false
-features = ["sqlite"]
-optional = true
-
 [features]
 # Drop the defaults with `--no-default-features` to build for `wasm32-unknown-unknown` or other no_std targets.
 # The sqlparser patch below is what lets `sqlparser/visitor` build without std.
@@ -110,13 +108,10 @@ sqlitegis = [
     "dep:sqlitegis",
     "dep:libsqlite3-sys",
 ]
-# Derives `Arbitrary` on `Pg2SqliteOptions`, `UuidRepresentation`,
-# `SessionVariablePattern`, `SessionVariableValue`, and
-# `SessionVariableMapping`. Consumed by the fuzz harnesses; not used by
-# production code.
-arbitrary = ["dep:arbitrary"]
+# Derives `Arbitrary` on `Pg2SqliteOptions` and the types it holds, for the fuzz harnesses.
+arbitrary = ["dep:arbitrary", "pg2sqlite-runtime/arbitrary"]
 # `JsonbFunctions::register`, `CaseFoldFunctions::register` and `Script::register_functions` on a diesel `SqliteConnection`.
-diesel = ["dep:diesel", "dep:diesel-dynamic-schema"]
+diesel = ["dep:diesel", "pg2sqlite-runtime/diesel"]
 # `parity::replay`, answering rls-parity's row-level security cases, which
 # sql-traits ships behind `parity-fixtures`, on the SQLite replica.
 parity = ["std", "diesel", "sql-traits/parity-fixtures"]
@@ -189,7 +184,10 @@ harness = false
 inherits = "test"
 debug = "none"
 
-[lints.rust]
+[lints]
+workspace = true
+
+[workspace.lints.rust]
 missing_docs = "deny"
 unused_macro_rules = "forbid"
 unconditional_recursion = "forbid"
@@ -198,7 +196,7 @@ unused_import_braces = "forbid"
 unused_must_use = "forbid"
 deprecated = "deny"
 
-[lints.rustdoc]
+[workspace.lints.rustdoc]
 broken_intra_doc_links = "forbid"
 bare_urls = "forbid"
 invalid_codeblock_attributes = "forbid"
@@ -208,7 +206,7 @@ unescaped_backticks = "forbid"
 redundant_explicit_links = "forbid"
 invalid_rust_codeblocks = "forbid"
 
-[lints.clippy]
+[workspace.lints.clippy]
 unreadable_literal = "allow"
 missing_panics_doc = "allow"
 new_ret_no_self = "allow"

@@ -145,8 +145,13 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-no-std-
 
-      - name: Check the crate builds without std
+      - name: Check the crates build without std
         run: cargo check --no-default-features --target wasm32-unknown-unknown
+        env:
+          RUSTFLAGS: -D warnings
+
+      - name: Check the runtime registers on WebAssembly
+        run: cargo check -p pg2sqlite-runtime --features diesel --target wasm32-unknown-unknown
         env:
           RUSTFLAGS: -D warnings
 

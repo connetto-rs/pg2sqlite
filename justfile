@@ -25,3 +25,4 @@ doc:
 
 no-std:
     RUSTFLAGS="-D warnings" cargo check --no-default-features --target wasm32-unknown-unknown
+    RUSTFLAGS="-D warnings" cargo check -p pg2sqlite-runtime --features diesel --target wasm32-unknown-unknown
