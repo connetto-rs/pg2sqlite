@@ -3,12 +3,13 @@
 //! PostgreSQL resolves a trigger body where it runs.
 
 use alloc::collections::BTreeSet;
+use core::ops::ControlFlow;
 
 use sql_traits::{structs::ParserDB, traits::DatabaseLike};
 use sqlparser::ast::{
     AlterFunction, AlterFunctionOperation, AlterFunctionSignature, AlterTableOperation,
-    CreateTrigger, DropTrigger, ObjectName, ObjectType, RenameTableNameKind, Statement,
-    TriggerEvent,
+    CreateTrigger, DropTrigger, Expr, Ident, ObjectName, ObjectType, RenameTableNameKind,
+    Statement, TriggerEvent, visit_expressions_mut,
 };
 
 use super::{
@@ -108,7 +109,7 @@ impl Touched {
 }
 
 /// Carries `trigger` along `event`, which renames its table or a column its
-/// `UPDATE OF` list names.
+/// `UPDATE OF` list or `WHEN` condition names.
 fn carry(trigger: &mut CreateTrigger, event: &Statement) {
     let Statement::AlterTable(alter) = event else { return };
     if folded(&alter.name) != folded(&trigger.table_name) {
@@ -128,6 +129,17 @@ fn carry(trigger: &mut CreateTrigger, event: &Statement) {
                         }
                     }
                 }
+                let rows = [Ident::new("new"), Ident::new("old")];
+                let _ = visit_expressions_mut(&mut trigger.condition, |expr| {
+                    if let Expr::CompoundIdentifier(parts) = expr
+                        && let [row, column] = parts.as_mut_slice()
+                        && rows.iter().any(|name| same_identifier(row, name))
+                        && same_identifier(column, old_column_name)
+                    {
+                        column.clone_from(new_column_name);
+                    }
+                    ControlFlow::<()>::Continue(())
+                });
             }
             _ => {}
         }
