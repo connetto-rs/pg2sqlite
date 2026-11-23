@@ -3122,12 +3122,7 @@ fn translate_column_assignment<D: TranslationDirection>(
     })
 }
 
-/// Translates the DO UPDATE assignments and WHERE inside an ON CONFLICT
-/// clause, and the predicate of its conflict target.
-///
-/// `rewrites` carries the target table's column-typed rewrites, since a DO
-/// UPDATE writes into the same columns the insert does. Empty for the reverse
-/// direction, which never unwraps or unscales.
+/// Translates the assignments and `WHERE` of a conflict update.
 pub(crate) fn translate_on_conflict_do_update<D: TranslationDirection>(
     on_conflict: &sqlparser::ast::OnConflict,
     do_update: &sqlparser::ast::DoUpdate,
@@ -3148,10 +3143,8 @@ pub(crate) fn translate_on_conflict_do_update<D: TranslationDirection>(
         .as_ref()
         .map(|expr| D::translate_expr(expr, schema, options, emit))
         .transpose()?;
-    let mut conflict_target = on_conflict.conflict_target.clone();
-    translate_conflict_predicate::<D>(&mut conflict_target, schema, options, emit)?;
     Ok(sqlparser::ast::OnInsert::OnConflict(sqlparser::ast::OnConflict {
-        conflict_target,
+        conflict_target: on_conflict.conflict_target.clone(),
         action: sqlparser::ast::OnConflictAction::DoUpdate(sqlparser::ast::DoUpdate {
             assignments,
             selection,

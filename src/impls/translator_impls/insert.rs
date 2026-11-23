@@ -6,7 +6,8 @@ use sql_traits::{
     traits::{ColumnLike, DatabaseLike, TableIndexLike, TableLike, UniqueIndexLike},
 };
 use sqlparser::ast::{
-    AssignmentTarget, DataType, Expr, Insert, ObjectName, Query, SelectItem, SetExpr, TableObject,
+    AssignmentTarget, DataType, Expr, Ident, Insert, ObjectName, Query, SelectItem, SetExpr,
+    TableAlias, TableFactor, TableObject, TableWithJoins,
 };
 
 use super::helpers::Forward;
@@ -356,6 +357,28 @@ fn wildcard_width(
     }))
 }
 
+/// Resolves the target row and incoming row of a conflict update.
+fn conflict_update_scope_query(insert: &Insert) -> Query {
+    let TableObject::TableName(name) = &insert.table else {
+        return crate::impls::shared_helpers::relations_scope_query(Vec::new());
+    };
+    let alias = |name| TableAlias { explicit: true, name, columns: Vec::new(), at: None };
+    let mut target = crate::impls::query_builder::plain_table_factor(name.clone());
+    let mut excluded = crate::impls::query_builder::plain_table_factor(name.clone());
+    if let TableFactor::Table { alias: written, .. } = &mut target {
+        *written = insert.table_alias.as_ref().map(|table_alias| alias(table_alias.alias.clone()));
+    }
+    if let TableFactor::Table { alias: written, .. } = &mut excluded {
+        *written = Some(alias(Ident::new("excluded")));
+    }
+    crate::impls::shared_helpers::relations_scope_query(
+        [target, excluded]
+            .into_iter()
+            .map(|relation| TableWithJoins { relation, joins: Vec::new() })
+            .collect(),
+    )
+}
+
 /// Translates the `ON CONFLICT` clause onto `insert`, refusing every other
 /// `ON` clause.
 fn translate_on_insert(
@@ -378,13 +401,12 @@ fn translate_on_insert(
         target,
         schema,
     )?;
-    let conflict_target =
+    let mut conflict_target =
         rewrite_conflict_interval_columns(conflict_target, target, schema, options)?;
+    translate_conflict_predicate::<Forward>(&mut conflict_target, schema, options, emit)?;
     match &on_conflict.action {
         sqlparser::ast::OnConflictAction::DoNothing => {
             // Unlike `INSERT OR IGNORE`, this keeps CHECK and NOT NULL errors.
-            let mut conflict_target = conflict_target;
-            translate_conflict_predicate::<Forward>(&mut conflict_target, schema, options, emit)?;
             insert.on = Some(sqlparser::ast::OnInsert::OnConflict(sqlparser::ast::OnConflict {
                 conflict_target,
                 action: sqlparser::ast::OnConflictAction::DoNothing,
@@ -393,6 +415,10 @@ fn translate_on_insert(
         sqlparser::ast::OnConflictAction::DoUpdate(do_update) => {
             let resolved =
                 sqlparser::ast::OnConflict { conflict_target, action: on_conflict.action.clone() };
+            let scope_query = conflict_update_scope_query(insert);
+            let scope = crate::options::query_column_scope(&scope_query, schema)?;
+            let scoped = options.with_scope(&scope);
+            let options = &scoped;
             // PostgreSQL writes the declared default for a DO UPDATE DEFAULT.
             let substituted = substitute_do_update_defaults(
                 do_update,
