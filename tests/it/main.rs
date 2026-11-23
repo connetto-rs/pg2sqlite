@@ -288,6 +288,7 @@ mod test_rls_strict_select_gate;
 mod test_rls_subquery_scope;
 mod test_rls_tenant_isolation;
 mod test_rls_translation;
+mod test_rls_trigger_table_name;
 mod test_rls_update_null_semantics;
 mod test_rls_validation;
 mod test_rls_view_defaults;
