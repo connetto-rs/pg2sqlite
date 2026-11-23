@@ -76,3 +76,17 @@ fn an_insert_alias_hides_the_table_name() {
         assert!(error.to_string().contains("base"), "{error}");
     }
 }
+
+#[test]
+fn a_returning_subquery_rejects_an_overqualified_relation() {
+    let error = Pg2Sqlite::default()
+        .sql(
+            "CREATE TABLE base (id INTEGER PRIMARY KEY, name TEXT);
+             INSERT INTO base AS x VALUES (1, 'a')
+                 RETURNING (SELECT name FROM a.b.c.d);",
+        )
+        .expect("parse")
+        .translate_to_sql(&Pg2SqliteOptions::default())
+        .expect_err("an overqualified relation is invalid");
+    assert!(error.to_string().contains("a.b.c.d"), "{error}");
+}
