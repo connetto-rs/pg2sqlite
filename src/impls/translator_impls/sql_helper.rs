@@ -169,19 +169,12 @@ pub(crate) fn inlined_call<'s>(
     let helper = declared_helper(&call.name, schema, options)?;
     let Some(helper) = helper.filter(|helper| written_in_sql(helper)) else { return Ok(None) };
     let caller = calling_role(schema, options)?;
-    let mut inliner = Inliner {
-        schema,
-        options,
-        expanding: Vec::new(),
-        keep_sets: false,
-        called: Some(Vec::new()),
-    };
+    let mut inliner = Inliner { schema, options, expanding: Vec::new(), keep_sets: false };
     match inliner.call(call, helper, caller)? {
         Expansion::Expression(expression) => Ok(Some(Inlined::Postgres(expression))),
         Expansion::Rows(rows) => {
-            let query = rows.translate(schema, options, emit)?;
-            options.record_helper_set(&query, inliner.called.unwrap_or_default());
-            Ok(Some(Inlined::Sqlite(Expr::Subquery(Box::new(query)))))
+            rows.translate(schema, options, emit)
+                .map(|query| Some(Inlined::Sqlite(Expr::Subquery(Box::new(query)))))
         }
     }
 }
@@ -217,17 +210,11 @@ pub(crate) fn inlined_rows<'s>(
     }
     let columns = columns.iter().cloned().zip(returned_row_types(name, helper, schema)?).collect();
     let caller = calling_role(schema, options)?;
-    let mut inliner = Inliner {
-        schema,
-        options,
-        expanding: Vec::new(),
-        keep_sets: false,
-        called: Some(Vec::new()),
-    };
-    let query =
-        inliner.set(name, arguments, helper, caller, columns)?.translate(schema, options, emit)?;
-    options.record_helper_set(&query, inliner.called.unwrap_or_default());
-    Ok(Some(query))
+    let mut inliner = Inliner { schema, options, expanding: Vec::new(), keep_sets: false };
+    inliner
+        .set(name, arguments, helper, caller, columns)?
+        .translate(schema, options, emit)
+        .map(Some)
 }
 
 /// Whether `function`'s body is SQL, the one language whose body has an
@@ -251,8 +238,7 @@ pub(crate) fn inlined_calls<'s>(
     options: &TranslationContext<'s>,
 ) -> Result<Expr, Error> {
     let caller = calling_role(schema, options)?;
-    let mut inliner =
-        Inliner { schema, options, expanding: Vec::new(), keep_sets: true, called: None };
+    let mut inliner = Inliner { schema, options, expanding: Vec::new(), keep_sets: true };
     let mut expr = expr.clone();
     inliner.expand(&mut expr, caller)?;
     Ok(expr)
@@ -279,9 +265,6 @@ struct Inliner<'s, 'o> {
     /// Leaves a call to a function returning a set as written, and writes a
     /// body reading relations as the PostgreSQL query it runs.
     keep_sets: bool,
-    /// The helpers expanded, one entry per call, when the expansion is
-    /// recorded as a helper set.
-    called: Option<Vec<String>>,
 }
 
 /// What a call expands to.
@@ -302,7 +285,6 @@ impl<'s> Inliner<'s, '_> {
     ) -> Result<Expansion<'s>, Error> {
         let name = &call.name;
         self.check_cycle(name, helper)?;
-        self.record_call(helper);
         if call.over.is_some()
             || call.filter.is_some()
             || call.null_treatment.is_some()
@@ -370,7 +352,6 @@ impl<'s> Inliner<'s, '_> {
         columns: Vec<(Ident, &'s DataType)>,
     ) -> Result<RowsCall<'s>, Error> {
         self.check_cycle(name, helper)?;
-        self.record_call(helper);
         if let Some(role) = caller {
             check_privileges(name, helper, role, self.schema)?;
         }
@@ -379,13 +360,6 @@ impl<'s> Inliner<'s, '_> {
         self.expand_arguments(&mut arguments, caller)?;
         let query = body_query(name, helper, self.schema)?;
         self.rows(name, helper, caller, &arguments, query, Answer::Rows(columns))
-    }
-
-    /// Records the call to `helper` when the expansion is recorded.
-    fn record_call(&mut self, helper: &CreateFunction) {
-        if let Some(called) = &mut self.called {
-            called.push(helper.target_name().to_string());
-        }
     }
 
     /// Refuses a call to `helper` made in its own body, directly or through

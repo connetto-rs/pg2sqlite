@@ -4,7 +4,6 @@ pub(crate) mod ast_builder;
 pub(crate) mod batch_cache;
 pub(crate) mod bind_once;
 pub(crate) mod column_access;
-pub(crate) mod cursor_budget;
 pub(crate) mod datetime_helpers;
 pub(crate) mod derived_writes;
 pub(crate) mod direction_wrappers;

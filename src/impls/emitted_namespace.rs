@@ -341,7 +341,7 @@ impl<'a> Namespaces<'a> {
 }
 
 /// The name SQLite would file an object under, which folds ASCII case.
-pub(crate) fn key(name: &ObjectName) -> String {
+fn key(name: &ObjectName) -> String {
     last_ident_value_or_display(name).to_ascii_lowercase()
 }
 

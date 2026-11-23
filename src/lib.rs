@@ -28,6 +28,8 @@ pub mod options;
 #[cfg(feature = "parity")]
 pub mod parity;
 pub mod pg2sqlite;
+#[cfg(feature = "diesel")]
+pub mod programs;
 pub mod script;
 pub mod sqlstate;
 pub mod traits;
