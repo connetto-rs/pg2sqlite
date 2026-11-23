@@ -266,7 +266,7 @@ fn route_trigger_write_name(
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
 ) -> Result<(), crate::errors::Error> {
-    if options.get_write_exemption_function().is_none() {
+    if options.get_rls_exemption_function().is_none() {
         return Ok(());
     }
     let Some(ObjectNamePart::Identifier(last)) = name.0.last_mut() else {
@@ -641,9 +641,12 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
                     body_schema(schema, options),
                 )
         {
+            // Each part names its table as written, as the trigger does.
             let mut translated = Vec::new();
-            translated.extend(non_insert_trigger.translate_with_warnings(schema, options, emit)?);
-            translated.extend(insert_trigger.translate_with_warnings(schema, options, emit)?);
+            for mut part in [non_insert_trigger, insert_trigger] {
+                part.table_name.clone_from(&self.table_name);
+                translated.extend(part.translate_with_warnings(schema, options, emit)?);
+            }
             return Ok(translated);
         }
 
@@ -1164,7 +1167,7 @@ mod tests {
     fn configured_exemption_routes_trigger_dml_targets_to_backing_tables() {
         let schema = schema_with_trigger_function_and_rls_table();
         let options = crate::options::TranslationContext::from_owned(
-            Pg2SqliteOptions::default().with_write_exemption_function("write_is_exempt"),
+            Pg2SqliteOptions::default().with_rls_exemption_function("write_is_exempt"),
         );
 
         for sql in [

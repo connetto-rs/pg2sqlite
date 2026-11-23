@@ -115,8 +115,9 @@ pub struct Pg2SqliteOptions {
     deployment: Option<Deployment>,
     /// The name of the audit table for RLS validation monitoring.
     rls_audit_table_name: Option<String>,
-    /// The caller-registered function that exempts generated write guards.
-    write_exemption_function: Option<String>,
+    /// The caller-registered function that lifts row-level security and the
+    /// generated write guards.
+    rls_exemption_function: Option<String>,
     /// Whether to enable strict RLS validation (abort on violations).
     strict_rls_validation: bool,
     /// Whether a write denied by a policy `USING` clause raises instead of
@@ -165,7 +166,7 @@ impl<'a> arbitrary::Arbitrary<'a> for Pg2SqliteOptions {
             session_variables: Vec::<SessionVariableMapping>::arbitrary(u)?,
             deployment: None,
             rls_audit_table_name: Option::<String>::arbitrary(u)?,
-            write_exemption_function: Option::<String>::arbitrary(u)?,
+            rls_exemption_function: Option::<String>::arbitrary(u)?,
             strict_rls_validation: bool::arbitrary(u)?,
             strict_rls_write_deny: bool::arbitrary(u)?,
             sqlitegis_enabled: bool::arbitrary(u)?,
@@ -198,7 +199,7 @@ impl Default for Pg2SqliteOptions {
             session_variables: Vec::new(),
             deployment: None,
             rls_audit_table_name: None,
-            write_exemption_function: None,
+            rls_exemption_function: None,
             strict_rls_validation: false,
             strict_rls_write_deny: false,
             sqlitegis_enabled: false,
@@ -1609,18 +1610,23 @@ impl Pg2SqliteOptions {
     }
 
     #[must_use]
-    /// Sets the boolean function that exempts generated write guards.
+    /// Sets the boolean function marking a statement as the table owner's.
     ///
-    /// Constraint triggers skip an exempt write too, deferred ones included.
-    pub fn with_write_exemption_function(mut self, name: impl Into<String>) -> Self {
-        self.write_exemption_function = Some(name.into());
+    /// While it answers true, row-level security binds neither the
+    /// statement's writes nor its reads, as it binds neither for PostgreSQL's
+    /// table owner. The generated write guards and grant gates let the write
+    /// through, and a row-secured view shows every row of its backing table,
+    /// still projecting only the columns the acting role may read. Constraint
+    /// triggers skip an exempt write too, deferred ones included.
+    pub fn with_rls_exemption_function(mut self, name: impl Into<String>) -> Self {
+        self.rls_exemption_function = Some(name.into());
         self
     }
 
     #[must_use]
-    /// Returns the configured write exemption function name.
-    pub fn get_write_exemption_function(&self) -> Option<&str> {
-        self.write_exemption_function.as_deref()
+    /// Returns the configured RLS exemption function name.
+    pub fn get_rls_exemption_function(&self) -> Option<&str> {
+        self.rls_exemption_function.as_deref()
     }
 
     #[must_use]

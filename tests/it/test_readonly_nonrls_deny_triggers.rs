@@ -3,7 +3,7 @@
 //! A table that is selectable but not writable and carries no RLS policy is
 //! emitted as a plain table plus `BEFORE INSERT`/`UPDATE`/`DELETE` deny
 //! triggers that `RAISE(ABORT)`, so interactive writes fail at the statement.
-//! A configured write exemption bypasses only these generated guards, leaving
+//! A configured RLS exemption bypasses only these generated guards, leaving
 //! unrelated SQLite triggers active. Without an exemption, authoritative
 //! changesets can disable every trigger through
 //! `SQLITE_DBCONFIG_ENABLE_TRIGGER`.
@@ -87,8 +87,8 @@ fn readonly_nonrls_select_works_and_insert_fails() {
 }
 
 #[test]
-fn write_exemption_bypasses_each_nonrls_deny_trigger() {
-    let opts = options().with_write_exemption_function("write_is_exempt");
+fn rls_exemption_bypasses_each_nonrls_deny_trigger() {
+    let opts = options().with_rls_exemption_function("write_is_exempt");
     let translated = helpers::translate_pg(SCHEMA, &opts).expect("translate");
     let mut conn = SqliteConnection::establish(":memory:").expect("connect");
     write_is_exempt_utils::register_nondeterministic_impl(&mut conn, || {

@@ -4,7 +4,7 @@
 //! `current_setting()`. The translation lowers `current_user` to the acting
 //! role's name as a literal, so every test translates the fixture once per
 //! acting role and seeds the rows straight into the backing table under the
-//! write exemption.
+//! RLS exemption.
 
 use std::cell::Cell;
 
@@ -73,7 +73,7 @@ fn options(role: &str) -> Pg2SqliteOptions {
         .with_rls_audit_table_name("rls_audit")
         .with_deployment(deployment([role], []))
         .with_acting_role(role)
-        .with_write_exemption_function("write_is_exempt")
+        .with_rls_exemption_function("write_is_exempt")
 }
 
 fn translate_and_setup(role: &str) -> diesel::SqliteConnection {
@@ -104,7 +104,7 @@ fn set_write_exempt(exempt: bool) {
     WRITE_IS_EXEMPT.with(|value| value.set(exempt));
 }
 
-/// Seeds one profile per role into the backing table. The write exemption
+/// Seeds one profile per role into the backing table. The RLS exemption
 /// has to hold the guards open for the foreign rows.
 fn seed_profiles(connection: &mut diesel::SqliteConnection) {
     set_write_exempt(true);

@@ -144,7 +144,7 @@ fn test_fk_constraint_enforcement() -> Result<(), Box<dyn std::error::Error>> {
 fn test_fk_both_tables_rls() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = establish_connection();
     let fixture_sql = include_str!("../fixtures/rls_fk_both.sql");
-    let options = translation_options().with_write_exemption_function("write_is_exempt");
+    let options = translation_options().with_rls_exemption_function("write_is_exempt");
     write_is_exempt_utils::register_nondeterministic_impl(&mut conn, || {
         WRITE_IS_EXEMPT.with(Cell::get)
     })?;

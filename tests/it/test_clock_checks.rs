@@ -25,7 +25,7 @@ diesel::table! {
 extern "SQL" {
     /// SQLite's `strftime`, reading `time` shifted by `modifier`.
     fn strftime(format: Text, time: Text, modifier: Text) -> Text;
-    /// The write exemption the translated guards consult.
+    /// The RLS exemption the translated guards consult.
     fn write_exempt() -> Bool;
 }
 
@@ -83,10 +83,10 @@ fn a_clock_check_admits_a_row_stamped_now_and_null_and_refuses_one_an_hour_ahead
 static EXEMPT: AtomicBool = AtomicBool::new(true);
 
 /// PostgreSQL checks the whole row on every update, and a row the server
-/// wrote, applied under the write exemption, is not judged again.
+/// wrote, applied under the RLS exemption, is not judged again.
 #[test]
 fn an_exempt_write_lands_and_an_update_of_another_column_is_checked() {
-    let options = Pg2SqliteOptions::default().with_write_exemption_function("write_exempt");
+    let options = Pg2SqliteOptions::default().with_rls_exemption_function("write_exempt");
     let mut connection =
         helpers::apply_with_options(TOLERANT, &options).expect("the translated table applies");
     write_exempt_utils::register_nondeterministic_impl(&mut connection, || {
