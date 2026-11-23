@@ -298,9 +298,9 @@ fn replay_unit(
         if context.shares_trigger_slot(&crate::impls::translator_impls::trigger_slots::trigger_key(create)));
     if unit.rebuilt_trigger || shares_slot {
         return Err(refusal(format!(
-            "statement {} emits triggers that other statements of the batch shape, and \
-             replaying it here renames what they read, which a retranslation of that one \
-             statement cannot carry into them",
+            "statement {} emits a trigger shared with other triggers on the same table, timing \
+             and event, and replaying it here renames what the trigger reads, which a \
+             retranslation of that one statement cannot carry into the shared trigger",
             id.index()
         )));
     }

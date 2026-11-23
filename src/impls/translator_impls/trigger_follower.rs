@@ -211,16 +211,7 @@ impl TriggerFollower {
         else {
             return Ok(Vec::new());
         };
-        let rendered = match &mut followed.rendered {
-            Some(rendered) => rendered,
-            unrendered @ None => {
-                unrendered.insert(translate_seeded(
-                    &Statement::CreateTrigger(followed.create.clone()),
-                    &mut |_| {},
-                )?)
-            }
-        };
-        Ok(created_triggers(rendered))
+        Ok(created_triggers(followed.rendering(translate_seeded)?))
     }
 
     /// The live triggers whose translation changes across `event`, from
@@ -258,16 +249,7 @@ impl TriggerFollower {
             let create = Statement::CreateTrigger(moved);
             let mut warnings = Vec::new();
             let rendered = translate_after(&create, &mut |warning| warnings.push(warning))?;
-            let last = match followed.rendered.take() {
-                Some(last) => last,
-                None => {
-                    translate_seeded(
-                        &Statement::CreateTrigger(followed.create.clone()),
-                        &mut |_| {},
-                    )?
-                }
-            };
-            followed.rendered = Some(rendered.clone());
+            let last = core::mem::replace(followed.rendering(translate_seeded)?, rendered.clone());
             if rendered == last {
                 continue;
             }
@@ -294,6 +276,21 @@ impl Followed {
     fn is(&self, name: &str, table: Option<&str>) -> bool {
         folded(&self.create.name) == name
             && table.is_none_or(|table| table == folded(&self.create.table_name))
+    }
+
+    /// Its last translation, a seeded one first translated with
+    /// `translate_seeded` and recorded.
+    fn rendering(
+        &mut self,
+        translate_seeded: &mut Translate<'_>,
+    ) -> Result<&mut Vec<Statement>, Error> {
+        match &mut self.rendered {
+            Some(rendered) => Ok(rendered),
+            unrendered @ None => {
+                let seeded = Statement::CreateTrigger(self.create.clone());
+                Ok(unrendered.insert(translate_seeded(&seeded, &mut |_| {})?))
+            }
+        }
     }
 }
 
