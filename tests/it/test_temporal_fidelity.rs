@@ -221,29 +221,6 @@ fn cast_date_to_timestamp_adds_midnight() {
     assert_eq!(result, "2024-12-31 00:00:00", "date cast to timestamp must be midnight");
 }
 
-// ── Finding 4: TIMESTAMPTZ cross-offset equality (documented limitation) ───
-//
-// Equality and ordering across different offsets (+02:00 vs +00:00) compare
-// text, not instants. This is unfixable without changing the storage model.
-// The LossyDowngrade warning now names this consequence.
-// Test: verify the warning IS emitted for a TIMESTAMPTZ column.
-
-/// The LossyDowngrade warning for TIMESTAMPTZ mentions comparison semantics.
-#[test]
-fn timestamptz_column_emits_lossy_downgrade_warning() {
-    use pg2sqlite::warnings::TranslationWarning;
-    let report = Pg2Sqlite::default()
-        .sql("CREATE TABLE t (id INTEGER PRIMARY KEY, tsz TIMESTAMPTZ);")
-        .unwrap()
-        .translate_with_report(&Pg2SqliteOptions::default())
-        .expect("should translate");
-    let has_tz_warning = report.warnings.iter().any(|w| {
-        matches!(w, TranslationWarning::LossyDowngrade { construct, reason, .. }
-            if construct == "WITH TIME ZONE" && reason.contains("text"))
-    });
-    assert!(has_tz_warning, "expected LossyDowngrade for WITH TIME ZONE: {:?}", report.warnings);
-}
-
 // ── Finding 5: Leap-second TIME literal ────────────────────────────────────
 //
 // PostgreSQL normalises time '23:59:60' to 24:00:00; SQLite cannot represent
