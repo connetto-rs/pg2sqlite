@@ -503,9 +503,9 @@ pub(crate) fn rebuild(
     let before = after_operations(written, alter_table, position)?;
     let pre_drop = translated_table(&before, alter_table, options)?;
     let after = after_operations(written, alter_table, position + 1)?;
-    if let Some(table) = resolve_translation_table(&after, &alter_table.name)? {
-        super::create_table::reject_all_generated_columns(table)?;
-    }
+    resolve_translation_table(&after, &alter_table.name)?
+        .map(super::create_table::reject_all_generated_columns)
+        .transpose()?;
     if !created_table(&pre_drop, &owner).is_some_and(|create| refuses_drop(create, columns)) {
         return Ok(None);
     }
