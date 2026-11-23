@@ -890,3 +890,37 @@ fn replacing_the_stamp_and_then_dropping_its_function() {
         &[SEED, "UPDATE items SET tag = 'b' WHERE id = 1;"],
     );
 }
+
+/// `schema` with `items` declared `TEMP`.
+fn temporary_schema(labels: &[&str], triggers: &str) -> String {
+    schema(labels, triggers).replace("CREATE TABLE items", "CREATE TEMP TABLE items")
+}
+
+/// A stamp firing on `INSERT OR UPDATE` of a temporary table fires on both.
+#[test]
+fn an_insert_or_update_stamp_on_a_temporary_table() {
+    assert_agree(
+        &[&temporary_schema(
+            &[],
+            "CREATE TRIGGER items_stamp BEFORE INSERT OR UPDATE ON items
+                 FOR EACH ROW EXECUTE FUNCTION stamp();",
+        )],
+        &[SEED, "UPDATE items SET tag = 'b' WHERE id = 1;"],
+    );
+}
+
+/// An audit beside a stamp on `INSERT OR UPDATE` of a temporary table sees
+/// the stamped row once on each event.
+#[test]
+fn an_insert_or_update_stamp_beside_an_audit_on_a_temporary_table() {
+    assert_agree(
+        &[&temporary_schema(
+            &["after"],
+            "CREATE TRIGGER items_stamp BEFORE INSERT OR UPDATE ON items
+                 FOR EACH ROW EXECUTE FUNCTION stamp();
+             CREATE TRIGGER items_audit AFTER INSERT OR UPDATE ON items
+                 FOR EACH ROW EXECUTE FUNCTION audit_after();",
+        )],
+        &[SEED, "UPDATE items SET tag = 'b' WHERE id = 1;"],
+    );
+}

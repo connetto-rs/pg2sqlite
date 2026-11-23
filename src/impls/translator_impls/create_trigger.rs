@@ -641,9 +641,12 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
                     body_schema(schema, options),
                 )
         {
+            // Each part names its table as written, as the trigger does.
             let mut translated = Vec::new();
-            translated.extend(non_insert_trigger.translate_with_warnings(schema, options, emit)?);
-            translated.extend(insert_trigger.translate_with_warnings(schema, options, emit)?);
+            for mut part in [non_insert_trigger, insert_trigger] {
+                part.table_name.clone_from(&self.table_name);
+                translated.extend(part.translate_with_warnings(schema, options, emit)?);
+            }
             return Ok(translated);
         }
 

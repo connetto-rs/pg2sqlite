@@ -494,3 +494,24 @@ fn a_trigger_destination_created_after_its_trigger_is_replayed() {
         [(1, 40)]
     );
 }
+
+/// A replayed stamp on `INSERT OR UPDATE` of a temporary table fires on both.
+#[test]
+fn a_replayed_insert_or_update_stamp_fires_on_both_events() {
+    let (_files, mut connection) = reopened(
+        "CREATE TEMP TABLE scratch(id INT PRIMARY KEY, value INT NOT NULL);
+         CREATE FUNCTION stamp() RETURNS trigger AS $$
+         BEGIN NEW.value := NEW.value * 10; RETURN NEW; END; $$ LANGUAGE plpgsql;
+         CREATE TRIGGER stamp BEFORE INSERT OR UPDATE ON scratch FOR EACH ROW EXECUTE FUNCTION stamp();",
+    );
+    diesel::insert_into(scratch::table)
+        .values((scratch::id.eq(1), scratch::value.eq(7)))
+        .execute(&mut connection)
+        .expect("insert");
+    assert_eq!(rows(&mut connection), [(1, 70)]);
+    diesel::update(scratch::table)
+        .set(scratch::value.eq(8))
+        .execute(&mut connection)
+        .expect("update");
+    assert_eq!(rows(&mut connection), [(1, 80)]);
+}
