@@ -105,3 +105,31 @@ fn a_returning_subquery_can_shadow_the_insert_target_alias() {
         [Some("b".to_owned())]
     );
 }
+
+#[test]
+fn a_nested_returning_subquery_keeps_the_shadowing_alias() {
+    assert_eq!(
+        run_translated_default(
+            "CREATE TABLE base (id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE other (name TEXT);
+             INSERT INTO other VALUES ('b');
+             INSERT INTO base AS x VALUES (1, 'a')
+                 RETURNING (SELECT (SELECT x.name) FROM other AS x);"
+        ),
+        [Some("b".to_owned())]
+    );
+}
+
+#[test]
+fn a_returning_subquery_rejects_an_overqualified_relation() {
+    let error = Pg2Sqlite::default()
+        .sql(
+            "CREATE TABLE base (id INTEGER PRIMARY KEY, name TEXT);
+             INSERT INTO base AS x VALUES (1, 'a')
+                 RETURNING (SELECT name FROM a.b.c.d);",
+        )
+        .expect("parse")
+        .translate_to_sql(&Pg2SqliteOptions::default())
+        .expect_err("an overqualified relation is invalid");
+    assert!(error.to_string().contains("a.b.c.d"), "{error}");
+}

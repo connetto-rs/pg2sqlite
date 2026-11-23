@@ -96,20 +96,19 @@ fn insert_target_scope_query(
     insert: &Insert,
     schema: &ParserDB,
 ) -> Result<Option<Query>, crate::errors::Error> {
-    let TableObject::TableName(name) = &insert.table else {
-        return Ok(None);
-    };
-    if last_ident(name).is_none() || resolve_translation_table(schema, name)?.is_none() {
-        return Ok(None);
+    if let TableObject::TableName(name) = &insert.table
+        && last_ident(name).is_some()
+        && resolve_translation_table(schema, name)?.is_some()
+    {
+        let relation = crate::impls::query_builder::aliased_table_factor(
+            name.clone(),
+            insert.table_alias.as_ref().map(|alias| alias.alias.clone()),
+        );
+        return Ok(Some(crate::impls::shared_helpers::relations_scope_query(vec![
+            TableWithJoins { relation, joins: vec![] },
+        ])));
     }
-    let relation = crate::impls::query_builder::aliased_table_factor(
-        name.clone(),
-        insert.table_alias.as_ref().map(|alias| alias.alias.clone()),
-    );
-    Ok(Some(crate::impls::shared_helpers::relations_scope_query(vec![TableWithJoins {
-        relation,
-        joins: vec![],
-    }])))
+    Ok(None)
 }
 
 struct ReturningAliasReferences<'schema> {
@@ -224,10 +223,10 @@ impl crate::traits::translator::TranslatorWithContext for Insert {
         // and a query inside the statement attaches its own scope over this
         // one, so an outer reference still resolves.
         let target_query = insert_target_scope_query(self, schema)?;
-        let target_scope = target_query
-            .as_ref()
-            .map(|query| crate::options::query_column_scope(query, schema))
-            .transpose()?;
+        let target_scope = match target_query.as_ref() {
+            Some(query) => Some(crate::options::query_column_scope(query, schema)?),
+            None => None,
+        };
         let scoped = target_scope.as_ref().map(|scope| options.with_scope(scope));
         let options = scoped.as_ref().unwrap_or(options);
         reject_explicit_identity_values(self, schema)?;
@@ -247,12 +246,11 @@ impl crate::traits::translator::TranslatorWithContext for Insert {
         refuse_returning_alias_subqueries(self, schema)?;
         let returning = crate::impls::returning_rows::ReturningRows::insert(self)
             .translate::<Forward>(self.returning.as_deref(), schema, options, emit)?;
-        let target_relation = target_query.as_ref().and_then(|query| {
-            match query.body.as_ref() {
-                SetExpr::Select(select) => select.from.first().map(|target| &target.relation),
-                _ => None,
-            }
-        });
+        let target_relation = target_query
+            .as_ref()
+            .and_then(|query| query.body.as_select())
+            .and_then(|select| select.from.first())
+            .map(|target| &target.relation);
         let returning = crate::impls::returning_scope::scope_returning_to_target(
             returning,
             target_relation,
