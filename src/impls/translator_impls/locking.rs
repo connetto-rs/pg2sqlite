@@ -247,7 +247,8 @@ pub(crate) fn locked_factor(
             || last_ident(name).cloned().unwrap_or_else(|| Ident::new(table.table_name()));
         return Ok(Some(match alias {
             Some(alias) if !alias.columns.is_empty() => {
-                renamed_relation_factor(name, alias, derived(rows, own_name()), schema)?
+                let written = options.written_schema().unwrap_or(schema);
+                renamed_relation_factor(name, alias, derived(rows, own_name()), written)?
             }
             Some(alias) => derived(rows, alias.name.clone()),
             None => derived(rows, own_name()),
