@@ -7,7 +7,7 @@ use sql_traits::{
 };
 use sqlparser::ast::{
     AssignmentTarget, DataType, Expr, Ident, Insert, ObjectName, Query, SelectItem, SetExpr,
-    TableAlias, TableFactor, TableObject, TableWithJoins,
+    TableObject, TableWithJoins,
 };
 
 use super::helpers::Forward;
@@ -362,15 +362,14 @@ fn conflict_update_scope_query(insert: &Insert) -> Query {
     let TableObject::TableName(name) = &insert.table else {
         return crate::impls::shared_helpers::relations_scope_query(Vec::new());
     };
-    let alias = |name| TableAlias { explicit: true, name, columns: Vec::new(), at: None };
-    let mut target = crate::impls::query_builder::plain_table_factor(name.clone());
-    let mut excluded = crate::impls::query_builder::plain_table_factor(name.clone());
-    if let TableFactor::Table { alias: written, .. } = &mut target {
-        *written = insert.table_alias.as_ref().map(|table_alias| alias(table_alias.alias.clone()));
-    }
-    if let TableFactor::Table { alias: written, .. } = &mut excluded {
-        *written = Some(alias(Ident::new("excluded")));
-    }
+    let target = crate::impls::query_builder::aliased_table_factor(
+        name.clone(),
+        insert.table_alias.as_ref().map(|table_alias| table_alias.alias.clone()),
+    );
+    let excluded = crate::impls::query_builder::aliased_table_factor(
+        name.clone(),
+        Some(Ident::new("excluded")),
+    );
     crate::impls::shared_helpers::relations_scope_query(
         [target, excluded]
             .into_iter()
@@ -413,8 +412,6 @@ fn translate_on_insert(
             }));
         }
         sqlparser::ast::OnConflictAction::DoUpdate(do_update) => {
-            let resolved =
-                sqlparser::ast::OnConflict { conflict_target, action: on_conflict.action.clone() };
             let scope_query = conflict_update_scope_query(insert);
             let scope = crate::options::query_column_scope(&scope_query, schema)?;
             let scoped = options.with_scope(&scope);
@@ -429,9 +426,14 @@ fn translate_on_insert(
                 emit,
             )?;
             let do_update = substituted.as_ref().unwrap_or(do_update);
-            insert.on = Some(translate_on_conflict_do_update::<Forward>(
-                &resolved, do_update, schema, options, rewrites, emit,
-            )?);
+            insert.on = Some(sqlparser::ast::OnInsert::OnConflict(sqlparser::ast::OnConflict {
+                conflict_target,
+                action: sqlparser::ast::OnConflictAction::DoUpdate(
+                    translate_on_conflict_do_update::<Forward>(
+                        do_update, schema, options, rewrites, emit,
+                    )?,
+                ),
+            }));
         }
     }
     Ok(())
