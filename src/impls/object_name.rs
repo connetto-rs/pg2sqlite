@@ -5,7 +5,7 @@ use core::ops::ControlFlow;
 use sql_traits::{
     errors::LookupError,
     structs::{IdentifierCase, ParserDB, TargetName},
-    traits::{ColumnLike, DatabaseLike, TableLike, ViewLike},
+    traits::{ColumnLike, DatabaseLike, IndexLike, TableLike, ViewLike},
     utils::identifier_resolution::{identifiers_match, is_temporary_schema},
 };
 use sqlparser::ast::{
@@ -267,6 +267,16 @@ fn normalize_relation_name_for_sqlite(
                     &identifier.value,
                     identifier.quote_style.is_some(),
                 )
+        }) || schema.indexes().any(|index| {
+            index.table().is_temporary()
+                && index.name().is_some_and(|name| {
+                    identifiers_match(
+                        name,
+                        index.name_is_quoted(),
+                        &identifier.value,
+                        identifier.quote_style.is_some(),
+                    )
+                })
         }))
     {
         return Ok(ObjectName(vec![

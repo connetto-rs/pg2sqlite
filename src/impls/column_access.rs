@@ -54,7 +54,7 @@ const NAMED_FUNCTIONS: [&str; 6] =
 /// own.
 ///
 /// A missing write privilege on a column the replica holds is left to the
-/// write guards, which a deployment's write exemption can lift.
+/// write guards, which a deployment's RLS exemption can lift.
 ///
 /// # Errors
 ///

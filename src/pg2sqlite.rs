@@ -456,6 +456,15 @@ impl ColumnChange {
 }
 
 impl PreparedEpoch {
+    /// Every schema the epoch holds.
+    fn schemas(&self) -> impl Iterator<Item = &ParserDB> {
+        core::iter::once(&self.schema)
+            .chain(self.bindings.iter().map(|change| &change.before))
+            .chain(self.before_index_drops.iter().map(|(_, schema)| schema))
+            .chain(self.trigger_positions.iter().map(|(_, schema)| schema))
+            .chain(self.events.iter().flat_map(|event| [&event.before, &event.after]))
+    }
+
     /// The schema a column reference in statement `index` binds against.
     fn binding(&self, index: usize) -> &ParserDB {
         self.bindings
@@ -590,7 +599,8 @@ impl Trackers {
             attachments: &self.attachments,
             in_transaction: at.in_transaction,
         });
-        let written = written.with_declaration(Declaration::Statement(statement));
+        let written =
+            written.with_declaration(Declaration::Statement { statement, schema: at.binding });
         let ambiguous = column_access::resolve_columns(statement, at.binding, &written)?;
         column_access::with_ambiguity(
             ambiguous,
@@ -1346,14 +1356,22 @@ impl Pg2Sqlite {
             initial_schema.iter().chain(epochs.iter().map(|epoch| &epoch.schema)),
             context,
         )?;
-        let (mut translated, rebuilt_triggers, warnings) = Self::translate_units(
+        context.batch_cache().borrow_mut().keep_for(
+            initial_schema
+                .iter()
+                .chain(schema.as_ref().ok())
+                .chain(epochs.iter().flat_map(PreparedEpoch::schemas)),
+        );
+        let units = Self::translate_units(
             statements,
             &epochs,
             &dispositions,
             (initial_schema.as_ref(), schema.as_ref().ok()),
             context,
             should_translate,
-        )?;
+        );
+        context.batch_cache().borrow_mut().forget();
+        let (mut translated, rebuilt_triggers, warnings) = units?;
         let held_views = crate::impls::translator_impls::held_views::hold_forward_views(
             statements,
             &mut translated,
@@ -1520,12 +1538,18 @@ impl Pg2Sqlite {
             epochs,
             dispositions,
         } = Self::translate_prepared(prepared, &mut context, |_| true)?;
-        warnings.extend(crate::impls::derived_writes::reads_left_to_server(
+        context
+            .batch_cache()
+            .borrow_mut()
+            .keep_for(core::iter::once(&schema).chain(initial_schema));
+        let left_to_server = crate::impls::derived_writes::reads_left_to_server(
             &schema,
             initial_schema,
             &sources,
             &context,
-        )?);
+        );
+        context.batch_cache().borrow_mut().forget();
+        warnings.extend(left_to_server?);
         let mut placed =
             crate::history::placement::place(&sources, &mut statements, &schema, options)?;
         let units: Vec<crate::history::Unit<'_>> = epochs

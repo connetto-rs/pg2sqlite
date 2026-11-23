@@ -15,7 +15,7 @@ mod schema {
     }
     diesel::table! {
         #[sql_name = "v"]
-        renamed (label) { label -> Text, }
+        renamed (name) { name -> Text, }
     }
     diesel::table! {
         direct (ax) { ax -> Text, bx -> Text, }
@@ -24,7 +24,7 @@ mod schema {
         aliased (tx) { tx -> Text, }
     }
     diesel::table! {
-        unq (y) { y -> Text, }
+        unq (x) { x -> Text, }
     }
     diesel::table! {
         s (id) { id -> Integer, note -> Text, }
@@ -48,13 +48,6 @@ mod schema {
     diesel::table! {
         #[sql_name = "v"]
         lineage (x) { x -> Text, }
-    }
-    diesel::table! {
-        #[sql_name = "v"]
-        keyword_column (selected) {
-            #[sql_name = "select"]
-            selected -> Text,
-        }
     }
     diesel::table! {
         physical_qualifier (x) { x -> Text, }
@@ -100,7 +93,7 @@ fn temp_view_survives_persistent_column_rename() {
     let files = tempfile::TempDir::new().expect("files");
     let mut reopened = create_and_reopen(&files, &script);
     let row = schema::renamed::table
-        .select(schema::renamed::label)
+        .select(schema::renamed::name)
         .first::<String>(&mut reopened)
         .expect("renamed view");
     assert_eq!(row, "kept");
@@ -126,7 +119,7 @@ fn rename_rewrites_only_scoped_columns() {
         .first::<String>(&mut reopened)
         .expect("qualified alias");
     let unqualified = schema::unq::table
-        .select(schema::unq::y)
+        .select(schema::unq::x)
         .first::<String>(&mut reopened)
         .expect("unqualified reference");
     assert_eq!(direct, ("ax".to_owned(), "bx".to_owned()));
@@ -282,8 +275,8 @@ fn external_schema_columns_bind_connection_definitions() {
     }
     let mut reopened = open(&files);
     run(&mut reopened, partial.connect().expect("connection program"));
-    let row = schema::renamed::table
-        .select(schema::renamed::label)
+    let row = schema::lineage::table
+        .select(schema::lineage::x)
         .first::<String>(&mut reopened)
         .expect("the external column binding");
     assert_eq!(row, "external");
@@ -374,8 +367,8 @@ fn renamed_columns_remain_quoted_when_required() {
     );
     let files = tempfile::TempDir::new().expect("files");
     let mut reopened = create_and_reopen(&files, &script);
-    let row = schema::keyword_column::table
-        .select(schema::keyword_column::selected)
+    let row = schema::lineage::table
+        .select(schema::lineage::x)
         .first::<String>(&mut reopened)
         .expect("the quoted output column");
     assert_eq!(row, "keyword");

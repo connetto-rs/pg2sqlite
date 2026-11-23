@@ -24,11 +24,18 @@
 //! Do not add a fourth mechanism. There are three outcomes, plus that closed
 //! list.
 
+use sql_traits::{
+    structs::{IdentifierCase, ParserDB},
+    traits::DatabaseLike,
+};
 use sqlparser::ast::{CreateIndex, CreatePolicy, Statement};
 
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
-use crate::{impls::object_name::last_ident_value_or_display, script::Script};
+use crate::{
+    history::placement::primary_write_target, impls::object_name::last_ident_value_or_display,
+    script::Script, traits::schema::lookup_target,
+};
 
 /// A warning emitted during translation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,8 +200,8 @@ pub enum DowngradeLocation {
     /// An expression translated into one that reads its operand differently.
     Expression {
         /// The declared object whose statement holds the expression, a
-        /// function body counting as its caller's, `None` for a query or a
-        /// write.
+        /// function body counting as its caller's, the table or view a write
+        /// changes, `None` for a query.
         object: Option<DeclaredObject>,
         /// The expression as written.
         text: String,
@@ -241,9 +248,10 @@ pub enum DeclaredObject {
 }
 
 impl DeclaredObject {
-    /// The object `statement` declares or alters, `None` for a statement
-    /// that names none.
-    pub(crate) fn of_statement(statement: &Statement) -> Option<Self> {
+    /// The object `statement` declares or alters, or the table or view it
+    /// writes as `schema` resolves the name, `schema` being the one the
+    /// statement was written against. `None` for a statement that names none.
+    pub(crate) fn of_statement(statement: &Statement, schema: &ParserDB) -> Option<Self> {
         match statement {
             Statement::CreateTable(create_table) => {
                 Some(Self::Table { name: last_ident_value_or_display(&create_table.name) })
@@ -266,8 +274,21 @@ impl DeclaredObject {
                     name: last_ident_value_or_display(&create_trigger.name),
                 })
             }
-            _ => None,
+            _ => Self::written(statement, schema),
         }
+    }
+
+    /// The table or view `statement` writes, a name `schema` holds no view
+    /// under counting as a table.
+    fn written(statement: &Statement, schema: &ParserDB) -> Option<Self> {
+        let target = primary_write_target(statement)?;
+        let name = last_ident_value_or_display(target);
+        let view = lookup_target(target).is_some_and(|target| {
+            schema
+                .resolve_target_view(target, IdentifierCase::AsWritten)
+                .is_ok_and(|view| view.is_some())
+        });
+        Some(if view { Self::View { name } } else { Self::Table { name } })
     }
 
     /// `policy`, by its table and name.

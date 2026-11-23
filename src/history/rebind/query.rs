@@ -2,16 +2,19 @@
 
 use sql_traits::{
     errors::LookupError,
-    structs::{ColumnBinding, ColumnDefinition, ColumnScope, IdentifierCase, ParserDB},
+    structs::{
+        ColumnBinding, ColumnDefinition, ColumnQueryScope, ColumnScope, IdentifierCase, ParserDB,
+        QueryOutput,
+    },
     traits::{ColumnLike, TableLike},
 };
 use sqlparser::{
-    ast::{Expr, Ident, InTarget, ObjectName, Query, Select, SelectItem, SetExpr, TableFactor},
+    ast::{Expr, Ident, InTarget, Query, Select, SelectItem, SetExpr, TableFactor},
     tokenizer::Span,
 };
 
 use super::{
-    Header, Names, Planner,
+    Header, Planner,
     edits::{last_span, quoted},
     scope::last,
 };
@@ -55,7 +58,7 @@ impl Planner<'_> {
                 self.query(scope, &cte.query, Header::Keep)?;
             }
         }
-        self.set_expr(scope, &query.body, header)?;
+        self.set_expr(scope, &query.body, header, scope.scope_for_query(query).as_ref())?;
         if let Some(order_by) = &query.order_by
             && let sqlparser::ast::OrderByKind::Expressions(keys) = &order_by.kind
             && let Some(outputs) = scope.scope_for_query(query)
@@ -111,19 +114,22 @@ impl Planner<'_> {
         })
     }
 
+    /// Plans `body`, `outputs` being the outputs of the query it leads, which
+    /// its leading select names.
     #[cfg_attr(feature = "std", recursive::recursive)]
     pub(super) fn set_expr(
         &mut self,
         scope: &ColumnScope<'_, '_, ParserDB>,
         body: &SetExpr,
         header: Header,
+        outputs: Option<&ColumnQueryScope<'_, '_, '_, ParserDB>>,
     ) -> Result<(), ConnectionError> {
         match body {
-            SetExpr::Select(select) => self.select(scope, select, header),
+            SetExpr::Select(select) => self.select(scope, select, header, outputs),
             SetExpr::Query(query) => self.query(scope, query, header),
             SetExpr::SetOperation { left, right, .. } => {
-                self.set_expr(scope, left, header)?;
-                self.set_expr(scope, right, Header::Follow)
+                self.set_expr(scope, left, header, outputs)?;
+                self.set_expr(scope, right, Header::Follow, None)
             }
             SetExpr::Insert(statement)
             | SetExpr::Update(statement)
@@ -137,11 +143,12 @@ impl Planner<'_> {
         scope: &ColumnScope<'_, '_, ParserDB>,
         select: &Select,
         header: Header,
+        outputs: Option<&ColumnQueryScope<'_, '_, '_, ParserDB>>,
     ) -> Result<(), ConnectionError> {
         let Some(inner) = scope.scope_for_select(select) else { return Ok(()) };
         let listed = self.list_from(select)?;
         self.frames.push(listed);
-        let result = self.select_clauses(scope, &inner, select, header);
+        let result = self.select_clauses(scope, &inner, select, header, outputs);
         self.frames.pop();
         result
     }
@@ -152,9 +159,10 @@ impl Planner<'_> {
         inner: &sql_traits::structs::ColumnDefinitionScope<'_, '_, '_, ParserDB>,
         select: &Select,
         header: Header,
+        outputs: Option<&ColumnQueryScope<'_, '_, '_, ParserDB>>,
     ) -> Result<(), ConnectionError> {
         let resolve = |reference: &Expr| inner.resolve_column_binding(reference);
-        for item in &select.projection {
+        for (position, item) in select.projection.iter().enumerate() {
             match item {
                 SelectItem::UnnamedExpr(expr) => {
                     let renamed = self.expr(scope, &resolve, expr)?;
@@ -181,13 +189,17 @@ impl Planner<'_> {
                         let replay_name = entry.replay_name.clone();
                         self.edits.rename(ident.span, replay_name);
                     }
-                    if header == Header::Keep {
-                        self.expand(select, Some(name), options.wildcard_token.0.span);
+                    if header == Header::Keep
+                        && let Some(outputs) = outputs
+                    {
+                        self.expand(outputs, position, options.wildcard_token.0.span);
                     }
                 }
                 SelectItem::Wildcard(options) => {
-                    if header == Header::Keep {
-                        self.expand(select, None, options.wildcard_token.0.span);
+                    if header == Header::Keep
+                        && let Some(outputs) = outputs
+                    {
+                        self.expand(outputs, position, options.wildcard_token.0.span);
                     }
                 }
                 SelectItem::QualifiedWildcard(..) => {}
@@ -309,16 +321,7 @@ impl Planner<'_> {
         let replay_name = entry.replay_name.clone();
         let rename_qualifier =
             !entry.aliased && parts.len() >= 2 && replay_name != parts[parts.len() - 2].value;
-        let follows = match &entry.view {
-            Some(following) => {
-                binding
-                    .exposed()
-                    .is_some_and(|(exposed, _)| following.contains(&exposed.to_ascii_lowercase()))
-            }
-            None => true,
-        };
-        let keeps_columns = !follows || table.is_temporary();
-        let through_view = entry.view.is_some();
+        let keeps_columns = entry.view || table.is_temporary();
         if rename_qualifier {
             self.edits.rename(parts[parts.len() - 2].span, replay_name.clone());
         }
@@ -330,7 +333,7 @@ impl Planner<'_> {
         }
         let Some(written) = parts.last() else { return Ok(None) };
         let current = self.current_column_name(table, column)?;
-        if parts.len() == 1 && !through_view {
+        if parts.len() == 1 {
             self.edits.qualify(written.span, quoted(&replay_name, Span::empty()));
         }
         if current == column.column_name() {
@@ -340,99 +343,77 @@ impl Planner<'_> {
         Ok(Some(column.column_name().to_owned()))
     }
 
-    /// Spells out a wildcard whose columns a replay would name differently,
-    /// so a table created from the query keeps its column names, `wildcard`
-    /// being the span of its `*`. A wildcard over a relation without
-    /// enumerable columns, or over an outer join that merges columns, is left
-    /// as written, and so is a qualified one under SQLite.
+    /// Spells out the wildcard at `position` of the leading select list of
+    /// the query `outputs` lists when a replay would name its columns
+    /// differently, so a view or a table created from the query keeps its
+    /// column names, `wildcard` being the span of its `*`. A wildcard whose
+    /// columns cannot be listed, or one reaching a renamed column a join
+    /// merged, is left as written.
     pub(super) fn expand(
         &mut self,
-        select: &Select,
-        qualifier: Option<&ObjectName>,
+        outputs: &ColumnQueryScope<'_, '_, '_, ParserDB>,
+        position: usize,
         wildcard: Span,
     ) {
-        let Some(frame) = self.frames.last() else { return };
         let mut items = Vec::new();
         let mut renamed = false;
-        let mut seen: Vec<String> = Vec::new();
-        let wanted = qualifier.and_then(last).map(|ident| ident.value.to_ascii_lowercase());
-        let mut index = 0;
-        for table in &select.from {
-            let mut shared_columns = vec![Vec::new()];
-            for join in &table.joins {
-                match merge(&join.join_operator) {
-                    Some(Merge::None) => shared_columns.push(Vec::new()),
-                    Some(Merge::Using(columns)) => shared_columns.push(columns),
-                    Some(Merge::Natural) => shared_columns.push(vec![String::from("*")]),
-                    None => return,
-                }
-            }
-            for shared in shared_columns {
-                let Some(entry) = frame.get(index) else { return };
-                index += 1;
-                let Some(columns) = &entry.columns else { return };
-                if wanted.as_ref().is_some_and(|wanted| *wanted != entry.qualifier) {
-                    continue;
-                }
-                let natural = shared.first().is_some_and(|name| name == "*");
-                for (written, current) in columns {
-                    let key = written.to_ascii_lowercase();
-                    let merged = wanted.is_none()
-                        && (shared.contains(&key) || (natural && seen.contains(&key)));
-                    if merged {
-                        continue;
+        for output in outputs.outputs() {
+            let (name, binding) = match output {
+                QueryOutput::Column { name, item, wildcard, .. } if item == position => {
+                    match (name, wildcard) {
+                        (Some(name), Some(binding)) => (name, binding),
+                        _ => return,
                     }
-                    seen.push(key);
-                    renamed |= current != written;
-                    items.push(SelectItem::ExprWithAlias {
-                        expr: Expr::CompoundIdentifier(vec![
-                            quoted(&entry.replay_name, Span::empty()),
-                            quoted(current, Span::empty()),
-                        ]),
-                        alias: quoted(written, Span::empty()),
-                    });
                 }
-            }
+                QueryOutput::Unexpanded { item } if item.is_none_or(|item| item == position) => {
+                    return;
+                }
+                QueryOutput::Column { .. } | QueryOutput::Unexpanded { .. } => continue,
+            };
+            let Some((exposed, _)) = binding.exposed() else { return };
+            let expr = match (binding.relation(), binding.merge()) {
+                (Some((relation, _)), None) => {
+                    let Some(entry) = self.listed(relation) else { return };
+                    let current = if entry.lexical {
+                        exposed
+                    } else {
+                        let Some(current) = entry.columns.as_ref().and_then(|columns| {
+                            columns
+                                .iter()
+                                .find(|(written, _)| written.eq_ignore_ascii_case(exposed))
+                                .map(|(_, current)| current.as_str())
+                        }) else {
+                            return;
+                        };
+                        current
+                    };
+                    renamed |= current != exposed;
+                    Expr::CompoundIdentifier(vec![
+                        quoted(&entry.replay_name, Span::empty()),
+                        quoted(current, Span::empty()),
+                    ])
+                }
+                (None, Some(_)) if !self.renames_column(exposed) => {
+                    Expr::Identifier(quoted(exposed, Span::empty()))
+                }
+                _ => return,
+            };
+            items.push(SelectItem::ExprWithAlias { expr, alias: quoted(name.0, Span::empty()) });
         }
-        if renamed && (qualifier.is_none() || self.names == Names::Postgres) {
+        if renamed {
             self.edits.expansions.insert(wildcard, items);
         }
     }
-}
 
-/// How a join combines its two sides' columns.
-enum Merge {
-    None,
-    Using(Vec<String>),
-    Natural,
-}
-
-/// The column merge an inner join performs, or `None` for a join whose
-/// merged columns a wildcard expansion cannot spell out.
-fn merge(operator: &sqlparser::ast::JoinOperator) -> Option<Merge> {
-    use sqlparser::ast::{JoinConstraint, JoinOperator};
-    let (inner, constraint) = match operator {
-        JoinOperator::Join(constraint) | JoinOperator::Inner(constraint) => (true, constraint),
-        JoinOperator::Left(constraint)
-        | JoinOperator::LeftOuter(constraint)
-        | JoinOperator::Right(constraint)
-        | JoinOperator::RightOuter(constraint)
-        | JoinOperator::FullOuter(constraint) => (false, constraint),
-        JoinOperator::CrossJoin(_) => return Some(Merge::None),
-        _ => return None,
-    };
-    match constraint {
-        JoinConstraint::On(_) | JoinConstraint::None => Some(Merge::None),
-        JoinConstraint::Using(columns) if inner => {
-            Some(Merge::Using(
-                columns
-                    .iter()
-                    .filter_map(|column| last(column).map(|ident| ident.value.to_ascii_lowercase()))
-                    .collect(),
-            ))
-        }
-        JoinConstraint::Natural if inner => Some(Merge::Natural),
-        _ => None,
+    /// Whether a stored relation the innermost select lists renames a column
+    /// named `exposed`.
+    fn renames_column(&self, exposed: &str) -> bool {
+        self.frames
+            .last()
+            .into_iter()
+            .flatten()
+            .flat_map(|entry| entry.columns.iter().flatten())
+            .any(|(written, current)| written.eq_ignore_ascii_case(exposed) && written != current)
     }
 }
 

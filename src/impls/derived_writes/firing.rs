@@ -24,9 +24,10 @@ use super::{
     chain::{Chain, Step, Walker},
     chain_phrase,
     columns::Columns,
-    function_writes, is_per_row,
+    is_per_row,
     landing::Landing,
     rows::Held,
+    writes_of,
 };
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
@@ -138,11 +139,10 @@ impl FiringTrigger {
     /// Every write the trigger's function runs, none when the schema does not
     /// hold that function.
     pub(super) fn writes(&self, landing: Landing<'_>) -> Result<Vec<DerivedWrite>, Error> {
-        let mut writes = Vec::new();
-        if let Some(function) = written_function(landing.schema, &self.function)? {
-            function_writes(function, landing, &mut Vec::new(), &mut Vec::new(), &mut writes)?;
+        match written_function(landing.schema, &self.function)? {
+            Some(function) => writes_of(function, landing, &[]),
+            None => Ok(Vec::new()),
         }
-        Ok(writes)
     }
 
     /// Whether the trigger's function assigns `NEW`, changing columns of the

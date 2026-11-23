@@ -12,19 +12,20 @@ use sql_traits::{
 use super::{DerivedWrite, Fresh, firing::FiringTrigger, rows::Rows};
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
-use crate::{errors::Error, options::TranslationContext};
+use crate::{errors::Error, impls::batch_cache::BatchCache, options::TranslationContext};
 
-/// The schema writes run against and the triggers it fires once the
-/// translation unit has run.
+/// The schema writes run against, the triggers it fires once the translation
+/// unit has run, and the batch's cache keeping the writes functions run.
 #[derive(Clone, Copy)]
 pub(super) struct Landing<'s> {
     pub(super) schema: &'s ParserDB,
     triggers: &'s [FiringTrigger],
+    pub(super) cache: &'s core::cell::RefCell<BatchCache>,
 }
 
 impl<'s> Landing<'s> {
     pub(super) fn new(schema: &'s ParserDB, options: &'s TranslationContext<'_>) -> Self {
-        Self { schema, triggers: options.firing_triggers() }
+        Self { schema, triggers: options.firing_triggers(), cache: options.batch_cache() }
     }
 
     /// `write` on the relation it lands on, through every automatically

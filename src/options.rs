@@ -115,8 +115,9 @@ pub struct Pg2SqliteOptions {
     deployment: Option<Deployment>,
     /// The name of the audit table for RLS validation monitoring.
     rls_audit_table_name: Option<String>,
-    /// The caller-registered function that exempts generated write guards.
-    write_exemption_function: Option<String>,
+    /// The caller-registered function that lifts row-level security and the
+    /// generated write guards.
+    rls_exemption_function: Option<String>,
     /// Whether to enable strict RLS validation (abort on violations).
     strict_rls_validation: bool,
     /// Whether a write denied by a policy `USING` clause raises instead of
@@ -165,7 +166,7 @@ impl<'a> arbitrary::Arbitrary<'a> for Pg2SqliteOptions {
             session_variables: Vec::<SessionVariableMapping>::arbitrary(u)?,
             deployment: None,
             rls_audit_table_name: Option::<String>::arbitrary(u)?,
-            write_exemption_function: Option::<String>::arbitrary(u)?,
+            rls_exemption_function: Option::<String>::arbitrary(u)?,
             strict_rls_validation: bool::arbitrary(u)?,
             strict_rls_write_deny: bool::arbitrary(u)?,
             sqlitegis_enabled: bool::arbitrary(u)?,
@@ -198,7 +199,7 @@ impl Default for Pg2SqliteOptions {
             session_variables: Vec::new(),
             deployment: None,
             rls_audit_table_name: None,
-            write_exemption_function: None,
+            rls_exemption_function: None,
             strict_rls_validation: false,
             strict_rls_write_deny: false,
             sqlitegis_enabled: false,
@@ -260,6 +261,9 @@ pub(crate) struct PrewalkCatalogs {
     helper_sets: core::cell::RefCell<
         alloc::collections::BTreeMap<crate::impls::cursor_budget::HelperSetKey, Vec<String>>,
     >,
+    /// What the batch's translation works out once, kept for the schemas it
+    /// holds alive, boxed so every context stays as small.
+    batch_cache: Box<core::cell::RefCell<crate::impls::batch_cache::BatchCache>>,
 }
 
 /// A trigger on a table or a view.
@@ -378,26 +382,35 @@ pub struct TranslationContext<'a> {
     /// Whether the query about to be translated sits in a locked `FROM` item,
     /// which locks every item of its own `FROM`.
     locks_whole_query: bool,
-    /// The declaration whose expressions a warning names, `None` for a query
-    /// or a write.
+    /// The declaration whose expressions a warning names, `None` for a query.
     declaration: Option<Declaration<'a>>,
 }
 
 /// A declaration whose expressions a translation reads.
 #[derive(Clone, Copy)]
 pub(crate) enum Declaration<'a> {
-    /// A statement, which names an object when it declares or alters one.
-    Statement(&'a sqlparser::ast::Statement),
+    /// A statement, which names an object when it declares or alters one or
+    /// writes a table or view, and the schema it was written against, which
+    /// tells a written view from a table.
+    Statement {
+        /// The statement.
+        statement: &'a sqlparser::ast::Statement,
+        /// The schema it was written against.
+        schema: &'a ParserDB,
+    },
     /// A row level security policy, whose expressions are translated under
     /// whichever statement builds its table's view and triggers.
     Policy(&'a sqlparser::ast::CreatePolicy),
 }
 
 impl Declaration<'_> {
-    /// The object it declares, `None` for a statement that declares none.
+    /// The object it declares or writes, `None` for a statement that names
+    /// none.
     fn object(self) -> Option<DeclaredObject> {
         match self {
-            Self::Statement(statement) => DeclaredObject::of_statement(statement),
+            Self::Statement { statement, schema } => {
+                DeclaredObject::of_statement(statement, schema)
+            }
             Self::Policy(policy) => Some(DeclaredObject::of_policy(policy)),
         }
     }
@@ -653,8 +666,8 @@ impl<'a> TranslationContext<'a> {
         fields.into_context(self.scope, self.outer)
     }
 
-    /// The object whose expressions are being translated, `None` for a query
-    /// or a write.
+    /// The object whose expressions are being translated or the table or
+    /// view written, `None` for a query.
     pub(crate) fn declared_object(&self) -> Option<DeclaredObject> {
         self.declaration.and_then(Declaration::object)
     }
@@ -734,6 +747,41 @@ impl<'a> TranslationContext<'a> {
     /// call.
     pub(crate) const fn inlined_body(&self) -> Option<&InlinedBody<'_>> {
         self.inlined_body
+    }
+
+    /// The context the set a helper call returns translates under. A function
+    /// body sees none of the query calling it, so its scope, `WITH` clause,
+    /// variables, trigger rows, trigger catalog, row locks and declaration
+    /// stay out, and the set reads the schema as it stands. Boxed so the
+    /// recursion through a helper's set holds no copy of it.
+    pub(crate) fn helper_body(&self) -> Box<TranslationContext<'_>> {
+        Box::new(TranslationContext {
+            options: Cow::Borrowed(self.options.as_ref()),
+            catalogs: Cow::Borrowed(self.catalogs.as_ref()),
+            scope: None,
+            outer: None,
+            with: None,
+            variables: &[],
+            schema_is_complete: self.schema_is_complete,
+            subqueries_allowed: self.subqueries_allowed,
+            written_schema: None,
+            history: None,
+            running_as: self.running_as,
+            inlined_body: self.inlined_body,
+            trigger_rows: None,
+            trigger_catalog: None,
+            locked: &[],
+            locks_whole_query: false,
+            declaration: None,
+        })
+    }
+
+    /// What the batch's translation worked out so far, kept for the schemas
+    /// it holds alive.
+    pub(crate) fn batch_cache(
+        &self,
+    ) -> &core::cell::RefCell<crate::impls::batch_cache::BatchCache> {
+        &self.catalogs.batch_cache
     }
 
     /// The same context translating a row trigger whose table and events
@@ -1051,12 +1099,14 @@ impl<'a> TranslationContext<'a> {
     }
 
     /// Records the triggers the schema holds once the translation unit has
-    /// run.
+    /// run, forgetting the writes kept for the triggers recorded before.
     pub(crate) fn set_firing_triggers(
         &mut self,
         triggers: Vec<crate::impls::derived_writes::FiringTrigger>,
     ) {
-        self.catalogs.to_mut().firing_triggers = triggers;
+        let catalogs = self.catalogs.to_mut();
+        catalogs.firing_triggers = triggers;
+        catalogs.batch_cache.get_mut().function_writes.clear();
     }
 
     /// The triggers the schema holds once the translation unit has run.
@@ -1575,18 +1625,23 @@ impl Pg2SqliteOptions {
     }
 
     #[must_use]
-    /// Sets the boolean function that exempts generated write guards.
+    /// Sets the boolean function marking a statement as the table owner's.
     ///
-    /// Constraint triggers skip an exempt write too, deferred ones included.
-    pub fn with_write_exemption_function(mut self, name: impl Into<String>) -> Self {
-        self.write_exemption_function = Some(name.into());
+    /// While it answers true, row-level security binds neither the
+    /// statement's writes nor its reads, as it binds neither for PostgreSQL's
+    /// table owner. The generated write guards and grant gates let the write
+    /// through, and a row-secured view shows every row of its backing table,
+    /// still projecting only the columns the acting role may read. Constraint
+    /// triggers skip an exempt write too, deferred ones included.
+    pub fn with_rls_exemption_function(mut self, name: impl Into<String>) -> Self {
+        self.rls_exemption_function = Some(name.into());
         self
     }
 
     #[must_use]
-    /// Returns the configured write exemption function name.
-    pub fn get_write_exemption_function(&self) -> Option<&str> {
-        self.write_exemption_function.as_deref()
+    /// Returns the configured RLS exemption function name.
+    pub fn get_rls_exemption_function(&self) -> Option<&str> {
+        self.rls_exemption_function.as_deref()
     }
 
     #[must_use]

@@ -79,7 +79,7 @@ fn options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_deployment(helpers::deployment::deployment(["app"], []))
         .with_rls_audit_table_name("rls_audit")
-        .with_write_exemption_function("key_write_exempt")
+        .with_rls_exemption_function("key_write_exempt")
         .with_acting_role("app")
 }
 

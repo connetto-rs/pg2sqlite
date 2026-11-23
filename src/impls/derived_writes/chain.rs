@@ -24,6 +24,7 @@ use super::{
     landing::Landing,
     parsed_body,
     rows::{self, Rows},
+    writes_of,
 };
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
@@ -549,7 +550,7 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
     /// writes: a read of `FOUND` after a write depends on it, the helpers it
     /// calls run before it, and it reads the relations it names.
     fn around<N: Visit>(&mut self, node: &N) -> Result<(), Error> {
-        let mut names = self.names();
+        let names = self.names();
         if self.functions.len() == 1 {
             record_reads(node, &mut self.chain.old, &mut self.chain.new);
         }
@@ -569,8 +570,7 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
                 self.function(helper)?;
                 continue;
             }
-            let mut writes = Vec::new();
-            function_writes(helper, self.landing(), &mut Vec::new(), &mut names, &mut writes)?;
+            let writes = writes_of(helper, self.landing(), &names)?;
             match self.record(writes) {
                 Some(first) => {
                     self.chain.inseparable.get_or_insert(first);
@@ -662,9 +662,7 @@ fn removes(
         return Ok(false);
     }
     for helper in helpers {
-        let mut writes = Vec::new();
-        function_writes(helper, landing, &mut Vec::new(), &mut Vec::new(), &mut writes)?;
-        if !writes.is_empty() {
+        if !writes_of(helper, landing, &[])?.is_empty() {
             return Ok(true);
         }
     }

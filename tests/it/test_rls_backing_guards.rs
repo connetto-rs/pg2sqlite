@@ -332,7 +332,7 @@ fn monitor_opts() -> Pg2SqliteOptions {
 }
 
 fn exemption_opts() -> Pg2SqliteOptions {
-    strict_opts().with_write_exemption_function("write_is_exempt")
+    strict_opts().with_rls_exemption_function("write_is_exempt")
 }
 
 fn set_write_exempt(exempt: bool) {
@@ -728,10 +728,10 @@ fn monitor_cuts_a_long_row_identifier() {
 }
 
 #[test]
-fn zero_policy_backing_insert_honours_write_exemption() {
+fn zero_policy_backing_insert_honours_rls_exemption() {
     let options = Pg2SqliteOptions::default()
         .with_rls_audit_table_name("rls_audit")
-        .with_write_exemption_function("write_is_exempt");
+        .with_rls_exemption_function("write_is_exempt");
     set_write_exempt(false);
     let mut conn = apply(ZERO_POLICY_SCHEMA, &options);
     write_is_exempt_utils::register_nondeterministic_impl(&mut conn, || {
@@ -778,7 +778,7 @@ fn innocuous_nondeterministic_exemption_works_with_trusted_schema_off() {
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_INNOCUOUS,
         |_| Ok(true),
     )
-    .expect("register innocuous write exemption");
+    .expect("register innocuous RLS exemption");
     conn.execute_batch("PRAGMA trusted_schema = OFF;").expect("disable trusted schema");
     apply_rendered(&conn, &translated);
 
@@ -859,7 +859,7 @@ fn exemption_short_circuits_policy_calls_but_not_function_resolution() {
 fn keyword_shaped_exemption_function_name_is_quoted() {
     use rusqlite::{Connection, functions::FunctionFlags};
 
-    let opts = strict_opts().with_write_exemption_function("select");
+    let opts = strict_opts().with_rls_exemption_function("select");
     let translated = rendered_translation(ZERO_POLICY_SCHEMA, &opts);
     let conn = Connection::open_in_memory().expect("open");
     conn.create_scalar_function("select", 0, FunctionFlags::SQLITE_UTF8, |_| Ok(true))
@@ -869,8 +869,11 @@ fn keyword_shaped_exemption_function_name_is_quoted() {
         .expect("quoted exemption function remains callable");
 }
 
+/// An exempt write reads its row back as PostgreSQL's table owner does, so
+/// the monitor records nothing, and the view hides the row once the exemption
+/// is off.
 #[test]
-fn hidden_exempt_row_still_reaches_monitoring() {
+fn hidden_exempt_row_is_not_audited() {
     let opts = exemption_opts();
     let mut conn = apply_with_exemption(INVISIBLE_INSERT_SCHEMA);
     set_write_exempt(true);
@@ -883,8 +886,7 @@ fn hidden_exempt_row_still_reaches_monitoring() {
     .expect("exempt hidden insert");
     set_write_exempt(false);
 
-    let audit = audit_rows(&mut conn);
-    assert_eq!(audit.len(), 1);
+    assert!(audit_rows(&mut conn).is_empty());
     assert_eq!(schema::events::table.count().get_result::<i64>(&mut conn).unwrap(), 0);
 }
 

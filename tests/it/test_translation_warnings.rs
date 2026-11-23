@@ -218,7 +218,16 @@ fn alter_user_emits_lossy_drop_warning() {
 /// The downgrades a translation reports, each as its location, source and
 /// target.
 fn downgrades_for(pg: &str) -> Vec<(DowngradeLocation, String, String)> {
-    warnings_for(pg)
+    downgrades_under(pg, &Pg2SqliteOptions::default())
+}
+
+/// The downgrades a translation under `options` reports, each as its
+/// location, source and target.
+fn downgrades_under(
+    pg: &str,
+    options: &Pg2SqliteOptions,
+) -> Vec<(DowngradeLocation, String, String)> {
+    warnings_under(pg, options)
         .into_iter()
         .filter_map(|warning| {
             match warning {
@@ -267,14 +276,41 @@ fn expression(object: Option<DeclaredObject>, text: &str) -> DowngradeLocation {
     DowngradeLocation::Expression { object, text: text.to_owned() }
 }
 
-/// SQLite has no zone-aware temporal type, so the column becomes TEXT holding
-/// whatever offset the writer put in it. Every PostgreSQL spelling that
-/// carries a zone loses it, and all four used to say nothing.
+/// SQLite has no zone-aware temporal type, so a `timetz` column becomes TEXT
+/// holding whatever offset the writer put in it, and its values order as that
+/// text rather than as times in UTC.
 #[test]
-fn a_zone_carrying_column_reports_the_zone_it_loses() {
-    for declared in ["TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE", "TIMETZ", "TIME WITH TIME ZONE"] {
+fn a_time_with_time_zone_column_reports_the_zone_it_loses() {
+    for declared in ["TIMETZ", "TIME WITH TIME ZONE"] {
         let downgrades =
             downgrades_for(&format!("CREATE TABLE events (id INT PRIMARY KEY, at {declared});"));
+        assert_eq!(downgrades.len(), 1, "{declared} should report one downgrade: {downgrades:?}");
+        assert_eq!(downgrades[0].0, column("events", "at"));
+        assert_eq!(downgrades[0].2, "TEXT");
+    }
+}
+
+/// The stored-text `CHECK` admits one spelling per instant, UTC text of fixed
+/// width, so a `timestamptz` column compares as PostgreSQL compares it.
+#[test]
+fn a_checked_timestamptz_column_reports_nothing() {
+    for declared in ["TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE", "TIMESTAMPTZ(3)"] {
+        let downgrades =
+            downgrades_for(&format!("CREATE TABLE events (id INT PRIMARY KEY, at {declared});"));
+        assert!(downgrades.is_empty(), "{declared} loses nothing under its CHECK: {downgrades:?}");
+    }
+}
+
+/// Without the stored-text `CHECK` a `timestamptz` column takes any offset, so
+/// two spellings of one instant compare unequal.
+#[test]
+fn an_unchecked_timestamptz_column_reports_the_zone_it_loses() {
+    let options = Pg2SqliteOptions::default().with_stored_text_checks_omitted();
+    for declared in ["TIMESTAMPTZ", "TIMESTAMP WITH TIME ZONE"] {
+        let downgrades = downgrades_under(
+            &format!("CREATE TABLE events (id INT PRIMARY KEY, at {declared});"),
+            &options,
+        );
         assert_eq!(downgrades.len(), 1, "{declared} should report one downgrade: {downgrades:?}");
         assert_eq!(downgrades[0].0, column("events", "at"));
         assert_eq!(downgrades[0].2, "TEXT");
@@ -306,7 +342,7 @@ fn a_column_downgrade_names_its_table() {
 fn an_added_column_downgrade_names_its_table() {
     let downgrades = downgrades_for(
         "CREATE TABLE people (id INT PRIMARY KEY);
-         ALTER TABLE people ADD COLUMN seen_at TIMESTAMPTZ;",
+         ALTER TABLE people ADD COLUMN seen_at TIMETZ;",
     );
     assert_eq!(downgrades.len(), 1, "{downgrades:?}");
     assert_eq!(downgrades[0].0, column("people", "seen_at"));
@@ -506,6 +542,46 @@ fn a_cast_downgrade_in_a_query_names_no_object() {
              SELECT CAST(title AS date) FROM notes;",
         ),
         [expression(None, "CAST(title AS DATE)")]
+    );
+}
+
+/// A write's cast names the table the write changes, whichever form the write
+/// takes.
+#[test]
+fn a_cast_downgrade_in_a_write_names_the_written_table() {
+    let table = |name: &str| Some(DeclaredObject::Table { name: name.to_owned() });
+    assert_eq!(
+        locations_for(
+            "CREATE TABLE notes (id INT PRIMARY KEY, title TEXT, at TIMESTAMP);
+             CREATE TABLE log (id INT PRIMARY KEY, at TIMESTAMP);
+             INSERT INTO log (id, at) SELECT id, CAST(title AS timestamp) FROM notes;
+             UPDATE public.notes SET at = CAST(title AS timestamp);
+             DELETE FROM log WHERE at < CAST((SELECT title FROM notes LIMIT 1) AS timestamp);
+             WITH titled AS (SELECT id, title FROM notes)
+             INSERT INTO log (id, at) SELECT id + 100, CAST(title AS timestamp) FROM titled;",
+        ),
+        [
+            expression(table("log"), "CAST(title AS TIMESTAMP)"),
+            expression(table("notes"), "CAST(title AS TIMESTAMP)"),
+            expression(table("log"), "CAST((SELECT title FROM notes LIMIT 1) AS TIMESTAMP)"),
+            expression(table("log"), "CAST(title AS TIMESTAMP)"),
+        ]
+    );
+}
+
+/// A write through an updatable view names the view it was written against.
+#[test]
+fn a_cast_downgrade_in_a_write_through_a_view_names_the_view() {
+    assert_eq!(
+        locations_for(
+            "CREATE TABLE notes (id INT PRIMARY KEY, title TEXT, at TIMESTAMP);
+             CREATE VIEW recent AS SELECT id, title, at FROM notes;
+             UPDATE recent SET at = CAST(title AS timestamp);",
+        ),
+        [expression(
+            Some(DeclaredObject::View { name: "recent".to_owned() }),
+            "CAST(title AS TIMESTAMP)"
+        )]
     );
 }
 

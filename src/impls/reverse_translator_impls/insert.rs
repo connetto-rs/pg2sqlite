@@ -383,8 +383,12 @@ impl ReverseTranslator for Insert {
             .transpose()?;
 
         // Reverse translate RETURNING clause if present
-        let returning =
-            translate_returning::<Reverse>(self.returning.as_ref(), schema, options, &mut |_| {})?;
+        let returning = translate_returning::<Reverse>(
+            self.returning.as_deref(),
+            schema,
+            options,
+            &mut |_| {},
+        )?;
 
         // Reverse translate assignments if present
         let assignments = self

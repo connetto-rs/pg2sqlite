@@ -89,6 +89,26 @@ pub(crate) fn insert_target_scope<'db>(
     }))
 }
 
+/// Builds the relation whose columns an insert target alias names.
+fn insert_target_scope_query(
+    insert: &Insert,
+    schema: &ParserDB,
+) -> Result<Option<Query>, crate::errors::Error> {
+    if let TableObject::TableName(name) = &insert.table
+        && last_ident(name).is_some()
+        && resolve_translation_table(schema, name)?.is_some()
+    {
+        let relation = crate::impls::query_builder::aliased_table_factor(
+            name.clone(),
+            insert.table_alias.as_ref().map(|alias| alias.alias.clone()),
+        );
+        return Ok(Some(crate::impls::shared_helpers::relations_scope_query(vec![
+            TableWithJoins { relation, joins: vec![] },
+        ])));
+    }
+    Ok(None)
+}
+
 impl crate::traits::translator::TranslatorWithContext for Insert {
     type SQLiteEntry = Insert;
 
@@ -142,7 +162,11 @@ impl crate::traits::translator::TranslatorWithContext for Insert {
         // The statement's target is the relation an unqualified column names,
         // and a query inside the statement attaches its own scope over this
         // one, so an outer reference still resolves.
-        let target_scope = insert_target_scope(self, schema)?;
+        let target_query = insert_target_scope_query(self, schema)?;
+        let target_scope = match target_query.as_ref() {
+            Some(query) => Some(crate::options::query_column_scope(query, schema)?),
+            None => None,
+        };
         let scoped = target_scope.as_ref().map(|scope| options.with_scope(scope));
         let options = scoped.as_ref().unwrap_or(options);
         reject_explicit_identity_values(self, schema)?;
@@ -158,21 +182,34 @@ impl crate::traits::translator::TranslatorWithContext for Insert {
             .map(|q| q.translate_with_warnings(schema, options, emit))
             .transpose()?
             .map(Box::new);
-
-        let returning = crate::impls::returning_rows::ReturningRows::insert(self)
-            .translate::<Forward>(self.returning.as_deref(), schema, options, emit)?;
-
-        let mut insert = Insert { source, returning, ..prepared };
-
-        // INSERT INTO <RLS view> ... RETURNING ...: rewrite to target
-        // the backing table so RETURNING surfaces the row that was
-        // actually written (the INSTEAD OF view trigger writes to the
-        // backing table, but RETURNING from the view sees the original
-        // NEW row and returns NULL for auto-assigned PKs). The paired
-        // BEFORE INSERT guard trigger emitted in `rls.rs` keeps WITH
-        // CHECK enforcement on this path. Plain INSERTs (no RETURNING)
-        // keep going through the view's INSTEAD OF trigger.
+        let mut insert = Insert { source, ..prepared };
         let mut target = rewrite_rls_view_insert(&mut insert, schema, options, emit)?;
+        let returning_target = match (&insert.table, &insert.table_alias) {
+            (TableObject::TableName(name), Some(alias)) => Some((&alias.alias, name)),
+            _ => None,
+        };
+
+        let target_relation = target_query
+            .as_ref()
+            .and_then(|query| query.body.as_select())
+            .and_then(|select| select.from.first())
+            .map(|target| &target.relation);
+        let returning = crate::impls::returning_scope::translate_target_returning::<Forward>(
+            &crate::impls::returning_rows::ReturningRows::insert(self),
+            insert.returning.as_deref(),
+            (returning_target, "INSERT"),
+            schema,
+            options,
+            emit,
+        )?;
+        insert.returning = crate::impls::returning_scope::scope_returning_to_target(
+            returning,
+            target_relation,
+            &[],
+            schema,
+            options.schema_is_complete(),
+            "INSERT",
+        )?;
 
         let rewrites = target.optional().map_or_else(ColumnRewrites::default, |table| {
             ColumnRewrites::of_table(table, schema, options)
@@ -180,17 +217,7 @@ impl crate::traits::translator::TranslatorWithContext for Insert {
         // One pass for all column-type conversions: literals and parameters.
         apply_column_type_conversions(&mut insert, target.optional(), schema, options)?;
 
-        if let Some(on_insert) = insert.on.take() {
-            translate_on_insert(
-                &on_insert,
-                &mut insert,
-                &mut target,
-                &rewrites,
-                schema,
-                options,
-                emit,
-            )?;
-        }
+        translate_on_insert(self, &mut insert, &mut target, &rewrites, schema, options, emit)?;
 
         if matches!(insert.on, Some(sqlparser::ast::OnInsert::OnConflict(_))) {
             disambiguate_upsert_source(&mut insert);
@@ -387,7 +414,7 @@ fn conflict_update_scope_query(insert: &Insert) -> Query {
 /// Translates the `ON CONFLICT` clause onto `insert`, refusing every other
 /// `ON` clause.
 fn translate_on_insert(
-    on_insert: &sqlparser::ast::OnInsert,
+    original: &Insert,
     insert: &mut Insert,
     target: &mut ResolvedInsertTarget<'_>,
     rewrites: &ColumnRewrites,
@@ -395,6 +422,9 @@ fn translate_on_insert(
     options: &crate::options::TranslationContext<'_>,
     emit: &mut dyn FnMut(crate::warnings::TranslationWarning),
 ) -> Result<(), crate::errors::Error> {
+    let Some(on_insert) = insert.on.take() else {
+        return Ok(());
+    };
     let sqlparser::ast::OnInsert::OnConflict(on_conflict) = on_insert else {
         return Err(crate::errors::Error::forward_refusal(format!(
             "Unsupported ON INSERT clause: {on_insert:?}"
@@ -418,7 +448,8 @@ fn translate_on_insert(
             }));
         }
         sqlparser::ast::OnConflictAction::DoUpdate(do_update) => {
-            let scope_query = conflict_update_scope_query(insert);
+            let scope_query = conflict_update_scope_query(original);
+            // Resolve against the logical target's schema.
             let scope = crate::options::query_column_scope(&scope_query, schema)?;
             let scoped = options.with_scope(&scope);
             let options = &scoped;

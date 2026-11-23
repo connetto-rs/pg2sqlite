@@ -23,7 +23,7 @@ mod landing;
 mod readers;
 mod rows;
 
-use alloc::borrow::Cow;
+use alloc::{borrow::Cow, collections::BTreeMap};
 use core::{fmt::Write as _, ops::ControlFlow};
 
 pub(crate) use chain::without_removed_writes;
@@ -55,6 +55,7 @@ use crate::{
     errors::Error,
     history::placement::primary_write_target,
     impls::{
+        batch_cache::address,
         object_name::{last_ident, last_ident_value_or_display},
         translator_impls::{off_replica::OffReplica, plpgsql::fold},
         unlabelled_body::unlabelled_body,
@@ -138,6 +139,7 @@ impl Fresh {
 
 /// A statement that writes rows, and the chain of functions that reaches it,
 /// the trigger's own function first.
+#[derive(Clone)]
 pub(crate) struct DerivedWrite {
     chain: Vec<String>,
     statement: &'static str,
@@ -443,6 +445,46 @@ fn function_writes<'db>(
     }
     chain.pop();
     Ok(())
+}
+
+/// The writes functions run, by the addresses of the schema they are read
+/// against and of the function, each reached through no function before it.
+#[derive(Default, Clone)]
+pub(crate) struct FunctionWrites(BTreeMap<(usize, usize), Vec<DerivedWrite>>);
+
+impl FunctionWrites {
+    /// Forgets every write kept, which the triggers firing around them landed.
+    pub(crate) fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+/// Every write `function` runs, as [`function_writes`] adds them to no write
+/// found before, each reached through `chain` and then `function`. The writes
+/// are kept for the batch when it holds the schema, so a function many
+/// triggers and helpers call is read once.
+fn writes_of<'db>(
+    function: &'db CreateFunction,
+    landing: Landing<'db>,
+    chain: &[String],
+) -> Result<Vec<DerivedWrite>, Error> {
+    let key = (address(landing.schema), address(function));
+    let kept = landing.cache.borrow().function_writes.0.get(&key).cloned();
+    let mut writes = if let Some(kept) = kept {
+        kept
+    } else {
+        let mut writes = Vec::new();
+        function_writes(function, landing, &mut Vec::new(), &mut Vec::new(), &mut writes)?;
+        let mut cache = landing.cache.borrow_mut();
+        if cache.holds(key.0) {
+            cache.function_writes.0.insert(key, writes.clone());
+        }
+        writes
+    };
+    for write in &mut writes {
+        write.chain.splice(0..0, chain.iter().cloned());
+    }
+    Ok(writes)
 }
 
 /// What the replica does with a trigger when it omits the writes the server

@@ -252,7 +252,7 @@ pub(crate) fn drain() -> Statement {
 /// when the drain deletes the firing.
 ///
 /// Each event is first translated as the immediate trigger it would be, so
-/// the `WHEN` clause, the write exemption and the body read as they do there.
+/// the `WHEN` clause, the RLS exemption and the body read as they do there.
 /// The `WHEN` clause stays on the queueing trigger, since PostgreSQL evaluates
 /// it when the event happens. The body moves to the payload table, its `NEW`
 /// and `OLD` columns read from the values queued with the firing, `NULL` where

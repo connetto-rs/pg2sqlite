@@ -137,7 +137,7 @@ pub fn case_options(case: &Case) -> Result<Pg2SqliteOptions, ParityError> {
             .with_uuid_representation(UuidRepresentation::Blob)
             .with_uuid_function_name("uuidv4")
             .with_rls_audit_table_name("rls_audit".to_owned())
-            .with_write_exemption_function("connetto_write_exempt")
+            .with_rls_exemption_function("connetto_write_exempt")
             .with_jsonb_functions(JsonbFunctions::new(
                 "jsonb_canonical",
                 "jsonb_text",
@@ -561,7 +561,7 @@ impl Replica {
 
 /// Register on `connection` the functions `options` name: each session
 /// variable's function answering the current caller's setting as the replica
-/// stores it, the write exemption, the UUID minter, and the `jsonb` functions
+/// stores it, the RLS exemption, the UUID minter, and the `jsonb` functions
 /// and collation.
 fn register_functions(
     connection: &mut SqliteConnection,
@@ -578,7 +578,7 @@ fn register_functions(
             move || session.setting(&setting),
         )?;
     }
-    if let Some(function) = options.get_write_exemption_function() {
+    if let Some(function) = options.get_rls_exemption_function() {
         let session = Arc::clone(session);
         connection.register_noarg_sql_function::<Bool, _, _>(function, volatile, move || {
             session.exempt.load(Ordering::Relaxed)

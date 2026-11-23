@@ -191,3 +191,241 @@ fn temporary_trigger_writes_qualified_temporary_table() {
     );
     assert_eq!(rows, vec![Some("updated".to_string())]);
 }
+
+#[test]
+fn shadowed_tables_keep_unique_indexes_on_their_owners() {
+    for temporary_index in ["scratch_id", "scratch_tag"] {
+        let rows = run_translated_default(&format!(
+            "CREATE TABLE scratch (id INTEGER, tag INTEGER);
+             CREATE TEMP TABLE scratch (id INTEGER, tag INTEGER);
+             CREATE UNIQUE INDEX scratch_id ON public.scratch(id);
+             CREATE UNIQUE INDEX {temporary_index} ON scratch(tag);
+             INSERT INTO public.scratch VALUES (1,10),(1,20),(2,10) ON CONFLICT DO NOTHING;
+             INSERT INTO scratch VALUES (1,10),(1,20),(2,10) ON CONFLICT DO NOTHING;
+             SELECT sum(id) FROM public.scratch UNION ALL SELECT sum(id) FROM scratch;"
+        ));
+        assert_eq!(rows, vec![Some("3".to_string()), Some("2".to_string())]);
+    }
+}
+
+#[test]
+fn dropping_shadowing_index_preserves_permanent_unique_index() {
+    let rows = run_translated_default(
+        "CREATE TABLE scratch (id INTEGER, tag INTEGER);
+         CREATE TEMP TABLE scratch (id INTEGER, tag INTEGER);
+         CREATE UNIQUE INDEX scratch_id ON public.scratch(id);
+         CREATE UNIQUE INDEX scratch_id ON scratch(tag);
+         INSERT INTO public.scratch VALUES (1,10),(1,20),(2,10) ON CONFLICT DO NOTHING;
+         INSERT INTO scratch VALUES (1,10),(1,20),(2,10) ON CONFLICT DO NOTHING;
+         DROP INDEX scratch_id;
+         INSERT INTO scratch VALUES (2,10);
+         INSERT INTO public.scratch VALUES (1,30) ON CONFLICT DO NOTHING;
+         SELECT count(*) FROM public.scratch UNION ALL SELECT count(*) FROM scratch;",
+    );
+    assert_eq!(rows, vec![Some("2".to_string()), Some("3".to_string())]);
+}
+
+#[test]
+fn dropping_qualified_permanent_index_preserves_temporary_unique_index() {
+    let rows = run_translated_default(
+        "CREATE TABLE scratch (id INTEGER, tag INTEGER);
+         CREATE TEMP TABLE scratch (id INTEGER, tag INTEGER);
+         CREATE UNIQUE INDEX scratch_id ON public.scratch(id);
+         CREATE UNIQUE INDEX scratch_id ON scratch(tag);
+         INSERT INTO public.scratch VALUES (1,10);
+         INSERT INTO scratch VALUES (1,10);
+         DROP INDEX public.scratch_id;
+         INSERT INTO public.scratch VALUES (1,30);
+         INSERT INTO scratch VALUES (2,10) ON CONFLICT DO NOTHING;
+         SELECT count(*) FROM public.scratch UNION ALL SELECT count(*) FROM scratch;",
+    );
+    assert_eq!(rows, vec![Some("2".to_string()), Some("1".to_string())]);
+}
+
+#[test]
+fn shadowed_tables_allow_same_and_different_index_names() {
+    for temporary_index in ["scratch_id", "scratch_tag"] {
+        for temporary_first in [false, true] {
+            let permanent = "CREATE INDEX scratch_id ON public.scratch(id);";
+            let temporary = format!("CREATE INDEX {temporary_index} ON scratch(tag);");
+            let indexes = if temporary_first {
+                format!("{temporary} {permanent}")
+            } else {
+                format!("{permanent} {temporary}")
+            };
+            let rows = run_translated_default(&format!(
+                "CREATE TABLE scratch (id INTEGER, tag INTEGER);
+                 CREATE TEMP TABLE scratch (id INTEGER, tag INTEGER);
+                 {indexes}
+                 SELECT count(*) FROM public.scratch UNION ALL SELECT count(*) FROM scratch;"
+            ));
+            assert_eq!(rows, vec![Some("0".to_string()), Some("0".to_string())]);
+        }
+    }
+}
+
+#[test]
+fn dropping_temporary_indexes_reveals_permanent_index() {
+    for (temporary_index, dropped_index) in [
+        ("scratch_id", "scratch_id"),
+        ("scratch_id", "pg_temp.scratch_id"),
+        ("scratch_tag", "scratch_tag"),
+    ] {
+        let rows = run_translated_default(&format!(
+            "CREATE TABLE scratch (id INTEGER);
+             CREATE TEMP TABLE scratch (id INTEGER);
+             CREATE UNIQUE INDEX scratch_id ON public.scratch(id);
+             CREATE UNIQUE INDEX {temporary_index} ON scratch(id);
+             INSERT INTO public.scratch VALUES (1);
+             INSERT INTO scratch VALUES (1);
+             DROP INDEX {dropped_index};
+             DROP INDEX scratch_id;
+             INSERT INTO public.scratch VALUES (1);
+             INSERT INTO scratch VALUES (1);
+             SELECT count(*) FROM public.scratch UNION ALL SELECT count(*) FROM scratch;"
+        ));
+        assert_eq!(rows, vec![Some("2".to_string()), Some("2".to_string())]);
+    }
+}
+
+#[test]
+fn temp_shadows_statement_targets_preserve_their_database() {
+    for temporary_first in [false, true] {
+        let permanent = "CREATE TABLE public.scratch (id INTEGER PRIMARY KEY, tag INTEGER);";
+        let temporary = "CREATE TEMP TABLE scratch (id INTEGER PRIMARY KEY, tag INTEGER);";
+        let tables = if temporary_first {
+            format!("{temporary} {permanent}")
+        } else {
+            format!("{permanent} {temporary}")
+        };
+        for relation in ["public.scratch", "pg_temp.scratch", "scratch"] {
+            let permanent = relation == "public.scratch";
+            let other = if permanent { "pg_temp.scratch" } else { "public.scratch" };
+            let renamed = if permanent { "public.renamed" } else { "pg_temp.renamed" };
+            for (statement, expected) in [
+                (format!("INSERT INTO {relation} VALUES (3,30) RETURNING tag;"), "30"),
+                (
+                    format!("UPDATE {relation} SET tag = tag + 1 RETURNING tag;"),
+                    if permanent { "11" } else { "21" },
+                ),
+                (
+                    format!("DELETE FROM {relation} RETURNING tag;"),
+                    if permanent { "10" } else { "20" },
+                ),
+                (
+                    format!("TRUNCATE {relation}; SELECT tag FROM {other};"),
+                    if permanent { "20" } else { "10" },
+                ),
+                (
+                    format!("DROP TABLE {relation}; SELECT tag FROM {other};"),
+                    if permanent { "20" } else { "10" },
+                ),
+                (
+                    format!(
+                        "ALTER TABLE {relation} ADD COLUMN added INTEGER DEFAULT 7;
+                         SELECT added FROM {relation};"
+                    ),
+                    "7",
+                ),
+                (
+                    format!("ALTER TABLE {relation} DROP COLUMN tag; SELECT id FROM {relation};"),
+                    if permanent { "1" } else { "2" },
+                ),
+                (
+                    format!(
+                        "ALTER TABLE {relation} RENAME COLUMN tag TO renamed;
+                         SELECT renamed FROM {relation};"
+                    ),
+                    if permanent { "10" } else { "20" },
+                ),
+                (
+                    format!(
+                        "ALTER TABLE {relation} RENAME TO renamed;
+                         SELECT tag FROM {renamed};"
+                    ),
+                    if permanent { "10" } else { "20" },
+                ),
+                (
+                    format!(
+                        "COMMENT ON TABLE {relation} IS 'table';
+                         COMMENT ON COLUMN {relation}.tag IS 'column';
+                         SELECT tag FROM {relation};"
+                    ),
+                    if permanent { "10" } else { "20" },
+                ),
+            ] {
+                let rows = run_translated_default(&format!(
+                    "{tables}
+                     INSERT INTO public.scratch VALUES (1,10);
+                     INSERT INTO pg_temp.scratch VALUES (2,20);
+                     {statement}"
+                ));
+                assert_eq!(rows, vec![Some(expected.to_string())], "{statement}");
+            }
+            let rows = run_translated_default(&format!(
+                "{tables}
+                 INSERT INTO public.scratch VALUES (1,10);
+                 INSERT INTO pg_temp.scratch VALUES (2,20);
+                 INSERT INTO {relation} VALUES (1,100),(2,200)
+                 ON CONFLICT (id) DO UPDATE SET tag = excluded.tag;
+                 SELECT tag FROM public.scratch UNION ALL SELECT tag FROM pg_temp.scratch;"
+            ));
+            let expected = if permanent { ["100", "200", "20"] } else { ["10", "100", "200"] };
+            assert_eq!(rows, expected.map(|value| Some(value.to_string())));
+        }
+    }
+}
+
+#[test]
+fn temp_shadows_generated_identifiers_keep_separate_counters() {
+    for temporary_first in [false, true] {
+        for column in [
+            "SERIAL PRIMARY KEY",
+            "INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY",
+            "INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY",
+        ] {
+            let permanent = format!("CREATE TABLE public.scratch (id {column}, tag INTEGER);");
+            let temporary = format!("CREATE TEMP TABLE scratch (id {column}, tag INTEGER);");
+            let tables = if temporary_first {
+                format!("{temporary} {permanent}")
+            } else {
+                format!("{permanent} {temporary}")
+            };
+            let rows = run_translated_default(&format!(
+                "{tables}
+                 INSERT INTO public.scratch (tag) VALUES (10),(11);
+                 INSERT INTO pg_temp.scratch (tag) VALUES (20);
+                 SELECT sum(id) FROM public.scratch UNION ALL SELECT sum(id) FROM pg_temp.scratch;"
+            ));
+            assert_eq!(rows, vec![Some("3".to_string()), Some("1".to_string())]);
+        }
+    }
+}
+
+#[test]
+fn temp_shadows_named_constraints_keep_separate_owners() {
+    for temporary_first in [false, true] {
+        for constraint in [
+            "CONSTRAINT same_check CHECK (tag > 0)",
+            "CONSTRAINT same_unique UNIQUE (tag)",
+            "CONSTRAINT same_primary PRIMARY KEY (id)",
+        ] {
+            let permanent =
+                format!("CREATE TABLE public.scratch (id INTEGER, tag INTEGER, {constraint});");
+            let temporary =
+                format!("CREATE TEMP TABLE scratch (id INTEGER, tag INTEGER, {constraint});");
+            let tables = if temporary_first {
+                format!("{temporary} {permanent}")
+            } else {
+                format!("{permanent} {temporary}")
+            };
+            let rows = run_translated_default(&format!(
+                "{tables}
+                 INSERT INTO public.scratch VALUES (1,10);
+                 INSERT INTO pg_temp.scratch VALUES (1,10);
+                 SELECT tag FROM public.scratch UNION ALL SELECT tag FROM pg_temp.scratch;"
+            ));
+            assert_eq!(rows, vec![Some("10".to_string()), Some("10".to_string())]);
+        }
+    }
+}

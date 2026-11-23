@@ -38,6 +38,7 @@ use crate::{
             plain_table_with_joins,
         },
         returning_rows::ReturningRows,
+        returning_scope::{aliased_target, delete_target, translate_target_returning},
         translator_impls::{
             unused_cte_name,
             uuid::{
@@ -3541,12 +3542,10 @@ pub(crate) fn translate_delete_core<D: TranslationDirection>(
     let from = map_from_table(&delete.from, |table| {
         translate_table_with_joins::<D>(table, schema, options, emit)
     })?;
-    let returning = ReturningRows::delete(delete).translate::<D>(
-        delete.returning.as_deref(),
-        schema,
-        options,
-        emit,
-    )?;
+    let target = (delete_target(&delete.from).and_then(aliased_target), "DELETE");
+    let (rows, returning) = (ReturningRows::delete(delete), delete.returning.as_deref());
+    let returning =
+        translate_target_returning::<D>(&rows, returning, target, schema, options, emit)?;
     let order_by = delete
         .order_by
         .iter()
@@ -4697,8 +4696,10 @@ pub(crate) fn translate_update<D: TranslationDirection>(
         })
         .transpose()?;
 
-    let rows = ReturningRows::update(update);
-    let returning = rows.translate::<D>(update.returning.as_deref(), schema, options, emit)?;
+    let target = (aliased_target(&update.table.relation), "UPDATE");
+    let (rows, returning) = (ReturningRows::update(update), update.returning.as_deref());
+    let returning =
+        translate_target_returning::<D>(&rows, returning, target, schema, options, emit)?;
     let limit = update
         .limit
         .as_ref()
@@ -5813,7 +5814,10 @@ pub(crate) fn translate_table_factor<D: TranslationDirection>(
                 && let Some(alias) = alias.as_ref().filter(|alias| !alias.columns.is_empty())
             {
                 let relation = plain_table_factor(D::translate_object_name(name, schema, options)?);
-                return renamed_relation_factor(name, alias, relation, schema);
+                let written = D::forward_context(options)
+                    .and_then(crate::options::TranslationContext::written_schema)
+                    .unwrap_or(schema);
+                return renamed_relation_factor(name, alias, relation, written);
             }
             TableFactor::Table {
                 name: D::translate_object_name(name, schema, options)?,
@@ -6237,25 +6241,29 @@ pub(crate) fn renamed_derived_factor<D: TranslationDirection>(
     })
 }
 
-/// Rewrites `FROM t AS x (a, b)` into `(SELECT id AS a, s AS b FROM t) AS x`,
-/// reading `relation` in place of `t`.
+/// Rewrites `FROM t AS x (a, b)` into
+/// `(SELECT id AS a, s AS b, rest AS rest FROM t) AS x`, reading `relation`
+/// in place of `t` and listing the columns of `t` in `written`, the schema
+/// the statement was written against.
 ///
 /// PostgreSQL renames the table's leading columns positionally and keeps the
 /// rest under their declared names, and it refuses a list longer than the
 /// table or one carrying data types, which belong to a function returning
 /// `record`. SQLite accepts no column list on a table alias, so the rename
 /// happens in a projection, the shape `translate_unnest_factor` already uses
-/// for the same reason. The declared idents are rebuilt with their quoting so
-/// a quoted column name stays quoted in the projection.
+/// for the same reason. Every column carries its alias, so a view keeps its
+/// names when SQLite rewrites a renamed column inside it. The declared idents
+/// are rebuilt with their quoting so a quoted column name stays quoted in the
+/// projection.
 pub(crate) fn renamed_relation_factor(
     name: &ObjectName,
     alias: &TableAlias,
     relation: TableFactor,
-    schema: &ParserDB,
+    written: &ParserDB,
 ) -> Result<TableFactor, Error> {
     refuse_typed_alias_columns(name, alias)?;
 
-    let Some(table) = resolve_translation_table(schema, name)? else {
+    let Some(table) = resolve_translation_table(written, name)? else {
         return Err(Error::forward_refusal(format!(
             "FROM {name} AS {} (...) renames the columns of a relation the translation schema \
              does not declare, so the declared column list the rewrite needs is unknown. \
@@ -6265,7 +6273,7 @@ pub(crate) fn renamed_relation_factor(
     };
 
     let declared: Vec<Ident> = table
-        .columns(schema)?
+        .columns(written)?
         .map(|column| {
             if column.column_name_is_quoted() {
                 Ident::with_quote('"', column.column_name())
@@ -6289,15 +6297,11 @@ pub(crate) fn renamed_relation_factor(
         .into_iter()
         .enumerate()
         .map(|(position, column)| {
-            match alias.columns.get(position) {
-                Some(renamed) => {
-                    SelectItem::ExprWithAlias {
-                        expr: Expr::Identifier(column),
-                        alias: renamed.name.clone(),
-                    }
-                }
-                None => SelectItem::UnnamedExpr(Expr::Identifier(column)),
-            }
+            let alias = alias
+                .columns
+                .get(position)
+                .map_or_else(|| column.clone(), |renamed| renamed.name.clone());
+            SelectItem::ExprWithAlias { expr: Expr::Identifier(column), alias }
         })
         .collect();
     Ok(TableFactor::Derived {
@@ -6352,7 +6356,7 @@ pub(crate) fn translate_select_item<D: TranslationDirection>(
 }
 
 pub(crate) fn translate_returning<D: TranslationDirection>(
-    returning: Option<&Vec<SelectItem>>,
+    returning: Option<&[SelectItem]>,
     schema: &ParserDB,
     options: &D::Options<'_>,
     emit: crate::warnings::WarningSink<'_>,

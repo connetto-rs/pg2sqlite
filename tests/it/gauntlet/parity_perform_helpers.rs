@@ -502,7 +502,7 @@ fn club_options() -> Pg2SqliteOptions {
         .with_deployment(deployment([], [caller("app.user_id", "text")]))
         .with_session_variable(SessionVariableMapping::new("app.user_id", "perform_app_user"))
         .with_rls_audit_table_name("rls_audit")
-        .with_write_exemption_function("perform_write_exempt")
+        .with_rls_exemption_function("perform_write_exempt")
 }
 
 /// The clubs `nina` cannot see: `secret`, founded, and `open`, not yet.
