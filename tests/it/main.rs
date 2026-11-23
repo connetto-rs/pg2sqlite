@@ -217,6 +217,7 @@ mod test_readonly_nonrls_deny_triggers;
 mod test_reads_left_to_server;
 mod test_recursive_view;
 mod test_rename_table;
+mod test_returning_old_new;
 mod test_returning_scope;
 mod test_reverse_coverage_gaps;
 mod test_reverse_dml;

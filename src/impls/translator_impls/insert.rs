@@ -24,7 +24,7 @@ use crate::{
             ColumnReferences, ColumnRewrites, carries_default_keyword, declares_always_identity,
             extract_columns_from_expr, is_default_keyword, is_generated_expression_column,
             substituted_assignment_default, translate_conflict_predicate,
-            translate_on_conflict_do_update, translate_returning, without_generated_defaults,
+            translate_on_conflict_do_update, without_generated_defaults,
         },
         translator_impls::rls,
     },
@@ -152,8 +152,8 @@ impl crate::traits::translator::TranslatorWithContext for Insert {
             .transpose()?
             .map(Box::new);
 
-        let returning =
-            translate_returning::<Forward>(self.returning.as_ref(), schema, options, emit)?;
+        let returning = crate::impls::returning_rows::ReturningRows::insert(self)
+            .translate::<Forward>(self.returning.as_deref(), schema, options, emit)?;
 
         let mut insert = Insert { source, returning, ..prepared };
 

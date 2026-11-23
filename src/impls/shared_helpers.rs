@@ -37,6 +37,7 @@ use crate::{
             from_relation, make_query, make_simple_select, plain_table_factor,
             plain_table_with_joins,
         },
+        returning_rows::ReturningRows,
         translator_impls::{
             unused_cte_name,
             uuid::{
@@ -3546,7 +3547,12 @@ pub(crate) fn translate_delete_core<D: TranslationDirection>(
     let from = map_from_table(&delete.from, |table| {
         translate_table_with_joins::<D>(table, schema, options, emit)
     })?;
-    let returning = translate_returning::<D>(delete.returning.as_ref(), schema, options, emit)?;
+    let returning = ReturningRows::delete(delete).translate::<D>(
+        delete.returning.as_deref(),
+        schema,
+        options,
+        emit,
+    )?;
     let order_by = delete
         .order_by
         .iter()
@@ -4684,7 +4690,8 @@ pub(crate) fn translate_update<D: TranslationDirection>(
         })
         .transpose()?;
 
-    let returning = translate_returning::<D>(update.returning.as_ref(), schema, options, emit)?;
+    let rows = ReturningRows::update(update);
+    let returning = rows.translate::<D>(update.returning.as_deref(), schema, options, emit)?;
     let limit = update
         .limit
         .as_ref()
