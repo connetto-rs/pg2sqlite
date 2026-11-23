@@ -329,24 +329,18 @@ fn every_membership_spelling_reads_the_same_set() {
     let options = options();
     let view = "CREATE VIEW docs AS SELECT id FROM docs_rls WHERE (id IN (SELECT docs_with FROM \
                 docs_with_#()))";
-    for predicate in [
-        "id IN (SELECT docs_with('write'))",
-        "id = ANY (ARRAY(SELECT docs_with('write')))",
-        "id = ANY (SELECT public.docs_with('write'))",
+    let excluded = "CREATE VIEW docs AS SELECT id FROM docs_rls WHERE (id NOT IN (SELECT \
+                    docs_with FROM docs_with_#()))";
+    for (predicate, expected) in [
+        ("id IN (SELECT docs_with('write'))", view),
+        ("id = ANY (ARRAY(SELECT docs_with('write')))", view),
+        ("id = ANY (SELECT public.docs_with('write'))", view),
+        ("id NOT IN (SELECT docs_with('write'))", excluded),
+        ("id <> ALL (ARRAY(SELECT docs_with('write')))", excluded),
     ] {
         let script = translated(&read_policy(predicate), &options);
         let docs = statement(&script, "docs");
-        assert_eq!(helpers::unhashed(docs), view, "{predicate}");
-        assert_eq!(called_body(&script, docs, "docs_with"), WRITERS, "{predicate}");
-    }
-    let excluded = "CREATE VIEW docs AS SELECT id FROM docs_rls WHERE (id NOT IN (SELECT \
-                    docs_with FROM docs_with_#()))";
-    for predicate in
-        ["id NOT IN (SELECT docs_with('write'))", "id <> ALL (ARRAY(SELECT docs_with('write')))"]
-    {
-        let script = translated(&read_policy(predicate), &options);
-        let docs = statement(&script, "docs");
-        assert_eq!(helpers::unhashed(docs), excluded, "{predicate}");
+        assert_eq!(helpers::unhashed(docs), expected, "{predicate}");
         assert_eq!(called_body(&script, docs, "docs_with"), WRITERS, "{predicate}");
     }
 }
@@ -440,6 +434,30 @@ fn a_parent_arm_without_a_foreign_key_reads_the_called_helpers_set() {
          docs_with_#())"
     );
     assert_eq!(called_body(&script, notes_with, "docs_with"), WRITERS);
+}
+
+/// A helper whose set reads the table an `INSERT` writes is written in the
+/// source in place, so SQLite copies the source before writing a row of it,
+/// as PostgreSQL reads the statement's snapshot.
+#[test]
+fn an_insert_reading_its_target_through_a_helper_reads_the_set_in_place() {
+    let script = translated(
+        &format!(
+            "{DOCS}INSERT INTO doc_members SELECT 'd', 'u', 'g' \
+             WHERE 'd' NOT IN (SELECT docs_in_group('g')) AND 'd' NOT IN (SELECT docs_with('g'));"
+        ),
+        &options(),
+    );
+    let insert = script
+        .iter()
+        .find(|statement| statement.starts_with("INSERT INTO doc_members "))
+        .expect("the INSERT translates");
+    assert_eq!(
+        helpers::unhashed(insert),
+        "INSERT INTO doc_members SELECT 'd', 'u', 'g' WHERE 'd' NOT IN (SELECT arm.doc_id FROM \
+         doc_members AS arm WHERE arm.principal_id = app_user() AND arm.\"group\" IN ('g')) AND \
+         'd' NOT IN (SELECT docs_with FROM docs_with_#())"
+    );
 }
 
 /// A call to a function the schema does not declare is no helper call.

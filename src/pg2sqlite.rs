@@ -1699,23 +1699,15 @@ impl Pg2Sqlite {
         let connection = crate::history::connection_program(&units, &schema, &context, &mut placed);
         let (main, attached) = crate::history::fresh_forms(&units, &mut placed, &schema, &context);
         drop(units);
-        let mut functions = context.take_helper_functions();
-        let mut reached = crate::impls::helper_functions::called(
-            &functions,
+        let functions = self.reached_functions(
+            context.take_helper_functions(),
             prelude
                 .iter()
                 .chain(statements.iter().flatten())
                 .chain(connection.iter().flatten())
                 .chain(main.iter().flatten().flatten().flatten())
                 .chain(attached.iter().flatten().flatten().flatten()),
-        )
-        .into_iter();
-        functions.retain(|_| reached.next().unwrap_or(false));
-        for function in &self.starting_functions {
-            if functions.iter().all(|translated| translated.name != function.name) {
-                functions.push(function.clone());
-            }
-        }
+        );
         let files = crate::initialization::InitializationPlan::new(
             prelude,
             placed.unit_files.into_iter().zip(statements),
@@ -1763,6 +1755,24 @@ impl Pg2Sqlite {
         }
 
         Ok(PreparedTranslation { script, warnings })
+    }
+
+    /// The helper functions of `translated` that `emitted` calls, and every
+    /// starting function, which a view or trigger the database holds may
+    /// call.
+    fn reached_functions<'s>(
+        &'s self,
+        mut translated: Vec<HelperFunction>,
+        emitted: impl Iterator<Item = &'s Statement>,
+    ) -> Vec<HelperFunction> {
+        let mut reached = crate::impls::helper_functions::called(&translated, emitted).into_iter();
+        translated.retain(|_| reached.next().unwrap_or(false));
+        for function in &self.starting_functions {
+            if translated.iter().all(|kept| kept.name != function.name) {
+                translated.push(function.clone());
+            }
+        }
+        translated
     }
 
     /// Translates loaded PostgreSQL statements to SQLite.

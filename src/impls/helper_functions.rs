@@ -6,7 +6,7 @@
 
 use core::ops::ControlFlow;
 
-use sqlparser::ast::{Statement, Visit, visit_relations};
+use sqlparser::ast::{Query, Statement, Visit, visit_relations};
 
 use super::emitted_namespace::key;
 #[cfg(not(feature = "std"))]
@@ -35,6 +35,27 @@ pub(crate) fn called<'s>(
         }
     }
     reached
+}
+
+/// Whether `query` reads `table`, the key of a relation, directly or through
+/// the body of one of `functions` it calls.
+pub(crate) fn reads(functions: &[HelperFunction], query: &Query, table: &str) -> bool {
+    let mut read = Vec::new();
+    relations(query, &mut read);
+    let mut visited = vec![false; functions.len()];
+    while let Some(name) = read.pop() {
+        if name == table {
+            return true;
+        }
+        if let Some(position) =
+            functions.iter().position(|function| function.name.eq_ignore_ascii_case(&name))
+            && !visited[position]
+        {
+            visited[position] = true;
+            relations(&functions[position].body, &mut read);
+        }
+    }
+    false
 }
 
 /// Adds to `read` the key of every relation `node` reads.

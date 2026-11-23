@@ -382,6 +382,9 @@ pub struct TranslationContext<'a> {
     locks_whole_query: bool,
     /// The declaration whose expressions a warning names, `None` for a query.
     declaration: Option<Declaration<'a>>,
+    /// The key of the table the `INSERT` whose source is being translated
+    /// writes.
+    inserting_into: Option<&'a str>,
 }
 
 /// A declaration whose expressions a translation reads.
@@ -446,6 +449,7 @@ struct ContextFields<'a> {
     locked: &'a [usize],
     locks_whole_query: bool,
     declaration: Option<Declaration<'a>>,
+    inserting_into: Option<&'a str>,
 }
 
 impl<'a> ContextFields<'a> {
@@ -466,6 +470,7 @@ impl<'a> ContextFields<'a> {
             locked: context.locked,
             locks_whole_query: context.locks_whole_query,
             declaration: context.declaration,
+            inserting_into: context.inserting_into,
         }
     }
 
@@ -494,6 +499,7 @@ impl<'a> ContextFields<'a> {
             locked: self.locked,
             locks_whole_query: self.locks_whole_query,
             declaration: self.declaration,
+            inserting_into: self.inserting_into,
         }
     }
 }
@@ -521,6 +527,7 @@ impl<'a> TranslationContext<'a> {
             locked: &[],
             locks_whole_query: false,
             declaration: None,
+            inserting_into: None,
         }
     }
     pub(crate) fn with_complete_schema(options: &'a Pg2SqliteOptions) -> Self {
@@ -549,6 +556,7 @@ impl<'a> TranslationContext<'a> {
             locked: &[],
             locks_whole_query: false,
             declaration: None,
+            inserting_into: None,
         }
     }
 
@@ -750,8 +758,10 @@ impl<'a> TranslationContext<'a> {
     /// The context the set a helper call returns translates under. A function
     /// body sees none of the query calling it, so its scope, `WITH` clause,
     /// variables, trigger rows, trigger catalog, row locks and declaration
-    /// stay out, and the set reads the schema as it stands. Boxed so the
-    /// recursion through a helper's set holds no copy of it.
+    /// stay out, and the set reads the schema as it stands. The table an
+    /// enclosing `INSERT` writes stays in, since the body reads the
+    /// statement's snapshot of it too. Boxed so the recursion through a
+    /// helper's set holds no copy of it.
     pub(crate) fn helper_body(&self) -> Box<TranslationContext<'_>> {
         Box::new(TranslationContext {
             options: Cow::Borrowed(self.options.as_ref()),
@@ -771,6 +781,7 @@ impl<'a> TranslationContext<'a> {
             locked: &[],
             locks_whole_query: false,
             declaration: None,
+            inserting_into: self.inserting_into,
         })
     }
 
@@ -807,6 +818,20 @@ impl<'a> TranslationContext<'a> {
     /// Whether a row-locking clause covers `factor`.
     pub(crate) fn locks(&self, factor: &sqlparser::ast::TableFactor) -> bool {
         self.locked.contains(&core::ptr::from_ref(factor).addr())
+    }
+
+    /// The same context translating the source of an `INSERT` writing the
+    /// table whose key is `table`.
+    pub(crate) fn with_inserting_into<'s>(&'s self, table: &'s str) -> TranslationContext<'s> {
+        let mut fields = ContextFields::borrowed(self);
+        fields.inserting_into = Some(table);
+        fields.into_context(self.scope, self.outer)
+    }
+
+    /// The key of the table the `INSERT` whose source is being translated
+    /// writes.
+    pub(crate) const fn inserting_into(&self) -> Option<&str> {
+        self.inserting_into
     }
 
     /// The same context translating the part of a row trigger that fires for

@@ -308,3 +308,67 @@ fn a_star_body_keeps_its_columns_and_a_strict_helper_skips_null() {
         linked_runs::table.order(linked_runs::id).load(&mut connection).expect("read linked_runs");
     assert_eq!(rows, [(10, Some("warm".to_owned()), 1), (11, Some("cold,warm".to_owned()), 0)]);
 }
+
+/// PostgreSQL calls a helper setting a configuration parameter without
+/// inlining it, so it takes an argument answering differently per evaluation.
+#[test]
+fn a_helper_setting_a_parameter_is_called_with_its_argument_evaluated_once() {
+    let source = format!(
+        "{RUNS}{}
+CREATE VIEW deviating AS SELECT run.id FROM runs run
+  WHERE EXISTS (SELECT 1 FROM run_deviations(CASE WHEN random() < 2 THEN run.id END));
+GRANT SELECT ON deviating TO app;",
+        deviations("STABLE SET search_path = public", BODY)
+    );
+    let script = helpers::translate_script(&source, &options())
+        .unwrap_or_else(|error| panic!("the call should translate: {error}"));
+    let view = script
+        .iter()
+        .find(|statement| statement.starts_with("CREATE VIEW deviating "))
+        .expect("the view");
+    helpers::called_function(&script, view, "run_deviations");
+}
+
+diesel::table! {
+    echoed_samples (id) {
+        id -> Integer,
+        reading -> Nullable<Double>,
+        payload -> Nullable<Binary>,
+    }
+}
+
+/// A called helper takes and answers real and blob values as stored.
+#[test]
+fn a_called_helper_passes_reals_and_blobs_through() {
+    let source = "
+        CREATE ROLE postgres;
+        CREATE ROLE app;
+        CREATE TABLE samples (id INTEGER PRIMARY KEY, reading DOUBLE PRECISION, payload BYTEA);
+        GRANT SELECT, INSERT ON samples TO app;
+        CREATE FUNCTION echoed(wanted_reading DOUBLE PRECISION, wanted_payload BYTEA)
+          RETURNS TABLE (reading DOUBLE PRECISION, payload BYTEA)
+          LANGUAGE sql STABLE SET search_path = public AS $$ SELECT wanted_reading, wanted_payload $$;
+        CREATE VIEW echoed_samples AS SELECT sample.id,
+          (SELECT echo.reading FROM echoed(sample.reading, sample.payload) AS echo) AS reading,
+          (SELECT echo.payload FROM echoed(sample.reading, sample.payload) AS echo) AS payload
+          FROM samples sample;
+        GRANT SELECT ON echoed_samples TO app;";
+    let script = Pg2Sqlite::default()
+        .sql(source)
+        .expect("parse")
+        .translate_to_sql(&options())
+        .unwrap_or_else(|error| panic!("the schema should translate: {error}"));
+    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
+    script.register_functions(&mut connection).expect("register helper functions");
+    for statement in script.into_vec() {
+        connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
+    }
+    connection
+        .batch_execute("INSERT INTO samples VALUES (1, 2.5, x'00ff'), (2, NULL, NULL);")
+        .expect("seed the replica");
+    let rows: Vec<(i32, Option<f64>, Option<Vec<u8>>)> = echoed_samples::table
+        .order(echoed_samples::id)
+        .load(&mut connection)
+        .expect("read echoed_samples");
+    assert_eq!(rows, [(1, Some(2.5), Some(vec![0x00, 0xff])), (2, None, None)]);
+}

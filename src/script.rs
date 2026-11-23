@@ -215,31 +215,168 @@ impl<S: core::fmt::Display> HelperFunction<S> {
         connection: &mut diesel::sqlite::SqliteConnection,
     ) -> diesel::QueryResult<()> {
         use diesel::RunQueryDsl;
-        use diesel_dynamic_schema::{
-            dynamic_value::{Any, DynamicRow, SqliteAnyValue},
-            table,
-        };
+        use diesel_dynamic_schema::dynamic_value::DynamicRow;
 
-        let function = table(self.name.clone());
-        let columns: Vec<_> =
-            self.columns.iter().map(|column| function.column::<Any, _>(column.clone())).collect();
-        let parameters: Vec<_> = self
-            .parameters
-            .iter()
-            .map(|parameter| function.column::<Any, _>(parameter.clone()))
-            .collect();
         let body = self.body.to_string();
         connection.register_table_valued_function(
-            columns,
-            parameters,
+            ResultColumns { function: &self.name, columns: &self.columns },
+            Parameters(self.parameters.clone()),
             diesel::sqlite::SqliteFunctionBehavior::INNOCUOUS,
-            move |connection, arguments: DynamicRow<SqliteAnyValue>| {
-                let query = (&arguments).into_iter().fold(
+            move |connection, arguments: Vec<StoredValue>| {
+                let query = arguments.iter().fold(
                     diesel::sql_query(body.as_str()).into_boxed::<diesel::sqlite::Sqlite>(),
                     |query, argument| argument.bind_to(query),
                 );
-                query.load::<DynamicRow<SqliteAnyValue>>(connection)
+                let rows = query.load::<DynamicRow<StoredValue>>(connection)?;
+                Ok(rows.into_iter().map(|row| StoredRow(row.into_iter().collect())))
             },
         )
+    }
+}
+
+/// The relation declaring a helper function, whose columns and parameters
+/// are named at run time.
+#[cfg(feature = "diesel")]
+struct HelperRelation;
+
+/// The columns a helper function returns.
+#[cfg(feature = "diesel")]
+struct ResultColumns<'s> {
+    function: &'s str,
+    columns: &'s [String],
+}
+
+#[cfg(feature = "diesel")]
+impl diesel::sqlite::SqliteTableFunctionColumns<HelperRelation> for ResultColumns<'_> {
+    type SqlType = ();
+
+    fn function_name(&self) -> diesel::QueryResult<&str> {
+        Ok(self.function)
+    }
+
+    fn column_names(&self) -> Vec<&str> {
+        self.columns.iter().map(String::as_str).collect()
+    }
+
+    fn relation_column_names(&self) -> Option<Vec<&str>> {
+        None
+    }
+}
+
+/// The parameters of a helper function, each argument read in the storage
+/// class SQLite passes it in.
+#[cfg(feature = "diesel")]
+struct Parameters(Vec<String>);
+
+#[cfg(feature = "diesel")]
+impl diesel::sqlite::SqliteTableFunctionParameters<HelperRelation, Vec<StoredValue>>
+    for Parameters
+{
+    fn parameter_names(&self, _function_name: &str) -> diesel::QueryResult<Vec<&str>> {
+        Ok(self.0.iter().map(String::as_str).collect())
+    }
+
+    fn arguments<'a>(
+        &self,
+        row: &impl diesel::row::Row<'a, diesel::sqlite::Sqlite>,
+    ) -> diesel::deserialize::Result<Vec<StoredValue>> {
+        use diesel::{deserialize::FromSql, row::Field, sqlite::Sqlite};
+        use diesel_dynamic_schema::dynamic_value::Any;
+        (0..row.field_count())
+            .map(|index| {
+                let field = row.get(index);
+                <StoredValue as FromSql<Any, Sqlite>>::from_nullable_sql(
+                    field.as_ref().and_then(Field::value),
+                )
+            })
+            .collect()
+    }
+}
+
+/// One row a helper function answers.
+#[cfg(feature = "diesel")]
+struct StoredRow(Vec<StoredValue>);
+
+#[cfg(feature = "diesel")]
+impl diesel::sqlite::SqliteTableFunctionRow<()> for StoredRow {
+    fn for_each_value(
+        &self,
+        mut sink: impl FnMut(diesel::sqlite::SqliteBindValue<'_>),
+    ) -> diesel::QueryResult<()> {
+        use diesel::sqlite::SqliteBindValue;
+        for value in &self.0 {
+            sink(match value {
+                StoredValue::Null => SqliteBindValue::from(None::<i64>),
+                StoredValue::Integer(value) => SqliteBindValue::from(*value),
+                StoredValue::Real(value) => SqliteBindValue::from(*value),
+                StoredValue::Text(value) => SqliteBindValue::from(value.as_str()),
+                StoredValue::Blob(value) => SqliteBindValue::from(value.as_slice()),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// A value in the storage class SQLite holds it in.
+#[cfg(feature = "diesel")]
+enum StoredValue {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+#[cfg(feature = "diesel")]
+impl StoredValue {
+    /// `query` with the value bound to its next placeholder, typed as its
+    /// storage class.
+    fn bind_to<'f, Query>(
+        &'f self,
+        query: diesel::query_builder::BoxedSqlQuery<'f, diesel::sqlite::Sqlite, Query>,
+    ) -> diesel::query_builder::BoxedSqlQuery<'f, diesel::sqlite::Sqlite, Query> {
+        use diesel::sql_types::{BigInt, Binary, Double, Nullable, Text};
+        match self {
+            Self::Null => query.bind::<Nullable<BigInt>, _>(None::<i64>),
+            Self::Integer(value) => query.bind::<BigInt, _>(value),
+            Self::Real(value) => query.bind::<Double, _>(value),
+            Self::Text(value) => query.bind::<Text, _>(value),
+            Self::Blob(value) => query.bind::<Binary, _>(value),
+        }
+    }
+}
+
+#[cfg(feature = "diesel")]
+impl diesel::deserialize::FromSql<diesel_dynamic_schema::dynamic_value::Any, diesel::sqlite::Sqlite>
+    for StoredValue
+{
+    /// `value` in its storage class, SQLite holding anything neither an
+    /// integer, a real nor text as a blob.
+    fn from_sql(
+        value: diesel::sqlite::SqliteValue<'_, '_, '_>,
+    ) -> diesel::deserialize::Result<Self> {
+        use diesel::{
+            deserialize::FromSql,
+            sql_types::{BigInt, Binary, Double, Text},
+            sqlite::{Sqlite, SqliteType},
+        };
+        match value.value_type() {
+            Some(SqliteType::Long) => {
+                <i64 as FromSql<BigInt, Sqlite>>::from_sql(value).map(Self::Integer)
+            }
+            Some(SqliteType::Double) => {
+                <f64 as FromSql<Double, Sqlite>>::from_sql(value).map(Self::Real)
+            }
+            Some(SqliteType::Text) => {
+                <String as FromSql<Text, Sqlite>>::from_sql(value).map(Self::Text)
+            }
+            _ => <Vec<u8> as FromSql<Binary, Sqlite>>::from_sql(value).map(Self::Blob),
+        }
+    }
+
+    fn from_nullable_sql(
+        value: Option<diesel::sqlite::SqliteValue<'_, '_, '_>>,
+    ) -> diesel::deserialize::Result<Self> {
+        value.map_or(Ok(Self::Null), Self::from_sql)
     }
 }

@@ -253,7 +253,9 @@ fn untranslatable(name: &ObjectName, error: &HelperSetError) -> Error {
 /// The set is the body of a helper function taking no parameter, one per
 /// helper and arguments, answering the columns the helper returns, or one
 /// named as the helper for a set of a scalar type, and the query reads them
-/// by `names`, a column past the end of `names` by its own.
+/// by `names`, a column past the end of `names` by its own. A set reading
+/// the table the enclosing `INSERT` writes is written in place, so SQLite
+/// copies the source before writing a row of it.
 fn helper_query(
     helper: &<ParserDB as DatabaseLike>::Function,
     name: &ObjectName,
@@ -263,7 +265,10 @@ fn helper_query(
     caller: &TranslationContext<'_>,
     emit: WarningSink<'_>,
 ) -> Result<Query, Error> {
-    let call = helper_call(helper, name, arguments.as_deref().ok(), names, schema, caller);
+    // A set an `INSERT` source reads may be written in place, so it is never
+    // kept or taken from what a call elsewhere translated to.
+    let call = helper_call(helper, name, arguments.as_deref().ok(), names, schema, caller)
+        .filter(|_| caller.inserting_into().is_none());
     if let Some(kept) = call.as_deref().and_then(|call| kept_query(call, caller, emit)) {
         return Ok(kept);
     }
@@ -285,8 +290,43 @@ fn helper_query(
             )
         })
         .map_err(|error| untranslatable(name, &error))?;
+    let mut warnings = Vec::new();
+    let lowered = lower(&set, name, &[], schema, options, &mut |warning| warnings.push(warning))?;
+    let reads_the_written_table = options.inserting_into().is_some_and(|table| {
+        crate::impls::helper_functions::reads(&options.helper_functions(), &lowered, table)
+    });
+    if reads_the_written_table {
+        let in_place = lower(&set, name, names, schema, options, &mut |_| {})?;
+        raise(warnings, emit);
+        return Ok(in_place);
+    }
+    let mut columns = returned_columns(helper, schema);
+    if columns.is_empty() {
+        columns.extend(last_ident(name).cloned());
+    }
+    let query = sql_helper::helper_call(helper, &columns, names, Vec::new(), lowered, options);
+    if let Some(call) = call {
+        let mut cache = options.batch_cache().borrow_mut();
+        if cache.holds(call.schema) {
+            cache.helper_queries.keep(call, &query, &warnings);
+        }
+    }
+    raise(warnings, emit);
+    Ok(query)
+}
+
+/// The SQLite query answering `set`, the set a call to `name` returns, under
+/// `names`.
+fn lower<'db>(
+    set: &HelperSet<'db, ParserDB>,
+    name: &ObjectName,
+    names: &[Ident],
+    schema: &'db ParserDB,
+    options: &TranslationContext<'_>,
+    emit: WarningSink<'_>,
+) -> Result<Query, Error> {
     let mut lowering = Lowering { helper: name, schema, read: Vec::new(), walks: 0 };
-    let lowered = lowering.set(&set, &[])?;
+    let lowered = lowering.set(set, names)?;
     let acting = session_variable::acting_role(schema, options)?;
     let mut guarded = Vec::new();
     for table in lowering.read {
@@ -303,24 +343,10 @@ fn helper_query(
             guarded.push(table_name);
         }
     }
-    let mut warnings = Vec::new();
-    let mut lowered =
-        lowered.translate_with_warnings(schema, options, &mut |warning| warnings.push(warning))?;
+    let mut lowered = lowered.translate_with_warnings(schema, options, emit)?;
     let ControlFlow::Continue(()) = lowered
         .visit(&mut BackingTables { guarded: &guarded, suffix: options.get_rls_table_suffix() });
-    let mut columns = returned_columns(helper, schema);
-    if columns.is_empty() {
-        columns.extend(last_ident(name).cloned());
-    }
-    let query = sql_helper::helper_call(helper, &columns, names, Vec::new(), lowered, options);
-    if let Some(call) = call {
-        let mut cache = options.batch_cache().borrow_mut();
-        if cache.holds(call.schema) {
-            cache.helper_queries.keep(call, &query, &warnings);
-        }
-    }
-    raise(warnings, emit);
-    Ok(query)
+    Ok(lowered)
 }
 
 /// The columns `RETURNS TABLE (...)` declares on `helper`, none for a
@@ -621,9 +647,9 @@ impl<'db> Lowering<'_, 'db> {
         (ObjectName(name), arguments)
     }
 
-    /// The set a call to `function` with `arguments` returns, for a
-    /// membership test: `SELECT f(...)` for a set of a scalar type and
-    /// `SELECT * FROM f(...)` for rows of declared columns.
+    /// The set a call to `function` with `arguments` returns for a membership
+    /// test, `SELECT f(...)` for a set of a scalar type and `SELECT * FROM
+    /// f(...)` for rows of declared columns.
     fn called_set(
         &self,
         function: &<ParserDB as DatabaseLike>::Function,

@@ -177,7 +177,7 @@ pub(crate) fn inlined_call<'s>(
     match inliner.call(call, helper, caller)? {
         Expansion::Expression(expression) => Ok(Some(Inlined::Postgres(expression))),
         Expansion::Rows(rows) => {
-            rows.translate_call(schema, options, emit)
+            rows.translate(true, schema, options, emit)
                 .map(|query| Some(Inlined::Sqlite(Expr::Subquery(Box::new(query)))))
         }
     }
@@ -186,9 +186,10 @@ pub(crate) fn inlined_call<'s>(
 /// The rows `FROM name(arguments)` reads, when `helper` is a set-returning
 /// `LANGUAGE sql` function running as its caller: the query its body runs,
 /// with the arguments bound to the parameters, each column under its name in
-/// `columns` and cast to its declared type. A `STRICT` function, which
-/// PostgreSQL calls, is read through the helper function holding that query,
-/// and any other has the query written in place of the call.
+/// `columns` and cast to its declared type. A function PostgreSQL calls
+/// without inlining it, see [`is_called_in_from`], is read through the helper
+/// function holding that query, and any other has the query written in place
+/// of the call.
 ///
 /// The arguments may read the queries around the call, as a column of an
 /// enclosing query or a trigger's `NEW` and `OLD` do. `None` leaves a
@@ -218,13 +219,7 @@ pub(crate) fn inlined_rows<'s>(
     let caller = calling_role(schema, options)?;
     let mut inliner = Inliner { schema, options, expanding: Vec::new(), keep_sets: false };
     let rows = inliner.set(name, arguments, helper, caller, columns)?;
-    // PostgreSQL inlines a set-returning SQL function in FROM only when it is
-    // not STRICT, and calls it otherwise.
-    if is_strict(helper) {
-        rows.translate_call(schema, options, emit).map(Some)
-    } else {
-        rows.translate_inline(schema, options, emit).map(Some)
-    }
+    rows.translate(is_called_in_from(helper), schema, options, emit).map(Some)
 }
 
 /// Whether `function`'s body is SQL, the one language whose body has an
@@ -240,6 +235,43 @@ fn is_strict(function: &CreateFunction) -> bool {
         function.null_input_behavior(),
         FunctionCalledOnNull::Strict | FunctionCalledOnNull::ReturnsNullOnNullInput
     )
+}
+
+/// Whether PostgreSQL calls `function` in `FROM` without inlining it, as it
+/// does a `STRICT` function and one setting a configuration parameter.
+fn is_called_in_from(function: &CreateFunction) -> bool {
+    is_strict(function) || !function.configuration_parameters().is_empty()
+}
+
+/// Whether `expr` reads a column outside any subquery it holds, which makes a
+/// subquery passing it correlated with the row reading it.
+fn reads_a_column_in_place(expr: &Expr) -> bool {
+    struct Columns {
+        depth: usize,
+    }
+    impl Visitor for Columns {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, _query: &Query) -> ControlFlow<()> {
+            self.depth += 1;
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<()> {
+            self.depth -= 1;
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+            match expr {
+                Expr::Identifier(_) | Expr::CompoundIdentifier(_) if self.depth == 0 => {
+                    ControlFlow::Break(())
+                }
+                _ => ControlFlow::Continue(()),
+            }
+        }
+    }
+    expr.visit(&mut Columns { depth: 0 }).is_break()
 }
 
 /// `expr` with every call it makes to a scalar `LANGUAGE sql` function the
@@ -480,19 +512,35 @@ impl<'s> Inliner<'s, '_> {
         self.qualify_calls(name, helper, &mut statement)?;
         // A helper function evaluates each argument once per call, as
         // PostgreSQL does, and a body written in place reads it where it reads
-        // the parameter.
-        let hosted = matches!(answer, Answer::Value(_)) || is_strict(helper);
+        // the parameter. SQLite evaluates a call reading no column of the
+        // calling row once for the whole statement.
+        let hosted = matches!(answer, Answer::Value(_)) || is_called_in_from(helper);
+        let correlated =
+            arguments.bound.iter().any(|bound| reads_a_column_in_place(&bound.written));
         if let Some(bound) = arguments.bound.iter().find(|bound| {
-            !hosted && !is_atomic(&bound.written) && !is_replayable(&bound.written, self.options)
+            !is_atomic(&bound.written) && !is_replayable(&bound.written, self.options)
         }) {
-            return Err(refusal(
-                name,
-                &format!(
-                    "reads relations and is passed {}, which may answer differently on each \
-                     evaluation where PostgreSQL evaluates it once. Pass a column or a literal",
-                    bound.written
-                ),
-            ));
+            if !hosted {
+                return Err(refusal(
+                    name,
+                    &format!(
+                        "reads relations and is passed {}, which may answer differently on each \
+                         evaluation where PostgreSQL evaluates it once. Pass a column or a literal",
+                        bound.written
+                    ),
+                ));
+            }
+            if !correlated {
+                return Err(refusal(
+                    name,
+                    &format!(
+                        "reads relations and is passed {}, which SQLite evaluates once for the \
+                         whole statement where PostgreSQL evaluates it on each row. Pass an \
+                         argument reading a column of the row",
+                        bound.written
+                    ),
+                ));
+            }
         }
         let owner = match helper.security_mode() {
             FunctionSecurity::Definer => Some(owner(name, helper, self.schema)?),
@@ -822,7 +870,11 @@ fn argument_column(relation: &Ident, position: usize) -> Expr {
 /// its own past the end of `names`, from the helper function whose body is
 /// `body`, recorded in `options` under a name derived from `helper`'s.
 ///
-/// The body reads the argument at position `k`, from one, as `?k`.
+/// The body reads the argument at position `k`, from one, as `?k`. A function
+/// taking arguments declares its columns and parameters under reserved names
+/// and is read through a derived table naming its columns, since SQLite
+/// resolves a call's arguments with the function's own columns and the
+/// aliases of the select holding the call in scope.
 pub(crate) fn helper_call(
     helper: &CreateFunction,
     columns: &[Ident],
@@ -831,7 +883,7 @@ pub(crate) fn helper_call(
     body: Query,
     options: &TranslationContext<'_>,
 ) -> Query {
-    let stem: String =
+    let mut stem: String =
         helper
             .target_name()
             .name()
@@ -840,25 +892,58 @@ pub(crate) fn helper_call(
                 if character.is_ascii_alphanumeric() { character.to_ascii_lowercase() } else { '_' }
             })
             .collect();
-    let parameters = (1..=arguments.len()).map(|position| format!("argument_{position}")).collect();
+    if stem.starts_with(|character: char| character.is_ascii_digit()) {
+        stem.insert(0, '_');
+    }
+    let passes_arguments = !arguments.is_empty();
+    let parameters =
+        (1..=arguments.len()).map(|position| format!("pg2sqlite_argument_{position}")).collect();
+    let declared: Vec<Ident> = if passes_arguments {
+        (1..=columns.len())
+            .map(|position| Ident::new(format!("pg2sqlite_column_{position}")))
+            .collect()
+    } else {
+        columns.to_vec()
+    };
     let function = options.record_helper_function(
         &stem,
         parameters,
-        columns.iter().map(|column| column.value.clone()).collect(),
+        declared.iter().map(|column| column.value.clone()).collect(),
         body,
     );
-    let projection = columns.iter().enumerate().map(|(position, column)| {
-        let expr = Expr::Identifier(column.clone());
-        match names.get(position) {
-            Some(name) if name != column => SelectItem::ExprWithAlias { expr, alias: name.clone() },
-            _ => SelectItem::UnnamedExpr(expr),
-        }
-    });
+    let mut relation = table_function_factor(&function, arguments, None, false);
+    if passes_arguments {
+        let projection = declared
+            .iter()
+            .map(|column| SelectItem::UnnamedExpr(Expr::Identifier(column.clone())))
+            .collect();
+        relation = TableFactor::Derived {
+            lateral: false,
+            subquery: Box::new(make_query(
+                None,
+                SetExpr::Select(Box::new(make_simple_select(
+                    projection,
+                    from_relation(relation),
+                    None,
+                ))),
+            )),
+            alias: None,
+            sample: None,
+        };
+    }
+    let projection =
+        declared.iter().zip(columns).enumerate().map(|(position, (declared, column))| {
+            let expr = Expr::Identifier(declared.clone());
+            match names.get(position).unwrap_or(column) {
+                alias if alias == declared => SelectItem::UnnamedExpr(expr),
+                alias => SelectItem::ExprWithAlias { expr, alias: alias.clone() },
+            }
+        });
     make_query(
         None,
         SetExpr::Select(Box::new(make_simple_select(
             projection.collect(),
-            from_relation(table_function_factor(&function, arguments, None, false)),
+            from_relation(relation),
             None,
         ))),
     )
@@ -1007,50 +1092,40 @@ impl RowsCall<'_> {
         )
     }
 
-    /// The SQLite query answering the call where `options` reaches it, the
-    /// body written in place of the call.
+    /// The SQLite query answering the call where `options` reaches it, through
+    /// the helper function whose body answers it when `called`, as PostgreSQL
+    /// calls a function it does not inline, and with the body written in
+    /// place of the call otherwise.
     ///
     /// The body translates as the role it runs as, a `SECURITY DEFINER` one
     /// reading the backing table of each table it names, and the arguments
-    /// translate where the call stands.
+    /// translate where the call stands. A called body reads the arguments as
+    /// the parameters `?1..?n` and runs as a statement of its own, so a body
+    /// reading the table the enclosing `INSERT` writes is written in place,
+    /// which has SQLite copy the source before writing a row of it, as
+    /// PostgreSQL reads the statement's snapshot.
     ///
     /// # Errors
     ///
-    /// Refuses a body or arguments that do not translate, and a definer body
-    /// naming a table whose policies bind its owner.
-    fn translate_inline(
+    /// Refuses a body or arguments that do not translate, a definer body
+    /// naming a table whose policies bind its owner, and an argument that may
+    /// answer differently on each evaluation passed to a body written in
+    /// place.
+    fn translate(
         self,
-        schema: &ParserDB,
-        options: &TranslationContext<'_>,
-        emit: WarningSink<'_>,
-    ) -> Result<Query, Error> {
-        let arguments = (!self.arguments.is_empty()).then(|| self.arguments(false));
-        let (mut translated, slot) = self.translate_body(schema, options, emit)?;
-        if let (Some((index, mut cte)), Some(arguments)) = (slot, arguments) {
-            *cte.query = arguments.translate_with_warnings(schema, options, emit)?;
-            translated.with.get_or_insert_with(empty_with).cte_tables.insert(index, cte);
-        }
-        Ok(translated)
-    }
-
-    /// The SQLite query answering the call through the helper function whose
-    /// body answers it, as PostgreSQL calls a function it does not inline.
-    ///
-    /// The body reads the arguments as the parameters `?1..?n` and runs as a
-    /// statement of its own, and the arguments translate where the call
-    /// stands and are passed to the function there.
-    ///
-    /// # Errors
-    ///
-    /// Refuses as [`Self::translate_inline`] does.
-    fn translate_call(
-        self,
+        called: bool,
         schema: &ParserDB,
         options: &TranslationContext<'_>,
         emit: WarningSink<'_>,
     ) -> Result<Query, Error> {
         let helper = self.helper;
         let count = self.arguments.len();
+        let changing = self
+            .arguments
+            .iter()
+            .map(|(argument, _)| argument)
+            .find(|argument| !is_atomic(argument) && !is_replayable(argument, options))
+            .cloned();
         let arguments = (count > 0).then(|| self.arguments(false));
         let columns = match &self.answered {
             Answered::Value(_) => vec![Ident::new(VALUE)],
@@ -1059,6 +1134,26 @@ impl RowsCall<'_> {
             }
         };
         let (mut body, slot) = self.translate_body(schema, options, emit)?;
+        let reads_the_written_table = options.inserting_into().is_some_and(|target| {
+            crate::impls::helper_functions::reads(&options.helper_functions(), &body, target)
+        });
+        if !called || reads_the_written_table {
+            if let Some(argument) = changing.filter(|_| called) {
+                return Err(refusal(
+                    &helper.name,
+                    &format!(
+                        "reads the table the INSERT writes, so its body is written in place, and \
+                         is passed {argument}, which may answer differently on each evaluation \
+                         where PostgreSQL evaluates it once. Pass a column or a literal"
+                    ),
+                ));
+            }
+            if let (Some((index, mut cte)), Some(arguments)) = (slot, arguments) {
+                *cte.query = arguments.translate_with_warnings(schema, options, emit)?;
+                body.with.get_or_insert_with(empty_with).cte_tables.insert(index, cte);
+            }
+            return Ok(body);
+        }
         let mut passed = Vec::new();
         if let (Some((index, mut cte)), Some(arguments)) = (slot, arguments) {
             *cte.query = parameters_row(count);
@@ -1121,6 +1216,7 @@ impl RowsCall<'_> {
     }
 }
 
+/// The column a call answering one value reads it under.
 const VALUE: &str = "value";
 
 /// The one row of a helper function's parameters, `?k` under the name the

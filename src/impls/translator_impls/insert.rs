@@ -176,10 +176,22 @@ impl crate::traits::translator::TranslatorWithContext for Insert {
         substitute_default_values(&mut prepared, schema, options, emit)?;
         assign_insert_values(&mut prepared, schema, options)?;
 
+        // A helper the source calls whose body reads the written table is
+        // written in place, so SQLite copies the source before writing a row.
+        let written = match &prepared.table {
+            TableObject::TableName(name) => {
+                Some(crate::impls::emitted_namespace::key(
+                    &normalize_schema_qualified_object_name_for_sqlite(schema, name)?,
+                ))
+            }
+            TableObject::TableFunction(_) | TableObject::TableQuery(_) => None,
+        };
+        let writing = written.as_deref().map(|table| options.with_inserting_into(table));
+        let source_options = writing.as_ref().unwrap_or(options);
         let source = prepared
             .source
             .as_ref()
-            .map(|q| q.translate_with_warnings(schema, options, emit))
+            .map(|q| q.translate_with_warnings(schema, source_options, emit))
             .transpose()?
             .map(Box::new);
         let mut insert = Insert { source, ..prepared };
