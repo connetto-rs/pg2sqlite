@@ -831,6 +831,7 @@ impl Pg2Sqlite {
             statement,
             Statement::Drop { object_type: ObjectType::Table | ObjectType::View, .. }
                 | Statement::RenameTable(_)
+                | Statement::DropFunction(_)
                 | Statement::AlterType(sqlparser::ast::AlterType {
                     operation: sqlparser::ast::AlterTypeOperation::Rename(_),
                     ..
@@ -1172,6 +1173,14 @@ impl Pg2Sqlite {
                 let event_before = (follows_triggers
                     && TriggerFollower::is_event(&statements[index]))
                 .then(|| input.snapshot());
+                if let Err(error) =
+                    crate::impls::translator_impls::function_cascade::reject_other_dependents(
+                        &statements[index],
+                        &input,
+                    )
+                {
+                    break Err(error);
+                }
                 match input.apply_statement(statements[index].clone()) {
                     Ok(next) => input = next,
                     Err(error) => break Err(error.into()),
@@ -1385,6 +1394,12 @@ impl Pg2Sqlite {
                 context,
             );
             for (offset, statement) in statements[epoch.start..epoch.end].iter().enumerate() {
+                // A function dropped with `CASCADE` first drops each trigger
+                // running it.
+                let cascaded = follower.cascaded(statement);
+                for drop in &cascaded {
+                    context.follow_triggers(drop);
+                }
                 context.follow_triggers(statement);
                 rebuilt_triggers.push(false);
                 if !should_translate(statement) {
@@ -1410,7 +1425,22 @@ impl Pg2Sqlite {
                         };
                         let sides =
                             event_sides(statement, epochs, (epoch_index, index), final_schema, at);
-                        let (emitted, rebuilt) = translate_followed(
+                        let mut emitted = Vec::new();
+                        let mut rebuilt = false;
+                        for drop in &cascaded {
+                            let (mut dropped, _) = translate_followed(
+                                drop,
+                                at,
+                                None,
+                                initial_schema,
+                                &mut trackers,
+                                &mut follower,
+                                &mut emit,
+                            )?;
+                            rebuilt |= !dropped.is_empty();
+                            emitted.append(&mut dropped);
+                        }
+                        let (mut own, own_rebuilt) = translate_followed(
                             statement,
                             at,
                             sides,
@@ -1419,7 +1449,8 @@ impl Pg2Sqlite {
                             &mut follower,
                             &mut emit,
                         )?;
-                        rebuilt_triggers[index] = rebuilt;
+                        emitted.append(&mut own);
+                        rebuilt_triggers[index] = rebuilt || own_rebuilt;
                         translated.push(emitted);
                     }
                 }
