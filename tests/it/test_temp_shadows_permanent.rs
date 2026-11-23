@@ -485,6 +485,45 @@ fn temp_shadows_views_keep_their_bound_table() {
     }
 }
 
+/// A view naming a quoted schema keeps reading the permanent rows.
+#[test]
+fn temp_shadows_views_keep_a_quoted_schema_binding() {
+    let rows = run_translated_default(
+        r#"CREATE TABLE "public".scratch (id INTEGER);
+         INSERT INTO "public".scratch VALUES (10);
+         CREATE TEMP TABLE scratch (id INTEGER);
+         INSERT INTO pg_temp.scratch VALUES (20);
+         CREATE VIEW seen AS SELECT id FROM "public".scratch;
+         SELECT id FROM seen;"#,
+    );
+    assert_eq!(rows, vec![Some("10".into())]);
+}
+
+/// Reading a temporary view promotes a view that shadows a permanent view.
+#[test]
+fn temp_shadows_views_reading_a_temporary_view_become_temporary() {
+    let rows = run_translated_default(
+        "CREATE VIEW seen AS SELECT 10 AS id;
+         CREATE TEMP VIEW scratch AS SELECT 20 AS id;
+         CREATE VIEW seen AS SELECT id FROM scratch;
+         SELECT id FROM public.seen
+         UNION ALL SELECT id FROM pg_temp.seen ORDER BY id;",
+    );
+    assert_eq!(rows, vec![Some("10".into()), Some("20".into())]);
+}
+
+/// A table function leaves a shadowed permanent view in the permanent schema.
+#[test]
+fn temp_shadows_views_over_a_table_function_stay_permanent() {
+    let rows = run_translated_default(
+        "CREATE VIEW seen AS SELECT value AS id FROM json_array_elements_text('[10]');
+         CREATE TEMP VIEW seen AS SELECT '20' AS id;
+         SELECT id FROM public.seen
+         UNION ALL SELECT id FROM pg_temp.seen ORDER BY id;",
+    );
+    assert_eq!(rows, vec![Some("10".into()), Some("20".into())]);
+}
+
 #[test]
 fn temp_shadows_views_created_before_shadowing_keep_their_bound_table() {
     for relation in ["public.scratch", "scratch"] {
