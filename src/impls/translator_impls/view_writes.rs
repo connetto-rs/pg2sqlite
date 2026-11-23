@@ -21,9 +21,8 @@ use sql_traits::{
 };
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, ConflictTarget, Delete, Expr, FromTable, Ident, Insert,
-    ObjectName, ObjectNamePart, OnConflictAction, OnInsert, SelectItem,
-    SelectItemQualifiedWildcardKind, SetExpr, Statement, TableAlias, TableFactor, TableObject,
-    Update, Visit, VisitMut, Visitor, VisitorMut,
+    ObjectName, ObjectNamePart, OnConflictAction, OnInsert, Query, Select, SelectItem, SetExpr,
+    Statement, TableAlias, TableFactor, TableObject, Update, Visit, VisitMut, Visitor, VisitorMut,
 };
 
 #[cfg(not(feature = "std"))]
@@ -39,7 +38,7 @@ use crate::{
 };
 
 /// What a view stands for over the relation it reads, one level down.
-struct Landing {
+struct Landing<'view> {
     /// The relation the write lands on, as a statement names it.
     relation: ObjectName,
     /// Each output column's name as PostgreSQL stores it, `None` past a
@@ -48,6 +47,10 @@ struct Landing {
     /// The column of `relation` each output column writes, `None` for one
     /// that computes its value.
     columns: Vec<Option<Ident>>,
+    definition: &'view Query,
+    select: &'view Select,
+    base: usize,
+    base_columns: Vec<Ident>,
 }
 
 /// `insert` written onto the relation the view it names reads, or `None`
@@ -76,9 +79,7 @@ pub(crate) fn land_insert(
         Some(alias) => alias.alias.clone(),
         None => last_part(name),
     };
-    let Some((rows, _)) = Rows::of(view, schema, &landing, exposed_name, &qualifier)? else {
-        return Ok(None);
-    };
+    let (rows, _) = Rows::of(schema, &landing, exposed_name, &qualifier)?;
 
     let mut statement = Statement::Insert(insert.clone());
     let replacements = {
@@ -155,10 +156,7 @@ pub(crate) fn land_update(
     };
     let view_name = view.stored_view_name();
     let qualifier = exposed(name, alias.as_ref());
-    let Some((rows, condition)) = Rows::of(view, schema, &landing, qualifier.clone(), &qualifier)?
-    else {
-        return Ok(None);
-    };
+    let (rows, condition) = Rows::of(schema, &landing, qualifier.clone(), &qualifier)?;
 
     let mut statement = Statement::Update(update.clone());
     let replacements = {
@@ -196,18 +194,12 @@ pub(crate) fn land_delete(
 ) -> Result<Option<Delete>, Error> {
     let (FromTable::WithFromKeyword(targets) | FromTable::WithoutKeyword(targets)) = &delete.from;
     let [target] = targets.as_slice() else { return Ok(None) };
-    if !target.joins.is_empty() || !delete.tables.is_empty() {
-        return Ok(None);
-    }
     let TableFactor::Table { name, alias, .. } = &target.relation else { return Ok(None) };
-    let Some((view, landing)) = landing(name, Event::Delete, schema, options)? else {
+    let Some((_view, landing)) = landing(name, Event::Delete, schema, options)? else {
         return Ok(None);
     };
     let qualifier = exposed(name, alias.as_ref());
-    let Some((rows, condition)) = Rows::of(view, schema, &landing, qualifier.clone(), &qualifier)?
-    else {
-        return Ok(None);
-    };
+    let (rows, condition) = Rows::of(schema, &landing, qualifier.clone(), &qualifier)?;
 
     let mut statement = Statement::Delete(delete.clone());
     let replacements = {
@@ -228,7 +220,7 @@ pub(crate) fn land_delete(
     landed.selection = narrowed(condition, landed.selection.take());
     let (FromTable::WithFromKeyword(targets) | FromTable::WithoutKeyword(targets)) =
         &mut landed.from;
-    if let Some(target) = targets.first_mut() {
+    for target in targets {
         target.relation = landing.target(&qualifier);
     }
     Ok(Some(landed))
@@ -243,7 +235,7 @@ fn landing<'s>(
     event: Event,
     schema: &'s ParserDB,
     options: &TranslationContext<'_>,
-) -> Result<Option<(&'s View, Landing)>, Error> {
+) -> Result<Option<(&'s View, Landing<'s>)>, Error> {
     let Some(view) = resolve_view(name, schema)? else { return Ok(None) };
     let stored = view.stored_view_name();
     if options.instead_of_trigger_takes(&stored, |fired| Event::of(fired) == event)
@@ -254,7 +246,16 @@ fn landing<'s>(
     {
         return Ok(None);
     }
+    let definition = view.definition();
+    let mut body = definition.body.as_ref();
+    while let SetExpr::Query(inner) = body {
+        body = inner.body.as_ref();
+    }
+    let SetExpr::Select(select) = body else { return Ok(None) };
+    let [from] = select.from.as_slice() else { return Ok(None) };
     let Some(base) = view.updatable_base(schema)? else { return Ok(None) };
+    let base_address = address(&from.relation);
+    let base_columns = relation_columns(&base, schema)?;
     let (relation, columns) = match base {
         UpdatableViewBase::Table { table, columns }
         | UpdatableViewBase::ForeignTable { table, columns } => {
@@ -288,10 +289,13 @@ fn landing<'s>(
         }
     };
     let names = output_names(view, schema)?;
-    Ok(Some((view, Landing { relation, names, columns })))
+    Ok(Some((
+        view,
+        Landing { relation, names, columns, definition, select, base: base_address, base_columns },
+    )))
 }
 
-impl Landing {
+impl Landing<'_> {
     /// The column of the written relation the view column `ident` passes
     /// through, refusing one it computes or does not have.
     fn written(&self, ident: &Ident, view: &str, verb: &str) -> Result<Ident, Error> {
@@ -333,16 +337,24 @@ impl Landing {
     /// The written relation as the target of an update or a delete, under
     /// `qualifier`.
     fn target(&self, qualifier: &Ident) -> TableFactor {
-        let mut factor = crate::impls::query_builder::plain_table_factor(self.relation.clone());
-        if let TableFactor::Table { alias, .. } = &mut factor {
-            *alias = Some(TableAlias {
+        TableFactor::Table {
+            name: self.relation.clone(),
+            alias: Some(TableAlias {
                 explicit: true,
                 name: qualifier.clone(),
                 columns: Vec::new(),
                 at: None,
-            });
+            }),
+            args: None,
+            with_hints: Vec::new(),
+            version: None,
+            with_ordinality: false,
+            partitions: Vec::new(),
+            json_path: None,
+            sample: None,
+            index_directives: Vec::new(),
+            inheritance: None,
         }
-        factor
     }
 }
 
@@ -369,20 +381,14 @@ struct ViewRow {
     condition: Option<Expr>,
 }
 
-/// What each output column of `view` selects, over the relation it reads
-/// named `qualifier`, with the view's condition over the same name, or
-/// `None` when the definition is no single plain `SELECT`.
-fn outputs(view: &View, schema: &ParserDB, qualifier: &Ident) -> Result<Option<ViewRow>, Error> {
-    let definition = view.definition();
-    let SetExpr::Select(select) = definition.body.as_ref() else { return Ok(None) };
-    let [from] = select.from.as_slice() else { return Ok(None) };
-    let base = address(&from.relation);
-    let base_columns = relation_columns(view, schema)?;
+/// The view's expressions over the written relation named `qualifier`.
+fn outputs(landing: &Landing<'_>, schema: &ParserDB, qualifier: &Ident) -> Result<ViewRow, Error> {
+    let Landing { definition, select, base, base_columns, .. } = landing;
     let context = ExpressionContext::new(definition, schema, IdentifierCase::AsWritten)?;
     let over = |expression: &Expr| -> Result<Expr, Error> {
         let replacements = decide(expression, |node| {
             let Some((_, binding)) = context.reference(node)? else { return Ok(None) };
-            let Some(entry) = binding.entry().filter(|entry| address(entry.factor()) == base)
+            let Some(entry) = binding.entry().filter(|entry| address(entry.factor()) == *base)
             else {
                 return Ok(None);
             };
@@ -396,34 +402,32 @@ fn outputs(view: &View, schema: &ParserDB, qualifier: &Ident) -> Result<Option<V
     for item in &select.projection {
         match item {
             SelectItem::UnnamedExpr(expression)
-            | SelectItem::ExprWithAlias { expr: expression, .. } => {
+            | SelectItem::ExprWithAlias { expr: expression, .. }
+            | SelectItem::ExprWithAliases { expr: expression, .. } => {
                 outputs.push(parenthesised(over(expression)?));
             }
-            SelectItem::Wildcard(_)
-            | SelectItem::QualifiedWildcard(SelectItemQualifiedWildcardKind::ObjectName(_), _) => {
-                outputs.extend(base_columns.iter().map(|column| qualified(qualifier, column)));
-            }
-            _ => return Ok(None),
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {}
         }
     }
     let condition = select.selection.as_ref().map(over).transpose()?;
-    Ok(Some(ViewRow { outputs, condition }))
+    Ok(ViewRow { outputs, condition })
 }
 
-/// The columns of the one relation `view` reads, in order, as references
-/// name them.
-fn relation_columns(view: &View, schema: &ParserDB) -> Result<Vec<Ident>, Error> {
-    Ok(match view.updatable_base(schema)? {
-        Some(
-            UpdatableViewBase::Table { table, .. } | UpdatableViewBase::ForeignTable { table, .. },
-        ) => table.columns(schema)?.map(declared_column_ident).collect(),
-        Some(UpdatableViewBase::View { view: inner, .. }) => {
+/// The written relation's columns in declaration order.
+fn relation_columns(
+    base: &UpdatableViewBase<'_, ParserDB>,
+    schema: &ParserDB,
+) -> Result<Vec<Ident>, Error> {
+    Ok(match base {
+        UpdatableViewBase::Table { table, .. } | UpdatableViewBase::ForeignTable { table, .. } => {
+            table.columns(schema)?.map(declared_column_ident).collect()
+        }
+        UpdatableViewBase::View { view: inner, .. } => {
             output_names(inner, schema)?
                 .into_iter()
                 .map(|name| stored_ident(name.as_deref().unwrap_or_default()))
                 .collect()
         }
-        None => Vec::new(),
     })
 }
 
@@ -440,28 +444,22 @@ struct Rows<'l> {
 }
 
 impl<'l> Rows<'l> {
-    /// The rows of `view` over the relation it reads, named `qualifier` for
-    /// the target row, with the view's condition over the same name, or
-    /// `None` when the definition is no single plain `SELECT`.
+    /// The view's rows over the written relation and its condition.
     fn of(
-        view: &View,
         schema: &ParserDB,
-        landing: &'l Landing,
+        landing: &'l Landing<'_>,
         exposed: Ident,
         qualifier: &Ident,
-    ) -> Result<Option<(Self, Option<Expr>)>, Error> {
-        let (Some(target), Some(excluded)) =
-            (outputs(view, schema, qualifier)?, outputs(view, schema, &Ident::new("excluded"))?)
-        else {
-            return Ok(None);
-        };
+    ) -> Result<(Self, Option<Expr>), Error> {
+        let target = outputs(landing, schema, qualifier)?;
+        let excluded = outputs(landing, schema, &Ident::new("excluded"))?;
         let rows = Self {
             exposed,
             target: target.outputs,
             excluded: excluded.outputs,
             names: &landing.names,
         };
-        Ok(Some((rows, target.condition)))
+        Ok((rows, target.condition))
     }
 
     /// The replacement of each column reference of `statement` that reads the

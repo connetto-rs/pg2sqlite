@@ -232,3 +232,54 @@ fn a_subquery_column_of_the_view_reads_its_own_relation() {
 fn a_write_into_a_missing_view_column_is_refused() {
     assert_refused(&format!("{SCHEMA} UPDATE v SET nope = 1;"), "nope");
 }
+
+#[test]
+fn a_parenthesized_view_definition_writes_its_table() {
+    assert_eq!(
+        run_translated_default(
+            "CREATE TABLE coverage_parenthesized_base (id INTEGER PRIMARY KEY, score INTEGER);
+             CREATE VIEW coverage_parenthesized_view AS (SELECT id, score FROM coverage_parenthesized_base);
+             INSERT INTO coverage_parenthesized_view VALUES (1, 2);
+             UPDATE coverage_parenthesized_view SET score = 3 WHERE id = 1;
+             DELETE FROM coverage_parenthesized_view WHERE id = 2;
+             SELECT id || ' ' || score FROM coverage_parenthesized_base;"
+        ),
+        [Some("1 3".to_owned())]
+    );
+}
+
+#[test]
+fn an_ambiguous_reference_in_a_view_write_is_refused() {
+    assert_refused(
+        &format!(
+            "{SCHEMA} UPDATE v SET score = (SELECT id FROM base first_base, base second_base);"
+        ),
+        "ambiguous",
+    );
+}
+
+#[test]
+fn a_wildcard_view_writes_a_table_in_another_schema() {
+    assert_eq!(
+        run_translated_default(
+            "CREATE SCHEMA coverage_schema;
+             CREATE TABLE coverage_schema.base (id INTEGER PRIMARY KEY, score INTEGER);
+             CREATE VIEW v AS SELECT * FROM coverage_schema.base;
+             INSERT INTO v VALUES (1, 2);
+             UPDATE v SET score = 4;
+             SELECT id || ' ' || score FROM coverage_schema.base;"
+        ),
+        [Some("1 4".to_owned())]
+    );
+}
+
+#[test]
+fn conflicts_through_a_view_can_skip_the_write() {
+    assert_eq!(
+        run("INSERT INTO base VALUES (1, 'a', 5);
+             INSERT INTO v (key, score) VALUES (1, 9) ON CONFLICT DO NOTHING;
+             INSERT INTO v (key, score) VALUES (1, 9) ON CONFLICT (key) DO NOTHING;
+             SELECT id || ' ' || score FROM base;"),
+        [Some("1 5".to_owned())]
+    );
+}
