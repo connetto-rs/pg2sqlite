@@ -1,21 +1,8 @@
-//! The names the emitted script defines, and the ones that would collide.
+//! Collision checks for the emitted `main` and `temp` database namespaces.
 //!
-//! PostgreSQL gives every schema its own namespace and scopes a trigger name to
-//! its table. SQLite has one namespace holding tables, views and indexes
-//! together, and one holding every trigger in the database. So objects that
-//! were distinct on the way in can arrive at the same name, and the script then
-//! fails at apply, or silently keeps only the first when the create carries
-//! `IF NOT EXISTS`.
-//!
-//! This walks the emitted statements keeping the namespaces SQLite itself would
-//! keep, rather than comparing the input's qualified names, because two of the
-//! collisions have nothing to do with schemas: a trigger name repeated on a
-//! second table, and a generated row-security backing table landing on a
-//! declared one.
-//!
-//! A `DROP` frees a name, and dropping a table or a view frees every index and
-//! trigger attached to it, so each of those records what it hangs off. Without
-//! that the walk would refuse input that translates and runs today.
+//! Tables, views and indexes share a namespace within each database, while
+//! triggers have their own. Dropping a relation releases its dependent indexes
+//! and triggers.
 
 use alloc::collections::BTreeMap;
 
@@ -26,7 +13,8 @@ use sql_traits::{
 use sqlparser::ast::{AlterTableOperation, ObjectName, ObjectType, RenameTableNameKind, Statement};
 
 use super::{
-    object_name::last_ident_value_or_display, translator_impls::create_trigger::trigger_relation,
+    object_name::last_ident_value_or_display,
+    translator_impls::create_trigger::{TriggerRelation, trigger_relation},
 };
 use crate::errors::Error;
 #[cfg(not(feature = "std"))]
@@ -77,7 +65,7 @@ pub(crate) fn reject_name_collisions<'a>(
     initial_schema: Option<&ParserDB>,
     emitted: impl IntoIterator<Item = (Source<'a>, &'a Statement)>,
 ) -> Result<(), Error> {
-    let mut namespaces = Namespaces::default();
+    let mut namespaces = Databases::default();
     if let Some(schema) = initial_schema {
         namespaces.seed(schema)?;
     }
@@ -85,6 +73,149 @@ pub(crate) fn reject_name_collisions<'a>(
         namespaces.apply(statement, source)?;
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct Databases<'a> {
+    main: Namespaces<'a>,
+    temporary: Namespaces<'a>,
+}
+
+impl<'a> Databases<'a> {
+    fn seed(&mut self, schema: &ParserDB) -> Result<(), Error> {
+        for table in schema.tables() {
+            let name = table.stored_table_name();
+            self.namespace(table.is_temporary()).define_object_key(
+                sqlite_key(&name),
+                None,
+                Source::Initial(initial_description(
+                    "table",
+                    table.table_schema(),
+                    table.table_name(),
+                )),
+            )?;
+        }
+        for view in schema.views() {
+            let name = view.stored_view_name();
+            self.namespace(view.is_temporary()).define_object_key(
+                sqlite_key(&name),
+                None,
+                Source::Initial(initial_description("view", view.view_schema(), view.view_name())),
+            )?;
+        }
+        for view in schema.materialized_views() {
+            let name = view.stored_view_name();
+            self.namespace(view.is_temporary()).define_object_key(
+                sqlite_key(&name),
+                None,
+                Source::Initial(initial_description(
+                    "materialized view",
+                    view.view_schema(),
+                    view.view_name(),
+                )),
+            )?;
+        }
+        for index in schema.indexes() {
+            let Some(name) = index.name() else { continue };
+            let owner = sqlite_key(&index.table().stored_table_name());
+            self.namespace(index.table().is_temporary()).define_object_key(
+                sqlite_key(name),
+                Some(owner),
+                Source::Initial(initial_description("index", index.schema(), name)),
+            )?;
+        }
+        let slots = super::translator_impls::trigger_slots::TriggerSlots::seeded(Some(schema))?;
+        for trigger in schema.triggers() {
+            let relation = trigger_relation(trigger, schema)?;
+            let relation_is_temporary = match relation {
+                TriggerRelation::Table(table) => table.is_temporary(),
+                TriggerRelation::View(view) => view.is_temporary(),
+            };
+            let namespace = self.namespace(relation_is_temporary);
+            let owner = sqlite_key(&relation.stored_name());
+            let description = initial_description("trigger", None, trigger.name());
+            for name in slots.frame_names_of(trigger) {
+                let name_key = key(name);
+                if !namespace.triggers.contains_key(&name_key) {
+                    namespace.define_trigger_key(
+                        name_key,
+                        owner.clone(),
+                        Source::Initial(description.clone()),
+                    )?;
+                }
+            }
+            // A plain row trigger lives under the names its slots were emitted
+            // with.
+            if slots.holds(trigger) {
+                for name in slots.names_of(trigger) {
+                    let name_key = key(name);
+                    if !namespace.triggers.contains_key(&name_key) {
+                        namespace.define_trigger_key(
+                            name_key,
+                            owner.clone(),
+                            Source::Initial(description.clone()),
+                        )?;
+                    }
+                }
+                continue;
+            }
+            namespace.define_trigger_key(
+                sqlite_key(trigger.name()),
+                owner,
+                Source::Initial(description),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn holds_temporary(&self, name: &ObjectName, trigger: bool) -> bool {
+        if name.0.len() > 1 {
+            return name.0[0]
+                .as_ident()
+                .is_some_and(|identifier| identifier.value.eq_ignore_ascii_case("temp"));
+        }
+        if trigger {
+            self.temporary.triggers.contains_key(&key(name))
+        } else {
+            self.temporary.objects.contains_key(&key(name))
+        }
+    }
+
+    fn namespace(&mut self, temporary: bool) -> &mut Namespaces<'a> {
+        if temporary { &mut self.temporary } else { &mut self.main }
+    }
+
+    fn apply(&mut self, statement: &'a Statement, source: Source<'a>) -> Result<(), Error> {
+        let temporary = match statement {
+            Statement::CreateTable(create) => create.temporary,
+            Statement::CreateView(view) => view.temporary,
+            Statement::CreateIndex(index) => {
+                index.name.as_ref().filter(|name| name.0.len() > 1).map_or_else(
+                    || self.holds_temporary(&index.table_name, false),
+                    |name| self.holds_temporary(name, false),
+                )
+            }
+            Statement::CreateTrigger(trigger) => self.holds_temporary(&trigger.table_name, false),
+            Statement::Drop {
+                object_type: ObjectType::Table | ObjectType::View | ObjectType::Index,
+                names,
+                ..
+            } => {
+                for name in names {
+                    let temporary = self.holds_temporary(name, false);
+                    self.namespace(temporary).drop_object(name);
+                }
+                return Ok(());
+            }
+            Statement::DropTrigger(drop) => self.holds_temporary(&drop.trigger_name, true),
+            Statement::AlterTable(alter) => self.holds_temporary(&alter.name, false),
+            Statement::CreateVirtualTable { name, .. } => {
+                name.0.len() > 1 && self.holds_temporary(name, false)
+            }
+            _ => false,
+        };
+        self.namespace(temporary).apply(statement, source)
+    }
 }
 
 /// One live name, and what would take it away.
@@ -103,86 +234,6 @@ struct Namespaces<'a> {
 }
 
 impl<'a> Namespaces<'a> {
-    fn seed(&mut self, schema: &ParserDB) -> Result<(), Error> {
-        for table in schema.tables() {
-            let name = table.stored_table_name();
-            self.define_object_key(
-                sqlite_key(&name),
-                None,
-                Source::Initial(initial_description(
-                    "table",
-                    table.table_schema(),
-                    table.table_name(),
-                )),
-            )?;
-        }
-        for view in schema.views() {
-            let name = view.stored_view_name();
-            self.define_object_key(
-                sqlite_key(&name),
-                None,
-                Source::Initial(initial_description("view", view.view_schema(), view.view_name())),
-            )?;
-        }
-        for view in schema.materialized_views() {
-            let name = view.stored_view_name();
-            self.define_object_key(
-                sqlite_key(&name),
-                None,
-                Source::Initial(initial_description(
-                    "materialized view",
-                    view.view_schema(),
-                    view.view_name(),
-                )),
-            )?;
-        }
-        for index in schema.indexes() {
-            let Some(name) = index.name() else { continue };
-            let owner = sqlite_key(&index.table().stored_table_name());
-            self.define_object_key(
-                sqlite_key(name),
-                Some(owner),
-                Source::Initial(initial_description("index", index.schema(), name)),
-            )?;
-        }
-        let slots = super::translator_impls::trigger_slots::TriggerSlots::seeded(Some(schema))?;
-        for trigger in schema.triggers() {
-            let owner = sqlite_key(&trigger_relation(trigger, schema)?.stored_name());
-            let description = initial_description("trigger", None, trigger.name());
-            for name in slots.frame_names_of(trigger) {
-                let name_key = key(name);
-                if !self.triggers.contains_key(&name_key) {
-                    self.define_trigger_key(
-                        name_key,
-                        owner.clone(),
-                        Source::Initial(description.clone()),
-                    )?;
-                }
-            }
-            // A plain row trigger lives under the names its slots were emitted
-            // with.
-            if slots.holds(trigger) {
-                for name in slots.names_of(trigger) {
-                    let name_key = key(name);
-                    if !self.triggers.contains_key(&name_key) {
-                        self.define_trigger_key(
-                            name_key,
-                            owner.clone(),
-                            Source::Initial(description.clone()),
-                        )?;
-                    }
-                }
-                continue;
-            }
-            self.define_trigger_key(
-                sqlite_key(trigger.name()),
-                owner,
-                Source::Initial(description),
-            )?;
-        }
-        Ok(())
-    }
-
     fn apply(&mut self, statement: &'a Statement, source: Source<'a>) -> Result<(), Error> {
         match statement {
             Statement::CreateTable(create) => self.define_object(&create.name, None, source),
@@ -196,14 +247,6 @@ impl<'a> Namespaces<'a> {
             }
             Statement::CreateTrigger(trigger) => {
                 self.define_trigger(&trigger.name, &trigger.table_name, source)
-            }
-            Statement::Drop { object_type, names, .. } => {
-                if matches!(object_type, ObjectType::Table | ObjectType::View | ObjectType::Index) {
-                    for name in names {
-                        self.drop_object(name);
-                    }
-                }
-                Ok(())
             }
             Statement::DropTrigger(drop) => {
                 self.triggers.remove(&key(&drop.trigger_name));

@@ -16,7 +16,7 @@ use crate::{
     impls::{
         ast_builder::blank_create_table,
         derived_writes::foreign_key_left_to_server,
-        object_name::normalize_schema_qualified_object_name_for_sqlite,
+        object_name::normalize_declared_relation_name_for_sqlite,
         translator_impls::{
             column::{folded_primary_key, translate_column_def},
             column_option::warn_no_inherit_dropped,
@@ -240,9 +240,11 @@ impl crate::traits::translator::TranslatorWithContext for CreateTable {
         // `blank_create_table` names every field, so a field added upstream
         // fails to compile there, and every clause refused by the checks above
         // keeps its blank default.
-        let mut created_table = blank_create_table(
-            normalize_schema_qualified_object_name_for_sqlite(schema, &self.name)?,
-        );
+        let mut created_table = blank_create_table(normalize_declared_relation_name_for_sqlite(
+            schema,
+            &self.name,
+            self.temporary,
+        )?);
         // The table definition itself, translated.
         created_table.columns = self
             .columns

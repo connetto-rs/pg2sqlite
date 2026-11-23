@@ -5,7 +5,7 @@ use core::ops::ControlFlow;
 use sql_traits::{
     errors::LookupError,
     structs::{IdentifierCase, ParserDB, TargetName},
-    traits::{ColumnLike, DatabaseLike, TableLike},
+    traits::{ColumnLike, DatabaseLike, TableLike, ViewLike},
     utils::identifier_resolution::{identifiers_match, is_temporary_schema},
 };
 use sqlparser::ast::{
@@ -216,21 +216,65 @@ pub(crate) fn validate_schema_qualified_object_name_for_sqlite(
     ensure_schema_resolves(schema, name, parts.explicit_schema)
 }
 
-/// Maps `pg_temp` to SQLite's `temp` and removes other resolvable schema
-/// qualifiers.
+/// Maps relation names to SQLite's `main` and `temp` database namespaces.
 pub(crate) fn normalize_schema_qualified_object_name_for_sqlite(
     schema: &ParserDB,
     name: &ObjectName,
+) -> Result<ObjectName, Error> {
+    normalize_relation_name_for_sqlite(schema, name, false)
+}
+
+/// Preserves the database of a relation declaration when a temporary relation
+/// shadows its name.
+pub(crate) fn normalize_declared_relation_name_for_sqlite(
+    schema: &ParserDB,
+    name: &ObjectName,
+    temporary: bool,
+) -> Result<ObjectName, Error> {
+    normalize_relation_name_for_sqlite(schema, name, !temporary)
+}
+
+fn normalize_relation_name_for_sqlite(
+    schema: &ParserDB,
+    name: &ObjectName,
+    permanent_declaration: bool,
 ) -> Result<ObjectName, Error> {
     let parts = parse_schema_qualified_name_parts(name)?;
     ensure_schema_resolves(schema, name, parts.explicit_schema)?;
     if parts.explicit_schema.is_some_and(|schema_name| {
         is_temporary_schema(&schema_name.value, schema_name.quote_style.is_some())
     }) {
-        Ok(ObjectName(vec![ObjectNamePart::Identifier(Ident::new("temp")), parts.object_part]))
-    } else {
-        Ok(ObjectName(vec![parts.object_part]))
+        return Ok(ObjectName(vec![
+            ObjectNamePart::Identifier(Ident::new("temp")),
+            parts.object_part,
+        ]));
     }
+    if (parts.explicit_schema.is_some() || permanent_declaration)
+        && let Some(identifier) = parts.object_part.as_ident()
+        && (schema.tables().any(|table| {
+            table.is_temporary()
+                && identifiers_match(
+                    table.table_name(),
+                    table.table_name_is_quoted(),
+                    &identifier.value,
+                    identifier.quote_style.is_some(),
+                )
+        }) || schema.views().any(|view| {
+            view.is_temporary()
+                && identifiers_match(
+                    view.view_name(),
+                    view.view_name_is_quoted(),
+                    &identifier.value,
+                    identifier.quote_style.is_some(),
+                )
+        }))
+    {
+        return Ok(ObjectName(vec![
+            ObjectNamePart::Identifier(Ident::new("main")),
+            parts.object_part,
+        ]));
+    }
+    Ok(ObjectName(vec![parts.object_part]))
 }
 
 /// Resolves the table a statement names, an unqualified name searching

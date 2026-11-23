@@ -316,6 +316,7 @@ mod test_table_constraint_catch_all;
 mod test_table_constraint_gaps;
 mod test_table_inheritance_markers;
 mod test_table_not_null;
+mod test_temp_shadows_permanent;
 mod test_temp_table_targets;
 mod test_temporal_fidelity;
 mod test_temporal_precision_typmod;
