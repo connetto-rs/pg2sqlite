@@ -130,6 +130,7 @@ mod test_ilike_lower;
 mod test_index_clause_warnings;
 mod test_infinite_timestamps;
 mod test_insert_implied_columns;
+mod test_insert_target_alias;
 mod test_instead_of_view_columns;
 mod test_interval_arithmetic;
 mod test_interval_arithmetic_exact;
