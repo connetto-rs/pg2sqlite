@@ -78,6 +78,7 @@ mod test_edge_branch_integration;
 mod test_emitted_sql_is_valid_sqlite;
 mod test_empty_trigger_body;
 mod test_error_variants_are_constructed;
+mod test_excluded_expression;
 mod test_expr_bool_checks;
 mod test_expr_position_substring;
 mod test_expr_string_math;

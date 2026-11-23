@@ -506,21 +506,28 @@ impl ReverseTranslator for Insert {
             && let OnConflictAction::DoUpdate(do_update) = &on_conflict.action
         {
             let mut translated = translate_on_conflict_do_update::<Reverse>(
-                on_conflict,
                 do_update,
                 schema,
                 options,
                 &crate::impls::shared_helpers::ColumnRewrites::default(),
                 &mut |_| {},
             )?;
-            if let OnInsert::OnConflict(on_conflict) = &mut translated
-                && let OnConflictAction::DoUpdate(do_update) = &mut on_conflict.action
-                && let TableObject::TableName(target) = &self.table
+            let mut conflict_target = on_conflict.conflict_target.clone();
+            translate_conflict_predicate::<Reverse>(
+                &mut conflict_target,
+                schema,
+                options,
+                &mut |_| {},
+            )?;
+            if let TableObject::TableName(target) = &self.table
                 && let Some(target) = last_ident(target)
             {
-                qualify_do_update_column_refs(do_update, &target.value);
+                qualify_do_update_column_refs(&mut translated, &target.value);
             }
-            insert.on = Some(translated);
+            insert.on = Some(OnInsert::OnConflict(OnConflict {
+                conflict_target,
+                action: OnConflictAction::DoUpdate(translated),
+            }));
         }
         if let Some(OnInsert::OnConflict(OnConflict {
             conflict_target,
