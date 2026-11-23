@@ -841,7 +841,7 @@ pub(crate) fn query_outputs<T>(
         ColumnScope::from_query(query, schema, sql_traits::structs::IdentifierCase::AsWritten)?;
     let mut read = Vec::new();
     for output in graph.scope_for_query(query).map(|scope| scope.outputs()).into_iter().flatten() {
-        let QueryOutput::Column { name, definition } = output else {
+        let QueryOutput::Column { name, definition, .. } = output else {
             return Ok(None);
         };
         let name = name
@@ -6151,7 +6151,7 @@ pub(crate) fn renamed_derived_factor<D: TranslationDirection>(
                                     }
                                 }))
                             }
-                            QueryOutput::Unexpanded => None,
+                            QueryOutput::Unexpanded { .. } => None,
                         }
                     })
                     .collect::<Option<Vec<_>>>()
