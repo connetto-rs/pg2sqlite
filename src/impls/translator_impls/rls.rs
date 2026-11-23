@@ -2070,16 +2070,7 @@ fn generate_rls_view_statement_with_context(
     grants: &RoleTable,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Statement, Error> {
-    let selection = match rls_read_predicate(table, schema, options, emit)? {
-        PolicyPredicate::DenyAll => {
-            Some(Expr::Value(ValueWithSpan {
-                value: Value::Boolean(false),
-                span: sqlparser::tokenizer::Span::empty(),
-            }))
-        }
-        PolicyPredicate::AllowAll => None,
-        PolicyPredicate::Expr(predicate) => Some(*predicate),
-    };
+    let selection = read_filter(rls_read_predicate(table, schema, options, emit)?, options);
     Ok(backing_view(&RlsTriggerContext::new(table, options), grants, selection))
 }
 
@@ -2160,23 +2151,22 @@ pub(crate) fn locking_read_rows(
         emit,
     )?;
     let selection = match (select, update) {
-        (PolicyPredicate::DenyAll, _) | (_, None) => {
-            Expr::Value(ValueWithSpan {
-                value: Value::Boolean(false),
-                span: sqlparser::tokenizer::Span::empty(),
-            })
-        }
-        (PolicyPredicate::AllowAll, Some(update)) => *update,
+        (PolicyPredicate::DenyAll, _) | (_, None) => PolicyPredicate::DenyAll,
+        (PolicyPredicate::AllowAll, Some(update)) => PolicyPredicate::Expr(update),
         (PolicyPredicate::Expr(select), Some(update)) => {
-            Expr::BinaryOp {
+            PolicyPredicate::Expr(Box::new(Expr::BinaryOp {
                 left: Box::new(Expr::Nested(select)),
                 op: BinaryOperator::And,
                 right: Box::new(Expr::Nested(update)),
-            }
+            }))
         }
     };
     let grants = RoleTable::acting(table, schema, options)?;
-    Ok(Some(backing_rows(&RlsTriggerContext::new(table, options), &grants, Some(selection))))
+    Ok(Some(backing_rows(
+        &RlsTriggerContext::new(table, options),
+        &grants,
+        read_filter(selection, options),
+    )))
 }
 
 /// The view standing for `table` until every relation its policy view and
@@ -2379,8 +2369,8 @@ fn generate_insert_trigger_sql(
     ])
 }
 
-fn write_exemption_expr(options: &Pg2SqliteOptions) -> Option<Expr> {
-    options.get_write_exemption_function().map(|name| {
+fn rls_exemption_expr(options: &Pg2SqliteOptions) -> Option<Expr> {
+    options.get_rls_exemption_function().map(|name| {
         let mut expression = simple_function_expr(name, Vec::new(), None);
         let Expr::Function(function) = &mut expression else {
             unreachable!("a function constructor must return a function")
@@ -2394,7 +2384,7 @@ pub(crate) fn write_guard_condition_expr(
     violation: Option<Expr>,
     options: &Pg2SqliteOptions,
 ) -> Option<Expr> {
-    let enforcement = write_exemption_expr(options)
+    let enforcement = rls_exemption_expr(options)
         .map(|call| Expr::IsNotTrue(Box::new(Expr::Nested(Box::new(call)))));
     match (enforcement, violation) {
         (None, None) => None,
@@ -2410,13 +2400,13 @@ pub(crate) fn write_guard_condition_expr(
     }
 }
 
-/// The guard that a denied write passes on the exemption call.
+/// The condition an exempt statement passes on the exemption call.
 fn exemption_guard(call: Expr) -> Expr {
     Expr::IsTrue(Box::new(Expr::Nested(Box::new(call))))
 }
 
 fn policy_or_exemption_expr(predicate: Expr, options: &Pg2SqliteOptions) -> Expr {
-    match write_exemption_expr(options) {
+    match rls_exemption_expr(options) {
         Some(call) => {
             Expr::BinaryOp {
                 left: Box::new(exemption_guard(call)),
@@ -2425,6 +2415,26 @@ fn policy_or_exemption_expr(predicate: Expr, options: &Pg2SqliteOptions) -> Expr
             }
         }
         None => predicate,
+    }
+}
+
+/// The `WHERE` clause of a read through the rows `predicate` admits, which an
+/// exempt statement reads in full as PostgreSQL's table owner does.
+fn read_filter(predicate: PolicyPredicate, options: &Pg2SqliteOptions) -> Option<Expr> {
+    match predicate {
+        PolicyPredicate::AllowAll => None,
+        PolicyPredicate::DenyAll => {
+            Some(rls_exemption_expr(options).map_or_else(
+                || {
+                    Expr::Value(ValueWithSpan {
+                        value: Value::Boolean(false),
+                        span: sqlparser::tokenizer::Span::empty(),
+                    })
+                },
+                exemption_guard,
+            ))
+        }
+        PolicyPredicate::Expr(predicate) => Some(policy_or_exemption_expr(*predicate, options)),
     }
 }
 
@@ -2743,7 +2753,7 @@ fn generate_delete_check_trigger_sql(
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Option<Statement>, Error> {
-    if options.get_write_exemption_function().is_none() {
+    if options.get_rls_exemption_function().is_none() {
         return Ok(None);
     }
     let (ctx, rows) =
@@ -2913,7 +2923,7 @@ fn update_body(
         PolicyPredicate::AllowAll | PolicyPredicate::DenyAll => None,
     };
     let authorization = if using_denies {
-        write_exemption_expr(options).map(exemption_guard)
+        rls_exemption_expr(options).map(exemption_guard)
     } else {
         using_predicate.clone().map(|predicate| policy_or_exemption_expr(predicate, options))
     };
@@ -2938,7 +2948,7 @@ fn update_body(
             body.extend(forwarded);
             body
         } else {
-            let exemption = write_exemption_expr(options);
+            let exemption = rls_exemption_expr(options);
             let mut body = ignored_write_body(exemption.clone());
             if exemption.is_some() {
                 body.extend(forwarded);
@@ -3011,7 +3021,7 @@ fn delete_body(
     let using_denies = rows.has_no_policy(GatedCommand::Delete, RowVersion::Existing)
         || matches!(using, PolicyPredicate::DenyAll);
     let authorization = if using_denies {
-        write_exemption_expr(options).map(exemption_guard)
+        rls_exemption_expr(options).map(exemption_guard)
     } else {
         match &using {
             PolicyPredicate::Expr(predicate) => {
@@ -3038,7 +3048,7 @@ fn delete_body(
                 forward,
             ]
         } else {
-            let exemption = write_exemption_expr(options);
+            let exemption = rls_exemption_expr(options);
             let mut body = ignored_write_body(exemption.clone());
             if exemption.is_some() {
                 body.push(forward);
@@ -3063,7 +3073,7 @@ fn generate_readonly_view_trigger_sql(
     grants: &RoleTable,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Vec<Statement>, Error> {
-    if options.get_write_exemption_function().is_none() {
+    if options.get_rls_exemption_function().is_none() {
         return Ok(Vec::new());
     }
     let refusal = ast_builder::raise_statement(
@@ -3152,7 +3162,7 @@ fn generate_readonly_backing_guard_sql(
     table: &CreateTable,
     options: &crate::options::TranslationContext<'_>,
 ) -> Vec<Statement> {
-    if options.get_write_exemption_function().is_none() {
+    if options.get_rls_exemption_function().is_none() {
         return Vec::new();
     }
     let ctx = RlsTriggerContext::new(table, options);

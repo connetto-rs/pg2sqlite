@@ -103,7 +103,7 @@ fn options() -> Pg2SqliteOptions {
         .with_deployment(deployment([], [caller("app.user_id", "text")]))
         .with_session_variable(SessionVariableMapping::new("app.user_id", "current_app_user"))
         .with_rls_audit_table_name("_rls_audit")
-        .with_write_exemption_function("write_is_exempt")
+        .with_rls_exemption_function("write_is_exempt")
 }
 
 fn placed_options() -> Pg2SqliteOptions {
@@ -160,7 +160,7 @@ impl Files {
         write_is_exempt_utils::register_nondeterministic_impl(&mut connection, || {
             WRITE_IS_EXEMPT.with(Cell::get)
         })
-        .expect("register the write exemption");
+        .expect("register the RLS exemption");
         connection
             .batch_execute(&format!("ATTACH '{}' AS shared", self.shared.display()))
             .expect("attach");

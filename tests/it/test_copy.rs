@@ -175,10 +175,10 @@ fn a_secured_table_receives_its_rows_in_the_backing_table() {
          COPY notes (id, owner) FROM stdin;\n1\talice\n\\.\n";
     let mut connection = SqliteConnection::establish(":memory:").expect("connect");
     write_is_exempt_utils::register_impl(&mut connection, || true)
-        .expect("register the write exemption");
+        .expect("register the RLS exemption");
     let options = Pg2SqliteOptions::default()
         .with_rls_audit_table_name("_rls_audit")
-        .with_write_exemption_function("write_is_exempt");
+        .with_rls_exemption_function("write_is_exempt");
     for statement in translate(pg, &options).expect("translate") {
         connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
     }

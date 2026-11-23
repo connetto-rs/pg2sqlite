@@ -12,7 +12,7 @@
 //! created with the table run after every `BEFORE` row trigger created later,
 //! as PostgreSQL checks constraints after its `BEFORE` triggers.
 //!
-//! The triggers yield to the write exemption when one is configured.
+//! The triggers yield to the RLS exemption when one is configured.
 //! PostgreSQL judged a row the server wrote against the server's clock when
 //! it wrote it, so the replica applying that row later does not judge it
 //! again against its own.
