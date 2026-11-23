@@ -462,6 +462,129 @@ fn temp_shadows_foreign_keys_keep_their_qualified_parent() {
 }
 
 #[test]
+fn temp_shadows_views_keep_their_bound_table() {
+    for temporary_first in [false, true] {
+        for relation in ["public.scratch", "pg_temp.scratch", "scratch"] {
+            let permanent = "CREATE TABLE public.scratch (id INTEGER);";
+            let temporary = "CREATE TEMP TABLE scratch (id INTEGER);";
+            let tables = if temporary_first {
+                format!("{temporary} {permanent}")
+            } else {
+                format!("{permanent} {temporary}")
+            };
+            let rows = run_translated_default(&format!(
+                "{tables}
+                 INSERT INTO public.scratch VALUES (10);
+                 INSERT INTO pg_temp.scratch VALUES (20);
+                 CREATE VIEW seen AS SELECT id FROM {relation};
+                 SELECT id FROM seen;"
+            ));
+            let expected = if relation == "public.scratch" { "10" } else { "20" };
+            assert_eq!(rows, vec![Some(expected.to_string())]);
+        }
+    }
+}
+
+/// A view naming a quoted schema keeps reading the permanent rows.
+#[test]
+fn temp_shadows_views_keep_a_quoted_schema_binding() {
+    let rows = run_translated_default(
+        r#"CREATE TABLE "public".scratch (id INTEGER);
+         INSERT INTO "public".scratch VALUES (10);
+         CREATE TEMP TABLE scratch (id INTEGER);
+         INSERT INTO pg_temp.scratch VALUES (20);
+         CREATE VIEW seen AS SELECT id FROM "public".scratch;
+         SELECT id FROM seen;"#,
+    );
+    assert_eq!(rows, vec![Some("10".into())]);
+}
+
+/// Reading a temporary view promotes a view that shadows a permanent view.
+#[test]
+fn temp_shadows_views_reading_a_temporary_view_become_temporary() {
+    let rows = run_translated_default(
+        "CREATE VIEW seen AS SELECT 10 AS id;
+         CREATE TEMP VIEW scratch AS SELECT 20 AS id;
+         CREATE VIEW seen AS SELECT id FROM scratch;
+         SELECT id FROM public.seen
+         UNION ALL SELECT id FROM pg_temp.seen ORDER BY id;",
+    );
+    assert_eq!(rows, vec![Some("10".into()), Some("20".into())]);
+}
+
+/// A table function leaves a shadowed permanent view in the permanent schema.
+#[test]
+fn temp_shadows_views_over_a_table_function_stay_permanent() {
+    let rows = run_translated_default(
+        "CREATE VIEW seen AS SELECT value AS id FROM json_array_elements_text('[10]');
+         CREATE TEMP VIEW seen AS SELECT '20' AS id;
+         SELECT id FROM public.seen
+         UNION ALL SELECT id FROM pg_temp.seen ORDER BY id;",
+    );
+    assert_eq!(rows, vec![Some("10".into()), Some("20".into())]);
+}
+
+#[test]
+fn temp_shadows_views_created_before_shadowing_keep_their_bound_table() {
+    for relation in ["public.scratch", "scratch"] {
+        let rows = run_translated_default(&format!(
+            "CREATE TABLE public.scratch (id INTEGER);
+             INSERT INTO public.scratch VALUES (10);
+             CREATE VIEW seen AS SELECT id FROM {relation};
+             CREATE TEMP TABLE scratch (id INTEGER);
+             INSERT INTO pg_temp.scratch VALUES (20);
+             SELECT id FROM seen;"
+        ));
+        assert_eq!(rows, vec![Some("10".to_string())]);
+    }
+}
+
+#[test]
+fn temp_shadows_views_created_before_permanent_table_keep_their_bound_table() {
+    for relation in ["pg_temp.scratch", "scratch"] {
+        let rows = run_translated_default(&format!(
+            "CREATE TEMP TABLE scratch (id INTEGER);
+             INSERT INTO pg_temp.scratch VALUES (20);
+             CREATE VIEW seen AS SELECT id FROM {relation};
+             CREATE TABLE public.scratch (id INTEGER);
+             INSERT INTO public.scratch VALUES (10);
+             SELECT id FROM seen;"
+        ));
+        assert_eq!(rows, vec![Some("20".to_string())]);
+    }
+}
+
+#[test]
+fn temp_shadows_views_bind_both_databases_and_preserve_ctes() {
+    let rows = run_translated_default(
+        "CREATE TABLE public.scratch (id INTEGER);
+         INSERT INTO public.scratch VALUES (10);
+         CREATE TEMP TABLE scratch (id INTEGER);
+         INSERT INTO pg_temp.scratch VALUES (20);
+         CREATE VIEW seen AS
+             WITH scratch AS (SELECT 30 AS id)
+             SELECT id FROM public.scratch
+             UNION ALL SELECT id FROM pg_temp.scratch
+             UNION ALL SELECT id FROM scratch;
+         SELECT id FROM seen ORDER BY id;",
+    );
+    assert_eq!(rows, vec![Some("10".into()), Some("20".into()), Some("30".into())]);
+}
+
+#[test]
+fn temp_shadows_views_promote_without_main_qualification() {
+    let rows = run_translated_default(
+        "CREATE TABLE public.scratch (id INTEGER);
+         CREATE VIEW seen AS SELECT id FROM public.scratch;
+         CREATE TEMP TABLE scratch (id INTEGER);
+         INSERT INTO pg_temp.scratch VALUES (20);
+         CREATE VIEW seen AS SELECT id FROM scratch;
+         SELECT id FROM seen;",
+    );
+    assert_eq!(rows, vec![Some("20".into())]);
+}
+
+#[test]
 fn temp_shadows_dropping_trigger_preserves_the_other_owner() {
     for temporary_first in [false, true] {
         let permanent = "CREATE TABLE public.scratch (id INTEGER PRIMARY KEY);";

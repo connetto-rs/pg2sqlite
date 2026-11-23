@@ -422,8 +422,9 @@ struct PreparedEpoch {
     /// Snapshots taken before each `DROP INDEX`, which still hold its indexes.
     before_index_drops: Vec<(usize, ParserDB)>,
     /// Snapshots taken at each `CREATE TRIGGER`, which hold the function it
-    /// runs and the names its body reaches where it fires.
-    trigger_positions: Vec<(usize, ParserDB)>,
+    /// runs and the names its body reaches where it fires, and after each
+    /// `CREATE VIEW`, which hold the relations its query binds.
+    declaration_snapshots: Vec<(usize, ParserDB)>,
     /// The schemas on either side of each statement a live trigger's
     /// translation can depend on.
     events: Vec<EventSnapshots>,
@@ -468,7 +469,7 @@ impl PreparedEpoch {
         core::iter::once(&self.schema)
             .chain(self.bindings.iter().map(|change| &change.before))
             .chain(self.before_index_drops.iter().map(|(_, schema)| schema))
-            .chain(self.trigger_positions.iter().map(|(_, schema)| schema))
+            .chain(self.declaration_snapshots.iter().map(|(_, schema)| schema))
             .chain(self.events.iter().flat_map(|event| [&event.before, &event.after]))
     }
 
@@ -483,7 +484,7 @@ impl PreparedEpoch {
     /// The schema statement `index` was written against.
     fn written(&self, index: usize) -> &ParserDB {
         if let Some(schema) = snapshot_at(&self.before_index_drops, index)
-            .or_else(|| snapshot_at(&self.trigger_positions, index))
+            .or_else(|| snapshot_at(&self.declaration_snapshots, index))
         {
             return schema;
         }
@@ -1337,7 +1338,7 @@ impl Pg2Sqlite {
     ) -> Result<(ParserDBIngestor, PreparedEpoch), crate::errors::Error> {
         let mut bindings = Vec::new();
         let mut before_index_drops = Vec::new();
-        let mut trigger_positions = Vec::new();
+        let mut declaration_snapshots = Vec::new();
         let mut events = Vec::new();
         crate::impls::enum_type::reject_late_added_values(&statements[start..schema_end], || {
             input.snapshot()
@@ -1350,7 +1351,7 @@ impl Pg2Sqlite {
                 before_index_drops.push((start + index, input.snapshot()));
             }
             if matches!(statement, Statement::CreateTrigger(_)) {
-                trigger_positions.push((start + index, input.snapshot()));
+                declaration_snapshots.push((start + index, input.snapshot()));
             }
             let event_before = (follows_triggers && TriggerFollower::is_event(statement))
                 .then(|| input.snapshot());
@@ -1371,6 +1372,9 @@ impl Pg2Sqlite {
                     sources.to_mut()[start + index] = applied.clone();
                 }
                 input = input.apply_statement(applied)?;
+                if matches!(statement, Statement::CreateView(_)) {
+                    declaration_snapshots.push((start + index, input.snapshot()));
+                }
             }
             if let Some(drop) = Self::seeded_trigger_drop(statement) {
                 input = input.apply_statement(drop)?;
@@ -1390,7 +1394,7 @@ impl Pg2Sqlite {
             schema,
             bindings,
             before_index_drops,
-            trigger_positions,
+            declaration_snapshots,
             events,
         };
         Ok((input, epoch))
