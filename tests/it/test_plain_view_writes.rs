@@ -174,3 +174,61 @@ fn a_view_over_a_temporary_table_writes_the_temporary_table() {
         [Some("4 u".to_owned())]
     );
 }
+
+/// An aliased upsert through the view writes the table's row.
+#[test]
+fn an_aliased_upsert_through_the_view_writes_the_table() {
+    assert_eq!(
+        run("INSERT INTO base VALUES (1, 'a', 5);
+             INSERT INTO v AS x (key, name, score) VALUES (1, 'b', 6), (2, 'c', 7)
+                 ON CONFLICT (key) DO UPDATE SET name = excluded.name;
+             SELECT id || ' ' || name || ' ' || score FROM base ORDER BY id;"),
+        [Some("1 b 5".to_owned()), Some("2 c 7".to_owned())]
+    );
+}
+
+/// A row assignment through a schema-qualified view over a schema-qualified
+/// table writes each column it names.
+#[test]
+fn a_row_assignment_through_qualified_names_writes_the_table() {
+    assert_eq!(
+        run("CREATE VIEW pv AS SELECT id AS key, name, score FROM public.base WHERE score > 0;
+             INSERT INTO base VALUES (1, 'a', 5);
+             UPDATE public.pv SET (name, score) = ('t', 3) WHERE key = 1;
+             SELECT id || ' ' || name || ' ' || score FROM base;"),
+        [Some("1 t 3".to_owned())]
+    );
+}
+
+/// A view selecting every column of a quoted table writes that table.
+#[test]
+fn a_wildcard_view_over_a_quoted_table_writes_it() {
+    assert_eq!(
+        run_translated_default(
+            "CREATE TABLE \"Base\" (id INTEGER PRIMARY KEY, tag TEXT);
+             CREATE VIEW sv AS SELECT * FROM \"Base\";
+             INSERT INTO sv VALUES (1, 'x'), (2, 'y');
+             DELETE FROM sv WHERE id = 2;
+             SELECT id || tag FROM \"Base\";"
+        ),
+        [Some("1x".to_owned())]
+    );
+}
+
+/// A view column computed by a subquery keeps the subquery's own columns.
+#[test]
+fn a_subquery_column_of_the_view_reads_its_own_relation() {
+    assert_eq!(
+        run("CREATE TABLE lim (m INTEGER);
+             CREATE VIEW cv AS SELECT id, score, (SELECT max(m) FROM lim) AS cap FROM base;
+             INSERT INTO lim VALUES (9);
+             INSERT INTO cv (id, score) VALUES (1, 4) RETURNING cap;"),
+        [Some("9".to_owned())]
+    );
+}
+
+/// PostgreSQL refuses a write to a column the view does not have.
+#[test]
+fn a_write_into_a_missing_view_column_is_refused() {
+    assert_refused(&format!("{SCHEMA} UPDATE v SET nope = 1;"), "nope");
+}
