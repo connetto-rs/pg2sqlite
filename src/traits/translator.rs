@@ -64,12 +64,14 @@ impl<T: TranslatorWithContext> Translator for T {
         schema: &Self::Schema,
         options: &Self::Options,
     ) -> Result<Self::SQLiteEntry, crate::errors::Error> {
-        let context = TranslationContext::new(options);
-        <Self as TranslatorWithContext>::translate_with_warnings(
-            self,
-            schema,
-            &context,
-            &mut |_| {},
-        )
+        crate::impls::stack_headroom::on_deep_stack(|| {
+            let context = TranslationContext::new(options);
+            <Self as TranslatorWithContext>::translate_with_warnings(
+                self,
+                schema,
+                &context,
+                &mut |_| {},
+            )
+        })
     }
 }

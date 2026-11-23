@@ -7,13 +7,11 @@ use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
 
 use crate::helpers::run_translated as run_translated_helper;
 
-/// Past the 13 levels a debug build and the 74 a release build survived, and
-/// short of where `sqlparser`'s derived `Clone` aborts in a debug build.
-const OPERANDS: usize = 150;
+/// Deeper than a 2 MiB thread holds the walks over the chain in a debug build.
+const OPERANDS: usize = 500;
 
-/// Past the 15 arms a debug build survived, and short of where `sqlparser`
-/// clones a `SetExpr` chain into an abort in a debug build.
-const ARMS: usize = 80;
+/// Deeper than a 2 MiB thread holds the walks over the chain in a debug build.
+const ARMS: usize = 250;
 
 const ROWS: &str = "CREATE TABLE t (a int, b text); INSERT INTO t VALUES (1, 'x');";
 

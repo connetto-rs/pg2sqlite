@@ -32,6 +32,9 @@ thiserror = { version = "2.0", default-features = false }
 # Grows the stack on demand in the translator's recursion, as `sqlparser`'s
 # `recursive-protection` does in its parser.
 recursive = { version = "0.1", optional = true }
+# Runs each translation on a stack deep enough for `sqlparser`'s unguarded
+# derived walks over a whole statement.
+stacker = { version = "0.1", optional = true }
 # Optional Arbitrary impls on the public option types so fuzz harnesses
 # can drive `Pg2SqliteOptions` (and its dependent enums) from libfuzzer
 # input bytes. Gated behind the `arbitrary` feature so production
@@ -87,6 +90,7 @@ std = [
     "sqlparser/recursive-protection",
     "sql-traits/std",
     "dep:recursive",
+    "dep:stacker",
     "thiserror/std",
 ]
 # `Pg2Sqlite::from_git`, kept out of `std` so dependents that never clone a schema skip libgit2.

@@ -158,6 +158,7 @@ pub(crate) fn is_array_type_name(name: &str) -> bool {
 /// `/` with an interval on the left only. `false` when nothing the statement
 /// writes settles the type, a column it cannot resolve included, so a
 /// position that only decides on the answer keeps its ordinary translation.
+#[cfg_attr(feature = "std", recursive::recursive)]
 pub(crate) fn is_interval_typed(
     expr: &Expr,
     schema: &ParserDB,

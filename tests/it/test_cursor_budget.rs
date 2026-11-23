@@ -362,6 +362,10 @@ fn a_deep_helper_chain_is_refused_on_a_default_thread() {
     assert!(message.contains("ids_7()"), "the refusal names the policy's helper: {message}");
 }
 
+/// Past the 60 helpers whose inlined sets a debug build copied into an abort
+/// on a default thread.
+const CHAIN_DEPTH: usize = 100;
+
 /// Translates `sql`, failing the test when translation errors.
 fn assert_translates(sql: &str) {
     helpers::translate_pg(sql, &options())
@@ -370,14 +374,14 @@ fn assert_translates(sql: &str) {
 
 #[test]
 fn a_helper_chain_read_through_from_translates_on_a_default_thread() {
-    assert_translates(&helper_chain(40, 1, |previous| {
+    assert_translates(&helper_chain(CHAIN_DEPTH, 1, |previous| {
         format!("SELECT x.id FROM public.ids_{previous}() AS x(id)")
     }));
 }
 
 #[test]
 fn a_helper_chain_read_through_in_translates_on_a_default_thread() {
-    assert_translates(&helper_chain(40, 1, |previous| {
+    assert_translates(&helper_chain(CHAIN_DEPTH, 1, |previous| {
         format!(
             "SELECT item.id FROM public.items item WHERE item.id IN (SELECT public.ids_{previous}())"
         )
@@ -390,8 +394,8 @@ fn a_helper_chain_read_through_a_scalar_subquery_translates_on_a_default_thread(
         "me",
         "UUID",
         "SELECT NULLIF(current_setting('app.user_id', true), '')::uuid",
-        40,
+        CHAIN_DEPTH,
         |previous| format!("SELECT (SELECT public.me_{previous}())"),
-        "owner_id = me_40()",
+        &format!("owner_id = me_{CHAIN_DEPTH}()"),
     ));
 }
