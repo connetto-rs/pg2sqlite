@@ -168,7 +168,8 @@ impl<'s> OffReplica<'s> {
     ) -> Result<(), Error> {
         let table = self.table.table_name();
         let role = self.role.name();
-        if let Some(trigger) = options.trigger_firing(table, |event| write.fires(event)) {
+        let owner = super::trigger_slots::TableKey::from(self.table);
+        if let Some(trigger) = options.trigger_firing(&owner, |event| write.fires(event)) {
             return Err(Error::forward_refusal(format!(
                 "{verb} on {table} would be left off the replica with {table}, which the acting \
                  role {role} holds no privilege on, but PostgreSQL fires trigger {trigger} for \

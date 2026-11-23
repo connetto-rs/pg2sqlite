@@ -145,7 +145,8 @@ fn populate_prewalk_catalogs(
             if matches!(trigger.period, Some(TriggerPeriod::Before))
                 && let Some(exec_body) = &trigger.exec_body
             {
-                let table_name = last_ident_value_or_display(&trigger.table_name).to_lowercase();
+                let table_name =
+                    crate::impls::translator_impls::trigger_slots::table_key(&trigger.table_name);
                 for event in trigger.events.iter().filter_map(MaintainedEvent::after) {
                     context.add_before_row_trigger_fn(
                         table_name.clone(),
@@ -1209,6 +1210,12 @@ impl Pg2Sqlite {
                 let event_before = (follows_triggers
                     && TriggerFollower::is_event(&statements[index]))
                 .then(|| input.snapshot());
+                if let Some(before) = event_before.as_ref()
+                    && let Cow::Owned(statement) =
+                        Self::canonical_trigger_event(&statements[index], before)?
+                {
+                    sources.to_mut()[index] = statement;
+                }
                 if let Err(error) =
                     crate::impls::translator_impls::function_cascade::reject_other_dependents(
                         &statements[index],
@@ -1240,6 +1247,80 @@ impl Pg2Sqlite {
         })
     }
 
+    fn canonical_trigger_owner(
+        schema: &ParserDB,
+        name: &ObjectName,
+    ) -> Result<Option<ObjectName>, crate::errors::Error> {
+        use sql_traits::traits::TableLike;
+
+        let Some(table) = crate::impls::object_name::resolve_translation_table(schema, name)?
+        else {
+            return Ok(None);
+        };
+        let mut owner = table.name.clone();
+        if owner.0.len() == 1 {
+            owner.0.insert(
+                0,
+                ObjectNamePart::Identifier(Ident::new(if table.is_temporary() {
+                    "pg_temp"
+                } else {
+                    "public"
+                })),
+            );
+        }
+        Ok(Some(owner))
+    }
+
+    fn canonical_trigger_event<'statement>(
+        statement: &'statement Statement,
+        schema: &ParserDB,
+    ) -> Result<Cow<'statement, Statement>, crate::errors::Error> {
+        let mut canonical = Cow::Borrowed(statement);
+        match statement {
+            Statement::CreateTrigger(trigger) => {
+                if let Some(owner) = Self::canonical_trigger_owner(schema, &trigger.table_name)?
+                    && owner != trigger.table_name
+                    && let Statement::CreateTrigger(trigger) = canonical.to_mut()
+                {
+                    trigger.table_name = owner;
+                }
+            }
+            Statement::DropTrigger(drop) => {
+                if let Some(name) = &drop.table_name
+                    && let Some(owner) = Self::canonical_trigger_owner(schema, name)?
+                    && owner != *name
+                    && let Statement::DropTrigger(drop) = canonical.to_mut()
+                {
+                    drop.table_name = Some(owner);
+                }
+            }
+            Statement::Drop { object_type: ObjectType::Table, names, .. } => {
+                for (index, name) in names.iter().enumerate() {
+                    if let Some(owner) = Self::canonical_trigger_owner(schema, name)?
+                        && owner != *name
+                        && let Statement::Drop { names, .. } = canonical.to_mut()
+                    {
+                        names[index] = owner;
+                    }
+                }
+            }
+            Statement::AlterTable(alter_table)
+                if alter_table.operations.iter().any(|operation| {
+                    matches!(operation, AlterTableOperation::RenameTable { .. })
+                }) =>
+            {
+                if let Some(owner) = Self::canonical_trigger_owner(schema, &alter_table.name)?
+                    && owner != alter_table.name
+                    && let Statement::AlterTable(alter_table) = canonical.to_mut()
+                {
+                    alter_table.name = owner;
+                }
+            }
+            _ => {}
+        }
+        Ok(canonical)
+    }
+
     /// The epoch of `statements` from `start` to `end`, whose statements up to
     /// `schema_end` are applied to `input`, with the snapshots its translation
     /// reads, and the ingestor after them.
@@ -1269,6 +1350,11 @@ impl Pg2Sqlite {
             }
             let event_before = (follows_triggers && TriggerFollower::is_event(statement))
                 .then(|| input.snapshot());
+            if let Some(before) = event_before.as_ref()
+                && let Cow::Owned(statement) = Self::canonical_trigger_event(statement, before)?
+            {
+                sources.to_mut()[start + index] = statement;
+            }
             if !Self::schema_statement_is_ignored(statement) {
                 let mut applied = statement.clone();
                 // PostgreSQL names an unnamed index against the catalog as

@@ -2169,10 +2169,21 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
                     .is_some_and(|name| options.is_server_derived_trigger_name(&name.value));
                 vec![Statement::DropTrigger(sqlparser::ast::DropTrigger {
                     if_exists: drop_trigger.if_exists || left_to_server,
-                    trigger_name: normalize_schema_qualified_object_name_for_sqlite(
-                        schema,
-                        &drop_trigger.trigger_name,
-                    )?,
+                    trigger_name: match &drop_trigger.table_name {
+                        Some(table) => {
+                            super::trigger_slots::owned_name(
+                                &drop_trigger.trigger_name,
+                                table,
+                                schema,
+                            )?
+                        }
+                        None => {
+                            normalize_schema_qualified_object_name_for_sqlite(
+                                schema,
+                                &drop_trigger.trigger_name,
+                            )?
+                        }
+                    },
                     table_name: None, // SQLite doesn't use ON table_name
                     option: None,     // SQLite doesn't support CASCADE/RESTRICT
                 })]
