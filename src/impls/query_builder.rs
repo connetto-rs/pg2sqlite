@@ -91,9 +91,15 @@ pub(crate) fn single_expr_query(
 /// A bare `FROM <name>` relation with no alias, arguments, or hints.
 #[must_use]
 pub(crate) fn plain_table_factor(name: ObjectName) -> TableFactor {
+    aliased_table_factor(name, None)
+}
+
+/// A `FROM <name> AS <alias>` relation with no arguments or hints.
+#[must_use]
+pub(crate) fn aliased_table_factor(name: ObjectName, alias: Option<Ident>) -> TableFactor {
     TableFactor::Table {
         name,
-        alias: None,
+        alias: alias.map(|name| TableAlias { explicit: true, name, columns: Vec::new(), at: None }),
         args: None,
         with_hints: Vec::new(),
         version: None,

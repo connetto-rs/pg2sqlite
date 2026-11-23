@@ -472,6 +472,12 @@ fn unbound(
         [ident] if names_function(ident) => Ok(()),
         // A whole-row reference.
         [ident] if relations.exposes(ident) => Ok(()),
+        [ident]
+            if matches!(stored_ident_name(ident).as_ref(), "old" | "new")
+                && relations.returning.contains(&ptr::from_ref(expression).addr()) =>
+        {
+            Ok(())
+        }
         [ident] => Err(undefined_column(ident)),
         [.., qualifier, _] if relations.hidden.contains(&ptr::from_ref(expression).addr()) => {
             Err(invalid_reference(qualifier))
@@ -817,6 +823,7 @@ struct Relations {
     /// Copied, since the visitor lends each node to its callback alone.
     names: Vec<Ident>,
     argument_names: Vec<usize>,
+    returning: Vec<usize>,
     /// The `FROM` items of each enclosing query level, innermost last, with
     /// how many non-`LATERAL` derived tables of that level are being visited.
     levels: Vec<(Vec<Ident>, usize)>,
@@ -842,6 +849,22 @@ impl Relations {
             {
                 relations.names.push(Ident::new("excluded"));
             }
+        }
+        let returning = match statement {
+            Statement::Insert(insert) => insert.returning.as_ref(),
+            Statement::Update(update) => update.returning.as_ref(),
+            Statement::Delete(delete) => delete.returning.as_ref(),
+            _ => None,
+        };
+        if let Some(returning) = returning {
+            let _ = visit_expressions(returning, |expression| {
+                if let Expr::Identifier(ident) = expression
+                    && matches!(stored_ident_name(ident).as_ref(), "old" | "new")
+                {
+                    relations.returning.push(ptr::from_ref(expression).addr());
+                }
+                ControlFlow::<()>::Continue(())
+            });
         }
         relations.read(statement)
     }

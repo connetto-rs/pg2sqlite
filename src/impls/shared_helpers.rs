@@ -37,6 +37,7 @@ use crate::{
             from_relation, make_query, make_simple_select, plain_table_factor,
             plain_table_with_joins,
         },
+        returning_rows::ReturningRows,
         translator_impls::{
             unused_cte_name,
             uuid::{
@@ -3122,20 +3123,14 @@ fn translate_column_assignment<D: TranslationDirection>(
     })
 }
 
-/// Translates the DO UPDATE assignments and WHERE inside an ON CONFLICT
-/// clause, and the predicate of its conflict target.
-///
-/// `rewrites` carries the target table's column-typed rewrites, since a DO
-/// UPDATE writes into the same columns the insert does. Empty for the reverse
-/// direction, which never unwraps or unscales.
+/// Translates the assignments and `WHERE` of a conflict update.
 pub(crate) fn translate_on_conflict_do_update<D: TranslationDirection>(
-    on_conflict: &sqlparser::ast::OnConflict,
     do_update: &sqlparser::ast::DoUpdate,
     schema: &ParserDB,
     options: &D::Options<'_>,
     rewrites: &ColumnRewrites,
     emit: crate::warnings::WarningSink<'_>,
-) -> Result<sqlparser::ast::OnInsert, Error> {
+) -> Result<sqlparser::ast::DoUpdate, Error> {
     let assignments = do_update
         .assignments
         .iter()
@@ -3148,15 +3143,7 @@ pub(crate) fn translate_on_conflict_do_update<D: TranslationDirection>(
         .as_ref()
         .map(|expr| D::translate_expr(expr, schema, options, emit))
         .transpose()?;
-    let mut conflict_target = on_conflict.conflict_target.clone();
-    translate_conflict_predicate::<D>(&mut conflict_target, schema, options, emit)?;
-    Ok(sqlparser::ast::OnInsert::OnConflict(sqlparser::ast::OnConflict {
-        conflict_target,
-        action: sqlparser::ast::OnConflictAction::DoUpdate(sqlparser::ast::DoUpdate {
-            assignments,
-            selection,
-        }),
-    }))
+    Ok(sqlparser::ast::DoUpdate { assignments, selection })
 }
 
 /// Translates the `WHERE` predicate of a column conflict target, which picks
@@ -3546,7 +3533,12 @@ pub(crate) fn translate_delete_core<D: TranslationDirection>(
     let from = map_from_table(&delete.from, |table| {
         translate_table_with_joins::<D>(table, schema, options, emit)
     })?;
-    let returning = translate_returning::<D>(delete.returning.as_ref(), schema, options, emit)?;
+    let returning = ReturningRows::delete(delete).translate::<D>(
+        delete.returning.as_deref(),
+        schema,
+        options,
+        emit,
+    )?;
     let order_by = delete
         .order_by
         .iter()
@@ -4684,7 +4676,8 @@ pub(crate) fn translate_update<D: TranslationDirection>(
         })
         .transpose()?;
 
-    let returning = translate_returning::<D>(update.returning.as_ref(), schema, options, emit)?;
+    let rows = ReturningRows::update(update);
+    let returning = rows.translate::<D>(update.returning.as_deref(), schema, options, emit)?;
     let limit = update
         .limit
         .as_ref()

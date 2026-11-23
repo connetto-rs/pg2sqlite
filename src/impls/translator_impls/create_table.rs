@@ -3,7 +3,7 @@
 
 use alloc::collections::BTreeSet;
 
-use sql_traits::utils::identifier_resolution::identifiers_match;
+use sql_traits::{traits::TableLike, utils::identifier_resolution::identifiers_match};
 use sqlparser::ast::{
     ColumnOption, ColumnOptionDef, CreateTable, CreateTableOptions, HiveDistributionStyle,
     NotNullConstraint, ObjectName, OnCommit, PrimaryKeyConstraint, SqliteTableOption,
@@ -16,7 +16,7 @@ use crate::{
     impls::{
         ast_builder::blank_create_table,
         derived_writes::foreign_key_left_to_server,
-        object_name::normalize_schema_qualified_object_name_for_sqlite,
+        object_name::normalize_declared_relation_name_for_sqlite,
         translator_impls::{
             column::{folded_primary_key, translate_column_def},
             column_option::warn_no_inherit_dropped,
@@ -48,6 +48,25 @@ fn reject_case_colliding_columns(
                 earlier.name, column.name
             )));
         }
+    }
+    Ok(())
+}
+
+/// Refuses tables whose columns are all generated expressions.
+pub(crate) fn reject_all_generated_columns(
+    table: &CreateTable,
+) -> Result<(), crate::errors::Error> {
+    if !table.columns.is_empty()
+        && table.columns.iter().all(|column| {
+            column.options.iter().any(|option| {
+                matches!(option.option, ColumnOption::Generated { generation_expr: Some(_), .. })
+            })
+        })
+    {
+        return Err(crate::errors::Error::forward_refusal(format!(
+            "SQLite requires at least one non-generated column in table {}. Add a plain column.",
+            table.name
+        )));
     }
     Ok(())
 }
@@ -125,6 +144,8 @@ impl crate::traits::translator::TranslatorWithContext for CreateTable {
                 "SQLite tables require at least one output column".to_string(),
             ));
         }
+
+        reject_all_generated_columns(self)?;
 
         reject_foreign_create_table_modifiers(self)?;
 
@@ -240,9 +261,11 @@ impl crate::traits::translator::TranslatorWithContext for CreateTable {
         // `blank_create_table` names every field, so a field added upstream
         // fails to compile there, and every clause refused by the checks above
         // keeps its blank default.
-        let mut created_table = blank_create_table(
-            normalize_schema_qualified_object_name_for_sqlite(schema, &self.name)?,
-        );
+        let mut created_table = blank_create_table(normalize_declared_relation_name_for_sqlite(
+            schema,
+            &self.name,
+            self.temporary,
+        )?);
         // The table definition itself, translated.
         created_table.columns = self
             .columns
@@ -277,7 +300,7 @@ impl crate::traits::translator::TranslatorWithContext for CreateTable {
         created_table.sqlite_table_options.options =
             if is_ctas { Vec::new() } else { vec![SqliteTableOption::Strict] };
         // Legal in both databases and carried through unchanged.
-        created_table.temporary = self.temporary;
+        created_table.temporary = self.is_temporary();
         created_table.if_not_exists = self.if_not_exists;
 
         let mut pk_column_names = BTreeSet::new();

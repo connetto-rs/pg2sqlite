@@ -3,15 +3,17 @@
 //! PostgreSQL resolves a trigger body where it runs.
 
 use alloc::collections::BTreeSet;
+use core::ops::ControlFlow;
 
 use sql_traits::{structs::ParserDB, traits::DatabaseLike};
 use sqlparser::ast::{
     AlterFunction, AlterFunctionOperation, AlterFunctionSignature, AlterTableOperation,
-    CreateTrigger, DropTrigger, ObjectName, ObjectType, RenameTableNameKind, Statement,
-    TriggerEvent,
+    CreateTrigger, DropTrigger, Expr, Ident, ObjectName, ObjectType, RenameTableNameKind,
+    Statement, TriggerEvent, visit_expressions_mut,
 };
 
 use super::{
+    function_cascade::{drop_of, runs_dropped},
     plpgsql::{ReadBodies, body_reach},
     trigger_slots::{folded, renamed_table},
 };
@@ -108,7 +110,7 @@ impl Touched {
 }
 
 /// Carries `trigger` along `event`, which renames its table or a column its
-/// `UPDATE OF` list names.
+/// `UPDATE OF` list or `WHEN` condition names.
 fn carry(trigger: &mut CreateTrigger, event: &Statement) {
     let Statement::AlterTable(alter) = event else { return };
     if folded(&alter.name) != folded(&trigger.table_name) {
@@ -128,6 +130,17 @@ fn carry(trigger: &mut CreateTrigger, event: &Statement) {
                         }
                     }
                 }
+                let rows = [Ident::new("new"), Ident::new("old")];
+                let _ = visit_expressions_mut(&mut trigger.condition, |expr| {
+                    if let Expr::CompoundIdentifier(parts) = expr
+                        && let [row, column] = parts.as_mut_slice()
+                        && rows.iter().any(|name| same_identifier(row, name))
+                        && same_identifier(column, old_column_name)
+                    {
+                        column.clone_from(new_column_name);
+                    }
+                    ControlFlow::<()>::Continue(())
+                });
             }
             _ => {}
         }
@@ -154,6 +167,22 @@ impl TriggerFollower {
     /// Whether no trigger is live.
     pub(crate) fn is_empty(&self) -> bool {
         self.live.is_empty()
+    }
+
+    /// The `DROP TRIGGER` of each live trigger running a function `statement`
+    /// drops with `CASCADE`.
+    pub(crate) fn cascaded(&self, statement: &Statement) -> Vec<Statement> {
+        self.live
+            .iter()
+            .filter(|followed| {
+                followed
+                    .create
+                    .exec_body
+                    .as_ref()
+                    .is_some_and(|body| runs_dropped(statement, &body.func_desc.name))
+            })
+            .map(|followed| drop_of(&followed.create))
+            .collect()
     }
 
     /// Whether `statement` can change what a live trigger's translation reads.

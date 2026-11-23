@@ -584,3 +584,20 @@ fn test_drop_trigger_snapshot() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+/// A function dropped with `CASCADE` while a view calls it is refused, naming
+/// the view, since SQLite would keep the view.
+#[test]
+fn a_function_cascade_taking_a_view_is_refused() {
+    let error = Pg2Sqlite::default()
+        .sql(
+            "CREATE FUNCTION f() RETURNS INT LANGUAGE sql IMMUTABLE AS $$ SELECT 1 $$;
+             CREATE VIEW v AS SELECT f() AS one;
+             DROP FUNCTION f() CASCADE;",
+        )
+        .unwrap()
+        .translate(&Pg2SqliteOptions::default())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("`v`"), "{error}");
+}

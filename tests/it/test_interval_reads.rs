@@ -1607,7 +1607,7 @@ fn greatest_over_an_interval_with_an_over_clause_is_refused() {
 #[test]
 fn greatest_in_a_generated_column_is_refused() {
     refused(
-        "CREATE TABLE gen_r (g text GENERATED ALWAYS AS \
+        "CREATE TABLE gen_r (id INTEGER, g text GENERATED ALWAYS AS \
          (greatest(interval '1 day', interval '2 days')) STORED)",
         "scalar subquery",
     );
