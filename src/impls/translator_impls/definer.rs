@@ -97,7 +97,7 @@ pub(crate) fn definer_owner<'s>(
 }
 
 /// Whether `owner` reads and writes `table` past its row-level security.
-fn exempts(table: &CreateTable, owner: &Role, schema: &ParserDB) -> bool {
+pub(crate) fn exempts(table: &CreateTable, owner: &Role, schema: &ParserDB) -> bool {
     matches!(table.row_security(RowStatement::Select, owner, schema), Ok(RowSecurity::Exempt(_)))
 }
 

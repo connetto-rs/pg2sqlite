@@ -98,6 +98,21 @@ CREATE TRIGGER organizations_cap BEFORE INSERT ON organizations
   FOR EACH ROW EXECUTE FUNCTION authz.cap_organizations();
 ";
 
+const REFOUNDING: &str = "
+CREATE FUNCTION authz.refound_organization() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+BEGIN
+  INSERT INTO public.organization_grants VALUES (NEW.id, NEW.created_by, 'admin')
+    ON CONFLICT (organization_id, principal_id) DO UPDATE SET role = 'admin';
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER organizations_refound AFTER UPDATE ON organizations
+  FOR EACH ROW EXECUTE FUNCTION authz.refound_organization();
+CREATE POLICY organizations_update ON organizations FOR UPDATE
+  USING (created_by = current_setting('app.user_id', true));
+";
+
 const POLICIES: &str = "
 ALTER TABLE organizations ENABLE ROW LEVEL SECURITY;
 CREATE POLICY organizations_read ON organizations FOR SELECT
@@ -241,6 +256,13 @@ const CAPPED_BY_BYPASSING_OWNER: Scenario = Scenario {
     owner: "trigger_owner",
     triggers: CAPPED,
     function: "authz.cap_organizations()",
+};
+
+const REFOUNDED_BY_BYPASSING_OWNER: Scenario = Scenario {
+    role: BYPASSING_OWNER,
+    owner: "trigger_owner",
+    triggers: REFOUNDING,
+    function: "authz.refound_organization()",
 };
 
 /// `scenario` on PostgreSQL, seeded as the superuser, then acting as `app`
@@ -601,4 +623,23 @@ fn the_cap_counts_organizations_the_caller_cannot_see() {
         .expect("read SQLite");
     assert_eq!(pg_held, held);
     assert_eq!(sqlite_held, held);
+}
+
+/// The owner's upsert lands on the grant Nina already holds, which SQLite
+/// conflicts on in the backing table the owner writes past the policies.
+#[test]
+fn a_bypassing_owner_upserts_a_grant_the_caller_holds() {
+    let scenario = REFOUNDED_BY_BYPASSING_OWNER;
+    let seeded = [("nina", "read")];
+    let mut pg = postgres(&scenario, &seeded);
+    let mut sqlite = replica(&translate(&scenario.source()).expect("translate"), &seeded);
+    let update_org2 = || {
+        diesel::update(schema::organizations::table.find("org2"))
+            .set(schema::organizations::created_by.eq("nina"))
+    };
+
+    assert_eq!(Outcome::of(&update_org2().execute(&mut pg)), Outcome::Accepted);
+    assert_eq!(Outcome::of(&update_org2().execute(&mut sqlite)), Outcome::Accepted);
+    assert_eq!(pg_grants_held(&mut pg), [grant("nina", "admin")]);
+    assert_eq!(sqlite_grants_held(&mut sqlite), [grant("nina", "admin")]);
 }
