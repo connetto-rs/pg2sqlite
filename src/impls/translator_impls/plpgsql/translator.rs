@@ -831,8 +831,9 @@ impl PlPgSqlTranslator {
                     options,
                     emit,
                 )?;
-                if let Some(named) = &scope.facts.skip_clears {
-                    let mut clear = crate::impls::translator_impls::reentry::clear_unclaimed(named);
+                if let Some(records) = &scope.facts.skip_clears {
+                    let mut clear =
+                        crate::impls::translator_impls::reentry::clear_unclaimed(records);
                     if let Some(condition) = scope.current_condition() {
                         Self::inject_condition_into_statement(&mut clear, &condition)?;
                     }

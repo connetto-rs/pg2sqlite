@@ -176,6 +176,7 @@ mod test_on_conflict_do_nothing;
 mod test_operator_translation_gaps;
 mod test_options_builder;
 mod test_ordered_attached_initialization;
+mod test_own_tables_sqlippy;
 mod test_param_bind_contract;
 mod test_parity_fixtures;
 mod test_parser_pathology_regressions;

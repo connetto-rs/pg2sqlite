@@ -352,7 +352,8 @@ struct TriggerPart<'a> {
     /// Whether the replica leaves the trigger's writes to the server, which
     /// an `INSTEAD OF` trigger keeps as the view's own.
     removes_derived_writes: bool,
-    /// The named table a `RETURN NULL` clears the row's unclaimed records from.
+    /// The record table a `RETURN NULL` clears the row's unclaimed records
+    /// from.
     skip_clears: Option<ObjectName>,
 }
 
@@ -834,7 +835,7 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
                     skip_clears: (plain
                         && updates
                         && matches!(period, Some(TriggerPeriod::Before)))
-                    .then(|| super::reentry::named_table(&source_table_name)),
+                    .then(|| super::reentry::record_table(&source_table_name)),
                 },
                 &normalized_source_table_name,
                 maintenance_refusal.as_ref().and_then(Option::as_ref),

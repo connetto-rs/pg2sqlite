@@ -1040,7 +1040,6 @@ impl TriggerSlots {
                 }
             }
             maintainers.push(FrameMember {
-                name: folded(&member.name),
                 twin: owned_name(&twin_name(member), &member.table_name, schema)?,
                 part,
             });
@@ -1055,7 +1054,6 @@ impl TriggerSlots {
                 statements.push(drop_trigger(part.name.clone()));
             }
             members.push(FrameMember {
-                name: folded(&member.name),
                 twin: owned_name(&twin_name(member), &member.table_name, schema)?,
                 part,
             });

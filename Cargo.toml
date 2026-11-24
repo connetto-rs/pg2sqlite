@@ -56,6 +56,8 @@ insta = "1.47.2"
 rosetta-uuid = { version = "0.2.0", features = ["diesel", "postgres", "sqlite"] }
 rusqlite = { version = "0.41", features = ["bundled", "functions", "window"] }
 sqlite-vec = "0.1.9"
+# Lints the tables the translation adds for itself.
+sqlippy = { git = "https://github.com/connetto-rs/SQLippy", branch = "main" }
 zerocopy = "0.8.48"
 rand = "0.10.1"
 tempfile = "3.27"
