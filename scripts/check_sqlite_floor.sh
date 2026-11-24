@@ -63,7 +63,7 @@ PYTHON
 # The sweep corpus, one script per translated row, same 0x01-separated format.
 # Emitted fresh by the crate so a corpus row added to the sweep is a floor
 # check on the next run with no further wiring.
-(cd "${repository}" && cargo run --release --quiet --example floor_corpus) \
+(cd "${repository}" && cargo run --profile floor-corpus --quiet --example floor_corpus) \
     > "${work}/corpus-rows.sql"
 combined="${work}/combined.sql"
 cat "${work}/corpus.sql" > "${combined}"

@@ -186,6 +186,12 @@ harness = false
 inherits = "test"
 debug = "none"
 
+# The SQLite floor check's corpus emitter, since a release build of the crate outgrows a 16 GB runner.
+[profile.floor-corpus]
+inherits = "dev"
+debug = false
+incremental = false
+
 [lints]
 workspace = true
 
