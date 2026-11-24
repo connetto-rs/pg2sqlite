@@ -11,7 +11,9 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use core::ops::ControlFlow;
 
 use sql_traits::{
-    structs::ParserDB, traits::FunctionLike, utils::identifier_resolution::stored_ident_name,
+    structs::ParserDB,
+    traits::{FunctionLike, RoleLike},
+    utils::identifier_resolution::stored_ident_name,
 };
 use sqlparser::{
     ast::{
@@ -41,7 +43,8 @@ use crate::{
         object_name::{last_ident, resolve_translation_table},
         query_builder::single_expr_query,
         translator_impls::{
-            create_trigger::body_schema, sql_helper::schema_helper, trigger_slots::folded,
+            create_trigger::body_schema, definer::definer_owner, sql_helper::schema_helper,
+            trigger_slots::folded,
         },
         unlabelled_body::signature,
     },
@@ -234,6 +237,9 @@ pub(crate) struct BodyReach {
     pub(crate) written: BTreeSet<String>,
     /// The function itself and every function its SQL calls, folded.
     pub(crate) functions: BTreeSet<String>,
+    /// The stored names of the owners of the `SECURITY DEFINER` functions of
+    /// `functions`, whose bodies run as them.
+    pub(crate) definers: BTreeSet<String>,
 }
 
 /// What each function body [`body_reach`] read names, by its text and how it
@@ -384,6 +390,7 @@ pub(crate) fn body_reach(
         relations: BTreeSet::new(),
         written: BTreeSet::new(),
         functions: BTreeSet::new(),
+        definers: BTreeSet::new(),
     };
     let mut pending = vec![function.clone()];
     while let Some(function) = pending.pop() {
@@ -397,6 +404,11 @@ pub(crate) fn body_reach(
             Err(_) if reach.functions.len() > 1 => return Ok(None),
             Err(error) => return Err(error),
         };
+        // An owner the schema never declares refuses the translation, on
+        // either side of an event.
+        if let Ok(Some(owner)) = definer_owner(declared, schema) {
+            reach.definers.insert(owner.stored_name().into_owned());
+        }
         let atomic;
         let names = if let Some(body) = declared.body() {
             bodies.names(body, declared, &function, schema)

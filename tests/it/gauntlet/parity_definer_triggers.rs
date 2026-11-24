@@ -98,6 +98,21 @@ CREATE TRIGGER organizations_cap BEFORE INSERT ON organizations
   FOR EACH ROW EXECUTE FUNCTION authz.cap_organizations();
 ";
 
+const REFOUNDING: &str = "
+CREATE FUNCTION authz.refound_organization() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+BEGIN
+  INSERT INTO public.organization_grants VALUES (NEW.id, NEW.created_by, 'admin')
+    ON CONFLICT (organization_id, principal_id) DO UPDATE SET role = 'admin';
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER organizations_refound AFTER UPDATE ON organizations
+  FOR EACH ROW EXECUTE FUNCTION authz.refound_organization();
+CREATE POLICY organizations_update ON organizations FOR UPDATE
+  USING (created_by = current_setting('app.user_id', true));
+";
+
 const POLICIES: &str = "
 ALTER TABLE organizations ENABLE ROW LEVEL SECURITY;
 CREATE POLICY organizations_read ON organizations FOR SELECT
@@ -146,6 +161,18 @@ mod schema {
             entry -> BigInt,
         }
     }
+    diesel::table! {
+        founder_grants (organization_id) {
+            organization_id -> Text,
+            founder -> Text,
+        }
+    }
+    diesel::table! {
+        founder_grants_rls (organization_id) {
+            organization_id -> Text,
+            founder -> Text,
+        }
+    }
 }
 
 diesel::define_sql_function! {
@@ -180,6 +207,8 @@ struct Scenario {
     /// The function and its trigger.
     triggers: &'static str,
     function: &'static str,
+    /// The row-level security set up after the triggers.
+    policies: &'static str,
 }
 
 impl Scenario {
@@ -189,7 +218,7 @@ impl Scenario {
 
     /// The PostgreSQL source the replica is translated from.
     fn source(&self) -> String {
-        [self.role, TABLES, self.triggers, &self.ownership(), POLICIES].concat()
+        [self.role, TABLES, self.triggers, &self.ownership(), self.policies].concat()
     }
 
     /// The same source on a cluster where an earlier case may have created the
@@ -204,7 +233,8 @@ impl Scenario {
             "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app, {};",
             self.owner
         );
-        [role.as_str(), TABLES, self.triggers, &self.ownership(), POLICIES, &privileges].concat()
+        [role.as_str(), TABLES, self.triggers, &self.ownership(), self.policies, &privileges]
+            .concat()
     }
 }
 
@@ -213,6 +243,7 @@ const FOUNDED_BY_BYPASSING_OWNER: Scenario = Scenario {
     owner: "trigger_owner",
     triggers: FOUNDING,
     function: "authz.found_organization()",
+    policies: POLICIES,
 };
 
 const FOUNDED_BY_BOUND_OWNER: Scenario = Scenario {
@@ -220,6 +251,7 @@ const FOUNDED_BY_BOUND_OWNER: Scenario = Scenario {
     owner: "trigger_bound_owner",
     triggers: FOUNDING,
     function: "authz.found_organization()",
+    policies: POLICIES,
 };
 
 const GUARDED_BY_BYPASSING_OWNER: Scenario = Scenario {
@@ -227,6 +259,7 @@ const GUARDED_BY_BYPASSING_OWNER: Scenario = Scenario {
     owner: "trigger_owner",
     triggers: LAST_ADMIN,
     function: "authz.keep_last_admin_on_delete()",
+    policies: POLICIES,
 };
 
 const LOGGED_BY_BOUND_OWNER: Scenario = Scenario {
@@ -234,6 +267,7 @@ const LOGGED_BY_BOUND_OWNER: Scenario = Scenario {
     owner: "trigger_bound_owner",
     triggers: LOGGING,
     function: "authz.log_organization()",
+    policies: POLICIES,
 };
 
 const CAPPED_BY_BYPASSING_OWNER: Scenario = Scenario {
@@ -241,6 +275,58 @@ const CAPPED_BY_BYPASSING_OWNER: Scenario = Scenario {
     owner: "trigger_owner",
     triggers: CAPPED,
     function: "authz.cap_organizations()",
+    policies: POLICIES,
+};
+
+/// A founding log the owner appends to, whose own trigger records the founder
+/// in `founder_grants`, running as whoever wrote the log row. PostgreSQL finds
+/// `founder_grants` when the trigger runs, so a later migration may create it.
+const FOUNDING_THROUGH_LOG: &str = "
+CREATE TABLE founding_log (organization_id TEXT NOT NULL, founder TEXT NOT NULL);
+CREATE FUNCTION authz.log_founding() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+BEGIN
+  INSERT INTO public.founding_log VALUES (NEW.id, NEW.created_by);
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER organizations_log_founding AFTER INSERT ON organizations
+  FOR EACH ROW EXECUTE FUNCTION authz.log_founding();
+CREATE FUNCTION authz.grant_founder() RETURNS trigger
+LANGUAGE plpgsql SET search_path = '' AS $$
+BEGIN
+  INSERT INTO public.founder_grants VALUES (NEW.organization_id, NEW.founder);
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER founding_log_grant AFTER INSERT ON founding_log
+  FOR EACH ROW EXECUTE FUNCTION authz.grant_founder();
+";
+
+/// A later migration, past a dropped draft table, adding `founder_grants`
+/// under row-level security that refuses every caller's insert.
+const LATE_FOUNDER_GRANTS: &str = "
+CREATE TABLE organization_drafts (id TEXT PRIMARY KEY);
+DROP TABLE organization_drafts;
+CREATE TABLE founder_grants (organization_id TEXT PRIMARY KEY, founder TEXT NOT NULL);
+ALTER TABLE founder_grants ENABLE ROW LEVEL SECURITY;
+CREATE POLICY founder_grants_insert ON founder_grants FOR INSERT WITH CHECK (false);
+";
+
+const FOUNDED_THROUGH_LOG_BY_BYPASSING_OWNER: Scenario = Scenario {
+    role: BYPASSING_OWNER,
+    owner: "trigger_owner",
+    triggers: FOUNDING_THROUGH_LOG,
+    function: "authz.log_founding()",
+    policies: LATE_FOUNDER_GRANTS,
+};
+
+const REFOUNDED_BY_BYPASSING_OWNER: Scenario = Scenario {
+    role: BYPASSING_OWNER,
+    owner: "trigger_owner",
+    triggers: REFOUNDING,
+    function: "authz.refound_organization()",
+    policies: POLICIES,
 };
 
 /// `scenario` on PostgreSQL, seeded as the superuser, then acting as `app`
@@ -441,6 +527,32 @@ fn a_later_owner_change_reaches_the_installed_trigger() {
     );
 }
 
+/// Row-level security on a table that a later migration adds, which the
+/// definer body never names, still exempts its owner, and the log trigger
+/// the body fires runs as that owner, so the founder's grant is stored.
+#[test]
+fn later_row_security_elsewhere_runs_the_definer_body_as_its_owner() {
+    let scenario = FOUNDED_THROUGH_LOG_BY_BYPASSING_OWNER;
+    let mut pg = postgres(&scenario, &[]);
+    let mut sqlite = replica(&translate(&scenario.source()).expect("translate"), &[]);
+
+    assert_eq!(found_org3(&mut pg), Outcome::Accepted);
+    assert_eq!(found_org3(&mut sqlite), Outcome::Accepted);
+
+    let founded = vec![("org3".to_owned(), "nina".to_owned())];
+    diesel::sql_query("RESET ROLE").execute(&mut pg).expect("reset role");
+    let pg_founded: Vec<(String, String)> = schema::founder_grants::table
+        .select((schema::founder_grants::organization_id, schema::founder_grants::founder))
+        .load(&mut pg)
+        .expect("read PostgreSQL");
+    let sqlite_founded: Vec<(String, String)> = schema::founder_grants_rls::table
+        .select((schema::founder_grants_rls::organization_id, schema::founder_grants_rls::founder))
+        .load(&mut sqlite)
+        .expect("read SQLite");
+    assert_eq!(pg_founded, founded);
+    assert_eq!(sqlite_founded, founded);
+}
+
 /// Nina's own grant, which she may delete under the delete policy.
 fn ninas_grant() -> diesel::dsl::Filter<
     schema::organization_grants::table,
@@ -601,4 +713,23 @@ fn the_cap_counts_organizations_the_caller_cannot_see() {
         .expect("read SQLite");
     assert_eq!(pg_held, held);
     assert_eq!(sqlite_held, held);
+}
+
+/// The owner's upsert lands on the grant Nina already holds, which SQLite
+/// conflicts on in the backing table the owner writes past the policies.
+#[test]
+fn a_bypassing_owner_upserts_a_grant_the_caller_holds() {
+    let scenario = REFOUNDED_BY_BYPASSING_OWNER;
+    let seeded = [("nina", "read")];
+    let mut pg = postgres(&scenario, &seeded);
+    let mut sqlite = replica(&translate(&scenario.source()).expect("translate"), &seeded);
+    let update_org2 = || {
+        diesel::update(schema::organizations::table.find("org2"))
+            .set(schema::organizations::created_by.eq("nina"))
+    };
+
+    assert_eq!(Outcome::of(&update_org2().execute(&mut pg)), Outcome::Accepted);
+    assert_eq!(Outcome::of(&update_org2().execute(&mut sqlite)), Outcome::Accepted);
+    assert_eq!(pg_grants_held(&mut pg), [grant("nina", "admin")]);
+    assert_eq!(sqlite_grants_held(&mut sqlite), [grant("nina", "admin")]);
 }

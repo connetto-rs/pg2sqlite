@@ -11,7 +11,6 @@ use pg2sqlite::{
     prelude::{Pg2Sqlite, Pg2SqliteOptions, postgres_error},
     warnings::TranslationWarning,
 };
-use sqlstate::pg;
 
 use crate::{helpers, support::transaction::transaction};
 
@@ -51,8 +50,12 @@ diesel::define_sql_function! {
     fn key_write_exempt() -> diesel::sql_types::Bool;
 }
 
-const REFUSAL: &str = "update or delete on table \"users\" violates foreign key constraint \
-                       \"memberships_user_id_fkey\" on table \"memberships\"";
+const REFUSAL: &str = "23503: update or delete on table \"users\" violates foreign key \
+                       constraint \"memberships_user_id_fkey\" on table \"memberships\"";
+
+const RESTRICT_REFUSAL: &str = "23001: update or delete on table \"users\" violates RESTRICT \
+                                setting of foreign key constraint \"memberships_user_id_fkey\" \
+                                on table \"memberships\"";
 
 /// `users`, whose rows the acting role reads only when `policy` holds, and
 /// `memberships`, whose `user_id` column declares `key`, followed by `extra`.
@@ -113,13 +116,12 @@ fn replica(key: &str) -> SqliteConnection {
     replica_with(&script(key), &options()).0
 }
 
-/// The message the replica refuses `sql` with as PostgreSQL's foreign key
-/// violation.
+/// The SQLSTATE and message the replica refuses `sql` with, as `psql` prints
+/// them in verbose mode.
 fn refusal(connection: &mut SqliteConnection, sql: &str) -> String {
     let error = connection.batch_execute(sql).expect_err("the write is refused").to_string();
     let refused = postgres_error(&error).unwrap_or_else(|| panic!("no PostgreSQL error: {error}"));
-    assert_eq!(refused.sqlstate(), pg::FOREIGN_KEY_VIOLATION, "{error}");
-    refused.message().to_owned()
+    format!("{}: {}", refused.sqlstate(), refused.message())
 }
 
 fn memberships(connection: &mut SqliteConnection) -> Vec<(i32, Option<i32>)> {
@@ -142,12 +144,18 @@ fn a_write_referencing_a_row_the_role_cannot_read_commits() {
 
 #[test]
 fn deleting_a_referenced_row_is_refused_while_a_referencing_row_remains() {
-    for key in
-        ["REFERENCES users (id)", "REFERENCES users", "REFERENCES users (id) ON DELETE RESTRICT"]
-    {
-        let mut connection = replica(key);
+    for (key, major, expected) in [
+        ("REFERENCES users (id)", None, REFUSAL),
+        ("REFERENCES users", None, REFUSAL),
+        ("REFERENCES users (id) ON DELETE NO ACTION", Some(18), REFUSAL),
+        ("REFERENCES users (id) ON DELETE RESTRICT", Some(17), REFUSAL),
+        ("REFERENCES users (id) ON DELETE RESTRICT", Some(18), RESTRICT_REFUSAL),
+    ] {
+        let options = major.map_or_else(options, |major| options().with_postgres_major(major));
+        let (mut connection, _) = replica_with(&script(key), &options);
         connection.batch_execute("INSERT INTO memberships VALUES (1, 1)").expect("membership");
-        assert_eq!(refusal(&mut connection, "DELETE FROM users WHERE id = 1"), REFUSAL, "{key}");
+        let delete = refusal(&mut connection, "DELETE FROM users WHERE id = 1");
+        assert_eq!(delete, expected, "{key} on {major:?}");
         connection.batch_execute("DELETE FROM memberships").expect("drop the membership");
         connection.batch_execute("DELETE FROM users WHERE id = 1").expect("nothing references it");
     }
@@ -155,12 +163,35 @@ fn deleting_a_referenced_row_is_refused_while_a_referencing_row_remains() {
 
 #[test]
 fn rekeying_a_referenced_row_is_refused_while_a_referencing_row_remains() {
-    let mut connection = replica("REFERENCES users (id)");
-    connection.batch_execute("INSERT INTO memberships VALUES (1, 1)").expect("membership");
-    assert_eq!(refusal(&mut connection, "UPDATE users SET id = 3 WHERE id = 1"), REFUSAL);
-    connection
-        .batch_execute("UPDATE users SET name = 'visible' WHERE id = 1")
-        .expect("an update keeping the key checks nothing");
+    for (key, major, expected) in [
+        ("REFERENCES users (id)", None, REFUSAL),
+        ("REFERENCES users (id) ON UPDATE RESTRICT", Some(17), REFUSAL),
+        ("REFERENCES users (id) ON UPDATE RESTRICT", Some(18), RESTRICT_REFUSAL),
+    ] {
+        let options = major.map_or_else(options, |major| options().with_postgres_major(major));
+        let (mut connection, _) = replica_with(&script(key), &options);
+        connection.batch_execute("INSERT INTO memberships VALUES (1, 1)").expect("membership");
+        let rekey = refusal(&mut connection, "UPDATE users SET id = 3 WHERE id = 1");
+        assert_eq!(rekey, expected, "{key} on {major:?}");
+        connection
+            .batch_execute("UPDATE users SET name = 'visible' WHERE id = 1")
+            .expect("an update keeping the key checks nothing");
+    }
+}
+
+#[test]
+fn a_restrict_key_is_refused_without_the_server_major() {
+    for key in
+        ["REFERENCES users (id) ON DELETE RESTRICT", "REFERENCES users (id) ON UPDATE RESTRICT"]
+    {
+        let refusal = Pg2Sqlite::default()
+            .sql(&script(key))
+            .expect("parse")
+            .translate_to_sql(&options())
+            .expect_err("the refusal depends on the server's major")
+            .to_string();
+        assert!(refusal.contains("with_postgres_major"), "{key}: {refusal}");
+    }
 }
 
 #[test]
@@ -219,13 +250,13 @@ fn an_exempt_write_fires_no_check() {
 
 #[test]
 fn a_replica_omitting_server_derived_writes_keeps_only_the_refusals() {
-    let options = options().with_server_derived_writes_omitted();
+    let options = options().with_server_derived_writes_omitted().with_postgres_major(18);
     let (mut connection, _) = replica_with(
         &script("REFERENCES users (id) ON DELETE CASCADE ON UPDATE RESTRICT"),
         &options,
     );
     connection.batch_execute("INSERT INTO memberships VALUES (1, 1)").expect("membership");
-    assert_eq!(refusal(&mut connection, "UPDATE users SET id = 3 WHERE id = 1"), REFUSAL);
+    assert_eq!(refusal(&mut connection, "UPDATE users SET id = 3 WHERE id = 1"), RESTRICT_REFUSAL);
     connection.batch_execute("DELETE FROM users WHERE id = 1").expect("the server cascades");
     assert_eq!(memberships(&mut connection), [(1, Some(1))]);
 }
@@ -241,8 +272,8 @@ fn a_key_added_later_keeps_its_referenced_side() {
     connection.batch_execute("INSERT INTO memberships VALUES (1, 1), (2, 2)").expect("memberships");
     assert_eq!(
         refusal(&mut connection, "DELETE FROM users WHERE id = 1"),
-        "update or delete on table \"users\" violates foreign key constraint \"member\" on table \
-         \"memberships\""
+        "23503: update or delete on table \"users\" violates foreign key constraint \"member\" on \
+         table \"memberships\""
     );
 }
 
@@ -338,7 +369,7 @@ fn renaming_the_referencing_table_moves_the_referenced_side() {
         .expect("membership");
     assert_eq!(
         refusal(&mut connection, "DELETE FROM users WHERE id = 1"),
-        "update or delete on table \"users\" violates foreign key constraint \
+        "23503: update or delete on table \"users\" violates foreign key constraint \
          \"memberships_user_id_fkey\" on table \"members\""
     );
 }
@@ -389,7 +420,7 @@ fn two_unnamed_keys_on_one_column_keep_their_own_names() {
     assert_eq!(refusal(&mut connection, "DELETE FROM users WHERE id = 1"), REFUSAL);
     assert_eq!(
         refusal(&mut connection, "DELETE FROM admins WHERE id = 1"),
-        "update or delete on table \"admins\" violates foreign key constraint \
+        "23503: update or delete on table \"admins\" violates foreign key constraint \
          \"memberships_user_id_fkey1\" on table \"memberships\""
     );
 }

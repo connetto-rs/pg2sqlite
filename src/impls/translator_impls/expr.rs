@@ -3,7 +3,7 @@
 
 use sql_traits::{
     structs::{ColumnDefinition, ParserDB},
-    traits::{ColumnLike, DatabaseLike, TableLike},
+    traits::{DatabaseLike, TableLike},
 };
 use sqlparser::{
     ast::{
@@ -36,6 +36,7 @@ use crate::{
         interval::{ClockShift, IntervalShift, interval_shift, interval_shift_scaled},
         object_name::{
             fts_table_name, last_ident_value_or_display, postgres_catalog_function_name,
+            quoted_ident,
         },
         query_builder::{
             from_relation, plain_table_factor, single_expr_query, table_function_factor,
@@ -67,6 +68,7 @@ use crate::{
                 translate_quantified_over_array,
             },
             case_fold,
+            create_index::FtsKey,
             data_type::{MAX_NUMERIC_PRECISION, exact_numeric_info, numeric_precision_and_scale},
             definer_helper::helper_membership,
             function::cube_root_closed_form,
@@ -128,8 +130,9 @@ fn is_to_tsquery(func: &Function) -> bool {
 }
 
 /// Translate a full-text search expression (to_tsvector @@ to_tsquery) to FTS5
-/// MATCH. Returns an expression like: pk_col IN (SELECT rowid FROM table_fts
-/// WHERE table_fts MATCH 'query')
+/// MATCH. Returns `pk IN (SELECT rowid FROM table_fts WHERE table_fts MATCH
+/// 'query')` for a key that is the FTS5 rowid, and `(key, ...) IN (SELECT key,
+/// ... FROM keys WHERE rowid IN (...))` through the keys table otherwise.
 fn translate_fts_expression(
     tsvector_func: &Function,
     tsquery_func: &Function,
@@ -192,14 +195,7 @@ fn translate_fts_expression(
         )));
     }
 
-    let pk_columns: Vec<_> = table.primary_key_columns(schema)?.collect();
-    if pk_columns.len() != 1 {
-        return Err(crate::errors::Error::forward_refusal(format!(
-            "FTS5 requires a single-column primary key. Table '{table_name}' has {} primary key columns.",
-            pk_columns.len()
-        )));
-    }
-    let pk_column = pk_columns[0].column_name();
+    let key = FtsKey::of(table, schema, &table_name)?;
 
     // Get the search query from tsquery
     let query_str = extract_query_from_tsquery(tsquery_func).ok_or_else(|| {
@@ -215,35 +211,33 @@ fn translate_fts_expression(
     let fts5_query = translate_tsquery_to_fts5(&query_str);
     let fts_name = fts_table_name(&table_name);
 
-    let pk_reference = match &references[0] {
-        Expr::CompoundIdentifier(parts) => {
-            let mut parts = parts.clone();
-            if let Some(column) = parts.last_mut() {
-                *column = Ident::new(pk_column);
+    let key_reference = |column: &str| {
+        match &references[0] {
+            Expr::CompoundIdentifier(parts) => {
+                let mut parts = parts.clone();
+                if let Some(last) = parts.last_mut() {
+                    *last = quoted_ident(column);
+                }
+                Expr::CompoundIdentifier(parts)
             }
-            Expr::CompoundIdentifier(parts)
+            _ => Expr::Identifier(quoted_ident(column)),
         }
-        _ => Expr::Identifier(Ident::new(pk_column)),
     };
-    Ok(Expr::In {
-        expr: Box::new(pk_reference),
-        target: InTarget::Subquery(Box::new(single_expr_query(
-            Expr::Identifier(Ident::new("rowid")),
-            from_relation(plain_table_factor(ObjectName(vec![ObjectNamePart::Identifier(
-                Ident::new(fts_name.clone()),
-            )]))),
-            Some(Expr::BinaryOp {
-                left: Box::new(Expr::Identifier(Ident::new(fts_name))),
-                op: BinaryOperator::Match,
-                right: Box::new(Expr::Value(ValueWithSpan {
-                    value: Value::SingleQuotedString(fts5_query),
-                    span: sqlparser::tokenizer::Span::empty(),
-                })),
-            }),
-        ))),
-        negated: false,
-        global: false,
-    })
+    let matching = single_expr_query(
+        Expr::Identifier(Ident::new("rowid")),
+        from_relation(plain_table_factor(ObjectName(vec![ObjectNamePart::Identifier(
+            Ident::new(fts_name.clone()),
+        )]))),
+        Some(Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(Ident::new(fts_name))),
+            op: BinaryOperator::Match,
+            right: Box::new(Expr::Value(ValueWithSpan {
+                value: Value::SingleQuotedString(fts5_query),
+                span: sqlparser::tokenizer::Span::empty(),
+            })),
+        }),
+    );
+    Ok(key.matched_by(key_reference, matching))
 }
 
 /// Translate PostgreSQL EXTRACT(field FROM expr) to SQLite

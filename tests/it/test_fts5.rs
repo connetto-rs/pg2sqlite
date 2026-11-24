@@ -695,42 +695,36 @@ fn test_at_at_operator_with_custom_primary_key() {
     helpers::apply_default(sql).expect("translated statement must execute");
 }
 
-/// FTS5 `content_rowid=` maps to the SQLite rowid, which must be an INTEGER.
-/// A VARCHAR primary key cannot be used as a rowid.
+/// A text key cannot be the FTS5 rowid, so its rows reach the index through
+/// the keys table, and an update that changes the key moves them.
 #[test]
-fn fts5_with_varchar_pk_causes_error() {
-    let sql = "
-        CREATE TABLE fts_varchar_test (id VARCHAR(36) PRIMARY KEY, body TEXT);
-        CREATE INDEX fts_varchar_test_fts ON fts_varchar_test USING GIN (to_tsvector('english', body));
-    ";
-    let result = Pg2Sqlite::default()
-        .sql(sql)
-        .unwrap()
-        .translate(&Pg2SqliteOptions::default())
-        .map(pg2sqlite::script::Script::into_vec);
-    assert!(result.is_err(), "FTS5 with VARCHAR primary key must cause a translation error");
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.to_lowercase().contains("integer")
-            || err.to_lowercase().contains("rowid")
-            || err.to_lowercase().contains("primary key"),
-        "Error must explain the INTEGER rowid requirement, got: {err}"
+fn a_text_key_table_is_searchable() {
+    let found = helpers::run_translated::run_translated_default(
+        "
+        CREATE TABLE notes (id VARCHAR(36) PRIMARY KEY, body TEXT NOT NULL);
+        INSERT INTO notes VALUES ('before', 'lamp shade');
+        CREATE INDEX notes_search ON notes USING GIN (to_tsvector('english', body));
+        INSERT INTO notes VALUES ('after', 'garden lamp'), ('gone', 'lamp post');
+        UPDATE notes SET id = 'moved' WHERE id = 'before';
+        DELETE FROM notes WHERE id = 'gone';
+        SELECT id FROM notes WHERE to_tsvector('english', body) @@ to_tsquery('lamp') ORDER BY id;
+        ",
     );
+    assert_eq!(found, [Some("after".to_string()), Some("moved".to_string())]);
 }
 
-/// TEXT primary key is also not a valid rowid.
 #[test]
-fn fts5_with_text_pk_causes_error() {
-    let sql = "
-        CREATE TABLE fts_text_pk (id TEXT PRIMARY KEY, body TEXT);
-        CREATE INDEX fts_text_pk_idx ON fts_text_pk USING GIN (to_tsvector('english', body));
-    ";
-    let result = Pg2Sqlite::default()
-        .sql(sql)
-        .unwrap()
+fn a_table_without_a_primary_key_is_refused() {
+    let error = Pg2Sqlite::default()
+        .sql(
+            "CREATE TABLE notes (body TEXT);
+             CREATE INDEX notes_search ON notes USING GIN (to_tsvector('english', body));",
+        )
+        .expect("parse")
         .translate(&Pg2SqliteOptions::default())
-        .map(pg2sqlite::script::Script::into_vec);
-    assert!(result.is_err(), "FTS5 with TEXT primary key must cause a translation error");
+        .expect_err("FTS5 has no key to tie its rows to")
+        .to_string();
+    assert!(error.contains("primary key"), "unexpected error: {error}");
 }
 
 /// INTEGER primary key must still work and produce a runnable FTS5 table.
@@ -936,8 +930,6 @@ fn partial_gin_update_crossing_predicate_boundary_syncs_index() {
     .expect("FTS query before flip");
     assert_eq!(hits.len(), 0, "unpublished row must not be in index before flip");
 
-    // Flip published to true. The au_insert trigger fires (NEW.published =
-    // true) and must add the row to the index.
     diesel::update(filterable_posts::table.filter(filterable_posts::id.eq(1i32)))
         .set(filterable_posts::published.eq(true))
         .execute(&mut conn)
@@ -951,8 +943,6 @@ fn partial_gin_update_crossing_predicate_boundary_syncs_index() {
     .expect("FTS query after flip to published");
     assert_eq!(hits.len(), 1, "row must appear in index after flipping to published");
 
-    // Flip back to unpublished. The au_delete trigger fires (OLD.published =
-    // true) and must remove the row from the index.
     diesel::update(filterable_posts::table.filter(filterable_posts::id.eq(1i32)))
         .set(filterable_posts::published.eq(false))
         .execute(&mut conn)
@@ -965,4 +955,18 @@ fn partial_gin_update_crossing_predicate_boundary_syncs_index() {
     .load(&mut conn)
     .expect("FTS query after flip back to unpublished");
     assert_eq!(hits.len(), 0, "row must leave index after flipping back to unpublished");
+}
+
+/// An update keeping a row inside a partial index's predicate removes the
+/// row's old words before it adds the new ones, so a word both share stays.
+#[test]
+fn partial_gin_update_inside_predicate_keeps_shared_words() {
+    let found = helpers::run_translated::run_translated_default(&format!(
+        "{PARTIAL_GIN_SQL}
+        INSERT INTO filterable_posts VALUES (1, 'garden lamp', true);
+        UPDATE filterable_posts SET title = 'garden kettle' WHERE id = 1;
+        SELECT id FROM filterable_posts
+            WHERE to_tsvector('english', title) @@ to_tsquery('garden') AND published;"
+    ));
+    assert_eq!(found, [Some("1".to_string())]);
 }

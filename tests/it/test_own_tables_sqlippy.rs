@@ -56,11 +56,20 @@ END
 $$;
 CREATE CONSTRAINT TRIGGER notes_check AFTER INSERT ON notes
   DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION check_note();
+CREATE TABLE note_bodies (
+  note_id INT NOT NULL,
+  locale TEXT NOT NULL,
+  body TEXT NOT NULL,
+  PRIMARY KEY (note_id, locale)
+);
+GRANT SELECT, INSERT, UPDATE, DELETE ON note_bodies TO app;
+CREATE INDEX note_bodies_search ON note_bodies USING GIN (to_tsvector('english', body));
 ";
 
 /// Every table [`SOURCE`] makes the translation add for itself, so a kind
 /// the source stops producing fails the test rather than leaving the lint.
-const OWN_TABLES: [&str; 8] = [
+const OWN_TABLES: [&str; 9] = [
+    "note_bodies_pg2sqlite_fts_keys",
     "notes_check_pg2sqlite_rows",
     "notes_pg2sqlite_forwards",
     "notes_pg2sqlite_records",
