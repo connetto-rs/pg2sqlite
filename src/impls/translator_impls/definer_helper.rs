@@ -825,9 +825,12 @@ impl<'db> Lowering<'_, 'db> {
         )))
     }
 
-    /// `SELECT DISTINCT <key> FROM f(...) AS called (column_0) CROSS JOIN
-    /// <table> WHERE called.column_0 IN (<columns>)`, the arms reading
-    /// `membership`'s set through each of `columns` as one.
+    /// The arms reading `membership`'s set through each of `columns` as one.
+    ///
+    /// ```sql
+    /// SELECT DISTINCT <key> FROM f(...) AS called (column_0)
+    /// CROSS JOIN <table> WHERE called.column_0 IN (<columns>)
+    /// ```
     ///
     /// SQLite runs a called helper's function at each place a query reads
     /// it, so the `CROSS JOIN` reads the set ahead of the table and calls the
