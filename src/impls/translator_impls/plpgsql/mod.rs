@@ -18,5 +18,5 @@ mod translator;
 mod unresolved;
 pub use translator::PlPgSqlTranslator;
 pub(crate) use unresolved::{
-    ReadBodies, body_reach, names_unresolved, raising_unresolved, unresolved_aborts,
+    BodyReach, ReadBodies, body_reach, names_unresolved, raising_unresolved, unresolved_aborts,
 };

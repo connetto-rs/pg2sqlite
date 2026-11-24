@@ -1,6 +1,6 @@
 //! Submodule defining the main translator struct.
 
-use alloc::{borrow::Cow, collections::BTreeSet};
+use alloc::{borrow::Cow, collections::BTreeSet, rc::Rc};
 #[cfg(feature = "std")]
 use std::path::PathBuf;
 
@@ -415,16 +415,16 @@ pub struct Pg2Sqlite {
 struct PreparedEpoch {
     start: usize,
     end: usize,
-    schema: ParserDB,
+    schema: Rc<ParserDB>,
     /// Snapshots taken before each column change inside the epoch, which bind
     /// the references written before that change.
     bindings: Vec<ColumnChange>,
     /// Snapshots taken before each `DROP INDEX`, which still hold its indexes.
-    before_index_drops: Vec<(usize, ParserDB)>,
+    before_index_drops: Vec<(usize, Rc<ParserDB>)>,
     /// Snapshots taken at each `CREATE TRIGGER`, which hold the function it
     /// runs and the names its body reaches where it fires, and after each
     /// `CREATE VIEW`, which hold the relations its query binds.
-    declaration_snapshots: Vec<(usize, ParserDB)>,
+    declaration_snapshots: Vec<(usize, Rc<ParserDB>)>,
     /// The schemas on either side of each statement a live trigger's
     /// translation can depend on.
     events: Vec<EventSnapshots>,
@@ -433,19 +433,25 @@ struct PreparedEpoch {
 /// The schemas before and after statement `index`.
 struct EventSnapshots {
     index: usize,
-    before: ParserDB,
-    after: ParserDB,
+    before: Rc<ParserDB>,
+    after: Rc<ParserDB>,
 }
 
 /// The snapshot of `snapshots` taken at statement `index`.
-fn snapshot_at(snapshots: &[(usize, ParserDB)], index: usize) -> Option<&ParserDB> {
-    snapshots.iter().find(|(position, _)| *position == index).map(|(_, schema)| schema)
+fn snapshot_at(snapshots: &[(usize, Rc<ParserDB>)], index: usize) -> Option<&ParserDB> {
+    snapshots.iter().find(|(position, _)| *position == index).map(|(_, schema)| &**schema)
+}
+
+/// The snapshot of the state `input` holds, `current` keeping the one taken
+/// since `input` last changed.
+fn shared_snapshot(input: &ParserDBIngestor, current: &mut Option<Rc<ParserDB>>) -> Rc<ParserDB> {
+    Rc::clone(current.get_or_insert_with(|| Rc::new(input.snapshot())))
 }
 
 /// A statement changing a table's columns, and the schema before it.
 struct ColumnChange {
     index: usize,
-    before: ParserDB,
+    before: Rc<ParserDB>,
     /// Whether the statement drops a column, so it was written against the
     /// schema still holding the column and what hangs off it.
     drops: bool,
@@ -454,7 +460,7 @@ struct ColumnChange {
 impl ColumnChange {
     /// Records `statement`, at `index` of the batch, against the schema
     /// before it.
-    fn new(index: usize, statement: &Statement, before: ParserDB) -> Self {
+    fn new(index: usize, statement: &Statement, before: Rc<ParserDB>) -> Self {
         let drops = matches!(statement, Statement::AlterTable(alter_table) if alter_table
             .operations
             .iter()
@@ -471,6 +477,7 @@ impl PreparedEpoch {
             .chain(self.before_index_drops.iter().map(|(_, schema)| schema))
             .chain(self.declaration_snapshots.iter().map(|(_, schema)| schema))
             .chain(self.events.iter().flat_map(|event| [&event.before, &event.after]))
+            .map(|schema| &**schema)
     }
 
     /// The schema a column reference in statement `index` binds against.
@@ -478,7 +485,7 @@ impl PreparedEpoch {
         self.bindings
             .iter()
             .find(|change| change.index > index)
-            .map_or(&self.schema, |change| &change.before)
+            .map_or(&*self.schema, |change| &*change.before)
     }
 
     /// The schema statement `index` was written against.
@@ -491,7 +498,7 @@ impl PreparedEpoch {
         self.bindings
             .iter()
             .find(|change| change.drops && change.index == index)
-            .map_or_else(|| self.binding(index), |change| &change.before)
+            .map_or_else(|| self.binding(index), |change| &*change.before)
     }
 
     /// The schemas on either side of statement `index`, when live triggers can
@@ -1210,6 +1217,7 @@ impl Pg2Sqlite {
             || statements.iter().any(|statement| matches!(statement, Statement::CreateTrigger(_)));
         let mut sources = Cow::Borrowed(statements.as_slice());
         let mut start = 0;
+        let mut current = None;
         let schema = loop {
             if start >= statements.len() {
                 break Ok(input.finish());
@@ -1226,13 +1234,13 @@ impl Pg2Sqlite {
                 &mut sources,
                 (start, schema_end, end),
                 follows_triggers,
-                input,
+                (input, &mut current),
             )?;
             epochs.push(epoch);
             if let Some(index) = boundary {
                 let event_before = (follows_triggers
                     && TriggerFollower::is_event(&statements[index]))
-                .then(|| input.snapshot());
+                .then(|| shared_snapshot(&input, &mut current));
                 if let Some(before) = event_before.as_ref()
                     && let Cow::Owned(statement) =
                         Self::canonical_trigger_event(&statements[index], before)?
@@ -1251,8 +1259,10 @@ impl Pg2Sqlite {
                     Ok(next) => input = next,
                     Err(error) => break Err(error.into()),
                 }
+                current = None;
                 if let (Some(before), Some(epoch)) = (event_before, epochs.last_mut()) {
-                    epoch.events.push(EventSnapshots { index, before, after: input.snapshot() });
+                    let after = shared_snapshot(&input, &mut current);
+                    epoch.events.push(EventSnapshots { index, before, after });
                 }
             }
             start = end;
@@ -1337,13 +1347,15 @@ impl Pg2Sqlite {
 
     /// The epoch of `statements` from `start` to `end`, whose statements up to
     /// `schema_end` are applied to `input`, with the snapshots its translation
-    /// reads, and the ingestor after them.
+    /// reads, and the ingestor after them. `current` holds the snapshot of
+    /// `input` taken since it last changed, which every snapshot of the same
+    /// state shares.
     fn prepare_epoch(
         statements: &[Statement],
         sources: &mut Cow<'_, [Statement]>,
         (start, schema_end, end): (usize, usize, usize),
         follows_triggers: bool,
-        mut input: ParserDBIngestor,
+        (mut input, current): (ParserDBIngestor, &mut Option<Rc<ParserDB>>),
     ) -> Result<(ParserDBIngestor, PreparedEpoch), crate::errors::Error> {
         let mut bindings = Vec::new();
         let mut before_index_drops = Vec::new();
@@ -1354,16 +1366,17 @@ impl Pg2Sqlite {
         })?;
         for (index, statement) in statements[start..schema_end].iter().enumerate() {
             if Self::changes_columns(statement) || Self::adds_foreign_key(statement) {
-                bindings.push(ColumnChange::new(start + index, statement, input.snapshot()));
+                let before = shared_snapshot(&input, current);
+                bindings.push(ColumnChange::new(start + index, statement, before));
             }
             if matches!(statement, Statement::Drop { object_type: ObjectType::Index, .. }) {
-                before_index_drops.push((start + index, input.snapshot()));
+                before_index_drops.push((start + index, shared_snapshot(&input, current)));
             }
             if matches!(statement, Statement::CreateTrigger(_)) {
-                declaration_snapshots.push((start + index, input.snapshot()));
+                declaration_snapshots.push((start + index, shared_snapshot(&input, current)));
             }
             let event_before = (follows_triggers && TriggerFollower::is_event(statement))
-                .then(|| input.snapshot());
+                .then(|| shared_snapshot(&input, current));
             if let Some(before) = event_before.as_ref()
                 && let Cow::Owned(statement) = Self::canonical_trigger_event(statement, before)?
             {
@@ -1381,22 +1394,21 @@ impl Pg2Sqlite {
                     sources.to_mut()[start + index] = applied.clone();
                 }
                 input = input.apply_statement(applied)?;
+                *current = None;
                 if matches!(statement, Statement::CreateView(_)) {
-                    declaration_snapshots.push((start + index, input.snapshot()));
+                    declaration_snapshots.push((start + index, shared_snapshot(&input, current)));
                 }
             }
             if let Some(drop) = Self::seeded_trigger_drop(statement) {
                 input = input.apply_statement(drop)?;
+                *current = None;
             }
             if let Some(before) = event_before {
-                events.push(EventSnapshots {
-                    index: start + index,
-                    before,
-                    after: input.snapshot(),
-                });
+                let after = shared_snapshot(&input, current);
+                events.push(EventSnapshots { index: start + index, before, after });
             }
         }
-        let schema = input.snapshot();
+        let schema = shared_snapshot(&input, current);
         let epoch = PreparedEpoch {
             start,
             end,
@@ -1426,11 +1438,11 @@ fn event_sides<'s, 'c>(
     let shape = if Pg2Sqlite::schema_ends_epoch(statement) {
         epochs
             .get(epoch_index + 1)
-            .map(|next| &next.schema)
+            .map(|next| &*next.schema)
             .or(final_schema)
-            .unwrap_or(&event.after)
+            .unwrap_or(&*event.after)
     } else {
-        &epoch.schema
+        &*epoch.schema
     };
     Some((
         Position { binding: &event.before, ..at },
@@ -1458,7 +1470,7 @@ impl Pg2Sqlite {
         register_server_derived_triggers(statements, &epochs, initial_schema.as_ref(), context);
         populate_prewalk_catalogs(statements, &epochs, initial_schema.as_ref(), context);
         register_deferred_key_checks(
-            initial_schema.iter().chain(epochs.iter().map(|epoch| &epoch.schema)),
+            initial_schema.iter().chain(epochs.iter().map(|epoch| &*epoch.schema)),
             context,
         )?;
         context.batch_cache().borrow_mut().keep_for(
@@ -1486,7 +1498,7 @@ impl Pg2Sqlite {
         )?;
 
         let schema = schema?;
-        let schemas = core::iter::once(&schema).chain(epochs.iter().map(|epoch| &epoch.schema));
+        let schemas = core::iter::once(&schema).chain(epochs.iter().map(|epoch| &*epoch.schema));
         let prelude = generated_prelude(&translated, schemas, &options, had_rls_tables, context)?;
 
         let names: Vec<String> = {
