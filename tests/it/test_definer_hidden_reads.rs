@@ -23,6 +23,16 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// The members a definer trigger records as they join.
+    admissions (org, member) {
+        /// The organization.
+        org -> Integer,
+        /// The member.
+        member -> Integer,
+    }
+}
+
 diesel::define_sql_function! {
     /// Whether the connection writes past the generated guards.
     fn member_write_exempt() -> diesel::sql_types::Bool;
@@ -195,6 +205,79 @@ fn dropping_or_replacing_a_trigger_left_to_the_server_drops_nothing() {
 
         leave(&mut connection, &before_commit).unwrap_or_else(|error| panic!("{error}\n{extra}"));
     }
+}
+
+/// `admissions`, written by the `SECURITY DEFINER` body of
+/// `members_admitted`, `timing` each member, with `statement`.
+fn admitting(timing: &str, statement: &str) -> String {
+    script(
+        DIRECT,
+        "",
+        &format!(
+            "CREATE TABLE admissions (org INT NOT NULL, member INT NOT NULL,
+               PRIMARY KEY (org, member));
+             GRANT SELECT ON admissions TO app;
+             GRANT SELECT, INSERT, UPDATE, DELETE ON admissions TO checker;
+             CREATE FUNCTION admit() RETURNS trigger
+             LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+             BEGIN
+               {statement};
+               RETURN NULL;
+             END
+             $$;
+             ALTER FUNCTION admit() OWNER TO checker;
+             CREATE TRIGGER members_admitted {timing} ON members
+               FOR EACH ROW EXECUTE FUNCTION admit();"
+        ),
+    )
+}
+
+#[test]
+fn a_definer_write_picking_rows_from_hidden_rows_stays_and_writes_from_the_rows_held() {
+    let pg = admitting(
+        "AFTER INSERT",
+        "INSERT INTO public.admissions SELECT org, member FROM public.members
+           WHERE org = NEW.org AND member = NEW.member",
+    );
+    let (mut connection, _) = replica(&pg);
+
+    diesel::insert_into(members::table)
+        .values((members::org.eq(2), members::member.eq(1), members::admin.eq(true)))
+        .execute(&mut connection)
+        .expect("member 1 founds organization 2");
+    let admitted: Vec<(i32, i32)> =
+        admissions::table.load(&mut connection).expect("read the admissions");
+    assert_eq!(admitted, [(2, 1)]);
+    assert_eq!(left_to_server(&pg), []);
+}
+
+#[test]
+fn definer_updates_and_deletes_filtered_by_hidden_rows_stay() {
+    for statement in [
+        "DELETE FROM public.admissions WHERE org = OLD.org
+           AND member IN (SELECT member FROM public.members WHERE org = OLD.org AND admin)",
+        "UPDATE public.admissions SET member = OLD.member
+           WHERE (org, member) IN (SELECT org, member FROM public.members WHERE admin)",
+    ] {
+        let pg = admitting("AFTER DELETE", statement);
+        let (mut connection, before_commit) = replica(&pg);
+
+        leave(&mut connection, &before_commit).unwrap_or_else(|error| panic!("{error}\n{pg}"));
+        assert_eq!(left_to_server(&pg), [], "{statement}");
+    }
+}
+
+#[test]
+fn a_definer_check_on_found_after_reading_hidden_rows_is_left_to_the_server() {
+    let pg = script(DIRECT, AFTER_DELETE, "").replace(
+        &format!("IF NOT ({DIRECT}) THEN"),
+        "PERFORM 1 FROM public.members WHERE org = OLD.org AND admin;
+           IF NOT FOUND THEN",
+    );
+    let (mut connection, before_commit) = replica(&pg);
+
+    leave(&mut connection, &before_commit).expect("the server holds the admin");
+    assert_eq!(left_to_server(&pg).len(), 1, "{pg}");
 }
 
 #[test]

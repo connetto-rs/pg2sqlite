@@ -8,8 +8,8 @@ use core::ops::ControlFlow;
 use sql_traits::{structs::ParserDB, traits::FunctionLike};
 use sqlparser::ast::{
     CreateFunction, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName,
-    ObjectNamePart, Select, SelectItem, SelectItemQualifiedWildcardKind, TableFactor, Visit,
-    Visitor,
+    ObjectNamePart, Select, SelectItem, SelectItemQualifiedWildcardKind, Statement, TableFactor,
+    Visit, Visitor,
 };
 use sqlparser_plpgsql::embedded::{
     self, Block, Branch, DeclarationKind, Loop, LoopControl, Node, NodeKind, Open, RaiseLevel,
@@ -41,6 +41,10 @@ pub(super) struct Read {
     /// The position in [`Self::through`] of the first `SECURITY DEFINER`
     /// function, whose owner the statement reads as.
     pub(super) definer: Option<usize>,
+    /// Whether what the read finds decides a branch, a raise, a value the
+    /// function assigns or returns, or `FOUND`. A read that only picks the
+    /// rows a write changes or inserts decides none of these.
+    pub(super) decides: bool,
 }
 
 /// What a trigger function does, read in the order PostgreSQL runs it.
@@ -74,6 +78,9 @@ pub(super) struct Walker<'s, 'o, 'c> {
     /// How many calls the walk passed over because their function was being
     /// read.
     recursions: usize,
+    /// Whether the function being read reads `FOUND` or `GET DIAGNOSTICS`,
+    /// which the rows its statements find decide.
+    found: bool,
     chain: Chain,
 }
 
@@ -107,6 +114,7 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
             functions: Vec::new(),
             recorded: BTreeMap::new(),
             recursions: 0,
+            found: false,
             chain: Chain::default(),
         };
         walker.function(function)?;
@@ -134,14 +142,22 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
         let body = parsed_body(function, self.schema)?;
         let (depth, recursions, reads) =
             (self.functions.len(), self.recursions, self.chain.reads.len());
+        let caller_found = core::mem::replace(&mut self.found, false);
         self.functions.push(function);
         let read = match &body {
             super::Body::PlPgSql(block) => self.block(block),
             super::Body::Sql(statements) => {
-                statements.iter().try_for_each(|statement| self.kept(statement))
+                statements
+                    .iter()
+                    .try_for_each(|statement| self.kept(statement, returns_rows(statement)))
             }
         };
         self.functions.pop();
+        if core::mem::replace(&mut self.found, caller_found) {
+            for read in &mut self.chain.reads[reads..] {
+                read.decides = true;
+            }
+        }
         read?;
         if self.recursions == recursions {
             self.recorded.insert(
@@ -168,6 +184,7 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
                 columns: read.columns.clone(),
                 through: names.iter().chain(&read.through[recorded.depth..]).cloned().collect(),
                 definer: caller_definer.or(own_definer),
+                decides: read.decides,
             };
             self.chain.reads.push(repeated);
         }
@@ -185,7 +202,7 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
             if let DeclarationKind::Variable(variable) = &declaration.kind
                 && let Some(default) = &variable.default
             {
-                self.kept(default.as_ref())?;
+                self.kept(default.as_ref(), true)?;
             }
         }
         self.nodes(&block.statements)?;
@@ -201,7 +218,7 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
 
     fn branches(&mut self, branches: &[Branch]) -> Result<(), Error> {
         for branch in branches {
-            self.kept(branch.condition.as_ref())?;
+            self.kept(branch.condition.as_ref(), true)?;
             self.nodes(&branch.statements)?;
         }
         Ok(())
@@ -209,17 +226,22 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
 
     fn node(&mut self, node: &Node) -> Result<(), Error> {
         match &node.kind {
-            NodeKind::Statement { statement, .. } => self.kept(statement.as_ref())?,
-            NodeKind::Perform { query } | NodeKind::Open(Open::Query { query, .. }) => {
-                self.kept(query.as_ref())?;
+            NodeKind::Statement { statement, into } => {
+                self.kept(statement.as_ref(), into.is_some() || returns_rows(statement))?;
             }
-            NodeKind::Assignment(assignment) => self.kept(assignment.value.as_ref())?,
+            // `PERFORM` discards its rows, so they decide only `FOUND`.
+            NodeKind::Perform { query } => self.kept(query.as_ref(), false)?,
+            NodeKind::Open(Open::Query { query, .. })
+            | NodeKind::ReturnQuery(ReturnQuery::Query(query)) => {
+                self.kept(query.as_ref(), true)?;
+            }
+            NodeKind::Assignment(assignment) => self.kept(assignment.value.as_ref(), true)?,
+            NodeKind::Diagnostics(_) => self.found = true,
             NodeKind::Dynamic { .. }
             | NodeKind::Fetch(_)
             | NodeKind::Move { .. }
             | NodeKind::Open(Open::Bound(_) | Open::Dynamic { .. })
             | NodeKind::Close { .. }
-            | NodeKind::Diagnostics(_)
             | NodeKind::Commit { .. }
             | NodeKind::Rollback { .. }
             | NodeKind::ReturnQuery(ReturnQuery::Dynamic(_)) => {}
@@ -230,7 +252,7 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
             }
             NodeKind::Case(case) => {
                 if let Some(subject) = &case.subject {
-                    self.kept(subject.as_ref())?;
+                    self.kept(subject.as_ref(), true)?;
                 }
                 self.branches(&case.branches)?;
                 if let Some(otherwise) = &case.otherwise {
@@ -240,7 +262,7 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
             NodeKind::Loop(looped) => self.looped(looped)?,
             NodeKind::Exit(exit) => {
                 if let Some(condition) = &exit.condition {
-                    self.kept(condition.as_ref())?;
+                    self.kept(condition.as_ref(), true)?;
                 }
             }
             NodeKind::Return { value } => {
@@ -248,58 +270,61 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
                 if let Some(value) = value
                     && !returns_record(value)
                 {
-                    self.kept(value.as_ref())?;
+                    self.kept(value.as_ref(), true)?;
                 }
             }
             NodeKind::ReturnNext { value } => {
                 if let Some(value) = value {
-                    self.kept(value.as_ref())?;
+                    self.kept(value.as_ref(), true)?;
                 }
             }
-            NodeKind::ReturnQuery(ReturnQuery::Query(query)) => self.kept(query.as_ref())?,
+            // The arguments of a raise shape only its message.
             NodeKind::Raise(raise) => {
                 if matches!(raise.level, RaiseLevel::Exception) {
                     for argument in &raise.arguments {
-                        self.kept(argument)?;
+                        self.kept(argument, false)?;
                     }
                     for option in &raise.options {
-                        self.kept(&option.value)?;
+                        self.kept(&option.value, false)?;
                     }
                 }
             }
-            NodeKind::Assert(assert) => self.kept(assert.condition.as_ref())?,
+            NodeKind::Assert(assert) => self.kept(assert.condition.as_ref(), true)?,
         }
         Ok(())
     }
 
     fn looped(&mut self, looped: &Loop) -> Result<(), Error> {
         match &looped.control {
-            LoopControl::Query { query, .. } => self.kept(query.as_ref())?,
+            LoopControl::Query { query, .. } => self.kept(query.as_ref(), true)?,
             LoopControl::Unconditional | LoopControl::Dynamic { .. } => {}
-            LoopControl::While(condition) => self.kept(condition.as_ref())?,
+            LoopControl::While(condition) => self.kept(condition.as_ref(), true)?,
             LoopControl::Range { lower, upper, step, .. } => {
-                self.kept(lower.as_ref())?;
-                self.kept(upper.as_ref())?;
+                self.kept(lower.as_ref(), true)?;
+                self.kept(upper.as_ref(), true)?;
                 if let Some(step) = step {
-                    self.kept(step.as_ref())?;
+                    self.kept(step.as_ref(), true)?;
                 }
             }
-            LoopControl::Cursor { cursor, .. } => self.kept(cursor.query.as_ref())?,
-            LoopControl::Array { array, .. } => self.kept(array.as_ref())?,
+            LoopControl::Cursor { cursor, .. } => self.kept(cursor.query.as_ref(), true)?,
+            LoopControl::Array { array, .. } => self.kept(array.as_ref(), true)?,
         }
         self.nodes(&looped.statements)
     }
 
     /// Reads a statement or expression: whether it writes rows, the fields
     /// of `OLD` and `NEW` the trigger's own function reads in it, the
-    /// helpers it calls, which run before it, and the relations it names.
-    fn kept<N: Visit>(&mut self, node: &N) -> Result<(), Error> {
+    /// helpers it calls, which run before it, the relations it names, and
+    /// whether the function reads `FOUND`. Its reads decide an outcome when
+    /// `decides` says.
+    fn kept<N: Visit>(&mut self, node: &N, decides: bool) -> Result<(), Error> {
         let written = written_relations(node);
         self.chain.writes |= !written.is_empty();
         self.chain.written.extend(written);
         if self.functions.len() == 1 {
             record_reads(node, &mut self.chain.old, &mut self.chain.new);
         }
+        self.found |= reads_found(node);
         for helper in helpers(node, self.schema, self.options)? {
             self.function(helper)?;
         }
@@ -309,10 +334,47 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
         let relations: BTreeSet<String> = relations_read(node, self.schema).into_iter().collect();
         for relation in relations {
             let columns = columns.remove(&relation).unwrap_or(Columns::Row);
-            self.chain.reads.push(Read { relation, columns, through: names.clone(), definer });
+            self.chain.reads.push(Read {
+                relation,
+                columns,
+                through: names.clone(),
+                definer,
+                decides,
+            });
         }
         Ok(())
     }
+}
+
+/// Whether `statement` hands rows on: a query, and a write with `RETURNING`.
+fn returns_rows(statement: &Statement) -> bool {
+    match statement {
+        Statement::Insert(insert) => insert.returning.is_some(),
+        Statement::Update(update) => update.returning.is_some(),
+        Statement::Delete(delete) => delete.returning.is_some(),
+        Statement::Merge(merge) => merge.output.is_some(),
+        _ => true,
+    }
+}
+
+/// Whether `node` reads `FOUND`.
+fn reads_found<N: Visit>(node: &N) -> bool {
+    struct Found;
+    impl Visitor for Found {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+            match expr {
+                Expr::Identifier(ident)
+                    if ident.quote_style.is_none() && ident.value.eq_ignore_ascii_case("found") =>
+                {
+                    ControlFlow::Break(())
+                }
+                _ => ControlFlow::Continue(()),
+            }
+        }
+    }
+    node.visit(&mut Found).is_break()
 }
 
 /// The functions the schema declares that `node` calls, in the order it names

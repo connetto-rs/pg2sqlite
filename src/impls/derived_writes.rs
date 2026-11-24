@@ -140,11 +140,15 @@ fn trigger_chain<'s>(
 }
 
 /// Why the replica leaves `trigger` to the server, or `None` when it keeps
-/// it: a statement its function chain runs reads, as the owner of a
-/// `SECURITY DEFINER` function in the chain, a table the replica holds whose
-/// policies may hide rows from the acting role. The owner reads past those
-/// policies on the server, while the replica holds only the rows the acting
-/// role reads, so the trigger would judge the write on a partial copy.
+/// it: what a statement its function chain runs finds decides a branch, a
+/// raise, an assigned or returned value, or `FOUND`, and the statement
+/// reads, as the owner of a `SECURITY DEFINER` function in the chain, a
+/// table the replica holds whose policies may hide rows from the acting
+/// role. The owner reads past those policies on the server, while the
+/// replica holds only the rows the acting role reads, so the trigger would
+/// judge the write on a partial copy. A read that only picks the rows a
+/// write changes or inserts runs on the rows the replica holds, and the
+/// rows the server writes besides arrive with the sync.
 ///
 /// An `INSTEAD OF` trigger is kept, since its writes are the view's own and
 /// the server applying them never fires it, and so is every trigger when no
@@ -166,7 +170,7 @@ pub(crate) fn definer_hidden_read(
         return Ok(None);
     }
     let Some((_, chain)) = trigger_chain(trigger, schema, options)? else { return Ok(None) };
-    for read in &chain.reads {
+    for read in chain.reads.iter().filter(|read| read.decides) {
         let Some(definer) = read.definer else { continue };
         let Some(table) = schema.tables().find(|table| table.stored_table_name() == read.relation)
         else {

@@ -323,6 +323,7 @@ fn stored_reads(
             columns: stored,
             through: through.to_vec(),
             definer: None,
+            decides: true,
         }];
     }
     let mut beneath = BTreeSet::new();
@@ -330,7 +331,13 @@ fn stored_reads(
     beneath
         .into_iter()
         .map(|relation| {
-            Read { relation, columns: Columns::Row, through: through.to_vec(), definer: None }
+            Read {
+                relation,
+                columns: Columns::Row,
+                through: through.to_vec(),
+                definer: None,
+                decides: true,
+            }
         })
         .collect()
 }
@@ -413,6 +420,7 @@ fn table_readers(
             ),
             through: Vec::new(),
             definer: None,
+            decides: true,
         }];
         // A key into rows the acting role may not read keeps only its
         // referenced side, which reads the referencing rows.
@@ -426,6 +434,7 @@ fn table_readers(
                 ),
                 through: Vec::new(),
                 definer: None,
+                decides: true,
             });
         }
         readers.push(Reader {
@@ -453,7 +462,9 @@ fn expression_reads(
     };
     let mut reads: Vec<Read> = direct
         .into_iter()
-        .map(|(relation, columns)| Read { relation, columns, through: Vec::new(), definer: None })
+        .map(|(relation, columns)| {
+            Read { relation, columns, through: Vec::new(), definer: None, decides: true }
+        })
         .collect();
     for helper in helpers(expression, schema, options)? {
         reads.extend(Walker::read(helper, schema, options)?.reads);
