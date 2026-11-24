@@ -65,8 +65,8 @@ sql-values = { git = "https://github.com/connetto-rs/sql-values", branch = "main
 
 [profile.release]
 opt-level = "z"
-lto = true
-codegen-units = 1
+# Fat LTO with one codegen unit peaks above the 16 GB of a GitHub runner.
+lto = "thin"
 # binaryen aborts on the DWARF that rustc emits, so strip before wasm-opt runs.
 strip = "debuginfo"
 debug = false
