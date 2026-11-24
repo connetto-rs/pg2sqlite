@@ -691,3 +691,121 @@ GRANT SELECT, INSERT ON memberships TO app;
           decides on them as they were before"],
     );
 }
+
+fn helper_read_warnings(helpers: &str, statements: &str) -> Vec<TranslationWarning> {
+    let initial = Pg2Sqlite::default()
+        .sql(&format!(
+            "CREATE TABLE users (id INT PRIMARY KEY);
+CREATE TABLE invitations (id INT PRIMARY KEY, accepted_by_id INT);
+CREATE TABLE inspection_requests (id INT PRIMARY KEY);
+{helpers}
+CREATE FUNCTION check_invitation() RETURNS BOOLEAN LANGUAGE plpgsql AS $$
+BEGIN
+  {statements}
+  RETURN true;
+END
+$$;
+CREATE FUNCTION pass_invitation() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN RETURN NEW; END $$;
+CREATE TRIGGER invitations_checked BEFORE UPDATE ON inspection_requests
+  FOR EACH ROW WHEN (check_invitation()) EXECUTE FUNCTION pass_invitation();"
+        ))
+        .expect("fixture parses")
+        .build_schema()
+        .expect("the starting schema builds");
+    Pg2Sqlite::default()
+        .sql(
+            "ALTER TABLE invitations ADD FOREIGN KEY (accepted_by_id)
+             REFERENCES users (id) ON DELETE SET NULL;",
+        )
+        .expect("key parses")
+        .translate_with_report_and_schema(
+            &initial,
+            &Pg2SqliteOptions::default().with_foreign_keys_omitted(),
+        )
+        .expect("key translates")
+        .warnings
+}
+
+#[test]
+fn helper_declarations_branches_returns_and_assertions_name_their_reads() {
+    for body in [
+        "DECLARE accepted INT DEFAULT (SELECT accepted_by_id FROM invitations LIMIT 1);
+         BEGIN RETURN; END",
+        "BEGIN CASE WHEN false THEN NULL;
+         ELSE PERFORM accepted_by_id FROM invitations; END CASE; RETURN; END",
+        "BEGIN RETURN (SELECT accepted_by_id FROM invitations LIMIT 1); END",
+        "BEGIN RETURN NEXT (SELECT accepted_by_id FROM invitations LIMIT 1); RETURN; END",
+        "BEGIN RETURN QUERY SELECT accepted_by_id FROM invitations; END",
+        "BEGIN ASSERT (SELECT accepted_by_id IS NULL FROM invitations LIMIT 1); RETURN; END",
+    ] {
+        let returns = if body.contains("RETURN NEXT") || body.contains("RETURN QUERY") {
+            "SETOF INT"
+        } else if body.contains("RETURN (") {
+            "INT"
+        } else {
+            "VOID"
+        };
+        let warnings = helper_read_warnings(
+            &format!(
+                "CREATE FUNCTION inspect_invitation() RETURNS {returns}
+                 LANGUAGE plpgsql AS $$ {body} $$;"
+            ),
+            "PERFORM inspect_invitation();",
+        );
+        assert_eq!(
+            through(&warnings, "invitations_checked"),
+            ["check_invitation", "inspect_invitation"],
+            "{body}",
+        );
+        assert_eq!(
+            readers_in(warnings),
+            owned(&[(
+                "TRIGGER",
+                "invitations_checked",
+                "accepted_by_id of invitations",
+                "(accepted_by_id) REFERENCES users",
+            )]),
+            "{body}",
+        );
+    }
+}
+
+#[test]
+fn dynamic_return_queries_do_not_claim_reads_of_their_sql_text() {
+    let warnings = helper_read_warnings(
+        "CREATE FUNCTION inspect_invitation() RETURNS SETOF INT LANGUAGE plpgsql AS $$
+         BEGIN RETURN QUERY EXECUTE 'SELECT accepted_by_id FROM invitations'; END $$;",
+        "PERFORM inspect_invitation();",
+    );
+    assert_eq!(readers_in(warnings), owned(&[]));
+}
+
+#[test]
+fn a_helper_reached_through_two_callers_names_the_first_read_path_once() {
+    let warnings = helper_read_warnings(
+        "CREATE FUNCTION inspect_invitation() RETURNS INT LANGUAGE sql STABLE AS $$
+           SELECT accepted_by_id FROM invitations LIMIT 1
+         $$;
+         CREATE FUNCTION first_inspection() RETURNS INT LANGUAGE sql STABLE AS $$
+           SELECT inspect_invitation()
+         $$;
+         CREATE FUNCTION second_inspection() RETURNS INT LANGUAGE sql STABLE AS $$
+           SELECT inspect_invitation()
+         $$;",
+        "PERFORM first_inspection(); PERFORM second_inspection();",
+    );
+    assert_eq!(
+        through(&warnings, "invitations_checked"),
+        ["check_invitation", "first_inspection", "inspect_invitation"],
+    );
+    assert_eq!(
+        readers_in(warnings),
+        owned(&[(
+            "TRIGGER",
+            "invitations_checked",
+            "accepted_by_id of invitations",
+            "(accepted_by_id) REFERENCES users",
+        )]),
+    );
+}

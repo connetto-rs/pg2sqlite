@@ -364,3 +364,50 @@ fn returning_current_view_versions_reads_computed_columns() {
         [Some("2 16".to_owned())]
     );
 }
+
+/// An `INSTEAD OF INSERT` trigger leaves a `DELETE` on the view to the view's
+/// own rewrite onto its table.
+#[test]
+fn a_delete_on_a_view_whose_trigger_takes_inserts_writes_its_table() {
+    let initial = Pg2Sqlite::default()
+        .sql(
+            "CREATE TABLE invitations (id INT PRIMARY KEY);
+             CREATE VIEW invitation_view AS SELECT id FROM invitations;
+             CREATE FUNCTION insert_invitation() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+             BEGIN INSERT INTO invitations VALUES (NEW.id); RETURN NEW; END $$;
+             CREATE TRIGGER invitation_insert INSTEAD OF INSERT ON invitation_view
+               FOR EACH ROW EXECUTE FUNCTION insert_invitation();",
+        )
+        .expect("fixture parses")
+        .build_schema()
+        .expect("the starting schema builds");
+    let emitted = Pg2Sqlite::default()
+        .sql("DELETE FROM invitation_view WHERE id = 1;")
+        .expect("write parses")
+        .translate_to_sql_with_schema(&initial, &Pg2SqliteOptions::default())
+        .expect("write translates")
+        .into_vec();
+    assert!(emitted.iter().any(|statement| statement.starts_with("DELETE FROM invitations ")));
+}
+
+#[test]
+fn a_view_over_a_wildcard_output_writes_the_view_it_reads() {
+    let initial = Pg2Sqlite::default()
+        .sql(
+            "CREATE VIEW invitation_source AS
+               SELECT 1 AS id, expanded.* FROM generate_series(1, 2) expanded;
+             CREATE VIEW invitation_view AS SELECT id FROM invitation_source;",
+        )
+        .expect("fixture parses")
+        .build_schema()
+        .expect("the starting schema builds");
+    let emitted = Pg2Sqlite::default()
+        .sql("DELETE FROM invitation_view WHERE id = 1;")
+        .expect("write parses")
+        .translate_to_sql_with_schema(&initial, &Pg2SqliteOptions::default())
+        .expect("write translates")
+        .into_vec();
+    assert!(
+        emitted.iter().any(|statement| statement.starts_with("DELETE FROM invitation_source "))
+    );
+}
