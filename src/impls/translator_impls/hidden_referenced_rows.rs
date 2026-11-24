@@ -14,8 +14,12 @@
 //! trigger.
 //!
 //! The triggers fire once per row. `RESTRICT` refuses while a referencing row
-//! remains, as `restrict_violation`, and `NO ACTION` while one remains and no
-//! row holds the key again, as `foreign_key_violation`.
+//! remains, and `NO ACTION` while one remains and no row holds the key again,
+//! as `foreign_key_violation`. `RESTRICT` refuses as the server's major does,
+//! as `restrict_violation` from PostgreSQL 18 on and as
+//! `foreign_key_violation` before it, and is refused unless
+//! [`with_postgres_major`](crate::options::Pg2SqliteOptions::with_postgres_major)
+//! names that major.
 //! A `NO ACTION` key declared `DEFERRABLE INITIALLY DEFERRED` queues that
 //! check for the commit, as a deferred constraint trigger does. Under
 //! [`with_server_derived_writes_omitted`](crate::options::Pg2SqliteOptions::with_server_derived_writes_omitted)
@@ -330,6 +334,14 @@ impl Event {
         }
     }
 
+    /// The event as `ON DELETE` and `ON UPDATE` spell it.
+    fn keyword(self) -> &'static str {
+        match self {
+            Self::Delete => "DELETE",
+            Self::Update => "UPDATE",
+        }
+    }
+
     fn deferred(self) -> DeferredEvent {
         match self {
             Self::Delete => DeferredEvent::Delete,
@@ -421,10 +433,26 @@ fn referenced_side(
                 parts.refusal(&refusal(sqlstate::pg::FOREIGN_KEY_VIOLATION, ""), true)
             }
             ReferentialAction::Restrict => {
-                parts.refusal(
-                    &refusal(sqlstate::pg::RESTRICT_VIOLATION, "RESTRICT setting of "),
-                    false,
-                )
+                let message = match options.get_postgres_major() {
+                    Some(major) if major >= 18 => {
+                        refusal(sqlstate::pg::RESTRICT_VIOLATION, "RESTRICT setting of ")
+                    }
+                    Some(_) => refusal(sqlstate::pg::FOREIGN_KEY_VIOLATION, ""),
+                    None => {
+                        return Err(Error::forward_refusal(format!(
+                            "the foreign key {} of {} is ON {} RESTRICT into rows a policy may \
+                             hide from the acting role, so the replica refuses its writes as \
+                             the server does, and PostgreSQL 18 refuses them as \
+                             restrict_violation (23001) where earlier majors refuse them as \
+                             foreign_key_violation (23503). Name the server's major with \
+                             with_postgres_major.",
+                            key.name,
+                            names.child,
+                            event.keyword(),
+                        )));
+                    }
+                };
+                parts.refusal(&message, false)
             }
             ReferentialAction::Cascade => parts.cascade(event),
             ReferentialAction::SetNull => {
@@ -512,10 +540,7 @@ fn refuse_cycle(
                  Break the cycle of actions writing rows, or let the role read every row of {}.",
                 key.name,
                 last_ident_value_or_display(&key.table.name),
-                match event {
-                    Event::Delete => "DELETE",
-                    Event::Update => "UPDATE",
-                },
+                event.keyword(),
                 path.join(" -> "),
                 last_ident_value_or_display(&parent.name),
             )));

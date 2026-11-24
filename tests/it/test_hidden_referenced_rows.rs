@@ -144,15 +144,18 @@ fn a_write_referencing_a_row_the_role_cannot_read_commits() {
 
 #[test]
 fn deleting_a_referenced_row_is_refused_while_a_referencing_row_remains() {
-    for (key, expected) in [
-        ("REFERENCES users (id)", REFUSAL),
-        ("REFERENCES users", REFUSAL),
-        ("REFERENCES users (id) ON DELETE NO ACTION", REFUSAL),
-        ("REFERENCES users (id) ON DELETE RESTRICT", RESTRICT_REFUSAL),
+    for (key, major, expected) in [
+        ("REFERENCES users (id)", None, REFUSAL),
+        ("REFERENCES users", None, REFUSAL),
+        ("REFERENCES users (id) ON DELETE NO ACTION", Some(18), REFUSAL),
+        ("REFERENCES users (id) ON DELETE RESTRICT", Some(17), REFUSAL),
+        ("REFERENCES users (id) ON DELETE RESTRICT", Some(18), RESTRICT_REFUSAL),
     ] {
-        let mut connection = replica(key);
+        let options = major.map_or_else(options, |major| options().with_postgres_major(major));
+        let (mut connection, _) = replica_with(&script(key), &options);
         connection.batch_execute("INSERT INTO memberships VALUES (1, 1)").expect("membership");
-        assert_eq!(refusal(&mut connection, "DELETE FROM users WHERE id = 1"), expected, "{key}");
+        let delete = refusal(&mut connection, "DELETE FROM users WHERE id = 1");
+        assert_eq!(delete, expected, "{key} on {major:?}");
         connection.batch_execute("DELETE FROM memberships").expect("drop the membership");
         connection.batch_execute("DELETE FROM users WHERE id = 1").expect("nothing references it");
     }
@@ -160,17 +163,34 @@ fn deleting_a_referenced_row_is_refused_while_a_referencing_row_remains() {
 
 #[test]
 fn rekeying_a_referenced_row_is_refused_while_a_referencing_row_remains() {
-    for (key, expected) in [
-        ("REFERENCES users (id)", REFUSAL),
-        ("REFERENCES users (id) ON UPDATE RESTRICT", RESTRICT_REFUSAL),
+    for (key, major, expected) in [
+        ("REFERENCES users (id)", None, REFUSAL),
+        ("REFERENCES users (id) ON UPDATE RESTRICT", Some(17), REFUSAL),
+        ("REFERENCES users (id) ON UPDATE RESTRICT", Some(18), RESTRICT_REFUSAL),
     ] {
-        let mut connection = replica(key);
+        let options = major.map_or_else(options, |major| options().with_postgres_major(major));
+        let (mut connection, _) = replica_with(&script(key), &options);
         connection.batch_execute("INSERT INTO memberships VALUES (1, 1)").expect("membership");
         let rekey = refusal(&mut connection, "UPDATE users SET id = 3 WHERE id = 1");
-        assert_eq!(rekey, expected, "{key}");
+        assert_eq!(rekey, expected, "{key} on {major:?}");
         connection
             .batch_execute("UPDATE users SET name = 'visible' WHERE id = 1")
             .expect("an update keeping the key checks nothing");
+    }
+}
+
+#[test]
+fn a_restrict_key_is_refused_without_the_server_major() {
+    for key in
+        ["REFERENCES users (id) ON DELETE RESTRICT", "REFERENCES users (id) ON UPDATE RESTRICT"]
+    {
+        let refusal = Pg2Sqlite::default()
+            .sql(&script(key))
+            .expect("parse")
+            .translate_to_sql(&options())
+            .expect_err("the refusal depends on the server's major")
+            .to_string();
+        assert!(refusal.contains("with_postgres_major"), "{key}: {refusal}");
     }
 }
 
@@ -230,7 +250,7 @@ fn an_exempt_write_fires_no_check() {
 
 #[test]
 fn a_replica_omitting_server_derived_writes_keeps_only_the_refusals() {
-    let options = options().with_server_derived_writes_omitted();
+    let options = options().with_server_derived_writes_omitted().with_postgres_major(18);
     let (mut connection, _) = replica_with(
         &script("REFERENCES users (id) ON DELETE CASCADE ON UPDATE RESTRICT"),
         &options,

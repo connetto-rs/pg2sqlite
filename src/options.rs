@@ -144,6 +144,10 @@ pub struct Pg2SqliteOptions {
     /// translation's analysis and emitted nowhere. Set via
     /// `with_foreign_keys_omitted`.
     foreign_keys_omitted: bool,
+    /// The major version of the PostgreSQL server the replica stands in for.
+    /// `None` refuses what answers differently across majors. Set via
+    /// `with_postgres_major`.
+    postgres_major: Option<u16>,
 }
 
 #[cfg(feature = "arbitrary")]
@@ -177,6 +181,7 @@ impl<'a> arbitrary::Arbitrary<'a> for Pg2SqliteOptions {
             server_derived_writes_omitted: bool::arbitrary(u)?,
             stored_text_checks_omitted: bool::arbitrary(u)?,
             foreign_keys_omitted: bool::arbitrary(u)?,
+            postgres_major: Option::<u16>::arbitrary(u)?,
         })
     }
 }
@@ -210,6 +215,7 @@ impl Default for Pg2SqliteOptions {
             server_derived_writes_omitted: false,
             stored_text_checks_omitted: false,
             foreign_keys_omitted: false,
+            postgres_major: None,
         }
     }
 }
@@ -1972,6 +1978,27 @@ impl Pg2SqliteOptions {
     /// Returns whether every foreign key is left to the server.
     pub fn is_foreign_keys_omitted(&self) -> bool {
         self.foreign_keys_omitted
+    }
+
+    #[must_use]
+    /// Names the major version of the PostgreSQL server the replica stands
+    /// in for, such as `18`.
+    ///
+    /// What the server answers differently across majors follows it, and a
+    /// statement whose translation depends on the major is refused without
+    /// it. A `RESTRICT` foreign key into rows a policy may hide from the
+    /// acting role refuses a delete or rekey with `restrict_violation`
+    /// (`23001`) from PostgreSQL 18 on, and with `foreign_key_violation`
+    /// (`23503`) before it.
+    pub fn with_postgres_major(mut self, major: u16) -> Self {
+        self.postgres_major = Some(major);
+        self
+    }
+
+    #[must_use]
+    /// Returns the configured PostgreSQL major version.
+    pub fn get_postgres_major(&self) -> Option<u16> {
+        self.postgres_major
     }
 }
 
