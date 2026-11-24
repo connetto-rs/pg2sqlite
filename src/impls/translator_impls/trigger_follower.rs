@@ -1,18 +1,20 @@
 //! Re-emits each live trigger whose translation a later change to its table, a
-//! relation or function its body reaches, or its own function alters, since
-//! PostgreSQL resolves a trigger body where it runs.
+//! relation or function its body reaches, its own function, or the tables
+//! exempting the owner a definer body runs as alters, since PostgreSQL
+//! resolves a trigger body where it runs.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use core::ops::ControlFlow;
 
 use sql_traits::{structs::ParserDB, traits::DatabaseLike};
 use sqlparser::ast::{
-    AlterFunction, AlterFunctionOperation, AlterFunctionSignature, AlterTableOperation,
-    CreateTrigger, DropTrigger, Expr, Ident, ObjectName, ObjectType, RenameTableNameKind,
-    Statement, TriggerEvent, visit_expressions_mut,
+    AlterFunction, AlterFunctionOperation, AlterFunctionSignature, AlterRoleOperation,
+    AlterTableOperation, CreateTrigger, DropTrigger, Expr, Ident, ObjectName, ObjectType,
+    RenameTableNameKind, RoleOption, Statement, TriggerEvent, visit_expressions_mut,
 };
 
 use super::{
+    definer::{exempt_somewhere, exempting_tables},
     function_cascade::{drop_of, runs_dropped},
     function_moves,
     plpgsql::{BodyReach, ReadBodies, body_reach},
@@ -27,8 +29,13 @@ pub(crate) type Translate<'t> =
     dyn FnMut(&Statement, &mut dyn FnMut(TranslationWarning)) -> Result<Vec<Statement>, Error> + 't;
 
 /// What [`body_reach`] answered for each function a trigger runs, on the
-/// schema before an event and on the schema after it.
-type Reached = [BTreeMap<ObjectName, Option<BodyReach>>; 2];
+/// schema before an event and on the schema after it, and how the event
+/// changes the tables exempting each owner a definer body runs as.
+#[derive(Default)]
+struct Reached {
+    bodies: [BTreeMap<ObjectName, Option<BodyReach>>; 2],
+    owners: BTreeMap<String, ExemptionChange>,
+}
 
 /// One live trigger.
 struct Followed {
@@ -55,6 +62,7 @@ pub(crate) struct Reemission {
 }
 
 /// What an event changes that a trigger's translation reads.
+#[derive(Default)]
 struct Touched {
     /// The relations it creates, alters, renames or drops, folded.
     relations: BTreeSet<String>,
@@ -65,52 +73,148 @@ struct Touched {
     /// The functions it creates, replaces, or changes the owner or attributes
     /// of, folded.
     functions: BTreeSet<String>,
+    /// How it can change which tables' row-level security exempts a role,
+    /// which decides whether a `SECURITY DEFINER` body runs as its owner.
+    exemptions: Option<Exemptions>,
+}
+
+/// What an event can change about which tables' row-level security exempts a
+/// role.
+#[derive(Clone, Copy)]
+enum Exemptions {
+    /// The row-level security, owner or existence of the tables it names.
+    Tables,
+    /// A role's attributes or memberships, which reach every table.
+    Roles,
+}
+
+/// How an event changes the tables exempting one role.
+struct ExemptionChange {
+    /// Whether some table exempts the role on one side of the event only.
+    somewhere: bool,
+    /// The tables, folded, exempting the role on one side only, worked out for
+    /// a role event alone. A table event changes only the tables it names,
+    /// which reach a trigger as relations.
+    tables: BTreeSet<String>,
+}
+
+impl Exemptions {
+    /// How the event changes the tables exempting the role stored as
+    /// `owner`, from `before` to `after`.
+    fn change(
+        self,
+        owner: &str,
+        (before, after): (&ParserDB, &ParserDB),
+    ) -> Result<ExemptionChange, Error> {
+        match self {
+            Self::Tables => {
+                let somewhere = |schema: &ParserDB| {
+                    schema.role(owner).map_or(Ok(false), |role| exempt_somewhere(role, schema))
+                };
+                Ok(ExemptionChange {
+                    somewhere: somewhere(before)? != somewhere(after)?,
+                    tables: BTreeSet::new(),
+                })
+            }
+            Self::Roles => {
+                let tables = |schema: &ParserDB| {
+                    schema
+                        .role(owner)
+                        .map_or_else(|| Ok(BTreeSet::new()), |role| exempting_tables(role, schema))
+                };
+                let (before, after) = (tables(before)?, tables(after)?);
+                Ok(ExemptionChange {
+                    somewhere: before.is_empty() != after.is_empty(),
+                    tables: before.symmetric_difference(&after).cloned().collect(),
+                })
+            }
+        }
+    }
 }
 
 impl Touched {
     fn of(event: &Statement) -> Option<Self> {
         let folded_names = |names: &[&ObjectName]| names.iter().map(|name| folded(name)).collect();
-        let none = BTreeSet::new;
-        let relations =
-            |relations| Some(Self { relations, trigger_tables: none(), functions: none() });
-        let trigger_tables =
-            |trigger_tables| Some(Self { relations: none(), trigger_tables, functions: none() });
-        let functions =
-            |functions| Some(Self { relations: none(), trigger_tables: none(), functions });
-        match event {
+        let touched = match event {
             Statement::AlterTable(alter) => {
-                let mut touched: BTreeSet<String> = folded_names(&[&alter.name]);
-                touched.extend(renamed_table(event).map(|(_, to)| folded(to)));
-                relations(touched)
+                let mut relations: BTreeSet<String> = folded_names(&[&alter.name]);
+                relations.extend(renamed_table(event).map(|(_, to)| folded(to)));
+                let exemptions = alter
+                    .operations
+                    .iter()
+                    .any(|operation| {
+                        matches!(
+                            operation,
+                            AlterTableOperation::EnableRowLevelSecurity
+                                | AlterTableOperation::DisableRowLevelSecurity
+                                | AlterTableOperation::ForceRowLevelSecurity
+                                | AlterTableOperation::NoForceRowLevelSecurity
+                                | AlterTableOperation::OwnerTo { .. }
+                        )
+                    })
+                    .then_some(Exemptions::Tables);
+                Self { relations, exemptions, ..Self::default() }
             }
-            Statement::CreateTable(create) => relations(folded_names(&[&create.name])),
-            Statement::CreateView(view) => relations(folded_names(&[&view.name])),
+            Statement::CreateTable(create) => {
+                Self { relations: folded_names(&[&create.name]), ..Self::default() }
+            }
+            Statement::CreateView(view) => {
+                Self { relations: folded_names(&[&view.name]), ..Self::default() }
+            }
             Statement::CreateTrigger(trigger) => {
-                trigger_tables(folded_names(&[&trigger.table_name]))
+                Self { trigger_tables: folded_names(&[&trigger.table_name]), ..Self::default() }
             }
             Statement::DropTrigger(drop) => {
-                drop.table_name.as_ref().and_then(|table| trigger_tables(folded_names(&[table])))
+                Self {
+                    trigger_tables: folded_names(&[drop.table_name.as_ref()?]),
+                    ..Self::default()
+                }
             }
             Statement::Drop {
-                object_type: ObjectType::Table | ObjectType::View, names, ..
-            } => relations(names.iter().map(folded).collect()),
-            Statement::CreateFunction(function) => functions(folded_names(&[&function.name])),
+                object_type: object_type @ (ObjectType::Table | ObjectType::View),
+                names,
+                ..
+            } => {
+                Self {
+                    relations: names.iter().map(folded).collect(),
+                    exemptions: (*object_type == ObjectType::Table).then_some(Exemptions::Tables),
+                    ..Self::default()
+                }
+            }
+            Statement::CreateFunction(function) => {
+                Self { functions: folded_names(&[&function.name]), ..Self::default() }
+            }
             Statement::AlterFunction(AlterFunction {
                 signature: AlterFunctionSignature::Function(function),
                 operation:
                     AlterFunctionOperation::OwnerTo(_) | AlterFunctionOperation::Actions { .. },
-            }) => functions(folded_names(&[&function.name])),
+            }) => Self { functions: folded_names(&[&function.name]), ..Self::default() },
+            Statement::AlterRole {
+                operation: AlterRoleOperation::WithOptions { options }, ..
+            } if options.iter().any(|option| {
+                matches!(
+                    option,
+                    RoleOption::BypassRLS(_) | RoleOption::SuperUser(_) | RoleOption::Inherit(_)
+                )
+            }) =>
+            {
+                Self { exemptions: Some(Exemptions::Roles), ..Self::default() }
+            }
+            Statement::GrantRole(_) | Statement::RevokeRole(_) => {
+                Self { exemptions: Some(Exemptions::Roles), ..Self::default() }
+            }
             // An event so a seeded trigger renders before its function's move
             // is carried.
-            _ if function_moves::moves_functions(event) => functions(BTreeSet::new()),
-            _ => None,
-        }
+            _ if function_moves::moves_functions(event) => Self::default(),
+            _ => return None,
+        };
+        Some(touched)
     }
 
     /// Whether `trigger`'s translation reads what this changes, its body read
     /// from `before` and from `after`, `bodies` holding what each body read
-    /// before names and `reached` what each function reached across this
-    /// event, or `event` moves the function it runs.
+    /// before names and `reached` what each function and owner reached across
+    /// this event, or `event` moves the function it runs.
     fn reaches(
         &self,
         event: &Statement,
@@ -131,17 +235,29 @@ impl Touched {
         if function_moves::moved(event, function).is_some() {
             return Ok(true);
         }
-        for (schema, reached) in [before, after].into_iter().zip(reached) {
+        let Reached { bodies: side_reaches, owners } = reached;
+        for (schema, reached) in [before, after].into_iter().zip(side_reaches.iter_mut()) {
             if !reached.contains_key(function) {
                 let reach = body_reach(function, schema, bodies)?;
                 reached.insert(function.clone(), reach);
             }
-            match reached.get(function) {
-                Some(Some(reach))
-                    if reach.relations.is_disjoint(&self.relations)
-                        && reach.written.is_disjoint(&self.trigger_tables)
-                        && reach.functions.is_disjoint(&self.functions) => {}
-                _ => return Ok(true),
+            let Some(Some(reach)) = reached.get(function) else { return Ok(true) };
+            if !reach.relations.is_disjoint(&self.relations)
+                || !reach.written.is_disjoint(&self.trigger_tables)
+                || !reach.functions.is_disjoint(&self.functions)
+            {
+                return Ok(true);
+            }
+            let Some(exemptions) = self.exemptions else { continue };
+            for owner in &reach.definers {
+                if !owners.contains_key(owner) {
+                    owners.insert(owner.clone(), exemptions.change(owner, (before, after))?);
+                }
+                if owners.get(owner).is_some_and(|change| {
+                    change.somewhere || !change.tables.is_disjoint(&reach.relations)
+                }) {
+                    return Ok(true);
+                }
             }
         }
         Ok(false)

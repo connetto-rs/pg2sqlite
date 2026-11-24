@@ -15,6 +15,7 @@
 //! failure inside a definer body would leave its owner on the stack.
 //! PostgreSQL has no `OR FAIL`, and no translated statement carries one.
 
+use alloc::collections::BTreeSet;
 use core::ops::ControlFlow;
 
 use sql_traits::{
@@ -27,6 +28,7 @@ use sqlparser::ast::{
     visit_relations_mut,
 };
 
+use super::trigger_slots::folded;
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
 use crate::{
@@ -187,13 +189,7 @@ pub(crate) fn run_as_owner(
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
 ) -> Result<Vec<Statement>, Error> {
-    let mut exempt_somewhere = false;
-    for table in schema.tables() {
-        if table.has_row_level_security(schema)? && exempts(table, owner, schema) {
-            exempt_somewhere = true;
-            break;
-        }
-    }
+    let exempt_somewhere = exempt_somewhere(owner, schema)?;
     for statement in &mut statements {
         let outcome = visit_relations_mut(statement, |name: &mut ObjectName| {
             match backing_name(function, owner, name, schema, options) {
@@ -229,6 +225,39 @@ pub(crate) fn run_as_owner(
         wrapped.push(pop());
     }
     Ok(wrapped)
+}
+
+/// The tables whose row-level security exempts `owner`, each failed lookup
+/// of a table's row-level security as an error in its place.
+fn exempting<'s>(
+    owner: &'s Role,
+    schema: &'s ParserDB,
+) -> impl Iterator<Item = Result<&'s CreateTable, Error>> + 's {
+    schema.tables().filter_map(move |table| {
+        match table.has_row_level_security(schema) {
+            Ok(secured) => (secured && exempts(table, owner, schema)).then_some(Ok(table)),
+            Err(error) => Some(Err(error.into())),
+        }
+    })
+}
+
+/// Whether row-level security on some table exempts `owner`, so a body running
+/// as `owner` stands on [`STACK`] for the guards that let it through.
+///
+/// # Errors
+///
+/// Returns the error looking up a table's row-level security returns.
+pub(crate) fn exempt_somewhere(owner: &Role, schema: &ParserDB) -> Result<bool, Error> {
+    Ok(exempting(owner, schema).next().transpose()?.is_some())
+}
+
+/// The tables, folded, whose row-level security exempts `owner`.
+///
+/// # Errors
+///
+/// As [`exempt_somewhere`].
+pub(crate) fn exempting_tables(owner: &Role, schema: &ParserDB) -> Result<BTreeSet<String>, Error> {
+    exempting(owner, schema).map(|table| Ok(folded(&table?.name))).collect()
 }
 
 /// The backing table `owner` reads and writes in place of `name`, `None` when
