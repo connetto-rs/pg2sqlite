@@ -605,6 +605,10 @@ struct Trackers {
     attachments: LiveAttachments,
 }
 
+/// A reshape's statements, the schema the replica held before it, and the
+/// tables whose shape it changes.
+type Reshaped<'s> = (Vec<Statement>, &'s ParserDB, Vec<ObjectName>);
+
 impl Trackers {
     /// `statement` translated at `at`.
     fn translate(
@@ -629,8 +633,10 @@ impl Trackers {
 
     /// The statements moving the replica from the shape `applied` holds to
     /// `shape`, for the tables the statements of `statements` separating the
-    /// two reach, followed, `applied` then holding `shape`. A shape is a
-    /// schema with the end of the statements it holds.
+    /// two reach, followed, with the schema `applied` held and the tables
+    /// whose shape changes, `applied` then holding `shape`. A shape is a
+    /// schema with the end of the statements it holds. Absent when `applied`
+    /// already holds `shape`.
     fn reshape<'a, 's: 'a>(
         &mut self,
         applied: &mut Option<(&'s ParserDB, usize)>,
@@ -638,14 +644,14 @@ impl Trackers {
         statements: &[Statement],
         at: Position<'a, '_>,
         emit: crate::warnings::WarningSink<'_>,
-    ) -> Result<Vec<Statement>, crate::errors::Error> {
+    ) -> Result<Option<Reshaped<'s>>, crate::errors::Error> {
         let Some((before, held_end)) =
             applied.replace((shape, shape_end)).filter(|(held, _)| !core::ptr::eq(*held, shape))
         else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         let at = Position { schema: shape, ..at };
-        let mut reshaped = {
+        let (mut reshaped, tables) = {
             let written = at.context.with_history(StatementHistory {
                 attachments: &self.attachments,
                 in_transaction: at.in_transaction,
@@ -658,7 +664,7 @@ impl Trackers {
                     let mut warnings = Vec::new();
                     let translated = self.translate(
                         statement,
-                        Position { schema, binding: before, ..at },
+                        Position { schema, binding: schema, ..at },
                         &mut |warning| warnings.push(warning),
                     )?;
                     Ok((translated, warnings))
@@ -668,7 +674,7 @@ impl Trackers {
         };
         self.marker_tables.create_named(&mut reshaped);
         self.attachments.follow_emitted(&reshaped);
-        Ok(reshaped)
+        Ok(Some((reshaped, before, tables)))
     }
 
     /// Follows `emitted`, `statement`'s translation, and answers whether
@@ -797,6 +803,53 @@ fn translate_followed(
         }
     }
     Ok((emitted, rebuilt))
+}
+
+/// The statements moving the replica from the shape `applied` holds to
+/// `shape`, as [`Trackers::reshape`] gives them, followed by each live
+/// trigger on a table whose shape changes, re-emitted as that shape takes it.
+///
+/// `initial` is the schema a seeded trigger was last translated on.
+fn reshape_followed<'a, 's: 'a>(
+    (trackers, follower): (&mut Trackers, &mut TriggerFollower),
+    (applied, shape): (&mut Option<(&'s ParserDB, usize)>, (&'s ParserDB, usize)),
+    statements: &[Statement],
+    at: Position<'a, '_>,
+    initial: Option<(&ParserDB, &[crate::options::TableTrigger])>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Vec<Statement>, crate::errors::Error> {
+    let Some((mut emitted, held, tables)) =
+        trackers.reshape(applied, shape, statements, at, &mut *emit)?
+    else {
+        return Ok(Vec::new());
+    };
+    if tables.is_empty() || follower.is_empty() {
+        return Ok(emitted);
+    }
+    let before = Position { schema: held, binding: held, ..at };
+    let after = Position { schema: shape.0, binding: shape.0, ..at };
+    let seeded_context =
+        at.context.with_table_triggers(initial.map_or(&[], |(_, triggers)| triggers));
+    let seeded = initial.map_or(before, |(initial, _)| {
+        Position { schema: initial, binding: initial, context: &seeded_context, ..before }
+    });
+    let reemissions = follower.reshaped(
+        &tables,
+        &mut |source, sink| trackers.translate(source, seeded, sink),
+        &mut |source, sink| trackers.translate(source, after, sink),
+    )?;
+    for reemission in reemissions {
+        let mut dropped = trackers.translate(&reemission.drop, before, &mut *emit)?;
+        trackers.follow(&reemission.drop, &mut dropped, before, &reemission.created)?;
+        emitted.append(&mut dropped);
+        for warning in reemission.warnings {
+            emit(warning);
+        }
+        let mut created = reemission.rendered;
+        trackers.follow(&reemission.create, &mut created, after, &[])?;
+        emitted.append(&mut created);
+    }
+    Ok(emitted)
 }
 
 impl Pg2Sqlite {
@@ -1671,12 +1724,18 @@ impl Pg2Sqlite {
                         let mut rebuilt = false;
                         let shape = epoch_shape(statement, epochs, epoch_index, final_schema)
                             .unwrap_or((&epoch.schema, epoch.schema_end));
-                        let reshaped =
-                            trackers.reshape(&mut applied, shape, statements, at, &mut emit)?;
-                        rebuilt |= !reshaped.is_empty();
-                        emitted.extend(reshaped);
                         let initial =
                             initial_schema.map(|schema| (schema, initial_triggers.as_slice()));
+                        let reshaped = reshape_followed(
+                            (&mut trackers, &mut follower),
+                            (&mut applied, shape),
+                            statements,
+                            at,
+                            initial,
+                            &mut emit,
+                        )?;
+                        rebuilt |= !reshaped.is_empty();
+                        emitted.extend(reshaped);
                         for drop in &cascaded {
                             let (mut dropped, _) = translate_followed(
                                 drop,

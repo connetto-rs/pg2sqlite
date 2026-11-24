@@ -450,53 +450,91 @@ impl TriggerFollower {
             {
                 continue;
             }
-            let mut moved = followed.create.clone();
-            carry(&mut moved, event);
-            let create = Statement::CreateTrigger(moved);
-            let mut warnings = Vec::new();
-            let mut rendered = translate_after(&create, &mut |warning| warnings.push(warning))?;
-            let previous = followed.rendering(translate_seeded)?;
-            if let Some(owner) = previous.iter().find_map(|statement| {
-                match statement {
-                    Statement::CreateTrigger(trigger) => Some(trigger),
-                    _ => None,
-                }
-            }) {
-                for statement in &mut rendered {
-                    if let Statement::CreateTrigger(trigger) = statement {
-                        if trigger.name.0.len() == 1 && owner.name.0.len() > 1 {
-                            trigger.name = renamed_owner(&owner.name, &trigger.name);
-                        }
-                        if trigger.table_name.0.len() == 1 && owner.table_name.0.len() > 1 {
-                            trigger.table_name =
-                                renamed_owner(&owner.table_name, &trigger.table_name);
-                        }
-                    }
-                }
+            reemissions.extend(followed.reemission(
+                Some(event),
+                translate_seeded,
+                translate_after,
+            )?);
+        }
+        Ok(reemissions)
+    }
+
+    /// The live triggers on `tables` whose translation changes as those
+    /// tables take a new replica shape, a seeded trigger compared with what
+    /// `translate_seeded` gives on the schema it came from.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error a trigger's translation on either side returns.
+    pub(crate) fn reshaped(
+        &mut self,
+        tables: &[ObjectName],
+        translate_seeded: &mut Translate<'_>,
+        translate_after: &mut Translate<'_>,
+    ) -> Result<Vec<Reemission>, Error> {
+        let tables: BTreeSet<TableKey> = tables.iter().map(table_key).collect();
+        let mut reemissions = Vec::new();
+        for followed in &mut self.live {
+            if tables.contains(&table_key(&followed.create.table_name)) {
+                reemissions.extend(followed.reemission(None, translate_seeded, translate_after)?);
             }
-            let last = core::mem::replace(previous, rendered.clone());
-            if rendered == last {
-                continue;
-            }
-            let created = created_triggers(&last);
-            reemissions.push(Reemission {
-                drop: Statement::DropTrigger(DropTrigger {
-                    if_exists: true,
-                    trigger_name: followed.create.name.clone(),
-                    table_name: Some(followed.create.table_name.clone()),
-                    option: None,
-                }),
-                created,
-                create,
-                rendered,
-                warnings,
-            });
         }
         Ok(reemissions)
     }
 }
 
 impl Followed {
+    /// This trigger carried along `event` when given and translated after
+    /// it, absent when that translation is its last one.
+    fn reemission(
+        &mut self,
+        event: Option<&Statement>,
+        translate_seeded: &mut Translate<'_>,
+        translate_after: &mut Translate<'_>,
+    ) -> Result<Option<Reemission>, Error> {
+        let mut moved = self.create.clone();
+        if let Some(event) = event {
+            carry(&mut moved, event);
+        }
+        let create = Statement::CreateTrigger(moved);
+        let mut warnings = Vec::new();
+        let mut rendered = translate_after(&create, &mut |warning| warnings.push(warning))?;
+        let previous = self.rendering(translate_seeded)?;
+        if let Some(owner) = previous.iter().find_map(|statement| {
+            match statement {
+                Statement::CreateTrigger(trigger) => Some(trigger),
+                _ => None,
+            }
+        }) {
+            for statement in &mut rendered {
+                if let Statement::CreateTrigger(trigger) = statement {
+                    if trigger.name.0.len() == 1 && owner.name.0.len() > 1 {
+                        trigger.name = renamed_owner(&owner.name, &trigger.name);
+                    }
+                    if trigger.table_name.0.len() == 1 && owner.table_name.0.len() > 1 {
+                        trigger.table_name = renamed_owner(&owner.table_name, &trigger.table_name);
+                    }
+                }
+            }
+        }
+        let last = core::mem::replace(previous, rendered.clone());
+        if rendered == last {
+            return Ok(None);
+        }
+        Ok(Some(Reemission {
+            drop: Statement::DropTrigger(DropTrigger {
+                if_exists: true,
+                trigger_name: self.create.name.clone(),
+                table_name: Some(self.create.table_name.clone()),
+                option: None,
+            }),
+            created: created_triggers(&last),
+            create,
+            rendered,
+            warnings,
+        }))
+    }
+
     /// Whether this is the trigger `name`, folded, on `table` when given.
     fn is(&self, name: &str, table: Option<&TableKey>) -> bool {
         folded(&self.create.name) == name

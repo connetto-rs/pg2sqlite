@@ -43,6 +43,13 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// A table whose key references `tags`.
+    pins (tag) {
+        tag -> Integer,
+    }
+}
+
 diesel::define_sql_function! {
     /// Whether the connection writes past the generated guards.
     fn write_is_exempt() -> diesel::sql_types::Bool;
@@ -389,4 +396,143 @@ fn a_migration_disabling_row_security_restores_the_table() {
     let earlier = format!("{HEAD}{TAGS}{SECURED}");
     let disable = "ALTER TABLE notes DISABLE ROW LEVEL SECURITY;";
     assert_same_replica(migrated(&earlier, disable), loaded(&format!("{earlier}{disable}")));
+}
+
+/// `notes` with a nullable label whose uniqueness treats NULLs as equal.
+const LABELLED: &str = "
+CREATE ROLE app NOLOGIN;
+CREATE TABLE notes (
+  id INTEGER PRIMARY KEY,
+  owner TEXT NOT NULL,
+  label TEXT,
+  CONSTRAINT notes_label UNIQUE NULLS NOT DISTINCT (label)
+);
+GRANT SELECT, INSERT, UPDATE, DELETE ON notes TO app;
+INSERT INTO notes (id, owner, label) VALUES (1, 'app', 'a'), (2, 'other', NULL);
+";
+
+#[test]
+fn a_late_enable_moves_the_index_keeping_nulls_equal() {
+    assert_late_event_matches(LABELLED, SECURED);
+}
+
+/// `tags`, keyed into `notes` by a table constraint, and `pins`, whose key
+/// references `tags`, with their seed rows.
+const CHAINED: &str = "
+CREATE TABLE tags (
+  note INTEGER,
+  CONSTRAINT tags_note UNIQUE (note),
+  CONSTRAINT tags_notes FOREIGN KEY (note) REFERENCES notes (id)
+);
+GRANT SELECT, INSERT, UPDATE, DELETE ON tags TO app;
+CREATE TABLE pins (tag INTEGER REFERENCES tags (note));
+GRANT SELECT, INSERT, UPDATE, DELETE ON pins TO app;
+INSERT INTO tags VALUES (1), (2);
+INSERT INTO pins VALUES (1), (2);
+";
+
+/// The rows of `tags` and of `pins`.
+fn chained_rows(connection: &mut SqliteConnection) -> (Vec<i32>, Vec<i32>) {
+    let tags = tags::table.select(tags::note).order(tags::note).load(connection);
+    let pins = pins::table.select(pins::tag).order(pins::tag).load(connection);
+    (tags.expect("read tags"), pins.expect("read pins"))
+}
+
+#[test]
+fn a_late_enable_rebuilds_a_child_another_table_references() {
+    let before = format!("{HEAD}{CHAINED}");
+    let (mut late, late_exempt) = loaded(&format!("{before}{BOUNDARY}{SECURED}"));
+    let (mut early, early_exempt) = loaded(&format!("{before}{SECURED}{BOUNDARY}"));
+    assert_same_objects(&mut late, &mut early);
+    assert_eq!(chained_rows(&mut late), chained_rows(&mut early));
+    assert_eq!(notes_rows(&mut late, &late_exempt), notes_rows(&mut early, &early_exempt));
+}
+
+#[test]
+fn a_late_enable_inside_a_transaction_refuses_to_rebuild_a_referenced_child() {
+    let script = format!("{HEAD}{CHAINED}BEGIN;{BOUNDARY}{SECURED}COMMIT;");
+    let error = Pg2Sqlite::default()
+        .sql(&script)
+        .expect("parse PostgreSQL")
+        .translate(&options())
+        .expect_err("SQLite keeps foreign keys on inside a transaction");
+    assert!(error.to_string().contains("outside a transaction block"), "{error}");
+}
+
+#[test]
+fn a_late_enable_on_both_ends_of_a_key_keeps_the_child_index() {
+    let child = format!("{TAGS}CREATE INDEX tags_note ON tags (note);");
+    let both = format!(
+        "{SECURED}ALTER TABLE tags ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY tags_all ON tags TO app USING (true);"
+    );
+    let before = format!("{HEAD}{child}");
+    let (mut late, late_exempt) = loaded(&format!("{before}{BOUNDARY}{both}"));
+    let (mut early, early_exempt) = loaded(&format!("{before}{both}{BOUNDARY}"));
+    assert_same_objects(&mut late, &mut early);
+    assert_eq!(notes_rows(&mut late, &late_exempt), notes_rows(&mut early, &early_exempt));
+    let tags = |connection: &mut SqliteConnection| {
+        tags::table.select(tags::note).order(tags::note).load::<i32>(connection).expect("read tags")
+    };
+    assert_eq!(tags(&mut late), tags(&mut early));
+}
+
+#[test]
+fn a_late_grant_on_all_tables_brings_the_table_with_its_index_and_trigger() {
+    let unread = format!(
+        "CREATE ROLE app NOLOGIN;
+         CREATE TABLE notes (id INTEGER PRIMARY KEY, owner TEXT NOT NULL);{ATTACHED}"
+    );
+    let grant = "GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA public TO app;";
+    let (mut late, _) = loaded(&format!("{unread}{BOUNDARY}{grant}"));
+    let (mut early, _) = loaded(&format!("{unread}{grant}{BOUNDARY}"));
+    assert_same_objects(&mut late, &mut early);
+}
+
+#[test]
+fn a_late_grant_brings_a_child_keyed_into_a_secured_table() {
+    let before = format!(
+        "{HEAD}{SECURED}CREATE TABLE tags (note INTEGER REFERENCES notes (id));
+         CREATE INDEX tags_note ON tags (note);"
+    );
+    let grant = "GRANT SELECT, INSERT ON tags TO app;";
+    let (mut late, _) = loaded(&format!("{before}{BOUNDARY}{grant}"));
+    let (mut early, _) = loaded(&format!("{before}{grant}{BOUNDARY}"));
+    assert_same_objects(&mut late, &mut early);
+}
+
+#[test]
+fn a_late_policy_the_replica_cannot_express_is_refused() {
+    let policy =
+        "CREATE POLICY notes_search ON notes TO app USING (to_tsvector(owner) IS NOT NULL);";
+    for script in
+        [format!("{HEAD}{SECURED}{BOUNDARY}{policy}"), format!("{HEAD}{SECURED}{policy}{BOUNDARY}")]
+    {
+        let error = Pg2Sqlite::default()
+            .sql(&script)
+            .expect("parse PostgreSQL")
+            .translate(&options())
+            .expect_err("SQLite has no to_tsvector");
+        assert!(error.to_string().contains("to_tsvector"), "{script}\n{error}");
+    }
+}
+
+#[test]
+fn a_late_revoke_drops_the_vector_companion() {
+    let embeddings = "
+CREATE EXTENSION vector;
+CREATE ROLE app NOLOGIN;
+CREATE TABLE embeddings (id SERIAL PRIMARY KEY, embedding vector(3));
+GRANT SELECT, INSERT ON embeddings TO app;
+";
+    let revoke = "REVOKE ALL ON embeddings FROM app;";
+    let script =
+        |sql: String| -> Vec<String> { translated(&sql).iter().map(ToString::to_string).collect() };
+    let late = script(format!("{embeddings}{BOUNDARY}{revoke}"));
+    let early = script(format!("{embeddings}{revoke}{BOUNDARY}"));
+    assert!(
+        late.iter().any(|statement| statement == "DROP TABLE IF EXISTS embeddings_embedding_vec"),
+        "{late:#?}"
+    );
+    assert!(!early.iter().any(|statement| statement.contains("embeddings_embedding_vec")));
 }

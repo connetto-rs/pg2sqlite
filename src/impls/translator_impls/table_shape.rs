@@ -105,7 +105,6 @@ fn drop_of(created: &Statement) -> Result<Statement, Error> {
                 option: None,
             }))
         }
-        Statement::CreateTable(table) => Ok(object(ObjectType::Table, &table.name)),
         Statement::CreateVirtualTable { name, .. } => Ok(object(ObjectType::Table, name)),
         _ => Err(irrevocable(created)),
     }
@@ -335,7 +334,8 @@ fn change<'s>(
 }
 
 /// The statements moving the replica from the shape `before` holds to the
-/// one `after` holds, for the tables `touched` reaches.
+/// one `after` holds, for the tables `touched` reaches, with the names of the
+/// tables whose shape changes, whose triggers follow it.
 ///
 /// `options` carries the live indexes and triggers, which a rebuilt table
 /// takes along.
@@ -350,13 +350,13 @@ pub(crate) fn reshaped(
     options: &TranslationContext<'_>,
     translate: &mut Translate<'_>,
     emit: WarningSink<'_>,
-) -> Result<Vec<Statement>, Error> {
+) -> Result<(Vec<Statement>, Vec<ObjectName>), Error> {
     let mut changes = Vec::new();
     for table in touched.reached(before)? {
         changes.extend(change(table, (before, after), translate, &mut *emit)?);
     }
     if changes.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
 
     let mut statements = Vec::new();
@@ -433,5 +433,5 @@ pub(crate) fn reshaped(
             )?);
         }
     }
-    Ok(statements)
+    Ok((statements, changes.iter().map(|change| change.table.name.clone()).collect()))
 }
