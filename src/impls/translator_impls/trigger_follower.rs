@@ -55,7 +55,8 @@ struct Touched {
     /// The relations it creates, alters, renames or drops, folded.
     relations: BTreeSet<String>,
     /// The tables it creates or drops a trigger on, folded, which only the
-    /// translation of a trigger on one of them or whose body writes one reads.
+    /// translation of a trigger whose body writes one, or of a trigger on one
+    /// with an `UPDATE OF` list, reads.
     trigger_tables: BTreeSet<String>,
     /// The functions it creates, replaces, or changes the owner or attributes
     /// of, folded.
@@ -113,7 +114,11 @@ impl Touched {
         bodies: &mut ReadBodies,
     ) -> Result<bool, Error> {
         let table = folded(&trigger.table_name);
-        if self.relations.contains(&table) || self.trigger_tables.contains(&table) {
+        let gated = trigger
+            .events
+            .iter()
+            .any(|fired| matches!(fired, TriggerEvent::Update(columns) if !columns.is_empty()));
+        if self.relations.contains(&table) || (gated && self.trigger_tables.contains(&table)) {
             return Ok(true);
         }
         let Some(exec_body) = &trigger.exec_body else { return Ok(false) };
