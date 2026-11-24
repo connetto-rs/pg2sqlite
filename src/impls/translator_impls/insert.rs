@@ -1185,6 +1185,11 @@ fn rewrite_rls_view_insert<'schema>(
     let Ok(true) = rls::table_has_backing(&last.value, schema, options) else {
         return Ok(target);
     };
+    // A definer body writes the backing table of a table exempting its owner,
+    // and SQLite takes `RETURNING` and `ON CONFLICT` there.
+    if options.running_as().is_some_and(|owner| super::definer::exempts(table, owner, schema)) {
+        return Ok(target);
+    }
 
     if !options.is_strict_rls_validation() {
         // RETURNING: refuse when a database-filled column would come back NULL
