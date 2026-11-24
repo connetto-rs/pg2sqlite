@@ -1,7 +1,7 @@
 # pg2sqlite
 
 [![CI](https://github.com/connetto-rs/pg2sqlite/workflows/Rust%20CI/badge.svg)](https://github.com/connetto-rs/pg2sqlite/actions)
-[![Security Audit](https://github.com/connetto-rs/pg2sqlite/workflows/Security%20Audit/badge.svg)](https://github.com/connetto-rs/pg2sqlite/actions)
+[![Audit](https://github.com/connetto-rs/pg2sqlite/actions/workflows/audit.yml/badge.svg)](https://github.com/connetto-rs/pg2sqlite/actions/workflows/audit.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Codecov](https://codecov.io/gh/connetto-rs/pg2sqlite/branch/main/graph/badge.svg)](https://codecov.io/gh/connetto-rs/pg2sqlite)
 [![Pages](https://github.com/connetto-rs/pg2sqlite/workflows/Pages/badge.svg)](https://github.com/connetto-rs/pg2sqlite/actions/workflows/pages.yml)

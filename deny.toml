@@ -1,6 +1,10 @@
 # cargo-deny configuration
 # See https://embarkstudios.github.io/cargo-deny/
 
+[graph]
+# Optional features pull in dependencies too, sqlitegis among them.
+all-features = true
+
 [licenses]
 # Allow common permissive licenses used by the Rust ecosystem.
 # Unicode-3.0 is used by ICU crates (transitive via git2 -> url -> idna).
