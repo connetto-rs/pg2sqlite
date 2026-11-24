@@ -20,12 +20,12 @@ use core::ops::ControlFlow;
 
 use sql_traits::{
     structs::{ParserDB, RowSecurity, RowStatement},
-    traits::{DatabaseLike, FunctionLike, RoleLike, TableLike},
+    traits::{ColumnLike, DatabaseLike, FunctionLike, RoleLike, TableLike},
 };
 use sqlparser::ast::{
-    BinaryOperator, CreateFunction, CreateTable, DataType, Expr, FunctionReturnType, Ident,
-    InTarget, ObjectName, ObjectNamePart, Statement, visit_expressions, visit_relations,
-    visit_relations_mut,
+    Assignment, AssignmentTarget, BinaryOperator, CreateFunction, CreateTable, DataType, Expr,
+    FunctionReturnType, Ident, InTarget, Insert, ObjectName, ObjectNamePart, Statement,
+    visit_expressions, visit_relations, visit_relations_mut,
 };
 
 use super::trigger_slots::folded;
@@ -36,10 +36,15 @@ use crate::{
     impls::{
         ast_builder,
         function_helpers::{simple_function_expr, string_literal},
-        object_name::{append_suffix, resolve_translation_table},
-        privileges::has_backing_table,
+        object_name::{append_suffix, last_ident_value_or_display, resolve_translation_table},
+        privileges::{RoleTable, has_backing_table},
         query_builder::{from_relation, plain_table_factor, single_expr_query},
+        translator_impls::{
+            insert::row_width,
+            off_replica::{Write, row_write},
+        },
     },
+    write_guard::permission_denied,
 };
 
 /// The frames of the definer bodies running on the connection, each holding
@@ -47,6 +52,7 @@ use crate::{
 pub(crate) const STACK: &str = "pg2sqlite_definer_frames";
 
 type Role = <ParserDB as DatabaseLike>::Role;
+type Table = <ParserDB as DatabaseLike>::Table;
 
 /// `CREATE TABLE IF NOT EXISTS` for [`STACK`], which a translation needs
 /// whenever one of its statements reads or writes it.
@@ -104,24 +110,44 @@ pub(crate) fn exempts(table: &CreateTable, owner: &Role, schema: &ParserDB) -> b
 }
 
 /// The owners of the schema's definer trigger functions and PL/pgSQL helpers,
+/// whose bodies a trigger runs, each named once.
+fn running_owners(schema: &ParserDB) -> Vec<&Role> {
+    let mut owners: Vec<&Role> = Vec::new();
+    let runs_in_triggers = |function: &CreateFunction| {
+        returns_trigger(function) || function.stored_language().as_deref() == Some("plpgsql")
+    };
+    for function in schema.functions().filter(|function| runs_in_triggers(function)) {
+        if let Ok(Some(owner)) = definer_owner(function, schema)
+            && !owners.iter().any(|listed| listed.name() == owner.name())
+        {
+            owners.push(owner);
+        }
+    }
+    owners
+}
+
+/// The owners of the schema's definer trigger functions and PL/pgSQL helpers,
 /// whose bodies a trigger runs, that `table`'s row-level security exempts,
 /// the ones whose bodies its guards let through.
 ///
 /// A definer function whose owner is undeclared exempts nothing, and a trigger
 /// running it is refused.
 pub(crate) fn exempt_owners<'s>(table: &'s CreateTable, schema: &'s ParserDB) -> Vec<&'s str> {
-    let mut owners = Vec::new();
-    let runs_in_triggers = |function: &CreateFunction| {
-        returns_trigger(function) || function.stored_language().as_deref() == Some("plpgsql")
-    };
-    for function in schema.functions().filter(|function| runs_in_triggers(function)) {
-        if let Ok(Some(owner)) = definer_owner(function, schema)
-            && !owners.contains(&owner.name())
-            && exempts(table, owner, schema)
-        {
-            owners.push(owner.name());
-        }
-    }
+    let mut owners: Vec<&str> = running_owners(schema)
+        .into_iter()
+        .filter(|owner| exempts(table, owner, schema))
+        .map(RoleLike::name)
+        .collect();
+    owners.sort_unstable();
+    owners
+}
+
+/// The owners of the schema's definer trigger functions and PL/pgSQL helpers,
+/// whose bodies a trigger runs, the ones the guards holding the acting role to
+/// its privileges let through. [`run_as_owner`] holds each body's writes to its
+/// owner's privileges instead.
+pub(crate) fn definer_owners(schema: &ParserDB) -> Vec<&str> {
+    let mut owners: Vec<&str> = running_owners(schema).into_iter().map(RoleLike::name).collect();
     owners.sort_unstable();
     owners
 }
@@ -172,11 +198,27 @@ pub(crate) fn outside_owners(owners: &[&str]) -> Option<Expr> {
     })
 }
 
+/// `condition`, narrowed to the writes made outside the bodies of `owners`.
+pub(crate) fn unless_running(condition: Option<Expr>, owners: &[&str]) -> Option<Expr> {
+    match (condition, outside_owners(owners)) {
+        (Some(condition), Some(outside)) => {
+            Some(Expr::BinaryOp {
+                left: Box::new(Expr::Nested(Box::new(condition))),
+                op: BinaryOperator::And,
+                right: Box::new(outside),
+            })
+        }
+        (condition, outside) => condition.or(outside),
+    }
+}
+
 /// Rewrites a translated definer body to run as `owner`.
 ///
 /// Every table with row-level security the body names is read and written
-/// through its backing table, and the body runs with `owner` on [`STACK`]
-/// when some table exempts it.
+/// through its backing table. A write needing a privilege `owner` lacks on a
+/// column it names raises PostgreSQL's refusal in its place, so the body runs
+/// with `owner` on [`STACK`] when some table exempts it or a write reaches a
+/// table whose guards hold the acting role to its own privileges.
 ///
 /// # Errors
 ///
@@ -189,8 +231,25 @@ pub(crate) fn run_as_owner(
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
 ) -> Result<Vec<Statement>, Error> {
-    let exempt_somewhere = exempt_somewhere(owner, schema)?;
+    let mut guarded = exempt_somewhere(owner, schema)?;
+    // Privileges are modelled only for a translation naming an acting role.
+    let privileged = crate::impls::session_variable::acting_role(schema, options)?.is_some();
     for statement in &mut statements {
+        let mut denied = None;
+        if privileged
+            && let Some((name, write)) = row_write(statement)
+            && let Some(table) = resolve_translation_table(schema, name)?
+        {
+            if owner_may(statement, table, &write, owner, schema)? {
+                guarded |= !RoleTable::acting(table, schema, options)?.writes_everything();
+            } else {
+                denied = Some(permission_denied(table.table_name()));
+            }
+        }
+        if let Some(message) = denied {
+            *statement = ast_builder::raise_statement("ABORT", Some(&message), None);
+            continue;
+        }
         let outcome = visit_relations_mut(statement, |name: &mut ObjectName| {
             match backing_name(function, owner, name, schema, options) {
                 Ok(Some(backing)) => {
@@ -206,7 +265,7 @@ pub(crate) fn run_as_owner(
         }
     }
 
-    if !exempt_somewhere {
+    if !guarded {
         return Ok(statements);
     }
     let mut wrapped = Vec::with_capacity(statements.len() + 2);
@@ -258,6 +317,71 @@ pub(crate) fn exempt_somewhere(owner: &Role, schema: &ParserDB) -> Result<bool, 
 /// As [`exempt_somewhere`].
 pub(crate) fn exempting_tables(owner: &Role, schema: &ParserDB) -> Result<BTreeSet<String>, Error> {
     exempting(owner, schema).map(|table| Ok(folded(&table?.name))).collect()
+}
+
+/// Whether `owner` holds what PostgreSQL checks before `statement` makes
+/// `write` on `table`, the command on each column it names.
+///
+/// # Errors
+///
+/// Propagates a lookup failure.
+fn owner_may(
+    statement: &Statement,
+    table: &Table,
+    write: &Write<'_>,
+    owner: &Role,
+    schema: &ParserDB,
+) -> Result<bool, Error> {
+    let held = RoleTable::of(table, Some(owner), schema)?;
+    let updates = |assignments: &[Assignment]| {
+        assignments
+            .iter()
+            .flat_map(|assignment| {
+                match &assignment.target {
+                    AssignmentTarget::ColumnName(name) => core::slice::from_ref(name),
+                    AssignmentTarget::Tuple(names) => names.as_slice(),
+                }
+            })
+            .all(|name| held.updates(&last_ident_value_or_display(name)))
+    };
+    Ok(match write {
+        Write::Insert { upsert } => {
+            let Statement::Insert(insert) = statement else { return Ok(true) };
+            inserts(insert, table, &held, schema)? && upsert.is_none_or(updates)
+        }
+        Write::Update(assignments) => updates(assignments),
+        Write::Delete | Write::Truncate => held.deletes(),
+    })
+}
+
+/// Whether `held` covers the columns `insert` fills, the ones it lists or as
+/// many leading columns as its rows hold, and some column for a row of
+/// defaults.
+///
+/// # Errors
+///
+/// Propagates a lookup failure.
+fn inserts(
+    insert: &Insert,
+    table: &Table,
+    held: &RoleTable,
+    schema: &ParserDB,
+) -> Result<bool, Error> {
+    if !insert.columns.is_empty() {
+        return Ok(insert
+            .columns
+            .iter()
+            .all(|name| held.inserts(&last_ident_value_or_display(name))));
+    }
+    let width = insert.source.as_deref().map_or(Some(0), |source| row_width(&source.body));
+    let columns: Vec<String> =
+        table.columns(schema)?.map(|column| column.column_name().to_string()).collect();
+    let filled = &columns[..width.map_or(columns.len(), |width| width.min(columns.len()))];
+    Ok(if filled.is_empty() {
+        held.inserts_any()
+    } else {
+        filled.iter().all(|column| held.inserts(column))
+    })
 }
 
 /// The backing table `owner` reads and writes in place of `name`, `None` when

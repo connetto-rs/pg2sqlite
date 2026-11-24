@@ -2560,16 +2560,7 @@ fn backing_abort_trigger(
     definer_owners: &[&str],
     message: &str,
 ) -> Statement {
-    let condition = match (condition, super::definer::outside_owners(definer_owners)) {
-        (Some(condition), Some(outside)) => {
-            Some(Expr::BinaryOp {
-                left: Box::new(Expr::Nested(Box::new(condition))),
-                op: BinaryOperator::And,
-                right: Box::new(outside),
-            })
-        }
-        (condition, outside) => condition.or(outside),
-    };
+    let condition = super::definer::unless_running(condition, definer_owners);
     ast_builder::trigger(
         generated_object_name(name),
         generated_object_name(table_name),
@@ -3158,8 +3149,12 @@ fn forwarding_view_triggers(
     ])
 }
 
+/// The guards refusing every write that reaches the backing table of a table
+/// the acting role only reads, unless it is exempt or a definer body runs it,
+/// whose writes are held to its owner's privileges.
 fn generate_readonly_backing_guard_sql(
     table: &CreateTable,
+    schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
 ) -> Vec<Statement> {
     if options.get_rls_exemption_function().is_none() {
@@ -3168,6 +3163,7 @@ fn generate_readonly_backing_guard_sql(
     let ctx = RlsTriggerContext::new(table, options);
     let condition = write_guard_condition_expr(None, options);
     let message = read_only(ctx.table_name);
+    let owners = super::definer::definer_owners(schema);
     [
         ("insert", sqlparser::ast::TriggerEvent::Insert),
         ("update", sqlparser::ast::TriggerEvent::Update(Vec::new())),
@@ -3180,9 +3176,7 @@ fn generate_readonly_backing_guard_sql(
             &ctx.inner_table_name,
             event,
             condition.clone(),
-            // The owner's privileges are not modelled, so a table the session
-            // role only reads stays closed to definer bodies too.
-            &[],
+            &owners,
             &message,
         )
     })
@@ -3217,7 +3211,7 @@ pub(crate) fn generate_view_statements(
     if grants.is_read_only() {
         statements
             .extend(generate_readonly_view_trigger_sql(table, schema, options, grants, emit)?);
-        statements.extend(generate_readonly_backing_guard_sql(table, options));
+        statements.extend(generate_readonly_backing_guard_sql(table, schema, options));
     } else {
         if let Some(column) = &unreadable_key
             && (grants.updates_any() || grants.deletes())

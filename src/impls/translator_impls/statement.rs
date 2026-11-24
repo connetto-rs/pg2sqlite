@@ -505,7 +505,7 @@ fn translate_create_table_for_role(
         return Ok(None);
     }
     let mut statements = build_create_table_statements(create_table, schema, options, None, emit)?;
-    append_deny_triggers(&mut statements, options, &grants)?;
+    append_deny_triggers(&mut statements, schema, options, &grants)?;
     Ok(Some(statements))
 }
 
@@ -553,9 +553,11 @@ fn build_create_table_statements(
 }
 
 /// Appends `BEFORE` triggers refusing the writes `grants` does not allow on a
-/// plain table, every write as read-only when it allows none.
+/// plain table, every write as read-only when it allows none. A definer body
+/// passes them, its writes held to its owner's privileges.
 fn append_deny_triggers(
     statements: &mut Vec<Statement>,
+    schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
     grants: &RoleTable,
 ) -> Result<(), Error> {
@@ -573,7 +575,10 @@ fn append_deny_triggers(
     } else {
         crate::write_guard::permission_denied(&table_ident)
     };
-    let condition = write_guard_condition_expr(None, options);
+    let condition = super::definer::unless_running(
+        write_guard_condition_expr(None, options),
+        &super::definer::definer_owners(schema),
+    );
     let unwritable: Vec<Ident> = grants.not_updatable().map(quoted_ident).collect();
     let update = if !grants.updates_any() {
         Some(TriggerEvent::Update(Vec::new()))
