@@ -126,7 +126,7 @@ fn pg_catalog_holds(schema: &ParserDB, target: &TargetName<'_>) -> bool {
     match target.schema() {
         Some(stored) => case.compared_form(stored, target.schema_is_quoted()) == "pg_catalog",
         None => {
-            schema.functions().any(|function| {
+            schema.functions_named(target.name()).any(|function| {
                 let stored = function.target_name();
                 case.compared_form(stored.name(), stored.name_is_quoted()) == name
                     && in_pg_catalog(function)
