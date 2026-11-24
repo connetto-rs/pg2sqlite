@@ -14,8 +14,8 @@ use core::ops::ControlFlow;
 
 use sql_traits::{
     structs::{
-        ColumnBinding, ExpressionContext, ExpressionScope, IdentifierCase, ParserDB, TargetName,
-        UpdatableViewBase, View,
+        ColumnBinding, ColumnScope, ExpressionContext, ExpressionScope, IdentifierCase, ParserDB,
+        QueryOutput, TargetName, UpdatableViewBase, View,
     },
     traits::{DatabaseLike, TableLike, ViewLike},
 };
@@ -30,7 +30,7 @@ use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{
-        derived_writes::{Event, FiringTrigger, output_names},
+        derived_writes::{Event, FiringTrigger},
         object_name::{declared_column_ident, last_ident},
         query_builder::aliased_table_factor,
         returning_rows::ReturningRows,
@@ -640,4 +640,32 @@ fn replace<N: VisitMut + ?Sized>(node: &mut N, replacements: Vec<(usize, Expr)>)
     }
     let _ =
         node.visit(&mut Replacements { position: 0, pending: replacements.into_iter().peekable() });
+}
+
+/// The name of each output column of `view` in order, as PostgreSQL stores
+/// it: the one its declaration gives, or else the one its definition
+/// produces. None follow a wildcard whose columns cannot be enumerated, since
+/// their positions are unknown.
+///
+/// # Errors
+///
+/// Returns the lookup errors reading the definition runs into.
+fn output_names(view: &View, schema: &ParserDB) -> Result<Vec<Option<String>>, Error> {
+    let definition = view.definition();
+    let graph = ColumnScope::from_query(definition, schema, IdentifierCase::AsWritten)?;
+    let mut declared = view.declared_column_names().iter();
+    let outputs = graph.scope_for_query(definition).into_iter().flat_map(|scope| scope.outputs());
+    Ok(outputs
+        .map_while(|output| {
+            match output {
+                QueryOutput::Column { name, .. } => Some(name),
+                QueryOutput::Unexpanded { .. } => None,
+            }
+        })
+        .map(|produced| {
+            declared.next().map(|(name, quoted)| (name.as_str(), *quoted)).or(produced).map(
+                |(name, quoted)| if quoted { name.to_owned() } else { name.to_ascii_lowercase() },
+            )
+        })
+        .collect())
 }

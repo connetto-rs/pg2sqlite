@@ -398,10 +398,7 @@ impl PlPgSqlTranslator {
         }
         check_call_privileges(name, helper, schema, options)?;
         let (body, returns_value) = callee_body(name, helper, schema)?;
-        let mut body = super::unresolved::helper_raising_unresolved(body, helper, schema);
-        if scope.facts.removes_derived_writes {
-            crate::impls::derived_writes::without_removed_writes(&mut body, schema, options)?;
-        }
+        let body = super::unresolved::helper_raising_unresolved(body, helper, schema);
 
         let mut callee = scope.for_callee(identity.clone());
         let mut parameters = Vec::new();

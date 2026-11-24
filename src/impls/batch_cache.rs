@@ -3,7 +3,7 @@
 
 use sql_traits::structs::ParserDB;
 
-use crate::impls::{derived_writes::FunctionWrites, translator_impls::HelperQueries};
+use crate::impls::translator_impls::HelperQueries;
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
 
@@ -16,8 +16,6 @@ pub(crate) struct BatchCache {
     schemas: Vec<usize>,
     /// The sets helper calls translate to.
     pub(crate) helper_queries: HelperQueries,
-    /// The writes functions run.
-    pub(crate) function_writes: FunctionWrites,
 }
 
 impl BatchCache {

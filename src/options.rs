@@ -132,10 +132,9 @@ pub struct Pg2SqliteOptions {
     math_functions_available: bool,
     /// Tables placed in an attached database. Set via `with_attached_tables`.
     attached_tables: Option<AttachedTables>,
-    /// Whether the triggers that write rows and the foreign keys that change
-    /// child rows are left to the server. Set via
-    /// `with_server_derived_writes_omitted`.
-    server_derived_writes_omitted: bool,
+    /// The function each write a trigger derives runs between calls of. Set
+    /// via `with_server_derived_write_function`.
+    server_derived_write_function: Option<String>,
     /// Whether the columns stored as text for a type PostgreSQL bounds go
     /// without the `CHECK` holding them to the text the translation writes.
     /// Set via `with_stored_text_checks_omitted`.
@@ -178,7 +177,7 @@ impl<'a> arbitrary::Arbitrary<'a> for Pg2SqliteOptions {
             math_functions_available: bool::arbitrary(u)?,
             user_defined_functions: Vec::<String>::arbitrary(u)?,
             attached_tables: Option::<AttachedTables>::arbitrary(u)?,
-            server_derived_writes_omitted: bool::arbitrary(u)?,
+            server_derived_write_function: Option::<String>::arbitrary(u)?,
             stored_text_checks_omitted: bool::arbitrary(u)?,
             foreign_keys_omitted: bool::arbitrary(u)?,
             postgres_major: Option::<u16>::arbitrary(u)?,
@@ -212,7 +211,7 @@ impl Default for Pg2SqliteOptions {
             math_functions_available: false,
             user_defined_functions: Vec::new(),
             attached_tables: None,
-            server_derived_writes_omitted: false,
+            server_derived_write_function: None,
             stored_text_checks_omitted: false,
             foreign_keys_omitted: false,
             postgres_major: None,
@@ -228,17 +227,6 @@ pub(crate) struct PrewalkCatalogs {
     fts_indexes: Vec<(String, String)>,
     declared_object_names: Vec<String>,
     trigger_function_names: Vec<String>,
-    /// The names of the triggers left to the server, whose `DROP TRIGGER`
-    /// finds nothing on the replica.
-    server_derived_trigger_names: Vec<String>,
-    /// The triggers the schema holds once the translation unit has run,
-    /// which the server fires around the writes it derives.
-    firing_triggers: Vec<crate::impls::derived_writes::FiringTrigger>,
-    /// The rows the server writes, and the replica does not, for each
-    /// trigger left on the schema once the translation unit has run whose
-    /// writes the replica leaves out, which a foreign key on its table may
-    /// reference.
-    server_rows: Vec<crate::impls::derived_writes::ServerRows>,
     /// The folded table and trigger names of the row triggers sharing a
     /// table, timing and event with another, whose `WHEN` moves into the body
     /// so the slot can run them as one SQLite trigger.
@@ -1116,47 +1104,6 @@ impl<'a> TranslationContext<'a> {
         self.catalogs.shared_slot_triggers.contains(key)
     }
 
-    /// Registers `name` as a trigger the replica leaves to the server.
-    pub(crate) fn add_server_derived_trigger_name(&mut self, name: &str) {
-        self.catalogs.to_mut().server_derived_trigger_names.push(name.to_owned());
-    }
-
-    /// Returns whether a trigger named `name` was left to the server.
-    #[must_use]
-    pub(crate) fn is_server_derived_trigger_name(&self, name: &str) -> bool {
-        self.catalogs.server_derived_trigger_names.iter().any(|left| left == name)
-    }
-
-    /// Records the triggers the schema holds once the translation unit has
-    /// run, forgetting the writes kept for the triggers recorded before.
-    pub(crate) fn set_firing_triggers(
-        &mut self,
-        triggers: Vec<crate::impls::derived_writes::FiringTrigger>,
-    ) {
-        let catalogs = self.catalogs.to_mut();
-        catalogs.firing_triggers = triggers;
-        catalogs.batch_cache.get_mut().function_writes.clear();
-    }
-
-    /// The triggers the schema holds once the translation unit has run.
-    #[must_use]
-    pub(crate) fn firing_triggers(&self) -> &[crate::impls::derived_writes::FiringTrigger] {
-        &self.catalogs.firing_triggers
-    }
-
-    /// Records the rows the server writes, and the replica does not, for
-    /// each trigger whose writes the replica leaves out.
-    pub(crate) fn set_server_rows(&mut self, rows: Vec<crate::impls::derived_writes::ServerRows>) {
-        self.catalogs.to_mut().server_rows = rows;
-    }
-
-    /// The rows the server writes, and the replica does not, for each
-    /// trigger whose writes the replica leaves out.
-    #[must_use]
-    pub(crate) fn server_rows(&self) -> &[crate::impls::derived_writes::ServerRows] {
-        &self.catalogs.server_rows
-    }
-
     pub(crate) fn add_before_row_trigger_fn(
         &mut self,
         table_name: TableKey,
@@ -1304,7 +1251,7 @@ impl<'a> TranslationContext<'a> {
     }
 
     /// The name of a trigger `table` carries that fires on an event `fires`
-    /// accepts, among those the replica does not leave to the server.
+    /// accepts.
     pub(crate) fn trigger_firing(
         &self,
         table: &TableKey,
@@ -1313,11 +1260,7 @@ impl<'a> TranslationContext<'a> {
         self.catalogs
             .table_triggers
             .iter()
-            .find(|trigger| {
-                trigger.table == *table
-                    && trigger.events.iter().any(&fires)
-                    && !self.is_server_derived_trigger_name(&trigger.name)
-            })
+            .find(|trigger| trigger.table == *table && trigger.events.iter().any(&fires))
             .map(|trigger| trigger.name.as_str())
     }
 
@@ -1848,64 +1791,71 @@ impl Pg2SqliteOptions {
     }
 
     #[must_use]
-    /// Leaves out the writes the server derives, for a replica that uploads
-    /// every row its transactions change to a PostgreSQL that runs its own
+    /// Marks the writes the server derives, for a replica that uploads the
+    /// rows its transactions change to a PostgreSQL that runs its own
     /// triggers and cascades when it applies them.
     ///
-    /// A `BEFORE` or `AFTER` trigger whose function runs `INSERT`, `UPDATE`,
-    /// `DELETE`, `MERGE` or `TRUNCATE`, directly or in a function it calls,
-    /// stays without those statements, since the server derives those rows
-    /// again from the uploaded one, and keeps its refusals and its reads. It
-    /// is left out whole when nothing else is left of it, when it assigns to
-    /// `NEW` beside them, and when what it keeps reads what a write the
-    /// server derives produces before it within the same write: a later
-    /// statement of its own, `FOUND` or the row such a write returns, or
-    /// rows of a table another trigger or a foreign key action writes before
-    /// it fires, a deferred one after every other. A read and a write that
-    /// each hold an enum column of the table to labels the other excludes,
-    /// with `=` or `IN` against literals or a generated label of the trigger's
-    /// own row, share no row. A trigger that only refuses a write, reads, or
-    /// sets columns of its own `NEW` row stays as it is unless it reads such
-    /// rows, and so does every `INSTEAD OF` trigger, whose
-    /// writes are the view's own. A foreign key whose `ON DELETE` or
-    /// `ON UPDATE` action is `CASCADE`, `SET NULL` or `SET DEFAULT` is left
-    /// out whole, since kept as `NO ACTION` it would refuse an offline delete
-    /// of a parent whose children the server removes. So is a foreign key
-    /// into rows that an insert or an update of its table leads the server
-    /// to write through a trigger whose writes the replica leaves out, since
-    /// kept it would refuse every such write PostgreSQL accepts.
+    /// Each run of statements a `BEFORE` or `AFTER` trigger runs that write
+    /// rows, directly or in a function it calls, runs between `SELECT name(1)`
+    /// and `SELECT name(-1)`. The consumer registers `name` as a
+    /// non-deterministic SQLite function, so SQLite calls it at each mark. The
+    /// replica writes those rows, so its policies, checks and triggers judge
+    /// later writes on the rows PostgreSQL's would. The server derives them
+    /// again from the uploaded rows, so the consumer keeps them out of the
+    /// upload. A consumer recording with a SQLite session suspends the
+    /// recording while the arguments it was called with add up to more than
+    /// zero. A statement that fails between the two calls never makes the
+    /// second, so the consumer sets the sum back to zero once each statement
+    /// ends. Rows written this way are not undone by inverting the uploaded
+    /// changes, and the consumer drops them itself when the server refuses the
+    /// upload. An `INSTEAD OF` trigger writes the view's own rows, which stay
+    /// unmarked. A trigger SQLite cannot run is refused as without this
+    /// option.
     ///
+    /// A foreign key whose `ON DELETE` or `ON UPDATE` action is `CASCADE`,
+    /// `SET NULL` or `SET DEFAULT` is left out whole, since SQLite runs the
+    /// action itself where no call can mark it, and kept as `NO ACTION` it
+    /// would refuse an offline delete of a parent whose children the server
+    /// removes.
     /// [`Pg2Sqlite::translate_with_report`](crate::pg2sqlite::Pg2Sqlite::translate_with_report)
-    /// names each one in a
+    /// names each such key in a
     /// [`TranslationWarning::LeftToServer`](crate::warnings::TranslationWarning::LeftToServer),
     /// and each policy, `CHECK`, trigger, unique key or index and foreign key
-    /// the replica keeps that reads what such a write changes, which it
-    /// judges on the rows as they were before the write until the server's
-    /// rows arrive, in a
+    /// the replica keeps that reads what its action changes, which it judges
+    /// on the rows as they were before the action until the server's rows
+    /// arrive, in a
     /// [`TranslationWarning::ReadsLeftToServer`](crate::warnings::TranslationWarning::ReadsLeftToServer).
     ///
     /// ```
     /// # use pg2sqlite::prelude::*;
-    /// let options = Pg2SqliteOptions::default().with_server_derived_writes_omitted();
+    /// let options = Pg2SqliteOptions::default().with_server_derived_write_function("derived");
     /// let script = Pg2Sqlite::default()
     ///     .sql(
-    ///         "CREATE TABLE folders (id INT PRIMARY KEY);
-    ///          CREATE TABLE files (id INT PRIMARY KEY,
-    ///              folder INT REFERENCES folders (id) ON DELETE CASCADE);",
+    ///         "CREATE TABLE notes (id INT PRIMARY KEY);
+    ///          CREATE TABLE note_events (note INT NOT NULL);
+    ///          CREATE FUNCTION log_note() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+    ///          BEGIN
+    ///            INSERT INTO note_events VALUES (NEW.id);
+    ///            RETURN NULL;
+    ///          END $$;
+    ///          CREATE TRIGGER notes_logged AFTER INSERT ON notes
+    ///            FOR EACH ROW EXECUTE FUNCTION log_note();",
     ///     )?
     ///     .translate_to_sql(&options)?;
-    /// assert!(script.iter().all(|statement| !statement.contains("REFERENCES")));
+    /// let trigger = script.iter().find(|statement| statement.contains("CREATE TRIGGER")).unwrap();
+    /// assert!(trigger.contains("derived(1)") && trigger.contains("derived(-1)"));
     /// # Ok::<(), Error>(())
     /// ```
-    pub fn with_server_derived_writes_omitted(mut self) -> Self {
-        self.server_derived_writes_omitted = true;
+    pub fn with_server_derived_write_function(mut self, name: impl Into<String>) -> Self {
+        self.server_derived_write_function = Some(name.into());
         self
     }
 
     #[must_use]
-    /// Returns whether the writes the server derives are left out.
-    pub fn is_server_derived_writes_omitted(&self) -> bool {
-        self.server_derived_writes_omitted
+    /// Returns the function the writes the server derives run between calls
+    /// of.
+    pub fn get_server_derived_write_function(&self) -> Option<&str> {
+        self.server_derived_write_function.as_deref()
     }
 
     #[must_use]

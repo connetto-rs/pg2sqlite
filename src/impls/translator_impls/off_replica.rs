@@ -179,7 +179,9 @@ impl<'s> OffReplica<'s> {
             )));
         }
         // Every key acting on its referencing rows is left to the server.
-        if options.is_server_derived_writes_omitted() || options.is_foreign_keys_omitted() {
+        if options.get_server_derived_write_function().is_some()
+            || options.is_foreign_keys_omitted()
+        {
             return Ok(());
         }
         for referencing in schema.tables() {
