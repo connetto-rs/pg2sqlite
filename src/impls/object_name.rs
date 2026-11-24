@@ -119,6 +119,13 @@ pub(crate) fn fts_table_name(base: &str) -> String {
     format!("{base}_fts")
 }
 
+/// The table pairing each row of the FTS5 index over `base` with `base`'s
+/// primary key, when that key cannot be the FTS5 rowid.
+#[must_use]
+pub(crate) fn fts_keys_table_name(base: &str) -> String {
+    format!("{base}_pg2sqlite_fts_keys")
+}
+
 /// The name of an AFTER sync trigger of a shadow table (`fts5`, `vec0`),
 /// `{table}_ai`, `{table}_ad`, `{table}_au`, one vocabulary for both surfaces.
 #[must_use]
