@@ -72,7 +72,7 @@ pub(crate) fn hold_forward_views(
         }
         let Statement::CreateTable(create_table) = source else { continue };
         let own = &translated[index][..own_lengths[index]];
-        let Some(view) = generated_view(own, backing_suffix) else { continue };
+        let Some((backing, view)) = generated_view(own, backing_suffix) else { continue };
         let created_later = |names: &[String]| {
             names
                 .iter()
@@ -81,7 +81,7 @@ pub(crate) fn hold_forward_views(
                 .max()
         };
         let relations: Vec<Vec<String>> = own.iter().map(relation_names).collect();
-        let changes = column_changes(&translated[..epoch_end(index)], index, own_lengths[index]);
+        let changes = column_changes(&translated[..epoch_end(index)], index, backing);
         let forward = relations.iter().skip(1).filter_map(|names| created_later(names)).max();
         let Some(ready) = forward.into_iter().chain(changes.units.last().copied()).max() else {
             continue;
@@ -146,79 +146,69 @@ fn initial_relations(initial_schema: Option<&ParserDB>) -> BTreeSet<String> {
 }
 
 /// The statements after a table's creation that change its backing table's
-/// columns where the generated view disagrees with it.
-#[derive(Default)]
+/// columns, during which the generated view disagrees with it.
 struct ColumnChanges {
     /// The units holding such a change, in order.
     units: Vec<usize>,
-    /// The columns, keyed as SQLite folds names, the generated statements read
-    /// before a change brings them to the backing table.
+    /// The columns, keyed as SQLite folds names, the generated view holds and
+    /// the creation of the backing table lacks.
     read: BTreeSet<String>,
 }
 
-/// The units of `translated` after `index` changing the columns of the backing
-/// table unit `index` creates first, where the next `own_length` statements of
-/// the unit, generated for the table's final columns, disagree with the
-/// creation. An added or renamed column they read is one the creation lacks,
-/// and a dropped column they do not read is one it holds. The search ends where
-/// a unit drops the backing table.
-fn column_changes(translated: &[Vec<Statement>], index: usize, own_length: usize) -> ColumnChanges {
-    let mut changes = ColumnChanges::default();
-    let own = &translated[index][..own_length];
-    let Some((Statement::CreateTable(backing), generated)) = own.split_first() else {
-        return changes;
-    };
+/// The units of `translated` after `index` changing the columns of `backing`,
+/// the table unit `index` creates first, up to the end of `translated` or the
+/// unit dropping the backing table, where the columns end as the generated
+/// view holds them. A unit changing them leaves the backing table or finds it
+/// with columns other than those, so the view disagrees with it there.
+fn column_changes(
+    translated: &[Vec<Statement>],
+    index: usize,
+    backing: &CreateTable,
+) -> ColumnChanges {
     let backing_key = key(&backing.name);
     let created: BTreeSet<String> =
         backing.columns.iter().map(|column| column.name.value.to_ascii_lowercase()).collect();
-    let generated_reads = |column: &str| {
-        let column = BTreeSet::from([column.to_owned()]);
-        generated.iter().any(|statement| reads(statement, &column))
-    };
-    for (unit, statements) in translated.iter().enumerate().skip(index + 1) {
+    let mut columns = created.clone();
+    let mut units = Vec::new();
+    'units: for (unit, statements) in translated.iter().enumerate().skip(index + 1) {
+        let before = columns.clone();
         for statement in statements {
             match statement {
                 Statement::Drop { object_type: ObjectType::Table, names, .. }
                     if names.iter().any(|name| key(name) == backing_key) =>
                 {
-                    return changes;
+                    break 'units;
                 }
                 Statement::AlterTable(alter) if key(&alter.name) == backing_key => {
-                    for operation in &alter.operations {
-                        let brought = match operation {
-                            AlterTableOperation::AddColumn { column_def, .. } => {
-                                Some(&column_def.name)
-                            }
-                            AlterTableOperation::RenameColumn { new_column_name, .. } => {
-                                Some(new_column_name)
-                            }
-                            AlterTableOperation::DropColumn { column_names, .. } => {
-                                if column_names.iter().any(|column| {
-                                    let column = column.value.to_ascii_lowercase();
-                                    created.contains(&column) && !generated_reads(&column)
-                                }) && changes.units.last() != Some(&unit)
-                                {
-                                    changes.units.push(unit);
-                                }
-                                None
-                            }
-                            _ => None,
-                        };
-                        let Some(brought) = brought else { continue };
-                        let column = brought.value.to_ascii_lowercase();
-                        if !created.contains(&column) && generated_reads(&column) {
-                            if changes.units.last() != Some(&unit) {
-                                changes.units.push(unit);
-                            }
-                            changes.read.insert(column);
-                        }
-                    }
+                    alter.operations.iter().for_each(|operation| change(&mut columns, operation));
                 }
                 _ => {}
             }
         }
+        if columns != before {
+            units.push(unit);
+        }
     }
-    changes
+    ColumnChanges { units, read: columns.difference(&created).cloned().collect() }
+}
+
+/// Applies `operation` to `columns`, keyed as SQLite folds names.
+fn change(columns: &mut BTreeSet<String>, operation: &AlterTableOperation) {
+    match operation {
+        AlterTableOperation::AddColumn { column_def, .. } => {
+            columns.insert(column_def.name.value.to_ascii_lowercase());
+        }
+        AlterTableOperation::DropColumn { column_names, .. } => {
+            for column in column_names {
+                columns.remove(&column.value.to_ascii_lowercase());
+            }
+        }
+        AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
+            columns.remove(&old_column_name.value.to_ascii_lowercase());
+            columns.insert(new_column_name.value.to_ascii_lowercase());
+        }
+        _ => {}
+    }
 }
 
 /// Whether `statement` names one of `columns`, keyed as SQLite folds names,
@@ -292,15 +282,21 @@ fn created_names(statement: &Statement) -> impl Iterator<Item = &ObjectName> {
     }))
 }
 
-/// The view a unit translating a `CREATE TABLE` emits for the table, named so
-/// that its backing table, the unit's first statement, carries `suffix`.
-fn generated_view(emitted: &[Statement], suffix: &str) -> Option<ObjectName> {
+/// The backing table a unit translating a `CREATE TABLE` creates first, and
+/// the view it emits for the table, named so that the backing table carries
+/// `suffix`.
+fn generated_view<'a>(
+    emitted: &'a [Statement],
+    suffix: &str,
+) -> Option<(&'a CreateTable, ObjectName)> {
     let Some(Statement::CreateTable(backing)) = emitted.first() else { return None };
-    let backing = key(&backing.name);
-    let table = backing.strip_suffix(&suffix.to_ascii_lowercase())?;
+    let table = key(&backing.name);
+    let table = table.strip_suffix(&suffix.to_ascii_lowercase())?;
     emitted.iter().find_map(|statement| {
         match statement {
-            Statement::CreateView(view) if key(&view.name) == table => Some(view.name.clone()),
+            Statement::CreateView(view) if key(&view.name) == table => {
+                Some((backing, view.name.clone()))
+            }
             _ => None,
         }
     })

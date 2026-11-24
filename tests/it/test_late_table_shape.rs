@@ -397,6 +397,40 @@ fn rows_written_between_column_changes_of_the_same_epoch_stay() {
 }
 
 #[test]
+fn rows_written_before_one_statement_changing_two_columns_stay() {
+    let alter = "ALTER TABLE notes DROP COLUMN label, ADD COLUMN body TEXT;";
+    let rows = "INSERT INTO notes (id, owner) VALUES (1, 'app'), (2, 'other'), (3, 'app');";
+    assert_same_replica(
+        loaded(&format!(
+            "{THREE_COLUMNS}{SECURED}INSERT INTO notes VALUES (1, 'app', 'a'), (2, 'other', 'b'), \
+             (3, 'app', 'c');{alter}"
+        )),
+        loaded(&format!("{THREE_COLUMNS}{SECURED}{alter}{rows}")),
+    );
+}
+
+#[test]
+fn rows_written_through_a_column_the_epoch_adds_and_drops_stay() {
+    let add = "ALTER TABLE notes ADD COLUMN scratch TEXT;";
+    let drop = "ALTER TABLE notes DROP COLUMN scratch;";
+    let scratched =
+        "INSERT INTO notes (id, owner, scratch) VALUES (1, 'app', 'a'), (2, 'other', 'b');";
+    let first = "INSERT INTO notes (id, owner) VALUES (1, 'app');";
+    let rest = "INSERT INTO notes (id, owner) VALUES (2, 'other'), (3, 'app');";
+    let rows = "INSERT INTO notes (id, owner) VALUES (1, 'app'), (2, 'other'), (3, 'app');";
+    assert_same_replica(
+        loaded(&format!(
+            "{TABLE}{SECURED}{add}{scratched}{drop}INSERT INTO notes (id, owner) VALUES (3, 'app');"
+        )),
+        loaded(&format!("{TABLE}{SECURED}{rows}")),
+    );
+    assert_same_replica(
+        loaded(&format!("{TABLE}{SECURED}{first}{add}{drop}{rest}")),
+        loaded(&format!("{TABLE}{SECURED}{rows}")),
+    );
+}
+
+#[test]
 fn a_late_enable_turns_the_keys_into_it_into_triggers() {
     let (mut late, late_exempt) = loaded(&format!("{HEAD}{TAGS}{BOUNDARY}{SECURED}"));
     let (mut early, early_exempt) = loaded(&format!("{HEAD}{TAGS}{SECURED}{BOUNDARY}"));
