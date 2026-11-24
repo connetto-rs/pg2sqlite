@@ -10,5 +10,6 @@ mod helpers;
 mod test_geography_measures;
 mod test_postgis_diesel;
 mod test_postgis_gist_diesel;
+mod test_postgis_json;
 mod test_sqlitegis_catalogue_floor;
 mod test_sqlitegis_smoke;
