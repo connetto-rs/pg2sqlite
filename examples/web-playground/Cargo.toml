@@ -70,3 +70,9 @@ lto = "thin"
 # binaryen aborts on the DWARF that rustc emits, so strip before wasm-opt runs.
 strip = "debuginfo"
 debug = false
+
+# `dx build --release` builds under this profile. Left undefined, dx derives it from release at
+# opt-level "s" instead of "z". dx also forces `strip = false` here and strips after bundling, so
+# `debug = false` is what keeps the DWARF away from binaryen.
+[profile.wasm-release]
+inherits = "release"
