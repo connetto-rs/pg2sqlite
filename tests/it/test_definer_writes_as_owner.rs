@@ -1,9 +1,11 @@
-//! A `SECURITY DEFINER` trigger body writing what the acting role may not.
+//! A `SECURITY DEFINER` trigger body reading and writing what the acting role
+//! may not.
 //!
-//! PostgreSQL checks the body's write against the privileges of the
-//! function's owner on the columns the write names, so the replica lets the
-//! write through the guards holding the acting role to its own grants when the
-//! owner holds them, and refuses it as PostgreSQL does otherwise.
+//! PostgreSQL checks each statement the body runs, and each statement of the
+//! invoker triggers its writes fire, against the privileges of the function's
+//! owner, who is also `current_user` there. The replica lets those statements
+//! through the guards holding the acting role to its own grants when the owner
+//! holds them, and refuses them as PostgreSQL does otherwise.
 
 use diesel::prelude::*;
 use pg2sqlite::prelude::{Pg2SqliteOptions, is_policy_refusal};
@@ -34,6 +36,38 @@ diesel::table! {
         id -> Integer,
         /// Set by the stamping trigger.
         stamped -> Nullable<Integer>,
+    }
+}
+
+diesel::table! {
+    /// The entries the acting role inserts.
+    entries (id) {
+        /// Primary key.
+        id -> Integer,
+        /// Read by the auditing body.
+        secret -> Nullable<Integer>,
+    }
+}
+
+diesel::table! {
+    /// What the auditing body records of each entry.
+    audit (entry) {
+        /// The entry audited.
+        entry -> Integer,
+        /// The entry's secret.
+        secret -> Nullable<Integer>,
+        /// The role the body ran as.
+        actor -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    /// What the invoker trigger on `audit` records.
+    audit_trail (entry) {
+        /// The entry audited.
+        entry -> Integer,
+        /// The role the trigger ran as.
+        actor -> Nullable<Text>,
     }
 }
 
@@ -153,4 +187,112 @@ fn an_owner_updating_another_column_is_refused_as_postgresql_refuses_it() {
 
     let refused = insert_note(&mut connection).expect_err("the stamp owner cannot set stamped");
     assert!(is_policy_refusal(&refused.to_string()), "{refused}");
+}
+
+/// `entries`, whose insert runs `audit_entry()` as `auditor`. The body deletes
+/// an entry with a negative key, which `auditor` may not, then copies the
+/// entry's secret into `audit`, whose insert runs the invoker `trail_audit()`
+/// appending to `audit_trail`. `grants` hands `app` and `auditor` their
+/// privileges past `app`'s inserting entries and reading the rest.
+fn audit_script(grants: &str) -> String {
+    format!(
+        "CREATE ROLE app;
+         CREATE ROLE auditor;
+         CREATE TABLE entries (id INT PRIMARY KEY, secret INT);
+         CREATE TABLE audit (entry INT NOT NULL, secret INT, actor TEXT);
+         CREATE TABLE audit_trail (entry INT NOT NULL, actor TEXT);
+         CREATE FUNCTION audit_entry() RETURNS trigger
+         LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+         BEGIN
+           IF NEW.id < 0 THEN
+             DELETE FROM public.entries WHERE id = NEW.id;
+           END IF;
+           INSERT INTO public.audit (entry, secret, actor)
+             SELECT id, secret, current_user FROM public.entries WHERE id = NEW.id;
+           RETURN NULL;
+         END
+         $$;
+         ALTER FUNCTION audit_entry() OWNER TO auditor;
+         CREATE TRIGGER entries_audited AFTER INSERT ON entries
+           FOR EACH ROW EXECUTE FUNCTION audit_entry();
+         CREATE FUNCTION trail_audit() RETURNS trigger
+         LANGUAGE plpgsql SET search_path = '' AS $$
+         BEGIN
+           INSERT INTO public.audit_trail VALUES (NEW.entry, current_user);
+           RETURN NULL;
+         END
+         $$;
+         CREATE TRIGGER audit_trailed AFTER INSERT ON audit
+           FOR EACH ROW EXECUTE FUNCTION trail_audit();
+         GRANT SELECT, INSERT ON entries TO app;
+         GRANT SELECT ON audit, audit_trail TO app;
+         {grants}"
+    )
+}
+
+fn audit_replica(grants: &str) -> SqliteConnection {
+    let options = Pg2SqliteOptions::default()
+        .with_deployment(Deployment::new("app", ["app"], []).expect("a valid deployment"))
+        .with_acting_role("app")
+        .with_rls_audit_table_name("rls_audit");
+    helpers::apply_with_options(&audit_script(grants), &options).expect("the script applies")
+}
+
+fn insert_entry(connection: &mut SqliteConnection, id: i32) -> QueryResult<usize> {
+    diesel::insert_into(entries::table)
+        .values((entries::id.eq(id), entries::secret.eq(7)))
+        .execute(connection)
+}
+
+const AUDITOR_HOLDS_ITS_WORK: &str = "GRANT SELECT (id, secret) ON entries TO auditor;
+     GRANT INSERT ON audit, audit_trail TO auditor;";
+
+#[test]
+fn a_refused_write_in_an_untaken_branch_never_runs() {
+    let mut connection = audit_replica(AUDITOR_HOLDS_ITS_WORK);
+
+    insert_entry(&mut connection, 1).expect("the delete branch is not taken");
+    let refused = insert_entry(&mut connection, -1).expect_err("auditor cannot delete entries");
+    assert!(is_policy_refusal(&refused.to_string()), "{refused}");
+}
+
+#[test]
+fn the_definer_reads_only_the_columns_its_owner_may_select() {
+    let mut connection = audit_replica(
+        "GRANT SELECT (id), DELETE ON entries TO auditor;
+         GRANT INSERT ON audit, audit_trail TO auditor; GRANT INSERT ON audit_trail TO app;",
+    );
+
+    let refused = insert_entry(&mut connection, 1).expect_err("auditor cannot read secret");
+    assert!(is_policy_refusal(&refused.to_string()), "{refused}");
+    assert!(refused.to_string().contains("table entries"), "{refused}");
+}
+
+#[test]
+fn the_definer_and_the_invoker_trigger_it_fires_run_as_the_owner() {
+    let mut connection = audit_replica(AUDITOR_HOLDS_ITS_WORK);
+
+    insert_entry(&mut connection, 1).expect("auditor audits the entry");
+    let audited: Vec<(i32, Option<i32>, Option<String>)> = audit::table
+        .select((audit::entry, audit::secret, audit::actor))
+        .load(&mut connection)
+        .expect("the audit reads");
+    assert_eq!(audited, [(1, Some(7), Some("auditor".to_owned()))]);
+    let trail: Vec<(i32, Option<String>)> = audit_trail::table
+        .select((audit_trail::entry, audit_trail::actor))
+        .load(&mut connection)
+        .expect("the trail reads");
+    assert_eq!(trail, [(1, Some("auditor".to_owned()))]);
+}
+
+#[test]
+fn the_invoker_trigger_a_definer_fires_holds_the_owners_privileges() {
+    let mut connection = audit_replica(
+        "GRANT SELECT (id, secret), DELETE ON entries TO auditor; GRANT INSERT ON audit TO auditor;
+         GRANT INSERT ON audit_trail TO app;",
+    );
+
+    let refused = insert_entry(&mut connection, 1).expect_err("auditor cannot append the trail");
+    assert!(is_policy_refusal(&refused.to_string()), "{refused}");
+    assert!(refused.to_string().contains("table audit_trail"), "{refused}");
 }

@@ -377,16 +377,18 @@ fn path_display(path: &[String]) -> String {
     path.iter().map(|key| format!("'{key}'")).collect::<Vec<_>>().join(" -> ")
 }
 
-/// What reading the session as one value becomes.
+/// What reading the session as one value becomes. The role a definer body
+/// runs as is its owner.
 pub(crate) fn translate_session_read(
     read: &SessionRead,
     schema: &ParserDB,
-    options: &Pg2SqliteOptions,
+    options: &crate::options::TranslationContext<'_>,
 ) -> Result<Expr, Error> {
     let name = match read {
         SessionRead::ActingRole(spelling) => {
             let (role, deployment) = acting_role_in_deployment(options)?
                 .ok_or_else(|| Error::ActingRoleRequired { reading: (*spelling).to_string() })?;
+            let role = options.running_as().map_or(role, sql_traits::traits::RoleLike::name);
             return role_literal(role, deployment, schema);
         }
         SessionRead::LoginRole => {
@@ -408,7 +410,7 @@ pub(crate) fn translate_session_read(
 pub(crate) fn translate_expr_read(
     expr: &Expr,
     schema: &ParserDB,
-    options: &Pg2SqliteOptions,
+    options: &crate::options::TranslationContext<'_>,
 ) -> Result<Option<Expr>, Error> {
     if let Some(read) = session_read(expr) {
         return translate_session_read(&read, schema, options).map(Some);

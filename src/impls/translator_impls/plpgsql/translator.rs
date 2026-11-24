@@ -38,6 +38,7 @@ use crate::{
     impls::{
         expression_type::type_name,
         function_helpers::simple_function_expr,
+        privileges::{Checked, unheld_table},
         query_builder::{
             from_relation, make_query, make_simple_select, plain_table_factor, single_expr_query,
         },
@@ -418,7 +419,8 @@ impl PlPgSqlTranslator {
     }
 
     /// Translates one node of a body, refusing what a SQLite trigger cannot
-    /// run.
+    /// run. A body running as a role that lacks a privilege PostgreSQL checks
+    /// before the node raises PostgreSQL's refusal wherever it reaches it.
     pub(super) fn translate_node(
         function: &str,
         node: &Node,
@@ -437,6 +439,58 @@ impl PlPgSqlTranslator {
             return Err(rewritten_guard(relation));
         }
 
+        let checked = match &node.kind {
+            NodeKind::Statement { statement, .. } | NodeKind::Perform { query: statement } => {
+                Some(Checked::Statement(statement))
+            }
+            NodeKind::Assignment(assignment) => Some(Checked::Query(&assignment.value)),
+            NodeKind::Return { value: Some(value) } => Some(Checked::Query(value)),
+            _ => None,
+        };
+        let mut statements = match checked {
+            Some(checked) => {
+                Self::privilege_refusal(checked, scope, schema, options)?.into_iter().collect()
+            }
+            None => Vec::new(),
+        };
+        statements.extend(Self::translate_node_kind(function, node, scope, schema, options, emit)?);
+        Ok(statements)
+    }
+
+    /// `SELECT RAISE(ABORT, ...)` under the condition the body reaches
+    /// `checked` on, when the role the body runs as lacks a privilege
+    /// PostgreSQL checks before running it. Privileges are modelled only for
+    /// a translation naming an acting role.
+    pub(super) fn privilege_refusal(
+        checked: Checked<'_>,
+        scope: &BodyScope,
+        schema: &ParserDB,
+        options: &crate::options::TranslationContext<'_>,
+    ) -> Result<Option<Statement>, Error> {
+        let Some(role) = options.running_as() else { return Ok(None) };
+        if crate::impls::session_variable::acting_role(schema, options)?.is_none() {
+            return Ok(None);
+        }
+        let Some(table) = unheld_table(checked, role, schema)? else { return Ok(None) };
+        let mut refusal = crate::impls::ast_builder::raise_statement(
+            "ABORT",
+            Some(&crate::write_guard::permission_denied(table.table_name())),
+            None,
+        );
+        if let Some(condition) = scope.current_condition() {
+            Self::inject_condition_into_statement(&mut refusal, &condition)?;
+        }
+        Ok(Some(refusal))
+    }
+
+    fn translate_node_kind(
+        function: &str,
+        node: &Node,
+        scope: &mut BodyScope,
+        schema: &ParserDB,
+        options: &crate::options::TranslationContext<'_>,
+        emit: crate::warnings::WarningSink<'_>,
+    ) -> Result<Vec<Statement>, Error> {
         match &node.kind {
             NodeKind::Statement { statement, into: Some(into) } => {
                 let Statement::Query(query) = statement.as_ref() else {
@@ -875,6 +929,12 @@ impl PlPgSqlTranslator {
         // helpers write is no write under the `IF`.
         let mut first = match conditional.branches.first() {
             Some(Branch { condition, .. }) => {
+                result.extend(Self::privilege_refusal(
+                    Checked::Query(condition),
+                    scope,
+                    schema,
+                    options,
+                )?);
                 let mut written = Self::prepare(
                     embedded::expression(condition).into_owned(),
                     scope,
@@ -912,8 +972,11 @@ impl PlPgSqlTranslator {
                     options,
                 )?;
                 scope.push_condition(conjunction(negated.iter().cloned()));
+                let refusal =
+                    Self::privilege_refusal(Checked::Query(condition), scope, schema, options);
                 let inlined = Self::inline_helper_calls(&mut written, scope, schema, options, emit);
                 scope.pop_condition();
+                result.extend(refusal?);
                 result.extend(inlined?);
                 // What the helpers wrote holds in every later branch.
                 outer = scope.scoped_bindings();

@@ -19,7 +19,8 @@ diesel::table! {
 }
 
 /// The owners, the tables, and the definer function the trigger runs, whose
-/// body names `log` alone.
+/// body reads `log` alone. A body that writes runs with its owner's frame
+/// whatever exempts the owner, so this one does not.
 fn base(owner_attributes: &str) -> String {
     format!(
         "CREATE ROLE trigger_owner NOLOGIN {owner_attributes};
@@ -27,9 +28,10 @@ fn base(owner_attributes: &str) -> String {
          CREATE TABLE docs (id INTEGER PRIMARY KEY);
          CREATE TABLE log (id INTEGER);
          CREATE TABLE secrets (id INTEGER);
+         GRANT SELECT ON log TO trigger_owner;
          CREATE FUNCTION log_doc() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
          BEGIN
-           INSERT INTO log VALUES (NEW.id);
+           PERFORM count(*) FROM log WHERE id = NEW.id;
            RETURN NULL;
          END $$;
          ALTER FUNCTION log_doc() OWNER TO trigger_owner;"

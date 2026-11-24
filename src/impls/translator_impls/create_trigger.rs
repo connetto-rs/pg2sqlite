@@ -3,7 +3,7 @@ use alloc::borrow::Cow;
 use sql_traits::{
     errors::LookupError,
     structs::{MaintenanceRefusal, ParserDB},
-    traits::{ColumnLike, DatabaseLike, Relation, TableLike, TriggerLike, ViewLike},
+    traits::{ColumnLike, DatabaseLike, Relation, RoleLike, TableLike, TriggerLike, ViewLike},
     utils::identifier_resolution::stored_ident_name,
 };
 use sqlparser::{
@@ -386,48 +386,91 @@ fn generate_standard_trigger_body(
     };
     // A definer body runs as its owner, read from the epoch like row-level
     // security.
-    let owner = crate::traits::schema::written_function(schema, function_name)?
+    let function = crate::traits::schema::written_function(schema, function_name)?;
+    let owner = function
         .map(|function| super::definer::definer_owner(function, schema))
         .transpose()?
         .flatten();
-    let running_as = owner.map(|owner| options.with_running_as(owner));
-    // The part fires for its own events alone, so a row another event gives
-    // reads as `NULL` here, as in PostgreSQL.
-    let body_options = running_as.as_ref().unwrap_or(options).with_trigger_events(part.events);
-    let translated = super::plpgsql::PlPgSqlTranslator::translate_body(
+    if let (Some(function), Some(owner)) = (function, owner) {
+        // The part fires for its own events alone, so a row another event
+        // gives reads as `NULL` here, as in PostgreSQL.
+        let running_as = options.with_running_as(owner);
+        let translated = super::plpgsql::PlPgSqlTranslator::translate_body(
+            &function_name.to_string(),
+            body,
+            facts,
+            part.guard,
+            schema,
+            &running_as.with_trigger_events(part.events),
+            emit,
+        )?;
+        let statements =
+            super::definer::run_as_owner(function, owner, translated, schema, options)?;
+        return Ok(Some(begin_end(statements)));
+    }
+    // An invoker body a definer body's write fires runs as that body's owner.
+    let firing_owners =
+        super::definer::owners_reaching(&super::trigger_slots::folded(table_name), schema)?;
+    let names: Vec<&str> = firing_owners.iter().map(|owner| owner.name()).collect();
+    let acting_guard = and_guards(part.guard, super::definer::outside_owners(&names));
+    let mut statements = super::plpgsql::PlPgSqlTranslator::translate_body(
         &function_name.to_string(),
-        body,
-        facts,
-        part.guard,
+        body.clone(),
+        facts.clone(),
+        acting_guard.as_ref(),
         schema,
-        &body_options,
+        &options.with_trigger_events(part.events),
         emit,
     )?;
-    Ok(Some(sqlparser::ast::BeginEndStatements {
-        begin_token: crate::impls::ast_builder::keyword_token("BEGIN", Keyword::BEGIN),
-        statements: run_as_definer_or_route_writes(function_name, translated, schema, options)?,
-        end_token: crate::impls::ast_builder::keyword_token("END", Keyword::END),
-    }))
-}
-
-/// A `SECURITY DEFINER` body reads and writes as its owner, and any other
-/// body has its writes routed to backing storage under a configured write
-/// exemption.
-fn run_as_definer_or_route_writes(
-    function_name: &ObjectName,
-    mut translated: Vec<Statement>,
-    schema: &ParserDB,
-    options: &crate::options::TranslationContext<'_>,
-) -> Result<Vec<Statement>, crate::errors::Error> {
-    if let Some(function) = crate::traits::schema::written_function(schema, function_name)?
-        && let Some(owner) = super::definer::definer_owner(function, schema)?
-    {
-        return super::definer::run_as_owner(function, owner, translated, schema, options);
-    }
-    for statement in &mut translated {
+    for statement in &mut statements {
         route_trigger_statement_writes(statement, schema, options)?;
     }
-    Ok(translated)
+    for owner in firing_owners {
+        let running = super::definer::running_owner(owner.name());
+        let guard = and_guards(part.guard, Some(running.clone())).unwrap_or(running);
+        let running_as = options.with_running_as(owner);
+        // The acting translation already reported what the body warns of.
+        let translated = super::plpgsql::PlPgSqlTranslator::translate_body(
+            &function_name.to_string(),
+            body.clone(),
+            facts.clone(),
+            Some(&guard),
+            schema,
+            &running_as.with_trigger_events(part.events),
+            &mut |_| {},
+        )?;
+        statements.extend(super::definer::run_as_firing_owner(
+            function_name,
+            owner,
+            translated,
+            &guard,
+            schema,
+            options,
+        )?);
+    }
+    Ok(Some(begin_end(statements)))
+}
+
+fn begin_end(statements: Vec<Statement>) -> sqlparser::ast::BeginEndStatements {
+    sqlparser::ast::BeginEndStatements {
+        begin_token: crate::impls::ast_builder::keyword_token("BEGIN", Keyword::BEGIN),
+        statements,
+        end_token: crate::impls::ast_builder::keyword_token("END", Keyword::END),
+    }
+}
+
+/// `left AND right`, either alone when the other is absent.
+fn and_guards(left: Option<&Expr>, right: Option<Expr>) -> Option<Expr> {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            Some(Expr::BinaryOp {
+                left: Box::new(Expr::Nested(Box::new(left.clone()))),
+                op: sqlparser::ast::BinaryOperator::And,
+                right: Box::new(right),
+            })
+        }
+        (left, right) => left.cloned().or(right),
+    }
 }
 
 /// The SQLite value a maintenance `UPDATE` writes into `column`, `raw` being
