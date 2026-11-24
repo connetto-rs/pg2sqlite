@@ -246,6 +246,11 @@ jobs:
   coverage:
     name: Code Coverage
     runs-on: ubuntu-26.04
+    # Two jobs without debug info keep the instrumented build under the runner's 16 GB.
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: false
+      CARGO_PROFILE_TEST_DEBUG: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
