@@ -351,27 +351,7 @@ impl MarkerTables {
     /// its statements name and do not find, and the renames and drops that
     /// keep a marker table with its table.
     pub(crate) fn follow(&mut self, source: &Statement, emitted: &mut Vec<Statement>) {
-        let mut named = Vec::new();
-        for statement in emitted.iter() {
-            let _ = visit_relations(statement, |name: &ObjectName| {
-                let key = table_key(name);
-                if is_marker_table(name)
-                    && !self.created.contains(&key)
-                    && !named.iter().any(|(known, _)| *known == key)
-                {
-                    named.push((key, name.clone()));
-                }
-                ControlFlow::<()>::Continue(())
-            });
-        }
-        for (key, marker) in named {
-            // A marker table the schema inherits is created again, since a
-            // replica built before marker tables existed has none.
-            self.inherited.remove(&key);
-            self.created.insert(key);
-            emitted.push(create(marker));
-        }
-
+        self.create_named(emitted);
         match source {
             Statement::AlterTable(alter) => {
                 for operation in &alter.operations {
@@ -392,6 +372,31 @@ impl MarkerTables {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Appends to `emitted` the marker tables its statements name and do not
+    /// find.
+    pub(crate) fn create_named(&mut self, emitted: &mut Vec<Statement>) {
+        let mut named = Vec::new();
+        for statement in emitted.iter() {
+            let _ = visit_relations(statement, |name: &ObjectName| {
+                let key = table_key(name);
+                if is_marker_table(name)
+                    && !self.created.contains(&key)
+                    && !named.iter().any(|(known, _)| *known == key)
+                {
+                    named.push((key, name.clone()));
+                }
+                ControlFlow::<()>::Continue(())
+            });
+        }
+        for (key, marker) in named {
+            // A marker table the schema inherits is created again, since a
+            // replica built before marker tables existed has none.
+            self.inherited.remove(&key);
+            self.created.insert(key);
+            emitted.push(create(marker));
         }
     }
 
