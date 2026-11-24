@@ -19,7 +19,7 @@ use crate::{
         bind_once::bind_once,
         expr_helpers::case_when,
         function_helpers::{number_literal, simple_function_expr, string_literal},
-        object_name::last_ident,
+        object_name::{last_catalog_name, last_ident},
         shared_helpers::{
             declared_in_scope, minor_unit_scale, numeric_scale, referenced_column_name,
             render_minor_units_as_text, scalar_query_declared, scope_declines_column,
@@ -122,6 +122,14 @@ pub(crate) fn json_argument(
                  form in SQL, and SQLite's JSON functions refuse a BLOB."
             )));
         }
+        Conversion::Geometry(data_type) => {
+            return Err(Error::forward_refusal(format!(
+                "{label}({argument}) needs the JSON form of a {data_type} value, which PostGIS \
+                 writes as ST_AsGeoJSON(geom, 15, 2), its coordinates rounded to 15 decimals \
+                 and its crs named from spatial_ref_sys. SQLiteGIS has no \
+                 ST_AsGeoJSON(geom, maxdecimaldigits, options) to write it."
+            )));
+        }
         Conversion::Stored(stored) => stored,
     };
     let value = argument.translate_with_warnings(schema, options, emit)?;
@@ -140,6 +148,7 @@ pub(crate) fn json_argument(
         Stored::UuidBlob => JsonArgument::Text(rendered(value, &uuid_text)?),
         Stored::Timestamp => JsonArgument::Text(rendered(value, &iso_timestamp)?),
         Stored::TimeWithTimeZone => JsonArgument::Text(rendered(value, &time_with_time_zone_text)?),
+        Stored::Geography => JsonArgument::Text(rendered(value, &geography_text)?),
     })
 }
 
@@ -225,6 +234,8 @@ enum Conversion {
     Boolean,
     /// A BLOB with no text form here, named by its type.
     Unrenderable(String),
+    /// A PostGIS `geometry` under SQLiteGIS, named by its type.
+    Geometry(String),
     /// A form rendered from the stored value.
     Stored(Stored),
 }
@@ -246,6 +257,9 @@ enum Stored {
     Timestamp,
     /// `HH:MM:SS±HH:MM`, whose offset PostgreSQL writes as `±HH` on the hour.
     TimeWithTimeZone,
+    /// A PostGIS `geography` held as EWKB, which PostgreSQL writes as its hex
+    /// text output.
+    Geography,
 }
 
 /// The conversion `expr` needs, or `None` for a column or subquery the scope
@@ -380,8 +394,12 @@ fn conversion_of_type(
         DataType::Time(_, TimezoneInfo::Tz | TimezoneInfo::WithTimeZone) => {
             Conversion::Stored(Stored::TimeWithTimeZone)
         }
-        DataType::Custom(..) if translates_to_blob(data_type, schema) => {
-            Conversion::Unrenderable(data_type.to_string())
+        DataType::Custom(name, ..) if translates_to_blob(data_type, schema) => {
+            match last_catalog_name(name).as_deref().filter(|_| options.is_sqlitegis_enabled()) {
+                Some("geography") => Conversion::Stored(Stored::Geography),
+                Some("geometry") => Conversion::Geometry(data_type.to_string()),
+                _ => Conversion::Unrenderable(data_type.to_string()),
+            }
         }
         _ => {
             Conversion::Stored(
@@ -435,6 +453,35 @@ pub(crate) fn uuid_text(value: &Expr) -> Expr {
         .into_iter()
         .fold(group("1", "8"), |text, next| concat(concat(text, string_literal("-")), next));
     unless_null(value, simple_function_expr("lower", vec![hyphenated], None))
+}
+
+/// The uppercase hex EWKB PostGIS prints for a `geography`, little endian
+/// with the SRID, 4326 where the value has none.
+///
+/// The value is parsed and written again, since a replica may hold the same
+/// point big endian or without its SRID.
+fn geography_text(value: &Expr) -> Expr {
+    let srid = simple_function_expr(
+        "coalesce",
+        vec![
+            simple_function_expr(
+                "nullif",
+                vec![
+                    simple_function_expr("ST_SRID", vec![value.clone()], None),
+                    number_literal("0"),
+                ],
+                None,
+            ),
+            number_literal("4326"),
+        ],
+        None,
+    );
+    let canonical = simple_function_expr(
+        "ST_GeomFromWKB",
+        vec![simple_function_expr("ST_AsBinary", vec![value.clone()], None), srid],
+        None,
+    );
+    unless_null(value, simple_function_expr("hex", vec![canonical], None))
 }
 
 /// ISO 8601 text of a timestamp, with a canonical `timestamptz`'s `.ffffff`
