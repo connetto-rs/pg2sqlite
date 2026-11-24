@@ -195,7 +195,7 @@ jobs:
             echo "::endgroup::"
           done &
           trap 'kill $!' EXIT
-          cargo build --release --example floor_corpus
+          cargo build --profile floor-corpus --example floor_corpus
 
       - name: Check emitted SQL against the declared floor
         run: scripts/check_sqlite_floor.sh

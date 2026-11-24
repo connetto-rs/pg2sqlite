@@ -123,35 +123,3 @@ fn test_fts5_backfill_populates_preexisting_rows() -> Result<(), Box<dyn std::er
 
     Ok(())
 }
-
-#[test]
-fn test_fts5_partial_index_generates_when_clause_in_triggers()
--> Result<(), Box<dyn std::error::Error>> {
-    let sql = "
-        CREATE TABLE articles (id INT PRIMARY KEY, body TEXT, published BOOLEAN);
-        CREATE INDEX articles_fts ON articles USING GIN (to_tsvector('english', body))
-            WHERE published = true;
-    ";
-    let out = helpers::translate_default_joined(sql)?;
-
-    // Trigger WHEN clauses only resolve row columns through NEW. or OLD., a
-    // bare column name fails at runtime, so the predicate must be qualified.
-    assert!(
-        out.contains("WHEN NEW.published") && out.contains("WHEN OLD.published"),
-        "the WHEN predicates must qualify the column with NEW. and OLD.: {out}"
-    );
-    assert!(
-        !out.lines().any(|l| l.contains("WHEN published")),
-        "no trigger may reference the predicate column unqualified: {out}"
-    );
-
-    // The backfill only indexes rows the partial index covers.
-    assert!(
-        out.lines().any(|l| l.contains("SELECT id, body FROM articles WHERE published")),
-        "the backfill must carry the partial predicate: {out}"
-    );
-
-    // Execute all translated statements to verify the output is valid SQLite.
-    helpers::apply_default(sql)?;
-    Ok(())
-}

@@ -11,7 +11,7 @@ use sqlparser::{
         FunctionArguments, Ident, InTarget, IndexColumn, IndexType, KeyOrIndexDisplay,
         NullsDistinctOption, ObjectName, ObjectNamePart, OrderByExpr, OrderByOptions, Query,
         SetExpr, SqliteTableOption, Statement, TableConstraint, TriggerEvent, TriggerPeriod,
-        UniqueConstraint, Value, VirtualTableModuleArgument, VisitMut, VisitorMut,
+        UniqueConstraint, Value, VirtualTableModuleArgument,
     },
     tokenizer::Span,
 };
@@ -312,14 +312,11 @@ impl<'db> FtsKey<'db> {
         ))
     }
 
-    /// `DELETE FROM <keys>` the keys table row of the row `row` names, when
-    /// `condition` holds. `None` when the key is the rowid.
-    fn forget(&self, row: &Ident, condition: Option<Expr>) -> Option<Statement> {
+    /// `DELETE FROM <keys>` the keys table row of the row `row` names. `None`
+    /// when the key is the rowid.
+    fn forget(&self, row: &Ident) -> Option<Statement> {
         let Self::Mapped { keys_table, .. } = self else { return None };
-        let selection = self.key_of(row).into_iter().chain(condition).reduce(|left, right| {
-            Expr::BinaryOp { left: Box::new(left), op: BinaryOperator::And, right: Box::new(right) }
-        });
-        Some(ast_builder::delete(plain_name(keys_table), selection))
+        Some(ast_builder::delete(plain_name(keys_table), self.key_of(row)))
     }
 
     /// `CREATE TABLE <keys> (id INTEGER PRIMARY KEY, key_<column> ANY NOT NULL,
@@ -423,46 +420,6 @@ fn create_fts5_virtual_table(
     }
 }
 
-fn qualify_predicate(predicate: &Expr, qualifier: &str) -> Expr {
-    use core::ops::ControlFlow;
-
-    struct QualifyIdents(Ident);
-
-    impl VisitorMut for QualifyIdents {
-        type Break = ();
-        fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<()> {
-            if let Expr::Identifier(column) = expr {
-                let column = column.clone();
-                *expr = Expr::CompoundIdentifier(vec![self.0.clone(), column]);
-            }
-            ControlFlow::Continue(())
-        }
-    }
-
-    let mut qualified_predicate = predicate.clone();
-    let _: ControlFlow<()> =
-        VisitMut::visit(&mut qualified_predicate, &mut QualifyIdents(Ident::new(qualifier)));
-    qualified_predicate
-}
-
-/// `VALUES (<values>)`, or `SELECT <values> WHERE <condition>` when the row is
-/// written only under `condition`.
-fn row_source(values: Vec<Expr>, condition: Option<Expr>) -> Query {
-    match condition {
-        None => ast_builder::values(vec![values]),
-        Some(condition) => {
-            make_query(
-                None,
-                SetExpr::Select(Box::new(make_simple_select(
-                    ast_builder::select_items(values),
-                    Vec::new(),
-                    Some(condition),
-                ))),
-            )
-        }
-    }
-}
-
 /// Generate the FTS5 sync triggers.
 ///
 /// A row leaves the index through the FTS5 `'delete'` command, which the
@@ -470,18 +427,13 @@ fn row_source(values: Vec<Expr>, condition: Option<Expr>) -> Query {
 /// old values from. A mapped key also writes and deletes the row's keys table
 /// row, before the FTS5 row is written and after it is deleted.
 ///
-/// With a `predicate`, the INSERT trigger guards with the NEW-qualified
-/// predicate and the DELETE trigger with the OLD-qualified one. The UPDATE
-/// trigger needs both, so it carries them on its statements rather than in a
-/// `WHEN` clause, and removes the old row before it adds the new one. A row
-/// crossing the predicate boundary therefore enters or leaves the index, and
-/// a row staying inside keeps the words its old and new text share.
+/// The UPDATE trigger removes the old row before it adds the new one, so a
+/// word the old and new text share stays.
 fn create_fts5_triggers(
     trigger_table: &str,
     fts_table_base: &str,
     key: &FtsKey<'_>,
     columns: &[String],
-    predicate: Option<&Expr>,
 ) -> Vec<Statement> {
     let fts_name = fts_table_name(fts_table_base);
     let new = Ident::new("new");
@@ -489,26 +441,25 @@ fn create_fts5_triggers(
     let target_columns = || {
         core::iter::once(plain_name("rowid")).chain(columns.iter().map(|column| plain_name(column)))
     };
-    let insert_new = |condition: Option<Expr>| {
+    let insert_new = || {
         let values = core::iter::once(key.rowid_of(&new))
             .chain(columns.iter().map(|column| qualified(&new, column)))
             .collect();
         let insert = ast_builder::insert(
             plain_name(&fts_name),
             target_columns().collect(),
-            row_source(values, condition.clone()),
+            ast_builder::values(vec![values]),
         );
         key.record(|key_columns| {
-            row_source(
+            ast_builder::values(vec![
                 key_columns.iter().map(|column| qualified(&new, column)).collect(),
-                condition,
-            )
+            ])
         })
         .into_iter()
         .chain([insert])
         .collect::<Vec<_>>()
     };
-    let delete_old = |condition: Option<Expr>| {
+    let delete_old = || {
         let values = [string_literal("delete"), key.rowid_of(&old)]
             .into_iter()
             .chain(columns.iter().map(|column| qualified(&old, column)))
@@ -516,32 +467,26 @@ fn create_fts5_triggers(
         let delete = ast_builder::insert(
             plain_name(&fts_name),
             core::iter::once(plain_name(&fts_name)).chain(target_columns()).collect(),
-            row_source(values, condition.clone()),
+            ast_builder::values(vec![values]),
         );
-        core::iter::once(delete).chain(key.forget(&old, condition)).collect::<Vec<_>>()
+        core::iter::once(delete).chain(key.forget(&old)).collect::<Vec<_>>()
     };
-    let trigger = |event: TriggerEvent, condition: Option<Expr>, statements: Vec<Statement>| {
+    let trigger = |event: TriggerEvent, statements: Vec<Statement>| {
         ast_builder::trigger(
             plain_name(&sync_trigger_name(&fts_name, &event)),
             plain_name(trigger_table),
             TriggerPeriod::After,
             event,
             false,
-            condition,
+            None,
             statements,
         )
     };
 
-    let new_predicate = predicate.map(|predicate| qualify_predicate(predicate, "NEW"));
-    let old_predicate = predicate.map(|predicate| qualify_predicate(predicate, "OLD"));
     vec![
-        trigger(TriggerEvent::Insert, new_predicate.clone(), insert_new(None)),
-        trigger(TriggerEvent::Delete, old_predicate.clone(), delete_old(None)),
-        trigger(
-            TriggerEvent::Update(Vec::new()),
-            None,
-            [delete_old(old_predicate), insert_new(new_predicate)].concat(),
-        ),
+        trigger(TriggerEvent::Insert, insert_new()),
+        trigger(TriggerEvent::Delete, delete_old()),
+        trigger(TriggerEvent::Update(Vec::new()), [delete_old(), insert_new()].concat()),
     ]
 }
 
@@ -550,7 +495,6 @@ fn create_fts5_triggers(
 fn create_fts5_statements(
     table_name: &ObjectName,
     columns: &[String],
-    predicate: Option<&Expr>,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
 ) -> Result<Vec<Statement>, Error> {
@@ -570,13 +514,7 @@ fn create_fts5_statements(
 
     let mut statements: Vec<Statement> = key.create_keys_table().into_iter().collect();
     statements.push(create_fts5_virtual_table(&base_name, &trigger_table_name, &key, columns));
-    statements.extend(create_fts5_triggers(
-        &trigger_table_name,
-        &base_name,
-        &key,
-        columns,
-        predicate,
-    ));
+    statements.extend(create_fts5_triggers(&trigger_table_name, &base_name, &key, columns));
 
     let from_table = |projection: Vec<Expr>| {
         make_query(
@@ -584,7 +522,7 @@ fn create_fts5_statements(
             SetExpr::Select(Box::new(make_simple_select(
                 ast_builder::select_items(projection),
                 from_relation(plain_table_factor(plain_name(&trigger_table_name))),
-                predicate.cloned(),
+                None,
             ))),
         )
     };
@@ -759,6 +697,34 @@ fn report_dropped_index_clauses(
     }
 }
 
+/// Translates a GIN or GiST full-text `index` into FTS5.
+///
+/// The FTS5 index holds every row, so a partial index's predicate is reported
+/// as dropped.
+fn translate_full_text_index(
+    index: &CreateIndex,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Vec<Statement>, Error> {
+    let (table_name, columns) = match analyze_fts_index(index) {
+        FtsTranslation::Fts5 { table_name, columns } => (table_name, columns),
+        FtsTranslation::Unsupported(reason) => return Err(Error::forward_refusal(reason)),
+    };
+    let statements = create_fts5_statements(&table_name, &columns, schema, options)?;
+    if let Some(predicate) = &index.predicate {
+        emit(crate::warnings::TranslationWarning::LossyDrop {
+            construct: "partial full-text index predicate".to_string(),
+            reason: format!(
+                "The FTS5 index indexes every row, those outside WHERE {predicate} included. \
+                 PostgreSQL's predicate only decides which rows its index stores, and `@@` \
+                 matches every row either way, so only the size of the index differs."
+            ),
+        });
+    }
+    Ok(statements)
+}
+
 impl crate::traits::translator::TranslatorWithContext for CreateIndex {
     type SQLiteEntry = Vec<Statement>;
 
@@ -790,27 +756,7 @@ impl crate::traits::translator::TranslatorWithContext for CreateIndex {
         }
 
         if matches!(self.using, Some(IndexType::GIN | IndexType::GiST)) {
-            let predicate = self
-                .predicate
-                .as_ref()
-                .map(|predicate| predicate.translate_with_warnings(schema, options, emit))
-                .transpose()?;
-
-            let mut normalized_index = self.clone();
-            normalized_index.table_name = self.table_name.clone();
-
-            return match analyze_fts_index(&normalized_index) {
-                FtsTranslation::Fts5 { table_name, columns } => {
-                    create_fts5_statements(
-                        &table_name,
-                        &columns,
-                        predicate.as_ref(),
-                        schema,
-                        options,
-                    )
-                }
-                FtsTranslation::Unsupported(reason) => Err(Error::forward_refusal(reason)),
-            };
+            return translate_full_text_index(self, schema, options, emit);
         }
 
         // `Pg2Sqlite` names every index whose PostgreSQL name it can predict.
