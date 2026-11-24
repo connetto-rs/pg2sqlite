@@ -183,26 +183,12 @@ jobs:
           path: target/sqlite-floor
           key: sqlite-floor-${{ hashFiles('scripts/check_sqlite_floor.sh') }}
 
-      # A runner that runs out of memory or disk dies without a log.
       - name: Build the floor corpus emitter
         timeout-minutes: 40
-        run: |
-          while sleep 30; do
-            echo "::group::$(date -u +%T) memory and disk"
-            free -m
-            df -h / "$GITHUB_WORKSPACE"
-            ps -eo rss,etime,args --sort=-rss | head -4 | cut -c1-160
-            echo "::endgroup::"
-          done &
-          trap 'kill $!' EXIT
-          cargo build --profile floor-corpus --example floor_corpus
+        run: cargo build --profile floor-corpus --example floor_corpus
 
       - name: Check emitted SQL against the declared floor
         run: scripts/check_sqlite_floor.sh
-
-      - name: Report kernel memory kills
-        if: always()
-        run: sudo dmesg | grep -iE 'out of memory|oom-kill|killed process' || echo "no kernel memory kill"
 
   msrv:
     name: Minimum Supported Rust Version
