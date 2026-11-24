@@ -2,7 +2,7 @@
 //! relation or function its body reaches, or its own function alters, since
 //! PostgreSQL resolves a trigger body where it runs.
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use core::ops::ControlFlow;
 
 use sql_traits::{structs::ParserDB, traits::DatabaseLike};
@@ -15,7 +15,7 @@ use sqlparser::ast::{
 use super::{
     function_cascade::{drop_of, runs_dropped},
     function_moves,
-    plpgsql::{ReadBodies, body_reach},
+    plpgsql::{BodyReach, ReadBodies, body_reach},
     trigger_slots::{TableKey, folded, renamed_owner, renamed_table, table_key},
 };
 #[cfg(not(feature = "std"))]
@@ -25,6 +25,10 @@ use crate::{errors::Error, impls::object_name::same_identifier, warnings::Transl
 /// Translates a statement as the batch stands on one side of an event.
 pub(crate) type Translate<'t> =
     dyn FnMut(&Statement, &mut dyn FnMut(TranslationWarning)) -> Result<Vec<Statement>, Error> + 't;
+
+/// What [`body_reach`] answered for each function a trigger runs, on the
+/// schema before an event and on the schema after it.
+type Reached = [BTreeMap<ObjectName, Option<BodyReach>>; 2];
 
 /// One live trigger.
 struct Followed {
@@ -105,13 +109,14 @@ impl Touched {
 
     /// Whether `trigger`'s translation reads what this changes, its body read
     /// from `before` and from `after`, `bodies` holding what each body read
-    /// before names, or `event` moves the function it runs.
+    /// before names and `reached` what each function reached across this
+    /// event, or `event` moves the function it runs.
     fn reaches(
         &self,
         event: &Statement,
         trigger: &CreateTrigger,
         (before, after): (&ParserDB, &ParserDB),
-        bodies: &mut ReadBodies,
+        (bodies, reached): (&mut ReadBodies, &mut Reached),
     ) -> Result<bool, Error> {
         let table = folded(&trigger.table_name);
         let gated = trigger
@@ -122,16 +127,21 @@ impl Touched {
             return Ok(true);
         }
         let Some(exec_body) = &trigger.exec_body else { return Ok(false) };
-        if function_moves::moved(event, &exec_body.func_desc.name).is_some() {
+        let function = &exec_body.func_desc.name;
+        if function_moves::moved(event, function).is_some() {
             return Ok(true);
         }
-        for schema in [before, after] {
-            match body_reach(&exec_body.func_desc.name, schema, bodies)? {
-                Some(reach)
+        for (schema, reached) in [before, after].into_iter().zip(reached) {
+            if !reached.contains_key(function) {
+                let reach = body_reach(function, schema, bodies)?;
+                reached.insert(function.clone(), reach);
+            }
+            match reached.get(function) {
+                Some(Some(reach))
                     if reach.relations.is_disjoint(&self.relations)
                         && reach.written.is_disjoint(&self.trigger_tables)
                         && reach.functions.is_disjoint(&self.functions) => {}
-                Some(_) | None => return Ok(true),
+                _ => return Ok(true),
             }
         }
         Ok(false)
@@ -296,6 +306,7 @@ impl TriggerFollower {
             _ => BTreeSet::new(),
         };
         let mut reemissions = Vec::new();
+        let mut reached = Reached::default();
         for followed in &mut self.live {
             let replaced = match event {
                 Statement::CreateTrigger(trigger) => {
@@ -314,7 +325,12 @@ impl TriggerFollower {
             }
             let table = table_key(&followed.create.table_name);
             if dropped.contains(&table)
-                || !touched.reaches(event, &followed.create, (before, after), &mut self.bodies)?
+                || !touched.reaches(
+                    event,
+                    &followed.create,
+                    (before, after),
+                    (&mut self.bodies, &mut reached),
+                )?
             {
                 continue;
             }
