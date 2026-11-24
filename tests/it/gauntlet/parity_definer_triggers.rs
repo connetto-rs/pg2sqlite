@@ -326,6 +326,7 @@ const REFOUNDED_BY_BYPASSING_OWNER: Scenario = Scenario {
     owner: "trigger_owner",
     triggers: REFOUNDING,
     function: "authz.refound_organization()",
+    policies: POLICIES,
 };
 
 /// `scenario` on PostgreSQL, seeded as the superuser, then acting as `app`
