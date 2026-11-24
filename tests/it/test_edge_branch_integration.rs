@@ -201,12 +201,6 @@ fn create_index_translation_covers_gin_error_branches() {
     let schema = schema_from_sql(
         r#"
         CREATE TABLE docs(id INTEGER PRIMARY KEY, title TEXT, body TEXT);
-        CREATE TABLE docs_composite(
-            id INTEGER,
-            tenant_id INTEGER,
-            title TEXT,
-            PRIMARY KEY(id, tenant_id)
-        );
         "#,
     );
     let options = Pg2SqliteOptions::default();
@@ -232,12 +226,6 @@ fn create_index_translation_covers_gin_error_branches() {
     );
     let err = missing_table.translate(&schema, &options).unwrap_err();
     assert!(unsupported_message(err).contains("Could not find table"));
-
-    let composite_pk = parse_create_index(
-        "CREATE INDEX idx_composite ON docs_composite USING GIN (to_tsvector(title))",
-    );
-    let err = composite_pk.translate(&schema, &options).unwrap_err();
-    assert!(unsupported_message(err).contains("single-column primary key"));
 }
 
 #[test]
@@ -543,20 +531,6 @@ fn forward_expr_translation_covers_remaining_fts_extract_and_timezone_paths() {
     let missing_table = parse_expr("to_tsvector(title) @@ to_tsquery('hello')");
     let err = missing_table.translate(&empty, &options).unwrap_err();
     assert!(unsupported_message(err).contains("Could not determine table name"));
-
-    // Composite PK + declared GIN index: the FTS-index gate passes (because the
-    // index IS declared in the schema and the full-pipeline catalog will pick
-    // it up), and the deeper single-column-PK check fires. Drive through the
-    // full pipeline so `populate_fts_index_catalog` populates the catalog.
-    let composite_pk_err = pg2sqlite::prelude::Pg2Sqlite::default()
-        .sql(
-            "CREATE TABLE composite_docs(id INTEGER, tenant_id INTEGER, title TEXT, \
-             PRIMARY KEY(id, tenant_id)); \
-             CREATE INDEX composite_docs_fts ON composite_docs USING GIN (to_tsvector('english', title)); \
-             SELECT id FROM composite_docs WHERE to_tsvector('english', title) @@ to_tsquery('hello');",
-        )
-        .expect("parse").translate(&options).unwrap_err();
-    assert!(unsupported_message(composite_pk_err).contains("single-column primary key"));
 
     // GIN index declared but tsquery argument is a non-literal expression: gate
     // passes, the literal-argument check fires.

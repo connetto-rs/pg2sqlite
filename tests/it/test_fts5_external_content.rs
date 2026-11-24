@@ -134,16 +134,6 @@ fn test_fts5_partial_index_generates_when_clause_in_triggers()
     ";
     let out = helpers::translate_default_joined(sql)?;
 
-    // Four sync triggers carry the predicate: insert, delete, and the two
-    // halves of update (a row can cross the predicate boundary, so the
-    // delete half is guarded by the OLD row and the insert half by NEW).
-    let trigger_count_with_when =
-        out.lines().filter(|l| l.contains("CREATE TRIGGER") && l.contains("WHEN")).count();
-    assert_eq!(
-        trigger_count_with_when, 4,
-        "all 4 FTS5 sync triggers must carry a WHEN clause for a partial index: {out}"
-    );
-
     // Trigger WHEN clauses only resolve row columns through NEW. or OLD., a
     // bare column name fails at runtime, so the predicate must be qualified.
     assert!(

@@ -3,14 +3,15 @@
 
 use sql_traits::{
     structs::ParserDB,
-    traits::{ColumnLike, TableLike},
+    traits::{ColumnLike, DatabaseLike, TableLike},
 };
 use sqlparser::{
     ast::{
-        BinaryOperator, CreateIndex, Expr, Function, FunctionArg, FunctionArgExpr,
-        FunctionArguments, Ident, IndexColumn, IndexType, ObjectName, ObjectNamePart, SetExpr,
-        Statement, TriggerEvent, TriggerPeriod, Value, VirtualTableModuleArgument, VisitMut,
-        VisitorMut,
+        BinaryOperator, CreateIndex, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
+        FunctionArguments, Ident, InTarget, IndexColumn, IndexType, KeyOrIndexDisplay,
+        NullsDistinctOption, ObjectName, ObjectNamePart, OrderByExpr, OrderByOptions, Query,
+        SetExpr, SqliteTableOption, Statement, TableConstraint, TriggerEvent, TriggerPeriod,
+        UniqueConstraint, Value, VirtualTableModuleArgument, VisitMut, VisitorMut,
     },
     tokenizer::Span,
 };
@@ -23,7 +24,7 @@ use crate::{
         ast_builder,
         function_helpers::{plain_catalog_function_args, simple_function_expr, string_literal},
         object_name::{
-            append_suffix, fts_table_name, last_ident_value_or_display,
+            append_suffix, fts_keys_table_name, fts_table_name, last_ident_value_or_display,
             normalize_schema_qualified_object_name_for_sqlite, postgres_catalog_function_name,
             quoted_ident, resolve_translation_table, sqlite_unqualified_object_name,
             sync_trigger_name,
@@ -34,8 +35,10 @@ use crate::{
         },
         shared_helpers::{ColumnReferences, extract_columns_from_expr},
         translator_impls::{
-            data_type::is_string_type, nulls_not_distinct::companion_index, postgis,
-            rls::resolve_trigger_table_name,
+            data_type::{is_serial_type, is_string_type},
+            nulls_not_distinct::companion_index,
+            postgis,
+            rls::{generated_key_column, generated_table_column, resolve_trigger_table_name},
         },
     },
 };
@@ -165,32 +168,255 @@ pub(crate) fn analyze_fts_index(create_index: &CreateIndex) -> FtsTranslation {
     FtsTranslation::Fts5 { table_name, columns: fts_columns }
 }
 
-/// Generate an FTS5 virtual table statement using external content mode.
+/// How the rows of the FTS5 index over a table are tied to the table's rows.
+pub(crate) enum FtsKey<'db> {
+    /// A primary key of one integer column, which serves as the FTS5 rowid.
+    Rowid(&'db str),
+    /// Any other primary key, which the keys table pairs with the integer the
+    /// FTS5 rows carry. The table's own rowid cannot serve, since `VACUUM` may
+    /// renumber it when the table has no `INTEGER PRIMARY KEY`.
+    Mapped {
+        /// The keys table.
+        keys_table: String,
+        /// The primary key columns.
+        columns: Vec<&'db str>,
+    },
+}
+
+/// The keys table's integer key, the FTS5 rowid, as
+/// [`generated_key_column`] names it.
+const KEYS_ID: &str = "id";
+
+/// The keys table's column holding the key column `column`, prefixed so no
+/// key column can take [`KEYS_ID`].
+fn keys_column(column: &str) -> String {
+    format!("key_{column}")
+}
+
+impl<'db> FtsKey<'db> {
+    /// The key of `table`, whose FTS5 index is named after `base_name`.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a table without a primary key, which leaves nothing to tie the
+    /// FTS5 rows to.
+    pub(crate) fn of(
+        table: &'db <ParserDB as DatabaseLike>::Table,
+        schema: &'db ParserDB,
+        base_name: &str,
+    ) -> Result<Self, Error> {
+        let key: Vec<_> = table.primary_key_columns(schema)?.collect();
+        match *key.as_slice() {
+            [] => {
+                Err(Error::forward_refusal(format!(
+                    "A full-text index on '{base_name}' cannot be translated, because FTS5 ties \
+                     its rows to the table's through the primary key and '{base_name}' has none. \
+                     Declare a primary key."
+                )))
+            }
+            [column] if is_rowid_type(&column.attribute().data_type) => {
+                Ok(Self::Rowid(column.column_name()))
+            }
+            _ => {
+                Ok(Self::Mapped {
+                    keys_table: fts_keys_table_name(base_name),
+                    columns: key.iter().map(|&column| column.column_name()).collect(),
+                })
+            }
+        }
+    }
+
+    /// The condition that the row `key_reference` names a key column of is
+    /// among the rows `matching` answers the FTS5 rowids of.
+    pub(crate) fn matched_by(&self, key_reference: impl Fn(&str) -> Expr, matching: Query) -> Expr {
+        let in_query = |expr: Expr, query: Query| {
+            Expr::In {
+                expr: Box::new(expr),
+                target: InTarget::Subquery(Box::new(query)),
+                negated: false,
+                global: false,
+            }
+        };
+        match self {
+            Self::Rowid(column) => in_query(key_reference(column), matching),
+            Self::Mapped { keys_table, columns } => {
+                let keys = make_query(
+                    None,
+                    SetExpr::Select(Box::new(make_simple_select(
+                        ast_builder::select_items(
+                            columns
+                                .iter()
+                                .map(|column| Expr::Identifier(quoted_ident(&keys_column(column))))
+                                .collect(),
+                        ),
+                        from_relation(plain_table_factor(plain_name(keys_table))),
+                        Some(in_query(qualified(&quoted_ident(keys_table), KEYS_ID), matching)),
+                    ))),
+                );
+                let key = match columns.as_slice() {
+                    [column] => key_reference(column),
+                    _ => Expr::Tuple(columns.iter().map(|column| key_reference(column)).collect()),
+                };
+                in_query(key, keys)
+            }
+        }
+    }
+
+    /// The FTS5 rowid of the row `row` names, `NEW`, `OLD` or the indexed
+    /// table itself.
+    fn rowid_of(&self, row: &Ident) -> Expr {
+        match self {
+            Self::Rowid(column) => qualified(row, column),
+            Self::Mapped { keys_table, .. } => {
+                Expr::Subquery(Box::new(single_expr_query(
+                    qualified(&quoted_ident(keys_table), KEYS_ID),
+                    from_relation(plain_table_factor(plain_name(keys_table))),
+                    self.key_of(row),
+                )))
+            }
+        }
+    }
+
+    /// `<keys>.key_<column> = <row>.<column>` for every key column, the keys
+    /// table row of the row `row` names. `None` when the key is the rowid.
+    fn key_of(&self, row: &Ident) -> Option<Expr> {
+        let Self::Mapped { keys_table, columns } = self else { return None };
+        let keys_table = quoted_ident(keys_table);
+        columns
+            .iter()
+            .map(|column| {
+                Expr::BinaryOp {
+                    left: Box::new(qualified(&keys_table, &keys_column(column))),
+                    op: BinaryOperator::Eq,
+                    right: Box::new(qualified(row, column)),
+                }
+            })
+            .reduce(|left, right| {
+                Expr::BinaryOp {
+                    left: Box::new(left),
+                    op: BinaryOperator::And,
+                    right: Box::new(right),
+                }
+            })
+    }
+
+    /// `INSERT INTO <keys> (key_<column>, ...) <source>`, recording the keys
+    /// of the rows `source` selects the key columns of. `None` when the key is
+    /// the rowid.
+    fn record(&self, source: impl FnOnce(&[&str]) -> Query) -> Option<Statement> {
+        let Self::Mapped { keys_table, columns } = self else { return None };
+        Some(ast_builder::insert(
+            plain_name(keys_table),
+            columns.iter().map(|column| plain_name(&keys_column(column))).collect(),
+            source(columns),
+        ))
+    }
+
+    /// `DELETE FROM <keys>` the keys table row of the row `row` names, when
+    /// `condition` holds. `None` when the key is the rowid.
+    fn forget(&self, row: &Ident, condition: Option<Expr>) -> Option<Statement> {
+        let Self::Mapped { keys_table, .. } = self else { return None };
+        let selection = self.key_of(row).into_iter().chain(condition).reduce(|left, right| {
+            Expr::BinaryOp { left: Box::new(left), op: BinaryOperator::And, right: Box::new(right) }
+        });
+        Some(ast_builder::delete(plain_name(keys_table), selection))
+    }
+
+    /// `CREATE TABLE <keys> (id INTEGER PRIMARY KEY, key_<column> ANY NOT NULL,
+    /// ..., UNIQUE (key_<column>, ...)) STRICT`. `None` when the key is the
+    /// rowid.
+    fn create_keys_table(&self) -> Option<Statement> {
+        let Self::Mapped { keys_table, columns } = self else { return None };
+        let keys_columns: Vec<String> = columns.iter().map(|column| keys_column(column)).collect();
+        let any = DataType::Custom(
+            ObjectName(vec![ObjectNamePart::Identifier(Ident::new("ANY"))]),
+            Vec::new(),
+        );
+        let mut table = ast_builder::blank_create_table(plain_name(keys_table));
+        table.columns = core::iter::once(generated_key_column())
+            .chain(
+                keys_columns.iter().map(|column| generated_table_column(column, any.clone(), true)),
+            )
+            .collect();
+        table.constraints = vec![TableConstraint::Unique(UniqueConstraint {
+            name: None,
+            index_name: None,
+            index_type_display: KeyOrIndexDisplay::None,
+            index_type: None,
+            columns: keys_columns
+                .iter()
+                .map(|column| {
+                    IndexColumn {
+                        column: OrderByExpr {
+                            expr: Expr::Identifier(quoted_ident(column)),
+                            options: OrderByOptions::default(),
+                            with_fill: None,
+                        },
+                        operator_class: None,
+                    }
+                })
+                .collect(),
+            include: Vec::new(),
+            index_options: Vec::new(),
+            characteristics: None,
+            nulls_distinct: NullsDistinctOption::None,
+            on_conflict: None,
+        })];
+        table.sqlite_table_options.options = vec![SqliteTableOption::Strict];
+        Some(Statement::CreateTable(table))
+    }
+}
+
+/// True when every value of `data_type` is an integer, which a single key
+/// column needs to be the FTS5 rowid.
+fn is_rowid_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::SmallInt(_)
+            | DataType::Int(_)
+            | DataType::Integer(_)
+            | DataType::BigInt(_)
+            | DataType::Int2(_)
+            | DataType::Int4(_)
+            | DataType::Int8(_)
+    ) || is_serial_type(data_type)
+}
+
+fn plain_name(value: &str) -> ObjectName {
+    ObjectName(vec![ObjectNamePart::Identifier(quoted_ident(value))])
+}
+
+fn qualified(row: &Ident, column: &str) -> Expr {
+    Expr::CompoundIdentifier(vec![row.clone(), quoted_ident(column)])
+}
+
+/// Generate the FTS5 virtual table statement.
 ///
-/// External content mode (`content=<table>`) avoids storing a second copy of
-/// the indexed text inside the FTS5 table - the content is read from the
-/// source table at query time. Sync triggers must use the FTS5 `'delete'`
-/// command instead of plain `DELETE` when removing rows from the index.
+/// A rowid key reads the indexed text from the table in external content mode
+/// (`content=<table>`), and a mapped key keeps no text at all (`content=''`).
+/// Neither stores a second copy of the text, and so the sync triggers remove
+/// a row with the FTS5 `'delete'` command, which takes the indexed values.
 fn create_fts5_virtual_table(
     base_name: &str,
     content_table: &str,
-    pk_column: &str,
+    key: &FtsKey<'_>,
     columns: &[String],
 ) -> Statement {
-    let fts_name =
-        ObjectName(vec![ObjectNamePart::Identifier(quoted_ident(&fts_table_name(base_name)))]);
-
-    // Column names followed by external content mode options, each written
-    // as FTS5 reads it.
+    let content = match key {
+        FtsKey::Rowid(column) => {
+            vec![format!("content={content_table}"), format!("content_rowid={column}")]
+        }
+        FtsKey::Mapped { .. } => vec!["content=''".to_string()],
+    };
     let module_args = columns
         .iter()
         .map(|column| quoted_ident(column).to_string())
-        .chain([format!("content={content_table}"), format!("content_rowid={pk_column}")])
+        .chain(content)
         .map(|value| VirtualTableModuleArgument { value, span: Span::empty() })
         .collect();
 
     Statement::CreateVirtualTable {
-        name: fts_name,
+        name: plain_name(&fts_table_name(base_name)),
         if_not_exists: false,
         module_name: Ident::new("fts5"),
         module_args,
@@ -219,73 +445,85 @@ fn qualify_predicate(predicate: &Expr, qualifier: &str) -> Expr {
     qualified_predicate
 }
 
-/// Generate FTS5 sync triggers for external content mode.
+/// `VALUES (<values>)`, or `SELECT <values> WHERE <condition>` when the row is
+/// written only under `condition`.
+fn row_source(values: Vec<Expr>, condition: Option<Expr>) -> Query {
+    match condition {
+        None => ast_builder::values(vec![values]),
+        Some(condition) => {
+            make_query(
+                None,
+                SetExpr::Select(Box::new(make_simple_select(
+                    ast_builder::select_items(values),
+                    Vec::new(),
+                    Some(condition),
+                ))),
+            )
+        }
+    }
+}
+
+/// Generate the FTS5 sync triggers.
 ///
-/// The DELETE and UPDATE triggers use the FTS5 `'delete'` command (inserting
-/// the special string into the table's own name column) rather than a plain
-/// `DELETE`, which is required when the FTS5 table is in external content mode.
+/// A row leaves the index through the FTS5 `'delete'` command, which the
+/// index needs since it keeps no copy of the text it would otherwise read the
+/// old values from. A mapped key also writes and deletes the row's keys table
+/// row, before the FTS5 row is written and after it is deleted.
 ///
-/// When `predicate_sql` is `None`, all three triggers are unconditional.
-///
-/// When `predicate_sql` is `Some`, the INSERT trigger guards with the
-/// NEW-qualified predicate and the DELETE trigger with the OLD-qualified one.
-/// The UPDATE trigger cannot use a single WHEN clause for both halves (the
-/// delete half needs OLD and the insert half needs NEW), so it is split into
-/// two triggers: `{base}_fts_au_delete` (WHEN OLD-qualified) and
-/// `{base}_fts_au_insert` (WHEN NEW-qualified). A row crossing the predicate
-/// boundary on UPDATE therefore enters or leaves the index correctly.
+/// With a `predicate`, the INSERT trigger guards with the NEW-qualified
+/// predicate and the DELETE trigger with the OLD-qualified one. The UPDATE
+/// trigger needs both, so it carries them on its statements rather than in a
+/// `WHEN` clause, and removes the old row before it adds the new one. A row
+/// crossing the predicate boundary therefore enters or leaves the index, and
+/// a row staying inside keeps the words its old and new text share.
 fn create_fts5_triggers(
     trigger_table: &str,
     fts_table_base: &str,
-    pk_column: &str,
+    key: &FtsKey<'_>,
     columns: &[String],
     predicate: Option<&Expr>,
 ) -> Vec<Statement> {
     let fts_name = fts_table_name(fts_table_base);
-    let name = |value: &str| ObjectName(vec![ObjectNamePart::Identifier(quoted_ident(value))]);
-    let row_value = |row: &str, column: &str| {
-        Expr::CompoundIdentifier(vec![Ident::new(row), quoted_ident(column)])
-    };
+    let new = Ident::new("new");
+    let old = Ident::new("old");
     let target_columns = || {
-        core::iter::once(name("rowid")).chain(columns.iter().map(|column| name(column))).collect()
+        core::iter::once(plain_name("rowid")).chain(columns.iter().map(|column| plain_name(column)))
     };
-    let new_values = || {
-        core::iter::once(row_value("new", pk_column))
-            .chain(columns.iter().map(|column| row_value("new", column)))
-            .collect()
+    let insert_new = |condition: Option<Expr>| {
+        let values = core::iter::once(key.rowid_of(&new))
+            .chain(columns.iter().map(|column| qualified(&new, column)))
+            .collect();
+        let insert = ast_builder::insert(
+            plain_name(&fts_name),
+            target_columns().collect(),
+            row_source(values, condition.clone()),
+        );
+        key.record(|key_columns| {
+            row_source(
+                key_columns.iter().map(|column| qualified(&new, column)).collect(),
+                condition,
+            )
+        })
+        .into_iter()
+        .chain([insert])
+        .collect::<Vec<_>>()
     };
-    let old_values = || {
-        core::iter::once(string_literal("delete"))
-            .chain(core::iter::once(row_value("old", pk_column)))
-            .chain(columns.iter().map(|column| row_value("old", column)))
-            .collect()
+    let delete_old = |condition: Option<Expr>| {
+        let values = [string_literal("delete"), key.rowid_of(&old)]
+            .into_iter()
+            .chain(columns.iter().map(|column| qualified(&old, column)))
+            .collect();
+        let delete = ast_builder::insert(
+            plain_name(&fts_name),
+            core::iter::once(plain_name(&fts_name)).chain(target_columns()).collect(),
+            row_source(values, condition.clone()),
+        );
+        core::iter::once(delete).chain(key.forget(&old, condition)).collect::<Vec<_>>()
     };
-    let insert_new = || {
-        ast_builder::insert(
-            name(&fts_name),
-            target_columns(),
-            ast_builder::values(vec![new_values()]),
-        )
-    };
-    let delete_old = || {
-        let delete_columns = core::iter::once(name(&fts_name)).chain(target_columns()).collect();
-        ast_builder::insert(
-            name(&fts_name),
-            delete_columns,
-            ast_builder::values(vec![old_values()]),
-        )
-    };
-    let trigger = |event: TriggerEvent,
-                   part: Option<&str>,
-                   condition: Option<Expr>,
-                   statements: Vec<Statement>| {
-        let trigger_name = match part {
-            None => sync_trigger_name(&fts_name, &event),
-            Some(part) => format!("{}_{part}", sync_trigger_name(&fts_name, &event)),
-        };
+    let trigger = |event: TriggerEvent, condition: Option<Expr>, statements: Vec<Statement>| {
         ast_builder::trigger(
-            name(&trigger_name),
-            name(trigger_table),
+            plain_name(&sync_trigger_name(&fts_name, &event)),
+            plain_name(trigger_table),
             TriggerPeriod::After,
             event,
             false,
@@ -294,54 +532,21 @@ fn create_fts5_triggers(
         )
     };
 
-    match predicate {
-        None => {
-            vec![
-                trigger(TriggerEvent::Insert, None, None, vec![insert_new()]),
-                trigger(TriggerEvent::Delete, None, None, vec![delete_old()]),
-                trigger(
-                    TriggerEvent::Update(Vec::new()),
-                    None,
-                    None,
-                    vec![delete_old(), insert_new()],
-                ),
-            ]
-        }
-        Some(predicate) => {
-            let new_predicate = qualify_predicate(predicate, "NEW");
-            let old_predicate = qualify_predicate(predicate, "OLD");
-            vec![
-                trigger(
-                    TriggerEvent::Insert,
-                    None,
-                    Some(new_predicate.clone()),
-                    vec![insert_new()],
-                ),
-                trigger(
-                    TriggerEvent::Delete,
-                    None,
-                    Some(old_predicate.clone()),
-                    vec![delete_old()],
-                ),
-                trigger(
-                    TriggerEvent::Update(Vec::new()),
-                    Some("delete"),
-                    Some(old_predicate),
-                    vec![delete_old()],
-                ),
-                trigger(
-                    TriggerEvent::Update(Vec::new()),
-                    Some("insert"),
-                    Some(new_predicate),
-                    vec![insert_new()],
-                ),
-            ]
-        }
-    }
+    let new_predicate = predicate.map(|predicate| qualify_predicate(predicate, "NEW"));
+    let old_predicate = predicate.map(|predicate| qualify_predicate(predicate, "OLD"));
+    vec![
+        trigger(TriggerEvent::Insert, new_predicate.clone(), insert_new(None)),
+        trigger(TriggerEvent::Delete, old_predicate.clone(), delete_old(None)),
+        trigger(
+            TriggerEvent::Update(Vec::new()),
+            None,
+            [delete_old(old_predicate), insert_new(new_predicate)].concat(),
+        ),
+    ]
 }
 
-/// Generate all FTS5 statements (virtual table + sync triggers + backfill
-/// INSERT).
+/// Generate all FTS5 statements: the keys table of a mapped key, the virtual
+/// table, the sync triggers and the backfill of the rows already present.
 fn create_fts5_statements(
     table_name: &ObjectName,
     columns: &[String],
@@ -360,58 +565,49 @@ fn create_fts5_statements(
             "Could not find table '{base_name}' in schema for FTS5 index creation"
         ))
     })?;
-
-    let pk_columns: Vec<_> = table.primary_key_columns(schema)?.collect();
-    if pk_columns.len() != 1 {
-        return Err(Error::forward_refusal(format!(
-            "FTS5 requires a single-column primary key. Table '{base_name}' has {} primary key columns.",
-            pk_columns.len()
-        )));
-    }
-    let pk_column = pk_columns[0].column_name();
-
-    // FTS5 external content mode uses `content_rowid=` to look up rows by
-    // SQLite rowid. The rowid must be a 64-bit integer alias, so the PK
-    // column must be an integer type. A TEXT or UUID primary key cannot
-    // serve as a rowid and would cause FTS5 reads to silently return empty
-    // or wrong results.
-    let pk_type_str = pk_columns[0].attribute().data_type.to_string().to_uppercase();
-    let is_integer_pk = pk_type_str.contains("INT") || pk_type_str.contains("SERIAL");
-    if !is_integer_pk {
-        return Err(Error::forward_refusal(format!(
-            "FTS5 external content mode requires an INTEGER primary key column for \
-         content_rowid= (table '{base_name}', column '{pk_column}', type '{pk_type_str}'). \
-         FTS5 uses the rowid - a 64-bit integer - to look up rows in the content table. \
-         Use an INTEGER or BIGINT primary key, or add a surrogate INTEGER rowid column."
-        )));
-    }
+    let key = FtsKey::of(table, schema, &base_name)?;
     let trigger_table_name = resolve_trigger_table_name(&base_name, table, schema, options)?;
 
-    let name = |value: &str| ObjectName(vec![ObjectNamePart::Identifier(quoted_ident(value))]);
-    let mut statements =
-        vec![create_fts5_virtual_table(&base_name, &trigger_table_name, pk_column, columns)];
+    let mut statements: Vec<Statement> = key.create_keys_table().into_iter().collect();
+    statements.push(create_fts5_virtual_table(&base_name, &trigger_table_name, &key, columns));
     statements.extend(create_fts5_triggers(
         &trigger_table_name,
         &base_name,
-        pk_column,
+        &key,
         columns,
         predicate,
     ));
 
-    let projection = core::iter::once(Expr::Identifier(quoted_ident(pk_column)))
+    let from_table = |projection: Vec<Expr>| {
+        make_query(
+            None,
+            SetExpr::Select(Box::new(make_simple_select(
+                ast_builder::select_items(projection),
+                from_relation(plain_table_factor(plain_name(&trigger_table_name))),
+                predicate.cloned(),
+            ))),
+        )
+    };
+    statements.extend(key.record(|key_columns| {
+        from_table(
+            key_columns.iter().map(|column| Expr::Identifier(quoted_ident(column))).collect(),
+        )
+    }));
+    let rowid = match &key {
+        FtsKey::Rowid(column) => Expr::Identifier(quoted_ident(column)),
+        FtsKey::Mapped { .. } => key.rowid_of(&quoted_ident(&trigger_table_name)),
+    };
+    let projection = core::iter::once(rowid)
         .chain(columns.iter().map(|column| Expr::Identifier(quoted_ident(column))))
         .collect();
-    let source = make_query(
-        None,
-        SetExpr::Select(Box::new(make_simple_select(
-            ast_builder::select_items(projection),
-            from_relation(plain_table_factor(name(&trigger_table_name))),
-            predicate.cloned(),
-        ))),
-    );
-    let target_columns =
-        core::iter::once(name("rowid")).chain(columns.iter().map(|column| name(column))).collect();
-    statements.push(ast_builder::insert(name(&fts_table_name(&base_name)), target_columns, source));
+    let target_columns = core::iter::once(plain_name("rowid"))
+        .chain(columns.iter().map(|column| plain_name(column)))
+        .collect();
+    statements.push(ast_builder::insert(
+        plain_name(&fts_table_name(&base_name)),
+        target_columns,
+        from_table(projection),
+    ));
 
     Ok(statements)
 }
