@@ -192,9 +192,6 @@ impl PlPgSqlTranslator {
         options: &crate::options::TranslationContext<'_>,
         emit: crate::warnings::WarningSink<'_>,
     ) -> Result<Vec<Statement>, Error> {
-        if facts.removes_derived_writes {
-            crate::impls::derived_writes::without_removed_writes(&mut block, schema, options)?;
-        }
         let mut scope = BodyScope::new(facts);
         Self::open_body(&block, &mut scope, options)?;
         block.statements = without_early_returns(core::mem::take(&mut block.statements));
@@ -2650,7 +2647,7 @@ fn conjunction(conditions: impl Iterator<Item = Expr>) -> Expr {
 }
 
 /// The relations `node` writes, folded, including from inside a `WITH`.
-pub(super) fn written_relations<N: Visit>(node: &N) -> Vec<String> {
+pub(crate) fn written_relations<N: Visit>(node: &N) -> Vec<String> {
     struct Writes(Vec<String>);
 
     impl Writes {

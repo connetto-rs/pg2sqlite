@@ -249,8 +249,8 @@ fn an_exempt_write_fires_no_check() {
 }
 
 #[test]
-fn a_replica_omitting_server_derived_writes_keeps_only_the_refusals() {
-    let options = options().with_server_derived_writes_omitted().with_postgres_major(18);
+fn a_replica_leaving_key_actions_to_the_server_keeps_only_the_refusals() {
+    let options = options().with_server_derived_write_function("derived").with_postgres_major(18);
     let (mut connection, _) = replica_with(
         &script("REFERENCES users (id) ON DELETE CASCADE ON UPDATE RESTRICT"),
         &options,

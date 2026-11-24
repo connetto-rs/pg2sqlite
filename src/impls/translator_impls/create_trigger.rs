@@ -139,7 +139,6 @@ fn maintenance_facts(trigger: &CreateTrigger) -> super::plpgsql::TriggerFacts {
             .map(|ident| ident.value.clone()),
         maintenance_refusal: None,
         after: matches!(trigger.period, Some(TriggerPeriod::After)),
-        removes_derived_writes: false,
         skip_clears: None,
     }
 }
@@ -349,9 +348,10 @@ struct TriggerPart<'a> {
     /// Whether the trigger fires after the write, where PostgreSQL ignores
     /// the row the body returns.
     after: bool,
-    /// Whether the replica leaves the trigger's writes to the server, which
-    /// an `INSTEAD OF` trigger keeps as the view's own.
-    removes_derived_writes: bool,
+    /// The function each statement writing rows runs between calls of, as
+    /// the server derives those rows again. `None` for an `INSTEAD OF`
+    /// trigger, which writes the view's own rows.
+    derived_write_function: Option<&'a str>,
     /// The record table a `RETURN NULL` clears the row's unclaimed records
     /// from.
     skip_clears: Option<ObjectName>,
@@ -381,7 +381,6 @@ fn generate_standard_trigger_body(
         table: crate::impls::object_name::last_ident(table_name).map(|ident| ident.value.clone()),
         maintenance_refusal: refusal.map(|refusal| (function_name.to_string(), refusal.clone())),
         after: part.after,
-        removes_derived_writes: part.removes_derived_writes,
         skip_clears: part.skip_clears.clone(),
     };
     // A definer body runs as its owner, read from the epoch like row-level
@@ -406,7 +405,7 @@ fn generate_standard_trigger_body(
         )?;
         let statements =
             super::definer::run_as_owner(function, owner, translated, schema, options)?;
-        return Ok(Some(begin_end(statements)));
+        return Ok(Some(begin_end(statements, part)));
     }
     // An invoker body a definer body's write fires runs as that body's owner.
     let firing_owners =
@@ -448,13 +447,21 @@ fn generate_standard_trigger_body(
             options,
         )?);
     }
-    Ok(Some(begin_end(statements)))
+    Ok(Some(begin_end(statements, part)))
 }
 
-fn begin_end(statements: Vec<Statement>) -> sqlparser::ast::BeginEndStatements {
+/// The trigger body holding `statements`, each statement writing rows marked
+/// for the server to derive again where `part` asks for it.
+fn begin_end(
+    statements: Vec<Statement>,
+    part: &TriggerPart<'_>,
+) -> sqlparser::ast::BeginEndStatements {
     sqlparser::ast::BeginEndStatements {
         begin_token: crate::impls::ast_builder::keyword_token("BEGIN", Keyword::BEGIN),
-        statements,
+        statements: match part.derived_write_function {
+            Some(function) => crate::impls::derived_writes::marked(statements, function),
+            None => statements,
+        },
         end_token: crate::impls::ast_builder::keyword_token("END", Keyword::END),
     }
 }
@@ -873,8 +880,9 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
                     events: &part_events,
                     guard: guard.as_ref(),
                     after: plain && matches!(period, Some(TriggerPeriod::After)),
-                    removes_derived_writes: options.is_server_derived_writes_omitted()
-                        && !matches!(period, Some(TriggerPeriod::InsteadOf)),
+                    derived_write_function: options
+                        .get_server_derived_write_function()
+                        .filter(|_| !matches!(period, Some(TriggerPeriod::InsteadOf))),
                     skip_clears: (plain
                         && updates
                         && matches!(period, Some(TriggerPeriod::Before)))

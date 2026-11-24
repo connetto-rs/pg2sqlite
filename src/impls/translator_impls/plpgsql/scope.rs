@@ -30,11 +30,6 @@ pub(crate) struct TriggerFacts {
     /// Whether the trigger fires after the write, where PostgreSQL ignores
     /// the row the body returns.
     pub(crate) after: bool,
-    /// Whether the replica leaves the trigger's writes to the server, so the
-    /// body and the helpers it inlines run without the statements
-    /// [`without_removed_writes`](crate::impls::derived_writes::without_removed_writes)
-    /// takes out.
-    pub(crate) removes_derived_writes: bool,
     /// The record table a `RETURN NULL` clears the row's unclaimed records
     /// from.
     pub(crate) skip_clears: Option<sqlparser::ast::ObjectName>,
@@ -353,7 +348,7 @@ impl BodyScope {
     /// An empty scope for the body of the helper `function`, called where
     /// this scope stands, so its statements run under the guards in force
     /// here. The helper sees none of this body's variables, nor the trigger's
-    /// rows, and leaves out the writes the trigger leaves to the server.
+    /// rows.
     pub(crate) fn for_callee(&self, function: String) -> Self {
         let mut inlining = self.inlining.clone();
         inlining.push(function);
@@ -361,10 +356,7 @@ impl BodyScope {
             conditions: self.conditions.clone(),
             writes_under_if: self.writes_under_if.clone(),
             inlining,
-            facts: TriggerFacts {
-                removes_derived_writes: self.facts.removes_derived_writes,
-                ..TriggerFacts::default()
-            },
+            facts: TriggerFacts::default(),
             ..Self::default()
         }
     }

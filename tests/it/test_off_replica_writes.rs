@@ -272,21 +272,13 @@ fn a_write_reaching_a_visible_table_through_a_foreign_key_is_refused() {
 }
 
 #[test]
-fn a_replica_leaving_derived_writes_to_the_server_leaves_their_writes_off() {
+fn a_replica_leaving_key_actions_to_the_server_leaves_their_writes_off() {
     let options = options()
         .with_uuid_representation(pg2sqlite::prelude::UuidRepresentation::Text)
-        .with_server_derived_writes_omitted();
+        .with_server_derived_write_function("derived");
     helpers::apply_with_options(
         &script(
-            "CREATE FUNCTION note_grantee() RETURNS trigger AS $$
-             BEGIN
-                 INSERT INTO kinds VALUES (3, NEW.kind);
-                 RETURN NEW;
-             END;
-             $$ LANGUAGE plpgsql;
-             CREATE TRIGGER grantees_noted AFTER INSERT ON grantees
-                 FOR EACH ROW EXECUTE FUNCTION note_grantee();
-             CREATE TABLE memberships (
+            "CREATE TABLE memberships (
                  id INTEGER PRIMARY KEY,
                  grantee UUID REFERENCES grantees (id) ON DELETE CASCADE
              );
@@ -386,7 +378,7 @@ const ADDED_KEYS: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, author UUI
 fn an_added_foreign_key_into_a_table_left_off_the_replica_leaves_with_it() {
     const ID: &str = "00000000-0000-0000-0000-000000000001";
     let options = options().with_uuid_representation(UuidRepresentation::Text);
-    for options in [options.clone(), options.with_server_derived_writes_omitted()] {
+    for options in [options.clone(), options.with_server_derived_write_function("derived")] {
         let mut connection = helpers::apply_with_options(&script(ADDED_KEYS), &options)
             .expect("the script runs on SQLite");
         diesel::insert_into(notes::table)
@@ -400,7 +392,7 @@ fn an_added_foreign_key_into_a_table_left_off_the_replica_leaves_with_it() {
 fn a_foreign_key_into_a_table_left_off_the_replica_is_not_reported_as_left_to_the_server() {
     let options = options()
         .with_uuid_representation(UuidRepresentation::Text)
-        .with_server_derived_writes_omitted();
+        .with_server_derived_write_function("derived");
     let report = Pg2Sqlite::default()
         .sql(&script(&format!(
             "{ADDED_KEYS}

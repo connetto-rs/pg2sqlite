@@ -1,63 +1,43 @@
 //! The writes the server derives, which a replica syncing its writes to it
-//! leaves out under
-//! [`Pg2SqliteOptions::with_server_derived_writes_omitted`](crate::options::Pg2SqliteOptions::with_server_derived_writes_omitted).
+//! marks under
+//! [`Pg2SqliteOptions::with_server_derived_write_function`](crate::options::Pg2SqliteOptions::with_server_derived_write_function),
+//! and the foreign key actions it leaves to the server there.
 //!
-//! Every reader works on the PostgreSQL source, so a trigger the replica
-//! leaves out is left out before any part of it is translated, and a body
-//! SQLite could not run never stops the translation.
-//!
-//! A trigger that writes rows keeps everything else it does on the replica,
-//! its refusals and its reads, with the write statements taken out. It is
-//! left out whole when it does nothing else, and when what it keeps reads
-//! what a write the server derives produces before it, which the replica
-//! never sees: a later statement of its own, `FOUND` or the row a write
-//! returns, or rows of a table another trigger writes or columns a foreign
-//! key action changes on the same write before it fires. [`rows`] holds a
-//! read and a write to the labels of enum columns they filter or write,
-//! where only disjoint labels prove that they share no row.
+//! Every reader works on the PostgreSQL source, so a body SQLite could not
+//! run never stops the reading.
 
 mod chain;
 mod columns;
 mod firing;
-mod landing;
 mod readers;
-mod rows;
 
-use alloc::{borrow::Cow, collections::BTreeMap};
-use core::{fmt::Write as _, ops::ControlFlow};
+use alloc::borrow::Cow;
 
-pub(crate) use chain::without_removed_writes;
 use columns::Columns;
-pub(crate) use firing::{FiringTrigger, firing_triggers};
-use landing::Landing;
-pub(crate) use landing::output_names;
+pub(crate) use firing::FiringTrigger;
 pub(crate) use readers::reads_left_to_server;
 use sql_traits::{
     structs::ParserDB,
-    traits::{ColumnLike, DatabaseLike, FunctionLike, TableLike},
+    traits::{DatabaseLike, FunctionLike, TableLike},
 };
 use sqlparser::{
     ast::{
-        AssignmentTarget, ColumnDef, ColumnOption, CreateFunction, CreateTrigger, Expr,
-        ForeignKeyConstraint, Ident, Merge, ObjectName, ReferentialAction, Statement, TableFactor,
-        TriggerEvent, TriggerObject, TriggerObjectKind, TriggerPeriod, Visit, Visitor,
+        ColumnDef, ColumnOption, CreateFunction, CreateTrigger, ForeignKeyConstraint,
+        FunctionSecurity, Ident, ObjectName, ReferentialAction, Statement, TriggerEvent,
+        TriggerPeriod,
     },
     dialect::PostgreSqlDialect,
     parser::Parser,
 };
-use sqlparser_plpgsql::embedded::{
-    Block, Branch, Case, If, LoopControl, Node, NodeKind, Open, ReturnQuery,
-};
+use sqlparser_plpgsql::embedded::Block;
 
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
-    history::placement::primary_write_target,
     impls::{
-        batch_cache::address,
-        object_name::{last_ident, last_ident_value_or_display},
-        translator_impls::{off_replica::OffReplica, plpgsql::fold},
+        object_name::last_ident_value_or_display,
+        translator_impls::{off_replica::OffReplica, rls::hiding_policies},
         unlabelled_body::unlabelled_body,
     },
     options::TranslationContext,
@@ -83,269 +63,6 @@ impl Event {
             TriggerEvent::Truncate => Self::Truncate,
         }
     }
-}
-
-/// The columns of its table, folded, to which a write may give a value no
-/// row held before.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Fresh {
-    /// Any column, as a row an `INSERT` or a `MERGE` adds.
-    Every,
-    /// These columns, as an `UPDATE` sets them to anything but themselves.
-    /// None for a `DELETE` or a `TRUNCATE`.
-    Columns(Vec<String>),
-}
-
-impl Fresh {
-    /// The columns `statement` may give new values, run where `variables`
-    /// are the names its function may read as variables, which a bare name
-    /// on the right of an assignment may stand for instead of the column.
-    fn of(statement: &Statement, variables: &[String]) -> Self {
-        match statement {
-            Statement::Update(update) => {
-                let mut columns = Vec::new();
-                for assignment in &update.assignments {
-                    let targets = match &assignment.target {
-                        AssignmentTarget::ColumnName(column) => core::slice::from_ref(column),
-                        AssignmentTarget::Tuple(columns) => columns.as_slice(),
-                    };
-                    for column in targets.iter().filter_map(last_ident) {
-                        let itself = matches!(
-                            &assignment.value,
-                            Expr::Identifier(value)
-                                if fold(value) == fold(column) && !variables.contains(&fold(value))
-                        );
-                        if !itself {
-                            columns.push(fold(column));
-                        }
-                    }
-                }
-                Self::Columns(columns)
-            }
-            Statement::Delete(_) | Statement::Truncate(_) => Self::Columns(Vec::new()),
-            _ => Self::Every,
-        }
-    }
-
-    /// Whether the write may give a row of its table one of the `columns`,
-    /// folded, a value no row held before.
-    fn reaches(&self, columns: &[String]) -> bool {
-        match self {
-            Self::Every => true,
-            Self::Columns(fresh) => fresh.iter().any(|column| columns.contains(column)),
-        }
-    }
-}
-
-/// A statement that writes rows, and the chain of functions that reaches it,
-/// the trigger's own function first.
-#[derive(Clone)]
-pub(crate) struct DerivedWrite {
-    chain: Vec<String>,
-    statement: &'static str,
-    /// The table written, its last name part as written.
-    table: String,
-    /// The table written, its last name part folded.
-    relation: String,
-    /// The rows of the table it writes.
-    rows: rows::Rows,
-    /// The columns it may give new values.
-    fresh: Fresh,
-}
-
-impl DerivedWrite {
-    /// The statement keyword, `INSERT` or `UPDATE` among them.
-    pub(crate) const fn statement(&self) -> &'static str {
-        self.statement
-    }
-
-    /// The events the write sets off on its table.
-    fn events(&self) -> &'static [Event] {
-        match self.statement {
-            "INSERT" => &[Event::Insert],
-            "UPDATE" => &[Event::Update],
-            "DELETE" => &[Event::Delete],
-            "TRUNCATE" => &[Event::Truncate],
-            _ => &[Event::Insert, Event::Update, Event::Delete],
-        }
-    }
-
-    /// The folded table the write writes with each event it sets off there.
-    fn set_off(&self) -> impl Iterator<Item = (&str, Event)> {
-        self.events().iter().map(|&event| (self.relation.as_str(), event))
-    }
-
-    /// The statement and the table it writes, as `INSERT on note_events`.
-    fn statement_on(&self) -> String {
-        format!("{} on {}", self.statement, self.table)
-    }
-
-    /// Why the replica leaves the write to the server.
-    pub(crate) fn reason(&self) -> String {
-        format!(
-            "{} runs {}, which the server runs again when it applies the upload",
-            chain_phrase(&self.chain),
-            self.statement_on()
-        )
-    }
-}
-
-/// The chain of functions `chain` names, as the subject of what the last of
-/// them does: `f()`, or `f() calls g(), which`.
-fn chain_phrase(chain: &[String]) -> String {
-    let mut phrase = String::new();
-    for (depth, function) in chain.iter().enumerate() {
-        let _ = match depth {
-            0 => write!(phrase, "{function}()"),
-            _ => write!(phrase, " calls {function}(), which"),
-        };
-    }
-    phrase
-}
-
-/// Where a statement runs: the chain of functions reaching it, the trigger's
-/// own first, the names the last of them may read as variables, as
-/// [`rows::variables`] gives them, and where its writes land.
-#[derive(Clone, Copy)]
-struct Reach<'c> {
-    chain: &'c [String],
-    variables: &'c [String],
-    landing: Landing<'c>,
-}
-
-/// Collects every statement that writes rows, in body order through nested
-/// blocks, branches and data-modifying `WITH` items, once for each table it
-/// writes.
-struct Writes<'c> {
-    reach: Reach<'c>,
-    found: Vec<DerivedWrite>,
-}
-
-impl Visitor for Writes<'_> {
-    type Break = ();
-
-    fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<()> {
-        let (kind, targets): (_, Vec<&ObjectName>) = match statement {
-            Statement::Insert(_) => {
-                ("INSERT", primary_write_target(statement).into_iter().collect())
-            }
-            Statement::Update(_) => {
-                ("UPDATE", primary_write_target(statement).into_iter().collect())
-            }
-            Statement::Delete(_) => {
-                ("DELETE", primary_write_target(statement).into_iter().collect())
-            }
-            Statement::Merge(Merge { table: TableFactor::Table { name, .. }, .. }) => {
-                ("MERGE", vec![name])
-            }
-            Statement::Truncate(truncate) => {
-                ("TRUNCATE", truncate.table_names.iter().map(|target| &target.name).collect())
-            }
-            _ => return ControlFlow::Continue(()),
-        };
-        for target in targets {
-            self.found.push(DerivedWrite {
-                chain: self.reach.chain.to_vec(),
-                statement: kind,
-                table: last_ident_value_or_display(target),
-                relation: last_ident(target).map_or_else(|| target.to_string(), fold),
-                rows: rows::written(statement, self.reach.variables),
-                fresh: Fresh::of(statement, self.reach.variables),
-            });
-        }
-        ControlFlow::Continue(())
-    }
-}
-
-/// Every write `node` makes itself, run where `reach` says, on the relation
-/// it lands on.
-///
-/// # Errors
-///
-/// Returns the lookup errors reading a view a write goes through runs into.
-fn statement_writes<N: Visit>(node: &N, reach: Reach<'_>) -> Result<Vec<DerivedWrite>, Error> {
-    let mut writes = Writes { reach, found: Vec::new() };
-    let _: ControlFlow<()> = node.visit(&mut writes);
-    writes.found.into_iter().map(|write| reach.landing.land(write)).collect()
-}
-
-/// Adds every write among the PL/pgSQL `nodes` to `writes`, through nested
-/// blocks, their handlers, branches and loops. SQL a body builds at run time
-/// is read by none of them, and [`FunctionLike::referenced_functions`]
-/// refuses it. A cursor's query, an assigned value and a returned value are a
-/// `SELECT` PostgreSQL refuses to write in, and a call they make is read with
-/// the function's other calls.
-fn nodes_writes(
-    nodes: &[Node],
-    reach: Reach<'_>,
-    writes: &mut Vec<DerivedWrite>,
-) -> Result<(), Error> {
-    for node in nodes {
-        match &node.kind {
-            NodeKind::Statement { statement, .. }
-            | NodeKind::Open(Open::Query { query: statement, .. })
-            | NodeKind::Perform { query: statement }
-            | NodeKind::ReturnQuery(ReturnQuery::Query(statement)) => {
-                writes.extend(statement_writes(statement.as_ref(), reach)?);
-            }
-            NodeKind::Block(block) => block_writes(block, reach, writes)?,
-            NodeKind::If(If { branches, otherwise }) => {
-                branches_writes(branches, otherwise, reach, writes)?;
-            }
-            NodeKind::Case(Case { branches, otherwise, .. }) => {
-                branches_writes(branches, otherwise.as_deref().unwrap_or_default(), reach, writes)?;
-            }
-            NodeKind::Loop(repeated) => {
-                if let LoopControl::Query { query, .. } = &repeated.control {
-                    writes.extend(statement_writes(query.as_ref(), reach)?);
-                }
-                nodes_writes(&repeated.statements, reach, writes)?;
-            }
-            NodeKind::Open(Open::Bound(_) | Open::Dynamic { .. })
-            | NodeKind::ReturnQuery(ReturnQuery::Dynamic(_))
-            | NodeKind::Assignment(_)
-            | NodeKind::Dynamic { .. }
-            | NodeKind::Fetch(_)
-            | NodeKind::Move { .. }
-            | NodeKind::Diagnostics(_)
-            | NodeKind::Close { .. }
-            | NodeKind::Commit { .. }
-            | NodeKind::Rollback { .. }
-            | NodeKind::Exit(_)
-            | NodeKind::Return { .. }
-            | NodeKind::ReturnNext { .. }
-            | NodeKind::Raise(_)
-            | NodeKind::Assert(_) => {}
-        }
-    }
-    Ok(())
-}
-
-/// Adds the writes in the `WHEN` or `ELSIF` `branches`, then in `otherwise`.
-/// A `CASE` without `ELSE` passes no statements there, since PostgreSQL runs
-/// none and raises `case_not_found` when no branch holds.
-fn branches_writes(
-    branches: &[Branch],
-    otherwise: &[Node],
-    reach: Reach<'_>,
-    writes: &mut Vec<DerivedWrite>,
-) -> Result<(), Error> {
-    for branch in branches {
-        nodes_writes(&branch.statements, reach, writes)?;
-    }
-    nodes_writes(otherwise, reach, writes)
-}
-
-fn block_writes(
-    block: &Block,
-    reach: Reach<'_>,
-    writes: &mut Vec<DerivedWrite>,
-) -> Result<(), Error> {
-    nodes_writes(&block.statements, reach, writes)?;
-    for handler in &block.handlers {
-        nodes_writes(&handler.statements, reach, writes)?;
-    }
-    Ok(())
 }
 
 /// Whether PostgreSQL provides `function` itself, which writes no row of the
@@ -404,188 +121,8 @@ pub(crate) fn parsed_body<'f>(
     }
 }
 
-/// Adds every write `function` runs to `writes`, in its own body and then in
-/// the functions it calls, each reached through `chain` and then `function`.
-/// `visited` holds the functions already read, so a recursive helper is read
-/// once. A body whose calls cannot be read, SQL it builds at run time among
-/// the reasons, is refused only when no write was found before it.
-fn function_writes<'db>(
-    function: &'db CreateFunction,
-    landing: Landing<'db>,
-    visited: &mut Vec<&'db CreateFunction>,
-    chain: &mut Vec<String>,
-    writes: &mut Vec<DerivedWrite>,
-) -> Result<(), Error> {
-    if is_builtin(function) || visited.iter().any(|seen| core::ptr::eq(*seen, function)) {
-        return Ok(());
-    }
-    visited.push(function);
-    chain.push(function.name().to_owned());
-    let schema = landing.schema;
-    match parsed_body(function, schema)? {
-        Body::PlPgSql(block) => {
-            let variables = rows::variables(function, &block);
-            block_writes(&block, Reach { chain, variables: &variables, landing }, writes)?;
-        }
-        Body::Sql(statements) => {
-            for statement in statements.iter() {
-                writes
-                    .extend(statement_writes(statement, Reach { chain, variables: &[], landing })?);
-            }
-        }
-    }
-    match function.referenced_functions(schema) {
-        Ok(called) => {
-            for called in called {
-                function_writes(called, landing, visited, chain, writes)?;
-            }
-        }
-        Err(error) if writes.is_empty() => return Err(error.into()),
-        Err(_) => {}
-    }
-    chain.pop();
-    Ok(())
-}
-
-/// The writes functions run, by the addresses of the schema they are read
-/// against and of the function, each reached through no function before it.
-#[derive(Default, Clone)]
-pub(crate) struct FunctionWrites(BTreeMap<(usize, usize), Vec<DerivedWrite>>);
-
-impl FunctionWrites {
-    /// Forgets every write kept, which the triggers firing around them landed.
-    pub(crate) fn clear(&mut self) {
-        self.0.clear();
-    }
-}
-
-/// Every write `function` runs, as [`function_writes`] adds them to no write
-/// found before, each reached through `chain` and then `function`. The writes
-/// are kept for the batch when it holds the schema, so a function many
-/// triggers and helpers call is read once.
-fn writes_of<'db>(
-    function: &'db CreateFunction,
-    landing: Landing<'db>,
-    chain: &[String],
-) -> Result<Vec<DerivedWrite>, Error> {
-    let key = (address(landing.schema), address(function));
-    let kept = landing.cache.borrow().function_writes.0.get(&key).cloned();
-    let mut writes = if let Some(kept) = kept {
-        kept
-    } else {
-        let mut writes = Vec::new();
-        function_writes(function, landing, &mut Vec::new(), &mut Vec::new(), &mut writes)?;
-        let mut cache = landing.cache.borrow_mut();
-        if cache.holds(key.0) {
-            cache.function_writes.0.insert(key, writes.clone());
-        }
-        writes
-    };
-    for write in &mut writes {
-        write.chain.splice(0..0, chain.iter().cloned());
-    }
-    Ok(writes)
-}
-
-/// What the replica does with a trigger when it omits the writes the server
-/// derives.
-pub(crate) enum Disposition {
-    /// The trigger writes no rows and reads none the server derives before
-    /// it, so the replica keeps it as it is.
-    Kept,
-    /// The replica keeps the trigger without these writes, which the server
-    /// runs again when it applies the upload.
-    Stripped(Vec<DerivedWrite>),
-    /// The replica leaves the trigger to the server, for this reason.
-    LeftOut(String),
-}
-
-/// What the replica does with `trigger` when it omits the writes the server
-/// derives.
-///
-/// An `INSTEAD OF` trigger is kept, since its writes are the view's own. The
-/// replica uploads the rows it writes as the caller's, and the server applying
-/// them to the tables never fires it. A trigger whose function the schema
-/// does not hold is kept too, for its translation to refuse.
-///
-/// # Errors
-///
-/// Refuses a trigger whose function chain cannot be read, and one building
-/// SQL at run time.
-pub(crate) fn trigger_disposition(
-    trigger: &CreateTrigger,
-    schema: &ParserDB,
-    options: &TranslationContext<'_>,
-) -> Result<Disposition, Error> {
-    if matches!(trigger.period, Some(TriggerPeriod::InsteadOf)) {
-        return Ok(Disposition::Kept);
-    }
-    let Some((function, mut chain)) = trigger_chain(trigger, schema, options)? else {
-        return Ok(Disposition::Kept);
-    };
-    chain_disposition(trigger, function, &mut chain, schema, options)
-}
-
-/// What the replica does with `trigger`, whose `function` does what `chain`
-/// holds, taking the writes it leaves to the server out of `chain`.
-///
-/// # Errors
-///
-/// As [`trigger_disposition`].
-fn chain_disposition(
-    trigger: &CreateTrigger,
-    function: &CreateFunction,
-    chain: &mut chain::Chain,
-    schema: &ParserDB,
-    options: &TranslationContext<'_>,
-) -> Result<Disposition, Error> {
-    if let Some(first) = chain.writes.first() {
-        if let Some(index) = chain.inseparable {
-            return Ok(Disposition::LeftOut(format!(
-                "{}, inside a statement the trigger keeps",
-                chain.writes[index].reason()
-            )));
-        }
-        if !chain.residue || chain.unreadable.is_some() {
-            return Ok(Disposition::LeftOut(first.reason()));
-        }
-        if let Some(dependency) = chain.dependency.take() {
-            return Ok(Disposition::LeftOut(dependency));
-        }
-        if let Some(dependency) = firing::own_dependency(trigger, chain, schema, options)? {
-            return Ok(Disposition::LeftOut(dependency));
-        }
-        if let Some(construct) = chain.procedural {
-            return Ok(Disposition::LeftOut(format!(
-                "{}, beside {construct}, which the replica cannot keep without the write",
-                first.reason()
-            )));
-        }
-        if !chain.assigned.is_empty() {
-            return Ok(Disposition::LeftOut(format!(
-                "{}() assigns NEW beside {}, which the server runs again when it applies the \
-                 upload",
-                function.name(),
-                first.statement_on()
-            )));
-        }
-    }
-    if let Some(error) = chain.unreadable.take() {
-        return Err(error);
-    }
-    if let Some(dependency) = firing::fired_dependency(trigger, chain, schema, options)? {
-        return Ok(Disposition::LeftOut(dependency));
-    }
-    Ok(if chain.writes.is_empty() {
-        Disposition::Kept
-    } else {
-        Disposition::Stripped(core::mem::take(&mut chain.writes))
-    })
-}
-
-/// The function `trigger` runs and what it does as the replica reads it,
-/// every write kept for an `INSTEAD OF` trigger, which the replica keeps
-/// whole, or `None` when the schema does not hold the function.
+/// The function `trigger` runs and what it does, or `None` when the schema
+/// does not hold the function.
 ///
 /// # Errors
 ///
@@ -599,25 +136,88 @@ fn trigger_chain<'s>(
     let Some(function) = written_function(schema, &exec_body.func_desc.name)? else {
         return Ok(None);
     };
-    if matches!(trigger.period, Some(TriggerPeriod::InsteadOf)) {
-        return Ok(Some((function, chain::Walker::read_whole(function, schema, options)?)));
-    }
-    let events: Vec<Event> = trigger.events.iter().map(Event::of).collect();
-    // PostgreSQL ignores what a statement trigger returns.
-    let before = (matches!(trigger.period, Some(TriggerPeriod::Before)) && is_per_row(trigger))
-        .then_some(events.as_slice());
-    Ok(Some((function, chain::Walker::read(function, before, schema, options)?)))
+    Ok(Some((function, chain::Walker::read(function, schema, options)?)))
 }
 
-/// Whether `trigger` fires for each row rather than once for the statement.
-fn is_per_row(trigger: &CreateTrigger) -> bool {
-    matches!(
-        trigger.trigger_object,
-        Some(
-            TriggerObjectKind::For(TriggerObject::Row)
-                | TriggerObjectKind::ForEach(TriggerObject::Row)
-        )
-    )
+/// Why the replica leaves `trigger` to the server, or `None` when it keeps
+/// it: what a statement its function chain runs finds decides a branch, a
+/// raise, an assigned or returned value, or `FOUND`, and the statement
+/// reads, as the owner of a `SECURITY DEFINER` function in the chain, a
+/// table the replica holds whose policies may hide rows from the acting
+/// role. The owner reads past those policies on the server, while the
+/// replica holds only the rows the acting role reads, so the trigger would
+/// judge the write on a partial copy. A read that only picks the rows a
+/// write changes or inserts runs on the rows the replica holds, and the
+/// rows the server writes besides arrive with the sync.
+///
+/// An `INSTEAD OF` trigger is kept, since its writes are the view's own and
+/// the server applying them never fires it, and so is every trigger when no
+/// acting role is named. A read under the trigger's `WHEN` or by an invoker
+/// body sees what PostgreSQL shows the acting role.
+///
+/// # Errors
+///
+/// Fails as [`chain::Walker::read`] and [`hiding_policies`] do.
+pub(crate) fn definer_hidden_read(
+    trigger: &CreateTrigger,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<Option<String>, Error> {
+    if matches!(trigger.period, Some(TriggerPeriod::InsteadOf))
+        || options.get_acting_role().is_none()
+        || !schema.functions().any(|function| function.security_mode() == FunctionSecurity::Definer)
+    {
+        return Ok(None);
+    }
+    let Some((_, chain)) = trigger_chain(trigger, schema, options)? else { return Ok(None) };
+    for read in chain.reads.iter().filter(|read| read.decides) {
+        let Some(definer) = read.definer else { continue };
+        let Some(table) = schema.tables().find(|table| table.stored_table_name() == read.relation)
+        else {
+            continue;
+        };
+        if OffReplica::of(&table.name, schema, options)?.is_some() {
+            continue;
+        }
+        let Some(policies) = hiding_policies(table, schema, options)? else { continue };
+        let reader = read.through.last().map_or("", String::as_str);
+        let callers: Vec<String> =
+            read.through.iter().rev().skip(1).map(|function| format!("{function}()")).collect();
+        let via = if callers.is_empty() {
+            String::new()
+        } else {
+            format!(", called through {},", callers.join(", "))
+        };
+        let hidden = if policies.is_empty() {
+            format!("no policy lets the acting role read a row of {}", read.relation)
+        } else {
+            format!(
+                "{} may hide rows of {} from the acting role",
+                policies.join(", "),
+                read.relation
+            )
+        };
+        return Ok(Some(format!(
+            "{reader}(){via} reads {} as the owner of SECURITY DEFINER {}(), past row-level \
+             security, and {hidden}, whose rows alone the replica holds",
+            read.relation, read.through[definer]
+        )));
+    }
+    Ok(None)
+}
+
+/// The warning for `trigger`, which the replica leaves to the server for
+/// `reason`.
+pub(crate) fn trigger_left_to_server(
+    trigger: &CreateTrigger,
+    reason: String,
+) -> TranslationWarning {
+    TranslationWarning::LeftToServer {
+        construct: "TRIGGER".to_owned(),
+        name: last_ident_value_or_display(&trigger.name),
+        table: last_ident_value_or_display(&trigger.table_name),
+        reason,
+    }
 }
 
 /// What a row trigger does that another trigger firing on the same write can
@@ -645,7 +245,7 @@ impl Footprint {
     ///
     /// # Errors
     ///
-    /// Fails as [`chain::Walker::read_whole`] does.
+    /// Fails as [`chain::Walker::read`] does.
     pub(crate) fn of(
         trigger: &CreateTrigger,
         schema: &ParserDB,
@@ -659,14 +259,14 @@ impl Footprint {
             .flatten();
         // Translation refuses a trigger whose function the schema lacks first.
         let Some(function) = function else { return Ok(Self::unread()) };
-        let mut chain = chain::Walker::read_whole(function, schema, options)?;
+        let mut chain = chain::Walker::read(function, schema, options)?;
         if let Some(condition) = &trigger.condition {
             chain::record_reads(condition, &mut Columns::none(), &mut chain.new);
         }
         Ok(Self {
             new: chain.new,
-            writes: !chain.writes.is_empty() || chain.unreadable.is_some(),
-            reads: chain.steps.iter().any(|step| matches!(step, chain::Step::Read { .. })),
+            writes: chain.writes || chain.unreadable.is_some(),
+            reads: !chain.reads.is_empty(),
         })
     }
 
@@ -686,32 +286,6 @@ impl Footprint {
     }
 }
 
-/// The trigger warning for `trigger`, left out because of `reason`.
-pub(crate) fn trigger_left_to_server(
-    trigger: &CreateTrigger,
-    reason: String,
-) -> TranslationWarning {
-    TranslationWarning::LeftToServer {
-        construct: "TRIGGER".to_owned(),
-        name: last_ident_value_or_display(&trigger.name),
-        table: last_ident_value_or_display(&trigger.table_name),
-        reason,
-    }
-}
-
-/// The warning for `write`, which the replica takes out of `trigger`.
-pub(crate) fn write_left_to_server(
-    trigger: &CreateTrigger,
-    write: &DerivedWrite,
-) -> TranslationWarning {
-    TranslationWarning::LeftToServer {
-        construct: format!("{} in TRIGGER", write.statement()),
-        name: last_ident_value_or_display(&trigger.name),
-        table: last_ident_value_or_display(&trigger.table_name),
-        reason: write.reason(),
-    }
-}
-
 fn action_writes_rows(action: Option<ReferentialAction>) -> Option<ReferentialAction> {
     action.filter(|action| {
         matches!(
@@ -721,127 +295,21 @@ fn action_writes_rows(action: Option<ReferentialAction>) -> Option<ReferentialAc
     })
 }
 
-/// The rows the server writes, and the replica does not, when it applies an
-/// insert or an update firing a trigger whose writes the replica leaves out.
-#[derive(Clone, Debug)]
-pub(crate) struct ServerRows {
-    /// The trigger, its last name part as written.
-    name: String,
-    /// The trigger, as the server fires it.
-    trigger: FiringTrigger,
-    /// Each table the rows go into, folded, with the columns of those rows
-    /// that may hold values no row held before.
-    written: Vec<(String, Fresh)>,
-}
-
-impl ServerRows {
-    /// The rows the server writes for `trigger`: those its function writes,
-    /// and those its writes set off in turn. `None` when it fires on neither
-    /// an insert nor an update, or writes no row a key could reference.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the function or a trigger set off cannot be read.
-    pub(crate) fn of(
-        trigger: &CreateTrigger,
-        schema: &ParserDB,
-        options: &TranslationContext<'_>,
-    ) -> Result<Option<Self>, Error> {
-        let Some(fired) = FiringTrigger::of(trigger)
-            .filter(|fired| fired.fires_on(Event::Insert) || fired.fires_on(Event::Update))
-        else {
-            return Ok(None);
-        };
-        let written: Vec<(String, Fresh)> =
-            firing::with_set_off(fired.writes(Landing::new(schema, options))?, schema, options)?
-                .into_iter()
-                .filter(|write| write.fresh != Fresh::Columns(Vec::new()))
-                .map(|write| (write.relation, write.fresh))
-                .collect();
-        Ok((!written.is_empty()).then(|| {
-            Self { name: last_ident_value_or_display(&trigger.name), trigger: fired, written }
-        }))
-    }
-
-    /// The trigger, as the server fires it.
-    pub(crate) const fn trigger(&self) -> &FiringTrigger {
-        &self.trigger
-    }
-}
-
-/// The trigger on `table` that leaves to the server the rows `key` references,
-/// as [`ServerRows`] holds them, or `None` when none does. A key naming no
-/// columns references the primary key of its table.
-fn referenced_rows_left_to_server<'o>(
-    key: &ForeignKeyConstraint,
-    table: &ObjectName,
-    schema: &ParserDB,
-    options: &'o TranslationContext<'_>,
-) -> Result<Option<&'o str>, Error> {
-    let host = last_ident(table).map(fold);
-    let referenced = last_ident(&key.foreign_table).map(fold);
-    let mut triggers = options
-        .server_rows()
-        .iter()
-        .filter(|rows| {
-            host.as_deref() == Some(rows.trigger.table())
-                && rows.written.iter().any(|(relation, _)| Some(relation) == referenced.as_ref())
-        })
-        .peekable();
-    if triggers.peek().is_none() {
-        return Ok(None);
-    }
-    let columns = referenced_columns(key, referenced.as_deref(), schema)?;
-    Ok(triggers
-        .find(|rows| {
-            rows.written.iter().any(|(relation, fresh)| {
-                Some(relation) == referenced.as_ref() && fresh.reaches(&columns)
-            })
-        })
-        .map(|rows| rows.name.as_str()))
-}
-
-/// The columns `key` references in `referenced`, its table, folded: those it
-/// names, or else the primary key of the table.
-fn referenced_columns(
-    key: &ForeignKeyConstraint,
-    referenced: Option<&str>,
-    schema: &ParserDB,
-) -> Result<Vec<String>, Error> {
-    if !key.referred_columns.is_empty() {
-        return Ok(key.referred_columns.iter().map(fold).collect());
-    }
-    schema
-        .tables()
-        .find(|declared| Some(declared.stored_table_name().as_ref()) == referenced)
-        .map(|declared| {
-            declared
-                .primary_key_columns(schema)
-                .map(|columns| columns.map(|column| column.column_name().to_owned()).collect())
-        })
-        .transpose()
-        .map(Option::unwrap_or_default)
-        .map_err(Into::into)
-}
-
 /// Reports and answers `true` when the replica leaves out `key`, declared on
 /// `table` over `columns` and named `name`: every key under
 /// [`Pg2SqliteOptions::with_foreign_keys_omitted`](crate::options::Pg2SqliteOptions::with_foreign_keys_omitted),
-/// else one whose actions write child rows the server writes itself, or
-/// whose referenced rows come from a trigger on `table` whose writes the
-/// replica leaves to the server. A key into a table left off the replica
-/// answers `false`, since it leaves with that table unreported.
+/// else one whose actions write child rows the server writes itself under
+/// [`Pg2SqliteOptions::with_server_derived_write_function`](crate::options::Pg2SqliteOptions::with_server_derived_write_function).
+/// A key into a table left off the replica answers `false`, since it leaves
+/// with that table unreported.
 ///
 /// The key goes whole. Kept as `NO ACTION` it would refuse an offline delete
 /// of a parent whose children the server removes, which the replica still
-/// holds until the server's changes reach it. Kept beside a trigger left to
-/// the server, it would refuse every write of `table` the trigger lets
-/// PostgreSQL accept, since the replica never holds the row it references.
+/// holds until the server's changes reach it.
 ///
 /// # Errors
 ///
-/// Fails as [`OffReplica::of`] does, and when the primary key of the table
-/// `key` references cannot be read.
+/// Fails as [`OffReplica::of`] does.
 pub(crate) fn foreign_key_left_to_server(
     key: &ForeignKeyConstraint,
     name: Option<&Ident>,
@@ -851,7 +319,7 @@ pub(crate) fn foreign_key_left_to_server(
     options: &TranslationContext<'_>,
     emit: WarningSink<'_>,
 ) -> Result<bool, Error> {
-    let Some(reason) = reason_left_to_server(key, table, schema, options)? else {
+    let Some(reason) = reason_left_to_server(key, options) else {
         return Ok(false);
     };
     if OffReplica::of(&key.foreign_table, schema, options)?.is_some() {
@@ -884,24 +352,20 @@ fn key_name(key: &ForeignKeyConstraint, name: Option<&Ident>, columns: &[Ident])
     )
 }
 
-/// Why the replica leaves `key`, declared on `table`, to the server, or
-/// `None` when it keeps the key.
+/// Why the replica leaves `key` to the server, or `None` when it keeps the
+/// key.
 fn reason_left_to_server(
     key: &ForeignKeyConstraint,
-    table: &ObjectName,
-    schema: &ParserDB,
     options: &TranslationContext<'_>,
-) -> Result<Option<String>, Error> {
+) -> Option<String> {
     if options.is_foreign_keys_omitted() {
-        return Ok(Some(
+        return Some(
             "the replica holds a partial copy of the rows, so the server checks every foreign key \
              and runs its actions when it applies the upload"
                 .to_owned(),
-        ));
+        );
     }
-    if !options.is_server_derived_writes_omitted() {
-        return Ok(None);
-    }
+    options.get_server_derived_write_function()?;
     let actions: Vec<String> = [
         ("ON DELETE", action_writes_rows(key.on_delete)),
         ("ON UPDATE", action_writes_rows(key.on_update)),
@@ -909,20 +373,13 @@ fn reason_left_to_server(
     .into_iter()
     .filter_map(|(clause, action)| action.map(|action| format!("{clause} {action}")))
     .collect();
-    if !actions.is_empty() {
+    (!actions.is_empty()).then(|| {
         let verb = if actions.len() == 1 { "writes" } else { "write" };
-        return Ok(Some(format!(
+        format!(
             "its {} {verb} rows the server writes itself when it applies the upload",
             actions.join(" and ")
-        )));
-    }
-    let referenced = last_ident_value_or_display(&key.foreign_table);
-    Ok(referenced_rows_left_to_server(key, table, schema, options)?.map(|trigger| {
-        format!(
-            "the {referenced} rows it references come from TRIGGER {trigger}, whose writes the \
-             server runs when it applies the upload"
         )
-    }))
+    })
 }
 
 /// `column` without the `REFERENCES` options the replica leaves to the
@@ -938,7 +395,7 @@ pub(crate) fn column_without_keys_left_to_server(
     options: &TranslationContext<'_>,
     emit: WarningSink<'_>,
 ) -> Result<Option<ColumnDef>, Error> {
-    if !options.is_server_derived_writes_omitted() && !options.is_foreign_keys_omitted() {
+    if options.get_server_derived_write_function().is_none() && !options.is_foreign_keys_omitted() {
         return Ok(None);
     }
     let mut kept: Option<Vec<_>> = None;
@@ -962,4 +419,34 @@ pub(crate) fn column_without_keys_left_to_server(
     Ok(kept.map(|options| {
         ColumnDef { name: column.name.clone(), data_type: column.data_type.clone(), options }
     }))
+}
+
+/// `statements`, a trigger body, with each run of consecutive statements
+/// writing rows between `SELECT function(1)` and `SELECT function(-1)`.
+pub(crate) fn marked(statements: Vec<Statement>, function: &str) -> Vec<Statement> {
+    let call = |step: i64| {
+        crate::impls::ast_builder::select_expression_statement(
+            crate::impls::function_helpers::simple_function_expr(
+                function,
+                vec![crate::impls::function_helpers::integer_literal(step)],
+                None,
+            ),
+            None,
+        )
+    };
+    let mut marked = Vec::with_capacity(statements.len() + 2);
+    let mut open = false;
+    for statement in statements {
+        let writes =
+            matches!(statement, Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_));
+        if writes != open {
+            marked.push(call(if writes { 1 } else { -1 }));
+            open = writes;
+        }
+        marked.push(statement);
+    }
+    if open {
+        marked.push(call(-1));
+    }
+    marked
 }

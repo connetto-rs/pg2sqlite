@@ -22,7 +22,7 @@
 //! names that major.
 //! A `NO ACTION` key declared `DEFERRABLE INITIALLY DEFERRED` queues that
 //! check for the commit, as a deferred constraint trigger does. Under
-//! [`with_server_derived_writes_omitted`](crate::options::Pg2SqliteOptions::with_server_derived_writes_omitted)
+//! [`with_server_derived_write_function`](crate::options::Pg2SqliteOptions::with_server_derived_write_function)
 //! the actions writing referencing rows are the server's, and only the
 //! refusals stay.
 //!
@@ -408,7 +408,7 @@ fn referenced_side(
         referenced: names.parent.clone(),
         policies,
     });
-    if !options.is_server_derived_writes_omitted() {
+    if options.get_server_derived_write_function().is_none() {
         refuse_cycle(key, schema, options)?;
     }
     let parts = Parts::of(key, written, options, rename)?;
@@ -425,7 +425,7 @@ fn referenced_side(
     let mut statements = Vec::new();
     let mut queued = Vec::new();
     for (event, action) in key.actions() {
-        if writes_rows(action) && options.is_server_derived_writes_omitted() {
+        if writes_rows(action) && options.get_server_derived_write_function().is_some() {
             continue;
         }
         let body = match action {

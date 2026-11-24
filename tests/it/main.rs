@@ -64,6 +64,7 @@ mod test_deferrable_constraints;
 mod test_deferred_constraint_trigger;
 mod test_definer_exemption_follow;
 mod test_definer_helper_inlining;
+mod test_definer_hidden_reads;
 mod test_definer_read_hidden_table;
 mod test_definer_writes_as_owner;
 mod test_delete_using;
