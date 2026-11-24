@@ -227,6 +227,9 @@ pub(crate) struct PrewalkCatalogs {
     fts_indexes: Vec<(String, String)>,
     declared_object_names: Vec<String>,
     trigger_function_names: Vec<String>,
+    /// The names of the triggers the replica leaves to the server, which
+    /// never reach SQLite.
+    left_out_trigger_names: Vec<String>,
     /// The folded table and trigger names of the row triggers sharing a
     /// table, timing and event with another, whose `WHEN` moves into the body
     /// so the slot can run them as one SQLite trigger.
@@ -1104,6 +1107,18 @@ impl<'a> TranslationContext<'a> {
         self.catalogs.shared_slot_triggers.contains(key)
     }
 
+    /// Registers `name` as a trigger the replica leaves to the server.
+    pub(crate) fn add_left_out_trigger_name(&mut self, name: &str) {
+        self.catalogs.to_mut().left_out_trigger_names.push(name.to_owned());
+    }
+
+    /// Returns whether the replica leaves the trigger named `name`, the last
+    /// part of its name as written, to the server.
+    #[must_use]
+    pub(crate) fn is_left_out_trigger_name(&self, name: &str) -> bool {
+        self.catalogs.left_out_trigger_names.iter().any(|left| left == name)
+    }
+
     pub(crate) fn add_before_row_trigger_fn(
         &mut self,
         table_name: TableKey,
@@ -1251,7 +1266,7 @@ impl<'a> TranslationContext<'a> {
     }
 
     /// The name of a trigger `table` carries that fires on an event `fires`
-    /// accepts.
+    /// accepts, among those the replica does not leave to the server.
     pub(crate) fn trigger_firing(
         &self,
         table: &TableKey,
@@ -1260,7 +1275,11 @@ impl<'a> TranslationContext<'a> {
         self.catalogs
             .table_triggers
             .iter()
-            .find(|trigger| trigger.table == *table && trigger.events.iter().any(&fires))
+            .find(|trigger| {
+                trigger.table == *table
+                    && trigger.events.iter().any(&fires)
+                    && !self.is_left_out_trigger_name(&trigger.name)
+            })
             .map(|trigger| trigger.name.as_str())
     }
 

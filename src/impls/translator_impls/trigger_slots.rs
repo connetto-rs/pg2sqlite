@@ -294,19 +294,23 @@ impl Roster {
 
 /// The triggers that share a slot with another row trigger at some statement
 /// of the batch, by folded table and trigger name, counting the triggers
-/// `initial` already holds. One `maintains` accepts assigns `NEW`, so that
-/// it frames its table's `AFTER UPDATE` triggers.
+/// `initial` already holds. A trigger `kept` refuses never reaches SQLite and
+/// joins no slot, and one `maintains` accepts assigns `NEW`, so that it
+/// frames its table's `AFTER UPDATE` triggers.
 pub(crate) fn shared_slot_triggers<'a>(
     initial: impl IntoIterator<Item = &'a CreateTrigger>,
     statements: &[Statement],
+    kept: impl Fn(&CreateTrigger) -> bool,
     maintains: impl Fn(&CreateTrigger) -> bool,
 ) -> BTreeSet<(TableKey, String)> {
     let mut roster = Roster::default();
     let mut constraints = Roster::default();
     let mut maintainers = BTreeSet::new();
     let mut shared = BTreeSet::new();
-    let initial: Vec<&CreateTrigger> =
-        initial.into_iter().filter(|t| is_slotted(t) || is_constraint_row(t)).collect();
+    let initial: Vec<&CreateTrigger> = initial
+        .into_iter()
+        .filter(|t| (is_slotted(t) || is_constraint_row(t)) && kept(t))
+        .collect();
     for trigger in &initial {
         let into = if is_slotted(trigger) { &mut roster } else { &mut constraints };
         into.triggers.insert(trigger_key(trigger), (*trigger).clone());
@@ -346,6 +350,9 @@ pub(crate) fn shared_slot_triggers<'a>(
                 roster.triggers.remove(&key);
                 constraints.triggers.remove(&key);
                 maintainers.remove(&key);
+                if !kept(trigger) {
+                    continue;
+                }
                 if is_slotted(trigger) {
                     roster.triggers.insert(key.clone(), trigger.clone());
                     roster.mark_shared(trigger, &mut shared);

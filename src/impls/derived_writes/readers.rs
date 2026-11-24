@@ -1,12 +1,13 @@
-//! The constructs the replica keeps that read what a foreign key action it
-//! leaves to the server changes.
+//! The constructs the replica keeps that read what it leaves the server to
+//! write: a foreign key action, and the statements of a trigger it leaves to
+//! the server whole.
 //!
-//! Until the server's rows reach it, the replica holds the rows such an
-//! action changes as they were before it. A construct the replica keeps that
-//! reads them admits or refuses a later write, or shows a row, on those rows
-//! where the server decides on the rows the action leaves: a policy of any
-//! command, a `CHECK`, a trigger, a unique key or index and a foreign key,
-//! each reading the table itself or through the functions it calls.
+//! Until the server's rows reach it, the replica holds the rows such a write
+//! changes as they were before it. A construct the replica keeps that reads
+//! them admits or refuses a later write, or shows a row, on those rows where
+//! the server decides on the rows the write leaves: a policy of any command,
+//! a `CHECK`, a trigger, a unique key or index and a foreign key, each
+//! reading the table itself or through the functions it calls.
 
 use alloc::{borrow::Cow, collections::BTreeSet};
 
@@ -25,6 +26,7 @@ use super::{
     Event, action_writes_rows,
     chain::{Chain, Read, Walker, helpers, record_reads},
     columns::{Columns, columns_read, row_columns_read},
+    definer_hidden_read,
     firing::live_triggers,
     foreign_key_left_to_server, key_name, trigger_chain,
 };
@@ -45,16 +47,19 @@ use crate::{
     warnings::TranslationWarning,
 };
 
-/// A foreign key whose action the replica leaves to the server, named as
-/// [`TranslationWarning::LeftToServer`] names it.
+/// A foreign key whose action, or a trigger whose statements, the replica
+/// leaves to the server, named as [`TranslationWarning::LeftToServer`] names
+/// it.
 #[derive(Clone, PartialEq, Eq)]
 struct Writer {
+    /// `"FOREIGN KEY"` or `"TRIGGER"`.
+    construct: &'static str,
     name: String,
     /// The table it is declared on, as written.
     table: String,
 }
 
-/// The writes one foreign key action leaves to the server on one table.
+/// The writes one writer leaves to the server on one table.
 struct Omitted {
     writer: Writer,
     /// The table written, folded.
@@ -80,6 +85,9 @@ type Triggers<'a> = [Cow<'a, CreateTrigger>];
 struct ReadTrigger<'a> {
     trigger: &'a CreateTrigger,
     run: Option<(&'a CreateFunction, Chain)>,
+    /// Whether the replica leaves the trigger to the server, since a
+    /// definer body it runs reads rows the acting role may not.
+    left_out: bool,
 }
 
 /// Reads each trigger of `triggers` on a table the replica holds.
@@ -93,17 +101,22 @@ fn read_triggers<'a>(
         if OffReplica::of(&trigger.table_name, schema, options)?.is_some() {
             continue;
         }
-        read.push(ReadTrigger { trigger, run: trigger_chain(trigger, schema, options)? });
+        read.push(ReadTrigger {
+            trigger,
+            run: trigger_chain(trigger, schema, options)?,
+            left_out: definer_hidden_read(trigger, schema, options)?.is_some(),
+        });
     }
     Ok(read)
 }
 
 /// A [`TranslationWarning::ReadsLeftToServer`] for each construct the replica
 /// keeps on `schema`, the schema `statements` leave on `initial`, and each
-/// foreign key whose action it leaves to the server that changes what the
-/// construct reads, none unless the replica leaves those actions or every
-/// foreign key out. A pair `initial` already holds is reported by the
-/// translation that brought it.
+/// writer it leaves to the server that changes what the construct reads: a
+/// foreign key action where the replica leaves those actions or every
+/// foreign key out, and a trigger the replica leaves to the server whole. A
+/// pair `initial` already holds is reported by the translation that brought
+/// it.
 ///
 /// # Errors
 ///
@@ -115,7 +128,7 @@ pub(crate) fn reads_left_to_server(
     statements: &[Statement],
     options: &TranslationContext<'_>,
 ) -> Result<Vec<TranslationWarning>, Error> {
-    if options.get_server_derived_write_function().is_none() && !options.is_foreign_keys_omitted() {
+    if !leaves_key_actions(options) && options.get_acting_role().is_none() {
         return Ok(Vec::new());
     }
     let triggers = live_triggers(initial.into_iter().flat_map(DatabaseLike::triggers), statements);
@@ -131,18 +144,25 @@ pub(crate) fn reads_left_to_server(
     Ok(warnings)
 }
 
-/// Every pair of a kept construct and a foreign key whose action changes
-/// what it reads, in the order `schema` holds the keys.
+/// Whether the replica leaves foreign key actions writing rows to the server.
+fn leaves_key_actions(options: &TranslationContext<'_>) -> bool {
+    options.get_server_derived_write_function().is_some() || options.is_foreign_keys_omitted()
+}
+
+/// Every pair of a kept construct and a writer left to the server that
+/// changes what it reads, the foreign keys in the order `schema` holds them,
+/// then the triggers.
 fn stale_reads(
     schema: &ParserDB,
     triggers: &Triggers<'_>,
     options: &TranslationContext<'_>,
 ) -> Result<Vec<TranslationWarning>, Error> {
-    let omitted = omitted_writes(schema, options)?;
+    let triggers = read_triggers(schema, triggers, options)?;
+    let omitted = omitted_writes(schema, &triggers, options)?;
     if omitted.is_empty() {
         return Ok(Vec::new());
     }
-    let readers = readers(schema, read_triggers(schema, triggers, options)?, options)?;
+    let readers = readers(schema, triggers, options)?;
     let mut warnings = Vec::new();
     for write in &omitted {
         for reader in &readers {
@@ -165,7 +185,7 @@ fn stale_reads(
                 through: through.to_vec(),
                 read: write.relation.clone(),
                 columns: if whole { Vec::new() } else { columns.into_iter().collect() },
-                writer: "FOREIGN KEY".to_owned(),
+                writer: write.writer.construct.to_owned(),
                 writer_name: write.writer.name.clone(),
                 writer_table: write.writer.table.clone(),
             };
@@ -185,15 +205,18 @@ fn add(omitted: &mut Vec<Omitted>, writer: &Writer, relation: String, changes: C
     }
 }
 
-/// The writes of each foreign key action that writes rows, which the replica
-/// leaves to the server. A table left off the replica takes its keys with it.
+/// The writes of each foreign key action that writes rows, where the replica
+/// leaves those to the server, then those of each trigger it leaves to the
+/// server whole, every row of each table it writes. A table left off the
+/// replica takes its keys with it.
 fn omitted_writes(
     schema: &ParserDB,
+    triggers: &[ReadTrigger<'_>],
     options: &TranslationContext<'_>,
 ) -> Result<Vec<Omitted>, Error> {
     let mut omitted = Vec::new();
     for table in schema.tables() {
-        if OffReplica::of(&table.name, schema, options)?.is_some() {
+        if !leaves_key_actions(options) || OffReplica::of(&table.name, schema, options)?.is_some() {
             continue;
         }
         for key in table.foreign_keys(schema)? {
@@ -214,10 +237,22 @@ fn omitted_writes(
                 )
             };
             let writer = Writer {
+                construct: "FOREIGN KEY",
                 name: key_name(constraint, None, &constraint.columns),
                 table: last_ident_value_or_display(&table.name),
             };
             add(&mut omitted, &writer, table.stored_table_name().into_owned(), changes);
+        }
+    }
+    for ReadTrigger { trigger, run, left_out } in triggers {
+        let (true, Some((_, chain))) = (left_out, run) else { continue };
+        let writer = Writer {
+            construct: "TRIGGER",
+            name: last_ident_value_or_display(&trigger.name),
+            table: last_ident_value_or_display(&trigger.table_name),
+        };
+        for relation in &chain.written {
+            add(&mut omitted, &writer, relation.clone(), Columns::Row);
         }
     }
     Ok(omitted)
@@ -236,8 +271,9 @@ fn readers(
             table_readers(table, schema, options, &mut readers)?;
         }
     }
-    for ReadTrigger { trigger, run } in triggers {
-        let Some((function, mut chain)) = run else { continue };
+    for ReadTrigger { trigger, run, left_out } in triggers {
+        // A trigger left to the server never runs on the replica.
+        let (false, Some((function, mut chain))) = (left_out, run) else { continue };
         let Some(record) = last_ident(&trigger.table_name).map(fold) else { continue };
         let events: Vec<Event> = trigger.events.iter().map(Event::of).collect();
         let body = (core::mem::take(&mut chain.old), core::mem::take(&mut chain.new));
@@ -286,13 +322,16 @@ fn stored_reads(
             relation: record.to_owned(),
             columns: stored,
             through: through.to_vec(),
+            definer: None,
         }];
     }
     let mut beneath = BTreeSet::new();
     expand_relation(record.to_owned(), schema, &mut beneath);
     beneath
         .into_iter()
-        .map(|relation| Read { relation, columns: Columns::Row, through: through.to_vec() })
+        .map(|relation| {
+            Read { relation, columns: Columns::Row, through: through.to_vec(), definer: None }
+        })
         .collect()
 }
 
@@ -373,6 +412,7 @@ fn table_readers(
                     .collect(),
             ),
             through: Vec::new(),
+            definer: None,
         }];
         // A key into rows the acting role may not read keeps only its
         // referenced side, which reads the referencing rows.
@@ -385,6 +425,7 @@ fn table_readers(
                         .collect(),
                 ),
                 through: Vec::new(),
+                definer: None,
             });
         }
         readers.push(Reader {
@@ -412,7 +453,7 @@ fn expression_reads(
     };
     let mut reads: Vec<Read> = direct
         .into_iter()
-        .map(|(relation, columns)| Read { relation, columns, through: Vec::new() })
+        .map(|(relation, columns)| Read { relation, columns, through: Vec::new(), definer: None })
         .collect();
     for helper in helpers(expression, schema, options)? {
         reads.extend(Walker::read(helper, schema, options)?.reads);

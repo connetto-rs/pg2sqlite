@@ -108,6 +108,43 @@ fn register_deferred_key_checks<'s>(
     Ok(())
 }
 
+/// Registers every trigger the replica leaves to the server, each read
+/// against the schema of its own epoch, an earlier batch's against the
+/// schema it starts from, so no deferred check is queued for one, it shares
+/// no slot, and a `DROP TRIGGER` of one drops nothing. A trigger whose
+/// reading fails counts as kept, and its translation reports why.
+fn register_left_out_triggers(
+    statements: &[Statement],
+    epochs: &[PreparedEpoch],
+    initial_schema: Option<&ParserDB>,
+    context: &mut TranslationContext<'_>,
+) {
+    use sql_traits::traits::DatabaseLike;
+
+    use crate::impls::derived_writes::definer_hidden_read;
+
+    let mut left_out = Vec::new();
+    if let Some(schema) = initial_schema {
+        for trigger in schema.triggers() {
+            if let Ok(Some(_)) = definer_hidden_read(trigger, schema, context) {
+                left_out.push(last_ident_value_or_display(&trigger.name));
+            }
+        }
+    }
+    for epoch in epochs {
+        for statement in &statements[epoch.start..epoch.end] {
+            if let Statement::CreateTrigger(trigger) = statement
+                && let Ok(Some(_)) = definer_hidden_read(trigger, &epoch.schema, context)
+            {
+                left_out.push(last_ident_value_or_display(&trigger.name));
+            }
+        }
+    }
+    for name in left_out {
+        context.add_left_out_trigger_name(&name);
+    }
+}
+
 fn populate_prewalk_catalogs(
     statements: &[Statement],
     epochs: &[PreparedEpoch],
@@ -117,12 +154,14 @@ fn populate_prewalk_catalogs(
     use crate::impls::translator_impls::deferred_constraint::DeferredTrigger;
 
     // An earlier batch's triggers still queue deferred checks and inline their
-    // functions.
+    // functions. A trigger left to the server queues nothing on the replica.
     for trigger in initial_schema.into_iter().flat_map(|schema| {
         use sql_traits::traits::DatabaseLike;
         schema.triggers()
     }) {
-        if let Some(deferred) = DeferredTrigger::of(trigger) {
+        if let Some(deferred) = DeferredTrigger::of(trigger)
+            && !context.is_left_out_trigger_name(&last_ident_value_or_display(&trigger.name))
+        {
             context.add_deferred_trigger(deferred);
         }
         if let Some(exec_body) = &trigger.exec_body {
@@ -140,7 +179,9 @@ fn populate_prewalk_catalogs(
             use sqlparser::ast::TriggerPeriod;
 
             use crate::impls::translator_impls::reentry::MaintainedEvent;
-            if let Some(deferred) = DeferredTrigger::of(trigger) {
+            if let Some(deferred) = DeferredTrigger::of(trigger)
+                && !context.is_left_out_trigger_name(&last_ident_value_or_display(&trigger.name))
+            {
                 context.add_deferred_trigger(deferred);
             }
             if matches!(trigger.period, Some(TriggerPeriod::Before))
@@ -188,9 +229,11 @@ fn populate_prewalk_catalogs(
             })
         }))
         .collect();
+    // A trigger left to the server never fires on SQLite, so it shares no slot.
     let shared = crate::impls::translator_impls::trigger_slots::shared_slot_triggers(
         initial_triggers,
         statements,
+        |trigger| !context.is_left_out_trigger_name(&last_ident_value_or_display(&trigger.name)),
         |trigger| maintainers.iter().any(|maintainer| core::ptr::eq(*maintainer, trigger)),
     );
     context.set_shared_slot_triggers(shared);
@@ -1397,6 +1440,7 @@ impl Pg2Sqlite {
             initial_schema,
         } = prepared;
         let statements = &*sources;
+        register_left_out_triggers(statements, &epochs, initial_schema.as_ref(), context);
         populate_prewalk_catalogs(statements, &epochs, initial_schema.as_ref(), context);
         register_deferred_key_checks(
             initial_schema.iter().chain(epochs.iter().map(|epoch| &*epoch.schema)),

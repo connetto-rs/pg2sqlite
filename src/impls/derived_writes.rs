@@ -16,11 +16,15 @@ use alloc::borrow::Cow;
 use columns::Columns;
 pub(crate) use firing::FiringTrigger;
 pub(crate) use readers::reads_left_to_server;
-use sql_traits::{structs::ParserDB, traits::FunctionLike};
+use sql_traits::{
+    structs::ParserDB,
+    traits::{DatabaseLike, FunctionLike, TableLike},
+};
 use sqlparser::{
     ast::{
-        ColumnDef, ColumnOption, CreateFunction, CreateTrigger, ForeignKeyConstraint, Ident,
-        ObjectName, ReferentialAction, Statement, TriggerEvent,
+        ColumnDef, ColumnOption, CreateFunction, CreateTrigger, ForeignKeyConstraint,
+        FunctionSecurity, Ident, ObjectName, ReferentialAction, Statement, TriggerEvent,
+        TriggerPeriod,
     },
     dialect::PostgreSqlDialect,
     parser::Parser,
@@ -32,7 +36,8 @@ use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{
-        object_name::last_ident_value_or_display, translator_impls::off_replica::OffReplica,
+        object_name::last_ident_value_or_display,
+        translator_impls::{off_replica::OffReplica, rls::hiding_policies},
         unlabelled_body::unlabelled_body,
     },
     options::TranslationContext,
@@ -132,6 +137,83 @@ fn trigger_chain<'s>(
         return Ok(None);
     };
     Ok(Some((function, chain::Walker::read(function, schema, options)?)))
+}
+
+/// Why the replica leaves `trigger` to the server, or `None` when it keeps
+/// it: a statement its function chain runs reads, as the owner of a
+/// `SECURITY DEFINER` function in the chain, a table the replica holds whose
+/// policies may hide rows from the acting role. The owner reads past those
+/// policies on the server, while the replica holds only the rows the acting
+/// role reads, so the trigger would judge the write on a partial copy.
+///
+/// An `INSTEAD OF` trigger is kept, since its writes are the view's own and
+/// the server applying them never fires it, and so is every trigger when no
+/// acting role is named. A read under the trigger's `WHEN` or by an invoker
+/// body sees what PostgreSQL shows the acting role.
+///
+/// # Errors
+///
+/// Fails as [`chain::Walker::read`] and [`hiding_policies`] do.
+pub(crate) fn definer_hidden_read(
+    trigger: &CreateTrigger,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<Option<String>, Error> {
+    if matches!(trigger.period, Some(TriggerPeriod::InsteadOf))
+        || options.get_acting_role().is_none()
+        || !schema.functions().any(|function| function.security_mode() == FunctionSecurity::Definer)
+    {
+        return Ok(None);
+    }
+    let Some((_, chain)) = trigger_chain(trigger, schema, options)? else { return Ok(None) };
+    for read in &chain.reads {
+        let Some(definer) = read.definer else { continue };
+        let Some(table) = schema.tables().find(|table| table.stored_table_name() == read.relation)
+        else {
+            continue;
+        };
+        if OffReplica::of(&table.name, schema, options)?.is_some() {
+            continue;
+        }
+        let Some(policies) = hiding_policies(table, schema, options)? else { continue };
+        let reader = read.through.last().map_or("", String::as_str);
+        let callers: Vec<String> =
+            read.through.iter().rev().skip(1).map(|function| format!("{function}()")).collect();
+        let via = if callers.is_empty() {
+            String::new()
+        } else {
+            format!(", called through {},", callers.join(", "))
+        };
+        let hidden = if policies.is_empty() {
+            format!("no policy lets the acting role read a row of {}", read.relation)
+        } else {
+            format!(
+                "{} may hide rows of {} from the acting role",
+                policies.join(", "),
+                read.relation
+            )
+        };
+        return Ok(Some(format!(
+            "{reader}(){via} reads {} as the owner of SECURITY DEFINER {}(), past row-level \
+             security, and {hidden}, whose rows alone the replica holds",
+            read.relation, read.through[definer]
+        )));
+    }
+    Ok(None)
+}
+
+/// The warning for `trigger`, which the replica leaves to the server for
+/// `reason`.
+pub(crate) fn trigger_left_to_server(
+    trigger: &CreateTrigger,
+    reason: String,
+) -> TranslationWarning {
+    TranslationWarning::LeftToServer {
+        construct: "TRIGGER".to_owned(),
+        name: last_ident_value_or_display(&trigger.name),
+        table: last_ident_value_or_display(&trigger.table_name),
+        reason,
+    }
 }
 
 /// What a row trigger does that another trigger firing on the same write can

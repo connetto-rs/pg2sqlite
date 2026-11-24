@@ -38,6 +38,9 @@ pub(super) struct Read {
     pub(super) relation: String,
     pub(super) columns: Columns,
     pub(super) through: Vec<String>,
+    /// The position in [`Self::through`] of the first `SECURITY DEFINER`
+    /// function, whose owner the statement reads as.
+    pub(super) definer: Option<usize>,
 }
 
 /// What a trigger function does, read in the order PostgreSQL runs it.
@@ -47,6 +50,8 @@ pub(super) struct Chain {
     pub(super) reads: Vec<Read>,
     /// Whether a statement of the function or of a helper writes rows.
     pub(super) writes: bool,
+    /// The tables those statements write, folded.
+    pub(super) written: BTreeSet<String>,
     /// Why the calls of a function in the chain cannot be read, SQL it
     /// builds at run time among the reasons.
     pub(super) unreadable: Option<Error>,
@@ -151,15 +156,28 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
     /// through the functions being read.
     fn repeat(&mut self, recorded: Recorded) {
         let names = self.names();
+        let caller_definer = self.definer();
         for index in recorded.reads.0..recorded.reads.1 {
             let read = &self.chain.reads[index];
+            let own_definer = read
+                .definer
+                .filter(|position| *position >= recorded.depth)
+                .map(|position| position - recorded.depth + names.len());
             let repeated = Read {
                 relation: read.relation.clone(),
                 columns: read.columns.clone(),
                 through: names.iter().chain(&read.through[recorded.depth..]).cloned().collect(),
+                definer: caller_definer.or(own_definer),
             };
             self.chain.reads.push(repeated);
         }
+    }
+
+    /// The position of the first `SECURITY DEFINER` function being read.
+    fn definer(&self) -> Option<usize> {
+        self.functions.iter().position(|function| {
+            function.security_mode() == sqlparser::ast::FunctionSecurity::Definer
+        })
     }
 
     fn block(&mut self, block: &Block) -> Result<(), Error> {
@@ -276,7 +294,9 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
     /// of `OLD` and `NEW` the trigger's own function reads in it, the
     /// helpers it calls, which run before it, and the relations it names.
     fn kept<N: Visit>(&mut self, node: &N) -> Result<(), Error> {
-        self.chain.writes |= !written_relations(node).is_empty();
+        let written = written_relations(node);
+        self.chain.writes |= !written.is_empty();
+        self.chain.written.extend(written);
         if self.functions.len() == 1 {
             record_reads(node, &mut self.chain.old, &mut self.chain.new);
         }
@@ -284,11 +304,12 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
             self.function(helper)?;
         }
         let names = self.names();
+        let definer = self.definer();
         let mut columns = columns_read(node, self.schema)?;
         let relations: BTreeSet<String> = relations_read(node, self.schema).into_iter().collect();
         for relation in relations {
             let columns = columns.remove(&relation).unwrap_or(Columns::Row);
-            self.chain.reads.push(Read { relation, columns, through: names.clone() });
+            self.chain.reads.push(Read { relation, columns, through: names.clone(), definer });
         }
         Ok(())
     }

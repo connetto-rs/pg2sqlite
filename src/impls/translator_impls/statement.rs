@@ -51,7 +51,7 @@ use crate::{
     errors::Error,
     impls::{
         ast_builder,
-        derived_writes::foreign_key_left_to_server,
+        derived_writes::{definer_hidden_read, foreign_key_left_to_server, trigger_left_to_server},
         object_name::{
             append_suffix, last_ident, last_ident_value_or_display,
             normalize_schema_qualified_object_name_for_sqlite, quoted_ident, reads_column,
@@ -116,7 +116,10 @@ fn append_guarded_statements(
     Ok(())
 }
 
-/// Translates `create_trigger`.
+/// Translates `create_trigger`, or leaves it to the server when a definer
+/// body it runs reads rows the acting role may not, which the replica lacks.
+/// A replacing trigger left out still drops the trigger it replaces, which
+/// may have been kept.
 fn append_translated_create_trigger_statements(
     statements: &mut Vec<Statement>,
     create_trigger: &sqlparser::ast::CreateTrigger,
@@ -124,6 +127,21 @@ fn append_translated_create_trigger_statements(
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<(), Error> {
+    use crate::traits::translator::TranslatorWithContext;
+
+    if let Some(reason) = definer_hidden_read(create_trigger, schema, options)? {
+        emit(trigger_left_to_server(create_trigger, reason));
+        if create_trigger.or_replace {
+            let replaced = Statement::DropTrigger(sqlparser::ast::DropTrigger {
+                if_exists: true,
+                trigger_name: create_trigger.name.clone(),
+                table_name: Some(create_trigger.table_name.clone()),
+                option: None,
+            });
+            statements.extend(replaced.translate_with_warnings(schema, options, emit)?);
+        }
+        return Ok(());
+    }
     if super::deferred_constraint::is_deferred(create_trigger) {
         statements.extend(super::deferred_constraint::translate(
             create_trigger,
@@ -2136,8 +2154,10 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
                 if let Some(deferred) = deferred {
                     return Ok(deferred.drop_statements(drop_trigger.if_exists));
                 }
+                let left_out = last_ident(&drop_trigger.trigger_name)
+                    .is_some_and(|name| options.is_left_out_trigger_name(&name.value));
                 vec![Statement::DropTrigger(sqlparser::ast::DropTrigger {
-                    if_exists: drop_trigger.if_exists,
+                    if_exists: drop_trigger.if_exists || left_out,
                     trigger_name: match &drop_trigger.table_name {
                         Some(table) => {
                             super::trigger_slots::owned_name(

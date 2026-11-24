@@ -122,34 +122,40 @@ pub enum TranslationWarning {
         /// the acting role, empty when none lets it read a row.
         policies: Vec<String>,
     },
-    /// A foreign key left out of the replica because its `ON DELETE` or
-    /// `ON UPDATE` action writes rows the server derives, under
+    /// A construct left out of the replica for the server alone to run: a
+    /// foreign key whose `ON DELETE` or `ON UPDATE` action writes rows the
+    /// server derives, under
     /// [`Pg2SqliteOptions::with_server_derived_write_function`](crate::options::Pg2SqliteOptions::with_server_derived_write_function),
-    /// or any foreign key under
-    /// [`Pg2SqliteOptions::with_foreign_keys_omitted`](crate::options::Pg2SqliteOptions::with_foreign_keys_omitted).
+    /// any foreign key under
+    /// [`Pg2SqliteOptions::with_foreign_keys_omitted`](crate::options::Pg2SqliteOptions::with_foreign_keys_omitted),
+    /// and, under an acting role, a trigger running a `SECURITY DEFINER` body
+    /// that reads a table whose policies may hide rows from that role. The
+    /// owner reads every row on the server, and the replica holds only those
+    /// the acting role reads.
     ///
-    /// The key is checked, and its actions run, only by the server, so a
-    /// write the application makes on the replica sees the rows an action
-    /// writes only once the server's changes arrive.
+    /// The construct runs only on the server, so a write the application
+    /// makes on the replica sees what it writes, and is refused by it, only
+    /// once the server's changes arrive.
     LeftToServer {
-        /// `"FOREIGN KEY"`.
+        /// `"FOREIGN KEY"` or `"TRIGGER"`.
         construct: String,
-        /// The foreign key's name. One declared without a name is named by
-        /// its columns and the table it references, as
+        /// The construct's name. A foreign key declared without a name is
+        /// named by its columns and the table it references, as
         /// `(org, member) REFERENCES memberships`.
         name: String,
-        /// The table the foreign key is declared on.
+        /// The table the construct is declared on.
         table: String,
-        /// Why the server runs the key.
+        /// Why the server runs the construct.
         reason: String,
     },
-    /// A construct the replica keeps reads what a foreign key action it
-    /// leaves to the server changes, under
+    /// A construct the replica keeps reads what a construct it leaves to the
+    /// server writes: a foreign key action, under
     /// [`Pg2SqliteOptions::with_server_derived_write_function`](crate::options::Pg2SqliteOptions::with_server_derived_write_function)
     /// or
-    /// [`Pg2SqliteOptions::with_foreign_keys_omitted`](crate::options::Pg2SqliteOptions::with_foreign_keys_omitted).
+    /// [`Pg2SqliteOptions::with_foreign_keys_omitted`](crate::options::Pg2SqliteOptions::with_foreign_keys_omitted),
+    /// or a trigger [`TranslationWarning::LeftToServer`] names.
     ///
-    /// Until the server's rows arrive, the replica holds the rows the action
+    /// Until the server's rows arrive, the replica holds the rows the writer
     /// changes as they were before it, so the construct may admit or refuse a
     /// later write, or show a row, where the server decides otherwise. A
     /// policy of any command, a `CHECK`, a trigger, a unique key or index and
