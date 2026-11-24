@@ -8,6 +8,9 @@
 //! triggers see which columns an insert supplied, which a `BEFORE` trigger on
 //! a plain table cannot tell from a default.
 
+mod needs;
+
+pub(crate) use needs::{Checked, unheld_table};
 use sql_traits::{
     structs::ParserDB,
     traits::{ColumnLike, DatabaseLike, TableLike},
@@ -106,6 +109,11 @@ impl RoleTable {
     /// table into the replica.
     pub(crate) fn reads_any(&self) -> bool {
         self.columns.iter().any(|column| column.select)
+    }
+
+    /// Whether the role may `SELECT` every column, as a wildcard reads them.
+    pub(crate) fn reads_all(&self) -> bool {
+        self.columns.iter().all(|column| column.select)
     }
 
     /// Whether the role may `SELECT` `column`.
