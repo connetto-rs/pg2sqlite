@@ -31,9 +31,9 @@ use sql_traits::{
 };
 use sqlparser::{
     ast::{
-        AlterTable, AlterTableOperation, ColumnOption, CreateTable, DataType, Expr, Ident,
-        ObjectName, ObjectNamePart, ObjectType, RenameTableNameKind, Statement, TableConstraint,
-        visit_expressions_mut, visit_relations_mut,
+        AlterTable, AlterTableOperation, ColumnDef, ColumnOption, CreateTable, DataType, Expr,
+        Ident, ObjectName, ObjectNamePart, ObjectType, RenameTableNameKind, Statement,
+        TableConstraint, visit_expressions_mut, visit_relations_mut,
     },
     dialect::SQLiteDialect,
     parser::Parser,
@@ -66,7 +66,7 @@ pub(crate) struct StatementHistory<'a> {
 }
 
 /// The name SQLite files an object under, which folds ASCII case.
-fn fold(name: &ObjectName) -> String {
+pub(crate) fn fold(name: &ObjectName) -> String {
     last_ident_value_or_display(name).to_ascii_lowercase()
 }
 
@@ -202,6 +202,13 @@ impl LiveAttachments {
         };
         for statement in emitted {
             self.follow(statement, origin.as_ref());
+        }
+    }
+
+    /// Follows `emitted`, which no single PostgreSQL statement emitted.
+    pub(crate) fn follow_emitted(&mut self, emitted: &[Statement]) {
+        for statement in emitted {
+            self.follow(statement, None);
         }
     }
 
@@ -403,7 +410,7 @@ fn translated_table(
 /// The catalog spells a serial out as an integer defaulting to `nextval` of
 /// its sequence, a call the translation refuses, where the declared serial
 /// becomes SQLite's `AUTOINCREMENT` rowid.
-fn as_declared(table: &CreateTable, schema: &ParserDB) -> Result<CreateTable, Error> {
+pub(crate) fn as_declared(table: &CreateTable, schema: &ParserDB) -> Result<CreateTable, Error> {
     let mut declared = table.clone();
     for column in &mut declared.columns {
         let Some(stored) = table.column(&column.name.value, schema, COLUMN_LOOKUP_CASE)? else {
@@ -477,7 +484,7 @@ fn referencing_table<'s>(
 }
 
 /// Parses statements this module writes as SQLite text.
-fn sqlite(text: &str) -> Result<Vec<Statement>, Error> {
+pub(crate) fn sqlite(text: &str) -> Result<Vec<Statement>, Error> {
     Parser::parse_sql(&SQLiteDialect {}, text).map_err(|error| {
         Error::forward_refusal(format!("the table rebuild `{text}` fails to parse: {error}"))
     })
@@ -506,9 +513,11 @@ pub(crate) fn rebuild(
     resolve_translation_table(&after, &alter_table.name)?
         .map(super::create_table::reject_all_generated_columns)
         .transpose()?;
-    if !created_table(&pre_drop, &owner).is_some_and(|create| refuses_drop(create, columns)) {
+    let Some(previous) =
+        created_table(&pre_drop, &owner).filter(|create| refuses_drop(create, columns))
+    else {
         return Ok(None);
-    }
+    };
     let post_drop = translated_table(&after, alter_table, options)?;
     let Some(created) = created_table(&post_drop, &owner) else { return Ok(None) };
     let Some(stored) = resolve_translation_table(&after, &alter_table.name)? else {
@@ -529,19 +538,159 @@ pub(crate) fn rebuild(
         )));
     }
 
+    let companions: Vec<Statement> = post_drop
+        .iter()
+        .filter(|statement| attached_to(statement, &owner).is_some())
+        .cloned()
+        .collect();
+    let mut skipped: Vec<(String, bool)> = emitted.iter().flat_map(dropped_by).collect();
+    skipped.extend(companions.iter().filter_map(|statement| attached_to(statement, &owner)));
+    let mut attachments = companions;
+    attachments.extend(recreated(&owner, columns, &skipped, written, &after, options)?);
+    let message = referenced.map(|_| {
+        format!(
+            "rebuilding {table} to drop a column needs foreign keys off, which SQLite ignores \
+             inside a transaction",
+            table = last_ident_value_or_display(target),
+        )
+    });
+    rebuild_rows(target, previous, created, message.as_deref(), attachments).map(Some)
+}
+
+/// A table whose storage a later change rebuilds.
+#[derive(Clone, Copy)]
+pub(crate) struct Storage<'a> {
+    /// The table as the schema after the change declares it.
+    pub(crate) table: &'a CreateTable,
+    /// The name, folded, its indexes and triggers were created on.
+    pub(crate) held_as: &'a str,
+    /// The storage the replica holds, under the name it takes.
+    pub(crate) was: &'a CreateTable,
+    /// The storage the schema after the change translates to.
+    pub(crate) now: &'a CreateTable,
+}
+
+/// The statements rebuilding `storage` with its rows and its live indexes
+/// and triggers, other than those `replaced` creates or takes back.
+///
+/// # Errors
+///
+/// Returns the refusal for a rebuild inside a transaction of a table another
+/// table's key references, and for an index or trigger the rebuild cannot
+/// create again.
+pub(crate) fn rebuilt_storage(
+    storage: Storage<'_>,
+    replaced: &[Statement],
+    (before, after): (&ParserDB, &ParserDB),
+    options: &TranslationContext<'_>,
+) -> Result<Vec<Statement>, Error> {
+    let Storage { table, held_as, was, now } = storage;
+    let owner = fold(&now.name);
+    let referenced = referencing_table(after, table, options)?;
+    let in_transaction = options.history().is_some_and(|history| history.in_transaction);
+    if let (Some(referencing), true) = (referenced, in_transaction) {
+        return Err(Error::forward_refusal(format!(
+            "a grant, policy or row-security change after {table}'s epoch changes how its keys \
+             are kept, which rebuilds it, and the foreign key of {holder} referencing {table} \
+             would follow the rebuild unless foreign keys are off, which SQLite ignores inside \
+             a transaction. Make the change outside a transaction block.",
+            table = table.table_name(),
+            holder = referencing.table_name(),
+        )));
+    }
+    let skipped: Vec<(String, bool)> = replaced
+        .iter()
+        .flat_map(|statement| {
+            attached_to(statement, held_as).into_iter().chain(attached_to(statement, &owner))
+        })
+        .collect();
+    let mut attachments = recreated(held_as, &[], &skipped, before, after, options)?;
+    if held_as != owner {
+        let unqualified = sqlite_unqualified_object_name(&now.name);
+        for attachment in &mut attachments {
+            let table_name = match attachment {
+                Statement::CreateIndex(create) => &mut create.table_name,
+                Statement::CreateTrigger(create) => &mut create.table_name,
+                _ => continue,
+            };
+            if fold(table_name) == held_as {
+                table_name.clone_from(&unqualified);
+            }
+        }
+    }
+    let message = referenced.map(|_| {
+        format!(
+            "rebuilding {table} to change how its keys are kept needs foreign keys off, which \
+             SQLite ignores inside a transaction",
+            table = last_ident_value_or_display(&now.name),
+        )
+    });
+    rebuild_rows(&now.name, was, now, message.as_deref(), attachments)
+}
+
+/// The indexes and triggers `table`, joining the replica as the SQLite table
+/// `owner`, holds by their PostgreSQL definitions, other than those `created`
+/// creates. A key's triggers come with the referencing table's translation.
+///
+/// # Errors
+///
+/// Returns a refused translation, and the refusal for a trigger no single
+/// definition produces.
+pub(crate) fn declared_attachments(
+    table: &CreateTable,
+    owner: &str,
+    created: &[Statement],
+    after: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<Vec<Statement>, Error> {
+    let mut live = LiveAttachments::default();
+    live.seed(after, Some(&table.table_name().to_ascii_lowercase()), options)?;
+    let mut taken: Vec<(String, bool)> =
+        created.iter().filter_map(|statement| attached_to(statement, owner)).collect();
+    let mut statements = Vec::new();
+    for entry in &live.entries {
+        if matches!(entry.origin, Some(Origin::Key)) {
+            continue;
+        }
+        for statement in regenerated(entry, owner, after, options)? {
+            let Some(key) = attached_to(&statement, owner) else { continue };
+            if !taken.contains(&key) {
+                taken.push(key);
+                statements.push(statement);
+            }
+        }
+    }
+    Ok(statements)
+}
+
+/// The statements rebuilding the SQLite table `target`, defined as
+/// `previous`, as `created` under the same name, followed by `attachments`.
+/// Its rows move under their rowids, with the values of each column both
+/// definitions store.
+///
+/// `referenced` is, when another table's foreign key references `target`,
+/// the message of the check stopping the rebuild where foreign keys did not
+/// turn off.
+///
+/// # Errors
+///
+/// Returns the refusal for a statement this module writes that does not
+/// parse.
+pub(crate) fn rebuild_rows(
+    target: &ObjectName,
+    previous: &CreateTable,
+    created: &CreateTable,
+    referenced: Option<&str>,
+    attachments: Vec<Statement>,
+) -> Result<Vec<Statement>, Error> {
     // The old table is dropped rather than renamed aside, the order SQLite
     // documents, since a legacy rename checks the old definition's column
     // references qualified with the table's own name against the new name.
     let fresh = append_suffix(target, "_pg2sqlite_rebuild");
     let table_name = sqlite_unqualified_object_name(target);
     let mut statements = Vec::new();
-    if referenced.is_some() {
-        let message = format!(
-            "rebuilding {table} to drop a column needs foreign keys off, which SQLite ignores \
-             inside a transaction",
-            table = last_ident_value_or_display(target),
-        )
-        .replace('"', "\"\"");
+    if let Some(message) = referenced {
+        let message = message.replace('"', "\"\"");
         statements.extend(sqlite(&format!(
             "PRAGMA foreign_keys = 0; \
              CREATE TEMP TABLE pg2sqlite_foreign_keys_off (foreign_keys INTEGER CONSTRAINT \
@@ -555,16 +704,21 @@ pub(crate) fn rebuild(
     renamed.name = fresh.clone();
     unqualify_own_columns(&mut renamed, &table_name);
     statements.push(Statement::CreateTable(renamed));
+    let stored = |column: &&ColumnDef| {
+        !column.options.iter().any(|option| matches!(option.option, ColumnOption::Generated { .. }))
+    };
     let copied: Vec<String> = core::iter::once("rowid".to_string())
         .chain(
             created
                 .columns
                 .iter()
+                .filter(stored)
                 .filter(|column| {
-                    !column
-                        .options
+                    previous
+                        .columns
                         .iter()
-                        .any(|option| matches!(option.option, ColumnOption::Generated { .. }))
+                        .filter(stored)
+                        .any(|held| same_identifier(&held.name, &column.name))
                 })
                 .map(|column| column.name.to_string()),
         )
@@ -588,19 +742,12 @@ pub(crate) fn rebuild(
         "DROP TABLE {target}; PRAGMA legacy_alter_table = 1; \
          ALTER TABLE {fresh} RENAME TO {table_name};"
     ))?);
-
-    let companions: Vec<&Statement> =
-        post_drop.iter().filter(|statement| attached_to(statement, &owner).is_some()).collect();
-    let mut skipped: Vec<(String, bool)> = emitted.iter().flat_map(dropped_by).collect();
-    skipped.extend(companions.iter().filter_map(|statement| attached_to(statement, &owner)));
-    statements.extend(companions.into_iter().cloned());
-    statements.extend(recreated(&owner, columns, &skipped, written, &after, options)?);
-
+    statements.extend(attachments);
     statements.extend(sqlite("PRAGMA legacy_alter_table = 0;")?);
     if referenced.is_some() {
         statements.extend(sqlite("PRAGMA foreign_keys = 1;")?);
     }
-    Ok(Some(statements))
+    Ok(statements)
 }
 
 /// Strips `table`, the name `create` takes after the rebuild, from the column

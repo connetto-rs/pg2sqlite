@@ -50,6 +50,7 @@ pub(crate) mod sql_helper;
 pub(crate) mod statement;
 mod stored_text;
 mod table_constraint;
+pub(crate) mod table_shape;
 pub(crate) mod trigger_follower;
 pub(crate) mod trigger_frame;
 pub(crate) mod trigger_row;

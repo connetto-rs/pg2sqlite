@@ -34,6 +34,7 @@ use crate::{
             reentry::MarkerTables,
             rls::generate_rls_audit_table,
             statement::is_data_movement_statement,
+            table_shape,
             trigger_follower::TriggerFollower,
             trigger_slots::{TriggerSlots, folded},
         },
@@ -414,6 +415,9 @@ pub struct Pg2Sqlite {
 
 struct PreparedEpoch {
     start: usize,
+    /// The end of the statements `schema` holds, short of `end` by the
+    /// statement ending the epoch.
+    schema_end: usize,
     end: usize,
     schema: Rc<ParserDB>,
     /// Snapshots taken before each column change inside the epoch, which bind
@@ -621,6 +625,50 @@ impl Trackers {
             ambiguous,
             statement.translate_with_warnings(at.schema, &written, emit),
         )
+    }
+
+    /// The statements moving the replica from the shape `applied` holds to
+    /// `shape`, for the tables the statements of `statements` separating the
+    /// two reach, followed, `applied` then holding `shape`. A shape is a
+    /// schema with the end of the statements it holds.
+    fn reshape<'a, 's: 'a>(
+        &mut self,
+        applied: &mut Option<(&'s ParserDB, usize)>,
+        (shape, shape_end): (&'s ParserDB, usize),
+        statements: &[Statement],
+        at: Position<'a, '_>,
+        emit: crate::warnings::WarningSink<'_>,
+    ) -> Result<Vec<Statement>, crate::errors::Error> {
+        let Some((before, held_end)) =
+            applied.replace((shape, shape_end)).filter(|(held, _)| !core::ptr::eq(*held, shape))
+        else {
+            return Ok(Vec::new());
+        };
+        let at = Position { schema: shape, ..at };
+        let mut reshaped = {
+            let written = at.context.with_history(StatementHistory {
+                attachments: &self.attachments,
+                in_transaction: at.in_transaction,
+            });
+            table_shape::reshaped(
+                (before, shape),
+                &table_shape::Touched::by(&statements[held_end..shape_end]),
+                &written,
+                &mut |statement, schema| {
+                    let mut warnings = Vec::new();
+                    let translated = self.translate(
+                        statement,
+                        Position { schema, binding: before, ..at },
+                        &mut |warning| warnings.push(warning),
+                    )?;
+                    Ok((translated, warnings))
+                },
+                emit,
+            )?
+        };
+        self.marker_tables.create_named(&mut reshaped);
+        self.attachments.follow_emitted(&reshaped);
+        Ok(reshaped)
     }
 
     /// Follows `emitted`, `statement`'s translation, and answers whether
@@ -1411,6 +1459,7 @@ impl Pg2Sqlite {
         let schema = shared_snapshot(&input, current);
         let epoch = PreparedEpoch {
             start,
+            schema_end,
             end,
             schema,
             bindings,
@@ -1419,6 +1468,28 @@ impl Pg2Sqlite {
             events,
         };
         Ok((input, epoch))
+    }
+}
+
+/// The schema holding the replica's shape once `statement`, of epoch
+/// `epoch_index`, has run, with the end of the statements it holds, absent
+/// when it ends the last epoch of a batch with no final schema.
+///
+/// An epoch-ending statement leaves the next epoch's shape.
+fn epoch_shape<'s>(
+    statement: &Statement,
+    epochs: &'s [PreparedEpoch],
+    epoch_index: usize,
+    final_schema: Option<&'s ParserDB>,
+) -> Option<(&'s ParserDB, usize)> {
+    let epoch = &epochs[epoch_index];
+    if Pg2Sqlite::schema_ends_epoch(statement) {
+        match epochs.get(epoch_index + 1) {
+            Some(next) => Some((&*next.schema, next.schema_end)),
+            None => final_schema.map(|schema| (schema, epoch.end)),
+        }
+    } else {
+        Some((&*epoch.schema, epoch.schema_end))
     }
 }
 
@@ -1432,18 +1503,9 @@ fn event_sides<'s, 'c>(
     final_schema: Option<&'s ParserDB>,
     at: Position<'s, 'c>,
 ) -> Option<(Position<'s, 'c>, Position<'s, 'c>)> {
-    let epoch = &epochs[epoch_index];
-    let event = epoch.event(index)?;
-    // An epoch-ending statement leaves the next epoch's shape.
-    let shape = if Pg2Sqlite::schema_ends_epoch(statement) {
-        epochs
-            .get(epoch_index + 1)
-            .map(|next| &*next.schema)
-            .or(final_schema)
-            .unwrap_or(&*event.after)
-    } else {
-        &*epoch.schema
-    };
+    let event = epochs[epoch_index].event(index)?;
+    let shape = epoch_shape(statement, epochs, epoch_index, final_schema)
+        .map_or(&*event.after, |(schema, _)| schema);
     Some((
         Position { binding: &event.before, ..at },
         Position { schema: shape, binding: &event.after, ..at },
@@ -1564,6 +1626,9 @@ impl Pg2Sqlite {
         let mut warnings = Vec::new();
         let mut translated = Vec::with_capacity(statements.len());
         let mut rebuilt_triggers = Vec::with_capacity(statements.len());
+        // The schema whose shape the emitted statements leave the replica in,
+        // with the end of the batch statements it holds.
+        let mut applied: Option<(&ParserDB, usize)> = initial_schema.map(|schema| (schema, 0));
         for (epoch_index, epoch) in epochs.iter().enumerate() {
             populate_spatial_index_catalog(
                 &statements[epoch.start..epoch.end],
@@ -1604,6 +1669,12 @@ impl Pg2Sqlite {
                             event_sides(statement, epochs, (epoch_index, index), final_schema, at);
                         let mut emitted = Vec::new();
                         let mut rebuilt = false;
+                        let shape = epoch_shape(statement, epochs, epoch_index, final_schema)
+                            .unwrap_or((&epoch.schema, epoch.schema_end));
+                        let reshaped =
+                            trackers.reshape(&mut applied, shape, statements, at, &mut emit)?;
+                        rebuilt |= !reshaped.is_empty();
+                        emitted.extend(reshaped);
                         let initial =
                             initial_schema.map(|schema| (schema, initial_triggers.as_slice()));
                         for drop in &cascaded {
