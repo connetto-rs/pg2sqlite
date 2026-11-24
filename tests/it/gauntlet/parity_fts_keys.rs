@@ -84,13 +84,12 @@ fn note_search(query: &str) -> String {
     )
 }
 
-/// The search over `pages`. PostgreSQL answers it over every page, so it reads
-/// published pages only to stay within the rows the partial index covers.
+/// The search over `pages`, which PostgreSQL answers over every page, those
+/// outside the partial index's predicate included.
 fn page_search(query: &str) -> String {
     format!(
         "SELECT id FROM pages \
-         WHERE to_tsvector('english', title || ' ' || body) @@ to_tsquery('english', '{query}') \
-         AND published"
+         WHERE to_tsvector('english', title || ' ' || body) @@ to_tsquery('english', '{query}')"
     )
 }
 

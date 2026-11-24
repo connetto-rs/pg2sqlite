@@ -738,31 +738,7 @@ fn fts5_with_integer_pk_succeeds() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-diesel::table! {
-    /// Table for partial GIN index tests (H4). Only published posts are indexed.
-    filterable_posts (id) {
-        /// Explicit integer primary key.
-        id -> Integer,
-        /// Post title indexed by the partial GIN.
-        title -> Text,
-        /// Visibility flag; the partial index predicate is `published = true`.
-        published -> Bool,
-    }
-}
-
-/// Row for partial GIN index test inserts.
-#[derive(Insertable)]
-#[diesel(table_name = filterable_posts)]
-struct NewFilterablePost<'a> {
-    /// Row id supplied by the test (not auto-generated).
-    id: i32,
-    /// Post title.
-    title: &'a str,
-    /// Visibility flag.
-    published: bool,
-}
-
-/// PostgreSQL schema for the H4 partial GIN index defect tests.
+/// PostgreSQL schema with a partial full-text index over published posts.
 const PARTIAL_GIN_SQL: &str = "
     CREATE TABLE filterable_posts (
         id INTEGER PRIMARY KEY,
@@ -774,199 +750,84 @@ const PARTIAL_GIN_SQL: &str = "
         WHERE published = true;
 ";
 
-/// [H4-A] A partial GIN index emits FTS5 sync triggers whose WHEN clause
-/// uses the bare column name `published = true`. SQLite triggers resolve row
-/// values only through `NEW.col` and `OLD.col`, so the trigger evaluation
-/// fails with "no such column: published" for every INSERT. PostgreSQL accepts
-/// the insert; the translated trigger must not block it. After the fix, a
-/// published row inserts and appears in the FTS index.
+/// The search every partial-index test reads, over every post.
+const GARDEN_SEARCH: &str = "SELECT id FROM filterable_posts
+    WHERE to_tsvector('english', title) @@ to_tsquery('garden') ORDER BY id;";
+
+/// A partial index's predicate decides which rows PostgreSQL's index stores,
+/// never which rows `@@` matches, so a row outside it is still found.
 #[test]
-fn partial_gin_trigger_published_insert_blocked_by_bare_column() {
-    // Applies the full translated schema including the buggy triggers.
-    let mut conn = helpers::apply_default(PARTIAL_GIN_SQL).expect("apply schema");
-
-    let result = diesel::insert_into(filterable_posts::table)
-        .values(&NewFilterablePost { id: 1, title: "rust programming guide", published: true })
-        .execute(&mut conn);
-
-    // PostgreSQL accepts this insert. Currently fails because WHEN published =
-    // true uses a bare column name that SQLite cannot resolve in a trigger
-    // context.
-    assert!(result.is_ok(), "published insert must succeed; got: {}", result.unwrap_err());
-
-    // FTS5 MATCH syntax is not expressible in the Diesel typed DSL.
-    #[derive(QueryableByName)]
-    struct Hit {
-        #[diesel(sql_type = diesel::sql_types::Integer)]
-        rowid: i32,
-    }
-    let hits: Vec<Hit> = diesel::sql_query(
-        "SELECT rowid FROM filterable_posts_fts \
-         WHERE filterable_posts_fts MATCH 'programming'",
-    )
-    .load(&mut conn)
-    .expect("FTS query");
-    assert_eq!(hits.len(), 1, "published row must appear in the FTS index after insert");
+fn a_row_outside_a_partial_index_answers_a_search() {
+    let found = helpers::run_translated::run_translated_default(&format!(
+        "{PARTIAL_GIN_SQL}
+        INSERT INTO filterable_posts VALUES (1, 'garden lamp', true), (2, 'garden kettle', false);
+        {GARDEN_SEARCH}"
+    ));
+    assert_eq!(found, [Some("1".to_string()), Some("2".to_string())]);
 }
 
-/// [H4-B] The same bare-column WHEN clause blocks even an unpublished insert.
-/// After the fix, `WHEN NEW.published = true` is false for this row so the
-/// trigger body is skipped, the insert succeeds, and the row is absent from
-/// the FTS index.
+/// The backfill of a partial index reaches the rows its predicate leaves out.
 #[test]
-fn partial_gin_trigger_unpublished_insert_blocked_by_bare_column() {
-    let mut conn = helpers::apply_default(PARTIAL_GIN_SQL).expect("apply schema");
-
-    let result = diesel::insert_into(filterable_posts::table)
-        .values(&NewFilterablePost { id: 2, title: "draft content only", published: false })
-        .execute(&mut conn);
-
-    // PostgreSQL accepts this insert. Currently fails for the same WHEN clause
-    // reason: SQLite evaluates the expression before checking its truth value.
-    assert!(result.is_ok(), "unpublished insert must succeed; got: {}", result.unwrap_err());
-
-    // FTS5 MATCH syntax is not expressible in the Diesel typed DSL.
-    #[derive(QueryableByName)]
-    struct Hit {
-        #[diesel(sql_type = diesel::sql_types::Integer)]
-        rowid: i32,
-    }
-    let hits: Vec<Hit> = diesel::sql_query(
-        "SELECT rowid FROM filterable_posts_fts \
-         WHERE filterable_posts_fts MATCH 'draft'",
-    )
-    .load(&mut conn)
-    .expect("FTS query");
-    assert_eq!(hits.len(), 0, "unpublished row must not appear in the FTS index");
+fn a_partial_index_backfills_rows_outside_its_predicate() {
+    let found = helpers::run_translated::run_translated_default(&format!(
+        "CREATE TABLE filterable_posts (
+            id INTEGER PRIMARY KEY,
+            title TEXT NOT NULL,
+            published BOOLEAN NOT NULL
+        );
+        INSERT INTO filterable_posts VALUES (1, 'garden lamp', true), (2, 'garden kettle', false);
+        CREATE INDEX filterable_posts_fts_idx ON filterable_posts
+            USING gin (to_tsvector('english', title))
+            WHERE published = true;
+        {GARDEN_SEARCH}"
+    ));
+    assert_eq!(found, [Some("1".to_string()), Some("2".to_string())]);
 }
 
-/// [H4-C] The FTS5 backfill INSERT has no WHERE clause to honor the partial
-/// predicate, so pre-existing unpublished rows are added to the index.
-/// PostgreSQL would only backfill rows where `published = true`. After the
-/// fix the backfill SELECT carries the predicate as a WHERE clause.
+/// A row an update moves out of the predicate stays searchable by its new text.
 #[test]
-fn partial_gin_backfill_indexes_all_rows_ignoring_predicate() {
-    let translated = Pg2Sqlite::default()
-        .sql(PARTIAL_GIN_SQL)
-        .expect("parse")
-        .translate(&Pg2SqliteOptions::default())
-        .expect("translate")
-        .into_vec();
-
-    let mut conn = diesel::SqliteConnection::establish(":memory:").expect("open db");
-
-    // Apply only CREATE TABLE so seed inserts are not blocked by the triggers.
-    // diesel::sql_query is used for DDL the typed DSL cannot express.
-    let create = translated
-        .iter()
-        .find(|s| s.to_string().starts_with("CREATE TABLE"))
-        .expect("a CREATE TABLE must be emitted");
-    diesel::sql_query(create.to_string()).execute(&mut conn).expect("create table");
-
-    diesel::insert_into(filterable_posts::table)
-        .values(&NewFilterablePost { id: 1, title: "published article", published: true })
-        .execute(&mut conn)
-        .expect("insert published");
-    diesel::insert_into(filterable_posts::table)
-        .values(&NewFilterablePost { id: 2, title: "draft article", published: false })
-        .execute(&mut conn)
-        .expect("insert unpublished");
-
-    // Apply the remaining output: FTS virtual table, triggers, and backfill
-    // INSERT. diesel::sql_query is required because CREATE TRIGGER, CREATE
-    // VIRTUAL TABLE, and FTS5 backfill SQL are not expressible via the
-    // Diesel typed DSL.
-    for stmt in translated.iter().filter(|s| !s.to_string().starts_with("CREATE TABLE")) {
-        diesel::sql_query(stmt.to_string()).execute(&mut conn).expect("apply fts statements");
-    }
-
-    // FTS5 MATCH syntax is not expressible in the Diesel typed DSL.
-    #[derive(QueryableByName)]
-    struct Hit {
-        #[diesel(sql_type = diesel::sql_types::Integer)]
-        rowid: i32,
-    }
-    let draft_hits: Vec<Hit> = diesel::sql_query(
-        "SELECT rowid FROM filterable_posts_fts \
-         WHERE filterable_posts_fts MATCH 'draft'",
-    )
-    .load(&mut conn)
-    .expect("FTS query for draft");
-
-    // The unpublished row must not be in the FTS index. Currently fails because
-    // the backfill INSERT has no WHERE clause and indexes every row.
-    assert_eq!(draft_hits.len(), 0, "unpublished row must not be in FTS after backfill");
+fn a_row_leaving_a_partial_index_stays_searchable() {
+    let found = helpers::run_translated::run_translated_default(&format!(
+        "{PARTIAL_GIN_SQL}
+        INSERT INTO filterable_posts VALUES (1, 'lamp', true);
+        UPDATE filterable_posts SET title = 'garden kettle', published = false WHERE id = 1;
+        {GARDEN_SEARCH}"
+    ));
+    assert_eq!(found, [Some("1".to_string())]);
 }
 
-/// [H4-D] A row crossing the partial-index predicate boundary on UPDATE must
-/// enter or leave the FTS index correctly. Flipping `published` from false to
-/// true must add the row to the index. Flipping from true to false must remove
-/// it. Both directions are guarded by separate WHEN-qualified triggers emitted
-/// for the UPDATE case.
+/// An update removes the row's old words before it adds the new ones, so a
+/// word both share stays.
 #[test]
-fn partial_gin_update_crossing_predicate_boundary_syncs_index() {
-    // Applies the full translated schema (CREATE TABLE, FTS5 virtual table,
-    // triggers, backfill).
-    let mut conn = helpers::apply_default(PARTIAL_GIN_SQL).expect("apply schema");
-
-    // Insert an unpublished post. The trigger WHEN clause is false, so the
-    // row must not appear in the FTS index.
-    diesel::insert_into(filterable_posts::table)
-        .values(&NewFilterablePost { id: 1, title: "unpublished article", published: false })
-        .execute(&mut conn)
-        .expect("insert unpublished");
-
-    // FTS5 MATCH is not expressible in the Diesel typed DSL.
-    #[derive(QueryableByName)]
-    struct Hit {
-        #[diesel(sql_type = diesel::sql_types::Integer)]
-        rowid: i32,
-    }
-    let hits: Vec<Hit> = diesel::sql_query(
-        "SELECT rowid FROM filterable_posts_fts \
-         WHERE filterable_posts_fts MATCH 'unpublished'",
-    )
-    .load(&mut conn)
-    .expect("FTS query before flip");
-    assert_eq!(hits.len(), 0, "unpublished row must not be in index before flip");
-
-    diesel::update(filterable_posts::table.filter(filterable_posts::id.eq(1i32)))
-        .set(filterable_posts::published.eq(true))
-        .execute(&mut conn)
-        .expect("update to published");
-
-    let hits: Vec<Hit> = diesel::sql_query(
-        "SELECT rowid FROM filterable_posts_fts \
-         WHERE filterable_posts_fts MATCH 'unpublished'",
-    )
-    .load(&mut conn)
-    .expect("FTS query after flip to published");
-    assert_eq!(hits.len(), 1, "row must appear in index after flipping to published");
-
-    diesel::update(filterable_posts::table.filter(filterable_posts::id.eq(1i32)))
-        .set(filterable_posts::published.eq(false))
-        .execute(&mut conn)
-        .expect("update back to unpublished");
-
-    let hits: Vec<Hit> = diesel::sql_query(
-        "SELECT rowid FROM filterable_posts_fts \
-         WHERE filterable_posts_fts MATCH 'unpublished'",
-    )
-    .load(&mut conn)
-    .expect("FTS query after flip back to unpublished");
-    assert_eq!(hits.len(), 0, "row must leave index after flipping back to unpublished");
-}
-
-/// An update keeping a row inside a partial index's predicate removes the
-/// row's old words before it adds the new ones, so a word both share stays.
-#[test]
-fn partial_gin_update_inside_predicate_keeps_shared_words() {
+fn a_partial_index_update_keeps_shared_words() {
     let found = helpers::run_translated::run_translated_default(&format!(
         "{PARTIAL_GIN_SQL}
         INSERT INTO filterable_posts VALUES (1, 'garden lamp', true);
         UPDATE filterable_posts SET title = 'garden kettle' WHERE id = 1;
-        SELECT id FROM filterable_posts
-            WHERE to_tsvector('english', title) @@ to_tsquery('garden') AND published;"
+        {GARDEN_SEARCH}"
     ));
     assert_eq!(found, [Some("1".to_string())]);
+}
+
+/// Indexing the rows the predicate leaves out changes no answer, only the
+/// index's size, so the dropped predicate is reported as a warning.
+#[test]
+fn a_partial_full_text_index_warns_that_it_drops_its_predicate() {
+    let warnings = Pg2Sqlite::default()
+        .sql(PARTIAL_GIN_SQL)
+        .expect("parse")
+        .translate_with_report(&Pg2SqliteOptions::default())
+        .expect("translate")
+        .warnings;
+
+    assert!(
+        warnings.iter().any(|warning| {
+            matches!(
+                warning,
+                pg2sqlite::warnings::TranslationWarning::LossyDrop { construct, .. }
+                    if *construct == "partial full-text index predicate"
+            )
+        }),
+        "expected a LossyDrop naming the predicate, got {warnings:?}"
+    );
 }
