@@ -26,6 +26,8 @@
 //! against the first and its new one against the second, its storage already
 //! renamed by the statement ending the epoch.
 
+use alloc::collections::BTreeSet;
+
 use sql_traits::{
     structs::ParserDB,
     traits::{DatabaseLike, TableLike},
@@ -126,19 +128,6 @@ fn dropped_names(drop: &Statement) -> impl Iterator<Item = String> + '_ {
     trigger.into_iter().chain(names).map(fold)
 }
 
-/// The folded name of the object `created` creates.
-fn created_name(created: &Statement) -> Option<String> {
-    match created {
-        Statement::CreateView(view) => Some(&view.name),
-        Statement::CreateIndex(index) => index.name.as_ref(),
-        Statement::CreateTrigger(trigger) => Some(&trigger.name),
-        Statement::CreateTable(table) => Some(&table.name),
-        Statement::CreateVirtualTable { name, .. } => Some(name),
-        _ => None,
-    }
-    .map(fold)
-}
-
 /// The refusal for `created`, which a reshaped table no longer emits and
 /// the replica cannot take back.
 fn irrevocable(created: &Statement) -> Error {
@@ -232,11 +221,6 @@ impl Touched {
                     }
                 }
             }
-            Statement::RenameTable(renames) => {
-                for rename in renames {
-                    self.rename(&rename.old_name, &rename.new_name);
-                }
-            }
             Statement::CreatePolicy(policy) => self.named.push(fold(&policy.table_name)),
             Statement::AlterPolicy(policy) => self.named.push(fold(&policy.table_name)),
             Statement::DropPolicy(policy) => self.named.push(fold(&policy.table_name)),
@@ -272,13 +256,11 @@ impl Touched {
         }
     }
 
-    /// Follows the rename of `from` to `to`.
+    /// Follows the rename of `from` to `to`, which ends its epoch and so its
+    /// run.
     fn rename(&mut self, from: &ObjectName, to: &ObjectName) {
         let from = fold(from);
-        match self.renamed.iter_mut().find(|(_, now)| fold(now) == from) {
-            Some((_, now)) => *now = to.clone(),
-            None => self.renamed.push((from.clone(), to.clone())),
-        }
+        self.renamed.push((from.clone(), to.clone()));
         self.replaced.push(from);
     }
 
@@ -287,6 +269,22 @@ impl Touched {
         let name = fold(name);
         self.renamed.retain(|(_, now)| fold(now) != name);
         self.replaced.push(name);
+    }
+
+    /// Moves `later`, folded table names after the run, to the names the
+    /// tables held before it, leaving out the names whose table the run
+    /// replaces.
+    pub(crate) fn follow_back(&self, later: &mut BTreeSet<String>) {
+        let renamed: Vec<String> = self
+            .renamed
+            .iter()
+            .filter(|(_, to)| later.remove(&fold(to)))
+            .map(|(from, _)| from.clone())
+            .collect();
+        for name in &self.replaced {
+            later.remove(name);
+        }
+        later.extend(renamed);
     }
 
     /// The tables of `before` whose shape the run may change, in the order
@@ -380,7 +378,16 @@ fn change<'s>(
     let gone: Vec<String> = boundary.iter().flat_map(dropped_names).collect();
     let held: Vec<Statement> = held
         .into_iter()
-        .filter(|statement| created_name(statement).is_none_or(|name| !gone.contains(&name)))
+        .filter(|statement| {
+            let removed = match statement {
+                Statement::CreateTable(table) => gone.contains(&fold(&table.name)),
+                other => {
+                    drop_of(other)
+                        .is_ok_and(|drop| dropped_names(&drop).any(|name| gone.contains(&name)))
+                }
+            };
+            !removed
+        })
         .chain(boundary.iter().filter(|statement| generated.contains(statement)).cloned())
         .collect();
     let mut renamed_from = None;

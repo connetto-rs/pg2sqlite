@@ -155,14 +155,12 @@ fn register_pending_tables(
 
     use crate::impls::{privileges::RoleTable, translator_impls::drop_column_rebuild::fold};
 
-    if context.get_acting_role().is_none() {
-        return Ok(());
-    }
     let mut pending = Vec::new();
     let mut later = BTreeSet::new();
     for epoch in epochs.iter().rev() {
         if epoch.schema_end < epoch.end {
-            follow_boundary_back(&statements[epoch.schema_end], &mut later);
+            table_shape::Touched::by(core::slice::from_ref(&statements[epoch.schema_end]))
+                .follow_back(&mut later);
         }
         let schema = &*epoch.schema;
         let mut tables = schema.tables().filter(|table| !table.temporary).peekable();
@@ -170,7 +168,7 @@ fn register_pending_tables(
             continue;
         }
         let Some(role) = crate::impls::session_variable::acting_role(schema, context)? else {
-            continue;
+            return Ok(());
         };
         let mut read = Vec::new();
         let mut unread = BTreeSet::new();
@@ -189,42 +187,6 @@ fn register_pending_tables(
     }
     context.set_pending_tables(pending);
     Ok(())
-}
-
-/// `later`, the folded names of the tables read after `boundary`, a statement
-/// ending an epoch, by the names they held before it.
-fn follow_boundary_back(boundary: &Statement, later: &mut BTreeSet<String>) {
-    use crate::impls::translator_impls::drop_column_rebuild::fold;
-
-    let mut follow_rename = |old: &ObjectName, new: &ObjectName| {
-        let old = fold(old);
-        later.remove(&old);
-        if later.remove(&fold(new)) {
-            later.insert(old);
-        }
-    };
-    match boundary {
-        Statement::AlterTable(alter_table) => {
-            for operation in &alter_table.operations {
-                if let AlterTableOperation::RenameTable { table_name } = operation {
-                    let (RenameTableNameKind::As(name) | RenameTableNameKind::To(name)) =
-                        table_name;
-                    follow_rename(&alter_table.name, name);
-                }
-            }
-        }
-        Statement::RenameTable(renames) => {
-            for rename in renames {
-                follow_rename(&rename.old_name, &rename.new_name);
-            }
-        }
-        Statement::Drop { object_type: ObjectType::Table, names, .. } => {
-            for name in names {
-                later.remove(&fold(name));
-            }
-        }
-        _ => {}
-    }
 }
 
 /// Registers every trigger the replica leaves to the server, each read

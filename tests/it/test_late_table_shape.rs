@@ -757,3 +757,13 @@ GRANT SELECT, INSERT ON embeddings TO app;
     );
     assert!(!early.iter().any(|statement| statement.contains("embeddings_embedding_vec")));
 }
+
+#[test]
+fn an_epoch_ending_before_the_role_is_declared_translates() {
+    let function =
+        "CREATE FUNCTION one() RETURNS integer LANGUAGE sql AS 'SELECT 1'; DROP FUNCTION one();";
+    assert_same_replica(
+        loaded(&format!("{function}{UNREAD_HEAD}{GRANT_ALL}")),
+        loaded(&format!("{UNREAD_HEAD}{GRANT_ALL}")),
+    );
+}
