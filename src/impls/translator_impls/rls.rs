@@ -3233,6 +3233,17 @@ pub(crate) fn generate_view_statements(
 
     let mut statements =
         vec![generate_rls_view_statement_with_context(table, schema, options, grants, emit)?];
+    // Created before every other guard on the backing table, so SQLite, which
+    // fires the newest trigger first, checks these after the policies, as
+    // PostgreSQL checks constraints after them.
+    let ctx = RlsTriggerContext::new(table, options);
+    statements.extend(super::withheld::Withheld::of(table, schema, grants)?.guards(
+        table,
+        &ctx.inner_table_name,
+        schema,
+        options,
+        emit,
+    )?);
 
     if grants.is_read_only() {
         statements

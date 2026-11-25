@@ -798,7 +798,14 @@ impl crate::traits::translator::TranslatorWithContext for CreateIndex {
             .map(|predicate| predicate.translate_with_warnings(schema, options, emit))
             .transpose()?;
 
-        let companion = if self.unique && self.nulls_distinct == Some(false) {
+        // A column the acting role cannot read arrives NULL in every row the
+        // server delivers, so a companion making NULLs collide over one would
+        // refuse the second such row.
+        let withheld = super::withheld::Withheld::of_named(&self.table_name, schema, options)?;
+        let companion = if self.unique
+            && self.nulls_distinct == Some(false)
+            && !self.columns.iter().any(|key| withheld.read_by(&key.column.expr))
+        {
             companion_index(
                 &last_ident_value_or_display(name),
                 &backing_table,

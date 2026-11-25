@@ -25,7 +25,13 @@ pub enum WrapperKind {
     /// it cannot read in full or can insert into only in part. The physical
     /// table carries the configured suffix, a view holds the logical name with
     /// the columns the role may read, and INSTEAD OF triggers refuse the
-    /// writes it may not make.
+    /// writes it may not make. A column the role cannot read, other than a
+    /// key column, carries no `NOT NULL` or `CHECK` in the physical table,
+    /// here and under [`WrapperKind::RlsView`], so a row stored past the
+    /// guards may hold NULL there, and BEFORE triggers hold the role's own
+    /// writes to those constraints. A later change making the column readable
+    /// brings them back, and its migration refuses while a stored row breaks
+    /// them, so whoever filled the table clears or refills those rows first.
     PrivilegeView,
     /// The acting role's grants on a table it reads in full and may write
     /// only in part. The name is unchanged and BEFORE triggers refuse the

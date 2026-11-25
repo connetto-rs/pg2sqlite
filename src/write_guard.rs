@@ -70,6 +70,14 @@ pub(crate) fn check_violation(relation: &str, constraint: &str) -> String {
     format!("new row for relation \"{relation}\" violates check constraint \"{constraint}\"")
 }
 
+/// The refusal for a row of `relation` holding NULL in `column`, declared
+/// `NOT NULL`, matching PostgreSQL's wording.
+pub(crate) fn not_null_violation(column: &str, relation: &str) -> String {
+    format!(
+        "null value in column \"{column}\" of relation \"{relation}\" violates not-null constraint"
+    )
+}
+
 /// A write a translated write guard refused, read from its message by
 /// [`guard_refusal`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
