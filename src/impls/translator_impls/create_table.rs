@@ -20,6 +20,7 @@ use crate::{
         translator_impls::{
             column::{folded_primary_key, translate_column_def},
             column_option::warn_no_inherit_dropped,
+            hidden_referenced_rows::without_guarded_actions,
         },
     },
     warnings::TranslationWarning,
@@ -287,9 +288,19 @@ impl crate::traits::translator::TranslatorWithContext for CreateTable {
                         emit,
                     )? => {}
                 _ => {
-                    created_table
-                        .constraints
-                        .extend(constraint.translate_with_warnings(schema, options, emit)?);
+                    let native = match constraint {
+                        TableConstraint::ForeignKey(key) => {
+                            without_guarded_actions(key, &self.name, schema, options)?
+                                .map(TableConstraint::ForeignKey)
+                        }
+                        _ => None,
+                    };
+                    created_table.constraints.extend(
+                        native
+                            .as_ref()
+                            .unwrap_or(constraint)
+                            .translate_with_warnings(schema, options, emit)?,
+                    );
                 }
             }
         }

@@ -2739,7 +2739,12 @@ fn generate_update_check_trigger_sql(
         &ctx.inner_table_name,
         sqlparser::ast::TriggerEvent::Update(Vec::new()),
         write_guard_condition_expr(violation, options),
-        &super::definer::exempt_owners(table, schema),
+        &super::definer::and_key_actions(
+            super::definer::exempt_owners(table, schema),
+            table,
+            schema,
+            options,
+        )?,
         RLS_VIOLATION,
     )))
 }
@@ -2772,7 +2777,12 @@ fn generate_delete_check_trigger_sql(
         &ctx.inner_table_name,
         sqlparser::ast::TriggerEvent::Delete,
         write_guard_condition_expr(violation, options),
-        &super::definer::exempt_owners(table, schema),
+        &super::definer::and_key_actions(
+            super::definer::exempt_owners(table, schema),
+            table,
+            schema,
+            options,
+        )?,
         RLS_VIOLATION,
     )))
 }
@@ -3156,21 +3166,31 @@ fn forwarding_view_triggers(
 }
 
 /// The guards refusing every write that reaches the backing table of a table
-/// the acting role only reads, unless it is exempt or a definer body runs it,
-/// whose writes are held to its owner's privileges.
+/// the acting role only reads, unless it is exempt, a definer body runs it,
+/// whose writes are held to its owner's privileges, or a foreign key action
+/// runs it.
+///
+/// # Errors
+///
+/// Fails as [`super::definer::and_key_actions`] does.
 fn generate_readonly_backing_guard_sql(
     table: &CreateTable,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
-) -> Vec<Statement> {
+) -> Result<Vec<Statement>, Error> {
     if options.get_rls_exemption_function().is_none() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let ctx = RlsTriggerContext::new(table, options);
     let condition = write_guard_condition_expr(None, options);
     let message = read_only(ctx.table_name);
-    let owners = super::definer::definer_owners(schema);
-    [
+    let owners = super::definer::and_key_actions(
+        super::definer::definer_owners(schema),
+        table,
+        schema,
+        options,
+    )?;
+    Ok([
         ("insert", sqlparser::ast::TriggerEvent::Insert),
         ("update", sqlparser::ast::TriggerEvent::Update(Vec::new())),
         ("delete", sqlparser::ast::TriggerEvent::Delete),
@@ -3186,7 +3206,7 @@ fn generate_readonly_backing_guard_sql(
             &message,
         )
     })
-    .collect()
+    .collect())
 }
 
 /// Generates the view standing for a table with a backing table, its write
@@ -3217,7 +3237,7 @@ pub(crate) fn generate_view_statements(
     if grants.is_read_only() {
         statements
             .extend(generate_readonly_view_trigger_sql(table, schema, options, grants, emit)?);
-        statements.extend(generate_readonly_backing_guard_sql(table, schema, options));
+        statements.extend(generate_readonly_backing_guard_sql(table, schema, options)?);
     } else {
         if let Some(column) = &unreadable_key
             && (grants.updates_any() || grants.deletes())

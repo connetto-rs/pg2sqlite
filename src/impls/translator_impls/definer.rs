@@ -14,6 +14,11 @@
 //! statement written `OR FAIL` keeps the rows before a failing one too, so a
 //! failure inside a definer body would leave its owner on the stack.
 //! PostgreSQL has no `OR FAIL`, and no translated statement carries one.
+//!
+//! A foreign key action the replica runs as a trigger pushes a frame owned by
+//! [`KEY_ACTION`], since PostgreSQL runs the action as the referencing
+//! table's owner and past its row-level security, and the guards of a table
+//! receiving such an action stand aside while that frame is the innermost.
 
 use alloc::collections::BTreeSet;
 use core::ops::ControlFlow;
@@ -50,6 +55,10 @@ use crate::{
 /// The frames of the definer bodies running on the connection, each holding
 /// its body's owner, innermost last.
 pub(crate) const STACK: &str = "pg2sqlite_definer_frames";
+
+/// The owner of the frame a running foreign key action pushes. PostgreSQL
+/// reserves the role names starting `pg_`, so no body's owner is this one.
+pub(crate) const KEY_ACTION: &str = "pg_key_action";
 
 type Role = <ParserDB as DatabaseLike>::Role;
 
@@ -149,6 +158,35 @@ pub(crate) fn definer_owners(schema: &ParserDB) -> Vec<&str> {
     let mut owners: Vec<&str> = running_owners(schema).into_iter().map(RoleLike::name).collect();
     owners.sort_unstable();
     owners
+}
+
+/// `owners`, with [`KEY_ACTION`] when a foreign key action writes `table`
+/// past its guards.
+///
+/// # Errors
+///
+/// Fails as [`receives_key_actions`](super::hidden_referenced_rows::receives_key_actions)
+/// does.
+pub(crate) fn and_key_actions<'s>(
+    mut owners: Vec<&'s str>,
+    table: &CreateTable,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<Vec<&'s str>, Error> {
+    if super::hidden_referenced_rows::receives_key_actions(table, schema, options)? {
+        owners.push(KEY_ACTION);
+    }
+    Ok(owners)
+}
+
+/// `statements`, the body of a foreign key action, run under a frame owned by
+/// [`KEY_ACTION`].
+pub(crate) fn as_key_action(statements: Vec<Statement>) -> Vec<Statement> {
+    let mut framed = Vec::with_capacity(statements.len() + 2);
+    framed.push(push(KEY_ACTION, None));
+    framed.extend(statements);
+    framed.push(pop(None));
+    framed
 }
 
 /// The owners of the schema's definer functions whose writes can fire a
@@ -411,7 +449,7 @@ fn framed(
         if ignores && pushed {
             wrapped.push(pop(guard));
         } else if !ignores && !pushed {
-            wrapped.push(push(owner, guard));
+            wrapped.push(push(owner.name(), guard));
         }
         pushed = !ignores;
         wrapped.push(statement);
@@ -545,12 +583,10 @@ fn ignores_the_write(statement: &Statement) -> bool {
     .is_break()
 }
 
-fn push(owner: &Role, guard: Option<&Expr>) -> Statement {
+fn push(owner: &str, guard: Option<&Expr>) -> Statement {
     let source = match guard {
-        Some(guard) => {
-            single_expr_query(string_literal(owner.name()), Vec::new(), Some(guard.clone()))
-        }
-        None => ast_builder::values(vec![vec![string_literal(owner.name())]]),
+        Some(guard) => single_expr_query(string_literal(owner), Vec::new(), Some(guard.clone())),
+        None => ast_builder::values(vec![vec![string_literal(owner)]]),
     };
     ast_builder::insert(
         stack_name(),

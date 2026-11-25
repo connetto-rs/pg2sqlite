@@ -490,7 +490,7 @@ fn translate_create_table_for_role(
         return Ok(None);
     }
     let mut statements = build_create_table_statements(create_table, schema, options, None, emit)?;
-    append_deny_triggers(&mut statements, schema, options, &grants)?;
+    append_deny_triggers(&mut statements, table, schema, options, &grants)?;
     Ok(Some(statements))
 }
 
@@ -560,11 +560,13 @@ fn overlay_if_derived(
     Ok(())
 }
 
-/// Appends `BEFORE` triggers refusing the writes `grants` does not allow on a
-/// plain table, every write as read-only when it allows none. A definer body
-/// passes them, its writes held to its owner's privileges.
+/// Appends `BEFORE` triggers refusing the writes `grants` does not allow on
+/// `table`, a plain table, every write as read-only when it allows none. A
+/// definer body passes them, its writes held to its owner's privileges, and so
+/// does a foreign key action.
 fn append_deny_triggers(
     statements: &mut Vec<Statement>,
+    table: &sqlparser::ast::CreateTable,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
     grants: &RoleTable,
@@ -585,7 +587,12 @@ fn append_deny_triggers(
     };
     let condition = super::definer::unless_running(
         write_guard_condition_expr(None, options),
-        &super::definer::definer_owners(schema),
+        &super::definer::and_key_actions(
+            super::definer::definer_owners(schema),
+            table,
+            schema,
+            options,
+        )?,
     );
     let unwritable: Vec<Ident> = grants.not_updatable().map(quoted_ident).collect();
     let update = if !grants.updates_any() {

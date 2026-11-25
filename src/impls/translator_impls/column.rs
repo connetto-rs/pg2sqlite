@@ -26,6 +26,7 @@ use crate::{
                 numeric_precision_bound_expr, regular_int_range_bound_expr,
                 small_int_range_bound_expr,
             },
+            hidden_referenced_rows::native_actions,
             stored_text::stored_text_check,
             uuid::{
                 is_blob_uuid_representation, is_uuid_data_type, uuid_blob_length_check_expr,
@@ -296,10 +297,10 @@ pub(crate) fn translate_column_def(
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<ColumnDef, crate::errors::Error> {
-    // A `REFERENCES` the replica leaves to the server goes before anything
-    // reads the column's options.
+    // Keys left to the server and actions run as triggers go before anything
+    // reads the options.
     let kept_column = column_without_keys_left_to_server(column, table, schema, options, emit)?;
-    let column = kept_column.as_ref().unwrap_or(column);
+    let column = &*native_actions(kept_column.as_ref().unwrap_or(column), table, schema, options)?;
     // Both an identity column and a serial ask SQLite to supply values, which
     // it does only through the rowid alias, so both need the translated type
     // and the table's key before anything else is decided.
