@@ -114,7 +114,7 @@ pub(crate) fn schema_helper<'s>(
 }
 
 /// Whether `function` is one of PostgreSQL's own.
-fn in_pg_catalog(function: &CreateFunction) -> bool {
+pub(crate) fn in_pg_catalog(function: &CreateFunction) -> bool {
     function.target_name().schema().is_some_and(|schema| schema.eq_ignore_ascii_case("pg_catalog"))
 }
 

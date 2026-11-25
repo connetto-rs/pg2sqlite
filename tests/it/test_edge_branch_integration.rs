@@ -328,13 +328,13 @@ fn create_trigger_translation_rejects_unsupported_shapes_and_handles_missing_fun
 }
 
 #[test]
-fn schema_function_body_covers_missing_and_error_paths() {
+fn schema_trigger_function_body_covers_missing_and_error_paths() {
     let function_name =
         |value: &str| sqlparser::ast::ObjectName::from(vec![Ident::new(value.to_owned())]);
     let missing = empty_schema();
     assert!(
         missing
-            .function_body(&function_name("does_not_exist"))
+            .trigger_function_body(&function_name("does_not_exist"))
             .expect("lookup should succeed")
             .is_none()
     );
@@ -351,7 +351,7 @@ fn schema_function_body_covers_missing_and_error_paths() {
         .expect("schema should build");
     assert!(
         no_body_schema
-            .function_body(&function_name("no_body"))
+            .trigger_function_body(&function_name("no_body"))
             .expect("lookup should succeed")
             .is_none()
     );

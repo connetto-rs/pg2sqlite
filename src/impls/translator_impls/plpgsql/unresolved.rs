@@ -43,7 +43,9 @@ use crate::{
         object_name::{last_ident, resolve_translation_table},
         query_builder::single_expr_query,
         translator_impls::{
-            create_trigger::body_schema, definer::definer_owner, sql_helper::schema_helper,
+            create_trigger::body_schema,
+            definer::definer_owner,
+            sql_helper::{in_pg_catalog, schema_helper},
             trigger_slots::folded,
         },
         unlabelled_body::signature,
@@ -108,7 +110,7 @@ pub(crate) fn names_unresolved(
     table: &ObjectName,
     schema: &ParserDB,
 ) -> Result<bool, Error> {
-    let Some(block) = schema.function_body(function)? else { return Ok(false) };
+    let Some(block) = schema.trigger_function_body(function)? else { return Ok(false) };
     Ok(!unresolved(&block, &trigger_signature(function), rows(table, schema), schema).is_empty())
 }
 
@@ -165,7 +167,9 @@ pub(crate) fn unresolved_aborts(
     emit: WarningSink<'_>,
 ) -> Result<Vec<Statement>, Error> {
     let body_schema = body_schema(schema, options);
-    let Some(mut block) = body_schema.function_body(function)? else { return Ok(Vec::new()) };
+    let Some(mut block) = body_schema.trigger_function_body(function)? else {
+        return Ok(Vec::new());
+    };
     let signature = trigger_signature(function);
     let found = unresolved(&block, &signature, rows(table, body_schema), body_schema);
     if found.is_empty() {
@@ -373,59 +377,69 @@ impl ReadBodies {
     }
 }
 
-/// What `function`'s body in `schema` reaches, the bodies of the functions it
-/// calls included, or `None` when its names are not all known before it runs,
-/// as with SQL it builds at run time or a body that does not parse. A builtin
-/// reaches nothing. `bodies` holds what each body read before names.
-///
-/// # Errors
-///
-/// Returns the error looking up `function` itself returns.
+/// What `declared`'s body in `schema`, the function `function` names,
+/// reaches, the bodies of the functions it calls included, or `None` when its
+/// names are not all known before it runs, as with SQL it builds at run time
+/// or a body that does not parse. A builtin, and a function the schema does
+/// not declare, reach nothing. `bodies` holds what each body read before
+/// names.
 pub(crate) fn body_reach(
     function: &ObjectName,
+    declared: Option<&CreateFunction>,
     schema: &ParserDB,
     bodies: &mut ReadBodies,
-) -> Result<Option<BodyReach>, Error> {
+) -> Option<BodyReach> {
     let mut reach = BodyReach {
         relations: BTreeSet::new(),
         written: BTreeSet::new(),
-        functions: BTreeSet::new(),
+        functions: BTreeSet::from([folded(function)]),
         definers: BTreeSet::new(),
     };
-    let mut pending = vec![function.clone()];
+    let mut pending = Vec::new();
+    if let Some(declared) = declared.filter(|declared| !in_pg_catalog(declared)) {
+        reach.read(function, declared, schema, bodies, &mut pending)?;
+    }
     while let Some(function) = pending.pop() {
         if !reach.functions.insert(folded(&function)) {
             continue;
         }
-        let declared = match schema_helper(&function, schema) {
-            Ok(Some(declared)) => declared,
-            Ok(None) => continue,
-            // A callee the schema cannot settle may reach anything.
-            Err(_) if reach.functions.len() > 1 => return Ok(None),
-            Err(error) => return Err(error),
-        };
+        // A callee the schema cannot settle may reach anything.
+        let Some(declared) = schema_helper(&function, schema).ok()? else { continue };
+        reach.read(&function, declared, schema, bodies, &mut pending)?;
+    }
+    Some(reach)
+}
+
+impl BodyReach {
+    /// Adds what `declared`'s own body, the function `function` names,
+    /// reaches, and pushes the functions it calls onto `pending`. `None` when
+    /// its names are not all known before it runs.
+    fn read(
+        &mut self,
+        function: &ObjectName,
+        declared: &CreateFunction,
+        schema: &ParserDB,
+        bodies: &mut ReadBodies,
+        pending: &mut Vec<ObjectName>,
+    ) -> Option<()> {
         // An owner the schema never declares refuses the translation, on
         // either side of an event.
         if let Ok(Some(owner)) = definer_owner(declared, schema) {
-            reach.definers.insert(owner.stored_name().into_owned());
+            self.definers.insert(owner.stored_name().into_owned());
         }
         let atomic;
         let names = if let Some(body) = declared.body() {
-            bodies.names(body, declared, &function, schema)
+            bodies.names(body, declared, function, schema)
         } else {
-            atomic = BodyNames::of(declared, schema, &trigger_signature(&function));
+            atomic = BodyNames::of(declared, schema, &trigger_signature(function));
             &atomic
         };
-        match names {
-            BodyNames::Known(names) => {
-                reach.relations.extend(names.relations.iter().cloned());
-                reach.written.extend(names.written.iter().cloned());
-                pending.extend(names.calls.iter().cloned());
-            }
-            BodyNames::Unknown => return Ok(None),
-        }
+        let BodyNames::Known(names) = names else { return None };
+        self.relations.extend(names.relations.iter().cloned());
+        self.written.extend(names.written.iter().cloned());
+        pending.extend(names.calls.iter().cloned());
+        Some(())
     }
-    Ok(Some(reach))
 }
 
 /// Every statement and expression of `block`, the body of the trigger

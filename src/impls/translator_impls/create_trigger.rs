@@ -374,7 +374,7 @@ fn generate_standard_trigger_body(
 ) -> Result<Option<sqlparser::ast::BeginEndStatements>, crate::errors::Error> {
     let function_name = &exec_body.func_desc.name;
     let body_schema = body_schema(schema, options);
-    let Some(stored) = body_schema.function_body(function_name)? else { return Ok(None) };
+    let Some(stored) = body_schema.trigger_function_body(function_name)? else { return Ok(None) };
     let body = super::plpgsql::raising_unresolved(stored, function_name, table_name, body_schema);
     let facts = super::plpgsql::TriggerFacts {
         events: part.events.to_vec(),
@@ -385,7 +385,7 @@ fn generate_standard_trigger_body(
     };
     // A definer body runs as its owner, read from the epoch like row-level
     // security.
-    let function = crate::traits::schema::written_function(schema, function_name)?;
+    let function = crate::traits::schema::trigger_function(schema, function_name)?;
     let owner = function
         .map(|function| super::definer::definer_owner(function, schema))
         .transpose()?
