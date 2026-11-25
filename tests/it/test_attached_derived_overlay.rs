@@ -68,10 +68,18 @@ mod schema {
             derived_seen -> Integer,
         }
     }
+
+    diesel::table! {
+        shared.sqlite_master (name) {
+            name -> Text,
+            tbl_name -> Text,
+        }
+    }
 }
 
 use schema::{
     note_counts, note_log, notes, notes_pg2sqlite_overlay, notes_pg2sqlite_shared, sources,
+    sqlite_master,
 };
 
 /// A source insert derives a note, rewrites note 1, removes note 2 and then
@@ -266,12 +274,70 @@ fn the_tables_own_triggers_run_on_overlay_writes() {
 
     derive(&mut alice, 5);
 
-    let logged: Vec<(i32, String)> = note_log::table
+    assert_eq!(logged(&mut alice), [(105, "insert".to_owned()), (2, "delete".to_owned())]);
+}
+
+fn logged(connection: &mut SqliteConnection) -> Vec<(i32, String)> {
+    note_log::table
         .select((note_log::note_id, note_log::event))
         .order(note_log::id)
+        .load(connection)
+        .expect("the log")
+}
+
+#[test]
+fn a_dropped_trigger_stops_firing_on_overlay_writes() {
+    let pg = format!("{NOTES}DROP TRIGGER notes_inserted ON notes;");
+    let script = translate(&pg, &options()).expect("translate");
+    let (_files, mut alice, _bob) = two_identities("dropped-trigger", &script);
+
+    derive(&mut alice, 5);
+
+    assert_eq!(logged(&mut alice), [(2, "delete".to_owned())]);
+}
+
+#[test]
+fn an_index_on_an_overlaid_table_indexes_the_shared_rows() {
+    let pg = format!("{NOTES}CREATE INDEX notes_body ON notes (body);");
+    let script = translate(&pg, &options()).expect("translate");
+    let (_files, mut alice, _bob) = two_identities("index", &script);
+
+    let indexed: Vec<String> = sqlite_master::table
+        .filter(sqlite_master::name.eq("notes_body"))
+        .select(sqlite_master::tbl_name)
         .load(&mut alice)
-        .expect("the log");
-    assert_eq!(logged, [(105, "insert".to_owned()), (2, "delete".to_owned())]);
+        .expect("the shared catalogue");
+    assert_eq!(indexed, ["notes_pg2sqlite_shared"]);
+}
+
+#[test]
+fn a_later_batch_cannot_overlay_a_table_an_earlier_batch_created() {
+    let earlier = Pg2Sqlite::default()
+        .sql(
+            "CREATE TABLE sources (id INTEGER PRIMARY KEY);
+             CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, stamp TEXT);",
+        )
+        .expect("parse")
+        .build_schema()
+        .expect("schema");
+    let later = Pg2Sqlite::default()
+        .sql(
+            "CREATE FUNCTION derive_notes() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+             BEGIN
+               INSERT INTO notes (id, body) VALUES (NEW.id + 100, 'derived');
+               RETURN NULL;
+             END
+             $$;
+             CREATE TRIGGER sources_derive AFTER INSERT ON sources
+               FOR EACH ROW EXECUTE FUNCTION derive_notes();",
+        )
+        .expect("parse")
+        .translate_to_sql_with_schema(&earlier, &options());
+    let reason = match later {
+        Err(Error::UnusableAttachedTables { reason }) => reason,
+        other => panic!("expected an attached table refusal, got {other:?}"),
+    };
+    assert!(reason.contains("`notes`") && reason.contains("earlier batch"), "{reason}");
 }
 
 #[test]
