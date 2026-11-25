@@ -10,7 +10,7 @@ A Rust library that translates PostgreSQL SQL into runnable SQLite. Every return
 
 Beyond types it translates row-level security and grants into views and triggers, GIN `to_tsvector` indexes into FTS5, pgvector into [sqlite-vec](https://github.com/asg017/sqlite-vec), PostGIS into [SQLiteGIS](https://github.com/connetto-rs/sqlitegis) and PL/pgSQL trigger bodies into SQLite triggers, and it translates SQLite DML back to PostgreSQL. It is `no_std + alloc`, and the [playground](https://pg2sqlite.luca.phd) runs it as WebAssembly in the browser.
 
-The functions and collation a replica registers for `jsonb`, case folding and SQL helpers live in [pg2sqlite-runtime](https://github.com/connetto-rs/pg2sqlite/tree/main/runtime), which pg2sqlite re-exports, so a replica registers them without compiling the translator.
+The functions and collation a replica registers for `jsonb`, case folding and SQL helpers, and `guard_refusal`, which classifies a write guard's refusal, live in [pg2sqlite-runtime](https://github.com/connetto-rs/pg2sqlite/tree/main/runtime), which pg2sqlite re-exports, so a replica uses them without compiling the translator.
 
 ## Quick start
 

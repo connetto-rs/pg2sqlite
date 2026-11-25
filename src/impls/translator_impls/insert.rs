@@ -1,6 +1,7 @@
 //! Implementation of the [`Translator`](crate::traits::Translator) trait for
 //! the `Insert` type.
 
+use pg2sqlite_runtime::write_guard::permission_denied;
 use sql_traits::{
     structs::{ColumnScope, IdentifierCase, ParserDB, QueryOutput},
     traits::{ColumnLike, DatabaseLike, TableIndexLike, TableLike, UniqueIndexLike},
@@ -30,7 +31,6 @@ use crate::{
         translator_impls::rls,
     },
     traits::translator::TranslatorWithContext,
-    write_guard::permission_denied,
 };
 type ParserTable = <ParserDB as DatabaseLike>::Table;
 

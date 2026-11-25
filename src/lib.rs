@@ -34,10 +34,12 @@ pub mod script;
 pub mod sqlstate;
 pub mod traits;
 pub mod warnings;
-pub mod write_guard;
+pub(crate) mod write_guard;
 
 /// Prelude module for the library.
 pub mod prelude {
+    pub use pg2sqlite_runtime::write_guard::{GuardRefusal, guard_refusal};
+
     pub use crate::{
         errors::{Error, RefusalCategory, SqlParseError, TranslationDirection, TranslationRefusal},
         initialization::{InitializationError, InitializationPlan},
@@ -55,6 +57,5 @@ pub mod prelude {
             UuidRepresentation, UuidVersion,
         },
         warnings::{TranslationReport, TranslationWarning, WarningSink},
-        write_guard::{GuardRefusal, guard_refusal},
     };
 }
