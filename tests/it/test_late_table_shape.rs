@@ -582,6 +582,93 @@ fn a_late_first_grant_and_policy_reading_a_later_table_keep_the_rows() {
     );
 }
 
+/// A write the owner makes on `notes` after the boundary, before the later
+/// statements of its epoch that its replica shape reads.
+const WRITTEN: &str = "INSERT INTO notes VALUES (4, 'app');";
+
+/// A policy on `notes` reading `allowed`.
+const ALLOWED_POLICY: &str =
+    "CREATE POLICY notes_allowed ON notes TO app USING (id IN (SELECT id FROM allowed));";
+
+#[test]
+fn a_write_before_the_table_a_late_policy_reads_lands() {
+    let secured = "ALTER TABLE notes ENABLE ROW LEVEL SECURITY;";
+    for boundary in [BOUNDARY, RENAME_BOUNDARY] {
+        assert_same_replica(
+            loaded(&format!("{HEAD}{secured}{boundary}{WRITTEN}{ALLOWED}{ALLOWED_POLICY}")),
+            loaded(&format!("{HEAD}{secured}{WRITTEN}{ALLOWED}{ALLOWED_POLICY}{boundary}")),
+        );
+    }
+}
+
+#[test]
+fn a_write_before_a_late_enable_with_a_policy_reading_a_later_table_lands() {
+    let secured = "ALTER TABLE notes ENABLE ROW LEVEL SECURITY;";
+    assert_same_replica(
+        loaded(&format!("{HEAD}{BOUNDARY}{WRITTEN}{ALLOWED}{secured}{ALLOWED_POLICY}")),
+        loaded(&format!("{HEAD}{WRITTEN}{ALLOWED}{secured}{ALLOWED_POLICY}{BOUNDARY}")),
+    );
+}
+
+#[test]
+fn a_write_before_a_late_first_grant_with_a_policy_reading_a_later_table_lands() {
+    let secured = "ALTER TABLE notes ENABLE ROW LEVEL SECURITY;";
+    assert_same_replica(
+        loaded(&format!(
+            "{UNREAD_HEAD}{secured}{BOUNDARY}{WRITTEN}{ALLOWED}{GRANT_ALL}{ALLOWED_POLICY}"
+        )),
+        loaded(&format!(
+            "{UNREAD_HEAD}{secured}{WRITTEN}{ALLOWED}{GRANT_ALL}{ALLOWED_POLICY}{BOUNDARY}"
+        )),
+    );
+}
+
+#[test]
+fn a_write_before_a_late_column_on_a_secured_table_lands() {
+    let added = "ALTER TABLE notes ADD COLUMN tag TEXT;";
+    assert_same_replica(
+        loaded(&format!("{HEAD}{SECURED}{BOUNDARY}{WRITTEN}{added}")),
+        loaded(&format!("{HEAD}{SECURED}{WRITTEN}{added}{BOUNDARY}")),
+    );
+}
+
+#[test]
+fn a_write_before_a_late_policy_reading_a_late_column_lands() {
+    let added = "ALTER TABLE notes ADD COLUMN tag TEXT;";
+    let policy = "CREATE POLICY notes_tagged ON notes TO app USING (tag IS NULL);";
+    assert_same_replica(
+        loaded(&format!("{HEAD}{SECURED}{BOUNDARY}{WRITTEN}{added}{policy}")),
+        loaded(&format!("{HEAD}{SECURED}{WRITTEN}{added}{policy}{BOUNDARY}")),
+    );
+}
+
+#[test]
+fn writes_before_two_late_policies_reading_different_later_tables_land() {
+    let extras = "
+CREATE TABLE extras (id INTEGER PRIMARY KEY);
+GRANT SELECT, INSERT ON extras TO app;
+ALTER TABLE extras ENABLE ROW LEVEL SECURITY;
+ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+";
+    let late = "
+INSERT INTO extras VALUES (1);
+CREATE TABLE blocked (id INTEGER PRIMARY KEY);
+GRANT SELECT ON blocked TO app;
+CREATE POLICY extras_open ON extras TO app USING (id NOT IN (SELECT id FROM blocked));
+";
+    assert_same_replica(
+        loaded(&format!("{HEAD}{extras}{BOUNDARY}{ALLOWED}{WRITTEN}{late}{ALLOWED_POLICY}")),
+        loaded(&format!("{HEAD}{extras}{ALLOWED}{WRITTEN}{late}{ALLOWED_POLICY}{BOUNDARY}")),
+    );
+}
+
+#[test]
+fn a_write_in_a_later_batch_before_the_table_its_policy_reads_lands() {
+    let earlier = format!("{HEAD}ALTER TABLE notes ENABLE ROW LEVEL SECURITY;");
+    let migration = format!("{WRITTEN}{ALLOWED}{ALLOWED_POLICY}");
+    assert_same_replica(migrated(&earlier, &migration), loaded(&format!("{earlier}{migration}")));
+}
+
 #[test]
 fn a_late_enable_keeps_the_index_and_trigger_on_the_table() {
     let (mut late, late_exempt) = loaded(&format!("{HEAD}{ATTACHED}{BOUNDARY}{SECURED}"));
