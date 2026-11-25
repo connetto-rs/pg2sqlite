@@ -21,6 +21,10 @@
 //!
 //! Each step runs for every table before the next, so the table a rebuilt
 //! key names exists, and no table is dropped while a key references it.
+//!
+//! A table renamed between the two schemas translates under its old name
+//! against the first and its new one against the second, its storage already
+//! renamed by the statement ending the epoch.
 
 use sql_traits::{
     structs::ParserDB,
@@ -62,6 +66,8 @@ struct Change<'s> {
     dropped: Vec<Statement>,
     /// The generated objects the new translation adds.
     created: Vec<Statement>,
+    /// The storage's folded name before the run renamed the table.
+    renamed_from: Option<String>,
 }
 
 /// Splits a table's translation into its storage and the objects generated
@@ -108,6 +114,29 @@ fn drop_of(created: &Statement) -> Result<Statement, Error> {
         Statement::CreateVirtualTable { name, .. } => Ok(object(ObjectType::Table, name)),
         _ => Err(irrevocable(created)),
     }
+}
+
+/// The folded names of the objects `drop` drops.
+fn dropped_names(drop: &Statement) -> impl Iterator<Item = String> + '_ {
+    let (trigger, names) = match drop {
+        Statement::DropTrigger(drop) => (Some(&drop.trigger_name), &[][..]),
+        Statement::Drop { names, .. } => (None, names.as_slice()),
+        _ => (None, &[][..]),
+    };
+    trigger.into_iter().chain(names).map(fold)
+}
+
+/// The folded name of the object `created` creates.
+fn created_name(created: &Statement) -> Option<String> {
+    match created {
+        Statement::CreateView(view) => Some(&view.name),
+        Statement::CreateIndex(index) => index.name.as_ref(),
+        Statement::CreateTrigger(trigger) => Some(&trigger.name),
+        Statement::CreateTable(table) => Some(&table.name),
+        Statement::CreateVirtualTable { name, .. } => Some(name),
+        _ => None,
+    }
+    .map(fold)
 }
 
 /// The refusal for `created`, which a reshaped table no longer emits and
@@ -164,6 +193,8 @@ pub(crate) struct Touched {
     /// The names, folded, the run creates, drops or renames, whose table
     /// before the run is not the one after it.
     replaced: Vec<String>,
+    /// The tables the run renames, folded as before it, with the name after.
+    renamed: Vec<(String, ObjectName)>,
 }
 
 impl Touched {
@@ -195,7 +226,7 @@ impl Touched {
                         AlterTableOperation::RenameTable { table_name } => {
                             let (RenameTableNameKind::As(name) | RenameTableNameKind::To(name)) =
                                 table_name;
-                            self.replaced.extend([fold(&alter.name), fold(name)]);
+                            self.rename(&alter.name, name);
                         }
                         _ => {}
                     }
@@ -203,7 +234,7 @@ impl Touched {
             }
             Statement::RenameTable(renames) => {
                 for rename in renames {
-                    self.replaced.extend([fold(&rename.old_name), fold(&rename.new_name)]);
+                    self.rename(&rename.old_name, &rename.new_name);
                 }
             }
             Statement::CreatePolicy(policy) => self.named.push(fold(&policy.table_name)),
@@ -223,7 +254,7 @@ impl Touched {
             Statement::CreateFunction(_)
             | Statement::AlterFunction(_)
             | Statement::DropFunction(_) => self.policy_reads = true,
-            Statement::CreateTable(create) => self.replaced.push(fold(&create.name)),
+            Statement::CreateTable(create) => self.replace(&create.name),
             Statement::Drop {
                 object_type: object_type @ (ObjectType::Table | ObjectType::View),
                 names,
@@ -232,29 +263,58 @@ impl Touched {
             } => {
                 self.policy_reads |= *cascade;
                 if *object_type == ObjectType::Table {
-                    self.replaced.extend(names.iter().map(fold));
+                    for name in names {
+                        self.replace(name);
+                    }
                 }
             }
             _ => {}
         }
     }
 
+    /// Follows the rename of `from` to `to`.
+    fn rename(&mut self, from: &ObjectName, to: &ObjectName) {
+        let from = fold(from);
+        match self.renamed.iter_mut().find(|(_, now)| fold(now) == from) {
+            Some((_, now)) => *now = to.clone(),
+            None => self.renamed.push((from.clone(), to.clone())),
+        }
+        self.replaced.push(from);
+    }
+
+    /// Follows a statement creating or dropping `name`.
+    fn replace(&mut self, name: &ObjectName) {
+        let name = fold(name);
+        self.renamed.retain(|(_, now)| fold(now) != name);
+        self.replaced.push(name);
+    }
+
     /// The tables of `before` whose shape the run may change, in the order
-    /// `before` holds them, with every table whose key references one of
-    /// them, as how a key is kept follows the table it references.
+    /// `before` holds them, with the name after the run of each it renames,
+    /// and every table whose key references one of them, as how a key is
+    /// kept follows the table it references. A renamed table is always
+    /// reached, since its generated objects carry its name.
     ///
     /// # Errors
     ///
     /// Propagates a lookup failure.
-    fn reached<'s>(&self, before: &'s ParserDB) -> Result<Vec<&'s CreateTable>, Error> {
+    fn reached<'s>(
+        &self,
+        before: &'s ParserDB,
+    ) -> Result<Vec<(&'s CreateTable, Option<&ObjectName>)>, Error> {
         let candidates = || {
-            before
-                .tables()
-                .filter(|table| !table.temporary && !self.replaced.contains(&fold(&table.name)))
+            before.tables().filter(|table| !table.temporary).filter_map(|table| {
+                let name = fold(&table.name);
+                match self.renamed.iter().find(|(from, _)| *from == name) {
+                    Some((_, to)) => Some((table, Some(to))),
+                    None => (!self.replaced.contains(&name)).then_some((table, None)),
+                }
+            })
         };
         let mut direct = Vec::new();
-        for table in candidates() {
+        for (table, renamed_to) in candidates() {
             if self.every
+                || renamed_to.is_some()
                 || self.named.contains(&fold(&table.name))
                 || (self.policy_reads && table.has_row_level_security(before)?)
             {
@@ -265,7 +325,7 @@ impl Touched {
             return Ok(Vec::new());
         }
         Ok(candidates()
-            .filter(|table| {
+            .filter(|(table, _)| {
                 direct.contains(&fold(&table.name))
                     || keys(table).any(|referenced| direct.contains(&fold(referenced)))
             })
@@ -290,29 +350,53 @@ fn keys(table: &CreateTable) -> impl Iterator<Item = &ObjectName> {
     inline.chain(declared)
 }
 
-/// How `table`, which `after` still holds, changes between the translation
-/// against `before` and the one against `after`, absent when it does not.
+/// How `table`, which `after` still holds as `renamed_to` when the run
+/// renames it, changes between the translation against `before`, with what
+/// `boundary`, the statements the epoch-ending statement emitted, drops and
+/// creates, and the one against `after`, absent when it does not.
 ///
 /// # Errors
 ///
 /// Returns a refused translation.
 fn change<'s>(
-    table: &CreateTable,
+    (table, renamed_to): (&CreateTable, Option<&ObjectName>),
     (before, after): (&ParserDB, &'s ParserDB),
+    boundary: &[Statement],
     translate: &mut Translate<'_>,
     emit: WarningSink<'_>,
 ) -> Result<Option<Change<'s>>, Error> {
-    let Some(declared) = resolve_declared_table(after, table)? else { return Ok(None) };
-    let source = Statement::CreateTable(drop_column_rebuild::as_declared(table, before)?);
-    let (was, _) = translate(&source, before)?;
-    let (now, warnings) = translate(&source, after)?;
-    if was == now {
+    let source = drop_column_rebuild::as_declared(table, before)?;
+    let mut target = source.clone();
+    // A rename keeps the table in its schema.
+    if let (Some(last), Some(to)) =
+        (target.name.0.last_mut(), renamed_to.and_then(|to| to.0.last()))
+    {
+        *last = to.clone();
+    }
+    let Some(declared) = resolve_declared_table(after, &target)? else { return Ok(None) };
+    let (was, _) = translate(&Statement::CreateTable(source), before)?;
+    let (now, warnings) = translate(&Statement::CreateTable(target), after)?;
+    let ((mut was, held), (now, generated)) = (split(was), split(now));
+    let gone: Vec<String> = boundary.iter().flat_map(dropped_names).collect();
+    let held: Vec<Statement> = held
+        .into_iter()
+        .filter(|statement| created_name(statement).is_none_or(|name| !gone.contains(&name)))
+        .chain(boundary.iter().filter(|statement| generated.contains(statement)).cloned())
+        .collect();
+    let mut renamed_from = None;
+    // The statement renaming the table has already renamed its storage.
+    if let (Some(name), Some(was)) = (renamed_to, &mut was)
+        && fold(&was.name) == fold(&table.name)
+    {
+        renamed_from = Some(fold(&was.name));
+        was.name = sqlite_unqualified_object_name(name);
+    }
+    if was == now && held == generated {
         return Ok(None);
     }
     for warning in warnings {
         emit(warning);
     }
-    let ((was, held), (now, generated)) = (split(was), split(now));
     let dropped: Vec<Statement> =
         held.iter().filter(|statement| !generated.contains(statement)).cloned().collect();
     // Dropping a view takes its triggers, changed or not.
@@ -330,15 +414,23 @@ fn change<'s>(
             || matches!(statement, Statement::CreateTrigger(trigger)
                 if dropped_views.contains(&fold(&trigger.table_name)))
     });
-    Ok(Some(Change { table: declared, was, now, dropped, created: created.cloned().collect() }))
+    Ok(Some(Change {
+        table: declared,
+        was,
+        now,
+        dropped,
+        created: created.cloned().collect(),
+        renamed_from,
+    }))
 }
 
 /// The statements moving the replica from the shape `before` holds to the
 /// one `after` holds, for the tables `touched` reaches, with the names of the
 /// tables whose shape changes, whose triggers follow it.
 ///
-/// `options` carries the live indexes and triggers, which a rebuilt table
-/// takes along.
+/// `boundary` is what the statement ending the epoch emitted, which the
+/// replica already holds, and `options` carries the live indexes and
+/// triggers, which a rebuilt table takes along.
 ///
 /// # Errors
 ///
@@ -347,13 +439,14 @@ fn change<'s>(
 pub(crate) fn reshaped(
     (before, after): (&ParserDB, &ParserDB),
     touched: &Touched,
+    boundary: &[Statement],
     options: &TranslationContext<'_>,
     translate: &mut Translate<'_>,
     emit: WarningSink<'_>,
 ) -> Result<(Vec<Statement>, Vec<ObjectName>), Error> {
     let mut changes = Vec::new();
-    for table in touched.reached(before)? {
-        changes.extend(change(table, (before, after), translate, &mut *emit)?);
+    for reached in touched.reached(before)? {
+        changes.extend(change(reached, (before, after), boundary, translate, &mut *emit)?);
     }
     if changes.is_empty() {
         return Ok((Vec::new(), Vec::new()));
@@ -369,11 +462,13 @@ pub(crate) fn reshaped(
         .iter()
         .filter_map(|change| {
             match (&change.was, &change.now) {
-                (Some(was), Some(now)) if fold(&was.name) != fold(&now.name) => {
-                    Some((fold(&was.name), now.name.clone()))
-                }
+                (Some(was), Some(now)) => Some((was, now, &change.renamed_from)),
                 _ => None,
             }
+        })
+        .flat_map(|(was, now, renamed_from)| {
+            let reshaped = (fold(&was.name) != fold(&now.name)).then(|| fold(&was.name));
+            renamed_from.iter().cloned().chain(reshaped).map(|from| (from, now.name.clone()))
         })
         .collect();
     let mut rebuilt = Vec::new();

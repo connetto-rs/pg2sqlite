@@ -548,8 +548,7 @@ impl<'s> Inliner<'s, '_> {
         };
         let reader = owner.or(caller);
         if let Some(reader) = reader {
-            let acting = session_variable::acting_role(self.schema, self.options)?;
-            check_reads_relations(name, &statement, reader, acting, self.schema)?;
+            check_reads_relations(name, &statement, reader, self.schema, self.options)?;
         }
         let depth = self.expanding.len()
             + self.options.inlined_body().map_or(0, |body| body.chain().count());
@@ -1478,15 +1477,17 @@ fn read_backing_tables(
 
 /// Refuses a body reading a table on which `reader` holds no `SELECT` on any
 /// column, which PostgreSQL requires of every table a query reads, or not on
-/// every column where a `*` reads them all, and one on which the `acting`
-/// role holds no privilege, which the translation leaves out of the replica.
+/// every column where a `*` reads them all, and one the translation leaves
+/// out of the replica, on which the acting role `options` names holds no
+/// privilege.
 fn check_reads_relations(
     name: &ObjectName,
     statement: &Statement,
     reader: &Role,
-    acting: Option<&Role>,
     schema: &ParserDB,
+    options: &TranslationContext<'_>,
 ) -> Result<(), Error> {
+    let acting = session_variable::acting_role(schema, options)?;
     let starred = wildcard_relations(statement);
     let check = |relation: &ObjectName| -> Result<(), Error> {
         let Some(table) = resolve_translation_table(schema, relation)? else { return Ok(()) };
@@ -1507,7 +1508,7 @@ fn check_reads_relations(
             ));
         }
         if let Some(acting) = acting
-            && !RoleTable::of(table, Some(acting), schema)?.reads_any()
+            && !RoleTable::in_batch(table, Some(acting), schema, options)?.reads_any()
         {
             return Err(refusal(name, &hidden_read(relation, acting)));
         }

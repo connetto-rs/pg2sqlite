@@ -465,7 +465,7 @@ fn translate_create_table_for_role(
         return Ok(None);
     };
 
-    let grants = RoleTable::of(table, Some(role), schema)?;
+    let grants = RoleTable::in_batch(table, Some(role), schema, options)?;
     if !grants.reads_any() {
         return Ok(Some(Vec::new()));
     }
@@ -667,7 +667,7 @@ fn role_access_for_object_name(
         return Err(Error::TableNotFoundInSchema { table_name: table_name.to_string() });
     };
 
-    if RoleTable::of(table, Some(role), schema)?.reads_any() {
+    if RoleTable::in_batch(table, Some(role), schema, options)?.reads_any() {
         Ok(RoleTableAccess::Allow)
     } else {
         Ok(RoleTableAccess::Deny)

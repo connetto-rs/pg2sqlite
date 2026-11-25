@@ -467,6 +467,121 @@ fn a_late_grant_brings_the_table_onto_the_replica() {
     assert_same_objects(&mut late, &mut early);
 }
 
+/// The role, `notes` holding no grant to it, and the rows its owner writes.
+const UNREAD_HEAD: &str = "
+CREATE ROLE app NOLOGIN;
+CREATE TABLE notes (id INTEGER PRIMARY KEY, owner TEXT NOT NULL);
+INSERT INTO notes VALUES (1, 'app'), (2, 'other'), (3, 'app');
+";
+
+/// Every privilege on `notes` to the role.
+const GRANT_ALL: &str = "GRANT SELECT, INSERT, UPDATE, DELETE ON notes TO app;";
+
+#[test]
+fn a_late_first_grant_keeps_the_rows_written_before_it() {
+    assert_late_event_matches(UNREAD_HEAD, GRANT_ALL);
+}
+
+#[test]
+fn a_late_first_grant_keeps_the_updates_made_before_it() {
+    assert_late_event_matches(
+        &format!("{UNREAD_HEAD}UPDATE notes SET owner = 'app' WHERE id = 2;"),
+        "GRANT SELECT ON notes TO app;",
+    );
+}
+
+#[test]
+fn a_late_first_grant_keeps_the_index_made_before_it() {
+    assert_late_event_matches(
+        &format!("{UNREAD_HEAD}CREATE INDEX notes_owner ON notes (owner);"),
+        GRANT_ALL,
+    );
+}
+
+#[test]
+fn a_late_first_grant_keeps_the_rows_a_read_table_keys_into() {
+    let (mut late, late_exempt) = loaded(&format!("{UNREAD_HEAD}{TAGS}{BOUNDARY}{GRANT_ALL}"));
+    let (mut early, early_exempt) = loaded(&format!("{UNREAD_HEAD}{TAGS}{GRANT_ALL}{BOUNDARY}"));
+    assert_same_objects(&mut late, &mut early);
+    let tags = |connection: &mut SqliteConnection| {
+        tags::table.select(tags::note).order(tags::note).load::<i32>(connection).expect("read tags")
+    };
+    assert_eq!(tags(&mut late), tags(&mut early));
+    assert_eq!(notes_rows(&mut late, &late_exempt), notes_rows(&mut early, &early_exempt));
+}
+
+#[test]
+fn a_revoke_granted_back_later_keeps_the_rows() {
+    let revoke = "REVOKE ALL ON notes FROM app;";
+    assert_same_replica(
+        loaded(&format!("{HEAD}{BOUNDARY}{revoke}{BOUNDARY}{GRANT_ALL}")),
+        loaded(&format!("{HEAD}{revoke}{GRANT_ALL}{BOUNDARY}{BOUNDARY}")),
+    );
+}
+
+#[test]
+fn a_first_grant_after_the_table_is_renamed_keeps_its_rows() {
+    let unread = UNREAD_HEAD.replace("notes", "drafts");
+    assert_same_replica(
+        loaded(&format!("{unread}ALTER TABLE drafts RENAME TO notes;{GRANT_ALL}")),
+        loaded(&format!("{UNREAD_HEAD}{GRANT_ALL}{BOUNDARY}")),
+    );
+}
+
+#[test]
+fn a_grant_after_the_table_is_renamed_reaches_it() {
+    let read = "GRANT SELECT ON drafts TO app;";
+    let head = UNREAD_HEAD.replace("notes", "drafts");
+    assert_same_replica(
+        loaded(&format!("{head}{read}ALTER TABLE drafts RENAME TO notes;{GRANT_ALL}")),
+        loaded(&format!("{UNREAD_HEAD}{GRANT_ALL}{BOUNDARY}")),
+    );
+}
+
+#[test]
+fn a_grant_an_epoch_after_the_rename_reaches_it() {
+    let read = "GRANT SELECT ON drafts TO app;";
+    let head = UNREAD_HEAD.replace("notes", "drafts");
+    assert_same_replica(
+        loaded(&format!("{head}{read}ALTER TABLE drafts RENAME TO notes;{BOUNDARY}{GRANT_ALL}")),
+        loaded(&format!("{UNREAD_HEAD}{GRANT_ALL}{BOUNDARY}{BOUNDARY}")),
+    );
+}
+
+/// `allowed`, which a later policy on `notes` reads, and the role's grant on
+/// it.
+const ALLOWED: &str = "
+CREATE TABLE allowed (id INTEGER PRIMARY KEY);
+GRANT SELECT ON allowed TO app;
+INSERT INTO allowed VALUES (1), (2);
+";
+
+/// Ends the epoch with a rename of a table the role reads, which SQLite runs
+/// only once every view resolves.
+const RENAME_BOUNDARY: &str = "CREATE TABLE draft (id INTEGER); GRANT SELECT ON draft TO app; ALTER TABLE draft RENAME TO sketch;";
+
+#[test]
+fn a_late_policy_reading_a_table_created_after_the_boundary_waits_for_it() {
+    let secured = "ALTER TABLE notes ENABLE ROW LEVEL SECURITY;";
+    let policy =
+        "CREATE POLICY notes_allowed ON notes TO app USING (id IN (SELECT id FROM allowed));";
+    assert_same_replica(
+        loaded(&format!("{HEAD}{secured}{RENAME_BOUNDARY}{ALLOWED}{policy}")),
+        loaded(&format!("{HEAD}{secured}{ALLOWED}{policy}{RENAME_BOUNDARY}")),
+    );
+}
+
+#[test]
+fn a_late_first_grant_and_policy_reading_a_later_table_keep_the_rows() {
+    let secured = "ALTER TABLE notes ENABLE ROW LEVEL SECURITY;";
+    let policy =
+        "CREATE POLICY notes_allowed ON notes TO app USING (id IN (SELECT id FROM allowed));";
+    assert_same_replica(
+        loaded(&format!("{UNREAD_HEAD}{secured}{RENAME_BOUNDARY}{ALLOWED}{GRANT_ALL}{policy}")),
+        loaded(&format!("{UNREAD_HEAD}{secured}{ALLOWED}{GRANT_ALL}{policy}{RENAME_BOUNDARY}")),
+    );
+}
+
 #[test]
 fn a_late_enable_keeps_the_index_and_trigger_on_the_table() {
     let (mut late, late_exempt) = loaded(&format!("{HEAD}{ATTACHED}{BOUNDARY}{SECURED}"));

@@ -185,6 +185,22 @@ GRANT SELECT ON kinds, labels, allowed TO app;
 CREATE POLICY kinds_read ON kinds FOR SELECT TO app USING (id IN (SELECT id FROM allowed));
 ";
 
+/// Seeds a table under row level security, then renames an unrelated table
+/// before the policy is created.
+const SEED_BEFORE_TABLE_RENAME_SCHEMA: &str = "
+CREATE ROLE app NOLOGIN;
+CREATE TABLE kinds (id TEXT PRIMARY KEY);
+ALTER TABLE kinds ENABLE ROW LEVEL SECURITY;
+INSERT INTO kinds (id) VALUES ('sample'), ('device'), ('reagent');
+UPDATE kinds SET id = 'specimen' WHERE id = 'reagent';
+CREATE TABLE labels (name TEXT PRIMARY KEY);
+ALTER TABLE labels RENAME TO tags;
+CREATE TABLE allowed (id TEXT PRIMARY KEY);
+INSERT INTO allowed (id) VALUES ('sample'), ('specimen');
+GRANT SELECT ON kinds, tags, allowed TO app;
+CREATE POLICY kinds_read ON kinds FOR SELECT TO app USING (id IN (SELECT id FROM allowed));
+";
+
 /// Seeds a table whose policy reads a later table under a policy reading a
 /// table later still.
 const SEED_BEFORE_POLICY_READ_CHAIN_SCHEMA: &str = "
@@ -1049,6 +1065,31 @@ fn exempt_writes_through_a_view_hiding_the_key_are_refused() {
 #[test]
 fn seeds_load_before_the_table_the_policy_reads() {
     let (mut connection, exempt) = load_exempt(SEED_BEFORE_POLICY_READ_SCHEMA);
+
+    assert_eq!(
+        schema::kinds_rls::table
+            .select(schema::kinds_rls::id)
+            .order(schema::kinds_rls::id)
+            .load::<String>(&mut connection)
+            .expect("read the backing table"),
+        ["device", "sample", "specimen"]
+    );
+    exempt.store(false, Ordering::Relaxed);
+    assert_eq!(
+        schema::kinds::table
+            .select(schema::kinds::id)
+            .order(schema::kinds::id)
+            .load::<String>(&mut connection)
+            .expect("read kinds through the view"),
+        ["sample", "specimen"]
+    );
+}
+
+/// A table rename between a table's seeds and its policy keeps the seeded
+/// rows in the backing table the policy reads.
+#[test]
+fn seeds_load_before_a_table_rename() {
+    let (mut connection, exempt) = load_exempt(SEED_BEFORE_TABLE_RENAME_SCHEMA);
 
     assert_eq!(
         schema::kinds_rls::table

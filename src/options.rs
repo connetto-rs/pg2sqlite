@@ -1,6 +1,6 @@
 //! Submodule defining a struct providing options for the translation.
 
-use alloc::borrow::Cow;
+use alloc::{borrow::Cow, collections::BTreeSet, rc::Rc};
 
 use sql_traits::{
     structs::{
@@ -274,6 +274,9 @@ pub(crate) struct PrewalkCatalogs {
     /// The helpers the translation calls as table-valued functions, in the
     /// order first called.
     helper_functions: core::cell::RefCell<Vec<crate::script::HelperFunction>>,
+    /// Each epoch's schema with the folded names of the tables it holds that
+    /// the acting role reads in none of its statements but in a later epoch.
+    pending_tables: Vec<(Rc<ParserDB>, BTreeSet<String>)>,
 }
 
 /// A trigger on a table or a view.
@@ -1132,6 +1135,24 @@ impl<'a> TranslationContext<'a> {
     #[must_use]
     pub(crate) fn is_left_out_trigger_name(&self, name: &str) -> bool {
         self.catalogs.left_out_trigger_names.iter().any(|left| left == name)
+    }
+
+    /// Records `pending`, each epoch's schema with the folded names of the
+    /// tables the acting role reads only in a later epoch.
+    pub(crate) fn set_pending_tables(&mut self, pending: Vec<(Rc<ParserDB>, BTreeSet<String>)>) {
+        self.catalogs.to_mut().pending_tables = pending;
+    }
+
+    /// Whether the table `name` of `schema`, an epoch's schema, is one the
+    /// acting role reads in no statement of that epoch but in a later one,
+    /// which the replica holds from its creation so the rows written before
+    /// the role reads it are there when it does.
+    #[must_use]
+    pub(crate) fn is_pending_table(&self, schema: &ParserDB, name: &ObjectName) -> bool {
+        let folded = crate::impls::translator_impls::drop_column_rebuild::fold(name);
+        self.catalogs.pending_tables.iter().any(|(epoch, names)| {
+            core::ptr::eq(Rc::as_ptr(epoch), schema) && names.contains(&folded)
+        })
     }
 
     pub(crate) fn add_before_row_trigger_fn(
