@@ -12,7 +12,7 @@ use ::sqlstate::pg;
 
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
-use crate::write_guard::is_policy_refusal;
+use crate::write_guard::guard_refusal;
 
 /// What separates the SQLSTATE from the message.
 const SEPARATOR: &str = ": ";
@@ -77,8 +77,8 @@ impl From<sql_traits::errors::PostgresError> for PostgresError<'_> {
 ///
 /// A translated `RAISE EXCEPTION` reports the SQLSTATE of its condition or its
 /// `USING ERRCODE`, and `P0001` without either. A write guard's refusal, which
-/// [`is_policy_refusal`] recognises, reports `42501` with the message as it
-/// stands. SQLite's own errors, such as a failed `NOT NULL`, are not read.
+/// [`guard_refusal`] recognises, reports `42501` with the message as it stands.
+/// SQLite's own errors, such as a failed `NOT NULL`, are not read.
 ///
 /// ```
 /// use pg2sqlite::prelude::postgres_error;
@@ -102,5 +102,5 @@ pub fn postgres_error(message: &str) -> Option<PostgresError<'_>> {
     {
         return Some(PostgresError::new(sqlstate, message));
     }
-    is_policy_refusal(message).then_some(PostgresError::new(pg::INSUFFICIENT_PRIVILEGE, message))
+    guard_refusal(message).map(|_| PostgresError::new(pg::INSUFFICIENT_PRIVILEGE, message))
 }

@@ -55,6 +55,6 @@ pub mod prelude {
             UuidRepresentation, UuidVersion,
         },
         warnings::{TranslationReport, TranslationWarning, WarningSink},
-        write_guard::is_policy_refusal,
+        write_guard::{GuardRefusal, guard_refusal},
     };
 }
