@@ -296,6 +296,7 @@ mod test_rls_self_referential;
 mod test_rls_self_referential_policy;
 mod test_rls_strict_select_gate;
 mod test_rls_subquery_scope;
+mod test_rls_table_alterations;
 mod test_rls_tenant_isolation;
 mod test_rls_translation;
 mod test_rls_trigger_table_name;
