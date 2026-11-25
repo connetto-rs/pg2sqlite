@@ -33,8 +33,8 @@ use sql_traits::{
     traits::{DatabaseLike, TableLike},
 };
 use sqlparser::ast::{
-    AlterTableOperation, ColumnOption, CreateTable, DropTrigger, Grant, GrantObjects, ObjectName,
-    ObjectType, RenameTableNameKind, Revoke, Statement, TableConstraint,
+    AlterTableOperation, ColumnOption, CreateTable, DropTrigger, ForeignKeyConstraint, Grant,
+    GrantObjects, ObjectName, ObjectType, RenameTableNameKind, Revoke, Statement, TableConstraint,
 };
 
 use super::drop_column_rebuild::{self, fold};
@@ -184,6 +184,10 @@ pub(crate) struct Touched {
     replaced: Vec<String>,
     /// The tables the run renames, folded as before it, with the name after.
     renamed: Vec<(String, ObjectName)>,
+    /// A change to a trigger, a table owner or a function, which can move
+    /// whom the triggers a foreign key action fires run as, and so which keys
+    /// SQLite keeps and every guard's list of roles.
+    action_runners: bool,
 }
 
 impl Touched {
@@ -201,11 +205,14 @@ impl Touched {
             Statement::AlterTable(alter) => {
                 for operation in &alter.operations {
                     match operation {
+                        AlterTableOperation::OwnerTo { .. } => {
+                            self.named.push(fold(&alter.name));
+                            self.action_runners = true;
+                        }
                         AlterTableOperation::EnableRowLevelSecurity
                         | AlterTableOperation::DisableRowLevelSecurity
                         | AlterTableOperation::ForceRowLevelSecurity
                         | AlterTableOperation::NoForceRowLevelSecurity
-                        | AlterTableOperation::OwnerTo { .. }
                         | AlterTableOperation::AddColumn { .. }
                         | AlterTableOperation::DropColumn { .. }
                         | AlterTableOperation::RenameColumn { .. }
@@ -237,7 +244,11 @@ impl Touched {
             | Statement::Drop { object_type: ObjectType::Role, .. } => self.every = true,
             Statement::CreateFunction(_)
             | Statement::AlterFunction(_)
-            | Statement::DropFunction(_) => self.policy_reads = true,
+            | Statement::DropFunction(_) => {
+                self.policy_reads = true;
+                self.action_runners = true;
+            }
+            Statement::CreateTrigger(_) | Statement::DropTrigger(_) => self.action_runners = true,
             Statement::CreateTable(create) => self.replace(&create.name),
             Statement::Drop {
                 object_type: object_type @ (ObjectType::Table | ObjectType::View),
@@ -291,7 +302,10 @@ impl Touched {
     /// `before` holds them, with the name after the run of each it renames,
     /// and every table whose key references one of them, as how a key is
     /// kept follows the table it references. A renamed table is always
-    /// reached, since its generated objects carry its name.
+    /// reached, since its generated objects carry its name. A run moving
+    /// whom the triggers a foreign key action fires run as reaches every
+    /// table when a key of `before` writes rows, as every guard lists the
+    /// roles a key action runs as.
     ///
     /// # Errors
     ///
@@ -309,9 +323,19 @@ impl Touched {
                 }
             })
         };
+        let runners_move = self.action_runners
+            && before.tables().any(|table| {
+                foreign_keys(table).any(|key| {
+                    [key.on_delete, key.on_update]
+                        .into_iter()
+                        .flatten()
+                        .any(super::hidden_referenced_rows::writes_rows)
+                })
+            });
         let mut direct = Vec::new();
         for (table, renamed_to) in candidates() {
             if self.every
+                || runners_move
                 || renamed_to.is_some()
                 || self.named.contains(&fold(&table.name))
                 || (self.policy_reads && table.has_row_level_security(before)?)
@@ -325,23 +349,23 @@ impl Touched {
         Ok(candidates()
             .filter(|(table, _)| {
                 direct.contains(&fold(&table.name))
-                    || keys(table).any(|referenced| direct.contains(&fold(referenced)))
+                    || foreign_keys(table).any(|key| direct.contains(&fold(&key.foreign_table)))
             })
             .collect())
     }
 }
 
-/// The tables `table`'s keys reference.
-fn keys(table: &CreateTable) -> impl Iterator<Item = &ObjectName> {
+/// The foreign keys `table` declares.
+fn foreign_keys(table: &CreateTable) -> impl Iterator<Item = &ForeignKeyConstraint> {
     let inline = table.columns.iter().flat_map(|column| &column.options).filter_map(|option| {
         match &option.option {
-            ColumnOption::ForeignKey(key) => Some(&key.foreign_table),
+            ColumnOption::ForeignKey(key) => Some(key),
             _ => None,
         }
     });
     let declared = table.constraints.iter().filter_map(|constraint| {
         match constraint {
-            TableConstraint::ForeignKey(key) => Some(&key.foreign_table),
+            TableConstraint::ForeignKey(key) => Some(key),
             _ => None,
         }
     });

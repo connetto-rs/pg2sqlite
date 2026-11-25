@@ -19,6 +19,11 @@
 //! [`KEY_ACTION`], since PostgreSQL runs the action as the referencing
 //! table's owner and past its row-level security, and the guards of a table
 //! receiving such an action stand aside while that frame is the innermost.
+//! A trigger the action fires runs as that owner, pushing it as a definer
+//! body pushes its own, and the triggers its writes fire run as that owner
+//! too. A table whose owner the schema never declares belongs to a
+//! superuser, so its triggers push [`KEY_ACTION_OWNER`], which every guard
+//! lets through.
 //!
 //! A `TRUNCATE` empties its tables under a frame owned by [`TRUNCATION`],
 //! since PostgreSQL checks only the `TRUNCATE` privilege and fires no row
@@ -34,13 +39,12 @@ use sql_traits::{
     traits::{DatabaseLike, FunctionLike, RoleLike, TableLike},
 };
 use sqlparser::ast::{
-    BinaryOperator, CreateFunction, CreateTable, DataType, Expr, FunctionReturnType, Ident,
-    InTarget, ObjectName, ObjectNamePart, Statement, visit_expressions, visit_relations,
-    visit_relations_mut,
+    BinaryOperator, CreateFunction, CreateRole, CreateTable, DataType, Expr, FunctionReturnType,
+    FunctionSecurity, Ident, InTarget, ObjectName, ObjectNamePart, RoleKeyword, Statement,
+    TriggerEvent, visit_expressions, visit_relations, visit_relations_mut,
 };
 
 use super::{
-    create_trigger::{TriggerRelation, trigger_relation},
     plpgsql::{ReadBodies, body_reach},
     trigger_slots::folded,
 };
@@ -54,6 +58,7 @@ use crate::{
         object_name::{append_suffix, resolve_translation_table},
         privileges::{RoleTable, has_backing_table},
         query_builder::{from_relation, plain_table_factor, single_expr_query},
+        session_variable,
         translator_impls::off_replica::row_write,
     },
     traits::schema::trigger_function,
@@ -71,7 +76,159 @@ pub(crate) const KEY_ACTION: &str = "pg_key_action";
 /// [`KEY_ACTION`] is.
 pub(crate) const TRUNCATION: &str = "pg_truncate";
 
+/// The owner of the frame a trigger a foreign key action fires pushes when
+/// its table's owner is undeclared, reserved as [`KEY_ACTION`] is. The
+/// trigger runs as a superuser, past every guard.
+pub(crate) const KEY_ACTION_OWNER: &str = "pg_key_action_owner";
+
 type Role = <ParserDB as DatabaseLike>::Role;
+
+/// The role the triggers a foreign key action fires on a table run as.
+pub(crate) enum ActionOwner<'s> {
+    /// The table's declared owner.
+    Declared(&'s Role),
+    /// A superuser, the owner of a table whose owner is undeclared.
+    Undeclared,
+}
+
+impl<'s> ActionOwner<'s> {
+    /// The role, `superuser` standing for an undeclared owner.
+    pub(crate) fn role(&self, superuser: &'s Role) -> &'s Role {
+        match self {
+            Self::Declared(role) => role,
+            Self::Undeclared => superuser,
+        }
+    }
+}
+
+/// The superuser [`ActionOwner::Undeclared`] stands for, named
+/// [`KEY_ACTION_OWNER`].
+pub(crate) fn key_action_superuser() -> Role {
+    CreateRole {
+        keyword: RoleKeyword::Role,
+        names: vec![ObjectName(vec![ObjectNamePart::Identifier(Ident::new(KEY_ACTION_OWNER))])],
+        if_not_exists: false,
+        login: None,
+        inherit: None,
+        bypassrls: None,
+        password: None,
+        superuser: Some(true),
+        create_db: None,
+        create_role: None,
+        replication: None,
+        connection_limit: None,
+        valid_until: None,
+        in_role: Vec::new(),
+        in_group: Vec::new(),
+        role: Vec::new(),
+        user: Vec::new(),
+        admin: Vec::new(),
+        authorization_owner: None,
+    }
+}
+
+/// The role the triggers a foreign key action fires on `table` run as,
+/// `None` when no acting role is named or the acting role owns `table`.
+///
+/// # Errors
+///
+/// Refuses an owner the schema does not declare as a role, and an acting
+/// role the schema does not declare.
+pub(crate) fn action_owner<'s>(
+    table: &CreateTable,
+    schema: &'s ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<Option<ActionOwner<'s>>, Error> {
+    let Some(acting) = session_variable::acting_role(schema, options)? else { return Ok(None) };
+    let Some(owner) = table.owner(schema)? else { return Ok(Some(ActionOwner::Undeclared)) };
+    if owner == acting.name() {
+        return Ok(None);
+    }
+    match schema.role(owner) {
+        Some(role) => Ok(Some(ActionOwner::Declared(role))),
+        None => {
+            Err(Error::forward_refusal(format!(
+                "table '{}' is owned by '{owner}', which the schema never declares, and a \
+                 foreign key action runs the table's triggers as its owner. Create the role.",
+                table.table_name()
+            )))
+        }
+    }
+}
+
+/// The row triggers the batch leaves on `table` whose function runs as the
+/// role writing the table, `SECURITY INVOKER` or not declared in the schema.
+///
+/// # Errors
+///
+/// Propagates a lookup failure.
+pub(crate) fn invoker_triggers<'o>(
+    table: &CreateTable,
+    schema: &ParserDB,
+    options: &'o crate::options::TranslationContext<'_>,
+) -> Result<Vec<&'o crate::options::TableTrigger>, Error> {
+    let key = super::trigger_slots::TableKey::from(table);
+    let mut triggers = Vec::new();
+    for trigger in options.batch_triggers() {
+        if trigger.table != key || !trigger.row_level {
+            continue;
+        }
+        let Some(function) = &trigger.function else { continue };
+        let function = trigger_function(schema, function)?;
+        if function.is_none_or(|function| function.security_mode() != FunctionSecurity::Definer) {
+            triggers.push(trigger);
+        }
+    }
+    Ok(triggers)
+}
+
+/// Whether a trigger firing on `fired` fires on one of `events`, an
+/// `UPDATE OF` list on an update writing one of its columns, or columns
+/// `events` leaves unnamed.
+pub(crate) fn fires_on(fired: &[TriggerEvent], events: &[TriggerEvent]) -> bool {
+    fired.iter().any(|fired| {
+        events.iter().any(|event| {
+            match (fired, event) {
+                (TriggerEvent::Update(listed), TriggerEvent::Update(written)) => {
+                    listed.is_empty()
+                        || written.is_empty()
+                        || listed.iter().any(|column| {
+                            written.iter().any(|written| {
+                                crate::impls::object_name::same_identifier(column, written)
+                            })
+                        })
+                }
+                (fired, event) => core::mem::discriminant(fired) == core::mem::discriminant(event),
+            }
+        })
+    })
+}
+
+/// The tables a foreign key action writes past their guards whose invoker
+/// triggers it fires run as an owner other than the acting role, with that
+/// owner.
+///
+/// # Errors
+///
+/// Fails as [`action_owner`] and
+/// [`receives_key_actions`](super::hidden_referenced_rows::receives_key_actions)
+/// do.
+pub(crate) fn action_owned_tables<'s>(
+    schema: &'s ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<Vec<(&'s CreateTable, ActionOwner<'s>)>, Error> {
+    let mut tables = Vec::new();
+    for table in schema.tables() {
+        if invoker_triggers(table, schema, options)?.is_empty() {
+            continue;
+        }
+        let Some(owner) = action_owner(table, schema, options)? else { continue };
+        if super::hidden_referenced_rows::receives_key_actions(table, schema, options)? {
+            tables.push((table, owner));
+        }
+    }
+    Ok(tables)
+}
 
 /// `CREATE TABLE IF NOT EXISTS` for [`STACK`], which a translation needs
 /// whenever one of its statements reads or writes it.
@@ -128,57 +285,110 @@ pub(crate) fn exempts(table: &CreateTable, owner: &Role, schema: &ParserDB) -> b
     matches!(table.row_security(RowStatement::Select, owner, schema), Ok(RowSecurity::Exempt(_)))
 }
 
-/// The owners of the schema's definer trigger functions and PL/pgSQL helpers,
-/// whose bodies a trigger runs, each named once.
-fn running_owners(schema: &ParserDB) -> Vec<&Role> {
-    let mut owners: Vec<&Role> = Vec::new();
+/// The roles whose bodies a trigger runs past the guards holding the acting
+/// role to its privileges.
+struct RunningOwners<'s> {
+    /// The owners of the schema's definer trigger functions and PL/pgSQL
+    /// helpers, and the declared owners the triggers a foreign key action
+    /// fires run as, each named once.
+    roles: Vec<&'s Role>,
+    /// Whether a foreign key action fires the triggers of a table whose owner
+    /// is undeclared, which run as [`KEY_ACTION_OWNER`].
+    superuser: bool,
+}
+
+/// The roles whose bodies a trigger runs past the guards holding the acting
+/// role.
+///
+/// # Errors
+///
+/// Fails as [`action_owned_tables`] does.
+fn running_owners<'s>(
+    schema: &'s ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<RunningOwners<'s>, Error> {
+    let mut owners = RunningOwners { roles: Vec::new(), superuser: false };
+    let mut add = |owner: &'s Role| {
+        if !owners.roles.iter().any(|listed| listed.name() == owner.name()) {
+            owners.roles.push(owner);
+        }
+    };
     let runs_in_triggers = |function: &CreateFunction| {
         returns_trigger(function) || function.stored_language().as_deref() == Some("plpgsql")
     };
     for function in schema.functions().filter(|function| runs_in_triggers(function)) {
-        if let Ok(Some(owner)) = definer_owner(function, schema)
-            && !owners.iter().any(|listed| listed.name() == owner.name())
-        {
-            owners.push(owner);
+        if let Ok(Some(owner)) = definer_owner(function, schema) {
+            add(owner);
         }
     }
-    owners
+    let mut superuser = false;
+    for (_, owner) in action_owned_tables(schema, options)? {
+        match owner {
+            ActionOwner::Declared(owner) => add(owner),
+            ActionOwner::Undeclared => superuser = true,
+        }
+    }
+    owners.superuser = superuser;
+    Ok(owners)
 }
 
-/// The owners of the schema's definer trigger functions and PL/pgSQL helpers,
-/// whose bodies a trigger runs, that `table`'s row-level security exempts,
-/// the ones whose bodies its guards let through.
+/// The roles whose bodies a trigger runs that `table`'s row-level security
+/// exempts, the ones whose bodies its guards let through.
 ///
 /// A definer function whose owner is undeclared exempts nothing, and a trigger
 /// running it is refused.
-pub(crate) fn exempt_owners<'s>(table: &'s CreateTable, schema: &'s ParserDB) -> Vec<&'s str> {
-    let mut owners: Vec<&str> = running_owners(schema)
+///
+/// # Errors
+///
+/// Fails as [`action_owned_tables`] does.
+pub(crate) fn exempt_owners<'s>(
+    table: &CreateTable,
+    schema: &'s ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<Vec<&'s str>, Error> {
+    let running = running_owners(schema, options)?;
+    let mut owners: Vec<&str> = running
+        .roles
         .into_iter()
         .filter(|owner| exempts(table, owner, schema))
         .map(RoleLike::name)
         .collect();
+    if running.superuser {
+        owners.push(KEY_ACTION_OWNER);
+    }
     owners.sort_unstable();
-    owners
+    Ok(owners)
 }
 
-/// The owners of the schema's definer trigger functions and PL/pgSQL helpers,
-/// whose bodies a trigger runs, the ones the guards holding the acting role to
-/// its privileges let through. The translator holds each body, and each
-/// trigger it fires, to its owner's privileges instead.
-pub(crate) fn definer_owners(schema: &ParserDB) -> Vec<&str> {
-    let mut owners: Vec<&str> = running_owners(schema).into_iter().map(RoleLike::name).collect();
+/// The roles whose bodies a trigger runs, the ones the guards holding the
+/// acting role to its privileges let through. The translator holds each
+/// body, and each trigger it fires, to its owner's privileges instead.
+///
+/// # Errors
+///
+/// Fails as [`action_owned_tables`] does.
+pub(crate) fn definer_owners<'s>(
+    schema: &'s ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<Vec<&'s str>, Error> {
+    let running = running_owners(schema, options)?;
+    let mut owners: Vec<&str> = running.roles.into_iter().map(RoleLike::name).collect();
+    if running.superuser {
+        owners.push(KEY_ACTION_OWNER);
+    }
     owners.sort_unstable();
-    owners
+    Ok(owners)
 }
 
 /// `owners`, with [`KEY_ACTION`] when a foreign key action writes `table`
-/// past its guards, and with [`TRUNCATION`] when the acting role or the owner
-/// of a definer body a trigger runs may truncate `table`.
+/// past its guards, and with [`TRUNCATION`] when the acting role or a role
+/// whose bodies a trigger runs may truncate `table`.
 ///
 /// # Errors
 ///
 /// Fails as [`receives_key_actions`](super::hidden_referenced_rows::receives_key_actions)
-/// does, and refuses an acting role the schema does not declare.
+/// and [`action_owned_tables`] do, and refuses an acting role the schema does
+/// not declare.
 pub(crate) fn and_system_frames<'s>(
     mut owners: Vec<&'s str>,
     table: &CreateTable,
@@ -188,8 +398,9 @@ pub(crate) fn and_system_frames<'s>(
     if super::hidden_referenced_rows::receives_key_actions(table, schema, options)? {
         owners.push(KEY_ACTION);
     }
-    let mut truncates = RoleTable::acting(table, schema, options)?.truncates();
-    for owner in running_owners(schema) {
+    let running = running_owners(schema, options)?;
+    let mut truncates = running.superuser || RoleTable::acting(table, schema, options)?.truncates();
+    for owner in running.roles {
         truncates = truncates || RoleTable::of(table, Some(owner), schema)?.truncates();
     }
     if truncates {
@@ -242,26 +453,31 @@ pub(crate) fn outside_truncation() -> Expr {
     }
 }
 
-/// The owners of the schema's definer functions whose writes can fire a
-/// trigger on `table`, folded, directly or through the invoker triggers those
-/// writes fire, each named once in name order. A body whose writes cannot be
-/// read may write any table.
+/// The roles whose writes can fire a trigger on `table`, folded, directly or
+/// through the invoker triggers those writes fire, each named once in name
+/// order: the owners of the schema's definer functions, and the owners the
+/// invoker triggers a foreign key action fires run as, `superuser` standing
+/// for an undeclared one. A body whose writes cannot be read may write any
+/// table.
 ///
 /// # Errors
 ///
-/// Propagates a lookup failure.
+/// Propagates a lookup failure, and fails as [`action_owned_tables`] does.
 pub(crate) fn owners_reaching<'s>(
     table: &str,
     schema: &'s ParserDB,
+    superuser: &'s Role,
+    options: &crate::options::TranslationContext<'_>,
 ) -> Result<Vec<&'s Role>, Error> {
     let mut bodies = ReadBodies::default();
-    // The tables each invoker trigger's table leads its writes to, `None`
-    // for a body whose writes cannot be read.
+    // The tables each invoker trigger the batch leaves on a table leads its
+    // writes to, `None` for a body whose writes cannot be read.
     let mut fired: Vec<(String, Option<BTreeSet<String>>)> = Vec::new();
-    for trigger in schema.triggers() {
-        let Ok(TriggerRelation::Table(_)) = trigger_relation(trigger, schema) else { continue };
-        let Some(exec_body) = &trigger.exec_body else { continue };
-        let function = &exec_body.func_desc.name;
+    for trigger in options.batch_triggers() {
+        if trigger.period == Some(sqlparser::ast::TriggerPeriod::InsteadOf) {
+            continue;
+        }
+        let Some(function) = &trigger.function else { continue };
         let declared = trigger_function(schema, function)?;
         if let Some(declared) = declared
             && definer_owner(declared, schema)?.is_some()
@@ -270,7 +486,7 @@ pub(crate) fn owners_reaching<'s>(
         }
         let written =
             body_reach(function, declared, schema, &mut bodies).map(|reach| reach.written);
-        fired.push((folded(&trigger.table_name), written));
+        fired.push((trigger.table.name.clone(), written));
     }
     let leads_to_table = |start: BTreeSet<String>| {
         let mut reached = start;
@@ -304,6 +520,25 @@ pub(crate) fn owners_reaching<'s>(
             owners.push(owner);
         }
     }
+    for (child, owner) in action_owned_tables(schema, options)? {
+        let owner = owner.role(superuser);
+        if owners.iter().any(|listed| listed.name() == owner.name()) {
+            continue;
+        }
+        let child = folded(&child.name);
+        let mut start = BTreeSet::new();
+        let mut unread = false;
+        for (on, leads) in &fired {
+            match leads {
+                Some(leads) if *on == child => start.extend(leads.iter().cloned()),
+                None if *on == child => unread = true,
+                _ => {}
+            }
+        }
+        if unread || leads_to_table(start) {
+            owners.push(owner);
+        }
+    }
     owners.sort_unstable_by(|left, right| left.name().cmp(right.name()));
     Ok(owners)
 }
@@ -334,9 +569,9 @@ pub(crate) fn outside_owners(owners: &[&str]) -> Option<Expr> {
 }
 
 /// The guard clause that holds while the innermost running definer body
-/// belongs to `owner`.
-pub(crate) fn running_owner(owner: &str) -> Expr {
-    innermost_among(&[owner], false)
+/// belongs to one of `owners`.
+pub(crate) fn running_among(owners: &[&str]) -> Expr {
+    innermost_among(owners, false)
 }
 
 /// Whether the innermost running definer body belongs to one of `owners`,

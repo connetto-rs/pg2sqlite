@@ -159,7 +159,10 @@ fn guards_writes(
 }
 
 /// Whether the actions of `key`, which `child` declares, write rows past the
-/// guards of `child` as triggers, run under a key action frame.
+/// guards of `child` as triggers, run under a key action frame. They do where
+/// the replica guards the writes reaching `child`, and where they fire an
+/// invoker trigger on `child` that has to run as an owner other than the
+/// acting role, which SQLite's own action cannot tell from the role's write.
 fn acts_past_guards(
     child: &CreateTable,
     key: &ForeignKeyConstraint,
@@ -168,7 +171,8 @@ fn acts_past_guards(
 ) -> Result<bool, Error> {
     if options.get_server_derived_write_function().is_some()
         || ![key.on_delete, key.on_update].into_iter().flatten().any(writes_rows)
-        || !guards_writes(child, schema, options)?
+        || !(guards_writes(child, schema, options)?
+            || fires_owned_triggers(child, key, schema, options)?)
     {
         return Ok(false);
     }
@@ -179,6 +183,33 @@ fn acts_past_guards(
         && OffReplica::of(&key.foreign_table, schema, options)?.is_none()
         && !overlay::names_overlaid_table(schema, &child.name, options)?
         && !overlay::names_overlaid_table(schema, &key.foreign_table, options)?)
+}
+
+/// Whether the actions of `key` writing rows of `child` fire an invoker
+/// trigger that runs as an owner of `child` other than the acting role.
+fn fires_owned_triggers(
+    child: &CreateTable,
+    key: &ForeignKeyConstraint,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<bool, Error> {
+    let mut events = Vec::new();
+    if key.on_delete == Some(ReferentialAction::Cascade) {
+        events.push(TriggerEvent::Delete);
+    }
+    if key
+        .on_delete
+        .is_some_and(|action| action != ReferentialAction::Cascade && writes_rows(action))
+        || key.on_update.is_some_and(writes_rows)
+    {
+        events.push(TriggerEvent::Update(key.columns.clone()));
+    }
+    if events.is_empty() || definer::action_owner(child, schema, options)?.is_none() {
+        return Ok(false);
+    }
+    Ok(definer::invoker_triggers(child, schema, options)?
+        .into_iter()
+        .any(|trigger| definer::fires_on(&trigger.events, &events)))
 }
 
 /// Whether a foreign key action writes `table` past its guards.
@@ -490,7 +521,7 @@ impl Event {
 
 /// Whether `action` writes referencing rows, which a replica leaving the
 /// writes the server derives leaves to the server.
-fn writes_rows(action: ReferentialAction) -> bool {
+pub(crate) fn writes_rows(action: ReferentialAction) -> bool {
     matches!(
         action,
         ReferentialAction::Cascade | ReferentialAction::SetNull | ReferentialAction::SetDefault

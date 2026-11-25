@@ -2607,7 +2607,7 @@ fn generate_insert_check_trigger_sql(
         Violation::Rows(Some(rows)) => Some(write_guard_condition_expr(Some(*rows), options)),
     };
     let name = format!("{}_insert_check", ctx.inner_table_name);
-    let exempt = super::definer::exempt_owners(table, schema);
+    let exempt = super::definer::exempt_owners(table, schema, options)?;
     if !marks {
         return Ok(condition.map(|condition| {
             backing_abort_trigger(
@@ -2740,7 +2740,7 @@ fn generate_update_check_trigger_sql(
         sqlparser::ast::TriggerEvent::Update(Vec::new()),
         write_guard_condition_expr(violation, options),
         &super::definer::and_system_frames(
-            super::definer::exempt_owners(table, schema),
+            super::definer::exempt_owners(table, schema, options)?,
             table,
             schema,
             options,
@@ -2778,7 +2778,7 @@ fn generate_delete_check_trigger_sql(
         sqlparser::ast::TriggerEvent::Delete,
         write_guard_condition_expr(violation, options),
         &super::definer::and_system_frames(
-            super::definer::exempt_owners(table, schema),
+            super::definer::exempt_owners(table, schema, options)?,
             table,
             schema,
             options,
@@ -3185,7 +3185,7 @@ fn generate_readonly_backing_guard_sql(
     let condition = write_guard_condition_expr(None, options);
     let message = read_only(ctx.table_name);
     let owners = super::definer::and_system_frames(
-        super::definer::definer_owners(schema),
+        super::definer::definer_owners(schema, options)?,
         table,
         schema,
         options,

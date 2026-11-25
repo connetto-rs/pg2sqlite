@@ -155,6 +155,7 @@ mod test_json_operators;
 mod test_json_path_operators;
 mod test_json_typeof;
 mod test_jsonb_set_and_insert;
+mod test_key_action_owner;
 mod test_key_actions_into_guarded_children;
 mod test_labelled_references;
 mod test_late_table_shape;
