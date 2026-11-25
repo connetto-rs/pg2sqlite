@@ -1730,6 +1730,8 @@ impl Pg2Sqlite {
             |index| {
                 epochs.iter().find(|epoch| epoch.end > index).map_or(index + 1, |epoch| epoch.end)
             },
+            // A statement ending its epoch leaves the next epoch's shape.
+            |index| index + usize::from(Self::schema_ends_epoch(&statements[index])),
             |index, at, create_table| {
                 pass_through_view(&epochs, context, (index, at), create_table)
             },
