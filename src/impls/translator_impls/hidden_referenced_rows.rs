@@ -40,6 +40,15 @@
 //! foreign key, as every key does when no acting role is named. Under
 //! [`with_foreign_keys_omitted`](crate::options::Pg2SqliteOptions::with_foreign_keys_omitted)
 //! neither half of any key stays.
+//!
+//! A key whose actions write referencing rows the acting role may not write
+//! itself, in a table under row-level security or one the role may not write
+//! in full, keeps its referencing check as a SQLite foreign key and its
+//! actions writing rows as the same triggers. PostgreSQL runs those actions as
+//! the referencing table's owner without row security, so each runs under a
+//! key action frame on the definer stack, which the referencing table's guards
+//! let through. A write the exemption function exempts fires them too, as it
+//! fires SQLite's own actions.
 
 use alloc::borrow::Cow;
 
@@ -49,9 +58,9 @@ use sql_traits::{
 };
 use sqlparser::{
     ast::{
-        AlterTable, AlterTableOperation, ColumnOption, CreateTable, DeferrableInitial, DropTrigger,
-        ForeignKeyConstraint, Ident, ObjectName, ReferentialAction, Statement, TableConstraint,
-        TriggerEvent, TriggerPeriod,
+        AlterTable, AlterTableOperation, ColumnDef, ColumnOption, CreateTable, DeferrableInitial,
+        DropTrigger, ForeignKeyConstraint, Ident, ObjectName, ReferentialAction, Statement,
+        TableConstraint, TriggerEvent, TriggerPeriod,
     },
     dialect::SQLiteDialect,
     parser::{Parser, ParserError},
@@ -68,12 +77,14 @@ use crate::{
             normalize_schema_qualified_object_name_for_sqlite, quoted_ident,
             resolve_translation_table, same_identifier,
         },
-        privileges::names_table_with_backing,
+        privileges::{RoleTable, has_backing_table, names_table_with_backing},
         session_variable,
         translator_impls::{
             column_option::parenthesize_default,
             deferred_constraint::{self, DeferredEvent, DeferredTrigger, QueuedEvent},
+            definer,
             off_replica::OffReplica,
+            overlay,
             rls::{hiding_policies, write_guard_condition_expr},
         },
     },
@@ -125,6 +136,116 @@ pub(crate) fn no_sqlite_key(
 ) -> Result<bool, Error> {
     Ok(OffReplica::of(foreign_table, schema, options)?.is_some()
         || hidden_rows(foreign_table, schema, options)?.is_some())
+}
+
+/// Whether the replica guards the writes reaching `table`, as it does for a
+/// table under row-level security and one the acting role may not write in
+/// full, `false` for a table left off the replica.
+fn guards_writes(
+    table: &CreateTable,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<bool, Error> {
+    if OffReplica::of(&table.name, schema, options)?.is_some() {
+        return Ok(false);
+    }
+    if has_backing_table(table, schema, options)? {
+        return Ok(true);
+    }
+    Ok(match session_variable::acting_role(schema, options)? {
+        Some(role) => !RoleTable::of(table, Some(role), schema)?.writes_everything(),
+        None => false,
+    })
+}
+
+/// Whether the actions of `key`, which `child` declares, write rows past the
+/// guards of `child` as triggers, run under a key action frame.
+fn acts_past_guards(
+    child: &CreateTable,
+    key: &ForeignKeyConstraint,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<bool, Error> {
+    if options.get_server_derived_write_function().is_some()
+        || ![key.on_delete, key.on_update].into_iter().flatten().any(writes_rows)
+        || !guards_writes(child, schema, options)?
+    {
+        return Ok(false);
+    }
+    if hidden_rows(&key.foreign_table, schema, options)?.is_some() {
+        return Ok(true);
+    }
+    Ok(!options.is_foreign_keys_omitted()
+        && OffReplica::of(&key.foreign_table, schema, options)?.is_none()
+        && !overlay::names_overlaid_table(schema, &child.name, options)?
+        && !overlay::names_overlaid_table(schema, &key.foreign_table, options)?)
+}
+
+/// Whether a foreign key action writes `table` past its guards.
+///
+/// # Errors
+///
+/// Fails as [`hidden_rows`] does.
+pub(crate) fn receives_key_actions(
+    table: &CreateTable,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<bool, Error> {
+    for key in Key::of(table, schema)? {
+        if acts_past_guards(table, key.constraint, schema, options)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// `key`, which the table `table` names declares, without the actions
+/// writing rows that its triggers run past the table's guards, `None` when it
+/// keeps every action.
+///
+/// # Errors
+///
+/// Fails as [`hidden_rows`] does.
+pub(crate) fn without_guarded_actions(
+    key: &ForeignKeyConstraint,
+    table: &ObjectName,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<Option<ForeignKeyConstraint>, Error> {
+    let Some(child) = resolve_translation_table(schema, table)? else { return Ok(None) };
+    if !acts_past_guards(child, key, schema, options)? {
+        return Ok(None);
+    }
+    let mut native = key.clone();
+    for action in [&mut native.on_delete, &mut native.on_update] {
+        if action.is_some_and(writes_rows) {
+            *action = None;
+        }
+    }
+    Ok(Some(native))
+}
+
+/// `column`, of the table `table` names, with each `REFERENCES` holding the
+/// actions its SQLite foreign key keeps, as [`without_guarded_actions`] does.
+///
+/// # Errors
+///
+/// Fails as [`hidden_rows`] does.
+pub(crate) fn native_actions<'c>(
+    column: &'c ColumnDef,
+    table: &ObjectName,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<Cow<'c, ColumnDef>, Error> {
+    let mut changed: Option<ColumnDef> = None;
+    for (index, option) in column.options.iter().enumerate() {
+        let ColumnOption::ForeignKey(key) = &option.option else { continue };
+        if let Some(native) = without_guarded_actions(key, table, schema, options)? {
+            changed.get_or_insert_with(|| column.clone()).options[index].option =
+                ColumnOption::ForeignKey(native);
+        }
+    }
+    Ok(changed.map_or(Cow::Borrowed(column), Cow::Owned))
 }
 
 /// Whether the trigger `name` keeps the referenced side of a key.
@@ -296,6 +417,23 @@ impl<'s> Key<'s> {
         }
         drops
     }
+
+    /// Whether the replica keeps the key's referenced side as triggers, as it
+    /// does for a key into rows a policy may hide and one whose actions write
+    /// rows past the referencing table's guards.
+    fn keeps_triggers(
+        &self,
+        schema: &ParserDB,
+        options: &TranslationContext<'_>,
+    ) -> Result<bool, Error> {
+        if hidden_rows(&self.constraint.foreign_table, schema, options)?.is_some() {
+            return Ok(true);
+        }
+        match resolve_translation_table(schema, &self.table.name)? {
+            Some(child) => acts_past_guards(child, self.constraint, schema, options),
+            None => Ok(false),
+        }
+    }
 }
 
 /// The names a key's triggers and refusal carry.
@@ -389,7 +527,9 @@ pub(crate) fn declared(
 
 /// The statements keeping the referenced side of `key`, its columns read from
 /// `written` and its rows hidden or not as `schema` holds them, under the
-/// names `rename` gives its tables.
+/// names `rename` gives its tables, every action for a key into rows a policy
+/// may hide and the actions writing rows past the referencing table's guards
+/// for any other.
 fn referenced_side(
     key: &Key<'_>,
     written: &ParserDB,
@@ -398,20 +538,30 @@ fn referenced_side(
     rename: Option<Rename<'_>>,
     emit: WarningSink<'_>,
 ) -> Result<Vec<Statement>, Error> {
-    let Some((_, policies)) = hidden_rows(&key.constraint.foreign_table, schema, options)? else {
-        return Ok(Vec::new());
+    let hidden = hidden_rows(&key.constraint.foreign_table, schema, options)?;
+    let hides = hidden.is_some();
+    let past_guards = match resolve_translation_table(schema, &key.table.name)? {
+        Some(child) => acts_past_guards(child, key.constraint, schema, options)?,
+        None => false,
     };
-    let names = key.names(rename);
-    emit(TranslationWarning::HiddenReferencedRows {
-        name: key.name.clone(),
-        table: names.child.clone(),
-        referenced: names.parent.clone(),
-        policies,
-    });
-    if options.get_server_derived_write_function().is_none() {
-        refuse_cycle(key, schema, options)?;
+    if !hides && !past_guards {
+        return Ok(Vec::new());
     }
-    let parts = Parts::of(key, written, options, rename)?;
+    let names = key.names(rename);
+    if let Some((_, policies)) = hidden {
+        emit(TranslationWarning::HiddenReferencedRows {
+            name: key.name.clone(),
+            table: names.child.clone(),
+            referenced: names.parent.clone(),
+            policies,
+        });
+    }
+    if options.get_server_derived_write_function().is_none() {
+        refuse_cycle(key, hides, schema, options)?;
+    }
+    let parent_backed =
+        hides || names_table_with_backing(schema, &key.constraint.foreign_table, options)?;
+    let parts = Parts::of(key, written, parent_backed, options, rename)?;
     let refusal = |sqlstate, setting| {
         format!(
             "{}update or delete on table \"{}\" violates {setting}foreign key constraint \"{}\" on \
@@ -425,7 +575,9 @@ fn referenced_side(
     let mut statements = Vec::new();
     let mut queued = Vec::new();
     for (event, action) in key.actions() {
-        if writes_rows(action) && options.get_server_derived_write_function().is_some() {
+        if (writes_rows(action) && options.get_server_derived_write_function().is_some())
+            || (!hides && !writes_rows(action))
+        {
             continue;
         }
         let body = match action {
@@ -463,7 +615,10 @@ fn referenced_side(
                 parts.assign(&defaults)
             }
         };
-        let firing = parts.event(event, &body, options)?;
+        let mut firing = parts.event(event, &body, hides, options)?;
+        if past_guards && writes_rows(action) {
+            firing.body = definer::as_key_action(firing.body);
+        }
         if key.queues(action) {
             queued.push(firing);
         } else {
@@ -496,12 +651,15 @@ struct Firing<'s> {
 
 /// Refuses `key` when the rows its actions write lead, through the actions of
 /// the keys `schema` holds, back to the event that fires its own trigger,
-/// which SQLite does not fire twice in one chain.
+/// which SQLite does not fire twice in one chain. `hides` tells a key into
+/// rows a policy may hide from one whose actions write past its referencing
+/// table's guards.
 ///
 /// A key referencing its own table is exempt on its own delete, which its
 /// trigger carries through itself.
 fn refuse_cycle(
     key: &Key<'_>,
+    hides: bool,
     schema: &ParserDB,
     options: &TranslationContext<'_>,
 ) -> Result<(), Error> {
@@ -532,17 +690,24 @@ fn refuse_cycle(
         let mut seen = Vec::new();
         let returns = !(self_cascade && event == Event::Delete) && first.fires(&start);
         if returns || reaches(&first, &start, &keys, &own, self_cascade, &mut seen, &mut path) {
+            let child = last_ident_value_or_display(&key.table.name);
+            let (reason, remedy) = if hides {
+                (
+                    "references rows a policy may hide from the acting role",
+                    format!("read every row of {}", last_ident_value_or_display(&parent.name)),
+                )
+            } else {
+                ("writes rows the acting role may not write itself", format!("write {child}"))
+            };
             return Err(Error::forward_refusal(format!(
-                "the foreign key {} of {} references rows a policy may hide from the acting \
-                 role, so the replica keeps its actions as triggers, and its ON {} action \
-                 leads back to its own trigger through {}. SQLite fires a trigger once in a \
-                 chain, so the replica cannot carry the actions through as PostgreSQL does. \
-                 Break the cycle of actions writing rows, or let the role read every row of {}.",
+                "the foreign key {} of {child} {reason}, so the replica keeps its actions as \
+                 triggers, and its ON {} action leads back to its own trigger through {}. SQLite \
+                 fires a trigger once in a chain, so the replica cannot carry the actions through \
+                 as PostgreSQL does. Break the cycle of actions writing rows, or let the role \
+                 {remedy}.",
                 key.name,
-                last_ident_value_or_display(&key.table.name),
                 event.keyword(),
                 path.join(" -> "),
-                last_ident_value_or_display(&parent.name),
             )));
         }
     }
@@ -664,9 +829,7 @@ pub(crate) fn dropped(
                 .iter()
                 .any(|column| dropped.iter().any(|gone| same_identifier(column, gone)))
         };
-        if columns.is_none_or(reads_dropped)
-            && hidden_rows(&key.constraint.foreign_table, schema, options)?.is_some()
-        {
+        if columns.is_none_or(reads_dropped) && key.keeps_triggers(schema, options)? {
             drops.extend(key.drops());
         }
     }
@@ -677,8 +840,10 @@ pub(crate) fn dropped(
 /// names declares, as the drops to run before the rename and the triggers to
 /// create after it.
 ///
-/// A key into the table needs no move, since a policy hiding its rows puts
-/// the table under row security, whose rename is refused.
+/// A key into the table needs no move. A policy hiding its rows puts the table
+/// under row security, whose rename is refused, and the triggers of any other
+/// key sit on the table, which SQLite renames with them, and name only the
+/// table writing the action.
 ///
 /// # Errors
 ///
@@ -691,7 +856,7 @@ pub(crate) fn moved(
     let written = options.written_schema().unwrap_or(schema);
     let (mut drops, mut creates) = (Vec::new(), Vec::new());
     for key in Key::of_named(rename.from, written)? {
-        if hidden_rows(&key.constraint.foreign_table, schema, options)?.is_none() {
+        if !key.keeps_triggers(schema, options)? {
             continue;
         }
         drops.extend(key.drops());
@@ -739,9 +904,12 @@ struct Parts {
 }
 
 impl Parts {
+    /// The parts of `key`, its columns read from `written`, its referenced
+    /// rows held in a backing table when `parent_backed`.
     fn of(
         key: &Key<'_>,
         written: &ParserDB,
+        parent_backed: bool,
         options: &TranslationContext<'_>,
         rename: Option<Rename<'_>>,
     ) -> Result<Self, Error> {
@@ -751,16 +919,16 @@ impl Parts {
         if names_table_with_backing(written, table, options)? {
             referencing = append_suffix(&referencing, options.get_rls_table_suffix());
         }
-        let referenced_name = append_suffix(
-            &renamed(
-                &normalize_schema_qualified_object_name_for_sqlite(
-                    written,
-                    &key.constraint.foreign_table,
-                )?,
-                rename,
-            ),
-            options.get_rls_table_suffix(),
+        let mut referenced_name = renamed(
+            &normalize_schema_qualified_object_name_for_sqlite(
+                written,
+                &key.constraint.foreign_table,
+            )?,
+            rename,
         );
+        if parent_backed {
+            referenced_name = append_suffix(&referenced_name, options.get_rls_table_suffix());
+        }
         let names: Vec<String> =
             key.constraint.columns.iter().map(|column| column.value.clone()).collect();
         Ok(Self {
@@ -904,14 +1072,17 @@ impl Parts {
     }
 
     /// The firing of `event` on the referenced table running `body`, for an
-    /// update only when it moves the key.
+    /// update only when it moves the key, and, `exempt_skips`, only for a
+    /// write the exemption function does not exempt.
     fn event(
         &self,
         event: Event,
         body: &str,
+        exempt_skips: bool,
         options: &TranslationContext<'_>,
     ) -> Result<QueuedEvent, Error> {
         let mut conditions: Vec<String> = write_guard_condition_expr(None, options)
+            .filter(|_| exempt_skips)
             .map(|guard| guard.to_string())
             .into_iter()
             .collect();
