@@ -15,17 +15,17 @@ use crate::{errors::Error, impls::unlabelled_body::unlabelled_body};
 /// Trait to define a schema for the translation between `PostgreSQL` and
 /// `SQLite`.
 pub trait Schema: DatabaseLike<Table = CreateTable, Function = CreateFunction> {
-    /// Returns the PL/pgSQL body of the named function as a statement tree,
-    /// if it exists.
+    /// Returns the PL/pgSQL body of the function a trigger's `EXECUTE
+    /// FUNCTION` names, as a statement tree, if it exists.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::LookupError`] if the name carries several
-    /// declarations, which a lookup by name cannot choose between, and
+    /// Returns [`Error::LookupError`] if the schema cannot tell whether the
+    /// function the name reaches is a procedure, and
     /// [`Error::TranslationRefusal`] if the body is not PL/pgSQL or an SQL
     /// statement in it does not parse.
-    fn function_body(&self, name: &ObjectName) -> Result<Option<Block>, Error> {
-        let Some(function) = written_function(self, name)? else { return Ok(None) };
+    fn trigger_function_body(&self, name: &ObjectName) -> Result<Option<Block>, Error> {
+        let Some(function) = trigger_function(self, name)? else { return Ok(None) };
         let Some(text) = function.body() else { return Ok(None) };
         unlabelled_body(function, text, |error| {
             Error::unsupported_source_syntax(format!(
@@ -36,20 +36,22 @@ pub trait Schema: DatabaseLike<Table = CreateTable, Function = CreateFunction> {
     }
 }
 
-/// Returns the function a written reference names, if it exists.
+/// Returns the function a trigger's `EXECUTE FUNCTION` names, if it exists,
+/// found as PostgreSQL does with a lookup that only a function taking no
+/// arguments answers.
 ///
 /// # Errors
 ///
-/// Returns [`Error::LookupError`] if the name carries several declarations,
-/// which a lookup by name cannot choose between.
-pub(crate) fn written_function<'s, S: Schema>(
+/// Returns [`Error::LookupError`] if the schema cannot tell whether the
+/// function the name reaches is a procedure.
+pub(crate) fn trigger_function<'s, S: Schema>(
     schema: &'s S,
     name: &ObjectName,
 ) -> Result<Option<&'s CreateFunction>, Error> {
-    let Some(target) = lookup_target(name) else {
+    if lookup_target(name).is_none() {
         return Ok(None);
-    };
-    Ok(schema.resolve_target_function(target, IdentifierCase::AsWritten)?)
+    }
+    Ok(schema.resolve_trigger_function(name, IdentifierCase::AsWritten)?)
 }
 
 /// Reads a written function or relation reference as the name to resolve,
@@ -121,7 +123,7 @@ mod tests {
             ("trg_tokenize_error", "BEGIN\n    SELECT \"unterminated;\nEND;"),
         ] {
             let err = schema_with_function(name, body)
-                .function_body(&function_name(name))
+                .trigger_function_body(&function_name(name))
                 .expect_err("the body should not read");
             assert!(
                 err.to_string()
@@ -150,7 +152,7 @@ mod tests {
             .expect("schema should build");
 
         let body = schema
-            .function_body(&function_name("log_doc"))
+            .trigger_function_body(&function_name("log_doc"))
             .expect("function body extraction should succeed")
             .expect("the recorded search path names `app`");
         assert_eq!(body.statements.len(), 2, "got {:?}", body.statements);

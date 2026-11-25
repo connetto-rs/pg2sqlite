@@ -35,12 +35,14 @@ use super::{
 use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
-    impls::translator_impls::{
-        definer,
-        sql_helper::{self, Arguments, check_call_privileges, declared_helper, refusal},
+    impls::{
+        translator_impls::{
+            definer,
+            sql_helper::{self, Arguments, check_call_privileges, declared_helper, refusal},
+        },
+        unlabelled_body::unlabelled_body,
     },
     options::TranslationContext,
-    traits::Schema,
     warnings::WarningSink,
 };
 
@@ -397,7 +399,7 @@ impl PlPgSqlTranslator {
             ));
         }
         check_call_privileges(name, helper, schema, options)?;
-        let (body, returns_value) = callee_body(name, helper, schema)?;
+        let (body, returns_value) = callee_body(name, helper)?;
         let body = super::unresolved::helper_raising_unresolved(body, helper, schema);
 
         let mut callee = scope.for_callee(identity.clone());
@@ -496,14 +498,13 @@ impl PlPgSqlTranslator {
 /// `helper`'s body, called as `name`, with no statement after a `RETURN`,
 /// and whether it returns a value, a body returning one raising where it
 /// runs off its end as PostgreSQL does.
-fn callee_body(
-    name: &ObjectName,
-    helper: &CreateFunction,
-    schema: &ParserDB,
-) -> Result<(Block, bool), Error> {
-    let Some(mut body) = schema.function_body(name)? else {
+fn callee_body(name: &ObjectName, helper: &CreateFunction) -> Result<(Block, bool), Error> {
+    let Some(text) = helper.body() else {
         return Err(refusal(name, "has no body"));
     };
+    let mut body = unlabelled_body(helper, text, |error| {
+        refusal(name, &format!("has a body that does not parse: {error}"))
+    })?;
     let returns_value = !matches!(
         &helper.return_type,
         Some(FunctionReturnType::DataType(returned))

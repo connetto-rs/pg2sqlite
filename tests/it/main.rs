@@ -357,6 +357,7 @@ mod test_trigger_cascading;
 mod test_trigger_condition_columns;
 mod test_trigger_conditional;
 mod test_trigger_elsif_else;
+mod test_trigger_function_builtin_name;
 mod test_trigger_maintenance_update;
 mod test_trigger_multi_insert_conflict;
 mod test_trigger_return;

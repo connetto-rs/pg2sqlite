@@ -26,7 +26,7 @@ use sqlparser_plpgsql::{
 use crate::{
     errors::Error,
     impls::{object_name::last_ident, translator_impls::definer::returns_trigger},
-    traits::schema::{Schema, written_function},
+    traits::schema::{Schema, trigger_function},
 };
 
 /// `function`'s PL/pgSQL body `text`, parsed with every label dropped that
@@ -67,7 +67,7 @@ pub(crate) fn folded_namespace(
 ) -> Result<Option<Namespace>, Error> {
     let Some(body) = &trigger.exec_body else { return Ok(None) };
     let function = &body.func_desc.name;
-    Ok(written_function(schema, function)?.zip(schema.function_body(function)?).and_then(
+    Ok(trigger_function(schema, function)?.zip(schema.trigger_function_body(function)?).and_then(
         |(written, block)| Some(block.sites(&signature(written), |_| true).ok()?.pop()?.namespace),
     ))
 }

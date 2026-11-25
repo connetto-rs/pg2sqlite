@@ -50,6 +50,7 @@ use crate::{
         query_builder::{from_relation, plain_table_factor, single_expr_query},
         translator_impls::off_replica::row_write,
     },
+    traits::schema::trigger_function,
 };
 
 /// The frames of the definer bodies running on the connection, each holding
@@ -209,12 +210,14 @@ pub(crate) fn owners_reaching<'s>(
         let Ok(TriggerRelation::Table(_)) = trigger_relation(trigger, schema) else { continue };
         let Some(exec_body) = &trigger.exec_body else { continue };
         let function = &exec_body.func_desc.name;
-        if let Some(declared) = crate::traits::schema::written_function(schema, function)?
+        let declared = trigger_function(schema, function)?;
+        if let Some(declared) = declared
             && definer_owner(declared, schema)?.is_some()
         {
             continue;
         }
-        let written = body_reach(function, schema, &mut bodies)?.map(|reach| reach.written);
+        let written =
+            body_reach(function, declared, schema, &mut bodies).map(|reach| reach.written);
         fired.push((folded(&trigger.table_name), written));
     }
     let leads_to_table = |start: BTreeSet<String>| {
@@ -241,7 +244,7 @@ pub(crate) fn owners_reaching<'s>(
         if owners.iter().any(|listed| listed.name() == owner.name()) {
             continue;
         }
-        let reaches = match body_reach(&function.name, schema, &mut bodies)? {
+        let reaches = match body_reach(&function.name, Some(function), schema, &mut bodies) {
             Some(reach) => leads_to_table(reach.written),
             None => true,
         };

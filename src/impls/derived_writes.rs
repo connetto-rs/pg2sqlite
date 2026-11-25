@@ -41,7 +41,7 @@ use crate::{
         unlabelled_body::unlabelled_body,
     },
     options::TranslationContext,
-    traits::schema::written_function,
+    traits::schema::trigger_function,
     warnings::{TranslationWarning, WarningSink},
 };
 
@@ -133,7 +133,7 @@ fn trigger_chain<'s>(
     options: &TranslationContext<'_>,
 ) -> Result<Option<(&'s CreateFunction, chain::Chain)>, Error> {
     let Some(exec_body) = &trigger.exec_body else { return Ok(None) };
-    let Some(function) = written_function(schema, &exec_body.func_desc.name)? else {
+    let Some(function) = trigger_function(schema, &exec_body.func_desc.name)? else {
         return Ok(None);
     };
     Ok(Some((function, chain::Walker::read(function, schema, options)?)))
@@ -280,7 +280,7 @@ impl Footprint {
         let function = trigger
             .exec_body
             .as_ref()
-            .map(|exec_body| written_function(schema, &exec_body.func_desc.name))
+            .map(|exec_body| trigger_function(schema, &exec_body.func_desc.name))
             .transpose()?
             .flatten();
         // Translation refuses a trigger whose function the schema lacks first.

@@ -22,7 +22,10 @@ use super::{
 };
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
-use crate::{errors::Error, impls::object_name::same_identifier, warnings::TranslationWarning};
+use crate::{
+    errors::Error, impls::object_name::same_identifier, traits::schema::trigger_function,
+    warnings::TranslationWarning,
+};
 
 /// Translates a statement as the batch stands on one side of an event.
 pub(crate) type Translate<'t> =
@@ -238,7 +241,8 @@ impl Touched {
         let Reached { bodies: side_reaches, owners } = reached;
         for (schema, reached) in [before, after].into_iter().zip(side_reaches.iter_mut()) {
             if !reached.contains_key(function) {
-                let reach = body_reach(function, schema, bodies)?;
+                let declared = trigger_function(schema, function)?;
+                let reach = body_reach(function, declared, schema, bodies);
                 reached.insert(function.clone(), reach);
             }
             let Some(Some(reach)) = reached.get(function) else { return Ok(true) };
