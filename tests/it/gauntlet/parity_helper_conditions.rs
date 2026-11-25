@@ -6,7 +6,9 @@
 //! column capped by another helper's set beside the caller, a column kept
 //! outside another helper's set, that set holding `NULL` or not, a setting
 //! left unset, read through `NULLIF` or as sent, a walk down two edge tables
-//! kept to a selection, and a walk up a tree feeding a grantee set. Then for
+//! kept to a selection, a walk up a tree feeding a grantee set, and a walk
+//! down an edge table no key orients, following the edges a state, a time
+//! bound and another helper's set leave it. Then for
 //! an arm reading another helper's rows, and for a helper read in `FROM`, as
 //! its rows, its columns under an alias, and its rows correlated with the row
 //! a policy reads. Each helper guards the same table under a policy of its
@@ -79,6 +81,14 @@ CREATE TABLE invitations (
   doc_id TEXT NOT NULL REFERENCES docs (id),
   email TEXT NOT NULL,
   PRIMARY KEY (doc_id, email)
+);
+CREATE TABLE doc_links (
+  id TEXT PRIMARY KEY,
+  parent_id TEXT NOT NULL REFERENCES docs (id),
+  child_id TEXT NOT NULL REFERENCES docs (id),
+  org_id TEXT NOT NULL REFERENCES orgs (id),
+  state TEXT NOT NULL,
+  ended_at TIMESTAMPTZ
 );
 
 CREATE SCHEMA authz;
@@ -278,6 +288,20 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
   WHERE doc.kind = 'file' AND current_setting('app.installation_id', true) IS NULL
 $$;
 
+CREATE FUNCTION authz.linked_down_docs() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  WITH RECURSIVE reached (id) AS (
+    SELECT grant_row.doc_id FROM public.grants grant_row
+    WHERE grant_row.grantee = authz.caller_id()
+    UNION
+    SELECT link.child_id FROM public.doc_links link
+    JOIN reached ON reached.id = link.parent_id
+    WHERE link.state = 'active' AND (link.ended_at IS NULL OR link.ended_at > now())
+      AND NOT (link.org_id = ANY (ARRAY(SELECT authz.blocked_orgs())))
+  )
+  SELECT reached.id FROM reached
+$$;
+
 ALTER FUNCTION authz.caller_id() OWNER TO conditions_owner;
 ALTER FUNCTION authz.installation_id() OWNER TO conditions_owner;
 ALTER FUNCTION authz.link_ids() OWNER TO conditions_owner;
@@ -306,6 +330,7 @@ ALTER FUNCTION authz.non_team_docs() OWNER TO conditions_owner;
 ALTER FUNCTION authz.member_granted_docs() OWNER TO conditions_owner;
 ALTER FUNCTION authz.uninstalled_grants() OWNER TO conditions_owner;
 ALTER FUNCTION authz.never_installed_files() OWNER TO conditions_owner;
+ALTER FUNCTION authz.linked_down_docs() OWNER TO conditions_owner;
 REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA authz FROM PUBLIC;
 GRANT USAGE ON SCHEMA authz TO conditions_owner;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA authz TO conditions_owner;
@@ -323,7 +348,7 @@ GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA authz TO app;
 
 /// Each helper's policy over `docs`, one case per condition it carries or
 /// place its rows are read in.
-const CASES: [(&str, &str); 30] = [
+const CASES: [(&str, &str); 31] = [
     ("a joined row", "org_id IN (SELECT authz.member_orgs())"),
     ("a row cap over a joined row", "org_id IN (SELECT authz.administered_orgs())"),
     ("an anti-join, time bounds and a principal", "id IN (SELECT authz.granted_docs())"),
@@ -337,6 +362,7 @@ const CASES: [(&str, &str); 30] = [
     ("a lifted row cap over no row", "id IN (SELECT authz.capped_files())"),
     ("a walk down kept to a selection", "id IN (SELECT authz.reachable_docs())"),
     ("a walk up feeding a grantee set", "id IN (SELECT authz.team_docs())"),
+    ("a walk down edges a condition filters", "id IN (SELECT authz.linked_down_docs())"),
     ("a returned key capped by another helper's set", "id IN (SELECT authz.granted_pages())"),
     ("a column outside another helper's set", "id IN (SELECT authz.unblocked_pages())"),
     ("a column outside a set holding NULL", "id IN (SELECT authz.non_team_docs())"),
@@ -497,6 +523,16 @@ const TEAMS: [(&str, Option<&str>); 3] = [("t1", None), ("t2", Some("t1")), ("t3
 const TEAM_MEMBERS: [(&str, &str); 1] = [("t3", "u2")];
 const INVITATIONS: [(&str, &str); 4] =
     [("d1", "eve@example.com"), ("d2", "Eve@Example.COM"), ("d3", "bob@example.com"), ("d6", "")];
+const DOC_LINKS: [(&str, &str, &str, &str, Option<Stamp>); 8] = [
+    ("d1", "d2", "o1", "active", None),
+    ("d1", "d5", "o2", "active", None),
+    ("d1", "d4", "o1", "revoked", None),
+    ("d2", "d7", "o1", "active", Some(Stamp::Past)),
+    ("d2", "d8", "o1", "active", Some(Stamp::Future)),
+    ("d8", "d1", "o1", "active", None),
+    ("d4", "d5", "o3", "active", None),
+    ("d4", "d8", "o1", "active", None),
+];
 
 mod schema {
     /// Declares the tables, every instant column holding `$instant`.
@@ -538,6 +574,16 @@ mod schema {
             diesel::table! { teams (id) { id -> Text, parent_id -> Nullable<Text>, } }
             diesel::table! { team_members (team_id, user_id) { team_id -> Text, user_id -> Text, } }
             diesel::table! { invitations (doc_id, email) { doc_id -> Text, email -> Text, } }
+            diesel::table! {
+                doc_links (id) {
+                    id -> Text,
+                    parent_id -> Text,
+                    child_id -> Text,
+                    org_id -> Text,
+                    state -> Text,
+                    ended_at -> Nullable<$instant>,
+                }
+            }
         };
     }
 
@@ -583,7 +629,7 @@ extern "SQL" {
 macro_rules! seed {
     ($connection:expr, $schema:ident, $docs:ident, $past:expr, $future:expr) => {{
         use schema::$schema::{
-            attachments, blocks, doc_parents, grants, invitations, links, members, orgs,
+            attachments, blocks, doc_links, doc_parents, grants, invitations, links, members, orgs,
             permissions, team_members, teams,
         };
         let stamp = |stamp: Option<Stamp>| {
@@ -691,6 +737,19 @@ macro_rules! seed {
                 .values((invitations::doc_id.eq(doc), invitations::email.eq(email)))
                 .execute($connection)
                 .expect("seed invitations");
+        }
+        for (position, (parent, child, org, state, ended)) in DOC_LINKS.into_iter().enumerate() {
+            diesel::insert_into(doc_links::table)
+                .values((
+                    doc_links::id.eq(format!("k{position}")),
+                    doc_links::parent_id.eq(parent),
+                    doc_links::child_id.eq(child),
+                    doc_links::org_id.eq(org),
+                    doc_links::state.eq(state),
+                    doc_links::ended_at.eq(stamp(ended)),
+                ))
+                .execute($connection)
+                .expect("seed doc links");
         }
     }};
 }
