@@ -503,7 +503,7 @@ fn callee_body(name: &ObjectName, helper: &CreateFunction) -> Result<(Block, boo
         return Err(refusal(name, "has no body"));
     };
     let mut body = unlabelled_body(helper, text, |error| {
-        Error::unsupported_source_syntax(format!("Failed to parse function '{name}' body: {error}"))
+        refusal(name, &format!("has a body that does not parse: {error}"))
     })?;
     let returns_value = !matches!(
         &helper.return_type,

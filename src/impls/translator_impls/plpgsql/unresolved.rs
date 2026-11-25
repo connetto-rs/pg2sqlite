@@ -167,9 +167,7 @@ pub(crate) fn unresolved_aborts(
     emit: WarningSink<'_>,
 ) -> Result<Vec<Statement>, Error> {
     let body_schema = body_schema(schema, options);
-    let Some(mut block) = body_schema.trigger_function_body(function)? else {
-        return Ok(Vec::new());
-    };
+    let Some(mut block) = body_schema.trigger_function_body(function)? else { return Ok(vec![]) };
     let signature = trigger_signature(function);
     let found = unresolved(&block, &signature, rows(table, body_schema), body_schema);
     if found.is_empty() {
@@ -392,54 +390,39 @@ pub(crate) fn body_reach(
     let mut reach = BodyReach {
         relations: BTreeSet::new(),
         written: BTreeSet::new(),
-        functions: BTreeSet::from([folded(function)]),
+        functions: BTreeSet::new(),
         definers: BTreeSet::new(),
     };
-    let mut pending = Vec::new();
-    if let Some(declared) = declared.filter(|declared| !in_pg_catalog(declared)) {
-        reach.read(function, declared, schema, bodies, &mut pending)?;
-    }
+    let mut root = Some(declared);
+    let mut pending = vec![function.clone()];
     while let Some(function) = pending.pop() {
         if !reach.functions.insert(folded(&function)) {
             continue;
         }
         // A callee the schema cannot settle may reach anything.
-        let Some(declared) = schema_helper(&function, schema).ok()? else { continue };
-        reach.read(&function, declared, schema, bodies, &mut pending)?;
-    }
-    Some(reach)
-}
-
-impl BodyReach {
-    /// Adds what `declared`'s own body, the function `function` names,
-    /// reaches, and pushes the functions it calls onto `pending`. `None` when
-    /// its names are not all known before it runs.
-    fn read(
-        &mut self,
-        function: &ObjectName,
-        declared: &CreateFunction,
-        schema: &ParserDB,
-        bodies: &mut ReadBodies,
-        pending: &mut Vec<ObjectName>,
-    ) -> Option<()> {
+        let declared = match root.take() {
+            Some(declared) => declared.filter(|declared| !in_pg_catalog(declared)),
+            None => schema_helper(&function, schema).ok()?,
+        };
+        let Some(declared) = declared else { continue };
         // An owner the schema never declares refuses the translation, on
         // either side of an event.
         if let Ok(Some(owner)) = definer_owner(declared, schema) {
-            self.definers.insert(owner.stored_name().into_owned());
+            reach.definers.insert(owner.stored_name().into_owned());
         }
         let atomic;
         let names = if let Some(body) = declared.body() {
-            bodies.names(body, declared, function, schema)
+            bodies.names(body, declared, &function, schema)
         } else {
-            atomic = BodyNames::of(declared, schema, &trigger_signature(function));
+            atomic = BodyNames::of(declared, schema, &trigger_signature(&function));
             &atomic
         };
         let BodyNames::Known(names) = names else { return None };
-        self.relations.extend(names.relations.iter().cloned());
-        self.written.extend(names.written.iter().cloned());
+        reach.relations.extend(names.relations.iter().cloned());
+        reach.written.extend(names.written.iter().cloned());
         pending.extend(names.calls.iter().cloned());
-        Some(())
     }
+    Some(reach)
 }
 
 /// Every statement and expression of `block`, the body of the trigger

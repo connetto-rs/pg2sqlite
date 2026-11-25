@@ -47,6 +47,17 @@ fn a_helper_performed_beside_other_columns_is_refused() {
     assert!(message.contains("check_val()") && message.contains("beside"), "{message}");
 }
 
+/// A helper whose body does not parse has nothing to inline.
+#[test]
+fn a_helper_whose_body_does_not_parse_is_refused() {
+    let message = refusal(
+        "CREATE FUNCTION check_val(n INTEGER) RETURNS VOID LANGUAGE plpgsql AS $$
+         BEGIN SELECT FROM; END $$;",
+        "PERFORM check_val(NEW.val);",
+    );
+    assert!(message.contains("check_val()") && message.contains("does not parse"), "{message}");
+}
+
 /// A definer trigger calls the helper as the trigger's owner, and an owner
 /// without `USAGE` on the helper's schema makes PostgreSQL raise at the call.
 #[test]
