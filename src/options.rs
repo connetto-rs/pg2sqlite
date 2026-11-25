@@ -39,6 +39,10 @@ type Role = <ParserDB as DatabaseLike>::Role;
 pub struct AttachedTables {
     schema: String,
     tables: Vec<String>,
+    /// The listed tables a trigger derives writes into, which the
+    /// translation of a batch reads off its triggers.
+    #[cfg_attr(feature = "arbitrary", arbitrary(default))]
+    overlaid: Vec<String>,
 }
 
 impl AttachedTables {
@@ -59,6 +63,17 @@ impl AttachedTables {
     #[must_use]
     pub fn contains(&self, table: &str) -> bool {
         self.tables.iter().any(|listed| listed.eq_ignore_ascii_case(table))
+    }
+
+    /// Whether a trigger derives writes into the listed `table`, so each
+    /// connection keeps those writes in an overlay of its own.
+    pub(crate) fn is_overlaid(&self, table: &str) -> bool {
+        self.overlaid.iter().any(|overlaid| overlaid.eq_ignore_ascii_case(table))
+    }
+
+    /// Records the listed tables a trigger derives writes into.
+    pub(crate) fn set_overlaid(&mut self, overlaid: Vec<String>) {
+        self.overlaid = overlaid;
     }
 }
 
@@ -1799,6 +1814,7 @@ impl Pg2SqliteOptions {
         self.attached_tables = Some(AttachedTables {
             schema: schema.into(),
             tables: tables.into_iter().map(Into::into).collect(),
+            overlaid: Vec::new(),
         });
         self
     }
@@ -1807,6 +1823,13 @@ impl Pg2SqliteOptions {
     /// Returns the tables placed in an attached database, if any.
     pub fn get_attached_tables(&self) -> Option<&AttachedTables> {
         self.attached_tables.as_ref()
+    }
+
+    /// Records the attached tables a trigger derives writes into.
+    pub(crate) fn set_overlaid_tables(&mut self, overlaid: Vec<String>) {
+        if let Some(attached) = &mut self.attached_tables {
+            attached.set_overlaid(overlaid);
+        }
     }
 
     #[must_use]
@@ -1830,6 +1853,27 @@ impl Pg2SqliteOptions {
     /// upload. An `INSTEAD OF` trigger writes the view's own rows, which stay
     /// unmarked. A trigger SQLite cannot run is refused as without this
     /// option.
+    ///
+    /// The emitted triggers also call `name` with `0`, which answers how many
+    /// runs are open and changes nothing. A table placed by
+    /// [`with_attached_tables`](Self::with_attached_tables) that a trigger
+    /// writes is shared by every connection attaching the database, so its
+    /// rows live in `<table>_pg2sqlite_shared` in the attached database, and
+    /// each connection keeps the rows it derives in
+    /// `<table>_pg2sqlite_overlay` in its own `main`, with the table's
+    /// columns and a `pg2sqlite_tombstone` flag set on a row it deleted. A
+    /// `TEMP` view under the table's name reads the overlay over the shared
+    /// rows. A write through it goes to the overlay while a run is open or
+    /// the overlay holds the row's key, and to the shared rows otherwise, and
+    /// the table's own triggers fire on both. The
+    /// [`translation
+    /// manifest`](crate::pg2sqlite::Pg2Sqlite::translation_manifest)
+    /// names the overlay, whose rows the consumer deletes by key once the
+    /// server settles them. Unique keys other than the primary key are
+    /// checked on the shared rows alone. A full-text or vector index on such a
+    /// table, an `ON CONFLICT` write into it and a table without a primary
+    /// key are refused, and a foreign key into or out of it is left to the
+    /// server.
     ///
     /// A foreign key whose `ON DELETE` or `ON UPDATE` action is `CASCADE`,
     /// `SET NULL` or `SET DEFAULT` is left out whole, since SQLite runs the

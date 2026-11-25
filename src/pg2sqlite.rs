@@ -30,7 +30,9 @@ use crate::{
             create_index::{FtsTranslation, analyze_fts_index},
             deferred_constraint, definer,
             drop_column_rebuild::{LiveAttachments, StatementHistory},
-            hidden_referenced_rows, postgis,
+            hidden_referenced_rows,
+            overlay::{self, OverlayMirrors},
+            postgis,
             reentry::MarkerTables,
             rls::generate_rls_audit_table,
             statement::is_data_movement_statement,
@@ -107,6 +109,30 @@ fn register_deferred_key_checks<'s>(
         }
     }
     Ok(())
+}
+
+/// Records on `options` the attached tables the triggers of `initial` and
+/// of `statements`, each read against the schema of its epoch, derive writes
+/// into.
+///
+/// # Errors
+///
+/// Fails as [`overlay::record_overlaid_tables`] does.
+fn record_overlaid_tables(
+    options: &mut Pg2SqliteOptions,
+    initial: Option<&ParserDB>,
+    statements: &[Statement],
+    epochs: &[PreparedEpoch],
+) -> Result<(), crate::errors::Error> {
+    let declared = epochs.iter().flat_map(|epoch| {
+        statements[epoch.start..epoch.end].iter().filter_map(|statement| {
+            match statement {
+                Statement::CreateTrigger(trigger) => Some((trigger, &*epoch.schema)),
+                _ => None,
+            }
+        })
+    });
+    overlay::record_overlaid_tables(options, initial, declared)
 }
 
 /// Registers every trigger the replica leaves to the server, each read
@@ -579,6 +605,7 @@ struct Trackers {
     trigger_slots: TriggerSlots,
     marker_tables: MarkerTables,
     attachments: LiveAttachments,
+    overlay_mirrors: OverlayMirrors,
 }
 
 /// A reshape's statements, the schema the replica held before it, and the
@@ -648,6 +675,7 @@ impl Trackers {
                 emit,
             )?
         };
+        self.overlay_mirrors.follow(&mut reshaped, shape, at.context)?;
         self.marker_tables.create_named(&mut reshaped);
         self.attachments.follow_emitted(&reshaped);
         Ok(Some((reshaped, before, tables)))
@@ -695,6 +723,7 @@ impl Trackers {
             .collect();
         let drops_superseded = !left.is_empty();
         emitted.extend(left);
+        self.overlay_mirrors.follow(emitted, at.schema, at.context)?;
         self.marker_tables.follow(statement, emitted);
         self.attachments.apply(statement, emitted);
         Ok(rebuilt || drops_superseded)
@@ -1271,7 +1300,7 @@ impl Pg2Sqlite {
         }
         let dispositions = crate::impls::transaction_blocks::analyse(statements)?;
 
-        let options = options.clone();
+        let mut options = options.clone();
         let had_rls_tables = match initial_schema {
             Some(schema) => schema.has_rls_tables()?,
             None => false,
@@ -1345,6 +1374,7 @@ impl Pg2Sqlite {
             start = end;
         };
 
+        record_overlaid_tables(&mut options, initial_namespace.as_ref(), &sources, &epochs)?;
         Ok(PreparedSchema {
             sources,
             schema,
@@ -1652,6 +1682,7 @@ impl Pg2Sqlite {
                 context.is_strict_rls_validation(),
             )?,
             attachments: LiveAttachments::seeded(initial_schema, context)?,
+            overlay_mirrors: OverlayMirrors::default(),
         };
         let mut follower = TriggerFollower::seeded(initial_schema);
         let initial_triggers = context.seed_table_triggers(initial_schema);
@@ -1767,6 +1798,8 @@ impl Pg2Sqlite {
         initial_schema: Option<&ParserDB>,
     ) -> Result<PreparedTranslation, crate::errors::Error> {
         let prepared = self.prepare_schema(options, initial_schema)?;
+        // The prepared options carry what the batch's triggers decide.
+        let options = &prepared.options.clone();
         let mut context = prepared.context(options);
         let PreparedStatements {
             sources,
@@ -2127,7 +2160,8 @@ impl Pg2Sqlite {
         };
 
         let prepared = self.prepare_schema(options, None)?;
-        let mut context = prepared.context(options);
+        let recorded = prepared.options.clone();
+        let mut context = prepared.context(&recorded);
         let PreparedStatements { sources, schema, options, mut statements, .. } =
             Self::translate_prepared(
                 prepared,
@@ -2182,11 +2216,19 @@ impl Pg2Sqlite {
                 })
                 .collect::<Result<Vec<_>, crate::errors::Error>>()?;
 
+            let overlay = if crate::impls::translator_impls::overlay::is_overlaid(table, options) {
+                let rows =
+                    crate::impls::translator_impls::overlay::rows_name(table, schema, options)?;
+                Some(crate::impls::translator_impls::overlay::overlay_name(&rows))
+            } else {
+                None
+            };
             entries.push(TableManifestEntry {
                 logical_placement: placed.home(&logical),
                 physical_placement: placed.home(&physical),
                 logical,
                 physical,
+                overlay,
                 wrapper,
                 columns,
             });

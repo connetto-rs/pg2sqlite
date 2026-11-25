@@ -69,9 +69,9 @@ use crate::{
 /// A view is not a table: it carries no defaults, and it cannot compute a
 /// generated column. Both facts have to reach the triggers, which are the only
 /// writers left once the table is split.
-struct TriggerColumn {
+pub(super) struct TriggerColumn {
     /// The column's name as the table declares it.
-    name: String,
+    pub(super) name: String,
     /// The `DEFAULT` in stored minor units (scaled). Used for the forwarding
     /// write.
     default: Option<Expr>,
@@ -90,7 +90,7 @@ impl TriggerColumn {
     ///
     /// A column the caller omitted arrives NULL, so a declared default answers
     /// for both.
-    fn forwarded_value(&self) -> Expr {
+    pub(super) fn forwarded_value(&self) -> Expr {
         let new_value = prefixed_column_expr("NEW", &self.name);
         match &self.default {
             Some(default) => coalesce(new_value, default.clone()),
@@ -114,7 +114,7 @@ impl TriggerColumn {
     }
 
     /// Whether the forwarding write supplies this column.
-    const fn is_forwarded(&self) -> bool {
+    pub(super) const fn is_forwarded(&self) -> bool {
         self.projected && !self.is_generated()
     }
 }
@@ -134,7 +134,7 @@ fn raw_column_default(column: &ColumnDef) -> Option<Expr> {
 ///
 /// Propagates a lookup failure, and a default that cannot be expressed at the
 /// column's scale, or a UUID BLOB column whose default is not a valid UUID.
-fn trigger_columns(
+pub(super) fn trigger_columns(
     table: &CreateTable,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
@@ -178,7 +178,7 @@ fn trigger_columns(
 /// `NEW."column"` and friends, as an expression rather than rendered text,
 /// quoted exactly where [`quote_identifier`] quotes so the emitted trigger
 /// reads the way the rest of it does.
-fn prefixed_column_expr(prefix: &str, column: &str) -> Expr {
+pub(super) fn prefixed_column_expr(prefix: &str, column: &str) -> Expr {
     let ident = if quote_identifier(column).starts_with('"') {
         Ident::with_quote('"', column)
     } else {
@@ -783,23 +783,29 @@ pub(crate) fn table_has_backing(
 /// triggers attach.
 ///
 /// A table with a backing table is split into a view and the backing table
-/// (e.g., `table_rls`), and views don't fire AFTER triggers in SQLite.
+/// (e.g., `table_rls`), and views don't fire AFTER triggers in SQLite. An
+/// overlaid table keeps its rows in the storage table the
+/// [`overlay`](super::overlay) names after its rows name.
 ///
 /// # Errors
 ///
-/// As [`has_backing_table`].
+/// As [`has_backing_table`] and [`super::overlay::is_overlaid`].
 pub(crate) fn resolve_trigger_table_name(
     base_name: &str,
     table: &CreateTable,
     schema: &ParserDB,
     options: &Pg2SqliteOptions,
 ) -> Result<String, Error> {
-    if has_backing_table(table, schema, options)? {
+    let rows = if has_backing_table(table, schema, options)? {
         let suffix = options.get_rls_table_suffix();
-        Ok(format!("{base_name}{suffix}"))
+        format!("{base_name}{suffix}")
     } else {
-        Ok(base_name.to_string())
+        base_name.to_string()
+    };
+    if super::overlay::is_overlaid(table, options) {
+        return Ok(super::overlay::storage_name(&rows));
     }
+    Ok(rows)
 }
 
 /// Refuses a backing table suffix that cannot separate a secured table from the

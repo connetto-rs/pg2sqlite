@@ -510,6 +510,12 @@ fn create_fts5_statements(
         ))
     })?;
     let key = FtsKey::of(table, schema, &base_name)?;
+    if super::overlay::is_overlaid(table, options) {
+        return Err(super::overlay::refusal(
+            table.table_name(),
+            "its full-text index would miss the rows the overlay holds",
+        ));
+    }
     let trigger_table_name = resolve_trigger_table_name(&base_name, table, schema, options)?;
 
     let mut statements: Vec<Statement> = key.create_keys_table().into_iter().collect();
@@ -767,10 +773,17 @@ impl crate::traits::translator::TranslatorWithContext for CreateIndex {
             )));
         };
         report_dropped_index_clauses(self, name, emit);
-        let backing_table = if names_table_with_backing(schema, &self.table_name, options)? {
-            append_suffix(&sqlite_table_name, options.get_rls_table_suffix())
-        } else {
-            sqlite_table_name
+        let backing_table = match resolve_translation_table(schema, &self.table_name)? {
+            Some(table) if super::overlay::is_overlaid(table, options) => {
+                append_suffix(
+                    &sqlite_table_name,
+                    &super::overlay::storage_suffix(table, schema, options)?,
+                )
+            }
+            _ if names_table_with_backing(schema, &self.table_name, options)? => {
+                append_suffix(&sqlite_table_name, options.get_rls_table_suffix())
+            }
+            _ => sqlite_table_name,
         };
         let definition_options = options.without_subqueries();
         let options = &definition_options;

@@ -50,13 +50,23 @@ pub struct TableManifestEntry {
     /// The table name in the source (PostgreSQL) schema.
     pub logical: String,
     /// Where the object named [`logical`](Self::logical) lives, which is the
-    /// view for [`WrapperKind::RlsView`] and [`WrapperKind::PrivilegeView`],
-    /// and the table itself otherwise.
+    /// view for [`WrapperKind::RlsView`] and [`WrapperKind::PrivilegeView`]
+    /// and for a table with an [`overlay`](Self::overlay), and the table
+    /// itself otherwise.
     pub logical_placement: Placement,
     /// The SQLite table that physically stores the rows.
     pub physical: String,
     /// Where [`physical`](Self::physical) lives, never [`Placement::Temp`].
     pub physical_placement: Placement,
+    /// The table in `main` holding this connection's server-derived writes
+    /// to an attached table, merged over [`physical`](Self::physical) by the
+    /// view under [`logical`](Self::logical).
+    ///
+    /// It has the table's columns and the `pg2sqlite_tombstone` flag, `1` on
+    /// a row the connection deleted. The embedder writes the server's rows to
+    /// [`physical`](Self::physical) and deletes the overlay rows by key once
+    /// the server settles them.
+    pub overlay: Option<String>,
     /// The wrapper generated around the physical table.
     pub wrapper: WrapperKind,
     /// How each column is physically represented, one entry per column in

@@ -40,6 +40,7 @@ pub(crate) mod locking;
 mod nulls_not_distinct;
 pub(crate) mod off_replica;
 mod order_by_expr;
+pub(crate) mod overlay;
 pub mod plpgsql;
 pub mod postgis;
 pub(crate) mod query;

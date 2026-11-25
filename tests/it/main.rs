@@ -22,6 +22,7 @@ mod test_array_to_string_empty;
 mod test_array_translation;
 mod test_ast_recursion;
 mod test_at_time_zone;
+mod test_attached_derived_overlay;
 mod test_attached_tables;
 mod test_bind_once_operands;
 mod test_boolean_cast;

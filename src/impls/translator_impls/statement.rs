@@ -70,6 +70,7 @@ use crate::{
             hidden_referenced_rows::{self, Rename, declared},
             nulls_not_distinct::{companion_drops, table_companions},
             off_replica::{self, OffReplica, Write},
+            overlay,
             rls::{
                 drop_view_statements, generate_rls_statements_with_context,
                 generate_view_statements, rename_table_for_rls, validate_table_policies,
@@ -533,7 +534,30 @@ fn build_create_table_statements(
     statements.extend(clock_triggers);
     statements.extend(referenced_sides);
     append_vec0_statements_if_needed(&mut statements, create_table, schema, options, emit)?;
+    overlay_if_derived(&mut statements, create_table, schema, options, emit)?;
     Ok(statements)
+}
+
+/// Moves `statements`, a table's translation, onto the storage table of the
+/// table's overlay and adds the overlay right after it, when the table keeps
+/// one.
+fn overlay_if_derived(
+    statements: &mut Vec<Statement>,
+    create_table: &sqlparser::ast::CreateTable,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<(), Error> {
+    let Some(table) = resolve_declared_table(schema, create_table)? else { return Ok(()) };
+    if !overlay::is_overlaid(table, options) {
+        return Ok(());
+    }
+    let rows = overlay::rows_name(table, schema, options)?;
+    overlay::move_to_storage(statements, &rows);
+    let Some(Statement::CreateTable(storage)) = statements.first() else { return Ok(()) };
+    let added = overlay::overlay_statements(table, storage, &rows, schema, options, emit)?;
+    statements.splice(1..1, added);
+    Ok(())
 }
 
 /// Appends `BEFORE` triggers refusing the writes `grants` does not allow on a

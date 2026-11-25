@@ -24,7 +24,9 @@ use crate::{
     impls::{
         object_name::{last_ident_value_or_display, quoted_ident},
         scoped_relations::relation_occurrences,
-        translator_impls::{reentry::is_marker_table, rls::resolve_trigger_table_name},
+        translator_impls::{
+            overlay::is_overlay_table, reentry::is_marker_table, rls::resolve_trigger_table_name,
+        },
     },
     manifest::Placement,
     options::{AttachedTables, Pg2SqliteOptions},
@@ -134,6 +136,11 @@ impl Placed {
     /// connection's `temp` storage.
     pub(crate) fn is_connection_local(&self, statement: &Statement) -> bool {
         is_connection_local(statement, &self.homes, &self.logical_storage, &self.trigger_homes)
+    }
+
+    /// Where the object a statement creates, changes or writes lives.
+    pub(crate) fn statement_home(&self, statement: &Statement) -> Placement {
+        statement_placement(statement, &self.homes, &self.logical_storage, &self.trigger_homes)
     }
 }
 
@@ -294,8 +301,13 @@ fn attached_storage(
         }
         for statement in emitted {
             match statement {
+                // The overlay holds one connection's rows, so it stays in
+                // `main`.
                 Statement::CreateTable(create) => {
-                    storage.insert(key(&last_ident_value_or_display(&create.name)));
+                    let created = last_ident_value_or_display(&create.name);
+                    if !is_overlay_table(&created) {
+                        storage.insert(key(&created));
+                    }
                 }
                 Statement::CreateVirtualTable { name, .. } => {
                     storage.insert(key(&last_ident_value_or_display(name)));

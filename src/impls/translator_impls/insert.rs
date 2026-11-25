@@ -229,6 +229,16 @@ impl crate::traits::translator::TranslatorWithContext for Insert {
         // One pass for all column-type conversions: literals and parameters.
         apply_column_type_conversions(&mut insert, target.optional(), schema, options)?;
 
+        // An overlaid table's writes go through the view merging its overlay,
+        // which SQLite refuses as an upsert target.
+        if let (Some(_), Some(table)) = (&self.on, target.optional())
+            && super::overlay::is_overlaid(table, options)
+        {
+            return Err(super::overlay::refusal(
+                table.table_name(),
+                "an `ON CONFLICT` write cannot target the view merging its overlay",
+            ));
+        }
         translate_on_insert(self, &mut insert, &mut target, &rewrites, schema, options, emit)?;
 
         if matches!(insert.on, Some(sqlparser::ast::OnInsert::OnConflict(_))) {
