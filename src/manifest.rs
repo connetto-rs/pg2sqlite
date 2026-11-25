@@ -67,6 +67,19 @@ pub struct TableManifestEntry {
     /// [`physical`](Self::physical) and deletes the overlay rows by key once
     /// the server settles them.
     pub overlay: Option<String>,
+    /// The connection's `TEMP` table of the keys at which the embedder lands
+    /// another author's writes on [`physical`](Self::physical), present
+    /// with [`overlay`](Self::overlay).
+    ///
+    /// It has the table's primary key columns. While it holds a key and no
+    /// derived run is open, the view under [`logical`](Self::logical) shows
+    /// the row of [`physical`](Self::physical) at that key, none when it
+    /// holds no row there, in place of the overlay's, and a write through
+    /// the view at that key goes to [`physical`](Self::physical) under the
+    /// table's policies, privileges and triggers. Derived writes it causes
+    /// still go to the overlay. The embedder inserts the key before the write
+    /// and deletes it afterwards.
+    pub shared_write: Option<String>,
     /// The wrapper generated around the physical table.
     pub wrapper: WrapperKind,
     /// How each column is physically represented, one entry per column in

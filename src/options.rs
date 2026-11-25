@@ -1865,15 +1865,19 @@ impl Pg2SqliteOptions {
     /// `TEMP` view under the table's name reads the overlay over the shared
     /// rows. A write through it goes to the overlay while a run is open or
     /// the overlay holds the row's key, and to the shared rows otherwise, and
-    /// the table's own triggers fire on both. The
+    /// the table's own triggers fire on both. The consumer lands another
+    /// author's write on the shared rows by inserting its key into the
+    /// connection's `TEMP` table `<table>_pg2sqlite_shared_write` for the
+    /// write. Outside a run the view then shows the shared row at that key,
+    /// and the write goes there under the table's policies and triggers. The
     /// [`translation
     /// manifest`](crate::pg2sqlite::Pg2Sqlite::translation_manifest)
-    /// names the overlay, whose rows the consumer deletes by key once the
-    /// server settles them. Unique keys other than the primary key are
-    /// checked on the shared rows alone. A full-text or vector index on such a
-    /// table, an `ON CONFLICT` write into it and a table without a primary
-    /// key are refused, and a foreign key into or out of it is left to the
-    /// server.
+    /// names the overlay and the shared-write table, and the consumer deletes
+    /// the overlay rows by key once the server settles them. Unique keys
+    /// other than the primary key are checked on the shared rows alone. A
+    /// full-text or vector index on such a table, an `ON CONFLICT` write into
+    /// it and a table without a primary key are refused, and a foreign key
+    /// into or out of it is left to the server.
     ///
     /// A foreign key whose `ON DELETE` or `ON UPDATE` action is `CASCADE`,
     /// `SET NULL` or `SET DEFAULT` is left out whole, since SQLite runs the

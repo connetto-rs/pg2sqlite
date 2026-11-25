@@ -302,10 +302,10 @@ fn attached_storage(
         for statement in emitted {
             match statement {
                 // The overlay holds one connection's rows, so it stays in
-                // `main`.
+                // `main`, and a `TEMP` table stays in the connection.
                 Statement::CreateTable(create) => {
                     let created = last_ident_value_or_display(&create.name);
-                    if !is_overlay_table(&created) {
+                    if !create.temporary && !is_overlay_table(&created) {
                         storage.insert(key(&created));
                     }
                 }
