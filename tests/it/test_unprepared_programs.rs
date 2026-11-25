@@ -1,5 +1,5 @@
-//! Every trigger and view a loaded connection holds that SQLite refuses to
-//! prepare is listed, and nothing SQLite prepares.
+//! Every trigger, view and helper function body a loaded connection holds that
+//! SQLite refuses to prepare is listed, and nothing SQLite prepares.
 //!
 //! SQLite refuses to expand a `WITH` query in a program already holding
 //! `SQLITE_LIMIT_EXPR_DEPTH` table cursors. A helper PostgreSQL inlines is
@@ -170,7 +170,8 @@ fn sweep(
         let translated = helpers::translate_script(&script(count), &options())
             .unwrap_or_else(|error| panic!("{count} fails to translate: {error}"));
         let mut connection = loaded(None, &translated);
-        let unprepared = unprepared_programs(&mut connection).expect("the schema reads");
+        let unprepared =
+            unprepared_programs(&mut connection, &translated.functions).expect("the schema reads");
         let listed = unprepared.iter().any(|unprepared| lists(unprepared, program));
         // The statement a client sends, written as text the way a client sends
         // it.
@@ -283,7 +284,7 @@ CREATE TRIGGER deep_updated INSTEAD OF UPDATE ON deep BEGIN SELECT 1; END;
             doubling_views(10)
         ))
         .expect("the script loads");
-    let unprepared = unprepared_programs(&mut connection).expect("the schema reads");
+    let unprepared = unprepared_programs::<String>(&mut connection, &[]).expect("the schema reads");
     let mut listed: Vec<(&str, Vec<&str>)> = unprepared
         .iter()
         .map(|unprepared| {
@@ -329,7 +330,8 @@ fn a_called_helper_chain_prepares_however_deep_or_often_called() {
         let script = helpers::translate_script(&sql, &options())
             .unwrap_or_else(|error| panic!("the chain translates: {error}"));
         let mut connection = loaded(None, &script);
-        let unprepared = unprepared_programs(&mut connection).expect("the schema reads");
+        let unprepared =
+            unprepared_programs(&mut connection, &script.functions).expect("the schema reads");
         assert!(unprepared.is_empty(), "SQLite refuses a program: {unprepared:?}");
         diesel::sql_query("UPDATE items SET value = 1")
             .execute(&mut connection)
@@ -466,11 +468,51 @@ INSERT INTO sqlite_schema VALUES ('trigger', 'written', 't', 0, 'create trigger 
 PRAGMA writable_schema = RESET;",
         )
         .expect("the schema is written");
-    let error = unprepared_programs(&mut connection).expect_err("the trigger is not read");
+    let error =
+        unprepared_programs::<String>(&mut connection, &[]).expect_err("the trigger is not read");
     assert!(
         matches!(&error, ProgramsError::UnreadTrigger { schema, name } if schema == "main" && name == "written"),
         "{error:?}"
     );
+}
+
+/// A helper function whose body a migration breaks is listed by name, while
+/// the view calling it still prepares and fails only once read.
+#[test]
+fn a_helper_function_whose_body_sqlite_refuses_is_listed_by_name() {
+    let function = |name: &str, relation: &str| {
+        HelperFunction {
+            name: name.to_owned(),
+            parameters: vec!["wanted".to_owned()],
+            columns: vec!["x".to_owned()],
+            body: format!("SELECT x FROM {relation} WHERE x = ?1"),
+        }
+    };
+    let functions = [function("kept", "t"), function("broken", "gone")];
+    let mut connection = helpers::establish_connection();
+    for function in &functions {
+        function.register(&mut connection).expect("register the helper function");
+    }
+    connection
+        .batch_execute(
+            "CREATE TABLE t (x);
+CREATE TABLE gone (x);
+CREATE VIEW reads_kept AS SELECT x FROM kept(1);
+CREATE VIEW reads_broken AS SELECT x FROM broken(1);
+DROP TABLE gone;",
+        )
+        .expect("the schema loads");
+    let unprepared = unprepared_programs(&mut connection, &functions).expect("the schema reads");
+    let listed: Vec<(&str, &[String])> = unprepared
+        .iter()
+        .map(|unprepared| (unprepared.statement.as_str(), unprepared.programs.as_slice()))
+        .collect();
+    assert_eq!(listed, [("SELECT x FROM gone WHERE x = ?1", &["broken".to_owned()][..])]);
+    assert!(unprepared[0].message.contains("no such table: gone"), "{unprepared:?}");
+    let error = diesel::sql_query("SELECT x FROM reads_broken")
+        .execute(&mut connection)
+        .expect_err("the broken body fails once called");
+    assert!(error.to_string().contains("no such table: gone"), "{error}");
 }
 
 #[test]

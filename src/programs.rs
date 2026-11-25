@@ -1,13 +1,14 @@
-//! The triggers and views a SQLite connection holds that SQLite refuses to
-//! prepare.
+//! The triggers, views and helper function bodies a SQLite connection holds
+//! that SQLite refuses to prepare.
 //!
-//! SQLite compiles a trigger when it prepares a write firing it and a view
-//! when it prepares a read of it, so a schema loads whole and fails on the
-//! first statement a client prepares.
+//! SQLite compiles a trigger when it prepares a write firing it, a view when
+//! it prepares a read of it, and a helper function's body only when a running
+//! statement calls the function, so a schema loads whole and fails on the
+//! first statement a client runs.
 //!
 //! ```
 //! use diesel::{connection::SimpleConnection, prelude::*};
-//! use pg2sqlite::programs::unprepared_programs;
+//! use pg2sqlite::{programs::unprepared_programs, script::HelperFunction};
 //!
 //! let mut connection = SqliteConnection::establish(":memory:")?;
 //! let mut script = String::from(
@@ -22,9 +23,17 @@
 //! }
 //! script.push_str("CREATE TRIGGER t_deleted AFTER DELETE ON t BEGIN SELECT x FROM v10; END;");
 //! connection.batch_execute(&script)?;
-//! let unprepared = unprepared_programs(&mut connection)?;
+//! let helper = HelperFunction {
+//!     name: "missing_rows".to_owned(),
+//!     parameters: Vec::new(),
+//!     columns: vec!["x".to_owned()],
+//!     body: "SELECT x FROM missing".to_owned(),
+//! };
+//! helper.register(&mut connection)?;
+//! let unprepared = unprepared_programs(&mut connection, &[helper])?;
 //! assert!(unprepared.iter().any(|program| program.programs == ["t_deleted"]));
 //! assert!(unprepared.iter().any(|program| program.programs == ["v10"]));
+//! assert!(unprepared.iter().any(|program| program.programs == ["missing_rows"]));
 //! assert!(unprepared.iter().all(|program| program.programs != ["v1"]));
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
@@ -36,19 +45,21 @@ use diesel::{
     dsl::sql,
     result::Error as DieselError,
     sql_types::{Nullable, Text},
-    sqlite::SqliteConnection,
+    sqlite::{Sqlite, SqliteConnection},
 };
 
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
+use crate::script::HelperFunction;
 
-/// A statement SQLite refuses to prepare, and the triggers or the view it
-/// compiles.
+/// A statement SQLite refuses to prepare, and the triggers, the view or the
+/// helper function it compiles.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnpreparedProgram {
-    /// The write firing the triggers, or the read of the view.
+    /// The write firing the triggers, the read of the view, or the helper
+    /// function's body.
     pub statement: String,
-    /// The triggers the write fires, or the view read.
+    /// The triggers the write fires, the view read, or the helper function.
     pub programs: Vec<String>,
     /// What SQLite answers preparing the statement.
     pub message: String,
@@ -84,15 +95,20 @@ pub enum ProgramsError {
 }
 
 /// Every trigger and view `connection` holds that its SQLite refuses to
-/// prepare, in every schema the connection has attached, each with the
-/// statement compiling it and SQLite's message.
+/// prepare, in every schema the connection has attached, and every body of
+/// `functions` it refuses, each with the statement compiling it and SQLite's
+/// message.
+///
+/// `functions` are the helper functions registered on `connection`, whose
+/// bodies the connection does not hold.
 ///
 /// # Errors
 ///
 /// Returns [`ProgramsError`] when the schema cannot be read, or a trigger is
 /// not stored as SQLite writes one.
-pub fn unprepared_programs(
+pub fn unprepared_programs<S: core::fmt::Display>(
     connection: &mut SqliteConnection,
+    functions: &[HelperFunction<S>],
 ) -> Result<Vec<UnpreparedProgram>, ProgramsError> {
     let schemas = schemas(connection)?;
     let mut relations: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
@@ -161,26 +177,37 @@ pub fn unprepared_programs(
                 }
             }
         };
-        prepare(connection, statement, programs, &mut unprepared);
+        prepare(connection, statement, 0, programs, &mut unprepared);
     }
     for (schema, view) in views {
         let statement = format!("SELECT * FROM {}.{}", quoted(schema), quoted(&view));
-        prepare(connection, statement, vec![view], &mut unprepared);
+        prepare(connection, statement, 0, vec![view], &mut unprepared);
+    }
+    for function in functions {
+        let statement = function.body.to_string();
+        let parameters = function.parameters.len();
+        prepare(connection, statement, parameters, vec![function.name.clone()], &mut unprepared);
     }
     Ok(unprepared)
 }
 
 /// Prepares `statement` under `EXPLAIN`, which compiles every program it
-/// runs and executes none, listing it in `unprepared` when SQLite refuses.
+/// runs and executes none, with its `parameters` bound to `NULL`, listing it
+/// in `unprepared` when SQLite refuses.
 fn prepare(
     connection: &mut SqliteConnection,
     statement: String,
+    parameters: usize,
     programs: Vec<String>,
     unprepared: &mut Vec<UnpreparedProgram>,
 ) {
     // The statement is built from the schema at run time, which the typed DSL
     // cannot name.
-    if let Err(error) = diesel::sql_query(format!("EXPLAIN {statement}")).execute(connection) {
+    let explained = (0..parameters).fold(
+        diesel::sql_query(format!("EXPLAIN {statement}")).into_boxed::<Sqlite>(),
+        |query, _| query.bind::<Nullable<Text>, _>(None::<String>),
+    );
+    if let Err(error) = explained.execute(connection) {
         unprepared.push(UnpreparedProgram { statement, programs, message: error.to_string() });
     }
 }
