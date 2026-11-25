@@ -246,3 +246,46 @@ fn test_check_constraint_string_length() -> Result<(), Box<dyn std::error::Error
 
     Ok(())
 }
+
+/// A table whose unsupported check reads `secret`, which the acting role
+/// cannot read.
+const WITHHELD_UNSUPPORTED: &str = "
+CREATE ROLE app NOLOGIN;
+CREATE TABLE t (id INTEGER PRIMARY KEY, owner TEXT, secret TEXT CHECK (starts_with(secret, 'a')));
+GRANT SELECT (id, owner), INSERT ON t TO app;
+";
+
+fn acting_app() -> Pg2SqliteOptions {
+    Pg2SqliteOptions::default()
+        .with_deployment(helpers::deployment::deployment(["app"], []))
+        .with_acting_role("app")
+}
+
+/// An unsupported check on a column the acting role cannot read is refused,
+/// as it is on any other column.
+#[test]
+fn test_unsupported_check_on_withheld_column_causes_error() {
+    let error = Pg2Sqlite::default()
+        .sql(WITHHELD_UNSUPPORTED)
+        .unwrap()
+        .translate(&acting_app())
+        .expect_err("the check does not translate");
+    assert!(error.to_string().contains("starts_with"), "{error}");
+}
+
+/// With `remove_unsupported_check_constraints()` an unsupported check on a
+/// column the acting role cannot read is dropped from the table and from
+/// the triggers holding the role's writes to it.
+#[test]
+fn test_unsupported_check_on_withheld_column_removed_with_option() {
+    let options = acting_app().with_remove_unsupported_check_constraints();
+    let translated = Pg2Sqlite::default()
+        .sql(WITHHELD_UNSUPPORTED)
+        .unwrap()
+        .translate(&options)
+        .unwrap()
+        .into_vec();
+    let stmts: Vec<String> = translated.iter().map(ToString::to_string).collect();
+    assert!(!stmts.join("\n").contains("starts_with"), "{stmts:#?}");
+    helpers::apply_statements(&stmts);
+}
