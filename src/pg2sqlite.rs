@@ -486,25 +486,28 @@ impl PreparedEpoch {
 }
 
 /// The pass-through view standing for the table `create_table`, statement
-/// `index` of the batch, until the relations its final view reads exist.
+/// `index` of the batch, with the columns the table holds once statement `at`
+/// of its epoch has run, until the relations and columns its final view reads
+/// exist.
 fn pass_through_view(
     epochs: &[PreparedEpoch],
     context: &TranslationContext<'_>,
-    index: usize,
+    (index, at): (usize, usize),
     create_table: &sqlparser::ast::CreateTable,
 ) -> Result<Vec<Statement>, crate::errors::Error> {
     let epoch =
         epochs.iter().find(|epoch| epoch.end > index).expect("the epochs cover every statement");
-    // A statement that drops or renames a table ends its epoch, so the schema
-    // of the epoch creating a table still holds it.
-    let table = crate::impls::object_name::resolve_declared_table(&epoch.schema, create_table)?
+    // A statement that drops or renames a table ends its epoch, so every
+    // schema of the epoch creating a table still holds it.
+    let written = epoch.binding(at);
+    let table = crate::impls::object_name::resolve_declared_table(written, create_table)?
         .expect("the epoch creating a table holds it");
     // The final view's triggers forward the same defaults and already reported
     // what translating them warns about.
     crate::impls::translator_impls::rls::generate_pass_through_view_statements(
         table,
-        &epoch.schema,
-        &context.with_written_schema(epoch.written(index)),
+        written,
+        &context.with_written_schema(written),
         &mut |_| {},
     )
 }
@@ -1582,7 +1585,12 @@ impl Pg2Sqlite {
             &mut translated,
             initial_schema.as_ref(),
             options.get_rls_table_suffix(),
-            |index, create_table| pass_through_view(&epochs, context, index, create_table),
+            |index| {
+                epochs.iter().find(|epoch| epoch.end > index).map_or(index + 1, |epoch| epoch.end)
+            },
+            |index, at, create_table| {
+                pass_through_view(&epochs, context, (index, at), create_table)
+            },
         )?;
 
         let schema = schema?;

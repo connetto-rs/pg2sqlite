@@ -319,9 +319,115 @@ fn a_late_column_grant_hides_the_other_columns() {
 #[test]
 fn a_late_column_reaches_the_view() {
     let column = "ALTER TABLE notes ADD COLUMN body TEXT;";
-    let (mut late, _) = loaded(&format!("{TABLE}{SECURED}{BOUNDARY}{column}"));
-    let (mut early, _) = loaded(&format!("{TABLE}{SECURED}{column}{BOUNDARY}"));
-    assert_same_objects(&mut late, &mut early);
+    assert_same_replica(
+        loaded(&format!("{HEAD}{SECURED}{BOUNDARY}{column}")),
+        loaded(&format!("{HEAD}{SECURED}{column}{BOUNDARY}")),
+    );
+}
+
+#[test]
+fn rows_written_before_a_column_of_the_same_epoch_stay() {
+    let column = "ALTER TABLE notes ADD COLUMN body TEXT;";
+    let rows = "INSERT INTO notes (id, owner) VALUES (1, 'app'), (2, 'other'), (3, 'app');";
+    assert_same_replica(
+        loaded(&format!("{TABLE}{SECURED}{rows}{column}")),
+        loaded(&format!("{TABLE}{SECURED}{column}{rows}")),
+    );
+}
+
+#[test]
+fn rows_written_before_a_policy_on_a_column_of_the_same_epoch_stay() {
+    let column = "ALTER TABLE notes ADD COLUMN body TEXT;
+        CREATE POLICY notes_blank ON notes TO app USING (body IS NULL);";
+    let rows = "INSERT INTO notes (id, owner) VALUES (1, 'app'), (2, 'other'), (3, 'app');";
+    assert_same_replica(
+        loaded(&format!("{TABLE}{SECURED}{rows}{column}")),
+        loaded(&format!("{TABLE}{SECURED}{column}{rows}")),
+    );
+}
+
+/// The role and `notes` with a third column, `label`, and no rows.
+const THREE_COLUMNS: &str = "
+CREATE ROLE app NOLOGIN;
+CREATE TABLE notes (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, label TEXT);
+GRANT SELECT, INSERT, UPDATE, DELETE ON notes TO app;
+";
+
+#[test]
+fn rows_written_before_a_column_drop_of_the_same_epoch_stay() {
+    let drop = "ALTER TABLE notes DROP COLUMN label;";
+    assert_same_replica(
+        loaded(&format!(
+            "{THREE_COLUMNS}{SECURED}INSERT INTO notes VALUES (1, 'app', 'a'), (2, 'other', 'b'), \
+             (3, 'app', 'c');{drop}"
+        )),
+        loaded(&format!(
+            "{THREE_COLUMNS}{SECURED}{drop}INSERT INTO notes VALUES (1, 'app'), (2, 'other'), \
+             (3, 'app');"
+        )),
+    );
+}
+
+#[test]
+fn rows_written_before_a_column_rename_of_the_same_epoch_stay() {
+    let rename = "ALTER TABLE notes RENAME COLUMN label TO title;";
+    let rows = |column: &str| {
+        format!(
+            "INSERT INTO notes (id, owner, {column}) VALUES (1, 'app', 'a'), (2, 'other', 'b'), \
+             (3, 'app', 'c');"
+        )
+    };
+    assert_same_replica(
+        loaded(&format!("{THREE_COLUMNS}{SECURED}{}{rename}", rows("label"))),
+        loaded(&format!("{THREE_COLUMNS}{SECURED}{rename}{}", rows("title"))),
+    );
+}
+
+#[test]
+fn rows_written_between_column_changes_of_the_same_epoch_stay() {
+    let drop = "ALTER TABLE notes DROP COLUMN label;";
+    let add = "ALTER TABLE notes ADD COLUMN body TEXT;";
+    let labelled = "INSERT INTO notes VALUES (1, 'app', 'a'), (2, 'other', 'b');";
+    let unlabelled = "INSERT INTO notes (id, owner) VALUES (3, 'app');";
+    let rows = "INSERT INTO notes (id, owner) VALUES (1, 'app'), (2, 'other'), (3, 'app');";
+    assert_same_replica(
+        loaded(&format!("{THREE_COLUMNS}{SECURED}{labelled}{drop}{unlabelled}{add}")),
+        loaded(&format!("{THREE_COLUMNS}{SECURED}{drop}{add}{rows}")),
+    );
+}
+
+#[test]
+fn rows_written_before_one_statement_changing_two_columns_stay() {
+    let alter = "ALTER TABLE notes DROP COLUMN label, ADD COLUMN body TEXT;";
+    let rows = "INSERT INTO notes (id, owner) VALUES (1, 'app'), (2, 'other'), (3, 'app');";
+    assert_same_replica(
+        loaded(&format!(
+            "{THREE_COLUMNS}{SECURED}INSERT INTO notes VALUES (1, 'app', 'a'), (2, 'other', 'b'), \
+             (3, 'app', 'c');{alter}"
+        )),
+        loaded(&format!("{THREE_COLUMNS}{SECURED}{alter}{rows}")),
+    );
+}
+
+#[test]
+fn rows_written_through_a_column_the_epoch_adds_and_drops_stay() {
+    let add = "ALTER TABLE notes ADD COLUMN scratch TEXT;";
+    let drop = "ALTER TABLE notes DROP COLUMN scratch;";
+    let scratched =
+        "INSERT INTO notes (id, owner, scratch) VALUES (1, 'app', 'a'), (2, 'other', 'b');";
+    let first = "INSERT INTO notes (id, owner) VALUES (1, 'app');";
+    let rest = "INSERT INTO notes (id, owner) VALUES (2, 'other'), (3, 'app');";
+    let rows = "INSERT INTO notes (id, owner) VALUES (1, 'app'), (2, 'other'), (3, 'app');";
+    assert_same_replica(
+        loaded(&format!(
+            "{TABLE}{SECURED}{add}{scratched}{drop}INSERT INTO notes (id, owner) VALUES (3, 'app');"
+        )),
+        loaded(&format!("{TABLE}{SECURED}{rows}")),
+    );
+    assert_same_replica(
+        loaded(&format!("{TABLE}{SECURED}{first}{add}{drop}{rest}")),
+        loaded(&format!("{TABLE}{SECURED}{rows}")),
+    );
 }
 
 #[test]
