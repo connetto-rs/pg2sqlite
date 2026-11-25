@@ -286,7 +286,7 @@ fn helper_query(
                 &arguments,
                 deployment,
                 schema,
-                &[ArmCondition::Exclusion, ArmCondition::UnsetSetting],
+                &[ArmCondition::Exclusion, ArmCondition::UnsetSetting, ArmCondition::EdgeCondition],
             )
         })
         .map_err(|error| untranslatable(name, &error))?;
@@ -530,7 +530,7 @@ fn unsupported_argument(name: &ObjectName, argument: &dyn ToString) -> HelperSet
     }
 }
 
-/// The alias of the table a grant or parent arm reads.
+/// The alias of the table a grant or parent arm reads, and of a walk's edges.
 const ARM: &str = "arm";
 /// The alias of the table an anti-join reads.
 const BLOCKING: &str = "blocking";
@@ -597,7 +597,7 @@ impl<'db> Lowering<'_, 'db> {
                 HelperArm::Grant(grant) => arms.push(self.grant(grant, arm_names)?),
                 HelperArm::Parent(parent) => arms.push(self.parent(parent, arm_names)),
                 HelperArm::Called(called) => arms.push(self.called(called, arm_names)),
-                HelperArm::Walk(walk) => edges.push(self.edge(walk)),
+                HelperArm::Walk(walk) => edges.push(self.edge(walk)?),
             }
         }
         let selection = match set.selection() {
@@ -793,9 +793,10 @@ impl<'db> Lowering<'_, 'db> {
         }
     }
 
-    /// `SELECT <next> AS next, <previous> AS previous FROM <table>`, the edges
-    /// of one walk, each from the row the walk holds to the row it adds.
-    fn edge(&mut self, walk: &WalkArm<'db, ParserDB>) -> SetExpr {
+    /// `SELECT <next> AS next, <previous> AS previous FROM <table> [WHERE
+    /// <conditions>]`, the edges of one walk, each from the row the walk holds
+    /// to the row it adds, kept to the rows the walk's term follows.
+    fn edge(&mut self, walk: &WalkArm<'db, ParserDB>) -> Result<SetExpr, Error> {
         self.read.push(walk.table());
         let (next, previous) = match walk.direction() {
             WalkDirection::Down => (walk.child(), walk.column()),
@@ -803,15 +804,21 @@ impl<'db> Lowering<'_, 'db> {
         };
         let projected = |column: &<ParserDB as DatabaseLike>::Column, name: &str| {
             SelectItem::ExprWithAlias {
-                expr: Expr::Identifier(declared_column_ident(column)),
+                expr: qualified(ARM, declared_column_ident(column)),
                 alias: Ident::new(name),
             }
         };
-        SetExpr::Select(Box::new(make_simple_select(
+        let mut conditions: Vec<Expr> = restrictions(ARM, walk.restrictions())
+            .chain(time_bounds(ARM, walk.time_bounds()))
+            .collect();
+        for exclusion in walk.exclusions() {
+            conditions.push(self.exclusion(exclusion)?);
+        }
+        Ok(SetExpr::Select(Box::new(make_simple_select(
             vec![projected(next, NEXT), projected(previous, PREVIOUS)],
-            from_relation(plain_table_factor(walk.table().name.clone())),
-            None,
-        )))
+            from_relation(aliased_table(walk.table(), ARM)),
+            conjunction(conditions),
+        ))))
     }
 
     /// `SELECT <key> FROM <table> WHERE <column> IN (<parents>)`.
