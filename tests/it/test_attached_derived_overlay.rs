@@ -22,6 +22,11 @@ diesel::define_sql_function! {
     fn derived(step: diesel::sql_types::Integer) -> diesel::sql_types::Integer;
 }
 
+diesel::define_sql_function! {
+    /// The rows every statement on the connection has changed so far.
+    fn total_changes() -> diesel::sql_types::BigInt;
+}
+
 mod schema {
     diesel::table! {
         notes (id) {
@@ -75,11 +80,43 @@ mod schema {
             tbl_name -> Text,
         }
     }
+
+    diesel::table! {
+        documents (id) {
+            id -> Integer,
+            title -> Text,
+            body -> Text,
+        }
+    }
+
+    diesel::table! {
+        shared.documents_rls_pg2sqlite_shared (id) {
+            id -> Integer,
+            title -> Text,
+            body -> Text,
+        }
+    }
+
+    diesel::table! {
+        documents_rls_pg2sqlite_overlay (id) {
+            id -> Integer,
+            title -> Text,
+            body -> Text,
+            pg2sqlite_tombstone -> Integer,
+        }
+    }
+
+    diesel::table! {
+        documents_rls_pg2sqlite_shared_write (id) {
+            id -> Integer,
+        }
+    }
 }
 
 use schema::{
-    note_counts, note_log, notes, notes_pg2sqlite_overlay, notes_pg2sqlite_shared, sources,
-    sqlite_master,
+    documents, documents_rls_pg2sqlite_overlay, documents_rls_pg2sqlite_shared,
+    documents_rls_pg2sqlite_shared_write, note_counts, note_log, notes, notes_pg2sqlite_overlay,
+    notes_pg2sqlite_shared, sources, sqlite_master,
 };
 
 /// A source insert derives a note, rewrites note 1, removes note 2 and then
@@ -411,6 +448,177 @@ fn a_policy_on_an_overlaid_table_filters_the_merged_rows() {
     );
 }
 
+const DOCUMENTS: &str = "
+CREATE TABLE sources (id INTEGER PRIMARY KEY);
+CREATE TABLE documents (id INTEGER PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL);
+CREATE FUNCTION draft_documents() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO documents VALUES (NEW.id + 100, 'draft', 'draft');
+  UPDATE documents SET title = 'draft', body = 'draft' WHERE id = 1;
+  DELETE FROM documents WHERE id = 2;
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER sources_draft AFTER INSERT ON sources
+  FOR EACH ROW EXECUTE FUNCTION draft_documents();
+CREATE FUNCTION echo_document() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO documents VALUES (NEW.id + 1000, 'echo', 'echo');
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER documents_echo AFTER UPDATE ON documents
+  FOR EACH ROW WHEN (NEW.body = 'peer') EXECUTE FUNCTION echo_document();
+ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+CREATE POLICY documents_read ON documents FOR SELECT USING (true);
+CREATE POLICY documents_insert ON documents FOR INSERT WITH CHECK (true);
+CREATE POLICY documents_update ON documents FOR UPDATE USING (title <> 'draft') WITH CHECK (true);
+CREATE POLICY documents_delete ON documents FOR DELETE USING (title <> 'draft');
+";
+
+type Document = (i32, String, String);
+
+fn document(id: i32, title: &str, body: &str) -> Document {
+    (id, title.to_owned(), body.to_owned())
+}
+
+/// Alice and bob over documents 1 and 2, after alice's derived run has
+/// drafted document 1, deleted document 2 and inserted document 105 in her
+/// overlay.
+fn drafted(label: &str) -> (Files, SqliteConnection, SqliteConnection) {
+    let options = Pg2SqliteOptions::default()
+        .with_server_derived_write_function("derived")
+        .with_attached_tables("shared", ["documents"])
+        .with_rls_audit_table_name("_rls_audit");
+    let script = translate(DOCUMENTS, &options).expect("translate");
+    let files = Files::new(label);
+    let mut alice = files.open(&files.alice, &script);
+    run(&mut alice, script.initialize(FreshFiles::Both).expect("initialize both"));
+    diesel::insert_into(documents::table)
+        .values(&[
+            (documents::id.eq(1), documents::title.eq("seed"), documents::body.eq("seed")),
+            (documents::id.eq(2), documents::title.eq("seed two"), documents::body.eq("seed two")),
+        ])
+        .execute(&mut alice)
+        .expect("seed documents");
+    let mut bob = files.open(&files.bob, &script);
+    run(&mut bob, script.initialize(FreshFiles::Main).expect("initialize bob's main"));
+    derive(&mut alice, 5);
+    (files, alice, bob)
+}
+
+fn documents_seen(connection: &mut SqliteConnection) -> Vec<Document> {
+    documents::table.order(documents::id).load(connection).expect("read documents")
+}
+
+fn shared_documents(connection: &mut SqliteConnection) -> Vec<Document> {
+    documents_rls_pg2sqlite_shared::table
+        .order(documents_rls_pg2sqlite_shared::id)
+        .load(connection)
+        .expect("read the shared documents")
+}
+
+fn overlay_documents(connection: &mut SqliteConnection) -> Vec<(i32, String, String, i32)> {
+    documents_rls_pg2sqlite_overlay::table
+        .order(documents_rls_pg2sqlite_overlay::id)
+        .load(connection)
+        .expect("read the overlay")
+}
+
+/// Runs `write` with `key` named as the key it lands on the shared rows at.
+fn land<T>(
+    connection: &mut SqliteConnection,
+    key: i32,
+    write: impl FnOnce(&mut SqliteConnection) -> T,
+) -> T {
+    diesel::insert_into(documents_rls_pg2sqlite_shared_write::table)
+        .values(documents_rls_pg2sqlite_shared_write::id.eq(key))
+        .execute(connection)
+        .expect("name the landing key");
+    let written = write(connection);
+    diesel::delete(documents_rls_pg2sqlite_shared_write::table)
+        .execute(connection)
+        .expect("clear the landing key");
+    written
+}
+
+#[test]
+fn a_landed_update_writes_the_shared_row_its_policy_judges() {
+    let (_files, mut alice, mut bob) = drafted("landed-update");
+
+    land(&mut alice, 1, |connection| {
+        diesel::update(documents::table.filter(documents::id.eq(1)))
+            .set(documents::body.eq("peer"))
+            .execute(connection)
+            .expect("a landed update")
+    });
+
+    let landed = [document(1, "seed", "peer"), document(2, "seed two", "seed two")];
+    assert_eq!(shared_documents(&mut alice), landed);
+    assert_eq!(documents_seen(&mut bob), landed);
+    assert_eq!(
+        documents_seen(&mut alice),
+        [
+            document(1, "draft", "draft"),
+            document(105, "draft", "draft"),
+            document(1001, "echo", "echo")
+        ],
+        "the derived write the landed update causes stays in the overlay"
+    );
+}
+
+#[test]
+fn a_landed_delete_and_insert_replace_the_shared_row() {
+    let (_files, mut alice, mut bob) = drafted("landed-replace");
+    let overlay = overlay_documents(&mut alice);
+
+    land(&mut alice, 1, |connection| {
+        diesel::delete(documents::table.filter(documents::id.eq(1)))
+            .execute(connection)
+            .expect("a landed delete");
+        diesel::insert_into(documents::table)
+            .values((documents::id.eq(1), documents::title.eq("peer"), documents::body.eq("peer")))
+            .execute(connection)
+            .expect("a landed insert")
+    });
+    land(&mut alice, 2, |connection| {
+        diesel::delete(documents::table.filter(documents::id.eq(2)))
+            .execute(connection)
+            .expect("a landed delete of a key the overlay holds deleted")
+    });
+
+    assert_eq!(shared_documents(&mut alice), [document(1, "peer", "peer")]);
+    assert_eq!(documents_seen(&mut bob), [document(1, "peer", "peer")]);
+    assert_eq!(overlay_documents(&mut alice), overlay);
+    assert_eq!(
+        documents_seen(&mut alice),
+        [document(1, "draft", "draft"), document(105, "draft", "draft")]
+    );
+}
+
+#[test]
+fn a_landed_write_on_a_key_the_shared_rows_lack_changes_nothing() {
+    let (_files, mut alice, _bob) = drafted("landed-missing");
+    let overlay = overlay_documents(&mut alice);
+    let shared = shared_documents(&mut alice);
+
+    let changed = land(&mut alice, 105, |connection| {
+        let before = diesel::select(total_changes()).get_result::<i64>(connection).expect("count");
+        diesel::update(documents::table.filter(documents::id.eq(105)))
+            .set(documents::body.eq("peer"))
+            .execute(connection)
+            .expect("a landed update");
+        diesel::delete(documents::table.filter(documents::id.eq(105)))
+            .execute(connection)
+            .expect("a landed delete");
+        diesel::select(total_changes()).get_result::<i64>(connection).expect("count") - before
+    });
+
+    assert_eq!(changed, 0);
+    assert_eq!(overlay_documents(&mut alice), overlay);
+    assert_eq!(shared_documents(&mut alice), shared);
+}
+
 #[test]
 fn the_manifest_names_the_shared_rows_and_the_overlay() {
     let manifest = Pg2Sqlite::default()
@@ -425,13 +633,15 @@ fn the_manifest_names_the_shared_rows_and_the_overlay() {
             notes.logical_placement,
             notes.physical.as_str(),
             notes.physical_placement,
-            notes.overlay.as_deref()
+            notes.overlay.as_deref(),
+            notes.shared_write.as_deref()
         ),
         (
             Placement::Temp,
             "notes_pg2sqlite_shared",
             Placement::Attached,
-            Some("notes_pg2sqlite_overlay")
+            Some("notes_pg2sqlite_overlay"),
+            Some("notes_pg2sqlite_shared_write")
         )
     );
     assert_eq!(entry("sources").overlay, None);

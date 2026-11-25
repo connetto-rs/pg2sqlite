@@ -18,6 +18,13 @@
 //!   overlay, a delete as a tombstone,
 //! - otherwise to the storage table.
 //!
+//! The embedder lands another author's write on the storage rows by naming
+//! its key in the connection's `TEMP` shared-write table. Outside a derived
+//! run, the view then shows the storage row at that key in place of the
+//! overlay's, so the table's policies and triggers judge the storage row, and
+//! the write goes to the storage table though the overlay holds the key. A
+//! derived write the landing write causes still goes to the overlay.
+//!
 //! SQLite refuses a qualified table name in the writes of a trigger, so every
 //! object carries a name of its own and each trigger reaches it unqualified.
 //!
@@ -78,6 +85,7 @@ use crate::{
 const STORAGE_SUFFIX: &str = "_pg2sqlite_shared";
 const OVERLAY_SUFFIX: &str = "_pg2sqlite_overlay";
 const COPY_SUFFIX: &str = "_pg2sqlite_overlay";
+const SHARED_WRITE_SUFFIX: &str = "_pg2sqlite_shared_write";
 const REVIVAL_SUFFIX: &str = "_pg2sqlite_revival";
 pub(crate) const TOMBSTONE: &str = "pg2sqlite_tombstone";
 
@@ -203,6 +211,12 @@ pub(crate) fn overlay_name(rows: &str) -> String {
     format!("{rows}{OVERLAY_SUFFIX}")
 }
 
+/// The table of the keys the embedder lands writes on the shared rows at,
+/// of the overlaid table read by `rows`.
+pub(crate) fn shared_write_name(rows: &str) -> String {
+    format!("{rows}{SHARED_WRITE_SUFFIX}")
+}
+
 /// Whether `name` names an overlay table.
 pub(crate) fn is_overlay_table(name: &str) -> bool {
     name.to_ascii_lowercase().ends_with(OVERLAY_SUFFIX)
@@ -285,6 +299,7 @@ struct Routing<'t> {
     rows: &'t str,
     storage: String,
     overlay: String,
+    shared_write: String,
     key: Vec<String>,
     /// The derived-write function, which answers how many derived runs are
     /// open when called with `0`.
@@ -314,6 +329,25 @@ impl Routing<'_> {
         exists(&self.overlay, self.key_is(prefix))
     }
 
+    /// Whether the embedder named `prefix`'s key as one a write lands on the
+    /// shared rows at.
+    fn named(&self, prefix: &str) -> Expr {
+        exists(&self.shared_write, self.key_is(prefix))
+    }
+
+    /// Whether the rows of `table` land on the shared rows: the embedder
+    /// named their key and no derived run is open.
+    fn lands(&self, table: &str) -> Expr {
+        let named = all(self.key.iter().map(|key| {
+            binary(
+                column(key),
+                BinaryOperator::Eq,
+                Expr::CompoundIdentifier(vec![quoted_ident(table), quoted_ident(key)]),
+            )
+        }));
+        all([exists(&self.shared_write, named), not(self.open())])
+    }
+
     fn held_as(&self, prefix: &str, tombstone: i64) -> Expr {
         exists(
             &self.overlay,
@@ -332,6 +366,14 @@ impl Routing<'_> {
     /// Whether `prefix`'s key names a row the merged rows already show.
     fn shown(&self, prefix: &str) -> Expr {
         any([self.held_as(prefix, 0), nested(all([not(self.held(prefix)), self.stored(prefix)]))])
+    }
+
+    /// Whether a write goes to the overlay: a derived run is open, or the
+    /// overlay holds the key of one of `held` and the embedder did not name
+    /// `landing`'s key.
+    fn routed(&self, held: &[&str], landing: &str) -> Expr {
+        let held = any(held.iter().map(|prefix| self.held(prefix)));
+        any([self.open(), nested(all([nested(held), not(self.named(landing))]))])
     }
 
     /// Whether the new row's key differs from the old row's.
@@ -381,8 +423,14 @@ pub(crate) fn overlay_statements(
     let derived = options
         .get_server_derived_write_function()
         .expect("an overlaid table has a derived-write function");
-    let routing =
-        Routing { rows, storage: storage_name(rows), overlay: overlay_name(rows), key, derived };
+    let routing = Routing {
+        rows,
+        storage: storage_name(rows),
+        overlay: overlay_name(rows),
+        shared_write: shared_write_name(rows),
+        key,
+        derived,
+    };
     let columns = trigger_columns(table, schema, options, None)?;
     let written: Vec<&TriggerColumn> =
         columns.iter().filter(|column| column.is_forwarded()).collect();
@@ -392,7 +440,10 @@ pub(crate) fn overlay_statements(
         .collect::<Result<Vec<_>, Error>>()?;
     let rowid_key = rowid_alias(storage, &routing.key);
 
-    let mut statements = vec![overlay_table(storage, &routing.overlay)];
+    let mut statements = vec![
+        overlay_table(storage, &routing.overlay),
+        shared_write_table(storage, &routing.key, &routing.shared_write),
+    ];
     statements.push(merged_view(&routing, &columns));
     statements.push(insert_trigger(&routing, &written, defaulted, rowid_key));
     statements.push(update_trigger(&routing, &written));
@@ -455,15 +506,60 @@ fn overlay_table(storage: &CreateTable, overlay: &str) -> Statement {
     Statement::CreateTable(table)
 }
 
+/// The connection's `TEMP` table of the keys the embedder lands writes on
+/// the shared rows at: `storage`'s key columns with their types and
+/// collations.
+fn shared_write_table(storage: &CreateTable, key: &[String], shared_write: &str) -> Statement {
+    let mut table = ast_builder::blank_create_table(name(shared_write));
+    table.temporary = true;
+    table.if_not_exists = storage.if_not_exists;
+    table.sqlite_table_options = storage.sqlite_table_options.clone();
+    table.columns = storage
+        .columns
+        .iter()
+        .filter(|each| key.iter().any(|key| each.name.value.eq_ignore_ascii_case(key)))
+        .map(|each| {
+            ColumnDef {
+                name: each.name.clone(),
+                data_type: each.data_type.clone(),
+                options: each
+                    .options
+                    .iter()
+                    .filter(|option| {
+                        matches!(
+                            option.option,
+                            ColumnOption::PrimaryKey(_)
+                                | ColumnOption::NotNull
+                                | ColumnOption::Collation(_)
+                        )
+                    })
+                    .cloned()
+                    .collect(),
+            }
+        })
+        .collect();
+    table.constraints = storage
+        .constraints
+        .iter()
+        .filter(|constraint| matches!(constraint, TableConstraint::PrimaryKey(_)))
+        .cloned()
+        .collect();
+    Statement::CreateTable(table)
+}
+
 /// The view under the rows name: the overlay's live rows and the storage rows
-/// whose key the overlay does not hold.
+/// whose key the overlay does not hold, with the storage row in place of the
+/// overlay's at a key a write lands on the shared rows at.
 fn merged_view(routing: &Routing<'_>, columns: &[TriggerColumn]) -> Statement {
     let projection =
         || columns.iter().map(|each| SelectItem::UnnamedExpr(column(&each.name))).collect();
     let live = make_simple_select(
         projection(),
         from_relation(plain_table_factor(name(&routing.overlay))),
-        Some(binary(column(TOMBSTONE), BinaryOperator::Eq, integer_literal(0))),
+        Some(all([
+            binary(column(TOMBSTONE), BinaryOperator::Eq, integer_literal(0)),
+            not(routing.lands(&routing.overlay)),
+        ])),
     );
     let shadowed = all(routing.key.iter().map(|key| {
         binary(
@@ -475,7 +571,10 @@ fn merged_view(routing: &Routing<'_>, columns: &[TriggerColumn]) -> Statement {
     let stored = make_simple_select(
         projection(),
         from_relation(plain_table_factor(name(&routing.storage))),
-        Some(not(exists(&routing.overlay, shadowed))),
+        Some(any([
+            not(exists(&routing.overlay, shadowed)),
+            nested(routing.lands(&routing.storage)),
+        ])),
     );
     ast_builder::create_view(
         name(routing.rows),
@@ -518,21 +617,22 @@ fn column_names<'c>(columns: impl IntoIterator<Item = &'c TriggerColumn>) -> Vec
 }
 
 /// The routed `INSTEAD OF INSERT`: to storage outside a run on a key the
-/// overlay does not hold, refused on a key the merged rows show, reviving a
-/// tombstone, and to the overlay inside a run.
+/// overlay does not hold or the write lands at, refused on a key the merged
+/// rows show, reviving a tombstone, and to the overlay inside a run.
 fn insert_trigger(
     routing: &Routing<'_>,
     written: &[&TriggerColumn],
     defaulted: Vec<Expr>,
     rowid_key: Option<&str>,
 ) -> Statement {
-    let routed = any([routing.open(), routing.held("NEW")]);
+    let routed = routing.routed(&["NEW"], "NEW");
     let to_storage = insert(
         &routing.storage,
         column_names(written.iter().copied()),
-        row_where(defaulted.clone(), all([not(routing.open()), not(routing.held("NEW"))])),
+        row_where(defaulted.clone(), not(routed.clone())),
     );
-    let refused = routing.unique_violation(all([nested(routed), nested(routing.shown("NEW"))]));
+    let refused =
+        routing.unique_violation(all([nested(routed.clone()), nested(routing.shown("NEW"))]));
     let revived = ast_builder::update(
         name(&routing.overlay),
         written
@@ -544,6 +644,7 @@ fn insert_trigger(
         Some(all([
             routing.key_is("NEW"),
             binary(column(TOMBSTONE), BinaryOperator::Eq, integer_literal(1)),
+            nested(routed),
         ])),
     );
     // SQLite numbers a left-out rowid key past the overlay's own rows alone,
@@ -621,11 +722,11 @@ fn copy_old(
 }
 
 /// The routed `INSTEAD OF UPDATE`: to storage outside a run on keys the
-/// overlay holds neither of, otherwise to the overlay, copying the old row
-/// there first and leaving a tombstone at a key the update moves away from a
-/// storage row.
+/// overlay holds neither of, or on an old key the write lands at, otherwise
+/// to the overlay, copying the old row there first and leaving a tombstone at
+/// a key the update moves away from a storage row.
 fn update_trigger(routing: &Routing<'_>, written: &[&TriggerColumn]) -> Statement {
-    let routed = any([routing.open(), routing.held("OLD"), routing.held("NEW")]);
+    let routed = routing.routed(&["OLD", "NEW"], "OLD");
     let assignments = || {
         written
             .iter()
@@ -642,22 +743,32 @@ fn update_trigger(routing: &Routing<'_>, written: &[&TriggerColumn]) -> Statemen
         nested(routing.moved()),
         nested(routing.shown("NEW")),
     ]));
-    let copied = copy_old(routing, written, 0, all([nested(routed), not(routing.held("OLD"))]));
+    let copied =
+        copy_old(routing, written, 0, all([nested(routed.clone()), not(routing.held("OLD"))]));
     let cleared = ast_builder::delete(
         name(&routing.overlay),
         Some(all([
             routing.key_is("NEW"),
             binary(column(TOMBSTONE), BinaryOperator::Eq, integer_literal(1)),
             nested(routing.moved()),
+            nested(routed.clone()),
         ])),
     );
-    let changed =
-        ast_builder::update(name(&routing.overlay), assignments(), Some(routing.key_is("OLD")));
+    let changed = ast_builder::update(
+        name(&routing.overlay),
+        assignments(),
+        Some(all([routing.key_is("OLD"), nested(routed.clone())])),
+    );
     let left = copy_old(
         routing,
         written,
         1,
-        all([nested(routing.moved()), routing.stored("OLD"), not(routing.held("OLD"))]),
+        all([
+            nested(routing.moved()),
+            routing.stored("OLD"),
+            not(routing.held("OLD")),
+            nested(routed),
+        ]),
     );
     route(
         routing,
@@ -668,13 +779,13 @@ fn update_trigger(routing: &Routing<'_>, written: &[&TriggerColumn]) -> Statemen
 }
 
 /// The routed `INSTEAD OF DELETE`: from storage outside a run on a key the
-/// overlay does not hold, otherwise a tombstone in the overlay over a copy of
-/// the old row.
+/// overlay does not hold or the write lands at, otherwise a tombstone in the
+/// overlay over a copy of the old row.
 fn delete_trigger(routing: &Routing<'_>, written: &[&TriggerColumn]) -> Statement {
-    let routed = any([routing.open(), routing.held("OLD")]);
+    let routed = routing.routed(&["OLD"], "OLD");
     let from_storage = ast_builder::delete(
         name(&routing.storage),
-        Some(all([routing.key_is("OLD"), not(routed)])),
+        Some(all([routing.key_is("OLD"), not(routed.clone())])),
     );
     let copied = copy_old(routing, written, 0, all([routing.open(), not(routing.held("OLD"))]));
     let buried = ast_builder::update(
@@ -683,6 +794,7 @@ fn delete_trigger(routing: &Routing<'_>, written: &[&TriggerColumn]) -> Statemen
         Some(all([
             routing.key_is("OLD"),
             binary(column(TOMBSTONE), BinaryOperator::Eq, integer_literal(0)),
+            nested(routed),
         ])),
     );
     route(routing, "delete", TriggerEvent::Delete, vec![from_storage, copied, buried])

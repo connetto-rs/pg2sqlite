@@ -2216,19 +2216,24 @@ impl Pg2Sqlite {
                 })
                 .collect::<Result<Vec<_>, crate::errors::Error>>()?;
 
-            let overlay = if crate::impls::translator_impls::overlay::is_overlaid(table, options) {
-                let rows =
-                    crate::impls::translator_impls::overlay::rows_name(table, schema, options)?;
-                Some(crate::impls::translator_impls::overlay::overlay_name(&rows))
-            } else {
-                None
-            };
+            let (overlay, shared_write) =
+                if crate::impls::translator_impls::overlay::is_overlaid(table, options) {
+                    let rows =
+                        crate::impls::translator_impls::overlay::rows_name(table, schema, options)?;
+                    (
+                        Some(crate::impls::translator_impls::overlay::overlay_name(&rows)),
+                        Some(crate::impls::translator_impls::overlay::shared_write_name(&rows)),
+                    )
+                } else {
+                    (None, None)
+                };
             entries.push(TableManifestEntry {
                 logical_placement: placed.home(&logical),
                 physical_placement: placed.home(&physical),
                 logical,
                 physical,
                 overlay,
+                shared_write,
                 wrapper,
                 columns,
             });
