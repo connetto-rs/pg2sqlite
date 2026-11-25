@@ -1,5 +1,6 @@
 //! Every refusal a translated write guard raises is recognisable from the
-//! message SQLite reports, and no other write error is.
+//! message SQLite reports, as a privilege or a policy refusal on its table, and
+//! no other write error is.
 
 extern crate alloc;
 
@@ -10,7 +11,7 @@ use diesel::{
     Connection as _, ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection,
     connection::SimpleConnection, result::Error,
 };
-use pg2sqlite::prelude::{Pg2SqliteOptions, is_policy_refusal, postgres_error};
+use pg2sqlite::prelude::{GuardRefusal, Pg2SqliteOptions, guard_refusal, postgres_error};
 use sqlstate::pg;
 
 const POLICY_SCHEMA: &str = "
@@ -29,15 +30,19 @@ ALTER TABLE locked ENABLE ROW LEVEL SECURITY;
 CREATE POLICY locked_select ON locked FOR SELECT USING (true);
 ";
 
-const READ_ONLY_SCHEMA: &str = "
+const ROLE_SCHEMA: &str = "
 CREATE ROLE app_user;
 CREATE TABLE reference_items (id INTEGER PRIMARY KEY);
 CREATE TABLE secure_reference_items (id INTEGER PRIMARY KEY);
 ALTER TABLE secure_reference_items ENABLE ROW LEVEL SECURITY;
 CREATE POLICY secure_reference_items_select ON secure_reference_items
     FOR SELECT USING (true);
+CREATE TABLE ledger (id INTEGER PRIMARY KEY);
+CREATE TABLE keyed (id INTEGER PRIMARY KEY, owner TEXT NOT NULL);
 GRANT SELECT ON reference_items TO app_user;
 GRANT SELECT ON secure_reference_items TO app_user;
+GRANT SELECT, INSERT ON ledger TO app_user;
+GRANT SELECT (owner), UPDATE (owner), DELETE ON keyed TO app_user;
 ";
 
 mod schema {
@@ -76,6 +81,22 @@ mod schema {
             id -> Integer,
         }
     }
+    diesel::table! {
+        ledger (id) {
+            id -> Integer,
+        }
+    }
+    diesel::table! {
+        keyed (owner) {
+            owner -> Text,
+        }
+    }
+    diesel::table! {
+        keyed_rls (id) {
+            id -> Integer,
+            owner -> Text,
+        }
+    }
 }
 
 diesel::define_sql_function! {
@@ -106,13 +127,13 @@ fn policy_connection() -> (SqliteConnection, Arc<AtomicBool>) {
     apply(POLICY_SCHEMA, &options)
 }
 
-fn read_only_connection() -> SqliteConnection {
+fn role_connection() -> (SqliteConnection, Arc<AtomicBool>) {
     let options = Pg2SqliteOptions::default()
         .with_deployment(crate::helpers::deployment::deployment(["app_user"], []))
         .with_acting_role("app_user")
         .with_rls_audit_table_name("rls_audit")
         .with_rls_exemption_function("write_is_exempt");
-    apply(READ_ONLY_SCHEMA, &options).0
+    apply(ROLE_SCHEMA, &options)
 }
 
 fn error_message(result: Result<usize, Error>, write: &str) -> String {
@@ -122,9 +143,19 @@ fn error_message(result: Result<usize, Error>, write: &str) -> String {
     }
 }
 
+const fn privilege(table: &str) -> GuardRefusal<'_> {
+    GuardRefusal::Privilege { table }
+}
+
+const fn policy(table: &str) -> GuardRefusal<'_> {
+    GuardRefusal::Policy { table: Some(table) }
+}
+
+const FAILED_CHECK: GuardRefusal<'static> = GuardRefusal::Policy { table: None };
+
 #[test]
-fn every_guard_refusal_is_recognised() {
-    use schema::{locked, locked_rls, orders, orders_rls, reference_items};
+fn every_guard_refusal_is_recognised_with_its_kind_and_table() {
+    use schema::{keyed, ledger, locked, locked_rls, orders, orders_rls, reference_items};
 
     let (mut connection, exempt) = policy_connection();
     diesel::insert_into(orders::table)
@@ -141,12 +172,14 @@ fn every_guard_refusal_is_recognised() {
     let refusals = [
         (
             "an insert failing WITH CHECK",
+            FAILED_CHECK,
             diesel::insert_into(orders::table)
                 .values((orders::id.eq(2), orders::owner.eq("mallory"), orders::body.eq("open")))
                 .execute(&mut connection),
         ),
         (
             "a backing-table insert failing WITH CHECK",
+            FAILED_CHECK,
             diesel::insert_into(orders_rls::table)
                 .values((
                     orders_rls::id.eq(2),
@@ -157,49 +190,67 @@ fn every_guard_refusal_is_recognised() {
         ),
         (
             "an update failing WITH CHECK",
+            FAILED_CHECK,
             diesel::update(orders::table.find(1))
                 .set(orders::owner.eq("mallory"))
                 .execute(&mut connection),
         ),
         (
             "a backing-table update failing WITH CHECK",
+            FAILED_CHECK,
             diesel::update(orders_rls::table.find(1))
                 .set(orders_rls::owner.eq("mallory"))
                 .execute(&mut connection),
         ),
-        ("a delete without a DELETE policy", {
+        ("a delete without a DELETE policy", policy("orders"), {
             diesel::delete(orders::table.find(1)).execute(&mut connection)
         }),
-        ("an insert without an INSERT policy", {
+        ("an insert without an INSERT policy", policy("locked"), {
             diesel::insert_into(locked::table).values(locked::id.eq(2)).execute(&mut connection)
         }),
-        ("a backing-table insert without an INSERT policy", {
+        ("a backing-table insert without an INSERT policy", policy("locked"), {
             diesel::insert_into(locked_rls::table)
                 .values(locked_rls::id.eq(2))
                 .execute(&mut connection)
         }),
-        ("an update without an UPDATE policy", {
+        ("an update without an UPDATE policy", policy("locked"), {
             diesel::update(locked::table.find(1)).set(locked::id.eq(3)).execute(&mut connection)
         }),
     ];
 
-    let mut read_only = read_only_connection();
-    let read_only_refusals = [
-        ("an insert into a read-only table", {
+    let (mut role, role_exempt) = role_connection();
+    diesel::insert_into(ledger::table)
+        .values(ledger::id.eq(1))
+        .execute(&mut role)
+        .expect("an insert the role holds the privilege for");
+    role_exempt.store(true, Ordering::Relaxed);
+    diesel::insert_into(schema::keyed_rls::table)
+        .values((schema::keyed_rls::id.eq(1), schema::keyed_rls::owner.eq("anna")))
+        .execute(&mut role)
+        .expect("an exempt insert into the backing table");
+    role_exempt.store(false, Ordering::Relaxed);
+    let privilege_refusals = [
+        ("an insert into a read-only table", privilege("reference_items"), {
             diesel::insert_into(reference_items::table)
                 .values(reference_items::id.eq(1))
-                .execute(&mut read_only)
+                .execute(&mut role)
         }),
-        ("an insert into a read-only RLS backing table", {
+        ("an insert into a read-only RLS backing table", privilege("secure_reference_items"), {
             diesel::insert_into(schema::secure_reference_items_rls::table)
                 .values(schema::secure_reference_items_rls::id.eq(1))
-                .execute(&mut read_only)
+                .execute(&mut role)
+        }),
+        ("a delete the role holds no privilege for", privilege("ledger"), {
+            diesel::delete(ledger::table).execute(&mut role)
+        }),
+        ("an update by a role that cannot read the key", privilege("keyed"), {
+            diesel::update(keyed::table).set(keyed::owner.eq("anna")).execute(&mut role)
         }),
     ];
 
-    for (write, result) in refusals.into_iter().chain(read_only_refusals) {
+    for (write, expected, result) in refusals.into_iter().chain(privilege_refusals) {
         let message = error_message(result, write);
-        assert!(is_policy_refusal(&message), "{write} raised an unrecognised refusal: {message}");
+        assert_eq!(guard_refusal(&message), Some(expected), "{write}: {message}");
         let error = postgres_error(&message)
             .unwrap_or_else(|| panic!("{write} does not read as a PostgreSQL error: {message}"));
         assert_eq!(error.sqlstate(), pg::INSUFFICIENT_PRIVILEGE, "{write}");
@@ -208,7 +259,7 @@ fn every_guard_refusal_is_recognised() {
 }
 
 #[test]
-fn other_write_errors_are_not_policy_refusals() {
+fn other_write_errors_are_not_guard_refusals() {
     use schema::orders;
 
     let (mut connection, _) = policy_connection();
@@ -232,7 +283,7 @@ fn other_write_errors_are_not_policy_refusals() {
 
     for (write, result) in errors {
         let message = error_message(result, write);
-        assert!(!is_policy_refusal(&message), "{write} was taken for a refusal: {message}");
+        assert_eq!(guard_refusal(&message), None, "{write} was taken for a refusal: {message}");
         assert_eq!(postgres_error(&message), None, "{write} was read as a PostgreSQL error");
     }
 }

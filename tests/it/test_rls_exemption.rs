@@ -1014,7 +1014,7 @@ fn schema_seeds_load_under_exemption_into_read_only_tables() {
         .values(schema::kinds::id.eq("reagent"))
         .execute(&mut connection)
         .expect_err("the role only reads kinds");
-    assert!(pg2sqlite::prelude::is_policy_refusal(&error.to_string()), "{error}");
+    assert!(pg2sqlite::prelude::guard_refusal(&error.to_string()).is_some(), "{error}");
     assert_eq!(kinds(&mut connection), ["specimen"]);
 }
 

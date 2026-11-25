@@ -8,7 +8,7 @@
 //! holds them, and refuses them as PostgreSQL does otherwise.
 
 use diesel::prelude::*;
-use pg2sqlite::prelude::{Pg2SqliteOptions, is_policy_refusal};
+use pg2sqlite::prelude::{GuardRefusal, Pg2SqliteOptions, guard_refusal};
 use sql_traits::structs::Deployment;
 
 use crate::helpers;
@@ -159,13 +159,13 @@ fn the_owners_privileges_end_with_the_trigger_body() {
         .values(note_log_rls::note.eq(2))
         .execute(&mut connection)
         .expect_err("the caller cannot write the log's storage");
-    assert!(is_policy_refusal(&direct.to_string()), "{direct}");
+    assert!(guard_refusal(&direct.to_string()).is_some(), "{direct}");
     insert_note(&mut connection).expect("the note goes in");
     let stamp = diesel::update(notes::table)
         .set(notes::stamped.eq(2))
         .execute(&mut connection)
         .expect_err("the caller cannot stamp");
-    assert!(is_policy_refusal(&stamp.to_string()), "{stamp}");
+    assert!(guard_refusal(&stamp.to_string()).is_some(), "{stamp}");
 }
 
 #[test]
@@ -175,7 +175,7 @@ fn an_owner_without_insert_is_refused_as_postgresql_refuses_it() {
     );
 
     let refused = insert_note(&mut connection).expect_err("the log owner cannot insert");
-    assert!(is_policy_refusal(&refused.to_string()), "{refused}");
+    assert!(guard_refusal(&refused.to_string()).is_some(), "{refused}");
     assert_eq!(logged(&mut connection), Vec::<i32>::new());
 }
 
@@ -186,7 +186,7 @@ fn an_owner_updating_another_column_is_refused_as_postgresql_refuses_it() {
     );
 
     let refused = insert_note(&mut connection).expect_err("the stamp owner cannot set stamped");
-    assert!(is_policy_refusal(&refused.to_string()), "{refused}");
+    assert!(guard_refusal(&refused.to_string()).is_some(), "{refused}");
 }
 
 /// `entries`, whose insert runs `audit_entry()` as `auditor`. The body deletes
@@ -253,7 +253,7 @@ fn a_refused_write_in_an_untaken_branch_never_runs() {
 
     insert_entry(&mut connection, 1).expect("the delete branch is not taken");
     let refused = insert_entry(&mut connection, -1).expect_err("auditor cannot delete entries");
-    assert!(is_policy_refusal(&refused.to_string()), "{refused}");
+    assert!(guard_refusal(&refused.to_string()).is_some(), "{refused}");
 }
 
 #[test]
@@ -264,8 +264,8 @@ fn the_definer_reads_only_the_columns_its_owner_may_select() {
     );
 
     let refused = insert_entry(&mut connection, 1).expect_err("auditor cannot read secret");
-    assert!(is_policy_refusal(&refused.to_string()), "{refused}");
-    assert!(refused.to_string().contains("table entries"), "{refused}");
+    let refusal = refused.to_string();
+    assert_eq!(guard_refusal(&refusal), Some(GuardRefusal::Privilege { table: "entries" }));
 }
 
 #[test]
@@ -293,6 +293,6 @@ fn the_invoker_trigger_a_definer_fires_holds_the_owners_privileges() {
     );
 
     let refused = insert_entry(&mut connection, 1).expect_err("auditor cannot append the trail");
-    assert!(is_policy_refusal(&refused.to_string()), "{refused}");
-    assert!(refused.to_string().contains("table audit_trail"), "{refused}");
+    let refusal = refused.to_string();
+    assert_eq!(guard_refusal(&refusal), Some(GuardRefusal::Privilege { table: "audit_trail" }));
 }
