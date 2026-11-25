@@ -216,7 +216,8 @@ pub(crate) fn fresh_forms(
 ///
 /// A unit of the existing file runs only its connection-local statements,
 /// since the new connection needs its `TEMP` objects while the file already
-/// holds the rest.
+/// holds the rest. A unit with objects in both files also runs the ones homed
+/// in `file`.
 fn replay_fresh(
     units: &[Unit<'_>],
     final_schema: &ParserDB,
@@ -228,9 +229,14 @@ fn replay_fresh(
     let mut forms = Vec::with_capacity(units.len());
     for (index, unit) in units.iter().enumerate() {
         let owned = placed.unit_files[index].contains(file);
+        let spans_both = placed.unit_files[index] == Files::default();
+        let runs = |placed: &Placed, statement: &Statement| {
+            placed.is_connection_local(statement)
+                || (spans_both && file.contains_placement(placed.statement_home(statement)))
+        };
         if !owned
             && !schema.replays(unit.source, false, &placed.homes)
-            && !unit.emitted.iter().any(|statement| placed.is_connection_local(statement))
+            && !unit.emitted.iter().any(|statement| runs(placed, statement))
         {
             forms.push(None);
             continue;
@@ -242,10 +248,13 @@ fn replay_fresh(
             forms.push(rebound);
             continue;
         }
-        let local = |statement: &Statement| placed.is_connection_local(statement);
         forms.push(Some(match rebound {
-            Some(statements) => statements.into_iter().filter(local).collect(),
-            None => unit.emitted.iter().filter(|statement| local(statement)).cloned().collect(),
+            Some(statements) => {
+                statements.into_iter().filter(|statement| runs(placed, statement)).collect()
+            }
+            None => {
+                unit.emitted.iter().filter(|statement| runs(placed, statement)).cloned().collect()
+            }
         }));
     }
     Ok(forms)

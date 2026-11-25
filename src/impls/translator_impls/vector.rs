@@ -314,6 +314,12 @@ pub fn generate_vec0_statements(
         ))
     })?;
 
+    if super::overlay::is_overlaid(table_obj, options) {
+        return Err(super::overlay::refusal(
+            &table_name,
+            "its vector index would miss the rows the overlay holds",
+        ));
+    }
     let trigger_table_name = resolve_trigger_table_name(&table_name, table_obj, schema, options)?;
 
     let mut statements = Vec::new();

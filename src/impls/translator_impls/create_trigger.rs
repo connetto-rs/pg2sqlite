@@ -794,13 +794,21 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
             period = Some(TriggerPeriod::After);
         }
 
-        // BEFORE/AFTER triggers on an RLS table belong on its backing table.
+        // BEFORE/AFTER triggers on an RLS table belong on its backing table,
+        // and those on an overlaid table on its storage table.
         let redirected_source_table_name =
             if matches!(period, Some(TriggerPeriod::Before | TriggerPeriod::After)) {
-                if names_table_with_backing(schema, &source_table_name, options)? {
-                    append_suffix(&source_table_name, options.get_rls_table_suffix())
-                } else {
-                    source_table_name.clone()
+                match resolve_translation_table(schema, &source_table_name)? {
+                    Some(table) if super::overlay::is_overlaid(table, options) => {
+                        append_suffix(
+                            &source_table_name,
+                            &super::overlay::storage_suffix(table, schema, options)?,
+                        )
+                    }
+                    _ if names_table_with_backing(schema, &source_table_name, options)? => {
+                        append_suffix(&source_table_name, options.get_rls_table_suffix())
+                    }
+                    _ => source_table_name.clone(),
                 }
             } else {
                 source_table_name.clone()

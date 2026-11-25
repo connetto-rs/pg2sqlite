@@ -11,7 +11,7 @@ mod columns;
 mod firing;
 mod readers;
 
-use alloc::borrow::Cow;
+use alloc::{borrow::Cow, collections::BTreeSet};
 
 use columns::Columns;
 pub(crate) use firing::FiringTrigger;
@@ -37,7 +37,7 @@ use crate::{
     errors::Error,
     impls::{
         object_name::last_ident_value_or_display,
-        translator_impls::{off_replica::OffReplica, rls::hiding_policies},
+        translator_impls::{off_replica::OffReplica, overlay, rls::hiding_policies},
         unlabelled_body::unlabelled_body,
     },
     options::TranslationContext,
@@ -137,6 +137,32 @@ fn trigger_chain<'s>(
         return Ok(None);
     };
     Ok(Some((function, chain::Walker::read(function, schema, options)?)))
+}
+
+/// The tables the derived regions of `triggers` write, folded, read through
+/// every helper their functions call, or `None` when a chain cannot be read
+/// and so may write any table. Each trigger comes with the schema it was
+/// declared against, and an `INSTEAD OF` trigger derives nothing.
+///
+/// # Errors
+///
+/// Fails as [`chain::Walker::read`] does.
+pub(crate) fn derived_targets<'t>(
+    triggers: impl IntoIterator<Item = (&'t CreateTrigger, &'t ParserDB)>,
+    options: &TranslationContext<'_>,
+) -> Result<Option<BTreeSet<String>>, Error> {
+    let mut written = BTreeSet::new();
+    for (trigger, schema) in triggers {
+        if matches!(trigger.period, Some(TriggerPeriod::InsteadOf)) {
+            continue;
+        }
+        let Some((_, chain)) = trigger_chain(trigger, schema, options)? else { continue };
+        if chain.unreadable.is_some() {
+            return Ok(None);
+        }
+        written.extend(chain.written);
+    }
+    Ok(Some(written))
 }
 
 /// Why the replica leaves `trigger` to the server, or `None` when it keeps
@@ -319,8 +345,16 @@ pub(crate) fn foreign_key_left_to_server(
     options: &TranslationContext<'_>,
     emit: WarningSink<'_>,
 ) -> Result<bool, Error> {
-    let Some(reason) = reason_left_to_server(key, options) else {
-        return Ok(false);
+    let reason = match reason_left_to_server(key, options) {
+        Some(reason) => reason,
+        None if overlay::names_overlaid_table(schema, table, options)?
+            || overlay::names_overlaid_table(schema, &key.foreign_table, options)? =>
+        {
+            "it joins a table whose server-derived rows each connection keeps in its own \
+             overlay, where SQLite cannot check a key across the merged rows"
+                .to_owned()
+        }
+        None => return Ok(false),
     };
     if OffReplica::of(&key.foreign_table, schema, options)?.is_some() {
         return Ok(false);
