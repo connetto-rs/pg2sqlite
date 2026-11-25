@@ -55,7 +55,8 @@ const TABLES: &str = "
 CREATE TABLE docs (
     id INTEGER PRIMARY KEY,
     owner TEXT NOT NULL,
-    secret TEXT NOT NULL,
+    secret TEXT,
+    CONSTRAINT docs_secret_present NOT NULL secret,
     CONSTRAINT docs_secret_key UNIQUE NULLS NOT DISTINCT (secret)
 );
 ALTER TABLE docs ADD COLUMN tag TEXT NOT NULL DEFAULT 'none' CHECK (tag IS NOT NULL);
@@ -63,6 +64,7 @@ CREATE TABLE notes (
     id INTEGER PRIMARY KEY,
     body TEXT NOT NULL,
     state TEXT NOT NULL DEFAULT 'open' CHECK (coalesce(state, '') <> ''),
+    CONSTRAINT notes_body_known CHECK (body <> 'withdrawn'),
     CONSTRAINT notes_open_body CHECK (state <> 'open' OR body <> '')
 );
 GRANT SELECT (id, owner), INSERT (id, owner) ON docs TO alice;

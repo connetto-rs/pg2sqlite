@@ -22,7 +22,7 @@ use sql_traits::{
 };
 use sqlparser::ast::{
     BinaryOperator, ColumnDef, ColumnOption, CreateTable, Expr, Ident, NullsDistinctOption,
-    ObjectName, Statement, TableConstraint, TriggerEvent, TriggerPeriod,
+    ObjectName, Statement, TableConstraint, TriggerEvent, TriggerPeriod, UniqueConstraint,
 };
 
 #[cfg(not(feature = "std"))]
@@ -126,16 +126,15 @@ impl Withheld {
                 _ => false,
             }
         };
-        let relaxes = |constraint: &TableConstraint| {
-            matches!(constraint, TableConstraint::Unique(unique)
-                if unique.nulls_distinct == NullsDistinctOption::NotDistinct
-                    && unique.columns.iter().any(|key| self.read_by(&key.column.expr)))
+        let relaxes = |unique: &UniqueConstraint| {
+            unique.nulls_distinct == NullsDistinctOption::NotDistinct
+                && unique.columns.iter().any(|key| self.read_by(&key.column.expr))
         };
         if columns.iter().all(|column| matches!(column, Cow::Borrowed(_)))
-            && !create_table
-                .constraints
-                .iter()
-                .any(|constraint| drops(constraint) || relaxes(constraint))
+            && !create_table.constraints.iter().any(|constraint| {
+                drops(constraint)
+                    || matches!(constraint, TableConstraint::Unique(unique) if relaxes(unique))
+            })
         {
             return Cow::Borrowed(create_table);
         }
@@ -147,8 +146,8 @@ impl Withheld {
         }
         released.constraints.retain(|constraint| !drops(constraint));
         for constraint in &mut released.constraints {
-            if relaxes(constraint)
-                && let TableConstraint::Unique(unique) = constraint
+            if let TableConstraint::Unique(unique) = constraint
+                && relaxes(unique)
             {
                 unique.nulls_distinct = NullsDistinctOption::None;
             }

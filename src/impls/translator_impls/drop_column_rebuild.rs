@@ -822,14 +822,12 @@ fn checks(table: &CreateTable) -> impl Iterator<Item = &Expr> {
     declared.chain(constrained)
 }
 
-/// Whether `table` declares `column` `NOT NULL`.
+/// Whether `table` declares `column` `NOT NULL`, which a translated table
+/// does on the column itself.
 fn not_null(table: &CreateTable, column: &Ident) -> bool {
     table.columns.iter().any(|held| {
         same_identifier(&held.name, column)
             && held.options.iter().any(|option| matches!(option.option, ColumnOption::NotNull))
-    }) || table.constraints.iter().any(|constraint| {
-        matches!(constraint, TableConstraint::NotNull(declared)
-            if same_identifier(&declared.column, column))
     })
 }
 
