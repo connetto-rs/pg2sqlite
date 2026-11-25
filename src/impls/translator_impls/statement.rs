@@ -33,7 +33,10 @@
 
 use alloc::borrow::Cow;
 
-use sql_traits::{structs::ParserDB, traits::TableLike};
+use sql_traits::{
+    structs::ParserDB,
+    traits::{DatabaseLike, ForeignKeyLike, TableLike},
+};
 use sqlparser::ast::{
     AlterTable, AlterTableOperation, AlterTableType, AlterType, AlterTypeOperation, AlterView,
     AlterViewOperation, BeginTransactionKind, BinaryOperator, CascadeOption, ColumnDef,
@@ -41,7 +44,7 @@ use sqlparser::ast::{
     ExceptionWhen, Expr, FromTable, Ident, Merge, ObjectName, ObjectNamePart, ObjectType,
     RenameTable, RenameTableNameKind, Set, Statement, TransactionAccessMode, TransactionMode,
     TransactionModifier, TriggerEvent, TriggerPeriod, Truncate, TruncateIdentityOption,
-    UnaryOperator, UserDefinedTypeRepresentation, VacuumStatement,
+    TruncateTableTarget, UnaryOperator, UserDefinedTypeRepresentation, VacuumStatement,
     helpers::attached_token::AttachedToken,
 };
 
@@ -1133,6 +1136,15 @@ fn translate_truncate(
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Vec<Statement>, Error> {
     reject_untranslatable_truncate_options(truncate)?;
+    let mut targets = Vec::with_capacity(truncate.table_names.len());
+    for target in &truncate.table_names {
+        targets.push(TruncateTarget {
+            target,
+            table: resolve_translation_table(schema, &target.name)?,
+            leaves: OffReplica::leaves_with(&target.name, &Write::Truncate, schema, options)?,
+        });
+    }
+    refuse_as_postgres_truncate(&targets, schema, options)?;
 
     if matches!(truncate.identity, Some(TruncateIdentityOption::Continue)) {
         emit(crate::warnings::TranslationWarning::LossyDrop {
@@ -1143,11 +1155,8 @@ fn translate_truncate(
         });
     }
 
-    let mut statements = Vec::with_capacity(truncate.table_names.len());
-    for target in &truncate.table_names {
-        if OffReplica::leaves_with(&target.name, &Write::Truncate, schema, options)? {
-            continue;
-        }
+    let mut statements = Vec::with_capacity(targets.len());
+    for target in emptying_order(targets, schema)? {
         // PostgreSQL does not apply policies to TRUNCATE: it needs the TRUNCATE
         // privilege and then empties the table. An RLS table is translated as a
         // view over a suffixed backing table, and the view's INSTEAD OF DELETE
@@ -1196,6 +1205,110 @@ fn translate_truncate(
     }
 
     Ok(statements)
+}
+
+/// A `TRUNCATE` target and the table it names.
+struct TruncateTarget<'t, 's> {
+    target: &'t TruncateTableTarget,
+    /// `None` when the schema has no such table.
+    table: Option<&'s <ParserDB as DatabaseLike>::Table>,
+    /// Whether the table is left off the replica, the write leaving with it.
+    leaves: bool,
+}
+
+/// PostgreSQL's refusals of a `TRUNCATE` of `targets` before it empties
+/// anything. A target staying on the replica that the acting role holds no
+/// `TRUNCATE` on is refused first, then a target another table's foreign key
+/// references, unless that table is a target too. A `SECURITY DEFINER` body's
+/// targets are checked against its owner where the body reaches the statement.
+///
+/// # Errors
+///
+/// Returns [`Error::Postgres`] with PostgreSQL's SQLSTATE and message, and the
+/// lookup errors resolution meets.
+fn refuse_as_postgres_truncate(
+    targets: &[TruncateTarget<'_, '_>],
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<(), Error> {
+    if options.running_as().is_none() {
+        for target in targets.iter().filter(|target| !target.leaves) {
+            if let Some(table) = target.table
+                && !RoleTable::acting(table, schema, options)?.truncates()
+            {
+                return Err(crate::impls::column_access::denied(table));
+            }
+        }
+    }
+    let tables: Vec<_> = targets.iter().filter_map(|target| target.table).collect();
+    for referencing in schema.tables() {
+        if tables.iter().any(|table| core::ptr::eq(*table, referencing)) {
+            continue;
+        }
+        for table in &tables {
+            if references(referencing, table, schema)? {
+                return Err(Error::Postgres {
+                    sqlstate: sqlstate::pg::FEATURE_NOT_SUPPORTED,
+                    message: "cannot truncate a table referenced in a foreign key constraint"
+                        .to_owned(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The targets staying on the replica, ordered so each table is emptied after
+/// every other target whose foreign key references it, as SQLite checks a key
+/// row by row and PostgreSQL's `TRUNCATE` checks none. Tables referencing one
+/// another in a cycle keep their written order.
+///
+/// # Errors
+///
+/// Propagates a lookup failure.
+fn emptying_order<'t>(
+    targets: Vec<TruncateTarget<'t, '_>>,
+    schema: &ParserDB,
+) -> Result<Vec<&'t TruncateTableTarget>, Error> {
+    let mut targets: Vec<_> = targets.into_iter().filter(|target| !target.leaves).collect();
+    let mut ordered = Vec::with_capacity(targets.len());
+    while !targets.is_empty() {
+        let mut next = 0;
+        'candidates: for (position, candidate) in targets.iter().enumerate() {
+            if let Some(table) = candidate.table {
+                for other in &targets {
+                    if let Some(other) = other.table
+                        && !core::ptr::eq(other, table)
+                        && references(other, table, schema)?
+                    {
+                        continue 'candidates;
+                    }
+                }
+            }
+            next = position;
+            break;
+        }
+        ordered.push(targets.remove(next).target);
+    }
+    Ok(ordered)
+}
+
+/// Whether a foreign key of `referencing` references `referenced`.
+///
+/// # Errors
+///
+/// Propagates a lookup failure.
+fn references(
+    referencing: &<ParserDB as DatabaseLike>::Table,
+    referenced: &<ParserDB as DatabaseLike>::Table,
+    schema: &ParserDB,
+) -> Result<bool, Error> {
+    for key in referencing.foreign_keys(schema)? {
+        if core::ptr::eq(key.referenced_table(schema)?, referenced) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Rejects the `TRUNCATE` options with no SQLite form, per the reporting policy

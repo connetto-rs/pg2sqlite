@@ -369,6 +369,7 @@ mod test_trigger_whole_row;
 mod test_trunc;
 mod test_trunc_scale_range;
 mod test_truncate;
+mod test_truncate_refusals;
 mod test_type_fidelity;
 mod test_typed_text_checks;
 mod test_unknown_functions;
