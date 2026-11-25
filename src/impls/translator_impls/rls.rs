@@ -14,6 +14,9 @@
 
 use core::ops::ControlFlow;
 
+use pg2sqlite_runtime::write_guard::{
+    RLS_VIOLATION, WriteCommand, no_policy, permission_denied, read_only, unreadable_key,
+};
 use sql_traits::{
     errors::{LookupError, RowSecurityError},
     structs::{
@@ -59,9 +62,6 @@ use crate::{
     },
     options::Pg2SqliteOptions,
     traits::translator::TranslatorWithContext,
-    write_guard::{
-        RLS_VIOLATION, WriteCommand, no_policy, permission_denied, read_only, unreadable_key,
-    },
 };
 
 /// A column of a guarded table, as the write triggers have to see it.

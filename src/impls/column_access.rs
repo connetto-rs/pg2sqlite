@@ -4,6 +4,7 @@
 
 use core::{ops::ControlFlow, ptr};
 
+use pg2sqlite_runtime::write_guard::permission_denied;
 use sql_traits::{
     errors::LookupError,
     structs::{
@@ -38,7 +39,6 @@ use crate::{
         },
     },
     options::TranslationContext,
-    write_guard::permission_denied,
 };
 
 pub(crate) type Table = <ParserDB as DatabaseLike>::Table;

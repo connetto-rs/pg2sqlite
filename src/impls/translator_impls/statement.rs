@@ -582,9 +582,9 @@ fn append_deny_triggers(
     let marker = options.get_readonly_deny_trigger_suffix();
     let name = |value: &str| ObjectName(vec![ObjectNamePart::Identifier(quoted_ident(value))]);
     let message = if grants.is_read_only() {
-        crate::write_guard::read_only(&table_ident)
+        pg2sqlite_runtime::write_guard::read_only(&table_ident)
     } else {
-        crate::write_guard::permission_denied(&table_ident)
+        pg2sqlite_runtime::write_guard::permission_denied(&table_ident)
     };
     let condition = super::definer::unless_running(
         write_guard_condition_expr(None, options),

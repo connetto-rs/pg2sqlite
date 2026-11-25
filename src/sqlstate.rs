@@ -9,10 +9,10 @@
 
 pub use ::sqlstate::SqlState;
 use ::sqlstate::pg;
+use pg2sqlite_runtime::write_guard::guard_refusal;
 
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
-use crate::write_guard::guard_refusal;
 
 /// What separates the SQLSTATE from the message.
 const SEPARATOR: &str = ": ";

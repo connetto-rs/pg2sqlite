@@ -471,7 +471,7 @@ impl PlPgSqlTranslator {
         let Some(table) = unheld_table(checked, role, schema)? else { return Ok(None) };
         let mut refusal = crate::impls::ast_builder::raise_statement(
             "ABORT",
-            Some(&crate::write_guard::permission_denied(table.table_name())),
+            Some(&pg2sqlite_runtime::write_guard::permission_denied(table.table_name())),
             None,
         );
         if let Some(condition) = scope.current_condition() {
