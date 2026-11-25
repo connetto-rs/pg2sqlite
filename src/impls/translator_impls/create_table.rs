@@ -85,9 +85,10 @@ impl crate::traits::translator::TranslatorWithContext for CreateTable {
         // A constraint check, a computed column and a default all name this
         // table's own columns, and there is no query around them, so the table
         // being defined is the scope every expression below resolves against.
+        let written = options.written_schema().unwrap_or(schema);
         let table_scope = crate::options::table_column_scope(
-            crate::impls::object_name::resolve_declared_table(schema, self)?,
-            schema,
+            crate::impls::object_name::resolve_declared_table(written, self)?,
+            written,
         );
         let scoped = table_scope.as_ref().map(|scope| options.with_scope(scope));
         let options = scoped.as_ref().unwrap_or(options);
