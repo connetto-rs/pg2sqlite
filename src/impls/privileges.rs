@@ -25,7 +25,7 @@ use crate::{
         object_name::{append_suffix, resolve_translation_table, sqlite_unqualified_object_name},
         session_variable,
     },
-    options::Pg2SqliteOptions,
+    options::{Pg2SqliteOptions, TranslationContext},
 };
 
 /// The privileges the acting role holds on one column.
@@ -87,7 +87,34 @@ impl RoleTable {
         Ok(Self { columns, delete: held.delete })
     }
 
-    /// What the acting role `options` names holds on `table`.
+    /// What `role` holds on `table` of `schema`, an epoch's schema of the
+    /// batch `options` translates. A table `role` reads only in a later epoch
+    /// holds every column read and none written until then, the shape of a
+    /// read-only table, so the rows its owner writes stay on the replica.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a lookup failure.
+    pub(crate) fn in_batch<'db>(
+        table: &'db CreateTable,
+        role: Option<&'db <ParserDB as DatabaseLike>::Role>,
+        schema: &'db ParserDB,
+        options: &TranslationContext<'_>,
+    ) -> Result<Self, Error> {
+        let mut held = Self::of(table, role, schema)?;
+        if role.is_some() && !held.reads_any() && options.is_pending_table(schema, &table.name) {
+            for column in &mut held.columns {
+                column.select = true;
+                column.insert = false;
+                column.update = false;
+            }
+            held.delete = false;
+        }
+        Ok(held)
+    }
+
+    /// What the acting role `options` names holds on `table`, as
+    /// [`Self::in_batch`] reads it.
     ///
     /// # Errors
     ///
@@ -96,9 +123,9 @@ impl RoleTable {
     pub(crate) fn acting(
         table: &CreateTable,
         schema: &ParserDB,
-        options: &Pg2SqliteOptions,
+        options: &TranslationContext<'_>,
     ) -> Result<Self, Error> {
-        Self::of(table, session_variable::acting_role(schema, options)?, schema)
+        Self::in_batch(table, session_variable::acting_role(schema, options)?, schema, options)
     }
 
     fn column(&self, name: &str) -> Option<&ColumnGrant> {

@@ -1,10 +1,14 @@
-//! Statements whose target is a table the acting role holds no privilege on.
+//! Statements whose target is a table the acting role holds no privilege on,
+//! neither in their epoch nor in a later epoch of the batch.
 //!
 //! The replica holds only what the acting role reads, so such a table is left
 //! off it, and a statement writing or altering the table leaves with it: the
-//! rows it writes have nowhere to go and the role could never read them. That
-//! holds only while the write stays inside the table. A trigger on the table
-//! may write a table the role reads, and a foreign key acting on its
+//! rows it writes have nowhere to go and the role could never read them. A
+//! table the role reads only in a later epoch stays on the replica, as
+//! [`RoleTable::in_batch`] reads it, so the rows written before then are
+//! there once the role reads them. Leaving a write off holds only while the
+//! write stays inside the table. A trigger on the table may write a table the
+//! role reads, and a foreign key acting on its
 //! referencing rows writes the table holding them, so a write PostgreSQL
 //! would follow with either is refused rather than left off. A replica that
 //! leaves the writes the server derives to the server leaves those triggers and
@@ -134,7 +138,7 @@ impl<'s> OffReplica<'s> {
     ) -> Result<Option<Self>, Error> {
         let Some(role) = session_variable::acting_role(schema, options)? else { return Ok(None) };
         let Some(table) = resolve_translation_table(schema, name)? else { return Ok(None) };
-        let hidden = !RoleTable::of(table, Some(role), schema)?.reads_any();
+        let hidden = !RoleTable::in_batch(table, Some(role), schema, options)?.reads_any();
         Ok(hidden.then_some(Self { table, role }))
     }
 
@@ -185,7 +189,7 @@ impl<'s> OffReplica<'s> {
             return Ok(());
         }
         for referencing in schema.tables() {
-            if !RoleTable::of(referencing, Some(self.role), schema)?.reads_any() {
+            if !RoleTable::in_batch(referencing, Some(self.role), schema, options)?.reads_any() {
                 continue;
             }
             for key in referencing.foreign_keys(schema)? {

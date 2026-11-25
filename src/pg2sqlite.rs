@@ -135,6 +135,60 @@ fn record_overlaid_tables(
     overlay::record_overlaid_tables(options, initial, declared)
 }
 
+/// Registers, for each epoch, the tables the acting role reads in none of its
+/// statements but in a later epoch, by the names the epoch's schema holds
+/// them under. A rename ending an epoch is followed back to the name before
+/// it, and a table a drop ends is another table than a later one of its name.
+/// Such a table stays on the replica from its creation, so the rows written
+/// before the role reads it are there when it does.
+///
+/// # Errors
+///
+/// Refuses an acting role the deployment or an epoch's schema holding tables
+/// does not declare, and propagates a lookup failure.
+fn register_pending_tables(
+    statements: &[Statement],
+    epochs: &[PreparedEpoch],
+    context: &mut TranslationContext<'_>,
+) -> Result<(), crate::errors::Error> {
+    use sql_traits::traits::DatabaseLike;
+
+    use crate::impls::{privileges::RoleTable, translator_impls::drop_column_rebuild::fold};
+
+    let mut pending = Vec::new();
+    let mut later = BTreeSet::new();
+    for epoch in epochs.iter().rev() {
+        if epoch.schema_end < epoch.end {
+            table_shape::Touched::by(core::slice::from_ref(&statements[epoch.schema_end]))
+                .follow_back(&mut later);
+        }
+        let schema = &*epoch.schema;
+        let mut tables = schema.tables().filter(|table| !table.temporary).peekable();
+        if tables.peek().is_none() {
+            continue;
+        }
+        let Some(role) = crate::impls::session_variable::acting_role(schema, context)? else {
+            return Ok(());
+        };
+        let mut read = Vec::new();
+        let mut unread = BTreeSet::new();
+        for table in tables {
+            let name = fold(&table.name);
+            if RoleTable::of(table, Some(role), schema)?.reads_any() {
+                read.push(name);
+            } else if later.contains(&name) {
+                unread.insert(name);
+            }
+        }
+        later.extend(read);
+        if !unread.is_empty() {
+            pending.push((Rc::clone(&epoch.schema), unread));
+        }
+    }
+    context.set_pending_tables(pending);
+    Ok(())
+}
+
 /// Registers every trigger the replica leaves to the server, each read
 /// against the schema of its own epoch, an earlier batch's against the
 /// schema it starts from, so no deferred check is queued for one, it shares
@@ -638,13 +692,14 @@ impl Trackers {
     /// `shape`, for the tables the statements of `statements` separating the
     /// two reach, followed, with the schema `applied` held and the tables
     /// whose shape changes, `applied` then holding `shape`. A shape is a
-    /// schema with the end of the statements it holds. Absent when `applied`
-    /// already holds `shape`.
+    /// schema with the end of the statements it holds. `boundary` is what the
+    /// statement ending the epoch emitted. Absent when `applied` already
+    /// holds `shape`.
     fn reshape<'a, 's: 'a>(
         &mut self,
         applied: &mut Option<(&'s ParserDB, usize)>,
         (shape, shape_end): (&'s ParserDB, usize),
-        statements: &[Statement],
+        (statements, boundary): (&[Statement], &[Statement]),
         at: Position<'a, '_>,
         emit: crate::warnings::WarningSink<'_>,
     ) -> Result<Option<Reshaped<'s>>, crate::errors::Error> {
@@ -662,6 +717,7 @@ impl Trackers {
             table_shape::reshaped(
                 (before, shape),
                 &table_shape::Touched::by(&statements[held_end..shape_end]),
+                boundary,
                 &written,
                 &mut |statement, schema| {
                     let mut warnings = Vec::new();
@@ -814,17 +870,18 @@ fn translate_followed(
 /// `shape`, as [`Trackers::reshape`] gives them, followed by each live
 /// trigger on a table whose shape changes, re-emitted as that shape takes it.
 ///
-/// `initial` is the schema a seeded trigger was last translated on.
+/// `boundary` is what the statement ending the epoch emitted, and `initial`
+/// is the schema a seeded trigger was last translated on.
 fn reshape_followed<'a, 's: 'a>(
     (trackers, follower): (&mut Trackers, &mut TriggerFollower),
     (applied, shape): (&mut Option<(&'s ParserDB, usize)>, (&'s ParserDB, usize)),
-    statements: &[Statement],
+    (statements, boundary): (&[Statement], &[Statement]),
     at: Position<'a, '_>,
     initial: Option<(&ParserDB, &[crate::options::TableTrigger])>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Vec<Statement>, crate::errors::Error> {
     let Some((mut emitted, held, tables)) =
-        trackers.reshape(applied, shape, statements, at, &mut *emit)?
+        trackers.reshape(applied, shape, (statements, boundary), at, &mut *emit)?
     else {
         return Ok(Vec::new());
     };
@@ -855,6 +912,60 @@ fn reshape_followed<'a, 's: 'a>(
         emitted.append(&mut created);
     }
     Ok(emitted)
+}
+
+/// Translates `statement` at `at`, after the drops `cascaded` that a
+/// `CASCADE` runs first, with the reshape moving the replica from the shape
+/// `applied` holds to `shape`. Answers the statements and whether
+/// retranslating `statement` alone cannot reproduce them.
+///
+/// `sides` and `initial` are as [`translate_followed`] takes them.
+fn translate_shaped<'a, 's: 'a>(
+    (trackers, follower): (&mut Trackers, &mut TriggerFollower),
+    (applied, shape): (&mut Option<(&'s ParserDB, usize)>, (&'s ParserDB, usize)),
+    (statement, cascaded): (&Statement, &[Statement]),
+    statements: &[Statement],
+    (at, sides): (Position<'a, '_>, Option<(Position<'a, '_>, Position<'a, '_>)>),
+    initial: Option<(&ParserDB, &[crate::options::TableTrigger])>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<(Vec<Statement>, bool), crate::errors::Error> {
+    // SQLite checks every view as a table renames, so the next epoch's shape
+    // follows.
+    let ends_epoch = Pg2Sqlite::schema_ends_epoch(statement);
+    let mut emitted = Vec::new();
+    if !ends_epoch {
+        emitted = reshape_followed(
+            (trackers, follower),
+            (applied, shape),
+            (statements, &[]),
+            at,
+            initial,
+            &mut *emit,
+        )?;
+    }
+    let mut rebuilt = !emitted.is_empty();
+    for drop in cascaded {
+        let (mut dropped, _) =
+            translate_followed(drop, at, None, initial, trackers, follower, &mut *emit)?;
+        rebuilt |= !dropped.is_empty();
+        emitted.append(&mut dropped);
+    }
+    let (mut own, own_rebuilt) =
+        translate_followed(statement, at, sides, initial, trackers, follower, &mut *emit)?;
+    if ends_epoch {
+        let reshaped = reshape_followed(
+            (trackers, follower),
+            (applied, shape),
+            (statements, &own),
+            at,
+            initial,
+            emit,
+        )?;
+        rebuilt |= !reshaped.is_empty();
+        own.extend(reshaped);
+    }
+    emitted.append(&mut own);
+    Ok((emitted, rebuilt || own_rebuilt))
 }
 
 impl Pg2Sqlite {
@@ -1588,6 +1699,7 @@ impl Pg2Sqlite {
             initial_schema,
         } = prepared;
         let statements = &*sources;
+        register_pending_tables(statements, &epochs, context)?;
         register_left_out_triggers(statements, &epochs, initial_schema.as_ref(), context);
         populate_prewalk_catalogs(statements, &epochs, initial_schema.as_ref(), context);
         register_deferred_key_checks(
@@ -1732,46 +1844,20 @@ impl Pg2Sqlite {
                         };
                         let sides =
                             event_sides(statement, epochs, (epoch_index, index), final_schema, at);
-                        let mut emitted = Vec::new();
-                        let mut rebuilt = false;
                         let shape = epoch_shape(statement, epochs, epoch_index, final_schema)
                             .unwrap_or((&epoch.schema, epoch.schema_end));
                         let initial =
                             initial_schema.map(|schema| (schema, initial_triggers.as_slice()));
-                        let reshaped = reshape_followed(
+                        let (emitted, rebuilt) = translate_shaped(
                             (&mut trackers, &mut follower),
                             (&mut applied, shape),
+                            (statement, &cascaded),
                             statements,
-                            at,
+                            (at, sides),
                             initial,
                             &mut emit,
                         )?;
-                        rebuilt |= !reshaped.is_empty();
-                        emitted.extend(reshaped);
-                        for drop in &cascaded {
-                            let (mut dropped, _) = translate_followed(
-                                drop,
-                                at,
-                                None,
-                                initial,
-                                &mut trackers,
-                                &mut follower,
-                                &mut emit,
-                            )?;
-                            rebuilt |= !dropped.is_empty();
-                            emitted.append(&mut dropped);
-                        }
-                        let (mut own, own_rebuilt) = translate_followed(
-                            statement,
-                            at,
-                            sides,
-                            initial,
-                            &mut trackers,
-                            &mut follower,
-                            &mut emit,
-                        )?;
-                        emitted.append(&mut own);
-                        rebuilt_triggers[index] = rebuilt || own_rebuilt;
+                        rebuilt_triggers[index] = rebuilt;
                         translated.push(emitted);
                     }
                 }

@@ -331,7 +331,7 @@ fn lower<'db>(
     let mut guarded = Vec::new();
     for table in lowering.read {
         if let Some(acting) = acting
-            && !RoleTable::of(table, Some(acting), schema)?.reads_any()
+            && !RoleTable::in_batch(table, Some(acting), schema, options)?.reads_any()
         {
             return Err(Error::forward_refusal(format!(
                 "{name}() cannot be translated as the set it returns: it {}.",
