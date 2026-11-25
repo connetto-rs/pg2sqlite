@@ -44,7 +44,8 @@ impl crate::traits::translator::TranslatorWithContext for Update {
         // and a query inside the statement attaches its own scope over this
         // one, so an outer reference still resolves.
         let scope_query = update_scope_query(self);
-        let target_scope = Some(crate::options::query_column_scope(&scope_query, schema)?);
+        let written = options.written_schema().unwrap_or(schema);
+        let target_scope = Some(crate::options::query_column_scope(&scope_query, written)?);
         let scoped = target_scope.as_ref().map(|scope| options.with_scope(scope));
         let options = scoped.as_ref().unwrap_or(options);
         if let Some(

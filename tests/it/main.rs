@@ -229,6 +229,7 @@ mod test_raise_sqlstate;
 mod test_readonly_nonrls_deny_triggers;
 mod test_reads_left_to_server;
 mod test_recursive_view;
+mod test_reference_before_rename;
 mod test_rename_table;
 mod test_returning_alias_subqueries;
 mod test_returning_old_new;

@@ -163,8 +163,9 @@ impl crate::traits::translator::TranslatorWithContext for Insert {
         // and a query inside the statement attaches its own scope over this
         // one, so an outer reference still resolves.
         let target_query = insert_target_scope_query(self, schema)?;
+        let written = options.written_schema().unwrap_or(schema);
         let target_scope = match target_query.as_ref() {
-            Some(query) => Some(crate::options::query_column_scope(query, schema)?),
+            Some(query) => Some(crate::options::query_column_scope(query, written)?),
             None => None,
         };
         let scoped = target_scope.as_ref().map(|scope| options.with_scope(scope));
@@ -471,8 +472,9 @@ fn translate_on_insert(
         }
         sqlparser::ast::OnConflictAction::DoUpdate(do_update) => {
             let scope_query = conflict_update_scope_query(original);
-            // Resolve against the logical target's schema.
-            let scope = crate::options::query_column_scope(&scope_query, schema)?;
+            // Resolve against the logical target's schema as written.
+            let written = options.written_schema().unwrap_or(schema);
+            let scope = crate::options::query_column_scope(&scope_query, written)?;
             let scoped = options.with_scope(&scope);
             let options = &scoped;
             // PostgreSQL writes the declared default for a DO UPDATE DEFAULT.
@@ -1048,7 +1050,7 @@ fn assign_insert_values(
     let scope = scope_query.as_ref().and_then(|query| {
         sql_traits::structs::ColumnScope::from_query(
             substitute.as_ref().unwrap_or(query),
-            schema,
+            options.written_schema().unwrap_or(schema),
             sql_traits::structs::IdentifierCase::AsWritten,
         )
         .ok()

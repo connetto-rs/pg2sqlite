@@ -963,9 +963,10 @@ fn translate_alter_table_operation(
             column_position,
         } => {
             reject_unsupported_added_column(column_def, alter_table.name.to_string().as_str())?;
+            let written = options.written_schema().unwrap_or(schema);
             let table_scope = crate::options::table_column_scope(
-                resolve_translation_table(schema, &alter_table.name)?,
-                schema,
+                resolve_translation_table(written, &alter_table.name)?,
+                written,
             );
             let scoped = table_scope.as_ref().map(|scope| options.with_scope(scope));
             let options = scoped.as_ref().unwrap_or(options);
