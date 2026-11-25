@@ -669,6 +669,88 @@ fn a_write_in_a_later_batch_before_the_table_its_policy_reads_lands() {
     assert_same_replica(migrated(&earlier, &migration), loaded(&format!("{earlier}{migration}")));
 }
 
+/// A column `allowed` gains after the write.
+const ALLOWED_OPEN: &str = "ALTER TABLE allowed ADD COLUMN open BOOLEAN NOT NULL DEFAULT TRUE;";
+
+/// A policy on `notes` reading the column `allowed` gains late.
+const OPEN_POLICY: &str =
+    "CREATE POLICY notes_open ON notes TO app USING (id IN (SELECT id FROM allowed WHERE open));";
+
+#[test]
+fn a_write_before_a_column_another_table_gains_for_a_late_policy_lands() {
+    let secured = "ALTER TABLE notes ENABLE ROW LEVEL SECURITY;";
+    assert_same_replica(
+        loaded(&format!("{HEAD}{secured}{ALLOWED}{BOUNDARY}{WRITTEN}{ALLOWED_OPEN}{OPEN_POLICY}")),
+        loaded(&format!("{HEAD}{secured}{ALLOWED}{WRITTEN}{ALLOWED_OPEN}{OPEN_POLICY}{BOUNDARY}")),
+    );
+}
+
+#[test]
+fn a_write_before_a_column_another_table_gains_in_the_creating_epoch_lands() {
+    let secured = "ALTER TABLE notes ENABLE ROW LEVEL SECURITY;";
+    assert_same_replica(
+        loaded(&format!("{HEAD}{secured}{ALLOWED}{WRITTEN}{ALLOWED_OPEN}{OPEN_POLICY}")),
+        loaded(&format!("{HEAD}{secured}{ALLOWED}{ALLOWED_OPEN}{OPEN_POLICY}{BOUNDARY}{WRITTEN}")),
+    );
+}
+
+#[test]
+fn a_write_before_a_column_a_secured_table_gains_for_a_late_policy_lands() {
+    let secured = "
+ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE allowed ENABLE ROW LEVEL SECURITY;
+CREATE POLICY allowed_all ON allowed TO app USING (true);
+";
+    assert_same_replica(
+        loaded(&format!("{HEAD}{ALLOWED}{secured}{BOUNDARY}{WRITTEN}{ALLOWED_OPEN}{OPEN_POLICY}")),
+        loaded(&format!("{HEAD}{ALLOWED}{secured}{WRITTEN}{ALLOWED_OPEN}{OPEN_POLICY}{BOUNDARY}")),
+    );
+}
+
+#[test]
+fn a_write_before_a_column_another_table_renames_into_place_lands() {
+    let closed = "ALTER TABLE allowed ADD COLUMN shut BOOLEAN NOT NULL DEFAULT TRUE;";
+    let renamed = "ALTER TABLE allowed RENAME COLUMN shut TO open;";
+    let secured = "ALTER TABLE notes ENABLE ROW LEVEL SECURITY;";
+    assert_same_replica(
+        loaded(&format!(
+            "{HEAD}{secured}{ALLOWED}{closed}{BOUNDARY}{WRITTEN}{renamed}{OPEN_POLICY}"
+        )),
+        loaded(&format!(
+            "{HEAD}{secured}{ALLOWED}{closed}{WRITTEN}{renamed}{OPEN_POLICY}{BOUNDARY}"
+        )),
+    );
+}
+
+#[test]
+fn a_write_before_a_late_rename_into_the_table_a_policy_reads_lands() {
+    let secured = "ALTER TABLE notes ENABLE ROW LEVEL SECURITY;";
+    let renamed = "
+CREATE TABLE pending (id INTEGER PRIMARY KEY);
+GRANT SELECT ON pending TO app;
+INSERT INTO pending VALUES (1), (2);
+";
+    let rename = "ALTER TABLE pending RENAME TO allowed;";
+    assert_same_replica(
+        loaded(&format!("{HEAD}{secured}{renamed}{BOUNDARY}{WRITTEN}{rename}{ALLOWED_POLICY}")),
+        loaded(&format!("{HEAD}{secured}{renamed}{WRITTEN}{rename}{ALLOWED_POLICY}{BOUNDARY}")),
+    );
+}
+
+#[test]
+fn a_write_before_a_late_policy_reading_a_secured_later_table_lands() {
+    let secured = "ALTER TABLE notes ENABLE ROW LEVEL SECURITY;";
+    let allowed_secured = "
+ALTER TABLE allowed ENABLE ROW LEVEL SECURITY;
+CREATE POLICY allowed_all ON allowed TO app USING (true);
+";
+    let late = format!("{WRITTEN}{ALLOWED}{allowed_secured}{ALLOWED_POLICY}");
+    assert_same_replica(
+        loaded(&format!("{HEAD}{secured}{BOUNDARY}{late}")),
+        loaded(&format!("{HEAD}{secured}{late}{BOUNDARY}")),
+    );
+}
+
 #[test]
 fn a_late_enable_keeps_the_index_and_trigger_on_the_table() {
     let (mut late, late_exempt) = loaded(&format!("{HEAD}{ATTACHED}{BOUNDARY}{SECURED}"));

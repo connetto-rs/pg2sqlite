@@ -38,11 +38,12 @@ use crate::{
 };
 
 /// Moves every generated view that reads a relation the script does not hold
-/// at that point but creates later, or that disagrees with its backing table
-/// on the columns until a later statement of the epoch adds, drops or renames
-/// one, with its triggers and every other generated object of its unit
-/// reading the view, such a relation or such a column, to the end of the unit
-/// creating the last relation or changing the last column. A generated view is
+/// at that point but creates later, that reads a column another relation
+/// gains later in the epoch, or that disagrees with its backing table on the
+/// columns until a later statement of the epoch adds, drops or renames one,
+/// with its triggers and every other generated object of its unit reading the
+/// view, such a relation or such a column, to the end of the unit creating the
+/// last relation or changing the last column. A generated view is
 /// one a table's creation or a later reshape emits, named after the table
 /// whose backing table carries `backing_suffix`. When a statement in between
 /// names the table, the view `pass_through` builds for the table from the
@@ -81,25 +82,9 @@ pub(crate) fn hold_forward_views(
         if shape >= translated.len() {
             continue;
         }
-        let own = &translated[index][..own_lengths[index]];
-        let views: Vec<(usize, ObjectName)> = own
-            .iter()
-            .enumerate()
-            .filter_map(|(position, statement)| {
-                match statement {
-                    Statement::CreateView(view)
-                        if live.relations.contains(&format!("{}{suffix}", key(&view.name))) =>
-                    {
-                        Some((position, view.name.clone()))
-                    }
-                    _ => None,
-                }
-            })
-            .collect();
-        let ends: Vec<usize> =
-            views.iter().skip(1).map(|(position, _)| *position).chain([own.len()]).collect();
+        let windows = generated_views(&translated[index][..own_lengths[index]], &live, &suffix);
         // Later windows first, so the positions of the earlier ones hold.
-        for ((start, view), end) in views.into_iter().zip(ends).rev() {
+        for (view, start, end) in windows.into_iter().rev() {
             let view_key = key(&view);
             let backing_key = format!("{view_key}{suffix}");
             let created_later = |names: &[String]| {
@@ -111,13 +96,17 @@ pub(crate) fn hold_forward_views(
                     })
                     .max()
             };
-            let relations: Vec<Vec<String>> =
-                translated[index][start..end].iter().map(relation_names).collect();
+            let window = &translated[index][start..end];
+            let relations: Vec<Vec<String>> = window.iter().map(relation_names).collect();
+            let epoch = &translated[..epoch_end(shape)];
             let created = live.columns.get(&backing_key).cloned().unwrap_or_default();
-            let changes =
-                column_changes(&translated[..epoch_end(shape)], index, &backing_key, &created);
+            let changes = column_changes(epoch, index, &backing_key, &created);
+            let foreign =
+                foreign_changes(epoch, index, window, &relations, &live, &view_key, &suffix);
             let forward = relations.iter().filter_map(|names| created_later(names)).max();
-            let Some(ready) = forward.into_iter().chain(changes.units.last().copied()).max() else {
+            let Some(ready) =
+                forward.into_iter().chain(changes.units.last().copied()).chain(foreign.last).max()
+            else {
                 continue;
             };
             let declared = declaration(&sources[..=index], initial_schema, &view_key)
@@ -132,7 +121,8 @@ pub(crate) fn hold_forward_views(
                     && (created_later(&names).is_some()
                         || names.contains(&view_key)
                         || belongs_to_view(&statement, &view_key)
-                        || reads(&statement, &changes.read))
+                        || reads(&statement, &changes.read)
+                        || reads(&statement, &foreign.read))
                 {
                     view_position.get_or_insert(kept.len());
                     held.push(statement);
@@ -172,6 +162,33 @@ pub(crate) fn hold_forward_views(
         }
     }
     Ok(moved)
+}
+
+/// Each generated view `emitted` creates, a view whose backing table, named
+/// with `suffix`, `live` holds, with the positions in `emitted` of the view
+/// and of the next generated view or the end, between which its triggers and
+/// guards follow it.
+fn generated_views(
+    emitted: &[Statement],
+    live: &Live,
+    suffix: &str,
+) -> Vec<(ObjectName, usize, usize)> {
+    let views: Vec<(usize, &ObjectName)> = emitted
+        .iter()
+        .enumerate()
+        .filter_map(|(position, statement)| {
+            match statement {
+                Statement::CreateView(view)
+                    if live.relations.contains(&format!("{}{suffix}", key(&view.name))) =>
+                {
+                    Some((position, &view.name))
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    let ends = views.iter().skip(1).map(|(position, _)| *position).chain([emitted.len()]);
+    views.iter().zip(ends).map(|((start, view), end)| ((*view).clone(), *start, end)).collect()
 }
 
 /// The declaration of the table SQLite files under `table`, the last of
@@ -259,6 +276,49 @@ fn column_changes(
         }
     }
     ColumnChanges { units, read: columns.difference(created).cloned().collect() }
+}
+
+/// The columns other relations gain after a view's position that the view's
+/// generated objects read.
+struct ForeignChanges {
+    /// The last unit changing the columns of such a relation.
+    last: Option<usize>,
+    /// The gained columns the objects read, keyed as SQLite folds names.
+    read: BTreeSet<String>,
+}
+
+/// The columns that the relations `window` reads, other than `table` and its
+/// backing table, gain after unit `index` up to the end of `epoch`, in the
+/// relation or in its backing table named with `suffix`, counting only the
+/// relations whose gained columns `window` reads. `relations` holds the
+/// relations each statement of `window` names, and `live` what the script
+/// holds after unit `index`.
+fn foreign_changes(
+    epoch: &[Vec<Statement>],
+    index: usize,
+    window: &[Statement],
+    relations: &[Vec<String>],
+    live: &Live,
+    table: &str,
+    suffix: &str,
+) -> ForeignChanges {
+    let backing = format!("{table}{suffix}");
+    let others: BTreeSet<&str> = relations
+        .iter()
+        .flatten()
+        .map(String::as_str)
+        .filter(|name| *name != table && *name != backing)
+        .collect();
+    let mut foreign = ForeignChanges { last: None, read: BTreeSet::new() };
+    for stored in others.into_iter().flat_map(|name| [name.to_owned(), format!("{name}{suffix}")]) {
+        let current = live.columns.get(&stored).cloned().unwrap_or_default();
+        let changes = column_changes(epoch, index, &stored, &current);
+        if window.iter().any(|statement| reads(statement, &changes.read)) {
+            foreign.last = foreign.last.max(changes.units.last().copied());
+            foreign.read.extend(changes.read);
+        }
+    }
+    foreign
 }
 
 /// Applies `operation` to `columns`, keyed as SQLite folds names.
