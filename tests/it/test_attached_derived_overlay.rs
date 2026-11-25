@@ -111,11 +111,35 @@ mod schema {
             id -> Integer,
         }
     }
+
+    diesel::table! {
+        memberships (team_id, user_id) {
+            team_id -> Integer,
+            user_id -> Integer,
+            role -> Text,
+        }
+    }
+
+    diesel::table! {
+        shared.memberships_pg2sqlite_shared (team_id, user_id) {
+            team_id -> Integer,
+            user_id -> Integer,
+            role -> Text,
+        }
+    }
+
+    diesel::table! {
+        memberships_pg2sqlite_shared_write (team_id, user_id) {
+            team_id -> Integer,
+            user_id -> Integer,
+        }
+    }
 }
 
 use schema::{
     documents, documents_rls_pg2sqlite_overlay, documents_rls_pg2sqlite_shared,
-    documents_rls_pg2sqlite_shared_write, note_counts, note_log, notes, notes_pg2sqlite_overlay,
+    documents_rls_pg2sqlite_shared_write, memberships, memberships_pg2sqlite_shared,
+    memberships_pg2sqlite_shared_write, note_counts, note_log, notes, notes_pg2sqlite_overlay,
     notes_pg2sqlite_shared, sources, sqlite_master,
 };
 
@@ -617,6 +641,99 @@ fn a_landed_write_on_a_key_the_shared_rows_lack_changes_nothing() {
     assert_eq!(changed, 0);
     assert_eq!(overlay_documents(&mut alice), overlay);
     assert_eq!(shared_documents(&mut alice), shared);
+}
+
+const MEMBERSHIPS: &str = "
+CREATE TABLE sources (id INTEGER PRIMARY KEY);
+CREATE TABLE memberships (
+  team_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  role TEXT NOT NULL,
+  PRIMARY KEY (team_id, user_id)
+);
+CREATE FUNCTION draft_memberships() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE memberships SET role = 'draft' WHERE team_id = 1;
+  RETURN NULL;
+END
+$$;
+CREATE TRIGGER sources_draft AFTER INSERT ON sources
+  FOR EACH ROW EXECUTE FUNCTION draft_memberships();
+";
+
+type Membership = (i32, i32, String);
+
+fn membership(team_id: i32, user_id: i32, role: &str) -> Membership {
+    (team_id, user_id, role.to_owned())
+}
+
+fn memberships_seen(connection: &mut SqliteConnection) -> Vec<Membership> {
+    memberships::table
+        .order((memberships::team_id, memberships::user_id))
+        .load(connection)
+        .expect("read memberships")
+}
+
+#[test]
+fn a_landed_write_on_a_composite_key_shows_the_shared_row_at_that_key_alone() {
+    let options = Pg2SqliteOptions::default()
+        .with_server_derived_write_function("derived")
+        .with_attached_tables("shared", ["memberships"]);
+    let script = translate(MEMBERSHIPS, &options).expect("translate");
+    let files = Files::new("landed-composite");
+    let mut alice = files.open(&files.alice, &script);
+    run(&mut alice, script.initialize(FreshFiles::Both).expect("initialize both"));
+    diesel::insert_into(memberships::table)
+        .values(&[
+            (
+                memberships::team_id.eq(1),
+                memberships::user_id.eq(1),
+                memberships::role.eq("member"),
+            ),
+            (
+                memberships::team_id.eq(1),
+                memberships::user_id.eq(2),
+                memberships::role.eq("member"),
+            ),
+        ])
+        .execute(&mut alice)
+        .expect("seed memberships");
+    let mut bob = files.open(&files.bob, &script);
+    run(&mut bob, script.initialize(FreshFiles::Main).expect("initialize bob's main"));
+    derive(&mut alice, 5);
+
+    diesel::insert_into(memberships_pg2sqlite_shared_write::table)
+        .values((
+            memberships_pg2sqlite_shared_write::team_id.eq(1),
+            memberships_pg2sqlite_shared_write::user_id.eq(1),
+        ))
+        .execute(&mut alice)
+        .expect("name the landing key");
+    let landing = memberships_seen(&mut alice);
+    diesel::update(
+        memberships::table.filter(memberships::team_id.eq(1).and(memberships::user_id.eq(1))),
+    )
+    .set(memberships::role.eq("owner"))
+    .execute(&mut alice)
+    .expect("a landed update");
+    diesel::delete(memberships_pg2sqlite_shared_write::table)
+        .execute(&mut alice)
+        .expect("clear the landing key");
+
+    assert_eq!(landing, [membership(1, 1, "member"), membership(1, 2, "draft")]);
+    let landed = [membership(1, 1, "owner"), membership(1, 2, "member")];
+    assert_eq!(
+        memberships_pg2sqlite_shared::table
+            .order((memberships_pg2sqlite_shared::team_id, memberships_pg2sqlite_shared::user_id))
+            .load::<Membership>(&mut alice)
+            .expect("read the shared memberships"),
+        landed
+    );
+    assert_eq!(memberships_seen(&mut bob), landed);
+    assert_eq!(
+        memberships_seen(&mut alice),
+        [membership(1, 1, "draft"), membership(1, 2, "draft")]
+    );
 }
 
 #[test]
