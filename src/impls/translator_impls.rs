@@ -56,6 +56,7 @@ pub(crate) mod trigger_follower;
 pub(crate) mod trigger_frame;
 pub(crate) mod trigger_row;
 pub(crate) mod trigger_slots;
+pub(crate) mod truncation;
 pub(crate) mod update;
 pub(crate) mod uuid;
 pub mod vector;

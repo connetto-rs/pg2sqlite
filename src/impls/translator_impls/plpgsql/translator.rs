@@ -634,15 +634,15 @@ impl PlPgSqlTranslator {
                     // PostgreSQL refuses such a `TRUNCATE` only when a run
                     // reaches it, so the refusal raises there.
                     Statement::Truncate(truncate) => {
-                        match statement::truncation(truncate, schema, options, emit)? {
+                        match statement::truncation(truncate, schema, options, emit, true)? {
                             Ok(deletes) => deletes,
                             Err(refusal) => vec![refusal.raise()],
                         }
                     }
                     other => other.translate_with_warnings(schema, options, emit)?,
                 };
-                // `TRUNCATE` becomes `DELETE`s or a refusal, which must stay
-                // inside its `IF`.
+                // A `TRUNCATE`'s deletes and the frame around them, or its
+                // refusal, stay inside their `IF`.
                 if let Some(condition) = scope.current_condition() {
                     for t_stmt in &mut translated {
                         Self::inject_condition_into_statement(t_stmt, &condition)?;

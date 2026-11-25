@@ -2739,7 +2739,7 @@ fn generate_update_check_trigger_sql(
         &ctx.inner_table_name,
         sqlparser::ast::TriggerEvent::Update(Vec::new()),
         write_guard_condition_expr(violation, options),
-        &super::definer::and_key_actions(
+        &super::definer::and_system_frames(
             super::definer::exempt_owners(table, schema),
             table,
             schema,
@@ -2777,7 +2777,7 @@ fn generate_delete_check_trigger_sql(
         &ctx.inner_table_name,
         sqlparser::ast::TriggerEvent::Delete,
         write_guard_condition_expr(violation, options),
-        &super::definer::and_key_actions(
+        &super::definer::and_system_frames(
             super::definer::exempt_owners(table, schema),
             table,
             schema,
@@ -3167,12 +3167,12 @@ fn forwarding_view_triggers(
 
 /// The guards refusing every write that reaches the backing table of a table
 /// the acting role only reads, unless it is exempt, a definer body runs it,
-/// whose writes are held to its owner's privileges, or a foreign key action
-/// runs it.
+/// whose writes are held to its owner's privileges, or a foreign key action or
+/// a `TRUNCATE` runs it.
 ///
 /// # Errors
 ///
-/// Fails as [`super::definer::and_key_actions`] does.
+/// Fails as [`super::definer::and_system_frames`] does.
 fn generate_readonly_backing_guard_sql(
     table: &CreateTable,
     schema: &ParserDB,
@@ -3184,7 +3184,7 @@ fn generate_readonly_backing_guard_sql(
     let ctx = RlsTriggerContext::new(table, options);
     let condition = write_guard_condition_expr(None, options);
     let message = read_only(ctx.table_name);
-    let owners = super::definer::and_key_actions(
+    let owners = super::definer::and_system_frames(
         super::definer::definer_owners(schema),
         table,
         schema,

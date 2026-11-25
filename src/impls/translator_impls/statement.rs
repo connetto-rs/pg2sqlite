@@ -567,7 +567,7 @@ fn overlay_if_derived(
 /// Appends `BEFORE` triggers refusing the writes `grants` does not allow on
 /// `table`, a plain table, every write as read-only when it allows none. A
 /// definer body passes them, its writes held to its owner's privileges, and so
-/// does a foreign key action.
+/// do a foreign key action and a `TRUNCATE`.
 fn append_deny_triggers(
     statements: &mut Vec<Statement>,
     table: &sqlparser::ast::CreateTable,
@@ -591,7 +591,7 @@ fn append_deny_triggers(
     };
     let condition = super::definer::unless_running(
         write_guard_condition_expr(None, options),
-        &super::definer::and_key_actions(
+        &super::definer::and_system_frames(
             super::definer::definer_owners(schema),
             table,
             schema,
@@ -1127,15 +1127,18 @@ fn translate_truncate(
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Vec<Statement>, Error> {
-    truncation(truncate, schema, options, emit)?.map_err(|refusal| refusal.error())
+    truncation(truncate, schema, options, emit, false)?.map_err(|refusal| refusal.error())
 }
 
-/// `TRUNCATE` as one `DELETE FROM` per named table, or the refusal
-/// PostgreSQL meets before emptying anything.
+/// `TRUNCATE` as one `DELETE FROM` per named table, run as one statement
+/// under the truncation frame when a guard or a trigger of a table it empties
+/// could see the deletes, or the refusal PostgreSQL meets before emptying
+/// anything. `in_trigger_body` when the `TRUNCATE` is a statement of a
+/// trigger body.
 ///
 /// Each table is routed through the `DELETE` translator rather than emitting
-/// the statement directly, so row level security rewriting, table renaming, and
-/// role access checks apply exactly as they do to a hand-written `DELETE FROM`.
+/// the statement directly, so table renaming applies exactly as it does to a
+/// hand-written `DELETE FROM`.
 ///
 /// The identity options need no special handling, which is not the obvious
 /// conclusion. This crate emits `AUTOINCREMENT` only for the RLS audit table,
@@ -1156,6 +1159,7 @@ pub(crate) fn truncation<'s>(
     schema: &'s ParserDB,
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
+    in_trigger_body: bool,
 ) -> Result<Result<Vec<Statement>, TruncateRefusal<'s>>, Error> {
     reject_untranslatable_truncate_options(truncate)?;
     let mut targets = Vec::with_capacity(truncate.table_names.len());
@@ -1180,15 +1184,19 @@ pub(crate) fn truncation<'s>(
     }
 
     let mut statements = Vec::with_capacity(targets.len());
-    for target in emptying_order(targets, schema)? {
+    let mut seen = false;
+    for TruncateTarget { target, table, .. } in emptying_order(targets, schema)? {
+        if let Some(table) = table {
+            seen = seen || sees_truncation(table, schema, options)?;
+        }
         // PostgreSQL does not apply policies to TRUNCATE: it needs the TRUNCATE
         // privilege and then empties the table. An RLS table is translated as a
         // view over a suffixed backing table, and the view's INSTEAD OF DELETE
         // trigger carries the policy predicate, so deleting through it would
-        // empty only the admitted rows. Naming the backing table
-        // directly reproduces PostgreSQL. Nothing observes it: only
-        // INSERT and UPDATE monitoring triggers are generated, so a
-        // delete raises no validation event.
+        // empty only the admitted rows. Naming the backing table, whose guards
+        // stand aside under the truncation frame, reproduces PostgreSQL.
+        // Nothing else observes it: only INSERT and UPDATE monitoring triggers
+        // are generated, so a delete raises no validation event.
         let rls_backed = names_table_with_backing(schema, &target.name, options)?;
         let name = if rls_backed {
             append_suffix(&target.name, options.get_rls_table_suffix())
@@ -1228,7 +1236,10 @@ pub(crate) fn truncation<'s>(
         }
     }
 
-    Ok(Ok(statements))
+    if !seen || statements.is_empty() {
+        return Ok(Ok(statements));
+    }
+    Ok(Ok(super::truncation::emptying(statements, in_trigger_body)))
 }
 
 /// A `TRUNCATE` target and the table it names.
@@ -1330,10 +1341,10 @@ fn truncate_refusal<'s>(
 /// # Errors
 ///
 /// Propagates a lookup failure.
-fn emptying_order<'t>(
-    targets: Vec<TruncateTarget<'t, '_>>,
+fn emptying_order<'t, 's>(
+    targets: Vec<TruncateTarget<'t, 's>>,
     schema: &ParserDB,
-) -> Result<Vec<&'t TruncateTableTarget>, Error> {
+) -> Result<Vec<TruncateTarget<'t, 's>>, Error> {
     let mut targets: Vec<_> = targets.into_iter().filter(|target| !target.leaves).collect();
     let mut ordered = Vec::with_capacity(targets.len());
     while !targets.is_empty() {
@@ -1352,9 +1363,27 @@ fn emptying_order<'t>(
             next = position;
             break;
         }
-        ordered.push(targets.remove(next).target);
+        ordered.push(targets.remove(next));
     }
     Ok(ordered)
+}
+
+/// Whether a guard or a row trigger of `table` could see the deletes emptying
+/// it, which then run under the truncation frame. A table the acting role
+/// writes in full, without a backing table and without triggers, has neither.
+///
+/// # Errors
+///
+/// Propagates a lookup failure, and refuses an acting role the schema does not
+/// declare.
+fn sees_truncation(
+    table: &<ParserDB as DatabaseLike>::Table,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<bool, Error> {
+    Ok(has_backing_table(table, schema, options)?
+        || !RoleTable::acting(table, schema, options)?.writes_everything()
+        || table.triggers(schema)?.next().is_some())
 }
 
 /// Whether a foreign key of `referencing` references `referenced`.
