@@ -153,18 +153,22 @@ fn loaded(sql: &str) -> (SqliteConnection, Arc<AtomicBool>) {
 /// loaded, both under the exemption.
 fn migrated(earlier: &str, migration: &str) -> (SqliteConnection, Arc<AtomicBool>) {
     let (mut connection, exempt) = loaded(earlier);
+    apply(&mut connection, &migration_script(earlier, migration));
+    (connection, exempt)
+}
+
+/// `migration` translated on top of the schema `earlier` builds.
+fn migration_script(earlier: &str, migration: &str) -> Script {
     let schema = Pg2Sqlite::default()
         .sql(earlier)
         .expect("parse PostgreSQL")
         .build_schema()
         .expect("build the earlier schema");
-    let script = Pg2Sqlite::default()
+    Pg2Sqlite::default()
         .sql(migration)
         .expect("parse PostgreSQL")
         .translate_with_schema(&schema, &options())
-        .unwrap_or_else(|error| panic!("{migration}\ntranslates: {error}"));
-    apply(&mut connection, &script);
-    (connection, exempt)
+        .unwrap_or_else(|error| panic!("{migration}\ntranslates: {error}"))
 }
 
 /// One line describing a table's columns and keys.
@@ -766,4 +770,71 @@ fn an_epoch_ending_before_the_role_is_declared_translates() {
         loaded(&format!("{function}{UNREAD_HEAD}{GRANT_ALL}")),
         loaded(&format!("{UNREAD_HEAD}{GRANT_ALL}")),
     );
+}
+
+diesel::table! {
+    /// The table whose `secret` the role reads only after a later grant.
+    docs (id) {
+        id -> Integer,
+        owner -> Text,
+        secret -> Nullable<Text>,
+    }
+}
+
+/// `docs`, whose constrained `secret` the role may write but not read.
+const WITHHELD: &str = "
+CREATE ROLE app NOLOGIN;
+CREATE TABLE docs (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, secret TEXT NOT NULL CHECK (secret <> ''));
+GRANT SELECT (id, owner), INSERT, UPDATE, DELETE ON docs TO app;
+";
+
+/// `WITHHELD` loaded with the row `(1, 'app', secret)` stored past the
+/// guards, then the grant reading `secret` run on top, up to its first
+/// refusal.
+fn widened(secret: Option<&str>) -> (SqliteConnection, Result<(), String>) {
+    let (mut connection, _exempt) = loaded(WITHHELD);
+    // The backing table holds what a server sends a reader of `id` and
+    // `owner`, which no typed table here names.
+    diesel::sql_query("INSERT INTO docs_rls (id, owner, secret) VALUES (1, 'app', ?)")
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(secret)
+        .execute(&mut connection)
+        .expect("store the row");
+    let script = migration_script(WITHHELD, "GRANT SELECT ON docs TO app;");
+    let outcome = script.iter().try_for_each(|statement| {
+        diesel::sql_query(statement.to_string())
+            .execute(&mut connection)
+            .map(drop)
+            .map_err(|error| error.to_string())
+    });
+    (connection, outcome)
+}
+
+#[test]
+fn a_grant_reading_a_withheld_column_refuses_rows_breaking_its_constraints() {
+    for secret in [None, Some("")] {
+        let (_, outcome) = widened(secret);
+        let refusal = outcome.expect_err("the rebuild refuses the stored row");
+        assert!(
+            refusal.contains(
+                "rebuilding docs brings back the NOT NULL or CHECK constraints of secret, which \
+                 a stored row breaks. Clear or refill those rows first."
+            ),
+            "{secret:?}: {refusal}"
+        );
+    }
+}
+
+#[test]
+fn a_grant_reading_a_withheld_column_keeps_rows_holding_it_and_its_constraints() {
+    let (mut connection, outcome) = widened(Some("kept"));
+    outcome.expect("the rebuild keeps the row");
+    assert_eq!(
+        docs::table.select((docs::id, docs::owner, docs::secret)).load(&mut connection),
+        Ok(vec![(1, "app".to_owned(), Some("kept".to_owned()))])
+    );
+    let refusal = diesel::insert_into(docs::table)
+        .values((docs::id.eq(2), docs::owner.eq("app")))
+        .execute(&mut connection)
+        .expect_err("secret is NOT NULL again");
+    assert!(refusal.to_string().contains("NOT NULL constraint failed"), "{refusal}");
 }

@@ -375,7 +375,7 @@ fn is_clock_call(function: &Function) -> bool {
 /// A check reads only its own table, since PostgreSQL refuses a subquery
 /// there, so a reference is a column of the table whether it is bare or
 /// qualified by the table. SQLite resolves a column name without ASCII case.
-fn read_through_new(condition: &mut Expr, columns: &[&Ident]) {
+pub(crate) fn read_through_new(condition: &mut Expr, columns: &[&Ident]) {
     let column = |ident: &Ident| {
         columns.iter().any(|column| column.value.eq_ignore_ascii_case(&ident.value))
     };

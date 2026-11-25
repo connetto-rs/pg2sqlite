@@ -112,6 +112,9 @@ mod parity_timestamptz_reads;
 #[path = "gauntlet/parity_privileges.rs"]
 mod parity_privileges;
 
+#[path = "gauntlet/parity_withheld_columns.rs"]
+mod parity_withheld_columns;
+
 #[path = "gauntlet/parity_uuid_text.rs"]
 mod parity_uuid_text;
 

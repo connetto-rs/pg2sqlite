@@ -476,8 +476,9 @@ fn translate_create_table_for_role(
             validate_table_policies(table, schema, options)?;
         }
         let view_statements = generate_view_statements(table, schema, options, &grants, emit)?;
+        let withheld = super::withheld::Withheld::of(table, schema, &grants)?;
         let statements = build_create_table_statements(
-            create_table,
+            &withheld.release(create_table),
             schema,
             options,
             Some(view_statements),
@@ -969,6 +970,7 @@ fn translate_alter_table_operation(
             );
             let scoped = table_scope.as_ref().map(|scope| options.with_scope(scope));
             let options = scoped.as_ref().unwrap_or(options);
+            let withheld = super::withheld::Withheld::of_named(&alter_table.name, schema, options)?;
             Ok(Some(AlterTableOperation::AddColumn {
                 column_keyword: *column_keyword,
                 if_not_exists: *if_not_exists,
@@ -979,7 +981,7 @@ fn translate_alter_table_operation(
                 // key with ALTER TABLE, so an added column is never its rowid
                 // alias.
                 column_def: translate_column_def(
-                    column_def,
+                    &withheld.release_column(column_def),
                     &alter_table.name,
                     &[],
                     schema,

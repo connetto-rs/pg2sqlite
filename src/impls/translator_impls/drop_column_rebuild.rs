@@ -672,6 +672,11 @@ pub(crate) fn declared_attachments(
 /// the message of the check stopping the rebuild where foreign keys did not
 /// turn off.
 ///
+/// A `NOT NULL` or check `created` declares and `previous` does not, as when
+/// a column the acting role could not read becomes readable, stops the
+/// rebuild on a named `CHECK` failure while a stored row breaks it. Whoever
+/// filled the table clears or refills such rows first.
+///
 /// # Errors
 ///
 /// Returns the refusal for a statement this module writes that does not
@@ -698,6 +703,21 @@ pub(crate) fn rebuild_rows(
              INSERT INTO temp.pg2sqlite_foreign_keys_off SELECT foreign_keys FROM \
              pragma_foreign_keys; \
              DROP TABLE temp.pg2sqlite_foreign_keys_off;"
+        ))?);
+    }
+    if let Some((columns, broken)) = brought_back(previous, created) {
+        let message = format!(
+            "rebuilding {table} brings back the NOT NULL or CHECK constraints of {columns}, \
+             which a stored row breaks. Clear or refill those rows first.",
+            table = last_ident_value_or_display(target),
+        )
+        .replace('"', "\"\"");
+        statements.extend(sqlite(&format!(
+            "CREATE TEMP TABLE pg2sqlite_brought_back (broken INTEGER CONSTRAINT \"{message}\" \
+             CHECK (broken = 0)); \
+             INSERT INTO temp.pg2sqlite_brought_back SELECT EXISTS (SELECT 1 FROM {target} \
+             WHERE {broken}); \
+             DROP TABLE temp.pg2sqlite_brought_back;"
         ))?);
     }
     let mut renamed = created.clone();
@@ -748,6 +768,69 @@ pub(crate) fn rebuild_rows(
         statements.extend(sqlite("PRAGMA foreign_keys = 1;")?);
     }
     Ok(statements)
+}
+
+/// The columns `created` holds to a `NOT NULL` or a check `previous` does
+/// not declare, in their order, with the condition a row breaking one of
+/// them meets. A column only `created` declares holds no stored row, so a
+/// check reading one is left to the copy.
+fn brought_back(previous: &CreateTable, created: &CreateTable) -> Option<(String, String)> {
+    let held =
+        |column: &Ident| previous.columns.iter().any(|kept| same_identifier(&kept.name, column));
+    let previous_checks: Vec<&Expr> = checks(previous).collect();
+    let new_checks: Vec<&Expr> = checks(created)
+        .filter(|check| !previous_checks.contains(check))
+        .filter(|check| {
+            created
+                .columns
+                .iter()
+                .all(|column| held(&column.name) || !reads_column(check, &column.name))
+        })
+        .collect();
+    let mut columns = Vec::new();
+    let mut broken = Vec::new();
+    for column in created.columns.iter().filter(|column| held(&column.name)) {
+        let nulled = not_null(created, &column.name) && !not_null(previous, &column.name);
+        if nulled {
+            broken.push(format!("{} IS NULL", column.name));
+        }
+        if nulled || new_checks.iter().any(|check| reads_column(check, &column.name)) {
+            columns.push(column.name.value.as_str());
+        }
+    }
+    if columns.is_empty() {
+        return None;
+    }
+    broken.extend(new_checks.iter().map(|check| format!("NOT ({check})")));
+    Some((columns.join(", "), broken.join(" OR ")))
+}
+
+/// The check conditions of `table`, on its columns and on the table.
+fn checks(table: &CreateTable) -> impl Iterator<Item = &Expr> {
+    let declared = table.columns.iter().flat_map(|column| &column.options).filter_map(|option| {
+        match &option.option {
+            ColumnOption::Check(check) => Some(check.expr.as_ref()),
+            _ => None,
+        }
+    });
+    let constrained = table.constraints.iter().filter_map(|constraint| {
+        match constraint {
+            TableConstraint::Check(check) => Some(check.expr.as_ref()),
+            _ => None,
+        }
+    });
+    declared.chain(constrained)
+}
+
+/// Whether `table` declares `column` `NOT NULL`.
+fn not_null(table: &CreateTable, column: &Ident) -> bool {
+    table.columns.iter().any(|held| {
+        same_identifier(&held.name, column)
+            && held.options.iter().any(|option| matches!(option.option, ColumnOption::NotNull))
+    }) || table.constraints.iter().any(|constraint| {
+        matches!(constraint, TableConstraint::NotNull(declared)
+            if same_identifier(&declared.column, column))
+    })
 }
 
 /// Strips `table`, the name `create` takes after the rebuild, from the column
