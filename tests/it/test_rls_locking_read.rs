@@ -48,6 +48,8 @@ const SCHEMA: &str = "
     CREATE VIEW invoker_docs WITH (security_invoker = true) AS SELECT id, dept FROM docs;
     CREATE VIEW nested_docs WITH (security_invoker = true) AS
         SELECT id FROM (SELECT id, dept FROM docs) AS d;
+    CREATE VIEW fenced_docs WITH (security_invoker = true, security_barrier = true) AS
+        SELECT id, owner_id FROM docs WHERE EXISTS (SELECT 1 FROM other WHERE other.doc = docs.id);
 ";
 
 #[derive(QueryableByName)]
@@ -174,6 +176,16 @@ fn a_lock_keeps_a_column_alias_list() {
 fn a_lock_reaches_the_tables_a_security_invoker_view_reads() {
     assert_eq!(ids("SELECT id FROM invoker_docs ORDER BY id"), [1, 2, 3]);
     assert_eq!(ids("SELECT id FROM invoker_docs ORDER BY id FOR UPDATE"), [1, 2]);
+}
+
+/// Row 2 passes both policies of a lock, so only the view's condition keeps
+/// it from the caller's `abs`, which overflows on its owner.
+#[test]
+fn a_lock_through_a_security_barrier_view_tests_the_view_condition_first() {
+    let query = "SELECT id FROM fenced_docs
+                 WHERE abs(-9223372036854775807 - (owner_id - 8)) > 0 ORDER BY id";
+    assert_eq!(ids(query), [1, 3]);
+    assert_eq!(ids(&format!("{query} FOR UPDATE")), [1]);
 }
 
 #[test]

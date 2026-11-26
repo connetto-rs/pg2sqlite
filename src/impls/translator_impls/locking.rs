@@ -274,12 +274,13 @@ pub(crate) fn locked_factor(
             }
         },
     ));
-    if columns.is_empty() {
-        let rows = view.definition().translate_with_warnings(schema, &body, emit)?;
-        return Ok(Some(derived(rows, reference)));
-    }
-    let renamed = TableAlias { explicit: true, name: reference, columns, at: None };
-    renamed_derived_factor::<Forward>(view.definition(), &renamed, schema, &body, emit).map(Some)
+    let factor = if columns.is_empty() {
+        derived(view.definition().translate_with_warnings(schema, &body, emit)?, reference)
+    } else {
+        let renamed = TableAlias { explicit: true, name: reference, columns, at: None };
+        renamed_derived_factor::<Forward>(view.definition(), &renamed, schema, &body, emit)?
+    };
+    Ok(Some(if view.is_security_barrier() { fenced_factor(factor) } else { factor }))
 }
 
 /// `(<rows>) AS <reference>`.
@@ -289,5 +290,21 @@ fn derived(rows: Query, reference: Ident) -> TableFactor {
         subquery: Box::new(rows),
         alias: Some(TableAlias { explicit: true, name: reference, columns: Vec::new(), at: None }),
         sample: None,
+    }
+}
+
+/// `factor`, a derived table, reading its rows behind
+/// [`fenced`](super::cte::fenced), as a security barrier view's body reads.
+fn fenced_factor(factor: TableFactor) -> TableFactor {
+    match factor {
+        TableFactor::Derived { lateral, subquery, alias, sample } => {
+            TableFactor::Derived {
+                lateral,
+                subquery: Box::new(super::cte::fenced(*subquery)),
+                alias,
+                sample,
+            }
+        }
+        other => other,
     }
 }

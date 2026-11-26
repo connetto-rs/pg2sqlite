@@ -5,12 +5,14 @@ use core::ops::ControlFlow;
 
 use sql_traits::structs::{ColumnScope, ParserDB, QueryOutput};
 use sqlparser::ast::{
-    Ident, ObjectName, ObjectNamePart, Query, SetExpr, Statement, TableAlias, TableAliasColumnDef,
-    TableFactor, Visit, VisitMut, Visitor, VisitorMut, With,
+    Cte, CteAsMaterialized, Ident, ObjectName, ObjectNamePart, Query, SelectItem, SetExpr,
+    Statement, TableAlias, TableAliasColumnDef, TableFactor, Visit, VisitMut, Visitor, VisitorMut,
+    WildcardAdditionalOptions, With, helpers::attached_token::AttachedToken,
 };
 
 use crate::impls::{
     object_name::last_ident,
+    query_builder::{make_query, make_simple_select, plain_table_with_joins},
     relation_scope::{RelationScopes, scope_visit_hooks},
 };
 #[cfg(not(feature = "std"))]
@@ -73,6 +75,31 @@ pub(super) fn preserve_bindings(query: &Query) -> Cow<'_, Query> {
 /// around `query` captures none of its references.
 pub(crate) fn unused_cte_name(query: &Query) -> String {
     Names::of(query).fresh(&mut 0)
+}
+
+/// `query` behind a materialized CTE, the optimization fence SQLite neither
+/// flattens into the query reading it nor pushes that query's conditions
+/// into, so `query`'s own conditions reject a row before any condition around
+/// it reads the row.
+pub(super) fn fenced(query: Query) -> Query {
+    let name = Ident::new(unused_cte_name(&query));
+    let rows = make_simple_select(
+        vec![SelectItem::Wildcard(WildcardAdditionalOptions::default())],
+        vec![plain_table_with_joins(ObjectName::from(vec![name.clone()]))],
+        None,
+    );
+    let with = With {
+        with_token: AttachedToken::empty(),
+        recursive: false,
+        cte_tables: vec![Cte {
+            alias: TableAlias { explicit: false, name, columns: Vec::new(), at: None },
+            query: Box::new(query),
+            from: None,
+            materialized: Some(CteAsMaterialized::Materialized),
+            closing_paren_token: AttachedToken::empty(),
+        }],
+    };
+    make_query(Some(with), SetExpr::Select(Box::new(rows)))
 }
 
 struct Captures {
