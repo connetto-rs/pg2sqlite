@@ -844,6 +844,11 @@ impl TriggerSlots {
                 || self.frames.contains_key(slot)
         });
         if previous.is_none() && !reshaped {
+            for statement in emitted.iter_mut() {
+                if let Statement::CreateTrigger(part) = statement {
+                    capture_keys(part, schema, context)?;
+                }
+            }
             if plain {
                 for slot in affected {
                     if let Some(part) = own_part(emitted, slot.event) {
@@ -1000,7 +1005,7 @@ impl TriggerSlots {
                 };
                 parts.extend(part.map(|part| (member, part)));
             }
-            let created = match parts.len() {
+            let mut created = match parts.len() {
                 0 => continue,
                 1 => {
                     let (member, mut part) = parts.remove(0);
@@ -1009,6 +1014,7 @@ impl TriggerSlots {
                 }
                 _ => merge(&slot, parts, schema)?,
             };
+            capture_keys(&mut created, schema, context)?;
             self.names.insert(slot, created.name.clone());
             statements.push(Statement::CreateTrigger(created));
         }
@@ -1078,6 +1084,8 @@ impl TriggerSlots {
                 Event::Insert => TriggerEvent::Insert,
                 _ => TriggerEvent::Update(Vec::new()),
             },
+            schema,
+            context,
         )?;
         let twins = created
             .iter()
@@ -1095,6 +1103,27 @@ impl TriggerSlots {
         statements.extend(created);
         Ok((statements, twins))
     }
+}
+
+/// Records a written row before an unframed body can change its identity.
+fn capture_keys(
+    trigger: &mut CreateTrigger,
+    schema: &ParserDB,
+    context: &TranslationContext<'_>,
+) -> Result<(), Error> {
+    if trigger.period == Some(TriggerPeriod::After)
+        && let Some(event) = trigger.events.first()
+        && let Some(ConditionalStatements::BeginEnd(body)) = &mut trigger.statements
+    {
+        let captures = super::hidden_referenced_rows::body_statement_keys::record(
+            &trigger.table_name,
+            event,
+            schema,
+            context,
+        )?;
+        body.statements.splice(0..0, captures);
+    }
+    Ok(())
 }
 
 fn drop_trigger(name: ObjectName) -> Statement {

@@ -272,6 +272,8 @@ impl Frame {
         self,
         name: ObjectName,
         event: TriggerEvent,
+        schema: &sql_traits::structs::ParserDB,
+        context: &crate::options::TranslationContext<'_>,
     ) -> Result<Vec<Statement>, Error> {
         let Self { table, mut maintainers, assigned, mut members, delivery } = self;
         if let Some(delivery) = &delivery {
@@ -338,6 +340,11 @@ impl Frame {
                 .enumerate()
                 .map(|(position, column)| snapshot(&records, &target, column, position)),
         );
+        let mut key_events = super::hidden_referenced_rows::body_statement_keys::record(
+            &target, &event, schema, context,
+        )?;
+        read_written(&mut key_events, &records, &assigned);
+        statements.extend(key_events);
         for member in &mut members {
             read_written(&mut member.part.condition, &records, &assigned);
             read_written(&mut member.part.statements, &records, &assigned);
@@ -356,14 +363,12 @@ impl Frame {
         for (member, run) in members.into_iter().zip(runs) {
             statements.extend(run_guarded(body(member.part), run.as_ref())?);
         }
-        statements.push(ast_builder::delete(
-            records.clone(),
-            Some(equals(identifier(FRAME), frame_id(&records))),
-        ));
-        statements.push(ast_builder::delete(
-            records.clone(),
-            Some(equals(identifier("id"), frame_id(&records))),
-        ));
+        for column in [FRAME, "id"] {
+            statements.push(ast_builder::delete(
+                records.clone(),
+                Some(equals(identifier(column), frame_id(&records))),
+            ));
+        }
 
         // A maintenance write is an UPDATE, so only an UPDATE frame skips one.
         let skip_maintained = matches!(event, TriggerEvent::Update(_));

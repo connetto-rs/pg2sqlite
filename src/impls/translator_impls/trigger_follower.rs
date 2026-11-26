@@ -79,6 +79,8 @@ struct Touched {
     /// How it can change which tables' row-level security exempts a role,
     /// which decides whether a `SECURITY DEFINER` body runs as its owner.
     exemptions: Option<Exemptions>,
+    /// A migration that can change body checks or recording prefixes.
+    body_keys: bool,
 }
 
 /// What an event can change about which tables' row-level security exempts a
@@ -225,6 +227,9 @@ impl Touched {
         (before, after): (&ParserDB, &ParserDB),
         (bodies, reached): (&mut ReadBodies, &mut Reached),
     ) -> Result<bool, Error> {
+        if self.body_keys {
+            return Ok(true);
+        }
         let table = folded(&trigger.table_name);
         let gated = trigger
             .events
@@ -415,10 +420,17 @@ impl TriggerFollower {
         event: &Statement,
         before: &ParserDB,
         after: &ParserDB,
+        checks_body_keys: bool,
         translate_seeded: &mut Translate<'_>,
         translate_after: &mut Translate<'_>,
     ) -> Result<Vec<Reemission>, Error> {
-        let Some(touched) = Touched::of(event) else { return Ok(Vec::new()) };
+        let Some(mut touched) = Touched::of(event) else { return Ok(Vec::new()) };
+        touched.body_keys = checks_body_keys
+            && [before, after].into_iter().any(|schema| {
+                schema
+                    .tables()
+                    .any(|table| super::table_shape::foreign_keys(table).next().is_some())
+            });
         let dropped: BTreeSet<TableKey> = match event {
             Statement::Drop {
                 object_type: ObjectType::Table | ObjectType::View, names, ..

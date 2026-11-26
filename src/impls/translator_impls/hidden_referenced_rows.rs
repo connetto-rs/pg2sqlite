@@ -94,6 +94,8 @@ use crate::{
     warnings::{TranslationWarning, WarningSink},
 };
 
+pub(crate) mod body_statement_keys;
+
 type ForeignKey = <ParserDB as DatabaseLike>::ForeignKey;
 
 /// What every object keeping a referenced side carries in its name.
@@ -605,6 +607,7 @@ pub(crate) fn declared(
     for key in &keys[skipped..] {
         statements.extend(referenced_side(key, written, schema, options, None, emit)?);
     }
+    statements.extend(body_statement_keys::declared(table, added, schema, options)?);
     Ok(statements)
 }
 
@@ -644,7 +647,7 @@ fn referenced_side(
     }
     let parent_backed =
         hides || names_table_with_backing(schema, &key.constraint.foreign_table, options)?;
-    let parts = Parts::of(key, written, parent_backed, options, rename)?;
+    let parts = Parts::of(key, written, written, parent_backed, options, rename)?;
     let refusal = |sqlstate, setting| {
         format!(
             "{}update or delete on table \"{}\" violates {setting}foreign key constraint \"{}\" on \
@@ -925,6 +928,7 @@ pub(crate) fn dropped(
             drops.extend(key.drops());
         }
     }
+    drops.extend(body_statement_keys::dropped(table, columns, written, options)?);
     Ok(drops)
 }
 
@@ -954,6 +958,9 @@ pub(crate) fn moved(
         drops.extend(key.drops());
         creates.extend(referenced_side(&key, written, schema, options, Some(rename), &mut |_| {})?);
     }
+    let (capture_drops, capture_creates) = body_statement_keys::moved(rename, schema, options)?;
+    drops.extend(capture_drops);
+    creates.extend(capture_creates);
     Ok((drops, creates))
 }
 
@@ -978,6 +985,7 @@ pub(crate) fn triggers_on(
             }
         }
     }
+    triggers.extend(body_statement_keys::triggers_on(owner, schema, options)?);
     Ok(triggers)
 }
 
@@ -1001,6 +1009,7 @@ impl Parts {
     fn of(
         key: &Key<'_>,
         written: &ParserDB,
+        replica: &ParserDB,
         parent_backed: bool,
         options: &TranslationContext<'_>,
         rename: Option<Rename<'_>>,
@@ -1008,7 +1017,7 @@ impl Parts {
         let table = &key.table.name;
         let mut referencing =
             renamed(&normalize_schema_qualified_object_name_for_sqlite(written, table)?, rename);
-        if names_table_with_backing(written, table, options)? {
+        if names_table_with_backing(replica, table, options)? {
             referencing = append_suffix(&referencing, options.get_rls_table_suffix());
         }
         let mut referenced_name = renamed(

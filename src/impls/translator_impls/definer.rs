@@ -40,8 +40,9 @@ use sql_traits::{
 };
 use sqlparser::ast::{
     BinaryOperator, CreateFunction, CreateRole, CreateTable, DataType, Expr, FunctionReturnType,
-    FunctionSecurity, Ident, InTarget, ObjectName, ObjectNamePart, RoleKeyword, Statement,
-    TriggerEvent, visit_expressions, visit_relations, visit_relations_mut,
+    FunctionSecurity, Ident, InTarget, ObjectName, ObjectNamePart, RoleKeyword, SelectItem,
+    SetExpr, SqliteTableOption, Statement, TriggerEvent, visit_expressions, visit_relations,
+    visit_relations_mut,
 };
 
 use super::{
@@ -54,10 +55,12 @@ use crate::{
     errors::Error,
     impls::{
         ast_builder, batch_cache,
-        function_helpers::{simple_function_expr, string_literal},
+        function_helpers::{integer_literal, simple_function_expr, string_literal},
         object_name::{append_suffix, resolve_translation_table},
         privileges::{RoleTable, has_backing_table},
-        query_builder::{from_relation, plain_table_factor, single_expr_query},
+        query_builder::{
+            from_relation, make_query, make_simple_select, plain_table_factor, single_expr_query,
+        },
         session_variable,
         translator_impls::off_replica::row_write,
     },
@@ -80,6 +83,12 @@ pub(crate) const TRUNCATION: &str = "pg_truncate";
 /// its table's owner is undeclared, reserved as [`KEY_ACTION`] is. The
 /// trigger runs as a superuser, past every guard.
 pub(crate) const KEY_ACTION_OWNER: &str = "pg_key_action_owner";
+
+/// A body statement whose foreign key events are being recorded.
+pub(crate) const BODY_STATEMENT: &str = "pg_body_statement";
+
+/// A body statement whose enclosing condition did not hold.
+pub(crate) const BODY_STATEMENT_SKIPPED: &str = "pg_body_statement_skipped";
 
 type Role = <ParserDB as DatabaseLike>::Role;
 
@@ -256,16 +265,18 @@ pub(crate) fn action_owned_tables<'s>(
 /// `CREATE TABLE IF NOT EXISTS` for [`STACK`], which a translation needs
 /// whenever one of its statements reads or writes it.
 pub(crate) fn stack_table() -> Statement {
-    ast_builder::create_table(
-        stack_name(),
-        vec![
-            super::rls::generated_key_column(),
-            super::rls::generated_text_column(
-                "owner",
-                super::rls::non_empty_at_most("owner", super::rls::NAME_LENGTH),
-            ),
-        ],
-    )
+    let mut table = ast_builder::blank_create_table(stack_name());
+    table.columns = vec![
+        super::rls::generated_key_column(),
+        super::rls::generated_text_column(
+            "owner",
+            super::rls::non_empty_at_most("owner", super::rls::NAME_LENGTH),
+        ),
+    ];
+    table.if_not_exists = true;
+    table.sqlite_table_options.options =
+        vec![SqliteTableOption::Strict, SqliteTableOption::WithoutRowid];
+    Statement::CreateTable(table)
 }
 
 /// Whether `statement` reads or writes [`STACK`].
@@ -447,11 +458,7 @@ pub(crate) fn as_key_action(statements: Vec<Statement>) -> Vec<Statement> {
 /// which takes the condition of the `IF` a trigger body runs it in.
 pub(crate) fn as_truncation(statements: Vec<Statement>) -> Vec<Statement> {
     let mut framed = Vec::with_capacity(statements.len() + 2);
-    framed.push(ast_builder::insert(
-        stack_name(),
-        vec![ObjectName(vec![ObjectNamePart::Identifier(Ident::new("owner"))])],
-        single_expr_query(string_literal(TRUNCATION), Vec::new(), None),
-    ));
+    framed.push(push(TRUNCATION, None));
     framed.extend(statements);
     framed.push(pop(None));
     framed
@@ -573,14 +580,14 @@ pub(crate) fn returns_trigger(function: &CreateFunction) -> bool {
 
 /// The filter that selects the frame of the innermost running definer body,
 /// `id = (SELECT max(id) FROM <stack>)`.
-fn innermost_frame() -> Expr {
+fn innermost_frame(selection: Option<Expr>) -> Expr {
     Expr::BinaryOp {
         left: Box::new(Expr::Identifier(Ident::new("id"))),
         op: BinaryOperator::Eq,
         right: Box::new(Expr::Subquery(Box::new(single_expr_query(
             simple_function_expr("max", vec![Expr::Identifier(Ident::new("id"))], None),
             from_relation(plain_table_factor(stack_name())),
-            None,
+            selection,
         )))),
     }
 }
@@ -611,7 +618,15 @@ fn innermost_among(owners: &[&str], negated: bool) -> Expr {
             Expr::Value(sqlparser::ast::Value::Number("1".to_string(), false).into()),
             from_relation(plain_table_factor(stack_name())),
             Some(Expr::BinaryOp {
-                left: Box::new(innermost_frame()),
+                left: Box::new(innermost_frame(Some(Expr::In {
+                    expr: Box::new(Expr::Identifier(Ident::new("owner"))),
+                    target: InTarget::List(vec![
+                        string_literal(BODY_STATEMENT),
+                        string_literal(BODY_STATEMENT_SKIPPED),
+                    ]),
+                    negated: true,
+                    global: false,
+                }))),
                 op: BinaryOperator::And,
                 right: Box::new(listed),
             }),
@@ -896,20 +911,64 @@ fn ignores_the_write(statement: &Statement) -> bool {
     .is_break()
 }
 
+/// Pushes the active or skipped frame of one body statement.
+pub(crate) fn push_body_statement(condition: Option<Expr>) -> Statement {
+    let owner = condition.map_or_else(
+        || string_literal(BODY_STATEMENT),
+        |condition| {
+            crate::impls::expr_helpers::case_when(
+                condition,
+                string_literal(BODY_STATEMENT),
+                Some(string_literal(BODY_STATEMENT_SKIPPED)),
+            )
+        },
+    );
+    push_frame(owner, None)
+}
+
+/// Pops the frame of the completed or skipped body statement.
+pub(crate) fn pop_body_statement() -> Statement {
+    pop(None)
+}
+
 fn push(owner: &str, guard: Option<&Expr>) -> Statement {
-    let source = match guard {
-        Some(guard) => single_expr_query(string_literal(owner), Vec::new(), Some(guard.clone())),
-        None => ast_builder::values(vec![vec![string_literal(owner)]]),
-    };
+    push_frame(string_literal(owner), guard)
+}
+
+/// Allocates and pushes a frame without changing `last_insert_rowid()`.
+fn push_frame(owner: Expr, guard: Option<&Expr>) -> Statement {
+    let next = Expr::Subquery(Box::new(single_expr_query(
+        Expr::BinaryOp {
+            left: Box::new(simple_function_expr(
+                "coalesce",
+                vec![
+                    simple_function_expr("max", vec![Expr::Identifier(Ident::new("id"))], None),
+                    integer_literal(0),
+                ],
+                None,
+            )),
+            op: BinaryOperator::Plus,
+            right: Box::new(integer_literal(1)),
+        },
+        from_relation(plain_table_factor(stack_name())),
+        None,
+    )));
     ast_builder::insert(
         stack_name(),
-        vec![ObjectName(vec![ObjectNamePart::Identifier(Ident::new("owner"))])],
-        source,
+        ["id", "owner"].into_iter().map(|name| ObjectName::from(vec![Ident::new(name)])).collect(),
+        make_query(
+            None,
+            SetExpr::Select(Box::new(make_simple_select(
+                vec![SelectItem::UnnamedExpr(next), SelectItem::UnnamedExpr(owner)],
+                Vec::new(),
+                guard.cloned(),
+            ))),
+        ),
     )
 }
 
 fn pop(guard: Option<&Expr>) -> Statement {
-    let innermost = innermost_frame();
+    let innermost = innermost_frame(None);
     let selection = match guard {
         Some(guard) => {
             Expr::BinaryOp {

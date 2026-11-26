@@ -441,6 +441,11 @@ fn generated_artifact_label(statement: &Statement) -> &'static str {
         {
             "a generated marker table"
         }
+        Statement::CreateTable(create)
+            if super::translator_impls::hidden_referenced_rows::body_statement_keys::is_capture_table(&create.name) =>
+        {
+            "a generated body-statement key table"
+        }
         Statement::CreateTable(_) => "a generated backing table",
         Statement::CreateIndex(_) => "a generated NULLS NOT DISTINCT index",
         _ => "a generated statement",
