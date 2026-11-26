@@ -4,7 +4,7 @@
 use diesel::{connection::SimpleConnection, prelude::*, sqlite::SqliteConnection};
 use pg2sqlite::{
     errors::Error,
-    prelude::{Pg2Sqlite, Pg2SqliteOptions},
+    prelude::{Pg2Sqlite, Pg2SqliteOptions, postgres_error},
 };
 use sqlstate::pg;
 
@@ -211,5 +211,70 @@ fn a_definer_body_whose_owner_lacks_truncate_is_refused() {
         Some(pg2sqlite::prelude::GuardRefusal::Privilege { table: "t" }),
         "{refused}"
     );
+    assert_eq!(t::table.count().get_result::<i64>(&mut connection), Ok(1));
+}
+
+/// `notes`, whose insert of a row with `id` 2 runs `TRUNCATE t` in a
+/// `security` trigger body owned by `cleaner`, over `t` and `c` seeded by
+/// `keyed`, `app` holding `app_grant` on `t` and `cleaner` every privilege.
+fn body_replica(security: &str, app_grant: &str) -> SqliteConnection {
+    let pg = format!(
+        "{}
+         CREATE ROLE cleaner;
+         CREATE TABLE notes (id INT PRIMARY KEY);
+         CREATE FUNCTION clear_t() RETURNS trigger
+         LANGUAGE plpgsql {security} SET search_path = '' AS $$
+         BEGIN
+           IF NEW.id = 2 THEN
+             TRUNCATE public.t;
+           END IF;
+           RETURN NULL;
+         END
+         $$;
+         ALTER FUNCTION clear_t() OWNER TO cleaner;
+         CREATE TRIGGER notes_clear AFTER INSERT ON notes
+           FOR EACH ROW EXECUTE FUNCTION clear_t();
+         GRANT SELECT, INSERT ON notes TO app;
+         REVOKE ALL ON t FROM app;
+         GRANT {app_grant} ON t TO app;
+         GRANT ALL ON t, c TO cleaner;",
+        keyed("")
+    );
+    let (triggers, base): (Vec<_>, Vec<_>) = translated(&pg)
+        .unwrap_or_else(|error| panic!("PostgreSQL loads the body: {error}"))
+        .into_iter()
+        .partition(|statement| statement.starts_with("CREATE TRIGGER"));
+    let mut connection = SqliteConnection::establish(":memory:").expect("open an in-memory SQLite");
+    for statement in base.iter().chain(&triggers) {
+        connection.batch_execute(statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
+    }
+    connection
+}
+
+/// The SQLSTATE the insert of a note with `id` aborts with, `None` when it
+/// succeeds.
+fn note_refusal(connection: &mut SqliteConnection, id: i32) -> Option<sqlstate::SqlState> {
+    let error =
+        diesel::insert_into(notes::table).values(notes::id.eq(id)).execute(connection).err()?;
+    let error = error.to_string();
+    let refused = postgres_error(&error).unwrap_or_else(|| panic!("no PostgreSQL error: {error}"));
+    Some(refused.sqlstate())
+}
+
+#[test]
+fn a_body_truncating_a_referenced_table_raises_where_it_runs() {
+    for security in ["SECURITY INVOKER", "SECURITY DEFINER"] {
+        let mut connection = body_replica(security, "ALL");
+        assert_eq!(note_refusal(&mut connection, 1), None, "{security}");
+        assert_eq!(note_refusal(&mut connection, 2), Some(pg::FEATURE_NOT_SUPPORTED), "{security}");
+        assert_eq!(t::table.count().get_result::<i64>(&mut connection), Ok(1), "{security}");
+    }
+}
+
+#[test]
+fn an_invoker_body_truncating_without_the_privilege_raises_where_it_runs() {
+    let mut connection = body_replica("SECURITY INVOKER", "SELECT, DELETE");
+    assert_eq!(note_refusal(&mut connection, 1), None);
+    assert_eq!(note_refusal(&mut connection, 2), Some(pg::INSUFFICIENT_PRIVILEGE));
     assert_eq!(t::table.count().get_result::<i64>(&mut connection), Ok(1));
 }

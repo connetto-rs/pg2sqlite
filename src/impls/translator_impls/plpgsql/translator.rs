@@ -43,7 +43,7 @@ use crate::{
             from_relation, make_query, make_simple_select, plain_table_factor, single_expr_query,
         },
         shared_helpers::{minor_unit_scale, scale_decimal_literal, scale_of},
-        translator_impls::condition_injection::inject_condition_into_dml_statement,
+        translator_impls::{condition_injection::inject_condition_into_dml_statement, statement},
     },
     options::BoundVariable,
     traits::translator::TranslatorWithContext,
@@ -630,9 +630,19 @@ impl PlPgSqlTranslator {
                 translated
             }
             other => {
-                let mut translated = other.translate_with_warnings(schema, options, emit)?;
-                // `TRUNCATE` becomes a `DELETE`, which must stay inside its
-                // `IF`.
+                let mut translated = match other {
+                    // PostgreSQL refuses such a `TRUNCATE` only when a run
+                    // reaches it, so the refusal raises there.
+                    Statement::Truncate(truncate) => {
+                        match statement::truncation(truncate, schema, options, emit)? {
+                            Ok(deletes) => deletes,
+                            Err(refusal) => vec![refusal.raise()],
+                        }
+                    }
+                    other => other.translate_with_warnings(schema, options, emit)?,
+                };
+                // `TRUNCATE` becomes `DELETE`s or a refusal, which must stay
+                // inside its `IF`.
                 if let Some(condition) = scope.current_condition() {
                     for t_stmt in &mut translated {
                         Self::inject_condition_into_statement(t_stmt, &condition)?;
