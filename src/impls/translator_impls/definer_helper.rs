@@ -931,7 +931,7 @@ impl<'db> Lowering<'_, 'db> {
             conditions.extend(time_bounds(&name, joined.time_bounds()));
         }
         match grant.granted_to() {
-            GrantedTo::Request(comparison) => conditions.push(request(comparison)),
+            GrantedTo::Request(comparisons) => conditions.extend(comparisons.iter().map(request)),
             GrantedTo::Set(grantees) => {
                 let set = self.called_set(grantees.function(), grantees.arguments());
                 conditions
