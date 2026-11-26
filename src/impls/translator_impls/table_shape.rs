@@ -171,10 +171,12 @@ fn renamed(
 /// The tables a run of statements can change the replica shape of.
 #[derive(Default)]
 pub(crate) struct Touched {
-    /// A change to a role, which every table's grants and policies read.
+    /// A change to a role, which every table's grants and policies read, or
+    /// to a function, which every guard reads through the owners of the
+    /// definer bodies it lets through.
     every: bool,
-    /// A change to a function a policy may inline, or a drop cascading to
-    /// policies, which every table under row-level security reads.
+    /// A drop cascading to policies, which every table under row-level
+    /// security reads.
     policy_reads: bool,
     /// The tables, folded, whose grants, policies, row security, owner or
     /// columns change.
@@ -184,10 +186,10 @@ pub(crate) struct Touched {
     replaced: Vec<String>,
     /// The tables the run renames, folded as before it, with the name after.
     renamed: Vec<(String, ObjectName)>,
-    /// A change to a trigger, a table owner, a table's name or a function,
-    /// which can move whom the triggers a foreign key action fires run as, and
-    /// so which keys SQLite keeps and every guard's list of roles. The batch's
-    /// trigger catalog names a renamed table as the batch leaves it.
+    /// A change to a trigger, a table owner or a table's name, which can move
+    /// whom the triggers a foreign key action fires run as, and so which keys
+    /// SQLite keeps and every guard's list of roles. The batch's trigger
+    /// catalog names a renamed table as the batch leaves it.
     action_runners: bool,
 }
 
@@ -243,13 +245,10 @@ impl Touched {
             Statement::GrantRole(_)
             | Statement::RevokeRole(_)
             | Statement::AlterRole { .. }
-            | Statement::Drop { object_type: ObjectType::Role, .. } => self.every = true,
-            Statement::CreateFunction(_)
+            | Statement::Drop { object_type: ObjectType::Role, .. }
+            | Statement::CreateFunction(_)
             | Statement::AlterFunction(_)
-            | Statement::DropFunction(_) => {
-                self.policy_reads = true;
-                self.action_runners = true;
-            }
+            | Statement::DropFunction(_) => self.every = true,
             Statement::CreateTrigger(_) | Statement::DropTrigger(_) => self.action_runners = true,
             Statement::CreateTable(create) => self.replace(&create.name),
             Statement::Drop {
