@@ -380,6 +380,8 @@ pub struct TranslationContext<'a> {
     /// The schema as the statement being translated was written, which names
     /// a wildcard's columns before a later column change in its epoch.
     written_schema: Option<&'a ParserDB>,
+    /// The foreign keys and row identities currently installed in the replica.
+    body_key_schema: Option<&'a ParserDB>,
     /// What the batch emitted before the statement being translated, which a
     /// table rebuild recreates indexes and triggers from.
     history: Option<StatementHistory<'a>>,
@@ -466,6 +468,7 @@ struct ContextFields<'a> {
     schema_is_complete: bool,
     subqueries_allowed: bool,
     written_schema: Option<&'a ParserDB>,
+    body_key_schema: Option<&'a ParserDB>,
     history: Option<StatementHistory<'a>>,
     running_as: Option<&'a Role>,
     inlined_body: Option<&'a InlinedBody<'a>>,
@@ -488,6 +491,7 @@ impl<'a> ContextFields<'a> {
             schema_is_complete: context.schema_is_complete,
             subqueries_allowed: context.subqueries_allowed,
             written_schema: context.written_schema,
+            body_key_schema: context.body_key_schema,
             history: context.history,
             running_as: context.running_as,
             inlined_body: context.inlined_body,
@@ -518,6 +522,7 @@ impl<'a> ContextFields<'a> {
             schema_is_complete: self.schema_is_complete,
             subqueries_allowed: self.subqueries_allowed,
             written_schema: self.written_schema,
+            body_key_schema: self.body_key_schema,
             history: self.history,
             running_as: self.running_as,
             inlined_body: self.inlined_body,
@@ -547,6 +552,7 @@ impl<'a> TranslationContext<'a> {
             schema_is_complete: false,
             subqueries_allowed: true,
             written_schema: None,
+            body_key_schema: None,
             history: None,
             running_as: None,
             inlined_body: None,
@@ -577,6 +583,7 @@ impl<'a> TranslationContext<'a> {
             schema_is_complete: false,
             subqueries_allowed: true,
             written_schema: None,
+            body_key_schema: None,
             history: None,
             running_as: None,
             inlined_body: None,
@@ -734,6 +741,24 @@ impl<'a> TranslationContext<'a> {
         self.written_schema
     }
 
+    /// Uses `schema` for body-statement key events during a replica reshape.
+    pub(crate) fn with_body_key_schema<'s>(
+        &'s self,
+        schema: &'s ParserDB,
+    ) -> TranslationContext<'s> {
+        let mut fields = ContextFields::borrowed(self);
+        fields.body_key_schema = Some(schema);
+        fields.into_context(self.scope, self.outer)
+    }
+
+    /// The currently installed keys, otherwise the statement's written schema.
+    pub(crate) const fn body_key_schema(&self) -> Option<&ParserDB> {
+        match self.body_key_schema {
+            Some(schema) => Some(schema),
+            None => self.written_schema,
+        }
+    }
+
     /// Derives a context translating a statement of the batch after the
     /// statements `history` follows.
     pub(crate) fn with_history<'s>(
@@ -803,6 +828,7 @@ impl<'a> TranslationContext<'a> {
             schema_is_complete: self.schema_is_complete,
             subqueries_allowed: self.subqueries_allowed,
             written_schema: None,
+            body_key_schema: self.body_key_schema,
             history: None,
             running_as: self.running_as,
             inlined_body: self.inlined_body,
@@ -1273,15 +1299,16 @@ impl<'a> TranslationContext<'a> {
         fields.into_context(self.scope, self.outer)
     }
 
+    pub(crate) fn live_table_triggers(&self) -> &[TableTrigger] {
+        self.trigger_catalog.unwrap_or(&self.catalogs.table_triggers)
+    }
+
     pub(crate) fn table_triggers<'s>(
         &'s self,
         table: &'s sqlparser::ast::CreateTable,
     ) -> impl Iterator<Item = &'s TableTrigger> {
         let key = TableKey::from(table);
-        self.trigger_catalog
-            .unwrap_or(&self.catalogs.table_triggers)
-            .iter()
-            .filter(move |trigger| trigger.table == key)
+        self.live_table_triggers().iter().filter(move |trigger| trigger.table == key)
     }
 
     /// The name of a trigger `table` carries that fires on an event `fires`

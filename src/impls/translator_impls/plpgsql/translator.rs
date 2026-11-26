@@ -590,7 +590,13 @@ impl PlPgSqlTranslator {
         options: &crate::options::TranslationContext<'_>,
         emit: crate::warnings::WarningSink<'_>,
     ) -> Result<Vec<Statement>, Error> {
-        let translated = match stmt {
+        let condition = scope.current_condition();
+        let checks = if writes(stmt) && !matches!(stmt, Statement::Truncate(_)) {
+            super::super::hidden_referenced_rows::body_statement_keys::checks(schema, options)?
+        } else {
+            Vec::new()
+        };
+        let mut translated = match stmt {
             Statement::Insert(insert) => {
                 Self::translate_insert_statement(insert, scope, schema, options, emit)?
             }
@@ -663,6 +669,11 @@ impl PlPgSqlTranslator {
                 translated
             }
         };
+        if !checks.is_empty() {
+            translated.insert(0, definer::push_body_statement(condition));
+            translated.extend(checks);
+            translated.push(definer::pop_body_statement());
+        }
         Self::after_write(stmt, scope, schema);
         Ok(translated)
     }

@@ -50,9 +50,19 @@ use crate::{
     warnings::{TranslationWarning, WarningSink},
 };
 
+#[derive(Clone, Copy)]
+pub(crate) enum ReplicaSide {
+    Held,
+    Target,
+}
+
 /// Translates a statement against a schema, answering what it emits and the
 /// warnings it raises.
-pub(crate) type Translate<'t> = dyn FnMut(&Statement, &ParserDB) -> Result<(Vec<Statement>, Vec<TranslationWarning>), Error>
+pub(crate) type Translate<'t> = dyn FnMut(
+        &Statement,
+        &ParserDB,
+        ReplicaSide,
+    ) -> Result<(Vec<Statement>, Vec<TranslationWarning>), Error>
     + 't;
 
 /// One table whose translation differs between the two schemas.
@@ -112,6 +122,13 @@ fn drop_of(created: &Statement) -> Result<Statement, Error> {
                 table_name: None,
                 option: None,
             }))
+        }
+        Statement::CreateTable(table)
+            if super::hidden_referenced_rows::body_statement_keys::is_capture_table(
+                &table.name,
+            ) =>
+        {
+            Ok(object(ObjectType::Table, &table.name))
         }
         Statement::CreateVirtualTable { name, .. } => Ok(object(ObjectType::Table, name)),
         _ => Err(irrevocable(created)),
@@ -191,6 +208,8 @@ pub(crate) struct Touched {
     /// SQLite keeps and every guard's list of roles. The batch's trigger
     /// catalog names a renamed table as the batch leaves it.
     action_runners: bool,
+    /// A migration that can change capture storage used by writing bodies.
+    body_keys: bool,
 }
 
 impl Touched {
@@ -203,7 +222,20 @@ impl Touched {
         touched
     }
 
+    pub(crate) fn triggers_changed(&mut self) {
+        self.action_runners = true;
+        self.body_keys = true;
+    }
+
     fn follow(&mut self, statement: &Statement) {
+        self.body_keys |= matches!(
+            statement,
+            Statement::CreateTable(_)
+                | Statement::AlterTable(_)
+                | Statement::CreateTrigger(_)
+                | Statement::DropTrigger(_)
+                | Statement::Drop { object_type: ObjectType::Table, .. }
+        );
         match statement {
             Statement::AlterTable(alter) => {
                 for operation in &alter.operations {
@@ -315,8 +347,12 @@ impl Touched {
         &self,
         (before, after): (&'s ParserDB, &ParserDB),
     ) -> Result<Vec<(&'s CreateTable, Option<&ObjectName>)>, Error> {
+        let body_keys = self.body_keys
+            && [before, after]
+                .into_iter()
+                .any(|schema| schema.tables().any(|table| foreign_keys(table).next().is_some()));
         let candidates = || {
-            before.tables().filter(|table| !table.temporary).filter_map(|table| {
+            before.tables().filter(|table| !table.temporary || body_keys).filter_map(|table| {
                 let name = fold(&table.name);
                 match self.renamed.iter().find(|(from, _)| *from == name) {
                     Some((_, to)) => Some((table, Some(to))),
@@ -338,6 +374,7 @@ impl Touched {
         let mut direct = Vec::new();
         for (table, renamed_to) in candidates() {
             if self.every
+                || body_keys
                 || runners_move
                 || renamed_to.is_some()
                 || self.named.contains(&fold(&table.name))
@@ -359,7 +396,7 @@ impl Touched {
 }
 
 /// The foreign keys `table` declares.
-fn foreign_keys(table: &CreateTable) -> impl Iterator<Item = &ForeignKeyConstraint> {
+pub(super) fn foreign_keys(table: &CreateTable) -> impl Iterator<Item = &ForeignKeyConstraint> {
     let inline = table.columns.iter().flat_map(|column| &column.options).filter_map(|option| {
         match &option.option {
             ColumnOption::ForeignKey(key) => Some(key),
@@ -399,8 +436,9 @@ fn change<'s>(
         *last = to.clone();
     }
     let Some(declared) = resolve_declared_table(after, &target)? else { return Ok(None) };
-    let (was, _) = translate(&Statement::CreateTable(source), before)?;
-    let (now, warnings) = translate(&Statement::CreateTable(target), after)?;
+    let (was, held_warnings) =
+        translate(&Statement::CreateTable(source), before, ReplicaSide::Held)?;
+    let (now, warnings) = translate(&Statement::CreateTable(target), after, ReplicaSide::Target)?;
     let ((mut was, held), (now, generated)) = (split(was), split(now));
     let gone: Vec<String> = boundary.iter().flat_map(dropped_names).collect();
     let held: Vec<Statement> = held
@@ -415,6 +453,26 @@ fn change<'s>(
             };
             !removed
         })
+        .map(|mut statement| {
+            if let Statement::CreateTable(table) = &mut statement
+                && super::hidden_referenced_rows::body_statement_keys::is_capture_table(&table.name)
+            {
+                for boundary in boundary {
+                    let Statement::AlterTable(alteration) = boundary else { continue };
+                    if fold(&alteration.name) != fold(&table.name) {
+                        continue;
+                    }
+                    for operation in &alteration.operations {
+                        if let AlterTableOperation::RenameTable { table_name } = operation {
+                            let (RenameTableNameKind::As(name) | RenameTableNameKind::To(name)) =
+                                table_name;
+                            table.name = name.clone();
+                        }
+                    }
+                }
+            }
+            statement
+        })
         .chain(boundary.iter().filter(|statement| generated.contains(statement)).cloned())
         .collect();
     let mut renamed_from = None;
@@ -428,7 +486,7 @@ fn change<'s>(
     if was == now && held == generated {
         return Ok(None);
     }
-    for warning in warnings {
+    for warning in warnings.into_iter().filter(|warning| !held_warnings.contains(warning)) {
         emit(warning);
     }
     let dropped: Vec<Statement> =

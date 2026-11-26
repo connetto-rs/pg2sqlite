@@ -25,6 +25,7 @@ mod test_at_time_zone;
 mod test_attached_derived_overlay;
 mod test_attached_tables;
 mod test_bind_once_operands;
+mod test_body_statement_keys;
 mod test_boolean_cast;
 mod test_boolean_helper_calls;
 mod test_boolean_to_text;
