@@ -7,7 +7,8 @@
 //! each column it reads, and on some column of a table it reads only the rows
 //! of. Columns are resolved through the scopes of the statement, so a name a
 //! table does not carry, a PL/pgSQL variable or a field of `NEW`, needs
-//! nothing.
+//! nothing, and neither does a column a view passes through, whose table
+//! PostgreSQL reads as the view's owner.
 
 use alloc::collections::BTreeSet;
 
@@ -58,7 +59,7 @@ pub(crate) fn unheld_table<'s>(
     role: &Role,
     schema: &'s ParserDB,
 ) -> Result<Option<&'s Table>, Error> {
-    let mut needs = Needs { schema, tables: Vec::new(), ctes: Vec::new() };
+    let mut needs = Needs { schema, tables: Vec::new(), named: Vec::new(), ctes: Vec::new() };
     match checked {
         Checked::Statement(statement) => needs.statement(statement)?,
         Checked::Query(query) => needs.root(query)?,
@@ -106,6 +107,8 @@ struct Needs<'s> {
     schema: &'s ParserDB,
     /// Each table needing something, in the order the statement names it.
     tables: Vec<(&'s Table, TableNeed)>,
+    /// The tables the statement names, which alone its column reads reach.
+    named: Vec<&'s Table>,
     /// The common table expressions each enclosing query defines, innermost
     /// last, whose names hide the tables they spell.
     ctes: Vec<Vec<String>>,
@@ -309,8 +312,11 @@ impl<'s> Needs<'s> {
     ) -> Result<(), Error> {
         match factor {
             TableFactor::Table { name, .. } => {
-                if !written && let Some(table) = self.table(name)? {
-                    self.need(table).select_any = true;
+                if let Some(table) = self.table(name)? {
+                    self.named.push(table);
+                    if !written {
+                        self.need(table).select_any = true;
+                    }
                 }
                 Ok(())
             }
@@ -398,7 +404,7 @@ impl<'s> Needs<'s> {
             Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
                 if let Ok(Some(ColumnDefinition::Base { table, column, .. })) = resolve(expr)
                     && let Some(table) =
-                        self.schema.tables().find(|stored| core::ptr::eq(*stored, table))
+                        self.named.iter().copied().find(|named| core::ptr::eq(*named, table))
                 {
                     self.need(table).select.insert(column.column_name().to_lowercase());
                 }

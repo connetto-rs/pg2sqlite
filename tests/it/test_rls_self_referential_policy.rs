@@ -368,13 +368,12 @@ fn a_view_over_an_ordinary_table_is_untouched() {
     );
 }
 
-/// Any other view option stays refused, so honouring `security_invoker` did
-/// not open the clause up in general.
+/// A view option the replica has no counterpart for stays refused.
 #[test]
 fn another_view_option_is_still_refused() {
     let error = refusal(
         "CREATE TABLE plain (id INTEGER PRIMARY KEY, v TEXT);
-         CREATE VIEW plain_all WITH (check_option = cascaded) AS SELECT id, v FROM plain;",
+         CREATE VIEW plain_all WITH (security_barrier = true) AS SELECT id, v FROM plain;",
     );
-    assert!(error.contains("VIEW options"), "{error}");
+    assert!(error.contains("VIEW option"), "{error}");
 }

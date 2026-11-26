@@ -155,6 +155,7 @@ fn append_translated_create_trigger_statements(
         )?);
         return Ok(());
     }
+    statements.extend(super::view_triggers::superseded(create_trigger, schema)?);
     for (maybe_drop_trigger, translated_trigger) in
         create_trigger.translate_with_warnings(schema, options, emit)?
     {
@@ -318,7 +319,8 @@ fn reject_unsupported_statement(statement: &Statement, reason: &str) -> Error {
 }
 
 /// Emits a view definition, preceded by `DROP VIEW IF EXISTS` when it replaces
-/// one, since SQLite has no `CREATE OR REPLACE VIEW`.
+/// one, since SQLite has no `CREATE OR REPLACE VIEW`, and followed by the
+/// triggers writing through it.
 fn translate_view_definition(
     create_view: &CreateView,
     schema: &ParserDB,
@@ -330,7 +332,15 @@ fn translate_view_definition(
         statements
             .push(ast_builder::drop_view(sqlite_unqualified_object_name(&create_view.name), true));
     }
-    statements.push(create_view.translate_with_warnings(schema, options, emit)?.into());
+    let translated = create_view.translate_with_warnings(schema, options, emit)?;
+    let triggers = match super::create_view::declared_view(schema, create_view)? {
+        Some(view) => {
+            super::view_triggers::view_triggers(view, &translated.name, schema, options, emit)?
+        }
+        None => Vec::new(),
+    };
+    statements.push(translated.into());
+    statements.extend(triggers);
     Ok(statements)
 }
 

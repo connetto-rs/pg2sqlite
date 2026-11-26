@@ -296,3 +296,46 @@ fn the_invoker_trigger_a_definer_fires_holds_the_owners_privileges() {
     let refusal = refused.to_string();
     assert_eq!(guard_refusal(&refusal), Some(GuardRefusal::Privilege { table: "audit_trail" }));
 }
+
+diesel::table! {
+    /// The rows the acting role marks seen.
+    seen (id) {
+        /// Primary key.
+        id -> Integer,
+    }
+}
+
+/// A definer body reading a view needs `SELECT` on the view alone, since
+/// PostgreSQL reads the table under it as the view's owner.
+#[test]
+fn a_definer_reading_a_view_needs_nothing_on_the_table_under_it() {
+    let script = "CREATE ROLE app;
+         CREATE ROLE viewer;
+         CREATE ROLE runner;
+         CREATE TABLE items (id INT PRIMARY KEY);
+         CREATE TABLE seen (id INT PRIMARY KEY);
+         GRANT SELECT ON items TO app, viewer;
+         CREATE VIEW item_ids AS SELECT id FROM items;
+         ALTER VIEW item_ids OWNER TO viewer;
+         GRANT SELECT ON item_ids TO runner;
+         GRANT SELECT, INSERT ON seen TO app;
+         CREATE FUNCTION note_seen() RETURNS trigger
+         LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+         BEGIN
+           PERFORM id FROM public.item_ids WHERE id = NEW.id;
+           RETURN NULL;
+         END
+         $$;
+         ALTER FUNCTION note_seen() OWNER TO runner;
+         CREATE TRIGGER seen_noted AFTER INSERT ON seen
+           FOR EACH ROW EXECUTE FUNCTION note_seen();";
+    let options = Pg2SqliteOptions::default()
+        .with_deployment(Deployment::new("app", ["app"], []).expect("a valid deployment"))
+        .with_acting_role("app")
+        .with_rls_audit_table_name("rls_audit");
+    let mut connection = helpers::apply_with_options(script, &options).expect("the script applies");
+    diesel::insert_into(seen::table)
+        .values(seen::id.eq(1))
+        .execute(&mut connection)
+        .expect("the insert runs");
+}

@@ -323,11 +323,13 @@ pub(crate) fn exempts(table: &CreateTable, owner: &Role, schema: &ParserDB) -> b
 /// role to its privileges.
 struct RunningOwners<'s> {
     /// The owners of the schema's definer trigger functions and PL/pgSQL
-    /// helpers, and the declared owners the triggers a foreign key action
-    /// fires run as, each named once.
+    /// helpers, the declared owners the triggers a foreign key action fires
+    /// run as, and the owners a write through an updatable view runs as,
+    /// each named once.
     roles: Vec<&'s Role>,
     /// Whether a foreign key action fires the triggers of a table whose owner
-    /// is undeclared, which run as [`KEY_ACTION_OWNER`].
+    /// is undeclared, or a write runs through a view whose owner is, either
+    /// running as [`KEY_ACTION_OWNER`].
     superuser: bool,
 }
 
@@ -355,7 +357,10 @@ fn running_owners<'s>(
             add(owner);
         }
     }
-    let mut superuser = false;
+    let (view_owners, mut superuser) = super::view_triggers::view_owners(schema, options)?;
+    for owner in view_owners {
+        add(owner);
+    }
     for (_, owner) in action_owned_tables(schema, options)? {
         match owner {
             ActionOwner::Declared(owner) => add(owner),
@@ -668,8 +673,29 @@ pub(crate) fn run_as_owner(
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
 ) -> Result<Vec<Statement>, Error> {
-    let refusal = |table: &CreateTable| binding_refusal(function, table, owner);
-    let (statements, guarded) = backed(owner, statements, &refusal, schema, options)?;
+    run_as(
+        owner,
+        statements,
+        &|table: &CreateTable| binding_refusal(function, table, owner),
+        schema,
+        options,
+    )
+}
+
+/// Rewrites translated `statements` that run as `owner`, as
+/// [`run_as_owner`] does for a definer body.
+///
+/// # Errors
+///
+/// Refuses with `refusal` of a table whose policies bind `owner`.
+pub(crate) fn run_as(
+    owner: &Role,
+    statements: Vec<Statement>,
+    refusal: &dyn Fn(&CreateTable) -> String,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<Vec<Statement>, Error> {
+    let (statements, guarded) = backed(owner, statements, refusal, schema, options)?;
     Ok(framed(owner, statements, guarded, None))
 }
 
