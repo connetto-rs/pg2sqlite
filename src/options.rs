@@ -264,6 +264,11 @@ pub(crate) struct PrewalkCatalogs {
     /// far, which a write left off the replica with its table reads to find
     /// one PostgreSQL fires for it.
     table_triggers: Vec<TableTrigger>,
+    /// The triggers each table carries once the batch's statements have run,
+    /// which decide how a foreign key action writing the table runs and whom
+    /// the triggers it fires run as, since SQLite fixes a key's actions with
+    /// its table.
+    batch_triggers: Vec<TableTrigger>,
     /// The deferred constraint triggers the translation unit creates.
     deferred_triggers: Vec<crate::impls::translator_impls::deferred_constraint::DeferredTrigger>,
     /// The request's zone, resolved the first time an operation needs it.
@@ -280,16 +285,18 @@ pub(crate) struct PrewalkCatalogs {
 }
 
 /// A trigger on a table or a view.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct TableTrigger {
     /// The trigger's name as written.
     pub(crate) name: String,
     /// The table's or view's identity.
-    table: TableKey,
+    pub(crate) table: TableKey,
     /// The events the trigger fires on.
     pub(crate) events: Vec<sqlparser::ast::TriggerEvent>,
     pub(crate) period: Option<sqlparser::ast::TriggerPeriod>,
     pub(crate) row_level: bool,
+    /// The function the trigger runs.
+    pub(crate) function: Option<sqlparser::ast::ObjectName>,
 }
 
 #[derive(Clone, Copy)]
@@ -387,6 +394,9 @@ pub struct TranslationContext<'a> {
     /// give it, which `NEW` and `OLD` read whole.
     trigger_rows: Option<TriggerRows<'a>>,
     trigger_catalog: Option<&'a [TableTrigger]>,
+    /// The triggers each table carries as the schema the statement translates
+    /// against was declared, in place of those the batch leaves.
+    batch_trigger_catalog: Option<&'a [TableTrigger]>,
     /// The addresses of the `FROM` items of the query being translated that
     /// a row-locking clause covers, which PostgreSQL filters by the `UPDATE`
     /// policies as well. Only a node of that query matches one, so a context
@@ -461,6 +471,7 @@ struct ContextFields<'a> {
     inlined_body: Option<&'a InlinedBody<'a>>,
     trigger_rows: Option<TriggerRows<'a>>,
     trigger_catalog: Option<&'a [TableTrigger]>,
+    batch_trigger_catalog: Option<&'a [TableTrigger]>,
     locked: &'a [usize],
     locks_whole_query: bool,
     declaration: Option<Declaration<'a>>,
@@ -482,6 +493,7 @@ impl<'a> ContextFields<'a> {
             inlined_body: context.inlined_body,
             trigger_rows: context.trigger_rows,
             trigger_catalog: context.trigger_catalog,
+            batch_trigger_catalog: context.batch_trigger_catalog,
             locked: context.locked,
             locks_whole_query: context.locks_whole_query,
             declaration: context.declaration,
@@ -511,6 +523,7 @@ impl<'a> ContextFields<'a> {
             inlined_body: self.inlined_body,
             trigger_rows: self.trigger_rows,
             trigger_catalog: self.trigger_catalog,
+            batch_trigger_catalog: self.batch_trigger_catalog,
             locked: self.locked,
             locks_whole_query: self.locks_whole_query,
             declaration: self.declaration,
@@ -539,6 +552,7 @@ impl<'a> TranslationContext<'a> {
             inlined_body: None,
             trigger_rows: None,
             trigger_catalog: None,
+            batch_trigger_catalog: None,
             locked: &[],
             locks_whole_query: false,
             declaration: None,
@@ -568,6 +582,7 @@ impl<'a> TranslationContext<'a> {
             inlined_body: None,
             trigger_rows: None,
             trigger_catalog: None,
+            batch_trigger_catalog: None,
             locked: &[],
             locks_whole_query: false,
             declaration: None,
@@ -793,6 +808,7 @@ impl<'a> TranslationContext<'a> {
             inlined_body: self.inlined_body,
             trigger_rows: None,
             trigger_catalog: None,
+            batch_trigger_catalog: self.batch_trigger_catalog,
             locked: &[],
             locks_whole_query: false,
             declaration: None,
@@ -1205,80 +1221,47 @@ impl<'a> TranslationContext<'a> {
     /// Follows the triggers `statement` creates, drops, or carries to a
     /// renamed table, and forgets those of a dropped table.
     pub(crate) fn follow_triggers(&mut self, statement: &sqlparser::ast::Statement) {
-        use sqlparser::ast::{AlterTableOperation, ObjectType, RenameTableNameKind, Statement};
-
-        use crate::impls::object_name::last_ident_value_or_display;
-
-        match statement {
-            Statement::CreateTrigger(trigger) => self.register_table_trigger(trigger),
-            Statement::DropTrigger(drop) => {
-                let name = last_ident_value_or_display(&drop.trigger_name);
-                let table = drop.table_name.as_ref().map(table_key);
-                self.catalogs.to_mut().table_triggers.retain(|kept| {
-                    !kept.name.eq_ignore_ascii_case(&name)
-                        || table.as_ref().is_some_and(|table| *table != kept.table)
-                });
-            }
-            Statement::Drop { object_type: ObjectType::Table, names, .. } => {
-                let dropped: Vec<TableKey> = names.iter().map(table_key).collect();
-                self.catalogs.to_mut().table_triggers.retain(|kept| !dropped.contains(&kept.table));
-            }
-            Statement::AlterTable(alter_table) => {
-                for operation in &alter_table.operations {
-                    let AlterTableOperation::RenameTable {
-                        table_name:
-                            RenameTableNameKind::As(renamed) | RenameTableNameKind::To(renamed),
-                    } = operation
-                    else {
-                        continue;
-                    };
-                    let from = table_key(&alter_table.name);
-                    let mut to = table_key(renamed);
-                    if renamed.0.len() == 1 {
-                        to.temporary = from.temporary;
-                    }
-                    for kept in &mut self.catalogs.to_mut().table_triggers {
-                        if kept.table == from {
-                            kept.table.clone_from(&to);
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn register_table_trigger(&mut self, trigger: &sqlparser::ast::CreateTrigger) {
-        use crate::impls::object_name::last_ident_value_or_display;
-        let name = last_ident_value_or_display(&trigger.name);
-        let table = table_key(&trigger.table_name);
-        let triggers = &mut self.catalogs.to_mut().table_triggers;
-        triggers.retain(|kept| kept.table != table || !kept.name.eq_ignore_ascii_case(&name));
-        triggers.push(TableTrigger {
-            name,
-            table,
-            events: trigger.events.clone(),
-            period: trigger.period,
-            row_level: matches!(
-                trigger.trigger_object,
-                Some(
-                    sqlparser::ast::TriggerObjectKind::For(sqlparser::ast::TriggerObject::Row)
-                        | sqlparser::ast::TriggerObjectKind::ForEach(
-                            sqlparser::ast::TriggerObject::Row
-                        )
-                )
-            ),
-        });
+        follow_table_triggers(&mut self.catalogs.to_mut().table_triggers, statement);
     }
 
     pub(crate) fn seed_table_triggers(&mut self, schema: Option<&ParserDB>) -> Vec<TableTrigger> {
         use sql_traits::traits::DatabaseLike;
         if let Some(schema) = schema {
             for trigger in schema.triggers() {
-                self.register_table_trigger(trigger);
+                register_table_trigger(&mut self.catalogs.to_mut().table_triggers, trigger);
             }
         }
         self.catalogs.table_triggers.clone()
+    }
+
+    /// Records the triggers each table carries once `statements`, the batch,
+    /// have run on top of `seeded`, those of the schema it starts from.
+    pub(crate) fn settle_batch_triggers(
+        &mut self,
+        statements: &[sqlparser::ast::Statement],
+        seeded: &[TableTrigger],
+    ) {
+        let mut triggers = seeded.to_vec();
+        for statement in statements {
+            follow_table_triggers(&mut triggers, statement);
+        }
+        self.catalogs.to_mut().batch_triggers = triggers;
+    }
+
+    /// The triggers each table carries once the batch has run, or as the
+    /// schema it starts from holds them in a translation against that schema.
+    pub(crate) fn batch_triggers(&self) -> &[TableTrigger] {
+        self.batch_trigger_catalog.unwrap_or(&self.catalogs.batch_triggers)
+    }
+
+    /// The same context reading `triggers` as the triggers the batch leaves.
+    pub(crate) fn with_batch_triggers<'s>(
+        &'s self,
+        triggers: &'s [TableTrigger],
+    ) -> TranslationContext<'s> {
+        let mut fields = ContextFields::borrowed(self);
+        fields.batch_trigger_catalog = Some(triggers);
+        fields.into_context(self.scope, self.outer)
     }
 
     pub(crate) fn with_table_triggers<'s>(
@@ -1414,6 +1397,78 @@ impl core::ops::Deref for TranslationContext<'_> {
     fn deref(&self) -> &Self::Target {
         self.options.as_ref()
     }
+}
+
+/// Follows in `triggers` the triggers `statement` creates, drops, or carries
+/// to a renamed table, and forgets those of a dropped table.
+fn follow_table_triggers(triggers: &mut Vec<TableTrigger>, statement: &sqlparser::ast::Statement) {
+    use sqlparser::ast::{AlterTableOperation, ObjectType, RenameTableNameKind, Statement};
+
+    use crate::impls::object_name::last_ident_value_or_display;
+
+    match statement {
+        Statement::CreateTrigger(trigger) => register_table_trigger(triggers, trigger),
+        Statement::DropTrigger(drop) => {
+            let name = last_ident_value_or_display(&drop.trigger_name);
+            let table = drop.table_name.as_ref().map(table_key);
+            triggers.retain(|kept| {
+                !kept.name.eq_ignore_ascii_case(&name)
+                    || table.as_ref().is_some_and(|table| *table != kept.table)
+            });
+        }
+        Statement::Drop { object_type: ObjectType::Table, names, .. } => {
+            let dropped: Vec<TableKey> = names.iter().map(table_key).collect();
+            triggers.retain(|kept| !dropped.contains(&kept.table));
+        }
+        Statement::AlterTable(alter_table) => {
+            for operation in &alter_table.operations {
+                let AlterTableOperation::RenameTable {
+                    table_name: RenameTableNameKind::As(renamed) | RenameTableNameKind::To(renamed),
+                } = operation
+                else {
+                    continue;
+                };
+                let from = table_key(&alter_table.name);
+                let mut to = table_key(renamed);
+                if renamed.0.len() == 1 {
+                    to.temporary = from.temporary;
+                }
+                for kept in triggers.iter_mut() {
+                    if kept.table == from {
+                        kept.table.clone_from(&to);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Records `trigger` in `triggers`, in place of one of its name on its table.
+fn register_table_trigger(
+    triggers: &mut Vec<TableTrigger>,
+    trigger: &sqlparser::ast::CreateTrigger,
+) {
+    use crate::impls::object_name::last_ident_value_or_display;
+    let name = last_ident_value_or_display(&trigger.name);
+    let table = table_key(&trigger.table_name);
+    triggers.retain(|kept| kept.table != table || !kept.name.eq_ignore_ascii_case(&name));
+    triggers.push(TableTrigger {
+        name,
+        table,
+        events: trigger.events.clone(),
+        period: trigger.period,
+        row_level: matches!(
+            trigger.trigger_object,
+            Some(
+                sqlparser::ast::TriggerObjectKind::For(sqlparser::ast::TriggerObject::Row)
+                    | sqlparser::ast::TriggerObjectKind::ForEach(
+                        sqlparser::ast::TriggerObject::Row
+                    )
+            )
+        ),
+        function: trigger.exec_body.as_ref().map(|body| body.func_desc.name.clone()),
+    });
 }
 
 /// The scope over one declared table's columns, `None` when the table does

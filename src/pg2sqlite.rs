@@ -705,14 +705,15 @@ impl Trackers {
     /// two reach, followed, with the schema `applied` held and the tables
     /// whose shape changes, `applied` then holding `shape`. A shape is a
     /// schema with the end of the statements it holds. `boundary` is what the
-    /// statement ending the epoch emitted. Absent when `applied` already
-    /// holds `shape`.
+    /// statement ending the epoch emitted. `seeded` holds the triggers of the
+    /// schema the batch starts from, which the tables of that schema
+    /// translate with. Absent when `applied` already holds `shape`.
     fn reshape<'a, 's: 'a>(
         &mut self,
         applied: &mut Option<(&'s ParserDB, usize)>,
         (shape, shape_end): (&'s ParserDB, usize),
         (statements, boundary): (&[Statement], &[Statement]),
-        at: Position<'a, '_>,
+        (at, seeded): (Position<'a, '_>, Option<&[crate::options::TableTrigger]>),
         emit: crate::warnings::WarningSink<'_>,
     ) -> Result<Option<Reshaped<'s>>, crate::errors::Error> {
         let Some((before, held_end)) =
@@ -721,6 +722,9 @@ impl Trackers {
             return Ok(None);
         };
         let at = Position { schema: shape, ..at };
+        let seeded_context = seeded
+            .filter(|_| held_end == 0)
+            .map(|triggers| at.context.with_batch_triggers(triggers));
         let (mut reshaped, tables) = {
             let written = at.context.with_history(StatementHistory {
                 attachments: &self.attachments,
@@ -733,9 +737,13 @@ impl Trackers {
                 &written,
                 &mut |statement, schema| {
                     let mut warnings = Vec::new();
+                    let context = seeded_context
+                        .as_ref()
+                        .filter(|_| core::ptr::eq(schema, before))
+                        .unwrap_or(at.context);
                     let translated = self.translate(
                         statement,
-                        Position { schema, binding: schema, ..at },
+                        Position { schema, binding: schema, context, ..at },
                         &mut |warning| warnings.push(warning),
                     )?;
                     Ok((translated, warnings))
@@ -814,8 +822,9 @@ fn translate_followed(
     follower: &mut TriggerFollower,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<(Vec<Statement>, bool), crate::errors::Error> {
-    let seeded_context =
-        at.context.with_table_triggers(initial.map_or(&[], |(_, triggers)| triggers));
+    let seeded_triggers = initial.map_or(&[][..], |(_, triggers)| triggers);
+    let seeded_tables = at.context.with_table_triggers(seeded_triggers);
+    let seeded_context = seeded_tables.with_batch_triggers(seeded_triggers);
     let reemissions = match sides {
         Some((before, after)) if !follower.is_empty() => {
             let seeded = initial.map_or(before, |(initial, _)| {
@@ -892,8 +901,14 @@ fn reshape_followed<'a, 's: 'a>(
     initial: Option<(&ParserDB, &[crate::options::TableTrigger])>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Vec<Statement>, crate::errors::Error> {
-    let Some((mut emitted, held, tables)) =
-        trackers.reshape(applied, shape, (statements, boundary), at, &mut *emit)?
+    let seeded_triggers = initial.map(|(_, triggers)| triggers);
+    let Some((mut emitted, held, tables)) = trackers.reshape(
+        applied,
+        shape,
+        (statements, boundary),
+        (at, seeded_triggers),
+        &mut *emit,
+    )?
     else {
         return Ok(Vec::new());
     };
@@ -902,8 +917,9 @@ fn reshape_followed<'a, 's: 'a>(
     }
     let before = Position { schema: held, binding: held, ..at };
     let after = Position { schema: shape.0, binding: shape.0, ..at };
-    let seeded_context =
-        at.context.with_table_triggers(initial.map_or(&[], |(_, triggers)| triggers));
+    let seeded_triggers = seeded_triggers.unwrap_or(&[]);
+    let seeded_tables = at.context.with_table_triggers(seeded_triggers);
+    let seeded_context = seeded_tables.with_batch_triggers(seeded_triggers);
     let seeded = initial.map_or(before, |(initial, _)| {
         Position { schema: initial, binding: initial, context: &seeded_context, ..before }
     });
@@ -1812,6 +1828,7 @@ impl Pg2Sqlite {
         };
         let mut follower = TriggerFollower::seeded(initial_schema);
         let initial_triggers = context.seed_table_triggers(initial_schema);
+        context.settle_batch_triggers(statements, &initial_triggers);
         let outline = crate::history::transactions::Outline::new(statements, dispositions);
 
         let mut warnings = Vec::new();

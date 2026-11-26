@@ -592,7 +592,7 @@ fn append_deny_triggers(
     let condition = super::definer::unless_running(
         write_guard_condition_expr(None, options),
         &super::definer::and_system_frames(
-            super::definer::definer_owners(schema),
+            super::definer::definer_owners(schema, options)?,
             table,
             schema,
             options,

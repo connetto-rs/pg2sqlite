@@ -653,7 +653,7 @@ impl PlPgSqlTranslator {
                         && translated.first().is_some_and(definer::uses_stack);
                     for (index, t_stmt) in translated.iter_mut().enumerate() {
                         let condition = if framed && index > 0 {
-                            definer::running_owner(definer::TRUNCATION)
+                            definer::running_among(&[definer::TRUNCATION])
                         } else {
                             condition.clone()
                         };

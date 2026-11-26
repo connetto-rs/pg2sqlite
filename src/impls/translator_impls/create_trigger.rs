@@ -361,12 +361,13 @@ struct TriggerPart<'a> {
 ///
 /// `table_name` is the table the trigger was created on, which `NEW`, `OLD`
 /// and `TG_TABLE_NAME` read also where the replica emits the trigger on its
-/// backing table. `refusal` is what keeps the trigger from being a maintenance
-/// trigger, which the refusal of an assignment to `NEW` in the body names.
+/// backing table, and `table` that table as the schema holds it. `refusal`
+/// is what keeps the trigger from being a maintenance trigger, which the
+/// refusal of an assignment to `NEW` in the body names.
 fn generate_standard_trigger_body(
     exec_body: &sqlparser::ast::TriggerExecBody,
     part: &TriggerPart<'_>,
-    table_name: &sqlparser::ast::ObjectName,
+    (table_name, table): (&sqlparser::ast::ObjectName, Option<&sqlparser::ast::CreateTable>),
     refusal: Option<&MaintenanceRefusal>,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
@@ -407,11 +408,34 @@ fn generate_standard_trigger_body(
             super::definer::run_as_owner(function, owner, translated, schema, options)?;
         return Ok(Some(begin_end(statements, part)));
     }
-    // An invoker body a definer body's write fires runs as that body's owner.
-    let firing_owners =
-        super::definer::owners_reaching(&super::trigger_slots::folded(table_name), schema)?;
-    let names: Vec<&str> = firing_owners.iter().map(|owner| owner.name()).collect();
-    let acting_guard = and_guards(part.guard, super::definer::outside_owners(&names));
+    // An invoker body a definer body's write fires runs as that body's owner,
+    // and one a foreign key action fires as the owner of the table it writes.
+    // Each owner's variant runs while one of its frames is innermost, its own
+    // or the key action's, so it still runs once it pushes its owner.
+    let superuser = super::definer::key_action_superuser();
+    let mut firing_owners: Vec<(Vec<&str>, &<ParserDB as DatabaseLike>::Role)> =
+        super::definer::owners_reaching(
+            &super::trigger_slots::folded(table_name),
+            schema,
+            &superuser,
+            options,
+        )?
+        .into_iter()
+        .map(|owner| (vec![owner.name()], owner))
+        .collect();
+    if let Some(table) = table
+        && super::hidden_referenced_rows::receives_key_actions(table, schema, options)?
+        && let Some(owner) = super::definer::action_owner(table, schema, options)?
+    {
+        let owner = owner.role(&superuser);
+        match firing_owners.iter_mut().find(|(_, listed)| listed.name() == owner.name()) {
+            Some((frames, _)) => frames.push(super::definer::KEY_ACTION),
+            None => firing_owners.push((vec![super::definer::KEY_ACTION, owner.name()], owner)),
+        }
+    }
+    let frames: Vec<&str> =
+        firing_owners.iter().flat_map(|(frames, _)| frames.iter().copied()).collect();
+    let acting_guard = and_guards(part.guard, super::definer::outside_owners(&frames));
     let mut statements = super::plpgsql::PlPgSqlTranslator::translate_body(
         &function_name.to_string(),
         body.clone(),
@@ -424,8 +448,8 @@ fn generate_standard_trigger_body(
     for statement in &mut statements {
         route_trigger_statement_writes(statement, schema, options)?;
     }
-    for owner in firing_owners {
-        let running = super::definer::running_owner(owner.name());
+    for (frames, owner) in firing_owners {
+        let running = super::definer::running_among(&frames);
         let guard = and_guards(part.guard, Some(running.clone())).unwrap_or(running);
         let running_as = options.with_running_as(owner);
         // The acting translation already reported what the body warns of.
@@ -907,7 +931,7 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
                         && matches!(period, Some(TriggerPeriod::Before)))
                     .then(|| super::reentry::record_table(&source_table_name)),
                 },
-                &normalized_source_table_name,
+                (&normalized_source_table_name, source_table),
                 maintenance_refusal.as_ref().and_then(Option::as_ref),
                 schema,
                 options,
