@@ -631,8 +631,8 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
         if self.events.iter().any(|event| matches!(event, TriggerEvent::Truncate)) {
             return Err(crate::errors::Error::forward_refusal(
                 "a TRUNCATE trigger has no SQLite equivalent, since SQLite has no TRUNCATE. \
-                 PostgreSQL TRUNCATE is translated to DELETE FROM, which fires DELETE triggers, \
-                 so add the work to a DELETE trigger if it should run on that."
+                 PostgreSQL TRUNCATE is translated to a DELETE FROM per table that, as in \
+                 PostgreSQL, fires no row trigger, so nothing on the replica can run its work."
                     .to_string(),
             ));
         }
@@ -860,6 +860,7 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
         } else {
             None
         };
+        let source_table = resolve_translation_table(schema, &source_table_name)?;
         let mut parts = Vec::with_capacity(part_events.len());
         for part_events in part_events {
             let updates = part_events.iter().any(|event| matches!(event, TriggerEvent::Update(_)));
@@ -872,6 +873,16 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
             } else {
                 (None, merge_conditions(translated_condition.clone(), maintained_write))
             };
+            // PostgreSQL fires no row trigger for the rows a TRUNCATE removes.
+            let mut truncated = false;
+            if let (true, Some(table)) = (plain, source_table) {
+                for event in &part_events {
+                    truncated =
+                        truncated || super::truncation::fires_on_truncation(event, table, schema)?;
+                }
+            }
+            let condition =
+                merge_conditions(condition, truncated.then(super::definer::outside_truncation));
             let condition = merge_conditions(delivery.clone(), condition);
             let function_body = if is_maintenance_trigger {
                 generate_maintenance_trigger_body(

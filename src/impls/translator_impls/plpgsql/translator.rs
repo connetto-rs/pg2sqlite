@@ -43,7 +43,9 @@ use crate::{
             from_relation, make_query, make_simple_select, plain_table_factor, single_expr_query,
         },
         shared_helpers::{minor_unit_scale, scale_decimal_literal, scale_of},
-        translator_impls::{condition_injection::inject_condition_into_dml_statement, statement},
+        translator_impls::{
+            condition_injection::inject_condition_into_dml_statement, definer, statement,
+        },
     },
     options::BoundVariable,
     traits::translator::TranslatorWithContext,
@@ -634,17 +636,27 @@ impl PlPgSqlTranslator {
                     // PostgreSQL refuses such a `TRUNCATE` only when a run
                     // reaches it, so the refusal raises there.
                     Statement::Truncate(truncate) => {
-                        match statement::truncation(truncate, schema, options, emit)? {
+                        match statement::truncation(truncate, schema, options, emit, true)? {
                             Ok(deletes) => deletes,
                             Err(refusal) => vec![refusal.raise()],
                         }
                     }
                     other => other.translate_with_warnings(schema, options, emit)?,
                 };
-                // `TRUNCATE` becomes `DELETE`s or a refusal, which must stay
-                // inside its `IF`.
+                // A `TRUNCATE`'s deletes and the frame around them, or its
+                // refusal, stay inside their `IF`. Only the push of the frame
+                // reads the `IF`, since the deletes can make it false. The
+                // deletes and the pop run while the frame it pushed is
+                // innermost.
                 if let Some(condition) = scope.current_condition() {
-                    for t_stmt in &mut translated {
+                    let framed = matches!(other, Statement::Truncate(_))
+                        && translated.first().is_some_and(definer::uses_stack);
+                    for (index, t_stmt) in translated.iter_mut().enumerate() {
+                        let condition = if framed && index > 0 {
+                            definer::running_owner(definer::TRUNCATION)
+                        } else {
+                            condition.clone()
+                        };
                         Self::inject_condition_into_statement(t_stmt, &condition)?;
                     }
                 }

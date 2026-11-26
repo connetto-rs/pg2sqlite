@@ -255,10 +255,14 @@ fn truncate_of_an_rls_table_empties_the_backing_table() -> Result<(), Box<dyn st
         sql_query(statement.clone()).execute(&mut conn)?;
     }
 
-    let statements =
-        Pg2Sqlite::default().sql(&format!("{ddl} TRUNCATE docs;"))?.translate(&options)?.into_vec();
-    let truncation = statements.last().expect("a statement must be emitted for TRUNCATE");
-    sql_query(truncation.to_string()).execute(&mut conn)?;
+    let schema = Pg2Sqlite::default().sql(ddl)?.build_schema()?;
+    let truncation = Pg2Sqlite::default()
+        .sql("TRUNCATE docs;")?
+        .translate_to_sql_with_schema(&schema, &options)?
+        .into_vec();
+    for statement in truncation {
+        sql_query(statement).execute(&mut conn)?;
+    }
 
     assert_eq!(
         docs_rls::table.count().get_result::<i64>(&mut conn)?,

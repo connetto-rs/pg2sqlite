@@ -19,6 +19,12 @@
 //! [`KEY_ACTION`], since PostgreSQL runs the action as the referencing
 //! table's owner and past its row-level security, and the guards of a table
 //! receiving such an action stand aside while that frame is the innermost.
+//!
+//! A `TRUNCATE` empties its tables under a frame owned by [`TRUNCATION`],
+//! since PostgreSQL checks only the `TRUNCATE` privilege and fires no row
+//! trigger. The guards of a table a role may truncate stand aside while that
+//! frame is the innermost, and a row trigger a truncation could fire holds
+//! only outside one.
 
 use alloc::collections::BTreeSet;
 use core::ops::ControlFlow;
@@ -46,7 +52,7 @@ use crate::{
         ast_builder,
         function_helpers::{simple_function_expr, string_literal},
         object_name::{append_suffix, resolve_translation_table},
-        privileges::has_backing_table,
+        privileges::{RoleTable, has_backing_table},
         query_builder::{from_relation, plain_table_factor, single_expr_query},
         translator_impls::off_replica::row_write,
     },
@@ -60,6 +66,10 @@ pub(crate) const STACK: &str = "pg2sqlite_definer_frames";
 /// The owner of the frame a running foreign key action pushes. PostgreSQL
 /// reserves the role names starting `pg_`, so no body's owner is this one.
 pub(crate) const KEY_ACTION: &str = "pg_key_action";
+
+/// The owner of the frame a running `TRUNCATE` pushes, reserved as
+/// [`KEY_ACTION`] is.
+pub(crate) const TRUNCATION: &str = "pg_truncate";
 
 type Role = <ParserDB as DatabaseLike>::Role;
 
@@ -162,13 +172,14 @@ pub(crate) fn definer_owners(schema: &ParserDB) -> Vec<&str> {
 }
 
 /// `owners`, with [`KEY_ACTION`] when a foreign key action writes `table`
-/// past its guards.
+/// past its guards, and with [`TRUNCATION`] when the acting role or the owner
+/// of a definer body a trigger runs may truncate `table`.
 ///
 /// # Errors
 ///
 /// Fails as [`receives_key_actions`](super::hidden_referenced_rows::receives_key_actions)
-/// does.
-pub(crate) fn and_key_actions<'s>(
+/// does, and refuses an acting role the schema does not declare.
+pub(crate) fn and_system_frames<'s>(
     mut owners: Vec<&'s str>,
     table: &CreateTable,
     schema: &ParserDB,
@@ -176,6 +187,13 @@ pub(crate) fn and_key_actions<'s>(
 ) -> Result<Vec<&'s str>, Error> {
     if super::hidden_referenced_rows::receives_key_actions(table, schema, options)? {
         owners.push(KEY_ACTION);
+    }
+    let mut truncates = RoleTable::acting(table, schema, options)?.truncates();
+    for owner in running_owners(schema) {
+        truncates = truncates || RoleTable::of(table, Some(owner), schema)?.truncates();
+    }
+    if truncates {
+        owners.push(TRUNCATION);
     }
     Ok(owners)
 }
@@ -188,6 +206,40 @@ pub(crate) fn as_key_action(statements: Vec<Statement>) -> Vec<Statement> {
     framed.extend(statements);
     framed.push(pop(None));
     framed
+}
+
+/// `statements`, the deletes emptying the tables of a `TRUNCATE`, run under a
+/// frame owned by [`TRUNCATION`]. The push reads its owner from a `SELECT`,
+/// which takes the condition of the `IF` a trigger body runs it in.
+pub(crate) fn as_truncation(statements: Vec<Statement>) -> Vec<Statement> {
+    let mut framed = Vec::with_capacity(statements.len() + 2);
+    framed.push(ast_builder::insert(
+        stack_name(),
+        vec![ObjectName(vec![ObjectNamePart::Identifier(Ident::new("owner"))])],
+        single_expr_query(string_literal(TRUNCATION), Vec::new(), None),
+    ));
+    framed.extend(statements);
+    framed.push(pop(None));
+    framed
+}
+
+/// The condition of a row trigger that holds outside every running
+/// `TRUNCATE`, wherever its frame is on the stack, since PostgreSQL fires no
+/// row trigger for the rows a `TRUNCATE` removes nor for the rows a key action
+/// it sets off writes.
+pub(crate) fn outside_truncation() -> Expr {
+    Expr::Exists {
+        subquery: Box::new(single_expr_query(
+            Expr::Value(sqlparser::ast::Value::Number("1".to_string(), false).into()),
+            from_relation(plain_table_factor(stack_name())),
+            Some(Expr::BinaryOp {
+                left: Box::new(Expr::Identifier(Ident::new("owner"))),
+                op: BinaryOperator::Eq,
+                right: Box::new(string_literal(TRUNCATION)),
+            }),
+        )),
+        negated: true,
+    }
 }
 
 /// The owners of the schema's definer functions whose writes can fire a

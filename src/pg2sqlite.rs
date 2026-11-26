@@ -39,6 +39,7 @@ use crate::{
             table_shape,
             trigger_follower::TriggerFollower,
             trigger_slots::{TriggerSlots, folded},
+            truncation,
         },
     },
     options::{Declaration, Pg2SqliteOptions, TranslationContext},
@@ -358,11 +359,12 @@ fn pragma_on(name: &str) -> Statement {
     }
 }
 
-/// The tables the translation creates for itself, each labelled for a name
-/// collision report: the row-security audit table when the batch is the first
-/// to carry row-level security in any of its `schemas`, a table it drops
-/// included, the definer owner stack when a statement pushes on it, and the
-/// deferred constraint check queue.
+/// The statements the translation runs ahead of its own, each labelled for a
+/// name collision report: the row-security audit table when the batch is the
+/// first to carry row-level security in any of its `schemas`, a table it drops
+/// included, the definer owner stack when a statement pushes on it, the
+/// deferred constraint check queue, and the drop of what a failed `TRUNCATE`
+/// left on the connection when a statement would trip over it.
 fn generated_prelude<'s>(
     translated: &[Vec<Statement>],
     schemas: impl Iterator<Item = &'s ParserDB>,
@@ -395,7 +397,17 @@ fn generated_prelude<'s>(
         .into_iter()
         .flatten()
         .map(|statement| ("the deferred constraint check queue", statement));
-    Ok(audit_table.into_iter().chain(definer_stack).chain(deferred_queue).collect())
+    let truncation_leftover = translated
+        .iter()
+        .flatten()
+        .any(truncation::checks_every_trigger)
+        .then(|| ("the leftover of a failed TRUNCATE", truncation::leftover_drop()));
+    Ok(truncation_leftover
+        .into_iter()
+        .chain(audit_table)
+        .chain(definer_stack)
+        .chain(deferred_queue)
+        .collect())
 }
 
 /// `PRAGMA foreign_keys = 1`, which is what makes SQLite enforce a foreign
