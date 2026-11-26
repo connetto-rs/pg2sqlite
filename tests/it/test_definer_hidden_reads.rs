@@ -531,7 +531,10 @@ fn the_report_names_why_the_proof_stopped_at_the_read() {
             "may not select its column status",
         ),
         (
-            own_run.replace("run.status <> 'open')", "run.status <> 'open' FOR UPDATE)"),
+            own_run.replace(
+                "FROM public.runs run WHERE",
+                "FROM public.runs run(id, team_id, status) WHERE",
+            ),
             "cannot be followed",
         ),
     ] {
