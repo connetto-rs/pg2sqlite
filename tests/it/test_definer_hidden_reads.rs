@@ -505,6 +505,44 @@ fn a_definer_read_no_fact_confines_is_left_to_the_server_naming_the_policy() {
 }
 
 #[test]
+fn the_report_names_why_the_proof_stopped_at_the_read() {
+    let other_run = bindings("NEW.other_run_id", COMPOSITE_RUN_KEY, TEAM, TEAM, "");
+    let own_run = bindings("NEW.run_id", COMPOSITE_RUN_KEY, TEAM, TEAM, "");
+    let runs_select =
+        format!("CREATE POLICY runs_select ON runs FOR SELECT TO app USING ({TEAM});");
+    for (pg, why) in [
+        (
+            other_run.replace(
+                &runs_select,
+                &format!(
+                    "CREATE POLICY runs_select ON runs FOR SELECT TO app USING (true);
+                     CREATE POLICY runs_team ON runs AS RESTRICTIVE FOR SELECT TO app
+                       USING ({TEAM});"
+                ),
+            ),
+            "implies the restrictive policy runs_team",
+        ),
+        (other_run.replace(&runs_select, ""), "no policy lets the acting role read a row of runs"),
+        (
+            own_run.replace(
+                "GRANT SELECT ON runs TO app, guard_owner;",
+                "GRANT SELECT (id, team_id) ON runs TO app; GRANT SELECT ON runs TO guard_owner;",
+            ),
+            "may not select its column status",
+        ),
+        (
+            own_run.replace("run.status <> 'open')", "run.status <> 'open' FOR UPDATE)"),
+            "cannot be followed",
+        ),
+    ] {
+        let left = triggers_left(&pg, &team_options());
+
+        let [(_, reason)] = left.as_slice() else { panic!("one trigger left: {left:?}\n{pg}") };
+        assert!(reason.contains(why), "{why}: {reason}");
+    }
+}
+
+#[test]
 fn a_write_policy_on_a_narrower_declared_set_confines_the_definer_read() {
     let helper = "CREATE SCHEMA authz;
          CREATE TABLE team_grants (team_id INT NOT NULL, principal_id TEXT NOT NULL,
