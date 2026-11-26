@@ -1862,26 +1862,30 @@ impl Pg2Sqlite {
         let statements = &*sources;
         epochs.iter_mut().try_for_each(PreparedEpoch::settle_key_bindings)?;
         register_pending_tables(statements, &epochs, context)?;
-        register_left_out_triggers(statements, &epochs, initial_schema.as_ref(), context);
-        populate_prewalk_catalogs(statements, &epochs, initial_schema.as_ref(), context);
-        register_deferred_key_checks(
-            initial_schema.iter().chain(epochs.iter().map(|epoch| &*epoch.schema)),
-            context,
-        )?;
+        // The translation reads again what registering the triggers left to
+        // the server proved against the same schemas.
         context.batch_cache().borrow_mut().keep_for(
             initial_schema
                 .iter()
                 .chain(schema.as_ref().ok())
                 .chain(epochs.iter().flat_map(PreparedEpoch::schemas)),
         );
-        let units = Self::translate_units(
-            statements,
-            &epochs,
-            &dispositions,
-            (initial_schema.as_ref(), schema.as_ref().ok()),
+        register_left_out_triggers(statements, &epochs, initial_schema.as_ref(), context);
+        populate_prewalk_catalogs(statements, &epochs, initial_schema.as_ref(), context);
+        let units = register_deferred_key_checks(
+            initial_schema.iter().chain(epochs.iter().map(|epoch| &*epoch.schema)),
             context,
-            should_translate,
-        );
+        )
+        .and_then(|()| {
+            Self::translate_units(
+                statements,
+                &epochs,
+                &dispositions,
+                (initial_schema.as_ref(), schema.as_ref().ok()),
+                context,
+                should_translate,
+            )
+        });
         context.batch_cache().borrow_mut().forget();
         let (mut translated, rebuilt_triggers, warnings) = units?;
         let held_views = crate::impls::translator_impls::held_views::hold_forward_views(

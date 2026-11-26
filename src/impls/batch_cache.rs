@@ -7,6 +7,7 @@ use alloc::{
 };
 
 use sql_traits::structs::ParserDB;
+use sqlparser::ast::CreateTrigger;
 
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
@@ -32,6 +33,9 @@ pub(crate) struct BatchCache {
     pub(crate) key_action_receivers: KeyActionReceivers,
     /// The captures each state of the replica keeps for body statements.
     pub(crate) body_captures: BodyCaptures,
+    /// Why the replica leaves each trigger to the server, by its confined
+    /// definer read proof.
+    pub(crate) unconfined_definer_reads: UnconfinedDefinerReads,
 }
 
 impl BatchCache {
@@ -230,6 +234,31 @@ impl BodyCaptures {
         captures: Rc<Captures>,
     ) {
         self.captures.entry(state).or_default().push((observed, batch.to_vec(), captures));
+    }
+}
+
+/// Why each trigger's confined definer read proof leaves it to the server,
+/// or `None` where the proof keeps it, by the address of the schema it was
+/// proved against and the trigger as written. Past the trigger and the
+/// schema, the proof reads only the acting role and the deployment the
+/// batch's options name.
+#[derive(Default, Clone)]
+pub(crate) struct UnconfinedDefinerReads(BTreeMap<usize, BTreeMap<CreateTrigger, Option<String>>>);
+
+impl UnconfinedDefinerReads {
+    /// What is kept for `trigger` against `schema`.
+    pub(crate) fn of(&self, schema: usize, trigger: &CreateTrigger) -> Option<&Option<String>> {
+        self.0.get(&schema)?.get(trigger)
+    }
+
+    /// Keeps `unconfined` for `trigger` against `schema`.
+    pub(crate) fn keep(
+        &mut self,
+        schema: usize,
+        trigger: &CreateTrigger,
+        unconfined: Option<String>,
+    ) {
+        self.0.entry(schema).or_default().insert(trigger.clone(), unconfined);
     }
 }
 
