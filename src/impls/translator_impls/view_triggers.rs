@@ -733,8 +733,8 @@ impl Written<'_> {
     /// writes, `None` for a view, a serial, whose rowid alias draws its value,
     /// and a column without one.
     fn default(&self, position: usize, schema: &ParserDB) -> Option<&Expr> {
-        let (WrittenRelation::Table { columns, .. } | WrittenRelation::ForeignTable { columns, .. }) =
-            &self.base
+        let (WrittenRelation::Table { columns, .. }
+        | WrittenRelation::ForeignTable { columns, .. }) = &self.base
         else {
             return None;
         };
