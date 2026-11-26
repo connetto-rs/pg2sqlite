@@ -159,6 +159,7 @@ mod test_key_action_owner;
 mod test_key_actions_into_guarded_children;
 mod test_labelled_references;
 mod test_late_table_shape;
+mod test_later_definer;
 mod test_like_escape;
 mod test_literal_forms;
 mod test_literal_scale_folding;
