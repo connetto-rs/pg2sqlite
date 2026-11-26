@@ -31,6 +31,9 @@ mod parity_definer_helpers;
 #[path = "gauntlet/parity_helper_conditions.rs"]
 mod parity_helper_conditions;
 
+#[path = "gauntlet/parity_pair_walks.rs"]
+mod parity_pair_walks;
+
 #[path = "gauntlet/parity_lateral.rs"]
 mod parity_lateral;
 
