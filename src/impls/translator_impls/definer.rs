@@ -31,7 +31,7 @@
 //! frame is the innermost, and a row trigger a truncation could fire holds
 //! only outside one.
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use core::ops::ControlFlow;
 
 use sql_traits::{
@@ -53,7 +53,7 @@ use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{
-        ast_builder,
+        ast_builder, batch_cache,
         function_helpers::{simple_function_expr, string_literal},
         object_name::{append_suffix, resolve_translation_table},
         privileges::{RoleTable, has_backing_table},
@@ -208,6 +208,9 @@ pub(crate) fn fires_on(fired: &[TriggerEvent], events: &[TriggerEvent]) -> bool 
 /// triggers it fires run as an owner other than the acting role, with that
 /// owner.
 ///
+/// Whether a table receives key actions is kept in the batch cache, since
+/// every guard of the batch asks it of every table.
+///
 /// # Errors
 ///
 /// Fails as [`action_owner`] and
@@ -217,14 +220,34 @@ pub(crate) fn action_owned_tables<'s>(
     schema: &'s ParserDB,
     options: &crate::options::TranslationContext<'_>,
 ) -> Result<Vec<(&'s CreateTable, ActionOwner<'s>)>, Error> {
+    let address = batch_cache::address(schema);
+    let triggers = options.batch_triggers();
+    let kept = options.batch_cache().borrow().key_action_receivers.of(address, triggers).cloned();
+    let mut learned = BTreeMap::new();
     let mut tables = Vec::new();
     for table in schema.tables() {
         if invoker_triggers(table, schema, options)?.is_empty() {
             continue;
         }
         let Some(owner) = action_owner(table, schema, options)? else { continue };
-        if super::hidden_referenced_rows::receives_key_actions(table, schema, options)? {
+        let key = super::trigger_slots::TableKey::from(table);
+        let cached = kept.as_ref().and_then(|kept| kept.get(&key)).copied();
+        let receives = if let Some(receives) = cached {
+            receives
+        } else {
+            let receives =
+                super::hidden_referenced_rows::receives_key_actions(table, schema, options)?;
+            learned.insert(key, receives);
+            receives
+        };
+        if receives {
             tables.push((table, owner));
+        }
+    }
+    if !learned.is_empty() {
+        let mut cache = options.batch_cache().borrow_mut();
+        if cache.holds(address) {
+            cache.key_action_receivers.keep(address, triggers, learned);
         }
     }
     Ok(tables)

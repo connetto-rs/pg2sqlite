@@ -169,19 +169,41 @@ fn acts_past_guards(
     schema: &ParserDB,
     options: &TranslationContext<'_>,
 ) -> Result<bool, Error> {
-    if options.get_server_derived_write_function().is_some()
-        || ![key.on_delete, key.on_update].into_iter().flatten().any(writes_rows)
+    if !actions_write_rows(key, options)
         || !(guards_writes(child, schema, options)?
             || fires_owned_triggers(child, key, schema, options)?)
     {
         return Ok(false);
     }
+    runs_as_triggers(&child.name, key, schema, options)
+}
+
+/// Whether the actions of `key` write rows on the replica, which leaves no
+/// write to the server's derived writes.
+fn actions_write_rows(key: &ForeignKeyConstraint, options: &TranslationContext<'_>) -> bool {
+    options.get_server_derived_write_function().is_none()
+        && [key.on_delete, key.on_update].into_iter().flatten().any(writes_rows)
+}
+
+/// Whether the replica runs the actions of `key`, which the table `child`
+/// names declares, as triggers once they write rows past the guards of
+/// `child`.
+///
+/// # Errors
+///
+/// Fails as [`hidden_rows`] does.
+fn runs_as_triggers(
+    child: &ObjectName,
+    key: &ForeignKeyConstraint,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<bool, Error> {
     if hidden_rows(&key.foreign_table, schema, options)?.is_some() {
         return Ok(true);
     }
     Ok(!options.is_foreign_keys_omitted()
         && OffReplica::of(&key.foreign_table, schema, options)?.is_none()
-        && !overlay::names_overlaid_table(schema, &child.name, options)?
+        && !overlay::names_overlaid_table(schema, child, options)?
         && !overlay::names_overlaid_table(schema, &key.foreign_table, options)?)
 }
 
@@ -464,6 +486,20 @@ impl<'s> Key<'s> {
             Some(child) => acts_past_guards(child, self.constraint, schema, options),
             None => Ok(false),
         }
+    }
+
+    /// Whether the replica could keep the key's referenced side as triggers,
+    /// whatever the referencing table's guards and triggers, which the
+    /// batch's trigger catalog no longer holds once the batch drops the
+    /// table.
+    fn could_keep_triggers(
+        &self,
+        schema: &ParserDB,
+        options: &TranslationContext<'_>,
+    ) -> Result<bool, Error> {
+        Ok(hidden_rows(&self.constraint.foreign_table, schema, options)?.is_some()
+            || (actions_write_rows(self.constraint, options)
+                && runs_as_triggers(&self.table.name, self.constraint, schema, options)?))
     }
 }
 
@@ -841,6 +877,8 @@ pub(crate) fn deferred_checks(
 /// The statements dropping what keeps the referenced side of the keys of
 /// `table`, as `written` holds it, every key's or, given `columns`, those of
 /// the keys reading one of them, which PostgreSQL drops with the column.
+/// Without `columns` the batch drops the table, whose triggers the batch's
+/// trigger catalog no longer holds.
 ///
 /// # Errors
 ///
@@ -860,7 +898,14 @@ pub(crate) fn dropped(
                 .iter()
                 .any(|column| dropped.iter().any(|gone| same_identifier(column, gone)))
         };
-        if columns.is_none_or(reads_dropped) && key.keeps_triggers(schema, options)? {
+        if !columns.is_none_or(reads_dropped) {
+            continue;
+        }
+        let triggers = match columns {
+            Some(_) => key.keeps_triggers(schema, options)?,
+            None => key.could_keep_triggers(schema, options)?,
+        };
+        if triggers {
             drops.extend(key.drops());
         }
     }

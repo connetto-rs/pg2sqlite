@@ -300,3 +300,37 @@ fn a_new_owner_moves_the_triggers_a_cascade_fires() {
     assert_denied(&mut connection, "DELETE FROM parents WHERE id = 1", "log");
     assert_eq!(count(&mut connection, "children"), 2);
 }
+
+/// The situation leaving `children` writable for `app` and owned by `keeper`.
+const OWNED_WRITABLE: &str = "ALTER TABLE children OWNER TO keeper; GRANT ALL ON children TO app;";
+
+#[test]
+fn a_migration_creating_the_children_runs_their_triggers_as_their_owner() {
+    let (mut connection, schema) = replica(COMMON, "INSERT INTO parents VALUES (1), (2);");
+    migrate(&mut connection, &schema, &format!("{CHILDREN} {OWNED_WRITABLE}"));
+    connection
+        .batch_execute("INSERT INTO children VALUES (1, 1), (2, 2)")
+        .expect("app writes children");
+    connection.batch_execute("DELETE FROM parents WHERE id = 1").expect("the cascade runs");
+    assert_eq!(count(&mut connection, "children"), 1);
+    assert_eq!(count(&mut connection, "log"), 1);
+}
+
+#[test]
+fn renamed_children_run_their_triggers_as_their_owner() {
+    let (mut connection, _) = replica(
+        &format!("{COMMON} {CHILDREN} {OWNED_WRITABLE} ALTER TABLE children RENAME TO kids;"),
+        "INSERT INTO parents VALUES (1), (2); INSERT INTO kids VALUES (1, 1), (2, 2);",
+    );
+    connection.batch_execute("DELETE FROM parents WHERE id = 1").expect("the cascade runs");
+    assert_eq!(count(&mut connection, "kids"), 1);
+    assert_eq!(count(&mut connection, "log"), 1);
+}
+
+#[test]
+fn dropped_children_leave_no_action_behind() {
+    let (mut connection, schema) = children_replica(OWNED_WRITABLE);
+    migrate(&mut connection, &schema, "DROP TABLE children;");
+    connection.batch_execute("DELETE FROM parents WHERE id = 1").expect("the delete runs");
+    assert_eq!(count(&mut connection, "parents"), 1);
+}

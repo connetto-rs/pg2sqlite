@@ -184,9 +184,10 @@ pub(crate) struct Touched {
     replaced: Vec<String>,
     /// The tables the run renames, folded as before it, with the name after.
     renamed: Vec<(String, ObjectName)>,
-    /// A change to a trigger, a table owner or a function, which can move
-    /// whom the triggers a foreign key action fires run as, and so which keys
-    /// SQLite keeps and every guard's list of roles.
+    /// A change to a trigger, a table owner, a table's name or a function,
+    /// which can move whom the triggers a foreign key action fires run as, and
+    /// so which keys SQLite keeps and every guard's list of roles. The batch's
+    /// trigger catalog names a renamed table as the batch leaves it.
     action_runners: bool,
 }
 
@@ -223,6 +224,7 @@ impl Touched {
                             let (RenameTableNameKind::As(name) | RenameTableNameKind::To(name)) =
                                 table_name;
                             self.rename(&alter.name, name);
+                            self.action_runners = true;
                         }
                         _ => {}
                     }
@@ -304,15 +306,15 @@ impl Touched {
     /// kept follows the table it references. A renamed table is always
     /// reached, since its generated objects carry its name. A run moving
     /// whom the triggers a foreign key action fires run as reaches every
-    /// table when a key of `before` writes rows, as every guard lists the
-    /// roles a key action runs as.
+    /// table when a key of `before` or `after` writes rows, as every guard
+    /// lists the roles a key action runs as.
     ///
     /// # Errors
     ///
     /// Propagates a lookup failure.
     fn reached<'s>(
         &self,
-        before: &'s ParserDB,
+        (before, after): (&'s ParserDB, &ParserDB),
     ) -> Result<Vec<(&'s CreateTable, Option<&ObjectName>)>, Error> {
         let candidates = || {
             before.tables().filter(|table| !table.temporary).filter_map(|table| {
@@ -323,15 +325,17 @@ impl Touched {
                 }
             })
         };
-        let runners_move = self.action_runners
-            && before.tables().any(|table| {
+        let writes_rows = |schema: &ParserDB| {
+            schema.tables().any(|table| {
                 foreign_keys(table).any(|key| {
                     [key.on_delete, key.on_update]
                         .into_iter()
                         .flatten()
                         .any(super::hidden_referenced_rows::writes_rows)
                 })
-            });
+            })
+        };
+        let runners_move = self.action_runners && (writes_rows(before) || writes_rows(after));
         let mut direct = Vec::new();
         for (table, renamed_to) in candidates() {
             if self.every
@@ -476,7 +480,7 @@ pub(crate) fn reshaped(
     emit: WarningSink<'_>,
 ) -> Result<(Vec<Statement>, Vec<ObjectName>), Error> {
     let mut changes = Vec::new();
-    for reached in touched.reached(before)? {
+    for reached in touched.reached((before, after))? {
         changes.extend(change(reached, (before, after), boundary, translate, &mut *emit)?);
     }
     if changes.is_empty() {

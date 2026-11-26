@@ -285,7 +285,7 @@ pub(crate) struct PrewalkCatalogs {
 }
 
 /// A trigger on a table or a view.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct TableTrigger {
     /// The trigger's name as written.
     pub(crate) name: String,
