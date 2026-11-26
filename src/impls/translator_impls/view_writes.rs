@@ -15,7 +15,7 @@ use core::ops::ControlFlow;
 use sql_traits::{
     structs::{
         ColumnBinding, ColumnScope, ExpressionContext, ExpressionScope, IdentifierCase, ParserDB,
-        QueryOutput, TargetName, UpdatableViewBase, View,
+        QueryOutput, TargetName, View, WrittenRelation,
     },
     traits::{DatabaseLike, TableLike, ViewLike},
 };
@@ -264,12 +264,14 @@ fn landing<'s>(
     }
     let SetExpr::Select(select) = body else { return Ok(None) };
     let [from] = select.from.as_slice() else { return Ok(None) };
-    let Some(base) = view.updatable_base(schema)? else { return Ok(None) };
+    let Some(base) = view.updatable_base(schema)?.map(|base| base.relation) else {
+        return Ok(None);
+    };
     let base_address = address(&from.relation);
     let base_columns = relation_columns(&base, schema)?;
     let (relation, columns) = match base {
-        UpdatableViewBase::Table { table, columns }
-        | UpdatableViewBase::ForeignTable { table, columns } => {
+        WrittenRelation::Table { table, columns, .. }
+        | WrittenRelation::ForeignTable { table, columns, .. } => {
             let mut parts = Vec::with_capacity(2);
             // An unqualified name reaches `pg_temp` first, as PostgreSQL's
             // search path does, and SQLite's `temp` likewise.
@@ -286,7 +288,7 @@ fn landing<'s>(
                 columns.iter().map(|column| column.map(declared_column_ident)).collect(),
             )
         }
-        UpdatableViewBase::View { view: inner, columns } => {
+        WrittenRelation::View { view: inner, columns, .. } => {
             let names = output_names(inner, schema)?;
             (
                 ObjectName::from(vec![stored_ident(&inner.stored_view_name())]),
@@ -409,14 +411,14 @@ fn outputs(landing: &Landing<'_>, schema: &ParserDB, qualifier: &Ident) -> Resul
 
 /// The written relation's columns in declaration order.
 fn relation_columns(
-    base: &UpdatableViewBase<'_, ParserDB>,
+    base: &WrittenRelation<'_, ParserDB>,
     schema: &ParserDB,
 ) -> Result<Vec<Ident>, Error> {
     Ok(match base {
-        UpdatableViewBase::Table { table, .. } | UpdatableViewBase::ForeignTable { table, .. } => {
+        WrittenRelation::Table { table, .. } | WrittenRelation::ForeignTable { table, .. } => {
             table.columns(schema)?.map(declared_column_ident).collect()
         }
-        UpdatableViewBase::View { view: inner, .. } => {
+        WrittenRelation::View { view: inner, .. } => {
             output_names(inner, schema)?
                 .into_iter()
                 .map(|name| stored_ident(name.as_deref().unwrap_or_default()))
