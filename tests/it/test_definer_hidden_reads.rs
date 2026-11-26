@@ -4,10 +4,12 @@
 //! A definer body reads as its owner, past the acting role's policies, while
 //! the replica holds only the rows the acting role reads. Such a trigger
 //! would judge a write on a partial copy, so the replica leaves it to the
-//! server and reports it.
+//! server and reports it, unless the facts the firing row carries confine
+//! every deciding read to rows the acting role reads.
 
 use diesel::{connection::SimpleConnection, prelude::*};
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, TranslationWarning};
+use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, TranslationWarning};
+use sql_traits::structs::Deployment;
 
 use crate::helpers;
 
@@ -325,4 +327,221 @@ fn constructs_reading_what_a_trigger_left_to_the_server_writes_are_reported() {
         })
         .collect();
     assert_eq!(stale, [("CHECK", "departures_member", "departures", "TRIGGER")]);
+}
+
+diesel::table! {
+    /// The runs of each team, as the acting role reads them.
+    runs (id) {
+        /// The run.
+        id -> Integer,
+        /// The team running it.
+        team_id -> Integer,
+        /// Whether the run takes bindings.
+        status -> Text,
+    }
+}
+
+diesel::table! {
+    /// The bindings `bindings_guard` checks against their run.
+    bindings (id) {
+        /// The binding.
+        id -> Integer,
+        /// The team writing it.
+        team_id -> Integer,
+        /// The run it binds to.
+        run_id -> Integer,
+        /// A run it refers to besides.
+        other_run_id -> Integer,
+    }
+}
+
+diesel::define_sql_function! {
+    /// The team the request acts for, `current_setting('app.team_id')::INT`
+    /// on PostgreSQL.
+    fn app_team_id() -> diesel::sql_types::Integer;
+}
+
+const TEAM: &str = "team_id = current_setting('app.team_id')::INT";
+
+const COMPOSITE_RUN_KEY: &str = "FOREIGN KEY (run_id, team_id) REFERENCES runs (id, team_id)";
+
+/// `bindings_guard`, refusing a binding whose run `key` names is not open,
+/// the run of each binding referenced by `run_key`. `runs_select` admits the
+/// runs `readable` holds of, and `bindings_insert` the bindings `writable`
+/// holds of, after `extra`.
+fn bindings(key: &str, run_key: &str, readable: &str, writable: &str, extra: &str) -> String {
+    format!(
+        "CREATE ROLE app;
+         CREATE ROLE guard_owner BYPASSRLS;
+         {extra}
+         CREATE TABLE runs (id INT PRIMARY KEY, team_id INT NOT NULL, status TEXT NOT NULL,
+           UNIQUE (id, team_id));
+         ALTER TABLE runs ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY runs_select ON runs FOR SELECT TO app USING ({readable});
+         CREATE TABLE bindings (id INT PRIMARY KEY, team_id INT NOT NULL,
+           run_id INT NOT NULL, other_run_id INT NOT NULL REFERENCES runs (id),
+           {run_key});
+         ALTER TABLE bindings ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY bindings_select ON bindings FOR SELECT TO app USING ({readable});
+         CREATE POLICY bindings_insert ON bindings FOR INSERT TO app WITH CHECK ({writable});
+         GRANT SELECT ON runs TO app, guard_owner;
+         GRANT SELECT, INSERT ON bindings TO app;
+         CREATE FUNCTION guard_binding() RETURNS trigger
+         LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+         BEGIN
+           IF EXISTS (SELECT 1 FROM public.runs run WHERE run.id = {key} AND run.status <> 'open')
+           THEN
+             RAISE EXCEPTION 'run % is closed', {key} USING ERRCODE = 'check_violation';
+           END IF;
+           RETURN NEW;
+         END
+         $$;
+         ALTER FUNCTION guard_binding() OWNER TO guard_owner;
+         REVOKE EXECUTE ON FUNCTION guard_binding() FROM PUBLIC;
+         CREATE TRIGGER bindings_guard AFTER INSERT ON bindings
+           FOR EACH ROW EXECUTE FUNCTION guard_binding();"
+    )
+}
+
+/// The translation acting as `app` in `deployment`, with `mapping`.
+fn acting_options(deployment: Deployment, mapping: SessionVariableMapping) -> Pg2SqliteOptions {
+    Pg2SqliteOptions::default()
+        .with_deployment(deployment)
+        .with_session_variable(mapping)
+        .with_rls_audit_table_name("rls_audit")
+        .with_rls_exemption_function("member_write_exempt")
+        .with_acting_role("app")
+}
+
+/// The translation acting as `app` for the team `app.team_id` names, read
+/// through `app_team_id()`.
+fn team_options() -> Pg2SqliteOptions {
+    acting_options(
+        helpers::deployment::deployment(
+            ["app"],
+            [helpers::deployment::scalar("app.team_id", "int")],
+        ),
+        SessionVariableMapping::new("app.team_id", "app_team_id"),
+    )
+}
+
+/// The triggers `pg` leaves to the server under `options`, each with its
+/// reason.
+fn triggers_left(pg: &str, options: &Pg2SqliteOptions) -> Vec<(String, String)> {
+    Pg2Sqlite::default()
+        .sql(pg)
+        .expect("parse")
+        .translate_with_report(options)
+        .unwrap_or_else(|error| panic!("{error}\n{pg}"))
+        .warnings
+        .into_iter()
+        .filter_map(|warning| {
+            match warning {
+                TranslationWarning::LeftToServer { construct, name, reason, .. }
+                    if construct == "TRIGGER" =>
+                {
+                    Some((name, reason))
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn a_definer_read_the_firing_rows_key_confines_to_the_team_stays_and_refuses_on_the_replica() {
+    let pg = bindings("NEW.run_id", COMPOSITE_RUN_KEY, TEAM, TEAM, "");
+    assert_eq!(triggers_left(&pg, &team_options()), []);
+
+    let script = Pg2Sqlite::default()
+        .sql(&pg)
+        .expect("parse")
+        .translate_to_sql(&team_options())
+        .expect("translate");
+    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
+    script.register_functions(&mut connection).expect("register helper functions");
+    app_team_id_utils::register_nondeterministic_impl(&mut connection, || 1)
+        .expect("act for team 1");
+    member_write_exempt_utils::register_nondeterministic_impl(&mut connection, || true)
+        .expect("exempt the delivery");
+    for statement in script.into_vec() {
+        connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
+    }
+    connection
+        .batch_execute(
+            "INSERT INTO runs_rls (id, team_id, status) VALUES (1, 1, 'closed'), (2, 1, 'open')",
+        )
+        .expect("deliver the team's runs");
+    member_write_exempt_utils::register_nondeterministic_impl(&mut connection, || false)
+        .expect("end the exemption");
+    let bind = |connection: &mut SqliteConnection, id: i32, run: i32| {
+        diesel::insert_into(bindings::table)
+            .values((
+                bindings::id.eq(id),
+                bindings::team_id.eq(1),
+                bindings::run_id.eq(run),
+                bindings::other_run_id.eq(run),
+            ))
+            .execute(connection)
+    };
+
+    let refused = bind(&mut connection, 1, 1).expect_err("run 1 is closed");
+    assert!(refused.to_string().contains("is closed"), "{refused}");
+    bind(&mut connection, 2, 2).expect("run 2 is open");
+}
+
+#[test]
+fn a_definer_read_no_fact_confines_is_left_to_the_server_naming_the_policy() {
+    for pg in [
+        bindings("NEW.other_run_id", COMPOSITE_RUN_KEY, TEAM, TEAM, ""),
+        bindings("NEW.run_id", "FOREIGN KEY (run_id) REFERENCES runs (id)", TEAM, TEAM, ""),
+    ] {
+        let left = triggers_left(&pg, &team_options());
+
+        let [(name, reason)] = left.as_slice() else { panic!("one trigger left: {left:?}\n{pg}") };
+        assert_eq!(name, "bindings_guard");
+        assert!(reason.contains("implies runs_select"), "{reason}");
+    }
+}
+
+#[test]
+fn a_write_policy_on_a_narrower_declared_set_confines_the_definer_read() {
+    let helper = "CREATE SCHEMA authz;
+         CREATE TABLE team_grants (team_id INT NOT NULL, principal_id TEXT NOT NULL,
+           role TEXT NOT NULL, PRIMARY KEY (team_id, principal_id));
+         ALTER TABLE team_grants ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY team_grants_own ON team_grants FOR SELECT TO app
+           USING (principal_id = current_setting('app.user_id', true));
+         GRANT SELECT ON team_grants TO app, guard_owner;
+         CREATE FUNCTION authz.teams_with(min_role TEXT) RETURNS SETOF INT
+         LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+           SELECT g.team_id FROM public.team_grants g
+           WHERE g.principal_id = current_setting('app.user_id', true) AND g.role = min_role
+         $$;
+         ALTER FUNCTION authz.teams_with(TEXT) OWNER TO guard_owner;";
+    let pg = bindings(
+        "NEW.run_id",
+        COMPOSITE_RUN_KEY,
+        "team_id = ANY (ARRAY(SELECT authz.teams_with('reader')))",
+        "team_id = ANY (ARRAY(SELECT authz.teams_with('writer')))",
+        helper,
+    );
+    let deployment = || {
+        helpers::deployment::deployment(
+            ["app"],
+            [helpers::deployment::caller("app.user_id", "text")],
+        )
+    };
+    let options = |deployment: Deployment| {
+        acting_options(deployment, SessionVariableMapping::new("app.user_id", "app_user"))
+    };
+
+    let undeclared = triggers_left(&pg, &options(deployment()));
+    let [(_, reason)] = undeclared.as_slice() else { panic!("one trigger left: {undeclared:?}") };
+    assert!(reason.contains("implies runs_select"), "{reason}");
+
+    let declared = deployment()
+        .with_set_within("authz.teams_with('writer')", "authz.teams_with('reader')")
+        .expect("valid set expressions");
+    assert_eq!(triggers_left(&pg, &options(declared)), []);
 }
