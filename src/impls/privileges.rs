@@ -44,6 +44,7 @@ pub(crate) struct RoleTable {
     /// Every column in declaration order.
     columns: Vec<ColumnGrant>,
     delete: bool,
+    truncate: bool,
 }
 
 impl RoleTable {
@@ -70,7 +71,7 @@ impl RoleTable {
                     }
                 })
                 .collect();
-            return Ok(Self { columns, delete: true });
+            return Ok(Self { columns, delete: true, truncate: true });
         };
         let held = table.privileges(role, schema)?;
         let columns = table
@@ -84,7 +85,7 @@ impl RoleTable {
                 }
             })
             .collect();
-        Ok(Self { columns, delete: held.delete })
+        Ok(Self { columns, delete: held.delete, truncate: held.truncate })
     }
 
     /// What `role` holds on `table` of `schema`, an epoch's schema of the
@@ -109,6 +110,7 @@ impl RoleTable {
                 column.update = false;
             }
             held.delete = false;
+            held.truncate = false;
         }
         Ok(held)
     }
@@ -172,6 +174,11 @@ impl RoleTable {
     /// Whether the role may `DELETE`.
     pub(crate) const fn deletes(&self) -> bool {
         self.delete
+    }
+
+    /// Whether the role may `TRUNCATE`.
+    pub(crate) const fn truncates(&self) -> bool {
+        self.truncate
     }
 
     /// Whether the role holds no write privilege at all.

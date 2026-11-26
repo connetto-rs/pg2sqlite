@@ -86,6 +86,7 @@ struct TableNeed {
     insert_any: bool,
     update: BTreeSet<String>,
     delete: bool,
+    truncate: bool,
 }
 
 impl TableNeed {
@@ -97,6 +98,7 @@ impl TableNeed {
             && self.insert.iter().all(|column| held.inserts(column))
             && self.update.iter().all(|column| held.updates(column))
             && (!self.delete || held.deletes())
+            && (!self.truncate || held.truncates())
     }
 }
 
@@ -140,6 +142,14 @@ impl<'s> Needs<'s> {
             Statement::Insert(insert) => self.insert(insert),
             Statement::Update(update) => self.update(update),
             Statement::Delete(delete) => self.delete(delete),
+            Statement::Truncate(truncate) => {
+                for target in &truncate.table_names {
+                    if let Some(table) = self.table(&target.name)? {
+                        self.need(table).truncate = true;
+                    }
+                }
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
