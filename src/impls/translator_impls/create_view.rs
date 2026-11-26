@@ -51,18 +51,12 @@ impl crate::traits::translator::TranslatorWithContext for CreateView {
             return Err(Error::forward_refusal("SECURE VIEW is not supported in SQLite"));
         }
 
-        // PostgreSQL runs a view with its owner's rights, so a view over a
-        // table with row level security bypasses that policy unless it is
-        // declared `security_invoker`. Measured on PostgreSQL 17 over a table
-        // of three rows whose policy admits two: a plain view answers 3, a
-        // `security_invoker` view answers 2. The clause is therefore honoured
-        // by which relation the body reads, below, and is not emitted, since
-        // SQLite has no view option to carry it.
+        // SQLite views carry no options, so each one shapes the translation
+        // instead.
         let security_invoker = reads_as_the_invoker(&self.options);
-        if !matches!(self.options, CreateTableOptions::None) && !security_invoker {
+        if let Some(option) = unsupported_option(&self.options) {
             return Err(Error::forward_refusal(format!(
-                "VIEW options are not supported in SQLite: {:?}",
-                self.options
+                "VIEW options are not supported in SQLite: {option}"
             )));
         }
 
@@ -114,17 +108,51 @@ impl crate::traits::translator::TranslatorWithContext for CreateView {
     }
 }
 
-/// True when the view declares `security_invoker = true`, so it reads with the
-/// caller's rights and its base table's row level security applies to it.
+/// True when the view declares `security_invoker = true`.
 fn reads_as_the_invoker(options: &CreateTableOptions) -> bool {
     let CreateTableOptions::With(pairs) = options else { return false };
-    matches!(
-        pairs.as_slice(),
-        [SqlOption::KeyValue { key, value }]
-            if matches!(key.0.as_slice(), [ObjectNamePart::Identifier(name)]
-                if name.value.eq_ignore_ascii_case("security_invoker"))
-                && matches!(value, Expr::Value(literal) if literal.value == Value::Boolean(true))
-    )
+    pairs.iter().any(|pair| {
+        matches!(pair, SqlOption::KeyValue { key, value }
+            if option_named(key, "security_invoker")
+                && matches!(value, Expr::Value(literal) if literal.value == Value::Boolean(true)))
+    })
+}
+
+/// The first option the replica has no counterpart for, past
+/// `security_invoker`, which picks the relations the view reads, and a
+/// `check_option` of `local` or `cascaded`, which its triggers apply.
+fn unsupported_option(options: &CreateTableOptions) -> Option<&SqlOption> {
+    match options {
+        CreateTableOptions::None => None,
+        CreateTableOptions::With(pairs) => pairs.iter().find(|pair| {
+            let SqlOption::KeyValue { key, value } = pair else { return true };
+            let named = |text: &str| match value {
+                Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(text),
+                Expr::Value(literal) => {
+                    matches!(&literal.value, Value::SingleQuotedString(written) if written.eq_ignore_ascii_case(text))
+                }
+                _ => false,
+            };
+            !(option_named(key, "security_invoker")
+                && matches!(value, Expr::Value(literal) if matches!(literal.value, Value::Boolean(_)))
+                || option_named(key, "check_option") && (named("local") || named("cascaded")))
+        }),
+        _ => options_first(options),
+    }
+}
+
+fn options_first(options: &CreateTableOptions) -> Option<&SqlOption> {
+    match options {
+        CreateTableOptions::With(pairs)
+        | CreateTableOptions::Options(pairs)
+        | CreateTableOptions::Plain(pairs)
+        | CreateTableOptions::TableProperties(pairs) => pairs.first(),
+        CreateTableOptions::None => None,
+    }
+}
+
+fn option_named(key: &ObjectName, name: &str) -> bool {
+    matches!(key.0.as_slice(), [ObjectNamePart::Identifier(ident)] if ident.value.eq_ignore_ascii_case(name))
 }
 
 /// Binds every relation the view body reads to the database PostgreSQL bound
@@ -282,7 +310,7 @@ fn owner_bypasses(
 }
 
 /// The stored view `view` declares.
-fn declared_view<'a>(
+pub(super) fn declared_view<'a>(
     schema: &'a ParserDB,
     view: &CreateView,
 ) -> Result<Option<&'a <ParserDB as DatabaseLike>::View>, LookupError> {

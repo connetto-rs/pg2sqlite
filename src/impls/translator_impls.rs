@@ -61,5 +61,6 @@ pub(crate) mod update;
 pub(crate) mod uuid;
 pub mod vector;
 mod view_outputs;
+mod view_triggers;
 pub(crate) mod view_writes;
 pub(crate) mod withheld;

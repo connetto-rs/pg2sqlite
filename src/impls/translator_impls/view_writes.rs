@@ -1,10 +1,12 @@
 //! A write naming an automatically updatable view, rewritten onto the
-//! relation the view reads as PostgreSQL's rewriter does. Each view column
-//! stands for what the view selects, an update or a delete reaches only the
-//! rows the view's condition admits, and a column list names the columns the
-//! view passes through. A view an `INSTEAD OF` trigger takes the write for,
-//! and one that is not automatically updatable, keep the write, which SQLite
-//! then runs or refuses as PostgreSQL does.
+//! relation the view reads as PostgreSQL's rewriter does, unless only the
+//! view's `INSTEAD OF` trigger (see [`super::view_triggers`]) can apply its
+//! check option or its owner's rights. Each view column stands for what it
+//! selects, an update or a delete reaches only the rows the view's condition
+//! admits, and a column list names the columns the view passes through. A
+//! view an `INSTEAD OF` trigger of the schema takes the write for, and one
+//! that is not automatically updatable, keep the write, which SQLite then
+//! runs or refuses as PostgreSQL does.
 //!
 //! The rewrite works on the PostgreSQL statement and goes one view at a
 //! time, so the statement it answers is translated afresh, through the next
@@ -56,12 +58,14 @@ struct Landing<'view> {
 }
 
 /// `insert` written onto the relation the view it names reads, or `None`
-/// when it names no view that PostgreSQL rewrites the write for.
+/// when it names no view that PostgreSQL rewrites the write for, or when the
+/// view's `INSTEAD OF INSERT` trigger on the replica takes it.
 ///
 /// # Errors
 ///
 /// Refuses a column list naming a view column that computes its value or
-/// that the view does not have, which PostgreSQL refuses for every row, and
+/// that the view does not have, which PostgreSQL refuses for every row, a
+/// write the trigger cannot take into a view with a check option, and
 /// returns the lookup errors resolving the view runs into.
 pub(crate) fn land_insert(
     insert: &Insert,
@@ -73,6 +77,40 @@ pub(crate) fn land_insert(
         return Ok(None);
     };
     let view_name = view.stored_view_name();
+    let listed: Vec<Ident> = if insert.columns.is_empty() {
+        let width = insert
+            .source
+            .as_deref()
+            .map_or(Some(0), |source| row_width(&source.body))
+            .unwrap_or(landing.names.len());
+        landing
+            .names
+            .iter()
+            .take(width)
+            .map(|name| Ident::with_quote('"', name.as_deref().unwrap_or_default()))
+            .collect()
+    } else {
+        insert.columns.iter().filter_map(|column| last_ident(column).cloned()).collect()
+    };
+    let columns = listed
+        .iter()
+        .map(|ident| {
+            landing
+                .written(ident, &view_name, "insert into")
+                .map(|column| ObjectName::from(vec![column]))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let plain = insert.on.is_none() && insert.returning.is_none();
+    if needs_trigger(view, true, plain, schema, options)? {
+        if !plain || !insert.columns.is_empty() {
+            return Ok(None);
+        }
+        // SQLite inserts into a view only a full row, so name the columns
+        // written.
+        let mut named = insert.clone();
+        named.columns = listed.into_iter().map(|ident| ObjectName::from(vec![ident])).collect();
+        return Ok(Some(named));
+    }
     let qualifier = match &insert.table_alias {
         Some(alias) => alias.alias.clone(),
         None => last_part(&landing.relation),
@@ -98,30 +136,7 @@ pub(crate) fn land_insert(
     };
     replace(&mut statement, replacements);
     let Statement::Insert(mut landed) = statement else { return Ok(None) };
-
-    let listed: Vec<Ident> = if landed.columns.is_empty() {
-        let width = landed
-            .source
-            .as_deref()
-            .map_or(Some(0), |source| row_width(&source.body))
-            .unwrap_or(landing.names.len());
-        landing
-            .names
-            .iter()
-            .take(width)
-            .map(|name| Ident::with_quote('"', name.as_deref().unwrap_or_default()))
-            .collect()
-    } else {
-        landed.columns.iter().filter_map(|column| last_ident(column).cloned()).collect()
-    };
-    landed.columns = listed
-        .iter()
-        .map(|ident| {
-            landing
-                .written(ident, &view_name, "insert into")
-                .map(|column| ObjectName::from(vec![column]))
-        })
-        .collect::<Result<_, _>>()?;
+    landed.columns = columns;
     if let Some(OnInsert::OnConflict(conflict)) = &mut landed.on {
         if let Some(ConflictTarget::Columns { columns, .. }) = &mut conflict.conflict_target {
             for column in columns.iter_mut() {
@@ -140,12 +155,14 @@ pub(crate) fn land_insert(
 
 /// `update` written onto the relation the view it names reads, the view's
 /// condition joined to its own, or `None` when it names no view that
-/// PostgreSQL rewrites the write for.
+/// PostgreSQL rewrites the write for, or when the view's `INSTEAD OF UPDATE`
+/// trigger on the replica takes it.
 ///
 /// # Errors
 ///
 /// Refuses an assignment to a view column that computes its value or that
-/// the view does not have, and returns the lookup errors resolving the view
+/// the view does not have, a write the trigger cannot take through a view
+/// with a check option, and returns the lookup errors resolving the view
 /// runs into.
 pub(crate) fn land_update(
     update: &Update,
@@ -160,6 +177,18 @@ pub(crate) fn land_update(
         return Ok(None);
     };
     let view_name = view.stored_view_name();
+    for assignment in &update.assignments {
+        landing.assignable(&assignment.target, &view_name)?;
+    }
+    if needs_trigger(
+        view,
+        true,
+        update.from.is_none() && update.returning.is_none(),
+        schema,
+        options,
+    )? {
+        return Ok(None);
+    }
     let qualifier = exposed(name, alias.as_ref());
     let (rows, condition) = Rows::of(schema, &landing, qualifier.clone(), &qualifier)?;
 
@@ -190,7 +219,8 @@ pub(crate) fn land_update(
 
 /// `delete` written onto the relation the view it names reads, the view's
 /// condition joined to its own, or `None` when it names no view that
-/// PostgreSQL rewrites the write for.
+/// PostgreSQL rewrites the write for, or when the view's `INSTEAD OF DELETE`
+/// trigger on the replica takes it.
 ///
 /// # Errors
 ///
@@ -203,9 +233,13 @@ pub(crate) fn land_delete(
     let (FromTable::WithFromKeyword(targets) | FromTable::WithoutKeyword(targets)) = &delete.from;
     let [target] = targets.as_slice() else { return Ok(None) };
     let TableFactor::Table { name, alias, .. } = &target.relation else { return Ok(None) };
-    let Some((_view, landing)) = landing(name, Event::Delete, schema, options)? else {
+    let Some((view, landing)) = landing(name, Event::Delete, schema, options)? else {
         return Ok(None);
     };
+    let plain = delete.using.is_none() && delete.returning.is_none() && target.joins.is_empty();
+    if needs_trigger(view, false, plain, schema, options)? {
+        return Ok(None);
+    }
     let qualifier = exposed(name, alias.as_ref());
     let (rows, condition) = Rows::of(schema, &landing, qualifier.clone(), &qualifier)?;
 
@@ -238,9 +272,7 @@ pub(crate) fn land_delete(
 }
 
 /// The view `name` resolves to and what it stands for, when PostgreSQL
-/// rewrites a write of `event` on it: no `INSTEAD OF` trigger takes the write
-/// and the view reads one relation it passes columns of through. The trigger
-/// is the translated script's or the schema's it is translated against.
+/// rewrites a write of `event` on it.
 fn landing<'s>(
     name: &ObjectName,
     event: Event,
@@ -248,6 +280,34 @@ fn landing<'s>(
     options: &TranslationContext<'_>,
 ) -> Result<Option<(&'s View, Landing<'s>)>, Error> {
     let Some(view) = resolve_view(name, schema)? else { return Ok(None) };
+    let Some(base) = rewritten_base(view, event, schema, options)? else { return Ok(None) };
+    let definition = view.definition();
+    let Some(select) = single_select(definition) else { return Ok(None) };
+    let [from] = select.from.as_slice() else { return Ok(None) };
+    let base_address = address(&from.relation);
+    let base_columns = relation_columns(&base, schema)?;
+    let (relation, columns) = written_relation(&base, schema)?;
+    let names = output_names(view, schema)?;
+    Ok(Some((
+        view,
+        Landing { relation, names, columns, definition, select, base: base_address, base_columns },
+    )))
+}
+
+/// The relation PostgreSQL rewrites a write of `event` on `view` onto, when
+/// it rewrites one: no `INSTEAD OF` trigger takes the write and the view reads
+/// one relation it passes columns of through. The trigger is the translated
+/// script's or the schema's it is translated against.
+///
+/// # Errors
+///
+/// Returns the lookup errors resolving the view's definition runs into.
+pub(super) fn rewritten_base<'s>(
+    view: &'s View,
+    event: Event,
+    schema: &'s ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<Option<WrittenRelation<'s, ParserDB>>, Error> {
     let stored = view.stored_view_name();
     if options.instead_of_trigger_takes(&stored, |fired| Event::of(fired) == event)
         || schema
@@ -257,19 +317,35 @@ fn landing<'s>(
     {
         return Ok(None);
     }
-    let definition = view.definition();
+    let Some(select) = single_select(view.definition()) else { return Ok(None) };
+    if select.from.len() != 1 {
+        return Ok(None);
+    }
+    Ok(view.updatable_base(schema)?.map(|base| base.relation))
+}
+
+/// The one `SELECT` a definition holds, through any parentheses.
+fn single_select(definition: &Query) -> Option<&Select> {
     let mut body = definition.body.as_ref();
     while let SetExpr::Query(inner) = body {
         body = inner.body.as_ref();
     }
-    let SetExpr::Select(select) = body else { return Ok(None) };
-    let [from] = select.from.as_slice() else { return Ok(None) };
-    let Some(base) = view.updatable_base(schema)?.map(|base| base.relation) else {
-        return Ok(None);
-    };
-    let base_address = address(&from.relation);
-    let base_columns = relation_columns(&base, schema)?;
-    let (relation, columns) = match base {
+    let SetExpr::Select(select) = body else { return None };
+    Some(select)
+}
+
+/// The relation `base` names as a PostgreSQL statement writes it, and the
+/// column of it each output column of the view writes, `None` for one that
+/// computes its value.
+///
+/// # Errors
+///
+/// Returns the lookup errors reading an inner view's definition runs into.
+pub(super) fn written_relation(
+    base: &WrittenRelation<'_, ParserDB>,
+    schema: &ParserDB,
+) -> Result<(ObjectName, Vec<Option<Ident>>), Error> {
+    Ok(match base {
         WrittenRelation::Table { table, columns, .. }
         | WrittenRelation::ForeignTable { table, columns, .. } => {
             let mut parts = Vec::with_capacity(2);
@@ -300,12 +376,7 @@ fn landing<'s>(
                     .collect(),
             )
         }
-    };
-    let names = output_names(view, schema)?;
-    Ok(Some((
-        view,
-        Landing { relation, names, columns, definition, select, base: base_address, base_columns },
-    )))
+    })
 }
 
 impl Landing<'_> {
@@ -347,6 +418,19 @@ impl Landing<'_> {
         Ok(())
     }
 
+    /// Refuses an assignment the view cannot pass to the written relation,
+    /// as [`Self::assign`] does, leaving `target` as written.
+    fn assignable(&self, target: &AssignmentTarget, view: &str) -> Result<(), Error> {
+        let names = match target {
+            AssignmentTarget::ColumnName(name) => core::slice::from_ref(name),
+            AssignmentTarget::Tuple(names) => names.as_slice(),
+        };
+        for ident in names.iter().filter_map(last_ident) {
+            self.written(ident, view, "update")?;
+        }
+        Ok(())
+    }
+
     /// The written relation as the target of an update or a delete, under
     /// `qualifier`.
     fn target(&self, qualifier: &Ident) -> TableFactor {
@@ -354,9 +438,40 @@ impl Landing<'_> {
     }
 }
 
+/// Whether the write must go through the view's `INSTEAD OF` trigger, which
+/// alone applies a check option, when the write `checks` new rows, and an
+/// owner's rights on the way. A `plain` write the trigger takes stays on the
+/// view, and any other is refused.
+fn needs_trigger(
+    view: &View,
+    checks: bool,
+    plain: bool,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<bool, Error> {
+    let Some((reason, current)) =
+        super::view_triggers::trigger_reason(view, checks, schema, options)?
+    else {
+        return Ok(false);
+    };
+    if plain {
+        return Ok(true);
+    }
+    Err(Error::forward_refusal(format!(
+        "a write through view {} with RETURNING, ON CONFLICT, FROM or USING cannot keep {reason} \
+         of view {}, which the replica applies in the view's INSTEAD OF trigger, and SQLite runs \
+         none of those clauses on a view. Write without them and read the row back afterwards.",
+        view.stored_view_name(),
+        current.stored_view_name()
+    )))
+}
+
 /// The view a statement's target `name` resolves to, a table of that name
 /// taking precedence as PostgreSQL's search path does.
-fn resolve_view<'s>(name: &ObjectName, schema: &'s ParserDB) -> Result<Option<&'s View>, Error> {
+pub(super) fn resolve_view<'s>(
+    name: &ObjectName,
+    schema: &'s ParserDB,
+) -> Result<Option<&'s View>, Error> {
     if crate::impls::object_name::resolve_translation_table(schema, name)?.is_some() {
         return Ok(None);
     }
@@ -652,7 +767,7 @@ fn replace<N: VisitMut + ?Sized>(node: &mut N, replacements: Vec<(usize, Expr)>)
 /// # Errors
 ///
 /// Returns the lookup errors reading the definition runs into.
-fn output_names(view: &View, schema: &ParserDB) -> Result<Vec<Option<String>>, Error> {
+pub(super) fn output_names(view: &View, schema: &ParserDB) -> Result<Vec<Option<String>>, Error> {
     let definition = view.definition();
     let graph = ColumnScope::from_query(definition, schema, IdentifierCase::AsWritten)?;
     let mut declared = view.declared_column_names().iter();
