@@ -51,7 +51,14 @@ pub(crate) fn type_name<'e>(
         Expr::Nested(inner) => type_name(inner, schema, options)?,
         Expr::Cast { data_type, .. } => Some(normalize_sqlparser_type(data_type)),
         Expr::TypedString(typed) => Some(normalize_sqlparser_type(&typed.data_type)),
-        Expr::Value(value) => literal_type_name(&value.value).map(Cow::Borrowed),
+        Expr::Value(value) => {
+            match options.parameter_type(&value.value) {
+                Some(data_type) => {
+                    Some(Cow::Owned(normalize_sqlparser_type(data_type).into_owned()))
+                }
+                None => literal_type_name(&value.value).map(Cow::Borrowed),
+            }
+        }
         Expr::Interval(_) => Some(Cow::Borrowed("interval")),
         Expr::Extract { .. } => Some(Cow::Borrowed("numeric")),
         Expr::Function(call) => call_type_name(call, schema, options)?.map(Cow::Owned),

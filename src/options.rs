@@ -374,6 +374,9 @@ pub struct TranslationContext<'a> {
     /// declaration, or nothing for a variable without one, and is never
     /// resolved against the relations in scope.
     variables: &'a [BoundVariable],
+    /// The types of the statement's parameters, `$1` first, as a call to a
+    /// declared function types the parameters it passes.
+    parameter_types: &'a [sqlparser::ast::DataType],
     /// Whether every relation available to the input is present in the schema.
     schema_is_complete: bool,
     subqueries_allowed: bool,
@@ -465,6 +468,7 @@ struct ContextFields<'a> {
     catalogs: Cow<'a, PrewalkCatalogs>,
     with: Option<&'a sqlparser::ast::With>,
     variables: &'a [BoundVariable],
+    parameter_types: &'a [sqlparser::ast::DataType],
     schema_is_complete: bool,
     subqueries_allowed: bool,
     written_schema: Option<&'a ParserDB>,
@@ -488,6 +492,7 @@ impl<'a> ContextFields<'a> {
             catalogs: Cow::Borrowed(context.catalogs.as_ref()),
             with: context.with,
             variables: context.variables,
+            parameter_types: context.parameter_types,
             schema_is_complete: context.schema_is_complete,
             subqueries_allowed: context.subqueries_allowed,
             written_schema: context.written_schema,
@@ -519,6 +524,7 @@ impl<'a> ContextFields<'a> {
             outer,
             with: self.with,
             variables: self.variables,
+            parameter_types: self.parameter_types,
             schema_is_complete: self.schema_is_complete,
             subqueries_allowed: self.subqueries_allowed,
             written_schema: self.written_schema,
@@ -549,6 +555,7 @@ impl<'a> TranslationContext<'a> {
             outer: None,
             with: None,
             variables: &[],
+            parameter_types: &[],
             schema_is_complete: false,
             subqueries_allowed: true,
             written_schema: None,
@@ -580,6 +587,7 @@ impl<'a> TranslationContext<'a> {
             outer: None,
             with: None,
             variables: &[],
+            parameter_types: &[],
             schema_is_complete: false,
             subqueries_allowed: true,
             written_schema: None,
@@ -725,6 +733,27 @@ impl<'a> TranslationContext<'a> {
         fields.into_context(self.scope, self.outer)
     }
 
+    /// The same context typing the statement's parameters, `$1` first.
+    pub(crate) fn with_parameter_types<'s>(
+        &'s self,
+        parameter_types: &'s [sqlparser::ast::DataType],
+    ) -> TranslationContext<'s> {
+        let mut fields = ContextFields::borrowed(self);
+        fields.parameter_types = parameter_types;
+        fields.into_context(self.scope, self.outer)
+    }
+
+    /// The type of `value` when it is a parameter `$k` the context types.
+    #[must_use]
+    pub(crate) fn parameter_type(
+        &self,
+        value: &sqlparser::ast::Value,
+    ) -> Option<&sqlparser::ast::DataType> {
+        let sqlparser::ast::Value::Placeholder(placeholder) = value else { return None };
+        let position: usize = placeholder.strip_prefix('$')?.parse().ok()?;
+        self.parameter_types.get(position.checked_sub(1)?)
+    }
+
     /// The same context noting `schema` as the one the statement was written
     /// against.
     pub(crate) fn with_written_schema<'s>(
@@ -847,6 +876,7 @@ impl<'a> TranslationContext<'a> {
             outer: None,
             with: None,
             variables: &[],
+            parameter_types: &[],
             schema_is_complete: self.schema_is_complete,
             subqueries_allowed: self.subqueries_allowed,
             written_schema: None,
