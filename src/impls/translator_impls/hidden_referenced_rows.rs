@@ -522,6 +522,7 @@ impl<'s> Key<'s> {
 }
 
 /// The names a key's triggers and refusal carry.
+#[derive(PartialEq)]
 struct Names {
     /// The referencing table, as PostgreSQL names it.
     child: String,
@@ -990,6 +991,7 @@ pub(crate) fn triggers_on(
 }
 
 /// The tables and columns a referenced-side trigger reads, quoted for SQLite.
+#[derive(PartialEq)]
 struct Parts {
     /// The table holding the referencing rows.
     referencing: String,

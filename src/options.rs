@@ -759,6 +759,28 @@ impl<'a> TranslationContext<'a> {
         }
     }
 
+    /// The context the statement declaring a table translates in, which
+    /// decides how the replica keeps the table's foreign keys. It holds none
+    /// of the body, query or statement being translated, so the acting role
+    /// stands in for the role a body runs as. The schemas, the trigger
+    /// catalogs and the keys bodies bind against stay.
+    pub(crate) fn declaring(&self) -> TranslationContext<'_> {
+        let mut fields = ContextFields::borrowed(self);
+        fields.with = None;
+        fields.variables = &[];
+        fields.subqueries_allowed = true;
+        fields.body_key_schema = self.body_key_schema();
+        fields.history = None;
+        fields.running_as = None;
+        fields.inlined_body = None;
+        fields.trigger_rows = None;
+        fields.locked = &[];
+        fields.locks_whole_query = false;
+        fields.declaration = None;
+        fields.inserting_into = None;
+        fields.into_context(None, None)
+    }
+
     /// Derives a context translating a statement of the batch after the
     /// statements `history` follows.
     pub(crate) fn with_history<'s>(

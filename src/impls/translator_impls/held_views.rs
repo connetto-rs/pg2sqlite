@@ -313,7 +313,9 @@ fn foreign_changes(
     for stored in others.into_iter().flat_map(|name| [name.to_owned(), format!("{name}{suffix}")]) {
         let current = live.columns.get(&stored).cloned().unwrap_or_default();
         let changes = column_changes(epoch, index, &stored, &current);
-        if window.iter().any(|statement| reads(statement, &changes.read)) {
+        if !changes.read.is_empty()
+            && window.iter().any(|statement| reads(statement, &changes.read))
+        {
             foreign.last = foreign.last.max(changes.units.last().copied());
             foreign.read.extend(changes.read);
         }

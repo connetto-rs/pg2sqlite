@@ -3,7 +3,10 @@
 //! exempting the owner a definer body runs as alters, since PostgreSQL
 //! resolves a trigger body where it runs.
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    rc::Rc,
+};
 use core::ops::ControlFlow;
 
 use sql_traits::{structs::ParserDB, traits::DatabaseLike};
@@ -17,6 +20,7 @@ use super::{
     definer::{exempt_somewhere, exempting_tables},
     function_cascade::{drop_of, runs_dropped},
     function_moves,
+    hidden_referenced_rows::body_statement_keys::Captures,
     plpgsql::{BodyReach, ReadBodies, body_reach},
     trigger_slots::{TableKey, folded, renamed_owner, renamed_table, table_key},
 };
@@ -79,7 +83,8 @@ struct Touched {
     /// How it can change which tables' row-level security exempts a role,
     /// which decides whether a `SECURITY DEFINER` body runs as its owner.
     exemptions: Option<Exemptions>,
-    /// A migration that can change body checks or recording prefixes.
+    /// Whether the captures body statements keep move, which every body
+    /// statement's checks read.
     body_keys: bool,
 }
 
@@ -316,6 +321,9 @@ fn carry(trigger: &mut CreateTrigger, event: &Statement) {
 pub(crate) struct TriggerFollower {
     live: Vec<Followed>,
     bodies: ReadBodies,
+    /// The captures body statements kept when the live triggers were last
+    /// translated.
+    captures: Option<Rc<Captures>>,
 }
 
 impl TriggerFollower {
@@ -326,7 +334,16 @@ impl TriggerFollower {
             .flat_map(DatabaseLike::triggers)
             .map(|trigger| Followed { create: trigger.clone(), rendered: None })
             .collect();
-        Self { live, bodies: ReadBodies::default() }
+        Self { live, bodies: ReadBodies::default(), captures: None }
+    }
+
+    /// Whether the captures body statements keep move from `before`, unless
+    /// the live triggers were translated since, to `after`, which they are
+    /// then translated with.
+    fn captures_move(&mut self, (before, after): (&Rc<Captures>, &Rc<Captures>)) -> bool {
+        let held = self.captures.replace(Rc::clone(after));
+        let held = held.as_ref().unwrap_or(before);
+        !Rc::ptr_eq(held, after) && **held != **after
     }
 
     /// Whether no trigger is live.
@@ -418,19 +435,13 @@ impl TriggerFollower {
     pub(crate) fn reemissions(
         &mut self,
         event: &Statement,
-        before: &ParserDB,
-        after: &ParserDB,
-        checks_body_keys: bool,
+        (before, after): (&ParserDB, &ParserDB),
+        captures: (&Rc<Captures>, &Rc<Captures>),
         translate_seeded: &mut Translate<'_>,
         translate_after: &mut Translate<'_>,
     ) -> Result<Vec<Reemission>, Error> {
         let Some(mut touched) = Touched::of(event) else { return Ok(Vec::new()) };
-        touched.body_keys = checks_body_keys
-            && [before, after].into_iter().any(|schema| {
-                schema
-                    .tables()
-                    .any(|table| super::table_shape::foreign_keys(table).next().is_some())
-            });
+        touched.body_keys = self.captures_move(captures);
         let dropped: BTreeSet<TableKey> = match event {
             Statement::Drop {
                 object_type: ObjectType::Table | ObjectType::View, names, ..
@@ -475,9 +486,10 @@ impl TriggerFollower {
         Ok(reemissions)
     }
 
-    /// The live triggers on `tables` whose translation changes as those
-    /// tables take a new replica shape, a seeded trigger compared with what
-    /// `translate_seeded` gives on the schema it came from.
+    /// The live triggers on `tables`, or every live trigger when the
+    /// `captures` body statements keep move, whose translation changes as
+    /// those tables take a new replica shape, a seeded trigger compared with
+    /// what `translate_seeded` gives on the schema it came from.
     ///
     /// # Errors
     ///
@@ -485,13 +497,15 @@ impl TriggerFollower {
     pub(crate) fn reshaped(
         &mut self,
         tables: &[ObjectName],
+        captures: (&Rc<Captures>, &Rc<Captures>),
         translate_seeded: &mut Translate<'_>,
         translate_after: &mut Translate<'_>,
     ) -> Result<Vec<Reemission>, Error> {
+        let every = self.captures_move(captures);
         let tables: BTreeSet<TableKey> = tables.iter().map(table_key).collect();
         let mut reemissions = Vec::new();
         for followed in &mut self.live {
-            if tables.contains(&table_key(&followed.create.table_name)) {
+            if every || tables.contains(&table_key(&followed.create.table_name)) {
                 reemissions.extend(followed.reemission(None, translate_seeded, translate_after)?);
             }
         }

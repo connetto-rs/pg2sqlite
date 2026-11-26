@@ -30,7 +30,10 @@ use crate::{
             create_index::{FtsTranslation, analyze_fts_index},
             deferred_constraint, definer,
             drop_column_rebuild::{LiveAttachments, StatementHistory},
-            hidden_referenced_rows,
+            hidden_referenced_rows::{
+                self,
+                body_statement_keys::{BoundKeys, Captures},
+            },
             overlay::{self, OverlayMirrors},
             postgis,
             reentry::MarkerTables,
@@ -497,6 +500,10 @@ struct PreparedEpoch {
     /// The schemas on either side of each statement a live trigger's
     /// translation can depend on.
     events: Vec<EventSnapshots>,
+    /// The schemas bodies bind their keys against on either side of each
+    /// event, one shared snapshot for each run of snapshots binding equal
+    /// keys.
+    key_bindings: Vec<(Rc<ParserDB>, Rc<ParserDB>)>,
 }
 
 /// The schemas before and after statement `index`.
@@ -572,10 +579,49 @@ impl PreparedEpoch {
 
     /// The key declarations present before statement `index`.
     fn body_key_schema(&self, index: usize) -> &ParserDB {
-        match self.events.iter().find(|event| event.index >= index) {
-            Some(event) => &event.before,
-            None => self.events.last().map_or_else(|| self.written(index), |event| &event.after),
+        match self.events.iter().position(|event| event.index >= index) {
+            Some(position) => &self.key_bindings[position].0,
+            None => {
+                self.key_bindings.last().map_or_else(|| self.written(index), |(_, after)| after)
+            }
         }
+    }
+
+    /// The key declarations present after statement `index`.
+    fn body_key_schema_after(&self, index: usize) -> &ParserDB {
+        match self.events.iter().position(|event| event.index == index) {
+            Some(position) => &self.key_bindings[position].1,
+            None => self.body_key_schema(index),
+        }
+    }
+
+    /// Settles [`Self::key_bindings`] once every event is known.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a snapshot cannot resolve a foreign key.
+    fn settle_key_bindings(&mut self) -> Result<(), crate::errors::Error> {
+        let mut settled: Vec<Rc<ParserDB>> = Vec::with_capacity(2 * self.events.len());
+        let mut bound = None;
+        for snapshot in self.events.iter().flat_map(|event| [&event.before, &event.after]) {
+            let shared = match settled.last() {
+                Some(last) if Rc::ptr_eq(last, snapshot) => Rc::clone(last),
+                last => {
+                    let keys = BoundKeys::of(snapshot)?;
+                    match last {
+                        Some(last) if bound.as_ref() == Some(&keys) => Rc::clone(last),
+                        _ => {
+                            bound = Some(keys);
+                            Rc::clone(snapshot)
+                        }
+                    }
+                }
+            };
+            settled.push(shared);
+        }
+        let mut sides = settled.into_iter();
+        self.key_bindings = core::iter::from_fn(|| Some((sides.next()?, sides.next()?))).collect();
+        Ok(())
     }
 
     /// The schemas on either side of statement `index`, when live triggers can
@@ -683,9 +729,11 @@ struct Trackers {
     shape_triggers: Vec<crate::options::TableTrigger>,
 }
 
-/// A reshape's statements, the schema the replica held before it, and the
-/// tables whose shape it changes.
-type Reshaped<'s> = (Vec<Statement>, &'s ParserDB, &'s ParserDB, Vec<ObjectName>);
+/// A reshape's statements, the schema the replica held before it with the
+/// keys bodies bound against, the tables whose shape it changes, and the
+/// captures body statements keep before and after it.
+type Reshaped<'s> =
+    (Vec<Statement>, (&'s ParserDB, &'s ParserDB), Vec<ObjectName>, (Rc<Captures>, Rc<Captures>));
 
 /// The physical shape, its statement boundary, and its written key metadata.
 type ReplicaShape<'s> = (&'s ParserDB, usize, &'s ParserDB);
@@ -748,10 +796,13 @@ impl Trackers {
         let seeded_context = seeded
             .filter(|_| held_end == 0)
             .map(|triggers| before_context.with_batch_triggers(triggers));
+        let held_context =
+            seeded_context.as_ref().unwrap_or(&before_context).with_body_key_schema(held_binding);
+        let target_context = at.context.with_body_key_schema(binding);
+        let held_captures = Captures::of(before, &held_context)?;
+        let captures = Captures::of(shape, &target_context)?;
         let mut touched = table_shape::Touched::by(&statements[held_end..shape_end]);
-        if triggers_changed || binding_changed {
-            touched.triggers_changed();
-        }
+        touched.captures_moved(held_captures.moved(&captures));
         let (mut reshaped, tables) = {
             let written = at.context.with_history(StatementHistory {
                 attachments: &self.attachments,
@@ -765,18 +816,12 @@ impl Trackers {
                 &mut |statement, schema, side| {
                     let mut warnings = Vec::new();
                     let context = match side {
-                        table_shape::ReplicaSide::Held => {
-                            seeded_context.as_ref().unwrap_or(&before_context)
-                        }
-                        table_shape::ReplicaSide::Target => at.context,
+                        table_shape::ReplicaSide::Held => &held_context,
+                        table_shape::ReplicaSide::Target => &target_context,
                     };
-                    let context = context.with_body_key_schema(match side {
-                        table_shape::ReplicaSide::Held => held_binding,
-                        table_shape::ReplicaSide::Target => binding,
-                    });
                     let translated = self.translate(
                         statement,
-                        Position { schema, binding: schema, context: &context, ..at },
+                        Position { schema, binding: schema, context, ..at },
                         &mut |warning| warnings.push(warning),
                     )?;
                     Ok((translated, warnings))
@@ -787,7 +832,7 @@ impl Trackers {
         self.overlay_mirrors.follow(&mut reshaped, shape, at.context)?;
         self.marker_tables.create_named(&mut reshaped);
         self.attachments.follow_emitted(&reshaped);
-        Ok(Some((reshaped, before, held_binding, tables)))
+        Ok(Some((reshaped, (before, held_binding), tables, (held_captures, captures))))
     }
 
     /// Follows `emitted`, `statement`'s translation, and answers whether
@@ -859,15 +904,17 @@ fn translate_followed(
     let seeded_tables = at.context.with_table_triggers(seeded_triggers);
     let seeded_context = seeded_tables.with_batch_triggers(seeded_triggers);
     let reemissions = match sides {
-        Some((before, after)) if !follower.is_empty() => {
+        Some((before, after)) if !follower.is_empty() && TriggerFollower::is_event(statement) => {
             let seeded = initial.map_or(before, |(initial, _)| {
                 Position { schema: initial, binding: initial, context: &seeded_context, ..before }
             });
+            let captures = |side: Position<'_, '_>| {
+                Captures::of(side.schema, &side.context.with_written_schema(side.binding))
+            };
             follower.reemissions(
                 statement,
-                before.binding,
-                after.binding,
-                !at.context.is_foreign_keys_omitted(),
+                (before.binding, after.binding),
+                (&captures(before)?, &captures(after)?),
                 &mut |source, sink| trackers.translate(source, seeded, sink),
                 &mut |source, sink| trackers.translate(source, after, sink),
             )?
@@ -936,7 +983,7 @@ fn reshape_followed<'a, 's: 'a>(
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Vec<Statement>, crate::errors::Error> {
     let seeded_triggers = initial.map(|(_, triggers)| triggers);
-    let Some((mut emitted, held, held_binding, tables)) = trackers.reshape(
+    let Some((mut emitted, (held, held_binding), tables, captures)) = trackers.reshape(
         applied,
         shape,
         (statements, boundary),
@@ -961,6 +1008,7 @@ fn reshape_followed<'a, 's: 'a>(
     });
     let reemissions = follower.reshaped(
         &tables,
+        (&captures.0, &captures.1),
         &mut |source, sink| trackers.translate(source, seeded, sink),
         &mut |source, sink| trackers.translate(source, after, sink),
     )?;
@@ -1724,6 +1772,7 @@ impl Pg2Sqlite {
             before_index_drops,
             declaration_snapshots,
             events,
+            key_bindings: Vec::new(),
         };
         Ok((input, epoch))
     }
@@ -1780,13 +1829,14 @@ impl Pg2Sqlite {
             sources,
             schema,
             options,
-            epochs,
+            mut epochs,
             had_rls_tables,
             complete: _,
             dispositions,
             initial_schema,
         } = prepared;
         let statements = &*sources;
+        epochs.iter_mut().try_for_each(PreparedEpoch::settle_key_bindings)?;
         register_pending_tables(statements, &epochs, context)?;
         register_left_out_triggers(statements, &epochs, initial_schema.as_ref(), context);
         populate_prewalk_catalogs(statements, &epochs, initial_schema.as_ref(), context);
@@ -1940,7 +1990,7 @@ impl Pg2Sqlite {
                         let shape = epoch_shape(statement, epochs, epoch_index, final_schema)
                             .unwrap_or((&epoch.schema, epoch.schema_end));
                         let before = epoch.body_key_schema(index);
-                        let after = epoch.event(index).map_or(before, |event| &*event.after);
+                        let after = epoch.body_key_schema_after(index);
                         let shape = ((shape.0, shape.1, before), after);
                         let initial =
                             initial_schema.map(|schema| (schema, initial_triggers.as_slice()));

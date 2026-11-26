@@ -208,8 +208,9 @@ pub(crate) struct Touched {
     /// SQLite keeps and every guard's list of roles. The batch's trigger
     /// catalog names a renamed table as the batch leaves it.
     action_runners: bool,
-    /// A migration that can change capture storage used by writing bodies.
-    body_keys: bool,
+    /// The tables, folded, carrying an object of a capture that body
+    /// statements keep on one side of the run and not on the other.
+    captured: Vec<String>,
 }
 
 impl Touched {
@@ -222,20 +223,13 @@ impl Touched {
         touched
     }
 
-    pub(crate) fn triggers_changed(&mut self) {
-        self.action_runners = true;
-        self.body_keys = true;
+    /// Follows the captures body statements keep moving off or onto
+    /// `tables`.
+    pub(crate) fn captures_moved<'n>(&mut self, tables: impl IntoIterator<Item = &'n ObjectName>) {
+        self.captured.extend(tables.into_iter().map(fold));
     }
 
     fn follow(&mut self, statement: &Statement) {
-        self.body_keys |= matches!(
-            statement,
-            Statement::CreateTable(_)
-                | Statement::AlterTable(_)
-                | Statement::CreateTrigger(_)
-                | Statement::DropTrigger(_)
-                | Statement::Drop { object_type: ObjectType::Table, .. }
-        );
         match statement {
             Statement::AlterTable(alter) => {
                 for operation in &alter.operations {
@@ -347,18 +341,17 @@ impl Touched {
         &self,
         (before, after): (&'s ParserDB, &ParserDB),
     ) -> Result<Vec<(&'s CreateTable, Option<&ObjectName>)>, Error> {
-        let body_keys = self.body_keys
-            && [before, after]
-                .into_iter()
-                .any(|schema| schema.tables().any(|table| foreign_keys(table).next().is_some()));
         let candidates = || {
-            before.tables().filter(|table| !table.temporary || body_keys).filter_map(|table| {
-                let name = fold(&table.name);
-                match self.renamed.iter().find(|(from, _)| *from == name) {
-                    Some((_, to)) => Some((table, Some(to))),
-                    None => (!self.replaced.contains(&name)).then_some((table, None)),
-                }
-            })
+            before
+                .tables()
+                .filter(|table| !table.temporary || self.captured.contains(&fold(&table.name)))
+                .filter_map(|table| {
+                    let name = fold(&table.name);
+                    match self.renamed.iter().find(|(from, _)| *from == name) {
+                        Some((_, to)) => Some((table, Some(to))),
+                        None => (!self.replaced.contains(&name)).then_some((table, None)),
+                    }
+                })
         };
         let writes_rows = |schema: &ParserDB| {
             schema.tables().any(|table| {
@@ -374,7 +367,7 @@ impl Touched {
         let mut direct = Vec::new();
         for (table, renamed_to) in candidates() {
             if self.every
-                || body_keys
+                || self.captured.contains(&fold(&table.name))
                 || runners_move
                 || renamed_to.is_some()
                 || self.named.contains(&fold(&table.name))
