@@ -358,6 +358,53 @@ fn a_definer_helper_checks_each_statement() {
     assert_eq!(refusal(&mut connection), pg::FOREIGN_KEY_VIOLATION);
 }
 
+diesel::define_sql_function! {
+    /// Whether a write passes the guards, which no write in these tests does.
+    fn key_write_exempt() -> diesel::sql_types::Bool;
+}
+
+#[test]
+fn a_definer_body_checks_keys_whose_policies_call_what_its_owner_may_not() {
+    let options = Pg2SqliteOptions::default()
+        .with_deployment(crate::helpers::deployment::deployment(["app"], []))
+        .with_rls_audit_table_name("rls_audit")
+        .with_rls_exemption_function("key_write_exempt")
+        .with_acting_role("app");
+    let mut connection = crate::helpers::apply_with_options(
+        "CREATE ROLE app;
+         CREATE ROLE cleaner;
+         CREATE FUNCTION visible(target INT) RETURNS boolean
+         LANGUAGE sql STABLE AS $$ SELECT target > 0 $$;
+         REVOKE EXECUTE ON FUNCTION visible(INT) FROM PUBLIC;
+         GRANT EXECUTE ON FUNCTION visible(INT) TO app;
+         CREATE TABLE hidden (id INT PRIMARY KEY);
+         ALTER TABLE hidden ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY hidden_read ON hidden FOR SELECT TO app USING (visible(id));
+         CREATE TABLE hiding (id INT PRIMARY KEY, hidden INT REFERENCES hidden(id));
+         CREATE TABLE p (id INT PRIMARY KEY);
+         CREATE TABLE t (id INT PRIMARY KEY, parent INT REFERENCES p(id));
+         CREATE TABLE requests (id INT PRIMARY KEY);
+         CREATE FUNCTION remove_parent() RETURNS trigger
+         LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+         BEGIN
+           DELETE FROM public.p WHERE id = NEW.id;
+           DELETE FROM public.t WHERE parent = NEW.id;
+           RETURN NEW;
+         END $$;
+         ALTER FUNCTION remove_parent() OWNER TO cleaner;
+         CREATE TRIGGER remove_parent AFTER INSERT ON requests
+         FOR EACH ROW EXECUTE FUNCTION remove_parent();
+         GRANT ALL ON hidden, hiding, p, t, requests TO app;
+         GRANT ALL ON p, t TO cleaner;",
+        &options,
+    )
+    .expect("the owner's missing EXECUTE on visible() decides nothing about the keys");
+    key_write_exempt_utils::register_nondeterministic_impl(&mut connection, || false)
+        .expect("register the exemption");
+    connection.batch_execute("INSERT INTO p VALUES (1); INSERT INTO t VALUES (2, 1);").unwrap();
+    assert_eq!(refusal(&mut connection), pg::FOREIGN_KEY_VIOLATION);
+}
+
 #[test]
 fn an_unrelated_column_update_leaves_the_unchanged_key_to_the_outer_statement() {
     let mut connection = replica(
