@@ -158,9 +158,18 @@ pub(crate) fn acting_role<'s>(
     schema: &'s ParserDB,
     options: &Pg2SqliteOptions,
 ) -> Result<Option<&'s <ParserDB as DatabaseLike>::Role>, Error> {
+    Ok(acting_role_and_deployment(schema, options)?.map(|(role, _)| role))
+}
+
+/// The acting role this translation runs as, declared in `schema`, and the
+/// deployment declaring it among its acting roles.
+pub(crate) fn acting_role_and_deployment<'s, 'o>(
+    schema: &'s ParserDB,
+    options: &'o Pg2SqliteOptions,
+) -> Result<Option<(&'s <ParserDB as DatabaseLike>::Role, &'o Deployment)>, Error> {
     let Some((role, deployment)) = acting_role_in_deployment(options)? else { return Ok(None) };
     resolve_roles(deployment, schema)?;
-    Ok(schema.role(role))
+    Ok(schema.role(role).map(|role| (role, deployment)))
 }
 
 /// Refuses a reading of the session whose declarations are missing, short of

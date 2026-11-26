@@ -17,8 +17,8 @@ use columns::Columns;
 pub(crate) use firing::FiringTrigger;
 pub(crate) use readers::reads_left_to_server;
 use sql_traits::{
-    structs::ParserDB,
-    traits::{DatabaseLike, FunctionLike, TableLike},
+    structs::{ActingRole, DefinerReading, ParserDB, UnconfinedRead, Unconfinement},
+    traits::{ColumnLike, DatabaseLike, FunctionLike, PolicyLike, TableLike, TriggerLike},
 };
 use sqlparser::{
     ast::{
@@ -37,6 +37,7 @@ use crate::{
     errors::Error,
     impls::{
         object_name::last_ident_value_or_display,
+        session_variable::acting_role_and_deployment,
         translator_impls::{off_replica::OffReplica, overlay, rls::hiding_policies},
         unlabelled_body::unlabelled_body,
     },
@@ -170,11 +171,20 @@ pub(crate) fn derived_targets<'t>(
 /// raise, an assigned or returned value, or `FOUND`, and the statement
 /// reads, as the owner of a `SECURITY DEFINER` function in the chain, a
 /// table the replica holds whose policies may hide rows from the acting
-/// role. The owner reads past those policies on the server, while the
-/// replica holds only the rows the acting role reads, so the trigger would
-/// judge the write on a partial copy. A read that only picks the rows a
-/// write changes or inserts runs on the rows the replica holds, and the
-/// rows the server writes besides arrive with the sync.
+/// role, reaching rows those policies may hide. The owner reads past those
+/// policies on the server, while the replica holds only the rows the acting
+/// role reads, so the trigger would judge the write on a partial copy. A
+/// read that only picks the rows a write changes or inserts runs on the rows
+/// the replica holds, and the rows the server writes besides arrive with the
+/// sync.
+///
+/// Whether such a read reaches only rows the acting role reads is
+/// [`TriggerLike::unconfined_definer_read`]'s answer for the whole chain,
+/// which knows what the trigger's `WHEN`, the write policies of its events,
+/// the trigger table's foreign keys and the deployment's set declarations
+/// hold of `NEW` and `OLD`. The proof stops at the first read it cannot
+/// confine, which the reason names, so a trigger is kept only when every
+/// definer read the proof counts is confined.
 ///
 /// An `INSTEAD OF` trigger is kept, since its writes are the view's own and
 /// the server applying them never fires it, and so is every trigger when no
@@ -183,7 +193,8 @@ pub(crate) fn derived_targets<'t>(
 ///
 /// # Errors
 ///
-/// Fails as [`chain::Walker::read`] and [`hiding_policies`] do.
+/// Fails as [`chain::Walker::read`], [`hiding_policies`] and
+/// [`TriggerLike::unconfined_definer_read`] do.
 pub(crate) fn definer_hidden_read(
     trigger: &CreateTrigger,
     schema: &ParserDB,
@@ -196,40 +207,92 @@ pub(crate) fn definer_hidden_read(
         return Ok(None);
     }
     let Some((_, chain)) = trigger_chain(trigger, schema, options)? else { return Ok(None) };
-    for read in chain.reads.iter().filter(|read| read.decides) {
-        let Some(definer) = read.definer else { continue };
+    if !decides_on_hidden_rows(&chain, schema, options)? {
+        return Ok(None);
+    }
+    let Some((role, deployment)) = acting_role_and_deployment(schema, options)? else {
+        return Ok(None);
+    };
+    let unconfined = trigger.unconfined_definer_read(
+        schema,
+        deployment,
+        ActingRole::Declared(role),
+        DefinerReading::Outcome,
+    )?;
+    Ok(unconfined.as_ref().map(unconfined_reason))
+}
+
+/// Whether a deciding read of `chain`, made as the owner of a `SECURITY
+/// DEFINER` function, reads a table the replica holds whose policies may
+/// hide rows from the acting role.
+///
+/// # Errors
+///
+/// Fails as [`OffReplica::of`] and [`hiding_policies`] do.
+fn decides_on_hidden_rows(
+    chain: &chain::Chain,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<bool, Error> {
+    for read in chain.reads.iter().filter(|read| read.decides && read.definer.is_some()) {
         let Some(table) = schema.tables().find(|table| table.stored_table_name() == read.relation)
         else {
             continue;
         };
-        if OffReplica::of(&table.name, schema, options)?.is_some() {
-            continue;
+        if OffReplica::of(&table.name, schema, options)?.is_none()
+            && hiding_policies(table, schema, options)?.is_some()
+        {
+            return Ok(true);
         }
-        let Some(policies) = hiding_policies(table, schema, options)? else { continue };
-        let reader = read.through.last().map_or("", String::as_str);
-        let callers: Vec<String> =
-            read.through.iter().rev().skip(1).map(|function| format!("{function}()")).collect();
-        let via = if callers.is_empty() {
-            String::new()
-        } else {
-            format!(", called through {},", callers.join(", "))
-        };
-        let hidden = if policies.is_empty() {
-            format!("no policy lets the acting role read a row of {}", read.relation)
-        } else {
-            format!(
-                "{} may hide rows of {} from the acting role",
-                policies.join(", "),
-                read.relation
-            )
-        };
-        return Ok(Some(format!(
-            "{reader}(){via} reads {} as the owner of SECURITY DEFINER {}(), past row-level \
-             security, and {hidden}, whose rows alone the replica holds",
-            read.relation, read.through[definer]
-        )));
     }
-    Ok(None)
+    Ok(false)
+}
+
+/// Why `read`, made as the owner of a `SECURITY DEFINER` function, may reach
+/// rows the replica does not hold: the policy no fact the read rests on
+/// implies, the column the acting role may not select, or a read the proof
+/// cannot follow.
+fn unconfined_reason(read: &UnconfinedRead<'_, ParserDB>) -> String {
+    let through = read.through();
+    let reader = through.last().map_or("", |function| function.name());
+    let definer = through
+        .iter()
+        .rev()
+        .find(|function| function.security_mode() == FunctionSecurity::Definer)
+        .map_or(reader, |function| function.name());
+    let callers: Vec<String> =
+        through.iter().rev().skip(1).map(|function| format!("{}()", function.name())).collect();
+    let via = if callers.is_empty() {
+        String::new()
+    } else {
+        format!(", called through {},", callers.join(", "))
+    };
+    let table = read.table().map_or("a table", TableLike::table_name);
+    let statement =
+        read.statement().map_or_else(String::new, |statement| format!(" in `{statement}`,"));
+    let unconfined = match read.reason() {
+        Unconfinement::Restrictive(policy) => {
+            format!("no fact the read rests on implies the restrictive policy {}", policy.name())
+        }
+        Unconfinement::Permissive(policies) if policies.is_empty() => {
+            format!("no policy lets the acting role read a row of {table}")
+        }
+        Unconfinement::Permissive(policies) => {
+            let names: Vec<&str> = policies.iter().map(|policy| policy.name()).collect();
+            format!("no fact the read rests on implies {}", names.join(" or "))
+        }
+        Unconfinement::HiddenColumn(column) => {
+            format!("the acting role may not select its column {}", column.column_name())
+        }
+        Unconfinement::Unfollowed => {
+            "whether the read reaches only rows the acting role reads cannot be followed".to_owned()
+        }
+    };
+    format!(
+        "{reader}(){via} reads {table} as the owner of SECURITY DEFINER {definer}(), past \
+         row-level security,{statement} and {unconfined}, while the replica holds only the rows \
+         the acting role reads"
+    )
 }
 
 /// The warning for `trigger`, which the replica leaves to the server for
