@@ -67,8 +67,7 @@ use crate::{
     traits::schema::trigger_function,
 };
 
-/// The frames of the definer bodies running on the connection, each holding
-/// its body's owner, innermost last.
+/// The shared stack of ownership, statement, and invocation frames.
 pub(crate) const STACK: &str = "pg2sqlite_definer_frames";
 
 /// The owner of the frame a running foreign key action pushes. PostgreSQL
@@ -89,6 +88,12 @@ pub(crate) const BODY_STATEMENT: &str = "pg_body_statement";
 
 /// A body statement whose enclosing condition did not hold.
 pub(crate) const BODY_STATEMENT_SKIPPED: &str = "pg_body_statement_skipped";
+
+/// A live body invocation holding generated values.
+pub(crate) const BODY_INVOCATION: &str = "pg_body_invocation";
+
+/// A body invocation whose cancellation decision has latched.
+pub(crate) const BODY_INVOCATION_CANCELLED: &str = "pg_body_invocation_cancelled";
 
 type Role = <ParserDB as DatabaseLike>::Role;
 
@@ -260,6 +265,37 @@ pub(crate) fn action_owned_tables<'s>(
         }
     }
     Ok(tables)
+}
+
+/// The owner rewrite applied to statements detached into a loop dispatcher.
+#[derive(Clone, Copy)]
+pub(crate) enum DispatcherOwner<'a> {
+    Definer { function: &'a CreateFunction, owner: &'a Role },
+    Firing { function: &'a ObjectName, owner: &'a Role, guard: &'a Expr },
+}
+
+impl DispatcherOwner<'_> {
+    /// Applies the enclosing body's owner semantics before dispatcher
+    /// registration.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the enclosing body's owner-policy refusal or lookup failure.
+    pub(crate) fn rewrite(
+        self,
+        statements: Vec<Statement>,
+        schema: &ParserDB,
+        options: &crate::options::TranslationContext<'_>,
+    ) -> Result<Vec<Statement>, Error> {
+        match self {
+            Self::Definer { function, owner } => {
+                run_as_owner(function, owner, statements, schema, options)
+            }
+            Self::Firing { function, owner, guard } => {
+                run_as_firing_owner(function, owner, statements, guard, schema, options)
+            }
+        }
+    }
 }
 
 /// `CREATE TABLE IF NOT EXISTS` for [`STACK`], which a translation needs
@@ -454,7 +490,7 @@ pub(crate) fn as_key_action(statements: Vec<Statement>) -> Vec<Statement> {
     let mut framed = Vec::with_capacity(statements.len() + 2);
     framed.push(push(KEY_ACTION, None));
     framed.extend(statements);
-    framed.push(pop(None));
+    framed.push(pop(owner_selection(), None));
     framed
 }
 
@@ -465,7 +501,7 @@ pub(crate) fn as_truncation(statements: Vec<Statement>) -> Vec<Statement> {
     let mut framed = Vec::with_capacity(statements.len() + 2);
     framed.push(push(TRUNCATION, None));
     framed.extend(statements);
-    framed.push(pop(None));
+    framed.push(pop(owner_selection(), None));
     framed
 }
 
@@ -623,15 +659,7 @@ fn innermost_among(owners: &[&str], negated: bool) -> Expr {
             Expr::Value(sqlparser::ast::Value::Number("1".to_string(), false).into()),
             from_relation(plain_table_factor(stack_name())),
             Some(Expr::BinaryOp {
-                left: Box::new(innermost_frame(Some(Expr::In {
-                    expr: Box::new(Expr::Identifier(Ident::new("owner"))),
-                    target: InTarget::List(vec![
-                        string_literal(BODY_STATEMENT),
-                        string_literal(BODY_STATEMENT_SKIPPED),
-                    ]),
-                    negated: true,
-                    global: false,
-                }))),
+                left: Box::new(innermost_frame(Some(owner_selection()))),
                 op: BinaryOperator::And,
                 right: Box::new(listed),
             }),
@@ -714,9 +742,15 @@ fn backed(
     options: &crate::options::TranslationContext<'_>,
 ) -> Result<(Vec<Statement>, bool), Error> {
     let guarded = exempt_somewhere(owner, schema)?
-        || statements.iter().any(|statement| row_write(statement).is_some());
+        || statements.iter().any(|statement| {
+            row_write(statement).is_some()
+                && !super::body_storage::is_internal_write(statement, options)
+        });
     for statement in &mut statements {
         let outcome = visit_relations_mut(statement, |name: &mut ObjectName| {
+            if super::body_storage::is_internal(name, options) {
+                return ControlFlow::Continue(());
+            }
             match backing_or_refusal(owner, name, refusal, schema, options) {
                 Ok(Some(backing)) => {
                     *name = backing;
@@ -766,6 +800,9 @@ pub(crate) fn run_as_firing_owner(
     };
     for statement in &statements {
         let outcome = visit_relations(statement, |name: &ObjectName| {
+            if super::body_storage::is_internal(name, options) {
+                return ControlFlow::Continue(());
+            }
             match binding_table(owner, name, schema, options) {
                 Ok(Some(table)) => ControlFlow::Break(Ok(table)),
                 Ok(None) => ControlFlow::Continue(()),
@@ -801,7 +838,7 @@ fn framed(
     for statement in statements {
         let ignores = ignores_the_write(&statement);
         if ignores && pushed {
-            wrapped.push(pop(guard));
+            wrapped.push(pop(owner_selection(), guard));
         } else if !ignores && !pushed {
             wrapped.push(push(owner.name(), guard));
         }
@@ -809,7 +846,7 @@ fn framed(
         wrapped.push(statement);
     }
     if pushed {
-        wrapped.push(pop(guard));
+        wrapped.push(pop(owner_selection(), guard));
     }
     wrapped
 }
@@ -954,11 +991,39 @@ pub(crate) fn push_body_statement(condition: Option<Expr>) -> Statement {
 
 /// Pops the frame of the completed or skipped body statement.
 pub(crate) fn pop_body_statement() -> Statement {
-    pop(None)
+    pop(super::rls::one_of("owner", &[BODY_STATEMENT, BODY_STATEMENT_SKIPPED]), None)
 }
 
 fn push(owner: &str, guard: Option<&Expr>) -> Statement {
     push_frame(string_literal(owner), guard)
+}
+
+fn owner_selection() -> Expr {
+    Expr::In {
+        expr: Box::new(Expr::Identifier(Ident::new("owner"))),
+        target: InTarget::List(
+            [BODY_STATEMENT, BODY_STATEMENT_SKIPPED, BODY_INVOCATION, BODY_INVOCATION_CANCELLED]
+                .into_iter()
+                .map(string_literal)
+                .collect(),
+        ),
+        negated: true,
+        global: false,
+    }
+}
+
+/// The identity of the innermost invocation.
+pub(crate) fn invocation_frame() -> Expr {
+    Expr::Subquery(Box::new(single_expr_query(
+        simple_function_expr("max", vec![Expr::Identifier(Ident::new("id"))], None),
+        from_relation(plain_table_factor(stack_name())),
+        Some(super::rls::one_of("owner", &[BODY_INVOCATION, BODY_INVOCATION_CANCELLED])),
+    )))
+}
+
+/// Pushes an invocation independently of ownership and statement frames.
+pub(crate) fn push_invocation(guard: Option<&Expr>) -> Statement {
+    push_frame(string_literal(BODY_INVOCATION), guard)
 }
 
 /// Allocates and pushes a frame without changing `last_insert_rowid()`.
@@ -993,8 +1058,8 @@ fn push_frame(owner: Expr, guard: Option<&Expr>) -> Statement {
     )
 }
 
-fn pop(guard: Option<&Expr>) -> Statement {
-    let innermost = innermost_frame(None);
+fn pop(selection: Expr, guard: Option<&Expr>) -> Statement {
+    let innermost = innermost_frame(Some(selection));
     let selection = match guard {
         Some(guard) => {
             Expr::BinaryOp {

@@ -519,7 +519,11 @@ pub(crate) fn column_without_keys_left_to_server(
 
 /// `statements`, a trigger body, with each run of consecutive statements
 /// writing rows between `SELECT function(1)` and `SELECT function(-1)`.
-pub(crate) fn marked(statements: Vec<Statement>, function: &str) -> Vec<Statement> {
+pub(crate) fn marked(
+    statements: Vec<Statement>,
+    function: &str,
+    options: &TranslationContext<'_>,
+) -> Vec<Statement> {
     let call = |step: i64| {
         crate::impls::ast_builder::select_expression_statement(
             crate::impls::function_helpers::simple_function_expr(
@@ -534,7 +538,8 @@ pub(crate) fn marked(statements: Vec<Statement>, function: &str) -> Vec<Statemen
     let mut open = false;
     for statement in statements {
         let writes =
-            matches!(statement, Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_));
+            matches!(statement, Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_))
+                && !super::translator_impls::body_storage::is_internal_write(&statement, options);
         if writes != open {
             marked.push(call(if writes { 1 } else { -1 }));
             open = writes;

@@ -35,7 +35,27 @@ pub(crate) fn trigger(
     condition: Option<Expr>,
     statements: Vec<Statement>,
 ) -> Statement {
-    Statement::CreateTrigger(CreateTrigger {
+    Statement::CreateTrigger(trigger_definition(
+        name,
+        table_name,
+        period,
+        event,
+        for_each_row,
+        condition,
+        statements,
+    ))
+}
+
+pub(crate) fn trigger_definition(
+    name: ObjectName,
+    table_name: ObjectName,
+    period: TriggerPeriod,
+    event: TriggerEvent,
+    for_each_row: bool,
+    condition: Option<Expr>,
+    statements: Vec<Statement>,
+) -> CreateTrigger {
+    CreateTrigger {
         or_alter: false,
         temporary: false,
         or_replace: false,
@@ -57,7 +77,7 @@ pub(crate) fn trigger(
             end_token: keyword_token("END", Keyword::END),
         })),
         characteristics: None,
-    })
+    }
 }
 
 pub(crate) fn insert(table: ObjectName, columns: Vec<ObjectName>, source: Query) -> Statement {

@@ -2099,12 +2099,11 @@ impl<'f> Arguments<'f> {
         self.bound.len()
     }
 
-    /// Each parameter's declared name, `None` for one only `$n` reaches, and
-    /// declared type, with the argument as the parameter's type receives it.
+    /// Each parameter's name and type with its written argument.
     pub(crate) fn into_parameters(
         self,
     ) -> impl Iterator<Item = (Option<&'f Ident>, &'f DataType, Expr)> {
-        self.bound.into_iter().map(|bound| (bound.name, bound.data_type, bound.value))
+        self.bound.into_iter().map(|bound| (bound.name, bound.data_type, bound.written))
     }
 
     /// `body` answering NULL whenever an argument is NULL, as a `STRICT`

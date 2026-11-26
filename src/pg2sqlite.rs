@@ -27,6 +27,7 @@ use crate::{
         object_name::last_ident_value_or_display,
         transaction_blocks::Disposition,
         translator_impls::{
+            body_storage,
             create_index::{FtsTranslation, analyze_fts_index},
             deferred_constraint, definer,
             drop_column_rebuild::{LiveAttachments, StatementHistory},
@@ -362,12 +363,7 @@ fn pragma_on(name: &str) -> Statement {
     }
 }
 
-/// The statements the translation runs ahead of its own, each labelled for a
-/// name collision report: the row-security audit table when the batch is the
-/// first to carry row-level security in any of its `schemas`, a table it drops
-/// included, the definer owner stack when a statement pushes on it, the
-/// deferred constraint check queue, and the drop of what a failed `TRUNCATE`
-/// left on the connection when a statement would trip over it.
+/// The emitted support statements labelled for generated-name collision checks.
 fn generated_prelude<'s>(
     translated: &[Vec<Statement>],
     schemas: impl Iterator<Item = &'s ParserDB>,
@@ -405,12 +401,40 @@ fn generated_prelude<'s>(
         .flatten()
         .any(truncation::checks_every_trigger)
         .then(|| ("the leftover of a failed TRUNCATE", truncation::leftover_drop()));
-    Ok(truncation_leftover
+    let mut prelude: Vec<_> = truncation_leftover
         .into_iter()
         .chain(audit_table)
         .chain(definer_stack)
         .chain(deferred_queue)
-        .collect())
+        .collect();
+    if translated.iter().flatten().any(|statement| body_storage::uses_storage(statement, context)) {
+        prelude.push(("the generated body storage", body_storage::table()));
+        let mut referenced_inputs = BTreeSet::new();
+        for statement in translated.iter().flatten() {
+            let _ = sqlparser::ast::visit_relations(statement, |name| {
+                if let Some(ObjectNamePart::Identifier(identifier)) = name.0.last()
+                    && identifier.value.starts_with("pg2sqlite_body_input_")
+                {
+                    referenced_inputs.insert(identifier.value.clone());
+                }
+                core::ops::ControlFlow::<()>::Continue(())
+            });
+        }
+        prelude.extend(
+            context
+                .body_tables()
+                .into_iter()
+                .filter(|table| {
+                    matches!(
+                        table.name.0.last(),
+                        Some(ObjectNamePart::Identifier(identifier))
+                            if referenced_inputs.contains(&identifier.value)
+                    )
+                })
+                .map(|table| ("a generated body input table", Statement::CreateTable(table))),
+        );
+    }
+    Ok(prelude)
 }
 
 /// `PRAGMA foreign_keys = 1`, which is what makes SQLite enforce a foreign
@@ -1946,6 +1970,7 @@ impl Pg2Sqlite {
         let mut warnings = Vec::new();
         let mut translated = Vec::with_capacity(statements.len());
         let mut rebuilt_triggers = Vec::with_capacity(statements.len());
+        let mut emitted_dispatchers = alloc::collections::BTreeSet::new();
         // The schema whose shape the emitted statements leave the replica in,
         // with the end of the batch statements it holds.
         let mut applied = initial_schema.map(|schema| (schema, 0, schema));
@@ -1994,7 +2019,7 @@ impl Pg2Sqlite {
                         let shape = ((shape.0, shape.1, before), after);
                         let initial =
                             initial_schema.map(|schema| (schema, initial_triggers.as_slice()));
-                        let (emitted, rebuilt) = translate_shaped(
+                        let (mut emitted, rebuilt) = translate_shaped(
                             (&mut trackers, &mut follower),
                             (&mut applied, shape),
                             (statement, &cascaded),
@@ -2003,6 +2028,11 @@ impl Pg2Sqlite {
                             initial,
                             &mut emit,
                         )?;
+                        crate::impls::translator_impls::body_storage::append_dispatchers(
+                            &mut emitted,
+                            context,
+                            &mut emitted_dispatchers,
+                        );
                         rebuilt_triggers[index] = rebuilt;
                         translated.push(emitted);
                     }

@@ -1,5 +1,4 @@
-//! Test that trigger translation properly uses `last_insert_rowid()` pattern
-//! to share UUIDs across multiple INSERTs in a single trigger.
+//! Generated assignments share one stored UUID across multiple `INSERT`s.
 
 use diesel::prelude::*;
 use helpers::establish_connection;
@@ -147,10 +146,9 @@ struct EntityInputInsert {
     name: String,
 }
 
-/// Test that the trigger translation generates the last_insert_rowid() pattern
-/// for sharing UUIDs across multiple INSERTs.
+/// Generated assignments share one stored value across inserts.
 #[test]
-fn test_trigger_translation_uses_last_insert_rowid() {
+fn test_trigger_translation_uses_stored_value() {
     let pg_sql = "
         CREATE TABLE entities (
             id UUID PRIMARY KEY DEFAULT uuidv7(),
@@ -201,21 +199,10 @@ fn test_trigger_translation_uses_last_insert_rowid() {
         translated.iter().map(ToString::to_string).collect::<Vec<_>>().join(";\n");
 
     // Snapshot the translated SQL for consistency checking
-    insta::assert_snapshot!("trigger_last_insert_rowid_pattern", &sqlite_sql);
+    insta::assert_snapshot!("trigger_shared_value_pattern", &sqlite_sql);
 
-    // The second INSERT (ownables) should use last_insert_rowid() to get the
-    // UUID from the first INSERT (entities)
-    assert!(
-        sqlite_sql.contains("last_insert_rowid()"),
-        "Expected the trigger to use last_insert_rowid() pattern for sharing UUIDs.\nGenerated SQL:\n{sqlite_sql}",
-    );
-
-    // The pattern should be: SELECT id FROM entities WHERE rowid =
-    // last_insert_rowid()
-    assert!(
-        sqlite_sql.contains("SELECT id FROM entities WHERE rowid = last_insert_rowid()"),
-        "Expected subquery pattern for retrieving UUID from first INSERT.\nGenerated SQL:\n{sqlite_sql}",
-    );
+    assert!(sqlite_sql.contains("pg2sqlite_body_values"));
+    assert!(!sqlite_sql.contains("last_insert_rowid()"));
 }
 
 /// Test that the translated trigger actually works in SQLite.
@@ -391,5 +378,166 @@ fn test_trigger_three_tables_shared_uuid() {
     assert_eq!(
         entity.id, metadata_record.entity_id,
         "Entity and metadata should reference the same UUID"
+    );
+}
+
+fn assert_generated_value_survives(columns: bool, between: &str) {
+    let entity_columns = if columns { "(id, name)" } else { "" };
+    let ownable_columns = if columns { "(id, owner)" } else { "" };
+    let postgres = format!(
+        "
+        CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT NOT NULL);
+        CREATE TABLE ownables (id UUID PRIMARY KEY REFERENCES entities(id), owner TEXT NOT NULL);
+        CREATE TABLE entity_staging (name TEXT NOT NULL, owner TEXT NOT NULL);
+        CREATE FUNCTION insert_pair() RETURNS trigger LANGUAGE plpgsql AS $$
+        DECLARE generated_id UUID; other_value INTEGER;
+        BEGIN
+            generated_id := uuidv7();
+            INSERT INTO entities {entity_columns} VALUES (generated_id, NEW.name);
+            {between}
+            INSERT INTO ownables {ownable_columns} VALUES (generated_id, NEW.owner);
+            RETURN NEW;
+        END $$;
+        CREATE TRIGGER insert_pair BEFORE INSERT ON entity_staging
+        FOR EACH ROW EXECUTE FUNCTION insert_pair();
+        "
+    );
+    let options = Pg2SqliteOptions::default()
+        .with_uuid_representation(UuidRepresentation::Blob)
+        .with_uuid_v7_function_name("uuidv7");
+    let translated = Pg2Sqlite::default().sql(&postgres).unwrap().translate(&options).unwrap();
+    let mut connection = establish_connection();
+    for statement in translated.into_vec() {
+        diesel::sql_query(statement.to_string()).execute(&mut connection).unwrap();
+    }
+    diesel::insert_into(entity_staging::table)
+        .values(EntityStagingInsert { name: "entity".into(), owner: "owner".into() })
+        .execute(&mut connection)
+        .unwrap();
+    let entity_ids = entities::table.select(entities::id).load::<Vec<u8>>(&mut connection).unwrap();
+    let ownable_ids =
+        ownables::table.select(ownables::id).load::<Vec<u8>>(&mut connection).unwrap();
+    assert_eq!(entity_ids.len(), 1);
+    assert_eq!(entity_ids, ownable_ids);
+}
+
+#[diesel::declare_sql_function]
+extern "SQL" {
+    fn counted_rowid_uuid() -> diesel::sql_types::Binary;
+}
+
+#[test]
+fn invocation_frame_preserves_last_insert_rowid_before_generated_value_capture() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use diesel::connection::SimpleConnection;
+
+    diesel::table! {
+        rowid_seed (id) {
+            id -> Integer,
+        }
+    }
+    diesel::table! {
+        rowid_observations (observed) {
+            observed -> BigInt,
+        }
+    }
+
+    let postgres = "
+        CREATE TABLE rowid_seed (id INTEGER PRIMARY KEY);
+        CREATE TABLE rowid_observations (observed BIGINT PRIMARY KEY);
+        CREATE TABLE entities (id UUID PRIMARY KEY, name TEXT NOT NULL);
+        CREATE TABLE ownables (id UUID PRIMARY KEY, owner TEXT NOT NULL);
+        CREATE TABLE entity_staging (name TEXT NOT NULL, owner TEXT NOT NULL);
+        CREATE FUNCTION insert_pair() RETURNS trigger LANGUAGE plpgsql AS $$
+        DECLARE generated_id UUID;
+        BEGIN
+            INSERT INTO rowid_observations VALUES (last_insert_rowid());
+            generated_id := uuidv7();
+            INSERT INTO entities (id, name) VALUES (generated_id, NEW.name);
+            INSERT INTO ownables (id, owner) VALUES (generated_id, NEW.owner);
+            RETURN NEW;
+        END $$;
+        CREATE TRIGGER insert_pair BEFORE INSERT ON entity_staging
+        FOR EACH ROW EXECUTE FUNCTION insert_pair();
+    ";
+    let options = Pg2SqliteOptions::default()
+        .with_uuid_representation(UuidRepresentation::Blob)
+        .with_uuid_v7_function_name("counted_rowid_uuid");
+    let script = Pg2Sqlite::default().sql(postgres).unwrap().translate_to_sql(&options).unwrap();
+    let mut connection = establish_connection();
+    script.register_functions(&mut connection).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    {
+        let calls = Arc::clone(&calls);
+        counted_rowid_uuid_utils::register_nondeterministic_impl(&mut connection, move || {
+            u128::try_from(calls.fetch_add(1, Ordering::Relaxed) + 1)
+                .unwrap()
+                .to_be_bytes()
+                .to_vec()
+        })
+        .unwrap();
+    }
+    let statements = script.into_vec();
+    assert!(statements.iter().any(|statement| statement.contains("pg2sqlite_body_values")));
+    for statement in statements {
+        connection.batch_execute(&statement).unwrap();
+    }
+    diesel::insert_into(rowid_seed::table)
+        .values(rowid_seed::id.eq(73))
+        .execute(&mut connection)
+        .unwrap();
+    diesel::insert_into(entity_staging::table)
+        .values(EntityStagingInsert { name: "entity".into(), owner: "owner".into() })
+        .execute(&mut connection)
+        .unwrap();
+    assert_eq!(
+        rowid_observations::table
+            .select(rowid_observations::observed)
+            .load::<i64>(&mut connection)
+            .unwrap(),
+        [73]
+    );
+    let entity_ids = entities::table.select(entities::id).load::<Vec<u8>>(&mut connection).unwrap();
+    let ownable_ids =
+        ownables::table.select(ownables::id).load::<Vec<u8>>(&mut connection).unwrap();
+    assert_eq!(entity_ids, [1_u128.to_be_bytes().to_vec()]);
+    assert_eq!(entity_ids, ownable_ids);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn generated_value_without_insert_columns() {
+    assert_generated_value_survives(false, "");
+}
+
+#[test]
+fn generated_value_after_untaken_return() {
+    assert_generated_value_survives(true, "IF false THEN RETURN NULL; END IF;");
+}
+
+#[test]
+fn generated_value_after_perform() {
+    assert_generated_value_survives(true, "PERFORM 1;");
+}
+
+#[test]
+fn generated_value_after_select_into() {
+    assert_generated_value_survives(true, "SELECT 1 INTO other_value;");
+}
+
+#[test]
+fn generated_value_after_notice() {
+    assert_generated_value_survives(true, "RAISE NOTICE 'notice';");
+}
+
+#[test]
+fn generated_value_after_nested_if() {
+    assert_generated_value_survives(
+        true,
+        "IF true THEN IF false THEN RETURN NULL; END IF; END IF;",
     );
 }
