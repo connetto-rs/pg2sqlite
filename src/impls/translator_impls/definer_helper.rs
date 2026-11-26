@@ -534,9 +534,10 @@ fn unsupported_argument(name: &ObjectName, argument: &dyn ToString) -> HelperSet
 const ARM: &str = "arm";
 /// The alias of the table an anti-join reads.
 const BLOCKING: &str = "blocking";
-/// The one column of a walk.
+/// The walk's columns, one per column of the key it walks, numbered from 0.
 const NODE: &str = "node";
-/// The alias of the edges a walk follows, and their two columns.
+/// The alias of the edges a walk follows, and their columns, a next and a
+/// previous one per column of the key, numbered as the walk's.
 const EDGE: &str = "edge";
 const NEXT: &str = "next";
 const PREVIOUS: &str = "previous";
@@ -619,7 +620,18 @@ impl<'db> Lowering<'_, 'db> {
         if !walked {
             return Ok(make_query(None, arms));
         }
-        Ok(self.reached(arms, union(edges, SetQuantifier::All), selection, names))
+        // A walk holds its key's columns, and a selection reselects one.
+        let arity = set
+            .arms()
+            .iter()
+            .find_map(|arm| {
+                match arm {
+                    HelperArm::Walk(walk) => Some(walk.key().len()),
+                    _ => None,
+                }
+            })
+            .unwrap_or(1);
+        Ok(self.reached(arms, union(edges, SetQuantifier::All), selection, arity, names))
     }
 
     /// The name and arguments of a call to `function` with `arguments`.
@@ -717,25 +729,38 @@ impl<'db> Lowering<'_, 'db> {
         }
     }
 
-    /// `WITH [RECURSIVE] <walk> (node) AS (<arms> [UNION <step>]) SELECT node
-    /// [AS <name>] FROM <walk> [WHERE node IN (<selection>)]`, one step adding
-    /// the next row along every edge from a row the walk holds.
+    /// `WITH [RECURSIVE] <walk> (node_0, ...) AS (<arms> [UNION <step>])
+    /// SELECT node_0 [AS <name>], ... FROM <walk> [WHERE (node_0, ...) IN
+    /// (<selection>)]`, a walk of `arity` columns, one step adding the next
+    /// row along every edge from a row the walk holds.
     ///
-    /// The step joins the walk once, to the union of the edges, since both
-    /// engines read a recursive reference in only one place.
+    /// The step joins the walk once, to the union of the edges, on every
+    /// column, since both engines read a recursive reference in only one
+    /// place.
     fn reached(
         &mut self,
         arms: SetExpr,
         edges: Option<SetExpr>,
         selection: Option<SetExpr>,
+        arity: usize,
         names: &[Ident],
     ) -> Query {
         let walk = self.walk_name();
         let recursive = edges.is_some();
         let body = match edges {
             Some(edges) => {
+                let reached = (0..arity).map(|position| {
+                    equals(
+                        qualified(EDGE, numbered(PREVIOUS, position)),
+                        qualified(&walk.value, numbered(NODE, position)),
+                    )
+                });
                 let step = make_simple_select(
-                    vec![SelectItem::UnnamedExpr(qualified(EDGE, Ident::new(NEXT)))],
+                    (0..arity)
+                        .map(|position| {
+                            SelectItem::UnnamedExpr(qualified(EDGE, numbered(NEXT, position)))
+                        })
+                        .collect(),
                     vec![TableWithJoins {
                         relation: plain_table_factor(ObjectName::from(vec![walk.clone()])),
                         joins: vec![Join {
@@ -746,10 +771,10 @@ impl<'db> Lowering<'_, 'db> {
                                 sample: None,
                             },
                             global: false,
-                            join_operator: JoinOperator::Join(JoinConstraint::On(equals(
-                                qualified(EDGE, Ident::new(PREVIOUS)),
-                                qualified(&walk.value, Ident::new(NODE)),
-                            ))),
+                            join_operator: JoinOperator::Join(
+                                conjunction(reached)
+                                    .map_or(JoinConstraint::None, JoinConstraint::On),
+                            ),
                         }],
                     }],
                     None,
@@ -762,7 +787,11 @@ impl<'db> Lowering<'_, 'db> {
             alias: TableAlias {
                 explicit: false,
                 name: walk.clone(),
-                columns: vec![TableAliasColumnDef { name: Ident::new(NODE), data_type: None }],
+                columns: (0..arity)
+                    .map(|position| {
+                        TableAliasColumnDef { name: numbered(NODE, position), data_type: None }
+                    })
+                    .collect(),
                 at: None,
             },
             query: Box::new(make_query(None, body)),
@@ -770,11 +799,12 @@ impl<'db> Lowering<'_, 'db> {
             materialized: None,
             closing_paren_token: AttachedToken::empty(),
         };
-        let node = Expr::Identifier(Ident::new(NODE));
-        let kept = selection.map(|selection| in_query(node.clone(), make_query(None, selection)));
+        let nodes = || (0..arity).map(|position| Expr::Identifier(numbered(NODE, position)));
+        let kept = selection
+            .map(|selection| in_query(row(nodes().collect()), make_query(None, selection)));
         let with = With { with_token: AttachedToken::empty(), recursive, cte_tables: vec![cte] };
         let walked = make_simple_select(
-            projection([node], names),
+            projection(nodes(), names),
             from_relation(plain_table_factor(ObjectName::from(vec![walk]))),
             kept,
         );
@@ -793,20 +823,15 @@ impl<'db> Lowering<'_, 'db> {
         }
     }
 
-    /// `SELECT <next> AS next, <previous> AS previous FROM <table> [WHERE
-    /// <conditions>]`, the edges of one walk, each from the row the walk holds
-    /// to the row it adds, kept to the rows the walk's term follows.
+    /// The edges of one walk, `SELECT <next> AS next_0, ..., <previous> AS
+    /// previous_0, ... FROM <table> [WHERE <conditions>]`, each from the row
+    /// the walk holds to the row it adds by every column of the key, kept to
+    /// the rows the walk's term follows.
     fn edge(&mut self, walk: &WalkArm<'db, ParserDB>) -> Result<SetExpr, Error> {
         self.read.push(walk.table());
         let (next, previous) = match walk.direction() {
-            WalkDirection::Down => (walk.child(), walk.column()),
-            WalkDirection::Up => (walk.column(), walk.child()),
-        };
-        let projected = |column: &<ParserDB as DatabaseLike>::Column, name: &str| {
-            SelectItem::ExprWithAlias {
-                expr: qualified(ARM, declared_column_ident(column)),
-                alias: Ident::new(name),
-            }
+            WalkDirection::Down => (walk.child(), walk.parent()),
+            WalkDirection::Up => (walk.parent(), walk.child()),
         };
         let mut conditions: Vec<Expr> = restrictions(ARM, walk.restrictions())
             .chain(time_bounds(ARM, walk.time_bounds()))
@@ -815,7 +840,7 @@ impl<'db> Lowering<'_, 'db> {
             conditions.push(self.exclusion(exclusion)?);
         }
         Ok(SetExpr::Select(Box::new(make_simple_select(
-            vec![projected(next, NEXT), projected(previous, PREVIOUS)],
+            numbered_columns(next, NEXT).chain(numbered_columns(previous, PREVIOUS)).collect(),
             from_relation(aliased_table(walk.table(), ARM)),
             conjunction(conditions),
         ))))
@@ -931,7 +956,7 @@ impl<'db> Lowering<'_, 'db> {
             conditions.extend(time_bounds(&name, joined.time_bounds()));
         }
         match grant.granted_to() {
-            GrantedTo::Request(comparison) => conditions.push(request(comparison)),
+            GrantedTo::Request(comparisons) => conditions.extend(comparisons.iter().map(request)),
             GrantedTo::Set(grantees) => {
                 let set = self.called_set(grantees.function(), grantees.arguments());
                 conditions
@@ -994,7 +1019,7 @@ impl<'db> Lowering<'_, 'db> {
 
     /// `[<setting> IS NULL OR] (<operands>) IN (<set>)`.
     fn cap(&mut self, cap: &RowCap<'db, ParserDB>) -> Expr {
-        let mut operands: Vec<Expr> = cap
+        let operands: Vec<Expr> = cap
             .operands()
             .iter()
             .map(|operand| {
@@ -1007,10 +1032,7 @@ impl<'db> Lowering<'_, 'db> {
                 }
             })
             .collect();
-        let row = match operands.len() {
-            1 => operands.remove(0),
-            _ => Expr::Tuple(operands),
-        };
+        let row = row(operands);
         // `SELECT NULL WHERE false` has one column, so a row cap cannot compare
         // with it.
         let capped = if cap.set().arms().is_empty() {
@@ -1139,7 +1161,35 @@ fn joined_alias(row: usize) -> String {
 /// The name a called arm reads the column of its helper's rows at `position`
 /// under.
 fn called_column(position: usize) -> Ident {
-    Ident::new(format!("column_{position}"))
+    numbered("column", position)
+}
+
+/// `<name>_<position>`, the column at `position` of a list of columns named
+/// `name`.
+fn numbered(name: &str, position: usize) -> Ident {
+    Ident::new(format!("{name}_{position}"))
+}
+
+/// `arm.<column> AS <name>_<position>` for the column at each position of
+/// `columns`.
+fn numbered_columns<'c>(
+    columns: &'c [&<ParserDB as DatabaseLike>::Column],
+    name: &'c str,
+) -> impl Iterator<Item = SelectItem> + 'c {
+    columns.iter().enumerate().map(move |(position, column)| {
+        SelectItem::ExprWithAlias {
+            expr: qualified(ARM, declared_column_ident(column)),
+            alias: numbered(name, position),
+        }
+    })
+}
+
+/// `values` as one row, the value itself for one value.
+fn row(mut values: Vec<Expr>) -> Expr {
+    match values.len() {
+        1 => values.remove(0),
+        _ => Expr::Tuple(values),
+    }
 }
 
 /// The values an arm returning `returned` projects, `read` writing a value
