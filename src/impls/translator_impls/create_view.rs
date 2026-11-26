@@ -122,33 +122,22 @@ fn reads_as_the_invoker(options: &CreateTableOptions) -> bool {
 /// `security_invoker`, which picks the relations the view reads, and a
 /// `check_option` of `local` or `cascaded`, which its triggers apply.
 fn unsupported_option(options: &CreateTableOptions) -> Option<&SqlOption> {
-    match options {
-        CreateTableOptions::None => None,
-        CreateTableOptions::With(pairs) => pairs.iter().find(|pair| {
-            let SqlOption::KeyValue { key, value } = pair else { return true };
-            let named = |text: &str| match value {
-                Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(text),
-                Expr::Value(literal) => {
-                    matches!(&literal.value, Value::SingleQuotedString(written) if written.eq_ignore_ascii_case(text))
-                }
-                _ => false,
-            };
-            !(option_named(key, "security_invoker")
-                && matches!(value, Expr::Value(literal) if matches!(literal.value, Value::Boolean(_)))
-                || option_named(key, "check_option") && (named("local") || named("cascaded")))
-        }),
-        _ => options_first(options),
-    }
-}
-
-fn options_first(options: &CreateTableOptions) -> Option<&SqlOption> {
-    match options {
+    let pairs: &[SqlOption] = match options {
+        CreateTableOptions::None => &[],
         CreateTableOptions::With(pairs)
         | CreateTableOptions::Options(pairs)
         | CreateTableOptions::Plain(pairs)
-        | CreateTableOptions::TableProperties(pairs) => pairs.first(),
-        CreateTableOptions::None => None,
-    }
+        | CreateTableOptions::TableProperties(pairs) => pairs,
+    };
+    let with = matches!(options, CreateTableOptions::With(_));
+    pairs.iter().find(|pair| !with || !supported(pair))
+}
+
+/// Whether the replica carries the `WITH` option `pair` of a view, whose
+/// value the schema has already read as PostgreSQL does.
+fn supported(pair: &SqlOption) -> bool {
+    matches!(pair, SqlOption::KeyValue { key, .. }
+        if option_named(key, "security_invoker") || option_named(key, "check_option"))
 }
 
 fn option_named(key: &ObjectName, name: &str) -> bool {

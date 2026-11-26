@@ -50,6 +50,163 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// A table without row-level security the acting role may read.
+    items (id) {
+        /// Primary key.
+        id -> Integer,
+        /// The item holding this one.
+        parent_id -> Nullable<Integer>,
+        /// A note with a default.
+        note -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    /// `items` through a view passing `id` through as `item`.
+    item_moves (item) {
+        /// Primary key of the item.
+        item -> Integer,
+        /// The item holding this one.
+        parent_id -> Nullable<Integer>,
+    }
+}
+
+diesel::table! {
+    /// `items` through a view passing every column through.
+    item_rows (id) {
+        /// Primary key.
+        id -> Integer,
+        /// The item holding this one.
+        parent_id -> Nullable<Integer>,
+        /// A note with a default.
+        note -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    /// `items` through a second view passing every column through.
+    curated_rows (id) {
+        /// Primary key.
+        id -> Integer,
+        /// The item holding this one.
+        parent_id -> Nullable<Integer>,
+        /// A note with a default.
+        note -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    /// `items` through a view passing the key and computing a column.
+    doubled_items (id) {
+        /// Primary key.
+        id -> Integer,
+        /// Twice the key.
+        doubled -> Integer,
+    }
+}
+
+diesel::table! {
+    /// A table keyed by a serial.
+    counters (id) {
+        /// Primary key, drawn by the serial.
+        id -> Integer,
+        /// The counter holding this one.
+        parent_id -> Nullable<Integer>,
+    }
+}
+
+diesel::table! {
+    /// `counters` through a view passing every column through.
+    counter_rows (id) {
+        /// Primary key.
+        id -> Integer,
+        /// The counter holding this one.
+        parent_id -> Nullable<Integer>,
+    }
+}
+
+diesel::table! {
+    /// `counters` through a view leaving the key out.
+    counter_parents (parent_id) {
+        /// The counter holding a counter.
+        parent_id -> Nullable<Integer>,
+    }
+}
+
+diesel::table! {
+    /// A table keyed by two quoted columns.
+    links (from_id, to_id) {
+        /// The first key column.
+        #[sql_name = "From"]
+        from_id -> Integer,
+        /// The second key column.
+        #[sql_name = "To"]
+        to_id -> Integer,
+        /// The weight of the link.
+        weight -> Nullable<Integer>,
+    }
+}
+
+diesel::table! {
+    /// `links` through a view passing every column through.
+    link_weights (from_id, to_id) {
+        /// The first key column.
+        #[sql_name = "From"]
+        from_id -> Integer,
+        /// The second key column.
+        #[sql_name = "To"]
+        to_id -> Integer,
+        /// The weight of the link.
+        weight -> Nullable<Integer>,
+    }
+}
+
+diesel::table! {
+    /// A table without a primary key.
+    tags (name) {
+        /// The tag's name.
+        name -> Text,
+        /// The weight of the tag.
+        weight -> Nullable<Integer>,
+    }
+}
+
+diesel::table! {
+    /// `tags` through a view passing every column through.
+    tag_weights (name) {
+        /// The tag's name.
+        name -> Text,
+        /// The weight of the tag.
+        weight -> Nullable<Integer>,
+    }
+}
+
+diesel::table! {
+    /// Requests whose triggers write through `resource_moves`.
+    requests (id) {
+        /// Primary key.
+        id -> Integer,
+        /// Which trigger acts: 1 moves, 2 and 3 insert, 4 deletes.
+        kind -> Integer,
+        /// The resource written.
+        target -> Integer,
+        /// The parent written.
+        parent -> Nullable<Integer>,
+    }
+}
+
+diesel::table! {
+    /// `resource_moves` passing `id` through as `resource`.
+    #[sql_name = "resource_moves"]
+    renamed_moves (resource) {
+        /// Primary key of the resource moved.
+        resource -> Integer,
+        /// The resource holding this one.
+        parent_id -> Integer,
+    }
+}
+
 /// `resources` under forced row-level security, which `app` may archive and
 /// may move only through `resource_moves`, owned by `mover`, which bypasses
 /// the policies. `view_options` follows the view's name and `grants` hands
@@ -227,4 +384,442 @@ fn a_translated_move_returning_rows_is_refused() {
         .expect_err("the write is refused")
         .to_string();
     assert!(error.contains("check option of view resource_moves"), "{error}");
+}
+
+/// `app` holds privileges on the view alone, so the table it reads is left
+/// off `app`'s replica. The view gets no triggers there, the replica applies,
+/// and a write through the view does not land.
+#[test]
+fn a_view_over_a_table_off_the_replica_applies_and_refuses_writes() {
+    let mut connection = helpers::apply_with_options(
+        "CREATE ROLE app NOLOGIN;
+         CREATE TABLE resources (id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL);
+         CREATE VIEW resource_moves AS SELECT id AS resource, parent_id FROM resources WHERE parent_id > 0;
+         GRANT SELECT, UPDATE (parent_id) ON resource_moves TO app;",
+        &acting(),
+    )
+    .expect("the script applies");
+    let moved = diesel::update(renamed_moves::table.filter(renamed_moves::resource.eq(1)))
+        .set(renamed_moves::parent_id.eq(2))
+        .execute(&mut connection);
+    assert!(moved.is_err(), "{moved:?}");
+}
+
+/// The options of `app`'s replica.
+fn acting() -> Pg2SqliteOptions {
+    Pg2SqliteOptions::default()
+        .with_rls_audit_table_name("rls_audit")
+        .with_rls_exemption_function("server_delivery")
+        .with_deployment(deployment(["app"], []))
+        .with_acting_role("app")
+}
+
+/// Applies `script` under `options`, then lands `seed` past the guards, as
+/// the server delivers rows.
+fn delivered(
+    script: &str,
+    options: &Pg2SqliteOptions,
+    seed: impl FnOnce(&mut SqliteConnection),
+) -> SqliteConnection {
+    let mut connection = helpers::apply_with_options(script, options).expect("the script applies");
+    server_delivery_utils::register_nondeterministic_impl(&mut connection, || true)
+        .expect("exempt the delivery");
+    seed(&mut connection);
+    server_delivery_utils::register_nondeterministic_impl(&mut connection, || false)
+        .expect("end the exemption");
+    connection
+}
+
+/// `items` holding `(1, 1)` and `(2, 0)`, which `app` reads, owned by the
+/// schema, with `views` and their grants after it.
+fn items_replica(views: &str, options: &Pg2SqliteOptions) -> SqliteConnection {
+    delivered(
+        &format!(
+            "CREATE ROLE app;
+             CREATE ROLE mover;
+             CREATE ROLE curator;
+             CREATE TABLE items (id INT PRIMARY KEY, parent_id INT, note TEXT DEFAULT 'fresh');
+             GRANT SELECT ON items TO app;
+             {views}"
+        ),
+        options,
+        |connection| {
+            diesel::insert_into(items::table)
+                .values(&[
+                    (items::id.eq(1), items::parent_id.eq(Some(1))),
+                    (items::id.eq(2), items::parent_id.eq(Some(0))),
+                ])
+                .execute(connection)
+                .expect("seed the items");
+        },
+    )
+}
+
+fn item(connection: &mut SqliteConnection, id: i32) -> Option<(Option<i32>, Option<String>)> {
+    items::table
+        .filter(items::id.eq(id))
+        .select((items::parent_id, items::note))
+        .first(connection)
+        .optional()
+        .expect("the items read")
+}
+
+/// A write through the view inside a trigger body stays on the view, whose
+/// triggers make it as the view's owner, and the owner's missing `DELETE`
+/// refuses the delete.
+#[test]
+fn writes_through_the_view_in_a_trigger_body_run_as_the_owner() {
+    let mut connection = replica(
+        CHECKED,
+        "GRANT SELECT, INSERT, UPDATE (parent_id), DELETE ON resource_moves TO app;
+         CREATE TABLE requests (id INT PRIMARY KEY, kind INT NOT NULL, target INT NOT NULL, parent INT);
+         GRANT SELECT, INSERT ON requests TO app;
+         CREATE FUNCTION request_move() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+         BEGIN UPDATE resource_moves SET parent_id = NEW.parent WHERE id = NEW.target; RETURN NEW; END $$;
+         CREATE FUNCTION request_add() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+         BEGIN INSERT INTO resource_moves VALUES (NEW.target, NEW.parent); RETURN NEW; END $$;
+         CREATE FUNCTION request_named_add() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+         BEGIN INSERT INTO resource_moves (id, parent_id) VALUES (NEW.target, NEW.parent); RETURN NEW; END $$;
+         CREATE FUNCTION request_drop() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+         BEGIN DELETE FROM resource_moves WHERE id = NEW.target; RETURN NEW; END $$;
+         CREATE TRIGGER requests_move AFTER INSERT ON requests FOR EACH ROW WHEN (NEW.kind = 1) EXECUTE FUNCTION request_move();
+         CREATE TRIGGER requests_add AFTER INSERT ON requests FOR EACH ROW WHEN (NEW.kind = 2) EXECUTE FUNCTION request_add();
+         CREATE TRIGGER requests_named_add AFTER INSERT ON requests FOR EACH ROW WHEN (NEW.kind = 3) EXECUTE FUNCTION request_named_add();
+         CREATE TRIGGER requests_drop AFTER INSERT ON requests FOR EACH ROW WHEN (NEW.kind = 4) EXECUTE FUNCTION request_drop();",
+    );
+    let mut request = |id: i32, kind: i32, target: i32, parent: Option<i32>| {
+        diesel::insert_into(requests::table)
+            .values((
+                requests::id.eq(id),
+                requests::kind.eq(kind),
+                requests::target.eq(target),
+                requests::parent.eq(parent),
+            ))
+            .execute(&mut connection)
+    };
+    request(1, 1, 1, Some(2)).expect("the move runs");
+    request(2, 2, 3, Some(1)).expect("the insert runs");
+    request(3, 3, 4, Some(1)).expect("the named insert runs");
+    assert_eq!(refusal(request(4, 4, 1, None)), pg::INSUFFICIENT_PRIVILEGE);
+    assert_eq!(parent(&mut connection, 1), Some(2));
+    assert_eq!(parent(&mut connection, 3), Some(1));
+    assert_eq!(parent(&mut connection, 4), Some(1));
+}
+
+/// PostgreSQL checks only the outer view's condition under `LOCAL`, and the
+/// replica, reading the row back through the outer view, would apply an inner
+/// view's condition too.
+#[test]
+fn local_over_an_unchecked_filtering_view_is_refused() {
+    let error = pg2sqlite::prelude::Pg2Sqlite::default()
+        .sql(
+            "CREATE ROLE app;
+             CREATE TABLE items (id INT PRIMARY KEY, parent_id INT);
+             GRANT SELECT ON items TO app;
+             CREATE VIEW positive_items AS SELECT id, parent_id FROM items WHERE parent_id > 0;
+             CREATE VIEW small_items WITH (check_option = local) AS
+               SELECT id, parent_id FROM positive_items WHERE parent_id < 10;",
+        )
+        .expect("parse")
+        .translate_to_sql(&acting())
+        .expect_err("the view is refused")
+        .to_string();
+    assert!(error.contains("WITH LOCAL CHECK OPTION over view positive_items"), "{error}");
+}
+
+/// `LOCAL` over a view checking its own rows, or over one admitting every
+/// row, checks the outer condition, and the inner check option still refuses
+/// a row its view would not show.
+#[test]
+fn local_over_a_checked_or_unfiltered_view_checks_the_outer_condition() {
+    for (inner, below_inner) in [
+        (
+            "WITH (check_option = cascaded) AS SELECT id, parent_id FROM items WHERE parent_id > 0",
+            true,
+        ),
+        ("AS SELECT id, parent_id FROM items", false),
+    ] {
+        let mut connection = items_replica(
+            &format!(
+                "CREATE VIEW inner_items {inner};
+                 CREATE VIEW item_moves WITH (check_option = local) AS
+                   SELECT id AS item, parent_id FROM inner_items WHERE parent_id < 10;
+                 GRANT SELECT, UPDATE ON item_moves TO app;"
+            ),
+            &acting(),
+        );
+        let mut move_to = |parent: i32| {
+            diesel::update(item_moves::table.filter(item_moves::item.eq(1)))
+                .set(item_moves::parent_id.eq(parent))
+                .execute(&mut connection)
+        };
+        move_to(5).expect("the move runs");
+        assert_eq!(refusal(move_to(20)), pg::WITH_CHECK_OPTION_VIOLATION);
+        let below = move_to(-1);
+        if below_inner {
+            assert_eq!(refusal(below), pg::WITH_CHECK_OPTION_VIOLATION);
+            assert_eq!(item(&mut connection, 1), Some((Some(5), Some("fresh".to_owned()))));
+        } else {
+            below.expect("the outer condition admits the row");
+            assert_eq!(item(&mut connection, 1), Some((Some(-1), Some("fresh".to_owned()))));
+        }
+    }
+}
+
+/// `curator` owns a checked view over `mover`'s view and writes it with its
+/// own privileges on that view, which lack `DELETE`.
+#[test]
+fn a_checked_view_over_an_owner_s_view_writes_with_its_owner_s_privileges() {
+    let mut connection = items_replica(
+        "GRANT SELECT, INSERT, UPDATE ON items TO mover;
+         CREATE VIEW inner_items AS SELECT id, parent_id FROM items WHERE parent_id > 0;
+         ALTER VIEW inner_items OWNER TO mover;
+         GRANT SELECT, INSERT, UPDATE (parent_id) ON inner_items TO curator;
+         CREATE VIEW item_moves WITH (check_option = cascaded) AS
+           SELECT id AS item, parent_id FROM inner_items WHERE parent_id < 10;
+         ALTER VIEW item_moves OWNER TO curator;
+         GRANT SELECT, INSERT, UPDATE (parent_id), DELETE ON item_moves TO app;",
+        &acting(),
+    );
+    diesel::update(item_moves::table.filter(item_moves::item.eq(1)))
+        .set(item_moves::parent_id.eq(5))
+        .execute(&mut connection)
+        .expect("the move runs");
+    let outside = diesel::update(item_moves::table.filter(item_moves::item.eq(1)))
+        .set(item_moves::parent_id.eq(-1))
+        .execute(&mut connection);
+    assert_eq!(refusal(outside), pg::WITH_CHECK_OPTION_VIOLATION);
+    diesel::insert_into(item_moves::table)
+        .values((item_moves::item.eq(3), item_moves::parent_id.eq(Some(1))))
+        .execute(&mut connection)
+        .expect("the insert runs");
+    let deleted =
+        diesel::delete(item_moves::table.filter(item_moves::item.eq(1))).execute(&mut connection);
+    assert_eq!(refusal(deleted), pg::INSUFFICIENT_PRIVILEGE);
+    assert_eq!(item(&mut connection, 1), Some((Some(5), Some("fresh".to_owned()))));
+    assert_eq!(item(&mut connection, 3), Some((Some(1), Some("fresh".to_owned()))));
+}
+
+/// The owner inserts only the columns it holds `INSERT` on, and a value for
+/// another column is refused, as is one for a column the acting role lacks
+/// `INSERT` on. An omitted column takes the table's default.
+#[test]
+fn an_insert_through_the_view_keeps_to_both_roles_column_privileges() {
+    let mut connection = items_replica(
+        "GRANT SELECT, INSERT (id), UPDATE ON items TO mover;
+         CREATE VIEW item_rows AS SELECT id, parent_id, note FROM items;
+         ALTER VIEW item_rows OWNER TO mover;
+         GRANT SELECT, INSERT ON item_rows TO app;
+         GRANT SELECT, INSERT, UPDATE ON items TO curator;
+         CREATE VIEW curated_rows AS SELECT id, parent_id, note FROM items;
+         ALTER VIEW curated_rows OWNER TO curator;
+         GRANT SELECT, INSERT (id, parent_id) ON curated_rows TO app;",
+        &acting(),
+    );
+    diesel::insert_into(item_rows::table)
+        .values(item_rows::id.eq(5))
+        .execute(&mut connection)
+        .expect("the owner inserts the key");
+    let refused = diesel::insert_into(item_rows::table)
+        .values((
+            item_rows::id.eq(6),
+            item_rows::parent_id.eq(Some(1)),
+            item_rows::note.eq(Some("x")),
+        ))
+        .execute(&mut connection);
+    assert_eq!(refusal(refused), pg::INSUFFICIENT_PRIVILEGE);
+    diesel::insert_into(curated_rows::table)
+        .values((curated_rows::id.eq(7), curated_rows::parent_id.eq(Some(1))))
+        .execute(&mut connection)
+        .expect("the insert runs");
+    let refused = diesel::insert_into(curated_rows::table)
+        .values((
+            curated_rows::id.eq(8),
+            curated_rows::parent_id.eq(Some(1)),
+            curated_rows::note.eq(Some("x")),
+        ))
+        .execute(&mut connection);
+    assert_eq!(refusal(refused), pg::INSUFFICIENT_PRIVILEGE);
+    assert_eq!(item(&mut connection, 5), Some((None, Some("fresh".to_owned()))));
+    assert_eq!(item(&mut connection, 6), None);
+    assert_eq!(item(&mut connection, 7), Some((Some(1), Some("fresh".to_owned()))));
+    assert_eq!(item(&mut connection, 8), None);
+}
+
+/// PostgreSQL refuses a value for a column the view computes.
+#[test]
+fn a_value_for_a_computed_column_is_refused() {
+    let mut connection = items_replica(
+        "GRANT SELECT, INSERT ON items TO mover;
+         CREATE VIEW doubled_items WITH (check_option = cascaded) AS
+           SELECT id, id * 2 AS doubled FROM items WHERE parent_id > 0;
+         ALTER VIEW doubled_items OWNER TO mover;
+         GRANT SELECT, INSERT ON doubled_items TO app;",
+        &acting(),
+    );
+    let inserted = diesel::insert_into(doubled_items::table)
+        .values((doubled_items::id.eq(3), doubled_items::doubled.eq(6)))
+        .execute(&mut connection);
+    assert_eq!(refusal(inserted), pg::FEATURE_NOT_SUPPORTED);
+}
+
+/// `counters` holding `(1, 1)`, with `views` over it owned by `mover`.
+fn counters_replica(views: &str) -> SqliteConnection {
+    delivered(
+        &format!(
+            "CREATE ROLE app;
+             CREATE ROLE mover;
+             CREATE TABLE counters (id SERIAL PRIMARY KEY, parent_id INT);
+             GRANT USAGE ON SEQUENCE counters_id_seq TO app, mover;
+             GRANT SELECT ON counters TO app;
+             GRANT SELECT, INSERT, UPDATE ON counters TO mover;
+             {views}"
+        ),
+        &acting(),
+        |connection| {
+            diesel::insert_into(counters::table)
+                .values((counters::id.eq(1), counters::parent_id.eq(Some(1))))
+                .execute(connection)
+                .expect("seed the counters");
+        },
+    )
+}
+
+/// An insert leaving the serial key out draws it, and the check reads the
+/// row back by the key drawn.
+#[test]
+fn an_insert_drawing_its_serial_key_is_checked() {
+    let mut connection = counters_replica(
+        "CREATE VIEW counter_rows WITH (check_option = cascaded) AS
+           SELECT id, parent_id FROM counters WHERE parent_id > 0;
+         ALTER VIEW counter_rows OWNER TO mover;
+         GRANT SELECT, INSERT ON counter_rows TO app;",
+    );
+    diesel::insert_into(counter_rows::table)
+        .values(counter_rows::parent_id.eq(Some(1)))
+        .execute(&mut connection)
+        .expect("the insert runs");
+    let outside = diesel::insert_into(counter_rows::table)
+        .values(counter_rows::parent_id.eq(Some(-1)))
+        .execute(&mut connection);
+    assert_eq!(refusal(outside), pg::WITH_CHECK_OPTION_VIOLATION);
+    let stored: i64 = counters::table.count().get_result(&mut connection).expect("count");
+    assert_eq!(stored, 2);
+}
+
+/// A view leaving the table's key out gives the replica no row to update and
+/// no row to check an insert against.
+#[test]
+fn a_checked_view_leaving_the_key_out_refuses_its_writes() {
+    let mut connection = counters_replica(
+        "CREATE VIEW counter_parents WITH (check_option = cascaded) AS
+           SELECT parent_id FROM counters WHERE parent_id > 0;
+         ALTER VIEW counter_parents OWNER TO mover;
+         GRANT SELECT, INSERT, UPDATE ON counter_parents TO app;",
+    );
+    let updated = diesel::update(counter_parents::table)
+        .set(counter_parents::parent_id.eq(Some(2)))
+        .execute(&mut connection);
+    assert_eq!(refusal(updated), pg::FEATURE_NOT_SUPPORTED);
+    let inserted = diesel::insert_into(counter_parents::table)
+        .values(counter_parents::parent_id.eq(Some(2)))
+        .execute(&mut connection);
+    assert_eq!(refusal(inserted), pg::FEATURE_NOT_SUPPORTED);
+}
+
+/// A row is found by every column of a composite key, quoted names included,
+/// and in a table without a key by every column.
+#[test]
+fn rows_are_found_by_a_composite_key_or_by_every_column() {
+    let mut connection = delivered(
+        "CREATE ROLE app;
+         CREATE ROLE mover;
+         CREATE TABLE links (\"From\" INT, \"To\" INT, weight INT, PRIMARY KEY (\"From\", \"To\"));
+         CREATE TABLE tags (name TEXT NOT NULL, weight INT);
+         GRANT SELECT ON links, tags TO app;
+         GRANT SELECT, UPDATE ON links, tags TO mover;
+         CREATE VIEW link_weights WITH (check_option = cascaded) AS
+           SELECT \"From\", \"To\", weight FROM links WHERE weight > 0;
+         CREATE VIEW tag_weights WITH (check_option = cascaded) AS
+           SELECT name, weight FROM tags WHERE weight > 0;
+         ALTER VIEW link_weights OWNER TO mover;
+         ALTER VIEW tag_weights OWNER TO mover;
+         GRANT SELECT, UPDATE ON link_weights, tag_weights TO app;",
+        &acting(),
+        |connection| {
+            diesel::insert_into(links::table)
+                .values(&[
+                    (links::from_id.eq(1), links::to_id.eq(2), links::weight.eq(Some(1))),
+                    (links::from_id.eq(1), links::to_id.eq(3), links::weight.eq(Some(1))),
+                ])
+                .execute(connection)
+                .expect("seed the links");
+            diesel::insert_into(tags::table)
+                .values(&[
+                    (tags::name.eq("a"), tags::weight.eq(Some(1))),
+                    (tags::name.eq("b"), tags::weight.eq(Some(1))),
+                ])
+                .execute(connection)
+                .expect("seed the tags");
+        },
+    );
+    diesel::update(link_weights::table.filter(link_weights::to_id.eq(2)))
+        .set(link_weights::weight.eq(Some(5)))
+        .execute(&mut connection)
+        .expect("the link update runs");
+    let outside = diesel::update(link_weights::table.filter(link_weights::to_id.eq(3)))
+        .set(link_weights::weight.eq(Some(-1)))
+        .execute(&mut connection);
+    assert_eq!(refusal(outside), pg::WITH_CHECK_OPTION_VIOLATION);
+    diesel::update(tag_weights::table.filter(tag_weights::name.eq("a")))
+        .set(tag_weights::weight.eq(Some(5)))
+        .execute(&mut connection)
+        .expect("the tag update runs");
+    let weights: Vec<Option<i32>> = links::table
+        .order(links::to_id)
+        .select(links::weight)
+        .load(&mut connection)
+        .expect("links");
+    assert_eq!(weights, [Some(5), Some(1)]);
+    let weights: Vec<Option<i32>> =
+        tags::table.order(tags::name).select(tags::weight).load(&mut connection).expect("tags");
+    assert_eq!(weights, [Some(5), Some(1)]);
+}
+
+/// Without an acting role the caller holds every privilege and the check
+/// option still refuses a row the view would not show.
+#[test]
+fn without_an_acting_role_the_check_option_still_holds() {
+    let mut connection = items_replica(
+        "CREATE VIEW item_moves WITH (check_option = cascaded) AS
+           SELECT id AS item, parent_id FROM items WHERE parent_id > 0;",
+        &Pg2SqliteOptions::default()
+            .with_rls_audit_table_name("rls_audit")
+            .with_rls_exemption_function("server_delivery"),
+    );
+    let mut move_to = |parent: i32| {
+        diesel::update(item_moves::table.filter(item_moves::item.eq(1)))
+            .set(item_moves::parent_id.eq(parent))
+            .execute(&mut connection)
+    };
+    move_to(2).expect("the move runs");
+    assert_eq!(refusal(move_to(-1)), pg::WITH_CHECK_OPTION_VIOLATION);
+    assert_eq!(item(&mut connection, 1), Some((Some(2), Some("fresh".to_owned()))));
+}
+
+/// View options the replica has no counterpart for are refused.
+#[test]
+fn view_options_without_a_counterpart_are_refused() {
+    for option in ["security_barrier", "security_barrier = true"] {
+        let error = pg2sqlite::prelude::Pg2Sqlite::default()
+            .sql(&format!(
+                "CREATE TABLE items (id INT PRIMARY KEY);
+                 CREATE VIEW item_ids WITH ({option}) AS SELECT id FROM items;"
+            ))
+            .expect("parse")
+            .translate_to_sql(&Pg2SqliteOptions::default())
+            .expect_err("the option is refused")
+            .to_string();
+        assert!(error.contains("VIEW options are not supported in SQLite"), "{option}: {error}");
+    }
 }

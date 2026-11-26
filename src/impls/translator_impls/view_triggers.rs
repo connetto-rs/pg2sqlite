@@ -17,6 +17,7 @@ use sqlstate::pg;
 
 use super::{
     definer,
+    off_replica::OffReplica,
     plpgsql::{PlPgSqlTranslator, TriggerFacts},
     view_writes::{output_names, rewritten_base, written_relation},
 };
@@ -150,7 +151,9 @@ pub(crate) fn view_triggers(
 
 /// What only the view's trigger applies to a write through `view` when the
 /// write `checks` new rows, the check option or the owner's rights of a view
-/// on the way, with that view, `None` when the static rewrite does as well.
+/// on the way, with that view, `None` when the static rewrite does as well
+/// and for a view reading a table left off the replica, which shows no rows
+/// there.
 ///
 /// # Errors
 ///
@@ -161,6 +164,9 @@ pub(super) fn trigger_reason<'s>(
     schema: &'s ParserDB,
     options: &TranslationContext<'_>,
 ) -> Result<Option<(&'static str, &'s View)>, Error> {
+    if OffReplica::read_through(view, schema, options)? {
+        return Ok(None);
+    }
     let mut written = Some(view);
     while let Some(current) = written {
         if checks && current.check_option().is_some() {
@@ -296,14 +302,8 @@ impl Written<'_> {
         emit: crate::warnings::WarningSink<'_>,
     ) -> Result<Vec<Statement>, Error> {
         let mut triggers = Vec::new();
-        match self.body(runner, schema, options, emit)? {
-            Some(body) => triggers.push(self.trigger("", None, body)),
-            None if self.event == Event::Insert
-                && self.outputs.iter().all(|output| output.written.is_none()) =>
-            {
-                return Ok(triggers);
-            }
-            None => {}
+        if let Some(body) = self.body(runner, schema, options, emit)? {
+            triggers.push(self.trigger("", Vec::new(), body));
         }
         if let Some(held) = self.running_privileges(runner, schema)? {
             triggers.extend(self.refusal(
@@ -357,14 +357,10 @@ impl Written<'_> {
         Ok(triggers)
     }
 
-    /// The trigger of the command named `suffix` after the view, under
-    /// `condition`, running `statements`.
-    fn trigger(
-        &self,
-        suffix: &str,
-        condition: Option<Expr>,
-        statements: Vec<Statement>,
-    ) -> Statement {
+    /// The trigger of the command named `suffix` after the view, firing for
+    /// an update of `columns` or of any column when empty, running
+    /// `statements`.
+    fn trigger(&self, suffix: &str, columns: Vec<Ident>, statements: Vec<Statement>) -> Statement {
         ast_builder::trigger(
             ObjectName::from(vec![Ident::with_quote(
                 '"',
@@ -372,9 +368,9 @@ impl Written<'_> {
             )]),
             self.sqlite_name.clone(),
             TriggerPeriod::InsteadOf,
-            self.trigger_event(Vec::new()),
+            self.trigger_event(columns),
             true,
-            condition,
+            None,
             statements,
         )
     }
@@ -467,7 +463,7 @@ impl Written<'_> {
             )]
         };
         if whole {
-            return Some(self.trigger(suffix, None, raise(None)));
+            return Some(self.trigger(suffix, Vec::new(), raise(None)));
         }
         if positions.is_empty() || self.event == Event::Delete {
             return None;
@@ -478,11 +474,7 @@ impl Written<'_> {
                     .iter()
                     .map(|position| quoted(&self.outputs[*position].name))
                     .collect();
-                let mut trigger = self.trigger(suffix, None, raise(None));
-                if let Statement::CreateTrigger(create) = &mut trigger {
-                    create.events = vec![self.trigger_event(columns)];
-                }
-                trigger
+                self.trigger(suffix, columns, raise(None))
             }
             Event::Insert | Event::Delete | Event::Truncate => {
                 let supplied = positions
@@ -499,7 +491,7 @@ impl Written<'_> {
                     });
                 self.trigger(
                     suffix,
-                    None,
+                    Vec::new(),
                     raise(supplied.map(|supplied| Expr::Nested(Box::new(supplied)))),
                 )
             }

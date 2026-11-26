@@ -102,7 +102,7 @@ pub(crate) fn land_insert(
         .collect::<Result<Vec<_>, _>>()?;
     let plain = insert.on.is_none() && insert.returning.is_none();
     if needs_trigger(view, true, plain, schema, options)? {
-        if !plain || !insert.columns.is_empty() {
+        if !insert.columns.is_empty() {
             return Ok(None);
         }
         // SQLite inserts into a view only a full row, so name the columns
@@ -315,10 +315,6 @@ pub(super) fn rewritten_base<'s>(
             .filter_map(FiringTrigger::of)
             .any(|trigger| trigger.takes(stored.as_ref(), &[event]))
     {
-        return Ok(None);
-    }
-    let Some(select) = single_select(view.definition()) else { return Ok(None) };
-    if select.from.len() != 1 {
         return Ok(None);
     }
     Ok(view.updatable_base(schema)?.map(|base| base.relation))

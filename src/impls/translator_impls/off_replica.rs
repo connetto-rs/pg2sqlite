@@ -21,8 +21,8 @@
 //! emitted table no longer carries.
 
 use sql_traits::{
-    structs::ParserDB,
-    traits::{ColumnLike, DatabaseLike, ForeignKeyLike, IndexLike, RoleLike, TableLike},
+    structs::{ParserDB, View},
+    traits::{ColumnLike, DatabaseLike, ForeignKeyLike, IndexLike, RoleLike, TableLike, ViewLike},
     utils::identifier_resolution::identifiers_match,
 };
 use sqlparser::ast::{
@@ -37,6 +37,7 @@ use crate::{
     impls::{
         object_name::{last_ident, last_ident_value_or_display, resolve_translation_table},
         privileges::RoleTable,
+        scoped_relations::relation_occurrences,
         session_variable,
     },
     options::TranslationContext,
@@ -140,6 +141,30 @@ impl<'s> OffReplica<'s> {
         let Some(table) = resolve_translation_table(schema, name)? else { return Ok(None) };
         let hidden = !RoleTable::in_batch(table, Some(role), schema, options)?.reads_any();
         Ok(hidden.then_some(Self { table, role }))
+    }
+
+    /// Whether `view` reads a table left off the replica, in its definition or
+    /// in a view it reads. Such a view has no rows to show on the replica.
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`Self::of`] does.
+    pub(crate) fn read_through(
+        view: &View,
+        schema: &'s ParserDB,
+        options: &TranslationContext<'_>,
+    ) -> Result<bool, Error> {
+        for name in relation_occurrences(view.definition()) {
+            if Self::of(&name, schema, options)?.is_some() {
+                return Ok(true);
+            }
+            if let Some(inner) = super::view_writes::resolve_view(&name, schema)?
+                && Self::read_through(inner, schema, options)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Whether `name` is a table left off the replica that `write` leaves
