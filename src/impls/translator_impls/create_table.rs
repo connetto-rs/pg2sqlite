@@ -20,7 +20,7 @@ use crate::{
         translator_impls::{
             column::{folded_primary_key, translate_column_def},
             column_option::warn_no_inherit_dropped,
-            hidden_referenced_rows::without_guarded_actions,
+            hidden_referenced_rows::sqlite_actions,
         },
     },
     warnings::TranslationWarning,
@@ -291,7 +291,7 @@ impl crate::traits::translator::TranslatorWithContext for CreateTable {
                 _ => {
                     let native = match constraint {
                         TableConstraint::ForeignKey(key) => {
-                            without_guarded_actions(key, &self.name, schema, options)?
+                            sqlite_actions(key, &self.name, schema, options)?
                                 .map(TableConstraint::ForeignKey)
                         }
                         _ => None,

@@ -252,34 +252,50 @@ pub(crate) fn receives_key_actions(
     Ok(false)
 }
 
-/// `key`, which the table `table` names declares, without the actions
-/// writing rows that its triggers run past the table's guards, `None` when it
-/// keeps every action.
+/// `key`, which the table `table` names declares, with the actions its SQLite
+/// foreign key runs, `None` when they are the declared ones. The actions
+/// writing rows that its triggers run past the table's guards leave the key,
+/// and a `RESTRICT` into `table` itself checked as each statement ends is
+/// SQLite's `NO ACTION`. PostgreSQL checks that `RESTRICT` once the statement
+/// has written every row, where SQLite's checks each row as it goes and so
+/// refuses a statement removing a row with every row referencing it.
 ///
 /// # Errors
 ///
 /// Fails as [`hidden_rows`] does.
-pub(crate) fn without_guarded_actions(
+pub(crate) fn sqlite_actions(
     key: &ForeignKeyConstraint,
     table: &ObjectName,
     schema: &ParserDB,
     options: &TranslationContext<'_>,
 ) -> Result<Option<ForeignKeyConstraint>, Error> {
     let Some(child) = resolve_translation_table(schema, table)? else { return Ok(None) };
-    if !acts_past_guards(child, key, schema, options)? {
+    let guarded = acts_past_guards(child, key, schema, options)?;
+    let restricts_itself = [key.on_delete, key.on_update]
+        .contains(&Some(ReferentialAction::Restrict))
+        && key.characteristics.is_none_or(|characteristics| {
+            characteristics.initially != Some(DeferrableInitial::Deferred)
+        })
+        && resolve_translation_table(schema, &key.foreign_table)?
+            .is_some_and(|parent| core::ptr::eq(parent, child));
+    if !guarded && !restricts_itself {
         return Ok(None);
     }
     let mut native = key.clone();
     for action in [&mut native.on_delete, &mut native.on_update] {
-        if action.is_some_and(writes_rows) {
-            *action = None;
+        match *action {
+            Some(written) if guarded && writes_rows(written) => *action = None,
+            Some(ReferentialAction::Restrict) if restricts_itself => {
+                *action = Some(ReferentialAction::NoAction);
+            }
+            _ => {}
         }
     }
     Ok(Some(native))
 }
 
 /// `column`, of the table `table` names, with each `REFERENCES` holding the
-/// actions its SQLite foreign key keeps, as [`without_guarded_actions`] does.
+/// actions its SQLite foreign key runs, as [`sqlite_actions`] gives them.
 ///
 /// # Errors
 ///
@@ -293,7 +309,7 @@ pub(crate) fn native_actions<'c>(
     let mut changed: Option<ColumnDef> = None;
     for (index, option) in column.options.iter().enumerate() {
         let ColumnOption::ForeignKey(key) = &option.option else { continue };
-        if let Some(native) = without_guarded_actions(key, table, schema, options)? {
+        if let Some(native) = sqlite_actions(key, table, schema, options)? {
             changed.get_or_insert_with(|| column.clone()).options[index].option =
                 ColumnOption::ForeignKey(native);
         }
