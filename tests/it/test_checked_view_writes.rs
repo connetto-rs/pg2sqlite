@@ -844,6 +844,34 @@ fn a_security_invoker_view_holds_the_caller_to_its_grant_on_the_view() {
     assert_eq!(item(&mut connection, 1), Some((Some(3), Some("fresh".to_owned()))));
 }
 
+/// A caller holding every privilege on a `security_invoker` view writes
+/// through it from a trigger body.
+#[test]
+fn a_security_invoker_view_the_caller_holds_takes_its_writes() {
+    let mut connection = items_replica(
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON items TO app;
+         CREATE VIEW item_moves WITH (security_invoker = true) AS
+           SELECT id AS item, parent_id FROM items;
+         GRANT SELECT, INSERT, UPDATE, DELETE ON item_moves TO app;
+         CREATE TABLE requests (id INT PRIMARY KEY, kind INT NOT NULL, target INT NOT NULL, parent INT);
+         GRANT SELECT, INSERT ON requests TO app;
+         CREATE FUNCTION request_move() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+         BEGIN UPDATE item_moves SET parent_id = NEW.parent WHERE item = NEW.target; RETURN NEW; END $$;
+         CREATE TRIGGER requests_move AFTER INSERT ON requests FOR EACH ROW EXECUTE FUNCTION request_move();",
+        &acting(),
+    );
+    diesel::insert_into(requests::table)
+        .values((
+            requests::id.eq(1),
+            requests::kind.eq(1),
+            requests::target.eq(1),
+            requests::parent.eq(Some(3)),
+        ))
+        .execute(&mut connection)
+        .expect("the move runs");
+    assert_eq!(item(&mut connection, 1), Some((Some(3), Some("fresh".to_owned()))));
+}
+
 /// View options the replica has no counterpart for are refused.
 #[test]
 fn view_options_without_a_counterpart_are_refused() {
