@@ -244,3 +244,40 @@ fn a_definer_body_truncates_past_the_guards_where_it_reaches_the_statement() {
     assert_eq!(count(&mut connection, "t"), 0);
     assert_eq!(count(&mut connection, "pg2sqlite_definer_frames"), 0);
 }
+
+#[test]
+fn a_body_truncate_whose_deletes_falsify_its_if_leaves_no_frame() {
+    let schema_pg = DEFINER
+        .replace("NEW.id > 0", "EXISTS (SELECT 1 FROM public.t)")
+        .replace("GRANT TRUNCATE ON t TO cleaner", "GRANT SELECT, TRUNCATE ON t TO cleaner");
+    let mut connection = replica(&schema_pg, "INSERT INTO t VALUES (1, 1), (2, 2);");
+
+    run(&mut connection, &schema_pg, "INSERT INTO notes VALUES (1);").expect("cleaner truncates t");
+    assert_eq!(count(&mut connection, "t"), 0);
+    assert_eq!(count(&mut connection, "pg2sqlite_definer_frames"), 0);
+    let refused =
+        connection.batch_execute("INSERT INTO t VALUES (3, 3)").expect_err("the guards hold");
+    assert!(guard_refusal(&refused.to_string()).is_some(), "{refused}");
+}
+
+#[test]
+fn a_truncate_fires_no_row_trigger_created_earlier_in_its_batch() {
+    let schema_pg = "CREATE ROLE app;
+        CREATE TABLE t (id INT PRIMARY KEY);
+        CREATE TABLE log (id INT);
+        GRANT ALL ON t, log TO app;
+        CREATE FUNCTION log_row() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN INSERT INTO log VALUES (OLD.id); RETURN NULL; END $$;";
+    let mut connection = replica(schema_pg, "INSERT INTO t VALUES (1), (2);");
+
+    run(
+        &mut connection,
+        schema_pg,
+        "CREATE TRIGGER t_after_delete AFTER DELETE ON t
+           FOR EACH ROW EXECUTE FUNCTION log_row();
+         TRUNCATE t;",
+    )
+    .expect("the batch runs");
+    assert_eq!(count(&mut connection, "t"), 0);
+    assert_eq!(count(&mut connection, "log"), 0);
+}

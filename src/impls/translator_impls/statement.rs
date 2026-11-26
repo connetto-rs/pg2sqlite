@@ -1370,7 +1370,8 @@ fn emptying_order<'t, 's>(
 
 /// Whether a guard or a row trigger of `table` could see the deletes emptying
 /// it, which then run under the truncation frame. A table the acting role
-/// writes in full, without a backing table and without triggers, has neither.
+/// writes in full, without a backing table and without triggers in the
+/// batch's catalog, has neither.
 ///
 /// # Errors
 ///
@@ -1383,7 +1384,7 @@ fn sees_truncation(
 ) -> Result<bool, Error> {
     Ok(has_backing_table(table, schema, options)?
         || !RoleTable::acting(table, schema, options)?.writes_everything()
-        || table.triggers(schema)?.next().is_some())
+        || options.table_triggers(table).next().is_some())
 }
 
 /// Whether a foreign key of `referencing` references `referenced`.
