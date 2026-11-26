@@ -201,18 +201,17 @@ pub(crate) fn definer_hidden_read(
     options: &TranslationContext<'_>,
 ) -> Result<Option<String>, Error> {
     if matches!(trigger.period, Some(TriggerPeriod::InsteadOf))
-        || options.get_acting_role().is_none()
         || !schema.functions().any(|function| function.security_mode() == FunctionSecurity::Definer)
     {
-        return Ok(None);
-    }
-    let Some((_, chain)) = trigger_chain(trigger, schema, options)? else { return Ok(None) };
-    if !decides_on_hidden_rows(&chain, schema, options)? {
         return Ok(None);
     }
     let Some((role, deployment)) = acting_role_and_deployment(schema, options)? else {
         return Ok(None);
     };
+    let Some((_, chain)) = trigger_chain(trigger, schema, options)? else { return Ok(None) };
+    if !decides_on_hidden_rows(&chain, schema, options)? {
+        return Ok(None);
+    }
     let unconfined = trigger.unconfined_definer_read(
         schema,
         deployment,
