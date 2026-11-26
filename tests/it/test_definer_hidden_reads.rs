@@ -452,6 +452,8 @@ fn triggers_left(pg: &str, options: &Pg2SqliteOptions) -> Vec<(String, String)> 
 fn a_definer_read_the_firing_rows_key_confines_to_the_team_stays_and_refuses_on_the_replica() {
     let pg = bindings("NEW.run_id", COMPOSITE_RUN_KEY, TEAM, TEAM, "");
     assert_eq!(triggers_left(&pg, &team_options()), []);
+    let locking = pg.replace("run.status <> 'open')", "run.status <> 'open' FOR UPDATE)");
+    assert_eq!(triggers_left(&locking, &team_options()), [], "{locking}");
 
     let script = Pg2Sqlite::default()
         .sql(&pg)
@@ -531,7 +533,7 @@ fn the_report_names_why_the_proof_stopped_at_the_read() {
             "may not select its column status",
         ),
         (
-            own_run.replace("run.status <> 'open')", "run.status <> 'open' FOR UPDATE)"),
+            own_run.replace("public.runs run WHERE", "public.runs AS run (id) WHERE"),
             "cannot be followed",
         ),
     ] {
