@@ -807,6 +807,43 @@ fn without_an_acting_role_the_check_option_still_holds() {
     assert_eq!(item(&mut connection, 1), Some((Some(2), Some("fresh".to_owned()))));
 }
 
+/// A `security_invoker` view writes as the caller, whom PostgreSQL holds to
+/// its grant on the view as well as to the one on the table, in a trigger
+/// body too.
+#[test]
+fn a_security_invoker_view_holds_the_caller_to_its_grant_on_the_view() {
+    let mut connection = items_replica(
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON items TO app;
+         CREATE VIEW item_moves WITH (security_invoker = true) AS
+           SELECT id AS item, parent_id FROM items;
+         GRANT SELECT, UPDATE (parent_id) ON item_moves TO app;
+         CREATE TABLE requests (id INT PRIMARY KEY, kind INT NOT NULL, target INT NOT NULL, parent INT);
+         GRANT SELECT, INSERT ON requests TO app;
+         CREATE FUNCTION request_drop() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+         BEGIN DELETE FROM item_moves WHERE item = NEW.target; RETURN NEW; END $$;
+         CREATE TRIGGER requests_drop AFTER INSERT ON requests FOR EACH ROW EXECUTE FUNCTION request_drop();",
+        &acting(),
+    );
+    diesel::update(item_moves::table.filter(item_moves::item.eq(1)))
+        .set(item_moves::parent_id.eq(3))
+        .execute(&mut connection)
+        .expect("the move runs");
+    let renumbered = diesel::update(item_moves::table.filter(item_moves::item.eq(1)))
+        .set(item_moves::item.eq(5))
+        .execute(&mut connection);
+    assert_eq!(refusal(renumbered), pg::INSUFFICIENT_PRIVILEGE);
+    let dropped = diesel::insert_into(requests::table)
+        .values((
+            requests::id.eq(1),
+            requests::kind.eq(4),
+            requests::target.eq(1),
+            requests::parent.eq(None::<i32>),
+        ))
+        .execute(&mut connection);
+    assert_eq!(refusal(dropped), pg::INSUFFICIENT_PRIVILEGE);
+    assert_eq!(item(&mut connection, 1), Some((Some(3), Some("fresh".to_owned()))));
+}
+
 /// View options the replica has no counterpart for are refused.
 #[test]
 fn view_options_without_a_counterpart_are_refused() {
