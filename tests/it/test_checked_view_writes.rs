@@ -696,6 +696,32 @@ fn a_view_computing_every_column_refuses_inserts_and_updates() {
     assert_eq!(item(&mut connection, 1), Some((Some(1), Some("fresh".to_owned()))));
 }
 
+/// An `INSTEAD OF` trigger takes the inserts into a view computing every
+/// column, which PostgreSQL then runs in place of refusing them.
+#[test]
+fn an_instead_of_trigger_takes_inserts_into_a_view_computing_every_column() {
+    let mut connection = items_replica(
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON items TO mover;
+         CREATE VIEW doubled_ids AS SELECT id * 2 AS doubled FROM items;
+         ALTER VIEW doubled_ids OWNER TO mover;
+         GRANT SELECT, INSERT ON doubled_ids TO app;
+         CREATE FUNCTION halve() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
+         BEGIN
+             INSERT INTO items (id) VALUES (NEW.doubled / 2);
+             RETURN NEW;
+         END $$;
+         ALTER FUNCTION halve() OWNER TO mover;
+         CREATE TRIGGER halve INSTEAD OF INSERT ON doubled_ids
+             FOR EACH ROW EXECUTE FUNCTION halve();",
+        &acting(),
+    );
+    diesel::insert_into(doubled_ids::table)
+        .values(doubled_ids::doubled.eq(6))
+        .execute(&mut connection)
+        .expect("the trigger takes the insert");
+    assert_eq!(item(&mut connection, 3), Some((None, Some("fresh".to_owned()))));
+}
+
 /// `counters` holding `(1, 1)`, with `views` over it owned by `mover`.
 fn counters_replica(views: &str) -> SqliteConnection {
     delivered(

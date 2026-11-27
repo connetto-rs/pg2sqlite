@@ -426,7 +426,7 @@ pub(crate) fn superseded(
         return Ok(Vec::new());
     };
     let width = output_names(view, schema)?.len();
-    let suffixes = ["", "owner_grant", "grant"]
+    let suffixes = ["", "owner_grant", "grant", "not_updatable"]
         .into_iter()
         .map(String::from)
         .chain((0..width).map(|position| format!("computed_{position}")));
