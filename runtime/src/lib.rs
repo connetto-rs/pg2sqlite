@@ -9,6 +9,7 @@ extern crate std;
 
 mod case_fold;
 mod clock;
+mod group;
 mod helper_function;
 mod jsonb;
 #[cfg(feature = "managed")]
@@ -27,11 +28,12 @@ pub use clock::{
 };
 #[cfg(feature = "managed")]
 pub use diesel_dynamic_schema::dynamic_value::{DynamicRow, SqliteAnyValue};
+pub use group::{BeginMode, ExecutionGroup, TransactionControl};
 pub use helper_function::HelperFunction;
 pub use jsonb::JsonbFunctions;
 #[cfg(feature = "managed")]
 pub use managed::{
-    BeginMode, ExecutionError, Guard, ManagedConnection, ManagedRows, Nested, Outermost,
+    ExecutionError, Guard, ManagedConnection, ManagedRows, Nested, Outermost,
     READER_ERROR_PREFIX, Registration, Savepoint, StatementError, Transaction,
 };
 pub use typmod::{RoundingError, TypmodRounding};

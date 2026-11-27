@@ -39,7 +39,7 @@ use crate::{
             postgis,
             reentry::MarkerTables,
             rls::generate_rls_audit_table,
-            statement::is_data_movement_statement,
+            statement::{self, is_data_movement_statement},
             table_shape,
             trigger_follower::TriggerFollower,
             trigger_slots::{TriggerSlots, folded},
@@ -48,7 +48,7 @@ use crate::{
     },
     options::{Declaration, Pg2SqliteOptions, TranslationContext},
     prelude::ReverseTranslator,
-    script::{HelperFunction, Script},
+    script::{Group, HelperFunction, Script},
     traits::translator::TranslatorWithContext,
 };
 
@@ -2113,13 +2113,18 @@ impl Pg2Sqlite {
             prelude
                 .iter()
                 .chain(statements.iter().flatten())
-                .chain(connection.iter().flatten())
+                .chain(connection.iter().flatten().flat_map(Group::emitted))
                 .chain(main.iter().flatten().flatten().flatten())
                 .chain(attached.iter().flatten().flatten().flatten()),
         );
         let files = crate::initialization::InitializationPlan::new(
             prelude,
-            placed.unit_files.into_iter().zip(statements),
+            placed
+                .unit_files
+                .into_iter()
+                .zip(sources.iter().map(statement::transaction_control))
+                .zip(statements)
+                .map(|((files, control), emitted)| (files, control, emitted)),
             main,
             attached,
         );
@@ -2133,7 +2138,7 @@ impl Pg2Sqlite {
         for statement in script
             .files
             .statements_mut()
-            .chain(script.connection.iter_mut().flatten())
+            .chain(script.connection.iter_mut().flatten().flat_map(Group::emitted_mut))
             .chain(script.functions.iter_mut().map(|function| &mut function.body))
         {
             crate::impls::sqlite_keywords::quote_reserved_identifiers(statement);

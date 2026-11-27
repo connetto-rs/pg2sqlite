@@ -3,7 +3,7 @@
 use alloc::{string::String, vec::Vec};
 
 use diesel::{
-    connection::{AnsiTransactionManager, TransactionManager},
+    connection::{AnsiTransactionManager, SimpleConnection, TransactionManager},
     result::Error as DatabaseError,
     sqlite::SqliteConnection,
 };
@@ -34,6 +34,8 @@ struct NamedSavepoint {
 #[derive(Default)]
 pub(crate) struct TransactionState {
     savepoints: Vec<NamedSavepoint>,
+    /// The statements run before every commit ending a transaction.
+    pub(crate) before_commit: Vec<String>,
 }
 
 impl TransactionState {
@@ -55,11 +57,13 @@ impl TransactionState {
         Ok(())
     }
 
-    /// Commits every nested level and the outer transaction.
+    /// Commits every nested level and the outer transaction, after the
+    /// pre-commit program.
     pub(crate) fn commit(
         &mut self,
         connection: &mut SqliteConnection,
     ) -> Result<(), TransactionError> {
+        self.drain(connection)?;
         loop {
             let result = AnsiTransactionManager::commit_transaction(connection);
             self.synchronize(connection)?;
@@ -112,6 +116,9 @@ impl TransactionState {
     ) -> Result<(), TransactionError> {
         let position = self.position(level)?;
         let target = self.savepoints[position].depth;
+        if target == 1 {
+            self.drain(connection)?;
+        }
         while Self::depth(connection)? >= target {
             let result = AnsiTransactionManager::commit_transaction(connection);
             self.synchronize(connection)?;
@@ -159,6 +166,24 @@ impl TransactionState {
                     .rposition(|savepoint| savepoint.depth == depth)
                     .ok_or(TransactionError::Ended)
             }
+        }
+    }
+
+    /// Runs the pre-commit program inside a transaction, rolling the whole
+    /// transaction back when a statement fails, as PostgreSQL ends a
+    /// transaction whose commit fails.
+    fn drain(&mut self, connection: &mut SqliteConnection) -> Result<(), TransactionError> {
+        if Self::depth(connection)? == 0 {
+            return Ok(());
+        }
+        let failure =
+            self.before_commit.iter().find_map(|statement| connection.batch_execute(statement).err());
+        match failure {
+            Some(error) => {
+                self.rollback(connection)?;
+                Err(error.into())
+            }
+            None => Ok(()),
         }
     }
 

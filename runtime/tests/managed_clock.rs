@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use pg2sqlite_runtime::{
-    BeginMode, ClockError, DynamicRow, ExecutionError, HelperFunction, ManagedConnection,
-    SqliteAnyValue, UtcInstant, UtcProvider,
+    BeginMode, ClockError, DynamicRow, ExecutionError, ExecutionGroup, HelperFunction,
+    ManagedConnection, SqliteAnyValue, TransactionControl, UtcInstant, UtcProvider,
 };
 
 /// A provider answering scripted microseconds since the Unix epoch in order,
@@ -422,4 +422,70 @@ fn leaked_inner_savepoint_guard_does_not_redirect_its_parent() {
     transaction.commit().unwrap();
     drop(transaction);
     assert_eq!(rows(&mut connection, "SELECT label FROM seen"), Vec::<Vec<String>>::new());
+}
+
+/// A queue drained by deleting its rows, each deletion logging the clocks it
+/// reads and the one numbered 99 failing, as a deferred constraint check does.
+const QUEUE: &str = "CREATE TABLE queue (id INTEGER PRIMARY KEY); CREATE TABLE log (id INTEGER, transaction_at TEXT, statement_at TEXT); CREATE TRIGGER checked AFTER DELETE ON queue BEGIN SELECT RAISE(ABORT, 'check 99 failed') WHERE old.id = 99; INSERT INTO log VALUES (old.id, pg2sqlite_transaction_timestamp(), pg2sqlite_statement_timestamp()); END";
+
+#[test]
+fn before_commit_uses_original_transaction_and_commit_statement_clocks() {
+    let script = Script::new(&(1..=21).collect::<Vec<_>>());
+    let mut connection = open(&script);
+    connection.execute_batch(QUEUE).unwrap();
+    connection.registration().unwrap().before_commit(["DELETE FROM queue"]).unwrap();
+    connection.begin(BeginMode::Deferred).unwrap();
+    connection.execute("INSERT INTO queue VALUES (1), (2)", &[]).unwrap();
+    connection.execute("INSERT INTO queue VALUES (3)", &[]).unwrap();
+    connection.commit().unwrap();
+    let logged = |id: &str| vec![id.to_string(), at(4), at(7)];
+    assert_eq!(rows(&mut connection, "SELECT * FROM log"), [logged("1"), logged("2"), logged("3")]);
+
+    connection.begin(BeginMode::Deferred).unwrap();
+    connection.execute("INSERT INTO queue VALUES (4), (99)", &[]).unwrap();
+    let Err(ExecutionError::Database(error)) = connection.commit() else {
+        panic!("a failing check fails the commit");
+    };
+    assert!(error.to_string().contains("check 99 failed"), "{error}");
+    assert_eq!(rows(&mut connection, "SELECT count(*) FROM queue"), [["0".to_string()]]);
+    assert_eq!(rows(&mut connection, "SELECT count(*) FROM log"), [["3".to_string()]]);
+    assert_eq!(rows(&mut connection, STABLE), [[at(14), at(14)]]);
+
+    connection.begin(BeginMode::Deferred).unwrap();
+    assert_eq!(rows(&mut connection, STABLE), [[at(15), at(16)]]);
+    connection.commit().unwrap();
+
+    connection.savepoint("outer").unwrap();
+    connection.execute("INSERT INTO queue VALUES (5)", &[]).unwrap();
+    connection.release("outer").unwrap();
+    assert_eq!(
+        rows(&mut connection, "SELECT * FROM log WHERE id = 5"),
+        [["5".to_string(), at(18), at(20)]]
+    );
+    assert_eq!(script.left(), 0);
+}
+
+#[test]
+fn a_group_shares_one_statement_instant_and_runs_its_typed_control() {
+    let script = Script::new(&(1..=8).collect::<Vec<_>>());
+    let mut connection = open(&script);
+    connection
+        .execute_batch("CREATE TABLE seen (at TEXT DEFAULT (pg2sqlite_statement_timestamp()))")
+        .unwrap();
+    let insert = "INSERT INTO seen DEFAULT VALUES";
+    let pair: ExecutionGroup<_> = ExecutionGroup::statements([insert, insert]);
+    connection.execute_group(pair).unwrap();
+    assert_eq!(rows(&mut connection, "SELECT at FROM seen"), [[at(2)], [at(2)]]);
+    let begin: TransactionControl = TransactionControl::Begin(BeginMode::Immediate);
+    connection.execute_group(ExecutionGroup::control(begin, ["BEGIN IMMEDIATE"])).unwrap();
+    let chain: TransactionControl = TransactionControl::Commit { chain: true };
+    connection.execute_group(ExecutionGroup::control(chain, ["COMMIT", "BEGIN"])).unwrap();
+    assert_eq!(rows(&mut connection, STABLE), [[at(6), at(7)]]);
+    connection.rollback().unwrap();
+    let smuggled: ExecutionGroup<_> = ExecutionGroup::statements([insert, "COMMIT"]);
+    assert!(matches!(
+        connection.execute_group(smuggled),
+        Err(ExecutionError::InvalidStatement(_))
+    ));
+    assert_eq!(script.left(), 0);
 }

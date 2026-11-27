@@ -8,6 +8,8 @@
 
 use core::iter::FusedIterator;
 
+use pg2sqlite_runtime::{ExecutionGroup, TransactionControl};
+
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
 use crate::{
@@ -40,6 +42,8 @@ pub(crate) type Forms<S> = Result<Vec<Option<Vec<S>>>, InitializationError>;
 struct Step<S> {
     /// The fresh files whose selection runs the unit.
     files: Files,
+    /// The transaction control the unit runs as, if it is one.
+    control: Option<TransactionControl>,
     /// The emitted form, run by the both-files initialization.
     base: Vec<S>,
     /// The fresh-main form, when rebinding changed it or the unit belongs to
@@ -64,6 +68,18 @@ impl<S> Step<S> {
             None => &[],
         }
     }
+
+    /// The group `selection` runs for this unit, `None` when it runs nothing.
+    fn group(&self, selection: FreshFiles) -> Option<ExecutionGroup<&[S], &str>> {
+        let form = self.form(selection);
+        if form.is_empty() {
+            return None;
+        }
+        Some(match &self.control {
+            Some(control) => ExecutionGroup::control(control.as_deref(), form),
+            None => ExecutionGroup::statements(form),
+        })
+    }
 }
 
 /// A source-ordered initializer with prevalidated fresh-file selections.
@@ -77,11 +93,12 @@ pub struct InitializationPlan<S> {
 }
 
 impl<S> InitializationPlan<S> {
-    /// Assembles the plan from the main-file `prelude`, every unit's files and
-    /// emitted form, and the forms of both fresh-file selections.
+    /// Assembles the plan from the main-file `prelude`, every unit's files,
+    /// transaction control and emitted form, and the forms of both fresh-file
+    /// selections.
     pub(crate) fn new(
         prelude: Vec<S>,
-        units: impl IntoIterator<Item = (Files, Vec<S>)>,
+        units: impl IntoIterator<Item = (Files, Option<TransactionControl>, Vec<S>)>,
         main: Forms<S>,
         attached: Forms<S>,
     ) -> Self {
@@ -90,15 +107,17 @@ impl<S> InitializationPlan<S> {
         let (mut main, mut attached) = (main.into_iter(), attached.into_iter());
         let prelude = (!prelude.is_empty()).then_some(Step {
             files: Files::MAIN,
+            control: None,
             base: prelude,
             main_rebound: None,
             attached_rebound: None,
         });
         let steps = prelude
             .into_iter()
-            .chain(units.into_iter().map(|(files, base)| {
+            .chain(units.into_iter().map(|(files, control, base)| {
                 Step {
                     files,
+                    control,
                     base,
                     main_rebound: main.next().flatten(),
                     attached_rebound: attached.next().flatten(),
@@ -130,15 +149,32 @@ impl<S> InitializationPlan<S> {
         &self,
         files: FreshFiles,
     ) -> Result<impl ExactSizeIterator<Item = &S> + FusedIterator, Error> {
+        self.available(files)?;
+        Ok(self.selected(files))
+    }
+
+    /// Complete initialization in source order, one group per source unit
+    /// that runs a statement.
+    pub fn groups(&self) -> impl Iterator<Item = ExecutionGroup<&[S], &str>> {
+        self.steps.iter().filter_map(|step| step.group(FreshFiles::Both))
+    }
+
+    pub(crate) fn select_groups(
+        &self,
+        files: FreshFiles,
+    ) -> Result<impl Iterator<Item = ExecutionGroup<&[S], &str>>, Error> {
+        self.available(files)?;
+        Ok(self.steps.iter().filter_map(move |step| step.group(files)))
+    }
+
+    /// Why `files` cannot be initialized, if it cannot.
+    fn available(&self, files: FreshFiles) -> Result<(), Error> {
         let unavailable = match files {
             FreshFiles::Main => self.main_unavailable.as_ref(),
             FreshFiles::Attached => self.attached_unavailable.as_ref(),
             FreshFiles::Both => None,
         };
-        if let Some(reason) = unavailable {
-            return Err(reason.clone().into());
-        }
-        Ok(self.selected(files))
+        unavailable.map_or(Ok(()), |reason| Err(reason.clone().into()))
     }
 
     fn selected(&self, files: FreshFiles) -> SelectionIter<'_, S> {
@@ -168,6 +204,7 @@ impl<S> InitializationPlan<S> {
             .map(|step| {
                 Step {
                     files: step.files,
+                    control: step.control,
                     base: forms(step.base),
                     main_rebound: step.main_rebound.map(&mut forms),
                     attached_rebound: step.attached_rebound.map(&mut forms),
