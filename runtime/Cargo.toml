@@ -18,6 +18,18 @@ sql-values = { version = "0.7", default-features = false, features = ["tzdb"] }
 # Derives `Arbitrary` on both function sets for pg2sqlite's fuzz harnesses.
 arbitrary = { version = "1", features = ["derive"], optional = true }
 thiserror = { version = "2", default-features = false }
+# Reads the platform's UTC wall clock, through `Date.now()` in a browser.
+jiff = { version = "0.2.39", default-features = false, features = ["std", "js"], optional = true }
+# Splits a managed connection's SQL into statements and parses its
+# transaction controls.
+sqlparser = { version = "0.64", default-features = false, optional = true }
+
+# Reads whether SQLite still holds a transaction after a failure ended it.
+[target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
+libsqlite3-sys = { version = "0.39", optional = true }
+
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
+sqlite-wasm-rs = { version = "0.5", default-features = false, optional = true }
 
 # Registers the functions and collation on a native or WebAssembly diesel connection.
 [dependencies.diesel]
@@ -35,14 +47,20 @@ optional = true
 
 [dev-dependencies]
 diesel = { version = "2.4", features = ["sqlite"] }
+parking_lot = "0.13"
 # The doctests and tests register the functions through `diesel`.
-pg2sqlite-runtime = { path = ".", features = ["diesel"] }
+pg2sqlite-runtime = { path = ".", features = ["managed"] }
 
 [features]
 # Derives `Arbitrary` on `JsonbFunctions` and `CaseFoldFunctions`.
 arbitrary = ["dep:arbitrary"]
 # The `register` of `JsonbFunctions`, `CaseFoldFunctions` and `HelperFunction` on a diesel `SqliteConnection`.
 diesel = ["dep:diesel", "dep:diesel-dynamic-schema"]
+# `JiffUtcProvider`, the platform's UTC wall clock.
+clock = ["dep:jiff"]
+# `ManagedConnection`, which owns its transactions and statements and answers
+# PostgreSQL's clock functions from the instants it samples at their starts.
+managed = ["diesel", "clock", "dep:sqlparser", "dep:libsqlite3-sys", "dep:sqlite-wasm-rs"]
 
 [lints]
 workspace = true
