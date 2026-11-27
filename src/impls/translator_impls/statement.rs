@@ -35,7 +35,7 @@ use alloc::borrow::Cow;
 
 use sql_traits::{
     structs::ParserDB,
-    traits::{DatabaseLike, ForeignKeyLike, TableLike},
+    traits::{DatabaseLike, ForeignKeyLike, TableLike, ViewLike},
 };
 use sqlparser::ast::{
     AlterTable, AlterTableOperation, AlterTableType, AlterType, AlterTypeOperation, AlterView,
@@ -80,6 +80,7 @@ use crate::{
                 write_guard_condition_expr,
             },
             vector::{generate_vec0_statements, has_vector_columns},
+            view_table::{self, ViewForm, ViewTable},
         },
     },
     traits::translator::TranslatorWithContext,
@@ -320,20 +321,45 @@ fn reject_unsupported_statement(statement: &Statement, reason: &str) -> Error {
 
 /// Emits a view definition, preceded by `DROP VIEW IF EXISTS` when it replaces
 /// one, since SQLite has no `CREATE OR REPLACE VIEW`, and followed by the
-/// triggers writing through it.
+/// triggers writing through it. A view the replica holds as a table emits
+/// that table, replacing the one a replaced view held, and a view it leaves
+/// off emits nothing.
 fn translate_view_definition(
     create_view: &CreateView,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Vec<Statement>, Error> {
+    let declared = super::create_view::declared_view(schema, create_view)?;
+    let form = match declared {
+        Some(view) => ViewForm::of(view, schema, options)?,
+        None => ViewForm::View,
+    };
     let mut statements: Vec<Statement> = Vec::new();
+    match (form, declared) {
+        (ViewForm::Off, _) => return Ok(statements),
+        (ViewForm::Table, Some(view)) => {
+            let sqlite_name = view_table::sqlite_name(view, schema)?;
+            if create_view.or_replace {
+                statements.push(ast_builder::drop_table(sqlite_name.clone(), true));
+            }
+            statements.extend(ViewTable::of(view, schema)?.statements(
+                view,
+                &sqlite_name,
+                schema,
+                options,
+                emit,
+            )?);
+            return Ok(statements);
+        }
+        (ViewForm::View | ViewForm::Table, _) => {}
+    }
     if create_view.or_replace {
         statements
             .push(ast_builder::drop_view(sqlite_unqualified_object_name(&create_view.name), true));
     }
     let translated = create_view.translate_with_warnings(schema, options, emit)?;
-    let triggers = match super::create_view::declared_view(schema, create_view)? {
+    let triggers = match declared {
         Some(view) => {
             super::view_triggers::view_triggers(view, &translated.name, schema, options, emit)?
         }
@@ -2107,11 +2133,35 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
             }
 
             Self::CreateTrigger(create_trigger) => {
-                if !matches!(trigger_relation(create_trigger, schema), Ok(TriggerRelation::View(_)))
-                    && let RoleTableAccess::Deny =
-                        role_access_for_object_name(&create_trigger.table_name, schema, options)?
-                {
-                    return Ok(Vec::new());
+                match trigger_relation(create_trigger, schema) {
+                    Ok(TriggerRelation::View(view)) => {
+                        match ViewForm::of(view, schema, options)? {
+                            ViewForm::Off => return Ok(Vec::new()),
+                            ViewForm::Table => {
+                                return Err(Error::forward_refusal(format!(
+                                    "trigger {} is an INSTEAD OF trigger on view {}, which the \
+                                     replica holds as a table of the rows the server delivers, \
+                                     since the view reads a table off the acting role's replica \
+                                     with its owner's rights. A trigger on that table would also \
+                                     run on the rows the server delivers. Grant the role a \
+                                     privilege on the tables the view reads, or leave the \
+                                     trigger to the server.",
+                                    create_trigger.name,
+                                    view.stored_view_name()
+                                )));
+                            }
+                            ViewForm::View => {}
+                        }
+                    }
+                    _ => {
+                        if let RoleTableAccess::Deny = role_access_for_object_name(
+                            &create_trigger.table_name,
+                            schema,
+                            options,
+                        )? {
+                            return Ok(Vec::new());
+                        }
+                    }
                 }
 
                 let mut statements = vec![];
@@ -2297,6 +2347,23 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
                         // SQLite drops one object per statement.
                         let mut statements = Vec::with_capacity(kept.len());
                         for name in kept.iter() {
+                            let view = match object_type {
+                                ObjectType::View => super::view_writes::resolve_view(name, schema)?,
+                                _ => None,
+                            };
+                            if let Some(view) = view {
+                                match ViewForm::of(view, schema, options)? {
+                                    ViewForm::Off => continue,
+                                    ViewForm::Table => {
+                                        statements.push(ast_builder::drop_table(
+                                            view_table::sqlite_name(view, schema)?,
+                                            *if_exists,
+                                        ));
+                                        continue;
+                                    }
+                                    ViewForm::View => {}
+                                }
+                            }
                             let table = match object_type {
                                 ObjectType::Table => resolve_translation_table(schema, name)?,
                                 _ => None,

@@ -17,7 +17,6 @@ use sqlstate::pg;
 
 use super::{
     definer,
-    off_replica::OffReplica,
     plpgsql::{PlPgSqlTranslator, TriggerFacts},
     view_writes::{output_names, rewritten_base, written_relation},
 };
@@ -41,7 +40,7 @@ use crate::{
 type Role = <ParserDB as DatabaseLike>::Role;
 
 /// The role a write through the view runs as.
-enum Runner<'s> {
+pub(super) enum Runner<'s> {
     /// The caller, for a `security_invoker` view, a view the acting role owns,
     /// and a translation naming no acting role.
     Caller,
@@ -104,13 +103,15 @@ struct Output {
 /// The view as the triggers of one command write through it.
 struct Written<'s> {
     view: &'s View,
-    /// The view on the replica.
+    /// The view on the replica, or the table holding it there.
     sqlite_name: &'s ObjectName,
     outputs: Vec<Output>,
     base: WrittenRelation<'s, ParserDB>,
     /// The relation written, as a PostgreSQL statement names it.
     relation: ObjectName,
     event: Event,
+    /// `INSTEAD OF` on a view, `BEFORE` on the table holding one.
+    period: TriggerPeriod,
 }
 
 /// The `INSTEAD OF` triggers making the view `sqlite_name` writable on the
@@ -151,8 +152,88 @@ pub(crate) fn view_triggers(
             .zip(columns.into_iter().chain(core::iter::repeat(None)))
             .map(|(name, written)| Output { name: name.clone(), written })
             .collect();
-        let written = Written { view, sqlite_name, outputs, base, relation, event };
+        let written = Written {
+            view,
+            sqlite_name,
+            outputs,
+            base,
+            relation,
+            event,
+            period: TriggerPeriod::InsteadOf,
+        };
         triggers.extend(written.triggers(&runner, caller.as_ref(), schema, options, emit)?);
+    }
+    Ok(triggers)
+}
+
+/// The `BEFORE` triggers refusing on `sqlite_name`, the table holding `view`
+/// on the replica, the client's writes PostgreSQL refuses through the view,
+/// each command's in the reverse of the order PostgreSQL refuses them. The
+/// rows the server delivers pass every one. `names` are the view's output
+/// columns.
+///
+/// # Errors
+///
+/// Refuses a check option whose condition reads a column the view does not
+/// pass through or another relation, and returns the lookup errors resolving
+/// the view runs into.
+pub(super) fn table_guards(
+    view: &View,
+    sqlite_name: &ObjectName,
+    names: &[String],
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<Vec<Statement>, Error> {
+    let runner = runner(view, schema, options)?;
+    let caller = caller_privileges(view, names.len(), schema, options)?;
+    let delivered = write_guard_condition_expr(None, options);
+    let mut triggers = Vec::new();
+    for event in [Event::Insert, Event::Update, Event::Delete] {
+        let Some(base) = view.updatable_base(schema)?.map(|base| base.relation) else {
+            let message = format!(
+                "{}cannot {} view \"{}\"",
+                message_prefix(pg::OBJECT_NOT_IN_PREREQUISITE_STATE),
+                verb(event),
+                view.stored_view_name()
+            );
+            triggers.push(ast_builder::trigger(
+                ObjectName::from(vec![quoted(&trigger_name(view, event, "not_updatable"))]),
+                sqlite_name.clone(),
+                TriggerPeriod::Before,
+                command_event(event, Vec::new()),
+                true,
+                None,
+                vec![ast_builder::raise_statement("ABORT", Some(&message), delivered.clone())],
+            ));
+            continue;
+        };
+        let (relation, columns) = written_relation(&base, schema)?;
+        let outputs = names
+            .iter()
+            .zip(columns.into_iter().chain(core::iter::repeat(None)))
+            .map(|(name, written)| Output { name: name.clone(), written })
+            .collect();
+        let written = Written {
+            view,
+            sqlite_name,
+            outputs,
+            base,
+            relation,
+            event,
+            period: TriggerPeriod::Before,
+        };
+        if event != Event::Delete
+            && let Some(condition) = written.row_condition(schema)?
+        {
+            triggers.push(written.row_check(condition, delivered.as_ref()));
+        }
+        triggers.extend(written.refusals(
+            &runner,
+            caller.as_ref(),
+            schema,
+            options,
+            delivered.as_ref(),
+        )?);
     }
     Ok(triggers)
 }
@@ -160,8 +241,8 @@ pub(crate) fn view_triggers(
 /// What only the view's trigger applies to a write of `event` through
 /// `view`, of any command when `None`: the check option, the owner's rights
 /// or the caller's missing grant of a view on the way, with that view. `None`
-/// when the static rewrite does as well and for a view reading a table left
-/// off the replica, which shows no rows there.
+/// when the static rewrite does as well and for a view whose writes land past
+/// the relations the replica holds as PostgreSQL holds them.
 ///
 /// # Errors
 ///
@@ -172,7 +253,7 @@ pub(super) fn trigger_reason<'s>(
     schema: &'s ParserDB,
     options: &TranslationContext<'_>,
 ) -> Result<Option<(&'static str, &'s View)>, Error> {
-    if OffReplica::read_through(view, schema, options)? {
+    if super::view_table::writes_past_replica(view, schema, options)? {
         return Ok(None);
     }
     let acting = session_variable::acting_role(schema, options)?;
@@ -240,7 +321,7 @@ fn has_condition(view: &View) -> bool {
 }
 
 /// The role a write through `view` runs as.
-fn runner<'s>(
+pub(super) fn runner<'s>(
     view: &'s View,
     schema: &'s ParserDB,
     options: &TranslationContext<'_>,
@@ -325,6 +406,22 @@ impl Written<'_> {
         if let Some(body) = self.body(runner, schema, options, emit)? {
             triggers.push(self.trigger("", Vec::new(), body));
         }
+        triggers.extend(self.refusals(runner, caller, schema, options, None)?);
+        Ok(triggers)
+    }
+
+    /// The refusals of the command in the reverse of the order PostgreSQL
+    /// makes them, those of a column the view computes holding only when
+    /// `computed_guard` does.
+    fn refusals(
+        &self,
+        runner: &Runner<'_>,
+        caller: Option<&Held>,
+        schema: &ParserDB,
+        options: &TranslationContext<'_>,
+        computed_guard: Option<&Expr>,
+    ) -> Result<Vec<Statement>, Error> {
+        let mut triggers = Vec::new();
         if let Some(held) = self.running_privileges(runner, schema)? {
             triggers.extend(self.refusal(
                 "owner_grant",
@@ -354,14 +451,20 @@ impl Written<'_> {
             ));
         }
         if self.event != Event::Delete {
-            let verb = if self.event == Event::Insert { "insert into" } else { "update" };
+            let verb = verb(self.event);
             if self.outputs.iter().all(|output| output.written.is_none()) {
                 let message = format!(
                     "{}cannot {verb} view \"{}\"",
                     message_prefix(pg::OBJECT_NOT_IN_PREREQUISITE_STATE),
                     self.view.stored_view_name()
                 );
-                triggers.extend(self.refusal("not_updatable", |_| false, true, &message, None));
+                triggers.extend(self.refusal(
+                    "not_updatable",
+                    |_| false,
+                    true,
+                    &message,
+                    computed_guard,
+                ));
                 return Ok(triggers);
             }
             for (position, output) in self.outputs.iter().enumerate() {
@@ -379,7 +482,7 @@ impl Written<'_> {
                     |listed| listed == position,
                     false,
                     &message,
-                    None,
+                    computed_guard,
                 ));
             }
         }
@@ -396,7 +499,7 @@ impl Written<'_> {
                 trigger_name(self.view, self.event, suffix),
             )]),
             self.sqlite_name.clone(),
-            TriggerPeriod::InsteadOf,
+            self.period,
             self.trigger_event(columns),
             true,
             None,
@@ -405,11 +508,188 @@ impl Written<'_> {
     }
 
     fn trigger_event(&self, columns: Vec<Ident>) -> TriggerEvent {
-        match self.event {
-            Event::Insert => TriggerEvent::Insert,
-            Event::Update => TriggerEvent::Update(columns),
-            Event::Delete | Event::Truncate => TriggerEvent::Delete,
+        command_event(self.event, columns)
+    }
+
+    /// The condition the check options PostgreSQL applies to a row written
+    /// through the view test, over the row's own columns as `NEW` holds them,
+    /// `None` when no check option applies. A condition holds under a view's
+    /// own check option, and under one `CASCADED` on a view above it.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a condition reading a column the view does not pass through
+    /// or another relation, since the row holds no value of either, and
+    /// returns the lookup errors resolving the views runs into.
+    fn row_condition(&self, schema: &ParserDB) -> Result<Option<Expr>, Error> {
+        let mut names: Vec<Option<String>> =
+            self.outputs.iter().map(|output| Some(output.name.clone())).collect();
+        let mut level = self.view;
+        let mut cascaded = false;
+        let mut conditions = Vec::new();
+        loop {
+            let option = level.check_option();
+            cascaded |= option == Some(ViewCheckOption::Cascaded);
+            let Some(base) = level.updatable_base(schema)? else { break };
+            if let Some(condition) = base.condition.filter(|_| cascaded || option.is_some()) {
+                conditions.push(self.over_row(condition, &base.relation, &names, level, schema)?);
+            }
+            let WrittenRelation::View { view: inner, columns, .. } = base.relation else { break };
+            let width = output_names(inner, schema)?.len();
+            names = (0..width)
+                .map(|inner_position| {
+                    columns
+                        .iter()
+                        .position(|written| *written == Some(inner_position))
+                        .and_then(|position| names.get(position).cloned().flatten())
+                })
+                .collect();
+            level = inner;
         }
+        Ok(conditions.into_iter().reduce(|left, right| {
+            Expr::BinaryOp {
+                left: Box::new(Expr::Nested(Box::new(left))),
+                op: BinaryOperator::And,
+                right: Box::new(Expr::Nested(Box::new(right))),
+            }
+        }))
+    }
+
+    /// `condition`, `level`'s over `relation`, with each column it reads
+    /// replaced by the `NEW` column of `names` its output passes it through
+    /// as, `names` naming one per output column of `level`.
+    fn over_row(
+        &self,
+        condition: &Expr,
+        relation: &WrittenRelation<'_, ParserDB>,
+        names: &[Option<String>],
+        level: &View,
+        schema: &ParserDB,
+    ) -> Result<Expr, Error> {
+        if let Some(read) = crate::impls::scoped_relations::relation_occurrences(condition).first()
+        {
+            return Err(Error::forward_refusal(format!(
+                "the check option of view {} reads {read}, which a row written through view {} \
+                 does not hold, so the replica holding the view as a table cannot check the row. \
+                 Test only the columns the view passes through.",
+                level.stored_view_name(),
+                self.view.stored_view_name()
+            )));
+        }
+        let passed = |position: usize| names.get(position).cloned().flatten();
+        let mut replacements = Vec::new();
+        match relation {
+            WrittenRelation::Table { columns, condition_columns, .. }
+            | WrittenRelation::ForeignTable { columns, condition_columns, .. } => {
+                for (index, column) in condition_columns {
+                    let name = columns
+                        .iter()
+                        .position(|written| {
+                            written.is_some_and(|written| core::ptr::eq(written, *column))
+                        })
+                        .and_then(passed)
+                        .ok_or_else(|| {
+                            hidden_condition_column(level, self.view, column.column_name())
+                        })?;
+                    replacements.push((*index, new_column("NEW", &name)));
+                }
+            }
+            WrittenRelation::View { view: inner, columns, condition_columns } => {
+                let inner_names = output_names(inner, schema)?;
+                for (index, inner_position) in condition_columns {
+                    let name = columns
+                        .iter()
+                        .position(|written| *written == Some(*inner_position))
+                        .and_then(passed)
+                        .ok_or_else(|| {
+                            let column = inner_names
+                                .get(*inner_position)
+                                .cloned()
+                                .flatten()
+                                .unwrap_or_default();
+                            hidden_condition_column(level, self.view, &column)
+                        })?;
+                    replacements.push((*index, new_column("NEW", &name)));
+                }
+            }
+        }
+        let mut rewritten = condition.clone();
+        let _: core::ops::ControlFlow<()> = sqlparser::ast::VisitMut::visit(
+            &mut rewritten,
+            &mut PreOrderReplacements { position: 0, replacements },
+        );
+        Ok(rewritten)
+    }
+
+    /// The trigger refusing with `44000` a row `condition` does not admit,
+    /// `delivered` holding.
+    fn row_check(&self, condition: Expr, delivered: Option<&Expr>) -> Statement {
+        let message = format!(
+            "{}new row violates check option for view \"{}\"",
+            message_prefix(pg::WITH_CHECK_OPTION_VIOLATION),
+            self.view.stored_view_name()
+        );
+        let violated = Expr::IsNotTrue(Box::new(Expr::Nested(Box::new(condition))));
+        self.trigger(
+            "check",
+            Vec::new(),
+            vec![ast_builder::raise_statement(
+                "ABORT",
+                Some(&message),
+                and(delivered.cloned(), Some(violated)),
+            )],
+        )
+    }
+}
+
+fn command_event(event: Event, columns: Vec<Ident>) -> TriggerEvent {
+    match event {
+        Event::Insert => TriggerEvent::Insert,
+        Event::Update => TriggerEvent::Update(columns),
+        Event::Delete | Event::Truncate => TriggerEvent::Delete,
+    }
+}
+
+const fn verb(event: Event) -> &'static str {
+    match event {
+        Event::Insert => "insert into",
+        Event::Update => "update",
+        Event::Delete | Event::Truncate => "delete from",
+    }
+}
+
+/// The refusal of a check option of `level`, reached through `view`, whose
+/// condition reads `column`, which `view` does not pass through.
+fn hidden_condition_column(level: &View, view: &View, column: &str) -> Error {
+    Error::forward_refusal(format!(
+        "the check option of view {} reads column {column}, which view {} does not pass \
+         through, so the replica holding the view as a table cannot check a row written \
+         through it. Pass {column} through the view, or test only the columns it passes \
+         through.",
+        level.stored_view_name(),
+        view.stored_view_name()
+    ))
+}
+
+/// Replaces the expressions at the positions of a pre-order walk, each a
+/// column reference, which holds no expression of its own, so the walk's
+/// count is the same with the replacement in place.
+struct PreOrderReplacements {
+    position: usize,
+    replacements: Vec<(usize, Expr)>,
+}
+
+impl sqlparser::ast::VisitorMut for PreOrderReplacements {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expression: &mut Expr) -> core::ops::ControlFlow<()> {
+        if let Some((_, replacement)) =
+            self.replacements.iter().find(|(position, _)| *position == self.position)
+        {
+            *expression = replacement.clone();
+        }
+        self.position += 1;
+        core::ops::ControlFlow::Continue(())
     }
 }
 

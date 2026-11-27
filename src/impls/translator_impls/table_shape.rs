@@ -25,19 +25,30 @@
 //! A table renamed between the two schemas translates under its old name
 //! against the first and its new one against the second, its storage already
 //! renamed by the statement ending the epoch.
+//!
+//! A view the acting role reaches a table off the replica through with its
+//! owner's rights is held as a table of its rows (see
+//! [`super::view_table`]). Where the new schema holds a view in another form,
+//! or its table differently, the old form is dropped before the tables move
+//! and the new one created after them, a table empty until the server fills
+//! it.
 
 use alloc::collections::BTreeSet;
 
 use sql_traits::{
-    structs::ParserDB,
-    traits::{DatabaseLike, TableLike},
+    structs::{IdentifierCase, ParserDB, View},
+    traits::{DatabaseLike, TableLike, ViewLike},
 };
 use sqlparser::ast::{
-    AlterTableOperation, ColumnOption, CreateTable, DropTrigger, ForeignKeyConstraint, Grant,
-    GrantObjects, ObjectName, ObjectType, RenameTableNameKind, Revoke, Statement, TableConstraint,
+    AlterTableOperation, ColumnOption, CreateTable, CreateTableOptions, CreateView, DropTrigger,
+    Expr, ForeignKeyConstraint, Grant, GrantObjects, Ident, ObjectName, ObjectType,
+    RenameTableNameKind, Revoke, SqlOption, Statement, TableConstraint, Value, ViewColumnDef,
 };
 
-use super::drop_column_rebuild::{self, fold};
+use super::{
+    drop_column_rebuild::{self, fold},
+    view_table::{self, ViewForm, ViewTable},
+};
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
 use crate::{
@@ -529,15 +540,19 @@ pub(crate) fn reshaped(
     translate: &mut Translate<'_>,
     emit: WarningSink<'_>,
 ) -> Result<(Vec<Statement>, Vec<ObjectName>), Error> {
+    let (view_drops, view_creations) =
+        reshaped_views((before, after), boundary, options, translate, &mut *emit)?;
     let mut changes = Vec::new();
     for reached in touched.reached((before, after))? {
         changes.extend(change(reached, (before, after), boundary, translate, &mut *emit)?);
     }
     if changes.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
+        let mut statements = view_drops;
+        statements.extend(view_creations);
+        return Ok((statements, Vec::new()));
     }
 
-    let mut statements = Vec::new();
+    let mut statements = view_drops;
     for change in &changes {
         for created in &change.dropped {
             statements.push(drop_of(created)?);
@@ -613,5 +628,147 @@ pub(crate) fn reshaped(
             )?);
         }
     }
+    statements.extend(view_creations);
     Ok((statements, changes.iter().map(|change| change.table.name.clone()).collect()))
+}
+
+/// The statements moving each view `before` holds to the form `after` holds
+/// it in, the drops of the forms the replica no longer holds and the
+/// creations of the new ones. A view's table whose shape stays keeps its
+/// rows, and only its guards move. `boundary` is what the statement ending
+/// the epoch emitted, whose drops the replica already holds.
+///
+/// # Errors
+///
+/// Returns a refused translation.
+fn reshaped_views(
+    (before, after): (&ParserDB, &ParserDB),
+    boundary: &[Statement],
+    options: &TranslationContext<'_>,
+    translate: &mut Translate<'_>,
+    emit: WarningSink<'_>,
+) -> Result<(Vec<Statement>, Vec<Statement>), Error> {
+    let gone: Vec<String> = boundary.iter().flat_map(dropped_names).collect();
+    let mut drops = Vec::new();
+    let mut creations = Vec::new();
+    for view in before.views() {
+        let held_name = view_table::sqlite_name(view, before)?;
+        let held = ViewForm::of(view, before, options)?;
+        let kept = after.view_by_target(view.target_name(), IdentifierCase::AsWritten)?;
+        let target = match kept {
+            Some(kept) => ViewForm::of(kept, after, options)?,
+            None => ViewForm::Off,
+        };
+        let dropped = gone.contains(&fold(&held_name));
+        match (held, target, kept) {
+            (ViewForm::Table, ViewForm::Table, Some(kept)) => {
+                let target_name = view_table::sqlite_name(kept, after)?;
+                let was = ViewTable::of(view, before)?.statements(
+                    view,
+                    &held_name,
+                    before,
+                    options,
+                    &mut |_| {},
+                )?;
+                let now = ViewTable::of(kept, after)?.statements(
+                    kept,
+                    &target_name,
+                    after,
+                    options,
+                    emit,
+                )?;
+                if was.first() == now.first() {
+                    for held in was.iter().filter(|held| !now.contains(held)) {
+                        drops.push(drop_of(held)?);
+                    }
+                    creations.extend(now.into_iter().filter(|created| !was.contains(created)));
+                } else {
+                    if !dropped {
+                        drops.push(ast_builder::drop_table(held_name, true));
+                    }
+                    creations.extend(now);
+                }
+            }
+            (ViewForm::View, ViewForm::View, _) | (ViewForm::Off, ViewForm::Off, _) => {}
+            (held, target, kept) => {
+                match held {
+                    ViewForm::Table if !dropped => {
+                        drops.push(ast_builder::drop_table(held_name, true));
+                    }
+                    ViewForm::View if !dropped && kept.is_some() => {
+                        drops.push(ast_builder::drop_view(held_name, true));
+                    }
+                    ViewForm::Table | ViewForm::View | ViewForm::Off => {}
+                }
+                let Some(kept) = kept else { continue };
+                match target {
+                    ViewForm::Table => {
+                        let target_name = view_table::sqlite_name(kept, after)?;
+                        creations.extend(ViewTable::of(kept, after)?.statements(
+                            kept,
+                            &target_name,
+                            after,
+                            options,
+                            emit,
+                        )?);
+                    }
+                    ViewForm::View => {
+                        let (created, warnings) =
+                            translate(&creation(kept), after, ReplicaSide::Target)?;
+                        for warning in warnings {
+                            emit(warning);
+                        }
+                        creations.extend(created);
+                    }
+                    ViewForm::Off => {}
+                }
+            }
+        }
+    }
+    Ok((drops, creations))
+}
+
+/// The `CREATE VIEW` declaring `view` as its schema holds it.
+fn creation(view: &View) -> Statement {
+    let spelled = |name: &str, quoted: bool| {
+        if quoted { Ident::with_quote('"', name) } else { Ident::new(name) }
+    };
+    let mut name = Vec::with_capacity(2);
+    if let Some(qualifier) = view.view_schema() {
+        name.push(spelled(qualifier, view.view_schema_is_quoted()));
+    }
+    name.push(spelled(view.view_name(), view.view_name_is_quoted()));
+    let options = if view.is_security_invoker() {
+        CreateTableOptions::With(vec![SqlOption::KeyValue {
+            key: ObjectName::from(vec![Ident::new("security_invoker")]),
+            value: Expr::Value(Value::Boolean(true).with_empty_span()),
+        }])
+    } else {
+        CreateTableOptions::None
+    };
+    Statement::CreateView(CreateView {
+        or_alter: false,
+        or_replace: false,
+        materialized: false,
+        secure: false,
+        name: ObjectName::from(name),
+        name_before_not_exists: false,
+        columns: view
+            .declared_column_names()
+            .iter()
+            .map(|(column, quoted)| {
+                ViewColumnDef { name: spelled(column, *quoted), data_type: None, options: None }
+            })
+            .collect(),
+        query: Box::new(view.definition().clone()),
+        options,
+        cluster_by: Vec::new(),
+        comment: None,
+        with_no_schema_binding: false,
+        if_not_exists: false,
+        temporary: view.is_temporary(),
+        to: None,
+        params: None,
+        copy_grants: false,
+    })
 }
