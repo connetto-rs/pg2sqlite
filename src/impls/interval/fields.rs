@@ -29,7 +29,7 @@ use crate::{
     errors::Error,
     impls::{
         expression_type::{is_interval_typed, type_name},
-        function_helpers::{integer_literal, number_literal, simple_function_expr, string_literal},
+        function_helpers::{integer_literal, simple_function_expr, string_literal},
         replay::{is_replayable, reject_duplicated_operand},
         shared_helpers::{declared_type_matches, numeric_scale},
         temporal_arithmetic::{TemporalKind, temporal_kind_of},
@@ -376,20 +376,7 @@ fn field_shift_body(kind: TemporalKind, calendar: ZonedCalendar<'_>, negate: boo
         // `time_pl_interval` adds the time field alone in 64 bits, which wrap
         // past the bound, takes the whole days off, and ignores the months
         // and days. `signed` negates a subtracted clock's modifiers.
-        let clock_modifiers = |micros: Expr| {
-            let fraction = binary(
-                binary(micros.clone(), BinaryOperator::Modulo, integer_literal(1_000_000)),
-                BinaryOperator::Divide,
-                number_literal("1000000.0"),
-            );
-            vec![
-                printf(
-                    "%+d seconds",
-                    binary(micros, BinaryOperator::Divide, integer_literal(1_000_000)),
-                ),
-                printf("%+.6f seconds", fraction),
-            ]
-        };
+        let clock_modifiers = |microseconds: Expr| vec![printf("%+d microseconds", microseconds)];
         let in_a_day = binary(field("u"), BinaryOperator::Modulo, integer_literal(86_400_000_000));
         let toward_wrap = if negate { BinaryOperator::Plus } else { BinaryOperator::Minus };
         let wrapped = binary(in_a_day.clone(), toward_wrap.clone(), integer_literal(WRAP_IN_A_DAY));
@@ -401,23 +388,12 @@ fn field_shift_body(kind: TemporalKind, calendar: ZonedCalendar<'_>, negate: boo
         };
         shifted_time_of_day(target_ref, &clock, zoned)
     } else {
-        let fraction = binary(
-            binary(field("u"), BinaryOperator::Modulo, integer_literal(1_000_000)),
-            BinaryOperator::Divide,
-            number_literal("1000000.0"),
-        );
         let calendar_modifiers = [
             printf("%+d months", field("m")),
             string_literal("floor"),
             printf("%+d days", field("d")),
         ];
-        let time_modifiers = [
-            printf(
-                "%+d seconds",
-                binary(field("u"), BinaryOperator::Divide, integer_literal(1_000_000)),
-            ),
-            printf("%+.6f seconds", fraction),
-        ];
+        let time_modifiers = [printf("%+d microseconds", field("u"))];
         match calendar {
             ZonedCalendar::Clock(offset) => {
                 let on_clock = |seconds: i32| {
@@ -430,14 +406,13 @@ fn field_shift_body(kind: TemporalKind, calendar: ZonedCalendar<'_>, negate: boo
                     .chain(on_clock(-offset))
                     .chain(time_modifiers)
                     .collect();
-                shifted_by_modifiers(target_ref, &modifiers)
+                shifted_by_modifiers(target_ref, &modifiers, kind == TemporalKind::TimestampTz)
             }
             ZonedCalendar::Registered(clock) => {
-                let mut local = vec![clock.local_clock(target_ref)];
-                local.extend(calendar_modifiers);
-                local.push(string_literal("subsec"));
-                let instant = clock.instant(simple_function_expr("datetime", local, None));
-                shifted_by_modifiers(instant, &time_modifiers)
+                let local =
+                    shifted_by_modifiers(clock.local_clock(target_ref), &calendar_modifiers, false);
+                let instant = clock.instant(local);
+                shifted_by_modifiers(instant, &time_modifiers, kind == TemporalKind::TimestampTz)
             }
         }
     }

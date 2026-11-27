@@ -25,6 +25,8 @@ pub(crate) enum DatePartKey {
     Hour,
     Minute,
     Second,
+    Milliseconds,
+    Microseconds,
     DayOfWeek,
     DayOfYear,
     Epoch,
@@ -49,6 +51,8 @@ pub(crate) fn parse_date_part_key(field: &str) -> Option<DatePartKey> {
         "hour" | "hours" => Some(DatePartKey::Hour),
         "minute" | "minutes" => Some(DatePartKey::Minute),
         "second" | "seconds" => Some(DatePartKey::Second),
+        "millisecond" | "milliseconds" => Some(DatePartKey::Milliseconds),
+        "microsecond" | "microseconds" => Some(DatePartKey::Microseconds),
         "dow" | "weekday" => Some(DatePartKey::DayOfWeek),
         "doy" => Some(DatePartKey::DayOfYear),
         "epoch" => Some(DatePartKey::Epoch),
@@ -69,6 +73,8 @@ pub(crate) fn datetime_field_key(field: &DateTimeField) -> Option<DatePartKey> {
         DateTimeField::Hour | DateTimeField::Hours => Some(DatePartKey::Hour),
         DateTimeField::Minute | DateTimeField::Minutes => Some(DatePartKey::Minute),
         DateTimeField::Second | DateTimeField::Seconds => Some(DatePartKey::Second),
+        DateTimeField::Millisecond | DateTimeField::Milliseconds => Some(DatePartKey::Milliseconds),
+        DateTimeField::Microsecond | DateTimeField::Microseconds => Some(DatePartKey::Microseconds),
         // PostgreSQL EXTRACT(DOW/DOY ...) uses Dow/Doy variants, not the
         // MySQL-style DayOfWeek/DayOfYear variants. Map both so either form
         // works.
@@ -93,7 +99,9 @@ pub(crate) fn strftime_mapping_for_key(key: DatePartKey) -> (&'static str, DataT
         DatePartKey::Day => ("%d", DataType::Integer(None)),
         DatePartKey::Hour => ("%H", DataType::Integer(None)),
         DatePartKey::Minute => ("%M", DataType::Integer(None)),
-        DatePartKey::Second => ("%f", DataType::Real),
+        DatePartKey::Second | DatePartKey::Milliseconds | DatePartKey::Microseconds => {
+            ("%f", DataType::Real)
+        }
         DatePartKey::DayOfWeek => ("%w", DataType::Integer(None)),
         DatePartKey::DayOfYear => ("%j", DataType::Integer(None)),
         // `build_date_part_expr` answers EPOCH before reaching here, so `%s`,
@@ -108,16 +116,31 @@ pub(crate) fn strftime_mapping_for_key(key: DatePartKey) -> (&'static str, DataT
     }
 }
 
-/// The whole of one date part, which for `EPOCH` is not a `strftime` call.
-///
-/// `strftime('%s', x)` answers whole seconds, so it drops the fraction
-/// PostgreSQL carries. `unixepoch(x, 'subsec')` keeps it, and is SQLite 3.42,
-/// inside the declared floor. SQLite holds milliseconds where PostgreSQL holds
-/// microseconds, so the two agree to three decimal places and no further.
+/// The numeric value of a date part, including fractional epoch seconds.
 #[must_use]
 pub(crate) fn build_date_part_expr(key: DatePartKey, value_expr: Expr) -> Expr {
     if key == DatePartKey::Epoch {
         return build_subsecond_unixepoch_call(value_expr);
+    }
+    if matches!(key, DatePartKey::Second | DatePartKey::Milliseconds | DatePartKey::Microseconds) {
+        let microseconds = local_second_microseconds(value_expr);
+        return match key {
+            DatePartKey::Second => {
+                Expr::Nested(Box::new(binary(
+                    microseconds,
+                    BinaryOperator::Divide,
+                    number_literal("1000000.0"),
+                )))
+            }
+            DatePartKey::Milliseconds => {
+                Expr::Nested(Box::new(binary(
+                    microseconds,
+                    BinaryOperator::Divide,
+                    number_literal("1000.0"),
+                )))
+            }
+            _ => microseconds,
+        };
     }
     let (format_str, cast_type) = strftime_mapping_for_key(key);
     Expr::Cast {
@@ -128,10 +151,14 @@ pub(crate) fn build_date_part_expr(key: DatePartKey, value_expr: Expr) -> Expr {
     }
 }
 
-/// `unixepoch(x, 'subsec')`, the seconds since the epoch with the fraction.
+/// Epoch seconds with the floating conversion confined to the result.
 #[must_use]
 pub(crate) fn build_subsecond_unixepoch_call(value_expr: Expr) -> Expr {
-    simple_function_expr("unixepoch", vec![value_expr, string_literal("subsec")], None)
+    Expr::Nested(Box::new(binary(
+        timestamp_microseconds(value_expr),
+        BinaryOperator::Divide,
+        number_literal("1000000.0"),
+    )))
 }
 
 /// Parse a SQLite `strftime` format into a PostgreSQL date-time field.
@@ -227,20 +254,8 @@ pub(crate) fn pg_to_char_format_to_strftime(pg_format: &str) -> Result<String, E
                  strftime answers NULL for '%y'. Use YYYY.",
             ));
         }
-        // MS (milliseconds) and US (microseconds) are sub-second codes.
-        // SQLite strftime has no sub-second specifier, so they are named
-        // explicitly rather than blamed on the first letter (M or U).
-        if rest.starts_with("MS") || rest.starts_with("US") {
-            let code = if rest.starts_with("MS") { "MS" } else { "US" };
-            return Err(unsupported_template(
-                pg_format,
-                &format!(
-                    "contains the fractional-seconds code \'{code}\'. SQLite strftime has no \
-                     sub-second specifier; the finest resolution is SS (whole seconds). \
-                     Three-digit milliseconds can be extracted with \
-                     printf(\'%.3f\', unixepoch(ts, \'subsec\') %% 1)."
-                ),
-            ));
+        if fractional_format_code(rest).is_some() {
+            return Err(unsupported_template(pg_format, "requires exact fractional formatting."));
         }
 
         let character = rest.chars().next().unwrap_or_default();
@@ -268,6 +283,297 @@ pub(crate) fn pg_to_char_format_to_strftime(pg_format: &str) -> Result<String, E
     }
 
     Ok(result)
+}
+
+/// The fractional template prefix and its decimal precision.
+fn fractional_format_code(format: &str) -> Option<(&'static str, i64)> {
+    [("MS", 3), ("US", 6), ("FF1", 1), ("FF2", 2), ("FF3", 3), ("FF4", 4), ("FF5", 5), ("FF6", 6)]
+        .into_iter()
+        .find(|(code, _)| format.starts_with(code))
+}
+
+/// Format temporal text with exact fractional digits.
+pub(crate) fn build_to_char_expr(format: &str, value: Expr) -> Result<Expr, Error> {
+    let mut result = None;
+    let mut start = 0;
+    let mut consumed = 0;
+    for (piece, range) in format_pieces(format)? {
+        if range.start < consumed || piece != FormatPiece::Other {
+            continue;
+        }
+        let rest = &format[range.start..];
+        if let Some((code, _)) = TO_CHAR_CODES.iter().find(|(code, _)| rest.starts_with(code)) {
+            consumed = range.start + code.len();
+            continue;
+        }
+        if rest.starts_with('T') && !bare_t_is_literal(rest) {
+            return Err(unsupported_template(
+                format,
+                "carries a bare T before an hour or a minute, which PostgreSQL reads as the \
+                 start of TH or TM rather than as a separator. Write the ISO separator as \
+                 \"T\".",
+            ));
+        }
+        let Some((code, precision)) = fractional_format_code(&format[range.start..]) else {
+            continue;
+        };
+        if range.start > start {
+            let mapped = pg_to_char_format_to_strftime(&format[start..range.start])?;
+            append_format_piece(&mut result, local_format_chunk(&mapped, value.clone()));
+        }
+        append_format_piece(&mut result, fractional_digits_text(value.clone(), precision));
+        start = range.start + code.len();
+        consumed = start;
+    }
+    if start < format.len() || result.is_none() {
+        let mapped = pg_to_char_format_to_strftime(&format[start..])?;
+        append_format_piece(&mut result, local_format_chunk(&mapped, value));
+    }
+    Ok(result.unwrap_or_else(|| string_literal("")))
+}
+
+/// Whether a template contains unquoted ISO calendar fields.
+pub(crate) fn to_char_has_iso_fields(format: &str) -> Result<bool, Error> {
+    Ok(format_pieces(format)?.into_iter().any(|(piece, range)| {
+        piece == FormatPiece::Other
+            && ["IYYY", "IW", "ID"].iter().any(|code| format[range.start..].starts_with(code))
+    }))
+}
+
+/// Format calendar fields of a time as zero-valued interval fields.
+fn local_format_chunk(format: &str, value: Expr) -> Expr {
+    let mut time_format = String::with_capacity(format.len());
+    let mut end_of_day_format = String::with_capacity(format.len());
+    let mut characters = format.chars();
+    while let Some(character) = characters.next() {
+        if character != '%' {
+            time_format.push(character);
+            end_of_day_format.push(character);
+            continue;
+        }
+        match characters.next() {
+            Some('Y') => {
+                time_format.push_str("0000");
+                end_of_day_format.push_str("0000");
+            }
+            Some('m' | 'd') => {
+                time_format.push_str("00");
+                end_of_day_format.push_str("00");
+            }
+            Some('H') => {
+                time_format.push_str("%H");
+                end_of_day_format.push_str("24");
+            }
+            Some(specifier) => {
+                time_format.push('%');
+                time_format.push(specifier);
+                end_of_day_format.push('%');
+                end_of_day_format.push(specifier);
+            }
+            None => {
+                time_format.push('%');
+                end_of_day_format.push('%');
+            }
+        }
+    }
+    if time_format == format && end_of_day_format == format {
+        return build_strftime_call(format, local_whole_seconds(value));
+    }
+    let time_value = if end_of_day_format == time_format {
+        build_strftime_call(&time_format, local_whole_seconds(value.clone()))
+    } else {
+        case_when(
+            binary(
+                temporal_substring(value.clone(), 1, Some(2)),
+                BinaryOperator::Eq,
+                string_literal("24"),
+            ),
+            build_strftime_call(&end_of_day_format, local_whole_seconds(value.clone())),
+            Some(build_strftime_call(&time_format, local_whole_seconds(value.clone()))),
+        )
+    };
+    case_when(
+        local_clock_guard(value.clone()),
+        time_value,
+        Some(build_strftime_call(format, local_whole_seconds(value))),
+    )
+}
+
+/// Append a format segment without changing concatenation precedence.
+fn append_format_piece(result: &mut Option<Expr>, piece: Expr) {
+    *result = Some(match result.take() {
+        Some(previous) => concat(previous, piece),
+        None => piece,
+    });
+}
+
+/// Whether temporal text begins with a time of day.
+fn local_clock_guard(value: Expr) -> Expr {
+    binary(temporal_substring(value, 3, Some(1)), BinaryOperator::Eq, string_literal(":"))
+}
+
+/// Local timestamp or time text without fractional digits or an offset.
+fn local_whole_seconds(value: Expr) -> Expr {
+    case_when(
+        local_clock_guard(value.clone()),
+        temporal_substring(value.clone(), 1, Some(8)),
+        Some(temporal_substring(value, 1, Some(19))),
+    )
+}
+
+/// Fractional microseconds of a timestamp or local time.
+fn local_fraction_microseconds(value: Expr) -> Expr {
+    case_when(
+        local_clock_guard(value.clone()),
+        fraction_microseconds(value.clone(), true),
+        Some(fraction_microseconds(value, false)),
+    )
+}
+
+/// Microseconds within the local minute, independent of offset seconds.
+fn local_second_microseconds(value: Expr) -> Expr {
+    let seconds = integer_cast(case_when(
+        local_clock_guard(value.clone()),
+        temporal_substring(value.clone(), 7, Some(2)),
+        Some(temporal_substring(value.clone(), 18, Some(2))),
+    ));
+    Expr::Nested(Box::new(binary(
+        binary(seconds, BinaryOperator::Multiply, integer_literal(1_000_000)),
+        BinaryOperator::Plus,
+        local_fraction_microseconds(value),
+    )))
+}
+
+/// Zero-padded fractional text with a null operand kept null.
+fn fractional_digits_text(value: Expr, precision: i64) -> Expr {
+    let digits = simple_function_expr(
+        "printf",
+        vec![string_literal("%06d"), local_fraction_microseconds(value.clone())],
+        None,
+    );
+    Expr::Nested(Box::new(concat(
+        temporal_substring(value, 1, Some(0)),
+        temporal_substring(digits, 1, Some(precision)),
+    )))
+}
+
+/// The operand tested by a local-clock branch.
+fn local_clock_argument(expression: &Expr) -> Option<&Expr> {
+    let Expr::Case { conditions, .. } = peel_nested(expression) else { return None };
+    let Expr::BinaryOp { left, .. } = &conditions.first()?.condition else { return None };
+    temporal_argument(left, "substr", 0).or_else(|| substr_bounded_argument(left, "3", "1"))
+}
+
+/// The field and operand of an exact local-second reader.
+pub(crate) fn exact_date_part_argument(expression: &Expr) -> Option<(DateTimeField, &Expr)> {
+    let total = match peel_nested(expression) {
+        Expr::BinaryOp { left, op: BinaryOperator::Divide, .. } => peel_nested(left),
+        expression => expression,
+    };
+    let Expr::BinaryOp { left, op: BinaryOperator::Plus, .. } = total else { return None };
+    let Expr::BinaryOp { left, op: BinaryOperator::Multiply, .. } = peel_nested(left) else {
+        return None;
+    };
+    let Expr::Cast { expr, .. } = peel_nested(left) else { return None };
+    let operand = local_clock_argument(expr)?;
+    [
+        (DatePartKey::Second, DateTimeField::Second),
+        (DatePartKey::Milliseconds, DateTimeField::Milliseconds),
+        (DatePartKey::Microseconds, DateTimeField::Microseconds),
+    ]
+    .into_iter()
+    .find_map(|(key, field)| {
+        temporal_shape_matches(
+            expression,
+            &build_date_part_expr(key, Expr::Value(Value::Null.into())),
+            operand,
+        )
+        .then_some((field, operand))
+    })
+}
+
+/// The template and operand of exact temporal formatting.
+pub(crate) fn exact_to_char_arguments(expression: &Expr) -> Option<(String, &Expr)> {
+    let (template, operand) = exact_format_piece(expression)?;
+    let expected = build_to_char_expr(&template, Expr::Value(Value::Null.into())).ok()?;
+    temporal_shape_matches(expression, &expected, operand).then_some((template, operand))
+}
+
+/// Recover one exact formatting segment or concatenation.
+#[cfg_attr(feature = "std", recursive::recursive)]
+fn exact_format_piece(expression: &Expr) -> Option<(String, &Expr)> {
+    let expression = peel_nested(expression);
+    let formatted = match expression {
+        Expr::Case { else_result: Some(formatted), .. } => &**formatted,
+        expression => expression,
+    };
+    if let Some(format) = temporal_argument(formatted, "strftime", 0) {
+        let Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(format), .. }) = format
+        else {
+            return None;
+        };
+        let whole = temporal_argument(formatted, "strftime", 1)?;
+        let operand = local_clock_argument(whole)?;
+        if !temporal_shape_matches(
+            expression,
+            &local_format_chunk(format, Expr::Value(Value::Null.into())),
+            operand,
+        ) {
+            return None;
+        }
+        return Some((exact_strftime_template(format)?, operand));
+    }
+    let (left, right) = concat_operands(expression)?;
+    if let Some(operand) =
+        temporal_argument(left, "substr", 0).or_else(|| substr_bounded_argument(left, "1", "0"))
+    {
+        for (code, precision) in
+            [("FF1", 1), ("FF2", 2), ("MS", 3), ("FF4", 4), ("FF5", 5), ("US", 6)]
+        {
+            if temporal_shape_matches(
+                expression,
+                &fractional_digits_text(Expr::Value(Value::Null.into()), precision),
+                operand,
+            ) {
+                return Some((code.to_owned(), operand));
+            }
+        }
+    }
+    let (mut template, operand) = exact_format_piece(left)?;
+    let (suffix, right_operand) = exact_format_piece(right)?;
+    if operand != right_operand {
+        return None;
+    }
+    template.push_str(&suffix);
+    Some((template, operand))
+}
+
+/// Recover supported codes and quoted literals from a formatting segment.
+fn exact_strftime_template(format: &str) -> Option<String> {
+    let mut template = String::new();
+    let mut characters = format.chars();
+    while let Some(character) = characters.next() {
+        if character == '%' {
+            let specifier = characters.next()?;
+            if specifier != '%' {
+                let (code, _) =
+                    TO_CHAR_CODES.iter().find(|(_, format)| format.ends_with(specifier))?;
+                template.push_str(code);
+                continue;
+            }
+        }
+        if character == '"' || character == '\\' {
+            return None;
+        }
+        if character != 'T' && TO_CHAR_SEPARATORS.contains(&character) {
+            template.push(character);
+            continue;
+        }
+        template.push('"');
+        template.push(character);
+        template.push('"');
+    }
+    Some(template)
 }
 
 /// True when PostgreSQL reads the `T` starting `rest` as a literal.
@@ -456,15 +762,40 @@ pub(crate) fn build_strftime_call(format: &str, value_expr: Expr) -> Expr {
     simple_function_expr("strftime", vec![string_literal(format), value_expr], None)
 }
 
-/// The `strftime` format of the text a replica holds for a `timestamptz`,
-/// `YYYY-MM-DD HH:MM:SS.ffffff+00:00`, where `%f` stops at milliseconds and
-/// the zeros pad it to microseconds.
+/// The legacy canonical format accepted by reverse translation.
 pub(crate) const TIMESTAMPTZ_FORMAT: &str = "%Y-%m-%d %H:%M:%f000+00:00";
 
 /// The canonical `timestamptz` text of a value SQLite's date functions read.
 #[must_use]
 pub(crate) fn canonical_timestamptz_call(value_expr: Expr) -> Expr {
-    build_strftime_call(TIMESTAMPTZ_FORMAT, value_expr)
+    let fraction = timestamp_fraction_microseconds(value_expr.clone());
+    let carry = binary(
+        Expr::Nested(Box::new(fraction.clone())),
+        BinaryOperator::Divide,
+        integer_literal(1_000_000),
+    );
+    let whole = simple_function_expr(
+        "strftime",
+        vec![
+            string_literal("%Y-%m-%d %H:%M:%S"),
+            whole_second_timestamp(value_expr),
+            simple_function_expr("printf", vec![string_literal("+%d seconds"), carry], None),
+        ],
+        None,
+    );
+    let fraction = simple_function_expr(
+        "printf",
+        vec![
+            string_literal("%06d"),
+            binary(
+                Expr::Nested(Box::new(fraction)),
+                BinaryOperator::Modulo,
+                integer_literal(1_000_000),
+            ),
+        ],
+        None,
+    );
+    concat(concat(concat(whole, string_literal(".")), fraction), string_literal("+00:00"))
 }
 
 /// The midnight text of a date, the form a TIMESTAMP value of that day holds.
@@ -476,19 +807,31 @@ pub(crate) fn promote_date_to_midnight(date_expr: Expr) -> Expr {
 /// Whether `expr` is a [`canonical_timestamptz_call`].
 #[must_use]
 pub(crate) fn is_canonical_timestamptz_call(expr: &Expr) -> bool {
-    let Expr::Function(function) = peel_nested(expr) else { return false };
-    super::function_helpers::is_function_named(function, "strftime")
-        && matches!(
-            super::shared_helpers::function_argument_exprs(&function.args).as_slice(),
-            [format, _] if super::function_helpers::single_quoted_literal(format)
-                == Some(TIMESTAMPTZ_FORMAT)
-        )
+    canonical_timestamptz_argument(expr).is_some()
 }
 
 /// Moves the operand out of a [`canonical_timestamptz_call`], leaving `expr`
 /// untouched and answering `None` when it is not one.
 pub(crate) fn take_canonical_timestamptz_operand(expr: &mut Expr) -> Option<Expr> {
-    if is_canonical_timestamptz_call(expr) { take_last_argument(expr) } else { None }
+    canonical_timestamptz_argument(expr)?;
+    if matches!(peel_nested(expr), Expr::Function(_)) {
+        return take_last_argument(expr);
+    }
+    let mut owned = core::mem::replace(expr, Expr::Value(Value::Null.into()));
+    while let Expr::Nested(inner) = owned {
+        owned = *inner;
+    }
+    let Expr::BinaryOp { left, .. } = owned else { return None };
+    let Expr::BinaryOp { left, .. } = *left else { return None };
+    let Expr::BinaryOp { mut left, .. } = *left else { return None };
+    let Expr::Function(function) = &mut *left else { return None };
+    let FunctionArguments::List(arguments) = &mut function.args else { return None };
+    let FunctionArg::Unnamed(FunctionArgExpr::Expr(mut whole)) = arguments.args.swap_remove(1)
+    else {
+        return None;
+    };
+    let Expr::Case { else_result, .. } = &mut whole else { return None };
+    else_result.take().map(|operand| *operand)
 }
 
 /// The fraction of a second of a timestamp text, read from character 20.
@@ -755,6 +1098,9 @@ fn take_last_argument(expr: &mut Expr) -> Option<Expr> {
 #[must_use]
 #[cfg_attr(feature = "std", recursive::recursive)]
 pub(crate) fn is_offset_less_timestamp_call(expr: &Expr) -> bool {
+    if timestamp_from_microseconds_argument(expr).is_some() {
+        return true;
+    }
     if let Some(guarded) = super::temporal_arithmetic::year_one_guarded(peel_nested(expr)) {
         return is_offset_less_timestamp_call(guarded);
     }
@@ -923,30 +1269,9 @@ fn integer_cast(expr: Expr) -> Expr {
     }
 }
 
-/// `strftime('%s', value) * 1000000` plus the fractional digits of `value`.
+/// The exact UTC epoch microseconds of timestamp text.
 fn fractional_second_total(value: Expr) -> Expr {
-    let seconds = strftime_number("%s", value.clone());
-    let digits = simple_function_expr(
-        "substr",
-        vec![
-            Expr::Nested(Box::new(concat(
-                simple_function_expr(
-                    "substr",
-                    vec![value, integer_literal(21), integer_literal(6)],
-                    None,
-                ),
-                string_literal("000000"),
-            ))),
-            integer_literal(1),
-            integer_literal(6),
-        ],
-        None,
-    );
-    binary(
-        binary(seconds, BinaryOperator::Multiply, integer_literal(1_000_000)),
-        BinaryOperator::Plus,
-        integer_cast(digits),
-    )
+    timestamp_microseconds(value)
 }
 
 /// `total` microseconds rounded half away from zero to a multiple of `divisor`.
@@ -1052,7 +1377,7 @@ pub(crate) fn round_naive_timestamp(value: &Expr, precision: u32, fallback: Expr
     let divisor = 10_i64.pow(6 - precision.min(5));
     let total = fractional_second_total(value.clone());
     let rounded = round_micros(total, divisor);
-    let fraction = binary(rounded.clone(), BinaryOperator::Modulo, integer_literal(1_000_000));
+    let fraction = positive_remainder(rounded.clone(), 1_000_000);
     let whole = whole_seconds_of_micros(rounded, fraction.clone());
     let guard = binary(
         simple_function_expr(
@@ -1072,31 +1397,9 @@ pub(crate) fn round_naive_timestamp(value: &Expr, precision: u32, fallback: Expr
 #[must_use]
 pub(crate) fn round_timestamptz(value: Expr, precision: u32) -> Expr {
     let divisor = 10_i64.pow(6 - precision.min(5));
-    let seconds = strftime_number("%s", value.clone());
-    let fraction = integer_cast(simple_function_expr(
-        "substr",
-        vec![value.clone(), integer_literal(21), integer_literal(6)],
-        None,
-    ));
-    let total = binary(
-        binary(seconds, BinaryOperator::Multiply, integer_literal(1_000_000)),
-        BinaryOperator::Plus,
-        fraction,
-    );
+    let total = timestamp_microseconds(value.clone());
     let rounded = round_micros(total, divisor);
-    let fraction = binary(
-        binary(
-            Expr::Nested(Box::new(binary(
-                rounded.clone(),
-                BinaryOperator::Modulo,
-                integer_literal(1_000_000),
-            ))),
-            BinaryOperator::Plus,
-            integer_literal(1_000_000),
-        ),
-        BinaryOperator::Modulo,
-        integer_literal(1_000_000),
-    );
+    let fraction = positive_remainder(rounded.clone(), 1_000_000);
     let whole = whole_seconds_of_micros(rounded, fraction.clone());
     let length = simple_function_expr("length", vec![value.clone()], None);
     let offset = simple_function_expr(
@@ -1355,4 +1658,461 @@ fn instant_text(instant: &Expr) -> Expr {
             None,
         )),
     )
+}
+
+/// The substring starting at `start`, optionally bounded by `length`.
+fn temporal_substring(value: Expr, start: i64, length: Option<i64>) -> Expr {
+    let mut arguments = vec![value, integer_literal(start)];
+    if let Some(length) = length {
+        arguments.push(integer_literal(length));
+    }
+    simple_function_expr("substr", arguments, None)
+}
+
+/// Whether timestamp or time text carries a fractional point.
+fn fraction_guard(value: Expr, time_only: bool) -> Expr {
+    binary(
+        temporal_substring(value, if time_only { 9 } else { 20 }, Some(1)),
+        BinaryOperator::Eq,
+        string_literal("."),
+    )
+}
+
+/// Whole-second timestamp text with its offset retained.
+pub(crate) fn whole_second_timestamp(value: Expr) -> Expr {
+    whole_second_temporal(value, false)
+}
+
+/// The operand of whole-second timestamp text with its offset retained.
+pub(crate) fn whole_second_timestamp_argument(expression: &Expr) -> Option<&Expr> {
+    let Expr::Case { else_result: Some(operand), .. } = peel_nested(expression) else {
+        return None;
+    };
+    temporal_shape_matches(
+        expression,
+        &whole_second_timestamp(Expr::Value(Value::Null.into())),
+        operand,
+    )
+    .then_some(operand)
+}
+
+/// Whole-second temporal text with its offset retained.
+fn whole_second_temporal(value: Expr, time_only: bool) -> Expr {
+    let point = if time_only { 9 } else { 20 };
+    let suffix = simple_function_expr(
+        "ltrim",
+        vec![temporal_substring(value.clone(), point + 1, None), string_literal("0123456789")],
+        None,
+    );
+    case_when(
+        fraction_guard(value.clone(), time_only),
+        concat(temporal_substring(value.clone(), 1, Some(point - 1)), suffix),
+        Some(value),
+    )
+}
+
+/// The integer microsecond fraction of timestamp text.
+pub(crate) fn timestamp_fraction_microseconds(value: Expr) -> Expr {
+    fraction_microseconds(value, false)
+}
+
+/// Fractional digits rounded to microseconds with ties to even.
+fn fraction_microseconds(value: Expr, time_only: bool) -> Expr {
+    let tail = temporal_substring(value.clone(), if time_only { 10 } else { 21 }, None);
+    let suffix =
+        simple_function_expr("ltrim", vec![tail.clone(), string_literal("0123456789")], None);
+    let length = binary(
+        simple_function_expr("length", vec![tail.clone()], None),
+        BinaryOperator::Minus,
+        simple_function_expr("length", vec![suffix], None),
+    );
+    let digits = simple_function_expr("substr", vec![tail, integer_literal(1), length], None);
+    let padded = temporal_substring(
+        Expr::Nested(Box::new(concat(digits.clone(), string_literal("000000")))),
+        1,
+        Some(6),
+    );
+    let truncated = integer_cast(padded);
+    let remainder = simple_function_expr(
+        "rtrim",
+        vec![temporal_substring(digits, 7, None), string_literal("0")],
+        None,
+    );
+    let above_half = binary(remainder.clone(), BinaryOperator::Gt, string_literal("5"));
+    let half = binary(remainder, BinaryOperator::Eq, string_literal("5"));
+    let odd = binary(
+        binary(truncated.clone(), BinaryOperator::Modulo, integer_literal(2)),
+        BinaryOperator::Eq,
+        integer_literal(1),
+    );
+    let round_up = binary(
+        above_half,
+        BinaryOperator::Or,
+        Expr::Nested(Box::new(binary(half, BinaryOperator::And, odd))),
+    );
+    let rounded = Expr::Nested(Box::new(binary(
+        truncated,
+        BinaryOperator::Plus,
+        case_when(round_up, integer_literal(1), Some(integer_literal(0))),
+    )));
+    case_when(fraction_guard(value, time_only), rounded, Some(integer_literal(0)))
+}
+
+/// Exact integer UTC epoch microseconds from timestamp text.
+pub(crate) fn timestamp_microseconds(value: Expr) -> Expr {
+    temporal_microseconds(value, false)
+}
+
+/// Exact integer microseconds from timestamp text or a time of day.
+pub(crate) fn temporal_microseconds(value: Expr, time_only: bool) -> Expr {
+    let whole = whole_second_temporal(value.clone(), time_only);
+    let seconds = simple_function_expr("unixepoch", vec![whole], None);
+    let seconds = if time_only {
+        Expr::Nested(Box::new(binary(seconds, BinaryOperator::Minus, integer_literal(946_684_800))))
+    } else {
+        seconds
+    };
+    Expr::Nested(Box::new(binary(
+        binary(seconds, BinaryOperator::Multiply, integer_literal(1_000_000)),
+        BinaryOperator::Plus,
+        fraction_microseconds(value, time_only),
+    )))
+}
+
+/// A nonnegative remainder, including for instants preceding the epoch.
+fn positive_remainder(value: Expr, modulus: i64) -> Expr {
+    Expr::Nested(Box::new(binary(
+        Expr::Nested(Box::new(binary(
+            Expr::Nested(Box::new(binary(
+                Expr::Nested(Box::new(value)),
+                BinaryOperator::Modulo,
+                integer_literal(modulus),
+            ))),
+            BinaryOperator::Plus,
+            integer_literal(modulus),
+        ))),
+        BinaryOperator::Modulo,
+        integer_literal(modulus),
+    )))
+}
+
+/// Trimmed timestamp text from integer UTC epoch microseconds.
+pub(crate) fn timestamp_from_microseconds(microseconds: Expr) -> Expr {
+    let fraction = positive_remainder(microseconds.clone(), 1_000_000);
+    concat(whole_seconds_of_micros(microseconds, fraction.clone()), fraction_text(fraction))
+}
+
+/// Canonical timestamp text from integer UTC epoch microseconds.
+pub(crate) fn canonical_timestamp_from_microseconds(microseconds: Expr) -> Expr {
+    let fraction = positive_remainder(microseconds.clone(), 1_000_000);
+    let whole = whole_seconds_of_micros(microseconds, fraction.clone());
+    let fraction = simple_function_expr("printf", vec![string_literal("%06d"), fraction], None);
+    concat(concat(concat(whole, string_literal(".")), fraction), string_literal("+00:00"))
+}
+
+/// Trimmed time text from integer microseconds modulo one day.
+pub(crate) fn time_from_microseconds(microseconds: Expr) -> Expr {
+    let fraction = positive_remainder(microseconds.clone(), 1_000_000);
+    let seconds = binary(
+        positive_remainder(microseconds, 86_400_000_000),
+        BinaryOperator::Divide,
+        integer_literal(1_000_000),
+    );
+    concat(
+        simple_function_expr(
+            "strftime",
+            vec![string_literal("%H:%M:%S"), seconds, string_literal("unixepoch")],
+            None,
+        ),
+        fraction_text(fraction),
+    )
+}
+
+/// Read timestamp or time text as integer microseconds.
+pub(crate) fn text_reader_microseconds(operand: Expr, time_only: bool) -> Expr {
+    let is_time = binary(
+        temporal_substring(operand.clone(), 3, Some(1)),
+        BinaryOperator::Eq,
+        string_literal(":"),
+    );
+    let time_microseconds = temporal_microseconds(operand.clone(), true);
+    let time_microseconds = if time_only {
+        time_microseconds
+    } else {
+        Expr::Nested(Box::new(binary(
+            time_microseconds,
+            BinaryOperator::Plus,
+            integer_literal(946_684_800_000_000),
+        )))
+    };
+    let timestamp_microseconds = if time_only {
+        let seconds =
+            simple_function_expr("unixepoch", vec![whole_second_timestamp(operand.clone())], None);
+        Expr::Nested(Box::new(binary(
+            binary(
+                positive_remainder(seconds, 86_400),
+                BinaryOperator::Multiply,
+                integer_literal(1_000_000),
+            ),
+            BinaryOperator::Plus,
+            timestamp_fraction_microseconds(operand),
+        )))
+    } else {
+        timestamp_microseconds(operand)
+    };
+    case_when(is_time, time_microseconds, Some(timestamp_microseconds))
+}
+
+/// The text operand of a temporal text reader.
+pub(crate) fn text_reader_microseconds_argument(expression: &Expr) -> Option<&Expr> {
+    let Expr::Case { conditions, .. } = peel_nested(expression) else { return None };
+    let condition = &conditions.first()?.condition;
+    let Expr::BinaryOp { left, op: BinaryOperator::Eq, .. } = condition else { return None };
+    let operand =
+        temporal_argument(left, "substr", 0).or_else(|| substr_bounded_argument(left, "3", "1"))?;
+    [false, true]
+        .into_iter()
+        .any(|time_only| {
+            temporal_shape_matches(
+                expression,
+                &text_reader_microseconds(Expr::Value(Value::Null.into()), time_only),
+                operand,
+            )
+        })
+        .then_some(operand)
+}
+
+/// A cast time retaining the end-of-day microsecond carry.
+pub(crate) fn text_time_from_microseconds(microseconds: Expr) -> Expr {
+    case_when(
+        binary(microseconds.clone(), BinaryOperator::Eq, integer_literal(86_400_000_000)),
+        string_literal("24:00:00"),
+        Some(time_from_microseconds(microseconds)),
+    )
+}
+
+/// The integer operand of a cast time retaining its end-of-day carry.
+pub(crate) fn text_time_from_microseconds_argument(expression: &Expr) -> Option<&Expr> {
+    let Expr::Case { else_result: Some(fallback), .. } = peel_nested(expression) else {
+        return None;
+    };
+    let operand = time_from_microseconds_argument(fallback)?;
+    temporal_shape_matches(
+        expression,
+        &text_time_from_microseconds(Expr::Value(Value::Null.into())),
+        operand,
+    )
+    .then_some(operand)
+}
+
+/// The argument of a function at a fixed position.
+fn temporal_argument<'a>(expression: &'a Expr, name: &str, index: usize) -> Option<&'a Expr> {
+    let Expr::Function(function) = peel_nested(expression) else { return None };
+    if !super::function_helpers::is_function_named(function, name) {
+        return None;
+    }
+    let FunctionArguments::List(arguments) = &function.args else { return None };
+    match arguments.args.get(index)? {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(argument)) => Some(argument),
+        _ => None,
+    }
+}
+
+/// The original operand of an exact or legacy canonical timestamp.
+pub(crate) fn canonical_timestamptz_argument(expression: &Expr) -> Option<&Expr> {
+    if let Some(format) = temporal_argument(expression, "strftime", 0)
+        && super::function_helpers::single_quoted_literal(format) == Some(TIMESTAMPTZ_FORMAT)
+    {
+        let Expr::Function(function) = peel_nested(expression) else { return None };
+        let arguments = super::function_helpers::plain_catalog_function_args(function, "strftime")?;
+        if arguments.args.len() != 2 || arguments.duplicate_treatment.is_some() {
+            return None;
+        }
+        return temporal_argument(expression, "strftime", 1);
+    }
+    let (left, _) = concat_operands(peel_nested(expression))?;
+    let (left, _) = concat_operands(left)?;
+    let (whole, _) = concat_operands(left)?;
+    let whole = temporal_argument(whole, "strftime", 1)?;
+    let Expr::Case { else_result: Some(operand), .. } = whole else { return None };
+    temporal_shape_matches(
+        expression,
+        &canonical_timestamptz_call(Expr::Value(Value::Null.into())),
+        operand,
+    )
+    .then_some(operand)
+}
+
+/// The operand and temporal kind of an exact microsecond conversion.
+pub(crate) fn temporal_microseconds_argument(expression: &Expr) -> Option<(&Expr, bool)> {
+    let Expr::BinaryOp { left, op: BinaryOperator::Plus, .. } = peel_nested(expression) else {
+        return None;
+    };
+    let Expr::BinaryOp { left: seconds, op: BinaryOperator::Multiply, .. } = &**left else {
+        return None;
+    };
+    let (seconds, time_only) = match peel_nested(seconds) {
+        Expr::BinaryOp { left, op: BinaryOperator::Minus, .. } => (&**left, true),
+        seconds => (seconds, false),
+    };
+    let whole = temporal_argument(seconds, "unixepoch", 0)?;
+    let Expr::Case { else_result: Some(operand), .. } = whole else { return None };
+    temporal_shape_matches(
+        expression,
+        &temporal_microseconds(Expr::Value(Value::Null.into()), time_only),
+        operand,
+    )
+    .then_some((operand, time_only))
+}
+
+/// The timestamp operand of an exact microsecond conversion.
+pub(crate) fn timestamp_microseconds_argument(expression: &Expr) -> Option<&Expr> {
+    let (operand, time_only) = temporal_microseconds_argument(expression)?;
+    (!time_only).then_some(operand)
+}
+
+/// The integer operand of exact timestamp formatting.
+pub(crate) fn timestamp_from_microseconds_argument(expression: &Expr) -> Option<&Expr> {
+    let (whole, _) = concat_operands(peel_nested(expression))?;
+    let seconds = temporal_argument(whole, "strftime", 1)?;
+    let Expr::BinaryOp { left, op: BinaryOperator::Divide, .. } = seconds else { return None };
+    let Expr::BinaryOp { left: operand, op: BinaryOperator::Minus, .. } = peel_nested(left) else {
+        return None;
+    };
+    temporal_shape_matches(
+        expression,
+        &timestamp_from_microseconds(Expr::Value(Value::Null.into())),
+        operand,
+    )
+    .then_some(operand)
+}
+
+/// The integer operand of exact time formatting.
+pub(crate) fn time_from_microseconds_argument(expression: &Expr) -> Option<&Expr> {
+    let (whole, _) = concat_operands(peel_nested(expression))?;
+    let seconds = temporal_argument(whole, "strftime", 1)?;
+    let Expr::BinaryOp { left, op: BinaryOperator::Divide, .. } = seconds else { return None };
+    let Expr::BinaryOp { left, op: BinaryOperator::Modulo, .. } = peel_nested(left) else {
+        return None;
+    };
+    let Expr::BinaryOp { left, op: BinaryOperator::Plus, .. } = peel_nested(left) else {
+        return None;
+    };
+    let Expr::BinaryOp { left: operand, op: BinaryOperator::Modulo, .. } = peel_nested(left) else {
+        return None;
+    };
+    let operand = peel_nested(operand);
+    temporal_shape_matches(
+        expression,
+        &time_from_microseconds(Expr::Value(Value::Null.into())),
+        operand,
+    )
+    .then_some(operand)
+}
+
+/// Match a temporal template whose null leaves stand for the borrowed operand.
+#[cfg_attr(feature = "std", recursive::recursive)]
+pub(crate) fn temporal_shape_matches(actual: &Expr, expected: &Expr, substitution: &Expr) -> bool {
+    let actual = peel_nested(actual);
+    let expected = peel_nested(expected);
+    if matches!(expected, Expr::Value(ValueWithSpan { value: Value::Null, .. })) {
+        return actual == peel_nested(substitution);
+    }
+    match (actual, expected) {
+        (
+            Expr::BinaryOp { left, op, right },
+            Expr::BinaryOp { left: expected_left, op: expected_operator, right: expected_right },
+        ) => {
+            op == expected_operator
+                && temporal_shape_matches(left, expected_left, substitution)
+                && temporal_shape_matches(right, expected_right, substitution)
+        }
+        (
+            Expr::Cast { expr, data_type, .. },
+            Expr::Cast { expr: expected_expression, data_type: expected_type, .. },
+        ) => {
+            data_type == expected_type
+                && temporal_shape_matches(expr, expected_expression, substitution)
+        }
+        (
+            Expr::Case { operand, conditions, else_result, .. },
+            Expr::Case {
+                operand: expected_operand,
+                conditions: expected_conditions,
+                else_result: expected_else,
+                ..
+            },
+        ) => {
+            operand == expected_operand
+                && conditions.len() == expected_conditions.len()
+                && conditions.iter().zip(expected_conditions).all(
+                    |(condition, expected_condition)| {
+                        temporal_shape_matches(
+                            &condition.condition,
+                            &expected_condition.condition,
+                            substitution,
+                        ) && temporal_shape_matches(
+                            &condition.result,
+                            &expected_condition.result,
+                            substitution,
+                        )
+                    },
+                )
+                && match (else_result, expected_else) {
+                    (Some(result), Some(expected_result)) => {
+                        temporal_shape_matches(result, expected_result, substitution)
+                    }
+                    (None, None) => true,
+                    _ => false,
+                }
+        }
+        (Expr::Substring { expr, substring_from, substring_for, .. }, Expr::Function(_)) => {
+            temporal_argument(expected, "substr", 0).is_some_and(|expected_value| {
+                temporal_shape_matches(expr, expected_value, substitution)
+                    && match (substring_from.as_deref(), temporal_argument(expected, "substr", 1)) {
+                        (Some(start), Some(expected_start)) => {
+                            temporal_shape_matches(start, expected_start, substitution)
+                        }
+                        _ => false,
+                    }
+                    && match (substring_for.as_deref(), temporal_argument(expected, "substr", 2)) {
+                        (Some(length), Some(expected_length)) => {
+                            temporal_shape_matches(length, expected_length, substitution)
+                        }
+                        (None, None) => true,
+                        _ => false,
+                    }
+            })
+        }
+        (Expr::Function(actual), Expr::Function(expected)) => {
+            if actual.name != expected.name
+                || actual.uses_odbc_syntax
+                || actual.parameters != FunctionArguments::None
+                || actual.filter.is_some()
+                || actual.null_treatment.is_some()
+                || actual.over.is_some()
+                || !actual.within_group.is_empty()
+            {
+                return false;
+            }
+            let (FunctionArguments::List(actual), FunctionArguments::List(expected)) =
+                (&actual.args, &expected.args)
+            else {
+                return false;
+            };
+            actual.duplicate_treatment.is_none()
+                && actual.clauses.is_empty()
+                && actual.args.len() == expected.args.len()
+                && actual.args.iter().zip(&expected.args).all(|(actual, expected)| {
+                    match (actual, expected) {
+                        (
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(actual)),
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(expected)),
+                        ) => temporal_shape_matches(actual, expected, substitution),
+                        _ => false,
+                    }
+                })
+        }
+        _ => actual == expected,
+    }
 }

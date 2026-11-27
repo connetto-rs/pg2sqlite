@@ -312,8 +312,7 @@ fn a_scaled_interval_is_multiplied_count_by_count() {
     assert_eq!(shift("timestamp '2026-01-31' - 3 * interval '1.5 days'"), "2026-01-26 12:00:00");
 }
 
-/// Two spellings of the same duration collapse onto one modifier, and it is
-/// the largest unit that divides the total exactly.
+/// Equivalent clock durations lower to one integer microsecond count.
 #[test]
 fn the_time_of_day_is_emitted_in_one_unit() {
     assert_eq!(
@@ -327,5 +326,5 @@ fn the_time_of_day_is_emitted_in_one_unit() {
         .unwrap()
         .into_vec()
         .join("\n");
-    assert!(emitted.contains("'+90 minutes'"), "one exact modifier, got: {emitted}");
+    assert!(emitted.contains("+ 5400000000"), "one exact clock count, got {emitted}");
 }

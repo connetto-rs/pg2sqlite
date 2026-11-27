@@ -18,10 +18,13 @@ use sqlparser::ast::{
 };
 
 use super::{
-    datetime_helpers::build_subsecond_unixepoch_call,
+    datetime_helpers::{
+        temporal_microseconds, temporal_microseconds_argument, temporal_shape_matches,
+        timestamp_from_microseconds, timestamp_from_microseconds_argument,
+    },
     function_helpers::{
-        integer_literal_value, is_function_named, simple_function_expr, single_quoted_literal,
-        string_literal,
+        integer_literal, integer_literal_value, is_function_named, number_literal,
+        simple_function_expr, single_quoted_literal, string_literal,
     },
     idioms::{infinite_epoch_guard_finite, infinite_temporal_guard_finite},
     shared_helpers::{declared_in_scope, function_argument_exprs, is_integral_expression},
@@ -447,9 +450,6 @@ fn is_year_one_literal(expr: &Expr) -> bool {
 ///
 /// `None` means the operand is not such a difference and the caller's ordinary
 /// epoch translation applies.
-///
-/// `unixepoch(x, 'subsec')` is exact and carries the fraction. The julianday
-/// form answers 525600.000013411 for a span PostgreSQL answers as 525600.
 pub(crate) fn epoch_of_temporal_difference(
     expr: &Expr,
     schema: &ParserDB,
@@ -475,9 +475,7 @@ pub(crate) fn epoch_of_temporal_difference(
     Some(subsec_epoch_difference(left, right, schema, options, emit))
 }
 
-/// `unixepoch(a, 'subsec') - unixepoch(b, 'subsec')`, an infinite side read as
-/// the REAL infinity of its sign, whose NaN for `infinity - infinity` SQLite
-/// answers as the NULL that stands for PostgreSQL's `interval out of range`.
+/// Subtracts integer microseconds before converting the result to seconds.
 fn subsec_epoch_difference(
     left: &Expr,
     right: &Expr,
@@ -497,24 +495,33 @@ fn subsec_epoch_difference(
              refuses it the same way."
         )));
     }
-    // Without `'subsec'` the integer difference would truncate under `/ 60`.
     let epoch = |written: &Expr, translated: Expr| {
+        let time_only =
+            matches!(temporal_kind_of(written, schema, options), Some(TemporalKind::Time { .. }));
         guard(&operation, written, translated, InfiniteAnswer::Signed, options, |translated| {
-            Ok(build_subsecond_unixepoch_call(translated))
+            Ok(temporal_microseconds(translated, time_only))
         })
     };
-    Ok(Expr::Nested(Box::new(Expr::BinaryOp {
-        left: Box::new(epoch(left, translated_left)?),
-        op: BinaryOperator::Minus,
-        right: Box::new(epoch(right, translated_right)?),
-    })))
+    crate::impls::bind_once::try_bind_once(
+        &operation,
+        [left, right],
+        [translated_left, translated_right],
+        options,
+        |[translated_left, translated_right]| {
+            Ok(temporal_binary(
+                temporal_binary(
+                    epoch(left, translated_left.clone())?,
+                    BinaryOperator::Minus,
+                    epoch(right, translated_right.clone())?,
+                ),
+                BinaryOperator::Divide,
+                number_literal("1000000.0"),
+            ))
+        },
+    )
 }
 
-/// `to_timestamp(e)`: the instant `e` seconds after the epoch, rendered the
-/// way PostgreSQL renders it, and either infinity for a float infinity.
-///
-/// `'subsec'` keeps the fraction at three places, which the trim takes back to
-/// PostgreSQL's spelling.
+/// Renders epoch seconds as timestamp text with microsecond precision.
 ///
 /// # Errors
 ///
@@ -525,13 +532,7 @@ pub(crate) fn subsecond_timestamp_from_epoch(
     epoch: Expr,
     options: &crate::options::TranslationContext<'_>,
 ) -> Result<Expr, Error> {
-    let rendered = |epoch: Expr| {
-        trim_trailing_zeros(simple_function_expr(
-            "datetime",
-            vec![epoch, string_literal("unixepoch"), string_literal("subsec")],
-            None,
-        ))
-    };
+    let rendered = |epoch: Expr| timestamp_from_microseconds(rounded_epoch_microseconds(epoch));
     let special = single_quoted_literal(written)
         .map(str::trim)
         .filter(|text| crate::impls::shared_helpers::is_float_special(text));
@@ -557,7 +558,87 @@ pub(crate) fn subsecond_timestamp_from_epoch(
             return Ok(string_literal(text));
         }
     }
-    epoch_guard(written, epoch, options, rendered)
+    crate::impls::bind_once::try_bind_once(
+        "to_timestamp",
+        [written],
+        [epoch],
+        options,
+        |[epoch]| epoch_guard(written, epoch.clone(), options, rendered),
+    )
+}
+
+fn temporal_binary(left: Expr, operator: BinaryOperator, right: Expr) -> Expr {
+    Expr::Nested(Box::new(Expr::BinaryOp {
+        left: Box::new(left),
+        op: operator,
+        right: Box::new(right),
+    }))
+}
+
+fn integer_cast(value: Expr) -> Expr {
+    Expr::Cast {
+        kind: CastKind::Cast,
+        expr: Box::new(value),
+        data_type: DataType::Integer(None),
+        format: None,
+    }
+}
+
+/// Rounds binary floating-point epoch seconds to microseconds with ties to
+/// even.
+fn rounded_epoch_microseconds(epoch: Expr) -> Expr {
+    let scaled = temporal_binary(epoch, BinaryOperator::Multiply, integer_literal(1_000_000));
+    let fraction = simple_function_expr(
+        "abs",
+        vec![temporal_binary(scaled.clone(), BinaryOperator::Minus, integer_cast(scaled.clone()))],
+        None,
+    );
+    let tie = temporal_binary(fraction, BinaryOperator::Eq, number_literal("0.5"));
+    let even = temporal_binary(
+        simple_function_expr(
+            "round",
+            vec![temporal_binary(scaled.clone(), BinaryOperator::Divide, number_literal("2.0"))],
+            None,
+        ),
+        BinaryOperator::Multiply,
+        integer_literal(2),
+    );
+    integer_cast(crate::impls::expr_helpers::case_when(
+        tie,
+        even,
+        Some(simple_function_expr("round", vec![scaled], None)),
+    ))
+}
+
+fn without_parentheses(mut expression: &Expr) -> &Expr {
+    while let Expr::Nested(inner) = expression {
+        expression = inner;
+    }
+    expression
+}
+
+/// Reads the epoch input of the exact floating-point conversion.
+fn rounded_epoch_argument(expression: &Expr) -> Option<&Expr> {
+    let Expr::Cast { expr, .. } = expression else { return None };
+    let Expr::Case { else_result: Some(rounded), .. } = expr.as_ref() else { return None };
+    let Expr::Function(function) = rounded.as_ref() else { return None };
+    let arguments = function_argument_exprs(&function.args);
+    let [scaled] = arguments.as_slice() else { return None };
+    let Expr::BinaryOp { left: epoch, op: BinaryOperator::Multiply, right } =
+        without_parentheses(scaled)
+    else {
+        return None;
+    };
+    if integer_literal_value(right) != Some(1_000_000)
+        || !temporal_shape_matches(
+            expression,
+            &rounded_epoch_microseconds(Expr::Value(Value::Null.into())),
+            epoch,
+        )
+    {
+        return None;
+    }
+    Some(epoch)
 }
 
 /// `rtrim(rtrim(x, '0'), '.')`, which turns `09.500` into `09.5` and `09.000`
@@ -612,6 +693,24 @@ pub(crate) fn reverse_temporal_arithmetic(
             (subsec_epoch_argument(left), subsec_epoch_argument(right))
     {
         return Some(reversed_epoch_difference(from, subtracted, schema, options));
+    }
+
+    if let Expr::BinaryOp { left, op: BinaryOperator::Divide, right } = difference
+        && matches!(right.as_ref(), Expr::Value(ValueWithSpan { value: Value::Number(value, _), .. }) if value == "1000000.0")
+        && let Expr::BinaryOp { left, op: BinaryOperator::Minus, right } = without_parentheses(left)
+        && let (Some((from, _)), Some((subtracted, _))) = (
+            temporal_microseconds_argument(infinite_temporal_guard_finite(left).unwrap_or(left)),
+            temporal_microseconds_argument(infinite_temporal_guard_finite(right).unwrap_or(right)),
+        )
+    {
+        return Some(reversed_epoch_difference(from, subtracted, schema, options));
+    }
+
+    let finite = infinite_epoch_guard_finite(expr).unwrap_or(expr);
+    if let Some(microseconds) = timestamp_from_microseconds_argument(finite)
+        && let Some(epoch) = rounded_epoch_argument(microseconds)
+    {
+        return Some(reversed_to_timestamp(epoch, schema, options));
     }
 
     if let Some(epoch) = trimmed_subsecond_datetime_argument(expr) {

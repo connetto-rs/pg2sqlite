@@ -867,27 +867,24 @@ fn extract_unsupported_field_message_lists_week_isodow_isoyear() {
     assert!(err.contains("ISOYEAR"), "EXTRACT refusal must list ISOYEAR, got: {err}");
 }
 
-/// to_char with MS code must name "MS" in the refusal, not just "M". R2-LOW.
+/// The `MS` code prints three fractional digits.
 #[test]
-fn to_char_ms_code_names_ms_in_refusal() {
-    let err = Pg2Sqlite::default()
-        .sql("SELECT to_char(NOW(), 'HH24:MI:SS.MS')")
-        .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
-        .expect_err("to_char with MS must fail")
-        .to_string();
-    assert!(err.contains("MS"), "refusal must name 'MS', got: {err}");
-    assert!(!err.contains("contains 'M'"), "must name MS not just M, got: {err}");
+fn to_char_ms_keeps_millisecond_digits() {
+    assert_eq!(
+        crate::helpers::run_translated::run_translated_utc(
+            "SELECT to_char(timestamp '2024-01-01 03:04:12.123456', 'HH24:MI:SS.MS');",
+        ),
+        vec![Some("03:04:12.123".to_owned())],
+    );
 }
 
-/// to_char with US code must name "US" in the refusal. R2-LOW.
+/// The `US` code prints six fractional digits.
 #[test]
-fn to_char_us_code_names_us_in_refusal() {
-    let err = Pg2Sqlite::default()
-        .sql("SELECT to_char(NOW(), 'HH24:MI:SS.US')")
-        .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
-        .expect_err("to_char with US must fail")
-        .to_string();
-    assert!(err.contains("US"), "refusal must name 'US', got: {err}");
+fn to_char_us_keeps_microsecond_digits() {
+    assert_eq!(
+        crate::helpers::run_translated::run_translated_utc(
+            "SELECT to_char(timestamp '2024-01-01 03:04:12.123456', 'HH24:MI:SS.US');",
+        ),
+        vec![Some("03:04:12.123456".to_owned())],
+    );
 }

@@ -376,14 +376,12 @@ fn time_column_plus_interval_answers_a_time_of_day() {
         ),
         &Pg2SqliteOptions::default(),
     );
-    // PostgreSQL: 04:04:05.5, 04:04:05, 04:04:05.123456 (last at three
-    // decimals, the documented millisecond limit of SQLite's date functions).
     assert_eq!(
         rows,
         vec![
             Some("04:04:05.5".to_string()),
             Some("04:04:05".to_string()),
-            Some("04:04:05.123".to_string()),
+            Some("04:04:05.123456".to_string()),
         ],
     );
 }
@@ -399,14 +397,12 @@ fn time_column_minus_interval_wraps_back_a_day() {
         ),
         &Pg2SqliteOptions::default(),
     );
-    // PostgreSQL: 03:04:05, 03:04:04.5, 03:04:04.623456 (last at three
-    // decimals, the documented millisecond limit).
     assert_eq!(
         rows,
         vec![
             Some("03:04:05".to_string()),
             Some("03:04:04.5".to_string()),
-            Some("03:04:04.623".to_string()),
+            Some("03:04:04.623456".to_string()),
         ],
     );
 }
@@ -812,17 +808,17 @@ fn unknown_argument_free_function_is_read_by_a_timestamp_cast() {
 fn text_column_is_read_by_a_temporal_cast() {
     for (query, expected) in [
         ("x::date", ["2024-01-02", "2024-12-31", "2025-02-28"]),
-        ("x::time", ["03:04:05.5", "23:59:59", "00:00:00.123"]),
+        ("x::time", ["03:04:05.5", "23:59:59", "00:00:00.123456"]),
         (
             "x::timestamp",
-            ["2024-01-02 03:04:05.5", "2024-12-31 23:59:59", "2025-02-28 00:00:00.123"],
+            ["2024-01-02 03:04:05.5", "2024-12-31 23:59:59", "2025-02-28 00:00:00.123456"],
         ),
         (
             "x::timestamptz",
             [
                 "2024-01-02 03:04:05.500000+00:00",
                 "2024-12-31 23:59:59.000000+00:00",
-                "2025-02-28 00:00:00.123000+00:00",
+                "2025-02-28 00:00:00.123456+00:00",
             ],
         ),
         ("x::date = d", ["1", "1", "1"]),

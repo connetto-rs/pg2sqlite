@@ -93,7 +93,7 @@ fn to_char_args_swapped_format_before_column() {
     let sql = format!("{TABLE} SELECT to_char(ts, 'YYYY-MM-DD') FROM t;");
     let output = translate(&sql).unwrap();
     // strftime(format, expr) — format string must appear first
-    let strftime_pos = output.find("strftime(").unwrap();
+    let strftime_pos = output.find("strftime('%Y-%m-%d'").unwrap();
     let format_pos = output[strftime_pos..].find("'%Y-%m-%d'").unwrap();
     let col_pos = output[strftime_pos..].find("ts").unwrap();
     assert!(

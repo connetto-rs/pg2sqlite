@@ -1,9 +1,4 @@
-//! Red tests for PG INTERVAL arithmetic to SQLite date modifiers.
-//!
-//! `ts + INTERVAL 'N unit'` becomes `datetime(ts, '+N unit')`, and minus
-//! becomes `'-N unit'`. Multi-unit intervals emit one modifier per unit.
-//! Standalone INTERVAL stays unsupported (no SQLite target). Every request
-//! runs in UTC, whose calendar SQLite's modifiers compute.
+//! PostgreSQL interval arithmetic preserves calendar units and microseconds.
 
 use pg2sqlite::prelude::Pg2Sqlite;
 
@@ -35,14 +30,14 @@ fn p1_now_plus_seven_days() {
 #[test]
 fn p1_now_minus_one_hour() {
     let out = translate("SELECT NOW() - INTERVAL '1 hour' AS ago;");
-    assert!(out.contains("datetime(") && out.contains("-1 hour"), "{out}");
+    assert!(out.contains("unixepoch") && out.contains("-3600000000"), "{out}");
     execute_translated("SELECT NOW() - INTERVAL '1 hour' AS ago;");
 }
 
 #[test]
 fn p1_current_timestamp_plus_minutes() {
     let out = translate("SELECT CURRENT_TIMESTAMP + INTERVAL '30 minutes' AS later;");
-    assert!(out.contains("datetime(") && out.contains("+30 minute"), "{out}");
+    assert!(out.contains("unixepoch") && out.contains("1800000000"), "{out}");
     execute_translated("SELECT CURRENT_TIMESTAMP + INTERVAL '30 minutes' AS later;");
 }
 
@@ -52,7 +47,7 @@ fn p1_timestamp_column_plus_seconds() {
         "CREATE TABLE events (id INTEGER PRIMARY KEY, ts TIMESTAMP NOT NULL);\n\
          SELECT ts + INTERVAL '5 seconds' AS later FROM events;",
     );
-    assert!(out.contains("datetime(") && out.contains("+5 second"), "{out}");
+    assert!(out.contains("unixepoch") && out.contains("5000000"), "{out}");
     execute_translated(
         "CREATE TABLE events (id INTEGER PRIMARY KEY, ts TIMESTAMP NOT NULL);\n\
          SELECT ts + INTERVAL '5 seconds' AS later FROM events;",
@@ -105,14 +100,14 @@ fn p2_year_and_months() {
 #[test]
 fn p2_days_and_hours() {
     let out = translate("SELECT NOW() + INTERVAL '3 days 4 hours' AS future;");
-    assert!(out.contains("+3 day") && out.contains("+4 hour"), "{out}");
+    assert!(out.contains("+3 day") && out.contains("14400000000"), "{out}");
     execute_translated("SELECT NOW() + INTERVAL '3 days 4 hours' AS future;");
 }
 
 #[test]
 fn p2_minus_propagates_to_each_modifier() {
     let out = translate("SELECT NOW() - INTERVAL '1 day 2 hours' AS past;");
-    assert!(out.contains("-1 day") && out.contains("-2 hour"), "{out}");
+    assert!(out.contains("-1 day") && out.contains("-7200000000"), "{out}");
     execute_translated("SELECT NOW() - INTERVAL '1 day 2 hours' AS past;");
 }
 

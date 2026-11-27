@@ -4,8 +4,9 @@
 use sql_traits::structs::ParserDB;
 use sqlparser::{
     ast::{
-        BinaryOperator, CaseWhen, DataType, Expr, Ident, InTarget, ObjectName, ObjectNamePart,
-        UnaryOperator, Value, ValueWithSpan, helpers::attached_token::AttachedToken,
+        BinaryOperator, CaseWhen, CastKind, DataType, DateTimeField, Expr, ExtractSyntax, Ident,
+        InTarget, ObjectName, ObjectNamePart, TimezoneInfo, UnaryOperator, Value, ValueWithSpan,
+        helpers::attached_token::AttachedToken,
     },
     tokenizer::Span,
 };
@@ -20,6 +21,13 @@ use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{
+        datetime_helpers::{
+            canonical_timestamptz_argument, exact_date_part_argument, exact_to_char_arguments,
+            temporal_microseconds_argument, temporal_shape_matches,
+            text_reader_microseconds_argument, text_time_from_microseconds_argument,
+            time_from_microseconds_argument, timestamp_from_microseconds_argument,
+            timestamp_microseconds_argument,
+        },
         function_helpers::{simple_function_expr, single_quoted_literal, string_literal},
         idioms::{
             DelimitedMembership, ascii_code_point_argument, delimited_membership_operands,
@@ -35,6 +43,7 @@ use crate::{
         temporal_arithmetic::reverse_temporal_arithmetic,
         timezone::restore_at_time_zone,
         translator_impls::expr::sqlite_json_path_to_pg_text_path,
+        zone_clock::build_date_trunc_expr,
     },
     prelude::ReverseTranslator,
     traits::SessionVariableMapping,
@@ -702,7 +711,138 @@ fn restore_lowered_idiom(
     if let Some(finite) = crate::impls::idioms::infinite_temporal_guard_finite(expr) {
         return Some(finite.reverse_translate(schema, options));
     }
+    if let Some(restored) = restore_exact_temporal(expr, schema, options) {
+        return Some(restored);
+    }
     reverse_temporal_arithmetic(expr, schema, options)
+}
+
+/// Restores exact temporal readers, formatting, truncation, and casts.
+fn restore_exact_temporal(
+    expression: &Expr,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Option<Result<Expr, Error>> {
+    if let Some((field, argument)) = exact_date_part_argument(expression) {
+        return Some(argument.reverse_translate(schema, options).map(|argument| {
+            Expr::Extract { field, syntax: ExtractSyntax::From, expr: Box::new(argument) }
+        }));
+    }
+    if let Some((template, argument)) = exact_to_char_arguments(expression) {
+        return Some(argument.reverse_translate(schema, options).map(|argument| {
+            simple_function_expr("to_char", vec![argument, string_literal(&template)], None)
+        }));
+    }
+    if let Some((field, argument)) = exact_date_trunc_arguments(expression) {
+        return Some(argument.reverse_translate(schema, options).map(|argument| {
+            simple_function_expr("date_trunc", vec![string_literal(field), argument], None)
+        }));
+    }
+    if let Some(argument) = canonical_timestamptz_argument(expression) {
+        if single_quoted_literal(argument) == Some("now") {
+            return Some(Ok(simple_function_expr("NOW", vec![], None)));
+        }
+        return Some(argument.reverse_translate(schema, options).map(|argument| {
+            Expr::Cast {
+                expr: Box::new(argument),
+                data_type: DataType::Timestamp(None, TimezoneInfo::Tz),
+                format: None,
+                kind: CastKind::DoubleColon,
+            }
+        }));
+    }
+    let temporal_cast = text_time_from_microseconds_argument(expression)
+        .or_else(|| time_from_microseconds_argument(expression))
+        .map(|microseconds| (microseconds, DataType::Time(None, TimezoneInfo::None)))
+        .or_else(|| {
+            timestamp_from_microseconds_argument(expression)
+                .map(|microseconds| (microseconds, DataType::Timestamp(None, TimezoneInfo::None)))
+        });
+    if let Some((microseconds, data_type)) = temporal_cast
+        && let Some(argument) = text_reader_microseconds_argument(microseconds)
+    {
+        return Some(argument.reverse_translate(schema, options).map(|argument| {
+            Expr::Cast {
+                expr: Box::new(argument),
+                data_type,
+                format: None,
+                kind: CastKind::DoubleColon,
+            }
+        }));
+    }
+    let mut expression = expression;
+    while let Expr::Nested(inner) = expression {
+        expression = inner;
+    }
+    let Expr::BinaryOp { left, op: BinaryOperator::Divide, right } = expression else {
+        return None;
+    };
+    if !matches!(
+        right.as_ref(),
+        Expr::Value(ValueWithSpan { value: Value::Number(number, false), .. })
+            if number == "1000000.0"
+    ) {
+        return None;
+    }
+    let argument = timestamp_microseconds_argument(left)?;
+    Some(argument.reverse_translate(schema, options).map(|argument| {
+        Expr::Extract {
+            field: DateTimeField::Epoch,
+            syntax: ExtractSyntax::From,
+            expr: Box::new(argument),
+        }
+    }))
+}
+
+/// Restores only the exact truncation shapes emitted by the forward builder.
+fn exact_date_trunc_arguments(expression: &Expr) -> Option<(&'static str, &Expr)> {
+    let (microseconds, time_only) = timestamp_from_microseconds_argument(expression)
+        .map(|argument| (argument, false))
+        .or_else(|| {
+            text_time_from_microseconds_argument(expression).map(|argument| (argument, true))
+        })?;
+    let Expr::BinaryOp { left, op: BinaryOperator::Multiply, right } =
+        peel_temporal_nested(microseconds)
+    else {
+        return None;
+    };
+    let Expr::Value(ValueWithSpan { value: Value::Number(divisor, false), .. }) =
+        peel_temporal_nested(right)
+    else {
+        return None;
+    };
+    let field = match divisor.as_str() {
+        "1" => "microseconds",
+        "1000" => "milliseconds",
+        "1000000" if time_only => "second",
+        "60000000" if time_only => "minute",
+        "3600000000" if time_only => "hour",
+        _ => return None,
+    };
+    let mut total = left.as_ref();
+    let (argument, operand_time_only) = loop {
+        if let Some(operand) = temporal_microseconds_argument(total) {
+            break operand;
+        }
+        let Expr::BinaryOp { left, op: BinaryOperator::Divide | BinaryOperator::Minus, .. } =
+            peel_temporal_nested(total)
+        else {
+            return None;
+        };
+        total = left;
+    };
+    if operand_time_only != time_only {
+        return None;
+    }
+    let template = build_date_trunc_expr(field, Expr::Value(Value::Null.into()), time_only).ok()?;
+    temporal_shape_matches(expression, &template, argument).then_some((field, argument))
+}
+
+fn peel_temporal_nested(mut expression: &Expr) -> &Expr {
+    while let Expr::Nested(inner) = expression {
+        expression = inner;
+    }
+    expression
 }
 
 /// Restores the

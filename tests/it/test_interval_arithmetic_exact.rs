@@ -10030,3 +10030,74 @@ fn a_bound_parameter_that_postgresql_answers_infinity_answers_null() {
         assert_eq!(got, vec![None, None, None, None, None], "{text} beside n.iv");
     }
 }
+
+#[test]
+fn microsecond_exact_literal_temporal_shifts() {
+    for (expression, answer) in [
+        (
+            "timestamp '2026-01-31 23:59:59.999999' + interval '0.000001 second'",
+            "2026-02-01 00:00:00",
+        ),
+        (
+            "timestamp '1969-12-31 23:59:59.123456' - interval '0.000001 second'",
+            "1969-12-31 23:59:59.123455",
+        ),
+        (
+            "timestamp '2026-01-31 10:20:30.123456' + interval '1 month 1 day 0.000001 second'",
+            "2026-03-01 10:20:30.123457",
+        ),
+        ("time '23:59:59.999999' + interval '0.000002 second'", "00:00:00.000001"),
+        ("time '00:00:00' - interval '0.000001 second'", "23:59:59.999999"),
+        (
+            "timestamptz '2026-01-01 01:00:00.123456+01' + interval '0.000001 second'",
+            "2026-01-01 00:00:00.123457+00",
+        ),
+    ] {
+        assert_eq!(
+            run_translated_utc(&format!("SELECT ({expression})::text;")),
+            some(&[answer]),
+            "{expression}"
+        );
+    }
+}
+
+#[test]
+fn microsecond_exact_column_temporal_shifts() {
+    let schema = "CREATE TABLE exact_shifts (stamp timestamp, clock time, span interval);
+        INSERT INTO exact_shifts VALUES ('1969-12-31 23:59:59.999999', '23:59:59.999999', '0.000002 second');";
+    for (expression, answer) in [
+        ("stamp + span", "1970-01-01 00:00:00.000001"),
+        ("stamp - span", "1969-12-31 23:59:59.999997"),
+        ("clock + span", "00:00:00.000001"),
+        ("clock - span", "23:59:59.999997"),
+    ] {
+        assert_eq!(
+            run_translated_utc(&format!("{schema} SELECT ({expression})::text FROM exact_shifts;")),
+            some(&[answer]),
+            "{expression}"
+        );
+    }
+}
+
+#[test]
+fn microsecond_exact_temporal_epoch_differences() {
+    for (expression, answer) in [
+        (
+            "extract(epoch from (timestamp '2026-01-01 00:00:00.123457' - timestamp '2026-01-01 00:00:00.123456'))",
+            "1",
+        ),
+        (
+            "extract(epoch from (timestamp '1969-12-31 23:59:59.999999' - timestamp '1970-01-01 00:00:00.000001'))",
+            "-2",
+        ),
+        ("extract(epoch from (time '12:00:00.123456' - time '12:00:00.123457'))", "-1"),
+    ] {
+        assert_eq!(
+            run_translated_utc(&format!(
+                "SELECT CAST(round(({expression}) * 1000000) AS bigint)::text;"
+            )),
+            some(&[answer]),
+            "{expression}"
+        );
+    }
+}

@@ -560,7 +560,7 @@ fn forward_expr_translation_covers_remaining_fts_extract_and_timezone_paths() {
     let translated_epoch =
         extract_epoch.translate(&schema, &options).expect("EXTRACT(EPOCH) should now be supported");
     assert!(
-        translated_epoch.to_string().contains("unixepoch(created_at, 'subsec')"),
+        translated_epoch.to_string().contains("/ 1000000.0"),
         "EXTRACT(EPOCH) should keep the fraction, got: {translated_epoch}"
     );
 

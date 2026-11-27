@@ -2493,7 +2493,7 @@ pub(crate) fn convert_temporal_value(
 ) -> Result<Expr, Error> {
     use crate::impls::{
         datetime_helpers::{
-            build_strftime_call, canonical_timestamptz_call, canonical_timestamptz_value,
+            canonical_timestamptz_call, canonical_timestamptz_value, local_timestamp_text,
             take_canonical_timestamptz_operand,
         },
         replay::{is_replayable, reject_duplicated_operand},
@@ -2542,8 +2542,7 @@ pub(crate) fn convert_temporal_value(
         let value = guarded(expr, &source_expr, &|expr| {
             Ok(match zone {
                 Some(zoned @ ZonedWallClock::Zone(_)) => {
-                    if zoned.instant_reads_twice()
-                        && let (Some(written), Some(options)) = (written, options)
+                    if let (Some(written), Some(options)) = (written, options)
                         && !is_replayable(written, options)
                     {
                         return Err(reject_duplicated_operand(
@@ -2551,9 +2550,7 @@ pub(crate) fn convert_temporal_value(
                             written,
                         ));
                     }
-                    // The date functions bring any SQLite time value to the
-                    // wall clock text the zone's conversion reads.
-                    zoned.instant(build_strftime_call("%Y-%m-%d %H:%M:%f", expr))
+                    zoned.instant(local_timestamp_text(expr, None))
                 }
                 Some(ZonedWallClock::Utc) | None => canonical_timestamptz_call(expr),
             })

@@ -21,8 +21,10 @@ use crate::no_std::prelude::*;
 use crate::{
     impls::{
         datetime_helpers::{
-            DatePartKey, canonical_timestamptz_text, datetime_field_key,
-            is_offset_less_timestamp_call, local_timestamp_text,
+            DatePartKey, canonical_timestamp_from_microseconds, canonical_timestamptz_text,
+            datetime_field_key, is_offset_less_timestamp_call, local_timestamp_text,
+            temporal_microseconds, time_from_microseconds, timestamp_fraction_microseconds,
+            timestamp_from_microseconds, timestamp_microseconds, whole_second_timestamp,
         },
         expr_helpers::{
             case_when, for_each_child_expr, not_predicate, null_safe_eq, null_safe_neq, rebuild,
@@ -54,7 +56,7 @@ use crate::{
         },
         temporal_arithmetic::{
             TemporalKind, epoch_of_temporal_difference, from_year_one, temporal_kind_of,
-            translate_temporal_binary_op, trim_trailing_zeros,
+            translate_temporal_binary_op,
         },
         timezone::{
             TimestampAwareness, flipped_shifting_offset, normalize_timezone_modifier_for_sqlite,
@@ -3222,13 +3224,94 @@ fn reject_quantified_pattern_all(
     )))
 }
 
-/// `datetime(target, modifier..., 'subsec')` with its trailing fractional zeros
-/// trimmed.
-fn shifted_datetime(target: Expr, modifiers: &[Expr]) -> Expr {
-    let mut args = vec![target];
-    args.extend(modifiers.iter().cloned());
-    args.push(string_literal("subsec"));
-    trim_trailing_zeros(simple_function_expr("datetime", args, None))
+/// Applies calendar modifiers before adding integer microseconds.
+fn shifted_datetime(target: Expr, modifiers: &[Expr], canonical: bool) -> Expr {
+    let calendar_end = modifiers
+        .iter()
+        .rposition(|modifier| !is_clock_modifier(modifier))
+        .map_or(0, |position| position + 1);
+    let mut microseconds = if calendar_end == 0 {
+        timestamp_microseconds(target)
+    } else {
+        let fraction = timestamp_fraction_microseconds(target.clone());
+        let mut arguments = vec![whole_second_timestamp(target)];
+        arguments.extend(modifiers[..calendar_end].iter().cloned());
+        let calendar = simple_function_expr("datetime", arguments, None);
+        temporal_binary(
+            temporal_binary(
+                simple_function_expr("unixepoch", vec![calendar], None),
+                BinaryOperator::Multiply,
+                integer_literal(1_000_000),
+            ),
+            BinaryOperator::Plus,
+            fraction,
+        )
+    };
+    for modifier in &modifiers[calendar_end..] {
+        microseconds = temporal_binary(
+            microseconds,
+            BinaryOperator::Plus,
+            modifier_microseconds(modifier).expect("trailing clock modifier"),
+        );
+    }
+    if canonical {
+        canonical_timestamp_from_microseconds(microseconds)
+    } else {
+        timestamp_from_microseconds(microseconds)
+    }
+}
+
+fn temporal_binary(left: Expr, operator: BinaryOperator, right: Expr) -> Expr {
+    Expr::Nested(Box::new(Expr::BinaryOp {
+        left: Box::new(left),
+        op: operator,
+        right: Box::new(right),
+    }))
+}
+
+fn is_clock_modifier(modifier: &Expr) -> bool {
+    if let Some(text) = single_quoted_literal(modifier) {
+        return [" hours", " minutes", " seconds"].iter().any(|unit| text.ends_with(unit));
+    }
+    let Expr::Function(function) = modifier else { return false };
+    crate::impls::function_helpers::is_function_named(function, "printf")
+        && function_argument_exprs(&function.args)
+            .first()
+            .is_some_and(|format| single_quoted_literal(format) == Some("%+d microseconds"))
+}
+
+/// Decodes generated clock modifiers without floating-point arithmetic.
+fn modifier_microseconds(modifier: &Expr) -> Option<Expr> {
+    if let Some(text) = single_quoted_literal(modifier) {
+        let (quantity, unit) = text.rsplit_once(' ')?;
+        let multiplier = match unit {
+            "hours" => 3_600_000_000_i128,
+            "minutes" => 60_000_000,
+            "seconds" => 1_000_000,
+            _ => return None,
+        };
+        let negative = quantity.starts_with('-');
+        let unsigned = quantity.trim_start_matches(['+', '-']);
+        let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+        let whole = whole.parse::<i128>().ok()?.checked_mul(multiplier)?;
+        let fraction = if fraction.is_empty() {
+            0
+        } else {
+            fraction.parse::<i128>().ok()?.checked_mul(multiplier)?
+                / 10_i128.checked_pow(u32::try_from(fraction.len()).ok()?)?
+        };
+        let microseconds = whole.checked_add(fraction)?;
+        return Some(integer_literal(
+            i64::try_from(if negative { -microseconds } else { microseconds }).ok()?,
+        ));
+    }
+    let Expr::Function(function) = modifier else { return None };
+    if !crate::impls::function_helpers::is_function_named(function, "printf") {
+        return None;
+    }
+    let arguments = function_argument_exprs(&function.args);
+    let [format, microseconds] = arguments.as_slice() else { return None };
+    (single_quoted_literal(format) == Some("%+d microseconds")).then(|| (*microseconds).clone())
 }
 
 /// The time of day `target` answers after `clock`, wrapped at midnight, with
@@ -3276,48 +3359,28 @@ fn shifted_clock(local: Expr, clock: &ClockShift) -> Expr {
     case_when(past, clock_after(local.clone(), wrapped), Some(clock_after(local, &clock.modifiers)))
 }
 
-/// The microsecond of the day a stored `HH:MM:SS[.ffffff]` time of day
-/// names, from SQLite's numeric reading of each part.
+/// Reads the exact microsecond of the local day.
 fn micros_of_day(local: &Expr) -> Expr {
-    let part = |start: i64, length: Option<i64>| {
-        let mut args = vec![local.clone(), integer_literal(start)];
-        args.extend(length.map(integer_literal));
-        simple_function_expr("substr", args, None)
-    };
-    let times = |left: Expr, factor: i64| {
-        Expr::BinaryOp {
-            left: Box::new(left),
-            op: BinaryOperator::Multiply,
-            right: Box::new(integer_literal(factor)),
-        }
-    };
-    let plus = |left: Expr, right: Expr| {
-        Expr::BinaryOp { left: Box::new(left), op: BinaryOperator::Plus, right: Box::new(right) }
-    };
-    // The seconds carry up to six decimals, which `round` makes whole.
-    let seconds = simple_function_expr("round", vec![times(part(7, None), 1_000_000)], None);
-    Expr::Nested(Box::new(plus(
-        plus(times(part(1, Some(2)), 3_600_000_000), times(part(4, Some(2)), 60_000_000)),
-        seconds,
-    )))
+    temporal_microseconds(local.clone(), true)
 }
 
-/// The time part of `local` shifted by `modifiers`, trailing fractional zeros
-/// trimmed. SQLite reads a bare time as 2000-01-01, so the part after the
-/// date wraps at midnight.
+/// Adds the clock modifiers modulo one day.
 fn clock_after(local: Expr, modifiers: &[Expr]) -> Expr {
-    let mut args = vec![local];
-    args.extend(modifiers.iter().cloned());
-    args.push(string_literal("subsec"));
-    let shifted = simple_function_expr("datetime", args, None);
-    // The date part is eleven characters, so the time of day starts at twelve.
-    trim_trailing_zeros(simple_function_expr("substr", vec![shifted, integer_literal(12)], None))
+    let mut microseconds = temporal_microseconds(local, true);
+    for modifier in modifiers {
+        microseconds = temporal_binary(
+            microseconds,
+            BinaryOperator::Plus,
+            modifier_microseconds(modifier).expect("generated clock modifier"),
+        );
+    }
+    time_from_microseconds(microseconds)
 }
 
 /// The shifted form of a translated date or timestamp `target` under the
 /// date `modifiers`, under the year-1 guard.
-pub(crate) fn shifted_by_modifiers(target: Expr, modifiers: &[Expr]) -> Expr {
-    from_year_one(shifted_datetime(target, modifiers))
+pub(crate) fn shifted_by_modifiers(target: Expr, modifiers: &[Expr], canonical: bool) -> Expr {
+    from_year_one(shifted_datetime(target, modifiers, canonical))
 }
 
 /// The shifted form of `left` for the temporal kind it resolves to, refusing
@@ -3350,7 +3413,16 @@ pub(crate) fn shifted_interval_target(
             }
         }
         let target = left.translate_with_warnings(schema, options, emit)?;
-        return Ok(shifted_time_of_day(target, &clock, zoned));
+        if !is_replayable(left, options) && is_replayable(&target, options) {
+            return Ok(shifted_time_of_day(target, &clock, zoned));
+        }
+        return crate::impls::bind_once::bind_once(
+            "a TIME operand shifted by an interval",
+            [left],
+            [target],
+            options,
+            |[target]| shifted_time_of_day(target.clone(), &clock, zoned),
+        );
     }
     // PostgreSQL refuses the interval's negation and a year past its range
     // in every zone, so those refusals come before the zone's.
@@ -3374,26 +3446,44 @@ pub(crate) fn shifted_interval_target(
         crate::impls::temporal_infinity::InfiniteAnswer::Same,
         options,
         |target| {
-            Ok(match calendar {
-                ZonedCalendar::Clock(offset) => {
-                    let modifiers: Vec<Expr> = shift
-                        .modifiers_on_clock(offset)?
-                        .iter()
-                        .map(|modifier| string_literal(modifier))
-                        .collect();
-                    shifted_by_modifiers(target, &modifiers)
-                }
-                ZonedCalendar::Registered(clock) => {
-                    let literals = |modifiers: Vec<String>| -> Vec<Expr> {
-                        modifiers.iter().map(|modifier| string_literal(modifier)).collect()
-                    };
-                    let mut local = vec![clock.local_clock(target)];
-                    local.extend(literals(calendar_modifiers));
-                    local.push(string_literal("subsec"));
-                    let instant = clock.instant(simple_function_expr("datetime", local, None));
-                    shifted_by_modifiers(instant, &literals(shift.time_modifiers()?))
-                }
-            })
+            crate::impls::bind_once::try_bind_once(
+                &operation,
+                [left],
+                [target],
+                options,
+                |[target]| {
+                    Ok(match calendar {
+                        ZonedCalendar::Clock(offset) => {
+                            let modifiers: Vec<Expr> = shift
+                                .modifiers_on_clock(offset)?
+                                .iter()
+                                .map(|modifier| string_literal(modifier))
+                                .collect();
+                            shifted_by_modifiers(
+                                target.clone(),
+                                &modifiers,
+                                kind == Some(TemporalKind::TimestampTz),
+                            )
+                        }
+                        ZonedCalendar::Registered(clock) => {
+                            let literals = |modifiers: Vec<String>| -> Vec<Expr> {
+                                modifiers.iter().map(|modifier| string_literal(modifier)).collect()
+                            };
+                            let local = shifted_datetime(
+                                clock.local_clock(target.clone()),
+                                &literals(calendar_modifiers),
+                                false,
+                            );
+                            let instant = clock.instant(local);
+                            shifted_by_modifiers(
+                                instant,
+                                &literals(shift.time_modifiers()?),
+                                kind == Some(TemporalKind::TimestampTz),
+                            )
+                        }
+                    })
+                },
+            )
         },
     )
 }

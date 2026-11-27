@@ -111,7 +111,7 @@ fn an_iso_separator_comes_home_quoted() {
 #[test]
 fn the_crate_reads_back_its_own_to_char_output() {
     let sqlite = forward("SELECT to_char(ts, 'YYYY-MM-DD') FROM t;");
-    assert!(sqlite.contains("strftime('%Y-%m-%d', ts)"), "{sqlite}");
+    assert!(sqlite.contains("strftime('%Y-%m-%d', "), "{sqlite}");
     let restored = reverse(&sqlite);
     assert!(restored.contains("to_char(ts, 'YYYY-MM-DD')"), "{restored}");
 }

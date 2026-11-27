@@ -50,21 +50,6 @@ struct Divergence {
 /// comparison is written the way it is (e.g. limited to whole-second rows,
 /// or using an alternative expression to get consistent text).
 const KNOWN_DIVERGENCES: &[Divergence] = &[
-    // SQLite's datetime() drops the sub-second component of its first argument.
-    // This affects the interval arithmetic comparison:
-    //
-    //   ts + INTERVAL '1 day' for row 4 (ts = '2024-03-05 14:07:09.250'):
-    //     PG gives '2024-03-06 14:07:09.25', SQLite gives '2024-03-06
-    // 14:07:09'.
-    //
-    // The comparison is limited to rows 1-3 (whole-second timestamps) so no
-    // runtime failure is triggered. Row 4 is excluded with a comment.
-    Divergence {
-        label: "datetime_drops_subseconds",
-        reason: "datetime() in SQLite drops the sub-second component of its \
-                 first argument, PostgreSQL preserves it through interval \
-                 arithmetic",
-    },
     // TIMESTAMP AT TIME ZONE returns TIMESTAMPTZ in PostgreSQL. In a UTC
     // session, CAST of TIMESTAMPTZ to TEXT appends a +00 zone suffix. The
     // underlying value is the same instant, but the text representation
@@ -289,11 +274,6 @@ fn sqlite_eval(conn: &mut SqliteConnection, pg_expr: &str, ids: &[i32]) -> Vec<O
 /// All four row ids.
 const ALL: &[i32] = &[1, 2, 3, 4];
 
-/// Rows with whole-second timestamps, for expressions where SQLite's datetime()
-/// drops sub-second precision (see
-/// `KNOWN_DIVERGENCES`, entry `datetime_drops_subseconds`).
-const WHOLE_SECOND: &[i32] = &[1, 2, 3];
-
 // ── Test ─────────────────────────────────────────────────────────────────────
 
 /// Every listed date/time expression produces the same result on both engines
@@ -366,15 +346,9 @@ fn datetime_expressions_agree() {
     cmp("date_trunc_month", "date_trunc('month', ts)", ALL);
 
     // ── Interval arithmetic ──────────────────────────────────────────────────
-    //
-    // Tested on rows 1-3 only (whole-second timestamps). Row 4 has a known
-    // divergence (KNOWN_DIVERGENCES["datetime_drops_subseconds"]): SQLite
-    // datetime() drops sub-second precision, so '2024-03-05 14:07:09.250' +
-    // '1 day' gives '2024-03-06 14:07:09' in SQLite but '2024-03-06
-    // 14:07:09.25' in PostgreSQL.
 
-    cmp("ts_add_interval_1_day", "ts + INTERVAL '1 day'", WHOLE_SECOND);
-    cmp("ts_sub_interval_1_hour", "ts - INTERVAL '1 hour'", WHOLE_SECOND);
+    cmp("ts_add_interval_1_day", "ts + INTERVAL '1 day'", ALL);
+    cmp("ts_sub_interval_1_hour", "ts - INTERVAL '1 hour'", ALL);
 
     // ── Difference between two timestamps (integer seconds) ──────────────────
     //
@@ -467,4 +441,36 @@ fn to_char_iso_codes_agree() {
         pg_eval(&mut pg, expr, ALL),
         "ISO to_char codes must agree after translation"
     );
+}
+
+#[test]
+fn microsecond_temporal_arithmetic_agrees() {
+    let mut postgres = pg_setup();
+    let mut sqlite = sqlite_setup();
+    for expression in [
+        "time '03:04:05.123456' + interval '24 hours'",
+        "time '23:59:59.999999' + interval '1 microsecond'",
+        "timestamp '2024-12-31 23:59:59.999999' + interval '1 microsecond'",
+        "timestamp '2024-03-31 01:02:03.123456' + interval '1 month'",
+        "timestamp '1969-12-31 23:59:59.999999' - interval '1 microsecond'",
+        "to_timestamp(-0.000001)::timestamp",
+        "to_timestamp(1709647629.123456)::timestamp",
+        "(timestamptz '2024-01-01 00:00:00.123456+00' + interval '1 microsecond') AT TIME ZONE 'UTC'",
+        "(timestamptz '2024-01-01 00:00:00.123456+00' AT TIME ZONE 'UTC')",
+        "extract(second from timestamp '2024-01-01 03:04:12.123456')",
+        "date_part('milliseconds', time '03:04:12.123456')",
+        "extract(microseconds from timetz '03:04:12.123456+02')",
+        "to_char(timestamp '2024-01-01 03:04:12.123456', 'MS US FF1 FF2 FF3 FF4 FF5 FF6')",
+        "to_char(time '03:04:12.123456', 'SS.US')",
+        "date_trunc('milliseconds', timestamp '2024-12-31 23:59:59.999999')",
+        "date_trunc('microseconds', timestamp '2024-12-31 23:59:59.999999')",
+        "date_trunc('milliseconds', time '23:59:59.999999')",
+        "date_trunc('microseconds', time '24:00:00')",
+    ] {
+        assert_eq!(
+            sqlite_eval(&mut sqlite, expression, &[1]),
+            pg_eval(&mut postgres, expression, &[1]),
+            "{expression}",
+        );
+    }
 }
