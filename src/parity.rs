@@ -48,7 +48,7 @@ use sql_traits::{
     structs::{ParserDB, WrittenRelation},
     traits::{ColumnLike, TableLike, ViewLike},
 };
-use sqlparser::ast::{Ident, ObjectName, Statement, TableObject};
+use sqlparser::ast::{Ident, ObjectName, Statement, TableObject, TriggerPeriod};
 
 use crate::{
     impls::translator_impls::view_writes::{output_names, resolve_view},
@@ -121,13 +121,13 @@ pub enum ParityError {
     #[error("Row {0} names no declared table")]
     UnknownTable(String),
     /// A write probes a measured view whose key the replica cannot trace to
-    /// columns of a published table the write lands on, so it cannot name
-    /// the rows the write changes.
+    /// columns of the table the write lands on, so it cannot name the rows
+    /// the write changes.
     #[error("Cannot name the rows a write through view {view} changes")]
     UntracedView {
         /// The measured view.
         view: String,
-        /// Why its key reaches no published table.
+        /// Why its key reaches no column of that table.
         #[source]
         reason: UntracedKey,
     },
@@ -136,28 +136,26 @@ pub enum ParityError {
     Deployment(#[from] DeploymentError),
 }
 
-/// Why the key of a measured view reaches no column of a published table a
-/// write through the view lands on.
+/// Why the key of a measured view reaches no column of the table a write
+/// through the view lands on.
 #[derive(Debug, thiserror::Error)]
 pub enum UntracedKey {
     /// The view outputs no column of the key's name.
     #[error("the view outputs no column {0}")]
     MissingColumn(String),
+    /// An `INSTEAD OF` trigger of the schema takes the write for a view the
+    /// write passes through, writing whatever its function writes.
+    #[error("an INSTEAD OF trigger takes the write for view {0}")]
+    TakenByTrigger(String),
     /// A view the write passes through is not automatically updatable.
     #[error("view {0} is not automatically updatable")]
     NotUpdatable(String),
     /// The key column computes its value from the relation a view reads.
     #[error("key column {0} computes its value")]
     Computed(String),
-    /// The write lands on a foreign table, which the replica does not hold.
-    #[error("the write lands on foreign table {0}")]
-    ForeignTable(String),
-    /// The write lands on a table the acting role's replica does not publish.
-    #[error("the write lands on table {0}, which the replica does not publish")]
-    Unpublished(String),
     /// Resolving a view the write passes through against the schema failed.
     #[error(transparent)]
-    Lookup(Box<Error>),
+    Lookup(#[from] Box<Error>),
 }
 
 /// The options a case translates its replica under before choosing its acting
@@ -432,7 +430,7 @@ struct Replica {
     /// text.
     manifest: Vec<TableManifestEntry>,
     /// Why the key of each measured view a write cannot be traced through
-    /// reaches no published table.
+    /// reaches no column of the table the write lands on.
     untraced: BTreeMap<String, UntracedKey>,
 }
 
@@ -700,26 +698,25 @@ struct Landing<'m, 'n> {
 
 /// The published table a write to the measured relation `table` lands on,
 /// which is the table itself or the table a measured view writes through
-/// every view it reads, and `None` when the translation publishes neither.
+/// every view it reads, and `None` when the replica holds neither.
 ///
 /// # Errors
 ///
-/// Returns [`UntracedKey`] when a view's key reaches no column of a
-/// published table.
+/// Returns [`UntracedKey`] when a view's key reaches no column of the table
+/// the write lands on.
 fn landing<'m, 'n>(
     table: &'n Table,
     schema: &'n ParserDB,
     manifest: &'m [TableManifestEntry],
 ) -> Result<Option<Landing<'m, 'n>>, UntracedKey> {
-    let lookup = |error: Error| UntracedKey::Lookup(Box::new(error));
     let published = |name: &str| manifest.iter().find(|entry| entry.logical == name);
     if let Some(entry) = published(&table.name) {
         let columns = table.key.iter().map(|key| (key.as_str(), key.as_str())).collect();
         return Ok(Some(Landing { entry, columns }));
     }
     let name = ObjectName::from(vec![Ident::with_quote('"', &table.name)]);
-    let Some(mut view) = resolve_view(&name, schema).map_err(lookup)? else { return Ok(None) };
-    let names = output_names(view, schema).map_err(lookup)?;
+    let Some(mut view) = resolve_view(&name, schema).map_err(Box::new)? else { return Ok(None) };
+    let names = output_names(view, schema).map_err(Box::new)?;
     let mut positions = table
         .key
         .iter()
@@ -732,48 +729,49 @@ fn landing<'m, 'n>(
         .collect::<Result<Vec<usize>, _>>()?;
     let computed = |index: usize| UntracedKey::Computed(table.key[index].clone());
     loop {
-        let Some(base) = view.updatable_base(schema).map_err(|error| lookup(error.into()))? else {
-            return Err(UntracedKey::NotUpdatable(view.stored_view_name().into_owned()));
-        };
-        match base.relation {
+        let view_name = || view.stored_view_name().into_owned();
+        if view
+            .triggers(schema)
+            .any(|trigger| matches!(trigger.period, Some(TriggerPeriod::InsteadOf)))
+        {
+            return Err(UntracedKey::TakenByTrigger(view_name()));
+        }
+        let base = view.updatable_base(schema).map_err(Error::from).map_err(Box::new)?;
+        let Some(base) = base else { return Err(UntracedKey::NotUpdatable(view_name())) };
+        // A foreign table, like a table the acting role holds no privilege
+        // on, is left off the replica and publishes nothing to watch.
+        let (written, columns) = match base.relation {
             WrittenRelation::View { view: inner, columns, .. } => {
                 for (index, position) in positions.iter_mut().enumerate() {
                     *position =
                         columns.get(*position).copied().flatten().ok_or_else(|| computed(index))?;
                 }
                 view = inner;
+                continue;
             }
-            WrittenRelation::Table { table: written, columns, .. } => {
-                let entry = published(written.table_name())
-                    .ok_or_else(|| UntracedKey::Unpublished(written.table_name().to_owned()))?;
-                let columns = table
-                    .key
-                    .iter()
-                    .zip(positions)
-                    .enumerate()
-                    .map(|(index, (key, position))| {
-                        let column = columns
-                            .get(position)
-                            .copied()
-                            .flatten()
-                            .ok_or_else(|| computed(index))?;
-                        Ok((key.as_str(), column.column_name()))
-                    })
-                    .collect::<Result<_, _>>()?;
-                return Ok(Some(Landing { entry, columns }));
-            }
-            WrittenRelation::ForeignTable { table: written, .. } => {
-                return Err(UntracedKey::ForeignTable(written.table_name().to_owned()));
-            }
-        }
+            WrittenRelation::Table { table: written, columns, .. }
+            | WrittenRelation::ForeignTable { table: written, columns, .. } => (written, columns),
+        };
+        let columns = table
+            .key
+            .iter()
+            .zip(positions)
+            .enumerate()
+            .map(|(index, (key, position))| {
+                let column =
+                    columns.get(position).copied().flatten().ok_or_else(|| computed(index))?;
+                Ok::<_, UntracedKey>((key.as_str(), column.column_name()))
+            })
+            .collect::<Result<_, _>>()?;
+        return Ok(published(written.table_name()).map(|entry| Landing { entry, columns }));
     }
 }
 
 /// Record in `probe_changes` the logical name and key of every row a statement
 /// writes to each of `tables` that the replica publishes, a measured view's
 /// rows being those of the table a write through it lands on, named under the
-/// view's key. Answers why each measured view whose key reaches no published
-/// table goes unwatched.
+/// view's key. Answers why each measured view whose key reaches no column of
+/// the table a write through it lands on goes unwatched.
 fn track_changes(
     connection: &mut SqliteConnection,
     tables: &[Table],
@@ -1106,29 +1104,28 @@ mod tests {
         assert_eq!(answers, [&Answer::Visible, &Answer::Hidden, &Answer::Hidden, &Answer::Visible]);
     }
 
-    /// The owner-rights view over `resources` the parity case
-    /// `owner_rights_view` measures, its key named `measured_key` in the view.
-    fn owner_rights_view(measured_key: &str) -> Case {
-        Case::parse(
-            "owner_rights_view",
-            "CREATE ROLE app_user NOLOGIN;
-             CREATE ROLE authz_writer NOLOGIN BYPASSRLS;
-             CREATE TABLE resources (id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL, archived BOOLEAN NOT NULL DEFAULT FALSE);
-             ALTER TABLE resources ENABLE ROW LEVEL SECURITY;
-             GRANT SELECT, UPDATE (archived) ON resources TO app_user;
-             GRANT SELECT, UPDATE (parent_id) ON resources TO authz_writer;
-             CREATE POLICY resources_select ON resources FOR SELECT TO app_user USING (parent_id > 0);
-             CREATE POLICY resources_update ON resources FOR UPDATE TO app_user USING (parent_id > 1) WITH CHECK (TRUE);
-             CREATE VIEW resource_moves WITH (check_option = cascaded) AS SELECT id, parent_id, id + 10 AS code FROM resources WHERE parent_id > 0;
-             ALTER VIEW resource_moves OWNER TO authz_writer;
-             GRANT SELECT, UPDATE (parent_id) ON resource_moves TO app_user;",
+    /// The answers of `app`, acting as `app_user` on the replica of `schema`,
+    /// to each row and statement of `probes`, `resource_moves` measured with
+    /// `key` over the rows of `resources` keyed 1 to 3.
+    fn view_writes(
+        schema: &str,
+        key: &str,
+        probes: &[(&str, &str)],
+    ) -> Result<Vec<Answer>, ParityError> {
+        let case = Case::parse(
+            "view_writes",
+            format!(
+                "CREATE ROLE app_user NOLOGIN;
+                 CREATE TABLE resources (id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL);
+                 {schema}"
+            ),
             "INSERT INTO resources (id, parent_id) VALUES (1, 1), (2, 2), (3, 3);",
-            &format!(
+            format!(
                 r#"
                 [[tables]]
                 name = "resource_moves"
-                key = ["{measured_key}"]
-                columns = ["id", "parent_id", "code"]
+                key = ["{key}"]
+                columns = ["{key}", "parent_id"]
 
                 [[callers]]
                 name = "app"
@@ -1137,47 +1134,95 @@ mod tests {
                 "#
             ),
         )
-        .expect("the case reads")
+        .expect("the case reads");
+        let owner = case_options(&case).expect("the case has a deployment");
+        let probes: Vec<Probe<'_>> = probes
+            .iter()
+            .map(|&(row, statement)| Probe { caller: "app", row, statement })
+            .collect();
+        let replay = replay(&case, &owner, &probes)?;
+        assert_eq!(replay.refusal, None);
+        Ok(replay.answers.into_iter().map(|answer| answer.answer).collect())
     }
 
+    const MOVE_ONE: &str = r#"UPDATE "resource_moves" SET "parent_id" = 2 WHERE "id" = 1"#;
+
+    const OWNER_RIGHTS: &str = "CREATE ROLE authz_writer NOLOGIN BYPASSRLS;
+         ALTER TABLE resources ENABLE ROW LEVEL SECURITY;
+         GRANT SELECT ON resources TO app_user;
+         GRANT SELECT, UPDATE (parent_id) ON resources TO authz_writer;
+         CREATE POLICY resources_select ON resources FOR SELECT TO app_user USING (parent_id > 0);
+         CREATE VIEW resource_moves WITH (check_option = cascaded) AS
+             SELECT id, parent_id, id + 10 AS code FROM resources WHERE parent_id > 0;
+         ALTER VIEW resource_moves OWNER TO authz_writer;
+         GRANT SELECT, UPDATE (parent_id) ON resource_moves TO app_user;";
+
+    const NESTED: &str = "CREATE VIEW resource_parents AS SELECT parent_id, id FROM resources;
+         CREATE VIEW resource_moves AS
+             SELECT id + 10 AS code, parent_id, id FROM resource_parents WHERE parent_id > 0;
+         GRANT SELECT, UPDATE ON resources, resource_parents, resource_moves TO app_user;";
+
     /// A write through a measured view changes the rows of the table it
-    /// lands on, named under the view's key, leaves the rows it does not
-    /// reach skipped, and a row the view's check option refuses rejected.
+    /// lands on, named under the view's key, through every view it reads,
+    /// leaves the rows it does not reach skipped, and a row the view's check
+    /// option refuses rejected.
     #[test]
     fn a_write_through_a_view_changes_its_rows() {
-        let case = owner_rights_view("id");
-        let owner = case_options(&case).expect("the case has a deployment");
-        let probes: Vec<Probe<'_>> = [
-            ("resource_moves:1", r#"UPDATE "resource_moves" SET "parent_id" = 2 WHERE "id" = 1"#),
-            ("resource_moves:2", r#"UPDATE "resource_moves" SET "parent_id" = 2 WHERE "id" = 1"#),
-            ("resource_moves:2", r#"UPDATE "resource_moves" SET "parent_id" = 0 WHERE "id" = 2"#),
-        ]
-        .into_iter()
-        .map(|(row, statement)| Probe { caller: "app", row, statement })
-        .collect();
-        let replay = replay(&case, &owner, &probes).expect("replays");
-        assert_eq!(replay.refusal, None);
-        let answers: Vec<&Answer> = replay.answers.iter().map(|answer| &answer.answer).collect();
+        let check_option = r#"UPDATE "resource_moves" SET "parent_id" = 0 WHERE "id" = 2"#;
+        let probes = [
+            ("resource_moves:1", MOVE_ONE),
+            ("resource_moves:2", MOVE_ONE),
+            ("resource_moves:2", check_option),
+        ];
         assert_eq!(
-            answers,
-            [&Answer::Changed, &Answer::Skipped, &Answer::Rejected("44000".into())]
+            view_writes(OWNER_RIGHTS, "id", &probes).expect("replays"),
+            [Answer::Changed, Answer::Skipped, Answer::Rejected("44000".into())]
+        );
+        assert_eq!(
+            view_writes(NESTED, "id", &probes[..2]).expect("replays"),
+            [Answer::Changed, Answer::Skipped]
         );
     }
 
-    /// A write through a measured view whose key no column of the table it
-    /// lands on holds names no rows, so the replay refuses it.
+    /// A write applied through a measured view whose key the replica cannot
+    /// trace to a column of the table the write lands on names no rows, so
+    /// the replay refuses it with the reason, and a write through such a view
+    /// that SQLite refuses answers that refusal.
     #[test]
-    fn a_computed_view_key_cannot_measure_writes() {
-        let case = owner_rights_view("code");
-        let owner = case_options(&case).expect("the case has a deployment");
-        let probe = Probe {
-            caller: "app",
-            row: "resource_moves:11",
-            statement: r#"UPDATE "resource_moves" SET "parent_id" = 2 WHERE "id" = 1"#,
+    fn an_untraced_view_key_cannot_measure_writes() {
+        let probe = [("resource_moves:1", MOVE_ONE)];
+        let untraced = |schema: &str, key: &str| {
+            match view_writes(schema, key, &probe) {
+                Err(ParityError::UntracedView { view, reason }) if view == "resource_moves" => {
+                    reason.to_string()
+                }
+                other => panic!("{other:?}"),
+            }
         };
+        assert_eq!(untraced(OWNER_RIGHTS, "code"), "key column code computes its value");
+        assert_eq!(untraced(NESTED, "code"), "key column code computes its value");
+        assert_eq!(untraced(NESTED, "nope"), "the view outputs no column nope");
+        let distinct = "CREATE VIEW resource_moves AS SELECT DISTINCT id, parent_id FROM resources;
+             GRANT SELECT, UPDATE ON resources, resource_moves TO app_user;";
+        assert_eq!(
+            untraced(
+                &format!(
+                    "{distinct}
+                     CREATE FUNCTION move_resource() RETURNS trigger LANGUAGE plpgsql AS $$
+                     BEGIN
+                         UPDATE resources SET parent_id = NEW.parent_id WHERE id = OLD.id;
+                         RETURN NEW;
+                     END $$;
+                     CREATE TRIGGER resource_moves_update INSTEAD OF UPDATE ON resource_moves
+                         FOR EACH ROW EXECUTE FUNCTION move_resource();"
+                ),
+                "id"
+            ),
+            "an INSTEAD OF trigger takes the write for view resource_moves"
+        );
         assert!(matches!(
-            replay(&case, &owner, &[probe]),
-            Err(ParityError::UntracedView { view, .. }) if view == "resource_moves"
+            view_writes(distinct, "id", &probe).as_deref(),
+            Ok([answer]) if !matches!(answer, Answer::Changed | Answer::Skipped)
         ));
     }
 
