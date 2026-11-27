@@ -30,6 +30,8 @@ pub(crate) enum Outcome {
 pub(crate) struct Outline {
     outcomes: Vec<Outcome>,
     transactions: Vec<Option<TransactionId>>,
+    /// Whether an explicit transaction is open as each statement starts.
+    open_before: Vec<bool>,
 }
 
 struct Frame {
@@ -43,12 +45,14 @@ impl Outline {
     pub(crate) fn new(statements: &[Statement], dispositions: &[Disposition]) -> Self {
         let mut outcomes = vec![Outcome::Committed; statements.len()];
         let mut transactions = vec![None; statements.len()];
+        let mut open_before = Vec::with_capacity(statements.len());
         let mut frames: Vec<Frame> = Vec::new();
         let mut pending: Vec<usize> = Vec::new();
         let mut open: Option<TransactionId> = None;
         let mut next = 0;
 
         for (index, statement) in statements.iter().enumerate() {
+            open_before.push(open.is_some());
             if matches!(dispositions[index], Disposition::DropNoOp { .. }) {
                 outcomes[index] = Outcome::Control;
                 continue;
@@ -109,7 +113,7 @@ impl Outline {
         for unfinished in pending {
             outcomes[unfinished] = Outcome::Undone;
         }
-        Self { outcomes, transactions }
+        Self { outcomes, transactions, open_before }
     }
 
     /// What the batch leaves of `statement`.
@@ -126,6 +130,12 @@ impl Outline {
     /// transaction.
     pub(crate) fn in_transaction(&self, index: usize) -> bool {
         self.transactions[index].is_some()
+    }
+
+    /// Whether an explicit transaction is open when statement `index` of the
+    /// batch starts.
+    pub(crate) fn open_before(&self, index: usize) -> bool {
+        self.open_before[index]
     }
 }
 

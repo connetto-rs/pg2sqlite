@@ -1929,11 +1929,14 @@ impl Pg2Sqlite {
                 .chain(client_functions.iter().map(|function| function.name.clone()))
                 .collect()
         };
+        let refusals_record =
+            crate::impls::privileges::statement_refusals::table_for(&schema, context)?;
         reject_name_collisions(
             initial_schema.as_ref(),
             names,
             prelude
                 .iter()
+                .chain(&refusals_record)
                 .map(|(label, statement)| (Source::Generated(label), statement))
                 .chain(sourced(statements, &translated)),
         )?;
@@ -2136,7 +2139,9 @@ impl Pg2Sqlite {
         let refusals = crate::impls::privileges::statement_refusals::recorded(
             &schema,
             &sources,
+            &crate::history::transactions::Outline::new(&sources, &dispositions),
             initial_schema.is_some(),
+            &placed,
             &context,
         )?;
         let files = crate::initialization::InitializationPlan::new(
