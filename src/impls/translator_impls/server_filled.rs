@@ -79,9 +79,9 @@ pub(crate) fn split<'t>(
 
     let table = last_ident_value_or_display(&create_table.name);
     let mut names = resolve_declared_table(written, create_table)?
-        .map(|stored| check_names(stored, checks.iter().map(|(check, _)| *check), written))
-        .transpose()?
-        .unwrap_or_default()
+        .map_or(Ok(Vec::new()), |stored| {
+            check_names(stored, checks.iter().map(|(check, _)| *check), written)
+        })?
         .into_iter();
     let mut report = |construct: &str, name: String, (trigger, column): (&str, &Ident)| {
         emit(TranslationWarning::LeftToServer {

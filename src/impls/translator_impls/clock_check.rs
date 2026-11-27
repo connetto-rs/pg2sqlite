@@ -306,11 +306,10 @@ pub(super) fn check_names<'c>(
                     held.is_some_and(|held| held.expression(schema) == check.expr.as_ref())
                 })
                 .and_then(Option::take);
-            Ok(held_check
-                .map(|held| held.constraint_name(schema))
-                .transpose()?
-                .flatten()
-                .map(Cow::into_owned))
+            held_check
+                .map_or(Ok(None), |held| held.constraint_name(schema))
+                .map(|name| name.map(Cow::into_owned))
+                .map_err(Error::from)
         })
         .collect()
 }
