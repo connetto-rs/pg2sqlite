@@ -37,6 +37,15 @@ pub enum WrapperKind {
     /// only in part. The name is unchanged and BEFORE triggers refuse the
     /// commands and columns it may not write.
     Gated,
+    /// A view the acting role reaches a table off its replica through with
+    /// the view owner's rights. The logical name is the PostgreSQL view, and
+    /// the physical name a table of the view's columns keyed by the primary
+    /// keys the view passes through, or by its `GROUP BY` outputs. The
+    /// embedder fills the table by subscribing to the view as the role, lands
+    /// the rows by that key, and applies a write the client makes to the
+    /// table as the same write on the view. `BEFORE` triggers refuse the
+    /// writes PostgreSQL refuses through the view.
+    ViewTable,
 }
 
 /// The database schema containing an emitted object.
