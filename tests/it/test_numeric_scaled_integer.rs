@@ -129,6 +129,122 @@ fn run_translated_or_error(pg: &str) -> Result<Vec<Option<String>>, String> {
     )
 }
 
+#[test]
+fn numeric_product_overflow_rejects_unrepresentable_intermediates_before_rescaling() {
+    for product in
+        ["amount * factor", "factor * amount", "amount * 1000000", "1000000 * amount"]
+    {
+        for amount in ["123456789012.123457", "-123456789012.123457"] {
+            let error = run_translated_or_error(&format!(
+                "CREATE TABLE samples (amount numeric(18,6), factor integer);
+                 INSERT INTO samples VALUES ({amount}, 1000000);
+                 SELECT ({product})::bigint FROM samples;"
+            ))
+            .expect_err("an overflowing minor-unit product must fail");
+            assert!(error.contains("integer overflow"), "{product} returned {error}");
+        }
+    }
+}
+
+#[test]
+fn numeric_product_overflow_preserves_fitting_products_and_nulls() {
+    for product in ["amount * factor", "amount * 1000000", "1000000 * amount"] {
+        assert_eq!(
+            run_translated_with(
+                &format!(
+                    "CREATE TABLE samples (amount numeric(18,6), factor integer);
+                     INSERT INTO samples VALUES
+                       (1234567.123457, 1000000),
+                       (-1234567.123457, 1000000),
+                       (0, 1000000),
+                       (NULL, 1000000);
+                     SELECT ({product})::bigint FROM samples;"
+                ),
+                &Pg2SqliteOptions::default(),
+            ),
+            vec![
+                Some("1234567123457".to_string()),
+                Some("-1234567123457".to_string()),
+                Some("0".to_string()),
+                None,
+            ]
+        );
+    }
+}
+
+#[test]
+fn numeric_product_overflow_checks_unscaled_numeric_and_signed_integer_limits() {
+    assert_eq!(
+        run_translated_with(
+            "CREATE TABLE samples (amount numeric(18,0), factor bigint);
+             INSERT INTO samples VALUES
+               (1, 9223372036854775807),
+               (1, -9223372036854775808),
+               (0, -9223372036854775808),
+               (1, NULL);
+             SELECT amount * factor FROM samples;",
+            &Pg2SqliteOptions::default(),
+        ),
+        vec![
+            Some("9223372036854775807".to_string()),
+            Some("-9223372036854775808".to_string()),
+            Some("0".to_string()),
+            None,
+        ]
+    );
+    let error = run_translated_or_error(
+        "CREATE TABLE samples (amount numeric(18,0), factor bigint);
+         INSERT INTO samples VALUES (-1, -9223372036854775808);
+         SELECT amount * factor FROM samples;",
+    )
+    .expect_err("negating the minimum integer must fail");
+    assert!(error.contains("integer overflow"), "{error}");
+}
+
+#[test]
+fn numeric_product_overflow_refuses_to_duplicate_volatile_operands() {
+    assert_refused(
+        "CREATE TABLE samples (amount numeric(18,6));
+         SELECT amount * CAST(random() AS bigint) FROM samples;",
+        "may answer a different value",
+    );
+}
+
+#[test]
+fn numeric_product_overflow_rounds_fitting_products_without_overflowing_the_bias() {
+    assert_eq!(
+        run_translated_with(
+            "CREATE TABLE samples (amount numeric(18,6), factor integer);
+             INSERT INTO samples VALUES
+               (922337203685.477580, 10),
+               (-922337203685.477580, 10);
+             SELECT (amount * factor)::bigint FROM samples;",
+            &Pg2SqliteOptions::default(),
+        ),
+        vec![Some("9223372036855".to_string()), Some("-9223372036855".to_string())]
+    );
+}
+
+#[test]
+fn numeric_product_overflow_checks_two_unscaled_numeric_operands() {
+    assert_eq!(
+        run_translated_with(
+            "CREATE TABLE samples (amount numeric(18,0), factor numeric(18,0));
+             INSERT INTO samples VALUES (2, 3);
+             SELECT amount * factor FROM samples;",
+            &Pg2SqliteOptions::default(),
+        ),
+        vec![Some("6".to_string())]
+    );
+    let error = run_translated_or_error(
+        "CREATE TABLE samples (amount numeric(18,0), factor numeric(18,0));
+         INSERT INTO samples VALUES (999999999999999999, 10);
+         SELECT amount * factor FROM samples;",
+    )
+    .expect_err("an unscaled numeric product must remain an integer");
+    assert!(error.contains("integer overflow"), "{error}");
+}
+
 /// A cast moves the point. Measured on PostgreSQL 16: `1.005::numeric(10,2)` is
 /// 1.01 and `(-1.005)::numeric(10,2)` is -1.01, so the rounding is away from
 /// zero on both signs, where SQLite's integer division truncates toward it.

@@ -1308,7 +1308,18 @@ pub(crate) fn is_integral_expression(
         Expr::Value(ValueWithSpan { value: Value::Number(digits, _), .. }) => {
             Ok(!digits.contains('.') && !digits.contains(['e', 'E']))
         }
-        Expr::Cast { data_type, .. } => Ok(matches!(data_type, DataType::Integer(_))),
+        Expr::Cast { data_type, .. } => Ok(matches!(
+            data_type,
+            DataType::Integer(_)
+                | DataType::Int(_)
+                | DataType::SmallInt(_)
+                | DataType::BigInt(_)
+                | DataType::Int2(_)
+                | DataType::Int4(_)
+                | DataType::Int8(_)
+                | DataType::TinyInt(_)
+                | DataType::Int64
+        )),
         _ => {
             declared_type_matches(expr, schema, options, |declared| {
                 let lowered = declared.to_ascii_lowercase();
@@ -1523,12 +1534,7 @@ fn numeric_precision_and_scale_of(
     }
 }
 
-/// Move a value held as minor units from `from` scale to `to` scale.
-///
-/// Growing the scale multiplies. Shrinking it divides, and PostgreSQL rounds
-/// half away from zero where SQLite's integer division truncates toward it, so
-/// half a unit is added with the value's sign first. `1.005::numeric(10,2)` is
-/// 1.01 and `(-1.005)::numeric(10,2)` is -1.01.
+/// Rescales minor units, rounding discarded fractions half away from zero.
 pub(crate) fn rescale_minor_units(value: Expr, from: u32, to: u32) -> Expr {
     if from == to {
         return value;
@@ -1545,25 +1551,24 @@ pub(crate) fn rescale_minor_units(value: Expr, from: u32, to: u32) -> Expr {
 
     let divisor = 10_i128.pow(from - to);
     let half = divisor / 2;
-    // `value + half * sign(value)` before the truncating division turns
-    // truncation toward zero into rounding away from it.
-    let biased = Expr::Nested(Box::new(Expr::BinaryOp {
+    let quotient = Expr::Nested(Box::new(Expr::BinaryOp {
         left: Box::new(value.clone()),
-        op: BinaryOperator::Plus,
-        right: Box::new(Expr::BinaryOp {
-            left: Box::new(crate::impls::function_helpers::number_literal(&half.to_string())),
-            op: BinaryOperator::Multiply,
-            right: Box::new(crate::impls::function_helpers::simple_function_expr(
-                "sign",
-                vec![value],
-                None,
-            )),
-        }),
-    }));
-    Expr::Nested(Box::new(Expr::BinaryOp {
-        left: Box::new(biased),
         op: BinaryOperator::Divide,
         right: Box::new(crate::impls::function_helpers::number_literal(&divisor.to_string())),
+    }));
+    let remainder = Expr::Nested(Box::new(Expr::BinaryOp {
+        left: Box::new(value),
+        op: BinaryOperator::Modulo,
+        right: Box::new(crate::impls::function_helpers::number_literal(&divisor.to_string())),
+    }));
+    Expr::Nested(Box::new(Expr::BinaryOp {
+        left: Box::new(quotient),
+        op: BinaryOperator::Plus,
+        right: Box::new(Expr::BinaryOp {
+            left: Box::new(remainder),
+            op: BinaryOperator::Divide,
+            right: Box::new(crate::impls::function_helpers::number_literal(&half.to_string())),
+        }),
     }))
 }
 

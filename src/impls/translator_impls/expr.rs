@@ -2787,11 +2787,7 @@ fn translate_numeric_arithmetic(
                     left_precision + right_precision
                 )));
             }
-            Expr::BinaryOp {
-                left: Box::new(translated(left)?),
-                op: op.clone(),
-                right: Box::new(translated(right)?),
-            }
+            checked_numeric_product(translated(left)?, translated(right)?, options)?
         }
         BinaryOperator::Divide => return Err(numeric_division_refusal(left, right)),
         _ => return Ok(None),
@@ -3033,6 +3029,32 @@ fn align_minor_units(
     )))
 }
 
+/// Rejects minor-unit products that SQLite promotes to floating point.
+fn checked_numeric_product(
+    left: Expr,
+    right: Expr,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<Expr, crate::errors::Error> {
+    let product = Expr::BinaryOp {
+        left: Box::new(left),
+        op: BinaryOperator::Multiply,
+        right: Box::new(right),
+    };
+    if !is_replayable(&product, options) {
+        return Err(reject_duplicated_operand("NUMERIC multiplication", &product));
+    }
+    Ok(Expr::Case {
+        case_token: AttachedToken::empty(),
+        end_token: AttachedToken::empty(),
+        operand: Some(Box::new(simple_function_expr("typeof", vec![product.clone()], None))),
+        conditions: vec![CaseWhen {
+            condition: Expr::Value(Value::SingleQuotedString("real".to_string()).with_empty_span()),
+            result: simple_function_expr("abs", vec![integer_literal(i64::MIN)], None),
+        }],
+        else_result: Some(Box::new(product)),
+    })
+}
+
 /// `scaled * plain`, where the plain side is a literal rather than another
 /// scaled value.
 ///
@@ -3066,20 +3088,22 @@ fn multiply_by_plain_operand(
     if plain_side(right, scales.1).is_some()
         && let Some(scaled) = literal_at_own_scale(right)?
     {
-        return Ok(Some(Expr::BinaryOp {
-            left: Box::new(left.translate_with_warnings(schema, options, emit)?),
-            op: BinaryOperator::Multiply,
-            right: Box::new(scaled),
-        }));
+        return checked_numeric_product(
+            left.translate_with_warnings(schema, options, emit)?,
+            scaled,
+            options,
+        )
+        .map(Some);
     }
     if plain_side(left, scales.0).is_some()
         && let Some(scaled) = literal_at_own_scale(left)?
     {
-        return Ok(Some(Expr::BinaryOp {
-            left: Box::new(scaled),
-            op: BinaryOperator::Multiply,
-            right: Box::new(right.translate_with_warnings(schema, options, emit)?),
-        }));
+        return checked_numeric_product(
+            scaled,
+            right.translate_with_warnings(schema, options, emit)?,
+            options,
+        )
+        .map(Some);
     }
     Ok(None)
 }
@@ -3690,6 +3714,17 @@ fn translate_binary_op(
             )?
         {
             return Ok(combined);
+        }
+        if *op == BinaryOperator::Multiply
+            && ((scales.0.is_some() && scales.1.is_some())
+                || (scales.0.is_some() && is_integral_expression(right, schema, options)?)
+                || (scales.1.is_some() && is_integral_expression(left, schema, options)?))
+        {
+            return checked_numeric_product(
+                left.translate_with_warnings(schema, options, emit)?,
+                right.translate_with_warnings(schema, options, emit)?,
+                options,
+            );
         }
         // One side holds minor units and the other a plain number, so the
         // plain one is brought onto the same scale. PostgreSQL promotes the
