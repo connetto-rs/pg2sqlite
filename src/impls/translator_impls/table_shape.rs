@@ -729,7 +729,7 @@ fn reshaped_views(
 }
 
 /// The `CREATE VIEW` declaring `view` as its schema holds it.
-fn creation(view: &View) -> Statement {
+pub(crate) fn creation(view: &View) -> Statement {
     let spelled = |name: &str, quoted: bool| {
         if quoted { Ident::with_quote('"', name) } else { Ident::new(name) }
     };

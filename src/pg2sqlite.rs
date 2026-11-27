@@ -25,6 +25,7 @@ use crate::{
         column_access,
         emitted_namespace::{Source, reject_name_collisions, sourced},
         object_name::last_ident_value_or_display,
+        privileges::statement_refusals::Record,
         transaction_blocks::Disposition,
         translator_impls::{
             body_storage,
@@ -2105,8 +2106,16 @@ impl Pg2Sqlite {
         );
         context.batch_cache().borrow_mut().forget();
         warnings.extend(left_to_server?);
-        let mut placed =
-            crate::history::placement::place(&sources, &mut statements, &schema, options)?;
+        let record =
+            Record::of(&schema, &sources, &dispositions, initial_schema.is_some(), &context)?;
+        let mut placed = crate::history::placement::place(
+            &sources,
+            &mut statements,
+            &schema,
+            initial_schema,
+            record.relations(),
+            options,
+        )?;
         let units: Vec<crate::history::Unit<'_>> = epochs
             .iter()
             .flat_map(|epoch| {
@@ -2136,14 +2145,7 @@ impl Pg2Sqlite {
                 .chain(main.iter().flatten().flatten().flatten())
                 .chain(attached.iter().flatten().flatten().flatten()),
         );
-        let refusals = crate::impls::privileges::statement_refusals::recorded(
-            &schema,
-            &sources,
-            &crate::history::transactions::Outline::new(&sources, &dispositions),
-            initial_schema.is_some(),
-            &placed,
-            &context,
-        )?;
+        let refusals = record.into_statements(&placed);
         let files = crate::initialization::InitializationPlan::new(
             prelude,
             placed.unit_files.into_iter().zip(statements),
@@ -2466,7 +2468,8 @@ impl Pg2Sqlite {
             )?;
         let schema = &schema;
         let options = &options;
-        let placed = crate::history::placement::place(&sources, &mut statements, schema, options)?;
+        let placed =
+            crate::history::placement::place(&sources, &mut statements, schema, None, [], options)?;
 
         let role = crate::impls::session_variable::acting_role(schema, options)?;
 

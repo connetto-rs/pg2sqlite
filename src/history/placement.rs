@@ -9,7 +9,7 @@ use core::ops::ControlFlow;
 
 use sql_traits::{
     structs::ParserDB,
-    traits::{DatabaseLike, TableLike},
+    traits::{DatabaseLike, TableLike, ViewLike},
 };
 use sqlparser::ast::{
     AlterTableOperation, ColumnOption, CreateTable, CreateTrigger, FromTable, ObjectName,
@@ -23,13 +23,19 @@ use crate::{
     errors::Error,
     impls::{
         object_name::{last_ident_value_or_display, quoted_ident},
+        privileges::has_backing_table,
         scoped_relations::relation_occurrences,
         translator_impls::{
-            overlay::is_overlay_table, reentry::is_marker_table, rls::resolve_trigger_table_name,
+            drop_column_rebuild::as_declared,
+            overlay::{is_overlaid, is_overlay_table},
+            reentry::is_marker_table,
+            rls::resolve_trigger_table_name,
+            table_shape::creation,
         },
     },
     manifest::Placement,
-    options::{AttachedTables, Pg2SqliteOptions},
+    options::{AttachedTables, Pg2SqliteOptions, TranslationContext},
+    traits::translator::TranslatorWithContext,
 };
 
 /// The database files an initialization belongs to, as a set over the main,
@@ -155,18 +161,36 @@ impl Placed {
 }
 
 /// Places objects while retaining source execution order.
-pub(crate) fn place(
+///
+/// With attached tables, a batch translated against `earlier`, the schema the
+/// database holds before it, places each earlier table and view the batch
+/// reaches or `reached` names where an earlier translation put it.
+pub(crate) fn place<'r>(
     sources: &[Statement],
     emitted: &mut [Vec<Statement>],
     schema: &ParserDB,
+    earlier: Option<&ParserDB>,
+    reached: impl IntoIterator<Item = &'r str>,
     options: &Pg2SqliteOptions,
 ) -> Result<Placed, Error> {
     let attached = options.get_attached_tables();
+    let rebuilt = match (attached, earlier) {
+        (Some(_), Some(earlier)) => {
+            rebuilt_earlier(earlier, (sources, &*emitted), reached, options)?
+        }
+        _ => Vec::new(),
+    };
+    let units: Vec<(&Statement, &[Statement])> = rebuilt
+        .iter()
+        .map(|(source, translated)| (source, translated.as_slice()))
+        .chain(sources.iter().zip(emitted.iter().map(Vec::as_slice)))
+        .collect();
     let storage = match attached {
-        Some(attached) => attached_storage(sources, emitted, attached, schema, options)?,
+        Some(attached) => attached_storage(&units, attached, schema, options)?,
         None => BTreeSet::new(),
     };
-    let mut homes = homes(sources, emitted, schema, &storage);
+    let mut homes = homes(&units, schema, &storage);
+    drop(units);
     let mut logical_storage = Homes::new();
     for table in schema.tables() {
         let physical = resolve_trigger_table_name(table.table_name(), table, schema, options)?;
@@ -189,6 +213,15 @@ pub(crate) fn place(
         logical_storage.insert(logical_key, placement);
     }
     let mut trigger_homes = Homes::new();
+    // An earlier trigger keeps the home its object's translation gave it, so
+    // the batch dropping it drops it where it lives.
+    for statement in rebuilt.iter().flat_map(|(_, translated)| translated) {
+        if let Statement::CreateTrigger(trigger) = statement {
+            let placement =
+                statement_placement(statement, &homes, &logical_storage, &trigger_homes);
+            trigger_homes.insert(key_of(&trigger.name), placement);
+        }
+    }
     let mut placed_unit_files = Vec::with_capacity(sources.len());
     let attached_schema =
         attached.map_or_else(String::new, |attached| attached.schema().to_owned());
@@ -211,6 +244,132 @@ pub(crate) fn place(
         trigger_homes,
         attached_schema,
     })
+}
+
+/// The translations of the views and the tables a view stands for that
+/// `earlier` holds and a statement of `sources` or `emitted` or `reached`
+/// names, and of those the views they emit read in turn. A name the batch
+/// creates, drops, alters or renames is left to the batch.
+///
+/// A view an earlier translation emitted reads what its translation against
+/// `earlier` reads, which tells whether it lives in `temp`.
+fn rebuilt_earlier<'r>(
+    earlier: &ParserDB,
+    (sources, emitted): (&[Statement], &[Vec<Statement>]),
+    reached: impl IntoIterator<Item = &'r str>,
+    options: &Pg2SqliteOptions,
+) -> Result<Vec<(Statement, Vec<Statement>)>, Error> {
+    let mut done = BTreeSet::new();
+    let mut pending: Vec<String> = reached.into_iter().map(key).collect();
+    for statement in sources {
+        add_reached_names(statement, &mut pending);
+    }
+    for statement in emitted.iter().flatten() {
+        add_changed_names(statement, &mut done);
+        add_reached_names(statement, &mut pending);
+    }
+    let context = TranslationContext::new(options);
+    let context = context.with_written_schema(earlier);
+    let mut rebuilt = Vec::new();
+    while let Some(name) = pending.pop() {
+        if done.contains(&name) {
+            continue;
+        }
+        let source = earlier_creation(earlier, &name, options)?;
+        done.insert(name);
+        let Some(source) = source else { continue };
+        let translated = source.translate_with_warnings(earlier, &context, &mut |_| {})?;
+        for statement in &translated {
+            if let Statement::CreateView(view) = statement {
+                pending.extend(
+                    relation_occurrences(&view.query)
+                        .iter()
+                        .map(|name| key(&last_ident_value_or_display(name))),
+                );
+            }
+        }
+        rebuilt.push((source, translated));
+    }
+    Ok(rebuilt)
+}
+
+/// Adds the tables, views and indexes `statement` creates, drops, alters or
+/// renames to `names`, under each name they have before and after it.
+fn add_changed_names(statement: &Statement, names: &mut BTreeSet<String>) {
+    let mut add = |name: &ObjectName| {
+        names.insert(key(&last_ident_value_or_display(name)));
+    };
+    match statement {
+        Statement::CreateTable(CreateTable { name, .. })
+        | Statement::CreateVirtualTable { name, .. } => add(name),
+        Statement::CreateView(view) => add(&view.name),
+        Statement::Drop {
+            object_type: ObjectType::Table | ObjectType::View | ObjectType::Index,
+            names: dropped,
+            ..
+        } => dropped.iter().for_each(add),
+        Statement::AlterTable(alter) => {
+            add(&alter.name);
+            for operation in &alter.operations {
+                if let AlterTableOperation::RenameTable {
+                    table_name: RenameTableNameKind::As(to) | RenameTableNameKind::To(to),
+                } = operation
+                {
+                    add(to);
+                }
+            }
+        }
+        Statement::RenameTable(renames) => {
+            for rename in renames {
+                add(&rename.old_name);
+                add(&rename.new_name);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Adds the relations `statement` reads, writes, or creates or drops a
+/// trigger on to `names`.
+fn add_reached_names(statement: &Statement, names: &mut Vec<String>) {
+    let trigger_table = match statement {
+        Statement::CreateTrigger(trigger) => Some(&trigger.table_name),
+        Statement::DropTrigger(drop) => drop.table_name.as_ref(),
+        _ => None,
+    };
+    names.extend(
+        relation_occurrences(statement)
+            .iter()
+            .chain(trigger_table)
+            .chain(primary_write_target(statement))
+            .map(|name| key(&last_ident_value_or_display(name))),
+    );
+}
+
+/// The `CREATE VIEW` `earlier` holds for the persistent view named `name`,
+/// or the `CREATE TABLE` declaring the persistent table a view stands for.
+///
+/// # Errors
+///
+/// Returns the lookup errors deciding whether a view stands for the table.
+fn earlier_creation(
+    earlier: &ParserDB,
+    name: &str,
+    options: &Pg2SqliteOptions,
+) -> Result<Option<Statement>, Error> {
+    if let Some(table) = earlier
+        .tables()
+        .find(|table| !table.temporary && table.table_name().eq_ignore_ascii_case(name))
+    {
+        if !has_backing_table(table, earlier, options)? && !is_overlaid(table, options) {
+            return Ok(None);
+        }
+        return Ok(Some(Statement::CreateTable(as_declared(table, earlier)?)));
+    }
+    Ok(earlier
+        .views()
+        .find(|view| !view.is_temporary() && view.view_name().eq_ignore_ascii_case(name))
+        .map(creation))
 }
 
 /// The fresh-file selections that replay a source unit.
@@ -263,8 +422,7 @@ fn is_transaction_control(statement: &Statement) -> bool {
 /// The SQLite names of each listed table's storage and its generated virtual
 /// tables.
 fn attached_storage(
-    inputs: &[Statement],
-    translated: &[Vec<Statement>],
+    units: &[(&Statement, &[Statement])],
     attached: &AttachedTables,
     schema: &ParserDB,
     options: &Pg2SqliteOptions,
@@ -301,7 +459,7 @@ fn attached_storage(
         )?));
     }
 
-    for (input, emitted) in inputs.iter().zip(translated) {
+    for &(input, emitted) in units {
         reject_rename(input, attached)?;
         let Some(subject) = subject_table(input) else {
             continue;
@@ -391,14 +549,13 @@ fn reject_rename(input: &Statement, attached: &AttachedTables) -> Result<(), Err
 /// Where every created table, view and index lives, with views closed over
 /// `temp`.
 fn homes(
-    inputs: &[Statement],
-    translated: &[Vec<Statement>],
+    units: &[(&Statement, &[Statement])],
     schema: &ParserDB,
     storage: &BTreeSet<String>,
 ) -> Homes {
     let mut homes = Homes::new();
     let mut views = Vec::new();
-    for (input, emitted) in inputs.iter().zip(translated) {
+    for &(input, emitted) in units {
         let temporary = match input {
             Statement::CreateTable(create) => create.temporary,
             _ => {
@@ -438,13 +595,17 @@ fn homes(
             homes.insert(name, placement);
         }
     }
-    for statement in translated.iter().flatten() {
+    for statement in units.iter().flat_map(|(_, emitted)| emitted.iter()) {
         if let Statement::CreateIndex(index) = statement
             && let Some(name) = &index.name
         {
             let placement = homes.get(&key_of(&index.table_name)).copied();
             homes.insert(key_of(name), placement.unwrap_or(Placement::Main));
         }
+    }
+    // A listed table no unit creates, an earlier batch's, is attached too.
+    for name in storage {
+        homes.entry(unqualified_key(name)).or_insert(Placement::Attached);
     }
 
     loop {

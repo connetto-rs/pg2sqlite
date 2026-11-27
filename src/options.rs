@@ -2017,11 +2017,6 @@ impl Pg2SqliteOptions {
     /// Places `tables` in `schema` and emits cross-database views and triggers
     /// as `TEMP`.
     ///
-    /// A translation against an existing schema places only the views it
-    /// creates, and counts a view an earlier translation emitted `TEMP` as
-    /// living in `main`. The record of the acting role's refusals then names
-    /// `main` for it, and the SQLite authorizer misses a write through it.
-    ///
     /// ```
     /// # use pg2sqlite::prelude::*;
     /// let options = Pg2SqliteOptions::default().with_attached_tables("shared", ["notes"]);
