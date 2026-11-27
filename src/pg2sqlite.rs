@@ -780,11 +780,8 @@ impl Trackers {
         });
         let written =
             written.with_declaration(Declaration::Statement { statement, schema: at.binding });
-        let ambiguous = column_access::resolve_columns(statement, at.binding, &written)?;
-        column_access::with_ambiguity(
-            ambiguous,
-            statement.translate_with_warnings(at.schema, &written, emit),
-        )
+        column_access::resolve_columns(statement, at.binding, &written)?
+            .translated(statement.translate_with_warnings(at.schema, &written, emit), &written)
     }
 
     /// The statements moving the replica from the shape `applied` holds to

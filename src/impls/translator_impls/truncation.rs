@@ -30,18 +30,12 @@ use sql_traits::{
     structs::ParserDB,
     traits::{DatabaseLike, ForeignKeyLike, TableLike},
 };
-use sqlparser::ast::{
-    AlterTableOperation, Expr, Ident, ObjectName, ObjectNamePart, ReferentialAction, Statement,
-    TriggerEvent, TriggerPeriod, Value,
-};
+use sqlparser::ast::{AlterTableOperation, ReferentialAction, Statement, TriggerEvent};
 
 use super::definer;
+use crate::errors::Error;
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
-use crate::{
-    errors::Error,
-    impls::{ast_builder, query_builder::single_expr_query},
-};
 
 /// The temporary view an insert into fires the truncation trigger.
 const VIEW: &str = "pg2sqlite_truncation";
@@ -57,49 +51,13 @@ pub(crate) fn emptying(deletes: Vec<Statement>, in_trigger_body: bool) -> Vec<St
     if in_trigger_body {
         return framed;
     }
-    let mut trigger = ast_builder::trigger(
-        name(&[TRIGGER]),
-        name(&[VIEW]),
-        TriggerPeriod::InsteadOf,
-        TriggerEvent::Insert,
-        true,
-        None,
-        framed,
-    );
-    if let Statement::CreateTrigger(create) = &mut trigger {
-        create.temporary = true;
-    }
-    let mut view = ast_builder::create_view(
-        name(&[VIEW]),
-        Vec::new(),
-        single_expr_query(
-            Expr::Value(Value::Number("1".to_owned(), false).into()),
-            Vec::new(),
-            None,
-        ),
-    );
-    if let Statement::CreateView(create) = &mut view {
-        create.temporary = true;
-    }
-    vec![
-        leftover_drop(),
-        view,
-        trigger,
-        ast_builder::insert(
-            name(&[VIEW]),
-            Vec::new(),
-            ast_builder::values(vec![vec![Expr::Value(
-                Value::Number("1".to_owned(), false).into(),
-            )]]),
-        ),
-        ast_builder::drop_view(name(&["temp", VIEW]), false),
-    ]
+    super::one_shot::run_once(VIEW, TRIGGER, framed)
 }
 
 /// The drop of what a failed `TRUNCATE` left on the connection, a no-op when
 /// nothing was left.
 pub(crate) fn leftover_drop() -> Statement {
-    ast_builder::drop_view(name(&["temp", VIEW]), true)
+    super::one_shot::leftover_drop(VIEW)
 }
 
 /// Whether SQLite refuses `statement` while a temporary trigger names a table
@@ -147,8 +105,4 @@ pub(crate) fn fires_on_truncation(
         }
         _ => Ok(false),
     }
-}
-
-fn name(parts: &[&str]) -> ObjectName {
-    ObjectName(parts.iter().map(|part| ObjectNamePart::Identifier(Ident::new(*part))).collect())
 }

@@ -150,20 +150,10 @@ fn writing_an_unreadable_column_without_its_write_privilege_is_denied() {
     assert_denied("INSERT INTO docs VALUES (3, 'c', 'z')");
 }
 
-/// The replica holds a readable column, so its write guards answer the
-/// missing privilege.
 #[test]
-fn writing_a_readable_column_without_its_write_privilege_is_denied_on_the_replica() {
-    let script = Pg2Sqlite::default()
-        .sql("UPDATE docs SET id = 5")
-        .unwrap()
-        .translate_to_sql_with_schema(&schema(), &as_app())
-        .unwrap();
-    let mut connection = replica();
-    let refused = connection.batch_execute(&script.into_vec().join(";\n")).unwrap_err();
-    assert!(refused.to_string().contains("permission denied for table docs"), "{refused}");
-    let ids: Vec<i32> = backing_rows(&mut connection).into_iter().map(|row| row.0).collect();
-    assert_eq!(ids, [1, 2]);
+fn writing_a_readable_column_without_its_write_privilege_is_denied() {
+    assert_denied("UPDATE docs SET id = 5");
+    assert_denied("UPDATE docs SET id = 5 WHERE false");
 }
 
 #[test]

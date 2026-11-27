@@ -14,18 +14,19 @@
 
 use core::ops::ControlFlow;
 
+use pg2sqlite_runtime::write_guard::permission_denied;
 use sql_traits::{
     structs::{
         ColumnBinding, ColumnScope, ExpressionContext, ExpressionScope, IdentifierCase, ParserDB,
         QueryOutput, TargetName, View, WrittenRelation,
     },
-    traits::{DatabaseLike, TableLike, ViewLike},
+    traits::{ColumnLike, DatabaseLike, TableLike, ViewLike},
 };
 use sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, CaseWhen, ConflictTarget, Delete, Expr, FromTable, Ident,
-    Insert, ObjectName, ObjectNamePart, OnConflictAction, OnInsert, Query, Select, SelectItem,
-    SetExpr, Statement, TableAlias, TableFactor, TableObject, Update, Visit, VisitMut, Visitor,
-    VisitorMut, helpers::attached_token::AttachedToken,
+    Assignment, AssignmentTarget, BinaryOperator, CaseWhen, ConflictTarget, Delete, Expr,
+    FromTable, Ident, Insert, ObjectName, ObjectNamePart, OnConflictAction, OnInsert, Query,
+    Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor, TableObject, Update, Visit,
+    VisitMut, Visitor, VisitorMut, helpers::attached_token::AttachedToken,
 };
 
 #[cfg(not(feature = "std"))]
@@ -35,12 +36,17 @@ use crate::{
     impls::{
         derived_writes::{Event, FiringTrigger},
         object_name::{declared_column_ident, last_ident},
+        privileges::RoleTable,
         query_builder::aliased_table_factor,
         returning_rows::ReturningRows,
+        session_variable,
         translator_impls::insert::row_width,
     },
     options::TranslationContext,
 };
+
+type Role = <ParserDB as DatabaseLike>::Role;
+type Table = <ParserDB as DatabaseLike>::Table;
 
 /// What a view stands for over the relation it reads, one level down.
 struct Landing<'view> {
@@ -295,6 +301,254 @@ fn landing<'s>(
     )))
 }
 
+/// The privileges a write needs on one relation, by the columns it names.
+struct Needs<C> {
+    /// The columns an insert fills.
+    insert: Vec<C>,
+    /// Whether an insert fills columns it does not name, which needs
+    /// `INSERT` on some column.
+    insert_any: bool,
+    /// The columns an update assigns.
+    update: Vec<C>,
+    delete: bool,
+}
+
+impl<C: Copy> Needs<C> {
+    /// The same needs on the relation a view writes, each column through
+    /// `written`, `None` when one computes its value.
+    fn through<D>(&self, written: impl Fn(C) -> Option<D>) -> Option<Needs<D>> {
+        Some(Needs {
+            insert: self.insert.iter().map(|column| written(*column)).collect::<Option<_>>()?,
+            insert_any: self.insert_any,
+            update: self.update.iter().map(|column| written(*column)).collect::<Option<_>>()?,
+            delete: self.delete,
+        })
+    }
+
+    fn held_by(
+        &self,
+        inserts: impl Fn(C) -> bool,
+        inserts_any: bool,
+        updates: impl Fn(C) -> bool,
+        deletes: bool,
+    ) -> bool {
+        self.insert.iter().all(|column| inserts(*column))
+            && (!self.insert_any || inserts_any)
+            && self.update.iter().all(|column| updates(*column))
+            && (!self.delete || deletes)
+    }
+}
+
+/// One relation PostgreSQL checks a role's privileges on before a write
+/// through a view reads a row.
+enum Checked<'s> {
+    View(&'s View, Needs<usize>),
+    Table(&'s Table, Needs<&'s str>),
+}
+
+impl Checked<'_> {
+    /// PostgreSQL's `42501` message when `role` lacks what the write needs,
+    /// `acting` being the acting role.
+    fn refusal(
+        &self,
+        role: &Role,
+        acting: &Role,
+        schema: &ParserDB,
+        options: &TranslationContext<'_>,
+    ) -> Result<Option<String>, Error> {
+        Ok(match self {
+            Self::View(view, needs) => {
+                let held = view.privileges(role, schema)?;
+                (!needs.held_by(
+                    |position| held.insert.on_column(position),
+                    held.insert.on_any_column(),
+                    |position| held.update.on_column(position),
+                    held.delete,
+                ))
+                .then(|| format!("permission denied for view {}", view.stored_view_name()))
+            }
+            Self::Table(table, needs) => {
+                let held = if core::ptr::eq(role, acting) {
+                    RoleTable::acting(table, schema, options)?
+                } else {
+                    RoleTable::of(table, Some(role), schema)?
+                };
+                (!needs.held_by(
+                    |column| held.inserts(column),
+                    held.inserts_any(),
+                    |column| held.updates(column),
+                    held.deletes(),
+                ))
+                .then(|| permission_denied(table.table_name()))
+            }
+        })
+    }
+}
+
+/// PostgreSQL's `42501` message refusing `statement`, a write of the acting
+/// role naming a view, for a privilege lacking on the view or on a relation
+/// the write lands on through it, which PostgreSQL makes before reading a
+/// row. The acting role needs the privileges on the view, and each view's
+/// owner, or the role writing a `security_invoker` view, needs them on the
+/// relation that view writes. `None` where no acting role is named, where the
+/// statement names no view or one whose writes land past the replica, and
+/// where the rewrite refuses the write first.
+///
+/// # Errors
+///
+/// Returns the lookup errors resolving the views runs into.
+pub(crate) fn unheld_view_privilege(
+    statement: &Statement,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<Option<String>, Error> {
+    let Some((name, event)) = written_name(statement) else { return Ok(None) };
+    let Some(acting) = session_variable::acting_role(schema, options)? else { return Ok(None) };
+    let Some(view) = resolve_view(name, schema)? else { return Ok(None) };
+    if super::view_table::writes_past_replica(view, schema, options)? {
+        return Ok(None);
+    }
+    let Some(needs) = view_needs(statement, &output_names(view, schema)?) else {
+        return Ok(None);
+    };
+    // The rewrite refuses a view it cannot write through before any
+    // privilege is checked, so every level is reached before one is.
+    let mut checked = Vec::new();
+    let (mut current, mut needs, mut role) = (view, needs, Some(acting));
+    loop {
+        let relation = if instead_of_takes(current, event, schema, options) {
+            None
+        } else {
+            let Some(base) = current.updatable_base(schema)? else { return Ok(None) };
+            Some(base.relation)
+        };
+        let below = if current.is_security_invoker() {
+            role
+        } else {
+            current.owner(schema)?.and_then(|owner| schema.role(owner))
+        };
+        let next = match relation {
+            None => None,
+            Some(
+                WrittenRelation::Table { table, columns, .. }
+                | WrittenRelation::ForeignTable { table, columns, .. },
+            ) => {
+                let Some(written) = needs.through(|position| {
+                    columns.get(position).copied().flatten().map(ColumnLike::column_name)
+                }) else {
+                    return Ok(None);
+                };
+                Some(Checked::Table(table, written))
+            }
+            Some(WrittenRelation::View { view: inner, columns, .. }) => {
+                let Some(written) =
+                    needs.through(|position| columns.get(position).copied().flatten())
+                else {
+                    return Ok(None);
+                };
+                Some(Checked::View(inner, written))
+            }
+        };
+        if let Some(role) = role {
+            checked.push((role, Checked::View(current, needs)));
+        }
+        match next {
+            Some(Checked::View(inner, written)) => (current, needs, role) = (inner, written, below),
+            Some(table) => {
+                if let Some(below) = below {
+                    checked.push((below, table));
+                }
+                break;
+            }
+            None => break,
+        }
+    }
+    for (role, relation) in &checked {
+        if let Some(refusal) = relation.refusal(role, acting, schema, options)? {
+            return Ok(Some(refusal));
+        }
+    }
+    Ok(None)
+}
+
+/// The relation an `INSERT`, `UPDATE` or `DELETE` names as its target, with
+/// its command.
+fn written_name(statement: &Statement) -> Option<(&ObjectName, Event)> {
+    match statement {
+        Statement::Insert(Insert { table: TableObject::TableName(name), .. }) => {
+            Some((name, Event::Insert))
+        }
+        Statement::Update(update) if update.table.joins.is_empty() => {
+            let TableFactor::Table { name, .. } = &update.table.relation else { return None };
+            Some((name, Event::Update))
+        }
+        Statement::Delete(delete) => {
+            let (FromTable::WithFromKeyword(targets) | FromTable::WithoutKeyword(targets)) =
+                &delete.from;
+            let [target] = targets.as_slice() else { return None };
+            let TableFactor::Table { name, .. } = &target.relation else { return None };
+            Some((name, Event::Delete))
+        }
+        _ => None,
+    }
+}
+
+/// What `statement` needs on the view it writes, whose output columns are
+/// `names`, `None` when it names a column the view does not have or fills
+/// more than it has, which PostgreSQL refuses before any privilege.
+fn view_needs(statement: &Statement, names: &[Option<String>]) -> Option<Needs<usize>> {
+    let positions = |idents: &mut dyn Iterator<Item = &ObjectName>| -> Option<Vec<usize>> {
+        idents
+            .map(|name| {
+                last_ident(name).and_then(|ident| output_position(names, &stored_name(ident)))
+            })
+            .collect()
+    };
+    let assigned = |assignments: &[Assignment]| {
+        positions(&mut assignments.iter().flat_map(|assignment| {
+            match &assignment.target {
+                AssignmentTarget::ColumnName(name) => core::slice::from_ref(name),
+                AssignmentTarget::Tuple(names) => names.as_slice(),
+            }
+        }))
+    };
+    let mut needs =
+        Needs { insert: Vec::new(), insert_any: false, update: Vec::new(), delete: false };
+    match statement {
+        Statement::Insert(insert) => {
+            if insert.columns.is_empty() {
+                match insert.source.as_deref().map_or(Some(0), |source| row_width(&source.body)) {
+                    Some(width) if width > names.len() => return None,
+                    Some(width) if width > 0 => needs.insert = (0..width).collect(),
+                    _ => needs.insert_any = true,
+                }
+            } else {
+                needs.insert = positions(&mut insert.columns.iter())?;
+            }
+            if let Some(OnInsert::OnConflict(conflict)) = &insert.on
+                && let OnConflictAction::DoUpdate(update) = &conflict.action
+            {
+                needs.update = assigned(&update.assignments)?;
+            }
+        }
+        Statement::Update(update) => needs.update = assigned(&update.assignments)?,
+        Statement::Delete(_) => needs.delete = true,
+        _ => return None,
+    }
+    Some(needs)
+}
+
+/// The position among the output columns `names` of the one stored as
+/// `wanted`.
+fn output_position(names: &[Option<String>], wanted: &str) -> Option<usize> {
+    names.iter().position(|name| name.as_deref() == Some(wanted))
+}
+
+/// `ident` as PostgreSQL stores it, an unquoted one folded to lower case.
+fn stored_name(ident: &Ident) -> String {
+    if ident.quote_style.is_some() { ident.value.clone() } else { ident.value.to_ascii_lowercase() }
+}
+
 /// The relation PostgreSQL rewrites a write of `event` on `view` onto, when
 /// it rewrites one: no `INSTEAD OF` trigger takes the write and the view reads
 /// one relation it passes columns of through.
@@ -389,14 +643,8 @@ impl Landing<'_> {
     /// The column of the written relation the view column `ident` passes
     /// through, refusing one it computes or does not have.
     fn written(&self, ident: &Ident, view: &str, verb: &str) -> Result<Ident, Error> {
-        let wanted = if ident.quote_style.is_some() {
-            ident.value.clone()
-        } else {
-            ident.value.to_ascii_lowercase()
-        };
-        let Some(position) =
-            self.names.iter().position(|name| name.as_deref() == Some(wanted.as_str()))
-        else {
+        let wanted = stored_name(ident);
+        let Some(position) = output_position(&self.names, &wanted) else {
             return Err(Error::forward_refusal(format!(
                 "column {wanted} of view {view} does not exist, so the write cannot {verb} it."
             )));

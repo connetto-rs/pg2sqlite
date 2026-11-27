@@ -40,6 +40,7 @@ mod lateral;
 pub(crate) mod locking;
 mod nulls_not_distinct;
 pub(crate) mod off_replica;
+pub(crate) mod one_shot;
 mod order_by_expr;
 pub(crate) mod overlay;
 pub mod plpgsql;
