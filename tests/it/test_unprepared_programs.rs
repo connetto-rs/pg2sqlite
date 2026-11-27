@@ -428,7 +428,8 @@ fn a_starting_helper_with_multiple_statements_is_refused() {
 fn a_starting_helper_already_emitted_is_retained_once() {
     let source = Pg2Sqlite::default().sql(&walk_chain(0, 1)).expect("the source parses");
     let held = source.translate_to_sql(&options()).expect("the source translates");
-    assert_eq!(held.functions.len(), 1);
+    // The helper the policy calls, and `ids_0`, which `app` may call.
+    assert_eq!(held.functions.len(), 2);
     let translated = source
         .starting_functions(&held.functions)
         .expect("the starting helpers parse")

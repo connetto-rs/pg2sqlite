@@ -722,6 +722,9 @@ struct PreparedStatements<'a> {
     warnings: Vec<crate::warnings::TranslationWarning>,
     epochs: Vec<PreparedEpoch>,
     dispositions: Vec<crate::impls::transaction_blocks::Disposition>,
+    /// The functions the acting role may call, registered under their
+    /// PostgreSQL names.
+    client_functions: Vec<HelperFunction>,
 }
 
 /// Each statement's emitted statements, whether its triggers were rebuilt from
@@ -1887,7 +1890,7 @@ impl Pg2Sqlite {
             )
         });
         context.batch_cache().borrow_mut().forget();
-        let (mut translated, rebuilt_triggers, warnings) = units?;
+        let (mut translated, rebuilt_triggers, mut warnings) = units?;
         let held_views = crate::impls::translator_impls::held_views::hold_forward_views(
             statements,
             &mut translated,
@@ -1906,18 +1909,27 @@ impl Pg2Sqlite {
         let schema = schema?;
         let schemas = core::iter::once(&schema).chain(epochs.iter().map(|epoch| &*epoch.schema));
         let prelude = generated_prelude(&translated, schemas, &options, had_rls_tables, context)?;
+        let client_functions =
+            crate::impls::client_functions::client_functions(&schema, context, &mut |warning| {
+                warnings.push(warning);
+            })?;
 
         let names: Vec<String> = {
             let functions = context.helper_functions();
             let reached = crate::impls::helper_functions::called(
                 &functions,
-                prelude.iter().map(|(_, statement)| statement).chain(translated.iter().flatten()),
+                prelude
+                    .iter()
+                    .map(|(_, statement)| statement)
+                    .chain(translated.iter().flatten())
+                    .chain(client_functions.iter().map(|function| &function.body)),
             );
             functions
                 .iter()
                 .zip(reached)
                 .filter(|(_, reached)| *reached)
                 .map(|(function, _)| function.name.clone())
+                .chain(client_functions.iter().map(|function| function.name.clone()))
                 .collect()
         };
         reject_name_collisions(
@@ -1940,6 +1952,7 @@ impl Pg2Sqlite {
             warnings,
             epochs,
             dispositions,
+            client_functions,
         })
     }
 
@@ -2078,6 +2091,7 @@ impl Pg2Sqlite {
             mut warnings,
             epochs,
             dispositions,
+            client_functions,
         } = Self::translate_prepared(prepared, &mut context, |_| true)?;
         context
             .batch_cache()
@@ -2114,6 +2128,7 @@ impl Pg2Sqlite {
         drop(units);
         let functions = self.reached_functions(
             context.take_helper_functions(),
+            client_functions,
             prelude
                 .iter()
                 .chain(statements.iter().flatten())
@@ -2170,16 +2185,22 @@ impl Pg2Sqlite {
         Ok(PreparedTranslation { script, warnings })
     }
 
-    /// The helper functions of `translated` that `emitted` calls, and every
-    /// starting function, which a view or trigger the database holds may
-    /// call.
+    /// The helper functions of `translated` that `emitted` or a body of
+    /// `exposed` calls, then `exposed`, the functions a client calls by
+    /// their PostgreSQL names, and every starting function, which a view or
+    /// trigger the database holds may call, under a name none of the others
+    /// takes.
     fn reached_functions<'s>(
         &'s self,
         mut translated: Vec<HelperFunction>,
+        exposed: Vec<HelperFunction>,
         emitted: impl Iterator<Item = &'s Statement>,
     ) -> Vec<HelperFunction> {
-        let mut reached = crate::impls::helper_functions::called(&translated, emitted).into_iter();
-        translated.retain(|_| reached.next().unwrap_or(false));
+        use crate::impls::helper_functions::called;
+        let by_exposed = called(&translated, exposed.iter().map(|function| &function.body));
+        let mut reached = called(&translated, emitted).into_iter().zip(by_exposed);
+        translated.retain(|_| reached.next().is_some_and(|(emitted, exposed)| emitted || exposed));
+        translated.extend(exposed);
         for function in &self.starting_functions {
             if translated.iter().all(|kept| kept.name != function.name) {
                 translated.push(function.clone());

@@ -468,6 +468,34 @@ pub enum Error {
         /// The reserved trigger name that collides with an existing object.
         trigger_name: String,
     },
+    /// Error when the functions the acting role may call cannot each be
+    /// registered on the replica under its bare name.
+    #[error(
+        "The replica registers every function the acting role '{role}' may call under its bare \
+         name, and {source}. Revoke EXECUTE from '{role}' on the functions clients do not call, \
+         or give them names of their own."
+    )]
+    ClientFunctions {
+        /// The acting role.
+        role: String,
+        /// Why the functions cannot be listed by their bare names.
+        source: sql_traits::errors::CallableFunctionsError,
+    },
+    /// Error when a function the acting role may call does not translate as
+    /// a call, so the replica cannot register it under its name.
+    #[error(
+        "The acting role '{role}' may call {function}, which the replica registers under its \
+         bare name, and a call to it does not translate: {source} Revoke EXECUTE on it from \
+         '{role}' if clients do not call it."
+    )]
+    ClientFunctionUntranslatable {
+        /// The acting role.
+        role: String,
+        /// The function, schema-qualified with its argument types.
+        function: String,
+        /// Why the call does not translate.
+        source: Box<Error>,
+    },
     /// PostgreSQL refuses the statement with `sqlstate` and `message`, read
     /// through [`Error::postgres_error`].
     #[error("{message}")]

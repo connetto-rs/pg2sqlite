@@ -44,6 +44,7 @@ pub(crate) fn cast_source_kind(
             invert_zone(cast_source_kind(timestamp, schema, options)?)
         }
         Expr::Function(function) => nullary_kind(function),
+        Expr::Value(value) => options.parameter_type(&value.value).and_then(temporal_literal_kind),
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
             declared_in_scope(
                 expr,

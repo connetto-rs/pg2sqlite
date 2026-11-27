@@ -138,6 +138,9 @@ pub(crate) fn timestamp_awareness(
         {
             Some(TimestampAwareness::Aware)
         }
+        Expr::Value(value) if options.parameter_type(&value.value).is_some() => {
+            options.parameter_type(&value.value).and_then(from_data_type)
+        }
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
             declared_in_scope(
                 expr,
