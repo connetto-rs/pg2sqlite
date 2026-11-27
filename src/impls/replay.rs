@@ -49,6 +49,16 @@ const VOLATILE: &[&str] = &[
     "uuidv7",
 ];
 
+/// Whether a built-in or configured function can change between calls.
+pub(crate) fn is_volatile_call(name: &str, options: &TranslationContext<'_>) -> bool {
+    VOLATILE.binary_search(&name).is_ok()
+        || name.eq_ignore_ascii_case(options.get_uuid_function_name())
+        || options
+            .get_uuid_v7_function_name()
+            .is_some_and(|name_v7| name.eq_ignore_ascii_case(name_v7))
+        || options.declares_user_defined_function(name)
+}
+
 /// True when evaluating `expr` a second time must answer what the first
 /// evaluation answered.
 ///
@@ -122,24 +132,10 @@ impl ReplayCheck<'_, '_> {
         if session || session_variable::mapping_for_function(&name, self.options).is_some() {
             return true;
         }
-        if VOLATILE.binary_search(&name.as_str()).is_ok() {
-            return false;
-        }
-        if self.uuid_names().iter().any(|uuid| uuid.eq_ignore_ascii_case(&name)) {
+        if is_volatile_call(&name, self.options) {
             return false;
         }
         classify(&name).is_known()
-    }
-
-    /// The UUID function names this translation emits, which a caller names
-    /// through the options and which answer a fresh value per call.
-    fn uuid_names(&self) -> Vec<String> {
-        let mut names = Vec::with_capacity(2);
-        names.push(String::from(self.options.get_uuid_function_name()));
-        if let Some(v7) = self.options.get_uuid_v7_function_name() {
-            names.push(String::from(v7));
-        }
-        names
     }
 }
 

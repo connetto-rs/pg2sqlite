@@ -478,7 +478,9 @@ impl PlPgSqlTranslator {
     ) -> Result<BoundValue, Error> {
         let returned = callee.bindings().find(|binding| binding.name == RESULT);
         match returned.map(|binding| &binding.value) {
-            Some(BoundValue::Expr(value)) if Self::depends_on_generated(value, callee) => {
+            Some(BoundValue::Expr(value))
+                if Self::depends_on_generated(value, callee, schema, options)? =>
+            {
                 let variables = callee.variables();
                 let expression = Self::translate_condition(
                     value,
@@ -517,7 +519,7 @@ impl PlPgSqlTranslator {
                 ));
             };
             let written = sql_helper::inlined_calls(&written, schema, options)?;
-            let value = if Self::depends_on_generated(&written, scope) {
+            let value = if Self::depends_on_generated(&written, scope, schema, options)? {
                 let (reference, capture) = Self::capture_value(
                     written,
                     Some(data_type.clone()),

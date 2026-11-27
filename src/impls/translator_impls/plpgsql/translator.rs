@@ -6,7 +6,7 @@ use core::ops::ControlFlow;
 
 use sql_traits::{
     structs::ParserDB,
-    traits::{DatabaseLike, TableLike},
+    traits::{DatabaseLike, FunctionLike, TableLike},
     utils::normalize_sqlparser_type,
 };
 use sqlparser::ast::{
@@ -826,8 +826,15 @@ impl PlPgSqlTranslator {
                  body cannot check",
             ));
         }
+        let volatile = invokes_volatile(&query, schema, options)?;
         let mut statements = Self::inline_selected_calls(&mut query, scope, schema, options, emit)?;
-        let generated = Self::depends_on_generated(&Expr::Subquery(Box::new(query.clone())), scope);
+        let generated = volatile
+            || Self::depends_on_generated(
+                &Expr::Subquery(Box::new(query.clone())),
+                scope,
+                schema,
+                options,
+            )?;
         let SetExpr::Select(select) = query.body.as_mut() else {
             return Err(refusal("reads a set operation, where only a plain SELECT binds"));
         };
@@ -1380,9 +1387,10 @@ impl PlPgSqlTranslator {
         if let Some(row) = Self::row_value(&value, scope) {
             return Ok((BoundValue::Row(row), Vec::new()));
         }
+        let volatile = invokes_volatile(&value, schema, options)?;
         let mut value = Self::prepare(value, scope, schema, options)?;
         let mut statements = Self::inline_helper_calls(&mut value, scope, schema, options, emit)?;
-        if Self::depends_on_generated(&value, scope) {
+        if volatile || Self::depends_on_generated(&value, scope, schema, options)? {
             let data_type = assigned.and_then(|name| scope.declared_type(name)).cloned();
             let (reference, capture) =
                 Self::capture_value(value, data_type, scope, schema, options, emit)?;
@@ -1393,9 +1401,14 @@ impl PlPgSqlTranslator {
     }
 
     /// Whether an expression depends on a generated assignment.
-    pub(super) fn depends_on_generated(value: &Expr, scope: &BodyScope) -> bool {
-        if generates_uuid(value) {
-            return true;
+    pub(super) fn depends_on_generated(
+        value: &Expr,
+        scope: &BodyScope,
+        schema: &ParserDB,
+        options: &crate::options::TranslationContext<'_>,
+    ) -> Result<bool, Error> {
+        if invokes_volatile(value, schema, options)? {
+            return Ok(true);
         }
         let bindings: Vec<_> = scope.bindings().cloned().collect();
         let mut generated = BTreeSet::new();
@@ -1403,7 +1416,7 @@ impl PlPgSqlTranslator {
             let depends = match &binding.value {
                 BoundValue::Stored { .. } => true,
                 BoundValue::Expr(expression) => {
-                    generates_uuid(expression)
+                    invokes_volatile(expression, schema, options)?
                         || generated.iter().any(|name: &&str| references_variable(expression, name))
                 }
                 BoundValue::Unreadable(_) | BoundValue::Row(_) => false,
@@ -1412,7 +1425,7 @@ impl PlPgSqlTranslator {
                 generated.insert(binding.name.as_str());
             }
         }
-        generated.iter().any(|name| references_variable(value, name))
+        Ok(generated.iter().any(|name| references_variable(value, name)))
     }
 
     /// Captures a generated expression under an immutable invocation slot.
@@ -1588,7 +1601,7 @@ impl PlPgSqlTranslator {
         let mut captures = Vec::new();
         while let Some((column, data_type, raw, guard)) = body.next()? {
             let raw = normalize(raw)?;
-            if !Self::depends_on_generated(&raw, scope) {
+            if !Self::depends_on_generated(&raw, scope, schema, options)? {
                 continue;
             }
             let guard = normalize(guard)?;
@@ -3232,17 +3245,50 @@ fn schema_function_call(query: &Query, schema: &ParserDB) -> Option<String> {
     found
 }
 
-/// Whether `expr` calls a function that generates a UUID.
-fn generates_uuid(expr: &Expr) -> bool {
-    visit_expressions(expr, |inner| {
-        if let Expr::Function(function) = inner
-            && is_uuid_generator(function)
+/// Whether an expression calls a volatile function.
+fn invokes_volatile<Node: Visit>(
+    node: &Node,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<bool, Error> {
+    match visit_expressions(node, |inner| {
+        let Expr::Function(function) = inner else {
+            return ControlFlow::Continue(());
+        };
+        let helper = match crate::impls::translator_impls::sql_helper::declared_helper(
+            &function.name,
+            schema,
+            options,
+        ) {
+            Ok(helper) => helper,
+            Err(error) => return ControlFlow::Break(Err(error)),
+        };
+        let volatile = helper.map_or_else(
+            || {
+                function_name(function)
+                    .is_some_and(|name| crate::impls::replay::is_volatile_call(&name, options))
+            },
+            |helper| helper.volatility() == sqlparser::ast::FunctionBehavior::Volatile,
+        );
+        if !volatile
+            && helper.is_some_and(|helper| helper.stored_language().as_deref() == Some("sql"))
         {
-            return ControlFlow::Break(());
+            let expanded = match crate::impls::translator_impls::sql_helper::inlined_calls(
+                inner, schema, options,
+            ) {
+                Ok(expanded) => expanded,
+                Err(error) => return ControlFlow::Break(Err(error)),
+            };
+            match invokes_volatile(&expanded, schema, options) {
+                Ok(false) => {}
+                result => return ControlFlow::Break(result),
+            }
         }
-        ControlFlow::Continue(())
-    })
-    .is_break()
+        if volatile { ControlFlow::Break(Ok(true)) } else { ControlFlow::Continue(()) }
+    }) {
+        ControlFlow::Break(result) => result,
+        ControlFlow::Continue(()) => Ok(false),
+    }
 }
 
 /// Recognizes the source UUID generators by their unqualified names.
