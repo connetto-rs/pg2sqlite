@@ -14,7 +14,7 @@ categories = ["database", "no-std"]
 
 [dependencies]
 # Reads, prints and compares jsonb the way PostgreSQL 18 does.
-sql-values = { version = "0.6", default-features = false }
+sql-values = { version = "0.7", default-features = false }
 # Derives `Arbitrary` on both function sets for pg2sqlite's fuzz harnesses.
 arbitrary = { version = "1", features = ["derive"], optional = true }
 
