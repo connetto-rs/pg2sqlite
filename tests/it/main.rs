@@ -328,6 +328,7 @@ mod test_semantic_differences_readme;
 mod test_semantic_divergence;
 mod test_serial_columns;
 mod test_server_derived_writes;
+mod test_server_filled_constraints;
 mod test_session_variable_queries;
 mod test_set_expr_edge_cases;
 mod test_set_operations;

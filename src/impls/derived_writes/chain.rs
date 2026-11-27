@@ -13,7 +13,7 @@ use sqlparser::ast::{
 };
 use sqlparser_plpgsql::embedded::{
     self, Block, Branch, DeclarationKind, Loop, LoopControl, Node, NodeKind, Open, RaiseLevel,
-    ReturnQuery,
+    ReturnQuery, Target,
 };
 
 use super::{
@@ -64,6 +64,9 @@ pub(super) struct Chain {
     pub(super) old: Columns,
     /// The fields of `NEW` read as [`Self::old`] holds those of `OLD`.
     pub(super) new: Columns,
+    /// The fields of `NEW` the trigger's own function assigns, the whole row
+    /// where it assigns the record.
+    pub(super) assigned: Columns,
 }
 
 /// Reads a trigger function's call chain.
@@ -225,6 +228,10 @@ impl<'s, 'o, 'c> Walker<'s, 'o, 'c> {
     }
 
     fn node(&mut self, node: &Node) -> Result<(), Error> {
+        if self.functions.len() == 1 {
+            let assigned = &mut self.chain.assigned;
+            each_target(&node.kind, |target| record_assignment(target, assigned));
+        }
         match &node.kind {
             NodeKind::Statement { statement, into } => {
                 self.kept(statement.as_ref(), into.is_some() || returns_rows(statement))?;
@@ -464,6 +471,33 @@ impl RecordReads<'_> {
     /// Records the read of `record.*`.
     fn wildcard(&mut self, record: &ObjectName) {
         self.read(record.0.iter().map(ObjectNamePart::as_ident));
+    }
+}
+
+/// Calls `visit` on each variable `node` assigns itself, leaving out those
+/// of the statements it holds. Only the forms a trigger body translates are
+/// read, since a trigger function holding any other is refused.
+fn each_target<'n>(node: &'n NodeKind, mut visit: impl FnMut(&'n Target)) {
+    match node {
+        NodeKind::Statement { into: Some(into), .. } => into.targets.iter().for_each(visit),
+        NodeKind::Assignment(assignment) => visit(&assignment.target),
+        NodeKind::Loop(Loop { control: LoopControl::Query { targets, .. }, .. }) => {
+            targets.iter().for_each(visit);
+        }
+        _ => {}
+    }
+}
+
+/// Adds the field of `NEW` `target` assigns to `assigned`, folded, the whole
+/// row where it assigns the record.
+fn record_assignment(target: &Target, assigned: &mut Columns) {
+    let mut parts = target.name.0.iter().map(ObjectNamePart::as_ident);
+    if !parts.next().flatten().is_some_and(|record| names_record(record, "new")) {
+        return;
+    }
+    match parts.next().flatten() {
+        Some(field) => assigned.insert(fold(field)),
+        None => *assigned = Columns::Row,
     }
 }
 

@@ -551,8 +551,10 @@ fn build_create_table_statements(
     let table_scope =
         crate::options::table_column_scope(resolve_declared_table(written, create_table)?, written);
     let scoped = table_scope.as_ref().map(|scope| options.with_scope(scope));
+    let server_checked =
+        super::server_filled::split(create_table, (schema, written), options, emit)?;
     let (checked_table, clock_checks) =
-        split_clock_checks(create_table, written, scoped.as_ref().unwrap_or(options), emit)?;
+        split_clock_checks(&server_checked, written, scoped.as_ref().unwrap_or(options), emit)?;
     let translated_table = checked_table.translate_with_warnings(schema, options, emit)?;
     let emitted_table = match rls_statements {
         Some(_) => rename_table_for_rls(&translated_table, options, schema),
