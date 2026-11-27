@@ -286,7 +286,13 @@ fn helper_query(
                 &arguments,
                 deployment,
                 schema,
-                &[ArmCondition::Exclusion, ArmCondition::UnsetSetting, ArmCondition::EdgeCondition],
+                &[
+                    ArmCondition::Exclusion,
+                    ArmCondition::UnsetSetting,
+                    ArmCondition::EdgeCondition,
+                    ArmCondition::ParentCondition,
+                    ArmCondition::Cap,
+                ],
             )
         })
         .map_err(|error| untranslatable(name, &error))?;
@@ -596,7 +602,7 @@ impl<'db> Lowering<'_, 'db> {
             }
             match arm {
                 HelperArm::Grant(grant) => arms.push(self.grant(grant, arm_names)?),
-                HelperArm::Parent(parent) => arms.push(self.parent(parent, arm_names)),
+                HelperArm::Parent(parent) => arms.push(self.parent(parent, arm_names)?),
                 HelperArm::Called(called) => arms.push(self.called(called, arm_names)),
                 HelperArm::Walk(walk) => edges.push(self.edge(walk)?),
             }
@@ -839,6 +845,9 @@ impl<'db> Lowering<'_, 'db> {
         for exclusion in walk.exclusions() {
             conditions.push(self.exclusion(exclusion)?);
         }
+        for cap in walk.caps() {
+            conditions.push(self.cap(cap));
+        }
         Ok(SetExpr::Select(Box::new(make_simple_select(
             numbered_columns(next, NEXT).chain(numbered_columns(previous, PREVIOUS)).collect(),
             from_relation(aliased_table(walk.table(), ARM)),
@@ -846,15 +855,30 @@ impl<'db> Lowering<'_, 'db> {
         ))))
     }
 
-    /// `SELECT <key> FROM <table> WHERE <column> IN (<parents>)`.
-    fn parent(&mut self, parent: &ParentArm<'db, ParserDB>, names: &[Ident]) -> SetExpr {
+    /// `SELECT <key> FROM <table> WHERE <column> IN (<parents>) [AND
+    /// <conditions>]`.
+    fn parent(
+        &mut self,
+        parent: &ParentArm<'db, ParserDB>,
+        names: &[Ident],
+    ) -> Result<SetExpr, Error> {
         self.read.push(parent.table());
         let parents = self.called_set(parent.function(), parent.arguments());
-        SetExpr::Select(Box::new(make_simple_select(
+        let mut conditions =
+            vec![in_query(qualified(ARM, declared_column_ident(parent.column())), parents)];
+        conditions.extend(restrictions(ARM, parent.restrictions()));
+        conditions.extend(time_bounds(ARM, parent.time_bounds()));
+        for exclusion in parent.exclusions() {
+            conditions.push(self.exclusion(exclusion)?);
+        }
+        for cap in parent.caps() {
+            conditions.push(self.cap(cap));
+        }
+        Ok(SetExpr::Select(Box::new(make_simple_select(
             projection([qualified(ARM, declared_column_ident(parent.key()))], names),
             from_relation(aliased_table(parent.table(), ARM)),
-            Some(in_query(qualified(ARM, declared_column_ident(parent.column())), parents)),
-        )))
+            conjunction(conditions),
+        ))))
     }
 
     /// The arms reading `membership`'s set through each of `columns` as one.
@@ -1098,18 +1122,24 @@ struct Membership<'a, 'db> {
 }
 
 impl<'a, 'db> Membership<'a, 'db> {
-    /// `arm` as a membership, a parent arm or a grant arm whose one
-    /// condition is its grantee set or a cap on one of its columns, or `None`
-    /// for any other arm.
+    /// `arm` as a membership, a parent arm keeping rows on nothing else or a
+    /// grant arm whose one condition is its grantee set or a cap on one of
+    /// its columns, or `None` for any other arm.
     fn of(arm: &'a HelperArm<'db, ParserDB>) -> Option<Self> {
         match arm {
             HelperArm::Parent(parent) => {
-                Some(Self {
-                    table: parent.table(),
-                    key: parent.key(),
-                    column: parent.column(),
-                    function: parent.function(),
-                    arguments: parent.arguments(),
+                let unconditioned = parent.restrictions().is_empty()
+                    && parent.time_bounds().is_empty()
+                    && parent.exclusions().is_empty()
+                    && parent.caps().is_empty();
+                unconditioned.then(|| {
+                    Self {
+                        table: parent.table(),
+                        key: parent.key(),
+                        column: parent.column(),
+                        function: parent.function(),
+                        arguments: parent.arguments(),
+                    }
                 })
             }
             HelperArm::Grant(grant) => {
