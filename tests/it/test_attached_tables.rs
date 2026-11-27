@@ -902,3 +902,136 @@ fn an_added_column_reaches_a_new_connection_with_the_earlier_temp_objects() {
         memos::table.select(memos::extra).load(&mut bob).expect("read the added column");
     assert!(extras.is_empty(), "{extras:?}");
 }
+
+/// `ITEMS` with the view's update granted on one column alone.
+const COLUMN_GRANTED_ITEMS: &str = "
+    CREATE ROLE app;
+    CREATE TABLE items (id INT PRIMARY KEY, parent_id INT);
+    GRANT SELECT, UPDATE (parent_id) ON items TO app;
+    CREATE VIEW item_view AS SELECT id, parent_id FROM items;
+    GRANT SELECT, UPDATE (parent_id) ON item_view TO app;
+";
+
+/// The files `label` after `migration` over `earlier` and `seed`, run past
+/// the write guards, and a new connection running the migration's connection
+/// program alone.
+fn connected_after(
+    label: &str,
+    earlier: &str,
+    migration: &str,
+    seed: &str,
+) -> (Files, SqliteConnection) {
+    let (files, migration) = migrate(label, earlier, migration, &items_options());
+    set_write_exempt(true);
+    files.connect("alice").batch_execute(seed).expect("seed");
+    set_write_exempt(false);
+    let mut bob = files.connect("bob");
+    run(&mut bob, migration.connect().expect("the migration's connection program"));
+    (files, bob)
+}
+
+/// An update a migration revokes on an earlier `temp` view, granted on the
+/// view or on one of its columns, is refused on a new connection.
+#[test]
+fn a_revoked_view_update_is_refused_on_a_new_connection() {
+    for (index, earlier) in [ITEMS, COLUMN_GRANTED_ITEMS].into_iter().enumerate() {
+        let (_files, mut bob) = connected_after(
+            &format!("revoked-view-update-{index}"),
+            earlier,
+            "REVOKE UPDATE ON item_view FROM app;",
+            "INSERT INTO items (id) VALUES (1)",
+        );
+        let error = diesel::sql_query("UPDATE item_view SET parent_id = 5 WHERE id = 1")
+            .execute(&mut bob)
+            .expect_err("the revoked update");
+        assert!(error.to_string().contains("42501"), "{earlier}: {error}");
+    }
+}
+
+/// A delete a migration grants on an earlier `temp` view runs on a new
+/// connection.
+#[test]
+fn a_granted_view_delete_runs_on_a_new_connection() {
+    diesel::table! {
+        items (id) {
+            id -> Integer,
+        }
+    }
+    let (_files, mut bob) = connected_after(
+        "granted-view-delete",
+        ITEMS,
+        "GRANT DELETE ON item_view TO app;",
+        "INSERT INTO items (id) VALUES (1)",
+    );
+    diesel::sql_query("DELETE FROM item_view WHERE id = 1")
+        .execute(&mut bob)
+        .expect("the granted delete");
+    let left: Vec<i32> = items::table.select(items::id).load(&mut bob).expect("read items");
+    assert!(left.is_empty(), "{left:?}");
+}
+
+/// A policy a migration adds to a table whose earlier policy reads an
+/// attached table shows its rows on a new connection.
+#[test]
+fn an_added_policy_shows_its_rows_on_a_new_connection() {
+    diesel::table! {
+        memos (id) {
+            id -> Integer,
+        }
+    }
+    let (_files, mut bob) = connected_after(
+        "added-policy",
+        &memos(),
+        "CREATE POLICY everyone ON memos FOR SELECT USING (true);",
+        "INSERT INTO memos_rls (id, body) VALUES (7, 'unlisted')",
+    );
+    let visible: Vec<i32> = memos::table.select(memos::id).load(&mut bob).expect("read memos");
+    assert_eq!(visible, [7]);
+}
+
+/// An earlier `temp` view over a column a migration renames keeps reading it
+/// under the view's own column name on a new connection.
+#[test]
+fn a_renamed_column_under_an_earlier_view_reaches_a_new_connection() {
+    diesel::table! {
+        item_view (id) {
+            id -> Integer,
+        }
+    }
+    let (_files, mut bob) = connected_after(
+        "renamed-under-view",
+        ITEMS,
+        "ALTER TABLE items RENAME COLUMN id TO item_id;",
+        "INSERT INTO items (item_id) VALUES (1)",
+    );
+    let ids: Vec<i32> = item_view::table.select(item_view::id).load(&mut bob).expect("read the view");
+    assert_eq!(ids, [1]);
+}
+
+/// An earlier table's write guards let through a write a view a migration
+/// adds runs as its undeclared owner.
+#[test]
+fn a_later_view_writes_past_the_earlier_guards_on_a_new_connection() {
+    diesel::table! {
+        items (id) {
+            id -> Integer,
+            shown -> Bool,
+        }
+    }
+    let earlier = "
+        CREATE ROLE app;
+        CREATE TABLE items (id INT PRIMARY KEY, parent_id INT, shown BOOLEAN NOT NULL DEFAULT true);
+        GRANT SELECT, UPDATE (parent_id) ON items TO app;";
+    let (_files, mut bob) = connected_after(
+        "later-view-owner",
+        earlier,
+        "CREATE VIEW shown_items AS SELECT id, shown FROM items;
+         GRANT SELECT, UPDATE ON shown_items TO app;",
+        "INSERT INTO items (id) VALUES (1)",
+    );
+    diesel::sql_query("UPDATE shown_items SET shown = false WHERE id = 1")
+        .execute(&mut bob)
+        .expect("the update runs as the view's owner");
+    let shown: Vec<bool> = items::table.select(items::shown).load(&mut bob).expect("read items");
+    assert_eq!(shown, [false]);
+}

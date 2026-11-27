@@ -566,6 +566,75 @@ fn land<T>(
     written
 }
 
+/// The files `label` after alice applies `earlier`, writes `seed`, and
+/// applies `migration` translated against `earlier`, with a new connection on
+/// her main file running the migration's connection program alone.
+fn migrated(
+    label: &str,
+    (earlier, migration): (&str, &str),
+    options: &Pg2SqliteOptions,
+    seed: impl FnOnce(&mut SqliteConnection),
+) -> (Files, SqliteConnection) {
+    let schema = Pg2Sqlite::default().sql(earlier).expect("parse").build_schema().expect("schema");
+    let migration = Pg2Sqlite::default()
+        .sql(migration)
+        .expect("parse")
+        .translate_to_sql_with_schema(&schema, options)
+        .expect("translate the migration");
+    let script = translate(earlier, options).expect("translate");
+    let files = Files::new(label);
+    let mut alice = files.open(&files.alice, &script);
+    run(&mut alice, script.initialize(FreshFiles::Both).expect("initialize both"));
+    seed(&mut alice);
+    run(&mut alice, migration.initialize(FreshFiles::Both).expect("initialize the migration"));
+    let mut carol = files.open(&files.alice, &migration);
+    run(&mut carol, migration.connect().expect("the migration's connection program"));
+    (files, carol)
+}
+
+/// The triggers of an overlaid table stamp and log a derived insert on a new
+/// connection running a later migration's connection program alone, without
+/// the trigger that migration drops.
+#[test]
+fn the_earlier_triggers_run_on_overlay_writes_after_a_migration() {
+    for (index, migration, stamp) in [
+        (0, "CREATE TABLE unrelated (id INT);", Some("stamped")),
+        (1, "DROP TRIGGER notes_stamp ON notes;", None),
+    ] {
+        let (_files, mut carol) =
+            migrated(&format!("migrated-notes-{index}"), (NOTES, migration), &options(), |_| {});
+        derive(&mut carol, 5);
+        assert_eq!(visible(&mut carol), [note(105, "derived", stamp)], "{migration}");
+        let log: Vec<(i32, String)> = note_log::table
+            .select((note_log::note_id, note_log::event))
+            .load(&mut carol)
+            .expect("read the log");
+        assert_eq!(log, [(105, "insert".to_owned())], "{migration}");
+    }
+}
+
+/// A table whose last `SELECT` policy a migration drops shows no row on a new
+/// connection.
+#[test]
+fn a_dropped_last_read_policy_hides_every_row_after_a_migration() {
+    let options = Pg2SqliteOptions::default()
+        .with_server_derived_write_function("derived")
+        .with_attached_tables("shared", ["documents"])
+        .with_rls_audit_table_name("_rls_audit");
+    let (_files, mut carol) = migrated(
+        "dropped-read-policy",
+        (DOCUMENTS, "DROP POLICY documents_read ON documents;"),
+        &options,
+        |alice| {
+            diesel::insert_into(documents::table)
+                .values((documents::id.eq(1), documents::title.eq("seed"), documents::body.eq("seed")))
+                .execute(alice)
+                .expect("seed documents");
+        },
+    );
+    assert_eq!(documents_seen(&mut carol), []);
+}
+
 #[test]
 fn a_landed_update_writes_the_shared_row_its_policy_judges() {
     let (_files, mut alice, mut bob) = drafted("landed-update");

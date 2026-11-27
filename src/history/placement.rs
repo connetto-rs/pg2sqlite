@@ -12,9 +12,9 @@ use sql_traits::{
     traits::{DatabaseLike, TableLike, ViewLike},
 };
 use sqlparser::ast::{
-    AlterTableOperation, ColumnOption, CreateTable, CreateTrigger, FromTable, ObjectName,
-    ObjectNamePart, ObjectType, RenameTableNameKind, SetExpr, Statement, TableConstraint,
-    TableFactor, TableObject, Visit, visit_statements_mut,
+    AlterTableOperation, ColumnOption, CreateTable, CreateTrigger, FromTable, Grant, GrantObjects,
+    ObjectName, ObjectNamePart, ObjectType, RenameTableNameKind, Revoke, SetExpr, Statement,
+    TableConstraint, TableFactor, TableObject, Visit, visit_statements_mut,
 };
 
 #[cfg(not(feature = "std"))]
@@ -257,56 +257,54 @@ fn layout(
     Ok((homes, logical_storage))
 }
 
-/// The `temp` objects the translations that built `earlier` left on a
-/// connection, rebuilt from the creation of each persistent table, view and
-/// trigger `earlier` holds and placed where those translations put them.
+/// The `temp` statements that recreate, on a new connection, the connection
+/// objects of every persistent table, view and trigger `schema` holds once
+/// `sources`, the committed statements of the batch, have run, `None` without
+/// attached tables, where no such object lives in `temp`.
 ///
-/// Each creation comes with its `temp` statements. Tables come first, then
-/// views, then triggers, so each object exists before a trigger on it, and a
-/// SQLite trigger several PostgreSQL triggers share is created once.
-pub(crate) fn earlier_connection(
-    earlier: &ParserDB,
-    options: &Pg2SqliteOptions,
-) -> Result<Vec<(Statement, Vec<Statement>)>, Error> {
-    let Some(attached) = options.get_attached_tables() else { return Ok(Vec::new()) };
-    let mut sources = Vec::new();
-    for table in earlier.tables().filter(|table| !table.temporary) {
-        sources.push(Statement::CreateTable(as_declared(table, earlier)?));
+/// The creations translate as one batch declaring them would, against
+/// `schema` and in `context`, so each object takes the grants, policies,
+/// owners and sibling triggers `schema` gives it. Tables come first, then
+/// views, then triggers, so each object exists before a trigger on it. A
+/// trigger on a `TEMP` relation is left to the batch that created it.
+pub(crate) fn final_connection(
+    schema: &ParserDB,
+    sources: &[&Statement],
+    context: &TranslationContext<'_>,
+) -> Result<Option<Vec<Statement>>, Error> {
+    let Some(attached) = context.get_attached_tables() else { return Ok(None) };
+    let temporary = temporary_relations(schema, sources.iter().copied());
+    let mut creations = Vec::new();
+    for table in schema.tables().filter(|table| !table.temporary) {
+        creations.push(Statement::CreateTable(as_declared(table, schema)?));
     }
-    sources.extend(earlier.views().filter(|view| !view.is_temporary()).map(creation));
-    sources.extend(earlier.triggers().map(|trigger| Statement::CreateTrigger(trigger.clone())));
-    let context = TranslationContext::new(options);
-    let context = context.with_written_schema(earlier);
-    let translated = sources
-        .iter()
-        .map(|source| source.translate_with_warnings(earlier, &context, &mut |_| {}))
-        .collect::<Result<Vec<_>, _>>()?;
+    creations.extend(schema.views().filter(|view| !view.is_temporary()).map(creation));
+    creations.extend(
+        final_triggers(schema, sources)
+            .into_iter()
+            .filter(|trigger| !temporary.contains(&folded(&trigger.table_name)))
+            .map(Statement::CreateTrigger),
+    );
+    let translated = crate::pg2sqlite::translate_creations(&creations, schema, context)?;
     let units: Vec<(&Statement, &[Statement])> =
-        sources.iter().zip(translated.iter().map(Vec::as_slice)).collect();
-    let (homes, logical_storage) = layout(&units, earlier, options)?;
+        creations.iter().zip(translated.iter().map(Vec::as_slice)).collect();
+    let (homes, logical_storage) = layout(&units, schema, context)?;
     drop(units);
     let mut trigger_homes = Homes::new();
-    let mut triggers = BTreeSet::new();
-    let mut connection = Vec::with_capacity(sources.len());
-    for (source, statements) in sources.into_iter().zip(translated) {
-        let mut local = Vec::new();
-        for mut statement in statements {
-            let placement = place_statement(
-                &mut statement,
-                attached.schema(),
-                &homes,
-                &logical_storage,
-                &mut trigger_homes,
-            )?;
-            let repeated = matches!(&statement, Statement::CreateTrigger(trigger)
-                if !triggers.insert(key_of(&trigger.name)));
-            if placement == Placement::Temp && !repeated {
-                local.push(statement);
-            }
+    let mut connection = Vec::new();
+    for mut statement in translated.into_iter().flatten() {
+        let placement = place_statement(
+            &mut statement,
+            attached.schema(),
+            &homes,
+            &logical_storage,
+            &mut trigger_homes,
+        )?;
+        if placement == Placement::Temp {
+            connection.push(statement);
         }
-        connection.push((source, local));
     }
-    Ok(connection)
+    Ok(Some(connection))
 }
 
 /// The translations of the views and the tables a view stands for that
@@ -390,6 +388,128 @@ fn add_changed_names(statement: &Statement, names: &mut BTreeSet<String>) {
         }
         _ => {}
     }
+}
+
+/// The folded names of the `TEMP` relations `schema` holds or `sources`
+/// create, and of the indexes `sources` create on them.
+pub(crate) fn temporary_relations<'s>(
+    schema: &ParserDB,
+    sources: impl IntoIterator<Item = &'s Statement>,
+) -> BTreeSet<String> {
+    let mut names: BTreeSet<String> = schema
+        .tables()
+        .filter(|table| table.temporary)
+        .map(|table| key(table.table_name()))
+        .chain(schema.views().filter(|view| view.is_temporary()).map(|view| key(view.view_name())))
+        .collect();
+    for statement in sources {
+        match statement {
+            Statement::CreateTable(create) if create.temporary || in_pg_temp(&create.name) => {
+                names.insert(folded(&create.name));
+            }
+            Statement::CreateView(view) if view.temporary || in_pg_temp(&view.name) => {
+                names.insert(folded(&view.name));
+            }
+            Statement::CreateIndex(index) if names.contains(&folded(&index.table_name)) => {
+                names.extend(index.name.as_ref().map(folded));
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// The triggers `schema` holds and those `sources` create, less those a later
+/// statement of `sources` drops or takes with its relation, each on the name
+/// its relation has once `sources` have run. The translation schema holds
+/// none of the batch's own triggers.
+fn final_triggers(schema: &ParserDB, sources: &[&Statement]) -> Vec<CreateTrigger> {
+    let same = |left: &ObjectName, right: &ObjectName| folded(left) == folded(right);
+    let mut triggers: Vec<CreateTrigger> = schema.triggers().cloned().collect();
+    for statement in sources {
+        match statement {
+            Statement::CreateTrigger(create) => {
+                triggers.retain(|kept| {
+                    !same(&kept.name, &create.name) || !same(&kept.table_name, &create.table_name)
+                });
+                triggers.push(create.clone());
+            }
+            Statement::DropTrigger(drop) => {
+                triggers.retain(|kept| {
+                    !same(&kept.name, &drop.trigger_name)
+                        || drop.table_name.as_ref().is_some_and(|table| !same(&kept.table_name, table))
+                });
+            }
+            Statement::Drop { object_type: ObjectType::Table | ObjectType::View, names, .. } => {
+                triggers.retain(|kept| !names.iter().any(|name| same(&kept.table_name, name)));
+            }
+            Statement::AlterTable(alter) => {
+                for operation in &alter.operations {
+                    if let AlterTableOperation::RenameTable {
+                        table_name: RenameTableNameKind::As(to) | RenameTableNameKind::To(to),
+                    } = operation
+                    {
+                        for kept in &mut triggers {
+                            if same(&kept.table_name, &alter.name) {
+                                kept.table_name = to.clone();
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    triggers
+}
+
+/// The SQLite-folded last part of `name`.
+fn folded(name: &ObjectName) -> String {
+    key(&last_ident_value_or_display(name))
+}
+
+/// Whether `name` is qualified by PostgreSQL's `pg_temp` schema.
+fn in_pg_temp(name: &ObjectName) -> bool {
+    name.0.len() > 1
+        && name.0[0].as_ident().is_some_and(|schema| schema.value.eq_ignore_ascii_case("pg_temp"))
+}
+
+/// Whether `statement` changes relations of `relations` alone, creating,
+/// dropping or altering them or a trigger, index, policy or grant on them,
+/// or reads and writes rows without changing any relation.
+pub(crate) fn changes_only(statement: &Statement, relations: &BTreeSet<String>) -> bool {
+    let mut changed = BTreeSet::new();
+    add_changed_names(statement, &mut changed);
+    let mut add = |name: &ObjectName| {
+        changed.insert(key(&last_ident_value_or_display(name)));
+    };
+    match statement {
+        Statement::CreateTrigger(trigger) => add(&trigger.table_name),
+        Statement::DropTrigger(drop) => {
+            let Some(table) = &drop.table_name else { return false };
+            add(table);
+        }
+        Statement::CreateIndex(index) => add(&index.table_name),
+        Statement::CreatePolicy(policy) => add(&policy.table_name),
+        Statement::AlterPolicy(policy) => add(&policy.table_name),
+        Statement::DropPolicy(policy) => add(&policy.table_name),
+        Statement::Grant(Grant {
+            objects: Some(GrantObjects::Tables(names) | GrantObjects::Views(names)),
+            ..
+        })
+        | Statement::Revoke(Revoke {
+            objects: Some(GrantObjects::Tables(names) | GrantObjects::Views(names)),
+            ..
+        }) => names.iter().for_each(add),
+        Statement::Insert(_)
+        | Statement::Update(_)
+        | Statement::Delete(_)
+        | Statement::Query(_)
+        | Statement::Merge(_) => {}
+        _ if changed.is_empty() => return false,
+        _ => {}
+    }
+    changed.iter().all(|name| relations.contains(name))
 }
 
 /// Adds the relations `statement` reads, writes, or creates or drops a
