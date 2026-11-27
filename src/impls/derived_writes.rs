@@ -36,6 +36,7 @@ use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{
+        batch_cache,
         object_name::last_ident_value_or_display,
         session_variable::acting_role_and_deployment,
         translator_impls::{off_replica::OffReplica, overlay, rls::hiding_policies},
@@ -184,7 +185,9 @@ pub(crate) fn derived_targets<'t>(
 /// the trigger table's foreign keys and the deployment's set declarations
 /// hold of `NEW` and `OLD`. The proof stops at the first read it cannot
 /// confine, which the reason names, so a trigger is kept only when every
-/// definer read the proof counts is confined.
+/// definer read the proof counts is confined. The answer is kept in the
+/// batch cache, since the trigger follower translates a trigger again
+/// against the same schema.
 ///
 /// An `INSTEAD OF` trigger is kept, since its writes are the view's own and
 /// the server applying them never fires it, and so is every trigger when no
@@ -212,13 +215,25 @@ pub(crate) fn definer_hidden_read(
     if !decides_on_hidden_rows(&chain, schema, options)? {
         return Ok(None);
     }
-    let unconfined = trigger.unconfined_definer_read(
-        schema,
-        deployment,
-        ActingRole::Declared(role),
-        DefinerReading::Outcome,
-    )?;
-    Ok(unconfined.as_ref().map(unconfined_reason))
+    let address = batch_cache::address(schema);
+    if let Some(kept) = options.batch_cache().borrow().unconfined_definer_reads.of(address, trigger)
+    {
+        return Ok(kept.clone());
+    }
+    let unconfined = trigger
+        .unconfined_definer_read(
+            schema,
+            deployment,
+            ActingRole::Declared(role),
+            DefinerReading::Outcome,
+        )?
+        .as_ref()
+        .map(unconfined_reason);
+    let mut cache = options.batch_cache().borrow_mut();
+    if cache.holds(address) {
+        cache.unconfined_definer_reads.keep(address, trigger, unconfined.clone());
+    }
+    Ok(unconfined)
 }
 
 /// Whether a deciding read of `chain`, made as the owner of a `SECURITY
