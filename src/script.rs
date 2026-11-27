@@ -172,8 +172,9 @@ impl<S> Script<S> {
 
 #[cfg(feature = "diesel")]
 impl<S: core::fmt::Display> Script<S> {
-    /// Registers every helper function on `connection`, which a connection
-    /// does before running any part of the script.
+    /// Registers every helper function on `connection`, with the typmod
+    /// rounding functions the translation calls, which a connection does
+    /// before running any part of the script.
     ///
     /// # Errors
     ///
@@ -182,6 +183,7 @@ impl<S: core::fmt::Display> Script<S> {
         &self,
         connection: &mut diesel::sqlite::SqliteConnection,
     ) -> diesel::QueryResult<()> {
+        pg2sqlite_runtime::TypmodRounding::register(connection)?;
         self.functions.iter().try_for_each(|function| function.register(connection))
     }
 }

@@ -137,8 +137,15 @@ const SQLITE_BUILTINS: &[&str] = &[
 /// reader: `avg` and `count` have no scalar form.
 const SQLITE_AGGREGATES: &[&str] = &["avg", "count"];
 
-/// Native codec names emitted by vector lowering.
-const TRANSLATOR_EMITTED: &[&str] = &["vec_f32"];
+/// Native codec names emitted by vector lowering, and the typmod rounding
+/// functions a replica registers.
+const TRANSLATOR_EMITTED: &[&str] = &[
+    "pg2sqlite_round_time",
+    "pg2sqlite_round_timestamp",
+    "pg2sqlite_round_timestamptz",
+    "pg2sqlite_round_timetz",
+    "vec_f32",
+];
 
 /// What SQLite ships only under `SQLITE_ENABLE_MATH_FUNCTIONS`, which is why
 /// none of them is in the inventory above.

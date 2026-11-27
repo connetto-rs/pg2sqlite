@@ -38,7 +38,10 @@ pub(crate) mod write_guard;
 
 /// Prelude module for the library.
 pub mod prelude {
-    pub use pg2sqlite_runtime::write_guard::{GuardRefusal, guard_refusal};
+    pub use pg2sqlite_runtime::{
+        RoundingError, TypmodRounding,
+        write_guard::{GuardRefusal, guard_refusal},
+    };
 
     pub use crate::{
         errors::{Error, RefusalCategory, SqlParseError, TranslationDirection, TranslationRefusal},
