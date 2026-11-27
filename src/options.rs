@@ -1922,6 +1922,13 @@ impl Pg2SqliteOptions {
     /// triggers and deferred ones included, as none fires where a PostgreSQL
     /// subscriber applies replicated rows with `session_replication_role =
     /// replica`, so a delivered row is stored as the server sent it.
+    ///
+    /// A translated write the acting role lacks a privilege for then
+    /// translates, since the exemption lifts its refusal for a schema's seed
+    /// rows, and only the SQLite authorizer
+    /// `pg2sqlite_runtime::statement_refusals::Authorizer` refuses it before
+    /// any row. A deployment installs it on each connection and removes it
+    /// while the function answers true.
     pub fn with_rls_exemption_function(mut self, name: impl Into<String>) -> Self {
         self.rls_exemption_function = Some(name.into());
         self
@@ -2009,6 +2016,11 @@ impl Pg2SqliteOptions {
     #[must_use]
     /// Places `tables` in `schema` and emits cross-database views and triggers
     /// as `TEMP`.
+    ///
+    /// A translation against an existing schema places only the views it
+    /// creates, and counts a view an earlier translation emitted `TEMP` as
+    /// living in `main`. The record of the acting role's refusals then names
+    /// `main` for it, and the SQLite authorizer misses a write through it.
     ///
     /// ```
     /// # use pg2sqlite::prelude::*;

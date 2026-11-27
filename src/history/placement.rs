@@ -121,6 +121,16 @@ impl Placed {
         home(&self.homes, name)
     }
 
+    /// The SQLite database the table, view or index named `name` lives in,
+    /// `main`, `temp` or the name the attached database is attached under.
+    pub(crate) fn database(&self, name: &str) -> &str {
+        match self.home(name) {
+            Placement::Main => "main",
+            Placement::Attached => &self.attached_schema,
+            Placement::Temp => "temp",
+        }
+    }
+
     /// Places a rebound statement, keeping the home of the object it creates.
     pub(crate) fn place_rebound(&mut self, statement: &mut Statement) -> Result<Placement, Error> {
         place_statement(
