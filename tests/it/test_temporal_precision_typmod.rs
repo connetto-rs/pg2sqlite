@@ -12,6 +12,7 @@
 //! runtime and a typed schema cannot name it. Each probe is the script's last
 //! statement, the shape the shared runner returns.
 
+use diesel::RunQueryDsl;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use rusqlite::Connection;
 
@@ -502,6 +503,57 @@ fn a_run_time_tie_rounds_away_from_the_postgres_epoch() {
             "{cast}"
         );
     }
+}
+
+// ── rounding past the last year the replica holds ──────────────────────────
+
+/// A literal that rounds into the year 10000 is refused, since the replica
+/// holds four-digit years. PostgreSQL prints 10000-01-01 00:00:00 and
+/// 10000-01-01 00:00:00+00.
+#[test]
+fn a_literal_rounding_past_the_year_9999_is_refused() {
+    for cast in [
+        "SELECT CAST('9999-12-31 23:59:59.9' AS TIMESTAMP(0));",
+        "SELECT CAST('9999-12-31 23:59:59.9+00' AS TIMESTAMPTZ(0));",
+    ] {
+        let error = Pg2Sqlite::default()
+            .sql(cast)
+            .expect("parse")
+            .translate_to_sql(&Pg2SqliteOptions::default())
+            .expect_err("the rounded literal leaves the years the replica holds")
+            .to_string();
+        assert!(error.contains("outside the years 1 to 9999"), "{cast}: {error}");
+    }
+}
+
+/// A stored value that rounds into the year 10000 at run time fails the
+/// query rather than answering text the replica cannot order. PostgreSQL
+/// prints 10000-01-01 00:00:00.
+#[test]
+fn a_column_rounding_past_the_year_9999_fails_the_query() {
+    let script = Pg2Sqlite::default()
+        .sql(&format!(
+            "{DDL}\n\
+             INSERT INTO t (ts) VALUES ('9999-12-31 23:59:59.9');\n\
+             SELECT CAST(ts AS TIMESTAMP(0)) FROM t;"
+        ))
+        .expect("parse")
+        .translate_to_sql(&Pg2SqliteOptions::default())
+        .expect("translate");
+    let mut connection = crate::helpers::establish_connection();
+    script.register_functions(&mut connection).expect("register the replica's functions");
+    let mut statements = script.into_vec();
+    let probe = statements.pop().expect("the probe");
+    // The translated statements are runtime text no typed DSL carries.
+    for statement in &statements {
+        diesel::sql_query(statement)
+            .execute(&mut connection)
+            .unwrap_or_else(|error| panic!("{error}\n{statement}"));
+    }
+    let error = diesel::sql_query(&probe)
+        .execute(&mut connection)
+        .expect_err("the rounded value leaves the years the replica holds");
+    assert!(error.to_string().contains("outside the years 1 to 9999"), "{error}");
 }
 
 // ── the full-precision types keep standing ─────────────────────────────────

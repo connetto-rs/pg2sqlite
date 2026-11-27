@@ -238,10 +238,6 @@ mod registration {
         let Ok(precision) = u8::try_from(precision) else {
             return Ok(text);
         };
-        let rounded = match kind.round(&text, precision)? {
-            Cow::Owned(rounded) => Some(rounded),
-            Cow::Borrowed(_) => None,
-        };
-        Ok(rounded.unwrap_or(text))
+        kind.round(&text, precision).map(Cow::into_owned)
     }
 }

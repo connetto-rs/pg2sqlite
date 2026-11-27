@@ -124,9 +124,12 @@ pub(crate) fn normalize_temporal_literal(
             let (body, zone) = split_time_zone(kind, trimmed, zoned)?;
             let zone = zone.map_or_else(String::new, |zone| zone.render());
             let clock = parse_time(kind, body, trimmed)?;
-            let time =
-                rounded(TypmodRounding::Time, time_of_day_text(clock.micros_of_day()), precision)
-                    .map_err(|_| outside_four_digit_years(trimmed))?;
+            let time = rounded(
+                TypmodRounding::Time,
+                time_of_day_text(clock.micros_of_day()),
+                precision,
+                trimmed,
+            )?;
             Ok(format!("{time}{zone}"))
         }
         TemporalLiteralKind::Timestamp { zoned, precision } => {
@@ -152,8 +155,7 @@ pub(crate) fn normalize_temporal_literal(
                     + micros_of_day
                     - offset * MICROS_PER_SECOND;
                 let instant = canonical_instant(micros, trimmed)?;
-                return rounded(TypmodRounding::TimestampTz, instant, precision)
-                    .map_err(|_| outside_four_digit_years(trimmed));
+                return rounded(TypmodRounding::TimestampTz, instant, precision, trimmed);
             }
             // PostgreSQL reads 24:00:00 on a timestamp as the next day's
             // midnight.
@@ -165,8 +167,7 @@ pub(crate) fn normalize_temporal_literal(
                 return Err(outside_four_digit_years(trimmed));
             }
             let wall = format!("{year:04}-{month:02}-{day:02} {}", time_of_day_text(micros));
-            rounded(TypmodRounding::Timestamp, wall, precision)
-                .map_err(|_| outside_four_digit_years(trimmed))
+            rounded(TypmodRounding::Timestamp, wall, precision, trimmed)
         }
     }
 }
@@ -231,19 +232,20 @@ fn rounded_microseconds(fraction: &str) -> i64 {
 }
 
 /// `text`, the replica's text of a `rounding` value, rounded to the typmod
-/// precision by the same function a replica registers.
+/// precision by the same function a replica registers, refusing a value that
+/// rounds out of the years 1 to 9999 as `literal`.
 fn rounded(
     rounding: TypmodRounding,
     text: String,
     precision: Option<u32>,
-) -> Result<String, pg2sqlite_runtime::RoundingError> {
+    literal: &str,
+) -> Result<String, Error> {
     let Some(precision) = precision else { return Ok(text) };
     let precision = u8::try_from(precision).unwrap_or(u8::MAX);
-    let rounded = match rounding.round(&text, precision)? {
-        Cow::Owned(rounded) => Some(rounded),
-        Cow::Borrowed(_) => None,
-    };
-    Ok(rounded.unwrap_or(text))
+    rounding
+        .round(&text, precision)
+        .map(Cow::into_owned)
+        .map_err(|_| outside_four_digit_years(literal))
 }
 
 /// Days since 1970-01-01 of a proleptic Gregorian date.
