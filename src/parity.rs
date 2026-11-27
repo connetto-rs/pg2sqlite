@@ -42,6 +42,7 @@ use diesel::{
     sql_types::{Binary, Bool, Nullable, Text},
     sqlite::{Sqlite, SqliteFunctionBehavior, SqliteType, SqliteValue},
 };
+use pg2sqlite_runtime::{ExecutionGroup, JiffUtcProvider, ManagedConnection};
 use sql_traits::{
     errors::DeploymentError,
     parity::{Answer, Case, EngineAnswer, Table, identifier, text_of},
@@ -49,7 +50,13 @@ use sql_traits::{
 };
 use sqlparser::ast::{Ident, ObjectName, Statement, TableObject};
 
-use crate::prelude::*;
+use crate::{
+    prelude::*,
+    script::{FreshFiles, OpenError},
+};
+
+/// The managed connection a replica runs on.
+type ReplicaConnection = ManagedConnection<JiffUtcProvider>;
 
 /// One caller, row and statement to answer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -333,7 +340,7 @@ impl ToSql<Text, Sqlite> for Stored {
 /// pg2sqlite's own conversion turns the case's text into the stored form, so
 /// the replica runs it once per setting.
 fn stored_settings(
-    connection: &mut SqliteConnection,
+    connection: &mut ReplicaConnection,
     owner: &Pg2SqliteOptions,
     settings: &BTreeMap<String, String>,
     role: &str,
@@ -384,7 +391,7 @@ struct KeyRow {
 }
 
 struct Replica {
-    connection: SqliteConnection,
+    connection: ReplicaConnection,
     session: Arc<Session>,
     schema: ParserDB,
     options: Pg2SqliteOptions,
@@ -418,7 +425,7 @@ impl Replica {
             .sql(&case.seed)
             .and_then(|seed| seed.translate_with_schema(&schema, owner))
             .map_err(failed)?;
-        let mut connection = SqliteConnection::establish(":memory:")
+        let mut connection = ReplicaConnection::establish(":memory:")
             .map_err(|source| ParityError::Connection { role: role.to_owned(), source })?;
         let callers = case
             .config
@@ -435,16 +442,20 @@ impl Replica {
         let database = |action: String| {
             move |source| ParityError::Database { role: role.to_owned(), action, source }
         };
-        register_functions(&mut connection, owner, &session)
+        let mut registration = connection
+            .registration()
+            .map_err(DieselError::from)
+            .map_err(database("Opening the registration".to_owned()))?;
+        register_functions(registration.sqlite(), owner, &session)
             .map_err(database("Registering the replica functions".to_owned()))?;
-        script
-            .register_functions(&mut connection)
-            .map_err(database("Registering the helper functions".to_owned()))?;
-        for statement in script.iter() {
-            connection
-                .batch_execute(&format!("{statement};"))
-                .map_err(database(format!("Applying {statement}")))?;
-        }
+        script.initialize_managed(&mut connection, FreshFiles::Both).map_err(|error| {
+            match error {
+                OpenError::Unavailable(source) => failed(source),
+                OpenError::Execution(source) => {
+                    database("Initializing the script".to_owned())(source.into())
+                }
+            }
+        })?;
         session.exempt.store(true, Ordering::Relaxed);
         for mut statement in seed.into_vec() {
             if let Statement::Insert(insert) = &mut statement {
@@ -491,13 +502,13 @@ impl Replica {
         let reads = matches!(source.statements(), [Statement::Query(_)]);
         let translated = match source.translate_with_schema(&self.schema, &self.options) {
             Ok(script) => {
-                match script.register_functions(&mut self.connection) {
+                match script.register_managed(&mut self.connection) {
                     Ok(()) => script.into_vec(),
                     Err(source) => {
                         return Err(ParityError::Database {
                             role: self.options.get_acting_role().unwrap_or_default().to_owned(),
                             action: format!("Registering the helper functions of {statement}"),
-                            source,
+                            source: source.into(),
                         });
                     }
                 }
@@ -534,8 +545,8 @@ impl Replica {
         }
     }
 
-    /// Run the translated write in a savepoint that is rolled back, collecting
-    /// the keys of the rows of `table` it wrote.
+    /// Run the translated write as one statement in a savepoint that is
+    /// rolled back, collecting the keys of the rows of `table` it wrote.
     fn write(&mut self, table: &Table, translated: &[Statement]) -> Result<Measured, ParityError> {
         let Self { connection, options, .. } = self;
         let role = options.get_acting_role().unwrap_or_default();
@@ -545,17 +556,17 @@ impl Replica {
         };
         connection.batch_execute("SAVEPOINT probe").map_err(database("Opening a savepoint"))?;
         let measured = (|| {
-            for statement in translated {
-                // The case's write is runtime fixture data, as pg2sqlite
-                // translated it.
-                if let Err(error) = connection.batch_execute(&format!("{statement};")) {
-                    if let DieselError::DatabaseError(_, information) = &error
-                        && let Some(refusal) = postgres_error(information.message())
-                    {
-                        return Measured::Rejected(refusal.sqlstate().to_string());
-                    }
-                    return Measured::Failed(error.to_string());
+            // The case's write is runtime fixture data, as pg2sqlite
+            // translated it.
+            let group: ExecutionGroup<_> = ExecutionGroup::statements(translated);
+            if let Err(error) = connection.execute_group(group) {
+                let error = DieselError::from(error);
+                if let DieselError::DatabaseError(_, information) = &error
+                    && let Some(refusal) = postgres_error(information.message())
+                {
+                    return Measured::Rejected(refusal.sqlstate().to_string());
                 }
+                return Measured::Failed(error.to_string());
             }
             match probe_changes::table
                 .filter(probe_changes::logical.eq(&table.name))
@@ -644,7 +655,7 @@ fn refused_write(reason: String) -> Measured {
 /// Record in `probe_changes` the logical table and key of every row a statement
 /// writes to each of `tables` that the replica publishes.
 fn track_changes(
-    connection: &mut SqliteConnection,
+    connection: &mut ReplicaConnection,
     tables: &[Table],
     manifest: &[TableManifestEntry],
 ) -> QueryResult<()> {

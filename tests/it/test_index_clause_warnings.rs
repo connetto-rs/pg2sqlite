@@ -10,11 +10,11 @@
 //! as the warning being raised, since a warning about SQL nobody executes is
 //! worth nothing.
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::{
     prelude::{Pg2Sqlite, Pg2SqliteOptions},
     warnings::TranslationWarning,
 };
-use rusqlite::Connection;
 
 const FIXTURE: &str = "CREATE TABLE ic (a INT, b INT, c TEXT);";
 
@@ -26,10 +26,10 @@ fn warnings_for(ddl: &str) -> Vec<TranslationWarning> {
         .translate_with_report(&Pg2SqliteOptions::default())
         .expect("translate");
 
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("in-memory SQLite");
     for statement in report.script.iter() {
         connection
-            .execute_batch(&format!("{statement};"))
+            .batch_execute(&format!("{statement};"))
             .unwrap_or_else(|error| panic!("emitted statement failed: {statement}: {error}"));
     }
     report.warnings
@@ -85,12 +85,12 @@ fn dropping_the_payload_leaves_the_uniqueness_alone() {
         .translate_to_sql(&Pg2SqliteOptions::default())
         .expect("translate")
         .into_vec();
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("in-memory SQLite");
     for statement in &statements {
-        connection.execute_batch(&format!("{statement};")).expect("emitted statement");
+        connection.batch_execute(&format!("{statement};")).expect("emitted statement");
     }
-    connection.execute_batch("INSERT INTO ic (a, b) VALUES (1, 1);").expect("first row");
-    let second = connection.execute_batch("INSERT INTO ic (a, b) VALUES (1, 2);");
+    connection.batch_execute("INSERT INTO ic (a, b) VALUES (1, 1);").expect("first row");
+    let second = connection.batch_execute("INSERT INTO ic (a, b) VALUES (1, 2);");
     assert!(second.is_err(), "the unique index must still refuse a duplicate key");
 }
 

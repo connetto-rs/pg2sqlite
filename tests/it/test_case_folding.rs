@@ -97,12 +97,12 @@ fn a_check_comparing_with_lower_refuses_what_the_server_refuses() {
         &options,
     )
     .expect("the folded address passes the check");
-    let refused = helpers::apply_with_options(
+    let Err(refused) = helpers::apply_with_options(
         &format!("{schema} INSERT INTO invitations VALUES ('Ä@example.com');"),
         &options,
-    )
-    .err()
-    .expect("an address with an upper case letter fails the check");
+    ) else {
+        panic!("an address with an upper case letter fails the check");
+    };
     assert!(refused.to_string().contains("CHECK constraint failed"), "{refused}");
 }
 

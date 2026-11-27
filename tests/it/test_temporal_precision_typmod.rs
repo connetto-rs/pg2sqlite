@@ -6,14 +6,10 @@
 //! `timestamp(0)` answers `05`, and a fraction that rounds up into the next
 //! second or day carries.
 //!
-//! Every expected value below was read off PostgreSQL 18.6 under
-//! `SET TimeZone='UTC'`. rusqlite executes the translated SQL, the same way
-//! the neighbouring temporal tests do, because the SQL is generated at test
-//! runtime and a typed schema cannot name it. Each probe is the script's last
-//! statement, the shape the shared runner returns.
+//! Each probe is the translated script's last statement.
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use rusqlite::Connection;
 
 use crate::helpers::run_translated::run_translated_utc;
 
@@ -166,14 +162,14 @@ fn unique_rejects_a_fraction_that_rounds_to_the_stored_second() {
         .translate_to_sql(&Pg2SqliteOptions::default())
         .expect("translate")
         .into_vec();
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("in-memory SQLite");
     for statement in &statements[..statements.len() - 1] {
         connection
-            .execute_batch(&format!("{statement};"))
+            .batch_execute(&format!("{statement};"))
             .unwrap_or_else(|error| panic!("the admitted statements fail: {error}\n{statement}"));
     }
     let refused = connection
-        .execute_batch(&format!("{};", statements[statements.len() - 1]))
+        .batch_execute(&format!("{};", statements[statements.len() - 1]))
         .expect_err("the rounded duplicate must be refused");
     assert!(
         refused.to_string().contains("UNIQUE"),

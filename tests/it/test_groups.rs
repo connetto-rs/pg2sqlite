@@ -8,7 +8,7 @@
 
 #![allow(clippy::missing_errors_doc)]
 
-use diesel::{prelude::*, sqlite::SqliteConnection};
+use diesel::prelude::*;
 use helpers::establish_connection;
 use pg2sqlite::prelude::{Pg2SqliteOptions, UuidRepresentation};
 use rosetta_uuid::Uuid;
@@ -87,14 +87,20 @@ impl Group {
     }
 
     /// Inserts the group into the database.
-    pub fn insert(self, conn: &mut SqliteConnection) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn insert(
+        self,
+        conn: &mut crate::helpers::Replica,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         diesel::insert_into(groups::table).values(&self).execute(conn)?;
         assert!(self.exists(conn)?);
         Ok(self)
     }
 
     /// Returns whether the group exists in the database.
-    pub fn exists(&self, conn: &mut SqliteConnection) -> Result<bool, Box<dyn std::error::Error>> {
+    pub fn exists(
+        &self,
+        conn: &mut crate::helpers::Replica,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
         let count: i64 = groups::table.filter(groups::id.eq(&self.id)).count().get_result(conn)?;
         Ok(count > 0)
     }
@@ -103,7 +109,7 @@ impl Group {
     pub fn add_member(
         &self,
         user: &User,
-        conn: &mut SqliteConnection,
+        conn: &mut crate::helpers::Replica,
     ) -> Result<GroupMembership, Box<dyn std::error::Error>> {
         GroupMembership::new(self, user).insert(conn)
     }
@@ -112,7 +118,7 @@ impl Group {
     pub fn has_member(
         &self,
         user: &User,
-        conn: &mut SqliteConnection,
+        conn: &mut crate::helpers::Replica,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let count: i64 = group_memberships::table
             .filter(group_memberships::group_id.eq(&self.id))
@@ -123,7 +129,10 @@ impl Group {
     }
 
     /// Deletes the group from the database.
-    pub fn delete(&self, conn: &mut SqliteConnection) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn delete(
+        &self,
+        conn: &mut crate::helpers::Replica,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         diesel::delete(groups::table.filter(groups::id.eq(&self.id))).execute(conn)?;
         Ok(())
     }
@@ -132,7 +141,7 @@ impl Group {
     pub fn remove_member(
         &self,
         user: &User,
-        conn: &mut SqliteConnection,
+        conn: &mut crate::helpers::Replica,
     ) -> Result<(), Box<dyn std::error::Error>> {
         diesel::delete(
             group_memberships::table
@@ -162,14 +171,20 @@ impl User {
     }
 
     /// Inserts the user into the database.
-    pub fn insert(self, conn: &mut SqliteConnection) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn insert(
+        self,
+        conn: &mut crate::helpers::Replica,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         diesel::insert_into(users::table).values(&self).execute(conn)?;
         assert!(self.exists(conn)?);
         Ok(self)
     }
 
     /// Returns whether the user exists in the database.
-    pub fn exists(&self, conn: &mut SqliteConnection) -> Result<bool, Box<dyn std::error::Error>> {
+    pub fn exists(
+        &self,
+        conn: &mut crate::helpers::Replica,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
         let count: i64 = users::table.filter(users::id.eq(&self.id)).count().get_result(conn)?;
         Ok(count > 0)
     }
@@ -177,7 +192,7 @@ impl User {
     /// Returns the memberships of this user.
     pub fn memberships(
         &self,
-        conn: &mut SqliteConnection,
+        conn: &mut crate::helpers::Replica,
     ) -> Result<Vec<GroupMembership>, Box<dyn std::error::Error>> {
         let memberships: Vec<GroupMembership> =
             group_memberships::table.filter(group_memberships::user_id.eq(&self.id)).load(conn)?;
@@ -187,7 +202,7 @@ impl User {
     /// Returns the number of group memberships for this user.
     pub fn membership_count(
         &self,
-        conn: &mut SqliteConnection,
+        conn: &mut crate::helpers::Replica,
     ) -> Result<i64, Box<dyn std::error::Error>> {
         let count: i64 = group_memberships::table
             .filter(group_memberships::user_id.eq(&self.id))
@@ -217,14 +232,20 @@ impl GroupMembership {
     }
 
     /// Inserts the group membership into the database.
-    pub fn insert(self, conn: &mut SqliteConnection) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn insert(
+        self,
+        conn: &mut crate::helpers::Replica,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         diesel::insert_into(group_memberships::table).values(&self).execute(conn)?;
         assert!(self.exists(conn)?);
         Ok(self)
     }
 
     /// Returns whether the group membership exists in the database.
-    pub fn exists(&self, conn: &mut SqliteConnection) -> Result<bool, Box<dyn std::error::Error>> {
+    pub fn exists(
+        &self,
+        conn: &mut crate::helpers::Replica,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
         let count: i64 = group_memberships::table
             .filter(group_memberships::id.eq(&self.id))
             .count()
@@ -242,7 +263,7 @@ fn groups_options() -> Pg2SqliteOptions {
 
 /// The `Company` > `Engineering` > `Backend` hierarchy.
 fn build_hierarchy(
-    connection: &mut SqliteConnection,
+    connection: &mut crate::helpers::Replica,
 ) -> Result<(Group, Group, Group), Box<dyn std::error::Error>> {
     let company = Group::new("Company", None).insert(connection)?;
     let engineering = Group::new("Engineering", Some(&company)).insert(connection)?;
@@ -250,7 +271,9 @@ fn build_hierarchy(
     Ok((company, engineering, backend))
 }
 
-fn setup_database(connection: &mut SqliteConnection) -> Result<(), Box<dyn std::error::Error>> {
+fn setup_database(
+    connection: &mut crate::helpers::Replica,
+) -> Result<(), Box<dyn std::error::Error>> {
     let translated =
         helpers::translate_pg(include_str!("../fixtures/groups.sql"), &groups_options())?;
     for stmt in &translated {

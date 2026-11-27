@@ -1,5 +1,6 @@
 //! Tests for `to_char` translation to SQLite `strftime`.
 
+use diesel::Connection;
 use helpers::{
     assert_translated_statements_run as assert_all_stmts_parse_as_sqlite,
     translate_default_joined as translate,
@@ -209,9 +210,10 @@ fn to_char_iso_year_week_day() {
         .find(|s| !s.to_string().starts_with("PRAGMA"))
         .expect("SELECT stmt")
         .to_string();
-    // The translated column has no alias; rusqlite positional access handles
-    // it.
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    let value: String = conn.query_row(&select_stmt, [], |row| row.get(0)).unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
+    let rows = helpers::query_values(&mut conn, &select_stmt, &[]).unwrap();
+    let helpers::SqliteAnyValue::Text(value) = &rows[0][0] else {
+        panic!("expected a text value");
+    };
     assert_eq!(value, "2025-01-1", "PostgreSQL answers 2025-01-1: {select_stmt}");
 }

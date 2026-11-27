@@ -164,7 +164,7 @@ struct Line {
     line: String,
 }
 
-fn read_line(conn: &mut SqliteConnection, sql: &str) -> String {
+fn read_line(conn: &mut crate::helpers::Replica, sql: &str) -> String {
     diesel::sql_query(sql).get_result::<Line>(conn).expect("read").line
 }
 

@@ -49,7 +49,6 @@ pub mod prelude {
 
     #[cfg(feature = "managed")]
     pub use crate::script::OpenError;
-
     pub use crate::{
         errors::{Error, RefusalCategory, SqlParseError, TranslationDirection, TranslationRefusal},
         initialization::{InitializationError, InitializationPlan},

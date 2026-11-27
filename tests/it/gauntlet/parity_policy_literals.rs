@@ -5,7 +5,7 @@
 //! deployment names that zone as the server's default. The rows each engine
 //! shows the acting role are compared.
 
-use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{pg::PgConnection, prelude::*};
 use pg2sqlite::prelude::Pg2SqliteOptions;
 
 use super::harness::apply_with_seed;
@@ -80,7 +80,7 @@ fn sqlite(zone: &str) -> Vec<i32> {
         .and_then(|translator| translator.translate(&options))
         .unwrap_or_else(|error| panic!("pg2sqlite refused the schema in {zone}: {error}"))
         .into_vec();
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
     apply_with_seed(&mut connection, &statements, |connection| {
         for (id, stored) in STORED {
             diesel::insert_into(events_rls::table)

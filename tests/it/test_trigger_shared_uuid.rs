@@ -469,16 +469,19 @@ fn invocation_frame_preserves_last_insert_rowid_before_generated_value_capture()
         .with_uuid_v7_function_name("counted_rowid_uuid");
     let script = Pg2Sqlite::default().sql(postgres).unwrap().translate_to_sql(&options).unwrap();
     let mut connection = establish_connection();
-    script.register_functions(&mut connection).unwrap();
+    script.register_managed(&mut connection).unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     {
         let calls = Arc::clone(&calls);
-        counted_rowid_uuid_utils::register_nondeterministic_impl(&mut connection, move || {
-            u128::try_from(calls.fetch_add(1, Ordering::Relaxed) + 1)
-                .unwrap()
-                .to_be_bytes()
-                .to_vec()
-        })
+        counted_rowid_uuid_utils::register_nondeterministic_impl(
+            connection.registration().expect("registration").sqlite(),
+            move || {
+                u128::try_from(calls.fetch_add(1, Ordering::Relaxed) + 1)
+                    .unwrap()
+                    .to_be_bytes()
+                    .to_vec()
+            },
+        )
         .unwrap();
     }
     let statements = script.into_vec();

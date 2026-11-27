@@ -4,12 +4,14 @@
 use core::str::FromStr;
 
 use diesel::{
+    connection::SimpleConnection,
     prelude::*,
     sql_types::{Blob, Text},
-    sqlite::SqliteConnection,
 };
 use pg2sqlite::prelude::*;
 use rosetta_uuid::Uuid;
+
+use crate::helpers::Replica;
 
 // Schema definitions for test tables
 diesel::table! {
@@ -107,9 +109,9 @@ fn uuidv7_text_impl() -> String {
     Uuid::utc_v7().to_string()
 }
 
-fn establish_connection() -> SqliteConnection {
+fn establish_connection() -> Replica {
     let mut connection =
-        SqliteConnection::establish(":memory:").expect("Error connecting to in-memory SQLite");
+        Replica::establish(":memory:").expect("Error connecting to in-memory SQLite");
     // Enable foreign key constraints
     diesel::sql_query("PRAGMA foreign_keys = ON")
         .execute(&mut connection)
@@ -124,12 +126,17 @@ fn establish_connection() -> SqliteConnection {
     diesel::sql_query("PRAGMA journal_mode = WAL")
         .execute(&mut connection)
         .expect("Failed to set journal mode to WAL");
-    uuidv4_utils::register_impl(&mut connection, uuidv4_impl).expect("Failed to register uuidv4");
-    uuidv7_utils::register_impl(&mut connection, uuidv7_impl).expect("Failed to register uuidv7");
-    uuidv4_text_utils::register_impl(&mut connection, uuidv4_text_impl)
-        .expect("Failed to register uuidv4_text");
-    uuidv7_text_utils::register_impl(&mut connection, uuidv7_text_impl)
-        .expect("Failed to register uuidv7_text");
+    {
+        let mut registration = connection.registration().expect("registration");
+        uuidv4_utils::register_impl(registration.sqlite(), uuidv4_impl)
+            .expect("Failed to register uuidv4");
+        uuidv7_utils::register_impl(registration.sqlite(), uuidv7_impl)
+            .expect("Failed to register uuidv7");
+        uuidv4_text_utils::register_impl(registration.sqlite(), uuidv4_text_impl)
+            .expect("Failed to register uuidv4_text");
+        uuidv7_text_utils::register_impl(registration.sqlite(), uuidv7_text_impl)
+            .expect("Failed to register uuidv7_text");
+    }
     connection
 }
 
@@ -329,9 +336,9 @@ fn uuid_function_name_accepts_str_literal() -> Result<(), Box<dyn std::error::Er
         ddl.contains("my_uuid_fn"),
         "Custom UUID function name must appear in DEFAULT, got: {ddl}"
     );
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     for stmt in &translated {
-        conn.execute_batch(&format!("{stmt};"))
+        conn.batch_execute(&format!("{stmt};"))
             .unwrap_or_else(|e| panic!("emitted SQL failed: {e}\n{stmt}"));
     }
     Ok(())

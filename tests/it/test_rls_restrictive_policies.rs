@@ -62,11 +62,13 @@ const TABLE: &str = "
 
 /// Applies the translated DDL to a fresh in-memory SQLite. The emitted SQL is
 /// the artifact under test; all other statements use the typed DSL.
-fn apply(policies: &str) -> Result<SqliteConnection, Box<dyn std::error::Error>> {
+fn apply(
+    policies: &str,
+) -> Result<crate::helpers::Replica, crate::support::fixtures::FixtureError> {
     let pg = format!("{TABLE}{policies}");
     let options = Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit");
     let translated = Pg2Sqlite::default().sql(&pg)?.translate(&options)?.into_vec();
-    let mut conn = SqliteConnection::establish(":memory:")?;
+    let mut conn = crate::helpers::Replica::establish(":memory:")?;
     for statement in &translated {
         diesel::sql_query(statement.to_string()).execute(&mut conn)?;
     }
@@ -75,7 +77,7 @@ fn apply(policies: &str) -> Result<SqliteConnection, Box<dyn std::error::Error>>
 
 /// Three rows spanning both dimensions the policies below discriminate on:
 /// `owner_id` and `dept`.
-fn seed(conn: &mut SqliteConnection) -> Result<(), Box<dyn std::error::Error>> {
+fn seed(conn: &mut crate::helpers::Replica) -> diesel::QueryResult<()> {
     diesel::insert_into(docs_rls::table)
         .values(vec![
             BackingRow { id: 1, owner_id: 7, dept: "eng".to_owned() },
@@ -86,8 +88,8 @@ fn seed(conn: &mut SqliteConnection) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn visible_ids(conn: &mut SqliteConnection) -> Result<Vec<i32>, Box<dyn std::error::Error>> {
-    Ok(docs::table.select(docs::id).order(docs::id.asc()).load(conn)?)
+fn visible_ids(conn: &mut crate::helpers::Replica) -> diesel::QueryResult<Vec<i32>> {
+    docs::table.select(docs::id).order(docs::id.asc()).load(conn)
 }
 
 /// Two permissive policies OR together, so a row satisfying either is visible.

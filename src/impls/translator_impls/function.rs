@@ -1144,7 +1144,10 @@ fn clock_reader(name: &str) -> FunctionTranslation {
 /// # Errors
 ///
 /// Refuses every other argument form, a syntax error in PostgreSQL.
-fn clock_precision(name: &str, args: &FunctionArguments) -> Result<Option<u32>, crate::errors::Error> {
+fn clock_precision(
+    name: &str,
+    args: &FunctionArguments,
+) -> Result<Option<u32>, crate::errors::Error> {
     let precision = match args {
         FunctionArguments::None => return Ok(None),
         FunctionArguments::List(_) => {
@@ -2798,11 +2801,13 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                 reject_over_on_scalar(&func)?;
                 let instant = crate::impls::zone_clock::transaction_instant();
                 Ok(match clock_precision("current_timestamp", &func.args)? {
-                    Some(precision) => crate::impls::datetime_helpers::round_text(
-                        pg2sqlite_runtime::TypmodRounding::TimestampTz,
-                        instant,
-                        precision,
-                    ),
+                    Some(precision) => {
+                        crate::impls::datetime_helpers::round_text(
+                            pg2sqlite_runtime::TypmodRounding::TimestampTz,
+                            instant,
+                            precision,
+                        )
+                    }
                     None => instant,
                 })
             }

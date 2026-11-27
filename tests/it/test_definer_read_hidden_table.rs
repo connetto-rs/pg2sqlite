@@ -122,10 +122,15 @@ fn granting_the_table_under_a_hiding_policy_lets_the_helper_read_it() {
     );
     let script =
         helpers::translate_script(&pg, &options()).unwrap_or_else(|error| panic!("{error}"));
-    let mut connection = helpers::applied_script(&script, None);
+    let mut connection = helpers::applied_script(&script);
     // The rows arrive as the sync delivers them, past the guards on the
     // backing tables.
-    connection.set_triggers_enabled(false).expect("disable triggers for the seed");
+    connection
+        .registration()
+        .expect("registration")
+        .sqlite()
+        .set_triggers_enabled(false)
+        .expect("disable triggers for the seed");
     diesel::insert_into(secret_rls::table)
         .values(&[
             (secret_rls::id.eq(1), secret_rls::kind.eq("x")),
@@ -137,7 +142,12 @@ fn granting_the_table_under_a_hiding_policy_lets_the_helper_read_it() {
         .values(&[(t_rls::id.eq(10), t_rls::owner.eq(1)), (t_rls::id.eq(20), t_rls::owner.eq(2))])
         .execute(&mut connection)
         .expect("the guarded rows are stored");
-    connection.set_triggers_enabled(true).expect("re-enable triggers");
+    connection
+        .registration()
+        .expect("registration")
+        .sqlite()
+        .set_triggers_enabled(true)
+        .expect("re-enable triggers");
     let visible = t::table.select(t::id).load::<i32>(&mut connection).expect("the view reads");
     assert_eq!(visible, [10]);
 }

@@ -857,9 +857,11 @@ pub(crate) fn local_clock_clock(
         ZonedWallClock::Utc => local_timestamp_text(instant.clone(), None),
         ZonedWallClock::Zone(clock) => clock.local(instant.clone()),
     };
-    let rounded = |kind: TypmodRounding, text: Expr| match precision {
-        Some(precision) => round_text(kind, text, precision),
-        None => text,
+    let rounded = |kind: TypmodRounding, text: Expr| {
+        match precision {
+            Some(precision) => round_text(kind, text, precision),
+            None => text,
+        }
     };
     Ok(match which {
         LocalClock::Date => simple_function_expr("date", vec![local], None),

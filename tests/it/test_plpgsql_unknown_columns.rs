@@ -8,11 +8,13 @@
 //! PostgreSQL's error where the run reaches the statement instead.
 
 use diesel::{
-    Connection, ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection,
-    connection::SimpleConnection, result::Error as DieselError,
+    Connection, ExpressionMethods, QueryDsl, RunQueryDsl, connection::SimpleConnection,
+    result::Error as DieselError,
 };
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, postgres_error};
 use sqlstate::pg;
+
+use crate::helpers::Replica;
 
 diesel::table! {
     docs (id) {
@@ -54,18 +56,18 @@ CREATE TRIGGER assign BEFORE INSERT ON docs FOR EACH ROW EXECUTE FUNCTION assign
 "#;
 
 /// The replica of `schema` on SQLite with its default flags.
-fn replica(schema: &str) -> SqliteConnection {
+fn replica(schema: &str) -> Replica {
     let script = Pg2Sqlite::default()
         .sql(schema)
         .unwrap()
         .translate_to_sql(&Pg2SqliteOptions::default())
         .unwrap_or_else(|error| panic!("{error}"));
-    let mut connection = SqliteConnection::establish(":memory:").unwrap();
+    let mut connection = Replica::establish(":memory:").unwrap();
     connection.batch_execute(&script.into_vec().join(";\n")).unwrap();
     connection
 }
 
-fn insert(connection: &mut SqliteConnection, id: i32, owner: &str) -> Result<usize, DieselError> {
+fn insert(connection: &mut Replica, id: i32, owner: &str) -> Result<usize, DieselError> {
     diesel::insert_into(docs::table)
         .values((docs::id.eq(id), docs::owner.eq(owner), docs::body.eq("text")))
         .execute(connection)
@@ -81,7 +83,7 @@ fn assert_undefined_column(inserted: Result<usize, DieselError>, message: &str) 
     assert_eq!((refused.sqlstate(), refused.message()), (pg::UNDEFINED_COLUMN, message));
 }
 
-fn ids(connection: &mut SqliteConnection) -> Vec<i32> {
+fn ids(connection: &mut Replica) -> Vec<i32> {
     docs::table.select(docs::id).order(docs::id).load(connection).unwrap()
 }
 

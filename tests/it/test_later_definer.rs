@@ -5,7 +5,7 @@
 //! writes take what the owner may write even though their grants never
 //! changed.
 
-use diesel::{connection::SimpleConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{connection::SimpleConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use sql_traits::structs::{Deployment, ParserDB};
 
@@ -76,22 +76,24 @@ fn options() -> Pg2SqliteOptions {
         .with_rls_audit_table_name("rls_audit")
 }
 
-fn apply(connection: &mut SqliteConnection, statements: Vec<String>) {
+fn apply(connection: &mut crate::helpers::Replica, statements: Vec<String>) {
     for statement in statements {
         connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
     }
 }
 
 /// A replica of [`SCHEMA`], with the schema it holds.
-fn replica() -> (SqliteConnection, ParserDB) {
+fn replica() -> (crate::helpers::Replica, ParserDB) {
     let script = Pg2Sqlite::default()
         .sql(SCHEMA)
         .expect("the schema parses")
         .translate_to_sql(&options())
         .expect("the schema translates");
-    let mut connection = SqliteConnection::establish(":memory:").expect("open an in-memory SQLite");
-    script.register_functions(&mut connection).expect("register the functions");
-    apply(&mut connection, script.into_vec());
+    let mut connection =
+        crate::helpers::Replica::establish(":memory:").expect("open an in-memory SQLite");
+    script
+        .initialize_managed(&mut connection, pg2sqlite::script::FreshFiles::Both)
+        .expect("initialize replica");
     let schema = Pg2Sqlite::default()
         .sql(SCHEMA)
         .expect("the schema parses")
@@ -101,7 +103,7 @@ fn replica() -> (SqliteConnection, ParserDB) {
 }
 
 /// Applies `migration`, translated against `schema`.
-fn migrate(connection: &mut SqliteConnection, schema: &ParserDB, migration: &str) {
+fn migrate(connection: &mut crate::helpers::Replica, schema: &ParserDB, migration: &str) {
     let statements = Pg2Sqlite::default()
         .sql(migration)
         .expect("the migration parses")

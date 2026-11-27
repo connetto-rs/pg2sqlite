@@ -1684,8 +1684,12 @@ pub fn reverse_translate_function(
             let inner =
                 crate::prelude::ReverseTranslator::reverse_translate(exprs[0], schema, options)?;
             let data_type = match rounding {
-                TypmodRounding::Timestamp => DataType::Timestamp(Some(precision), TimezoneInfo::None),
-                TypmodRounding::TimestampTz => DataType::Timestamp(Some(precision), TimezoneInfo::Tz),
+                TypmodRounding::Timestamp => {
+                    DataType::Timestamp(Some(precision), TimezoneInfo::None)
+                }
+                TypmodRounding::TimestampTz => {
+                    DataType::Timestamp(Some(precision), TimezoneInfo::Tz)
+                }
                 TypmodRounding::Time => DataType::Time(Some(precision), TimezoneInfo::None),
                 TypmodRounding::TimeTz => DataType::Time(Some(precision), TimezoneInfo::Tz),
             };

@@ -139,7 +139,7 @@ struct NewArrItem {
     tags: String,
 }
 
-fn apply_ddl(conn: &mut SqliteConnection, sql: &str) {
+fn apply_ddl(conn: &mut crate::helpers::Replica, sql: &str) {
     // sql_query: applying translated DDL (dynamically generated, DSL cannot
     // express DDL).
     diesel::sql_query(sql).execute(conn).unwrap_or_else(|e| panic!("DDL failed: {e}\n{sql}"));
@@ -147,7 +147,7 @@ fn apply_ddl(conn: &mut SqliteConnection, sql: &str) {
 
 /// Build and populate an `arr_items` table through the translator, returning a
 /// connection ready for containment queries.
-fn arr_items_conn() -> SqliteConnection {
+fn arr_items_conn() -> crate::helpers::Replica {
     let schema_and_query = "CREATE TABLE arr_items (id INT PRIMARY KEY, tags int[]);";
     let ddl: Vec<String> = Pg2Sqlite::default()
         .sql(schema_and_query)

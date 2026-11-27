@@ -5,7 +5,7 @@
 //! - Each set-operation keyword survives translation
 //! - The translated SQL actually executes in SQLite (integration)
 
-use diesel::{RunQueryDsl, prelude::*};
+use diesel::{RunQueryDsl, connection::SimpleConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
 use crate::helpers;
@@ -24,9 +24,9 @@ fn test_union_query_translation() {
 
     assert!(output.contains("UNION"), "Output should contain UNION keyword, got:\n{output}");
     {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let mut conn = helpers::Replica::establish(":memory:").unwrap();
         for stmt in &translated {
-            conn.execute_batch(&format!("{stmt};")).unwrap();
+            conn.batch_execute(&format!("{stmt};")).unwrap();
         }
     }
 }
@@ -48,9 +48,9 @@ fn test_union_all_translation() {
         "Output should contain UNION ALL keyword, got:\n{output}"
     );
     {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let mut conn = helpers::Replica::establish(":memory:").unwrap();
         for stmt in &translated {
-            conn.execute_batch(&format!("{stmt};")).unwrap();
+            conn.batch_execute(&format!("{stmt};")).unwrap();
         }
     }
 }
@@ -72,9 +72,9 @@ fn test_intersect_translation() {
         "Output should contain INTERSECT keyword, got:\n{output}"
     );
     {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let mut conn = helpers::Replica::establish(":memory:").unwrap();
         for stmt in &translated {
-            conn.execute_batch(&format!("{stmt};")).unwrap();
+            conn.batch_execute(&format!("{stmt};")).unwrap();
         }
     }
 }
@@ -93,9 +93,9 @@ fn test_except_translation() {
 
     assert!(output.contains("EXCEPT"), "Output should contain EXCEPT keyword, got:\n{output}");
     {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let mut conn = helpers::Replica::establish(":memory:").unwrap();
         for stmt in &translated {
-            conn.execute_batch(&format!("{stmt};")).unwrap();
+            conn.batch_execute(&format!("{stmt};")).unwrap();
         }
     }
 }
@@ -198,7 +198,7 @@ fn an_untyped_literal_arm_takes_the_type_of_the_arms_beside_it() {
             .expect("parse")
             .translate_to_sql(&Pg2SqliteOptions::default())
             .unwrap_or_else(|error| panic!("{view}\nshould translate: {error}"));
-        let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
+        let mut connection = helpers::Replica::establish(":memory:").expect("open SQLite");
         for statement in script.into_vec() {
             diesel::connection::SimpleConnection::batch_execute(&mut connection, &statement)
                 .unwrap_or_else(|error| panic!("{error}\n{statement}"));

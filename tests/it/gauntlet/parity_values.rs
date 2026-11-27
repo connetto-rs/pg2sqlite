@@ -17,27 +17,22 @@
 //! - UUID equality comparison: UUID on PG vs BLOB on SQLite; no shared diesel
 //!   column type for a cross-backend comparison.
 //!
-//! The statistical-aggregates test additionally opens a rusqlite Connection
-//! for aggregate registration; diesel provides no API for window-aggregate
-//! registration (create_window_function is a rusqlite API).
-//!
 //! Floating point comparisons use a relative tolerance of FLOAT_TOL (1e-9),
 //! which covers last-digit rounding ("0.6666666666666666" vs
 //! "0.6666666666666667") and the PG/SQLite text-representation difference
 //! where PG emits "1" and SQLite emits "1.0" for the same 1.0 value.
 
-// Window-aggregate registration requires a rusqlite::Connection; there is no
-// diesel equivalent.
 use std::fmt::Write;
 
-use diesel::{dsl, pg::PgConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{connection::SimpleConnection, dsl, pg::PgConnection, prelude::*};
 use pg2sqlite::prelude::{ArrayRepresentation, Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation};
-use rusqlite::Connection as RusqliteConn;
 use stat_agg::{STATISTICAL_AGGREGATES, register_statistical_aggregates};
 
 use crate::helpers::{
+    Replica, SqliteAnyValue,
     deployment::{utc_request, utc_script},
-    establish_connection, postgres as postgres_harness, statistical_aggregates as stat_agg,
+    establish_connection, postgres as postgres_harness, query_values,
+    statistical_aggregates as stat_agg,
 };
 
 // ── typed diesel schema
@@ -113,7 +108,7 @@ fn setup_pg() -> PgConnection {
 // output (migration DDL), and the seed values contain PostgreSQL-specific
 // syntax (ARRAY[], JSONB literals, UUID) that has no unified typed-insert
 // representation across both backends.
-fn setup_sq_diesel() -> SqliteConnection {
+fn setup_sq_diesel() -> crate::helpers::Replica {
     let source = utc_script(&format!("{SCHEMA}{SEEDS}"));
     let stmts = Pg2Sqlite::default()
         .sql(&source)
@@ -134,10 +129,7 @@ fn setup_sq_diesel() -> SqliteConnection {
     conn
 }
 
-// Returns a rusqlite Connection with statistical aggregates registered. Used
-// only by `statistical_aggregates_agree_within_tolerance` because diesel
-// provides no API for window-aggregate registration.
-fn setup_sq_rusqlite() -> RusqliteConn {
+fn setup_sq_aggregates() -> Replica {
     let source = utc_script(
         "CREATE TABLE vals (id INTEGER PRIMARY KEY, n INTEGER, r DOUBLE PRECISION, s TEXT);
          INSERT INTO vals VALUES (1, 10, 1.5, 'hello'), (2, 20, 2.5, 'world'),
@@ -150,12 +142,13 @@ fn setup_sq_rusqlite() -> RusqliteConn {
         .expect("translate schema and seeds")
         .into_vec();
 
-    let sq = RusqliteConn::open_in_memory().expect("in-memory SQLite");
-    sq.execute_batch("PRAGMA foreign_keys = ON; PRAGMA recursive_triggers = ON;")
+    let mut sq = Replica::establish(":memory:").expect("in-memory SQLite");
+    sq.batch_execute("PRAGMA foreign_keys = ON; PRAGMA recursive_triggers = ON;")
         .expect("configure SQLite pragmas");
-    register_statistical_aggregates(&sq).expect("register statistical aggregates");
+    register_statistical_aggregates(sq.registration().expect("registration").sqlite())
+        .expect("register statistical aggregates");
     for stmt in &stmts {
-        sq.execute_batch(&format!("{stmt};"))
+        sq.batch_execute(&format!("{stmt};"))
             .unwrap_or_else(|e| panic!("SQLite setup: {e}\n{stmt}"));
     }
     sq
@@ -198,7 +191,7 @@ fn translate_last(pg_query: &str) -> String {
 }
 
 // Runs the last emitted statement on the diesel SQLite connection.
-fn sq_sql_diesel(conn: &mut SqliteConnection, pg_query: &str) -> Vec<Option<String>> {
+fn sq_sql_diesel(conn: &mut crate::helpers::Replica, pg_query: &str) -> Vec<Option<String>> {
     let probe = translate_last(pg_query);
     diesel::sql_query(&probe)
         .load::<Val>(conn)
@@ -208,30 +201,26 @@ fn sq_sql_diesel(conn: &mut SqliteConnection, pg_query: &str) -> Vec<Option<Stri
         .collect()
 }
 
-// Runs the last emitted statement on a rusqlite Connection (for
-// statistical aggregates).
-fn sq_sql_rusqlite(sq: &RusqliteConn, pg_query: &str) -> Vec<Option<String>> {
+fn sq_sql_aggregates(sq: &mut Replica, pg_query: &str) -> Vec<Option<String>> {
     let probe = translate_last(pg_query);
-    let mut stmt =
-        sq.prepare(&probe).unwrap_or_else(|e| panic!("SQLite prepare failed: {e}\n{probe}"));
-    stmt.query_map([], |row| {
-        use rusqlite::types::ValueRef;
-        Ok(match row.get_ref(0)? {
-            ValueRef::Null => None,
-            ValueRef::Integer(i) => Some(i.to_string()),
-            ValueRef::Real(f) => Some(f.to_string()),
-            ValueRef::Text(t) => Some(String::from_utf8_lossy(t).into_owned()),
-            ValueRef::Blob(b) => {
-                Some(b.iter().fold(String::new(), |mut hex, byte| {
-                    let _ = write!(hex, "{byte:02x}");
-                    hex
-                }))
+    query_values(sq, &probe, &[])
+        .unwrap_or_else(|error| panic!("SQLite query failed: {error}\n{probe}"))
+        .into_iter()
+        .map(|mut row| {
+            match row.remove(0) {
+                SqliteAnyValue::Null => None,
+                SqliteAnyValue::Integer(value) => Some(value.to_string()),
+                SqliteAnyValue::Real(value) => Some(value.to_string()),
+                SqliteAnyValue::Text(value) => Some(value),
+                SqliteAnyValue::Blob(value) => {
+                    Some(value.iter().fold(String::new(), |mut hex, byte| {
+                        let _ = write!(hex, "{byte:02x}");
+                        hex
+                    }))
+                }
             }
         })
-    })
-    .unwrap_or_else(|e| panic!("SQLite query failed: {e}\n{probe}"))
-    .collect::<Result<Vec<_>, _>>()
-    .expect("SQLite rows")
+        .collect()
 }
 
 // ── comparison helpers
@@ -406,16 +395,12 @@ fn array_agg_element_count_agrees() {
 
 #[test]
 fn statistical_aggregates_agree_within_tolerance() {
-    // rusqlite is used because register_statistical_aggregates requires a
-    // rusqlite::Connection; diesel provides no API for window-aggregate
-    // registration (create_window_function is a rusqlite API).
-    //
     // r values (NULL in row 3 excluded): 1.5, 2.5, 3.5
     // var_pop = 2/3; var_samp = 1.0; stddev = 1.0
     // n=[10,20,30] and r=[1.5,2.5,3.5] are perfectly linearly correlated:
     // corr=1.0
     let mut pg = setup_pg();
-    let sq = setup_sq_rusqlite();
+    let mut sq = setup_sq_aggregates();
 
     for (q, label) in [
         ("SELECT var_pop(r)::text AS val FROM vals", "var_pop"),
@@ -426,7 +411,7 @@ fn statistical_aggregates_agree_within_tolerance() {
         ("SELECT var_pop(r)::text AS val FROM vals WHERE id < 0", "var_pop empty"),
         ("SELECT corr(n, r)::text AS val FROM vals WHERE id < 0", "corr empty"),
     ] {
-        assert_sql_scalar(&pg_sql(&mut pg, q), &sq_sql_rusqlite(&sq, q), label);
+        assert_sql_scalar(&pg_sql(&mut pg, q), &sq_sql_aggregates(&mut sq, q), label);
     }
 }
 

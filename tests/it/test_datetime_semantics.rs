@@ -6,20 +6,43 @@
 //! Where SQLite cannot express a construct faithfully the translation is
 //! expected to return a typed translation refusal rather
 //! than silently returning a wrong answer.
-//!
-//! The SQL executed here is the output of the translator, which is not known
-//! at compile time. That is why this file uses rusqlite to execute the
-//! translated strings directly rather than diesel's typed DSL (which requires
-//! a fixed schema at compile time). Every other test file in this suite that
-//! exercises translated SQL follows the same pattern.
 
+use diesel::{Connection as _, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-// rusqlite is used here because the SQL being executed is dynamically generated
-// by the translator at test runtime. diesel's typed DSL requires a schema known
-// at compile time and cannot execute an arbitrary translated SQL string.
-use rusqlite::Connection;
 
-use crate::helpers::deployment::{UTC_REQUEST_ROLE, utc_request};
+use crate::helpers::{
+    Replica, SqliteAnyValue,
+    deployment::{UTC_REQUEST_ROLE, utc_request},
+    query_values,
+};
+
+trait ProbeValue {
+    fn from_value(value: SqliteAnyValue) -> Self;
+}
+
+impl ProbeValue for String {
+    fn from_value(value: SqliteAnyValue) -> Self {
+        match value {
+            SqliteAnyValue::Text(value) => value,
+            value => panic!("expected text, got {value:?}"),
+        }
+    }
+}
+
+impl ProbeValue for i64 {
+    fn from_value(value: SqliteAnyValue) -> Self {
+        match value {
+            SqliteAnyValue::Integer(value) => value,
+            value => panic!("expected integer, got {value:?}"),
+        }
+    }
+}
+
+impl ProbeValue for f64 {
+    fn from_value(value: SqliteAnyValue) -> Self {
+        crate::helpers::numeric_value(&value).expect("expected a number, got NULL")
+    }
+}
 
 /// DDL for date/time tests: a TIMESTAMP and a DATE column.
 const DT_DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP, d DATE);";
@@ -59,7 +82,7 @@ fn translate_err(pg: &str) -> String {
 /// Applies the translated DDL of `ddl`, seeds `seed`, and probes the last
 /// emitted statement, returning its first column as `Option<T>`. The script
 /// is led by the role declaration `role` and translated under `options`.
-fn eval_row<T: rusqlite::types::FromSql>(
+fn eval_row<T: ProbeValue>(
     ddl: &str,
     seed: &str,
     select_list: &str,
@@ -73,16 +96,20 @@ fn eval_row<T: rusqlite::types::FromSql>(
 
 /// Applies every statement of `script` but the last, seeds `seed`, and probes
 /// the last one, returning its first column as `Option<T>`.
-fn eval_row_script<T: rusqlite::types::FromSql>(script: &[String], seed: &str) -> Option<T> {
-    let conn = Connection::open_in_memory().expect("in-memory SQLite");
+fn eval_row_script<T: ProbeValue>(script: &[String], seed: &str) -> Option<T> {
+    let mut conn = Replica::establish(":memory:").expect("in-memory SQLite");
     for stmt in &script[..script.len() - 1] {
-        conn.execute_batch(&format!("{stmt};"))
+        conn.batch_execute(&format!("{stmt};"))
             .unwrap_or_else(|e| panic!("DDL failed: {e}\n{stmt}"));
     }
-    conn.execute_batch(seed).expect("seed row");
+    conn.batch_execute(seed).expect("seed row");
     let probe = script.last().expect("a query");
-    conn.query_row(probe, [], |r| r.get::<_, Option<T>>(0))
-        .unwrap_or_else(|e| panic!("query failed: {e}\n{probe}"))
+    let mut rows = query_values(&mut conn, probe, &[])
+        .unwrap_or_else(|error| panic!("query failed: {error}\n{probe}"));
+    match rows.remove(0).remove(0) {
+        SqliteAnyValue::Null => None,
+        value => Some(T::from_value(value)),
+    }
 }
 
 /// Run the translated form of `select_list` against the date/time table.

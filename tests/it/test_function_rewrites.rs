@@ -1,11 +1,11 @@
 //! Tests for function translation rewrites: random(), NOW() window
 //! preservation, to_timestamp(), and timestamp variant functions.
 
-use diesel::{RunQueryDsl, SqliteConnection, prelude::*};
+use diesel::{RunQueryDsl, prelude::*};
 use helpers::{translate_pg, translate_sql};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
-use crate::helpers;
+use crate::{helpers, helpers::Replica};
 
 #[test]
 fn random_translates_to_float_range() {
@@ -19,7 +19,7 @@ fn random_translates_to_float_range() {
     assert!(lower.contains("18446744073709551616"), "expected divisor constant: {sql}");
     assert!(!lower.contains("abs("), "random rewrite should avoid ABS to prevent overflow: {sql}");
     assert!(lower.contains('/'), "expected division operator: {sql}");
-    let mut conn = SqliteConnection::establish(":memory:").unwrap();
+    let mut conn = Replica::establish(":memory:").unwrap();
     // Translator output is a dynamic expression; typed DSL cannot reproduce it.
     diesel::sql_query(sql.as_str()).execute(&mut conn).unwrap();
 }
@@ -48,7 +48,7 @@ fn random_rewrite_handles_sqlite_min_i64_without_overflow() -> Result<(), Box<dy
         val: f64,
     }
 
-    let mut conn = SqliteConnection::establish(":memory:")?;
+    let mut conn = Replica::establish(":memory:")?;
     let results = diesel::sql_query(&forced_min_sql).load::<FloatResult>(&mut conn)?;
     assert_eq!(results.len(), 1);
     assert!(
@@ -72,7 +72,7 @@ fn random_covers_the_unit_interval() -> Result<(), Box<dyn std::error::Error>> {
     let options = Pg2SqliteOptions::default();
     let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
 
-    let mut conn = SqliteConnection::establish(":memory:")?;
+    let mut conn = Replica::establish(":memory:")?;
 
     // Skip the leading dialect PRAGMA to reach the SELECT itself.
     let select_sql =
@@ -145,7 +145,7 @@ fn a_window_aggregate_keeps_its_over_clause() {
     let sql = stmts.iter().find(|s| !s.starts_with("PRAGMA")).expect("SELECT stmt");
     let lower = sql.to_lowercase();
     assert!(lower.contains("over (partition by"), "OVER PARTITION BY should survive: {sql}");
-    let mut conn = SqliteConnection::establish(":memory:").unwrap();
+    let mut conn = Replica::establish(":memory:").unwrap();
     // DDL: no typed DSL exists for CREATE TABLE in diesel.
     diesel::sql_query("CREATE TABLE employees (department_id INT)").execute(&mut conn).unwrap();
     // Translator output is a dynamic string; typed DSL cannot reproduce it.
@@ -161,7 +161,7 @@ fn to_timestamp_epoch() {
     let lower = sql.to_lowercase();
     assert!(lower.contains("strftime("), "expected whole-second timestamp formatting, got {sql}");
     assert!(lower.contains("unixepoch"), "expected 'unixepoch' modifier: {sql}");
-    let mut conn = SqliteConnection::establish(":memory:").unwrap();
+    let mut conn = Replica::establish(":memory:").unwrap();
     // Dynamically generated translated SQL cannot be expressed via the typed
     // DSL.
     diesel::sql_query(sql.as_str()).execute(&mut conn).unwrap();
@@ -173,7 +173,7 @@ fn to_timestamp_epoch_semantic() -> Result<(), Box<dyn std::error::Error>> {
     let options = Pg2SqliteOptions::default();
     let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
 
-    let mut conn = SqliteConnection::establish(":memory:")?;
+    let mut conn = Replica::establish(":memory:")?;
 
     #[derive(QueryableByName, Debug)]
     struct TextResult {
@@ -203,7 +203,7 @@ fn to_timestamp_epoch_semantic_nonzero() -> Result<(), Box<dyn std::error::Error
     let options = Pg2SqliteOptions::default();
     let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
 
-    let mut conn = SqliteConnection::establish(":memory:")?;
+    let mut conn = Replica::establish(":memory:")?;
 
     #[derive(QueryableByName, Debug)]
     struct TextResult {
@@ -242,7 +242,7 @@ fn timestamp_variants_call_their_clock_readers() {
         let stmts = translate_pg(&format!("SELECT {func}"), &options).unwrap();
         let sql = stmts.iter().find(|s| !s.starts_with("PRAGMA")).expect("SELECT stmt");
         assert!(sql.contains(reader), "{func} should translate to {reader}: {sql}");
-        let mut conn = SqliteConnection::establish(":memory:").unwrap();
+        let mut conn = Replica::establish(":memory:").unwrap();
         // Dynamically generated translated SQL cannot be expressed via the
         // typed DSL.
         diesel::sql_query(sql.as_str()).execute(&mut conn).unwrap();
@@ -256,7 +256,7 @@ fn timestamp_variants_semantic() -> Result<(), Box<dyn std::error::Error>> {
         let options = Pg2SqliteOptions::default();
         let translated = Pg2Sqlite::default().sql(&sql)?.translate(&options)?.into_vec();
 
-        let mut conn = SqliteConnection::establish(":memory:")?;
+        let mut conn = Replica::establish(":memory:")?;
 
         #[derive(QueryableByName, Debug)]
         struct TsResult {

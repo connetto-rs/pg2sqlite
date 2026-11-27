@@ -25,6 +25,7 @@ use postgres_harness::{apply, fresh_database};
 use sql_traits::structs::ParserDB;
 
 use crate::helpers::{
+    Replica,
     deployment::{caller, deployment},
     postgres as postgres_harness,
 };
@@ -936,15 +937,17 @@ const STORAGE_WRAPPER_PARITY: &[&str] = &[
 /// The pair a caller really has: the PostgreSQL `stored` table, the SQLite
 /// replica this crate's forward translation builds from it, and the schema
 /// the reverse direction reads.
-fn stored_pair(options: &Pg2SqliteOptions) -> (SqliteConnection, PgConnection, ParserDB) {
+fn stored_pair(options: &Pg2SqliteOptions) -> (Replica, PgConnection, ParserDB) {
     let replica = Pg2Sqlite::default()
         .sql(&format!("{STORED_DDL}{STORED_ROWS}"))
         .expect("the fixture parses")
         .translate_to_sql(options)
         .expect("the fixture translates")
         .into_vec();
-    let mut sqlite = SqliteConnection::establish(":memory:").expect("SQLite opens");
-    crate::helpers::jsonb_functions::register(&mut sqlite);
+    let mut sqlite = Replica::establish(":memory:").expect("SQLite opens");
+    crate::helpers::jsonb_functions::register(
+        sqlite.registration().expect("registration").sqlite(),
+    );
     for statement in &replica {
         sql_query(statement).execute(&mut sqlite).expect("the emitted fixture applies");
     }
@@ -971,7 +974,7 @@ fn stored_options() -> Pg2SqliteOptions {
 /// describes the divergence when the two answers differ.
 fn read_divergence(
     sqlite_sql: &str,
-    sqlite: &mut SqliteConnection,
+    sqlite: &mut Replica,
     postgres: &mut PgConnection,
     schema: &ParserDB,
     options: &Pg2SqliteOptions,

@@ -9,11 +9,13 @@
 //! The RLS triggers already emit the right idiom, `SELECT RAISE(ABORT, ...)
 //! WHERE NOT (...)`, so the guard has a place to go.
 
+use diesel::{Connection as _, connection::SimpleConnection};
 use pg2sqlite::{
     errors::{Error, RefusalCategory, TranslationDirection},
     prelude::{Pg2Sqlite, Pg2SqliteOptions},
 };
-use rusqlite::Connection;
+
+use crate::helpers::{Replica as Connection, SqliteAnyValue, query_values};
 
 const SCHEMA: &str = "CREATE TABLE t (id INT PRIMARY KEY, val INT);
      CREATE FUNCTION reject_negative() RETURNS trigger AS $$
@@ -34,10 +36,10 @@ fn applied() -> Connection {
         .translate_to_sql(&Pg2SqliteOptions::default())
         .expect("translate")
         .into_vec();
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = Connection::establish(":memory:").expect("in-memory SQLite");
     for statement in &statements {
         connection
-            .execute_batch(&format!("{statement};"))
+            .batch_execute(&format!("{statement};"))
             .unwrap_or_else(|error| panic!("emitted setup failed: {error}\n{statement}"));
     }
     connection
@@ -45,26 +47,30 @@ fn applied() -> Connection {
 
 #[test]
 fn a_row_the_guard_permits_is_inserted() {
-    let connection = applied();
-    connection.execute("INSERT INTO t VALUES (1, 5)", []).expect("a positive value is allowed");
-    let stored: i64 =
-        connection.query_row("SELECT val FROM t WHERE id = 1", [], |row| row.get(0)).expect("row");
-    assert_eq!(stored, 5);
+    let mut connection = applied();
+    connection.execute("INSERT INTO t VALUES (1, 5)", &[]).expect("a positive value is allowed");
+    let stored = query_values(&mut connection, "SELECT val FROM t WHERE id = 1", &[])
+        .expect("row")
+        .remove(0)
+        .remove(0);
+    assert_eq!(stored, SqliteAnyValue::Integer(5));
 }
 
 #[test]
 fn a_row_the_guard_rejects_aborts() {
-    let connection = applied();
+    let mut connection = applied();
     let error = connection
-        .execute("INSERT INTO t VALUES (2, -1)", [])
+        .execute("INSERT INTO t VALUES (2, -1)", &[])
         .expect_err("a negative value must abort");
     assert!(
         error.to_string().contains("val must not be negative"),
         "the abort must carry the message, got: {error}"
     );
-    let remaining: i64 =
-        connection.query_row("SELECT count(*) FROM t", [], |row| row.get(0)).expect("count");
-    assert_eq!(remaining, 0, "the rejected row must not be stored");
+    let remaining = query_values(&mut connection, "SELECT count(*) FROM t", &[])
+        .expect("count")
+        .remove(0)
+        .remove(0);
+    assert_eq!(remaining, SqliteAnyValue::Integer(0), "the rejected row must not be stored");
 }
 
 /// PostgreSQL refuses a RAISE whose `%` placeholders and arguments differ in

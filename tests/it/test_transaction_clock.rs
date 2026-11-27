@@ -62,8 +62,8 @@ fn clock_row(pg: &str, instants: &[i64]) -> Vec<Option<String>> {
     let mut scripted = vec![0; statements.len()];
     scripted.extend_from_slice(instants);
     let provider = Script(Arc::new(Mutex::new(scripted)));
-    let mut connection =
-        ManagedConnection::establish(":memory:", provider.clone()).expect("open managed SQLite");
+    let mut connection = ManagedConnection::establish_with_provider(":memory:", provider.clone())
+        .expect("open managed SQLite");
     for statement in &statements {
         connection
             .execute(statement, &[])
@@ -118,10 +118,7 @@ fn the_precision_forms_round_the_transaction_instant() {
 #[test]
 fn a_local_time_rounding_past_midnight_reads_24_00() {
     let row = clock_row("SELECT LOCALTIME(0), LOCALTIMESTAMP(0);", &[BEFORE_MIDNIGHT]);
-    assert_eq!(
-        row,
-        ["24:00:00", "2026-11-28 00:00:00"].map(|text| Some(String::from(text)))
-    );
+    assert_eq!(row, ["24:00:00", "2026-11-28 00:00:00"].map(|text| Some(String::from(text))));
 }
 
 /// A provider answering one microsecond later at each sample.
@@ -171,7 +168,8 @@ fn a_managed_script_runs_its_transactions_and_drains_deferred_checks_at_commit()
         .expect("parse")
         .translate(&Pg2SqliteOptions::default())
         .expect("translate");
-    let mut connection = ManagedConnection::establish(":memory:", counting()).expect("open");
+    let mut connection =
+        ManagedConnection::establish_with_provider(":memory:", counting()).expect("open");
     script.initialize_managed(&mut connection, FreshFiles::Both).expect("initialize");
     assert_eq!(
         texts(&mut connection, "SELECT count(DISTINCT created_at) FROM resources"),
@@ -210,10 +208,12 @@ fn a_managed_connection_replays_its_committed_temp_rows() {
     let path = files.path().join("main.db");
     let path = path.to_str().expect("UTF-8 path");
     {
-        let mut creating = ManagedConnection::establish(path, counting()).expect("create");
+        let mut creating =
+            ManagedConnection::establish_with_provider(path, counting()).expect("create");
         script.initialize_managed(&mut creating, FreshFiles::Both).expect("initialize");
     }
-    let mut reopened = ManagedConnection::establish(path, counting()).expect("reopen");
+    let mut reopened =
+        ManagedConnection::establish_with_provider(path, counting()).expect("reopen");
     script.connect_managed(&mut reopened).expect("replay the connection objects");
     assert_eq!(texts(&mut reopened, "SELECT id FROM drafts"), [[Some(String::from("1"))]]);
 }

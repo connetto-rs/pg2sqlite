@@ -1,7 +1,9 @@
 //! Test for DELETE ... USING translation inside triggers.
 
-use diesel::{Connection, RunQueryDsl, SqliteConnection, prelude::*};
+use diesel::{Connection, RunQueryDsl, connection::SimpleConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+
+use crate::helpers::{Replica, SqliteAnyValue, query_values};
 
 // Schema definitions for test tables
 diesel::table! {
@@ -93,7 +95,7 @@ FOR EACH ROW EXECUTE FUNCTION propagate_delete();
     insta::assert_snapshot!("delete_using_translation", translated_sql);
 
     // 4. Runtime Verification (Diesel + SQLite)
-    let mut connection = SqliteConnection::establish(":memory:")?;
+    let mut connection = Replica::establish(":memory:")?;
 
     // Enable recursive triggers if needed (though this is depth 1)
     diesel::sql_query("PRAGMA recursive_triggers = ON").execute(&mut connection)?;
@@ -230,20 +232,25 @@ fn test_delete_using_with_rls_table() -> Result<(), Box<dyn std::error::Error>> 
 
     // The whole batch must apply, and the DELETE must then remove exactly the
     // posts whose author is inactive when re-run against seeded rows.
-    let conn = rusqlite::Connection::open_in_memory()?;
+    let mut conn = Replica::establish(":memory:")?;
     for stmt in &translated {
-        conn.execute_batch(&format!("{stmt};"))
+        conn.batch_execute(&format!("{stmt};"))
             .unwrap_or_else(|e| panic!("SQLite rejected output: {e}\n{stmt}"));
     }
-    conn.execute_batch(
+    conn.batch_execute(
         "INSERT INTO users_rls (id, username, active) VALUES (1, 'a', 1), (2, 'b', 0);
          INSERT INTO posts (id, author_id, title) VALUES (10, 1, 'keep'), (20, 2, 'drop');",
     )?;
-    conn.execute_batch(&format!("{delete_stmt};"))?;
-    let surviving: Vec<i64> = conn
-        .prepare("SELECT id FROM posts ORDER BY id")?
-        .query_map([], |row| row.get(0))?
-        .collect::<Result<_, _>>()?;
+    conn.batch_execute(&format!("{delete_stmt};"))?;
+    let surviving: Vec<i64> = query_values(&mut conn, "SELECT id FROM posts ORDER BY id", &[])?
+        .into_iter()
+        .map(|row| {
+            match row[0] {
+                SqliteAnyValue::Integer(value) => value,
+                ref value => panic!("expected integer, got {value:?}"),
+            }
+        })
+        .collect();
     assert_eq!(surviving, vec![10], "only the inactive author's post is deleted");
 
     Ok(())

@@ -1,6 +1,6 @@
 //! Tests for PostgreSQL string function translations.
 
-use diesel::prelude::*;
+use diesel::{connection::SimpleConnection, prelude::*};
 use helpers::translate_pg;
 use pg2sqlite::prelude::Pg2SqliteOptions;
 
@@ -98,11 +98,9 @@ fn test_strpos_translation() {
         !select_stmt.to_lowercase().contains("strpos"),
         "strpos should not appear in output, got: {select_stmt}"
     );
-    // Translated SQL is dynamically generated; rusqlite execute_batch proves
-    // SQLite accepts it.
-    let conn = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+    let mut conn = helpers::Replica::establish(":memory:").expect("in-memory SQLite");
     for stmt in &translated {
-        conn.execute_batch(&format!("{stmt};"))
+        conn.batch_execute(&format!("{stmt};"))
             .unwrap_or_else(|e| panic!("SQLite rejected emitted SQL: {e}\n{stmt}"));
     }
 }
@@ -170,11 +168,9 @@ fn test_chr_translation() {
         !select_stmt.to_lowercase().contains("chr("),
         "chr should not appear in output, got: {select_stmt}"
     );
-    // Translated SQL is dynamically generated; rusqlite execute_batch proves
-    // SQLite accepts it.
-    let conn = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+    let mut conn = helpers::Replica::establish(":memory:").expect("in-memory SQLite");
     for stmt in &translated {
-        conn.execute_batch(&format!("{stmt};"))
+        conn.batch_execute(&format!("{stmt};"))
             .unwrap_or_else(|e| panic!("SQLite rejected emitted SQL: {e}\n{stmt}"));
     }
 }
@@ -240,11 +236,9 @@ fn test_concat_ws_translation() {
         !select_stmt.to_uppercase().contains("CONCAT_WS"),
         "CONCAT_WS should not appear in output, got: {select_stmt}"
     );
-    // Translated SQL is dynamically generated; rusqlite execute_batch proves
-    // SQLite accepts it.
-    let conn = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+    let mut conn = helpers::Replica::establish(":memory:").expect("in-memory SQLite");
     for stmt in &translated {
-        conn.execute_batch(&format!("{stmt};"))
+        conn.batch_execute(&format!("{stmt};"))
             .unwrap_or_else(|e| panic!("SQLite rejected emitted SQL: {e}\n{stmt}"));
     }
 }
@@ -358,7 +352,7 @@ fn left_function_to_substr() {
     let lower = sql.to_lowercase();
     assert!(lower.contains("substr("), "expected substr: {sql}");
     // Translator output is dynamic; typed DSL cannot reproduce it.
-    let mut conn = diesel::SqliteConnection::establish(":memory:").unwrap();
+    let mut conn = helpers::Replica::establish(":memory:").unwrap();
     diesel::sql_query(sql.as_str())
         .execute(&mut conn)
         .unwrap_or_else(|e| panic!("SQLite rejected output: {e}\n{sql}"));
@@ -368,7 +362,7 @@ fn left_function_to_substr() {
 fn left_function_semantic() -> Result<(), Box<dyn std::error::Error>> {
     let sql = "SELECT left('hello world', 5) AS result";
 
-    let mut conn = diesel::SqliteConnection::establish(":memory:")?;
+    let mut conn = helpers::Replica::establish(":memory:")?;
 
     #[derive(QueryableByName, Debug)]
     struct TextResult {
@@ -395,7 +389,7 @@ fn right_function_to_substr() {
     let lower = sql.to_lowercase();
     assert!(lower.contains("substr("), "expected substr: {sql}");
     // Translator output is dynamic; typed DSL cannot reproduce it.
-    let mut conn = diesel::SqliteConnection::establish(":memory:").unwrap();
+    let mut conn = helpers::Replica::establish(":memory:").unwrap();
     diesel::sql_query(sql.as_str())
         .execute(&mut conn)
         .unwrap_or_else(|e| panic!("SQLite rejected output: {e}\n{sql}"));
@@ -405,7 +399,7 @@ fn right_function_to_substr() {
 fn right_function_semantic() -> Result<(), Box<dyn std::error::Error>> {
     let sql = "SELECT right('hello world', 5) AS result";
 
-    let mut conn = diesel::SqliteConnection::establish(":memory:")?;
+    let mut conn = helpers::Replica::establish(":memory:")?;
 
     #[derive(QueryableByName, Debug)]
     struct TextResult {

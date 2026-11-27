@@ -13,6 +13,7 @@
 
 #![allow(dead_code)]
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
 use crate::{helpers, support};
@@ -42,11 +43,9 @@ fn test_vector_type_to_blob() -> Result<(), Box<dyn std::error::Error>> {
         create_table.contains("BLOB"),
         "vector(384) should translate to BLOB, got: {create_table}"
     );
-    // Translated DDL is dynamically generated; rusqlite execute_batch proves
-    // SQLite accepts it.
-    rusqlite::Connection::open_in_memory()
+    helpers::Replica::establish(":memory:")
         .expect("in-memory SQLite")
-        .execute_batch(&format!("{create_table};"))
+        .batch_execute(&format!("{create_table};"))
         .unwrap_or_else(|e| panic!("SQLite rejected CREATE TABLE: {e}\n{create_table}"));
 
     Ok(())
@@ -151,8 +150,8 @@ fn qualified_vector_cast_lowers_to_vec_f32() -> Result<(), Box<dyn std::error::E
         "the CAST AS BLOB fallback stores text bytes as the vector, got: {select_stmt}"
     );
     // Execute the standalone SELECT with sqlite-vec loaded so vec_f32 is known.
-    helpers::vec_connection()
-        .execute_batch(&format!("{select_stmt};"))
+    support::vec_connection()
+        .batch_execute(&format!("{select_stmt};"))
         .unwrap_or_else(|e| panic!("SQLite rejected SELECT: {e}\n{select_stmt}"));
     Ok(())
 }

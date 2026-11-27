@@ -6,7 +6,7 @@
 //! Without a session role, a batch whose gating policies name a role refuses
 //! translation naming the option.
 
-use diesel::{prelude::*, sqlite::SqliteConnection};
+use diesel::prelude::*;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
 
 use crate::helpers::deployment::{caller, deployment};
@@ -78,7 +78,7 @@ fn opts_without_role() -> Pg2SqliteOptions {
     // no with_acting_role
 }
 
-fn apply(opts: &Pg2SqliteOptions) -> SqliteConnection {
+fn apply(opts: &Pg2SqliteOptions) -> crate::helpers::Replica {
     apply_schema(
         &format!(
             "CREATE ROLE admin; CREATE ROLE app_user; {PG} GRANT SELECT, INSERT ON docs TO app_user;"
@@ -87,15 +87,18 @@ fn apply(opts: &Pg2SqliteOptions) -> SqliteConnection {
     )
 }
 
-fn apply_schema(sql: &str, opts: &Pg2SqliteOptions) -> SqliteConnection {
+fn apply_schema(sql: &str, opts: &Pg2SqliteOptions) -> crate::helpers::Replica {
     let stmts = Pg2Sqlite::default()
         .sql(sql)
         .expect("parse")
         .translate(opts)
         .expect("translate")
         .into_vec();
-    let mut conn = SqliteConnection::establish(":memory:").expect("open db");
-    app_user_utils::register_impl(&mut conn, || "alice".to_string()).expect("register app_user");
+    let mut conn = crate::helpers::Replica::establish(":memory:").expect("open db");
+    app_user_utils::register_impl(conn.registration().expect("registration").sqlite(), || {
+        "alice".to_string()
+    })
+    .expect("register app_user");
     for s in &stmts {
         // DDL (CREATE TABLE, CREATE VIEW, CREATE TRIGGER) cannot be expressed
         // in Diesel's typed DSL.
@@ -104,7 +107,7 @@ fn apply_schema(sql: &str, opts: &Pg2SqliteOptions) -> SqliteConnection {
     conn
 }
 
-fn seed(conn: &mut SqliteConnection) {
+fn seed(conn: &mut crate::helpers::Replica) {
     diesel::insert_into(docs_rls::table)
         .values(vec![
             SeedRow { id: 1, owner: "alice".to_owned(), body: Some("alice body".to_owned()) },

@@ -72,7 +72,7 @@ fn options() -> Pg2SqliteOptions {
 }
 
 /// An `a` row owned by `alice` whose `note` is null.
-fn seed_null_note_row(conn: &mut SqliteConnection) {
+fn seed_null_note_row(conn: &mut crate::helpers::Replica) {
     diesel::insert_into(t_rls::table)
         .values((t_rls::label.eq("a"), t_rls::owner.eq("alice")))
         .execute(conn)
@@ -80,7 +80,7 @@ fn seed_null_note_row(conn: &mut SqliteConnection) {
 }
 
 /// An `a` row owned by `alice` whose `note` is set.
-fn seed_set_note_row(conn: &mut SqliteConnection) {
+fn seed_set_note_row(conn: &mut crate::helpers::Replica) {
     diesel::insert_into(t_rls::table)
         .values((t_rls::label.eq("a"), t_rls::owner.eq("alice"), t_rls::note.eq("set")))
         .execute(conn)

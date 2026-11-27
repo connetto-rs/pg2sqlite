@@ -32,7 +32,7 @@ fn sales_fixture_sql() -> &'static str {
     "
 }
 
-fn load_sales_data(conn: &mut SqliteConnection) -> Result<(), Box<dyn std::error::Error>> {
+fn load_sales_data(conn: &mut crate::helpers::Replica) -> diesel::QueryResult<()> {
     diesel::sql_query(
         "INSERT INTO sales (id, region, product, amount) VALUES
          (1, 'North', 'A', 10),

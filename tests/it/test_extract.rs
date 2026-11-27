@@ -1,6 +1,6 @@
 //! Tests for PostgreSQL date-field extraction in SQLite.
 
-use diesel::RunQueryDsl;
+use diesel::{Connection, RunQueryDsl, connection::SimpleConnection};
 
 use crate::helpers;
 
@@ -21,9 +21,9 @@ fn extract_week_uses_the_iso_format() {
 
     assert!(query.contains("'%V'"), "expected the ISO week format: {query}");
     assert!(!query.contains("'%W'"), "%W is Sunday based, not ISO: {query}");
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = helpers::Replica::establish(":memory:").unwrap();
     for statement in &statements {
-        conn.execute_batch(&format!("{statement};")).unwrap_or_else(|e| {
+        conn.batch_execute(&format!("{statement};")).unwrap_or_else(|e| {
             panic!("EXTRACT(WEEK) output must run in SQLite: {e}\n{statement}")
         });
     }

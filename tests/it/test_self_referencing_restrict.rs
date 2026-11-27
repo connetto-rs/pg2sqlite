@@ -8,7 +8,7 @@
 //! The replica checks the key as SQLite's `NO ACTION`, which accepts a key
 //! another row takes over, as the README's semantic differences name.
 
-use diesel::{prelude::*, sqlite::SqliteConnection};
+use diesel::prelude::*;
 use pg2sqlite::prelude::Pg2SqliteOptions;
 
 use crate::helpers;
@@ -19,7 +19,7 @@ const SCHEMA: &str = "CREATE TABLE t (
      );";
 
 /// The rows of `t`, ordered by key.
-fn rows(connection: &mut SqliteConnection) -> Vec<(i32, Option<i32>)> {
+fn rows(connection: &mut crate::helpers::Replica) -> Vec<(i32, Option<i32>)> {
     diesel::table! {
         t (id) {
             id -> Integer,
@@ -38,7 +38,7 @@ fn run_on(schema: &str, seed: &str, statement: &str) -> QueryResult<Vec<(i32, Op
     let held = applied.iter().count();
     let script = helpers::translate_script(&format!("{setup} {statement}"), &options)
         .expect("the statement translates");
-    let mut connection = helpers::applied_script(&applied, None);
+    let mut connection = helpers::applied_script(&applied);
     for sql in script.iter().skip(held) {
         diesel::sql_query(sql).execute(&mut connection)?;
     }

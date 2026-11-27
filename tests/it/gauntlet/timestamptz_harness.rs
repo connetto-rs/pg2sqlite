@@ -5,7 +5,6 @@ use diesel::{
     pg::PgConnection,
     prelude::*,
     sql_types::{Nullable, Text},
-    sqlite::SqliteConnection,
 };
 use pg2sqlite::prelude::{Error, Pg2Sqlite, Pg2SqliteOptions, TypmodRounding};
 use sql_traits::structs::Deployment;
@@ -89,15 +88,22 @@ impl Events {
 
     /// The replica's schema under `roles` and `options`, holding the one row,
     /// on a connection with the zone and rounding functions registered.
-    pub(super) fn replica(&self, roles: &str, options: &Pg2SqliteOptions) -> SqliteConnection {
+    pub(super) fn replica(
+        &self,
+        roles: &str,
+        options: &Pg2SqliteOptions,
+    ) -> crate::helpers::Replica {
         let statements = Pg2Sqlite::default()
             .sql(&format!("{roles}{TABLE}{GRANT}"))
             .and_then(|source| source.translate(options))
             .unwrap_or_else(|error| panic!("pg2sqlite refused the schema: {error}"))
             .into_vec();
-        let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-        zone_functions::register(&mut connection);
-        TypmodRounding::register(&mut connection).expect("register the typmod rounding");
+        let mut connection = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
+        {
+            let mut registration = connection.registration().expect("registration");
+            zone_functions::register(registration.sqlite());
+            TypmodRounding::register(registration.sqlite()).expect("register the typmod rounding");
+        }
         apply_with_seed(&mut connection, &statements, |connection| {
             use schema::events;
             diesel::insert_into(events::table)
@@ -345,7 +351,7 @@ pub(super) fn translate(
 }
 
 /// What `connection` answers for the one-value `query`.
-pub(super) fn sqlite_query(connection: &mut SqliteConnection, query: &str) -> String {
+pub(super) fn sqlite_query(connection: &mut crate::helpers::Replica, query: &str) -> String {
     // The query under test is runtime text no typed DSL carries.
     diesel::sql_query(query)
         .get_result::<TextRow>(connection)

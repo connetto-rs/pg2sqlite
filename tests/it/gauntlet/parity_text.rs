@@ -4,7 +4,7 @@
 //! runs an expression on both engines and either asserts agreement or
 //! records a finding when a known divergence appears.
 
-use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{pg::PgConnection, prelude::*};
 use helpers::establish_connection;
 use pg2sqlite::prelude::Pg2Sqlite;
 use postgres_harness::Outcome;
@@ -59,7 +59,7 @@ fn pg_conn() -> PgConnection {
     conn
 }
 
-fn sqlite_conn() -> SqliteConnection {
+fn sqlite_conn() -> crate::helpers::Replica {
     // The translator output is a runtime string; raw sql_query is the correct
     // form for applying translated DDL.
     let translated = Pg2Sqlite::default()
@@ -112,7 +112,7 @@ fn pg_rows(conn: &mut PgConnection, sql: &str) -> Outcome {
     rows_outcome(conn, sql)
 }
 
-fn sqlite_rows(conn: &mut SqliteConnection, sql: &str) -> Outcome {
+fn sqlite_rows(conn: &mut crate::helpers::Replica, sql: &str) -> Outcome {
     rows_outcome(conn, sql)
 }
 

@@ -3,7 +3,7 @@
 //! Each fixture runs the same writes on both engines and compares what the
 //! trigger left in storage, which is where `FOUND` and the locked read show.
 
-use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{pg::PgConnection, prelude::*};
 use helpers::establish_connection;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use postgres_harness::Outcome;
@@ -12,7 +12,7 @@ use super::harness::execute_ddl;
 use crate::{helpers, helpers::postgres as postgres_harness};
 
 /// Translates `fixture` and applies it to a fresh SQLite connection.
-fn apply_to_sqlite(fixture: &str) -> SqliteConnection {
+fn apply_to_sqlite(fixture: &str) -> crate::helpers::Replica {
     let translated = Pg2Sqlite::default()
         .sql(fixture)
         .expect("parse fixture")
@@ -150,7 +150,7 @@ macro_rules! found_runner {
 }
 
 found_runner!(FoundPostgresRunner, PgConnection);
-found_runner!(FoundSqliteRunner, SqliteConnection);
+found_runner!(FoundSqliteRunner, crate::helpers::Replica);
 
 fn found_scenario() -> Vec<FoundStep> {
     vec![
@@ -303,7 +303,7 @@ macro_rules! lock_runner {
 }
 
 lock_runner!(LockPostgresRunner, PgConnection);
-lock_runner!(LockSqliteRunner, SqliteConnection);
+lock_runner!(LockSqliteRunner, crate::helpers::Replica);
 
 /// Every row-locking clause reads the same rows on both engines, `SKIP
 /// LOCKED` included, and a missing row is refused on both.

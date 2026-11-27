@@ -15,7 +15,7 @@
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::duplicate_mod)]
 
-use diesel::{prelude::*, sqlite::SqliteConnection};
+use diesel::prelude::*;
 use helpers::set_session_user_id;
 use pg2sqlite::prelude::{Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 use rosetta_uuid::Uuid;
@@ -136,20 +136,29 @@ impl Ownable {
     /// Inserts the ownable into the database.
     /// The RLS INSERT trigger auto-adds the creator as the first owner.
     /// Note: The session user must be set before calling this method.
-    pub fn insert(self, conn: &mut SqliteConnection) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn insert(
+        self,
+        conn: &mut crate::helpers::Replica,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         diesel::insert_into(ownables::table).values(&self).execute(conn)?;
         Ok(self)
     }
 
     /// Returns whether the ownable exists in the database.
-    pub fn exists(&self, conn: &mut SqliteConnection) -> Result<bool, Box<dyn std::error::Error>> {
+    pub fn exists(
+        &self,
+        conn: &mut crate::helpers::Replica,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
         let count: i64 =
             ownables::table.filter(ownables::id.eq(&self.id)).count().get_result(conn)?;
         Ok(count > 0)
     }
 
     /// Deletes the ownable from the database.
-    pub fn delete(&self, conn: &mut SqliteConnection) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn delete(
+        &self,
+        conn: &mut crate::helpers::Replica,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         diesel::delete(ownables::table.filter(ownables::id.eq(&self.id))).execute(conn)?;
         Ok(())
     }
@@ -160,7 +169,7 @@ impl Ownable {
         &self,
         owner: &T,
         as_user: &User,
-        conn: &mut SqliteConnection,
+        conn: &mut crate::helpers::Replica,
     ) -> Result<(), Box<dyn std::error::Error>> {
         set_session_user_id(&as_user.id);
         diesel::insert_into(ownable_owners::table)
@@ -178,7 +187,7 @@ impl Ownable {
         &self,
         owner: &T,
         as_user: &User,
-        conn: &mut SqliteConnection,
+        conn: &mut crate::helpers::Replica,
     ) -> Result<usize, Box<dyn std::error::Error>> {
         set_session_user_id(&as_user.id);
         let rows = diesel::delete(
@@ -193,7 +202,7 @@ impl Ownable {
     /// Returns the number of owners for this ownable.
     pub fn owner_count(
         &self,
-        conn: &mut SqliteConnection,
+        conn: &mut crate::helpers::Replica,
     ) -> Result<i64, Box<dyn std::error::Error>> {
         let count: i64 = ownable_owners::table
             .filter(ownable_owners::ownable_id.eq(&self.id))
@@ -206,7 +215,7 @@ impl Ownable {
     pub fn has_owner<T: HasOwnerId>(
         &self,
         owner: &T,
-        conn: &mut SqliteConnection,
+        conn: &mut crate::helpers::Replica,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let count: i64 = ownable_owners::table
             .filter(ownable_owners::ownable_id.eq(&self.id))
@@ -221,7 +230,7 @@ impl Ownable {
         &self,
         admin: &T,
         grantor: &User,
-        conn: &mut SqliteConnection,
+        conn: &mut crate::helpers::Replica,
     ) -> Result<(), Box<dyn std::error::Error>> {
         diesel::insert_into(ownable_administrators::table)
             .values((
@@ -237,7 +246,7 @@ impl Ownable {
     pub fn remove_admin<T: HasOwnerId>(
         &self,
         admin: &T,
-        conn: &mut SqliteConnection,
+        conn: &mut crate::helpers::Replica,
     ) -> Result<usize, Box<dyn std::error::Error>> {
         let rows = diesel::delete(
             ownable_administrators::table
@@ -252,7 +261,7 @@ impl Ownable {
     pub fn has_admin<T: HasOwnerId>(
         &self,
         admin: &T,
-        conn: &mut SqliteConnection,
+        conn: &mut crate::helpers::Replica,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let count: i64 = ownable_administrators::table
             .filter(ownable_administrators::ownable_id.eq(&self.id))
@@ -268,7 +277,7 @@ impl Ownable {
         grantee: &T,
         grantor: &User,
         role_id: i16,
-        conn: &mut SqliteConnection,
+        conn: &mut crate::helpers::Replica,
     ) -> Result<Grant, Box<dyn std::error::Error>> {
         set_session_user_id(&grantor.id);
         let grant = Grant {
@@ -286,7 +295,7 @@ impl Ownable {
     pub fn has_grant<T: HasOwnerId>(
         &self,
         grantee: &T,
-        conn: &mut SqliteConnection,
+        conn: &mut crate::helpers::Replica,
     ) -> Result<Option<i16>, Box<dyn std::error::Error>> {
         let role: Option<i16> = grants::table
             .filter(grants::ownable_id.eq(&self.id))
@@ -301,7 +310,7 @@ impl Ownable {
     pub fn revoke_access<T: HasOwnerId>(
         &self,
         grantee: &T,
-        conn: &mut SqliteConnection,
+        conn: &mut crate::helpers::Replica,
     ) -> Result<usize, Box<dyn std::error::Error>> {
         let rows = diesel::delete(
             grants::table

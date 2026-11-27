@@ -13,8 +13,10 @@
 //!
 //! Every expected value below was read off PostgreSQL 17.
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::prelude::{ArrayRepresentation, Pg2Sqlite, Pg2SqliteOptions};
-use rusqlite::{Connection, types::FromSql};
+
+use crate::helpers::{Replica, SqliteAnyValue, query_values};
 
 const TABLE: &str = "CREATE TABLE t (id INT PRIMARY KEY, tags TEXT[]);";
 
@@ -33,27 +35,32 @@ fn translate(pg: &str) -> Vec<String> {
 
 /// Applies everything but the last statement, then reads the last one's first
 /// column.
-fn evaluate<T: FromSql>(pg: &str) -> T {
+fn evaluate(pg: &str) -> Option<String> {
     let mut statements = translate(pg);
     let probe = statements.pop().expect("a probe statement");
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = Replica::establish(":memory:").expect("in-memory SQLite");
     for statement in &statements {
         connection
-            .execute_batch(&format!("{statement};"))
+            .batch_execute(&format!("{statement};"))
             .unwrap_or_else(|error| panic!("emitted setup failed: {error}\n{statement}"));
     }
-    connection
-        .query_row(&probe, [], |row| row.get::<_, T>(0))
-        .unwrap_or_else(|error| panic!("emitted probe failed: {error}\n{probe}"))
+    let rows = query_values(&mut connection, &probe, &[])
+        .unwrap_or_else(|error| panic!("emitted probe failed: {error}\n{probe}"));
+    nullable_text(rows.into_iter().next().expect("probe row").remove(0))
+}
+
+fn nullable_text(value: SqliteAnyValue) -> Option<String> {
+    match value {
+        SqliteAnyValue::Null => None,
+        SqliteAnyValue::Text(value) => Some(value),
+        value => panic!("expected nullable text, got {value:?}"),
+    }
 }
 
 /// PostgreSQL answers the empty string, of length zero. This used to be NULL.
 #[test]
 fn an_empty_array_joins_to_the_empty_string() {
-    assert_eq!(
-        evaluate::<Option<String>>("SELECT array_to_string(ARRAY[]::text[], ',');"),
-        Some(String::new())
-    );
+    assert_eq!(evaluate("SELECT array_to_string(ARRAY[]::text[], ',');"), Some(String::new()));
 }
 
 /// Both engines skip a NULL element, so an array of nothing but NULLs has
@@ -61,7 +68,7 @@ fn an_empty_array_joins_to_the_empty_string() {
 #[test]
 fn an_array_of_only_nulls_joins_to_the_empty_string() {
     assert_eq!(
-        evaluate::<Option<String>>("SELECT array_to_string(ARRAY[NULL, NULL]::text[], ',');"),
+        evaluate("SELECT array_to_string(ARRAY[NULL, NULL]::text[], ',');"),
         Some(String::new())
     );
 }
@@ -70,15 +77,12 @@ fn an_array_of_only_nulls_joins_to_the_empty_string() {
 /// broken.
 #[test]
 fn a_null_array_stays_null() {
-    assert_eq!(evaluate::<Option<String>>("SELECT array_to_string(NULL::text[], ',');"), None);
+    assert_eq!(evaluate("SELECT array_to_string(NULL::text[], ',');"), None);
 }
 
 #[test]
 fn a_populated_array_is_unchanged() {
-    assert_eq!(
-        evaluate::<Option<String>>("SELECT array_to_string(ARRAY['a', 'b'], ',');"),
-        Some("a,b".to_string())
-    );
+    assert_eq!(evaluate("SELECT array_to_string(ARRAY['a', 'b'], ',');"), Some("a,b".to_string()));
 }
 
 /// PostgreSQL skips the NULL rather than joining an empty slot, so the answer
@@ -86,7 +90,7 @@ fn a_populated_array_is_unchanged() {
 #[test]
 fn a_null_element_is_skipped_rather_than_joined() {
     assert_eq!(
-        evaluate::<Option<String>>("SELECT array_to_string(ARRAY['a', NULL, 'b'], ',');"),
+        evaluate("SELECT array_to_string(ARRAY['a', NULL, 'b'], ',');"),
         Some("a,b".to_string())
     );
 }
@@ -102,18 +106,17 @@ fn a_column_holding_each_case_answers_as_postgresql_does() {
          SELECT array_to_string(tags, ',') FROM t ORDER BY id;",
     );
     let (probe, setup) = statements.split_last().expect("a probe statement");
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = Replica::establish(":memory:").expect("in-memory SQLite");
     for statement in setup {
         connection
-            .execute_batch(&format!("{statement};"))
+            .batch_execute(&format!("{statement};"))
             .unwrap_or_else(|error| panic!("emitted setup failed: {error}\n{statement}"));
     }
-    let mut prepared = connection.prepare(probe).expect("prepare the probe");
-    let answers: Vec<Option<String>> = prepared
-        .query_map([], |row| row.get::<_, Option<String>>(0))
+    let answers: Vec<Option<String>> = query_values(&mut connection, probe, &[])
         .expect("query")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("read every row");
+        .into_iter()
+        .map(|mut row| nullable_text(row.remove(0)))
+        .collect();
     assert_eq!(
         answers,
         vec![Some(String::new()), Some("a,b".to_string()), None, Some(String::new())]

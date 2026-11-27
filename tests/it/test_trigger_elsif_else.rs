@@ -40,11 +40,11 @@ struct NewEvent {
     data: Option<String>,
 }
 
-fn translate_and_setup() -> Result<diesel::SqliteConnection, Box<dyn std::error::Error>> {
-    crate::support::fixtures::apply_fixture(
+fn translate_and_setup() -> Result<crate::helpers::Replica, Box<dyn std::error::Error>> {
+    Ok(crate::support::fixtures::apply_fixture(
         include_str!("../fixtures/trigger_elsif_else.sql"),
         &Pg2SqliteOptions::default(),
-    )
+    )?)
 }
 
 /// Snapshot test for ELSIF/ELSE translation.

@@ -229,13 +229,14 @@ fn translation_options() -> Pg2SqliteOptions {
 }
 
 /// Helper to set up the database with all translated statements.
-fn setup_database() -> Result<SqliteConnection, Box<dyn std::error::Error>> {
+fn setup_database() -> Result<crate::helpers::Replica, Box<dyn std::error::Error>> {
     let translated = helpers::translate_pg(SQL_FIXTURE, &translation_options())?;
 
     let mut conn = establish_connection();
-    write_is_exempt_utils::register_nondeterministic_impl(&mut conn, || {
-        WRITE_IS_EXEMPT.with(Cell::get)
-    })?;
+    write_is_exempt_utils::register_nondeterministic_impl(
+        conn.registration().expect("registration").sqlite(),
+        || WRITE_IS_EXEMPT.with(Cell::get),
+    )?;
 
     for stmt in &translated {
         diesel::sql_query(stmt).execute(&mut conn)?;
@@ -245,7 +246,7 @@ fn setup_database() -> Result<SqliteConnection, Box<dyn std::error::Error>> {
 }
 
 fn insert_synced_user(
-    conn: &mut SqliteConnection,
+    conn: &mut crate::helpers::Replica,
     user: &User,
 ) -> Result<usize, diesel::result::Error> {
     WRITE_IS_EXEMPT.with(|exempt| exempt.set(true));
@@ -255,7 +256,7 @@ fn insert_synced_user(
 }
 
 /// A `testuser` row for the read-only tests to act on.
-fn seed_test_user(conn: &mut SqliteConnection) -> Result<User, Box<dyn std::error::Error>> {
+fn seed_test_user(conn: &mut crate::helpers::Replica) -> Result<User, Box<dyn std::error::Error>> {
     let user = User::new(Uuid::new_v4(), "testuser", "test@example.com");
     insert_synced_user(conn, &user)?;
     Ok(user)

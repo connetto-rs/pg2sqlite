@@ -1,12 +1,12 @@
 //! Maintenance trigger translation, including R106 sequential assignments and
 //! R107 statement-supplied override.
 
-use diesel::{Connection, QueryableByName, RunQueryDsl, SqliteConnection, prelude::*};
+use diesel::{Connection, QueryableByName, RunQueryDsl, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, Translator};
 use sql_traits::structs::ParserDB;
 use sqlparser::{ast::Statement, dialect::PostgreSqlDialect, parser::Parser};
 
-use crate::helpers;
+use crate::{helpers, helpers::Replica};
 
 // Schema definitions for test tables
 diesel::table! {
@@ -401,7 +401,7 @@ FOR EACH ROW EXECUTE FUNCTION set_brands_edited_at();
 
     let translated = translate_with_direct_create_trigger_path(sql, &Pg2SqliteOptions::default())?;
 
-    let mut connection = SqliteConnection::establish(":memory:")?;
+    let mut connection = Replica::establish(":memory:")?;
     diesel::sql_query("PRAGMA foreign_keys = ON").execute(&mut connection)?;
     diesel::sql_query("PRAGMA recursive_triggers = ON").execute(&mut connection)?;
 

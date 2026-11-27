@@ -172,8 +172,8 @@ fn sqlite_accepts(sql: &str) {
 /// emitted script.
 fn sqlite_syntax_check(sql: &str) {
     helpers::register_sqlite_vec_once();
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    conn.execute_batch("CREATE TABLE t (id INTEGER, a TEXT, embedding BLOB);").unwrap();
-    conn.execute_batch(&format!("{sql};"))
+    let mut conn = helpers::Replica::establish(":memory:").unwrap();
+    conn.batch_execute("CREATE TABLE t (id INTEGER, a TEXT, embedding BLOB);").unwrap();
+    conn.batch_execute(&format!("{sql};"))
         .unwrap_or_else(|e| panic!("SQLite rejected emitted SQL: {e}\n{sql}"));
 }

@@ -8,10 +8,13 @@
 //!   4. GENERATED ALWAYS AS IDENTITY (START WITH …)
 //!   5. PRIMARY KEY / UNIQUE DEFERRABLE at column level
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use rusqlite::Connection;
 
-use crate::helpers;
+use crate::{
+    helpers,
+    helpers::{Replica, SqliteAnyValue, query_values},
+};
 fn opts() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
 }
@@ -25,11 +28,11 @@ fn translate(sql: &str) -> Result<Vec<String>, pg2sqlite::errors::Error> {
 
 use helpers::translate_with_default_warnings as translate_with_warnings;
 
-/// Executes every statement through rusqlite and returns the first error.
-fn sqlite_exec(stmts: &[String]) -> Result<(), rusqlite::Error> {
-    let conn = Connection::open_in_memory()?;
+/// Executes every statement and returns the first error.
+fn sqlite_exec(stmts: &[String]) -> diesel::QueryResult<()> {
+    let mut conn = Replica::establish(":memory:").expect("in-memory SQLite");
     for s in stmts {
-        conn.execute_batch(s)?;
+        conn.batch_execute(s)?;
     }
     Ok(())
 }
@@ -58,13 +61,20 @@ fn drop_column_restrict_translates_and_runs() {
     sqlite_exec(&stmts).expect("emitted SQL must run in SQLite");
 
     // Verify the column is actually gone.
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Replica::establish(":memory:").unwrap();
     for s in &stmts {
-        conn.execute_batch(s).unwrap();
+        conn.batch_execute(s).unwrap();
     }
-    let col_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM pragma_table_info('t') WHERE name = 'b'", [], |r| r.get(0))
-        .unwrap();
+    let col_count = match query_values(
+        &mut conn,
+        "SELECT COUNT(*) FROM pragma_table_info('t') WHERE name = 'b'",
+        &[],
+    )
+    .unwrap()[0][0]
+    {
+        SqliteAnyValue::Integer(value) => value,
+        ref value => panic!("expected integer, got {value:?}"),
+    };
     assert_eq!(col_count, 0, "column b must have been dropped");
 }
 
@@ -92,12 +102,12 @@ fn unique_include_is_dropped_with_warning_and_runs() {
     sqlite_exec(&stmts).expect("emitted SQL must run in SQLite");
 
     // The UNIQUE constraint must still enforce uniqueness.
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Replica::establish(":memory:").unwrap();
     for s in &stmts {
-        conn.execute_batch(s).unwrap();
+        conn.batch_execute(s).unwrap();
     }
-    conn.execute_batch("INSERT INTO t VALUES (1, 10);").expect("first row");
-    let err = conn.execute_batch("INSERT INTO t VALUES (1, 20);");
+    conn.batch_execute("INSERT INTO t VALUES (1, 10);").expect("first row");
+    let err = conn.batch_execute("INSERT INTO t VALUES (1, 20);");
     assert!(err.is_err(), "UNIQUE constraint must still fire after INCLUDE is dropped");
 }
 
@@ -117,12 +127,12 @@ fn primary_key_include_is_dropped_with_warning_and_runs() {
     sqlite_exec(&stmts).expect("emitted SQL must run in SQLite");
 
     // Primary key must still enforce uniqueness.
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Replica::establish(":memory:").unwrap();
     for s in &stmts {
-        conn.execute_batch(s).unwrap();
+        conn.batch_execute(s).unwrap();
     }
-    conn.execute_batch("INSERT INTO t VALUES (1, 10);").expect("first row");
-    let err = conn.execute_batch("INSERT INTO t VALUES (1, 20);");
+    conn.batch_execute("INSERT INTO t VALUES (1, 10);").expect("first row");
+    let err = conn.batch_execute("INSERT INTO t VALUES (1, 20);");
     assert!(err.is_err(), "PRIMARY KEY constraint must still fire after INCLUDE is dropped");
 }
 
@@ -191,12 +201,15 @@ fn bare_identity_still_works_as_rowid_alias() {
     sqlite_exec(&stmts).expect("emitted SQL must run in SQLite");
 
     // The rowid auto-assigns.
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Replica::establish(":memory:").unwrap();
     for s in &stmts {
-        conn.execute_batch(s).unwrap();
+        conn.batch_execute(s).unwrap();
     }
-    conn.execute_batch("INSERT INTO t DEFAULT VALUES;").unwrap();
-    let id: i64 = conn.query_row("SELECT id FROM t", [], |r| r.get(0)).unwrap();
+    conn.batch_execute("INSERT INTO t DEFAULT VALUES;").unwrap();
+    let id = match query_values(&mut conn, "SELECT id FROM t", &[]).unwrap()[0][0] {
+        SqliteAnyValue::Integer(value) => value,
+        ref value => panic!("expected integer, got {value:?}"),
+    };
     assert_ne!(id, 0, "rowid alias must auto-assign");
 }
 

@@ -21,6 +21,8 @@
 use diesel::prelude::*;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
+use crate::helpers::Replica;
+
 mod schema {
     diesel::table! {
         t3 (id) {
@@ -79,10 +81,10 @@ fn translate_err(dml: &str) -> String {
 
 /// Applies every emitted statement but the last, and returns the connection
 /// together with the last statement, which is the one under test.
-fn apply_setup(dml: &str) -> (SqliteConnection, String) {
+fn apply_setup(dml: &str) -> (Replica, String) {
     let mut statements = translate(dml);
     let probe = statements.pop().expect("at least one statement");
-    let mut connection = SqliteConnection::establish(":memory:").expect("connect");
+    let mut connection = Replica::establish(":memory:").expect("connect");
     for statement in statements {
         diesel::sql_query(&statement)
             .execute(&mut connection)
@@ -92,7 +94,7 @@ fn apply_setup(dml: &str) -> (SqliteConnection, String) {
 }
 
 /// The integers a translated statement's RETURNING clause answers.
-fn returned_numbers(dml: &str) -> (SqliteConnection, Vec<i32>) {
+fn returned_numbers(dml: &str) -> (Replica, Vec<i32>) {
     let (mut connection, probe) = apply_setup(dml);
     let rows = diesel::sql_query(&probe)
         .load::<Number>(&mut connection)

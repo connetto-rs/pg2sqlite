@@ -41,7 +41,7 @@ fn test_custom_suffix_renames_backing_table() {
         sql_output.contains("CREATE VIEW documents "),
         "View should still be named 'documents' (no suffix), got:\n{sql_output}"
     );
-    let mut conn = SqliteConnection::establish(":memory:").expect("open in-memory SQLite");
+    let mut conn = crate::helpers::Replica::establish(":memory:").expect("open in-memory SQLite");
     for stmt in &translated {
         conn.batch_execute(&format!("{stmt};")).expect("apply the emitted statement");
     }
@@ -86,7 +86,7 @@ fn test_custom_suffix_in_foreign_keys() {
         !sql_output.contains("REFERENCES users_rls"),
         "FK must not reference 'users_rls' when custom suffix is set, got:\n{sql_output}"
     );
-    let mut conn = SqliteConnection::establish(":memory:").expect("open in-memory SQLite");
+    let mut conn = crate::helpers::Replica::establish(":memory:").expect("open in-memory SQLite");
     for stmt in &translated {
         conn.batch_execute(&format!("{stmt};")).expect("apply the emitted statement");
     }

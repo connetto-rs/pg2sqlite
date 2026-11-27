@@ -6,11 +6,14 @@
 //! DELETE, SetOperation in query body, inject_condition_into_statement
 //! (UPDATE/DELETE).
 
-use diesel::RunQueryDsl;
+use diesel::{Connection, RunQueryDsl, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use translate_helpers::translate_default as translate;
 
-use crate::{helpers, helpers::translate as translate_helpers};
+use crate::{
+    helpers,
+    helpers::{SqliteAnyValue, translate as translate_helpers},
+};
 
 /// Translates `sql` with default options and executes every emitted statement
 /// in an in-memory SQLite connection, verifying the output is valid SQLite.
@@ -182,8 +185,8 @@ fn select_into_with_comma_expression_produces_valid_sqlite_trigger_sql() {
         .into_vec();
     let sqlite_sql = translated.iter().map(ToString::to_string).collect::<Vec<_>>().join(";\n");
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    let exec_result = conn.execute_batch(&sqlite_sql);
+    let mut conn = helpers::Replica::establish(":memory:").unwrap();
+    let exec_result = conn.batch_execute(&sqlite_sql);
     assert!(
         exec_result.is_ok(),
         "Translated SQL should execute in SQLite, got error: {exec_result:?}\nSQL:\n{sqlite_sql}"
@@ -664,20 +667,26 @@ fn a_guarded_truncate_keeps_its_condition() {
     ";
 
     let stmts = helpers::translate_pg(sql, &Pg2SqliteOptions::default()).unwrap();
-    let connection = helpers::apply_rusqlite_statements(&stmts);
-    connection.execute_batch("INSERT INTO trash (id) VALUES (1), (2), (3);").expect("rows");
+    let mut connection = helpers::apply_statements(&stmts);
+    connection.batch_execute("INSERT INTO trash (id) VALUES (1), (2), (3);").expect("rows");
 
-    connection.execute_batch("INSERT INTO t (id, val) VALUES (1, -5);").expect("guard is false");
-    let surviving: i64 = connection
-        .query_row("SELECT count(*) FROM trash", [], |row| row.get(0))
+    connection.batch_execute("INSERT INTO t (id, val) VALUES (1, -5);").expect("guard is false");
+    let surviving = helpers::query_values(&mut connection, "SELECT count(*) FROM trash", &[])
         .expect("count after the false guard");
-    assert_eq!(surviving, 3, "a false condition must leave the table alone");
+    assert_eq!(
+        surviving[0][0],
+        SqliteAnyValue::Integer(3),
+        "a false condition must leave the table alone"
+    );
 
-    connection.execute_batch("INSERT INTO t (id, val) VALUES (2, 5);").expect("guard is true");
-    let emptied: i64 = connection
-        .query_row("SELECT count(*) FROM trash", [], |row| row.get(0))
+    connection.batch_execute("INSERT INTO t (id, val) VALUES (2, 5);").expect("guard is true");
+    let emptied = helpers::query_values(&mut connection, "SELECT count(*) FROM trash", &[])
         .expect("count after the true guard");
-    assert_eq!(emptied, 0, "a true condition must run the statement");
+    assert_eq!(
+        emptied[0][0],
+        SqliteAnyValue::Integer(0),
+        "a true condition must run the statement"
+    );
 }
 
 /// `TG_OP` is folded to the event literal wherever it is read, not only in an
@@ -698,13 +707,15 @@ fn a_trigger_special_is_folded_in_a_statement_body() {
     ";
 
     let stmts = helpers::translate_pg(sql, &Pg2SqliteOptions::default()).unwrap();
-    let connection = helpers::apply_rusqlite_statements(&stmts);
-    connection.execute_batch("INSERT INTO t (id) VALUES (1);").expect("trigger fires");
+    let mut connection = helpers::apply_statements(&stmts);
+    connection.batch_execute("INSERT INTO t (id) VALUES (1);").expect("trigger fires");
 
-    let logged: (String, String) = connection
-        .query_row("SELECT op, tbl FROM log", [], |row| Ok((row.get(0)?, row.get(1)?)))
+    let logged = helpers::query_values(&mut connection, "SELECT op, tbl FROM log", &[])
         .expect("the trigger logged a row");
-    assert_eq!(logged, ("INSERT".to_string(), "t".to_string()));
+    assert_eq!(
+        logged[0],
+        vec![SqliteAnyValue::Text("INSERT".to_string()), SqliteAnyValue::Text("t".to_string())]
+    );
 }
 
 /// SQLite's trigger body grammar takes no `WITH` before an `UPDATE`, so the
@@ -725,13 +736,17 @@ fn a_with_update_in_a_trigger_body_runs() {
     ";
 
     let stmts = helpers::translate_pg(sql, &Pg2SqliteOptions::default()).unwrap();
-    let connection = helpers::apply_rusqlite_statements(&stmts);
-    connection.execute_batch("INSERT INTO t (id, n) VALUES (1, 0);").expect("seed row");
-    connection.execute_batch("UPDATE t SET id = 1 WHERE id = 1;").expect("trigger fires");
+    let mut connection = helpers::apply_statements(&stmts);
+    connection.batch_execute("INSERT INTO t (id, n) VALUES (1, 0);").expect("seed row");
+    connection.batch_execute("UPDATE t SET id = 1 WHERE id = 1;").expect("trigger fires");
 
-    let n: i64 =
-        connection.query_row("SELECT n FROM t", [], |row| row.get(0)).expect("read the row back");
-    assert_eq!(n, 99, "the CTE's value must reach the assignment");
+    let rows =
+        helpers::query_values(&mut connection, "SELECT n FROM t", &[]).expect("read the row back");
+    assert_eq!(
+        rows[0][0],
+        SqliteAnyValue::Integer(99),
+        "the CTE's value must reach the assignment"
+    );
 }
 
 /// A CTE that declares its column names. Inlining it as a derived table loses
@@ -752,13 +767,17 @@ fn a_with_update_naming_its_cte_columns_runs() {
     ";
 
     let stmts = helpers::translate_pg(sql, &Pg2SqliteOptions::default()).unwrap();
-    let connection = helpers::apply_rusqlite_statements(&stmts);
-    connection.execute_batch("INSERT INTO t (id, n) VALUES (1, 0);").expect("seed row");
-    connection.execute_batch("UPDATE t SET id = 1 WHERE id = 1;").expect("trigger fires");
+    let mut connection = helpers::apply_statements(&stmts);
+    connection.batch_execute("INSERT INTO t (id, n) VALUES (1, 0);").expect("seed row");
+    connection.batch_execute("UPDATE t SET id = 1 WHERE id = 1;").expect("trigger fires");
 
-    let n: i64 =
-        connection.query_row("SELECT n FROM t", [], |row| row.get(0)).expect("read the row back");
-    assert_eq!(n, 99, "the declared column name must survive the inlining");
+    let rows =
+        helpers::query_values(&mut connection, "SELECT n FROM t", &[]).expect("read the row back");
+    assert_eq!(
+        rows[0][0],
+        SqliteAnyValue::Integer(99),
+        "the declared column name must survive the inlining"
+    );
 }
 
 /// A CTE reading the one declared before it. Each is inlined into the bodies
@@ -779,13 +798,13 @@ fn a_with_update_over_chained_ctes_runs() {
     ";
 
     let stmts = helpers::translate_pg(sql, &Pg2SqliteOptions::default()).unwrap();
-    let connection = helpers::apply_rusqlite_statements(&stmts);
-    connection.execute_batch("INSERT INTO t (id, n) VALUES (1, 0);").expect("seed row");
-    connection.execute_batch("UPDATE t SET id = 1 WHERE id = 1;").expect("trigger fires");
+    let mut connection = helpers::apply_statements(&stmts);
+    connection.batch_execute("INSERT INTO t (id, n) VALUES (1, 0);").expect("seed row");
+    connection.batch_execute("UPDATE t SET id = 1 WHERE id = 1;").expect("trigger fires");
 
-    let n: i64 =
-        connection.query_row("SELECT n FROM t", [], |row| row.get(0)).expect("read the row back");
-    assert_eq!(n, 14, "the second CTE must carry the first");
+    let rows =
+        helpers::query_values(&mut connection, "SELECT n FROM t", &[]).expect("read the row back");
+    assert_eq!(rows[0][0], SqliteAnyValue::Integer(14), "the second CTE must carry the first");
 }
 
 /// Inlining copies a CTE's body into each read of it, so a body that answers
@@ -831,13 +850,16 @@ fn a_volatile_cte_read_once_is_inlined() {
     ";
 
     let stmts = helpers::translate_pg(sql, &Pg2SqliteOptions::default()).unwrap();
-    let connection = helpers::apply_rusqlite_statements(&stmts);
-    connection.execute_batch("INSERT INTO t (id, a) VALUES (1, 0);").expect("seed row");
-    connection.execute_batch("UPDATE t SET id = 1 WHERE id = 1;").expect("trigger fires");
+    let mut connection = helpers::apply_statements(&stmts);
+    connection.batch_execute("INSERT INTO t (id, a) VALUES (1, 0);").expect("seed row");
+    connection.batch_execute("UPDATE t SET id = 1 WHERE id = 1;").expect("trigger fires");
 
-    let a: f64 =
-        connection.query_row("SELECT a FROM t", [], |row| row.get(0)).expect("read the row back");
-    assert!((0.0..1.0).contains(&a), "a uniform random float, got {a}");
+    let rows =
+        helpers::query_values(&mut connection, "SELECT a FROM t", &[]).expect("read the row back");
+    let SqliteAnyValue::Real(value) = rows[0][0] else {
+        panic!("expected real, got {:?}", rows[0][0]);
+    };
+    assert!((0.0..1.0).contains(&value), "a uniform random float, got {value}");
 }
 
 /// A CTE whose declared names cannot be applied to its body is refused: a

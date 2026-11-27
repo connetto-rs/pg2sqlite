@@ -8,7 +8,7 @@
 //! different wrappers. The few places where the replica cannot answer as
 //! PostgreSQL does are spelled out step by step, with both answers.
 
-use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{pg::PgConnection, prelude::*};
 use pg2sqlite::{
     manifest::WrapperKind,
     prelude::{Pg2Sqlite, Pg2SqliteOptions},
@@ -215,7 +215,7 @@ macro_rules! runner {
 }
 
 runner!(PgRunner, PgConnection);
-runner!(SqliteRunner, SqliteConnection);
+runner!(SqliteRunner, crate::helpers::Replica);
 
 /// The source, acting as one role.
 struct Source {

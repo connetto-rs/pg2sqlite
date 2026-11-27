@@ -2,7 +2,7 @@
 
 #![allow(dead_code)]
 
-use diesel::prelude::*;
+use diesel::{connection::SimpleConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
 mod schema {
@@ -112,11 +112,11 @@ struct UserOrderSummary {
     total_spent: Option<f32>,
 }
 
-fn translate_and_setup() -> Result<diesel::SqliteConnection, Box<dyn std::error::Error>> {
-    crate::support::fixtures::apply_fixture(
+fn translate_and_setup() -> Result<crate::helpers::Replica, Box<dyn std::error::Error>> {
+    Ok(crate::support::fixtures::apply_fixture(
         include_str!("../fixtures/views.sql"),
         &Pg2SqliteOptions::default(),
-    )
+    )?)
 }
 
 #[test]
@@ -282,9 +282,9 @@ fn test_or_replace_view_emits_drop_then_create() {
         "Second statement should be CREATE VIEW, got: {create}"
     );
     {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
         for stmt in &stmts {
-            conn.execute_batch(&format!("{stmt};")).unwrap();
+            conn.batch_execute(&format!("{stmt};")).unwrap();
         }
     }
 }
@@ -301,7 +301,7 @@ fn test_or_replace_view_diesel_roundtrip() -> Result<(), Box<dyn std::error::Err
     let setup_stmts = Pg2Sqlite::default().sql(setup_sql)?.translate(&options)?.into_vec();
     let replace_stmts = Pg2Sqlite::default().sql(replace_sql)?.translate(&options)?.into_vec();
 
-    let mut conn = diesel::SqliteConnection::establish(":memory:")?;
+    let mut conn = crate::helpers::Replica::establish(":memory:")?;
 
     for stmt in &setup_stmts {
         diesel::sql_query(stmt.to_string()).execute(&mut conn)?;

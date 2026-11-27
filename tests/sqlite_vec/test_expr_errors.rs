@@ -10,6 +10,7 @@
 //! - Vector operators: <#>, <+>, <%> -> errors; <->, <=> -> vec_distance
 //!   functions
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
 use crate::helpers;
@@ -110,7 +111,7 @@ fn all_gt_subquery_translates_to_not_exists() {
 /// Seeds `t` with `(1, 20), (7, 0), (10, 5)`, runs the translated statements,
 /// and returns the ids the translated SELECT keeps.
 fn quantifier_survivors(sql: &str) -> Vec<i64> {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = helpers::Replica::establish(":memory:").unwrap();
     let stmts = Pg2Sqlite::default()
         .sql(sql)
         .expect("parse")
@@ -121,19 +122,21 @@ fn quantifier_survivors(sql: &str) -> Vec<i64> {
     for stmt in &stmts {
         let text = stmt.to_string();
         if text.starts_with("SELECT") {
-            let mut prepared = conn
-                .prepare(&text)
-                .unwrap_or_else(|e| panic!("SQLite rejected output: {e}\n{text}"));
-            survivors = prepared
-                .query_map([], |row| row.get::<_, i64>(0))
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap();
+            survivors = helpers::query_values(&mut conn, &text, &[])
+                .unwrap_or_else(|error| panic!("SQLite rejected output: {error}\n{text}"))
+                .into_iter()
+                .map(|row| {
+                    match row[0] {
+                        helpers::SqliteAnyValue::Integer(value) => value,
+                        ref value => panic!("expected integer, got {value:?}"),
+                    }
+                })
+                .collect();
         } else {
-            conn.execute_batch(&format!("{text};"))
+            conn.batch_execute(&format!("{text};"))
                 .unwrap_or_else(|e| panic!("SQLite rejected output: {e}\n{text}"));
             if text.starts_with("CREATE TABLE") {
-                conn.execute_batch("INSERT INTO t (id, val) VALUES (1, 20), (7, 0), (10, 5);")
+                conn.batch_execute("INSERT INTO t (id, val) VALUES (1, 20), (7, 0), (10, 5);")
                     .expect("seed rows");
             }
         }
@@ -256,12 +259,9 @@ fn at_time_zone_named_zone_still_errors() {
 
 /// Translate the original PG SQL and execute all emitted statements against an
 /// in-memory SQLite connection that has sqlite-vec loaded.
-///
-/// rusqlite is used directly because diesel does not expose
-/// `sqlite3_auto_extension`.
 fn sqlite_accepts(pg: &str) {
     helpers::register_sqlite_vec_once();
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = helpers::Replica::establish(":memory:").unwrap();
     let stmts = Pg2Sqlite::default()
         .sql(pg)
         .expect("parse")
@@ -269,7 +269,7 @@ fn sqlite_accepts(pg: &str) {
         .expect("translate")
         .into_vec();
     for stmt in &stmts {
-        conn.execute_batch(&format!("{stmt};"))
+        conn.batch_execute(&format!("{stmt};"))
             .unwrap_or_else(|e| panic!("emitted statement failed: {e}\n{stmt}"));
     }
 }

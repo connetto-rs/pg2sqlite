@@ -1,7 +1,12 @@
 //! Replayed-connection scaffolding for the connection replay tests.
 
-use diesel::{connection::SimpleConnection, prelude::*, sqlite::SqliteConnection};
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, Script};
+use diesel::{Connection, connection::SimpleConnection};
+use pg2sqlite::{
+    prelude::{Pg2Sqlite, Pg2SqliteOptions, Script},
+    script::FreshFiles,
+};
+
+use super::Replica;
 
 /// Translates `sql` with the default options, expecting both steps to succeed.
 pub fn script(sql: &str) -> Script<String> {
@@ -13,31 +18,23 @@ pub fn script(sql: &str) -> Script<String> {
 }
 
 /// Opens the `main.db` file under `files`.
-pub fn open(files: &tempfile::TempDir) -> SqliteConnection {
-    SqliteConnection::establish(files.path().join("main.db").to_str().expect("path")).expect("open")
+pub fn open(files: &tempfile::TempDir) -> Replica {
+    Replica::establish(files.path().join("main.db").to_str().expect("path")).expect("open")
 }
 
 /// Batch-executes `statements`, panicking with the statement that failed.
-pub fn run(
-    connection: &mut SqliteConnection,
-    statements: impl IntoIterator<Item = impl AsRef<str>>,
-) {
+pub fn run(connection: &mut Replica, statements: impl IntoIterator<Item = impl AsRef<str>>) {
     for statement in statements {
         let statement = statement.as_ref();
         connection.batch_execute(statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
     }
 }
 
-/// Runs `script` on a fresh store and returns the replayed connection, each
-/// connection holding the script's helper functions.
-pub fn create_and_reopen(files: &tempfile::TempDir, script: &Script<String>) -> SqliteConnection {
-    {
-        let mut creating = open(files);
-        script.register_functions(&mut creating).expect("helper functions");
-        run(&mut creating, script.iter());
-    }
+/// Initializes a fresh store with `script` and returns a reopened
+/// connection that replayed the script's connection part.
+pub fn create_and_reopen(files: &tempfile::TempDir, script: &Script<String>) -> Replica {
+    script.initialize_managed(&mut open(files), FreshFiles::Both).expect("initialize the store");
     let mut reopened = open(files);
-    script.register_functions(&mut reopened).expect("helper functions");
-    run(&mut reopened, script.connect().expect("connection program"));
+    script.connect_managed(&mut reopened).expect("replay the connection program");
     reopened
 }

@@ -94,35 +94,36 @@ fn options() -> Pg2SqliteOptions {
 /// `pg` applied to a fresh connection holding the row member 1 reads, a
 /// plain member of organization 1, whose admin the server holds alone. Each
 /// write runs with the statements a `COMMIT` runs first.
-fn replica(pg: &str) -> (SqliteConnection, Vec<String>) {
+fn replica(pg: &str) -> crate::helpers::Replica {
     let script = Pg2Sqlite::default()
         .sql(pg)
         .expect("parse")
         .translate_to_sql(&options())
         .unwrap_or_else(|error| panic!("{error}\n{pg}"));
-    let before_commit = script.before_commit.clone();
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-    script.register_functions(&mut connection).expect("register helper functions");
-    member_write_exempt_utils::register_nondeterministic_impl(&mut connection, || true)
-        .expect("exempt the delivery");
-    for statement in script.into_vec() {
-        connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
-    }
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
+    member_write_exempt_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        || true,
+    )
+    .expect("exempt the delivery");
+    script
+        .initialize_managed(&mut connection, pg2sqlite::prelude::FreshFiles::Both)
+        .expect("initialize replica");
     connection
         .batch_execute("INSERT INTO members_rls (org, member, admin) VALUES (1, 1, false)")
         .expect("deliver member 1");
-    member_write_exempt_utils::register_nondeterministic_impl(&mut connection, || false)
-        .expect("end the exemption");
-    (connection, before_commit)
+    member_write_exempt_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        || false,
+    )
+    .expect("end the exemption");
+    connection
 }
 
 /// Member 1 leaves organization 1 in one transaction.
-fn leave(connection: &mut SqliteConnection, before_commit: &[String]) -> QueryResult<()> {
+fn leave(connection: &mut crate::helpers::Replica) -> QueryResult<()> {
     connection.transaction(|connection| {
         diesel::delete(members::table.filter(members::member.eq(1))).execute(connection)?;
-        for statement in before_commit {
-            connection.batch_execute(statement)?;
-        }
         Ok(())
     })
 }
@@ -144,9 +145,9 @@ fn a_definer_trigger_reading_hidden_rows_leaves_its_check_to_the_server() {
     for (body, trigger) in
         [(DIRECT, AFTER_DELETE), (THROUGH_HELPER, AFTER_DELETE), (DIRECT, DEFERRED)]
     {
-        let (mut connection, before_commit) = replica(&script(body, trigger, ""));
+        let mut connection = replica(&script(body, trigger, ""));
 
-        leave(&mut connection, &before_commit)
+        leave(&mut connection)
             .unwrap_or_else(|error| panic!("the server holds the admin: {error}\n{trigger}"));
     }
 }
@@ -175,10 +176,9 @@ fn a_definer_trigger_reading_rows_the_role_reads_in_full_stays() {
         "CREATE POLICY members_own ON members TO app USING (member = 1);",
         "CREATE POLICY members_own ON members TO app USING (true);",
     );
-    let (mut connection, before_commit) = replica(&pg);
+    let mut connection = replica(&pg);
 
-    let refused = leave(&mut connection, &before_commit)
-        .expect_err("the replica holds every member and no admin");
+    let refused = leave(&mut connection).expect_err("the replica holds every member and no admin");
     assert!(refused.to_string().contains("would lose its last admin"), "{refused}");
     assert_eq!(left_to_server(&pg), []);
 }
@@ -188,10 +188,10 @@ fn an_invoker_trigger_reads_as_the_acting_role_and_stays() {
     let pg = script(DIRECT, AFTER_DELETE, "")
         .replace("SECURITY DEFINER SET search_path", "SET search_path")
         .replace("ALTER FUNCTION keep_an_admin() OWNER TO checker;", "");
-    let (mut connection, before_commit) = replica(&pg);
+    let mut connection = replica(&pg);
 
-    let refused = leave(&mut connection, &before_commit)
-        .expect_err("PostgreSQL shows the acting role no admin either");
+    let refused =
+        leave(&mut connection).expect_err("PostgreSQL shows the acting role no admin either");
     assert!(refused.to_string().contains("would lose its last admin"), "{refused}");
     assert_eq!(left_to_server(&pg), []);
 }
@@ -203,9 +203,9 @@ fn dropping_or_replacing_a_trigger_left_to_the_server_drops_nothing() {
         "CREATE OR REPLACE TRIGGER members_keep_admin AFTER DELETE ON members
            FOR EACH ROW EXECUTE FUNCTION keep_an_admin();",
     ] {
-        let (mut connection, before_commit) = replica(&script(DIRECT, AFTER_DELETE, extra));
+        let mut connection = replica(&script(DIRECT, AFTER_DELETE, extra));
 
-        leave(&mut connection, &before_commit).unwrap_or_else(|error| panic!("{error}\n{extra}"));
+        leave(&mut connection).unwrap_or_else(|error| panic!("{error}\n{extra}"));
     }
 }
 
@@ -241,7 +241,7 @@ fn a_definer_write_picking_rows_from_hidden_rows_stays_and_writes_from_the_rows_
         "INSERT INTO public.admissions SELECT org, member FROM public.members
            WHERE org = NEW.org AND member = NEW.member",
     );
-    let (mut connection, _) = replica(&pg);
+    let mut connection = replica(&pg);
 
     diesel::insert_into(members::table)
         .values((members::org.eq(2), members::member.eq(1), members::admin.eq(true)))
@@ -262,9 +262,9 @@ fn definer_updates_and_deletes_filtered_by_hidden_rows_stay() {
            WHERE (org, member) IN (SELECT org, member FROM public.members WHERE admin)",
     ] {
         let pg = admitting("AFTER DELETE", statement);
-        let (mut connection, before_commit) = replica(&pg);
+        let mut connection = replica(&pg);
 
-        leave(&mut connection, &before_commit).unwrap_or_else(|error| panic!("{error}\n{pg}"));
+        leave(&mut connection).unwrap_or_else(|error| panic!("{error}\n{pg}"));
         assert_eq!(left_to_server(&pg), [], "{statement}");
     }
 }
@@ -276,9 +276,9 @@ fn a_definer_check_on_found_after_reading_hidden_rows_is_left_to_the_server() {
         "PERFORM 1 FROM public.members WHERE org = OLD.org AND admin;
            IF NOT FOUND THEN",
     );
-    let (mut connection, before_commit) = replica(&pg);
+    let mut connection = replica(&pg);
 
-    leave(&mut connection, &before_commit).expect("the server holds the admin");
+    leave(&mut connection).expect("the server holds the admin");
     assert_eq!(left_to_server(&pg).len(), 1, "{pg}");
 }
 
@@ -460,23 +460,28 @@ fn a_definer_read_the_firing_rows_key_confines_to_the_team_stays_and_refuses_on_
         .expect("parse")
         .translate_to_sql(&team_options())
         .expect("translate");
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-    script.register_functions(&mut connection).expect("register helper functions");
-    app_team_id_utils::register_nondeterministic_impl(&mut connection, || 1)
-        .expect("act for team 1");
-    member_write_exempt_utils::register_nondeterministic_impl(&mut connection, || true)
-        .expect("exempt the delivery");
-    for statement in script.into_vec() {
-        connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
+    {
+        let mut registration = connection.registration().expect("registration");
+        app_team_id_utils::register_nondeterministic_impl(registration.sqlite(), || 1)
+            .expect("act for team 1");
+        member_write_exempt_utils::register_nondeterministic_impl(registration.sqlite(), || true)
+            .expect("exempt the delivery");
     }
+    script
+        .initialize_managed(&mut connection, pg2sqlite::prelude::FreshFiles::Both)
+        .expect("initialize replica");
     connection
         .batch_execute(
             "INSERT INTO runs_rls (id, team_id, status) VALUES (1, 1, 'closed'), (2, 1, 'open')",
         )
         .expect("deliver the team's runs");
-    member_write_exempt_utils::register_nondeterministic_impl(&mut connection, || false)
-        .expect("end the exemption");
-    let bind = |connection: &mut SqliteConnection, id: i32, run: i32| {
+    member_write_exempt_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        || false,
+    )
+    .expect("end the exemption");
+    let bind = |connection: &mut crate::helpers::Replica, id: i32, run: i32| {
         diesel::insert_into(bindings::table)
             .values((
                 bindings::id.eq(id),

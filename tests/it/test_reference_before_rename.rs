@@ -2,7 +2,7 @@
 //! renames or drops it is translated against the column it was written for.
 //! Each scenario was measured on PostgreSQL 18.
 
-use diesel::{Connection, RunQueryDsl, SqliteConnection, connection::SimpleConnection};
+use diesel::{Connection, RunQueryDsl, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
 #[derive(diesel::QueryableByName)]
@@ -31,7 +31,7 @@ fn count_after_script(earlier: &str, batch: &str, query: &str) -> i64 {
     .flat_map(|script| script.unwrap_or_else(|error| panic!("{error}")).into_vec())
     .collect::<Vec<_>>()
     .join(";\n");
-    let mut connection = SqliteConnection::establish(":memory:").unwrap();
+    let mut connection = crate::helpers::Replica::establish(":memory:").unwrap();
     connection.batch_execute(&emitted).unwrap_or_else(|error| panic!("{error}\n{emitted}"));
     diesel::sql_query(format!("SELECT count(*) AS n FROM ({query})"))
         .get_result::<Count>(&mut connection)

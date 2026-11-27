@@ -8,8 +8,10 @@
 //! branch condition as a guard, so a value assigned inside a branch has to
 //! reach later reads as a conditional value rather than as itself.
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use rusqlite::Connection;
+
+use crate::helpers::{Replica, SqliteAnyValue, query_values};
 
 /// Translates a trigger function over `body`, fires it for a row with
 /// `t.val = val`, and returns the `log` rows as `note|n` with `NULL` spelled
@@ -43,32 +45,34 @@ CREATE TRIGGER tr AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION f();
         .expect("fixture translates")
         .into_vec();
 
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = Replica::establish(":memory:").expect("in-memory SQLite");
     for statement in &statements {
         connection
-            .execute_batch(&format!("{statement};"))
+            .batch_execute(&format!("{statement};"))
             .unwrap_or_else(|error| panic!("emitted statement failed: {error}\n{statement}"));
     }
     connection
-        .execute_batch("INSERT INTO log (id, note, n) VALUES (1, 'seed', 0);")
+        .batch_execute("INSERT INTO log (id, note, n) VALUES (1, 'seed', 0);")
         .expect("seed row");
     connection
-        .execute_batch(&format!("INSERT INTO t (id, val) VALUES (1, {val});"))
+        .batch_execute(&format!("INSERT INTO t (id, val) VALUES (1, {val});"))
         .expect("the write that fires the trigger");
 
-    let mut prepared =
-        connection.prepare("SELECT note, n FROM log ORDER BY id").expect("probe prepares");
-    prepared
-        .query_map([], |row| {
-            Ok(format!(
-                "{}|{}",
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<i64>>(1)?.map_or_else(|| "NULL".to_string(), |n| n.to_string())
-            ))
-        })
+    query_values(&mut connection, "SELECT note, n FROM log ORDER BY id", &[])
         .expect("probe runs")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("probe rows decode")
+        .into_iter()
+        .map(|row| {
+            let SqliteAnyValue::Text(note) = &row[0] else {
+                panic!("expected text, got {:?}", row[0]);
+            };
+            let number = match &row[1] {
+                SqliteAnyValue::Null => "NULL".to_string(),
+                SqliteAnyValue::Integer(value) => value.to_string(),
+                value => panic!("expected nullable integer, got {value:?}"),
+            };
+            format!("{note}|{number}")
+        })
+        .collect()
 }
 
 #[test]

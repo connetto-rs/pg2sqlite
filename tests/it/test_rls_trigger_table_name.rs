@@ -2,7 +2,7 @@
 //! the backing table behind the table's view. Its body still runs as a
 //! trigger on the table it was created on, as in PostgreSQL.
 
-use diesel::{ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection};
+use diesel::{ExpressionMethods, QueryDsl, RunQueryDsl};
 use pg2sqlite::prelude::Pg2SqliteOptions;
 
 use crate::helpers;
@@ -22,7 +22,7 @@ diesel::table! {
 
 /// The replica of a secured `notes` table whose `AFTER INSERT` trigger runs
 /// `body`, with `trigger_log` for the body to write to.
-fn secured_notes_running(body: &str) -> SqliteConnection {
+fn secured_notes_running(body: &str) -> crate::helpers::Replica {
     let schema = format!(
         "CREATE TABLE notes (id INT PRIMARY KEY);
         ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
@@ -44,7 +44,7 @@ fn secured_notes_running(body: &str) -> SqliteConnection {
     )
 }
 
-fn insert_note(connection: &mut SqliteConnection, id: i32) -> diesel::QueryResult<usize> {
+fn insert_note(connection: &mut crate::helpers::Replica, id: i32) -> diesel::QueryResult<usize> {
     diesel::insert_into(notes::table).values(notes::id.eq(id)).execute(connection)
 }
 

@@ -1,10 +1,10 @@
 //! Execution contracts for `DEFERRABLE INITIALLY DEFERRED` constraint
 //! triggers, whose checks run at commit against the rows as they stand then.
 
-use diesel::{QueryDsl, RunQueryDsl, SqliteConnection, connection::SimpleConnection};
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+use diesel::{Connection, QueryDsl, QueryResult, RunQueryDsl, connection::SimpleConnection};
+use pg2sqlite::prelude::{FreshFiles, Pg2Sqlite, Pg2SqliteOptions};
 
-use crate::support::transaction::transaction;
+use crate::helpers::Replica;
 
 const SCHEMA: &str = "
 CREATE TABLE resources (id TEXT PRIMARY KEY, kind TEXT NOT NULL);
@@ -40,36 +40,44 @@ diesel::define_sql_function! {
 }
 
 /// The schema with `source` appended, translated and applied to a fresh
-/// connection, with the statements a `COMMIT` has to run first.
-fn replica(source: &str, options: &Pg2SqliteOptions) -> (SqliteConnection, Vec<String>) {
+/// managed connection, which runs the checks before every commit.
+fn replica(source: &str, options: &Pg2SqliteOptions) -> Replica {
     let script = Pg2Sqlite::default()
         .sql(&[SCHEMA, source].concat())
         .expect("parse")
         .translate_to_sql(options)
         .expect("translate");
-    let before_commit = script.before_commit.clone();
-    let mut connection =
-        diesel::Connection::establish(":memory:").expect("open an in-memory SQLite");
+    let mut connection = Replica::establish(":memory:").expect("open an in-memory SQLite");
     if options.get_rls_exemption_function().is_some() {
-        constraint_write_exempt_utils::register_nondeterministic_impl(&mut connection, || false)
-            .expect("register the exemption");
+        exempt(&mut connection, false);
     }
-    for statement in script.into_vec() {
-        connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
-    }
-    (connection, before_commit)
+    script.initialize_managed(&mut connection, FreshFiles::Both).expect("initialize the replica");
+    connection
 }
 
-fn resource_ids(connection: &mut SqliteConnection) -> Vec<String> {
+/// Registers the exemption function answering `exempt`.
+fn exempt(connection: &mut Replica, exempt: bool) {
+    constraint_write_exempt_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        move || exempt,
+    )
+    .expect("register the exemption");
+}
+
+/// Runs `writes` in one transaction.
+fn transaction(connection: &mut Replica, writes: &str) -> QueryResult<()> {
+    connection.transaction(|connection| connection.batch_execute(writes))
+}
+
+fn resource_ids(connection: &mut Replica) -> Vec<String> {
     resources::table.select(resources::id).order(resources::id).load(connection).expect("read")
 }
 
 #[test]
 fn a_later_statement_satisfies_the_check_before_commit() {
-    let (mut connection, before_commit) = replica("", &Pg2SqliteOptions::default());
+    let mut connection = replica("", &Pg2SqliteOptions::default());
     transaction(
         &mut connection,
-        &before_commit,
         "INSERT INTO resources VALUES ('f1', 'folder');
          INSERT INTO resource_parents VALUES ('f1', 'root');",
     )
@@ -79,32 +87,26 @@ fn a_later_statement_satisfies_the_check_before_commit() {
 
 #[test]
 fn a_violation_fails_the_commit_with_the_body_message() {
-    let (mut connection, before_commit) = replica("", &Pg2SqliteOptions::default());
-    let error = transaction(
-        &mut connection,
-        &before_commit,
-        "INSERT INTO resources VALUES ('f1', 'folder');",
-    )
-    .expect_err("a folder without an edge cannot commit");
+    let mut connection = replica("", &Pg2SqliteOptions::default());
+    let error = transaction(&mut connection, "INSERT INTO resources VALUES ('f1', 'folder');")
+        .expect_err("a folder without an edge cannot commit");
     assert!(error.to_string().contains("a folder requires a parent edge"), "{error}");
     assert_eq!(resource_ids(&mut connection), [""; 0]);
 }
 
 #[test]
 fn the_check_reads_the_rows_as_they_stand_at_commit() {
-    let (mut connection, before_commit) = replica("", &Pg2SqliteOptions::default());
+    let mut connection = replica("", &Pg2SqliteOptions::default());
     transaction(
         &mut connection,
-        &before_commit,
         "INSERT INTO resources VALUES ('f1', 'folder');
          INSERT INTO resource_parents VALUES ('f1', 'root');",
     )
     .expect("seed");
-    transaction(&mut connection, &before_commit, "DELETE FROM resource_parents WHERE id = 'f1';")
+    transaction(&mut connection, "DELETE FROM resource_parents WHERE id = 'f1';")
         .expect_err("removing the edge orphans the folder");
     transaction(
         &mut connection,
-        &before_commit,
         "DELETE FROM resource_parents WHERE id = 'f1';
          DELETE FROM resources WHERE id = 'f1';",
     )
@@ -114,10 +116,14 @@ fn the_check_reads_the_rows_as_they_stand_at_commit() {
 
 #[test]
 fn a_commit_without_the_queued_checks_run_fails_closed() {
-    let (mut connection, _) = replica("", &Pg2SqliteOptions::default());
+    let mut connection = replica("", &Pg2SqliteOptions::default());
+    connection
+        .registration()
+        .expect("registration")
+        .before_commit(Vec::<String>::new())
+        .expect("clear the checks run before a commit");
     transaction(
         &mut connection,
-        &[],
         "INSERT INTO resources VALUES ('f1', 'folder');
          INSERT INTO resource_parents VALUES ('f1', 'root');",
     )
@@ -130,7 +136,7 @@ fn a_commit_without_the_queued_checks_run_fails_closed() {
 
 #[test]
 fn the_script_commit_runs_the_checks() {
-    let (mut connection, _) = replica(
+    let mut connection = replica(
         "BEGIN;
          INSERT INTO resources VALUES ('f1', 'folder');
          INSERT INTO resource_parents VALUES ('f1', 'root');
@@ -142,36 +148,34 @@ fn the_script_commit_runs_the_checks() {
 
 #[test]
 fn an_exempt_write_queues_no_check() {
-    let (mut connection, before_commit) =
+    let mut connection =
         replica("", &Pg2SqliteOptions::default().with_rls_exemption_function(EXEMPTION_FUNCTION));
-    constraint_write_exempt_utils::register_nondeterministic_impl(&mut connection, || true)
-        .expect("exempt the write");
-    transaction(&mut connection, &before_commit, "INSERT INTO resources VALUES ('f1', 'folder');")
+    exempt(&mut connection, true);
+    transaction(&mut connection, "INSERT INTO resources VALUES ('f1', 'folder');")
         .expect("an exempt write skips the check");
     assert_eq!(resource_ids(&mut connection), ["f1"]);
 }
 
 #[test]
 fn dropping_the_trigger_drops_its_check() {
-    let (mut connection, before_commit) = replica(
+    let mut connection = replica(
         "DROP TRIGGER resources_parent_required ON resources;",
         &Pg2SqliteOptions::default(),
     );
-    transaction(&mut connection, &before_commit, "INSERT INTO resources VALUES ('f1', 'folder');")
+    transaction(&mut connection, "INSERT INTO resources VALUES ('f1', 'folder');")
         .expect("no check remains on resources");
     assert_eq!(resource_ids(&mut connection), ["f1"]);
 }
 
 #[test]
 fn dropping_the_table_drops_the_queued_firings_table() {
-    let (mut connection, before_commit) = replica(
+    let mut connection = replica(
         "DROP TABLE resource_parents;
          CREATE TABLE resource_parents (id TEXT PRIMARY KEY, parent_id TEXT NOT NULL);",
         &Pg2SqliteOptions::default(),
     );
     transaction(
         &mut connection,
-        &before_commit,
         "INSERT INTO resources VALUES ('f1', 'folder');
          INSERT INTO resource_parents VALUES ('f1', 'root');
          DELETE FROM resource_parents;
@@ -182,7 +186,7 @@ fn dropping_the_table_drops_the_queued_firings_table() {
 
 #[test]
 fn an_immediate_constraint_trigger_fires_at_the_statement() {
-    let (mut connection, _) = replica(
+    let mut connection = replica(
         "CREATE FUNCTION no_archive() RETURNS TRIGGER LANGUAGE plpgsql AS $$
          BEGIN
            IF NEW.kind = 'archive' THEN RAISE EXCEPTION 'archives are read-only'; END IF;
@@ -236,11 +240,12 @@ fn a_later_batch_runs_and_drops_the_checks_an_earlier_batch_declared() {
     let options = Pg2SqliteOptions::default();
     let earlier = Pg2Sqlite::default().sql(SCHEMA).expect("parse");
     let schema = earlier.build_schema().expect("schema");
-    let mut connection: SqliteConnection =
-        diesel::Connection::establish(":memory:").expect("open an in-memory SQLite");
-    for statement in earlier.translate_to_sql(&options).expect("translate").into_vec() {
-        connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
-    }
+    let mut connection = Replica::establish(":memory:").expect("open an in-memory SQLite");
+    earlier
+        .translate_to_sql(&options)
+        .expect("translate")
+        .initialize_managed(&mut connection, FreshFiles::Both)
+        .expect("initialize the replica");
     let later = |source: &str| {
         Pg2Sqlite::default()
             .sql(source)
@@ -257,7 +262,6 @@ fn a_later_batch_runs_and_drops_the_checks_an_earlier_batch_declared() {
         .try_for_each(|statement| connection.batch_execute(statement))
         .expect_err("the later COMMIT runs the earlier check");
     assert!(error.to_string().contains("a folder requires a parent edge"), "{error}");
-    connection.batch_execute("ROLLBACK").expect("roll back");
 
     for statement in later("DROP TRIGGER resources_parent_required ON resources;").into_vec() {
         connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));

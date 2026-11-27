@@ -16,7 +16,7 @@
 //! of their own, and only one spelling is accepted, so the two cannot drift
 //! apart again.
 
-use diesel::prelude::*;
+use diesel::{connection::SimpleConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
 
 use crate::{
@@ -161,9 +161,9 @@ fn row_level_security_without_a_rename_builds_its_object_set() {
         emitted.contains("CREATE VIEW t2") && emitted.contains("t2_rls"),
         "the control must emit the backing table and the view, got:\n{emitted}"
     );
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     for stmt in &stmts {
-        conn.execute_batch(&format!("{stmt};"))
+        conn.batch_execute(&format!("{stmt};"))
             .unwrap_or_else(|e| panic!("emitted DDL failed: {e}\n{stmt}"));
     }
 }
@@ -235,9 +235,9 @@ fn a_rename_without_row_level_security_still_translates() {
         emitted.contains("ALTER TABLE t RENAME TO t2"),
         "the rename must still be emitted, got:\n{emitted}"
     );
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     for stmt in &stmts {
-        conn.execute_batch(&format!("{stmt};"))
+        conn.batch_execute(&format!("{stmt};"))
             .unwrap_or_else(|e| panic!("emitted DDL failed: {e}\n{stmt}"));
     }
 }

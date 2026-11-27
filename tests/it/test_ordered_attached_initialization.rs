@@ -70,9 +70,9 @@ fn translated(sql: &str) -> Script<String> {
 }
 
 /// A connection to the `main_file` file with the existing shared file attached.
-fn connection(files: &tempfile::TempDir, main_file: &str) -> SqliteConnection {
+fn connection(files: &tempfile::TempDir, main_file: &str) -> crate::helpers::Replica {
     let mut connection =
-        SqliteConnection::establish(files.path().join(main_file).to_str().expect("path"))
+        crate::helpers::Replica::establish(files.path().join(main_file).to_str().expect("path"))
             .expect("open main");
     // `ATTACH` is SQLite DDL the diesel DSL cannot express.
     diesel::sql_query("ATTACH DATABASE ? AS shared")
@@ -83,7 +83,7 @@ fn connection(files: &tempfile::TempDir, main_file: &str) -> SqliteConnection {
 }
 
 /// A connection to a new main file with the existing shared file attached.
-fn second_connection(files: &tempfile::TempDir) -> SqliteConnection {
+fn second_connection(files: &tempfile::TempDir) -> crate::helpers::Replica {
     connection(files, "second-main.db")
 }
 
@@ -92,7 +92,7 @@ fn initialized(
     files: &tempfile::TempDir,
     script: &Script<String>,
     mode: FreshFiles,
-) -> SqliteConnection {
+) -> crate::helpers::Replica {
     let mut connection = connection(files, "main.db");
     run(&mut connection, script.initialize(mode).expect("initialize"));
     connection

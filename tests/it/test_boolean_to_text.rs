@@ -12,10 +12,12 @@
 //! there where PostgreSQL truthiness says true.
 //!
 //! Every expectation was read off PostgreSQL 17. The emitted statements are
-//! executed as text because that text is the artifact under test.
+//! executed as text because use that text is the artifact under test.
 
 use diesel::prelude::*;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+
+use crate::helpers::Replica;
 
 mod schema {
     diesel::table! {
@@ -49,7 +51,7 @@ fn translate(pg: &str) -> Vec<String> {
 /// Every row of `projection`, ordered by id, through the emitted SQLite.
 fn rendered(projection: &str) -> Vec<Option<String>> {
     let statements = translate(&format!("{FIXTURE}\nSELECT {projection} AS v FROM b ORDER BY id;"));
-    let mut connection = SqliteConnection::establish(":memory:").expect("connect");
+    let mut connection = Replica::establish(":memory:").expect("connect");
     let (probe, setup) = statements.split_last().expect("an emitted query");
     for statement in setup {
         diesel::sql_query(statement)
@@ -188,7 +190,7 @@ fn a_non_boolean_operand_is_untouched() {
 fn an_out_of_range_value_is_still_truthy() {
     let statements =
         translate(&format!("{FIXTURE}\nSELECT CAST(flag AS TEXT) AS v FROM b ORDER BY id;"));
-    let mut connection = SqliteConnection::establish(":memory:").expect("connect");
+    let mut connection = Replica::establish(":memory:").expect("connect");
     let (probe, setup) = statements.split_last().expect("an emitted query");
     for statement in setup {
         diesel::sql_query(statement).execute(&mut connection).expect("emitted setup");

@@ -67,10 +67,17 @@ fn next_uuid() -> Vec<u8> {
 
 fn sqlite_accepts(setup: &[String], stmts: &[String]) -> Result<(), String> {
     let mut connection = crate::helpers::establish_connection();
-    sqrt_utils::register_impl(&mut connection, f64::sqrt).map_err(|error| error.to_string())?;
-    pow_utils::register_impl(&mut connection, f64::powf).map_err(|error| error.to_string())?;
-    uuid_utils::register_impl(&mut connection, next_uuid).map_err(|error| error.to_string())?;
-    uuid7_utils::register_impl(&mut connection, next_uuid).map_err(|error| error.to_string())?;
+    {
+        let mut registration = connection.registration().expect("registration");
+        sqrt_utils::register_impl(registration.sqlite(), f64::sqrt)
+            .map_err(|error| error.to_string())?;
+        pow_utils::register_impl(registration.sqlite(), f64::powf)
+            .map_err(|error| error.to_string())?;
+        uuid_utils::register_impl(registration.sqlite(), next_uuid)
+            .map_err(|error| error.to_string())?;
+        uuid7_utils::register_impl(registration.sqlite(), next_uuid)
+            .map_err(|error| error.to_string())?;
+    }
     for statement in setup {
         diesel::sql_query(statement)
             .execute(&mut connection)

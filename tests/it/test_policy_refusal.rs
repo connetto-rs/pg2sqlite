@@ -8,11 +8,13 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use diesel::{
-    Connection as _, ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection,
-    connection::SimpleConnection, result::Error,
+    Connection as _, ExpressionMethods, QueryDsl, RunQueryDsl, connection::SimpleConnection,
+    result::Error,
 };
 use pg2sqlite::prelude::{GuardRefusal, Pg2SqliteOptions, guard_refusal, postgres_error};
 use sqlstate::pg;
+
+use crate::helpers::Replica;
 
 const POLICY_SCHEMA: &str = "
 CREATE TABLE orders (
@@ -104,13 +106,14 @@ diesel::define_sql_function! {
     fn write_is_exempt() -> diesel::sql_types::Bool;
 }
 
-fn apply(pg: &str, options: &Pg2SqliteOptions) -> (SqliteConnection, Arc<AtomicBool>) {
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
+fn apply(pg: &str, options: &Pg2SqliteOptions) -> (Replica, Arc<AtomicBool>) {
+    let mut connection = Replica::establish(":memory:").expect("open SQLite");
     let exempt = Arc::new(AtomicBool::new(false));
     let function_state = Arc::clone(&exempt);
-    write_is_exempt_utils::register_nondeterministic_impl(&mut connection, move || {
-        function_state.load(Ordering::Relaxed)
-    })
+    write_is_exempt_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        move || function_state.load(Ordering::Relaxed),
+    )
     .expect("register RLS exemption");
     let statements = crate::helpers::translate_pg(pg, options).expect("translate SQLite");
     for statement in statements {
@@ -119,7 +122,7 @@ fn apply(pg: &str, options: &Pg2SqliteOptions) -> (SqliteConnection, Arc<AtomicB
     (connection, exempt)
 }
 
-fn policy_connection() -> (SqliteConnection, Arc<AtomicBool>) {
+fn policy_connection() -> (Replica, Arc<AtomicBool>) {
     let options = Pg2SqliteOptions::default()
         .with_rls_audit_table_name("rls_audit")
         .with_strict_rls_write_deny()
@@ -127,7 +130,7 @@ fn policy_connection() -> (SqliteConnection, Arc<AtomicBool>) {
     apply(POLICY_SCHEMA, &options)
 }
 
-fn role_connection() -> (SqliteConnection, Arc<AtomicBool>) {
+fn role_connection() -> (Replica, Arc<AtomicBool>) {
     let options = Pg2SqliteOptions::default()
         .with_deployment(crate::helpers::deployment::deployment(["app_user"], []))
         .with_acting_role("app_user")

@@ -7,11 +7,11 @@
 //! same parent on both engines and compares whether the write is accepted,
 //! which child the refusal names and what the tables hold after.
 
-use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{pg::PgConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use postgres_harness::{Outcome, apply, fresh_database};
 
-use crate::helpers::postgres as postgres_harness;
+use crate::helpers::{Replica, postgres as postgres_harness};
 
 mod schema {
     diesel::table! {
@@ -169,15 +169,15 @@ macro_rules! runner {
 }
 
 runner!(Postgres, PgConnection);
-runner!(Sqlite, SqliteConnection);
+runner!(Sqlite, Replica);
 
-fn replica(source: &str) -> SqliteConnection {
+fn replica(source: &str) -> Replica {
     let statements = Pg2Sqlite::default()
         .sql(source)
         .and_then(|parsed| parsed.translate_to_sql(&Pg2SqliteOptions::default()))
         .unwrap_or_else(|error| panic!("the schema should translate: {error}"))
         .into_vec();
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
+    let mut connection = Replica::establish(":memory:").expect("open SQLite");
     for statement in &statements {
         diesel::connection::SimpleConnection::batch_execute(&mut connection, statement)
             .unwrap_or_else(|error| panic!("{error}\n{statement}"));

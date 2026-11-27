@@ -4,10 +4,7 @@
 //! later change to a column, a relation or the function itself changes what
 //! the next run does. Each scenario below was measured on PostgreSQL 18.7.
 
-use diesel::{
-    Connection, ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection,
-    connection::SimpleConnection, result::Error as DieselError,
-};
+use diesel::{Connection, ExpressionMethods, QueryDsl, RunQueryDsl, result::Error as DieselError};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SqlState, postgres_error};
 use sql_traits::structs::ParserDB;
 use sqlstate::pg;
@@ -50,8 +47,8 @@ const INTO_LATER: &str = "INSERT INTO later (id) VALUES (NEW.id);";
 
 /// `batches` translated one after another, each on the schema the ones
 /// before it built, and run on SQLite with its default flags.
-fn replica(batches: &[&str]) -> SqliteConnection {
-    let mut connection = SqliteConnection::establish(":memory:").unwrap();
+fn replica(batches: &[&str]) -> crate::helpers::Replica {
+    let mut connection = crate::helpers::Replica::establish(":memory:").unwrap();
     let mut written = String::new();
     for batch in batches {
         let parsed = Pg2Sqlite::default().sql(batch).unwrap();
@@ -61,8 +58,9 @@ fn replica(batches: &[&str]) -> SqliteConnection {
             parsed.translate_to_sql_with_schema(&schema(&written), &Pg2SqliteOptions::default())
         }
         .unwrap_or_else(|error| panic!("{error}"));
-        script.register_functions(&mut connection).expect("register helper functions");
-        connection.batch_execute(&script.into_vec().join(";\n")).unwrap();
+        script
+            .initialize_managed(&mut connection, pg2sqlite::script::FreshFiles::Both)
+            .expect("initialize replica");
         written.push_str(batch);
         written.push('\n');
     }
@@ -73,7 +71,7 @@ fn schema(sql: &str) -> ParserDB {
     Pg2Sqlite::default().sql(sql).unwrap().build_schema().unwrap()
 }
 
-fn run(connection: &mut SqliteConnection, sql: &str) -> Result<usize, DieselError> {
+fn run(connection: &mut crate::helpers::Replica, sql: &str) -> Result<usize, DieselError> {
     diesel::sql_query(sql).execute(connection)
 }
 
@@ -87,7 +85,7 @@ fn assert_refused(outcome: Result<usize, DieselError>, sqlstate: SqlState, messa
     assert_eq!((refused.sqlstate(), refused.message()), (sqlstate, message));
 }
 
-fn audited(connection: &mut SqliteConnection) -> Vec<(i32, Option<String>)> {
+fn audited(connection: &mut crate::helpers::Replica) -> Vec<(i32, Option<String>)> {
     audit::table.order(audit::id).load(connection).unwrap()
 }
 

@@ -42,7 +42,7 @@ const SQL: &str = concat!(
     "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
 );
 
-fn translate_and_setup() -> diesel::SqliteConnection {
+fn translate_and_setup() -> crate::helpers::Replica {
     helpers::apply_translated_ddl(SQL, &helpers::rls::options("authenticated", true))
 }
 
@@ -334,7 +334,7 @@ CREATE POLICY mix1_all ON mix1 FOR ALL USING (owner = 'alice');
             .translate(&options)
             .expect("translate")
             .into_vec();
-        let mut connection = SqliteConnection::establish(":memory:").expect("open db");
+        let mut connection = crate::helpers::Replica::establish(":memory:").expect("open db");
         let (triggers, base): (Vec<_>, Vec<_>) = statements
             .iter()
             .map(ToString::to_string)

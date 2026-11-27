@@ -6,9 +6,7 @@
 //! schema never declares belongs to a role the replica holds past every
 //! guard.
 
-use diesel::{
-    connection::SimpleConnection, prelude::*, sql_types::BigInt, sqlite::SqliteConnection,
-};
+use diesel::{connection::SimpleConnection, prelude::*, sql_types::BigInt};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, postgres_error};
 use sql_traits::structs::ParserDB;
 
@@ -54,7 +52,7 @@ fn options() -> Pg2SqliteOptions {
         .with_acting_role("app")
 }
 
-fn apply(connection: &mut SqliteConnection, statements: Vec<String>) {
+fn apply(connection: &mut crate::helpers::Replica, statements: Vec<String>) {
     for statement in statements {
         connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
     }
@@ -62,27 +60,35 @@ fn apply(connection: &mut SqliteConnection, statements: Vec<String>) {
 
 /// `pg` translated and applied to a fresh connection, holding `delivered` as
 /// the server delivers it, with the schema it leaves.
-fn replica(pg: &str, delivered: &str) -> (SqliteConnection, ParserDB) {
+fn replica(pg: &str, delivered: &str) -> (crate::helpers::Replica, ParserDB) {
     let script = Pg2Sqlite::default()
         .sql(pg)
         .expect("parse")
         .translate_to_sql(&options())
         .unwrap_or_else(|error| panic!("{error}\n{pg}"));
-    let mut connection = SqliteConnection::establish(":memory:").expect("open an in-memory SQLite");
-    script.register_functions(&mut connection).expect("register the functions");
-    key_owner_exempt_utils::register_nondeterministic_impl(&mut connection, || true)
-        .expect("exempt the delivery");
-    apply(&mut connection, script.into_vec());
+    let mut connection =
+        crate::helpers::Replica::establish(":memory:").expect("open an in-memory SQLite");
+    key_owner_exempt_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        || true,
+    )
+    .expect("exempt the delivery");
+    script
+        .initialize_managed(&mut connection, pg2sqlite::script::FreshFiles::Both)
+        .expect("initialize schema");
     connection.batch_execute(delivered).unwrap_or_else(|error| panic!("{error}\n{delivered}"));
-    key_owner_exempt_utils::register_nondeterministic_impl(&mut connection, || false)
-        .expect("end the exemption");
+    key_owner_exempt_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        || false,
+    )
+    .expect("end the exemption");
     let schema = Pg2Sqlite::default().sql(pg).expect("parse").build_schema().expect("schema");
     (connection, schema)
 }
 
 /// Applies `migration`, translated against `schema`, the schema the replica
 /// holds.
-fn migrate(connection: &mut SqliteConnection, schema: &ParserDB, migration: &str) {
+fn migrate(connection: &mut crate::helpers::Replica, schema: &ParserDB, migration: &str) {
     let statements = Pg2Sqlite::default()
         .sql(migration)
         .expect("parse")
@@ -92,7 +98,7 @@ fn migrate(connection: &mut SqliteConnection, schema: &ParserDB, migration: &str
     apply(connection, statements);
 }
 
-fn count(connection: &mut SqliteConnection, table: &str) -> i64 {
+fn count(connection: &mut crate::helpers::Replica, table: &str) -> i64 {
     diesel::sql_query(format!("SELECT count(*) AS count FROM {table}"))
         .get_result::<Count>(connection)
         .unwrap_or_else(|error| panic!("count {table}: {error}"))
@@ -102,7 +108,7 @@ fn count(connection: &mut SqliteConnection, table: &str) -> i64 {
 /// Asserts the replica refuses `sql` as PostgreSQL refuses a write to
 /// `table` by a role without the privilege.
 #[track_caller]
-fn assert_denied(connection: &mut SqliteConnection, sql: &str, table: &str) {
+fn assert_denied(connection: &mut crate::helpers::Replica, sql: &str, table: &str) {
     let error = connection.batch_execute(sql).expect_err("the write is refused").to_string();
     let refused = postgres_error(&error).unwrap_or_else(|| panic!("no PostgreSQL error: {error}"));
     assert_eq!(refused.sqlstate().to_string(), "42501", "{error}");
@@ -117,7 +123,7 @@ fn assert_denied(connection: &mut SqliteConnection, sql: &str, table: &str) {
 
 /// The replica of `children` in `situation`, holding parents 1 and 2 and a
 /// child of each.
-fn children_replica(situation: &str) -> (SqliteConnection, ParserDB) {
+fn children_replica(situation: &str) -> (crate::helpers::Replica, ParserDB) {
     replica(
         &format!("{COMMON} {CHILDREN} {situation}"),
         "INSERT INTO parents VALUES (1), (2); INSERT INTO children VALUES (1, 1), (2, 2);",

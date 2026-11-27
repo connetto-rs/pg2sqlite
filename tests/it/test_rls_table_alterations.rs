@@ -5,7 +5,6 @@ use diesel::{
     connection::SimpleConnection,
     prelude::*,
     sql_types::{Integer, Text},
-    sqlite::SqliteConnection,
 };
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
@@ -34,7 +33,7 @@ fn options() -> Pg2SqliteOptions {
 }
 
 /// Applies every statement of `statements` to `connection`.
-fn apply(connection: &mut SqliteConnection, statements: Vec<String>) {
+fn apply(connection: &mut crate::helpers::Replica, statements: Vec<String>) {
     for statement in statements {
         connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
     }
@@ -42,23 +41,30 @@ fn apply(connection: &mut SqliteConnection, statements: Vec<String>) {
 
 /// `pg` translated and applied to a fresh connection, with `delivered` run as
 /// the server applies its rows, exempt from the generated guards.
-fn replica(pg: &str, delivered: &str) -> SqliteConnection {
+fn replica(pg: &str, delivered: &str) -> crate::helpers::Replica {
     let script = Pg2Sqlite::default()
         .sql(pg)
         .expect("parse")
         .translate_to_sql(&options())
         .expect("translate");
-    let mut connection = SqliteConnection::establish(":memory:").expect("open an in-memory SQLite");
-    key_write_exempt_utils::register_nondeterministic_impl(&mut connection, || true)
-        .expect("exempt the delivery");
+    let mut connection =
+        crate::helpers::Replica::establish(":memory:").expect("open an in-memory SQLite");
+    key_write_exempt_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        || true,
+    )
+    .expect("exempt the delivery");
     apply(&mut connection, script.into_vec());
     connection.batch_execute(delivered).unwrap_or_else(|error| panic!("{error}\n{delivered}"));
-    key_write_exempt_utils::register_nondeterministic_impl(&mut connection, || false)
-        .expect("end the exemption");
+    key_write_exempt_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        || false,
+    )
+    .expect("end the exemption");
     connection
 }
 
-fn rows(connection: &mut SqliteConnection, query: &str) -> Vec<Row> {
+fn rows(connection: &mut crate::helpers::Replica, query: &str) -> Vec<Row> {
     diesel::sql_query(query).load(connection).unwrap_or_else(|error| panic!("{error}\n{query}"))
 }
 

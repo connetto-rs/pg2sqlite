@@ -71,11 +71,10 @@ fn dimensionless_vector_column_translation_still_executes() {
         .translate_with_report(&Pg2SqliteOptions::default())
         .expect("translate");
 
-    let conn = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+    use diesel::{Connection, connection::SimpleConnection};
+    let mut conn = crate::helpers::Replica::establish(":memory:").expect("in-memory SQLite");
     for stmt in report.script.iter() {
-        // rusqlite: applying translated DDL (dynamically generated, diesel DSL
-        // cannot express DDL).
-        conn.execute_batch(&stmt.to_string())
+        conn.batch_execute(&stmt.to_string())
             .unwrap_or_else(|e| panic!("emitted DDL failed: {e}\n{stmt}"));
     }
     // If we get here the DDL is valid SQLite.

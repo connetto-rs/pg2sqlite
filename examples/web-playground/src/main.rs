@@ -181,7 +181,7 @@ fn run_translate(state: AppState, pg_sql: &str, opts: &state::WebOptions) {
     match translator::translate(pg_sql, &options, now) {
         Ok(output) => {
             let sqlite_sql = output.sqlite_sql;
-            state.sqlite_output.clone().set(Some(sqlite_sql.clone()));
+            state.sqlite_output.clone().set(Some(sqlite_sql));
             state.translation_error.clone().set(None);
             state.stats.clone().set(Some(output.stats));
             state.query_result.clone().set(None);
@@ -189,7 +189,7 @@ fn run_translate(state: AppState, pg_sql: &str, opts: &state::WebOptions) {
             let session_var_funcs: Vec<String> =
                 opts.session_variables.iter().map(|entry| entry.function.clone()).collect();
             let apply_result =
-                db::reopen(&session_var_funcs).and_then(|()| db::run_script(&sqlite_sql));
+                db::reopen(&session_var_funcs).and_then(|()| db::run_script(&output.script));
             match apply_result {
                 Ok(()) => {
                     state.apply_error.clone().set(None);

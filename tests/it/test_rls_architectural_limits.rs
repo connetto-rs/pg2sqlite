@@ -123,7 +123,11 @@ fn strict_opts() -> Pg2SqliteOptions {
         .with_acting_role("alice")
 }
 
-fn run_dml(conn: &mut SqliteConnection, pg_schema: &str, pg_dml: &str) -> QueryResult<usize> {
+fn run_dml(
+    conn: &mut crate::helpers::Replica,
+    pg_schema: &str,
+    pg_dml: &str,
+) -> QueryResult<usize> {
     let schema_len = Pg2Sqlite::default()
         .sql(pg_schema)
         .expect("parse")
@@ -147,14 +151,14 @@ fn run_dml(conn: &mut SqliteConnection, pg_schema: &str, pg_dml: &str) -> QueryR
 }
 
 /// Seeds `items` with `rows`, each `v` set to 0.
-fn seed_items(conn: &mut SqliteConnection, rows: &[i32]) {
+fn seed_items(conn: &mut crate::helpers::Replica, rows: &[i32]) {
     let values: Vec<_> =
         rows.iter().map(|id| (schema::items::id.eq(id), schema::items::v.eq(0))).collect();
     diesel::insert_into(schema::items::table).values(values).execute(conn).expect("seed items");
 }
 
 /// Every stored `(id, v)` pair, read from the backing table.
-fn stored_items(conn: &mut SqliteConnection) -> Vec<(i32, i32)> {
+fn stored_items(conn: &mut crate::helpers::Replica) -> Vec<(i32, i32)> {
     schema::items_rls::table
         .select((schema::items_rls::id, schema::items_rls::v))
         .order(schema::items_rls::id)

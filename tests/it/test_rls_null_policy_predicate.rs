@@ -11,10 +11,13 @@
 //! These tests pin the correct PostgreSQL behavior: INSERT or UPDATE whose
 //! WITH CHECK evaluates to NULL must be refused.
 
-use diesel::{prelude::*, sqlite::SqliteConnection};
+use diesel::prelude::*;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
 
-use crate::helpers::deployment::{caller, deployment};
+use crate::helpers::{
+    Replica,
+    deployment::{caller, deployment},
+};
 
 #[declare_sql_function]
 extern "SQL" {
@@ -70,17 +73,20 @@ fn opts() -> Pg2SqliteOptions {
         .with_user_defined_functions(["app_user"])
 }
 
-fn apply() -> SqliteConnection {
+fn apply() -> Replica {
     let stmts = Pg2Sqlite::default()
         .sql(PG)
         .expect("parse")
         .translate(&opts())
         .expect("translate")
         .into_vec();
-    let mut conn = SqliteConnection::establish(":memory:").expect("open db");
+    let mut conn = Replica::establish(":memory:").expect("open db");
     // app_user() maps current_setting('app.user'). Returns a static string so
     // the closure is 'static.
-    app_user_utils::register_impl(&mut conn, || "alice".to_string()).expect("register app_user");
+    app_user_utils::register_impl(conn.registration().expect("registration").sqlite(), || {
+        "alice".to_string()
+    })
+    .expect("register app_user");
     for s in &stmts {
         // DDL (CREATE TABLE, CREATE VIEW, CREATE TRIGGER) cannot be expressed
         // in Diesel's typed DSL.

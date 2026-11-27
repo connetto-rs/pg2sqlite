@@ -9,7 +9,7 @@
 //! - Filtered/skipped statements: ALTER TABLE, CREATE FUNCTION, GRANT, etc.
 //! - DROP of unsupported object type -> empty
 
-use diesel::{Connection, connection::SimpleConnection, sqlite::SqliteConnection};
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
 use crate::helpers;
@@ -39,7 +39,7 @@ fn commit_passes_through() {
     let output = translate("BEGIN; COMMIT;").unwrap();
     assert!(output.contains("COMMIT"), "COMMIT should pass through, got: {output}");
     {
-        let mut conn = SqliteConnection::establish(":memory:").unwrap();
+        let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
         conn.batch_execute(&output.replace('\n', ";\n")).unwrap();
     }
 }
@@ -49,7 +49,7 @@ fn rollback_passes_through() {
     let output = translate("BEGIN; ROLLBACK;").unwrap();
     assert!(output.contains("ROLLBACK"), "ROLLBACK should pass through, got: {output}");
     {
-        let mut conn = SqliteConnection::establish(":memory:").unwrap();
+        let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
         conn.batch_execute(&output.replace('\n', ";\n")).unwrap();
     }
 }
@@ -78,7 +78,7 @@ fn savepoint_passes_through() {
     let output = translate("BEGIN; SAVEPOINT sp1;").unwrap();
     assert!(output.contains("SAVEPOINT"), "SAVEPOINT should pass through, got: {output}");
     {
-        let mut conn = SqliteConnection::establish(":memory:").unwrap();
+        let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
         conn.batch_execute(&output.replace('\n', ";\n")).unwrap();
     }
 }
@@ -88,7 +88,7 @@ fn release_savepoint_passes_through() {
     let output = translate("BEGIN; SAVEPOINT sp1; RELEASE SAVEPOINT sp1;").unwrap();
     assert!(output.contains("RELEASE"), "RELEASE SAVEPOINT should pass through, got: {output}");
     {
-        let mut conn = SqliteConnection::establish(":memory:").unwrap();
+        let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
         conn.batch_execute(&output.replace('\n', ";\n")).unwrap();
     }
 }
@@ -293,7 +293,7 @@ fn mixed_statements_filters_correctly() {
 }
 
 fn exec_stmts(sql_str: &str) {
-    let mut conn = SqliteConnection::establish(":memory:").unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     for line in sql_str.lines().filter(|l| !l.trim().is_empty()) {
         conn.batch_execute(&format!("{line};"))
             .unwrap_or_else(|e| panic!("SQLite rejected translated statement: {line}\n{e}"));

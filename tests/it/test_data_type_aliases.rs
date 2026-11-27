@@ -3,11 +3,11 @@
 //! Covers integer, float, numeric, binary, text, bit, and temporal type
 //! aliases, typed string literals, and a Diesel end-to-end integration test.
 
-use diesel::prelude::*;
+use diesel::{connection::SimpleConnection, prelude::*};
 use helpers::translate_sql;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
-use crate::helpers;
+use crate::{helpers, helpers::Replica};
 
 fn translate_ok(sql: &str) -> String {
     translate_sql(sql, &Pg2SqliteOptions::default()).expect("should translate")
@@ -321,7 +321,7 @@ fn diesel_translated_schema_accepts_insert_and_query() {
         .unwrap()
         .into_vec();
 
-    let mut conn = SqliteConnection::establish(":memory:").unwrap();
+    let mut conn = Replica::establish(":memory:").unwrap();
     for stmt in &stmts {
         diesel::sql_query(stmt.to_string()).execute(&mut conn).unwrap();
     }
@@ -363,7 +363,7 @@ fn float_with_a_precision_maps_to_real() {
         .unwrap_or_else(|error| panic!("every FLOAT width should translate: {error}"))
         .into_vec();
 
-    let mut connection = SqliteConnection::establish(":memory:").expect("in-memory SQLite");
+    let mut connection = Replica::establish(":memory:").expect("in-memory SQLite");
     for statement in &statements {
         // Emitted DDL is the artifact under test, so it runs as text.
         diesel::sql_query(statement)
@@ -392,7 +392,7 @@ fn float_with_a_precision_maps_to_real() {
     }
 }
 fn execute_pg(pg_sql: &str) {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     let stmts = Pg2Sqlite::default()
         .sql(pg_sql)
         .unwrap()
@@ -400,7 +400,7 @@ fn execute_pg(pg_sql: &str) {
         .unwrap()
         .into_vec();
     for s in &stmts {
-        conn.execute_batch(&format!("{s};"))
+        conn.batch_execute(&format!("{s};"))
             .unwrap_or_else(|e| panic!("emitted SQL failed: {e}\n{s}"));
     }
 }

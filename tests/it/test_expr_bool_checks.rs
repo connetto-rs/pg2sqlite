@@ -2,7 +2,7 @@
 //!
 //! These expressions pass through directly as SQLite supports them.
 
-use diesel::prelude::*;
+use diesel::{connection::SimpleConnection, prelude::*};
 
 use crate::helpers;
 
@@ -56,9 +56,9 @@ fn test_is_true_translation() -> Result<(), Box<dyn std::error::Error>> {
 
     // Execute all translated statements to verify the output is valid SQLite.
     {
-        let conn = rusqlite::Connection::open_in_memory()?;
+        let mut conn = crate::helpers::Replica::establish(":memory:")?;
         for stmt in &translated {
-            conn.execute_batch(&format!("{stmt};"))?;
+            conn.batch_execute(&format!("{stmt};"))?;
         }
     }
     Ok(())
@@ -119,9 +119,9 @@ fn test_is_false_translation() -> Result<(), Box<dyn std::error::Error>> {
 
     // Execute all translated statements to verify the output is valid SQLite.
     {
-        let conn = rusqlite::Connection::open_in_memory()?;
+        let mut conn = crate::helpers::Replica::establish(":memory:")?;
         for stmt in &translated {
-            conn.execute_batch(&format!("{stmt};"))?;
+            conn.batch_execute(&format!("{stmt};"))?;
         }
     }
     Ok(())
@@ -179,9 +179,9 @@ fn test_is_not_true_translation() -> Result<(), Box<dyn std::error::Error>> {
 
     // Execute all translated statements to verify the output is valid SQLite.
     {
-        let conn = rusqlite::Connection::open_in_memory()?;
+        let mut conn = crate::helpers::Replica::establish(":memory:")?;
         for stmt in &translated {
-            conn.execute_batch(&format!("{stmt};"))?;
+            conn.batch_execute(&format!("{stmt};"))?;
         }
     }
     Ok(())
@@ -207,9 +207,9 @@ fn test_is_not_false_translation() -> Result<(), Box<dyn std::error::Error>> {
 
     // Execute all translated statements to verify the output is valid SQLite.
     {
-        let conn = rusqlite::Connection::open_in_memory()?;
+        let mut conn = crate::helpers::Replica::establish(":memory:")?;
         for stmt in &translated {
-            conn.execute_batch(&format!("{stmt};"))?;
+            conn.batch_execute(&format!("{stmt};"))?;
         }
     }
     Ok(())

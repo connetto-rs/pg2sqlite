@@ -1,9 +1,7 @@
 //! Parity for the SQLSTATE and the message a trigger's `RAISE EXCEPTION`
 //! reports, read on the replica through `postgres_error`.
 
-use diesel::{
-    pg::PgConnection, prelude::*, result::Error as DieselError, sqlite::SqliteConnection,
-};
+use diesel::{pg::PgConnection, prelude::*, result::Error as DieselError};
 use helpers::establish_connection;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SqlState, postgres_error};
 
@@ -62,7 +60,7 @@ fn on_replica(raise: &str) -> (SqlState, String) {
         .translate(&Pg2SqliteOptions::default())
         .unwrap_or_else(|error| panic!("pg2sqlite refused {raise}: {error}"))
         .into_vec();
-    let mut connection: SqliteConnection = establish_connection();
+    let mut connection: crate::helpers::Replica = establish_connection();
     execute_ddl(&mut connection, &translated);
     let DieselError::DatabaseError(_, information) = refused_insert!(&mut connection) else {
         panic!("SQLite did not refuse with a database error under {raise}");

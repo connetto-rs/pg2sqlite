@@ -1,6 +1,6 @@
 //! Tests for `date_trunc` translation to SQLite `strftime`.
 
-use diesel::RunQueryDsl;
+use diesel::{Connection, RunQueryDsl, connection::SimpleConnection};
 use helpers::translate_sql;
 use pg2sqlite::prelude::Pg2SqliteOptions;
 use run_translated_helper::run_translated_with;
@@ -192,12 +192,12 @@ fn a_window_aggregate_over_partition_still_translates() {
     // prepare.
     let select = sql.split('\n').find(|s| !s.trim().starts_with("PRAGMA")).unwrap();
     {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
+        let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
+        conn.batch_execute(
             "CREATE TABLE events (id INT PRIMARY KEY, user_id INT, created_at TEXT);",
         )
         .unwrap();
-        conn.prepare(select).expect("COUNT OVER must prepare in SQLite");
+        helpers::query_values(&mut conn, select, &[]).expect("COUNT OVER must prepare in SQLite");
     }
 }
 

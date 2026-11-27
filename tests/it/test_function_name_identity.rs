@@ -19,9 +19,9 @@
 //! Types take the quoting half of that rule and not the prefix half, because an
 //! extension may be installed into a named schema, which is why
 //! `public.vector` maps to `BLOB` and must keep doing so.
+use diesel::Connection;
 use helpers::translate_pg as translate;
 use pg2sqlite::prelude::Pg2SqliteOptions;
-use rusqlite::Connection;
 
 use crate::helpers;
 
@@ -39,10 +39,13 @@ fn run_one(pg: &str, options: &Pg2SqliteOptions) -> String {
         .iter()
         .find(|s| !s.starts_with("PRAGMA"))
         .unwrap_or_else(|| panic!("expected a user statement in: {emitted:?}"));
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
-    connection
-        .query_row(probe, [], |row| row.get::<_, String>(0))
-        .unwrap_or_else(|error| panic!("emitted statement failed: {error}\n{probe}"))
+    let mut connection = helpers::Replica::establish(":memory:").expect("in-memory SQLite");
+    let rows = helpers::query_values(&mut connection, probe, &[])
+        .unwrap_or_else(|error| panic!("emitted statement failed: {error}\n{probe}"));
+    match rows.into_iter().next().expect("probe row").into_iter().next().expect("probe column") {
+        helpers::SqliteAnyValue::Text(value) => value,
+        value => panic!("expected text, got {value:?}"),
+    }
 }
 
 const OWN_RANDOM: &str = r#"
@@ -113,10 +116,7 @@ fn the_catalogue_prefix_still_names_the_builtin() {
         .expect("pg_catalog.now names the built-in");
     assert_eq!(
         emitted,
-        [
-            "PRAGMA case_sensitive_like = 1",
-            "SELECT pg2sqlite_transaction_timestamp() AS v"
-        ]
+        ["PRAGMA case_sensitive_like = 1", "SELECT pg2sqlite_transaction_timestamp() AS v"]
     );
 }
 
@@ -126,10 +126,7 @@ fn a_bare_builtin_is_untouched_by_the_new_rule() {
         .expect("bare now names the built-in");
     assert_eq!(
         emitted,
-        [
-            "PRAGMA case_sensitive_like = 1",
-            "SELECT pg2sqlite_transaction_timestamp() AS v"
-        ]
+        ["PRAGMA case_sensitive_like = 1", "SELECT pg2sqlite_transaction_timestamp() AS v"]
     );
 }
 

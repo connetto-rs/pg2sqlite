@@ -6,11 +6,12 @@
 //! scenario as the non-owner role `app`, and the replica as the same signed-in
 //! user, and both have to accept or refuse the write and leave the same rows.
 
-use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{pg::PgConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
 use postgres_harness::{Outcome, apply, fresh_database, set_session_user};
 
 use crate::helpers::{
+    Replica,
     deployment::{caller, deployment},
     postgres as postgres_harness,
 };
@@ -362,12 +363,18 @@ fn postgres(scenario: &Scenario, seeded: &[(&str, &str)]) -> PgConnection {
 
 /// The translated schema on SQLite, seeded through the backing tables under
 /// the RLS exemption, then with `nina` signed in.
-fn replica(translated: &[String], seeded: &[(&str, &str)]) -> SqliteConnection {
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-    definer_app_user_utils::register_nondeterministic_impl(&mut connection, || Some("nina"))
-        .expect("register the signed-in user");
-    definer_write_exempt_utils::register_nondeterministic_impl(&mut connection, || true)
-        .expect("exempt the seed");
+fn replica(translated: &[String], seeded: &[(&str, &str)]) -> Replica {
+    let mut connection = Replica::establish(":memory:").expect("open SQLite");
+    definer_app_user_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        || Some("nina"),
+    )
+    .expect("register the signed-in user");
+    definer_write_exempt_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        || true,
+    )
+    .expect("exempt the seed");
     for statement in translated {
         diesel::connection::SimpleConnection::batch_execute(&mut connection, statement)
             .unwrap_or_else(|error| panic!("{error}\n{statement}"));
@@ -391,8 +398,11 @@ fn replica(translated: &[String], seeded: &[(&str, &str)]) -> SqliteConnection {
                 .expect("seed grant");
         }
     }
-    definer_write_exempt_utils::register_nondeterministic_impl(&mut connection, || false)
-        .expect("end the exemption");
+    definer_write_exempt_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        || false,
+    )
+    .expect("end the exemption");
     connection
 }
 
@@ -428,7 +438,7 @@ fn pg_grants_held(connection: &mut PgConnection) -> Vec<Grant> {
         .expect("read grants")
 }
 
-fn sqlite_grants_held(connection: &mut SqliteConnection) -> Vec<Grant> {
+fn sqlite_grants_held(connection: &mut Replica) -> Vec<Grant> {
     use schema::organization_grants_rls::dsl::*;
     organization_grants_rls
         .select((organization_id, principal_id, role))
@@ -656,7 +666,7 @@ where
 
 /// Nora's `org1`, hidden from Nina, and Nina's `org2`, stored past the
 /// policies on both engines.
-fn seed_two_organizations(pg: &mut PgConnection, sqlite: &mut SqliteConnection) {
+fn seed_two_organizations(pg: &mut PgConnection, sqlite: &mut Replica) {
     let seeded = [
         (schema::organizations::id.eq("org1"), schema::organizations::created_by.eq("nora")),
         (schema::organizations::id.eq("org2"), schema::organizations::created_by.eq("nina")),
@@ -668,8 +678,11 @@ fn seed_two_organizations(pg: &mut PgConnection, sqlite: &mut SqliteConnection) 
         .expect("seed PostgreSQL");
     diesel::sql_query("SET ROLE app").execute(pg).expect("act as app");
 
-    definer_write_exempt_utils::register_nondeterministic_impl(sqlite, || true)
-        .expect("exempt the seed");
+    definer_write_exempt_utils::register_nondeterministic_impl(
+        sqlite.registration().expect("registration").sqlite(),
+        || true,
+    )
+    .expect("exempt the seed");
     diesel::insert_into(schema::organizations_rls::table)
         .values([
             (
@@ -683,8 +696,11 @@ fn seed_two_organizations(pg: &mut PgConnection, sqlite: &mut SqliteConnection) 
         ])
         .execute(sqlite)
         .expect("seed SQLite");
-    definer_write_exempt_utils::register_nondeterministic_impl(sqlite, || false)
-        .expect("end the exemption");
+    definer_write_exempt_utils::register_nondeterministic_impl(
+        sqlite.registration().expect("registration").sqlite(),
+        || false,
+    )
+    .expect("end the exemption");
 }
 
 /// Nora's organization fills the cap although Nina cannot see it, so Nina's

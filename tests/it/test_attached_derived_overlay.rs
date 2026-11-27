@@ -8,7 +8,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicI32, Ordering};
 use std::path::{Path, PathBuf};
 
-use diesel::{connection::SimpleConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{connection::SimpleConnection, prelude::*};
 use pg2sqlite::{
     prelude::{Error, FreshFiles, Pg2Sqlite, Pg2SqliteOptions, Placement, Script},
     warnings::TranslationWarning,
@@ -228,14 +228,15 @@ impl Files {
 
     /// A connection on `main` with the shared file attached and `derived`
     /// counting its open depth.
-    fn open(&self, main: &Path, script: &Script<String>) -> SqliteConnection {
+    fn open(&self, main: &Path, script: &Script<String>) -> crate::helpers::Replica {
         let mut connection =
-            SqliteConnection::establish(main.to_str().expect("utf-8 path")).expect("open");
-        script.register_functions(&mut connection).expect("helper functions");
+            crate::helpers::Replica::establish(main.to_str().expect("utf-8 path")).expect("open");
+        script.register_managed(&mut connection).expect("helper functions");
         let depth = Arc::new(AtomicI32::new(0));
-        derived_utils::register_nondeterministic_impl(&mut connection, move |step: i32| {
-            depth.fetch_add(step, Ordering::Relaxed) + step
-        })
+        derived_utils::register_nondeterministic_impl(
+            connection.registration().expect("registration").sqlite(),
+            move |step: i32| depth.fetch_add(step, Ordering::Relaxed) + step,
+        )
         .expect("register derived");
         connection
             .batch_execute(&format!("ATTACH '{}' AS shared", self.shared.display()))
@@ -255,7 +256,7 @@ impl Drop for Files {
 fn two_identities(
     label: &str,
     script: &Script<String>,
-) -> (Files, SqliteConnection, SqliteConnection) {
+) -> (Files, crate::helpers::Replica, crate::helpers::Replica) {
     let files = Files::new(label);
     let mut alice = files.open(&files.alice, script);
     run(&mut alice, script.initialize(FreshFiles::Both).expect("initialize both"));
@@ -272,11 +273,11 @@ fn two_identities(
     (files, alice, bob)
 }
 
-fn visible(connection: &mut SqliteConnection) -> Vec<(i32, String, Option<String>)> {
+fn visible(connection: &mut crate::helpers::Replica) -> Vec<(i32, String, Option<String>)> {
     notes::table.order(notes::id).load(connection).expect("read notes")
 }
 
-fn shared_rows(connection: &mut SqliteConnection) -> Vec<(i32, String, Option<String>)> {
+fn shared_rows(connection: &mut crate::helpers::Replica) -> Vec<(i32, String, Option<String>)> {
     notes_pg2sqlite_shared::table
         .order(notes_pg2sqlite_shared::id)
         .load(connection)
@@ -287,7 +288,7 @@ fn note(id: i32, body: &str, stamp: Option<&str>) -> (i32, String, Option<String
     (id, body.to_owned(), stamp.map(str::to_owned))
 }
 
-fn derive(connection: &mut SqliteConnection, source: i32) {
+fn derive(connection: &mut crate::helpers::Replica, source: i32) {
     diesel::insert_into(sources::table)
         .values(sources::id.eq(source))
         .execute(connection)
@@ -338,7 +339,7 @@ fn the_tables_own_triggers_run_on_overlay_writes() {
     assert_eq!(logged(&mut alice), [(105, "insert".to_owned()), (2, "delete".to_owned())]);
 }
 
-fn logged(connection: &mut SqliteConnection) -> Vec<(i32, String)> {
+fn logged(connection: &mut crate::helpers::Replica) -> Vec<(i32, String)> {
     note_log::table
         .select((note_log::note_id, note_log::event))
         .order(note_log::id)
@@ -509,7 +510,7 @@ fn document(id: i32, title: &str, body: &str) -> Document {
 /// Alice and bob over documents 1 and 2, after alice's derived run has
 /// drafted document 1, deleted document 2 and inserted document 105 in her
 /// overlay.
-fn drafted(label: &str) -> (Files, SqliteConnection, SqliteConnection) {
+fn drafted(label: &str) -> (Files, crate::helpers::Replica, crate::helpers::Replica) {
     let options = Pg2SqliteOptions::default()
         .with_server_derived_write_function("derived")
         .with_attached_tables("shared", ["documents"])
@@ -531,18 +532,18 @@ fn drafted(label: &str) -> (Files, SqliteConnection, SqliteConnection) {
     (files, alice, bob)
 }
 
-fn documents_seen(connection: &mut SqliteConnection) -> Vec<Document> {
+fn documents_seen(connection: &mut crate::helpers::Replica) -> Vec<Document> {
     documents::table.order(documents::id).load(connection).expect("read documents")
 }
 
-fn shared_documents(connection: &mut SqliteConnection) -> Vec<Document> {
+fn shared_documents(connection: &mut crate::helpers::Replica) -> Vec<Document> {
     documents_rls_pg2sqlite_shared::table
         .order(documents_rls_pg2sqlite_shared::id)
         .load(connection)
         .expect("read the shared documents")
 }
 
-fn overlay_documents(connection: &mut SqliteConnection) -> Vec<(i32, String, String, i32)> {
+fn overlay_documents(connection: &mut crate::helpers::Replica) -> Vec<(i32, String, String, i32)> {
     documents_rls_pg2sqlite_overlay::table
         .order(documents_rls_pg2sqlite_overlay::id)
         .load(connection)
@@ -551,9 +552,9 @@ fn overlay_documents(connection: &mut SqliteConnection) -> Vec<(i32, String, Str
 
 /// Runs `write` with `key` named as the key it lands on the shared rows at.
 fn land<T>(
-    connection: &mut SqliteConnection,
+    connection: &mut crate::helpers::Replica,
     key: i32,
-    write: impl FnOnce(&mut SqliteConnection) -> T,
+    write: impl FnOnce(&mut crate::helpers::Replica) -> T,
 ) -> T {
     diesel::insert_into(documents_rls_pg2sqlite_shared_write::table)
         .values(documents_rls_pg2sqlite_shared_write::id.eq(key))
@@ -667,7 +668,7 @@ fn membership(team_id: i32, user_id: i32, role: &str) -> Membership {
     (team_id, user_id, role.to_owned())
 }
 
-fn memberships_seen(connection: &mut SqliteConnection) -> Vec<Membership> {
+fn memberships_seen(connection: &mut crate::helpers::Replica) -> Vec<Membership> {
     memberships::table
         .order((memberships::team_id, memberships::user_id))
         .load(connection)

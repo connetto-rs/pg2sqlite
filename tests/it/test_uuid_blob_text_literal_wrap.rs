@@ -17,13 +17,23 @@
 //! (parse-time emission of `x'...'`, an unhex-based expression, a
 //! pseudo UDF, ...) is intentionally not prescribed.
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation};
-use rusqlite::Connection;
+
+use crate::helpers::{Replica, SqliteAnyValue, query_values};
 
 const UUID_HEX_STR: &str = "550e8400-e29b-41d4-a716-446655440000";
 const UUID_BYTES: [u8; 16] = [
     0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00,
 ];
+
+fn read_uuid(connection: &mut Replica) -> Vec<u8> {
+    let rows = query_values(connection, "SELECT id FROM u WHERE name = 'alice'", &[]).unwrap();
+    match rows.into_iter().next().unwrap().into_iter().next().unwrap() {
+        SqliteAnyValue::Blob(value) => value,
+        value => panic!("expected blob, got {value:?}"),
+    }
+}
 
 fn blob_opts() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
@@ -47,12 +57,11 @@ fn insert_uuid_text_literal_wraps_for_blob_representation() {
         "CREATE TABLE u (id UUID PRIMARY KEY, name TEXT NOT NULL);\n\
          INSERT INTO u (id, name) VALUES ('{UUID_HEX_STR}', 'alice');"
     );
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(&translate(&schema, &blob_opts())).expect(
+    let mut conn = Replica::establish(":memory:").unwrap();
+    conn.batch_execute(&translate(&schema, &blob_opts())).expect(
         "INSERT of a UUID text literal must apply against the translated BLOB STRICT table",
     );
-    let row: Vec<u8> =
-        conn.query_row("SELECT id FROM u WHERE name = 'alice'", [], |r| r.get(0)).unwrap();
+    let row: Vec<u8> = read_uuid(&mut conn);
     assert_eq!(row, UUID_BYTES, "stored UUID must be the 16-byte binary form");
 }
 
@@ -62,24 +71,26 @@ fn insert_uuid_pg_cast_wraps_for_blob_representation() {
         "CREATE TABLE u (id UUID PRIMARY KEY, name TEXT NOT NULL);\n\
          INSERT INTO u (id, name) VALUES ('{UUID_HEX_STR}'::uuid, 'alice');"
     );
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(&translate(&schema, &blob_opts())).expect(
+    let mut conn = Replica::establish(":memory:").unwrap();
+    conn.batch_execute(&translate(&schema, &blob_opts())).expect(
         "INSERT of a `'...'::uuid` cast must translate into a binary-conversion call and apply",
     );
-    let row: Vec<u8> =
-        conn.query_row("SELECT id FROM u WHERE name = 'alice'", [], |r| r.get(0)).unwrap();
+    let row: Vec<u8> = read_uuid(&mut conn);
     assert_eq!(row, UUID_BYTES, "stored UUID must be the 16-byte binary form");
 }
 
 #[test]
 fn update_uuid_text_literal_wraps_for_blob_representation() {
     let schema = "CREATE TABLE u (id UUID PRIMARY KEY, name TEXT NOT NULL);".to_string();
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(&translate(&schema, &blob_opts())).expect("apply schema");
+    let mut conn = Replica::establish(":memory:").unwrap();
+    conn.batch_execute(&translate(&schema, &blob_opts())).expect("apply schema");
     // Seed via a parameter so the test does not depend on the INSERT
     // wrap (covered by the INSERT-side tests above).
-    conn.execute("INSERT INTO u (id, name) VALUES (?1, 'alice')", [&UUID_BYTES[..]])
-        .expect("seed via parameter");
+    conn.execute(
+        "INSERT INTO u (id, name) VALUES (?1, 'alice')",
+        &[SqliteAnyValue::Blob(UUID_BYTES.to_vec())],
+    )
+    .expect("seed via parameter");
 
     // PG-style UPDATE that targets the UUID column with a text literal.
     let pg_update = format!("UPDATE u SET id = '{UUID_HEX_STR}' WHERE name = 'alice';");
@@ -102,13 +113,12 @@ fn update_uuid_text_literal_wraps_for_blob_representation() {
         .map(|s| format!("{s};"))
         .collect::<Vec<_>>()
         .join("\n");
-    conn.execute_batch(&update_sql).expect(
+    conn.batch_execute(&update_sql).expect(
         "UPDATE setting a UUID column to a text literal must wrap with a binary-conversion call \
          and apply against the BLOB STRICT column",
     );
 
-    let row: Vec<u8> =
-        conn.query_row("SELECT id FROM u WHERE name = 'alice'", [], |r| r.get(0)).unwrap();
+    let row: Vec<u8> = read_uuid(&mut conn);
     assert_eq!(row, UUID_BYTES, "UPDATEd UUID must still be the 16-byte binary form");
 }
 
@@ -119,11 +129,14 @@ fn check_constraint_rejects_short_blob_under_blob_representation() {
     // pg2sqlite attaches under `UuidRepresentation::Blob` must catch
     // them at apply time so a malformed UUID never lands in the table.
     let schema = "CREATE TABLE u (id UUID PRIMARY KEY, name TEXT NOT NULL);";
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(&translate(schema, &blob_opts())).expect("apply schema");
+    let mut conn = Replica::establish(":memory:").unwrap();
+    conn.batch_execute(&translate(schema, &blob_opts())).expect("apply schema");
     let short: [u8; 4] = [0, 1, 2, 3];
     let err = conn
-        .execute("INSERT INTO u (id, name) VALUES (?1, 'alice')", [&short[..]])
+        .execute(
+            "INSERT INTO u (id, name) VALUES (?1, 'alice')",
+            &[SqliteAnyValue::Blob(short.to_vec())],
+        )
         .expect_err("4-byte blob must trip the length(id) = 16 CHECK constraint");
     assert!(
         err.to_string().to_lowercase().contains("check"),
@@ -158,18 +171,18 @@ fn uuid_text_to_blob_function_name_override_is_honoured() {
     // INSERT so SQLite validates the table reference and SQL syntax without
     // needing the UDF at call time.
     let stmts = Pg2Sqlite::default().sql(&schema).unwrap().translate(&opts).unwrap().into_vec();
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Replica::establish(":memory:").unwrap();
     for stmt in &stmts {
         let s = stmt.to_string();
         let up = s.trim_start().to_ascii_uppercase();
         if up.starts_with("CREATE") || up.starts_with("ALTER") {
-            conn.execute_batch(&format!("{s};"))
+            conn.batch_execute(&format!("{s};"))
                 .unwrap_or_else(|e| panic!("DDL must execute in SQLite: {e}\n{s}"));
         } else {
             // uuid_text_to_blob is a caller-registered UDF absent in the test
             // process; accept that specific error so SQLite still validates the
             // table and column references.
-            match conn.prepare(&s) {
+            match query_values(&mut conn, &format!("EXPLAIN {s}"), &[]) {
                 Ok(_) => {}
                 Err(e) if e.to_string().contains("no such function: uuid_text_to_blob") => {}
                 Err(e) => panic!("translated SQL must prepare in SQLite: {e}\n{s}"),
@@ -205,10 +218,10 @@ fn uuid_cast_in_select_lowers_to_conversion_call() {
     );
     // Execute the SELECT to prove SQLite accepts it (unhex is a built-in
     // function).
-    let conn = Connection::open_in_memory().unwrap();
-    conn.prepare(&stmt)
+    let mut conn = Replica::establish(":memory:").unwrap();
+    query_values(&mut conn, &format!("EXPLAIN {stmt}"), &[])
         .unwrap_or_else(|e| panic!("translated SELECT must prepare in SQLite: {e}\n{stmt}"));
-    conn.execute_batch(&format!("{stmt};"))
+    conn.batch_execute(&format!("{stmt};"))
         .unwrap_or_else(|e| panic!("translated SELECT must execute in SQLite: {e}\n{stmt}"));
 }
 
@@ -223,10 +236,10 @@ fn text_representation_must_not_wrap() {
     let opts = Pg2SqliteOptions::default()
         .with_sqlitegis_enabled()
         .with_uuid_representation(UuidRepresentation::Text);
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(&translate(&schema, &opts)).expect("apply schema with Text rep");
-    let row: String =
-        conn.query_row("SELECT id FROM u WHERE name = 'alice'", [], |r| r.get(0)).unwrap();
+    let mut conn = Replica::establish(":memory:").unwrap();
+    conn.batch_execute(&translate(&schema, &opts)).expect("apply schema with Text rep");
+    let rows = query_values(&mut conn, "SELECT id FROM u WHERE name = 'alice'", &[]).unwrap();
+    let SqliteAnyValue::Text(row) = &rows[0][0] else { panic!("expected text UUID") };
     assert_eq!(row, UUID_HEX_STR, "Text-represented UUID must be stored as the 36-char string");
 }
 
@@ -250,11 +263,10 @@ fn every_postgres_uuid_spelling_stores_the_same_blob() {
             "CREATE TABLE u (id UUID PRIMARY KEY, name TEXT NOT NULL);\n\
              INSERT INTO u (id, name) VALUES ('{spelling}', 'alice');"
         );
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(&translate(&schema, &blob_opts()))
+        let mut conn = Replica::establish(":memory:").unwrap();
+        conn.batch_execute(&translate(&schema, &blob_opts()))
             .unwrap_or_else(|error| panic!("`{spelling}` must apply: {error}"));
-        let row: Vec<u8> =
-            conn.query_row("SELECT id FROM u WHERE name = 'alice'", [], |r| r.get(0)).unwrap();
+        let row: Vec<u8> = read_uuid(&mut conn);
         assert_eq!(row, UUID_BYTES, "`{spelling}` must store the same 16 bytes");
     }
 }
@@ -293,10 +305,9 @@ fn the_cast_spelling_accepts_and_refuses_the_same_set() {
         "CREATE TABLE u (id UUID PRIMARY KEY, name TEXT NOT NULL);\n\
          INSERT INTO u (id, name) VALUES ('{{{UUID_HEX_STR}}}'::uuid, 'alice');"
     );
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(&translate(&braced, &blob_opts())).expect("a braced cast must apply");
-    let row: Vec<u8> =
-        conn.query_row("SELECT id FROM u WHERE name = 'alice'", [], |r| r.get(0)).unwrap();
+    let mut conn = Replica::establish(":memory:").unwrap();
+    conn.batch_execute(&translate(&braced, &blob_opts())).expect("a braced cast must apply");
+    let row: Vec<u8> = read_uuid(&mut conn);
     assert_eq!(row, UUID_BYTES);
 
     let bad = "CREATE TABLE u (id UUID PRIMARY KEY, name TEXT NOT NULL);\n\
@@ -315,9 +326,13 @@ const OTHER_BYTES: [u8; 16] = [
 
 /// Applies a whole translated script and reads `tag` back as bytes.
 fn tag_after(pg: &str) -> Vec<u8> {
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(&translate(pg, &blob_opts())).expect("the emitted script must apply");
-    conn.query_row("SELECT tag FROM u", [], |r| r.get(0)).unwrap()
+    let mut conn = Replica::establish(":memory:").unwrap();
+    conn.batch_execute(&translate(pg, &blob_opts())).expect("the emitted script must apply");
+    let rows = query_values(&mut conn, "SELECT tag FROM u", &[]).unwrap();
+    match rows.into_iter().next().unwrap().into_iter().next().unwrap() {
+        SqliteAnyValue::Blob(value) => value,
+        value => panic!("expected blob, got {value:?}"),
+    }
 }
 
 /// The upsert's assignment list writes into the same BLOB column the plain
@@ -379,8 +394,7 @@ fn excluded_reference_in_do_update_stays_untouched() {
 
 /// Tests for the runtime bind-parameter UUID path (L10).
 ///
-/// Isolated in a submodule to bring diesel into scope without clashing with
-/// the `rusqlite::Connection` imported at the file level.
+/// Diesel bindings exercise translated placeholders.
 mod bind_param {
     use diesel::{RunQueryDsl, prelude::*};
     use pg2sqlite::prelude::Pg2Sqlite;
@@ -418,7 +432,7 @@ mod bind_param {
             .expect("translate")
             .into_vec();
 
-        let mut conn = diesel::sqlite::SqliteConnection::establish(":memory:").expect("open db");
+        let mut conn = crate::helpers::Replica::establish(":memory:").expect("open db");
 
         // Apply CREATE TABLE. diesel::sql_query is used because the emitted DDL
         // includes STRICT and CHECK clauses that the Diesel typed DSL cannot

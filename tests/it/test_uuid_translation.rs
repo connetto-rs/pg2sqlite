@@ -1,6 +1,6 @@
 //! Test translation of UUID related defaults.
 
-use diesel::{prelude::*, sqlite::SqliteConnection};
+use diesel::prelude::*;
 use pg2sqlite::{pg2sqlite::Pg2Sqlite, prelude::*};
 
 // Schema definitions for test tables
@@ -57,8 +57,9 @@ fn test_default_gen_random_uuid() {
 
 #[test]
 fn uuid_default_uses_registered_uuid_function() {
-    let mut conn = SqliteConnection::establish(":memory:").expect("Failed to open SQLite");
-    uuid_utils::register_impl(&mut conn, uuid_impl).expect("Failed to register uuid()");
+    let mut conn = crate::helpers::Replica::establish(":memory:").expect("Failed to open SQLite");
+    uuid_utils::register_impl(conn.registration().expect("registration").sqlite(), uuid_impl)
+        .expect("Failed to register uuid()");
 
     let sql = "CREATE TABLE users (id UUID PRIMARY KEY DEFAULT gen_random_uuid())";
     let translated = Pg2Sqlite::default()

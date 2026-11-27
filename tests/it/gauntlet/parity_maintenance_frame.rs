@@ -3,7 +3,7 @@
 //! `AFTER` one with the row the assigning trigger returned as `NEW` and, on
 //! `UPDATE`, the row before the write as `OLD`.
 
-use diesel::{QueryResult, connection::SimpleConnection, prelude::*};
+use diesel::{QueryResult, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use postgres_harness::{Outcome, apply, fresh_database};
 
@@ -51,10 +51,9 @@ fn audit(label: &str) -> String {
 
 const SEED: &str = "INSERT INTO items (id, tag, note) VALUES (1, 'a', 'n');";
 
-/// Applies `batches` in order on both engines, the replica translating each
-/// against the schema the batches before it build, and answers the replica's
-/// statements to run before each commit.
-fn engines(batches: &[&str]) -> (PgConnection, SqliteConnection, Vec<String>) {
+/// Applies `batches` to both engines against the schema built by preceding
+/// batches.
+fn engines(batches: &[&str]) -> (PgConnection, crate::helpers::Replica) {
     let mut postgres = fresh_database();
     let mut sqlite = crate::helpers::establish_connection();
     let options = Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit");
@@ -64,7 +63,7 @@ fn engines(batches: &[&str]) -> (PgConnection, SqliteConnection, Vec<String>) {
         apply(&mut postgres, batch)
             .unwrap_or_else(|error| panic!("PostgreSQL refused the batch: {error}"));
         let translator = Pg2Sqlite::default().sql(batch).expect("parse");
-        let script = if applied.is_empty() {
+        let mut script = if applied.is_empty() {
             translator.translate_to_sql(&options)
         } else {
             let schema = Pg2Sqlite::default().sql(&applied).unwrap().build_schema().unwrap();
@@ -76,38 +75,28 @@ fn engines(batches: &[&str]) -> (PgConnection, SqliteConnection, Vec<String>) {
                 before_commit.push(statement.clone());
             }
         }
-        for statement in script.into_vec() {
-            sqlite.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
-        }
+        script.before_commit = before_commit;
+        script
+            .initialize_managed(&mut sqlite, pg2sqlite::script::FreshFiles::Both)
+            .expect("initialize batch");
+        before_commit = script.before_commit;
         applied.push_str(batch);
     }
-    (postgres, sqlite, before_commit)
+    (postgres, sqlite)
 }
 
 /// Runs `writes` in one transaction and commits it, rolling back a failed
 /// commit as PostgreSQL does.
-fn transaction<C: SimpleConnection>(
-    connection: &mut C,
-    before_commit: &[String],
-    writes: &str,
-) -> QueryResult<()> {
-    connection.batch_execute("BEGIN")?;
-    let committed = connection.batch_execute(writes).and_then(|()| {
-        before_commit.iter().try_for_each(|statement| connection.batch_execute(statement))?;
-        connection.batch_execute("COMMIT")
-    });
-    if committed.is_err() {
-        connection.batch_execute("ROLLBACK")?;
-    }
-    committed
+fn transaction<C: Connection>(connection: &mut C, writes: &str) -> QueryResult<()> {
+    connection.transaction(|connection| connection.batch_execute(writes))
 }
 
 /// Each transaction's outcome, then the log in firing order and the items.
 macro_rules! observe {
-    ($connection:expr, $before_commit:expr, $transactions:expr) => {{
+    ($connection:expr, $transactions:expr) => {{
         let mut outcomes: Vec<Outcome> = $transactions
             .iter()
-            .map(|writes| Outcome::of(&transaction($connection, $before_commit, writes)))
+            .map(|writes| Outcome::of(&transaction($connection, writes)))
             .collect();
         let entries: Vec<String> = fired::table
             .select(fired::entry)
@@ -124,9 +113,9 @@ macro_rules! observe {
 
 /// Asserts both engines agree on `transactions` after `batches`.
 fn assert_agree(batches: &[&str], transactions: &[&str]) {
-    let (mut postgres, mut sqlite, before_commit) = engines(batches);
-    let expected = observe!(&mut postgres, &[], transactions);
-    let actual = observe!(&mut sqlite, &before_commit, transactions);
+    let (mut postgres, mut sqlite) = engines(batches);
+    let expected = observe!(&mut postgres, transactions);
+    let actual = observe!(&mut sqlite, transactions);
     assert_eq!(actual, expected, "the replica disagrees with PostgreSQL");
 }
 

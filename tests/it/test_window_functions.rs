@@ -9,13 +9,13 @@
 
 #![allow(dead_code)]
 
-use diesel::prelude::*;
+use diesel::{connection::SimpleConnection, prelude::*};
 use pg2sqlite::prelude::Pg2SqliteOptions;
 use translate_helpers::translate_default_err as translate_err;
 
 use crate::{helpers, helpers::translate as translate_helpers};
 
-/// Applies every non-query statement of `stmts` on a fresh in-memory rusqlite
+/// Applies every non-query statement of `stmts` on a fresh in-memory managed
 /// connection and returns it. The query statements are left to `prepare`.
 ///
 /// The statements are the translator's own output, which no typed query
@@ -24,15 +24,15 @@ use crate::{helpers, helpers::translate as translate_helpers};
 /// # Panics
 ///
 /// Panics when the connection cannot be opened or a statement is rejected.
-fn apply_ddl_rusqlite(stmts: &[String]) -> rusqlite::Connection {
-    let connection = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+fn apply_ddl(stmts: &[String]) -> helpers::Replica {
+    let mut connection = helpers::Replica::establish(":memory:").expect("in-memory SQLite");
     let ddl = stmts
         .iter()
         .filter(|s| !s.to_ascii_uppercase().trim_start().starts_with("SELECT"))
         .map(|s| format!("{s};"))
         .collect::<Vec<_>>()
         .join("\n");
-    connection.execute_batch(&ddl).unwrap();
+    connection.batch_execute(&ddl).unwrap();
     connection
 }
 
@@ -468,14 +468,21 @@ fn test_filter_clause_to_case() {
 
     // Value check: 3 rows, 2 active -> window reports active_count = 2 for
     // every row.
-    let conn = apply_ddl_rusqlite(&translated);
-    conn.execute_batch(
+    let mut conn = apply_ddl(&translated);
+    conn.batch_execute(
         "INSERT INTO data (status, value) VALUES ('active', 1), ('active', 2), ('inactive', 3);",
     )
     .unwrap();
-    let mut stmt = conn.prepare(&select_stmt).unwrap();
-    let counts: Vec<i64> =
-        stmt.query_map([], |row| row.get(0)).unwrap().map(|r| r.unwrap()).collect();
+    let counts: Vec<i64> = helpers::query_values(&mut conn, &select_stmt, &[])
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            match row[0] {
+                helpers::SqliteAnyValue::Integer(value) => value,
+                ref value => panic!("expected integer, got {value:?}"),
+            }
+        })
+        .collect();
     assert_eq!(counts, vec![2, 2, 2], "window FILTER must count only active rows: {counts:?}");
 }
 
@@ -499,11 +506,14 @@ fn test_filter_clause_aggregate_to_case() {
     assert!(!lower.contains("case when"), "no CASE WHEN lowering expected: {select_stmt}");
 
     // Value check: 2 click events out of 3.
-    let conn = apply_ddl_rusqlite(&translated);
-    conn.execute_batch("INSERT INTO events (event_type) VALUES ('click'), ('click'), ('view');")
+    let mut conn = apply_ddl(&translated);
+    conn.batch_execute("INSERT INTO events (event_type) VALUES ('click'), ('click'), ('view');")
         .unwrap();
-    let mut stmt = conn.prepare(&select_stmt).unwrap();
-    let click_count: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
+    let rows = helpers::query_values(&mut conn, &select_stmt, &[]).unwrap();
+    let click_count = match rows[0][0] {
+        helpers::SqliteAnyValue::Integer(value) => value,
+        ref value => panic!("expected integer, got {value:?}"),
+    };
     assert_eq!(click_count, 2, "FILTER must count only click events: {click_count}");
 }
 

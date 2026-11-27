@@ -202,11 +202,10 @@ fn a_call_passed_a_trigger_field_beside_another_from_item_reads_the_row() {
         .expect("parse")
         .translate_to_sql(&options())
         .unwrap_or_else(|error| panic!("the schema should translate: {error}"));
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-    script.register_functions(&mut connection).expect("register helper functions");
-    for statement in script.into_vec() {
-        connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
-    }
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
+    script
+        .initialize_managed(&mut connection, pg2sqlite::script::FreshFiles::Both)
+        .expect("initialize replica");
     connection
         .batch_execute("INSERT INTO runs VALUES (1, NULL, 5, 5), (2, NULL, 5, 6), (3, 'ok', 5, 6);")
         .expect("seed the replica");
@@ -242,11 +241,10 @@ fn a_call_passed_an_enclosing_column_beside_another_from_item_reads_that_row() {
         .expect("parse")
         .translate_to_sql(&options())
         .unwrap_or_else(|error| panic!("the schema should translate: {error}"));
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-    script.register_functions(&mut connection).expect("register helper functions");
-    for statement in script.into_vec() {
-        connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
-    }
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
+    script
+        .initialize_managed(&mut connection, pg2sqlite::script::FreshFiles::Both)
+        .expect("initialize replica");
     connection
         .batch_execute(
             "INSERT INTO runs VALUES (1, NULL, 5, 5), (2, NULL, 5, 6), (3, NULL, 5, 6);
@@ -293,11 +291,10 @@ fn a_star_body_keeps_its_columns_and_a_strict_helper_skips_null() {
         .expect("parse")
         .translate_to_sql(&options())
         .unwrap_or_else(|error| panic!("the schema should translate: {error}"));
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-    script.register_functions(&mut connection).expect("register helper functions");
-    for statement in script.into_vec() {
-        connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
-    }
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
+    script
+        .initialize_managed(&mut connection, pg2sqlite::script::FreshFiles::Both)
+        .expect("initialize replica");
     connection
         .batch_execute(
             "INSERT INTO runs VALUES (1, 'cold', 5, 5), (2, 'warm', 5, 6);
@@ -358,11 +355,10 @@ fn a_called_helper_passes_reals_and_blobs_through() {
         .expect("parse")
         .translate_to_sql(&options())
         .unwrap_or_else(|error| panic!("the schema should translate: {error}"));
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-    script.register_functions(&mut connection).expect("register helper functions");
-    for statement in script.into_vec() {
-        connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
-    }
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
+    script
+        .initialize_managed(&mut connection, pg2sqlite::script::FreshFiles::Both)
+        .expect("initialize replica");
     connection
         .batch_execute("INSERT INTO samples VALUES (1, 2.5, x'00ff'), (2, NULL, NULL);")
         .expect("seed the replica");
@@ -431,11 +427,10 @@ fn a_hosted_helper_inside_a_nested_join_returns_matching_rows() {
         deviations("STABLE STRICT", BODY)
     );
     let script = helpers::translate_script(&source, &options()).expect("translate nested join");
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-    script.register_functions(&mut connection).expect("register helpers");
-    for statement in script.into_vec() {
-        connection.batch_execute(&statement).expect("create replica");
-    }
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
+    script
+        .initialize_managed(&mut connection, pg2sqlite::script::FreshFiles::Both)
+        .expect("initialize replica");
     connection
         .batch_execute(
             "INSERT INTO runs VALUES (1, NULL, 5, 5), (2, NULL, 5, 6);
@@ -468,11 +463,10 @@ fn an_insert_reading_its_target_through_nested_helpers_keeps_the_original_count(
            (SELECT amount FROM nested_counts() AS counted(amount)), 0 FROM links link;"
     );
     let script = helpers::translate_script(&source, &options()).expect("translate snapshot read");
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-    script.register_functions(&mut connection).expect("register helpers");
-    for statement in script.into_vec() {
-        connection.batch_execute(&statement).expect("execute snapshot insert");
-    }
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
+    script
+        .initialize_managed(&mut connection, pg2sqlite::script::FreshFiles::Both)
+        .expect("initialize replica");
     let rows: Vec<i32> = deviating::table
         .select(deviating::id)
         .order(deviating::id)
@@ -497,11 +491,10 @@ fn an_insert_reads_another_table_through_nested_helpers() {
          INSERT INTO runs SELECT id, NULL, 0, 0 FROM nested_ids() AS linked(id);"
     );
     let script = helpers::translate_script(&source, &options()).expect("translate nested helpers");
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-    script.register_functions(&mut connection).expect("register helpers");
-    for statement in script.into_vec() {
-        connection.batch_execute(&statement).expect("execute nested helper insert");
-    }
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
+    script
+        .initialize_managed(&mut connection, pg2sqlite::script::FreshFiles::Both)
+        .expect("initialize replica");
     let rows: Vec<i32> = deviating::table
         .select(deviating::id)
         .order(deviating::id)

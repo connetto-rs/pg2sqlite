@@ -61,7 +61,7 @@ fn translate_err(pg: &str) -> String {
 
 /// The first execution failure, for the rows PostgreSQL refuses.
 fn apply_err(pg: &str) -> diesel::result::Error {
-    let mut connection = SqliteConnection::establish(":memory:").expect("connect");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("connect");
     diesel::sql_query("PRAGMA foreign_keys = ON").execute(&mut connection).expect("pragma");
     for statement in translate(pg) {
         if let Err(error) = diesel::sql_query(&statement).execute(&mut connection) {
@@ -71,7 +71,7 @@ fn apply_err(pg: &str) -> diesel::result::Error {
     panic!("every emitted statement succeeded, expected one to fail");
 }
 
-fn stored(connection: &mut SqliteConnection) -> Vec<(Option<i32>, Option<i32>)> {
+fn stored(connection: &mut crate::helpers::Replica) -> Vec<(Option<i32>, Option<i32>)> {
     schema::child::table
         .select((schema::child::x, schema::child::y))
         .order(schema::child::rowid)

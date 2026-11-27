@@ -7,7 +7,6 @@ use diesel::{
     prelude::*,
     result::Error as DieselError,
     sql_types::{Bool, Text},
-    sqlite::SqliteConnection,
 };
 use pg2sqlite::prelude::Pg2SqliteOptions;
 
@@ -33,12 +32,12 @@ extern "SQL" {
 const TIMESTAMPTZ: &str = "%Y-%m-%d %H:%M:%f000+00:00";
 
 /// The `timestamptz` text of the instant `shift` away from now.
-fn stamp(connection: &mut SqliteConnection, shift: &str) -> String {
+fn stamp(connection: &mut crate::helpers::Replica, shift: &str) -> String {
     diesel::select(strftime(TIMESTAMPTZ, "now", shift)).get_result(connection).expect("strftime")
 }
 
 fn insert(
-    connection: &mut SqliteConnection,
+    connection: &mut crate::helpers::Replica,
     id: i32,
     started_at: Option<&str>,
 ) -> Result<usize, DieselError> {
@@ -89,9 +88,10 @@ fn an_exempt_write_lands_and_an_update_of_another_column_is_checked() {
     let options = Pg2SqliteOptions::default().with_rls_exemption_function("write_exempt");
     let mut connection =
         helpers::apply_with_options(TOLERANT, &options).expect("the translated table applies");
-    write_exempt_utils::register_nondeterministic_impl(&mut connection, || {
-        EXEMPT.load(Ordering::Relaxed)
-    })
+    write_exempt_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        || EXEMPT.load(Ordering::Relaxed),
+    )
     .expect("register the exemption");
     let ahead = stamp(&mut connection, "+1 hour");
 
@@ -120,7 +120,7 @@ fn a_table_check_qualifying_its_column_raises_its_declared_name() {
     );
 }
 
-fn insert_note(connection: &mut SqliteConnection, id: i32) -> Result<usize, DieselError> {
+fn insert_note(connection: &mut crate::helpers::Replica, id: i32) -> Result<usize, DieselError> {
     diesel::insert_into(stamped::table)
         .values((stamped::id.eq(id), stamped::note.eq("x")))
         .execute(connection)

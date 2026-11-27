@@ -25,9 +25,10 @@ jiff = { version = "0.2.39", default-features = false, features = ["std", "js"],
 # transaction controls.
 sqlparser = { version = "0.64", default-features = false, optional = true }
 
-# Reads whether SQLite still holds a transaction after a failure ended it.
+# Reads whether SQLite still holds a transaction after a failure ended it,
+# on the one SQLite diesel links, so the range is diesel's.
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
-libsqlite3-sys = { version = "0.39", optional = true }
+libsqlite3-sys = { version = ">=0.17.2, <0.41.0", optional = true }
 
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
 sqlite-wasm-rs = { version = "0.5", default-features = false, optional = true }

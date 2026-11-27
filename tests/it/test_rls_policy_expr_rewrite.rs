@@ -3,9 +3,11 @@
 //! Covers function argument rewriting in WITH CHECK, non-session cast
 //! preservation, and quoted-table update trigger execution.
 
-use diesel::{Connection, RunQueryDsl, SqliteConnection};
+use diesel::{Connection, RunQueryDsl};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use sqlparser::ast::Statement;
+
+use crate::helpers::Replica;
 
 fn translate(sql: &str) -> Result<Vec<Statement>, Box<dyn std::error::Error>> {
     let options = crate::helpers::case_fold_functions::with_functions(Pg2SqliteOptions::default())
@@ -13,9 +15,11 @@ fn translate(sql: &str) -> Result<Vec<Statement>, Box<dyn std::error::Error>> {
     Ok(Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec())
 }
 
-fn apply_all(stmts: &[Statement]) -> Result<SqliteConnection, Box<dyn std::error::Error>> {
-    let mut conn = SqliteConnection::establish(":memory:")?;
-    crate::helpers::case_fold_functions::register(&mut conn);
+fn apply_all(stmts: &[Statement]) -> diesel::QueryResult<Replica> {
+    let mut conn = Replica::establish(":memory:").expect("open in-memory SQLite");
+    crate::helpers::case_fold_functions::register(
+        conn.registration().expect("registration").sqlite(),
+    );
     for stmt in stmts {
         diesel::sql_query(stmt.to_string()).execute(&mut conn)?;
     }

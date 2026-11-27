@@ -589,6 +589,14 @@ impl Registration<'_> {
         helper.register(self.connection).map_err(ExecutionError::Database)
     }
 
+    /// The inner connection, lent for registrations this surface has no
+    /// method for, such as the `register_impl` of a Diesel
+    /// `declare_sql_function`. Statements run through it bypass the managed
+    /// clocks, so the clock readers fail in them.
+    pub fn sqlite(&mut self) -> &mut SqliteConnection {
+        self.connection
+    }
+
     /// Sets the statements run before every commit that ends a transaction,
     /// including the release of an outermost savepoint, under the commit's
     /// statement instant. A failure among them rolls the transaction back

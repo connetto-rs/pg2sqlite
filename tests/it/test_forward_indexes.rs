@@ -77,7 +77,7 @@ fn index_on_a_secured_table_lands_on_its_backing_table() {
         CREATE INDEX notes_title ON notes (title);
     ";
     let options = Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit");
-    let mut connection = SqliteConnection::establish(":memory:").expect("in-memory SQLite");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("in-memory SQLite");
     for statement in helpers::translate_pg(sql, &options).expect("translate") {
         connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
     }
@@ -376,7 +376,7 @@ const KEYED_TABLE: &str = "CREATE TABLE t (id INT PRIMARY KEY, s TEXT, live INT 
 
 /// Inserts one row into `t` of the translated schema.
 fn insert_keyed(
-    connection: &mut diesel::SqliteConnection,
+    connection: &mut crate::helpers::Replica,
     id: i32,
     s: Option<&str>,
     live: i32,

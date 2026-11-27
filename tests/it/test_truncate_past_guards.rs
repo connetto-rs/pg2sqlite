@@ -5,12 +5,10 @@
 //! guards holding the acting role to those let the deletes through, and only
 //! while they run.
 
-use diesel::{
-    connection::SimpleConnection, prelude::*, sql_types::BigInt, sqlite::SqliteConnection,
-};
+use diesel::{connection::SimpleConnection, prelude::*, sql_types::BigInt};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, guard_refusal};
 
-use crate::helpers;
+use crate::{helpers, helpers::Replica};
 
 diesel::define_sql_function! {
     /// Whether a write is the server's delivery, true only while seeding.
@@ -43,7 +41,7 @@ fn translated(pg: &str, schema_pg: Option<&str>) -> Vec<String> {
     script.unwrap_or_else(|error| panic!("{error}\n{pg}")).into_vec()
 }
 
-fn apply(connection: &mut SqliteConnection, statements: &[String]) -> QueryResult<()> {
+fn apply(connection: &mut Replica, statements: &[String]) -> QueryResult<()> {
     for statement in statements {
         connection.batch_execute(statement)?;
     }
@@ -52,22 +50,30 @@ fn apply(connection: &mut SqliteConnection, statements: &[String]) -> QueryResul
 
 /// `schema_pg` applied to a fresh connection, then `delivered` as the
 /// server's delivery.
-fn replica(schema_pg: &str, delivered_rows: &str) -> SqliteConnection {
-    let mut connection = SqliteConnection::establish(":memory:").expect("open");
-    delivered_utils::register_nondeterministic_impl(&mut connection, || true).expect("register");
+fn replica(schema_pg: &str, delivered_rows: &str) -> Replica {
+    let mut connection = Replica::establish(":memory:").expect("open");
+    delivered_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        || true,
+    )
+    .expect("register");
     apply(&mut connection, &translated(schema_pg, None)).expect("the schema applies");
     connection.batch_execute(delivered_rows).expect("the delivery applies");
-    delivered_utils::register_nondeterministic_impl(&mut connection, || false).expect("register");
+    delivered_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        || false,
+    )
+    .expect("register");
     connection
 }
 
 /// The acting role's `pg`, translated against `schema_pg`, run on
 /// `connection`.
-fn run(connection: &mut SqliteConnection, schema_pg: &str, pg: &str) -> QueryResult<()> {
+fn run(connection: &mut Replica, schema_pg: &str, pg: &str) -> QueryResult<()> {
     apply(connection, &translated(pg, Some(schema_pg)))
 }
 
-fn count(connection: &mut SqliteConnection, table: &str) -> i64 {
+fn count(connection: &mut Replica, table: &str) -> i64 {
     diesel::sql_query(format!("SELECT count(*) AS count FROM {table}"))
         .get_result::<Count>(connection)
         .expect("count")

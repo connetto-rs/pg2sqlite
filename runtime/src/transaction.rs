@@ -94,10 +94,7 @@ impl TransactionState {
 
     /// Opens one more Diesel level without a source name, as Diesel's own
     /// nested transactions do.
-    pub(crate) fn nest(
-        &mut self,
-        connection: &mut SqliteConnection,
-    ) -> Result<(), TransactionError> {
+    pub(crate) fn nest(connection: &mut SqliteConnection) -> Result<(), TransactionError> {
         AnsiTransactionManager::begin_transaction(connection)?;
         Ok(())
     }

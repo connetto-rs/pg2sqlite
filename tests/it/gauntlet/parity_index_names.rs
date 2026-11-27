@@ -1,6 +1,6 @@
 //! Parity for the names PostgreSQL gives an index written without one.
 
-use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{pg::PgConnection, prelude::*};
 use helpers::establish_connection;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
@@ -87,7 +87,7 @@ fn postgres_names(connection: &mut PgConnection) -> Vec<String> {
 
 /// The replica's index names, leaving out the companion PostgreSQL has no
 /// counterpart for.
-fn sqlite_names(connection: &mut SqliteConnection) -> Vec<String> {
+fn sqlite_names(connection: &mut crate::helpers::Replica) -> Vec<String> {
     use catalogue::sqlite_master;
     sqlite_master::table
         .filter(sqlite_master::kind.eq("index"))
@@ -104,7 +104,7 @@ fn options() -> Pg2SqliteOptions {
         .with_rls_audit_table_name("rls_audit")
 }
 
-fn has_companion(connection: &mut SqliteConnection) -> bool {
+fn has_companion(connection: &mut crate::helpers::Replica) -> bool {
     use catalogue::sqlite_master;
     diesel::select(diesel::dsl::exists(
         sqlite_master::table.filter(sqlite_master::name.eq(COMPANION)),

@@ -58,7 +58,7 @@ use schema::{items, ledger, notes, pay_rls};
 /// `diesel::sql_query` because the emitted form includes `STRICT` tables,
 /// `CHECK` constraints, and `CREATE TRIGGER` bodies that Diesel's typed DSL
 /// cannot express.
-fn setup_for_dml(pg: &str, opts: &Pg2SqliteOptions) -> (SqliteConnection, String) {
+fn setup_for_dml(pg: &str, opts: &Pg2SqliteOptions) -> (crate::helpers::Replica, String) {
     let mut stmts = Pg2Sqlite::default()
         .sql(pg)
         .expect("parse")

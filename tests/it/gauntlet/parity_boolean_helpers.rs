@@ -12,7 +12,7 @@
 
 use core::str::FromStr;
 
-use diesel::{data_types::PgTimestamp, pg::PgConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{data_types::PgTimestamp, pg::PgConnection, prelude::*};
 use pg2sqlite::prelude::{ArrayRepresentation, Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation};
 use rosetta_uuid::Uuid;
 
@@ -285,14 +285,14 @@ fn postgres(policy: &str) -> PgConnection {
     connection
 }
 
-fn sqlite(policy: &str) -> SqliteConnection {
+fn sqlite(policy: &str) -> crate::helpers::Replica {
     let translated = Pg2Sqlite::default()
         .sql(&format!("{OWNER}{SCHEMA}{policy}"))
         .expect("parse")
         .translate(&options())
         .unwrap_or_else(|error| panic!("pg2sqlite refused {policy}: {error}"));
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-    translated.register_functions(&mut connection).expect("register helper functions");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
+    translated.register_managed(&mut connection).expect("register helper functions");
     let translated = translated.into_vec();
     apply_with_seed(&mut connection, &translated, |connection| {
         seed!(

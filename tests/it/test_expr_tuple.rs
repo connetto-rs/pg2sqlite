@@ -55,7 +55,7 @@ fn test_tuple_equality_translation() {
         "Should contain tuple (x, y), got: {select_stmt}"
     );
 
-    helpers::apply_rusqlite_statements(&translated);
+    helpers::apply_statements(&translated);
 }
 
 #[test]
@@ -104,7 +104,7 @@ fn test_tuple_in_list_translation() {
 
     assert!(select_stmt.contains("IN"), "Should contain IN clause, got: {select_stmt}");
 
-    helpers::apply_rusqlite_statements(&translated);
+    helpers::apply_statements(&translated);
 }
 
 #[test]

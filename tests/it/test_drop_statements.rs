@@ -1,7 +1,7 @@
 //! Tests for DROP statement translations (DROP TABLE, DROP VIEW, DROP INDEX,
 //! DROP TRIGGER).
 
-use diesel::{Connection, RunQueryDsl, SqliteConnection, prelude::*};
+use diesel::{Connection, RunQueryDsl, prelude::*};
 use helpers::Count;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, Translator};
 
@@ -111,7 +111,7 @@ fn translate_statement(
 }
 
 /// Helper to check if a table exists in SQLite.
-fn table_exists(conn: &mut SqliteConnection, table_name: &str) -> bool {
+fn table_exists(conn: &mut crate::helpers::Replica, table_name: &str) -> bool {
     let result: Result<Count, _> = diesel::sql_query(format!(
         "SELECT COUNT(*) as count FROM sqlite_master WHERE type='table' AND name='{table_name}'"
     ))
@@ -121,7 +121,7 @@ fn table_exists(conn: &mut SqliteConnection, table_name: &str) -> bool {
 }
 
 /// Helper to check if a view exists in SQLite.
-fn view_exists(conn: &mut SqliteConnection, view_name: &str) -> bool {
+fn view_exists(conn: &mut crate::helpers::Replica, view_name: &str) -> bool {
     let result: Result<Count, _> = diesel::sql_query(format!(
         "SELECT COUNT(*) as count FROM sqlite_master WHERE type='view' AND name='{view_name}'"
     ))
@@ -131,7 +131,7 @@ fn view_exists(conn: &mut SqliteConnection, view_name: &str) -> bool {
 }
 
 /// Helper to check if an index exists in SQLite.
-fn index_exists(conn: &mut SqliteConnection, index_name: &str) -> bool {
+fn index_exists(conn: &mut crate::helpers::Replica, index_name: &str) -> bool {
     let result: Result<Count, _> = diesel::sql_query(format!(
         "SELECT COUNT(*) as count FROM sqlite_master WHERE type='index' AND name='{index_name}'"
     ))
@@ -141,7 +141,7 @@ fn index_exists(conn: &mut SqliteConnection, index_name: &str) -> bool {
 }
 
 /// Helper to check if a trigger exists in SQLite.
-fn trigger_exists(conn: &mut SqliteConnection, trigger_name: &str) -> bool {
+fn trigger_exists(conn: &mut crate::helpers::Replica, trigger_name: &str) -> bool {
     let result: Result<Count, _> = diesel::sql_query(format!(
         "SELECT COUNT(*) as count FROM sqlite_master WHERE type='trigger' AND name='{trigger_name}'"
     ))
@@ -158,10 +158,14 @@ fn test_drop_table_translation() -> Result<(), Box<dyn std::error::Error>> {
     let drop_str = translated[0].to_string();
     assert!(drop_str.contains("DROP TABLE"), "Should contain DROP TABLE: {drop_str}");
     assert!(drop_str.contains("users"), "Should contain table name: {drop_str}");
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    conn.execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY);").unwrap();
+    let mut conn = <crate::helpers::Replica as diesel::Connection>::establish(":memory:").unwrap();
+    diesel::connection::SimpleConnection::batch_execute(
+        &mut conn,
+        "CREATE TABLE users (id INTEGER PRIMARY KEY);",
+    )
+    .unwrap();
     for stmt in &translated {
-        conn.execute_batch(&format!("{stmt};"))
+        diesel::connection::SimpleConnection::batch_execute(&mut conn, &format!("{stmt};"))
             .unwrap_or_else(|e| panic!("emitted SQL failed: {e}\n{stmt}"));
     }
     Ok(())
@@ -174,9 +178,9 @@ fn test_drop_table_if_exists_translation() -> Result<(), Box<dyn std::error::Err
     assert_eq!(translated.len(), 1);
     let drop_str = translated[0].to_string();
     assert!(drop_str.contains("IF EXISTS"), "Should contain IF EXISTS: {drop_str}");
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = <crate::helpers::Replica as diesel::Connection>::establish(":memory:").unwrap();
     for stmt in &translated {
-        conn.execute_batch(&format!("{stmt};"))
+        diesel::connection::SimpleConnection::batch_execute(&mut conn, &format!("{stmt};"))
             .unwrap_or_else(|e| panic!("emitted SQL failed: {e}\n{stmt}"));
     }
     Ok(())
@@ -185,7 +189,7 @@ fn test_drop_table_if_exists_translation() -> Result<(), Box<dyn std::error::Err
 #[test]
 fn test_drop_table_if_exists_nonexistent() -> Result<(), Box<dyn std::error::Error>> {
     // Create a minimal setup, then execute DROP TABLE IF EXISTS
-    let mut connection = SqliteConnection::establish(":memory:").expect("Failed to connect");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("Failed to connect");
 
     // Create a table first using DDL (table creation is DDL, not DML)
     diesel::sql_query("CREATE TABLE other_table (id INTEGER PRIMARY KEY)")
@@ -210,10 +214,14 @@ fn test_drop_table_cascade_stripped() -> Result<(), Box<dyn std::error::Error>> 
     assert_eq!(translated.len(), 1);
     let drop_str = translated[0].to_string();
     assert!(!drop_str.contains("CASCADE"), "CASCADE should be stripped: {drop_str}");
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    conn.execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY);").unwrap();
+    let mut conn = <crate::helpers::Replica as diesel::Connection>::establish(":memory:").unwrap();
+    diesel::connection::SimpleConnection::batch_execute(
+        &mut conn,
+        "CREATE TABLE users (id INTEGER PRIMARY KEY);",
+    )
+    .unwrap();
     for stmt in &translated {
-        conn.execute_batch(&format!("{stmt};"))
+        diesel::connection::SimpleConnection::batch_execute(&mut conn, &format!("{stmt};"))
             .unwrap_or_else(|e| panic!("emitted SQL failed: {e}\n{stmt}"));
     }
     Ok(())
@@ -226,10 +234,14 @@ fn test_drop_table_restrict_stripped() -> Result<(), Box<dyn std::error::Error>>
     assert_eq!(translated.len(), 1);
     let drop_str = translated[0].to_string();
     assert!(!drop_str.contains("RESTRICT"), "RESTRICT should be stripped: {drop_str}");
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    conn.execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY);").unwrap();
+    let mut conn = <crate::helpers::Replica as diesel::Connection>::establish(":memory:").unwrap();
+    diesel::connection::SimpleConnection::batch_execute(
+        &mut conn,
+        "CREATE TABLE users (id INTEGER PRIMARY KEY);",
+    )
+    .unwrap();
     for stmt in &translated {
-        conn.execute_batch(&format!("{stmt};"))
+        diesel::connection::SimpleConnection::batch_execute(&mut conn, &format!("{stmt};"))
             .unwrap_or_else(|e| panic!("emitted SQL failed: {e}\n{stmt}"));
     }
     Ok(())
@@ -237,7 +249,7 @@ fn test_drop_table_restrict_stripped() -> Result<(), Box<dyn std::error::Error>>
 
 #[test]
 fn test_drop_table_execution() -> Result<(), Box<dyn std::error::Error>> {
-    let mut connection = SqliteConnection::establish(":memory:").expect("Failed to connect");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("Failed to connect");
 
     // Create table directly in SQLite using DDL (table creation is DDL, not
     // DML)
@@ -339,11 +351,19 @@ fn test_drop_index_translation() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(translated.len(), 1);
     let drop_str = translated[0].to_string();
     assert!(drop_str.contains("DROP INDEX"), "Should contain DROP INDEX: {drop_str}");
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);").unwrap();
-    conn.execute_batch("CREATE INDEX idx_name ON t (name);").unwrap();
+    let mut conn = <crate::helpers::Replica as diesel::Connection>::establish(":memory:").unwrap();
+    diesel::connection::SimpleConnection::batch_execute(
+        &mut conn,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);",
+    )
+    .unwrap();
+    diesel::connection::SimpleConnection::batch_execute(
+        &mut conn,
+        "CREATE INDEX idx_name ON t (name);",
+    )
+    .unwrap();
     for stmt in &translated {
-        conn.execute_batch(&format!("{stmt};"))
+        diesel::connection::SimpleConnection::batch_execute(&mut conn, &format!("{stmt};"))
             .unwrap_or_else(|e| panic!("emitted SQL failed: {e}\n{stmt}"));
     }
     Ok(())
@@ -383,9 +403,9 @@ fn test_drop_trigger_translation() -> Result<(), Box<dyn std::error::Error>> {
 
     // SQLite DROP TRIGGER syntax doesn't include ON table_name
     assert!(!drop_str.contains(" ON "), "ON table_name should be stripped for SQLite: {drop_str}");
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = <crate::helpers::Replica as diesel::Connection>::establish(":memory:").unwrap();
     for stmt in &translated {
-        conn.execute_batch(&format!("{stmt};"))
+        diesel::connection::SimpleConnection::batch_execute(&mut conn, &format!("{stmt};"))
             .unwrap_or_else(|e| panic!("emitted SQL failed: {e}\n{stmt}"));
     }
     Ok(())
@@ -402,9 +422,9 @@ fn test_drop_trigger_if_exists() -> Result<(), Box<dyn std::error::Error>> {
     assert!(drop_str.contains("IF EXISTS"), "IF EXISTS should be preserved: {drop_str}");
     // Should not contain ON table_name
     assert!(!drop_str.contains(" ON "), "ON table should be stripped: {drop_str}");
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = <crate::helpers::Replica as diesel::Connection>::establish(":memory:").unwrap();
     for stmt in &translated {
-        conn.execute_batch(&format!("{stmt};"))
+        diesel::connection::SimpleConnection::batch_execute(&mut conn, &format!("{stmt};"))
             .unwrap_or_else(|e| panic!("emitted SQL failed: {e}\n{stmt}"));
     }
     Ok(())
@@ -419,12 +439,19 @@ fn test_drop_trigger_cascade_stripped() -> Result<(), Box<dyn std::error::Error>
 
     assert!(!drop_str.contains("CASCADE"), "CASCADE should be stripped: {drop_str}");
     assert!(!drop_str.contains(" ON "), "ON table should be stripped: {drop_str}");
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    conn.execute_batch("CREATE TABLE my_table (id INTEGER PRIMARY KEY);").unwrap();
-    conn.execute_batch("CREATE TRIGGER my_trigger AFTER INSERT ON my_table BEGIN SELECT 1; END;")
-        .unwrap();
+    let mut conn = <crate::helpers::Replica as diesel::Connection>::establish(":memory:").unwrap();
+    diesel::connection::SimpleConnection::batch_execute(
+        &mut conn,
+        "CREATE TABLE my_table (id INTEGER PRIMARY KEY);",
+    )
+    .unwrap();
+    diesel::connection::SimpleConnection::batch_execute(
+        &mut conn,
+        "CREATE TRIGGER my_trigger AFTER INSERT ON my_table BEGIN SELECT 1; END;",
+    )
+    .unwrap();
     for stmt in &translated {
-        conn.execute_batch(&format!("{stmt};"))
+        diesel::connection::SimpleConnection::batch_execute(&mut conn, &format!("{stmt};"))
             .unwrap_or_else(|e| panic!("emitted SQL failed: {e}\n{stmt}"));
     }
     Ok(())
@@ -432,7 +459,7 @@ fn test_drop_trigger_cascade_stripped() -> Result<(), Box<dyn std::error::Error>
 
 #[test]
 fn test_drop_trigger_execution() -> Result<(), Box<dyn std::error::Error>> {
-    let mut connection = SqliteConnection::establish(":memory:").expect("Failed to connect");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("Failed to connect");
 
     // Create tables directly in SQLite using DDL (table creation is DDL, not
     // DML)

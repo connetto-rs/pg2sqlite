@@ -1,7 +1,7 @@
 //! Tests for forward query translation covering join types and other query
 //! paths in `src/impls/translator_impls/query.rs`.
 
-use diesel::{RunQueryDsl, SqliteConnection, prelude::*};
+use diesel::{RunQueryDsl, prelude::*};
 use helpers::translate_statements;
 use pg2sqlite::{
     errors::{Error, RefusalCategory, TranslationDirection},
@@ -12,7 +12,10 @@ use sql_traits::structs::ParserDB;
 use sqlparser::ast::{Expr, Ident, OrderByExpr, OrderByOptions, Value, ValueWithSpan, WithFill};
 use translate_helpers::translate_default as translate;
 
-use crate::{helpers, helpers::translate as translate_helpers};
+use crate::{
+    helpers,
+    helpers::{Replica, translate as translate_helpers},
+};
 
 const SCHEMA: &str = "
     CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT);
@@ -574,7 +577,7 @@ fn test_wildcard_semantic() -> Result<(), Box<dyn std::error::Error>> {
 
 fn exec_translated(pg_sql: &str) {
     use diesel::connection::SimpleConnection;
-    let mut conn = SqliteConnection::establish(":memory:").unwrap();
+    let mut conn = Replica::establish(":memory:").unwrap();
     let stmts = Pg2Sqlite::default()
         .sql(pg_sql)
         .unwrap()

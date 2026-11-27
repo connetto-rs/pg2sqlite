@@ -106,10 +106,10 @@ fn translated_value(sql: &str) -> String {
         .expect("translation")
         .into_vec();
     let probe = statements.last().expect("a select").clone();
-    let connection = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
-    connection
-        .query_row(&probe, [], |row| row.get::<_, String>(0))
-        .unwrap_or_else(|error| panic!("probe failed: {error}\n{probe}"))
+    match crate::helpers::evaluate_probe(&probe) {
+        crate::helpers::SqliteAnyValue::Text(value) => value,
+        value => panic!("expected text, got {value:?}"),
+    }
 }
 
 /// Two intervals added answer PostgreSQL's literal: the fields summed and

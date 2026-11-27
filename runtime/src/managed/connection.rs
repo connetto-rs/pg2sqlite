@@ -22,6 +22,7 @@ use super::{
 use crate::{
     clock::UtcProvider,
     group::{BeginMode, TransactionControl},
+    transaction::TransactionState,
 };
 
 impl From<ExecutionError> for DatabaseError {
@@ -195,7 +196,7 @@ impl<Provider: UtcProvider + Default + Send + 'static>
         if depth(connection)? == 0 {
             Ok(connection.begin(BeginMode::Deferred)?)
         } else {
-            Ok(connection.transition(|transaction, sqlite| transaction.nest(sqlite))?)
+            Ok(connection.transition(|_, sqlite| TransactionState::nest(sqlite))?)
         }
     }
 

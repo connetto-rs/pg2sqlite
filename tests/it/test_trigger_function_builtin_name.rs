@@ -40,15 +40,10 @@ fn audited_after_split(first: &str, second: &str) -> Vec<String> {
         .expect("parse")
         .translate_to_sql_with_schema(&schema, &options)
         .expect("second");
-    let mut connection = applied_script(&first_script, None);
+    let mut connection = applied_script(&first_script);
     second_script
-        .register_functions(&mut connection)
+        .initialize_managed(&mut connection, pg2sqlite::script::FreshFiles::Both)
         .unwrap_or_else(|error| panic!("SQLite must register the helper functions: {error}"));
-    for statement in second_script.iter() {
-        diesel::sql_query(statement)
-            .execute(&mut connection)
-            .unwrap_or_else(|error| panic!("{error}\n{statement}"));
-    }
     diesel::sql_query("SELECT n FROM audit")
         .load::<Audit>(&mut connection)
         .expect("audit reads")

@@ -242,7 +242,7 @@ const CHECKED: &str = "WITH (check_option = cascaded)";
 const MOVES: &str = "GRANT SELECT, UPDATE (parent_id) ON resource_moves TO app;";
 
 /// The replica `app` writes, holding `(1, 1, false)` and `(2, 0, false)`.
-fn replica(view_options: &str, grants: &str) -> SqliteConnection {
+fn replica(view_options: &str, grants: &str) -> crate::helpers::Replica {
     let options = Pg2SqliteOptions::default()
         .with_rls_audit_table_name("rls_audit")
         .with_rls_exemption_function("server_delivery")
@@ -250,8 +250,11 @@ fn replica(view_options: &str, grants: &str) -> SqliteConnection {
         .with_acting_role("app");
     let mut connection = helpers::apply_with_options(&script(view_options, grants), &options)
         .expect("the script applies");
-    server_delivery_utils::register_nondeterministic_impl(&mut connection, || true)
-        .expect("exempt the delivery");
+    server_delivery_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        || true,
+    )
+    .expect("exempt the delivery");
     diesel::insert_into(resources_rls::table)
         .values(&[
             (resources_rls::id.eq(1), resources_rls::parent_id.eq(Some(1))),
@@ -259,18 +262,21 @@ fn replica(view_options: &str, grants: &str) -> SqliteConnection {
         ])
         .execute(&mut connection)
         .expect("seed the storage");
-    server_delivery_utils::register_nondeterministic_impl(&mut connection, || false)
-        .expect("end the exemption");
+    server_delivery_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        || false,
+    )
+    .expect("end the exemption");
     connection
 }
 
-fn move_to(connection: &mut SqliteConnection, id: i32, parent: i32) -> QueryResult<usize> {
+fn move_to(connection: &mut crate::helpers::Replica, id: i32, parent: i32) -> QueryResult<usize> {
     diesel::update(resource_moves::table.filter(resource_moves::id.eq(id)))
         .set(resource_moves::parent_id.eq(parent))
         .execute(connection)
 }
 
-fn parent(connection: &mut SqliteConnection, id: i32) -> Option<i32> {
+fn parent(connection: &mut crate::helpers::Replica, id: i32) -> Option<i32> {
     resources_rls::table
         .filter(resources_rls::id.eq(id))
         .select(resources_rls::parent_id)
@@ -427,20 +433,26 @@ fn acting() -> Pg2SqliteOptions {
 fn delivered(
     script: &str,
     options: &Pg2SqliteOptions,
-    seed: impl FnOnce(&mut SqliteConnection),
-) -> SqliteConnection {
+    seed: impl FnOnce(&mut crate::helpers::Replica),
+) -> crate::helpers::Replica {
     let mut connection = helpers::apply_with_options(script, options).expect("the script applies");
-    server_delivery_utils::register_nondeterministic_impl(&mut connection, || true)
-        .expect("exempt the delivery");
+    server_delivery_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        || true,
+    )
+    .expect("exempt the delivery");
     seed(&mut connection);
-    server_delivery_utils::register_nondeterministic_impl(&mut connection, || false)
-        .expect("end the exemption");
+    server_delivery_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        || false,
+    )
+    .expect("end the exemption");
     connection
 }
 
 /// `items` holding `(1, 1)` and `(2, 0)`, which `app` reads, owned by the
 /// schema, with `views` and their grants after it.
-fn items_replica(views: &str, options: &Pg2SqliteOptions) -> SqliteConnection {
+fn items_replica(views: &str, options: &Pg2SqliteOptions) -> crate::helpers::Replica {
     delivered(
         &format!(
             "CREATE ROLE app;
@@ -463,7 +475,10 @@ fn items_replica(views: &str, options: &Pg2SqliteOptions) -> SqliteConnection {
     )
 }
 
-fn item(connection: &mut SqliteConnection, id: i32) -> Option<(Option<i32>, Option<String>)> {
+fn item(
+    connection: &mut crate::helpers::Replica,
+    id: i32,
+) -> Option<(Option<i32>, Option<String>)> {
     items::table
         .filter(items::id.eq(id))
         .select((items::parent_id, items::note))
@@ -723,7 +738,7 @@ fn an_instead_of_trigger_takes_inserts_into_a_view_computing_every_column() {
 }
 
 /// `counters` holding `(1, 1)`, with `views` over it owned by `mover`.
-fn counters_replica(views: &str) -> SqliteConnection {
+fn counters_replica(views: &str) -> crate::helpers::Replica {
     delivered(
         &format!(
             "CREATE ROLE app;

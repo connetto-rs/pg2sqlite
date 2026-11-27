@@ -8,8 +8,8 @@
 //! 5. plpgsql derived-subquery (Derived table factor) translation
 //! 6. plpgsql GROUP BY expression inside trigger body
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use rusqlite::Connection;
 use translate_helpers::{
     translate_default as translate_all, translate_default_first_query as translate_ok,
 };
@@ -278,7 +278,7 @@ FOR EACH ROW EXECUTE FUNCTION fn_group_by();
 }
 
 fn exec_translated(pg_sql: &str) {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     let stmts = Pg2Sqlite::default()
         .sql(pg_sql)
         .unwrap()
@@ -286,7 +286,7 @@ fn exec_translated(pg_sql: &str) {
         .unwrap()
         .into_vec();
     for s in &stmts {
-        conn.execute_batch(&format!("{s};"))
+        conn.batch_execute(&format!("{s};"))
             .unwrap_or_else(|e| panic!("SQLite rejected: {s}\n{e}"));
     }
 }

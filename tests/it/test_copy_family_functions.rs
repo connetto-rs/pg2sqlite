@@ -4,8 +4,10 @@
 //! than PostgreSQL evaluates it, and the copies would answer from draws
 //! PostgreSQL never made.
 
-use diesel::{RunQueryDsl, SqliteConnection, prelude::*};
+use diesel::{RunQueryDsl, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+
+use crate::helpers::Replica;
 
 fn translate_err(pg: &str, options: &Pg2SqliteOptions) -> String {
     Pg2Sqlite::default()
@@ -46,7 +48,7 @@ struct TextResult {
 /// The statement is the translator's own output, so `diesel::sql_query` is the
 /// correct form: the typed DSL cannot express a dynamically generated string.
 fn exec_scalar(sql: &str) -> String {
-    let mut conn = SqliteConnection::establish(":memory:").expect("in-memory SQLite");
+    let mut conn = Replica::establish(":memory:").expect("in-memory SQLite");
     diesel::sql_query(sql)
         .load::<TextResult>(&mut conn)
         .unwrap_or_else(|e| panic!("query failed: {e}\n{sql}"))

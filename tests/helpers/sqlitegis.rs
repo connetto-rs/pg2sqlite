@@ -1,11 +1,13 @@
 //! Test harness that registers SQLiteGIS spatial functions onto every
-//! `SqliteConnection::establish()` via SQLite's `sqlite3_auto_extension`.
+//! connection the process opens via SQLite's `sqlite3_auto_extension`.
 //!
 //! Only compiled when the `sqlitegis` cargo feature is enabled.
 
 use std::sync::Once;
 
-use diesel::{Connection, sqlite::SqliteConnection};
+use diesel::Connection;
+
+use super::Replica;
 
 static INIT: Once = Once::new();
 
@@ -22,16 +24,16 @@ unsafe extern "C" fn sqlitegis_init(
     unsafe { sqlitegis::sqlite::register_functions(db) }
 }
 
-/// Returns a fresh in-memory `SqliteConnection` with SQLiteGIS's spatial
+/// Returns a fresh in-memory managed replica with SQLiteGIS's spatial
 /// functions registered. Safe to call from any test; the auto-extension
 /// registration runs once per process.
 #[must_use]
-pub fn sqlitegis_connection() -> SqliteConnection {
+pub fn sqlitegis_connection() -> Replica {
     INIT.call_once(|| {
         // SAFETY: `sqlite3_auto_extension` stores the function pointer in a
         // global table. Single-threaded init is enforced by `Once`.
         let rc = unsafe { libsqlite3_sys::sqlite3_auto_extension(Some(sqlitegis_init)) };
         assert_eq!(rc, 0, "sqlite3_auto_extension failed with rc={rc}");
     });
-    SqliteConnection::establish(":memory:").expect("open :memory: SQLite")
+    Replica::establish(":memory:").expect("open :memory: SQLite")
 }

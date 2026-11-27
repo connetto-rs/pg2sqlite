@@ -19,7 +19,7 @@ fn replica(
     body: &str,
     helpers: &str,
     maintenance: bool,
-) -> (SqliteConnection, Arc<AtomicI64>, String) {
+) -> (crate::helpers::Replica, Arc<AtomicI64>, String) {
     let timing = if maintenance { "BEFORE" } else { "AFTER" };
     let source = format!(
         "CREATE TABLE inputs (id INTEGER PRIMARY KEY, first_value TEXT, second_value TEXT); CREATE TABLE observed (id INTEGER PRIMARY KEY, first_value TEXT, second_value TEXT); CREATE TABLE source_rows (id INTEGER PRIMARY KEY); {helpers} CREATE FUNCTION run_body() RETURNS trigger LANGUAGE plpgsql AS $$ {declarations} BEGIN {body} RETURN NEW; END $$; CREATE TRIGGER run_body {timing} INSERT ON inputs FOR EACH ROW EXECUTE FUNCTION run_body();"
@@ -37,13 +37,14 @@ fn replica(
     };
     let translated = Pg2Sqlite::default().sql(&source).unwrap().translate_to_sql(&options).unwrap();
     let emitted = translated.iter().map(ToString::to_string).collect::<Vec<_>>().join(";\n");
-    let mut connection = SqliteConnection::establish(":memory:").unwrap();
-    translated.register_functions(&mut connection).unwrap();
+    let mut connection = crate::helpers::Replica::establish(":memory:").unwrap();
+    translated.register_managed(&mut connection).unwrap();
     let calls = Arc::new(AtomicI64::new(0));
     let counter = Arc::clone(&calls);
-    counted_utils::register_nondeterministic_impl(&mut connection, move || {
-        counter.fetch_add(1, Ordering::Relaxed) + 1
-    })
+    counted_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        move || counter.fetch_add(1, Ordering::Relaxed) + 1,
+    )
     .unwrap();
     connection.batch_execute(&emitted).unwrap();
     connection.batch_execute("INSERT INTO source_rows VALUES (10), (20)").unwrap();

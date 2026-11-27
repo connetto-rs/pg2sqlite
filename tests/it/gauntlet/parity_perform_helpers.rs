@@ -4,9 +4,7 @@
 //! Each scenario runs the same writes on both engines and compares whether
 //! each write is accepted and what the tables hold after.
 
-use diesel::{
-    pg::PgConnection, prelude::*, result::Error as DieselError, sqlite::SqliteConnection,
-};
+use diesel::{pg::PgConnection, prelude::*, result::Error as DieselError};
 use pg2sqlite::prelude::{
     Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, SqlState, UuidRepresentation,
     postgres_error,
@@ -189,7 +187,7 @@ macro_rules! last_admin_runner {
 }
 
 last_admin_runner!(LastAdminPostgres, PgConnection);
-last_admin_runner!(LastAdminSqlite, SqliteConnection);
+last_admin_runner!(LastAdminSqlite, crate::helpers::Replica);
 
 fn translated(source: &str, options: &Pg2SqliteOptions) -> pg2sqlite::script::Script<String> {
     Pg2Sqlite::default()
@@ -198,13 +196,11 @@ fn translated(source: &str, options: &Pg2SqliteOptions) -> pg2sqlite::script::Sc
         .unwrap_or_else(|error| panic!("the schema should translate: {error}"))
 }
 
-fn replica(statements: &pg2sqlite::script::Script<String>) -> SqliteConnection {
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-    statements.register_functions(&mut connection).expect("register helper functions");
-    for statement in statements.iter() {
-        diesel::connection::SimpleConnection::batch_execute(&mut connection, statement)
-            .unwrap_or_else(|error| panic!("{error}\n{statement}"));
-    }
+fn replica(statements: &pg2sqlite::script::Script<String>) -> crate::helpers::Replica {
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
+    statements
+        .initialize_managed(&mut connection, pg2sqlite::script::FreshFiles::Both)
+        .expect("initialize replica");
     connection
 }
 
@@ -309,7 +305,7 @@ macro_rules! parents_runner {
 }
 
 parents_runner!(ParentsPostgres, PgConnection);
-parents_runner!(ParentsSqlite, SqliteConnection);
+parents_runner!(ParentsSqlite, crate::helpers::Replica);
 
 /// The helper compares the `UUID` its caller passes as the same uuid, so a
 /// parent with a child publishes and one without is refused, and the refusal
@@ -535,18 +531,21 @@ fn postgres_clubs() -> PgConnection {
     connection
 }
 
-fn sqlite_clubs() -> SqliteConnection {
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-    perform_app_user_utils::register_nondeterministic_impl(&mut connection, || Some("nina"))
+fn sqlite_clubs() -> crate::helpers::Replica {
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
+    {
+        let mut registration = connection.registration().expect("registration");
+        perform_app_user_utils::register_nondeterministic_impl(registration.sqlite(), || {
+            Some("nina")
+        })
         .expect("register the signed-in user");
-    perform_write_exempt_utils::register_nondeterministic_impl(&mut connection, || true)
-        .expect("exempt the seed");
-    let script = translated(&[UTC_REQUEST_ROLE, OWNER, CLUBS].concat(), &club_options());
-    script.register_functions(&mut connection).expect("register helper functions");
-    for statement in script.iter() {
-        diesel::connection::SimpleConnection::batch_execute(&mut connection, statement)
-            .unwrap_or_else(|error| panic!("{error}\n{statement}"));
+        perform_write_exempt_utils::register_nondeterministic_impl(registration.sqlite(), || true)
+            .expect("exempt the seed");
     }
+    let script = translated(&[UTC_REQUEST_ROLE, OWNER, CLUBS].concat(), &club_options());
+    script
+        .initialize_managed(&mut connection, pg2sqlite::script::FreshFiles::Both)
+        .expect("initialize replica");
     for (id, created_by, founded) in SEEDED_CLUBS {
         diesel::insert_into(schema::clubs_rls::table)
             .values((
@@ -557,8 +556,11 @@ fn sqlite_clubs() -> SqliteConnection {
             .execute(&mut connection)
             .expect("seed a club");
     }
-    perform_write_exempt_utils::register_nondeterministic_impl(&mut connection, || false)
-        .expect("end the exemption");
+    perform_write_exempt_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        || false,
+    )
+    .expect("end the exemption");
     connection
 }
 
@@ -585,7 +587,7 @@ fn postgres_log(connection: &mut PgConnection) -> Vec<(String, String)> {
     club_log.select((club, member)).order(club).load(connection).expect("read the log")
 }
 
-fn sqlite_log(connection: &mut SqliteConnection) -> Vec<(String, String)> {
+fn sqlite_log(connection: &mut crate::helpers::Replica) -> Vec<(String, String)> {
     use schema::club_log_rls::dsl::*;
     club_log_rls.select((club, member)).order(club).load(connection).expect("read the log")
 }

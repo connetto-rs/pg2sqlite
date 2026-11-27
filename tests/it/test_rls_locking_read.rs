@@ -66,7 +66,7 @@ fn replica(
     schema: &str,
     statement: &str,
     options: &Pg2SqliteOptions,
-) -> (SqliteConnection, String) {
+) -> (crate::helpers::Replica, String) {
     let mut emitted = Pg2Sqlite::default()
         .sql(&format!("{schema}{statement}"))
         .expect("parse")

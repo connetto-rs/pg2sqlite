@@ -70,7 +70,7 @@ fn plpgsql_substitute_variable_in_extract() {
         "gen_random_uuid should be translated in trigger with EXTRACT: {sql}"
     );
     let stmts = translate_statements(pg, &options).unwrap();
-    let mut conn = diesel::SqliteConnection::establish(":memory:").expect("connect");
+    let mut conn = helpers::Replica::establish(":memory:").expect("connect");
     for s in &stmts {
         diesel::sql_query(s.to_string())
             .execute(&mut conn)
@@ -100,7 +100,7 @@ fn plpgsql_substitute_variable_in_trim() {
         "gen_random_uuid should be translated in trigger with TRIM: {sql}"
     );
     let stmts = translate_statements(pg, &options).unwrap();
-    let mut conn = diesel::SqliteConnection::establish(":memory:").expect("connect");
+    let mut conn = helpers::Replica::establish(":memory:").expect("connect");
     for s in &stmts {
         diesel::sql_query(s.to_string())
             .execute(&mut conn)
@@ -130,7 +130,7 @@ fn plpgsql_substitute_variable_in_substring() {
         "gen_random_uuid should be translated in trigger with SUBSTRING: {sql}"
     );
     let stmts = translate_statements(pg, &options).unwrap();
-    let mut conn = diesel::SqliteConnection::establish(":memory:").expect("connect");
+    let mut conn = helpers::Replica::establish(":memory:").expect("connect");
     for s in &stmts {
         diesel::sql_query(s.to_string())
             .execute(&mut conn)

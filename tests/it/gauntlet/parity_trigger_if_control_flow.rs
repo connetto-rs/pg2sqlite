@@ -4,7 +4,7 @@
 //! Each fixture fires its triggers with the same writes on both engines and
 //! compares what they left in `items` and `log`.
 
-use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{pg::PgConnection, prelude::*};
 use helpers::establish_connection;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use postgres_harness::Outcome;
@@ -329,7 +329,7 @@ macro_rules! runner {
 }
 
 runner!(PgRunner, PgConnection);
-runner!(SqliteRunner, SqliteConnection);
+runner!(SqliteRunner, crate::helpers::Replica);
 
 /// Runs `steps` against `triggers` on both engines, comparing every step.
 fn assert_engines_agree(triggers: &str, steps: &[Step]) {

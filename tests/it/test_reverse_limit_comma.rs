@@ -61,7 +61,7 @@ fn a_round_trip_preserves_both_numbers() {
     let back = fwd_stmts.join("\n");
     assert!(back.contains("LIMIT 10"), "{back}");
     assert!(back.contains("OFFSET 5"), "{back}");
-    let mut conn = diesel::SqliteConnection::establish(":memory:").expect("in-memory connection");
+    let mut conn = crate::helpers::Replica::establish(":memory:").expect("in-memory connection");
     for s in &fwd_stmts {
         diesel::sql_query(s.as_str())
             .execute(&mut conn)
