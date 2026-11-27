@@ -107,6 +107,14 @@ diesel::table! {
 }
 
 diesel::table! {
+    /// `items` through a view computing its one column.
+    doubled_ids (doubled) {
+        /// Twice the key.
+        doubled -> Integer,
+    }
+}
+
+diesel::table! {
     /// A table keyed by a serial.
     counters (id) {
         /// Primary key, drawn by the serial.
@@ -661,6 +669,31 @@ fn a_value_for_a_computed_column_is_refused() {
         .values((doubled_items::id.eq(3), doubled_items::doubled.eq(6)))
         .execute(&mut connection);
     assert_eq!(refusal(inserted), pg::FEATURE_NOT_SUPPORTED);
+}
+
+/// A view computing every column has no column to insert or update, which
+/// PostgreSQL refuses before it checks privileges.
+#[test]
+fn a_view_computing_every_column_refuses_inserts_and_updates() {
+    let mut connection = items_replica(
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON items TO mover;
+         CREATE VIEW doubled_ids AS SELECT id * 2 AS doubled FROM items;
+         ALTER VIEW doubled_ids OWNER TO mover;
+         GRANT SELECT, UPDATE ON doubled_ids TO app;",
+        &acting(),
+    );
+    let inserted = diesel::insert_into(doubled_ids::table)
+        .values(doubled_ids::doubled.eq(4))
+        .execute(&mut connection);
+    assert_eq!(refusal(inserted), pg::OBJECT_NOT_IN_PREREQUISITE_STATE);
+    let defaulted =
+        diesel::insert_into(doubled_ids::table).default_values().execute(&mut connection);
+    assert_eq!(refusal(defaulted), pg::OBJECT_NOT_IN_PREREQUISITE_STATE);
+    let updated = diesel::update(doubled_ids::table.filter(doubled_ids::doubled.eq(2)))
+        .set(doubled_ids::doubled.eq(8))
+        .execute(&mut connection);
+    assert_eq!(refusal(updated), pg::OBJECT_NOT_IN_PREREQUISITE_STATE);
+    assert_eq!(item(&mut connection, 1), Some((Some(1), Some("fresh".to_owned()))));
 }
 
 /// `counters` holding `(1, 1)`, with `views` over it owned by `mover`.

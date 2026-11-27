@@ -334,11 +334,20 @@ impl Written<'_> {
             ));
         }
         if self.event != Event::Delete {
+            let verb = if self.event == Event::Insert { "insert into" } else { "update" };
+            if self.outputs.iter().all(|output| output.written.is_none()) {
+                let message = format!(
+                    "{}cannot {verb} view \"{}\"",
+                    message_prefix(pg::OBJECT_NOT_IN_PREREQUISITE_STATE),
+                    self.view.stored_view_name()
+                );
+                triggers.extend(self.refusal("not_updatable", |_| false, true, &message, None));
+                return Ok(triggers);
+            }
             for (position, output) in self.outputs.iter().enumerate() {
                 if output.written.is_some() {
                     continue;
                 }
-                let verb = if self.event == Event::Insert { "insert into" } else { "update" };
                 let message = format!(
                     "{}cannot {verb} column \"{}\" of view \"{}\"",
                     message_prefix(pg::FEATURE_NOT_SUPPORTED),
