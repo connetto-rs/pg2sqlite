@@ -437,7 +437,12 @@ fn a_view_whose_table_leaves_the_replica_moves_into_a_table() {
 #[test]
 fn the_manifest_names_the_view_held_as_a_table() {
     let manifest = Pg2Sqlite::default()
-        .sql(&script(MOVES))
+        .sql(&script(&format!(
+            "{MOVES}
+             GRANT SELECT ON owners TO app;
+             CREATE VIEW named AS SELECT id, name FROM owners;
+             GRANT SELECT ON named TO app;"
+        )))
         .expect("parse")
         .translation_manifest(&acting())
         .expect("manifest");
@@ -449,7 +454,7 @@ fn the_manifest_names_the_view_held_as_a_table() {
     assert_eq!(entry.physical, "resource_moves");
     let columns: Vec<&str> = entry.columns.iter().map(|column| column.name.as_str()).collect();
     assert_eq!(columns, ["resource", "parent_id"]);
-    assert!(manifest.iter().all(|entry| entry.logical != "resources"));
+    assert!(manifest.iter().all(|entry| entry.logical != "resources" && entry.logical != "named"));
 }
 
 #[test]
@@ -517,6 +522,15 @@ fn a_check_option_the_table_cannot_check_is_refused() {
              GRANT SELECT, INSERT ON owned_moves TO app;",
             "the check option of view owned_moves reads owners",
         ),
+        (
+            "CREATE VIEW inner_moves AS SELECT id AS resource, parent_id FROM resources;
+             ALTER VIEW inner_moves OWNER TO mover;
+             CREATE VIEW outer_hidden WITH (check_option = cascaded) AS
+               SELECT resource FROM inner_moves WHERE parent_id > 0;
+             ALTER VIEW outer_hidden OWNER TO mover;
+             GRANT SELECT, INSERT ON outer_hidden TO app;",
+            "reads column parent_id, which view outer_hidden does not pass",
+        ),
     ] {
         let error = refused(views);
         assert!(error.contains(reason), "{error}");
@@ -568,6 +582,19 @@ fn an_output_whose_modifier_the_replica_cannot_spell_is_refused() {
 }
 
 #[test]
+fn a_view_selecting_a_wildcard_it_cannot_list_is_refused() {
+    let error = refused(
+        "CREATE VIEW probed AS SELECT r.id, f.* FROM resources r, generate_series(1, 2) AS f;
+         ALTER VIEW probed OWNER TO mover;
+         GRANT SELECT ON probed TO app;",
+    );
+    assert!(
+        error.contains("view probed selects a wildcard whose columns cannot be listed"),
+        "{error}"
+    );
+}
+
+#[test]
 fn a_view_is_keyed_by_what_it_groups_by_however_named_and_by_a_parenthesized_join() {
     for (definition, key) in [
         (
@@ -582,6 +609,7 @@ fn a_view_is_keyed_by_what_it_groups_by_however_named_and_by_a_parenthesized_joi
             "SELECT parent_id + 1 AS next, count(*) AS members FROM resources GROUP BY next",
             &["next"],
         ),
+        (r#"SELECT parent_id AS "P", count(*) AS members FROM resources GROUP BY "P""#, &["P"]),
         (
             "SELECT r.id AS resource, o.id AS owner
              FROM (resources r JOIN owners o ON o.id = r.parent_id)",
@@ -643,22 +671,25 @@ diesel::table! {
 
 #[test]
 fn a_serial_key_the_view_passes_through_auto_assigns_as_on_its_table() {
-    let mut connection = applied(
-        "CREATE TABLE things (id SERIAL PRIMARY KEY, label TEXT);
-         ALTER TABLE things OWNER TO mover;
-         CREATE VIEW labels AS SELECT id, label FROM things;
-         ALTER VIEW labels OWNER TO mover;
-         GRANT SELECT, INSERT ON labels TO app;
-         GRANT USAGE ON SEQUENCE things_id_seq TO app;",
-    );
-    diesel::insert_into(labels::table)
-        .values(&[labels::label.eq("a"), labels::label.eq("b")])
-        .execute(&mut connection)
-        .expect("the labels land");
-    assert_eq!(
-        labels::table.select(labels::id).order(labels::id).load::<i32>(&mut connection),
-        Ok(vec![1, 2])
-    );
+    for serial in ["SMALLSERIAL", "SERIAL", "BIGSERIAL"] {
+        let mut connection = applied(&format!(
+            "CREATE TABLE things (id {serial} PRIMARY KEY, label TEXT);
+             ALTER TABLE things OWNER TO mover;
+             CREATE VIEW labels AS SELECT id, label FROM things;
+             ALTER VIEW labels OWNER TO mover;
+             GRANT SELECT, INSERT ON labels TO app;
+             GRANT USAGE ON SEQUENCE things_id_seq TO app;"
+        ));
+        diesel::insert_into(labels::table)
+            .values(&[labels::label.eq("a"), labels::label.eq("b")])
+            .execute(&mut connection)
+            .expect("the labels land");
+        assert_eq!(
+            labels::table.select(labels::id).order(labels::id).load::<i32>(&mut connection),
+            Ok(vec![1, 2]),
+            "{serial}"
+        );
+    }
 }
 
 #[test]
@@ -674,12 +705,38 @@ fn a_serial_the_view_passes_through_off_its_key_is_refused() {
     assert!(error.contains("PRIMARY KEY"), "{error}");
 }
 
+/// A table the role reads in a later epoch counts as on the replica from the
+/// start, so the view over it never becomes a table.
 #[test]
-fn gaining_the_table_turns_the_view_table_back_into_a_view() {
+fn a_table_granted_in_a_later_epoch_keeps_the_view_a_view() {
     let mut connection =
         applied(&format!("{MOVES} {NEXT_EPOCH} GRANT SELECT ON resources TO app;"));
     assert_eq!(kind(&mut connection, "resource_moves").as_deref(), Some("view"));
     assert_eq!(kind(&mut connection, "resources").as_deref(), Some("table"));
+}
+
+#[test]
+fn a_view_replaced_to_read_only_tables_on_the_replica_moves_into_a_view() {
+    let mut connection = applied(&format!(
+        "{MOVES} {NEXT_EPOCH}
+         CREATE OR REPLACE VIEW resource_moves (resource, parent_id) AS SELECT id, id FROM owners;
+         {NEXT_EPOCH}"
+    ));
+    assert_eq!(kind(&mut connection, "resource_moves").as_deref(), Some("view"));
+    let names: Vec<String> =
+        diesel::sql_query("SELECT name FROM pragma_table_info('resource_moves')")
+            .load::<Named>(&mut connection)
+            .expect("the view's columns read")
+            .into_iter()
+            .map(|column| column.name)
+            .collect();
+    assert_eq!(names, ["resource", "parent_id"]);
+}
+
+#[derive(QueryableByName)]
+struct Named {
+    #[diesel(sql_type = Text)]
+    name: String,
 }
 
 #[test]
