@@ -17,7 +17,7 @@ use std::sync::{
 
 use diesel::{connection::SimpleConnection, prelude::*};
 use pg2sqlite::prelude::{Error, Pg2Sqlite, Pg2SqliteOptions, postgres_error};
-use pg2sqlite_runtime::statement_refusals::Authorizer;
+use pg2sqlite_runtime::statement_refusals::{Authorizer, TABLE};
 use sql_traits::structs::ParserDB;
 use sqlstate::pg;
 
@@ -152,24 +152,35 @@ fn exempting() -> Pg2SqliteOptions {
     as_app().with_rls_exemption_function("write_is_exempt")
 }
 
-/// The replica of [`SCHEMA`] with one shown item, loaded under the
-/// exemption, with the switch turning it on and off, off once loaded, and the
-/// authorizer the translation recorded installed.
-fn authorized_replica() -> (SqliteConnection, Arc<AtomicBool>, Authorizer) {
+/// The replica `options` translate `sql` into on a connection `prepare` set
+/// up, with one shown item loaded under the exemption, with the switch
+/// turning it on and off, off once loaded, and the authorizer the
+/// translation recorded installed.
+fn replica_of(
+    sql: &str,
+    options: &Pg2SqliteOptions,
+    prepare: &str,
+) -> (SqliteConnection, Arc<AtomicBool>, Authorizer) {
     let mut connection = SqliteConnection::establish(":memory:").unwrap();
+    connection.batch_execute(prepare).unwrap();
     let exempt = Arc::new(AtomicBool::new(true));
     let state = Arc::clone(&exempt);
     write_is_exempt_utils::register_nondeterministic_impl(&mut connection, move || {
         state.load(Ordering::Relaxed)
     })
     .unwrap();
-    let script = Pg2Sqlite::default().sql(SCHEMA).unwrap().translate_to_sql(&exempting()).unwrap();
+    let script = Pg2Sqlite::default().sql(sql).unwrap().translate_to_sql(options).unwrap();
     connection.batch_execute(&script.into_vec().join(";\n")).unwrap();
     diesel::insert_into(items::table).values(items::id.eq(1)).execute(&mut connection).unwrap();
     exempt.store(false, Ordering::Relaxed);
     let authorizer = Authorizer::load(&mut connection).unwrap();
     authorizer.install(&mut connection);
     (connection, exempt, authorizer)
+}
+
+/// The replica of [`SCHEMA`] as [`replica_of`] loads it.
+fn authorized_replica() -> (SqliteConnection, Arc<AtomicBool>, Authorizer) {
+    replica_of(SCHEMA, &exempting(), "")
 }
 
 /// Asserts that `statement`, run on `connection` as written, is refused with
@@ -255,4 +266,79 @@ fn the_deployments_own_writes_run_with_the_authorizer_removed() {
     exempt.store(false, Ordering::Relaxed);
     authorizer.install(&mut connection);
     assert_refused(&mut connection, &authorizer, "DELETE FROM items WHERE false", "table items");
+}
+
+/// With `items` in an attached database, every view reading it lives in the
+/// connection's `temp` database, and a write through one is refused there.
+#[test]
+fn a_write_through_a_view_over_an_attached_table_is_refused() {
+    let (mut connection, _, authorizer) = replica_of(
+        SCHEMA,
+        &exempting().with_attached_tables("shared", ["items"]),
+        "ATTACH DATABASE ':memory:' AS shared",
+    );
+    for (statement, relation) in [
+        ("DELETE FROM listed WHERE false", "view listed"),
+        ("UPDATE item_view SET id = 3 WHERE false", "view item_view"),
+        ("DELETE FROM items WHERE false", "table items"),
+    ] {
+        assert_refused(&mut connection, &authorizer, statement, relation);
+    }
+}
+
+/// A session's own `TEMP` table shadowing a relation is the session's to
+/// write, as PostgreSQL's `pg_temp` table is.
+#[test]
+fn a_temp_table_shadowing_a_relation_is_written() {
+    let (mut connection, _, _) = authorized_replica();
+    connection
+        .batch_execute(
+            "CREATE TEMP TABLE items (id INTEGER, parent_id INTEGER); \
+             INSERT INTO items (id) VALUES (3); UPDATE items SET id = 4; DELETE FROM items",
+        )
+        .unwrap();
+}
+
+/// A schema change the script rolls back leaves the record of the changes
+/// it keeps.
+#[test]
+fn the_record_outlives_a_rolled_back_change() {
+    let (mut connection, _, authorizer) = replica_of(
+        &format!("{SCHEMA} BEGIN; GRANT DELETE ON listed TO app; ROLLBACK;"),
+        &exempting(),
+        "",
+    );
+    assert_refused(&mut connection, &authorizer, "DELETE FROM listed WHERE false", "view listed");
+}
+
+/// A statement changing no relation or grant of an existing database leaves
+/// its record as it is, inside the client's transaction too.
+#[test]
+fn a_session_statement_leaves_the_record_alone() {
+    for statement in ["LISTEN updates", "NOTIFY updates", "SELECT id FROM items"] {
+        let script = Pg2Sqlite::default()
+            .sql(statement)
+            .unwrap()
+            .translate_to_sql_with_schema(&schema(), &as_app())
+            .unwrap();
+        assert!(
+            !script.into_vec().iter().any(|emitted| emitted.contains(TABLE)),
+            "`{statement}` writes the record again"
+        );
+    }
+}
+
+/// The record's table is the translation's own, so a source table of its
+/// name is refused rather than emptied.
+#[test]
+fn a_source_table_named_as_the_record_is_refused() {
+    let error = Pg2Sqlite::default()
+        .sql(&format!("{SCHEMA} CREATE TABLE {TABLE} (id INT); GRANT SELECT ON {TABLE} TO app;"))
+        .unwrap()
+        .translate_to_sql(&as_app())
+        .expect_err("a source table taking the record's name translated");
+    let Error::EmittedNameCollision { name, .. } = error else {
+        panic!("expected a name collision, got {error}");
+    };
+    assert_eq!(name, TABLE);
 }
