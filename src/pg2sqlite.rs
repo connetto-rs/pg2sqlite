@@ -2133,11 +2133,18 @@ impl Pg2Sqlite {
                 .chain(main.iter().flatten().flatten().flatten())
                 .chain(attached.iter().flatten().flatten().flatten()),
         );
+        let refusals = crate::impls::privileges::statement_refusals::recorded(
+            &schema,
+            &sources,
+            initial_schema.is_some(),
+            &context,
+        )?;
         let files = crate::initialization::InitializationPlan::new(
             prelude,
             placed.unit_files.into_iter().zip(statements),
             main,
             attached,
+            refusals,
         );
         let before_commit = if context.deferred_triggers().is_empty() {
             Vec::new()

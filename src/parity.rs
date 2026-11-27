@@ -42,6 +42,7 @@ use diesel::{
     sql_types::{Binary, Bool, Nullable, Text},
     sqlite::{Sqlite, SqliteFunctionBehavior, SqliteType, SqliteValue},
 };
+use pg2sqlite_runtime::statement_refusals::Authorizer;
 use sql_traits::{
     errors::DeploymentError,
     parity::{Answer, Case, EngineAnswer, Table, identifier, text_of},
@@ -432,6 +433,9 @@ struct Replica {
     /// Why the key of each measured view a write cannot be traced through
     /// reaches no column of the table the write lands on.
     untraced: BTreeMap<String, UntracedKey>,
+    /// The authorizer refusing the writes the acting role lacks a privilege
+    /// for, installed once the seed rows landed.
+    authorizer: Authorizer,
 }
 
 impl Replica {
@@ -512,7 +516,18 @@ impl Replica {
         session.exempt.store(false, Ordering::Relaxed);
         let untraced = track_changes(&mut connection, &case.config.tables, &schema, &manifest)
             .map_err(database("Tracking the changed rows".to_owned()))?;
-        Ok(Prepared::Ready(Self { connection, session, schema, options, manifest, untraced }))
+        let authorizer = Authorizer::load(&mut connection)
+            .map_err(database("Reading the recorded refusals".to_owned()))?;
+        authorizer.install(&mut connection);
+        Ok(Prepared::Ready(Self {
+            connection,
+            session,
+            schema,
+            options,
+            manifest,
+            untraced,
+            authorizer,
+        }))
     }
 
     /// Run pg2sqlite's own translation of `statement` with the caller's session
@@ -578,7 +593,7 @@ impl Replica {
     /// Run the translated write in a savepoint that is rolled back, collecting
     /// the keys of the rows of `table` it wrote.
     fn write(&mut self, table: &Table, translated: &[Statement]) -> Result<Measured, ParityError> {
-        let Self { connection, options, untraced, .. } = self;
+        let Self { connection, options, untraced, authorizer, .. } = self;
         let role = options.get_acting_role().unwrap_or_default();
         let database = |action: &str| {
             let action = action.to_owned();
@@ -590,9 +605,15 @@ impl Replica {
                 // The case's write is runtime fixture data, as pg2sqlite
                 // translated it.
                 if let Err(error) = connection.batch_execute(&format!("{statement};")) {
-                    if let DieselError::DatabaseError(_, information) = &error
-                        && let Some(refusal) = postgres_error(information.message())
-                    {
+                    let refusal = authorizer.refusal(&error);
+                    let message = match (&refusal, &error) {
+                        (Some(message), _) => Some(message.as_str()),
+                        (None, DieselError::DatabaseError(_, information)) => {
+                            Some(information.message())
+                        }
+                        (None, _) => None,
+                    };
+                    if let Some(refusal) = message.and_then(postgres_error) {
                         return Measured::Rejected(refusal.sqlstate().to_string());
                     }
                     return Measured::Failed(error.to_string());

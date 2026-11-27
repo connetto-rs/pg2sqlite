@@ -6,17 +6,18 @@
 //! inserts, and down an owner-rights view the owner's privileges on the
 //! relation the view writes. The replica's row triggers never fire for a
 //! statement matching no row, so a translated statement is refused at
-//! translation, or with an RLS exemption function by a guard ahead of the
-//! write that the exemption lifts. The answers are PostgreSQL 18's for the
-//! same script.
+//! translation, and with an RLS exemption function, as a statement run as
+//! written is, by the SQLite authorizer the translation records. The answers
+//! are PostgreSQL 18's for the same script.
 
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 
-use diesel::{Connection, SqliteConnection, connection::SimpleConnection};
+use diesel::{connection::SimpleConnection, prelude::*};
 use pg2sqlite::prelude::{Error, Pg2Sqlite, Pg2SqliteOptions, postgres_error};
+use pg2sqlite_runtime::statement_refusals::Authorizer;
 use sql_traits::structs::ParserDB;
 use sqlstate::pg;
 
@@ -151,9 +152,10 @@ fn exempting() -> Pg2SqliteOptions {
     as_app().with_rls_exemption_function("write_is_exempt")
 }
 
-/// The replica of [`SCHEMA`] loaded under the exemption, with the switch
-/// turning it on and off, off once loaded.
-fn exempting_replica() -> (SqliteConnection, Arc<AtomicBool>) {
+/// The replica of [`SCHEMA`] with one shown item, loaded under the
+/// exemption, with the switch turning it on and off, off once loaded, and the
+/// authorizer the translation recorded installed.
+fn authorized_replica() -> (SqliteConnection, Arc<AtomicBool>, Authorizer) {
     let mut connection = SqliteConnection::establish(":memory:").unwrap();
     let exempt = Arc::new(AtomicBool::new(true));
     let state = Arc::clone(&exempt);
@@ -163,34 +165,94 @@ fn exempting_replica() -> (SqliteConnection, Arc<AtomicBool>) {
     .unwrap();
     let script = Pg2Sqlite::default().sql(SCHEMA).unwrap().translate_to_sql(&exempting()).unwrap();
     connection.batch_execute(&script.into_vec().join(";\n")).unwrap();
+    diesel::insert_into(items::table).values(items::id.eq(1)).execute(&mut connection).unwrap();
     exempt.store(false, Ordering::Relaxed);
-    (connection, exempt)
+    let authorizer = Authorizer::load(&mut connection).unwrap();
+    authorizer.install(&mut connection);
+    (connection, exempt, authorizer)
 }
 
-/// `statement` translated as `app` under the exemption function and run on
-/// `connection`.
-fn run(connection: &mut SqliteConnection, statement: &str) -> diesel::QueryResult<()> {
-    let script = Pg2Sqlite::default()
-        .sql(statement)
-        .unwrap()
-        .translate_to_sql_with_schema(&schema(), &exempting())
-        .unwrap_or_else(|error| panic!("`{statement}`: {error}"));
-    connection.batch_execute(&script.into_vec().join(";\n"))
+/// Asserts that `statement`, run on `connection` as written, is refused with
+/// `permission denied for <relation>` before any row.
+fn assert_refused(
+    connection: &mut SqliteConnection,
+    authorizer: &Authorizer,
+    statement: &str,
+    relation: &str,
+) {
+    let error = connection
+        .batch_execute(statement)
+        .expect_err(&format!("`{statement}` ran where PostgreSQL refuses it"));
+    let message = authorizer.refusal(&error).unwrap_or_else(|| panic!("`{statement}`: {error}"));
+    let refused = postgres_error(&message).unwrap_or_else(|| panic!("`{statement}`: {message}"));
+    assert_eq!(
+        (refused.sqlstate(), refused.message()),
+        (pg::INSUFFICIENT_PRIVILEGE, format!("permission denied for {relation}").as_str()),
+        "`{statement}`"
+    );
 }
 
 #[test]
-fn the_exemption_lifts_a_refusal_matching_no_row() {
-    let (mut connection, exempt) = exempting_replica();
-    let refused = run(&mut connection, "DELETE FROM listed WHERE false").unwrap_err().to_string();
-    let refused = postgres_error(&refused).unwrap_or_else(|| panic!("{refused}"));
-    assert_eq!(
-        (refused.sqlstate(), refused.message()),
-        (pg::INSUFFICIENT_PRIVILEGE, "permission denied for view listed")
-    );
-    run(&mut connection, "UPDATE item_view SET parent_id = 2 WHERE id = 3")
-        .expect("a held write runs after a refused one");
+fn a_write_run_as_written_is_refused_whatever_rows_it_matches() {
+    let (mut connection, _, authorizer) = authorized_replica();
+    for (statement, relation) in [
+        ("DELETE FROM listed WHERE false", "view listed"),
+        ("DELETE FROM listed WHERE id = 1", "view listed"),
+        ("DELETE FROM item_view WHERE id = 3", "table items"),
+        ("UPDATE item_view SET id = 3 WHERE false", "view item_view"),
+        ("UPDATE items SET id = 3 WHERE false", "table items"),
+        ("DELETE FROM items WHERE false", "table items"),
+        ("INSERT INTO items (id) SELECT 3 WHERE false", "table items"),
+        ("DELETE FROM outer_view WHERE false", "view item_view"),
+    ] {
+        assert_refused(&mut connection, &authorizer, statement, relation);
+    }
+}
+
+diesel::table! {
+    items (id) {
+        id -> Integer,
+        parent_id -> Nullable<Integer>,
+    }
+}
+
+/// The view's trigger writes `items`, which only its owner may update.
+#[test]
+fn a_held_write_runs_through_a_view_whose_owner_writes_the_table() {
+    let (mut connection, _, _) = authorized_replica();
+    connection.batch_execute("UPDATE item_view SET parent_id = 2 WHERE id = 1").unwrap();
+    let parents: Vec<Option<i32>> =
+        items::table.select(items::parent_id).load(&mut connection).unwrap();
+    assert_eq!(parents, [Some(2)]);
+}
+
+/// A translated write passes the translation under an exemption function,
+/// which lifts its refusal for a schema's seed rows, and the authorizer
+/// refuses it where it runs.
+#[test]
+fn a_translated_write_is_refused_where_it_runs() {
+    let (mut connection, _, authorizer) = authorized_replica();
+    let script = Pg2Sqlite::default()
+        .sql("DELETE FROM listed WHERE false")
+        .unwrap()
+        .translate_to_sql_with_schema(&schema(), &exempting())
+        .unwrap();
+    assert_refused(&mut connection, &authorizer, &script.into_vec().join(";\n"), "view listed");
+}
+
+/// A deployment applies the server's rows with the authorizer removed and
+/// the exemption on, and the authorizer judges the next statement again.
+#[test]
+fn the_deployments_own_writes_run_with_the_authorizer_removed() {
+    let (mut connection, exempt, authorizer) = authorized_replica();
+    connection.remove_authorizer();
     exempt.store(true, Ordering::Relaxed);
-    run(&mut connection, "DELETE FROM listed WHERE false").expect("the exemption lifts it");
-    run(&mut connection, "INSERT INTO items (id, parent_id) VALUES (3, 1)")
-        .expect("the exemption lifts it");
+    diesel::insert_into(items::table)
+        .values((items::id.eq(2), items::parent_id.eq(1)))
+        .execute(&mut connection)
+        .unwrap();
+    diesel::delete(items::table.filter(items::id.eq(2))).execute(&mut connection).unwrap();
+    exempt.store(false, Ordering::Relaxed);
+    authorizer.install(&mut connection);
+    assert_refused(&mut connection, &authorizer, "DELETE FROM items WHERE false", "table items");
 }

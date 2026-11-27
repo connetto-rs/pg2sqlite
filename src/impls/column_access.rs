@@ -30,20 +30,16 @@ use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{
-        ast_builder,
         object_name::{last_ident, resolve_translation_table},
         privileges::RoleTable,
         scoped_relations::relation_occurrences,
         translator_impls::{
             insert::row_width,
             off_replica::{self, OffReplica},
-            one_shot,
-            rls::write_guard_condition_expr,
             view_writes::unheld_view_privilege,
         },
     },
     options::TranslationContext,
-    sqlstate::message_prefix,
 };
 
 pub(crate) type Table = <ParserDB as DatabaseLike>::Table;
@@ -65,22 +61,16 @@ pub(crate) struct Resolved {
     unheld: Option<String>,
 }
 
-/// The temporary view whose insert raises a guarded write's refusal.
-const REFUSAL_VIEW: &str = "pg2sqlite_refusal";
-
-/// The temporary trigger raising a guarded write's refusal.
-const REFUSAL_TRIGGER: &str = "pg2sqlite_refuse";
-
 impl Resolved {
     /// `translated`, the statement's translation, refused as the statement
     /// is.
     ///
-    /// A write the acting role lacks a privilege for is refused before any
-    /// row, as PostgreSQL refuses it, since the replica's write guards fire
-    /// only for a row the statement reaches. Without an RLS exemption
-    /// function nothing lifts the refusal, so the translation refuses the
-    /// write. With one, the write runs after a guard raising the refusal
-    /// unless the exemption holds, as it holds for a schema's seed rows.
+    /// A write the acting role lacks a privilege for is refused at
+    /// translation, before any row, as PostgreSQL refuses it. With an RLS
+    /// exemption function the write translates, since the exemption lifts
+    /// the refusal for a schema's seed rows, and the SQLite authorizer the
+    /// replica installs refuses it before any row, as it refuses a write run
+    /// untranslated.
     ///
     /// # Errors
     ///
@@ -91,19 +81,13 @@ impl Resolved {
         translated: Result<Vec<Statement>, Error>,
         options: &TranslationContext<'_>,
     ) -> Result<Vec<Statement>, Error> {
-        let mut translated = with_ambiguity(self.ambiguous, translated)?;
-        let Some(message) = self.unheld else { return Ok(translated) };
-        let Some(exemption) = write_guard_condition_expr(None, options) else {
-            return Err(postgres(pg::INSUFFICIENT_PRIVILEGE, message));
-        };
-        let raise = ast_builder::raise_statement(
-            "ABORT",
-            Some(&format!("{}{message}", message_prefix(pg::INSUFFICIENT_PRIVILEGE))),
-            Some(exemption),
-        );
-        let mut guarded = one_shot::run_once(REFUSAL_VIEW, REFUSAL_TRIGGER, vec![raise]);
-        guarded.append(&mut translated);
-        Ok(guarded)
+        let translated = with_ambiguity(self.ambiguous, translated)?;
+        match self.unheld {
+            Some(message) if options.get_rls_exemption_function().is_none() => {
+                Err(postgres(pg::INSUFFICIENT_PRIVILEGE, message))
+            }
+            _ => Ok(translated),
+        }
     }
 }
 

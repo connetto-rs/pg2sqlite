@@ -21,8 +21,8 @@ const UNREADABLE_KEY: &str = "cannot update or delete a row of ";
 const UNREADABLE_KEY_ROLE: &str =
     " on the replica, since the acting role cannot read its key column ";
 
-/// A write command a table may lack a policy for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A write command a table may lack a policy or a privilege for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum WriteCommand {
     /// `INSERT`.
     Insert,
@@ -35,12 +35,20 @@ pub enum WriteCommand {
 impl WriteCommand {
     const ALL: [Self; 3] = [Self::Insert, Self::Update, Self::Delete];
 
-    const fn keyword(self) -> &'static str {
+    /// The command's SQL keyword, in upper case.
+    #[must_use]
+    pub const fn keyword(self) -> &'static str {
         match self {
             Self::Insert => "INSERT",
             Self::Update => "UPDATE",
             Self::Delete => "DELETE",
         }
+    }
+
+    /// The command whose [`keyword`](Self::keyword) is `keyword`.
+    #[must_use]
+    pub fn from_keyword(keyword: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|command| command.keyword() == keyword)
     }
 }
 

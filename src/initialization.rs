@@ -78,32 +78,44 @@ pub struct InitializationPlan<S> {
 
 impl<S> InitializationPlan<S> {
     /// Assembles the plan from the main-file `prelude`, every unit's files and
-    /// emitted form, and the forms of both fresh-file selections.
+    /// emitted form, the forms of both fresh-file selections, and the
+    /// main-file `interlude` run ahead of the unit at its index.
     pub(crate) fn new(
         prelude: Vec<S>,
         units: impl IntoIterator<Item = (Files, Vec<S>)>,
         main: Forms<S>,
         attached: Forms<S>,
+        interlude: (usize, Vec<S>),
     ) -> Self {
         let (main_unavailable, main) = split(main);
         let (attached_unavailable, attached) = split(attached);
         let (mut main, mut attached) = (main.into_iter(), attached.into_iter());
-        let prelude = (!prelude.is_empty()).then_some(Step {
-            files: Files::MAIN,
-            base: prelude,
-            main_rebound: None,
-            attached_rebound: None,
-        });
-        let steps = prelude
+        let main_step = |base: Vec<S>| {
+            (!base.is_empty()).then_some(Step {
+                files: Files::MAIN,
+                base,
+                main_rebound: None,
+                attached_rebound: None,
+            })
+        };
+        let (at, interlude) = interlude;
+        let mut units: Vec<Step<S>> = units
             .into_iter()
-            .chain(units.into_iter().map(|(files, base)| {
+            .map(|(files, base)| {
                 Step {
                     files,
                     base,
                     main_rebound: main.next().flatten(),
                     attached_rebound: attached.next().flatten(),
                 }
-            }))
+            })
+            .collect();
+        let later = units.split_off(at.min(units.len()));
+        let steps = main_step(prelude)
+            .into_iter()
+            .chain(units)
+            .chain(main_step(interlude))
+            .chain(later)
             .collect();
         Self { steps, main_unavailable, attached_unavailable }
     }

@@ -14,7 +14,7 @@
 
 use core::ops::ControlFlow;
 
-use pg2sqlite_runtime::write_guard::permission_denied;
+use pg2sqlite_runtime::write_guard::{WriteCommand, permission_denied};
 use sql_traits::{
     structs::{
         ColumnBinding, ColumnScope, ExpressionContext, ExpressionScope, IdentifierCase, ParserDB,
@@ -386,13 +386,8 @@ impl Checked<'_> {
 }
 
 /// PostgreSQL's `42501` message refusing `statement`, a write of the acting
-/// role naming a view, for a privilege lacking on the view or on a relation
-/// the write lands on through it, which PostgreSQL makes before reading a
-/// row. The acting role needs the privileges on the view, and each view's
-/// owner, or the role writing a `security_invoker` view, needs them on the
-/// relation that view writes. `None` where no acting role is named, where the
-/// statement names no view or one whose writes land past the replica, and
-/// where the rewrite refuses the write first.
+/// role naming a view, as [`view_refusal`] answers it. `None` where the
+/// statement names no view, or a column the view does not have.
 ///
 /// # Errors
 ///
@@ -403,14 +398,70 @@ pub(crate) fn unheld_view_privilege(
     options: &TranslationContext<'_>,
 ) -> Result<Option<String>, Error> {
     let Some((name, event)) = written_name(statement) else { return Ok(None) };
-    let Some(acting) = session_variable::acting_role(schema, options)? else { return Ok(None) };
     let Some(view) = resolve_view(name, schema)? else { return Ok(None) };
-    if super::view_table::writes_past_replica(view, schema, options)? {
-        return Ok(None);
-    }
     let Some(needs) = view_needs(statement, &output_names(view, schema)?) else {
         return Ok(None);
     };
+    view_refusal(view, event, needs, schema, options)
+}
+
+/// What the acting role may not write through `view`, each command it may
+/// not run as a whole and each output column it may not update, with
+/// PostgreSQL's `42501` message, as [`view_refusal`] answers each. An insert
+/// is listed only when it is refused whichever columns it fills.
+///
+/// # Errors
+///
+/// Returns the lookup errors resolving the views runs into.
+pub(crate) fn view_write_refusals(
+    view: &View,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<Vec<(WriteCommand, Option<String>, String)>, Error> {
+    let none =
+        || Needs { insert: Vec::new(), insert_any: false, update: Vec::new(), delete: false };
+    let mut refusals = Vec::new();
+    for (event, command, needs) in [
+        (Event::Insert, WriteCommand::Insert, Needs { insert_any: true, ..none() }),
+        (Event::Delete, WriteCommand::Delete, Needs { delete: true, ..none() }),
+    ] {
+        if let Some(message) = view_refusal(view, event, needs, schema, options)? {
+            refusals.push((command, None, message));
+        }
+    }
+    for (position, name) in output_names(view, schema)?.into_iter().enumerate() {
+        let Some(name) = name else { continue };
+        let needs = Needs { update: vec![position], ..none() };
+        if let Some(message) = view_refusal(view, Event::Update, needs, schema, options)? {
+            refusals.push((WriteCommand::Update, Some(name), message));
+        }
+    }
+    Ok(refusals)
+}
+
+/// PostgreSQL's `42501` message refusing a write of `event` on `view` that
+/// needs `needs` on it, for a privilege lacking on the view or on a relation
+/// the write lands on through it, which PostgreSQL makes before reading a
+/// row. The acting role needs the privileges on the view, and each view's
+/// owner, or the role writing a `security_invoker` view, needs them on the
+/// relation that view writes. `None` where no acting role is named, where the
+/// view's writes land past the replica, and where the rewrite refuses the
+/// write first.
+///
+/// # Errors
+///
+/// Returns the lookup errors resolving the views runs into.
+fn view_refusal(
+    view: &View,
+    event: Event,
+    needs: Needs<usize>,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<Option<String>, Error> {
+    let Some(acting) = session_variable::acting_role(schema, options)? else { return Ok(None) };
+    if super::view_table::writes_past_replica(view, schema, options)? {
+        return Ok(None);
+    }
     // The rewrite refuses a view it cannot write through before any
     // privilege is checked, so every level is reached before one is.
     let mut checked = Vec::new();
