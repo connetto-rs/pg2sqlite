@@ -6,14 +6,15 @@
 //! column capped by another helper's set beside the caller, a column kept
 //! outside another helper's set, that set holding `NULL` or not, a setting
 //! left unset, read through `NULLIF` or as sent, a walk down two edge tables
-//! kept to a selection, a walk up a tree feeding a grantee set, and a walk
-//! down an edge table no key orients, following the edges a state, a time
-//! bound and another helper's set leave it. Then for
-//! an arm reading another helper's rows, and for a helper read in `FROM`, as
-//! its rows, its columns under an alias, and its rows correlated with the row
-//! a policy reads. Each helper guards the same table under a policy of its
-//! own, which both engines read before any request and then under every
-//! request state.
+//! kept to a selection, a walk up a tree feeding a grantee set, a walk down an
+//! edge table no key orients, following the edges a state, a time bound and
+//! another helper's set leave it, and a walk following the edges a lifted row
+//! cap leaves it. Then for a parent arm a lifted row cap keeps to, a parent arm
+//! a kind, a time bound and another helper's set keep to, an arm reading
+//! another helper's rows, and for a helper read in `FROM`, as its rows, its
+//! columns under an alias, and its rows correlated with the row a policy reads.
+//! Each helper guards the same table under a policy of its own, which both
+//! engines read before any request and then under every request state.
 
 // `register_impl` takes an unwind-safe closure, which a poisoning mutex is.
 use std::sync::{Arc, Mutex};
@@ -35,7 +36,12 @@ const PG_OWNER: &str = "DO $$ BEGIN CREATE ROLE conditions_owner NOLOGIN BYPASSR
 
 const SCHEMA: &str = "
 CREATE TABLE orgs (id TEXT PRIMARY KEY, state TEXT NOT NULL, closed_at TIMESTAMPTZ);
-CREATE TABLE docs (id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES orgs (id), kind TEXT NOT NULL);
+CREATE TABLE docs (
+  id TEXT PRIMARY KEY,
+  org_id TEXT NOT NULL REFERENCES orgs (id),
+  kind TEXT NOT NULL,
+  archived_at TIMESTAMPTZ
+);
 CREATE TABLE doc_parents (
   id TEXT PRIMARY KEY REFERENCES docs (id),
   parent_id TEXT NOT NULL REFERENCES docs (id)
@@ -302,6 +308,36 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
   SELECT reached.id FROM reached
 $$;
 
+CREATE FUNCTION authz.capped_linked_docs() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  WITH RECURSIVE reached (id) AS (
+    SELECT grant_row.doc_id FROM public.grants grant_row
+    WHERE grant_row.grantee = authz.caller_id()
+    UNION
+    SELECT link.child_id FROM public.doc_links link
+    JOIN reached ON reached.id = link.parent_id
+    WHERE (SELECT authz.installation_id()) IS NULL
+      OR (link.org_id, 'page') IN (SELECT * FROM authz.capped_kinds())
+  )
+  SELECT reached.id FROM reached
+$$;
+
+CREATE FUNCTION authz.capped_member_docs() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT doc.id FROM public.docs doc
+  WHERE doc.org_id IN (SELECT authz.member_orgs())
+    AND ((SELECT authz.installation_id()) IS NULL
+      OR (doc.org_id, doc.kind) IN (SELECT * FROM authz.capped_kinds()))
+$$;
+
+CREATE FUNCTION authz.kept_member_files() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT doc.id FROM public.docs doc
+  WHERE doc.org_id IN (SELECT authz.member_orgs())
+    AND doc.kind = 'file' AND (doc.archived_at IS NULL OR doc.archived_at > now())
+    AND doc.id NOT IN (SELECT authz.granted_docs())
+$$;
+
 ALTER FUNCTION authz.caller_id() OWNER TO conditions_owner;
 ALTER FUNCTION authz.installation_id() OWNER TO conditions_owner;
 ALTER FUNCTION authz.link_ids() OWNER TO conditions_owner;
@@ -331,6 +367,9 @@ ALTER FUNCTION authz.member_granted_docs() OWNER TO conditions_owner;
 ALTER FUNCTION authz.uninstalled_grants() OWNER TO conditions_owner;
 ALTER FUNCTION authz.never_installed_files() OWNER TO conditions_owner;
 ALTER FUNCTION authz.linked_down_docs() OWNER TO conditions_owner;
+ALTER FUNCTION authz.capped_linked_docs() OWNER TO conditions_owner;
+ALTER FUNCTION authz.capped_member_docs() OWNER TO conditions_owner;
+ALTER FUNCTION authz.kept_member_files() OWNER TO conditions_owner;
 REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA authz FROM PUBLIC;
 GRANT USAGE ON SCHEMA authz TO conditions_owner;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA authz TO conditions_owner;
@@ -348,7 +387,7 @@ GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA authz TO app;
 
 /// Each helper's policy over `docs`, one case per condition it carries or
 /// place its rows are read in.
-const CASES: [(&str, &str); 31] = [
+const CASES: [(&str, &str); 34] = [
     ("a joined row", "org_id IN (SELECT authz.member_orgs())"),
     ("a row cap over a joined row", "org_id IN (SELECT authz.administered_orgs())"),
     ("an anti-join, time bounds and a principal", "id IN (SELECT authz.granted_docs())"),
@@ -363,6 +402,12 @@ const CASES: [(&str, &str); 31] = [
     ("a walk down kept to a selection", "id IN (SELECT authz.reachable_docs())"),
     ("a walk up feeding a grantee set", "id IN (SELECT authz.team_docs())"),
     ("a walk down edges a condition filters", "id IN (SELECT authz.linked_down_docs())"),
+    ("a walk down edges a lifted row cap filters", "id IN (SELECT authz.capped_linked_docs())"),
+    ("a parent row a lifted row cap keeps", "id IN (SELECT authz.capped_member_docs())"),
+    (
+        "a parent row a kind, a time bound and another helper's set keep",
+        "id IN (SELECT authz.kept_member_files())",
+    ),
     ("a returned key capped by another helper's set", "id IN (SELECT authz.granted_pages())"),
     ("a column outside another helper's set", "id IN (SELECT authz.unblocked_pages())"),
     ("a column outside a set holding NULL", "id IN (SELECT authz.non_team_docs())"),
@@ -481,15 +526,15 @@ const ORGS: [(&str, &str, Option<Stamp>); 4] = [
     ("o3", "active", Some(Stamp::Past)),
     ("o4", "active", Some(Stamp::Future)),
 ];
-const DOCS: [(&str, &str, &str); 8] = [
-    ("d1", "o1", "page"),
-    ("d2", "o1", "file"),
-    ("d3", "o2", "page"),
-    ("d4", "o1", "page"),
-    ("d5", "o1", "file"),
-    ("d6", "o2", "file"),
-    ("d7", "o3", "page"),
-    ("d8", "o4", "file"),
+const DOCS: [(&str, &str, &str, Option<Stamp>); 8] = [
+    ("d1", "o1", "page", None),
+    ("d2", "o1", "file", None),
+    ("d3", "o2", "page", None),
+    ("d4", "o1", "page", None),
+    ("d5", "o1", "file", Some(Stamp::Past)),
+    ("d6", "o2", "file", None),
+    ("d7", "o3", "page", None),
+    ("d8", "o4", "file", Some(Stamp::Future)),
 ];
 const DOC_PARENTS: [(&str, &str); 1] = [("d4", "d1")];
 const ATTACHMENTS: [(&str, &str); 1] = [("d5", "d4")];
@@ -539,7 +584,9 @@ mod schema {
     macro_rules! tables {
         ($instant:ident) => {
             diesel::table! { orgs (id) { id -> Text, state -> Text, closed_at -> Nullable<$instant>, } }
-            diesel::table! { docs (id) { id -> Text, org_id -> Text, kind -> Text, } }
+            diesel::table! {
+                docs (id) { id -> Text, org_id -> Text, kind -> Text, archived_at -> Nullable<$instant>, }
+            }
             diesel::table! { doc_parents (id) { id -> Text, parent_id -> Text, } }
             diesel::table! { attachments (id) { id -> Text, doc_id -> Text, } }
             diesel::table! {
@@ -595,7 +642,7 @@ mod schema {
         tables!(Text);
         diesel::table! {
             /// The table behind the `docs` view.
-            docs_rls (id) { id -> Text, org_id -> Text, kind -> Text, }
+            docs_rls (id) { id -> Text, org_id -> Text, kind -> Text, archived_at -> Nullable<Text>, }
         }
     }
 }
@@ -646,12 +693,13 @@ macro_rules! seed {
                 .execute($connection)
                 .expect("seed orgs");
         }
-        for (id, org, kind) in DOCS {
+        for (id, org, kind, archived) in DOCS {
             diesel::insert_into(schema::$schema::$docs::table)
                 .values((
                     schema::$schema::$docs::id.eq(id),
                     schema::$schema::$docs::org_id.eq(org),
                     schema::$schema::$docs::kind.eq(kind),
+                    schema::$schema::$docs::archived_at.eq(stamp(archived)),
                 ))
                 .execute($connection)
                 .expect("seed docs");
