@@ -25,7 +25,7 @@ const EVENTS: Events = Events::new(AT, AT_STORED);
 /// A table whose instant column defaults to a computed wall clock, Rome's
 /// repeated 02:30.
 const DEFAULTED: &str = "CREATE TABLE d (id INTEGER PRIMARY KEY, at TIMESTAMPTZ NOT NULL \
-                         DEFAULT (timestamp '2026-10-24 23:30' + interval '3 hours'));";
+                         DEFAULT (timestamp '2026-10-24 23:30:00.123456' + interval '3 hours'));";
 
 mod source_schema {
     diesel::table! {
@@ -116,10 +116,10 @@ fn a_wall_clock_cast_to_an_instant_reads_in_the_zone() {
 #[test]
 fn a_wall_clock_default_of_an_instant_column_reads_in_the_zone() {
     let expectations = expected(
-        "2026-10-25 02:30:00+01",
-        "2026-10-25 02:30:00+00",
-        "2026-10-25 02:30:00-05:30",
-        "2026-10-25 02:30:00+05:30",
+        "2026-10-25 02:30:00.123456+01",
+        "2026-10-25 02:30:00.123456+00",
+        "2026-10-25 02:30:00.123456-05:30",
+        "2026-10-25 02:30:00.123456+05:30",
     );
     for ((zone, opts), want) in zones().iter().zip(expectations) {
         let mut source = postgres_harness::fresh_database_in_zone(zone);

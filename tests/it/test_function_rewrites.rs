@@ -159,7 +159,7 @@ fn to_timestamp_epoch() {
     let stmts = translate_pg("SELECT to_timestamp(0)", &options).unwrap();
     let sql = stmts.iter().find(|s| !s.starts_with("PRAGMA")).expect("SELECT stmt");
     let lower = sql.to_lowercase();
-    assert!(lower.contains("datetime("), "expected datetime: {sql}");
+    assert!(lower.contains("strftime("), "expected whole-second timestamp formatting, got {sql}");
     assert!(lower.contains("unixepoch"), "expected 'unixepoch' modifier: {sql}");
     let mut conn = SqliteConnection::establish(":memory:").unwrap();
     // Dynamically generated translated SQL cannot be expressed via the typed

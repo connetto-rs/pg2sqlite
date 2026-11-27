@@ -15,13 +15,15 @@ use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{
-        datetime_helpers::{canonical_timestamptz_call, promote_date_to_midnight, time_of_day},
+        datetime_helpers::{
+            canonical_timestamptz_call, promote_date_to_midnight, text_reader_microseconds,
+            text_time_from_microseconds, time_of_day, timestamp_from_microseconds,
+        },
         expr_helpers::concat,
-        function_helpers::{integer_literal, simple_function_expr, string_literal},
+        function_helpers::{integer_literal, simple_function_expr},
         object_name::last_ident,
         replay::{is_replayable, reject_duplicated_operand},
         shared_helpers::{declared_in_scope, is_integral_expression},
-        temporal_arithmetic::trim_trailing_zeros,
         temporal_infinity::{InfiniteAnswer, guard},
         temporal_literals::{TemporalLiteralKind, temporal_literal_kind},
     },
@@ -308,13 +310,14 @@ pub(crate) fn temporal_text_reader(target: TemporalLiteralKind) -> Option<fn(Exp
     }
 }
 
-/// `function(operand, 'subsec')` with its trailing fractional zeros trimmed.
+/// Read temporal text rounded to integer microseconds.
 fn read_subsec(function: &str, operand: Expr) -> Expr {
-    trim_trailing_zeros(simple_function_expr(
-        function,
-        vec![operand, string_literal("subsec")],
-        None,
-    ))
+    let microseconds = text_reader_microseconds(operand, function == "time");
+    if function == "time" {
+        text_time_from_microseconds(microseconds)
+    } else {
+        timestamp_from_microseconds(microseconds)
+    }
 }
 
 /// Reports that `operand` is read by SQLite's date functions on its way to

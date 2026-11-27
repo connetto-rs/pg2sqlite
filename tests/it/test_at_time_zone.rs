@@ -108,6 +108,100 @@ fn reverse_stmt(schema: &str, sqlite: &str) -> sqlparser::ast::Statement {
         .expect("one statement")
 }
 
+#[test]
+fn default_cast_at_time_zone_keeps_microseconds() {
+    assert_eq!(
+        run_translated_with(
+            "CREATE TABLE exact_zone (id INT PRIMARY KEY, value TIMESTAMP DEFAULT \
+             ('2024-01-02 03:04:05.123456+00'::timestamptz AT TIME ZONE 'UTC')); \
+             INSERT INTO exact_zone (id) VALUES (1); SELECT value FROM exact_zone;",
+            &Pg2SqliteOptions::default(),
+        ),
+        vec![Some("2024-01-02 03:04:05.123456".to_owned())],
+    );
+    assert_eq!(
+        run_translated_utc(
+            "CREATE TABLE exact_zone (id INT PRIMARY KEY, value TIMESTAMPTZ DEFAULT \
+             ('2024-01-02 03:04:05.123456+00'::timestamptz AT TIME ZONE 'UTC')); \
+             INSERT INTO exact_zone (id) VALUES (1); SELECT value FROM exact_zone;",
+        ),
+        vec![Some("2024-01-02 03:04:05.123456+00:00".to_owned())],
+    );
+}
+
+#[test]
+fn offset_cast_at_time_zone_keeps_microseconds() {
+    for (literal, expected) in [
+        ("2024-01-02 03:04:05.123456+05:30", "2024-01-01 21:34:05.123456"),
+        ("1969-12-31 23:59:59.999999+00", "1969-12-31 23:59:59.999999"),
+        ("2024-01-02 03:04:05.1-02:30", "2024-01-02 05:34:05.1"),
+    ] {
+        assert_eq!(
+            run_translated_with(
+                &format!("SELECT '{literal}'::timestamptz AT TIME ZONE 'UTC';"),
+                &Pg2SqliteOptions::default(),
+            ),
+            vec![Some(expected.to_owned())],
+            "{literal}",
+        );
+    }
+}
+
+#[test]
+fn text_cast_at_time_zone_keeps_fraction_and_offset_separate() {
+    assert_eq!(
+        run_translated_utc(
+            "CREATE TABLE exact_zone (id INT PRIMARY KEY, value TEXT);
+             INSERT INTO exact_zone VALUES
+             (1, '2024-01-02 03:04:05.123456+05:30'),
+             (2, '1969-12-31 23:59:59.999999+00:00'),
+             (3, '2024-01-02 03:04:05.1-02:30'),
+             (4, '2024-01-02'),
+             (5, NULL);
+             SELECT value::timestamptz AT TIME ZONE 'UTC' FROM exact_zone ORDER BY id;",
+        ),
+        vec![
+            Some("2024-01-01 21:34:05.123456".to_owned()),
+            Some("1969-12-31 23:59:59.999999".to_owned()),
+            Some("2024-01-02 05:34:05.1".to_owned()),
+            Some("2024-01-02 00:00:00".to_owned()),
+            None,
+        ],
+    );
+}
+
+#[test]
+fn raw_text_temporal_casts_round_microsecond_half_ties() {
+    for (target, expected) in [
+        (
+            "timestamp",
+            ["2025-01-01 00:00:00", "2024-12-31 23:59:59.123456", "2024-12-31 23:59:59.123458"],
+        ),
+        ("time", ["24:00:00", "23:59:59.123456", "23:59:59.123458"]),
+        (
+            "timestamptz",
+            [
+                "2025-01-01 00:00:00.000000+00:00",
+                "2024-12-31 23:59:59.123456+00:00",
+                "2024-12-31 23:59:59.123458+00:00",
+            ],
+        ),
+    ] {
+        assert_eq!(
+            run_translated_utc(&format!(
+                "CREATE TABLE exact_text (id INT PRIMARY KEY, value TEXT);
+                 INSERT INTO exact_text VALUES
+                 (1, '2024-12-31 23:59:59.9999995'),
+                 (2, '2024-12-31 23:59:59.1234565'),
+                 (3, '2024-12-31 23:59:59.1234575');
+                 SELECT value::{target} FROM exact_text ORDER BY id;"
+            )),
+            expected.into_iter().map(|value| Some(value.to_owned())).collect::<Vec<_>>(),
+            "{target}",
+        );
+    }
+}
+
 /// A volatile operand is read by both the whole-second and the fraction part
 /// of the local-text form, so it is refused before the copies can disagree.
 /// `c()::timestamptz` is aware, so the local form is chosen, while the unknown
@@ -261,10 +355,7 @@ fn a_volatile_temporal_default_is_refused() {
         .translate(&utc_request())
         .expect_err("a volatile default has no single-read SQLite form")
         .to_string();
-    assert!(
-        message.contains("a temporal write"),
-        "the refusal names the construct, got: {message}"
-    );
+    assert!(message.contains("to_timestamp"), "the refusal names the construct, got: {message}");
     assert!(message.contains("random"), "the refusal names the operand, got: {message}");
 }
 

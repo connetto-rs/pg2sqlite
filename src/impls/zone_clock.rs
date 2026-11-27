@@ -17,10 +17,14 @@ use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{
+        bind_once::try_bind_once,
         datetime_helpers::{
-            DatePartKey, build_date_part_expr, build_strftime_call, canonical_timestamptz_text,
-            local_timestamp_text, pg_to_char_format_to_strftime, split_at_offset_codes,
-            time_of_day, to_char_zone_codes, to_char_zone_codes_to_literals,
+            DatePartKey, build_date_part_expr, build_date_trunc_quarter_call,
+            build_date_trunc_week_call, build_date_trunc_year_span_call, build_strftime_call,
+            build_to_char_expr, canonical_timestamptz_text, local_timestamp_text,
+            split_at_offset_codes, temporal_microseconds, text_time_from_microseconds, time_of_day,
+            timestamp_from_microseconds, to_char_has_iso_fields, to_char_zone_codes,
+            to_char_zone_codes_to_literals, whole_second_timestamp,
         },
         expr_helpers::{case_when, concat},
         function_helpers::{integer_literal, simple_function_expr, string_literal},
@@ -466,11 +470,13 @@ pub(crate) fn zoned_date_part(
     };
     let value = expr.translate_with_warnings(schema, options, emit)?;
     let read = |value: Expr| -> Result<Expr, Error> {
-        let local = match zoned {
-            Some(zoned) => zoned.local(value),
-            None => value,
-        };
-        Ok(build_date_part_expr(key, local))
+        try_bind_once(operation, [expr], [value], options, |[value]| {
+            let local = match zoned {
+                Some(zoned) => zoned.local(value.clone()),
+                None => value.clone(),
+            };
+            Ok(build_date_part_expr(key, local))
+        })
     };
     if matches!(kind, Some(TemporalKind::Time { .. })) {
         return read(value);
@@ -582,16 +588,7 @@ pub(crate) fn zoned_to_char(
     let kind = temporal_kind_of(expr, schema, options);
     let (saw_of, saw_tz, wall_clock) = to_char_zone_codes(format)?;
     let has_zone_code = saw_of || saw_tz;
-    if has_zone_code && let Some(TemporalKind::Time { zoned }) = kind {
-        return Err(Error::forward_refusal(if zoned {
-            "PostgreSQL has no to_char over a time with time zone, and the replica refuses the \
-             read the same way."
-        } else {
-            "PostgreSQL answers `invalid format specification for an interval value` for a \
-             to_char format with a zone field over a time, and the replica refuses the read the \
-             same way."
-        }));
-    }
+    validate_time_format(kind, format, has_zone_code)?;
     if kind.is_none() && (wall_clock || has_zone_code) {
         unsettled_operand_refusal(operation, expr, schema, options)?;
     }
@@ -648,12 +645,11 @@ pub(crate) fn zoned_to_char(
             (translated, PrintedOffset::Constant("+00".to_string()), String::new())
         };
         let strftime = |format: &str, of: &str| -> Result<Expr, Error> {
-            let mapped = if has_zone_code {
-                pg_to_char_format_to_strftime(&to_char_zone_codes_to_literals(format, of, &tz)?)?
+            if has_zone_code {
+                build_to_char_expr(&to_char_zone_codes_to_literals(format, of, &tz)?, local.clone())
             } else {
-                pg_to_char_format_to_strftime(format)?
-            };
-            Ok(build_strftime_call(&mapped, local.clone()))
+                build_to_char_expr(format, local.clone())
+            }
         };
         let offset = match offset {
             PrintedOffset::Constant(text) => return strftime(format, &text),
@@ -672,10 +668,126 @@ pub(crate) fn zoned_to_char(
         }
         Ok(printed.expect("a format holding OF prints the offset"))
     };
+    let print_bound =
+        |value| try_bind_once(operation, [expr], [value], options, |[value]| print(value.clone()));
     match answer {
-        Some(answer) => guard(operation, expr, translated, answer, options, print),
-        None => print(translated),
+        Some(answer) => guard(operation, expr, translated, answer, options, print_bound),
+        None => print_bound(translated),
     }
+}
+
+/// Rejects temporal formats unavailable for PostgreSQL time operands.
+fn validate_time_format(
+    kind: Option<TemporalKind>,
+    format: &str,
+    has_zone_code: bool,
+) -> Result<(), Error> {
+    if let Some(TemporalKind::Time { zoned }) = kind
+        && (zoned || has_zone_code)
+    {
+        return Err(Error::forward_refusal(if zoned {
+            "PostgreSQL has no to_char over a time with time zone, and the replica refuses the \
+             read the same way."
+        } else {
+            "PostgreSQL answers `invalid format specification for an interval value` for a \
+             to_char format with a zone field over a time, and the replica refuses the read the \
+             same way."
+        }));
+    }
+    if kind == Some(TemporalKind::Time { zoned: false }) && to_char_has_iso_fields(format)? {
+        return Err(Error::forward_refusal(
+            "PostgreSQL refuses ISO date fields in to_char over an interval value.",
+        ));
+    }
+    Ok(())
+}
+
+/// Truncates temporal text without rounding fractional seconds through SQLite.
+pub(crate) fn build_date_trunc_expr(
+    field: &str,
+    value: Expr,
+    time_only: bool,
+) -> Result<Expr, Error> {
+    let divisor = match field {
+        "microsecond" | "microseconds" => Some(1),
+        "millisecond" | "milliseconds" => Some(1_000),
+        "second" | "seconds" if time_only => Some(1_000_000),
+        "minute" | "minutes" if time_only => Some(60_000_000),
+        "hour" | "hours" if time_only => Some(3_600_000_000),
+        _ => None,
+    };
+    if let Some(divisor) = divisor {
+        let microseconds = temporal_microseconds(value, time_only);
+        let truncated = if divisor == 1 {
+            bin(microseconds, BinaryOperator::Multiply, integer_literal(1))
+        } else {
+            let integral = if time_only {
+                microseconds
+            } else {
+                let remainder = bin(
+                    bin(
+                        bin(microseconds.clone(), BinaryOperator::Modulo, integer_literal(divisor)),
+                        BinaryOperator::Plus,
+                        integer_literal(divisor),
+                    ),
+                    BinaryOperator::Modulo,
+                    integer_literal(divisor),
+                );
+                bin(microseconds, BinaryOperator::Minus, remainder)
+            };
+            bin(
+                bin(integral, BinaryOperator::Divide, integer_literal(divisor)),
+                BinaryOperator::Multiply,
+                integer_literal(divisor),
+            )
+        };
+        return Ok(if time_only {
+            text_time_from_microseconds(truncated)
+        } else {
+            timestamp_from_microseconds(truncated)
+        });
+    }
+    if time_only {
+        return match field {
+            "day" | "days" | "month" | "months" | "quarter" | "quarters" | "year" | "years"
+            | "decade" | "decades" | "century" | "centuries" | "millennium" | "millennia" => {
+                Ok(concat(
+                    simple_function_expr(
+                        "substr",
+                        vec![value, integer_literal(1), integer_literal(0)],
+                        None,
+                    ),
+                    string_literal("00:00:00"),
+                ))
+            }
+            _ => {
+                Err(Error::forward_refusal(format!(
+                    "date_trunc('{field}', time) is not supported for interval values."
+                )))
+            }
+        };
+    }
+    let whole = whole_second_timestamp(value);
+    Ok(match field {
+        "second" | "seconds" => build_strftime_call("%Y-%m-%d %H:%M:%S", whole),
+        "minute" | "minutes" => build_strftime_call("%Y-%m-%d %H:%M:00", whole),
+        "hour" | "hours" => build_strftime_call("%Y-%m-%d %H:00:00", whole),
+        "day" | "days" => build_strftime_call("%Y-%m-%d 00:00:00", whole),
+        "month" | "months" => build_strftime_call("%Y-%m-01 00:00:00", whole),
+        "year" | "years" => build_strftime_call("%Y-01-01 00:00:00", whole),
+        "week" | "weeks" => build_date_trunc_week_call(whole),
+        "quarter" | "quarters" => build_date_trunc_quarter_call(whole),
+        "decade" | "decades" => build_date_trunc_year_span_call(whole, 10, 0),
+        "century" | "centuries" => build_date_trunc_year_span_call(whole, 100, 1),
+        "millennium" | "millennia" => build_date_trunc_year_span_call(whole, 1000, 1),
+        _ => {
+            return Err(Error::forward_refusal(format!(
+                "date_trunc('{field}', ...) is not supported by this translation. \
+             Supported fields are microsecond, millisecond, second, minute, hour, day, week, \
+             month, quarter, year, decade, century, millennium, and their plurals."
+            )));
+        }
+    })
 }
 
 /// The type name PostgreSQL names in the `unit ... not supported for type`

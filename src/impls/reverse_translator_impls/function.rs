@@ -17,7 +17,10 @@ use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{
-        datetime_helpers::{datetime_field_from_strftime_format, strftime_format_to_pg_to_char},
+        datetime_helpers::{
+            datetime_field_from_strftime_format, strftime_format_to_pg_to_char,
+            whole_second_timestamp_argument,
+        },
         function_helpers::{
             extract_exactly_reverse as extract_exactly, function_arg_expr_or_err, integer_literal,
             positional_arity, simple_function_expr, single_quoted_literal, string_literal,
@@ -1289,16 +1292,17 @@ pub fn reverse_translate_function(
                     "strftime requires list arguments for date_trunc reversal".to_string(),
                 ));
             };
-            let ts_expr = function_arg_expr_or_err(
+            let timestamp = function_arg_expr_or_err(
                 list.args.get(1).expect("strftime must have timestamp argument"),
             )?;
-            let reversed_ts =
-                crate::prelude::ReverseTranslator::reverse_translate(ts_expr, schema, options)?;
+            let timestamp = whole_second_timestamp_argument(timestamp).unwrap_or(timestamp);
+            let reversed_timestamp =
+                crate::prelude::ReverseTranslator::reverse_translate(timestamp, schema, options)?;
             let translated_over =
                 reverse_translate_window_type(func.over.as_ref(), schema, options, &mut |_| {})?;
             Ok(simple_function_expr(
                 "date_trunc",
-                vec![string_literal(&field), reversed_ts],
+                vec![string_literal(&field), reversed_timestamp],
                 translated_over,
             ))
         }

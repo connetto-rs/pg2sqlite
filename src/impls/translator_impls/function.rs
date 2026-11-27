@@ -18,10 +18,8 @@ use super::{
 use crate::no_std::prelude::*;
 use crate::{
     impls::{
-        datetime_helpers::{
-            DatePartKey, build_date_trunc_quarter_call, build_date_trunc_week_call,
-            build_date_trunc_year_span_call, build_strftime_call, parse_date_part_key,
-        },
+        bind_once::try_bind_once,
+        datetime_helpers::{DatePartKey, parse_date_part_key},
         expr_helpers::case_when,
         function_helpers::{
             extract_exactly, integer_literal, integer_literal_value, number_literal,
@@ -40,7 +38,8 @@ use crate::{
         },
         temporal_infinity::{InfiniteAnswer, guard},
         zone_clock::{
-            unsettled_operand_refusal, zoned_date_part, zoned_offset_of, zoned_wall_clock,
+            build_date_trunc_expr, unsettled_operand_refusal, zoned_date_part, zoned_offset_of,
+            zoned_wall_clock,
         },
     },
     prelude::Pg2SqliteOptions,
@@ -1916,6 +1915,11 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                 // A timestamptz truncates the zone's wall clock and answers
                 // an instant.
                 let kind = temporal_kind_of(ts_expr, schema, options);
+                if kind == Some(TemporalKind::Time { zoned: true }) {
+                    return Err(crate::errors::Error::forward_refusal(
+                        "PostgreSQL has no date_trunc over time with time zone.",
+                    ));
+                }
                 if kind.is_none() {
                     unsettled_operand_refusal(&operation, ts_expr, schema, options)?;
                 }
@@ -1931,6 +1935,15 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                     _ => None,
                 };
                 let translated_ts = ts_expr.translate_with_warnings(schema, options, emit)?;
+                if kind == Some(TemporalKind::Time { zoned: false }) {
+                    return try_bind_once(
+                        &operation,
+                        [ts_expr],
+                        [translated_ts],
+                        options,
+                        |[value]| build_date_trunc_expr(&field_str, value.clone(), true),
+                    );
+                }
                 guard(
                     &operation,
                     ts_expr,
@@ -1938,72 +1951,36 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                     InfiniteAnswer::Same,
                     options,
                     |translated_ts| {
-                        let wall_clock = match zoned {
-                            Some(zoned) => {
-                                let reads_twice =
-                                    matches!(field_str.as_str(), "quarter" | "quarters")
-                                        || zoned.local_reads_twice()
-                                        || zoned.instant_reads_twice();
-                                if reads_twice && !is_replayable(ts_expr, options) {
-                                    return Err(reject_duplicated_operand(&operation, ts_expr));
+                        try_bind_once(
+                            &operation,
+                            [ts_expr],
+                            [translated_ts],
+                            options,
+                            |[translated_ts]| {
+                                let wall_clock = match zoned {
+                                    Some(zoned) => {
+                                        let reads_twice =
+                                            matches!(field_str.as_str(), "quarter" | "quarters")
+                                                || zoned.local_reads_twice()
+                                                || zoned.instant_reads_twice();
+                                        if reads_twice && !is_replayable(ts_expr, options) {
+                                            return Err(reject_duplicated_operand(
+                                                &operation, ts_expr,
+                                            ));
+                                        }
+                                        zoned.local(translated_ts.clone())
+                                    }
+                                    None => translated_ts.clone(),
+                                };
+                                let call = build_date_trunc_expr(&field_str, wall_clock, false)?;
+                                match zoned {
+                                    // The result is a timestamptz in every
+                                    // zone.
+                                    Some(zoned) => Ok(zoned.instant(call)),
+                                    None => Ok(call),
                                 }
-                                zoned.local(translated_ts)
-                            }
-                            None => translated_ts,
-                        };
-                        let call = match field_str.as_str() {
-                            // A full timestamp, the sub-granularity components
-                            // zeroed rather than dropped, so the result
-                            // compares against a stored value.
-                            "second" | "seconds" => {
-                                build_strftime_call("%Y-%m-%d %H:%M:%S", wall_clock)
-                            }
-                            "millisecond" | "milliseconds" => {
-                                // SQLite %f prints three digits where
-                                // PostgreSQL drops trailing zeros.
-                                trim_trailing_zeros(build_strftime_call(
-                                    "%Y-%m-%d %H:%M:%f",
-                                    wall_clock,
-                                ))
-                            }
-                            "minute" | "minutes" => {
-                                build_strftime_call("%Y-%m-%d %H:%M:00", wall_clock)
-                            }
-                            "hour" | "hours" => {
-                                build_strftime_call("%Y-%m-%d %H:00:00", wall_clock)
-                            }
-                            "day" | "days" => build_strftime_call("%Y-%m-%d 00:00:00", wall_clock),
-                            "month" | "months" => {
-                                build_strftime_call("%Y-%m-01 00:00:00", wall_clock)
-                            }
-                            "year" | "years" => {
-                                build_strftime_call("%Y-01-01 00:00:00", wall_clock)
-                            }
-                            // Calendar arithmetic, not a format.
-                            "week" | "weeks" => build_date_trunc_week_call(wall_clock),
-                            "quarter" | "quarters" => build_date_trunc_quarter_call(wall_clock),
-                            "decade" | "decades" => {
-                                build_date_trunc_year_span_call(wall_clock, 10, 0)
-                            }
-                            "century" | "centuries" => {
-                                build_date_trunc_year_span_call(wall_clock, 100, 1)
-                            }
-                            "millennium" | "millennia" => {
-                                build_date_trunc_year_span_call(wall_clock, 1000, 1)
-                            }
-                            other => {
-                                return Err(crate::errors::Error::forward_refusal(format!(
-                                    "date_trunc('{other}', ...) is not supported by this translation. \
-                            Supported: millisecond, second, minute, hour, day, week, month, \
-                            quarter, year, decade, century, millennium, and their plurals."
-                                )));
-                            }
-                        };
-                        match zoned {
-                            // The result is a timestamptz in every zone.
-                            Some(zoned) => Ok(zoned.instant(call)),
-                            None => Ok(call),
-                        }
+                            },
+                        )
                     },
                 )
             }

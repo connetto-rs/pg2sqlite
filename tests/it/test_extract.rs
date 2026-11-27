@@ -1,4 +1,4 @@
-//! Tests for EXTRACT(field FROM expr) translation to SQLite strftime.
+//! Tests for PostgreSQL date-field extraction in SQLite.
 
 use diesel::RunQueryDsl;
 
@@ -37,8 +37,8 @@ fn extract_second_produces_valid_sqlite() -> Result<(), Box<dyn std::error::Erro
     let (translated, select_sql) =
         helpers::translate::translate_utc_statements_and_first_query(sql);
     assert!(
-        select_sql.to_lowercase().contains("strftime"),
-        "EXTRACT(SECOND) must use strftime, got: {select_sql}"
+        select_sql.contains("/ 1000000.0"),
+        "`EXTRACT(SECOND)` must scale integer microseconds, got {select_sql}"
     );
 
     let mut conn = helpers::apply_statements(&translated);
