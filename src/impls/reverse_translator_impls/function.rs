@@ -3,9 +3,9 @@
 
 use sql_traits::structs::ParserDB;
 use sqlparser::ast::{
-    BinaryOperator, CastKind, DataType, DateTimeField, Expr, ExtractSyntax, Function, FunctionArg,
-    FunctionArgExpr, FunctionArguments, Ident, ObjectName, ObjectNamePart, TimezoneInfo,
-    TrimWhereField, Value, ValueWithSpan,
+    BinaryOperator, CastKind, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
+    FunctionArguments, Ident, ObjectName, ObjectNamePart, TimezoneInfo, TrimWhereField, Value,
+    ValueWithSpan,
 };
 
 use super::{
@@ -17,14 +17,13 @@ use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{
-        datetime_helpers::{datetime_field_from_strftime_format, strftime_format_to_pg_to_char},
         function_helpers::{
             extract_exactly_reverse as extract_exactly, function_arg_expr_or_err, integer_literal,
-            positional_arity, simple_function_expr, single_quoted_literal, string_literal,
+            positional_arity, simple_function_expr, string_literal,
         },
         idioms::{
             boolean_aggregate_unlowered, extract_json_group_array_nullif,
-            extract_json_group_object_nullif, is_now_localtime_args,
+            extract_json_group_object_nullif,
         },
         session_variable,
         shared_helpers::{
@@ -32,7 +31,6 @@ use crate::{
             translate_order_by_expr,
         },
         sqlite_functions::classify,
-        timezone::{at_time_zone_for_modifier, normalize_timezone_modifier_for_postgres},
         translator_impls::{expr::sqlite_json_path_to_pg_text_path, postgis},
     },
     traits::SessionVariableMapping,
@@ -56,10 +54,6 @@ pub enum FunctionReversal {
     Rename(String),
     /// Transform to NOW() function
     ToNow,
-    /// Transform datetime(expr, modifier) to expr AT TIME ZONE '...'
-    ToAtTimeZone(String),
-    /// Transform to EXTRACT expression
-    ToExtract(DateTimeField),
     /// Transform to POSITION expression (INSTR -> POSITION with arg swap)
     ToPosition,
     /// Transform to operator (vec_distance_L2 -> <->)
@@ -73,12 +67,6 @@ pub enum FunctionReversal {
     /// Transform LTRIM/RTRIM/TRIM(str, chars) to TRIM(LEADING|TRAILING|BOTH
     /// chars FROM str)
     ToTrimDirectional(TrimWhereField),
-    /// Transform datetime(epoch, 'unixepoch') to to_timestamp(epoch)
-    ToTimestampFromEpoch,
-    /// Transform strftime(composite_fmt, ts) to date_trunc(field, ts)
-    ToDateTrunc(String),
-    /// Transform the canonical `timestamptz` strftime to a timestamptz cast.
-    ToTimestamptz,
     /// Transform json(x) to CAST(x AS JSONB)
     ToCastAsJsonb,
     /// Transform the registered `jsonb` text function's call to
@@ -119,8 +107,6 @@ pub enum FunctionReversal {
     ToEncodeHex,
     /// Translate unhex(x) to decode(x, 'hex').
     ToDecodeHex,
-    /// Translate unixepoch(x) to EXTRACT(EPOCH FROM x).
-    ToExtractEpoch,
     /// Translate `group_concat(x)` to `string_agg(x, ',')`.
     ///
     /// SQLite's one-argument spelling joins with a comma. PostgreSQL has no
@@ -130,9 +116,6 @@ pub enum FunctionReversal {
     /// every input except the empty string, where `unicode` answers NULL and
     /// PostgreSQL's `ascii` answers 0, and 0 arises for no other input.
     ToAsciiNullif,
-    /// Translate `strftime(fmt, x)` to `to_char(x, template)`, the string
-    /// naming the PostgreSQL template.
-    ToChar(String),
     /// The function a session variable mapping pairs with a PostgreSQL
     /// setting, which becomes the setting again.
     ToSessionVariable(SessionVariableMapping),
@@ -144,14 +127,6 @@ pub enum FunctionReversal {
     /// Emit a bare keyword with no argument list, which is the only form
     /// PostgreSQL takes for `current_date` and its relatives.
     ToBareKeyword(&'static str),
-    /// The registered zone function: `local_clock(x, 'zone')` becomes
-    /// `x::timestamptz AT TIME ZONE 'zone'` and `instant(x, 'zone')` becomes
-    /// `x::timestamp AT TIME ZONE 'zone'`, the cast naming the value's type
-    /// as the replica holds it in text, and the field saying which one.
-    ToZoneConversion {
-        /// Whether the call answers the zone's wall clock of an instant.
-        to_local: bool,
-    },
     /// Reject the named SQLite-only construct with the reason string.
     Reject(String),
 }
@@ -188,88 +163,6 @@ fn reverse_date_or_time(
     }
 }
 
-/// Reverse a composite strftime format string back to a `date_trunc` field
-/// name. Returns `None` if the format doesn't match a known `date_trunc`
-/// pattern.
-///
-/// The three coarse formats carry ` 00:00:00` because PostgreSQL's
-/// `date_trunc` always answers a full timestamp. A date-only format such as
-/// `%Y-%m-%d` is deliberately absent: it is a valid thing to write in SQLite,
-/// but reversing it to `date_trunc('day', ...)` would hand back PostgreSQL
-/// that answers a timestamp where the SQLite it came from answered a date.
-fn reverse_strftime_to_date_trunc_field(format: &str) -> Option<&'static str> {
-    match format {
-        "%Y-01-01 00:00:00" => Some("year"),
-        "%Y-%m-01 00:00:00" => Some("month"),
-        "%Y-%m-%d 00:00:00" => Some("day"),
-        "%Y-%m-%d %H:00:00" => Some("hour"),
-        "%Y-%m-%d %H:%M:00" => Some("minute"),
-        "%Y-%m-%d %H:%M:%S" => Some("second"),
-        _ => None,
-    }
-}
-
-/// What a `strftime` call becomes, or why it cannot become anything.
-///
-/// PostgreSQL has no `strftime`, so a format outside the three tables, a
-/// format that is not a literal, and the extra modifier arguments SQLite
-/// allows after the timestamp all have to be refused rather than forwarded.
-fn reverse_strftime(args: &FunctionArguments) -> FunctionReversal {
-    let FunctionArguments::List(list) = args else {
-        return FunctionReversal::Reject(strftime_rejection("a call with no argument list"));
-    };
-    if list.args.len() != 2 {
-        return FunctionReversal::Reject(strftime_rejection(
-            "a call with anything but a format and a timestamp, since SQLite's trailing date \
-             modifiers have no PostgreSQL form",
-        ));
-    }
-    let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(ValueWithSpan {
-        value: Value::SingleQuotedString(format),
-        ..
-    })))) = list.args.first()
-    else {
-        return FunctionReversal::Reject(strftime_rejection(
-            "a format that is not a string literal, which cannot be read at translation time",
-        ));
-    };
-
-    if format == crate::impls::datetime_helpers::TIMESTAMPTZ_FORMAT {
-        let is_now = list.args.get(1).is_some_and(|arg| {
-            matches!(
-                arg,
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(ValueWithSpan {
-                    value: Value::SingleQuotedString(value),
-                    ..
-                }))) if value == "now"
-            )
-        });
-        return if is_now { FunctionReversal::ToNow } else { FunctionReversal::ToTimestamptz };
-    }
-    if let Some(field) = reverse_strftime_to_date_trunc_field(format) {
-        return FunctionReversal::ToDateTrunc(field.to_string());
-    }
-    if let Some(field) = datetime_field_from_strftime_format(format) {
-        return FunctionReversal::ToExtract(field);
-    }
-    if let Some(template) = strftime_format_to_pg_to_char(format) {
-        return FunctionReversal::ToChar(template);
-    }
-    FunctionReversal::Reject(strftime_rejection(&format!("the format '{format}'")))
-}
-
-/// The refusal every unreversible `strftime` shares, which names what does
-/// reverse so the author can pick one.
-fn strftime_rejection(subject: &str) -> String {
-    format!(
-        "strftime has no PostgreSQL equivalent, and this is {subject}. These reverse: the six \
-         truncating formats ('%Y-01-01 00:00:00', '%Y-%m-01 00:00:00', '%Y-%m-%d 00:00:00', \
-         '%Y-%m-%d %H:00:00', '%Y-%m-%d %H:%M:00', '%Y-%m-%d %H:%M:%S') become date_trunc, a \
-         single field (%Y %m %d %H %M %S %f %s %V %G %u %w %j) becomes EXTRACT, and a format \
-         built from %Y %G %V %u %m %d %H %I %M %S with separators becomes to_char."
-    )
-}
-
 /// True when a multi-argument `min` or `max` cannot become `LEAST` or
 /// `GREATEST` without changing what NULL does.
 ///
@@ -299,18 +192,6 @@ fn multi_argument(args: &FunctionArguments) -> bool {
     matches!(args, FunctionArguments::List(list) if list.args.len() > 1)
 }
 
-/// The reversal of a call to a registered zone function.
-fn zone_conversion(
-    name: &str,
-    options: &crate::options::TranslationContext<'_>,
-) -> FunctionReversal {
-    FunctionReversal::ToZoneConversion {
-        to_local: options
-            .get_time_zone_functions()
-            .is_some_and(|functions| functions.local_clock.eq_ignore_ascii_case(name)),
-    }
-}
-
 #[allow(clippy::too_many_lines)]
 pub fn reverse_function(
     name: &ObjectName,
@@ -336,89 +217,22 @@ pub fn reverse_function(
         // The choice depends on the argument's declared column type and is
         // resolved in reverse_translate_function where schema is available.
         "json_array_length" => FunctionReversal::JsonArrayLength,
-        // datetime('now') -> NOW(), datetime(x) -> x AT TIME ZONE 'UTC'
         "datetime" => {
-            if let FunctionArguments::List(list) = args
-                && list.args.len() == 1
+            if let Some("now") = string_modifier_at(args, 0)
+                && positional_arity(args) == Some(1)
             {
-                if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
-                    ValueWithSpan { value: Value::SingleQuotedString(s), .. },
-                )))) = list.args.first()
-                    && s == "now"
-                {
-                    return FunctionReversal::ToNow;
-                }
-                // The one-argument form is what `AT TIME ZONE 'UTC'` becomes on
-                // the way out, since SQLite's own `utc` modifier shifts by the
-                // machine's offset and PostgreSQL's UTC shifts nothing.
-                return FunctionReversal::ToAtTimeZone("UTC".to_string());
+                FunctionReversal::ToNow
+            } else {
+                reverse_date_or_time(
+                    args,
+                    DataType::Timestamp(None, TimezoneInfo::None),
+                    "LOCALTIMESTAMP",
+                    "datetime",
+                )
             }
-            // localtimestamp: datetime('now', 'localtime') -> LOCALTIMESTAMP.
-            // This must be checked before the generic 2-arg timezone path,
-            // which would map 'localtime' to AT TIME ZONE and then
-            // fail because 'now' is not a known timestamp
-            // expression.
-            if is_now_localtime_args(args) {
-                return FunctionReversal::ToBareKeyword("LOCALTIMESTAMP");
-            }
-            if let Some(modifier) = string_modifier_at(args, 1) {
-                if let Some(zone) = normalize_timezone_modifier_for_postgres(modifier) {
-                    return FunctionReversal::ToAtTimeZone(zone);
-                }
-                if modifier == "unixepoch" {
-                    return FunctionReversal::ToTimestampFromEpoch;
-                }
-            }
-            // `datetime(e, 'unixepoch', 'subsec')` is the same conversion with
-            // the fraction kept, which `to_timestamp` carries anyway.
-            if let FunctionArguments::List(list) = args
-                && list.args.len() == 3
-                && let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
-                    ValueWithSpan { value: Value::SingleQuotedString(epoch), .. },
-                )))) = list.args.get(1)
-                && let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(
-                    ValueWithSpan { value: Value::SingleQuotedString(subsec), .. },
-                )))) = list.args.get(2)
-                && epoch == "unixepoch"
-                && subsec == "subsec"
-            {
-                return FunctionReversal::ToTimestampFromEpoch;
-            }
-            // Anything else has no PostgreSQL spelling: PostgreSQL has no
-            // datetime function, so a call that is neither a zone shift nor
-            // an epoch conversion cannot be emitted. The refusal names the
-            // modifier when there is exactly one, and stays generic for a
-            // chain, whose first modifier alone would mislead (R98).
-            let sole_modifier = string_modifier_at(args, 1).map(String::from);
-            FunctionReversal::Reject(match sole_modifier {
-                Some(modifier) => {
-                    format!(
-                        "the datetime modifier '{modifier}' has no PostgreSQL form. PostgreSQL has \
-                     no datetime function, and only a time zone modifier or unixepoch can be \
-                     rewritten onto AT TIME ZONE or to_timestamp. Express the arithmetic with \
-                     interval arithmetic or date_trunc before translating."
-                    )
-                }
-                None => {
-                    "this datetime call has no PostgreSQL form. PostgreSQL has no datetime \
-                         function, and only datetime('now'), a single timestamp argument, one \
-                         time zone modifier, or unixepoch can be rewritten onto NOW(), AT TIME \
-                         ZONE, or to_timestamp."
-                        .to_string()
-                }
-            })
         }
-        // date(x) -> x::date, time(x) -> x::time, and the argument-less
-        // spellings -> the keywords, which is what SQLite answers for them.
-        // PostgreSQL has a `date` function and a `time` one, but `time` is a
-        // type name there and refuses a bare call, so the cast is what crosses
-        // for both. A modifier argument has no counterpart at all.
         "date" => reverse_date_or_time(args, DataType::Date, "current_date", "date"),
         "time" => {
-            // localtime: time('now', 'localtime') -> LOCALTIME.
-            if is_now_localtime_args(args) {
-                return FunctionReversal::ToBareKeyword("LOCALTIME");
-            }
             reverse_date_or_time(
                 args,
                 DataType::Time(None, TimezoneInfo::None),
@@ -426,10 +240,9 @@ pub fn reverse_function(
                 "time",
             )
         }
-        // strftime('%Y-01-01 00:00:00', expr) -> date_trunc('year', expr)
-        // strftime('%Y', expr) -> EXTRACT(YEAR FROM expr)
-        // strftime('%Y-%m-%d', expr) -> to_char(expr, 'YYYY-MM-DD')
-        "strftime" => reverse_strftime(args),
+        "strftime" | "unixepoch" => {
+            FunctionReversal::Reject(format!("{func_name} has no supported PostgreSQL reversal"))
+        }
         // INSTR(str, substr) -> POSITION(substr IN str)
         "instr" => FunctionReversal::ToPosition,
         // unicode(x) -> NULLIF(ascii(x), 0), NULL for the empty string.
@@ -534,15 +347,6 @@ pub fn reverse_function(
                 FunctionReversal::Reject(session_variable::paired_arity_refusal(mapping))
             }
         }
-        // The registered zone functions -> AT TIME ZONE, which PostgreSQL
-        // computes in the zone named whatever the session's own.
-        name if options.get_time_zone_functions().is_some_and(|functions| {
-            functions.local_clock.eq_ignore_ascii_case(name)
-                || functions.instant.eq_ignore_ascii_case(name)
-        }) =>
-        {
-            zone_conversion(name, options)
-        }
         // The declared version 7 generator -> uuidv7(). Checked before the
         // random one, so a caller who pointed both options at one name gets
         // the reading that keeps the creation-time ordering.
@@ -606,8 +410,6 @@ pub fn reverse_function(
         "hex" => FunctionReversal::ToEncodeHex,
         // unhex(x) -> decode(x, 'hex')
         "unhex" => FunctionReversal::ToDecodeHex,
-        // unixepoch(x) -> EXTRACT(EPOCH FROM x)
-        "unixepoch" => FunctionReversal::ToExtractEpoch,
         // typeof(x): pg_typeof returns a registered type name; SQLite returns a
         // storage-class string. The values differ, so this is not a
         // translation.
@@ -950,7 +752,7 @@ fn json_path_extraction(
 
 /// Build a reverse-translated function: translate `args`, params, window,
 /// filter and within_group, then wrap in `Expr::Function` with the given name.
-fn build_reverse_function(
+pub(super) fn build_reverse_function(
     name: ObjectName,
     func: &Function,
     args: &FunctionArguments,
@@ -991,26 +793,6 @@ fn sqlite_hex_of_null(hexed: Expr) -> Expr {
     simple_function_expr("coalesce", vec![hexed, string_literal("")], None)
 }
 
-/// `floor(extract(epoch from now()))::bigint`, which is what SQLite's
-/// `unixepoch()` answers.
-///
-/// SQLite gives whole seconds as an integer, measured, while
-/// `extract(epoch from now())` gives `1786200937.154282`, so neither the floor
-/// nor the cast is decoration.
-fn current_epoch_seconds() -> Expr {
-    let epoch = Expr::Extract {
-        field: DateTimeField::Epoch,
-        syntax: ExtractSyntax::From,
-        expr: Box::new(simple_function_expr("NOW", vec![], None)),
-    };
-    Expr::Cast {
-        expr: Box::new(simple_function_expr("floor", vec![epoch], None)),
-        data_type: DataType::BigInt(None),
-        format: None,
-        kind: CastKind::DoubleColon,
-    }
-}
-
 /// Writes out the comma SQLite's one-argument `group_concat` joins with, since
 /// PostgreSQL's `string_agg` has no one-argument form.
 fn with_default_separator(mut reversed: Expr) -> Expr {
@@ -1034,6 +816,12 @@ pub fn reverse_translate_function(
             "ODBC function escape syntax around {} is not supported by reverse translation",
             func.name
         )));
+    }
+    if let Some(clock) = super::temporal::reverse_clock(func)? {
+        return Ok(clock);
+    }
+    if let Some(operation) = super::temporal::classify(&func.name, options) {
+        return super::temporal::reverse(func, operation, schema, options);
     }
 
     // Recognize NULLIF(json_group_array(x), '[]') and restore json_agg(x).
@@ -1095,80 +883,9 @@ pub fn reverse_translate_function(
             )?;
             Ok(with_default_separator(reversed))
         }
-        FunctionReversal::ToChar(template) => {
-            // SQLite writes the format first, PostgreSQL writes it second.
-            let exprs = extract_exactly(&func.args, 2, "strftime")?;
-            let timestamp =
-                crate::prelude::ReverseTranslator::reverse_translate(exprs[1], schema, options)?;
-            Ok(simple_function_expr("to_char", vec![timestamp, string_literal(&template)], None))
-        }
-        FunctionReversal::ToTimestamptz => {
-            let exprs = extract_exactly(&func.args, 2, "strftime")?;
-            let timestamp =
-                crate::prelude::ReverseTranslator::reverse_translate(exprs[1], schema, options)?;
-            Ok(Expr::Cast {
-                expr: Box::new(timestamp),
-                data_type: DataType::Timestamp(None, TimezoneInfo::Tz),
-                format: None,
-                kind: CastKind::DoubleColon,
-            })
-        }
         FunctionReversal::ToNow => {
             // datetime('now') -> NOW()
             Ok(simple_function_expr("NOW", vec![], None))
-        }
-        FunctionReversal::ToAtTimeZone(time_zone) => {
-            let FunctionArguments::List(list) = &func.args else {
-                debug_assert!(
-                    false,
-                    "reverse_function classified datetime as ToAtTimeZone without list args"
-                );
-                unreachable!(
-                    "internal invariant violation in datetime AT TIME ZONE reverse translation"
-                );
-            };
-            debug_assert!(
-                (1..=2).contains(&list.args.len()),
-                "reverse_function classified datetime as ToAtTimeZone with {} args",
-                list.args.len()
-            );
-            let timestamp_expr = function_arg_expr_or_err(
-                list.args
-                    .first()
-                    .expect("reverse_function must provide datetime timestamp argument"),
-            )?;
-            let reversed_timestamp = crate::prelude::ReverseTranslator::reverse_translate(
-                timestamp_expr,
-                schema,
-                options,
-            )?;
-
-            let zone = at_time_zone_for_modifier(time_zone, &reversed_timestamp, schema, options)?;
-            Ok(Expr::AtTimeZone {
-                timestamp: Box::new(reversed_timestamp),
-                time_zone: Box::new(Expr::Value(ValueWithSpan {
-                    value: Value::SingleQuotedString(zone),
-                    span: sqlparser::tokenizer::Span::empty(),
-                })),
-            })
-        }
-        FunctionReversal::ToExtract(field) => {
-            // strftime('%Y', expr) -> EXTRACT(YEAR FROM expr)
-            if let FunctionArguments::List(list) = &func.args
-                && list.args.len() == 2
-                && let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))) = list.args.get(1)
-            {
-                let reversed_expr =
-                    crate::prelude::ReverseTranslator::reverse_translate(expr, schema, options)?;
-                return Ok(Expr::Extract {
-                    field,
-                    syntax: sqlparser::ast::ExtractSyntax::From,
-                    expr: Box::new(reversed_expr),
-                });
-            }
-            Err(Error::reverse_refusal(
-                "Invalid strftime arguments for EXTRACT conversion".to_string(),
-            ))
         }
         FunctionReversal::ToPosition => {
             // INSTR(str, substr) -> POSITION(substr IN str)
@@ -1269,38 +986,6 @@ pub fn reverse_translate_function(
                 trim_what: Some(Box::new(reversed_char)),
                 trim_characters: None,
             })
-        }
-        FunctionReversal::ToTimestampFromEpoch => {
-            let FunctionArguments::List(list) = &func.args else {
-                return Err(Error::reverse_refusal(
-                    "datetime unixepoch requires list arguments".to_string(),
-                ));
-            };
-            let epoch_expr = function_arg_expr_or_err(
-                list.args.first().expect("datetime must have epoch argument"),
-            )?;
-            let reversed_epoch =
-                crate::prelude::ReverseTranslator::reverse_translate(epoch_expr, schema, options)?;
-            Ok(simple_function_expr("to_timestamp", vec![reversed_epoch], None))
-        }
-        FunctionReversal::ToDateTrunc(field) => {
-            let FunctionArguments::List(list) = &func.args else {
-                return Err(Error::reverse_refusal(
-                    "strftime requires list arguments for date_trunc reversal".to_string(),
-                ));
-            };
-            let ts_expr = function_arg_expr_or_err(
-                list.args.get(1).expect("strftime must have timestamp argument"),
-            )?;
-            let reversed_ts =
-                crate::prelude::ReverseTranslator::reverse_translate(ts_expr, schema, options)?;
-            let translated_over =
-                reverse_translate_window_type(func.over.as_ref(), schema, options, &mut |_| {})?;
-            Ok(simple_function_expr(
-                "date_trunc",
-                vec![string_literal(&field), reversed_ts],
-                translated_over,
-            ))
         }
         FunctionReversal::ToCastAsJsonb => {
             // json(x) -> CAST(x AS JSONB)
@@ -1587,51 +1272,6 @@ pub fn reverse_translate_function(
                 crate::prelude::ReverseTranslator::reverse_translate(exprs[0], schema, options)?;
             Ok(simple_function_expr("decode", vec![inner, string_literal("hex")], None))
         }
-        FunctionReversal::ToExtractEpoch => {
-            let exprs = function_argument_exprs(&func.args);
-            let value = match exprs.as_slice() {
-                // No argument: current time as whole seconds; extract carries a
-                // fraction.
-                [] => return Ok(current_epoch_seconds()),
-                // One argument: SQLite truncates toward zero, same as floor.
-                [value] => {
-                    let inner = crate::prelude::ReverseTranslator::reverse_translate(
-                        *value, schema, options,
-                    )?;
-                    let extract = Expr::Extract {
-                        field: DateTimeField::Epoch,
-                        syntax: ExtractSyntax::From,
-                        expr: Box::new(inner),
-                    };
-                    return Ok(Expr::Cast {
-                        expr: Box::new(simple_function_expr("floor", vec![extract], None)),
-                        data_type: DataType::BigInt(None),
-                        format: None,
-                        kind: CastKind::DoubleColon,
-                    });
-                }
-                [
-                    value,
-                    Expr::Value(ValueWithSpan {
-                        value: Value::SingleQuotedString(modifier), ..
-                    }),
-                ] if modifier == "subsec" => value,
-                _ => {
-                    return Err(Error::reverse_refusal(
-                        "unixepoch reverses as unixepoch(), unixepoch(x) or \
-                     unixepoch(x, 'subsec'). Any other modifier has no PostgreSQL form."
-                            .to_string(),
-                    ));
-                }
-            };
-            let inner =
-                crate::prelude::ReverseTranslator::reverse_translate(*value, schema, options)?;
-            Ok(Expr::Extract {
-                field: DateTimeField::Epoch,
-                syntax: ExtractSyntax::From,
-                expr: Box::new(inner),
-            })
-        }
         FunctionReversal::ToSessionVariable(mapping) => {
             session_variable::reverse_expression(&mapping, options)
         }
@@ -1659,31 +1299,6 @@ pub fn reverse_translate_function(
                 within_group: vec![],
             }))
         }
-        FunctionReversal::ToZoneConversion { to_local } => {
-            let (value, zone) = match function_argument_exprs(&func.args)[..] {
-                [value, zone] if single_quoted_literal(zone).is_some() => (value, zone),
-                _ => {
-                    return Err(Error::reverse_refusal(format!(
-                        "{}() is a zone function named with with_time_zone_functions, which \
-                         takes a value and the zone's name as a string literal, and this call \
-                         does not, so it has no AT TIME ZONE to become.",
-                        func.name
-                    )));
-                }
-            };
-            let value =
-                crate::prelude::ReverseTranslator::reverse_translate(value, schema, options)?;
-            let timezone = if to_local { TimezoneInfo::WithTimeZone } else { TimezoneInfo::None };
-            Ok(Expr::AtTimeZone {
-                timestamp: Box::new(Expr::Cast {
-                    expr: Box::new(value),
-                    data_type: DataType::Timestamp(None, timezone),
-                    format: None,
-                    kind: CastKind::DoubleColon,
-                }),
-                time_zone: Box::new(zone.clone()),
-            })
-        }
         FunctionReversal::Reject(msg) => Err(Error::reverse_refusal(msg)),
         FunctionReversal::PassThrough => {
             build_reverse_function(func.name.clone(), func, &func.args, schema, options)
@@ -1703,7 +1318,6 @@ mod tests {
         impls::{
             function_helpers::function_arg_expr_or_err,
             test_fixtures::{empty_schema, parse_expr, parse_query},
-            timezone::is_fixed_utc_offset,
         },
         prelude::Pg2SqliteOptions,
     };
@@ -1844,13 +1458,6 @@ mod tests {
     }
 
     #[test]
-    fn fixed_offset_validator_rejects_non_digit_offsets() {
-        assert!(!is_fixed_utc_offset("+0x:00"));
-        assert!(!is_fixed_utc_offset("+24:00"));
-        assert!(is_fixed_utc_offset("+23:59"));
-    }
-
-    #[test]
     fn extract_expr_and_datetime_reverse_translation_reject_wildcards() {
         let wildcard = FunctionArg::Unnamed(FunctionArgExpr::Wildcard);
         let err = function_arg_expr_or_err(&wildcard).expect_err("wildcard should be rejected");
@@ -1870,7 +1477,7 @@ mod tests {
         let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
         let err = reverse_translate_function(&func, &schema, &options)
             .expect_err("datetime wildcard argument should be rejected");
-        assert!(err.to_string().contains("Expected expression argument"));
+        assert!(err.to_string().contains("modifier argument"));
     }
 
     #[test]

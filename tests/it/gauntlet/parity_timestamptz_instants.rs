@@ -4,15 +4,13 @@
 //! an offset, and a time of day given the zone's offset.
 
 use diesel::{data_types::PgTimestamp, prelude::*, sqlite::SqliteConnection};
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+use pg2sqlite::prelude::{Pg2Sqlite, TemporalFunctions};
 
 use super::{
     harness::execute_ddl,
-    timestamptz_harness::{
-        Events, GRANT, ROLES, TABLE, expected, instant, options, refusal, zoned, zones,
-    },
+    timestamptz_harness::{Events, ROLES, expected, instant, options, refusal, zoned, zones},
 };
-use crate::helpers::{postgres as postgres_harness, zone_functions};
+use crate::helpers::postgres as postgres_harness;
 
 /// The instant `at` holds, 2026-10-24 23:30:00.25 UTC.
 const AT: &str = "2026-10-24 23:30:00.25+00";
@@ -139,7 +137,9 @@ fn a_wall_clock_default_of_an_instant_column_reads_in_the_zone() {
             .unwrap_or_else(|error| panic!("pg2sqlite refused the table under {zone}: {error}"))
             .into_vec();
         let mut replica = SqliteConnection::establish(":memory:").expect("open SQLite");
-        zone_functions::register(&mut replica);
+        TemporalFunctions::default()
+            .register(&mut replica)
+            .expect("register the temporal functions");
         execute_ddl(&mut replica, &statements);
         diesel::insert_into(replica_schema::d::table)
             .values(replica_schema::d::id.eq(1))
@@ -276,49 +276,32 @@ fn a_conversion_without_a_zone_names_what_is_missing() {
         "time '12:00'::timetz",
         "(at > '2026-10-25 01:00')",
     ] {
-        let error = refusal(expression, &Pg2SqliteOptions::default());
+        let error = refusal(expression, &crate::helpers::function_options());
         assert!(error.contains("with_deployment"), "{expression}: {error}");
     }
-    for expression in ["ts::timestamptz", "(at > ts)", "time '12:00'::timetz"] {
-        let error = refusal(expression, &zoned("Europe/Rome"));
-        assert!(error.contains("with_time_zone_functions"), "{expression}: {error}");
-    }
-    // Text is read at translation time, so a zone with transitions needs no
-    // registered function.
     let same = "(timestamptz '2026-10-25 02:30' = timestamptz '2026-10-25 01:30+00')";
     assert_eq!(EVENTS.sqlite(ROLES, same, &zoned("Europe/Rome")), "true");
 }
 
-/// Offset-less text whose instant falls past the year 9999 once moved to UTC
-/// is refused, since the replica holds a `timestamptz` as UTC text with a
-/// four-digit year.
 #[test]
-fn text_read_past_the_replicas_years_is_refused() {
-    let error = refusal("timestamptz '9999-12-31 23:30'", &options("America/New_York"));
-    assert!(
-        error.contains(
-            "\"9999-12-31 23:30\" falls outside the years 1 to 9999 once it is moved to UTC"
-        ),
-        "{error}"
-    );
+fn text_at_the_end_of_the_zone_databases_years_matches_postgresql() {
+    let expression = "timestamptz '9999-12-31 23:30'";
+    let source = EVENTS.postgres("America/New_York", expression);
+    EVENTS.assert_parity("America/New_York", expression, &options("America/New_York"), &source);
 }
 
-/// A conversion reading its operand twice refuses one that cannot be
-/// replayed.
 #[test]
-fn a_conversion_reading_its_operand_twice_refuses_a_volatile_one() {
+fn subquery_conversions_match_postgresql() {
     for expression in
         ["(SELECT e.ts FROM events AS e)::timestamptz", "(at > (SELECT e.ts FROM events AS e))"]
     {
-        let error = refusal(expression, &zoned("+05:30"));
-        assert!(error.contains("once"), "{expression}: {error}");
+        let source = EVENTS.postgres("+05:30", expression);
+        assert_eq!(EVENTS.sqlite(ROLES, expression, &zoned("+05:30")), source);
     }
-    let error = Pg2Sqlite::default()
-        .sql(&format!(
-            "{ROLES}{TABLE}{GRANT}UPDATE events SET at = (SELECT e.ts FROM events AS e);"
-        ))
-        .and_then(|source| source.translate(&zoned("+05:30")))
-        .expect_err("the assignment reads the subquery twice")
-        .to_string();
-    assert!(error.contains("once"), "{error}");
+    EVENTS.assert_assignment(
+        "+05:30",
+        "(SELECT e.ts FROM events AS e)",
+        &zoned("+05:30"),
+        "2026-10-24 23:30:00-05:30",
+    );
 }

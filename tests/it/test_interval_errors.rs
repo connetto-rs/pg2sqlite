@@ -99,17 +99,9 @@ fn test_interval_in_arithmetic() -> Result<(), Box<dyn std::error::Error>> {
 /// Translates `sql` and returns the first value of its single emitted
 /// statement, as text.
 fn translated_value(sql: &str) -> String {
-    let statements = Pg2Sqlite::default()
-        .sql(&utc_script(sql))
-        .expect("parse")
-        .translate_to_sql(&utc_request())
-        .expect("translation")
-        .into_vec();
-    let probe = statements.last().expect("a select").clone();
-    let connection = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
-    connection
-        .query_row(&probe, [], |row| row.get::<_, String>(0))
-        .unwrap_or_else(|error| panic!("probe failed: {error}\n{probe}"))
+    crate::helpers::run_translated::run_translated_with(&utc_script(sql), &utc_request())
+        .remove(0)
+        .expect("interval value")
 }
 
 /// Two intervals added answer PostgreSQL's literal: the fields summed and

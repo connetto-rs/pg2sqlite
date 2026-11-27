@@ -30,7 +30,7 @@ pub fn run_translated_with(pg: &str, options: &Pg2SqliteOptions) -> Vec<Option<S
 /// Panics when translation fails, when an emitted statement will not execute,
 /// or when the script emits nothing.
 pub fn run_translated_default(pg: &str) -> Vec<Option<String>> {
-    run_translated_with(pg, &super::jsonb_functions::with_functions(Pg2SqliteOptions::default()))
+    run_translated_with(pg, &super::function_options())
 }
 
 /// [`run_translated_with`] with `params` bound as text to the last
@@ -46,6 +46,25 @@ pub fn run_translated_bound_with(
     options: &Pg2SqliteOptions,
     params: &[&str],
 ) -> Vec<Option<String>> {
+    try_run_translated_bound_with(pg, options, params)
+        .unwrap_or_else(|error| panic!("emitted probe failed: {error}"))
+}
+
+/// Executes translated SQL and returns any SQLite execution error.
+///
+/// # Errors
+///
+/// Returns an error when an emitted statement fails.
+///
+/// # Panics
+///
+/// Panics when translation or function registration fails, or the script is
+/// empty.
+pub fn try_run_translated_bound_with(
+    pg: &str,
+    options: &Pg2SqliteOptions,
+    params: &[&str],
+) -> Result<Vec<Option<String>>, diesel::result::Error> {
     let script =
         Pg2Sqlite::default().sql(pg).expect("parse").translate_to_sql(options).expect("translate");
     let mut connection = super::establish_connection();
@@ -56,21 +75,18 @@ pub fn run_translated_bound_with(
     let probe = statements.pop().expect("script should emit at least one statement");
 
     for statement in &statements {
-        diesel::sql_query(statement)
-            .execute(&mut connection)
-            .unwrap_or_else(|error| panic!("emitted setup failed: {error}\n{statement}"));
+        diesel::sql_query(statement).execute(&mut connection)?;
     }
 
     let mut query = diesel::sql_query(&probe).into_boxed::<Sqlite>();
     for parameter in params {
         query = query.bind::<Text, _>(*parameter);
     }
-    query
-        .load::<DynamicRow<NamedField<TextCell>>>(&mut connection)
-        .unwrap_or_else(|error| panic!("emitted probe failed: {error}\n{probe}"))
+    Ok(query
+        .load::<DynamicRow<NamedField<TextCell>>>(&mut connection)?
         .into_iter()
         .map(first_column_text)
-        .collect()
+        .collect())
 }
 
 /// [`run_translated_with`] for a request whose `TimeZone` is UTC, `pg` led by

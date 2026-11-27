@@ -8,16 +8,20 @@
 //! compared, and PostgreSQL's own text is checked against what 18.6 answered
 //! when the case was written.
 //!
-//! A zone with transitions needs the two SQLite functions the application
-//! registers, [`zone_functions::register`], backed by sql-values.
+//! The replica reads every zone through the temporal functions the
+//! application registers, `TemporalFunctions::register`.
 
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, TemporalFunction, TemporalFunctions};
 use sql_traits::structs::Deployment;
 
 use super::timestamptz_harness::{
     Events, GRANT, ROLES, TABLE, instant, options, refusal, select, sqlite_query, translate, zoned,
 };
-use crate::helpers::zone_functions;
+
+/// The registered name of `function`.
+fn name(function: TemporalFunction) -> String {
+    TemporalFunctions::default().name(function)
+}
 
 /// `at` is 2026-10-25 12:00 in Rome, on the day its clocks go back.
 const AT: &str = "2026-10-25 11:00:00+00";
@@ -107,14 +111,12 @@ fn a_fixed_offset_adds_days_and_months_on_its_local_calendar() {
     }
 }
 
-/// An interval of hours alone moves the instant in every zone, so it needs no
-/// zone at all, the UTC wall clock reading the result without one either.
 #[test]
-fn an_interval_without_months_or_days_needs_no_zone() {
+fn an_interval_without_months_or_days_moves_the_instant() {
     EVENTS.assert_parity(
         "Europe/Rome",
         "(at + interval '2 hours') AT TIME ZONE 'UTC'",
-        &Pg2SqliteOptions::default(),
+        &options("Europe/Rome"),
         "2026-10-25 13:00:00",
     );
 }
@@ -126,7 +128,7 @@ fn timestamp_arithmetic_needs_no_zone() {
     EVENTS.assert_parity(
         "Europe/Rome",
         "timestamp '2026-03-28 12:00' + interval '1 day'",
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::function_options(),
         "2026-03-29 12:00:00",
     );
     // The read-back settles in UTC, where the zone is the calendar.
@@ -134,21 +136,18 @@ fn timestamp_arithmetic_needs_no_zone() {
         .expect("localtimestamp is a timestamp");
 }
 
-/// A date and a time of day add up to a `timestamp`, or a `timestamptz` for a
-/// `timetz`, which SQLite has no operator to build, so the shift over the sum
-/// is refused for the sum.
 #[test]
-fn a_shift_over_a_date_and_time_sum_is_refused_for_the_sum() {
+fn a_shift_over_a_date_and_time_sum_matches_postgresql() {
     for time in ["time '10:00'", "timetz '10:00+00'"] {
-        let error =
-            refusal(&format!("(date '2026-01-01' + {time}) + interval '1 day'"), &zoned("UTC"));
-        assert!(error.contains("pairs a date with a time of day"), "{error}");
+        let expression = format!("(date '2026-01-01' + {time}) + interval '1 day'");
+        let source = EVENTS.postgres("UTC", &expression);
+        EVENTS.assert_parity("UTC", &expression, &options("UTC"), &source);
     }
 }
 
 #[test]
 fn calendar_arithmetic_without_a_zone_names_the_deployment() {
-    let error = refusal("at - interval '1 day'", &Pg2SqliteOptions::default());
+    let error = refusal("at - interval '1 day'", &crate::helpers::function_options());
     assert!(error.contains("with_deployment"), "{error}");
 }
 
@@ -161,7 +160,7 @@ fn a_request_without_an_acting_role_runs_in_the_login_zone() {
         .expect("a valid deployment");
     let options = Pg2SqliteOptions::default()
         .with_deployment(deployment)
-        .with_time_zone_functions(zone_functions::functions());
+        .with_temporal_functions(TemporalFunctions::default());
     EVENTS.assert_parity(
         "Europe/Rome",
         "at - interval '1 day'",
@@ -182,7 +181,9 @@ fn the_role_settings_choose_the_zone() {
             .and_then(|deployment| deployment.with_default_time_zone("UTC"))
             .expect("a valid deployment")
     };
-    let login = Pg2SqliteOptions::default().with_deployment(deployment());
+    let login = Pg2SqliteOptions::default()
+        .with_deployment(deployment())
+        .with_temporal_functions(TemporalFunctions::default());
     EVENTS.assert_parity_with(
         roles,
         "+05:30",
@@ -193,7 +194,7 @@ fn the_role_settings_choose_the_zone() {
     let acting = Pg2SqliteOptions::default()
         .with_deployment(deployment().with_acting_role_settings())
         .with_acting_role("app")
-        .with_time_zone_functions(zone_functions::functions());
+        .with_temporal_functions(TemporalFunctions::default());
     EVENTS.assert_parity_with(
         roles,
         "Europe/Rome",
@@ -206,7 +207,8 @@ fn the_role_settings_choose_the_zone() {
 #[test]
 fn a_deployment_without_a_zone_is_refused() {
     let deployment = Deployment::new("postgres", ["app"], []).expect("a valid deployment");
-    let options = Pg2SqliteOptions::default().with_deployment(deployment).with_acting_role("app");
+    let options =
+        crate::helpers::function_options().with_deployment(deployment).with_acting_role("app");
     let error = refusal("at::date", &options);
     assert!(error.contains("with_default_time_zone"), "{error}");
 }
@@ -218,28 +220,57 @@ fn a_deployment_role_the_schema_does_not_declare_is_refused() {
     let deployment = Deployment::new("authenticator", ["app"], [])
         .and_then(|deployment| deployment.with_default_time_zone("UTC"))
         .expect("a valid deployment");
-    let error = refusal("at::date", &Pg2SqliteOptions::default().with_deployment(deployment));
+    let error =
+        refusal("at::date", &crate::helpers::function_options().with_deployment(deployment));
     assert!(error.contains("authenticator"), "{error}");
 }
 
 #[test]
 fn a_zone_with_transitions_without_the_functions_names_the_option() {
     for expression in ["at::date", "(at - span)::timestamptz"] {
-        let error = refusal(expression, &zoned("Europe/Rome"));
-        assert!(error.contains("with_time_zone_functions"), "{error}");
+        let deployment = Deployment::new("postgres", ["app"], [])
+            .and_then(|deployment| deployment.with_default_time_zone("Europe/Rome"))
+            .expect("a valid deployment");
+        let error = refusal(expression, &Pg2SqliteOptions::default().with_deployment(deployment));
+        assert!(error.contains("with_temporal_functions"), "{error}");
     }
 }
 
-/// A bind parameter's type is not settled by the statement, and could be a
-/// `timestamptz`, whose calendar is the zone's.
 #[test]
-fn an_operand_of_unsettled_type_is_refused_outside_utc() {
-    let unsettled = "($1 - interval '1 day') IS NULL";
-    for options in [Pg2SqliteOptions::default(), options("Europe/Rome"), zoned("+05:30")] {
-        let error = refusal(unsettled, &options);
-        assert!(error.contains("adds days or months"), "{error}");
+fn an_interval_operand_settles_a_bound_parameter() {
+    use diesel::{
+        prelude::*,
+        sql_types::{Nullable, Text},
+    };
+
+    #[derive(QueryableByName)]
+    struct Answer {
+        #[diesel(sql_type = Text)]
+        val: String,
     }
-    translate(unsettled, &zoned("UTC")).expect("UTC answers either type alike");
+
+    let expression = "($1 - interval '1 day') IS NULL";
+    for zone in ["Europe/Rome", "+05:30", "UTC"] {
+        let configured = options(zone);
+        let query = translate(expression, &configured)
+            .expect("infer the interval operand")
+            .pop()
+            .expect("the translated query")
+            .to_string();
+        let mut replica = EVENTS.replica(ROLES, &configured);
+        for (parameter, literal) in
+            [(Some("2 days"), "interval '2 days'"), (None, "NULL::interval")]
+        {
+            // The translated parameterized query has no typed DSL
+            // representation.
+            let answer = diesel::sql_query(&query)
+                .bind::<Nullable<Text>, _>(parameter)
+                .get_result::<Answer>(&mut replica)
+                .expect("execute the inferred interval operation");
+            let source = EVENTS.postgres(zone, &expression.replace("$1", literal));
+            assert_eq!(answer.val, source, "{zone} {parameter:?}");
+        }
+    }
 }
 
 /// A call to a zone function reverses to `AT TIME ZONE` in the zone it names,
@@ -255,9 +286,15 @@ fn a_zone_function_reverses_to_at_time_zone() {
         .expect("build the schema");
     let mut replica = EVENTS.replica(ROLES, &options);
     for (call, expected) in [
-        (format!("{}(at, 'Europe/Rome')", zone_functions::LOCAL_CLOCK), "2026-10-25 12:00:00"),
         (
-            format!("{}('2026-10-25 02:30:00', 'Europe/Rome')", zone_functions::INSTANT),
+            format!("{}('Europe/Rome', at)", name(TemporalFunction::TimestampTzAtZone)),
+            "2026-10-25 12:00:00",
+        ),
+        (
+            format!(
+                "{}('Europe/Rome', '2026-10-25 02:30:00')",
+                name(TemporalFunction::TimestampAtZone)
+            ),
             "2026-10-25 01:30:00+00",
         ),
     ] {
@@ -276,31 +313,14 @@ fn a_zone_function_reverses_to_at_time_zone() {
     }
 }
 
-#[test]
-fn a_zone_function_call_without_a_literal_zone_is_refused_in_reverse() {
-    let options = options("Europe/Rome");
-    let schema = Pg2Sqlite::default()
-        .sql(&format!("{ROLES}{TABLE}{GRANT}"))
-        .and_then(|source| source.build_schema())
-        .expect("build the schema");
-    let error = Pg2Sqlite::default()
-        .reverse_sql(
-            &select(&format!("{}(at, span)", zone_functions::LOCAL_CLOCK)),
-            &schema,
-            &options,
-        )
-        .expect_err("the zone is not a literal");
-    assert!(error.to_string().contains("with_time_zone_functions"), "{error}");
-}
-
 /// A source calling a zone function by name reaches the replica unchanged,
 /// since naming the functions says the replica registers them.
 #[test]
 fn a_source_calling_a_zone_function_keeps_the_call() {
-    let call = format!("{}(at, 'Europe/Rome')", zone_functions::LOCAL_CLOCK);
+    let call = format!("{}('Europe/Rome', at)", name(TemporalFunction::TimestampTzAtZone));
     // The read-back is settled in UTC, where it needs no zone of its own.
     let answer = EVENTS.sqlite(ROLES, &call, &options("UTC"));
     assert_eq!(answer, "2026-10-25 12:00:00");
-    let error = refusal(&call, &zoned("UTC"));
-    assert!(error.contains(zone_functions::LOCAL_CLOCK), "{error}");
+    let error = refusal(&call, &Pg2SqliteOptions::default());
+    assert!(error.contains(&name(TemporalFunction::TimestampTzAtZone)), "{error}");
 }

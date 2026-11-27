@@ -11,6 +11,7 @@ use crate::no_std::prelude::*;
 use crate::{
     errors::{Error, TranslationRefusal},
     initialization::InitializationPlan,
+    traits::TemporalFunctions,
 };
 
 /// Why the connection part cannot be produced.
@@ -91,6 +92,10 @@ pub struct Script<S = Statement> {
     /// The helpers the script's statements call as table-valued functions,
     /// connection state every connection registers before running any part.
     pub functions: Vec<HelperFunction<S>>,
+    /// The temporal functions the translation calls, which every connection
+    /// registers before running any part, or `None` when the translation was
+    /// not given any.
+    pub temporal: Option<TemporalFunctions>,
 }
 
 impl<S> Script<S> {
@@ -166,15 +171,16 @@ impl<S> Script<S> {
                     }
                 })
                 .collect(),
+            temporal: self.temporal,
         }
     }
 }
 
 #[cfg(feature = "diesel")]
 impl<S: core::fmt::Display> Script<S> {
-    /// Registers every helper function on `connection`, with the typmod
-    /// rounding functions the translation calls, which a connection does
-    /// before running any part of the script.
+    /// Registers every helper function on `connection`, with the temporal
+    /// functions the translation calls, which a connection does before
+    /// running any part of the script.
     ///
     /// # Errors
     ///
@@ -183,7 +189,9 @@ impl<S: core::fmt::Display> Script<S> {
         &self,
         connection: &mut diesel::sqlite::SqliteConnection,
     ) -> diesel::QueryResult<()> {
-        pg2sqlite_runtime::TypmodRounding::register(connection)?;
+        if let Some(temporal) = &self.temporal {
+            temporal.register(connection)?;
+        }
         self.functions.iter().try_for_each(|function| function.register(connection))
     }
 }

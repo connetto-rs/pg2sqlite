@@ -161,13 +161,8 @@ fn plpgsql_insert_on_conflict_transformed() {
 
 #[test]
 fn plpgsql_if_condition_translates_now() {
-    // IF condition contains now() — it should be translated to datetime('now')
-    // rather than silently falling back to raw PG text
-    let options = uuid_options().with_deployment(
-        helpers::deployment::deployment([], [])
-            .with_default_time_zone("UTC")
-            .expect("PostgreSQL accepts UTC"),
-    );
+    let options =
+        helpers::deployment::utc_request().with_uuid_representation(UuidRepresentation::Blob);
     let sql = translate_sql(
         &helpers::deployment::utc_script(
             r#"
@@ -188,12 +183,7 @@ fn plpgsql_if_condition_translates_now() {
     .unwrap();
     let lower = sql.to_lowercase();
 
-    // now() in the IF condition should be translated to datetime('now')
-    // NOT left as raw "now()" PG text
-    assert!(
-        !lower.contains("now()"),
-        "now() should be translated to datetime('now') in IF condition: {sql}"
-    );
+    assert!(!lower.contains("now()"), "the condition must translate `now()`: {sql}");
     exec_translated_str(&sql);
 }
 

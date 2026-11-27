@@ -9,8 +9,8 @@ use sqlparser::{
     ast::{
         AccessExpr, Array, ArrayElemTypeDef, BinaryOperator, CaseWhen, CastKind, DataType,
         DateTimeField, ExactNumberInfo, Expr, Function, FunctionArg, FunctionArgExpr, Ident,
-        InTarget, Interval, JsonKeyUniqueness, JsonPredicateType, ObjectName, ObjectNamePart,
-        Query, SelectItem, SetExpr, Subscript, TableAlias, TableFactor, UnaryOperator, Value,
+        InTarget, JsonKeyUniqueness, JsonPredicateType, ObjectName, ObjectNamePart, Query,
+        SelectItem, SetExpr, Subscript, TableAlias, TableFactor, UnaryOperator, Value,
         ValueWithSpan, helpers::attached_token::AttachedToken,
     },
     tokenizer::Span,
@@ -20,20 +20,15 @@ use sqlparser::{
 use crate::no_std::prelude::*;
 use crate::{
     impls::{
-        datetime_helpers::{
-            DatePartKey, canonical_timestamptz_text, datetime_field_key,
-            is_offset_less_timestamp_call, local_timestamp_text,
-        },
         expr_helpers::{
             case_when, for_each_child_expr, not_predicate, null_safe_eq, null_safe_neq, rebuild,
         },
         function_helpers::{
-            array_constructor_subquery, integer_literal, integer_literal_value, number_literal,
+            array_constructor_subquery, integer_literal, number_literal,
             plain_catalog_function_args, simple_function_expr, single_quoted_literal,
             string_literal,
         },
         idioms::{delimited_membership, single_character},
-        interval::{ClockShift, IntervalShift, interval_shift, interval_shift_scaled},
         object_name::{
             fts_table_name, last_ident_value_or_display, postgres_catalog_function_name,
             quoted_ident,
@@ -42,7 +37,6 @@ use crate::{
             from_relation, plain_table_factor, single_expr_query, table_function_factor,
         },
         replay::{is_replayable, reject_duplicated_operand},
-        request_zone::RequestZone,
         session_variable,
         shared_helpers::{
             DeclaredCollation, declared_in_scope, declared_numeric_precision,
@@ -52,14 +46,7 @@ use crate::{
             rescale_minor_units, scale_decimal_literal, scale_of, scale_parameter,
             scope_declines_column, translate_expr_recursive,
         },
-        temporal_arithmetic::{
-            TemporalKind, epoch_of_temporal_difference, from_year_one, temporal_kind_of,
-            translate_temporal_binary_op, trim_trailing_zeros,
-        },
-        timezone::{
-            TimestampAwareness, flipped_shifting_offset, normalize_timezone_modifier_for_sqlite,
-            timestamp_awareness,
-        },
+        temporal_arithmetic::{TemporalKind, temporal_kind_of, translate_temporal_binary_op},
         translator_impls::{
             array::{
                 self, Quantifier, array_concat, array_overlap, is_json_array_representation,
@@ -76,7 +63,6 @@ use crate::{
             uuid::uuid_as_text,
             vector::{UnstoredVector, is_vector_data_type},
         },
-        zone_clock::{RegisteredClock, ZoneClock, zone_clock},
     },
     traits::translator::TranslatorWithContext,
 };
@@ -240,12 +226,7 @@ fn translate_fts_expression(
     Ok(key.matched_by(key_reference, matching))
 }
 
-/// Translate PostgreSQL EXTRACT(field FROM expr) to SQLite
-/// CAST(strftime(format, expr) AS INTEGER).
-///
-/// PostgreSQL's EXTRACT returns a numeric value, while SQLite's strftime
-/// returns a string. We wrap the strftime call in CAST to maintain numeric
-/// semantics.
+/// Reads a temporal field as numeric minor units.
 fn translate_extract(
     field: &DateTimeField,
     expr: &Expr,
@@ -253,43 +234,14 @@ fn translate_extract(
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Expr, crate::errors::Error> {
-    if crate::impls::expression_type::is_interval_typed(expr, schema, options) {
-        return Err(crate::errors::Error::forward_refusal(
-            "extract over an interval cannot be translated: reading a field out of an interval \
-             is a value read the replica does not translate. Read the stored text in the \
-             application."
-                .to_string(),
-        ));
-    }
-    // The offset fields answer the instant's UTC offset, not a wall clock.
-    let unit = match field {
-        DateTimeField::Timezone => Some("timezone"),
-        DateTimeField::TimezoneHour => Some("timezone_hour"),
-        DateTimeField::TimezoneMinute => Some("timezone_minute"),
-        _ => None,
-    };
-    if let Some(unit) = unit {
-        let operation = format!("extract({unit} from {expr})");
-        return crate::impls::zone_clock::zoned_offset_of(
-            unit, expr, &operation, schema, options, emit,
-        );
-    }
-    let key = datetime_field_key(field).ok_or_else(|| {
-        crate::errors::Error::forward_refusal(format!(
-            "EXTRACT({field}) is not supported in SQLite. Supported fields: \
-             YEAR, MONTH, DAY, HOUR, MINUTE, SECOND, DOW, DOY, EPOCH, WEEK, ISODOW, ISOYEAR."
-        ))
-    })?;
-    // `extract(epoch from (a - b))` asks for the seconds in a difference
-    // PostgreSQL answers as an interval, which erases the interval before it
-    // needs a value of its own.
-    if key == DatePartKey::Epoch
-        && let Some(result) = epoch_of_temporal_difference(expr, schema, options, emit)
-    {
-        return result;
-    }
-    let operation = format!("extract({field} from {expr})");
-    crate::impls::zone_clock::zoned_date_part(key, expr, &operation, schema, options, emit)
+    crate::impls::translator_impls::function::translate_temporal_field(
+        &field.to_string(),
+        expr,
+        true,
+        schema,
+        options,
+        emit,
+    )
 }
 /// True when `expr` is an array: an `ARRAY[...]` literal, or a column declared
 /// with an array type.
@@ -1598,19 +1550,6 @@ fn translate_overlay(
     })
 }
 
-/// Return true when value is a SQLite-supported fixed UTC offset (`+HH:MM`,
-/// `-HH:MM`).
-#[cfg(all(test, feature = "std"))]
-fn is_sqlite_fixed_offset(value: &str) -> bool {
-    crate::impls::timezone::is_fixed_utc_offset(value)
-}
-
-/// Normalize PostgreSQL AT TIME ZONE literal names to SQLite datetime
-/// modifiers.
-fn normalize_at_time_zone_modifier(value: &str) -> Option<String> {
-    normalize_timezone_modifier_for_sqlite(value)
-}
-
 /// `CAST(x AS NUMERIC(p,s))`, which moves `x` onto the scaled-integer
 /// representation rather than truncating it into a bare INTEGER.
 fn translate_numeric_cast(
@@ -1621,6 +1560,27 @@ fn translate_numeric_cast(
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Expr, crate::errors::Error> {
     let (_, target_scale) = numeric_precision_and_scale(info)?;
+    if matches!(expr, Expr::Value(ValueWithSpan { value: Value::Null, .. })) {
+        return Ok(expr.clone());
+    }
+    if let Some(text) = single_quoted_literal(expr) {
+        let number =
+            crate::impls::shared_helpers::quoted_decimal_as_number(text).ok_or_else(|| {
+                crate::errors::Error::forward_refusal(format!(
+                    "'{text}' cannot be represented as numeric minor units"
+                ))
+            })?;
+        if let Some(scaled) =
+            crate::impls::shared_helpers::scale_decimal_literal(&number, target_scale)?
+        {
+            return Ok(Expr::Cast {
+                kind: CastKind::Cast,
+                expr: Box::new(scaled),
+                data_type: DataType::Integer(None),
+                format: None,
+            });
+        }
+    }
     let translated = expr.translate_with_warnings(schema, options, emit)?;
 
     if let Some(source_scale) = scale_of(expr, schema, options) {
@@ -1640,115 +1600,71 @@ fn translate_numeric_cast(
     )))
 }
 
-/// Translate PostgreSQL `expr AT TIME ZONE '...'` to the SQLite text that
-/// keeps the fraction PostgreSQL prints.
-///
-/// The two PostgreSQL operations share this syntax and shift opposite ways: a
-/// naive timestamp moves toward UTC, an aware one away from it. Over
-/// `2023-01-15 12:00:00` with `'+05:30'` PostgreSQL answers 17:30 and 06:30.
-///
-/// The naive side ADDS because PostgreSQL reads a bare `'+05:30'` string as a
-/// POSIX zone, whose sign is the opposite of the ISO one. `AT TIME ZONE
-/// INTERVAL '05:30'` goes the other way and is not accepted here.
-///
-/// An aware operand's result is local timestamp text and a naive operand's
-/// is canonical `timestamptz` text, and the fraction is read from the operand's
-/// text, where a date function's `subsec` reading would cap it at three digits.
-fn translate_at_time_zone(
+pub(crate) fn translate_at_time_zone(
     timestamp: &Expr,
     time_zone: &Expr,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Expr, crate::errors::Error> {
-    let modifier = single_quoted_literal(time_zone)
-        .and_then(normalize_at_time_zone_modifier)
-        .ok_or_else(|| {
-            crate::errors::Error::forward_refusal(
-                "AT TIME ZONE supports only literal UTC or fixed offsets (+HH:MM/-HH:MM) in \
-                 SQLite translation."
-                    .to_string(),
-            )
-        })?;
-    if modifier == "localtime" {
-        return Err(crate::errors::Error::forward_refusal(format!(
-            "`{timestamp} AT TIME ZONE {time_zone}` reads the zone the PostgreSQL server's \
-             operating system runs in, which neither the request nor the replica knows. Name \
-             the zone, as `AT TIME ZONE 'Europe/Rome'`."
-        )));
-    }
-    // SQLite's `utc` modifier reads a value as local time, so UTC takes the
-    // operand's own text form.
-    if modifier == "utc" || modifier == "+00:00" || modifier == "-00:00" {
-        let awareness = timestamp_awareness(timestamp, schema, options).ok().flatten();
-        if matches!(awareness, Some(TimestampAwareness::Naive | TimestampAwareness::Aware)) {
-            require_replayable(timestamp, options)?;
+    use pg2sqlite_runtime::TemporalFunction;
+
+    use crate::impls::temporal_literals::TemporalLiteralKind;
+    let source_kind = crate::impls::temporal_casts::cast_source_kind(timestamp, schema, options)?;
+    let function = match source_kind {
+        Some(TemporalLiteralKind::Date | TemporalLiteralKind::Timestamp { zoned: true, .. }) => {
+            TemporalFunction::TimestampTzAtZone
         }
-        let translated = timestamp.translate_with_warnings(schema, options, emit)?;
-        return crate::impls::temporal_infinity::guard(
-            "AT TIME ZONE",
-            timestamp,
-            translated,
-            crate::impls::temporal_infinity::InfiniteAnswer::Same,
-            options,
-            |translated| {
-                Ok(match awareness {
-                    Some(TimestampAwareness::Naive) => canonical_timestamptz_text(translated, None),
-                    Some(TimestampAwareness::Aware) => local_timestamp_text(translated, None),
-                    None if is_offset_less_timestamp_call(&translated) => {
-                        local_timestamp_text(translated, None)
-                    }
-                    None => simple_function_expr("datetime", vec![translated], None),
-                })
-            },
-        );
-    }
-
-    let aware_shift = flipped_shifting_offset(&modifier)
-        .expect("every modifier left is a fixed offset that shifts");
-    let naive_shift = modifier;
-
-    let awareness = timestamp_awareness(timestamp, schema, options)?.ok_or_else(|| {
-        crate::errors::Error::forward_refusal(format!(
-            "AT TIME ZONE shifts a bare timestamp and a timestamptz in opposite directions, and \
-             `{timestamp}` is not known to be either, so either choice would be wrong half the \
-             time. Cast the operand, as `{timestamp}::timestamptz`, to say which it is."
-        ))
-    })?;
-    require_replayable(timestamp, options)?;
-    let translated = timestamp.translate_with_warnings(schema, options, emit)?;
-    // Either infinity is the same infinity in every zone.
-    crate::impls::temporal_infinity::guard(
-        "AT TIME ZONE",
-        timestamp,
-        translated,
-        crate::impls::temporal_infinity::InfiniteAnswer::Same,
-        options,
-        |translated| {
-            Ok(match awareness {
-                // A bare timestamp is read as local to the zone, so the result
-                // is the zone's instant in canonical `timestamptz` text.
-                TimestampAwareness::Naive => {
-                    canonical_timestamptz_text(translated, Some(&naive_shift))
-                }
-                // A timestamptz is already an instant, so the result is the
-                // zone's wall clock as local timestamp text.
-                TimestampAwareness::Aware => local_timestamp_text(translated, Some(&aware_shift)),
-            })
-        },
-    )
-}
-
-/// Refuses an `AT TIME ZONE` whose operand the slicing form would read twice.
-fn require_replayable(
-    operand: &Expr,
-    options: &crate::options::TranslationContext<'_>,
-) -> Result<(), crate::errors::Error> {
-    if crate::impls::replay::is_replayable(operand, options) {
-        Ok(())
+        Some(TemporalLiteralKind::Timestamp { zoned: false, .. }) => {
+            TemporalFunction::TimestampAtZone
+        }
+        Some(TemporalLiteralKind::Time { .. }) => TemporalFunction::TimeTzAtZone,
+        _ => {
+            return Err(crate::errors::Error::forward_refusal(
+                "AT TIME ZONE requires a timestamp, timestamptz or timetz operand.",
+            ));
+        }
+    };
+    let function = if crate::impls::expression_type::is_interval_typed(time_zone, schema, options) {
+        match function {
+            TemporalFunction::TimestampAtZone => TemporalFunction::TimestampAtIntervalZone,
+            TemporalFunction::TimestampTzAtZone => TemporalFunction::TimestampTzAtIntervalZone,
+            TemporalFunction::TimeTzAtZone => TemporalFunction::TimeTzAtIntervalZone,
+            _ => unreachable!(),
+        }
     } else {
-        Err(crate::impls::replay::reject_duplicated_operand("AT TIME ZONE", operand))
+        function
+    };
+    let timestamp = timestamp.translate_with_warnings(schema, options, emit)?;
+    let timestamp = if source_kind == Some(TemporalLiteralKind::Date) {
+        crate::impls::temporal_functions::call(
+            options,
+            TemporalFunction::DateToTimestampTz,
+            vec![
+                timestamp,
+                crate::impls::temporal_functions::session_zone(options, schema, "AT TIME ZONE")?,
+            ],
+            "AT TIME ZONE",
+        )?
+    } else if matches!(source_kind, Some(TemporalLiteralKind::Time { zoned: false, .. })) {
+        crate::impls::temporal_functions::call(
+            options,
+            TemporalFunction::TimeToTimeTz,
+            vec![
+                timestamp,
+                crate::impls::temporal_functions::session_zone(options, schema, "AT TIME ZONE")?,
+                crate::impls::zone_clock::canonical_now(),
+            ],
+            "AT TIME ZONE",
+        )?
+    } else {
+        timestamp
+    };
+    let mut arguments = vec![time_zone.translate_with_warnings(schema, options, emit)?, timestamp];
+    if function == TemporalFunction::TimeTzAtZone {
+        arguments.push(crate::impls::zone_clock::canonical_now());
     }
+    crate::impls::temporal_functions::call(options, function, arguments, "AT TIME ZONE")
 }
 
 /// The pgvector type sqlite-vec cannot store that `expr` evaluates to, read
@@ -2893,36 +2809,6 @@ fn array_containment(haystack: Expr, needle: Expr) -> Expr {
     Expr::Exists { subquery: Box::new(inner), negated: true }
 }
 
-/// Extract the `Interval` node from a bare or parenthesised interval
-/// expression.
-fn extract_interval_expr(expr: &Expr) -> Option<&Interval> {
-    match expr {
-        Expr::Interval(i) => Some(i),
-        Expr::Nested(inner) => {
-            match inner.as_ref() {
-                Expr::Interval(i) => Some(i),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
-/// Detect `scalar * INTERVAL` or `INTERVAL * scalar`. Returns (scalar_expr,
-/// interval) when the pattern matches; the caller decides whether the scalar is
-/// a constant.
-fn scalar_times_interval(expr: &Expr) -> Option<(&Expr, &Interval)> {
-    if let Expr::BinaryOp { left, op: BinaryOperator::Multiply, right } = expr {
-        if let Some(i) = extract_interval_expr(right) {
-            return Some((left, i));
-        }
-        if let Some(i) = extract_interval_expr(left) {
-            return Some((right, i));
-        }
-    }
-    None
-}
-
 /// Whether a literal beside a column of this type has to be examined before
 /// the comparison is emitted.
 ///
@@ -3222,242 +3108,6 @@ fn reject_quantified_pattern_all(
     )))
 }
 
-/// `datetime(target, modifier..., 'subsec')` with its trailing fractional zeros
-/// trimmed.
-fn shifted_datetime(target: Expr, modifiers: &[Expr]) -> Expr {
-    let mut args = vec![target];
-    args.extend(modifiers.iter().cloned());
-    args.push(string_literal("subsec"));
-    trim_trailing_zeros(simple_function_expr("datetime", args, None))
-}
-
-/// The time of day `target` answers after `clock`, wrapped at midnight, with
-/// a `timetz` operand's offset kept in place. The zoned form, and a shift
-/// whose sum can leave 64 bits, read `target` more than once, so the caller
-/// refuses a non-replayable operand.
-pub(crate) fn shifted_time_of_day(target: Expr, clock: &ClockShift, zoned: bool) -> Expr {
-    if !zoned {
-        return shifted_clock(target, clock);
-    }
-    // The offset is the trailing ±HH:MM, which the answer keeps as written.
-    let local = simple_function_expr(
-        "substr",
-        vec![
-            target.clone(),
-            integer_literal(1),
-            Expr::BinaryOp {
-                left: Box::new(simple_function_expr("length", vec![target.clone()], None)),
-                op: BinaryOperator::Minus,
-                right: Box::new(integer_literal(6)),
-            },
-        ],
-        None,
-    );
-    let moved = shifted_clock(local, clock);
-    let offset = simple_function_expr("substr", vec![target, integer_literal(-6)], None);
-    Expr::BinaryOp {
-        left: Box::new(moved),
-        op: BinaryOperator::StringConcat,
-        right: Box::new(offset),
-    }
-}
-
-/// The time of day `local` answers after `clock`, taking the wrapped
-/// modifiers for a time of day past the clock's 64-bit threshold.
-fn shifted_clock(local: Expr, clock: &ClockShift) -> Expr {
-    let Some((threshold, wrapped)) = &clock.wrap else {
-        return clock_after(local, &clock.modifiers);
-    };
-    let past = Expr::BinaryOp {
-        left: Box::new(micros_of_day(&local)),
-        op: BinaryOperator::Gt,
-        right: Box::new(Expr::Nested(Box::new(threshold.clone()))),
-    };
-    case_when(past, clock_after(local.clone(), wrapped), Some(clock_after(local, &clock.modifiers)))
-}
-
-/// The microsecond of the day a stored `HH:MM:SS[.ffffff]` time of day
-/// names, from SQLite's numeric reading of each part.
-fn micros_of_day(local: &Expr) -> Expr {
-    let part = |start: i64, length: Option<i64>| {
-        let mut args = vec![local.clone(), integer_literal(start)];
-        args.extend(length.map(integer_literal));
-        simple_function_expr("substr", args, None)
-    };
-    let times = |left: Expr, factor: i64| {
-        Expr::BinaryOp {
-            left: Box::new(left),
-            op: BinaryOperator::Multiply,
-            right: Box::new(integer_literal(factor)),
-        }
-    };
-    let plus = |left: Expr, right: Expr| {
-        Expr::BinaryOp { left: Box::new(left), op: BinaryOperator::Plus, right: Box::new(right) }
-    };
-    // The seconds carry up to six decimals, which `round` makes whole.
-    let seconds = simple_function_expr("round", vec![times(part(7, None), 1_000_000)], None);
-    Expr::Nested(Box::new(plus(
-        plus(times(part(1, Some(2)), 3_600_000_000), times(part(4, Some(2)), 60_000_000)),
-        seconds,
-    )))
-}
-
-/// The time part of `local` shifted by `modifiers`, trailing fractional zeros
-/// trimmed. SQLite reads a bare time as 2000-01-01, so the part after the
-/// date wraps at midnight.
-fn clock_after(local: Expr, modifiers: &[Expr]) -> Expr {
-    let mut args = vec![local];
-    args.extend(modifiers.iter().cloned());
-    args.push(string_literal("subsec"));
-    let shifted = simple_function_expr("datetime", args, None);
-    // The date part is eleven characters, so the time of day starts at twelve.
-    trim_trailing_zeros(simple_function_expr("substr", vec![shifted, integer_literal(12)], None))
-}
-
-/// The shifted form of a translated date or timestamp `target` under the
-/// date `modifiers`, under the year-1 guard.
-pub(crate) fn shifted_by_modifiers(target: Expr, modifiers: &[Expr]) -> Expr {
-    from_year_one(shifted_datetime(target, modifiers))
-}
-
-/// The shifted form of `left` for the temporal kind it resolves to, refusing
-/// an operand the emitted form would read more than once and cannot replay,
-/// and a literal date or timestamp whose shifted year SQLite's date functions
-/// cannot hold.
-pub(crate) fn shifted_interval_target(
-    left: &Expr,
-    (op, right): (&BinaryOperator, &Expr),
-    shift: &IntervalShift,
-    schema: &ParserDB,
-    options: &crate::options::TranslationContext<'_>,
-    emit: crate::warnings::WarningSink<'_>,
-) -> Result<Expr, crate::errors::Error> {
-    let kind = temporal_kind_of(left, schema, options);
-    if let Some(TemporalKind::Time { zoned }) = kind {
-        let clock = shift.clock_shift();
-        if !is_replayable(left, options) {
-            if zoned {
-                return Err(reject_duplicated_operand(
-                    "a TIMETZ operand shifted by an interval",
-                    left,
-                ));
-            }
-            if clock.wrap.is_some() {
-                return Err(reject_duplicated_operand(
-                    "a TIME operand shifted by an interval whose sum with it can pass 64 bits",
-                    left,
-                ));
-            }
-        }
-        let target = left.translate_with_warnings(schema, options, emit)?;
-        return Ok(shifted_time_of_day(target, &clock, zoned));
-    }
-    // PostgreSQL refuses the interval's negation and a year past its range
-    // in every zone, so those refusals come before the zone's.
-    let calendar_modifiers = shift.calendar_modifiers()?;
-    let operation = format!("{left} {op} {right}");
-    let target = left.translate_with_warnings(schema, options, emit)?;
-    if let Some(literal) = single_quoted_literal(&target)
-        && let Some(year) = shift.year_after(literal)
-        && !(1..=9999).contains(&year)
-    {
-        return Err(crate::impls::temporal_literals::arithmetic_outside_four_digit_years(
-            &operation, year,
-        ));
-    }
-    let calendar = zoned_calendar(left, kind, shift.moves_calendar(), &operation, schema, options)?;
-    // An infinity shifted by a finite interval stays the same infinity.
-    crate::impls::temporal_infinity::guard(
-        &operation,
-        left,
-        target,
-        crate::impls::temporal_infinity::InfiniteAnswer::Same,
-        options,
-        |target| {
-            Ok(match calendar {
-                ZonedCalendar::Clock(offset) => {
-                    let modifiers: Vec<Expr> = shift
-                        .modifiers_on_clock(offset)?
-                        .iter()
-                        .map(|modifier| string_literal(modifier))
-                        .collect();
-                    shifted_by_modifiers(target, &modifiers)
-                }
-                ZonedCalendar::Registered(clock) => {
-                    let literals = |modifiers: Vec<String>| -> Vec<Expr> {
-                        modifiers.iter().map(|modifier| string_literal(modifier)).collect()
-                    };
-                    let mut local = vec![clock.local_clock(target)];
-                    local.extend(literals(calendar_modifiers));
-                    local.push(string_literal("subsec"));
-                    let instant = clock.instant(simple_function_expr("datetime", local, None));
-                    shifted_by_modifiers(instant, &literals(shift.time_modifiers()?))
-                }
-            })
-        },
-    )
-}
-
-/// How the months and days of an interval reach a date or timestamp.
-#[derive(Clone, Copy)]
-pub(crate) enum ZonedCalendar<'o> {
-    /// SQLite's date modifiers on the clock this many seconds east of UTC,
-    /// zero for a date, a `timestamp`, and a `timestamptz` in UTC.
-    Clock(i32),
-    /// The wall clock of a zone whose UTC offset changes, through the
-    /// functions the replica registers.
-    Registered(RegisteredClock<'o>),
-}
-
-/// The calendar PostgreSQL adds the months and days of an interval to
-/// `target` on, `kind` being its temporal type and `operation` the arithmetic
-/// as written.
-///
-/// A `timestamptz` counts them on the request's zone, and so does an operand
-/// whose type is not settled, which could be one. An interval without months
-/// or days moves the instant alike in every zone.
-///
-/// # Errors
-///
-/// Refuses a zone that does not resolve, a zone whose offset changes when no
-/// functions are registered for it, and an operand whose type is not settled
-/// outside UTC.
-pub(crate) fn zoned_calendar<'o>(
-    target: &Expr,
-    kind: Option<TemporalKind>,
-    moves_calendar: bool,
-    operation: &str,
-    schema: &ParserDB,
-    options: &'o crate::options::TranslationContext<'_>,
-) -> Result<ZonedCalendar<'o>, crate::errors::Error> {
-    match kind {
-        _ if !moves_calendar => return Ok(ZonedCalendar::Clock(0)),
-        Some(TemporalKind::Date | TemporalKind::Timestamp | TemporalKind::Time { .. }) => {
-            return Ok(ZonedCalendar::Clock(0));
-        }
-        Some(TemporalKind::TimestampTz) => {}
-        None => {
-            return match options.request_zone(schema) {
-                Ok(RequestZone::Fixed(0)) => Ok(ZonedCalendar::Clock(0)),
-                Ok(_) | Err(_) => {
-                    Err(crate::errors::Error::forward_refusal(format!(
-                        "`{operation}` adds days or months to an operand whose type this \
-                         translation cannot settle. PostgreSQL counts them on the calendar of \
-                         the request's TimeZone for a timestamptz and on a calendar of no zone \
-                         for a timestamp, and outside UTC the two answers differ. Cast the \
-                         operand, as `{target}::timestamptz` or `{target}::timestamp`, to say \
-                         which it is."
-                    )))
-                }
-            };
-        }
-    }
-    Ok(match zone_clock(operation, "add days or months on the calendar of", schema, options)? {
-        ZoneClock::Offset(offset) => ZonedCalendar::Clock(offset),
-        ZoneClock::Registered(clock) => ZonedCalendar::Registered(clock),
-    })
-}
-
 /// The display spelling of a comparison operator, in PostgreSQL's spelling.
 const fn comparison_operator_display(op: &BinaryOperator) -> Option<&'static str> {
     match op {
@@ -3533,18 +3183,6 @@ fn interval_binary(
             op, left, right, schema, options, emit,
         )
         .map(Some);
-    }
-    let left_shift = extract_interval_expr(left).is_some() || scalar_times_interval(left).is_some();
-    let right_shift =
-        extract_interval_expr(right).is_some() || scalar_times_interval(right).is_some();
-    if (right_shift && !left_typed) || (left_shift && !right_typed) {
-        // A shift literal beside a non-interval target keeps its existing
-        // translation, unless PostgreSQL's unknown-literal rule resolves the
-        // target as an interval itself.
-        let other = if right_shift { left } else { right };
-        if !crate::impls::interval::fields::is_interval_literal(other, schema, options)? {
-            return Ok(None);
-        }
     }
     crate::impls::interval::fields::binary(op, left, right, schema, options, emit).map(Some)
 }
@@ -4312,92 +3950,6 @@ fn translate_binary_op(
         _ => {}
     }
 
-    // PG INTERVAL arithmetic: `target + INTERVAL 'N unit'` becomes
-    // `datetime(target, '+M months', 'floor', '+D days', '+S seconds')`, and
-    // `-` negates every count.
-    //
-    // Three shapes beyond the basic right-hand-interval case:
-    // 1. INTERVAL + target: commute to target + INTERVAL.
-    // 2. n * INTERVAL or INTERVAL * n: fold the literal integer scalar.
-    // 3. Unrecognised interval notation (HH:MM:SS, ISO P-forms): emit a message
-    //    naming the verbose form instead of blaming INTERVAL wholesale.
-    if matches!(op, BinaryOperator::Plus | BinaryOperator::Minus) {
-        let negating = matches!(op, BinaryOperator::Minus);
-
-        // Case 1: INTERVAL on the left commutes (addition only). Two
-        // intervals answer an interval in PostgreSQL, which SQLite has no
-        // type for, so they take the ordinary refusal rather than commuting
-        // back and forth forever.
-        if extract_interval_expr(left).is_some() && extract_interval_expr(right).is_some() {
-            return Err(crate::errors::Error::forward_refusal(
-                "INTERVAL expressions are not supported in SQLite. Adding or subtracting two \
-                 intervals answers an interval, and SQLite has no interval type to hold one. \
-                 Fold the two into a single INTERVAL literal, or apply them one after the other \
-                 to a date or a timestamp."
-                    .to_string(),
-            ));
-        }
-        if *op == BinaryOperator::Plus && extract_interval_expr(left).is_some() {
-            return translate_binary_op(right, op, left, schema, options, emit);
-        }
-
-        // Case 2: n * INTERVAL or INTERVAL * n on the right.
-        if let Some((scalar, interval)) = scalar_times_interval(right) {
-            match integer_literal_value(scalar) {
-                Some(n) => {
-                    match interval_shift_scaled(interval, negating, n)? {
-                        Some(shift) => {
-                            return shifted_interval_target(
-                                left,
-                                (op, right),
-                                &shift,
-                                schema,
-                                options,
-                                emit,
-                            );
-                        }
-                        None => {
-                            return Err(crate::errors::Error::forward_refusal(format!(
-                                "INTERVAL '{}' notation is not supported. Use the verbose form                                  with explicit count and unit pairs, for example                                  INTERVAL '1 hour 30 minutes'.",
-                                single_quoted_literal(interval.value.as_ref()).unwrap_or("...")
-                            )));
-                        }
-                    }
-                }
-                None => {
-                    // Runtime scalar: cannot be constant-folded into a
-                    // modifier.
-                    return Err(crate::errors::Error::forward_refusal("INTERVAL scaled by a runtime expression cannot be folded at translation                          time. Compute the multiplier in application code and use a plain                          INTERVAL literal, for example INTERVAL '3 days'."
-                        .to_string()));
-                }
-            }
-        }
-
-        // Case 3: bare INTERVAL on the right.
-        if let Some(interval) = extract_interval_expr(right) {
-            match interval_shift(interval, negating)? {
-                Some(shift) => {
-                    return shifted_interval_target(
-                        left,
-                        (op, right),
-                        &shift,
-                        schema,
-                        options,
-                        emit,
-                    );
-                }
-                None => {
-                    // The notation was not decoded (HH:MM:SS, ISO P-form,
-                    // 'ago').
-                    return Err(crate::errors::Error::forward_refusal(format!(
-                        "INTERVAL '{}' notation is not supported. Use the verbose form with                          explicit count and unit pairs, for example INTERVAL '1 hour 30 minutes'.",
-                        single_quoted_literal(interval.value.as_ref()).unwrap_or("...")
-                    )));
-                }
-            }
-        }
-    }
-
     // A date or a timestamp compared with another kind takes the other's
     // text: a date the midnight of a timestamp, either the instant its wall
     // clock names in the request's zone beside a timestamptz.
@@ -4412,6 +3964,25 @@ fn translate_binary_op(
     ) {
         let lk = temporal_kind_of(left, schema, options);
         let rk = temporal_kind_of(right, schema, options);
+        if lk == Some(TemporalKind::Time { zoned: true })
+            && rk == Some(TemporalKind::Time { zoned: true })
+        {
+            let arguments = vec![
+                left.translate_with_warnings(schema, options, emit)?,
+                right.translate_with_warnings(schema, options, emit)?,
+            ];
+            let comparison = crate::impls::temporal_functions::call(
+                options,
+                pg2sqlite_runtime::TemporalFunction::TimeTzCompare,
+                arguments,
+                "timetz comparison",
+            )?;
+            return Ok(Expr::BinaryOp {
+                left: Box::new(comparison),
+                op: op.clone(),
+                right: Box::new(crate::impls::function_helpers::number_literal("0")),
+            });
+        }
         let wider = match (lk, rk) {
             (
                 Some(TemporalKind::TimestampTz),
@@ -4429,44 +4000,28 @@ fn translate_binary_op(
         };
         if let Some(wider) = wider {
             let operation = format!("{left} {op} {right}");
-            let zoned = (wider == TemporalKind::TimestampTz)
-                .then(|| {
-                    crate::impls::zone_clock::zoned_wall_clock(
-                        &operation,
-                        "read a wall clock in",
-                        schema,
-                        options,
-                    )
-                })
-                .transpose()?;
-            // A promoted infinity stays the same infinity and orders as
-            // PostgreSQL's.
             let mut to_common = |side: &Expr, kind| -> Result<Expr, crate::errors::Error> {
+                use pg2sqlite_runtime::TemporalFunction;
                 let translated = side.translate_with_warnings(schema, options, emit)?;
-                let promoted = kind == Some(TemporalKind::Date)
-                    || (kind == Some(TemporalKind::Timestamp) && zoned.is_some());
-                if !promoted {
-                    return Ok(translated);
+                let function = match (kind, wider) {
+                    (Some(TemporalKind::Date), TemporalKind::Timestamp) => {
+                        TemporalFunction::DateToTimestamp
+                    }
+                    (Some(TemporalKind::Date), TemporalKind::TimestampTz) => {
+                        TemporalFunction::DateToTimestampTz
+                    }
+                    (Some(TemporalKind::Timestamp), TemporalKind::TimestampTz) => {
+                        TemporalFunction::TimestampToTimestampTz
+                    }
+                    _ => return Ok(translated),
+                };
+                let mut arguments = vec![translated];
+                if wider == TemporalKind::TimestampTz {
+                    arguments.push(crate::impls::temporal_functions::session_zone(
+                        options, schema, &operation,
+                    )?);
                 }
-                crate::impls::temporal_infinity::guard(
-                    &operation,
-                    side,
-                    translated,
-                    crate::impls::temporal_infinity::InfiniteAnswer::Same,
-                    options,
-                    |translated| {
-                        let local = if kind == Some(TemporalKind::Date) {
-                            crate::impls::datetime_helpers::promote_date_to_midnight(translated)
-                        } else {
-                            translated
-                        };
-                        let Some(zoned) = zoned else { return Ok(local) };
-                        if zoned.instant_reads_twice() && !is_replayable(side, options) {
-                            return Err(reject_duplicated_operand(&operation, side));
-                        }
-                        Ok(zoned.instant(local))
-                    },
-                )
+                crate::impls::temporal_functions::call(options, function, arguments, &operation)
             };
             return Ok(Expr::BinaryOp {
                 left: Box::new(to_common(left, lk)?),
@@ -4828,6 +4383,16 @@ impl TranslateUnfinished for Expr {
                             *precision,
                         );
                     }
+                    if let DataType::Interval { fields, precision } = data_type {
+                        return crate::impls::interval::fields::cast(
+                            expr,
+                            fields.as_ref(),
+                            *precision,
+                            schema,
+                            options,
+                            emit,
+                        );
+                    }
                     // A temporal literal is validated and normalised where it
                     // is written, since the column holds the text itself.
                     if let Some(kind) =
@@ -4888,33 +4453,51 @@ impl TranslateUnfinished for Expr {
                     if let Some(info) = exact_numeric_info(data_type) {
                         return translate_numeric_cast(expr, info, schema, options, emit);
                     }
-                    // A cast to a temporal type or to text answers the text
-                    // PostgreSQL answers for the pair.
                     let temporal_target =
                         crate::impls::temporal_literals::temporal_literal_kind(data_type);
                     let text_target = matches!(data_type, sqlparser::ast::DataType::Text);
                     if temporal_target.is_some() || text_target {
-                        use crate::impls::temporal_casts as casts;
-                        let source_kind =
-                            casts::cast_source_kind(expr, schema, options).ok().flatten();
-                        let awareness =
-                            crate::impls::timezone::timestamp_awareness(expr, schema, options)
-                                .ok()
-                                .flatten();
-                        // A cast this translation cannot settle by kind reads
-                        // a timestamptz as the request's zone answers it.
+                        use crate::impls::{
+                            temporal_casts as casts, temporal_literals::TemporalLiteralKind,
+                        };
+                        let source_kind = casts::cast_source_kind(expr, schema, options)?;
                         let cast = format!("{expr}::{data_type}");
-                        if source_kind.is_none() && awareness.is_none() {
-                            crate::impls::zone_clock::unsettled_operand_refusal(
-                                &cast, expr, schema, options,
-                            )?;
+                        if source_kind.is_some() {
+                            crate::impls::temporal_functions::functions(options, &cast)?;
                         }
                         if let Some(kind) = temporal_target {
-                            crate::impls::shared_helpers::temporal_precision_replay_refusal(
-                                expr, data_type, options,
-                            )?;
+                            if let TemporalLiteralKind::Time { zoned: false, precision } = kind
+                                && crate::impls::expression_type::is_interval_typed(
+                                    expr, schema, options,
+                                )
+                            {
+                                let translated =
+                                    expr.translate_with_warnings(schema, options, emit)?;
+                                let converted = crate::impls::temporal_functions::call(
+                                    options,
+                                    pg2sqlite_runtime::TemporalFunction::IntervalToTime,
+                                    vec![translated],
+                                    &cast,
+                                )?;
+                                return if let Some(precision) = precision {
+                                    crate::impls::temporal_functions::call(
+                                        options,
+                                        pg2sqlite_runtime::TemporalFunction::Round(
+                                            pg2sqlite_runtime::TemporalKind::Time,
+                                        ),
+                                        vec![
+                                            converted,
+                                            crate::impls::function_helpers::number_literal(
+                                                &precision.to_string(),
+                                            ),
+                                        ],
+                                        &cast,
+                                    )
+                                } else {
+                                    Ok(converted)
+                                };
+                            }
                             if source_kind.is_none()
-                                && awareness.is_none()
                                 && crate::impls::shared_helpers::is_integral_expression(
                                     expr, schema, options,
                                 )?
@@ -4922,92 +4505,56 @@ impl TranslateUnfinished for Expr {
                                 return Err(casts::integer_cast_refusal(kind));
                             }
                             let translated = expr.translate_with_warnings(schema, options, emit)?;
-                            // A kind change rewrites the text into the target
-                            // kind's form, or refuses the pair.
-                            if let Some(source) = source_kind
-                                && let Some(rewritten) = casts::translate_temporal_kind_cast(
-                                    kind,
-                                    source,
-                                    &translated,
-                                    expr,
-                                    &cast,
-                                    schema,
-                                    options,
-                                )?
-                            {
-                                return Ok(rewritten);
-                            }
-                            // SQLite's date functions read text of unknown
-                            // kind, either infinity kept.
-                            if source_kind.is_none()
-                                && awareness.is_none()
-                                && let Some(read) = casts::temporal_text_reader(kind)
-                            {
-                                casts::warn_text_read_by_date_functions(
-                                    expr, data_type, options, emit,
-                                );
-                                let read = match kind {
-                                    crate::impls::temporal_literals::TemporalLiteralKind::Time {
-                                        ..
-                                    } => read(translated),
-                                    _ => {
-                                        crate::impls::temporal_infinity::text_guard(
-                                            &cast,
-                                            expr,
-                                            translated,
-                                            options,
-                                            |operand| Ok(read(operand)),
-                                        )?
-                                    }
-                                };
-                                return Ok(crate::impls::shared_helpers::round_column_text(
-                                    kind, read,
-                                ));
-                            }
-                            // A timestamptz read as a wall clock answers from
-                            // the request's zone.
-                            let zoned = crate::impls::zone_clock::conversion_wall_clock(
-                                kind, awareness, &cast, schema, options,
-                            )?;
-                            let converted = crate::impls::shared_helpers::convert_temporal_value(
-                                kind,
-                                translated,
-                                awareness,
-                                zoned,
-                                Some(expr),
-                                Some(&cast),
-                                Some(crate::impls::shared_helpers::ZoneSite { schema, options }),
-                            )?;
-                            if matches!(converted, Expr::Function(_)) {
-                                return Ok(converted);
-                            }
-                            return Ok(Expr::Cast {
-                                expr: Box::new(converted),
-                                data_type: data_type
-                                    .translate_with_warnings(schema, options, emit)?,
-                                format: None,
-                                kind: CastKind::Cast,
-                            });
+                            return match source_kind {
+                                Some(source) => {
+                                    casts::translate_temporal_kind_cast(
+                                        kind, source, translated, &cast, schema, options,
+                                    )
+                                }
+                                None => {
+                                    casts::temporal_text_reader(kind, translated, schema, options)
+                                }
+                            };
                         }
-                        // A cast to text of a timestamptz answers PostgreSQL's
-                        // output form, the zone's wall clock with its offset.
-                        if text_target
-                            && awareness == Some(crate::impls::timezone::TimestampAwareness::Aware)
-                        {
-                            let zoned = crate::impls::zone_clock::zoned_wall_clock(
-                                &cast,
-                                "read the wall clock of",
-                                schema,
-                                options,
-                            )?;
-                            let translated = expr.translate_with_warnings(schema, options, emit)?;
-                            return crate::impls::zone_clock::timestamptz_text_form(
-                                zoned, translated, expr, &cast, options,
-                            );
+                        match source_kind {
+                            Some(TemporalLiteralKind::Timestamp { zoned: true, .. }) => {
+                                let translated =
+                                    expr.translate_with_warnings(schema, options, emit)?;
+                                return crate::impls::zone_clock::timestamptz_text_form(
+                                    translated, &cast, schema, options,
+                                );
+                            }
+                            Some(TemporalLiteralKind::Time { zoned: true, .. }) => {
+                                let translated =
+                                    expr.translate_with_warnings(schema, options, emit)?;
+                                return crate::impls::temporal_functions::call(
+                                    options,
+                                    pg2sqlite_runtime::TemporalFunction::TimeTzOut,
+                                    vec![translated],
+                                    &cast,
+                                );
+                            }
+                            _ => {}
                         }
                     }
                     let translated_type =
                         data_type.translate_with_warnings(schema, options, emit)?;
+                    if matches!(translated_type, DataType::Text)
+                        && options.get_temporal_functions().is_some()
+                        && crate::impls::expression_type::type_name(expr, schema, options)?
+                            .is_some_and(|name| {
+                                name.eq_ignore_ascii_case("float8")
+                                    || name.eq_ignore_ascii_case("double precision")
+                            })
+                    {
+                        let translated = expr.translate_with_warnings(schema, options, emit)?;
+                        return crate::impls::temporal_functions::call(
+                            options,
+                            pg2sqlite_runtime::TemporalFunction::Float8Out,
+                            vec![translated],
+                            "double precision output",
+                        );
+                    }
                     // A NUMERIC column cast to text must render the decimal
                     // PostgreSQL renders, not the stored
                     // minor-unit integer.
@@ -5244,14 +4791,8 @@ impl TranslateUnfinished for Expr {
                     })
                 })?
             }
-            Expr::Interval(interval) => {
-                let field_str =
-                    interval.leading_field.as_ref().map_or(String::new(), |f| format!(" {f}"));
-                return Err(crate::errors::Error::forward_refusal(format!(
-                    "INTERVAL{field_str} expressions are not supported in SQLite. \
-                         Use SQLite date modifiers instead: \
-                         date('now', '-7 days'), datetime('now', '+1 hour'), etc."
-                )));
+            Expr::Interval(_) => {
+                crate::impls::interval::fields::literal(self, schema, options, emit)?
             }
             Expr::IsNormalized { .. } => {
                 return Err(crate::errors::Error::forward_refusal("IS NORMALIZED (Unicode normalization check) is not supported in SQLite. \
@@ -5850,9 +5391,8 @@ mod tests {
     };
 
     use super::{
-        extract_query_from_tsquery, is_sqlite_fixed_offset, is_string_literal_spelling,
-        normalize_at_time_zone_modifier, translate_any_all_to_in, translate_extract,
-        translate_trim,
+        extract_query_from_tsquery, is_string_literal_spelling, translate_any_all_to_in,
+        translate_extract, translate_trim,
     };
     use crate::{
         impls::test_fixtures::{empty_schema, parse_expr},
@@ -5903,16 +5443,11 @@ mod tests {
             ..tsquery.clone()
         };
         assert!(extract_query_from_tsquery(&non_literal).is_none());
-
-        assert!(!is_sqlite_fixed_offset("+0x:00"));
-        assert_eq!(normalize_at_time_zone_modifier("utc+05:30").as_deref(), Some("+05:30"));
     }
 
     #[test]
     #[allow(clippy::too_many_lines)]
     fn translate_extract_trim_any_and_unimplemented_branches() {
-        // An unsettled operand reads as a timestamptz, which needs the
-        // request's zone, so the request logs in as `app` on a UTC server.
         let schema = sql_traits::structs::ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(
             "CREATE ROLE app;",
         )
@@ -5922,41 +5457,53 @@ mod tests {
             .with_default_time_zone("UTC")
             .expect("PostgreSQL accepts UTC");
         let options = crate::options::TranslationContext::from_owned(
-            Pg2SqliteOptions::default().with_deployment(deployment),
+            Pg2SqliteOptions::default()
+                .with_deployment(deployment)
+                .with_temporal_functions(pg2sqlite_runtime::TemporalFunctions::default()),
         );
         let emit = &mut |_| {};
 
-        // EXTRACT(WEEK) is the ISO week, which SQLite spells %V. %W is the
-        // Sunday based one and disagrees at every year boundary.
         let week = translate_extract(
             &DateTimeField::Week(None),
-            &parse_expr("created_at"),
+            &parse_expr("timestamp '2024-01-01'"),
             &schema,
             &options,
             emit,
         )
         .expect("week extract should translate");
-        assert!(week.to_string().contains("'%V'"), "week must use the ISO format: {week}");
+        assert!(
+            week.to_string()
+                .contains(&format!("pg2sqlite_extract_timestamp('{}'", DateTimeField::Week(None))),
+            "{week}",
+        );
 
         let extracted_day_of_year = translate_extract(
             &DateTimeField::DayOfYear,
-            &parse_expr("created_at"),
+            &parse_expr("timestamp '2024-01-01'"),
             &schema,
             &options,
             emit,
         )
         .expect("doy extract should translate");
-        assert!(extracted_day_of_year.to_string().contains("strftime('%j'"));
+        assert!(
+            extracted_day_of_year
+                .to_string()
+                .contains(&format!("pg2sqlite_extract_timestamp('{}'", DateTimeField::DayOfYear))
+        );
 
         let extracted_day_of_week = translate_extract(
             &DateTimeField::DayOfWeek,
-            &parse_expr("created_at"),
+            &parse_expr("timestamp '2024-01-01'"),
             &schema,
             &options,
             emit,
         )
         .expect("dow extract should translate");
-        assert!(extracted_day_of_week.to_string().contains("strftime('%w'"));
+        assert!(
+            extracted_day_of_week
+                .to_string()
+                .contains(&format!("pg2sqlite_extract_timestamp('{}'", DateTimeField::DayOfWeek))
+        );
 
         let trimmed = translate_trim(
             &parse_expr("body"),

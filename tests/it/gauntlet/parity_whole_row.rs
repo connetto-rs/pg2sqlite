@@ -188,7 +188,7 @@ type AuditRow = (i32, String, String, Option<String>, Option<String>, Option<Str
 
 fn options() -> Pg2SqliteOptions {
     crate::helpers::jsonb_functions::with_functions(
-        Pg2SqliteOptions::default()
+        crate::helpers::function_options()
             .with_uuid_representation(UuidRepresentation::Blob)
             .with_array_representation(ArrayRepresentation::Json),
     )

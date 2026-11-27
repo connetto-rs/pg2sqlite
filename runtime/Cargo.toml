@@ -13,9 +13,8 @@ keywords = ["postgresql", "sqlite", "jsonb", "collation", "diesel"]
 categories = ["database", "no-std"]
 
 [dependencies]
-# Reads, prints and compares jsonb, and rounds temporal values to a precision,
-# the way PostgreSQL 18 does.
-sql-values = { version = "0.7", default-features = false }
+# PostgreSQL temporal, jsonb and case-fold semantics.
+sql-values = { version = "0.7", default-features = false, features = ["tzdb"] }
 # Derives `Arbitrary` on both function sets for pg2sqlite's fuzz harnesses.
 arbitrary = { version = "1", features = ["derive"], optional = true }
 thiserror = { version = "2", default-features = false }

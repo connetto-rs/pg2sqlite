@@ -7,7 +7,7 @@
 //! A drift between the shape the translator emits and what SQLite accepts
 //! fails here.
 
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+use pg2sqlite::prelude::Pg2Sqlite;
 use run_translated_helper::{first_column_text, run_translated_utc, run_translated_with};
 
 use crate::helpers::{run_translated as run_translated_helper, translate::assert_refused};
@@ -49,7 +49,7 @@ INSERT INTO t4 VALUES
 ";
 
 fn ids(query: &str) -> Vec<String> {
-    run_translated_with(&format!("{SCHEMA}\n{query}"), &Pg2SqliteOptions::default())
+    run_translated_utc(&format!("{SCHEMA}\n{query}"))
         .into_iter()
         .map(|cell| cell.expect("id column is never NULL"))
         .collect()
@@ -305,49 +305,49 @@ fn the_stored_text_is_unchanged_on_value_free_reads() {
     assert_eq!(
         run_translated_with(
             &format!("{SCHEMA}\nSELECT iv FROM t WHERE id = 1;"),
-            &Pg2SqliteOptions::default()
+            &crate::helpers::function_options()
         ),
         vec![Some("1 day".to_string())]
     );
     assert_eq!(
         run_translated_with(
             &format!("{SCHEMA}\nSELECT iv::text FROM t WHERE id = 2;"),
-            &Pg2SqliteOptions::default()
+            &crate::helpers::function_options()
         ),
         vec![Some("1 mon".to_string())]
     );
     assert_eq!(
         run_translated_with(
             &format!("{SCHEMA}\nSELECT iv || '!' FROM t WHERE id = 3;"),
-            &Pg2SqliteOptions::default()
+            &crate::helpers::function_options()
         ),
         vec![Some("10 days!".to_string())]
     );
     assert_eq!(
         run_translated_with(
             &format!("{SCHEMA}\nSELECT length(iv) FROM t WHERE id = 1;"),
-            &Pg2SqliteOptions::default()
+            &crate::helpers::function_options()
         ),
         vec![Some("5".to_string())]
     );
     assert_eq!(
         run_translated_with(
             &format!("{SCHEMA}\nSELECT coalesce(iv, '0') FROM n WHERE id = 2;"),
-            &Pg2SqliteOptions::default()
+            &crate::helpers::function_options()
         ),
         vec![Some("0".to_string())]
     );
     assert_eq!(
         run_translated_with(
             &format!("{SCHEMA}\nSELECT CASE WHEN id = 1 THEN iv ELSE 'x' END FROM t WHERE id = 1;"),
-            &Pg2SqliteOptions::default(),
+            &crate::helpers::function_options(),
         ),
         vec![Some("1 day".to_string())]
     );
     assert_eq!(
         run_translated_with(
             &format!("{SCHEMA}\nSELECT +iv FROM n WHERE id = 1;"),
-            &Pg2SqliteOptions::default()
+            &crate::helpers::function_options()
         ),
         vec![Some("1 day".to_string())]
     );
@@ -416,15 +416,24 @@ fn a_negated_interval_answers_postgresqls_text() {
 }
 
 #[test]
-fn interval_aggregates_answer_and_field_reads_are_refused() {
+fn interval_aggregates_and_field_reads_match_postgresql() {
     let run = |query: &str| {
-        run_translated_with(&format!("{SCHEMA}\n{query}"), &Pg2SqliteOptions::default())
+        run_translated_with(&format!("{SCHEMA}\n{query}"), &crate::helpers::function_options())
     };
     assert_eq!(run("SELECT sum(iv)::text FROM t;"), vec![Some("1 mon 11 days".to_string())]);
     assert_eq!(run("SELECT avg(iv)::text FROM t;"), vec![Some("13 days 16:00:00".to_string())]);
-    refused("SELECT extract(day FROM iv) FROM t;", "extract over an interval");
-    refused("SELECT date_part('day', iv) FROM t;", "date_part over an interval");
-    refused("SELECT to_char(iv, 'DD') FROM t;", "to_char over an interval");
+    assert_eq!(
+        run("SELECT extract(day FROM iv)::text FROM t ORDER BY id;"),
+        vec![Some("1".to_owned()), Some("0".to_owned()), Some("10".to_owned())]
+    );
+    assert_eq!(
+        run("SELECT date_part('day', iv) FROM t ORDER BY id;"),
+        vec![Some("1".to_owned()), Some("0".to_owned()), Some("10".to_owned())]
+    );
+    assert_eq!(
+        run("SELECT to_char(iv, 'DD') FROM t ORDER BY id;"),
+        vec![Some("01".to_owned()), Some("00".to_owned()), Some("10".to_owned())]
+    );
     refused("SELECT abs(iv) FROM t;", "function abs(interval) does not exist");
 }
 
@@ -438,7 +447,7 @@ fn a_number_or_text_beside_an_interval_is_refused_with_postgresqls_message() {
     let error = Pg2Sqlite::default()
         .sql(&format!("{SCHEMA}\nSELECT id FROM s WHERE s.s = (SELECT iv FROM t WHERE id = 1);"))
         .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
+        .translate_to_sql(&crate::helpers::function_options())
         .expect_err("the subquery side is text, so the read is refused")
         .to_string();
     assert!(
@@ -456,10 +465,10 @@ fn a_literal_postgresql_refuses_is_refused_with_its_message() {
 }
 
 #[test]
-fn a_cast_over_a_non_literal_beside_an_interval_is_refused() {
-    refused(
-        "SELECT id FROM n WHERE iv = (n.id || ' day')::interval;",
-        "any of PostgreSQL's spellings",
+fn a_cast_over_a_non_literal_beside_an_interval_compares_values() {
+    assert_eq!(
+        ids("SELECT id FROM n WHERE iv = (n.id || ' day')::interval ORDER BY id;"),
+        vec!["-1", "0", "1"],
     );
 }
 
@@ -484,7 +493,7 @@ fn an_in_subquery_over_an_interval_is_refused() {
 /// The first result cell of a single-cell query.
 fn first(query: &str) -> String {
     let mut cells =
-        run_translated_with(&format!("{SCHEMA}\n{query}"), &Pg2SqliteOptions::default());
+        run_translated_with(&format!("{SCHEMA}\n{query}"), &crate::helpers::function_options());
     assert_eq!(cells.len(), 1, "single-cell result: {query}");
     cells.remove(0).expect("non-NULL cell")
 }
@@ -501,7 +510,7 @@ fn first_one_of(query: &str, members: &[&str]) {
 
 /// The result cells of a query as the values they hold.
 fn texts(query: &str) -> Vec<String> {
-    run_translated_with(&format!("{SCHEMA}\n{query}"), &Pg2SqliteOptions::default())
+    run_translated_with(&format!("{SCHEMA}\n{query}"), &crate::helpers::function_options())
         .into_iter()
         .map(|cell| cell.expect("cell is never NULL"))
         .collect()
@@ -514,37 +523,14 @@ fn texts(query: &str) -> Vec<String> {
 /// SQL, which diesel cannot express, so it runs through the driver the way
 /// the emitted script will.
 fn run_translated_bound(pg: &str, binding: &str) -> Vec<String> {
-    let mut statements = Pg2Sqlite::default()
-        .sql(&format!("{SCHEMA}\n{pg}"))
-        .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
-        .expect("translate")
-        .into_vec();
-    let probe = statements.pop().expect("script should emit at least one statement");
-    let connection = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
-    for statement in &statements {
-        connection
-            .execute_batch(&format!("{statement};"))
-            .unwrap_or_else(|error| panic!("emitted setup failed: {error}\n{statement}"));
-    }
-    let mut prepared = connection
-        .prepare(&probe)
-        .unwrap_or_else(|error| panic!("emitted probe failed: {error}\n{probe}"));
-    prepared
-        .query_map([binding], |row| {
-            Ok(match row.get_ref(0)? {
-                rusqlite::types::ValueRef::Integer(i) => Some(i.to_string()),
-                rusqlite::types::ValueRef::Real(f) => Some(f.to_string()),
-                rusqlite::types::ValueRef::Text(t) => Some(String::from_utf8_lossy(t).into_owned()),
-                _ => None,
-            })
-        })
-        .unwrap_or_else(|error| panic!("emitted probe failed to run: {error}\n{probe}"))
-        .collect::<Result<Vec<Option<String>>, _>>()
-        .expect("probe rows should decode")
-        .into_iter()
-        .map(|cell| cell.expect("bound probe cell is never NULL"))
-        .collect()
+    run_translated_helper::run_translated_bound_with(
+        &crate::helpers::deployment::utc_script(&format!("{SCHEMA}\n{pg}")),
+        &crate::helpers::deployment::utc_request(),
+        &[binding],
+    )
+    .into_iter()
+    .map(|cell| cell.expect("bound probe cell is never NULL"))
+    .collect()
 }
 
 #[test]
@@ -628,7 +614,7 @@ fn bind_setup(sql: &str) -> rusqlite::Connection {
     let stmts = Pg2Sqlite::default()
         .sql(sql)
         .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
+        .translate_to_sql(&crate::helpers::function_options())
         .expect("translate")
         .into_vec();
     let conn = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
@@ -644,7 +630,7 @@ fn bind_query(sql: &str) -> String {
     Pg2Sqlite::default()
         .sql(sql)
         .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
+        .translate_to_sql(&crate::helpers::function_options())
         .expect("translate")
         .into_vec()
         .into_iter()
@@ -661,7 +647,7 @@ fn a_distinct_over_the_column_rewrites_to_a_group_by_the_key() {
         &format!(
             "{SCHEMA}\nSELECT DISTINCT iv FROM (SELECT iv FROM t UNION ALL SELECT iv2 FROM t)"
         ),
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::function_options(),
     );
     assert_eq!(rows.len(), 4, "PostgreSQL answers 4 distinct interval values");
 }
@@ -670,7 +656,7 @@ fn a_distinct_over_the_column_rewrites_to_a_group_by_the_key() {
 fn a_simple_distinct_over_the_column_rewrites_to_a_group_by_the_key() {
     let rows = run_translated_with(
         &format!("{SCHEMA}\nSELECT DISTINCT iv FROM t"),
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::function_options(),
     );
     assert_eq!(rows.len(), 3);
 }
@@ -679,7 +665,7 @@ fn a_simple_distinct_over_the_column_rewrites_to_a_group_by_the_key() {
 fn a_distinct_over_a_pair_of_interval_items_rewrites_both_to_keys() {
     let rows = run_translated_with(
         &format!("{SCHEMA}\nSELECT DISTINCT iv, iv2 FROM t"),
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::function_options(),
     );
     assert_eq!(rows.len(), 3);
 }
@@ -703,7 +689,7 @@ fn a_distinct_wildcard_over_a_function_interval_result_is_refused() {
         .expect("parse the interval functions")
         .build_schema()
         .expect("build the interval schema");
-    let options = Pg2SqliteOptions::default()
+    let options = crate::helpers::function_options()
         .with_user_defined_functions(["duration_values", "duration_rows"]);
     for function in ["duration_values", "duration_rows"] {
         let message = Pg2Sqlite::default()
@@ -834,7 +820,7 @@ fn run_with_failures(pg: &str, failing: &[&str]) -> Vec<Option<String>> {
     let statements = Pg2Sqlite::default()
         .sql(pg)
         .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
+        .translate_to_sql(&crate::helpers::function_options())
         .expect("translate")
         .into_vec();
     let mut connection = crate::helpers::establish_connection();
@@ -881,7 +867,7 @@ fn a_conflict_target_on_an_interval_column_keeps_one_row() {
          INSERT INTO u1 VALUES ('1 day');
          INSERT INTO u1 VALUES ('24:00:00') ON CONFLICT (iv) DO NOTHING;
          SELECT count(*) FROM u1;",
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::function_options(),
     );
     assert_eq!(rows, vec![Some("1".into())]);
 }
@@ -893,7 +879,7 @@ fn a_conflict_on_the_constraint_keeps_one_row() {
          INSERT INTO u1 VALUES ('1 day');
          INSERT INTO u1 VALUES ('24:00:00') ON CONFLICT ON CONSTRAINT u1_iv_key DO NOTHING;
          SELECT count(*) FROM u1;",
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::function_options(),
     );
     assert_eq!(rows, vec![Some("1".into())]);
 }
@@ -905,7 +891,7 @@ fn a_conflict_do_update_updates_the_existing_row() {
          INSERT INTO du1 VALUES (1, '1 day');
          INSERT INTO du1 VALUES (2, '24:00:00') ON CONFLICT (iv) DO UPDATE SET id = EXCLUDED.id;
          SELECT id FROM du1;",
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::function_options(),
     );
     assert_eq!(rows, vec![Some("2".into())]);
 }
@@ -980,7 +966,7 @@ fn run_script(pg: &str) -> rusqlite::Connection {
     let statements = Pg2Sqlite::default()
         .sql(pg)
         .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
+        .translate_to_sql(&crate::helpers::function_options())
         .expect("translate")
         .into_vec();
     let connection = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
@@ -1027,7 +1013,7 @@ fn a_generated_column_comparing_an_interval_runs_on_the_key() {
          INSERT INTO gc1 VALUES (3, '24:00:00');
          INSERT INTO gc1 VALUES (4, NULL);
          SELECT bigger FROM gc1 ORDER BY id;",
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::function_options(),
     );
     assert_eq!(rows, vec![Some("0".into()), Some("1".into()), Some("0".into()), None]);
 }
@@ -1040,7 +1026,7 @@ fn a_generated_column_comparing_two_intervals_runs_on_the_keys() {
          INSERT INTO gc2 VALUES ('1 day', '2 days');
          INSERT INTO gc2 VALUES ('10 hours', '1 day');
          SELECT longer FROM gc2;",
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::function_options(),
     );
     assert_eq!(rows, vec![Some("0".into()), Some("1".into()), Some("1".into())]);
 }
@@ -1053,7 +1039,7 @@ fn an_index_on_an_interval_column_runs_on_the_key() {
          INSERT INTO ix1 VALUES (2, '24:00:00');
          CREATE INDEX ix1_iv ON ix1 (iv);
          SELECT count(*) FROM ix1 WHERE iv = '1 day';",
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::function_options(),
     );
     assert_eq!(rows, vec![Some("2".into())]);
 }
@@ -1079,7 +1065,7 @@ fn a_partial_index_predicate_over_an_interval_runs_on_the_key() {
          INSERT INTO ix3 VALUES (2, '10 days');
          CREATE INDEX ix3_p ON ix3 (id) WHERE iv > '1 day';
          SELECT id FROM ix3 WHERE iv > '1 day';",
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::function_options(),
     );
     assert_eq!(rows, vec![Some("2".into())]);
 }
@@ -1134,7 +1120,7 @@ fn a_conflict_predicate_over_an_interval_runs_on_the_key() {
          INSERT INTO u2 VALUES (1, '2 days');
          INSERT INTO u2 VALUES (2, '48:00:00') ON CONFLICT (iv) WHERE iv > '1 day' DO NOTHING;
          SELECT count(*) FROM u2;",
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::function_options(),
     );
     assert_eq!(rows, vec![Some("1".into())]);
 }
@@ -1148,7 +1134,7 @@ fn a_conflict_do_update_with_a_predicate_over_an_interval_runs_on_the_key() {
          INSERT INTO u3 VALUES (2, '2 days') ON CONFLICT (iv) WHERE iv > '1 day' \
          DO UPDATE SET id = EXCLUDED.id;
          SELECT id FROM u3;",
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::function_options(),
     );
     assert_eq!(rows, vec![Some("2".into())]);
 }
@@ -1397,7 +1383,7 @@ fn execution_error(pg: &str) -> Option<String> {
     let statements = Pg2Sqlite::default()
         .sql(&format!("{SCHEMA}\n{pg}"))
         .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
+        .translate_to_sql(&crate::helpers::function_options())
         .expect("translate")
         .into_vec();
     let connection = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
@@ -1726,7 +1712,7 @@ fn an_is_not_null_check_beside_an_interval_column_keeps_its_key() {
     Pg2Sqlite::default()
         .sql(&script)
         .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
+        .translate_to_sql(&crate::helpers::function_options())
         .expect("translate");
 }
 
@@ -1749,12 +1735,17 @@ fn a_unique_over_an_interval_column_keeps_its_companion() {
 }
 
 #[test]
-fn a_unique_beside_an_interval_arithmetic_column_is_refused() {
-    refused(
-        "CREATE TABLE uk_e (iv interval, iv2 interval); \
-         CREATE UNIQUE INDEX uk_e_u ON uk_e (iv, (iv2 + interval '1 day'))",
-        "scalar subquery",
-    );
+fn a_unique_beside_an_interval_arithmetic_column_enforces_equality() {
+    let error = run_translated_helper::try_run_translated_bound_with(
+        "CREATE TABLE uk_e (iv interval, iv2 interval);
+         CREATE UNIQUE INDEX uk_e_u ON uk_e (iv, (iv2 + interval '1 day'));
+         INSERT INTO uk_e VALUES ('1 day', '1 hour'), ('24 hours', '1 hour');
+         SELECT iv FROM uk_e;",
+        &crate::helpers::function_options(),
+        &[],
+    )
+    .expect_err("equivalent interval keys");
+    assert!(error.to_string().contains("UNIQUE"), "{error}");
 }
 
 #[test]

@@ -11,7 +11,7 @@ use run_translated_helper::{run_translated_utc, run_translated_with};
 use crate::helpers::{deployment::utc_request, run_translated as run_translated_helper};
 
 fn rows(pg: &str) -> Vec<Option<String>> {
-    run_translated_with(pg, &Pg2SqliteOptions::default())
+    run_translated_utc(pg)
 }
 
 /// Whether `text` matches `shape`, where `d` stands for any digit.
@@ -241,7 +241,14 @@ fn now_written_into_another_temporal_column_takes_that_column_form() {
         assert_eq!(written.len(), 3, "{declared}");
         for row in written {
             let text = row.expect("the value should not be NULL");
-            assert!(has_shape(&text, shape), "{declared}: {text} is not {shape}");
+            let shape = if let Some((_, fraction)) = text.split_once('.') {
+                let digits = fraction.bytes().take_while(u8::is_ascii_digit).count();
+                assert!((1..=6).contains(&digits), "{declared} {text}");
+                shape.replace("dd:dd:dd", &format!("dd:dd:dd.{}", "d".repeat(digits)))
+            } else {
+                shape.to_string()
+            };
+            assert!(has_shape(&text, &shape), "{declared}: {text} is not {shape}");
         }
     }
 }
@@ -288,25 +295,19 @@ fn a_default_forwarded_by_a_row_level_security_trigger_keeps_the_column_form() {
     }
 }
 
+/// The canonical clock reading `now()` translates to comes home as `NOW()`.
 #[test]
-fn the_canonical_form_reverses_to_now_or_a_timestamptz_cast() {
+fn the_canonical_clock_reverses_to_now() {
     let translator = Pg2Sqlite::default().sql("CREATE TABLE t (at timestamptz);").expect("parse");
     let schema = translator.build_schema().expect("schema");
-    for (sqlite, postgres) in [
-        ("SELECT strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')", "SELECT NOW()"),
-        (
-            "SELECT strftime('%Y-%m-%d %H:%M:%f000+00:00', at) FROM t",
-            "SELECT at::TIMESTAMPTZ FROM t",
-        ),
-    ] {
-        let reversed =
-            translator.reverse_sql(sqlite, &schema, &Pg2SqliteOptions::default()).expect("reverse");
-        assert_eq!(
-            reversed.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            [postgres],
-            "{sqlite}"
-        );
-    }
+    let reversed = translator
+        .reverse_sql(
+            "SELECT strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')",
+            &schema,
+            &Pg2SqliteOptions::default(),
+        )
+        .expect("reverse");
+    assert_eq!(reversed.iter().map(ToString::to_string).collect::<Vec<_>>(), ["SELECT NOW()"]);
     // A trailing modifier shifts the instant, so it cannot collapse to NOW().
     translator
         .reverse_sql(

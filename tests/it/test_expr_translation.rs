@@ -6,7 +6,7 @@
 #![allow(dead_code)]
 
 use diesel::prelude::*;
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+use pg2sqlite::prelude::Pg2SqliteOptions;
 
 use crate::helpers;
 
@@ -534,7 +534,7 @@ fn test_extract_translation() {
     let sql = "
         CREATE TABLE events (
             id INTEGER PRIMARY KEY,
-            event_date TEXT NOT NULL
+            event_date DATE NOT NULL
         );
         SELECT id, EXTRACT(YEAR FROM event_date) as year FROM events;
     ";
@@ -542,9 +542,7 @@ fn test_extract_translation() {
     let sql = helpers::deployment::utc_script(sql);
     let query = helpers::prepared_user_select(&sql, &helpers::deployment::utc_request());
 
-    // Should contain strftime, not EXTRACT
-    assert!(query.contains("strftime"), "EXTRACT should translate to strftime, got: {query}");
-    assert!(!query.to_uppercase().contains("EXTRACT"), "Should not contain EXTRACT, got: {query}");
+    assert!(query.contains("pg2sqlite_extract_date('YEAR', event_date)"), "{query}");
 }
 
 #[test]
@@ -552,7 +550,7 @@ fn test_extract_fields_semantic() -> Result<(), Box<dyn std::error::Error>> {
     let sql = "
         CREATE TABLE events (
             id INTEGER PRIMARY KEY,
-            event_date TEXT NOT NULL
+            event_date DATE NOT NULL
         );
         SELECT
             EXTRACT(YEAR FROM event_date) as year,
@@ -598,12 +596,12 @@ fn test_extract_time_fields_semantic() -> Result<(), Box<dyn std::error::Error>>
     let sql = "
         CREATE TABLE logs (
             id INTEGER PRIMARY KEY,
-            timestamp TEXT NOT NULL
+            timestamp TIMESTAMP NOT NULL
         );
         SELECT
             EXTRACT(HOUR FROM timestamp) as hour,
             EXTRACT(MINUTE FROM timestamp) as minute,
-            EXTRACT(SECOND FROM timestamp) as second
+            EXTRACT(SECOND FROM timestamp)::text as second
         FROM logs;
     ";
 
@@ -615,7 +613,7 @@ fn test_extract_time_fields_semantic() -> Result<(), Box<dyn std::error::Error>>
 
     // Insert test data with ISO datetime format using Diesel ORM
     diesel::insert_into(logs::table)
-        .values(&Log { id: 1, timestamp: "2024-03-15 14:30:45".to_string() })
+        .values(&Log { id: 1, timestamp: "2024-03-15 14:30:45.123456".to_string() })
         .execute(&mut connection)?;
 
     #[derive(QueryableByName, Debug)]
@@ -624,8 +622,8 @@ fn test_extract_time_fields_semantic() -> Result<(), Box<dyn std::error::Error>>
         hour: i32,
         #[diesel(sql_type = diesel::sql_types::Integer)]
         minute: i32,
-        #[diesel(sql_type = diesel::sql_types::Integer)]
-        second: i32,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        second: String,
     }
 
     let results = diesel::sql_query(&select_stmt).load::<TimeParts>(&mut connection)?;
@@ -633,7 +631,7 @@ fn test_extract_time_fields_semantic() -> Result<(), Box<dyn std::error::Error>>
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].hour, 14);
     assert_eq!(results[0].minute, 30);
-    assert_eq!(results[0].second, 45);
+    assert_eq!(results[0].second, "45.123456");
 
     Ok(())
 }
@@ -643,7 +641,7 @@ fn test_extract_in_where_clause() -> Result<(), Box<dyn std::error::Error>> {
     let sql = "
         CREATE TABLE events (
             id INTEGER PRIMARY KEY,
-            event_date TEXT NOT NULL,
+            event_date DATE NOT NULL,
             name TEXT NOT NULL
         );
         SELECT name FROM events WHERE EXTRACT(YEAR FROM event_date) = 2024;
@@ -690,7 +688,7 @@ fn test_combined_expressions() -> Result<(), Box<dyn std::error::Error>> {
             id INTEGER PRIMARY KEY,
             status TEXT NOT NULL,
             amount INTEGER NOT NULL,
-            order_date TEXT NOT NULL
+            order_date DATE NOT NULL
         );
         SELECT
             id,
@@ -826,8 +824,8 @@ fn test_at_time_zone_fixed_offset_semantic() -> Result<(), Box<dyn std::error::E
         "AT TIME ZONE should be rewritten, got: {select_stmt}"
     );
     assert!(
-        select_stmt.to_lowercase().contains("datetime"),
-        "Expected datetime(...) rewrite, got: {select_stmt}"
+        select_stmt.contains("pg2sqlite_timestamp_zone('+02:00', ts)"),
+        "Expected temporal runtime dispatch, got {select_stmt}"
     );
 
     // Execute DDL
@@ -850,44 +848,32 @@ fn test_at_time_zone_fixed_offset_semantic() -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-/// EXTRACT refusal must list WEEK, ISODOW, ISOYEAR as supported fields.
-/// They are implemented but the old error text omitted them. R2-LOW. QUARTER
-/// is a field PostgreSQL accepts that this translation refuses, so its
-/// refusal carries the supported field list.
 #[test]
-fn extract_unsupported_field_message_lists_week_isodow_isoyear() {
-    let err = Pg2Sqlite::default()
-        .sql("SELECT EXTRACT(QUARTER FROM TIMESTAMP '2024-01-01 12:00:00')")
-        .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
-        .expect_err("EXTRACT(QUARTER) must fail")
-        .to_string();
-    assert!(err.contains("WEEK"), "EXTRACT refusal must list WEEK, got: {err}");
-    assert!(err.contains("ISODOW"), "EXTRACT refusal must list ISODOW, got: {err}");
-    assert!(err.contains("ISOYEAR"), "EXTRACT refusal must list ISOYEAR, got: {err}");
+fn extract_quarter_dispatches_to_runtime() {
+    let sql = "SELECT EXTRACT(QUARTER FROM TIMESTAMP '2024-04-01 12:00:00')";
+    let (_, query) = helpers::translate::translate_utc_statements_and_first_query(sql);
+    assert!(query.contains("pg2sqlite_extract_timestamp('QUARTER',"), "{query}");
+    assert_eq!(helpers::run_translated::run_translated_utc(sql), vec![Some("2".to_string())]);
 }
 
-/// to_char with MS code must name "MS" in the refusal, not just "M". R2-LOW.
 #[test]
-fn to_char_ms_code_names_ms_in_refusal() {
-    let err = Pg2Sqlite::default()
-        .sql("SELECT to_char(NOW(), 'HH24:MI:SS.MS')")
-        .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
-        .expect_err("to_char with MS must fail")
-        .to_string();
-    assert!(err.contains("MS"), "refusal must name 'MS', got: {err}");
-    assert!(!err.contains("contains 'M'"), "must name MS not just M, got: {err}");
+fn to_char_ms_dispatches_to_runtime() {
+    let sql = "SELECT to_char(TIMESTAMP '2024-01-01 12:34:56.123456', 'HH24:MI:SS.MS')";
+    let (_, query) = helpers::translate::translate_utc_statements_and_first_query(sql);
+    assert!(query.contains("pg2sqlite_timestamp_to_char("), "{query}");
+    assert_eq!(
+        helpers::run_translated::run_translated_utc(sql),
+        vec![Some("12:34:56.123".to_string())]
+    );
 }
 
-/// to_char with US code must name "US" in the refusal. R2-LOW.
 #[test]
-fn to_char_us_code_names_us_in_refusal() {
-    let err = Pg2Sqlite::default()
-        .sql("SELECT to_char(NOW(), 'HH24:MI:SS.US')")
-        .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
-        .expect_err("to_char with US must fail")
-        .to_string();
-    assert!(err.contains("US"), "refusal must name 'US', got: {err}");
+fn to_char_us_dispatches_to_runtime() {
+    let sql = "SELECT to_char(TIMESTAMP '2024-01-01 12:34:56.123456', 'HH24:MI:SS.US')";
+    let (_, query) = helpers::translate::translate_utc_statements_and_first_query(sql);
+    assert!(query.contains("pg2sqlite_timestamp_to_char("), "{query}");
+    assert_eq!(
+        helpers::run_translated::run_translated_utc(sql),
+        vec![Some("12:34:56.123456".to_string())]
+    );
 }

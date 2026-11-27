@@ -7,13 +7,13 @@ use diesel::{
     sql_types::{Nullable, Text},
     sqlite::SqliteConnection,
 };
-use pg2sqlite::prelude::{Error, Pg2Sqlite, Pg2SqliteOptions, TypmodRounding};
+use pg2sqlite::prelude::{Error, Pg2Sqlite, Pg2SqliteOptions, TemporalFunctions};
 use sql_traits::structs::Deployment;
 use sql_values::postgres::{InputContext, PgTimestampTz};
 use sqlparser::ast::Statement;
 
 use super::harness::apply_with_seed;
-use crate::helpers::{postgres as postgres_harness, zone_functions};
+use crate::helpers::postgres as postgres_harness;
 
 /// The roles the deployment names, declared for the translation, which reads
 /// them from the schema.
@@ -88,7 +88,7 @@ impl Events {
     }
 
     /// The replica's schema under `roles` and `options`, holding the one row,
-    /// on a connection with the zone and rounding functions registered.
+    /// on a connection with the temporal functions registered.
     pub(super) fn replica(&self, roles: &str, options: &Pg2SqliteOptions) -> SqliteConnection {
         let statements = Pg2Sqlite::default()
             .sql(&format!("{roles}{TABLE}{GRANT}"))
@@ -96,8 +96,9 @@ impl Events {
             .unwrap_or_else(|error| panic!("pg2sqlite refused the schema: {error}"))
             .into_vec();
         let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-        zone_functions::register(&mut connection);
-        TypmodRounding::register(&mut connection).expect("register the typmod rounding");
+        TemporalFunctions::default()
+            .register(&mut connection)
+            .expect("register the temporal functions");
         apply_with_seed(&mut connection, &statements, |connection| {
             use schema::events;
             diesel::insert_into(events::table)
@@ -290,17 +291,17 @@ pub(super) fn parse_instant(
     }
 }
 
-/// A request acting as `app` in `zone`, with the zone functions named.
+/// A request acting as `app` in `zone`, with the temporal functions named.
 pub(super) fn options(zone: &str) -> Pg2SqliteOptions {
-    zoned(zone).with_time_zone_functions(zone_functions::functions())
+    zoned(zone).with_temporal_functions(TemporalFunctions::default())
 }
 
-/// A request acting as `app` in `zone`, with no zone functions named.
+/// A request acting as `app` in `zone`.
 pub(super) fn zoned(zone: &str) -> Pg2SqliteOptions {
     let deployment = Deployment::new("postgres", ["app"], [])
         .and_then(|deployment| deployment.with_default_time_zone(zone))
         .expect("a valid deployment");
-    Pg2SqliteOptions::default().with_deployment(deployment).with_acting_role("app")
+    crate::helpers::function_options().with_deployment(deployment).with_acting_role("app")
 }
 
 /// The four zones every case runs in, with the options each needs.

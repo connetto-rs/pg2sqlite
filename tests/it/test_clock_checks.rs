@@ -9,7 +9,6 @@ use diesel::{
     sql_types::{Bool, Text},
     sqlite::SqliteConnection,
 };
-use pg2sqlite::prelude::Pg2SqliteOptions;
 
 use crate::helpers;
 
@@ -60,7 +59,11 @@ const TOLERANT: &str = "CREATE TABLE stamped (id INT PRIMARY KEY, started_at TIM
 
 #[test]
 fn a_clock_check_admits_a_row_stamped_now_and_null_and_refuses_one_an_hour_ahead() {
-    let mut connection = helpers::apply_default(TOLERANT).expect("the translated table applies");
+    let mut connection = helpers::apply_with_options(
+        &helpers::deployment::utc_script(TOLERANT),
+        &helpers::deployment::utc_request(),
+    )
+    .expect("the translated table applies");
     let now = stamp(&mut connection, "+0 seconds");
     let ahead = stamp(&mut connection, "+1 hour");
 
@@ -86,9 +89,10 @@ static EXEMPT: AtomicBool = AtomicBool::new(true);
 /// wrote, applied under the RLS exemption, is not judged again.
 #[test]
 fn an_exempt_write_lands_and_an_update_of_another_column_is_checked() {
-    let options = Pg2SqliteOptions::default().with_rls_exemption_function("write_exempt");
+    let options = helpers::deployment::utc_request().with_rls_exemption_function("write_exempt");
     let mut connection =
-        helpers::apply_with_options(TOLERANT, &options).expect("the translated table applies");
+        helpers::apply_with_options(&helpers::deployment::utc_script(TOLERANT), &options)
+            .expect("the translated table applies");
     write_exempt_utils::register_nondeterministic_impl(&mut connection, || {
         EXEMPT.load(Ordering::Relaxed)
     })
@@ -129,9 +133,13 @@ fn insert_note(connection: &mut SqliteConnection, id: i32) -> Result<usize, Dies
 /// PostgreSQL drops a check along with a column it reads.
 #[test]
 fn dropping_the_column_a_clock_check_reads_drops_the_check() {
-    let mut connection =
-        helpers::apply_default(&format!("{TOLERANT} ALTER TABLE stamped DROP COLUMN started_at;"))
-            .expect("the column drops");
+    let mut connection = helpers::apply_with_options(
+        &helpers::deployment::utc_script(&format!(
+            "{TOLERANT} ALTER TABLE stamped DROP COLUMN started_at;"
+        )),
+        &helpers::deployment::utc_request(),
+    )
+    .expect("the column drops");
     insert_note(&mut connection, 1).expect("the table takes rows without the column");
 }
 
@@ -149,9 +157,13 @@ fn dropping_another_column_a_table_clock_check_reads_drops_the_check() {
 
 #[test]
 fn dropping_a_column_no_clock_check_reads_keeps_the_checks() {
-    let mut connection =
-        helpers::apply_default(&format!("{TOLERANT} ALTER TABLE stamped DROP COLUMN note;"))
-            .expect("the column drops");
+    let mut connection = helpers::apply_with_options(
+        &helpers::deployment::utc_script(&format!(
+            "{TOLERANT} ALTER TABLE stamped DROP COLUMN note;"
+        )),
+        &helpers::deployment::utc_request(),
+    )
+    .expect("the column drops");
     let ahead = stamp(&mut connection, "+1 hour");
     refusal(insert(&mut connection, 1, Some(&ahead)));
 }

@@ -154,6 +154,32 @@ fn setup_sq_rusqlite() -> RusqliteConn {
     sq.execute_batch("PRAGMA foreign_keys = ON; PRAGMA recursive_triggers = ON;")
         .expect("configure SQLite pragmas");
     register_statistical_aggregates(&sq).expect("register statistical aggregates");
+    sq.create_scalar_function(
+        pg2sqlite_runtime::TemporalFunctions::default()
+            .name(pg2sqlite_runtime::TemporalFunction::Float8Out)
+            .as_str(),
+        1,
+        rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| {
+            use pg2sqlite_runtime::{TemporalArgument, TemporalFunction, TemporalValue};
+            let value = context.get::<Option<f64>>(0)?;
+            let argument = value.map_or(TemporalArgument::Null, TemporalArgument::Real);
+            TemporalFunction::Float8Out
+                .evaluate(&[argument])
+                .map(|value| {
+                    match value {
+                        None => rusqlite::types::Value::Null,
+                        Some(TemporalValue::Text(value)) => rusqlite::types::Value::Text(value),
+                        Some(TemporalValue::Integer(value)) => {
+                            rusqlite::types::Value::Integer(value)
+                        }
+                        Some(TemporalValue::Real(value)) => rusqlite::types::Value::Real(value),
+                    }
+                })
+                .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))
+        },
+    )
+    .expect("register float output");
     for stmt in &stmts {
         sq.execute_batch(&format!("{stmt};"))
             .unwrap_or_else(|e| panic!("SQLite setup: {e}\n{stmt}"));

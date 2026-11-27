@@ -1,136 +1,38 @@
-//! Casts between temporal kinds over a non-literal value.
-//!
-//! A temporal column holds its own text, so a cast that changes the kind
-//! rewrites that text into the target kind's form, or answers the refusal
-//! PostgreSQL 18.6 gives for the pair. The rewrites slice the stored text
-//! rather than route it through SQLite's date functions, which would drop
-//! fraction digits past milliseconds. A value of unknown kind has no stored
-//! form to slice, so the date functions read it.
+//! Temporal casts through the registered PostgreSQL functions.
 
 use sql_traits::structs::ParserDB;
-use sqlparser::ast::{BinaryOperator, DataType, Expr, Function, FunctionArguments};
+use sqlparser::ast::Expr;
 
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
-    impls::{
-        datetime_helpers::{canonical_timestamptz_call, promote_date_to_midnight, time_of_day},
-        expr_helpers::concat,
-        function_helpers::{integer_literal, simple_function_expr, string_literal},
-        object_name::last_ident,
-        replay::{is_replayable, reject_duplicated_operand},
-        shared_helpers::{declared_in_scope, is_integral_expression},
-        temporal_arithmetic::trim_trailing_zeros,
-        temporal_infinity::{InfiniteAnswer, guard},
-        temporal_literals::{TemporalLiteralKind, temporal_literal_kind},
-    },
-    warnings::{DowngradeLocation, TranslationWarning, WarningSink},
+    impls::temporal_literals::{TemporalLiteralKind, temporal_literal_kind},
 };
 
-/// The temporal kind a non-literal cast operand carries, from its own spelling
-/// or from the declared type of the column it names.
-#[cfg_attr(feature = "std", recursive::recursive)]
 pub(crate) fn cast_source_kind(
     expr: &Expr,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
 ) -> Result<Option<TemporalLiteralKind>, Error> {
-    Ok(match expr {
-        Expr::Nested(inner) => cast_source_kind(inner, schema, options)?,
-        Expr::TypedString(typed) => temporal_literal_kind(&typed.data_type),
-        Expr::Cast { data_type, .. } => temporal_literal_kind(data_type),
-        Expr::AtTimeZone { timestamp, .. } => {
-            invert_zone(cast_source_kind(timestamp, schema, options)?)
-        }
-        Expr::Function(function) => nullary_kind(function),
-        Expr::Value(value) => options.parameter_type(&value.value).and_then(temporal_literal_kind),
-        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
-            declared_in_scope(
-                expr,
-                schema,
-                options,
-                |column| temporal_literal_kind(column.data_type()),
-                cast_source_kind,
-            )?
-        }
-        Expr::BinaryOp { left, op, right } => binary_kind(left, op, right, schema, options)?,
-        _ => None,
-    })
-}
-
-/// The kind `value AT TIME ZONE` answers, which inverts a timestamp's zone and
-/// reads a zoneless time in the named zone.
-fn invert_zone(kind: Option<TemporalLiteralKind>) -> Option<TemporalLiteralKind> {
-    match kind {
-        Some(TemporalLiteralKind::Timestamp { zoned, .. }) => {
-            Some(TemporalLiteralKind::Timestamp { zoned: !zoned, precision: None })
-        }
-        Some(TemporalLiteralKind::Time { zoned: false, .. }) => {
-            Some(TemporalLiteralKind::Time { zoned: true, precision: None })
-        }
-        _ => None,
+    if let Expr::Value(value) = expr
+        && let Some(kind) = options.parameter_type(&value.value).and_then(temporal_literal_kind)
+    {
+        return Ok(Some(kind));
     }
-}
-
-/// The kind the clock functions answer, for the argument-free spellings only.
-fn nullary_kind(function: &Function) -> Option<TemporalLiteralKind> {
-    let FunctionArguments::List(list) = &function.args else {
-        return None;
-    };
-    if !list.args.is_empty() {
-        return None;
-    }
-    let name = last_ident(&function.name)?;
-    match name.value.to_ascii_lowercase().as_str() {
-        "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp" => {
-            Some(TemporalLiteralKind::Timestamp { zoned: true, precision: None })
-        }
-        _ => None,
-    }
-}
-
-/// The kind `left op right` answers, for the shapes this translation lowers.
-fn binary_kind(
-    left: &Expr,
-    op: &BinaryOperator,
-    right: &Expr,
-    schema: &ParserDB,
-    options: &crate::options::TranslationContext<'_>,
-) -> Result<Option<TemporalLiteralKind>, Error> {
-    // `interval + x` translates as `x + interval`, so the interval lands on
-    // the right and the result takes the other operand's kind.
-    let (left, right) = if *op == BinaryOperator::Plus && is_interval_expr(left) {
-        (right, left)
-    } else {
-        (left, right)
-    };
-    if is_interval_expr(right) {
-        let widen_date = |kind: Option<TemporalLiteralKind>| {
-            match kind {
-                Some(TemporalLiteralKind::Date) => {
-                    Some(TemporalLiteralKind::Timestamp { zoned: false, precision: None })
-                }
-                other => other,
+    use crate::impls::temporal_arithmetic::{TemporalKind, temporal_kind};
+    Ok(temporal_kind(expr, schema, options)?.map(|kind| {
+        match kind {
+            TemporalKind::Date => TemporalLiteralKind::Date,
+            TemporalKind::Timestamp => {
+                TemporalLiteralKind::Timestamp { zoned: false, precision: None }
             }
-        };
-        return Ok(widen_date(cast_source_kind(left, schema, options)?));
-    }
-    let left_kind = cast_source_kind(left, schema, options)?;
-    let right_kind = cast_source_kind(right, schema, options)?;
-    Ok(match (left_kind, right_kind) {
-        (Some(kind @ TemporalLiteralKind::Date), None)
-            if is_integral_expression(right, schema, options)? =>
-        {
-            Some(kind)
+            TemporalKind::TimestampTz => {
+                TemporalLiteralKind::Timestamp { zoned: true, precision: None }
+            }
+            TemporalKind::Time { zoned } => TemporalLiteralKind::Time { zoned, precision: None },
         }
-        (None, Some(kind @ TemporalLiteralKind::Date))
-            if *op == BinaryOperator::Plus && is_integral_expression(left, schema, options)? =>
-        {
-            Some(kind)
-        }
-        _ => None,
-    })
+    }))
 }
 
 /// Whether `expr` is an interval value, through parentheses.
@@ -143,118 +45,72 @@ pub(crate) fn is_interval_expr(expr: &Expr) -> bool {
     }
 }
 
-/// The target-kind text of a `source`-kind value, rounded to the target's
-/// precision, or `None` when the value passes through and keeps the caller's
-/// lowering. `written` and `operation` name the operand and the cast as
-/// written, for a refusal.
-///
-/// An infinite date or timestamp stays the same infinity in the other kinds
-/// and is NULL as a time of day, as PostgreSQL casts it.
-///
-/// # Errors
-///
-/// Refuses the pairs PostgreSQL refuses, a conversion into an instant or an
-/// offset whose request zone does not resolve, and an operand the conversion
-/// reads twice that cannot be replayed.
 pub(crate) fn translate_temporal_kind_cast(
     target: TemporalLiteralKind,
     source: TemporalLiteralKind,
-    operand: &Expr,
-    written: &Expr,
+    operand: Expr,
     operation: &str,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
-) -> Result<Option<Expr>, Error> {
+) -> Result<Expr, Error> {
     use TemporalLiteralKind::{Date, Time, Timestamp};
-    let zoned = || {
-        crate::impls::zone_clock::zoned_wall_clock(
-            operation,
-            "read a wall clock in",
-            schema,
-            options,
-        )
-    };
-    let infinite = |answer, rewrite: &dyn Fn(Expr) -> Result<Expr, Error>| {
-        guard(operation, written, operand.clone(), answer, options, rewrite)
-    };
-    let rewritten = match (target, source) {
-        // A timestamptz into the session's local zone is another lowering's.
-        (_, Timestamp { zoned: true, .. })
-        | (Date, Date)
+    use pg2sqlite_runtime::TemporalFunction;
+    crate::impls::temporal_functions::functions(options, operation)?;
+    let (function, zoned) = match (target, source) {
+        (Date, Date)
         | (Time { zoned: false, .. }, Time { zoned: false, .. })
         | (Time { zoned: true, .. }, Time { zoned: true, .. })
-        | (Timestamp { zoned: false, .. }, Timestamp { zoned: false, .. }) => return Ok(None),
-        (Timestamp { zoned: true, .. }, Timestamp { zoned: false, .. } | Date) => {
-            let zoned = zoned()?;
-            if zoned.instant_reads_twice() && !is_replayable(written, options) {
-                return Err(reject_duplicated_operand(operation, written));
-            }
-            infinite(InfiniteAnswer::Same, &|operand| {
-                let local =
-                    if source == Date { promote_date_to_midnight(operand) } else { operand };
-                Ok(zoned.instant(local))
-            })?
+        | (Timestamp { zoned: false, .. }, Timestamp { zoned: false, .. })
+        | (Timestamp { zoned: true, .. }, Timestamp { zoned: true, .. }) => {
+            return crate::impls::shared_helpers::round_column_text(target, operand, options);
         }
-        // The first ten characters hold either infinity whole.
-        (Date, Timestamp { zoned: false, .. }) => date_part(operand),
-        (Timestamp { zoned: false, .. }, Date) => {
-            infinite(InfiniteAnswer::Same, &|operand| Ok(promote_date_to_midnight(operand)))?
+        (Timestamp { zoned: false, .. }, Timestamp { zoned: true, .. }) => {
+            (TemporalFunction::TimestampTzToTimestamp, true)
         }
-        (Time { zoned: false, .. }, Timestamp { zoned: false, .. }) => {
-            infinite(InfiniteAnswer::Null, &|operand| Ok(time_of_day(operand)))?
+        (Timestamp { zoned: true, .. }, Timestamp { zoned: false, .. }) => {
+            (TemporalFunction::TimestampToTimestampTz, true)
         }
-        (Time { zoned: false, .. }, Time { zoned: true, .. }) => wall_time(operand, options)?,
+        (Date, Timestamp { zoned: true, .. }) => (TemporalFunction::TimestampTzToDate, true),
+        (Timestamp { zoned: true, .. }, Date) => (TemporalFunction::DateToTimestampTz, true),
+        (Time { zoned: false, .. }, Timestamp { zoned: true, .. }) => {
+            (TemporalFunction::TimestampTzToTime, true)
+        }
+        (Time { zoned: true, .. }, Timestamp { zoned: true, .. }) => {
+            (TemporalFunction::TimestampTzToTimeTz, true)
+        }
         (Time { zoned: true, .. }, Time { zoned: false, .. }) => {
-            concat(operand.clone(), crate::impls::zone_clock::offset_now(zoned()?))
+            (TemporalFunction::TimeToTimeTz, true)
         }
-        (Time { .. }, Date) => {
-            return Err(kind_cast_refusal(source, target, "a date holds no time of day"));
+        (Date, Timestamp { zoned: false, .. }) => (TemporalFunction::TimestampToDate, false),
+        (Timestamp { zoned: false, .. }, Date) => (TemporalFunction::DateToTimestamp, false),
+        (Time { zoned: false, .. }, Timestamp { zoned: false, .. }) => {
+            (TemporalFunction::TimestampToTime, false)
         }
-        (Date, Time { .. }) => {
-            return Err(kind_cast_refusal(source, target, "a time holds no calendar day"));
+        (Time { zoned: false, .. }, Time { zoned: true, .. }) => {
+            (TemporalFunction::TimeTzToTime, false)
         }
-        (Timestamp { .. }, Time { .. }) => {
-            return Err(kind_cast_refusal(source, target, "a time holds no date to stand on"));
-        }
-        (Time { zoned: true, .. }, Timestamp { zoned: false, .. }) => {
-            return Err(kind_cast_refusal(
-                source,
-                target,
-                "a bare timestamp holds no zone to read the time under",
-            ));
-        }
+        _ => return Err(kind_cast_refusal(source, target, "the temporal kinds are incompatible")),
     };
-    Ok(Some(crate::impls::shared_helpers::round_column_text(target, rewritten)))
-}
-
-/// The `YYYY-MM-DD` part of the stored text.
-fn date_part(operand: &Expr) -> Expr {
-    simple_function_expr(
-        "substr",
-        vec![operand.clone(), integer_literal(1), integer_literal(10)],
-        None,
-    )
-}
-
-/// The wall-clock part of a `HH:MM:SS[.f]±HH:MM` text, with the six offset
-/// characters off the end.
-fn wall_time(
-    operand: &Expr,
-    options: &crate::options::TranslationContext<'_>,
-) -> Result<Expr, Error> {
-    if !is_replayable(operand, options) {
-        return Err(reject_duplicated_operand("a TIMETZ to TIME cast", operand));
+    let mut arguments = vec![operand];
+    if zoned {
+        arguments.push(crate::impls::temporal_functions::session_zone(options, schema, operation)?);
     }
-    let offset_less = Expr::BinaryOp {
-        left: Box::new(simple_function_expr("length", vec![operand.clone()], None)),
-        op: BinaryOperator::Minus,
-        right: Box::new(integer_literal(6)),
-    };
-    Ok(simple_function_expr(
-        "substr",
-        vec![operand.clone(), integer_literal(1), Expr::Nested(Box::new(offset_less))],
-        None,
-    ))
+    if function == TemporalFunction::TimeToTimeTz {
+        arguments.push(crate::impls::zone_clock::canonical_now());
+    }
+    let value = crate::impls::temporal_functions::call(options, function, arguments, operation)?;
+    crate::impls::shared_helpers::round_column_text(target, value, options)
+}
+
+pub(crate) const fn runtime_kind(kind: TemporalLiteralKind) -> pg2sqlite_runtime::TemporalKind {
+    use pg2sqlite_runtime::TemporalKind;
+    match kind {
+        TemporalLiteralKind::Date => TemporalKind::Date,
+        TemporalLiteralKind::Time { zoned: false, .. } => TemporalKind::Time,
+        TemporalLiteralKind::Time { zoned: true, .. } => TemporalKind::TimeTz,
+        TemporalLiteralKind::Timestamp { zoned: false, .. } => TemporalKind::Timestamp,
+        TemporalLiteralKind::Timestamp { zoned: true, .. } => TemporalKind::TimestampTz,
+    }
 }
 
 /// The refusal PostgreSQL answers for a pair of kinds it cannot cast between.
@@ -291,52 +147,18 @@ pub(crate) fn integer_cast_refusal(target: TemporalLiteralKind) -> Error {
     ))
 }
 
-/// How SQLite's date functions read a value of unknown kind into `target`, or
-/// `None` for a `timetz`, whose offset they would move to UTC.
-pub(crate) fn temporal_text_reader(target: TemporalLiteralKind) -> Option<fn(Expr) -> Expr> {
-    match target {
-        TemporalLiteralKind::Date => {
-            Some(|operand| simple_function_expr("date", vec![operand], None))
-        }
-        TemporalLiteralKind::Time { zoned: false, .. } => {
-            Some(|operand| read_subsec("time", operand))
-        }
-        TemporalLiteralKind::Timestamp { zoned: false, .. } => {
-            Some(|operand| read_subsec("datetime", operand))
-        }
-        TemporalLiteralKind::Timestamp { zoned: true, .. } => Some(canonical_timestamptz_call),
-        TemporalLiteralKind::Time { zoned: true, .. } => None,
-    }
-}
-
-/// `function(operand, 'subsec')` with its trailing fractional zeros trimmed.
-fn read_subsec(function: &str, operand: Expr) -> Expr {
-    trim_trailing_zeros(simple_function_expr(
-        function,
-        vec![operand, string_literal("subsec")],
-        None,
-    ))
-}
-
-/// Reports that `operand` is read by SQLite's date functions on its way to
-/// `data_type`, in the object `options` translates.
-pub(crate) fn warn_text_read_by_date_functions(
-    operand: &Expr,
-    data_type: &DataType,
+pub(crate) fn temporal_text_reader(
+    target: TemporalLiteralKind,
+    operand: Expr,
+    schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
-    emit: WarningSink<'_>,
-) {
-    emit(TranslationWarning::LossyDowngrade {
-        construct: "CAST".to_string(),
-        from: "PostgreSQL date and time input".to_string(),
-        to: "SQLite's date functions".to_string(),
-        location: DowngradeLocation::Expression {
-            object: options.declared_object(),
-            text: format!("CAST({operand} AS {data_type})"),
-        },
-        reason: "the value is text known only at run time, and SQLite's date functions read \
-                 ISO 8601 text to milliseconds, answering NULL for any other spelling where \
-                 PostgreSQL parses it or raises an error."
-            .to_string(),
-    });
+) -> Result<Expr, Error> {
+    let zone = crate::impls::temporal_functions::session_zone(options, schema, "temporal input")?;
+    let value = crate::impls::temporal_functions::call(
+        options,
+        pg2sqlite_runtime::TemporalFunction::Input(runtime_kind(target)),
+        vec![operand, zone, crate::impls::zone_clock::canonical_now()],
+        "temporal input",
+    )?;
+    crate::impls::shared_helpers::round_column_text(target, value, options)
 }

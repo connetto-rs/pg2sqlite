@@ -132,6 +132,12 @@ impl ReplayCheck<'_, '_> {
         if session || session_variable::mapping_for_function(&name, self.options).is_some() {
             return true;
         }
+        if self.options.get_temporal_functions().is_some_and(|functions| {
+            crate::impls::reverse_translator_impls::temporal::classify_name(&name, functions)
+                .is_some()
+        }) {
+            return true;
+        }
         if is_volatile_call(&name, self.options) {
             return false;
         }

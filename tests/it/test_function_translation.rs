@@ -131,17 +131,15 @@ fn test_now_translation() {
         "Should not contain NOW(), got: {select_stmt}"
     );
 
-    // Execute DDL statements and prepare the SELECT to verify SQLite accepts
-    // them.
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    // Only `Query` nodes render SELECT-prefixed, so the text filter skips
-    // exactly the queries the AST filter used to skip.
-    for s in
-        translated.iter().filter(|s| !s.trim_start().to_ascii_uppercase().starts_with("SELECT"))
+    use diesel::connection::SimpleConnection;
+    let mut connection = helpers::establish_connection();
+    for statement in translated
+        .iter()
+        .filter(|statement| !statement.trim_start().to_ascii_uppercase().starts_with("SELECT"))
     {
-        conn.execute_batch(&format!("{s};")).unwrap();
+        connection.batch_execute(statement).unwrap();
     }
-    conn.prepare(&select_stmt).unwrap();
+    connection.batch_execute(&select_stmt).unwrap();
 }
 
 #[test]

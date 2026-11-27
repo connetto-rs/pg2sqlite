@@ -271,11 +271,6 @@ fn index(table: &str, name: &str) -> DowngradeLocation {
     })
 }
 
-/// The location of a downgraded expression held by `object`.
-fn expression(object: Option<DeclaredObject>, text: &str) -> DowngradeLocation {
-    DowngradeLocation::Expression { object, text: text.to_owned() }
-}
-
 /// SQLite has no zone-aware temporal type, so a `timetz` column becomes TEXT
 /// holding whatever offset the writer put in it, and its values order as that
 /// text rather than as times in UTC.
@@ -395,64 +390,6 @@ fn an_index_clause_downgrade_names_its_index() {
     );
 }
 
-/// A cast read by SQLite's date functions names the view whose definition
-/// holds it.
-#[test]
-fn a_cast_downgrade_in_a_view_names_the_view() {
-    assert_eq!(
-        locations_for(
-            "CREATE TABLE notes (id INT PRIMARY KEY, title TEXT);
-             CREATE VIEW recent AS SELECT CAST(title AS timestamptz) AS at FROM notes;",
-        ),
-        [expression(
-            Some(DeclaredObject::View { name: "recent".to_owned() }),
-            "CAST(title AS TIMESTAMPTZ)"
-        )]
-    );
-}
-
-/// A cast in a table's `CHECK` names the table.
-#[test]
-fn a_cast_downgrade_in_a_check_names_the_table() {
-    assert_eq!(
-        locations_for(
-            "CREATE TABLE notes (id INT PRIMARY KEY, title TEXT \
-             CHECK (CAST(title AS date) > DATE '2000-01-01'));",
-        ),
-        [expression(
-            Some(DeclaredObject::Table { name: "notes".to_owned() }),
-            "CAST(title AS DATE)"
-        )]
-    );
-}
-
-/// A cast in a column that `ALTER TABLE` adds names the table.
-#[test]
-fn a_cast_downgrade_in_an_added_column_names_the_table() {
-    assert_eq!(
-        locations_for(
-            "CREATE TABLE notes (id INT PRIMARY KEY, title TEXT);
-             ALTER TABLE notes ADD COLUMN day TEXT CHECK (CAST(day AS date) > DATE '2000-01-01');",
-        ),
-        [expression(Some(DeclaredObject::Table { name: "notes".to_owned() }), "CAST(day AS DATE)")]
-    );
-}
-
-/// A cast in a partial index's predicate names the index.
-#[test]
-fn a_cast_downgrade_in_a_partial_index_names_the_index() {
-    assert_eq!(
-        locations_for(
-            "CREATE TABLE notes (id INT PRIMARY KEY, title TEXT);
-             CREATE INDEX dated ON notes (title) WHERE CAST(title AS date) > DATE '2000-01-01';",
-        ),
-        [expression(
-            Some(DeclaredObject::Index { table: "notes".to_owned(), name: "dated".to_owned() }),
-            "CAST(title AS DATE)"
-        )]
-    );
-}
-
 /// A warning renders each kind of location in its message.
 #[test]
 fn a_downgrade_location_renders_the_place_it_names() {
@@ -470,14 +407,6 @@ fn a_downgrade_location_renders_the_place_it_names() {
             object(DeclaredObject::Trigger { table: "notes".to_owned(), name: "stamp".to_owned() }),
             "trigger stamp on notes",
         ),
-        (
-            expression(
-                Some(DeclaredObject::View { name: "recent".to_owned() }),
-                "CAST(title AS DATE)",
-            ),
-            "CAST(title AS DATE) in view recent",
-        ),
-        (expression(None, "CAST(title AS DATE)"), "CAST(title AS DATE)"),
         (DowngradeLocation::Script, "every connection that writes"),
     ];
     for (location, rendered) in cases {
@@ -490,99 +419,6 @@ fn a_downgrade_location_renders_the_place_it_names() {
         };
         assert_eq!(warning.to_string(), format!("downgraded CAST at {rendered} from a to b: c"));
     }
-}
-
-/// A cast in a policy names the policy and its table, whichever statement
-/// the policy's view and triggers are built under.
-#[test]
-fn a_cast_downgrade_in_a_policy_names_the_policy() {
-    let locations = locations_under(
-        "CREATE TABLE notes (id INT PRIMARY KEY, title TEXT);
-         ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
-         CREATE POLICY fresh ON notes FOR SELECT USING (CAST(title AS date) > DATE '2000-01-01');",
-        &Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit"),
-    );
-    let policy =
-        Some(DeclaredObject::Policy { table: "notes".to_owned(), name: "fresh".to_owned() });
-    assert!(!locations.is_empty(), "the policy's cast reported nothing");
-    assert!(
-        locations.iter().all(|location| {
-            matches!(location, DowngradeLocation::Expression { object, .. } if *object == policy)
-        }),
-        "{locations:?} should all name the policy"
-    );
-}
-
-/// A cast in a trigger's function body names the trigger and its table.
-#[test]
-fn a_cast_downgrade_in_a_trigger_names_the_trigger() {
-    let locations = locations_for(
-        "CREATE TABLE notes (id INT PRIMARY KEY, title TEXT, day DATE);
-         CREATE FUNCTION stamp() RETURNS trigger LANGUAGE plpgsql AS $$
-         BEGIN NEW.day := CAST(NEW.title AS date); RETURN NEW; END $$;
-         CREATE TRIGGER notes_stamp BEFORE INSERT ON notes FOR EACH ROW EXECUTE FUNCTION stamp();",
-    );
-    let trigger =
-        Some(DeclaredObject::Trigger { table: "notes".to_owned(), name: "notes_stamp".to_owned() });
-    assert!(!locations.is_empty(), "the trigger's cast reported nothing");
-    assert!(
-        locations.iter().all(|location| {
-            matches!(location, DowngradeLocation::Expression { object, .. } if *object == trigger)
-        }),
-        "{locations:?} should all name the trigger"
-    );
-}
-
-/// A query declares nothing, so its cast names no object.
-#[test]
-fn a_cast_downgrade_in_a_query_names_no_object() {
-    assert_eq!(
-        locations_for(
-            "CREATE TABLE notes (id INT PRIMARY KEY, title TEXT);
-             SELECT CAST(title AS date) FROM notes;",
-        ),
-        [expression(None, "CAST(title AS DATE)")]
-    );
-}
-
-/// A write's cast names the table the write changes, whichever form the write
-/// takes.
-#[test]
-fn a_cast_downgrade_in_a_write_names_the_written_table() {
-    let table = |name: &str| Some(DeclaredObject::Table { name: name.to_owned() });
-    assert_eq!(
-        locations_for(
-            "CREATE TABLE notes (id INT PRIMARY KEY, title TEXT, at TIMESTAMP);
-             CREATE TABLE log (id INT PRIMARY KEY, at TIMESTAMP);
-             INSERT INTO log (id, at) SELECT id, CAST(title AS timestamp) FROM notes;
-             UPDATE public.notes SET at = CAST(title AS timestamp);
-             DELETE FROM log WHERE at < CAST((SELECT title FROM notes LIMIT 1) AS timestamp);
-             WITH titled AS (SELECT id, title FROM notes)
-             INSERT INTO log (id, at) SELECT id + 100, CAST(title AS timestamp) FROM titled;",
-        ),
-        [
-            expression(table("log"), "CAST(title AS TIMESTAMP)"),
-            expression(table("notes"), "CAST(title AS TIMESTAMP)"),
-            expression(table("log"), "CAST((SELECT title FROM notes LIMIT 1) AS TIMESTAMP)"),
-            expression(table("log"), "CAST(title AS TIMESTAMP)"),
-        ]
-    );
-}
-
-/// A write through an updatable view names the view it was written against.
-#[test]
-fn a_cast_downgrade_in_a_write_through_a_view_names_the_view() {
-    assert_eq!(
-        locations_for(
-            "CREATE TABLE notes (id INT PRIMARY KEY, title TEXT, at TIMESTAMP);
-             CREATE VIEW recent AS SELECT id, title, at FROM notes;
-             UPDATE recent SET at = CAST(title AS timestamp);",
-        ),
-        [expression(
-            Some(DeclaredObject::View { name: "recent".to_owned() }),
-            "CAST(title AS TIMESTAMP)"
-        )]
-    );
 }
 
 /// Foreign keys are enforced only under a connection setting, which no

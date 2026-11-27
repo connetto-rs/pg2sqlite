@@ -1,23 +1,8 @@
-//! Semantic fidelity tests for date/time and string functions translated from
-//! PostgreSQL to SQLite.
-//!
-//! Each test executes translated SQL against an in-memory SQLite connection
-//! and compares the result to the value documented by PostgreSQL semantics.
-//! Where SQLite cannot express a construct faithfully the translation is
-//! expected to return a typed translation refusal rather
-//! than silently returning a wrong answer.
-//!
-//! The SQL executed here is the output of the translator, which is not known
-//! at compile time. That is why this file uses rusqlite to execute the
-//! translated strings directly rather than diesel's typed DSL (which requires
-//! a fixed schema at compile time). Every other test file in this suite that
-//! exercises translated SQL follows the same pattern.
+//! Date, time and string expression results.
+
+use core::{fmt::Debug, str::FromStr};
 
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-// rusqlite is used here because the SQL being executed is dynamically generated
-// by the translator at test runtime. diesel's typed DSL requires a schema known
-// at compile time and cannot execute an arbitrary translated SQL string.
-use rusqlite::Connection;
 
 use crate::helpers::deployment::{UTC_REQUEST_ROLE, utc_request};
 
@@ -29,17 +14,6 @@ const DT_ROW: &str = "INSERT INTO t (id, ts, d) VALUES (1, '2024-03-05 14:07:09'
 
 /// DDL for string tests: a TEXT column and an INT column (used for NULL tests).
 const STR_DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, s TEXT, n INT);";
-
-/// Translate a PostgreSQL SQL fragment through `Pg2Sqlite` under `options`.
-/// Panics on either a parse error or a translation error.
-fn translate_sql(pg: &str, options: &Pg2SqliteOptions) -> Vec<String> {
-    Pg2Sqlite::default()
-        .sql(pg)
-        .expect("parses")
-        .translate_to_sql(options)
-        .expect("translates")
-        .into_vec()
-}
 
 /// Translate a PostgreSQL SQL fragment and return the error string. Handles
 /// both parse errors (from `sql()`) and translation errors (from
@@ -59,36 +33,28 @@ fn translate_err(pg: &str) -> String {
 /// Applies the translated DDL of `ddl`, seeds `seed`, and probes the last
 /// emitted statement, returning its first column as `Option<T>`. The script
 /// is led by the role declaration `role` and translated under `options`.
-fn eval_row<T: rusqlite::types::FromSql>(
+fn eval_row<T: FromStr>(
     ddl: &str,
     seed: &str,
     select_list: &str,
     role: &str,
     options: &Pg2SqliteOptions,
-) -> Option<T> {
-    let script =
-        translate_sql(&format!("{role}{ddl}\nSELECT {select_list} FROM t WHERE id = 1;"), options);
-    eval_row_script(&script, seed)
-}
-
-/// Applies every statement of `script` but the last, seeds `seed`, and probes
-/// the last one, returning its first column as `Option<T>`.
-fn eval_row_script<T: rusqlite::types::FromSql>(script: &[String], seed: &str) -> Option<T> {
-    let conn = Connection::open_in_memory().expect("in-memory SQLite");
-    for stmt in &script[..script.len() - 1] {
-        conn.execute_batch(&format!("{stmt};"))
-            .unwrap_or_else(|e| panic!("DDL failed: {e}\n{stmt}"));
-    }
-    conn.execute_batch(seed).expect("seed row");
-    let probe = script.last().expect("a query");
-    conn.query_row(probe, [], |r| r.get::<_, Option<T>>(0))
-        .unwrap_or_else(|e| panic!("query failed: {e}\n{probe}"))
+) -> Option<T>
+where
+    T::Err: Debug,
+{
+    crate::helpers::run_translated::run_translated_with(
+        &format!("{role}{ddl}\n{seed}\nSELECT {select_list} FROM t WHERE id = 1;"),
+        options,
+    )[0]
+    .as_deref()
+    .map(|value| value.parse().expect("answer type"))
 }
 
 /// Run the translated form of `select_list` against the date/time table.
 /// Returns the first column of the single result row as a string.
 fn eval_dt(select_list: &str) -> Option<String> {
-    eval_row::<String>(DT_DDL, DT_ROW, select_list, "", &Pg2SqliteOptions::default())
+    eval_row::<String>(DT_DDL, DT_ROW, select_list, UTC_REQUEST_ROLE, &utc_request())
 }
 
 /// [`eval_dt`] for a request whose `TimeZone` is UTC.
@@ -98,12 +64,18 @@ fn eval_dt_utc(select_list: &str) -> Option<String> {
 
 /// Like `eval_dt` but returns the first column as a 64-bit integer.
 fn eval_dt_i64(select_list: &str) -> Option<i64> {
-    eval_row::<i64>(DT_DDL, DT_ROW, select_list, "", &Pg2SqliteOptions::default())
+    eval_row::<i64>(DT_DDL, DT_ROW, select_list, UTC_REQUEST_ROLE, &utc_request())
 }
 
 /// Like `eval_dt` but returns the first column as an f64.
 fn eval_dt_f64(select_list: &str) -> Option<f64> {
-    eval_row::<f64>(DT_DDL, DT_ROW, select_list, "", &Pg2SqliteOptions::default())
+    eval_row::<f64>(
+        DT_DDL,
+        DT_ROW,
+        &format!("({select_list})::double precision"),
+        UTC_REQUEST_ROLE,
+        &utc_request(),
+    )
 }
 
 /// Run the translated form of `select_list` against the string table, seeded
@@ -125,7 +97,6 @@ fn eval_str_i64(row: &str, select_list: &str) -> Option<i64> {
 // ───────────────────────────────────────────────────────────────────
 
 /// PostgreSQL EXTRACT(YEAR FROM TIMESTAMP '2024-03-05 14:07:09') = 2024.
-/// Translated to CAST(strftime('%Y', ts) AS INTEGER).
 #[test]
 fn extract_year() {
     assert_eq!(eval_dt_i64("EXTRACT(YEAR FROM ts)"), Some(2024));
@@ -156,15 +127,12 @@ fn extract_minute() {
 }
 
 /// PostgreSQL EXTRACT(SECOND FROM TIMESTAMP '2024-03-05 14:07:09') = 9.0.
-/// Translated to CAST(strftime('%f', ts) AS REAL); '%f' yields '09.000' which
-/// casts to 9.0.
 #[test]
 fn extract_second() {
     assert_eq!(eval_dt_f64("EXTRACT(SECOND FROM ts)"), Some(9.0));
 }
 
 /// PostgreSQL DOW is 0=Sunday. 2024-03-05 is a Tuesday, so DOW = 2.
-/// SQLite strftime('%w') uses the same convention: 0=Sunday, 2=Tuesday.
 #[test]
 fn extract_dow() {
     // PostgreSQL EXTRACT(DOW FROM TIMESTAMP '2024-03-05 ...') = 2 (Tuesday).
@@ -178,36 +146,20 @@ fn extract_doy() {
     assert_eq!(eval_dt_i64("EXTRACT(DOY FROM ts)"), Some(65));
 }
 
-/// PostgreSQL EXTRACT(EPOCH FROM TIMESTAMP '2024-03-05 14:07:09') =
-/// 1709647629.0 when the session treats the timestamp as UTC.
-///
-/// Derivation (UTC):
-/// 2024-01-01 00:00:00 UTC = 1704067200 (54 years, 13 leap years in 1970-2023).
-/// 2024 is a leap year: Jan=31 + Feb=29 + Mar 1-4 = 64 days = 5529600 s.
-/// Time component: 14*3600 + 7*60 + 9 = 50829 s. Total: 1709647629.
-///
-/// SQLite strftime('%s', ...) also treats the value as UTC, so both agree.
 #[test]
 fn extract_epoch() {
     assert_eq!(eval_dt_f64("EXTRACT(EPOCH FROM ts)"), Some(1_709_647_629.0));
 }
 
-/// EXTRACT(QUARTER FROM ...) has no faithful strftime equivalent in SQLite.
-/// The translation must reject it rather than silently emit a wrong value.
 #[test]
-fn extract_quarter_is_rejected() {
-    let err = translate_err("SELECT EXTRACT(QUARTER FROM ts) FROM t");
-    assert!(
-        err.contains("QUARTER") || err.contains("not supported") || err.contains("EXTRACT"),
-        "expected rejection for QUARTER, got: {err}"
-    );
+fn extract_quarter() {
+    assert_eq!(eval_dt_i64("EXTRACT(QUARTER FROM ts)"), Some(1));
 }
 
 // ── date_part
 // ─────────────────────────────────────────────────────────────────
 
-/// PostgreSQL date_part always returns double precision. The translated form
-/// uses CAST(strftime('%Y', ts) AS INTEGER). The integer 2024 equals 2024.0.
+/// `date_part` returns double precision.
 #[test]
 fn date_part_year() {
     // PostgreSQL date_part('year', ...) = 2024.0 (double precision).
@@ -239,7 +191,6 @@ fn date_part_minute() {
 }
 
 /// PostgreSQL date_part('second', ...) = 9.0 (double precision).
-/// strftime('%f', ts) = '09.000'; CAST AS REAL = 9.0.
 #[test]
 fn date_part_second() {
     assert_eq!(eval_dt_f64("date_part('second', ts)"), Some(9.0));
@@ -267,9 +218,6 @@ fn date_part_epoch() {
 // ── date_trunc
 // ────────────────────────────────────────────────────────────────
 
-/// PostgreSQL date_trunc('second', '2024-03-05 14:07:09') = '2024-03-05
-/// 14:07:09'. No sub-second component to remove; strftime('%Y-%m-%d %H:%M:%S',
-/// ts) reproduces the same string.
 #[test]
 fn date_trunc_second() {
     assert_eq!(eval_dt("date_trunc('second', ts)").as_deref(), Some("2024-03-05 14:07:09"));
@@ -317,10 +265,7 @@ fn date_trunc_quarter() {
     assert_eq!(eval_dt("date_trunc('quarter', ts)").as_deref(), Some("2024-01-01 00:00:00"));
 }
 
-/// PostgreSQL date_trunc('week', '2024-03-05 14:07:09') = '2024-03-04
-/// 00:00:00', the Monday of the ISO week. The old rejection reasoned about
-/// `strftime('%W')`, which answers a Sunday based week NUMBER and was never
-/// the right shape for a truncation.
+/// Week truncation returns Monday midnight.
 #[test]
 fn date_trunc_week() {
     assert_eq!(eval_dt("date_trunc('week', ts)").as_deref(), Some("2024-03-04 00:00:00"));
@@ -337,16 +282,11 @@ fn date_trunc_decade() {
 // ── to_char
 // ───────────────────────────────────────────────────────────────────
 
-/// PostgreSQL to_char(TIMESTAMP '2024-03-05 14:07:09', 'YYYY-MM-DD') =
-/// '2024-03-05'. Mapped to strftime('%Y-%m-%d', ts).
 #[test]
 fn to_char_date_format() {
     assert_eq!(eval_dt("to_char(ts, 'YYYY-MM-DD')").as_deref(), Some("2024-03-05"));
 }
 
-/// PostgreSQL to_char(TIMESTAMP '2024-03-05 14:07:09', 'HH24:MI:SS') =
-/// '14:07:09'. HH24 -> %H, MI -> %M, SS -> %S; strftime('%H:%M:%S', ts) =
-/// '14:07:09'.
 #[test]
 fn to_char_time_format() {
     assert_eq!(eval_dt("to_char(ts, 'HH24:MI:SS')").as_deref(), Some("14:07:09"));
@@ -362,25 +302,14 @@ fn to_char_datetime_format() {
     );
 }
 
-/// PostgreSQL supports 'Day' (full weekday name) but strftime has no such code.
-/// The translation must reject unsupported format codes rather than emit an
-/// empty or incorrect result.
 #[test]
-fn to_char_unsupported_format_is_rejected() {
-    // 'Day' is a valid PostgreSQL to_char format code that strftime cannot
-    // express.
-    let err = translate_err("SELECT to_char(ts, 'Day') FROM t");
-    assert!(
-        err.contains("to_char") || err.contains("Day") || err.contains("unsupported"),
-        "expected rejection for 'Day' format, got: {err}"
-    );
+fn to_char_day_name() {
+    assert_eq!(eval_dt("to_char(ts, 'Day')").as_deref(), Some("Tuesday  "));
 }
 
 // ── misc date/time functions
 // ──────────────────────────────────────────────────
 
-/// age(ts) returns an interval; SQLite has no interval type.
-/// The translation must reject it with a clear message.
 #[test]
 fn age_is_rejected() {
     let err = translate_err("SELECT age(ts) FROM t");
@@ -423,16 +352,11 @@ fn localtimestamp_is_nonnull() {
     assert!(eval_dt_utc("localtimestamp").is_some(), "localtimestamp returned NULL");
 }
 
-/// to_timestamp(0) translates to datetime(0, 'unixepoch') = '1970-01-01
-/// 00:00:00'. PostgreSQL to_timestamp(0) = 1970-01-01 00:00:00+00 (Unix epoch).
 #[test]
 fn to_timestamp_epoch_zero() {
-    assert_eq!(eval_dt("to_timestamp(0)").as_deref(), Some("1970-01-01 00:00:00"));
+    assert_eq!(eval_dt("to_timestamp(0)::text").as_deref(), Some("1970-01-01 00:00:00+00"));
 }
 
-/// ts + INTERVAL '1 day' translates to datetime(ts, '+1 day').
-/// PostgreSQL: TIMESTAMP '2024-03-05 14:07:09' + INTERVAL '1 day'
-///           = TIMESTAMP '2024-03-06 14:07:09'.
 #[test]
 fn interval_add_one_day() {
     assert_eq!(eval_dt("ts + INTERVAL '1 day'").as_deref(), Some("2024-03-06 14:07:09"));

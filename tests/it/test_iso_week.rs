@@ -1,19 +1,4 @@
-//! ISO week numbering for `date_part('week', ...)` and `EXTRACT(WEEK ...)`.
-//!
-//! PostgreSQL numbers weeks by ISO 8601, Monday based, with week 1 holding the
-//! first Thursday. SQLite's `%W` is Sunday based and disagrees at every year
-//! boundary. Its `%V` is the ISO one, available since 3.30.0 and well under the
-//! 3.47.0 floor.
-//!
-//! Measured on PostgreSQL 16 and SQLite 3.51.1:
-//!
-//! | date | `%W` | `%V` = PostgreSQL week | `%G` = ISOYEAR | `%u` = ISODOW |
-//! |---|---|---|---|---|
-//! | 2023-01-01 | 0 | 52 | 2022 | 7 |
-//! | 2021-01-01 | 0 | 53 | 2020 | 5 |
-//! | 2024-12-30 | 53 | 1 | 2025 | 1 |
-//! | 2020-12-31 | 52 | 53 | 2020 | 4 |
-//! | 2024-03-15 | 11 | 11 | 2024 | 5 |
+//! ISO week numbering and weekday extraction.
 
 use crate::helpers::run_translated as run_translated_helper;
 
@@ -29,7 +14,7 @@ fn evaluate(expression: &str) -> Vec<Option<String>> {
         .collect::<Vec<_>>()
         .join(", ");
     run_translated_helper::run_translated_utc(&format!(
-        "CREATE TABLE t (id INT PRIMARY KEY, d TEXT);
+        "CREATE TABLE t (id INT PRIMARY KEY, d DATE);
              INSERT INTO t VALUES {rows};
              SELECT {expression} FROM t ORDER BY id;"
     ))

@@ -100,8 +100,7 @@ pub(crate) enum BareLiterals {
 ///
 /// # Errors
 ///
-/// Propagates the refusal an `INTERVAL` over a non-literal operand answers,
-/// and the refusal a cast to `interval` over a non-literal answers.
+/// Propagates invalid interval literals and qualifiers.
 pub(super) fn interval_side(
     side: &Expr,
     schema: &ParserDB,
@@ -140,7 +139,7 @@ pub(super) fn interval_side(
             Ok(IntervalSide::TypedLiteral { text, typmod: qualifier_typmod(interval)? })
         }
         Expr::Cast { expr, data_type, .. } if is_interval_data_type(data_type) => {
-            interval_side_cast(expr, data_type)
+            interval_side_cast(side, expr, data_type)
         }
         _ => {
             Ok(if is_interval_typed(side, schema, options) {
@@ -152,36 +151,23 @@ pub(super) fn interval_side(
     }
 }
 
-/// The interval side of a cast's inner expression. `NULL` cast to interval
-/// is a `NULL` side, and a bound parameter cast to interval is keyed, since
-/// the parameter holds the interval's canonical text the way a column does.
-/// A string literal is keyed through its text, and any other operand answers
-/// the refusal the cast spells.
+/// Keeps dynamic interval casts for the ordinary cast dispatcher.
 fn interval_side_cast(
+    original: &Expr,
     expr: &Expr,
     data_type: &sqlparser::ast::DataType,
 ) -> Result<IntervalSide, Error> {
     match value_of(expr) {
         Some(Value::Null) => Ok(IntervalSide::Null),
-        Some(Value::Placeholder(_)) => Ok(IntervalSide::Keyed(Box::new(expr.clone()))),
+        Some(Value::Placeholder(_)) => Ok(IntervalSide::Keyed(Box::new(original.clone()))),
         _ => {
             let Some(text) = value_of(expr).and_then(string_literal_text).map(str::to_owned) else {
-                return Err(cast_spelling_refusal());
+                return Ok(IntervalSide::Keyed(Box::new(original.clone())));
             };
             let typmod = interval_data_type_typmod(data_type)?.unwrap_or_default();
             Ok(IntervalSide::TypedLiteral { text, typmod })
         }
     }
-}
-
-/// The refusal a cast to `interval` over a non-literal answers.
-fn cast_spelling_refusal() -> Error {
-    Error::forward_refusal(
-        "a cast to interval over a non-literal cannot be keyed: any of PostgreSQL's spellings \
-         may be stored in the text it reads, and the key reads only the canonical text the \
-         replica writes. Store the cast in an interval column first."
-            .to_string(),
-    )
 }
 
 /// The PostgreSQL type name a refusal message spells, as `format_type`
@@ -730,30 +716,6 @@ pub(crate) fn function(
         "min" | "max" => extremum(name.as_str(), func, &args, schema, options, emit),
         "sum" => interval_aggregate(Aggregate::Sum, func, list, &args, schema, options, emit),
         "avg" => interval_aggregate(Aggregate::Avg, func, list, &args, schema, options, emit),
-        "date_part" => {
-            if args.get(1).is_some_and(|arg| is_interval_typed(arg, schema, options)) {
-                Err(Error::forward_refusal(
-                    "date_part over an interval cannot be translated: reading a field out of an \
-                     interval is a value read the replica does not translate. Read the stored \
-                     text in the application."
-                        .to_string(),
-                ))
-            } else {
-                Ok(None)
-            }
-        }
-        "to_char" => {
-            if args.first().is_some_and(|arg| is_interval_typed(arg, schema, options)) {
-                Err(Error::forward_refusal(
-                    "to_char over an interval cannot be translated: rendering an interval from \
-                     its fields is a value read the replica does not translate. Read the \
-                     stored text in the application."
-                        .to_string(),
-                ))
-            } else {
-                Ok(None)
-            }
-        }
         "abs" => {
             if any_interval_typed(&args, schema, options) {
                 return Err(Error::forward_refusal(
@@ -843,14 +805,7 @@ fn count(
     })))
 }
 
-/// The interval translation of a `sum` or `avg` call: the fields summed the
-/// way PostgreSQL's `do_interval_accum` adds row by row, an average divided
-/// by the row count the way `interval_avg` divides, rendered in the text
-/// PostgreSQL prints.
-///
-/// # Errors
-///
-/// Propagates the refusal the call answers.
+/// Translates an interval aggregate and its row selection clauses.
 fn interval_aggregate(
     kind: Aggregate,
     func: &Function,
@@ -874,11 +829,9 @@ fn interval_aggregate(
              arguments, so this is not a statement the server runs."
         )));
     }
-    if list.duplicate_treatment.is_some() {
+    if list.duplicate_treatment == Some(DuplicateTreatment::Distinct) {
         return Err(Error::forward_refusal(format!(
-            "{name}(DISTINCT) over an interval cannot be translated: the fields are summed over \
-             every row, and PostgreSQL decides the distinct rows on the value, not the text. \
-             Aggregate in the application."
+            "{name}(DISTINCT interval) requires PostgreSQL interval equality rather than stored text equality."
         )));
     }
     if args.len() > 1 {
@@ -886,19 +839,29 @@ fn interval_aggregate(
     }
     if func.over.is_some() {
         return Err(Error::forward_refusal(format!(
-            "{name} over an interval with an OVER clause cannot be translated: the fields are \
-             summed in a scalar subquery, and SQLite does not allow one inside a window \
-             function."
+            "{name}(interval) OVER requires window support unavailable in the registered aggregate."
         )));
     }
-    if func.filter.is_some() || !func.within_group.is_empty() || func.null_treatment.is_some() {
+    if !func.within_group.is_empty() || func.null_treatment.is_some() {
         return Err(Error::forward_refusal(format!(
-            "{name} over an interval with a FILTER or WITHIN GROUP clause cannot be translated: \
-             the fields are summed in a scalar subquery, and the clause does not carry \
-             through it. Aggregate in the application."
+            "{name}(interval) does not accept WITHIN GROUP or a null treatment."
         )));
     }
-    Ok(Some(super::fields::aggregate(kind, args[0], schema, options, emit)?))
+    let mut translated = super::fields::aggregate(kind, args[0], schema, options, emit)?;
+    if let Expr::Function(function) = &mut translated {
+        function.filter = func
+            .filter
+            .as_ref()
+            .map(|filter| filter.translate_with_warnings(schema, options, emit).map(Box::new))
+            .transpose()?;
+        if let FunctionArguments::List(arguments) = &mut function.args {
+            arguments.duplicate_treatment = list.duplicate_treatment;
+            arguments.clauses = crate::impls::shared_helpers::translate_function_argument_clauses::<
+                crate::impls::translator_impls::Forward,
+            >(&list.clauses, schema, options, emit)?;
+        }
+    }
+    Ok(Some(translated))
 }
 
 /// PostgreSQL's spelling of a call's arguments, a named one as `name => type`.

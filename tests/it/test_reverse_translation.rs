@@ -178,24 +178,6 @@ mod roundtrip {
     }
 
     #[test]
-    fn test_strftime_to_extract_roundtrip() {
-        let pg_ddl = "CREATE TABLE events (id UUID PRIMARY KEY, created_at TIMESTAMP);";
-        let translator = setup_translator(pg_ddl);
-        let schema = translator.build_schema().unwrap();
-        let options = Pg2SqliteOptions::default();
-
-        let sqlite_sql = "SELECT strftime('%Y', created_at) FROM events";
-        let pg_stmts = translator.reverse_sql(sqlite_sql, &schema, &options).unwrap();
-
-        assert_eq!(pg_stmts.len(), 1);
-        let pg_sql = pg_stmts[0].to_string();
-        assert!(pg_sql.contains("EXTRACT(YEAR FROM"));
-        assert!(!pg_sql.contains("strftime"));
-        Parser::parse_sql(&PostgreSqlDialect {}, &pg_sql)
-            .expect("reverse output must parse as PostgreSQL");
-    }
-
-    #[test]
     fn test_instr_to_position_roundtrip() {
         let pg_ddl = "CREATE TABLE docs (id UUID PRIMARY KEY, content TEXT);";
         let translator = setup_translator(pg_ddl);

@@ -104,7 +104,5 @@ pub fn utc_script(sql: &str) -> String {
 /// Never, since UTC is a zone PostgreSQL accepts.
 #[must_use]
 pub fn utc_request() -> Pg2SqliteOptions {
-    let deployment =
-        deployment([], []).with_default_time_zone("UTC").expect("PostgreSQL accepts UTC");
-    super::jsonb_functions::with_functions(Pg2SqliteOptions::default()).with_deployment(deployment)
+    super::temporal::options("UTC")
 }

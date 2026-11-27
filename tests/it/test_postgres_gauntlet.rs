@@ -60,6 +60,9 @@ mod parity_text;
 #[path = "gauntlet/parity_datetime.rs"]
 mod parity_datetime;
 
+#[path = "gauntlet/parity_microsecond_arithmetic.rs"]
+mod parity_microsecond_arithmetic;
+
 #[path = "gauntlet/parity_ddl.rs"]
 mod parity_ddl;
 

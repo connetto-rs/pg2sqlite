@@ -153,9 +153,8 @@ fn scalar_functions_reverse_to_postgres_spellings() {
         ("SELECT total(n) FROM t", Emits("COALESCE")),
         ("SELECT hex(s) FROM t", Emits("encode")),
         ("SELECT unhex(s) FROM t", Emits("decode")),
-        ("SELECT unixepoch(s) FROM t", Emits("EXTRACT")),
-        // SQLite answers whole seconds, so the fraction is floored off.
-        ("SELECT unixepoch() FROM t", Emits("floor(EXTRACT(EPOCH FROM NOW()))::BIGINT")),
+        ("SELECT unixepoch(s) FROM t", Rejected),
+        ("SELECT unixepoch() FROM t", Rejected),
         // Already correct.
         ("SELECT group_concat(s, ',') FROM t", Emits("string_agg(s, ',')")),
         // PostgreSQL has no one-argument string_agg, so the comma SQLite
@@ -188,17 +187,15 @@ fn sqlite_only_functions_are_rejected() {
     ]);
 }
 
-/// PostgreSQL has no `strftime`. Three tables decide what one becomes, and
-/// every format outside them is refused rather than forwarded.
+/// Handwritten `strftime` calls have no supported reversal.
 #[test]
-fn strftime_becomes_a_postgres_spelling_or_nothing() {
+fn handwritten_strftime_is_rejected() {
     check(&[
-        ("SELECT strftime('%Y-01-01 00:00:00', s) FROM t", Emits("date_trunc('year', s)")),
-        ("SELECT strftime('%Y', s) FROM t", Emits("EXTRACT(YEAR FROM s)")),
-        ("SELECT strftime('%Y-%m-%d', s) FROM t", Emits("to_char(s, 'YYYY-MM-DD')")),
-        ("SELECT strftime('%H:%M:%S', s) FROM t", Emits("to_char(s, 'HH24:MI:SS')")),
-        // PostgreSQL reads a bare template `T` as the start of `TH` or `TM`.
-        ("SELECT strftime('%Y-%m-%dT%H', s) FROM t", Emits("to_char(s, 'YYYY-MM-DD\"T\"HH24')")),
+        ("SELECT strftime('%Y-01-01 00:00:00', s) FROM t", Rejected),
+        ("SELECT strftime('%Y', s) FROM t", Rejected),
+        ("SELECT strftime('%Y-%m-%d', s) FROM t", Rejected),
+        ("SELECT strftime('%H:%M:%S', s) FROM t", Rejected),
+        ("SELECT strftime('%Y-%m-%dT%H', s) FROM t", Rejected),
         // The Sunday based week, which no PostgreSQL field matches.
         ("SELECT strftime('%W', s) FROM t", Rejected),
         // SQLite has no `%y`, so the call answers NULL and names nothing.

@@ -1,16 +1,8 @@
-//! R2-18: Interval notation refusals and unimplemented shapes.
-//!
-//! Verified on postgres:18-alpine:
-//!   TIMESTAMP '2024-01-01 00:00:00' + 3 * INTERVAL '1 day'   -> 2024-01-04
-//!   TIMESTAMP '2024-01-01 00:00:00' + INTERVAL '1 day' * 3   -> 2024-01-04
-//!   INTERVAL '1 day' + TIMESTAMP '2024-01-01 00:00:00'        -> 2024-01-04
-//!
-//! Refusal contract: `ts + $1 * INTERVAL '1 day'` must say the scalar cannot be
-//! folded at translation time.
+//! Interval notation and scalar arithmetic.
 
 use diesel::{QueryableByName, RunQueryDsl, sql_query, sql_types};
 use helpers::establish_connection;
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+use pg2sqlite::prelude::Pg2Sqlite;
 
 use crate::helpers;
 
@@ -18,21 +10,12 @@ fn tr(pg: &str) -> String {
     Pg2Sqlite::default()
         .sql(pg)
         .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
+        .translate_to_sql(&helpers::function_options())
         .expect("translate")
         .into_vec()
         .into_iter()
         .find(|s| !s.starts_with("PRAGMA"))
         .expect("at least one user statement")
-}
-
-fn tr_err(pg: &str) -> String {
-    Pg2Sqlite::default()
-        .sql(pg)
-        .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
-        .expect_err("must fail")
-        .to_string()
 }
 
 #[derive(QueryableByName)]
@@ -60,13 +43,8 @@ fn interval_left_of_timestamp_commutes_and_executes() {
     );
 }
 
-// --- R2-18b: scalar * INTERVAL constant-fold
-// ----------------------------------
-
-/// `TIMESTAMP + n * INTERVAL` folds the integer scalar into the modifier count.
-/// Measured on postgres:18-alpine: 2024-01-04.
 #[test]
-fn scalar_times_interval_on_right_folds_to_modifier() {
+fn scalar_times_interval_on_right_executes() {
     let sql = tr("SELECT TIMESTAMP '2024-01-01 00:00:00' + 3 * INTERVAL '1 day' AS r");
     let mut conn = establish_connection();
     // sql_query: running dynamically generated translated SQL.
@@ -79,10 +57,8 @@ fn scalar_times_interval_on_right_folds_to_modifier() {
     );
 }
 
-/// `TIMESTAMP + INTERVAL * n` (operands flipped inside the multiplication) also
-/// folds. Measured on postgres:18-alpine: 2024-01-04.
 #[test]
-fn interval_times_scalar_on_right_folds_to_modifier() {
+fn interval_times_scalar_on_right_executes() {
     let sql = tr("SELECT TIMESTAMP '2024-01-01 00:00:00' + INTERVAL '1 day' * 3 AS r");
     let mut conn = establish_connection();
     // sql_query: running dynamically generated translated SQL.
@@ -107,24 +83,18 @@ fn hh_mm_ss_interval_is_added() {
     assert_eq!(rows[0].r, "2024-01-01 01:30:00", "{sql}");
 }
 
-/// `ts + $1 * INTERVAL '1 day'` cannot be folded at translation time because
-/// the scalar is a runtime parameter. The refusal must say so, not blame
-/// INTERVAL.
 #[test]
-fn runtime_scalar_interval_refusal_names_folding_limit() {
-    let err = tr_err("SELECT TIMESTAMP '2024-01-01 00:00:00' + $1 * INTERVAL '1 day' AS r");
-    assert!(
-        err.to_lowercase().contains("fold")
-            || err.to_lowercase().contains("translation time")
-            || err.to_lowercase().contains("runtime"),
-        "refusal must say the scalar cannot be folded at translation time, got: {err}"
-    );
+fn runtime_scalar_interval_executes() {
+    let sql = tr("SELECT TIMESTAMP '2024-01-01 00:00:00' + $1 * INTERVAL '1 day' AS r");
+    let mut connection = establish_connection();
+    // The probe executes the translator's generated SQL.
+    let rows = sql_query(&sql)
+        .bind::<sql_types::Integer, _>(3)
+        .load::<ScalarText>(&mut connection)
+        .expect("bound scalar");
+    assert_eq!(rows[0].r, "2024-01-04 00:00:00");
 }
 
-// --- regression: existing verbose-form intervals still work ------------------
-
-/// Plain verbose `INTERVAL '1 day'` arithmetic already works; this guards
-/// against regressions in the new code paths.
 #[test]
 fn verbose_interval_arithmetic_still_translates() {
     let sql = tr("SELECT TIMESTAMP '2024-01-01 00:00:00' + INTERVAL '1 day' AS r");

@@ -492,6 +492,7 @@ const POSTGRES_ONLY: &[&str] = &[
     "string_to_array",
     "strpos",
     "timeofday",
+    "timezone",
     "to_char",
     "to_date",
     "to_json",
@@ -591,12 +592,18 @@ mod tests {
             );
         }
     }
-    const DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, s TEXT, n INT, r REAL, bin BYTEA, \
+    const DDL: &str = "CREATE ROLE app; CREATE TABLE t (id INT PRIMARY KEY, s TEXT, n INT, r REAL, bin BYTEA, \
                        ts TIMESTAMP, payload JSONB);";
 
     fn options() -> Pg2SqliteOptions {
+        let deployment = sql_traits::structs::Deployment::new("app", ["app"], [])
+            .expect("valid deployment")
+            .with_default_time_zone("UTC")
+            .expect("valid time zone");
         Pg2SqliteOptions::default()
+            .with_deployment(deployment)
             .with_math_functions_available()
+            .with_temporal_functions(pg2sqlite_runtime::TemporalFunctions::default())
             .with_jsonb_functions(crate::prelude::JsonbFunctions::new(
                 "pg_jsonb",
                 "pg_jsonb_text",
@@ -627,11 +634,21 @@ mod tests {
     }
 
     fn reversible_call(name: &str) -> Option<(String, String)> {
+        if matches!(name, "current_date" | "current_time" | "current_timestamp") {
+            let sqlite = format!("SELECT {name} FROM t");
+            return reverse(&sqlite).ok().map(|postgres| (sqlite, postgres));
+        }
         const ARGUMENTS: [&str; 4] = ["s", "s, s", "s, s, s", ""];
         ARGUMENTS.iter().find_map(|arguments| {
             let sqlite = format!("SELECT {name}({arguments}) FROM t");
             reverse(&sqlite).ok().map(|postgres| (sqlite, postgres))
         })
+    }
+
+    #[test]
+    fn timezone_is_a_postgres_builtin() {
+        assert!(classify("timezone").postgres_only);
+        assert!(reverse("SELECT timezone('UTC', ts) FROM t").is_ok());
     }
 
     #[test]

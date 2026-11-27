@@ -1,37 +1,32 @@
-//! Fractional seconds survive `extract(epoch)`, `to_timestamp`, `make_time`
-//! and `make_timestamp`.
-//!
-//! All four used to round to whole seconds without saying so:
-//! `strftime('%s', ...)` has no fractional part, `datetime(e, 'unixepoch')`
-//! renders none, and `printf('%02d', ...)` truncates the argument it is given.
-//!
-//! SQLite stops at milliseconds where PostgreSQL carries microseconds, so the
-//! two agree to three decimal places and no further. That ceiling is pinned
-//! here and documented in the README, since only the timestamp paths hit it:
-//! `make_time` formats its own argument and never goes through SQLite's date
-//! machinery, so it keeps a microsecond.
-//!
-//! Every expected value below was read off PostgreSQL 17 before the change.
+//! Microsecond precision in temporal functions.
 
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use rusqlite::types::FromSql;
+use std::{fmt::Debug, str::FromStr};
+
+use pg2sqlite::prelude::Pg2Sqlite;
 
 use crate::helpers;
 const TABLE: &str = "CREATE TABLE t (ts TIMESTAMP, n DOUBLE PRECISION);";
 
 fn translate(pg: &str) -> String {
     Pg2Sqlite::default()
-        .sql(&format!("{TABLE}\n{pg}"))
+        .sql(&helpers::deployment::utc_script(&format!("{TABLE}\n{pg}")))
         .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
+        .translate_to_sql(&helpers::deployment::utc_request())
         .expect("translate")
         .into_vec()
         .pop()
         .expect("a probe statement")
 }
 
-fn evaluate<T: FromSql>(pg: &str) -> T {
-    helpers::evaluate_probe(&translate(pg))
+fn evaluate<T: FromStr>(pg: &str) -> T
+where
+    T::Err: Debug,
+{
+    helpers::run_translated::run_translated_utc(pg)[0]
+        .as_deref()
+        .expect("non-null answer")
+        .parse()
+        .expect("answer type")
 }
 
 /// Reverse translates one SQLite statement back to PostgreSQL.
@@ -39,7 +34,7 @@ fn reverse(sqlite: &str) -> String {
     let translator = Pg2Sqlite::default().sql(TABLE).expect("parse the schema");
     let schema = translator.build_schema().expect("build the schema");
     translator
-        .reverse_sql(sqlite, &schema, &Pg2SqliteOptions::default())
+        .reverse_sql(sqlite, &schema, &helpers::function_options())
         .expect("reverse translate")
         .pop()
         .expect("a statement")
@@ -51,7 +46,8 @@ fn reverse(sqlite: &str) -> String {
 /// PostgreSQL answers 1709647629.500000.
 #[test]
 fn extract_epoch_keeps_the_fraction() {
-    let answer: f64 = evaluate("SELECT extract(epoch from timestamp '2024-03-05 14:07:09.5');");
+    let answer: f64 =
+        evaluate("SELECT extract(epoch from timestamp '2024-03-05 14:07:09.5')::double precision;");
     assert!((answer - 1_709_647_629.5).abs() < 1e-6, "got {answer}");
 }
 
@@ -64,28 +60,18 @@ fn date_part_epoch_keeps_the_fraction() {
 /// PostgreSQL answers 1709647629 for a whole second and 1709596800 for a date.
 #[test]
 fn epoch_without_a_fraction_is_unchanged() {
-    let whole: f64 = evaluate("SELECT extract(epoch from timestamp '2024-03-05 14:07:09');");
+    let whole: f64 =
+        evaluate("SELECT extract(epoch from timestamp '2024-03-05 14:07:09')::double precision;");
     assert!((whole - 1_709_647_629.0).abs() < 1e-6, "got {whole}");
-    let day: f64 = evaluate("SELECT extract(epoch from date '2024-03-05');");
+    let day: f64 = evaluate("SELECT extract(epoch from date '2024-03-05')::double precision;");
     assert!((day - 1_709_596_800.0).abs() < 1e-6, "got {day}");
 }
 
-/// F1 intercepts a difference of two timestamps as a pair, before either call
-/// is reversed on its own. That interception must survive this item, which
-/// makes the crate emit the same spelling on its own for the first time.
 #[test]
-fn the_paired_epoch_difference_is_still_intercepted_whole() {
-    assert_eq!(
-        translate(
-            "SELECT extract(epoch from (timestamp '2024-03-05 14:07:09.5' \
-             - timestamp '2024-03-05 14:07:09'));"
-        ),
-        "SELECT (unixepoch('2024-03-05 14:07:09.5', 'subsec') \
-         - unixepoch('2024-03-05 14:07:09', 'subsec'))"
-    );
+fn the_epoch_difference_keeps_the_fraction() {
     let answer: f64 = evaluate(
         "SELECT extract(epoch from (timestamp '2024-03-05 14:07:09.5' \
-                 - timestamp '2024-03-05 14:07:09'));",
+                 - timestamp '2024-03-05 14:07:09'))::double precision;",
     );
     assert!((answer - 0.5).abs() < 1e-6, "got {answer}");
 }
@@ -96,15 +82,24 @@ fn the_paired_epoch_difference_is_still_intercepted_whole() {
 /// literal keeps its own `.5`, so the two texts have to agree to compare equal.
 #[test]
 fn to_timestamp_keeps_the_fraction() {
-    assert_eq!(evaluate::<String>("SELECT to_timestamp(1709647629.5);"), "2024-03-05 14:07:09.5");
+    assert_eq!(
+        evaluate::<String>("SELECT to_timestamp(1709647629.5)::text;"),
+        "2024-03-05 14:07:09.5+00"
+    );
 }
 
 /// PostgreSQL answers 2024-03-05 14:07:09+00, with no fractional part at all.
 #[test]
 fn to_timestamp_of_a_whole_second_renders_no_fraction() {
-    assert_eq!(evaluate::<String>("SELECT to_timestamp(1709647629);"), "2024-03-05 14:07:09");
-    assert_eq!(evaluate::<String>("SELECT to_timestamp(1709647630);"), "2024-03-05 14:07:10");
-    assert_eq!(evaluate::<String>("SELECT to_timestamp(0);"), "1970-01-01 00:00:00");
+    assert_eq!(
+        evaluate::<String>("SELECT to_timestamp(1709647629)::text;"),
+        "2024-03-05 14:07:09+00"
+    );
+    assert_eq!(
+        evaluate::<String>("SELECT to_timestamp(1709647630)::text;"),
+        "2024-03-05 14:07:10+00"
+    );
+    assert_eq!(evaluate::<String>("SELECT to_timestamp(0)::text;"), "1970-01-01 00:00:00+00");
 }
 
 // ---------- make_time and make_timestamp ----------
@@ -123,9 +118,7 @@ fn make_time_of_whole_seconds_renders_no_fraction() {
     assert_eq!(evaluate::<String>("SELECT make_time(8, 15, 0);"), "08:15:00");
 }
 
-/// PostgreSQL answers 08:15:00.000001 and 08:15:59.999999. `make_time` formats
-/// its own argument, so it is exact to the microsecond where the timestamp
-/// paths stop at the millisecond.
+/// `make_time` preserves six fractional digits.
 #[test]
 fn make_time_keeps_a_microsecond() {
     assert_eq!(evaluate::<String>("SELECT make_time(8, 15, 0.000001);"), "08:15:00.000001");
@@ -151,8 +144,7 @@ fn make_date_is_unaffected() {
     assert_eq!(evaluate::<String>("SELECT make_date(2024, 3, 5);"), "2024-03-05");
 }
 
-/// PostgreSQL answers NULL when any argument is NULL. `printf` renders a NULL
-/// as zero, so every one of these used to answer a plausible wrong string.
+/// Constructors propagate null arguments.
 #[test]
 fn a_null_argument_makes_every_make_function_null() {
     for call in [
@@ -163,43 +155,27 @@ fn a_null_argument_makes_every_make_function_null() {
         "make_timestamp(2024, 3, 5, 14, 7, NULL)",
     ] {
         assert_eq!(
-            evaluate::<Option<String>>(&format!("SELECT {call};")),
+            helpers::run_translated::run_translated_utc(&format!("SELECT {call};"))[0],
             None,
             "{call} must be NULL"
         );
     }
 }
 
-// ---------- the ceiling ----------
-
-/// PostgreSQL answers 1709647629.123456 and 2024-03-05 14:07:09.123456.
-/// SQLite's date functions hold milliseconds, so both stop at three decimals.
-/// This is the README's caveat, pinned so it cannot go stale unnoticed.
+/// Timestamp functions preserve six fractional digits.
 #[test]
-fn the_timestamp_paths_stop_at_the_millisecond() {
-    let epoch: f64 = evaluate("SELECT extract(epoch from timestamp '2024-03-05 14:07:09.123456');");
-    assert!((epoch - 1_709_647_629.123).abs() < 1e-6, "got {epoch}");
+fn the_timestamp_paths_keep_microseconds() {
+    let epoch: f64 = evaluate(
+        "SELECT extract(epoch from timestamp '2024-03-05 14:07:09.123456')::double precision;",
+    );
+    assert!((epoch - 1_709_647_629.123456).abs() < 1e-6, "got {epoch}");
     assert_eq!(
-        evaluate::<String>("SELECT to_timestamp(1709647629.123456);"),
-        "2024-03-05 14:07:09.123"
+        evaluate::<String>("SELECT to_timestamp(1709647629.123456)::text;"),
+        "2024-03-05 14:07:09.123456+00"
     );
 }
 
 // ---------- the way back ----------
-
-/// The crate now emits a lone `unixepoch(x, 'subsec')`, so it has to read one
-/// back. Before this item only the paired form was ever emitted.
-#[test]
-fn a_lone_subsecond_unixepoch_reverses_to_extract_epoch() {
-    let pg = reverse("SELECT unixepoch(ts, 'subsec') FROM t;");
-    assert!(pg.contains("EXTRACT(EPOCH FROM ts)"), "{pg}");
-}
-
-#[test]
-fn a_subsecond_datetime_reverses_to_to_timestamp() {
-    let pg = reverse("SELECT datetime(n, 'unixepoch', 'subsec') FROM t;");
-    assert!(pg.contains("to_timestamp(n)"), "{pg}");
-}
 
 /// The shapes the crate itself emits have to come back, or it can no longer
 /// read its own output. This reverses the exact emitted text rather than a
@@ -210,8 +186,11 @@ fn the_crate_reads_back_what_it_emitted() {
     for pg in ["SELECT extract(epoch from ts) FROM t;", "SELECT to_timestamp(n) FROM t;"] {
         let emitted = translate(pg);
         let restored = reverse(&format!("{emitted};"));
-        let wanted =
-            if pg.contains("epoch from") { "EXTRACT(EPOCH FROM ts)" } else { "to_timestamp(n)" };
+        let wanted = if pg.contains("epoch from") {
+            "EXTRACT(EPOCH FROM ts::TIMESTAMP)"
+        } else {
+            "to_timestamp(n)"
+        };
         assert!(restored.contains(wanted), "{pg}\n  emitted {emitted}\n  restored {restored}");
     }
 }

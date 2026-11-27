@@ -1,45 +1,29 @@
-//! Tests for EXTRACT(field FROM expr) translation to SQLite strftime.
+//! Tests for temporal field extraction.
 
 use diesel::RunQueryDsl;
 
 use crate::helpers;
 
-/// `EXTRACT(WEEK)` is the ISO week, which SQLite spells `%V`. `%W` is the
-/// Sunday based one and disagrees at every year boundary, so emitting it would
-/// be a silently wrong answer rather than a failure.
-///
-/// The values are asserted over the boundary dates in
-/// `tests/it/test_iso_week.rs`. This guards the format alone, since a return to
-/// `%W` would still translate and still run.
 #[test]
-fn extract_week_uses_the_iso_format() {
+fn extract_week_calls_the_temporal_function() {
     let sql = "
-        CREATE TABLE week_test (id INTEGER PRIMARY KEY, ts TEXT);
+        CREATE TABLE week_test (id INTEGER PRIMARY KEY, ts TIMESTAMP);
         SELECT EXTRACT(WEEK FROM ts) FROM week_test;
     ";
     let (statements, query) = helpers::translate::translate_utc_statements_and_first_query(sql);
 
-    assert!(query.contains("'%V'"), "expected the ISO week format: {query}");
-    assert!(!query.contains("'%W'"), "%W is Sunday based, not ISO: {query}");
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    for statement in &statements {
-        conn.execute_batch(&format!("{statement};")).unwrap_or_else(|e| {
-            panic!("EXTRACT(WEEK) output must run in SQLite: {e}\n{statement}")
-        });
-    }
+    assert!(query.contains("pg2sqlite_extract_timestamp('WEEK', ts)"), "{query}");
+    helpers::apply_statements(&statements);
 }
 
 /// The EXTRACT(SECOND) translation must produce runnable SQLite.
 #[test]
 fn extract_second_produces_valid_sqlite() -> Result<(), Box<dyn std::error::Error>> {
-    let sql = "CREATE TABLE sec2_test (id INTEGER PRIMARY KEY, ts TEXT NOT NULL);
-               SELECT EXTRACT(SECOND FROM ts) AS secs FROM sec2_test;";
+    let sql = "CREATE TABLE sec2_test (id INTEGER PRIMARY KEY, ts TIMESTAMP NOT NULL);
+               SELECT EXTRACT(SECOND FROM ts)::double precision AS secs FROM sec2_test;";
     let (translated, select_sql) =
         helpers::translate::translate_utc_statements_and_first_query(sql);
-    assert!(
-        select_sql.to_lowercase().contains("strftime"),
-        "EXTRACT(SECOND) must use strftime, got: {select_sql}"
-    );
+    assert!(select_sql.contains("pg2sqlite_extract_timestamp"), "{select_sql}");
 
     let mut conn = helpers::apply_statements(&translated);
     diesel::sql_query("INSERT INTO sec2_test VALUES (1, '2024-01-15 10:30:45.123')")

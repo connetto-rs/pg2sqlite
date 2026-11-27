@@ -66,7 +66,7 @@ const WRITTEN: &str = "decode('0102', 'hex'), '\\x0a'::bytea, \
                        '03:04:05+02'::timetz, n * 2, ts + INTERVAL '1 day', (j)";
 
 fn options() -> Pg2SqliteOptions {
-    crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default())
+    crate::helpers::temporal::options("UTC")
         .with_uuid_representation(UuidRepresentation::Blob)
         .with_array_representation(ArrayRepresentation::Json)
 }
@@ -110,7 +110,7 @@ fn setup_pg() -> PgConnection {
 // insertable covers on both backends.
 fn setup_sqlite() -> SqliteConnection {
     let statements = Pg2Sqlite::default()
-        .sql(&format!("{SCHEMA}{SEEDS}"))
+        .sql(&crate::helpers::deployment::utc_script(&format!("{SCHEMA}{SEEDS}")))
         .expect("parse schema and seeds")
         .translate_to_sql(&options())
         .expect("translate schema and seeds")
@@ -143,7 +143,7 @@ fn sqlite_answer(
 ) -> Result<Option<String>, String> {
     let probe = format!("{SCHEMA}SELECT {expression} AS val FROM json_vals {filter};");
     let translated = Pg2Sqlite::default()
-        .sql(&probe)
+        .sql(&crate::helpers::deployment::utc_script(&probe))
         .expect("parse probe")
         .translate_to_sql(&options())
         .map_err(|error| format!("refused: {error}"))?

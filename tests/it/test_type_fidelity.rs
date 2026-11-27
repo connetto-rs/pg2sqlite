@@ -1223,11 +1223,19 @@ fn a_utc_marker_becomes_a_zero_offset() {
 
 #[test]
 fn an_impossible_offset_is_refused() {
-    // PostgreSQL's offsets run to ±15:59; anything past that is not a zone.
     let message = temporal_refusal("timestamptz", "2024-01-02 03:04:05+20");
     assert!(message.contains("out of range"), "{message}");
-    let too_many = temporal_refusal("timestamptz", "2024-01-02 03:04:05+02:00:00");
-    assert!(too_many.contains("too many parts"), "{too_many}");
+}
+
+#[test]
+fn an_offset_with_seconds_is_normalised() {
+    let rows = query_rows(
+        "CREATE TABLE t (v timestamptz);
+         INSERT INTO t (v) VALUES ('2024-01-02 03:04:05+02:00:00');
+         SELECT v FROM t;",
+        &default_opts(),
+    );
+    assert_eq!(rows, vec![Some("2024-01-02 01:04:05.000000+00:00".to_string())]);
 }
 
 #[test]

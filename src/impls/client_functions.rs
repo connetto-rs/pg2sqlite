@@ -24,7 +24,7 @@ use crate::no_std::prelude::*;
 use crate::{
     errors::{Error, SqlParseError},
     impls::{column_access, session_variable},
-    options::{Declaration, TranslationContext},
+    options::TranslationContext,
     script::HelperFunction,
     traits::TranslatorWithContext,
     warnings::WarningSink,
@@ -118,8 +118,6 @@ fn client_function(
         .collect();
     let typed = context.with_parameter_types(&parameter_types);
     let written = typed.with_written_schema(schema);
-    let written =
-        written.with_declaration(Declaration::Statement { statement: &statement, schema });
     let ambiguous = column_access::resolve_columns(&statement, schema, &written)?;
     let translated = column_access::with_ambiguity(
         ambiguous,

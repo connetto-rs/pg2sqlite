@@ -1,10 +1,6 @@
-//! Guards on `make_date`, `make_time`, `make_timestamp`, `greatest`, `least`,
-//! `left`, `right`, and `cbrt`: each lowering names an operand in more than
-//! one output position, so a volatile operand would be evaluated more often
-//! than PostgreSQL evaluates it, and the copies would answer from draws
-//! PostgreSQL never made.
+//! Operand evaluation counts for scalar function translations.
 
-use diesel::{RunQueryDsl, SqliteConnection, prelude::*};
+use diesel::{RunQueryDsl, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
 fn translate_err(pg: &str, options: &Pg2SqliteOptions) -> String {
@@ -46,7 +42,7 @@ struct TextResult {
 /// The statement is the translator's own output, so `diesel::sql_query` is the
 /// correct form: the typed DSL cannot express a dynamically generated string.
 fn exec_scalar(sql: &str) -> String {
-    let mut conn = SqliteConnection::establish(":memory:").expect("in-memory SQLite");
+    let mut conn = crate::helpers::establish_connection();
     diesel::sql_query(sql)
         .load::<TextResult>(&mut conn)
         .unwrap_or_else(|e| panic!("query failed: {e}\n{sql}"))
@@ -59,58 +55,53 @@ fn exec_scalar(sql: &str) -> String {
 // ── C1: make_time
 // ─────────────────────────────────────────────────────────────
 
-/// `make_time(h, m, s)` names each argument in both the NULL-presence guard and
-/// the format expression. A volatile argument for `s` would be evaluated four
-/// times at runtime where PostgreSQL evaluates it once, answering a time whose
-/// seconds component advances with each draw.
 #[test]
-fn make_time_refuses_volatile_seconds() {
-    let err = translate_err("SELECT make_time(12, 0, random())", &Pg2SqliteOptions::default());
-    assert!(err.contains("make_time"), "error should name make_time: {err}");
+fn make_time_reads_volatile_seconds_once() {
+    let sql =
+        translate_ok("SELECT make_time(12, 0, random())", &crate::helpers::function_options());
+    assert_eq!(sql.matches("random()").count(), 1);
 }
 
 /// Literal arguments are replayable; the ordinary `make_time` still translates
 /// and the emitted SQL executes to the expected time string.
 #[test]
 fn make_time_with_literal_args_executes() {
-    let sql = translate_ok("SELECT make_time(12, 30, 15) AS result", &Pg2SqliteOptions::default());
+    let sql =
+        translate_ok("SELECT make_time(12, 30, 15) AS result", &crate::helpers::function_options());
     assert_eq!(exec_scalar(&sql), "12:30:15");
 }
 
 // ── C1: make_date
 // ─────────────────────────────────────────────────────────────
 
-/// `make_date(y, m, d)` names each argument in the NULL guard and the format
-/// string. A volatile year would cause the date to be constructed from draws
-/// that disagree.
 #[test]
-fn make_date_refuses_volatile_year() {
-    let err = translate_err("SELECT make_date(random()::int, 1, 1)", &Pg2SqliteOptions::default());
-    assert!(err.contains("make_date"), "error should name make_date: {err}");
+fn make_date_reads_volatile_year_once() {
+    let sql =
+        translate_ok("SELECT make_date(random()::int, 1, 1)", &crate::helpers::function_options());
+    assert_eq!(sql.matches("random()").count(), 1);
 }
 
 /// Literal arguments are replayable; the ordinary `make_date` executes and
 /// returns the expected ISO date string.
 #[test]
 fn make_date_with_literal_args_executes() {
-    let sql = translate_ok("SELECT make_date(2024, 3, 15) AS result", &Pg2SqliteOptions::default());
+    let sql = translate_ok(
+        "SELECT make_date(2024, 3, 15) AS result",
+        &crate::helpers::function_options(),
+    );
     assert_eq!(exec_scalar(&sql), "2024-03-15");
 }
 
 // ── C2: make_timestamp
 // ────────────────────────────────────────────────────────
 
-/// `make_timestamp` names each of its six arguments in both the NULL guard and
-/// the format string. A volatile seconds argument would be evaluated four
-/// times, assembling a timestamp whose seconds field disagrees across its four
-/// reads.
 #[test]
-fn make_timestamp_refuses_volatile_seconds() {
-    let err = translate_err(
+fn make_timestamp_reads_volatile_seconds_once() {
+    let sql = translate_ok(
         "SELECT make_timestamp(2024, 1, 1, 12, 0, random())",
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::function_options(),
     );
-    assert!(err.contains("make_timestamp"), "error should name make_timestamp: {err}");
+    assert_eq!(sql.matches("random()").count(), 1);
 }
 
 /// Literal arguments are replayable; the ordinary `make_timestamp` executes
@@ -119,7 +110,7 @@ fn make_timestamp_refuses_volatile_seconds() {
 fn make_timestamp_with_literal_args_executes() {
     let sql = translate_ok(
         "SELECT make_timestamp(2024, 3, 15, 12, 30, 45) AS result",
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::function_options(),
     );
     assert_eq!(exec_scalar(&sql), "2024-03-15 12:30:45");
 }

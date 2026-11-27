@@ -100,13 +100,11 @@ fn unhex_becomes_decode_hex() {
 }
 
 #[test]
-fn unixepoch_becomes_extract_epoch() {
-    let out = ok("SELECT unixepoch(s) FROM t");
-    assert!(out.contains("EXTRACT"), "expected EXTRACT in: {out}");
-    assert!(out.contains("EPOCH"), "expected EPOCH in: {out}");
-    assert!(!out.to_ascii_lowercase().contains("unixepoch("), "unixepoch( survived into: {out}");
-    Parser::parse_sql(&PostgreSqlDialect {}, &out)
-        .expect("reverse output must parse as PostgreSQL");
+fn unixepoch_is_rejected() {
+    for query in ["SELECT unixepoch(s) FROM t", "SELECT unixepoch() FROM t"] {
+        let error = err(query);
+        assert!(error.contains("unixepoch"), "{error}");
+    }
 }
 
 // ---------- rejected cases ----------

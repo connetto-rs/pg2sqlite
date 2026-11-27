@@ -14,7 +14,7 @@ pub fn assert_refused(pg: &str, needle: &str) {
     let error = Pg2Sqlite::default()
         .sql(pg)
         .expect("parse")
-        .translate_to_sql(&super::jsonb_functions::with_functions(Pg2SqliteOptions::default()))
+        .translate_to_sql(&super::function_options())
         .expect_err("should be refused at translation time");
     assert!(error.to_string().contains(needle), "refusal {error} should name {needle}");
 }
@@ -28,7 +28,7 @@ pub fn translate_default(sql: &str) -> String {
     Pg2Sqlite::default()
         .sql(sql)
         .unwrap()
-        .translate(&super::jsonb_functions::with_functions(Pg2SqliteOptions::default()))
+        .translate(&super::function_options())
         .unwrap()
         .into_vec()
         .iter()
@@ -43,7 +43,7 @@ pub fn translate_default_err(sql: &str) -> String {
     Pg2Sqlite::default()
         .sql(sql)
         .unwrap()
-        .translate(&super::jsonb_functions::with_functions(Pg2SqliteOptions::default()))
+        .translate(&super::function_options())
         .unwrap_err()
         .to_string()
 }
@@ -78,10 +78,7 @@ pub fn translate_statements_and_first_query(
 
 /// [`translate_statements_and_first_query`] with default options.
 pub fn translate_default_statements_and_first_query(sql: &str) -> (Vec<String>, String) {
-    translate_statements_and_first_query(
-        sql,
-        &super::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
-    )
+    translate_statements_and_first_query(sql, &super::function_options())
 }
 
 /// [`translate_statements_and_first_query`] with default options for a server
@@ -89,9 +86,7 @@ pub fn translate_default_statements_and_first_query(sql: &str) -> (Vec<String>, 
 pub fn translate_ascii_statements_and_first_query(sql: &str) -> (Vec<String>, String) {
     translate_statements_and_first_query(
         sql,
-        &super::case_fold_functions::with_ascii_builtins(super::jsonb_functions::with_functions(
-            Pg2SqliteOptions::default(),
-        )),
+        &super::case_fold_functions::with_ascii_builtins(super::function_options()),
     )
 }
 

@@ -15,9 +15,7 @@
 //! `'today'` is resolved when the server reads it rather than standing for a
 //! fixed date.
 
-use alloc::borrow::Cow;
-
-use pg2sqlite_runtime::TypmodRounding;
+use pg2sqlite_runtime::{TemporalFunctions, TemporalKind};
 use sqlparser::ast::{DataType, TimezoneInfo};
 
 use crate::errors::Error;
@@ -125,7 +123,7 @@ pub(crate) fn normalize_temporal_literal(
             let zone = zone.map_or_else(String::new, |zone| zone.render());
             let clock = parse_time(kind, body, trimmed)?;
             let time = rounded(
-                TypmodRounding::Time,
+                TemporalKind::Time,
                 time_of_day_text(clock.micros_of_day()),
                 precision,
                 trimmed,
@@ -155,7 +153,7 @@ pub(crate) fn normalize_temporal_literal(
                     + micros_of_day
                     - offset * MICROS_PER_SECOND;
                 let instant = canonical_instant(micros, trimmed)?;
-                return rounded(TypmodRounding::TimestampTz, instant, precision, trimmed);
+                return rounded(TemporalKind::TimestampTz, instant, precision, trimmed);
             }
             // PostgreSQL reads 24:00:00 on a timestamp as the next day's
             // midnight.
@@ -167,7 +165,7 @@ pub(crate) fn normalize_temporal_literal(
                 return Err(outside_four_digit_years(trimmed));
             }
             let wall = format!("{year:04}-{month:02}-{day:02} {}", time_of_day_text(micros));
-            rounded(TypmodRounding::Timestamp, wall, precision, trimmed)
+            rounded(TemporalKind::Timestamp, wall, precision, trimmed)
         }
     }
 }
@@ -235,16 +233,14 @@ fn rounded_microseconds(fraction: &str) -> i64 {
 /// precision by the same function a replica registers, refusing a value that
 /// rounds out of the years 1 to 9999 as `literal`.
 fn rounded(
-    rounding: TypmodRounding,
+    rounding: TemporalKind,
     text: String,
     precision: Option<u32>,
     literal: &str,
 ) -> Result<String, Error> {
     let Some(precision) = precision else { return Ok(text) };
     let precision = u8::try_from(precision).unwrap_or(u8::MAX);
-    rounding
-        .round(&text, precision)
-        .map(Cow::into_owned)
+    TemporalFunctions::round(rounding, &text, precision)
         .map_err(|_| outside_four_digit_years(literal))
 }
 
@@ -326,39 +322,6 @@ fn outside_four_digit_years(text: &str) -> Error {
     ))
 }
 
-/// The refusal for date or timestamp arithmetic over literals whose answer
-/// leaves the years the replica holds.
-pub(crate) fn arithmetic_outside_four_digit_years(expression: &str, year: i64) -> Error {
-    Error::forward_refusal(format!(
-        "`{expression}` lands in the year {year}, outside the years 1 to 9999 the replica holds \
-         dates and timestamps in, and SQLite's date functions cannot answer it."
-    ))
-}
-
-/// The year a date or timestamp literal, in the text the replica stores,
-/// lands in after PostgreSQL's `timestamp + interval`: the months with the
-/// day clamped to the month's end, then the days, then the microseconds.
-/// `None` when the literal is not in that text or the counts overflow.
-pub(crate) fn year_after_shift(literal: &str, months: i64, days: i64, micros: i64) -> Option<i64> {
-    const KIND: TemporalLiteralKind =
-        TemporalLiteralKind::Timestamp { zoned: false, precision: None };
-    let (date, time) = split_timestamp(literal.strip_suffix("+00:00").unwrap_or(literal));
-    let (year, month, day) = parse_date(KIND, date, literal).ok()?;
-    let micros_of_day = match time {
-        Some(time) => parse_time(KIND, time, literal).ok()?.micros_of_day(),
-        None => 0,
-    };
-    let month_index = (i64::from(year) * 12 + i64::from(month) - 1).checked_add(months)?;
-    let (year, month) = (month_index.div_euclid(12), month_index.rem_euclid(12) + 1);
-    let month = u32::try_from(month).ok()?;
-    let day = day.min(days_in_month(year, month));
-    let micros = micros_of_day.checked_add(micros)?;
-    let day_number = days_from_civil(year, month, day)
-        .checked_add(days)?
-        .checked_add(micros.div_euclid(MICROS_PER_DAY))?;
-    Some(civil_from_days(day_number).0)
-}
-
 /// The text the replica stores for a `date`, `timestamp` or `timestamptz`
 /// later than every other.
 pub(crate) const INFINITY: &str = "infinity";
@@ -425,35 +388,32 @@ fn reject_non_iso_input(kind: TemporalLiteralKind, text: &str) -> Result<(), Err
     Ok(())
 }
 
-/// A UTC offset as written, kept apart from its text so a timestamp can be
-/// moved to UTC and a time can print it as `±HH:MM`.
+/// A signed UTC offset retaining second precision.
 #[derive(Clone, Copy)]
 struct UtcOffset {
     negative: bool,
     hours: u32,
     minutes: u32,
+    seconds: u32,
 }
 
 impl UtcOffset {
-    const UTC: Self = Self { negative: false, hours: 0, minutes: 0 };
+    const UTC: Self = Self { negative: false, hours: 0, minutes: 0, seconds: 0 };
 
-    /// `±HH:MM`, the only offset form SQLite's date functions read.
     fn render(self) -> String {
         let sign = if self.negative { '-' } else { '+' };
-        format!("{sign}{:02}:{:02}", self.hours, self.minutes)
+        if self.seconds == 0 {
+            format!("{sign}{:02}:{:02}", self.hours, self.minutes)
+        } else {
+            format!("{sign}{:02}:{:02}:{:02}", self.hours, self.minutes, self.seconds)
+        }
     }
 
     fn seconds(self) -> i64 {
-        let magnitude = i64::from(self.hours) * 3600 + i64::from(self.minutes) * 60;
+        let magnitude =
+            i64::from(self.hours) * 3600 + i64::from(self.minutes) * 60 + i64::from(self.seconds);
         if self.negative { -magnitude } else { magnitude }
     }
-}
-
-/// The `±HH:MM` text of the UTC offset `offset` seconds east.
-pub(crate) fn offset_text(offset: i32) -> String {
-    let magnitude = offset.unsigned_abs();
-    UtcOffset { negative: offset < 0, hours: magnitude / 3600, minutes: magnitude / 60 % 60 }
-        .render()
 }
 
 /// Splits a UTC offset off the end.
@@ -492,7 +452,6 @@ fn split_time_zone(
     Ok((body.trim_end(), Some(offset)))
 }
 
-/// Reads `±HH[:MM]`, whose sign is its first character.
 fn parse_offset(kind: TemporalLiteralKind, zone: &str, text: &str) -> Result<UtcOffset, Error> {
     let (sign, digits) = zone.split_at(1);
     let mut parts = digits.split(':');
@@ -501,13 +460,17 @@ fn parse_offset(kind: TemporalLiteralKind, zone: &str, text: &str) -> Result<Utc
         Some(minutes) => parse_component(kind, minutes, text)?,
         None => 0,
     };
+    let seconds: u32 = match parts.next() {
+        Some(seconds) => parse_component(kind, seconds, text)?,
+        None => 0,
+    };
     if parts.next().is_some() {
         return Err(unreadable(kind, text, "the time zone offset has too many parts."));
     }
-    if hours > 15 || minutes > 59 {
+    if hours > 15 || minutes > 59 || seconds > 59 {
         return Err(out_of_range(text));
     }
-    Ok(UtcOffset { negative: sign == "-", hours, minutes })
+    Ok(UtcOffset { negative: sign == "-", hours, minutes, seconds })
 }
 
 /// Splits a timestamp into its date and, when present, its time.
@@ -642,4 +605,31 @@ fn next_day(year: u32, month: u32, day: u32) -> (u32, u32, u32) {
         return (year, month + 1, 1);
     }
     (year + 1, 1, 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TemporalLiteralKind, normalize_temporal_literal};
+
+    #[test]
+    fn timetz_retains_offset_seconds() {
+        let kind = TemporalLiteralKind::Time { zoned: true, precision: None };
+        assert_eq!(
+            normalize_temporal_literal(kind, "12:34:56.123456+00:49:56", &|_| Ok(0)).unwrap(),
+            "12:34:56.123456+00:49:56",
+        );
+        assert_eq!(
+            normalize_temporal_literal(kind, "12:34:56-01:00:00", &|_| Ok(0)).unwrap(),
+            "12:34:56-01:00",
+        );
+    }
+
+    #[test]
+    fn temporal_precision_uses_postgres_rounding() {
+        let kind = TemporalLiteralKind::Timestamp { zoned: false, precision: Some(3) };
+        assert_eq!(
+            normalize_temporal_literal(kind, "2024-01-01 23:59:59.9995", &|_| Ok(0)).unwrap(),
+            "2024-01-02 00:00:00",
+        );
+    }
 }

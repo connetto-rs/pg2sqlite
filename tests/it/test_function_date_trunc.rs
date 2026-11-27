@@ -1,8 +1,6 @@
-//! Tests for `date_trunc` translation to SQLite `strftime`.
+//! Executable `date_trunc` contracts.
 
-use diesel::RunQueryDsl;
 use helpers::translate_sql;
-use pg2sqlite::prelude::Pg2SqliteOptions;
 use run_translated_helper::run_translated_with;
 
 use crate::{helpers, helpers::run_translated as run_translated_helper};
@@ -26,7 +24,7 @@ fn every_granularity_returns_the_postgres_value() {
                  INSERT INTO t VALUES (1, '2024-03-15 10:20:30');
                  SELECT date_trunc('{unit}', ts) FROM t;"
             ),
-            &Pg2SqliteOptions::default(),
+            &helpers::function_options(),
         );
         assert_eq!(rows, vec![Some(expected.to_string())], "date_trunc('{unit}', ts)");
     }
@@ -41,7 +39,7 @@ fn a_truncated_value_compares_against_a_stored_timestamp() {
         "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP);
          INSERT INTO t VALUES (1, '2024-03-15 10:20:30');
          SELECT count(*) FROM t WHERE date_trunc('month', ts) = '2024-03-01 00:00:00';",
-        &Pg2SqliteOptions::default(),
+        &helpers::function_options(),
     );
     assert_eq!(rows, vec![Some("1".to_string())]);
 }
@@ -76,7 +74,7 @@ fn every_coarse_granularity_returns_the_postgres_value() {
                  INSERT INTO t VALUES (1, '{stamp}');
                  SELECT date_trunc('{unit}', ts) FROM t;"
             ),
-            &Pg2SqliteOptions::default(),
+            &helpers::function_options(),
         );
         assert_eq!(rows, vec![Some(expected.to_string())], "date_trunc('{unit}', '{stamp}')");
     }
@@ -85,17 +83,24 @@ fn every_coarse_granularity_returns_the_postgres_value() {
 /// The coarse units take the same plural spellings as the rest.
 #[test]
 fn a_coarse_granularity_accepts_its_plural() {
-    for unit in ["weeks", "quarters", "decades", "centuries", "millennia"] {
+    for unit in ["weeks", "months", "decades", "centuries", "millennia"] {
         let rows = run_translated_with(
             &format!(
                 "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP);
                  INSERT INTO t VALUES (1, '2024-03-15 13:45:30');
                  SELECT date_trunc('{unit}', ts) FROM t;"
             ),
-            &Pg2SqliteOptions::default(),
+            &helpers::function_options(),
         );
         assert_eq!(rows.len(), 1, "date_trunc('{unit}', ts) should return a row");
     }
+    let error = run_translated_helper::try_run_translated_bound_with(
+        "SELECT date_trunc('quarters', TIMESTAMP '2024-03-15 13:45:30')",
+        &helpers::function_options(),
+        &[],
+    )
+    .expect_err("PostgreSQL refuses quarters");
+    assert!(error.to_string().contains("unit not recognized"), "{error}");
 }
 
 /// The granularity is matched case insensitively, which the coarse units have
@@ -106,24 +111,29 @@ fn date_trunc_ignores_the_case_of_the_granularity() {
         "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP);
          INSERT INTO t VALUES (1, '2024-12-30 13:45:30');
          SELECT date_trunc('QUARTER', ts) FROM t;",
-        &Pg2SqliteOptions::default(),
+        &helpers::function_options(),
     );
     assert_eq!(rows, vec![Some("2024-10-01 00:00:00".to_string())]);
 }
 
-/// A granularity PostgreSQL does not have is still refused, and the message
-/// lists what it accepts. It used to claim the coarse units have no strftime
-/// equivalent, which was never true.
+/// An unknown granularity raises once a row reaches it, as PostgreSQL's
+/// strict `date_trunc` does, and a `NULL` timestamp answers `NULL`.
 #[test]
 fn date_trunc_unsupported_granularity_produces_helpful_error() {
     let sql = "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP);
+               INSERT INTO t VALUES (1, NULL);
                SELECT date_trunc('fortnight', ts) FROM t;";
-    let result = translate_sql(sql, &Pg2SqliteOptions::default());
-    assert!(result.is_err(), "date_trunc('fortnight', ...) should produce an error");
-    let err = result.unwrap_err();
-    for granularity in ["second", "week", "quarter", "century", "millennium"] {
-        assert!(err.contains(granularity), "error should list {granularity}, got: {err}");
-    }
+    assert_eq!(run_translated_with(sql, &helpers::function_options()), vec![None]);
+    let sql = "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP);
+               INSERT INTO t VALUES (1, '2024-03-15 13:45:30');
+               SELECT date_trunc('fortnight', ts) FROM t;";
+    let error = run_translated_helper::try_run_translated_bound_with(
+        sql,
+        &helpers::function_options(),
+        &[],
+    )
+    .expect_err("unknown granularity");
+    assert!(error.to_string().contains("unit not recognized"), "{error}");
 }
 
 /// Flipped R120 pin. `date_trunc(...) OVER (...)` is not PostgreSQL, which
@@ -132,7 +142,7 @@ fn date_trunc_unsupported_granularity_produces_helpful_error() {
 /// `may not be used as a window function`. The translator now refuses.
 #[test]
 fn date_trunc_with_an_over_clause_is_refused() {
-    let options = Pg2SqliteOptions::default();
+    let options = helpers::function_options();
     let err = translate_sql(
         "SELECT date_trunc('day', created_at) OVER (PARTITION BY user_id) FROM events",
         &options,
@@ -145,43 +155,22 @@ fn date_trunc_with_an_over_clause_is_refused() {
 }
 
 #[test]
-fn date_trunc_without_over_semantic() -> Result<(), Box<dyn std::error::Error>> {
-    // Test date_trunc semantics work correctly (without OVER, since strftime
-    // is not a valid SQLite window function).
-    let pg_sql = "
-        CREATE TABLE events (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL, created_at TEXT NOT NULL);
-        SELECT date_trunc('day', created_at) AS truncated FROM events;
-    ";
-    let (translated, select_sql) =
-        helpers::translate::translate_utc_statements_and_first_query(pg_sql);
-
-    let mut conn = helpers::apply_ddl(&translated);
-
-    diesel::sql_query(
-        "INSERT INTO events (id, user_id, created_at) VALUES (1, 1, '2024-03-15 10:30:00'), (2, 1, '2024-03-15 14:00:00')",
-    )
-    .execute(&mut conn)?;
-
-    #[derive(diesel::QueryableByName, Debug)]
-    struct TruncResult {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        truncated: String,
-    }
-
-    let results = diesel::sql_query(&select_sql).load::<TruncResult>(&mut conn)?;
-    assert_eq!(results.len(), 2);
-    // Both rows for the same day should produce the same truncated date
-    assert_eq!(results[0].truncated, results[1].truncated);
-    assert_eq!(results[0].truncated, "2024-03-15 00:00:00");
-
-    Ok(())
+fn date_trunc_without_over_semantic() {
+    let rows = run_translated_with(
+        "CREATE TABLE events (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL, created_at TIMESTAMP NOT NULL);
+         INSERT INTO events (id, user_id, created_at) VALUES
+             (1, 1, '2024-03-15 10:30:00'), (2, 1, '2024-03-15 14:00:00');
+         SELECT date_trunc('day', created_at) FROM events ORDER BY id;",
+        &helpers::function_options(),
+    );
+    assert_eq!(rows, vec![Some("2024-03-15 00:00:00".into()); 2]);
 }
 
 /// The guard the flipped pin above leaves behind: a real window aggregate in
 /// the same shape keeps its OVER clause and the emitted SQL prepares.
 #[test]
 fn a_window_aggregate_over_partition_still_translates() {
-    let options = Pg2SqliteOptions::default();
+    let options = helpers::function_options();
     let sql =
         translate_sql("SELECT COUNT(created_at) OVER (PARTITION BY user_id) FROM events", &options)
             .unwrap();
@@ -204,16 +193,12 @@ fn a_window_aggregate_over_partition_still_translates() {
 // ── M9: date_trunc milliseconds support and refusal message accuracy
 // ──────────
 
-/// M9: 'milliseconds' is valid PostgreSQL and maps to strftime('%Y-%m-%d
-/// %H:%M:%f', ts), which keeps three fractional digits. The current catch-all
-/// refuses it with "is not a PostgreSQL granularity", which is false. An input
-/// whose sub-second value is already at millisecond precision must survive the
-/// truncation unchanged.
+/// Millisecond truncation retains three fractional digits.
 #[test]
 fn milliseconds_granularity_translates_and_truncates_correctly() {
     let result = translate_sql(
         &helpers::deployment::utc_script(
-            "CREATE TABLE t (id INT PRIMARY KEY, ts TEXT);
+            "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP);
          SELECT date_trunc('milliseconds', ts) FROM t;",
         ),
         &helpers::deployment::utc_request(),
@@ -223,7 +208,7 @@ fn milliseconds_granularity_translates_and_truncates_correctly() {
         "milliseconds is a valid PostgreSQL granularity and must translate: {result:?}"
     );
     let rows = run_translated_helper::run_translated_utc(
-        "CREATE TABLE t (id INT PRIMARY KEY, ts TEXT);
+        "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP);
          INSERT INTO t VALUES (1, '2024-01-15 10:30:45.678');
          SELECT date_trunc('milliseconds', ts) FROM t;",
     );
@@ -234,20 +219,15 @@ fn milliseconds_granularity_translates_and_truncates_correctly() {
     );
 }
 
-/// M9: 'microseconds' is also valid PostgreSQL. Refusing it is correct because
-/// SQLite carries only millisecond precision, but the refusal message must not
-/// claim it is not a PostgreSQL granularity.
 #[test]
-fn microseconds_refusal_does_not_misrepresent_postgresql() {
-    let err = translate_sql(
-        "CREATE TABLE t (ts TEXT); SELECT date_trunc('microseconds', ts) FROM t;",
-        &Pg2SqliteOptions::default(),
-    )
-    .expect_err("microseconds is not yet supported and must fail");
-    assert!(
-        !err.contains("is not a PostgreSQL granularity"),
-        "refusal must not claim microseconds is not PostgreSQL: {err}"
+fn microseconds_granularity_preserves_the_fraction() {
+    let rows = run_translated_with(
+        "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP);
+         INSERT INTO t VALUES (1, '2024-01-15 10:30:45.123456');
+         SELECT date_trunc('microseconds', ts) FROM t;",
+        &helpers::function_options(),
     );
+    assert_eq!(rows, vec![Some("2024-01-15 10:30:45.123456".to_string())]);
 }
 
 /// PostgreSQL 18.6 prints a millisecond truncation without trailing zeros.
@@ -264,7 +244,7 @@ fn millisecond_granularity_answers_postgres_fraction_text() {
                  INSERT INTO t VALUES (1, '{stamp}');
                  SELECT date_trunc('millisecond', ts) FROM t;"
             ),
-            &Pg2SqliteOptions::default(),
+            &helpers::function_options(),
         );
         assert_eq!(rows, vec![Some(expected.to_string())], "date_trunc('millisecond', '{stamp}')");
     }
@@ -277,7 +257,7 @@ fn milliseconds_granularity_trims_the_padded_fraction() {
         "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP);
          INSERT INTO t VALUES (1, '2024-01-02 03:04:05.5');
          SELECT date_trunc('milliseconds', ts) FROM t;",
-        &Pg2SqliteOptions::default(),
+        &helpers::function_options(),
     );
     assert_eq!(rows, vec![Some("2024-01-02 03:04:05.5".to_string())]);
 }
@@ -289,7 +269,7 @@ fn a_millisecond_truncated_value_compares_against_a_stored_literal() {
         "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP);
          INSERT INTO t VALUES (1, '2024-01-02 03:04:05.5');
          SELECT count(*) FROM t WHERE date_trunc('millisecond', ts) = '2024-01-02 03:04:05.5';",
-        &Pg2SqliteOptions::default(),
+        &helpers::function_options(),
     );
     assert_eq!(rows, vec![Some("1".to_string())]);
 }
@@ -307,17 +287,14 @@ fn a_millisecond_truncation_written_to_timestamptz_keeps_the_canonical_form() {
     assert_eq!(rows, vec![Some("2024-01-02 03:04:05.500000+00:00".to_string())]);
 }
 
-/// A field argument that is not a string literal names no strftime format, so
-/// the rewrite refuses instead of guessing one.
+/// The translator requires a literal truncation field.
 #[test]
 fn date_trunc_with_a_non_literal_field_is_refused() {
-    let err = translate_sql("SELECT date_trunc(field, ts) FROM t", &Pg2SqliteOptions::default())
-        .expect_err("a non-literal field has no strftime format");
-    assert!(
-        err.contains(
-            "date_trunc: the field argument must be a string literal \
-             (e.g., date_trunc('day', timestamp))"
-        ),
-        "the refusal should name the function and the expected form: {err}"
-    );
+    let error = translate_sql(
+        "CREATE TABLE t (id INT PRIMARY KEY, field TEXT, ts TIMESTAMP);
+         SELECT date_trunc(field, ts) FROM t",
+        &helpers::function_options(),
+    )
+    .expect_err("a literal field is required");
+    assert!(error.contains("date_trunc") && error.contains("literal field"), "{error}");
 }

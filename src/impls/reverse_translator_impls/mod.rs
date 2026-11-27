@@ -11,4 +11,5 @@ mod insert;
 mod query;
 mod statement;
 pub(crate) mod storage_shape;
+pub(crate) mod temporal;
 mod update;

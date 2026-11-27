@@ -154,14 +154,13 @@ fn a_window_aggregate_keeps_its_over_clause() {
 
 #[test]
 fn to_timestamp_epoch() {
-    let options = Pg2SqliteOptions::default();
+    let options = helpers::function_options();
     // Filter to the SELECT so the dialect PRAGMA is not run as sql_query body.
     let stmts = translate_pg("SELECT to_timestamp(0)", &options).unwrap();
     let sql = stmts.iter().find(|s| !s.starts_with("PRAGMA")).expect("SELECT stmt");
     let lower = sql.to_lowercase();
-    assert!(lower.contains("datetime("), "expected datetime: {sql}");
-    assert!(lower.contains("unixepoch"), "expected 'unixepoch' modifier: {sql}");
-    let mut conn = SqliteConnection::establish(":memory:").unwrap();
+    assert!(lower.contains("pg2sqlite_float8_timestamptz("), "expected registered function {sql}");
+    let mut conn = helpers::establish_connection();
     // Dynamically generated translated SQL cannot be expressed via the typed
     // DSL.
     diesel::sql_query(sql.as_str()).execute(&mut conn).unwrap();
@@ -170,10 +169,10 @@ fn to_timestamp_epoch() {
 #[test]
 fn to_timestamp_epoch_semantic() -> Result<(), Box<dyn std::error::Error>> {
     let sql = "SELECT to_timestamp(0) AS result";
-    let options = Pg2SqliteOptions::default();
+    let options = helpers::function_options();
     let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
 
-    let mut conn = SqliteConnection::establish(":memory:")?;
+    let mut conn = helpers::establish_connection();
 
     #[derive(QueryableByName, Debug)]
     struct TextResult {
@@ -188,10 +187,7 @@ fn to_timestamp_epoch_semantic() -> Result<(), Box<dyn std::error::Error>> {
     let results = diesel::sql_query(&select_sql).load::<TextResult>(&mut conn)?;
     assert_eq!(results.len(), 1);
     // Unix epoch 0 = 1970-01-01 00:00:00
-    assert_eq!(
-        results[0].result, "1970-01-01 00:00:00",
-        "to_timestamp(0) should be 1970-01-01 00:00:00"
-    );
+    assert_eq!(results[0].result, "1970-01-01 00:00:00.000000+00:00", "unexpected epoch timestamp");
 
     Ok(())
 }
@@ -200,10 +196,10 @@ fn to_timestamp_epoch_semantic() -> Result<(), Box<dyn std::error::Error>> {
 fn to_timestamp_epoch_semantic_nonzero() -> Result<(), Box<dyn std::error::Error>> {
     // 1700000000 = 2023-11-14 22:13:20 UTC
     let sql = "SELECT to_timestamp(1700000000) AS result";
-    let options = Pg2SqliteOptions::default();
+    let options = helpers::function_options();
     let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
 
-    let mut conn = SqliteConnection::establish(":memory:")?;
+    let mut conn = helpers::establish_connection();
 
     #[derive(QueryableByName, Debug)]
     struct TextResult {
@@ -217,14 +213,14 @@ fn to_timestamp_epoch_semantic_nonzero() -> Result<(), Box<dyn std::error::Error
     // Translator output is a dynamic expression; typed DSL cannot reproduce it.
     let results = diesel::sql_query(&select_sql).load::<TextResult>(&mut conn)?;
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].result, "2023-11-14 22:13:20");
+    assert_eq!(results[0].result, "2023-11-14 22:13:20.000000+00:00");
 
     Ok(())
 }
 
 #[test]
 fn to_timestamp_with_format_unsupported() {
-    let options = Pg2SqliteOptions::default();
+    let options = helpers::function_options();
     let result = translate_sql("SELECT to_timestamp('2023-01-01', 'YYYY-MM-DD')", &options);
     assert!(result.is_err(), "to_timestamp with format should be unsupported");
 }

@@ -15,8 +15,6 @@ use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
 use crate::helpers;
 
 const SCHEMA: &str = "CREATE TABLE t (id INT PRIMARY KEY, val TEXT, num INT);";
-const EVENTS: &str =
-    "CREATE TABLE events (id INT PRIMARY KEY, created_at TIMESTAMP, category TEXT);";
 
 fn reverse(pg_ddl: &str, sqlite_sql: &str) -> String {
     let translator = Pg2Sqlite::default().sql(pg_ddl).unwrap();
@@ -37,7 +35,7 @@ fn forward_execute_reverse(pg_ddl: &str, pg_query: &str, options: &Pg2SqliteOpti
 
     // Set up in-memory SQLite with the emitted DDL
     let (forward_stmts, sqlite_sql) =
-        helpers::translate::translate_default_statements_and_first_query(&sql);
+        helpers::translate::translate_statements_and_first_query(&sql, options);
     let mut conn = helpers::apply_ddl(&forward_stmts);
 
     // Execute in SQLite to verify it's valid SQLite
@@ -69,14 +67,6 @@ fn forward_execute_reverse(pg_ddl: &str, pg_query: &str, options: &Pg2SqliteOpti
 }
 
 #[test]
-fn reverse_datetime_unixepoch_to_to_timestamp() {
-    let pg = reverse(SCHEMA, "SELECT datetime(num, 'unixepoch') FROM t;");
-    assert!(pg.contains("to_timestamp"), "Expected to_timestamp: {pg}");
-    assert!(!pg.contains("datetime"), "Should not contain datetime: {pg}");
-    assert_parses_as_pg(&pg);
-}
-
-#[test]
 fn reverse_uuid_to_gen_random_uuid() {
     let pg = reverse(SCHEMA, "SELECT uuid() FROM t;");
     assert!(pg.contains("gen_random_uuid"), "Expected gen_random_uuid: {pg}");
@@ -96,107 +86,64 @@ fn reverse_custom_uuid_function_name() {
 }
 
 #[test]
-fn reverse_strftime_year_to_date_trunc() {
-    let pg = reverse(EVENTS, "SELECT strftime('%Y-01-01 00:00:00', created_at) FROM events;");
-    assert!(pg.contains("date_trunc"), "Expected date_trunc: {pg}");
-    assert!(pg.contains("year"), "Expected 'year' field: {pg}");
-    assert_parses_as_pg(&pg);
-}
-
-#[test]
-fn reverse_strftime_month_to_date_trunc() {
-    let pg = reverse(EVENTS, "SELECT strftime('%Y-%m-01 00:00:00', created_at) FROM events;");
-    assert!(pg.contains("date_trunc"), "Expected date_trunc: {pg}");
-    assert!(pg.contains("month"), "Expected 'month' field: {pg}");
-    assert_parses_as_pg(&pg);
-}
-
-#[test]
-fn reverse_strftime_day_to_date_trunc() {
-    let pg = reverse(EVENTS, "SELECT strftime('%Y-%m-%d 00:00:00', created_at) FROM events;");
-    assert!(pg.contains("date_trunc"), "Expected date_trunc: {pg}");
-    assert!(pg.contains("day"), "Expected 'day' field: {pg}");
-    assert_parses_as_pg(&pg);
-}
-
-/// A date-only format is not a `date_trunc`: PostgreSQL's answers a timestamp,
-/// so reversing it that way would change what the query returns.
-#[test]
-fn reverse_strftime_date_only_is_not_date_trunc() {
-    let pg = reverse(EVENTS, "SELECT strftime('%Y-%m-%d', created_at) FROM events;");
-    assert!(!pg.contains("date_trunc"), "a bare date is not a truncated timestamp: {pg}");
-    assert_parses_as_pg(&pg);
-}
-
-#[test]
-fn reverse_strftime_extract_still_works() {
-    // Single-token formats like %Y must still reverse to EXTRACT, not
-    // date_trunc
-    let pg = reverse(EVENTS, "SELECT strftime('%Y', created_at) FROM events;");
-    assert!(pg.contains("EXTRACT(YEAR"), "Expected EXTRACT(YEAR): {pg}");
-    assert!(!pg.contains("date_trunc"), "Should not contain date_trunc: {pg}");
-    assert_parses_as_pg(&pg);
-}
-
-#[test]
 fn functional_to_timestamp_roundtrip() {
     let ddl = "CREATE TABLE t (id INT PRIMARY KEY, epoch_val INT);";
     let query = "SELECT to_timestamp(epoch_val) FROM t;";
-    let pg = forward_execute_reverse(ddl, query, &Pg2SqliteOptions::default());
+    let pg = forward_execute_reverse(ddl, query, &helpers::function_options());
     assert!(pg.contains("to_timestamp"), "Expected to_timestamp in round-trip: {pg}");
     assert!(!pg.contains("datetime"), "Should not contain datetime after round-trip: {pg}");
 }
 
 #[test]
 fn functional_date_trunc_day_roundtrip() {
-    let ddl = "CREATE TABLE events (id INT PRIMARY KEY, created_at TEXT);";
+    let ddl = "CREATE TABLE events (id INT PRIMARY KEY, created_at TIMESTAMP);";
     let query = "SELECT date_trunc('day', created_at) FROM events;";
-    let pg = forward_execute_reverse(ddl, query, &Pg2SqliteOptions::default());
+    let pg = forward_execute_reverse(ddl, query, &helpers::function_options());
     assert!(pg.contains("date_trunc"), "Expected date_trunc in round-trip: {pg}");
     assert!(pg.contains("day"), "Expected 'day' field in round-trip: {pg}");
 }
 
 #[test]
 fn functional_date_trunc_month_roundtrip() {
-    let ddl = "CREATE TABLE events (id INT PRIMARY KEY, created_at TEXT);";
+    let ddl = "CREATE TABLE events (id INT PRIMARY KEY, created_at TIMESTAMP);";
     let query = "SELECT date_trunc('month', created_at) FROM events;";
-    let pg = forward_execute_reverse(ddl, query, &Pg2SqliteOptions::default());
+    let pg = forward_execute_reverse(ddl, query, &helpers::function_options());
     assert!(pg.contains("date_trunc"), "Expected date_trunc in round-trip: {pg}");
     assert!(pg.contains("month"), "Expected 'month' field in round-trip: {pg}");
 }
 
 #[test]
 fn functional_date_trunc_year_roundtrip() {
-    let ddl = "CREATE TABLE events (id INT PRIMARY KEY, created_at TEXT);";
+    let ddl = "CREATE TABLE events (id INT PRIMARY KEY, created_at TIMESTAMP);";
     let query = "SELECT date_trunc('year', created_at) FROM events;";
-    let pg = forward_execute_reverse(ddl, query, &Pg2SqliteOptions::default());
+    let pg = forward_execute_reverse(ddl, query, &helpers::function_options());
     assert!(pg.contains("date_trunc"), "Expected date_trunc in round-trip: {pg}");
     assert!(pg.contains("year"), "Expected 'year' field in round-trip: {pg}");
 }
 
 #[test]
 fn functional_date_trunc_hour_roundtrip() {
-    let ddl = "CREATE TABLE events (id INT PRIMARY KEY, created_at TEXT);";
+    let ddl = "CREATE TABLE events (id INT PRIMARY KEY, created_at TIMESTAMP);";
     let query = "SELECT date_trunc('hour', created_at) FROM events;";
-    let pg = forward_execute_reverse(ddl, query, &Pg2SqliteOptions::default());
+    let pg = forward_execute_reverse(ddl, query, &helpers::function_options());
     assert!(pg.contains("date_trunc"), "Expected date_trunc in round-trip: {pg}");
     assert!(pg.contains("hour"), "Expected 'hour' field in round-trip: {pg}");
 }
 
 #[test]
 fn functional_date_trunc_minute_roundtrip() {
-    let ddl = "CREATE TABLE events (id INT PRIMARY KEY, created_at TEXT);";
+    let ddl = "CREATE TABLE events (id INT PRIMARY KEY, created_at TIMESTAMP);";
     let query = "SELECT date_trunc('minute', created_at) FROM events;";
-    let pg = forward_execute_reverse(ddl, query, &Pg2SqliteOptions::default());
+    let pg = forward_execute_reverse(ddl, query, &helpers::function_options());
     assert!(pg.contains("date_trunc"), "Expected date_trunc in round-trip: {pg}");
     assert!(pg.contains("minute"), "Expected 'minute' field in round-trip: {pg}");
 }
 
 #[test]
 fn functional_date_trunc_second_roundtrip() {
-    let ddl = "CREATE TABLE events (id INT PRIMARY KEY, created_at TEXT);";
+    let ddl = "CREATE TABLE events (id INT PRIMARY KEY, created_at TIMESTAMP);";
     let query = "SELECT date_trunc('second', created_at) FROM events;";
-    let pg = forward_execute_reverse(ddl, query, &Pg2SqliteOptions::default());
+    let pg = forward_execute_reverse(ddl, query, &helpers::function_options());
     assert!(pg.contains("date_trunc"), "Expected date_trunc in round-trip: {pg}");
     assert!(pg.contains("second"), "Expected 'second' field in round-trip: {pg}");
 }
@@ -207,7 +154,7 @@ fn functional_to_timestamp_with_data() -> Result<(), Box<dyn std::error::Error>>
         CREATE TABLE t (id INT PRIMARY KEY, epoch_val INT);
         SELECT to_timestamp(epoch_val) FROM t;
     ";
-    let options = Pg2SqliteOptions::default();
+    let options = helpers::function_options();
     let translator = Pg2Sqlite::default().sql(pg_sql)?;
     let schema = translator.build_schema()?;
     let (forward_stmts, sqlite_sql) =
@@ -247,10 +194,10 @@ fn functional_to_timestamp_with_data() -> Result<(), Box<dyn std::error::Error>>
 #[test]
 fn functional_date_trunc_with_data() -> Result<(), Box<dyn std::error::Error>> {
     let pg_sql = "
-        CREATE TABLE events (id INT PRIMARY KEY, created_at TEXT);
+        CREATE TABLE events (id INT PRIMARY KEY, created_at TIMESTAMP);
         SELECT date_trunc('day', created_at) FROM events;
     ";
-    let options = Pg2SqliteOptions::default();
+    let options = helpers::function_options();
     let translator = Pg2Sqlite::default().sql(pg_sql)?;
     let schema = translator.build_schema()?;
     let (forward_stmts, sqlite_sql) =
@@ -431,7 +378,7 @@ fn restored_distinct_on_uses_the_restored_relation_scope() {
     let ddl = "CREATE TABLE t (id INT PRIMARY KEY, aware TIMESTAMPTZ, naive TIMESTAMP);";
     let pg_query = "SELECT DISTINCT ON (id) id, naive AS aware FROM t \
                     ORDER BY id, aware AT TIME ZONE '+05:00';";
-    let options = Pg2SqliteOptions::default();
+    let options = helpers::function_options();
     let source = format!("{ddl} {pg_query}");
     let translator = Pg2Sqlite::default().sql(&source).expect("source should parse");
     let schema = translator.build_schema().expect("schema should build");

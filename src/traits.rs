@@ -10,5 +10,5 @@ pub use schema::Schema;
 pub mod translation_options;
 pub use translation_options::{
     ArrayRepresentation, CaseFoldFunctions, JsonbFunctions, SessionVariableMapping,
-    TimeZoneFunctions, UuidRepresentation, UuidVersion,
+    TemporalFunction, TemporalFunctions, TemporalKind, UuidRepresentation, UuidVersion,
 };

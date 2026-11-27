@@ -4,7 +4,7 @@
 //! column of the given type, or the error it raises. The replica refuses an
 //! infinite interval, which it has no representation for.
 
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+use pg2sqlite::prelude::Pg2Sqlite;
 use run_translated_helper::run_translated_with;
 
 use crate::helpers::run_translated as run_translated_helper;
@@ -691,7 +691,7 @@ fn refusal(script: &str) -> Option<String> {
     Pg2Sqlite::default()
         .sql(script)
         .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
+        .translate_to_sql(&crate::helpers::function_options())
         .err()
         .map(|error| error.to_string())
 }
@@ -702,11 +702,19 @@ fn check(script: &str, answer: &Answer) {
             if let Some(error) = refusal(script) {
                 panic!("{script}: refused with {error}, PostgreSQL answers {text}");
             }
-            let rows = run_translated_with(script, &Pg2SqliteOptions::default());
+            let rows = run_translated_with(script, &crate::helpers::function_options());
             assert_eq!(rows, vec![Some((*text).to_string())], "{script}");
         }
         Refused(message) => {
-            let error = refusal(script).unwrap_or_else(|| panic!("{script}: translated"));
+            let error = refusal(script).unwrap_or_else(|| {
+                crate::helpers::run_translated::try_run_translated_bound_with(
+                    script,
+                    &crate::helpers::function_options(),
+                    &[],
+                )
+                .expect_err("PostgreSQL rejects the value")
+                .to_string()
+            });
             assert!(error.contains(message), "{script}: {error}");
         }
     }

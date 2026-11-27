@@ -268,12 +268,10 @@ fn every_default_shape_produces_runnable_ddl() {
         &utc_request(),
     );
 
-    let conn = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
-    // The translator leads with a dialect pragma; execute each statement
-    // individually.
-    for stmt in ddl.split('\n').filter(|s| !s.trim().is_empty()) {
-        conn.execute_batch(&format!("{stmt};"))
-            .unwrap_or_else(|e| panic!("emitted DDL is not runnable: {e}\n{stmt}"));
+    use diesel::connection::SimpleConnection;
+    let mut connection = crate::helpers::establish_connection();
+    for statement in ddl.lines().filter(|statement| !statement.trim().is_empty()) {
+        connection.batch_execute(&format!("{statement};")).expect("apply translated DDL");
     }
 
     // A bare literal or signed number must stay bare: wrapping is harmless but
@@ -282,7 +280,7 @@ fn every_default_shape_produces_runnable_ddl() {
     assert!(ddl.contains("signed INTEGER DEFAULT -1"), "{ddl}");
     assert!(ddl.contains("arithmetic INTEGER DEFAULT (1 + 2)"), "{ddl}");
     assert!(ddl.contains("casted TEXT DEFAULT (CAST('hello' AS TEXT))"), "{ddl}");
-    assert!(ddl.contains("keyword TEXT DEFAULT CURRENT_DATE"), "{ddl}");
+    assert!(ddl.contains("keyword TEXT DEFAULT (pg2sqlite_timestamptz_date("), "{ddl}");
     assert!(
         ddl.contains("call TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'))"),
         "{ddl}"

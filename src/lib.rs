@@ -39,7 +39,7 @@ pub(crate) mod write_guard;
 /// Prelude module for the library.
 pub mod prelude {
     pub use pg2sqlite_runtime::{
-        RoundingError, TypmodRounding,
+        TemporalArgument, TemporalError, TemporalValue, extract_scale,
         write_guard::{GuardRefusal, guard_refusal},
     };
 
@@ -56,8 +56,8 @@ pub mod prelude {
         sqlstate::{PostgresError, SqlState, postgres_error},
         traits::{
             ArrayRepresentation, CaseFoldFunctions, JsonbFunctions, ReverseTranslator, Schema,
-            SessionVariableMapping, TimeZoneFunctions, Translator, TranslatorWithContext,
-            UuidRepresentation, UuidVersion,
+            SessionVariableMapping, TemporalFunction, TemporalFunctions, TemporalKind, Translator,
+            TranslatorWithContext, UuidRepresentation, UuidVersion,
         },
         warnings::{TranslationReport, TranslationWarning, WarningSink},
     };

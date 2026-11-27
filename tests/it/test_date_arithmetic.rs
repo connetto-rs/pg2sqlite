@@ -33,7 +33,7 @@ fn eval_with(select_list: &str, id: u8, role: &str, options: &Pg2SqliteOptions) 
 
 /// [`eval_with`] with default options.
 fn eval(select_list: &str, id: u8) -> Option<String> {
-    eval_with(select_list, id, "", &Pg2SqliteOptions::default())
+    eval_with(select_list, id, "", &crate::helpers::function_options())
 }
 
 /// [`eval_with`] for a request whose `TimeZone` is UTC, which reading
@@ -48,7 +48,7 @@ fn refusal(select_list: &str) -> String {
     Pg2Sqlite::default()
         .sql(&pg)
         .expect("parses")
-        .translate_to_sql(&Pg2SqliteOptions::default())
+        .translate_to_sql(&crate::helpers::function_options())
         .expect_err(&format!("expected a refusal for: {select_list}"))
         .to_string()
 }
@@ -142,40 +142,24 @@ fn current_date_is_recognised_as_a_date() {
 // ── the shapes PostgreSQL answers with an interval
 // ───────────────────────────
 
-/// `timestamp - timestamp` is an interval in PostgreSQL and SQLite has no
-/// interval, so it is refused rather than emitted as text arithmetic.
 #[test]
-fn timestamp_difference_is_refused() {
-    let message = refusal("ts2 - ts1");
-    assert!(message.contains("interval"), "the message should name the interval result: {message}");
-    assert!(
-        message.contains("extract(epoch"),
-        "the message should name the form that does translate: {message}"
-    );
+fn timestamp_difference_answers_an_interval() {
+    assert_eq!(eval("(ts2 - ts1)::text", 1).as_deref(), Some("6 days 02:00:00"));
 }
 
-/// `time - time` is an interval too.
 #[test]
-fn time_difference_is_refused() {
-    let message = refusal("tm2 - tm1");
-    assert!(message.contains("interval"), "the message should name the interval result: {message}");
+fn time_difference_answers_an_interval() {
+    assert_eq!(eval("(tm2 - tm1)::text", 1).as_deref(), Some("02:00:00"));
 }
 
-/// PostgreSQL widens the date to a timestamp and answers an interval.
 #[test]
-fn date_minus_timestamp_is_refused() {
-    let message = refusal("d1 - ts1");
-    assert!(message.contains("interval"), "the message should name the interval result: {message}");
+fn date_minus_timestamp_answers_an_interval() {
+    assert_eq!(eval("(d1 - ts1)::text", 1).as_deref(), Some("-10:00:00"));
 }
 
-/// `date + time` is a timestamp in PostgreSQL and has no SQLite operator.
 #[test]
-fn date_plus_time_is_refused() {
-    let message = refusal("d1 + tm1");
-    assert!(
-        message.contains("timestamp"),
-        "the message should name the timestamp result: {message}"
-    );
+fn date_plus_time_answers_a_timestamp() {
+    assert_eq!(eval("(d1 + tm1)::text", 1).as_deref(), Some("2026-08-01 12:00:00"));
 }
 
 /// PostgreSQL would accept an integer, a time or an interval on the right of a
@@ -185,7 +169,7 @@ fn date_plus_time_is_refused() {
 fn date_plus_an_unresolvable_operand_is_refused() {
     let message = refusal("d1 + (SELECT 1)");
     assert!(
-        message.contains("whole number of days"),
+        message.contains("Cannot resolve the PostgreSQL temporal operator"),
         "the message should say what is missing: {message}"
     );
 }
@@ -196,7 +180,7 @@ fn date_plus_an_unresolvable_operand_is_refused() {
 /// PostgreSQL `extract(epoch from (ts2 - ts1))` = 525600 seconds.
 #[test]
 fn epoch_of_a_timestamp_difference_is_seconds() {
-    assert_eq!(eval("extract(epoch from (ts2 - ts1))", 1).as_deref(), Some("525600"));
+    assert_eq!(eval("extract(epoch from (ts2 - ts1))::text", 1).as_deref(), Some("525600.000000"));
 }
 
 /// `date_part('epoch', ...)` is the same operation spelled as a function.
@@ -205,13 +189,12 @@ fn date_part_epoch_of_a_timestamp_difference_is_seconds() {
     assert_eq!(eval("date_part('epoch', ts2 - ts1)", 1).as_deref(), Some("525600"));
 }
 
-/// PostgreSQL answers a numeric, so dividing the seconds keeps the fraction:
-/// `extract(epoch from (ts2 - ts1)) / 1000` = 525.6. SQLite would answer 525
-/// if the difference came back as an integer, which is why the `'subsec'`
-/// modifier is load-bearing rather than decoration.
 #[test]
-fn epoch_of_a_timestamp_difference_divides_as_a_number() {
-    assert_eq!(eval("extract(epoch from (ts2 - ts1)) / 1000", 1).as_deref(), Some("525.6"));
+fn epoch_of_a_timestamp_difference_divides_as_a_float() {
+    assert_eq!(
+        eval("CAST(extract(epoch from (ts2 - ts1)) AS DOUBLE PRECISION) / 1000", 1).as_deref(),
+        Some("525.6")
+    );
 }
 
 /// PostgreSQL keeps the fraction: the same span with a `.25` second operand is
@@ -220,14 +203,14 @@ fn epoch_of_a_timestamp_difference_divides_as_a_number() {
 #[test]
 fn epoch_of_a_timestamp_difference_keeps_subseconds() {
     let select_list = "extract(epoch from \
-                       (timestamp '2026-08-07 12:00:00.25' - timestamp '2026-08-01 10:00:00'))";
-    assert_eq!(eval(select_list, 1).as_deref(), Some("525600.25"));
+                       (timestamp '2026-08-07 12:00:00.25' - timestamp '2026-08-01 10:00:00'))::text";
+    assert_eq!(eval(select_list, 1).as_deref(), Some("525600.250000"));
 }
 
 /// PostgreSQL `extract(epoch from (time '14:00' - time '12:00'))` = 7200.
 #[test]
 fn epoch_of_a_time_difference_is_seconds() {
-    assert_eq!(eval("extract(epoch from (tm2 - tm1))", 1).as_deref(), Some("7200"));
+    assert_eq!(eval("extract(epoch from (tm2 - tm1))::text", 1).as_deref(), Some("7200.000000"));
 }
 
 // ── everything outside the family is untouched
@@ -251,7 +234,7 @@ fn interval_arithmetic_is_untouched() {
 /// Forward-translate `pg`, then reverse the emitted statement, and return the
 /// PostgreSQL it comes back as.
 fn round_trip(select_list: &str) -> String {
-    let options = Pg2SqliteOptions::default();
+    let options = crate::helpers::function_options();
     let translator =
         Pg2Sqlite::default().sql(&format!("{DDL}\nSELECT {select_list} FROM dt;")).expect("parses");
     let schema = translator.build_schema().expect("schema builds");
@@ -272,14 +255,14 @@ fn round_trip(select_list: &str) -> String {
 /// shape or not at all.
 #[test]
 fn a_day_count_reverses_to_date_subtraction() {
-    assert_eq!(round_trip("d2 - d1"), "SELECT d2 - d1 FROM dt");
+    assert_eq!(round_trip("d2 - d1"), "SELECT (d2::DATE - d1::DATE) FROM dt");
 }
 
 /// The same for a date moved by whole days, in both directions.
 #[test]
 fn a_shifted_date_reverses_to_date_arithmetic() {
-    assert_eq!(round_trip("d1 + 7"), "SELECT d1 + 7 FROM dt");
-    assert_eq!(round_trip("d1 - n"), "SELECT d1 - n FROM dt");
+    assert_eq!(round_trip("d1 + 7"), "SELECT (d1::DATE + 7::INTEGER) FROM dt");
+    assert_eq!(round_trip("d1 - n"), "SELECT (d1::DATE - n::INTEGER) FROM dt");
 }
 
 /// The year-1 guard is recognised only with `'0001'` in both places, so a
@@ -305,7 +288,7 @@ fn a_look_alike_of_the_year_one_guard_is_not_reversed_as_one() {
 fn an_epoch_difference_reverses_to_extract() {
     assert_eq!(
         round_trip("extract(epoch from (ts2 - ts1))"),
-        "SELECT EXTRACT(EPOCH FROM (ts2 - ts1)) FROM dt"
+        "SELECT EXTRACT(EPOCH FROM ((ts2::TIMESTAMP - ts1::TIMESTAMP))::INTERVAL) FROM dt"
     );
 }
 

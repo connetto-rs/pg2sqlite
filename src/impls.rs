@@ -35,7 +35,7 @@ pub(crate) mod sqlite_keywords;
 pub(crate) mod stack_headroom;
 pub(crate) mod temporal_arithmetic;
 pub(crate) mod temporal_casts;
-pub(crate) mod temporal_infinity;
+pub(crate) mod temporal_functions;
 pub(crate) mod temporal_literals;
 #[cfg(test)]
 pub(crate) mod test_fixtures;

@@ -1,9 +1,4 @@
-//! Reverse-translation fixes: `#>` / `#>>` path conversion, `unixepoch(x)`
-//! fraction truncation, and `json_type(x)` vocabulary refusal.
-//!
-//! All assertions are on the emitted SQL text and whether a call is accepted
-//! or refused; no database execution is needed to prove any of the three
-//! changes.
+//! Reverse translation of `#>` / `#>>` paths and `json_type` calls.
 
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use sql_traits::structs::ParserDB;
@@ -116,27 +111,6 @@ fn jsonb_collations_do_not_reach_postgres() {
     let pg = rev("SELECT payload COLLATE PG_JSONB_ORDER FROM t").expect("reverse");
     assert!(!pg.to_uppercase().contains("COLLATE"), "{pg}");
     assert_rejected_with("SELECT CAST(id AS TEXT) COLLATE BINARY FROM t", "SQLite-only");
-}
-
-// === unixepoch(x) one-argument form: whole seconds ==========================
-
-/// SQLite's one-argument `unixepoch(x)` answers whole seconds, exactly like
-/// the zero-argument form. The same `floor(...)::BIGINT` wrap applies.
-#[test]
-fn unixepoch_one_arg_emits_floor_and_bigint_cast() {
-    let pg = rev("SELECT unixepoch(ts) FROM t").expect("one-arg unixepoch reverses");
-    assert!(pg.contains("floor"), "the fraction must be floored: {pg}");
-    assert!(pg.contains("EPOCH"), "must use EXTRACT EPOCH: {pg}");
-    assert!(pg.contains("BIGINT"), "SQLite answers an integer: {pg}");
-}
-
-/// The `subsec` modifier keeps the fraction; the floor must not appear.
-#[test]
-fn unixepoch_subsec_form_stays_unfloored() {
-    let pg = rev("SELECT unixepoch(ts, 'subsec') FROM t").expect("subsec unixepoch reverses");
-    assert!(pg.contains("EPOCH"), "{pg}");
-    assert!(!pg.contains("floor"), "subsec is faithful, no floor: {pg}");
-    assert!(!pg.contains("BIGINT"), "subsec is not cast to bigint: {pg}");
 }
 
 // === json_type(x) one-argument form: vocabulary refusal =====================

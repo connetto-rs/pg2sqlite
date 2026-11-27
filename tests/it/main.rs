@@ -173,6 +173,7 @@ mod test_literal_scale_folding;
 mod test_maintenance_trigger;
 mod test_math_function_capability;
 mod test_merge;
+mod test_microsecond_temporal_arithmetic;
 mod test_migration_discovery;
 mod test_minor_unit_expressions;
 mod test_multiple_session_variables;

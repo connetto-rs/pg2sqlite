@@ -1,11 +1,9 @@
-//! The `TimeZone` a request runs in, on whose calendar PostgreSQL adds the
-//! months and days of an interval to a `timestamptz`.
+//! The `TimeZone` a request runs in, which every temporal function depending
+//! on the session's zone takes as an argument.
 //!
 //! The deployment passed with `with_deployment` and the acting role named with
 //! `with_acting_role` settle the zone, through the role settings the schema
-//! declares and the deployment's server default. The replica computes that
-//! calendar with SQLite's date modifiers when the zone keeps one offset, and
-//! through the function the application registers when the offset changes.
+//! declares and the deployment's server default.
 
 use sql_traits::{errors::DeploymentError, structs::ParserDB};
 
@@ -13,16 +11,20 @@ use sql_traits::{errors::DeploymentError, structs::ParserDB};
 use crate::no_std::prelude::*;
 use crate::{errors::Error, options::Pg2SqliteOptions};
 
-/// The calendar of the request's zone, as the replica computes it.
+/// The request's zone.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RequestZone {
-    /// One offset forever, in seconds east of UTC, UTC itself at zero.
-    Fixed(i32),
-    /// A zone whose offset changes, named as `SHOW timezone` prints it.
-    Changing(String),
+pub(crate) struct RequestZone {
+    /// The zone as `SHOW timezone` prints it, which `PgTimeZone::parse` reads
+    /// back.
+    name: String,
 }
 
 impl RequestZone {
+    /// The zone as `SHOW timezone` prints it.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
     /// The UTC offset in seconds the zone gives the `YYYY-MM-DD HH:MM:SS[.f]`
     /// wall clock `local`, as PostgreSQL reads a `timestamptz` written without
     /// an offset.
@@ -32,10 +34,7 @@ impl RequestZone {
     /// Refuses a clock outside PostgreSQL's timestamps.
     pub(crate) fn offset_at(&self, local: &str) -> Result<i64, Error> {
         use sql_values::postgres::{InputContext, PgTimeZone, PgTimestamp, PgTimestampTz};
-        let name = match self {
-            Self::Fixed(offset) => return Ok(i64::from(*offset)),
-            Self::Changing(name) => name,
-        };
+        let name = &self.name;
         let refusal = |reason: &dyn core::fmt::Display| {
             Error::forward_refusal(format!(
                 "the wall clock `{local}` cannot be read in the zone '{name}': {reason}."
@@ -102,8 +101,20 @@ pub(crate) fn resolve(
         })
         .map_err(ZoneUnavailable::Deployment)?
         .zone();
-    Ok(match zone.fixed_offset() {
-        Some(offset) => RequestZone::Fixed(offset),
-        None => RequestZone::Changing(zone.name().to_string()),
-    })
+    Ok(RequestZone { name: zone.name().to_string() })
+}
+
+#[cfg(test)]
+mod tests {
+    use sql_values::postgres::PgTimeZone;
+
+    #[test]
+    fn request_zone_names_round_trip() {
+        for setting in ["+2", "UTC", "interval '-01:00'", "EST5EDT5"] {
+            let original = PgTimeZone::parse(setting).unwrap();
+            let restored = PgTimeZone::parse(original.name()).unwrap();
+            assert_eq!(restored.fixed_offset(), original.fixed_offset(), "{setting}");
+            assert_eq!(restored.name(), original.name(), "{setting}");
+        }
+    }
 }

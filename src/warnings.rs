@@ -24,18 +24,9 @@
 //! Do not add a fourth mechanism. There are three outcomes, plus that closed
 //! list.
 
-use sql_traits::{
-    structs::{IdentifierCase, ParserDB},
-    traits::DatabaseLike,
-};
-use sqlparser::ast::{CreateIndex, CreatePolicy, Statement};
-
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
-use crate::{
-    history::placement::primary_write_target, impls::object_name::last_ident_value_or_display,
-    script::Script, traits::schema::lookup_target,
-};
+use crate::script::Script;
 
 /// A warning emitted during translation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,15 +192,6 @@ pub enum DowngradeLocation {
     },
     /// A declared object that lost one of its clauses.
     Object(DeclaredObject),
-    /// An expression translated into one that reads its operand differently.
-    Expression {
-        /// The declared object whose statement holds the expression, a
-        /// function body counting as its caller's, the table or view a write
-        /// changes, `None` for a query.
-        object: Option<DeclaredObject>,
-        /// The expression as written.
-        text: String,
-    },
     /// Every connection that writes to the replica, for a downgrade that
     /// connection state decides rather than any declared object.
     Script,
@@ -251,66 +233,11 @@ pub enum DeclaredObject {
     },
 }
 
-impl DeclaredObject {
-    /// The object `statement` declares or alters, or the table or view it
-    /// writes as `schema` resolves the name, `schema` being the one the
-    /// statement was written against. `None` for a statement that names none.
-    pub(crate) fn of_statement(statement: &Statement, schema: &ParserDB) -> Option<Self> {
-        match statement {
-            Statement::CreateTable(create_table) => {
-                Some(Self::Table { name: last_ident_value_or_display(&create_table.name) })
-            }
-            Statement::AlterTable(alter_table) => {
-                Some(Self::Table { name: last_ident_value_or_display(&alter_table.name) })
-            }
-            Statement::CreateView(create_view) => {
-                Some(Self::View { name: last_ident_value_or_display(&create_view.name) })
-            }
-            Statement::CreateIndex(CreateIndex { name: Some(name), table_name, .. }) => {
-                Some(Self::Index {
-                    table: last_ident_value_or_display(table_name),
-                    name: last_ident_value_or_display(name),
-                })
-            }
-            Statement::CreateTrigger(create_trigger) => {
-                Some(Self::Trigger {
-                    table: last_ident_value_or_display(&create_trigger.table_name),
-                    name: last_ident_value_or_display(&create_trigger.name),
-                })
-            }
-            _ => Self::written(statement, schema),
-        }
-    }
-
-    /// The table or view `statement` writes, a name `schema` holds no view
-    /// under counting as a table.
-    fn written(statement: &Statement, schema: &ParserDB) -> Option<Self> {
-        let target = primary_write_target(statement)?;
-        let name = last_ident_value_or_display(target);
-        let view = lookup_target(target).is_some_and(|target| {
-            schema
-                .resolve_target_view(target, IdentifierCase::AsWritten)
-                .is_ok_and(|view| view.is_some())
-        });
-        Some(if view { Self::View { name } } else { Self::Table { name } })
-    }
-
-    /// `policy`, by its table and name.
-    pub(crate) fn of_policy(policy: &CreatePolicy) -> Self {
-        Self::Policy {
-            table: last_ident_value_or_display(&policy.table_name),
-            name: policy.name.value.clone(),
-        }
-    }
-}
-
 impl core::fmt::Display for DowngradeLocation {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Column { table, column } => write!(f, "{table}.{column}"),
             Self::Object(object) => write!(f, "{object}"),
-            Self::Expression { object: Some(object), text } => write!(f, "{text} in {object}"),
-            Self::Expression { object: None, text } => write!(f, "{text}"),
             Self::Script => write!(f, "every connection that writes"),
         }
     }

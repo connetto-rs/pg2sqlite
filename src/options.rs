@@ -25,9 +25,8 @@ use crate::{
     },
     traits::{
         ArrayRepresentation, CaseFoldFunctions, JsonbFunctions, SessionVariableMapping,
-        TimeZoneFunctions, UuidRepresentation,
+        TemporalFunctions, UuidRepresentation,
     },
-    warnings::DeclaredObject,
 };
 
 type Role = <ParserDB as DatabaseLike>::Role;
@@ -96,10 +95,10 @@ pub struct Pg2SqliteOptions {
     /// `unhex(replace(literal, '-', ''))` inline" (pure SQLite, no UDF
     /// setup). Set via `with_uuid_text_to_blob_function_name`.
     uuid_text_to_blob_function_name: Option<String>,
-    /// The host-registered SQLite functions that read a zone whose UTC offset
-    /// changes. `None` refuses what needs one. Set via
-    /// `with_time_zone_functions`.
-    time_zone_functions: Option<TimeZoneFunctions>,
+    /// The host-registered SQLite functions computing PostgreSQL's temporal
+    /// operations. `None` refuses every temporal operation. Set via
+    /// `with_temporal_functions`.
+    temporal_functions: Option<TemporalFunctions>,
     /// The host-registered SQLite functions and collation that canonicalise,
     /// read as text and compare `jsonb`. `None` refuses what needs any of
     /// them. Set via `with_jsonb_functions`.
@@ -174,7 +173,7 @@ impl<'a> arbitrary::Arbitrary<'a> for Pg2SqliteOptions {
             uuid_function_name: String::arbitrary(u)?,
             uuid_v7_function_name: Option::<String>::arbitrary(u)?,
             uuid_text_to_blob_function_name: Option::<String>::arbitrary(u)?,
-            time_zone_functions: Option::<TimeZoneFunctions>::arbitrary(u)?,
+            temporal_functions: Option::<TemporalFunctions>::arbitrary(u)?,
             jsonb_functions: Option::<JsonbFunctions>::arbitrary(u)?,
             case_fold_functions: Option::<CaseFoldFunctions>::arbitrary(u)?,
             array_representation: Option::<ArrayRepresentation>::arbitrary(u)?,
@@ -208,7 +207,7 @@ impl Default for Pg2SqliteOptions {
             uuid_function_name: "uuid".to_string(),
             uuid_v7_function_name: None,
             uuid_text_to_blob_function_name: None,
-            time_zone_functions: None,
+            temporal_functions: None,
             jsonb_functions: None,
             case_fold_functions: None,
             array_representation: None,
@@ -413,41 +412,9 @@ pub struct TranslationContext<'a> {
     /// Whether the query about to be translated sits in a locked `FROM` item,
     /// which locks every item of its own `FROM`.
     locks_whole_query: bool,
-    /// The declaration whose expressions a warning names, `None` for a query.
-    declaration: Option<Declaration<'a>>,
     /// The key of the table the `INSERT` whose source is being translated
     /// writes.
     inserting_into: Option<&'a str>,
-}
-
-/// A declaration whose expressions a translation reads.
-#[derive(Clone, Copy)]
-pub(crate) enum Declaration<'a> {
-    /// A statement, which names an object when it declares or alters one or
-    /// writes a table or view, and the schema it was written against, which
-    /// tells a written view from a table.
-    Statement {
-        /// The statement.
-        statement: &'a sqlparser::ast::Statement,
-        /// The schema it was written against.
-        schema: &'a ParserDB,
-    },
-    /// A row level security policy, whose expressions are translated under
-    /// whichever statement builds its table's view and triggers.
-    Policy(&'a sqlparser::ast::CreatePolicy),
-}
-
-impl Declaration<'_> {
-    /// The object it declares or writes, `None` for a statement that names
-    /// none.
-    fn object(self) -> Option<DeclaredObject> {
-        match self {
-            Self::Statement { statement, schema } => {
-                DeclaredObject::of_statement(statement, schema)
-            }
-            Self::Policy(policy) => Some(DeclaredObject::of_policy(policy)),
-        }
-    }
 }
 
 /// A `LANGUAGE sql` function whose body is being translated in place of a
@@ -485,7 +452,6 @@ struct ContextFields<'a> {
     batch_trigger_catalog: Option<&'a [TableTrigger]>,
     locked: &'a [usize],
     locks_whole_query: bool,
-    declaration: Option<Declaration<'a>>,
     inserting_into: Option<&'a str>,
 }
 
@@ -510,7 +476,6 @@ impl<'a> ContextFields<'a> {
             batch_trigger_catalog: context.batch_trigger_catalog,
             locked: context.locked,
             locks_whole_query: context.locks_whole_query,
-            declaration: context.declaration,
             inserting_into: context.inserting_into,
         }
     }
@@ -543,7 +508,6 @@ impl<'a> ContextFields<'a> {
             batch_trigger_catalog: self.batch_trigger_catalog,
             locked: self.locked,
             locks_whole_query: self.locks_whole_query,
-            declaration: self.declaration,
             inserting_into: self.inserting_into,
         }
     }
@@ -575,7 +539,6 @@ impl<'a> TranslationContext<'a> {
             batch_trigger_catalog: None,
             locked: &[],
             locks_whole_query: false,
-            declaration: None,
             inserting_into: None,
         }
     }
@@ -608,7 +571,6 @@ impl<'a> TranslationContext<'a> {
             batch_trigger_catalog: None,
             locked: &[],
             locks_whole_query: false,
-            declaration: None,
             inserting_into: None,
         }
     }
@@ -715,22 +677,6 @@ impl<'a> TranslationContext<'a> {
         fields.into_context(self.scope, self.outer)
     }
 
-    /// The same context translating the expressions of `declaration`.
-    pub(crate) fn with_declaration<'s>(
-        &'s self,
-        declaration: Declaration<'s>,
-    ) -> TranslationContext<'s> {
-        let mut fields = ContextFields::borrowed(self);
-        fields.declaration = Some(declaration);
-        fields.into_context(self.scope, self.outer)
-    }
-
-    /// The object whose expressions are being translated or the table or
-    /// view written, `None` for a query.
-    pub(crate) fn declared_object(&self) -> Option<DeclaredObject> {
-        self.declaration.and_then(Declaration::object)
-    }
-
     /// The same context noting the PL/pgSQL variables in scope.
     pub(crate) fn with_variables<'s>(
         &'s self,
@@ -813,7 +759,6 @@ impl<'a> TranslationContext<'a> {
         fields.trigger_rows = None;
         fields.locked = &[];
         fields.locks_whole_query = false;
-        fields.declaration = None;
         fields.inserting_into = None;
         fields.into_context(None, None)
     }
@@ -922,7 +867,6 @@ impl<'a> TranslationContext<'a> {
             batch_trigger_catalog: self.batch_trigger_catalog,
             locked: &[],
             locks_whole_query: false,
-            declaration: None,
             inserting_into: self.inserting_into,
         })
     }
@@ -1700,28 +1644,28 @@ impl Pg2SqliteOptions {
     }
 
     #[must_use]
-    /// Sets the functions that read a zone whose UTC offset changes.
+    /// Names the SQLite functions the replica registers to compute
+    /// PostgreSQL's temporal operations.
     ///
-    /// PostgreSQL turns an instant into a wall clock and back, and adds the
-    /// months and days of an interval to a `timestamptz`, in the request's
-    /// `TimeZone`, which the deployment passed with
-    /// [`with_deployment`](Self::with_deployment) resolves, for the acting
-    /// role named with [`with_acting_role`](Self::with_acting_role) or,
-    /// without one, as the connection has it before any `SET ROLE`. In UTC
-    /// and in a zone of one fixed offset the translation computes all of it
-    /// with SQLite's own date functions. A zone whose offset changes, such as
-    /// `Europe/Rome`, needs these two functions, and what reads that zone is
-    /// refused without them. [`TimeZoneFunctions`] states what each one
-    /// answers.
-    pub fn with_time_zone_functions(mut self, functions: TimeZoneFunctions) -> Self {
-        self.time_zone_functions = Some(functions);
+    /// The replica stores temporal values as text, and every operator, cast
+    /// and function over them (interval arithmetic, differences, zone
+    /// conversion, `AT TIME ZONE`, `EXTRACT`, `date_part`, `date_trunc`,
+    /// `to_char`, `to_timestamp`, typmod rounding) calls one of these
+    /// functions, which compute it as PostgreSQL 18 does. Each that depends on
+    /// the session's `TimeZone` takes the zone the deployment passed with
+    /// [`with_deployment`](Self::with_deployment) resolves for the acting
+    /// role named with [`with_acting_role`](Self::with_acting_role). A
+    /// temporal operation is refused without them. [`TemporalFunctions`]
+    /// states what each one answers.
+    pub fn with_temporal_functions(mut self, functions: TemporalFunctions) -> Self {
+        self.temporal_functions = Some(functions);
         self
     }
 
     #[must_use]
-    /// Returns the configured zone functions.
-    pub fn get_time_zone_functions(&self) -> Option<&TimeZoneFunctions> {
-        self.time_zone_functions.as_ref()
+    /// Returns the configured temporal functions.
+    pub fn get_temporal_functions(&self) -> Option<&TemporalFunctions> {
+        self.temporal_functions.as_ref()
     }
 
     #[must_use]

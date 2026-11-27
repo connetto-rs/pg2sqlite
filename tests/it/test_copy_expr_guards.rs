@@ -312,7 +312,7 @@ fn timetz_interval_volatile_operand_is_refused() {
 fn timetz_interval_stable_operand_executes_correctly() {
     let rows = run_translated_with(
         "SELECT CAST('03:04:05.5+02' AS TIMETZ) + interval '1 hour';",
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::function_options(),
     );
     assert_eq!(rows, vec![Some("04:04:05.5+02:00".to_string())]);
 }

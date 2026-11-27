@@ -32,8 +32,6 @@ use crate::{
             declared_in_scope, declared_type_matches, is_scale_preserving_call, scale_of,
             translate_expr_recursive,
         },
-        temporal_arithmetic::reverse_temporal_arithmetic,
-        timezone::restore_at_time_zone,
         translator_impls::expr::sqlite_json_path_to_pg_text_path,
     },
     prelude::ReverseTranslator,
@@ -162,11 +160,11 @@ fn reverse_numeric_rules_may_apply(op: &BinaryOperator, left: &Expr, right: &Exp
             Expr::Identifier(_)
             | Expr::CompoundIdentifier(_)
             | Expr::Nested(_)
-            | Expr::Cast { .. } => true,
+            | Expr::Cast { .. }
+            | Expr::Function(_) => true,
             Expr::UnaryOp { op: UnaryOperator::Minus | UnaryOperator::Plus, expr } => {
                 addressable(expr)
             }
-            Expr::Function(f) => is_scale_preserving_call(f),
             _ => false,
         }
     }
@@ -385,6 +383,14 @@ impl ReverseTranslator for Expr {
         }
 
         match self {
+            Expr::Cast { data_type: DataType::Integer(_) | DataType::Int(_), .. } => {
+                let mut reversed =
+                    translate_expr_recursive::<Reverse>(self, schema, options, &mut |_| {})?;
+                if let Expr::Cast { data_type, .. } = &mut reversed {
+                    *data_type = DataType::BigInt(None);
+                }
+                Ok(reversed)
+            }
             Expr::Function(func) => reverse_numeric_call(self, func, schema, options),
 
             // SQLite's FTS5 MATCH operator (`table MATCH 'query'`) has no
@@ -494,6 +500,16 @@ impl ReverseTranslator for Expr {
             }
 
             Expr::BinaryOp { left, op, right } => {
+                if let Some(reversed) =
+                    super::temporal::reverse_timetz_comparison(left, op, right, schema, options)?
+                {
+                    return Ok(reversed);
+                }
+                if let Some(reversed) =
+                    super::temporal::reverse_interval_comparison(left, op, right, schema, options)?
+                {
+                    return Ok(reversed);
+                }
                 let reversed = reverse_numeric_binary_op(self, left, op, right, schema, options)?;
                 retype_binary_operands(reversed, left, right, schema, options)
             }
@@ -670,6 +686,49 @@ fn reverse_numeric_call(
     }
 }
 
+fn numeric_round_operand<'a>(
+    expression: &'a Expr,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Option<&'a Expr> {
+    let Expr::Nested(division) = expression else { return None };
+    let Expr::BinaryOp { left, op: BinaryOperator::Divide, .. } = division.as_ref() else {
+        return None;
+    };
+    let Expr::Nested(biased) = left.as_ref() else { return None };
+    let Expr::BinaryOp { left: operand, op: BinaryOperator::Plus, .. } = biased.as_ref() else {
+        return None;
+    };
+    let scale = scale_of(operand, schema, options)?;
+    if !(1..=38).contains(&scale) || !is_replayable(operand, options) {
+        return None;
+    }
+    let expected =
+        crate::impls::shared_helpers::rescale_minor_units(operand.as_ref().clone(), scale, 0);
+    (expression.to_string() == expected.to_string()).then_some(operand)
+}
+
+fn numeric_text_operand<'a>(
+    expression: &'a Expr,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Option<&'a Expr> {
+    let Expr::Case { operand: None, conditions, else_result: Some(_), .. } = expression else {
+        return None;
+    };
+    let [condition] = conditions.as_slice() else { return None };
+    let Expr::IsNull(operand) = &condition.condition else { return None };
+    if !matches!(&condition.result, Expr::Value(value) if value.value == Value::Null) {
+        return None;
+    }
+    let scale = scale_of(operand, schema, options)?;
+    if !(1..=38).contains(&scale) || !is_replayable(operand, options) {
+        return None;
+    }
+    let expected = crate::impls::shared_helpers::render_minor_units_as_text(operand, scale);
+    (expression.to_string() == expected.to_string()).then_some(operand)
+}
+
 /// Restores a shape the forward direction lowered, before the ordinary walk
 /// can take it apart.
 ///
@@ -682,6 +741,28 @@ fn restore_lowered_idiom(
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
 ) -> Option<Result<Expr, Error>> {
+    if let Some(operand) = numeric_round_operand(expr, schema, options) {
+        return Some(
+            operand
+                .reverse_translate(schema, options)
+                .map(|value| simple_function_expr("round", vec![value], None)),
+        );
+    }
+    if let Some(operand) = numeric_text_operand(expr, schema, options) {
+        return Some(operand.reverse_translate(schema, options).map(|value| {
+            let value = if matches!(value, Expr::BinaryOp { .. } | Expr::AtTimeZone { .. }) {
+                Expr::Nested(Box::new(value))
+            } else {
+                value
+            };
+            Expr::Cast {
+                kind: sqlparser::ast::CastKind::DoubleColon,
+                expr: Box::new(value),
+                data_type: DataType::Text,
+                format: None,
+            }
+        }));
+    }
     if is_uniform_random_float(expr) {
         return Some(Ok(simple_function_expr("random", vec![], None)));
     }
@@ -695,14 +776,7 @@ fn restore_lowered_idiom(
     if let Some(membership) = delimited_membership_operands(expr) {
         return Some(reverse_delimited_membership(membership, schema, options));
     }
-    if let Some(at_zone) = restore_at_time_zone(expr, schema, options) {
-        return Some(at_zone);
-    }
-    // PostgreSQL answers an infinite operand itself.
-    if let Some(finite) = crate::impls::idioms::infinite_temporal_guard_finite(expr) {
-        return Some(finite.reverse_translate(schema, options));
-    }
-    reverse_temporal_arithmetic(expr, schema, options)
+    None
 }
 
 /// Restores the
@@ -835,6 +909,28 @@ fn reverse_numeric_binary_op(
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
 ) -> Result<Expr, Error> {
+    if *op == BinaryOperator::Multiply {
+        return translate_expr_recursive::<Reverse>(whole, schema, options, &mut |_| {});
+    }
+    if *op == BinaryOperator::Divide
+        && let Some(scale) =
+            scale_of(left, schema, options).filter(|scale| (1..=38).contains(scale))
+        && matches!(right, Expr::Value(value) if matches!(&value.value,
+            Value::Number(number, _) if *number == format!("{}.0", 10_i128.pow(scale))))
+    {
+        let value = left.reverse_translate(schema, options)?;
+        let value = if matches!(value, Expr::BinaryOp { .. }) {
+            Expr::Nested(Box::new(value))
+        } else {
+            value
+        };
+        return Ok(Expr::Cast {
+            kind: sqlparser::ast::CastKind::DoubleColon,
+            expr: Box::new(value),
+            data_type: DataType::DoublePrecision,
+            format: None,
+        });
+    }
     if !reverse_numeric_rules_may_apply(op, left, right) {
         return translate_expr_recursive::<Reverse>(whole, schema, options, &mut |_| {});
     }

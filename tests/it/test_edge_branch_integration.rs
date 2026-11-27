@@ -485,7 +485,7 @@ fn reverse_translation_covers_uncommon_function_variants() {
     let err = strftime_with_wildcard
         .reverse_translate(&schema, &pg2sqlite::options::TranslationContext::new(&options))
         .unwrap_err();
-    assert!(unsupported_message(err).contains("Invalid strftime arguments"));
+    assert!(unsupported_message(err).contains("strftime has no supported PostgreSQL reversal"));
 
     let datetime_prefixed_offset = make_func(
         "datetime",
@@ -499,13 +499,11 @@ fn reverse_translation_covers_uncommon_function_variants() {
             ))),
         ],
     );
-    // The zone's sign depends on whether the operand carries one, so the
-    // operand needs a declared type, which is what this case always modelled.
     let dated =
         schema_from_sql("CREATE TABLE events(id INTEGER PRIMARY KEY, created_at TIMESTAMP);");
-    let translated = reverse_expr_in_table(&datetime_prefixed_offset, &dated, &options, "events")
-        .expect("datetime timezone should reverse");
-    assert!(translated.to_string().contains("AT TIME ZONE"));
+    let error = reverse_expr_in_table(&datetime_prefixed_offset, &dated, &options, "events")
+        .expect_err("datetime modifiers must be refused");
+    assert!(unsupported_message(error).contains("datetime with a modifier"));
 }
 
 #[test]
@@ -522,7 +520,7 @@ fn forward_expr_translation_covers_remaining_fts_extract_and_timezone_paths() {
         "#,
     );
     let empty = empty_schema();
-    let options = Pg2SqliteOptions::default();
+    let options = crate::helpers::function_options();
 
     let no_columns = parse_expr("to_tsvector('english', 'literal') @@ to_tsquery('hello & world')");
     let err = no_columns.translate(&schema, &options).unwrap_err();
@@ -556,31 +554,44 @@ fn forward_expr_translation_covers_remaining_fts_extract_and_timezone_paths() {
         "an unscoped expression must not guess a table"
     );
 
-    let extract_epoch = parse_expr("EXTRACT(EPOCH FROM created_at)");
-    let translated_epoch =
-        extract_epoch.translate(&schema, &options).expect("EXTRACT(EPOCH) should now be supported");
-    assert!(
-        translated_epoch.to_string().contains("unixepoch(created_at, 'subsec')"),
-        "EXTRACT(EPOCH) should keep the fraction, got: {translated_epoch}"
-    );
-
-    // `created_at` is declared TEXT here, so the cast is what says which of the
-    // two AT TIME ZONE directions applies. This exercises the `utc±HH:MM`
-    // prefix path, where a naive operand keeps the offset's sign.
-    let translated = translate_script(
-        "CREATE TABLE tz_docs(created_at TEXT); \
-         SELECT created_at::timestamp AT TIME ZONE 'utc+02:30' FROM tz_docs;",
+    let translated_epoch = translate_script(
+        "CREATE TABLE events(created_at TIMESTAMP); \
+         SELECT EXTRACT(EPOCH FROM created_at) FROM events;",
         &options,
     );
-    assert!(translated.contains("'+02:30'"), "got: {translated}");
+    assert!(
+        translated_epoch.contains("pg2sqlite_extract_timestamp('EPOCH', created_at)"),
+        "{translated_epoch}"
+    );
 
-    let at_tz_invalid_offset = parse_expr("created_at AT TIME ZONE '+25:00'");
-    let err = at_tz_invalid_offset.translate(&schema, &options).unwrap_err();
-    assert!(unsupported_message(err).contains("AT TIME ZONE supports only literal"));
+    let translated = translate_script(
+        &crate::helpers::deployment::utc_script(
+            "CREATE TABLE tz_docs(created_at TEXT); \
+             SELECT created_at::timestamp AT TIME ZONE 'utc+02:30' FROM tz_docs;",
+        ),
+        &crate::helpers::deployment::utc_request(),
+    );
+    assert!(translated.contains("pg2sqlite_timestamp_zone('utc+02:30'"), "{translated}");
 
-    let at_tz_non_literal = parse_expr("created_at AT TIME ZONE tz_value");
-    let err = at_tz_non_literal.translate(&schema, &options).unwrap_err();
-    assert!(unsupported_message(err).contains("AT TIME ZONE supports only literal"));
+    let invalid_offset = translate_script(
+        "CREATE TABLE events(created_at TIMESTAMP); \
+         SELECT created_at AT TIME ZONE '+25:00' FROM events;",
+        &options,
+    );
+    assert!(
+        invalid_offset.contains("pg2sqlite_timestamp_zone('+25:00', created_at)"),
+        "{invalid_offset}"
+    );
+
+    let dynamic_zone = translate_script(
+        "CREATE TABLE events(created_at TIMESTAMP, tz_value TEXT); \
+         SELECT created_at AT TIME ZONE tz_value FROM events;",
+        &options,
+    );
+    assert!(
+        dynamic_zone.contains("pg2sqlite_timestamp_zone(tz_value, created_at)"),
+        "{dynamic_zone}"
+    );
 }
 
 #[test]

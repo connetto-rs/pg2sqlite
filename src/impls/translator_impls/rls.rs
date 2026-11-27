@@ -470,8 +470,7 @@ fn combine_policy_predicates(
         } else {
             sql_traits::structs::ColumnScope::for_table(table, schema, IdentifierCase::AsWritten)
         };
-        let declared = options.with_declaration(crate::options::Declaration::Policy(term.policy()));
-        let scoped = declared.with_pseudo_row_scope(&policy_scope);
+        let scoped = options.with_pseudo_row_scope(&policy_scope);
         let mut transformed = transformed.translate_with_warnings(schema, &scoped, emit)?;
         if let Some(prefix) = prefix {
             fold_guard(&mut transformed, prefix, stored);

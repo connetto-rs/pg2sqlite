@@ -14,7 +14,7 @@ use pg2sqlite::prelude::Pg2SqliteOptions;
 use crate::helpers;
 
 fn options() -> Pg2SqliteOptions {
-    helpers::case_fold_functions::with_ascii_builtins(Pg2SqliteOptions::default())
+    helpers::case_fold_functions::with_ascii_builtins(helpers::function_options())
         .with_rls_audit_table_name("rls_audit".to_string())
 }
 /// Seeds the backing table with triggers disabled, mirroring the
@@ -38,6 +38,22 @@ fn visible_ids(conn: &rusqlite::Connection, view: &str) -> Vec<i64> {
         .expect("read rows")
 }
 
+fn temporal_policy_ids(statements: &[String], seed: &str, view: &str) -> Vec<i64> {
+    use diesel::{connection::SimpleConnection, prelude::*};
+    let mut connection = helpers::establish_connection();
+    for statement in statements.iter().filter(|statement| !statement.starts_with("CREATE TRIGGER"))
+    {
+        connection.batch_execute(statement).expect("apply translated schema");
+    }
+    connection.batch_execute(seed).expect("seed backing table");
+    for statement in statements.iter().filter(|statement| statement.starts_with("CREATE TRIGGER")) {
+        connection.batch_execute(statement).expect("apply translated trigger");
+    }
+    let relation = diesel_dynamic_schema::table(view);
+    let identifier = relation.column::<diesel::sql_types::BigInt, _>("id");
+    relation.select(identifier).order(identifier).load(&mut connection).expect("read policy view")
+}
+
 #[test]
 fn an_ilike_policy_translates_and_filters() {
     let conn = helpers::apply_rusqlite_statements(
@@ -59,45 +75,42 @@ fn an_ilike_policy_translates_and_filters() {
 
 #[test]
 fn a_now_policy_translates_and_filters() {
-    let conn = helpers::apply_rusqlite_statements(
-        &helpers::translate_pg(
-            &helpers::deployment::utc_script(
-                "CREATE TABLE runs (id INT PRIMARY KEY, ts TIMESTAMP);
-         ALTER TABLE runs ENABLE ROW LEVEL SECURITY;
-         CREATE POLICY p ON runs FOR SELECT USING (ts < now());",
-            ),
-            &helpers::deployment::utc_request().with_rls_audit_table_name("rls_audit".to_string()),
-        )
-        .expect("translate"),
+    let statements = helpers::translate_pg(
+        &helpers::deployment::utc_script(
+            "CREATE TABLE runs (id INT PRIMARY KEY, ts TIMESTAMP);
+             ALTER TABLE runs ENABLE ROW LEVEL SECURITY;
+             CREATE POLICY p ON runs FOR SELECT USING (ts < now());",
+        ),
+        &helpers::deployment::utc_request().with_rls_audit_table_name("rls_audit".to_string()),
+    )
+    .expect("translate");
+    assert_eq!(
+        temporal_policy_ids(
+            &statements,
+            "INSERT INTO runs_rls (id, ts) VALUES (1, '2000-01-01 00:00:00'), (2, '9999-01-01 00:00:00');",
+            "runs",
+        ),
+        vec![1],
     );
-    seed(
-        &conn,
-        "INSERT INTO runs_rls (id, ts) VALUES (1, '2000-01-01 00:00:00'), (2, '9999-01-01 00:00:00');",
-    );
-    assert_eq!(visible_ids(&conn, "runs"), vec![1], "only the past row is before now()");
 }
 
 #[test]
 fn a_date_trunc_policy_translates_and_filters() {
-    let conn = helpers::apply_rusqlite_statements(
-        &helpers::translate_pg(
-            "CREATE TABLE events (id INT PRIMARY KEY, ts TIMESTAMP);
+    let statements = helpers::translate_pg(
+        "CREATE TABLE events (id INT PRIMARY KEY, ts TIMESTAMP);
          ALTER TABLE events ENABLE ROW LEVEL SECURITY;
          CREATE POLICY p ON events FOR SELECT
              USING (date_trunc('day', ts) = '2024-03-15 00:00:00');",
-            &options(),
-        )
-        .expect("translate"),
-    );
-    seed(
-        &conn,
-        "INSERT INTO events_rls (id, ts) VALUES \
-         (1, '2024-03-15 10:30:00'), (2, '2024-03-16 00:10:00');",
-    );
+        &options(),
+    )
+    .expect("translate");
     assert_eq!(
-        visible_ids(&conn, "events"),
+        temporal_policy_ids(
+            &statements,
+            "INSERT INTO events_rls (id, ts) VALUES (1, '2024-03-15 10:30:00'), (2, '2024-03-16 00:10:00');",
+            "events",
+        ),
         vec![1],
-        "date_trunc must translate so the day comparison filters"
     );
 }
 

@@ -46,7 +46,7 @@ use crate::{
             truncation,
         },
     },
-    options::{Declaration, Pg2SqliteOptions, TranslationContext},
+    options::{Pg2SqliteOptions, TranslationContext},
     prelude::ReverseTranslator,
     script::{HelperFunction, Script},
     traits::translator::TranslatorWithContext,
@@ -778,8 +778,6 @@ impl Trackers {
             attachments: &self.attachments,
             in_transaction: at.in_transaction,
         });
-        let written =
-            written.with_declaration(Declaration::Statement { statement, schema: at.binding });
         let ambiguous = column_access::resolve_columns(statement, at.binding, &written)?;
         column_access::with_ambiguity(
             ambiguous,
@@ -2147,7 +2145,14 @@ impl Pg2Sqlite {
         } else {
             vec![deferred_constraint::drain()]
         };
-        let mut script = Script { setup: Vec::new(), files, connection, before_commit, functions };
+        let mut script = Script {
+            setup: Vec::new(),
+            files,
+            connection,
+            before_commit,
+            functions,
+            temporal: options.get_temporal_functions().cloned(),
+        };
         // Last, so the replay and rebinding forms built above are covered too.
         for statement in script
             .files

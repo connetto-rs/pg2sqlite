@@ -8,7 +8,7 @@
 //! second, `NULL` where PostgreSQL raises.
 
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use run_translated_helper::{run_translated_bound_with, run_translated_utc, run_translated_with};
+use run_translated_helper::{run_translated_bound_with, run_translated_utc};
 
 use crate::helpers::{
     deployment::{utc_request, utc_script},
@@ -8744,16 +8744,10 @@ INSERT INTO n VALUES
     (3, '-1 days +02:00:00');
 ";
 
-/// The differential pairs as one table.
-fn pair_schema() -> String {
-    let tuples: Vec<String> = PAIRS
-        .iter()
-        .enumerate()
-        .map(|(index, (a, b, _, _, _))| format!("({}, '{a}', '{b}')", index + 1))
-        .collect();
+fn pair_schema(pair: &Pair<'_>) -> String {
     format!(
-        "CREATE TABLE piv (id int, a interval, b interval);\nINSERT INTO piv VALUES {};",
-        tuples.join(", ")
+        "CREATE TABLE piv (a interval, b interval);\nINSERT INTO piv VALUES ('{}', '{}');",
+        pair.0, pair.1,
     )
 }
 
@@ -8781,31 +8775,67 @@ fn refused(pg: &str, needle: &str) {
     assert!(error.to_string().contains(needle), "refusal {error} should name {needle}");
 }
 
+fn raises(pg: &str, needle: &str) {
+    let error = crate::helpers::run_translated::try_run_translated_bound_with(
+        &utc_script(&format!("{SCHEMA}\n{pg}")),
+        &utc_request(),
+        &[],
+    )
+    .expect_err("PostgreSQL raises");
+    assert!(error.to_string().contains(needle), "{pg} {error}");
+}
+
+fn assert_answer(pg: &str, answer: Option<String>, parameters: &[&str], error: &str) {
+    let result = crate::helpers::run_translated::try_run_translated_bound_with(
+        &utc_script(pg),
+        &utc_request(),
+        parameters,
+    );
+    if let Some(answer) = answer {
+        assert_eq!(result.expect(pg), vec![Some(answer)], "{pg}");
+    } else {
+        let actual = result.expect_err(pg).to_string();
+        assert!(actual.contains(error), "{pg} {actual}");
+    }
+}
+
 #[test]
 fn negating_the_corpus_matches_postgresql() {
-    let schema = pair_schema();
-    let got = run_translated_utc(&format!("{schema}\nSELECT (-a)::text FROM piv ORDER BY id;"));
-    let want: Vec<Option<String>> =
-        PAIRS.iter().map(|pair| pair.2.map(ToString::to_string)).collect();
-    assert_eq!(got, want, "the negation of the corpus should match PostgreSQL");
+    for pair in PAIRS {
+        let schema = pair_schema(pair);
+        assert_answer(
+            &format!("{schema}\nSELECT (-a)::text FROM piv;"),
+            pair.2.map(ToString::to_string),
+            &[],
+            "interval out of range",
+        );
+    }
 }
 
 #[test]
 fn adding_the_corpus_matches_postgresql() {
-    let schema = pair_schema();
-    let got = run_translated_utc(&format!("{schema}\nSELECT (a + b)::text FROM piv ORDER BY id;"));
-    let want: Vec<Option<String>> =
-        PAIRS.iter().map(|pair| pair.3.map(ToString::to_string)).collect();
-    assert_eq!(got, want, "the addition of the corpus should match PostgreSQL");
+    for pair in PAIRS {
+        let schema = pair_schema(pair);
+        assert_answer(
+            &format!("{schema}\nSELECT (a + b)::text FROM piv;"),
+            pair.3.map(ToString::to_string),
+            &[],
+            "interval out of range",
+        );
+    }
 }
 
 #[test]
 fn subtracting_the_corpus_matches_postgresql() {
-    let schema = pair_schema();
-    let got = run_translated_utc(&format!("{schema}\nSELECT (a - b)::text FROM piv ORDER BY id;"));
-    let want: Vec<Option<String>> =
-        PAIRS.iter().map(|pair| pair.4.map(ToString::to_string)).collect();
-    assert_eq!(got, want, "the subtraction of the corpus should match PostgreSQL");
+    for pair in PAIRS {
+        let schema = pair_schema(pair);
+        assert_answer(
+            &format!("{schema}\nSELECT (a - b)::text FROM piv;"),
+            pair.4.map(ToString::to_string),
+            &[],
+            "interval out of range",
+        );
+    }
 }
 
 #[test]
@@ -8832,21 +8862,19 @@ fn summing_only_nulls_answers_null() {
 }
 
 #[test]
-fn summing_a_total_that_leaves_range_answers_null() {
-    let got = run_translated_utc(&format!(
-        "{SCHEMA}\nCREATE TABLE big_iv (id int, iv interval);\nINSERT INTO big_iv VALUES (1, '2147483647 mons'), (2, '1 mon');\nSELECT sum(iv)::text FROM big_iv;"
-    ));
-    assert_eq!(got, vec![None]);
+fn summing_a_total_that_leaves_range_raises() {
+    raises(
+        "CREATE TABLE big_iv (id int, iv interval);\nINSERT INTO big_iv VALUES (1, '2147483647 mons'), (2, '1 mon');\nSELECT sum(iv)::text FROM big_iv;",
+        "interval out of range",
+    );
 }
 
 #[test]
-fn summing_a_total_postgresql_refuses_at_a_midway_step_answers_the_total() {
-    // PostgreSQL errors when a running total leaves the 32-bit months range,
-    // at its second row; the replica sums the fields, and the total fits.
-    let got = run_translated_utc(&format!(
-        "{SCHEMA}\nCREATE TABLE mid_iv (id int, iv interval);\nINSERT INTO mid_iv VALUES (1, '2147483647 mons'), (2, '2147483647 mons'), (3, '-2147483648 mons');\nSELECT sum(iv)::text FROM mid_iv;"
-    ));
-    assert_eq!(got, vec![Some("178956970 years 6 mons".to_string())]);
+fn summing_a_total_that_leaves_range_midway_raises() {
+    raises(
+        "CREATE TABLE mid_iv (id int, iv interval);\nINSERT INTO mid_iv VALUES (1, '2147483647 mons'), (2, '2147483647 mons'), (3, '-2147483648 mons');\nSELECT sum(iv)::text FROM mid_iv;",
+        "interval out of range",
+    );
 }
 
 #[test]
@@ -8976,40 +9004,40 @@ fn a_string_literal_beside_a_typed_literal_matches_postgresql() {
 }
 
 #[test]
-fn a_literal_answer_over_the_field_limits_is_refused() {
-    refused(
+fn a_literal_answer_over_the_field_limits_raises() {
+    raises(
         "SELECT (INTERVAL '2147483647 mons' + INTERVAL '1 mon')::text;",
         "interval out of range",
     );
-    refused("SELECT (-interval '-2147483648 days')::text;", "interval out of range");
-    refused(
+    raises("SELECT (-interval '-2147483648 days')::text;", "interval out of range");
+    raises(
         "SELECT (interval '2147483647 mons' - interval '-2147483647 mons')::text;",
         "interval out of range",
     );
 }
 
 #[test]
-fn a_literal_sum_past_a_field_limit_is_refused_with_postgresqls_error() {
+fn a_literal_sum_past_a_field_limit_raises_postgresqls_error() {
     // PostgreSQL answers every one of these with `interval out of range`:
     // the micros field overflows its 64-bit range, and the months and days
     // fields their 32-bit ranges, in both directions.
-    refused(
+    raises(
         "SELECT (interval '2562047788:00:00' + interval '2562047788:00:00')::text;",
         "interval out of range",
     );
-    refused(
+    raises(
         "SELECT (interval '-2562047788:00:00' - interval '2562047788:00:00')::text;",
         "interval out of range",
     );
-    refused(
+    raises(
         "SELECT (interval '2147483647 days' + interval '2147483647 days')::text;",
         "interval out of range",
     );
-    refused(
+    raises(
         "SELECT (interval '-2147483647 days' + interval '-2147483647 days')::text;",
         "interval out of range",
     );
-    refused(
+    raises(
         "SELECT (interval '-2147483647 mons' + interval '-2147483647 mons')::text;",
         "interval out of range",
     );
@@ -9109,13 +9137,21 @@ fn scaling_an_interval_column_by_a_literal_matches_postgresql() {
     let schema = scaled_schema();
     for (factor_index, factor) in FACTORS.iter().enumerate() {
         for (op, expression) in scaled_expressions("iv", factor).iter().enumerate() {
-            let got = run_translated_utc(&format!(
-                "{schema}\nSELECT ({expression})::text FROM sc ORDER BY id;"
-            ));
-            let want: Vec<Option<String>> = (0..SCALED_INTERVALS.len())
-                .map(|interval| scaled_answer(interval, factor_index, op))
-                .collect();
-            assert_eq!(got, want, "{expression} should match PostgreSQL");
+            for interval in 0..SCALED_INTERVALS.len() {
+                assert_answer(
+                    &format!(
+                        "{schema}\nSELECT ({expression})::text FROM sc WHERE id = {};",
+                        interval + 1
+                    ),
+                    scaled_answer(interval, factor_index, op),
+                    &[],
+                    if op == 2 && *factor == "0" {
+                        "division by zero"
+                    } else {
+                        "interval out of range"
+                    },
+                );
+            }
         }
     }
 }
@@ -9134,11 +9170,12 @@ fn scaling_an_interval_literal_by_a_literal_matches_postgresql() {
                         "{expression} should match PostgreSQL"
                     );
                 } else {
-                    let error = Pg2Sqlite::default()
-                        .sql(&utc_script(&pg))
-                        .expect("parse")
-                        .translate_to_sql(&utc_request())
-                        .expect_err("PostgreSQL raises, so the translation refuses");
+                    let error = crate::helpers::run_translated::try_run_translated_bound_with(
+                        &utc_script(&pg),
+                        &utc_request(),
+                        &[],
+                    )
+                    .expect_err("PostgreSQL raises");
                     let needle = if op == 2 && *factor == "0" {
                         "division by zero"
                     } else {
@@ -9168,15 +9205,24 @@ fn assert_column_factor_matches(column_type: &str, factors: &[usize]) {
         tuples.join(", ")
     );
     for (op, expression) in scaled_expressions("sc.iv", "fa.n").iter().enumerate() {
-        let got = run_translated_utc(&format!(
-            "{schema}\nSELECT ({expression})::text FROM sc, fa ORDER BY sc.id, fa.id;"
-        ));
-        let want: Vec<Option<String>> = (0..SCALED_INTERVALS.len())
-            .flat_map(|interval| {
-                factors.iter().map(move |factor| scaled_answer(interval, *factor, op))
-            })
-            .collect();
-        assert_eq!(got, want, "{expression} over a {column_type} factor should match PostgreSQL");
+        for interval in 0..SCALED_INTERVALS.len() {
+            for (position, factor) in factors.iter().enumerate() {
+                assert_answer(
+                    &format!(
+                        "{schema}\nSELECT ({expression})::text FROM sc, fa WHERE sc.id = {} AND fa.id = {};",
+                        interval + 1,
+                        position + 1
+                    ),
+                    scaled_answer(interval, *factor, op),
+                    &[],
+                    if op == 2 && FACTORS[*factor] == "0" {
+                        "division by zero"
+                    } else {
+                        "interval out of range"
+                    },
+                );
+            }
+        }
     }
 }
 
@@ -9208,14 +9254,18 @@ fn scaling_an_interval_column_by_a_numeric_column_matches_postgresql() {
 fn scaling_by_a_bound_parameter_matches_postgresql() {
     let factor =
         FACTORS.iter().position(|factor| *factor == "1.5").expect("1.5 is a corpus factor");
-    let got = run_translated_bound_with(
-        &utc_script(&format!("{}\nSELECT (iv * $1)::text FROM sc ORDER BY id;", scaled_schema())),
-        &utc_request(),
-        &["1.5"],
-    );
-    let want: Vec<Option<String>> =
-        (0..SCALED_INTERVALS.len()).map(|interval| scaled_answer(interval, factor, 0)).collect();
-    assert_eq!(got, want);
+    for interval in 0..SCALED_INTERVALS.len() {
+        assert_answer(
+            &format!(
+                "{}\nSELECT (iv * $1)::text FROM sc WHERE id = {};",
+                scaled_schema(),
+                interval + 1
+            ),
+            scaled_answer(interval, factor, 0),
+            &["1.5"],
+            "interval out of range",
+        );
+    }
 }
 
 #[test]
@@ -9317,14 +9367,10 @@ fn averaging_matches_postgresql() {
 }
 
 #[test]
-fn an_average_whose_total_leaves_range_answers_null() {
-    // PostgreSQL raises `interval out of range` while accumulating; the
-    // replica answers NULL, as the README's Quiet answers say.
-    assert_eq!(
-        run_translated_utc(&format!(
-            "{SCHEMA}\nCREATE TABLE a (id int, iv interval);\nINSERT INTO a VALUES (1, '178956970 years 7 mons'), (2, '1 mon');\nSELECT avg(iv)::text FROM a;"
-        )),
-        vec![None]
+fn an_average_whose_total_leaves_range_raises() {
+    raises(
+        "CREATE TABLE a (id int, iv interval);\nINSERT INTO a VALUES (1, '178956970 years 7 mons'), (2, '1 mon');\nSELECT avg(iv)::text FROM a;",
+        "interval out of range",
     );
 }
 
@@ -9340,23 +9386,28 @@ fn scaling_refuses_what_postgresql_refuses() {
         "CREATE TABLE x (iv interval, s text);\nSELECT (iv * s)::text FROM x;",
         "operator does not exist: interval * text",
     );
-    refused(
-        "SELECT (interval '1 day' * 1e400)::text;",
-        "is out of range for type double precision",
-    );
-    refused("SELECT (interval '1 day' / 0)::text;", "division by zero");
-    refused("SELECT (interval '1 day' / 0.0)::text;", "division by zero");
-    refused("SELECT (interval '2147483647 days' * 2)::text;", "interval out of range");
+    refused("SELECT (interval '1 day' * 1e400)::text;", "is out of range for double precision");
+    raises("SELECT (interval '1 day' / 0)::text;", "division by zero");
+    raises("SELECT (interval '1 day' / 0.0)::text;", "division by zero");
+    raises("SELECT (interval '2147483647 days' * 2)::text;", "interval out of range");
 }
 
 #[test]
-fn a_factor_without_an_exact_reading_is_refused() {
-    refused(
-        "CREATE TABLE x (iv interval, dp double precision);\nSELECT (iv * dp)::text FROM x;",
-        "cannot be translated exactly",
+fn computed_and_float_factors_match_postgresql() {
+    assert_eq!(
+        run_translated_utc(
+            "CREATE TABLE x (iv interval, dp double precision); INSERT INTO x VALUES ('1 day', 1.5); SELECT (iv * dp)::text FROM x;"
+        ),
+        some(&["1 day 12:00:00"]),
     );
-    refused("SELECT (iv * (id + 1))::text FROM t;", "cannot be translated exactly");
-    refused("SELECT ((id + 1) * iv)::text FROM t;", "cannot be translated exactly");
+    for expression in ["iv * (id + 1)", "(id + 1) * iv"] {
+        assert_eq!(
+            run_translated_utc(&format!(
+                "{SCHEMA}\nSELECT ({expression})::text FROM t ORDER BY id;"
+            )),
+            some(&["2 days", "3 mons", "40 days"]),
+        );
+    }
     refused(
         "SELECT (interval '1 day' * CAST(NULL AS text))::text;",
         "operator does not exist: interval * text",
@@ -9381,34 +9432,40 @@ fn a_type_postgresql_has_no_operator_for_is_named_as_postgresql_names_it() {
 }
 
 #[test]
-fn a_zero_factor_column_answers_null_for_division() {
-    // PostgreSQL raises `division by zero`; the replica answers NULL.
-    assert_eq!(
-        run_translated_utc(&format!(
-            "{SCHEMA}\nCREATE TABLE z (n int);\nINSERT INTO z VALUES (0);\nSELECT (t.iv / z.n)::text FROM t, z ORDER BY t.id;"
-        )),
-        vec![None, None, None]
+fn a_zero_factor_column_raises_for_division() {
+    raises(
+        "CREATE TABLE z (n int);\nINSERT INTO z VALUES (0);\nSELECT (t.iv / z.n)::text FROM t, z ORDER BY t.id;",
+        "division by zero",
     );
 }
 
 #[test]
 fn averaging_refuses_the_clauses_it_cannot_carry() {
-    refused("SELECT avg(DISTINCT iv)::text FROM t;", "avg(DISTINCT) over an interval");
-    refused("SELECT (avg(iv) OVER ())::text FROM t;", "avg over an interval with an OVER clause");
-    refused(
-        "SELECT (avg(iv) FILTER (WHERE id > 1))::text FROM t;",
-        "avg over an interval with a FILTER",
+    refused("SELECT avg(DISTINCT iv)::text FROM t;", "avg(DISTINCT interval)");
+    refused("SELECT (avg(iv) OVER ())::text FROM t;", "OVER");
+    assert_eq!(
+        run_translated_utc(&format!(
+            "{SCHEMA}\nSELECT (avg(iv) FILTER (WHERE id > 1))::text FROM t;"
+        )),
+        some(&["20 days"]),
     );
     refused("SELECT avg(iv, iv2)::text FROM t;", "function avg(interval, interval) does not exist");
-    refused(
-        "SELECT avg(CASE WHEN random() > 0.5 THEN iv ELSE iv2 END)::text FROM t;",
-        "an interval average has no SQLite form",
+    assert_eq!(
+        run_translated_utc(&format!(
+            "{SCHEMA}\nSELECT avg(CASE WHEN random() > 0.5 THEN iv ELSE iv END)::text FROM t;"
+        )),
+        some(&["13 days 16:00:00"]),
     );
 }
 
 #[test]
-fn scaling_in_a_generated_column_or_index_is_refused() {
-    refused("CREATE INDEX ON t (iv * 2);", "scalar subquery");
+fn scaling_in_an_index_executes_and_in_a_generated_column_is_refused() {
+    assert_eq!(
+        run_translated_utc(&format!(
+            "{SCHEMA}\nCREATE INDEX ON t (iv * 2); SELECT id::text FROM t ORDER BY iv * 2;"
+        )),
+        some(&["1", "3", "2"]),
+    );
     refused(
         "CREATE TABLE gen_m (iv interval, g interval GENERATED ALWAYS AS (iv * 2) STORED);",
         "is not legal in that position",
@@ -9454,10 +9511,7 @@ fn shift_expressions(target: &str, interval: &str) -> [String; 3] {
     ]
 }
 
-/// The corpus shift whose month step passes the year 9999 before its
-/// negative day step brings it back: PostgreSQL answers inside the years,
-/// and SQLite's date functions answer `NULL` at the month step, as for a
-/// literal interval.
+/// A month step crosses year 9999 before the day step returns to range.
 const PAST_9999_MIDWAY: (&str, &str) = ("9999-12-01", "1 mon -1 days +01:00:00");
 
 #[test]
@@ -9467,30 +9521,26 @@ fn shifting_by_an_interval_column_matches_postgresql() {
     {
         let schema = shift_schema(kind, targets);
         for (op, expression) in shift_expressions("tg", "iv").iter().enumerate() {
-            let got = run_translated_utc(&format!(
-                "{schema}\nSELECT ({expression})::text FROM sh ORDER BY id;"
-            ));
-            let want: Vec<Option<String>> = answers
-                .iter()
-                .enumerate()
-                .map(|(index, row)| {
-                    let target = targets[index / SHIFT_INTERVALS.len()];
-                    let interval = SHIFT_INTERVALS[index % SHIFT_INTERVALS.len()];
-                    if (target, interval) == PAST_9999_MIDWAY && op != 1 {
-                        return None;
-                    }
-                    row[op]
-                        .filter(|answer| *kind == "time" || in_replica_years(answer))
-                        .map(ToString::to_string)
-                })
-                .collect();
-            assert_eq!(got, want, "{expression} over {kind} should match PostgreSQL");
+            for (index, row) in answers.iter().enumerate() {
+                let answer = row[op]
+                    .filter(|answer| *kind == "time" || in_replica_years(answer))
+                    .map(ToString::to_string);
+                assert_answer(
+                    &format!(
+                        "{schema}\nSELECT ({expression})::text FROM sh WHERE id = {};",
+                        index + 1
+                    ),
+                    answer,
+                    &[],
+                    "22008",
+                );
+            }
         }
     }
 }
 
 #[test]
-fn a_shift_passing_the_year_9999_midway_answers_null() {
+fn a_shift_passing_the_year_9999_midway_returns_the_final_instant() {
     let (target, interval) = PAST_9999_MIDWAY;
     let index = SHIFT_INTERVALS.iter().position(|text| *text == interval).expect("corpus interval");
     let (_, targets, answers) =
@@ -9505,7 +9555,7 @@ fn a_shift_passing_the_year_9999_midway_answers_null() {
             "CREATE TABLE p (d date);\nINSERT INTO p VALUES ('{target}');\nSELECT (d + INTERVAL '{interval}')::text FROM p;"
         ),
     ] {
-        assert_eq!(run_translated_utc(&pg), vec![None], "{pg}");
+        assert_eq!(run_translated_utc(&pg), some(&["9999-12-31 01:00:00"]), "{pg}");
     }
 }
 
@@ -9516,33 +9566,26 @@ fn shifting_by_an_interval_column_answers_what_the_literal_shift_answers() {
     for (kind, targets, _) in SHIFTS {
         let schema = utc_script(&shift_schema(kind, targets));
         for (op, expression) in shift_expressions("tg", "iv").iter().enumerate() {
-            let got = run_translated_with(
-                &format!("{schema}\nSELECT ({expression})::text FROM sh ORDER BY id;"),
-                &options,
-            );
-            for (row, value) in got.iter().enumerate() {
+            for row in 0..targets.len() * SHIFT_INTERVALS.len() {
                 let interval = SHIFT_INTERVALS[row % SHIFT_INTERVALS.len()];
                 let literal = &shift_expressions("tg", &format!("INTERVAL '{interval}'"))[op];
-                let script = Pg2Sqlite::default()
-                    .sql(&format!(
-                        "{schema}\nSELECT ({literal})::text FROM sh WHERE id = {};",
+                let column_answer = crate::helpers::run_translated::try_run_translated_bound_with(
+                    &format!(
+                        "{schema}\nSELECT ({expression})::text FROM sh WHERE id = {};",
                         row + 1
-                    ))
-                    .expect("parse")
-                    .translate_to_sql(&options);
-                let Ok(script) = script else {
-                    // The literal path refuses what it can decide is out of
-                    // range; the column form answers NULL there.
-                    assert_eq!(*value, None, "{literal} over {kind} row {}", row + 1);
-                    continue;
-                };
-                drop(script);
-                let literal_answer = run_translated_with(
+                    ),
+                    &options,
+                    &[],
+                )
+                .map_err(|error| error.to_string());
+                let literal_answer = crate::helpers::run_translated::try_run_translated_bound_with(
                     &format!("{schema}\nSELECT ({literal})::text FROM sh WHERE id = {};", row + 1),
                     &options,
-                );
+                    &[],
+                )
+                .map_err(|error| error.to_string());
                 assert_eq!(
-                    vec![value.clone()],
+                    column_answer,
                     literal_answer,
                     "{expression} and {literal} over {kind} row {}",
                     row + 1
@@ -9669,19 +9712,14 @@ fn a_time_shift_that_wraps_for_every_time_of_day_matches_postgresql() {
 }
 
 #[test]
-fn a_volatile_time_shifted_past_the_64_bit_bound_is_refused() {
-    // The wrapping form reads the time of day for the bound and for each
-    // answer, and `clock_timestamp()` answers anew on each read.
-    let volatile = "CAST(clock_timestamp() AS time)";
-    let wrapping = format!("SELECT ({volatile} + interval '{NEAR_BOUND_CLOCK}')::text FROM t;");
-    refused(&wrapping, "64 bits");
-    refused(&wrapping, "clock_timestamp");
-    let within =
-        utc_script(&format!("{SCHEMA}\nSELECT ({volatile} + interval '1 hour')::text FROM t;"));
-    assert!(
-        Pg2Sqlite::default().sql(&within).expect("parse").translate_to_sql(&utc_request()).is_ok(),
-        "a shift that stays in 64 bits reads the time of day once"
-    );
+fn a_volatile_time_shifted_past_the_64_bit_bound_executes() {
+    for interval in [NEAR_BOUND_CLOCK, "1 hour"] {
+        let rows = run_translated_utc(&format!(
+            "{SCHEMA}\nSELECT (CAST(clock_timestamp() AS time) + interval '{interval}')::text FROM t;"
+        ));
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(Option::is_some));
+    }
 }
 
 #[test]
@@ -9759,7 +9797,7 @@ fn shifting_by_a_cast_interval_literal_matches_postgresql() {
         )),
         vec![None]
     );
-    refused(
+    raises(
         "SELECT (ts - CAST('-178956970 years -8 mons' AS interval))::text FROM t;",
         "interval out of range",
     );
@@ -9771,10 +9809,11 @@ fn an_interval_minus_a_timestamp_is_refused_with_postgresqls_message() {
         "SELECT (iv - ts)::text FROM t;",
         "operator does not exist: interval - timestamp with time zone",
     );
-    // PostgreSQL casts the time to an interval and answers an interval.
-    refused(
-        "CREATE TABLE tm (iv interval, t time);\nSELECT (iv - t)::text FROM tm;",
-        "PostgreSQL casts the time to an interval",
+    assert_eq!(
+        run_translated_utc(
+            "CREATE TABLE tm (iv interval, t time); INSERT INTO tm VALUES ('1 day', '12:00:00'); SELECT (iv - t)::text FROM tm;"
+        ),
+        some(&["1 day -12:00:00"]),
     );
 }
 
@@ -9793,15 +9832,20 @@ fn a_non_interval_side_is_refused_with_postgresqls_message() {
 }
 
 #[test]
-fn a_shift_by_an_interval_column_in_an_index_is_refused() {
-    refused("CREATE INDEX ON t (ts + iv);", "scalar subquery");
+fn a_shift_by_an_interval_column_in_an_index_executes() {
+    let rows = run_translated_utc(&format!(
+        "{SCHEMA}\nCREATE INDEX ON t (ts + iv); SELECT id::text FROM t ORDER BY ts + iv;"
+    ));
+    assert_eq!(rows, some(&["1", "3", "2"]));
 }
 
 #[test]
-fn an_aggregate_over_an_operand_with_an_exists_is_refused() {
-    refused(
-        "SELECT sum(CASE WHEN EXISTS (SELECT 1 FROM t) THEN iv END)::text FROM t;",
-        "an interval sum has no SQLite form",
+fn an_aggregate_over_an_operand_with_an_exists_executes() {
+    assert_eq!(
+        run_translated_utc(&format!(
+            "{SCHEMA}\nSELECT sum(CASE WHEN EXISTS (SELECT 1 FROM t) THEN iv END)::text FROM t;"
+        )),
+        some(&["1 mon 11 days"]),
     );
 }
 
@@ -9852,19 +9896,24 @@ fn a_sum_without_arguments_is_not_an_interval_sum() {
 
 #[test]
 fn a_sum_with_a_distinct_modifier_is_refused() {
-    refused("SELECT sum(DISTINCT iv)::text FROM t;", "sum(DISTINCT) over an interval");
+    refused("SELECT sum(DISTINCT iv)::text FROM t;", "sum(DISTINCT interval)");
 }
 
 #[test]
 fn a_sum_with_an_over_clause_is_refused() {
-    refused("SELECT sum(iv) OVER () FROM t;", "OVER clause");
+    refused("SELECT sum(iv) OVER () FROM t;", "OVER");
 }
 
 #[test]
-fn a_sum_with_a_filter_clause_is_refused() {
-    refused("SELECT sum(iv) FILTER (WHERE id = 1)::text FROM t;", "FILTER or WITHIN GROUP");
-    refused("SELECT sum(iv) WITHIN GROUP (ORDER BY id) FROM t;", "FILTER or WITHIN GROUP");
-    refused("SELECT sum(iv) RESPECT NULLS FROM t;", "FILTER or WITHIN GROUP");
+fn a_sum_with_a_filter_clause_executes() {
+    assert_eq!(
+        run_translated_utc(&format!(
+            "{SCHEMA}\nSELECT sum(iv) FILTER (WHERE id = 1)::text FROM t;"
+        )),
+        some(&["1 day"]),
+    );
+    refused("SELECT sum(iv) WITHIN GROUP (ORDER BY id) FROM t;", "WITHIN GROUP");
+    refused("SELECT sum(iv) RESPECT NULLS FROM t;", "null treatment");
 }
 
 #[test]
@@ -9873,19 +9922,31 @@ fn a_sum_over_a_pair_is_refused_with_postgresqls_message() {
 }
 
 #[test]
-fn a_sum_with_a_volatile_operand_is_refused() {
-    refused(
-        "SELECT sum(CASE WHEN random() > 0.5 THEN iv ELSE iv2 END)::text FROM t;",
-        "an interval sum has no SQLite form",
+fn a_sum_with_a_volatile_operand_executes() {
+    assert_eq!(
+        run_translated_utc(&format!(
+            "{SCHEMA}\nSELECT sum(CASE WHEN random() > 0.5 THEN iv ELSE iv END)::text FROM t;"
+        )),
+        some(&["1 mon 11 days"]),
     );
 }
 
 #[test]
-fn interval_arithmetic_in_an_index_expression_is_refused() {
-    refused("CREATE INDEX ON t (iv + iv2);", "scalar subquery");
-    refused("CREATE INDEX ON t (iv - iv2);", "scalar subquery");
-    refused("CREATE INDEX ON t (-iv);", "scalar subquery");
-    refused("CREATE INDEX ON t (iv + interval '1 day');", "scalar subquery");
+fn interval_arithmetic_in_an_index_expression_executes() {
+    for (expression, answers) in [
+        ("iv + iv2", ["1", "3", "2"]),
+        ("iv - iv2", ["1", "2", "3"]),
+        ("-iv", ["2", "3", "1"]),
+        ("iv + interval '1 day'", ["1", "3", "2"]),
+    ] {
+        assert_eq!(
+            run_translated_utc(&format!(
+                "{SCHEMA}\nCREATE INDEX ON t ({expression}); SELECT id::text FROM t ORDER BY {expression}, id;"
+            )),
+            some(&answers),
+            "{expression}",
+        );
+    }
 }
 
 #[test]
@@ -9930,14 +9991,12 @@ fn an_infinite_literal_beside_an_interval_is_refused() {
 }
 
 #[test]
-fn a_literal_result_on_the_infinity_bound_is_refused() {
-    // PostgreSQL raises interval out of range on a result that equals either
-    // infinity's fields; the translation refuses it at the same step.
-    refused(
+fn a_literal_result_on_the_infinity_bound_raises() {
+    raises(
         "SELECT (interval '2147483646 mons 2147483647 days 2562047788:00:54.775806' + interval '1 mon 00:00:00.000001')::text;",
         "interval out of range",
     );
-    refused(
+    raises(
         "SELECT (interval '-2147483647 mons -2147483647 days -2562047788:00:54.775807' - interval '1 mon 1 day 00:00:00.000001')::text;",
         "interval out of range",
     );
@@ -9960,14 +10019,11 @@ fn a_literal_result_past_the_negative_bound_stays_finite() {
 }
 
 #[test]
-fn negating_past_the_microsecond_bound_answers_null() {
-    // The inner subtraction answers the clock on the bound, whose negation
-    // leaves the 64-bit range PostgreSQL's fields hold; PostgreSQL raises
-    // interval out of range, and the replica answers NULL.
-    let got = run_translated_utc(&format!(
-        "{SCHEMA}\nSELECT (-(interval '-2562047788:00:54.775807' - interval '00:00:00.000001'))::text;"
-    ));
-    assert_eq!(got, vec![None]);
+fn negating_past_the_microsecond_bound_raises() {
+    raises(
+        "SELECT (-(interval '-2562047788:00:54.775807' - interval '00:00:00.000001'))::text;",
+        "interval out of range",
+    );
 }
 
 #[test]
@@ -10018,15 +10074,23 @@ fn a_bound_parameter_beside_an_interval_matches_postgresql() {
 }
 
 #[test]
-fn a_bound_parameter_that_postgresql_answers_infinity_answers_null() {
-    // PostgreSQL answers the addition with infinity, which the replica has no
-    // representation for, and answers NULL.
+fn a_bound_parameter_that_postgresql_answers_infinity_returns_infinity() {
     for text in ["infinity", "-infinity"] {
         let got = run_translated_bound_with(
             &utc_script(&format!("{SCHEMA}\nSELECT (iv + $1)::text FROM n ORDER BY id;")),
             &utc_request(),
             &[text],
         );
-        assert_eq!(got, vec![None, None, None, None, None], "{text} beside n.iv");
+        assert_eq!(
+            got,
+            vec![
+                Some(text.to_owned()),
+                Some(text.to_owned()),
+                Some(text.to_owned()),
+                None,
+                Some(text.to_owned())
+            ],
+            "{text} beside n.iv"
+        );
     }
 }

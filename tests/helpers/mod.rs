@@ -9,8 +9,8 @@ pub mod replay;
 pub mod rls;
 pub mod run_translated;
 pub mod statistical_aggregates;
+pub mod temporal;
 pub mod translate;
-pub mod zone_functions;
 
 #[cfg(feature = "sqlitegis")]
 #[allow(dead_code, reason = "used by the sqlitegis test binary alone")]
@@ -332,6 +332,13 @@ fn current_app_user_impl() -> rosetta_uuid::Uuid {
     })
 }
 
+/// Default options naming the jsonb and temporal functions
+/// [`establish_connection`] registers.
+#[must_use]
+pub fn function_options() -> Pg2SqliteOptions {
+    temporal::with_functions(jsonb_functions::with_functions(Pg2SqliteOptions::default()))
+}
+
 /// Establishes an in-memory SQLite connection with:
 /// - Foreign keys enabled
 /// - Recursive triggers enabled
@@ -359,6 +366,7 @@ pub fn establish_connection() -> SqliteConnection {
         .expect("Failed to register current_app_department");
     jsonb_functions::register(&mut connection);
     case_fold_functions::register(&mut connection);
+    temporal::register(&mut connection);
 
     connection
 }
@@ -401,7 +409,7 @@ pub fn reverse_translate_sql(sql: &str) -> Result<String, String> {
     let ddl = "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, val TEXT, key TEXT, value TEXT);";
     let translator = Pg2Sqlite::default().sql(ddl).map_err(|e| e.to_string())?;
     let schema = translator.build_schema().map_err(|e| e.to_string())?;
-    let options = jsonb_functions::with_functions(Pg2SqliteOptions::default());
+    let options = function_options();
     let stmts = translator.reverse_sql(sql, &schema, &options).map_err(|e| e.to_string())?;
     Ok(stmts.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"))
 }
@@ -495,7 +503,7 @@ pub fn translate_default_statements(pg: &str) -> Result<Vec<String>, String> {
     Pg2Sqlite::default()
         .sql(pg)
         .map_err(|e| e.to_string())?
-        .translate(&jsonb_functions::with_functions(Pg2SqliteOptions::default()))
+        .translate(&function_options())
         .map(|script| script.into_vec().iter().map(ToString::to_string).collect())
         .map_err(|e| e.to_string())
 }
@@ -511,11 +519,7 @@ pub fn translate_default_joined(pg: &str) -> Result<String, String> {
 /// is refused.
 #[allow(dead_code, reason = "used by the sqlite_vec test binary alone")]
 pub fn translate_default_or_err(pg: &str) -> String {
-    match Pg2Sqlite::default()
-        .sql(pg)
-        .unwrap()
-        .translate(&jsonb_functions::with_functions(Pg2SqliteOptions::default()))
-    {
+    match Pg2Sqlite::default().sql(pg).unwrap().translate(&function_options()) {
         Err(e) => e.to_string(),
         Ok(script) => {
             script.into_vec().iter().map(ToString::to_string).collect::<Vec<_>>().join("\n")
@@ -529,7 +533,7 @@ pub fn translate_prefixed(prefix: &str, pg: &str) -> Result<Vec<String>, String>
     Pg2Sqlite::default()
         .sql(&format!("{prefix}\n{pg}"))
         .map_err(|e| e.to_string())?
-        .translate_to_sql(&jsonb_functions::with_functions(Pg2SqliteOptions::default()))
+        .translate_to_sql(&function_options())
         .map(pg2sqlite::script::Script::into_vec)
         .map_err(|e| e.to_string())
 }
@@ -539,9 +543,7 @@ pub fn translate_prefixed(prefix: &str, pg: &str) -> Result<Vec<String>, String>
 pub fn translate_with_default_warnings(
     pg: &str,
 ) -> Result<(Vec<String>, Vec<pg2sqlite::warnings::TranslationWarning>), pg2sqlite::errors::Error> {
-    let report = Pg2Sqlite::default()
-        .sql(pg)?
-        .translate_with_report(&jsonb_functions::with_functions(Pg2SqliteOptions::default()))?;
+    let report = Pg2Sqlite::default().sql(pg)?.translate_with_report(&function_options())?;
     let stmts = report.script.iter().map(ToString::to_string).collect();
     Ok((stmts, report.warnings))
 }
@@ -568,26 +570,22 @@ pub fn apply_with_options(
 /// Translates `pg` with default options and applies every emitted statement
 /// to a fresh in-memory connection.
 pub fn apply_default(pg: &str) -> Result<SqliteConnection, Box<dyn std::error::Error>> {
-    apply_with_options(pg, &jsonb_functions::with_functions(Pg2SqliteOptions::default()))
+    apply_with_options(pg, &function_options())
 }
 
 /// Translates `pg` with the `rls_audit` audit table name and returns the
 /// emitted statements joined with newlines.
 pub fn translate_rls_sql(pg: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let options = case_fold_functions::with_functions(jsonb_functions::with_functions(
-        Pg2SqliteOptions::default(),
-    ))
-    .with_rls_audit_table_name("rls_audit");
+    let options = case_fold_functions::with_functions(function_options())
+        .with_rls_audit_table_name("rls_audit");
     Ok(translate_pg(pg, &options)?.join("\n"))
 }
 
 /// Translates `pg` with the `rls_audit` audit table name and applies every
 /// emitted statement to a fresh in-memory connection.
 pub fn apply_rls_sql(pg: &str) -> Result<SqliteConnection, Box<dyn std::error::Error>> {
-    let options = case_fold_functions::with_functions(jsonb_functions::with_functions(
-        Pg2SqliteOptions::default(),
-    ))
-    .with_rls_audit_table_name("rls_audit");
+    let options = case_fold_functions::with_functions(function_options())
+        .with_rls_audit_table_name("rls_audit");
     let script = translate_script(pg, &options)?;
     let mut conn = SqliteConnection::establish(":memory:")?;
     jsonb_functions::register(&mut conn);
@@ -622,6 +620,7 @@ pub fn apply_translated_ddl(pg: &str, opts: &Pg2SqliteOptions) -> SqliteConnecti
 pub fn apply_statements(stmts: &[String]) -> SqliteConnection {
     let mut conn = SqliteConnection::establish(":memory:").expect("connect");
     jsonb_functions::register(&mut conn);
+    temporal::register(&mut conn);
     for statement in stmts {
         // Emitted DDL is not expressible via the typed DSL.
         diesel::sql_query(statement)
@@ -640,6 +639,7 @@ pub fn apply_statements(stmts: &[String]) -> SqliteConnection {
 pub fn apply_ddl(stmts: &[String]) -> SqliteConnection {
     let mut conn = SqliteConnection::establish(":memory:").expect("connect");
     jsonb_functions::register(&mut conn);
+    temporal::register(&mut conn);
     for stmt in stmts.iter().filter(|s| !s.to_ascii_uppercase().trim_start().starts_with("SELECT"))
     {
         // Emitted DDL is not expressible via the typed DSL.
@@ -683,14 +683,7 @@ pub fn execute_joined_statements(output: &str) {
 pub fn reverse_sql_err(pg_ddl: &str, sqlite_sql: &str) -> String {
     let translator = Pg2Sqlite::default().sql(pg_ddl).unwrap();
     let schema = translator.build_schema().unwrap();
-    translator
-        .reverse_sql(
-            sqlite_sql,
-            &schema,
-            &jsonb_functions::with_functions(Pg2SqliteOptions::default()),
-        )
-        .unwrap_err()
-        .to_string()
+    translator.reverse_sql(sqlite_sql, &schema, &function_options()).unwrap_err().to_string()
 }
 
 /// Reverse-translates `sqlite_sql` against `schema` and returns the joined
@@ -700,11 +693,7 @@ pub fn reverse_sql_joined(
     schema: &sql_traits::structs::ParserDB,
 ) -> Result<String, pg2sqlite::errors::Error> {
     Pg2Sqlite::default()
-        .reverse_sql(
-            sqlite_sql,
-            schema,
-            &jsonb_functions::with_functions(Pg2SqliteOptions::default()),
-        )
+        .reverse_sql(sqlite_sql, schema, &function_options())
         .map(|stmts| stmts.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))
 }
 
@@ -728,11 +717,7 @@ where
 /// parses as PostgreSQL, and returns it.
 pub fn reverse_checked(sqlite_sql: &str, schema: &sql_traits::structs::ParserDB) -> String {
     let statements = Pg2Sqlite::default()
-        .reverse_sql(
-            sqlite_sql,
-            schema,
-            &jsonb_functions::with_functions(Pg2SqliteOptions::default()),
-        )
+        .reverse_sql(sqlite_sql, schema, &function_options())
         .expect("reverse translation");
     let sql = statements.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ");
     sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, &sql)
@@ -751,12 +736,7 @@ pub fn forward_translate_against(pg_sql: &str, schema: &str) -> String {
     stmts
         .iter()
         .flat_map(|s| {
-            pg2sqlite::prelude::Translator::translate(
-                s,
-                &built,
-                &jsonb_functions::with_functions(Pg2SqliteOptions::default()),
-            )
-            .unwrap()
+            pg2sqlite::prelude::Translator::translate(s, &built, &function_options()).unwrap()
         })
         .map(|s| s.to_string())
         .collect::<Vec<_>>()
@@ -769,25 +749,12 @@ pub fn reverse_translate_against(sqlite_sql: &str, schema: &str) -> String {
     let translator = Pg2Sqlite::default().sql(schema).unwrap();
     let built = translator.build_schema().unwrap();
     translator
-        .reverse_sql(
-            sqlite_sql,
-            &built,
-            &jsonb_functions::with_functions(Pg2SqliteOptions::default()),
-        )
+        .reverse_sql(sqlite_sql, &built, &function_options())
         .unwrap()
         .into_iter()
         .map(|s| s.to_string())
         .collect::<Vec<_>>()
         .join("; ")
-}
-
-/// Evaluates `probe` in a fresh in-memory SQLite and returns the first
-/// column of the first row.
-pub fn evaluate_probe<T: rusqlite::types::FromSql>(probe: &str) -> T {
-    let connection = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
-    connection
-        .query_row(probe, [], |row| row.get::<_, T>(0))
-        .unwrap_or_else(|error| panic!("emitted probe failed: {error}\n{probe}"))
 }
 
 /// Translates `pg_sql` with default options and proves every emitted
@@ -797,7 +764,7 @@ pub fn assert_translated_statements_run(pg_sql: &str) {
     for stmt in Pg2Sqlite::default()
         .sql(pg_sql)
         .expect("parse")
-        .translate(&jsonb_functions::with_functions(Pg2SqliteOptions::default()))
+        .translate(&function_options())
         .expect("translate")
         .into_vec()
     {

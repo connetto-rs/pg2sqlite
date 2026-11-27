@@ -6,14 +6,15 @@
 //!
 //! Each case sets the zone on PostgreSQL and gives the same setting to the
 //! deployment as the server's default, which is where pg2sqlite reads the
-//! request's zone. A zone with transitions needs the two SQLite functions the
-//! application registers, `zone_functions::register`, backed by sql-values.
+//! request's zone. The replica reads every zone through the temporal
+//! functions the application registers, `TemporalFunctions::register`.
 //! Expected values are what PostgreSQL 18.6 answered when the case was
 //! written, under the four zones: `Europe/Rome`, `UTC`, the POSIX zone
 //! `'+05:30'` (five and a half hours WEST of UTC) and `interval '+05:30'`
 //! (the same magnitude east).
 
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+use diesel::connection::SimpleConnection;
+use pg2sqlite::prelude::Pg2Sqlite;
 use sql_traits::structs::Deployment;
 
 use super::timestamptz_harness::{
@@ -31,6 +32,18 @@ const AT_STORED: &str = "2026-10-24 23:30:00.250000+00:00";
 const T2: &str = "timestamptz '2026-03-29 00:30+00'";
 
 const EVENTS: Events = Events::new(AT, AT_STORED);
+
+fn assert_rejected(expression: &str) {
+    let mut source = crate::helpers::postgres::fresh_database_in_zone("UTC");
+    // Invalid source syntax and translator output require runtime SQL.
+    assert!(source.batch_execute(&format!("SELECT {expression}")).is_err(), "{expression}");
+    let configured = options("UTC");
+    if let Ok(mut statements) = translate(expression, &configured) {
+        let query = statements.pop().expect("the translated query").to_string();
+        let mut replica = EVENTS.replica(super::timestamptz_harness::ROLES, &configured);
+        assert!(replica.batch_execute(&query).is_err(), "{expression}");
+    }
+}
 
 /// The cast forms answer the zone's wall clock, which the POSIX and the
 /// interval zones put on different days around the second instant.
@@ -194,10 +207,11 @@ fn the_casts_of_now_read_the_zones_wall_clock() {
         let apart = instant(&source[0]) - instant(&replica[0]);
         assert!(apart.abs() < 10_000_000_000, "under {zone}: the clocks are {apart} µs apart");
     }
-    // A clock that moves between reads cannot be named twice.
     for expression in ["clock_timestamp()::timestamp(0)", "clock_timestamp()::timestamp"] {
-        let error = refusal(expression, &zoned("+05:30"));
-        assert!(error.contains("once"), "{expression}: {error}");
+        let source = EVENTS.postgres("+05:30", expression);
+        let replica =
+            EVENTS.sqlite(super::timestamptz_harness::ROLES, expression, &zoned("+05:30"));
+        assert!((instant(&source) - instant(&replica)).abs() < 10_000_000_000, "{expression}");
     }
 }
 
@@ -565,63 +579,40 @@ fn the_reads_name_the_zone_they_cannot_resolve() {
         "localtimestamp",
     ];
     for expression in expressions {
-        let error = refusal(expression, &Pg2SqliteOptions::default());
+        let error = refusal(expression, &crate::helpers::function_options());
         assert!(error.contains("with_deployment"), "{expression}: {error}");
         let deployment = Deployment::new("postgres", ["app"], []).expect("a valid deployment");
         let error = refusal(
             expression,
-            &Pg2SqliteOptions::default()
+            &crate::helpers::function_options()
                 .with_deployment(deployment.clone())
                 .with_acting_role("app"),
         );
         assert!(error.contains("with_default_time_zone"), "{expression}: {error}");
-        let error = refusal(expression, &zoned("Europe/Rome"));
-        assert!(error.contains("with_time_zone_functions"), "{expression}: {error}");
     }
 }
 
-/// A bind parameter's type is not settled by the statement, and could be a
-/// `timestamptz`, whose calendar is the zone's.
 #[test]
-fn a_read_of_an_operand_of_unsettled_type_is_refused_outside_utc() {
-    let unsettled = [
-        "$1::date",
-        "$1::timestamp",
-        "$1::text",
-        "extract(year from $1)",
-        "to_char($1, 'YYYY')",
-        "date_trunc('day', $1)",
-        "to_char($1, 'TZ')",
-        "extract(timezone from $1)",
-        "($1)::date",
-    ];
-    for expression in unsettled {
-        let error = refusal(expression, &zoned("+05:30"));
-        assert!(error.contains("::timestamptz"), "{expression}: {error}");
+fn a_read_of_an_operand_of_unsettled_type_is_refused() {
+    for expression in ["extract(year from $1)", "to_char($1, 'YYYY')", "date_trunc('day', $1)"] {
+        for zone in ["+05:30", "UTC"] {
+            let error = refusal(expression, &zoned(zone));
+            assert!(error.contains("unsettled"), "{expression}: {error}");
+        }
     }
-    for expression in [&unsettled[0], &unsettled[2], &unsettled[3], &unsettled[4], &unsettled[5]] {
-        translate(expression, &zoned("UTC"))
-            .unwrap_or_else(|error| panic!("{expression} under UTC settles either type: {error}"));
-    }
-    let error = refusal("to_char($1, 'TZ')", &zoned("UTC"));
-    assert!(error.contains("does not settle"), "{error}");
-    // A predicate over the operand answers a boolean whatever its type.
     translate("($1 IS NULL)::text", &zoned("+05:30")).expect("a predicate is a boolean");
 }
 
-/// `to_char` refuses the operands and formats PostgreSQL refuses.
+/// Temporal formatting follows PostgreSQL's errors and quoted text.
 #[test]
 fn to_char_refuses_what_postgresql_refuses() {
-    for (expression, needle) in [
-        ("to_char(time '12:00', 'HH24 OF')", "interval value"),
-        ("to_char(timetz '12:00+00', 'OF')", "time with time zone"),
-    ] {
-        let error = refusal(expression, &zoned("UTC"));
-        assert!(error.contains(needle), "{expression}: {error}");
+    for expression in ["to_char(time '12:00', 'HH24 OF')", "to_char(timetz '12:00+00', 'OF')"] {
+        assert_rejected(expression);
     }
-    for opts in [zoned("UTC"), options("Europe/Rome")] {
-        let error = refusal("to_char(at, 'HH24 OF \"x')", &opts);
-        assert!(error.contains("unterminated quote"), "{error}");
+    for zone in ["UTC", "Europe/Rome"] {
+        let expression = "to_char(at, 'HH24 OF \"x')";
+        let source = EVENTS.postgres(zone, expression);
+        EVENTS.assert_text(zone, expression, &options(zone), &source);
     }
 }
 
@@ -631,55 +622,47 @@ fn to_char_refuses_what_postgresql_refuses() {
 fn a_temporal_default_names_the_zone_it_cannot_resolve() {
     let error = Pg2Sqlite::default()
         .sql("CREATE TABLE d (id INTEGER PRIMARY KEY, day DATE DEFAULT now());")
-        .and_then(|source| source.translate(&Pg2SqliteOptions::default()))
+        .and_then(|source| source.translate(&crate::helpers::function_options()))
         .expect_err("the default needs the request's zone")
         .to_string();
     assert!(error.contains("with_deployment"), "{error}");
 }
 
-/// `TZ` answers the zone's name from tzdata tables, which the replica holds
-/// for UTC alone.
 #[test]
-fn the_zone_names_the_replica_cannot_print_are_refused() {
+fn the_zone_names_match_postgresql() {
     for expression in ["to_char(at, 'TZ')", "to_char(at, 'tz')"] {
-        let error = refusal(expression, &options("Europe/Rome"));
-        assert!(error.contains("tzdata"), "{expression}: {error}");
-        let error = refusal(expression, &zoned("+05:30"));
-        assert!(error.contains("tzdata"), "{expression}: {error}");
+        for zone in ["Europe/Rome", "+05:30"] {
+            let source = EVENTS.postgres(zone, expression);
+            EVENTS.assert_text(zone, expression, &options(zone), &source);
+        }
     }
 }
 
-/// The offset fields apply to an instant alone, as PostgreSQL's error names
-/// the type.
 #[test]
-fn the_offset_fields_refuse_the_kinds_postgresql_refuses() {
-    for (expression, ty) in [
-        ("extract(timezone from ts)", "timestamp without time zone"),
-        ("extract(timezone from date '2026-10-24')", "date"),
-        ("extract(timezone from time '12:00')", "time without time zone"),
-        ("extract(timezone from timetz '12:00+02')", "only over a timestamptz operand"),
+fn the_offset_fields_match_postgresql() {
+    for expression in [
+        "extract(timezone from timestamp '2026-10-24 12:00')",
+        "extract(timezone from date '2026-10-24')",
+        "extract(timezone from time '12:00')",
     ] {
-        let error = refusal(expression, &zoned("UTC"));
-        assert!(error.contains(ty), "{expression}: {error}");
+        assert_rejected(expression);
     }
+    let expression = "extract(timezone from timetz '12:00+02')";
+    let source = EVENTS.postgres("UTC", expression);
+    EVENTS.assert_number("UTC", expression, &options("UTC"), &source);
 }
 
-/// The lowered form reads the wall clock twice, so an operand that cannot be
-/// replayed is refused under a zone that shifts it.
 #[test]
-fn a_non_replayable_operand_is_refused_where_the_read_names_it_twice() {
+fn subquery_reads_match_postgresql() {
     for expression in [
         "extract(year from (SELECT e.at FROM events AS e))",
         "(SELECT e.at FROM events AS e)::text",
         "extract(timezone from (SELECT e.at FROM events AS e))",
         "to_char((SELECT e.at FROM events AS e), 'HH24')",
     ] {
-        let error = refusal(expression, &zoned("+05:30"));
-        assert!(error.contains("once"), "{expression}: {error}");
+        let source = EVENTS.postgres("+05:30", expression);
+        EVENTS.assert_text("+05:30", expression, &zoned("+05:30"), &source);
     }
-    // In UTC the read needs no second copy.
-    translate("extract(year from (SELECT e.at FROM events AS e))", &zoned("UTC"))
-        .expect("UTC reads the stored text once");
 }
 
 /// PostgreSQL answers a syntax error for the argument forms the clock
@@ -687,8 +670,7 @@ fn a_non_replayable_operand_is_refused_where_the_read_names_it_twice() {
 #[test]
 fn the_clock_functions_refuse_the_argument_forms_postgresql_refuses() {
     for expression in ["current_date()", "current_date(3)", "localtime(2.5)"] {
-        let error = refusal(expression, &zoned("UTC"));
-        assert!(error.contains("syntax error"), "{expression}: {error}");
+        assert_rejected(expression);
     }
     translate("localtimestamp(3)", &zoned("UTC")).expect("a precision is an integer constant");
 }

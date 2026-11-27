@@ -1,5 +1,6 @@
 //! Implementation of the [`Translator`](crate::traits::Translator) trait for
 //! the `Function` type.
+use pg2sqlite_runtime::{TemporalFunction, TemporalKind as RuntimeTemporalKind};
 use sql_traits::structs::ParserDB;
 use sqlparser::ast::{
     BinaryOperator, CaseWhen, CastKind, DataType, DuplicateTreatment, Expr, Function, FunctionArg,
@@ -18,10 +19,6 @@ use super::{
 use crate::no_std::prelude::*;
 use crate::{
     impls::{
-        datetime_helpers::{
-            DatePartKey, build_date_trunc_quarter_call, build_date_trunc_week_call,
-            build_date_trunc_year_span_call, build_strftime_call, parse_date_part_key,
-        },
         expr_helpers::case_when,
         function_helpers::{
             extract_exactly, integer_literal, integer_literal_value, number_literal,
@@ -34,14 +31,8 @@ use crate::{
             GENERATE_SERIES_UNSUPPORTED_MESSAGE, declared_in_scope, declared_type_matches,
             function_argument_exprs, rescale_minor_units, scale_of, translate_function_arguments,
         },
-        temporal_arithmetic::{
-            TemporalKind, epoch_of_temporal_difference, subsecond_timestamp_from_epoch,
-            temporal_kind_of, trim_trailing_zeros,
-        },
-        temporal_infinity::{InfiniteAnswer, guard},
-        zone_clock::{
-            unsettled_operand_refusal, zoned_date_part, zoned_offset_of, zoned_wall_clock,
-        },
+        temporal_arithmetic::{TemporalKind, temporal_kind_of},
+        temporal_functions::{call as temporal_call, session_zone},
     },
     prelude::Pg2SqliteOptions,
     traits::translator::TranslatorWithContext,
@@ -52,18 +43,21 @@ enum FunctionTranslation {
     /// Simple name replacement (e.g., LEAST -> MIN)
     Rename(String),
     /// Function with modified arguments (e.g., NOW() -> datetime('now'))
-    WithArgs { name: String, args: Vec<Expr> },
+    WithArgs {
+        name: String,
+        args: Vec<Expr>,
+    },
     /// Transform to concatenation operator (CONCAT -> ||)
     ToConcatenation,
     /// Transform to concatenation with separator (CONCAT_WS)
     ToConcatenationWithSeparator,
-    /// Transform date_trunc to strftime equivalent
+    /// Calls the temporal truncation function.
     DateTrunc,
-    /// Transform date_part('field', expr) to CAST(strftime(format, expr) AS
-    /// type)
+    /// Calls the floating-point field reader.
     DatePart,
-    /// Transform to_char(expr, format) to strftime(mapped_format, expr)
+    /// Calls the temporal formatter.
     ToChar,
+    TemporalUnary(TemporalFunction),
     /// Unsupported function with error message
     Unsupported(String),
     /// Transform random() to ABS(random()) / 9223372036854775807.0
@@ -72,7 +66,7 @@ enum FunctionTranslation {
     ToSubstrLeft,
     /// Transform right(s, n) to substr(s, -n)
     ToSubstrRight,
-    /// Transform to_timestamp(epoch) to datetime(epoch, 'unixepoch')
+    /// Converts epoch seconds to an instant.
     ToTimestampEpoch,
     /// Transform mod(a, b) to (a % b)
     ToModulo,
@@ -89,15 +83,16 @@ enum FunctionTranslation {
     /// Transform `decode(x, 'hex')` to `unhex(x)`, which needs no fold since
     /// both engines read either case.
     ToUnhex,
-    /// Transform make_date/make_time/make_timestamp to a printf over the parts.
-    /// `format` covers every argument except a trailing fractional-seconds
-    /// one, which `fractional_seconds` marks and which is rendered separately.
-    ToMakePrintf {
-        format: &'static str,
-        arg_count: usize,
-        func_label: &'static str,
-        fractional_seconds: bool,
+    /// Constructs a temporal value from numeric parts.
+    MakeTemporal {
+        function: TemporalFunction,
+        argument_count: usize,
+        label: &'static str,
     },
+    /// Converts a value into an explicitly named zone.
+    Timezone,
+    /// Reads the current instant with optional precision.
+    CurrentTimestamp,
     /// `json_extract_path` and `jsonb_extract_path`, read as the `#>` chain
     /// of SQLite arrows their path spells, and their `_text` forms, read as
     /// the text `#>>` extracts.
@@ -110,7 +105,9 @@ enum FunctionTranslation {
     /// Transform `jsonb_set` and `jsonb_insert` to the `json_set`,
     /// `json_replace`, or `json_insert` that matches, converting the `text[]`
     /// path to JSONPath and keeping the value typed as JSON.
-    JsonSet { insert: bool },
+    JsonSet {
+        insert: bool,
+    },
     /// Transform `to_json` and `to_jsonb` to `json_quote`, which CONVERTS a
     /// value to JSON, keeping SQL NULL and leaving an argument that is already
     /// JSON alone.
@@ -203,7 +200,9 @@ enum FunctionTranslation {
     /// `infinity` or `-infinity`.
     IsFinite,
     /// The local clock of now, answered from the request's zone.
-    LocalClock { which: crate::impls::zone_clock::LocalClock },
+    LocalClock {
+        which: crate::impls::zone_clock::LocalClock,
+    },
     /// `lower` and `upper`, which fold by the text's collation.
     CaseFold(case_fold::Case),
 }
@@ -677,19 +676,7 @@ fn translate_catalog_function(
     "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp" => {
         canonical_now_translation()
     }
-    "current_timestamp" => {
-        match args {
-            FunctionArguments::List(list) if !list.args.is_empty() => {
-                FunctionTranslation::Unsupported(
-                    "CURRENT_TIMESTAMP with a precision argument rounds the instant to that many \
-                     digits, and SQLite's clock has no such rounding. Write CURRENT_TIMESTAMP \
-                     without a precision."
-                        .to_string(),
-                )
-            }
-            _ => canonical_now_translation(),
-        }
-    }
+    "current_timestamp" => FunctionTranslation::CurrentTimestamp,
     "ts_rank" | "ts_rank_cd" => FunctionTranslation::Unsupported(
         "ts_rank/ts_rank_cd are not directly translatable to SQLite. \
          FTS5 provides bm25() for ranking, but it requires a different query structure. \
@@ -788,24 +775,16 @@ fn translate_catalog_function(
     "trunc" | "truncate" => FunctionTranslation::ToTrunc,
     // ceiling(x) is a function call (sqlparser parses only CEIL/FLOOR as Expr variants).
     "ceiling" => FunctionTranslation::NumericCeil,
-    "make_date" => FunctionTranslation::ToMakePrintf {
-        format: "%04d-%02d-%02d",
-        arg_count: 3,
-        func_label: "make_date",
-        fractional_seconds: false,
+    "make_date" => FunctionTranslation::MakeTemporal {
+        function: TemporalFunction::MakeDate, argument_count: 3, label: "make_date",
     },
-    "make_time" => FunctionTranslation::ToMakePrintf {
-        format: "%02d:%02d:",
-        arg_count: 3,
-        func_label: "make_time",
-        fractional_seconds: true,
+    "make_time" => FunctionTranslation::MakeTemporal {
+        function: TemporalFunction::MakeTime, argument_count: 3, label: "make_time",
     },
-    "make_timestamp" => FunctionTranslation::ToMakePrintf {
-        format: "%04d-%02d-%02d %02d:%02d:",
-        arg_count: 6,
-        func_label: "make_timestamp",
-        fractional_seconds: true,
+    "make_timestamp" => FunctionTranslation::MakeTemporal {
+        function: TemporalFunction::MakeTimestamp, argument_count: 6, label: "make_timestamp",
     },
+    "timezone" => FunctionTranslation::Timezone,
     // round over a NUMERIC needs the column's scale, so it is decided at
     // emission where the schema is in hand.
     "round" => FunctionTranslation::NumericRound,
@@ -896,8 +875,6 @@ fn translate_catalog_function(
     "left" => FunctionTranslation::ToSubstrLeft,
     // right(s, n) -> substr(s, -n)
     "right" => FunctionTranslation::ToSubstrRight,
-    // to_timestamp(epoch) -> datetime(val, 'unixepoch') (single-arg form)
-    // to_timestamp(text, format) -> Unsupported (two-arg form)
     "to_timestamp" => {
         match args {
             FunctionArguments::List(list) if list.args.len() == 1 => {
@@ -1039,10 +1016,10 @@ fn translate_catalog_function(
         FunctionTranslation::Unsupported(format!("{original_name}() is not available in SQLite."))
     }
     "isfinite" => FunctionTranslation::IsFinite,
-    "justify_days" | "justify_hours" | "justify_interval" => {
-        FunctionTranslation::Unsupported(format!(
-            "{original_name}() is not available in SQLite (no interval type)."
-        ))
+    "justify_days" => FunctionTranslation::TemporalUnary(TemporalFunction::IntervalJustifyDays),
+    "justify_hours" => FunctionTranslation::TemporalUnary(TemporalFunction::IntervalJustifyHours),
+    "justify_interval" => {
+        FunctionTranslation::TemporalUnary(TemporalFunction::IntervalJustifyInterval)
     }
     "timeofday" => FunctionTranslation::Unsupported(
         "timeofday() is not available in SQLite. Use now() instead.".to_string(),
@@ -1150,6 +1127,164 @@ fn canonical_now_translation() -> FunctionTranslation {
             string_literal("now"),
         ],
     }
+}
+
+/// The canonical current instant read from SQLite's clock.
+fn canonical_now() -> Expr {
+    simple_function_expr(
+        "strftime",
+        vec![
+            string_literal(crate::impls::datetime_helpers::TIMESTAMPTZ_FORMAT),
+            string_literal("now"),
+        ],
+        None,
+    )
+}
+
+/// Rounds a clock reading to its optional literal precision.
+fn round_clock(
+    clock: Expr,
+    kind: RuntimeTemporalKind,
+    arguments: &FunctionArguments,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<Expr, crate::errors::Error> {
+    let arguments = function_argument_exprs(arguments);
+    if arguments.is_empty() {
+        return Ok(clock);
+    }
+    let [precision] = arguments.as_slice() else {
+        return Err(crate::errors::Error::forward_refusal(
+            "clock precision requires one integer".to_string(),
+        ));
+    };
+    let precision = integer_literal_value(precision)
+        .filter(|precision| (0..=6).contains(precision))
+        .ok_or_else(|| {
+            crate::errors::Error::forward_refusal(
+                "clock precision must be an integer between zero and six".to_string(),
+            )
+        })?;
+    temporal_call(
+        options,
+        TemporalFunction::Round(kind),
+        vec![clock, integer_literal(precision)],
+        &"clock precision",
+    )
+}
+
+/// Resolves a temporal operand to its runtime overload.
+pub(crate) fn temporal_operand_kind(
+    operand: &Expr,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+) -> Result<RuntimeTemporalKind, crate::errors::Error> {
+    if crate::impls::expression_type::is_interval_typed(operand, schema, options) {
+        return Ok(RuntimeTemporalKind::Interval);
+    }
+    match temporal_kind_of(operand, schema, options) {
+        Some(TemporalKind::Date) => Ok(RuntimeTemporalKind::Date),
+        Some(TemporalKind::Timestamp) => Ok(RuntimeTemporalKind::Timestamp),
+        Some(TemporalKind::TimestampTz) => Ok(RuntimeTemporalKind::TimestampTz),
+        Some(TemporalKind::Time { zoned: false }) => Ok(RuntimeTemporalKind::Time),
+        Some(TemporalKind::Time { zoned: true }) => Ok(RuntimeTemporalKind::TimeTz),
+        None => {
+            Err(crate::errors::Error::forward_refusal(format!(
+                "the temporal type of {operand} is unsettled"
+            )))
+        }
+    }
+}
+
+/// Reads a temporal field as minor units or floating point.
+pub(crate) fn translate_temporal_field(
+    field: &str,
+    operand: &Expr,
+    exact: bool,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Expr, crate::errors::Error> {
+    let kind = temporal_operand_kind(operand, schema, options)?;
+    if exact
+        && sql_values::postgres::ExtractField::parse(field)
+            == Some(sql_values::postgres::ExtractField::Julian)
+    {
+        return Err(crate::errors::Error::forward_refusal(format!(
+            "extract({field} from {operand}) has no supported numeric scale"
+        )));
+    }
+    let mut arguments =
+        vec![string_literal(field), operand.translate_with_warnings(schema, options, emit)?];
+    if kind == RuntimeTemporalKind::TimestampTz {
+        arguments.push(session_zone(options, schema, "temporal field extraction")?);
+    }
+    let function =
+        if exact { TemporalFunction::Extract(kind) } else { TemporalFunction::DatePart(kind) };
+    temporal_call(options, function, arguments, &"temporal field extraction")
+}
+
+fn epoch_argument(
+    operand: &Expr,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<(TemporalFunction, Expr), crate::errors::Error> {
+    use crate::impls::{expression_type::type_name, shared_helpers::strip_nesting};
+
+    let text_type = |name: &str| {
+        ["text", "varchar", "character", "char", "character varying"]
+            .iter()
+            .any(|family| name.split('(').next().unwrap_or(name).eq_ignore_ascii_case(family))
+    };
+    let kind = type_name(operand, schema, options)?;
+    if kind.as_deref() == Some("unknown") {
+        return Ok((
+            TemporalFunction::EpochTextToTimestampTz,
+            operand.translate_with_warnings(schema, options, emit)?,
+        ));
+    }
+    if kind.as_deref().is_some_and(text_type) {
+        return Err(crate::errors::Error::forward_refusal("to_timestamp has no text overload"));
+    }
+    if kind.as_deref().is_some_and(|name| {
+        name.eq_ignore_ascii_case("float8") || name.eq_ignore_ascii_case("double precision")
+    }) && let Expr::Cast { expr, format: None, .. } = strip_nesting(operand)
+        && type_name(expr, schema, options)?
+            .as_deref()
+            .is_some_and(|name| name == "unknown" || text_type(name))
+    {
+        return Ok((
+            TemporalFunction::EpochTextToTimestampTz,
+            expr.translate_with_warnings(schema, options, emit)?,
+        ));
+    }
+    Ok((
+        TemporalFunction::EpochToTimestampTz,
+        temporal_numeric_argument(operand, schema, options, emit)?,
+    ))
+}
+
+/// Converts numeric minor units into the real argument a constructor reads.
+fn temporal_numeric_argument(
+    operand: &Expr,
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Expr, crate::errors::Error> {
+    let translated = operand.translate_with_warnings(schema, options, emit)?;
+    let Some(scale) = scale_of(operand, schema, options).filter(|scale| *scale > 0) else {
+        return Ok(translated);
+    };
+    let translated = if matches!(translated, Expr::BinaryOp { .. }) {
+        Expr::Nested(Box::new(translated))
+    } else {
+        translated
+    };
+    Ok(Expr::Nested(Box::new(Expr::BinaryOp {
+        left: Box::new(translated),
+        op: BinaryOperator::Divide,
+        right: Box::new(number_literal(&format!("{}.0", 10_i64.pow(scale)))),
+    })))
 }
 
 /// What `uuidv7()` becomes.
@@ -1302,9 +1437,10 @@ fn declares_function_by_option(name: &str, options: &Pg2SqliteOptions) -> bool {
     matches(options.get_uuid_function_name())
         || options.get_uuid_v7_function_name().is_some_and(matches)
         || options.get_uuid_text_to_blob_function_name().is_some_and(matches)
-        || options
-            .get_time_zone_functions()
-            .is_some_and(|functions| matches(&functions.local_clock) || matches(&functions.instant))
+        || options.get_temporal_functions().is_some_and(|functions| {
+            crate::impls::reverse_translator_impls::temporal::classify_name(name, functions)
+                .is_some()
+        })
         || options.get_session_variables().iter().any(|m| matches(&m.sqlite_function))
         || options
             .get_case_fold_functions()
@@ -1499,66 +1635,6 @@ fn json_path_not_literal(label: &str, path: &Expr) -> crate::errors::Error {
          converted to the JSONPath SQLite takes, and {path} cannot be converted at translation \
          time."
     ))
-}
-
-/// `make_date`, `make_time` and `make_timestamp` over their already-translated
-/// parts.
-///
-/// Two things `printf` alone gets wrong. It renders a NULL argument as zero,
-/// so any NULL used to produce a plausible wrong string where PostgreSQL
-/// answers NULL, which the guard fixes. And `%02d` truncates the seconds,
-/// which is this item: the seconds are formatted to six decimal places and
-/// trimmed instead, so a whole second reads `07` and a fractional one keeps
-/// every digit PostgreSQL keeps.
-fn make_closed_form(format: &str, parts: &[Expr], fractional_seconds: bool) -> Expr {
-    let (head, seconds) = if fractional_seconds {
-        let (last, rest) = parts.split_last().expect("a fractional-seconds make has parts");
-        (rest, Some(last))
-    } else {
-        (parts, None)
-    };
-
-    let mut printf_args = vec![string_literal(format)];
-    printf_args.extend(head.iter().cloned());
-    let mut body = simple_function_expr("printf", printf_args, None);
-
-    if let Some(seconds) = seconds {
-        body = Expr::BinaryOp {
-            left: Box::new(body),
-            op: BinaryOperator::StringConcat,
-            right: Box::new(rendered_seconds(seconds)),
-        };
-    }
-
-    let present = parts
-        .iter()
-        .map(|part| Expr::IsNotNull(Box::new(part.clone())))
-        .reduce(|left, right| {
-            Expr::BinaryOp { left: Box::new(left), op: BinaryOperator::And, right: Box::new(right) }
-        })
-        .expect("a make function has at least one argument");
-    case_when(present, body, None)
-}
-
-/// The seconds slot: `07` when whole, `00.5` and `00.000001` when not.
-fn rendered_seconds(seconds: &Expr) -> Expr {
-    let is_whole = Expr::BinaryOp {
-        left: Box::new(seconds.clone()),
-        op: BinaryOperator::Eq,
-        right: Box::new(Expr::Cast {
-            expr: Box::new(seconds.clone()),
-            data_type: DataType::Integer(None),
-            format: None,
-            kind: CastKind::Cast,
-        }),
-    };
-    let whole = simple_function_expr("printf", vec![string_literal("%02d"), seconds.clone()], None);
-    let fractional = trim_trailing_zeros(simple_function_expr(
-        "printf",
-        vec![string_literal("%09.6f"), seconds.clone()],
-        None,
-    ));
-    case_when(is_whole, whole, Some(fractional))
 }
 
 /// `left(s, n)`: the first `n` characters, or all but the last `|n|` when `n`
@@ -1906,168 +1982,109 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                     )
                 })
             }
-            FunctionTranslation::DateTrunc => {
+            FunctionTranslation::TemporalUnary(function) => {
                 reject_over_on_scalar(&func)?;
-                // The written arguments, whose subqueries the scope finds by
-                // address.
-                let (field_str, ts_expr) =
-                    literal_field_argument(&self.args, "date_trunc", "'day'")?;
-                let operation = format!("date_trunc('{field_str}', {ts_expr})");
-                // A timestamptz truncates the zone's wall clock and answers
-                // an instant.
-                let kind = temporal_kind_of(ts_expr, schema, options);
-                if kind.is_none() {
-                    unsettled_operand_refusal(&operation, ts_expr, schema, options)?;
-                }
-                let zoned = match kind {
-                    Some(TemporalKind::TimestampTz) => {
-                        Some(zoned_wall_clock(
-                            &operation,
-                            "truncate the wall clock of",
-                            schema,
-                            options,
-                        )?)
-                    }
-                    _ => None,
-                };
-                let translated_ts = ts_expr.translate_with_warnings(schema, options, emit)?;
-                guard(
-                    &operation,
-                    ts_expr,
-                    translated_ts,
-                    InfiniteAnswer::Same,
-                    options,
-                    |translated_ts| {
-                        let wall_clock = match zoned {
-                            Some(zoned) => {
-                                let reads_twice =
-                                    matches!(field_str.as_str(), "quarter" | "quarters")
-                                        || zoned.local_reads_twice()
-                                        || zoned.instant_reads_twice();
-                                if reads_twice && !is_replayable(ts_expr, options) {
-                                    return Err(reject_duplicated_operand(&operation, ts_expr));
-                                }
-                                zoned.local(translated_ts)
-                            }
-                            None => translated_ts,
-                        };
-                        let call = match field_str.as_str() {
-                            // A full timestamp, the sub-granularity components
-                            // zeroed rather than dropped, so the result
-                            // compares against a stored value.
-                            "second" | "seconds" => {
-                                build_strftime_call("%Y-%m-%d %H:%M:%S", wall_clock)
-                            }
-                            "millisecond" | "milliseconds" => {
-                                // SQLite %f prints three digits where
-                                // PostgreSQL drops trailing zeros.
-                                trim_trailing_zeros(build_strftime_call(
-                                    "%Y-%m-%d %H:%M:%f",
-                                    wall_clock,
-                                ))
-                            }
-                            "minute" | "minutes" => {
-                                build_strftime_call("%Y-%m-%d %H:%M:00", wall_clock)
-                            }
-                            "hour" | "hours" => {
-                                build_strftime_call("%Y-%m-%d %H:00:00", wall_clock)
-                            }
-                            "day" | "days" => build_strftime_call("%Y-%m-%d 00:00:00", wall_clock),
-                            "month" | "months" => {
-                                build_strftime_call("%Y-%m-01 00:00:00", wall_clock)
-                            }
-                            "year" | "years" => {
-                                build_strftime_call("%Y-01-01 00:00:00", wall_clock)
-                            }
-                            // Calendar arithmetic, not a format.
-                            "week" | "weeks" => build_date_trunc_week_call(wall_clock),
-                            "quarter" | "quarters" => build_date_trunc_quarter_call(wall_clock),
-                            "decade" | "decades" => {
-                                build_date_trunc_year_span_call(wall_clock, 10, 0)
-                            }
-                            "century" | "centuries" => {
-                                build_date_trunc_year_span_call(wall_clock, 100, 1)
-                            }
-                            "millennium" | "millennia" => {
-                                build_date_trunc_year_span_call(wall_clock, 1000, 1)
-                            }
-                            other => {
-                                return Err(crate::errors::Error::forward_refusal(format!(
-                                    "date_trunc('{other}', ...) is not supported by this translation. \
-                            Supported: millisecond, second, minute, hour, day, week, month, \
-                            quarter, year, decade, century, millennium, and their plurals."
-                                )));
-                            }
-                        };
-                        match zoned {
-                            // The result is a timestamptz in every zone.
-                            Some(zoned) => Ok(zoned.instant(call)),
-                            None => Ok(call),
-                        }
-                    },
-                )
-            }
-            FunctionTranslation::DatePart => {
-                // date_part('field', expr) -> CAST(strftime(format, expr) AS
-                // INTEGER/REAL)
-                reject_over_on_scalar(&func)?;
-                let (field_str, ts_expr) =
-                    literal_field_argument(&self.args, "date_part", "'year'")?;
-                // The offset fields answer the instant's UTC offset.
-                if matches!(field_str.as_str(), "timezone" | "timezone_hour" | "timezone_minute") {
-                    let operation = format!("date_part('{field_str}', {ts_expr})");
-                    return zoned_offset_of(
-                        field_str.as_str(),
-                        ts_expr,
-                        &operation,
-                        schema,
-                        options,
-                        emit,
-                    );
-                }
-                let key = parse_date_part_key(&field_str).ok_or_else(|| {
-                    crate::errors::Error::forward_refusal(format!(
-                        "date_part('{field_str}', ...) is not supported in SQLite. \
-                                 Supported fields: year, month, day, hour, minute, second, \
-                                 week, dow, doy, epoch."
-                    ))
-                })?;
-                // The same composite `extract(epoch from (a - b))` takes,
-                // spelled as a function.
-                if key == DatePartKey::Epoch
-                    && let Some(result) =
-                        epoch_of_temporal_difference(ts_expr, schema, options, emit)
-                {
-                    return result;
-                }
-                let operation = format!("date_part('{field_str}', {ts_expr})");
-                zoned_date_part(key, ts_expr, &operation, schema, options, emit)
-            }
-            FunctionTranslation::ToChar => {
-                reject_over_on_scalar(&func)?;
-                let exprs = extract_exactly(&self.args, 2, "to_char")?;
-                let ts_expr = exprs[0];
-                let format_expr = exprs[1];
-                let format_str = match format_expr {
-                    Expr::Value(ValueWithSpan { value: Value::SingleQuotedString(s), .. }) => {
-                        s.clone()
-                    }
-                    _ => {
-                        return Err(crate::errors::Error::forward_refusal("to_char: format argument must be a string literal known at \
-                                         translation time (e.g., to_char(col, 'YYYY-MM-DD')). Dynamic \
-                                         formats cannot be translated."
-                            .to_string()));
-                    }
-                };
-                let operation = format!("to_char({ts_expr}, '{format_str}')");
-                crate::impls::zone_clock::zoned_to_char(
-                    ts_expr,
-                    &format_str,
-                    &operation,
+                let name = func.name.to_string();
+                let arguments = extract_exactly(&self.args, 1, &name)?;
+                let argument = crate::impls::interval::fields::cast(
+                    arguments[0],
+                    None,
+                    None,
                     schema,
                     options,
                     emit,
-                )
+                )?;
+                temporal_call(options, function, vec![argument], &name)
+            }
+            FunctionTranslation::DateTrunc => {
+                reject_over_on_scalar(&func)?;
+                let arguments = function_argument_exprs(&self.args);
+                if !matches!(arguments.len(), 2 | 3) {
+                    return Err(crate::errors::Error::forward_refusal(
+                        "date_trunc requires two or three arguments".to_string(),
+                    ));
+                }
+                let field = single_quoted_literal(arguments[0]).ok_or_else(|| {
+                    crate::errors::Error::forward_refusal(
+                        "date_trunc requires a literal field".to_string(),
+                    )
+                })?;
+                let kind = temporal_operand_kind(arguments[1], schema, options)?;
+                let function = match kind {
+                    RuntimeTemporalKind::Timestamp => TemporalFunction::TimestampTrunc,
+                    RuntimeTemporalKind::Date | RuntimeTemporalKind::TimestampTz => {
+                        TemporalFunction::TimestampTzTrunc
+                    }
+                    RuntimeTemporalKind::Interval | RuntimeTemporalKind::Time => {
+                        TemporalFunction::IntervalTrunc
+                    }
+                    RuntimeTemporalKind::TimeTz => {
+                        return Err(crate::errors::Error::forward_refusal(
+                            "date_trunc requires timestamp, timestamptz or interval".to_string(),
+                        ));
+                    }
+                };
+                if arguments.len() == 3
+                    && !matches!(kind, RuntimeTemporalKind::Date | RuntimeTemporalKind::TimestampTz)
+                {
+                    return Err(crate::errors::Error::forward_refusal(
+                        "three-argument date_trunc requires timestamptz".to_string(),
+                    ));
+                }
+                let operand = if kind == RuntimeTemporalKind::Time {
+                    crate::impls::interval::fields::cast(
+                        arguments[1],
+                        None,
+                        None,
+                        schema,
+                        options,
+                        emit,
+                    )?
+                } else if kind == RuntimeTemporalKind::Date {
+                    temporal_call(
+                        options,
+                        TemporalFunction::DateToTimestampTz,
+                        vec![
+                            arguments[1].translate_with_warnings(schema, options, emit)?,
+                            session_zone(options, schema, "date_trunc")?,
+                        ],
+                        "date_trunc",
+                    )?
+                } else {
+                    arguments[1].translate_with_warnings(schema, options, emit)?
+                };
+                let mut translated = vec![string_literal(field), operand];
+                if matches!(kind, RuntimeTemporalKind::Date | RuntimeTemporalKind::TimestampTz) {
+                    translated.push(if arguments.len() == 3 {
+                        arguments[2].translate_with_warnings(schema, options, emit)?
+                    } else {
+                        session_zone(options, schema, "date_trunc")?
+                    });
+                }
+                temporal_call(options, function, translated, &"date_trunc")
+            }
+            FunctionTranslation::DatePart => {
+                reject_over_on_scalar(&func)?;
+                let (field, operand) = literal_field_argument(&self.args, "date_part", "'year'")?;
+                translate_temporal_field(&field, operand, false, schema, options, emit)
+            }
+            FunctionTranslation::ToChar => {
+                reject_over_on_scalar(&func)?;
+                let arguments = extract_exactly(&self.args, 2, "to_char")?;
+                let kind = temporal_operand_kind(arguments[0], schema, options)?;
+                if kind == RuntimeTemporalKind::TimeTz {
+                    return Err(crate::errors::Error::forward_refusal(
+                        "to_char has no timetz overload".to_string(),
+                    ));
+                }
+                let mut translated = arguments
+                    .iter()
+                    .map(|argument| argument.translate_with_warnings(schema, options, emit))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if matches!(kind, RuntimeTemporalKind::Date | RuntimeTemporalKind::TimestampTz) {
+                    translated.push(session_zone(options, schema, "to_char")?);
+                }
+                temporal_call(options, TemporalFunction::ToChar(kind), translated, &"to_char")
             }
             FunctionTranslation::ToRandomFloat => Ok(crate::impls::idioms::uniform_random_float()),
             FunctionTranslation::ToSubstrLeft => {
@@ -2095,12 +2112,10 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                 Ok(right_closed_form(s, n))
             }
             FunctionTranslation::ToTimestampEpoch => {
-                let exprs = extract_exactly(&func.args, 1, "to_timestamp")?;
-                subsecond_timestamp_from_epoch(
-                    exprs[0],
-                    exprs[0].translate_with_warnings(schema, options, emit)?,
-                    options,
-                )
+                reject_over_on_scalar(&func)?;
+                let arguments = extract_exactly(&self.args, 1, "to_timestamp")?;
+                let (function, argument) = epoch_argument(arguments[0], schema, options, emit)?;
+                temporal_call(options, function, vec![argument], &"to_timestamp")
             }
             FunctionTranslation::ToModulo => {
                 // mod(a, b) → (a % b), with a plain operand brought onto the
@@ -2221,23 +2236,29 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                     }
                 }
             }
-            FunctionTranslation::ToMakePrintf {
-                format,
-                arg_count,
-                func_label,
-                fractional_seconds,
-            } => {
-                let exprs = extract_exactly(&func.args, arg_count, func_label)?;
-                let translated = exprs
+            FunctionTranslation::MakeTemporal { function, argument_count, label } => {
+                reject_over_on_scalar(&func)?;
+                let arguments = extract_exactly(&self.args, argument_count, label)?;
+                let translated = arguments
                     .iter()
-                    .map(|e| e.translate_with_warnings(schema, options, emit))
+                    .map(|argument| temporal_numeric_argument(argument, schema, options, emit))
                     .collect::<Result<Vec<_>, _>>()?;
-                for part in &translated {
-                    if !is_replayable(part, options) {
-                        return Err(reject_duplicated_operand(func_label, part));
-                    }
-                }
-                Ok(make_closed_form(format, &translated, fractional_seconds))
+                temporal_call(options, function, translated, &label)
+            }
+            FunctionTranslation::Timezone => {
+                reject_over_on_scalar(&func)?;
+                let arguments = extract_exactly(&self.args, 2, "timezone")?;
+                super::expr::translate_at_time_zone(
+                    arguments[1],
+                    arguments[0],
+                    schema,
+                    options,
+                    emit,
+                )
+            }
+            FunctionTranslation::CurrentTimestamp => {
+                reject_over_on_scalar(&func)?;
+                round_clock(canonical_now(), RuntimeTemporalKind::TimestampTz, &self.args, options)
             }
             FunctionTranslation::JsonExtractPath { function, text } => {
                 let exprs = function_argument_exprs(&func.args);
@@ -2788,8 +2809,6 @@ impl crate::traits::translator::TranslatorWithContext for Function {
             }
             FunctionTranslation::LocalClock { which } => {
                 reject_over_on_scalar(&func)?;
-                // The clock holds whole seconds, so a precision narrows
-                // nothing.
                 let name = which.name();
                 let precision_form = match &func.args {
                     FunctionArguments::None => None,
@@ -2819,7 +2838,27 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                          parentheses."
                     )));
                 }
-                crate::impls::zone_clock::local_clock_clock(which, schema, options)
+                let (function, kind) = match which {
+                    crate::impls::zone_clock::LocalClock::Date => {
+                        (TemporalFunction::TimestampTzToDate, RuntimeTemporalKind::Date)
+                    }
+                    crate::impls::zone_clock::LocalClock::Timestamp => {
+                        (TemporalFunction::TimestampTzToTimestamp, RuntimeTemporalKind::Timestamp)
+                    }
+                    crate::impls::zone_clock::LocalClock::Time => {
+                        (TemporalFunction::TimestampTzToTime, RuntimeTemporalKind::Time)
+                    }
+                    crate::impls::zone_clock::LocalClock::TimeWithZone => {
+                        (TemporalFunction::TimestampTzToTimeTz, RuntimeTemporalKind::TimeTz)
+                    }
+                };
+                let clock = temporal_call(
+                    options,
+                    function,
+                    vec![canonical_now(), session_zone(options, schema, name)?],
+                    &name,
+                )?;
+                round_clock(clock, kind, &self.args, options)
             }
             FunctionTranslation::ToLowerHex => {
                 let exprs = extract_exactly(&func.args, 2, "encode")?;
@@ -2881,6 +2920,86 @@ mod tests {
         },
         prelude::{Pg2SqliteOptions, Translator},
     };
+
+    #[test]
+    fn temporal_operations_require_registered_functions() {
+        let schema = empty_schema();
+        let options = Pg2SqliteOptions::default();
+        for expression in [
+            "extract(second from time '12:34:56.123456')",
+            "date_part('second', time '12:34:56.123456')",
+            "date_trunc('microseconds', timestamp '2024-01-01 12:34:56.123456')",
+            "to_char(time '12:34:56.123456', 'HH24:MI:SS.US')",
+            "to_timestamp(1.123456)",
+            "make_date(2024, 1, 1)",
+            "make_time(12, 34, 56.123456)",
+            "make_timestamp(2024, 1, 1, 12, 34, 56.123456)",
+        ] {
+            assert!(parse_expr(expression).translate(&schema, &options).is_err(), "{expression}");
+        }
+    }
+
+    #[test]
+    fn temporal_fields_and_constructors_use_configured_names() {
+        use pg2sqlite_runtime::{TemporalFunction, TemporalFunctions, TemporalKind};
+        let schema = empty_schema();
+        let functions = TemporalFunctions::new("replica_");
+        let options = Pg2SqliteOptions::default().with_temporal_functions(functions.clone());
+        for (expression, function) in [
+            (
+                "extract(second from time '12:34:56.123456')",
+                TemporalFunction::Extract(TemporalKind::Time),
+            ),
+            (
+                "extract(epoch from interval '1.000001 seconds')",
+                TemporalFunction::Extract(TemporalKind::Interval),
+            ),
+            (
+                "date_part('second', time '12:34:56.123456')",
+                TemporalFunction::DatePart(TemporalKind::Time),
+            ),
+            (
+                "date_trunc('microseconds', timestamp '2024-01-01 12:34:56.123456')",
+                TemporalFunction::TimestampTrunc,
+            ),
+            ("date_trunc('hour', interval '1 day 02:03:04')", TemporalFunction::IntervalTrunc),
+            (
+                "to_char(time '12:34:56.123456', 'HH24:MI:' || 'SS.US')",
+                TemporalFunction::ToChar(TemporalKind::Time),
+            ),
+            ("to_timestamp(1.123456)", TemporalFunction::EpochToTimestampTz),
+            ("make_date(2024, 1, 1)", TemporalFunction::MakeDate),
+            ("make_time(12, 34, 56.123456)", TemporalFunction::MakeTime),
+            ("make_timestamp(2024, 1, 1, 12, 34, 56.123456)", TemporalFunction::MakeTimestamp),
+        ] {
+            let translated = parse_expr(expression).translate(&schema, &options).expect(expression);
+            let sqlparser::ast::Expr::Function(call) = translated else {
+                panic!("expected a runtime function for {expression}");
+            };
+            assert_eq!(call.name.to_string(), functions.name(function));
+        }
+    }
+
+    #[test]
+    fn extract_scale_follows_operand_and_field() {
+        let schema = empty_schema();
+        let options = Pg2SqliteOptions::default()
+            .with_temporal_functions(pg2sqlite_runtime::TemporalFunctions::new("replica_"));
+        let context = crate::options::TranslationContext::from_owned(options);
+        for (expression, expected) in [
+            ("extract(second from time '12:34:56.123456')", Some(6)),
+            ("extract(milliseconds from time '12:34:56.123456')", Some(3)),
+            ("extract(hour from time '12:34:56.123456')", Some(0)),
+            ("replica_extract_time('second', '12:34:56.123456')", Some(6)),
+            ("date_part('second', time '12:34:56.123456')", None),
+        ] {
+            assert_eq!(
+                crate::impls::shared_helpers::scale_of(&parse_expr(expression), &schema, &context),
+                expected,
+                "{expression}",
+            );
+        }
+    }
 
     #[test]
     fn helper_functions_cover_none_args_passthrough_and_separator_builder() {

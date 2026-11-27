@@ -10,7 +10,7 @@
 //! every case runs the crate's own emitted SQL, because what this guards is a
 //! date, not a keyword.
 
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+use pg2sqlite::prelude::Pg2Sqlite;
 use run_translated_helper::run_translated_with;
 
 use crate::helpers::run_translated as run_translated_helper;
@@ -18,7 +18,7 @@ use crate::helpers::run_translated as run_translated_helper;
 /// The instant `expression` evaluates to, through the emitted SQLite.
 fn shift(expression: &str) -> String {
     let script = format!("SELECT {expression};");
-    run_translated_with(&script, &Pg2SqliteOptions::default())
+    run_translated_with(&script, &crate::helpers::function_options())
         .remove(0)
         .unwrap_or_else(|| panic!("{expression} evaluated to NULL"))
 }
@@ -27,9 +27,19 @@ fn refusal(expression: &str) -> String {
     Pg2Sqlite::default()
         .sql(&format!("SELECT {expression};"))
         .unwrap()
-        .translate_to_sql(&Pg2SqliteOptions::default())
+        .translate_to_sql(&crate::helpers::function_options())
         .expect_err("this shape has no SQLite form")
         .to_string()
+}
+
+fn execution_error(script: &str) -> String {
+    crate::helpers::run_translated::try_run_translated_bound_with(
+        script,
+        &crate::helpers::function_options(),
+        &[],
+    )
+    .expect_err("temporal range error")
+    .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -215,11 +225,8 @@ fn a_range_postgresql_lacks_is_refused() {
     assert!(error.contains("qualifier PostgreSQL does not accept"), "{error}");
 }
 
-/// SQLite's date functions answer NULL outside the years 1 to 9999, where
-/// PostgreSQL answers a value, so arithmetic whose operands are all literals
-/// and whose result leaves that range is refused rather than emitted.
 #[test]
-fn literal_arithmetic_leaving_the_four_digit_years_is_refused() {
+fn literal_arithmetic_leaving_the_four_digit_years_raises() {
     for expression in [
         "timestamp '9999-12-31' + interval '1 day'",
         "timestamp '9000-01-01' + interval '2000 years'",
@@ -229,7 +236,7 @@ fn literal_arithmetic_leaving_the_four_digit_years_is_refused() {
         "date '9999-12-31' + 1",
         "date '0001-01-01' - 1",
     ] {
-        let error = refusal(expression);
+        let error = execution_error(&format!("SELECT {expression};"));
         assert!(error.contains("years 1 to 9999"), "{expression}: {error}");
     }
 }
@@ -241,20 +248,16 @@ fn literal_arithmetic_inside_the_four_digit_years_is_kept() {
     assert_eq!(shift("date '9999-12-30' + 1"), "9999-12-31");
 }
 
-/// Each step is emitted on its own, so a literal step that leaves the range is
-/// refused even when a later step would bring PostgreSQL's answer back inside.
 #[test]
-fn a_literal_step_leaving_the_range_is_refused_before_a_later_step() {
-    let error = refusal("timestamp '9999-06-01' + interval '12 months' - interval '1 year'");
+fn a_literal_step_leaving_the_range_raises_before_a_later_step() {
+    let error = execution_error(
+        "SELECT timestamp '9999-06-01' + interval '12 months' - interval '1 year';",
+    );
     assert!(error.contains("years 1 to 9999"), "{error}");
 }
 
-/// Below the year 1 SQLite answers its own astronomical year (`0000` for
-/// 1 BC, `-0699` for 700 BC), which never matches PostgreSQL's `… BC` text and
-/// sorts backwards, so a column shifted before the year 1 answers NULL, as
-/// one shifted past 9999 does.
 #[test]
-fn column_arithmetic_landing_before_the_year_one_answers_null() {
+fn column_arithmetic_landing_before_the_year_one_raises() {
     for probe in [
         "SELECT ts - interval '1 year' FROM t",
         "SELECT ts - interval '700 years' FROM t",
@@ -262,15 +265,12 @@ fn column_arithmetic_landing_before_the_year_one_answers_null() {
         "SELECT d - 365 FROM t",
         "SELECT d - 1000 FROM t",
     ] {
-        let rows = run_translated_with(
-            &format!(
-                "CREATE TABLE t (ts timestamp, d date);
-                 INSERT INTO t (ts, d) VALUES ('0001-06-01', '0001-06-01');
-                 {probe};"
-            ),
-            &Pg2SqliteOptions::default(),
-        );
-        assert_eq!(rows, vec![None], "{probe}");
+        let error = execution_error(&format!(
+            "CREATE TABLE t (ts timestamp, d date);
+             INSERT INTO t (ts, d) VALUES ('0001-06-01', '0001-06-01');
+             {probe};"
+        ));
+        assert!(error.contains("22008"), "{probe} {error}");
     }
 }
 
@@ -280,7 +280,7 @@ fn column_arithmetic_inside_the_year_one_is_kept() {
         "CREATE TABLE t (ts timestamp, d date);
          INSERT INTO t (ts, d) VALUES ('0002-06-01 10:00:00', '0002-06-01');
          SELECT ts - interval '1 year' FROM t UNION ALL SELECT d - 516 FROM t;",
-        &Pg2SqliteOptions::default(),
+        &crate::helpers::function_options(),
     );
     assert_eq!(rows, vec![Some("0001-06-01 10:00:00".to_string()), Some("0001-01-01".to_string())]);
 }
@@ -323,9 +323,12 @@ fn the_time_of_day_is_emitted_in_one_unit() {
     let emitted = Pg2Sqlite::default()
         .sql("SELECT timestamp '2026-01-31' + interval '1 hour 30 minutes';")
         .unwrap()
-        .translate_to_sql(&Pg2SqliteOptions::default())
+        .translate_to_sql(&crate::helpers::function_options())
         .unwrap()
         .into_vec()
         .join("\n");
-    assert!(emitted.contains("'+90 minutes'"), "one exact modifier, got: {emitted}");
+    assert!(
+        emitted.contains("pg2sqlite_timestamp_pl_interval(") && emitted.contains("'01:30:00'"),
+        "{emitted}"
+    );
 }

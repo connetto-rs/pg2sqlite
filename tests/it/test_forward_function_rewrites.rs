@@ -8,7 +8,7 @@ use pg2sqlite::prelude::Pg2SqliteOptions;
 use crate::helpers;
 
 fn default_opts() -> Pg2SqliteOptions {
-    crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default())
+    helpers::function_options()
 }
 
 #[test]
@@ -16,8 +16,10 @@ fn localtimestamp_reads_sqlites_utc_clock() {
     let sql = helpers::deployment::utc_script("SELECT localtimestamp");
     let result = translate_sql(&sql, &helpers::deployment::utc_request()).unwrap();
     assert!(
-        result.to_lowercase().contains("datetime('now')"),
-        "localtimestamp in UTC should become datetime('now'): {result}"
+        result.contains(
+            "pg2sqlite_timestamptz_timestamp(strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'), 'UTC')"
+        ),
+        "unexpected local timestamp conversion {result}"
     );
     sqlite_accepts(&result);
 }
@@ -27,8 +29,10 @@ fn localtime_reads_sqlites_utc_clock() {
     let sql = helpers::deployment::utc_script("SELECT localtime");
     let result = translate_sql(&sql, &helpers::deployment::utc_request()).unwrap();
     assert!(
-        result.to_lowercase().contains("time('now')"),
-        "localtime in UTC should become time('now'): {result}"
+        result.contains(
+            "pg2sqlite_timestamptz_time(strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'), 'UTC')"
+        ),
+        "unexpected local time conversion {result}"
     );
     sqlite_accepts(&result);
 }
@@ -179,29 +183,32 @@ fn trunc_single_arg_to_cast_integer() {
 }
 
 #[test]
-fn make_date_to_printf() {
+fn make_date_dispatches_to_runtime() {
     let sql = "SELECT make_date(2024, 1, 15)";
     let result = translate_sql(sql, &default_opts()).unwrap();
     let lower = result.to_lowercase();
-    assert!(lower.contains("printf("), "make_date should become printf: {result}");
+    assert!(lower.contains("pg2sqlite_make_date("), "unexpected date constructor {result}");
     sqlite_accepts(&result);
 }
 
 #[test]
-fn make_time_to_printf() {
+fn make_time_dispatches_to_runtime() {
     let sql = "SELECT make_time(12, 30, 45)";
     let result = translate_sql(sql, &default_opts()).unwrap();
     let lower = result.to_lowercase();
-    assert!(lower.contains("printf("), "make_time should become printf: {result}");
+    assert!(lower.contains("pg2sqlite_make_time("), "unexpected time constructor {result}");
     sqlite_accepts(&result);
 }
 
 #[test]
-fn make_timestamp_to_printf() {
+fn make_timestamp_dispatches_to_runtime() {
     let sql = "SELECT make_timestamp(2024, 1, 15, 12, 30, 45)";
     let result = translate_sql(sql, &default_opts()).unwrap();
     let lower = result.to_lowercase();
-    assert!(lower.contains("printf("), "make_timestamp should become printf: {result}");
+    assert!(
+        lower.contains("pg2sqlite_make_timestamp("),
+        "unexpected timestamp constructor {result}"
+    );
     sqlite_accepts(&result);
 }
 

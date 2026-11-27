@@ -63,8 +63,53 @@ pub(crate) fn type_name<'e>(
         Expr::Extract { .. } => Some(Cow::Borrowed("numeric")),
         Expr::Function(call) => call_type_name(call, schema, options)?.map(Cow::Owned),
         Expr::BinaryOp { left, op, right } => {
+            use crate::impls::temporal_arithmetic::{TemporalKind, temporal_kind_of};
+            if matches!(
+                op,
+                BinaryOperator::Plus
+                    | BinaryOperator::Minus
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+            ) && is_interval_typed(expr, schema, options)
+            {
+                return Ok(Some(Cow::Borrowed("interval")));
+            }
+            if let Some(kind) = temporal_kind_of(expr, schema, options) {
+                return Ok(Some(Cow::Borrowed(match kind {
+                    TemporalKind::Date => "date",
+                    TemporalKind::Timestamp => "timestamp",
+                    TemporalKind::TimestampTz => "timestamptz",
+                    TemporalKind::Time { zoned: false } => "time",
+                    TemporalKind::Time { zoned: true } => "timetz",
+                })));
+            }
+            if matches!(op, BinaryOperator::Minus)
+                && temporal_kind_of(left, schema, options) == Some(TemporalKind::Date)
+                && temporal_kind_of(right, schema, options) == Some(TemporalKind::Date)
+            {
+                return Ok(Some(Cow::Borrowed("int4")));
+            }
             if let Some(document) = json_operator_type(left, op, schema, options)? {
                 return Ok(Some(Cow::Borrowed(document)));
+            }
+            if matches!(
+                op,
+                BinaryOperator::Plus
+                    | BinaryOperator::Minus
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+                    | BinaryOperator::Modulo
+            ) {
+                let left_type = type_name(left, schema, options)?;
+                let right_type = type_name(right, schema, options)?;
+                if let (Some(left_type), Some(right_type)) = (left_type, right_type)
+                    && numeric_type_name(&left_type)
+                    && numeric_type_name(&right_type)
+                {
+                    return Ok(schema
+                        .common_type_name(&[Some(left_type.as_ref()), Some(right_type.as_ref())])
+                        .map(|name| Cow::Owned(name.into_owned())));
+                }
             }
             crate::impls::translator_impls::blob_operator::result_type(
                 left, op, right, schema, options,
@@ -94,6 +139,27 @@ pub(crate) fn type_name<'e>(
             .map(Cow::Owned)
         }
     })
+}
+
+fn numeric_type_name(name: &str) -> bool {
+    let family = name.split('(').next().unwrap_or(name).trim();
+    [
+        "smallint",
+        "int2",
+        "int",
+        "integer",
+        "int4",
+        "bigint",
+        "int8",
+        "real",
+        "float4",
+        "double precision",
+        "float8",
+        "numeric",
+        "decimal",
+    ]
+    .iter()
+    .any(|numeric| family.eq_ignore_ascii_case(numeric))
 }
 
 /// The type a JSON path operator answers over a `json` or `jsonb` left
@@ -177,8 +243,34 @@ pub(crate) fn is_interval_typed(
         Expr::UnaryOp { op: UnaryOperator::Minus, expr: inner } => {
             is_interval_typed(inner, schema, options)
         }
-        Expr::BinaryOp { op: BinaryOperator::Plus | BinaryOperator::Minus, left, right } => {
-            is_interval_typed(left, schema, options) && is_interval_typed(right, schema, options)
+        Expr::BinaryOp {
+            op: operator @ (BinaryOperator::Plus | BinaryOperator::Minus),
+            left,
+            right,
+        } => {
+            if is_interval_typed(left, schema, options) && is_interval_typed(right, schema, options)
+            {
+                return true;
+            }
+            if !matches!(operator, BinaryOperator::Minus) {
+                return false;
+            }
+            use crate::impls::temporal_arithmetic::{TemporalKind, temporal_kind_of};
+            match (
+                temporal_kind_of(left, schema, options),
+                temporal_kind_of(right, schema, options),
+            ) {
+                (Some(TemporalKind::Date), Some(TemporalKind::Date)) => false,
+                (
+                    Some(TemporalKind::Time { zoned: false }),
+                    Some(TemporalKind::Time { zoned: false }),
+                )
+                | (
+                    Some(TemporalKind::Date | TemporalKind::Timestamp | TemporalKind::TimestampTz),
+                    Some(TemporalKind::Date | TemporalKind::Timestamp | TemporalKind::TimestampTz),
+                ) => true,
+                _ => false,
+            }
         }
         Expr::BinaryOp { op: BinaryOperator::Multiply, left, right } => {
             is_interval_typed(left, schema, options) != is_interval_typed(right, schema, options)
@@ -296,6 +388,34 @@ fn call_type_name(
         }
     };
     let argument_types: Vec<Option<&str>> = argument_types.iter().map(Option::as_deref).collect();
+    if let Some(name) = last_ident(&call.name) {
+        let result = match name.value.to_ascii_lowercase().as_str() {
+            "date_trunc" => {
+                match argument_types.get(1).copied().flatten() {
+                    Some(kind)
+                        if kind.eq_ignore_ascii_case("time")
+                            || kind.eq_ignore_ascii_case("interval") =>
+                    {
+                        Some("interval")
+                    }
+                    Some(kind)
+                        if kind.eq_ignore_ascii_case("date")
+                            || kind.eq_ignore_ascii_case("timestamptz") =>
+                    {
+                        Some("timestamptz")
+                    }
+                    Some(kind) if kind.eq_ignore_ascii_case("timestamp") => Some("timestamp"),
+                    _ => None,
+                }
+            }
+            "justify_hours" | "justify_days" | "justify_interval" => Some("interval"),
+            "date_part" => Some("float8"),
+            _ => None,
+        };
+        if let Some(result) = result {
+            return Ok(Some(String::from(result)));
+        }
+    }
     if let Some(result) =
         schema.call_result_type_name(call, &argument_types, IdentifierCase::AsWritten)?
     {
@@ -355,6 +475,12 @@ mod interval_typing {
             "interval hour to minute '2:30'",
             "CASE WHEN id = 1 THEN sp ELSE iv END",
             "greatest(sp, iv)",
+            "timestamp '2024-01-02' - timestamp '2024-01-01'",
+            "timestamptz '2024-01-02+00' - timestamp '2024-01-01'",
+            "date '2024-01-02' - timestamp '2024-01-01'",
+            "timestamp '2024-01-02' - date '2024-01-01'",
+            "time '12:00' - time '11:00'",
+            "(timestamp '2024-01-02' - timestamp '2024-01-01') + iv",
         ] {
             assert!(interval_typed(expr), "{expr} should be interval-typed");
         }
@@ -369,6 +495,9 @@ mod interval_typing {
             "coalesce(id, 1)",
             "greatest(id, 1)",
             "CASE WHEN id = 1 THEN id ELSE 2 END",
+            "date '2024-01-02' - date '2024-01-01'",
+            "timetz '12:00+00' - timetz '11:00+00'",
+            "date '2024-01-02' + interval '1 day'",
         ] {
             assert!(!interval_typed(expr), "{expr} should not be interval-typed");
         }
@@ -416,6 +545,18 @@ mod common_typing {
                     .map(Cow::into_owned)
             },
         )
+    }
+
+    #[test]
+    fn integer_aliases_remain_numeric_through_arithmetic() {
+        for expression in ["id + 1", "1 + id", "(id + 1) * 2", "2 * (id + 1)"] {
+            let inferred = domain_scoped_type_name(expression)
+                .unwrap_or_else(|| panic!("{expression} has no inferred type"));
+            assert!(super::numeric_type_name(&inferred), "{expression}: {inferred}");
+        }
+        for name in ["int", "INT", "integer", "INTEGER", "int4", "INT4"] {
+            assert!(super::numeric_type_name(name), "{name}");
+        }
     }
 
     #[test]

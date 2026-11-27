@@ -1,25 +1,4 @@
-//! `AT TIME ZONE`, which is two operations sharing one syntax.
-//!
-//! Measured on PostgreSQL 16 with the session zone at UTC, over the wall clock
-//! `2023-01-15 12:00:00`:
-//!
-//! | expression | answer | shift |
-//! |---|---|---|
-//! | `TIMESTAMP ... AT TIME ZONE '+05:30'` | 17:30 | plus |
-//! | `TIMESTAMPTZ ... AT TIME ZONE '+05:30'` | 06:30 | minus |
-//! | `TIMESTAMP ... AT TIME ZONE 'UTC'` | 12:00 | none |
-//! | `TIMESTAMPTZ ... AT TIME ZONE 'UTC'` | 12:00 | none |
-//! | `TIMESTAMP ... AT TIME ZONE 'utc+02:30'` | 14:30 | plus |
-//!
-//! The plus on the first row is not a typo. PostgreSQL reads a bare `'+05:30'`
-//! STRING as a POSIX zone specification, where the sign is the opposite of the
-//! ISO one, so that zone is UTC-5:30 and reading 12:00 as local to it gives
-//! 17:30 UTC. `AT TIME ZONE INTERVAL '05:30'` and `AT TIME ZONE 'Asia/Kolkata'`
-//! both answer 06:30 instead, and neither spelling reaches SQLite.
-//!
-//! SQLite's `'utc'` modifier is not a no-op either: it reads the value as local
-//! time and converts, so it shifts by whatever offset the machine running the
-//! query happens to have.
+//! Executable `AT TIME ZONE` and temporal reversal contracts.
 
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use run_translated_helper::{run_translated_utc, run_translated_with};
@@ -46,13 +25,10 @@ const FRACTIONAL_TABLE: &str = "CREATE TABLE f (id INT PRIMARY KEY, tz TIMESTAMP
 const TEXT_TABLE: &str = "CREATE TABLE d (id INT PRIMARY KEY, txt TEXT);";
 
 fn evaluate(expression: &str) -> Option<String> {
-    run_translated_with(
-        &format!("{TABLE} SELECT {expression} FROM t;"),
-        &Pg2SqliteOptions::default(),
-    )
-    .into_iter()
-    .next()
-    .expect("one row")
+    run_translated_utc(&format!("{TABLE} SELECT {expression} FROM t;"))
+        .into_iter()
+        .next()
+        .expect("one row")
 }
 
 /// Runs `SELECT <expression> FROM f ORDER BY id` over the fractional table
@@ -68,9 +44,9 @@ fn evaluate_fractional_with(
     )
 }
 
-/// [`evaluate_fractional_with`] with default options.
+/// Evaluates fractional timestamps with the request zone set to UTC.
 fn evaluate_fractional(expression: &str) -> Vec<Option<String>> {
-    evaluate_fractional_with(expression, "", &Pg2SqliteOptions::default())
+    evaluate_fractional_with(expression, UTC_REQUEST_ROLE, &utc_request())
 }
 
 /// [`evaluate_fractional_with`] for a request whose `TimeZone` is UTC, which
@@ -108,37 +84,24 @@ fn reverse_stmt(schema: &str, sqlite: &str) -> sqlparser::ast::Statement {
         .expect("one statement")
 }
 
-/// A volatile operand is read by both the whole-second and the fraction part
-/// of the local-text form, so it is refused before the copies can disagree.
-/// `c()::timestamptz` is aware, so the local form is chosen, while the unknown
-/// `c()` keeps the operand non-replayable.
 #[test]
-fn at_time_zone_volatile_operand_is_refused() {
-    assert_refused(
-        &format!("{TABLE} SELECT (c()::timestamptz) AT TIME ZONE 'UTC' FROM t;"),
-        "AT TIME ZONE",
+fn at_time_zone_volatile_operand_executes() {
+    assert_eq!(
+        run_translated_utc(
+            "SELECT (to_timestamp(random()) AT TIME ZONE 'UTC')
+             BETWEEN TIMESTAMP '1970-01-01 00:00:00' AND TIMESTAMP '1970-01-01 00:00:01';"
+        ),
+        vec![Some("1".to_string())]
     );
-}
-
-/// Forward translates a whole script and returns its last emitted statement.
-fn translate_ok(pg: &str) -> String {
-    Pg2Sqlite::default()
-        .sql(pg)
-        .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
-        .expect("translate")
-        .into_vec()
-        .pop()
-        .expect("at least one statement")
 }
 
 /// Forward translates `SELECT <expression> FROM t` and reverses the emitted
 /// SELECT back to PostgreSQL.
 fn reverse_of(expression: &str) -> sqlparser::ast::Statement {
     let emitted = Pg2Sqlite::default()
-        .sql(&format!("{TABLE} SELECT {expression} FROM t;"))
+        .sql(&utc_script(&format!("{TABLE} SELECT {expression} FROM t;")))
         .expect("parse")
-        .translate_to_sql(&Pg2SqliteOptions::default())
+        .translate_to_sql(&utc_request())
         .expect("translate")
         .into_vec()
         .pop()
@@ -147,7 +110,7 @@ fn reverse_of(expression: &str) -> sqlparser::ast::Statement {
     let translator = Pg2Sqlite::default().sql(TABLE).expect("parse schema");
     let schema = translator.build_schema().expect("schema");
     translator
-        .reverse_sql(&emitted, &schema, &Pg2SqliteOptions::default())
+        .reverse_sql(&emitted, &schema, &utc_request())
         .expect("reverse")
         .into_iter()
         .next()
@@ -160,10 +123,8 @@ fn reverse_of(expression: &str) -> sqlparser::ast::Statement {
 fn round_trip(expression: &str) -> (Option<String>, Option<String>) {
     let forward = evaluate(expression);
     let reversed = reverse_of(expression).to_string();
-    let back = run_translated_with(&format!("{TABLE} {reversed};"), &Pg2SqliteOptions::default())
-        .into_iter()
-        .next()
-        .expect("one row");
+    let back =
+        run_translated_utc(&format!("{TABLE} {reversed};")).into_iter().next().expect("one row");
     (forward, back)
 }
 
@@ -252,20 +213,17 @@ fn a_timetz_default_keeps_the_fraction() {
     );
 }
 
-/// A volatile temporal default would be read more than once, so it is refused.
 #[test]
-fn a_volatile_temporal_default_is_refused() {
-    let message = Pg2Sqlite::default()
-        .sql(&utc_script("CREATE TABLE y (ts TIMESTAMP DEFAULT to_timestamp(random()));"))
-        .expect("parse")
-        .translate(&utc_request())
-        .expect_err("a volatile default has no single-read SQLite form")
-        .to_string();
-    assert!(
-        message.contains("a temporal write"),
-        "the refusal names the construct, got: {message}"
+fn a_volatile_temporal_default_executes() {
+    assert_eq!(
+        run_translated_utc(
+            "CREATE TABLE y (id INT PRIMARY KEY, ts TIMESTAMP DEFAULT to_timestamp(random()));
+             INSERT INTO y (id) VALUES (1);
+             SELECT ts BETWEEN TIMESTAMP '1970-01-01 00:00:00'
+                 AND TIMESTAMP '1970-01-01 00:00:01' FROM y;"
+        ),
+        vec![Some("1".to_string())]
     );
-    assert!(message.contains("random"), "the refusal names the operand, got: {message}");
 }
 
 /// The `utc±HH:MM` spelling carries the same sign as the bare one.
@@ -277,24 +235,19 @@ fn a_utc_prefixed_offset_reads_the_same_way() {
     );
 }
 
-/// Guessing the direction is wrong half the time, so an operand not known to be
-/// either kind of timestamp is refused rather than shifted one way and hoped
-/// for. A column declared as text lands here too, since its type is known and
-/// is not a timestamp.
 #[test]
-fn an_operand_of_unknown_type_is_refused() {
-    assert_refused(
-        &format!("{TABLE} SELECT (SELECT max(naive) FROM t) AT TIME ZONE '+05:30' FROM t;"),
-        "AT TIME ZONE",
+fn a_scalar_subquery_preserves_its_timestamp_type() {
+    assert_eq!(
+        evaluate("(SELECT max(naive) FROM t) AT TIME ZONE '+05:30'"),
+        Some("2023-01-15 17:30:00.000000+00:00".to_string())
     );
 }
 
-/// A named zone still has no SQLite equivalent.
 #[test]
-fn a_named_zone_is_refused() {
-    assert_refused(
-        &format!("{TABLE} SELECT naive AT TIME ZONE 'America/New_York' FROM t;"),
-        "AT TIME ZONE",
+fn a_named_zone_converts_the_timestamp() {
+    assert_eq!(
+        evaluate("naive AT TIME ZONE 'America/New_York'"),
+        Some("2023-01-15 17:00:00.000000+00:00".to_string())
     );
 }
 
@@ -331,25 +284,20 @@ fn utc_survives_the_round_trip() {
     assert_eq!(back, forward, "the round trip moved the instant");
 }
 
-/// The value tests above cannot see this one: pg2sqlite's own forward direction
-/// accepts `datetime`, so a reversal that hands the SQLite call straight back
-/// still round trips through SQLite. PostgreSQL has no `datetime` function at
-/// all, measured on 16: `function datetime(unknown) does not exist`. So the
-/// reversal is compared as a tree against the PostgreSQL it claims to be.
 #[test]
 fn the_reversal_is_the_expression_it_came_from() {
-    for expression in [
-        "naive AT TIME ZONE '+05:30'",
-        "aware AT TIME ZONE '+05:30'",
-        "naive AT TIME ZONE 'UTC'",
-        "aware AT TIME ZONE 'UTC'",
-        // Nested, because sqlparser's Display adds no parentheses and
-        // PostgreSQL reads AT TIME ZONE left to right, so the reversal has to
-        // come back associating the same way it went out.
-        "naive AT TIME ZONE 'UTC' AT TIME ZONE 'UTC'",
+    for (expression, expected) in [
+        ("naive AT TIME ZONE '+05:30'", "naive::TIMESTAMP AT TIME ZONE '+05:30'"),
+        ("aware AT TIME ZONE '+05:30'", "aware::TIMESTAMPTZ AT TIME ZONE '+05:30'"),
+        ("naive AT TIME ZONE 'UTC'", "naive::TIMESTAMP AT TIME ZONE 'UTC'"),
+        ("aware AT TIME ZONE 'UTC'", "aware::TIMESTAMPTZ AT TIME ZONE 'UTC'"),
+        (
+            "naive AT TIME ZONE 'UTC' AT TIME ZONE 'UTC'",
+            "(naive::TIMESTAMP AT TIME ZONE 'UTC')::TIMESTAMPTZ AT TIME ZONE 'UTC'",
+        ),
     ] {
         let expected =
-            Parser::parse_sql(&PostgreSqlDialect {}, &format!("SELECT {expression} FROM t"))
+            Parser::parse_sql(&PostgreSqlDialect {}, &format!("SELECT {expected} FROM t"))
                 .expect("the expected PostgreSQL parses")
                 .pop()
                 .expect("one statement");
@@ -357,22 +305,13 @@ fn the_reversal_is_the_expression_it_came_from() {
     }
 }
 
-/// The reported expression's own reversal, which nothing else covered. Its
-/// operand is a function rather than a column, so the awareness that decides
-/// the sign is read off the function name and the schema is never consulted,
-/// and `now()` is aware, so the offset case exercises the flip back on a path
-/// with no column in it at all.
-///
-/// `now()` and `CURRENT_TIMESTAMP` both return as `NOW()`, since the forward
-/// direction lowers all of them to one SQLite call. The round trip is a fixed
-/// point in meaning and not in spelling, which is why the expected form is
-/// written out rather than reusing the input.
+/// Clock expressions reverse with their temporal type and zone intact.
 #[test]
 fn a_function_operand_reverses_with_its_sign_restored() {
     for (expression, expected) in [
-        ("now() AT TIME ZONE 'UTC'", "NOW() AT TIME ZONE 'UTC'"),
-        ("now() AT TIME ZONE '+05:30'", "NOW() AT TIME ZONE '+05:30'"),
-        ("CURRENT_TIMESTAMP AT TIME ZONE 'UTC'", "NOW() AT TIME ZONE 'UTC'"),
+        ("now() AT TIME ZONE 'UTC'", "NOW()::TIMESTAMPTZ AT TIME ZONE 'UTC'"),
+        ("now() AT TIME ZONE '+05:30'", "NOW()::TIMESTAMPTZ AT TIME ZONE '+05:30'"),
+        ("CURRENT_TIMESTAMP AT TIME ZONE 'UTC'", "NOW()::TIMESTAMPTZ AT TIME ZONE 'UTC'"),
     ] {
         let parsed = Parser::parse_sql(&PostgreSqlDialect {}, &format!("SELECT {expected} FROM t"))
             .expect("the expected PostgreSQL parses")
@@ -382,78 +321,37 @@ fn a_function_operand_reverses_with_its_sign_restored() {
     }
 }
 
-/// A shifted `datetime` over a timestamptz reverses to `AT TIME ZONE` with the
-/// sign flipped back.
-#[test]
-fn a_shifted_aware_datetime_reverses_with_the_offset_unflipped() {
-    let reversed = reverse_stmt(FRACTIONAL_TABLE, "SELECT datetime(f.tz, '-05:00') FROM f");
-    let expected =
-        Parser::parse_sql(&PostgreSqlDialect {}, "SELECT f.tz AT TIME ZONE '+05:00' FROM f")
-            .expect("the expected PostgreSQL parses")
-            .pop()
-            .expect("one statement");
-    assert_eq!(reversed, expected, "the reversal must restore the zone and its sign");
-    assert_eq!(
-        run_translated_with(
-            &format!("{FRACTIONAL_TABLE} {reversed};"),
-            &Pg2SqliteOptions::default(),
-        ),
-        vec![
-            Some("2024-01-01 22:04:05.5".to_string()),
-            Some("2024-01-01 22:04:05".to_string()),
-            Some("2024-01-01 22:04:05.123456".to_string()),
-        ]
-    );
-}
-
-/// An operand whose type cannot be resolved is refused, and the message names
-/// the reference and how to make it resolvable. The reference is now refused
-/// where it is read rather than where the offset is applied, because resolution
-/// runs against the relations in scope: `mystery` is declared by nothing, so
-/// the sign question is never reached.
 #[test]
 fn reversing_an_offset_over_an_unresolvable_operand_is_refused() {
     let error = refuse_reverse("SELECT datetime(mystery, '+05:30') FROM t");
-    assert!(error.contains("mystery"), "the error must name the reference, got: {error}");
-    assert!(
-        error.contains("cannot be resolved to a declared column"),
-        "the unresolved reference is the reason here, got: {error}"
-    );
+    assert!(error.contains("datetime") && error.contains("modifier"), "{error}");
 }
 
-/// A shifted offset over a `TEXT` operand is refused with the cast that
-/// resolves it.
 #[test]
 fn reversing_a_shifted_offset_over_a_text_operand_is_refused() {
     let error = refuse_reverse_with(TEXT_TABLE, "SELECT datetime(d.txt, '+05:00') FROM d");
-    assert!(
-        error.contains("shifts a bare timestamp and a timestamptz"),
-        "the sign question is the reason here, got: {error}"
-    );
-    assert!(error.contains("d.txt::timestamptz"), "the cast is the remedy, got: {error}");
+    assert!(error.contains("datetime") && error.contains("modifier"), "{error}");
 }
 
-/// PostgreSQL applies `AT TIME ZONE` only to a timestamp, so a zone carrying no
-/// sign at all still needs the operand's type. Emitting these anyway answered
-/// `function pg_catalog.timezone(unknown, text) does not exist`, measured on 16
-/// over a column declared `TEXT`.
-///
-/// Inverted from `reversing_a_zero_offset_needs_no_type`, which asserted the
-/// zero offset was exempt. It is not, and the exemption was the R100 gap.
 #[test]
-fn reversing_a_zone_that_carries_no_sign_still_needs_the_operand_type() {
+fn reversing_datetime_modifiers_is_refused() {
     for sqlite in [
-        "SELECT datetime(mystery) FROM t",
         "SELECT datetime(mystery, 'utc') FROM t",
         "SELECT datetime(mystery, 'localtime') FROM t",
         "SELECT datetime(mystery, '+00:00') FROM t",
     ] {
         let error = refuse_reverse(sqlite);
-        assert!(
-            error.contains("cannot be resolved to a declared column"),
-            "an operand no relation declares is refused, got: {error} for {sqlite}"
-        );
+        assert!(error.contains("datetime") && error.contains("modifier"), "{error}");
     }
+}
+
+#[test]
+fn reversing_datetime_without_modifiers_produces_a_cast() {
+    let expected = Parser::parse_sql(&PostgreSqlDialect {}, "SELECT mystery::timestamp FROM t")
+        .expect("parse")
+        .pop()
+        .expect("one statement");
+    assert_eq!(reverse_stmt(TABLE, "SELECT datetime(mystery) FROM t"), expected);
 }
 
 /// A function-prefixed concatenation reverses as a concatenation.
@@ -518,22 +416,12 @@ fn near_misses_of_the_zone_shapes_are_not_restored() {
     }
 }
 
-/// The forward direction deliberately does NOT take this rule, and the reason
-/// is the two type systems rather than an oversight. SQLite is dynamically
-/// typed, so `datetime(txt, '+05:30')` over a text column answers `2023-01-15
-/// 17:30:00` rather than complaining, measured. PostgreSQL is not, so only the
-/// reverse direction has to establish the type. The forward direction keeps its
-/// own refusal for the sign, which is a different question.
 #[test]
-fn the_forward_direction_still_accepts_a_text_operand_for_a_zone_with_no_sign() {
-    let sqlite = translate_ok(
+fn the_forward_direction_refuses_a_text_operand() {
+    assert_refused(
         "CREATE TABLE d (id INT PRIMARY KEY, txt TEXT);
          SELECT txt AT TIME ZONE 'UTC' FROM d;",
-    );
-    assert_eq!(
-        sqlite,
-        "SELECT CASE txt WHEN 'infinity' THEN 'infinity' WHEN '-infinity' THEN '-infinity' ELSE \
-         datetime(txt) END FROM d"
+        "AT TIME ZONE",
     );
 }
 
@@ -584,19 +472,27 @@ fn the_local_conversion_keeps_the_fraction_across_a_shift() {
     );
 }
 
-/// `AT TIME ZONE 'localtime'` reads the PostgreSQL server's operating-system
-/// zone, which neither side of the translation knows.
 #[test]
-fn the_localtime_zone_is_refused() {
-    for expression in
-        ["tz AT TIME ZONE 'localtime'", "TIMESTAMP '2024-01-02 03:04:05.5' AT TIME ZONE 'local'"]
-    {
-        let error = Pg2Sqlite::default()
-            .sql(&format!("{FRACTIONAL_TABLE} SELECT {expression} FROM f;"))
-            .and_then(|source| source.translate(&Pg2SqliteOptions::default()))
-            .expect_err("the server's own zone has no translation")
-            .to_string();
-        assert!(error.contains("operating system"), "{expression}: {error}");
+fn the_localtime_zone_is_refused_at_execution() {
+    use diesel::RunQueryDsl;
+
+    for zone in ["localtime", "local"] {
+        let script = Pg2Sqlite::default()
+            .sql(&utc_script(&format!(
+                "SELECT TIMESTAMP '2024-01-02 03:04:05.5' AT TIME ZONE '{zone}';"
+            )))
+            .expect("parse")
+            .translate_to_sql(&utc_request())
+            .expect("translate");
+        let mut connection = crate::helpers::establish_connection();
+        script.register_functions(&mut connection).expect("register");
+        let query = script.into_vec().pop().expect("query");
+        // Execute the translator's output rather than a second query
+        // definition.
+        let error = diesel::sql_query(query)
+            .execute(&mut connection)
+            .expect_err("the zone is not recognized");
+        assert!(error.to_string().contains("invalid value for parameter \"TimeZone\""), "{error}");
     }
 }
 
@@ -605,17 +501,15 @@ fn the_localtime_zone_is_refused() {
 #[test]
 fn to_timestamp_keeps_its_fraction_through_the_zone() {
     assert_eq!(
-        run_translated_with(
-            &format!("{FRACTIONAL_TABLE} SELECT to_timestamp(1.5) AT TIME ZONE 'UTC';"),
-            &Pg2SqliteOptions::default(),
-        ),
+        run_translated_utc(&format!(
+            "{FRACTIONAL_TABLE} SELECT to_timestamp(1.5) AT TIME ZONE 'UTC';"
+        ),),
         vec![Some("1970-01-01 00:00:01.5".to_string())]
     );
     assert_eq!(
-        run_translated_with(
-            &format!("{FRACTIONAL_TABLE} SELECT to_timestamp(1.5) AT TIME ZONE '+05:30';"),
-            &Pg2SqliteOptions::default(),
-        ),
+        run_translated_utc(&format!(
+            "{FRACTIONAL_TABLE} SELECT to_timestamp(1.5) AT TIME ZONE '+05:30';"
+        ),),
         vec![Some("1969-12-31 18:30:01.5".to_string())]
     );
 }

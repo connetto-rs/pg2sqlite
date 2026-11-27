@@ -8,13 +8,10 @@
 //! 5. plpgsql derived-subquery (Derived table factor) translation
 //! 6. plpgsql GROUP BY expression inside trigger body
 
+use diesel::connection::SimpleConnection;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use rusqlite::Connection;
-use translate_helpers::{
-    translate_default as translate_all, translate_default_first_query as translate_ok,
-};
 
-use crate::helpers::translate as translate_helpers;
+use crate::helpers;
 
 const SCHEMA: &str = "
 CREATE TABLE t (
@@ -25,9 +22,6 @@ CREATE TABLE t (
 );";
 
 /// An expression inside a window-frame `PRECEDING` bound must be translated.
-/// Here `EXTRACT(EPOCH FROM NOW())` is a PG-specific expression; after
-/// translation `NOW()` becomes `strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')`
-/// so the output must not contain the raw PG form.
 #[test]
 fn window_frame_preceding_expr_is_translated() {
     let sql = format!(
@@ -41,8 +35,8 @@ fn window_frame_preceding_expr_is_translated() {
     let out = translate_ok(&sql);
     assert!(!out.contains("now()"), "now() must be translated inside PRECEDING bound: {out}");
     assert!(
-        out.contains("strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"),
-        "Expected strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now') in PRECEDING bound: {out}"
+        out.contains("pg2sqlite_extract_timestamptz('EPOCH',"),
+        "Expected temporal runtime dispatch in PRECEDING bound {out}"
     );
     exec_translated(&sql);
 }
@@ -61,14 +55,13 @@ fn window_frame_following_expr_is_translated() {
     let out = translate_ok(&sql);
     assert!(!out.contains("now()"), "now() must be translated inside FOLLOWING bound: {out}");
     assert!(
-        out.contains("strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"),
-        "Expected strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now') in FOLLOWING bound: {out}"
+        out.contains("pg2sqlite_extract_timestamptz('EPOCH',"),
+        "Expected temporal runtime dispatch in FOLLOWING bound {out}"
     );
     exec_translated(&sql);
 }
 
-/// `date_trunc` inside the `ORDER BY` clause of `string_agg` must be
-/// translated to `strftime`.
+/// `date_trunc` dispatches inside the aggregate's `ORDER BY`.
 #[test]
 fn string_agg_order_by_clause_translates_date_trunc() {
     let sql = format!(
@@ -77,11 +70,7 @@ fn string_agg_order_by_clause_translates_date_trunc() {
     );
     let out = translate_ok(&sql);
     assert!(out.contains("group_concat"), "string_agg should rename to group_concat: {out}");
-    assert!(
-        !out.contains("date_trunc"),
-        "date_trunc inside ORDER BY clause must be translated: {out}"
-    );
-    assert!(out.contains("strftime"), "Expected strftime in the ORDER BY clause: {out}");
+    assert!(out.contains("pg2sqlite_timestamp_trunc('month', ts)"), "{out}");
     exec_translated(&sql);
 }
 
@@ -165,9 +154,7 @@ fn qualify_and_connect_by_clauses_are_refused() {
     }
 }
 
-/// When a plpgsql trigger uses `date_trunc` in an `IF` condition, the
-/// condition injected into the WHERE clause must use `strftime`, not
-/// `date_trunc`.
+/// `date_trunc` dispatches inside a trigger's `IF` condition.
 #[test]
 fn plpgsql_if_condition_date_trunc_is_translated() {
     let sql = "
@@ -187,8 +174,7 @@ AFTER INSERT ON t
 FOR EACH ROW EXECUTE FUNCTION fn_if_cond();
 ";
     let out = translate_all(sql);
-    assert!(!out.contains("date_trunc"), "date_trunc in IF condition must be translated: {out}");
-    assert!(out.contains("strftime"), "Expected strftime in translated IF condition: {out}");
+    assert!(out.contains("pg2sqlite_timestamp_trunc('day',"), "{out}");
     exec_translated(sql);
 }
 
@@ -214,8 +200,7 @@ AFTER INSERT ON t
 FOR EACH ROW EXECUTE FUNCTION fn_elsif_cond();
 ";
     let out = translate_all(sql);
-    assert!(!out.contains("date_trunc"), "date_trunc in ELSIF condition must be translated: {out}");
-    assert!(out.contains("strftime"), "Expected strftime in translated ELSIF condition: {out}");
+    assert!(out.matches("pg2sqlite_timestamp_trunc('month',").count() >= 2, "{out}");
     exec_translated(sql);
 }
 
@@ -241,11 +226,7 @@ AFTER INSERT ON src
 FOR EACH ROW EXECUTE FUNCTION fn_derived();
 ";
     let out = translate_all(sql);
-    assert!(
-        !out.contains("date_trunc"),
-        "date_trunc inside derived subquery must be translated: {out}"
-    );
-    assert!(out.contains("strftime"), "Expected strftime in translated derived subquery: {out}");
+    assert!(out.contains("pg2sqlite_timestamp_trunc('month',"), "{out}");
     exec_translated(sql);
 }
 
@@ -272,21 +253,25 @@ AFTER INSERT ON t
 FOR EACH ROW EXECUTE FUNCTION fn_group_by();
 ";
     let out = translate_all(sql);
-    assert!(!out.contains("date_trunc"), "date_trunc in GROUP BY must be translated: {out}");
-    assert!(out.contains("strftime"), "Expected strftime in translated GROUP BY: {out}");
+    assert!(out.matches("pg2sqlite_timestamp_trunc('month',").count() >= 2, "{out}");
     exec_translated(sql);
 }
 
+fn translate_ok(sql: &str) -> String {
+    helpers::translate::translate_utc_statements_and_first_query(sql).1
+}
+
+fn translate_all(sql: &str) -> String {
+    Pg2Sqlite::default()
+        .sql(&helpers::deployment::utc_script(sql))
+        .unwrap()
+        .translate_to_sql(&helpers::deployment::utc_request())
+        .unwrap()
+        .into_vec()
+        .join(";\n")
+}
+
 fn exec_translated(pg_sql: &str) {
-    let conn = Connection::open_in_memory().unwrap();
-    let stmts = Pg2Sqlite::default()
-        .sql(pg_sql)
-        .unwrap()
-        .translate(&Pg2SqliteOptions::default())
-        .unwrap()
-        .into_vec();
-    for s in &stmts {
-        conn.execute_batch(&format!("{s};"))
-            .unwrap_or_else(|e| panic!("SQLite rejected: {s}\n{e}"));
-    }
+    let mut connection = helpers::establish_connection();
+    connection.batch_execute(&translate_all(pg_sql)).unwrap();
 }

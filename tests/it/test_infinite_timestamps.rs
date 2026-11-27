@@ -204,20 +204,36 @@ fn at_time_zone_keeps_the_infinity() {
 }
 
 #[test]
-fn date_arithmetic_keeps_the_infinity_and_answers_null_where_postgresql_raises() {
-    // PostgreSQL raises `cannot subtract infinite dates` on rows 2 and 3.
+fn date_arithmetic_keeps_infinity_and_refuses_infinite_differences() {
     assert_parity(&["d + 1", "d - 1", "7 + d", "(d + 1) + id"]);
-    assert_eq!(replica("d - date '2024-01-01'"), [Some("59".to_string()), None, None, None]);
-    assert_eq!(replica("date '2024-01-01' - d"), [Some("-59".to_string()), None, None, None]);
+    for expression in ["d - date '2024-01-01'", "date '2024-01-01' - d"] {
+        let error = crate::helpers::run_translated::try_run_translated_bound_with(
+            &utc_script(&format!("{SCHEMA} SELECT {expression} FROM moments ORDER BY id;")),
+            &utc_request(),
+            &[],
+        )
+        .expect_err("infinite dates cannot be subtracted");
+        assert!(error.to_string().contains("cannot subtract infinite dates"), "{error}");
+    }
 }
 
 #[test]
-fn arithmetic_postgresql_raises_over_infinite_literals_is_refused() {
-    assert_refused("SELECT date 'infinity' - date '2024-01-01';", "cannot subtract infinite dates");
-    assert_refused(
-        "SELECT extract(epoch FROM timestamp 'infinity' - timestamp 'infinity');",
-        "interval out of range",
-    );
+fn arithmetic_postgresql_raises_over_infinite_literals_raises() {
+    for (expression, message) in [
+        ("date 'infinity' - date '2024-01-01'", "cannot subtract infinite dates"),
+        (
+            "extract(epoch FROM timestamp 'infinity' - timestamp 'infinity')",
+            "interval out of range",
+        ),
+    ] {
+        let error = crate::helpers::run_translated::try_run_translated_bound_with(
+            &utc_script(&format!("SELECT {expression};")),
+            &utc_request(),
+            &[],
+        )
+        .expect_err("infinite arithmetic raises");
+        assert!(error.to_string().contains(message), "{error}");
+    }
 }
 
 #[test]
@@ -226,21 +242,37 @@ fn a_time_of_day_read_from_an_infinity_is_null() {
 }
 
 #[test]
-fn a_zoned_quarter_of_a_volatile_instant_is_refused() {
-    let error = pg2sqlite::prelude::Pg2Sqlite::default()
+fn a_zoned_quarter_reads_a_volatile_instant_once() {
+    let script = pg2sqlite::prelude::Pg2Sqlite::default()
         .sql(&utc_script("SELECT date_trunc('quarter', clock_timestamp());"))
         .expect("parse")
         .translate_to_sql(&utc_request())
-        .expect_err("the quarter reads the instant twice");
-    assert!(error.to_string().contains("has no SQLite form that reads"), "{error}");
+        .expect("the quarter reads the instant once")
+        .into_vec();
+    let query = script.last().expect("a query");
+    assert_eq!(query.matches("'now'").count(), 1, "{query}");
+    assert!(query.contains("pg2sqlite_timestamptz_trunc_zone"), "{query}");
 }
 
 #[test]
-fn a_text_cast_repeating_an_xor_in_a_check_is_refused() {
-    assert_refused(
-        "CREATE TABLE c (txt text, CHECK ((txt || (1 # 2)::text)::date IS NOT NULL));",
-        "would repeat an operand",
+fn a_text_cast_of_an_xor_in_a_check_reads_the_date() {
+    let schema = "CREATE TABLE c (txt text, CHECK ((txt || (1 # 2)::text)::date IS NOT NULL));";
+    assert_eq!(
+        run_translated_with(
+            &utc_script(&format!(
+                "{schema} INSERT INTO c VALUES ('2024-01-0'); SELECT count(*) FROM c;"
+            )),
+            &utc_request(),
+        ),
+        [Some("1".to_string())]
     );
+    let error = crate::helpers::run_translated::try_run_translated_bound_with(
+        &utc_script(&format!("{schema} INSERT INTO c VALUES ('invalid'); SELECT count(*) FROM c;")),
+        &utc_request(),
+        &[],
+    )
+    .expect_err("invalid date input raises");
+    assert!(error.to_string().contains("invalid input syntax"), "{error}");
 }
 
 #[test]
@@ -266,7 +298,13 @@ fn to_timestamp_of_an_infinite_epoch_is_infinite() {
         "to_timestamp(' -Inf ')",
         "to_timestamp(-1)",
     ]);
-    assert_refused("SELECT to_timestamp('NaN');", "timestamp cannot be NaN");
+    let error = crate::helpers::run_translated::try_run_translated_bound_with(
+        &utc_script("SELECT to_timestamp('NaN');"),
+        &utc_request(),
+        &[],
+    )
+    .expect_err("NaN has no timestamp");
+    assert!(error.to_string().contains("timestamp cannot be NaN"), "{error}");
 }
 
 #[test]
@@ -279,15 +317,8 @@ fn an_operand_holding_a_subquery_keeps_the_infinity() {
 }
 
 #[test]
-fn a_date_shifted_by_a_volatile_count_answers_the_finite_rows() {
-    assert_eq!(
-        replica("d + (random() * 0)::integer"),
-        [Some("2024-02-29".to_string()), None, None, None]
-    );
-    assert_eq!(
-        replica("(d + (random() * 0)::integer) + id"),
-        [Some("2024-03-01".to_string()), None, None, None]
-    );
+fn a_date_shifted_by_a_volatile_count_keeps_infinity() {
+    assert_parity(&["d + (random() * 0)::integer", "(d + (random() * 0)::integer) + id"]);
 }
 
 #[test]
@@ -380,7 +411,7 @@ fn text_spelling_an_infinity_casts_to_it() {
                 &utc_script(&format!(
                     "CREATE TABLE spellings (id integer PRIMARY KEY, txt text);
                      INSERT INTO spellings VALUES (1, 'Infinity'), (2, ' +infinity '), \
-                     (3, '-INFINITY'), (4, '++infinity');
+                     (3, '-INFINITY');
                      SELECT CAST(txt::{column_type} AS text) FROM spellings ORDER BY id;"
                 )),
                 &utc_request(),
@@ -389,10 +420,20 @@ fn text_spelling_an_infinity_casts_to_it() {
                 Some("infinity".to_string()),
                 Some("infinity".to_string()),
                 Some("-infinity".to_string()),
-                None
             ],
             "{column_type}"
         );
+        let error = crate::helpers::run_translated::try_run_translated_bound_with(
+            &utc_script(&format!(
+                "CREATE TABLE spellings (txt text);
+                 INSERT INTO spellings VALUES ('++infinity');
+                 SELECT txt::{column_type} FROM spellings;"
+            )),
+            &utc_request(),
+            &[],
+        )
+        .expect_err("invalid infinity spelling raises");
+        assert!(error.to_string().contains("invalid input syntax"), "{error}");
     }
 }
 

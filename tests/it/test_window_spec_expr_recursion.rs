@@ -5,18 +5,17 @@
 //! - WHERE clause expressions in subqueries inside aggregates
 //! - CTE (WITH clause) body expressions
 
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use translate_helpers::translate_default_first_query as translate_ok;
+use diesel::connection::SimpleConnection;
+use pg2sqlite::prelude::Pg2Sqlite;
 
-use crate::helpers::translate as translate_helpers;
+use crate::helpers;
 
 const SCHEMA: &str = "CREATE TABLE events (id INT PRIMARY KEY, val FLOAT, created_at TIMESTAMP);";
 
 // Inline OVER (PARTITION BY <pg-expr>) — partition_by expressions must be
 // translated, not left as PG syntax.
 
-/// date_trunc inside PARTITION BY of an inline window spec must be translated
-/// to strftime (the SQLite equivalent) — not left as `date_trunc(...)`.
+/// `date_trunc` dispatches inside a window's `PARTITION BY`.
 #[test]
 fn window_partition_by_date_trunc_is_translated() {
     let sql = format!(
@@ -24,14 +23,7 @@ fn window_partition_by_date_trunc_is_translated() {
          SELECT SUM(val) OVER (PARTITION BY date_trunc('month', created_at)) FROM events;"
     );
     let out = translate_ok(&sql);
-    assert!(
-        out.to_lowercase().contains("strftime"),
-        "date_trunc in PARTITION BY must be translated to strftime: {out}"
-    );
-    assert!(
-        !out.to_lowercase().contains("date_trunc"),
-        "date_trunc must not appear verbatim in output: {out}"
-    );
+    assert!(out.contains("PARTITION BY pg2sqlite_timestamp_trunc('month', created_at)"), "{out}");
     execute_all_emitted(&sql);
 }
 
@@ -63,14 +55,7 @@ fn window_order_by_date_trunc_is_translated() {
          SELECT RANK() OVER (ORDER BY date_trunc('day', created_at)) FROM events;"
     );
     let out = translate_ok(&sql);
-    assert!(
-        out.to_lowercase().contains("strftime"),
-        "date_trunc in window ORDER BY must be translated to strftime: {out}"
-    );
-    assert!(
-        !out.to_lowercase().contains("date_trunc"),
-        "date_trunc must not appear in output: {out}"
-    );
+    assert!(out.contains("ORDER BY pg2sqlite_timestamp_trunc('day', created_at)"), "{out}");
     execute_all_emitted(&sql);
 }
 
@@ -85,11 +70,8 @@ fn window_partition_and_order_by_date_trunc_both_translated() {
          ) FROM events;"
     );
     let out = translate_ok(&sql);
-    assert!(
-        out.to_lowercase().contains("strftime"),
-        "date_trunc in both PARTITION BY and ORDER BY must translate to strftime: {out}"
-    );
-    assert!(!out.to_lowercase().contains("date_trunc"), "No date_trunc should remain: {out}");
+    assert!(out.contains("PARTITION BY pg2sqlite_timestamp_trunc('month', created_at)"), "{out}");
+    assert!(out.contains("ORDER BY pg2sqlite_timestamp_trunc('day', created_at)"), "{out}");
     execute_all_emitted(&sql);
 }
 
@@ -105,14 +87,7 @@ fn named_window_partition_by_date_trunc_is_translated() {
          WINDOW w AS (PARTITION BY date_trunc('month', created_at));"
     );
     let out = translate_ok(&sql);
-    assert!(
-        out.to_lowercase().contains("strftime"),
-        "date_trunc in named WINDOW must be translated to strftime: {out}"
-    );
-    assert!(
-        !out.to_lowercase().contains("date_trunc"),
-        "date_trunc must not remain in named WINDOW: {out}"
-    );
+    assert!(out.contains("PARTITION BY pg2sqlite_timestamp_trunc('month', created_at)"), "{out}");
     execute_all_emitted(&sql);
 }
 
@@ -127,27 +102,25 @@ fn window_aggregate_arg_date_trunc_is_translated() {
          SELECT FIRST_VALUE(date_trunc('hour', created_at)) OVER (ORDER BY id) FROM events;"
     );
     let out = translate_ok(&sql);
-    assert!(
-        out.to_lowercase().contains("strftime"),
-        "date_trunc in window aggregate arg must become strftime: {out}"
-    );
-    assert!(
-        !out.to_lowercase().contains("date_trunc"),
-        "date_trunc must not remain in window aggregate arg: {out}"
-    );
+    assert!(out.contains("FIRST_VALUE(pg2sqlite_timestamp_trunc('hour', created_at))"), "{out}");
     execute_all_emitted(&sql);
 }
 
+fn translate_ok(sql: &str) -> String {
+    helpers::translate::translate_utc_statements_and_first_query(sql).1
+}
+
 fn execute_all_emitted(sql: &str) {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    let stmts = Pg2Sqlite::default()
-        .sql(sql)
+    let mut connection = helpers::establish_connection();
+    let statements = Pg2Sqlite::default()
+        .sql(&helpers::deployment::utc_script(sql))
         .unwrap()
-        .translate_to_sql(&Pg2SqliteOptions::default())
+        .translate_to_sql(&helpers::deployment::utc_request())
         .unwrap()
         .into_vec();
-    for s in &stmts {
-        conn.execute_batch(&format!("{s};"))
-            .unwrap_or_else(|e| panic!("emitted SQL failed: {e}\n{s}"));
+    for statement in &statements {
+        connection
+            .batch_execute(&format!("{statement};"))
+            .unwrap_or_else(|error| panic!("emitted SQL failed {error}\n{statement}"));
     }
 }

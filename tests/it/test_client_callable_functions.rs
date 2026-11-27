@@ -24,7 +24,7 @@ fn deployment() -> Deployment {
 }
 
 fn options() -> Pg2SqliteOptions {
-    Pg2SqliteOptions::default().with_deployment(deployment()).with_acting_role("app")
+    crate::helpers::function_options().with_deployment(deployment()).with_acting_role("app")
 }
 
 fn translated(source: &str, options: &Pg2SqliteOptions) -> pg2sqlite::script::Script<String> {

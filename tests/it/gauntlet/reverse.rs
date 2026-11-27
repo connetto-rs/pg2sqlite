@@ -182,17 +182,6 @@ const ACCEPT_CASES: &[(&str, &str)] = &[
     ("SELECT group_concat(DISTINCT s) FROM t", "scalar_functions"),
     // hex(x) now casts the argument to bytea so encode() accepts it.
     ("SELECT hex(s) FROM t", "scalar_functions"),
-    // --- strftime (test_reverse_strftime.rs,
-    // test_reverse_output_is_valid_postgres.rs)
-    ("SELECT strftime('%Y-01-01 00:00:00', ts) FROM t", "strftime"),
-    ("SELECT strftime('%Y', ts) FROM t", "strftime"),
-    ("SELECT strftime('%Y-%m-%d', ts) FROM t", "strftime"),
-    ("SELECT strftime('%H:%M:%S', ts) FROM t", "strftime"),
-    ("SELECT strftime('%Y-%m-%dT%H', ts) FROM t", "strftime"),
-    ("SELECT strftime('%I:%M', ts) FROM t", "strftime"),
-    // --- epoch (test_reverse_epoch_now.rs)
-    ("SELECT unixepoch(ts) FROM t", "epoch_now"),
-    ("SELECT unixepoch(ts, 'subsec') FROM t", "epoch_now"),
     ("SELECT datetime(tz) FROM t", "epoch_now"),
     ("SELECT datetime(ts) FROM t", "epoch_now"),
     // --- string_agg (test_reverse_string_agg.rs)
@@ -384,14 +373,6 @@ const ACCEPT_CASES: &[(&str, &str)] = &[
     // --- LIKE contract (test_reverse_like_contract.rs)
     ("SELECT * FROM t WHERE s LIKE '%test%'", "like_contract"),
     ("SELECT * FROM t WHERE s NOT LIKE '%test%'", "like_contract"),
-    // --- roundtrip (test_reverse_roundtrip.rs)
-    ("SELECT strftime('%Y-01-01 00:00:00', created_at) FROM events", "roundtrip"),
-    ("SELECT strftime('%Y', created_at) FROM events", "roundtrip"),
-    ("SELECT strftime('%m', created_at) FROM events", "roundtrip"),
-    ("SELECT strftime('%d', created_at) FROM events", "roundtrip"),
-    ("SELECT strftime('%H', created_at) FROM events", "roundtrip"),
-    ("SELECT strftime('%M', created_at) FROM events", "roundtrip"),
-    ("SELECT strftime('%S', created_at) FROM events", "roundtrip"),
     // --- translation (test_reverse_translation.rs)
     ("SELECT id, name, email FROM users WHERE name = 'Alice'", "translation"),
     ("INSERT INTO users (id, name, email) VALUES (1, 'Alice', 'alice@example.com')", "translation"),
@@ -424,9 +405,6 @@ const EXECUTE_CASES: &[(&str, &str)] = &[
     ("SELECT ifnull(1, 0)", "COALESCE(1, 0) returns 1"),
     // iif(1 > 0, 'yes', 'no') -> CASE WHEN returns 'yes'
     ("SELECT iif(1 > 0, 'yes', 'no')", "CASE WHEN returns 'yes'"),
-    // unixepoch() -> floor(EXTRACT(EPOCH FROM NOW()))::BIGINT returns current
-    // epoch seconds
-    ("SELECT unixepoch()", "returns current epoch as whole seconds"),
     // nullif(1, 0) -> nullif(1, 0) returns 1
     ("SELECT nullif(1, 0)", "returns 1"),
     // min(3, 1) -> LEAST(3, 1) returns 1
@@ -464,6 +442,23 @@ const KNOWN_REFUSALS: &[(&str, &str)] = &[
 /// than among the failures: the corpus records that the refusal is deliberate
 /// and that its message still says why.
 const TRANSLATOR_REFUSALS: &[(&str, &str)] = &[
+    ("SELECT strftime('%Y-01-01 00:00:00', ts) FROM t", "strftime"),
+    ("SELECT strftime('%Y', ts) FROM t", "strftime"),
+    ("SELECT strftime('%Y-%m-%d', ts) FROM t", "strftime"),
+    ("SELECT strftime('%H:%M:%S', ts) FROM t", "strftime"),
+    ("SELECT strftime('%Y-%m-%dT%H', ts) FROM t", "strftime"),
+    ("SELECT strftime('%I:%M', ts) FROM t", "strftime"),
+    ("SELECT unixepoch(ts) FROM t", "unixepoch"),
+    ("SELECT unixepoch(ts, 'subsec') FROM t", "unixepoch"),
+    ("SELECT unixepoch()", "unixepoch"),
+    ("SELECT strftime('%Y-01-01 00:00:00', created_at) FROM events", "strftime"),
+    ("SELECT strftime('%Y', created_at) FROM events", "strftime"),
+    ("SELECT strftime('%m', created_at) FROM events", "strftime"),
+    ("SELECT strftime('%d', created_at) FROM events", "strftime"),
+    ("SELECT strftime('%H', created_at) FROM events", "strftime"),
+    ("SELECT strftime('%M', created_at) FROM events", "strftime"),
+    ("SELECT strftime('%S', created_at) FROM events", "strftime"),
+    ("SELECT datetime(ts, '+1 day') FROM t", "datetime"),
     // A hex blob compared with a uuid column: whether it reverses at all
     // depends on how the translation holds a uuid, and these options name no
     // representation, which is also why the forward direction refuses a uuid
