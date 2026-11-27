@@ -69,9 +69,10 @@ fn explicit_commit_keeps_diesel_transaction_state_synchronized() {
     AnsiTransactionManager::rollback_transaction(&mut connection).expect("rollback transaction");
 }
 
-/// SQLite's conflict rollback closes the transaction tracked by Diesel.
+/// SQLite's conflict rollback leaves Diesel refusing every statement until
+/// the caller rolls back, which then unwinds without issuing SQL.
 #[test]
-fn implicit_rollback_clears_diesel_transaction_depth() {
+fn implicit_rollback_holds_diesel_until_rolled_back() {
     let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
     connection
         .batch_execute(
@@ -87,15 +88,21 @@ fn implicit_rollback_clears_diesel_transaction_depth() {
         .values(clock_children::identifier.eq(1))
         .execute(&mut connection)
         .expect_err("duplicate rolls back transaction");
-    let pending: i64 =
-        clock_children::table.count().get_result(&mut connection).expect("read rolled back rows");
-    assert_eq!(pending, 0);
+    assert!(matches!(
+        clock_children::table.count().get_result::<i64>(&mut connection),
+        Err(diesel::result::Error::TransactionRolledBackByDatabase)
+    ));
+    AnsiTransactionManager::rollback_transaction(&mut connection)
+        .expect("unwind the rolled back transaction");
     assert_eq!(
         AnsiTransactionManager::transaction_manager_status_mut(&mut connection)
             .transaction_depth()
             .expect("read transaction depth"),
         None,
     );
+    let pending: i64 =
+        clock_children::table.count().get_result(&mut connection).expect("read rolled back rows");
+    assert_eq!(pending, 0);
     AnsiTransactionManager::begin_transaction_sql(&mut connection, "BEGIN")
         .expect("begin after implicit rollback");
     AnsiTransactionManager::rollback_transaction(&mut connection).expect("rollback transaction");
