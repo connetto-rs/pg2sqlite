@@ -222,7 +222,7 @@ fn translate(pg: &str, zone: &str) -> Result<Script<String>, String> {
 fn run(script: Script<String>) -> Outcome {
     let mut connection = temporal::connection();
     script
-        .register_functions(&mut connection)
+        .register_managed(&mut connection)
         .map_err(|error| format!("SQLite refused the script's functions: {error}"))?;
     let statements = script.into_vec();
     let (probe, setup) = statements.split_last().ok_or("nothing was emitted")?;

@@ -832,7 +832,7 @@ diesel::table! {
 }
 
 /// Seeds resources whose permissions distinguish each column of a row cap.
-fn seed_capped_resources(connection: &mut diesel::sqlite::SqliteConnection) {
+fn seed_capped_resources(connection: &mut crate::helpers::Replica) {
     diesel::insert_into(cap_resources::table)
         .values(&["allowed", "wrong-role", "ungranted"].map(|name| cap_resources::id.eq(name)))
         .execute(connection)
@@ -857,7 +857,7 @@ fn a_tuple_capped_helper_returns_only_matching_resources() {
         ),
         &options(),
     );
-    let mut connection = helpers::applied_script(&script, None);
+    let mut connection = helpers::applied_script(&script);
     seed_capped_resources(&mut connection);
     let rows = permitted_resources::table
         .select(permitted_resources::id)
@@ -882,7 +882,7 @@ fn repeated_definer_calls_return_rows_at_every_call_site() {
         ),
         &options(),
     );
-    let mut connection = helpers::applied_script(&script, None);
+    let mut connection = helpers::applied_script(&script);
     seed_capped_resources(&mut connection);
     for _ in 0..2 {
         let first = permitted_resources::table

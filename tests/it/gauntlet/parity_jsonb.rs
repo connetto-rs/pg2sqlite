@@ -11,7 +11,6 @@ use diesel::{
     pg::PgConnection,
     prelude::*,
     sql_types::{Nullable, Text},
-    sqlite::SqliteConnection,
 };
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
@@ -97,7 +96,7 @@ fn translated(
 /// What the replica does with the same `steps` and `queries`.
 fn sqlite(schema: &str, steps: &[Step], queries: &[&str]) -> (Vec<Outcome>, Vec<Vec<String>>) {
     let options = options();
-    let mut connection: SqliteConnection = establish_connection();
+    let mut connection: crate::helpers::Replica = establish_connection();
     for statement in translated("", schema, &options)
         .unwrap_or_else(|error| panic!("pg2sqlite refused the schema: {error}"))
     {
@@ -352,7 +351,7 @@ fn computed_defaults_and_generated_values_are_canonical() {
 /// for a function registered as innocuous once the schema is untrusted.
 #[test]
 fn the_function_runs_where_the_schema_is_untrusted() {
-    let mut connection: SqliteConnection = establish_connection();
+    let mut connection: crate::helpers::Replica = establish_connection();
     diesel::sql_query("PRAGMA trusted_schema = OFF")
         .execute(&mut connection)
         .expect("distrust the schema");

@@ -9,6 +9,7 @@
 //! the column now holds 10 and 20, and 0.30 reads as 30. R46g publishes the
 //! scale through the manifest so a consumer can adapt.
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::{
     manifest::ColumnStorage,
     prelude::{Pg2Sqlite, Pg2SqliteOptions},
@@ -40,9 +41,9 @@ fn a_scaled_numeric_becomes_an_integer() {
     let sql = stmts.join("\n");
     assert!(sql.contains("price INTEGER"), "expected a scaled integer column: {sql}");
     assert!(!sql.to_uppercase().contains("REAL"), "REAL is what loses the exactness: {sql}");
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     for s in &stmts {
-        conn.execute_batch(&format!("{s};")).unwrap();
+        conn.batch_execute(&format!("{s};")).unwrap();
     }
 }
 
@@ -74,9 +75,9 @@ fn an_unscaled_numeric_is_a_plain_integer() {
         .into_vec();
     let sql = stmts.join("\n");
     assert!(sql.contains("n INTEGER"), "{sql}");
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     for s in &stmts {
-        conn.execute_batch(&format!("{s};")).unwrap();
+        conn.batch_execute(&format!("{s};")).unwrap();
     }
 }
 

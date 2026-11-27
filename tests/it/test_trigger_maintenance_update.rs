@@ -5,8 +5,10 @@
 //! timing fire in PostgreSQL's name order, and the constructs that cannot
 //! share one SQLite trigger are refused by name.
 
-use diesel::{Connection, RunQueryDsl, SqliteConnection, prelude::*};
+use diesel::{Connection, RunQueryDsl, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+
+use crate::helpers::Replica;
 
 diesel::table! {
     mut_tbl (id) {
@@ -43,14 +45,14 @@ const FIRING_ORDER_SCHEMA: &str = "
     CREATE TRIGGER mm3_m BEFORE INSERT ON trg3 FOR EACH ROW EXECUTE FUNCTION trg3_m();
 ";
 
-fn apply_schema(pg: &str) -> SqliteConnection {
+fn apply_schema(pg: &str) -> Replica {
     let stmts = Pg2Sqlite::default()
         .sql(pg)
         .expect("parse")
         .translate_to_sql(&Pg2SqliteOptions::default())
         .expect("translate")
         .into_vec();
-    let mut conn = SqliteConnection::establish(":memory:").expect("connect");
+    let mut conn = Replica::establish(":memory:").expect("connect");
     // Translated DDL cannot be expressed via diesel's typed DSL.
     diesel::sql_query("PRAGMA recursive_triggers = ON").execute(&mut conn).expect("pragma");
     for stmt in &stmts {
@@ -67,7 +69,7 @@ struct TagRow {
     tag: Option<String>,
 }
 
-fn read_tag(conn: &mut SqliteConnection) -> Option<String> {
+fn read_tag(conn: &mut Replica) -> Option<String> {
     diesel::sql_query("SELECT tag FROM mut WHERE id = 1")
         .get_result::<TagRow>(conn)
         .expect("select")
@@ -428,7 +430,7 @@ fn an_assignment_turned_plain_keeps_both_conditions() {
             .execute(&mut connection)
             .unwrap_or_else(|error| panic!("DDL: {error}\n{statement}"));
     }
-    let insert = |connection: &mut SqliteConnection, id: i32, parent_id: i32| {
+    let insert = |connection: &mut Replica, id: i32, parent_id: i32| {
         diesel::sql_query(format!("INSERT INTO edges (id, parent_id) VALUES ({id}, {parent_id})"))
             .execute(connection)
             .map_err(|error| error.to_string())

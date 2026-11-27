@@ -19,7 +19,7 @@ fn rows<T: QueryableByName<diesel::sqlite::Sqlite> + 'static>(pg: &str) -> Vec<T
         .translate_to_sql(&Pg2SqliteOptions::default())
         .expect("translate")
         .into_vec();
-    let mut connection = SqliteConnection::establish(":memory:").expect("connect");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("connect");
     let (probe, setup) = statements.split_last().expect("an emitted query");
     for statement in setup {
         diesel::sql_query(statement)

@@ -4,13 +4,12 @@
 //! These tests assert observable contracts (exact emitted SQL or error message
 //! content) rather than implementation internals.
 
-use diesel::prelude::*;
+use diesel::{Connection, connection::SimpleConnection, prelude::*};
 use pg2sqlite::{
     errors::{Error, RefusalCategory, TranslationDirection},
     prelude::{Pg2Sqlite, Pg2SqliteOptions},
     warnings::TranslationWarning,
 };
-use rusqlite::Connection;
 
 use crate::helpers;
 
@@ -28,16 +27,15 @@ fn translate(sql: &str) -> Result<Vec<String>, pg2sqlite::errors::Error> {
 
 use helpers::translate_with_default_warnings as translate_with_warnings;
 
-/// Executes every statement in `stmts` through rusqlite to confirm they parse
-/// and run without error.
+/// Executes every statement in `stmts` through a managed connection.
 ///
 /// # Errors
 ///
 /// Returns the first SQLite error encountered.
-fn sqlite_accepts(stmts: &[String]) -> Result<(), rusqlite::Error> {
-    let conn = Connection::open_in_memory()?;
+fn sqlite_accepts(stmts: &[String]) -> Result<(), crate::support::fixtures::FixtureError> {
+    let mut conn = crate::helpers::Replica::establish(":memory:")?;
     for s in stmts {
-        conn.execute_batch(s)?;
+        conn.batch_execute(s)?;
     }
     Ok(())
 }
@@ -52,25 +50,29 @@ fn temporary_definition_columns_keep_generated_values_and_checks() {
         );"#,
     )
     .unwrap();
-    let connection = Connection::open_in_memory().unwrap();
+    let mut connection = crate::helpers::Replica::establish(":memory:").unwrap();
     for statement in statements {
-        connection.execute_batch(&statement).unwrap();
+        connection.batch_execute(&statement).unwrap();
     }
-    connection.execute(r#"INSERT INTO temp."Docs" ("Id") VALUES (23)"#, []).unwrap();
+    connection.execute(r#"INSERT INTO temp."Docs" ("Id") VALUES (23)"#, &[]).unwrap();
     let error = connection
-        .execute(r#"INSERT INTO temp."Docs" ("Id", quantity) VALUES (41, -1)"#, [])
+        .execute(r#"INSERT INTO temp."Docs" ("Id", quantity) VALUES (41, -1)"#, &[])
         .unwrap_err();
-    assert_eq!(error.sqlite_error_code(), Some(rusqlite::ErrorCode::ConstraintViolation));
-    let rows = connection
-        .prepare(r#"SELECT "Id", quantity, total FROM temp."Docs" ORDER BY "Id""#)
-        .unwrap()
-        .query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
-        })
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    assert_eq!(rows, [(23, 2, 25)]);
+    assert!(error.to_string().contains("CHECK"), "{error}");
+    let rows = helpers::query_values(
+        &mut connection,
+        r#"SELECT "Id", quantity, total FROM temp."Docs" ORDER BY "Id""#,
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        rows,
+        [vec![
+            helpers::SqliteAnyValue::Integer(23),
+            helpers::SqliteAnyValue::Integer(2),
+            helpers::SqliteAnyValue::Integer(25)
+        ]]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -98,9 +100,9 @@ fn rename_no_longer_panics() {
     );
 
     // Build a fresh db with the original table, then apply the rename.
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY NOT NULL) STRICT;").unwrap();
-    conn.execute_batch(rename_stmt).unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
+    conn.batch_execute("CREATE TABLE t (id INTEGER PRIMARY KEY NOT NULL) STRICT;").unwrap();
+    conn.batch_execute(rename_stmt).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -150,12 +152,15 @@ fn identity_pk_auto_assigns_on_insert() {
     let stmts = translate(sql).expect("should translate");
     sqlite_accepts(&stmts).expect("DDL must be valid");
 
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     for s in &stmts {
-        conn.execute_batch(s).unwrap();
+        conn.batch_execute(s).unwrap();
     }
-    conn.execute_batch("INSERT INTO a DEFAULT VALUES;").unwrap();
-    let id: i64 = conn.query_row("SELECT id FROM a", [], |row| row.get(0)).unwrap();
+    conn.batch_execute("INSERT INTO a DEFAULT VALUES;").unwrap();
+    let rows = helpers::query_values(&mut conn, "SELECT id FROM a", &[]).unwrap();
+    let helpers::SqliteAnyValue::Integer(id) = rows[0][0] else {
+        panic!("expected an integer rowid");
+    };
     assert_ne!(id, 0, "auto-assigned rowid must be nonzero");
 }
 
@@ -460,12 +465,12 @@ fn check_no_inherit_keeps_the_check_and_drops_the_modifier_with_a_warning() {
         sqlite_accepts(&stmts).expect("the emitted DDL must run");
 
         // The kept CHECK still enforces: an out-of-range row is refused.
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
         for stmt in &stmts {
-            conn.execute_batch(stmt).unwrap();
+            conn.batch_execute(stmt).unwrap();
         }
-        conn.execute_batch("INSERT INTO t VALUES (1, 5);").expect("a passing row lands");
-        let err = conn.execute_batch("INSERT INTO t VALUES (2, -1);");
+        conn.batch_execute("INSERT INTO t VALUES (1, 5);").expect("a passing row lands");
+        let err = conn.batch_execute("INSERT INTO t VALUES (2, -1);");
         assert!(err.is_err(), "the CHECK must still enforce after the modifier is dropped");
     }
 }
@@ -590,7 +595,7 @@ mod subquery_positions {
         }
     }
 
-    fn database(source: &str) -> SqliteConnection {
+    fn database(source: &str) -> crate::helpers::Replica {
         let mut connection = helpers::establish_connection();
         for statement in translate(source).unwrap() {
             connection.batch_execute(&statement).unwrap();
@@ -599,7 +604,7 @@ mod subquery_positions {
     }
 
     fn insert(
-        connection: &mut SqliteConnection,
+        connection: &mut crate::helpers::Replica,
         id: i32,
         value: i32,
     ) -> diesel::QueryResult<usize> {
@@ -608,7 +613,7 @@ mod subquery_positions {
             .execute(connection)
     }
 
-    fn rows(connection: &mut SqliteConnection) -> Vec<(i32, i32)> {
+    fn rows(connection: &mut crate::helpers::Replica) -> Vec<(i32, i32)> {
         position_docs::table
             .select((position_docs::id, position_docs::value))
             .order(position_docs::id)

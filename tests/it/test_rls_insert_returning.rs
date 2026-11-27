@@ -8,10 +8,15 @@
 //! RETURNING (including auto-assigned integer primary keys) must
 //! come back as the value actually stored.
 
+use diesel::{Connection, connection::SimpleConnection};
+use diesel_dynamic_schema::dynamic_value::{DynamicRow, NamedField};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
-use rusqlite::Connection;
 
-use crate::helpers::deployment::{caller, deployment};
+use crate::helpers::{
+    Replica, SqliteAnyValue,
+    deployment::{caller, deployment},
+    query_values,
+};
 
 const RLS_SCHEMA: &str = "\
 CREATE TABLE documents (
@@ -80,13 +85,15 @@ fn translate_query_tail(pg_query: &str, schema: &str, opts: &Pg2SqliteOptions) -
         .join("\n")
 }
 
-fn open_with_session_user() -> Connection {
-    let conn = Connection::open_in_memory().unwrap();
-    conn.create_scalar_function(
-        "current_app_user",
-        0,
-        rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
-        |_| Ok(42i64),
+diesel::define_sql_function! {
+    fn current_app_user() -> diesel::sql_types::BigInt;
+}
+
+fn open_with_session_user() -> Replica {
+    let mut conn = Replica::establish(":memory:").unwrap();
+    current_app_user_utils::register_impl(
+        conn.registration().expect("registration").sqlite(),
+        || 42i64,
     )
     .unwrap();
     conn
@@ -95,19 +102,19 @@ fn open_with_session_user() -> Connection {
 #[test]
 fn insert_returning_id_yields_the_assigned_primary_key() {
     let opts = opts();
-    let conn = open_with_session_user();
-    conn.execute_batch(&translate(RLS_SCHEMA, &opts)).expect("apply schema");
+    let mut conn = open_with_session_user();
+    conn.batch_execute(&translate(RLS_SCHEMA, &opts)).expect("apply schema");
 
     let sql = translate_query_tail(
         "INSERT INTO documents (owner_id, title) VALUES (42, 'r') RETURNING id",
         RLS_SCHEMA,
         &opts,
     );
-    let returned: Option<i64> = conn
-        .query_row(sql.trim_end_matches(";\n").trim_end_matches(';'), [], |r| r.get(0))
+    let rows = query_values(&mut conn, sql.trim_end_matches(";\n").trim_end_matches(';'), &[])
         .expect("RETURNING id must produce a row");
-    let id = returned
-        .expect("RETURNING id must surface the auto-assigned PK from the backing table, got NULL");
+    let SqliteAnyValue::Integer(id) = rows[0][0] else {
+        panic!("RETURNING id must surface the auto-assigned PK from the backing table");
+    };
     assert!(id > 0, "the returned PK should be a positive integer, got {id}");
 }
 
@@ -119,16 +126,15 @@ fn insert_returning_when_policy_fails_raises() {
     // bypass policy enforcement (the backing-table BEFORE INSERT
     // guard trigger picks up the slack).
     let opts = opts();
-    let conn = open_with_session_user();
-    conn.execute_batch(&translate(RLS_SCHEMA, &opts)).expect("apply schema");
+    let mut conn = open_with_session_user();
+    conn.batch_execute(&translate(RLS_SCHEMA, &opts)).expect("apply schema");
 
     let sql = translate_query_tail(
         "INSERT INTO documents (owner_id, title) VALUES (99, 't') RETURNING id",
         RLS_SCHEMA,
         &opts,
     );
-    let err = conn
-        .query_row(sql.trim_end_matches(";\n").trim_end_matches(';'), [], |r| r.get::<_, i64>(0))
+    let err = query_values(&mut conn, sql.trim_end_matches(";\n").trim_end_matches(';'), &[])
         .expect_err("policy must reject RETURNING-bearing INSERT with foreign owner_id");
     let err_msg = err.to_string();
     assert!(
@@ -157,9 +163,9 @@ fn plain_insert_still_uses_view_path() {
         last.contains("INSERT INTO documents (") && !last.contains("documents_rls"),
         "plain INSERT must target the view, got: {last}"
     );
-    let conn = open_with_session_user();
-    conn.execute_batch(&translate(RLS_SCHEMA, &opts)).expect("apply schema");
-    conn.execute_batch(&format!("{last};")).unwrap();
+    let mut conn = open_with_session_user();
+    conn.batch_execute(&translate(RLS_SCHEMA, &opts)).expect("apply schema");
+    conn.batch_execute(&format!("{last};")).unwrap();
 }
 
 #[test]
@@ -189,31 +195,35 @@ fn insert_returning_through_custom_rls_suffix() {
         last.contains("INSERT INTO documents_inner"),
         "rewrite must use the configured suffix, got: {last}"
     );
-    let conn = open_with_session_user();
-    conn.execute_batch(&translate(RLS_SCHEMA, &custom_opts)).expect("apply schema");
-    conn.execute_batch(&format!("{last};")).unwrap();
+    let mut conn = open_with_session_user();
+    conn.batch_execute(&translate(RLS_SCHEMA, &custom_opts)).expect("apply schema");
+    conn.batch_execute(&format!("{last};")).unwrap();
 }
 
 #[test]
 fn insert_returning_star_yields_full_row_from_backing_table() {
     let opts = opts();
-    let conn = open_with_session_user();
-    conn.execute_batch(&translate(RLS_SCHEMA, &opts)).expect("apply schema");
+    let mut conn = open_with_session_user();
+    conn.batch_execute(&translate(RLS_SCHEMA, &opts)).expect("apply schema");
 
     let sql = translate_query_tail(
         "INSERT INTO documents (owner_id, title) VALUES (42, 'star') RETURNING *",
         RLS_SCHEMA,
         &opts,
     );
-    let (id, owner_id, title): (Option<i64>, Option<i64>, Option<String>) = conn
-        .query_row(sql.trim_end_matches(";\n").trim_end_matches(';'), [], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        })
+    let rows = query_values(&mut conn, sql.trim_end_matches(";\n").trim_end_matches(';'), &[])
         .expect("RETURNING * must produce a row");
 
-    assert!(id.is_some(), "RETURNING * must surface the assigned PK, got NULL");
-    assert_eq!(owner_id, Some(42), "owner_id must come back as written");
-    assert_eq!(title.as_deref(), Some("star"), "title must come back as written");
+    assert!(
+        matches!(rows[0][0], SqliteAnyValue::Integer(_)),
+        "RETURNING * must surface the assigned PK, got NULL"
+    );
+    assert_eq!(rows[0][1], SqliteAnyValue::Integer(42), "owner_id must come back as written");
+    assert_eq!(
+        rows[0][2],
+        SqliteAnyValue::Text("star".to_owned()),
+        "title must come back as written"
+    );
 }
 
 /// The default validation mode emits no backing-table guard, so a
@@ -274,19 +284,18 @@ fn monitor_mode_refuses_returning_star() {
 #[test]
 fn monitor_mode_returns_a_column_the_caller_wrote() {
     let opts = monitor_opts();
-    let conn = open_with_session_user();
-    conn.execute_batch(&translate(RLS_SCHEMA, &opts)).expect("apply schema");
+    let mut conn = open_with_session_user();
+    conn.batch_execute(&translate(RLS_SCHEMA, &opts)).expect("apply schema");
 
     let sql = translate_query_tail(
         "INSERT INTO documents (owner_id, title) VALUES (42, 'written') RETURNING title",
         RLS_SCHEMA,
         &opts,
     );
-    let title: Option<String> = conn
-        .query_row(sql.trim_end_matches(";\n").trim_end_matches(';'), [], |r| r.get(0))
+    let rows = query_values(&mut conn, sql.trim_end_matches(";\n").trim_end_matches(';'), &[])
         .expect("a caller-written column comes back through the view");
 
-    assert_eq!(title.as_deref(), Some("written"));
+    assert_eq!(rows[0][0], SqliteAnyValue::Text("written".to_owned()));
 }
 
 /// The refusal is scoped to policy-bearing tables. An ordinary table returns
@@ -307,8 +316,10 @@ fn a_table_without_a_policy_still_returns_its_assigned_key() {
 // --- M1: strict-mode backing-table INSERT guard mis-combines policies --------
 
 mod m1_tests {
-    use diesel::{prelude::*, sqlite::SqliteConnection};
+    use diesel::prelude::*;
     use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+
+    use crate::helpers::Replica;
 
     fn strict_opts() -> Pg2SqliteOptions {
         Pg2SqliteOptions::default()
@@ -316,14 +327,14 @@ mod m1_tests {
             .with_strict_rls_validation()
     }
 
-    fn apply(schema: &str) -> SqliteConnection {
+    fn apply(schema: &str) -> Replica {
         let stmts = Pg2Sqlite::default()
             .sql(schema)
             .expect("parse")
             .translate(&strict_opts())
             .expect("translate")
             .into_vec();
-        let mut conn = SqliteConnection::establish(":memory:").expect("open db");
+        let mut conn = Replica::establish(":memory:").expect("open db");
         for s in &stmts {
             // CREATE TABLE / CREATE VIEW / CREATE TRIGGER: DDL the typed DSL
             // cannot express.
@@ -532,23 +543,36 @@ fn translate_grant_query(pg_query: &str) -> Result<String, pg2sqlite::errors::Er
 /// the acting role's grants itself, the way the view would.
 #[test]
 fn insert_returning_through_a_grant_view_keeps_to_the_grants() {
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(&translate(GRANT_SCHEMA, &grant_opts())).expect("apply schema");
+    let mut conn = Replica::establish(":memory:").unwrap();
+    conn.batch_execute(&translate(GRANT_SCHEMA, &grant_opts())).expect("apply schema");
 
     let star = translate_grant_query("INSERT INTO items (id, owner) VALUES (1, 'a') RETURNING *")
         .expect("an insert of insertable columns translates");
-    let mut statement = conn.prepare(&star).expect("prepare the redirected insert");
-    let names: Vec<String> = statement.column_names().map(str::to_owned).collect();
+    let row = conn
+        .query::<DynamicRow<NamedField<SqliteAnyValue>>>(&star, &[])
+        .expect("prepare the redirected insert")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("returned rows")
+        .into_iter()
+        .next()
+        .expect("returned row");
+    let names: Vec<&str> = row.iter().map(|field| field.name.as_str()).collect();
     assert_eq!(names, ["id", "owner", "title"], "RETURNING * names the readable columns");
-    let row: (i64, String) = statement.query_row([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
-    assert_eq!(row, (1, "a".to_owned()));
+    assert_eq!(row.get(0).unwrap().value, SqliteAnyValue::Integer(1));
+    assert_eq!(row.get(1).unwrap().value, SqliteAnyValue::Text("a".to_owned()));
 
-    let returned = |query: &str| -> Vec<String> {
+    let mut returned = |query: &str| -> Vec<String> {
         let sql = translate_grant_query(query).expect(query);
-        let mut statement = conn.prepare(&sql).expect(query);
-        let names = statement.column_names().map(str::to_owned).collect();
-        statement.query_row([], |_| Ok(())).expect(query);
-        names
+        let row = conn
+            .query::<DynamicRow<NamedField<SqliteAnyValue>>>(&sql, &[])
+            .expect(query)
+            .collect::<Result<Vec<_>, _>>()
+            .expect(query)
+            .into_iter()
+            .next()
+            .expect("returned row");
+        let fields: Vec<NamedField<SqliteAnyValue>> = row.into();
+        fields.into_iter().map(|field| field.name).collect()
     };
     assert_eq!(
         returned("INSERT INTO items VALUES (2, 'b') RETURNING items.*"),

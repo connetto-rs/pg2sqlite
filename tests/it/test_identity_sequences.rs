@@ -10,11 +10,13 @@
 //! failed insert consumes no value, where PostgreSQL's sequence has already
 //! advanced.
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::{
     prelude::{Pg2Sqlite, Pg2SqliteOptions},
     warnings::TranslationWarning,
 };
-use rusqlite::Connection;
+
+use crate::helpers::{Replica, SqliteAnyValue, query_values};
 
 /// Applies the translated `ddl`, runs each of `writes`, and returns the `id`
 /// values in ascending order.
@@ -32,22 +34,26 @@ fn ids_after(ddl: &str, writes: &[&str]) -> Vec<i64> {
         .expect("fixture translates")
         .into_vec();
 
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = Replica::establish(":memory:").expect("in-memory SQLite");
     for statement in &statements {
         connection
-            .execute_batch(&format!("{statement};"))
+            .batch_execute(&format!("{statement};"))
             .unwrap_or_else(|error| panic!("emitted statement failed: {error}\n{statement}"));
     }
     for write in writes {
-        let _ = connection.execute_batch(&format!("{write};"));
+        let _ = connection.batch_execute(&format!("{write};"));
     }
 
-    let mut prepared = connection.prepare("SELECT id FROM t ORDER BY id").expect("probe prepares");
-    prepared
-        .query_map([], |row| row.get::<_, i64>(0))
+    query_values(&mut connection, "SELECT id FROM t ORDER BY id", &[])
         .expect("probe runs")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("probe rows decode")
+        .into_iter()
+        .map(|row| {
+            match row[0] {
+                SqliteAnyValue::Integer(value) => value,
+                ref value => panic!("expected integer, got {value:?}"),
+            }
+        })
+        .collect()
 }
 
 /// Translating `sql` and expecting a refusal, returned as its message.
@@ -197,11 +203,11 @@ fn a_named_table_level_primary_key_keeps_its_name() {
     let ddl = statements.join("\n");
     assert!(ddl.contains("CONSTRAINT t_pkey PRIMARY KEY AUTOINCREMENT"), "{ddl}");
 
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = Replica::establish(":memory:").expect("in-memory SQLite");
     // The translator leads with a dialect pragma; execute each statement
     // individually.
     for stmt in &statements {
-        connection.execute_batch(&format!("{stmt};")).expect("emitted DDL executes");
+        connection.batch_execute(&format!("{stmt};")).expect("emitted DDL executes");
     }
 }
 

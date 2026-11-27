@@ -6,7 +6,7 @@
 //! as it is, so the column itself admits only the text the translation
 //! writes for the type.
 
-use diesel::{prelude::*, result::DatabaseErrorKind, sqlite::SqliteConnection};
+use diesel::{prelude::*, result::DatabaseErrorKind};
 use pg2sqlite::prelude::{Pg2SqliteOptions, UuidRepresentation};
 
 use crate::helpers::{apply_translated_ddl, jsonb_functions};
@@ -24,12 +24,12 @@ fn text_uuid_options() -> Pg2SqliteOptions {
 }
 
 /// A replica holding `typed (id, v <data_type>)`.
-fn replica(data_type: &str) -> SqliteConnection {
+fn replica(data_type: &str) -> crate::helpers::Replica {
     replica_with(data_type, &text_uuid_options())
 }
 
 /// A replica holding `typed (id, v <data_type>)`, translated with `options`.
-fn replica_with(data_type: &str, options: &Pg2SqliteOptions) -> SqliteConnection {
+fn replica_with(data_type: &str, options: &Pg2SqliteOptions) -> crate::helpers::Replica {
     apply_translated_ddl(
         &format!("CREATE TABLE typed (id INT PRIMARY KEY, v {data_type});"),
         options,
@@ -37,7 +37,7 @@ fn replica_with(data_type: &str, options: &Pg2SqliteOptions) -> SqliteConnection
 }
 
 fn write(
-    connection: &mut SqliteConnection,
+    connection: &mut crate::helpers::Replica,
     id: i32,
     value: Option<&str>,
 ) -> diesel::QueryResult<usize> {

@@ -10,8 +10,21 @@
 //! The expected PostgreSQL values are from the documented semantics of each
 //! function, noted per test.
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use rusqlite::Connection;
+
+fn text_rows(connection: &mut crate::helpers::Replica, probe: &str) -> Vec<String> {
+    crate::helpers::query_values(connection, probe, &[])
+        .expect("emitted query runs")
+        .into_iter()
+        .map(|row| {
+            match row.into_iter().next().expect("first column") {
+                crate::helpers::SqliteAnyValue::Text(value) => value,
+                value => panic!("expected text, got {value:?}"),
+            }
+        })
+        .collect()
+}
 
 const DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, s TEXT, n INT);";
 
@@ -30,33 +43,33 @@ fn translate(pg: &str) -> Vec<String> {
 /// `select_list` and return it as text.
 fn eval_on(row: &str, select_list: &str) -> Option<String> {
     let script = translate(&format!("{DDL}\nSELECT {select_list} FROM t WHERE id = 1;"));
-    let conn = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut conn = crate::helpers::Replica::establish(":memory:").expect("in-memory SQLite");
     for stmt in &script[..script.len() - 1] {
-        conn.execute_batch(&format!("{stmt};"))
+        conn.batch_execute(&format!("{stmt};"))
             .unwrap_or_else(|e| panic!("emitted DDL failed: {e}\n{stmt}"));
     }
-    conn.execute_batch(row).expect("seed row");
+    conn.batch_execute(row).expect("seed row");
     let probe = script.last().expect("a query");
-    conn.query_row(probe, [], |r| r.get::<_, Option<String>>(0))
-        .unwrap_or_else(|e| panic!("emitted query failed: {e}\n{probe}"))
+    let rows = crate::helpers::query_values(&mut conn, probe, &[])
+        .unwrap_or_else(|error| panic!("emitted query failed: {error}\n{probe}"));
+    match rows.into_iter().next().expect("first row").into_iter().next().expect("first column") {
+        crate::helpers::SqliteAnyValue::Null => None,
+        crate::helpers::SqliteAnyValue::Text(value) => Some(value),
+        value => panic!("expected nullable text, got {value:?}"),
+    }
 }
 
 /// Rows surviving a translated WHERE clause, in id order.
 fn rows_matching(predicate: &str) -> Vec<String> {
     let script = translate(&format!("{DDL}\nSELECT s FROM t WHERE {predicate} ORDER BY id;"));
-    let conn = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut conn = crate::helpers::Replica::establish(":memory:").expect("in-memory SQLite");
     for stmt in &script[..script.len() - 1] {
-        conn.execute_batch(&format!("{stmt};")).expect("emitted DDL");
+        conn.batch_execute(&format!("{stmt};")).expect("emitted DDL");
     }
-    conn.execute_batch("INSERT INTO t (id, s) VALUES (1, 'Alpha'), (2, 'alpha'), (3, 'beta');")
+    conn.batch_execute("INSERT INTO t (id, s) VALUES (1, 'Alpha'), (2, 'alpha'), (3, 'beta');")
         .expect("seed rows");
     let probe = script.last().expect("a query");
-    let mut stmt =
-        conn.prepare(probe).unwrap_or_else(|e| panic!("emitted query failed: {e}\n{probe}"));
-    stmt.query_map([], |r| r.get::<_, String>(0))
-        .expect("runs")
-        .collect::<Result<_, _>>()
-        .expect("decodes")
+    text_rows(&mut conn, probe)
 }
 
 /// PostgreSQL's `LIKE` is case-sensitive. SQLite's is case-insensitive for
@@ -98,19 +111,14 @@ fn like_against_a_column_pattern_is_case_sensitive() {
     let script = translate(&format!(
         "{DDL}\nSELECT a.s FROM t AS a JOIN t AS b ON a.s LIKE b.s WHERE b.id = 2 ORDER BY a.id;"
     ));
-    let conn = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut conn = crate::helpers::Replica::establish(":memory:").expect("in-memory SQLite");
     for stmt in &script[..script.len() - 1] {
-        conn.execute_batch(&format!("{stmt};")).expect("emitted DDL");
+        conn.batch_execute(&format!("{stmt};")).expect("emitted DDL");
     }
-    conn.execute_batch("INSERT INTO t (id, s) VALUES (1, 'Alpha'), (2, 'alpha');")
+    conn.batch_execute("INSERT INTO t (id, s) VALUES (1, 'Alpha'), (2, 'alpha');")
         .expect("seed rows");
     let probe = script.last().expect("a query");
-    let mut stmt = conn.prepare(probe).expect("emitted query parses");
-    let got: Vec<String> = stmt
-        .query_map([], |r| r.get::<_, String>(0))
-        .expect("runs")
-        .collect::<Result<_, _>>()
-        .expect("decodes");
+    let got = text_rows(&mut conn, probe);
     assert_eq!(got, vec!["alpha".to_string()], "only the exact-case row matches in PostgreSQL");
 }
 

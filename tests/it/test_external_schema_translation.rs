@@ -15,7 +15,7 @@ fn schema(ddl: &str) -> ParserDB {
         .expect("schema should build")
 }
 
-fn sqlite_with(ddl: &str) -> SqliteConnection {
+fn sqlite_with(ddl: &str) -> crate::helpers::Replica {
     let statements = Pg2Sqlite::default()
         .sql(ddl)
         .expect("schema should parse")

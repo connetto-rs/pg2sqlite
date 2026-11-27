@@ -37,7 +37,7 @@ fn translate(pg: &str, options: &Pg2SqliteOptions) -> Vec<String> {
         .collect()
 }
 
-fn loaded(connection: &mut SqliteConnection, statements: &[String]) -> Vec<i64> {
+fn loaded(connection: &mut crate::helpers::Replica, statements: &[String]) -> Vec<i64> {
     let (query, definitions) = statements.split_last().expect("a query");
     for definition in definitions {
         connection.batch_execute(definition).expect("apply the definition");
@@ -55,7 +55,7 @@ fn loaded(connection: &mut SqliteConnection, statements: &[String]) -> Vec<i64> 
 
 fn run(pg: &str) -> Vec<i64> {
     let statements = translate(&format!("{TABLE}{pg}"), &Pg2SqliteOptions::default());
-    loaded(&mut SqliteConnection::establish(":memory:").expect("connect"), &statements)
+    loaded(&mut crate::helpers::Replica::establish(":memory:").expect("connect"), &statements)
 }
 
 #[test]
@@ -70,7 +70,7 @@ fn chained_xor_grows_linearly_and_answers() {
         emitted.len(),
         source.len()
     );
-    let mut connection = SqliteConnection::establish(":memory:").expect("connect");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("connect");
     let value = sql_query(emitted).get_result::<Row>(&mut connection).expect("run").r;
     assert_eq!(value, 12);
 }

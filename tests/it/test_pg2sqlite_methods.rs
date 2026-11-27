@@ -26,7 +26,7 @@ fn test_statement() {
     assert!(result[1].to_string().contains("CREATE TABLE test_statement"));
     // Execute to prove real SQLite accepts the translated DDL.
     let sqls: Vec<String> = result.iter().map(ToString::to_string).collect();
-    crate::helpers::apply_rusqlite_statements(&sqls);
+    crate::helpers::apply_statements(&sqls);
 }
 
 #[test]
@@ -38,7 +38,7 @@ fn test_sql() {
     assert!(result[1].to_string().contains("CREATE TABLE test_sql"));
     // Execute to prove real SQLite accepts the translated DDL.
     let sqls: Vec<String> = result.iter().map(ToString::to_string).collect();
-    crate::helpers::apply_rusqlite_statements(&sqls);
+    crate::helpers::apply_statements(&sqls);
 }
 
 #[test]
@@ -54,7 +54,7 @@ fn test_file() {
     assert!(result[1].to_string().contains("CREATE TABLE test_file"));
     // Execute to prove real SQLite accepts the translated DDL.
     let sqls: Vec<String> = result.iter().map(ToString::to_string).collect();
-    crate::helpers::apply_rusqlite_statements(&sqls);
+    crate::helpers::apply_statements(&sqls);
 }
 
 #[test]
@@ -82,7 +82,7 @@ fn test_ups() {
     assert!(result[2].to_string().contains("CREATE TABLE t2"));
     // Execute to prove real SQLite accepts the translated DDL.
     let sqls: Vec<String> = result.iter().map(ToString::to_string).collect();
-    crate::helpers::apply_rusqlite_statements(&sqls);
+    crate::helpers::apply_statements(&sqls);
 }
 
 #[test]
@@ -114,7 +114,7 @@ fn test_ups_until() {
     assert!(result[2].to_string().contains("CREATE TABLE t2"));
     // Execute to prove real SQLite accepts the translated DDL.
     let sqls: Vec<String> = result.iter().map(ToString::to_string).collect();
-    crate::helpers::apply_rusqlite_statements(&sqls);
+    crate::helpers::apply_statements(&sqls);
 }
 
 #[test]
@@ -220,7 +220,7 @@ fn test_alter_table_add_column_is_translated() {
     assert!(stmts[2].to_string().contains("ADD COLUMN name TEXT"), "got: {}", stmts[2]);
     // Execute to prove real SQLite accepts the translated DDL.
     let sqls: Vec<String> = stmts.iter().map(ToString::to_string).collect();
-    crate::helpers::apply_rusqlite_statements(&sqls);
+    crate::helpers::apply_statements(&sqls);
 }
 
 #[test]
@@ -259,7 +259,7 @@ fn test_index_skipped_for_role_without_access() {
     );
     // Execute to prove real SQLite accepts the translated DDL.
     let sqls: Vec<String> = stmts.iter().map(ToString::to_string).collect();
-    crate::helpers::apply_rusqlite_statements(&sqls);
+    crate::helpers::apply_statements(&sqls);
 }
 
 /// `translate_to_sql` must return `Vec<String>` of SQL text directly.

@@ -3,7 +3,7 @@
 #![cfg(feature = "sqlitegis")]
 
 use diesel::{
-    QueryableByName, RunQueryDsl, SqliteConnection,
+    QueryableByName, RunQueryDsl,
     connection::SimpleConnection,
     sql_query,
     sql_types::{Double, Integer, Text},
@@ -50,7 +50,7 @@ struct Object {
     name: String,
 }
 
-fn call(connection: &mut SqliteConnection, source: &str, reverse: bool) {
+fn call(connection: &mut helpers::Replica, source: &str, reverse: bool) {
     let options = Pg2SqliteOptions::default().with_sqlitegis_enabled();
     let statements = if reverse {
         let translator = Pg2Sqlite::default();
@@ -77,21 +77,21 @@ fn call(connection: &mut SqliteConnection, source: &str, reverse: bool) {
     }
 }
 
-fn bounds(connection: &mut SqliteConnection, owner: &str) -> Vec<Bounds> {
+fn bounds(connection: &mut helpers::Replica, owner: &str) -> Vec<Bounds> {
     // The owner selects the native index under test.
     sql_query(format!("SELECT id,xmin,xmax,ymin,ymax FROM {owner}.shapes_geom_rtree ORDER BY id"))
         .load(connection)
         .expect("native bounds")
 }
 
-fn points(connection: &mut SqliteConnection, owner: &str) -> Vec<Point> {
+fn points(connection: &mut helpers::Replica, owner: &str) -> Vec<Point> {
     // The owner selects the preserved base rows.
     sql_query(format!("SELECT id,ST_AsText(geom) AS point FROM {owner}.shapes ORDER BY id"))
         .load(connection)
         .expect("base points")
 }
 
-fn remaining_index(connection: &mut SqliteConnection, owner: &str) -> Vec<Object> {
+fn remaining_index(connection: &mut helpers::Replica, owner: &str) -> Vec<Object> {
     // The owner selects the catalogue affected by the drop.
     sql_query(format!("SELECT name FROM {owner}.sqlite_master WHERE name='shapes_geom_rtree'"))
         .load(connection)

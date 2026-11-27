@@ -182,7 +182,9 @@ impl<S> Script<S> {
             connection: self.connection.map(|groups| {
                 groups
                     .into_iter()
-                    .map(|group| group.map(|statements| statements.into_iter().map(&mut f).collect()))
+                    .map(|group| {
+                        group.map(|statements| statements.into_iter().map(&mut f).collect())
+                    })
                     .collect()
             }),
             before_commit: self.before_commit.into_iter().map(&mut f).collect(),
@@ -200,26 +202,6 @@ impl<S> Script<S> {
                 .collect(),
             temporal: self.temporal,
         }
-    }
-}
-
-#[cfg(feature = "diesel")]
-impl<S: core::fmt::Display> Script<S> {
-    /// Registers every helper function on `connection`, with the temporal
-    /// functions the translation calls, which a connection does before
-    /// running any part of the script.
-    ///
-    /// # Errors
-    ///
-    /// The error SQLite answers when it refuses a registration.
-    pub fn register_functions(
-        &self,
-        connection: &mut diesel::sqlite::SqliteConnection,
-    ) -> diesel::QueryResult<()> {
-        if let Some(temporal) = &self.temporal {
-            temporal.register(connection)?;
-        }
-        self.functions.iter().try_for_each(|function| function.register(connection))
     }
 }
 
@@ -265,16 +247,36 @@ impl<S: core::fmt::Display> Script<S> {
         Ok(())
     }
 
+    /// Registers the script's temporal functions, helpers and pre-commit
+    /// checks on `connection`, which every connection does before running any
+    /// part of the script. [`initialize_managed`](Self::initialize_managed)
+    /// and [`connect_managed`](Self::connect_managed) start with it.
+    ///
+    /// # Errors
+    ///
+    /// The connection's refusal, or
+    /// [`ExecutionError::InvalidTransactionState`](pg2sqlite_runtime::ExecutionError::InvalidTransactionState)
+    /// inside a transaction.
+    pub fn register_managed<Provider: pg2sqlite_runtime::UtcProvider + Send + 'static>(
+        &self,
+        connection: &mut pg2sqlite_runtime::ManagedConnection<Provider>,
+    ) -> Result<(), pg2sqlite_runtime::ExecutionError> {
+        let mut registration = connection.registration()?;
+        if let Some(temporal) = &self.temporal {
+            registration.temporal(temporal)?;
+        }
+        for function in &self.functions {
+            registration.helper(function)?;
+        }
+        registration.before_commit(&self.before_commit)
+    }
+
     /// Registers the helpers and the pre-commit checks, then runs the setup.
     fn prepare<Provider: pg2sqlite_runtime::UtcProvider + Send + 'static>(
         &self,
         connection: &mut pg2sqlite_runtime::ManagedConnection<Provider>,
     ) -> Result<(), pg2sqlite_runtime::ExecutionError> {
-        let mut registration = connection.registration()?;
-        for function in &self.functions {
-            registration.helper(function)?;
-        }
-        registration.before_commit(&self.before_commit)?;
+        self.register_managed(connection)?;
         for statement in &self.setup {
             let group: pg2sqlite_runtime::ExecutionGroup<_> =
                 pg2sqlite_runtime::ExecutionGroup::statements(core::slice::from_ref(statement));

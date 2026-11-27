@@ -8,8 +8,10 @@
 //! `CREATE TRIGGER` itself fail. Each test here fires the emitted trigger and
 //! reads the rows it produced.
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use rusqlite::Connection;
+
+use crate::helpers::{Replica, SqliteAnyValue, query_values};
 
 /// Translates a trigger function with `body`, applies the emitted script,
 /// fires the trigger, and returns `log.total` in ascending order.
@@ -53,24 +55,27 @@ CREATE TRIGGER tr AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION f();
         .expect("fixture translates")
         .into_vec();
 
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = Replica::establish(":memory:").expect("in-memory SQLite");
     for statement in &statements {
         connection
-            .execute_batch(&format!("{statement};"))
+            .batch_execute(&format!("{statement};"))
             .unwrap_or_else(|error| panic!("emitted statement failed: {error}\n{statement}"));
     }
     connection
-        .execute_batch("INSERT INTO src (id, v) VALUES (1,1),(2,2),(3,3),(4,4),(5,5);")
+        .batch_execute("INSERT INTO src (id, v) VALUES (1,1),(2,2),(3,3),(4,4),(5,5);")
         .expect("fixture rows");
-    connection.execute_batch("INSERT INTO t (id, n) VALUES (1, 5);").expect("trigger fires");
+    connection.batch_execute("INSERT INTO t (id, n) VALUES (1, 5);").expect("trigger fires");
 
-    let mut prepared =
-        connection.prepare("SELECT total FROM log ORDER BY total").expect("probe prepares");
-    prepared
-        .query_map([], |row| row.get::<_, i64>(0))
+    query_values(&mut connection, "SELECT total FROM log ORDER BY total", &[])
         .expect("probe runs")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("probe rows decode")
+        .into_iter()
+        .map(|row| {
+            match row[0] {
+                SqliteAnyValue::Integer(value) => value,
+                ref value => panic!("expected integer, got {value:?}"),
+            }
+        })
+        .collect()
 }
 
 #[test]

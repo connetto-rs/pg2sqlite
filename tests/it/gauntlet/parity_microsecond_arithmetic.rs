@@ -15,12 +15,12 @@
 use diesel::{
     prelude::*,
     sql_types::{Nullable, Text},
-    sqlite::SqliteConnection,
 };
 use pg2sqlite::prelude::{Error, Pg2Sqlite, Pg2SqliteOptions};
 use sql_traits::structs::ParserDB;
 
 use crate::helpers::{
+    Replica,
     deployment::utc_script,
     establish_connection,
     postgres::{apply, fresh_database_in_zone},
@@ -290,7 +290,7 @@ struct Engines {
     zone: &'static str,
     options: Pg2SqliteOptions,
     postgres: PgConnection,
-    replica: SqliteConnection,
+    replica: Replica,
     schema: ParserDB,
 }
 
@@ -308,7 +308,7 @@ impl Engines {
             .expect("parse the schema and the rows");
         let script = source.translate_to_sql(&options).expect("translate the schema and the rows");
         let mut replica = establish_connection();
-        script.register_functions(&mut replica).expect("register the replica's functions");
+        script.register_managed(&mut replica).expect("register the replica's functions");
         // The translated schema and rows are runtime text no typed DSL holds.
         for statement in script.into_vec() {
             diesel::sql_query(&statement)

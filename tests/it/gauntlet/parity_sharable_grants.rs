@@ -13,7 +13,7 @@
 // `register_impl` takes an unwind-safe closure, which a poisoning mutex is.
 use std::sync::{Arc, Mutex};
 
-use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{pg::PgConnection, prelude::*};
 use pg2sqlite::prelude::Pg2Sqlite;
 use postgres_harness::Outcome;
 
@@ -323,7 +323,7 @@ macro_rules! runner {
 }
 
 runner!(PgRunner, PgConnection {});
-runner!(SqliteRunner, SqliteConnection {
+runner!(SqliteRunner, crate::helpers::Replica {
     /// The caller `app_user()` answers.
     caller: Arc<Mutex<Option<String>>>,
 });
@@ -373,14 +373,15 @@ fn sqlite_runner() -> SqliteRunner {
         .expect("parse")
         .translate(&options())
         .unwrap_or_else(|error| panic!("pg2sqlite refused the document: {error}"));
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-    translated.register_functions(&mut connection).expect("register helper functions");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
+    translated.register_managed(&mut connection).expect("register helper functions");
     let translated = translated.into_vec();
     let caller = Arc::new(Mutex::new(None));
     let answered = Arc::clone(&caller);
-    app_user_utils::register_impl(&mut connection, move || {
-        answered.lock().expect("the caller lock").clone()
-    })
+    app_user_utils::register_impl(
+        connection.registration().expect("registration").sqlite(),
+        move || answered.lock().expect("the caller lock").clone(),
+    )
     .expect("register app_user");
     apply_with_seed(&mut connection, &translated, |connection| {
         seed!(connection, grants_rls, offers_rls);

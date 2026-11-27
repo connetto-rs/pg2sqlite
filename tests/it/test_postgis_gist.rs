@@ -5,7 +5,7 @@
 //! These tests cover the dispatch behavior only, no SQLite execution.
 //! The end-to-end Diesel variant lives in `test_postgis_gist_diesel.rs`.
 
-use diesel::connection::SimpleConnection;
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::{errors::Error, prelude::Pg2SqliteOptions};
 
 use crate::helpers;
@@ -83,9 +83,9 @@ fn gist_on_tsvector_still_routes_to_fts5_when_sqlitegis_enabled() {
     assert!(joined.contains("FTS5"), "expected FTS5 routing for to_tsvector, got:\n{joined}");
     // The FTS5 path is standard SQLite; execute_batch proves SQLite accepts the
     // output.
-    let conn = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+    let mut conn = crate::helpers::Replica::establish(":memory:").expect("in-memory SQLite");
     for s in &stmts {
-        conn.execute_batch(&format!("{s};"))
+        conn.batch_execute(&format!("{s};"))
             .unwrap_or_else(|e| panic!("SQLite rejected emitted SQL: {e}\n{s}"));
     }
 }

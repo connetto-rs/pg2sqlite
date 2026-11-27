@@ -40,17 +40,19 @@ impl UtcProvider for Script {
     }
 }
 
-/// The setup statements the translation of the UTC request `pg` emits, and
-/// the SQLite text of its last statement.
-fn translated(pg: &str) -> (Vec<String>, String) {
-    let mut statements = Pg2Sqlite::default()
+/// The translation of the UTC request `pg`.
+fn translated(pg: &str) -> pg2sqlite::script::Script<String> {
+    Pg2Sqlite::default()
         .sql(&utc_script(pg))
         .expect("parse")
         .translate_to_sql(&utc_request())
         .expect("translate")
-        .into_vec();
-    let probe = statements.pop().expect("the translated SELECT");
-    (statements, probe)
+}
+
+/// The SQLite text of the last statement the translation of the UTC request
+/// `pg` emits.
+fn translated_probe(pg: &str) -> String {
+    translated(pg).into_vec().pop().expect("the translated SELECT")
 }
 
 /// The text of every column of the one row the translation of the UTC
@@ -58,12 +60,15 @@ fn translated(pg: &str) -> (Vec<String>, String) {
 /// `instants` for it, after the translation's setup, each of whose
 /// statements starts a transaction at the Unix epoch.
 fn clock_row(pg: &str, instants: &[i64]) -> Vec<Option<String>> {
-    let (statements, probe) = translated(pg);
+    let script = translated(pg);
+    let mut statements = script.iter().cloned().collect::<Vec<_>>();
+    let probe = statements.pop().expect("the translated SELECT");
     let mut scripted = vec![0; statements.len()];
     scripted.extend_from_slice(instants);
     let provider = Script(Arc::new(Mutex::new(scripted)));
-    let mut connection =
-        ManagedConnection::establish(":memory:", provider.clone()).expect("open managed SQLite");
+    let mut connection = ManagedConnection::establish_with_provider(":memory:", provider.clone())
+        .expect("open managed SQLite");
+    script.register_managed(&mut connection).expect("register the script's functions");
     for statement in &statements {
         connection
             .execute(statement, &[])
@@ -83,8 +88,9 @@ fn clock_row(pg: &str, instants: &[i64]) -> Vec<Option<String>> {
 
 #[test]
 fn the_clock_readers_reverse_to_the_clocks_they_answer() {
-    let (_, probe) =
-        translated("SELECT now(), statement_timestamp(), clock_timestamp(), CURRENT_TIMESTAMP(3);");
+    let probe = translated_probe(
+        "SELECT now(), statement_timestamp(), clock_timestamp(), CURRENT_TIMESTAMP(3);",
+    );
     let schema = Pg2Sqlite::default().sql("").expect("parse").build_schema().expect("build");
     assert_eq!(
         crate::helpers::reverse_checked(&probe, &schema),
@@ -109,7 +115,7 @@ fn the_precision_forms_round_the_transaction_instant() {
             "2026-11-27 10:20:30.567890+00:00",
             "2026-11-27 10:20:30.5679",
             "10:20:30.6",
-            "10:20:30.568+00",
+            "10:20:30.568+00:00",
         ]
         .map(|text| Some(String::from(text)))
     );
@@ -118,10 +124,7 @@ fn the_precision_forms_round_the_transaction_instant() {
 #[test]
 fn a_local_time_rounding_past_midnight_reads_24_00() {
     let row = clock_row("SELECT LOCALTIME(0), LOCALTIMESTAMP(0);", &[BEFORE_MIDNIGHT]);
-    assert_eq!(
-        row,
-        ["24:00:00", "2026-11-28 00:00:00"].map(|text| Some(String::from(text)))
-    );
+    assert_eq!(row, ["24:00:00", "2026-11-28 00:00:00"].map(|text| Some(String::from(text))));
 }
 
 /// A provider answering one microsecond later at each sample.
@@ -169,9 +172,10 @@ fn a_managed_script_runs_its_transactions_and_drains_deferred_checks_at_commit()
     let script = Pg2Sqlite::default()
         .sql(FOLDERS)
         .expect("parse")
-        .translate(&Pg2SqliteOptions::default())
+        .translate(&crate::helpers::function_options())
         .expect("translate");
-    let mut connection = ManagedConnection::establish(":memory:", counting()).expect("open");
+    let mut connection =
+        ManagedConnection::establish_with_provider(":memory:", counting()).expect("open");
     script.initialize_managed(&mut connection, FreshFiles::Both).expect("initialize");
     assert_eq!(
         texts(&mut connection, "SELECT count(DISTINCT created_at) FROM resources"),
@@ -210,10 +214,12 @@ fn a_managed_connection_replays_its_committed_temp_rows() {
     let path = files.path().join("main.db");
     let path = path.to_str().expect("UTF-8 path");
     {
-        let mut creating = ManagedConnection::establish(path, counting()).expect("create");
+        let mut creating =
+            ManagedConnection::establish_with_provider(path, counting()).expect("create");
         script.initialize_managed(&mut creating, FreshFiles::Both).expect("initialize");
     }
-    let mut reopened = ManagedConnection::establish(path, counting()).expect("reopen");
+    let mut reopened =
+        ManagedConnection::establish_with_provider(path, counting()).expect("reopen");
     script.connect_managed(&mut reopened).expect("replay the connection objects");
     assert_eq!(texts(&mut reopened, "SELECT id FROM drafts"), [[Some(String::from("1"))]]);
 }

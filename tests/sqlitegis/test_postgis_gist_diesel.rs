@@ -8,7 +8,9 @@
 #![cfg(feature = "sqlitegis")]
 
 use diesel::{
-    QueryableByName, RunQueryDsl, SqliteConnection, sql_query,
+    QueryableByName, RunQueryDsl,
+    connection::SimpleConnection,
+    sql_query,
     sql_types::{Integer, Text},
 };
 use helpers::sqlitegis::sqlitegis_connection;
@@ -37,7 +39,7 @@ struct PlanRow {
 /// Runs `EXPLAIN QUERY PLAN <sql>` and returns the planner's `detail` column
 /// rows joined with newlines. Tests assert substrings (such as
 /// `"VIRTUAL TABLE INDEX"`) on the returned string.
-fn explain_plan_text(conn: &mut SqliteConnection, sql: &str) -> String {
+fn explain_plan_text(conn: &mut crate::helpers::Replica, sql: &str) -> String {
     let plan: Vec<PlanRow> = sql_query(format!("EXPLAIN QUERY PLAN {sql}"))
         .load(conn)
         .unwrap_or_else(|e| panic!("EXPLAIN QUERY PLAN for `{sql}`: {e:?}"));
@@ -47,7 +49,7 @@ fn explain_plan_text(conn: &mut SqliteConnection, sql: &str) -> String {
 /// Inserts a 100x100 grid of `ST_Point(i, j)` rows into `table`. The caller
 /// manages the transaction (with `BEGIN` / `COMMIT`) so paired tests can
 /// populate two tables atomically inside a single transaction.
-fn populate_grid_points(conn: &mut SqliteConnection, table: &str) {
+fn populate_grid_points(conn: &mut crate::helpers::Replica, table: &str) {
     for i in 0..100 {
         for j in 0..100 {
             let id = i * 100 + j;
@@ -139,9 +141,9 @@ fn gist_geometry_index_accelerates_spatial_queries() {
     // 3. Insert 10k points on a 100x100 grid. The AFTER INSERT triggers
     //    installed by SQLiteGIS's CreateSpatialIndex must populate the rtree
     //    transparently; pg2sqlite emits no extra sync SQL of its own.
-    sql_query("BEGIN").execute(&mut conn).expect("begin tx");
+    conn.batch_execute("BEGIN").expect("begin tx");
     populate_grid_points(&mut conn, "perf_grid");
-    sql_query("COMMIT").execute(&mut conn).expect("commit tx");
+    conn.batch_execute("COMMIT").expect("commit tx");
 
     let base_count: Vec<CountRow> =
         sql_query("SELECT count(*) AS n FROM perf_grid").load(&mut conn).expect("base count");
@@ -244,9 +246,9 @@ fn st_intersects_on_indexed_column_uses_rtree_via_translation() {
         sql_query(s).execute(&mut conn).expect("execute schema stmt");
     }
 
-    sql_query("BEGIN").execute(&mut conn).expect("begin tx");
+    conn.batch_execute("BEGIN").expect("begin tx");
     populate_grid_points(&mut conn, "perf_grid");
-    sql_query("COMMIT").execute(&mut conn).expect("commit");
+    conn.batch_execute("COMMIT").expect("commit");
 
     let select = user_select;
 
@@ -323,10 +325,10 @@ fn acceleration_is_conditional_on_index_presence() {
 
     // Populate both tables identically with the same 10k-point grid so the
     // ST_Intersects answers are guaranteed equal.
-    sql_query("BEGIN").execute(&mut conn).expect("begin tx");
+    conn.batch_execute("BEGIN").expect("begin tx");
     populate_grid_points(&mut conn, "indexed_grid");
     populate_grid_points(&mut conn, "unindexed_grid");
-    sql_query("COMMIT").execute(&mut conn).expect("commit");
+    conn.batch_execute("COMMIT").expect("commit");
 
     // Correctness: both queries return the same row count.
     let indexed_count: Vec<CountRow> =
@@ -408,10 +410,10 @@ fn update_acceleration_is_conditional_on_index_presence() {
         sql_query(s).execute(&mut conn).expect("execute schema stmt");
     }
 
-    sql_query("BEGIN").execute(&mut conn).expect("begin tx");
+    conn.batch_execute("BEGIN").expect("begin tx");
     populate_grid_points(&mut conn, "indexed_grid");
     populate_grid_points(&mut conn, "unindexed_grid");
-    sql_query("COMMIT").execute(&mut conn).expect("commit");
+    conn.batch_execute("COMMIT").expect("commit");
 
     // EXPLAIN QUERY PLAN before running, so we can observe the planner's
     // choice without depending on per-row execution semantics.
@@ -488,10 +490,10 @@ fn delete_acceleration_is_conditional_on_index_presence() {
         sql_query(s).execute(&mut conn).expect("execute schema stmt");
     }
 
-    sql_query("BEGIN").execute(&mut conn).expect("begin tx");
+    conn.batch_execute("BEGIN").expect("begin tx");
     populate_grid_points(&mut conn, "indexed_grid");
     populate_grid_points(&mut conn, "unindexed_grid");
-    sql_query("COMMIT").execute(&mut conn).expect("commit");
+    conn.batch_execute("COMMIT").expect("commit");
 
     let indexed_text = explain_plan_text(&mut conn, indexed_delete);
     let unindexed_text = explain_plan_text(&mut conn, unindexed_delete);

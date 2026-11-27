@@ -2,7 +2,7 @@
 
 #![allow(missing_docs)]
 
-use diesel::{Connection, RunQueryDsl, SqliteConnection};
+use diesel::{Connection, RunQueryDsl};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
 use crate::{helpers, support::fts5::DOCS_SQL};
@@ -86,7 +86,7 @@ fn test_fts5_backfill_insert_is_generated() -> Result<(), Box<dyn std::error::Er
 fn test_fts5_backfill_populates_preexisting_rows() -> Result<(), Box<dyn std::error::Error>> {
     let translated =
         Pg2Sqlite::default().sql(DOCS_SQL)?.translate(&Pg2SqliteOptions::default())?.into_vec();
-    let mut conn = SqliteConnection::establish(":memory:")?;
+    let mut conn = crate::helpers::Replica::establish(":memory:")?;
 
     // Create the table FIRST, insert rows BEFORE creating the FTS index, then
     // run the remaining translated statements (FTS virtual table, triggers,

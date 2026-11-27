@@ -81,7 +81,7 @@ struct BackingRow {
 /// backing table between the phases so the typed insert runs before trigger
 /// enforcement is active. Diesel does not expose sqlite3_db_config, so phase
 /// ordering replaces the toggle.
-fn setup(pg: &str) -> Result<SqliteConnection, Box<dyn std::error::Error>> {
+fn setup(pg: &str) -> Result<crate::helpers::Replica, Box<dyn std::error::Error>> {
     let options = Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit");
     setup_with_options(pg, &options)
 }
@@ -89,9 +89,9 @@ fn setup(pg: &str) -> Result<SqliteConnection, Box<dyn std::error::Error>> {
 fn setup_with_options(
     pg: &str,
     options: &Pg2SqliteOptions,
-) -> Result<SqliteConnection, Box<dyn std::error::Error>> {
+) -> Result<crate::helpers::Replica, Box<dyn std::error::Error>> {
     let translated = Pg2Sqlite::default().sql(pg)?.translate(options)?.into_vec();
-    let mut conn = SqliteConnection::establish(":memory:")?;
+    let mut conn = crate::helpers::Replica::establish(":memory:")?;
     // Phase 1: tables and views (no triggers yet).
     // Phase 2 (inside): seed via diesel typed insert before triggers exist.
     // Phase 3: triggers (guard is active for subsequent writes).
@@ -108,17 +108,17 @@ fn setup_with_options(
     Ok(conn)
 }
 
-fn seed(conn: &mut SqliteConnection) -> diesel::QueryResult<usize> {
+fn seed(conn: &mut crate::helpers::Replica) -> diesel::QueryResult<usize> {
     diesel::insert_into(docs_rls::table)
         .values(vec![BackingRow { id: 1, owner_id: 7 }, BackingRow { id: 2, owner_id: 9 }])
         .execute(conn)
 }
 
-fn view_count(conn: &mut SqliteConnection) -> Result<i64, Box<dyn std::error::Error>> {
+fn view_count(conn: &mut crate::helpers::Replica) -> Result<i64, Box<dyn std::error::Error>> {
     Ok(docs::table.count().get_result(conn)?)
 }
 
-fn backing_count(conn: &mut SqliteConnection) -> Result<i64, Box<dyn std::error::Error>> {
+fn backing_count(conn: &mut crate::helpers::Replica) -> Result<i64, Box<dyn std::error::Error>> {
     Ok(docs_rls::table.count().get_result(conn)?)
 }
 

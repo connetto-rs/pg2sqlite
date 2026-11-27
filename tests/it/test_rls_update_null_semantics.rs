@@ -14,6 +14,8 @@
 use diesel::prelude::*;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
+use crate::helpers::Replica;
+
 mod schema {
     diesel::table! {
         /// RLS view over `docs_rls`. Writes route through INSTEAD OF triggers.
@@ -74,11 +76,11 @@ const PG: &str = "
 /// Translates `PG` and applies the result. The emitted DDL is the artifact
 /// under test, so it is applied as generated text. Every subsequent statement
 /// uses the typed DSL against the schemas above.
-fn setup() -> Result<SqliteConnection, Box<dyn std::error::Error>> {
+fn setup() -> Result<Replica, Box<dyn std::error::Error>> {
     let options = Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit");
     let translated = Pg2Sqlite::default().sql(PG)?.translate(&options)?.into_vec();
 
-    let mut conn = SqliteConnection::establish(":memory:")?;
+    let mut conn = Replica::establish(":memory:")?;
     for statement in &translated {
         diesel::sql_query(statement.to_string()).execute(&mut conn)?;
     }
@@ -95,7 +97,7 @@ fn setup() -> Result<SqliteConnection, Box<dyn std::error::Error>> {
     Ok(conn)
 }
 
-fn stored(conn: &mut SqliteConnection) -> Result<StoredDoc, Box<dyn std::error::Error>> {
+fn stored(conn: &mut Replica) -> Result<StoredDoc, Box<dyn std::error::Error>> {
     Ok(docs_rls::table.filter(docs_rls::id.eq(1)).select(StoredDoc::as_select()).first(conn)?)
 }
 

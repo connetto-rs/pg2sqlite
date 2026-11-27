@@ -5,7 +5,7 @@
 //! `UPDATE` triggers for an `INSERT`, and answers to the row-security
 //! policies PostgreSQL holds the row the trigger returns to.
 
-use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{pg::PgConnection, prelude::*};
 use helpers::establish_connection;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use postgres_harness::Outcome;
@@ -131,9 +131,9 @@ fn act_as_app_on_postgres(connection: &mut PgConnection) -> Outcome {
 }
 
 run_step!(run_postgres, PgConnection, act_as_app_on_postgres);
-run_step!(run_sqlite, SqliteConnection, |_: &mut SqliteConnection| Outcome::Accepted);
+run_step!(run_sqlite, crate::helpers::Replica, |_: &mut crate::helpers::Replica| Outcome::Accepted);
 
-fn execute_ddl(connection: &mut SqliteConnection, statements: &[String]) {
+fn execute_ddl(connection: &mut crate::helpers::Replica, statements: &[String]) {
     for statement in statements {
         // Translated DDL has no typed form.
         diesel::sql_query(statement.as_str())
@@ -144,7 +144,7 @@ fn execute_ddl(connection: &mut SqliteConnection, statements: &[String]) {
 
 /// Both engines with `batches` applied in order, the replica translating each
 /// batch against the schema the batches before it build.
-fn engines(batches: &[&str]) -> (PgConnection, SqliteConnection) {
+fn engines(batches: &[&str]) -> (PgConnection, crate::helpers::Replica) {
     let mut postgres = postgres_harness::fresh_database();
     let mut sqlite = establish_connection();
     let options = Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit");

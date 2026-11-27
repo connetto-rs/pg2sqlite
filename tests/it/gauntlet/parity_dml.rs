@@ -22,9 +22,7 @@
 
 #![allow(clippy::too_many_lines)]
 
-use diesel::{
-    connection::SimpleConnection, pg::PgConnection, prelude::*, sqlite::SqliteConnection,
-};
+use diesel::{connection::SimpleConnection, pg::PgConnection, prelude::*};
 use helpers::establish_connection;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use postgres_harness::Outcome;
@@ -93,7 +91,7 @@ fn pg_setup() -> PgConnection {
     conn
 }
 
-fn sq_setup() -> SqliteConnection {
+fn sq_setup() -> crate::helpers::Replica {
     let mut conn = establish_connection();
     for stmt in sqlite_ddl() {
         diesel::sql_query(stmt).execute(&mut conn).expect("DDL accepted by SQLite");
@@ -105,7 +103,7 @@ fn sq_setup() -> SqliteConnection {
 ///
 /// Raw sql_query is the only option here because the translated statements
 /// exist only at runtime (the translator produces them from the PG source).
-fn run_on_sqlite(conn: &mut SqliteConnection, pg_dml: &str) -> Outcome {
+fn run_on_sqlite(conn: &mut crate::helpers::Replica, pg_dml: &str) -> Outcome {
     for stmt in sqlite_dml(pg_dml) {
         let r: QueryResult<usize> = diesel::sql_query(stmt.as_str()).execute(conn);
         if r.is_err() {
@@ -120,7 +118,7 @@ struct PgRunner {
 }
 
 struct SqRunner {
-    conn: SqliteConnection,
+    conn: crate::helpers::Replica,
 }
 
 /// Generates the diesel typed DML steps that compile identically for both

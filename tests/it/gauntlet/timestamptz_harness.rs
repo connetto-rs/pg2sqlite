@@ -5,7 +5,6 @@ use diesel::{
     pg::PgConnection,
     prelude::*,
     sql_types::{Nullable, Text},
-    sqlite::SqliteConnection,
 };
 use pg2sqlite::prelude::{Error, Pg2Sqlite, Pg2SqliteOptions, TemporalFunctions};
 use sql_traits::structs::Deployment;
@@ -89,15 +88,19 @@ impl Events {
 
     /// The replica's schema under `roles` and `options`, holding the one row,
     /// on a connection with the temporal functions registered.
-    pub(super) fn replica(&self, roles: &str, options: &Pg2SqliteOptions) -> SqliteConnection {
+    pub(super) fn replica(
+        &self,
+        roles: &str,
+        options: &Pg2SqliteOptions,
+    ) -> crate::helpers::Replica {
         let statements = Pg2Sqlite::default()
             .sql(&format!("{roles}{TABLE}{GRANT}"))
             .and_then(|source| source.translate(options))
             .unwrap_or_else(|error| panic!("pg2sqlite refused the schema: {error}"))
             .into_vec();
-        let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
+        let mut connection = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
         TemporalFunctions::default()
-            .register(&mut connection)
+            .register(connection.registration().expect("registration").sqlite())
             .expect("register the temporal functions");
         apply_with_seed(&mut connection, &statements, |connection| {
             use schema::events;
@@ -346,7 +349,7 @@ pub(super) fn translate(
 }
 
 /// What `connection` answers for the one-value `query`.
-pub(super) fn sqlite_query(connection: &mut SqliteConnection, query: &str) -> String {
+pub(super) fn sqlite_query(connection: &mut crate::helpers::Replica, query: &str) -> String {
     // The query under test is runtime text no typed DSL carries.
     diesel::sql_query(query)
         .get_result::<TextRow>(connection)

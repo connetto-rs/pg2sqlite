@@ -14,7 +14,6 @@ use diesel::{
     pg::PgConnection,
     prelude::*,
     sql_types::{Nullable, Text},
-    sqlite::SqliteConnection,
 };
 use pg2sqlite::prelude::{ArrayRepresentation, Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation};
 
@@ -229,7 +228,7 @@ fn sqlite_rows() -> Vec<AuditRow> {
         .translate_to_sql(&options())
         .expect("translate the script")
         .into_vec();
-    let mut connection: SqliteConnection = establish_connection();
+    let mut connection: crate::helpers::Replica = establish_connection();
     for statement in &statements {
         diesel::sql_query(statement.as_str())
             .execute(&mut connection)

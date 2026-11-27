@@ -93,14 +93,18 @@ CREATE POLICY documents_insert_policy ON documents
 INSERT INTO documents (id, owner_id, title) VALUES (1, 42, 'First'), (2, 42, 'Second');
 ";
 
-fn open_with_session_user() -> SqliteConnection {
-    let mut conn = SqliteConnection::establish(":memory:").expect("connect");
-    current_app_user_utils::register_impl(&mut conn, || 42i64).expect("register current_app_user");
+fn open_with_session_user() -> crate::helpers::Replica {
+    let mut conn = crate::helpers::Replica::establish(":memory:").expect("connect");
+    current_app_user_utils::register_impl(
+        conn.registration().expect("registration").sqlite(),
+        || 42i64,
+    )
+    .expect("register current_app_user");
     conn
 }
 
 /// Applies the emitted script, which is DDL the typed DSL cannot express.
-fn apply(schema: &str, opts: &Pg2SqliteOptions) -> SqliteConnection {
+fn apply(schema: &str, opts: &Pg2SqliteOptions) -> crate::helpers::Replica {
     let mut conn = open_with_session_user();
     conn.batch_execute(&translate(schema, opts)).expect("apply schema");
     conn
@@ -283,7 +287,11 @@ fn select_only_table_blocks_inserts_and_silently_ignores_other_writes() {
     // Seed via backing table simulating system-level data loading that runs
     // with triggers disabled (authoritative-apply pattern). The BEFORE INSERT
     // guard on a zero-policy table is unconditional; disable it for the seed.
-    conn.set_triggers_enabled(false).expect("disable triggers for seed");
+    conn.registration()
+        .expect("registration")
+        .sqlite()
+        .set_triggers_enabled(false)
+        .expect("disable triggers for seed");
     diesel::insert_into(documents_rls::table)
         .values((
             documents_rls::id.eq(1),
@@ -292,7 +300,11 @@ fn select_only_table_blocks_inserts_and_silently_ignores_other_writes() {
         ))
         .execute(&mut conn)
         .expect("seed via backing table");
-    conn.set_triggers_enabled(true).expect("re-enable triggers");
+    conn.registration()
+        .expect("registration")
+        .sqlite()
+        .set_triggers_enabled(true)
+        .expect("re-enable triggers");
 
     let insert_err = diesel::insert_into(documents::table)
         .values((documents::id.eq(2), documents::owner_id.eq(42), documents::title.eq("t")))

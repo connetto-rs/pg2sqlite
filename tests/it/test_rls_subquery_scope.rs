@@ -161,7 +161,7 @@ fn opts_with_username() -> Pg2SqliteOptions {
 }
 
 /// The `members` rows, `alice` on the blue team and `bob` on the red team.
-fn seed_members(conn: &mut SqliteConnection) {
+fn seed_members(conn: &mut crate::helpers::Replica) {
     diesel::insert_into(members::table)
         .values(&[
             (members::owner.eq("alice"), members::team.eq("blue")),
@@ -173,7 +173,7 @@ fn seed_members(conn: &mut SqliteConnection) {
 
 /// Inserts an `id`/`owner` row into the `t` view.
 fn insert_t(
-    conn: &mut SqliteConnection,
+    conn: &mut crate::helpers::Replica,
     id: i32,
     owner: &str,
 ) -> diesel::result::QueryResult<usize> {

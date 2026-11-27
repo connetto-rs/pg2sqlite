@@ -755,8 +755,11 @@ fn unknown_argument_free_function_is_read_by_a_timestamp_cast() {
         fn probe_stamp() -> diesel::sql_types::Text;
     }
     let mut connection = crate::helpers::establish_connection();
-    probe_stamp_utils::register_impl(&mut connection, || "2024-03-05 03:04:05.500".to_string())
-        .expect("register the probe function");
+    probe_stamp_utils::register_impl(
+        connection.registration().expect("registration").sqlite(),
+        || "2024-03-05 03:04:05.500".to_string(),
+    )
+    .expect("register the probe function");
     let expression = probe.strip_prefix("SELECT ").expect("a select expression");
     let value: String = diesel::select(diesel::dsl::sql::<diesel::sql_types::Text>(expression))
         .get_result(&mut connection)

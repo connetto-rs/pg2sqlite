@@ -170,8 +170,11 @@ fn sweep(
         let translated = helpers::translate_script(&script(count), &options())
             .unwrap_or_else(|error| panic!("{count} fails to translate: {error}"));
         let mut connection = loaded(None, &translated);
-        let unprepared =
-            unprepared_programs(&mut connection, &translated.functions).expect("the schema reads");
+        let unprepared = unprepared_programs(
+            connection.registration().expect("registration").sqlite(),
+            &translated.functions,
+        )
+        .expect("the schema reads");
         let listed = unprepared.iter().any(|unprepared| lists(unprepared, program));
         // The statement a client sends, written as text the way a client sends
         // it.
@@ -198,12 +201,11 @@ fn sweep(
 
 /// A connection registering the helper functions of `translated` and
 /// holding `held` then `translated`.
-fn loaded(held: Option<&Script<String>>, translated: &Script<String>) -> diesel::SqliteConnection {
+fn loaded(held: Option<&Script<String>>, translated: &Script<String>) -> crate::helpers::Replica {
     let mut connection = helpers::establish_connection();
-    translated.register_functions(&mut connection).expect("register helper functions");
     for script in held.into_iter().chain([translated]) {
-        connection
-            .batch_execute(&script.iter().map(String::as_str).collect::<Vec<_>>().join(";\n"))
+        script
+            .initialize_managed(&mut connection, pg2sqlite::prelude::FreshFiles::Both)
             .expect("the script loads");
     }
     connection
@@ -284,7 +286,11 @@ CREATE TRIGGER deep_updated INSTEAD OF UPDATE ON deep BEGIN SELECT 1; END;
             doubling_views(10)
         ))
         .expect("the script loads");
-    let unprepared = unprepared_programs::<String>(&mut connection, &[]).expect("the schema reads");
+    let unprepared = unprepared_programs::<String>(
+        connection.registration().expect("registration").sqlite(),
+        &[],
+    )
+    .expect("the schema reads");
     let mut listed: Vec<(&str, Vec<&str>)> = unprepared
         .iter()
         .map(|unprepared| {
@@ -330,8 +336,11 @@ fn a_called_helper_chain_prepares_however_deep_or_often_called() {
         let script = helpers::translate_script(&sql, &options())
             .unwrap_or_else(|error| panic!("the chain translates: {error}"));
         let mut connection = loaded(None, &script);
-        let unprepared =
-            unprepared_programs(&mut connection, &script.functions).expect("the schema reads");
+        let unprepared = unprepared_programs(
+            connection.registration().expect("registration").sqlite(),
+            &script.functions,
+        )
+        .expect("the schema reads");
         assert!(unprepared.is_empty(), "SQLite refuses a program: {unprepared:?}");
         diesel::sql_query("UPDATE items SET value = 1")
             .execute(&mut connection)
@@ -469,8 +478,11 @@ INSERT INTO sqlite_schema VALUES ('trigger', 'written', 't', 0, 'create trigger 
 PRAGMA writable_schema = RESET;",
         )
         .expect("the schema is written");
-    let error =
-        unprepared_programs::<String>(&mut connection, &[]).expect_err("the trigger is not read");
+    let error = unprepared_programs::<String>(
+        connection.registration().expect("registration").sqlite(),
+        &[],
+    )
+    .expect_err("the trigger is not read");
     assert!(
         matches!(&error, ProgramsError::UnreadTrigger { schema, name } if schema == "main" && name == "written"),
         "{error:?}"
@@ -491,8 +503,9 @@ fn a_helper_function_whose_body_sqlite_refuses_is_listed_by_name() {
     };
     let functions = [function("kept", "t"), function("broken", "gone")];
     let mut connection = helpers::establish_connection();
+    let mut registration = connection.registration().expect("registration");
     for function in &functions {
-        function.register(&mut connection).expect("register the helper function");
+        function.register(registration.sqlite()).expect("register the helper function");
     }
     connection
         .batch_execute(
@@ -503,7 +516,9 @@ CREATE VIEW reads_broken AS SELECT x FROM broken(1);
 DROP TABLE gone;",
         )
         .expect("the schema loads");
-    let unprepared = unprepared_programs(&mut connection, &functions).expect("the schema reads");
+    let unprepared =
+        unprepared_programs(connection.registration().expect("registration").sqlite(), &functions)
+            .expect("the schema reads");
     let listed: Vec<(&str, &[String])> = unprepared
         .iter()
         .map(|unprepared| (unprepared.statement.as_str(), unprepared.programs.as_slice()))
@@ -592,7 +607,7 @@ fn a_helper_reading_another_twice_keeps_the_rows_postgresql_keeps() {
         .unwrap_or_else(|error| panic!("the chain translates: {error}"));
     let blob = |byte: u8| format!("X'{}'", format!("{byte:02x}").repeat(16));
     let mut connection = helpers::establish_connection();
-    script.register_functions(&mut connection).expect("register helper functions");
+    script.register_managed(&mut connection).expect("register helper functions");
     for statement in script.iter() {
         diesel::sql_query(statement)
             .execute(&mut connection)

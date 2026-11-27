@@ -39,7 +39,8 @@ fn ctas_function_output_preserves_values_and_nulls() {
     let translator =
         Pg2Sqlite::default().sql("CREATE TABLE source(id INT PRIMARY KEY, value TEXT);").unwrap();
     let schema = translator.build_schema().unwrap();
-    let mut connection = SqliteConnection::establish(":memory:").unwrap();
+    use crate::helpers::Replica;
+    let mut connection = Replica::establish(":memory:").unwrap();
     for sql in translator.translate_to_sql(&options).unwrap().into_vec() {
         connection.batch_execute(&sql).unwrap();
     }
@@ -73,7 +74,8 @@ fn ctas_materializes_selected_rows() {
         .sql("CREATE TABLE users(id INT PRIMARY KEY, name TEXT NOT NULL, active BOOLEAN NOT NULL);")
         .unwrap();
     let schema = translator.build_schema().unwrap();
-    let mut connection = SqliteConnection::establish(":memory:").unwrap();
+    use crate::helpers::Replica;
+    let mut connection = Replica::establish(":memory:").unwrap();
     for sql in translator.translate_to_sql(&options).unwrap().into_vec() {
         connection.batch_execute(&sql).unwrap();
     }

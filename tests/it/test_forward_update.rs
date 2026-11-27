@@ -1,9 +1,9 @@
 //! Tests for forward UPDATE translation in
 //! `src/impls/translator_impls/update.rs`.
 
+use diesel::{Connection, connection::SimpleConnection};
 use helpers::execute_joined_statements as execute_all;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use rusqlite::Connection;
 use sqlparser::{
     ast::{
         BinaryOperator, Expr, Ident, Join, JoinConstraint, JoinOperator, ObjectName,
@@ -142,24 +142,23 @@ fn forward_update_limit_translates_expressions() {
     let output = stmts.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
 
     assert!(
-        output.contains("LIMIT")
-            && output.contains("pg2sqlite_transaction_timestamp()"),
+        output.contains("LIMIT") && output.contains("pg2sqlite_transaction_timestamp()"),
         "Expected translated LIMIT expression in UPDATE: {output}"
     );
 
     // Execute DDL statements. The UPDATE uses LIMIT which requires
     // SQLITE_ENABLE_UPDATE_DELETE_LIMIT at compile time, so only the DDL
     // (non-Update) statements are run here to prove SQLite accepts the schema.
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     for s in stmts.iter().filter(|s| !matches!(s, Statement::Update(_))) {
-        conn.execute_batch(&format!("{s};")).unwrap();
+        conn.batch_execute(&format!("{s};")).unwrap();
     }
 }
 
 /// Target aliases preserve stored and returned values, with the translated SQL
 /// run raw as the output under test.
 mod update_alias {
-    use diesel::{prelude::*, sqlite::SqliteConnection};
+    use diesel::prelude::*;
     use pg2sqlite::prelude::Pg2SqliteOptions;
     use sqlparser::ast::Statement;
 
@@ -187,7 +186,7 @@ mod update_alias {
         a: i32,
     }
 
-    fn prepared_update(pg: &str) -> (SqliteConnection, String) {
+    fn prepared_update(pg: &str) -> (crate::helpers::Replica, String) {
         let statements = helpers::translate_statements(pg, &Pg2SqliteOptions::default())
             .expect("translation should succeed");
         let mut conn = helpers::establish_connection();
@@ -206,7 +205,7 @@ mod update_alias {
         (conn, update.expect("an UPDATE must be emitted"))
     }
 
-    fn insert_t(conn: &mut SqliteConnection) {
+    fn insert_t(conn: &mut crate::helpers::Replica) {
         diesel::insert_into(t::table)
             .values([
                 (t::id.eq(1), t::a.eq(10), t::b.eq(100)),
@@ -217,7 +216,7 @@ mod update_alias {
             .expect("fixture rows must insert");
     }
 
-    fn read_t(conn: &mut SqliteConnection) -> Vec<(i32, i32, i32)> {
+    fn read_t(conn: &mut crate::helpers::Replica) -> Vec<(i32, i32, i32)> {
         t::table
             .select((t::id, t::a, t::b))
             .order(t::id.asc())

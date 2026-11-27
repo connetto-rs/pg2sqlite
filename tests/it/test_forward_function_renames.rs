@@ -2,6 +2,7 @@
 //!
 //! Simple PG → SQLite function name renames.
 
+use diesel::{Connection, connection::SimpleConnection};
 use helpers::translate_sql;
 use pg2sqlite::prelude::Pg2SqliteOptions;
 
@@ -125,9 +126,9 @@ fn reverse_json_array_length_passes_through_for_non_jsonb_arguments() {
 
 /// Execute the renamed SQLite output against an in-memory connection.
 fn sqlite_accepts(sql: &str) {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     for stmt in sql.split('\n').filter(|s| !s.trim().is_empty()) {
-        conn.execute_batch(&format!("{stmt};"))
+        conn.batch_execute(&format!("{stmt};"))
             .unwrap_or_else(|e| panic!("SQLite rejected renamed output: {e}\n{stmt}"));
     }
 }
@@ -150,8 +151,13 @@ fn ascii_of_the_empty_string_is_zero() {
         stmts.into_iter().find(|s| !s.starts_with("PRAGMA")).expect("expected a SELECT statement");
     // The SQL under test is translator output, a runtime string, so the raw
     // query interface is the correct one.
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    let value: Option<i64> = conn.query_row(&result, [], |row| row.get(0)).unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
+    let rows = helpers::query_values(&mut conn, &result, &[]).unwrap();
+    let value = match rows[0][0] {
+        helpers::SqliteAnyValue::Null => None,
+        helpers::SqliteAnyValue::Integer(value) => Some(value),
+        ref value => panic!("expected a nullable integer, got {value:?}"),
+    };
     assert_eq!(
         value,
         Some(0),
@@ -164,7 +170,7 @@ fn ascii_of_the_empty_string_is_zero() {
 /// first code point, `ascii('ab')` being 97 on both engines.
 #[test]
 fn ascii_keeps_null_and_first_character_semantics() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     for (pg_sql, expected) in [
         ("SELECT ascii(NULL)", None),
         ("SELECT ascii('a')", Some(97)),
@@ -176,7 +182,12 @@ fn ascii_keeps_null_and_first_character_semantics() {
             .into_iter()
             .find(|s| !s.starts_with("PRAGMA"))
             .expect("expected a SELECT statement");
-        let value: Option<i64> = conn.query_row(&result, [], |row| row.get(0)).unwrap();
+        let rows = helpers::query_values(&mut conn, &result, &[]).unwrap();
+        let value = match rows[0][0] {
+            helpers::SqliteAnyValue::Null => None,
+            helpers::SqliteAnyValue::Integer(value) => Some(value),
+            ref value => panic!("expected a nullable integer, got {value:?}"),
+        };
         assert_eq!(value, expected, "{pg_sql} translated to: {result}");
     }
 }

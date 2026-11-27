@@ -57,7 +57,7 @@ fn translate(pg: &str, options: &Pg2SqliteOptions) -> Result<Vec<String>, Error>
         .map(pg2sqlite::script::Script::into_vec)
 }
 
-fn rows(connection: &mut SqliteConnection) -> Vec<(Option<i32>, Option<String>)> {
+fn rows(connection: &mut crate::helpers::Replica) -> Vec<(Option<i32>, Option<String>)> {
     schema::t::table
         .select((schema::t::a, schema::t::b))
         .order(schema::t::rowid)
@@ -173,9 +173,12 @@ fn a_secured_table_receives_its_rows_in_the_backing_table() {
          ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
          CREATE POLICY notes_read ON notes FOR SELECT USING (false);
          COPY notes (id, owner) FROM stdin;\n1\talice\n\\.\n";
-    let mut connection = SqliteConnection::establish(":memory:").expect("connect");
-    write_is_exempt_utils::register_impl(&mut connection, || true)
-        .expect("register the RLS exemption");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("connect");
+    write_is_exempt_utils::register_impl(
+        connection.registration().expect("registration").sqlite(),
+        || true,
+    )
+    .expect("register the RLS exemption");
     let options = Pg2SqliteOptions::default()
         .with_rls_audit_table_name("_rls_audit")
         .with_rls_exemption_function("write_is_exempt");

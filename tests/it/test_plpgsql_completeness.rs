@@ -146,5 +146,5 @@ fn test_plpgsql_derived_subquery_full_transform() {
 /// SQLite. This proves the emitted CREATE TABLE and CREATE TRIGGER statements
 /// are valid.
 fn execute_plpgsql_ddl(pg: &str, options: &Pg2SqliteOptions) {
-    helpers::apply_rusqlite_statements(&helpers::translate_pg(pg, options).unwrap());
+    helpers::apply_statements(&helpers::translate_pg(pg, options).unwrap());
 }

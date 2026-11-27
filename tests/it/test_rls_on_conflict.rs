@@ -78,7 +78,7 @@ fn default_opts() -> Pg2SqliteOptions {
 }
 
 /// The pre-existing `alice` row that the upserts collide with.
-fn seed_row(conn: &mut SqliteConnection) {
+fn seed_row(conn: &mut crate::helpers::Replica) {
     diesel::insert_into(items_rls::table)
         .values((items_rls::id.eq(1), items_rls::owner.eq("alice"), items_rls::val.eq(10)))
         .execute(conn)
@@ -90,7 +90,7 @@ fn seed_row(conn: &mut SqliteConnection) {
 /// The emitted upsert SQL is the artifact under test; diesel's typed DSL
 /// bypasses the translator and cannot verify what pg2sqlite generates.
 fn run_dml(
-    conn: &mut SqliteConnection,
+    conn: &mut crate::helpers::Replica,
     pg_dml: &str,
     schema: &str,
     opts: &Pg2SqliteOptions,

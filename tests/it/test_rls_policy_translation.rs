@@ -9,6 +9,7 @@
 //! shape SQLite misreads. Every test here seeds the backing table, reads
 //! through the policy view, and asserts which rows the policy admits.
 
+use diesel::connection::SimpleConnection;
 use pg2sqlite::prelude::Pg2SqliteOptions;
 
 use crate::helpers;
@@ -20,22 +21,32 @@ fn options() -> Pg2SqliteOptions {
 /// Seeds the backing table with triggers disabled, mirroring the
 /// authoritative-apply contract (system loads run with triggers off so the
 /// BEFORE INSERT guard does not block them).
-fn seed(conn: &rusqlite::Connection, sql: &str) {
-    conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false)
+fn seed(conn: &mut helpers::Replica, sql: &str) {
+    conn.registration()
+        .expect("registration")
+        .sqlite()
+        .set_triggers_enabled(false)
         .expect("disable triggers for seed");
-    conn.execute_batch(sql).expect("seed backing table");
-    conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, true)
+    conn.batch_execute(sql).expect("seed backing table");
+    conn.registration()
+        .expect("registration")
+        .sqlite()
+        .set_triggers_enabled(true)
         .expect("re-enable triggers");
 }
 
 /// Reads the ids the policy view admits, in order.
-fn visible_ids(conn: &rusqlite::Connection, view: &str) -> Vec<i64> {
-    conn.prepare(&format!("SELECT id FROM {view} ORDER BY id"))
+fn visible_ids(conn: &mut helpers::Replica, view: &str) -> Vec<i64> {
+    helpers::query_values(conn, &format!("SELECT id FROM {view} ORDER BY id"), &[])
         .expect("the policy view must be readable")
-        .query_map([], |row| row.get(0))
-        .expect("query view")
-        .collect::<Result<_, _>>()
-        .expect("read rows")
+        .into_iter()
+        .map(|row| {
+            match row[0] {
+                helpers::SqliteAnyValue::Integer(value) => value,
+                ref value => panic!("expected integer, got {value:?}"),
+            }
+        })
+        .collect()
 }
 
 fn temporal_policy_ids(statements: &[String], seed: &str, view: &str) -> Vec<i64> {
@@ -56,7 +67,7 @@ fn temporal_policy_ids(statements: &[String], seed: &str, view: &str) -> Vec<i64
 
 #[test]
 fn an_ilike_policy_translates_and_filters() {
-    let conn = helpers::apply_rusqlite_statements(
+    let mut conn = helpers::apply_statements(
         &helpers::translate_pg(
             "CREATE TABLE docs (id INT PRIMARY KEY, s TEXT);
          ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
@@ -65,9 +76,12 @@ fn an_ilike_policy_translates_and_filters() {
         )
         .expect("translate"),
     );
-    seed(&conn, "INSERT INTO docs_rls (id, s) VALUES (1, 'Apple'), (2, 'banana'), (3, 'avocado');");
+    seed(
+        &mut conn,
+        "INSERT INTO docs_rls (id, s) VALUES (1, 'Apple'), (2, 'banana'), (3, 'avocado');",
+    );
     assert_eq!(
-        visible_ids(&conn, "docs"),
+        visible_ids(&mut conn, "docs"),
         vec![1, 3],
         "ILIKE is case insensitive, so Apple and avocado pass and banana does not"
     );
@@ -116,7 +130,7 @@ fn a_date_trunc_policy_translates_and_filters() {
 
 #[test]
 fn a_position_policy_translates_and_filters() {
-    let conn = helpers::apply_rusqlite_statements(
+    let mut conn = helpers::apply_statements(
         &helpers::translate_pg(
             "CREATE TABLE tags (id INT PRIMARY KEY, s TEXT);
          ALTER TABLE tags ENABLE ROW LEVEL SECURITY;
@@ -125,13 +139,13 @@ fn a_position_policy_translates_and_filters() {
         )
         .expect("translate"),
     );
-    seed(&conn, "INSERT INTO tags_rls (id, s) VALUES (1, 'xy'), (2, 'ab');");
-    assert_eq!(visible_ids(&conn, "tags"), vec![1], "position() must become instr()");
+    seed(&mut conn, "INSERT INTO tags_rls (id, s) VALUES (1, 'xy'), (2, 'ab');");
+    assert_eq!(visible_ids(&mut conn, "tags"), vec![1], "position() must become instr()");
 }
 
 #[test]
 fn a_with_check_policy_translates_into_the_write_guard() {
-    let conn = helpers::apply_rusqlite_statements(
+    let mut conn = helpers::apply_statements(
         &helpers::translate_pg(
             "CREATE TABLE names (id INT PRIMARY KEY, s TEXT);
          ALTER TABLE names ENABLE ROW LEVEL SECURITY;
@@ -141,14 +155,14 @@ fn a_with_check_policy_translates_into_the_write_guard() {
         )
         .expect("translate"),
     );
-    conn.execute_batch("INSERT INTO names (id, s) VALUES (1, 'Ann');")
+    conn.batch_execute("INSERT INTO names (id, s) VALUES (1, 'Ann');")
         .expect("a row passing the translated CHECK inserts through the view");
     let err = conn
-        .execute_batch("INSERT INTO names (id, s) VALUES (2, 'bob');")
+        .batch_execute("INSERT INTO names (id, s) VALUES (2, 'bob');")
         .expect_err("a row failing the CHECK must be aborted by the guard");
     assert!(
         err.to_string().contains("row-level security"),
         "the guard names the policy violation: {err}"
     );
-    assert_eq!(visible_ids(&conn, "names"), vec![1]);
+    assert_eq!(visible_ids(&mut conn, "names"), vec![1]);
 }

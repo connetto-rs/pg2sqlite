@@ -8,7 +8,7 @@
 //!    reverse, and parse the result with the PostgreSQL dialect to prove
 //!    syntactic validity
 
-use diesel::{ExpressionMethods, RunQueryDsl, SqliteConnection};
+use diesel::{ExpressionMethods, RunQueryDsl};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
 
@@ -278,7 +278,7 @@ struct LatestReading {
 
 /// Forward translates [`READINGS`] plus `pg_query` and returns the emitted
 /// SELECT alongside a SQLite database holding the emitted schema and a seed.
-fn forward_and_seed(pg_query: &str) -> (String, SqliteConnection) {
+fn forward_and_seed(pg_query: &str) -> (String, crate::helpers::Replica) {
     let sql = format!("{READINGS}\n{pg_query}");
     let (statements, select) = helpers::translate::translate_ascii_statements_and_first_query(&sql);
     let mut connection = helpers::apply_ddl(&statements);
@@ -318,7 +318,7 @@ fn forward_and_seed(pg_query: &str) -> (String, SqliteConnection) {
 
 /// Runs `select`, which is translator output rather than a query this suite
 /// composes, so it goes to SQLite as text.
-fn run_select<R>(select: &str, connection: &mut SqliteConnection) -> Vec<R>
+fn run_select<R>(select: &str, connection: &mut crate::helpers::Replica) -> Vec<R>
 where
     R: diesel::deserialize::QueryableByName<diesel::sqlite::Sqlite> + 'static,
 {

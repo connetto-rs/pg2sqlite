@@ -34,11 +34,10 @@ struct Distance {
 /// statement.
 fn run_emitted<T>(
     statements: &pg2sqlite::script::Script<sqlparser::ast::Statement>,
-    connection: &mut diesel::sqlite::SqliteConnection,
+    connection: &mut helpers::Replica,
 ) -> Vec<T>
 where
-    diesel::query_builder::SqlQuery:
-        diesel::query_dsl::LoadQuery<'static, diesel::sqlite::SqliteConnection, T>,
+    diesel::query_builder::SqlQuery: diesel::query_dsl::LoadQuery<'static, helpers::Replica, T>,
 {
     let mut rows = Vec::new();
     for statement in statements.iter() {
@@ -213,7 +212,7 @@ fn a_trigger_variable_named_like_a_half_precision_column_is_the_variable() {
         .unwrap()
         .translate_with_schema(&schema, &Pg2SqliteOptions::default())
         .unwrap();
-    let mut connection = diesel::sqlite::SqliteConnection::establish(":memory:").unwrap();
+    let mut connection = helpers::Replica::establish(":memory:").unwrap();
     connection
         .batch_execute(
             "CREATE TABLE items(id INTEGER PRIMARY KEY, h BLOB); CREATE TABLE audit(n INTEGER);",
@@ -324,16 +323,19 @@ fn an_explicit_caller_codec_preserves_genuine_binary16_bytes() {
         .unwrap()
         .translate(&options)
         .unwrap();
-    let mut connection = diesel::sqlite::SqliteConnection::establish(":memory:").unwrap();
-    vec_f16_utils::register_impl(&mut connection, |value: String| {
-        value
-            .trim()
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .split(',')
-            .flat_map(|value| helpers::f32_to_f16_le(value.trim().parse::<f32>().unwrap()))
-            .collect::<Vec<_>>()
-    })
+    let mut connection = helpers::Replica::establish(":memory:").unwrap();
+    vec_f16_utils::register_impl(
+        connection.registration().expect("registration").sqlite(),
+        |value: String| {
+            value
+                .trim()
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .split(',')
+                .flat_map(|value| helpers::f32_to_f16_le(value.trim().parse::<f32>().unwrap()))
+                .collect::<Vec<_>>()
+        },
+    )
     .unwrap();
     let rows = run_emitted::<Encoded>(&statements, &mut connection);
     assert_eq!(rows, vec![Encoded { encoded: vec![0x66, 0x2e, 0x66, 0x32, 0xcd, 0x34] }]);
@@ -356,7 +358,7 @@ fn float32_distance_executes_with_an_opaque_function_relation() {
         .unwrap()
         .translate(&options)
         .unwrap();
-    let mut connection = diesel::sqlite::SqliteConnection::establish(":memory:").unwrap();
+    let mut connection = helpers::Replica::establish(":memory:").unwrap();
     let rows = run_emitted::<Distance>(&statements, &mut connection);
     assert_eq!(
         rows,
@@ -422,7 +424,7 @@ fn float32_scalar_outputs_preserve_binding_and_cardinality() {
     )
     .unwrap();
     let options = Pg2SqliteOptions::default().with_user_defined_functions(["pragma_table_info"]);
-    let mut connection = diesel::sqlite::SqliteConnection::establish(":memory:").unwrap();
+    let mut connection = helpers::Replica::establish(":memory:").unwrap();
     connection
         .batch_execute(
             "CREATE TABLE scalar_items(id INTEGER PRIMARY KEY,v BLOB);
@@ -520,7 +522,7 @@ fn float32_bound_parameters_store_native_vectors() {
     )
     .unwrap();
     let options = Pg2SqliteOptions::default();
-    let mut connection = diesel::sqlite::SqliteConnection::establish(":memory:").unwrap();
+    let mut connection = helpers::Replica::establish(":memory:").unwrap();
     connection
         .batch_execute(
             "CREATE TABLE scalar_items(id INTEGER PRIMARY KEY,v BLOB);
@@ -539,7 +541,7 @@ fn float32_bound_parameters_store_native_vectors() {
             .collect::<Vec<_>>();
         helpers::user_statement_of(&statements, kind).clone()
     };
-    let distances = |connection: &mut diesel::sqlite::SqliteConnection| {
+    let distances = |connection: &mut helpers::Replica| {
         // Emitted statements are dynamic SQL.
         diesel::sql_query(translate(
             "SELECT i.id,i.v <-> s.v AS distance FROM scalar_items i,scalar_vectors s ORDER BY i.id;",
@@ -589,7 +591,7 @@ fn vector_results(expression: &str, dimensions: u32) -> Vec<VectorResult> {
         .unwrap()
         .translate(&Pg2SqliteOptions::default())
         .unwrap();
-    let mut connection = diesel::sqlite::SqliteConnection::establish(":memory:").unwrap();
+    let mut connection = helpers::Replica::establish(":memory:").unwrap();
     run_emitted::<VectorResult>(&statements, &mut connection)
 }
 
@@ -682,7 +684,7 @@ fn a_distance_to_a_null_vector_is_null() {
             .unwrap()
             .translate(&Pg2SqliteOptions::default())
             .unwrap();
-        let mut connection = diesel::sqlite::SqliteConnection::establish(":memory:").unwrap();
+        let mut connection = helpers::Replica::establish(":memory:").unwrap();
         let rows = run_emitted::<NullableDistance>(&statements, &mut connection);
         assert_eq!(rows.len(), 2, "{operator}");
         assert!((rows[0].distance.unwrap() - expected).abs() < 1e-6, "{operator}: {rows:?}");

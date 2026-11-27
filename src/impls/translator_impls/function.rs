@@ -1129,7 +1129,10 @@ fn clock_reader(name: &str) -> FunctionTranslation {
 /// # Errors
 ///
 /// Refuses every other argument form, a syntax error in PostgreSQL.
-fn clock_precision(name: &str, args: &FunctionArguments) -> Result<Option<u32>, crate::errors::Error> {
+fn clock_precision(
+    name: &str,
+    args: &FunctionArguments,
+) -> Result<Option<u32>, crate::errors::Error> {
     let precision = match args {
         FunctionArguments::None => return Ok(None),
         FunctionArguments::List(_) => {

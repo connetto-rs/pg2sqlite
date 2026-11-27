@@ -48,9 +48,9 @@ fn registered(script: &pg2sqlite::script::Script<String>) -> Vec<&str> {
 }
 
 /// A replica of `script` holding the notes `alpha` and `beta`.
-fn replica(script: pg2sqlite::script::Script<String>) -> SqliteConnection {
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-    script.register_functions(&mut connection).expect("register the functions");
+fn replica(script: pg2sqlite::script::Script<String>) -> crate::helpers::Replica {
+    let mut connection = crate::helpers::establish_connection();
+    script.register_managed(&mut connection).expect("register the functions");
     for statement in script.into_vec() {
         connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
     }

@@ -1,7 +1,7 @@
 //! `ALTER TABLE ... DROP COLUMN` takes along what PostgreSQL drops with the
 //! column, which SQLite refuses to drop a column under.
 
-use diesel::{prelude::*, result::Error as DieselError, sqlite::SqliteConnection};
+use diesel::{prelude::*, result::Error as DieselError};
 
 use crate::helpers;
 
@@ -12,7 +12,7 @@ diesel::table! {
     }
 }
 
-fn insert(connection: &mut SqliteConnection, a: i32) -> Result<usize, DieselError> {
+fn insert(connection: &mut crate::helpers::Replica, a: i32) -> Result<usize, DieselError> {
     diesel::insert_into(t::table).values(t::a.eq(a)).execute(connection)
 }
 

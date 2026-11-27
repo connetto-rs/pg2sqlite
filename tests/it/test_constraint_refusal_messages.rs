@@ -10,8 +10,10 @@
 //! `CREATE TABLE` without saying that a circular pair can be declared there,
 //! which measurement shows it can.
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use rusqlite::Connection;
+
+use crate::helpers::Replica;
 
 /// The refusal `pg` earns.
 fn refusal(pg: &str) -> String {
@@ -59,14 +61,14 @@ fn a_deferred_foreign_key_still_translates() {
              CREATE TABLE c (id int primary key, pid int REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);",
         )
         .expect("fixture parses").translate_to_sql(&Pg2SqliteOptions::default()).expect("a deferred foreign key is translatable").into_vec();
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = Replica::establish(":memory:").expect("in-memory SQLite");
     for statement in &statements {
         connection
-            .execute_batch(&format!("{statement};"))
+            .batch_execute(&format!("{statement};"))
             .unwrap_or_else(|error| panic!("emitted statement failed: {error}\n{statement}"));
     }
     connection
-        .execute_batch("BEGIN; INSERT INTO c VALUES (10, 1); INSERT INTO p VALUES (1); COMMIT;")
+        .batch_execute("BEGIN; INSERT INTO c VALUES (10, 1); INSERT INTO p VALUES (1); COMMIT;")
         .expect("the child may precede the parent inside one transaction");
 }
 

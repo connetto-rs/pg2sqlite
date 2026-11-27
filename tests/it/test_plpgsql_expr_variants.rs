@@ -42,7 +42,7 @@ fn plpgsql_combined_expr_types_transformed() {
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
     let stmts = helpers::translate_pg(sql, &options).unwrap();
-    helpers::apply_rusqlite_statements(&stmts);
+    helpers::apply_statements(&stmts);
 }
 
 #[test]
@@ -68,7 +68,7 @@ fn plpgsql_position_expr_transformed() {
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
     let stmts = helpers::translate_pg(sql, &options).unwrap();
-    helpers::apply_rusqlite_statements(&stmts);
+    helpers::apply_statements(&stmts);
 }
 
 #[test]
@@ -94,7 +94,7 @@ fn plpgsql_ceil_floor_expr_transformed() {
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
     let stmts = helpers::translate_pg(sql, &options).unwrap();
-    helpers::apply_rusqlite_statements(&stmts);
+    helpers::apply_statements(&stmts);
 }
 
 /// Renamed from `plpgsql_at_time_zone_time_zone_field_transformed`, which
@@ -140,5 +140,5 @@ fn plpgsql_at_time_zone_is_transformed() {
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
     let stmts = helpers::translate_pg(sql, &options).unwrap();
-    helpers::apply_rusqlite_statements(&stmts);
+    helpers::apply_statements(&stmts);
 }

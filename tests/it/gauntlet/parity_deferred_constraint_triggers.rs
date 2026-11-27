@@ -5,10 +5,10 @@
 //! PostgreSQL runs the body at commit against the rows as they stand then, so
 //! a resource inserted before its parent edge commits, and a commit that
 //! leaves one orphaned fails and rolls back. The replica commits through the
-//! script's `before_commit` statements and has to accept and refuse the same
+//! managed connection and has to accept and refuse the same
 //! transactions and leave the same rows.
 
-use diesel::{QueryResult, connection::SimpleConnection, prelude::*};
+use diesel::{QueryResult, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use postgres_harness::{Outcome, apply, fresh_database};
 
@@ -47,23 +47,17 @@ diesel::table! {
     }
 }
 
-struct Replica {
-    connection: SqliteConnection,
-    before_commit: Vec<String>,
-}
-
-fn replica() -> Replica {
+fn replica() -> crate::helpers::Replica {
     let script = Pg2Sqlite::default()
         .sql(SOURCE)
         .expect("parse")
         .translate_to_sql(&Pg2SqliteOptions::default())
         .expect("translate");
-    let before_commit = script.before_commit.clone();
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-    for statement in script.into_vec() {
-        connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
-    }
-    Replica { connection, before_commit }
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
+    script
+        .initialize_managed(&mut connection, pg2sqlite::script::FreshFiles::Both)
+        .expect("initialize the replica");
+    connection
 }
 
 fn postgres() -> PgConnection {
@@ -72,41 +66,21 @@ fn postgres() -> PgConnection {
     connection
 }
 
-/// Runs `writes` in one transaction and commits it, rolling back a failed
-/// commit on SQLite as PostgreSQL rolls it back.
-fn transaction<C: SimpleConnection>(
-    connection: &mut C,
-    before_commit: &[String],
-    writes: &str,
-) -> QueryResult<()> {
-    connection.batch_execute("BEGIN")?;
-    let committed = connection.batch_execute(writes).and_then(|()| {
-        before_commit.iter().try_for_each(|statement| connection.batch_execute(statement))?;
-        connection.batch_execute("COMMIT")
-    });
-    if committed.is_err() {
-        connection.batch_execute("ROLLBACK")?;
-    }
-    committed
+/// Runs `writes` in a transaction with rollback on failure.
+fn transaction<C: Connection>(connection: &mut C, writes: &str) -> QueryResult<()> {
+    connection.transaction(|connection| connection.batch_execute(writes))
 }
 
 /// Each transaction's outcome.
-fn run<C: SimpleConnection>(
-    connection: &mut C,
-    before_commit: &[String],
-    transactions: &[&str],
-) -> Vec<Outcome> {
-    transactions
-        .iter()
-        .map(|writes| Outcome::of(&transaction(connection, before_commit, writes)))
-        .collect()
+fn run<C: Connection>(connection: &mut C, transactions: &[&str]) -> Vec<Outcome> {
+    transactions.iter().map(|writes| Outcome::of(&transaction(connection, writes))).collect()
 }
 
 /// Asserts PostgreSQL and the replica agree on each transaction and on the
 /// resources left after the last, and that PostgreSQL leaves `expected`.
 fn assert_parity(transactions: &[&str], expected: &[Outcome]) {
     let mut postgres = postgres();
-    let mut on_postgres = run(&mut postgres, &[], transactions);
+    let mut on_postgres = run(&mut postgres, transactions);
     on_postgres.push(Outcome::Rows(
         resources::table
             .select(resources::id)
@@ -115,8 +89,8 @@ fn assert_parity(transactions: &[&str], expected: &[Outcome]) {
             .expect("read the resources on PostgreSQL"),
     ));
     assert_eq!(on_postgres, expected, "PostgreSQL disagrees with the expectation");
-    let Replica { mut connection, before_commit } = replica();
-    let mut on_replica = run(&mut connection, &before_commit, transactions);
+    let mut connection = replica();
+    let mut on_replica = run(&mut connection, transactions);
     on_replica.push(Outcome::Rows(
         resources::table
             .select(resources::id)

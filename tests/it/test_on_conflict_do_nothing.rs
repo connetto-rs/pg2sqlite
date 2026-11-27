@@ -62,7 +62,7 @@ fn translate(dml: &str) -> Vec<String> {
 
 /// The first execution failure, for the cases where PostgreSQL raises one.
 fn apply_err(dml: &str) -> diesel::result::Error {
-    let mut connection = SqliteConnection::establish(":memory:").expect("connect");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("connect");
     for statement in translate(dml) {
         if let Err(error) = diesel::sql_query(&statement).execute(&mut connection) {
             return error;
@@ -71,7 +71,7 @@ fn apply_err(dml: &str) -> diesel::result::Error {
     panic!("every emitted statement succeeded, expected one to fail");
 }
 
-fn rows(connection: &mut SqliteConnection) -> Vec<(i32, i32, i32)> {
+fn rows(connection: &mut crate::helpers::Replica) -> Vec<(i32, i32, i32)> {
     schema::oc::table
         .select((schema::oc::id, schema::oc::n, schema::oc::m))
         .order(schema::oc::id)
@@ -226,7 +226,7 @@ struct Returned {
 /// ignored one must not appear.
 #[test]
 fn returning_reports_only_the_inserted_row() {
-    let mut connection = SqliteConnection::establish(":memory:").expect("connect");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("connect");
     let emitted = translate(
         "INSERT INTO oc (id, n) VALUES (1, 9), (7, 7) ON CONFLICT (id) DO NOTHING RETURNING id;",
     );
@@ -250,7 +250,7 @@ const PARTIAL: &str =
      CREATE UNIQUE INDEX pu_k ON pu (k) WHERE n > 0;
      INSERT INTO pu (id, k, n, tag) VALUES (1, 5, 1, 'a');";
 
-fn partial_rows(connection: &mut SqliteConnection) -> Vec<(i32, i32, i32)> {
+fn partial_rows(connection: &mut crate::helpers::Replica) -> Vec<(i32, i32, i32)> {
     schema::pu::table
         .select((schema::pu::id, schema::pu::k, schema::pu::n))
         .order(schema::pu::id)

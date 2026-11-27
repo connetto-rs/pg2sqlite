@@ -34,7 +34,6 @@
 use alloc::borrow::Cow;
 
 use pg2sqlite_runtime::{BeginMode, TransactionControl};
-
 use sql_traits::{
     structs::ParserDB,
     traits::{DatabaseLike, ForeignKeyLike, TableLike, ViewLike},

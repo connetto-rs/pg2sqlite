@@ -9,8 +9,10 @@
 //! Measured on PostgreSQL 16: a trigger logging only when `NEW.val > 10`, over
 //! inserts of 5 and 50, logs one row.
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use rusqlite::Connection;
+
+use crate::helpers::{Replica, SqliteAnyValue, query_values};
 
 const SCHEMA: &str = "CREATE TABLE t (id INT PRIMARY KEY, val INT);
      CREATE TABLE log (note TEXT);
@@ -33,19 +35,28 @@ fn a_guarded_insert_runs_only_when_the_condition_holds() {
         .expect("translate")
         .into_vec();
 
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = Replica::establish(":memory:").expect("in-memory SQLite");
     for statement in &statements {
         connection
-            .execute_batch(&format!("{statement};"))
+            .batch_execute(&format!("{statement};"))
             .unwrap_or_else(|error| panic!("emitted setup failed: {error}\n{statement}"));
     }
 
     for (id, val) in [(1, 5), (2, 50)] {
-        connection.execute("INSERT INTO t VALUES (?1, ?2)", [id, val]).expect("insert");
+        connection
+            .execute(
+                "INSERT INTO t VALUES (?1, ?2)",
+                &[SqliteAnyValue::Integer(id), SqliteAnyValue::Integer(val)],
+            )
+            .expect("insert");
     }
 
-    let logged: i64 =
-        connection.query_row("SELECT count(*) FROM log", [], |row| row.get(0)).expect("count");
+    let logged = match query_values(&mut connection, "SELECT count(*) FROM log", &[])
+        .expect("count")[0][0]
+    {
+        SqliteAnyValue::Integer(value) => value,
+        ref value => panic!("expected integer, got {value:?}"),
+    };
     assert_eq!(logged, 1, "only the row over the threshold may be logged");
 }
 

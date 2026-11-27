@@ -6,10 +6,10 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use diesel::{Connection, ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection};
+use diesel::{Connection, ExpressionMethods, QueryDsl, RunQueryDsl};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, Script};
 
-use crate::helpers::deployment::deployment;
+use crate::helpers::{Replica, deployment::deployment};
 
 diesel::table! {
     sqlite_master (name) {
@@ -112,19 +112,20 @@ fn options() -> Pg2SqliteOptions {
 }
 
 /// A connection whose exemption the returned switch turns on and off.
-fn connection() -> (SqliteConnection, Arc<AtomicBool>) {
-    let mut connection = SqliteConnection::establish(":memory:").expect("connect");
+fn connection() -> (Replica, Arc<AtomicBool>) {
+    let mut connection = Replica::establish(":memory:").expect("connect");
     let exempt = Arc::new(AtomicBool::new(true));
     let state = Arc::clone(&exempt);
-    write_is_exempt_utils::register_nondeterministic_impl(&mut connection, move || {
-        state.load(Ordering::Relaxed)
-    })
+    write_is_exempt_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        move || state.load(Ordering::Relaxed),
+    )
     .expect("register the exemption");
     (connection, exempt)
 }
 
 /// Runs `script` on `connection`.
-fn apply(connection: &mut SqliteConnection, script: &Script) {
+fn apply(connection: &mut Replica, script: &Script) {
     for statement in script.iter() {
         // The emitted script is the artifact under test, which no typed DSL
         // can stand in for.
@@ -143,7 +144,7 @@ fn translated(sql: &str) -> Script {
 }
 
 /// `sql` translated and loaded under the exemption.
-fn loaded(sql: &str) -> (SqliteConnection, Arc<AtomicBool>) {
+fn loaded(sql: &str) -> (Replica, Arc<AtomicBool>) {
     let (mut connection, exempt) = connection();
     apply(&mut connection, &translated(sql));
     (connection, exempt)
@@ -151,7 +152,7 @@ fn loaded(sql: &str) -> (SqliteConnection, Arc<AtomicBool>) {
 
 /// `earlier` loaded, then `migration` translated on top of its schema and
 /// loaded, both under the exemption.
-fn migrated(earlier: &str, migration: &str) -> (SqliteConnection, Arc<AtomicBool>) {
+fn migrated(earlier: &str, migration: &str) -> (Replica, Arc<AtomicBool>) {
     let (mut connection, exempt) = loaded(earlier);
     apply(&mut connection, &migration_script(earlier, migration));
     (connection, exempt)
@@ -181,7 +182,7 @@ struct Described {
 /// The columns and keys of the table `name`, whose definition text SQLite
 /// keeps as written, so a table rebuilt from the schema spells the same
 /// columns in another order of clauses.
-fn table_description(connection: &mut SqliteConnection, name: &str) -> String {
+fn table_description(connection: &mut Replica, name: &str) -> String {
     // Pragma table-valued functions have no typed DSL.
     diesel::sql_query(
         "SELECT coalesce((SELECT group_concat(name || ' ' || type || ' ' || \"notnull\" || ' ' \
@@ -200,7 +201,7 @@ fn table_description(connection: &mut SqliteConnection, name: &str) -> String {
 /// table rename adds, a table by its columns and keys. The audit table and
 /// the sequence its key keeps stay with their rows once row security has
 /// been on, so they are left out.
-fn objects(connection: &mut SqliteConnection) -> Vec<(String, String, String, Option<String>)> {
+fn objects(connection: &mut Replica) -> Vec<(String, String, String, Option<String>)> {
     let held = sqlite_master::table
         .select((
             sqlite_master::kind,
@@ -226,7 +227,7 @@ fn objects(connection: &mut SqliteConnection) -> Vec<(String, String, String, Op
 
 /// The objects `late` holds and `early` does not, and those `early` holds
 /// and `late` does not, both empty.
-fn assert_same_objects(late: &mut SqliteConnection, early: &mut SqliteConnection) {
+fn assert_same_objects(late: &mut Replica, early: &mut Replica) {
     let (late, early) = (objects(late), objects(early));
     let only_late: Vec<_> = late.iter().filter(|object| !early.contains(object)).collect();
     let only_early: Vec<_> = early.iter().filter(|object| !late.contains(object)).collect();
@@ -237,7 +238,7 @@ fn assert_same_objects(late: &mut SqliteConnection, early: &mut SqliteConnection
 }
 
 /// What the role reads of `notes`, and what is stored, read past the guards.
-fn notes_rows(connection: &mut SqliteConnection, exempt: &AtomicBool) -> [Vec<(i32, String)>; 2] {
+fn notes_rows(connection: &mut Replica, exempt: &AtomicBool) -> [Vec<(i32, String)>; 2] {
     let mut read = |exempted: bool| {
         exempt.store(exempted, Ordering::Relaxed);
         notes::table
@@ -254,8 +255,8 @@ fn notes_rows(connection: &mut SqliteConnection, exempt: &AtomicBool) -> [Vec<(i
 /// The objects of `late` and `early` agree, and so do the rows each holds of
 /// `notes`.
 fn assert_same_replica(
-    (mut late, late_exempt): (SqliteConnection, Arc<AtomicBool>),
-    (mut early, early_exempt): (SqliteConnection, Arc<AtomicBool>),
+    (mut late, late_exempt): (Replica, Arc<AtomicBool>),
+    (mut early, early_exempt): (Replica, Arc<AtomicBool>),
 ) {
     assert_same_objects(&mut late, &mut early);
     assert_eq!(notes_rows(&mut late, &late_exempt), notes_rows(&mut early, &early_exempt));
@@ -439,7 +440,7 @@ fn a_late_enable_turns_the_keys_into_it_into_triggers() {
     let (mut late, late_exempt) = loaded(&format!("{HEAD}{TAGS}{BOUNDARY}{SECURED}"));
     let (mut early, early_exempt) = loaded(&format!("{HEAD}{TAGS}{SECURED}{BOUNDARY}"));
     assert_same_objects(&mut late, &mut early);
-    let tags = |connection: &mut SqliteConnection| {
+    let tags = |connection: &mut Replica| {
         tags::table.select(tags::note).order(tags::note).load::<i32>(connection).expect("read tags")
     };
     assert_eq!(tags(&mut late), tags(&mut early));
@@ -507,7 +508,7 @@ fn a_late_first_grant_keeps_the_rows_a_read_table_keys_into() {
     let (mut late, late_exempt) = loaded(&format!("{UNREAD_HEAD}{TAGS}{BOUNDARY}{GRANT_ALL}"));
     let (mut early, early_exempt) = loaded(&format!("{UNREAD_HEAD}{TAGS}{GRANT_ALL}{BOUNDARY}"));
     assert_same_objects(&mut late, &mut early);
-    let tags = |connection: &mut SqliteConnection| {
+    let tags = |connection: &mut Replica| {
         tags::table.select(tags::note).order(tags::note).load::<i32>(connection).expect("read tags")
     };
     assert_eq!(tags(&mut late), tags(&mut early));
@@ -826,7 +827,7 @@ INSERT INTO pins VALUES (1), (2);
 ";
 
 /// The rows of `tags` and of `pins`.
-fn chained_rows(connection: &mut SqliteConnection) -> (Vec<i32>, Vec<i32>) {
+fn chained_rows(connection: &mut Replica) -> (Vec<i32>, Vec<i32>) {
     let tags = tags::table.select(tags::note).order(tags::note).load(connection);
     let pins = pins::table.select(pins::tag).order(pins::tag).load(connection);
     (tags.expect("read tags"), pins.expect("read pins"))
@@ -865,7 +866,7 @@ fn a_late_enable_on_both_ends_of_a_key_keeps_the_child_index() {
     let (mut early, early_exempt) = loaded(&format!("{before}{both}{BOUNDARY}"));
     assert_same_objects(&mut late, &mut early);
     assert_eq!(notes_rows(&mut late, &late_exempt), notes_rows(&mut early, &early_exempt));
-    let tags = |connection: &mut SqliteConnection| {
+    let tags = |connection: &mut Replica| {
         tags::table.select(tags::note).order(tags::note).load::<i32>(connection).expect("read tags")
     };
     assert_eq!(tags(&mut late), tags(&mut early));
@@ -960,7 +961,7 @@ GRANT SELECT (id, owner), INSERT, UPDATE, DELETE ON docs TO app;
 /// `WITHHELD` loaded with the row `(1, 'app', secret)` stored past the
 /// guards, then the grant reading `secret` run on top, up to its first
 /// refusal.
-fn widened(secret: Option<&str>) -> (SqliteConnection, Result<(), String>) {
+fn widened(secret: Option<&str>) -> (Replica, Result<(), String>) {
     let (mut connection, _exempt) = loaded(WITHHELD);
     // The backing table holds what a server sends a reader of `id` and
     // `owner`, which no typed table here names.

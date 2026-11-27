@@ -14,7 +14,6 @@ use diesel::{
     pg::PgConnection,
     prelude::*,
     sql_types::{Nullable, Text},
-    sqlite::SqliteConnection,
 };
 use pg2sqlite::prelude::{ArrayRepresentation, Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation};
 
@@ -108,7 +107,7 @@ fn setup_pg() -> PgConnection {
 // The schema and seeds are translator output, a runtime string with no typed
 // form, and the seeds carry bytea, uuid and array literals no shared
 // insertable covers on both backends.
-fn setup_sqlite() -> SqliteConnection {
+fn setup_sqlite() -> crate::helpers::Replica {
     let statements = Pg2Sqlite::default()
         .sql(&crate::helpers::deployment::utc_script(&format!("{SCHEMA}{SEEDS}")))
         .expect("parse schema and seeds")
@@ -137,7 +136,7 @@ fn postgres_answer(pg: &mut PgConnection, expression: &str, filter: &str) -> Opt
 /// pg2sqlite's answer to the same probe, read through PostgreSQL's `jsonb`.
 fn sqlite_answer(
     pg: &mut PgConnection,
-    sqlite: &mut SqliteConnection,
+    sqlite: &mut crate::helpers::Replica,
     expression: &str,
     filter: &str,
 ) -> Result<Option<String>, String> {

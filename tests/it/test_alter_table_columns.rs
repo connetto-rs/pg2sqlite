@@ -52,13 +52,15 @@ struct ColumnInfo {
     declared_type: String,
 }
 
-fn table_info(conn: &mut SqliteConnection) -> Result<Vec<ColumnInfo>, Box<dyn std::error::Error>> {
+fn table_info(
+    conn: &mut crate::helpers::Replica,
+) -> Result<Vec<ColumnInfo>, Box<dyn std::error::Error>> {
     Ok(diesel::sql_query("PRAGMA table_info(t)").load(conn)?)
 }
 
 /// [`helpers::apply_with_options`] under the UTC deployment, which the
 /// migration's `now()` default needs to read the zone from.
-fn apply(pg: &str) -> Result<SqliteConnection, Box<dyn std::error::Error>> {
+fn apply(pg: &str) -> Result<crate::helpers::Replica, Box<dyn std::error::Error>> {
     helpers::apply_with_options(&utc_script(pg), &utc_request())
 }
 
@@ -436,7 +438,7 @@ fn alter_on_a_protected_table_lands_on_the_backing_table() -> Result<(), Box<dyn
         .translate(&options)?
         .into_vec();
 
-    let mut conn = SqliteConnection::establish(":memory:")?;
+    let mut conn = crate::helpers::Replica::establish(":memory:")?;
     for statement in &translated {
         diesel::sql_query(statement.to_string()).execute(&mut conn)?;
     }

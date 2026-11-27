@@ -3,7 +3,7 @@
 
 #![allow(missing_docs)]
 
-use diesel::RunQueryDsl;
+use diesel::{Connection, RunQueryDsl, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
 use crate::helpers;
@@ -29,10 +29,10 @@ fn test_is_distinct_from_translation_form() {
 
     // Execute the translated query against a connection that has the fixture
     // table.
-    let conn = rusqlite::Connection::open_in_memory().expect("open");
-    conn.execute_batch("CREATE TABLE pairs (id INTEGER PRIMARY KEY, a TEXT, b TEXT)")
+    let mut conn = crate::helpers::Replica::establish(":memory:").expect("open");
+    conn.batch_execute("CREATE TABLE pairs (id INTEGER PRIMARY KEY, a TEXT, b TEXT)")
         .expect("fixture");
-    conn.execute_batch(&format!("{out};")).expect("SQLite takes it");
+    conn.batch_execute(&format!("{out};")).expect("SQLite takes it");
 }
 
 /// Whatever shape the comparison takes, the crate's own parser has to be able
@@ -60,10 +60,10 @@ fn the_emitted_comparison_reparses_under_the_sqlite_dialect() {
         sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::SQLiteDialect {}, emitted)
             .unwrap_or_else(|error| panic!("`{emitted}` must parse as SQLite: {error}"));
 
-        let conn = rusqlite::Connection::open_in_memory().expect("open");
-        conn.execute_batch("CREATE TABLE pairs (id INTEGER PRIMARY KEY, a TEXT, b TEXT)")
+        let mut conn = crate::helpers::Replica::establish(":memory:").expect("open");
+        conn.batch_execute("CREATE TABLE pairs (id INTEGER PRIMARY KEY, a TEXT, b TEXT)")
             .expect("fixture");
-        conn.execute_batch(&format!("{emitted};")).expect("SQLite must take it");
+        conn.batch_execute(&format!("{emitted};")).expect("SQLite must take it");
     }
 }
 

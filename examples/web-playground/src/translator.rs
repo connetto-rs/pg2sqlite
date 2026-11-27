@@ -3,6 +3,7 @@
 use pg2sqlite::{
     errors::Error as PgError,
     prelude::{Pg2Sqlite, Pg2SqliteOptions},
+    script::Script,
 };
 
 use crate::{
@@ -12,6 +13,8 @@ use crate::{
 
 pub struct TranslationOutput {
     pub sqlite_sql: String,
+    /// The translation, which the in-page database runs group by group.
+    pub script: Script,
     pub stats: TranslationStats,
 }
 
@@ -24,17 +27,19 @@ pub fn translate(
     mut elapsed_ms_fn: impl FnMut() -> f64,
 ) -> Result<TranslationOutput, TranslationError> {
     let start = elapsed_ms_fn();
-    let stmts = Pg2Sqlite::default()
+    let script = Pg2Sqlite::default()
         .sql(&declaring_role(pg_sql))
-        .and_then(|t| t.translate(options).map(pg2sqlite::script::Script::into_vec))
+        .and_then(|t| t.translate(options))
         .map_err(classify_error)?;
 
     let elapsed_ms = elapsed_ms_fn() - start;
-    let sqlite_sql = stmts.iter().map(ToString::to_string).collect::<Vec<_>>().join(";\n");
+    let sqlite_sql = script.iter().map(ToString::to_string).collect::<Vec<_>>().join(";\n");
+    let statement_count = script.iter().count();
 
     Ok(TranslationOutput {
         sqlite_sql,
-        stats: TranslationStats { statement_count: stmts.len(), elapsed_ms },
+        script,
+        stats: TranslationStats { statement_count, elapsed_ms },
     })
 }
 

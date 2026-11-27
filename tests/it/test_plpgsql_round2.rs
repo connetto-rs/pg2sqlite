@@ -14,7 +14,7 @@ fn translate(sql: &str) -> Result<Vec<String>, pg2sqlite::errors::Error> {
     helpers::translate_pg(sql, &Pg2SqliteOptions::default())
 }
 
-fn apply_all(conn: &mut diesel::SqliteConnection, stmts: &[String]) {
+fn apply_all(conn: &mut crate::helpers::Replica, stmts: &[String]) {
     for s in stmts {
         diesel::sql_query(s.as_str())
             .execute(conn)

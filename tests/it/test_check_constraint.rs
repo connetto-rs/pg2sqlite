@@ -80,7 +80,7 @@ fn test_check_constraint_removed_with_option() {
     );
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
-    helpers::apply_rusqlite_statements(&stmts);
+    helpers::apply_statements(&stmts);
 }
 
 /// A simple arithmetic CHECK (no PG-specific functions) always passes through.
@@ -103,7 +103,7 @@ fn test_valid_check_constraint_passes_through() {
     );
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
-    helpers::apply_rusqlite_statements(&stmts);
+    helpers::apply_statements(&stmts);
 }
 
 /// A table-level CHECK with a nested function call should fail translation
@@ -144,7 +144,7 @@ fn test_nested_function_check_constraint_removed_with_option() {
     );
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
-    helpers::apply_rusqlite_statements(&stmts);
+    helpers::apply_statements(&stmts);
 }
 
 /// Column-level CHECK constraints are now translated to SQLite CHECK
@@ -169,7 +169,7 @@ fn test_column_level_check_is_translated() {
     );
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
-    helpers::apply_rusqlite_statements(&stmts);
+    helpers::apply_statements(&stmts);
 }
 
 /// Column-level CHECK constraints are silently dropped when
@@ -191,7 +191,7 @@ fn test_column_level_check_is_dropped_with_option() {
     );
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
-    helpers::apply_rusqlite_statements(&stmts);
+    helpers::apply_statements(&stmts);
 }
 
 /// Table-level CHECK with `char_length` is translated to `length`.
@@ -211,7 +211,7 @@ fn table_check_translates_char_length() {
     assert!(!lower.contains("char_length"), "char_length should be translated: {sql_output}");
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
-    helpers::apply_rusqlite_statements(&stmts);
+    helpers::apply_statements(&stmts);
 }
 
 /// Semantic test: table-level CHECK with `char_length` rejects empty strings.

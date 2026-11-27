@@ -24,7 +24,7 @@
 
 use std::cell::Cell;
 
-use diesel::prelude::*;
+use diesel::{connection::SimpleConnection, prelude::*};
 use helpers::apply_translated_ddl as apply;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
@@ -266,7 +266,7 @@ struct AuditLog {
     detail: String,
 }
 
-fn audit_rows(conn: &mut SqliteConnection) -> Vec<AuditLog> {
+fn audit_rows(conn: &mut crate::helpers::Replica) -> Vec<AuditLog> {
     schema::rls_audit::table.select(AuditLog::as_select()).load(conn).expect("audit rows")
 }
 
@@ -297,19 +297,20 @@ fn set_write_exempt(exempt: bool) {
     WRITE_IS_EXEMPT.with(|value| value.set(exempt));
 }
 
-fn apply_with_exemption(pg: &str) -> SqliteConnection {
+fn apply_with_exemption(pg: &str) -> crate::helpers::Replica {
     set_write_exempt(false);
     let mut conn = apply(pg, &exemption_opts());
-    write_is_exempt_utils::register_nondeterministic_impl(&mut conn, || {
-        WRITE_IS_EXEMPT.with(Cell::get)
-    })
+    write_is_exempt_utils::register_nondeterministic_impl(
+        conn.registration().expect("registration").sqlite(),
+        || WRITE_IS_EXEMPT.with(Cell::get),
+    )
     .expect("register write_is_exempt");
     conn
 }
 
 /// A `bob` row with `id` 1 in the `shared_items` backing table.
 fn insert_shared_item(
-    conn: &mut SqliteConnection,
+    conn: &mut crate::helpers::Replica,
     body: &str,
 ) -> diesel::result::QueryResult<usize> {
     diesel::insert_into(schema::shared_items_rls::table)
@@ -322,7 +323,7 @@ fn insert_shared_item(
 }
 
 /// The `owner`/`body` pair of the stored `branch_items` row.
-fn read_branch_item(conn: &mut SqliteConnection) -> (String, String) {
+fn read_branch_item(conn: &mut crate::helpers::Replica) -> (String, String) {
     schema::branch_items_rls::table
         .find(1)
         .select((schema::branch_items_rls::owner, schema::branch_items_rls::body))
@@ -399,9 +400,9 @@ fn rendered_translation(pg: &str, opts: &Pg2SqliteOptions) -> Vec<String> {
         .collect()
 }
 
-fn apply_rendered(conn: &rusqlite::Connection, statements: &[String]) {
+fn apply_rendered(conn: &mut helpers::Replica, statements: &[String]) {
     for statement in statements {
-        conn.execute_batch(statement).expect("apply translated statement");
+        conn.batch_execute(statement).expect("apply translated statement");
     }
 }
 
@@ -430,7 +431,7 @@ fn translate_dml_tail(pg_dml: &str, schema: &str, opts: &Pg2SqliteOptions) -> Ve
 
 /// Runs all translated DML statements; returns the last execute result.
 fn run_dml(
-    conn: &mut SqliteConnection,
+    conn: &mut crate::helpers::Replica,
     pg_dml: &str,
     schema: &str,
     opts: &Pg2SqliteOptions,
@@ -692,9 +693,10 @@ fn zero_policy_backing_insert_honours_rls_exemption() {
         .with_rls_exemption_function("write_is_exempt");
     set_write_exempt(false);
     let mut conn = apply(ZERO_POLICY_SCHEMA, &options);
-    write_is_exempt_utils::register_nondeterministic_impl(&mut conn, || {
-        WRITE_IS_EXEMPT.with(Cell::get)
-    })
+    write_is_exempt_utils::register_nondeterministic_impl(
+        conn.registration().expect("registration").sqlite(),
+        || WRITE_IS_EXEMPT.with(Cell::get),
+    )
     .expect("register write_is_exempt");
 
     assert!(
@@ -726,54 +728,63 @@ fn configured_but_unregistered_exemption_fails_closed() {
 
 #[test]
 fn innocuous_nondeterministic_exemption_works_with_trusted_schema_off() {
-    use rusqlite::{Connection, functions::FunctionFlags};
-
     let translated = rendered_translation(ZERO_POLICY_SCHEMA, &exemption_opts());
-    let conn = Connection::open_in_memory().expect("open");
-    conn.create_scalar_function(
-        "write_is_exempt",
-        0,
-        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_INNOCUOUS,
-        |_| Ok(true),
-    )
-    .expect("register innocuous RLS exemption");
-    conn.execute_batch("PRAGMA trusted_schema = OFF;").expect("disable trusted schema");
-    apply_rendered(&conn, &translated);
+    let mut conn = helpers::Replica::establish(":memory:").expect("open");
+    conn.registration()
+        .expect("registration")
+        .sqlite()
+        .register_noarg_sql_function::<diesel::sql_types::Bool, bool, _>(
+            "write_is_exempt",
+            diesel::sqlite::SqliteFunctionBehavior::INNOCUOUS,
+            || true,
+        )
+        .expect("register innocuous RLS exemption");
+    conn.batch_execute("PRAGMA trusted_schema = OFF;").expect("disable trusted schema");
+    apply_rendered(&mut conn, &translated);
 
-    conn.execute("INSERT INTO posts_rls (body) VALUES ('restored')", [])
+    conn.execute("INSERT INTO posts_rls (body) VALUES ('restored')", &[])
         .expect("hardened SQLite accepts the exemption function in a trigger");
-    let count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM posts_rls", [], |row| row.get(0)).unwrap();
-    assert_eq!(count, 1);
+    let rows = helpers::query_values(&mut conn, "SELECT COUNT(*) FROM posts_rls", &[]).unwrap();
+    assert_eq!(rows[0][0], helpers::SqliteAnyValue::Integer(1));
 }
 
 #[test]
 fn null_and_error_exemption_results_abort_writes() {
-    use rusqlite::{Connection, Error, functions::FunctionFlags};
-
     let translated = rendered_translation(ZERO_POLICY_SCHEMA, &exemption_opts());
-    let null_conn = Connection::open_in_memory().expect("open");
-    null_conn
-        .create_scalar_function("write_is_exempt", 0, FunctionFlags::SQLITE_UTF8, |_| {
-            Ok(None::<bool>)
-        })
+    let mut null_conn = helpers::Replica::establish(":memory:").expect("open");
+    null_conn.registration().expect("registration").sqlite()
+        .register_noarg_sql_function::<diesel::sql_types::Nullable<diesel::sql_types::Bool>, Option<bool>, _>(
+            "write_is_exempt", diesel::sqlite::SqliteFunctionBehavior::empty(), || None,
+        )
         .expect("register nullable exemption");
-    apply_rendered(&null_conn, &translated);
-    assert!(null_conn.execute("INSERT INTO posts_rls (body) VALUES ('blocked')", []).is_err());
+    apply_rendered(&mut null_conn, &translated);
+    assert!(null_conn.execute("INSERT INTO posts_rls (body) VALUES ('blocked')", &[]).is_err());
 
-    let error_conn = Connection::open_in_memory().expect("open");
+    let mut error_conn = helpers::Replica::establish(":memory:").expect("open");
+    #[derive(Debug)]
+    struct FailedExemption;
+
+    impl diesel::serialize::ToSql<diesel::sql_types::Bool, diesel::sqlite::Sqlite> for FailedExemption {
+        fn to_sql<'output>(
+            &'output self,
+            _: &mut diesel::serialize::Output<'output, '_, diesel::sqlite::Sqlite>,
+        ) -> diesel::serialize::Result {
+            Err(Box::new(std::io::Error::other("exemption failed")))
+        }
+    }
+
     error_conn
-        .create_scalar_function(
+        .registration()
+        .expect("registration")
+        .sqlite()
+        .register_noarg_sql_function::<diesel::sql_types::Bool, FailedExemption, _>(
             "write_is_exempt",
-            0,
-            FunctionFlags::SQLITE_UTF8,
-            |_| -> rusqlite::Result<bool> {
-                Err(Error::UserFunctionError(Box::new(std::io::Error::other("exemption failed"))))
-            },
+            diesel::sqlite::SqliteFunctionBehavior::empty(),
+            || FailedExemption,
         )
         .expect("register failing exemption");
-    apply_rendered(&error_conn, &translated);
-    assert!(error_conn.execute("INSERT INTO posts_rls (body) VALUES ('blocked')", []).is_err());
+    apply_rendered(&mut error_conn, &translated);
+    assert!(error_conn.execute("INSERT INTO posts_rls (body) VALUES ('blocked')", &[]).is_err());
 }
 
 #[test]
@@ -783,47 +794,71 @@ fn exemption_short_circuits_policy_calls_but_not_function_resolution() {
         atomic::{AtomicUsize, Ordering},
     };
 
-    use rusqlite::{Connection, functions::FunctionFlags};
-
     let opts = exemption_opts().with_user_defined_functions(["policy_probe"]);
     let translated = rendered_translation(POLICY_FUNCTION_SCHEMA, &opts);
     let calls = Arc::new(AtomicUsize::new(0));
-    let conn = Connection::open_in_memory().expect("open");
-    conn.create_scalar_function("write_is_exempt", 0, FunctionFlags::SQLITE_UTF8, |_| Ok(true))
+    let mut conn = helpers::Replica::establish(":memory:").expect("open");
+    conn.registration()
+        .expect("registration")
+        .sqlite()
+        .register_noarg_sql_function::<diesel::sql_types::Bool, bool, _>(
+            "write_is_exempt",
+            diesel::sqlite::SqliteFunctionBehavior::empty(),
+            || true,
+        )
         .expect("register exemption");
     let function_calls = Arc::clone(&calls);
-    conn.create_scalar_function("policy_probe", 0, FunctionFlags::SQLITE_UTF8, move |_| {
-        function_calls.fetch_add(1, Ordering::Relaxed);
-        Ok(false)
-    })
-    .expect("register policy function");
-    apply_rendered(&conn, &translated);
-    conn.execute("INSERT INTO policy_items (id, body) VALUES (1, 'restored')", [])
+    conn.registration()
+        .expect("registration")
+        .sqlite()
+        .register_noarg_sql_function::<diesel::sql_types::Bool, bool, _>(
+            "policy_probe",
+            diesel::sqlite::SqliteFunctionBehavior::empty(),
+            move || {
+                function_calls.fetch_add(1, Ordering::Relaxed);
+                false
+            },
+        )
+        .expect("register policy function");
+    apply_rendered(&mut conn, &translated);
+    conn.execute("INSERT INTO policy_items (id, body) VALUES (1, 'restored')", &[])
         .expect("exemption bypasses the policy");
     assert_eq!(calls.load(Ordering::Relaxed), 0);
 
-    let missing_conn = Connection::open_in_memory().expect("open");
+    let mut missing_conn = helpers::Replica::establish(":memory:").expect("open");
     missing_conn
-        .create_scalar_function("write_is_exempt", 0, FunctionFlags::SQLITE_UTF8, |_| Ok(true))
+        .registration()
+        .expect("registration")
+        .sqlite()
+        .register_noarg_sql_function::<diesel::sql_types::Bool, bool, _>(
+            "write_is_exempt",
+            diesel::sqlite::SqliteFunctionBehavior::empty(),
+            || true,
+        )
         .expect("register exemption");
-    apply_rendered(&missing_conn, &translated);
+    apply_rendered(&mut missing_conn, &translated);
     let error = missing_conn
-        .execute("INSERT INTO policy_items (id, body) VALUES (1, 'blocked')", [])
+        .execute("INSERT INTO policy_items (id, body) VALUES (1, 'blocked')", &[])
         .expect_err("SQLite must resolve every trigger function");
     assert!(error.to_string().contains("policy_probe"));
 }
 
 #[test]
 fn keyword_shaped_exemption_function_name_is_quoted() {
-    use rusqlite::{Connection, functions::FunctionFlags};
-
     let opts = strict_opts().with_rls_exemption_function("select");
     let translated = rendered_translation(ZERO_POLICY_SCHEMA, &opts);
-    let conn = Connection::open_in_memory().expect("open");
-    conn.create_scalar_function("select", 0, FunctionFlags::SQLITE_UTF8, |_| Ok(true))
+    let mut conn = helpers::Replica::establish(":memory:").expect("open");
+    conn.registration()
+        .expect("registration")
+        .sqlite()
+        .register_noarg_sql_function::<diesel::sql_types::Bool, bool, _>(
+            "select",
+            diesel::sqlite::SqliteFunctionBehavior::empty(),
+            || true,
+        )
         .expect("register keyword-shaped exemption");
-    apply_rendered(&conn, &translated);
-    conn.execute("INSERT INTO posts_rls (body) VALUES ('restored')", [])
+    apply_rendered(&mut conn, &translated);
+    conn.execute("INSERT INTO posts_rls (body) VALUES ('restored')", &[])
         .expect("quoted exemption function remains callable");
 }
 

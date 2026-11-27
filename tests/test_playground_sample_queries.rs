@@ -14,11 +14,7 @@ mod request;
 #[path = "../examples/web-playground/src/sample_sql.rs"]
 mod sample_sql;
 
-use diesel::{
-    connection::SimpleConnection,
-    sql_types::BigInt,
-    sqlite::{SqliteConnection, SqliteFunctionBehavior},
-};
+use diesel::connection::SimpleConnection;
 use helpers::deployment::caller;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 use request::declaring_role;
@@ -53,19 +49,23 @@ struct CannedQuery {
     expectation: Expectation,
 }
 
-fn open_connection() -> SqliteConnection {
+fn open_connection() -> helpers::Replica {
     helpers::register_sqlite_vec_once();
     helpers::establish_connection()
 }
 
-fn register_current_app_user(connection: &mut SqliteConnection) {
-    connection
-        .register_noarg_sql_function::<BigInt, _, _>(
-            "current_app_user",
-            SqliteFunctionBehavior::DETERMINISTIC,
-            || 42_i64,
-        )
-        .expect("register current_app_user");
+#[diesel::declare_sql_function]
+extern "SQL" {
+    /// The caller the playground's row security reads, answered as user 42.
+    fn current_app_user() -> diesel::sql_types::BigInt;
+}
+
+fn register_current_app_user(connection: &mut helpers::Replica) {
+    current_app_user_utils::register_impl(
+        connection.registration().expect("registration").sqlite(),
+        || 42_i64,
+    )
+    .expect("register current_app_user");
 }
 
 /// The playground's deployment in the server zone it starts with, declaring
@@ -95,7 +95,7 @@ fn translate(schema: &str, options: &Pg2SqliteOptions) -> String {
 }
 
 fn run_query_once(
-    connection: &mut SqliteConnection,
+    connection: &mut helpers::Replica,
     schema: &str,
     query: &CannedQuery,
     options: &Pg2SqliteOptions,
@@ -152,7 +152,7 @@ fn run_query_once(
 /// INSERTs must remain re-runnable, and negative chips must keep
 /// failing for the same reason.
 fn run_queries_twice(
-    connection: &mut SqliteConnection,
+    connection: &mut helpers::Replica,
     schema: &str,
     queries: &[CannedQuery],
     options: &Pg2SqliteOptions,

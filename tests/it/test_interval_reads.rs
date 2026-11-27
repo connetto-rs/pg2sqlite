@@ -7,10 +7,14 @@
 //! A drift between the shape the translator emits and what SQLite accepts
 //! fails here.
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::prelude::Pg2Sqlite;
 use run_translated_helper::{first_column_text, run_translated_utc, run_translated_with};
 
-use crate::helpers::{run_translated as run_translated_helper, translate::assert_refused};
+use crate::helpers::{
+    SqliteAnyValue, query_values, run_translated as run_translated_helper,
+    translate::assert_refused,
+};
 
 const SCHEMA: &str = "
 CREATE TABLE t (id int, iv interval, iv2 interval, ts timestamptz);
@@ -604,22 +608,19 @@ fn a_greatest_that_ignores_null_keeps_the_column() {
     );
 }
 
-// A bound parameter binds canonical interval text; the translation keys the
-// placeholder. rusqlite, not diesel, runs the translated parameterized SQL:
-// the emitted statement is the artifact under test, and diesel's sql_query
-// bind rewrites the numbered placeholders the translator emits.
+// Managed bindings preserve the translator's numbered placeholders.
 
 /// Runs every translated statement of `sql` in a fresh in-memory connection.
-fn bind_setup(sql: &str) -> rusqlite::Connection {
+fn bind_setup(sql: &str) -> crate::helpers::Replica {
     let stmts = Pg2Sqlite::default()
         .sql(sql)
         .expect("parse")
         .translate_to_sql(&crate::helpers::function_options())
         .expect("translate")
         .into_vec();
-    let conn = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+    let mut conn = crate::helpers::Replica::establish(":memory:").expect("in-memory SQLite");
     for stmt in &stmts {
-        conn.execute_batch(&format!("{stmt};"))
+        conn.batch_execute(&format!("{stmt};"))
             .unwrap_or_else(|err| panic!("setup: {err}\n{stmt}"));
     }
     conn
@@ -788,22 +789,13 @@ fn a_distinct_wildcard_over_an_interval_values_relation_is_refused() {
 
 #[test]
 fn a_bound_parameter_is_keyed_like_a_column() {
-    let conn = bind_setup(SCHEMA);
+    let mut conn = bind_setup(SCHEMA);
     let query = bind_query(&format!("{SCHEMA}\nSELECT id FROM t WHERE iv = $1;"));
-    let mut stmt = conn.prepare(&query).unwrap_or_else(|err| panic!("prepare: {err}\n{query}"));
-    let rows: Vec<i64> = stmt
-        .query_map(rusqlite::params!["1 day"], |row| row.get::<_, i64>(0))
-        .unwrap()
-        .map(|cell| cell.unwrap())
-        .collect();
-    assert_eq!(rows, vec![1]);
-
-    let rows: Vec<i64> = stmt
-        .query_map(rusqlite::params!["24:00:00"], |row| row.get::<_, i64>(0))
-        .unwrap()
-        .map(|cell| cell.unwrap())
-        .collect();
-    assert_eq!(rows, vec![1]);
+    for binding in ["1 day", "24:00:00"] {
+        let rows = query_values(&mut conn, &query, &[SqliteAnyValue::Text(binding.to_owned())])
+            .expect("bound interval query");
+        assert_eq!(rows, vec![vec![SqliteAnyValue::Integer(1)]]);
+    }
 }
 
 /// Translates `pg` and runs it with the statements naming `failing` expected
@@ -932,47 +924,45 @@ fn a_table_keyed_by_an_interval_keeps_its_declared_key() {
         "CREATE TABLE shifts (span interval PRIMARY KEY, crew text);",
         "CREATE TABLE shifts (span interval, crew text, PRIMARY KEY (span));",
     ] {
-        let connection = run_script(&format!(
+        let mut connection = run_script(&format!(
             "{ddl}
              INSERT INTO shifts VALUES ('1 day', 'a');"
         ));
-        let pk: i64 = connection
-            .query_row(
-                "SELECT pk FROM pragma_table_info('shifts') WHERE name = 'span'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("the span column");
-        assert_eq!(pk, 1, "{ddl}");
+        let rows = query_values(
+            &mut connection,
+            "SELECT pk FROM pragma_table_info('shifts') WHERE name = 'span'",
+            &[],
+        )
+        .expect("the span column");
+        assert_eq!(rows[0][0], SqliteAnyValue::Integer(1), "{ddl}");
         assert!(
-            connection.execute_batch("INSERT INTO shifts VALUES ('24:00:00', 'b');").is_err(),
+            connection.batch_execute("INSERT INTO shifts VALUES ('24:00:00', 'b');").is_err(),
             "{ddl}: the key index must still reject an equal interval"
         );
     }
-    let connection = run_script("CREATE TABLE crews (id int, span interval UNIQUE);");
-    let unique: i64 = connection
-        .query_row(
-            "SELECT count(*) FROM pragma_index_list('crews') WHERE origin = 'u'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("the index list");
-    assert_eq!(unique, 1);
+    let mut connection = run_script("CREATE TABLE crews (id int, span interval UNIQUE);");
+    let rows = query_values(
+        &mut connection,
+        "SELECT count(*) FROM pragma_index_list('crews') WHERE origin = 'u'",
+        &[],
+    )
+    .expect("the index list");
+    assert_eq!(rows[0][0], SqliteAnyValue::Integer(1));
 }
 
 /// Runs every statement translated from `pg` on a fresh in-memory SQLite and
 /// hands the connection back for raw probes of the replica.
-fn run_script(pg: &str) -> rusqlite::Connection {
+fn run_script(pg: &str) -> crate::helpers::Replica {
     let statements = Pg2Sqlite::default()
         .sql(pg)
         .expect("parse")
         .translate_to_sql(&crate::helpers::function_options())
         .expect("translate")
         .into_vec();
-    let connection = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("in-memory SQLite");
     for statement in &statements {
         connection
-            .execute_batch(&format!("{statement};"))
+            .batch_execute(&format!("{statement};"))
             .unwrap_or_else(|error| panic!("{error}\n{statement}"));
     }
     connection
@@ -1386,10 +1376,10 @@ fn execution_error(pg: &str) -> Option<String> {
         .translate_to_sql(&crate::helpers::function_options())
         .expect("translate")
         .into_vec();
-    let connection = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("in-memory SQLite");
     let mut error = None;
     for statement in &statements {
-        if let Err(e) = connection.execute(&format!("{statement};"), []) {
+        if let Err(e) = connection.execute(&format!("{statement};"), &[]) {
             error = Some(e.to_string());
         }
     }

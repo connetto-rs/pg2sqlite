@@ -22,7 +22,7 @@ use pg2sqlite::{
 use sql_traits::structs::Deployment;
 use sqlstate::pg;
 
-use crate::{helpers::establish_connection, support::transaction::transaction};
+use crate::helpers::establish_connection;
 
 diesel::table! {
     /// The organizations of the fixtures.
@@ -210,45 +210,41 @@ fn replica_options() -> Pg2SqliteOptions {
 
 /// A replica of `pg` translated under `options`.
 struct Replica {
-    connection: SqliteConnection,
-    /// The statements a `COMMIT` runs first.
-    before_commit: Vec<String>,
+    connection: crate::helpers::Replica,
     /// How many marked writes are open, as `derived` counts them.
     depth: Arc<AtomicI32>,
 }
 
 impl Replica {
     fn new(pg: &str, options: &Pg2SqliteOptions) -> Self {
-        let mut script = Pg2Sqlite::default()
+        let script = Pg2Sqlite::default()
             .sql(pg)
             .expect("fixture parses")
             .translate_to_sql(options)
             .expect("fixture translates");
-        let before_commit = core::mem::take(&mut script.before_commit);
         let mut connection = establish_connection();
-        script.register_functions(&mut connection).expect("register helper functions");
         let depth = Arc::new(AtomicI32::new(0));
         let counted = Arc::clone(&depth);
-        derived_utils::register_nondeterministic_impl(&mut connection, move |step: i32| {
-            counted.fetch_add(step, Ordering::Relaxed) + step
-        })
-        .expect("register derived");
-        let read = Arc::clone(&depth);
-        derived_depth_utils::register_nondeterministic_impl(&mut connection, move || {
-            read.load(Ordering::Relaxed)
-        })
-        .expect("register derived_depth");
-        // The script is the translator's own output, which no typed query
-        // expresses.
-        for statement in script.into_vec() {
-            connection
-                .batch_execute(&format!("{statement};"))
-                .unwrap_or_else(|error| panic!("emitted statement failed: {error}\n{statement}"));
+        {
+            let mut registration = connection.registration().expect("registration");
+            derived_utils::register_nondeterministic_impl(
+                registration.sqlite(),
+                move |step: i32| counted.fetch_add(step, Ordering::Relaxed) + step,
+            )
+            .expect("register derived");
+            let read = Arc::clone(&depth);
+            derived_depth_utils::register_nondeterministic_impl(registration.sqlite(), move || {
+                read.load(Ordering::Relaxed)
+            })
+            .expect("register derived_depth");
         }
+        script
+            .initialize_managed(&mut connection, pg2sqlite::script::FreshFiles::Both)
+            .expect("initialize replica");
         connection
             .batch_execute("CREATE TABLE observed (relation TEXT, user_id INTEGER, depth INTEGER);")
             .expect("observed");
-        Self { connection, before_commit, depth }
+        Self { connection, depth }
     }
 
     /// Records each row written into `table` on `event` with the depth of
@@ -272,7 +268,7 @@ impl Replica {
     }
 
     fn transaction(&mut self, writes: &str) -> QueryResult<()> {
-        transaction(&mut self.connection, &self.before_commit, writes)
+        self.connection.transaction(|connection| connection.batch_execute(writes))
     }
 }
 
@@ -310,7 +306,7 @@ fn owned(entries: &[(&str, &str, &str)]) -> Vec<(String, String, String)> {
         .collect()
 }
 
-fn granted(connection: &mut SqliteConnection) -> Vec<(i32, i32, String)> {
+fn granted(connection: &mut crate::helpers::Replica) -> Vec<(i32, i32, String)> {
     grants::table
         .select((grants::organization_id, grants::user_id, grants::role))
         .order((grants::organization_id, grants::user_id))

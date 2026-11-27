@@ -32,7 +32,7 @@ pub fn options(zone: &str) -> Pg2SqliteOptions {
 /// A connection from [`establish_connection`](super::establish_connection),
 /// which registers the temporal functions.
 #[must_use]
-pub fn connection() -> SqliteConnection {
+pub fn connection() -> super::Replica {
     super::establish_connection()
 }
 

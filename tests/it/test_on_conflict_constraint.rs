@@ -70,7 +70,7 @@ const AUTO: &str = "CREATE TABLE t (
 
 /// Asserts the upsert landed on the existing row rather than inserting a
 /// second one, which is what proves the conflict target survived.
-fn assert_upserted(conn: &mut SqliteConnection) {
+fn assert_upserted(conn: &mut crate::helpers::Replica) {
     let rows: Vec<(i32, String, i32)> = schema::t::table
         .select((schema::t::id, schema::t::v, schema::t::n))
         .load(conn)

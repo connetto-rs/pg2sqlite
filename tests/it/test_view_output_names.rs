@@ -4,7 +4,7 @@
 //! each output's name, so a later column rename or added column leaves the
 //! view's columns alone. Each scenario was measured on PostgreSQL 18.
 
-use diesel::{Connection, RunQueryDsl, SqliteConnection, connection::SimpleConnection};
+use diesel::{Connection, RunQueryDsl, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use sql_traits::structs::ParserDB;
 
@@ -25,7 +25,7 @@ fn schema(sql: &str) -> ParserDB {
 /// before it built, and run on SQLite, answering how many rows `query`
 /// counts afterwards.
 fn count_after(batches: &[&str], query: &str) -> i64 {
-    let mut connection = SqliteConnection::establish(":memory:").unwrap();
+    let mut connection = crate::helpers::Replica::establish(":memory:").unwrap();
     let mut written = String::new();
     for batch in batches {
         let parsed = Pg2Sqlite::default().sql(batch).unwrap();

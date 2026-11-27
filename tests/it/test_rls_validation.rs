@@ -3,7 +3,7 @@
 //! This module tests the RLS validation system that monitors for violations
 //! between backend RLS policies and client-side views.
 
-use diesel::prelude::*;
+use diesel::{connection::SimpleConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 use rosetta_uuid::Uuid;
 
@@ -102,9 +102,9 @@ fn test_audit_table_uses_configured_name() -> Result<(), Box<dyn std::error::Err
     // Execute the generated DDL against SQLite to verify it runs. The
     // translated statements are arbitrary CREATE TABLE, VIEW, and TRIGGER
     // strings that cannot be expressed via diesel's typed DSL.
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     for s in &translated {
-        conn.execute_batch(&format!("{s};")).unwrap();
+        conn.batch_execute(&format!("{s};")).unwrap();
     }
 
     Ok(())
@@ -154,9 +154,9 @@ fn test_triggers_use_configured_audit_table() -> Result<(), Box<dyn std::error::
     // Execute the generated DDL against SQLite to verify it runs. The
     // translated statements are arbitrary CREATE TABLE, VIEW, and TRIGGER
     // strings that cannot be expressed via diesel's typed DSL.
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     for s in &translated {
-        conn.execute_batch(&format!("{s};")).unwrap();
+        conn.batch_execute(&format!("{s};")).unwrap();
     }
 
     Ok(())

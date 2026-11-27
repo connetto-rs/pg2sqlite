@@ -4,8 +4,10 @@
 //! no opt-out, so a fragment becomes translatable by declaring its targets
 //! earlier in the same document.
 
-use diesel::{Connection, RunQueryDsl, SqliteConnection};
+use diesel::{Connection, RunQueryDsl};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+
+use crate::helpers::Replica;
 
 const DANGLING_TABLE: &str =
     "CREATE TABLE child (id INT PRIMARY KEY, parent_id INT REFERENCES missing_table(id));";
@@ -86,7 +88,7 @@ fn closing_the_document_translates_the_former_fragment() {
         .translate_to_sql(&Pg2SqliteOptions::default())
         .expect("declaring the target in the same document must translate")
         .into_vec();
-    let mut conn = SqliteConnection::establish(":memory:").unwrap();
+    let mut conn = Replica::establish(":memory:").unwrap();
     for s in &sql {
         diesel::sql_query(s.as_str()).execute(&mut conn).unwrap();
     }

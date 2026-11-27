@@ -116,7 +116,7 @@ fn script(grants: &str) -> String {
     )
 }
 
-fn replica(grants: &str) -> SqliteConnection {
+fn replica(grants: &str) -> crate::helpers::Replica {
     let options = Pg2SqliteOptions::default()
         .with_deployment(Deployment::new("app", ["app"], []).expect("a valid deployment"))
         .with_acting_role("app")
@@ -124,16 +124,19 @@ fn replica(grants: &str) -> SqliteConnection {
         .with_rls_exemption_function("note_write_exempt");
     let mut connection =
         helpers::apply_with_options(&script(grants), &options).expect("the script applies");
-    note_write_exempt_utils::register_nondeterministic_impl(&mut connection, || false)
-        .expect("register the exemption");
+    note_write_exempt_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        || false,
+    )
+    .expect("register the exemption");
     connection
 }
 
-fn insert_note(connection: &mut SqliteConnection) -> QueryResult<usize> {
+fn insert_note(connection: &mut crate::helpers::Replica) -> QueryResult<usize> {
     diesel::insert_into(notes::table).values(notes::id.eq(1)).execute(connection)
 }
 
-fn logged(connection: &mut SqliteConnection) -> Vec<i32> {
+fn logged(connection: &mut crate::helpers::Replica) -> Vec<i32> {
     note_log::table.select(note_log::note).load(connection).expect("the log reads")
 }
 
@@ -230,7 +233,7 @@ fn audit_script(grants: &str) -> String {
     )
 }
 
-fn audit_replica(grants: &str) -> SqliteConnection {
+fn audit_replica(grants: &str) -> crate::helpers::Replica {
     let options = Pg2SqliteOptions::default()
         .with_deployment(Deployment::new("app", ["app"], []).expect("a valid deployment"))
         .with_acting_role("app")
@@ -238,7 +241,7 @@ fn audit_replica(grants: &str) -> SqliteConnection {
     helpers::apply_with_options(&audit_script(grants), &options).expect("the script applies")
 }
 
-fn insert_entry(connection: &mut SqliteConnection, id: i32) -> QueryResult<usize> {
+fn insert_entry(connection: &mut crate::helpers::Replica, id: i32) -> QueryResult<usize> {
     diesel::insert_into(entries::table)
         .values((entries::id.eq(id), entries::secret.eq(7)))
         .execute(connection)

@@ -5,11 +5,11 @@
 
 #![allow(missing_docs)]
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use rusqlite::Connection;
 use translate_helpers::translate_default as translate;
 
-use crate::helpers::translate as translate_helpers;
+use crate::helpers::{Replica, translate as translate_helpers};
 
 #[test]
 fn cas_type_maps_to_blob_not_binary() {
@@ -19,7 +19,7 @@ fn cas_type_maps_to_blob_not_binary() {
     assert!(!out.contains("BINARY"), "cas must not produce BINARY (invalid in STRICT): {out}");
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Replica::establish(":memory:").unwrap();
     let stmts = Pg2Sqlite::default()
         .sql(sql)
         .unwrap()
@@ -27,7 +27,7 @@ fn cas_type_maps_to_blob_not_binary() {
         .unwrap()
         .into_vec();
     let script = stmts.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n");
-    conn.execute_batch(&script).unwrap_or_else(|e| panic!("translated DDL must execute: {e}"));
+    conn.batch_execute(&script).unwrap_or_else(|e| panic!("translated DDL must execute: {e}"));
 }
 
 #[test]
@@ -38,7 +38,7 @@ fn molecular_formula_maps_to_blob_not_binary() {
     assert!(!out.contains("BINARY"), "molecularformula must not produce BINARY: {out}");
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Replica::establish(":memory:").unwrap();
     let stmts = Pg2Sqlite::default()
         .sql(sql)
         .unwrap()
@@ -46,7 +46,7 @@ fn molecular_formula_maps_to_blob_not_binary() {
         .unwrap()
         .into_vec();
     let script = stmts.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n");
-    conn.execute_batch(&script).unwrap_or_else(|e| panic!("translated DDL must execute: {e}"));
+    conn.batch_execute(&script).unwrap_or_else(|e| panic!("translated DDL must execute: {e}"));
 }
 
 #[test]
@@ -57,7 +57,7 @@ fn media_type_maps_to_blob_not_binary() {
     assert!(!out.contains("BINARY"), "mediatype must not produce BINARY: {out}");
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Replica::establish(":memory:").unwrap();
     let stmts = Pg2Sqlite::default()
         .sql(sql)
         .unwrap()
@@ -65,5 +65,5 @@ fn media_type_maps_to_blob_not_binary() {
         .unwrap()
         .into_vec();
     let script = stmts.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n");
-    conn.execute_batch(&script).unwrap_or_else(|e| panic!("translated DDL must execute: {e}"));
+    conn.batch_execute(&script).unwrap_or_else(|e| panic!("translated DDL must execute: {e}"));
 }

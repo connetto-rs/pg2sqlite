@@ -31,7 +31,7 @@ fn pk_constraint_columns_translated() {
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
     let stmts = helpers::translate_pg(sql, &options).unwrap();
-    helpers::apply_rusqlite_statements(&stmts);
+    helpers::apply_statements(&stmts);
 }
 
 #[test]
@@ -52,7 +52,7 @@ fn unique_constraint_columns_translated() {
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
     let stmts = helpers::translate_pg(sql, &options).unwrap();
-    helpers::apply_rusqlite_statements(&stmts);
+    helpers::apply_statements(&stmts);
 }
 
 #[test]
@@ -120,7 +120,7 @@ fn the_translatable_constraints_still_translate() {
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
     let stmts = helpers::translate_pg(sql, &default_options()).unwrap();
-    helpers::apply_rusqlite_statements(&stmts);
+    helpers::apply_statements(&stmts);
 }
 
 mod keyed {
@@ -135,7 +135,7 @@ mod keyed {
 
 /// Inserts one row into `t` of the translated schema.
 fn insert_keyed(
-    connection: &mut SqliteConnection,
+    connection: &mut crate::helpers::Replica,
     id: i32,
     a: Option<i32>,
     s: Option<&str>,
@@ -232,5 +232,5 @@ fn unique_nulls_distinct_is_translated() {
     // Execute the emitted DDL to prove real SQLite accepts the translated
     // schema.
     let stmts = helpers::translate_pg(sql, &default_options()).unwrap();
-    helpers::apply_rusqlite_statements(&stmts);
+    helpers::apply_statements(&stmts);
 }

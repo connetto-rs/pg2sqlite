@@ -1,12 +1,12 @@
 //! `IS [NOT] JSON` translation onto SQLite's `json1` predicates.
 //!
-//! Every assertion executes the translator's own output against an in-memory
-//! SQLite. `rusqlite` is used rather than diesel's typed DSL because the
-//! statements under test are generated text whose shape is what is being
-//! verified.
+//! Every assertion executes the translator's output against managed in-memory
+//! SQLite.
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use rusqlite::Connection;
+
+use crate::helpers::{Replica, SqliteAnyValue, query_values};
 
 /// The fixture every predicate test shares: one well-formed object, one
 /// well-formed array, one scalar, and one string that is not JSON at all.
@@ -39,17 +39,22 @@ fn matching_ids(predicate: &str) -> Vec<i64> {
             .expect("translation should succeed");
     let probe = statements.pop().expect("script should emit a query");
 
-    let conn = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut conn = Replica::establish(":memory:").expect("in-memory SQLite");
     for statement in &statements {
-        conn.execute_batch(&format!("{statement};"))
+        conn.batch_execute(&format!("{statement};"))
             .unwrap_or_else(|e| panic!("emitted setup failed: {e}\n{statement}"));
     }
-    let mut stmt =
-        conn.prepare(&probe).unwrap_or_else(|e| panic!("emitted probe failed: {e}\n{probe}"));
-    stmt.query_map([], |row| row.get::<_, i64>(0))
-        .unwrap_or_else(|e| panic!("emitted probe failed to run: {e}\n{probe}"))
-        .collect::<Result<Vec<_>, _>>()
-        .expect("ids should decode")
+
+    query_values(&mut conn, &probe, &[])
+        .expect("probe runs")
+        .into_iter()
+        .map(|row| {
+            match row[0] {
+                SqliteAnyValue::Integer(value) => value,
+                ref value => panic!("expected integer, got {value:?}"),
+            }
+        })
+        .collect()
 }
 
 /// Before the predicate was translated it was emitted verbatim as

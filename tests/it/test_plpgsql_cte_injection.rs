@@ -2,7 +2,7 @@
 //!
 //! G1: Case, `Expr::In`, Between, Cast, Function, Tuple arms missing from
 //! catch-all. When a CTE-referencing subquery is nested inside one of these
-//! expressions, the WITH clause must be injected into the subquery.
+//! expressions, the WITH clause use must be injected into the subquery.
 //!
 //! The three R125 pins flipped here: `SELECT ... INTO var` with no FROM
 //! clause used to survive verbatim into the emitted trigger body, which
@@ -11,6 +11,7 @@
 //! still materialises in the output, and the trigger is exercised by
 //! execution with its effect asserted row by row.
 
+use diesel::connection::SimpleConnection;
 use helpers::translate_sql;
 use pg2sqlite::prelude::{Pg2SqliteOptions, UuidRepresentation};
 
@@ -21,14 +22,21 @@ fn uuid_options() -> Pg2SqliteOptions {
 }
 
 /// Reads `(hex(id), flagged)` pairs from the audit table in insertion order.
-fn audit_rows(conn: &rusqlite::Connection) -> Vec<(String, i64)> {
-    let mut stmt = conn
-        .prepare("SELECT hex(id), flagged FROM audit ORDER BY rowid")
-        .expect("audit table must exist");
-    let rows = stmt
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
-        .expect("query audit");
-    rows.collect::<Result<Vec<_>, _>>().expect("read audit rows")
+fn audit_rows(connection: &mut helpers::Replica) -> Vec<(String, i64)> {
+    helpers::query_values(connection, "SELECT hex(id), flagged FROM audit ORDER BY rowid", &[])
+        .expect("query audit")
+        .into_iter()
+        .map(|row| {
+            let mut values = row.into_iter();
+            match (values.next(), values.next()) {
+                (
+                    Some(helpers::SqliteAnyValue::Text(identifier)),
+                    Some(helpers::SqliteAnyValue::Integer(flagged)),
+                ) => (identifier, flagged),
+                values => panic!("unexpected audit row {values:?}"),
+            }
+        })
+        .collect()
 }
 
 #[test]
@@ -52,15 +60,14 @@ fn plpgsql_cte_injection_inside_case() {
         "#;
     let sql = translate_sql(pg, &options).unwrap();
     assert!(sql.contains("counts"), "CTE 'counts' should appear in translated output: {sql}");
-    let conn = helpers::apply_rusqlite_statements(
-        &helpers::translate_pg(pg, &options).expect("translate"),
-    );
+    let mut conn =
+        helpers::apply_statements(&helpers::translate_pg(pg, &options).expect("translate"));
     // The CASE reads COUNT(*) at BEFORE INSERT time: 0 rows for the first
     // insert, 1 row for the second.
-    conn.execute_batch("INSERT INTO t (id, val) VALUES (X'01', 10);").expect("first insert");
-    conn.execute_batch("INSERT INTO t (id, val) VALUES (X'02', 20);").expect("second insert");
+    conn.batch_execute("INSERT INTO t (id, val) VALUES (X'01', 10);").expect("first insert");
+    conn.batch_execute("INSERT INTO t (id, val) VALUES (X'02', 20);").expect("second insert");
     assert_eq!(
-        audit_rows(&conn),
+        audit_rows(&mut conn),
         vec![("01".to_string(), 0), ("02".to_string(), 1)],
         "the bound CASE result must see the pre-insert row count"
     );
@@ -87,14 +94,13 @@ fn plpgsql_cte_injection_inside_inlist() {
         "#;
     let sql = translate_sql(pg, &options).unwrap();
     assert!(sql.contains("ids"), "CTE 'ids' should appear in translated output: {sql}");
-    let conn = helpers::apply_rusqlite_statements(
-        &helpers::translate_pg(pg, &options).expect("translate"),
-    );
+    let mut conn =
+        helpers::apply_statements(&helpers::translate_pg(pg, &options).expect("translate"));
     // A fresh primary key is never already present, so both lookups answer 0,
     // which still proves the IN subquery prepared and ran against the CTE.
-    conn.execute_batch("INSERT INTO t (id, val) VALUES (X'01', 10);").expect("first insert");
-    conn.execute_batch("INSERT INTO t (id, val) VALUES (X'02', 20);").expect("second insert");
-    assert_eq!(audit_rows(&conn), vec![("01".to_string(), 0), ("02".to_string(), 0)]);
+    conn.batch_execute("INSERT INTO t (id, val) VALUES (X'01', 10);").expect("first insert");
+    conn.batch_execute("INSERT INTO t (id, val) VALUES (X'02', 20);").expect("second insert");
+    assert_eq!(audit_rows(&mut conn), vec![("01".to_string(), 0), ("02".to_string(), 0)]);
 }
 
 #[test]
@@ -118,13 +124,12 @@ fn plpgsql_cte_injection_inside_between() {
         "#;
     let sql = translate_sql(pg, &options).unwrap();
     assert!(sql.contains("bounds"), "CTE 'bounds' should appear in translated output: {sql}");
-    let conn = helpers::apply_rusqlite_statements(
-        &helpers::translate_pg(pg, &options).expect("translate"),
-    );
-    conn.execute_batch("INSERT INTO t (id, val) VALUES (X'01', 5);").expect("in-range insert");
-    conn.execute_batch("INSERT INTO t (id, val) VALUES (X'02', 50);").expect("out-of-range insert");
+    let mut conn =
+        helpers::apply_statements(&helpers::translate_pg(pg, &options).expect("translate"));
+    conn.batch_execute("INSERT INTO t (id, val) VALUES (X'01', 5);").expect("in-range insert");
+    conn.batch_execute("INSERT INTO t (id, val) VALUES (X'02', 50);").expect("out-of-range insert");
     assert_eq!(
-        audit_rows(&conn),
+        audit_rows(&mut conn),
         vec![("01".to_string(), 1), ("02".to_string(), 0)],
         "BETWEEN over the CTE bounds must discriminate in-range from out-of-range"
     );
@@ -152,13 +157,12 @@ fn a_with_prefixed_select_into_with_from_binds_and_runs() {
         $$ LANGUAGE plpgsql;
         CREATE TRIGGER wf_trigger BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION wf_fn();
         "#;
-    let conn = helpers::apply_rusqlite_statements(
-        &helpers::translate_pg(pg, &options).expect("translate"),
-    );
-    conn.execute_batch("INSERT INTO t (id, val) VALUES (X'01', 10);").expect("first insert");
-    conn.execute_batch("INSERT INTO t (id, val) VALUES (X'02', 20);").expect("second insert");
+    let mut conn =
+        helpers::apply_statements(&helpers::translate_pg(pg, &options).expect("translate"));
+    conn.batch_execute("INSERT INTO t (id, val) VALUES (X'01', 10);").expect("first insert");
+    conn.batch_execute("INSERT INTO t (id, val) VALUES (X'02', 20);").expect("second insert");
     assert_eq!(
-        audit_rows(&conn),
+        audit_rows(&mut conn),
         vec![("01".to_string(), 0), ("02".to_string(), 1)],
         "the FROM-carrying shape must bind the pre-insert row count"
     );
@@ -183,9 +187,8 @@ fn a_plain_expression_select_into_binds_and_runs() {
         $$ LANGUAGE plpgsql;
         CREATE TRIGGER plain_trigger BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION plain_fn();
         "#;
-    let conn = helpers::apply_rusqlite_statements(
-        &helpers::translate_pg(pg, &options).expect("translate"),
-    );
-    conn.execute_batch("INSERT INTO t (id, val) VALUES (X'01', 10);").expect("insert");
-    assert_eq!(audit_rows(&conn), vec![("01".to_string(), 3)]);
+    let mut conn =
+        helpers::apply_statements(&helpers::translate_pg(pg, &options).expect("translate"));
+    conn.batch_execute("INSERT INTO t (id, val) VALUES (X'01', 10);").expect("insert");
+    assert_eq!(audit_rows(&mut conn), vec![("01".to_string(), 3)]);
 }

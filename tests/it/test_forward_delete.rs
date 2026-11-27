@@ -1,9 +1,9 @@
 //! Tests for forward DELETE translation covering USING clause conversion.
 //! in `src/impls/translator_impls/delete.rs`.
 
+use diesel::{Connection, connection::SimpleConnection};
 use helpers::execute_joined_statements as execute_all;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use rusqlite::Connection;
 use sqlparser::{
     ast::{Expr, Statement},
     dialect::PostgreSqlDialect,
@@ -143,9 +143,9 @@ fn delete_order_by_and_limit_translate_expressions() {
     // Execute DDL statements. The DELETE uses ORDER BY/LIMIT which requires
     // SQLITE_ENABLE_UPDATE_DELETE_LIMIT at compile time, so only the DDL
     // (non-Delete) statements are run here to prove SQLite accepts the schema.
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     for s in stmts.iter().filter(|s| !matches!(s, Statement::Delete(_))) {
-        conn.execute_batch(&format!("{s};")).unwrap();
+        conn.batch_execute(&format!("{s};")).unwrap();
     }
 }
 
@@ -173,14 +173,14 @@ mod delete_alias {
 
     const SCHEMA: &str = "CREATE TABLE t (id INT PRIMARY KEY, n INT NOT NULL);";
 
-    fn prepared(source: &str) -> (SqliteConnection, String) {
+    fn prepared(source: &str) -> (crate::helpers::Replica, String) {
         let statements = Pg2Sqlite::default()
             .sql(&format!("{SCHEMA}\n{source}"))
             .unwrap()
             .translate(&Pg2SqliteOptions::default())
             .unwrap()
             .into_vec();
-        let mut connection = SqliteConnection::establish(":memory:").unwrap();
+        let mut connection = crate::helpers::Replica::establish(":memory:").unwrap();
         let mut delete = None;
         for statement in statements {
             if matches!(statement, Statement::Delete(_)) {
@@ -200,7 +200,7 @@ mod delete_alias {
         (connection, delete.expect("translated delete"))
     }
 
-    fn remaining(connection: &mut SqliteConnection) -> Vec<(i32, i32)> {
+    fn remaining(connection: &mut crate::helpers::Replica) -> Vec<(i32, i32)> {
         t::table.select((t::id, t::n)).order(t::id.asc()).load(connection).unwrap()
     }
 

@@ -76,7 +76,7 @@ fn options(role: &str) -> Pg2SqliteOptions {
         .with_rls_exemption_function("write_is_exempt")
 }
 
-fn translate_and_setup(role: &str) -> diesel::SqliteConnection {
+fn translate_and_setup(role: &str) -> crate::helpers::Replica {
     let translated = Pg2Sqlite::default()
         .sql(FIXTURE_SQL)
         .expect("parse fixture")
@@ -85,9 +85,10 @@ fn translate_and_setup(role: &str) -> diesel::SqliteConnection {
         .into_vec();
 
     let mut connection = helpers::establish_connection();
-    write_is_exempt_utils::register_nondeterministic_impl(&mut connection, || {
-        WRITE_IS_EXEMPT.with(Cell::get)
-    })
+    write_is_exempt_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        || WRITE_IS_EXEMPT.with(Cell::get),
+    )
     .expect("register write_is_exempt");
 
     for statement in &translated {
@@ -106,7 +107,7 @@ fn set_write_exempt(exempt: bool) {
 
 /// Seeds one profile per role into the backing table. The RLS exemption
 /// has to hold the guards open for the foreign rows.
-fn seed_profiles(connection: &mut diesel::SqliteConnection) {
+fn seed_profiles(connection: &mut crate::helpers::Replica) {
     set_write_exempt(true);
     for (username, is_public) in SEED {
         diesel::insert_into(schema::profiles_rls::table)

@@ -62,11 +62,12 @@ struct CategoryDescendantCount {
     descendant_count: i64,
 }
 
-fn translate_and_setup() -> Result<diesel::SqliteConnection, Box<dyn std::error::Error>> {
+fn translate_and_setup() -> crate::helpers::Replica {
     crate::support::fixtures::apply_fixture(
         include_str!("../fixtures/recursive_view.sql"),
         &Pg2SqliteOptions::default(),
     )
+    .expect("recursive view fixture")
 }
 
 /// Snapshot test for recursive view translation.
@@ -83,7 +84,7 @@ fn test_recursive_view_translation_snapshot() -> Result<(), Box<dyn std::error::
 
 #[test]
 fn test_category_tree_view() -> Result<(), Box<dyn std::error::Error>> {
-    let mut connection = translate_and_setup()?;
+    let mut connection = translate_and_setup();
 
     // Insert a category hierarchy:
     // Electronics (root)
@@ -145,7 +146,7 @@ fn test_category_tree_view() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn test_category_descendant_count_view() -> Result<(), Box<dyn std::error::Error>> {
-    let mut connection = translate_and_setup()?;
+    let mut connection = translate_and_setup();
 
     // Same hierarchy as above
     diesel::insert_into(categories::table)
@@ -199,7 +200,7 @@ fn test_category_descendant_count_view() -> Result<(), Box<dyn std::error::Error
 
 #[test]
 fn test_recursive_view_empty_table() -> Result<(), Box<dyn std::error::Error>> {
-    let mut connection = translate_and_setup()?;
+    let mut connection = translate_and_setup();
 
     // Query empty views
     let tree = diesel::sql_query("SELECT id, name, parent_id, depth, path FROM category_tree")

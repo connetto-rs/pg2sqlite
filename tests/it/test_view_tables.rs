@@ -116,20 +116,29 @@ fn acting() -> Pg2SqliteOptions {
 
 /// Applies `views` over the schema on `app`'s replica, then lands `seed`
 /// past the guards, as the server delivers rows.
-fn replica(views: &str, seed: impl FnOnce(&mut SqliteConnection)) -> SqliteConnection {
+fn replica(
+    views: &str,
+    seed: impl FnOnce(&mut helpers::Replica),
+) -> helpers::Replica {
     let mut connection =
         helpers::apply_with_options(&script(views), &acting()).expect("the script applies");
-    server_delivery_utils::register_nondeterministic_impl(&mut connection, || true)
-        .expect("exempt the delivery");
+    server_delivery_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        || true,
+    )
+    .expect("exempt the delivery");
     seed(&mut connection);
-    server_delivery_utils::register_nondeterministic_impl(&mut connection, || false)
-        .expect("end the exemption");
+    server_delivery_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        || false,
+    )
+    .expect("end the exemption");
     connection
 }
 
 /// `resource_moves` holding the rows the view shows `app`, `(1, 1)` and
 /// `(3, 1)`.
-fn moves_replica() -> SqliteConnection {
+fn moves_replica() -> helpers::Replica {
     replica(MOVES, |connection| {
         diesel::insert_into(resource_moves::table)
             .values(&[
@@ -141,7 +150,7 @@ fn moves_replica() -> SqliteConnection {
     })
 }
 
-fn moves(connection: &mut SqliteConnection) -> Vec<(i32, i32)> {
+fn moves(connection: &mut helpers::Replica) -> Vec<(i32, i32)> {
     resource_moves::table.order(resource_moves::resource).load(connection).expect("the moves read")
 }
 
@@ -174,7 +183,7 @@ struct Kind {
 }
 
 /// What `name` is on the replica, `None` when it holds nothing of the name.
-fn kind(connection: &mut SqliteConnection, name: &str) -> Option<String> {
+fn kind(connection: &mut helpers::Replica, name: &str) -> Option<String> {
     diesel::sql_query("SELECT type AS kind FROM sqlite_master WHERE name = ?")
         .bind::<Text, _>(name)
         .get_result::<Kind>(connection)
@@ -195,7 +204,7 @@ struct Column {
 
 /// The columns of table `name` on the replica, with their declared types and
 /// their positions in its primary key.
-fn columns(connection: &mut SqliteConnection, name: &str) -> Vec<Column> {
+fn columns(connection: &mut helpers::Replica, name: &str) -> Vec<Column> {
     diesel::sql_query("SELECT name, type AS declared, pk FROM pragma_table_info(?) ORDER BY cid")
         .bind::<Text, _>(name)
         .load::<Column>(connection)
@@ -203,7 +212,7 @@ fn columns(connection: &mut SqliteConnection, name: &str) -> Vec<Column> {
 }
 
 /// The names of the columns keying table `name` on the replica, in key order.
-fn key_of(connection: &mut SqliteConnection, name: &str) -> Vec<String> {
+fn key_of(connection: &mut helpers::Replica, name: &str) -> Vec<String> {
     let mut keyed: Vec<Column> =
         columns(connection, name).into_iter().filter(|column| column.pk > 0).collect();
     keyed.sort_by_key(|column| column.pk);
@@ -211,7 +220,7 @@ fn key_of(connection: &mut SqliteConnection, name: &str) -> Vec<String> {
 }
 
 /// Applies `views` over the schema on `app`'s replica, delivering nothing.
-fn applied(views: &str) -> SqliteConnection {
+fn applied(views: &str) -> helpers::Replica {
     replica(views, |_| {})
 }
 

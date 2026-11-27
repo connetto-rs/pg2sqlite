@@ -9,7 +9,6 @@
 use diesel::{
     prelude::*,
     sql_types::{Nullable, Text},
-    sqlite::SqliteConnection,
 };
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation, postgres_error};
 use rosetta_uuid::Uuid;
@@ -49,7 +48,7 @@ fn options() -> Pg2SqliteOptions {
 
 /// Translates `source` and applies every statement, answering the error of the
 /// first one SQLite refuses.
-fn apply_translated(connection: &mut SqliteConnection, source: &str) -> QueryResult<()> {
+fn apply_translated(connection: &mut crate::helpers::Replica, source: &str) -> QueryResult<()> {
     let statements = Pg2Sqlite::default()
         .sql(source)
         .expect("parse the source")
@@ -75,7 +74,7 @@ fn probe_query(expression: &str, id: u8) -> String {
     format!("SELECT {expression} AS val FROM ids WHERE id = {id}")
 }
 
-fn sqlite_answer(sqlite: &mut SqliteConnection, expression: &str, id: u8) -> Option<String> {
+fn sqlite_answer(sqlite: &mut crate::helpers::Replica, expression: &str, id: u8) -> Option<String> {
     let source = format!("{SCHEMA}{};", probe_query(expression, id));
     let translated = Pg2Sqlite::default()
         .sql(&source)

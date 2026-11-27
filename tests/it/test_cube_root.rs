@@ -12,8 +12,18 @@
 //!
 //! Every expected value below was read off PostgreSQL 17.
 
+#[diesel::declare_sql_function]
+extern "SQL" {
+    fn pow(
+        base: diesel::sql_types::Nullable<diesel::sql_types::Double>,
+        exponent: diesel::sql_types::Nullable<diesel::sql_types::Double>,
+    ) -> diesel::sql_types::Nullable<diesel::sql_types::Double>;
+}
+
+use diesel::Connection;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use rusqlite::{Connection, functions::FunctionFlags, types::FromSql};
+
+use crate::helpers;
 
 fn options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default().with_math_functions_available()
@@ -32,42 +42,42 @@ fn translate(pg: &str) -> String {
 
 /// The bundled SQLite is built without the math functions, so `pow` is
 /// registered here. `abs` and `sign` are core and need nothing.
-fn evaluate<T: FromSql>(pg: &str) -> T {
+fn evaluate(pg: &str) -> Option<f64> {
     let probe = translate(pg);
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
-    connection
-        .create_scalar_function("pow", 2, FunctionFlags::SQLITE_DETERMINISTIC, |context| {
-            // SQLite's own math functions answer NULL for a NULL argument.
-            let (base, exponent) = (context.get::<Option<f64>>(0)?, context.get::<Option<f64>>(1)?);
-            Ok(base.zip(exponent).map(|(base, exponent)| base.powf(exponent)))
-        })
-        .expect("register pow");
-    connection
-        .query_row(&probe, [], |row| row.get::<_, T>(0))
-        .unwrap_or_else(|error| panic!("emitted probe failed: {error}\n{probe}"))
+    let mut connection = helpers::Replica::establish(":memory:").expect("in-memory SQLite");
+    pow_utils::register_impl(
+        connection.registration().expect("registration").sqlite(),
+        |base: Option<f64>, exponent: Option<f64>| {
+            base.zip(exponent).map(|(base, exponent)| base.powf(exponent))
+        },
+    )
+    .expect("register pow");
+    let rows = helpers::query_values(&mut connection, &probe, &[])
+        .unwrap_or_else(|error| panic!("emitted probe failed: {error}\n{probe}"));
+    helpers::numeric_value(&rows[0][0])
 }
 
 /// PostgreSQL answers -2. This used to be NULL.
 #[test]
 fn the_cube_root_of_a_negative_number_is_negative() {
-    assert_eq!(evaluate::<Option<f64>>("SELECT cbrt(-8);"), Some(-2.0));
-    assert_eq!(evaluate::<Option<f64>>("SELECT cbrt(-27);"), Some(-3.0));
+    assert_eq!(evaluate("SELECT cbrt(-8);"), Some(-2.0));
+    assert_eq!(evaluate("SELECT cbrt(-27);"), Some(-3.0));
 }
 
 #[test]
 fn the_cube_root_of_a_positive_number_is_unchanged() {
-    assert_eq!(evaluate::<Option<f64>>("SELECT cbrt(8);"), Some(2.0));
-    assert_eq!(evaluate::<Option<f64>>("SELECT cbrt(27);"), Some(3.0));
+    assert_eq!(evaluate("SELECT cbrt(8);"), Some(2.0));
+    assert_eq!(evaluate("SELECT cbrt(27);"), Some(3.0));
 }
 
 #[test]
 fn the_cube_root_of_zero_is_zero() {
-    assert_eq!(evaluate::<Option<f64>>("SELECT cbrt(0);"), Some(0.0));
+    assert_eq!(evaluate("SELECT cbrt(0);"), Some(0.0));
 }
 
 #[test]
 fn a_null_operand_stays_null() {
-    assert_eq!(evaluate::<Option<f64>>("SELECT cbrt(NULL);"), None);
+    assert_eq!(evaluate("SELECT cbrt(NULL);"), None);
 }
 
 /// PostgreSQL answers 1.2599210498948734 and -0.1. `pow` is not correctly
@@ -75,9 +85,9 @@ fn a_null_operand_stays_null() {
 /// further, which is why this is a tolerance rather than an equality.
 #[test]
 fn a_value_that_is_not_a_perfect_cube_matches_postgresql_closely() {
-    let two: f64 = evaluate("SELECT cbrt(2);");
+    let two: f64 = evaluate("SELECT cbrt(2);").expect("non-null root");
     assert!((two - 1.259_921_049_894_873_4).abs() < 1e-15, "got {two}");
-    let small: f64 = evaluate("SELECT cbrt(-0.001);");
+    let small: f64 = evaluate("SELECT cbrt(-0.001);").expect("non-null root");
     assert!((small + 0.1).abs() < 1e-15, "got {small}");
 }
 
@@ -86,7 +96,7 @@ fn a_value_that_is_not_a_perfect_cube_matches_postgresql_closely() {
 #[test]
 fn cubing_the_answer_returns_the_operand() {
     for operand in [-8.0, -1.5, -0.001, 0.0, 0.001, 1.5, 8.0] {
-        let root: f64 = evaluate(&format!("SELECT cbrt({operand});"));
+        let root: f64 = evaluate(&format!("SELECT cbrt({operand});")).expect("non-null root");
         let cubed = root * root * root;
         assert!(
             (cubed - operand).abs() < 1e-12 * operand.abs().max(1.0),
@@ -138,24 +148,24 @@ fn the_emitted_shape_reverses_to_valid_postgresql() {
 /// arm does not, so the two forms disagree on negative inputs.
 #[test]
 fn the_operator_form_of_cube_root_of_negative_eight_is_negative_two() {
-    assert_eq!(evaluate::<Option<f64>>("SELECT ||/ -8;"), Some(-2.0));
+    assert_eq!(evaluate("SELECT ||/ -8;"), Some(-2.0));
 }
 
 /// Same defect at a different value to pin both the translation shape and the
 /// sign rule.
 #[test]
 fn the_operator_form_of_cube_root_of_negative_twenty_seven_is_negative_three() {
-    assert_eq!(evaluate::<Option<f64>>("SELECT ||/ -27;"), Some(-3.0));
+    assert_eq!(evaluate("SELECT ||/ -27;"), Some(-3.0));
 }
 
 /// Green companion: a positive operand already works through pow(x, 1/3).
 #[test]
 fn the_operator_form_of_cube_root_of_positive_eight_is_two() {
-    assert_eq!(evaluate::<Option<f64>>("SELECT ||/ 8;"), Some(2.0));
+    assert_eq!(evaluate("SELECT ||/ 8;"), Some(2.0));
 }
 
 /// Green companion: NULL propagates through any form of the translation.
 #[test]
 fn the_operator_form_null_operand_stays_null() {
-    assert_eq!(evaluate::<Option<f64>>("SELECT ||/ NULL;"), None);
+    assert_eq!(evaluate("SELECT ||/ NULL;"), None);
 }

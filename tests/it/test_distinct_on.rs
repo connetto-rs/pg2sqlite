@@ -54,7 +54,7 @@ fn distinct_on_semantic_highest_per_partition() -> Result<(), Box<dyn std::error
     let options = Pg2SqliteOptions::default();
     let stmts = helpers::translate_pg(sql, &options).unwrap();
     let query = helpers::user_statement_of(&stmts, "SELECT").clone();
-    let mut conn = SqliteConnection::establish(":memory:")?;
+    let mut conn = crate::helpers::Replica::establish(":memory:")?;
     // Dynamically-generated DDL; the table schema is ephemeral and has no
     // table! macro.
     for s in stmts.iter().filter(|s| !helpers::is_user_statement(s, "SELECT")) {
@@ -130,7 +130,7 @@ fn latest_per_sensor(query: &str) -> Result<Vec<Latest>, Box<dyn std::error::Err
     let options = Pg2SqliteOptions::default();
     let stmts = helpers::translate_pg(&format!("{READINGS} {query};"), &options).unwrap();
     let select = helpers::user_statement_of(&stmts, "SELECT").clone();
-    let mut conn = SqliteConnection::establish(":memory:")?;
+    let mut conn = crate::helpers::Replica::establish(":memory:")?;
     // Dynamically-generated DDL/DML; the table schema is ephemeral and has no
     // table! macro.
     for s in stmts.iter().filter(|s| !helpers::is_user_statement(s, "SELECT")) {

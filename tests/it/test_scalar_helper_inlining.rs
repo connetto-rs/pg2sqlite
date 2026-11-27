@@ -674,7 +674,7 @@ fn counted(sql: &str, count_query: &str) -> i64 {
     use diesel::RunQueryDsl;
     let script = helpers::translate_script(sql, &Pg2SqliteOptions::default())
         .unwrap_or_else(|error| panic!("refused: {error}"));
-    let mut connection = helpers::applied_script(&script, None);
+    let mut connection = helpers::applied_script(&script);
     diesel::select(diesel::dsl::sql::<diesel::sql_types::BigInt>(&format!("({count_query})")))
         .get_result(&mut connection)
         .unwrap_or_else(|error| panic!("SQLite refuses {count_query}: {error}"))

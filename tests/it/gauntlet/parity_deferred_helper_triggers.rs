@@ -9,7 +9,7 @@
 //! before its check. The replica has to accept and refuse the same
 //! transactions and keep the same rows.
 
-use diesel::{QueryResult, connection::SimpleConnection, prelude::*};
+use diesel::{connection::SimpleConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use postgres_harness::{Outcome, apply, fresh_database};
 
@@ -122,24 +122,17 @@ diesel::table! {
     }
 }
 
-struct Replica {
-    connection: SqliteConnection,
-    before_commit: Vec<String>,
-}
-
-fn replica() -> Replica {
+fn replica() -> crate::helpers::Replica {
     let script = Pg2Sqlite::default()
         .sql(&format!("{OWNER};{SOURCE}"))
         .expect("parse")
         .translate_to_sql(&Pg2SqliteOptions::default())
         .unwrap_or_else(|error| panic!("the schema should translate: {error}"));
-    let before_commit = script.before_commit.clone();
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-    script.register_functions(&mut connection).expect("register helper functions");
-    for statement in script.into_vec() {
-        connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
-    }
-    Replica { connection, before_commit }
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
+    script
+        .initialize_managed(&mut connection, pg2sqlite::prelude::FreshFiles::Both)
+        .expect("the schema loads");
+    connection
 }
 
 fn postgres() -> PgConnection {
@@ -153,33 +146,16 @@ fn postgres() -> PgConnection {
     connection
 }
 
-/// Runs `writes` in one transaction and commits it, rolling back a failed
-/// commit on SQLite as PostgreSQL rolls it back.
-fn transaction<C: SimpleConnection>(
-    connection: &mut C,
-    before_commit: &[String],
-    writes: &str,
-) -> QueryResult<()> {
-    connection.batch_execute("BEGIN")?;
-    let committed = connection.batch_execute(writes).and_then(|()| {
-        before_commit.iter().try_for_each(|statement| connection.batch_execute(statement))?;
-        connection.batch_execute("COMMIT")
-    });
-    if committed.is_err() {
-        connection.batch_execute("ROLLBACK")?;
-    }
-    committed
-}
-
 /// Each transaction's outcome.
-fn run<C: SimpleConnection>(
+fn run<C: Connection + SimpleConnection>(
     connection: &mut C,
-    before_commit: &[String],
     transactions: &[&str],
 ) -> Vec<Outcome> {
     transactions
         .iter()
-        .map(|writes| Outcome::of(&transaction(connection, before_commit, writes)))
+        .map(|writes| {
+            Outcome::of(&connection.transaction(|connection| connection.batch_execute(writes)))
+        })
         .collect()
 }
 
@@ -187,7 +163,7 @@ fn run<C: SimpleConnection>(
 /// grants left after the last, and that PostgreSQL gives `expected`.
 fn assert_parity(transactions: &[&str], expected: &[Outcome]) {
     let mut postgres = postgres();
-    let mut on_postgres = run(&mut postgres, &[], transactions);
+    let mut on_postgres = run(&mut postgres, transactions);
     on_postgres.push(Outcome::Rows(
         grants::table
             .select(grants::id)
@@ -196,8 +172,8 @@ fn assert_parity(transactions: &[&str], expected: &[Outcome]) {
             .expect("read the grants on PostgreSQL"),
     ));
     assert_eq!(on_postgres, expected, "PostgreSQL disagrees with the expectation");
-    let Replica { mut connection, before_commit } = replica();
-    let mut on_replica = run(&mut connection, &before_commit, transactions);
+    let mut connection = replica();
+    let mut on_replica = run(&mut connection, transactions);
     on_replica.push(Outcome::Rows(
         grants::table
             .select(grants::id)

@@ -7,10 +7,7 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use diesel::{
-    pg::PgConnection, prelude::*, result::Error as DieselError, sql_types::Bool,
-    sqlite::SqliteConnection,
-};
+use diesel::{pg::PgConnection, prelude::*, result::Error as DieselError, sql_types::Bool};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
 use crate::helpers::{deployment::deployment, establish_connection, postgres as postgres_harness};
@@ -156,7 +153,7 @@ fn postgres() -> PgConnection {
 
 /// The replica for alice, holding the rows the server sends her, with every
 /// column she cannot read left NULL.
-fn replica() -> SqliteConnection {
+fn replica() -> crate::helpers::Replica {
     let options = Pg2SqliteOptions::default()
         .with_deployment(deployment(["alice"], []))
         .with_acting_role("alice")
@@ -167,9 +164,10 @@ fn replica() -> SqliteConnection {
         .translate_with_report(&options)
         .unwrap_or_else(|error| panic!("pg2sqlite refused the schema: {error}"));
     let mut connection = establish_connection();
-    write_exempt_utils::register_nondeterministic_impl(&mut connection, || {
-        EXEMPT.load(Ordering::Relaxed)
-    })
+    write_exempt_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        || EXEMPT.load(Ordering::Relaxed),
+    )
     .expect("register the exemption");
     for statement in report.script.into_vec() {
         // Translated DDL is runtime text no typed DSL carries.

@@ -5,7 +5,7 @@
 //! the rows written after it through the sync triggers, including an update
 //! that moves a row to another key.
 
-use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{pg::PgConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation};
 use rosetta_uuid::Uuid;
 
@@ -183,7 +183,7 @@ macro_rules! writes {
 }
 
 writes!(seed_postgres, later_postgres, PgConnection);
-writes!(seed_sqlite, later_sqlite, SqliteConnection);
+writes!(seed_sqlite, later_sqlite, crate::helpers::Replica);
 
 fn options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default().with_uuid_representation(UuidRepresentation::Blob)
@@ -199,7 +199,7 @@ fn translate(source: &str) -> Vec<String> {
 }
 
 /// Runs translator output, which has no typed form.
-fn execute(connection: &mut SqliteConnection, statements: &[String]) {
+fn execute(connection: &mut crate::helpers::Replica, statements: &[String]) {
     for statement in statements {
         diesel::sql_query(statement)
             .execute(connection)
@@ -216,7 +216,7 @@ fn translated_search(search: &str) -> String {
 /// Every search answered by both engines, PostgreSQL first.
 fn searches<Key>(
     postgres: &mut PgConnection,
-    sqlite: &mut SqliteConnection,
+    sqlite: &mut crate::helpers::Replica,
     search: impl Fn(&str) -> String,
     queries: &[&str],
 ) -> Vec<(String, Vec<Key>, Vec<Key>)>

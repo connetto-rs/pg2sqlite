@@ -11,7 +11,6 @@ use diesel::{
     pg::PgConnection,
     prelude::*,
     sql_types::{Nullable, Text},
-    sqlite::SqliteConnection,
 };
 use pg2sqlite::prelude::{ArrayRepresentation, Pg2Sqlite, Pg2SqliteOptions};
 use sql_traits::structs::ParserDB;
@@ -70,7 +69,7 @@ fn options() -> Pg2SqliteOptions {
 /// translates later statements against.
 struct Replicas {
     postgres: PgConnection,
-    sqlite: SqliteConnection,
+    sqlite: crate::helpers::Replica,
     schema: ParserDB,
 }
 

@@ -11,7 +11,7 @@
 
 use std::cell::RefCell;
 
-use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{pg::PgConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
 use sql_traits::structs::{Deployment, JsonField, SessionSetting, SetPacking, SettingValue};
 use sqlparser::ast::DataType;
@@ -167,20 +167,26 @@ fn options(acting: &str) -> Pg2SqliteOptions {
         .with_session_variable(SessionVariableMapping::new("request.jwt.claims", "jwt_claims"))
 }
 
-fn sqlite(predicate: &str, acting: &str) -> SqliteConnection {
+fn sqlite(predicate: &str, acting: &str) -> crate::helpers::Replica {
     let translated = Pg2Sqlite::default()
         .sql(&format!("{ROLES}{SCHEMA}{}", policy(predicate)))
         .expect("parse")
         .translate(&options(acting))
         .unwrap_or_else(|error| panic!("pg2sqlite refused the schema: {error}"))
         .into_vec();
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-    app_teams_utils::register_impl(&mut connection, current_value).expect("register app_teams");
-    app_owners_utils::register_impl(&mut connection, current_value).expect("register app_owners");
-    app_team_ids_utils::register_impl(&mut connection, current_value)
-        .expect("register app_team_ids");
-    jwt_claims_utils::register_impl(&mut connection, current_value).expect("register jwt_claims");
-    jsonb_functions::register(&mut connection);
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
+    {
+        let mut registration = connection.registration().expect("registration");
+        app_teams_utils::register_impl(registration.sqlite(), current_value)
+            .expect("register app_teams");
+        app_owners_utils::register_impl(registration.sqlite(), current_value)
+            .expect("register app_owners");
+        app_team_ids_utils::register_impl(registration.sqlite(), current_value)
+            .expect("register app_team_ids");
+        jwt_claims_utils::register_impl(registration.sqlite(), current_value)
+            .expect("register jwt_claims");
+        jsonb_functions::register(registration.sqlite());
+    }
     apply_with_seed(&mut connection, &translated, |connection| {
         seed!(connection, docs_rls);
     });

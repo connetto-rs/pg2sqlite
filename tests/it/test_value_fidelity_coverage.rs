@@ -67,8 +67,8 @@ fn cast_uuid_literal_to_uuid_text_canonicalizes() {
 /// branch at column.rs:336.
 #[test]
 fn char_column_length_check_is_enforced() {
-    use rusqlite::Connection;
-    let conn = Connection::open_in_memory().unwrap();
+    use diesel::{Connection, connection::SimpleConnection};
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     let stmts = Pg2Sqlite::default()
         .sql("CREATE TABLE t (col CHAR(3) NOT NULL);")
         .expect("parse")
@@ -76,11 +76,11 @@ fn char_column_length_check_is_enforced() {
         .expect("translate")
         .into_vec();
     for s in &stmts {
-        conn.execute_batch(&format!("{s};")).unwrap_or_else(|e| panic!("DDL failed: {e}\n{s}"));
+        conn.batch_execute(&format!("{s};")).unwrap_or_else(|e| panic!("DDL failed: {e}\n{s}"));
     }
-    conn.execute_batch("INSERT INTO t VALUES ('ab');").expect("2-char value fits in CHAR(3)");
+    conn.batch_execute("INSERT INTO t VALUES ('ab');").expect("2-char value fits in CHAR(3)");
     let err = conn
-        .execute_batch("INSERT INTO t VALUES ('abcd');")
+        .batch_execute("INSERT INTO t VALUES ('abcd');")
         .expect_err("4-char value must be rejected by the CHAR(3) CHECK");
     assert!(err.to_string().contains("CHECK"), "rejection must come from CHECK, got: {err}");
 }

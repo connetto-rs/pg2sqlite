@@ -2,7 +2,7 @@
 //! which no `INSTEAD OF` trigger takes, fails on the replica when it runs with
 //! PostgreSQL 18's `55000` and message.
 
-use diesel::{connection::SimpleConnection, prelude::*};
+use diesel::connection::SimpleConnection;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, postgres_error};
 use sqlstate::pg;
 
@@ -11,14 +11,14 @@ const SCHEMA: &str = "CREATE TABLE base (id INTEGER PRIMARY KEY, score INTEGER N
     INSERT INTO base VALUES (1, 5);";
 
 /// A replica holding `schema`, translated and applied.
-fn replica(schema: &str) -> SqliteConnection {
-    let mut connection = SqliteConnection::establish(":memory:").expect("SQLite opens");
+fn replica(schema: &str) -> crate::helpers::Replica {
+    let mut connection = crate::helpers::establish_connection();
     let script = Pg2Sqlite::default()
         .sql(schema)
         .expect("the schema parses")
         .translate(&Pg2SqliteOptions::default())
         .expect("the schema translates");
-    script.register_functions(&mut connection).expect("the helpers register");
+    script.register_managed(&mut connection).expect("the helpers register");
     for statement in script.iter() {
         connection.batch_execute(&format!("{statement};")).expect("the schema applies");
     }

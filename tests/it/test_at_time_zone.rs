@@ -487,7 +487,7 @@ fn the_localtime_zone_is_refused_at_execution() {
             .translate_to_sql(&utc_request())
             .expect("translate");
         let mut connection = crate::helpers::establish_connection();
-        script.register_functions(&mut connection).expect("register");
+        script.register_managed(&mut connection).expect("register");
         let query = script.into_vec().pop().expect("query");
         // Execute the translator's output rather than a second query
         // definition.

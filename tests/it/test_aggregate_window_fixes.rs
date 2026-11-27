@@ -4,7 +4,7 @@ use diesel::prelude::*;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use translate_helpers::translate_default_err as translate_err;
 
-use crate::helpers::translate as translate_helpers;
+use crate::helpers::{Replica, translate as translate_helpers};
 
 fn translate_to_stmts(pg: &str) -> Vec<String> {
     Pg2Sqlite::default()
@@ -15,10 +15,10 @@ fn translate_to_stmts(pg: &str) -> Vec<String> {
         .into_vec()
 }
 
-fn setup_and_query(pg: &str) -> (String, SqliteConnection) {
+fn setup_and_query(pg: &str) -> (String, Replica) {
     let mut stmts = translate_to_stmts(pg);
     let query = stmts.pop().unwrap();
-    let mut conn = SqliteConnection::establish(":memory:").unwrap();
+    let mut conn = Replica::establish(":memory:").unwrap();
     for stmt in &stmts {
         // Translated DDL/DML cannot be expressed through Diesel's typed DSL.
         diesel::sql_query(stmt.as_str())

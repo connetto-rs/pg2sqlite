@@ -6,7 +6,7 @@
 
 #![cfg(feature = "sqlitegis")]
 
-use diesel::{RunQueryDsl, sql_query};
+use diesel::connection::SimpleConnection;
 use helpers::sqlitegis::sqlitegis_connection;
 use pg2sqlite::{pg2sqlite::Pg2Sqlite, prelude::Pg2SqliteOptions};
 use sqlitegis::core::function_catalog::SQLITE_DETERMINISTIC_FUNCTIONS;
@@ -34,7 +34,7 @@ fn every_sqlitegis_smoke_sql_translates_and_executes() {
                 continue;
             }
         };
-        if let Err(e) = sql_query(&translated).execute(&mut conn) {
+        if let Err(e) = conn.batch_execute(&translated) {
             failures.push(format!(
                 "{}/{}: execute failed for `{translated}`: {e:?}",
                 spec.name, spec.n_arg

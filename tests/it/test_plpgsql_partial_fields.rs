@@ -7,9 +7,9 @@
 //! K6: transform_insert missing fields (returning, on conflict)
 //! K7: IF/ELSIF silent fallback to raw PG text
 
+use diesel::{Connection, connection::SimpleConnection};
 use helpers::translate_sql;
 use pg2sqlite::prelude::{Pg2SqliteOptions, UuidRepresentation};
-use rusqlite::Connection;
 
 use crate::helpers;
 
@@ -188,9 +188,9 @@ fn plpgsql_if_condition_translates_now() {
 }
 
 fn exec_translated_str(sql_str: &str) {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     for line in sql_str.lines().filter(|l| !l.trim().is_empty()) {
-        conn.execute_batch(&format!("{line};"))
+        conn.batch_execute(&format!("{line};"))
             .unwrap_or_else(|e| panic!("SQLite rejected: {line}\n{e}"));
     }
 }

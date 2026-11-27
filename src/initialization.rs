@@ -159,6 +159,8 @@ impl<S> InitializationPlan<S> {
         self.steps.iter().filter_map(|step| step.group(FreshFiles::Both))
     }
 
+    /// The groups initializing `files`, in source order.
+    #[cfg(feature = "managed")]
     pub(crate) fn select_groups(
         &self,
         files: FreshFiles,

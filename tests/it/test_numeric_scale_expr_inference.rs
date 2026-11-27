@@ -288,7 +288,7 @@ fn insert_into_log(pg: &str) -> Option<String> {
         .map(|statement| format!("{statement};"))
         .collect::<Vec<_>>()
         .join("\n");
-    let mut connection = SqliteConnection::establish(":memory:").expect("connect");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("connect");
     connection
         .batch_execute("PRAGMA foreign_keys = ON; PRAGMA recursive_triggers = ON;")
         .expect("set the replica pragmas");

@@ -71,7 +71,7 @@ fn translated(statement: &str) -> (Vec<String>, Vec<String>) {
 }
 
 /// The backing rows, as `id:owner_id:dept`.
-fn backing(connection: &mut SqliteConnection) -> Vec<String> {
+fn backing(connection: &mut crate::helpers::Replica) -> Vec<String> {
     docs_rls::table
         .order(docs_rls::id)
         .select((docs_rls::id, docs_rls::owner_id, docs_rls::dept))

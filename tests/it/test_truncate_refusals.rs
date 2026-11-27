@@ -1,14 +1,14 @@
 //! `TRUNCATE`s PostgreSQL refuses before emptying anything, for a missing
 //! privilege or for a table another table's key references.
 
-use diesel::{connection::SimpleConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{connection::SimpleConnection, prelude::*};
 use pg2sqlite::{
     errors::Error,
     prelude::{Pg2Sqlite, Pg2SqliteOptions, postgres_error},
 };
 use sqlstate::pg;
 
-use crate::helpers;
+use crate::{helpers, helpers::Replica};
 
 diesel::table! {
     /// The referenced table.
@@ -48,8 +48,8 @@ fn refusal(pg: &str) -> (sqlstate::SqlState, String) {
 }
 
 /// `pg` translated and applied to a fresh connection.
-fn replica(pg: &str) -> SqliteConnection {
-    let mut connection = SqliteConnection::establish(":memory:").expect("open an in-memory SQLite");
+fn replica(pg: &str) -> Replica {
+    let mut connection = Replica::establish(":memory:").expect("open an in-memory SQLite");
     for statement in translated(pg).unwrap_or_else(|error| panic!("{error}\n{pg}")) {
         connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
     }
@@ -154,7 +154,7 @@ diesel::table! {
 
 /// `notes`, whose insert runs `clear_t()` as `cleaner`, truncating `t`, which
 /// `app` only reads. `grant` hands `cleaner` its privileges on `t`.
-fn definer_replica(grant: &str) -> SqliteConnection {
+fn definer_replica(grant: &str) -> Replica {
     let pg = format!(
         "CREATE ROLE app;
          CREATE ROLE cleaner;
@@ -180,7 +180,7 @@ fn definer_replica(grant: &str) -> SqliteConnection {
         .expect("the script translates")
         .into_iter()
         .partition(|statement| statement.starts_with("CREATE TRIGGER"));
-    let mut connection = SqliteConnection::establish(":memory:").expect("open an in-memory SQLite");
+    let mut connection = Replica::establish(":memory:").expect("open an in-memory SQLite");
     for statement in
         base.iter().chain(["INSERT INTO t VALUES (1)".to_owned()].iter()).chain(&triggers)
     {
@@ -217,7 +217,7 @@ fn a_definer_body_whose_owner_lacks_truncate_is_refused() {
 /// `notes`, whose insert of a row with `id` 2 runs `TRUNCATE t` in a
 /// `security` trigger body owned by `cleaner`, over `t` and `c` seeded by
 /// `keyed`, `app` holding `app_grant` on `t` and `cleaner` every privilege.
-fn body_replica(security: &str, app_grant: &str) -> SqliteConnection {
+fn body_replica(security: &str, app_grant: &str) -> Replica {
     let pg = format!(
         "{}
          CREATE ROLE cleaner;
@@ -244,7 +244,7 @@ fn body_replica(security: &str, app_grant: &str) -> SqliteConnection {
         .unwrap_or_else(|error| panic!("PostgreSQL loads the body: {error}"))
         .into_iter()
         .partition(|statement| statement.starts_with("CREATE TRIGGER"));
-    let mut connection = SqliteConnection::establish(":memory:").expect("open an in-memory SQLite");
+    let mut connection = Replica::establish(":memory:").expect("open an in-memory SQLite");
     for statement in base.iter().chain(&triggers) {
         connection.batch_execute(statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
     }
@@ -253,7 +253,7 @@ fn body_replica(security: &str, app_grant: &str) -> SqliteConnection {
 
 /// The SQLSTATE the insert of a note with `id` aborts with, `None` when it
 /// succeeds.
-fn note_refusal(connection: &mut SqliteConnection, id: i32) -> Option<sqlstate::SqlState> {
+fn note_refusal(connection: &mut Replica, id: i32) -> Option<sqlstate::SqlState> {
     let error =
         diesel::insert_into(notes::table).values(notes::id.eq(id)).execute(connection).err()?;
     let error = error.to_string();

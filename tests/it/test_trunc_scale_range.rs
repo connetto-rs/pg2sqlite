@@ -11,11 +11,11 @@
 //! `trunc(1.5, 19)` answers the saturated 64-bit maximum divided by the factor.
 //!
 //! Every expectation below was read off PostgreSQL 17 first. The tests run the
-//! emitted SQL, because the whole defect was output that parses and answers the
-//! wrong thing.
+//! emitted SQL, because use the whole defect was output that parses and answers
+//! the wrong thing.
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use rusqlite::Connection;
 
 use crate::helpers;
 const FIXTURE: &str = "CREATE TABLE t (id INT PRIMARY KEY);";
@@ -28,17 +28,18 @@ fn translate(dml: &str) -> Result<Vec<String>, String> {
 fn answer(dml: &str) -> String {
     let statements = translate(dml).expect("translate");
     let probe = statements.last().expect("a statement").clone();
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("in-memory SQLite");
     for statement in &statements[..statements.len() - 1] {
-        connection.execute_batch(&format!("{statement};")).expect("emitted setup");
+        connection.batch_execute(&format!("{statement};")).expect("emitted setup");
     }
-    connection.execute("INSERT INTO t (id) VALUES (1)", []).expect("row");
-    connection
-        .query_row(&format!("SELECT CAST(({probe}) AS TEXT)"), [], |r| {
-            r.get::<_, Option<String>>(0)
-        })
-        .unwrap_or_else(|error| panic!("emitted probe failed: {probe}: {error}"))
-        .unwrap_or_else(|| panic!("emitted probe answered NULL: {probe}"))
+    connection.execute("INSERT INTO t (id) VALUES (1)", &[]).expect("row");
+    let rows =
+        helpers::query_values(&mut connection, &format!("SELECT CAST(({probe}) AS TEXT)"), &[])
+            .unwrap_or_else(|error| panic!("emitted probe failed: {probe}: {error}"));
+    match rows.into_iter().next().expect("one row").into_iter().next().expect("first column") {
+        helpers::SqliteAnyValue::Text(value) => value,
+        value => panic!("expected non-null text, got {value:?}"),
+    }
 }
 
 fn refusal(dml: &str) -> String {

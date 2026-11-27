@@ -10,11 +10,10 @@
 //! translator's output text, and the aggregates, `FILTER` and `OVER` have no
 //! typed form. The seed and the reads of stored rows are typed.
 
-use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{pg::PgConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use postgres_harness::Outcome;
 
-use super::harness::execute_ddl;
 use crate::helpers::{establish_connection, postgres as postgres_harness};
 
 mod schema {
@@ -137,7 +136,7 @@ macro_rules! seed {
 }
 
 /// Both engines with [`SCHEMA`] applied and seeded.
-fn engines() -> (PgConnection, SqliteConnection) {
+fn engines() -> (PgConnection, crate::helpers::Replica) {
     let mut postgres = postgres_harness::fresh_database();
     postgres_harness::apply(&mut postgres, SCHEMA).expect("PostgreSQL takes the schema");
     seed!(&mut postgres);
@@ -148,9 +147,9 @@ fn engines() -> (PgConnection, SqliteConnection) {
         .translate(&Pg2SqliteOptions::default())
         .expect("translate schema");
     let mut sqlite = establish_connection();
-    translated.register_functions(&mut sqlite).expect("register schema helper functions");
-    let translated = translated.into_vec();
-    execute_ddl(&mut sqlite, &translated);
+    translated
+        .initialize_managed(&mut sqlite, pg2sqlite::script::FreshFiles::Both)
+        .expect("initialize schema");
     seed!(&mut sqlite);
     (postgres, sqlite)
 }
@@ -229,7 +228,7 @@ fn boolean_aggregates_answer_as_postgresql_does() {
     for probe in CALL_PROBES.iter().chain(CONTEXT_PROBES) {
         let source = postgres_flags(&mut postgres, probe);
         let translated = translated_probe(probe);
-        translated.register_functions(&mut sqlite).expect("register probe helper functions");
+        translated.register_managed(&mut sqlite).expect("register probe helper functions");
         let translated = translated.iter().last().expect("a translated probe").to_string();
         let counterpart: Vec<(i32, Option<bool>)> = diesel::sql_query(&translated)
             .load::<SqliteFlag>(&mut sqlite)
@@ -299,7 +298,7 @@ fn boolean_aggregates_render_as_words() {
             .map(|row| (row.id, row.rendered))
             .collect();
         let translated = translated_probe(probe);
-        translated.register_functions(&mut sqlite).expect("register probe helper functions");
+        translated.register_managed(&mut sqlite).expect("register probe helper functions");
         let translated = translated.iter().last().expect("a translated probe").to_string();
         let counterpart: Vec<(i32, Option<String>)> = diesel::sql_query(&translated)
             .load::<Rendered>(&mut sqlite)

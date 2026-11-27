@@ -1,6 +1,6 @@
 //! Foreign keys are checked at each PL/pgSQL statement boundary.
 
-use diesel::{connection::SimpleConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{connection::SimpleConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, postgres_error};
 use sqlstate::pg;
 
@@ -22,9 +22,9 @@ fn translated(schema: &str, body: &str, options: &Pg2SqliteOptions) -> Vec<Strin
         .into_vec()
 }
 
-fn replica(schema: &str, body: &str) -> SqliteConnection {
+fn replica(schema: &str, body: &str) -> crate::helpers::Replica {
     let statements = translated(schema, body, &Pg2SqliteOptions::default());
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
     connection.batch_execute("PRAGMA foreign_keys = ON;").expect("enable foreign keys");
     for statement in &statements {
         connection.batch_execute(statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
@@ -32,7 +32,7 @@ fn replica(schema: &str, body: &str) -> SqliteConnection {
     connection
 }
 
-fn refusal(connection: &mut SqliteConnection) -> sqlstate::SqlState {
+fn refusal(connection: &mut crate::helpers::Replica) -> sqlstate::SqlState {
     let error = connection
         .batch_execute("INSERT INTO requests VALUES (1)")
         .expect_err("the first orphaning statement must fail")
@@ -399,8 +399,11 @@ fn a_definer_body_checks_keys_whose_policies_call_what_its_owner_may_not() {
         &options,
     )
     .expect("the owner's missing EXECUTE on visible() decides nothing about the keys");
-    key_write_exempt_utils::register_nondeterministic_impl(&mut connection, || false)
-        .expect("register the exemption");
+    key_write_exempt_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        || false,
+    )
+    .expect("register the exemption");
     connection.batch_execute("INSERT INTO p VALUES (1); INSERT INTO t VALUES (2, 1);").unwrap();
     assert_eq!(refusal(&mut connection), pg::FOREIGN_KEY_VIOLATION);
 }
@@ -525,7 +528,7 @@ diesel::table! {
     }
 }
 
-fn captures_are_empty(connection: &mut SqliteConnection) {
+fn captures_are_empty(connection: &mut crate::helpers::Replica) {
     assert_eq!(body_records::table.count().get_result::<i64>(connection).unwrap(), 0);
     assert_eq!(pg2sqlite_definer_frames::table.count().get_result::<i64>(connection).unwrap(), 0);
 }
@@ -654,7 +657,7 @@ fn temporary_keys_keep_their_captures_in_temporary_storage() {
     );
 }
 
-fn migrated_replica(schema: &str, body: &str, migration: &str) -> SqliteConnection {
+fn migrated_replica(schema: &str, body: &str, migration: &str) -> crate::helpers::Replica {
     replica(
         &format!(
             "{schema}
@@ -805,7 +808,7 @@ fn body_checks_run_with_an_existing_rowid_frame_table() {
         ("DELETE FROM p WHERE id = NEW.id; DELETE FROM t;", true),
         ("DELETE FROM t; DELETE FROM p WHERE id = NEW.id;", false),
     ] {
-        let mut connection = SqliteConnection::establish(":memory:").unwrap();
+        let mut connection = crate::helpers::Replica::establish(":memory:").unwrap();
         connection.batch_execute("CREATE TABLE pg2sqlite_definer_frames (id INTEGER PRIMARY KEY, owner TEXT NOT NULL CHECK (owner <> '' AND length(owner) <= 63)) STRICT").unwrap();
         for statement in translated(&schema("", false), body, &Pg2SqliteOptions::default()) {
             connection.batch_execute(&statement).unwrap();

@@ -4,7 +4,7 @@
 //! keeps PostgreSQL's outcome when none of the others reads what it assigns
 //! or writes what it reads.
 
-use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{pg::PgConnection, prelude::*};
 use helpers::establish_connection;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use postgres_harness::Outcome;
@@ -170,7 +170,7 @@ macro_rules! run_step {
 }
 
 run_step!(run_postgres, PgConnection);
-run_step!(run_sqlite, SqliteConnection);
+run_step!(run_sqlite, crate::helpers::Replica);
 
 fn assert_agree(source: &str, steps: &[Step]) {
     let mut postgres = postgres_harness::fresh_database();

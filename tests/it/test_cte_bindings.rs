@@ -1,7 +1,9 @@
 //! PostgreSQL common-table-expression bindings survive SQLite translation.
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use rusqlite::Connection;
+
+use crate::helpers::{Replica, SqliteAnyValue, query_values};
 
 fn query_rows(source: &str) -> Vec<i64> {
     let script = Pg2Sqlite::default()
@@ -9,19 +11,22 @@ fn query_rows(source: &str) -> Vec<i64> {
         .expect("parse source")
         .translate(&Pg2SqliteOptions::default())
         .expect("translate source");
-    let connection = Connection::open_in_memory().expect("open SQLite");
+    let mut connection = Replica::establish(":memory:").expect("open SQLite");
     for statement in script.into_vec() {
         connection
-            .execute_batch(&format!("{statement};"))
+            .batch_execute(&format!("{statement};"))
             .unwrap_or_else(|error| panic!("{error}\n{statement}"));
     }
-    connection
-        .prepare("SELECT id FROM result ORDER BY id")
-        .expect("prepare result")
-        .query_map([], |row| row.get(0))
+    query_values(&mut connection, "SELECT id FROM result ORDER BY id", &[])
         .expect("query result")
-        .collect::<Result<_, _>>()
-        .expect("read result")
+        .into_iter()
+        .map(|row| {
+            match row[0] {
+                SqliteAnyValue::Integer(value) => value,
+                ref value => panic!("expected integer, got {value:?}"),
+            }
+        })
+        .collect()
 }
 
 #[test]
@@ -168,26 +173,26 @@ fn a_forward_storage_reference_follows_a_table_rename_on_reconnect() {
     let directory = tempfile::tempdir().expect("database directory");
     let path = directory.path().join("main.db");
     {
-        let connection = Connection::open(&path).expect("create database");
+        let mut connection =
+            Replica::establish(path.to_str().expect("database path")).expect("create database");
         for statement in script.iter() {
-            connection.execute_batch(statement).expect("initialize");
+            connection.batch_execute(statement).expect("initialize");
         }
         assert_eq!(
-            connection
-                .query_row("SELECT id FROM result", [], |row| row.get::<_, i64>(0))
-                .expect("read initial view"),
-            9
+            query_values(&mut connection, "SELECT id FROM result", &[]).expect("read initial view")
+                [0][0],
+            SqliteAnyValue::Integer(9)
         );
     }
-    let connection = Connection::open(&path).expect("reopen database");
+    let mut connection =
+        Replica::establish(path.to_str().expect("database path")).expect("reopen database");
     for statement in script.connect().expect("connection program") {
-        connection.execute_batch(statement).expect("reconnect");
+        connection.batch_execute(statement).expect("reconnect");
     }
     assert_eq!(
-        connection
-            .query_row("SELECT id FROM result", [], |row| row.get::<_, i64>(0))
-            .expect("read replayed view"),
-        9
+        query_values(&mut connection, "SELECT id FROM result", &[]).expect("read replayed view")[0]
+            [0],
+        SqliteAnyValue::Integer(9)
     );
 }
 

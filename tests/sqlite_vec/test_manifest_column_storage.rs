@@ -8,13 +8,13 @@
 //! array column holds JSON text, and a vector column holds packed floats.
 //! Each test decodes a stored value using only what the manifest publishes.
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::{
     manifest::{ColumnStorage, VectorElement},
     prelude::{ArrayRepresentation, Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation},
 };
-use rusqlite::Connection;
 
-use crate::helpers;
+use crate::{helpers, helpers::SqliteAnyValue};
 
 /// The storage of each column of `table`, in declaration order.
 fn storage_of(pg: &str, options: &Pg2SqliteOptions) -> Vec<(String, ColumnStorage)> {
@@ -100,12 +100,15 @@ fn the_published_scale_decodes_a_value_written_through_the_emitted_sql() {
         .translate_to_sql(&options)
         .expect("translate")
         .into_vec();
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = helpers::Replica::establish(":memory:").expect("in-memory SQLite");
     for statement in &statements {
-        connection.execute_batch(&format!("{statement};")).expect("emitted statement executes");
+        connection.batch_execute(&format!("{statement};")).expect("emitted statement executes");
     }
-    let stored: i64 =
-        connection.query_row("SELECT amount FROM t", [], |row| row.get(0)).expect("read back");
+    let rows =
+        helpers::query_values(&mut connection, "SELECT amount FROM t", &[]).expect("read back");
+    let SqliteAnyValue::Integer(stored) = &rows[0][0] else {
+        panic!("unexpected storage class");
+    };
 
     let ColumnStorage::MinorUnits { scale } =
         storage_of(pg, &options).into_iter().find(|(name, _)| name == "amount").expect("amount").1
@@ -131,9 +134,9 @@ fn the_published_uuid_storage_decodes_a_value_written_through_the_emitted_sql() 
         .translate_to_sql(&options)
         .expect("translate")
         .into_vec();
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = helpers::Replica::establish(":memory:").expect("in-memory SQLite");
     for statement in &statements {
-        connection.execute_batch(&format!("{statement};")).expect("emitted statement executes");
+        connection.batch_execute(&format!("{statement};")).expect("emitted statement executes");
     }
 
     assert_eq!(
@@ -141,8 +144,10 @@ fn the_published_uuid_storage_decodes_a_value_written_through_the_emitted_sql() 
         vec![("id".to_string(), ColumnStorage::UuidBlob)],
         "the manifest has to say the column holds bytes before a reader can decode them"
     );
-    let stored: Vec<u8> =
-        connection.query_row("SELECT id FROM t", [], |row| row.get(0)).expect("read back");
+    let rows = helpers::query_values(&mut connection, "SELECT id FROM t", &[]).expect("read back");
+    let SqliteAnyValue::Blob(stored) = &rows[0][0] else {
+        panic!("unexpected storage class");
+    };
     assert_eq!(stored.len(), 16);
     let hex = stored.iter().fold(String::new(), |mut text, byte| {
         use core::fmt::Write;
@@ -161,9 +166,9 @@ fn the_published_vector_storage_decodes_a_value_written_through_the_emitted_sql(
     let statements =
         Pg2Sqlite::default().sql(pg).expect("parse").translate_to_sql(&options).expect("translate");
     helpers::register_sqlite_vec_once();
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = helpers::Replica::establish(":memory:").expect("in-memory SQLite");
     for statement in statements.iter() {
-        connection.execute_batch(&format!("{statement};")).expect("emitted statement executes");
+        connection.batch_execute(&format!("{statement};")).expect("emitted statement executes");
     }
 
     let ColumnStorage::Vector { dimensions, element } =
@@ -173,8 +178,10 @@ fn the_published_vector_storage_decodes_a_value_written_through_the_emitted_sql(
     };
     assert_eq!((dimensions, element), (Some(3), VectorElement::Float32));
 
-    let stored: Vec<u8> =
-        connection.query_row("SELECT e FROM t", [], |row| row.get(0)).expect("read back");
+    let rows = helpers::query_values(&mut connection, "SELECT e FROM t", &[]).expect("read back");
+    let SqliteAnyValue::Blob(stored) = &rows[0][0] else {
+        panic!("unexpected storage class");
+    };
     let width = usize::try_from(dimensions.expect("a declared width")).expect("a native width");
     assert_eq!(stored.len(), 4 * width);
     let decoded: Vec<f32> =

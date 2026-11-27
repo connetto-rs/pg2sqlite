@@ -54,8 +54,8 @@ fn query(source: &str) -> String {
         .expect("translated query")
 }
 
-fn fixture() -> SqliteConnection {
-    let mut connection = SqliteConnection::establish(":memory:").unwrap();
+fn fixture() -> crate::helpers::Replica {
+    let mut connection = crate::helpers::Replica::establish(":memory:").unwrap();
     connection.batch_execute(SCHEMA).unwrap();
     let rows = [1, 2, 3, 4, 5].map(|n| nums::n.eq(n));
     diesel::insert_into(nums::table).values(&rows).execute(&mut connection).unwrap();

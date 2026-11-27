@@ -76,9 +76,9 @@ fn test_fk_points_to_rls_backing_table() -> Result<(), Box<dyn std::error::Error
         "FK should not point to users view, got: {posts_create}"
     );
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = <crate::helpers::Replica as diesel::Connection>::establish(":memory:").unwrap();
     for stmt in &translated {
-        conn.execute_batch(&format!("{stmt};"))
+        diesel::connection::SimpleConnection::batch_execute(&mut conn, &format!("{stmt};"))
             .unwrap_or_else(|e| panic!("emitted SQL failed: {e}\n{stmt}"));
     }
 
@@ -145,9 +145,10 @@ fn test_fk_both_tables_rls() -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = establish_connection();
     let fixture_sql = include_str!("../fixtures/rls_fk_both.sql");
     let options = translation_options().with_rls_exemption_function("write_is_exempt");
-    write_is_exempt_utils::register_nondeterministic_impl(&mut conn, || {
-        WRITE_IS_EXEMPT.with(Cell::get)
-    })?;
+    write_is_exempt_utils::register_nondeterministic_impl(
+        conn.registration().expect("registration").sqlite(),
+        || WRITE_IS_EXEMPT.with(Cell::get),
+    )?;
 
     // Translate and execute
     let translated = helpers::translate_pg(fixture_sql, &options)?;

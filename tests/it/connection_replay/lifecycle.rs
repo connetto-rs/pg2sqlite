@@ -24,13 +24,13 @@ diesel::table! {
 }
 diesel::infix_operator!(Matches, " MATCH ", backend: diesel::sqlite::Sqlite);
 
-fn reopened(source: &str) -> (tempfile::TempDir, SqliteConnection) {
+fn reopened(source: &str) -> (tempfile::TempDir, crate::helpers::Replica) {
     let files = tempfile::TempDir::new().expect("files");
     let connection = create_and_reopen(&files, &script(source));
     (files, connection)
 }
 
-fn rows(connection: &mut SqliteConnection) -> Vec<(i32, i32)> {
+fn rows(connection: &mut crate::helpers::Replica) -> Vec<(i32, i32)> {
     scratch::table.order(scratch::id).load(connection).expect("temporary rows")
 }
 
