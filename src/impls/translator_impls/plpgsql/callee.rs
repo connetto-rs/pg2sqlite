@@ -17,7 +17,7 @@ use sql_traits::{
 };
 use sqlparser::{
     ast::{
-        BinaryOperator, CreateFunction, Expr, Function, FunctionArg, FunctionArgExpr,
+        BinaryOperator, CastKind, CreateFunction, Expr, Function, FunctionArg, FunctionArgExpr,
         FunctionArguments, FunctionReturnType, FunctionSecurity, GroupByExpr, ObjectName, Query,
         SelectItem, SetExpr, Statement, UnaryOperator, Value, visit_expressions,
         visit_expressions_mut, visit_relations,
@@ -295,6 +295,9 @@ impl PlPgSqlTranslator {
                 let inlined = Self::inline_call(call, helper, scope, schema, options, emit)?;
                 let mut value = match inlined.result {
                     Some(BoundValue::Expr(value)) => value,
+                    Some(BoundValue::Stored { expression, data_type }) => {
+                        scope.hold_stored(expression, data_type)
+                    }
                     Some(BoundValue::Unreadable(reason)) => {
                         return Err(refusal(
                             &call.name,
@@ -403,42 +406,37 @@ impl PlPgSqlTranslator {
         let body = super::unresolved::helper_raising_unresolved(body, helper, schema);
 
         let mut callee = scope.for_callee(identity.clone());
-        let mut parameters = Vec::new();
-        for (parameter, data_type, value) in Arguments::of(call, helper)?.into_parameters() {
-            let Some(parameter) = parameter else {
-                return Err(refusal(
-                    name,
-                    "declares a parameter only $n reaches, which the inlined body cannot bind",
-                ));
-            };
-            // The arguments are the caller's expressions, so their own calls
-            // run as the caller and read the caller's variables.
-            let value = sql_helper::inlined_calls(&value, schema, options)?;
-            let value = resolved(value, scope)?;
-            let parameter = fold(parameter);
-            callee.declare(&parameter, Some(data_type.clone()));
-            callee.bind_persistent(Binding {
-                name: parameter.clone(),
-                value: BoundValue::Expr(value),
-            });
-            parameters.push(parameter);
-        }
         Self::open_body(&body, &mut callee, options)?;
+        if let Some(FunctionReturnType::DataType(data_type)) = &helper.return_type {
+            callee.declare(RESULT, Some(data_type.clone()));
+        }
+        let (parameters, prerequisites) =
+            Self::bind_call_arguments(call, helper, scope, &mut callee, schema, options, emit)?;
+        callee.next_slot = scope.next_slot;
 
         let owner = match helper.security_mode() {
             FunctionSecurity::Definer => Some(sql_helper::owner(name, helper, schema)?),
             FunctionSecurity::Invoker => None,
         };
-        let running_as = owner.map(|owner| options.with_running_as(owner));
+        let other_owner = owner.filter(|owner| {
+            options.running_as().is_none_or(|running| running.name() != owner.name())
+        });
+        let running_as = other_owner.map(|owner| {
+            options.with_dispatcher_owner(definer::DispatcherOwner::Definer {
+                function: helper,
+                owner,
+            })
+        });
         let body_options = running_as.as_ref().unwrap_or(options);
         let variables = callee.variables();
-        let mut statements = Self::evaluate_assigned(
+        let mut statements = prerequisites;
+        statements.extend(Self::evaluate_assigned(
             &parameters,
             &callee,
             schema,
             &body_options.with_variables(&variables),
             emit,
-        )?;
+        )?);
         statements.extend(Self::translate_block(
             &identity,
             &body,
@@ -447,11 +445,6 @@ impl PlPgSqlTranslator {
             body_options,
             emit,
         )?);
-        // A definer body running as a role other than the caller's reads and
-        // writes as its owner. Under the same role the caller's own pass does.
-        let other_owner = owner.filter(|owner| {
-            options.running_as().is_none_or(|running| running.name() != owner.name())
-        });
         if let Some(owner) = other_owner {
             statements = definer::run_as_owner(helper, owner, statements, schema, options)?;
         }
@@ -459,8 +452,110 @@ impl PlPgSqlTranslator {
         for relation in callee.written() {
             scope.invalidate_readers(relation, schema);
         }
-        let result = returns_value.then(|| returned_value(&callee, other_owner.is_some()));
+        let result = if returns_value {
+            Some(Self::returned_binding(
+                &callee,
+                other_owner.is_some(),
+                schema,
+                body_options,
+                emit,
+            )?)
+        } else {
+            None
+        };
+        scope.next_slot = callee.next_slot;
         Ok(Inlined { statements, result })
+    }
+
+    /// Captures a generated return expression before the callee's bindings
+    /// leave scope.
+    fn returned_binding(
+        callee: &BodyScope,
+        other_owner: bool,
+        schema: &ParserDB,
+        options: &TranslationContext<'_>,
+        emit: WarningSink<'_>,
+    ) -> Result<BoundValue, Error> {
+        let returned = callee.bindings().find(|binding| binding.name == RESULT);
+        match returned.map(|binding| &binding.value) {
+            Some(BoundValue::Expr(value)) if Self::depends_on_generated(value, callee) => {
+                let variables = callee.variables();
+                let expression = Self::translate_condition(
+                    value,
+                    callee,
+                    schema,
+                    &options.with_variables(&variables),
+                    emit,
+                )?;
+                let data_type = callee.declared_type(RESULT).cloned();
+                Ok(BoundValue::Stored { expression, data_type })
+            }
+            _ => Ok(returned_value(callee, other_owner)),
+        }
+    }
+
+    /// Binds caller expressions to the helper's typed parameters.
+    fn bind_call_arguments(
+        call: &Function,
+        helper: &CreateFunction,
+        scope: &mut BodyScope,
+        callee: &mut BodyScope,
+        schema: &ParserDB,
+        options: &TranslationContext<'_>,
+        emit: WarningSink<'_>,
+    ) -> Result<(Vec<String>, Vec<Statement>), Error> {
+        let name = &call.name;
+        let arguments: Vec<_> = Arguments::of(call, helper)?.into_parameters().collect();
+        callee.reserve_names(arguments.iter().filter_map(|(parameter, _, _)| parameter.map(fold)));
+        let mut prerequisites = Vec::new();
+        let mut parameters = Vec::new();
+        for (parameter, data_type, written) in arguments {
+            let Some(parameter) = parameter else {
+                return Err(refusal(
+                    name,
+                    "declares a parameter only $n reaches, which the inlined body cannot bind",
+                ));
+            };
+            let written = sql_helper::inlined_calls(&written, schema, options)?;
+            let value = if Self::depends_on_generated(&written, scope) {
+                let (reference, capture) = Self::capture_value(
+                    written,
+                    Some(data_type.clone()),
+                    scope,
+                    schema,
+                    options,
+                    emit,
+                )?;
+                prerequisites.extend(capture);
+                let variables = scope.variables();
+                let translated = Self::translate_condition(
+                    &reference,
+                    scope,
+                    schema,
+                    &options.with_variables(&variables),
+                    emit,
+                )?;
+                callee.hold_stored(translated, Some(data_type.clone()))
+            } else {
+                resolved(
+                    Expr::Cast {
+                        kind: CastKind::Cast,
+                        expr: Box::new(written),
+                        data_type: data_type.clone(),
+                        format: None,
+                    },
+                    scope,
+                )?
+            };
+            let parameter = fold(parameter);
+            callee.declare(&parameter, Some(data_type.clone()));
+            callee.bind_persistent(Binding {
+                name: parameter.clone(),
+                value: BoundValue::Expr(value),
+            });
+            parameters.push(parameter);
+        }
+        Ok((parameters, prerequisites))
     }
 
     /// Translates `RETURN <value>` in a helper's body, which binds the value
@@ -478,10 +573,15 @@ impl PlPgSqlTranslator {
         emit: WarningSink<'_>,
     ) -> Result<Vec<Statement>, Error> {
         let Some(value) = value else { return Ok(Vec::new()) };
-        let mut value =
-            Self::prepare(embedded::expression(value).into_owned(), scope, schema, options)?;
-        let mut statements = Self::inline_helper_calls(&mut value, scope, schema, options, emit)?;
-        scope.bind(Binding { name: RESULT.to_string(), value: BoundValue::Expr(value) });
+        let (value, mut statements) = Self::assigned_value(
+            embedded::expression(value).into_owned(),
+            Some(RESULT),
+            scope,
+            schema,
+            options,
+            emit,
+        )?;
+        scope.bind(Binding { name: RESULT.to_string(), value });
         // PostgreSQL computes the value where it returns, so one that may
         // raise runs there.
         statements.extend(Self::evaluate_assigned(
@@ -615,7 +715,10 @@ fn resolved(mut expr: Expr, scope: &BodyScope) -> Result<Expr, Error> {
                     Err(reason) => BoundValue::Unreadable(reason.to_string()),
                 }
             }
-            other @ (BoundValue::Unreadable(_) | BoundValue::Row(_)) => other.clone(),
+            other
+            @ (BoundValue::Unreadable(_) | BoundValue::Row(_) | BoundValue::Stored { .. }) => {
+                other.clone()
+            }
         };
         values.push((binding.name.clone(), value));
     }
@@ -634,7 +737,9 @@ pub(super) fn substitute(expr: &mut Expr, values: &[(String, BoundValue)]) -> Re
             }
             Some(BoundValue::Unreadable(reason)) => ControlFlow::Break(reason.clone()),
             // A row is read field by field before the statement resolves.
-            Some(BoundValue::Row(_)) | None => ControlFlow::Continue(()),
+            Some(BoundValue::Row(_) | BoundValue::Stored { .. }) | None => {
+                ControlFlow::Continue(())
+            }
         }
     });
     match flow {

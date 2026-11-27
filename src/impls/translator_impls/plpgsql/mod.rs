@@ -1,14 +1,13 @@
 //! Translates PL/pgSQL trigger function bodies to SQLite-compatible statements.
 //!
-//! The body arrives as `sqlparser-plpgsql`'s statement tree. Variables
-//! (`variable := expr`) become `WITH var(val) AS (SELECT expr)` CTEs, and IF
-//! conditions become WHERE clauses injected into each enclosed DML statement.
-//! UUID variables are regenerated per INSERT via the `last_insert_rowid()`
-//! pattern.
+//! The body arrives as `sqlparser-plpgsql`'s statement tree, with scalar
+//! bindings represented by CTEs and generated values held in invocation slots.
+//! `IF` conditions become `WHERE` clauses on enclosed statements.
 
 mod callee;
 mod cte_builder;
 pub(crate) use cte_builder::VARIABLE_VALUE_COLUMN;
+mod maintenance;
 mod per_row;
 mod raise;
 mod returns;

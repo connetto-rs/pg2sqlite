@@ -13,7 +13,7 @@ use sqlparser::ast::{
     BinaryOperator, CaseWhen, CastKind, DataType, Expr, FunctionArg, FunctionArgExpr,
     FunctionArguments, FunctionReturnType, GroupByExpr, Ident, InTarget, ObjectName,
     ObjectNamePart, Query, Select, SelectItem, SetExpr, Statement, TableAlias, TableFactor,
-    TableWithJoins, Value, Visit, VisitMut, Visitor, VisitorMut,
+    TableWithJoins, Value, Visit, VisitMut, Visitor, VisitorMut, WildcardAdditionalOptions,
     helpers::attached_token::AttachedToken, visit_expressions, visit_expressions_mut,
 };
 use sqlparser_plpgsql::embedded::{
@@ -79,6 +79,7 @@ struct Survey {
     calls_uuid_v7: bool,
     reads_found: bool,
     declares_found: bool,
+    declared_names: BTreeSet<String>,
 }
 
 impl Visitor for Survey {
@@ -103,6 +104,7 @@ impl Survey {
     fn block(&mut self, block: &Block) {
         for declaration in &block.declarations {
             self.declares_found |= declaration.name == FOUND;
+            self.declared_names.insert(declaration.name.clone());
             if let DeclarationKind::Variable(variable) = &declaration.kind
                 && let Some(default) = &variable.default
             {
@@ -226,6 +228,7 @@ impl PlPgSqlTranslator {
     ) -> Result<(), Error> {
         let mut survey = Survey::default();
         survey.block(block);
+        scope.reserve_names(survey.declared_names.iter().cloned());
         // Later sites swallow a refusal from a `uuidv7()` they meet, so the
         // check runs first.
         if survey.calls_uuid_v7 && options.get_uuid_v7_function_name().is_none() {
@@ -299,6 +302,7 @@ impl PlPgSqlTranslator {
                         let variables = scope.variables();
                         let (value, inlined) = Self::assigned_value(
                             embedded::expression(default).into_owned(),
+                            Some(&declaration.name),
                             scope,
                             schema,
                             &options.with_variables(&variables),
@@ -413,7 +417,7 @@ impl PlPgSqlTranslator {
         match value {
             BoundValue::Expr(expr) => visit(expr),
             BoundValue::Row(row) => row.for_each_condition_mut(visit),
-            BoundValue::Unreadable(_) => {}
+            BoundValue::Unreadable(_) | BoundValue::Stored { .. } => {}
         }
     }
 
@@ -539,6 +543,7 @@ impl PlPgSqlTranslator {
                 let name = Self::assigned_name(&assignment.target, &scope.facts)?;
                 let (value, mut statements) = Self::assigned_value(
                     embedded::expression(&assignment.value).into_owned(),
+                    Some(&name),
                     scope,
                     schema,
                     options,
@@ -765,7 +770,13 @@ impl PlPgSqlTranslator {
         let condition = scope.current_condition();
         let mut evaluated = Vec::new();
         for (name, value) in values {
-            if !assigned.contains(&name) || !may_raise(&value, options) {
+            let captured =
+                bindings.iter().find(|binding| binding.name == name).is_some_and(|binding| {
+                    matches!(&binding.value, BoundValue::Stored { .. })
+                        || matches!(&binding.value, BoundValue::Expr(expression)
+                            if Self::stored_type(expression, scope).is_some())
+                });
+            if !assigned.contains(&name) || captured || !may_raise(&value, options) {
                 continue;
             }
             if let Some(relation) = scope.rewritten_guard_relation(schema) {
@@ -816,12 +827,13 @@ impl PlPgSqlTranslator {
             ));
         }
         let mut statements = Self::inline_selected_calls(&mut query, scope, schema, options, emit)?;
-        let SetExpr::Select(select) = query.body.as_ref() else {
+        let generated = Self::depends_on_generated(&Expr::Subquery(Box::new(query.clone())), scope);
+        let SetExpr::Select(select) = query.body.as_mut() else {
             return Err(refusal("reads a set operation, where only a plain SELECT binds"));
         };
-        let columns: Vec<&Expr> = select
+        let columns: Vec<&mut Expr> = select
             .projection
-            .iter()
+            .iter_mut()
             .map(|item| {
                 match item {
                     SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
@@ -835,11 +847,26 @@ impl PlPgSqlTranslator {
         if columns.len() != targets.len() {
             return Err(refusal("assigns a different number of columns than it names targets"));
         }
+        if generated {
+            let types: Vec<_> =
+                targets.iter().map(|name| scope.declared_type(name).cloned()).collect();
+            for (expression, data_type) in columns.into_iter().zip(&types) {
+                if let Some(data_type) = data_type {
+                    *expression =
+                        Self::converted_to(expression.clone(), data_type, schema, options);
+                }
+            }
+            statements.extend(Self::capture_selected(
+                query, &targets, types, scope, schema, options, emit,
+            )?);
+            return Ok(statements);
+        }
+        let columns: Vec<_> = columns.into_iter().map(|column| column.clone()).collect();
 
         for (name, column) in targets.iter().cloned().zip(columns) {
             let mut read = query.clone();
             if let SetExpr::Select(select) = read.body.as_mut() {
-                select.projection = vec![SelectItem::UnnamedExpr(column.clone())];
+                select.projection = vec![SelectItem::UnnamedExpr(column)];
             }
             if read.limit_clause.is_none() && read.fetch.is_none() {
                 read.limit_clause = Some(sqlparser::ast::LimitClause::LimitOffset {
@@ -859,6 +886,145 @@ impl PlPgSqlTranslator {
         }
         statements.extend(Self::evaluate_assigned(&targets, scope, schema, options, emit)?);
         Ok(statements)
+    }
+
+    /// Captures one selected row before distributing its typed target values.
+    fn capture_selected(
+        mut query: Query,
+        targets: &[String],
+        types: Vec<Option<DataType>>,
+        scope: &mut BodyScope,
+        schema: &ParserDB,
+        options: &crate::options::TranslationContext<'_>,
+        emit: crate::warnings::WarningSink<'_>,
+    ) -> Result<Vec<Statement>, Error> {
+        use core::hash::{Hash, Hasher};
+
+        use crate::impls::{ast_builder, helper_functions::Fnv1a};
+        if query.limit_clause.is_none() && query.fetch.is_none() {
+            query.limit_clause = Some(sqlparser::ast::LimitClause::LimitOffset {
+                limit: Some(Expr::Value(Value::Number("1".into(), false).with_empty_span())),
+                offset: None,
+                limit_by: Vec::new(),
+            });
+        }
+        let query = Self::translate_unguarded_read(&query, scope, schema, options, emit)?;
+        let mut hasher = Fnv1a::new();
+        query.hash(&mut hasher);
+        let slot = scope.next_slot;
+        scope.next_slot += 1;
+        let name = ObjectName::from(vec![Ident::new(format!(
+            "pg2sqlite_body_input_select_{:016x}_{slot}",
+            hasher.finish(),
+        ))]);
+        let columns = Self::selected_input_table(name.clone(), &types, schema, options, emit)?;
+        let zero = || Expr::Value(Value::Number("0".into(), false).with_empty_span());
+        let (iteration_site, iteration) =
+            scope.iteration.clone().unwrap_or_else(|| (zero(), zero()));
+        let frame = crate::impls::translator_impls::body_storage::current_frame();
+        let identity =
+            [("frame", frame), ("iteration_site", iteration_site), ("iteration", iteration)];
+        let selection = conjunction(identity.iter().map(|(column, value)| {
+            Expr::BinaryOp {
+                left: Box::new(Expr::Identifier(Ident::new(*column))),
+                op: BinaryOperator::Eq,
+                right: Box::new(value.clone()),
+            }
+        }));
+        let mut select = make_simple_select(
+            identity.iter().map(|(_, value)| SelectItem::UnnamedExpr(value.clone())).collect(),
+            from_relation(TableFactor::Derived {
+                lateral: false,
+                subquery: query,
+                alias: Some(TableAlias {
+                    name: Ident::new("pg2sqlite_selected"),
+                    columns: Vec::new(),
+                    explicit: false,
+                    at: None,
+                }),
+                sample: None,
+            }),
+            None,
+        );
+        select.projection.push(SelectItem::Wildcard(WildcardAdditionalOptions::default()));
+        let mut insert = ast_builder::insert(
+            name.clone(),
+            columns,
+            make_query(None, SetExpr::Select(Box::new(select))),
+        );
+        if let Some(condition) = scope.current_condition() {
+            Self::inject_condition_into_statement(&mut insert, &condition)?;
+        }
+        let mut statements = vec![insert];
+        for (index, (target, data_type)) in targets.iter().zip(types).enumerate() {
+            let read = Expr::Subquery(Box::new(single_expr_query(
+                Expr::Identifier(Ident::new(format!("value_{index}"))),
+                from_relation(plain_table_factor(name.clone())),
+                Some(selection.clone()),
+            )));
+            let (reference, statement) = Self::store_value(read, data_type, scope);
+            statements.push(statement);
+            scope.bind_persistent(Binding {
+                name: target.clone(),
+                value: BoundValue::Expr(reference),
+            });
+        }
+        if scope.tracks_found {
+            let found = Expr::Exists {
+                subquery: Box::new(single_expr_query(
+                    zero(),
+                    from_relation(plain_table_factor(name.clone())),
+                    Some(selection.clone()),
+                )),
+                negated: false,
+            };
+            let (reference, statement) = Self::store_value(found, Some(DataType::Boolean), scope);
+            statements.push(statement);
+            scope.bind(Binding { name: FOUND.to_string(), value: BoundValue::Expr(reference) });
+        }
+        let mut delete = ast_builder::delete(name, Some(selection));
+        if let Some(condition) = scope.current_condition() {
+            Self::inject_condition_into_statement(&mut delete, &condition)?;
+        }
+        statements.push(delete);
+        Ok(statements)
+    }
+
+    /// Registers typed storage for a single selected row.
+    fn selected_input_table(
+        name: ObjectName,
+        types: &[Option<DataType>],
+        schema: &ParserDB,
+        options: &crate::options::TranslationContext<'_>,
+        emit: crate::warnings::WarningSink<'_>,
+    ) -> Result<Vec<ObjectName>, Error> {
+        let mut table = crate::impls::ast_builder::blank_create_table(name);
+        table.if_not_exists = true;
+        let mut columns = Vec::with_capacity(3 + types.len());
+        for field in ["frame", "iteration_site", "iteration"] {
+            table.columns.push(sqlparser::ast::ColumnDef {
+                name: Ident::new(field),
+                data_type: DataType::Integer(None),
+                options: Vec::new(),
+            });
+            columns.push(ObjectName::from(vec![Ident::new(field)]));
+        }
+        for (index, data_type) in types.iter().enumerate() {
+            let column = Ident::new(format!("value_{index}"));
+            let data_type = data_type
+                .as_ref()
+                .map(|data_type| data_type.translate_with_warnings(schema, options, emit))
+                .transpose()?
+                .unwrap_or(DataType::Unspecified);
+            table.columns.push(sqlparser::ast::ColumnDef {
+                name: column.clone(),
+                data_type,
+                options: Vec::new(),
+            });
+            columns.push(ObjectName::from(vec![column]));
+        }
+        options.record_body_table(table);
+        Ok(columns)
     }
 
     /// What `FOUND` reads after `query` ran for its rows, which is whether it
@@ -1023,7 +1189,6 @@ impl PlPgSqlTranslator {
             };
             scope.push_condition(guard);
             scope.restore_scoped(&outer);
-            scope.clear_uuid_first_use();
             for node in statements {
                 result.extend(Self::translate_node(function, node, scope, schema, options, emit)?);
             }
@@ -1039,7 +1204,6 @@ impl PlPgSqlTranslator {
         } else {
             scope.push_condition(conjunction(negated.into_iter()));
             scope.restore_scoped(&outer);
-            scope.clear_uuid_first_use();
             for node in &conditional.otherwise {
                 result.extend(Self::translate_node(function, node, scope, schema, options, emit)?);
             }
@@ -1151,7 +1315,7 @@ impl PlPgSqlTranslator {
         let row = |value: BoundValue| {
             match value {
                 BoundValue::Row(row) => Ok(row),
-                BoundValue::Expr(_) => Ok(RowValue::Unassigned),
+                BoundValue::Expr(_) | BoundValue::Stored { .. } => Ok(RowValue::Unassigned),
                 BoundValue::Unreadable(reason) => Err(reason),
             }
         };
@@ -1170,7 +1334,7 @@ impl PlPgSqlTranslator {
     ///
     /// Variables are embedded rather than read from a CTE, since the guard
     /// reaches `UPDATE` and `DELETE`, which take no `WITH` in a trigger body.
-    fn translate_condition(
+    pub(super) fn translate_condition(
         condition: &Expr,
         scope: &BodyScope,
         schema: &ParserDB,
@@ -1179,7 +1343,16 @@ impl PlPgSqlTranslator {
     ) -> Result<Expr, Error> {
         let bindings: Vec<_> = scope.bindings().cloned().collect();
         let mut transformed = condition.clone();
-        Self::transform_expr(&mut transformed, options);
+        let _: ControlFlow<()> = visit_expressions_mut(&mut transformed, |expression| {
+            if let Expr::Function(function) = expression
+                && function.name.0.len() > 1
+                && is_uuid_generator(function)
+            {
+                let qualifiers = function.name.0.len() - 1;
+                function.name.0.drain(..qualifiers);
+            }
+            ControlFlow::Continue(())
+        });
         reserve_variables(&mut transformed, &bindings);
         let reserved = reserved_variables(&bindings, options);
         let mut translated = transformed.translate_with_warnings(
@@ -1196,8 +1369,9 @@ impl PlPgSqlTranslator {
     /// What a variable assigned `value` holds, the whole row when `value` is
     /// `NEW`, `OLD` or a variable holding a row, with the statements running
     /// the helpers `value` calls.
-    fn assigned_value(
+    pub(super) fn assigned_value(
         value: Expr,
+        assigned: Option<&str>,
         scope: &mut BodyScope,
         schema: &ParserDB,
         options: &crate::options::TranslationContext<'_>,
@@ -1207,8 +1381,309 @@ impl PlPgSqlTranslator {
             return Ok((BoundValue::Row(row), Vec::new()));
         }
         let mut value = Self::prepare(value, scope, schema, options)?;
-        let statements = Self::inline_helper_calls(&mut value, scope, schema, options, emit)?;
+        let mut statements = Self::inline_helper_calls(&mut value, scope, schema, options, emit)?;
+        if Self::depends_on_generated(&value, scope) {
+            let data_type = assigned.and_then(|name| scope.declared_type(name)).cloned();
+            let (reference, capture) =
+                Self::capture_value(value, data_type, scope, schema, options, emit)?;
+            statements.extend(capture);
+            return Ok((BoundValue::Expr(reference), statements));
+        }
         Ok((BoundValue::Expr(value), statements))
+    }
+
+    /// Whether an expression depends on a generated assignment.
+    pub(super) fn depends_on_generated(value: &Expr, scope: &BodyScope) -> bool {
+        if generates_uuid(value) {
+            return true;
+        }
+        let bindings: Vec<_> = scope.bindings().cloned().collect();
+        let mut generated = BTreeSet::new();
+        for binding in Self::order_bindings_by_dependency(&bindings) {
+            let depends = match &binding.value {
+                BoundValue::Stored { .. } => true,
+                BoundValue::Expr(expression) => {
+                    generates_uuid(expression)
+                        || generated.iter().any(|name: &&str| references_variable(expression, name))
+                }
+                BoundValue::Unreadable(_) | BoundValue::Row(_) => false,
+            };
+            if depends {
+                generated.insert(binding.name.as_str());
+            }
+        }
+        generated.iter().any(|name| references_variable(value, name))
+    }
+
+    /// Captures a generated expression under an immutable invocation slot.
+    pub(super) fn capture_value(
+        value: Expr,
+        data_type: Option<DataType>,
+        scope: &mut BodyScope,
+        schema: &ParserDB,
+        options: &crate::options::TranslationContext<'_>,
+        emit: crate::warnings::WarningSink<'_>,
+    ) -> Result<(Expr, Vec<Statement>), Error> {
+        if Self::stored_type(&value, scope).is_some_and(|stored_type| *stored_type == data_type) {
+            return Ok((value, Vec::new()));
+        }
+        if let Some(relation) = scope.rewritten_guard_relation(schema) {
+            return Err(rewritten_guard(relation));
+        }
+        let value = match &data_type {
+            Some(data_type) => Self::converted_to(value, data_type, schema, options),
+            None => value,
+        };
+        let variables = scope.variables();
+        let value = Self::translate_condition(
+            &value,
+            scope,
+            schema,
+            &options.with_variables(&variables),
+            emit,
+        )?;
+        let (reference, statement) = Self::store_value(value, data_type, scope);
+        Ok((reference, vec![statement]))
+    }
+
+    /// Finds the type of a captured value through direct variable aliases.
+    fn stored_type<'scope>(
+        value: &Expr,
+        scope: &'scope BodyScope,
+    ) -> Option<&'scope Option<DataType>> {
+        let mut direct = value;
+        let mut remaining = scope.bindings().count();
+        while remaining > 0 {
+            if let Expr::Nested(inner) = direct {
+                direct = inner;
+                continue;
+            }
+            let identifier = bare_identifier(direct)?;
+            let name = fold(identifier);
+            let binding = scope.bindings().find(|binding| binding.name == name)?;
+            match &binding.value {
+                BoundValue::Stored { data_type, .. } => return Some(data_type),
+                BoundValue::Expr(expression) => direct = expression,
+                _ => return None,
+            }
+            remaining -= 1;
+        }
+        None
+    }
+
+    /// Captures generated maintenance assignments before composing later reads.
+    pub(crate) fn translate_maintenance_values(
+        trigger: &sqlparser::ast::CreateTrigger,
+        rewrites: &crate::impls::shared_helpers::ColumnRewrites,
+        schema: &ParserDB,
+        options: &crate::options::TranslationContext<'_>,
+        emit: crate::warnings::WarningSink<'_>,
+    ) -> Result<(Vec<sqlparser::ast::Assignment>, Vec<Statement>), Error> {
+        use sql_traits::{
+            traits::{ColumnLike, TableLike, TriggerLike},
+            utils::identifier_resolution::stored_ident_name,
+        };
+
+        use crate::{
+            impls::{
+                translator_impls::create_trigger::{
+                    body_schema, maintained_value, maintenance_facts, without_undeclared,
+                },
+                unlabelled_body::{folded_namespace, signature, unlabelled_value},
+            },
+            traits::schema::{Schema, trigger_function},
+        };
+        let source_schema = body_schema(schema, options);
+        let assignments: Vec<_> = trigger
+            .maintenance_assignments(source_schema)?
+            .map(|(column, value)| {
+                (column.column_name().to_owned(), column.data_type(source_schema).clone(), value)
+            })
+            .collect();
+        let facts = maintenance_facts(trigger);
+        let undeclared: Vec<_> = trigger
+            .maintenance_undeclared_fields(source_schema)?
+            .map(|field| (field.row().name(), stored_ident_name(field.field()).into_owned()))
+            .collect();
+        let namespace = folded_namespace(trigger, source_schema)?;
+        let normalize = |value| {
+            Self::fold_trigger_specials_in(
+                without_undeclared(&unlabelled_value(value, namespace.as_ref()), &undeclared),
+                &facts,
+            )
+        };
+        let mut scope = BodyScope::new(facts.clone());
+        let mut captures = Vec::new();
+        let mut values = assignments
+            .iter()
+            .map(|(column, _, value)| (column.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        if let Some(execution) = &trigger.exec_body
+            && let Some(function) = trigger_function(source_schema, &execution.func_desc.name)?
+            && let Some(block) = source_schema.trigger_function_body(&execution.func_desc.name)?
+        {
+            Self::open_body(&block, &mut scope, options)?;
+            let columns = crate::impls::object_name::resolve_translation_table(
+                source_schema,
+                &trigger.table_name,
+            )?
+            .map(|table| {
+                table.columns(source_schema).map(|columns| {
+                    columns.map(|column| column.column_name().to_owned()).collect::<Vec<_>>()
+                })
+            })
+            .transpose()?
+            .unwrap_or_default();
+            let mut body = super::maintenance::MaintenanceBody::new(
+                block,
+                signature(function),
+                &columns,
+                &assignments,
+            );
+            captures = Self::capture_maintenance_assignments(
+                &mut body, &normalize, rewrites, &mut scope, schema, options, emit,
+            )?;
+            if !captures.is_empty() {
+                values = body.finish();
+            }
+        }
+        let bindings: Vec<_> = scope.bindings().cloned().collect();
+        let reserved = reserved_variables(&bindings, options);
+        let (_, variables) =
+            Self::bound_values(&bindings, ReferenceForm::Inline, schema, options, emit);
+        let mut translated = Vec::with_capacity(assignments.len());
+        for (column, _, _) in assignments {
+            let Some((_, raw)) = values.iter().find(|(name, _)| name == &column) else { continue };
+            let mut raw = normalize(raw.clone())?;
+            reserve_variables(&mut raw, &bindings);
+            let mut value = maintained_value(
+                rewrites,
+                &column,
+                &raw,
+                schema,
+                &options.with_variables(&reserved),
+                emit,
+            )?;
+            substitute_variables(&mut value, &variables)?;
+            translated.push(sqlparser::ast::Assignment {
+                target: sqlparser::ast::AssignmentTarget::ColumnName(ObjectName::from(vec![
+                    Ident::new(column),
+                ])),
+                value,
+            });
+        }
+        Ok((translated, captures))
+    }
+
+    /// Captures executed maintenance assignments in source order.
+    fn capture_maintenance_assignments(
+        body: &mut super::maintenance::MaintenanceBody<'_>,
+        normalize: &impl Fn(Expr) -> Result<Expr, Error>,
+        rewrites: &crate::impls::shared_helpers::ColumnRewrites,
+        scope: &mut BodyScope,
+        schema: &ParserDB,
+        options: &crate::options::TranslationContext<'_>,
+        emit: crate::warnings::WarningSink<'_>,
+    ) -> Result<Vec<Statement>, Error> {
+        let mut captures = Vec::new();
+        while let Some((column, data_type, raw, guard)) = body.next()? {
+            let raw = normalize(raw)?;
+            if !Self::depends_on_generated(&raw, scope) {
+                continue;
+            }
+            let guard = normalize(guard)?;
+            let variables = scope.variables();
+            let guard = Self::translate_condition(
+                &guard,
+                scope,
+                schema,
+                &options.with_variables(&variables),
+                emit,
+            )?;
+            let bindings: Vec<_> = scope.bindings().cloned().collect();
+            let reserved = reserved_variables(&bindings, options);
+            let mut raw = raw;
+            reserve_variables(&mut raw, &bindings);
+            let mut value = crate::impls::translator_impls::create_trigger::maintained_value(
+                rewrites,
+                column,
+                &raw,
+                schema,
+                &options.with_variables(&reserved),
+                emit,
+            )?;
+            let (_, variables) =
+                Self::bound_values(&bindings, ReferenceForm::Inline, schema, options, emit);
+            substitute_variables(&mut value, &variables)?;
+            scope.push_condition(guard);
+            let (reference, statement) = Self::store_value(value, Some(data_type.clone()), scope);
+            scope.pop_condition();
+            captures.push(statement);
+            body.bind(reference);
+        }
+        Ok(captures)
+    }
+
+    /// Writes a translated value into an immutable invocation slot.
+    fn store_value(
+        value: Expr,
+        data_type: Option<DataType>,
+        scope: &mut BodyScope,
+    ) -> (Expr, Statement) {
+        let slot = scope.next_slot;
+        scope.next_slot += 1;
+        let number =
+            |number: usize| Expr::Value(Value::Number(number.to_string(), false).with_empty_span());
+        let (iteration_site, iteration) =
+            scope.iteration.clone().unwrap_or_else(|| (number(0), number(0)));
+        let frame = crate::impls::translator_impls::body_storage::current_frame();
+        let table = ObjectName::from(vec![Ident::new(
+            crate::impls::translator_impls::body_storage::VALUES,
+        )]);
+        let source = make_query(
+            None,
+            SetExpr::Select(Box::new(make_simple_select(
+                vec![
+                    SelectItem::UnnamedExpr(frame.clone()),
+                    SelectItem::UnnamedExpr(iteration_site.clone()),
+                    SelectItem::UnnamedExpr(iteration.clone()),
+                    SelectItem::UnnamedExpr(number(slot)),
+                    SelectItem::UnnamedExpr(value),
+                ],
+                Vec::new(),
+                scope.current_condition(),
+            ))),
+        );
+        let statement = crate::impls::ast_builder::insert(
+            table.clone(),
+            ["frame", "iteration_site", "iteration", "slot", "value"]
+                .into_iter()
+                .map(|name| ObjectName::from(vec![Ident::new(name)]))
+                .collect(),
+            source,
+        );
+        let selection = conjunction(
+            [
+                ("frame", frame),
+                ("iteration_site", iteration_site),
+                ("iteration", iteration),
+                ("slot", number(slot)),
+            ]
+            .into_iter()
+            .map(|(name, value)| {
+                Expr::BinaryOp {
+                    left: Box::new(Expr::Identifier(Ident::new(name))),
+                    op: BinaryOperator::Eq,
+                    right: Box::new(value),
+                }
+            }),
+        );
+        let read = Expr::Subquery(Box::new(single_expr_query(
+            Expr::Identifier(Ident::new("value")),
+            from_relation(plain_table_factor(table)),
+            Some(selection),
+        )));
+        (scope.hold_stored(read, data_type), statement)
     }
 
     /// The whole row `value` reads, when it is `NEW`, `OLD` or a variable
@@ -1225,7 +1700,7 @@ impl PlPgSqlTranslator {
         }
         match &scope.bindings().find(|binding| binding.name == name)?.value {
             BoundValue::Row(row) => Some(row.clone()),
-            BoundValue::Expr(_) | BoundValue::Unreadable(_) => None,
+            BoundValue::Expr(_) | BoundValue::Unreadable(_) | BoundValue::Stored { .. } => None,
         }
     }
 
@@ -1457,7 +1932,7 @@ impl PlPgSqlTranslator {
         schema: &ParserDB,
         options: &crate::options::TranslationContext<'_>,
         emit: crate::warnings::WarningSink<'_>,
-    ) -> Result<Vec<Statement>, Error> {
+    ) -> Result<Box<Query>, Error> {
         let bindings: Vec<_> = scope.bindings().cloned().collect();
         let (_, variables) =
             Self::bound_values(&bindings, ReferenceForm::Inline, schema, options, emit);
@@ -1465,13 +1940,15 @@ impl PlPgSqlTranslator {
         reserve_variables(&mut reserved_query, &bindings);
         let reserved = reserved_variables(&bindings, options);
         let options = options.with_variables(&reserved);
-        let mut translated = Vec::new();
-        for statement in Self::translate_query_statement(&reserved_query, &options)? {
-            translated.extend(statement.translate_with_warnings(schema, &options, emit)?);
+        *reserved_query.body = Self::transform_query_body(&reserved_query.body, &options);
+        if let Some(with) = &mut reserved_query.with {
+            for cte in &mut with.cte_tables {
+                Self::transform_query_expressions(&mut cte.query, &options);
+            }
         }
-        for statement in &mut translated {
-            substitute_variables(statement, &variables)?;
-        }
+        let mut translated =
+            Box::new(reserved_query.translate_with_warnings(schema, &options, emit)?);
+        substitute_variables(translated.as_mut(), &variables)?;
         Ok(translated)
     }
 
@@ -2091,10 +2568,6 @@ impl PlPgSqlTranslator {
     }
 
     /// Translates an `INSERT`, each variable it reads carried by a CTE.
-    ///
-    /// A generated UUID variable is read back by a later `INSERT` through
-    /// `last_insert_rowid()` from the row the first one wrote, so both see one
-    /// value.
     fn translate_insert_statement(
         insert: &sqlparser::ast::Insert,
         scope: &mut BodyScope,
@@ -2102,6 +2575,9 @@ impl PlPgSqlTranslator {
         options: &crate::options::TranslationContext<'_>,
         emit: crate::warnings::WarningSink<'_>,
     ) -> Result<Vec<Statement>, Error> {
+        if matches!(insert.table, sqlparser::ast::TableObject::TableFunction(_)) {
+            return Err(Error::forward_refusal("INSERT into a table function not supported"));
+        }
         let bindings: Vec<_> = scope.bindings().cloned().collect();
         let condition = scope.current_condition();
 
@@ -2110,11 +2586,10 @@ impl PlPgSqlTranslator {
                 .translate_with_warnings(schema, options, emit);
         }
 
-        let modified_bindings = Self::insert_bindings(insert, bindings, scope)?;
         let mut new_insert = insert.clone();
 
         let (values, variables) =
-            Self::bound_values(&modified_bindings, ReferenceForm::Cte, schema, options, emit);
+            Self::bound_values(&bindings, ReferenceForm::Cte, schema, options, emit);
         let ctes: Vec<sqlparser::ast::Cte> = values
             .into_iter()
             .map(|(name, value)| CteBuilder::create_variable_cte(&name, value))
@@ -2123,7 +2598,7 @@ impl PlPgSqlTranslator {
         if let Some(source) = &insert.source {
             match &*source.body {
                 SetExpr::Values(values) => {
-                    let new_source = Self::transform_values_to_select(values, &modified_bindings)?;
+                    let new_source = Self::transform_values_to_select(values, &bindings)?;
                     new_insert.source = Some(Box::new(make_query(None, new_source)));
                 }
                 SetExpr::Select(select) => {
@@ -2132,7 +2607,7 @@ impl PlPgSqlTranslator {
                         body: Box::new(SetExpr::Select(select.clone())),
                         ..source.as_ref().clone()
                     };
-                    reserve_variables(&mut new_source, &modified_bindings);
+                    reserve_variables(&mut new_source, &bindings);
                     new_insert.source = Some(Box::new(new_source));
                 }
                 _ => {
@@ -2141,18 +2616,18 @@ impl PlPgSqlTranslator {
                 }
             }
         }
-        reserve_variables(&mut new_insert.on, &modified_bindings);
+        reserve_variables(&mut new_insert.on, &bindings);
         // The `WITH` holding the values belongs to the source query, which
         // the `ON CONFLICT` clause cannot read, so the clause reads each value
         // inline.
         let conflict_variables = if insert.on.is_some() {
-            Self::bound_values(&modified_bindings, ReferenceForm::Inline, schema, options, emit).1
+            Self::bound_values(&bindings, ReferenceForm::Inline, schema, options, emit).1
         } else {
             VariableScope::default()
         };
 
         // The CTE reads would hide the declared types the reserved names carry.
-        let reserved = reserved_variables(&modified_bindings, options);
+        let reserved = reserved_variables(&bindings, options);
         let mut translated = Statement::Insert(new_insert).translate_with_warnings(
             schema,
             &options.with_variables(&reserved),
@@ -2173,81 +2648,6 @@ impl PlPgSqlTranslator {
             }
         }
         Ok(translated)
-    }
-
-    /// The bindings `insert` reads, each generated UUID an earlier `INSERT`
-    /// wrote read back from that row through `last_insert_rowid()`.
-    ///
-    /// A generated UUID this `INSERT` writes first is recorded, so later ones
-    /// read the same value back.
-    fn insert_bindings(
-        insert: &sqlparser::ast::Insert,
-        bindings: Vec<Binding>,
-        scope: &mut BodyScope,
-    ) -> Result<Vec<Binding>, Error> {
-        let sqlparser::ast::TableObject::TableName(table) = &insert.table else {
-            return Err(Error::forward_refusal(
-                "INSERT into table function not supported".to_string(),
-            ));
-        };
-        let table_name = crate::impls::object_name::last_ident(table)
-            .map(|ident| ident.value.clone())
-            .unwrap_or_default();
-        let column_names: Vec<String> = insert
-            .columns
-            .iter()
-            .map(|c| {
-                c.0.last()
-                    .and_then(sqlparser::ast::ObjectNamePart::as_ident)
-                    .map_or_else(|| c.to_string(), |id| id.value.clone())
-            })
-            .collect();
-
-        let mut modified_bindings = Vec::with_capacity(bindings.len());
-        let mut first_uses: Vec<(String, String)> = Vec::new();
-        for binding in bindings {
-            if !matches!(&binding.value, BoundValue::Expr(expr) if generates_uuid(expr)) {
-                modified_bindings.push(binding);
-                continue;
-            }
-            if let Some(first_use) = scope.uuid_first_use(&binding.name) {
-                let rowid = Expr::BinaryOp {
-                    left: Box::new(Expr::Identifier(Ident::new("rowid"))),
-                    op: BinaryOperator::Eq,
-                    right: Box::new(simple_function_expr("last_insert_rowid", Vec::new(), None)),
-                };
-                let read_back = single_expr_query(
-                    Expr::Identifier(Ident::new(first_use.column.clone())),
-                    from_relation(plain_table_factor(ObjectName::from(vec![Ident::new(
-                        first_use.table.clone(),
-                    )]))),
-                    Some(rowid),
-                );
-                modified_bindings.push(Binding {
-                    name: binding.name,
-                    value: BoundValue::Expr(Expr::Subquery(Box::new(read_back))),
-                });
-                continue;
-            }
-            if let Some(source) = &insert.source
-                && let SetExpr::Values(values) = &*source.body
-                && let Some(row) = values.rows.first()
-            {
-                for (expr, column) in row.iter().zip(&column_names) {
-                    if references_variable(expr, &binding.name) {
-                        first_uses.push((binding.name.clone(), column.clone()));
-                    }
-                }
-            }
-            modified_bindings.push(binding);
-        }
-
-        for (variable, column) in &first_uses {
-            if scope.uuid_first_use(variable).is_none() {
-                scope.record_uuid_first_use(variable, &table_name, column);
-            }
-        }
-        Ok(modified_bindings)
     }
 
     /// Reorders bindings so one read by another comes first.
@@ -2310,6 +2710,11 @@ impl PlPgSqlTranslator {
         for binding in ordered {
             let expr = match &binding.value {
                 BoundValue::Expr(expr) => expr,
+                BoundValue::Stored { expression, .. } => {
+                    scope.bind(&binding.name, form.reference(&binding.name, expression));
+                    values.push((binding.name.clone(), expression.clone()));
+                    continue;
+                }
                 BoundValue::Unreadable(reason) => {
                     scope.refuse(&binding.name, reason);
                     continue;
@@ -2645,14 +3050,20 @@ fn reserved_variables(
     bindings
         .iter()
         .flat_map(|binding| {
-            let declaration = options.variable_declaration(&binding.name);
-            [
-                BoundVariable::declared(binding.name.clone(), declaration.cloned()),
-                BoundVariable::declared(
-                    format!("{RESERVED_VARIABLE_PREFIX}{}", binding.name),
-                    declaration.cloned(),
-                ),
-            ]
+            let name = binding.name.clone();
+            let reserved_name = format!("{RESERVED_VARIABLE_PREFIX}{name}");
+            if let BoundValue::Stored { data_type, .. } = &binding.value {
+                [
+                    BoundVariable::new(name, data_type.clone()),
+                    BoundVariable::new(reserved_name, data_type.clone()),
+                ]
+            } else {
+                let declaration = options.variable_declaration(&binding.name);
+                [
+                    BoundVariable::declared(name, declaration.cloned()),
+                    BoundVariable::declared(reserved_name, declaration.cloned()),
+                ]
+            }
         })
         .collect()
 }
@@ -2825,18 +3236,22 @@ fn schema_function_call(query: &Query, schema: &ParserDB) -> Option<String> {
 fn generates_uuid(expr: &Expr) -> bool {
     visit_expressions(expr, |inner| {
         if let Expr::Function(function) = inner
-            && function_name(function).is_some_and(|name| {
-                matches!(
-                    name.as_str(),
-                    "uuidv7" | "uuidv4" | "uuid_generate_v4" | "gen_random_uuid"
-                )
-            })
+            && is_uuid_generator(function)
         {
             return ControlFlow::Break(());
         }
         ControlFlow::Continue(())
     })
     .is_break()
+}
+
+/// Recognizes the source UUID generators by their unqualified names.
+fn is_uuid_generator(function: &sqlparser::ast::Function) -> bool {
+    function.name.0.last().and_then(ObjectNamePart::as_ident).is_some_and(|name| {
+        ["uuidv7", "uuidv4", "uuid_generate_v4", "gen_random_uuid"]
+            .iter()
+            .any(|candidate| name.value.eq_ignore_ascii_case(candidate))
+    })
 }
 
 /// Replaces a read of one CTE with a derived table over its body.
@@ -3492,7 +3907,7 @@ mod tests {
     }
 
     #[test]
-    fn translate_insert_statement_covers_uuid_tracking_and_select_source_paths() {
+    fn translate_insert_statement_reuses_captured_values_and_select_sources() {
         let schema = ParserDB::from_statements(
             Parser::parse_sql(
                 &PostgreSqlDialect {},
@@ -3507,10 +3922,17 @@ mod tests {
         );
 
         let mut scope = BodyScope::new(TriggerFacts::default());
-        scope.bind(Binding {
-            name: "v_id".to_string(),
-            value: BoundValue::Expr(parse_expr("uuidv7()")),
-        });
+        let (reference, capture) = PlPgSqlTranslator::capture_value(
+            parse_expr("uuidv7()"),
+            None,
+            &mut scope,
+            &schema,
+            &options,
+            &mut core::mem::drop,
+        )
+        .unwrap();
+        assert_eq!(capture.len(), 1);
+        scope.bind(Binding { name: "v_id".to_string(), value: BoundValue::Expr(reference) });
 
         let Statement::Insert(insert_values) =
             parse_statement("INSERT INTO users (id, name) VALUES (v_id, 'a')")
@@ -3529,7 +3951,8 @@ mod tests {
             !translated_values.is_empty(),
             "the VALUES body should translate into at least one statement"
         );
-        assert!(scope.uuid_first_use("v_id").is_some());
+        assert!(translated_values[0].to_string().contains("pg2sqlite_body_values"));
+        assert!(!translated_values[0].to_string().contains("uuid7()"));
 
         let Statement::Insert(insert_select) =
             parse_statement("INSERT INTO users (id) SELECT v_id")
@@ -3549,6 +3972,8 @@ mod tests {
             !translated_select.is_empty(),
             "the SELECT body should translate into at least one statement"
         );
+        assert!(translated_select[0].to_string().contains("pg2sqlite_body_values"));
+        assert!(!translated_select[0].to_string().contains("uuid7()"));
 
         let mut table_function_insert = insert_values.clone();
         let Expr::Function(function) = parse_expr("remote()") else {
@@ -3567,19 +3992,29 @@ mod tests {
     }
 
     #[test]
-    fn translate_insert_statement_tracks_schema_qualified_uuid_generate_v4_bindings() {
+    fn translate_insert_statement_reuses_schema_qualified_uuid_generate_v4_values() {
         let schema = ParserDB::from_statements(
             Parser::parse_sql(&PostgreSqlDialect {}, "CREATE TABLE users(id TEXT, name TEXT);")
                 .unwrap(),
             "test".to_string(),
         )
         .unwrap();
-        let options = crate::options::TranslationContext::from_owned(Pg2SqliteOptions::default());
+        let options = crate::options::TranslationContext::from_owned(
+            Pg2SqliteOptions::default().with_uuid_function_name("captured_uuid"),
+        );
         let mut scope = BodyScope::new(TriggerFacts::default());
-        scope.bind(Binding {
-            name: "v_id".to_string(),
-            value: BoundValue::Expr(parse_expr("pg_catalog.uuid_generate_v4()")),
-        });
+        let (reference, capture) = PlPgSqlTranslator::capture_value(
+            parse_expr("pg_catalog.uuid_generate_v4()"),
+            None,
+            &mut scope,
+            &schema,
+            &options,
+            &mut core::mem::drop,
+        )
+        .unwrap();
+        assert_eq!(capture.len(), 1);
+        assert!(capture[0].to_string().contains("captured_uuid()"));
+        scope.bind(Binding { name: "v_id".to_string(), value: BoundValue::Expr(reference) });
 
         let Statement::Insert(insert_values) =
             parse_statement("INSERT INTO users (id, name) VALUES (v_id, 'a')")
@@ -3596,10 +4031,8 @@ mod tests {
         )
         .expect("values insert should translate");
         assert!(!translated.is_empty(), "the body should translate into at least one statement");
-        assert!(
-            scope.uuid_first_use("v_id").is_some(),
-            "schema-qualified uuid_generate_v4() should be tracked for last_insert_rowid pattern"
-        );
+        assert!(translated[0].to_string().contains("pg2sqlite_body_values"));
+        assert!(!translated[0].to_string().contains("captured_uuid()"));
     }
 
     #[test]

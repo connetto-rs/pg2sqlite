@@ -3,15 +3,15 @@ use alloc::borrow::Cow;
 use sql_traits::{
     errors::LookupError,
     structs::{MaintenanceRefusal, ParserDB},
-    traits::{ColumnLike, DatabaseLike, Relation, RoleLike, TableLike, TriggerLike, ViewLike},
+    traits::{DatabaseLike, Relation, RoleLike, TableLike, TriggerLike, ViewLike},
     utils::identifier_resolution::stored_ident_name,
 };
 use sqlparser::{
     ast::{
-        Assignment, AssignmentTarget, BinaryOperator, ConditionalStatements, CreateTrigger,
-        DropTrigger, Expr, FromTable, Ident, ObjectName, ObjectNamePart, Query, SetExpr, Statement,
-        TableFactor, TableObject, TriggerEvent, TriggerExecBodyType, TriggerObject,
-        TriggerObjectKind, TriggerPeriod, Update, Value, ValueWithSpan,
+        BinaryOperator, ConditionalStatements, CreateTrigger, DropTrigger, Expr, FromTable, Ident,
+        ObjectName, ObjectNamePart, Query, SetExpr, Statement, TableFactor, TableObject,
+        TriggerEvent, TriggerExecBodyType, TriggerObject, TriggerObjectKind, TriggerPeriod, Update,
+        Value, ValueWithSpan,
     },
     keywords::Keyword,
     tokenizer::Span,
@@ -31,38 +31,9 @@ use crate::{
         privileges::names_table_with_backing,
         query_builder::{plain_table_with_joins, single_expr_query},
         shared_helpers::ColumnRewrites,
-        unlabelled_body::{folded_namespace, unlabelled_value},
     },
     traits::{schema::Schema, translator::TranslatorWithContext},
 };
-
-/// R106 sequential semantics: PostgreSQL runs plpgsql assignments in order,
-/// so a value referencing a column assigned earlier in the same body
-/// must see that write. A single SQLite `UPDATE` evaluates its whole SET list
-/// against the pre-update row, so earlier values are composed into later ones
-/// instead of split across statements, each of which would fire the table's
-/// other `UPDATE` triggers once more. References to columns assigned LATER
-/// stay raw, because reading the pre-update row is exactly what PostgreSQL
-/// does for them.
-#[cfg_attr(feature = "std", recursive::recursive)]
-fn compose_assignment_refs(expr: &Expr, assigned: &[(String, Expr)]) -> Expr {
-    let earlier = |name: &str| {
-        assigned
-            .iter()
-            .rev()
-            .find(|(col, _)| col.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.clone())
-    };
-    match expr {
-        Expr::Identifier(id) => earlier(&id.value).unwrap_or_else(|| expr.clone()),
-        Expr::CompoundIdentifier(parts)
-            if parts.len() == 2 && parts[0].value.eq_ignore_ascii_case("NEW") =>
-        {
-            earlier(&parts[1].value).unwrap_or_else(|| expr.clone())
-        }
-        _ => map_expr_children(expr, &|child| compose_assignment_refs(child, assigned)),
-    }
-}
 
 /// The schema a trigger's function is read from, the one its `CREATE
 /// TRIGGER` was written against, since PostgreSQL runs the function and
@@ -75,42 +46,10 @@ pub(crate) fn body_schema<'s>(
     options.written_schema().unwrap_or(schema)
 }
 
-/// The maintenance assignments in body order, each value composed against the
-/// ones before it and read as the trigger's events see it, with `TG_OP` and
-/// `TG_TABLE_NAME` folded and the fields of the row an event lacks NULL. These
-/// are the values the trigger body's `UPDATE` writes.
-///
-/// # Errors
-///
-/// Returns an error when the trigger's table does not resolve, or when a value
-/// reads `TG_OP` under several events or a trigger variable SQLite has no
-/// value for.
-fn maintenance_chain(
-    trigger: &CreateTrigger,
-    schema: &ParserDB,
-) -> Result<Vec<(String, Expr)>, crate::errors::Error> {
-    let facts = maintenance_facts(trigger);
-    let undeclared: Vec<(&str, String)> = trigger
-        .maintenance_undeclared_fields(schema)?
-        .map(|field| (field.row().name(), stored_ident_name(field.field()).into_owned()))
-        .collect();
-    let namespace = folded_namespace(trigger, schema)?;
-    let mut assigned: Vec<(String, Expr)> = Vec::new();
-    for (col, raw) in trigger.maintenance_assignments(schema)? {
-        let raw = unlabelled_value(raw, namespace.as_ref());
-        let composed = super::plpgsql::PlPgSqlTranslator::fold_trigger_specials_in(
-            compose_assignment_refs(&without_undeclared(&raw, &undeclared), &assigned),
-            &facts,
-        )?;
-        assigned.push((col.column_name().to_owned(), composed));
-    }
-    Ok(assigned)
-}
-
 /// `expr` with each read of a field `undeclared` lists, and of a nested field,
 /// as `NULL`, which no run reads since the abort for that read runs first.
 #[cfg_attr(feature = "std", recursive::recursive)]
-fn without_undeclared(expr: &Expr, undeclared: &[(&str, String)]) -> Expr {
+pub(super) fn without_undeclared(expr: &Expr, undeclared: &[(&str, String)]) -> Expr {
     match expr {
         Expr::CompoundIdentifier(parts)
             if parts.len() >= 2
@@ -132,7 +71,7 @@ fn without_undeclared(expr: &Expr, undeclared: &[(&str, String)]) -> Expr {
 
 /// What the body of the maintenance trigger `trigger` reads its trigger
 /// specials from.
-fn maintenance_facts(trigger: &CreateTrigger) -> super::plpgsql::TriggerFacts {
+pub(super) fn maintenance_facts(trigger: &CreateTrigger) -> super::plpgsql::TriggerFacts {
     super::plpgsql::TriggerFacts {
         events: trigger.events.clone(),
         table: crate::impls::object_name::last_ident(&trigger.table_name)
@@ -167,18 +106,9 @@ fn generate_maintenance_trigger_body(
     // PostgreSQL one at this point. `target_table_name` may already be the
     // redirected RLS backing table, which the schema does not hold.
     let rewrites = ColumnRewrites::for_named_table(schema, &trigger.table_name, options);
-    let assignments = maintenance_chain(trigger, body_schema(schema, options))?
-        .into_iter()
-        .map(|(col, raw)| {
-            let value = maintained_value(&rewrites, &col, &raw, schema, options, emit)?;
-            Ok(Assignment {
-                target: AssignmentTarget::ColumnName(ObjectName(vec![ObjectNamePart::Identifier(
-                    Ident::new(col),
-                )])),
-                value,
-            })
-        })
-        .collect::<Result<Vec<_>, crate::errors::Error>>()?;
+    let (assignments, captures) = super::plpgsql::PlPgSqlTranslator::translate_maintenance_values(
+        trigger, &rewrites, schema, options, emit,
+    )?;
     let writes_any = !assignments.is_empty();
 
     let update_stmt = Statement::Update(Update {
@@ -225,7 +155,11 @@ fn generate_maintenance_trigger_body(
     });
     Ok(sqlparser::ast::BeginEndStatements {
         begin_token: ast_builder::keyword_token("BEGIN", Keyword::BEGIN),
-        statements: aborts.into_iter().chain(writes.into_iter().flatten()).collect(),
+        statements: aborts
+            .into_iter()
+            .chain(captures)
+            .chain(writes.into_iter().flatten())
+            .collect(),
         end_token: ast_builder::keyword_token("END", Keyword::END),
     })
 }
@@ -394,7 +328,8 @@ fn generate_standard_trigger_body(
     if let (Some(function), Some(owner)) = (function, owner) {
         // The part fires for its own events alone, so a row another event
         // gives reads as `NULL` here, as in PostgreSQL.
-        let running_as = options.with_running_as(owner);
+        let running_as = options
+            .with_dispatcher_owner(super::definer::DispatcherOwner::Definer { function, owner });
         let translated = super::plpgsql::PlPgSqlTranslator::translate_body(
             &function_name.to_string(),
             body,
@@ -406,7 +341,7 @@ fn generate_standard_trigger_body(
         )?;
         let statements =
             super::definer::run_as_owner(function, owner, translated, schema, options)?;
-        return Ok(Some(begin_end(statements, part)));
+        return Ok(Some(begin_end(statements, part, options)));
     }
     // An invoker body a definer body's write fires runs as that body's owner,
     // and one a foreign key action fires as the owner of the table it writes.
@@ -451,7 +386,11 @@ fn generate_standard_trigger_body(
     for (frames, owner) in firing_owners {
         let running = super::definer::running_among(&frames);
         let guard = and_guards(part.guard, Some(running.clone())).unwrap_or(running);
-        let running_as = options.with_running_as(owner);
+        let running_as = options.with_dispatcher_owner(super::definer::DispatcherOwner::Firing {
+            function: function_name,
+            owner,
+            guard: &guard,
+        });
         // The acting translation already reported what the body warns of.
         let translated = super::plpgsql::PlPgSqlTranslator::translate_body(
             &function_name.to_string(),
@@ -471,7 +410,7 @@ fn generate_standard_trigger_body(
             options,
         )?);
     }
-    Ok(Some(begin_end(statements, part)))
+    Ok(Some(begin_end(statements, part, options)))
 }
 
 /// The trigger body holding `statements`, each statement writing rows marked
@@ -479,11 +418,12 @@ fn generate_standard_trigger_body(
 fn begin_end(
     statements: Vec<Statement>,
     part: &TriggerPart<'_>,
+    options: &crate::options::TranslationContext<'_>,
 ) -> sqlparser::ast::BeginEndStatements {
     sqlparser::ast::BeginEndStatements {
         begin_token: crate::impls::ast_builder::keyword_token("BEGIN", Keyword::BEGIN),
         statements: match part.derived_write_function {
-            Some(function) => crate::impls::derived_writes::marked(statements, function),
+            Some(function) => crate::impls::derived_writes::marked(statements, function, options),
             None => statements,
         },
         end_token: crate::impls::ast_builder::keyword_token("END", Keyword::END),
@@ -507,7 +447,7 @@ fn and_guards(left: Option<&Expr>, right: Option<Expr>) -> Option<Expr> {
 /// The SQLite value a maintenance `UPDATE` writes into `column`, `raw` being
 /// the PostgreSQL value the trigger assigns, with the cast, scaling and
 /// canonical form any write into that column takes.
-fn maintained_value(
+pub(super) fn maintained_value(
     rewrites: &ColumnRewrites,
     column: &str,
     raw: &Expr,
@@ -945,6 +885,12 @@ impl crate::traits::translator::TranslatorWithContext for CreateTrigger {
                     exec_body.func_desc.name
                 )));
             };
+            let mut function_body = function_body;
+            function_body.statements = super::body_storage::wrap_guarded(
+                function_body.statements,
+                guard.as_ref(),
+                options,
+            );
             // SQLite rejects an empty BEGIN END, and dropping the trigger would
             // orphan a later DROP TRIGGER.
             let function_body = substitute_no_op_body_when_empty(function_body, emit);

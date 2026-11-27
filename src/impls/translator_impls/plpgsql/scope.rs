@@ -70,14 +70,12 @@ impl TriggerFacts {
 
 /// The value a variable holds where a statement reads it.
 #[derive(Clone, Debug, PartialEq)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "nearly every binding holds an expression, so boxing it costs an allocation per binding"
-)]
 pub(crate) enum BoundValue {
     /// The PostgreSQL expression computing the value, translated where it is
     /// read.
     Expr(Expr),
+    /// A typed SQLite expression reading an immutable captured value.
+    Stored { expression: Expr, data_type: Option<DataType> },
     /// A value the emitted trigger cannot compute, refused with the reason
     /// where a statement reads it.
     Unreadable(String),
@@ -91,7 +89,7 @@ impl BoundValue {
         match self {
             Self::Expr(expr) => reads_variable(expr, name),
             Self::Row(row) => row.reads_variable(name),
-            Self::Unreadable(_) => false,
+            Self::Unreadable(_) | Self::Stored { .. } => false,
         }
     }
 
@@ -104,7 +102,7 @@ impl BoundValue {
                     replace_reads(condition, name, replacement);
                 });
             }
-            Self::Unreadable(_) => {}
+            Self::Unreadable(_) | Self::Stored { .. } => {}
         }
     }
 }
@@ -238,7 +236,7 @@ impl Binding {
         match &self.value {
             BoundValue::Expr(expr) => relations_read(expr, schema).contains(relation),
             BoundValue::Row(row) => row.reads(relation, schema),
-            BoundValue::Unreadable(_) => false,
+            BoundValue::Unreadable(_) | BoundValue::Stored { .. } => false,
         }
     }
 }
@@ -290,16 +288,6 @@ fn table_names<N: Visit>(node: &N) -> Vec<String> {
     names.0
 }
 
-/// The first `INSERT` a generated UUID variable was written by, which later
-/// statements read it back from through `last_insert_rowid()`.
-#[derive(Clone, Debug)]
-pub(crate) struct UuidFirstUse {
-    /// The table the `INSERT` wrote.
-    pub(crate) table: String,
-    /// The column the variable was written to.
-    pub(crate) column: String,
-}
-
 /// The variables, guards and generated keys in force at one statement of a
 /// body.
 ///
@@ -326,7 +314,10 @@ pub(crate) struct BodyScope {
     /// The variable each value bound under a name of its own held before an
     /// assignment replaced it, by that name.
     earlier: BTreeMap<String, String>,
-    uuid_first_use: BTreeMap<String, UuidFirstUse>,
+    reserved_names: BTreeSet<String>,
+    next_private: usize,
+    pub(crate) next_slot: usize,
+    pub(crate) iteration: Option<(Expr, Expr)>,
     /// Every relation the body wrote, views expanded.
     written: BTreeSet<String>,
     /// The helpers whose bodies are inlined to reach this one, outermost
@@ -356,6 +347,8 @@ impl BodyScope {
             conditions: self.conditions.clone(),
             writes_under_if: self.writes_under_if.clone(),
             inlining,
+            next_slot: self.next_slot,
+            iteration: self.iteration.clone(),
             facts: TriggerFacts::default(),
             ..Self::default()
         }
@@ -408,6 +401,32 @@ impl BodyScope {
         self.declared.get(name).and_then(Option::as_ref)
     }
 
+    /// Reserves source names before allocating private captured bindings.
+    pub(crate) fn reserve_names(&mut self, names: impl IntoIterator<Item = String>) {
+        self.reserved_names.extend(names);
+    }
+
+    /// Binds a captured expression under a private typed name.
+    pub(crate) fn hold_stored(&mut self, expression: Expr, data_type: Option<DataType>) -> Expr {
+        let name = loop {
+            let candidate = format!("pg2sqlite_stored_{}", self.next_private);
+            self.next_private += 1;
+            if !self.reserved_names.contains(&candidate)
+                && !self.declared.contains_key(&candidate)
+                && !self.persistent.contains_key(&candidate)
+                && !self.scoped.contains_key(&candidate)
+            {
+                break candidate;
+            }
+        };
+        self.declared.insert(name.clone(), data_type.clone());
+        self.persistent.insert(
+            name.clone(),
+            Binding { name: name.clone(), value: BoundValue::Stored { expression, data_type } },
+        );
+        Expr::Identifier(Ident::new(name))
+    }
+
     /// Binds `binding` for the rest of the body, across `IF` branches.
     pub(crate) fn bind_persistent(&mut self, mut binding: Binding) {
         self.keep_earlier_reads(&mut binding);
@@ -433,13 +452,9 @@ impl BodyScope {
     /// value where it is assigned, and a binding is translated where it is
     /// read.
     ///
-    /// The earlier value is bound under a name of its own, so a value read
-    /// many times is still computed once per statement. A generated UUID's
-    /// first `INSERT` goes with the earlier value, since the variable's new
-    /// value generates another.
+    /// The earlier value keeps its declared type under a private name.
     fn keep_earlier_reads(&mut self, binding: &mut Binding) {
         let name = binding.name.as_str();
-        let first_use = self.uuid_first_use.remove(name);
         let read = binding.value.reads_variable(name)
             || self
                 .scoped
@@ -455,9 +470,6 @@ impl BodyScope {
         };
         let value = earlier.value.clone();
         let held = self.unused_name();
-        if let Some(first_use) = first_use {
-            self.uuid_first_use.insert(held.clone(), first_use);
-        }
         // Declared with the variable's type, so a read of the earlier value
         // translates as a read of the variable does.
         let data_type = self.declared.get(name).cloned().flatten();
@@ -559,7 +571,6 @@ impl BodyScope {
         self.rows.remove(name);
         self.scoped.remove(name);
         self.persistent.remove(name);
-        self.uuid_first_use.remove(name);
     }
 
     /// Makes every binding whose value reads `relation` unreadable, since a
@@ -583,7 +594,7 @@ impl BodyScope {
                 );
                 binding.value = match binding.value {
                     BoundValue::Row(_) => BoundValue::Row(RowValue::Unreadable(reason)),
-                    BoundValue::Expr(_) | BoundValue::Unreadable(_) => {
+                    BoundValue::Expr(_) | BoundValue::Unreadable(_) | BoundValue::Stored { .. } => {
                         BoundValue::Unreadable(reason)
                     }
                 };
@@ -620,8 +631,7 @@ impl BodyScope {
         self.writes_under_if.push(BTreeSet::new());
     }
 
-    /// Stops recording for the innermost `IF`, answering the relations its
-    /// statements wrote.
+    /// Ends recording the relations written under an `IF`.
     pub(crate) fn end_if(&mut self) -> BTreeSet<String> {
         self.writes_under_if.pop().unwrap_or_default()
     }
@@ -633,25 +643,6 @@ impl BodyScope {
             let read = relations_read(condition, schema);
             writes.iter().find(|relation| read.contains(relation.as_str())).map(String::as_str)
         })
-    }
-
-    /// Records that `variable` was first written to `table`.`column`.
-    pub(crate) fn record_uuid_first_use(&mut self, variable: &str, table: &str, column: &str) {
-        self.uuid_first_use.insert(
-            variable.to_string(),
-            UuidFirstUse { table: table.to_string(), column: column.to_string() },
-        );
-    }
-
-    /// The `INSERT` that first wrote `variable`, if one did.
-    pub(crate) fn uuid_first_use(&self, variable: &str) -> Option<&UuidFirstUse> {
-        self.uuid_first_use.get(variable)
-    }
-
-    /// Forgets every first write, as a branch that generates a new UUID
-    /// needs.
-    pub(crate) fn clear_uuid_first_use(&mut self) {
-        self.uuid_first_use.clear();
     }
 }
 

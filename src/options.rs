@@ -9,7 +9,7 @@ use sql_traits::{
     },
     traits::DatabaseLike,
 };
-use sqlparser::ast::{Expr, ObjectName};
+use sqlparser::ast::{CreateTable, CreateTrigger, Expr, ObjectName};
 
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
@@ -279,6 +279,8 @@ pub(crate) struct PrewalkCatalogs {
     /// The helpers the translation calls as table-valued functions, in the
     /// order first called.
     helper_functions: core::cell::RefCell<Vec<crate::script::HelperFunction>>,
+    body_tables: core::cell::RefCell<Vec<CreateTable>>,
+    body_dispatchers: core::cell::RefCell<Vec<CreateTrigger>>,
     /// Each epoch's schema with the folded names of the tables it holds that
     /// the acting role reads in none of its statements but in a later epoch.
     pending_tables: Vec<(Rc<ParserDB>, BTreeSet<String>)>,
@@ -389,6 +391,7 @@ pub struct TranslationContext<'a> {
     /// DEFINER` trigger function, which PostgreSQL checks a call's privileges
     /// against in place of the acting role.
     running_as: Option<&'a Role>,
+    dispatcher_owner: Option<crate::impls::translator_impls::definer::DispatcherOwner<'a>>,
     /// The innermost `LANGUAGE sql` function whose body is being translated
     /// in place of a call, linked to the ones enclosing it.
     inlined_body: Option<&'a InlinedBody<'a>>,
@@ -471,6 +474,7 @@ struct ContextFields<'a> {
     body_key_schema: Option<&'a ParserDB>,
     history: Option<StatementHistory<'a>>,
     running_as: Option<&'a Role>,
+    dispatcher_owner: Option<crate::impls::translator_impls::definer::DispatcherOwner<'a>>,
     inlined_body: Option<&'a InlinedBody<'a>>,
     trigger_rows: Option<TriggerRows<'a>>,
     trigger_catalog: Option<&'a [TableTrigger]>,
@@ -494,6 +498,7 @@ impl<'a> ContextFields<'a> {
             body_key_schema: context.body_key_schema,
             history: context.history,
             running_as: context.running_as,
+            dispatcher_owner: context.dispatcher_owner,
             inlined_body: context.inlined_body,
             trigger_rows: context.trigger_rows,
             trigger_catalog: context.trigger_catalog,
@@ -525,6 +530,7 @@ impl<'a> ContextFields<'a> {
             body_key_schema: self.body_key_schema,
             history: self.history,
             running_as: self.running_as,
+            dispatcher_owner: self.dispatcher_owner,
             inlined_body: self.inlined_body,
             trigger_rows: self.trigger_rows,
             trigger_catalog: self.trigger_catalog,
@@ -555,6 +561,7 @@ impl<'a> TranslationContext<'a> {
             body_key_schema: None,
             history: None,
             running_as: None,
+            dispatcher_owner: None,
             inlined_body: None,
             trigger_rows: None,
             trigger_catalog: None,
@@ -586,6 +593,7 @@ impl<'a> TranslationContext<'a> {
             body_key_schema: None,
             history: None,
             running_as: None,
+            dispatcher_owner: None,
             inlined_body: None,
             trigger_rows: None,
             trigger_catalog: None,
@@ -798,17 +806,41 @@ impl<'a> TranslationContext<'a> {
         self.history
     }
 
-    /// The same context translating a body that runs as `role`.
+    /// The role the body being translated runs as, when it runs as other than
+    /// the acting role.
+    pub(crate) const fn running_as(&self) -> Option<&'a Role> {
+        self.running_as
+    }
+
+    /// The same context translating a body that runs as `role` and detaches
+    /// no dispatcher.
     pub(crate) fn with_running_as<'s>(&'s self, role: &'s Role) -> TranslationContext<'s> {
         let mut fields = ContextFields::borrowed(self);
         fields.running_as = Some(role);
         fields.into_context(self.scope, self.outer)
     }
 
-    /// The role the body being translated runs as, when it runs as other than
-    /// the acting role.
-    pub(crate) const fn running_as(&self) -> Option<&'a Role> {
-        self.running_as
+    /// Runs a body and its detached dispatchers under the same owner.
+    pub(crate) fn with_dispatcher_owner<'s>(
+        &'s self,
+        owner: crate::impls::translator_impls::definer::DispatcherOwner<'s>,
+    ) -> TranslationContext<'s> {
+        let mut fields = ContextFields::borrowed(self);
+        fields.running_as = Some(match owner {
+            crate::impls::translator_impls::definer::DispatcherOwner::Definer { owner, .. }
+            | crate::impls::translator_impls::definer::DispatcherOwner::Firing { owner, .. } => {
+                owner
+            }
+        });
+        fields.dispatcher_owner = Some(owner);
+        fields.into_context(self.scope, self.outer)
+    }
+
+    /// The owner rewrite for statements detached from the current body.
+    pub(crate) const fn dispatcher_owner(
+        &self,
+    ) -> Option<crate::impls::translator_impls::definer::DispatcherOwner<'a>> {
+        self.dispatcher_owner
     }
 
     /// The same context translating `body` in place of a call, running as
@@ -853,6 +885,7 @@ impl<'a> TranslationContext<'a> {
             body_key_schema: self.body_key_schema,
             history: None,
             running_as: self.running_as,
+            dispatcher_owner: self.dispatcher_owner,
             inlined_body: self.inlined_body,
             trigger_rows: None,
             trigger_catalog: None,
@@ -1437,6 +1470,37 @@ impl<'a> TranslationContext<'a> {
     /// out of the catalog once the translation is done.
     pub(crate) fn take_helper_functions(&self) -> Vec<crate::script::HelperFunction> {
         core::mem::take(&mut *self.catalogs.helper_functions.borrow_mut())
+    }
+
+    /// Records a generated body-input table once by name.
+    pub(crate) fn record_body_table(&self, table: CreateTable) {
+        let mut tables = self.catalogs.body_tables.borrow_mut();
+        if !tables.iter().any(|recorded| recorded.name == table.name) {
+            tables.push(table);
+        }
+    }
+
+    /// The generated body-input tables in registration order.
+    pub(crate) fn body_tables(&self) -> Vec<CreateTable> {
+        self.catalogs.body_tables.borrow().clone()
+    }
+
+    /// Whether a relation is a registered procedural input table.
+    pub(crate) fn has_body_table(&self, name: &ObjectName) -> bool {
+        self.catalogs.body_tables.borrow().iter().any(|table| table.name == *name)
+    }
+
+    /// Records a generated iteration dispatcher once by name.
+    pub(crate) fn record_body_dispatcher(&self, dispatcher: CreateTrigger) {
+        let mut dispatchers = self.catalogs.body_dispatchers.borrow_mut();
+        if !dispatchers.iter().any(|recorded| recorded.name == dispatcher.name) {
+            dispatchers.push(dispatcher);
+        }
+    }
+
+    /// The generated iteration dispatchers in registration order.
+    pub(crate) fn body_dispatchers(&self) -> Vec<CreateTrigger> {
+        self.catalogs.body_dispatchers.borrow().clone()
     }
 }
 

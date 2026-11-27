@@ -3,6 +3,7 @@
 
 pub(crate) mod array;
 pub(crate) mod blob_operator;
+pub(crate) mod body_storage;
 pub(crate) mod case_fold;
 pub(crate) mod clock_check;
 pub(crate) mod column;
