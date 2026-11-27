@@ -311,6 +311,33 @@ fn a_migration_keeps_the_database_of_an_earlier_temp_view() {
     }
 }
 
+/// A table whose row-level security a later translation disables loses the
+/// `temp` view standing for it, and the record names the table in `main`.
+#[test]
+fn a_migration_disabling_row_security_records_the_table_in_main() {
+    const MEMOS: &str = "
+        CREATE TABLE memos (id INT PRIMARY KEY, body TEXT);
+        GRANT SELECT ON memos TO app;
+        ALTER TABLE memos ENABLE ROW LEVEL SECURITY;
+        CREATE POLICY m ON memos USING (EXISTS (SELECT 1 FROM items i WHERE i.id = memos.id));
+    ";
+    let options = exempting().with_attached_tables("shared", ["items"]);
+    let earlier = format!("{SCHEMA}{MEMOS}");
+    let (mut connection, _, _) =
+        replica_of(&earlier, &options, "ATTACH DATABASE ':memory:' AS shared");
+    connection.remove_authorizer();
+    let schema = Pg2Sqlite::default().sql(&earlier).unwrap().build_schema().unwrap();
+    let migration = Pg2Sqlite::default()
+        .sql("ALTER TABLE memos DISABLE ROW LEVEL SECURITY;")
+        .unwrap()
+        .translate_to_sql_with_schema(&schema, &options)
+        .unwrap();
+    connection.batch_execute(&migration.into_vec().join(";\n")).unwrap();
+    let authorizer = Authorizer::load(&mut connection).unwrap();
+    authorizer.install(&mut connection);
+    assert_refused(&mut connection, &authorizer, "DELETE FROM memos WHERE false", "table memos");
+}
+
 /// A session's own `TEMP` table shadowing a relation is the session's to
 /// write, as PostgreSQL's `pg_temp` table is.
 #[test]

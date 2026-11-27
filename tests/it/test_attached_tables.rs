@@ -608,6 +608,84 @@ fn a_later_view_over_an_earlier_temp_view_is_temp() {
     assert_eq!(titles, ["shared to alice"]);
 }
 
+/// An earlier table whose key is a serial, plain or with row-level security,
+/// is read by a later batch.
+#[test]
+fn a_later_batch_reads_an_earlier_serial_table() {
+    let earlier = format!(
+        "{PAPERS}
+         CREATE TABLE counters (id SERIAL PRIMARY KEY, label TEXT);
+         CREATE TABLE stamps (id BIGSERIAL PRIMARY KEY, label TEXT);
+         ALTER TABLE stamps ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY stamps_read ON stamps FOR SELECT USING (true);"
+    );
+    let schema = Pg2Sqlite::default().sql(&earlier).expect("parse").build_schema().expect("schema");
+    Pg2Sqlite::default()
+        .sql("SELECT label FROM counters; SELECT label FROM stamps;")
+        .expect("parse")
+        .translate_to_sql_with_schema(&schema, &placed_options())
+        .expect("translate the reads");
+}
+
+/// A trigger a later batch puts on a view an earlier batch placed in `temp`
+/// replaces the view's write on every connection running both connection
+/// programs.
+#[test]
+fn a_later_instead_of_trigger_on_an_earlier_temp_view_reaches_another_connection() {
+    diesel::table! {
+        items (id) {
+            id -> Integer,
+            parent_id -> Nullable<Integer>,
+        }
+    }
+    const ITEMS: &str = "
+        CREATE ROLE app;
+        CREATE TABLE items (id INT PRIMARY KEY, parent_id INT);
+        GRANT SELECT, UPDATE (parent_id) ON items TO app;
+        CREATE VIEW item_view AS SELECT id, parent_id FROM items;
+        GRANT SELECT, UPDATE ON item_view TO app;
+    ";
+    let options = Pg2SqliteOptions::default()
+        .with_deployment(deployment(["app"], []))
+        .with_acting_role("app")
+        .with_rls_audit_table_name("_rls_audit")
+        .with_rls_exemption_function("write_is_exempt")
+        .with_attached_tables("shared", ["items"]);
+    let schema = Pg2Sqlite::default().sql(ITEMS).expect("parse").build_schema().expect("schema");
+    let migration = Pg2Sqlite::default()
+        .sql(
+            "CREATE FUNCTION pin_parent() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN UPDATE items SET parent_id = 42 WHERE id = OLD.id; RETURN NEW; END $$;
+             CREATE TRIGGER pinned INSTEAD OF UPDATE ON item_view
+                 FOR EACH ROW EXECUTE FUNCTION pin_parent();",
+        )
+        .expect("parse")
+        .translate_to_sql_with_schema(&schema, &options)
+        .expect("translate the migration");
+    let script = translate(ITEMS, &options).expect("translate");
+    let files = Files::new("later-instead-of-trigger");
+    {
+        let mut alice = files.connect("alice");
+        run(&mut alice, script.initialize(FreshFiles::Both).expect("initialize"));
+        run(&mut alice, migration.initialize(FreshFiles::Both).expect("initialize the migration"));
+        set_write_exempt(true);
+        diesel::insert_into(items::table)
+            .values(items::id.eq(1))
+            .execute(&mut alice)
+            .expect("seed");
+        set_write_exempt(false);
+    }
+    let mut bob = files.connect("bob");
+    run(&mut bob, script.connect().expect("connection program"));
+    run(&mut bob, migration.connect().expect("the migration's connection program"));
+    diesel::sql_query("UPDATE item_view SET parent_id = 5 WHERE id = 1")
+        .execute(&mut bob)
+        .expect("update through the view");
+    let parents: Vec<Option<i32>> =
+        items::table.select(items::parent_id).load(&mut bob).expect("read items");
+    assert_eq!(parents, [Some(42)]);
+}
+
 #[test]
 fn a_seed_write_through_a_temp_view_is_initialized() {
     let pg = format!("{PAPERS} INSERT INTO papers VALUES (1, 'seed');");
