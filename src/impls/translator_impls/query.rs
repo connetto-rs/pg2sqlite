@@ -1047,7 +1047,7 @@ pub(crate) fn is_aggregate_call(func: &Function) -> bool {
 }
 
 /// True when `expr` contains an aggregate call without an `OVER` clause.
-fn is_aggregate_expression(expr: &Expr) -> bool {
+pub(crate) fn is_aggregate_expression(expr: &Expr) -> bool {
     contains_call(expr, &|func| func.over.is_none() && is_aggregate_call(func))
 }
 

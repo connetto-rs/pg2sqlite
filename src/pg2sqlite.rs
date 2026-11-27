@@ -2471,6 +2471,12 @@ impl Pg2Sqlite {
             });
         }
 
+        entries.extend(crate::impls::translator_impls::view_table::manifest_entries(
+            schema,
+            options,
+            |name| placed.home(name),
+        )?);
+
         Ok(entries)
     }
 

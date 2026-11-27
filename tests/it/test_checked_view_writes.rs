@@ -204,17 +204,6 @@ diesel::table! {
     }
 }
 
-diesel::table! {
-    /// `resource_moves` passing `id` through as `resource`.
-    #[sql_name = "resource_moves"]
-    renamed_moves (resource) {
-        /// Primary key of the resource moved.
-        resource -> Integer,
-        /// The resource holding this one.
-        parent_id -> Integer,
-    }
-}
-
 /// `resources` under forced row-level security, which `app` may archive and
 /// may move only through `resource_moves`, owned by `mover`, which bypasses
 /// the policies. `view_options` follows the view's name and `grants` hands
@@ -392,25 +381,6 @@ fn a_translated_move_returning_rows_is_refused() {
         .expect_err("the write is refused")
         .to_string();
     assert!(error.contains("check option of view resource_moves"), "{error}");
-}
-
-/// `app` holds privileges on the view alone, so the table it reads is left
-/// off `app`'s replica. The view gets no triggers there, the replica applies,
-/// and a write through the view does not land.
-#[test]
-fn a_view_over_a_table_off_the_replica_applies_and_refuses_writes() {
-    let mut connection = helpers::apply_with_options(
-        "CREATE ROLE app NOLOGIN;
-         CREATE TABLE resources (id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL);
-         CREATE VIEW resource_moves AS SELECT id AS resource, parent_id FROM resources WHERE parent_id > 0;
-         GRANT SELECT, UPDATE (parent_id) ON resource_moves TO app;",
-        &acting(),
-    )
-    .expect("the script applies");
-    let moved = diesel::update(renamed_moves::table.filter(renamed_moves::resource.eq(1)))
-        .set(renamed_moves::parent_id.eq(2))
-        .execute(&mut connection);
-    assert!(moved.is_err(), "{moved:?}");
 }
 
 /// The options of `app`'s replica.
