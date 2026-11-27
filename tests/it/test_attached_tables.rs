@@ -582,6 +582,32 @@ fn translating_against_a_starting_schema_keeps_the_placement() {
     assert!(main_objects.contains(&"extra".to_owned()), "{main_objects:?}");
 }
 
+/// A view a later batch creates over a view an earlier batch placed in `temp`
+/// is placed there too.
+#[test]
+fn a_later_view_over_an_earlier_temp_view_is_temp() {
+    diesel::table! {
+        titles (title) {
+            title -> Text,
+        }
+    }
+    let schema = Pg2Sqlite::default().sql(PAPERS).expect("parse").build_schema().expect("schema");
+    let migration = Pg2Sqlite::default()
+        .sql("CREATE VIEW titles WITH (security_invoker = true) AS SELECT title FROM papers;")
+        .expect("parse")
+        .translate_to_sql_with_schema(&schema, &placed_options())
+        .expect("translate the migration");
+    let script = translate(PAPERS, &placed_options()).expect("translate");
+    let files = Files::new("later-temp-view");
+    let mut alice = files.connect("alice");
+    run(&mut alice, script.initialize(FreshFiles::Both).expect("initialize"));
+    run(&mut alice, migration.initialize(FreshFiles::Both).expect("initialize the migration"));
+    seed_papers(&mut alice);
+    let titles: Vec<String> =
+        titles::table.select(titles::title).load(&mut alice).expect("read the later view");
+    assert_eq!(titles, ["shared to alice"]);
+}
+
 #[test]
 fn a_seed_write_through_a_temp_view_is_initialized() {
     let pg = format!("{PAPERS} INSERT INTO papers VALUES (1, 'seed');");

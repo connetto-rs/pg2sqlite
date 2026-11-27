@@ -286,6 +286,31 @@ fn a_write_through_a_view_over_an_attached_table_is_refused() {
     }
 }
 
+/// A later translation rewriting the record names the `temp` database for the
+/// views an earlier translation placed there.
+#[test]
+fn a_migration_keeps_the_database_of_an_earlier_temp_view() {
+    let options = exempting().with_attached_tables("shared", ["items"]);
+    let (mut connection, _, _) =
+        replica_of(SCHEMA, &options, "ATTACH DATABASE ':memory:' AS shared");
+    connection.remove_authorizer();
+    let migration = Pg2Sqlite::default()
+        .sql("GRANT INSERT ON items TO app;")
+        .unwrap()
+        .translate_to_sql_with_schema(&schema(), &options)
+        .unwrap();
+    connection.batch_execute(&migration.into_vec().join(";\n")).unwrap();
+    let authorizer = Authorizer::load(&mut connection).unwrap();
+    authorizer.install(&mut connection);
+    for (statement, relation) in [
+        ("DELETE FROM listed WHERE false", "view listed"),
+        ("UPDATE item_view SET id = 3 WHERE false", "view item_view"),
+        ("DELETE FROM items WHERE false", "table items"),
+    ] {
+        assert_refused(&mut connection, &authorizer, statement, relation);
+    }
+}
+
 /// A session's own `TEMP` table shadowing a relation is the session's to
 /// write, as PostgreSQL's `pg_temp` table is.
 #[test]
