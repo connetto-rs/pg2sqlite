@@ -68,7 +68,7 @@ CREATE INDEX note_bodies_search ON note_bodies USING GIN (to_tsvector('english',
 
 /// Every table [`SOURCE`] makes the translation add for itself, so a kind
 /// the source stops producing fails the test rather than leaving the lint.
-const OWN_TABLES: [&str; 9] = [
+const OWN_TABLES: [&str; 10] = [
     "note_bodies_pg2sqlite_fts_keys",
     "notes_check_pg2sqlite_rows",
     "notes_pg2sqlite_forwards",
@@ -77,6 +77,7 @@ const OWN_TABLES: [&str; 9] = [
     "pg2sqlite_deferred_barriers",
     "pg2sqlite_deferred_checks",
     "pg2sqlite_definer_frames",
+    "pg2sqlite_statement_refusals",
     AUDIT_TABLE,
 ];
 

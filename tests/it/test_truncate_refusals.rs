@@ -62,15 +62,20 @@ const ACTIONS: [&str; 5] =
 
 /// `c` referencing `t` with `action`, one row each.
 fn keyed(action: &str) -> String {
+    format!("{} {KEYED_ROWS}", keyed_tables(action))
+}
+
+/// `c` referencing `t` with `action`.
+fn keyed_tables(action: &str) -> String {
     format!(
         "CREATE ROLE app;
          CREATE TABLE t (id INT PRIMARY KEY);
          CREATE TABLE c (id INT PRIMARY KEY, t_id INT REFERENCES t (id) {action});
-         GRANT ALL ON t, c TO app;
-         INSERT INTO t VALUES (1);
-         INSERT INTO c VALUES (1, 1);"
+         GRANT ALL ON t, c TO app;"
     )
 }
+
+const KEYED_ROWS: &str = "INSERT INTO t VALUES (1); INSERT INTO c VALUES (1, 1);";
 
 #[test]
 fn a_truncate_without_the_privilege_is_refused() {
@@ -215,8 +220,9 @@ fn a_definer_body_whose_owner_lacks_truncate_is_refused() {
 }
 
 /// `notes`, whose insert of a row with `id` 2 runs `TRUNCATE t` in a
-/// `security` trigger body owned by `cleaner`, over `t` and `c` seeded by
-/// `keyed`, `app` holding `app_grant` on `t` and `cleaner` every privilege.
+/// `security` trigger body owned by `cleaner`, over `t` and `c` keyed as
+/// `keyed` keys them, `app` holding `app_grant` on `t` and `cleaner` every
+/// privilege.
 fn body_replica(security: &str, app_grant: &str) -> SqliteConnection {
     let pg = format!(
         "{}
@@ -238,14 +244,16 @@ fn body_replica(security: &str, app_grant: &str) -> SqliteConnection {
          REVOKE ALL ON t FROM app;
          GRANT {app_grant} ON t TO app;
          GRANT ALL ON t, c TO cleaner;",
-        keyed("")
+        keyed_tables("")
     );
+    // The rows play the system load, so they go in before the triggers that
+    // keep `app` from writing `t`.
     let (triggers, base): (Vec<_>, Vec<_>) = translated(&pg)
         .unwrap_or_else(|error| panic!("PostgreSQL loads the body: {error}"))
         .into_iter()
         .partition(|statement| statement.starts_with("CREATE TRIGGER"));
     let mut connection = SqliteConnection::establish(":memory:").expect("open an in-memory SQLite");
-    for statement in base.iter().chain(&triggers) {
+    for statement in base.iter().chain([KEYED_ROWS.to_owned()].iter()).chain(&triggers) {
         connection.batch_execute(statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
     }
     connection

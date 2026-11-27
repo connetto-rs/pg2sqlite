@@ -405,3 +405,4 @@ mod test_window_functions;
 mod test_window_spec_expr_recursion;
 mod test_with_ordinality;
 mod test_with_update_bindings;
+mod test_write_privileges_before_rows;

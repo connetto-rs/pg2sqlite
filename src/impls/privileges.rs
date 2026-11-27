@@ -9,6 +9,7 @@
 //! a plain table cannot tell from a default.
 
 mod needs;
+pub(crate) mod statement_refusals;
 
 pub(crate) use needs::{Checked, unheld_table};
 use sql_traits::{

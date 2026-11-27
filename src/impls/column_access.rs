@@ -15,9 +15,9 @@ use sql_traits::{
     utils::identifier_resolution::{identifiers_match, stored_ident_name},
 };
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, ConflictTarget, Expr, FunctionArg, FunctionArguments, Ident,
-    Insert, ObjectName, ObjectNamePart, OnConflictAction, OnInsert, Select, Statement, TableAlias,
-    TableFactor, TableObject, TableWithJoins, Visit, Visitor, visit_expressions,
+    Assignment, AssignmentTarget, ConflictTarget, Expr, FromTable, FunctionArg, FunctionArguments,
+    Ident, Insert, ObjectName, ObjectNamePart, OnConflictAction, OnInsert, Select, Statement,
+    TableAlias, TableFactor, TableObject, TableWithJoins, Visit, Visitor, visit_expressions,
 };
 use sqlparser_plpgsql::{
     embedded,
@@ -36,6 +36,7 @@ use crate::{
         translator_impls::{
             insert::row_width,
             off_replica::{self, OffReplica},
+            view_writes::unheld_view_privilege,
         },
     },
     options::TranslationContext,
@@ -48,13 +49,51 @@ pub(crate) type Table = <ParserDB as DatabaseLike>::Table;
 const NAMED_FUNCTIONS: [&str; 6] =
     ["current_catalog", "current_role", "current_schema", "current_user", "session_user", "user"];
 
+/// What [`resolve_columns`] leaves to a statement's translation.
+#[derive(Default)]
+pub(crate) struct Resolved {
+    /// The first ambiguous name, PostgreSQL's `42702`, raised only where the
+    /// translation has no refusal of its own, as [`with_ambiguity`] does.
+    ambiguous: Option<Error>,
+    /// PostgreSQL's `42501` message for a write the acting role lacks a
+    /// privilege for, raised only where the translation has no refusal of its
+    /// own, since PostgreSQL checks privileges after parsing and rewriting.
+    unheld: Option<String>,
+}
+
+impl Resolved {
+    /// `translated`, the statement's translation, refused as the statement
+    /// is.
+    ///
+    /// A write the acting role lacks a privilege for is refused at
+    /// translation, before any row, as PostgreSQL refuses it. With an RLS
+    /// exemption function the write translates, since the exemption lifts
+    /// the refusal for a schema's seed rows, and the SQLite authorizer the
+    /// replica installs refuses it before any row, as it refuses a write run
+    /// untranslated.
+    ///
+    /// # Errors
+    ///
+    /// Returns the translation's error, then the ambiguity and the refusal
+    /// of a write the acting role lacks a privilege for.
+    pub(crate) fn translated(
+        self,
+        translated: Result<Vec<Statement>, Error>,
+        options: &TranslationContext<'_>,
+    ) -> Result<Vec<Statement>, Error> {
+        let translated = with_ambiguity(self.ambiguous, translated)?;
+        match self.unheld {
+            Some(message) if options.get_rls_exemption_function().is_none() => {
+                Err(postgres(pg::INSUFFICIENT_PRIVILEGE, message))
+            }
+            _ => Ok(translated),
+        }
+    }
+}
+
 /// Refuses a top-level query, `INSERT`, `UPDATE` or `DELETE` naming a column
-/// PostgreSQL refuses, answering a first ambiguous name as `Ok(Some(42702))`
-/// for the caller to raise only where the translation has no refusal of its
-/// own.
-///
-/// A missing write privilege on a column the replica holds is left to the
-/// write guards, which a deployment's RLS exemption can lift.
+/// PostgreSQL refuses, and leaves to [`Resolved::translated`] a first
+/// ambiguous name and a write the acting role lacks a privilege for.
 ///
 /// # Errors
 ///
@@ -64,17 +103,17 @@ pub(crate) fn resolve_columns(
     statement: &Statement,
     schema: &ParserDB,
     options: &TranslationContext<'_>,
-) -> Result<Option<Error>, Error> {
+) -> Result<Resolved, Error> {
     if !matches!(
         statement,
         Statement::Query(_) | Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
     ) {
-        return Ok(None);
+        return Ok(Resolved::default());
     }
     if let Some((table, write)) = off_replica::row_write(statement)
         && OffReplica::leaves_with(table, &write, schema, options)?
     {
-        return Ok(None);
+        return Ok(Resolved::default());
     }
 
     let context = ExpressionContext::for_statement(
@@ -89,7 +128,7 @@ pub(crate) fn resolve_columns(
     let Reads { columns: read, ambiguous } =
         read_names(statement, &context, &relations, &arbiter, schema, None)?;
     if ambiguous.is_some() {
-        return Ok(ambiguous);
+        return Ok(Resolved { ambiguous, unheld: None });
     }
     written.extend(set_targets(statement, schema)?);
 
@@ -99,31 +138,83 @@ pub(crate) fn resolve_columns(
             return Err(denied(table));
         }
     }
-    let mut hidden = None;
+    let unheld = unheld_write(statement, &written, &mut grants)?;
     for target in &written {
-        let held = grants.of(target.table)?;
-        if !held.reads(target.column) {
-            hidden.get_or_insert(target);
+        if grants.of(target.table)?.reads(target.column) {
+            continue;
+        }
+        return Err(match unheld {
+            Some(message) => postgres(pg::INSUFFICIENT_PRIVILEGE, message),
+            None => {
+                Error::forward_refusal(format!(
+                    "the acting role may {} column {} of {} but not read it, and the replica \
+                     holds only the columns the role reads, so the value has nowhere to go",
+                    target.write.verb(),
+                    target.column,
+                    target.table.table_name(),
+                ))
+            }
+        });
+    }
+    Ok(Resolved { ambiguous: None, unheld })
+}
+
+/// PostgreSQL's `42501` message refusing `statement`, whose written columns
+/// are `written`, for a privilege the acting role lacks on the table or view
+/// it names, a column it fills or, through a view, on the relation the view
+/// writes.
+///
+/// # Errors
+///
+/// Returns the lookup errors resolving the relations meets.
+fn unheld_write<'s>(
+    statement: &Statement,
+    written: &[Target<'s>],
+    grants: &mut Grants<'s, '_>,
+) -> Result<Option<String>, Error> {
+    for target in written {
+        if !target.write.held(grants.of(target.table)?, target.column) {
+            return Ok(Some(permission_denied(target.table.table_name())));
         }
     }
-    let Some(hidden) = hidden else { return Ok(None) };
-    for target in &written {
-        let held = grants.of(target.table)?;
-        let writes = match target.write {
-            Write::Insert => held.inserts(target.column),
-            Write::Update => held.updates(target.column),
-        };
-        if !writes {
-            return Err(denied(target.table));
-        }
+    if let Some(table) = unheld_command(statement, written, grants)? {
+        return Ok(Some(permission_denied(table.table_name())));
     }
-    Err(Error::forward_refusal(format!(
-        "the acting role may {} column {} of {} but not read it, and the replica holds only the \
-         columns the role reads, so the value has nowhere to go",
-        hidden.write.verb(),
-        hidden.column,
-        hidden.table.table_name(),
-    )))
+    unheld_view_privilege(statement, grants.schema, grants.options)
+}
+
+/// The table `statement` deletes from, or inserts into without naming a
+/// column it fills, when the acting role holds no `DELETE` on it, or no
+/// `INSERT` on any column for such an insert.
+///
+/// # Errors
+///
+/// Returns the lookup errors resolving the table meets.
+fn unheld_command<'s>(
+    statement: &Statement,
+    written: &[Target<'s>],
+    grants: &mut Grants<'s, '_>,
+) -> Result<Option<&'s Table>, Error> {
+    let (name, holds): (_, fn(&RoleTable) -> bool) = match statement {
+        Statement::Delete(delete) => {
+            let (FromTable::WithFromKeyword(targets) | FromTable::WithoutKeyword(targets)) =
+                &delete.from;
+            let [TableWithJoins { relation: TableFactor::Table { name, .. }, .. }] =
+                targets.as_slice()
+            else {
+                return Ok(None);
+            };
+            (name, RoleTable::deletes)
+        }
+        Statement::Insert(Insert { table: TableObject::TableName(name), .. })
+            if !written.iter().any(|target| matches!(target.write, Write::Insert)) =>
+        {
+            (name, RoleTable::inserts_any)
+        }
+        _ => return Ok(None),
+    };
+    let Some(table) = resolve_translation_table(grants.schema, name)? else { return Ok(None) };
+    Ok((!holds(grants.of(table)?)).then_some(table))
 }
 
 /// The SQLSTATE and message PostgreSQL raises where a PL/pgSQL body runs
@@ -320,10 +411,7 @@ fn read_names<'c, N: Visit>(
 /// What a statement answers given the ambiguity [`resolve_columns`] found and
 /// its translation, PostgreSQL's `42702` unless the translation refuses the
 /// statement for another reason.
-pub(crate) fn with_ambiguity<T>(
-    ambiguous: Option<Error>,
-    translated: Result<T, Error>,
-) -> Result<T, Error> {
+fn with_ambiguity<T>(ambiguous: Option<Error>, translated: Result<T, Error>) -> Result<T, Error> {
     match (ambiguous, translated) {
         (
             Some(ambiguity),
@@ -680,6 +768,14 @@ impl Write {
         match self {
             Self::Insert => "insert into",
             Self::Update => "update",
+        }
+    }
+
+    /// Whether `grants` hold this write of `column`.
+    fn held(self, grants: &RoleTable, column: &str) -> bool {
+        match self {
+            Self::Insert => grants.inserts(column),
+            Self::Update => grants.updates(column),
         }
     }
 }

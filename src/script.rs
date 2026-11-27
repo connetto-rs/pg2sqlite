@@ -72,6 +72,11 @@ pub struct Script<S = Statement> {
     pub setup: Vec<S>,
     /// The source-ordered initialization of the newly created database files,
     /// with a prevalidated selection per newly created file.
+    ///
+    /// Under an acting role, the main file records the writes the role may
+    /// not run once the last statement changing a relation or a grant ran,
+    /// and `pg2sqlite_runtime::statement_refusals::Authorizer` refuses them
+    /// while SQLite prepares them, before any row.
     pub files: InitializationPlan<S>,
     /// The committed `TEMP` objects and rows the source leaves behind,
     /// recreated on a connection to an existing database file.

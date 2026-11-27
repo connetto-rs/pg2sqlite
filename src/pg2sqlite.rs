@@ -780,11 +780,8 @@ impl Trackers {
         });
         let written =
             written.with_declaration(Declaration::Statement { statement, schema: at.binding });
-        let ambiguous = column_access::resolve_columns(statement, at.binding, &written)?;
-        column_access::with_ambiguity(
-            ambiguous,
-            statement.translate_with_warnings(at.schema, &written, emit),
-        )
+        column_access::resolve_columns(statement, at.binding, &written)?
+            .translated(statement.translate_with_warnings(at.schema, &written, emit), &written)
     }
 
     /// The statements moving the replica from the shape `applied` holds to
@@ -2136,11 +2133,18 @@ impl Pg2Sqlite {
                 .chain(main.iter().flatten().flatten().flatten())
                 .chain(attached.iter().flatten().flatten().flatten()),
         );
+        let refusals = crate::impls::privileges::statement_refusals::recorded(
+            &schema,
+            &sources,
+            initial_schema.is_some(),
+            &context,
+        )?;
         let files = crate::initialization::InitializationPlan::new(
             prelude,
             placed.unit_files.into_iter().zip(statements),
             main,
             attached,
+            refusals,
         );
         let before_commit = if context.deferred_triggers().is_empty() {
             Vec::new()

@@ -120,11 +120,8 @@ fn client_function(
     let written = typed.with_written_schema(schema);
     let written =
         written.with_declaration(Declaration::Statement { statement: &statement, schema });
-    let ambiguous = column_access::resolve_columns(&statement, schema, &written)?;
-    let translated = column_access::with_ambiguity(
-        ambiguous,
-        statement.translate_with_warnings(schema, &written, emit),
-    )?;
+    let translated = column_access::resolve_columns(&statement, schema, &written)?
+        .translated(statement.translate_with_warnings(schema, &written, emit), &written)?;
     let [body @ Statement::Query(_)] = <[Statement; 1]>::try_from(translated).map_err(|_| {
         Error::forward_refusal(format!("{sql} translates to more than one statement."))
     })?
