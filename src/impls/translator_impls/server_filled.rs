@@ -78,10 +78,11 @@ pub(crate) fn split<'t>(
     }
 
     let table = last_ident_value_or_display(&create_table.name);
-    let names = match resolve_declared_table(written, create_table)? {
-        Some(stored) => check_names(stored, checks.iter().map(|(check, _)| *check), written)?,
-        None => vec![None; checks.len()],
-    };
+    let mut names = resolve_declared_table(written, create_table)?
+        .map(|stored| check_names(stored, checks.iter().map(|(check, _)| *check), written))
+        .transpose()?
+        .unwrap_or_default()
+        .into_iter();
     let mut report = |construct: &str, name: String, (trigger, column): (&str, &Ident)| {
         emit(TranslationWarning::LeftToServer {
             construct: construct.to_owned(),
@@ -94,8 +95,9 @@ pub(crate) fn split<'t>(
             ),
         });
     };
-    for ((check, filling), name) in checks.iter().zip(names) {
-        report("CHECK", name.unwrap_or_else(|| format!("({})", check.expr)), *filling);
+    for (check, filling) in &checks {
+        let name = names.next().flatten().unwrap_or_else(|| format!("({})", check.expr));
+        report("CHECK", name, *filling);
     }
     for (column, filling) in &not_null {
         report("NOT NULL", column.name.value.clone(), *filling);

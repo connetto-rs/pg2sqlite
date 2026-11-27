@@ -272,13 +272,14 @@ fn constraint_names(
         .iter()
         .zip(names)
         .map(|((_, check, _), name)| {
-            name.ok_or_else(|| {
+            let unnamed = || {
                 Error::forward_refusal(format!(
                     "CHECK ({}) on {} reads the clock, and the translation schema holds no check \
                      of the table with that expression to name the triggers enforcing it after.",
                     check.expr, stored.name
                 ))
-            })
+            };
+            name.ok_or_else(unnamed)
         })
         .collect()
 }
@@ -299,16 +300,17 @@ pub(super) fn check_names<'c>(
     checks
         .into_iter()
         .map(|check| {
-            let Some(held_check) = held
+            let held_check = held
                 .iter_mut()
                 .find(|held| {
                     held.is_some_and(|held| held.expression(schema) == check.expr.as_ref())
                 })
-                .and_then(Option::take)
-            else {
-                return Ok(None);
-            };
-            Ok(held_check.constraint_name(schema)?.map(Cow::into_owned))
+                .and_then(Option::take);
+            Ok(held_check
+                .map(|held| held.constraint_name(schema))
+                .transpose()?
+                .flatten()
+                .map(Cow::into_owned))
         })
         .collect()
 }

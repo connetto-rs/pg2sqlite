@@ -475,27 +475,15 @@ impl RecordReads<'_> {
 }
 
 /// Calls `visit` on each variable `node` assigns itself, leaving out those
-/// of the statements it holds.
+/// of the statements it holds. Only the forms a trigger body translates are
+/// read, since a trigger function holding any other is refused.
 fn each_target<'n>(node: &'n NodeKind, mut visit: impl FnMut(&'n Target)) {
     match node {
-        NodeKind::Statement { into: Some(into), .. }
-        | NodeKind::Dynamic { into: Some(into), .. } => {
-            into.targets.iter().for_each(visit);
-        }
+        NodeKind::Statement { into: Some(into), .. } => into.targets.iter().for_each(visit),
         NodeKind::Assignment(assignment) => visit(&assignment.target),
-        NodeKind::Fetch(fetch) => fetch.targets.iter().for_each(visit),
-        NodeKind::Diagnostics(diagnostics) => {
-            for item in &diagnostics.items {
-                visit(&item.target);
-            }
+        NodeKind::Loop(Loop { control: LoopControl::Query { targets, .. }, .. }) => {
+            targets.iter().for_each(visit);
         }
-        NodeKind::Loop(Loop {
-            control:
-                LoopControl::Query { targets, .. }
-                | LoopControl::Dynamic { targets, .. }
-                | LoopControl::Array { targets, .. },
-            ..
-        }) => targets.iter().for_each(visit),
         _ => {}
     }
 }

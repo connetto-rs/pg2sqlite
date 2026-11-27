@@ -36,7 +36,8 @@ CREATE TABLE children (
   note TEXT CHECK (note <> ''),
   previous_kind TEXT NOT NULL,
   CONSTRAINT children_open CHECK (NOT children.parent_archived OR note IS NULL),
-  CONSTRAINT children_moved CHECK (previous_kind <> 'archive')
+  CONSTRAINT children_moved CHECK (previous_kind <> 'archive'),
+  UNIQUE (parent_id, id)
 );
 ALTER TABLE children ENABLE ROW LEVEL SECURITY;
 CREATE POLICY children_all ON children TO app USING (true) WITH CHECK (true);
@@ -55,8 +56,19 @@ BEGIN
   NEW.previous_kind := (SELECT parent.kind FROM public.parents parent WHERE parent.id = OLD.parent_id);
   RETURN NEW;
 END $$;
+CREATE FUNCTION require_parent() RETURNS TRIGGER
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM public.parents parent WHERE parent.id = NEW.parent_id) THEN
+    RAISE EXCEPTION 'no parent';
+  END IF;
+  RETURN NEW;
+END $$;
 ALTER FUNCTION copy_parent() OWNER TO archivist;
 ALTER FUNCTION remember_kind() OWNER TO archivist;
+ALTER FUNCTION require_parent() OWNER TO archivist;
+CREATE TRIGGER children_guard BEFORE INSERT ON children
+  FOR EACH ROW EXECUTE FUNCTION require_parent();
 CREATE TRIGGER children_copy BEFORE INSERT ON children
   FOR EACH ROW EXECUTE FUNCTION copy_parent();
 CREATE TRIGGER children_move BEFORE UPDATE ON children
@@ -69,6 +81,90 @@ fn options() -> Pg2SqliteOptions {
         .with_deployment(helpers::deployment::deployment(["app"], []))
         .with_rls_audit_table_name("rls_audit")
         .with_acting_role("app")
+}
+
+/// The constraints and triggers on `items` left to the server, by construct
+/// and name, when its `BEFORE INSERT` trigger runs `body` as a definer
+/// reading parents the acting role cannot see.
+fn left_on_items(body: &str) -> Vec<(String, String)> {
+    let schema = format!(
+        "
+CREATE ROLE app;
+CREATE ROLE archivist BYPASSRLS;
+CREATE TABLE parents (id INT PRIMARY KEY, kind TEXT NOT NULL, owner_id INT NOT NULL);
+ALTER TABLE parents ENABLE ROW LEVEL SECURITY;
+CREATE POLICY parents_own ON parents TO app USING (owner_id = 1);
+CREATE TABLE items (
+  id INT PRIMARY KEY,
+  parent_id INT NOT NULL,
+  kind TEXT CHECK (kind <> ''),
+  tally BIGINT CHECK (tally >= 0),
+  label TEXT
+);
+GRANT SELECT ON parents TO app, archivist;
+GRANT SELECT, INSERT ON items TO app;
+CREATE FUNCTION fill() RETURNS TRIGGER
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = '' AS $$
+{body}
+$$;
+ALTER FUNCTION fill() OWNER TO archivist;
+CREATE TRIGGER items_fill BEFORE INSERT ON items FOR EACH ROW EXECUTE FUNCTION fill();
+"
+    );
+    Pg2Sqlite::default()
+        .sql(&schema)
+        .expect("parse")
+        .translate_with_report(&options())
+        .unwrap_or_else(|error| panic!("{error}\n{body}"))
+        .warnings
+        .into_iter()
+        .filter_map(|warning| {
+            match warning {
+                TranslationWarning::LeftToServer { construct, name, table, .. }
+                    if table == "items" =>
+                {
+                    Some((construct, name))
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn every_form_assigning_new_leaves_the_constraints_on_what_it_fills() {
+    let looped = "
+BEGIN
+  FOR NEW.tally IN SELECT count(*) FROM public.parents parent WHERE parent.id = NEW.parent_id LOOP
+    NULL;
+  END LOOP;
+  RETURN NEW;
+END";
+    let whole_row = "
+BEGIN
+  SELECT NEW.id, NEW.parent_id, parent.kind, NEW.tally, NEW.label INTO NEW
+    FROM public.parents parent WHERE parent.id = NEW.parent_id;
+  RETURN NEW;
+END";
+    let unchecked = "
+BEGIN
+  SELECT parent.kind INTO NEW.label FROM public.parents parent WHERE parent.id = NEW.parent_id;
+  RETURN NEW;
+END";
+    let tally = ("CHECK", "items_tally_check");
+    let kind = ("CHECK", "items_kind_check");
+    for (body, constraints) in [
+        (looped, &[tally][..]),
+        (whole_row, &[kind, tally, ("NOT NULL", "parent_id")]),
+        (unchecked, &[]),
+    ] {
+        let expected: Vec<(String, String)> = constraints
+            .iter()
+            .chain(&[("TRIGGER", "items_fill")])
+            .map(|(construct, name)| ((*construct).to_owned(), (*name).to_owned()))
+            .collect();
+        assert_eq!(left_on_items(body), expected, "{body}");
+    }
 }
 
 fn insert(connection: &mut SqliteConnection, note: Option<&str>) -> QueryResult<usize> {
