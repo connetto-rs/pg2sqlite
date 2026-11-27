@@ -12,8 +12,8 @@ use sql_traits::{
     traits::{DatabaseLike, TableLike, ViewLike},
 };
 use sqlparser::ast::{
-    Ident, ObjectName, ObjectNamePart, Query, SetExpr, TableAlias, TableAliasColumnDef,
-    TableFactor, TableWithJoins, With,
+    CteAsMaterialized, Ident, ObjectName, ObjectNamePart, Query, SetExpr, TableAlias,
+    TableAliasColumnDef, TableFactor, TableWithJoins, With,
 };
 
 #[cfg(not(feature = "std"))]
@@ -26,7 +26,7 @@ use crate::{
         privileges::RoleTable,
         session_variable,
         shared_helpers::{renamed_derived_factor, renamed_relation_factor},
-        translator_impls::{Forward, rls::locking_read_rows},
+        translator_impls::{Forward, cte::fenced, rls::locking_read_rows},
     },
     options::TranslationContext,
     traits::translator::TranslatorWithContext,
@@ -274,13 +274,22 @@ pub(crate) fn locked_factor(
             }
         },
     ));
-    let factor = if columns.is_empty() {
-        derived(view.definition().translate_with_warnings(schema, &body, emit)?, reference)
-    } else {
-        let renamed = TableAlias { explicit: true, name: reference, columns, at: None };
-        renamed_derived_factor::<Forward>(view.definition(), &renamed, schema, &body, emit)?
-    };
-    Ok(Some(if view.is_security_barrier() { fenced_factor(factor) } else { factor }))
+    let barrier = view.is_security_barrier();
+    if columns.is_empty() {
+        let rows = view.definition().translate_with_warnings(schema, &body, emit)?;
+        return Ok(Some(derived(if barrier { fenced(rows) } else { rows }, reference)));
+    }
+    let renamed = TableAlias { explicit: true, name: reference, columns, at: None };
+    let materialized = barrier.then_some(CteAsMaterialized::Materialized);
+    renamed_derived_factor::<Forward>(
+        view.definition(),
+        &renamed,
+        materialized,
+        schema,
+        &body,
+        emit,
+    )
+    .map(Some)
 }
 
 /// `(<rows>) AS <reference>`.
@@ -290,21 +299,5 @@ fn derived(rows: Query, reference: Ident) -> TableFactor {
         subquery: Box::new(rows),
         alias: Some(TableAlias { explicit: true, name: reference, columns: Vec::new(), at: None }),
         sample: None,
-    }
-}
-
-/// `factor`, a derived table, reading its rows behind
-/// [`fenced`](super::cte::fenced), as a security barrier view's body reads.
-fn fenced_factor(factor: TableFactor) -> TableFactor {
-    match factor {
-        TableFactor::Derived { lateral, subquery, alias, sample } => {
-            TableFactor::Derived {
-                lateral,
-                subquery: Box::new(super::cte::fenced(*subquery)),
-                alias,
-                sample,
-            }
-        }
-        other => other,
     }
 }

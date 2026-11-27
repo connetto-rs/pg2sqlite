@@ -12,19 +12,20 @@ use sql_traits::{
     traits::{ColumnLike, DatabaseLike, TableLike},
 };
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, BinaryOperator, CastKind, ColumnOption, Cte, DataType, Expr,
-    ExprWithAlias, ExprWithAliasAndOrderBy, Fetch, FromTable, Function, FunctionArg,
-    FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList, FunctionArguments, GeneratedAs,
-    GroupByExpr, HavingBound, Ident, InTarget, Join, JoinConstraint, JoinOperator, LimitClause,
-    ListAggOnOverflow, Measure, NamedWindowDefinition, NamedWindowExpr, ObjectName, ObjectNamePart,
-    OrderBy, OrderByExpr, OrderByKind, PipeOperator, PivotValueSource, Query, Select, SelectItem,
-    SetExpr, SetOperator, SetQuantifier, Setting, Statement, SymbolDefinition, TableAlias,
-    TableAliasColumnDef, TableFactor, TableFunctionArgs, TableSample, TableSampleBucket,
-    TableSampleKind, TableSampleQuantity, TableVersion, TableWithJoins, UnaryOperator,
-    UpdateTableFromKind, Value, ValueWithSpan, Values, Visit, Visitor, WildcardAdditionalOptions,
-    WindowFrame, WindowFrameBound, WindowFrameUnits, WindowSpec, WindowType, With, WithFill,
-    XmlNamespaceDefinition, XmlPassingArgument, XmlPassingClause, XmlTableColumn,
-    XmlTableColumnOption, helpers::attached_token::AttachedToken, visit_expressions,
+    Assignment, AssignmentTarget, BinaryOperator, CastKind, ColumnOption, Cte, CteAsMaterialized,
+    DataType, Expr, ExprWithAlias, ExprWithAliasAndOrderBy, Fetch, FromTable, Function,
+    FunctionArg, FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList, FunctionArguments,
+    GeneratedAs, GroupByExpr, HavingBound, Ident, InTarget, Join, JoinConstraint, JoinOperator,
+    LimitClause, ListAggOnOverflow, Measure, NamedWindowDefinition, NamedWindowExpr, ObjectName,
+    ObjectNamePart, OrderBy, OrderByExpr, OrderByKind, PipeOperator, PivotValueSource, Query,
+    Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Setting, Statement, SymbolDefinition,
+    TableAlias, TableAliasColumnDef, TableFactor, TableFunctionArgs, TableSample,
+    TableSampleBucket, TableSampleKind, TableSampleQuantity, TableVersion, TableWithJoins,
+    UnaryOperator, UpdateTableFromKind, Value, ValueWithSpan, Values, Visit, Visitor,
+    WildcardAdditionalOptions, WindowFrame, WindowFrameBound, WindowFrameUnits, WindowSpec,
+    WindowType, With, WithFill, XmlNamespaceDefinition, XmlPassingArgument, XmlPassingClause,
+    XmlTableColumn, XmlTableColumnOption, helpers::attached_token::AttachedToken,
+    visit_expressions,
 };
 
 #[cfg(not(feature = "std"))]
@@ -5909,7 +5910,14 @@ pub(crate) fn translate_table_factor<D: TranslationDirection>(
             if D::IS_FORWARD
                 && let Some(alias) = alias.as_ref().filter(|alias| !alias.columns.is_empty())
             {
-                return renamed_derived_factor::<D>(subquery, alias, schema, body_options, emit);
+                return renamed_derived_factor::<D>(
+                    subquery,
+                    alias,
+                    None,
+                    schema,
+                    body_options,
+                    emit,
+                );
             }
             TableFactor::Derived {
                 subquery: Box::new(D::translate_query(subquery, schema, body_options, emit)?),
@@ -6174,7 +6182,8 @@ fn refuse_typed_alias_columns(
 }
 
 /// Rewrites `(subquery) AS x (a, b)` into
-/// `(WITH c (a, b) AS (subquery) SELECT * FROM c) AS x`.
+/// `(WITH c (a, b) AS (subquery) SELECT * FROM c) AS x`, with `c` carrying
+/// `materialized`.
 ///
 /// A CTE column list renames by position, since SQLite names translated
 /// outputs differently from PostgreSQL (`count(*)` against `count`). Outputs
@@ -6183,6 +6192,7 @@ fn refuse_typed_alias_columns(
 pub(crate) fn renamed_derived_factor<D: TranslationDirection>(
     subquery: &Query,
     alias: &TableAlias,
+    materialized: Option<CteAsMaterialized>,
     schema: &ParserDB,
     options: &D::Options<'_>,
     emit: crate::warnings::WarningSink<'_>,
@@ -6259,7 +6269,7 @@ pub(crate) fn renamed_derived_factor<D: TranslationDirection>(
             alias: TableAlias { explicit: false, name, columns, at: None },
             query: Box::new(translated),
             from: None,
-            materialized: None,
+            materialized,
             closing_paren_token: AttachedToken::empty(),
         }],
     };

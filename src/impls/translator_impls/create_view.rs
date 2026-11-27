@@ -6,7 +6,8 @@ use core::ops::ControlFlow;
 
 use sql_traits::{
     errors::{LookupError, RowSecurityError},
-    structs::{IdentifierCase, ParserDB, RowSecurity, RowStatement, TargetName},
+    prelude::SqlparserDialect,
+    structs::{IdentifierCase, ParserDB, RowSecurity, RowStatement, TargetName, View},
     traits::{DatabaseLike, Relation, RoleLike, TableLike, ViewLike},
 };
 use sqlparser::ast::{
@@ -77,12 +78,12 @@ impl crate::traits::translator::TranslatorWithContext for CreateView {
         let written = options.written_schema().unwrap_or(schema);
         let stored = declared_view(written, self)?;
         let temporary = self.temporary || stored.is_some_and(ViewLike::is_temporary);
-        // A view the schema does not hold is fenced whenever it writes the
-        // option, which costs only the planner's freedom.
-        let security_barrier = stored.map_or_else(
-            || writes_option(&self.options, "security_barrier"),
-            ViewLike::is_security_barrier,
-        );
+        let security_barrier = match stored {
+            Some(view) => view.is_security_barrier(),
+            None => {
+                View::from_node(self.clone(), SqlparserDialect::PostgreSql)?.is_security_barrier()
+            }
+        };
         let pinned = super::view_outputs::pin_outputs(&self.query, written)?;
         let mut query = pinned.translate_with_warnings(schema, options, emit)?;
         retarget_reads(&mut query, self, schema, options, temporary, security_invoker)?;
@@ -147,24 +148,11 @@ fn unsupported_option(options: &CreateTableOptions) -> Option<&SqlOption> {
 /// value the schema has already read as PostgreSQL does. A bare
 /// `security_barrier` turns the barrier on.
 fn supported(pair: &SqlOption) -> bool {
-    match pair {
-        SqlOption::KeyValue { key, .. } => {
-            ["security_invoker", "check_option", "security_barrier"]
-                .into_iter()
-                .any(|name| option_named(key, name))
-        }
-        SqlOption::Ident(key) => option_named(key, "security_barrier"),
-        _ => false,
-    }
-}
-
-/// Whether the view's `WITH` list writes the option `name`, with or without a
-/// value.
-fn writes_option(options: &CreateTableOptions, name: &str) -> bool {
-    let CreateTableOptions::With(pairs) = options else { return false };
-    pairs.iter().any(|pair| {
-        matches!(pair, SqlOption::KeyValue { key, .. } | SqlOption::Ident(key) if option_named(key, name))
-    })
+    matches!(pair, SqlOption::KeyValue { key, .. }
+        if ["security_invoker", "check_option", "security_barrier"]
+            .into_iter()
+            .any(|name| option_named(key, name)))
+        || matches!(pair, SqlOption::Ident(key) if option_named(key, "security_barrier"))
 }
 
 fn option_named(key: &ObjectName, name: &str) -> bool {

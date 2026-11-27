@@ -186,6 +186,11 @@ fn a_lock_through_a_security_barrier_view_tests_the_view_condition_first() {
                  WHERE abs(-9223372036854775807 - (owner_id - 8)) > 0 ORDER BY id";
     assert_eq!(ids(query), [1, 3]);
     assert_eq!(ids(&format!("{query} FOR UPDATE")), [1]);
+    assert_eq!(
+        ids("SELECT x AS id FROM fenced_docs AS f (x, o)
+             WHERE abs(-9223372036854775807 - (o - 8)) > 0 ORDER BY x FOR UPDATE"),
+        [1]
+    );
 }
 
 #[test]
