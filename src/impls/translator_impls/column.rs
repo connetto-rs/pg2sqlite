@@ -3,8 +3,8 @@
 
 use sql_traits::structs::ParserDB;
 use sqlparser::ast::{
-    CheckConstraint, ColumnDef, ColumnOption, ColumnOptionDef, DataType, Expr, Ident, ObjectName,
-    PrimaryKeyConstraint, TimezoneInfo, UnaryOperator, Value, ValueWithSpan,
+    CheckConstraint, ColumnDef, ColumnOption, ColumnOptionDef, DataType, Expr, Ident, IndexColumn,
+    ObjectName, PrimaryKeyConstraint, TimezoneInfo, UnaryOperator, Value, ValueWithSpan,
 };
 
 #[cfg(not(feature = "std"))]
@@ -27,6 +27,7 @@ use crate::{
                 small_int_range_bound_expr,
             },
             hidden_referenced_rows::native_actions,
+            plpgsql::fold,
             stored_text::stored_text_check,
             uuid::{
                 is_blob_uuid_representation, is_uuid_data_type, uuid_blob_length_check_expr,
@@ -589,17 +590,20 @@ fn is_rowid_alias(
         return false;
     }
     column.options.iter().any(|o| matches!(o.option, ColumnOption::PrimaryKey(_)))
-        || matches!(primary_key_column_names(table_primary_key).as_slice(),
-            [only] if only.eq_ignore_ascii_case(&column.name.value))
+        || matches!(
+            table_primary_key
+                .iter()
+                .flat_map(|primary_key| primary_key.columns.iter())
+                .collect::<Vec<_>>()
+                .as_slice(),
+            [only] if names_column(only, column)
+        )
 }
 
-/// The columns the table's `PRIMARY KEY` constraints name, in order.
-pub(crate) fn primary_key_column_names(table_primary_key: &[&PrimaryKeyConstraint]) -> Vec<String> {
-    table_primary_key
-        .iter()
-        .flat_map(|primary_key| primary_key.columns.iter())
-        .map(|column| column.column.to_string())
-        .collect()
+/// Whether the key column `key` names `column`, the two identifiers folded
+/// as PostgreSQL folds them.
+fn names_column(key: &IndexColumn, column: &ColumnDef) -> bool {
+    matches!(&key.column.expr, Expr::Identifier(name) if fold(name) == fold(&column.name))
 }
 
 /// Reports what the rowid cannot promise where a PostgreSQL sequence can.
@@ -661,7 +665,7 @@ pub(crate) fn folded_primary_key(
         return None;
     }
     let [only] = primary_key.columns.as_slice() else { return None };
-    if !only.column.to_string().eq_ignore_ascii_case(&column.name.value) {
+    if !names_column(only, column) {
         return None;
     }
     Some(ColumnOptionDef {

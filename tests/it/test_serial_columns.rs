@@ -138,6 +138,16 @@ fn a_table_level_single_column_primary_key_still_auto_assigns() {
     assert_eq!(rows, vec![(1, Some("a".to_owned())), (2, Some("b".to_owned()))]);
 }
 
+/// A quoted key column names the same column as its unquoted spelling.
+#[test]
+fn a_quoted_table_level_primary_key_auto_assigns() {
+    let rows = assigned(
+        r#"CREATE TABLE s ("n" SERIAL, tag TEXT, PRIMARY KEY ("n"));
+           INSERT INTO s (tag) VALUES ('a'), ('b');"#,
+    );
+    assert_eq!(rows, vec![(1, Some("a".to_owned())), (2, Some("b".to_owned()))]);
+}
+
 // ---------------------------------------------------------------------------
 // The identity spelling, which shares the check
 // ---------------------------------------------------------------------------
