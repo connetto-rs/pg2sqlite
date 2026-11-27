@@ -8,12 +8,12 @@
 //! answers the three functions a pg2sqlite translation calls,
 //! [`TRANSACTION_TIMESTAMP`](crate::TRANSACTION_TIMESTAMP),
 //! [`STATEMENT_TIMESTAMP`](crate::STATEMENT_TIMESTAMP) and
-//! [`CLOCK_TIMESTAMP`](crate::CLOCK_TIMESTAMP), from what it sampled. Every statement and every
-//! transaction control therefore goes through the connection, which hands out
-//! no `SqliteConnection` while a statement runs. A reader called outside a
-//! statement the connection dispatched fails.
+//! [`CLOCK_TIMESTAMP`](crate::CLOCK_TIMESTAMP), from what it sampled. Every
+//! statement and every transaction control therefore goes through the
+//! connection, which hands out no `SqliteConnection` while a statement runs. A
+//! reader called outside a statement the connection dispatched fails.
 
-mod guard;
+mod connection;
 mod readers;
 mod statements;
 
@@ -22,24 +22,23 @@ use alloc::{
     vec::Vec,
 };
 
+pub use connection::{ManagedCursor, ManagedTransactionManager};
 use diesel::{
     Connection, ConnectionError, QueryResult, RunQueryDsl,
-    query_dsl::{LoadQuery, methods::ExecuteDsl},
     result::Error as DatabaseError,
     sqlite::{Sqlite, SqliteConnection},
 };
 use diesel_dynamic_schema::dynamic_value::SqliteAnyValue;
-pub use guard::{Guard, Nested, Outermost, Savepoint, Transaction};
 pub use readers::READER_ERROR_PREFIX;
 use readers::{ReaderError, SharedClocks};
-pub use statements::StatementError;
 use statements::SourceStatement;
+pub use statements::StatementError;
 
 use crate::{
     CaseFoldFunctions, HelperFunction, JsonbFunctions, TemporalFunctions,
     clock::{ClockError, UtcProvider},
     group::{BeginMode, ExecutionGroup, TransactionControl},
-    transaction::{Level, TransactionError, TransactionState},
+    transaction::{TransactionError, TransactionState},
 };
 
 /// The way a managed statement or transaction control fails.
@@ -71,13 +70,6 @@ pub enum ExecutionError {
     /// A `RELEASE` or `ROLLBACK TO` names no open savepoint.
     #[error("savepoint \"{0}\" does not exist")]
     MissingSavepoint(String),
-    /// A guard was used after it committed or rolled back.
-    #[error("the transaction or savepoint is already closed")]
-    ClosedScope,
-    /// A dropped guard failed to roll back, so the transaction state is
-    /// unknown.
-    #[error("the connection's transaction state was lost during cleanup")]
-    Poisoned,
 }
 
 impl From<TransactionError> for ExecutionError {
@@ -88,7 +80,6 @@ impl From<TransactionError> for ExecutionError {
             ) => Self::InvalidTransactionState(error),
             TransactionError::Database(error) => Self::Database(error),
             TransactionError::MissingSavepoint(name) => Self::MissingSavepoint(name),
-            TransactionError::Ended => Self::ClosedScope,
         }
     }
 }
@@ -97,6 +88,7 @@ impl From<TransactionError> for ExecutionError {
 ///
 /// # Example
 /// ```
+/// use diesel::connection::SimpleConnection;
 /// use pg2sqlite_runtime::{ClockError, ManagedConnection, UtcInstant, UtcProvider};
 ///
 /// struct Fixed(i64);
@@ -107,12 +99,12 @@ impl From<TransactionError> for ExecutionError {
 ///     }
 /// }
 ///
-/// let mut connection = ManagedConnection::establish(":memory:", Fixed(0)).unwrap();
+/// let mut connection = ManagedConnection::establish_with_provider(":memory:", Fixed(0)).unwrap();
 /// connection
-///     .execute_batch("CREATE TABLE seen (at TEXT DEFAULT (pg2sqlite_transaction_timestamp()))")
+///     .batch_execute("CREATE TABLE seen (at TEXT DEFAULT (pg2sqlite_transaction_timestamp()))")
 ///     .unwrap();
 /// connection
-///     .execute_batch(
+///     .batch_execute(
 ///         "BEGIN; INSERT INTO seen DEFAULT VALUES; INSERT INTO seen DEFAULT VALUES; COMMIT",
 ///     )
 ///     .unwrap();
@@ -132,36 +124,29 @@ pub struct ManagedConnection<Provider> {
     connection: SqliteConnection,
     clocks: SharedClocks<Provider>,
     transaction: TransactionState,
-    poisoned: bool,
 }
 
 impl<Provider> core::fmt::Debug for ManagedConnection<Provider> {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        formatter
-            .debug_struct("ManagedConnection")
-            .field("poisoned", &self.poisoned)
-            .finish_non_exhaustive()
+        formatter.debug_struct("ManagedConnection").finish_non_exhaustive()
     }
 }
 
-/// Whether a statement may be a transaction control.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Controls {
-    Allowed,
-    Refused,
-}
-
 impl<Provider: UtcProvider + Send + 'static> ManagedConnection<Provider> {
-    /// Opens a fresh SQLite connection and registers on it the clock readers.
+    /// Opens a fresh SQLite connection sampling `provider` and registers on
+    /// it the clock readers.
     ///
     /// # Errors
     ///
     /// The error opening the database or registering a function.
-    pub fn establish(database_url: &str, provider: Provider) -> Result<Self, ExecutionError> {
+    pub fn establish_with_provider(
+        database_url: &str,
+        provider: Provider,
+    ) -> Result<Self, ExecutionError> {
         let mut connection = SqliteConnection::establish(database_url)?;
         let clocks = SharedClocks::new(provider);
         clocks.register(&mut connection).map_err(ExecutionError::Database)?;
-        Ok(Self { connection, clocks, transaction: TransactionState::default(), poisoned: false })
+        Ok(Self { connection, clocks, transaction: TransactionState::default() })
     }
 
     /// The registration surface, available while no transaction is open.
@@ -196,17 +181,7 @@ impl<Provider: UtcProvider + Send + 'static> ManagedConnection<Provider> {
         parameters: &[SqliteAnyValue],
     ) -> Result<usize, ExecutionError> {
         let statement = statements::single(sql)?;
-        self.dispatch(statement, parameters, Controls::Allowed)
-    }
-
-    /// Runs each statement of `sql` in turn, each under its own statement
-    /// instant, stopping at the first failure.
-    ///
-    /// # Errors
-    ///
-    /// The first statement's failure.
-    pub fn execute_batch(&mut self, sql: &str) -> Result<(), ExecutionError> {
-        self.batch(sql, Controls::Allowed)
+        self.dispatch(statement, parameters)
     }
 
     /// Runs one logical statement: a group's transaction control as typed,
@@ -231,7 +206,8 @@ impl<Provider: UtcProvider + Send + 'static> ManagedConnection<Provider> {
         if let Some(control) = control {
             return self.control(control.as_deref()).map(|()| 0);
         }
-        let texts: Vec<String> = emitted.into_iter().map(|statement| statement.to_string()).collect();
+        let texts: Vec<String> =
+            emitted.into_iter().map(|statement| statement.to_string()).collect();
         let plain = texts
             .iter()
             .map(|text| {
@@ -275,40 +251,6 @@ impl<Provider: UtcProvider + Send + 'static> ManagedConnection<Provider> {
             return Err(StatementError::UnsupportedControl(String::from(sql)).into());
         };
         let query = bound(text, parameters);
-        self.load(query)
-    }
-
-    /// Runs a typed Diesel statement and answers the rows it changed.
-    ///
-    /// # Errors
-    ///
-    /// The statement's failure.
-    pub fn run<Query>(&mut self, query: Query) -> Result<usize, ExecutionError>
-    where
-        Query: RunQueryDsl<SqliteConnection> + ExecuteDsl<SqliteConnection>,
-    {
-        let scope = self.open_statement()?;
-        let result = query.execute(&mut self.connection);
-        self.close_statement(scope, result)
-    }
-
-    /// Streams the rows of a typed Diesel query, keeping the statement's
-    /// instant until the rows are dropped.
-    ///
-    /// # Errors
-    ///
-    /// The failure preparing the query.
-    pub fn load<'connection, Row, Query>(
-        &'connection mut self,
-        query: Query,
-    ) -> Result<
-        ManagedRows<impl Iterator<Item = QueryResult<Row>> + 'connection, Provider>,
-        ExecutionError,
-    >
-    where
-        Row: 'connection,
-        Query: LoadQuery<'connection, SqliteConnection, Row> + 'connection,
-    {
         let scope = self.open_statement()?;
         match query.load_iter::<Row, diesel::connection::DefaultLoadingMode>(&mut self.connection) {
             Ok(rows) => Ok(ManagedRows { rows, scope }),
@@ -381,21 +323,9 @@ impl<Provider: UtcProvider + Send + 'static> ManagedConnection<Provider> {
         self.control(TransactionControl::RollbackTo(name))
     }
 
-    /// Opens a transaction in `mode` that rolls back unless committed.
-    ///
-    /// # Errors
-    ///
-    /// The failure of [`ManagedConnection::begin`].
-    pub fn transaction(
-        &mut self,
-        mode: BeginMode,
-    ) -> Result<Transaction<'_, Provider>, ExecutionError> {
-        Transaction::begin(self, mode)
-    }
-
-    fn batch(&mut self, sql: &str, controls: Controls) -> Result<(), ExecutionError> {
+    fn batch(&mut self, sql: &str) -> Result<(), ExecutionError> {
         for statement in statements::split(sql)? {
-            self.dispatch(statement, &[], controls)?;
+            self.dispatch(statement, &[])?;
         }
         Ok(())
     }
@@ -404,7 +334,6 @@ impl<Provider: UtcProvider + Send + 'static> ManagedConnection<Provider> {
         &mut self,
         statement: SourceStatement<'_>,
         parameters: &[SqliteAnyValue],
-        controls: Controls,
     ) -> Result<usize, ExecutionError> {
         match statement {
             SourceStatement::Plain(text) => {
@@ -413,7 +342,7 @@ impl<Provider: UtcProvider + Send + 'static> ManagedConnection<Provider> {
                 self.close_statement(scope, result)
             }
             SourceStatement::Control(control) => {
-                if controls == Controls::Refused || !parameters.is_empty() {
+                if !parameters.is_empty() {
                     return Err(
                         StatementError::UnsupportedControl(alloc::format!("{control:?}")).into()
                     );
@@ -428,22 +357,17 @@ impl<Provider: UtcProvider + Send + 'static> ManagedConnection<Provider> {
     fn control(&mut self, control: TransactionControl<&str>) -> Result<(), ExecutionError> {
         let chain = matches!(
             control,
-            TransactionControl::Commit { chain: true } | TransactionControl::Rollback { chain: true }
+            TransactionControl::Commit { chain: true }
+                | TransactionControl::Rollback { chain: true }
         );
         self.transition(|transaction, connection| {
             match control {
                 TransactionControl::Begin(mode) => transaction.begin(connection, mode.statement()),
                 TransactionControl::Commit { .. } => transaction.commit(connection),
                 TransactionControl::Rollback { .. } => transaction.rollback(connection),
-                TransactionControl::Savepoint(name) => {
-                    transaction.savepoint(connection, name).map(drop)
-                }
-                TransactionControl::Release(name) => {
-                    transaction.release(connection, Level::Named(name))
-                }
-                TransactionControl::RollbackTo(name) => {
-                    transaction.rollback_to(connection, Level::Named(name))
-                }
+                TransactionControl::Savepoint(name) => transaction.savepoint(connection, name),
+                TransactionControl::Release(name) => transaction.release(connection, name),
+                TransactionControl::RollbackTo(name) => transaction.rollback_to(connection, name),
             }
         })?;
         if chain { self.begin(BeginMode::Deferred) } else { Ok(()) }
@@ -511,9 +435,6 @@ impl<Provider: UtcProvider + Send + 'static> ManagedConnection<Provider> {
     }
 
     fn check_idle(&self) -> Result<(), ExecutionError> {
-        if self.poisoned {
-            return Err(ExecutionError::Poisoned);
-        }
         if self.clocks.lock().statement.is_some() {
             return Err(ExecutionError::StatementActive);
         }
@@ -691,7 +612,8 @@ impl Registration<'_> {
         &mut self,
         program: impl IntoIterator<Item = Statement>,
     ) -> Result<(), ExecutionError> {
-        let program: Vec<String> = program.into_iter().map(|statement| statement.to_string()).collect();
+        let program: Vec<String> =
+            program.into_iter().map(|statement| statement.to_string()).collect();
         for text in &program {
             if let SourceStatement::Control(_) = statements::single(text)? {
                 return Err(StatementError::UnsupportedControl(text.clone()).into());
@@ -717,8 +639,10 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::ManagedConnection;
-    use crate::group::BeginMode;
-    use crate::clock::{ClockError, UtcInstant, UtcProvider};
+    use crate::{
+        clock::{ClockError, UtcInstant, UtcProvider},
+        group::BeginMode,
+    };
 
     struct Steps(Vec<i64>);
 
@@ -731,7 +655,8 @@ mod tests {
     #[test]
     fn begin_mode_reaches_sqlite() {
         let mut connection =
-            ManagedConnection::establish(":memory:", Steps(alloc::vec![1, 2, 3])).unwrap();
+            ManagedConnection::establish_with_provider(":memory:", Steps(alloc::vec![1, 2, 3]))
+                .unwrap();
         connection.begin(BeginMode::Immediate).unwrap();
         connection.commit().unwrap();
     }

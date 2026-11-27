@@ -14,16 +14,6 @@ pub(crate) enum TransactionError {
     Database(#[from] DatabaseError),
     #[error("savepoint \"{0}\" does not exist")]
     MissingSavepoint(String),
-    #[error("the savepoint has already ended")]
-    Ended,
-}
-
-/// The savepoint a control addresses, by its source name or by the Diesel
-/// depth a guard opened it at.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum Level<'name> {
-    Named(&'name str),
-    Depth(u32),
 }
 
 struct NamedSavepoint {
@@ -89,32 +79,56 @@ impl TransactionState {
         }
     }
 
-    /// Records the source name of a newly nested Diesel savepoint and answers
-    /// its depth. Outside a transaction the savepoint opens one, as SQLite's
-    /// `SAVEPOINT` does.
+    /// Records the source name of a newly nested Diesel savepoint. Outside a
+    /// transaction the savepoint opens one, as SQLite's `SAVEPOINT` does.
     pub(crate) fn savepoint(
         &mut self,
         connection: &mut SqliteConnection,
         name: &str,
-    ) -> Result<u32, TransactionError> {
+    ) -> Result<(), TransactionError> {
         AnsiTransactionManager::begin_transaction(connection)?;
         let depth = Self::depth(connection)?;
         self.savepoints.push(NamedSavepoint { name: String::from(name), depth });
-        Ok(depth)
+        Ok(())
     }
 
-    /// Whether the savepoint opened at `depth` is still open.
-    pub(crate) fn holds(&self, depth: u32) -> bool {
-        self.savepoints.iter().any(|savepoint| savepoint.depth == depth)
+    /// Opens one more Diesel level without a source name, as Diesel's own
+    /// nested transactions do.
+    pub(crate) fn nest(
+        &mut self,
+        connection: &mut SqliteConnection,
+    ) -> Result<(), TransactionError> {
+        AnsiTransactionManager::begin_transaction(connection)?;
+        Ok(())
+    }
+
+    /// Releases the innermost level alone, below the outermost one.
+    pub(crate) fn release_innermost(
+        &mut self,
+        connection: &mut SqliteConnection,
+    ) -> Result<(), TransactionError> {
+        let result = AnsiTransactionManager::commit_transaction(connection);
+        self.synchronize(connection)?;
+        Ok(result?)
+    }
+
+    /// Rolls back the innermost level alone, below the outermost one.
+    pub(crate) fn rollback_innermost(
+        &mut self,
+        connection: &mut SqliteConnection,
+    ) -> Result<(), TransactionError> {
+        let result = AnsiTransactionManager::rollback_transaction(connection);
+        self.synchronize(connection)?;
+        Ok(result?)
     }
 
     /// Releases the savepoint and every level nested inside it.
     pub(crate) fn release(
         &mut self,
         connection: &mut SqliteConnection,
-        level: Level<'_>,
+        name: &str,
     ) -> Result<(), TransactionError> {
-        let position = self.position(level)?;
+        let position = self.position(name)?;
         let target = self.savepoints[position].depth;
         if target == 1 {
             self.drain(connection)?;
@@ -131,9 +145,9 @@ impl TransactionState {
     pub(crate) fn rollback_to(
         &mut self,
         connection: &mut SqliteConnection,
-        level: Level<'_>,
+        name: &str,
     ) -> Result<(), TransactionError> {
-        let position = self.position(level)?;
+        let position = self.position(name)?;
         let target = self.savepoints[position].depth;
         while Self::depth(connection)? >= target {
             if let Err(error) = AnsiTransactionManager::rollback_transaction(connection) {
@@ -149,24 +163,13 @@ impl TransactionState {
         Ok(())
     }
 
-    /// The savepoint `level` addresses. A name matches its most recently
-    /// declared savepoint without regard to ASCII case, as SQLite compares
-    /// them.
-    fn position(&self, level: Level<'_>) -> Result<usize, TransactionError> {
-        match level {
-            Level::Named(name) => {
-                self.savepoints
-                    .iter()
-                    .rposition(|savepoint| savepoint.name.eq_ignore_ascii_case(name))
-                    .ok_or_else(|| TransactionError::MissingSavepoint(String::from(name)))
-            }
-            Level::Depth(depth) => {
-                self.savepoints
-                    .iter()
-                    .rposition(|savepoint| savepoint.depth == depth)
-                    .ok_or(TransactionError::Ended)
-            }
-        }
+    /// The latest savepoint named `name`, matched without regard to ASCII
+    /// case, as SQLite compares them.
+    fn position(&self, name: &str) -> Result<usize, TransactionError> {
+        self.savepoints
+            .iter()
+            .rposition(|savepoint| savepoint.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| TransactionError::MissingSavepoint(String::from(name)))
     }
 
     /// Runs the pre-commit program inside a transaction, rolling the whole
@@ -176,8 +179,10 @@ impl TransactionState {
         if Self::depth(connection)? == 0 {
             return Ok(());
         }
-        let failure =
-            self.before_commit.iter().find_map(|statement| connection.batch_execute(statement).err());
+        let failure = self
+            .before_commit
+            .iter()
+            .find_map(|statement| connection.batch_execute(statement).err());
         match failure {
             Some(error) => {
                 self.rollback(connection)?;
@@ -205,7 +210,7 @@ mod tests {
         sqlite::SqliteConnection,
     };
 
-    use super::{Level, TransactionState};
+    use super::TransactionState;
 
     /// The depth reported by Diesel's transaction manager.
     fn depth(connection: &mut SqliteConnection) -> u32 {
@@ -227,22 +232,17 @@ mod tests {
             transactions.savepoint(&mut connection, name).expect("create named savepoint");
             assert_eq!(depth(&mut connection), expected_depth);
         }
-        transactions
-            .rollback_to(&mut connection, Level::Named("outermost"))
-            .expect("rollback to outermost");
+        transactions.rollback_to(&mut connection, "outermost").expect("rollback to outermost");
         assert_eq!(depth(&mut connection), 2);
-        let error = transactions
-            .release(&mut connection, Level::Named("middle"))
-            .expect_err("middle was removed");
+        let error =
+            transactions.release(&mut connection, "middle").expect_err("middle was removed");
         assert_eq!(error.to_string(), "savepoint \"middle\" does not exist");
         assert_eq!(depth(&mut connection), 2);
         transactions
-            .rollback_to(&mut connection, Level::Named("outermost"))
+            .rollback_to(&mut connection, "outermost")
             .expect("repeat rollback to outermost");
         assert_eq!(depth(&mut connection), 2);
-        transactions
-            .release(&mut connection, Level::Named("outermost"))
-            .expect("release outermost");
+        transactions.release(&mut connection, "outermost").expect("release outermost");
         assert_eq!(depth(&mut connection), 1);
         transactions.commit(&mut connection).expect("commit transaction");
         assert_eq!(depth(&mut connection), 0);
@@ -259,11 +259,9 @@ mod tests {
         for name in ["outermost", "middle", "innermost"] {
             transactions.savepoint(&mut connection, name).expect("create named savepoint");
         }
-        transactions
-            .release(&mut connection, Level::Named("middle"))
-            .expect("release middle and innermost");
+        transactions.release(&mut connection, "middle").expect("release middle and innermost");
         assert_eq!(depth(&mut connection), 2);
-        assert!(transactions.rollback_to(&mut connection, Level::Named("innermost")).is_err());
+        assert!(transactions.rollback_to(&mut connection, "innermost").is_err());
         transactions.rollback(&mut connection).expect("rollback whole transaction");
         assert_eq!(depth(&mut connection), 0);
     }
@@ -276,9 +274,9 @@ mod tests {
         let mut transactions = TransactionState::default();
         transactions.savepoint(&mut connection, "Outer").expect("open by savepoint");
         assert_eq!(depth(&mut connection), 1);
-        transactions.rollback_to(&mut connection, Level::Named("OUTER")).expect("roll back to it");
+        transactions.rollback_to(&mut connection, "OUTER").expect("roll back to it");
         assert_eq!(depth(&mut connection), 1);
-        transactions.release(&mut connection, Level::Named("outer")).expect("release it");
+        transactions.release(&mut connection, "outer").expect("release it");
         assert_eq!(depth(&mut connection), 0);
     }
 }
