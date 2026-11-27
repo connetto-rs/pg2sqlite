@@ -10,9 +10,11 @@
 //! edge table no key orients, following the edges a state, a time bound and
 //! another helper's set leave it, and a walk following the edges a lifted row
 //! cap leaves it. Then for a parent arm a lifted row cap keeps to, a parent arm
-//! a kind, a time bound and another helper's set keep to, an arm reading
-//! another helper's rows, and for a helper read in `FROM`, as its rows, its
-//! columns under an alias, and its rows correlated with the row a policy reads.
+//! a kind, a time bound and another helper's set keep to, a parent arm kept
+//! outside another helper's pairs, that helper keeping rows or none, an arm
+//! reading another helper's rows, and for a helper read in `FROM`, as its
+//! rows, its columns under an alias, and its rows correlated with the row a
+//! policy reads.
 //! Each helper guards the same table under a policy of its own, which both
 //! engines read before any request and then under every request state.
 
@@ -338,6 +340,20 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
     AND doc.id NOT IN (SELECT authz.granted_docs())
 $$;
 
+CREATE FUNCTION authz.uncapped_member_docs() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT doc.id FROM public.docs doc
+  WHERE doc.org_id IN (SELECT authz.member_orgs())
+    AND (doc.org_id, doc.kind) NOT IN (SELECT * FROM authz.capped_kinds())
+$$;
+
+CREATE FUNCTION authz.unfiled_member_docs() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT doc.id FROM public.docs doc
+  WHERE doc.org_id IN (SELECT authz.member_orgs())
+    AND (doc.org_id, doc.kind) NOT IN (SELECT * FROM authz.kinds_for('file'))
+$$;
+
 ALTER FUNCTION authz.caller_id() OWNER TO conditions_owner;
 ALTER FUNCTION authz.installation_id() OWNER TO conditions_owner;
 ALTER FUNCTION authz.link_ids() OWNER TO conditions_owner;
@@ -370,6 +386,8 @@ ALTER FUNCTION authz.linked_down_docs() OWNER TO conditions_owner;
 ALTER FUNCTION authz.capped_linked_docs() OWNER TO conditions_owner;
 ALTER FUNCTION authz.capped_member_docs() OWNER TO conditions_owner;
 ALTER FUNCTION authz.kept_member_files() OWNER TO conditions_owner;
+ALTER FUNCTION authz.uncapped_member_docs() OWNER TO conditions_owner;
+ALTER FUNCTION authz.unfiled_member_docs() OWNER TO conditions_owner;
 REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA authz FROM PUBLIC;
 GRANT USAGE ON SCHEMA authz TO conditions_owner;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA authz TO conditions_owner;
@@ -387,7 +405,7 @@ GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA authz TO app;
 
 /// Each helper's policy over `docs`, one case per condition it carries or
 /// place its rows are read in.
-const CASES: [(&str, &str); 34] = [
+const CASES: [(&str, &str); 36] = [
     ("a joined row", "org_id IN (SELECT authz.member_orgs())"),
     ("a row cap over a joined row", "org_id IN (SELECT authz.administered_orgs())"),
     ("an anti-join, time bounds and a principal", "id IN (SELECT authz.granted_docs())"),
@@ -407,6 +425,11 @@ const CASES: [(&str, &str); 34] = [
     (
         "a parent row a kind, a time bound and another helper's set keep",
         "id IN (SELECT authz.kept_member_files())",
+    ),
+    ("a parent row outside another helper's pairs", "id IN (SELECT authz.uncapped_member_docs())"),
+    (
+        "a parent row outside pairs a helper keeps none of",
+        "id IN (SELECT authz.unfiled_member_docs())",
     ),
     ("a returned key capped by another helper's set", "id IN (SELECT authz.granted_pages())"),
     ("a column outside another helper's set", "id IN (SELECT authz.unblocked_pages())"),
