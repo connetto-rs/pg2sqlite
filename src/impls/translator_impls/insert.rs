@@ -65,28 +65,17 @@ impl<'schema> ResolvedInsertTarget<'schema> {
     }
 }
 
-/// The relation an `INSERT` names, whose columns a default, an `ON CONFLICT`
-/// clause or a `RETURNING` item resolves against.
-pub(crate) fn insert_target_scope<'db>(
-    insert: &Insert,
-    schema: &'db sql_traits::structs::ParserDB,
-) -> Result<
-    Option<sql_traits::structs::ColumnScope<'db, 'db, sql_traits::structs::ParserDB>>,
-    crate::errors::Error,
-> {
-    let sqlparser::ast::TableObject::TableName(name) = &insert.table else {
-        return Ok(None);
-    };
-    if crate::impls::object_name::last_ident(name).is_none() {
-        return Ok(None);
-    }
-    Ok(crate::impls::object_name::resolve_translation_table(schema, name)?.map(|table| {
-        sql_traits::structs::ColumnScope::for_table(
-            table,
-            schema,
-            sql_traits::structs::IdentifierCase::AsWritten,
-        )
-    }))
+/// The relation `insert` writes under the name it gives it, as the query a
+/// scope over its columns is built from.
+pub(crate) fn insert_relation_query(insert: &Insert, name: &ObjectName) -> Query {
+    let relation = crate::impls::query_builder::aliased_table_factor(
+        name.clone(),
+        insert.table_alias.as_ref().map(|alias| alias.alias.clone()),
+    );
+    crate::impls::shared_helpers::relations_scope_query(vec![TableWithJoins {
+        relation,
+        joins: vec![],
+    }])
 }
 
 /// Builds the relation whose columns an insert target alias names.
@@ -98,13 +87,7 @@ fn insert_target_scope_query(
         && last_ident(name).is_some()
         && resolve_translation_table(schema, name)?.is_some()
     {
-        let relation = crate::impls::query_builder::aliased_table_factor(
-            name.clone(),
-            insert.table_alias.as_ref().map(|alias| alias.alias.clone()),
-        );
-        return Ok(Some(crate::impls::shared_helpers::relations_scope_query(vec![
-            TableWithJoins { relation, joins: vec![] },
-        ])));
+        return Ok(Some(insert_relation_query(insert, name)));
     }
     Ok(None)
 }
@@ -1105,10 +1088,13 @@ fn apply_column_type_conversions(
 /// column-typed rewrites share this walk so they cover exactly the same source
 /// shapes.
 #[cfg_attr(feature = "std", recursive::recursive)]
-pub(crate) fn for_each_insert_position(
+pub(crate) fn for_each_insert_position<Column>(
     body: &mut SetExpr,
-    column_names: &[String],
-    f: &mut impl FnMut(&str, sqlparser::ast::Expr) -> Result<sqlparser::ast::Expr, crate::errors::Error>,
+    column_names: &[Column],
+    f: &mut impl FnMut(
+        &Column,
+        sqlparser::ast::Expr,
+    ) -> Result<sqlparser::ast::Expr, crate::errors::Error>,
 ) -> Result<(), crate::errors::Error> {
     match body {
         SetExpr::Values(values) => {

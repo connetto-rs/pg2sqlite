@@ -2,52 +2,19 @@
 //! `Update` type.
 
 use sql_traits::structs::ParserDB;
-use sqlparser::ast::{AssignmentTarget, Expr, ObjectName, TableFactor, Update};
+use sqlparser::ast::{TableFactor, Update};
 
-use super::{
-    helpers::{Reverse, unscale_integer_literal},
-    storage_shape::retype_assignment,
-};
+use super::{helpers::Reverse, storage_shape::reverse_written_assignment};
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{
-        object_name::{last_ident, resolve_translation_table},
-        shared_helpers::{numeric_minor_unit_scales_of_table, translate_update},
+        object_name::last_ident, shared_helpers::translate_update,
         translator_impls::update::update_scope_query,
     },
     prelude::ReverseTranslator,
 };
-
-/// Unscales an assignment value when its target column holds minor units.
-fn unscale_assignment(target: &AssignmentTarget, value: &mut Expr, scales: &[(String, u32)]) {
-    match target {
-        AssignmentTarget::ColumnName(name) => unscale_for_column(name, value, scales),
-        AssignmentTarget::Tuple(names) => {
-            let Expr::Tuple(items) = value else { return };
-            if items.len() != names.len() {
-                return;
-            }
-            for (name, item) in names.iter().zip(items.iter_mut()) {
-                unscale_for_column(name, item, scales);
-            }
-        }
-    }
-}
-
-/// Unscales `value` when `name` names a column carrying a scale.
-fn unscale_for_column(name: &ObjectName, value: &mut Expr, scales: &[(String, u32)]) {
-    if let Some(column) = last_ident(name)
-        && let Some(scale) = scales
-            .iter()
-            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(&column.value))
-            .map(|(_, scale)| *scale)
-        && let Some(unscaled) = unscale_integer_literal(value, scale)
-    {
-        *value = unscaled;
-    }
-}
 
 impl ReverseTranslator for Update {
     type Schema = ParserDB;
@@ -90,16 +57,14 @@ impl ReverseTranslator for Update {
         let scoped = options.with_scope(&scope);
         let mut translated = translate_update::<Reverse>(self, schema, &scoped, &mut |_| {})?;
         // Minor units back to decimals, storage wrappers back to the declared
-        // type.
-        if let TableFactor::Table { name, .. } = &self.table.relation
-            && let Ok(Some(table)) = resolve_translation_table(schema, name)
+        // type, each column read through the target as the statement exposes
+        // it.
+        if let TableFactor::Table { name, alias, .. } = &self.table.relation
+            && let Some(relation) =
+                alias.as_ref().map(|alias| &alias.name).or_else(|| last_ident(name))
         {
-            let scales = numeric_minor_unit_scales_of_table(table, schema);
             for assignment in &mut translated.assignments {
-                if !scales.is_empty() {
-                    unscale_assignment(&assignment.target, &mut assignment.value, &scales);
-                }
-                retype_assignment(assignment, table, schema, &scoped)?;
+                reverse_written_assignment(assignment, relation, schema, &scoped)?;
             }
         }
         Ok(translated)

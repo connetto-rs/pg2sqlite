@@ -33,6 +33,7 @@ const PG_DDL: &str = "
         amount  NUMERIC(10, 2),
         tag     TEXT
     );
+    CREATE VIEW t_amounts AS SELECT id, amount FROM t;
 ";
 
 fn pg2sqlite() -> Pg2Sqlite {
@@ -319,4 +320,16 @@ fn a_tuple_update_unscales_the_value_of_each_column() {
     let emitted = reverse("UPDATE t SET (amount, tag) = (150, 'x') WHERE id = 1")
         .expect("a tuple assignment reverses");
     assert!(emitted.contains("1.50"), "the amount reads 1.50 at the server: {emitted}");
+}
+
+/// A view passes its column's minor units through, so a value written through
+/// it is unscaled as one written to the table is.
+#[test]
+fn a_value_written_through_a_view_unscales_in_reverse() {
+    let updated = reverse("UPDATE t_amounts SET amount = 150 WHERE id = 1")
+        .expect("an update through a view reverses");
+    assert!(updated.contains("amount = 1.50"), "{updated}");
+    let inserted = reverse("INSERT INTO t_amounts (id, amount) VALUES (1, 150)")
+        .expect("an insert through a view reverses");
+    assert!(inserted.contains("(1, 1.50)"), "{inserted}");
 }

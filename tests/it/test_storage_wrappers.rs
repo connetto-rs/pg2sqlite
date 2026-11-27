@@ -19,7 +19,9 @@ use run_translated_helper::run_translated_with;
 use crate::helpers::run_translated as run_translated_helper;
 
 const DDL: &str =
-    "CREATE TABLE stored (id int PRIMARY KEY, u uuid, raw bytea, xs int[], doc jsonb);";
+    "CREATE TABLE stored (id int PRIMARY KEY, u uuid, raw bytea, xs int[], doc jsonb);
+     CREATE VIEW stored_view AS SELECT id, u, raw, xs FROM stored;
+     CREATE VIEW renamed AS SELECT id, u AS owner FROM stored_view;";
 
 /// Options naming both storage representations, which a uuid or array column
 /// needs in either direction.
@@ -230,6 +232,47 @@ fn an_upsert_assignment_reverses_to_the_declared_type() {
 }
 
 #[test]
+fn values_assigned_through_a_view_reverse_to_the_declared_type() {
+    let postgres = reversed(
+        "UPDATE stored_view SET u = X'550E8400E29B41D4A716446655440000', \
+         (raw, xs) = (X'00FF', json_array(1)) WHERE id = 1",
+    );
+    assert!(postgres.contains("u = '550e8400-e29b-41d4-a716-446655440000'"), "{postgres}");
+    assert!(postgres.contains("(raw, xs) = ('\\x00FF', ARRAY[1])"), "{postgres}");
+}
+
+#[test]
+fn values_inserted_through_a_view_reverse_to_the_declared_type() {
+    let listed = reversed(
+        "INSERT INTO stored_view (id, u, raw, xs) VALUES (1, \
+         X'550E8400E29B41D4A716446655440000', X'0303', json_array(1, 2))",
+    );
+    assert!(
+        listed.contains("(1, '550e8400-e29b-41d4-a716-446655440000', '\\x0303', ARRAY[1, 2])"),
+        "{listed}"
+    );
+    let implied = reversed(
+        "INSERT INTO stored_view VALUES (1, X'550E8400E29B41D4A716446655440000', X'0303', \
+         json_array(1, 2))",
+    );
+    assert!(
+        implied.contains("(1, '550e8400-e29b-41d4-a716-446655440000', '\\x0303', ARRAY[1, 2])"),
+        "{implied}"
+    );
+}
+
+/// A view column renamed over another view takes the type of the base column
+/// it reads.
+#[test]
+fn a_renamed_column_of_a_view_over_a_view_reverses_to_the_base_type() {
+    let updated = reversed("UPDATE renamed SET owner = X'550E8400E29B41D4A716446655440000'");
+    assert!(updated.contains("owner = '550e8400-e29b-41d4-a716-446655440000'"), "{updated}");
+    let inserted =
+        reversed("INSERT INTO renamed (id, owner) VALUES (1, X'550E8400E29B41D4A716446655440000')");
+    assert!(inserted.contains("(1, '550e8400-e29b-41d4-a716-446655440000')"), "{inserted}");
+}
+
+#[test]
 fn a_json_array_beside_an_array_column_reverses_to_an_array_constructor() {
     // `xs = json_build_array(1, 2)` earns `operator does not exist:
     // integer[] = json` on the server.
@@ -313,9 +356,13 @@ fn a_declared_decode_of_another_encoding_beside_a_uuid_column_is_unchanged() {
 
 #[test]
 fn a_blob_written_to_an_undeclared_column_is_left_for_the_server_to_refuse() {
-    let inserted =
-        reversed("INSERT INTO stored (id, nope) VALUES (1, X'550E8400E29B41D4A716446655440000')");
-    assert!(inserted.contains("(1, X'550E8400E29B41D4A716446655440000')"), "{inserted}");
-    let updated = reversed("UPDATE stored SET nope = X'550E8400E29B41D4A716446655440000'");
-    assert!(updated.contains("nope = X'550E8400E29B41D4A716446655440000'"), "{updated}");
+    for relation in ["stored", "stored_view"] {
+        let inserted = reversed(&format!(
+            "INSERT INTO {relation} (id, nope) VALUES (1, X'550E8400E29B41D4A716446655440000')"
+        ));
+        assert!(inserted.contains("(1, X'550E8400E29B41D4A716446655440000')"), "{inserted}");
+        let updated =
+            reversed(&format!("UPDATE {relation} SET nope = X'550E8400E29B41D4A716446655440000'"));
+        assert!(updated.contains("nope = X'550E8400E29B41D4A716446655440000'"), "{updated}");
+    }
 }

@@ -18,20 +18,21 @@
 //! Those positions call [`retype_for_declared`] with the type they already
 //! know.
 
-use sql_traits::{
-    structs::ParserDB,
-    traits::{ColumnLike, DatabaseLike, TableLike},
-};
+use sql_traits::structs::ParserDB;
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, CastKind, DataType, Expr, FunctionArguments, ObjectName,
+    Assignment, AssignmentTarget, CastKind, DataType, Expr, FunctionArguments, Ident, ObjectName,
     ObjectNamePart, Value, ValueWithSpan,
 };
 
+use super::helpers::unscale_integer_literal;
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
-    impls::{object_name::last_ident, shared_helpers::declared_in_scope},
+    impls::{
+        object_name::last_ident,
+        shared_helpers::{declared_in_scope, scale_of},
+    },
 };
 
 /// The PostgreSQL type `expr` is declared with, when the schema names one.
@@ -133,57 +134,63 @@ pub(crate) fn retype_against_peer(
     }
 }
 
-/// Retypes `value` for the column `column` of `table`, the position an
-/// `INSERT` fills and an `UPDATE` assigns.
+/// Undoes the storage shape of `value`, written into the column `column`
+/// names on the relation the statement writes: minor units back to a decimal
+/// and a storage wrapper back to the declared type.
+///
+/// `column` reads the written relation through the statement's scope, so a
+/// view's column takes the type of the column it passes through. A column the
+/// relation does not have leaves `value` as written, for the server to refuse.
 ///
 /// # Errors
 ///
-/// Propagates the refusal [`retype_for_declared`] makes, and the failure to
-/// read `table`'s columns.
-pub(crate) fn retype_for_column(
+/// Propagates the refusal [`retype_for_declared`] makes.
+pub(crate) fn reverse_written_value(
     value: Expr,
-    column: &str,
-    table: &<ParserDB as DatabaseLike>::Table,
+    column: &Expr,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
 ) -> Result<Expr, Error> {
-    if !needs_declared_type(&value) {
+    let Some(Ok(Some(_))) = options.column_definitions(column, None).next() else {
         return Ok(value);
-    }
-    let declared = table
-        .columns(schema)?
-        .find(|candidate| candidate.column_name().eq_ignore_ascii_case(column));
-    match declared {
-        Some(declared) => retype_for_declared(value, &declared.attribute().data_type, options),
-        None => Ok(value),
-    }
+    };
+    let value = match scale_of(column, schema, options).filter(|scale| *scale > 0) {
+        Some(scale) => unscale_integer_literal(&value, scale).unwrap_or(value),
+        None => value,
+    };
+    retype_against_peer(value, column, schema, options)
 }
 
-/// Retypes the values `assignment` writes for the columns of `table` it
-/// names, one by one for a tuple target.
+/// Undoes the storage shape of the values `assignment` writes into the
+/// relation exposed as `relation`, one by one for a tuple target.
 ///
 /// # Errors
 ///
-/// Propagates the refusal [`retype_for_column`] makes.
-pub(crate) fn retype_assignment(
+/// Propagates the refusal [`reverse_written_value`] makes.
+pub(crate) fn reverse_written_assignment(
     assignment: &mut Assignment,
-    table: &<ParserDB as DatabaseLike>::Table,
+    relation: &Ident,
     schema: &ParserDB,
     options: &crate::options::TranslationContext<'_>,
 ) -> Result<(), Error> {
-    let retype_one = |name: &ObjectName, value: &mut Expr| -> Result<(), Error> {
+    let reverse_one = |name: &ObjectName, value: &mut Expr| -> Result<(), Error> {
         let Some(column) = last_ident(name) else { return Ok(()) };
         let taken = core::mem::replace(value, Expr::Value(Value::Null.with_empty_span()));
-        *value = retype_for_column(taken, &column.value, table, schema, options)?;
+        *value = reverse_written_value(taken, &written_column(relation, column), schema, options)?;
         Ok(())
     };
     match &assignment.target {
-        AssignmentTarget::ColumnName(name) => retype_one(name, &mut assignment.value),
+        AssignmentTarget::ColumnName(name) => reverse_one(name, &mut assignment.value),
         AssignmentTarget::Tuple(names) => {
             let Expr::Tuple(items) = &mut assignment.value else { return Ok(()) };
-            names.iter().zip(items.iter_mut()).try_for_each(|(name, item)| retype_one(name, item))
+            names.iter().zip(items.iter_mut()).try_for_each(|(name, item)| reverse_one(name, item))
         }
     }
+}
+
+/// The reference to `column` of the written relation exposed as `relation`.
+pub(crate) fn written_column(relation: &Ident, column: &Ident) -> Expr {
+    Expr::CompoundIdentifier(vec![relation.clone(), column.clone()])
 }
 
 /// A SQLite blob, in the two shapes the reverse direction meets it.

@@ -3,18 +3,18 @@
 
 use sql_traits::{
     errors::LookupError,
-    structs::ParserDB,
+    structs::{ColumnScope, IdentifierCase, ParserDB, QueryOutput},
     traits::{ColumnLike, DatabaseLike, ForeignKeyLike, TableLike, TriggerLike},
 };
 use sqlparser::ast::{
     Assignment, AssignmentTarget, ConflictTarget, DoUpdate, Expr, Ident, Insert, ObjectName,
-    ObjectNamePart, OnConflict, OnConflictAction, OnInsert, ReferentialAction, SqliteOnConflict,
-    TableObject,
+    ObjectNamePart, OnConflict, OnConflictAction, OnInsert, Query, ReferentialAction,
+    SqliteOnConflict, TableObject,
 };
 
 use super::{
-    helpers::{Reverse, unscale_integer_literal},
-    storage_shape::{retype_assignment, retype_for_column},
+    helpers::Reverse,
+    storage_shape::{reverse_written_assignment, reverse_written_value, written_column},
 };
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
@@ -26,11 +26,11 @@ use crate::{
             qualify_do_update_column_refs, refuse_sqlite_specific_names,
         },
         shared_helpers::{
-            numeric_minor_unit_scales_of_table, translate_conflict_predicate,
-            translate_on_conflict_do_update, translate_returning,
+            translate_conflict_predicate, translate_on_conflict_do_update, translate_returning,
         },
-        translator_impls::insert::{
-            for_each_insert_position, insert_column_names, insert_target_scope,
+        translator_impls::{
+            insert::{for_each_insert_position, insert_relation_query},
+            view_writes::resolve_view,
         },
     },
     prelude::ReverseTranslator,
@@ -243,46 +243,47 @@ fn build_upsert_on_conflict(
     }))
 }
 
-type ParserTable = <ParserDB as DatabaseLike>::Table;
-
-/// Unscales integer literals at NUMERIC column positions back to decimal form.
-///
-/// Mirrors the forward `scale_numeric_literals` but divides by 10^s rather than
-/// multiplying.
-fn unscale_numeric_literals(
-    insert: &mut Insert,
-    table: &ParserTable,
+/// The relation `insert` writes, a table or a view, under the name the
+/// statement exposes it by, with the query a scope over its columns is built
+/// from.
+fn written_relation<'i>(
+    insert: &'i Insert,
     schema: &ParserDB,
-    scales: &[(String, u32)],
-) -> Result<(), Error> {
-    if scales.is_empty() {
-        return Ok(());
+) -> Result<Option<(&'i Ident, Query)>, Error> {
+    let TableObject::TableName(name) = &insert.table else { return Ok(None) };
+    let Some(table_name) = last_ident(name) else { return Ok(None) };
+    if resolve_translation_table(schema, name)?.is_none() && resolve_view(name, schema)?.is_none() {
+        return Ok(None);
     }
-    let column_names = insert_column_names(insert, table, schema)?;
-    let Some(source) = insert.source.as_deref_mut() else { return Ok(()) };
-    for_each_insert_position(source.body.as_mut(), &column_names, &mut |column, mut expr| {
-        if let Some(scale) =
-            scales.iter().find(|(name, _)| name.eq_ignore_ascii_case(column)).map(|(_, s)| *s)
-            && let Some(unscaled) = unscale_integer_literal(&expr, scale)
-        {
-            expr = unscaled;
-        }
-        Ok(expr)
-    })
+    let exposed = insert.table_alias.as_ref().map_or(table_name, |alias| &alias.alias);
+    Ok(Some((exposed, insert_relation_query(insert, name))))
 }
 
-/// Retypes the values of `insert`'s rows for the columns they fill.
-fn retype_insert_values(
-    insert: &mut Insert,
-    table: &ParserTable,
-    schema: &ParserDB,
-    options: &crate::options::TranslationContext<'_>,
-) -> Result<(), Error> {
-    let column_names = insert_column_names(insert, table, schema)?;
-    let Some(source) = insert.source.as_deref_mut() else { return Ok(()) };
-    for_each_insert_position(source.body.as_mut(), &column_names, &mut |column, expr| {
-        retype_for_column(expr, column, table, schema, options)
-    })
+/// The column each value of `insert`'s rows fills, in order, the columns
+/// `query` selects from the written relation when the statement lists none.
+fn written_columns(
+    insert: &Insert,
+    query: &Query,
+    scope: &ColumnScope<'_, '_, ParserDB>,
+) -> Vec<Option<Ident>> {
+    if !insert.columns.is_empty() {
+        return insert.columns.iter().map(|column| last_ident(column).cloned()).collect();
+    }
+    scope
+        .scope_for_query(query)
+        .into_iter()
+        .flat_map(|root| root.outputs())
+        .map_while(|output| {
+            match output {
+                QueryOutput::Column { name, .. } => {
+                    Some(name.map(|(name, quoted)| {
+                        if quoted { Ident::with_quote('"', name) } else { Ident::new(name) }
+                    }))
+                }
+                QueryOutput::Unexpanded { .. } => None,
+            }
+        })
+        .collect()
 }
 
 /// Refuses `INSERT ... DEFAULT VALUES` when a `NOT NULL` column has no
@@ -359,7 +360,11 @@ impl ReverseTranslator for Insert {
 
         refuse_default_values_without_defaults(self, schema)?;
 
-        let target_scope = insert_target_scope(self, schema)?;
+        let written = written_relation(self, schema)?;
+        let target_scope = written
+            .as_ref()
+            .map(|(_, query)| ColumnScope::from_query(query, schema, IdentifierCase::AsWritten))
+            .transpose()?;
         let scoped = target_scope.as_ref().map(|scope| options.with_scope(scope));
         let options = scoped.as_ref().unwrap_or(options);
         // Reverse translate the source (VALUES or SELECT)
@@ -542,20 +547,23 @@ impl ReverseTranslator for Insert {
         }
 
         // Minor units back to decimals, storage wrappers back to the declared
-        // type.
-        if let TableObject::TableName(name) = &self.table
-            && let Ok(Some(table)) = resolve_translation_table(schema, name)
-        {
-            let scales = numeric_minor_unit_scales_of_table(table, schema);
-            unscale_numeric_literals(&mut insert, table, schema, &scales)?;
-            retype_insert_values(&mut insert, table, schema, options)?;
+        // type, each column read through the target as the statement exposes
+        // it.
+        if let (Some((relation, query)), Some(scope)) = (&written, &target_scope) {
+            let columns = written_columns(self, query, scope);
+            if let Some(source) = insert.source.as_deref_mut() {
+                for_each_insert_position(source.body.as_mut(), &columns, &mut |column, value| {
+                    let Some(column) = column else { return Ok(value) };
+                    reverse_written_value(value, &written_column(relation, column), schema, options)
+                })?;
+            }
             if let Some(OnInsert::OnConflict(OnConflict {
                 action: OnConflictAction::DoUpdate(do_update),
                 ..
             })) = &mut insert.on
             {
                 for assignment in &mut do_update.assignments {
-                    retype_assignment(assignment, table, schema, options)?;
+                    reverse_written_assignment(assignment, relation, schema, options)?;
                 }
             }
         }
