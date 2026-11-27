@@ -7,7 +7,7 @@ use diesel::{
     sql_types::{Nullable, Text},
     sqlite::SqliteConnection,
 };
-use pg2sqlite::prelude::{Error, Pg2Sqlite, Pg2SqliteOptions};
+use pg2sqlite::prelude::{Error, Pg2Sqlite, Pg2SqliteOptions, TypmodRounding};
 use sql_traits::structs::Deployment;
 use sql_values::postgres::{InputContext, PgTimestampTz};
 use sqlparser::ast::Statement;
@@ -88,7 +88,7 @@ impl Events {
     }
 
     /// The replica's schema under `roles` and `options`, holding the one row,
-    /// on a connection with the zone functions registered.
+    /// on a connection with the zone and rounding functions registered.
     pub(super) fn replica(&self, roles: &str, options: &Pg2SqliteOptions) -> SqliteConnection {
         let statements = Pg2Sqlite::default()
             .sql(&format!("{roles}{TABLE}{GRANT}"))
@@ -97,6 +97,7 @@ impl Events {
             .into_vec();
         let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
         zone_functions::register(&mut connection);
+        TypmodRounding::register(&mut connection).expect("register the typmod rounding");
         apply_with_seed(&mut connection, &statements, |connection| {
             use schema::events;
             diesel::insert_into(events::table)

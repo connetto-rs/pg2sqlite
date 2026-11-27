@@ -12,6 +12,7 @@
 //! runtime and a typed schema cannot name it. Each probe is the script's last
 //! statement, the shape the shared runner returns.
 
+use diesel::RunQueryDsl;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use rusqlite::Connection;
 
@@ -463,6 +464,96 @@ fn an_update_rounds_the_written_literal() {
          SELECT ts0 FROM t;"
     ));
     assert_eq!(rows, vec!["2024-01-02 03:04:06"]);
+}
+
+/// PostgreSQL rounds a timestamp's microseconds from its 2000-01-01 epoch
+/// half away from zero, so a tie before 2000 rounds down and one after rounds
+/// up. PostgreSQL 18.6 prints 1999-12-31 23:59:59, 1960-01-01 00:00:00,
+/// 2000-01-01 00:00:01, 1990-01-01 00:00:00+00 and 1999-12-31 23:59:59.7+00
+/// for the five literals.
+#[test]
+fn a_literal_tie_rounds_away_from_the_postgres_epoch() {
+    for (literal, expected) in [
+        ("CAST('1999-12-31 23:59:59.5' AS TIMESTAMP(0))", "1999-12-31 23:59:59"),
+        ("CAST('1960-01-01 00:00:00.5' AS TIMESTAMP(0))", "1960-01-01 00:00:00"),
+        ("CAST('2000-01-01 00:00:00.5' AS TIMESTAMP(0))", "2000-01-01 00:00:01"),
+        ("CAST('1990-01-01 00:00:00.5+00' AS TIMESTAMPTZ(0))", "1990-01-01 00:00:00.000000+00:00"),
+        ("CAST('1999-12-31 23:59:59.75+00' AS TIMESTAMPTZ(1))", "1999-12-31 23:59:59.700000+00:00"),
+    ] {
+        assert_eq!(run(&format!("SELECT {literal};")), vec![expected], "{literal}");
+    }
+}
+
+/// A cast over a full-precision column rounds the same ties when SQLite runs
+/// it. PostgreSQL 18.6 prints 1999-12-31 23:59:59 for the timestamp, and
+/// 1990-01-01 00:00:00+00 and 1990-01-01 00:00:00 for the timestamptz cast
+/// to TIMESTAMPTZ(0) and TIMESTAMP(0).
+#[test]
+fn a_run_time_tie_rounds_away_from_the_postgres_epoch() {
+    const INSERT: &str = "INSERT INTO t (ts, tstz) VALUES
+        ('1999-12-31 23:59:59.5', '1990-01-01 00:00:00.5+00');";
+    for (cast, expected) in [
+        ("CAST(ts AS TIMESTAMP(0))", "1999-12-31 23:59:59"),
+        ("CAST(tstz AS TIMESTAMPTZ(0))", "1990-01-01 00:00:00.000000+00:00"),
+        ("CAST(tstz AS TIMESTAMP(0))", "1990-01-01 00:00:00"),
+    ] {
+        assert_eq!(
+            run(&format!("{DDL}\n{INSERT}\nSELECT {cast} FROM t;")),
+            vec![expected],
+            "{cast}"
+        );
+    }
+}
+
+// ── rounding past the last year the replica holds ──────────────────────────
+
+/// A literal that rounds into the year 10000 is refused, since the replica
+/// holds four-digit years. PostgreSQL prints 10000-01-01 00:00:00 and
+/// 10000-01-01 00:00:00+00.
+#[test]
+fn a_literal_rounding_past_the_year_9999_is_refused() {
+    for cast in [
+        "SELECT CAST('9999-12-31 23:59:59.9' AS TIMESTAMP(0));",
+        "SELECT CAST('9999-12-31 23:59:59.9+00' AS TIMESTAMPTZ(0));",
+    ] {
+        let error = Pg2Sqlite::default()
+            .sql(cast)
+            .expect("parse")
+            .translate_to_sql(&Pg2SqliteOptions::default())
+            .expect_err("the rounded literal leaves the years the replica holds")
+            .to_string();
+        assert!(error.contains("outside the years 1 to 9999"), "{cast}: {error}");
+    }
+}
+
+/// A stored value that rounds into the year 10000 at run time fails the
+/// query rather than answering text the replica cannot order. PostgreSQL
+/// prints 10000-01-01 00:00:00.
+#[test]
+fn a_column_rounding_past_the_year_9999_fails_the_query() {
+    let script = Pg2Sqlite::default()
+        .sql(&format!(
+            "{DDL}\n\
+             INSERT INTO t (ts) VALUES ('9999-12-31 23:59:59.9');\n\
+             SELECT CAST(ts AS TIMESTAMP(0)) FROM t;"
+        ))
+        .expect("parse")
+        .translate_to_sql(&Pg2SqliteOptions::default())
+        .expect("translate");
+    let mut connection = crate::helpers::establish_connection();
+    script.register_functions(&mut connection).expect("register the replica's functions");
+    let mut statements = script.into_vec();
+    let probe = statements.pop().expect("the probe");
+    // The translated statements are runtime text no typed DSL carries.
+    for statement in &statements {
+        diesel::sql_query(statement)
+            .execute(&mut connection)
+            .unwrap_or_else(|error| panic!("{error}\n{statement}"));
+    }
+    let error = diesel::sql_query(&probe)
+        .execute(&mut connection)
+        .expect_err("the rounded value leaves the years the replica holds");
+    assert!(error.to_string().contains("outside the years 1 to 9999"), "{error}");
 }
 
 // ── the full-precision types keep standing ─────────────────────────────────
