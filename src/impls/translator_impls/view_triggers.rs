@@ -18,7 +18,7 @@ use sqlstate::pg;
 use super::{
     definer,
     plpgsql::{PlPgSqlTranslator, TriggerFacts},
-    view_writes::{output_names, rewritten_base, written_relation},
+    view_writes::{instead_of_takes, output_names, rewritten_base, written_relation},
 };
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
@@ -116,7 +116,8 @@ struct Written<'s> {
 
 /// The `INSTEAD OF` triggers making the view `sqlite_name` writable on the
 /// replica as PostgreSQL makes `view` writable, one set per command
-/// PostgreSQL rewrites onto the relation the view reads.
+/// PostgreSQL rewrites onto the relation the view reads, or refusing each
+/// command on a view that is not automatically updatable.
 ///
 /// # Errors
 ///
@@ -131,6 +132,9 @@ pub(crate) fn view_triggers(
     options: &TranslationContext<'_>,
     emit: crate::warnings::WarningSink<'_>,
 ) -> Result<Vec<Statement>, Error> {
+    if view.updatable_base(schema)?.is_none() {
+        return Ok(not_updatable(view, sqlite_name, schema, options));
+    }
     let names = output_names(view, schema)?;
     let Some(names) = names.into_iter().collect::<Option<Vec<String>>>() else {
         return Ok(Vec::new());
@@ -164,6 +168,39 @@ pub(crate) fn view_triggers(
         triggers.extend(written.triggers(&runner, caller.as_ref(), schema, options, emit)?);
     }
     Ok(triggers)
+}
+
+/// The `INSTEAD OF` triggers refusing with `55000` each command on `view`,
+/// which is not automatically updatable, that no `INSTEAD OF` trigger takes,
+/// as PostgreSQL's rewriter does when the write runs. SQLite refuses a write
+/// to a view without a trigger in words of its own, which carry no SQLSTATE.
+fn not_updatable(
+    view: &View,
+    sqlite_name: &ObjectName,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> Vec<Statement> {
+    [Event::Insert, Event::Update, Event::Delete]
+        .into_iter()
+        .filter(|event| !instead_of_takes(view, *event, schema, options))
+        .map(|event| {
+            let message = format!(
+                "{}cannot {} view \"{}\"",
+                message_prefix(pg::OBJECT_NOT_IN_PREREQUISITE_STATE),
+                verb(event),
+                view.stored_view_name()
+            );
+            ast_builder::trigger(
+                ObjectName::from(vec![quoted(&trigger_name(view, event, "not_updatable"))]),
+                sqlite_name.clone(),
+                TriggerPeriod::InsteadOf,
+                command_event(event, Vec::new()),
+                true,
+                None,
+                vec![ast_builder::raise_statement("ABORT", Some(&message), None)],
+            )
+        })
+        .collect()
 }
 
 /// The `BEFORE` triggers refusing on `sqlite_name`, the table holding `view`

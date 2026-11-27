@@ -178,6 +178,7 @@ mod test_multiple_session_variables;
 mod test_name_collisions;
 mod test_native_sqlite_statements;
 mod test_no_statement_is_silently_dropped;
+mod test_non_updatable_view_writes;
 mod test_nul_byte_in_source;
 mod test_null_ordering;
 mod test_numeric_floor_ceil_trunc;

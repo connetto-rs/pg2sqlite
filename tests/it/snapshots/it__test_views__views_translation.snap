@@ -1,6 +1,5 @@
 ---
 source: tests/it/test_views.rs
-assertion_line: 128
 expression: translated_sql
 ---
 PRAGMA foreign_keys = 1
@@ -9,4 +8,10 @@ CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, username TEXT
 CREATE TABLE orders (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, user_id INTEGER NOT NULL REFERENCES users (id) CHECK (user_id BETWEEN -2147483648 AND 2147483647), total REAL NOT NULL, status TEXT NOT NULL DEFAULT 'pending') STRICT
 CREATE VIEW active_users AS SELECT id AS id, username AS username, email AS email FROM users WHERE is_active = true
 CREATE VIEW user_orders AS SELECT u.id AS user_id, u.username AS username, o.id AS order_id, o.total AS total, o.status AS status FROM users u JOIN orders o ON u.id = o.user_id
+CREATE TRIGGER "user_orders_view_insert_not_updatable" INSTEAD OF INSERT ON user_orders FOR EACH ROW BEGIN SELECT RAISE(ABORT, '55000: cannot insert into view "user_orders"'); END
+CREATE TRIGGER "user_orders_view_update_not_updatable" INSTEAD OF UPDATE ON user_orders FOR EACH ROW BEGIN SELECT RAISE(ABORT, '55000: cannot update view "user_orders"'); END
+CREATE TRIGGER "user_orders_view_delete_not_updatable" INSTEAD OF DELETE ON user_orders FOR EACH ROW BEGIN SELECT RAISE(ABORT, '55000: cannot delete from view "user_orders"'); END
 CREATE VIEW user_order_summary AS SELECT u.id AS id, u.username AS username, COUNT(o.id) AS order_count, SUM(o.total) AS total_spent FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.id, u.username
+CREATE TRIGGER "user_order_summary_view_insert_not_updatable" INSTEAD OF INSERT ON user_order_summary FOR EACH ROW BEGIN SELECT RAISE(ABORT, '55000: cannot insert into view "user_order_summary"'); END
+CREATE TRIGGER "user_order_summary_view_update_not_updatable" INSTEAD OF UPDATE ON user_order_summary FOR EACH ROW BEGIN SELECT RAISE(ABORT, '55000: cannot update view "user_order_summary"'); END
+CREATE TRIGGER "user_order_summary_view_delete_not_updatable" INSTEAD OF DELETE ON user_order_summary FOR EACH ROW BEGIN SELECT RAISE(ABORT, '55000: cannot delete from view "user_order_summary"'); END

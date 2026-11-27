@@ -297,8 +297,7 @@ fn landing<'s>(
 
 /// The relation PostgreSQL rewrites a write of `event` on `view` onto, when
 /// it rewrites one: no `INSTEAD OF` trigger takes the write and the view reads
-/// one relation it passes columns of through. The trigger is the translated
-/// script's or the schema's it is translated against.
+/// one relation it passes columns of through.
 ///
 /// # Errors
 ///
@@ -309,16 +308,26 @@ pub(super) fn rewritten_base<'s>(
     schema: &'s ParserDB,
     options: &TranslationContext<'_>,
 ) -> Result<Option<WrittenRelation<'s, ParserDB>>, Error> {
+    if instead_of_takes(view, event, schema, options) {
+        return Ok(None);
+    }
+    Ok(view.updatable_base(schema)?.map(|base| base.relation))
+}
+
+/// Whether an `INSTEAD OF` trigger takes a write of `event` on `view`, the
+/// translated script's or the schema's it is translated against.
+pub(super) fn instead_of_takes(
+    view: &View,
+    event: Event,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+) -> bool {
     let stored = view.stored_view_name();
-    if options.instead_of_trigger_takes(&stored, |fired| Event::of(fired) == event)
+    options.instead_of_trigger_takes(&stored, |fired| Event::of(fired) == event)
         || schema
             .triggers()
             .filter_map(FiringTrigger::of)
             .any(|trigger| trigger.takes(stored.as_ref(), &[event]))
-    {
-        return Ok(None);
-    }
-    Ok(view.updatable_base(schema)?.map(|base| base.relation))
 }
 
 /// The one `SELECT` a definition holds, through any parentheses.

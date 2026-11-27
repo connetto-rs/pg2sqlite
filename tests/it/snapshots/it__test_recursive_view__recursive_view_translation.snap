@@ -1,10 +1,15 @@
 ---
 source: tests/it/test_recursive_view.rs
-assertion_line: 79
 expression: translated_sql
 ---
 PRAGMA foreign_keys = 1
 PRAGMA case_sensitive_like = 1
 CREATE TABLE categories (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, name TEXT NOT NULL, parent_id INTEGER REFERENCES categories (id) CHECK (parent_id BETWEEN -2147483648 AND 2147483647)) STRICT
 CREATE VIEW category_tree AS WITH RECURSIVE tree (id, name, parent_id, depth, path) AS (SELECT id AS id, name AS name, parent_id AS parent_id, 0 AS depth, name AS path FROM categories WHERE parent_id IS NULL UNION ALL SELECT c.id, c.name, c.parent_id, t.depth + 1, t.path || ' > ' || c.name FROM categories c JOIN tree t ON c.parent_id = t.id) SELECT id AS id, name AS name, parent_id AS parent_id, depth AS depth, path AS path FROM tree
+CREATE TRIGGER "category_tree_view_insert_not_updatable" INSTEAD OF INSERT ON category_tree FOR EACH ROW BEGIN SELECT RAISE(ABORT, '55000: cannot insert into view "category_tree"'); END
+CREATE TRIGGER "category_tree_view_update_not_updatable" INSTEAD OF UPDATE ON category_tree FOR EACH ROW BEGIN SELECT RAISE(ABORT, '55000: cannot update view "category_tree"'); END
+CREATE TRIGGER "category_tree_view_delete_not_updatable" INSTEAD OF DELETE ON category_tree FOR EACH ROW BEGIN SELECT RAISE(ABORT, '55000: cannot delete from view "category_tree"'); END
 CREATE VIEW category_descendant_count AS WITH RECURSIVE descendants (id, root_id) AS (SELECT id AS id, id AS root_id FROM categories UNION ALL SELECT c.id, d.root_id FROM categories c JOIN descendants d ON c.parent_id = d.id) SELECT root_id AS category_id, COUNT(*) - 1 AS descendant_count FROM descendants GROUP BY root_id
+CREATE TRIGGER "category_descendant_count_view_insert_not_updatable" INSTEAD OF INSERT ON category_descendant_count FOR EACH ROW BEGIN SELECT RAISE(ABORT, '55000: cannot insert into view "category_descendant_count"'); END
+CREATE TRIGGER "category_descendant_count_view_update_not_updatable" INSTEAD OF UPDATE ON category_descendant_count FOR EACH ROW BEGIN SELECT RAISE(ABORT, '55000: cannot update view "category_descendant_count"'); END
+CREATE TRIGGER "category_descendant_count_view_delete_not_updatable" INSTEAD OF DELETE ON category_descendant_count FOR EACH ROW BEGIN SELECT RAISE(ABORT, '55000: cannot delete from view "category_descendant_count"'); END
