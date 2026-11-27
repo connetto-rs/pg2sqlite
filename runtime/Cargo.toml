@@ -61,7 +61,16 @@ diesel = ["dep:diesel", "dep:diesel-dynamic-schema"]
 clock = ["dep:jiff"]
 # `ManagedConnection`, which owns its transactions and statements and answers
 # PostgreSQL's clock functions from the instants it samples at their starts.
-managed = ["diesel", "clock", "dep:sqlparser", "dep:libsqlite3-sys", "dep:sqlite-wasm-rs"]
+# It implements diesel's `Connection`, which diesel opens to third-party
+# connections behind its breaking-changes feature.
+managed = [
+    "diesel",
+    "clock",
+    "diesel/i-implement-a-third-party-backend-and-opt-into-breaking-changes",
+    "dep:sqlparser",
+    "dep:libsqlite3-sys",
+    "dep:sqlite-wasm-rs",
+]
 
 [lints]
 workspace = true

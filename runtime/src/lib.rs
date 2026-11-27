@@ -33,7 +33,7 @@ pub use helper_function::HelperFunction;
 pub use jsonb::JsonbFunctions;
 #[cfg(feature = "managed")]
 pub use managed::{
-    ExecutionError, Guard, ManagedConnection, ManagedRows, Nested, Outermost,
-    READER_ERROR_PREFIX, Registration, Savepoint, StatementError, Transaction,
+    ExecutionError, ManagedConnection, ManagedCursor, ManagedRows, ManagedTransactionManager,
+    READER_ERROR_PREFIX, Registration, StatementError,
 };
 pub use typmod::{RoundingError, TypmodRounding};
