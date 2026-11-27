@@ -10,6 +10,7 @@ pub(crate) mod placement;
 mod rebind;
 pub(crate) mod transactions;
 
+use pg2sqlite_runtime::{BeginMode, TransactionControl};
 use sql_traits::{
     structs::{ParserDB, ParserDBIngestor},
     traits::{DatabaseLike, TableLike, ViewLike},
@@ -34,7 +35,7 @@ use crate::{
     manifest::Placement,
     options::TranslationContext,
     pg2sqlite::Pg2Sqlite,
-    script::ConnectionError,
+    script::{ConnectionError, Group},
     traits::translator::TranslatorWithContext,
 };
 
@@ -78,7 +79,7 @@ pub(crate) fn connection_program(
     final_schema: &ParserDB,
     context: &TranslationContext<'_>,
     placed: &mut Placed,
-) -> Result<Vec<Statement>, ConnectionError> {
+) -> Result<Vec<Group>, ConnectionError> {
     let sources: Vec<Statement> = units.iter().map(|unit| unit.source.clone()).collect();
     let dispositions: Vec<Disposition> = units.iter().map(|unit| *unit.disposition).collect();
     let outline = Outline::new(&sources, &dispositions);
@@ -140,8 +141,8 @@ fn retention(catalog: &Catalog, effects: &[Effects]) -> Vec<bool> {
     retained
 }
 
-/// Emits the retained units in source order, grouping the ones a source
-/// transaction committed together.
+/// Emits the retained units in source order, one group each, inside the
+/// transactions the source committed them in.
 fn replay(
     units: &[Unit<'_>],
     retained: &[bool],
@@ -149,7 +150,7 @@ fn replay(
     final_schema: &ParserDB,
     context: &TranslationContext<'_>,
     placed: &mut Placed,
-) -> Result<Vec<Statement>, ConnectionError> {
+) -> Result<Vec<Group>, ConnectionError> {
     let mut schema = ReplaySchema::new(final_schema, Files::CONNECTION, &placed.homes)?;
     let mut program = Vec::new();
     let mut open: Option<TransactionId> = None;
@@ -160,7 +161,7 @@ fn replay(
         let transaction = outline.transaction(StatementId(index));
         if transaction != open {
             if open.is_some() {
-                program.extend(commit(context));
+                program.push(commit());
             }
             if transaction.is_some() {
                 program.push(begin());
@@ -170,26 +171,27 @@ fn replay(
         let rebound;
         (schema, rebound) =
             replay_unit(unit, StatementId(index), final_schema, context, true, placed, schema)?;
-        match rebound {
+        let statements: Vec<Statement> = match rebound {
             Some(statements) => {
-                program.extend(
-                    statements
-                        .into_iter()
-                        .filter(|statement| placed.is_connection_local(statement)),
-                );
+                statements
+                    .into_iter()
+                    .filter(|statement| placed.is_connection_local(statement))
+                    .collect()
             }
             None => {
-                program.extend(
-                    unit.emitted
-                        .iter()
-                        .filter(|statement| placed.is_connection_local(statement))
-                        .cloned(),
-                );
+                unit.emitted
+                    .iter()
+                    .filter(|statement| placed.is_connection_local(statement))
+                    .cloned()
+                    .collect()
             }
+        };
+        if !statements.is_empty() {
+            program.push(Group::statements(statements));
         }
     }
     if open.is_some() {
-        program.extend(commit(context));
+        program.push(commit());
     }
     Ok(program)
 }
@@ -464,8 +466,9 @@ fn drop_of(
         .then(|| format!("DROP {kind} IF EXISTS {schema}{} CASCADE", quoted(name)))
 }
 
-fn begin() -> Statement {
-    Statement::StartTransaction {
+/// The `BEGIN` opening a replayed transaction.
+fn begin() -> Group {
+    let statement = Statement::StartTransaction {
         modes: Vec::new(),
         begin: true,
         transaction: None,
@@ -473,18 +476,15 @@ fn begin() -> Statement {
         statements: Vec::new(),
         exception: None,
         has_end_keyword: false,
-    }
+    };
+    Group::control(TransactionControl::Begin(BeginMode::Deferred), vec![statement])
 }
 
-/// The `COMMIT` of a replayed transaction, running the deferred constraint
-/// checks it queued first as a translated `COMMIT` does.
-fn commit(context: &TranslationContext<'_>) -> Vec<Statement> {
-    let mut statements: Vec<Statement> = (!context.deferred_triggers().is_empty())
-        .then(crate::impls::translator_impls::deferred_constraint::drain)
-        .into_iter()
-        .collect();
-    statements.push(Statement::Commit { chain: false, end: false, modifier: None });
-    statements
+/// The `COMMIT` of a replayed transaction, before which a managed connection
+/// runs the deferred constraint checks it queued.
+fn commit() -> Group {
+    let statement = Statement::Commit { chain: false, end: false, modifier: None };
+    Group::control(TransactionControl::Commit { chain: false }, vec![statement])
 }
 
 pub(super) fn refusal(detail: String) -> ConnectionError {

@@ -12,7 +12,10 @@ use std::sync::Arc;
 
 use diesel_dynamic_schema::dynamic_value::{DynamicRow, NamedField};
 use parking_lot::Mutex;
-use pg2sqlite::prelude::{ClockError, ManagedConnection, Pg2Sqlite, UtcInstant, UtcProvider};
+use pg2sqlite::prelude::{
+    BeginMode, ClockError, ExecutionError, FreshFiles, ManagedConnection, Pg2Sqlite,
+    Pg2SqliteOptions, UtcInstant, UtcProvider,
+};
 
 use crate::helpers::{
     deployment::{utc_request, utc_script},
@@ -119,4 +122,98 @@ fn a_local_time_rounding_past_midnight_reads_24_00() {
         row,
         ["24:00:00", "2026-11-28 00:00:00"].map(|text| Some(String::from(text)))
     );
+}
+
+/// A provider answering one microsecond later at each sample.
+fn counting() -> Script {
+    Script(Arc::new(Mutex::new((1..=1_000).collect())))
+}
+
+/// The text of every column of every row `sql` answers.
+fn texts(connection: &mut ManagedConnection<Script>, sql: &str) -> Vec<Vec<Option<String>>> {
+    connection
+        .query::<DynamicRow<NamedField<TextCell>>>(sql, &[])
+        .unwrap_or_else(|error| panic!("{error}\n{sql}"))
+        .map(|row| row.expect("read the row").into_iter().map(|field| field.value.0).collect())
+        .collect()
+}
+
+/// Folders that need a parent edge by the time their transaction commits,
+/// two of them created inside one source transaction.
+const FOLDERS: &str = "
+CREATE TABLE resources (id TEXT PRIMARY KEY, kind TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE resource_parents (id TEXT PRIMARY KEY, parent_id TEXT NOT NULL);
+CREATE FUNCTION check_resource_edge() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.kind = 'folder' AND NOT EXISTS (SELECT 1 FROM resource_parents edge WHERE edge.id = NEW.id) THEN
+    RAISE EXCEPTION 'a folder requires a parent edge';
+  END IF;
+  RETURN NULL;
+END
+$$;
+CREATE CONSTRAINT TRIGGER resources_parent_required AFTER INSERT OR UPDATE ON resources
+  DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION check_resource_edge();
+BEGIN;
+INSERT INTO resources (id, kind) VALUES ('f1', 'folder');
+INSERT INTO resources (id, kind) VALUES ('f2', 'folder');
+INSERT INTO resource_parents VALUES ('f1', 'root'), ('f2', 'root');
+COMMIT;
+";
+
+/// A managed initialization runs the source's own transaction as one, so
+/// its rows share the transaction's instant, and every commit on the
+/// connection runs the queued deferred checks, rolling back a transaction
+/// one of them fails.
+#[test]
+fn a_managed_script_runs_its_transactions_and_drains_deferred_checks_at_commit() {
+    let script = Pg2Sqlite::default()
+        .sql(FOLDERS)
+        .expect("parse")
+        .translate(&Pg2SqliteOptions::default())
+        .expect("translate");
+    let mut connection = ManagedConnection::establish(":memory:", counting()).expect("open");
+    script.initialize_managed(&mut connection, FreshFiles::Both).expect("initialize");
+    assert_eq!(
+        texts(&mut connection, "SELECT count(DISTINCT created_at) FROM resources"),
+        [[Some(String::from("1"))]]
+    );
+    connection.begin(BeginMode::Deferred).expect("begin");
+    connection
+        .execute("INSERT INTO resources (id, kind) VALUES ('f3', 'folder')", &[])
+        .expect("the check waits for the commit");
+    let Err(ExecutionError::Database(error)) = connection.commit() else {
+        panic!("a folder without an edge cannot commit");
+    };
+    assert!(error.to_string().contains("a folder requires a parent edge"), "{error}");
+    assert_eq!(
+        texts(&mut connection, "SELECT id FROM resources ORDER BY id"),
+        [[Some(String::from("f1"))], [Some(String::from("f2"))]]
+    );
+}
+
+/// A connection to an existing file replays the `TEMP` rows the source
+/// committed, inside the transaction the source wrote them in.
+#[test]
+fn a_managed_connection_replays_its_committed_temp_rows() {
+    let script = Pg2Sqlite::default()
+        .sql(
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY);
+             BEGIN;
+             CREATE TEMP TABLE drafts (id INTEGER);
+             INSERT INTO drafts VALUES (1);
+             COMMIT;",
+        )
+        .expect("parse")
+        .translate(&Pg2SqliteOptions::default())
+        .expect("translate");
+    let files = tempfile::tempdir().expect("scratch directory");
+    let path = files.path().join("main.db");
+    let path = path.to_str().expect("UTF-8 path");
+    {
+        let mut creating = ManagedConnection::establish(path, counting()).expect("create");
+        script.initialize_managed(&mut creating, FreshFiles::Both).expect("initialize");
+    }
+    let mut reopened = ManagedConnection::establish(path, counting()).expect("reopen");
+    script.connect_managed(&mut reopened).expect("replay the connection objects");
+    assert_eq!(texts(&mut reopened, "SELECT id FROM drafts"), [[Some(String::from("1"))]]);
 }

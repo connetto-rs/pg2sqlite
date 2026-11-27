@@ -39,14 +39,17 @@ pub(crate) mod write_guard;
 /// Prelude module for the library.
 pub mod prelude {
     pub use pg2sqlite_runtime::{
-        TemporalArgument, TemporalError, TemporalValue, extract_scale,
+        BeginMode, ExecutionGroup, TemporalArgument, TemporalError, TemporalValue,
+        TransactionControl, extract_scale,
         write_guard::{GuardRefusal, guard_refusal},
     };
     #[cfg(feature = "managed")]
     pub use pg2sqlite_runtime::{
-        BeginMode, ClockError, ExecutionError, JiffUtcProvider, ManagedConnection, UtcInstant,
-        UtcProvider,
+        ClockError, ExecutionError, JiffUtcProvider, ManagedConnection, UtcInstant, UtcProvider,
     };
+
+    #[cfg(feature = "managed")]
+    pub use crate::script::OpenError;
 
     pub use crate::{
         errors::{Error, RefusalCategory, SqlParseError, TranslationDirection, TranslationRefusal},
@@ -57,7 +60,7 @@ pub mod prelude {
         },
         options::{AttachedTables, Pg2SqliteOptions, TranslationContext},
         pg2sqlite::Pg2Sqlite,
-        script::{FreshFiles, HelperFunction, Script},
+        script::{FreshFiles, Group, HelperFunction, Script},
         sqlstate::{PostgresError, SqlState, postgres_error},
         traits::{
             ArrayRepresentation, CaseFoldFunctions, JsonbFunctions, ReverseTranslator, Schema,

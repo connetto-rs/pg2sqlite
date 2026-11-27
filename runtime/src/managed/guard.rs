@@ -8,8 +8,8 @@ use diesel::{
 };
 use diesel_dynamic_schema::dynamic_value::SqliteAnyValue;
 
-use super::{BeginMode, Controls, ExecutionError, ManagedConnection, ManagedRows, statements};
-use crate::{clock::UtcProvider, transaction::Level};
+use super::{Controls, ExecutionError, ManagedConnection, ManagedRows, statements};
+use crate::{BeginMode, clock::UtcProvider, transaction::Level};
 
 /// An open transaction or savepoint, exclusively borrowing its connection or
 /// its parent guard. Dropping it open undoes what it opened, and poisons the

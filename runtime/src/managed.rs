@@ -17,7 +17,10 @@ mod guard;
 mod readers;
 mod statements;
 
-use alloc::string::String;
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
 
 use diesel::{
     Connection, ConnectionError, QueryResult, RunQueryDsl,
@@ -29,12 +32,13 @@ use diesel_dynamic_schema::dynamic_value::SqliteAnyValue;
 pub use guard::{Guard, Nested, Outermost, Savepoint, Transaction};
 pub use readers::READER_ERROR_PREFIX;
 use readers::{ReaderError, SharedClocks};
-pub use statements::{BeginMode, StatementError};
-use statements::{Control, SourceStatement};
+pub use statements::StatementError;
+use statements::SourceStatement;
 
 use crate::{
     CaseFoldFunctions, HelperFunction, JsonbFunctions, TemporalFunctions,
     clock::{ClockError, UtcProvider},
+    group::{BeginMode, ExecutionGroup, TransactionControl},
     transaction::{Level, TransactionError, TransactionState},
 };
 
@@ -173,7 +177,10 @@ impl<Provider: UtcProvider + Send + 'static> ManagedConnection<Provider> {
                 DatabaseError::AlreadyInTransaction,
             ));
         }
-        Ok(Registration { connection: &mut self.connection })
+        Ok(Registration {
+            connection: &mut self.connection,
+            before_commit: &mut self.transaction.before_commit,
+        })
     }
 
     /// Runs one statement or transaction control, binding `parameters` to
@@ -200,6 +207,50 @@ impl<Provider: UtcProvider + Send + 'static> ManagedConnection<Provider> {
     /// The first statement's failure.
     pub fn execute_batch(&mut self, sql: &str) -> Result<(), ExecutionError> {
         self.batch(sql, Controls::Allowed)
+    }
+
+    /// Runs one logical statement: a group's transaction control as typed,
+    /// or else its statements in order under one statement instant, once
+    /// every one of them is known to be a single statement other than a
+    /// transaction control. A group without statements samples no instant.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecutionError::InvalidStatement`] before any statement runs, or the
+    /// first failure.
+    pub fn execute_group<Statements, Name>(
+        &mut self,
+        group: ExecutionGroup<Statements, Name>,
+    ) -> Result<usize, ExecutionError>
+    where
+        Statements: IntoIterator,
+        Statements::Item: core::fmt::Display,
+        Name: AsRef<str>,
+    {
+        let (control, emitted) = group.into_parts();
+        if let Some(control) = control {
+            return self.control(control.as_deref()).map(|()| 0);
+        }
+        let texts: Vec<String> = emitted.into_iter().map(|statement| statement.to_string()).collect();
+        let plain = texts
+            .iter()
+            .map(|text| {
+                match statements::single(text)? {
+                    SourceStatement::Plain(plain) => Ok(plain),
+                    SourceStatement::Control(_) => {
+                        Err(StatementError::UnsupportedControl(text.clone()))
+                    }
+                }
+            })
+            .collect::<Result<Vec<&str>, StatementError>>()?;
+        if plain.is_empty() {
+            return Ok(0);
+        }
+        let scope = self.open_statement()?;
+        let result = plain.iter().try_fold(0, |changed, text| {
+            diesel::sql_query(*text).execute(&mut self.connection).map(|rows| changed + rows)
+        });
+        self.close_statement(scope, result)
     }
 
     /// Runs a query with `parameters` bound and streams its rows, keeping
@@ -277,7 +328,7 @@ impl<Provider: UtcProvider + Send + 'static> ManagedConnection<Provider> {
     /// [`ExecutionError::InvalidTransactionState`] inside a transaction, or
     /// the failure of `BEGIN`.
     pub fn begin(&mut self, mode: BeginMode) -> Result<(), ExecutionError> {
-        self.control(Control::Begin(mode))
+        self.control(TransactionControl::Begin(mode))
     }
 
     /// Commits the transaction. A failed commit rolls the transaction back,
@@ -288,7 +339,7 @@ impl<Provider: UtcProvider + Send + 'static> ManagedConnection<Provider> {
     /// [`ExecutionError::InvalidTransactionState`] outside a transaction, or
     /// the failure of `COMMIT`.
     pub fn commit(&mut self) -> Result<(), ExecutionError> {
-        self.control(Control::Commit)
+        self.control(TransactionControl::Commit { chain: false })
     }
 
     /// Rolls the transaction back.
@@ -298,7 +349,7 @@ impl<Provider: UtcProvider + Send + 'static> ManagedConnection<Provider> {
     /// [`ExecutionError::InvalidTransactionState`] outside a transaction, or
     /// the failure of `ROLLBACK`.
     pub fn rollback(&mut self) -> Result<(), ExecutionError> {
-        self.control(Control::Rollback)
+        self.control(TransactionControl::Rollback { chain: false })
     }
 
     /// Opens a savepoint named `name`. Outside a transaction it opens the
@@ -308,7 +359,7 @@ impl<Provider: UtcProvider + Send + 'static> ManagedConnection<Provider> {
     ///
     /// The failure of `SAVEPOINT`.
     pub fn savepoint(&mut self, name: &str) -> Result<(), ExecutionError> {
-        self.control(Control::Savepoint(name))
+        self.control(TransactionControl::Savepoint(name))
     }
 
     /// Releases the latest savepoint named `name` and every one opened after
@@ -318,7 +369,7 @@ impl<Provider: UtcProvider + Send + 'static> ManagedConnection<Provider> {
     ///
     /// [`ExecutionError::MissingSavepoint`] when none is open under that name.
     pub fn release(&mut self, name: &str) -> Result<(), ExecutionError> {
-        self.control(Control::Release(name))
+        self.control(TransactionControl::Release(name))
     }
 
     /// Rolls back to the latest savepoint named `name`, which stays open.
@@ -327,7 +378,7 @@ impl<Provider: UtcProvider + Send + 'static> ManagedConnection<Provider> {
     ///
     /// [`ExecutionError::MissingSavepoint`] when none is open under that name.
     pub fn rollback_to(&mut self, name: &str) -> Result<(), ExecutionError> {
-        self.control(Control::RollbackTo(name))
+        self.control(TransactionControl::RollbackTo(name))
     }
 
     /// Opens a transaction in `mode` that rolls back unless committed.
@@ -372,19 +423,30 @@ impl<Provider: UtcProvider + Send + 'static> ManagedConnection<Provider> {
         }
     }
 
-    fn control(&mut self, control: Control<&str>) -> Result<(), ExecutionError> {
+    /// Runs `control`, and after a chained commit or rollback succeeds opens
+    /// the next transaction under its own instant.
+    fn control(&mut self, control: TransactionControl<&str>) -> Result<(), ExecutionError> {
+        let chain = matches!(
+            control,
+            TransactionControl::Commit { chain: true } | TransactionControl::Rollback { chain: true }
+        );
         self.transition(|transaction, connection| {
             match control {
-                Control::Begin(mode) => transaction.begin(connection, mode.statement()),
-                Control::Commit => transaction.commit(connection),
-                Control::Rollback => transaction.rollback(connection),
-                Control::Savepoint(name) => transaction.savepoint(connection, name).map(drop),
-                Control::Release(name) => transaction.release(connection, Level::Named(name)),
-                Control::RollbackTo(name) => {
+                TransactionControl::Begin(mode) => transaction.begin(connection, mode.statement()),
+                TransactionControl::Commit { .. } => transaction.commit(connection),
+                TransactionControl::Rollback { .. } => transaction.rollback(connection),
+                TransactionControl::Savepoint(name) => {
+                    transaction.savepoint(connection, name).map(drop)
+                }
+                TransactionControl::Release(name) => {
+                    transaction.release(connection, Level::Named(name))
+                }
+                TransactionControl::RollbackTo(name) => {
                     transaction.rollback_to(connection, Level::Named(name))
                 }
             }
-        })
+        })?;
+        if chain { self.begin(BeginMode::Deferred) } else { Ok(()) }
     }
 
     /// Runs a transaction control under its own statement instant, then
@@ -563,6 +625,7 @@ where
 /// The registrations a connection takes while no transaction is open.
 pub struct Registration<'connection> {
     connection: &'connection mut SqliteConnection,
+    before_commit: &'connection mut Vec<String>,
 }
 
 impl core::fmt::Debug for Registration<'_> {
@@ -612,6 +675,31 @@ impl Registration<'_> {
     ) -> Result<(), ExecutionError> {
         helper.register(self.connection).map_err(ExecutionError::Database)
     }
+
+    /// Sets the statements run before every commit that ends a transaction,
+    /// including the release of an outermost savepoint, under the commit's
+    /// statement instant. A failure among them rolls the transaction back
+    /// and fails the commit, as a deferred check failing at commit does in
+    /// PostgreSQL.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecutionError::InvalidStatement`] unless each is exactly one
+    /// statement other than a transaction control, leaving the earlier
+    /// program in place.
+    pub fn before_commit<Statement: core::fmt::Display>(
+        &mut self,
+        program: impl IntoIterator<Item = Statement>,
+    ) -> Result<(), ExecutionError> {
+        let program: Vec<String> = program.into_iter().map(|statement| statement.to_string()).collect();
+        for text in &program {
+            if let SourceStatement::Control(_) = statements::single(text)? {
+                return Err(StatementError::UnsupportedControl(text.clone()).into());
+            }
+        }
+        *self.before_commit = program;
+        Ok(())
+    }
 }
 
 /// `text` as a query with each of `parameters` bound in order.
@@ -628,7 +716,8 @@ fn bound<'query>(
 mod tests {
     use alloc::vec::Vec;
 
-    use super::{ManagedConnection, statements::BeginMode};
+    use super::ManagedConnection;
+    use crate::group::BeginMode;
     use crate::clock::{ClockError, UtcInstant, UtcProvider};
 
     struct Steps(Vec<i64>);

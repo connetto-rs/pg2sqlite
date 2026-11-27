@@ -14,55 +14,7 @@ use sqlparser::{
     tokenizer::{Token, TokenWithSpan, Tokenizer},
 };
 
-/// The locking mode a `BEGIN` opens its transaction in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum BeginMode {
-    /// `BEGIN DEFERRED`, which takes no lock until the first read or write.
-    #[default]
-    Deferred,
-    /// `BEGIN IMMEDIATE`, which takes the write lock at once.
-    Immediate,
-    /// `BEGIN EXCLUSIVE`, which takes the write lock and refuses readers in
-    /// other journal modes than WAL.
-    Exclusive,
-}
-
-impl BeginMode {
-    /// The statement opening a transaction in this mode.
-    pub(crate) const fn statement(self) -> &'static str {
-        match self {
-            Self::Deferred => "BEGIN DEFERRED",
-            Self::Immediate => "BEGIN IMMEDIATE",
-            Self::Exclusive => "BEGIN EXCLUSIVE",
-        }
-    }
-}
-
-/// A transaction control, which the connection runs through its transaction
-/// manager instead of handing its text to SQLite.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Control<Name = String> {
-    Begin(BeginMode),
-    Commit,
-    Rollback,
-    Savepoint(Name),
-    Release(Name),
-    RollbackTo(Name),
-}
-
-impl Control {
-    /// The control naming its savepoint by reference.
-    pub(crate) fn as_deref(&self) -> Control<&str> {
-        match self {
-            Self::Begin(mode) => Control::Begin(*mode),
-            Self::Commit => Control::Commit,
-            Self::Rollback => Control::Rollback,
-            Self::Savepoint(name) => Control::Savepoint(name),
-            Self::Release(name) => Control::Release(name),
-            Self::RollbackTo(name) => Control::RollbackTo(name),
-        }
-    }
-}
+use crate::group::{BeginMode, TransactionControl};
 
 /// One top-level statement of a batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,7 +22,7 @@ pub(crate) enum SourceStatement<'sql> {
     /// A statement SQLite runs as written.
     Plain(&'sql str),
     /// A transaction control.
-    Control(Control),
+    Control(TransactionControl),
 }
 
 /// The way SQLite text fails to split into statements.
@@ -214,7 +166,7 @@ fn statement<'sql>(
     let unsupported = || StatementError::UnsupportedControl(String::from(text));
     let control = match parsed {
         Statement::StartTransaction { modes, modifier, .. } if modes.is_empty() => {
-            Control::Begin(match modifier {
+            TransactionControl::Begin(match modifier {
                 None | Some(TransactionModifier::Deferred) => BeginMode::Deferred,
                 Some(TransactionModifier::Immediate) => BeginMode::Immediate,
                 Some(TransactionModifier::Exclusive) => BeginMode::Exclusive,
@@ -223,13 +175,17 @@ fn statement<'sql>(
                 }
             })
         }
-        Statement::Commit { chain: false, modifier: None, .. } => Control::Commit,
-        Statement::Rollback { chain: false, savepoint: None } => Control::Rollback,
-        Statement::Rollback { chain: false, savepoint: Some(name) } => {
-            Control::RollbackTo(name.value)
+        Statement::Commit { chain: false, modifier: None, .. } => {
+            TransactionControl::Commit { chain: false }
         }
-        Statement::Savepoint { name } => Control::Savepoint(name.value),
-        Statement::ReleaseSavepoint { name } => Control::Release(name.value),
+        Statement::Rollback { chain: false, savepoint: None } => {
+            TransactionControl::Rollback { chain: false }
+        }
+        Statement::Rollback { chain: false, savepoint: Some(name) } => {
+            TransactionControl::RollbackTo(name.value)
+        }
+        Statement::Savepoint { name } => TransactionControl::Savepoint(name.value),
+        Statement::ReleaseSavepoint { name } => TransactionControl::Release(name.value),
         _ => return Err(unsupported()),
     };
     Ok(SourceStatement::Control(control))
@@ -268,7 +224,7 @@ impl<'sql> Offsets<'sql> {
 mod tests {
     use alloc::{string::ToString, vec};
 
-    use super::{BeginMode, Control, SourceStatement, StatementError, single, split};
+    use super::{BeginMode, SourceStatement, StatementError, TransactionControl, single, split};
 
     fn plain(text: &str) -> SourceStatement<'_> {
         SourceStatement::Plain(text)
@@ -300,13 +256,13 @@ mod tests {
         assert_eq!(
             split("/* x */ BEGIN IMMEDIATE; savepoint \"Outer\"; RELEASE Outer; ROLLBACK TO SAVEPOINT Outer; ROLLBACK; END TRANSACTION; COMMIT").unwrap(),
             vec![
-                SourceStatement::Control(Control::Begin(BeginMode::Immediate)),
-                SourceStatement::Control(Control::Savepoint("Outer".to_string())),
-                SourceStatement::Control(Control::Release("Outer".to_string())),
-                SourceStatement::Control(Control::RollbackTo("Outer".to_string())),
-                SourceStatement::Control(Control::Rollback),
-                SourceStatement::Control(Control::Commit),
-                SourceStatement::Control(Control::Commit),
+                SourceStatement::Control(TransactionControl::Begin(BeginMode::Immediate)),
+                SourceStatement::Control(TransactionControl::Savepoint("Outer".to_string())),
+                SourceStatement::Control(TransactionControl::Release("Outer".to_string())),
+                SourceStatement::Control(TransactionControl::RollbackTo("Outer".to_string())),
+                SourceStatement::Control(TransactionControl::Rollback { chain: false }),
+                SourceStatement::Control(TransactionControl::Commit { chain: false }),
+                SourceStatement::Control(TransactionControl::Commit { chain: false }),
             ],
         );
         assert_eq!(split("\"begin\"").unwrap(), vec![plain("\"begin\"")]);
