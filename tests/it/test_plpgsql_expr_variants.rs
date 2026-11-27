@@ -130,7 +130,7 @@ fn plpgsql_at_time_zone_is_transformed() {
         "AT TIME ZONE has no SQLite equivalent and must not survive: {sql_str}"
     );
     assert!(
-        sql_str.contains("datetime(substr(strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'), 1, 19)) || rtrim(rtrim(replace(substr(strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'), 20, 7), '+00:00', ''), '0'), '.'))"),
+        sql_str.contains("datetime(substr(pg2sqlite_transaction_timestamp(), 1, 19)) || rtrim(rtrim(replace(substr(pg2sqlite_transaction_timestamp(), 20, 7), '+00:00', ''), '0'), '.'))"),
         "NOW() AT TIME ZONE 'UTC' should read the fraction into local text: {sql_str}"
     );
     assert!(

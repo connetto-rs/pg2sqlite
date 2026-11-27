@@ -122,7 +122,7 @@ fn string_agg_with_order_by_preserves_order_clause() {
 }
 
 /// string_agg(NOW()::text, ',') — the NOW() inside the aggregate arg must be
-/// translated to strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now') in the output,
+/// translated to `pg2sqlite_transaction_timestamp()` in the output,
 /// not left as NOW().
 #[test]
 fn string_agg_translates_nested_now_in_args() {
@@ -142,8 +142,8 @@ fn string_agg_translates_nested_now_in_args() {
         .clone();
     assert!(out.contains("group_concat"), "Should rename to group_concat: {out}");
     assert!(
-        out.to_lowercase().contains("strftime("),
-        "NOW() inside arg must translate to strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'): {out}"
+        out.contains("pg2sqlite_transaction_timestamp()"),
+        "NOW() inside arg must translate to pg2sqlite_transaction_timestamp(): {out}"
     );
     assert!(
         !out.to_uppercase().contains("NOW()"),

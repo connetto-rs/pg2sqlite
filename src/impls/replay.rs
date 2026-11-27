@@ -22,10 +22,12 @@ use crate::{
 /// The calls that answer a different value each time they run.
 ///
 /// Sorted, and searched rather than matched. A clock function is absent on
-/// purpose: `now()` and `current_timestamp` are fixed for the whole statement
-/// in both engines, so naming one twice reads the same value twice.
-/// `clock_timestamp` and `timeofday` are the two PostgreSQL spellings that
-/// are not, and the sequence functions move a counter on every call.
+/// purpose: `now()`, `current_timestamp` and `statement_timestamp()` are
+/// fixed for the whole statement in both engines, so naming one twice reads
+/// the same value twice. `clock_timestamp` and `timeofday` are the two
+/// PostgreSQL spellings that are not, `pg2sqlite_clock_timestamp` is the
+/// reader the first becomes, and the sequence functions move a counter on
+/// every call.
 const VOLATILE: &[&str] = &[
     "clock_timestamp",
     "currval",
@@ -33,13 +35,13 @@ const VOLATILE: &[&str] = &[
     "gen_random_uuid",
     "lastval",
     "nextval",
+    "pg2sqlite_clock_timestamp",
     "pg_backend_pid",
     "random",
     "random_bytes",
     "random_normal",
     "randomblob",
     "setval",
-    "statement_timestamp",
     "timeofday",
     "txid_current",
     "uuid_generate_v1",

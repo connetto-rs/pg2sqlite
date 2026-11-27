@@ -26,7 +26,7 @@ CREATE TABLE t (
 
 /// An expression inside a window-frame `PRECEDING` bound must be translated.
 /// Here `EXTRACT(EPOCH FROM NOW())` is a PG-specific expression; after
-/// translation `NOW()` becomes `strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')`
+/// translation `NOW()` becomes `pg2sqlite_transaction_timestamp()`
 /// so the output must not contain the raw PG form.
 #[test]
 fn window_frame_preceding_expr_is_translated() {
@@ -41,8 +41,8 @@ fn window_frame_preceding_expr_is_translated() {
     let out = translate_ok(&sql);
     assert!(!out.contains("now()"), "now() must be translated inside PRECEDING bound: {out}");
     assert!(
-        out.contains("strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"),
-        "Expected strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now') in PRECEDING bound: {out}"
+        out.contains("pg2sqlite_transaction_timestamp()"),
+        "Expected pg2sqlite_transaction_timestamp() in PRECEDING bound: {out}"
     );
     exec_translated(&sql);
 }
@@ -61,8 +61,8 @@ fn window_frame_following_expr_is_translated() {
     let out = translate_ok(&sql);
     assert!(!out.contains("now()"), "now() must be translated inside FOLLOWING bound: {out}");
     assert!(
-        out.contains("strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"),
-        "Expected strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now') in FOLLOWING bound: {out}"
+        out.contains("pg2sqlite_transaction_timestamp()"),
+        "Expected pg2sqlite_transaction_timestamp() in FOLLOWING bound: {out}"
     );
     exec_translated(&sql);
 }
@@ -86,7 +86,7 @@ fn string_agg_order_by_clause_translates_date_trunc() {
 }
 
 /// `now()` inside the `ORDER BY` clause of `string_agg` must become
-/// `strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')`.
+/// `pg2sqlite_transaction_timestamp()`.
 #[test]
 fn string_agg_order_by_clause_translates_now() {
     let sql = format!(
@@ -97,8 +97,8 @@ fn string_agg_order_by_clause_translates_now() {
     assert!(out.contains("group_concat"), "string_agg should rename to group_concat: {out}");
     assert!(!out.contains("now()"), "now() inside ORDER BY clause must be translated: {out}");
     assert!(
-        out.contains("strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"),
-        "Expected strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now') in the ORDER BY clause: {out}"
+        out.contains("pg2sqlite_transaction_timestamp()"),
+        "Expected pg2sqlite_transaction_timestamp() in the ORDER BY clause: {out}"
     );
     exec_translated(&sql);
 }

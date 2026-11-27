@@ -201,8 +201,12 @@ enum FunctionTranslation {
     /// `isfinite`, whose operand is infinite only as the stored text
     /// `infinity` or `-infinity`.
     IsFinite,
-    /// The local clock of now, answered from the request's zone.
+    /// The local clock of the transaction's start, answered from the
+    /// request's zone.
     LocalClock { which: crate::impls::zone_clock::LocalClock },
+    /// `CURRENT_TIMESTAMP`, the transaction's start rounded to the precision
+    /// it takes in parentheses.
+    CurrentTimestamp,
     /// `lower` and `upper`, which fold by the text's collation.
     CaseFold(case_fold::Case),
 }
@@ -673,22 +677,10 @@ fn translate_catalog_function(
         FunctionTranslation::Rename(options.get_uuid_function_name().to_string())
     }
     "uuidv7" => uuid_v7_translation(options),
-    "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp" => {
-        canonical_now_translation()
-    }
-    "current_timestamp" => {
-        match args {
-            FunctionArguments::List(list) if !list.args.is_empty() => {
-                FunctionTranslation::Unsupported(
-                    "CURRENT_TIMESTAMP with a precision argument rounds the instant to that many \
-                     digits, and SQLite's clock has no such rounding. Write CURRENT_TIMESTAMP \
-                     without a precision."
-                        .to_string(),
-                )
-            }
-            _ => canonical_now_translation(),
-        }
-    }
+    "now" | "transaction_timestamp" => clock_reader(pg2sqlite_runtime::TRANSACTION_TIMESTAMP),
+    "statement_timestamp" => clock_reader(pg2sqlite_runtime::STATEMENT_TIMESTAMP),
+    "clock_timestamp" => clock_reader(pg2sqlite_runtime::CLOCK_TIMESTAMP),
+    "current_timestamp" => FunctionTranslation::CurrentTimestamp,
     "ts_rank" | "ts_rank_cd" => FunctionTranslation::Unsupported(
         "ts_rank/ts_rank_cd are not directly translatable to SQLite. \
          FTS5 provides bm25() for ranking, but it requires a different query structure. \
@@ -1139,16 +1131,41 @@ fn classify_statistical_aggregate(name: &str, options: &Pg2SqliteOptions) -> Fun
     ))
 }
 
-/// What `now()` and its aliases become: the current instant as the replica's
-/// `timestamptz` text.
-fn canonical_now_translation() -> FunctionTranslation {
-    FunctionTranslation::WithArgs {
-        name: "strftime".to_string(),
-        args: vec![
-            string_literal(crate::impls::datetime_helpers::TIMESTAMPTZ_FORMAT),
-            string_literal("now"),
-        ],
-    }
+/// The call of the managed connection's clock reader `name`.
+fn clock_reader(name: &str) -> FunctionTranslation {
+    FunctionTranslation::WithArgs { name: name.to_string(), args: Vec::new() }
+}
+
+/// The fractional digits the clock function `name` rounds to, from the one
+/// unsigned integer constant `args` holds in parentheses, or `None` when it
+/// keeps every microsecond. PostgreSQL reduces a precision above six to six,
+/// which keeps them all.
+///
+/// # Errors
+///
+/// Refuses every other argument form, a syntax error in PostgreSQL.
+fn clock_precision(name: &str, args: &FunctionArguments) -> Result<Option<u32>, crate::errors::Error> {
+    let precision = match args {
+        FunctionArguments::None => return Ok(None),
+        FunctionArguments::List(_) => {
+            match function_argument_exprs(args).as_slice() {
+                [Expr::Value(ValueWithSpan { value: Value::Number(digits, ..), .. })]
+                    if digits.bytes().all(|byte| byte.is_ascii_digit()) =>
+                {
+                    digits.parse::<i32>().ok()
+                }
+                _ => None,
+            }
+        }
+        FunctionArguments::Subquery(_) => None,
+    };
+    let precision = precision.ok_or_else(|| {
+        crate::errors::Error::forward_refusal(format!(
+            "PostgreSQL answers a syntax error for this argument form of {name}, which takes \
+             no argument or one integer-constant precision in parentheses."
+        ))
+    })?;
+    Ok(u32::try_from(precision).ok().filter(|precision| *precision < 6))
 }
 
 /// What `uuidv7()` becomes.
@@ -2765,38 +2782,29 @@ impl crate::traits::translator::TranslatorWithContext for Function {
             }
             FunctionTranslation::LocalClock { which } => {
                 reject_over_on_scalar(&func)?;
-                // The clock holds whole seconds, so a precision narrows
-                // nothing.
                 let name = which.name();
-                let precision_form = match &func.args {
-                    FunctionArguments::None => None,
-                    FunctionArguments::List(_) => {
-                        Some(matches!(
-                            function_argument_exprs(&func.args).as_slice(),
-                            [
-                                Expr::Value(ValueWithSpan {
-                                    value: Value::Number(digits, ..),
-                                    ..
-                                })
-                            ] if !digits.contains(['.', 'e', 'E'])
-                        ))
-                    }
-                    FunctionArguments::Subquery(_) => Some(false),
-                };
-                let invalid = match precision_form {
-                    None => false,
-                    Some(precision) => {
-                        which == crate::impls::zone_clock::LocalClock::Date || !precision
-                    }
-                };
-                if invalid {
+                if which == crate::impls::zone_clock::LocalClock::Date
+                    && !matches!(func.args, FunctionArguments::None)
+                {
                     return Err(crate::errors::Error::forward_refusal(format!(
-                        "PostgreSQL answers a syntax error for this argument form of {name}, \
-                         which takes no argument or one integer-constant precision in \
-                         parentheses."
+                        "PostgreSQL answers a syntax error for {name} with an argument list, \
+                         since it takes no precision."
                     )));
                 }
-                crate::impls::zone_clock::local_clock_clock(which, schema, options)
+                let precision = clock_precision(name, &func.args)?;
+                crate::impls::zone_clock::local_clock_clock(which, precision, schema, options)
+            }
+            FunctionTranslation::CurrentTimestamp => {
+                reject_over_on_scalar(&func)?;
+                let instant = crate::impls::zone_clock::transaction_instant();
+                Ok(match clock_precision("current_timestamp", &func.args)? {
+                    Some(precision) => crate::impls::datetime_helpers::round_text(
+                        pg2sqlite_runtime::TypmodRounding::TimestampTz,
+                        instant,
+                        precision,
+                    ),
+                    None => instant,
+                })
             }
             FunctionTranslation::ToLowerHex => {
                 let exprs = extract_exactly(&func.args, 2, "encode")?;

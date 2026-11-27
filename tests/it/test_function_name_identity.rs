@@ -115,7 +115,7 @@ fn the_catalogue_prefix_still_names_the_builtin() {
         emitted,
         [
             "PRAGMA case_sensitive_like = 1",
-            "SELECT strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now') AS v"
+            "SELECT pg2sqlite_transaction_timestamp() AS v"
         ]
     );
 }
@@ -128,7 +128,7 @@ fn a_bare_builtin_is_untouched_by_the_new_rule() {
         emitted,
         [
             "PRAGMA case_sensitive_like = 1",
-            "SELECT strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now') AS v"
+            "SELECT pg2sqlite_transaction_timestamp() AS v"
         ]
     );
 }

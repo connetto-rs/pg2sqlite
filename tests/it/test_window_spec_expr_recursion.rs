@@ -36,7 +36,7 @@ fn window_partition_by_date_trunc_is_translated() {
 }
 
 /// NOW() inside ORDER BY of an inline window spec must become
-/// strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now').
+/// `pg2sqlite_transaction_timestamp()`.
 #[test]
 fn window_order_by_now_is_translated() {
     let sql = format!(
@@ -45,8 +45,8 @@ fn window_order_by_now_is_translated() {
     );
     let out = translate_ok(&sql);
     assert!(
-        out.to_lowercase().contains("strftime("),
-        "NOW() in window ORDER BY must become strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'): {out}"
+        out.contains("pg2sqlite_transaction_timestamp()"),
+        "NOW() in window ORDER BY must become pg2sqlite_transaction_timestamp(): {out}"
     );
     assert!(
         !out.to_uppercase().contains("NOW()"),

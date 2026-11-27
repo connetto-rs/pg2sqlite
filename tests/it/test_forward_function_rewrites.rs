@@ -12,23 +12,23 @@ fn default_opts() -> Pg2SqliteOptions {
 }
 
 #[test]
-fn localtimestamp_reads_sqlites_utc_clock() {
+fn localtimestamp_reads_the_transaction_clock() {
     let sql = helpers::deployment::utc_script("SELECT localtimestamp");
     let result = translate_sql(&sql, &helpers::deployment::utc_request()).unwrap();
     assert!(
-        result.to_lowercase().contains("datetime('now')"),
-        "localtimestamp in UTC should become datetime('now'): {result}"
+        result.contains("pg2sqlite_transaction_timestamp()"),
+        "localtimestamp in UTC should read pg2sqlite_transaction_timestamp(): {result}"
     );
     sqlite_accepts(&result);
 }
 
 #[test]
-fn localtime_reads_sqlites_utc_clock() {
+fn localtime_reads_the_transaction_clock() {
     let sql = helpers::deployment::utc_script("SELECT localtime");
     let result = translate_sql(&sql, &helpers::deployment::utc_request()).unwrap();
     assert!(
-        result.to_lowercase().contains("time('now')"),
-        "localtime in UTC should become time('now'): {result}"
+        result.contains("pg2sqlite_transaction_timestamp()"),
+        "localtime in UTC should read pg2sqlite_transaction_timestamp(): {result}"
     );
     sqlite_accepts(&result);
 }

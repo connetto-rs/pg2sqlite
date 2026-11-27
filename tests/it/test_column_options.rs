@@ -193,15 +193,15 @@ fn fk_to_non_rls_table_unchanged() {
 }
 
 /// PostgreSQL's `now()` function returns the current timestamp.
-/// SQLite's equivalent is `strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')`.
+/// SQLite's equivalent is `pg2sqlite_transaction_timestamp()`.
 /// A column with `DEFAULT now()` must survive translation and work at runtime.
 #[test]
 fn default_now_translates_to_canonical_now() {
     let output =
         translate("CREATE TABLE now_test (id INTEGER PRIMARY KEY, created_at TEXT DEFAULT now());");
     assert!(
-        output.contains("strftime("),
-        "now() must become strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'), got: {output}"
+        output.contains("pg2sqlite_transaction_timestamp()"),
+        "now() must become pg2sqlite_transaction_timestamp(), got: {output}"
     );
     assert!(
         !output.to_lowercase().contains("now()"),
@@ -282,9 +282,12 @@ fn every_default_shape_produces_runnable_ddl() {
     assert!(ddl.contains("signed INTEGER DEFAULT -1"), "{ddl}");
     assert!(ddl.contains("arithmetic INTEGER DEFAULT (1 + 2)"), "{ddl}");
     assert!(ddl.contains("casted TEXT DEFAULT (CAST('hello' AS TEXT))"), "{ddl}");
-    assert!(ddl.contains("keyword TEXT DEFAULT CURRENT_DATE"), "{ddl}");
     assert!(
-        ddl.contains("call TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'))"),
+        ddl.contains("keyword TEXT DEFAULT (date(datetime(substr(pg2sqlite_transaction_timestamp()"),
+        "{ddl}"
+    );
+    assert!(
+        ddl.contains("call TEXT DEFAULT (pg2sqlite_transaction_timestamp())"),
         "{ddl}"
     );
 }

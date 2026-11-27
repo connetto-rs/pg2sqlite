@@ -105,8 +105,8 @@ fn to_char_args_swapped_format_before_column() {
 
 #[test]
 fn to_char_now_also_translated() {
-    // NOW() inside to_char should also be translated to strftime('%Y-%m-%d
-    // %H:%M:%f000+00:00', 'now')
+    // NOW() inside to_char should also be translated to
+    // pg2sqlite_transaction_timestamp()
     let sql = helpers::deployment::utc_script("SELECT to_char(NOW(), 'YYYY-MM-DD');");
     let options = helpers::deployment::utc_request();
     let output = helpers::translate_sql(&sql, &options).unwrap();
@@ -115,8 +115,8 @@ fn to_char_now_also_translated() {
         "to_char(NOW(), ...) should produce strftime, got: {output}"
     );
     assert!(
-        output.contains("strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"),
-        "NOW() inside to_char should become strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'), got: {output}"
+        output.contains("pg2sqlite_transaction_timestamp()"),
+        "NOW() inside to_char should become pg2sqlite_transaction_timestamp(), got: {output}"
     );
     helpers::prepared_user_select(&sql, &options);
 }

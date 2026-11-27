@@ -55,8 +55,8 @@ fn forward_update_translates_assignment_expressions() {
     ";
     let output = translate(sql);
     assert!(
-        output.contains("strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"),
-        "Expected now() to translate to strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'): {output}"
+        output.contains("pg2sqlite_transaction_timestamp()"),
+        "Expected now() to translate to pg2sqlite_transaction_timestamp(): {output}"
     );
     execute_all(&output);
 }
@@ -143,7 +143,7 @@ fn forward_update_limit_translates_expressions() {
 
     assert!(
         output.contains("LIMIT")
-            && output.contains("strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"),
+            && output.contains("pg2sqlite_transaction_timestamp()"),
         "Expected translated LIMIT expression in UPDATE: {output}"
     );
 

@@ -342,7 +342,7 @@ pub(crate) fn refuse_clock_check(source: &Expr, condition: &Expr) -> Result<(), 
     )))
 }
 
-/// Whether the translated `expr` reads SQLite's clock.
+/// Whether the translated `expr` reads a clock.
 fn reads_clock(expr: &Expr) -> bool {
     visit_expressions(expr, |node| {
         match node {
@@ -353,9 +353,17 @@ fn reads_clock(expr: &Expr) -> bool {
     .is_break()
 }
 
-/// Whether `function` is a date function given `'now'`, which SQLite matches
-/// without case.
+/// Whether `function` is a clock reader of the managed connection, or a date
+/// function given `'now'`, which SQLite matches without case.
 fn is_clock_call(function: &Function) -> bool {
+    const READERS: [&str; 3] = [
+        pg2sqlite_runtime::TRANSACTION_TIMESTAMP,
+        pg2sqlite_runtime::STATEMENT_TIMESTAMP,
+        pg2sqlite_runtime::CLOCK_TIMESTAMP,
+    ];
+    if READERS.iter().any(|name| is_function_named(function, name)) {
+        return true;
+    }
     if !DATE_FUNCTIONS.iter().any(|name| is_function_named(function, name)) {
         return false;
     }

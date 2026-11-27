@@ -3483,7 +3483,11 @@ fn generate_monitoring_trigger_statement(
                     None,
                 ),
                 string_literal(SELECT_POLICY),
-                simple_function_expr("datetime", vec![string_literal("now")], None),
+                simple_function_expr(
+                    "datetime",
+                    vec![simple_function_expr(pg2sqlite_runtime::CLOCK_TIMESTAMP, Vec::new(), None)],
+                    None,
+                ),
                 string_literal(severity(strict_mode)),
                 string_literal(&monitor_detail(operation)),
             ]),
