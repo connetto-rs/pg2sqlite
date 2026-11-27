@@ -7,7 +7,9 @@
 //! answers are PostgreSQL 18's for the same script and statements.
 
 use diesel::{prelude::*, sql_types::Text};
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, WrapperKind, postgres_error};
+use pg2sqlite::prelude::{
+    ArrayRepresentation, Pg2Sqlite, Pg2SqliteOptions, WrapperKind, postgres_error,
+};
 use sqlstate::pg;
 
 use crate::helpers::{self, deployment::deployment};
@@ -61,6 +63,17 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// `resources` through a view over a view `app` holds nothing on,
+    /// checking both conditions.
+    outer_moves (resource) {
+        /// Primary key of the resource.
+        resource -> Integer,
+        /// The resource holding this one.
+        parent_id -> Integer,
+    }
+}
+
 /// The schema `app` reaches `resources` and `owners` through, owned by
 /// `mover`, with `views` after it.
 fn script(views: &str) -> String {
@@ -98,6 +111,7 @@ fn acting() -> Pg2SqliteOptions {
         .with_rls_exemption_function("server_delivery")
         .with_deployment(deployment(["app"], []))
         .with_acting_role("app")
+        .with_array_representation(ArrayRepresentation::Json)
 }
 
 /// Applies `views` over the schema on `app`'s replica, then lands `seed`
@@ -168,6 +182,41 @@ fn kind(connection: &mut SqliteConnection, name: &str) -> Option<String> {
         .expect("the catalog reads")
         .map(|kind| kind.kind)
 }
+
+#[derive(QueryableByName, Debug, PartialEq, Eq)]
+struct Column {
+    #[diesel(sql_type = Text)]
+    name: String,
+    #[diesel(sql_type = Text)]
+    declared: String,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    pk: i32,
+}
+
+/// The columns of table `name` on the replica, with their declared types and
+/// their positions in its primary key.
+fn columns(connection: &mut SqliteConnection, name: &str) -> Vec<Column> {
+    diesel::sql_query("SELECT name, type AS declared, pk FROM pragma_table_info(?) ORDER BY cid")
+        .bind::<Text, _>(name)
+        .load::<Column>(connection)
+        .expect("the columns read")
+}
+
+/// The names of the columns keying table `name` on the replica, in key order.
+fn key_of(connection: &mut SqliteConnection, name: &str) -> Vec<String> {
+    let mut keyed: Vec<Column> =
+        columns(connection, name).into_iter().filter(|column| column.pk > 0).collect();
+    keyed.sort_by_key(|column| column.pk);
+    keyed.into_iter().map(|column| column.name).collect()
+}
+
+/// Applies `views` over the schema on `app`'s replica, delivering nothing.
+fn applied(views: &str) -> SqliteConnection {
+    replica(views, |_| {})
+}
+
+/// Statements ending one epoch and starting the next.
+const NEXT_EPOCH: &str = "CREATE TABLE scratch (id INTEGER PRIMARY KEY); DROP TABLE scratch; GRANT SELECT ON owners TO app;";
 
 #[test]
 fn a_view_reaching_a_table_off_the_replica_holds_the_rows_the_server_delivers() {
@@ -401,4 +450,299 @@ fn the_manifest_names_the_view_held_as_a_table() {
     let columns: Vec<&str> = entry.columns.iter().map(|column| column.name.as_str()).collect();
     assert_eq!(columns, ["resource", "parent_id"]);
     assert!(manifest.iter().all(|entry| entry.logical != "resources"));
+}
+
+#[test]
+fn a_view_passing_no_key_through_has_no_manifest() {
+    let refused = Pg2Sqlite::default()
+        .sql(&script(
+            "CREATE VIEW parents AS SELECT parent_id FROM resources;
+             ALTER VIEW parents OWNER TO mover;
+             GRANT SELECT ON parents TO app;",
+        ))
+        .expect("parse")
+        .translation_manifest(&acting())
+        .expect_err("the manifest is refused")
+        .to_string();
+    assert!(refused.contains("does not pass through column resources.id"), "{refused}");
+}
+
+const NESTED: &str = "CREATE VIEW inner_moves AS
+       SELECT id AS resource, parent_id FROM resources WHERE parent_id > 0;
+     ALTER VIEW inner_moves OWNER TO mover;
+     CREATE VIEW outer_moves WITH (check_option = cascaded) AS
+       SELECT resource, parent_id FROM inner_moves WHERE resource > 0;
+     ALTER VIEW outer_moves OWNER TO mover;
+     GRANT SELECT, INSERT ON outer_moves TO app;";
+
+#[test]
+fn a_cascaded_check_option_checks_the_view_it_reads_too() {
+    let mut connection = applied(NESTED);
+    assert_eq!(kind(&mut connection, "inner_moves"), None);
+    assert_eq!(key_of(&mut connection, "outer_moves"), ["resource"]);
+    for (resource, parent_id) in [(5, 0), (0, 1)] {
+        let inserted = diesel::insert_into(outer_moves::table)
+            .values((outer_moves::resource.eq(resource), outer_moves::parent_id.eq(parent_id)))
+            .execute(&mut connection);
+        assert_eq!(refusal(inserted), pg::WITH_CHECK_OPTION_VIOLATION, "({resource}, {parent_id})");
+    }
+    diesel::insert_into(outer_moves::table)
+        .values((outer_moves::resource.eq(5), outer_moves::parent_id.eq(1)))
+        .execute(&mut connection)
+        .expect("the row both views show lands");
+    assert_eq!(
+        outer_moves::table.load::<(i32, i32)>(&mut connection).expect("the moves read"),
+        [(5, 1)]
+    );
+}
+
+#[test]
+fn a_check_option_the_table_cannot_check_is_refused() {
+    for (views, reason) in [
+        (
+            "CREATE VIEW inner_moves AS
+               SELECT id AS resource, parent_id FROM resources WHERE parent_id > 0;
+             ALTER VIEW inner_moves OWNER TO mover;
+             CREATE VIEW outer_hidden WITH (check_option = cascaded) AS
+               SELECT resource FROM inner_moves;
+             ALTER VIEW outer_hidden OWNER TO mover;
+             GRANT SELECT, INSERT ON outer_hidden TO app;",
+            "reads column parent_id, which view outer_hidden does not pass",
+        ),
+        (
+            "CREATE VIEW owned_moves WITH (check_option = cascaded) AS
+               SELECT id AS resource, parent_id FROM resources
+               WHERE parent_id IN (SELECT id FROM owners);
+             ALTER VIEW owned_moves OWNER TO mover;
+             GRANT SELECT, INSERT ON owned_moves TO app;",
+            "the check option of view owned_moves reads owners",
+        ),
+    ] {
+        let error = refused(views);
+        assert!(error.contains(reason), "{error}");
+    }
+}
+
+#[test]
+fn a_view_whose_rows_the_table_cannot_key_is_refused() {
+    for (views, reason) in [
+        (
+            "CREATE VIEW counted AS SELECT (SELECT count(*) FROM resources) AS n",
+            "reads no relation",
+        ),
+        (
+            "CREATE VIEW unioned AS
+               SELECT id, parent_id FROM resources UNION SELECT id, 0 FROM owners",
+            "is not a single SELECT without a WITH clause",
+        ),
+        (
+            "CREATE VIEW counted AS SELECT s.id FROM (SELECT id FROM resources) AS s",
+            "which declares no primary key",
+        ),
+        (
+            "CREATE TABLE notes (body TEXT);
+             ALTER TABLE notes OWNER TO mover;
+             CREATE VIEW counted AS SELECT body FROM notes",
+            "reads table notes, which declares no primary key",
+        ),
+    ] {
+        let name = if views.contains("unioned") { "unioned" } else { "counted" };
+        let error = refused(&format!(
+            "{views};
+             ALTER VIEW {name} OWNER TO mover;
+             GRANT SELECT ON {name} TO app;"
+        ));
+        assert!(error.contains(reason), "{views}: {error}");
+    }
+}
+
+#[test]
+fn an_output_whose_modifier_the_replica_cannot_spell_is_refused() {
+    let error = refused(
+        "CREATE VIEW bits AS SELECT id, B'101'::bit(3) AS flags FROM resources;
+         ALTER VIEW bits OWNER TO mover;
+         GRANT SELECT ON bits TO app;",
+    );
+    assert!(error.contains("column flags of view bits is of type"), "{error}");
+    assert!(error.contains("with modifier 3"), "{error}");
+}
+
+#[test]
+fn a_view_is_keyed_by_what_it_groups_by_however_named_and_by_a_parenthesized_join() {
+    for (definition, key) in [
+        (
+            "SELECT parent_id, count(*) AS members FROM resources GROUP BY 1",
+            ["parent_id"].as_slice(),
+        ),
+        (
+            "SELECT parent_id + 1 AS next, count(*) AS members FROM resources GROUP BY parent_id + 1",
+            &["next"],
+        ),
+        (
+            "SELECT parent_id + 1 AS next, count(*) AS members FROM resources GROUP BY next",
+            &["next"],
+        ),
+        (
+            "SELECT r.id AS resource, o.id AS owner
+             FROM (resources r JOIN owners o ON o.id = r.parent_id)",
+            &["resource", "owner"],
+        ),
+    ] {
+        let mut connection = applied(&format!(
+            "CREATE VIEW keyed AS {definition};
+             ALTER VIEW keyed OWNER TO mover;
+             GRANT SELECT ON keyed TO app;"
+        ));
+        assert_eq!(key_of(&mut connection, "keyed"), key, "{definition}");
+    }
+}
+
+#[test]
+fn each_column_of_the_view_table_is_typed_as_a_table_column_of_its_type() {
+    let mut connection = applied(
+        "CREATE SCHEMA kinds;
+         CREATE TYPE kinds.mood AS ENUM ('calm', 'busy');
+         CREATE TABLE events (id INTEGER PRIMARY KEY);
+         ALTER TABLE events OWNER TO mover;
+         CREATE VIEW typed AS SELECT
+           e.id, e.id::numeric(10,2) AS amount, '{1}'::integer[] AS ids,
+           now()::timestamptz(3) AS at_zone, now()::timestamp(3) AS at,
+           localtime::time(2) AS clock, current_time::timetz(2) AS clock_zone,
+           'x'::varchar(5) AS code, 'x'::char(2) AS letters, (e.id > 0) AS positive,
+           e.id::float8 AS ratio, e.id::float4 AS half, e.id::int2 AS tiny, e.id::int8 AS wide,
+           'calm'::kinds.mood AS mood
+         FROM events e;
+         ALTER VIEW typed OWNER TO mover;
+         GRANT SELECT ON typed TO app;
+         CREATE TABLE reference (
+           id INTEGER PRIMARY KEY, amount numeric(10,2), ids integer[],
+           at_zone timestamp(3) with time zone, at timestamp(3), clock time(2),
+           clock_zone time(2) with time zone, code varchar(5), letters char(2),
+           positive boolean, ratio double precision, half real, tiny smallint, wide bigint,
+           mood kinds.mood
+         );
+         GRANT SELECT ON reference TO app;",
+    );
+    let declared = |columns: Vec<Column>| -> Vec<(String, String)> {
+        columns.into_iter().map(|column| (column.name, column.declared)).collect()
+    };
+    let typed = declared(columns(&mut connection, "typed"));
+    assert_eq!(typed.len(), 15);
+    assert_eq!(typed, declared(columns(&mut connection, "reference")));
+}
+
+diesel::table! {
+    /// `things` through a view passing its serial key through.
+    labels (id) {
+        /// The serial key.
+        id -> Integer,
+        /// The label.
+        label -> Nullable<Text>,
+    }
+}
+
+#[test]
+fn a_serial_key_the_view_passes_through_auto_assigns_as_on_its_table() {
+    let mut connection = applied(
+        "CREATE TABLE things (id SERIAL PRIMARY KEY, label TEXT);
+         ALTER TABLE things OWNER TO mover;
+         CREATE VIEW labels AS SELECT id, label FROM things;
+         ALTER VIEW labels OWNER TO mover;
+         GRANT SELECT, INSERT ON labels TO app;
+         GRANT USAGE ON SEQUENCE things_id_seq TO app;",
+    );
+    diesel::insert_into(labels::table)
+        .values(&[labels::label.eq("a"), labels::label.eq("b")])
+        .execute(&mut connection)
+        .expect("the labels land");
+    assert_eq!(
+        labels::table.select(labels::id).order(labels::id).load::<i32>(&mut connection),
+        Ok(vec![1, 2])
+    );
+}
+
+#[test]
+fn a_serial_the_view_passes_through_off_its_key_is_refused() {
+    let error = refused(
+        "CREATE TABLE things (id INTEGER PRIMARY KEY, seq BIGSERIAL);
+         ALTER TABLE things OWNER TO mover;
+         CREATE VIEW numbered AS SELECT id, seq FROM things;
+         ALTER VIEW numbered OWNER TO mover;
+         GRANT SELECT ON numbered TO app;",
+    );
+    assert!(error.contains(r#"SERIAL on column '"seq"'"#), "{error}");
+    assert!(error.contains("PRIMARY KEY"), "{error}");
+}
+
+#[test]
+fn gaining_the_table_turns_the_view_table_back_into_a_view() {
+    let mut connection =
+        applied(&format!("{MOVES} {NEXT_EPOCH} GRANT SELECT ON resources TO app;"));
+    assert_eq!(kind(&mut connection, "resource_moves").as_deref(), Some("view"));
+    assert_eq!(kind(&mut connection, "resources").as_deref(), Some("table"));
+}
+
+#[test]
+fn a_view_replaced_with_invoker_rights_is_held_as_a_view() {
+    let mut connection = applied(&format!(
+        "{MOVES} {NEXT_EPOCH}
+         CREATE OR REPLACE VIEW resource_moves WITH (security_invoker = true) AS
+           SELECT id AS resource, parent_id FROM resources WHERE parent_id > 0;
+         {NEXT_EPOCH}"
+    ));
+    assert_eq!(kind(&mut connection, "resource_moves").as_deref(), Some("view"));
+}
+
+#[test]
+fn a_write_granted_on_the_view_in_a_later_epoch_lands() {
+    let mut connection =
+        applied(&format!("{MOVES} {NEXT_EPOCH} GRANT INSERT ON resource_moves TO app;"));
+    diesel::insert_into(resource_moves::table)
+        .values((resource_moves::resource.eq(5), resource_moves::parent_id.eq(1)))
+        .execute(&mut connection)
+        .expect("the insert lands");
+    assert_eq!(moves(&mut connection), [(5, 1)]);
+}
+
+#[test]
+fn a_default_set_on_the_table_the_view_reads_fills_an_insert_through_it() {
+    let mut connection = applied(&format!(
+        "{MOVES} GRANT INSERT ON resource_moves TO app; {NEXT_EPOCH}
+         ALTER TABLE resources ALTER COLUMN parent_id SET DEFAULT 1;
+         {NEXT_EPOCH}"
+    ));
+    diesel::insert_into(resource_moves::table)
+        .values(resource_moves::resource.eq(5))
+        .execute(&mut connection)
+        .expect("the insert lands");
+    assert_eq!(moves(&mut connection), [(5, 1)]);
+}
+
+#[test]
+fn replacing_the_view_with_another_column_recreates_its_table() {
+    let mut connection = applied(&format!(
+        "{MOVES}
+         CREATE OR REPLACE VIEW resource_moves WITH (check_option = cascaded) AS
+           SELECT id AS resource, parent_id, parent_id + 1 AS next FROM resources
+           WHERE parent_id > 0;"
+    ));
+    let names: Vec<String> =
+        columns(&mut connection, "resource_moves").into_iter().map(|column| column.name).collect();
+    assert_eq!(names, ["resource", "parent_id", "next"]);
+}
+
+#[test]
+fn a_view_app_holds_nothing_on_leaves_with_its_trigger_and_its_drop() {
+    let mut connection = applied(
+        "CREATE VIEW hidden AS SELECT id FROM resources;
+         ALTER VIEW hidden OWNER TO mover;
+         CREATE FUNCTION keep() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             RETURN NEW;
+         END $$;
+         CREATE TRIGGER keep INSTEAD OF UPDATE ON hidden FOR EACH ROW EXECUTE FUNCTION keep();
+         DROP VIEW hidden;",
+    );
+    assert_eq!(kind(&mut connection, "hidden"), None);
+    assert_eq!(kind(&mut connection, "keep"), None);
 }

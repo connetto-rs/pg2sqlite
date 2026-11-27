@@ -39,7 +39,6 @@ use crate::{
         scoped_relations::relation_occurrences,
         session_variable,
         shared_helpers::column_storage,
-        translator_impls::data_type::is_serial_type,
     },
     manifest::{ColumnManifestEntry, Placement, TableManifestEntry, WrapperKind},
     options::{Pg2SqliteOptions, TranslationContext},
@@ -235,9 +234,8 @@ impl ViewTable {
         let outputs = output_expressions(view, select)?;
         let key = key(view, select, &outputs, &names, &context, schema)?;
         let mut columns = Vec::with_capacity(outputs.len());
-        for (position, (expression, name)) in outputs.iter().zip(&names).enumerate() {
-            let sole_key = key.as_slice() == [position];
-            columns.push(column(view, name, expression, sole_key, &context, schema)?);
+        for (expression, name) in outputs.iter().zip(&names) {
+            columns.push(column(view, name, expression, &context, schema)?);
         }
         Ok(Self { columns, key })
     }
@@ -546,9 +544,10 @@ fn factor_key(
 
 /// The column of the table holding `view` for the output `name`, which
 /// selects `expression`. A column of a table the output passes through takes
-/// its declared type and default, a serial type its integer type unless the
-/// column alone keys the table, and any other output the type PostgreSQL
-/// resolves for it.
+/// its declared type and default, a column drawing its default from a
+/// sequence the serial type of its width, which the table translates as it
+/// translates a serial column of a table, and any other output the type
+/// PostgreSQL resolves for it.
 ///
 /// # Errors
 ///
@@ -558,7 +557,6 @@ fn column(
     view: &View,
     name: &str,
     expression: &Expr,
-    sole_key: bool,
     context: &ExpressionContext<'_, '_, ParserDB>,
     schema: &ParserDB,
 ) -> Result<ColumnDef, Error> {
@@ -570,15 +568,17 @@ fn column(
         && let Some(declared) = table.columns(schema)?.nth(entry.ordinal())
     {
         let declared = declared.attribute();
-        let data_type = if is_serial_type(&declared.data_type) && !sole_key {
-            serial_integer(&declared.data_type)
-        } else {
-            declared.data_type.clone()
-        };
+        let drawn = declared.options.iter().any(|option| {
+            matches!(&option.option, ColumnOption::Default(default) if is_nextval(default))
+        });
+        let data_type =
+            if drawn { serial_of(&declared.data_type) } else { declared.data_type.clone() };
         let options = declared
             .options
             .iter()
-            .filter(|option| matches!(option.option, ColumnOption::Default(_)))
+            .filter(|option| {
+                matches!(&option.option, ColumnOption::Default(default) if !is_nextval(default))
+            })
             .cloned()
             .collect();
         return Ok(ColumnDef { name: ident, data_type, options });
@@ -597,13 +597,21 @@ fn column(
     Ok(ColumnDef { name: ident, data_type, options: Vec::new() })
 }
 
-/// The integer type a serial type `data_type` stores.
-fn serial_integer(data_type: &DataType) -> DataType {
-    match data_type.to_string().to_ascii_lowercase().as_str() {
-        "smallserial" => DataType::SmallInt(None),
-        "bigserial" => DataType::BigInt(None),
-        _ => DataType::Integer(None),
-    }
+/// Whether `default` draws from a sequence.
+fn is_nextval(default: &Expr) -> bool {
+    matches!(default, Expr::Function(function)
+        if function.name.0.last().and_then(|part| part.as_ident())
+            .is_some_and(|part| part.value.eq_ignore_ascii_case("nextval")))
+}
+
+/// The serial type of the width of the integer type `data_type`.
+fn serial_of(data_type: &DataType) -> DataType {
+    let serial = match data_type {
+        DataType::SmallInt(_) | DataType::Int2(_) => "smallserial",
+        DataType::BigInt(_) | DataType::Int8(_) => "bigserial",
+        _ => "serial",
+    };
+    DataType::Custom(ObjectName::from(vec![Ident::new(serial)]), Vec::new())
 }
 
 /// The data type `type_name` carrying `typmod` spells, a type of the
