@@ -465,6 +465,45 @@ fn an_update_rounds_the_written_literal() {
     assert_eq!(rows, vec!["2024-01-02 03:04:06"]);
 }
 
+/// PostgreSQL rounds a timestamp's microseconds from its 2000-01-01 epoch
+/// half away from zero, so a tie before 2000 rounds down and one after rounds
+/// up. PostgreSQL 18.6 prints 1999-12-31 23:59:59, 1960-01-01 00:00:00,
+/// 2000-01-01 00:00:01, 1990-01-01 00:00:00+00 and 1999-12-31 23:59:59.7+00
+/// for the five literals.
+#[test]
+fn a_literal_tie_rounds_away_from_the_postgres_epoch() {
+    for (literal, expected) in [
+        ("CAST('1999-12-31 23:59:59.5' AS TIMESTAMP(0))", "1999-12-31 23:59:59"),
+        ("CAST('1960-01-01 00:00:00.5' AS TIMESTAMP(0))", "1960-01-01 00:00:00"),
+        ("CAST('2000-01-01 00:00:00.5' AS TIMESTAMP(0))", "2000-01-01 00:00:01"),
+        ("CAST('1990-01-01 00:00:00.5+00' AS TIMESTAMPTZ(0))", "1990-01-01 00:00:00.000000+00:00"),
+        ("CAST('1999-12-31 23:59:59.75+00' AS TIMESTAMPTZ(1))", "1999-12-31 23:59:59.700000+00:00"),
+    ] {
+        assert_eq!(run(&format!("SELECT {literal};")), vec![expected], "{literal}");
+    }
+}
+
+/// A cast over a full-precision column rounds the same ties when SQLite runs
+/// it. PostgreSQL 18.6 prints 1999-12-31 23:59:59 for the timestamp, and
+/// 1990-01-01 00:00:00+00 and 1990-01-01 00:00:00 for the timestamptz cast
+/// to TIMESTAMPTZ(0) and TIMESTAMP(0).
+#[test]
+fn a_run_time_tie_rounds_away_from_the_postgres_epoch() {
+    const INSERT: &str = "INSERT INTO t (ts, tstz) VALUES
+        ('1999-12-31 23:59:59.5', '1990-01-01 00:00:00.5+00');";
+    for (cast, expected) in [
+        ("CAST(ts AS TIMESTAMP(0))", "1999-12-31 23:59:59"),
+        ("CAST(tstz AS TIMESTAMPTZ(0))", "1990-01-01 00:00:00.000000+00:00"),
+        ("CAST(tstz AS TIMESTAMP(0))", "1990-01-01 00:00:00"),
+    ] {
+        assert_eq!(
+            run(&format!("{DDL}\n{INSERT}\nSELECT {cast} FROM t;")),
+            vec![expected],
+            "{cast}"
+        );
+    }
+}
+
 // ── the full-precision types keep standing ─────────────────────────────────
 
 /// A column with no typmod keeps every digit, so the rounding must not reach
