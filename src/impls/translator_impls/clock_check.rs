@@ -40,13 +40,14 @@ use crate::{
     errors::Error,
     impls::{
         ast_builder,
+        derived_writes::server_filled,
         function_helpers::{is_function_named, single_quoted_literal},
         object_name::{
             quoted_ident, reads_column, resolve_declared_table, resolve_translation_table,
         },
         translator_impls::{
             column_option::warn_no_inherit_dropped, rls::write_guard_condition_expr,
-            statement::negate,
+            server_filled::filler, statement::negate,
         },
     },
     options::TranslationContext,
@@ -201,13 +202,15 @@ fn clock_condition(
 }
 
 /// Drops of the triggers enforcing the clock checks of `table` that read one
-/// of `columns`, which PostgreSQL drops along with the column.
+/// of `columns`, which PostgreSQL drops along with the column. A check left
+/// to the server with the trigger filling a column it reads has none.
 ///
 /// `written` is the schema before the drop, still holding the checks.
 ///
 /// # Errors
 ///
-/// Propagates a failed schema lookup.
+/// Propagates a failed schema lookup and a trigger function whose body cannot
+/// be read.
 pub(crate) fn dropped_clock_triggers(
     table: &ObjectName,
     columns: &[Ident],
@@ -226,10 +229,15 @@ pub(crate) fn dropped_clock_triggers(
     }
     let names = constraint_names(stored, &taken, written)?;
     let relation = stored.stored_table_name();
+    let filled = server_filled(stored, written, options)?;
+    let declared: Vec<&Ident> = stored.columns.iter().map(|column| &column.name).collect();
     Ok(taken
         .iter()
         .zip(names)
-        .filter(|((_, check, _), _)| columns.iter().any(|column| reads_column(&check.expr, column)))
+        .filter(|((_, check, _), _)| {
+            columns.iter().any(|column| reads_column(&check.expr, column))
+                && filler(&check.expr, &declared, &filled).is_none()
+        })
         .flat_map(|(_, name)| {
             [VERB_INSERT, VERB_UPDATE].map(|verb| {
                 Statement::DropTrigger(DropTrigger {
@@ -254,34 +262,53 @@ fn trigger_name(relation: &str, constraint: &str, verb: &str) -> String {
 }
 
 /// The names PostgreSQL gives the checks in `taken`, in order.
-///
-/// The schema holds the table's checks in the order they are written, columns
-/// first, so each check in `taken` is the first one not yet named that has
-/// its expression.
 fn constraint_names(
     stored: &CreateTable,
     taken: &[(Slot, &CheckConstraint, Expr)],
     schema: &ParserDB,
 ) -> Result<Vec<String>, Error> {
-    let mut held: Vec<_> = stored.check_constraints(schema)?.map(Some).collect();
+    let names = check_names(stored, taken.iter().map(|(_, check, _)| *check), schema)?;
     taken
         .iter()
-        .map(|(_, check, _)| {
-            let unnamed = || {
+        .zip(names)
+        .map(|((_, check, _), name)| {
+            name.ok_or_else(|| {
                 Error::forward_refusal(format!(
                     "CHECK ({}) on {} reads the clock, and the translation schema holds no check \
                      of the table with that expression to name the triggers enforcing it after.",
                     check.expr, stored.name
                 ))
-            };
-            let held_check = held
+            })
+        })
+        .collect()
+}
+
+/// The names PostgreSQL gives `checks`, checks of `stored` in order, `None`
+/// for one the schema holds no named check of `stored` with its expression
+/// for.
+///
+/// The schema holds the table's checks in the order they are written, columns
+/// first, so each check is the first one not yet named that has its
+/// expression.
+pub(super) fn check_names<'c>(
+    stored: &CreateTable,
+    checks: impl IntoIterator<Item = &'c CheckConstraint>,
+    schema: &ParserDB,
+) -> Result<Vec<Option<String>>, Error> {
+    let mut held: Vec<_> = stored.check_constraints(schema)?.map(Some).collect();
+    checks
+        .into_iter()
+        .map(|check| {
+            let Some(held_check) = held
                 .iter_mut()
                 .find(|held| {
                     held.is_some_and(|held| held.expression(schema) == check.expr.as_ref())
                 })
                 .and_then(Option::take)
-                .ok_or_else(unnamed)?;
-            held_check.constraint_name(schema)?.map(Cow::into_owned).ok_or_else(unnamed)
+            else {
+                return Ok(None);
+            };
+            Ok(held_check.constraint_name(schema)?.map(Cow::into_owned))
         })
         .collect()
 }

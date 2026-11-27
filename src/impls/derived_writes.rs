@@ -22,7 +22,7 @@ use sql_traits::{
 };
 use sqlparser::{
     ast::{
-        ColumnDef, ColumnOption, CreateFunction, CreateTrigger, ForeignKeyConstraint,
+        ColumnDef, ColumnOption, CreateFunction, CreateTable, CreateTrigger, ForeignKeyConstraint,
         FunctionSecurity, Ident, ObjectName, ReferentialAction, Statement, TriggerEvent,
         TriggerPeriod,
     },
@@ -39,7 +39,9 @@ use crate::{
         batch_cache,
         object_name::last_ident_value_or_display,
         session_variable::acting_role_and_deployment,
-        translator_impls::{off_replica::OffReplica, overlay, rls::hiding_policies},
+        translator_impls::{
+            off_replica::OffReplica, overlay, rls::hiding_policies, trigger_slots::TableKey,
+        },
         unlabelled_body::unlabelled_body,
     },
     options::TranslationContext,
@@ -321,6 +323,74 @@ pub(crate) fn trigger_left_to_server(
         table: last_ident_value_or_display(&trigger.table_name),
         reason,
     }
+}
+
+/// The fields of `NEW` one `BEFORE` row trigger the replica leaves to the
+/// server assigns, which only the server fills.
+pub(crate) struct ServerFilled<'t> {
+    /// The trigger's name as written.
+    trigger: &'t str,
+    fields: Columns,
+    /// Whether the trigger fires on `INSERT`.
+    on_insert: bool,
+}
+
+impl ServerFilled<'_> {
+    /// The trigger's name as written.
+    pub(crate) const fn trigger(&self) -> &str {
+        self.trigger
+    }
+
+    /// Whether the trigger may assign `column`, folded.
+    pub(crate) fn fills(&self, column: &str) -> bool {
+        self.fields.contains(column)
+    }
+
+    /// Whether the trigger fires on `INSERT` and may assign `column`, folded.
+    pub(crate) fn fills_on_insert(&self, column: &str) -> bool {
+        self.on_insert && self.fills(column)
+    }
+}
+
+/// The `BEFORE` row triggers the batch leaves on `table` that the replica
+/// leaves to the server and that assign fields of `NEW`, each with the fields
+/// its own function assigns.
+///
+/// # Errors
+///
+/// Fails as [`chain::Walker::read`] does.
+pub(crate) fn server_filled<'o>(
+    table: &CreateTable,
+    schema: &ParserDB,
+    options: &'o TranslationContext<'_>,
+) -> Result<Vec<ServerFilled<'o>>, Error> {
+    let key = TableKey::from(table);
+    let mut filled = Vec::new();
+    for trigger in options.batch_triggers() {
+        let writes_row = trigger
+            .events
+            .iter()
+            .any(|event| matches!(event, TriggerEvent::Insert | TriggerEvent::Update(_)));
+        if trigger.table != key
+            || trigger.period != Some(TriggerPeriod::Before)
+            || !trigger.row_level
+            || !writes_row
+            || !options.is_left_out_trigger_name(&trigger.name)
+        {
+            continue;
+        }
+        let Some(function) = trigger.function.as_ref() else { continue };
+        let Some(function) = trigger_function(schema, function)? else { continue };
+        let fields = chain::Walker::read(function, schema, options)?.assigned;
+        if !fields.is_empty() {
+            filled.push(ServerFilled {
+                trigger: &trigger.name,
+                fields,
+                on_insert: trigger.events.iter().any(|event| matches!(event, TriggerEvent::Insert)),
+            });
+        }
+    }
+    Ok(filled)
 }
 
 /// What a row trigger does that another trigger firing on the same write can

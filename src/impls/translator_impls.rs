@@ -48,6 +48,7 @@ pub(crate) mod query;
 pub(crate) mod reentry;
 mod referential_action;
 pub mod rls;
+pub(crate) mod server_filled;
 pub(crate) mod sql_helper;
 pub(crate) mod statement;
 mod stored_text;
