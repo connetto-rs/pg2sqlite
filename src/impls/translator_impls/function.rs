@@ -199,10 +199,9 @@ enum FunctionTranslation {
     /// `isfinite`, whose operand is infinite only as the stored text
     /// `infinity` or `-infinity`.
     IsFinite,
-    /// The local clock of now, answered from the request's zone.
-    LocalClock {
-        which: crate::impls::zone_clock::LocalClock,
-    },
+    /// The local clock of the transaction's start, answered from the
+    /// request's zone.
+    LocalClock { which: crate::impls::zone_clock::LocalClock },
     /// `lower` and `upper`, which fold by the text's collation.
     CaseFold(case_fold::Case),
 }
@@ -673,9 +672,9 @@ fn translate_catalog_function(
         FunctionTranslation::Rename(options.get_uuid_function_name().to_string())
     }
     "uuidv7" => uuid_v7_translation(options),
-    "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp" => {
-        canonical_now_translation()
-    }
+    "now" | "transaction_timestamp" => clock_reader(pg2sqlite_runtime::TRANSACTION_TIMESTAMP),
+    "statement_timestamp" => clock_reader(pg2sqlite_runtime::STATEMENT_TIMESTAMP),
+    "clock_timestamp" => clock_reader(pg2sqlite_runtime::CLOCK_TIMESTAMP),
     "current_timestamp" => FunctionTranslation::CurrentTimestamp,
     "ts_rank" | "ts_rank_cd" => FunctionTranslation::Unsupported(
         "ts_rank/ts_rank_cd are not directly translatable to SQLite. \
@@ -1117,58 +1116,60 @@ fn classify_statistical_aggregate(name: &str, options: &Pg2SqliteOptions) -> Fun
     ))
 }
 
-/// What `now()` and its aliases become: the current instant as the replica's
-/// `timestamptz` text.
-fn canonical_now_translation() -> FunctionTranslation {
-    FunctionTranslation::WithArgs {
-        name: "strftime".to_string(),
-        args: vec![
-            string_literal(crate::impls::datetime_helpers::TIMESTAMPTZ_FORMAT),
-            string_literal("now"),
-        ],
-    }
+/// The call of the managed connection's clock reader `name`.
+fn clock_reader(name: &str) -> FunctionTranslation {
+    FunctionTranslation::WithArgs { name: name.to_string(), args: Vec::new() }
 }
 
-/// The canonical current instant read from SQLite's clock.
-fn canonical_now() -> Expr {
-    simple_function_expr(
-        "strftime",
-        vec![
-            string_literal(crate::impls::datetime_helpers::TIMESTAMPTZ_FORMAT),
-            string_literal("now"),
-        ],
-        None,
-    )
+/// The fractional digits the clock function `name` rounds to, from the one
+/// unsigned integer constant `args` holds in parentheses, or `None` when it
+/// keeps every microsecond. PostgreSQL reduces a precision above six to six,
+/// which keeps them all.
+///
+/// # Errors
+///
+/// Refuses every other argument form, a syntax error in PostgreSQL.
+fn clock_precision(name: &str, args: &FunctionArguments) -> Result<Option<u32>, crate::errors::Error> {
+    let precision = match args {
+        FunctionArguments::None => return Ok(None),
+        FunctionArguments::List(_) => {
+            match function_argument_exprs(args).as_slice() {
+                [Expr::Value(ValueWithSpan { value: Value::Number(digits, ..), .. })]
+                    if digits.bytes().all(|byte| byte.is_ascii_digit()) =>
+                {
+                    digits.parse::<i32>().ok()
+                }
+                _ => None,
+            }
+        }
+        FunctionArguments::Subquery(_) => None,
+    };
+    let precision = precision.ok_or_else(|| {
+        crate::errors::Error::forward_refusal(format!(
+            "PostgreSQL answers a syntax error for this argument form of {name}, which takes \
+             no argument or one integer-constant precision in parentheses."
+        ))
+    })?;
+    Ok(u32::try_from(precision).ok().filter(|precision| *precision < 6))
 }
 
-/// Rounds a clock reading to its optional literal precision.
+/// `clock`, the reading of the clock function `name`, rounded as a `kind` to
+/// the precision its `arguments` give.
 fn round_clock(
     clock: Expr,
     kind: RuntimeTemporalKind,
+    name: &str,
     arguments: &FunctionArguments,
     options: &crate::options::TranslationContext<'_>,
 ) -> Result<Expr, crate::errors::Error> {
-    let arguments = function_argument_exprs(arguments);
-    if arguments.is_empty() {
+    let Some(precision) = clock_precision(name, arguments)? else {
         return Ok(clock);
-    }
-    let [precision] = arguments.as_slice() else {
-        return Err(crate::errors::Error::forward_refusal(
-            "clock precision requires one integer".to_string(),
-        ));
     };
-    let precision = integer_literal_value(precision)
-        .filter(|precision| (0..=6).contains(precision))
-        .ok_or_else(|| {
-            crate::errors::Error::forward_refusal(
-                "clock precision must be an integer between zero and six".to_string(),
-            )
-        })?;
     temporal_call(
         options,
         TemporalFunction::Round(kind),
-        vec![clock, integer_literal(precision)],
-        &"clock precision",
+        vec![clock, integer_literal(i64::from(precision))],
+        &name,
     )
 }
 
@@ -2258,7 +2259,13 @@ impl crate::traits::translator::TranslatorWithContext for Function {
             }
             FunctionTranslation::CurrentTimestamp => {
                 reject_over_on_scalar(&func)?;
-                round_clock(canonical_now(), RuntimeTemporalKind::TimestampTz, &self.args, options)
+                round_clock(
+                    crate::impls::zone_clock::transaction_instant(),
+                    RuntimeTemporalKind::TimestampTz,
+                    "current_timestamp",
+                    &self.args,
+                    options,
+                )
             }
             FunctionTranslation::JsonExtractPath { function, text } => {
                 let exprs = function_argument_exprs(&func.args);
@@ -2810,32 +2817,12 @@ impl crate::traits::translator::TranslatorWithContext for Function {
             FunctionTranslation::LocalClock { which } => {
                 reject_over_on_scalar(&func)?;
                 let name = which.name();
-                let precision_form = match &func.args {
-                    FunctionArguments::None => None,
-                    FunctionArguments::List(_) => {
-                        Some(matches!(
-                            function_argument_exprs(&func.args).as_slice(),
-                            [
-                                Expr::Value(ValueWithSpan {
-                                    value: Value::Number(digits, ..),
-                                    ..
-                                })
-                            ] if !digits.contains(['.', 'e', 'E'])
-                        ))
-                    }
-                    FunctionArguments::Subquery(_) => Some(false),
-                };
-                let invalid = match precision_form {
-                    None => false,
-                    Some(precision) => {
-                        which == crate::impls::zone_clock::LocalClock::Date || !precision
-                    }
-                };
-                if invalid {
+                if which == crate::impls::zone_clock::LocalClock::Date
+                    && !matches!(func.args, FunctionArguments::None)
+                {
                     return Err(crate::errors::Error::forward_refusal(format!(
-                        "PostgreSQL answers a syntax error for this argument form of {name}, \
-                         which takes no argument or one integer-constant precision in \
-                         parentheses."
+                        "PostgreSQL answers a syntax error for {name} with an argument list, \
+                         since it takes no precision."
                     )));
                 }
                 let (function, kind) = match which {
@@ -2855,10 +2842,13 @@ impl crate::traits::translator::TranslatorWithContext for Function {
                 let clock = temporal_call(
                     options,
                     function,
-                    vec![canonical_now(), session_zone(options, schema, name)?],
+                    vec![
+                        crate::impls::zone_clock::transaction_instant(),
+                        session_zone(options, schema, name)?,
+                    ],
                     &name,
                 )?;
-                round_clock(clock, kind, &self.args, options)
+                round_clock(clock, kind, name, &self.args, options)
             }
             FunctionTranslation::ToLowerHex => {
                 let exprs = extract_exactly(&func.args, 2, "encode")?;

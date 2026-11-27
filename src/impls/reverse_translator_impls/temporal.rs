@@ -327,24 +327,6 @@ fn reverse_at_zone(
     })
 }
 
-pub(super) fn reverse_clock(function: &Function) -> Result<Option<Expr>, Error> {
-    if !matches!(function.name.0.as_slice(), [part] if part.as_ident()
-        .is_some_and(|ident| ident.value.eq_ignore_ascii_case("strftime")))
-    {
-        return Ok(None);
-    }
-    let Ok(arguments) = extract_exactly_reverse(&function.args, 2, "strftime") else {
-        return Ok(None);
-    };
-    if single_quoted_literal(arguments[0]) != Some("%Y-%m-%d %H:%M:%f000+00:00")
-        || single_quoted_literal(arguments[1]) != Some("now")
-    {
-        return Ok(None);
-    }
-    validate_call(function, TimestampTzOut)?;
-    Ok(Some(simple_function_expr("NOW", vec![], None)))
-}
-
 fn validate_call(function: &Function, operation: TemporalFunction) -> Result<(), Error> {
     let aggregate = matches!(operation, IntervalSum | IntervalAverage);
     let FunctionArguments::List(list) = &function.args else {
@@ -915,28 +897,18 @@ mod tests {
     }
 
     #[test]
-    fn canonical_clock_restores_now_without_admitting_other_strftime_calls() {
+    fn handwritten_strftime_clocks_are_refused() {
         let schema = empty_schema();
         let options = TranslationContext::from_owned(
             Pg2SqliteOptions::default().with_temporal_functions(TemporalFunctions::default()),
         );
-        let canonical = crate::impls::zone_clock::canonical_now();
-        assert_eq!(canonical.reverse_translate(&schema, &options).unwrap().to_string(), "NOW()");
-        let zoned = parse_expr(&format!(
-            "{}('UTC', strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'))",
-            TemporalFunctions::default().name(TimestampTzAtZone),
-        ));
-        assert!(zoned.reverse_translate(&schema, &options).unwrap().to_string().contains("NOW()"));
         for expression in [
+            "strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')",
             "strftime('%Y', 'now')",
-            "strftime('%Y-%m-%d %H:%M:%f000+00:00', '2001-01-01')",
             "strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now', '+1 day')",
-            "strftime(DISTINCT '%Y-%m-%d %H:%M:%f000+00:00', 'now')",
         ] {
             assert!(parse_expr(expression).reverse_translate(&schema, &options).is_err());
         }
-        let undeployed = TranslationContext::from_owned(Pg2SqliteOptions::default());
-        assert_eq!(canonical.reverse_translate(&schema, &undeployed).unwrap().to_string(), "NOW()");
     }
 
     #[test]

@@ -7,6 +7,13 @@ use sql_values::postgres::PgTimestampTz;
 /// The microseconds from 1970-01-01 to PostgreSQL's 2000-01-01 epoch.
 pub(crate) const UNIX_TO_POSTGRES_MICROSECONDS: i64 = 946_684_800_000_000;
 
+/// The name of the function answering the transaction's instant.
+pub const TRANSACTION_TIMESTAMP: &str = "pg2sqlite_transaction_timestamp";
+/// The name of the function answering the statement's instant.
+pub const STATEMENT_TIMESTAMP: &str = "pg2sqlite_statement_timestamp";
+/// The name of the function answering the provider's instant at each call.
+pub const CLOCK_TIMESTAMP: &str = "pg2sqlite_clock_timestamp";
+
 /// A failure to obtain or represent a finite UTC instant.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ClockError {

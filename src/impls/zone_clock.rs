@@ -1,6 +1,6 @@
 //! Session-zone conversions through the temporal runtime.
 
-use pg2sqlite_runtime::TemporalFunction;
+use pg2sqlite_runtime::{TRANSACTION_TIMESTAMP, TemporalFunction};
 use sql_traits::structs::ParserDB;
 use sqlparser::ast::Expr;
 
@@ -9,18 +9,17 @@ use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{
-        function_helpers::{simple_function_expr, string_literal},
+        function_helpers::simple_function_expr,
         temporal_functions::{call, session_zone},
     },
     options::TranslationContext,
 };
 
-pub(crate) fn canonical_now() -> Expr {
-    simple_function_expr(
-        "strftime",
-        vec![string_literal("%Y-%m-%d %H:%M:%f000+00:00"), string_literal("now")],
-        None,
-    )
+/// `pg2sqlite_transaction_timestamp()`, the canonical `timestamptz` text of
+/// the instant the running transaction started, which a managed connection
+/// answers.
+pub(crate) fn transaction_instant() -> Expr {
+    simple_function_expr(TRANSACTION_TIMESTAMP, Vec::new(), None)
 }
 
 pub(crate) fn conversion_wall_clock(

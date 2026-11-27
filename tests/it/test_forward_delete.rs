@@ -89,8 +89,8 @@ fn delete_where_translates_expressions() {
     ";
     let output = translate(sql);
     assert!(
-        output.contains("strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"),
-        "Expected strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now') in DELETE WHERE: {output}"
+        output.contains("pg2sqlite_transaction_timestamp()"),
+        "Expected pg2sqlite_transaction_timestamp() in DELETE WHERE: {output}"
     );
     execute_all(&output);
 }
@@ -103,8 +103,8 @@ fn delete_returning_translates_expressions() {
     ";
     let output = translate(sql);
     assert!(
-        output.contains("strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"),
-        "Expected strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now') in DELETE RETURNING: {output}"
+        output.contains("pg2sqlite_transaction_timestamp()"),
+        "Expected pg2sqlite_transaction_timestamp() in DELETE RETURNING: {output}"
     );
     execute_all(&output);
 }
@@ -136,7 +136,7 @@ fn delete_order_by_and_limit_translate_expressions() {
     assert!(
         output.contains("ORDER BY")
             && output.contains("LIMIT")
-            && output.contains("strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"),
+            && output.contains("pg2sqlite_transaction_timestamp()"),
         "Expected translated ORDER BY/LIMIT expressions in DELETE: {output}"
     );
 

@@ -299,8 +299,8 @@ fn now_becomes_canonical_now() {
                SELECT now();";
     let output = translate(sql).unwrap();
     assert!(
-        output.contains("strftime("),
-        "NOW() should become strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'), got: {output}"
+        output.contains("pg2sqlite_transaction_timestamp()"),
+        "NOW() should become pg2sqlite_transaction_timestamp(), got: {output}"
     );
     execute_all(sql);
 }
@@ -311,8 +311,8 @@ fn schema_qualified_now_becomes_canonical_now() {
                SELECT pg_catalog.now();";
     let output = translate(sql).unwrap();
     assert!(
-        output.contains("strftime("),
-        "pg_catalog.now() should become strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'), got: {output}"
+        output.contains("pg2sqlite_transaction_timestamp()"),
+        "pg_catalog.now() should become pg2sqlite_transaction_timestamp(), got: {output}"
     );
     assert!(
         !output.to_lowercase().contains("pg_catalog.now"),

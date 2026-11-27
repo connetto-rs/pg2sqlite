@@ -263,10 +263,10 @@ fn test_join_now_translation() {
         &helpers::deployment::utc_request(),
     );
 
-    // Should contain strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'), not NOW()
+    // Should contain pg2sqlite_transaction_timestamp(), not NOW()
     assert!(
-        select_stmt.contains("strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"),
-        "NOW() in JOIN should translate to strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'), got: {select_stmt}"
+        select_stmt.contains("pg2sqlite_transaction_timestamp()"),
+        "NOW() in JOIN should translate to pg2sqlite_transaction_timestamp(), got: {select_stmt}"
     );
     assert!(
         !select_stmt.to_uppercase().contains("NOW()"),

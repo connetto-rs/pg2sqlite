@@ -250,7 +250,7 @@ fn a_zoned_quarter_reads_a_volatile_instant_once() {
         .expect("the quarter reads the instant once")
         .into_vec();
     let query = script.last().expect("a query");
-    assert_eq!(query.matches("'now'").count(), 1, "{query}");
+    assert_eq!(query.matches("pg2sqlite_clock_timestamp()").count(), 1, "{query}");
     assert!(query.contains("pg2sqlite_timestamptz_trunc_zone"), "{query}");
 }
 

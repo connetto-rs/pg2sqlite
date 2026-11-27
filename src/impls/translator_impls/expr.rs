@@ -1653,7 +1653,7 @@ pub(crate) fn translate_at_time_zone(
             vec![
                 timestamp,
                 crate::impls::temporal_functions::session_zone(options, schema, "AT TIME ZONE")?,
-                crate::impls::zone_clock::canonical_now(),
+                crate::impls::zone_clock::transaction_instant(),
             ],
             "AT TIME ZONE",
         )?
@@ -1662,7 +1662,7 @@ pub(crate) fn translate_at_time_zone(
     };
     let mut arguments = vec![time_zone.translate_with_warnings(schema, options, emit)?, timestamp];
     if function == TemporalFunction::TimeTzAtZone {
-        arguments.push(crate::impls::zone_clock::canonical_now());
+        arguments.push(crate::impls::zone_clock::transaction_instant());
     }
     crate::impls::temporal_functions::call(options, function, arguments, "AT TIME ZONE")
 }

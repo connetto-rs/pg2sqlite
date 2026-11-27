@@ -47,6 +47,10 @@ const REVERSE_RENAMES: &[(&str, &str)] = &[
     ("quote", "quote_nullable"),
     ("json_quote", "to_jsonb"),
     ("ifnull", "COALESCE"),
+    // A managed connection's clock readers answer PostgreSQL's three clocks.
+    (pg2sqlite_runtime::TRANSACTION_TIMESTAMP, "now"),
+    (pg2sqlite_runtime::STATEMENT_TIMESTAMP, "statement_timestamp"),
+    (pg2sqlite_runtime::CLOCK_TIMESTAMP, "clock_timestamp"),
 ];
 
 pub enum FunctionReversal {
@@ -817,9 +821,6 @@ pub fn reverse_translate_function(
             func.name
         )));
     }
-    if let Some(clock) = super::temporal::reverse_clock(func)? {
-        return Ok(clock);
-    }
     if let Some(operation) = super::temporal::classify(&func.name, options) {
         return super::temporal::reverse(func, operation, schema, options);
     }
@@ -1382,6 +1383,11 @@ mod tests {
         // json_array_length forwards under a json_type guard, since SQLite
         // answers 0 for a non-array where PostgreSQL raises.
         ("json_array_length", "FunctionTranslation::JsonArrayLength"),
+        // The clock functions forward to the managed connection's readers
+        // through their own match arms, which the precision forms need.
+        (pg2sqlite_runtime::TRANSACTION_TIMESTAMP, "the now() and transaction_timestamp() arm"),
+        (pg2sqlite_runtime::STATEMENT_TIMESTAMP, "the statement_timestamp() arm"),
+        (pg2sqlite_runtime::CLOCK_TIMESTAMP, "the clock_timestamp() arm"),
     ];
 
     /// Every plain rename must invert: for a forward `(pg, sqlite)` pair the

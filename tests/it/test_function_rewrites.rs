@@ -226,17 +226,18 @@ fn to_timestamp_with_format_unsupported() {
 }
 
 #[test]
-fn timestamp_variants_are_now() {
+fn timestamp_variants_call_their_clock_readers() {
     let options = Pg2SqliteOptions::default();
-    for func in &["transaction_timestamp()", "statement_timestamp()", "clock_timestamp()"] {
+    for (func, reader) in [
+        ("transaction_timestamp()", "pg2sqlite_transaction_timestamp()"),
+        ("statement_timestamp()", "pg2sqlite_statement_timestamp()"),
+        ("clock_timestamp()", "pg2sqlite_clock_timestamp()"),
+    ] {
         // Filter to the SELECT so the dialect PRAGMA is not run as sql_query
         // body.
         let stmts = translate_pg(&format!("SELECT {func}"), &options).unwrap();
         let sql = stmts.iter().find(|s| !s.starts_with("PRAGMA")).expect("SELECT stmt");
-        assert!(
-            sql.contains("strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"),
-            "{func} should translate to strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'): {sql}"
-        );
+        assert!(sql.contains(reader), "{func} should translate to {reader}: {sql}");
         let mut conn = SqliteConnection::establish(":memory:").unwrap();
         // Dynamically generated translated SQL cannot be expressed via the
         // typed DSL.

@@ -312,7 +312,7 @@ pub(crate) fn cast(
             vec![
                 translated,
                 temporal_functions::session_zone(options, schema, "interval input")?,
-                crate::impls::zone_clock::canonical_now(),
+                crate::impls::zone_clock::transaction_instant(),
             ],
             "interval input",
         )?

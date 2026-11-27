@@ -130,9 +130,7 @@ fn plpgsql_at_time_zone_is_transformed() {
         "AT TIME ZONE has no SQLite equivalent and must not survive: {sql_str}"
     );
     assert!(
-        sql_str.contains(
-            "pg2sqlite_timestamptz_zone('UTC', strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'))"
-        ),
+        sql_str.contains("pg2sqlite_timestamptz_zone('UTC', pg2sqlite_transaction_timestamp())"),
         "the zone conversion must preserve the instant: {sql_str}"
     );
     assert!(

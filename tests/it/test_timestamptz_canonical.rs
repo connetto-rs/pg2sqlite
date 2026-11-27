@@ -294,26 +294,3 @@ fn a_default_forwarded_by_a_row_level_security_trigger_keeps_the_column_form() {
         assert_eq!(text.contains('+'), canonical, "{declared}: {text}");
     }
 }
-
-/// The canonical clock reading `now()` translates to comes home as `NOW()`.
-#[test]
-fn the_canonical_clock_reverses_to_now() {
-    let translator = Pg2Sqlite::default().sql("CREATE TABLE t (at timestamptz);").expect("parse");
-    let schema = translator.build_schema().expect("schema");
-    let reversed = translator
-        .reverse_sql(
-            "SELECT strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')",
-            &schema,
-            &Pg2SqliteOptions::default(),
-        )
-        .expect("reverse");
-    assert_eq!(reversed.iter().map(ToString::to_string).collect::<Vec<_>>(), ["SELECT NOW()"]);
-    // A trailing modifier shifts the instant, so it cannot collapse to NOW().
-    translator
-        .reverse_sql(
-            "SELECT strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now', '+1 day')",
-            &schema,
-            &Pg2SqliteOptions::default(),
-        )
-        .expect_err("the modifier has no PostgreSQL form here");
-}

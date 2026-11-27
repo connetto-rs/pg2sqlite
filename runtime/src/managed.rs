@@ -6,8 +6,9 @@
 //! holds still only within one step of one statement. A
 //! [`ManagedConnection`] samples its [`UtcProvider`] at those boundaries and
 //! answers the three functions a pg2sqlite translation calls,
-//! [`TRANSACTION_TIMESTAMP`], [`STATEMENT_TIMESTAMP`] and
-//! [`CLOCK_TIMESTAMP`], from what it sampled. Every statement and every
+//! [`TRANSACTION_TIMESTAMP`](crate::TRANSACTION_TIMESTAMP),
+//! [`STATEMENT_TIMESTAMP`](crate::STATEMENT_TIMESTAMP) and
+//! [`CLOCK_TIMESTAMP`](crate::CLOCK_TIMESTAMP), from what it sampled. Every statement and every
 //! transaction control therefore goes through the connection, which hands out
 //! no `SqliteConnection` while a statement runs. A reader called outside a
 //! statement the connection dispatched fails.
@@ -26,15 +27,13 @@ use diesel::{
 };
 use diesel_dynamic_schema::dynamic_value::SqliteAnyValue;
 pub use guard::{Guard, Nested, Outermost, Savepoint, Transaction};
-pub use readers::{
-    CLOCK_TIMESTAMP, READER_ERROR_PREFIX, STATEMENT_TIMESTAMP, TRANSACTION_TIMESTAMP,
-};
+pub use readers::READER_ERROR_PREFIX;
 use readers::{ReaderError, SharedClocks};
 pub use statements::{BeginMode, StatementError};
 use statements::{Control, SourceStatement};
 
 use crate::{
-    CaseFoldFunctions, HelperFunction, JsonbFunctions,
+    CaseFoldFunctions, HelperFunction, JsonbFunctions, TemporalFunctions,
     clock::{ClockError, UtcProvider},
     transaction::{Level, TransactionError, TransactionState},
 };
@@ -149,11 +148,11 @@ enum Controls {
 }
 
 impl<Provider: UtcProvider + Send + 'static> ManagedConnection<Provider> {
-    /// Opens a fresh SQLite connection and registers the clock readers on it.
+    /// Opens a fresh SQLite connection and registers on it the clock readers.
     ///
     /// # Errors
     ///
-    /// The error opening the database or registering a reader.
+    /// The error opening the database or registering a function.
     pub fn establish(database_url: &str, provider: Provider) -> Result<Self, ExecutionError> {
         let mut connection = SqliteConnection::establish(database_url)?;
         let clocks = SharedClocks::new(provider);
@@ -588,6 +587,16 @@ impl Registration<'_> {
     ///
     /// SQLite's refusal.
     pub fn jsonb(&mut self, functions: &JsonbFunctions) -> Result<(), ExecutionError> {
+        functions.register(self.connection).map_err(ExecutionError::Database)
+    }
+
+    /// Registers the temporal functions, which compute every temporal
+    /// operation, the clock readers' precision forms included.
+    ///
+    /// # Errors
+    ///
+    /// SQLite's refusal.
+    pub fn temporal(&mut self, functions: &TemporalFunctions) -> Result<(), ExecutionError> {
         functions.register(self.connection).map_err(ExecutionError::Database)
     }
 

@@ -96,7 +96,7 @@ pub(crate) fn translate_temporal_kind_cast(
         arguments.push(crate::impls::temporal_functions::session_zone(options, schema, operation)?);
     }
     if function == TemporalFunction::TimeToTimeTz {
-        arguments.push(crate::impls::zone_clock::canonical_now());
+        arguments.push(crate::impls::zone_clock::transaction_instant());
     }
     let value = crate::impls::temporal_functions::call(options, function, arguments, operation)?;
     crate::impls::shared_helpers::round_column_text(target, value, options)
@@ -157,7 +157,7 @@ pub(crate) fn temporal_text_reader(
     let value = crate::impls::temporal_functions::call(
         options,
         pg2sqlite_runtime::TemporalFunction::Input(runtime_kind(target)),
-        vec![operand, zone, crate::impls::zone_clock::canonical_now()],
+        vec![operand, zone, crate::impls::zone_clock::transaction_instant()],
         "temporal input",
     )?;
     crate::impls::shared_helpers::round_column_text(target, value, options)

@@ -22,16 +22,18 @@ pub mod write_guard;
 pub use case_fold::CaseFoldFunctions;
 #[cfg(feature = "clock")]
 pub use clock::JiffUtcProvider;
-pub use clock::{ClockError, UtcInstant, UtcProvider};
+pub use clock::{
+    CLOCK_TIMESTAMP, ClockError, STATEMENT_TIMESTAMP, TRANSACTION_TIMESTAMP, UtcInstant,
+    UtcProvider,
+};
 #[cfg(feature = "managed")]
 pub use diesel_dynamic_schema::dynamic_value::{DynamicRow, SqliteAnyValue};
 pub use helper_function::HelperFunction;
 pub use jsonb::JsonbFunctions;
 #[cfg(feature = "managed")]
 pub use managed::{
-    BeginMode, CLOCK_TIMESTAMP, ExecutionError, Guard, ManagedConnection, ManagedRows, Nested,
-    Outermost, READER_ERROR_PREFIX, Registration, STATEMENT_TIMESTAMP, Savepoint, StatementError,
-    TRANSACTION_TIMESTAMP, Transaction,
+    BeginMode, ExecutionError, Guard, ManagedConnection, ManagedRows, Nested, Outermost,
+    READER_ERROR_PREFIX, Registration, Savepoint, StatementError, Transaction,
 };
 pub use temporal::{
     TemporalArgument, TemporalError, TemporalFunction, TemporalFunctions, TemporalKind,

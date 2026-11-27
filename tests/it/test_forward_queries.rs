@@ -316,8 +316,8 @@ fn view_body_translates_now() {
     ";
     let output = translate(sql);
     assert!(
-        output.contains("strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"),
-        "Expected strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now') in view body: {output}"
+        output.contains("pg2sqlite_transaction_timestamp()"),
+        "Expected pg2sqlite_transaction_timestamp() in view body: {output}"
     );
     exec_translated(sql);
 }
@@ -330,7 +330,7 @@ fn group_by_translates_expressions() {
     ";
     let output = translate(sql);
     assert!(
-        output.contains("GROUP BY strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"),
+        output.contains("GROUP BY pg2sqlite_transaction_timestamp()"),
         "Expected translated GROUP BY: {output}"
     );
     exec_translated(sql);
@@ -344,7 +344,7 @@ fn having_translates_expressions() {
     ";
     let output = translate(sql);
     assert!(
-        output.contains("HAVING strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"),
+        output.contains("HAVING pg2sqlite_transaction_timestamp()"),
         "Expected translated HAVING: {output}"
     );
     exec_translated(sql);
@@ -358,8 +358,8 @@ fn cte_body_translates_expressions() {
     ";
     let output = translate(sql);
     assert!(
-        output.contains("strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"),
-        "Expected strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now') in CTE body: {output}"
+        output.contains("pg2sqlite_transaction_timestamp()"),
+        "Expected pg2sqlite_transaction_timestamp() in CTE body: {output}"
     );
     exec_translated(sql);
 }
@@ -388,8 +388,8 @@ fn named_window_translates_expressions() {
     ";
     let output = translate(sql);
     assert!(
-        output.contains("strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"),
-        "Expected strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now') in named window: {output}"
+        output.contains("pg2sqlite_transaction_timestamp()"),
+        "Expected pg2sqlite_transaction_timestamp() in named window: {output}"
     );
     exec_translated(sql);
 }

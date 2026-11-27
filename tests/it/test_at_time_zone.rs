@@ -306,12 +306,14 @@ fn the_reversal_is_the_expression_it_came_from() {
 }
 
 /// Clock expressions reverse with their temporal type and zone intact.
+/// `now()` and `CURRENT_TIMESTAMP` both return as `now()`, since the forward
+/// direction reads both from the transaction clock.
 #[test]
 fn a_function_operand_reverses_with_its_sign_restored() {
     for (expression, expected) in [
-        ("now() AT TIME ZONE 'UTC'", "NOW()::TIMESTAMPTZ AT TIME ZONE 'UTC'"),
-        ("now() AT TIME ZONE '+05:30'", "NOW()::TIMESTAMPTZ AT TIME ZONE '+05:30'"),
-        ("CURRENT_TIMESTAMP AT TIME ZONE 'UTC'", "NOW()::TIMESTAMPTZ AT TIME ZONE 'UTC'"),
+        ("now() AT TIME ZONE 'UTC'", "now()::TIMESTAMPTZ AT TIME ZONE 'UTC'"),
+        ("now() AT TIME ZONE '+05:30'", "now()::TIMESTAMPTZ AT TIME ZONE '+05:30'"),
+        ("CURRENT_TIMESTAMP AT TIME ZONE 'UTC'", "now()::TIMESTAMPTZ AT TIME ZONE 'UTC'"),
     ] {
         let parsed = Parser::parse_sql(&PostgreSqlDialect {}, &format!("SELECT {expected} FROM t"))
             .expect("the expected PostgreSQL parses")

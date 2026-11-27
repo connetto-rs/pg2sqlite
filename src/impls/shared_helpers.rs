@@ -2483,7 +2483,7 @@ pub(crate) fn normalize_temporal_literal_expr(
         vec![
             literal(normalized),
             crate::impls::temporal_functions::session_zone(site.options, site.schema, &operation)?,
-            crate::impls::zone_clock::canonical_now(),
+            crate::impls::zone_clock::transaction_instant(),
         ],
         &operation,
     )

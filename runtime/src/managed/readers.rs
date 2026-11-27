@@ -17,14 +17,10 @@ use diesel::{
 };
 use sql_values::postgres::PgTimestamp;
 
-use crate::clock::{ClockError, UNIX_TO_POSTGRES_MICROSECONDS, UtcInstant, UtcProvider};
-
-/// The name of the function answering the transaction's instant.
-pub const TRANSACTION_TIMESTAMP: &str = "pg2sqlite_transaction_timestamp";
-/// The name of the function answering the statement's instant.
-pub const STATEMENT_TIMESTAMP: &str = "pg2sqlite_statement_timestamp";
-/// The name of the function answering the provider's instant at each call.
-pub const CLOCK_TIMESTAMP: &str = "pg2sqlite_clock_timestamp";
+use crate::clock::{
+    CLOCK_TIMESTAMP, ClockError, STATEMENT_TIMESTAMP, TRANSACTION_TIMESTAMP,
+    UNIX_TO_POSTGRES_MICROSECONDS, UtcInstant, UtcProvider,
+};
 
 /// The prefix of every error a reader raises, which the connection tells
 /// apart from SQLite's own errors.

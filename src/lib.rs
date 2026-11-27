@@ -42,6 +42,11 @@ pub mod prelude {
         TemporalArgument, TemporalError, TemporalValue, extract_scale,
         write_guard::{GuardRefusal, guard_refusal},
     };
+    #[cfg(feature = "managed")]
+    pub use pg2sqlite_runtime::{
+        BeginMode, ClockError, ExecutionError, JiffUtcProvider, ManagedConnection, UtcInstant,
+        UtcProvider,
+    };
 
     pub use crate::{
         errors::{Error, RefusalCategory, SqlParseError, TranslationDirection, TranslationRefusal},
