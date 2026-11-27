@@ -188,7 +188,7 @@ fn relation_name(name: &ObjectName) -> String {
 /// but those reading or writing rows, bounding a transaction or touching the
 /// session alone counts, so one this list misses writes the record again
 /// rather than leaving it stale.
-fn may_change_relations_or_grants(statement: &Statement) -> bool {
+pub(crate) fn may_change_relations_or_grants(statement: &Statement) -> bool {
     !matches!(
         statement,
         Statement::Query(_)

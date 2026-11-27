@@ -627,47 +627,85 @@ fn a_later_batch_reads_an_earlier_serial_table() {
         .expect("translate the reads");
 }
 
+const ITEMS: &str = "
+    CREATE ROLE app;
+    CREATE TABLE items (id INT PRIMARY KEY, parent_id INT);
+    GRANT SELECT, UPDATE (parent_id) ON items TO app;
+    CREATE VIEW item_view AS SELECT id, parent_id FROM items;
+    GRANT SELECT, UPDATE ON item_view TO app;
+";
+
+fn items_options() -> Pg2SqliteOptions {
+    Pg2SqliteOptions::default()
+        .with_deployment(deployment(["app"], []))
+        .with_acting_role("app")
+        .with_rls_audit_table_name("_rls_audit")
+        .with_rls_exemption_function("write_is_exempt")
+        .with_attached_tables("shared", ["items"])
+}
+
+/// Creates the files `label` from `earlier`, applies `migration`, translated
+/// against the schema `earlier` leaves, to them, and returns them with the
+/// migration's script.
+fn migrate(
+    label: &str,
+    earlier: &str,
+    migration: &str,
+    options: &Pg2SqliteOptions,
+) -> (Files, Script<String>) {
+    let schema = Pg2Sqlite::default().sql(earlier).expect("parse").build_schema().expect("schema");
+    let migration = Pg2Sqlite::default()
+        .sql(migration)
+        .expect("parse")
+        .translate_to_sql_with_schema(&schema, options)
+        .expect("translate the migration");
+    let script = translate(earlier, options).expect("translate");
+    let files = Files::new(label);
+    let mut alice = files.connect("alice");
+    run(&mut alice, script.initialize(FreshFiles::Both).expect("initialize"));
+    run(&mut alice, migration.initialize(FreshFiles::Both).expect("initialize the migration"));
+    (files, migration)
+}
+
+/// The names of the views a connection's `temp` schema holds.
+fn temp_views(connection: &mut SqliteConnection) -> Vec<String> {
+    diesel::table! {
+        temp.sqlite_master (name) {
+            name -> Text,
+            #[sql_name = "type"]
+            kind -> Text,
+        }
+    }
+    sqlite_master::table
+        .filter(sqlite_master::kind.eq("view"))
+        .select(sqlite_master::name)
+        .order(sqlite_master::name)
+        .load(connection)
+        .expect("read the temp catalogue")
+}
+
 /// A trigger a later batch puts on a view an earlier batch placed in `temp`
-/// replaces the view's write on every connection running both connection
-/// programs.
+/// replaces the view's write on a new connection running the later batch's
+/// connection program alone.
 #[test]
-fn a_later_instead_of_trigger_on_an_earlier_temp_view_reaches_another_connection() {
+fn a_later_instead_of_trigger_on_an_earlier_temp_view_reaches_a_new_connection() {
     diesel::table! {
         items (id) {
             id -> Integer,
             parent_id -> Nullable<Integer>,
         }
     }
-    const ITEMS: &str = "
-        CREATE ROLE app;
-        CREATE TABLE items (id INT PRIMARY KEY, parent_id INT);
-        GRANT SELECT, UPDATE (parent_id) ON items TO app;
-        CREATE VIEW item_view AS SELECT id, parent_id FROM items;
-        GRANT SELECT, UPDATE ON item_view TO app;
-    ";
-    let options = Pg2SqliteOptions::default()
-        .with_deployment(deployment(["app"], []))
-        .with_acting_role("app")
-        .with_rls_audit_table_name("_rls_audit")
-        .with_rls_exemption_function("write_is_exempt")
-        .with_attached_tables("shared", ["items"]);
-    let schema = Pg2Sqlite::default().sql(ITEMS).expect("parse").build_schema().expect("schema");
-    let migration = Pg2Sqlite::default()
-        .sql(
-            "CREATE FUNCTION pin_parent() RETURNS trigger LANGUAGE plpgsql AS $$
-             BEGIN UPDATE items SET parent_id = 42 WHERE id = OLD.id; RETURN NEW; END $$;
-             CREATE TRIGGER pinned INSTEAD OF UPDATE ON item_view
-                 FOR EACH ROW EXECUTE FUNCTION pin_parent();",
-        )
-        .expect("parse")
-        .translate_to_sql_with_schema(&schema, &options)
-        .expect("translate the migration");
-    let script = translate(ITEMS, &options).expect("translate");
-    let files = Files::new("later-instead-of-trigger");
+    let (files, migration) = migrate(
+        "later-instead-of-trigger",
+        ITEMS,
+        "CREATE FUNCTION pin_parent() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN UPDATE items SET parent_id = 42 WHERE id = OLD.id; RETURN NEW; END $$;
+         CREATE TRIGGER pinned INSTEAD OF UPDATE ON item_view
+             FOR EACH ROW EXECUTE FUNCTION pin_parent();",
+        &items_options(),
+    );
     {
         let mut alice = files.connect("alice");
-        run(&mut alice, script.initialize(FreshFiles::Both).expect("initialize"));
-        run(&mut alice, migration.initialize(FreshFiles::Both).expect("initialize the migration"));
         set_write_exempt(true);
         diesel::insert_into(items::table)
             .values(items::id.eq(1))
@@ -676,7 +714,6 @@ fn a_later_instead_of_trigger_on_an_earlier_temp_view_reaches_another_connection
         set_write_exempt(false);
     }
     let mut bob = files.connect("bob");
-    run(&mut bob, script.connect().expect("connection program"));
     run(&mut bob, migration.connect().expect("the migration's connection program"));
     diesel::sql_query("UPDATE item_view SET parent_id = 5 WHERE id = 1")
         .execute(&mut bob)
@@ -684,6 +721,77 @@ fn a_later_instead_of_trigger_on_an_earlier_temp_view_reaches_another_connection
     let parents: Vec<Option<i32>> =
         items::table.select(items::parent_id).load(&mut bob).expect("read items");
     assert_eq!(parents, [Some(42)]);
+}
+
+/// A migration that leaves an earlier table's policy alone recreates its
+/// `temp` objects on a new connection running its connection program alone.
+#[test]
+fn a_migration_alone_connects_an_earlier_policy() {
+    let (files, migration) =
+        migrate("untouched-policy", PAPERS, "CREATE TABLE extra (id INT);", &placed_options());
+    seed_papers(&mut files.connect("alice"));
+    let mut bob = files.connect("bob");
+    run(&mut bob, migration.connect().expect("the migration's connection program"));
+    assert_eq!(visible_papers(&mut bob), [(11, "shared to bob".to_owned())]);
+}
+
+/// A view a migration drops over an earlier `temp` view is absent from a new
+/// connection, while the view it read stays.
+#[test]
+fn a_dropped_view_is_absent_from_a_new_connection() {
+    let earlier = format!(
+        "{ITEMS}
+         CREATE VIEW outer_view AS SELECT id FROM item_view;
+         GRANT SELECT ON outer_view TO app;"
+    );
+    let (files, migration) =
+        migrate("dropped-view", &earlier, "DROP VIEW outer_view;", &items_options());
+    let mut bob = files.connect("bob");
+    run(&mut bob, migration.connect().expect("the migration's connection program"));
+    assert_eq!(temp_views(&mut bob), ["item_view"]);
+}
+
+/// A table whose row-level security a migration disables reads its rows on a
+/// new connection, with no `temp` view left standing for it.
+#[test]
+fn disabling_row_security_reaches_a_new_connection() {
+    diesel::table! {
+        memos (id) {
+            id -> Integer,
+            body -> Text,
+        }
+    }
+    let (files, migration) = migrate(
+        "disabled-row-security",
+        &memos(),
+        "ALTER TABLE memos DISABLE ROW LEVEL SECURITY;",
+        &items_options(),
+    );
+    set_write_exempt(true);
+    diesel::insert_into(memos::table)
+        .values((memos::id.eq(1), memos::body.eq("kept")))
+        .execute(&mut files.connect("alice"))
+        .expect("seed");
+    set_write_exempt(false);
+    let mut bob = files.connect("bob");
+    run(&mut bob, migration.connect().expect("the migration's connection program"));
+    assert_eq!(temp_views(&mut bob), ["item_view"]);
+    let bodies: Vec<String> = memos::table.select(memos::body).load(&mut bob).expect("read memos");
+    assert_eq!(bodies, ["kept"]);
+}
+
+/// A migration initializes no fresh file, which would lack every earlier
+/// object, and its refusal names the translation that does.
+#[test]
+fn a_migration_initializes_no_fresh_file() {
+    let (_files, migration) =
+        migrate("fresh-file-refusal", ITEMS, "CREATE TABLE extra (id INT);", &items_options());
+    for files in [FreshFiles::Main, FreshFiles::Attached] {
+        let Err(error @ Error::Initialization(_)) = migration.initialize(files) else {
+            panic!("{files:?} initializes a fresh file from a migration");
+        };
+        assert!(error.to_string().contains("whole history"), "{error}");
+    }
 }
 
 #[test]
@@ -700,4 +808,97 @@ fn a_seed_write_through_a_temp_view_is_initialized() {
         .load(&mut connection)
         .expect("seed rows");
     assert_eq!(seeded, [(1, "seed".to_owned())]);
+}
+
+/// The `ITEMS` schema with a table whose policy reads the attached `items`.
+fn memos() -> String {
+    format!(
+        "{ITEMS}
+         CREATE TABLE memos (id INT PRIMARY KEY, body TEXT NOT NULL);
+         GRANT SELECT ON memos TO app;
+         ALTER TABLE memos ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY m ON memos USING (EXISTS (SELECT 1 FROM items i WHERE i.id = memos.id));"
+    )
+}
+
+/// The name and definition of each object a connection's `temp` schema holds.
+fn temp_objects(connection: &mut SqliteConnection) -> Vec<(String, Option<String>)> {
+    diesel::table! {
+        temp.sqlite_master (name) {
+            name -> Text,
+            sql -> Nullable<Text>,
+        }
+    }
+    sqlite_master::table
+        .select((sqlite_master::name, sqlite_master::sql))
+        .order(sqlite_master::name)
+        .load(connection)
+        .expect("read the temp catalogue")
+}
+
+/// A migration that leaves an earlier translation's connection objects alone
+/// recreates each of them on a new connection running its program alone.
+#[test]
+fn a_migration_recreates_the_earlier_connection_objects() {
+    let pinned = format!(
+        "{ITEMS}
+         CREATE FUNCTION pin_parent() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN UPDATE items SET parent_id = 42 WHERE id = OLD.id; RETURN NEW; END $$;
+         CREATE TRIGGER pinned INSTEAD OF UPDATE ON item_view
+             FOR EACH ROW EXECUTE FUNCTION pin_parent();
+         CREATE TRIGGER pinned_too INSTEAD OF UPDATE ON item_view
+             FOR EACH ROW EXECUTE FUNCTION pin_parent();"
+    );
+    for (index, (earlier, options)) in [
+        (PAPERS.to_owned(), placed_options()),
+        (ITEMS.to_owned(), items_options()),
+        (memos(), items_options()),
+        (pinned, items_options()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (files, migration) = migrate(
+            &format!("recreated-{index}"),
+            &earlier,
+            "CREATE TABLE unrelated (id INT);",
+            &options,
+        );
+        let script = translate(&earlier, &options).expect("translate");
+        let mut carol = files.connect("carol");
+        run(&mut carol, script.connect().expect("connection program"));
+        let mut bob = files.connect("bob");
+        run(&mut bob, migration.connect().expect("the migration's connection program"));
+        assert_eq!(temp_objects(&mut bob), temp_objects(&mut carol), "{earlier}");
+    }
+}
+
+/// A column a migration adds to a table with policies reaches a new
+/// connection, which holds every `temp` object of that table as well.
+#[test]
+fn an_added_column_reaches_a_new_connection_with_the_earlier_temp_objects() {
+    diesel::table! {
+        memos (id) {
+            id -> Integer,
+            extra -> Nullable<Integer>,
+        }
+    }
+    let (files, migration) = migrate(
+        "added-column",
+        &memos(),
+        "ALTER TABLE memos ADD COLUMN extra INT;",
+        &items_options(),
+    );
+    let script = translate(&memos(), &items_options()).expect("translate");
+    let mut carol = files.connect("carol");
+    run(&mut carol, script.connect().expect("connection program"));
+    let mut bob = files.connect("bob");
+    run(&mut bob, migration.connect().expect("the migration's connection program"));
+    let names = |connection: &mut SqliteConnection| {
+        temp_objects(connection).into_iter().map(|(name, _)| name).collect::<Vec<_>>()
+    };
+    assert_eq!(names(&mut bob), names(&mut carol));
+    let extras: Vec<Option<i32>> =
+        memos::table.select(memos::extra).load(&mut bob).expect("read the added column");
+    assert!(extras.is_empty(), "{extras:?}");
 }

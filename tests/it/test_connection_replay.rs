@@ -282,6 +282,27 @@ fn external_schema_columns_bind_connection_definitions() {
     assert_eq!(row, "external");
 }
 
+/// A migration's connection program, which a new connection runs alone,
+/// refuses a `TEMP` table an earlier translation created, since no schema
+/// records its rows.
+#[test]
+fn a_migration_refuses_an_earlier_temp_table() {
+    let schema = Pg2Sqlite::default()
+        .sql("CREATE TEMP TABLE scratch (id INT);")
+        .expect("earlier source")
+        .build_schema()
+        .expect("earlier schema");
+    let migration = Pg2Sqlite::default()
+        .sql("CREATE TABLE extra (id INT);")
+        .expect("migration source")
+        .translate_to_sql_with_schema(&schema, &Pg2SqliteOptions::default())
+        .expect("migration translation");
+    let Err(error @ Error::Connection(_)) = migration.connect() else {
+        panic!("the migration connects without the earlier TEMP table");
+    };
+    assert!(error.to_string().contains("`scratch`"), "{error}");
+}
+
 fn assert_replayed_alias(definition: &str) {
     let script = script(&format!(
         "CREATE TABLE a(id INT PRIMARY KEY, x TEXT NOT NULL);

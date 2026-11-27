@@ -21,6 +21,7 @@ use tempfile::TempDir;
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
 use crate::{
+    history,
     impls::{
         column_access,
         emitted_namespace::{Source, reject_name_collisions, sourced},
@@ -2132,8 +2133,10 @@ impl Pg2Sqlite {
                 }
             })
             .collect();
-        let connection = crate::history::connection_program(&units, &schema, &context, &mut placed);
-        let (main, attached) = crate::history::fresh_forms(&units, &mut placed, &schema, &context);
+        let connection =
+            history::connection_program(initial_schema, &units, &schema, &context, &mut placed);
+        let (main, attached) =
+            history::fresh_forms(&units, &mut placed, &schema, &context, initial_schema.is_some());
         drop(units);
         let functions = self.reached_functions(
             context.take_helper_functions(),
@@ -2262,6 +2265,14 @@ impl Pg2Sqlite {
     ///
     /// Loaded schema statements update that state before later statements are
     /// translated.
+    ///
+    /// The script applies the statements to existing database files through
+    /// [`FreshFiles::Both`](crate::script::FreshFiles::Both) and refuses the
+    /// other selections, since a fresh file would lack every object of
+    /// `schema`. When a statement may change a relation, a grant, a policy, a
+    /// role or a trigger, [`Script::connect`] also recreates the connection
+    /// objects the translations behind `schema` left, so a new connection runs
+    /// it alone.
     ///
     /// # Errors
     ///

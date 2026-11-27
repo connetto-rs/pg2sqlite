@@ -22,6 +22,13 @@ pub enum InitializationError {
     /// An attached-file initializer was requested without attached storage.
     #[error("the script has no attached database to initialize")]
     NoAttachedDatabase,
+    /// A fresh-file initializer was requested from a script translated
+    /// against an earlier schema, whose objects no fresh file would hold.
+    #[error(
+        "a script translated against an earlier schema initializes no fresh file, which would \
+         lack every earlier object. Translate the whole history as one batch to initialize one"
+    )]
+    Migration,
     /// Existing file state cannot satisfy a source-ordered initializer.
     #[error(transparent)]
     Unrepresentable(#[from] TranslationRefusal),

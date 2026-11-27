@@ -185,33 +185,8 @@ pub(crate) fn place<'r>(
         .map(|(source, translated)| (source, translated.as_slice()))
         .chain(sources.iter().zip(emitted.iter().map(Vec::as_slice)))
         .collect();
-    let storage = match attached {
-        Some(attached) => attached_storage(&units, attached, schema, options)?,
-        None => BTreeSet::new(),
-    };
-    let mut homes = homes(&units, schema, &storage);
+    let (homes, logical_storage) = layout(&units, schema, options)?;
     drop(units);
-    let mut logical_storage = Homes::new();
-    for table in schema.tables() {
-        let physical = resolve_trigger_table_name(table.table_name(), table, schema, options)?;
-        let mut physical_key = HomeKey { main: !table.temporary, name: key(&physical) };
-        if !homes.contains_key(&physical_key) {
-            physical_key.main = false;
-        }
-        // Nothing the batch emits relocates a table it does not create.
-        let placement = homes.get(&physical_key).copied().unwrap_or_else(|| {
-            if table.temporary {
-                Placement::Temp
-            } else if storage.contains(&physical_key.name) {
-                Placement::Attached
-            } else {
-                Placement::Main
-            }
-        });
-        let logical_key = HomeKey { main: physical_key.main, name: key(table.table_name()) };
-        homes.insert(physical_key, placement);
-        logical_storage.insert(logical_key, placement);
-    }
     let mut trigger_homes = Homes::new();
     // An earlier trigger keeps the home its object's translation gave it, so
     // the batch dropping it drops it where it lives.
@@ -244,6 +219,94 @@ pub(crate) fn place<'r>(
         trigger_homes,
         attached_schema,
     })
+}
+
+/// Where every object `units` create lives, and where each table of `schema`
+/// keeps its rows under its logical name.
+fn layout(
+    units: &[(&Statement, &[Statement])],
+    schema: &ParserDB,
+    options: &Pg2SqliteOptions,
+) -> Result<(Homes, Homes), Error> {
+    let storage = match options.get_attached_tables() {
+        Some(attached) => attached_storage(units, attached, schema, options)?,
+        None => BTreeSet::new(),
+    };
+    let mut homes = homes(units, schema, &storage);
+    let mut logical_storage = Homes::new();
+    for table in schema.tables() {
+        let physical = resolve_trigger_table_name(table.table_name(), table, schema, options)?;
+        let mut physical_key = HomeKey { main: !table.temporary, name: key(&physical) };
+        if !homes.contains_key(&physical_key) {
+            physical_key.main = false;
+        }
+        // Nothing the batch emits relocates a table it does not create.
+        let placement = homes.get(&physical_key).copied().unwrap_or_else(|| {
+            if table.temporary {
+                Placement::Temp
+            } else if storage.contains(&physical_key.name) {
+                Placement::Attached
+            } else {
+                Placement::Main
+            }
+        });
+        let logical_key = HomeKey { main: physical_key.main, name: key(table.table_name()) };
+        homes.insert(physical_key, placement);
+        logical_storage.insert(logical_key, placement);
+    }
+    Ok((homes, logical_storage))
+}
+
+/// The `temp` objects the translations that built `earlier` left on a
+/// connection, rebuilt from the creation of each persistent table, view and
+/// trigger `earlier` holds and placed where those translations put them.
+///
+/// Each creation comes with its `temp` statements. Tables come first, then
+/// views, then triggers, so each object exists before a trigger on it, and a
+/// SQLite trigger several PostgreSQL triggers share is created once.
+pub(crate) fn earlier_connection(
+    earlier: &ParserDB,
+    options: &Pg2SqliteOptions,
+) -> Result<Vec<(Statement, Vec<Statement>)>, Error> {
+    let Some(attached) = options.get_attached_tables() else { return Ok(Vec::new()) };
+    let mut sources = Vec::new();
+    for table in earlier.tables().filter(|table| !table.temporary) {
+        sources.push(Statement::CreateTable(as_declared(table, earlier)?));
+    }
+    sources.extend(earlier.views().filter(|view| !view.is_temporary()).map(creation));
+    sources.extend(earlier.triggers().map(|trigger| Statement::CreateTrigger(trigger.clone())));
+    let context = TranslationContext::new(options);
+    let context = context.with_written_schema(earlier);
+    let translated = sources
+        .iter()
+        .map(|source| source.translate_with_warnings(earlier, &context, &mut |_| {}))
+        .collect::<Result<Vec<_>, _>>()?;
+    let units: Vec<(&Statement, &[Statement])> =
+        sources.iter().zip(translated.iter().map(Vec::as_slice)).collect();
+    let (homes, logical_storage) = layout(&units, earlier, options)?;
+    drop(units);
+    let mut trigger_homes = Homes::new();
+    let mut triggers = BTreeSet::new();
+    let mut connection = Vec::with_capacity(sources.len());
+    for (source, statements) in sources.into_iter().zip(translated) {
+        let mut local = Vec::new();
+        for mut statement in statements {
+            let placement = place_statement(
+                &mut statement,
+                attached.schema(),
+                &homes,
+                &logical_storage,
+                &mut trigger_homes,
+            )?;
+            let repeated = matches!(&statement, Statement::CreateTrigger(trigger)
+                if !triggers.insert(key_of(&trigger.name)));
+            if placement == Placement::Temp && !repeated {
+                local.push(statement);
+            }
+        }
+        connection.push((source, local));
+    }
+    Ok(connection)
 }
 
 /// The translations of the views and the tables a view stands for that
