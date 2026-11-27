@@ -4,9 +4,7 @@
 
 use alloc::{borrow::Cow, format, string::String};
 
-use sql_values::postgres::{
-    CastTarget, CastValue, InputContext, PgTime, PgTimestamp, PgTimestampTz, cast_value,
-};
+use sql_values::postgres::{InputContext, PgTime, PgTimeTz, PgTimestamp, PgTimestampTz};
 
 /// A temporal type whose text the replica rounds to a number of fractional
 /// digits, each with the SQL function a translation calls for it.
@@ -76,18 +74,13 @@ impl TypmodRounding {
     /// 9999-12-31.
     pub fn round(self, text: &str, precision: u8) -> Result<Cow<'_, str>, RoundingError> {
         let context = InputContext::new();
+        let precision = Some(precision);
         let rounded = match self {
             Self::Timestamp => {
                 let Ok(at) = PgTimestamp::parse(text, context) else {
                     return Ok(Cow::Borrowed(text));
                 };
-                let rounded = match cast_value(
-                    CastValue::Timestamp(at),
-                    CastTarget::Timestamp(Some(precision)),
-                ) {
-                    Ok(Some(CastValue::Timestamp(rounded))) => rounded,
-                    _ => at,
-                };
+                let rounded = at.adjust_for_typmod(precision);
                 four_digit_years(rounded)?;
                 format!("{rounded}")
             }
@@ -95,43 +88,36 @@ impl TypmodRounding {
                 let Ok(at) = PgTimestampTz::parse(text, context) else {
                     return Ok(Cow::Borrowed(text));
                 };
-                let rounded = match cast_value(
-                    CastValue::TimestampTz(at),
-                    CastTarget::TimestampTz(Some(precision)),
-                ) {
-                    Ok(Some(CastValue::TimestampTz(rounded))) => rounded,
-                    _ => at,
-                };
-                canonical(rounded)?
+                canonical(at.adjust_for_typmod(precision))?
             }
             Self::Time => {
-                match time(text, precision) {
-                    Some(time) => format!("{time}"),
-                    None => return Ok(Cow::Borrowed(text)),
-                }
-            }
-            Self::TimeTz => {
-                let Some(sign) = text.rfind(['+', '-']) else {
+                let Ok(time) = PgTime::parse(text, context) else {
                     return Ok(Cow::Borrowed(text));
                 };
-                let (clock, offset) = text.split_at(sign);
-                match time(clock, precision) {
-                    Some(time) => format!("{time}{offset}"),
-                    None => return Ok(Cow::Borrowed(text)),
-                }
+                format!("{}", time.adjust_for_typmod(precision))
+            }
+            Self::TimeTz => {
+                let Ok(time) = PgTimeTz::parse(text, context) else {
+                    return Ok(Cow::Borrowed(text));
+                };
+                let rounded = time.adjust_for_typmod(precision);
+                format!("{}{}", rounded.time(), replica_offset(rounded.offset()))
             }
         };
         Ok(Cow::Owned(rounded))
     }
 }
 
-/// The `time` `text` reads as, rounded to `precision` digits, or `None` when
-/// PostgreSQL's `time` input refuses it.
-fn time(text: &str, precision: u8) -> Option<PgTime> {
-    let time = PgTime::parse(text, InputContext::new()).ok()?;
-    match cast_value(CastValue::Time(time), CastTarget::Time(Some(precision))) {
-        Ok(Some(CastValue::Time(rounded))) => Some(rounded),
-        _ => Some(time),
+/// The replica's `±HH:MM` text of an offset `seconds_east` of UTC, with
+/// `:SS` when the offset has seconds.
+fn replica_offset(seconds_east: i32) -> String {
+    let sign = if seconds_east < 0 { '-' } else { '+' };
+    let seconds = seconds_east.unsigned_abs();
+    let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+    if seconds == 0 {
+        format!("{sign}{hours:02}:{minutes:02}")
+    } else {
+        format!("{sign}{hours:02}:{minutes:02}:{seconds:02}")
     }
 }
 

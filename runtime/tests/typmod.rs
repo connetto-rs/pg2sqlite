@@ -39,6 +39,20 @@ fn text_no_value_of_the_kind_comes_back_unchanged() {
     }
 }
 
+/// A `timetz` keeps its offset in the replica's `±HH:MM` form, with seconds
+/// when it has them. PostgreSQL prints `timetz(2)` of these as
+/// 03:04:05.13+05:30:15, 03:04:05.13-03:30 and 00:00:00+00.
+#[test]
+fn a_timetz_keeps_its_offset_in_the_replica_form() {
+    for (text, rounded) in [
+        ("03:04:05.125+05:30:15", "03:04:05.13+05:30:15"),
+        ("03:04:05.125-03:30", "03:04:05.13-03:30"),
+        ("allballs", "00:00:00+00:00"),
+    ] {
+        assert_eq!(TypmodRounding::TimeTz.round(text, 2), Ok(rounded.into()), "{text}");
+    }
+}
+
 /// A timestamp that rounds into the year 10000 is refused, where PostgreSQL
 /// prints 10000-01-01 00:00:00, since the replica holds four-digit years.
 #[test]
