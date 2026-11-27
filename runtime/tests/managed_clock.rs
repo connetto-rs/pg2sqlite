@@ -141,6 +141,34 @@ fn rollback_clears_transaction_instant() {
 }
 
 #[test]
+fn implicit_rollback_clears_transaction_instant() {
+    let script = Script::new(&(1..=20).collect::<Vec<_>>());
+    let mut connection = open(&script);
+    connection
+        .batch_execute(
+            "CREATE TABLE conflicts (id INTEGER PRIMARY KEY ON CONFLICT ROLLBACK, at TEXT DEFAULT (pg2sqlite_transaction_timestamp()))",
+        )
+        .unwrap();
+    connection.begin(BeginMode::Deferred).unwrap();
+    let first = rows(&mut connection, STABLE).remove(0).remove(0);
+    connection.execute("INSERT INTO conflicts (id) VALUES (1)", &[]).unwrap();
+    assert!(matches!(
+        connection.execute("INSERT INTO conflicts (id) VALUES (1)", &[]),
+        Err(ExecutionError::Database(_))
+    ));
+    assert!(matches!(
+        connection.execute("INSERT INTO conflicts (id) VALUES (2)", &[]),
+        Err(ExecutionError::Database(_))
+    ));
+    connection.rollback().unwrap();
+    assert_eq!(rows(&mut connection, "SELECT count(*) FROM conflicts"), [["0".to_string()]]);
+    connection.begin(BeginMode::Deferred).unwrap();
+    let second = rows(&mut connection, STABLE).remove(0).remove(0);
+    assert_ne!(first, second, "a fresh transaction samples a fresh instant");
+    connection.rollback().unwrap();
+}
+
+#[test]
 fn failed_commit_rolls_back_and_clears_clocks() {
     let script = Script::new(&[1, 2, 3, 4, 5, 6, 7, 8]);
     let mut connection = open(&script);
