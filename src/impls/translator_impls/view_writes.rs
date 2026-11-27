@@ -465,7 +465,7 @@ fn needs_trigger(
 
 /// The view a statement's target `name` resolves to, a table of that name
 /// taking precedence as PostgreSQL's search path does.
-pub(super) fn resolve_view<'s>(
+pub(crate) fn resolve_view<'s>(
     name: &ObjectName,
     schema: &'s ParserDB,
 ) -> Result<Option<&'s View>, Error> {
