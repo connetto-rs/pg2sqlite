@@ -101,7 +101,7 @@ pub(crate) fn land_insert(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let plain = insert.on.is_none() && insert.returning.is_none();
-    if needs_trigger(view, true, plain, schema, options)? {
+    if needs_trigger(view, Event::Insert, plain, schema, options)? {
         if !insert.columns.is_empty() {
             return Ok(None);
         }
@@ -182,7 +182,7 @@ pub(crate) fn land_update(
     }
     if needs_trigger(
         view,
-        true,
+        Event::Update,
         update.from.is_none() && update.returning.is_none(),
         schema,
         options,
@@ -237,7 +237,7 @@ pub(crate) fn land_delete(
         return Ok(None);
     };
     let plain = delete.using.is_none() && delete.returning.is_none() && target.joins.is_empty();
-    if needs_trigger(view, false, plain, schema, options)? {
+    if needs_trigger(view, Event::Delete, plain, schema, options)? {
         return Ok(None);
     }
     let qualifier = exposed(name, alias.as_ref());
@@ -434,19 +434,19 @@ impl Landing<'_> {
     }
 }
 
-/// Whether the write must go through the view's `INSTEAD OF` trigger, which
-/// alone applies a check option, when the write `checks` new rows, and an
-/// owner's rights on the way. A `plain` write the trigger takes stays on the
-/// view, and any other is refused.
+/// Whether a write of `event` must go through the view's `INSTEAD OF`
+/// trigger, which alone applies a check option, an owner's rights and the
+/// caller's grant on a view on the way. A `plain` write the trigger takes
+/// stays on the view, and any other is refused.
 fn needs_trigger(
     view: &View,
-    checks: bool,
+    event: Event,
     plain: bool,
     schema: &ParserDB,
     options: &TranslationContext<'_>,
 ) -> Result<bool, Error> {
     let Some((reason, current)) =
-        super::view_triggers::trigger_reason(view, checks, schema, options)?
+        super::view_triggers::trigger_reason(view, Some(event), schema, options)?
     else {
         return Ok(false);
     };

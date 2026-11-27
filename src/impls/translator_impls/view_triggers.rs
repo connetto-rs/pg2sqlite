@@ -82,6 +82,14 @@ impl Held {
             Event::Delete | Event::Truncate => self.delete,
         }
     }
+
+    fn holds_every(&self, event: Event) -> bool {
+        match event {
+            Event::Insert => !self.insert.contains(&false),
+            Event::Update => !self.update.contains(&false),
+            Event::Delete | Event::Truncate => self.delete,
+        }
+    }
 }
 
 /// One output column of the view, as a trigger on it reads it.
@@ -126,7 +134,7 @@ pub(crate) fn view_triggers(
     let Some(names) = names.into_iter().collect::<Option<Vec<String>>>() else {
         return Ok(Vec::new());
     };
-    if trigger_reason(view, true, schema, options)?.is_none() {
+    if trigger_reason(view, None, schema, options)?.is_none() {
         return Ok(Vec::new());
     }
     if view.check_option() == Some(ViewCheckOption::Local) {
@@ -149,31 +157,43 @@ pub(crate) fn view_triggers(
     Ok(triggers)
 }
 
-/// What only the view's trigger applies to a write through `view` when the
-/// write `checks` new rows, the check option or the owner's rights of a view
-/// on the way, with that view, `None` when the static rewrite does as well
-/// and for a view reading a table left off the replica, which shows no rows
-/// there.
+/// What only the view's trigger applies to a write of `event` through
+/// `view`, of any command when `None`: the check option, the owner's rights
+/// or the caller's missing grant of a view on the way, with that view. `None`
+/// when the static rewrite does as well and for a view reading a table left
+/// off the replica, which shows no rows there.
 ///
 /// # Errors
 ///
 /// Returns the lookup errors resolving the views runs into.
 pub(super) fn trigger_reason<'s>(
     view: &'s View,
-    checks: bool,
+    event: Option<Event>,
     schema: &'s ParserDB,
     options: &TranslationContext<'_>,
 ) -> Result<Option<(&'static str, &'s View)>, Error> {
     if OffReplica::read_through(view, schema, options)? {
         return Ok(None);
     }
+    let acting = session_variable::acting_role(schema, options)?;
     let mut written = Some(view);
     while let Some(current) = written {
-        if checks && current.check_option().is_some() {
+        if event != Some(Event::Delete) && current.check_option().is_some() {
             return Ok(Some(("the check option", current)));
         }
         if !matches!(runner(current, schema, options)?, Runner::Caller) {
             return Ok(Some(("the owner's rights", current)));
+        }
+        if let Some(acting) = acting {
+            let held =
+                view_privileges(current, acting, output_names(current, schema)?.len(), schema)?;
+            let lacks = |event: Event| !held.holds_every(event);
+            if event.map_or_else(
+                || [Event::Insert, Event::Update, Event::Delete].into_iter().any(lacks),
+                lacks,
+            ) {
+                return Ok(Some(("the caller's grant", current)));
+            }
         }
         written = match current.updatable_base(schema)?.map(|base| base.relation) {
             Some(WrittenRelation::View { view: inner, .. }) => Some(inner),
