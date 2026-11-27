@@ -21,6 +21,7 @@ use tempfile::TempDir;
 #[cfg(not(feature = "std"))]
 use crate::no_std::prelude::*;
 use crate::{
+    history,
     impls::{
         column_access,
         emitted_namespace::{Source, reject_name_collisions, sourced},
@@ -1129,6 +1130,45 @@ fn translate_shaped<'a, 's: 'a>(
     Ok((emitted, rebuilt || own_rebuilt))
 }
 
+/// Translates `creations`, which recreate objects `schema` holds, in order as
+/// one batch over `schema`, the way a batch that declares them translates.
+/// Triggers sharing a slot merge into one SQLite trigger, and each trigger on
+/// an overlaid table gains its overlay copies.
+///
+/// # Errors
+///
+/// Fails as the translation of a creation does.
+pub(crate) fn translate_creations(
+    creations: &[Statement],
+    schema: &ParserDB,
+    context: &TranslationContext<'_>,
+) -> Result<Vec<Vec<Statement>>, crate::errors::Error> {
+    let mut trackers = Trackers {
+        trigger_slots: TriggerSlots::seeded(None)?,
+        marker_tables: MarkerTables::seeded(None, context.is_strict_rls_validation())?,
+        attachments: LiveAttachments::seeded(None, context)?,
+        overlay_mirrors: OverlayMirrors::default(),
+        shape_triggers: Vec::new(),
+    };
+    let mut live = Vec::new();
+    let mut dispatchers = BTreeSet::new();
+    let mut translated = Vec::with_capacity(creations.len());
+    for creation in creations {
+        crate::options::follow_table_triggers(&mut live, creation);
+        let context = context.with_table_triggers(&live);
+        let at = Position { schema, binding: schema, context: &context, in_transaction: false };
+        let mut emitted = trackers.translate(creation, at, &mut |_| {})?;
+        trackers.follow(creation, &mut emitted, at, &[])?;
+        crate::impls::translator_impls::body_storage::append_dispatchers(
+            &mut emitted,
+            &context,
+            &mut dispatchers,
+        );
+        translated.push(emitted);
+    }
+    Ok(translated)
+}
+
 impl Pg2Sqlite {
     /// Refuses a table that is both renamed and placed under row level
     /// security.
@@ -2132,8 +2172,10 @@ impl Pg2Sqlite {
                 }
             })
             .collect();
-        let connection = crate::history::connection_program(&units, &schema, &context, &mut placed);
-        let (main, attached) = crate::history::fresh_forms(&units, &mut placed, &schema, &context);
+        let connection =
+            history::connection_program(initial_schema, &units, &schema, &context, &mut placed);
+        let (main, attached) =
+            history::fresh_forms(&units, &mut placed, &schema, &context, initial_schema.is_some());
         drop(units);
         let functions = self.reached_functions(
             context.take_helper_functions(),
@@ -2262,6 +2304,14 @@ impl Pg2Sqlite {
     ///
     /// Loaded schema statements update that state before later statements are
     /// translated.
+    ///
+    /// The script applies the statements to existing database files through
+    /// [`FreshFiles::Both`](crate::script::FreshFiles::Both) and refuses the
+    /// other selections, since a fresh file would lack every object of
+    /// `schema`. When a statement may change a relation, a grant, a policy, a
+    /// role or a trigger, [`Script::connect`] also recreates the connection
+    /// objects the translations behind `schema` left, so a new connection runs
+    /// it alone.
     ///
     /// # Errors
     ///

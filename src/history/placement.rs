@@ -12,9 +12,9 @@ use sql_traits::{
     traits::{DatabaseLike, TableLike, ViewLike},
 };
 use sqlparser::ast::{
-    AlterTableOperation, ColumnOption, CreateTable, CreateTrigger, FromTable, ObjectName,
-    ObjectNamePart, ObjectType, RenameTableNameKind, SetExpr, Statement, TableConstraint,
-    TableFactor, TableObject, Visit, visit_statements_mut,
+    AlterTableOperation, ColumnOption, CreateTable, CreateTrigger, FromTable, Grant, GrantObjects,
+    ObjectName, ObjectNamePart, ObjectType, RenameTableNameKind, Revoke, SetExpr, Statement,
+    TableConstraint, TableFactor, TableObject, Visit, visit_statements_mut,
 };
 
 #[cfg(not(feature = "std"))]
@@ -185,33 +185,8 @@ pub(crate) fn place<'r>(
         .map(|(source, translated)| (source, translated.as_slice()))
         .chain(sources.iter().zip(emitted.iter().map(Vec::as_slice)))
         .collect();
-    let storage = match attached {
-        Some(attached) => attached_storage(&units, attached, schema, options)?,
-        None => BTreeSet::new(),
-    };
-    let mut homes = homes(&units, schema, &storage);
+    let (homes, logical_storage) = layout(&units, schema, options)?;
     drop(units);
-    let mut logical_storage = Homes::new();
-    for table in schema.tables() {
-        let physical = resolve_trigger_table_name(table.table_name(), table, schema, options)?;
-        let mut physical_key = HomeKey { main: !table.temporary, name: key(&physical) };
-        if !homes.contains_key(&physical_key) {
-            physical_key.main = false;
-        }
-        // Nothing the batch emits relocates a table it does not create.
-        let placement = homes.get(&physical_key).copied().unwrap_or_else(|| {
-            if table.temporary {
-                Placement::Temp
-            } else if storage.contains(&physical_key.name) {
-                Placement::Attached
-            } else {
-                Placement::Main
-            }
-        });
-        let logical_key = HomeKey { main: physical_key.main, name: key(table.table_name()) };
-        homes.insert(physical_key, placement);
-        logical_storage.insert(logical_key, placement);
-    }
     let mut trigger_homes = Homes::new();
     // An earlier trigger keeps the home its object's translation gave it, so
     // the batch dropping it drops it where it lives.
@@ -244,6 +219,92 @@ pub(crate) fn place<'r>(
         trigger_homes,
         attached_schema,
     })
+}
+
+/// Where every object `units` create lives, and where each table of `schema`
+/// keeps its rows under its logical name.
+fn layout(
+    units: &[(&Statement, &[Statement])],
+    schema: &ParserDB,
+    options: &Pg2SqliteOptions,
+) -> Result<(Homes, Homes), Error> {
+    let storage = match options.get_attached_tables() {
+        Some(attached) => attached_storage(units, attached, schema, options)?,
+        None => BTreeSet::new(),
+    };
+    let mut homes = homes(units, schema, &storage);
+    let mut logical_storage = Homes::new();
+    for table in schema.tables() {
+        let physical = resolve_trigger_table_name(table.table_name(), table, schema, options)?;
+        let mut physical_key = HomeKey { main: !table.temporary, name: key(&physical) };
+        if !homes.contains_key(&physical_key) {
+            physical_key.main = false;
+        }
+        // Nothing the batch emits relocates a table it does not create.
+        let placement = homes.get(&physical_key).copied().unwrap_or_else(|| {
+            if table.temporary {
+                Placement::Temp
+            } else if storage.contains(&physical_key.name) {
+                Placement::Attached
+            } else {
+                Placement::Main
+            }
+        });
+        let logical_key = HomeKey { main: physical_key.main, name: key(table.table_name()) };
+        homes.insert(physical_key, placement);
+        logical_storage.insert(logical_key, placement);
+    }
+    Ok((homes, logical_storage))
+}
+
+/// The `temp` statements that recreate, on a new connection, the connection
+/// objects of every persistent table, view and trigger `schema` holds once
+/// `sources`, the committed statements of the batch, have run, `None` without
+/// attached tables, where no such object lives in `temp`.
+///
+/// The creations translate as one batch declaring them would, against
+/// `schema` and in `context`, so each object takes the grants, policies,
+/// owners and sibling triggers `schema` gives it. Tables come first, then
+/// views, then triggers, so each object exists before a trigger on it. A
+/// trigger on a `TEMP` relation is left to the batch that created it.
+pub(crate) fn final_connection(
+    schema: &ParserDB,
+    sources: &[&Statement],
+    context: &TranslationContext<'_>,
+) -> Result<Option<Vec<Statement>>, Error> {
+    let Some(attached) = context.get_attached_tables() else { return Ok(None) };
+    let temporary = temporary_relations(schema, sources.iter().copied());
+    let mut creations = Vec::new();
+    for table in schema.tables().filter(|table| !table.temporary) {
+        creations.push(Statement::CreateTable(as_declared(table, schema)?));
+    }
+    creations.extend(schema.views().filter(|view| !view.is_temporary()).map(creation));
+    creations.extend(
+        final_triggers(schema, sources)
+            .into_iter()
+            .filter(|trigger| !temporary.contains(&folded(&trigger.table_name)))
+            .map(Statement::CreateTrigger),
+    );
+    let translated = crate::pg2sqlite::translate_creations(&creations, schema, context)?;
+    let units: Vec<(&Statement, &[Statement])> =
+        creations.iter().zip(translated.iter().map(Vec::as_slice)).collect();
+    let (homes, logical_storage) = layout(&units, schema, context)?;
+    drop(units);
+    let mut trigger_homes = Homes::new();
+    let mut connection = Vec::new();
+    for mut statement in translated.into_iter().flatten() {
+        let placement = place_statement(
+            &mut statement,
+            attached.schema(),
+            &homes,
+            &logical_storage,
+            &mut trigger_homes,
+        )?;
+        if placement == Placement::Temp {
+            connection.push(statement);
+        }
+    }
+    Ok(Some(connection))
 }
 
 /// The translations of the views and the tables a view stands for that
@@ -327,6 +388,128 @@ fn add_changed_names(statement: &Statement, names: &mut BTreeSet<String>) {
         }
         _ => {}
     }
+}
+
+/// The folded names of the `TEMP` relations `schema` holds or `sources`
+/// create, and of the indexes `sources` create on them.
+pub(crate) fn temporary_relations<'s>(
+    schema: &ParserDB,
+    sources: impl IntoIterator<Item = &'s Statement>,
+) -> BTreeSet<String> {
+    let mut names: BTreeSet<String> = schema
+        .tables()
+        .filter(|table| table.temporary)
+        .map(|table| key(table.table_name()))
+        .chain(schema.views().filter(|view| view.is_temporary()).map(|view| key(view.view_name())))
+        .collect();
+    for statement in sources {
+        match statement {
+            Statement::CreateTable(create) if create.temporary || in_pg_temp(&create.name) => {
+                names.insert(folded(&create.name));
+            }
+            Statement::CreateView(view) if view.temporary || in_pg_temp(&view.name) => {
+                names.insert(folded(&view.name));
+            }
+            Statement::CreateIndex(index) if names.contains(&folded(&index.table_name)) => {
+                names.extend(index.name.as_ref().map(folded));
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// The triggers `schema` holds and those `sources` create, less those a later
+/// statement of `sources` drops or takes with its relation, each on the name
+/// its relation has once `sources` have run. The translation schema holds
+/// none of the batch's own triggers.
+fn final_triggers(schema: &ParserDB, sources: &[&Statement]) -> Vec<CreateTrigger> {
+    let same = |left: &ObjectName, right: &ObjectName| folded(left) == folded(right);
+    let mut triggers: Vec<CreateTrigger> = schema.triggers().cloned().collect();
+    for statement in sources {
+        match statement {
+            Statement::CreateTrigger(create) => {
+                triggers.retain(|kept| {
+                    !same(&kept.name, &create.name) || !same(&kept.table_name, &create.table_name)
+                });
+                triggers.push(create.clone());
+            }
+            Statement::DropTrigger(drop) => {
+                triggers.retain(|kept| {
+                    !same(&kept.name, &drop.trigger_name)
+                        || drop.table_name.as_ref().is_some_and(|table| !same(&kept.table_name, table))
+                });
+            }
+            Statement::Drop { object_type: ObjectType::Table | ObjectType::View, names, .. } => {
+                triggers.retain(|kept| !names.iter().any(|name| same(&kept.table_name, name)));
+            }
+            Statement::AlterTable(alter) => {
+                for operation in &alter.operations {
+                    if let AlterTableOperation::RenameTable {
+                        table_name: RenameTableNameKind::As(to) | RenameTableNameKind::To(to),
+                    } = operation
+                    {
+                        for kept in &mut triggers {
+                            if same(&kept.table_name, &alter.name) {
+                                kept.table_name = to.clone();
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    triggers
+}
+
+/// The SQLite-folded last part of `name`.
+fn folded(name: &ObjectName) -> String {
+    key(&last_ident_value_or_display(name))
+}
+
+/// Whether `name` is qualified by PostgreSQL's `pg_temp` schema.
+fn in_pg_temp(name: &ObjectName) -> bool {
+    name.0.len() > 1
+        && name.0[0].as_ident().is_some_and(|schema| schema.value.eq_ignore_ascii_case("pg_temp"))
+}
+
+/// Whether `statement` changes relations of `relations` alone, creating,
+/// dropping or altering them or a trigger, index, policy or grant on them,
+/// or reads and writes rows without changing any relation.
+pub(crate) fn changes_only(statement: &Statement, relations: &BTreeSet<String>) -> bool {
+    let mut changed = BTreeSet::new();
+    add_changed_names(statement, &mut changed);
+    let mut add = |name: &ObjectName| {
+        changed.insert(key(&last_ident_value_or_display(name)));
+    };
+    match statement {
+        Statement::CreateTrigger(trigger) => add(&trigger.table_name),
+        Statement::DropTrigger(drop) => {
+            let Some(table) = &drop.table_name else { return false };
+            add(table);
+        }
+        Statement::CreateIndex(index) => add(&index.table_name),
+        Statement::CreatePolicy(policy) => add(&policy.table_name),
+        Statement::AlterPolicy(policy) => add(&policy.table_name),
+        Statement::DropPolicy(policy) => add(&policy.table_name),
+        Statement::Grant(Grant {
+            objects: Some(GrantObjects::Tables(names) | GrantObjects::Views(names)),
+            ..
+        })
+        | Statement::Revoke(Revoke {
+            objects: Some(GrantObjects::Tables(names) | GrantObjects::Views(names)),
+            ..
+        }) => names.iter().for_each(add),
+        Statement::Insert(_)
+        | Statement::Update(_)
+        | Statement::Delete(_)
+        | Statement::Query(_)
+        | Statement::Merge(_) => {}
+        _ if changed.is_empty() => return false,
+        _ => {}
+    }
+    changed.iter().all(|name| relations.contains(name))
 }
 
 /// Adds the relations `statement` reads, writes, or creates or drops a

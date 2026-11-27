@@ -1544,7 +1544,10 @@ impl core::ops::Deref for TranslationContext<'_> {
 
 /// Follows in `triggers` the triggers `statement` creates, drops, or carries
 /// to a renamed table, and forgets those of a dropped table.
-fn follow_table_triggers(triggers: &mut Vec<TableTrigger>, statement: &sqlparser::ast::Statement) {
+pub(crate) fn follow_table_triggers(
+    triggers: &mut Vec<TableTrigger>,
+    statement: &sqlparser::ast::Statement,
+) {
     use sqlparser::ast::{AlterTableOperation, ObjectType, RenameTableNameKind, Statement};
 
     use crate::impls::object_name::last_ident_value_or_display;

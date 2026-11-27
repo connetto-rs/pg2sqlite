@@ -3,12 +3,17 @@
 //! A database file keeps what the batch committed to it, while `TEMP` objects
 //! and their rows end with the connection. Reconnecting therefore replays the
 //! committed history of the connection objects that survive the batch, and
-//! refuses when that history would write the database file again.
+//! refuses when that history would write the database file again. A batch
+//! changing the schema an earlier translation left recreates the connection
+//! objects of the schema it leaves, so a new connection runs the newest such
+//! batch's program alone.
 
 mod effects;
 pub(crate) mod placement;
 mod rebind;
 pub(crate) mod transactions;
+
+use alloc::collections::BTreeSet;
 
 use sql_traits::{
     structs::{ParserDB, ParserDBIngestor},
@@ -29,7 +34,10 @@ use self::{
 use crate::no_std::prelude::*;
 use crate::{
     errors::{Error, RefusalCategory, TranslationDirection, TranslationRefusal},
-    impls::transaction_blocks::Disposition,
+    impls::{
+        privileges::statement_refusals::may_change_relations_or_grants,
+        transaction_blocks::Disposition,
+    },
     initialization::{Forms, InitializationError},
     manifest::Placement,
     options::TranslationContext,
@@ -69,11 +77,54 @@ pub(crate) struct Unit<'a> {
     pub(crate) disposition: &'a Disposition,
 }
 
-/// The statements a connection to an existing database file runs.
+/// The `temp` statements recreating every connection object the schema
+/// leaves once a batch translated against `earlier` has run, when the batch
+/// may change the schema, and `None` when it holds its own objects only.
+///
+/// A new connection runs the program of the newest translation that may
+/// change the schema alone, so that program recreates the objects of every
+/// translation, its own included, as `final_schema` and the `committed`
+/// statements of the batch leave them. The error says why they cannot be
+/// rebuilt, which leaves initialization usable.
+fn final_connection(
+    earlier: Option<&ParserDB>,
+    committed: &[&Statement],
+    final_schema: &ParserDB,
+    context: &TranslationContext<'_>,
+) -> Result<Option<Vec<Statement>>, ConnectionError> {
+    let Some(earlier) = earlier else { return Ok(None) };
+    if !committed.iter().any(|statement| may_change_relations_or_grants(statement)) {
+        return Ok(None);
+    }
+    let temporary = earlier
+        .tables()
+        .filter(|table| table.temporary)
+        .map(|table| table.table_name())
+        .chain(earlier.views().filter(|view| view.is_temporary()).map(|view| view.view_name()))
+        .next();
+    if let Some(name) = temporary {
+        return Err(refusal(format!(
+            "`TEMP` relation `{name}` of an earlier translation lives only on the connections \
+             running that translation's connection program, and no schema records its rows. \
+             Translate the whole history as one batch to connect to it."
+        )));
+    }
+    placement::final_connection(final_schema, committed, context).map_err(|error| {
+        refusal(format!("the connection objects of the final schema cannot be rebuilt: {error}"))
+    })
+}
+
+/// The statements a connection to an existing database file runs, for a
+/// batch translated against `earlier` when given.
+///
+/// When the batch may change that schema, the program first recreates the
+/// connection objects the final schema holds, and replays only the history of
+/// the batch's own `TEMP` relations after them.
 ///
 /// The error says why the connection part cannot be produced, which leaves
 /// initialization usable.
 pub(crate) fn connection_program(
+    earlier: Option<&ParserDB>,
     units: &[Unit<'_>],
     final_schema: &ParserDB,
     context: &TranslationContext<'_>,
@@ -82,7 +133,13 @@ pub(crate) fn connection_program(
     let sources: Vec<Statement> = units.iter().map(|unit| unit.source.clone()).collect();
     let dispositions: Vec<Disposition> = units.iter().map(|unit| *unit.disposition).collect();
     let outline = Outline::new(&sources, &dispositions);
-
+    let committed: Vec<&Statement> = sources
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| outline.outcome(StatementId(*index)) == Outcome::Committed)
+        .map(|(_, source)| source)
+        .collect();
+    let rebuilt = final_connection(earlier, &committed, final_schema, context)?;
     let mut catalog = Catalog::default();
     let effects: Vec<Effects> = units
         .iter()
@@ -94,8 +151,16 @@ pub(crate) fn connection_program(
             }
         })
         .collect();
-    let retained = retention(&catalog, &effects);
-    if !retained.iter().any(|kept| *kept) {
+    let mut retained = retention(&catalog, &effects);
+    let temporary =
+        rebuilt.as_ref().map(|_| placement::temporary_relations(final_schema, &sources));
+    if let Some(temporary) = &temporary {
+        for (kept, source) in retained.iter_mut().zip(&sources) {
+            *kept = *kept && placement::changes_only(source, temporary);
+        }
+    }
+    let rebuilt = rebuilt.unwrap_or_default();
+    if rebuilt.is_empty() && !retained.iter().any(|kept| *kept) {
         return Ok(Vec::new());
     }
     for (index, kept) in retained.iter().enumerate() {
@@ -108,7 +173,8 @@ pub(crate) fn connection_program(
             )));
         }
     }
-    replay(units, &retained, &outline, final_schema, context, placed)
+    let replayed = Replayed { units, retained: &retained, outline: &outline };
+    replay(rebuilt, temporary.as_ref(), replayed, final_schema, context, placed)
 }
 
 /// Which units the surviving connection objects need.
@@ -140,18 +206,28 @@ fn retention(catalog: &Catalog, effects: &[Effects]) -> Vec<bool> {
     retained
 }
 
-/// Emits the retained units in source order, grouping the ones a source
-/// transaction committed together.
+/// The units of a batch, which of them the connection program replays, and
+/// the transactions they ran in.
+struct Replayed<'u, 'a> {
+    units: &'u [Unit<'a>],
+    retained: &'u [bool],
+    outline: &'u Outline,
+}
+
+/// Emits `rebuilt`, then the retained units in source order, grouping the
+/// ones a source transaction committed together. With `temporary`, the units
+/// replay over the final schema with only those relations removed, since
+/// `rebuilt` already holds every other one.
 fn replay(
-    units: &[Unit<'_>],
-    retained: &[bool],
-    outline: &Outline,
+    rebuilt: Vec<Statement>,
+    temporary: Option<&BTreeSet<String>>,
+    Replayed { units, retained, outline }: Replayed<'_, '_>,
     final_schema: &ParserDB,
     context: &TranslationContext<'_>,
     placed: &mut Placed,
 ) -> Result<Vec<Statement>, ConnectionError> {
-    let mut schema = ReplaySchema::new(final_schema, Files::CONNECTION, &placed.homes)?;
-    let mut program = Vec::new();
+    let mut schema = ReplaySchema::new(final_schema, Files::CONNECTION, &placed.homes, temporary)?;
+    let mut program = rebuilt;
     let mut open: Option<TransactionId> = None;
     for (index, unit) in units.iter().enumerate() {
         if !retained[index] {
@@ -195,16 +271,26 @@ fn replay(
 }
 
 /// The fresh-main and fresh-attached forms of every unit, each refused on its
-/// own when its rebinding needs history the target file does not have.
+/// own when its rebinding needs history the target file does not have, and
+/// both refused for a `migration`, a batch translated against an earlier
+/// schema.
 pub(crate) fn fresh_forms(
     units: &[Unit<'_>],
     placed: &mut Placed,
     final_schema: &ParserDB,
     context: &TranslationContext<'_>,
+    migration: bool,
 ) -> (Forms<Statement>, Forms<Statement>) {
-    let main = replay_fresh(units, final_schema, context, Files::MAIN, placed);
+    let fresh = |file, placed: &mut Placed| {
+        if migration {
+            Err(InitializationError::Migration)
+        } else {
+            replay_fresh(units, final_schema, context, file, placed)
+        }
+    };
+    let main = fresh(Files::MAIN, placed);
     let attached = if placed.attached_configured {
-        replay_fresh(units, final_schema, context, Files::ATTACHED, placed)
+        fresh(Files::ATTACHED, placed)
     } else {
         Err(InitializationError::NoAttachedDatabase)
     };
@@ -225,7 +311,7 @@ fn replay_fresh(
     file: Files,
     placed: &mut Placed,
 ) -> Forms<Statement> {
-    let mut schema = ReplaySchema::new(final_schema, file | Files::CONNECTION, &placed.homes)?;
+    let mut schema = ReplaySchema::new(final_schema, file | Files::CONNECTION, &placed.homes, None)?;
     let mut forms = Vec::with_capacity(units.len());
     for (index, unit) in units.iter().enumerate() {
         let owned = placed.unit_files[index].contains(file);
@@ -348,13 +434,18 @@ struct ReplaySchema {
 }
 
 impl ReplaySchema {
+    /// The final schema without the relations of `replay_homes`, or without
+    /// those of them `only` names by folded name when given.
     fn new(
         final_schema: &ParserDB,
         replay_homes: Files,
         homes: &Homes,
+        only: Option<&BTreeSet<String>>,
     ) -> Result<Self, ConnectionError> {
+        let replayed =
+            |name: &str| only.is_none_or(|names| names.contains(&name.to_ascii_lowercase()));
         let mut drops = Vec::new();
-        for view in final_schema.views() {
+        for view in final_schema.views().filter(|view| replayed(view.view_name())) {
             drops.extend(drop_of(
                 view.view_name(),
                 view.is_temporary(),
@@ -363,7 +454,7 @@ impl ReplaySchema {
                 "VIEW",
             ));
         }
-        for table in final_schema.tables() {
+        for table in final_schema.tables().filter(|table| replayed(table.table_name())) {
             drops.extend(drop_of(
                 table.table_name(),
                 table.is_temporary(),

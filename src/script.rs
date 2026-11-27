@@ -63,6 +63,12 @@ pub type HelperFunction<S = Statement> = pg2sqlite_runtime::HelperFunction<S>;
 /// [`files`](Self::files) or [`initialize`](Self::initialize), and every
 /// later connection runs [`connect`](Self::connect) instead. Every connection
 /// registers [`functions`](Self::functions) before running any part.
+///
+/// After a chain of scripts translated with
+/// [`translate_with_schema`](crate::pg2sqlite::Pg2Sqlite::translate_with_schema),
+/// a later connection runs the `connect` of the newest one that may change a
+/// relation, a grant, a policy, a role or a trigger, which recreates the
+/// connection objects of the scripts before it too.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Script<S = Statement> {
     /// Connection pragmas, `PRAGMA case_sensitive_like = 1` whenever the
@@ -119,8 +125,10 @@ impl<S> Script<S> {
     /// # Errors
     ///
     /// Returns [`Error::Initialization`] when the selection needs source
-    /// history the target file does not have, or names a file the
-    /// translation does not create.
+    /// history the target file does not have, names a file the
+    /// translation does not create, or picks one fresh file of a script
+    /// translated against an earlier schema, which would hold none of that
+    /// schema's objects.
     pub fn initialize(&self, files: FreshFiles) -> Result<impl Iterator<Item = &S>, Error> {
         let initialization = self.files.select(files)?;
         Ok(self.setup.iter().chain(initialization))
@@ -132,8 +140,9 @@ impl<S> Script<S> {
     /// # Errors
     ///
     /// Returns [`Error::Connection`] when the connection part needs a
-    /// relation or column the final schema dropped, or would repeat a write
-    /// to the database file.
+    /// relation or column the final schema dropped, would repeat a write
+    /// to the database file, or needs a `TEMP` relation an earlier
+    /// translation created.
     pub fn connect(&self) -> Result<impl Iterator<Item = &S>, Error> {
         let connection =
             self.connection.as_ref().map_err(|error| Error::Connection(error.clone()))?;
