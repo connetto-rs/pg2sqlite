@@ -21,7 +21,10 @@
 //! emitted SQL applies cleanly against an FTS5 vtable that has not
 //! been declared.
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation};
+
+use crate::helpers::Replica;
 
 const SCHEMA_WITHOUT_GIN_INDEX: &str = "\
 CREATE TABLE docs (
@@ -55,11 +58,9 @@ fn fts_predicate_without_gin_index_errors_at_translate_time() {
              vtable. The schema did not declare a `CREATE INDEX ... USING GIN`, so the rewrite \
              must error at translate time (or pass the predicate through). Got:\n{joined}"
         );
-        // Translated SQL is dynamically generated; rusqlite execute_batch
-        // proves SQLite accepts it.
-        let conn = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+        let mut conn = Replica::establish(":memory:").expect("in-memory SQLite");
         for s in &stmts {
-            conn.execute_batch(&format!("{s};"))
+            conn.batch_execute(&format!("{s};"))
                 .unwrap_or_else(|e| panic!("SQLite rejected emitted SQL: {e}\n{s}"));
         }
     }
@@ -89,11 +90,9 @@ SELECT id FROM docs WHERE to_tsvector('english', body) @@ to_tsquery('test');
         joined.contains("docs_fts MATCH 'test'"),
         "expected FTS5 MATCH rewrite, got:\n{joined}"
     );
-    // Translated SQL is dynamically generated; rusqlite execute_batch proves
-    // SQLite accepts it.
-    let conn = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+    let mut conn = Replica::establish(":memory:").expect("in-memory SQLite");
     for s in &stmts {
-        conn.execute_batch(&format!("{s};"))
+        conn.batch_execute(&format!("{s};"))
             .unwrap_or_else(|e| panic!("SQLite rejected emitted SQL: {e}\n{s}"));
     }
 }
@@ -143,11 +142,9 @@ SELECT id FROM Docs WHERE to_tsvector('english', body) @@ to_tsquery('test');
         .into_vec();
     let joined = stmts.iter().map(|s| format!("{s};")).collect::<Vec<_>>().join("\n");
     assert!(joined.contains("MATCH 'test'"), "expected FTS5 MATCH rewrite, got:\n{joined}");
-    // Translated SQL is dynamically generated; rusqlite execute_batch proves
-    // SQLite accepts it.
-    let conn = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+    let mut conn = Replica::establish(":memory:").expect("in-memory SQLite");
     for s in &stmts {
-        conn.execute_batch(&format!("{s};"))
+        conn.batch_execute(&format!("{s};"))
             .unwrap_or_else(|e| panic!("SQLite rejected emitted SQL: {e}\n{s}"));
     }
 }
@@ -175,10 +172,10 @@ WHERE to_tsvector('english', b.title) @@ to_tsquery('needle');
         joined.contains("b_fts MATCH 'needle'") && !joined.contains("a_fts"),
         "the rewrite should use the relation named by the document, got:\n{joined}"
     );
-    let connection = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = Replica::establish(":memory:").expect("in-memory SQLite");
     for statement in statements {
         connection
-            .execute_batch(&statement.to_string())
+            .batch_execute(&statement.to_string())
             .unwrap_or_else(|error| panic!("SQLite rejected emitted SQL: {error}\n{statement}"));
     }
 }

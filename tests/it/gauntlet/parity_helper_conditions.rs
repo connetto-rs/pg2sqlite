@@ -19,7 +19,7 @@
 // `register_impl` takes an unwind-safe closure, which a poisoning mutex is.
 use std::sync::{Arc, Mutex};
 
-use diesel::{data_types::PgTimestamp, pg::PgConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{data_types::PgTimestamp, pg::PgConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
 use sql_traits::structs::{Deployment, SessionSetting, SetPacking, SettingValue};
 use sqlparser::ast::DataType;
@@ -882,31 +882,35 @@ fn postgres(predicate: &str) -> PgConnection {
 }
 
 /// The replica, whose settings read what `request` holds.
-fn sqlite(predicate: &str, request: &Arc<Mutex<Request>>) -> SqliteConnection {
+fn sqlite(predicate: &str, request: &Arc<Mutex<Request>>) -> crate::helpers::Replica {
     let translated = Pg2Sqlite::default()
         .sql(&format!("{OWNER}{SCHEMA}{}", policy(predicate)))
         .expect("parse")
         .translate(&options())
         .unwrap_or_else(|error| panic!("pg2sqlite refused {predicate}: {error}"));
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-    translated.register_functions(&mut connection).expect("register helper functions");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
+    translated.register_managed(&mut connection).expect("register helper functions");
     let translated = translated.into_vec();
-    crate::helpers::case_fold_functions::register(&mut connection);
+    let mut registration = connection.registration().expect("registration");
+    crate::helpers::case_fold_functions::register(registration.sqlite());
     let read = |pick: fn(&Request) -> Option<&'static str>| {
         let request = Arc::clone(request);
         move || pick(&request.lock().expect("the request lock")).map(str::to_owned)
     };
-    app_user_id_utils::register_impl(&mut connection, read(|request| request.user))
+    app_user_id_utils::register_impl(registration.sqlite(), read(|request| request.user))
         .expect("register app_user_id");
-    app_installation_id_utils::register_impl(&mut connection, read(|request| request.installation))
-        .expect("register app_installation_id");
-    app_link_ids_utils::register_impl(&mut connection, read(|request| request.links))
+    app_installation_id_utils::register_impl(
+        registration.sqlite(),
+        read(|request| request.installation),
+    )
+    .expect("register app_installation_id");
+    app_link_ids_utils::register_impl(registration.sqlite(), read(|request| request.links))
         .expect("register app_link_ids");
-    app_org_ids_utils::register_impl(&mut connection, read(|request| request.orgs))
+    app_org_ids_utils::register_impl(registration.sqlite(), read(|request| request.orgs))
         .expect("register app_org_ids");
-    app_level_utils::register_impl(&mut connection, read(|request| request.level))
+    app_level_utils::register_impl(registration.sqlite(), read(|request| request.level))
         .expect("register app_level");
-    app_verified_email_utils::register_impl(&mut connection, read(|request| request.email))
+    app_verified_email_utils::register_impl(registration.sqlite(), read(|request| request.email))
         .expect("register app_verified_email");
     apply_with_seed(&mut connection, &translated, |connection| {
         seed!(connection, replica, docs_rls, STORED_PAST, STORED_FUTURE);

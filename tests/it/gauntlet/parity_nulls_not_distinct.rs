@@ -1,7 +1,7 @@
 //! Parity for `NULLS NOT DISTINCT`, where PostgreSQL and the translated SQLite
 //! must accept or refuse each write as the scenario says.
 
-use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{pg::PgConnection, prelude::*};
 use helpers::establish_connection;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use postgres_harness::Outcome;
@@ -162,7 +162,7 @@ fn migrate_postgres(connection: &mut PgConnection) {
 }
 
 /// Translates the migration against the schema it follows.
-fn migrate_sqlite(connection: &mut SqliteConnection) {
+fn migrate_sqlite(connection: &mut crate::helpers::Replica) {
     let schema = Pg2Sqlite::default().sql(SOURCE).unwrap().build_schema().unwrap();
     let translated = Pg2Sqlite::default()
         .sql(MIGRATION)
@@ -177,7 +177,7 @@ fn migrate_sqlite(connection: &mut SqliteConnection) {
 }
 
 runner!(PgRunner, PgConnection, migrate_postgres);
-runner!(SqliteRunner, SqliteConnection, migrate_sqlite);
+runner!(SqliteRunner, crate::helpers::Replica, migrate_sqlite);
 
 fn scenario() -> Vec<(Step, Outcome)> {
     use Outcome::{Accepted, Refused};

@@ -303,7 +303,7 @@ fn test_generated_column_translation() -> Result<(), Box<dyn std::error::Error>>
         create_stmt.contains("GENERATED ALWAYS AS"),
         "Should preserve GENERATED ALWAYS AS, got: {create_stmt}"
     );
-    let mut conn = diesel::SqliteConnection::establish(":memory:")?;
+    let mut conn = helpers::Replica::establish(":memory:")?;
     for s in &translated {
         diesel::sql_query(s.to_string()).execute(&mut conn)?;
     }

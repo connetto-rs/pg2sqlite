@@ -19,12 +19,12 @@
 //! definition belongs to, and a reference the scope cannot answer is refused
 //! rather than guessed.
 
+use diesel::{Connection, connection::SimpleConnection};
 use helpers::translate_pg as translate;
 use pg2sqlite::{
     errors::Error,
     prelude::{Pg2Sqlite, Pg2SqliteOptions},
 };
-use rusqlite::Connection;
 
 use crate::helpers;
 
@@ -41,15 +41,20 @@ fn run(pg: &str) -> String {
     let mut emitted =
         translate(pg, &Pg2SqliteOptions::default()).expect("translation should succeed");
     let probe = emitted.pop().expect("the script emits at least one statement");
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("in-memory SQLite");
     for statement in &emitted {
         connection
-            .execute_batch(&format!("{statement};"))
+            .batch_execute(&format!("{statement};"))
             .unwrap_or_else(|error| panic!("emitted setup failed: {error}\n{statement}"));
     }
-    connection
-        .query_row(&probe, [], |row| row.get::<_, String>(0))
-        .unwrap_or_else(|error| panic!("emitted probe failed: {error}\n{probe}"))
+    let rows = helpers::query_values(&mut connection, &probe, &[])
+        .unwrap_or_else(|error| panic!("emitted probe failed: {error}\n{probe}"));
+    let helpers::SqliteAnyValue::Text(value) =
+        rows.into_iter().next().expect("first row").into_iter().next().expect("first column")
+    else {
+        panic!("expected a text value");
+    };
+    value
 }
 
 fn reverse(sqlite: &str, ddl: &str) -> Result<String, Error> {

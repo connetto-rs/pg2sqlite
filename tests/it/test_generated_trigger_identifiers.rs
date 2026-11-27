@@ -1,6 +1,7 @@
 //! Regression tests for trigger identifiers built through direct AST
 //! construction.
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
 #[test]
@@ -30,9 +31,9 @@ fn fts5_generated_trigger_sql_handles_quoted_identifiers() {
     );
     // Execute all translated statements to verify the output is valid SQLite.
     {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
         for stmt in &translated {
-            conn.execute_batch(&format!("{stmt};")).expect("translated SQL must execute in SQLite");
+            conn.batch_execute(&format!("{stmt};")).expect("translated SQL must execute in SQLite");
         }
     }
 }
@@ -64,12 +65,12 @@ fn vec0_generated_trigger_sql_handles_quoted_identifiers() {
     // Execute translated DDL, skipping vec0 virtual tables that need the
     // sqlite-vec extension loaded (unavailable in the standard test runtime).
     {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
         for stmt in &translated {
             if stmt.contains("USING vec0") {
                 continue;
             }
-            conn.execute_batch(&format!("{stmt};")).expect("translated SQL must execute in SQLite");
+            conn.batch_execute(&format!("{stmt};")).expect("translated SQL must execute in SQLite");
         }
     }
 }

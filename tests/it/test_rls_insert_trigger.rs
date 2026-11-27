@@ -3,7 +3,7 @@
 //! BEFORE INSERT maintenance trigger that mutates NEW but no UPDATE policy.
 //! PostgreSQL ground truth: INSERT (1,'a') → (1,'a*'), DELETE succeeds.
 
-use diesel::{Connection, QueryResult, RunQueryDsl, SqliteConnection, prelude::*};
+use diesel::{Connection, QueryResult, RunQueryDsl, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
 use crate::helpers;
@@ -46,7 +46,7 @@ const RTS_SCHEMA: &str = "
     CREATE TRIGGER rts_tag_trg BEFORE INSERT ON rts FOR EACH ROW EXECUTE FUNCTION rts_tag();
 ";
 
-fn insert_via_view(conn: &mut SqliteConnection, id: i32, tag: &str) -> QueryResult<usize> {
+fn insert_via_view(conn: &mut crate::helpers::Replica, id: i32, tag: &str) -> QueryResult<usize> {
     // INSERT goes through the INSTEAD OF INSERT trigger on the RLS view.
     diesel::sql_query(format!("INSERT INTO rts (id, tag) VALUES ({id}, '{tag}')")).execute(conn)
 }
@@ -360,7 +360,7 @@ fn rls_non_maintenance_before_insert_trigger_has_no_exemption() {
     );
 
     let mut conn = {
-        let mut c = SqliteConnection::establish(":memory:").expect("connect");
+        let mut c = crate::helpers::Replica::establish(":memory:").expect("connect");
         diesel::sql_query("PRAGMA recursive_triggers = ON").execute(&mut c).expect("pragma");
         for stmt in &stmts {
             diesel::sql_query(stmt.as_str())

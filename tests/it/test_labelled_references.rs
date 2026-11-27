@@ -34,7 +34,7 @@ fn trigger_on_t(event: &str, function: &str, body: &str) -> String {
     )
 }
 
-fn rows(conn: &mut SqliteConnection) -> Vec<(i32, Option<i32>, Option<String>)> {
+fn rows(conn: &mut crate::helpers::Replica) -> Vec<(i32, Option<i32>, Option<String>)> {
     t::table.order(t::id).load(conn).expect("rows load")
 }
 

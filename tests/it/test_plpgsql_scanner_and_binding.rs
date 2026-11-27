@@ -50,7 +50,7 @@ fn run_with_options(pg: &str, probe: &str, options: &Pg2SqliteOptions) -> Vec<Pa
         .translate_to_sql(options)
         .expect("translate")
         .into_vec();
-    let mut connection = SqliteConnection::establish(":memory:").expect("connect");
+    let mut connection = helpers::Replica::establish(":memory:").expect("connect");
     for statement in &statements {
         diesel::sql_query(statement)
             .execute(&mut connection)

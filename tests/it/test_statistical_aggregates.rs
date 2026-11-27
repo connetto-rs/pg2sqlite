@@ -16,13 +16,13 @@
 // be computed alongside the one SQLite answers.
 #![allow(clippy::cast_precision_loss)]
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use rusqlite::Connection;
 use statistical_aggregates::{
     STATISTICAL_AGGREGATES, register_statistical_aggregates, registered_names,
 };
 
-use crate::helpers::statistical_aggregates;
+use crate::helpers::{Replica, SqliteAnyValue, query_values, statistical_aggregates};
 
 /// Options declaring all nine, which is what a caller who registered them
 /// writes.
@@ -52,21 +52,26 @@ fn translate(pg: &str, options: &Pg2SqliteOptions) -> Vec<String> {
 fn evaluate(pg: &str) -> Vec<Option<f64>> {
     let mut statements = translate(pg, &declared());
     let probe = statements.pop().expect("a probe statement");
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
-    register_statistical_aggregates(&connection).expect("register the aggregates");
+    let mut connection = Replica::establish(":memory:").expect("in-memory SQLite");
+    register_statistical_aggregates(connection.registration().expect("registration").sqlite())
+        .expect("register the aggregates");
     for statement in &statements {
         connection
-            .execute_batch(&format!("{statement};"))
+            .batch_execute(&format!("{statement};"))
             .unwrap_or_else(|error| panic!("emitted setup failed: {error}\n{statement}"));
     }
-    let mut prepared = connection
-        .prepare(&probe)
-        .unwrap_or_else(|error| panic!("emitted probe failed to prepare: {error}\n{probe}"));
-    prepared
-        .query_map([], |row| row.get::<_, Option<f64>>(0))
+    query_values(&mut connection, &probe, &[])
         .expect("query the probe")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("read every row")
+        .into_iter()
+        .map(|row| {
+            match row[0] {
+                SqliteAnyValue::Null => None,
+                SqliteAnyValue::Real(value) => Some(value),
+                SqliteAnyValue::Integer(value) => Some(value as f64),
+                ref value => panic!("expected number, got {value:?}"),
+            }
+        })
+        .collect()
 }
 
 /// The single value of a one-row probe.

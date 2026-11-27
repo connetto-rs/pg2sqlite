@@ -14,7 +14,8 @@ path = "src/main.rs"
 
 [dependencies]
 # `default-features = false` drops git2/tempfile/std::fs, letting the crate build for wasm32.
-pg2sqlite = { path = "../..", default-features = false }
+# `managed` runs the translation on a connection answering its clock functions.
+pg2sqlite = { path = "../..", default-features = false, features = ["managed"] }
 
 dioxus = { version = "0.7", features = ["web"] }
 
@@ -62,6 +63,7 @@ dx_icons = { version = "0.1.0", features = ["simple"] }
 [patch.crates-io]
 sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
 sql-values = { git = "https://github.com/connetto-rs/sql-values", branch = "main" }
+diesel = { git = "https://github.com/diesel-rs/diesel", branch = "upstream/sqlite-table-valued-functions-dynamic" }
 
 [profile.release]
 opt-level = "z"

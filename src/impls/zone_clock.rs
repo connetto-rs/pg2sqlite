@@ -9,6 +9,7 @@
 //! since SQLite's own `localtime` and `utc` modifiers read the host
 //! process's zone.
 
+use pg2sqlite_runtime::{TRANSACTION_TIMESTAMP, TypmodRounding};
 use sql_traits::structs::ParserDB;
 use sqlparser::ast::{BinaryOperator, Expr};
 
@@ -21,7 +22,7 @@ use crate::{
         datetime_helpers::{
             DatePartKey, build_date_part_expr, build_date_trunc_quarter_call,
             build_date_trunc_week_call, build_date_trunc_year_span_call, build_strftime_call,
-            build_to_char_expr, canonical_timestamptz_text, local_timestamp_text,
+            build_to_char_expr, canonical_timestamptz_text, local_timestamp_text, round_text,
             split_at_offset_codes, temporal_microseconds, text_time_from_microseconds, time_of_day,
             timestamp_from_microseconds, to_char_has_iso_fields, to_char_zone_codes,
             to_char_zone_codes_to_literals, whole_second_timestamp,
@@ -291,10 +292,17 @@ pub(crate) fn conversion_wall_clock<'o>(
     zoned_wall_clock(operation, need, schema, options).map(Some)
 }
 
-/// The `±HH:MM` offset the zone has now, which a time of day written without
-/// one takes.
+/// `pg2sqlite_transaction_timestamp()`, the canonical `timestamptz` text of
+/// the instant the running transaction started, which a managed connection
+/// answers.
+pub(crate) fn transaction_instant() -> Expr {
+    simple_function_expr(TRANSACTION_TIMESTAMP, Vec::new(), None)
+}
+
+/// The `±HH:MM` offset the zone has at the transaction's start, which a time
+/// of day written without one takes.
 pub(crate) fn offset_now(zoned: ZonedWallClock<'_>) -> Expr {
-    let now = simple_function_expr("datetime", vec![string_literal("now")], None);
+    let now = transaction_instant();
     zoned.offset(zoned.local(now.clone()), now, OffsetForm::Stored)
 }
 
@@ -828,45 +836,42 @@ impl LocalClock {
     }
 }
 
-/// The local clock of now `which` reads in the request's zone.
+/// The local clock `which` reads at the transaction's start in the request's
+/// zone, rounded to `precision` fractional digits when one is given.
+///
+/// PostgreSQL answers each from the instant the transaction started, as the
+/// cast of that `timestamptz` to the clock's type would.
 ///
 /// # Errors
 ///
 /// Refuses a zone that does not resolve.
 pub(crate) fn local_clock_clock(
     which: LocalClock,
+    precision: Option<u32>,
     schema: &ParserDB,
     options: &TranslationContext<'_>,
 ) -> Result<Expr, Error> {
     let zoned = zoned_wall_clock(which.name(), "read the wall clock of", schema, options)?;
-    let now_of = |function: &str| simple_function_expr(function, vec![string_literal("now")], None);
-    let now = now_of("datetime");
-    let local = zoned.local(now.clone());
-    let time = match zoned {
-        // SQLite's own clock reads UTC.
-        ZonedWallClock::Utc => now_of("time"),
-        ZonedWallClock::Zone(_) => time_of_day(local.clone()),
+    let instant = transaction_instant();
+    let local = match zoned {
+        ZonedWallClock::Utc => local_timestamp_text(instant.clone(), None),
+        ZonedWallClock::Zone(clock) => clock.local(instant.clone()),
     };
-    Ok(match (which, zoned) {
-        (LocalClock::Time, _) => time,
-        (LocalClock::Date, ZonedWallClock::Utc) => {
-            Expr::Function(sqlparser::ast::Function {
-                name: sqlparser::ast::ObjectName::from(vec![sqlparser::ast::Ident::new(
-                    "CURRENT_DATE",
-                )]),
-                parameters: sqlparser::ast::FunctionArguments::None,
-                args: sqlparser::ast::FunctionArguments::None,
-                null_treatment: None,
-                filter: None,
-                over: None,
-                within_group: vec![],
-                uses_odbc_syntax: false,
-            })
+    let rounded = |kind: TypmodRounding, text: Expr| {
+        match precision {
+            Some(precision) => round_text(kind, text, precision),
+            None => text,
         }
-        (LocalClock::Timestamp, _) => local,
-        (LocalClock::Date, _) => simple_function_expr("date", vec![local], None),
-        (LocalClock::TimeWithZone, _) => {
-            concat(time, zoned.offset(local, now, OffsetForm::Printed))
+    };
+    Ok(match which {
+        LocalClock::Date => simple_function_expr("date", vec![local], None),
+        LocalClock::Timestamp => rounded(TypmodRounding::Timestamp, local),
+        LocalClock::Time => rounded(TypmodRounding::Time, time_of_day(local)),
+        LocalClock::TimeWithZone => {
+            concat(
+                rounded(TypmodRounding::Time, time_of_day(local.clone())),
+                zoned.offset(local, instant, OffsetForm::Printed),
+            )
         }
     })
 }

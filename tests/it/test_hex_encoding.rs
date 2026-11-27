@@ -14,6 +14,7 @@
 //! case-insensitively and a non-literal argument is refused rather than
 //! guessed.
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use sql_traits::structs::ParserDB;
 use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
@@ -45,14 +46,18 @@ fn reverse(sqlite: &str) -> Result<String, pg2sqlite::errors::Error> {
 
 /// Runs a translated expression over a fixture row and answers the one value.
 fn value_of(sqlite: &str) -> String {
-    let connection = rusqlite::Connection::open_in_memory().expect("open SQLite");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
     connection
-        .execute_batch(
+        .batch_execute(
             "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT, bin BLOB, enc TEXT);
              INSERT INTO t VALUES (1, '0abcde', x'0abcde', 'hex');",
         )
         .expect("fixture");
-    connection.query_row(sqlite, [], |row| row.get::<_, String>(0)).expect("one value")
+    let rows = crate::helpers::query_values(&mut connection, sqlite, &[]).expect("one value");
+    match rows.into_iter().next().expect("one row").into_iter().next().expect("first column") {
+        crate::helpers::SqliteAnyValue::Text(value) => value,
+        value => panic!("expected text, got {value:?}"),
+    }
 }
 
 // ---------- outbound: PostgreSQL to SQLite ----------

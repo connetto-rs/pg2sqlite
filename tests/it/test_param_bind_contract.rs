@@ -3,7 +3,7 @@
 //! The emitted SQL performs every re-representation conversion so the stored
 //! value and the bound value are always in the same terms.
 
-use diesel::{Connection, RunQueryDsl, SqliteConnection};
+use diesel::{Connection, RunQueryDsl};
 use pg2sqlite::prelude::{ArrayRepresentation, Pg2Sqlite, Pg2SqliteOptions};
 
 use crate::helpers::{is_user_statement, translate_pg, user_statement_of};
@@ -18,10 +18,14 @@ use crate::helpers::{is_user_statement, translate_pg, user_statement_of};
 ///
 /// Panics when translation fails, when no statement of `kind` is emitted, or
 /// when an applied statement is rejected.
-fn setup_and_probe(pg: &str, options: &Pg2SqliteOptions, kind: &str) -> (SqliteConnection, String) {
+fn setup_and_probe(
+    pg: &str,
+    options: &Pg2SqliteOptions,
+    kind: &str,
+) -> (crate::helpers::Replica, String) {
     let statements = translate_pg(pg, options).expect("translation should succeed");
     let probe = user_statement_of(&statements, kind).clone();
-    let mut connection = SqliteConnection::establish(":memory:").expect("open");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("open");
     for statement in statements.iter().filter(|statement| !is_user_statement(statement, kind)) {
         diesel::sql_query(statement).execute(&mut connection).expect("setup");
     }

@@ -11,11 +11,11 @@
 //! the part a script cannot do: every other connection that writes needs the
 //! pragma too.
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::{
     prelude::{Pg2Sqlite, Pg2SqliteOptions},
     warnings::TranslationWarning,
 };
-use rusqlite::Connection;
 
 const PARENT_AND_CHILD: &str = "CREATE TABLE p (id int primary key);
      CREATE TABLE c (id int primary key, pid int REFERENCES p(id));
@@ -26,11 +26,7 @@ const PARENT_AND_CHILD: &str = "CREATE TABLE p (id int primary key);
 /// keys off, which is SQLite's own default, and answers the error of the
 /// first statement that fails, or `None`.
 ///
-/// The pragma is turned off explicitly because `rusqlite` turns it on for
-/// every connection it opens, measured as `PRAGMA foreign_keys = 1`, where
-/// the `sqlite3` command line and a plain C connection answer 0. Leaving
-/// that alone would make these tests pass on a driver default rather than on
-/// what the emitted script says.
+/// Foreign keys start disabled so the emitted script controls enforcement.
 fn apply_on_a_default_connection(pg: &str) -> Option<String> {
     let statements = Pg2Sqlite::default()
         .sql(pg)
@@ -38,12 +34,12 @@ fn apply_on_a_default_connection(pg: &str) -> Option<String> {
         .translate_to_sql(&Pg2SqliteOptions::default())
         .expect("fixture translates")
         .into_vec();
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("in-memory SQLite");
     connection
-        .execute_batch("PRAGMA foreign_keys = OFF;")
+        .batch_execute("PRAGMA foreign_keys = OFF;")
         .expect("a connection as SQLite hands it out");
     for statement in &statements {
-        if let Err(error) = connection.execute_batch(&format!("{statement};")) {
+        if let Err(error) = connection.batch_execute(&format!("{statement};")) {
             return Some(error.to_string());
         }
     }

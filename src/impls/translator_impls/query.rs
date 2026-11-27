@@ -1886,27 +1886,25 @@ mod tests {
             panic!("expected translated select");
         };
 
-        assert!(select.prewhere.as_ref().is_some_and(|expr| {
-            expr.to_string().contains("strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')")
-        }));
+        let reader = pg2sqlite_runtime::TRANSACTION_TIMESTAMP;
+        assert!(select.prewhere.as_ref().is_some_and(|expr| expr.to_string().contains(reader)));
 
-        assert!(translated.settings.as_ref().is_some_and(|settings| {
-            settings[0].value.to_string().contains("strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')")
-        }));
+        assert!(
+            translated
+                .settings
+                .as_ref()
+                .is_some_and(|settings| settings[0].value.to_string().contains(reader))
+        );
 
         match &translated.pipe_operators[0] {
             sqlparser::ast::PipeOperator::Where { expr } => {
-                assert!(expr.to_string().contains("strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"));
+                assert!(expr.to_string().contains(reader));
             }
             other => panic!("unexpected first pipe operator variant: {other:?}"),
         }
         match &translated.pipe_operators[1] {
             sqlparser::ast::PipeOperator::Union { queries, .. } => {
-                assert!(
-                    queries[0]
-                        .to_string()
-                        .contains("strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')")
-                );
+                assert!(queries[0].to_string().contains(reader));
             }
             other => panic!("unexpected second pipe operator variant: {other:?}"),
         }

@@ -1,7 +1,7 @@
 //! Parity for `BEFORE` row triggers that assign `NEW` columns, which the
 //! replica runs as an `UPDATE` of the written row.
 
-use diesel::{pg::PgConnection, prelude::*, sql_types::Text, sqlite::SqliteConnection};
+use diesel::{pg::PgConnection, prelude::*, sql_types::Text};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use postgres_harness::Outcome;
 use sql_traits::structs::ParserDB;
@@ -11,7 +11,7 @@ use crate::{helpers, helpers::postgres as postgres_harness};
 
 /// The replica of `source` on a fresh connection, with the schema it was
 /// translated against.
-fn replica(source: &str) -> (SqliteConnection, ParserDB) {
+fn replica(source: &str) -> (crate::helpers::Replica, ParserDB) {
     let translator = Pg2Sqlite::default().sql(source).expect("parse the fixture");
     let statements =
         translator.translate(&Pg2SqliteOptions::default()).expect("translate the fixture");
@@ -127,7 +127,7 @@ macro_rules! event_runner {
 }
 
 event_runner!(EventSourceRunner, PgConnection);
-event_runner!(EventReplicaRunner, SqliteConnection);
+event_runner!(EventReplicaRunner, crate::helpers::Replica);
 
 /// `TG_OP` and `TG_TABLE_NAME` name the event and table the trigger fired
 /// for, and `OLD` reads NULL on `INSERT`, in a value the trigger assigns.
@@ -196,7 +196,7 @@ fn read_stamp(id: i32) -> String {
 /// A PostgreSQL statement run on both engines, translated for the replica.
 struct Stamping {
     source: PgConnection,
-    replica: SqliteConnection,
+    replica: crate::helpers::Replica,
     schema: ParserDB,
 }
 

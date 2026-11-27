@@ -7,7 +7,7 @@
 //! finding about the translator, reported with the fixture, the step, and both
 //! outcomes.
 
-use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{pg::PgConnection, prelude::*};
 use helpers::{establish_connection, set_session_department, set_session_user_id};
 use pg2sqlite::prelude::{Pg2SqliteOptions, UuidRepresentation};
 use postgres_harness::Outcome;
@@ -35,7 +35,7 @@ fn uc() -> Uuid {
 /// seeding, and authoritative loads run with triggers
 /// disabled. Diesel cannot reach sqlite3_db_config, so the toggle is
 /// replaced by applying triggers only after the seeds.
-fn apply_base_ddl(conn: &mut SqliteConnection, translated: Vec<String>) -> Vec<String> {
+fn apply_base_ddl(conn: &mut crate::helpers::Replica, translated: Vec<String>) -> Vec<String> {
     let (triggers, base): (Vec<String>, Vec<String>) =
         translated.into_iter().partition(|s| s.starts_with("CREATE TRIGGER"));
     for stmt in &base {
@@ -46,7 +46,7 @@ fn apply_base_ddl(conn: &mut SqliteConnection, translated: Vec<String>) -> Vec<S
 }
 
 /// Applies the withheld triggers once seeding is done.
-fn arm_triggers(conn: &mut SqliteConnection, triggers: &[String]) {
+fn arm_triggers(conn: &mut crate::helpers::Replica, triggers: &[String]) {
     for stmt in triggers {
         diesel::sql_query(stmt.clone())
             .execute(conn)
@@ -158,7 +158,7 @@ struct BasicPgRunner {
     current_role: String,
 }
 struct BasicSqliteRunner {
-    connection: SqliteConnection,
+    connection: crate::helpers::Replica,
     acting: Uuid,
 }
 
@@ -470,7 +470,7 @@ struct MultiPgRunner {
     current_role: String,
 }
 struct MultiSqliteRunner {
-    connection: SqliteConnection,
+    connection: crate::helpers::Replica,
     acting: Uuid,
 }
 
@@ -761,7 +761,7 @@ struct TenantPgRunner {
     current_role: String,
 }
 struct TenantSqliteRunner {
-    connection: SqliteConnection,
+    connection: crate::helpers::Replica,
     acting: Uuid,
 }
 
@@ -1045,7 +1045,7 @@ struct PublicPgRunner {
     current_role: String,
 }
 struct PublicSqliteRunner {
-    connection: SqliteConnection,
+    connection: crate::helpers::Replica,
     acting: Uuid,
 }
 
@@ -1350,7 +1350,7 @@ struct CurrentUserPgRunner {
     acting: String,
 }
 struct CurrentUserSqliteRunner {
-    connection: SqliteConnection,
+    connection: crate::helpers::Replica,
 }
 
 macro_rules! current_user_step {

@@ -8,7 +8,7 @@
 //! length of 1. `VARCHAR(5 OCTETS)` is a syntax error, so the octet unit
 //! cannot arrive from PostgreSQL.
 
-use diesel::{RunQueryDsl, SqliteConnection};
+use diesel::RunQueryDsl;
 use pg2sqlite::{
     prelude::{Pg2Sqlite, Pg2SqliteOptions},
     warnings::{DowngradeLocation, TranslationWarning},
@@ -25,7 +25,7 @@ struct ColumnInfo {
 }
 
 /// The declared SQLite type of every column of `table` but `id`.
-fn declared_types(connection: &mut SqliteConnection, table: &str) -> Vec<(String, String)> {
+fn declared_types(connection: &mut crate::helpers::Replica, table: &str) -> Vec<(String, String)> {
     // A pragma has no diesel DSL form, so the column types are read as text.
     diesel::sql_query(format!(
         "SELECT name, type AS declared FROM pragma_table_info('{table}') WHERE name <> 'id'"

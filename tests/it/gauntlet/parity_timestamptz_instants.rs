@@ -3,7 +3,7 @@
 //! compared with an instant, `timestamptz` and `timetz` text written without
 //! an offset, and a time of day given the zone's offset.
 
-use diesel::{data_types::PgTimestamp, prelude::*, sqlite::SqliteConnection};
+use diesel::{data_types::PgTimestamp, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
 use super::{
@@ -138,8 +138,8 @@ fn a_wall_clock_default_of_an_instant_column_reads_in_the_zone() {
             .and_then(|source| source.translate(opts))
             .unwrap_or_else(|error| panic!("pg2sqlite refused the table under {zone}: {error}"))
             .into_vec();
-        let mut replica = SqliteConnection::establish(":memory:").expect("open SQLite");
-        zone_functions::register(&mut replica);
+        let mut replica = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
+        zone_functions::register(replica.registration().expect("registration").sqlite());
         execute_ddl(&mut replica, &statements);
         diesel::insert_into(replica_schema::d::table)
             .values(replica_schema::d::id.eq(1))

@@ -7,7 +7,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{pg::PgConnection, prelude::*};
 use helpers::establish_connection;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation};
 use postgres_harness::Outcome;
@@ -53,25 +53,25 @@ fn uuid_text_impl() -> String {
 /// connection. Raw SQL is the right tool here: the translator emits
 /// multi-statement DDL with dollar-quoted bodies that the typed DSL cannot
 /// express.
-fn apply_to_sqlite(fixture: &str) -> SqliteConnection {
+fn apply_to_sqlite(fixture: &str) -> crate::helpers::Replica {
     apply_to_sqlite_with(fixture, &options())
 }
 
-fn apply_to_sqlite_with(fixture: &str, options: &Pg2SqliteOptions) -> SqliteConnection {
+fn apply_to_sqlite_with(fixture: &str, options: &Pg2SqliteOptions) -> crate::helpers::Replica {
     let translated = Pg2Sqlite::default()
         .sql(fixture)
         .expect("parse fixture")
         .translate(options)
-        .expect("translate fixture")
-        .into_vec();
+        .expect("translate fixture");
     let mut conn = establish_connection();
-    uuid_text_utils::register_impl(&mut conn, uuid_text_impl).expect("register uuid_text");
-    for stmt in &translated {
-        // DDL migration: raw SQL is the correct form here.
-        diesel::sql_query(stmt.to_string())
-            .execute(&mut conn)
-            .unwrap_or_else(|e| panic!("DDL failed: {e}\n{stmt}"));
-    }
+    uuid_text_utils::register_impl(
+        conn.registration().expect("registration").sqlite(),
+        uuid_text_impl,
+    )
+    .expect("register uuid_text");
+    translated
+        .initialize_managed(&mut conn, pg2sqlite::script::FreshFiles::Both)
+        .expect("initialize replica");
     conn
 }
 
@@ -138,7 +138,7 @@ macro_rules! elsif_runner {
 }
 
 elsif_runner!(ElsifPgRunner, PgConnection);
-elsif_runner!(ElsifSqliteRunner, SqliteConnection);
+elsif_runner!(ElsifSqliteRunner, crate::helpers::Replica);
 
 /// All four branches: error (high), warning (medium), info (low), else
 /// (unknown). Each is driven once and the audit_log is read after each insert.
@@ -280,7 +280,7 @@ macro_rules! trigger_issue_runner {
 }
 
 trigger_issue_runner!(TriggerIssuePgRunner, PgConnection);
-trigger_issue_runner!(TriggerIssueSqliteRunner, SqliteConnection);
+trigger_issue_runner!(TriggerIssueSqliteRunner, crate::helpers::Replica);
 
 fn trigger_issue_scenario() -> Vec<TriggerIssueStep> {
     vec![
@@ -380,7 +380,7 @@ macro_rules! uuid_insert_runner {
 }
 
 uuid_insert_runner!(UuidInsertPgRunner, PgConnection);
-uuid_insert_runner!(UuidInsertSqliteRunner, SqliteConnection);
+uuid_insert_runner!(UuidInsertSqliteRunner, crate::helpers::Replica);
 
 fn uuid_insert_scenario() -> Vec<UuidInsertStep> {
     vec![
@@ -482,7 +482,7 @@ macro_rules! recursive_runner {
 }
 
 recursive_runner!(RecursivePgRunner, PgConnection);
-recursive_runner!(RecursiveSqliteRunner, SqliteConnection);
+recursive_runner!(RecursiveSqliteRunner, crate::helpers::Replica);
 
 fn recursive_scenario() -> Vec<RecursiveStep> {
     vec![
@@ -648,7 +648,7 @@ macro_rules! groups_runner {
 }
 
 groups_runner!(GroupsPgRunner, PgConnection);
-groups_runner!(GroupsSqliteRunner, SqliteConnection);
+groups_runner!(GroupsSqliteRunner, crate::helpers::Replica);
 
 /// Adding alice to the child group propagates up to parent and grandparent,
 /// giving three memberships. Removing from the parent cascades down and removes

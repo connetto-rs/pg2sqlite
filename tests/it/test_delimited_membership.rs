@@ -19,7 +19,10 @@ use pg2sqlite::{
 use sql_traits::structs::{SessionSetting, SetPacking, SettingValue};
 use sqlparser::ast::DataType;
 
-use crate::helpers::deployment::{delimited, deployment, scalar};
+use crate::helpers::{
+    Replica,
+    deployment::{delimited, deployment, scalar},
+};
 
 diesel::define_sql_function! {
     /// Answers the delimited session setting the policy reads.
@@ -63,7 +66,7 @@ INSERT INTO keys (id, k) VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'a,b'), (5, NU
 /// The pragmas are the ones `tests/helpers/mod.rs` gives every other row
 /// level security test, so the guarded view is exercised under the settings a
 /// replica is opened with rather than under bare defaults.
-fn open(pg: &str, options: &Pg2SqliteOptions, subjects: Option<&'static str>) -> SqliteConnection {
+fn open(pg: &str, options: &Pg2SqliteOptions, subjects: Option<&'static str>) -> Replica {
     let script = Pg2Sqlite::default()
         .sql(pg)
         .expect("parse")
@@ -74,10 +77,11 @@ fn open(pg: &str, options: &Pg2SqliteOptions, subjects: Option<&'static str>) ->
         .map(|statement| format!("{statement};"))
         .collect::<Vec<_>>()
         .join("\n");
-    let mut connection = SqliteConnection::establish(":memory:").expect("connect");
-    current_app_subjects_utils::register_impl(&mut connection, move || {
-        subjects.map(str::to_string)
-    })
+    let mut connection = Replica::establish(":memory:").expect("connect");
+    current_app_subjects_utils::register_impl(
+        connection.registration().expect("registration").sqlite(),
+        move || subjects.map(str::to_string),
+    )
     .expect("register current_app_subjects");
     connection
         .batch_execute("PRAGMA foreign_keys = ON; PRAGMA recursive_triggers = ON;")
@@ -347,18 +351,28 @@ fn a_membership_test_on_another_delimiter_is_refused() {
 
 /// Seeds the backing table the way an authoritative apply does, with the
 /// generated triggers disabled.
-fn seed(connection: &mut SqliteConnection, owners: &[Option<&str>]) {
-    connection.set_triggers_enabled(false).expect("disable triggers for the seed");
+fn seed(connection: &mut Replica, owners: &[Option<&str>]) {
+    connection
+        .registration()
+        .expect("registration")
+        .sqlite()
+        .set_triggers_enabled(false)
+        .expect("disable triggers for the seed");
     for owner in owners {
         diesel::insert_into(t_rls::table)
             .values(t_rls::owner.eq(*owner))
             .execute(connection)
             .expect("seed the backing table");
     }
-    connection.set_triggers_enabled(true).expect("re-enable triggers");
+    connection
+        .registration()
+        .expect("registration")
+        .sqlite()
+        .set_triggers_enabled(true)
+        .expect("re-enable triggers");
 }
 
-fn visible(connection: &mut SqliteConnection) -> Vec<Option<String>> {
+fn visible(connection: &mut Replica) -> Vec<Option<String>> {
     t::table.select(t::owner).order(t::owner).load(connection).expect("read the guarded view")
 }
 

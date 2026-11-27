@@ -8,9 +8,12 @@
 //! The literal cases read the declared value back out of the row, so a default
 //! that is mangled rather than lost is visible.
 
-use rusqlite::Connection;
+use diesel::{Connection as _, connection::SimpleConnection};
 
-use crate::helpers;
+use crate::{
+    helpers,
+    helpers::{Replica as Connection, SqliteAnyValue, query_values},
+};
 
 /// The schema and trigger around the body under test.
 fn template(body: &str) -> String {
@@ -28,10 +31,10 @@ fn template(body: &str) -> String {
 fn apply(body: &str) -> Result<Connection, String> {
     let statements = helpers::translate_default_statements(&template(body))?;
 
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = Connection::establish(":memory:").expect("in-memory SQLite");
     for statement in &statements {
         connection
-            .execute_batch(&format!("{statement};"))
+            .batch_execute(&format!("{statement};"))
             .map_err(|error| format!("{error}\n{statement}"))?;
     }
     Ok(connection)
@@ -40,7 +43,7 @@ fn apply(body: &str) -> Result<Connection, String> {
 /// Declare `v_msg` with `default`, write it into the row, and return what was
 /// stored. A default the scanner cut short comes back short.
 fn stored_default(default: &str) -> Result<Option<String>, String> {
-    let connection = apply(&format!(
+    let mut connection = apply(&format!(
         "DECLARE
              v_msg TEXT := {default};
          BEGIN
@@ -48,9 +51,15 @@ fn stored_default(default: &str) -> Result<Option<String>, String> {
              RETURN NEW;
          END;"
     ))?;
-    connection.execute("INSERT INTO t VALUES (1, 5, NULL)", []).map_err(|e| e.to_string())?;
-    connection
-        .query_row("SELECT note FROM log", [], |row| row.get(0))
+    connection.execute("INSERT INTO t VALUES (1, 5, NULL)", &[]).map_err(|e| e.to_string())?;
+    query_values(&mut connection, "SELECT note FROM log", &[])
+        .map(|mut rows| {
+            match rows.remove(0).remove(0) {
+                SqliteAnyValue::Null => None,
+                SqliteAnyValue::Text(value) => Some(value),
+                value => panic!("expected text, got {value:?}"),
+            }
+        })
         .map_err(|error| error.to_string())
 }
 
@@ -105,7 +114,7 @@ fn a_dollar_quoted_default_is_scanned_as_one_token() {
 #[test]
 fn a_keyword_inside_a_comment_is_not_a_keyword() {
     for comment in ["-- RAISE EXCEPTION never happens; END", "/* RAISE EXCEPTION happens; END */"] {
-        let connection = apply(&format!(
+        let mut connection = apply(&format!(
             "BEGIN
                  {comment}
                  INSERT INTO log (note) VALUES ('ok');
@@ -113,9 +122,16 @@ fn a_keyword_inside_a_comment_is_not_a_keyword() {
              END;"
         ))
         .unwrap_or_else(|error| panic!("`{comment}` must be ignored: {error}"));
-        connection.execute("INSERT INTO t VALUES (1, 5, NULL)", []).expect("insert");
-        let note: Option<String> =
-            connection.query_row("SELECT note FROM log", [], |row| row.get(0)).expect("row");
+        connection.execute("INSERT INTO t VALUES (1, 5, NULL)", &[]).expect("insert");
+        let note: Option<String> = match query_values(&mut connection, "SELECT note FROM log", &[])
+            .expect("row")
+            .remove(0)
+            .remove(0)
+        {
+            SqliteAnyValue::Null => None,
+            SqliteAnyValue::Text(value) => Some(value),
+            value => panic!("expected text, got {value:?}"),
+        };
         assert_eq!(note, Some("ok".to_string()), "{comment}");
     }
 }
@@ -123,7 +139,7 @@ fn a_keyword_inside_a_comment_is_not_a_keyword() {
 /// R55: an identifier that merely contains a keyword must not be rewritten.
 #[test]
 fn an_identifier_containing_a_keyword_is_left_alone() {
-    let connection = apply(
+    let mut connection = apply(
         "DECLARE
              myelsif INT := 1;
          BEGIN
@@ -134,8 +150,15 @@ fn an_identifier_containing_a_keyword_is_left_alone() {
          END;",
     )
     .expect("the identifier must not be rewritten");
-    connection.execute("INSERT INTO t VALUES (1, 5, NULL)", []).expect("insert");
-    let note: Option<String> =
-        connection.query_row("SELECT note FROM log", [], |row| row.get(0)).expect("row");
+    connection.execute("INSERT INTO t VALUES (1, 5, NULL)", &[]).expect("insert");
+    let note: Option<String> = match query_values(&mut connection, "SELECT note FROM log", &[])
+        .expect("row")
+        .remove(0)
+        .remove(0)
+    {
+        SqliteAnyValue::Null => None,
+        SqliteAnyValue::Text(value) => Some(value),
+        value => panic!("expected text, got {value:?}"),
+    };
     assert_eq!(note, Some("positive".to_string()));
 }

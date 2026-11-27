@@ -101,7 +101,7 @@ fn options() -> Pg2SqliteOptions {
 }
 
 struct Replica {
-    connection: SqliteConnection,
+    connection: crate::helpers::Replica,
     calls: Arc<AtomicUsize>,
     depth: Arc<AtomicI32>,
     marks: Arc<Mutex<Vec<i32>>>,
@@ -115,39 +115,42 @@ impl Replica {
         if attached {
             connection.batch_execute("ATTACH ':memory:' AS shared").unwrap();
         }
-        script.register_functions(&mut connection).unwrap();
-        policy_write_exempt_utils::register_nondeterministic_impl(&mut connection, || false)
-            .unwrap();
+        script.register_managed(&mut connection).unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let depth = Arc::new(AtomicI32::new(0));
         let marks = Arc::new(Mutex::new(Vec::new()));
         let generation_depths = Arc::new(Mutex::new(Vec::new()));
         {
-            let calls = Arc::clone(&calls);
-            let depth = Arc::clone(&depth);
-            let generation_depths = Arc::clone(&generation_depths);
-            counted_policy_uuid_utils::register_nondeterministic_impl(&mut connection, move || {
-                generation_depths.lock().unwrap().push(depth.load(Ordering::Relaxed));
-                value(calls.fetch_add(1, Ordering::Relaxed) + 1)
-            })
+            let mut registration = connection.registration().expect("registration");
+            policy_write_exempt_utils::register_nondeterministic_impl(
+                registration.sqlite(),
+                || false,
+            )
             .unwrap();
-        }
-        {
-            let depth = Arc::clone(&depth);
-            let marks = Arc::clone(&marks);
-            derived_policy_utils::register_nondeterministic_impl(
-                &mut connection,
-                move |step: i32| {
-                    marks.lock().unwrap().push(step);
-                    depth.fetch_add(step, Ordering::Relaxed) + step
+            let generator_calls = Arc::clone(&calls);
+            let generator_depth = Arc::clone(&depth);
+            let generator_depths = Arc::clone(&generation_depths);
+            counted_policy_uuid_utils::register_nondeterministic_impl(
+                registration.sqlite(),
+                move || {
+                    generator_depths.lock().unwrap().push(generator_depth.load(Ordering::Relaxed));
+                    value(generator_calls.fetch_add(1, Ordering::Relaxed) + 1)
                 },
             )
             .unwrap();
-        }
-        {
-            let depth = Arc::clone(&depth);
-            policy_depth_utils::register_nondeterministic_impl(&mut connection, move || {
-                depth.load(Ordering::Relaxed)
+            let derived_depth = Arc::clone(&depth);
+            let derived_marks = Arc::clone(&marks);
+            derived_policy_utils::register_nondeterministic_impl(
+                registration.sqlite(),
+                move |step: i32| {
+                    derived_marks.lock().unwrap().push(step);
+                    derived_depth.fetch_add(step, Ordering::Relaxed) + step
+                },
+            )
+            .unwrap();
+            let read_depth = Arc::clone(&depth);
+            policy_depth_utils::register_nondeterministic_impl(registration.sqlite(), move || {
+                read_depth.load(Ordering::Relaxed)
             })
             .unwrap();
         }

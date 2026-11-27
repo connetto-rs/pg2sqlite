@@ -4,7 +4,7 @@
 //! Each fixture fires its trigger with the same writes on both engines and
 //! compares what it left in `log`.
 
-use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{pg::PgConnection, prelude::*};
 use helpers::establish_connection;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use postgres_harness::Outcome;
@@ -98,7 +98,7 @@ macro_rules! runner {
 }
 
 runner!(PostgresRunner, PgConnection);
-runner!(SqliteRunner, SqliteConnection);
+runner!(SqliteRunner, crate::helpers::Replica);
 
 /// Fires `triggers` with one row that grows and one that shrinks, and asserts
 /// both engines accept the same writes and log the same rows.

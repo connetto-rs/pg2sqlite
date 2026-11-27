@@ -64,8 +64,9 @@ tempfile = "3.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 testcontainers = { version = "0.27", features = ["blocking"] }
 parking_lot = "0.13.0"
-# The tests register the replica's functions through `diesel` and replay sql-traits' parity fixtures.
-pg2sqlite = { path = ".", features = ["diesel", "parity"] }
+# The tests register the replica's functions through `diesel`, run translated
+# clocks on a managed connection and replay sql-traits' parity fixtures.
+pg2sqlite = { path = ".", features = ["diesel", "managed", "parity"] }
 
 # Optional integration gated by the `sqlitegis` feature. Declared in
 # `[dependencies]` (not `[dev-dependencies]`) because Cargo only honors
@@ -112,11 +113,14 @@ sqlitegis = [
 ]
 # Derives `Arbitrary` on `Pg2SqliteOptions` and the types it holds, for the fuzz harnesses.
 arbitrary = ["dep:arbitrary", "pg2sqlite-runtime/arbitrary"]
-# `JsonbFunctions::register`, `CaseFoldFunctions::register` and `Script::register_functions` on a diesel `SqliteConnection`.
+# `JsonbFunctions::register` and `CaseFoldFunctions::register` on a diesel `SqliteConnection`.
 diesel = ["dep:diesel", "pg2sqlite-runtime/diesel"]
+# `ManagedConnection`, which answers the clock functions a translation calls
+# from the instants it samples at each transaction and statement start.
+managed = ["diesel", "pg2sqlite-runtime/managed"]
 # `parity::replay`, answering rls-parity's row-level security cases, which
-# sql-traits ships behind `parity-fixtures`, on the SQLite replica.
-parity = ["std", "diesel", "sql-traits/parity-fixtures"]
+# sql-traits ships behind `parity-fixtures`, on a managed SQLite replica.
+parity = ["std", "managed", "sql-traits/parity-fixtures"]
 
 # Every crate in this graph targets unreleased sqlparser AST, so this patch is
 # not droppable. Against released 0.62.0 the build dies inside `sql-traits`

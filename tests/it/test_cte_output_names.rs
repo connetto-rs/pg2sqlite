@@ -1,7 +1,9 @@
 //! CTE output names remain stable across physical column renames.
 
+use diesel::Connection;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use rusqlite::Connection;
+
+use crate::helpers::{Replica, SqliteAnyValue, query_values};
 
 fn assert_after_rename(definition: &str, query: &str, expected: &[i64]) {
     let source = format!(
@@ -18,29 +20,30 @@ fn assert_after_rename(definition: &str, query: &str, expected: &[i64]) {
         .expect("translate source");
     let directory = tempfile::tempdir().expect("database directory");
     let path = directory.path().join("main.db");
-    let values = |connection: &Connection| {
-        connection
-            .prepare(query)
-            .expect("prepare result")
-            .query_map([], |row| row.get::<_, i64>(0))
+    let values = |connection: &mut Replica| {
+        query_values(connection, query, &[])
             .expect("query result")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("read result")
+            .into_iter()
+            .map(|row| {
+                match row.into_iter().next().expect("result column") {
+                    SqliteAnyValue::Integer(value) => value,
+                    value => panic!("expected integer, got {value:?}"),
+                }
+            })
+            .collect::<Vec<_>>()
     };
     {
-        let connection = Connection::open(&path).expect("create database");
-        for statement in script.iter() {
-            connection
-                .execute_batch(statement)
-                .unwrap_or_else(|error| panic!("{error}\n{statement}"));
-        }
-        assert_eq!(values(&connection), expected);
+        let mut connection =
+            Replica::establish(path.to_str().expect("database path")).expect("create database");
+        script
+            .initialize_managed(&mut connection, pg2sqlite::script::FreshFiles::Both)
+            .expect("initialize database");
+        assert_eq!(values(&mut connection), expected);
     }
-    let connection = Connection::open(&path).expect("reopen database");
-    for statement in script.connect().expect("connection program") {
-        connection.execute_batch(statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
-    }
-    assert_eq!(values(&connection), expected);
+    let mut connection =
+        Replica::establish(path.to_str().expect("database path")).expect("reopen database");
+    script.connect_managed(&mut connection).expect("connection program");
+    assert_eq!(values(&mut connection), expected);
 }
 
 #[test]

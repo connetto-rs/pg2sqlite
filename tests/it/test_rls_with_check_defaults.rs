@@ -19,6 +19,8 @@
 use diesel::prelude::*;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
+use crate::helpers::Replica;
+
 mod schema {
     diesel::table! {
         /// RLS view over `docs_rls`.
@@ -87,12 +89,12 @@ const TABLE: &str = "
 /// the seed plays the system-load role, which runs with triggers disabled
 /// under the authoritative-load contract, and diesel cannot reach
 /// sqlite3_db_config.
-fn setup(policies: &str) -> Result<SqliteConnection, Box<dyn std::error::Error>> {
+fn setup(policies: &str) -> Result<Replica, Box<dyn std::error::Error>> {
     let pg = format!("{TABLE}{policies}");
     let options = Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit");
     let translated = Pg2Sqlite::default().sql(&pg)?.translate(&options)?.into_vec();
 
-    let mut conn = SqliteConnection::establish(":memory:")?;
+    let mut conn = Replica::establish(":memory:")?;
     let (triggers, base): (Vec<_>, Vec<_>) =
         translated.iter().map(ToString::to_string).partition(|s| s.starts_with("CREATE TRIGGER"));
     for statement in &base {
@@ -110,7 +112,7 @@ fn setup(policies: &str) -> Result<SqliteConnection, Box<dyn std::error::Error>>
     Ok(conn)
 }
 
-fn stored(conn: &mut SqliteConnection) -> Result<StoredRow, Box<dyn std::error::Error>> {
+fn stored(conn: &mut Replica) -> Result<StoredRow, Box<dyn std::error::Error>> {
     Ok(docs_rls::table.filter(docs_rls::id.eq(1)).select(StoredRow::as_select()).first(conn)?)
 }
 

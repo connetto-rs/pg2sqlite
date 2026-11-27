@@ -94,7 +94,7 @@ fn unnest_with_ordinality_still_numbers_the_rows() {
     )
     .expect("UNNEST WITH ORDINALITY must keep translating");
 
-    let mut conn = SqliteConnection::establish(":memory:").expect("connect");
+    let mut conn = crate::helpers::Replica::establish(":memory:").expect("connect");
     let select_sql = translated
         .iter()
         .find(|s| s.to_ascii_uppercase().trim_start().starts_with("SELECT"))

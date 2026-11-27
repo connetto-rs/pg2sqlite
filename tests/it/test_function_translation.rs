@@ -121,27 +121,26 @@ fn test_now_translation() {
         &helpers::deployment::utc_request(),
     );
 
-    // Should contain strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'), not NOW()
+    // Should contain pg2sqlite_transaction_timestamp(), not NOW()
     assert!(
-        select_stmt.contains("strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"),
-        "NOW() should translate to strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'), got: {select_stmt}"
+        select_stmt.contains("pg2sqlite_transaction_timestamp()"),
+        "NOW() should translate to pg2sqlite_transaction_timestamp(), got: {select_stmt}"
     );
     assert!(
         !select_stmt.to_uppercase().contains("NOW()"),
         "Should not contain NOW(), got: {select_stmt}"
     );
 
-    // Execute DDL statements and prepare the SELECT to verify SQLite accepts
-    // them.
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    // Execute the translated setup and query.
+    let mut conn = <crate::helpers::Replica as diesel::Connection>::establish(":memory:").unwrap();
     // Only `Query` nodes render SELECT-prefixed, so the text filter skips
     // exactly the queries the AST filter used to skip.
     for s in
         translated.iter().filter(|s| !s.trim_start().to_ascii_uppercase().starts_with("SELECT"))
     {
-        conn.execute_batch(&format!("{s};")).unwrap();
+        diesel::connection::SimpleConnection::batch_execute(&mut conn, &format!("{s};")).unwrap();
     }
-    conn.prepare(&select_stmt).unwrap();
+    helpers::query_values(&mut conn, &select_stmt, &[]).unwrap();
 }
 
 #[test]
@@ -207,17 +206,16 @@ fn test_string_agg_translation() {
         "Should not contain string_agg, got: {select_stmt}"
     );
 
-    // Execute DDL statements and prepare the SELECT to verify SQLite accepts
-    // them.
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    // Execute the translated setup and query.
+    let mut conn = <crate::helpers::Replica as diesel::Connection>::establish(":memory:").unwrap();
     // Only `Query` nodes render SELECT-prefixed, so the text filter skips
     // exactly the queries the AST filter used to skip.
     for s in
         translated.iter().filter(|s| !s.trim_start().to_ascii_uppercase().starts_with("SELECT"))
     {
-        conn.execute_batch(&format!("{s};")).unwrap();
+        diesel::connection::SimpleConnection::batch_execute(&mut conn, &format!("{s};")).unwrap();
     }
-    conn.prepare(&select_stmt).unwrap();
+    helpers::query_values(&mut conn, &select_stmt, &[]).unwrap();
 }
 
 #[test]
@@ -293,17 +291,16 @@ fn test_ilike_translation() {
         "Should not contain ILIKE, got: {select_stmt}"
     );
 
-    // Execute DDL statements and prepare the SELECT to verify SQLite accepts
-    // them.
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    // Execute the translated setup and query.
+    let mut conn = <crate::helpers::Replica as diesel::Connection>::establish(":memory:").unwrap();
     // Only `Query` nodes render SELECT-prefixed, so the text filter skips
     // exactly the queries the AST filter used to skip.
     for s in
         translated.iter().filter(|s| !s.trim_start().to_ascii_uppercase().starts_with("SELECT"))
     {
-        conn.execute_batch(&format!("{s};")).unwrap();
+        diesel::connection::SimpleConnection::batch_execute(&mut conn, &format!("{s};")).unwrap();
     }
-    conn.prepare(&select_stmt).unwrap();
+    helpers::query_values(&mut conn, &select_stmt, &[]).unwrap();
 }
 
 #[test]

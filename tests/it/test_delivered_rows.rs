@@ -2,8 +2,10 @@
 //! a PostgreSQL subscriber applying with `session_replication_role = replica`
 //! fires none of the table's triggers.
 
-use diesel::{connection::SimpleConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{connection::SimpleConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+
+use crate::helpers::Replica;
 
 diesel::table! {
     /// The table whose `stamped` a maintenance trigger writes on every write.
@@ -101,16 +103,19 @@ CREATE TRIGGER edges_copy_archive BEFORE INSERT OR UPDATE ON edges
     FOR EACH ROW EXECUTE FUNCTION copy_archive();
 ";
 
-fn replica() -> SqliteConnection {
+fn replica() -> Replica {
     let options = Pg2SqliteOptions::default().with_rls_exemption_function("delivery_exempt");
     let script = Pg2Sqlite::default()
         .sql(SCHEMA)
         .expect("parse")
         .translate_to_sql(&options)
         .expect("translate");
-    let mut connection = SqliteConnection::establish(":memory:").expect("open an in-memory SQLite");
-    delivery_exempt_utils::register_nondeterministic_impl(&mut connection, || false)
-        .expect("register the exemption");
+    let mut connection = Replica::establish(":memory:").expect("open an in-memory SQLite");
+    delivery_exempt_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        || false,
+    )
+    .expect("register the exemption");
     for statement in script.into_vec() {
         connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
     }
@@ -118,15 +123,21 @@ fn replica() -> SqliteConnection {
 }
 
 /// Runs `sql` as the server applies its rows.
-fn deliver(connection: &mut SqliteConnection, sql: &str) {
-    delivery_exempt_utils::register_nondeterministic_impl(connection, || true)
-        .expect("exempt the delivery");
+fn deliver(connection: &mut Replica, sql: &str) {
+    delivery_exempt_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        || true,
+    )
+    .expect("exempt the delivery");
     connection.batch_execute(sql).unwrap_or_else(|error| panic!("{error}\n{sql}"));
-    delivery_exempt_utils::register_nondeterministic_impl(connection, || false)
-        .expect("end the exemption");
+    delivery_exempt_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        || false,
+    )
+    .expect("end the exemption");
 }
 
-fn folders(connection: &mut SqliteConnection) -> Vec<(i32, bool, Option<String>, i32)> {
+fn folders(connection: &mut Replica) -> Vec<(i32, bool, Option<String>, i32)> {
     folders::table
         .select((folders::id, folders::archived, folders::stamped, folders::updates))
         .order(folders::id)
@@ -134,7 +145,7 @@ fn folders(connection: &mut SqliteConnection) -> Vec<(i32, bool, Option<String>,
         .expect("read folders")
 }
 
-fn edges(connection: &mut SqliteConnection) -> Vec<(i32, bool)> {
+fn edges(connection: &mut Replica) -> Vec<(i32, bool)> {
     edges::table
         .select((edges::id, edges::archived))
         .order(edges::id)
@@ -142,7 +153,7 @@ fn edges(connection: &mut SqliteConnection) -> Vec<(i32, bool)> {
         .expect("read edges")
 }
 
-fn audit(connection: &mut SqliteConnection) -> Vec<String> {
+fn audit(connection: &mut Replica) -> Vec<String> {
     audit::table.select(audit::source).order(audit::id).load(connection).expect("read audit")
 }
 

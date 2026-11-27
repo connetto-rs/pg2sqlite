@@ -1,18 +1,18 @@
 //! The shared PostgreSQL harness works, so the gauntlets built on it start
 //! from a known-good base.
 
-use diesel::{prelude::*, sqlite::SqliteConnection};
+use diesel::prelude::*;
 use postgres_harness::{FIXTURES, apply, fixture_source, fresh_database, read_every_table};
 use sqlparser::ast::Statement;
 
-use crate::helpers::postgres as postgres_harness;
+use crate::helpers::{Replica, postgres as postgres_harness};
 
 /// Executes every statement of `statements` on `connection`, panicking with
 /// the statement when SQLite refuses it.
 ///
 /// The statements are the translator's own output, which the typed query
 /// builder cannot express.
-pub fn execute_ddl(connection: &mut SqliteConnection, statements: &[Statement]) {
+pub fn execute_ddl(connection: &mut Replica, statements: &[Statement]) {
     for statement in statements {
         diesel::sql_query(statement.to_string())
             .execute(connection)
@@ -25,9 +25,9 @@ pub fn execute_ddl(connection: &mut SqliteConnection, statements: &[Statement]) 
 /// counterpart of the bypassing load that lands after the schema on
 /// PostgreSQL and before the triggers guard it.
 pub fn apply_with_seed(
-    connection: &mut SqliteConnection,
+    connection: &mut Replica,
     statements: &[Statement],
-    seed: impl FnOnce(&mut SqliteConnection),
+    seed: impl FnOnce(&mut Replica),
 ) {
     let (triggers, base): (Vec<_>, Vec<_>) =
         statements.iter().map(ToString::to_string).partition(|s| s.starts_with("CREATE TRIGGER"));

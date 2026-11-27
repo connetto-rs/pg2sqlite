@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use diesel::{connection::SimpleConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{connection::SimpleConnection, prelude::*};
 use pg2sqlite::{
     prelude::{Error, Pg2Sqlite, Pg2SqliteOptions, Script},
     script::FreshFiles,
@@ -130,11 +130,12 @@ impl Files {
         files
     }
 
-    fn open(&self) -> SqliteConnection {
-        SqliteConnection::establish(self.main.to_str().expect("utf-8 path")).expect("open main")
+    fn open(&self) -> crate::helpers::Replica {
+        crate::helpers::Replica::establish(self.main.to_str().expect("utf-8 path"))
+            .expect("open main")
     }
 
-    fn attach(&self, connection: &mut SqliteConnection) {
+    fn attach(&self, connection: &mut crate::helpers::Replica) {
         connection
             .batch_execute(&format!("ATTACH '{}' AS shared", self.shared.display()))
             .expect("attach shared");

@@ -6,7 +6,7 @@ use std::sync::{
 use diesel::{connection::SimpleConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation};
 
-use crate::helpers::{deployment::deployment, establish_connection};
+use crate::helpers::{Replica, deployment::deployment, establish_connection};
 
 diesel::table! {
     inputs (id) {
@@ -36,21 +36,24 @@ fn options() -> Pg2SqliteOptions {
         .with_uuid_v7_function_name("counted_dispatch_uuid")
 }
 
-fn connection() -> (SqliteConnection, Arc<AtomicUsize>) {
+fn connection() -> (Replica, Arc<AtomicUsize>) {
     let mut connection = establish_connection();
     let calls = Arc::new(AtomicUsize::new(0));
     let generator_calls = Arc::clone(&calls);
-    counted_dispatch_uuid_utils::register_nondeterministic_impl(&mut connection, move || {
-        u128::try_from(generator_calls.fetch_add(1, Ordering::Relaxed) + 1)
-            .unwrap()
-            .to_be_bytes()
-            .to_vec()
-    })
+    counted_dispatch_uuid_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        move || {
+            u128::try_from(generator_calls.fetch_add(1, Ordering::Relaxed) + 1)
+                .unwrap()
+                .to_be_bytes()
+                .to_vec()
+        },
+    )
     .unwrap();
     (connection, calls)
 }
 
-fn seed_candidates(connection: &mut SqliteConnection) {
+fn seed_candidates(connection: &mut Replica) {
     for identifier in 1..=3 {
         diesel::insert_into(candidates::table)
             .values(candidates::id.eq(identifier))
@@ -87,7 +90,7 @@ fn generated_dispatcher_replacement_applies_across_schema_batches() {
     let empty_schema = Pg2Sqlite::default().sql("").unwrap().build_schema().unwrap();
     let translated = parsed.translate_with_schema(&empty_schema, &options()).unwrap();
     let (mut connection, calls) = connection();
-    translated.register_functions(&mut connection).unwrap();
+    translated.register_managed(&mut connection).unwrap();
     for statement in translated.into_vec() {
         connection.batch_execute(&statement.to_string()).unwrap();
     }
@@ -136,7 +139,7 @@ fn untaken_generated_dispatcher_does_not_evaluate_loop_source() {
     );
     let translated = Pg2Sqlite::default().sql(&source).unwrap().translate(&options()).unwrap();
     let (mut connection, calls) = connection();
-    translated.register_functions(&mut connection).unwrap();
+    translated.register_managed(&mut connection).unwrap();
     let mut source_type = None;
     for statement in translated.into_vec() {
         if let sqlparser::ast::Statement::CreateTable(table) = &statement
@@ -237,7 +240,7 @@ fn generated_dispatcher_preserves_unknown_and_composed_query_inputs() {
         );
         let translated = Pg2Sqlite::default().sql(&source).unwrap().translate(&options()).unwrap();
         let (mut connection, calls) = connection();
-        translated.register_functions(&mut connection).unwrap();
+        translated.register_managed(&mut connection).unwrap();
         for statement in translated.into_vec() {
             connection.batch_execute(&statement.to_string()).unwrap();
         }

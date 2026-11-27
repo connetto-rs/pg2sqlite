@@ -3,7 +3,7 @@
 
 use std::{cell::Cell, path::PathBuf};
 
-use diesel::{connection::SimpleConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{connection::SimpleConnection, prelude::*};
 use pg2sqlite::prelude::{
     Error, FreshFiles, Pg2Sqlite, Pg2SqliteOptions, Placement, Script, SessionVariableMapping,
 };
@@ -141,23 +141,24 @@ impl Files {
     }
 
     /// A connection serving `caller`, with the shared file attached.
-    fn connect(&self, caller: &str) -> SqliteConnection {
+    fn connect(&self, caller: &str) -> crate::helpers::Replica {
         self.open(&self.main, caller)
     }
 
     /// A connection serving `caller` from the second main file, with the
     /// shared file attached.
-    fn connect_second(&self, caller: &str) -> SqliteConnection {
+    fn connect_second(&self, caller: &str) -> crate::helpers::Replica {
         self.open(&self.second_main, caller)
     }
 
-    fn open(&self, main: &std::path::Path, caller: &str) -> SqliteConnection {
+    fn open(&self, main: &std::path::Path, caller: &str) -> crate::helpers::Replica {
         let mut connection =
-            SqliteConnection::establish(main.to_str().expect("utf-8 path")).expect("open");
+            crate::helpers::Replica::establish(main.to_str().expect("utf-8 path")).expect("open");
         let caller = caller.to_owned();
-        current_app_user_utils::register_impl(&mut connection, move || caller.clone())
+        let mut registration = connection.registration().expect("registration");
+        current_app_user_utils::register_impl(registration.sqlite(), move || caller.clone())
             .expect("register the caller function");
-        write_is_exempt_utils::register_nondeterministic_impl(&mut connection, || {
+        write_is_exempt_utils::register_nondeterministic_impl(registration.sqlite(), || {
             WRITE_IS_EXEMPT.with(Cell::get)
         })
         .expect("register the RLS exemption");
@@ -180,7 +181,7 @@ fn set_write_exempt(exempt: bool) {
 
 /// Seeds the backing storage with the write guards exempt, the way a trusted
 /// sync bypasses the generated enforcement.
-fn seed_papers(connection: &mut SqliteConnection) {
+fn seed_papers(connection: &mut crate::helpers::Replica) {
     set_write_exempt(true);
     diesel::insert_into(paper_shares::table)
         .values(&[
@@ -208,7 +209,7 @@ fn seed_papers(connection: &mut SqliteConnection) {
 }
 
 /// Seeds the `notes` backing table directly, the way a server sync would.
-fn seed_notes(connection: &mut SqliteConnection) {
+fn seed_notes(connection: &mut crate::helpers::Replica) {
     set_write_exempt(true);
     diesel::insert_into(notes::table)
         .values(&[
@@ -232,7 +233,7 @@ fn seed_in_fresh_store(label: &str, script: &Script<String>) -> Files {
     files
 }
 
-fn visible_papers(connection: &mut SqliteConnection) -> Vec<(i32, String)> {
+fn visible_papers(connection: &mut crate::helpers::Replica) -> Vec<(i32, String)> {
     papers::table.order(papers::id).load(connection).expect("read papers")
 }
 

@@ -7,7 +7,7 @@
 //! An integer literal beside a column this crate cannot resolve in scope is
 //! also refused rather than passed through unscaled.
 
-use diesel::{Connection, ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection};
+use diesel::{Connection, ExpressionMethods, QueryDsl, RunQueryDsl};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use sql_traits::structs::ParserDB;
 use sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
@@ -67,8 +67,9 @@ fn reverse(sqlite_sql: &str) -> Result<String, pg2sqlite::errors::Error> {
 
 /// Opens an in-memory SQLite connection with the translated schema applied.
 /// Emitted DDL runs as text because it is the artifact under test.
-fn open_replica() -> SqliteConnection {
-    let mut conn = SqliteConnection::establish(":memory:").expect("in-memory SQLite should open");
+fn open_replica() -> crate::helpers::Replica {
+    let mut conn =
+        crate::helpers::Replica::establish(":memory:").expect("in-memory SQLite should open");
     for stmt in
         pg2sqlite().translate(&Pg2SqliteOptions::default()).expect("translate DDL").into_vec()
     {
@@ -82,7 +83,7 @@ fn open_replica() -> SqliteConnection {
 
 /// Seeds the replica with a row whose `amount` is already in minor units
 /// (replica form), using the typed schema so the insert is compile-checked.
-fn seed(conn: &mut SqliteConnection, id: i32, amount_minor_units: i64) {
+fn seed(conn: &mut crate::helpers::Replica, id: i32, amount_minor_units: i64) {
     diesel::insert_into(t::table)
         .values((t::id.eq(id), t::amount.eq(amount_minor_units)))
         .execute(conn)

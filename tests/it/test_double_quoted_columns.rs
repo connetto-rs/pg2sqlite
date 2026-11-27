@@ -7,10 +7,7 @@
 //! refused at translation with the SQLSTATE and message PostgreSQL 18 answers,
 //! and the backing table keeps its rows.
 
-use diesel::{
-    Connection, ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection,
-    connection::SimpleConnection,
-};
+use diesel::{Connection, ExpressionMethods, QueryDsl, RunQueryDsl, connection::SimpleConnection};
 use pg2sqlite::prelude::{Error, Pg2Sqlite, Pg2SqliteOptions, RefusalCategory, SqlState};
 use sql_traits::structs::ParserDB;
 use sqlstate::pg;
@@ -53,9 +50,9 @@ fn schema() -> ParserDB {
 
 /// The replica of [`SCHEMA`] as `app` sees it, on SQLite with its default
 /// flags, holding [`ROWS`].
-fn replica() -> SqliteConnection {
+fn replica() -> crate::helpers::Replica {
     let script = Pg2Sqlite::default().sql(SCHEMA).unwrap().translate_to_sql(&as_app()).unwrap();
-    let mut connection = SqliteConnection::establish(":memory:").unwrap();
+    let mut connection = crate::helpers::Replica::establish(":memory:").unwrap();
     connection.batch_execute(&script.into_vec().join(";\n")).unwrap();
     diesel::insert_into(docs_rls::table)
         .values(
@@ -69,7 +66,7 @@ fn replica() -> SqliteConnection {
     connection
 }
 
-fn backing_rows(connection: &mut SqliteConnection) -> Vec<(i32, String, Option<String>)> {
+fn backing_rows(connection: &mut crate::helpers::Replica) -> Vec<(i32, String, Option<String>)> {
     docs_rls::table.order(docs_rls::id).load(connection).unwrap()
 }
 

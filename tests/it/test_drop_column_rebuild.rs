@@ -2,7 +2,7 @@
 //! table reads, which SQLite cannot drop in place, rebuilds the table with
 //! its rows, its indexes and its triggers.
 
-use diesel::{prelude::*, result::Error as DieselError, sqlite::SqliteConnection};
+use diesel::{prelude::*, result::Error as DieselError};
 use pg2sqlite::prelude::*;
 
 use crate::helpers;
@@ -32,11 +32,11 @@ diesel::table! {
     }
 }
 
-fn insert(connection: &mut SqliteConnection, id: i32, a: i32) -> Result<usize, DieselError> {
+fn insert(connection: &mut crate::helpers::Replica, id: i32, a: i32) -> Result<usize, DieselError> {
     diesel::insert_into(t::table).values((t::id.eq(id), t::a.eq(a))).execute(connection)
 }
 
-fn rows(connection: &mut SqliteConnection) -> Vec<(i32, i32)> {
+fn rows(connection: &mut crate::helpers::Replica) -> Vec<(i32, i32)> {
     t::table.order(t::id).load(connection).expect("the rows read")
 }
 
@@ -145,7 +145,7 @@ fn a_full_text_index_keeps_following_the_rows() {
     diesel::sql_query("INSERT INTO t (id, a, note) VALUES (2, 20, 'fresh words')")
         .execute(&mut connection)
         .expect("a row lands");
-    let matches = |connection: &mut SqliteConnection, word: &str| {
+    let matches = |connection: &mut crate::helpers::Replica, word: &str| {
         diesel::sql_query(format!("SELECT count(*) AS count FROM t_fts WHERE t_fts MATCH '{word}'"))
             .get_result::<helpers::Count>(connection)
             .expect("the index answers")
@@ -218,7 +218,7 @@ fn a_referenced_table_rebuilt_inside_a_transaction_stops() {
         "{REFERENCED} {ROWS} INSERT INTO u (x) VALUES (1); ALTER TABLE t DROP COLUMN b;"
     ))
     .expect("the drop translates");
-    let mut connection = SqliteConnection::establish(":memory:").expect("connect");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("connect");
     diesel::sql_query("PRAGMA foreign_keys = ON").execute(&mut connection).expect("keys on");
     diesel::sql_query("BEGIN").execute(&mut connection).expect("begin");
     let failure = statements
@@ -463,7 +463,7 @@ fn a_drop_translated_alone_regenerates_the_table_objects() {
     insert(&mut connection, 1, 10).expect("a row lands");
     assert!(refusal(insert(&mut connection, 2, 10)).contains("UNIQUE"));
     assert_eq!(refusal(insert(&mut connection, 3, -1)), "P0001: too low");
-    let insert_o = |connection: &mut SqliteConnection, id: i32, c: i32| {
+    let insert_o = |connection: &mut crate::helpers::Replica, id: i32, c: i32| {
         diesel::sql_query(format!("INSERT INTO o (id, c) VALUES ({id}, {c})")).execute(connection)
     };
     insert_o(&mut connection, 1, 1).expect("a row lands in the other table");

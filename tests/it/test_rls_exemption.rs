@@ -6,7 +6,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use diesel::{ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection};
+use diesel::{ExpressionMethods, QueryDsl, RunQueryDsl};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
 use crate::{helpers, helpers::deployment::deployment};
@@ -417,13 +417,14 @@ fn translated(pg: &str, options: &Pg2SqliteOptions) -> Vec<String> {
 fn apply_with_exemption(
     pg: &str,
     options: &Pg2SqliteOptions,
-) -> (SqliteConnection, Arc<AtomicBool>) {
+) -> (crate::helpers::Replica, Arc<AtomicBool>) {
     let mut connection = helpers::apply_with_options(pg, options).expect("apply");
     let exempt = Arc::new(AtomicBool::new(false));
     let function_state = Arc::clone(&exempt);
-    write_is_exempt_utils::register_nondeterministic_impl(&mut connection, move || {
-        function_state.load(Ordering::Relaxed)
-    })
+    write_is_exempt_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        move || function_state.load(Ordering::Relaxed),
+    )
     .expect("register RLS exemption");
     (connection, exempt)
 }
@@ -433,9 +434,10 @@ fn null_and_function_error_fail_closed() {
     let null_options = options().with_rls_exemption_function("write_exemption_is_null");
     let mut null_connection =
         helpers::apply_with_options(POLICY_SCHEMA, &null_options).expect("apply");
-    write_exemption_is_null_utils::register_nondeterministic_impl(&mut null_connection, || {
-        None::<bool>
-    })
+    write_exemption_is_null_utils::register_nondeterministic_impl(
+        null_connection.registration().expect("registration").sqlite(),
+        || None::<bool>,
+    )
     .expect("register NULL exemption");
     assert!(
         diesel::insert_into(schema::shared_items_rls::table)
@@ -453,7 +455,7 @@ fn null_and_function_error_fail_closed() {
     let mut panic_connection =
         helpers::apply_with_options(POLICY_SCHEMA, &panic_options).expect("apply");
     write_exemption_panics_utils::register_nondeterministic_impl(
-        &mut panic_connection,
+        panic_connection.registration().expect("registration").sqlite(),
         || -> bool { panic!("exemption failure") },
     )
     .expect("register failing exemption");
@@ -476,10 +478,13 @@ fn exemption_skips_registered_policy_evaluation_but_not_function_resolution() {
     let (mut connection, exempt) = apply_with_exemption(FUNCTION_POLICY_SCHEMA, &policy_options);
     let calls = Arc::new(AtomicUsize::new(0));
     let function_calls = Arc::clone(&calls);
-    policy_allows_utils::register_nondeterministic_impl(&mut connection, move |_owner: String| {
-        function_calls.fetch_add(1, Ordering::Relaxed);
-        false
-    })
+    policy_allows_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        move |_owner: String| {
+            function_calls.fetch_add(1, Ordering::Relaxed);
+            false
+        },
+    )
     .expect("register policy function");
     exempt.store(true, Ordering::Relaxed);
     diesel::insert_into(schema::function_items_rls::table)
@@ -790,7 +795,7 @@ fn a_delivered_row_fires_no_translated_trigger() {
         .execute(&mut connection)
         .expect("deliver the parent");
 
-    let visible_notes = |connection: &mut SqliteConnection| {
+    let visible_notes = |connection: &mut crate::helpers::Replica| {
         schema::child_items::table
             .select(schema::child_items::note)
             .load::<String>(connection)
@@ -897,7 +902,7 @@ fn restrictive_and_one_sided_update_guards_honour_exemption() {
 
 #[test]
 fn hardened_connection_accepts_only_innocuous_exemption_function() {
-    use rusqlite::functions::FunctionFlags;
+    use diesel::{Connection, connection::SimpleConnection, sqlite::SqliteFunctionBehavior};
 
     let translated = translated(
         POLICY_SCHEMA,
@@ -905,31 +910,43 @@ fn hardened_connection_accepts_only_innocuous_exemption_function() {
             .with_rls_audit_table_name("rls_audit")
             .with_rls_exemption_function(EXEMPTION_FUNCTION),
     );
-    let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_INNOCUOUS;
-    let connection = rusqlite::Connection::open_in_memory().expect("open hardened SQLite");
+    let mut connection = helpers::Replica::establish(":memory:").expect("open hardened SQLite");
     connection
-        .create_scalar_function(EXEMPTION_FUNCTION, 0, flags, |_| Ok(true))
+        .registration()
+        .expect("registration")
+        .sqlite()
+        .register_noarg_sql_function::<diesel::sql_types::Bool, bool, _>(
+            EXEMPTION_FUNCTION,
+            SqliteFunctionBehavior::INNOCUOUS,
+            || true,
+        )
         .expect("register innocuous exemption");
-    connection.execute_batch("PRAGMA trusted_schema = OFF").expect("disable trusted schema");
+    connection.batch_execute("PRAGMA trusted_schema = OFF").expect("disable trusted schema");
     for statement in &translated {
-        connection.execute_batch(statement).expect("apply hardened DDL");
+        connection.batch_execute(statement).expect("apply hardened DDL");
     }
-    // rusqlite is required here because the project's Diesel version cannot set
-    // SQLITE_INNOCUOUS.
     connection
-        .execute("INSERT INTO shared_items_rls (id, owner, body) VALUES (1, 'bob', 'server')", [])
+        .execute("INSERT INTO shared_items_rls (id, owner, body) VALUES (1, 'bob', 'server')", &[])
         .expect("innocuous exemption runs from the trigger");
 
-    let unsafe_connection = rusqlite::Connection::open_in_memory().expect("open unsafe SQLite");
+    let mut unsafe_connection =
+        helpers::Replica::establish(":memory:").expect("open unsafe SQLite");
     unsafe_connection
-        .create_scalar_function(EXEMPTION_FUNCTION, 0, FunctionFlags::SQLITE_UTF8, |_| Ok(true))
+        .registration()
+        .expect("registration")
+        .sqlite()
+        .register_noarg_sql_function::<diesel::sql_types::Bool, bool, _>(
+            EXEMPTION_FUNCTION,
+            SqliteFunctionBehavior::empty(),
+            || true,
+        )
         .expect("register non-innocuous exemption");
-    unsafe_connection.execute_batch("PRAGMA trusted_schema = OFF").expect("disable trusted schema");
+    unsafe_connection.batch_execute("PRAGMA trusted_schema = OFF").expect("disable trusted schema");
     for statement in &translated {
-        unsafe_connection.execute_batch(statement).expect("apply unsafe DDL");
+        unsafe_connection.batch_execute(statement).expect("apply unsafe DDL");
     }
     let error = unsafe_connection
-        .execute("INSERT INTO shared_items_rls (id, owner, body) VALUES (1, 'bob', 'server')", [])
+        .execute("INSERT INTO shared_items_rls (id, owner, body) VALUES (1, 'bob', 'server')", &[])
         .expect_err("non-innocuous schema function must fail");
     assert!(error.to_string().contains("unsafe use"));
 }
@@ -943,6 +960,9 @@ fn quoted_exemption_function_name_is_safe() {
     let mut connection =
         helpers::apply_with_options(POLICY_SCHEMA, &quoted_options).expect("apply");
     connection
+        .registration()
+        .expect("registration")
+        .sqlite()
         .register_noarg_sql_function::<diesel::sql_types::Bool, bool, _>(
             QUOTED_NAME,
             diesel::sqlite::SqliteFunctionBehavior::empty(),
@@ -969,27 +989,24 @@ fn role_options() -> Pg2SqliteOptions {
 
 /// The script `sql` translates to under a deployment acting as `app`, loaded
 /// with the exemption on, and the switch that turns it off.
-fn load_exempt(sql: &str) -> (SqliteConnection, Arc<AtomicBool>) {
+fn load_exempt(sql: &str) -> (crate::helpers::Replica, Arc<AtomicBool>) {
     let script = Pg2Sqlite::default()
         .sql(sql)
         .expect("parse PostgreSQL")
         .translate(&role_options())
         .expect("translate SQLite");
     let mut connection =
-        <SqliteConnection as diesel::Connection>::establish(":memory:").expect("connect");
+        <crate::helpers::Replica as diesel::Connection>::establish(":memory:").expect("connect");
     let exempt = Arc::new(AtomicBool::new(true));
     let function_state = Arc::clone(&exempt);
-    write_is_exempt_utils::register_nondeterministic_impl(&mut connection, move || {
-        function_state.load(Ordering::Relaxed)
-    })
+    write_is_exempt_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        move || function_state.load(Ordering::Relaxed),
+    )
     .expect("register RLS exemption");
-    for statement in script.iter() {
-        // The emitted script is the artifact under test, which no typed DSL
-        // can stand in for.
-        diesel::sql_query(statement.to_string())
-            .execute(&mut connection)
-            .unwrap_or_else(|error| panic!("{statement}: {error}"));
-    }
+    script
+        .initialize_managed(&mut connection, pg2sqlite::prelude::FreshFiles::Both)
+        .expect("initialize replica");
     (connection, exempt)
 }
 
@@ -1007,7 +1024,7 @@ fn schema_seeds_load_under_exemption_into_read_only_tables() {
             .expect("read statuses"),
         ["draft", "published"]
     );
-    let kinds = |connection: &mut SqliteConnection| {
+    let kinds = |connection: &mut crate::helpers::Replica| {
         schema::kinds::table
             .select(schema::kinds::id)
             .order(schema::kinds::id)
@@ -1157,7 +1174,7 @@ fn exempt_reads_see_every_row_through_the_view() {
         .expect("the locking read translates")
         .to_string();
 
-    let reads = |connection: &mut SqliteConnection| {
+    let reads = |connection: &mut crate::helpers::Replica| {
         let owned = schema::owned_notes::table
             .filter(schema::owned_notes::id.eq("n1"))
             .select(schema::owned_notes::id)

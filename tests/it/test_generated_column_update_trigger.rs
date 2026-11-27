@@ -258,9 +258,7 @@ fn later_generated_gate_refuses_a_trigger_updating_its_table() {
 /// Seeded trigger catalogs preserve gate changes across translation batches.
 #[test]
 fn seeded_generated_gate_rebuilds_when_before_trigger_changes() {
-    use diesel::{
-        Connection, QueryDsl, RunQueryDsl, SqliteConnection, connection::SimpleConnection,
-    };
+    use diesel::{Connection, QueryDsl, RunQueryDsl, connection::SimpleConnection};
     use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
     diesel::table! {
@@ -282,7 +280,7 @@ fn seeded_generated_gate_rebuilds_when_before_trigger_changes() {
          UPDATE subject SET c = 1;";
     let dropped = "DROP TRIGGER before_update ON subject;
          UPDATE subject SET c = 2;";
-    let mut connection = SqliteConnection::establish(":memory:").unwrap();
+    let mut connection = crate::helpers::Replica::establish(":memory:").unwrap();
     let mut written = String::new();
     for batch in [setup, added, dropped] {
         let parsed = Pg2Sqlite::default().sql(batch).unwrap();

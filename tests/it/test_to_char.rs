@@ -1,5 +1,6 @@
 //! Tests for `to_char` translation to SQLite `strftime`.
 
+use diesel::Connection;
 use helpers::{
     assert_translated_statements_run as assert_all_stmts_parse_as_sqlite,
     translate_default_joined as translate,
@@ -105,8 +106,8 @@ fn to_char_args_swapped_format_before_column() {
 
 #[test]
 fn to_char_now_also_translated() {
-    // NOW() inside to_char should also be translated to strftime('%Y-%m-%d
-    // %H:%M:%f000+00:00', 'now')
+    // NOW() inside to_char should also be translated to
+    // pg2sqlite_transaction_timestamp()
     let sql = helpers::deployment::utc_script("SELECT to_char(NOW(), 'YYYY-MM-DD');");
     let options = helpers::deployment::utc_request();
     let output = helpers::translate_sql(&sql, &options).unwrap();
@@ -115,8 +116,8 @@ fn to_char_now_also_translated() {
         "to_char(NOW(), ...) should produce strftime, got: {output}"
     );
     assert!(
-        output.contains("strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"),
-        "NOW() inside to_char should become strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'), got: {output}"
+        output.contains("pg2sqlite_transaction_timestamp()"),
+        "NOW() inside to_char should become pg2sqlite_transaction_timestamp(), got: {output}"
     );
     helpers::prepared_user_select(&sql, &options);
 }
@@ -209,9 +210,10 @@ fn to_char_iso_year_week_day() {
         .find(|s| !s.to_string().starts_with("PRAGMA"))
         .expect("SELECT stmt")
         .to_string();
-    // The translated column has no alias; rusqlite positional access handles
-    // it.
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    let value: String = conn.query_row(&select_stmt, [], |row| row.get(0)).unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
+    let rows = helpers::query_values(&mut conn, &select_stmt, &[]).unwrap();
+    let helpers::SqliteAnyValue::Text(value) = &rows[0][0] else {
+        panic!("expected a text value");
+    };
     assert_eq!(value, "2025-01-1", "PostgreSQL answers 2025-01-1: {select_stmt}");
 }

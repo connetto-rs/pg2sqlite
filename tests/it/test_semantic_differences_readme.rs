@@ -102,7 +102,10 @@ fn the_same_ordering_reaches_order_by() {
 fn translated_answer(expression: &str) -> String {
     let translated = translate(&format!("SELECT {expression};"));
     let projection = translated.strip_prefix("SELECT ").expect("a projection");
-    sqlite_answers(projection).expect("a value")
+    match crate::helpers::evaluate_probe(&format!("SELECT CAST({projection} AS TEXT)")) {
+        crate::helpers::SqliteAnyValue::Text(value) => value,
+        value => panic!("expected text, got {value:?}"),
+    }
 }
 
 #[test]

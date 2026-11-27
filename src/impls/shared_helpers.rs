@@ -2451,23 +2451,24 @@ pub(crate) fn round_column_text(
     kind: crate::impls::temporal_literals::TemporalLiteralKind,
     text: Expr,
 ) -> Expr {
+    use pg2sqlite_runtime::TypmodRounding;
+
     use crate::impls::{
-        datetime_helpers::{round_naive_timestamp, round_time, round_timestamptz, round_timetz},
+        datetime_helpers::round_text,
         temporal_literals::TemporalLiteralKind::{Time, Timestamp},
     };
-    match kind {
-        Time { zoned: true, precision: Some(precision) } => {
-            round_timetz(&text, precision, text.clone())
+    let (rounding, precision) = match kind {
+        Time { zoned: true, precision: Some(precision) } => (TypmodRounding::TimeTz, precision),
+        Time { zoned: false, precision: Some(precision) } => (TypmodRounding::Time, precision),
+        Timestamp { zoned: true, precision: Some(precision) } => {
+            (TypmodRounding::TimestampTz, precision)
         }
-        Time { zoned: false, precision: Some(precision) } => {
-            round_time(&text, precision, text.clone())
-        }
-        Timestamp { zoned: true, precision: Some(precision) } => round_timestamptz(text, precision),
         Timestamp { zoned: false, precision: Some(precision) } => {
-            round_naive_timestamp(&text, precision, text.clone())
+            (TypmodRounding::Timestamp, precision)
         }
-        _ => text,
-    }
+        _ => return text,
+    };
+    round_text(rounding, text, precision)
 }
 
 /// Brings a value written into, or compared with, a temporal column to the

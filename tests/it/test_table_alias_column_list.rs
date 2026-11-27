@@ -10,11 +10,15 @@
 //! derived table, since the names SQLite gives the translated outputs need not
 //! be PostgreSQL's.
 
+use diesel::{
+    Connection, RunQueryDsl,
+    connection::SimpleConnection,
+    row::{Field, Row},
+};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use run_translated_helper::run_translated_with;
-use rusqlite::Connection;
 
-use crate::helpers::{run_translated as run_translated_helper, translate::assert_refused};
+use crate::helpers::{Replica, run_translated as run_translated_helper, translate::assert_refused};
 
 const FIXTURE: &str = "CREATE TABLE t (id INT PRIMARY KEY, s TEXT);
      INSERT INTO t VALUES (1, 'one');";
@@ -35,16 +39,36 @@ fn probe_column_names(query: &str) -> Vec<String> {
         .into_vec();
     let probe = statements.pop().expect("the script should emit at least one statement");
 
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = Replica::establish(":memory:").expect("in-memory SQLite");
     for statement in &statements {
         connection
-            .execute_batch(&format!("{statement};"))
+            .batch_execute(&format!("{statement};"))
             .unwrap_or_else(|error| panic!("emitted setup failed: {error}\n{statement}"));
     }
-    let prepared = connection
-        .prepare(&probe)
-        .unwrap_or_else(|error| panic!("emitted probe failed: {error}\n{probe}"));
-    prepared.column_names().map(str::to_string).collect()
+    struct ColumnNames(Vec<String>);
+
+    impl diesel::deserialize::QueryableByName<diesel::sqlite::Sqlite> for ColumnNames {
+        fn build<'row>(
+            row: &impl diesel::row::NamedRow<'row, diesel::sqlite::Sqlite>,
+        ) -> diesel::deserialize::Result<Self> {
+            Ok(Self(
+                (0..row.field_count())
+                    .map(|index| {
+                        Row::get(row, index)
+                            .expect("column")
+                            .field_name()
+                            .expect("column name")
+                            .to_string()
+                    })
+                    .collect(),
+            ))
+        }
+    }
+
+    diesel::sql_query(&probe)
+        .get_result::<ColumnNames>(&mut connection)
+        .unwrap_or_else(|error| panic!("emitted probe failed: {error}\n{probe}"))
+        .0
 }
 
 fn refuse(query: &str) -> String {

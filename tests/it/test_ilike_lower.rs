@@ -6,7 +6,7 @@
 //! case-sensitive and ILIKE semantics are lost.  The correct translation is
 //! `lower(expr) LIKE lower(pattern)`, which is pragma-independent.
 
-use diesel::{QueryableByName, RunQueryDsl, SqliteConnection, prelude::*};
+use diesel::{QueryableByName, RunQueryDsl, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
 use crate::helpers;
@@ -64,7 +64,7 @@ fn ilike_matches_case_insensitively_with_case_sensitive_like_pragma() {
         .expect("a query statement")
         .to_string();
 
-    let mut conn = SqliteConnection::establish(":memory:").unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
 
     // Create the table
     for stmt in &ddl {

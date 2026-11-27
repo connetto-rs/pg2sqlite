@@ -356,6 +356,7 @@ mod test_to_char;
 mod test_to_char_template;
 mod test_to_json;
 mod test_transaction_blocks;
+mod test_transaction_clock;
 mod test_transaction_control;
 mod test_translation_warnings;
 mod test_translator;

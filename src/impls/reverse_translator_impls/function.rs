@@ -52,6 +52,10 @@ const REVERSE_RENAMES: &[(&str, &str)] = &[
     ("quote", "quote_nullable"),
     ("json_quote", "to_jsonb"),
     ("ifnull", "COALESCE"),
+    // A managed connection's clock readers answer PostgreSQL's three clocks.
+    (pg2sqlite_runtime::TRANSACTION_TIMESTAMP, "now"),
+    (pg2sqlite_runtime::STATEMENT_TIMESTAMP, "statement_timestamp"),
+    (pg2sqlite_runtime::CLOCK_TIMESTAMP, "clock_timestamp"),
 ];
 
 pub enum FunctionReversal {
@@ -144,6 +148,9 @@ pub enum FunctionReversal {
     /// there and will not take a bare call, and the cast says the same thing
     /// without depending on name resolution at all.
     ToCast(DataType),
+    /// A typmod rounding function, back to the cast to the type at that
+    /// precision it rounds for.
+    ToTypmodCast(pg2sqlite_runtime::TypmodRounding),
     /// Emit a bare keyword with no argument list, which is the only form
     /// PostgreSQL takes for `current_date` and its relatives.
     ToBareKeyword(&'static str),
@@ -330,6 +337,13 @@ pub fn reverse_function(
         REVERSE_RENAMES.iter().find(|&&(sqlite, _)| sqlite == func_name.as_str())
     {
         return FunctionReversal::Rename(target.to_string());
+    }
+
+    if let Some(rounding) = pg2sqlite_runtime::TypmodRounding::ALL
+        .into_iter()
+        .find(|rounding| rounding.function() == func_name)
+    {
+        return FunctionReversal::ToTypmodCast(rounding);
     }
 
     match func_name.as_str() {
@@ -1651,6 +1665,41 @@ pub fn reverse_translate_function(
                 kind: CastKind::DoubleColon,
             })
         }
+        FunctionReversal::ToTypmodCast(rounding) => {
+            use pg2sqlite_runtime::TypmodRounding;
+            let name = session_variable::function_name_lower(&func.name);
+            let exprs = extract_exactly(&func.args, 2, &name)?;
+            let precision = match exprs[1] {
+                Expr::Value(ValueWithSpan { value: Value::Number(digits, ..), .. }) => {
+                    digits.parse::<u64>().ok()
+                }
+                _ => None,
+            }
+            .ok_or_else(|| {
+                crate::errors::Error::reverse_refusal(format!(
+                    "{name} rounds to a precision that is not an integer constant, and a \
+                     PostgreSQL typmod is one."
+                ))
+            })?;
+            let inner =
+                crate::prelude::ReverseTranslator::reverse_translate(exprs[0], schema, options)?;
+            let data_type = match rounding {
+                TypmodRounding::Timestamp => {
+                    DataType::Timestamp(Some(precision), TimezoneInfo::None)
+                }
+                TypmodRounding::TimestampTz => {
+                    DataType::Timestamp(Some(precision), TimezoneInfo::Tz)
+                }
+                TypmodRounding::Time => DataType::Time(Some(precision), TimezoneInfo::None),
+                TypmodRounding::TimeTz => DataType::Time(Some(precision), TimezoneInfo::Tz),
+            };
+            Ok(Expr::Cast {
+                expr: Box::new(inner),
+                data_type,
+                format: None,
+                kind: CastKind::DoubleColon,
+            })
+        }
         FunctionReversal::ToBareKeyword(keyword) => {
             Ok(Expr::Function(Function {
                 name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(keyword))]),
@@ -1772,6 +1821,11 @@ mod tests {
         // json_array_length forwards under a json_type guard, since SQLite
         // answers 0 for a non-array where PostgreSQL raises.
         ("json_array_length", "FunctionTranslation::JsonArrayLength"),
+        // The clock functions forward to the managed connection's readers
+        // through their own match arms, which the precision forms need.
+        (pg2sqlite_runtime::TRANSACTION_TIMESTAMP, "the now() and transaction_timestamp() arm"),
+        (pg2sqlite_runtime::STATEMENT_TIMESTAMP, "the statement_timestamp() arm"),
+        (pg2sqlite_runtime::CLOCK_TIMESTAMP, "the clock_timestamp() arm"),
     ];
 
     /// Every plain rename must invert: for a forward `(pg, sqlite)` pair the

@@ -5,6 +5,7 @@
 //! - WHERE clause expressions in subqueries inside aggregates
 //! - CTE (WITH clause) body expressions
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use translate_helpers::translate_default_first_query as translate_ok;
 
@@ -36,7 +37,7 @@ fn window_partition_by_date_trunc_is_translated() {
 }
 
 /// NOW() inside ORDER BY of an inline window spec must become
-/// strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now').
+/// `pg2sqlite_transaction_timestamp()`.
 #[test]
 fn window_order_by_now_is_translated() {
     let sql = format!(
@@ -45,8 +46,8 @@ fn window_order_by_now_is_translated() {
     );
     let out = translate_ok(&sql);
     assert!(
-        out.to_lowercase().contains("strftime("),
-        "NOW() in window ORDER BY must become strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'): {out}"
+        out.contains("pg2sqlite_transaction_timestamp()"),
+        "NOW() in window ORDER BY must become pg2sqlite_transaction_timestamp(): {out}"
     );
     assert!(
         !out.to_uppercase().contains("NOW()"),
@@ -139,7 +140,7 @@ fn window_aggregate_arg_date_trunc_is_translated() {
 }
 
 fn execute_all_emitted(sql: &str) {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     let stmts = Pg2Sqlite::default()
         .sql(sql)
         .unwrap()
@@ -147,7 +148,7 @@ fn execute_all_emitted(sql: &str) {
         .unwrap()
         .into_vec();
     for s in &stmts {
-        conn.execute_batch(&format!("{s};"))
+        conn.batch_execute(&format!("{s};"))
             .unwrap_or_else(|e| panic!("emitted SQL failed: {e}\n{s}"));
     }
 }

@@ -10,7 +10,7 @@ use core::str::FromStr;
 // `register_impl` takes an unwind-safe closure, which a poisoning mutex is.
 use std::sync::{Arc, Mutex};
 
-use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{pg::PgConnection, prelude::*};
 use pg2sqlite::prelude::{
     ArrayRepresentation, Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation,
 };
@@ -247,27 +247,32 @@ fn postgres(predicate: &str) -> PgConnection {
     connection
 }
 
-fn sqlite(predicate: &str, request: &Arc<Mutex<Request>>) -> SqliteConnection {
+fn sqlite(predicate: &str, request: &Arc<Mutex<Request>>) -> crate::helpers::Replica {
     use schema::replica::notes_rls;
     let translated = Pg2Sqlite::default()
         .sql(&format!("{ROLES}{SCHEMA}{}{TRIGGERS}", policy(predicate)))
         .expect("parse")
         .translate(&options())
         .unwrap_or_else(|error| panic!("pg2sqlite refused {predicate}: {error}"));
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-    translated.register_functions(&mut connection).expect("register helper functions");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
+    translated.register_managed(&mut connection).expect("register helper functions");
     let translated = translated.into_vec();
-    crate::helpers::case_fold_functions::register(&mut connection);
+    crate::helpers::case_fold_functions::register(
+        connection.registration().expect("registration").sqlite(),
+    );
     let read = |pick: fn(&Request) -> Option<&'static str>| {
         let request = Arc::clone(request);
         move || pick(&request.lock().expect("the request lock")).map(str::to_owned)
     };
-    app_caller_utils::register_impl(&mut connection, read(|request| request.caller))
-        .expect("register app_caller");
-    app_email_utils::register_impl(&mut connection, read(|request| request.email))
-        .expect("register app_email");
-    app_links_utils::register_impl(&mut connection, read(|request| request.links))
-        .expect("register app_links");
+    {
+        let mut registration = connection.registration().expect("registration");
+        app_caller_utils::register_impl(registration.sqlite(), read(|request| request.caller))
+            .expect("register app_caller");
+        app_email_utils::register_impl(registration.sqlite(), read(|request| request.email))
+            .expect("register app_email");
+        app_links_utils::register_impl(registration.sqlite(), read(|request| request.links))
+            .expect("register app_links");
+    }
     apply_with_seed(&mut connection, &translated, |connection| {
         for (id, owner, email, link, depth) in NOTES {
             diesel::insert_into(notes_rls::table)
@@ -320,7 +325,7 @@ fn insert_source(connection: &mut PgConnection, id: &str, depth: i32) -> bool {
 }
 
 /// Whether the replica takes a note `id` owned by `U1` at `depth`.
-fn insert_replica(connection: &mut SqliteConnection, id: &str, depth: i32) -> bool {
+fn insert_replica(connection: &mut crate::helpers::Replica, id: &str, depth: i32) -> bool {
     use schema::replica::notes;
     diesel::insert_into(notes::table)
         .values((notes::id.eq(id), notes::owner_id.eq(U1), notes::depth.eq(depth)))

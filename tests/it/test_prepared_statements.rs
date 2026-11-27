@@ -17,6 +17,7 @@
 //! statement which cannot exist in the output is not something to accept
 //! quietly.
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
 const BASE: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER);";
@@ -97,9 +98,9 @@ fn execute_function_in_a_trigger_still_translates() -> Result<(), Box<dyn std::e
         statements.iter().any(|s| s.to_string().contains("CREATE TRIGGER")),
         "the trigger must still be emitted: {statements:?}"
     );
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     for stmt in &statements {
-        conn.execute_batch(&format!("{stmt};"))
+        conn.batch_execute(&format!("{stmt};"))
             .unwrap_or_else(|e| panic!("emitted statement must run in SQLite: {e}\n{stmt}"));
     }
 

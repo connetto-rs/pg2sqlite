@@ -6,7 +6,7 @@
 
 #![allow(dead_code, clippy::cast_sign_loss, clippy::cast_precision_loss)]
 
-use diesel::prelude::*;
+use diesel::{Connection, connection::SimpleConnection, prelude::*};
 use helpers::establish_connection;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
@@ -106,9 +106,9 @@ fn test_fts5_rls_triggers_reference_backing_table() -> Result<(), Box<dyn std::e
         delete_trigger.contains("ON documents_rls"),
         "DELETE trigger should be ON documents_rls (backing table), got: {delete_trigger}"
     );
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     for stmt in &translated_sql {
-        conn.execute_batch(&format!("{stmt};"))
+        conn.batch_execute(&format!("{stmt};"))
             .unwrap_or_else(|e| panic!("emitted DDL failed: {e}\n{stmt}"));
     }
 

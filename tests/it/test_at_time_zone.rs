@@ -454,16 +454,16 @@ fn the_reversal_is_the_expression_it_came_from() {
 /// and `now()` is aware, so the offset case exercises the flip back on a path
 /// with no column in it at all.
 ///
-/// `now()` and `CURRENT_TIMESTAMP` both return as `NOW()`, since the forward
+/// `now()` and `CURRENT_TIMESTAMP` both return as `now()`, since the forward
 /// direction lowers all of them to one SQLite call. The round trip is a fixed
 /// point in meaning and not in spelling, which is why the expected form is
 /// written out rather than reusing the input.
 #[test]
 fn a_function_operand_reverses_with_its_sign_restored() {
     for (expression, expected) in [
-        ("now() AT TIME ZONE 'UTC'", "NOW() AT TIME ZONE 'UTC'"),
-        ("now() AT TIME ZONE '+05:30'", "NOW() AT TIME ZONE '+05:30'"),
-        ("CURRENT_TIMESTAMP AT TIME ZONE 'UTC'", "NOW() AT TIME ZONE 'UTC'"),
+        ("now() AT TIME ZONE 'UTC'", "now() AT TIME ZONE 'UTC'"),
+        ("now() AT TIME ZONE '+05:30'", "now() AT TIME ZONE '+05:30'"),
+        ("CURRENT_TIMESTAMP AT TIME ZONE 'UTC'", "now() AT TIME ZONE 'UTC'"),
     ] {
         let parsed = Parser::parse_sql(&PostgreSqlDialect {}, &format!("SELECT {expected} FROM t"))
             .expect("the expected PostgreSQL parses")

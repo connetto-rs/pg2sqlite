@@ -4,15 +4,16 @@
 //! refusal message for constructs the target cannot represent, or the
 //! round-trip value for constructs that must translate faithfully.
 //!
-//! Every assertion executes the emitted SQL through rusqlite against the
-//! emitted DDL; grepping the output string is not accepted as proof.
+//! Every assertion executes the emitted SQL through a managed connection
+//! against the emitted DDL; grepping the output string is not accepted as
+//! proof.
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::{
     prelude::{Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation},
     warnings::TranslationWarning,
 };
 use run_translated_helper::run_translated_with;
-use rusqlite::Connection;
 
 use crate::helpers::{execute_all, run_translated as run_translated_helper};
 
@@ -150,7 +151,7 @@ fn bit_values_remain_distinct() {
 #[test]
 fn overlong_bit_value_is_rejected() {
     // '10101' is 5 bits; bit(4) must not accept it.
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     let stmts = Pg2Sqlite::default()
         .sql("CREATE TABLE t (col bit(4));")
         .expect("parse")
@@ -158,10 +159,10 @@ fn overlong_bit_value_is_rejected() {
         .expect("translate")
         .into_vec();
     for s in &stmts {
-        conn.execute_batch(&format!("{s};")).unwrap_or_else(|e| panic!("DDL failed: {e}\n{s}"));
+        conn.batch_execute(&format!("{s};")).unwrap_or_else(|e| panic!("DDL failed: {e}\n{s}"));
     }
     let err = conn
-        .execute_batch("INSERT INTO t VALUES ('10101');")
+        .batch_execute("INSERT INTO t VALUES ('10101');")
         .expect_err("5-bit value into bit(4) must fail the CHECK");
     assert!(
         err.to_string().contains("CHECK"),
@@ -171,7 +172,7 @@ fn overlong_bit_value_is_rejected() {
 
 #[test]
 fn bit_varying_n_accepts_at_boundary_and_rejects_past_it() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     let stmts = Pg2Sqlite::default()
         .sql("CREATE TABLE t (col bit varying(3));")
         .expect("parse")
@@ -179,11 +180,11 @@ fn bit_varying_n_accepts_at_boundary_and_rejects_past_it() {
         .expect("translate")
         .into_vec();
     for s in &stmts {
-        conn.execute_batch(&format!("{s};")).unwrap_or_else(|e| panic!("{e}\n{s}"));
+        conn.batch_execute(&format!("{s};")).unwrap_or_else(|e| panic!("{e}\n{s}"));
     }
-    conn.execute_batch("INSERT INTO t VALUES ('101');").expect("3-bit value into bit varying(3)");
+    conn.batch_execute("INSERT INTO t VALUES ('101');").expect("3-bit value into bit varying(3)");
     let err = conn
-        .execute_batch("INSERT INTO t VALUES ('1010');")
+        .batch_execute("INSERT INTO t VALUES ('1010');")
         .expect_err("4-bit value into bit varying(3) must fail");
     assert!(err.to_string().contains("CHECK"), "rejection must come from CHECK, got: {err}");
 }
@@ -228,7 +229,7 @@ fn a_non_binary_digit_in_a_bit_column_is_refused() {
 #[test]
 fn a_non_binary_value_written_later_fails_the_check() {
     // A write the translator never sees must fail in the replica too.
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     let stmts = Pg2Sqlite::default()
         .sql("CREATE TABLE t (col bit(3));")
         .expect("parse")
@@ -236,11 +237,11 @@ fn a_non_binary_value_written_later_fails_the_check() {
         .expect("translate")
         .into_vec();
     for s in &stmts {
-        conn.execute_batch(&format!("{s};")).unwrap_or_else(|e| panic!("DDL failed: {e}\n{s}"));
+        conn.batch_execute(&format!("{s};")).unwrap_or_else(|e| panic!("DDL failed: {e}\n{s}"));
     }
-    conn.execute_batch("INSERT INTO t VALUES ('010');").expect("three binary digits");
+    conn.batch_execute("INSERT INTO t VALUES ('010');").expect("three binary digits");
     let err = conn
-        .execute_batch("INSERT INTO t VALUES ('012');")
+        .batch_execute("INSERT INTO t VALUES ('012');")
         .expect_err("a non-binary digit must fail the CHECK");
     assert!(err.to_string().contains("CHECK"), "rejection must come from CHECK, got: {err}");
 }
@@ -312,7 +313,7 @@ fn smallint_boundary_is_accepted() {
 
 #[test]
 fn smallint_above_upper_bound_is_rejected() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     let stmts = Pg2Sqlite::default()
         .sql("CREATE TABLE t (col smallint);")
         .expect("parse")
@@ -320,17 +321,17 @@ fn smallint_above_upper_bound_is_rejected() {
         .expect("translate")
         .into_vec();
     for s in &stmts {
-        conn.execute_batch(&format!("{s};")).unwrap_or_else(|e| panic!("{e}\n{s}"));
+        conn.batch_execute(&format!("{s};")).unwrap_or_else(|e| panic!("{e}\n{s}"));
     }
     let err = conn
-        .execute_batch("INSERT INTO t VALUES (32768);")
+        .batch_execute("INSERT INTO t VALUES (32768);")
         .expect_err("32768 must fail the smallint range CHECK");
     assert!(err.to_string().contains("CHECK"), "got: {err}");
 }
 
 #[test]
 fn smallint_below_lower_bound_is_rejected() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     let stmts = Pg2Sqlite::default()
         .sql("CREATE TABLE t (col smallint);")
         .expect("parse")
@@ -338,10 +339,10 @@ fn smallint_below_lower_bound_is_rejected() {
         .expect("translate")
         .into_vec();
     for s in &stmts {
-        conn.execute_batch(&format!("{s};")).unwrap_or_else(|e| panic!("{e}\n{s}"));
+        conn.batch_execute(&format!("{s};")).unwrap_or_else(|e| panic!("{e}\n{s}"));
     }
     let err = conn
-        .execute_batch("INSERT INTO t VALUES (-32769);")
+        .batch_execute("INSERT INTO t VALUES (-32769);")
         .expect_err("-32769 must fail the smallint range CHECK");
     assert!(err.to_string().contains("CHECK"), "got: {err}");
 }
@@ -357,7 +358,7 @@ fn integer_boundary_is_accepted() {
 
 #[test]
 fn integer_above_upper_bound_is_rejected() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     let stmts = Pg2Sqlite::default()
         .sql("CREATE TABLE t (col integer);")
         .expect("parse")
@@ -365,10 +366,10 @@ fn integer_above_upper_bound_is_rejected() {
         .expect("translate")
         .into_vec();
     for s in &stmts {
-        conn.execute_batch(&format!("{s};")).unwrap_or_else(|e| panic!("{e}\n{s}"));
+        conn.batch_execute(&format!("{s};")).unwrap_or_else(|e| panic!("{e}\n{s}"));
     }
     let err = conn
-        .execute_batch("INSERT INTO t VALUES (2147483648);")
+        .batch_execute("INSERT INTO t VALUES (2147483648);")
         .expect_err("2147483648 must fail the integer range CHECK");
     assert!(err.to_string().contains("CHECK"), "got: {err}");
 }
@@ -998,12 +999,12 @@ fn spellings_of_one_fraction_collide_in_a_unique_column() {
             .expect("translate")
             .into_vec();
         let (last, setup) = stmts.split_last().expect("statements");
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
         for s in setup {
-            conn.execute_batch(&format!("{s};")).unwrap_or_else(|e| panic!("{e}\n{s}"));
+            conn.batch_execute(&format!("{s};")).unwrap_or_else(|e| panic!("{e}\n{s}"));
         }
         let err = conn
-            .execute_batch(&format!("{last};"))
+            .batch_execute(&format!("{last};"))
             .expect_err(&format!("{column} '{second}' duplicates '{first}'"));
         assert!(err.to_string().contains("UNIQUE"), "{err}");
     }
@@ -1366,12 +1367,12 @@ fn typed_literal_spellings_collide_in_a_unique_column() {
             .expect("translate")
             .into_vec();
         let (last, setup) = stmts.split_last().expect("statements");
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
         for s in setup {
-            conn.execute_batch(&format!("{s};")).unwrap_or_else(|e| panic!("{e}\n{s}"));
+            conn.batch_execute(&format!("{s};")).unwrap_or_else(|e| panic!("{e}\n{s}"));
         }
         let err = conn
-            .execute_batch(&format!("{last};"))
+            .batch_execute(&format!("{last};"))
             .expect_err(&format!("{column} {second} duplicates {first}"));
         assert!(err.to_string().contains("UNIQUE"), "{err}");
     }

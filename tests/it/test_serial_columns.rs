@@ -47,7 +47,7 @@ fn refusal(pg: &str) -> String {
 
 /// Applies the translation and reads back what the auto-assigned column holds.
 fn assigned(pg: &str) -> Vec<(i32, Option<String>)> {
-    let mut connection = SqliteConnection::establish(":memory:").expect("connect");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("connect");
     for statement in translate(pg) {
         diesel::sql_query(&statement)
             .execute(&mut connection)

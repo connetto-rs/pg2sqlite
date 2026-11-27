@@ -6,7 +6,7 @@
 
 #![allow(dead_code, clippy::cast_sign_loss, clippy::cast_precision_loss)]
 
-use diesel::prelude::*;
+use diesel::{connection::SimpleConnection, prelude::*};
 use helpers::establish_connection;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
@@ -112,12 +112,12 @@ fn test_vec0_rls_triggers_reference_backing_table() -> Result<(), Box<dyn std::e
     // Execute translated DDL (skip vec0 virtual tables that need the sqlite-vec
     // extension loaded, which is unavailable in the standard test runtime).
     {
-        let conn = rusqlite::Connection::open_in_memory()?;
+        let mut conn = crate::helpers::Replica::establish(":memory:")?;
         for s in &translated_sql {
             if s.contains("USING vec0") {
                 continue;
             }
-            conn.execute_batch(&format!("{s};")).expect("translated SQL must execute in SQLite");
+            conn.batch_execute(&format!("{s};")).expect("translated SQL must execute in SQLite");
         }
     }
     Ok(())
@@ -202,13 +202,13 @@ fn test_role_filtered_vector_translation_keeps_vec0_artifacts()
     // Execute translated DDL (skip vec0 virtual tables that need the sqlite-vec
     // extension loaded, which is unavailable in the standard test runtime).
     {
-        let conn = rusqlite::Connection::open_in_memory()?;
+        let mut conn = crate::helpers::Replica::establish(":memory:")?;
         for stmt in &translated {
             let s = stmt.to_string();
             if s.contains("USING vec0") {
                 continue;
             }
-            conn.execute_batch(&format!("{s};")).expect("translated SQL must execute in SQLite");
+            conn.batch_execute(&format!("{s};")).expect("translated SQL must execute in SQLite");
         }
     }
     Ok(())

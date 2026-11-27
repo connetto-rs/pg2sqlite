@@ -15,7 +15,7 @@
 //! at scale 2), because `to_minor_units` converts the PG value 3.00 to 300 and
 //! the equality check fails.
 
-use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{pg::PgConnection, prelude::*};
 use helpers::establish_connection;
 use pg2sqlite::{
     manifest::ColumnStorage,
@@ -148,7 +148,7 @@ fn pg_setup() -> PgConnection {
 ///
 /// DDL is applied via `diesel::sql_query` because CREATE TABLE is not
 /// expressible in the diesel typed DSL.
-fn sqlite_setup(base: &Pg2Sqlite) -> SqliteConnection {
+fn sqlite_setup(base: &Pg2Sqlite) -> crate::helpers::Replica {
     let ddl_stmts =
         base.clone().translate_to_sql(&options()).expect("translate amounts DDL").into_vec();
     let mut conn = establish_connection();
@@ -179,7 +179,7 @@ fn pg_text(conn: &mut PgConnection, sql: &str) -> String {
 ///
 /// Used when the query is a translated or arithmetic form that the typed DSL
 /// cannot represent.
-fn sqlite_i64(conn: &mut SqliteConnection, sql: &str) -> i64 {
+fn sqlite_i64(conn: &mut crate::helpers::Replica, sql: &str) -> i64 {
     diesel::sql_query(sql)
         .load::<I64Row>(conn)
         .expect("SQLite query")

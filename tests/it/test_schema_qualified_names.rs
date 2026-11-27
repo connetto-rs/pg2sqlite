@@ -1,8 +1,8 @@
 //! Tests for schema-qualified PostgreSQL object names being normalized for
 //! SQLite output.
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, Translator};
-use rusqlite::Connection;
 use sql_traits::structs::ParserDB;
 use sqlparser::{ast::Statement, dialect::PostgreSqlDialect, parser::Parser};
 
@@ -36,9 +36,9 @@ fn translate_single_statement(sql: &str) -> String {
 /// in-memory SQLite connection to verify the output is valid SQLite.
 fn execute_as_sqlite(pg_sql: &str) {
     let stmts = translate(pg_sql).expect("translation should succeed");
-    let conn = Connection::open_in_memory().expect("open in-memory SQLite");
+    let mut conn = crate::helpers::Replica::establish(":memory:").expect("open in-memory SQLite");
     for stmt in &stmts {
-        conn.execute_batch(&format!("{stmt};"))
+        conn.batch_execute(&format!("{stmt};"))
             .unwrap_or_else(|e| panic!("translated SQL failed in SQLite: {e}\nSQL: {stmt}"));
     }
 }
@@ -100,9 +100,9 @@ fn create_index_schema_qualified_target_is_unqualified() {
     // This test uses translate_single_statement (empty schema context), so we
     // create the prerequisite table inline before running the translated index.
     {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);").unwrap();
-        conn.execute_batch(&format!("{output};")).unwrap();
+        let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
+        conn.batch_execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);").unwrap();
+        conn.batch_execute(&format!("{output};")).unwrap();
     }
 }
 
@@ -597,9 +597,9 @@ fn translated_schema_qualified_sql_executes_in_sqlite() -> Result<(), Box<dyn st
         ",
     )?;
 
-    let conn = Connection::open_in_memory()?;
+    let mut conn = crate::helpers::Replica::establish(":memory:")?;
     for stmt in translated {
-        conn.execute_batch(&format!("{};", stmt))?;
+        conn.batch_execute(&format!("{};", stmt))?;
     }
 
     Ok(())
@@ -609,14 +609,18 @@ fn translated_schema_qualified_sql_executes_in_sqlite() -> Result<(), Box<dyn st
 /// trigger fires, and answers `query` against what the body left behind.
 fn audit_after_one_insert(pg_sql: &str, query: &str) -> i64 {
     let translated = translate(pg_sql).expect("translation should succeed");
-    let conn = Connection::open_in_memory().expect("open in-memory SQLite");
+    let mut conn = crate::helpers::Replica::establish(":memory:").expect("open in-memory SQLite");
     for statement in &translated {
-        conn.execute_batch(&format!("{statement};"))
+        conn.batch_execute(&format!("{statement};"))
             .unwrap_or_else(|e| panic!("translated SQL failed in SQLite: {e}\nSQL: {statement}"));
     }
-    conn.execute_batch("INSERT INTO docs (id) VALUES (1);")
+    conn.batch_execute("INSERT INTO docs (id) VALUES (1);")
         .expect("insert should fire the trigger");
-    conn.query_row(query, [], |row| row.get(0)).expect("query should succeed")
+    let rows = crate::helpers::query_values(&mut conn, query, &[]).expect("query should succeed");
+    match rows[0][0] {
+        crate::helpers::SqliteAnyValue::Integer(value) => value,
+        ref value => panic!("expected integer, got {value:?}"),
+    }
 }
 
 /// Applies every translated statement, inserts one row into `docs`, and

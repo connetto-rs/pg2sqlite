@@ -9,11 +9,10 @@ use diesel::{
     connection::SimpleConnection,
     prelude::*,
     sql_types::{Integer, Nullable},
-    sqlite::SqliteConnection,
 };
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, postgres_error};
+use pg2sqlite::prelude::{FreshFiles, Pg2Sqlite, Pg2SqliteOptions, postgres_error};
 
-use crate::{helpers, support::transaction::transaction};
+use crate::helpers::{self, Replica};
 
 diesel::table! {
     /// The referenced table.
@@ -101,37 +100,39 @@ fn options() -> Pg2SqliteOptions {
 
 /// Runs `sql` as the server applies its rows, exempt from the generated
 /// guards.
-fn deliver(connection: &mut SqliteConnection, sql: &str) {
-    key_action_exempt_utils::register_nondeterministic_impl(connection, || true)
-        .expect("exempt the delivery");
+fn deliver(connection: &mut Replica, sql: &str) {
+    exempt(connection, true);
     connection.batch_execute(sql).unwrap_or_else(|error| panic!("{error}\n{sql}"));
-    key_action_exempt_utils::register_nondeterministic_impl(connection, || false)
-        .expect("end the exemption");
+    exempt(connection, false);
 }
 
-/// `pg` translated and applied to a fresh connection, with the statements a
-/// `COMMIT` has to run first.
-fn replica(pg: &str) -> (SqliteConnection, Vec<String>) {
+/// Registers the exemption function answering `exempt`.
+fn exempt(connection: &mut Replica, exempt: bool) {
+    key_action_exempt_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        move || exempt,
+    )
+    .expect("register the exemption");
+}
+
+/// `pg` translated and applied to a fresh managed connection.
+fn replica(pg: &str) -> Replica {
     let script = Pg2Sqlite::default()
         .sql(pg)
         .expect("parse")
         .translate_to_sql(&options())
         .unwrap_or_else(|error| panic!("{error}\n{pg}"));
-    let before_commit = script.before_commit.clone();
-    let mut connection = SqliteConnection::establish(":memory:").expect("open an in-memory SQLite");
-    key_action_exempt_utils::register_nondeterministic_impl(&mut connection, || false)
-        .expect("register the exemption");
-    for statement in script.into_vec() {
-        connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
-    }
-    (connection, before_commit)
+    let mut connection = Replica::establish(":memory:").expect("open an in-memory SQLite");
+    exempt(&mut connection, false);
+    script.initialize_managed(&mut connection, FreshFiles::Both).expect("initialize the replica");
+    connection
 }
 
 /// The replica of `children` declaring `key` in `situation`, holding parents
 /// 1 and 2, child 1 referencing parent 1, child 2 referencing none and child
 /// 3 referencing parent 2.
-fn children_replica(key: &str, situation: &Situation) -> SqliteConnection {
-    let (mut connection, _) = replica(&script(key, situation.sql));
+fn children_replica(key: &str, situation: &Situation) -> Replica {
+    let mut connection = replica(&script(key, situation.sql));
     deliver(
         &mut connection,
         &format!(
@@ -144,7 +145,7 @@ fn children_replica(key: &str, situation: &Situation) -> SqliteConnection {
 }
 
 /// Every row of `table`, in key order.
-fn rows(connection: &mut SqliteConnection, table: &str) -> Vec<Row> {
+fn rows(connection: &mut Replica, table: &str) -> Vec<Row> {
     diesel::sql_query(format!("SELECT id, parent_id FROM {table} ORDER BY id"))
         .load(connection)
         .unwrap_or_else(|error| panic!("read {table}: {error}"))
@@ -155,7 +156,7 @@ fn row(id: i32, parent_id: Option<i32>) -> Row {
 }
 
 /// The SQLSTATE and message the replica refuses `sql` with.
-fn refusal(connection: &mut SqliteConnection, sql: &str) -> String {
+fn refusal(connection: &mut Replica, sql: &str) -> String {
     let error = connection.batch_execute(sql).expect_err("the write is refused").to_string();
     let refused = postgres_error(&error).unwrap_or_else(|| panic!("no PostgreSQL error: {error}"));
     format!("{}: {}", refused.sqlstate(), refused.message())
@@ -179,7 +180,7 @@ fn assert_action(key: &str, write: &str, expected: &[Row]) {
     }
 }
 
-fn parents(connection: &mut SqliteConnection) -> Vec<i32> {
+fn parents(connection: &mut Replica) -> Vec<i32> {
     parents::table.select(parents::id).order(parents::id).load(connection).expect("read parents")
 }
 
@@ -292,7 +293,7 @@ fn a_deferred_key_runs_its_action_at_the_parent_write() {
         "REFERENCES parents (id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED",
         SITUATIONS[0].sql,
     );
-    let (mut connection, before_commit) = replica(&pg);
+    let mut connection = replica(&pg);
     deliver(
         &mut connection,
         "INSERT INTO parents (id) VALUES (1); INSERT INTO children_rls VALUES (1, 1);",
@@ -300,7 +301,8 @@ fn a_deferred_key_runs_its_action_at_the_parent_write() {
     connection.batch_execute("BEGIN; DELETE FROM parents WHERE id = 1;").expect("delete");
     assert_eq!(rows(&mut connection, "children_rls"), Vec::new());
     connection.batch_execute("ROLLBACK").expect("roll back");
-    transaction(&mut connection, &before_commit, "DELETE FROM parents WHERE id = 1")
+    connection
+        .transaction(|connection| connection.batch_execute("DELETE FROM parents WHERE id = 1"))
         .expect("the delete commits");
     assert_eq!(rows(&mut connection, "children_rls"), Vec::new());
 }
@@ -320,7 +322,7 @@ fn a_key_into_hidden_parent_rows_runs_its_action_into_read_only_children() {
          {}",
         SITUATIONS[0].sql
     );
-    let (mut connection, _) = replica(&pg);
+    let mut connection = replica(&pg);
     deliver(
         &mut connection,
         "INSERT INTO parents_rls VALUES (1, 'visible'), (2, 'visible');
@@ -341,7 +343,7 @@ fn a_self_referencing_key_runs_its_action_through_every_level() {
          CREATE POLICY nodes_select ON nodes FOR SELECT TO app USING (true);
          CREATE POLICY nodes_update ON nodes FOR UPDATE TO app USING (parent_id IS NULL);
          CREATE POLICY nodes_delete ON nodes FOR DELETE TO app USING (parent_id IS NULL);";
-    let (mut connection, _) = replica(pg);
+    let mut connection = replica(pg);
     deliver(
         &mut connection,
         "INSERT INTO nodes_rls VALUES (1, NULL), (2, 1), (3, 2), (4, NULL), (5, 4);",
@@ -367,7 +369,7 @@ fn an_action_runs_through_two_read_only_children() {
          ALTER TABLE children ENABLE ROW LEVEL SECURITY;
          GRANT SELECT ON children, grandchildren TO app;
          CREATE POLICY children_select ON children FOR SELECT TO app USING (true);";
-    let (mut connection, _) = replica(pg);
+    let mut connection = replica(pg);
     deliver(
         &mut connection,
         "INSERT INTO parents VALUES (1), (2);
@@ -391,7 +393,7 @@ fn a_multi_column_key_runs_its_actions_on_every_column() {
          {}",
         SITUATIONS[0].sql
     );
-    let (mut connection, _) = replica(&pg);
+    let mut connection = replica(&pg);
     deliver(
         &mut connection,
         "INSERT INTO parents VALUES (1, 1), (1, 2), (2, 1);

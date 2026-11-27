@@ -3,6 +3,7 @@
 //! Covers PostgreSQL functions that were previously falling through to
 //! `PassThrough` and should instead be explicitly renamed or rejected.
 
+use diesel::{Connection, connection::SimpleConnection};
 use translate_helpers::{translate_default as translate, translate_default_err as translate_err};
 
 use crate::helpers::translate as translate_helpers;
@@ -23,9 +24,9 @@ fn test_ascii_renamed_to_unicode() {
             .translate(&pg2sqlite::prelude::Pg2SqliteOptions::default())
             .unwrap()
             .into_vec();
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
         for stmt in &stmts {
-            conn.execute_batch(&format!("{stmt};")).expect("translated SQL must execute in SQLite");
+            conn.batch_execute(&format!("{stmt};")).expect("translated SQL must execute in SQLite");
         }
     }
 }

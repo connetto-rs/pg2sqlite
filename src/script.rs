@@ -13,6 +13,18 @@ use crate::{
     initialization::InitializationPlan,
 };
 
+/// Why a script cannot open a managed connection.
+#[cfg(feature = "managed")]
+#[derive(Debug, thiserror::Error)]
+pub enum OpenError {
+    /// The script cannot produce the part the connection runs.
+    #[error(transparent)]
+    Unavailable(#[from] Error),
+    /// The connection refused a registration or a statement.
+    #[error(transparent)]
+    Execution(#[from] pg2sqlite_runtime::ExecutionError),
+}
+
 /// Why the connection part cannot be produced.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConnectionError {
@@ -56,6 +68,10 @@ pub enum FreshFiles {
 /// translated statement unless `S` names another form.
 pub type HelperFunction<S = Statement> = pg2sqlite_runtime::HelperFunction<S>;
 
+/// One logical source statement of a script part, the statements emitted for
+/// it or the transaction control it runs as.
+pub type Group<S = Statement> = pg2sqlite_runtime::ExecutionGroup<Vec<S>>;
+
 /// A translation's statements, in parts run in field order.
 ///
 /// Every connection runs [`setup`](Self::setup). The connection creating the
@@ -63,6 +79,14 @@ pub type HelperFunction<S = Statement> = pg2sqlite_runtime::HelperFunction<S>;
 /// [`files`](Self::files) or [`initialize`](Self::initialize), and every
 /// later connection runs [`connect`](Self::connect) instead. Every connection
 /// registers [`functions`](Self::functions) before running any part.
+///
+/// The translation calls clock readers that only a
+/// [`ManagedConnection`](pg2sqlite_runtime::ManagedConnection) answers, from
+/// the instants it samples at each logical statement and transaction start.
+/// [`initialize_managed`](Self::initialize_managed) and
+/// [`connect_managed`](Self::connect_managed) run the parts as such groups.
+/// The flat statement iterators export the text, and executing that text
+/// statement by statement loses those boundaries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Script<S = Statement> {
     /// Connection pragmas, `PRAGMA case_sensitive_like = 1` whenever the
@@ -74,19 +98,19 @@ pub struct Script<S = Statement> {
     /// with a prevalidated selection per newly created file.
     pub files: InitializationPlan<S>,
     /// The committed `TEMP` objects and rows the source leaves behind,
-    /// recreated on a connection to an existing database file.
-    pub connection: Result<Vec<S>, ConnectionError>,
-    /// The statements to run before every `COMMIT` of a transaction that
-    /// writes the database, empty unless the source declares a `DEFERRABLE
+    /// recreated on a connection to an existing database file, inside the
+    /// transactions the source wrote them in.
+    pub connection: Result<Vec<Group<S>>, ConnectionError>,
+    /// The statements a managed connection runs before every commit ending
+    /// a transaction, empty unless the source declares a `DEFERRABLE
     /// INITIALLY DEFERRED` constraint trigger.
     ///
     /// They run the checks such a trigger queued, against the rows as they
-    /// stand, and fail with the trigger's own message on a violation, leaving
-    /// the transaction open to roll back as PostgreSQL rolls it back. A
-    /// `COMMIT` with a check still queued fails with `FOREIGN KEY constraint
-    /// failed`, and so does an autocommit write that queues one, so writes to
-    /// a table carrying such a trigger run inside a transaction. The script's
-    /// own translated `COMMIT`s already run them.
+    /// stand, and fail with the trigger's own message on a violation, which
+    /// rolls the transaction back as PostgreSQL does. A `COMMIT` with a check
+    /// still queued fails with `FOREIGN KEY constraint failed`, and so does
+    /// an autocommit write that queues one, so writes to a table carrying
+    /// such a trigger run inside a transaction.
     pub before_commit: Vec<S>,
     /// The helpers the script's statements call as table-valued functions,
     /// connection state every connection registers before running any part.
@@ -132,7 +156,7 @@ impl<S> Script<S> {
     pub fn connect(&self) -> Result<impl Iterator<Item = &S>, Error> {
         let connection =
             self.connection.as_ref().map_err(|error| Error::Connection(error.clone()))?;
-        Ok(self.setup.iter().chain(connection))
+        Ok(self.setup.iter().chain(connection.iter().flat_map(Group::emitted)))
     }
 
     /// The statements a connection creating the database runs, in order,
@@ -150,9 +174,14 @@ impl<S> Script<S> {
         Script {
             setup: self.setup.into_iter().map(&mut f).collect(),
             files: self.files.map(&mut f),
-            connection: self
-                .connection
-                .map(|statements| statements.into_iter().map(&mut f).collect()),
+            connection: self.connection.map(|groups| {
+                groups
+                    .into_iter()
+                    .map(|group| {
+                        group.map(|statements| statements.into_iter().map(&mut f).collect())
+                    })
+                    .collect()
+            }),
             before_commit: self.before_commit.into_iter().map(&mut f).collect(),
             functions: self
                 .functions
@@ -170,18 +199,80 @@ impl<S> Script<S> {
     }
 }
 
-#[cfg(feature = "diesel")]
+#[cfg(feature = "managed")]
 impl<S: core::fmt::Display> Script<S> {
-    /// Registers every helper function on `connection`, which a connection
-    /// does before running any part of the script.
+    /// Registers the script's helpers and pre-commit checks on `connection`,
+    /// then runs the setup and the initialization of the selected fresh
+    /// files, one group per logical source statement.
     ///
     /// # Errors
     ///
-    /// The error SQLite answers when it refuses a registration.
-    pub fn register_functions(
+    /// [`OpenError::Unavailable`] when the selection is unavailable, before
+    /// anything runs, or the connection's refusal.
+    pub fn initialize_managed<Provider: pg2sqlite_runtime::UtcProvider + Send + 'static>(
         &self,
-        connection: &mut diesel::sqlite::SqliteConnection,
-    ) -> diesel::QueryResult<()> {
-        self.functions.iter().try_for_each(|function| function.register(connection))
+        connection: &mut pg2sqlite_runtime::ManagedConnection<Provider>,
+        files: FreshFiles,
+    ) -> Result<(), OpenError> {
+        let groups = self.files.select_groups(files)?;
+        self.prepare(connection)?;
+        for group in groups {
+            connection.execute_group(group)?;
+        }
+        Ok(())
+    }
+
+    /// Registers the script's helpers and pre-commit checks on `connection`
+    /// to an existing database, then runs the setup and the connection part.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenError::Unavailable`] when the connection part is unavailable,
+    /// before anything runs, or the connection's refusal.
+    pub fn connect_managed<Provider: pg2sqlite_runtime::UtcProvider + Send + 'static>(
+        &self,
+        connection: &mut pg2sqlite_runtime::ManagedConnection<Provider>,
+    ) -> Result<(), OpenError> {
+        let groups = self.connection.as_ref().map_err(|error| Error::Connection(error.clone()))?;
+        self.prepare(connection)?;
+        for group in groups {
+            connection.execute_group(group.borrowed())?;
+        }
+        Ok(())
+    }
+
+    /// Registers the script's helpers and pre-commit checks on
+    /// `connection`, which every connection does before running any part of
+    /// the script. [`initialize_managed`](Self::initialize_managed) and
+    /// [`connect_managed`](Self::connect_managed) start with it.
+    ///
+    /// # Errors
+    ///
+    /// The connection's refusal, or
+    /// [`ExecutionError::InvalidTransactionState`](pg2sqlite_runtime::ExecutionError::InvalidTransactionState)
+    /// inside a transaction.
+    pub fn register_managed<Provider: pg2sqlite_runtime::UtcProvider + Send + 'static>(
+        &self,
+        connection: &mut pg2sqlite_runtime::ManagedConnection<Provider>,
+    ) -> Result<(), pg2sqlite_runtime::ExecutionError> {
+        let mut registration = connection.registration()?;
+        for function in &self.functions {
+            registration.helper(function)?;
+        }
+        registration.before_commit(&self.before_commit)
+    }
+
+    /// Registers the helpers and the pre-commit checks, then runs the setup.
+    fn prepare<Provider: pg2sqlite_runtime::UtcProvider + Send + 'static>(
+        &self,
+        connection: &mut pg2sqlite_runtime::ManagedConnection<Provider>,
+    ) -> Result<(), pg2sqlite_runtime::ExecutionError> {
+        self.register_managed(connection)?;
+        for statement in &self.setup {
+            let group: pg2sqlite_runtime::ExecutionGroup<_> =
+                pg2sqlite_runtime::ExecutionGroup::statements(core::slice::from_ref(statement));
+            connection.execute_group(group)?;
+        }
+        Ok(())
     }
 }

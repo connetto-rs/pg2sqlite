@@ -5,7 +5,7 @@
 
 #![allow(dead_code)]
 
-use diesel::prelude::*;
+use diesel::{connection::SimpleConnection, prelude::*};
 
 use crate::helpers;
 
@@ -197,15 +197,15 @@ struct Customer {
 /// prepares in SQLite. The statements are translator output, a runtime
 /// string no typed DSL can carry.
 fn prove_script(translated: &[String], select_stmt: &str) {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     // Only `Query` nodes render SELECT-prefixed, so the text filter skips
     // exactly the queries the AST filter used to skip.
     for stmt in
         translated.iter().filter(|s| !s.trim_start().to_ascii_uppercase().starts_with("SELECT"))
     {
-        conn.execute_batch(&format!("{stmt};")).unwrap();
+        conn.batch_execute(&format!("{stmt};")).unwrap();
     }
-    conn.prepare(select_stmt).unwrap();
+    helpers::query_values(&mut conn, &format!("EXPLAIN {select_stmt}"), &[]).unwrap();
 }
 #[test]
 fn test_join_ilike_translation() {
@@ -263,10 +263,10 @@ fn test_join_now_translation() {
         &helpers::deployment::utc_request(),
     );
 
-    // Should contain strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'), not NOW()
+    // Should contain pg2sqlite_transaction_timestamp(), not NOW()
     assert!(
-        select_stmt.contains("strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"),
-        "NOW() in JOIN should translate to strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'), got: {select_stmt}"
+        select_stmt.contains("pg2sqlite_transaction_timestamp()"),
+        "NOW() in JOIN should translate to pg2sqlite_transaction_timestamp(), got: {select_stmt}"
     );
     assert!(
         !select_stmt.to_uppercase().contains("NOW()"),

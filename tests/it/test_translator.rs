@@ -4,7 +4,7 @@
 
 #![cfg(feature = "git")]
 
-use diesel::{Connection, RunQueryDsl, SqliteConnection, declare_sql_function};
+use diesel::{Connection, RunQueryDsl, declare_sql_function};
 use git2::{Repository, Signature};
 use pg2sqlite::{
     prelude::{Pg2Sqlite, Pg2SqliteOptions},
@@ -12,6 +12,8 @@ use pg2sqlite::{
 };
 use rosetta_uuid::Uuid;
 use tempfile::TempDir;
+
+use crate::helpers::Replica;
 
 #[declare_sql_function]
 extern "SQL" {
@@ -86,7 +88,7 @@ fn test_translator() -> Result<(), Box<dyn std::error::Error>> {
 
     // Execute translated migrations against in-memory SQLite to ensure
     // syntactic and basic runtime compatibility.
-    let mut connection = SqliteConnection::establish(":memory:")?;
+    let mut connection = Replica::establish(":memory:")?;
 
     // Enable foreign key constraints (PRAGMA)
     diesel::sql_query("PRAGMA foreign_keys = ON")
@@ -103,7 +105,8 @@ fn test_translator() -> Result<(), Box<dyn std::error::Error>> {
         .execute(&mut connection)
         .expect("Failed to set journal mode to WAL");
 
-    uuid_utils::register_impl(&mut connection, uuid_impl).expect("Failed to register uuid()");
+    uuid_utils::register_impl(connection.registration().expect("registration").sqlite(), uuid_impl)
+        .expect("Failed to register uuid()");
 
     // Execute all translated statements and fail fast on runtime
     // incompatibility.

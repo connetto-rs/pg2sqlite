@@ -7,11 +7,29 @@
 //! stands, and a call with no SQLite translation is refused wherever it is
 //! assigned.
 
+use diesel::{Connection as _, connection::SimpleConnection};
 use pg2sqlite::{
     errors::Error,
     prelude::{Pg2Sqlite, Pg2SqliteOptions},
 };
-use rusqlite::{Connection, functions::FunctionFlags};
+
+use crate::helpers::{Replica as Connection, SqliteAnyValue, query_values};
+
+#[derive(Debug)]
+struct CheckedPositive(i64);
+
+impl diesel::serialize::ToSql<diesel::sql_types::Bool, diesel::sqlite::Sqlite> for CheckedPositive {
+    fn to_sql<'value>(
+        &'value self,
+        output: &mut diesel::serialize::Output<'value, '_, diesel::sqlite::Sqlite>,
+    ) -> diesel::serialize::Result {
+        if self.0 < 0 {
+            return Err(std::io::Error::other(format!("{} is negative", self.0)).into());
+        }
+        output.set_value(1);
+        Ok(diesel::serialize::IsNull::No)
+    }
+}
 
 /// A function the destination registers, failing for a negative argument.
 const CHECK: &str = "check_positive";
@@ -52,51 +70,62 @@ fn applied(body: &str) -> Connection {
     let options = Pg2SqliteOptions::default().with_user_defined_functions([CHECK]);
     let statements = translated(body, &options)
         .unwrap_or_else(|error| panic!("the trigger should translate: {error}"));
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = Connection::establish(":memory:").expect("in-memory SQLite");
     connection
-        .create_scalar_function(CHECK, 1, FunctionFlags::SQLITE_DETERMINISTIC, |context| {
-            let value = context.get::<i64>(0)?;
-            if value < 0 {
-                return Err(rusqlite::Error::UserFunctionError(
-                    format!("{value} is negative").into(),
-                ));
-            }
-            Ok(true)
-        })
+        .registration()
+        .expect("registration")
+        .sqlite()
+        .register_sql_function::<(diesel::sql_types::BigInt,), diesel::sql_types::Bool, _, _, _>(
+            CHECK,
+            diesel::sqlite::SqliteFunctionBehavior::DETERMINISTIC,
+            |(value,): (i64,)| CheckedPositive(value),
+        )
         .expect("register check_positive");
     for statement in &statements {
-        connection.execute_batch(statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
+        connection.batch_execute(statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
     }
     connection
 }
 
 /// Whether inserting `(id, val)` succeeds.
-fn inserts(connection: &Connection, id: i64, val: i64) -> bool {
-    connection.execute("INSERT INTO t VALUES (?1, ?2)", [id, val]).is_ok()
+fn inserts(connection: &mut Connection, id: i64, val: i64) -> bool {
+    connection
+        .execute(
+            "INSERT INTO t VALUES (?1, ?2)",
+            &[SqliteAnyValue::Integer(id), SqliteAnyValue::Integer(val)],
+        )
+        .is_ok()
 }
 
 /// The error inserting `(id, val)` fails with.
-fn insert_error(connection: &Connection, id: i64, val: i64) -> String {
+fn insert_error(connection: &mut Connection, id: i64, val: i64) -> String {
     connection
-        .execute("INSERT INTO t VALUES (?1, ?2)", [id, val])
+        .execute(
+            "INSERT INTO t VALUES (?1, ?2)",
+            &[SqliteAnyValue::Integer(id), SqliteAnyValue::Integer(val)],
+        )
         .expect_err("the insert should fail")
         .to_string()
 }
 
-fn stored_ids(connection: &Connection) -> Vec<i64> {
-    let mut prepared = connection.prepare("SELECT id FROM t ORDER BY id").expect("prepare");
-    prepared
-        .query_map([], |row| row.get(0))
+fn stored_ids(connection: &mut Connection) -> Vec<i64> {
+    query_values(connection, "SELECT id FROM t ORDER BY id", &[])
         .expect("query")
-        .collect::<Result<Vec<i64>, _>>()
-        .expect("rows")
+        .into_iter()
+        .map(|row| {
+            match row[0] {
+                SqliteAnyValue::Integer(value) => value,
+                ref value => panic!("expected integer, got {value:?}"),
+            }
+        })
+        .collect()
 }
 
 /// The helper's body runs where the assignment stands, and the variable reads
 /// what it returned.
 #[test]
 fn a_helper_assigned_to_a_read_variable_runs_its_body_and_returns_its_value() {
-    let connection = applied(
+    let mut connection = applied(
         "DECLARE large BOOLEAN;
          BEGIN
              large := require_positive(NEW.val);
@@ -104,44 +133,44 @@ fn a_helper_assigned_to_a_read_variable_runs_its_body_and_returns_its_value() {
              RETURN NEW;
          END",
     );
-    assert!(inserts(&connection, 1, 5));
-    assert!(inserts(&connection, 2, 50), "50 is large and vetoed without an error");
-    assert!(insert_error(&connection, 3, -1).contains("negative"));
-    assert_eq!(stored_ids(&connection), vec![1]);
+    assert!(inserts(&mut connection, 1, 5));
+    assert!(inserts(&mut connection, 2, 50), "50 is large and vetoed without an error");
+    assert!(insert_error(&mut connection, 3, -1).contains("negative"));
+    assert_eq!(stored_ids(&mut connection), vec![1]);
 }
 
 #[test]
 fn a_helper_assigned_to_an_unread_variable_runs_its_check() {
-    let connection = applied(
+    let mut connection = applied(
         "DECLARE large BOOLEAN;
          BEGIN
              large := require_positive(NEW.val);
              RETURN NEW;
          END",
     );
-    assert!(inserts(&connection, 1, 5));
-    assert!(insert_error(&connection, 2, -1).contains("negative"));
-    assert_eq!(stored_ids(&connection), vec![1]);
+    assert!(inserts(&mut connection, 1, 5));
+    assert!(insert_error(&mut connection, 2, -1).contains("negative"));
+    assert_eq!(stored_ids(&mut connection), vec![1]);
 }
 
 #[test]
 fn a_helper_in_a_declaration_default_runs_its_body_and_returns_its_value() {
-    let connection = applied(
+    let mut connection = applied(
         "DECLARE large BOOLEAN := require_positive(NEW.val);
          BEGIN
              IF large THEN RETURN NULL; END IF;
              RETURN NEW;
          END",
     );
-    assert!(inserts(&connection, 1, 5));
-    assert!(inserts(&connection, 2, 50), "50 is large and vetoed without an error");
-    assert!(insert_error(&connection, 3, -1).contains("negative"));
-    assert_eq!(stored_ids(&connection), vec![1]);
+    assert!(inserts(&mut connection, 1, 5));
+    assert!(inserts(&mut connection, 2, 50), "50 is large and vetoed without an error");
+    assert!(insert_error(&mut connection, 3, -1).contains("negative"));
+    assert_eq!(stored_ids(&mut connection), vec![1]);
 }
 
 #[test]
 fn a_helper_selected_into_a_variable_runs_its_body_and_returns_its_value() {
-    let connection = applied(
+    let mut connection = applied(
         "DECLARE large BOOLEAN;
          BEGIN
              SELECT require_positive(NEW.val) INTO large;
@@ -149,16 +178,16 @@ fn a_helper_selected_into_a_variable_runs_its_body_and_returns_its_value() {
              RETURN NEW;
          END",
     );
-    assert!(inserts(&connection, 1, 5));
-    assert!(inserts(&connection, 2, 50), "50 is large and vetoed without an error");
-    assert!(insert_error(&connection, 3, -1).contains("negative"));
-    assert_eq!(stored_ids(&connection), vec![1]);
+    assert!(inserts(&mut connection, 1, 5));
+    assert!(inserts(&mut connection, 2, 50), "50 is large and vetoed without an error");
+    assert!(insert_error(&mut connection, 3, -1).contains("negative"));
+    assert_eq!(stored_ids(&mut connection), vec![1]);
 }
 
 /// The assignment in the branch not taken runs no helper body.
 #[test]
 fn a_helper_assigned_inside_a_branch_runs_only_when_the_branch_does() {
-    let connection = applied(
+    let mut connection = applied(
         "DECLARE large BOOLEAN;
          BEGIN
              IF NEW.val > 100 THEN
@@ -167,16 +196,16 @@ fn a_helper_assigned_inside_a_branch_runs_only_when_the_branch_does() {
              RETURN NEW;
          END",
     );
-    assert!(inserts(&connection, 1, 50), "val 50 takes no branch");
-    assert!(insert_error(&connection, 2, 150).contains("negative"), "val 150 checks -50");
-    assert!(inserts(&connection, 3, 250), "val 250 checks 50");
-    assert_eq!(stored_ids(&connection), vec![1, 3]);
+    assert!(inserts(&mut connection, 1, 50), "val 50 takes no branch");
+    assert!(insert_error(&mut connection, 2, 150).contains("negative"), "val 150 checks -50");
+    assert!(inserts(&mut connection, 3, 250), "val 250 checks 50");
+    assert_eq!(stored_ids(&mut connection), vec![1, 3]);
 }
 
 /// A helper returning another helper's answer runs that helper's body too.
 #[test]
 fn a_helper_returning_a_helper_call_runs_both_bodies() {
-    let connection = applied(
+    let mut connection = applied(
         "DECLARE large BOOLEAN;
          BEGIN
              large := wrapped(NEW.val);
@@ -184,10 +213,10 @@ fn a_helper_returning_a_helper_call_runs_both_bodies() {
              RETURN NEW;
          END",
     );
-    assert!(inserts(&connection, 1, 5));
-    assert!(inserts(&connection, 2, 50), "50 is large and vetoed without an error");
-    assert!(insert_error(&connection, 3, -1).contains("negative"));
-    assert_eq!(stored_ids(&connection), vec![1]);
+    assert!(inserts(&mut connection, 1, 5));
+    assert!(inserts(&mut connection, 2, 50), "50 is large and vetoed without an error");
+    assert!(insert_error(&mut connection, 3, -1).contains("negative"));
+    assert_eq!(stored_ids(&mut connection), vec![1]);
 }
 
 /// PostgreSQL skips the right operand of `AND` once the left one is false, so
@@ -223,35 +252,35 @@ fn a_helper_whose_body_does_not_translate_is_refused_where_assigned() {
 
 #[test]
 fn an_unread_assignment_runs_its_check() {
-    let connection = applied(
+    let mut connection = applied(
         "DECLARE ok BOOLEAN;
          BEGIN
              ok := check_positive(NEW.val);
              RETURN NEW;
          END",
     );
-    assert!(inserts(&connection, 1, 5));
-    assert!(!inserts(&connection, 2, -1), "the check must reject the negative row");
-    assert_eq!(stored_ids(&connection), vec![1]);
+    assert!(inserts(&mut connection, 1, 5));
+    assert!(!inserts(&mut connection, 2, -1), "the check must reject the negative row");
+    assert_eq!(stored_ids(&mut connection), vec![1]);
 }
 
 #[test]
 fn an_unread_declaration_default_runs_its_check() {
-    let connection = applied(
+    let mut connection = applied(
         "DECLARE ok BOOLEAN := check_positive(NEW.val);
          BEGIN
              RETURN NEW;
          END",
     );
-    assert!(inserts(&connection, 1, 5));
-    assert!(!inserts(&connection, 2, -1), "the check must reject the negative row");
-    assert_eq!(stored_ids(&connection), vec![1]);
+    assert!(inserts(&mut connection, 1, 5));
+    assert!(!inserts(&mut connection, 2, -1), "the check must reject the negative row");
+    assert_eq!(stored_ids(&mut connection), vec![1]);
 }
 
 /// The branch not taken assigns nothing, so its check does not run either.
 #[test]
 fn an_assignment_inside_a_branch_runs_only_when_the_branch_does() {
-    let connection = applied(
+    let mut connection = applied(
         "DECLARE ok BOOLEAN;
          BEGIN
              IF NEW.val > 100 THEN
@@ -260,17 +289,17 @@ fn an_assignment_inside_a_branch_runs_only_when_the_branch_does() {
              RETURN NEW;
          END",
     );
-    assert!(inserts(&connection, 1, 50), "val 50 takes no branch");
-    assert!(!inserts(&connection, 2, 150), "val 150 checks -50");
-    assert!(inserts(&connection, 3, 250), "val 250 checks 50");
-    assert_eq!(stored_ids(&connection), vec![1, 3]);
+    assert!(inserts(&mut connection, 1, 50), "val 50 takes no branch");
+    assert!(!inserts(&mut connection, 2, 150), "val 150 checks -50");
+    assert!(inserts(&mut connection, 3, 250), "val 250 checks 50");
+    assert_eq!(stored_ids(&mut connection), vec![1, 3]);
 }
 
 /// A value read later still runs where it is assigned, so a veto before the
 /// read cannot skip the check PostgreSQL ran.
 #[test]
 fn an_assignment_runs_before_a_later_veto() {
-    let connection = applied(
+    let mut connection = applied(
         "DECLARE ok BOOLEAN;
          BEGIN
              ok := check_positive(NEW.val + 10);
@@ -279,8 +308,8 @@ fn an_assignment_runs_before_a_later_veto() {
              RETURN NEW;
          END",
     );
-    assert!(inserts(&connection, 1, 5));
-    assert!(inserts(&connection, 2, -5), "-5 checks 5 and is vetoed without an error");
-    assert!(!inserts(&connection, 3, -20), "-20 checks -10, which raises before the veto");
-    assert_eq!(stored_ids(&connection), vec![1]);
+    assert!(inserts(&mut connection, 1, 5));
+    assert!(inserts(&mut connection, 2, -5), "-5 checks 5 and is vetoed without an error");
+    assert!(!inserts(&mut connection, 3, -20), "-20 checks -10, which raises before the veto");
+    assert_eq!(stored_ids(&mut connection), vec![1]);
 }

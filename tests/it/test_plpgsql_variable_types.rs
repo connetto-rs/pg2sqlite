@@ -60,7 +60,7 @@ fn raises(pg: &str) -> bool {
         .map(|statement| format!("{statement};"))
         .collect::<Vec<_>>()
         .join("\n");
-    let mut connection = SqliteConnection::establish(":memory:").expect("connect");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("connect");
     connection.batch_execute(&script).expect("apply the translated script");
     match diesel::insert_into(log::table).values(log::id.eq(1)).execute(&mut connection) {
         Ok(_) => false,

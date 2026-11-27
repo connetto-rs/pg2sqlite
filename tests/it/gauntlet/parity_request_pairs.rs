@@ -10,7 +10,7 @@ use alloc::sync::Arc;
 // `register_impl` takes an unwind-safe closure, which a poisoning mutex is.
 use std::sync::Mutex;
 
-use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{pg::PgConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
 use sql_traits::structs::{Deployment, SessionSetting, SettingValue};
 use sqlparser::ast::DataType;
@@ -226,25 +226,26 @@ fn postgres(predicate: &str) -> PgConnection {
 
 /// The replica, whose settings read what `request` holds, `None` for a
 /// session that never set them.
-fn sqlite(predicate: &str, request: &Arc<Mutex<Option<Request>>>) -> SqliteConnection {
+fn sqlite(predicate: &str, request: &Arc<Mutex<Option<Request>>>) -> crate::helpers::Replica {
     let translated = Pg2Sqlite::default()
         .sql(&format!("{OWNER}{SCHEMA}{}", policy(predicate)))
         .expect("parse")
         .translate(&options())
         .unwrap_or_else(|error| panic!("pg2sqlite refused {predicate}: {error}"));
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-    translated.register_functions(&mut connection).expect("register helper functions");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
+    translated.register_managed(&mut connection).expect("register helper functions");
     let read = |pick: fn(Request) -> &'static str| {
         let request = Arc::clone(request);
         move || request.lock().expect("the request lock").map(|sent| pick(sent).to_owned())
     };
+    let mut registration = connection.registration().expect("registration");
     app_installation_namespace_id_utils::register_impl(
-        &mut connection,
+        registration.sqlite(),
         read(|(namespace, _)| namespace),
     )
     .expect("register app_installation_namespace_id");
     app_installation_id_utils::register_impl(
-        &mut connection,
+        registration.sqlite(),
         read(|(_, installation)| installation),
     )
     .expect("register app_installation_id");

@@ -1,6 +1,6 @@
 //! Tests for COLLATE clause translation and validation.
 
-use diesel::{RunQueryDsl, SqliteConnection, prelude::*};
+use diesel::{RunQueryDsl, connection::SimpleConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
 use crate::helpers;
@@ -75,9 +75,9 @@ fn test_collate_translation() {
 
     assert!(select_stmt.contains("COLLATE"), "Should contain COLLATE clause, got: {select_stmt}");
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     for s in &translated {
-        conn.execute_batch(&format!("{s};"))
+        conn.batch_execute(&format!("{s};"))
             .unwrap_or_else(|e| panic!("emitted SQL failed: {e}\n{s}"));
     }
 }
@@ -172,7 +172,7 @@ fn c_and_posix_collations_sort_in_byte_order() {
         );
 
         let mut connection =
-            SqliteConnection::establish(":memory:").expect("in-memory SQLite should open");
+            crate::helpers::Replica::establish(":memory:").expect("in-memory SQLite should open");
         for statement in
             translated.iter().filter(|s| !matches!(s, sqlparser::ast::Statement::Query(_)))
         {

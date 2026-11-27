@@ -2,7 +2,7 @@
 //! the replica aborts with carries the arguments where PostgreSQL's does,
 //! `NULL` printed as `<NULL>`, after the SQLSTATE `P0001`.
 
-use diesel::{prelude::*, sqlite::SqliteConnection};
+use diesel::prelude::*;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
 diesel::table! {
@@ -39,7 +39,7 @@ fn translate(raise: &str) -> Result<Vec<String>, pg2sqlite::errors::Error> {
 
 /// The message inserting `val` into a replica guarded by `raise` aborts with.
 fn abort_message(raise: &str, val: Option<i32>) -> String {
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
     for statement in translate(raise).unwrap_or_else(|error| panic!("refused: {error}")) {
         // Translated DDL is runtime text no typed DSL carries.
         diesel::sql_query(&statement)

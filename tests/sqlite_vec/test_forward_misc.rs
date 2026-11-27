@@ -5,6 +5,7 @@
 //! - Statement translation: DROP, VACUUM, transactions (statement.rs)
 //! - Forward function translation edge cases (function.rs)
 
+use diesel::{Connection, connection::SimpleConnection};
 use helpers::translate_default_or_err as translate_err;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 use translate_helpers::translate_default as translate;
@@ -779,18 +780,17 @@ fn delete_using_with_rls_table_join() {
         "the EXISTS subquery should read the policy view: {delete_stmt}"
     );
 
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = helpers::Replica::establish(":memory:").unwrap();
     let session_user = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(2));
     let session_user_for_fn = std::sync::Arc::clone(&session_user);
-    conn.create_scalar_function(
-        "current_app_user",
-        0,
-        rusqlite::functions::FunctionFlags::SQLITE_UTF8,
-        move |_| Ok(session_user_for_fn.load(std::sync::atomic::Ordering::Relaxed)),
+    diesel::define_sql_function! { fn current_app_user() -> diesel::sql_types::BigInt; }
+    current_app_user_utils::register_nondeterministic_impl(
+        conn.registration().expect("registration").sqlite(),
+        move || session_user_for_fn.load(std::sync::atomic::Ordering::Relaxed),
     )
     .unwrap();
     for s in &stmts {
-        conn.execute_batch(&format!("{s};"))
+        conn.batch_execute(&format!("{s};"))
             .unwrap_or_else(|e| panic!("SQLite rejected output: {e}\n{s}"));
     }
     // Seed each row with a matching session user so the BEFORE INSERT guard
@@ -798,33 +798,37 @@ fn delete_using_with_rls_table_join() {
     // authoritative apply pattern where system inserts satisfy the
     // configured policies.
     session_user.store(1, std::sync::atomic::Ordering::Relaxed);
-    conn.execute_batch("INSERT INTO users_rls (id, owner_id) VALUES (5, 1);").unwrap();
+    conn.batch_execute("INSERT INTO users_rls (id, owner_id) VALUES (5, 1);").unwrap();
     session_user.store(2, std::sync::atomic::Ordering::Relaxed);
-    conn.execute_batch("INSERT INTO users_rls (id, owner_id) VALUES (6, 2);").unwrap();
+    conn.batch_execute("INSERT INTO users_rls (id, owner_id) VALUES (6, 2);").unwrap();
     // Restore session_user to 2 for the test scenario.
-    conn.execute_batch(
+    conn.batch_execute(
         "INSERT INTO orders (id, user_id, amount) VALUES (100, 5, 10), (200, 6, 20);",
     )
     .unwrap();
 
-    let surviving = |conn: &rusqlite::Connection| -> Vec<i64> {
-        conn.prepare("SELECT id FROM orders ORDER BY id")
+    let surviving = |connection: &mut helpers::Replica| -> Vec<i64> {
+        helpers::query_values(connection, "SELECT id FROM orders ORDER BY id", &[])
             .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap()
+            .into_iter()
+            .map(|row| {
+                match row[0] {
+                    helpers::SqliteAnyValue::Integer(value) => value,
+                    ref value => panic!("expected integer, got {value:?}"),
+                }
+            })
+            .collect()
     };
 
     // Session user 2: the owner-1 users row the predicate wants is hidden by
     // the SELECT policy, so the DELETE must remove nothing.
-    conn.execute_batch(&format!("{delete_stmt};")).unwrap();
-    assert_eq!(surviving(&conn), vec![100, 200], "a policy-hidden row must not match USING");
+    conn.batch_execute(&format!("{delete_stmt};")).unwrap();
+    assert_eq!(surviving(&mut conn), vec![100, 200], "a policy-hidden row must not match USING");
 
     // Session user 1: the same row is now visible and exactly its order goes.
     session_user.store(1, std::sync::atomic::Ordering::Relaxed);
-    conn.execute_batch(&format!("{delete_stmt};")).unwrap();
-    assert_eq!(surviving(&conn), vec![200], "the visible owner-1 row drives the delete");
+    conn.batch_execute(&format!("{delete_stmt};")).unwrap();
+    assert_eq!(surviving(&mut conn), vec![200], "the visible owner-1 row drives the delete");
 }
 
 #[test]
@@ -980,8 +984,8 @@ fn insert_on_conflict_do_update_translates_expressions() {
     ";
     let output = translate(sql);
     assert!(
-        output.contains("strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"),
-        "Expected strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now') in ON CONFLICT DO UPDATE: {output}"
+        output.contains("pg2sqlite_transaction_timestamp()"),
+        "Expected pg2sqlite_transaction_timestamp() in ON CONFLICT DO UPDATE: {output}"
     );
     execute_emitted(sql);
 }
@@ -994,8 +998,8 @@ fn insert_returning_translates_expressions() {
     ";
     let output = translate(sql);
     assert!(
-        output.contains("strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"),
-        "Expected strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now') in INSERT RETURNING: {output}"
+        output.contains("pg2sqlite_transaction_timestamp()"),
+        "Expected pg2sqlite_transaction_timestamp() in INSERT RETURNING: {output}"
     );
     execute_emitted(sql);
 }

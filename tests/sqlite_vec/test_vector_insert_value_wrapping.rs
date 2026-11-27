@@ -1,5 +1,6 @@
 //! Vector writes convert text inputs to native storage.
 
+use diesel::{Connection, connection::SimpleConnection};
 use translate_helpers::translate_default as translate;
 
 use crate::{helpers, helpers::translate as translate_helpers};
@@ -249,8 +250,6 @@ fn tuple_update_on_vector_column_wraps_text_literal_with_vec_f32() {
 
 /// Translates `pg` and executes every emitted statement against an in-memory
 /// SQLite connection with the sqlite-vec extension loaded.
-/// rusqlite is used directly because registering sqlite3_auto_extension
-/// requires the raw FFI layer that diesel does not expose.
 fn apply_vector_sql(pg: &str) {
     use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
     helpers::register_sqlite_vec_once();
@@ -260,9 +259,9 @@ fn apply_vector_sql(pg: &str) {
         .translate(&Pg2SqliteOptions::default())
         .expect("translate")
         .into_vec();
-    let conn = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+    let mut conn = helpers::Replica::establish(":memory:").expect("in-memory SQLite");
     for s in &stmts {
-        conn.execute_batch(&format!("{s};"))
+        conn.batch_execute(&format!("{s};"))
             .unwrap_or_else(|e| panic!("translated statement must execute: {e}\n{s}"));
     }
 }
@@ -350,10 +349,6 @@ fn translate_uuid_blob(sql: &str) -> String {
 
 /// Translates and executes every statement in `sql` against a fresh in-memory
 /// SQLite with the UUID blob representation enabled.
-///
-/// Translated DDL uses STRICT BLOB columns and dynamically-generated DML;
-/// diesel has no compile-time schema for translator output, so rusqlite is
-/// used through the existing `helpers::execute_all` shim.
 fn apply_uuid_blob_sql(sql: &str) {
     use pg2sqlite::prelude::{Pg2SqliteOptions, UuidRepresentation};
     helpers::execute_all(

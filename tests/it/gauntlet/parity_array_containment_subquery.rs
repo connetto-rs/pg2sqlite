@@ -5,7 +5,7 @@
 
 use std::cell::RefCell;
 
-use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{pg::PgConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
 
 use super::harness::apply_with_seed;
@@ -147,7 +147,7 @@ fn postgres(policies: &str) -> PgConnection {
     connection
 }
 
-fn sqlite(policies: &str) -> SqliteConnection {
+fn sqlite(policies: &str) -> crate::helpers::Replica {
     let options = Pg2SqliteOptions::default()
         .with_rls_audit_table_name("rls_audit")
         .with_deployment(deployment([], [caller("app.owner", "text")]))
@@ -158,8 +158,12 @@ fn sqlite(policies: &str) -> SqliteConnection {
         .translate(&options)
         .unwrap_or_else(|error| panic!("pg2sqlite refused the schema: {error}"))
         .into_vec();
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-    app_owner_utils::register_impl(&mut connection, current_owner).expect("register app_owner");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
+    app_owner_utils::register_impl(
+        connection.registration().expect("registration").sqlite(),
+        current_owner,
+    )
+    .expect("register app_owner");
     apply_with_seed(&mut connection, &translated, |connection| {
         seed!(connection, edges_rls);
     });

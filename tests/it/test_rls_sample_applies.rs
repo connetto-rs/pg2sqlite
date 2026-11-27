@@ -6,8 +6,15 @@
 //! or the translator's trigger emission shows up as a normal test
 //! failure rather than a "in-memory apply failed" toast.
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
-use rusqlite::{Connection, params};
+
+use crate::helpers::{Replica, SqliteAnyValue, query_values};
+
+diesel::define_sql_function! {
+    /// Returns the sample caller's identifier.
+    fn current_app_user() -> diesel::sql_types::BigInt;
+}
 
 use crate::{
     helpers::deployment::{caller, deployment},
@@ -32,46 +39,52 @@ fn translate_rls_sample() -> String {
 
 #[test]
 fn rls_sample_applies_to_in_memory_sqlite() {
-    let conn = Connection::open_in_memory().expect("open in-memory db");
-    conn.create_scalar_function(
-        "current_app_user",
-        0,
-        rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
-        |_| Ok(42i64),
+    let mut conn = Replica::establish(":memory:").expect("open in-memory db");
+    current_app_user_utils::register_impl(
+        conn.registration().expect("registration").sqlite(),
+        || 42i64,
     )
     .expect("register current_app_user");
 
     let sql = translate_rls_sample();
-    conn.execute_batch(&sql).expect("apply translated RLS sample");
+    conn.batch_execute(&sql).expect("apply translated RLS sample");
 
-    let visible_rows: i64 = conn
-        .query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))
-        .expect("count documents view");
+    let visible_rows = match query_values(&mut conn, "SELECT COUNT(*) FROM documents", &[])
+        .expect("count documents view")[0][0]
+    {
+        SqliteAnyValue::Integer(value) => value,
+        ref value => panic!("expected integer, got {value:?}"),
+    };
     assert_eq!(visible_rows, 2, "user 42 should see exactly the two seeded rows");
 
-    let backing_rows: i64 = conn
-        .query_row("SELECT COUNT(*) FROM documents_rls", [], |row| row.get(0))
-        .expect("count documents_rls backing table");
+    let backing_rows = match query_values(&mut conn, "SELECT COUNT(*) FROM documents_rls", &[])
+        .expect("count documents_rls backing table")[0][0]
+    {
+        SqliteAnyValue::Integer(value) => value,
+        ref value => panic!("expected integer, got {value:?}"),
+    };
     assert_eq!(backing_rows, 2, "backing table should hold the two seeded rows");
 }
 
 #[test]
 fn rls_sample_blocks_disallowed_insert() {
-    let conn = Connection::open_in_memory().expect("open in-memory db");
-    conn.create_scalar_function(
-        "current_app_user",
-        0,
-        rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
-        |_| Ok(42i64),
+    let mut conn = Replica::establish(":memory:").expect("open in-memory db");
+    current_app_user_utils::register_impl(
+        conn.registration().expect("registration").sqlite(),
+        || 42i64,
     )
     .expect("register current_app_user");
 
     let sql = translate_rls_sample();
-    conn.execute_batch(&sql).expect("apply translated RLS sample");
+    conn.batch_execute(&sql).expect("apply translated RLS sample");
 
     let result = conn.execute(
         "INSERT INTO documents (id, owner_id, title) VALUES (?1, ?2, ?3)",
-        params![99i64, 99i64, "Owned by someone else"],
+        &[
+            SqliteAnyValue::Integer(99),
+            SqliteAnyValue::Integer(99),
+            SqliteAnyValue::Text("Owned by someone else".into()),
+        ],
     );
     let err = result.expect_err("policy must reject foreign-owner insert");
     assert!(

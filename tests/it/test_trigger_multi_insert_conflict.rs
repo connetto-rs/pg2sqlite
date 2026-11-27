@@ -1,7 +1,9 @@
 //! Tests for trigger translation with multiple inserts and ON CONFLICT clauses.
 
-use diesel::{Connection, RunQueryDsl, SqliteConnection, prelude::*};
+use diesel::{Connection, RunQueryDsl, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
+
+use crate::helpers::Replica;
 
 // Define Diesel schema and models
 
@@ -102,7 +104,7 @@ fn test_trigger_translation() -> Result<(), Box<dyn std::error::Error>> {
     insta::assert_snapshot!(generated_sql);
 
     // Verify it runs on SQLite
-    let mut connection = SqliteConnection::establish(":memory:")?;
+    let mut connection = Replica::establish(":memory:")?;
     diesel::sql_query("PRAGMA foreign_keys = ON").execute(&mut connection)?;
     diesel::sql_query("PRAGMA recursive_triggers = ON").execute(&mut connection)?;
 

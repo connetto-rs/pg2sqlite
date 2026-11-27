@@ -17,7 +17,7 @@
 //! A superuser and a table owner both bypass row-level security, so the
 //! PostgreSQL side acts as a role holding nothing but DML grants.
 
-use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{pg::PgConnection, prelude::*};
 use helpers::{establish_connection, set_session_user_id};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 use postgres_harness::Outcome;
@@ -315,7 +315,7 @@ macro_rules! runner {
 }
 
 runner!(PgRunner, PgConnection);
-runner!(SqliteRunner, SqliteConnection);
+runner!(SqliteRunner, crate::helpers::Replica);
 
 impl PgRunner {
     fn become_user(&mut self, user: Uuid) {

@@ -1,4 +1,4 @@
-//! Registers the nine PostgreSQL statistical aggregates on a `rusqlite`
+//! Registers the nine PostgreSQL statistical aggregates on a diesel SQLite
 //! connection, which SQLite does not provide.
 //! The translator refuses these names unless the caller declares them, so a
 //! test that wants a number out of one has to supply the implementation. The
@@ -11,13 +11,16 @@
 //! test group in memory is irrelevant here. A caller writing this for
 //! production would use Welford's method instead and give up the exactness.
 //!
-//! Registration goes through `create_window_function`, so the same
-//! registration answers both a plain aggregate call and one carrying `OVER`.
+//! Registration goes through rusqlite's `create_window_function` on the
+//! connection's own handle, since diesel registers no window function, so the
+//! same registration answers both a plain aggregate call and one carrying
+//! `OVER`.
 
 // A group's row count crosses into `f64` to be divided by, which is what
 // every one of these aggregates is defined as.
 #![allow(clippy::cast_precision_loss)]
 
+use diesel::sqlite::SqliteConnection;
 use rusqlite::{
     Connection, Result,
     functions::{Aggregate, Context, FunctionFlags, WindowAggregate},
@@ -53,18 +56,24 @@ pub const STATISTICAL_AGGREGATES: &[&str] = &[
     "corr",
 ];
 
-/// Registers all nine on `connection`.
+/// Registers all nine on `connection`, a managed replica's
+/// `registration().sqlite()` included.
 ///
 /// # Errors
 ///
 /// Propagates a `rusqlite` registration failure.
-pub fn register_statistical_aggregates(connection: &Connection) -> Result<()> {
+pub fn register_statistical_aggregates(connection: &mut SqliteConnection) -> Result<()> {
+    // SAFETY: diesel and rusqlite link the one `libsqlite3-sys`, so the handle
+    // is the type rusqlite reads. `from_handle` borrows it without closing it
+    // on drop, and SQLite keeps each registered function until the diesel
+    // connection closes.
+    let handle = unsafe { connection.with_raw_connection(|raw| Connection::from_handle(raw)) }?;
     let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
     for (name, kind) in UNIVARIATE {
-        connection.create_window_function(*name, 1, flags, *kind)?;
+        handle.create_window_function(*name, 1, flags, *kind)?;
     }
     for (name, kind) in BIVARIATE {
-        connection.create_window_function(*name, 2, flags, *kind)?;
+        handle.create_window_function(*name, 2, flags, *kind)?;
     }
     Ok(())
 }

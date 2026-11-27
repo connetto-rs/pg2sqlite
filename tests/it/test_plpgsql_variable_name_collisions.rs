@@ -7,6 +7,8 @@
 use diesel::{connection::SimpleConnection, prelude::*, sql_types::BigInt};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
+use crate::helpers::Replica;
+
 diesel::table! {
     /// The table whose insert fires the trigger.
     log (id) {
@@ -45,8 +47,8 @@ CREATE TRIGGER mark_log BEFORE INSERT ON log FOR EACH ROW EXECUTE FUNCTION mark(
 
 /// Applies `script`, writes a `log` row, and answers the error the trigger
 /// raised, with the connection to read what it changed.
-fn fire(script: &str) -> (Option<String>, SqliteConnection) {
-    let mut connection = SqliteConnection::establish(":memory:").expect("connect");
+fn fire(script: &str) -> (Option<String>, Replica) {
+    let mut connection = Replica::establish(":memory:").expect("connect");
     connection.batch_execute(script).expect("apply the translated script");
     let raised = diesel::insert_into(log::table)
         .values(log::id.eq(1))

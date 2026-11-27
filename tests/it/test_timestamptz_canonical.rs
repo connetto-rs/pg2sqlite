@@ -22,6 +22,18 @@ fn has_shape(text: &str, shape: &str) -> bool {
         })
 }
 
+/// Whether `text` has `shape` once the fraction PostgreSQL prints after the
+/// seconds, one to six digits without trailing zeros, is taken out.
+fn has_shape_with_trimmed_fraction(text: &str, shape: &str) -> bool {
+    let Some((whole, rest)) = text.split_once('.') else {
+        return has_shape(text, shape);
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    (1..=6).contains(&digits)
+        && !rest[..digits].ends_with('0')
+        && has_shape(&format!("{whole}{}", &rest[digits..]), shape)
+}
+
 fn is_canonical(text: &str) -> bool {
     has_shape(text, "dddd-dd-dd dd:dd:dd.dddddd+00:00")
 }
@@ -241,7 +253,10 @@ fn now_written_into_another_temporal_column_takes_that_column_form() {
         assert_eq!(written.len(), 3, "{declared}");
         for row in written {
             let text = row.expect("the value should not be NULL");
-            assert!(has_shape(&text, shape), "{declared}: {text} is not {shape}");
+            assert!(
+                has_shape_with_trimmed_fraction(&text, shape),
+                "{declared}: {text} is not {shape}"
+            );
         }
     }
 }

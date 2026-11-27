@@ -101,7 +101,8 @@ struct UpsertRow {
     counter: i32,
 }
 
-fn translate_and_setup() -> Result<diesel::SqliteConnection, Box<dyn std::error::Error>> {
+fn translate_and_setup() -> Result<crate::helpers::Replica, crate::support::fixtures::FixtureError>
+{
     crate::support::fixtures::apply_fixture(
         include_str!("../fixtures/data_types_extended.sql"),
         &crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default()),
@@ -216,8 +217,7 @@ fn test_upsert_insert_new_row() -> Result<(), Box<dyn std::error::Error>> {
     let options = crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default());
     let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
 
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("Failed to connect");
 
     for stmt in &translated {
         diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;
@@ -255,8 +255,7 @@ fn test_upsert_update_existing_row() -> Result<(), Box<dyn std::error::Error>> {
     let options = crate::helpers::jsonb_functions::with_functions(Pg2SqliteOptions::default());
     let translated = Pg2Sqlite::default().sql(sql)?.translate(&options)?.into_vec();
 
-    let mut connection =
-        diesel::SqliteConnection::establish(":memory:").expect("Failed to connect");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("Failed to connect");
 
     for stmt in &translated {
         diesel::sql_query(&stmt.to_string()).execute(&mut connection)?;

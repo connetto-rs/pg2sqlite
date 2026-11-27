@@ -14,23 +14,27 @@
 //! A name no column answers to under PostgreSQL's case rules, an unquoted
 //! `cola` for `"ColA"` among them, is refused with PostgreSQL's message.
 
+use diesel::{Connection, connection::SimpleConnection};
 use helpers::translate_pg as translate;
 use pg2sqlite::prelude::{
     Error, Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, SqlState, UuidRepresentation,
 };
-use rusqlite::Connection;
 use sqlstate::pg;
 
 use crate::{
     helpers,
-    helpers::deployment::{caller, deployment},
+    helpers::{
+        Replica, SqliteAnyValue,
+        deployment::{caller, deployment},
+        query_values,
+    },
 };
 
 /// Applies every emitted statement, which proves SQLite takes the output.
-fn apply(connection: &Connection, statements: &[String]) {
+fn apply(connection: &mut Replica, statements: &[String]) {
     for statement in statements {
         connection
-            .execute_batch(&format!("{statement};"))
+            .batch_execute(&format!("{statement};"))
             .unwrap_or_else(|error| panic!("SQLite rejected emitted SQL: {error}\n{statement}"));
     }
 }
@@ -47,11 +51,15 @@ fn a_quoted_column_carries_its_default_into_the_values_row() {
     let insert = statements.last().expect("an insert statement");
     assert!(insert.contains("VALUES (1, 7)"), "the declared default must be substituted: {insert}");
 
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
-    apply(&connection, &statements);
-    let stored: i64 = connection
-        .query_row("SELECT \"ColA\" FROM \"Tbl\" WHERE id = 1", [], |row| row.get(0))
-        .expect("the inserted row");
+    let mut connection = Replica::establish(":memory:").expect("in-memory SQLite");
+    apply(&mut connection, &statements);
+    let stored =
+        match query_values(&mut connection, "SELECT \"ColA\" FROM \"Tbl\" WHERE id = 1", &[])
+            .expect("the inserted row")[0][0]
+        {
+            SqliteAnyValue::Integer(value) => value,
+            ref value => panic!("expected integer, got {value:?}"),
+        };
     assert_eq!(stored, 7);
 }
 

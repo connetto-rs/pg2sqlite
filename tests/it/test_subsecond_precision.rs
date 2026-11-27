@@ -1,9 +1,8 @@
 //! Fractional seconds survive temporal conversion and arithmetic.
 
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use rusqlite::types::FromSql;
 
-use crate::helpers;
+use crate::{helpers, helpers::SqliteAnyValue};
 const TABLE: &str = "CREATE TABLE t (ts TIMESTAMP, n DOUBLE PRECISION);";
 
 fn translate(pg: &str) -> String {
@@ -17,8 +16,21 @@ fn translate(pg: &str) -> String {
         .expect("a probe statement")
 }
 
-fn evaluate<T: FromSql>(pg: &str) -> T {
-    helpers::evaluate_probe(&translate(pg))
+fn evaluate(pg: &str) -> f64 {
+    helpers::numeric_value(&helpers::evaluate_probe(&translate(pg)))
+        .expect("expected a number, got NULL")
+}
+
+fn evaluate_nullable_text(pg: &str) -> Option<String> {
+    match helpers::evaluate_probe(&translate(pg)) {
+        SqliteAnyValue::Text(value) => Some(value),
+        SqliteAnyValue::Null => None,
+        value => panic!("expected nullable text, got {value:?}"),
+    }
+}
+
+fn evaluate_text(pg: &str) -> String {
+    evaluate_nullable_text(pg).expect("non-null text")
 }
 
 /// Reverse translates one SQLite statement back to PostgreSQL.
@@ -79,15 +91,15 @@ fn the_paired_epoch_difference_is_still_intercepted_whole() {
 /// literal keeps its own `.5`, so the two texts have to agree to compare equal.
 #[test]
 fn to_timestamp_keeps_the_fraction() {
-    assert_eq!(evaluate::<String>("SELECT to_timestamp(1709647629.5);"), "2024-03-05 14:07:09.5");
+    assert_eq!(evaluate_text("SELECT to_timestamp(1709647629.5);"), "2024-03-05 14:07:09.5");
 }
 
 /// PostgreSQL answers 2024-03-05 14:07:09+00, with no fractional part at all.
 #[test]
 fn to_timestamp_of_a_whole_second_renders_no_fraction() {
-    assert_eq!(evaluate::<String>("SELECT to_timestamp(1709647629);"), "2024-03-05 14:07:09");
-    assert_eq!(evaluate::<String>("SELECT to_timestamp(1709647630);"), "2024-03-05 14:07:10");
-    assert_eq!(evaluate::<String>("SELECT to_timestamp(0);"), "1970-01-01 00:00:00");
+    assert_eq!(evaluate_text("SELECT to_timestamp(1709647629);"), "2024-03-05 14:07:09");
+    assert_eq!(evaluate_text("SELECT to_timestamp(1709647630);"), "2024-03-05 14:07:10");
+    assert_eq!(evaluate_text("SELECT to_timestamp(0);"), "1970-01-01 00:00:00");
 }
 
 // ---------- make_time and make_timestamp ----------
@@ -95,22 +107,22 @@ fn to_timestamp_of_a_whole_second_renders_no_fraction() {
 /// PostgreSQL answers 08:15:00.5.
 #[test]
 fn make_time_keeps_the_fraction() {
-    assert_eq!(evaluate::<String>("SELECT make_time(8, 15, 0.5);"), "08:15:00.5");
+    assert_eq!(evaluate_text("SELECT make_time(8, 15, 0.5);"), "08:15:00.5");
 }
 
 /// PostgreSQL answers 08:15:07, with no fractional part, so a fixed decimal
 /// format would be a new divergence rather than a fix.
 #[test]
 fn make_time_of_whole_seconds_renders_no_fraction() {
-    assert_eq!(evaluate::<String>("SELECT make_time(8, 15, 7);"), "08:15:07");
-    assert_eq!(evaluate::<String>("SELECT make_time(8, 15, 0);"), "08:15:00");
+    assert_eq!(evaluate_text("SELECT make_time(8, 15, 7);"), "08:15:07");
+    assert_eq!(evaluate_text("SELECT make_time(8, 15, 0);"), "08:15:00");
 }
 
 /// `make_time` preserves microseconds.
 #[test]
 fn make_time_keeps_a_microsecond() {
-    assert_eq!(evaluate::<String>("SELECT make_time(8, 15, 0.000001);"), "08:15:00.000001");
-    assert_eq!(evaluate::<String>("SELECT make_time(8, 15, 59.999999);"), "08:15:59.999999");
+    assert_eq!(evaluate_text("SELECT make_time(8, 15, 0.000001);"), "08:15:00.000001");
+    assert_eq!(evaluate_text("SELECT make_time(8, 15, 59.999999);"), "08:15:59.999999");
 }
 
 /// PostgreSQL answers 2024-03-05 14:07:09.5 and 2024-03-05 14:07:09. The item
@@ -118,18 +130,18 @@ fn make_time_keeps_a_microsecond() {
 #[test]
 fn make_timestamp_keeps_the_fraction() {
     assert_eq!(
-        evaluate::<String>("SELECT make_timestamp(2024, 3, 5, 14, 7, 9.5);"),
+        evaluate_text("SELECT make_timestamp(2024, 3, 5, 14, 7, 9.5);"),
         "2024-03-05 14:07:09.5"
     );
     assert_eq!(
-        evaluate::<String>("SELECT make_timestamp(2024, 3, 5, 14, 7, 9);"),
+        evaluate_text("SELECT make_timestamp(2024, 3, 5, 14, 7, 9);"),
         "2024-03-05 14:07:09"
     );
 }
 
 #[test]
 fn make_date_is_unaffected() {
-    assert_eq!(evaluate::<String>("SELECT make_date(2024, 3, 5);"), "2024-03-05");
+    assert_eq!(evaluate_text("SELECT make_date(2024, 3, 5);"), "2024-03-05");
 }
 
 /// PostgreSQL answers NULL when any argument is NULL. `printf` renders a NULL
@@ -143,11 +155,7 @@ fn a_null_argument_makes_every_make_function_null() {
         "make_time(NULL, 15, 0.5)",
         "make_timestamp(2024, 3, 5, 14, 7, NULL)",
     ] {
-        assert_eq!(
-            evaluate::<Option<String>>(&format!("SELECT {call};")),
-            None,
-            "{call} must be NULL"
-        );
+        assert_eq!(evaluate_nullable_text(&format!("SELECT {call};")), None, "{call} must be NULL");
     }
 }
 
@@ -157,7 +165,7 @@ fn timestamp_paths_keep_microseconds() {
     let epoch: f64 = evaluate("SELECT extract(epoch from timestamp '2024-03-05 14:07:09.123456');");
     assert!((epoch - 1_709_647_629.123_456).abs() < 1e-6, "got {epoch}");
     assert_eq!(
-        evaluate::<String>("SELECT to_timestamp(1709647629.123456);"),
+        evaluate_text("SELECT to_timestamp(1709647629.123456);"),
         "2024-03-05 14:07:09.123456"
     );
 }
@@ -173,9 +181,9 @@ fn epoch_difference_keeps_microseconds() {
 
 #[test]
 fn timestamp_epoch_keeps_negative_microseconds() {
-    assert_eq!(evaluate::<String>("SELECT to_timestamp(-0.000001);"), "1969-12-31 23:59:59.999999");
+    assert_eq!(evaluate_text("SELECT to_timestamp(-0.000001);"), "1969-12-31 23:59:59.999999");
     assert_eq!(
-        evaluate::<String>("SELECT to_timestamp(1735689599.999999);"),
+        evaluate_text("SELECT to_timestamp(1735689599.999999);"),
         "2024-12-31 23:59:59.999999"
     );
 }
@@ -189,7 +197,7 @@ fn timestamp_epoch_rounds_half_microseconds_to_even() {
         ("-0.0000005", "1970-01-01 00:00:00"),
         ("-0.0000015", "1969-12-31 23:59:59.999998"),
     ] {
-        assert_eq!(evaluate::<String>(&format!("SELECT to_timestamp({argument});")), expected);
+        assert_eq!(evaluate_text(&format!("SELECT to_timestamp({argument});")), expected);
     }
 }
 
@@ -201,7 +209,7 @@ fn microsecond_conversions_keep_null() {
         "NULL::timestamp + interval '1 microsecond'",
         "NULL::time + interval '1 microsecond'",
     ] {
-        assert_eq!(evaluate::<Option<String>>(&format!("SELECT {expression};")), None);
+        assert_eq!(evaluate_nullable_text(&format!("SELECT {expression};")), None);
     }
 }
 
@@ -238,10 +246,10 @@ fn the_crate_reads_back_what_it_emitted() {
 #[test]
 fn microsecond_time_arithmetic_compares_equal() {
     assert_eq!(
-        evaluate::<i64>(
+        helpers::evaluate_probe(&translate(
             "SELECT time '03:04:05.123456' + interval '24 hours' = time '03:04:05.123456';",
-        ),
-        1,
+        )),
+        SqliteAnyValue::Integer(1),
     );
 }
 

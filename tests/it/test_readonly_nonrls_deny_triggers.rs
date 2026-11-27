@@ -63,7 +63,7 @@ fn translate(schema: &str) -> Vec<String> {
     helpers::translate_pg(schema, &options()).expect("translate")
 }
 
-fn apply(schema: &str) -> SqliteConnection {
+fn apply(schema: &str) -> crate::helpers::Replica {
     helpers::apply_statements(&translate(schema))
 }
 
@@ -90,10 +90,11 @@ fn readonly_nonrls_select_works_and_insert_fails() {
 fn rls_exemption_bypasses_each_nonrls_deny_trigger() {
     let opts = options().with_rls_exemption_function("write_is_exempt");
     let translated = helpers::translate_pg(SCHEMA, &opts).expect("translate");
-    let mut conn = SqliteConnection::establish(":memory:").expect("connect");
-    write_is_exempt_utils::register_nondeterministic_impl(&mut conn, || {
-        WRITE_IS_EXEMPT.with(Cell::get)
-    })
+    let mut conn = crate::helpers::Replica::establish(":memory:").expect("connect");
+    write_is_exempt_utils::register_nondeterministic_impl(
+        conn.registration().expect("registration").sqlite(),
+        || WRITE_IS_EXEMPT.with(Cell::get),
+    )
     .expect("register write_is_exempt");
     for statement in &translated {
         diesel::sql_query(statement).execute(&mut conn).expect("apply statement");
@@ -272,7 +273,7 @@ CREATE TABLE \"orders__readonly_insert\" (x INTEGER);
     );
     // Execute translated DDL to prove it is accepted by SQLite.
     // Translated DDL cannot be expressed via diesel's typed DSL.
-    let mut conn = SqliteConnection::establish(":memory:").expect("connect");
+    let mut conn = crate::helpers::Replica::establish(":memory:").expect("connect");
     for stmt in &stmts {
         diesel::sql_query(stmt.as_str())
             .execute(&mut conn)
@@ -285,14 +286,22 @@ fn deny_triggers_are_inert_when_disabled_and_block_when_enabled() {
     let mut conn = apply(SCHEMA);
 
     // With triggers disabled, the apply-path INSERT succeeds.
-    conn.set_triggers_enabled(false).expect("disable triggers");
+    conn.registration()
+        .expect("registration")
+        .sqlite()
+        .set_triggers_enabled(false)
+        .expect("disable triggers");
     diesel::insert_into(orders::table)
         .values(NewOrder { id: 1, item: "seed".to_owned() })
         .execute(&mut conn)
         .expect("insert succeeds while triggers disabled");
 
     // Re-enable triggers: interactive writes are denied again.
-    conn.set_triggers_enabled(true).expect("enable triggers");
+    conn.registration()
+        .expect("registration")
+        .sqlite()
+        .set_triggers_enabled(true)
+        .expect("enable triggers");
 
     let count: i64 = orders::table.count().get_result(&mut conn).expect("count after seed");
     assert_eq!(count, 1, "seeded row is visible via SELECT");

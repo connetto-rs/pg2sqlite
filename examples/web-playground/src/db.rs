@@ -1,16 +1,16 @@
-//! In-browser SQLite connection backed by `sqlite-wasm-rs` + Diesel.
+//! In-browser SQLite connection backed by `sqlite-wasm-rs` + Diesel, managed
+//! so the translated clock functions answer from the browser's clock.
 //!
 //! Thread-local because Dioxus's wasm runtime is single-threaded, so `RefCell`
 //! suffices.
 
 use std::{cell::RefCell, sync::Once};
 
-use diesel::{
-    connection::SimpleConnection,
-    prelude::*,
-    sql_types::BigInt,
-    sqlite::{SqliteConnection, SqliteFunctionBehavior},
-};
+use diesel::{prelude::*, sql_types::BigInt, sqlite::SqliteFunctionBehavior};
+use pg2sqlite::prelude::{FreshFiles, JiffUtcProvider, ManagedConnection, Script};
+
+/// The in-page connection, sampling the browser's UTC clock.
+pub type PageConnection = ManagedConnection<JiffUtcProvider>;
 
 /// Stand-in for every session-variable UDF (e.g. `current_app_user()`). Matches
 /// seed row `owner_id = 42` so RLS policies produce visible output. Must be
@@ -19,7 +19,7 @@ use diesel::{
 const SESSION_VAR_VALUE: i64 = 42;
 
 thread_local! {
-    static CONN: RefCell<Option<SqliteConnection>> = const { RefCell::new(None) };
+    static CONN: RefCell<Option<PageConnection>> = const { RefCell::new(None) };
 }
 
 static INIT_AUTO_EXTENSIONS: Once = Once::new();
@@ -53,20 +53,23 @@ fn ensure_auto_extensions() {
 /// no-arg stub returning `SESSION_VAR_VALUE`.
 pub fn reopen(session_var_funcs: &[String]) -> Result<(), String> {
     ensure_auto_extensions();
-    let mut conn = SqliteConnection::establish(":memory:").map_err(|e| e.to_string())?;
+    let mut conn = PageConnection::establish(":memory:").map_err(|e| e.to_string())?;
+    let mut registration = conn.registration().map_err(|e| e.to_string())?;
     for name in session_var_funcs {
-        conn.register_noarg_sql_function::<BigInt, _, _>(
-            name,
-            SqliteFunctionBehavior::DETERMINISTIC,
-            || SESSION_VAR_VALUE,
-        )
-        .map_err(|e| format!("could not register session-variable UDF '{name}': {e}"))?;
+        registration
+            .sqlite()
+            .register_noarg_sql_function::<BigInt, _, _>(
+                name,
+                SqliteFunctionBehavior::DETERMINISTIC,
+                || SESSION_VAR_VALUE,
+            )
+            .map_err(|e| format!("could not register session-variable UDF '{name}': {e}"))?;
     }
     CONN.with(|cell| *cell.borrow_mut() = Some(conn));
     Ok(())
 }
 
-pub fn with_conn<R>(f: impl FnOnce(&mut SqliteConnection) -> R) -> R {
+pub fn with_conn<R>(f: impl FnOnce(&mut PageConnection) -> R) -> R {
     CONN.with(|cell| {
         let mut borrow = cell.borrow_mut();
         let conn = borrow.as_mut().expect("db::reopen must be called before with_conn");
@@ -74,6 +77,8 @@ pub fn with_conn<R>(f: impl FnOnce(&mut SqliteConnection) -> R) -> R {
     })
 }
 
-pub fn run_script(sql: &str) -> Result<(), String> {
-    with_conn(|c| c.batch_execute(sql).map_err(|e| e.to_string()))
+/// Initialize the in-page database with `script`, one group per logical
+/// source statement.
+pub fn run_script(script: &Script) -> Result<(), String> {
+    with_conn(|c| script.initialize_managed(c, FreshFiles::Both).map_err(|e| e.to_string()))
 }

@@ -163,7 +163,7 @@ fn options() -> Pg2SqliteOptions {
 }
 
 /// An `alice` row with `id` 1 and a given `qty`, for the computed-column cases.
-fn seed_item(conn: &mut SqliteConnection, qty: i32) {
+fn seed_item(conn: &mut crate::helpers::Replica, qty: i32) {
     diesel::insert_into(items::table)
         .values((items::id.eq(1), items::qty.eq(qty), items::owner.eq("alice")))
         .execute(conn)

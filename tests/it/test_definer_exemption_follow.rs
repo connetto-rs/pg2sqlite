@@ -3,10 +3,7 @@
 //! that when the body runs, so a later change to which tables exempt the owner
 //! leaves the trigger as it would have been installed after the change.
 
-use diesel::{
-    Connection, ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection,
-    connection::SimpleConnection,
-};
+use diesel::{Connection, ExpressionMethods, QueryDsl, RunQueryDsl};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
 diesel::table! {
@@ -46,16 +43,17 @@ const TRIGGER: &str =
 const DRAFT: &str = "CREATE TABLE drafts (id INTEGER); DROP TABLE drafts;";
 
 /// `source` translated and installed on SQLite.
-fn installed(source: &str) -> SqliteConnection {
+fn installed(source: &str) -> crate::helpers::Replica {
     let options = Pg2SqliteOptions::default().with_rls_audit_table_name("rls_audit");
     let script = Pg2Sqlite::default()
         .sql(source)
         .unwrap()
         .translate_to_sql(&options)
         .unwrap_or_else(|error| panic!("{error}\n{source}"));
-    let mut connection = SqliteConnection::establish(":memory:").unwrap();
-    script.register_functions(&mut connection).expect("register helper functions");
-    connection.batch_execute(&script.into_vec().join(";\n")).unwrap();
+    let mut connection = crate::helpers::Replica::establish(":memory:").unwrap();
+    script
+        .initialize_managed(&mut connection, pg2sqlite::script::FreshFiles::Both)
+        .expect("initialize replica");
     connection
 }
 

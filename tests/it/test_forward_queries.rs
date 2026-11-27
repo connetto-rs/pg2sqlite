@@ -1,7 +1,7 @@
 //! Tests for forward query translation covering join types and other query
 //! paths in `src/impls/translator_impls/query.rs`.
 
-use diesel::{RunQueryDsl, SqliteConnection, prelude::*};
+use diesel::{RunQueryDsl, prelude::*};
 use helpers::translate_statements;
 use pg2sqlite::{
     errors::{Error, RefusalCategory, TranslationDirection},
@@ -12,7 +12,10 @@ use sql_traits::structs::ParserDB;
 use sqlparser::ast::{Expr, Ident, OrderByExpr, OrderByOptions, Value, ValueWithSpan, WithFill};
 use translate_helpers::translate_default as translate;
 
-use crate::{helpers, helpers::translate as translate_helpers};
+use crate::{
+    helpers,
+    helpers::{Replica, translate as translate_helpers},
+};
 
 const SCHEMA: &str = "
     CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT);
@@ -316,8 +319,8 @@ fn view_body_translates_now() {
     ";
     let output = translate(sql);
     assert!(
-        output.contains("strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"),
-        "Expected strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now') in view body: {output}"
+        output.contains("pg2sqlite_transaction_timestamp()"),
+        "Expected pg2sqlite_transaction_timestamp() in view body: {output}"
     );
     exec_translated(sql);
 }
@@ -330,7 +333,7 @@ fn group_by_translates_expressions() {
     ";
     let output = translate(sql);
     assert!(
-        output.contains("GROUP BY strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"),
+        output.contains("GROUP BY pg2sqlite_transaction_timestamp()"),
         "Expected translated GROUP BY: {output}"
     );
     exec_translated(sql);
@@ -344,7 +347,7 @@ fn having_translates_expressions() {
     ";
     let output = translate(sql);
     assert!(
-        output.contains("HAVING strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"),
+        output.contains("HAVING pg2sqlite_transaction_timestamp()"),
         "Expected translated HAVING: {output}"
     );
     exec_translated(sql);
@@ -358,8 +361,8 @@ fn cte_body_translates_expressions() {
     ";
     let output = translate(sql);
     assert!(
-        output.contains("strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"),
-        "Expected strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now') in CTE body: {output}"
+        output.contains("pg2sqlite_transaction_timestamp()"),
+        "Expected pg2sqlite_transaction_timestamp() in CTE body: {output}"
     );
     exec_translated(sql);
 }
@@ -388,8 +391,8 @@ fn named_window_translates_expressions() {
     ";
     let output = translate(sql);
     assert!(
-        output.contains("strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"),
-        "Expected strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now') in named window: {output}"
+        output.contains("pg2sqlite_transaction_timestamp()"),
+        "Expected pg2sqlite_transaction_timestamp() in named window: {output}"
     );
     exec_translated(sql);
 }
@@ -574,7 +577,7 @@ fn test_wildcard_semantic() -> Result<(), Box<dyn std::error::Error>> {
 
 fn exec_translated(pg_sql: &str) {
     use diesel::connection::SimpleConnection;
-    let mut conn = SqliteConnection::establish(":memory:").unwrap();
+    let mut conn = Replica::establish(":memory:").unwrap();
     let stmts = Pg2Sqlite::default()
         .sql(pg_sql)
         .unwrap()

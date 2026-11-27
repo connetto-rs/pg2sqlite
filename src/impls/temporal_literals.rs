@@ -15,6 +15,9 @@
 //! `'today'` is resolved when the server reads it rather than standing for a
 //! fixed date.
 
+use alloc::borrow::Cow;
+
+use pg2sqlite_runtime::TypmodRounding;
 use sqlparser::ast::{DataType, TimezoneInfo};
 
 use crate::errors::Error;
@@ -121,8 +124,10 @@ pub(crate) fn normalize_temporal_literal(
             let (body, zone) = split_time_zone(kind, trimmed, zoned)?;
             let zone = zone.map_or_else(String::new, |zone| zone.render());
             let clock = parse_time(kind, body, trimmed)?;
-            let micros = round_typmod_micros(clock.micros_of_day(), precision);
-            Ok(format!("{}{zone}", time_of_day_text(micros)))
+            let time =
+                rounded(TypmodRounding::Time, time_of_day_text(clock.micros_of_day()), precision)
+                    .map_err(|_| outside_four_digit_years(trimmed))?;
+            Ok(format!("{time}{zone}"))
         }
         TemporalLiteralKind::Timestamp { zoned, precision } => {
             let (body, zone) = split_time_zone(kind, trimmed, zoned)?;
@@ -146,19 +151,22 @@ pub(crate) fn normalize_temporal_literal(
                 let micros = days_from_civil(i64::from(year), month, day) * MICROS_PER_DAY
                     + micros_of_day
                     - offset * MICROS_PER_SECOND;
-                return canonical_instant(round_typmod_micros(micros, precision), trimmed);
+                let instant = canonical_instant(micros, trimmed)?;
+                return rounded(TypmodRounding::TimestampTz, instant, precision)
+                    .map_err(|_| outside_four_digit_years(trimmed));
             }
-            // PostgreSQL reads 24:00:00 on a timestamp, and a fraction that
-            // rounds up into it, as the next day's midnight.
-            let micros = round_typmod_micros(micros_of_day, precision);
-            let ((year, month, day), micros) = match micros {
+            // PostgreSQL reads 24:00:00 on a timestamp as the next day's
+            // midnight.
+            let ((year, month, day), micros) = match micros_of_day {
                 MICROS_PER_DAY => (next_day(year, month, day), 0),
                 micros => ((year, month, day), micros),
             };
             if year > 9999 {
                 return Err(outside_four_digit_years(trimmed));
             }
-            Ok(format!("{year:04}-{month:02}-{day:02} {}", time_of_day_text(micros)))
+            let wall = format!("{year:04}-{month:02}-{day:02} {}", time_of_day_text(micros));
+            rounded(TypmodRounding::Timestamp, wall, precision)
+                .map_err(|_| outside_four_digit_years(trimmed))
         }
     }
 }
@@ -222,17 +230,20 @@ fn rounded_microseconds(fraction: &str) -> i64 {
     }
 }
 
-/// The value of `micros` rounded to the typmod precision, half away from
-/// zero the way PostgreSQL's typmod adjustment rounds it.
-fn round_typmod_micros(micros: i64, precision: Option<u32>) -> i64 {
-    let Some(precision) = precision else { return micros };
-    let divisor = 10_i64.pow(6 - precision);
-    let half = divisor / 2;
-    if micros >= 0 {
-        (micros + half) / divisor * divisor
-    } else {
-        (micros - half) / divisor * divisor
-    }
+/// `text`, the replica's text of a `rounding` value, rounded to the typmod
+/// precision by the same function a replica registers.
+fn rounded(
+    rounding: TypmodRounding,
+    text: String,
+    precision: Option<u32>,
+) -> Result<String, pg2sqlite_runtime::RoundingError> {
+    let Some(precision) = precision else { return Ok(text) };
+    let precision = u8::try_from(precision).unwrap_or(u8::MAX);
+    let rounded = match rounding.round(&text, precision)? {
+        Cow::Owned(rounded) => Some(rounded),
+        Cow::Borrowed(_) => None,
+    };
+    Ok(rounded.unwrap_or(text))
 }
 
 /// Days since 1970-01-01 of a proleptic Gregorian date.

@@ -52,7 +52,7 @@ fn refusal(pg: &str) -> String {
 /// Applies every emitted statement and then reads the guarded table, which is
 /// where a circular view surfaces.
 fn apply_and_read(pg: &str) -> Result<(), diesel::result::Error> {
-    let mut connection = SqliteConnection::establish(":memory:").expect("connect");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("connect");
     for statement in translate(pg) {
         diesel::sql_query(&statement).execute(&mut connection)?;
     }

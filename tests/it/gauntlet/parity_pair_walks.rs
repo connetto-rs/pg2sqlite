@@ -11,7 +11,7 @@ use alloc::sync::Arc;
 // `register_impl` takes an unwind-safe closure, which a poisoning mutex is.
 use std::sync::Mutex;
 
-use diesel::{pg::PgConnection, prelude::*, sqlite::SqliteConnection};
+use diesel::{pg::PgConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping};
 use sql_traits::structs::{Deployment, SessionSetting, SettingValue};
 use sqlparser::ast::DataType;
@@ -285,18 +285,19 @@ fn postgres(predicate: &str) -> PgConnection {
 }
 
 /// The replica, whose `app.user_id` reads `caller`.
-fn sqlite(predicate: &str, caller: &Arc<Mutex<&'static str>>) -> SqliteConnection {
+fn sqlite(predicate: &str, caller: &Arc<Mutex<&'static str>>) -> crate::helpers::Replica {
     let translated = Pg2Sqlite::default()
         .sql(&format!("{OWNER}{SCHEMA}{}", policy(predicate)))
         .expect("parse")
         .translate(&options())
         .unwrap_or_else(|error| panic!("pg2sqlite refused {predicate}: {error}"));
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-    translated.register_functions(&mut connection).expect("register helper functions");
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
+    translated.register_managed(&mut connection).expect("register helper functions");
     let read = Arc::clone(caller);
-    app_user_id_utils::register_impl(&mut connection, move || {
-        Some((*read.lock().expect("the caller lock")).to_owned())
-    })
+    app_user_id_utils::register_impl(
+        connection.registration().expect("registration").sqlite(),
+        move || Some((*read.lock().expect("the caller lock")).to_owned()),
+    )
     .expect("register app_user_id");
     apply_with_seed(&mut connection, &translated.into_vec(), |connection| {
         seed!(connection, replica, grantees_rls);

@@ -13,10 +13,13 @@
 //! the fix, and the pairs that must agree are asserted as one value here: the
 //! translated call is run and compared to the literal PostgreSQL answered.
 
+use diesel::{Connection as _, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use rusqlite::Connection;
 
-use crate::helpers;
+use crate::{
+    helpers,
+    helpers::{Replica as Connection, SqliteAnyValue, query_values},
+};
 const TABLE: &str = "CREATE TABLE t (id INT PRIMARY KEY, ts TIMESTAMP);";
 const INSTANT: &str = "2026-08-08 15:04:05";
 
@@ -35,15 +38,23 @@ fn formatted(template: &str) -> String {
         translate(&format!("SELECT to_char(ts, '{template}') FROM t;")).expect("translate");
     let probe = statements.last().expect("a statement").clone();
 
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = Connection::establish(":memory:").expect("in-memory SQLite");
     for statement in &statements[..statements.len() - 1] {
-        connection.execute_batch(&format!("{statement};")).expect("emitted setup");
+        connection.batch_execute(&format!("{statement};")).expect("emitted setup");
     }
-    connection.execute("INSERT INTO t (id, ts) VALUES (1, ?1)", [INSTANT]).expect("row");
     connection
-        .query_row(&probe, [], |row| row.get::<_, Option<String>>(0))
-        .unwrap_or_else(|error| panic!("emitted probe failed: {probe}: {error}"))
-        .unwrap_or_else(|| panic!("emitted probe answered NULL: {probe}"))
+        .execute(
+            "INSERT INTO t (id, ts) VALUES (1, ?1)",
+            &[SqliteAnyValue::Text(INSTANT.to_owned())],
+        )
+        .expect("row");
+    let mut rows = query_values(&mut connection, &probe, &[])
+        .unwrap_or_else(|error| panic!("emitted probe failed: {probe}: {error}"));
+    match rows.remove(0).remove(0) {
+        SqliteAnyValue::Text(value) => value,
+        SqliteAnyValue::Null => panic!("emitted probe answered NULL: {probe}"),
+        value => panic!("expected text, got {value:?}"),
+    }
 }
 
 // --- F33: the two-digit year -----------------------------------------------

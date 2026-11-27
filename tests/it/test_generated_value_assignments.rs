@@ -6,7 +6,7 @@ use std::sync::{
 use diesel::{connection::SimpleConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation};
 
-use crate::helpers::{deployment::deployment, establish_connection};
+use crate::helpers::{Replica, deployment::deployment, establish_connection};
 
 diesel::table! {
     inputs (id) {
@@ -103,7 +103,7 @@ fn replica(
     body: &str,
     helpers: &str,
     representation: UuidRepresentation,
-) -> (SqliteConnection, Arc<AtomicUsize>) {
+) -> (Replica, Arc<AtomicUsize>) {
     let source = format!(
         "{SCHEMA}
         {helpers}
@@ -122,17 +122,19 @@ fn replica(
         .translate_to_sql(&options(representation))
         .unwrap();
     let mut connection = establish_connection();
-    translated.register_functions(&mut connection).unwrap();
+    translated.register_managed(&mut connection).unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     let blob_calls = Arc::clone(&calls);
-    counted_uuid_blob_utils::register_nondeterministic_impl(&mut connection, move || {
-        binary_value(blob_calls.fetch_add(1, Ordering::Relaxed) + 1)
-    })
+    counted_uuid_blob_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        move || binary_value(blob_calls.fetch_add(1, Ordering::Relaxed) + 1),
+    )
     .unwrap();
     let text_calls = Arc::clone(&calls);
-    counted_uuid_text_utils::register_nondeterministic_impl(&mut connection, move || {
-        text_value(text_calls.fetch_add(1, Ordering::Relaxed) + 1)
-    })
+    counted_uuid_text_utils::register_nondeterministic_impl(
+        connection.registration().expect("registration").sqlite(),
+        move || text_value(text_calls.fetch_add(1, Ordering::Relaxed) + 1),
+    )
     .unwrap();
     for statement in translated.into_vec() {
         connection.batch_execute(&statement).unwrap();
@@ -141,7 +143,7 @@ fn replica(
     (connection, calls)
 }
 
-fn insert_input(connection: &mut SqliteConnection, identifier: i32) {
+fn insert_input(connection: &mut Replica, identifier: i32) {
     diesel::insert_into(inputs::table)
         .values(inputs::id.eq(identifier))
         .execute(connection)
@@ -150,7 +152,7 @@ fn insert_input(connection: &mut SqliteConnection, identifier: i32) {
 
 type ObservedPair = (Option<Vec<u8>>, Option<Vec<u8>>);
 
-fn observed_values(connection: &mut SqliteConnection) -> Vec<ObservedPair> {
+fn observed_values(connection: &mut Replica) -> Vec<ObservedPair> {
     observations::table
         .order(observations::id)
         .select((observations::first_value, observations::second_value))

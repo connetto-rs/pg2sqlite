@@ -6,7 +6,7 @@
 //! PostgreSQL 16 reads a bare `INITIALLY DEFERRED` as deferrable, reporting
 //! `condeferrable=true`, while SQLite needs the keyword spelled out.
 
-use diesel::{Connection, RunQueryDsl, SqliteConnection, prelude::*};
+use diesel::{Connection, RunQueryDsl, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
 
 use crate::helpers;
@@ -40,7 +40,10 @@ const DEFERRED: &str = "
 /// Inserts a child row whose parent does not exist, creating the parent before
 /// COMMIT when `repair_before_commit`. Returns whether the orphan was accepted
 /// at statement time, and whether the transaction committed.
-fn insert_orphan(connection: &mut SqliteConnection, repair_before_commit: bool) -> (bool, bool) {
+fn insert_orphan(
+    connection: &mut crate::helpers::Replica,
+    repair_before_commit: bool,
+) -> (bool, bool) {
     let mut orphan_accepted = false;
     let committed = connection.transaction::<_, diesel::result::Error, _>(|connection| {
         diesel::insert_into(child::table)

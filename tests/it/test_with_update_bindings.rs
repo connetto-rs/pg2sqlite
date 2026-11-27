@@ -1,6 +1,6 @@
 //! Runtime regressions for `WITH`-wrapped `UPDATE` translation.
 
-use diesel::{prelude::*, sqlite::SqliteConnection};
+use diesel::prelude::*;
 use pg2sqlite::prelude::Pg2SqliteOptions;
 use sqlparser::ast::Statement;
 
@@ -52,7 +52,7 @@ fn is_update(statement: &Statement) -> bool {
 
 /// Translate `pg`, run every emitted statement but the `UPDATE` and return
 /// the `UPDATE`.
-fn prepared_update(pg: &str) -> (SqliteConnection, String) {
+fn prepared_update(pg: &str) -> (crate::helpers::Replica, String) {
     let statements = helpers::translate_statements(pg, &Pg2SqliteOptions::default())
         .unwrap_or_else(|error| panic!("translation failed: {error}\n{pg}"));
     let mut conn = helpers::establish_connection();
@@ -72,7 +72,7 @@ fn prepared_update(pg: &str) -> (SqliteConnection, String) {
 
 /// Run the emitted `UPDATE`, whose `WITH`-wrapped `FROM` form the query DSL
 /// cannot express.
-fn execute_update(conn: &mut SqliteConnection, update: &str) {
+fn execute_update(conn: &mut crate::helpers::Replica, update: &str) {
     diesel::sql_query(update)
         .execute(conn)
         .unwrap_or_else(|error| panic!("translated update failed {error}\n{update}"));

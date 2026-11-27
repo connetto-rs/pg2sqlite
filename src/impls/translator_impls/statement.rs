@@ -33,6 +33,7 @@
 
 use alloc::borrow::Cow;
 
+use pg2sqlite_runtime::{BeginMode, TransactionControl};
 use sql_traits::{
     structs::ParserDB,
     traits::{DatabaseLike, ForeignKeyLike, TableLike, ViewLike},
@@ -1671,16 +1672,14 @@ fn translate_start_transaction(
 /// characteristics, so emitting `COMMIT` alone would leave the statements after
 /// it outside any transaction and a later `ROLLBACK` with nothing to undo.
 /// Emitting the `BEGIN` reproduces it, minus characteristics SQLite does not
-/// have anyway.
-///
-/// Where the translation unit declares a deferred constraint trigger, its
-/// queued checks run first, which is when PostgreSQL runs them.
+/// have anyway. A managed connection runs the queued deferred checks of
+/// [`Script::before_commit`](crate::script::Script::before_commit) before it
+/// commits.
 fn translate_commit(
     statement: &Statement,
     chain: bool,
     end: bool,
     modifier: Option<TransactionModifier>,
-    drains_deferred_checks: bool,
 ) -> Result<Vec<Statement>, Error> {
     if let Some(TransactionModifier::Try | TransactionModifier::Catch) = modifier {
         return Err(reject_unsupported_statement(
@@ -1690,9 +1689,7 @@ fn translate_commit(
     }
 
     // `END` is SQLite's own synonym for `COMMIT`, so the spelling survives.
-    let mut translated: Vec<Statement> =
-        drains_deferred_checks.then(super::deferred_constraint::drain).into_iter().collect();
-    translated.push(Statement::Commit { chain: false, end, modifier: None });
+    let mut translated = vec![Statement::Commit { chain: false, end, modifier: None }];
     if chain {
         translated.push(sqlite_begin(None));
     }
@@ -1708,6 +1705,30 @@ fn translate_rollback(chain: bool, savepoint: Option<&Ident>) -> Vec<Statement> 
         translated.push(sqlite_begin(None));
     }
     translated
+}
+
+/// The transaction control a translated source statement runs as, `None`
+/// for any other statement.
+pub(crate) fn transaction_control(source: &Statement) -> Option<TransactionControl> {
+    Some(match source {
+        Statement::StartTransaction { modifier, .. } => {
+            TransactionControl::Begin(match modifier {
+                Some(TransactionModifier::Immediate) => BeginMode::Immediate,
+                Some(TransactionModifier::Exclusive) => BeginMode::Exclusive,
+                _ => BeginMode::Deferred,
+            })
+        }
+        Statement::Commit { chain, .. } => TransactionControl::Commit { chain: *chain },
+        Statement::Rollback { chain, savepoint: None } => {
+            TransactionControl::Rollback { chain: *chain }
+        }
+        Statement::Rollback { savepoint: Some(name), .. } => {
+            TransactionControl::RollbackTo(name.value.clone())
+        }
+        Statement::Savepoint { name } => TransactionControl::Savepoint(name.value.clone()),
+        Statement::ReleaseSavepoint { name } => TransactionControl::Release(name.value.clone()),
+        _ => return None,
+    })
 }
 
 /// Emits a bare `VACUUM`.
@@ -2304,13 +2325,7 @@ impl crate::traits::translator::TranslatorWithContext for Statement {
                 )?
             }
             Self::Commit { chain, end, modifier } => {
-                translate_commit(
-                    self,
-                    *chain,
-                    *end,
-                    *modifier,
-                    !options.deferred_triggers().is_empty(),
-                )?
+                translate_commit(self, *chain, *end, *modifier)?
             }
             Self::Rollback { chain, savepoint } => translate_rollback(*chain, savepoint.as_ref()),
             Self::Vacuum(vacuum) => translate_vacuum(vacuum, emit),

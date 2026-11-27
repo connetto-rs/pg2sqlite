@@ -64,7 +64,7 @@ const BASE: &str = "
 ";
 
 /// Seeds both tables through the typed DSL.
-fn seed(conn: &mut SqliteConnection) -> Result<(), Box<dyn std::error::Error>> {
+fn seed(conn: &mut crate::helpers::Replica) -> Result<(), Box<dyn std::error::Error>> {
     diesel::insert_into(docs::table)
         .values(vec![
             (docs::id.eq(1), docs::title.eq("first")),
@@ -236,8 +236,10 @@ fn truncate_of_an_rls_table_empties_the_backing_table() -> Result<(), Box<dyn st
     // mirroring the triggers-disabled authoritative-load contract. The id=2 row
     // deliberately fails the policy: TRUNCATE must remove rows the session user
     // cannot write.
-    let statements = Pg2Sqlite::default().sql(ddl)?.translate(&options)?.into_vec();
-    let mut conn = SqliteConnection::establish(":memory:")?;
+    let statements = Pg2Sqlite::default().sql(ddl)?.translate(&options)?;
+    let mut conn = crate::helpers::Replica::establish(":memory:")?;
+    statements.register_managed(&mut conn)?;
+    let statements = statements.into_vec();
     let (triggers, base): (Vec<_>, Vec<_>) =
         statements.iter().map(ToString::to_string).partition(|s| s.starts_with("CREATE TRIGGER"));
     for statement in &base {

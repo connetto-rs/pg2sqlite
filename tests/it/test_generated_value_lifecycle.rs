@@ -6,7 +6,7 @@ use std::sync::{
 use diesel::prelude::*;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, UuidRepresentation};
 
-use crate::helpers::establish_connection;
+use crate::helpers::{Replica, establish_connection};
 
 diesel::table! {
     inputs (id) {
@@ -87,12 +87,15 @@ fn generated_value(sequence: usize) -> Vec<u8> {
     u128::try_from(sequence).unwrap().to_be_bytes().to_vec()
 }
 
-fn replica(postgres: &str) -> (SqliteConnection, Arc<AtomicUsize>) {
+fn replica(postgres: &str) -> (Replica, Arc<AtomicUsize>) {
     let translated = Pg2Sqlite::default().sql(postgres).unwrap().translate(&options()).unwrap();
     let mut connection = establish_connection();
     let calls = Arc::new(AtomicUsize::new(0));
     let function_calls = Arc::clone(&calls);
     connection
+        .registration()
+        .expect("registration")
+        .sqlite()
         .register_noarg_sql_function::<diesel::sql_types::Binary, Vec<u8>, _>(
             "uuidv7",
             diesel::sqlite::SqliteFunctionBehavior::empty(),
@@ -110,11 +113,11 @@ fn replica(postgres: &str) -> (SqliteConnection, Arc<AtomicUsize>) {
     (connection, calls)
 }
 
-fn insert_input(connection: &mut SqliteConnection, identifier: i32) -> QueryResult<usize> {
+fn insert_input(connection: &mut Replica, identifier: i32) -> QueryResult<usize> {
     diesel::insert_into(inputs::table).values(inputs::id.eq(identifier)).execute(connection)
 }
 
-fn observed(connection: &mut SqliteConnection) -> Vec<(i32, i32, Vec<u8>)> {
+fn observed(connection: &mut Replica) -> Vec<(i32, i32, Vec<u8>)> {
     observations::table
         .order((observations::event, observations::phase))
         .select((observations::event, observations::phase, observations::token))
@@ -122,14 +125,14 @@ fn observed(connection: &mut SqliteConnection) -> Vec<(i32, i32, Vec<u8>)> {
         .unwrap()
 }
 
-fn store_counts(connection: &mut SqliteConnection) -> (i64, i64) {
+fn store_counts(connection: &mut Replica) -> (i64, i64) {
     (
         pg2sqlite_definer_frames::table.count().get_result(connection).unwrap(),
         pg2sqlite_body_values::table.count().get_result(connection).unwrap(),
     )
 }
 
-fn assert_empty_store(connection: &mut SqliteConnection) {
+fn assert_empty_store(connection: &mut Replica) {
     assert_eq!(store_counts(connection), (0, 0));
 }
 
@@ -581,7 +584,7 @@ CREATE TRIGGER loop_body BEFORE INSERT ON inputs FOR EACH ROW EXECUTE FUNCTION l
     )
 }
 
-fn seed_candidates(connection: &mut SqliteConnection) {
+fn seed_candidates(connection: &mut Replica) {
     for identifier in 1..=3 {
         diesel::insert_into(candidates::table)
             .values(candidates::id.eq(identifier))

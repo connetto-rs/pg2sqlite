@@ -7,7 +7,7 @@
 //!    the same options the playground configures (UUID = Blob, SQLiteGIS
 //!    enabled, RLS audit table for the RLS sample, session variable mapping
 //!    where applicable).
-//! 2. Applies the translated SQL to an in-memory `rusqlite` connection that
+//! 2. Applies the translated SQL to an in-memory managed connection that
 //!    registers the same auxiliary surface the playground's `db::reopen` does:
 //!    the `sqlite-vec` auto-extension and a `current_app_user()` UDF returning
 //!    the integer `42` for RLS.
@@ -29,7 +29,7 @@
 //! (and assert that translation itself does not crash), since the
 //! `ST_*` functions are not registered on the native test connection.
 //! With `--features sqlitegis` the test registers `sqlitegis::sqlite::
-//! register_functions` on the rusqlite connection so the full chip
+//! register_functions` on the managed connection so the full chip
 //! pipeline (translate + apply + run twice) executes end-to-end.
 
 #![allow(clippy::too_many_lines)]
@@ -42,10 +42,10 @@ mod request;
 #[path = "../examples/web-playground/src/sample_sql.rs"]
 mod sample_sql;
 
+use diesel::{Connection, connection::SimpleConnection};
 use helpers::deployment::caller;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 use request::declaring_role;
-use rusqlite::Connection;
 use sample_sql::{
     CONSTRAINTS_SQL as CONSTRAINTS_SCHEMA, FTS5_SQL as FTS5_SCHEMA,
     PGVECTOR_SQL as PGVECTOR_SCHEMA, POSTGIS_SQL as POSTGIS_SCHEMA, RLS_SQL as RLS_SCHEMA,
@@ -77,17 +77,21 @@ struct CannedQuery {
     expectation: Expectation,
 }
 
-fn open_connection() -> Connection {
+fn open_connection() -> helpers::Replica {
     helpers::register_sqlite_vec_once();
-    Connection::open_in_memory().expect("open in-memory sqlite")
+    crate::helpers::Replica::establish(":memory:").expect("open in-memory sqlite")
 }
 
-fn register_current_app_user(conn: &Connection) {
-    conn.create_scalar_function(
-        "current_app_user",
-        0,
-        rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
-        |_| Ok(42i64),
+#[diesel::declare_sql_function]
+extern "SQL" {
+    /// The caller the playground's row security reads, answered as user 42.
+    fn current_app_user() -> diesel::sql_types::BigInt;
+}
+
+fn register_current_app_user(connection: &mut helpers::Replica) {
+    current_app_user_utils::register_impl(
+        connection.registration().expect("registration").sqlite(),
+        || 42i64,
     )
     .expect("register current_app_user");
 }
@@ -119,7 +123,7 @@ fn translate(schema: &str, options: &Pg2SqliteOptions) -> String {
 }
 
 fn run_query_once(
-    conn: &Connection,
+    conn: &mut helpers::Replica,
     schema: &str,
     query: &CannedQuery,
     options: &Pg2SqliteOptions,
@@ -151,7 +155,7 @@ fn run_query_once(
         }
     };
 
-    let outcome = conn.execute_batch(&effective_sql);
+    let outcome = conn.batch_execute(&effective_sql);
 
     match (query.expectation, &outcome) {
         (Expectation::Positive, Ok(())) | (Expectation::Negative, Err(_)) => {}
@@ -176,7 +180,7 @@ fn run_query_once(
 /// INSERTs must remain re-runnable, and negative chips must keep
 /// failing for the same reason.
 fn run_queries_twice(
-    conn: &Connection,
+    conn: &mut helpers::Replica,
     schema: &str,
     queries: &[CannedQuery],
     options: &Pg2SqliteOptions,
@@ -211,9 +215,9 @@ const SIMPLE_QUERIES: &[CannedQuery] = &[
 #[test]
 fn simple_sample_queries() {
     let opts = playground_options();
-    let conn = open_connection();
-    conn.execute_batch(&translate(SIMPLE_SCHEMA, &opts)).expect("apply Simple schema");
-    run_queries_twice(&conn, SIMPLE_SCHEMA, SIMPLE_QUERIES, &opts);
+    let mut conn = open_connection();
+    conn.batch_execute(&translate(SIMPLE_SCHEMA, &opts)).expect("apply Simple schema");
+    run_queries_twice(&mut conn, SIMPLE_SCHEMA, SIMPLE_QUERIES, &opts);
 }
 
 const FTS5_QUERIES: &[CannedQuery] = &[
@@ -240,9 +244,9 @@ const FTS5_QUERIES: &[CannedQuery] = &[
 #[test]
 fn fts5_sample_queries() {
     let opts = playground_options();
-    let conn = open_connection();
-    conn.execute_batch(&translate(FTS5_SCHEMA, &opts)).expect("apply FTS5 schema");
-    run_queries_twice(&conn, FTS5_SCHEMA, FTS5_QUERIES, &opts);
+    let mut conn = open_connection();
+    conn.batch_execute(&translate(FTS5_SCHEMA, &opts)).expect("apply FTS5 schema");
+    run_queries_twice(&mut conn, FTS5_SCHEMA, FTS5_QUERIES, &opts);
 }
 
 const PGVECTOR_QUERIES: &[CannedQuery] = &[
@@ -269,9 +273,9 @@ const PGVECTOR_QUERIES: &[CannedQuery] = &[
 #[test]
 fn pgvector_sample_queries() {
     let opts = playground_options();
-    let conn = open_connection();
-    conn.execute_batch(&translate(PGVECTOR_SCHEMA, &opts)).expect("apply pgvector schema");
-    run_queries_twice(&conn, PGVECTOR_SCHEMA, PGVECTOR_QUERIES, &opts);
+    let mut conn = open_connection();
+    conn.batch_execute(&translate(PGVECTOR_SCHEMA, &opts)).expect("apply pgvector schema");
+    run_queries_twice(&mut conn, PGVECTOR_SCHEMA, PGVECTOR_QUERIES, &opts);
 }
 
 const RLS_QUERIES: &[CannedQuery] = &[
@@ -308,10 +312,10 @@ fn rls_options() -> Pg2SqliteOptions {
 #[test]
 fn rls_sample_queries() {
     let opts = rls_options();
-    let conn = open_connection();
-    register_current_app_user(&conn);
-    conn.execute_batch(&translate(RLS_SCHEMA, &opts)).expect("apply RLS schema");
-    run_queries_twice(&conn, RLS_SCHEMA, RLS_QUERIES, &opts);
+    let mut conn = open_connection();
+    register_current_app_user(&mut conn);
+    conn.batch_execute(&translate(RLS_SCHEMA, &opts)).expect("apply RLS schema");
+    run_queries_twice(&mut conn, RLS_SCHEMA, RLS_QUERIES, &opts);
 }
 
 const CONSTRAINTS_QUERIES: &[CannedQuery] = &[
@@ -344,9 +348,9 @@ const CONSTRAINTS_QUERIES: &[CannedQuery] = &[
 #[test]
 fn constraints_sample_queries() {
     let opts = playground_options();
-    let conn = open_connection();
-    conn.execute_batch(&translate(CONSTRAINTS_SCHEMA, &opts)).expect("apply Constraints schema");
-    run_queries_twice(&conn, CONSTRAINTS_SCHEMA, CONSTRAINTS_QUERIES, &opts);
+    let mut conn = open_connection();
+    conn.batch_execute(&translate(CONSTRAINTS_SCHEMA, &opts)).expect("apply Constraints schema");
+    run_queries_twice(&mut conn, CONSTRAINTS_SCHEMA, CONSTRAINTS_QUERIES, &opts);
 }
 
 // PostGIS (translation-only without the `SQLiteGIS` feature; full apply
@@ -399,12 +403,12 @@ fn postgis_sample_queries_translate() {
 #[test]
 fn postgis_sample_queries() {
     // The shared helper's auto-extension registration is process-wide, so the
-    // rusqlite connection below also gets the ST_* functions.
+    // managed connection below also gets the ST_* functions.
     let _gis_connection = helpers::sqlitegis::sqlitegis_connection();
     let opts = playground_options();
-    let conn = open_connection();
-    conn.execute_batch(&translate(POSTGIS_SCHEMA, &opts)).expect("apply PostGIS schema");
-    run_queries_twice(&conn, POSTGIS_SCHEMA, POSTGIS_QUERIES, &opts);
+    let mut conn = open_connection();
+    conn.batch_execute(&translate(POSTGIS_SCHEMA, &opts)).expect("apply PostGIS schema");
+    run_queries_twice(&mut conn, POSTGIS_SCHEMA, POSTGIS_QUERIES, &opts);
 }
 
 // Reverse-chip coverage

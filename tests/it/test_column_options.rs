@@ -4,6 +4,7 @@
 //! Covers: Default with UnaryOp, Nested, BinaryOp, Cast, generated columns
 //! (ALWAYS), generated column (BY DEFAULT) error, and FK to RLS table.
 
+use diesel::{Connection, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 use translate_helpers::translate_default as translate;
 
@@ -193,15 +194,15 @@ fn fk_to_non_rls_table_unchanged() {
 }
 
 /// PostgreSQL's `now()` function returns the current timestamp.
-/// SQLite's equivalent is `strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')`.
+/// SQLite's equivalent is `pg2sqlite_transaction_timestamp()`.
 /// A column with `DEFAULT now()` must survive translation and work at runtime.
 #[test]
 fn default_now_translates_to_canonical_now() {
     let output =
         translate("CREATE TABLE now_test (id INTEGER PRIMARY KEY, created_at TEXT DEFAULT now());");
     assert!(
-        output.contains("strftime("),
-        "now() must become strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'), got: {output}"
+        output.contains("pg2sqlite_transaction_timestamp()"),
+        "now() must become pg2sqlite_transaction_timestamp(), got: {output}"
     );
     assert!(
         !output.to_lowercase().contains("now()"),
@@ -209,8 +210,8 @@ fn default_now_translates_to_canonical_now() {
     );
 
     // Verify the translated DDL works at runtime.
-    use diesel::{Connection, RunQueryDsl, SqliteConnection};
-    let mut conn = SqliteConnection::establish(":memory:").unwrap();
+    use diesel::RunQueryDsl;
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     // The translator leads with a dialect pragma; DDL and vendor pragmas use
     // sql_query.
     let stmts = Pg2Sqlite::default()
@@ -244,9 +245,7 @@ fn default_now_translates_to_canonical_now() {
 /// translation emitted them bare, so every `DEFAULT` shape is checked here by
 /// executing the emitted DDL rather than by grepping for the keyword.
 ///
-/// The DDL is executed as generated text through `rusqlite` because the string
-/// the translator produced is exactly what is under test; a typed diesel schema
-/// would describe a table this test is trying to discover the shape of.
+/// The emitted `DDL` runs through a managed connection.
 #[test]
 fn every_default_shape_produces_runnable_ddl() {
     // The temporal defaults read the zone of the request, so the DDL
@@ -268,11 +267,11 @@ fn every_default_shape_produces_runnable_ddl() {
         &utc_request(),
     );
 
-    let conn = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+    let mut conn = crate::helpers::Replica::establish(":memory:").expect("in-memory SQLite");
     // The translator leads with a dialect pragma; execute each statement
     // individually.
     for stmt in ddl.split('\n').filter(|s| !s.trim().is_empty()) {
-        conn.execute_batch(&format!("{stmt};"))
+        conn.batch_execute(&format!("{stmt};"))
             .unwrap_or_else(|e| panic!("emitted DDL is not runnable: {e}\n{stmt}"));
     }
 
@@ -282,11 +281,13 @@ fn every_default_shape_produces_runnable_ddl() {
     assert!(ddl.contains("signed INTEGER DEFAULT -1"), "{ddl}");
     assert!(ddl.contains("arithmetic INTEGER DEFAULT (1 + 2)"), "{ddl}");
     assert!(ddl.contains("casted TEXT DEFAULT (CAST('hello' AS TEXT))"), "{ddl}");
-    assert!(ddl.contains("keyword TEXT DEFAULT CURRENT_DATE"), "{ddl}");
     assert!(
-        ddl.contains("call TEXT DEFAULT (strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now'))"),
+        ddl.contains(
+            "keyword TEXT DEFAULT (date(datetime(substr(pg2sqlite_transaction_timestamp()"
+        ),
         "{ddl}"
     );
+    assert!(ddl.contains("call TEXT DEFAULT (pg2sqlite_transaction_timestamp())"), "{ddl}");
 }
 
 #[test]
@@ -419,17 +420,17 @@ fn c_and_posix_collations_become_binary() {
 }
 
 fn assert_stmt_parses_as_sqlite(sql: &str) {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     // The translator leads with a dialect pragma; execute each statement
     // individually.
     for stmt in sql.split('\n').filter(|s| !s.trim().is_empty()) {
-        conn.execute_batch(&format!("{stmt};"))
+        conn.batch_execute(&format!("{stmt};"))
             .unwrap_or_else(|e| panic!("emitted statement must run in SQLite: {e}\n{stmt}"));
     }
 }
 
 fn assert_all_stmts_parse_as_sqlite_with(pg_sql: &str, opts: &Pg2SqliteOptions) {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let mut conn = crate::helpers::Replica::establish(":memory:").unwrap();
     for stmt in Pg2Sqlite::default()
         .sql(pg_sql)
         .expect("parse")
@@ -437,7 +438,7 @@ fn assert_all_stmts_parse_as_sqlite_with(pg_sql: &str, opts: &Pg2SqliteOptions) 
         .expect("translate")
         .into_vec()
     {
-        conn.execute_batch(&format!("{stmt};"))
+        conn.batch_execute(&format!("{stmt};"))
             .unwrap_or_else(|e| panic!("emitted statement must run in SQLite: {e}\n{stmt}"));
     }
 }

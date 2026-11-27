@@ -75,7 +75,7 @@ const SQL: &str = concat!(
     "\nGRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated;",
 );
 
-fn translate_and_setup() -> diesel::SqliteConnection {
+fn translate_and_setup() -> crate::helpers::Replica {
     helpers::apply_translated_ddl(SQL, &helpers::rls::options("authenticated", false))
 }
 

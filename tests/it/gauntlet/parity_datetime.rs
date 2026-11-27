@@ -187,7 +187,7 @@ fn pg_setup() -> PgConnection {
 /// every date/time column, and the string literals in seed_rows() are valid
 /// SQLite text values that match what PostgreSQL coerces from the same
 /// literals.
-fn sqlite_setup() -> SqliteConnection {
+fn sqlite_setup() -> crate::helpers::Replica {
     let ddl_stmts = Pg2Sqlite::default()
         .sql(&utc_script(SCHEMA_PG))
         .expect("parse moments DDL")
@@ -247,7 +247,11 @@ fn pg_eval(conn: &mut PgConnection, pg_expr: &str, ids: &[i32]) -> Vec<Option<St
 
 /// Translates `SELECT CAST(<pg_expr> AS TEXT) AS val FROM moments WHERE id IN
 /// (<ids>) ORDER BY id` through pg2sqlite and runs the result on SQLite.
-fn sqlite_eval(conn: &mut SqliteConnection, pg_expr: &str, ids: &[i32]) -> Vec<Option<String>> {
+fn sqlite_eval(
+    conn: &mut crate::helpers::Replica,
+    pg_expr: &str,
+    ids: &[i32],
+) -> Vec<Option<String>> {
     let id_list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
     let pg_sql = utc_script(&format!(
         "{SCHEMA_PG}\n\

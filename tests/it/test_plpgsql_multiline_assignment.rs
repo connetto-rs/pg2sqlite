@@ -5,10 +5,13 @@
 //! reported `Expected: an SQL statement, found: v`. A statement ends at an
 //! unquoted semicolon, not at a newline.
 
+use diesel::{Connection as _, connection::SimpleConnection};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions};
-use rusqlite::Connection;
 
-use crate::support;
+use crate::{
+    helpers::{Replica as Connection, SqliteAnyValue, query_values},
+    support,
+};
 
 /// Run `body` as a BEFORE INSERT trigger and return what it logged.
 fn logged(body: &str) -> Result<Option<String>, String> {
@@ -19,15 +22,21 @@ fn logged(body: &str) -> Result<Option<String>, String> {
         .map(pg2sqlite::script::Script::into_vec)
         .map_err(|error| error.to_string())?;
 
-    let connection = Connection::open_in_memory().expect("in-memory SQLite");
+    let mut connection = Connection::establish(":memory:").expect("in-memory SQLite");
     for statement in &statements {
         connection
-            .execute_batch(&format!("{statement};"))
+            .batch_execute(&format!("{statement};"))
             .map_err(|error| format!("{error}\n{statement}"))?;
     }
-    connection.execute("INSERT INTO t VALUES (1, 5)", []).map_err(|e| e.to_string())?;
-    connection
-        .query_row("SELECT note FROM log", [], |row| row.get(0))
+    connection.execute("INSERT INTO t VALUES (1, 5)", &[]).map_err(|e| e.to_string())?;
+    query_values(&mut connection, "SELECT note FROM log", &[])
+        .map(|mut rows| {
+            match rows.remove(0).remove(0) {
+                SqliteAnyValue::Null => None,
+                SqliteAnyValue::Text(value) => Some(value),
+                value => panic!("expected text, got {value:?}"),
+            }
+        })
         .map_err(|error| error.to_string())
 }
 

@@ -9676,12 +9676,10 @@ fn a_volatile_time_shifted_past_the_64_bit_bound_is_refused() {
     let wrapping = format!("SELECT ({volatile} + interval '{NEAR_BOUND_CLOCK}')::text FROM t;");
     refused(&wrapping, "64 bits");
     refused(&wrapping, "clock_timestamp");
-    let within =
-        utc_script(&format!("{SCHEMA}\nSELECT ({volatile} + interval '1 hour')::text FROM t;"));
-    assert!(
-        Pg2Sqlite::default().sql(&within).expect("parse").translate_to_sql(&utc_request()).is_ok(),
-        "a shift that stays in 64 bits reads the time of day once"
-    );
+    // Within 64 bits the shift reads the time of day once, and what refuses
+    // is the cast, which slices the clock's text in two places.
+    let within = format!("SELECT ({volatile} + interval '1 hour')::text FROM t;");
+    refused(&within, "reads pg2sqlite_clock_timestamp() once");
 }
 
 #[test]

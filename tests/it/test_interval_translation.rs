@@ -67,20 +67,24 @@ fn p1_default_now_plus_interval() {
 
 #[test]
 fn p1_apply_roundtrip_seven_days_default() {
-    use rusqlite::Connection;
+    use diesel::{Connection, connection::SimpleConnection};
+
+    use crate::helpers::{Replica, SqliteAnyValue, query_values};
     let script = translate(
         "CREATE TABLE jobs (id INTEGER PRIMARY KEY, deadline TIMESTAMP NOT NULL DEFAULT (NOW() + INTERVAL '7 days'));\n\
          INSERT INTO jobs (id) VALUES (1);",
     );
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(&script).expect("apply");
-    let days: f64 = conn
-        .query_row(
-            "SELECT julianday(deadline) - julianday('now') FROM jobs WHERE id = 1",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let mut conn = Replica::establish(":memory:").unwrap();
+    conn.batch_execute(&script).expect("apply");
+    let rows = query_values(
+        &mut conn,
+        "SELECT julianday(deadline) - julianday('now') FROM jobs WHERE id = 1",
+        &[],
+    )
+    .unwrap();
+    let SqliteAnyValue::Real(days) = rows[0][0] else {
+        panic!("expected real, got {:?}", rows[0][0]);
+    };
     assert!((6.9..7.1).contains(&days), "deadline ~7 days, got {days}");
 }
 

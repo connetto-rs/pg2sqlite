@@ -73,7 +73,7 @@ diesel::table! {
     }
 }
 
-fn replica() -> SqliteConnection {
+fn replica() -> crate::helpers::Replica {
     let deployment = Deployment::new("postgres", ["app"], []).expect("a valid deployment");
     let options = Pg2SqliteOptions::default().with_deployment(deployment).with_acting_role("app");
     let script = Pg2Sqlite::default()
@@ -81,11 +81,10 @@ fn replica() -> SqliteConnection {
         .expect("parse")
         .translate_to_sql(&options)
         .unwrap_or_else(|error| panic!("the schema should translate: {error}"));
-    let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
-    script.register_functions(&mut connection).expect("register helper functions");
-    for statement in script.into_vec() {
-        connection.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
-    }
+    let mut connection = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
+    script
+        .initialize_managed(&mut connection, pg2sqlite::script::FreshFiles::Both)
+        .expect("initialize replica");
     connection
 }
 
@@ -248,11 +247,10 @@ fn each_body_shape_answers_the_rows_postgresql_answers() {
         .expect("parse")
         .translate_to_sql(&Pg2SqliteOptions::default())
         .unwrap_or_else(|error| panic!("the schema should translate: {error}"));
-    let mut replica = SqliteConnection::establish(":memory:").expect("open SQLite");
-    script.register_functions(&mut replica).expect("register helper functions");
-    for statement in script.into_vec() {
-        replica.batch_execute(&statement).unwrap_or_else(|error| panic!("{error}\n{statement}"));
-    }
+    let mut replica = crate::helpers::Replica::establish(":memory:").expect("open SQLite");
+    script
+        .initialize_managed(&mut replica, pg2sqlite::script::FreshFiles::Both)
+        .expect("initialize replica");
     let mut postgres = fresh_database();
     apply(&mut postgres, SHAPES).expect("apply the schema on PostgreSQL");
     postgres.batch_execute(SHAPE_ROWS).expect("seed PostgreSQL");
