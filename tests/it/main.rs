@@ -396,6 +396,7 @@ mod test_vector_rls;
 mod test_view_output_names;
 mod test_view_triggers;
 mod test_views;
+mod test_volatile_variable_values;
 mod test_window_functions;
 mod test_window_spec_expr_recursion;
 mod test_with_ordinality;
