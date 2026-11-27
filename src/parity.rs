@@ -1222,7 +1222,7 @@ mod tests {
         );
         assert!(matches!(
             view_writes(distinct, "id", &probe).as_deref(),
-            Ok([answer]) if !matches!(answer, Answer::Changed | Answer::Skipped)
+            Ok([Answer::Rejected(sqlstate)]) if sqlstate == "55000"
         ));
     }
 

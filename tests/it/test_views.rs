@@ -270,7 +270,12 @@ fn test_or_replace_view_emits_drop_then_create() {
 
     let stmts = Pg2Sqlite::default().sql(sql).unwrap().translate(&options).unwrap().into_vec();
 
-    assert_eq!(stmts.len(), 3, "the script leads with the dialect pragma, then DROP + CREATE");
+    assert_eq!(
+        stmts.len(),
+        6,
+        "the script leads with the dialect pragma, then DROP + CREATE, then the three triggers \
+         refusing writes to a view reading no relation"
+    );
     let drop = stmts[1].to_string();
     let create = stmts[2].to_string();
     assert!(
