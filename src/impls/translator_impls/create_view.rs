@@ -6,7 +6,8 @@ use core::ops::ControlFlow;
 
 use sql_traits::{
     errors::{LookupError, RowSecurityError},
-    structs::{IdentifierCase, ParserDB, RowSecurity, RowStatement, TargetName},
+    prelude::SqlparserDialect,
+    structs::{IdentifierCase, ParserDB, RowSecurity, RowStatement, TargetName, View},
     traits::{DatabaseLike, Relation, RoleLike, TableLike, ViewLike},
 };
 use sqlparser::ast::{
@@ -77,9 +78,18 @@ impl crate::traits::translator::TranslatorWithContext for CreateView {
         let written = options.written_schema().unwrap_or(schema);
         let stored = declared_view(written, self)?;
         let temporary = self.temporary || stored.is_some_and(ViewLike::is_temporary);
+        let security_barrier = match stored {
+            Some(view) => view.is_security_barrier(),
+            None => {
+                View::from_node(self.clone(), SqlparserDialect::PostgreSql)?.is_security_barrier()
+            }
+        };
         let pinned = super::view_outputs::pin_outputs(&self.query, written)?;
         let mut query = pinned.translate_with_warnings(schema, options, emit)?;
         retarget_reads(&mut query, self, schema, options, temporary, security_invoker)?;
+        if security_barrier {
+            query = super::cte::fenced(query);
+        }
         let name = if temporary {
             sqlite_unqualified_object_name(&self.name)
         } else {
@@ -119,8 +129,9 @@ fn reads_as_the_invoker(options: &CreateTableOptions) -> bool {
 }
 
 /// The first option the replica has no counterpart for, past
-/// `security_invoker`, which picks the relations the view reads, and a
-/// `check_option` of `local` or `cascaded`, which its triggers apply.
+/// `security_invoker`, which picks the relations the view reads, a
+/// `check_option` of `local` or `cascaded`, which its triggers apply, and
+/// `security_barrier`, which fences the view's body.
 fn unsupported_option(options: &CreateTableOptions) -> Option<&SqlOption> {
     let pairs: &[SqlOption] = match options {
         CreateTableOptions::None => &[],
@@ -134,10 +145,14 @@ fn unsupported_option(options: &CreateTableOptions) -> Option<&SqlOption> {
 }
 
 /// Whether the replica carries the `WITH` option `pair` of a view, whose
-/// value the schema has already read as PostgreSQL does.
+/// value the schema has already read as PostgreSQL does. A bare
+/// `security_barrier` turns the barrier on.
 fn supported(pair: &SqlOption) -> bool {
     matches!(pair, SqlOption::KeyValue { key, .. }
-        if option_named(key, "security_invoker") || option_named(key, "check_option"))
+        if ["security_invoker", "check_option", "security_barrier"]
+            .into_iter()
+            .any(|name| option_named(key, name)))
+        || matches!(pair, SqlOption::Ident(key) if option_named(key, "security_barrier"))
 }
 
 fn option_named(key: &ObjectName, name: &str) -> bool {

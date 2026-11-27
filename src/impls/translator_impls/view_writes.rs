@@ -22,9 +22,10 @@ use sql_traits::{
     traits::{DatabaseLike, TableLike, ViewLike},
 };
 use sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, ConflictTarget, Delete, Expr, FromTable, Ident, Insert,
-    ObjectName, ObjectNamePart, OnConflictAction, OnInsert, Query, Select, SelectItem, SetExpr,
-    Statement, TableAlias, TableFactor, TableObject, Update, Visit, VisitMut, Visitor, VisitorMut,
+    AssignmentTarget, BinaryOperator, CaseWhen, ConflictTarget, Delete, Expr, FromTable, Ident,
+    Insert, ObjectName, ObjectNamePart, OnConflictAction, OnInsert, Query, Select, SelectItem,
+    SetExpr, Statement, TableAlias, TableFactor, TableObject, Update, Visit, VisitMut, Visitor,
+    VisitorMut, helpers::attached_token::AttachedToken,
 };
 
 #[cfg(not(feature = "std"))]
@@ -212,7 +213,7 @@ pub(crate) fn land_update(
     for assignment in &mut landed.assignments {
         landing.assign(&mut assignment.target, &view_name)?;
     }
-    landed.selection = narrowed(condition, landed.selection.take());
+    landed.selection = narrowed(condition, landed.selection.take(), view.is_security_barrier());
     landed.table.relation = landing.target(&qualifier);
     Ok(Some(landed))
 }
@@ -262,7 +263,7 @@ pub(crate) fn land_delete(
     };
     replace(&mut statement, replacements);
     let Statement::Delete(mut landed) = statement else { return Ok(None) };
-    landed.selection = narrowed(condition, landed.selection.take());
+    landed.selection = narrowed(condition, landed.selection.take(), view.is_security_barrier());
     let (FromTable::WithFromKeyword(targets) | FromTable::WithoutKeyword(targets)) =
         &mut landed.from;
     for target in targets {
@@ -648,9 +649,21 @@ fn stored_bytes(ident: &Ident) -> impl Iterator<Item = u8> + '_ {
     ident.value.bytes().map(move |byte| if quoted { byte } else { byte.to_ascii_lowercase() })
 }
 
-/// The view's condition and the statement's own, both holding.
-fn narrowed(condition: Option<Expr>, selection: Option<Expr>) -> Option<Expr> {
+/// The view's condition and the statement's own, both holding. A security
+/// barrier view's condition is tested first on every row, as a `CASE` branch
+/// SQLite evaluates only once its `WHEN` holds, where it would reorder the
+/// terms of an `AND`.
+fn narrowed(condition: Option<Expr>, selection: Option<Expr>, barrier: bool) -> Option<Expr> {
     match (condition, selection) {
+        (Some(condition), Some(selection)) if barrier => {
+            Some(Expr::Case {
+                case_token: AttachedToken::empty(),
+                end_token: AttachedToken::empty(),
+                operand: None,
+                conditions: vec![CaseWhen { condition, result: selection }],
+                else_result: None,
+            })
+        }
         (Some(condition), Some(selection)) => {
             Some(Expr::BinaryOp {
                 left: Box::new(Expr::Nested(Box::new(condition))),

@@ -900,20 +900,3 @@ fn a_security_invoker_view_the_caller_holds_takes_its_writes() {
         .expect("the move runs");
     assert_eq!(item(&mut connection, 1), Some((Some(3), Some("fresh".to_owned()))));
 }
-
-/// View options the replica has no counterpart for are refused.
-#[test]
-fn view_options_without_a_counterpart_are_refused() {
-    for option in ["security_barrier", "security_barrier = true"] {
-        let error = pg2sqlite::prelude::Pg2Sqlite::default()
-            .sql(&format!(
-                "CREATE TABLE items (id INT PRIMARY KEY);
-                 CREATE VIEW item_ids WITH ({option}) AS SELECT id FROM items;"
-            ))
-            .expect("parse")
-            .translate_to_sql(&Pg2SqliteOptions::default())
-            .expect_err("the option is refused")
-            .to_string();
-        assert!(error.contains("VIEW options are not supported in SQLite"), "{option}: {error}");
-    }
-}

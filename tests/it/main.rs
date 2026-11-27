@@ -320,6 +320,7 @@ mod test_root_query_parentheses;
 mod test_scalar_helper_inlining;
 mod test_schema_qualified_names;
 mod test_schema_refusal_sqlstate;
+mod test_security_barrier_views;
 mod test_self_referencing_restrict;
 mod test_semantic_differences_readme;
 mod test_semantic_divergence;
