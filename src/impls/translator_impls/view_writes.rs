@@ -776,7 +776,7 @@ fn replace<N: VisitMut + ?Sized>(node: &mut N, replacements: Vec<(usize, Expr)>)
 /// # Errors
 ///
 /// Returns the lookup errors reading the definition runs into.
-pub(super) fn output_names(view: &View, schema: &ParserDB) -> Result<Vec<Option<String>>, Error> {
+pub(crate) fn output_names(view: &View, schema: &ParserDB) -> Result<Vec<Option<String>>, Error> {
     let definition = view.definition();
     let graph = ColumnScope::from_query(definition, schema, IdentifierCase::AsWritten)?;
     let mut declared = view.declared_column_names().iter();
