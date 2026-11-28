@@ -65,7 +65,7 @@ use crate::{
         privileges::{RoleTable, has_backing_table, names_table_with_backing},
         query_builder::plain_table_with_joins,
         translator_impls::{
-            clock_check::{dropped_clock_triggers, split_clock_checks},
+            check_triggers,
             column::translate_column_def,
             condition_injection::inject_condition_into_dml_statement,
             create_trigger::{TriggerRelation, trigger_relation},
@@ -551,10 +551,12 @@ fn build_create_table_statements(
     let table_scope =
         crate::options::table_column_scope(resolve_declared_table(written, create_table)?, written);
     let scoped = table_scope.as_ref().map(|scope| options.with_scope(scope));
-    let server_checked =
-        super::server_filled::split(create_table, (schema, written), options, emit)?;
-    let (checked_table, clock_checks) =
-        split_clock_checks(&server_checked, written, scoped.as_ref().unwrap_or(options), emit)?;
+    let (checked_table, enforced) = check_triggers::split(
+        create_table,
+        (schema, written),
+        scoped.as_ref().unwrap_or(options),
+        emit,
+    )?;
     let translated_table = checked_table.translate_with_warnings(schema, options, emit)?;
     let emitted_table = match rls_statements {
         Some(_) => rename_table_for_rls(&translated_table, options, schema),
@@ -565,15 +567,14 @@ fn build_create_table_statements(
         &interval_companions,
         &emitted_table.name,
     );
-    let clock_triggers: Vec<Statement> =
-        clock_checks.into_triggers(&emitted_table.name, options).collect();
+    let enforcing_triggers = enforced.into_triggers(&emitted_table.name, options);
     let referenced_sides = declared(&create_table.name, None, schema, options, emit)?;
 
     let mut statements = vec![Statement::CreateTable(emitted_table)];
     statements.extend(rls_statements.into_iter().flatten());
     statements.extend(companions);
     statements.extend(interval_companions);
-    statements.extend(clock_triggers);
+    statements.extend(enforcing_triggers);
     statements.extend(referenced_sides);
     append_vec0_statements_if_needed(&mut statements, create_table, schema, options, emit)?;
     overlay_if_derived(&mut statements, create_table, schema, options, emit)?;
@@ -771,8 +772,12 @@ fn translate_alter_table(
         statements.extend(drops);
         if let AlterTableOperation::DropColumn { column_names, .. } = operation {
             let written = options.written_schema().unwrap_or(schema);
-            let mut dependents =
-                dropped_clock_triggers(&alter_table.name, column_names, written, options)?;
+            let mut dependents = check_triggers::dropped_triggers(
+                &alter_table.name,
+                column_names,
+                written,
+                options,
+            )?;
             dependents.extend(dropped_column_indexes(
                 &alter_table.name,
                 column_names,

@@ -5,6 +5,7 @@ pub(crate) mod array;
 pub(crate) mod blob_operator;
 pub(crate) mod body_storage;
 pub(crate) mod case_fold;
+mod check_triggers;
 pub(crate) mod clock_check;
 pub(crate) mod column;
 pub(crate) mod column_option;

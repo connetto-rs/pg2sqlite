@@ -22,9 +22,9 @@ use sql_traits::{
 };
 use sqlparser::{
     ast::{
-        ColumnDef, ColumnOption, CreateFunction, CreateTable, CreateTrigger, ForeignKeyConstraint,
-        FunctionSecurity, Ident, ObjectName, ReferentialAction, Statement, TriggerEvent,
-        TriggerPeriod,
+        ColumnDef, ColumnOption, CreateFunction, CreateTable, CreateTrigger, Expr,
+        ForeignKeyConstraint, FunctionSecurity, Ident, ObjectName, ReferentialAction, Statement,
+        TriggerEvent, TriggerPeriod,
     },
     dialect::PostgreSqlDialect,
     parser::Parser,
@@ -44,7 +44,7 @@ use crate::{
         },
         unlabelled_body::unlabelled_body,
     },
-    options::TranslationContext,
+    options::{TableTrigger, TranslationContext},
     traits::schema::trigger_function,
     warnings::{TranslationWarning, WarningSink},
 };
@@ -328,17 +328,24 @@ pub(crate) fn trigger_left_to_server(
 /// The fields of `NEW` one `BEFORE` row trigger the replica leaves to the
 /// server assigns, which only the server fills.
 pub(crate) struct ServerFilled<'t> {
-    /// The trigger's name as written.
-    trigger: &'t str,
+    trigger: &'t TableTrigger,
     fields: Columns,
-    /// Whether the trigger fires on `INSERT`.
-    on_insert: bool,
 }
 
 impl ServerFilled<'_> {
     /// The trigger's name as written.
-    pub(crate) const fn trigger(&self) -> &str {
-        self.trigger
+    pub(crate) fn trigger(&self) -> &str {
+        &self.trigger.name
+    }
+
+    /// The events the trigger fires on.
+    pub(crate) fn events(&self) -> &[TriggerEvent] {
+        &self.trigger.events
+    }
+
+    /// The trigger's `WHEN` condition as written.
+    pub(crate) fn condition(&self) -> Option<&Expr> {
+        self.trigger.condition.as_ref()
     }
 
     /// Whether the trigger may assign `column`, folded.
@@ -348,7 +355,7 @@ impl ServerFilled<'_> {
 
     /// Whether the trigger fires on `INSERT` and may assign `column`, folded.
     pub(crate) fn fills_on_insert(&self, column: &str) -> bool {
-        self.on_insert && self.fills(column)
+        self.events().contains(&TriggerEvent::Insert) && self.fills(column)
     }
 }
 
@@ -383,11 +390,7 @@ pub(crate) fn server_filled<'o>(
         let Some(function) = trigger_function(schema, function)? else { continue };
         let fields = chain::Walker::read(function, schema, options)?.assigned;
         if !fields.is_empty() {
-            filled.push(ServerFilled {
-                trigger: &trigger.name,
-                fields,
-                on_insert: trigger.events.iter().any(|event| matches!(event, TriggerEvent::Insert)),
-            });
+            filled.push(ServerFilled { trigger, fields });
         }
     }
     Ok(filled)

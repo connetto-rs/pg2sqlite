@@ -297,6 +297,8 @@ pub(crate) struct TableTrigger {
     pub(crate) events: Vec<sqlparser::ast::TriggerEvent>,
     pub(crate) period: Option<sqlparser::ast::TriggerPeriod>,
     pub(crate) row_level: bool,
+    /// The trigger's `WHEN` condition as written.
+    pub(crate) condition: Option<sqlparser::ast::Expr>,
     /// The function the trigger runs.
     pub(crate) function: Option<sqlparser::ast::ObjectName>,
 }
@@ -1610,6 +1612,7 @@ fn register_table_trigger(
                     )
             )
         ),
+        condition: trigger.condition.clone(),
         function: trigger.exec_body.as_ref().map(|body| body.func_desc.name.clone()),
     });
 }
