@@ -5,16 +5,17 @@
 //! through no installation, a returned key capped by another helper's set, a
 //! column capped by another helper's set beside the caller, a column kept
 //! outside another helper's set, that set holding `NULL` or not, a setting
-//! left unset, read through `NULLIF` or as sent, a walk down two edge tables
-//! kept to a selection, a walk up a tree feeding a grantee set, a walk down an
-//! edge table no key orients, following the edges a state, a time bound and
-//! another helper's set leave it, and a walk following the edges a lifted row
-//! cap leaves it. Then for a parent arm a lifted row cap keeps to, a parent arm
-//! a kind, a time bound and another helper's set keep to, a parent arm kept
-//! outside another helper's pairs, that helper keeping rows or none, an arm
-//! reading another helper's rows, and for a helper read in `FROM`, as its
-//! rows, its columns under an alias, and its rows correlated with the row a
-//! policy reads.
+//! left unset or carried, read through `NULLIF` or as sent, a caller or a
+//! carried setting, a carried setting beside a column another helper's set
+//! caps, a walk down two edge tables kept to a selection, a walk up a tree
+//! feeding a grantee set, a walk down an edge table no key orients, following
+//! the edges a state, a time bound and another helper's set leave it, and a
+//! walk following the edges a lifted row cap leaves it. Then for a parent arm
+//! a lifted row cap keeps to, a parent arm a kind, a time bound and another
+//! helper's set keep to, a parent arm kept outside another helper's pairs,
+//! that helper keeping rows or none, an arm reading another helper's rows,
+//! and for a helper read in `FROM`, as its rows, its columns under an alias,
+//! and its rows correlated with the row a policy reads.
 //! Each helper guards the same table under a policy of its own, which both
 //! engines read before any request and then under every request state.
 
@@ -296,6 +297,34 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
   WHERE doc.kind = 'file' AND current_setting('app.installation_id', true) IS NULL
 $$;
 
+CREATE FUNCTION authz.installed_grants() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT grant_row.doc_id FROM public.grants grant_row
+  WHERE grant_row.grantee = authz.caller_id() AND authz.installation_id() IS NOT NULL
+$$;
+
+CREATE FUNCTION authz.ever_installed_files() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT doc.id FROM public.docs doc
+  WHERE doc.kind = 'file' AND current_setting('app.installation_id', true) IS NOT NULL
+$$;
+
+CREATE FUNCTION authz.signed_in_or_installed_pages() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT doc.id FROM public.docs doc
+  WHERE doc.kind = 'page'
+    AND ((SELECT authz.caller_id()) IS NOT NULL OR (SELECT authz.installation_id()) IS NOT NULL)
+$$;
+
+CREATE FUNCTION authz.installed_member_docs() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT grant_row.doc_id FROM public.grants grant_row
+  WHERE grant_row.org_id IN (SELECT authz.member_orgs()) AND authz.installation_id() IS NOT NULL
+  UNION
+  SELECT grant_row.doc_id FROM public.grants grant_row
+  WHERE grant_row.grantee IN (SELECT authz.member_orgs())
+$$;
+
 CREATE FUNCTION authz.linked_down_docs() RETURNS SETOF TEXT
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
   WITH RECURSIVE reached (id) AS (
@@ -382,6 +411,10 @@ ALTER FUNCTION authz.non_team_docs() OWNER TO conditions_owner;
 ALTER FUNCTION authz.member_granted_docs() OWNER TO conditions_owner;
 ALTER FUNCTION authz.uninstalled_grants() OWNER TO conditions_owner;
 ALTER FUNCTION authz.never_installed_files() OWNER TO conditions_owner;
+ALTER FUNCTION authz.installed_grants() OWNER TO conditions_owner;
+ALTER FUNCTION authz.ever_installed_files() OWNER TO conditions_owner;
+ALTER FUNCTION authz.signed_in_or_installed_pages() OWNER TO conditions_owner;
+ALTER FUNCTION authz.installed_member_docs() OWNER TO conditions_owner;
 ALTER FUNCTION authz.linked_down_docs() OWNER TO conditions_owner;
 ALTER FUNCTION authz.capped_linked_docs() OWNER TO conditions_owner;
 ALTER FUNCTION authz.capped_member_docs() OWNER TO conditions_owner;
@@ -405,7 +438,7 @@ GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA authz TO app;
 
 /// Each helper's policy over `docs`, one case per condition it carries or
 /// place its rows are read in.
-const CASES: [(&str, &str); 36] = [
+const CASES: [(&str, &str); 40] = [
     ("a joined row", "org_id IN (SELECT authz.member_orgs())"),
     ("a row cap over a joined row", "org_id IN (SELECT authz.administered_orgs())"),
     ("an anti-join, time bounds and a principal", "id IN (SELECT authz.granted_docs())"),
@@ -437,6 +470,13 @@ const CASES: [(&str, &str); 36] = [
     ("a column capped beside the caller", "id IN (SELECT authz.member_granted_docs())"),
     ("a setting left unset through NULLIF", "id IN (SELECT authz.uninstalled_grants())"),
     ("a setting left unset as sent", "id IN (SELECT authz.never_installed_files())"),
+    ("a setting carried through NULLIF", "id IN (SELECT authz.installed_grants())"),
+    ("a setting carried as sent", "id IN (SELECT authz.ever_installed_files())"),
+    ("a caller or a carried setting", "id IN (SELECT authz.signed_in_or_installed_pages())"),
+    (
+        "a carried setting beside a column another helper's set caps",
+        "id IN (SELECT authz.installed_member_docs())",
+    ),
     ("an arm reading another helper's rows", "org_id IN (SELECT authz.called_orgs())"),
     ("a set helper's rows", "org_id IN (SELECT member_orgs FROM authz.member_orgs())"),
     ("a set helper's rows under an alias", "org_id IN (SELECT o FROM authz.member_orgs() o)"),
