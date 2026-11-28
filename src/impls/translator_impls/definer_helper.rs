@@ -1,8 +1,9 @@
 //! A call to a `SECURITY DEFINER` SQL helper, written as the set it returns.
 //!
 //! A policy compares a column to what a helper returns, as
-//! `x IN (SELECT authz.f('admin'))` or `x = ANY (ARRAY(SELECT
-//! authz.f('admin')))`, or reads the helper's rows where a table goes, as
+//! `x IN (SELECT authz.f('admin'))`, `x = ANY (ARRAY(SELECT
+//! authz.f('admin')))` or `x = (SELECT authz.f('admin'))`, or reads the
+//! helper's rows where a table goes, as
 //! `(a, b) IN (SELECT * FROM authz.f('admin'))`. SQLite has no functions of
 //! the schema's own to call, so the call reads the rows of a helper function
 //! the replica registers, one per helper and arguments, whose body is the
@@ -27,8 +28,8 @@ use sql_traits::{
     traits::{DatabaseLike, FunctionLike, RoleLike, TableLike},
 };
 use sqlparser::ast::{
-    ArrayElemTypeDef, BinaryOperator, CastKind, CreateTable, Cte, DataType, Distinct, Expr,
-    Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident,
+    ArrayElemTypeDef, BinaryOperator, CaseWhen, CastKind, CreateTable, Cte, DataType, Distinct,
+    Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident,
     InTarget, Join, JoinConstraint, JoinOperator, ObjectName, ObjectNamePart, Query, SelectItem,
     SetExpr, SetOperator, SetQuantifier, TableAlias, TableAliasColumnDef, TableFactor,
     TableFunctionArgs, TableWithJoins, Value, ValueWithSpan, VisitMut, Visitor, VisitorMut,
@@ -42,7 +43,9 @@ use crate::{
     impls::{
         batch_cache::address,
         column_access::{from_names, holds},
-        function_helpers::{query_projection, simple_function_expr, string_literal},
+        function_helpers::{
+            number_literal, query_projection, simple_function_expr, string_literal,
+        },
         object_name::{declared_column_ident, last_ident},
         privileges::{RoleTable, has_backing_table},
         query_builder::{
@@ -50,7 +53,10 @@ use crate::{
         },
         session_variable,
         shared_helpers::leaf_factors,
-        translator_impls::sql_helper::{self, declared_helper, hidden_read, inlined_rows},
+        translator_impls::{
+            expr::raised_error,
+            sql_helper::{self, declared_helper, hidden_read, inlined_rows},
+        },
     },
     options::TranslationContext,
     traits::TranslatorWithContext,
@@ -78,20 +84,98 @@ pub(crate) fn helper_membership(
     options: &TranslationContext<'_>,
     emit: WarningSink<'_>,
 ) -> Result<Option<Query>, Error> {
-    let Some(Expr::Function(call)) = query_projection(subquery) else { return Ok(None) };
+    let Some((call, helper)) = set_call(subquery, schema, options)? else { return Ok(None) };
+    helper_query(helper, &call.name, call_arguments(call), &[], schema, options, emit).map(Some)
+}
+
+/// The SQLite expression answering the scalar subquery `subquery`, when
+/// `subquery` is `SELECT f(...)` and `f` is a set-returning function the
+/// schema declares: `NULL` for a set holding no row, the value of its one
+/// row, and an error past one row, where PostgreSQL raises `21000`.
+///
+/// `None` is as for [`helper_membership`].
+///
+/// # Errors
+///
+/// Refuses the call as [`helper_membership`] does, and a helper returning rows
+/// of several columns, each of which the subquery answers as one record.
+pub(crate) fn helper_value(
+    subquery: &Query,
+    schema: &ParserDB,
+    options: &TranslationContext<'_>,
+    emit: WarningSink<'_>,
+) -> Result<Option<Expr>, Error> {
+    let Some((call, helper)) = set_call(subquery, schema, options)? else { return Ok(None) };
     let name = &call.name;
+    let columns = returned_columns(helper, schema);
+    if columns.len() > 1 {
+        return Err(Error::forward_refusal(format!(
+            "(SELECT {name}(...)) answers each row of {name}() as one record of its {} columns, \
+             which the replica holds no type for. Compare the columns with (a, b) IN (SELECT * \
+             FROM {name}(...)).",
+            columns.len()
+        )));
+    }
+    let value = Ident::new(VALUE);
+    let set = helper_query(
+        helper,
+        name,
+        call_arguments(call),
+        core::slice::from_ref(&value),
+        schema,
+        options,
+        emit,
+    )?;
+    let rows =
+        TableFactor::Derived { lateral: false, subquery: Box::new(set), alias: None, sample: None };
+    let answer = Expr::Case {
+        case_token: AttachedToken::empty(),
+        end_token: AttachedToken::empty(),
+        operand: None,
+        conditions: vec![CaseWhen {
+            condition: Expr::BinaryOp {
+                left: Box::new(simple_function_expr("count", vec![number_literal("1")], None)),
+                op: BinaryOperator::Gt,
+                right: Box::new(number_literal("1")),
+            },
+            result: raised_error("more than one row returned by a subquery used as an expression"),
+        }],
+        else_result: Some(Box::new(simple_function_expr(
+            "min",
+            vec![Expr::Identifier(value)],
+            None,
+        ))),
+    };
+    Ok(Some(Expr::Subquery(Box::new(single_expr_query(answer, from_relation(rows), None)))))
+}
+
+/// The call `subquery` makes and the set-returning function the schema
+/// declares under its name, when `subquery` is `SELECT f(...)`.
+///
+/// # Errors
+///
+/// Propagates a lookup failure, an overloaded name among them.
+fn set_call<'q, 's>(
+    subquery: &'q Query,
+    schema: &'s ParserDB,
+    options: &TranslationContext<'_>,
+) -> Result<Option<(&'q Function, &'s <ParserDB as DatabaseLike>::Function)>, Error> {
+    let Some(Expr::Function(call)) = query_projection(subquery) else { return Ok(None) };
     // A helper returning one value stands for its body, which the call's
     // ordinary translation writes in place of it.
-    let Some(helper) =
-        declared_helper(name, schema, options)?.filter(|helper| helper.returns_set())
-    else {
-        return Ok(None);
-    };
-    let arguments = match &call.args {
-        FunctionArguments::List(list) if list.clauses.is_empty() => arguments(name, &list.args),
-        other => Err(unsupported_argument(name, other)),
-    };
-    helper_query(helper, name, arguments, &[], schema, options, emit).map(Some)
+    let helper = declared_helper(&call.name, schema, options)?;
+    Ok(helper.filter(|helper| helper.returns_set()).map(|helper| (call, helper)))
+}
+
+/// The literal arguments of `call`, or the refusal of the first one that is
+/// none.
+fn call_arguments(call: &Function) -> Result<Vec<Value>, HelperSetError> {
+    match &call.args {
+        FunctionArguments::List(list) if list.clauses.is_empty() => {
+            arguments(&call.name, &list.args)
+        }
+        other => Err(unsupported_argument(&call.name, other)),
+    }
 }
 
 /// The derived table answering `FROM f(...) [AS alias [(columns)]]`, when `f`
@@ -552,6 +636,7 @@ const PREVIOUS: &str = "previous";
 const CALLED: &str = "called";
 /// The one column of a list of labels.
 const LABEL: &str = "label";
+const VALUE: &str = "value";
 
 /// Writes a helper's set as a PostgreSQL query over the tables its arms read,
 /// under their declared names so the translation resolves their columns.

@@ -1734,7 +1734,8 @@ fn returned_type<'f>(name: &ObjectName, helper: &'f CreateFunction) -> Result<&'
             return Err(refusal(
                 name,
                 "returns a set, which translates only where a query reads its rows, as `FROM \
-                 f(...)`, or where a policy compares a value with it, as `x IN (SELECT f(...))`",
+                 f(...)`, or where a policy compares a value with it, as `x IN (SELECT f(...))` \
+                 or `x = (SELECT f(...))`",
             ));
         }
         None => return Err(refusal(name, "declares no return type")),
