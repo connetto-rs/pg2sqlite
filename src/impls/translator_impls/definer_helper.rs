@@ -21,8 +21,8 @@ use sql_traits::{
     structs::{
         AntiJoin, ArmCondition, CalledArm, CallerGate, CapOperand, ExcludedSet, GrantArm,
         GrantedTo, HelperArm, HelperSet, ParentArm, ParserDB, RequestNormalization, Restriction,
-        Returned, RowCap, SetPacking, SettingComparison, SettingContent, SettingValue, TimeBound,
-        TimeComparison, UnsetSetting, WalkArm, WalkDirection,
+        Returned, RowCap, SetPacking, SetSetting, SettingComparison, SettingContent, SettingValue,
+        TimeBound, TimeComparison, UnsetSetting, WalkArm, WalkDirection,
     },
     traits::{DatabaseLike, FunctionLike, RoleLike, TableLike},
 };
@@ -289,6 +289,7 @@ fn helper_query(
                 &[
                     ArmCondition::Exclusion,
                     ArmCondition::UnsetSetting,
+                    ArmCondition::SetSetting,
                     ArmCondition::EdgeCondition,
                     ArmCondition::ParentCondition,
                     ArmCondition::Cap,
@@ -992,6 +993,7 @@ impl<'db> Lowering<'_, 'db> {
             conditions.extend(self.gate(gate)?);
         }
         conditions.extend(grant.unset_settings().iter().map(unset));
+        conditions.extend(grant.set_settings().iter().map(carried));
         conditions.extend(restrictions(ARM, grant.restrictions()));
         conditions.extend(time_bounds(ARM, grant.time_bounds()));
         for cap in grant.caps() {
@@ -1156,6 +1158,7 @@ impl<'a, 'db> Membership<'a, 'db> {
                 let unconditioned = grant.joined_rows().is_empty()
                     && grant.gate().is_none()
                     && grant.unset_settings().is_empty()
+                    && grant.set_settings().is_empty()
                     && grant.restrictions().is_empty()
                     && grant.time_bounds().is_empty()
                     && grant.anti_joins().is_empty()
@@ -1437,6 +1440,15 @@ fn request(comparison: &SettingComparison<'_, ParserDB>) -> Expr {
 /// `<setting> IS NULL`, read as the body reads it.
 fn unset(setting: &UnsetSetting<'_>) -> Expr {
     Expr::IsNull(Box::new(setting_read(
+        setting.setting().name(),
+        setting.raises_when_unset(),
+        setting.reads_empty_as_unset(),
+    )))
+}
+
+/// `<setting> IS NOT NULL`, read as the body reads it.
+fn carried(setting: &SetSetting<'_>) -> Expr {
+    Expr::IsNotNull(Box::new(setting_read(
         setting.setting().name(),
         setting.raises_when_unset(),
         setting.reads_empty_as_unset(),
