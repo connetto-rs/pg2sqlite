@@ -1102,12 +1102,21 @@ impl<'db> Lowering<'_, 'db> {
         }
     }
 
-    /// `<column> NOT IN (<set>)`, which is `NULL`, dropping the row, where
-    /// the column holds `NULL` and the set any row, or the set holds `NULL`
-    /// but not the column's value, as PostgreSQL's exclusion is.
+    /// `<columns> NOT IN (<set>)`, which is `NULL`, dropping the row, where a
+    /// column holds `NULL` and the set a row matching the others, or the set
+    /// holds a row with `NULL` matching the row's other values but no row
+    /// holding them all, as PostgreSQL's exclusion is. The set takes the
+    /// helper's declared columns, so a set keeping no row compares with as
+    /// many columns as the row holds.
     fn exclusion(&mut self, exclusion: &ExcludedSet<'db, ParserDB>) -> Result<Expr, Error> {
-        let excluded = self.set(exclusion.set(), &[])?;
-        Ok(not_in_query(qualified(ARM, declared_column_ident(exclusion.column())), excluded))
+        let names = returned_columns(exclusion.function(), self.schema);
+        let excluded = self.set(exclusion.set(), &names)?;
+        let columns = exclusion
+            .columns()
+            .iter()
+            .map(|column| qualified(ARM, declared_column_ident(column)))
+            .collect();
+        Ok(not_in_query(row(columns), excluded))
     }
 }
 
