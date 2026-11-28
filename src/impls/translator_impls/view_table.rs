@@ -586,7 +586,9 @@ fn column(
     let data_type = match context.type_of(expression)? {
         OperandType::Known { type_name, typmod } => catalog_type(view, name, &type_name, typmod)?,
         OperandType::UntypedLiteral => DataType::Text,
-        OperandType::Unknown => {
+        // The schema's views read PostgreSQL's types, so a SQLite type tells
+        // no more of the column than an unknown one.
+        OperandType::Sqlite { .. } | OperandType::Unknown => {
             return Err(Error::forward_refusal(format!(
                 "the type of column {name} of view {} is not known, so the replica cannot hold \
                  the view as a table of its columns. Cast the column to its type in the view.",
