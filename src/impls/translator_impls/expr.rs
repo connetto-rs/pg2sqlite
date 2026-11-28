@@ -70,7 +70,7 @@ use crate::{
             case_fold,
             create_index::FtsKey,
             data_type::{MAX_NUMERIC_PRECISION, exact_numeric_info, numeric_precision_and_scale},
-            definer_helper::helper_membership,
+            definer_helper::{helper_membership, helper_value},
             function::cube_root_closed_form,
             helpers::Forward,
             uuid::uuid_as_text,
@@ -1380,7 +1380,7 @@ pub(crate) fn guarded_json_write(
 /// statement on a path that does not start with `$`, quoting the path as
 /// `bad JSON path: '<message>'`. A `CASE` evaluates only the branch it takes,
 /// so the error fires only for the rows PostgreSQL refuses.
-fn raised_error(message: &str) -> Expr {
+pub(crate) fn raised_error(message: &str) -> Expr {
     simple_function_expr("json_extract", vec![string_literal("{}"), string_literal(message)], None)
 }
 
@@ -5338,6 +5338,12 @@ impl TranslateUnfinished for Expr {
                          Restructure as separate GROUP BY queries and UNION ALL the results."
                         .to_string(),
                 ));
+            }
+            Expr::Subquery(subquery) => {
+                match helper_value(subquery, schema, options, emit)? {
+                    Some(value) => value,
+                    None => translate_expr_recursive::<Forward>(self, schema, options, emit)?,
+                }
             }
             Expr::In { expr: operand, target: InTarget::Subquery(subquery), negated, global } => {
                 if crate::impls::expression_type::is_interval_typed(operand, schema, options) {

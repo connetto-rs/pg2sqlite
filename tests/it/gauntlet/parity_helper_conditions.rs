@@ -12,11 +12,13 @@
 //! cap leaves it. Then for a parent arm a lifted row cap keeps to, a parent arm
 //! a kind, a time bound and another helper's set keep to, a parent arm kept
 //! outside another helper's pairs, that helper keeping rows or none, an arm
-//! reading another helper's rows, and for a helper read in `FROM`, as its
-//! rows, its columns under an alias, and its rows correlated with the row a
-//! policy reads.
+//! reading another helper's rows, for a helper read in `FROM`, as its rows,
+//! its columns under an alias, and its rows correlated with the row a policy
+//! reads, and for a helper's one value read as a scalar subquery.
 //! Each helper guards the same table under a policy of its own, which both
-//! engines read before any request and then under every request state.
+//! engines read before any request and then under every request state. An
+//! insert checked against a helper's one value is accepted, refused, or
+//! stopped by a second row as PostgreSQL decides it.
 
 // `register_impl` takes an unwind-safe closure, which a poisoning mutex is.
 use std::sync::{Arc, Mutex};
@@ -354,6 +356,15 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
     AND (doc.org_id, doc.kind) NOT IN (SELECT * FROM authz.kinds_for('file'))
 $$;
 
+CREATE FUNCTION authz.acting_org() RETURNS SETOF TEXT
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '' AS $$
+  SELECT member.org_id FROM public.members member
+  WHERE member.user_id = authz.caller_id() AND member.role IS NULL
+  UNION ALL
+  SELECT permission.org_id FROM public.permissions permission
+  WHERE permission.installation_id = authz.installation_id() AND authz.caller_id() IS NULL
+$$;
+
 ALTER FUNCTION authz.caller_id() OWNER TO conditions_owner;
 ALTER FUNCTION authz.installation_id() OWNER TO conditions_owner;
 ALTER FUNCTION authz.link_ids() OWNER TO conditions_owner;
@@ -388,6 +399,7 @@ ALTER FUNCTION authz.capped_member_docs() OWNER TO conditions_owner;
 ALTER FUNCTION authz.kept_member_files() OWNER TO conditions_owner;
 ALTER FUNCTION authz.uncapped_member_docs() OWNER TO conditions_owner;
 ALTER FUNCTION authz.unfiled_member_docs() OWNER TO conditions_owner;
+ALTER FUNCTION authz.acting_org() OWNER TO conditions_owner;
 REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA authz FROM PUBLIC;
 GRANT USAGE ON SCHEMA authz TO conditions_owner;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA authz TO conditions_owner;
@@ -398,14 +410,14 @@ ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
 
 /// The reader role's rights on PostgreSQL, which the cluster creates.
 const PG_READER_GRANTS: &str = "
-GRANT SELECT ON docs TO app;
+GRANT SELECT, INSERT ON docs TO app;
 GRANT USAGE ON SCHEMA authz TO app;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA authz TO app;
 ";
 
 /// Each helper's policy over `docs`, one case per condition it carries or
 /// place its rows are read in.
-const CASES: [(&str, &str); 36] = [
+const CASES: [(&str, &str); 37] = [
     ("a joined row", "org_id IN (SELECT authz.member_orgs())"),
     ("a row cap over a joined row", "org_id IN (SELECT authz.administered_orgs())"),
     ("an anti-join, time bounds and a principal", "id IN (SELECT authz.granted_docs())"),
@@ -464,6 +476,7 @@ const CASES: [(&str, &str); 36] = [
         "EXISTS (SELECT 1 FROM authz.capped_kinds() capped \
          WHERE capped.org_id = docs.org_id AND capped.kind = docs.kind)",
     ),
+    ("a helper's one value", "org_id = (SELECT authz.acting_org())"),
 ];
 
 /// What a request carries, `''` standing for a setting it sends empty and
@@ -892,9 +905,9 @@ fn policy(predicate: &str) -> String {
     format!("CREATE POLICY docs_read ON docs FOR SELECT USING ({predicate});")
 }
 
-fn postgres(predicate: &str) -> PgConnection {
+fn postgres(policy: &str) -> PgConnection {
     let mut connection = postgres_harness::fresh_database();
-    for script in [PG_OWNER, SCHEMA, PG_READER_GRANTS, &policy(predicate)] {
+    for script in [PG_OWNER, SCHEMA, PG_READER_GRANTS, policy] {
         postgres_harness::apply(&mut connection, script)
             .unwrap_or_else(|error| panic!("PostgreSQL refused the document: {error}"));
     }
@@ -904,13 +917,13 @@ fn postgres(predicate: &str) -> PgConnection {
     connection
 }
 
-/// The replica, whose settings read what `request` holds.
-fn sqlite(predicate: &str, request: &Arc<Mutex<Request>>) -> SqliteConnection {
+/// The replica under `policy`, whose settings read what `request` holds.
+fn sqlite(policy: &str, request: &Arc<Mutex<Request>>) -> SqliteConnection {
     let translated = Pg2Sqlite::default()
-        .sql(&format!("{OWNER}{SCHEMA}{}", policy(predicate)))
+        .sql(&format!("{OWNER}{SCHEMA}{policy}"))
         .expect("parse")
         .translate(&options())
-        .unwrap_or_else(|error| panic!("pg2sqlite refused {predicate}: {error}"));
+        .unwrap_or_else(|error| panic!("pg2sqlite refused {policy}: {error}"));
     let mut connection = SqliteConnection::establish(":memory:").expect("open SQLite");
     translated.register_functions(&mut connection).expect("register helper functions");
     let translated = translated.into_vec();
@@ -962,9 +975,10 @@ fn send(connection: &mut PgConnection, request: Request) {
 #[test]
 fn every_helper_condition_keeps_the_rows_postgresql_keeps() {
     for (case, predicate) in CASES {
-        let mut source = postgres(predicate);
+        let read = policy(predicate);
+        let mut source = postgres(&read);
         let current = Arc::new(Mutex::new(UNSENT));
-        let mut replica = sqlite(predicate, &current);
+        let mut replica = sqlite(&read, &current);
         let expected = visible(&mut source);
         assert_eq!(visible(&mut replica), expected, "{case} before any request");
         let mut kept_any = !expected.is_empty();
@@ -976,5 +990,64 @@ fn every_helper_condition_keeps_the_rows_postgresql_keeps() {
             assert_eq!(visible(&mut replica), expected, "{case} under {request:?}");
         }
         assert!(kept_any, "{case} keeps no row under any request, which measures nothing");
+    }
+}
+
+/// Inserts a page of `$org` under `$id` into the `docs` of `$schema`.
+macro_rules! insert_page {
+    ($connection:expr, $schema:ident, $id:expr, $org:expr) => {{
+        use schema::$schema::docs;
+        diesel::insert_into(docs::table)
+            .values((docs::id.eq($id), docs::org_id.eq($org), docs::kind.eq("page")))
+            .execute($connection)
+    }};
+}
+
+/// What became of an insert, the policy accepting or refusing it, or the
+/// check stopped by a scalar subquery answering a second row.
+fn outcome(result: QueryResult<usize>) -> &'static str {
+    match result {
+        Ok(_) => "inserted",
+        Err(error) => {
+            let message = error.to_string();
+            if message.contains("more than one row returned by a subquery used as an expression") {
+                "more than one row"
+            } else if message.contains("violates row-level security policy") {
+                "refused"
+            } else {
+                panic!("the insert failed otherwise: {message}")
+            }
+        }
+    }
+}
+
+#[test]
+fn an_insert_checked_against_a_helpers_one_value_ends_as_on_postgresql() {
+    let mut seen = Vec::new();
+    for predicate in
+        ["org_id = (SELECT authz.acting_org())", "org_id = (SELECT authz.member_orgs())"]
+    {
+        let check =
+            format!("CREATE POLICY docs_insert ON docs FOR INSERT WITH CHECK ({predicate});");
+        let mut source = postgres(&check);
+        let current = Arc::new(Mutex::new(UNSENT));
+        let mut replica = sqlite(&check, &current);
+        for (index, request) in REQUESTS.into_iter().enumerate() {
+            send(&mut source, request);
+            *current.lock().expect("the request lock") = request;
+            for org in ["o1", "o4"] {
+                let id = format!("n{index}{org}");
+                let expected = outcome(insert_page!(&mut source, source, &id, org));
+                let replicated = outcome(insert_page!(&mut replica, replica, &id, org));
+                assert_eq!(
+                    replicated, expected,
+                    "{predicate} inserting into {org} under {request:?}"
+                );
+                seen.push(expected);
+            }
+        }
+    }
+    for ended in ["inserted", "refused", "more than one row"] {
+        assert!(seen.contains(&ended), "no insert ended {ended}, which measures nothing");
     }
 }
