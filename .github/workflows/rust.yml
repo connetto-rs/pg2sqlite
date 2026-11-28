@@ -52,9 +52,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-stable-
 
-      - name: Build
-        run: cargo build --all-targets
-
       - name: Run tests
         run: cargo test --all-targets
 
