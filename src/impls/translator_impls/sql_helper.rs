@@ -7,10 +7,14 @@
 //! the declared return type. The caller then translates that expression where
 //! the call stood, so the setting reads in an accessor such as
 //! `authz.caller_id()` go through the deployment's session variable mappings
-//! as if written in place. A call to one whose body reads relations reads the
-//! rows of a helper function the replica registers, whose body runs as a
-//! statement of its own, as PostgreSQL calls such a function, and a call in
-//! `FROM` that PostgreSQL inlines reads the body in place.
+//! as if written in place. A body selecting from the one row a `plpgsql`
+//! function with output parameters returns, as `SELECT id FROM
+//! authz.acting_installation()`, is replaced the same way, each output
+//! standing for what `FunctionLike::returned_values` finds it holding when
+//! the function returns under the deployment. A call to one whose body reads
+//! relations reads the rows of a helper function the replica registers, whose
+//! body runs as a statement of its own, as PostgreSQL calls such a function,
+//! and a call in `FROM` that PostgreSQL inlines reads the body in place.
 //!
 //! The body is read as PostgreSQL runs it. Its unqualified calls resolve
 //! under the function's own `search_path`, its own calls to other helpers
@@ -26,9 +30,10 @@ use sql_traits::{
     errors::LookupError,
     structs::{
         ColumnDefinition, ExpressionContext, ExpressionScope, FunctionKind, IdentifierCase,
-        ParserDB, TargetName, UnqualifiedName,
+        ParserDB, ReturnedOutput, ReturnedValue, TargetName, UnqualifiedName,
     },
     traits::{ColumnLike, DatabaseLike, FunctionLike, RoleLike, SchemaLike, TableLike},
+    utils::identifier_resolution::identifiers_match,
 };
 use sqlparser::{
     ast::{
@@ -36,8 +41,8 @@ use sqlparser::{
         FunctionArg, FunctionArgExpr, FunctionArguments, FunctionBehavior, FunctionCalledOnNull,
         FunctionReturnType, FunctionSecurity, GroupByExpr, Ident, JoinConstraint, JoinOperator,
         ObjectName, ObjectNamePart, Query, Select, SelectItem, SelectItemQualifiedWildcardKind,
-        SetExpr, Statement, TableAlias, TableAliasColumnDef, TableFactor, TableWithJoins,
-        UnaryOperator, Value, Visit, VisitMut, Visitor, With,
+        SetExpr, Statement, TableAlias, TableAliasColumnDef, TableFactor, TableFunctionArgs,
+        TableWithJoins, UnaryOperator, Value, Visit, VisitMut, Visitor, VisitorMut, With,
         helpers::attached_token::AttachedToken, visit_expressions, visit_expressions_mut,
         visit_relations, visit_relations_mut,
     },
@@ -51,7 +56,7 @@ use crate::{
     errors::Error,
     impls::{
         bind_once::is_atomic,
-        object_name::{last_ident, resolve_translation_table},
+        object_name::{last_ident, resolve_translation_table, same_identifier},
         privileges::{RoleTable, names_table_with_backing},
         query_builder::{
             from_relation, make_query, make_simple_select, plain_table_factor,
@@ -357,9 +362,14 @@ impl<'s> Inliner<'s, '_> {
         let mut body = match body_shape(name, helper, self.schema)? {
             BodyShape::Expression(body) => body.into_owned(),
             BodyShape::Rows(query) => {
-                return self
-                    .rows(name, helper, caller, &arguments, query, Answer::Value(returned))
-                    .map(Expansion::Rows);
+                match self.selected_outputs(name, helper, caller, &query)? {
+                    Some(body) => body,
+                    None => {
+                        return self
+                            .rows(name, helper, caller, &arguments, query, Answer::Value(returned))
+                            .map(Expansion::Rows);
+                    }
+                }
             }
         };
         check_session_reads(
@@ -377,12 +387,7 @@ impl<'s> Inliner<'s, '_> {
         parameters.check_references(name, &body)?;
         arguments.bind(name, &mut body, &parameters, self.options)?;
 
-        let runs_as = match caller {
-            Some(_) if helper.security_mode() == FunctionSecurity::Definer => {
-                Some(owner(name, helper, self.schema)?)
-            }
-            _ => caller,
-        };
+        let runs_as = self.runs_as(name, helper, caller)?;
         self.expanding.push(helper);
         let expanded = self.expand(&mut body, runs_as);
         self.expanding.pop();
@@ -390,6 +395,127 @@ impl<'s> Inliner<'s, '_> {
         // `cast_to` left the body a `CAST(... AS ...)`, one operand of
         // whatever surrounds the call.
         Ok(Expansion::Expression(body))
+    }
+
+    /// The role a call to `helper`, named `name` and made as `caller`, runs
+    /// its body as, the owner of a `SECURITY DEFINER` function and the caller
+    /// of any other.
+    fn runs_as(
+        &self,
+        name: &ObjectName,
+        helper: &CreateFunction,
+        caller: Option<&'s Role>,
+    ) -> Result<Option<&'s Role>, Error> {
+        match caller {
+            Some(_) if helper.security_mode() == FunctionSecurity::Definer => {
+                owner(name, helper, self.schema).map(Some)
+            }
+            _ => Ok(caller),
+        }
+    }
+
+    /// What `query`, the body of `helper` called as `name` by `caller`,
+    /// computes where it selects one expression from the row a `plpgsql`
+    /// function returning no set hands its `FROM` when passed no argument,
+    /// as `SELECT id FROM authz.acting_installation()`. Each column of the
+    /// row is replaced by what the output parameter of that name holds when
+    /// the function returns, on every request the deployment admits, as
+    /// `FunctionLike::returned_values` reads it, cast to the parameter's type
+    /// as PL/pgSQL converts what it assigns.
+    ///
+    /// `None` leaves the body to [`Self::rows`] where it has another shape,
+    /// where the call reaches a function in another language or returning a
+    /// set, where the projection names anything but the row's columns or
+    /// holds a subquery, where the function resolves names on a `search_path`
+    /// other than `helper`'s, which reads the outputs, and where no deployment
+    /// is configured.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a function the role `helper` runs as may not call, a
+    /// `VOLATILE` one, one whose outputs `returned_values` does not read, a
+    /// selected output holding no one expression, and an output reading the
+    /// session where its value in place of the call differs, as
+    /// [`check_session_reads`] and [`Self::check_immutable`] refuse it.
+    fn selected_outputs(
+        &self,
+        name: &ObjectName,
+        helper: &'s CreateFunction,
+        caller: Option<&'s Role>,
+        query: &Query,
+    ) -> Result<Option<Expr>, Error> {
+        let Some((selected, written, alias)) = output_selection(query) else { return Ok(None) };
+        let resolved = match written.0.as_slice() {
+            [ObjectNamePart::Identifier(unqualified)] => {
+                let reached = helper.unqualified_names(self.schema)?;
+                qualified(name, &reached, unqualified)?
+            }
+            _ => None,
+        };
+        let validator_name = resolved.as_ref().unwrap_or(written);
+        let validator =
+            declared_helper(validator_name, self.schema, self.options)?.filter(|function| {
+                function.stored_language().as_deref() == Some("plpgsql") && !function.returns_set()
+            });
+        let (Some(validator), Some(deployment)) = (validator, self.options.get_deployment()) else {
+            return Ok(None);
+        };
+        if let Some(path) = validator.search_path(self.schema)?
+            && helper.search_path(self.schema)?.as_ref() != Some(&path)
+        {
+            return Ok(None);
+        }
+        let Some(row_name) = alias.map(|alias| &alias.name).or_else(|| last_ident(written)) else {
+            return Ok(None);
+        };
+        if let Some(role) = self.runs_as(name, helper, caller)? {
+            check_privileges(validator_name, validator, role, self.schema)?;
+        }
+        check_volatility(validator_name, validator)?;
+        let returned = validator.returned_values(self.schema, deployment).map_err(|error| {
+            refusal(
+                name,
+                &format!(
+                    "selects what {validator_name} returns, whose outputs are not read: {error}"
+                ),
+            )
+        })?;
+        let Some(outputs) = returned
+            .iter()
+            .map(|value| output_type(validator, value.name()).map(|declared| (value, declared)))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        let mut body = selected.clone();
+        let mut substitution = OutputSubstitution {
+            row_name,
+            outputs: &outputs,
+            selected: vec![false; outputs.len()],
+        };
+        match VisitMut::visit(&mut body, &mut substitution) {
+            ControlFlow::Continue(()) => {}
+            ControlFlow::Break(None) => return Ok(None),
+            ControlFlow::Break(Some(output)) => {
+                return Err(refusal(
+                    name,
+                    &format!(
+                        "selects the output {output} of {validator_name}, which holds what several \
+                         assignments or a write other than an assignment give it"
+                    ),
+                ));
+            }
+        }
+        let running_as = self.options.running_as().map(sql_traits::traits::RoleLike::name);
+        let held = outputs
+            .iter()
+            .zip(substitution.selected)
+            .filter_map(|((value, _), selected)| value.expression().filter(|_| selected));
+        for held in held {
+            check_session_reads(validator_name, self.enclosing(validator), running_as, held)?;
+            self.check_immutable(validator, held)?;
+        }
+        Ok(Some(body))
     }
 
     /// `FROM name(arguments)`, a call to the set-returning `helper` made as
@@ -723,52 +849,194 @@ impl<'s> Inliner<'s, '_> {
         body: &mut N,
     ) -> Result<(), Error> {
         let reached = helper.unqualified_names(self.schema)?;
-        let case = IdentifierCase::AsWritten;
         let flow = visit_expressions_mut(body, |expr| {
             let Expr::Function(call) = expr else { return ControlFlow::Continue(()) };
             let [ObjectNamePart::Identifier(written)] = call.name.0.as_slice() else {
                 return ControlFlow::Continue(());
             };
-            let written_form = case.compared_form(&written.value, written.quote_style.is_some());
-            let functions = reached.iter().find_map(|unqualified| {
-                match unqualified {
-                    UnqualifiedName::Function { name: target, functions }
-                        if case.compared_form(target.name(), target.name_is_quoted())
-                            == written_form =>
-                    {
-                        Some(functions)
-                    }
-                    _ => None,
-                }
-            });
-            let Some(functions) = functions else { return ControlFlow::Continue(()) };
-            if functions.iter().any(|function| in_pg_catalog(function)) {
-                return ControlFlow::Continue(());
+            match qualified(name, &reached, written) {
+                Ok(Some(qualified)) => call.name = qualified,
+                Ok(None) => {}
+                Err(error) => return ControlFlow::Break(error),
             }
-            let mut schemas = functions.iter().map(|function| function.target_name());
-            let Some(first) = schemas.next() else { return ControlFlow::Continue(()) };
-            let Some(namespace) = first.schema() else { return ControlFlow::Continue(()) };
-            if schemas.any(|other| other.schema() != Some(namespace)) {
-                return ControlFlow::Break(refusal(
-                    name,
-                    &format!("calls {written}, which its search_path resolves to several schemas"),
-                ));
-            }
-            let quoted = first.schema_is_quoted();
-            let mut namespace = Ident::new(namespace);
-            if quoted {
-                namespace.quote_style = Some('"');
-            }
-            call.name = ObjectName(vec![
-                ObjectNamePart::Identifier(namespace),
-                ObjectNamePart::Identifier(written.clone()),
-            ]);
             ControlFlow::Continue(())
         });
         match flow {
             ControlFlow::Continue(()) => Ok(()),
             ControlFlow::Break(error) => Err(error),
         }
+    }
+}
+
+/// The name `written`, an unqualified call in the body of the function
+/// called as `name`, qualified by the schema of the declared function the
+/// function's own `search_path` resolves it to, `reached` holding what that
+/// path resolves each unqualified name of the body to. `None` for a call
+/// resolving to a builtin, or to nothing the schema holds.
+///
+/// # Errors
+///
+/// Refuses a name the path resolves to functions of several schemas.
+fn qualified(
+    name: &ObjectName,
+    reached: &[UnqualifiedName<'_, ParserDB>],
+    written: &Ident,
+) -> Result<Option<ObjectName>, Error> {
+    let case = IdentifierCase::AsWritten;
+    let written_form = case.compared_form(&written.value, written.quote_style.is_some());
+    let functions = reached.iter().find_map(|unqualified| {
+        match unqualified {
+            UnqualifiedName::Function { name: target, functions }
+                if case.compared_form(target.name(), target.name_is_quoted()) == written_form =>
+            {
+                Some(functions)
+            }
+            _ => None,
+        }
+    });
+    let Some(functions) = functions else { return Ok(None) };
+    if functions.iter().any(|function| in_pg_catalog(function)) {
+        return Ok(None);
+    }
+    let mut schemas = functions.iter().map(|function| function.target_name());
+    let Some(first) = schemas.next() else { return Ok(None) };
+    let Some(namespace) = first.schema() else { return Ok(None) };
+    if schemas.any(|other| other.schema() != Some(namespace)) {
+        return Err(refusal(
+            name,
+            &format!("calls {written}, which its search_path resolves to several schemas"),
+        ));
+    }
+    let mut namespace = Ident::new(namespace);
+    if first.schema_is_quoted() {
+        namespace.quote_style = Some('"');
+    }
+    Ok(Some(ObjectName(vec![
+        ObjectNamePart::Identifier(namespace),
+        ObjectNamePart::Identifier(written.clone()),
+    ])))
+}
+
+/// The expression `query` selects from the one row a call passing no
+/// argument hands its `FROM`, as `SELECT <expression> FROM <function>()
+/// [<alias>]`, beside the call's name and alias, which names no column.
+fn output_selection(query: &Query) -> Option<(&Expr, &ObjectName, Option<&TableAlias>)> {
+    let Query { with: None, body, order_by: None, limit_clause: None, fetch: None, .. } = query
+    else {
+        return None;
+    };
+    let SetExpr::Select(select) = body.as_ref() else { return None };
+    let (
+        [
+            SelectItem::UnnamedExpr(expression)
+            | SelectItem::ExprWithAlias { expr: expression, .. },
+        ],
+        [from],
+    ) = (select.projection.as_slice(), select.from.as_slice())
+    else {
+        return None;
+    };
+    let TableFactor::Table {
+        name,
+        alias,
+        args: Some(TableFunctionArgs { args, settings: None }),
+        with_hints,
+        version: None,
+        with_ordinality: false,
+        partitions,
+        json_path: None,
+        sample: None,
+        index_directives,
+        inheritance: None,
+    } = &from.relation
+    else {
+        return None;
+    };
+    (args.is_empty()
+        && with_hints.is_empty()
+        && partitions.is_empty()
+        && index_directives.is_empty()
+        && from.joins.is_empty()
+        && alias.as_ref().is_none_or(|alias| alias.columns.is_empty())
+        && selects_one_row(select))
+    .then_some((expression, name, alias.as_ref()))
+}
+
+/// Whether `select` keeps every row of its `FROM` once, without filtering,
+/// grouping or windowing them.
+fn selects_one_row(select: &Select) -> bool {
+    select.distinct.is_none()
+        && select.top.is_none()
+        && select.into.is_none()
+        && select.selection.is_none()
+        && select.prewhere.is_none()
+        && matches!(&select.group_by, GroupByExpr::Expressions(grouped, modifiers)
+            if grouped.is_empty() && modifiers.is_empty())
+        && select.having.is_none()
+        && select.qualify.is_none()
+        && select.named_window.is_empty()
+}
+
+/// The declared type of the output parameter of `function` PostgreSQL
+/// stores as `stored`.
+fn output_type<'f>(function: &'f CreateFunction, stored: &str) -> Option<&'f DataType> {
+    function.args.iter().flatten().find_map(|argument| {
+        let output = matches!(argument.mode, Some(ArgMode::Out | ArgMode::InOut));
+        let written = argument.name.as_ref()?;
+        (output && identifiers_match(stored, true, &written.value, written.quote_style.is_some()))
+            .then_some(&argument.data_type)
+    })
+}
+
+/// Replaces each column of the row a call hands its `FROM`, bare or
+/// qualified by `row_name`, with what the output parameter of that name
+/// holds, cast to the parameter's type, marking in `selected` the outputs
+/// replaced. Breaks with `None` on a subquery, which resolves names in a
+/// scope of its own, and on a name no output answers, and with the output's
+/// name where it holds no one expression.
+struct OutputSubstitution<'o> {
+    row_name: &'o Ident,
+    outputs: &'o [(&'o ReturnedValue, &'o DataType)],
+    selected: Vec<bool>,
+}
+
+impl VisitorMut for OutputSubstitution<'_> {
+    type Break = Option<String>;
+
+    fn pre_visit_query(&mut self, _query: &mut Query) -> ControlFlow<Self::Break> {
+        ControlFlow::Break(None)
+    }
+
+    fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+        let column = match expr {
+            Expr::Identifier(column) => column,
+            Expr::CompoundIdentifier(parts) => {
+                match parts.as_slice() {
+                    [relation, column] if same_identifier(relation, self.row_name) => column,
+                    _ => return ControlFlow::Break(None),
+                }
+            }
+            _ => return ControlFlow::Continue(()),
+        };
+        let quoted = column.quote_style.is_some();
+        let Some(position) = self
+            .outputs
+            .iter()
+            .position(|(value, _)| identifiers_match(value.name(), true, &column.value, quoted))
+        else {
+            return ControlFlow::Break(None);
+        };
+        let (value, declared) = self.outputs[position];
+        let held = match value.output() {
+            ReturnedOutput::Expression(held) => held.as_ref().clone(),
+            ReturnedOutput::Null => Expr::value(Value::Null),
+            ReturnedOutput::Several | ReturnedOutput::Unread => {
+                return ControlFlow::Break(Some(value.name().to_owned()));
+            }
+        };
+        self.selected[position] = true;
+        *expr = cast_to(held, declared);
+        ControlFlow::Continue(())
     }
 }
 
@@ -1694,18 +1962,7 @@ fn single_expression(query: Query) -> Option<Expr> {
         return None;
     };
     let SetExpr::Select(select) = *body else { return None };
-    let one_row = select.distinct.is_none()
-        && select.top.is_none()
-        && select.into.is_none()
-        && select.from.is_empty()
-        && select.selection.is_none()
-        && select.prewhere.is_none()
-        && matches!(&select.group_by, GroupByExpr::Expressions(grouped, modifiers)
-            if grouped.is_empty() && modifiers.is_empty())
-        && select.having.is_none()
-        && select.qualify.is_none()
-        && select.named_window.is_empty();
-    if !one_row {
+    if !select.from.is_empty() || !selects_one_row(&select) {
         return None;
     }
     let mut projection = select.projection.into_iter();

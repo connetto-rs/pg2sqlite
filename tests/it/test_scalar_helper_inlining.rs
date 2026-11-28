@@ -9,7 +9,7 @@ use sql_traits::structs::SetPacking;
 
 use crate::helpers::{
     self,
-    deployment::{caller, deployment, set},
+    deployment::{caller, deployment, scalar, set},
 };
 
 /// The accessor of connetto-schema's core and a table whose policy reads it.
@@ -719,4 +719,102 @@ INSERT INTO t SELECT v FROM src WHERE seen(v) = 0;",
         "SELECT count(*) FROM t",
     );
     assert_eq!(rows, 2);
+}
+
+const INSTALLATION: &str = "
+CREATE FUNCTION authz.acting_installation(OUT namespace_id UUID, OUT id UUID) RETURNS RECORD
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+BEGIN
+  namespace_id := NULLIF(current_setting('app.installation_namespace_id', true), '')::UUID;
+  id := NULLIF(current_setting('app.installation_id', true), '')::UUID;
+  IF (namespace_id IS NULL) <> (id IS NULL) THEN
+    RAISE EXCEPTION 'incomplete installation identity' USING ERRCODE = '22023';
+  END IF;
+END
+$$;
+CREATE FUNCTION authz.acting_installation_id() RETURNS UUID
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+  SELECT id FROM authz.acting_installation()
+$$;
+CREATE FUNCTION authz.acting_installation_namespace_id() RETURNS UUID
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
+  SELECT CASE WHEN id IS NOT NULL THEN namespace_id END FROM authz.acting_installation()
+$$;
+GRANT USAGE ON SCHEMA authz TO authz_owner;
+ALTER FUNCTION authz.acting_installation() OWNER TO authz_owner;
+ALTER FUNCTION authz.acting_installation_id() OWNER TO authz_owner;
+ALTER FUNCTION authz.acting_installation_namespace_id() OWNER TO authz_owner;
+";
+
+/// The translation of the read policy keeping `predicate` over [`SCHEMA`],
+/// `extra` and [`INSTALLATION`], under a deployment declaring the two
+/// installation settings, set together where `together` holds.
+fn installation_translation(
+    extra: &str,
+    predicate: &str,
+    together: bool,
+) -> Result<String, pg2sqlite::errors::Error> {
+    let settings = ["app.installation_namespace_id", "app.installation_id"];
+    let mut declared = deployment(
+        ["app"],
+        [caller("app.user_id", "uuid"), scalar(settings[0], "uuid"), scalar(settings[1], "uuid")],
+    );
+    if together {
+        declared =
+            declared.with_settings_set_together(settings).expect("both settings are declared");
+    }
+    let options = options()
+        .with_session_variable(SessionVariableMapping::new(settings[0], "app_namespace_id"))
+        .with_session_variable(SessionVariableMapping::new(settings[1], "app_installation_id"))
+        .with_deployment(declared);
+    let script = script(&format!("{INSTALLATION}{extra}"), predicate);
+    helpers::translate_pg(&script, &options).map(|translated| translated.join("\n"))
+}
+
+#[test]
+fn an_accessor_selecting_a_validated_output_reads_its_setting() {
+    for (predicate, mapping) in [
+        ("owner_id = (SELECT authz.acting_installation_id())", "app_installation_id()"),
+        ("(SELECT authz.acting_installation_id()) IS NULL", "app_installation_id()"),
+        ("owner_id = authz.acting_installation_namespace_id()", "app_namespace_id()"),
+    ] {
+        let translated = installation_translation("", predicate, true)
+            .unwrap_or_else(|error| panic!("refused {predicate}: {error}"));
+        assert!(translated.contains(mapping), "{predicate} reads {mapping}: {translated}");
+        assert!(
+            !translated.contains("acting_installation"),
+            "{predicate} keeps no call: {translated}"
+        );
+    }
+}
+
+#[test]
+fn an_accessor_selecting_an_output_whose_validator_may_raise_is_refused() {
+    let error = installation_translation("", "owner_id = authz.acting_installation_id()", false)
+        .map_or_else(|error| error.to_string(), |translated| panic!("translated:\n{translated}"));
+    assert!(
+        error.contains("authz.acting_installation_id()") && error.contains("outputs are not read"),
+        "{error}"
+    );
+}
+
+#[test]
+fn an_accessor_selecting_an_output_several_assignments_give_is_refused() {
+    let error = installation_translation(
+        "CREATE FUNCTION authz.either(OUT id UUID) RETURNS UUID LANGUAGE plpgsql STABLE AS $$
+         BEGIN
+           IF current_setting('app.installation_id', true) IS NULL THEN
+             id := NULL;
+           ELSE
+             id := NULLIF(current_setting('app.installation_id', true), '')::UUID;
+           END IF;
+         END $$;
+         CREATE FUNCTION authz.either_id() RETURNS UUID LANGUAGE sql STABLE AS $$
+           SELECT id FROM authz.either()
+         $$;",
+        "owner_id = authz.either_id()",
+        true,
+    )
+    .map_or_else(|error| error.to_string(), |translated| panic!("translated:\n{translated}"));
+    assert!(error.contains("authz.either_id()") && error.contains("several"), "{error}");
 }
