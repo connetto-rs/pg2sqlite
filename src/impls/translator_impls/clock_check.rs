@@ -5,17 +5,12 @@
 //! a table carrying one stores no row at all. PostgreSQL evaluates a `CHECK`
 //! when it writes the row, which is when a `BEFORE INSERT` or `BEFORE UPDATE`
 //! trigger runs, and a trigger may read the clock. Each such check therefore
-//! leaves the table and becomes two triggers that abort with PostgreSQL's
-//! message when the condition is false. A condition that is NULL passes, as
-//! it does in a `CHECK`. SQLite fires the most recently created trigger
-//! first, as [`trigger_slots`](super::trigger_slots) measured, so triggers
-//! created with the table run after every `BEFORE` row trigger created later,
-//! as PostgreSQL checks constraints after its `BEFORE` triggers.
-//!
-//! The triggers yield to the RLS exemption when one is configured.
-//! PostgreSQL judged a row the server wrote against the server's clock when
-//! it wrote it, so the replica applying that row later does not judge it
-//! again against its own.
+//! leaves the table for [`check_triggers`](super::check_triggers), enforced on
+//! every insert and update, and aborts with PostgreSQL's message when the
+//! condition is false. A condition that is NULL passes, as it does in a
+//! `CHECK`. PostgreSQL judged a row the server wrote against the server's
+//! clock when it wrote it, so the replica applying that row later does not
+//! judge it again against its own.
 //!
 //! A check added after its table is refused. PostgreSQL checks every row the
 //! table already holds when the check arrives, and a trigger judges only the
@@ -29,9 +24,8 @@ use sql_traits::{
     traits::{CheckConstraintLike, TableLike},
 };
 use sqlparser::ast::{
-    CheckConstraint, ColumnOption, CreateTable, DropTrigger, Expr, Function, FunctionArg,
-    FunctionArgExpr, FunctionArguments, Ident, ObjectName, Statement, TableConstraint,
-    TriggerEvent, TriggerPeriod, visit_expressions, visit_expressions_mut,
+    CheckConstraint, ColumnOption, CreateTable, Expr, Function, FunctionArg, FunctionArgExpr,
+    FunctionArguments, Ident, TableConstraint, visit_expressions, visit_expressions_mut,
 };
 
 #[cfg(not(feature = "std"))]
@@ -39,15 +33,12 @@ use crate::no_std::prelude::*;
 use crate::{
     errors::Error,
     impls::{
-        ast_builder,
-        derived_writes::server_filled,
         function_helpers::{is_function_named, single_quoted_literal},
-        object_name::{
-            quoted_ident, reads_column, resolve_declared_table, resolve_translation_table,
-        },
+        object_name::reads_column,
         translator_impls::{
-            column_option::warn_no_inherit_dropped, rls::write_guard_condition_expr,
-            server_filled::filler, statement::negate,
+            check_triggers::{Enforced, TriggerConstraint},
+            column_option::warn_no_inherit_dropped,
+            statement::negate,
         },
     },
     options::TranslationContext,
@@ -60,21 +51,6 @@ use crate::{
 const DATE_FUNCTIONS: [&str; 7] =
     ["date", "datetime", "julianday", "strftime", "time", "timediff", "unixepoch"];
 
-/// A check of the table that reads the clock, translated.
-struct ClockCheck {
-    /// The constraint's name, as PostgreSQL names it.
-    name: String,
-    /// The translated condition, reading the written row through `NEW`.
-    condition: Expr,
-}
-
-/// The checks of one table that read the clock.
-pub(crate) struct ClockChecks {
-    /// The table's name as PostgreSQL reports it.
-    relation: String,
-    checks: Vec<ClockCheck>,
-}
-
 /// Takes the checks that read the clock out of `create_table`, answering the
 /// definition the table is created from and those checks.
 ///
@@ -82,8 +58,8 @@ pub(crate) struct ClockChecks {
 /// every column check, and a check refused there stays to be refused, so only
 /// a check that translates and reads the clock leaves. Its warnings are
 /// reported here, once, since the table translation no longer sees it. A
-/// table the schema does not hold keeps its checks for the table translation,
-/// which refuses one reading the clock.
+/// table the schema does not hold, `stored` absent, keeps its checks for the
+/// table translation, which refuses one reading the clock.
 ///
 /// `options` is the table's scope, which every check reads its columns from.
 ///
@@ -92,19 +68,17 @@ pub(crate) struct ClockChecks {
 /// Propagates a failed schema lookup.
 pub(crate) fn split_clock_checks<'t>(
     create_table: &'t CreateTable,
+    stored: Option<&CreateTable>,
     schema: &ParserDB,
     options: &TranslationContext<'_>,
     emit: WarningSink<'_>,
-) -> Result<(Cow<'t, CreateTable>, ClockChecks), Error> {
-    let unchanged = || {
-        (Cow::Borrowed(create_table), ClockChecks { relation: String::new(), checks: Vec::new() })
-    };
-    let Some(stored) = resolve_declared_table(schema, create_table)? else {
-        return Ok(unchanged());
+) -> Result<(Cow<'t, CreateTable>, Vec<TriggerConstraint>), Error> {
+    let Some(stored) = stored else {
+        return Ok((Cow::Borrowed(create_table), Vec::new()));
     };
     let taken = clock_checks_of(create_table, schema, options, emit);
     if taken.is_empty() {
-        return Ok(unchanged());
+        return Ok((Cow::Borrowed(create_table), Vec::new()));
     }
 
     let names = constraint_names(stored, &taken, schema)?;
@@ -118,17 +92,29 @@ pub(crate) fn split_clock_checks<'t>(
             Slot::Table(index) => drop(table.constraints.remove(index)),
         }
     }
+    let relation = stored.stored_table_name();
     let checks = taken
         .into_iter()
         .zip(names)
         .map(|((_, check, mut condition), name)| {
             warn_no_inherit_dropped("CHECK ... NO INHERIT", "CHECK", check.no_inherit, emit);
             read_through_new(&mut condition, &column_names);
-            ClockCheck { name, condition }
+            TriggerConstraint {
+                message: crate::write_guard::check_violation(&relation, &name),
+                name,
+                broken: negate(condition),
+                reads: column_names
+                    .iter()
+                    .filter(|column| reads_column(&check.expr, column))
+                    .map(|column| (*column).clone())
+                    .collect(),
+                // PostgreSQL rechecks the whole row on any update.
+                insert: Enforced::Always,
+                update: Enforced::Always,
+            }
         })
         .collect();
-    let relation = stored.stored_table_name().into_owned();
-    Ok((Cow::Owned(table), ClockChecks { relation, checks }))
+    Ok((Cow::Owned(table), checks))
 }
 
 /// Where a check sits in its table's definition.
@@ -201,66 +187,6 @@ fn clock_condition(
     Some(condition)
 }
 
-/// Drops of the triggers enforcing the clock checks of `table` that read one
-/// of `columns`, which PostgreSQL drops along with the column. A check left
-/// to the server with the trigger filling a column it reads has none.
-///
-/// `written` is the schema before the drop, still holding the checks.
-///
-/// # Errors
-///
-/// Propagates a failed schema lookup and a trigger function whose body cannot
-/// be read.
-pub(crate) fn dropped_clock_triggers(
-    table: &ObjectName,
-    columns: &[Ident],
-    written: &ParserDB,
-    options: &TranslationContext<'_>,
-) -> Result<Vec<Statement>, Error> {
-    let Some(stored) = resolve_translation_table(written, table)? else {
-        return Ok(Vec::new());
-    };
-    let scope = crate::options::table_column_scope(Some(stored), written);
-    let scoped = scope.as_ref().map(|scope| options.with_scope(scope));
-    // Their warnings reached the caller when the table was created.
-    let taken = clock_checks_of(stored, written, scoped.as_ref().unwrap_or(options), &mut |_| {});
-    if taken.is_empty() {
-        return Ok(Vec::new());
-    }
-    let names = constraint_names(stored, &taken, written)?;
-    let relation = stored.stored_table_name();
-    let filled = server_filled(stored, written, options)?;
-    let declared: Vec<&Ident> = stored.columns.iter().map(|column| &column.name).collect();
-    Ok(taken
-        .iter()
-        .zip(names)
-        .filter(|((_, check, _), _)| {
-            columns.iter().any(|column| reads_column(&check.expr, column))
-                && filler(&check.expr, &declared, &filled).is_none()
-        })
-        .flat_map(|(_, name)| {
-            [VERB_INSERT, VERB_UPDATE].map(|verb| {
-                Statement::DropTrigger(DropTrigger {
-                    if_exists: false,
-                    trigger_name: ObjectName::from(vec![quoted_ident(&trigger_name(
-                        &relation, &name, verb,
-                    ))]),
-                    table_name: None,
-                    option: None,
-                })
-            })
-        })
-        .collect())
-}
-
-const VERB_INSERT: &str = "insert";
-const VERB_UPDATE: &str = "update";
-
-/// The name of the trigger enforcing `constraint` of `relation` on `verb`.
-fn trigger_name(relation: &str, constraint: &str, verb: &str) -> String {
-    format!("{relation}_{constraint}_{verb}")
-}
-
 /// The names PostgreSQL gives the checks in `taken`, in order.
 fn constraint_names(
     stored: &CreateTable,
@@ -315,42 +241,6 @@ pub(super) fn check_names<'c>(
         .collect()
 }
 
-impl ClockChecks {
-    /// The `BEFORE INSERT` and `BEFORE UPDATE` triggers enforcing each check
-    /// on the emitted `table`.
-    pub(crate) fn into_triggers(
-        self,
-        table: &ObjectName,
-        options: &TranslationContext<'_>,
-    ) -> impl Iterator<Item = Statement> {
-        let Self { relation, checks } = self;
-        checks.into_iter().flat_map(move |check| {
-            let condition = write_guard_condition_expr(Some(negate(check.condition)), options);
-            let message = crate::write_guard::check_violation(&relation, &check.name);
-            let trigger = |verb: &str, event: TriggerEvent, condition: Option<Expr>| {
-                ast_builder::trigger(
-                    ObjectName::from(vec![quoted_ident(&trigger_name(
-                        &relation,
-                        &check.name,
-                        verb,
-                    ))]),
-                    table.clone(),
-                    TriggerPeriod::Before,
-                    event,
-                    true,
-                    condition,
-                    vec![ast_builder::raise_statement("ABORT", Some(&message), None)],
-                )
-            };
-            // PostgreSQL rechecks the whole row on any update.
-            [
-                trigger(VERB_INSERT, TriggerEvent::Insert, condition.clone()),
-                trigger(VERB_UPDATE, TriggerEvent::Update(Vec::new()), condition),
-            ]
-        })
-    }
-}
-
 /// Refuses a translated check condition that reads the clock, which only a
 /// check declared with its table can be enforced for.
 ///
@@ -372,7 +262,7 @@ pub(crate) fn refuse_clock_check(source: &Expr, condition: &Expr) -> Result<(), 
 }
 
 /// Whether the translated `expr` reads SQLite's clock.
-fn reads_clock(expr: &Expr) -> bool {
+pub(super) fn reads_clock(expr: &Expr) -> bool {
     visit_expressions(expr, |node| {
         match node {
             Expr::Function(function) if is_clock_call(function) => ControlFlow::Break(()),

@@ -476,6 +476,35 @@ pub(crate) fn merge_conditions(a: Option<Expr>, b: Option<Expr>) -> Option<Expr>
     }
 }
 
+/// `condition`, the `WHEN` of a row trigger on `table` firing on `events`,
+/// translated to read SQLite's `NEW` and `OLD` rows, as the trigger's own
+/// translation reads it.
+///
+/// # Errors
+///
+/// Fails as the condition's translation does.
+pub(crate) fn translate_when(
+    condition: &Expr,
+    table: &<ParserDB as DatabaseLike>::Table,
+    events: &[TriggerEvent],
+    schema: &ParserDB,
+    options: &crate::options::TranslationContext<'_>,
+    emit: crate::warnings::WarningSink<'_>,
+) -> Result<Expr, crate::errors::Error> {
+    let scope = sql_traits::structs::ColumnScope::for_table(
+        table,
+        schema,
+        sql_traits::structs::IdentifierCase::AsWritten,
+    );
+    let scoped = options.with_pseudo_row_scope(&scope);
+    let options = scoped.with_trigger_rows(super::trigger_row::TriggerRows::new(table, events));
+    let mut condition = condition.clone();
+    if let Some(rows) = options.trigger_rows() {
+        rows.unstar(&mut condition, &|_| None, schema)?;
+    }
+    condition.translate_with_warnings(schema, &options, emit)
+}
+
 /// The condition a `BEFORE` or `AFTER` trigger translated from PostgreSQL
 /// fires under, false while the exemption function answers true.
 ///

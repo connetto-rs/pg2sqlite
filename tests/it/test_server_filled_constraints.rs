@@ -3,7 +3,8 @@
 //!
 //! PostgreSQL checks the row after its `BEFORE` triggers fill it, and the
 //! replica runs no trigger it leaves to the server, so such a constraint
-//! leaves the replica with the trigger and is reported.
+//! leaves the replica's table, is enforced on the writes that trigger does
+//! not fire on, and is reported.
 
 use diesel::{QueryResult, RunQueryDsl, SqliteConnection, prelude::*};
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, TranslationWarning};
@@ -199,15 +200,26 @@ fn the_report_names_each_constraint_left_with_the_trigger_filling_its_column() {
             }
         })
         .collect();
-    let filling = |trigger: &str, column: &str| {
+    let filling = |trigger: &str, column: &str, events: &str, enforced: &str| {
         format!(
-            "TRIGGER {trigger} on children, which the replica leaves to the server, fills \
-             {column} before PostgreSQL checks the row"
+            "TRIGGER {trigger} on children fills {column} on {events} before PostgreSQL checks \
+             the row, and the replica leaves it to the server, so it enforces the constraint \
+             {enforced}"
         )
     };
-    let kind = filling("children_copy", "parent_kind");
-    let archived = filling("children_copy", "parent_archived");
-    let moved = filling("children_move", "previous_kind");
+    let kind = filling("children_copy", "parent_kind", "INSERT", "on UPDATE changing parent_kind");
+    let archived = filling(
+        "children_copy",
+        "parent_archived",
+        "INSERT",
+        "on UPDATE changing parent_archived or note",
+    );
+    let moved = filling(
+        "children_move",
+        "previous_kind",
+        "UPDATE where its WHEN holds",
+        "on INSERT and on UPDATE changing previous_kind unless TRIGGER children_move fires",
+    );
     assert_eq!(
         left,
         [
@@ -238,4 +250,130 @@ fn a_constraint_reading_no_filled_column_stays() {
     let error = insert(&mut connection, Some("")).expect_err("an empty note is refused");
     assert!(error.to_string().contains("note <> ''"), "{error}");
     assert_eq!(children::table.count().get_result::<i64>(&mut connection), Ok(0));
+}
+
+fn update_kind(connection: &mut SqliteConnection, kind: Option<&str>) -> QueryResult<usize> {
+    diesel::update(children::table).set(children::parent_kind.eq(kind)).execute(connection)
+}
+
+#[test]
+fn an_update_changing_a_column_filled_on_insert_alone_is_checked() {
+    let mut connection =
+        helpers::apply_with_options(SCHEMA, &options()).expect("apply the replica");
+    insert(&mut connection, Some("first")).expect("PostgreSQL fills parent_kind before its checks");
+    let error = update_kind(&mut connection, Some("ownable"))
+        .expect_err("children_copy does not fire on UPDATE, so PostgreSQL checks the kind");
+    assert!(
+        error.to_string().contains(
+            "new row for relation \"children\" violates check constraint \
+             \"children_parent_kind_check\""
+        ),
+        "{error}"
+    );
+    update_kind(&mut connection, Some("folder")).expect("a folder child passes the check");
+    let error = update_kind(&mut connection, None).expect_err("parent_kind is NOT NULL on UPDATE");
+    assert!(
+        error.to_string().contains(
+            "null value in column \"parent_kind\" of relation \"children\" violates not-null \
+             constraint"
+        ),
+        "{error}"
+    );
+    let stored: Option<String> =
+        children::table.select(children::parent_kind).first(&mut connection).expect("stored");
+    assert_eq!(stored.as_deref(), Some("folder"));
+}
+
+#[test]
+fn an_update_leaving_the_checked_columns_alone_lands_before_the_server_row() {
+    let mut connection =
+        helpers::apply_with_options(SCHEMA, &options()).expect("apply the replica");
+    diesel::insert_into(children::table)
+        .values((
+            children::id.eq(1),
+            children::parent_id.eq(7),
+            children::parent_kind.eq("ownable"),
+            children::previous_kind.eq(""),
+        ))
+        .execute(&mut connection)
+        .expect("children_copy overwrites parent_kind on INSERT");
+    diesel::update(children::table)
+        .set(children::note.eq("second"))
+        .execute(&mut connection)
+        .expect("PostgreSQL judges the kind children_copy filled, which the update leaves alone");
+}
+
+#[test]
+fn a_server_trigger_s_when_narrows_the_updates_left_to_it() {
+    let mut connection =
+        helpers::apply_with_options(SCHEMA, &options()).expect("apply the replica");
+    let refused = |error: diesel::result::Error| {
+        assert!(
+            error.to_string().contains(
+                "new row for relation \"children\" violates check constraint \"children_moved\""
+            ),
+            "{error}"
+        );
+    };
+    let archived = diesel::insert_into(children::table)
+        .values((
+            children::id.eq(2),
+            children::parent_id.eq(7),
+            children::previous_kind.eq("archive"),
+        ))
+        .execute(&mut connection)
+        .expect_err("children_move does not fire on INSERT");
+    refused(archived);
+    insert(&mut connection, None).expect("an empty previous kind passes");
+    let kept_parent = diesel::update(children::table)
+        .set(children::previous_kind.eq("archive"))
+        .execute(&mut connection)
+        .expect_err("children_move fires only when parent_id changes");
+    refused(kept_parent);
+    diesel::update(children::table)
+        .set((children::parent_id.eq(8), children::previous_kind.eq("archive")))
+        .execute(&mut connection)
+        .expect("children_move fills previous_kind before PostgreSQL checks the moved child");
+}
+
+diesel::table! {
+    sqlite_schema (name) {
+        #[sql_name = "type"]
+        kind -> Text,
+        name -> Text,
+    }
+}
+
+/// The names of the triggers the replica of `schema` holds.
+fn triggers(schema: &str) -> Vec<String> {
+    let mut connection =
+        helpers::apply_with_options(schema, &options()).expect("apply the replica");
+    sqlite_schema::table
+        .filter(sqlite_schema::kind.eq("trigger"))
+        .select(sqlite_schema::name)
+        .load(&mut connection)
+        .expect("list the triggers")
+}
+
+#[test]
+fn dropping_a_checked_column_takes_the_triggers_enforcing_its_constraints() {
+    let enforcing = [
+        "children_children_parent_kind_check_update",
+        "children_children_parent_kind_not_null_update",
+        "children_children_moved_insert",
+        "children_children_moved_update",
+    ];
+    let kept = "children_children_open_update";
+    let created = triggers(SCHEMA);
+    assert!(
+        enforcing.iter().chain([&kept]).all(|name| created.iter().any(|held| held == name)),
+        "{created:?}"
+    );
+    let dropped = triggers(&format!(
+        "{SCHEMA}
+ALTER TABLE children DROP COLUMN previous_kind;
+ALTER TABLE children DROP COLUMN parent_kind;"
+    ));
+    assert!(dropped.iter().any(|name| name == kept), "{dropped:?}");
+    assert!(dropped.iter().all(|name| !enforcing.contains(&name.as_str())), "{dropped:?}");
 }
