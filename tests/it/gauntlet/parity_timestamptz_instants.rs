@@ -289,13 +289,16 @@ fn a_conversion_without_a_zone_names_what_is_missing() {
     assert_eq!(EVENTS.sqlite(ROLES, same, &zoned("Europe/Rome")), "true");
 }
 
-/// Offset-less text whose instant falls past the years the zone database
-/// covers names the clock and the zone.
+/// Offset-less text whose instant falls past the year 9999 once moved to UTC
+/// is refused, since the replica holds a `timestamptz` as UTC text with a
+/// four-digit year.
 #[test]
-fn text_read_past_the_zone_databases_years_names_the_clock() {
+fn text_read_past_the_replicas_years_is_refused() {
     let error = refusal("timestamptz '9999-12-31 23:30'", &options("America/New_York"));
     assert!(
-        error.contains("`9999-12-31 23:30:00` cannot be read in the zone 'America/New_York'"),
+        error.contains(
+            "\"9999-12-31 23:30\" falls outside the years 1 to 9999 once it is moved to UTC"
+        ),
         "{error}"
     );
 }
